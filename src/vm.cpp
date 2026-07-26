@@ -3447,6 +3447,49 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
     return 0;
 }
 
+/* model-flip (nativize-ops): the native CheckFuncV - map/filter's arg0
+ * guard. A non-function conveys a LOC-LESS TypeErrorEx; EnterNative's
+ * re-raise (vm_raise) stamps arg0's caret from the loc table at the op's
+ * pc - exactly the loc_at(pc) the interpreted throw uses. */
+extern "C" int jit_check_func(int_type slot) noexcept
+{
+    ML_JIT_OP_RAN(CheckFuncV);
+    EvalContext *ctx = g_current_ctx;
+    if (ctx->frame->at(slot).get().is<intrusive_ptr<FuncObject>>())
+        return 0;
+    g_vm_jit_exc = std::make_unique<TypeErrorEx>("Expected function");
+    return 1;
+}
+
+/* model-flip (nativize-ops): the native MapFilterV - map/filter over the
+ * pre-validated function + container via the SHARED vm_map_filter (the
+ * interpreter's exact body; a callback re-enters vm_dispatch through
+ * VmInvoker, which owns g_current_ctx for its loop, so `ctx` stays valid
+ * for the dst write). The unsupported-container TypeErrorEx is built
+ * LOC-LESS (empty locs passed) and stamped at the op's pc by EnterNative's
+ * re-raise - the same loc_at(pc) caret the interpreted op passes in; a
+ * callback's own throw already carries its loc. A PLAIN exception (a
+ * callback's UndefinedVariableEx - no clone()) rides g_vm_jit_eptr. */
+extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
+                              int_type dst, int_type is_map) noexcept
+{
+    ML_JIT_OP_RAN(MapFilterV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        ctx->frame->at(dst).put(
+            vm_map_filter(ctx, ctx->frame->at(fn_slot).get(),
+                          ctx->frame->at(cont_slot).get(),
+                          is_map != 0, Loc(), Loc()));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
 /*
  * model-flip (nativize-ops): the native AppendV `append(a, x)` / `push(a, x)` -
  * the interpreter's D1 fast op. Forms arg0's LValue* from `kind` (0 local / 1

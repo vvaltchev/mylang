@@ -1066,6 +1066,14 @@ static bool jit_op_eligible(const Instr &in)
      * append-in-a-loop native. NOT op_fully_native (the fallback can throw). */
     case OpCode::AppendV:
         return true;
+    /* CheckFuncV/MapFilterV (the map/filter pair): the guard conveys a
+     * loc-less TypeErrorEx (re-raise stamps the side-table caret at the op
+     * pc -> NOT op_fully_native), the map/filter runs the shared
+     * vm_map_filter (callbacks re-enter vm_dispatch; a plain callback throw
+     * rides g_vm_jit_eptr). The last non-call island pair. */
+    case OpCode::CheckFuncV:
+    case OpCode::MapFilterV:
+        return true;
     /* CallBuiltinLV: a mutating lvalue-ABI builtin (pop/insert/erase/sort/
      * reverse/intptr) via jit_call_builtin_lv - forms arg0 from kind+slot, calls
      * vm_call_builtin_lv_rest (rest-native) or func_lv (no value args). Every
@@ -1312,7 +1320,6 @@ static void emit_sync_call(Emitter &e, const Chunk &ck, const Instr &in,
     const uint64_t site =
         (static_cast<uint64_t>(static_cast<uint32_t>(ls.line)) << 32)
         | static_cast<uint32_t>(ls.col);
-    e.bump_op(op);
     emit_call_prologue(e);
     e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
     e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
@@ -1612,6 +1619,16 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * instead - the old rule - cost a hot loop its registers whenever it
              * merged into a fragment containing ANY builtin call. */
             mark_barrier(pc);
+            break;
+        case OpCode::MapFilterV:
+            /* map/filter's callback re-enters vm_dispatch (same as a
+             * callback builtin) - bracket; the boxed operand/dst slots are
+             * never int candidates, disqualify defensively. */
+            mark_barrier(pc);
+            bad(in.a_slot()); bad(in.b_slot()); bad(in.target);
+            break;
+        case OpCode::CheckFuncV:
+            bad(in.a_slot());            /* a func-value slot - never int */
             break;
         case OpCode::BinOpV:
         case OpCode::CmpV:
@@ -3616,6 +3633,48 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::CheckFuncV: {
+        /* jit_check_func(slot) - rdi = a_slot. A non-func conveys a loc-less
+         * TypeErrorEx -> test eax + exit_pc (the re-raise stamps arg0's
+         * caret from the loc table at this pc). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_check_func) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        const size_t j_ok_cf = e.j8(0x74);
+        e.exit_pc(pc);
+        e.patch8(j_ok_cf, e.pos());
+        return true;
+    }
+
+    case OpCode::MapFilterV: {
+        /* jit_map_filter(fn, cont, dst, is_map) - rdi=a_slot, rsi=b_slot,
+         * rdx=target, rcx=target2. The callback re-enters vm_dispatch; a
+         * throw conveys (exc/eptr) -> test eax + exit_pc. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.b_slot())));
+        e.movabs(RDX, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target)));
+        e.movabs(RCX, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_map_filter) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        const size_t j_ok_mf = e.j8(0x74);
+        e.exit_pc(pc);
+        e.patch8(j_ok_mf, e.pos());
+        return true;
+    }
+
     case OpCode::AppendV:
         /* jit_append(kind=a_dual_hi, arg0_slot=target2, val_slot=b_lit,
          * dst_slot=target, bc=&ck.builtin_calls[a_dual_lo]). r8 = the pool entry
@@ -4565,19 +4624,20 @@ static bool op_is_simple_island(OpCode op)
 {
     switch (op) {
     /* The simple boxed SCALAR ops, SliceV, the CONTAINER/STRUCT BUILDS
-     * (MakeArrayV/MakeDictV/StructCtorBoxedV) and DeclConstV are ALL
-     * op_run_eligible now (the nativize-ops path), so op_run_eligible
-     * (checked FIRST in the gate) wins - they never reach here as islands.
-     * They stay listed for documentation / a `-nj` build (where
-     * op_run_eligible is false). The ops here that are STILL boxed (not
-     * jit_op_eligible) are CheckFuncV + MapFilterV (a map/filter call - its
-     * validate-arg0-before-arg1 order + the callback re-entry keep it a
-     * helper-pair for now) - the container gate's island source, so the
-     * jit_exec_block mechanism (M2-M4) stays exercised. (The source was
-     * SliceV -> MakeArrayV -> MakeDictV -> StructCtorBoxedV -> DeclConstV
-     * before each was nativized - it hops to the next still-boxed simple op
-     * each time, and each hop is perf-checked by probing bench/ + samples/
-     * for containers formed.) */
+     * (MakeArrayV/MakeDictV/StructCtorBoxedV), DeclConstV AND the map/filter
+     * pair (CheckFuncV/MapFilterV) are ALL op_run_eligible now (the
+     * nativize-ops path), so op_run_eligible (checked FIRST in the gate)
+     * wins - they never reach here as islands. They stay listed for
+     * documentation / a `-nj` build (where op_run_eligible is false). The
+     * ONLY genuinely-still-boxed sequential ops are the dyn-callee generic
+     * call pair below (CheckCallableV + CallValueGenericV - the one
+     * remaining AST-holding op, inherently node-based until the F1
+     * descriptor work) - the container gate's island source, so the
+     * jit_exec_block mechanism (M2-M4) stays exercised on real dyn-dispatch
+     * code. (The island-source hop chain: SliceV -> MakeArrayV -> MakeDictV
+     * -> StructCtorBoxedV -> DeclConstV -> CheckFuncV/MapFilterV -> this
+     * pair, each hop perf-checked by probing bench/ + samples/ for
+     * containers formed.) */
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
     case OpCode::UnaryV: case OpCode::MoveV: case OpCode::CompoundV:
     case OpCode::LoadConstV: case OpCode::CoerceNumV:
@@ -4588,6 +4648,8 @@ static bool op_is_simple_island(OpCode op)
     case OpCode::DeclConstV:
     case OpCode::CheckFuncV:
     case OpCode::MapFilterV:
+    case OpCode::CheckCallableV:
+    case OpCode::CallValueGenericV:
         return true;
     default:
         return false;

@@ -528,6 +528,13 @@ extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
 extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
                                 const void *bc) noexcept;
 
+/* model-flip (nativize-ops): CheckFuncV (map/filter's arg0 guard - a non-func
+ * conveys a loc-less TypeErrorEx, stamped at the op pc by the re-raise) and
+ * MapFilterV (the shared vm_map_filter body; callback re-enters vm_dispatch). */
+extern "C" int jit_check_func(int_type slot) noexcept;
+extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
+                              int_type dst, int_type is_map) noexcept;
+
 /* model-flip (nativize-ops): AppendV - `append(a, x)`/`push(a, x)`. Forms arg0's
  * LValue* from kind (0 loc/1 gbl/2 cap) + arg0_slot, runs the never-throwing
  * arr_append_fast; a decline falls back to vm_call_builtin_lv_rest (builtin_
