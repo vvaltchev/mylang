@@ -14845,9 +14845,10 @@ static bool jit_container()
     const unsigned long b0 = g_jit_container_calls;
     /* (1) a boxed-island container; correct result. Discarded DYN-callee
      * calls are the island source (CheckCallableV + CallValueGenericV - the
-     * one remaining AST-holding pair, now that the scalar ops, SliceV, the
-     * container/struct builds, DeclConstV AND map/filter are all
-     * nativized); their array args compile to ELIGIBLE ops, so the islands
+     * last still-boxed sequential pair, now that the scalar ops, SliceV,
+     * the container/struct builds, DeclConstV AND map/filter are all
+     * nativized; AST-FREE like every op - it reads the call_sites pool -
+     * just not yet given an emit case); their array args compile to ELIGIBLE ops, so the islands
      * are the check+call pairs. Returns the arg. runtime() keeps the call
      * non-const so the pure call isn't folded away (else cleaf never runs
      * -> no container). */
@@ -14878,7 +14879,7 @@ static bool jit_container()
     /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
      * (native ops + the for.step back edge) iterates in machine code, only the
      * island (the dyn call `f([1, 2])` - CheckCallableV/CallValueGenericV,
-     * the AST-holding pair) calls jit_exec_block; `var j = i + 1` is native.
+     * the still-boxed pair) calls jit_exec_block; `var j = i + 1` is native.
      * The arg is returned. (The island was `const c = [..]` / DeclConstV,
      * then `map(...)`, until each went native - the recurring island-source
      * hop.) */
@@ -16897,8 +16898,8 @@ static bool vm_disasm_container_plan()
             const std::string d = disassemble_program(b);
             /* main: a MIXED chunk -> NOT ready + at least one island line.
              * The island is now the discarded DYN call `dcf(...)` - the
-             * CheckCallableV/CallValueGenericV pair, the one remaining
-             * AST-holding op family. (The island source hopped again: it was
+             * CheckCallableV/CallValueGenericV pair, the last still-boxed
+             * op family (AST-free like all ops; no emit case yet). (The island source hopped again: it was
              * the CallV until the M5 sync call, then map()'s CheckFuncV/
              * MapFilterV until those went native - each migration is the
              * nativize-ops arc working.) */
