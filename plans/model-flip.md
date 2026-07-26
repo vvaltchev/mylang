@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (29 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (31 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -386,7 +386,14 @@ builtins: pop/insert/erase/sort/reverse/intptr. Forms arg0 from kind+slot,
 calls vm_call_builtin_lv_rest (rest_base >= 0) or func_lv with an empty rest
 (rest_base == -1); every throw is a RuntimeException -> g_vm_jit_exc; NOT
 op_fully_native, NOT cached. Completes the lvalue-builtin family for a slotted
-arg0 - LVElem/LVMember (subscript/member arg0) remain).
+arg0). And **CallBuiltinLVElem / CallBuiltinLVMember** (`jit_call_builtin_lv_elem`
+/ `_member` - the subscript (`append(a[i], x)`) and struct-member
+(`append(s.f, x)`) arg0 variants: form the base by kind+slot, derive the
+element LValue* via the runtime Type::subscript / the boxed field LValue* via
+vm_member_lvalue, then func_lv rest-native. The `run_base` holds the value args
+(elem: run[0] index + run[1..] values; member: run[0..] values). Every throw a
+RuntimeException -> g_vm_jit_exc (arg0's caret if loc-less); NOT op_fully_native,
+NOT cached. Completes the WHOLE lvalue-builtin family).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -532,10 +539,23 @@ to do LATER, separately (don't forget these):
   discarded `pop(a);` writes a temp (interpreter doesn't discard LV dst) - OK
   under hardening.
 - **CallBuiltinLVElem / CallBuiltinLVMember** (the subscript/member arg0 variants:
-  `append(a[i], x)`, `append(s.f, x)`) — REMAIN. They form arg0 via the runtime
-  Type::subscript (elem) / a boxed field LValue (member) rather than a slot, so
-  they need the arg0-derivation logic in the helper (like the interpreter's
-  handlers) + the emit. CannotChangeConstEx is already a RuntimeException.
+  `append(a[i], x)`, `append(s.f, x)`) — DONE (2026-07-24) via
+  `jit_call_builtin_lv_elem` / `_member`. Same 5-arg shape as CallBuiltinLV
+  (kind, base_slot, dst_slot, run_base, &builtin_calls[idx]) but `b` is always a
+  lit (the value-args run - no -1 sentinel needed). Elem: form the base's LValue*
+  by kind, then the element's via the runtime Type::subscript (the SAME COW path
+  Subscript::do_eval uses; a non-lvalue element -> null target -> NotLValueEx),
+  run[0] = the index + run[1..] = the values (a `holder` EvalValue keeps the
+  subscript result alive across func_lv). Member: form the boxed field LValue*
+  via vm_member_lvalue (needs `m->base_struct` - a PROVEN struct base; a dyn/dict
+  base takes the MemberV+AppendV path instead, so the op only fires for a typed
+  struct), run[0..] = the values (NO index). Both stamp arg0's caret
+  (`bc.args[0]`, the a[i]/s.f target) if loc-less; every throw is a
+  RuntimeException. NOT op_fully_native, NOT cached. VERIFIED: -vdj fragment
+  covers both call.blt.lve/lvm ops with native calls; jit_op_nativized cases
+  (dyn `append(rows[k],i)` loop; `Bag b` `append(b.items,i)` loop) prove the
+  counters bump; OOB-subscript / flat-scalar-NotLValue / const-struct-field
+  (read-only -> NotLValue) errors byte-identical vm/tw.
 - **Halt** (83, the biggest blocker) — DONE (2026-07-23). A fall-through body's
   implicit `return none` runs in the fragment via `jit_halt` - EXACTLY ReturnV's
   jit_ret with the result hard-wired to none (no slot): IN-VM frame ->
