@@ -433,14 +433,16 @@ to do LATER, separately (don't forget these):
 - **CallBuiltinV** (~294, the big island source) — DONE (2026-07-22, c606b61 +
   the exception change fa90955); see `plans/callbuiltinv-nativization.md` (#1
   exception model change, #2 op_fully_native, #3 root-caused-orthogonal).
-- **`IntSubIR` (imm − reg) shape in `specialize_arith_ops`** — a lit-first
-  NON-commutative int op like `0 - i` / `k - i` stays a GENERIC `IntBin`
-  (`codegen.cpp` ~6775 `continue`s the lit-first non-commutative case; there's
-  no imm-reg shape, and subtraction can't swap to RI). Generic IntBin is not
-  jit_op_eligible, so such an op SPLITS a loop run below MIN_RUN and the loop
-  doesn't fragment (root-caused via the `abs(0-i)` case, see callbuiltinv #3).
-  Add an `IntSubIR` (+ `IntShl/ShrIR` if wanted) so these specialize → become
-  JIT-eligible. Targeted; helps reverse-iteration / `k - i` loops.
+- **`IntSubIR` (imm − reg) shape in `specialize_arith_ops`** — WON'T DO
+  (2026-07-22, maintainer decision). The JIT motivation is SUBSUMED by the
+  generic-IntBin task above: `0 - i` / `k - i` / `50 - s` now fragment + delete
+  native via the generic path. Since subtraction is non-commutative with no
+  imm-reg shape, `imm - reg` was the ONLY non-throwing generic-IntBin shape, so
+  the generic emit covers exactly what IntSubIR targeted. That leaves IntSubIR a
+  purely INTERPRETER-side win (a fixed op skips the 11-way `aop` switch for
+  `imm - reg`) — a marginal one shape of 23, not worth a new opcode + the
+  documented dispatch-layout regression risk. Skipped; the generic path is the
+  fix.
 - **Make a NON-div/mod/non-shift generic `IntBin` JIT-eligible** — DONE
   (2026-07-22). `jit_op_eligible(IntBin)` now gates on `aop`
   (plus/minus/times/band/bor/bxor → true; div/mod/shl/shr/ushr → false, they
