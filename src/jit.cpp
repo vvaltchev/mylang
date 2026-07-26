@@ -845,6 +845,12 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::LoadStructElemV:
     case OpCode::LoadElemValue:
         return true;
+    /* model-flip (nativize-ops): the typed int compare-to-BOOL VALUE
+     * (`(a<b)+(a>b)`, a predicate's return, a sort comparator's `a<b`). Pure
+     * int compare + setcc + a bool store - no call, and it CANNOT fault, so it
+     * is op_fully_native. It was islanding real loops (57_bool_reduce). */
+    case OpCode::CmpIntV:
+        return true;
     /* model-flip (nativize-ops): the BOXED condition BRANCH (`if (dynvalue)`,
      * `while (flag)`, a &&/|| conjunct, the boxed ternary) - jit_is_true
      * evaluates it and the FRAGMENT jumps (emit_branch). This was the top
@@ -998,6 +1004,13 @@ static void jit_put_int(LValue *lv, int_type v) noexcept
     lv->put(EvalValue(v));
 }
 
+/* The BOOL sibling (CmpIntV's dst is a real bool, not 0/1). Same cold ref
+ * path: the slot currently holds a reference, whose release needs C++. */
+static void jit_put_bool(LValue *lv, int_type v) noexcept
+{
+    lv->put(EvalValue(v != 0));
+}
+
 /* A helper CALL clobbers every caller-saved GP reg. The fragment relies on
  * rdi (slots base), rsi (t_int), r8 (t_float) AND the N5 cache regs
  * r10/r11 (which hold a hot slot's LIVE in-register value). rdi + the cache
@@ -1069,6 +1082,33 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
         return;
     }
     e.store(RSI, a.type);        /* the int Type singleton */
+    e.store(src_reg, a.payload);
+}
+
+/* Store a BOOL result (0/1 in `src_reg`) into a slot: the two-store with the
+ * t_bool singleton, or - when the slot is REF-LISTED, i.e. it may currently
+ * hold a reference whose release needs C++ - the same ref-check + put-helper
+ * shape store_dst uses for ints. A bool dst is never N5-cached (the cache is
+ * int-only), so there is no register case. */
+static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst)
+{
+    const SlotAddr a = slot_addr(dst);
+    const uint64_t tb = reinterpret_cast<uint64_t>(jit_layout().t_bool);
+    if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                           static_cast<int32_t>(dst))) {
+        const size_t jb_fast = emit_ref_check(e, a.type);
+        emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_bool),
+                          dst, src_reg);
+        const size_t jmp_done = e.j8(0xEB);   /* jmp done */
+        e.patch8(jb_fast, e.pos());           /* fast: */
+        e.movabs(RCX, tb);
+        e.store(RCX, a.type);
+        e.store(src_reg, a.payload);
+        e.patch8(jmp_done, e.pos());          /* done */
+        return;
+    }
+    e.movabs(RCX, tb);
+    e.store(RCX, a.type);
     e.store(src_reg, a.payload);
 }
 
@@ -1391,6 +1431,15 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             /* writes dst from memory (a builtin / const / literal / capture /
              * global value, not an int); target2 is a compile-time index (the
              * global slot for LoadGlobalV), not a frame slot. */
+            bad(in.target);
+            break;
+        case OpCode::CmpIntV:
+            /* both operands are plain int reads (cache-aware load_operand), so
+             * they stay countable int uses; the dst holds a BOOL, written to
+             * memory - never an int-cache candidate. Without this case the op
+             * hit the `default` and disabled pinning for the WHOLE run. */
+            if (!in.a_is_lit()) usei(in.a_slot());
+            if (!in.b_is_lit()) usei(in.b_slot());
             bad(in.target);
             break;
         case OpCode::JumpUnlessTrueV:
@@ -2274,6 +2323,23 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         return true;
 
+    case OpCode::CmpIntV: {
+        /* dst = (a <cmp> b) as a REAL bool. Fully inline: two cache-aware
+         * operand reads, one `cmp`, a `setcc` for the op's condition (the
+         * setcc opcode is the near-jcc opcode + 0x10, so the existing cc_for
+         * table drives it), `movzx` to a clean 0/1, then the bool two-store.
+         * Never faults -> op_fully_native. */
+        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        e.cmp_rax_rcx();                          /* cmp rax, rcx */
+        e.u8(0x0F);
+        e.u8(static_cast<uint8_t>(cc_for(in.aop).near_op + 0x10));
+        e.u8(0xC0);                               /* setcc al */
+        e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);       /* movzx eax, al */
+        store_dst_bool(e, ck, RAX, in.target);
+        return true;
+    }
+
     case OpCode::LoadElemBool:
         /* INLINE (no helper call): the N4 flat-array navigation with a BYTE
          * element - slot -> shobj -> kind + data, unsigned bounds check, movzx
@@ -2959,6 +3025,7 @@ static bool op_fully_native(const Instr &in)
     case OpCode::ArrLen:            /* size() of a proven array, never throws */
     case OpCode::MakeClosureV:      /* resolved-closure create, never throws */
     case OpCode::MakeArrayV:        /* array literal build, no error path */
+    case OpCode::CmpIntV:           /* int compare -> bool; cannot fault */
     /* the foreach loads: the index is loop-bounded by the ArrLen/StrLen that
      * produced it and the base kind is proven, so none of these can throw or
      * bail (LoadElemValue, which bounds-checks, is deliberately NOT here). */

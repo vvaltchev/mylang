@@ -610,6 +610,14 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             o << "movq xmm" << regf << ", " << rm; }
         else if (o2 == 0x2E) { modrm(regf, rm);
             o << "ucomisd xmm" << regf << ", " << rm; }
+        else if (o2 >= 0x90 && o2 <= 0x9F) {   /* setcc r/m8 (CmpIntV) */
+            modrm(regf, rm);
+            static const char *sc[16] = {"seto","setno","setb","setae",
+                "sete","setne","setbe","seta","sets","setns","setp","setnp",
+                "setl","setge","setle","setg"};
+            o << sc[o2 - 0x90] << " " << rm; }
+        else if (o2 == 0xB6) { modrm(regf, rm);   /* movzx r32, r/m8 */
+            o << "movzx " << gp64(regf) << ", " << rm; }
         else { o << ".0f 0x" << hex2(o2); }
         break; }
     default:
