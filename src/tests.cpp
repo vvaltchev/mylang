@@ -14694,13 +14694,13 @@ static bool jit_native_call()
  * calls bumps, the "prove the code ran" rule) with a correct result, AND that a
  * throw propagates + is catchable. dyn params keep the body boxed; the block
  * body keeps it above the inline threshold (so it stays a real call, not inlined
- * away). The ISLAND op is a BOXED STRUCT construction `B(a)` (StructCtorBoxedV)
- * - as the nativize-ops path made BinOpV/CmpV/CompoundV/MoveV/LogV/UnaryV/
- * CoerceNumV, SliceV, MakeArrayV and MakeDictV all NATIVE, StructCtorBoxedV is
+ * away). The ISLAND op is a `const` ARRAY DECL (DeclConstV) - as the
+ * nativize-ops path made BinOpV/CmpV/CompoundV/MoveV/LogV/UnaryV/CoerceNumV,
+ * SliceV, MakeArrayV, MakeDictV and the struct builds all NATIVE, DeclConstV is
  * the container gate's remaining still-boxed island source (the source hops to
  * the next still-boxed simple op each time one is nativized). A straight-line
  * container needs total island ops >= MIN_CONTAINER_ISLAND, so subtest (1)
- * chains 6 constructions (each its own 1-op island; total 6 >= 5). */
+ * chains 6 const decls (each its own 1-op island; total 6 >= 5). */
 static bool jit_container()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -14732,23 +14732,23 @@ static bool jit_container()
     };
 
     const unsigned long b0 = g_jit_container_calls;
-    /* (1) a straight-line boxed-island container; correct result. Six BOXED
-     * struct constructions `B(a)` (B has an `opt` field, so it is non-POD ->
-     * StructCtorBoxedV) = six islands (total >= MIN_CONTAINER_ISLAND). Returns
-     * B(a), whose .v is a. runtime() keeps the arg non-const so the pure call
-     * isn't folded away (else cleaf never runs -> no container).
-     * StructCtorBoxedV is the container gate's island source now that the simple
-     * scalar ops, SliceV, MakeArrayV AND MakeDictV are all nativized. */
-    if (!run({ "struct B { dyn? v; }",
-               "func cleaf(dyn a) {",
-               "  var dyn t = B(a);",
-               "  var dyn u = B(a);",
-               "  var dyn v = B(a);",
-               "  var dyn w = B(a);",
-               "  var dyn x = B(a);",
-               "  return B(a);",
+    /* (1) a straight-line boxed-island container; correct result. Six `const`
+     * ARRAY decls (a const arr is kept as a runtime symbol -> DeclConstV) = six
+     * islands (total >= MIN_CONTAINER_ISLAND). Returns the arg. runtime() keeps
+     * it non-const so the pure call isn't folded away (else cleaf never runs ->
+     * no container). DeclConstV is the container gate's island source now that
+     * the simple scalar ops, SliceV, MakeArrayV, MakeDictV and the struct builds
+     * are all nativized. */
+    if (!run({ "func cleaf(dyn a) {",
+               "  const t = [1, 2];",
+               "  const u = [3, 4];",
+               "  const v = [5, 6];",
+               "  const w = [7, 8];",
+               "  const x = [9, 10];",
+               "  const y = [11, 12];",
+               "  return a;",
                "}",
-               "assert(cleaf(runtime(\"hello\")).v == \"hello\");" }))
+               "assert(cleaf(runtime(\"hello\")) == \"hello\");" }))
         return false;
     if (g_jit_container_calls <= b0)
         return false;   /* the container's island call did NOT run */
@@ -14766,19 +14766,18 @@ static bool jit_container()
         return false;
     /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
      * (native ops + the for.step back edge) iterates in machine code, only the
-     * island `B(a)` (StructCtorBoxedV) calls jit_exec_block; `var j = i + 1` is
-     * native. last = B(a) each iteration, whose .v is a. */
+     * island `const c = [..]` (DeclConstV) calls jit_exec_block; `var j = i + 1`
+     * is native. The const is re-declared each iteration; the arg is returned. */
     const unsigned long b1 = g_jit_container_calls;
-    if (!run({ "struct B2 { dyn? v; }",
-               "func lc(dyn a, int n) {",
-               "  var dyn last = B2(a);",
+    if (!run({ "func lc(dyn a, int n) {",
+               "  var dyn last = a;",
                "  for (var i = 0; i < n; i++) {",
-               "    last = B2(a);",
+               "    const c = [1, 2];",
                "    var j = i + 1;",
                "  }",
                "  return last;",
                "}",
-               "assert(lc(runtime(\"hello\"), 5).v == \"hello\");" }))
+               "assert(lc(runtime(\"hello\"), 5) == \"hello\");" }))
         return false;
     if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
         return false;
@@ -15178,6 +15177,39 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(10)) == 90);" } },
+        /* StructCtorV: a per-iteration POD struct construction `P(i, i * 2)`
+         * builds natively (jit_struct_ctor, incl. the H1 dst-slot reuse). */
+        { OpCode::StructCtorV, {
+            "struct P { int x; int y; }",
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) { var p = P(i, i * 2); s += p.y; }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(10)) == 90);" } },
+        /* StructCtorBoxedV: a NON-POD construction (B has an `opt` field) with a
+         * runtime arg -> jit_struct_ctor_boxed (per-arg carets from the pool). */
+        { OpCode::StructCtorBoxedV, {
+            "struct B { dyn? v; int t; }",
+            "func f(dyn a, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) { var b = B(a, i); s += b.t; }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(\"z\"), 10) == 45);" } },
+        /* MakeStructArrayV: the FUSED flat array<PodStruct> literal - two
+         * same-def POD ctors with all-scalar args -> jit_make_struct_array. */
+        { OpCode::MakeStructArrayV, {
+            "struct Q { int x; int y; }",
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var a = [Q(i, i * 2), Q(i + 1, 0)];",
+            "    s += a[0].y + a[1].x;",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(10)) == 145);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

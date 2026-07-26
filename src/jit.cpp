@@ -741,6 +741,16 @@ static bool jit_op_eligible(const Instr &in)
      * (its caret comes from the pc-keyed loc side table). */
     case OpCode::MakeDictV:
         return true;
+    /* model-flip (nativize-ops): the STRUCT BUILDS - a POD ctor `P(x,y)`
+     * (jit_struct_ctor), a BOXED ctor `B(a,x)` (jit_struct_ctor_boxed), and the
+     * fused flat array<PodStruct> literal (jit_make_struct_array). Each can
+     * throw a TypeErrorEx from a field coerce -> re-raise, so NONE is
+     * op_fully_native (the POD/array pair carry a side-table caret; the boxed
+     * ctor carries its own POOLED per-arg caret). */
+    case OpCode::StructCtorV:
+    case OpCode::StructCtorBoxedV:
+    case OpCode::MakeStructArrayV:
+        return true;
     /* model-flip (nativize-ops): the boxed-arith ops (dyn/string operands) via
      * jit_boxed_* + the boxed_ops pool (target2 = the pool index, set by
      * build_boxed_ops). vm_num_binop CAN throw (div0/type) -> NOT
@@ -1208,6 +1218,23 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
                 bad(static_cast<int>(in.a_lit() + i));
             bad(in.target);
             break;
+        case OpCode::StructCtorV:
+            /* jit_struct_ctor reads the FIELD run [a_lit, a_lit+b_lit) from
+             * MEMORY (a field arg can be a cached int counter - `P(i, i*2)`)
+             * and reads+writes dst (the H1 reuse inspects the current value). */
+            for (int_type i = 0; i < in.b_lit(); i++)
+                bad(static_cast<int>(in.a_lit() + i));
+            bad(in.target);
+            break;
+        case OpCode::StructCtorBoxedV:
+        case OpCode::MakeStructArrayV:
+            /* Their run LENGTH is not derivable from the instruction alone -
+             * the boxed ctor's arg count lives in the boxed_ctors pool, and the
+             * struct-array literal's run is n * nfields (the field count is in
+             * the DEF) - and pick_cached_slots has no chunk to resolve either.
+             * Per the MakeClosureV rule (a helper reading slots the emit site
+             * cannot name), disable caching for the WHOLE run. */
+            return {};
         case OpCode::LoadBuiltinV:
         case OpCode::LoadConstV:
         case OpCode::LoadLiteralObjV:
@@ -2024,6 +2051,55 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         return true;
 
+    case OpCode::StructCtorV:
+    case OpCode::MakeStructArrayV:
+        /* jit_struct_ctor / jit_make_struct_array(def, run base, n, dst):
+         * rdi = the struct_defs[target2] StructTypeDef* baked as a VALUE (a
+         * program-lifetime address, like MakeClosureV's descriptor), rsi = the
+         * field/element run base, rdx = the field count (ctor) or ELEMENT count
+         * (array literal), rcx = dst. A defensive coerce throw -> test eax +
+         * exit_pc so EnterNative re-raises with the loc side table's caret. */
+        emit_call_prologue(e);
+        e.movabs(RDI, reinterpret_cast<uint64_t>(ck.struct_defs[in.target2]));
+        e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(
+                           in.op == OpCode::StructCtorV
+                               ? jit_struct_ctor : jit_make_struct_array) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::StructCtorBoxedV:
+        /* jit_struct_ctor_boxed(dst, run base, &ck.boxed_ctors[target2]) - the
+         * pool entry (def + the per-arg carets) is baked as a stable buffer
+         * address. A field coerce throw carries the arg's POOLED caret, which
+         * vm_raise leaves untouched (it stamps only an EMPTY loc). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RDX,
+                 reinterpret_cast<uint64_t>(&ck.boxed_ctors[in.target2]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_struct_ctor_boxed) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
     case OpCode::BinOpV:
     case OpCode::CmpV:
     case OpCode::CompoundV:
@@ -2692,17 +2768,18 @@ static constexpr size_t MIN_CONTAINER_ISLAND = 5;
 static bool op_is_simple_island(OpCode op)
 {
     switch (op) {
-    /* The simple boxed SCALAR ops (and SliceV, MakeArrayV, MakeDictV) are ALL
-     * op_run_eligible now (the nativize-ops path), so op_run_eligible (checked
-     * FIRST in the gate) wins - they never reach here as islands. They stay
-     * listed for documentation / a `-nj` build (where op_run_eligible is false).
-     * The one op here that is STILL boxed (not jit_op_eligible) is
-     * StructCtorBoxedV (a NON-POD struct construction with runtime args - the
-     * rarest remaining container build) - the container gate's island source, so
-     * the jit_exec_block mechanism (M2-M4) stays exercised. (The source was
-     * SliceV, then MakeArrayV, then MakeDictV, before each was nativized - it
-     * hops to the next still-boxed simple op each time, and each hop is
-     * perf-checked by probing bench/ + samples/ for containers formed.) */
+    /* The simple boxed SCALAR ops, SliceV, and the CONTAINER/STRUCT BUILDS
+     * (MakeArrayV/MakeDictV/StructCtorBoxedV) are ALL op_run_eligible now (the
+     * nativize-ops path), so op_run_eligible (checked FIRST in the gate) wins -
+     * they never reach here as islands. They stay listed for documentation / a
+     * `-nj` build (where op_run_eligible is false). The one op here that is
+     * STILL boxed (not jit_op_eligible) is DeclConstV (a `const` array/dict
+     * decl inside a function body - a non-branching data op that is rare in
+     * real code) - the container gate's island source, so the jit_exec_block
+     * mechanism (M2-M4) stays exercised. (The source was SliceV, then
+     * MakeArrayV, then MakeDictV, then StructCtorBoxedV, before each was
+     * nativized - it hops to the next still-boxed simple op each time, and each
+     * hop is perf-checked by probing bench/ + samples/ for containers formed.) */
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
     case OpCode::UnaryV: case OpCode::MoveV: case OpCode::CompoundV:
     case OpCode::LoadConstV: case OpCode::CoerceNumV:
@@ -2710,6 +2787,7 @@ static bool op_is_simple_island(OpCode op)
     case OpCode::MakeArrayV:
     case OpCode::MakeDictV:
     case OpCode::StructCtorBoxedV:
+    case OpCode::DeclConstV:
         return true;
     default:
         return false;
