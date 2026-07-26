@@ -810,9 +810,53 @@ The order:
    fuzzer 300, backtrace through nested sync calls byte-identical).
    Still open: indirect mutual recursion past the cap pays the bail
    round-trip (rare; per-pc entry points would absorb it).
+
+   **Follow-ups landed the same day (2026-07-25):**
+   - **CheckFuncV + MapFilterV nativized** (1776e72): jit_check_func (a
+     non-func conveys a loc-less TypeErrorEx; the re-raise stamps arg0's
+     caret at the op pc) + jit_map_filter (the shared vm_map_filter;
+     MapFilterV is a pick_cached_slots BARRIER - callback writes). Bench-
+     neutral (the body dominates) but it removes the LAST simple boxed
+     island pair: bench/ is now **97 READY / 3 NOT-ready chunks** (the two
+     compile-time-gated self-recursive CallVs + main's map pair before this
+     - now just the self-gated pair). The container tests' island source
+     migrated to the ONLY genuinely-still-boxed sequential ops - the
+     AST-holding dyn-callee pair (CheckCallableV + CallValueGenericV, now
+     in op_is_simple_island), keeping jit_exec_block exercised on real
+     dyn-dispatch code.
+   - **FloatBin mod arm** (3a1137a): the div arm's sign-stripped +-0.0
+     bits test (JR_DIV0) + the exact fmod libm call TypeFloat::mod makes
+     (emit_libm_call - the bracket saves rdi + pinned regs). The last
+     FloatBin arm; FloatBin is now fully eligible.
+   - **Suite geomean checkpoint** (one measure run, cached CPython):
+     **7.84x vs CPython** (0.128x my/py over 76 paired benches) - from
+     ~5.5x at the start of the model-flip arc. The remaining worst ratios
+     (67_make_dict 0.73, 66_dyn_foreach 0.58, 76_funcval 0.53,
+     63_closures 0.52) are VALUE-MODEL costs (dict/closure allocation,
+     callback-loop protocol, boxed-value churn - the paused #60/N7 arc),
+     not dispatch - the nativize-ops lane is reaching diminishing geomean
+     returns; its remaining value is STRUCTURAL (deletability/.myv, the
+     per-pc entry points, full-native call graph).
 Plus the standing structural item: per-op loc conveyance so the side-table
 re-raise ops (SubscriptV/DictLoad/boxed-arith/...) become DELETABLE (their
 carets currently collide on the EnterNative pc when a run is deleted).
+**Design validated (2026-07-25, not yet built):** deletability for a
+throwing op = "conveys WITH ITS OWN LOC + never re-executes + never
+BAILS". Key insight on why that suffices: a conveyed throw is handled
+INSIDE the EnterNative handler (jit_enter returns, the g_vm_jit_exc check
+runs right there - control never re-dispatches to the exit pc), so the
+collapsed pc only matters for vm_raise's loc stamp - which own-loc
+conveyance makes moot. A BAIL, by contrast, resumes AT the exit pc, which
+in a deleted run is the EnterNative pc itself -> the fragment would
+RE-RUN from the head (double execution) - hence bailing ops stay
+non-deletable no matter what. Mechanism: bake `&chunk.locs[i]` (the
+LocEntry - pool-buffer baking, established sound) as an extra helper arg;
+the helper stamps e.loc_start/end from it before g_vm_jit_exc. Guard:
+delete-originals must additionally EXCLUDE runs with ANY inline_ctxs
+entries (multiple deleted ops' inlined-at chains would collapse onto one
+pc - ambiguous flush). Families to convert: SubscriptV, DictLoadInt/
+Float, BinOpV/CmpV/CompoundV/UnaryV, CoerceNumV, MemberV, SliceV,
+LoadGlobalV (undefined-name throw), the IncDec family, the store family.
 
 (Historical note - the older tally below predates the iterator ops.)
 CallBuiltinV (~294) is DONE (see
