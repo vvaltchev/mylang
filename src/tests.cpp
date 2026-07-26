@@ -14873,6 +14873,28 @@ static bool jit_post_call_entry()
         fprintf(stderr, "jit_post_call_entry: entry stub DID NOT RUN\n");
         return false;
     }
+    /* Increment 2 (branch-target re-entry): after a caught same-frame
+     * throw the catch body runs interpreted; the join/back-edge target
+     * now carries an inserted EnterNative, so the loop rejoins native
+     * EVERY iteration - the counter must grow per-iteration (>= n/2
+     * bumps for n/2 throwing iterations), not just once. */
+    const unsigned long b1 = g_jit_entry_resume;
+    if (!run({
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { s += 10 / (i % 2); s += 1; }",
+            "    catch (DivisionByZeroEx) { s += 100; }",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(6)) == 333);" }))
+        return false;
+    if (g_jit_entry_resume < b1 + 3) {
+        fprintf(stderr, "jit_post_call_entry: branch-target entries did "
+                        "not re-enter per iteration\n");
+        return false;
+    }
     return true;
 #else
     return true;
