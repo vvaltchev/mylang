@@ -2182,10 +2182,31 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
     slots[dst].put(slots[src].get());
 }
 
+/*
+ * Re-raise DELETABILITY (plans/model-flip.md): a conveying op's caret must
+ * be pc-INDEPENDENT (a DELETED run collapses every pc onto its EnterNative,
+ * where a loc-table lookup would be wrong). Two zero-hot-cost carriers:
+ * the BoxedOp-family helpers stamp from their pool entry's start/end (the
+ * pool pointer is hot-live anyway), and the pointer-arg helpers
+ * (subscript/slice/dict-load/coerce) stay LOC-LESS - their EMIT stores the
+ * baked `&chunk.locs[i]` into `g_vm_jit_lep` on the COLD failure branch
+ * (3 instructions never executed on success), and vm_raise consumes it
+ * (stamp-if-empty, then clear). A helper ARG was measured to cost +4 Ir
+ * per CALL on the hot path (the value stays live across the try -> an
+ * extra callee-saved spill; 62_dict_word_count +0.6%); the cold-side
+ * store costs nothing.
+ */
+const void *g_vm_jit_lep;
+
+const void **jit_addr_lep()
+{
+    return &g_vm_jit_lep;
+}
+
 /* model-flip (nativize-ops): the native SubscriptV body - the interpreter's
  * exact `dst = RValue(base.subscript(idx, for_write=false))`. base_lv is passed
- * as an LValue* (like Subscript::do_eval, for COW identity). Throws -> caught
- * loc-less; EnterNative re-raises (loc from the side table). */
+ * as an LValue* (like Subscript::do_eval, for COW identity). Throws -> conveyed
+ * WITH the op's own (baked) caret -> op_fully_native (deletable). */
 extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
                              LValue *dst) noexcept
 {
@@ -2209,8 +2230,8 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
  * self-slice a=a[i:j]) reads the old base first - matching the tree-walker. Only
  * TypeErrorEx (a non-int bound / non-sliceable base) is thrown (slices CLAMP
  * out-of-range indices, no OOB), and it is a RuntimeException -> caught loc-less
- * into g_vm_jit_exc + return 1, so EnterNative re-raises with the caret from the
- * loc side table. NOT op_fully_native (its caret rides the pc-keyed side table).
+ * into g_vm_jit_exc + return 1 - conveyed WITH the op's own baked caret
+ * (`lep`, the fifth register arg) -> op_fully_native (deletable).
  */
 extern "C" int jit_slice(int_type base_slot, int_type start_slot,
                          int_type end_slot, int_type dst_slot) noexcept
@@ -2304,22 +2325,39 @@ extern "C" void jit_store_capture(int_type cap_slot,
 /*
  * model-flip (nativize-ops): the native LoadGlobalV body - `frame[dst] =
  * gfuncs->slots[gslot]`. The COMMON case (the global is defined) runs native.
- * The RARE undefined case (a use-before-def read of a global) BAILS - returns 1
- * WITHOUT writing dst, and the emit exits to the op's pc so the INTERPRETER
- * re-runs LoadGlobalV, which throws UndefinedVariableEx (a plain Exception, NOT
- * a RuntimeException, so it can't ride g_vm_jit_exc; the interpreted re-run
- * throws it at the boundary with the global's NAME + the caret from the loc side
- * table - byte-identical to a non-JIT run, and semantics-preserving: undefined-
- * variable stays a non-catchable hard error). The N4 array-read bail pattern.
- * Because it bails-to-reinterpret, the interpreted original is KEPT (LoadGlobalV
- * is NOT op_fully_native). noexcept: the write can't throw (a defined slot).
+ * The RARE undefined case (a use-before-def read of a global) CONVEYS the
+ * exact interpreted throw - UndefinedVariableEx(names[gslot], caret) - via
+ * g_vm_jit_eptr (it is a PLAIN Exception with no clone(), so it can't ride
+ * g_vm_jit_exc; the M5 eptr channel rethrows it from EnterNative, and it
+ * propagates out of vm_dispatch exactly like the interpreted throw does:
+ * a non-catchable hard error either way). The caret comes from the op's
+ * baked LocEntry (`lep`) - pc-independent, so the op is op_fully_native
+ * (deletable); the pre-eptr version BAILED to a re-interpret instead,
+ * which kept the original alive. noexcept: the throw is caught and
+ * converted here; the defined-slot write can't throw.
  */
-extern "C" int jit_load_global(int_type dst, int_type gslot) noexcept
+extern "C" int jit_load_global(int_type dst_gslot,
+                               const void *lep) noexcept
 {
+    /* dst_gslot = dst (lo32) | gslot (hi32) - the same two movabs as the
+     * pre-deletability emit, so the lep costs nothing per call site. */
     ML_JIT_OP_RAN(LoadGlobalV);
+    const int_type dst = dst_gslot & 0xffffffff;
+    const int_type gslot = static_cast<int_type>(
+        static_cast<uint64_t>(dst_gslot) >> 32);
     GlobalFuncTable *g = g_current_ctx->gfuncs;
-    if (!g->defined[gslot])
-        return 1;                            /* bail -> interpreter re-throws */
+    if (!g->defined[gslot]) {
+        Loc s, en;
+        if (lep) {
+            const Chunk::LocEntry *le =
+                static_cast<const Chunk::LocEntry *>(lep);
+            s = le->start;
+            en = le->end;
+        }
+        g_vm_jit_eptr = std::make_exception_ptr(
+            UndefinedVariableEx(g->names[gslot]->val, s, en));
+        return 1;
+    }
     g_current_ctx->frame->at(dst).put(g->slots[gslot].get());
     return 0;
 }
@@ -2697,31 +2735,53 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
     return 0;
 }
 
-extern "C" int jit_dict_load(int_type dst, int_type base_slot,
-                             const EvalValue *key, int is_int) noexcept
+/* TWO ENTRY POINTS (int/float) so the scalar kind is a compile-time
+ * constant: the single-entry is_int ARG cost a movabs per call site, and
+ * folding it into lep's low bit cost an unpack per CALL (+4M Ir on
+ * 25_dict_member - measured; this form is back to the pre-deletability
+ * instruction count, the lep movabs simply replacing the is_int movabs). */
+static ML_ALWAYS_INLINE int
+jit_dict_load_body(int_type dst, int_type base_slot, const EvalValue *key,
+                   bool is_int) noexcept
 {
-#ifdef TESTS
-    g_jit_op_run[static_cast<size_t>(
-        is_int ? OpCode::DictLoadInt : OpCode::DictLoadFloat)]++;
-#endif
     EvalContext *ctx = g_current_ctx;
-    const EvalValue &base = ctx->frame->at(base_slot).get();
-    if (base.is<intrusive_ptr<DictObject>>())
-        if (const EvalValue *v = dict_present_value(
-                base.get_ref<intrusive_ptr<DictObject>>(), *key)) {
-            write_scalar_slot(ctx, dst, is_int != 0, *v);
-            return 0;
-        }
-    LValue &dlv = ctx->frame->at(base_slot);
+    /* The PRESENT-key write sits inside the try too: write_scalar_slot's
+     * get<> throws TypeErrorEx for a dyn-laundered WRONG-typed value (the
+     * inference safety net) - previously an unguarded throw in a noexcept
+     * helper == std::terminate, a latent JIT crash; now conveyed with a
+     * caret. The try is the zero-cost-EH shape (a TYPE PRE-CHECK variant
+     * measured WORSE: +2.0% Ir on 25_dict_member vs this form's +0.0%). */
     try {
+        const EvalValue &base = ctx->frame->at(base_slot).get();
+        if (base.is<intrusive_ptr<DictObject>>())
+            if (const EvalValue *v = dict_present_value(
+                    base.get_ref<intrusive_ptr<DictObject>>(), *key)) {
+                write_scalar_slot(ctx, dst, is_int, *v);
+                return 0;
+            }
+        LValue &dlv = ctx->frame->at(base_slot);
         EvalValue r = base.get_type()->subscript(EvalValue(&dlv), *key, false);
-        write_scalar_slot(ctx, dst, is_int != 0,
+        write_scalar_slot(ctx, dst, is_int,
                           r.is<LValue *>() ? r.get<LValue *>()->get() : r);
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
     return 0;
+}
+
+extern "C" int jit_dict_load_int(int_type dst, int_type base_slot,
+                                 const EvalValue *key) noexcept
+{
+    ML_JIT_OP_RAN(DictLoadInt);
+    return jit_dict_load_body(dst, base_slot, key, true);
+}
+
+extern "C" int jit_dict_load_float(int_type dst, int_type base_slot,
+                                   const EvalValue *key) noexcept
+{
+    ML_JIT_OP_RAN(DictLoadFloat);
+    return jit_dict_load_body(dst, base_slot, key, false);
 }
 
 /* The SHARED UnpackElem* body (the STRICT foreach-unpack of pairs[i] into N
@@ -3209,6 +3269,8 @@ extern "C" int jit_boxed_binop(const void *bop) noexcept
     try {
         vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
     } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -3226,6 +3288,8 @@ extern "C" int jit_boxed_cmp(const void *bop) noexcept
     try {
         vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
     } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -3243,6 +3307,8 @@ extern "C" int jit_boxed_compound(const void *bop) noexcept
     try {
         vm_num_binop(nv, boxed_operand(bo->b, ctx, sb), bo->aop);
     } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -3326,6 +3392,8 @@ extern "C" int jit_boxed_log(const void *bop) noexcept
          * before this catch existed the exception ESCAPED -> std::terminate: a
          * real JIT crash, from the "is_true never throws" assumption LogV was
          * nativized under. Re-raise like every other throwing op. */
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -3369,6 +3437,8 @@ extern "C" int jit_unary(const void *bop) noexcept
                                         * InternalErrorEx default is dead) */
         }
     } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -3751,6 +3821,19 @@ static bool
 vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
          std::unique_ptr<RuntimeException> ex)
 {
+    /* Re-raise deletability: a conveying fragment's COLD failure branch
+     * stored the op's own LocEntry here (see g_vm_jit_lep) - it wins over
+     * the pc-keyed table (the pc may be a deleted run's collapsed
+     * EnterNative). Consumed exactly once per convey. */
+    if (g_vm_jit_lep) {
+        const Chunk::LocEntry *le =
+            static_cast<const Chunk::LocEntry *>(g_vm_jit_lep);
+        g_vm_jit_lep = nullptr;
+        if (!ex->loc_start) {
+            ex->loc_start = le->start;
+            ex->loc_end = le->end;
+        }
+    }
     if (!ex->loc_start) {
         Loc s, en;
         chunk->loc_at(pc, s, en);

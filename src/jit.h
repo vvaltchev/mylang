@@ -114,6 +114,10 @@ extern "C" void jit_push_handler_grow(int_type catch_pc) noexcept;
 /* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
 class EvalContext;
 EvalContext **jit_addr_current_ctx();   /* &g_current_ctx (file-static) */
+/* Re-raise deletability: the cold-side loc handoff - a conveying fragment's
+ * failure branch stores the op's baked &chunk.locs[i] here; vm_raise
+ * consumes it (stamp-if-empty + clear), making the caret pc-independent. */
+const void **jit_addr_lep();
 ptrdiff_t jit_off_ctx_captures();       /* EvalContext::captures */
 ptrdiff_t jit_off_ctx_gfuncs();         /* EvalContext::gfuncs */
 ptrdiff_t jit_off_gft_slots();          /* GlobalFuncTable::slots */
@@ -324,7 +328,8 @@ extern "C" void jit_store_capture(int_type cap_slot,
  * interpreter re-runs LoadGlobalV + throws UndefinedVariableEx (a plain
  * Exception, not conveyable via g_vm_jit_exc). NOT op_fully_native (the
  * original is kept for the bail). gfuncs/frame via g_current_ctx. */
-extern "C" int jit_load_global(int_type dst, int_type gslot) noexcept;
+extern "C" int jit_load_global(int_type dst_gslot,
+                               const void *lep) noexcept;
 
 /* model-flip (nativize-ops): LoadLiteralObjV natively - materialize a baked
  * const array/dict/struct literal via the shared eval_literal_obj (immutable
@@ -346,8 +351,10 @@ extern "C" void jit_arr_len(LValue *slots, int_type dst,
  * Type::subscript LOC-LESS and, on throw, catches into g_vm_jit_exc + returns 1
  * (EnterNative re-raises with the loc from the side table); returns 0 on the
  * hot present-key path. `is_int` selects the DictLoadInt vs Float result. */
-extern "C" int jit_dict_load(int_type dst, int_type base_slot,
-                             const EvalValue *key, int is_int) noexcept;
+extern "C" int jit_dict_load_int(int_type dst, int_type base_slot,
+                                 const EvalValue *key) noexcept;
+extern "C" int jit_dict_load_float(int_type dst, int_type base_slot,
+                                   const EvalValue *key) noexcept;
 
 /* model-flip (nativize-ops): MakeClosureV natively - create a closure +
  * snapshot captures from the running ctx. `def` is the closure's
