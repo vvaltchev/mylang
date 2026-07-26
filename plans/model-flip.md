@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (43 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (44 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -417,7 +417,14 @@ each the interpreter's body, with the INDEX materialized cache-aware into a
 register BEFORE the call (so an N5-pinned foreach counter is read from its
 REGISTER, and the counter stays cacheable). All op_fully_native except
 LoadElemValue (it bounds-checks) - so a whole foreach body now DELETES its
-originals to one `enter.nat`. See their backlog entry for the shape traps.
+originals to one `enter.nat`. See their backlog entry for the shape traps. And
+**JumpUnlessTrueV** - the BOXED condition BRANCH, the first non-arithmetic op to
+join `op_is_branch`/`emit_branch`: `jit_is_true` evaluates the condition (a
+TRI-STATE 1/0/-1, since is_true CAN throw) and the FRAGMENT jumps. This was the
+top blocker - an un-nativized branch SPLIT the run, so a loop body holding one
+left its back edge interpreted; nativizing it made the previous batch's loads run
+on EVERY iteration (LoadElemBool 1 -> 100 for a 100-element array). It also
+exposed and FIXED a **JIT std::terminate in LogV** - see its backlog entry.
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -701,6 +708,39 @@ to do LATER, separately (don't forget these):
   (LoadElemBool bumped 1 for a 100-element array). With a branch-free body the
   same loop bumps 50/50 and 26/26. That makes **JumpUnlessTrueV the next real
   blocker for foreach loops** - it is worth more than any remaining load.
+- **JumpUnlessTrueV** (the boxed condition branch - the top blocker) — DONE
+  (2026-07-24). The FIRST non-arithmetic op to join `op_is_branch` /
+  `emit_branch`: `jit_is_true(cond_slot)` evaluates the condition and returns a
+  **TRI-STATE** (1 true / 0 false / **-1 threw**, because `is_true` is a virtual
+  Type op whose BASE throws for a value with no bool conversion - reachable with
+  a builtin laundered through `dyn`), and the FRAGMENT does the jump: `test eax`
+  + `jns` past an `exit_pc` for the throw, then `test eax` + a `jz` through
+  `emit_cond_jump_raw` (fragment-local jcc for an in-run target, exit_pc
+  otherwise). N5: the condition slot is disqualified (read from memory; it holds
+  a boxed value anyway). NOT op_fully_native (side-table caret).
+  **WHY IT WAS THE TOP BLOCKER, measured:** an un-nativized branch SPLITS the
+  run, so a loop body containing one left the back edge OUTSIDE the fragment and
+  every iteration after the first ran interpreted. The same bool-foreach loop
+  that bumped `LoadElemBool` **1 time for a 100-element array** now bumps **100**
+  (and LoadStrChar 1 -> 25); its container plan went "NOT ready - 1 island" ->
+  "READY - whole body native". So this single op unblocked the entire previous
+  batch in branchy bodies - the compounding the arc predicts.
+  **⛔ AND IT EXPOSED A REAL JIT CRASH IN LogV (fixed here).** `jit_boxed_log` is
+  `noexcept` and called `is_true()` with NO try/catch, because LogV had been
+  nativized under the comment "eager && / || (is_true), never throws" - the same
+  wrong assumption that cost MakeDictV and JumpUnlessTrueV their carets, but here
+  the escaping exception hit **std::terminate**: `if (n > 0 && x)` with an
+  unconvertible `x` CRASHED the JIT (`-nj` merely lost the caret). Fixed: the
+  helper returns a status and re-raises, the emit gained the `test eax` +
+  exit_pc, LogV left `op_fully_native`, and its loc is now recorded (the codegen
+  already attached the `&&` node - extract_locs was dropping it). Both VM engines
+  now caret the &&-expression; the tree-walker carets the offending OPERAND, a
+  residual VM-vs-tw difference of the same kind already documented for UnaryV, so
+  the regression test pins the TYPE only.
+  **THE STANDING LESSON, now three-for-three:** every "never throws" comment on
+  an op that calls a VIRTUAL Type op (is_true / hash / to_string / a coerce) must
+  be checked against that op's BASE implementation, which throws. Two cost a
+  caret; one cost a crash.
 - **Halt** (83, the biggest blocker) — DONE (2026-07-23). A fall-through body's
   implicit `return none` runs in the fragment via `jit_halt` - EXACTLY ReturnV's
   jit_ret with the result hard-wired to none (no slot): IN-VM frame ->
