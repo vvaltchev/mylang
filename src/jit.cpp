@@ -2015,8 +2015,17 @@ static void emit_put_scalar_call(Emitter &e, const void *fn, int slot)
  * (the fast path), int -> cvtsi2sd (promote), anything else (bool/str)
  * -> BAIL (the interpreter re-runs the op; rare in a float loop). r8
  * holds t_float, rsi holds t_int (both set once at fragment entry). */
+/* `no_bail`: the 2-way form (float -> movsd, ELSE -> cvtsi2sd) for an op
+ * that must be exit-free (deletability). Sound for every state the release
+ * interpreter accepts: read_float_slot promotes int AND bool (a bool
+ * payload is 0/1 fully zero-extended, so cvtsi2sd yields the same 1.0/0.0)
+ * and ML_VM_CHECKs anything else - a state inference already excludes, so
+ * the raw convert matches the release interpreter's own trust of the
+ * proven tag. The default 3-way form keeps the bail for ops whose
+ * originals survive. */
 static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
-                            float_type flit, int slot, uint32_t bail_pc)
+                            float_type flit, int slot, uint32_t bail_pc,
+                            bool no_bail = false)
 {
     if (is_lit) {
         uint64_t bits;
@@ -2032,10 +2041,12 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
     e.fload(xr, a.payload);               /* FAST: movsd xmm, [payload] */
     const size_t j_done1 = e.j8(0xEB);    /* jmp done */
     e.patch8(j_notf, e.pos());
-    e.cmp_rax_rsi();                      /* == t_int ? */
-    const size_t j_int = e.j8(0x74);      /* je -> promote */
-    e.exit_pc(bail_pc);                   /* neither -> bail */
-    e.patch8(j_int, e.pos());
+    if (!no_bail) {
+        e.cmp_rax_rsi();                  /* == t_int ? */
+        const size_t j_int = e.j8(0x74);  /* je -> promote */
+        e.exit_pc(bail_pc);               /* neither -> bail */
+        e.patch8(j_int, e.pos());
+    }
     e.cvt(xr, a.payload);                 /* cvtsi2sd xmm, [payload] */
     e.patch8(j_done1, e.pos());
 }
@@ -2332,7 +2343,11 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
      * everywhere in the float tier - the value is proven numeric, so it
      * won't in practice) */
     if (is_float)
-        emit_float_load(e, X0, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
+        /* no_bail: the value is compile-proven float (int/bool promote in
+         * the 2-way form exactly as read_float_slot does) - the store op's
+         * ONLY exit was this load's bail, which kept it non-deletable. */
+        emit_float_load(e, X0, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+                        /*no_bail=*/true);
     else
         load_operand(e, RDX, in.b_is_lit(), in.b_lit(), in.b_slot());
 
@@ -3630,6 +3645,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (in.op == OpCode::LoadElemValue) {
             e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* cold: the OOB caret (the
+                                               * InternalErrorEx net rides
+                                               * eptr, loc-less both ways) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -4608,7 +4626,8 @@ static bool op_never_exits(const Instr &in)
     case OpCode::CmpIntV:           /* int compare -> bool; cannot fault */
     /* the foreach loads: the index is loop-bounded by the ArrLen/StrLen that
      * produced it and the base kind is proven, so none of these can throw or
-     * bail (LoadElemValue, which bounds-checks, is deliberately NOT here). */
+     * bail (LoadElemValue bounds-checks, so it lives in op_fully_native's
+     * convey family instead - it exits, but only by conveying). */
     case OpCode::LoadElemBool:
     case OpCode::StrLen:
     case OpCode::LoadStrChar:
@@ -4700,13 +4719,19 @@ static bool op_fully_native(const Instr &in)
         return in.target != 1;
     case OpCode::IncDecChainV:
         return in.a_lit() != 1;
+    /* LoadElemValue (the general/str-array element read incl. 2-D
+     * `a[i][k]`): the OOB conveys (exc-stamped caret) and the
+     * unreachable-by-inference non-array/wrong-kind tail conveys the
+     * interpreted InternalErrorEx via eptr - no bail left. */
+    case OpCode::LoadElemValue:
+        return true;
     /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
-     * DictStore / StoreElem2V: convey-only helpers, cold-side lep caret.
-     * StoreElemFloat is EXCLUDED: its emitted VALUE load (emit_float_load)
-     * can structurally BAIL on a non-numeric tag - unreachable when
-     * inference is right, but a bail in a deleted run re-runs the fragment
-     * head (the double-execution hazard), so the original stays. */
+     * DictStore / StoreElem2V: convey-only helpers, cold-side caret.
+     * StoreElemFloat joined once its emitted VALUE load moved to the
+     * no-bail 2-way form (float -> movsd, else -> cvtsi2sd - the release
+     * interpreter's exact int/bool promotion), removing its only exit. */
     case OpCode::StoreElemInt:
+    case OpCode::StoreElemFloat:
     case OpCode::DictStore:
     case OpCode::StoreElem2V:
         return true;
