@@ -386,6 +386,19 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
  *    g_vm_jit_exc + return 1 (loc side table), else 0.
  *  - jit_foreach_dyn_next: 1 = bound, 0 = end, -1 = THREW (the strict N-var
  *    unpack's TypeErrorEx via g_vm_jit_exc, loc side table). */
+/* model-flip (nativize-ops): the StructFieldAddInt READ half (the #9 fusion
+ * `dst = other + a[i].f`) - vm_struct_field_int, proven no-fault; the add +
+ * dst write run in the fragment. And the EmplaceStruct body -
+ * append(struct_arr, Ctor(args)): arg0 by kind (0 local / 1 global, nullptr
+ * when undefined / 2 capture), the shared vm_do_emplace, dst written; a
+ * throw -> g_vm_jit_exc + return 1. `site` = a baked
+ * &chunk.emplace_sites[idx]. */
+extern "C" int_type jit_struct_field_add_int(int_type base_slot, int_type idx,
+                                             int_type fidx) noexcept;
+extern "C" int jit_emplace_struct(int_type dst, int_type base_slot,
+                                  int_type kind, const void *site,
+                                  int_type run_base) noexcept;
+
 /* model-flip (nativize-ops): LoadMemberInt/Float natively - the H1 typed
  * standalone struct-member read `p.x` (POD byte fast path; boxed/dict/const
  * fallback via member_read_core). `mk` = a baked &chunk.member_keys[idx]; a

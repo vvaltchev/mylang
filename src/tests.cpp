@@ -723,6 +723,34 @@ static const std::vector<test> tests =
     },
 
     {
+        /* a NEGATIVE index in a native element read WRAPS (idx += size),
+         * exactly like the interpreter - the JIT used to raise OOB for
+         * a[-1] where both interpreters returned the wrapped element (a
+         * real divergence, found while nativizing ForStepElemInt); a
+         * doubly-negative index still throws OOB. Int AND float paths. */
+        "jit: negative array index wraps in a native read",
+        {
+            "func f(array<int> a, int i) {",
+            "  var s = 0;",
+            "  for (var k = 0; k < 3; k++) s += a[i];",
+            "  return s;",
+            "}",
+            "func g(array<float> a, int i) {",
+            "  var s = 0.0;",
+            "  for (var k = 0; k < 2; k++) s += a[i];",
+            "  return s;",
+            "}",
+            "assert(f(runtime([10, 20, 30]), runtime(-1)) == 90);",
+            "assert(f(runtime([10, 20, 30]), runtime(-3)) == 30);",
+            "assert(g(runtime([1.5, 2.5]), runtime(-2)) == 3.0);",
+            "var caught = 0;",
+            "try { f(runtime([1, 2]), runtime(-5)); }",
+            "catch (OutOfBoundsEx) { caught = 1; }",
+            "assert(caught == 1);",
+        },
+    },
+
+    {
         /* NATIVE AOT N3 (plans/native-aot.md): float ordering compares
          * over a NaN must all be FALSE (IEEE) on the VM+JIT exactly as
          * on the tree-walker - the ucomisd swap trick avoids the NaN
@@ -15463,6 +15491,44 @@ static bool jit_op_nativized()
             "assert(f(9.0, runtime(0.0)) == 77.0);",
             "assert(f(9.0, runtime(-0.0)) == 77.0);",
             "assert(f(9.0, runtime(4.5)) == 2.0);" } },
+        /* StructFieldAddInt: the #9 struct-reduction fusion - fires on the
+         * FOREACH-over-flat-struct-array chain `s = (s + p.x + p.y) % k`
+         * (the fused base/index are the foreach snapshot + counter; a
+         * hand-written `for i: s = s + a[i].x` lowers boxed instead - the
+         * shape trap, caught by the counter). The read runs via the helper,
+         * the add + write in the fragment. */
+        { OpCode::StructFieldAddInt, {
+            "struct FS { int x; int y; }",
+            "func f(array<FS> a) {",
+            "  var s = 0;",
+            "  foreach (var p in a) s = (s + p.x + p.y) % 1000;",
+            "  return s;",
+            "}",
+            "assert(f(runtime([FS(1, 9), FS(2, 9), FS(3, 9)])) == 33);" } },
+        /* ForStepElemInt: the #9 back-edge `a[i]` load fused into the step.
+         * SHAPE: a foreach whose body is the checksum `s = (s + x) % k`
+         * (IntAddModRI) - a plain `s += a[i]` is claimed by the IntAddStep
+         * fusion instead and never emits this op (the shape trap, caught by
+         * the counter). */
+        { OpCode::ForStepElemInt, {
+            "func f(array<int> a) {",
+            "  var s = 0;",
+            "  foreach (var x in a) s = (s + x) % 1000000007;",
+            "  return s;",
+            "}",
+            "assert(f(runtime([10, 20, 30, 40])) == 100);" } },
+        /* EmplaceStruct: append(struct_arr, Ctor(args)) - construct-in-place
+         * into the flat array's bytes. */
+        { OpCode::EmplaceStruct, {
+            "struct ES { int x; int y; }",
+            "func f(int n) {",
+            "  var a = [ES(0, 0)];",
+            "  for (var i = 1; i < n; i++) append(a, ES(i, i * 2));",
+            "  var s = 0;",
+            "  for (var i = 0; i < len(a); i++) s = s + a[i].y;",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 20);" } },
         /* The iterator THROW paths, script-caught: a non-container init and a
          * strict-unpack next each ride g_vm_jit_exc out of the fragment and
          * dispatch to the same-frame handler. */
