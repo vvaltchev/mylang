@@ -14923,6 +14923,19 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(5)) == 25);" } },
+        /* LoadCaptureV: a closure reads its captured value each iteration. The
+         * `base` capture is loaded (LoadCaptureV) then boxed-added per iter, so
+         * the loop fragments and the capture read runs native. */
+        { OpCode::LoadCaptureV, {
+            "func mk(dyn base) {",
+            "  return func [base] (int n) {",
+            "    var dyn s = 0;",
+            "    for (var i = 0; i < n; i++) s = s + base;",
+            "    return s;",
+            "  };",
+            "}",
+            "var f = mk(runtime(7));",
+            "assert(f(runtime(5)) == 35);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

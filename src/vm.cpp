@@ -1854,6 +1854,18 @@ extern "C" void jit_load_builtin(LValue *slots, int_type dst,
     slots[dst].put(builtin_slot(static_cast<int>(idx)).get());
 }
 
+/* model-flip (nativize-ops): the native LoadCaptureV body - the interpreter's
+ * exact `frame[dst] = (*ctx->captures)[idx]`. A capture is snapshot into the
+ * closure's capture_slots at creation, so it is always defined and the read
+ * never throws. Uses g_current_ctx (the running closure's ctx - captures +
+ * frame), like jit_make_closure. */
+extern "C" void jit_load_capture(int_type dst, int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadCaptureV);
+    g_current_ctx->frame->at(dst).put(
+        (*g_current_ctx->captures)[idx].get());
+}
+
 /* model-flip (nativize-ops): the native LoadConstV body - the interpreter's
  * exact `slots[dst] = chunk->consts[idx]` (a value copy; never throws). `src`
  * points into the const-pool buffer (baked by the emitter). */
