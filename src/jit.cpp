@@ -925,18 +925,25 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::CallBuiltinLVMember:
         return true;
     /* GENERIC IntBin (the residual after specialize_arith_ops - a lit-first
-     * NON-commutative op like `0 - i` that has no imm-reg specialized shape, or
-     * any op the specializer doesn't cover): JIT-eligible ONLY for the
-     * NON-THROWING arms (plus/minus/times/band/bor/bxor). div/mod (div0) and the
-     * shift arms (a reg/negative count throws) stay interpreted. Unlike the
-     * RR/RI forms, both operands may be slot OR imm (that's why `0 - i` is
-     * generic - operand a is the imm), so the emit uses load_operand on both. */
+     * NON-commutative op like `0 - i` that has no imm-reg specialized shape,
+     * div/mod-by-reg which have no specialized shape at all, `>>>`, or any op
+     * the specializer doesn't cover). ALL arms are now eligible: the
+     * non-throwing ones (plus/minus/times/band/bor/bxor) emit as before;
+     * div/mod emit a zero-check that RAISES DivisionByZeroEx (JR_DIV0, the
+     * jit_raise path - caret from the loc side table, byte-identical to the
+     * interpreted throw) then cqo+idiv; the shift arms reuse the reg-count
+     * shift core (negative count -> JR_NEG_SHIFT raise, >= 64 saturates).
+     * Unlike the RR/RI forms, both operands may be slot OR imm (that's why
+     * `0 - i` is generic - operand a is the imm), so the emit uses
+     * load_operand on both. Only the non-throwing arms are op_fully_native. */
     case OpCode::IntBin:
         switch (in.aop) {
         case Op::plus: case Op::minus: case Op::times:
         case Op::band: case Op::bor:  case Op::bxor:
+        case Op::div:  case Op::mod:
+        case Op::shl:  case Op::shr:  case Op::ushr:
             return true;
-        default:                       /* div/mod/shl/shr/ushr can throw */
+        default:
             return false;
         }
     case OpCode::IntShlRI: case OpCode::IntShrRI:
@@ -1674,6 +1681,41 @@ static void raise_unless(Emitter &e, uint8_t pass_cond, int kind, uint32_t pc)
     e.patch8(sk, e.pos());
 }
 
+/* The shared REG-COUNT shift core (rax = value, rcx = count): a negative
+ * count RAISES InvalidValueEx (JR_NEG_SHIFT), a count >= 64 SATURATES (0 for
+ * shl/ushr, a full sign-fill for the arithmetic shr), else the machine shift
+ * by cl - exactly bit_shl/bit_shr/bit_ushr (bitops.h). Used by the IntShlRR/
+ * IntShrRR reg branch AND the generic-IntBin shift arms, so the two cannot
+ * drift. Result in rax. */
+static void emit_reg_shift(Emitter &e, Op aop, uint32_t pc)
+{
+    /* D3 /4 shl, /7 sar (signed shr), /5 shr (ushr); C1 imm forms same /r */
+    const uint8_t modrm = aop == Op::shl ? 0xE0
+                        : aop == Op::shr ? 0xF8 : 0xE8;
+    /* test rcx,rcx; js Lraise (negative count throws) */
+    e.u8(0x48); e.u8(0x85); e.u8(0xC9);
+    e.u8(0x0F); e.u8(0x88);
+    const size_t js = e.pos(); e.u32(0);
+    /* cmp rcx,64; jl Lnorm */
+    e.u8(0x48); e.u8(0x83); e.u8(0xF9); e.u8(64);
+    e.u8(0x0F); e.u8(0x8C);
+    const size_t jl = e.pos(); e.u32(0);
+    if (aop == Op::shr) {
+        e.u8(0x48); e.u8(0xC1); e.u8(0xF8); e.u8(63);    /* sar rax,63 */
+    } else {
+        e.u8(0x31); e.u8(0xC0);                          /* xor eax,eax */
+    }
+    e.u8(0xE9);
+    const size_t jdone = e.pos(); e.u32(0);
+    e.patch32(js, static_cast<uint32_t>(e.pos() - (js + 4)));
+    emit_raise(e, JR_NEG_SHIFT, pc);                     /* negative count:
+                                                          * RAISE InvalidValue
+                                                          * (no re-interpret) */
+    e.patch32(jl, static_cast<uint32_t>(e.pos() - (jl + 4)));
+    e.u8(0x48); e.u8(0xD3); e.u8(modrm);                 /* shl/sar/shr rax,cl */
+    e.patch32(jdone, static_cast<uint32_t>(e.pos() - (jdone + 4)));
+}
+
 /* Approach A: a flat-array element STORE `a[i] = v` / `a[i] OP= v` as a CALL
  * to jit_store_elem_int/float (the interpreter's exact store body - COW /
  * bounds / universal fallback), keeping the surrounding loop native rather
@@ -1847,14 +1889,48 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::IntBin:
-        /* generic NON-THROWING IntBin (the aop was gated to plus/minus/times/
-         * band/bor/bxor by jit_op_eligible). UNLIKE the RR/RI forms above, BOTH
-         * operands may be slot OR imm (that's exactly why `0 - i` stays generic
-         * - operand a is the imm), so load_operand on both (cache-aware for a
-         * slot). op_rr emits `rax OP= rcx`. Never throws -> op_fully_native. */
+        /* generic IntBin - ALL arms (jit_op_eligible admits exactly the aops
+         * the interpreter's switch handles). UNLIKE the RR/RI forms, BOTH
+         * operands may be slot OR imm (that's exactly why `0 - i` stays
+         * generic - operand a is the imm), so load_operand on both
+         * (cache-aware for a slot). The non-throwing arms are a bare op_rr;
+         * div/mod check the divisor and RAISE DivisionByZeroEx (JR_DIV0 -
+         * caret from the loc side table at this pc, byte-identical to the
+         * interpreted throw) then cqo+idiv (an INT64_MIN/-1 divisor traps in
+         * idiv - EXACTLY the interpreter's own UB, see TypeInt::div); the
+         * shift arms share emit_reg_shift with the RR forms (negative count
+         * -> JR_NEG_SHIFT raise, >= 64 saturates - the bit_shl/bit_shr/
+         * bit_ushr semantics). Only the non-throwing arms are
+         * op_fully_native. */
+        switch (in.aop) {
+        case Op::div: case Op::mod: case Op::shl: case Op::shr: case Op::ushr:
+            /* execution proof - BEFORE the operand loads: bump_op emits
+             * `movabs rax, <counter>; inc [rax]`, i.e. it CLOBBERS rax (a
+             * counter inc after load_operand wiped the dividend - a wrong
+             * 16/3, caught by the differential + read in -vdj). */
+            e.bump_op(OpCode::IntBin);
+            break;
+        default:
+            break;
+        }
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
-        op_rr(e, in.aop);
+        switch (in.aop) {
+        case Op::div: case Op::mod:
+            /* test rcx,rcx; raise DIV0 unless nonzero */
+            e.u8(0x48); e.u8(0x85); e.u8(0xC9);
+            raise_unless(e, 0x75 /* jnz */, JR_DIV0, pc);
+            e.u8(0x48); e.u8(0x99);              /* cqo */
+            e.u8(0x48); e.u8(0xF7); e.u8(0xF9);  /* idiv rcx */
+            write_slot(e, ck, in.aop == Op::div ? RAX : RDX, in.target, pc);
+            return true;
+        case Op::shl: case Op::shr: case Op::ushr:
+            emit_reg_shift(e, in.aop, pc);
+            break;
+        default:
+            op_rr(e, in.aop);
+            break;
+        }
         write_slot(e, ck, RAX, in.target, pc);
         return true;
 
@@ -1882,29 +1958,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             read_slot(e, RCX, in.b_slot());   /* cache-aware (the classifier
                                                * counts this shift count as a
                                                * cacheable int use) */
-            /* test rcx,rcx; js bail (negative count throws) */
-            e.u8(0x48); e.u8(0x85); e.u8(0xC9);
-            e.u8(0x0F); e.u8(0x88);
-            const size_t js = e.pos(); e.u32(0);
-            /* cmp rcx,64; jl Lnorm */
-            e.u8(0x48); e.u8(0x83); e.u8(0xF9); e.u8(64);
-            e.u8(0x0F); e.u8(0x8C);
-            const size_t jl = e.pos(); e.u32(0);
-            if (shl) {
-                e.u8(0x31); e.u8(0xC0);                  /* xor eax,eax */
-            } else {
-                e.u8(0x48); e.u8(0xC1); e.u8(0xF8); e.u8(63);
-            }
-            e.u8(0xE9);
-            const size_t jdone = e.pos(); e.u32(0);
-            e.patch32(js, static_cast<uint32_t>(e.pos() - (js + 4)));
-            emit_raise(e, JR_NEG_SHIFT, pc);             /* negative count:
-                                                          * RAISE InvalidValue
-                                                          * (no re-interpret) */
-            e.patch32(jl, static_cast<uint32_t>(e.pos() - (jl + 4)));
-            e.u8(0x48); e.u8(0xD3);
-            e.u8(shl ? 0xE0 : 0xF8);                     /* shl/sar rax,cl */
-            e.patch32(jdone, static_cast<uint32_t>(e.pos() - (jdone + 4)));
+            emit_reg_shift(e, shl ? Op::shl : Op::shr, pc);
         }
         write_slot(e, ck, RAX, in.target, pc);
         return true;
@@ -3163,17 +3217,27 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
 static bool op_fully_native(const Instr &in)
 {
     switch (in.op) {
+    /* generic IntBin: the NON-THROWING arms never return an interior pc ->
+     * deletable. The div/mod/shift arms RAISE (JR_DIV0/JR_NEG_SHIFT) with a
+     * caret from the pc-keyed loc side table, so their originals must stay
+     * (a deleted run collapses every pc onto the EnterNative - the caret
+     * would be wrong), exactly like the reg-shift RR forms. (Own case, NOT
+     * part of the fall-through chain below - the nested switch would
+     * swallow the chain's earlier labels.) */
+    case OpCode::IntBin:
+        switch (in.aop) {
+        case Op::plus: case Op::minus: case Op::times:
+        case Op::band: case Op::bor:  case Op::bxor:
+            return true;
+        default:                       /* div/mod/shl/shr/ushr raise */
+            return false;
+        }
     case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
     case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
     case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
     case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
     case OpCode::IntShlRI: case OpCode::IntShrRI:
     case OpCode::IntModRI: case OpCode::IntAddModRI:
-    /* generic IntBin: only the NON-THROWING arms are jit_op_eligible (the gate
-     * gates div/mod/shifts out of runs), so an IntBin reaching a run never
-     * throws -> never returns an interior pc -> deletable. op_fully_native takes
-     * only the opcode, but the eligibility gate is what makes this sound. */
-    case OpCode::IntBin:
     case OpCode::LoadImmInt: case OpCode::Jump:
     case OpCode::JumpUnlessIntCmp: case OpCode::ForLoopStep:
     case OpCode::IntAddStep:

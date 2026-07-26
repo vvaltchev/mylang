@@ -508,12 +508,79 @@ container commits but is dead) - `assert(lc("hi",5)==...)` folded to
 `assert(true)`, CC stayed 0. The vm_exec_block MECHANISM is also independently
 unit-tested (vm_exec_block_selftest).
 
-**Remaining top blockers (bench tally):** CallBuiltinV (~294) is now DONE (see
-above + the deferred backlog). Next: Halt (83 - a void-function end; needs the
-return-none path, and the native_leaf predicate wants a trailing ReturnV so a
-Halt-ending body needs thought). The simple scalar islands are EXHAUSTED -
-SliceV / LoadGlobalV / the container stores / the LVALUE builtins (CallBuiltinLV)
-are the remaining boxed ops, each a bigger step. GOTCHA: an op needing a CHUNK pool
+**THE NATIVIZATION ROADMAP (maintainer-approved 2026-07-25, "I wanna do all of
+that").** The fresh island tally over ALL benches (`-vd` container plans,
+post-iterator-ops) and the agreed order. Discipline per step: read `-vdj`
+FIRST (does the disassembly match expectations?), prove execution with the
+per-op counter, measure with CALLGRIND instruction counts (wall-clock is not
+the criterion), stop and ask on anything very surprising.
+
+Tally: IntBin(throwing arms) 16, CallV 13, CachedCallV 12, exception family
+~15 (PushHandler 8, CatchTest/Reraise 4, Throw 3, PopHandler/SetPend/
+EndFinally), FloatBin(div) 5, CallValueV 4, LoadMemberInt/Float 3,
+StructFieldAddInt 2, ForStepElemInt 2, EmplaceStruct 2, IncDecCheckedV 2,
+DeclConstV 2, CheckFuncV+MapFilterV 2, UnpackElem* 2, MultiUnpackV 1.
+
+The order:
+1. **Throwing IntBin arms** (div/mod/reg-shift-by-generic, 16) - **DONE
+   (2026-07-25).** div/mod emit inline `test rcx; raise_unless(JR_DIV0);
+   cqo; idiv` (quotient RAX / remainder RDX); the shift arms share the
+   NEW `emit_reg_shift` core with the IntShlRR/IntShrRR reg branch
+   (negative -> JR_NEG_SHIFT, >= 64 saturates, D3 /4 shl, /7 sar,
+   /5 shr for `>>>`), so the two cannot drift. JR_DIV0 joined
+   JitRaiseKind; op_fully_native gates IntBin on aop (raise arms keep
+   their originals - side-table caret; NOTE the nested aop switch must be
+   its OWN case, not mid-fall-through-chain). INT64_MIN/-1 traps in idiv
+   = EXACTLY the interpreter's pre-existing UB (UBSan-abort/SIGFPE both
+   engines - a language wart to raise with the maintainer separately;
+   IntModRI's "-fwrapv defines it" comment is wrong). ⛔ NEW EMIT GOTCHA:
+   **`e.bump_op()` CLOBBERS RAX** (movabs rax, <counter>; inc [rax]) -
+   it must be emitted BEFORE the operand loads; placing it after
+   load_operand wiped the dividend (a wrong 16/3 the differential caught,
+   root-caused in one -vdj read). Edge semantics verified byte-identical
+   jit/nj/tw (trunc div, sat shifts 63/64/100, catchable div0/negshift,
+   uncaught div0 caret). MEASURED (callgrind Ir, matched releases): the
+   one div/mod island was SPLITTING whole hot loops - 53_collatz
+   **0.194x**, 61_popcount **0.181x**, 59_bit_hash 0.276x,
+   44_primes_sqrt 0.297x, 03_int_arith 0.310x, 60_bit_sieve 0.498x,
+   45_gcd 0.631x; controls 1.0000. (collatz's plan: "NOT ready - 1
+   island: IntBin" -> "READY - whole body native".)
+2. **FloatBin div** (5) - float div-by-zero throws; same raise pattern.
+3. **LoadMemberInt/Float** (3) - typed POD member reads, the same inline
+   shape as the done LoadStructFieldInt/Float pair.
+4. **The 65_struct_field_sum trio** - StructFieldAddInt + ForStepElemInt
+   (inline fusion emits, the IntAddStep precedent) + EmplaceStruct (a
+   helper, the AppendV precedent). That bench's whole hot loop goes native.
+5. **Tail singles**: UnpackElemInt/Float/Value/Targets + MultiUnpackV (the
+   ForeachDyn bodies are 90% of the work), IncDecCheckedV/ElemChecked/
+   MemberChecked/ChainV, DeclConstV (also the container test's current
+   island - it will hop again), DefinedGlobalV, ThrowRuntimeV, CmpFloatV,
+   JumpIfNotNoneV (trivial branch; 0 bench occurrences).
+6. **DE-HELPERIZE the trivial-value ops** (perf-parity today, but the road
+   to REMOVING ALL HELPERS): MoveV / LoadConstV / LoadCaptureV /
+   LoadBuiltinV / plain StoreGlobalV / StoreCaptureV currently CALL a
+   helper per execution (LoadConstV runs 200k/hot in 47_wordcount). Inline
+   the TRIVIAL-type path (type < t_str: the two-store, exactly the
+   LoadElemBool/store_dst pattern) and keep the helper only for a
+   REFERENCE value (release/retain needs C++) - decided per-slot at
+   compile time via ref_slots where possible, else a runtime type-tag
+   branch. Also CmpIntV's ref-listed bool store (jit_put_bool) fits here.
+7. **The exception family** (~15: PushHandler/PopHandler/CatchTest/Throw/
+   Reraise/SetPend/EndFinally) - a design step (handler-stack ops touch
+   the record state).
+8. **Calls - M5** (CallV/CachedCallV/CallValueV, 29 combined, the largest
+   class): native calls to EVERY function (checked-return unwind +
+   growable native stack; today only native_leaf callees from function
+   callers).
+Plus the standing structural item: per-op loc conveyance so the side-table
+re-raise ops (SubscriptV/DictLoad/boxed-arith/...) become DELETABLE (their
+carets currently collide on the EnterNative pc when a run is deleted).
+
+(Historical note - the older tally below predates the iterator ops.)
+CallBuiltinV (~294) is DONE (see
+above + the deferred backlog); Halt (83) is DONE. The simple scalar islands are
+EXHAUSTED - SliceV / LoadGlobalV / the container stores / the LVALUE builtins
+(CallBuiltinLV) are all DONE too. GOTCHA: an op needing a CHUNK pool
 (LoadConstV/MemberV/LoadLiteralObjV/DictLoad-key/boxed-arith) can't bake
 `&chunk` (it dangles - the chunk is stack-built then moved) but CAN bake the
 pool's heap BUFFER address (`&vec[idx]`), which a vector move preserves
