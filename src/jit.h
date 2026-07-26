@@ -311,6 +311,12 @@ extern unsigned long g_jit_op_run[];
  * throw-free, so the pop/leave here cannot throw. */
 extern "C" size_t jit_ret(int_type res_slot) noexcept;
 
+/* model-flip (nativize-ops): the native Halt - a fall-through body's implicit
+ * `return none`. Like jit_ret but the result is hard-wired to none (no slot).
+ * IN-VM: vm_frame_leave (parent dst = none) -> JIT_RET_SENTINEL. BOUNDARY: bare
+ * JIT_RET_BOUNDARY (flow untouched - a fall-through body's flow is none). */
+extern "C" size_t jit_halt() noexcept;
+
 /*
  * model-flip M3 (plans/model-flip.md): the native CONTAINER's ISLAND call. A
  * container fragment, at an interpreted island, `call`s this with its OWN

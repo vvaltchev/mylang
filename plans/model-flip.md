@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (18 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (19 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -361,7 +361,11 @@ fixed in codegen.cpp, its own commit + regression test) - the standing "verify
 native EXECUTION with hard evidence" rule paying off: the differential missed it
 (the harness JIT-fragmented the shape correctly while the interpreter path was
 buggy), only the per-op nativized test (which runs the CLI-equivalent path)
-exposed it.
+exposed it. And **Halt** (`jit_halt` - a fall-through body's implicit `return
+none`, = ReturnV's jit_ret with a none result; op_fully_native; the biggest
+single blocker at 83 island occurrences) - see its backlog entry for the
+in-VM/boundary paths + why "native_leaf needs a trailing ReturnV" was a
+non-issue.
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -483,11 +487,23 @@ to do LATER, separately (don't forget these):
   CallBuiltinV; when nativized, `CannotChangeConstEx` (const mutation) becomes
   reachable → apply the SAME "make it a RuntimeException" fix as
   InvalidArgumentEx/InvalidNumberOfArgsEx.
-- **Halt** (83) — a void-function end; needs the return-none path, and the
-  native_leaf predicate wants a trailing ReturnV, so a Halt-ending body needs
-  thought.
+- **Halt** (83, the biggest blocker) — DONE (2026-07-23). A fall-through body's
+  implicit `return none` runs in the fragment via `jit_halt` - EXACTLY ReturnV's
+  jit_ret with the result hard-wired to none (no slot): IN-VM frame ->
+  vm_frame_leave (parent dst = none) -> JIT_RET_SENTINEL; BOUNDARY frame (main /
+  a callback) -> bare JIT_RET_BOUNDARY (flow untouched - a fall-through body's
+  flow is none, unlike ReturnV's boundary which sets flow=ret). op_fully_native
+  (rets a sentinel, never an interior pc -> deletable), no slots in
+  pick_cached_slots (like Jump). The "native_leaf needs a trailing ReturnV"
+  concern was a non-issue: a Halt-ending body is simply NOT a native_leaf (not
+  native-CALLABLE), but its OWN fragment still runs the Halt natively. VERIFIED
+  (jit_op_nativized Halt case - a void func's whole body deletes to one
+  enter.nat; both paths exercised: f's Halt boundary=0 IN-VM returns none to the
+  caller, main's Halt boundary=1 ends the program).
 - **SliceV / LoadGlobalV / the remaining container stores** — the other boxed
-  ops still splitting runs.
+  ops still splitting runs. (LoadGlobalV needs UndefinedVariableEx ->
+  RuntimeException - a language decision like the CallBuiltinV #1 exceptions -
+  AND is 0x in benches, so low priority.)
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);

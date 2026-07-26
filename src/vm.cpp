@@ -2661,6 +2661,28 @@ extern "C" size_t jit_ret(int_type res_slot) noexcept
     return JIT_RET_SENTINEL;
 }
 
+/*
+ * model-flip (nativize-ops): the native Halt - a fall-through body's implicit
+ * `return none`. The interpreted analog (VM_CASE(Halt)) with the result value
+ * hard-wired to none (no result slot). IN-VM frame: vm_frame_leave writes the
+ * parent's dst = none + sets the resume globals -> JIT_RET_SENTINEL (EnterNative
+ * switches to the parent). BOUNDARY frame (main / a callback callee): just
+ * return the boundary sentinel WITHOUT touching flow - the interpreted Halt
+ * boundary path is a bare `return` (a fall-through body left flow == none, so
+ * the caller reads none), NOT the ReturnV boundary path (which sets flow=ret).
+ * noexcept: nothing here throws.
+ */
+extern "C" size_t jit_halt() noexcept
+{
+    ML_JIT_OP_RAN(Halt);
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    if (act.back_rec().boundary)
+        return JIT_RET_BOUNDARY;             /* flow stays none -> caller none */
+    vm_frame_leave(act, ctx, EvalValue());   /* return none to the parent */
+    return JIT_RET_SENTINEL;
+}
+
 /* #55 STEP 2.1: native CallVs set up process-wide (coverage - see jit.h). */
 unsigned long g_jit_native_calls = 0;
 
