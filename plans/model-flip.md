@@ -858,6 +858,43 @@ pc - ambiguous flush). Families to convert: SubscriptV, DictLoadInt/
 Float, BinOpV/CmpV/CompoundV/UnaryV, CoerceNumV, MemberV, SliceV,
 LoadGlobalV (undefined-name throw), the IncDec family, the store family.
 
+**INCREMENT 1 LANDED (ef536b7, 2026-07-25)** - the read/arith family:
+BinOpV/CmpV/LogV/UnaryV/CompoundV (the BoxedOp pool gains start/end,
+stamped in the helpers' catch - the pool ptr is hot-live, zero tax),
+SubscriptV/SliceV/DictLoad*/CoerceNumV (loc-less helpers + the COLD-side
+`g_vm_jit_lep` handoff: the emit stores the baked &chunk.locs[i] on the
+FAILURE branch only, vm_raise consumes it stamp-if-empty + clear),
+MemberV (already pool-stamped - free), LoadGlobalV (bail -> eptr
+conveyance of the exact UndefinedVariableEx; dst|gslot packed into one
+arg so the lep arg is emit-neutral). MEASURED DEAD ENDS (all rejected):
+a helper ARG for the lep = +4 Ir/call (live across the try -> an extra
+callee-saved spill; 62_dict_word_count +0.6%); a lep|flag TAG unpack =
++2 Ir/call; a dict-load type PRE-CHECK instead of the try = +2.0% on
+25_dict_member (the try is the zero-cost-EH shape). DictLoad split into
+_int/_float entry points (kills the old per-site is_int movabs):
+25_dict_member **0.984x**, everything else neutral, deletions verified
+(a boxed `s = s + a[i]` loop -> a bare enter.nat, caret err-loc-pinned).
+bench/ surviving convey-family ops 122 -> 92; the rest sit in runs with
+non-fully-native neighbors (the store family, JumpUnlessTrueV, calls).
+
+**THE SPLIT PREDICATE (a real bug found + fixed):** native_leaf now
+requires **op_never_exits** (exit-FREE), not op_fully_native: the #55
+direct call IGNORES the callee fragment's return value, so a conveying
+throw inside a leaf was DROPPED with the callee frame left pushed - a
+PRE-EXISTING hang (CallBuiltinV was already on the old combined list;
+`-ni` + a non-inlined `len(dyn)` callee printed a stale dst and hung).
+Pinned by jit_leaf_never_exits. The delete gate also excludes
+raise-capable runs carrying inline_ctxs entries (collapsed pcs would
+merge distinct inlined-at chains); an all-never-exits run keeps its
+inline entries deletable (no raise can flush them). Also fixed: a
+latent noexcept std::terminate in jit_dict_load's present-key write
+(a dyn-laundered wrong-typed value hit get<>'s throw outside the try).
+
+NEXT INCREMENTS: the store family (StoreElemInt/Float/DictStore/
+StoreElemValue/StoreMemberV/chains), the IncDec family (their pools
+already carry dual carets), ThrowRuntimeV, the raise-kind ops (IntBin
+div/mod + shifts via a lep-style kind+loc handoff), JumpUnlessTrueV.
+
 (Historical note - the older tally below predates the iterator ops.)
 CallBuiltinV (~294) is DONE (see
 above + the deferred backlog); Halt (83) is DONE. The simple scalar islands are
