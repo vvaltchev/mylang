@@ -1461,6 +1461,12 @@ struct Chunk {
      */
     bool native_leaf = false;
     size_t native_entry_off = 0;
+    /* Lever 1 step 5 (fragment-inline sync call): when the compiled body
+     * STARTS with an EnterNative (code[0]), the fragment offset a sync
+     * caller may `call` DIRECTLY; -1 = the body starts interpreted (the
+     * sync path must go through vm_dispatch). Derived post-JIT, never
+     * serialized (like NativeCode). */
+    int64_t sync_entry_off = -1;
 
     /* Live dyn-foreach iterator state slots (max iter_id + 1); one per native
      * ForeachDyn in the chunk. See the ForeachDyn ops. */
