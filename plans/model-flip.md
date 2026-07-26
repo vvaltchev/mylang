@@ -722,10 +722,38 @@ The order:
    chunk - bake the DESCRIPTOR (desc->vm_chunk, the jit_exec_block
    pattern; main has no descriptor -> main's throws stay interpreted or
    get a chunk-registry answer first).
-8. **Calls - M5** (CallV/CachedCallV/CallValueV, 29 combined, the largest
-   class): native calls to EVERY function (checked-return unwind +
-   growable native stack; today only native_leaf callees from function
-   callers).
+8. **Calls - M5.** Increment 1 **DONE (2026-07-25)**: the SYNCHRONOUS
+   native call - a fragment's plain CallV runs its callee TO COMPLETION
+   inside jit_call_sync (the vm_try_invoke boundary machinery builtin
+   callbacks already use; the callee's own fragments run within), so the
+   CALLER stays native across the call. Any callee with a chunk, MAIN
+   callers included; the #55 direct fragment call remains for native_leaf
+   callees. Three conveyance pieces built: (1) a BAKED call-site loc
+   (packed line<<32|col; ⚠ the emit must look the loc up by the OLD pc -
+   the side tables are remapped AFTER emission, and a remapped lookup
+   silently baked 0 -> `at line 0` in a backtrace) patched onto the
+   innermost frame vm_try_invoke captures loc-less; (2) a
+   **std::exception_ptr conveyance (g_vm_jit_eptr)** for PLAIN exceptions
+   (a callee's UndefinedVariableEx has no clone()) - EnterNative rethrows,
+   propagating exactly like the interpreted call's own throw - this
+   unlocks the whole non-Runtime class no clone-based conveyance could;
+   (3) a SYNC DEPTH CAP (200) bailing the deep tail to the interpreted
+   CallV's flat in-VM stack (C-stack bounded). ⚠ DIRECT SELF-RECURSION is
+   compile-time INELIGIBLE (jc->slot_desc[callee] == caller_desc): past
+   the cap every level paid a fragment-enter -> sync-bail -> exit ->
+   re-dispatch round-trip (a measured +14% on 10_recursion_deep, now
+   1.004); a self-recursive caller gains nothing from staying native
+   across its own call. MEASURED: neutral on the current benches - the
+   hot plain-CallV shapes were already leaf-covered (08), self-recursive
+   (10), or cold (43's setup call); the container-plan test's main island
+   migrated CallV -> CheckFuncV/MapFilterV (the arc again). The PAYOFF
+   increments on this foundation: **CachedCallV** (fib's 12 islands: the
+   sync helper + a cache probe/store around it keeps the unrolled body
+   native across the frontier calls) and **CallValueV** (12_higher_order/
+   76: same helper shape with the callee from a frame slot +
+   NotCallableEx). Also still open: indirect mutual recursion past the
+   cap pays the bail round-trip (rare; the per-pc entry points backlog
+   item would absorb it).
 Plus the standing structural item: per-op loc conveyance so the side-table
 re-raise ops (SubscriptV/DictLoad/boxed-arith/...) become DELETABLE (their
 carets currently collide on the EnterNative pc when a run is deleted).

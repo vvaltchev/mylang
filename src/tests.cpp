@@ -15668,6 +15668,44 @@ static bool jit_op_nativized()
             "  return r;",
             "}",
             "assert(f(runtime(\"nope\")) == 8);" } },
+        /* M5: the SYNC native call - a plain CallV to a NON-leaf callee
+         * (a loop body -> multi-run, never native_leaf), from MAIN (which
+         * the #55 direct call never covered). The caller's loop continues
+         * natively across the call. */
+        { OpCode::CallV, {
+            "func f(int a, int b) {",
+            "  var s = a;",
+            "  for (var i = 0; i < 3; i++) s += b;",
+            "  return s;",
+            "}",
+            "var t = 0;",
+            "for (var k = 0; k < 4; k++) t += f(k, runtime(2));",
+            "assert(t == 30);" } },
+        /* the sync call's throw path: a callee div0 dispatches to the
+         * CALLER's same-frame handler via g_vm_jit_exc. */
+        { OpCode::CallV, {
+            "var gsink = 0;",
+            "func d(int a, dyn b) { gsink = a; return a / b; }",
+            "func f(int n) {",
+            "  var c = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { c += d(i, 0); } catch (DivisionByZeroEx) { c += 1; }",
+            "  }",
+            "  return c;",
+            "}",
+            "assert(f(runtime(4)) == 4);" } },
+        /* the DEPTH CAP: deep PLAIN-CallV recursion (impure - no pure-call
+         * cache, no CachedCallV) bails the deep tail to the interpreted
+         * call's flat in-VM stack - no C-stack overflow. */
+        { OpCode::CallV, {
+            "var gg = 0;",
+            "func r(int n) {",
+            "  gg = n;",
+            "  if (n == 0) { return 0; }",
+            "  return r(n - 1);",
+            "}",
+            "assert(r(runtime(10000)) == 0);",
+            "assert(gg == 0);" } },
         /* Step 7a - the INLINE simple exception ops: the hot NO-THROW try
          * path (handler push/pop per entry/exit) and the finally pend
          * flag. (The helper-call form was measured +8% and reverted; these
@@ -16669,6 +16707,7 @@ static bool vm_disasm_container_plan()
             "  foreach (w in words) d[w] = 1;",
             "  return d;",
             "}",
+            "map(func (e) => e, [runtime(1), 2]);",
             "print(add(runtime(2), 3));",
             "print(wc([\"a\"]));" }) {
         if (!src.empty())
@@ -16693,13 +16732,12 @@ static bool vm_disasm_container_plan()
         const Block *b = dynamic_cast<const Block *>(root.get());
         if (b) {
             const std::string d = disassemble_program(b);
-            /* main: a MIXED chunk -> NOT ready + at least one island line. Its
-             * island is the CallV (calls are M5 territory, deliberately not on
-             * the nativize-ops path), so this stays a stable mixed case.
-             * (The `wc` body was the mixed case originally; the nativize-ops
-             * path made the whole dict-building foreach - LoadElemValue,
-             * MakeDictV, the stores - native, so it now reports READY. That
-             * migration IS the arc working, and is asserted below.) */
+            /* main: a MIXED chunk -> NOT ready + at least one island line.
+             * The island is now the discarded map() statement's CheckFuncV/
+             * MapFilterV pair (the deliberately-kept island source) - the
+             * CallV that used to be the island became ELIGIBLE with the M5
+             * sync call, another island migration of the arc working. (Before
+             * that, `wc`'s dict foreach was the mixed example.) */
             const std::string mn = section(d, "; ===== main");
             const bool mixed_ok =
                 mn.find("container plan: NOT ready") != std::string::npos

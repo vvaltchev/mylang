@@ -2251,8 +2251,12 @@ static void emit_dict_store(Emitter &e, const Instr &in, uint32_t pc)
 }
 
 /* Emit one op; returns false if (unexpectedly) unhandled. */
+/* fwd (defined with the run-building code below): the #55 native-call gate
+ * the CallV emit uses to pick the direct-call vs the M5 sync form. */
+static bool callv_native_ok(const Instr &in, const JitCtx *jc);
+
 static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
-                    uint32_t pc, const JitCtx *jc)
+                    uint32_t pc, const JitCtx *jc, size_t old_pc)
 {
     switch (in.op) {
 
@@ -3836,6 +3840,43 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::CallV: {
+        if (!callv_native_ok(in, jc)) {
+            /* M5: the SYNC call - jit_call_sync(callee_slot, argbase, nargs,
+             * dst, site) runs the callee to completion (its own fragments
+             * active inside); this fragment continues natively on 0. The
+             * baked site = the CallV's side-table loc start (the lazy in-VM
+             * backtrace capture's loc). Non-0 -> exit (bail re-runs the op;
+             * a throw rides g_vm_jit_exc / g_vm_jit_eptr). */
+            /* the loc table is still OLD-pc-keyed at emission (the side
+             * tables are remapped AFTER) - look up with old_pc, not the
+             * remapped pc (a remapped lookup silently found nothing and
+             * baked site 0, which showed as `at line 0` in a backtrace). */
+            Loc ls, le;
+            ck.loc_at(old_pc, ls, le);
+            const uint64_t site =
+                (static_cast<uint64_t>(static_cast<uint32_t>(ls.line)) << 32)
+                | static_cast<uint32_t>(ls.col);
+            e.bump_op(OpCode::CallV);
+            emit_call_prologue(e);
+            e.movabs(RDI, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target2)));
+            e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+            e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+            e.movabs(RCX, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target)));
+            e.movabs_r8(site);
+            e.call_relocs.push_back(
+                { e.pos(), reinterpret_cast<const void *>(jit_call_sync) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
+            {
+                const size_t j_ok = e.j8(0x74);
+                e.exit_pc(pc);
+                e.patch8(j_ok, e.pos());
+            }
+            return true;
+        }
         /* #55 STEP 2.1: a NATIVE direct call (the run builder included it only
          * when callv_native_ok). Push the callee frame via jit_call_setup, then
          * `call` the callee's fragment directly; the callee's native ReturnV
@@ -4365,6 +4406,30 @@ static bool callv_native_ok(const Instr &in, const JitCtx *jc)
  * STEP-2.1 gate accepts (native call). */
 static bool op_run_eligible(const Instr &in, const JitCtx *jc)
 {
+    /* M5: a plain CallV is eligible - the emit picks the #55 direct
+     * fragment call for a native_leaf callee (callv_native_ok), else the
+     * SYNCHRONOUS jit_call_sync (any callee with a chunk, main callers
+     * included): the callee runs to completion via the vm_try_invoke
+     * boundary machinery and the CALLER stays native across the call.
+     * Undefined/non-callable/chunk-less/depth-capped shapes BAIL
+     * pre-side-effect. EXCEPT direct SELF-recursion: past the depth cap
+     * every level would pay a fragment-enter -> sync-bail -> exit ->
+     * re-dispatch round-trip (a measured +14% on 10_recursion_deep), and
+     * a self-recursive caller gains nothing from staying native across
+     * the call - ineligible keeps the pre-M5 shape (the op splits the
+     * run; the lean interpreted vm_enter_call runs it). NOT
+     * op_fully_native. CachedCallV / CallValueV are the next
+     * increments. */
+    if (in.op == OpCode::CallV) {
+        if (callv_native_ok(in, jc))
+            return true;
+        if (jc && jc->caller_desc && jc->slot_desc
+                && in.target2 >= 0
+                && static_cast<size_t>(in.target2) < jc->slot_desc->size()
+                && (*jc->slot_desc)[in.target2] == jc->caller_desc)
+            return false;                  /* direct self-recursion */
+        return true;
+    }
     return jit_op_eligible(in) || callv_native_ok(in, jc);
 }
 
@@ -4636,7 +4701,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
             emit_branch(e, chunk, chunk.code[pc],
                         static_cast<uint32_t>(remap[pc]), 0, n, remap, fixups);
         else if (!emit_op(e, chunk, chunk.code[pc],
-                          static_cast<uint32_t>(remap[pc]), jc))
+                          static_cast<uint32_t>(remap[pc]), jc, pc))
             return false;                  /* selection miss: chunk pristine */
         pc++;
     }
@@ -4879,7 +4944,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 emit_branch(e, chunk, in, static_cast<uint32_t>(remap[pc]),
                             begin, end, remap, fixups);
             } else if (!emit_op(e, chunk, in,
-                                static_cast<uint32_t>(remap[pc]), jc)) {
+                                static_cast<uint32_t>(remap[pc]), jc, pc)) {
                 e.b.clear();
                 return;                    /* selection bug: give up */
             }
