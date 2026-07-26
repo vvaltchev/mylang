@@ -2188,19 +2188,43 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
  * where a loc-table lookup would be wrong). Two zero-hot-cost carriers:
  * the BoxedOp-family helpers stamp from their pool entry's start/end (the
  * pool pointer is hot-live anyway), and the pointer-arg helpers
- * (subscript/slice/dict-load/coerce) stay LOC-LESS - their EMIT stores the
- * baked `&chunk.locs[i]` into `g_vm_jit_lep` on the COLD failure branch
- * (3 instructions never executed on success), and vm_raise consumes it
- * (stamp-if-empty, then clear). A helper ARG was measured to cost +4 Ir
- * per CALL on the hot path (the value stays live across the try -> an
- * extra callee-saved spill; 62_dict_word_count +0.6%); the cold-side
- * store costs nothing.
+ * (subscript/slice/dict-load/coerce, the stores) stay LOC-LESS - their
+ * EMIT stamps the op's baked caret DIRECTLY INTO the conveyed exception
+ * object on the COLD failure branch: load g_vm_jit_exc's pointer, and only
+ * if it is non-null (a BAIL conveys nothing - the null check makes a
+ * stale-state bug structurally impossible, where an earlier side-global
+ * design left a value a later unrelated raise could mis-consume) and the
+ * exception is still loc-less (a nested throw keeps its own caret), store
+ * the start/end Locs into it. A helper ARG was measured to cost +4 Ir per
+ * CALL on the hot path (the value stays live across the try -> an extra
+ * callee-saved spill; 62_dict_word_count +0.6%); the cold-side stores
+ * cost nothing on success. The accessors below give the emitter the
+ * unique_ptr's storage address + the Loc offsets inside the object.
  */
-const void *g_vm_jit_lep;
-
-const void **jit_addr_lep()
+void **jit_addr_exc()
 {
-    return &g_vm_jit_lep;
+    static_assert(sizeof(g_vm_jit_exc) == sizeof(void *),
+                  "unique_ptr<RuntimeException> must be one raw pointer "
+                  "for the native null-check + stamp");
+    return reinterpret_cast<void **>(&g_vm_jit_exc);
+}
+
+ptrdiff_t jit_off_exc_loc_start()
+{
+    DivisionByZeroEx e;              /* any concrete subclass; loc_start
+                                      * lives in the Exception base, same
+                                      * offset for all (single inheritance) */
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->loc_start)
+         - reinterpret_cast<char *>(b);
+}
+
+ptrdiff_t jit_off_exc_loc_end()
+{
+    DivisionByZeroEx e;
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->loc_end)
+         - reinterpret_cast<char *>(b);
 }
 
 /* model-flip (nativize-ops): the native SubscriptV body - the interpreter's
@@ -3833,19 +3857,6 @@ static bool
 vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
          std::unique_ptr<RuntimeException> ex)
 {
-    /* Re-raise deletability: a conveying fragment's COLD failure branch
-     * stored the op's own LocEntry here (see g_vm_jit_lep) - it wins over
-     * the pc-keyed table (the pc may be a deleted run's collapsed
-     * EnterNative). Consumed exactly once per convey. */
-    if (g_vm_jit_lep) {
-        const Chunk::LocEntry *le =
-            static_cast<const Chunk::LocEntry *>(g_vm_jit_lep);
-        g_vm_jit_lep = nullptr;
-        if (!ex->loc_start) {
-            ex->loc_start = le->start;
-            ex->loc_end = le->end;
-        }
-    }
     if (!ex->loc_start) {
         Loc s, en;
         chunk->loc_at(pc, s, en);

@@ -114,10 +114,15 @@ extern "C" void jit_push_handler_grow(int_type catch_pc) noexcept;
 /* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
 class EvalContext;
 EvalContext **jit_addr_current_ctx();   /* &g_current_ctx (file-static) */
-/* Re-raise deletability: the cold-side loc handoff - a conveying fragment's
- * failure branch stores the op's baked &chunk.locs[i] here; vm_raise
- * consumes it (stamp-if-empty + clear), making the caret pc-independent. */
-const void **jit_addr_lep();
+/* Re-raise deletability: the cold-side caret stamp - a conveying fragment's
+ * failure branch writes the op's baked start/end Locs DIRECTLY into the
+ * exception object in g_vm_jit_exc (null-checked: a bail conveys nothing,
+ * so nothing is written - no stale side-state is possible), making the
+ * caret pc-independent. The emitter needs the unique_ptr's storage address
+ * and the Loc offsets inside the object (probed, so they cannot drift). */
+void **jit_addr_exc();
+ptrdiff_t jit_off_exc_loc_start();
+ptrdiff_t jit_off_exc_loc_end();
 ptrdiff_t jit_off_ctx_captures();       /* EvalContext::captures */
 ptrdiff_t jit_off_ctx_gfuncs();         /* EvalContext::gfuncs */
 ptrdiff_t jit_off_gft_slots();          /* GlobalFuncTable::slots */

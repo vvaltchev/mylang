@@ -1324,20 +1324,48 @@ static const void *loc_entry_addr(const Chunk &ck, size_t old_pc)
     return nullptr;
 }
 
-/* The COLD-side loc handoff: on a conveying helper's failure branch (taken
- * only when the op THREW), store the op's baked LocEntry into g_vm_jit_lep
- * for vm_raise to consume - zero instructions on the success path, unlike a
- * helper ARG (which stays live across the helper's try and cost a measured
- * +4 Ir per CALL in an extra callee-saved spill). rax/rcx are dead here
- * (exit_pc's cache flush uses rdi/rsi/r8/r10/r11; eax is set after). */
-static void emit_lep_store(Emitter &e, const Chunk &ck, size_t old_pc)
+/* The COLD-side caret stamp: on a conveying helper's failure branch (taken
+ * only when the helper returned non-zero), write the op's baked start/end
+ * Locs DIRECTLY into the exception object in g_vm_jit_exc - zero
+ * instructions on the success path, unlike a helper ARG (which stays live
+ * across the helper's try and cost a measured +4 Ir per CALL in an extra
+ * callee-saved spill). GUARDS: skip when g_vm_jit_exc is NULL (a BAIL or
+ * an eptr conveyance - nothing to stamp; this is what makes a stale-state
+ * bug structurally impossible on ops whose failure branch serves both a
+ * bail and a convey), and when the exception already carries a caret
+ * (Loc::operator bool == col != 0 - a nested throw keeps its own). A Loc
+ * is {int line; int col} = one qword store per Loc, little-endian
+ * line | col<<32. rax/rcx are dead here (exit_pc's cache flush uses
+ * rdi/rsi/r8/r10/r11; eax is set after). */
+static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
 {
-    const void *lep = loc_entry_addr(ck, old_pc);
-    if (!lep)
+    const Chunk::LocEntry *le = static_cast<const Chunk::LocEntry *>(
+        loc_entry_addr(ck, old_pc));
+    if (!le)
         return;                    /* no loc recorded - stays loc-less */
-    e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_lep()));
-    e.movabs(RCX, reinterpret_cast<uint64_t>(lep));
-    e.u8(0x48); e.u8(0x89); e.u8(0x08);      /* mov [rax], rcx */
+    const auto pack = [](const Loc &l) {
+        return static_cast<uint64_t>(static_cast<uint32_t>(l.line))
+             | (static_cast<uint64_t>(static_cast<uint32_t>(l.col)) << 32);
+    };
+    const uint32_t off_s = static_cast<uint32_t>(jit_off_exc_loc_start());
+    const uint32_t off_e = static_cast<uint32_t>(jit_off_exc_loc_end());
+
+    e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_exc()));
+    e.u8(0x48); e.u8(0x8B); e.u8(0x00);      /* mov rax, [rax] (the object) */
+    e.u8(0x48); e.u8(0x85); e.u8(0xC0);      /* test rax, rax */
+    const size_t j_null = e.j8(0x74);        /* jz skip: bail/eptr - no exc */
+    e.u8(0x83); e.u8(0xB8);                  /* cmp dword [rax+off], 0 */
+    e.u32(off_s + 4);                        /*   ... loc_start.col */
+    e.u8(0x00);
+    const size_t j_has = e.j8(0x75);         /* jnz skip: caret already set */
+    e.movabs(RCX, pack(le->start));
+    e.u8(0x48); e.u8(0x89); e.u8(0x88);      /* mov [rax+off_s], rcx */
+    e.u32(off_s);
+    e.movabs(RCX, pack(le->end));
+    e.u8(0x48); e.u8(0x89); e.u8(0x88);      /* mov [rax+off_e], rcx */
+    e.u32(off_e);
+    e.patch8(j_null, e.pos());
+    e.patch8(j_has, e.pos());
 }
 
 /* M5: emit a SYNC call op (CallV / CachedCallV / CallValueV - one emit
@@ -2308,7 +2336,7 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
 
     e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
     const size_t j_ok = e.j8(0x74);       /* jz -> continue (0 = no raise) */
-    emit_lep_store(e, ck, old_pc);        /* cold: the op's own caret */
+    emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
     e.exit_pc(pc);                        /* raised: EnterNative raises exc */
     e.patch8(j_ok, e.pos());
 }
@@ -2338,7 +2366,7 @@ static void emit_dict_store(Emitter &e, const Chunk &ck, const Instr &in,
     emit_call_epilogue(e);
     e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
     const size_t j_ok = e.j8(0x74);
-    emit_lep_store(e, ck, old_pc);        /* cold: the op's own caret */
+    emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
     e.exit_pc(pc);
     e.patch8(j_ok, e.pos());
 }
@@ -2629,12 +2657,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
-            if (in.target != 1)               /* a GLOBAL base can BAIL (undefined,
-                                   * no exc) - a lep stored on that
-                                   * path would go STALE and poison a
-                                   * later loc-less raise; a non-
-                                   * global base is convey-only */
-                emit_lep_store(e, ck, old_pc);
+            emit_exc_stamp(e, ck, old_pc); /* cold; null-checked,
+                                   * so bail-safe too */
             e.exit_pc(pc);                    /* raise (exc set) or bail (unset) */
             e.patch8(j_ok, e.pos());
         }
@@ -2683,7 +2707,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
-            emit_lep_store(e, ck, old_pc);  /* cold: own caret */
+            emit_exc_stamp(e, ck, old_pc);  /* cold: own caret */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -2708,12 +2732,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
-            if (in.a_dual_hi() != 1)               /* a GLOBAL base can BAIL (undefined,
-                                   * no exc) - a lep stored on that
-                                   * path would go STALE and poison a
-                                   * later loc-less raise; a non-
-                                   * global base is convey-only */
-                emit_lep_store(e, ck, old_pc);
+            emit_exc_stamp(e, ck, old_pc); /* cold; null-checked,
+                                   * so bail-safe too */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -2739,12 +2759,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
-            if (in.a_dual_hi() != 1)               /* a GLOBAL base can BAIL (undefined,
-                                   * no exc) - a lep stored on that
-                                   * path would go STALE and poison a
-                                   * later loc-less raise; a non-
-                                   * global base is convey-only */
-                emit_lep_store(e, ck, old_pc);
+            emit_exc_stamp(e, ck, old_pc); /* cold; null-checked,
+                                   * so bail-safe too */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -2916,7 +2932,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = no raise) */
-            emit_lep_store(e, ck, old_pc);    /* cold: the op's own caret */
+            emit_exc_stamp(e, ck, old_pc);    /* cold: the op's own caret */
             e.exit_pc(pc);                    /* raised: EnterNative re-raises */
             e.patch8(j_ok, e.pos());
         }
@@ -3022,7 +3038,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         const size_t j_ok = e.j8(0x74);       /* jz -> continue (0 = no raise) */
-        emit_lep_store(e, ck, old_pc);        /* cold: the op's own caret */
+        emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
         e.exit_pc(pc);                        /* raised: EnterNative re-raises */
         e.patch8(j_ok, e.pos());
         return true;
@@ -3680,7 +3696,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         const size_t j_ok_cn = e.j8(0x74);
-        emit_lep_store(e, ck, old_pc);        /* cold: the op's own caret */
+        emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
         e.exit_pc(pc);
         e.patch8(j_ok_cn, e.pos());
         return true;
@@ -3923,7 +3939,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
         const size_t j_ok = e.j8(0x74);     /* jz ok (0 = no throw) */
-        emit_lep_store(e, ck, old_pc);      /* cold: the op's own caret */
+        emit_exc_stamp(e, ck, old_pc);      /* cold: the op's own caret */
         e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
         e.patch8(j_ok, e.pos());
         return true;
