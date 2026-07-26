@@ -367,6 +367,20 @@ extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
                                    int_type dst_slot, int_type rest_base,
                                    const void *bc) noexcept;
 
+/* model-flip (nativize-ops): CallBuiltinLVElem / CallBuiltinLVMember - a mutating
+ * lvalue builtin whose arg0 is a SUBSCRIPT (`append(a[i], x)`) or struct-MEMBER
+ * (`append(s.f, x)`) target. Form the base by kind + base_slot, derive the
+ * element/field LValue*, then func_lv. `run_base` = the value-args run (for
+ * elem, run[0] is the index + run[1..] the values; for member, run[0..] the
+ * values). All throws are RuntimeExceptions -> g_vm_jit_exc + return 1.
+ * `bc` = &chunk.builtin_calls[idx]. */
+extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
+                                        int_type dst_slot, int_type run_base,
+                                        const void *bc) noexcept;
+extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
+                                          int_type dst_slot, int_type run_base,
+                                          const void *bc) noexcept;
+
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
  * the native code for each op actually RAN (not merely that the op is

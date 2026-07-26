@@ -15124,6 +15124,27 @@ static bool jit_op_nativized()
             "  return len(a);",
             "}",
             "assert(f(runtime([1, 2, 3]), 20) == 3);" } },
+        /* CallBuiltinLVElem: a mutating builtin whose arg0 is a SUBSCRIPT target
+         * `append(rows[k], v)`; the helper forms the element LValue* via the
+         * runtime Type::subscript, then func_lv. `dyn rows` keeps it a runtime
+         * subscript. */
+        { OpCode::CallBuiltinLVElem, {
+            "func f(dyn rows, int n) {",
+            "  for (var i = 0; i < n; i++) append(rows[i % 3], i);",
+            "  return len(rows[0]) + len(rows[1]) + len(rows[2]);",
+            "}",
+            "assert(f(runtime([[], [], []]), 30) == 30);" } },
+        /* CallBuiltinLVMember: a mutating builtin whose arg0 is a struct-MEMBER
+         * target `append(b.items, v)`; the helper forms the boxed field LValue*
+         * via vm_member_lvalue. A PROVEN struct base (`Bag b`) is required for the
+         * op (a dyn/dict base takes the MemberV+AppendV path). */
+        { OpCode::CallBuiltinLVMember, {
+            "struct Bag { array<int> items; int tag; }",
+            "func f(Bag b, int n) {",
+            "  for (var i = 0; i < n; i++) append(b.items, i);",
+            "  return len(b.items);",
+            "}",
+            "assert(f(Bag([], 0), 25) == 25);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

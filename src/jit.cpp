@@ -766,6 +766,13 @@ static bool jit_op_eligible(const Instr &in)
      * throw is a RuntimeException now -> g_vm_jit_exc. NOT op_fully_native. */
     case OpCode::CallBuiltinLV:
         return true;
+    /* CallBuiltinLVElem/LVMember: a mutating lvalue builtin with a subscript
+     * (`append(a[i], x)`) or struct-member (`append(s.f, x)`) arg0 - derive the
+     * element/field LValue* in the helper, then func_lv. Rest-native (run always
+     * a lit), every throw a RuntimeException. NOT op_fully_native. */
+    case OpCode::CallBuiltinLVElem:
+    case OpCode::CallBuiltinLVMember:
+        return true;
     /* GENERIC IntBin (the residual after specialize_arith_ops - a lit-first
      * NON-commutative op like `0 - i` that has no imm-reg specialized shape, or
      * any op the specializer doesn't cover): JIT-eligible ONLY for the
@@ -2071,6 +2078,35 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             reinterpret_cast<uint64_t>(&ck.builtin_calls[in.a_dual_lo()]));
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_call_builtin_lv) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::CallBuiltinLVElem:
+    case OpCode::CallBuiltinLVMember:
+        /* jit_call_builtin_lv_{elem,member}(kind=a_dual_hi, base_slot=target2,
+         * dst_slot=target, run_base=b_lit, bc=&ck.builtin_calls[a_dual_lo]).
+         * `b` is always a lit here (the value-args run). Throws -> test eax +
+         * exit_pc (re-raise). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_dual_hi())));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.b_lit())));
+        e.movabs_r8(
+            reinterpret_cast<uint64_t>(&ck.builtin_calls[in.a_dual_lo()]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(
+                           in.op == OpCode::CallBuiltinLVElem
+                               ? jit_call_builtin_lv_elem
+                               : jit_call_builtin_lv_member) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
