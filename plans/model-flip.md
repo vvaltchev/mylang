@@ -890,10 +890,23 @@ inline entries deletable (no raise can flush them). Also fixed: a
 latent noexcept std::terminate in jit_dict_load's present-key write
 (a dyn-laundered wrong-typed value hit get<>'s throw outside the try).
 
-NEXT INCREMENTS: the store family (StoreElemInt/Float/DictStore/
-StoreElemValue/StoreMemberV/chains), the IncDec family (their pools
-already carry dual carets), ThrowRuntimeV, the raise-kind ops (IntBin
-div/mod + shifts via a lep-style kind+loc handoff), JumpUnlessTrueV.
+**INCREMENT 2 LANDED (8596ef0, 2026-07-25)** - the store family:
+StoreElemInt/DictStore/StoreElem2V (convey-only, cold-side lep);
+StoreElemValue/StoreMemberV/chains deletable for a LOCAL/CAPTURE base
+only (a GLOBAL base bails on undefined - and the emit SKIPS the lep on
+those kinds: the shared failure branch would leave a STALE lep on the
+bail path that could poison a later loc-less raise - the one new hazard
+class this increment surfaced); StoreMemberV lep-free (helper already
+pool-stamps); compound StoreGlobalV/StoreCaptureV via the BoxedOp pool
+locs + the global's undefined bail -> eptr UndefinedVariableEx.
+StoreElemFloat EXCLUDED (its emitted value load can structurally bail).
+bench/ surviving convey-family ops 222 -> 161; store-bench Ir neutral
+(deletion is structural), 25 0.984 / 09 0.970 held.
+
+NEXT INCREMENTS: the IncDec family (their pools already carry dual
+carets), ThrowRuntimeV (build the pooled exception natively), the
+raise-kind ops (IntBin div/mod + shifts via a lep-style kind+loc
+handoff), JumpUnlessTrueV, LoadElemValue (bounds-check bail -> convey).
 
 (Historical note - the older tally below predates the iterator ops.)
 CallBuiltinV (~294) is DONE (see
