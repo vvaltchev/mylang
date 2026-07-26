@@ -2633,12 +2633,23 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
 
     if (auto *te = dynamic_cast<const TernaryExpr *>(e)) {
         /* `c ? a : b` is the join of the two branches (the condition does not
-         * affect the result type). Defer on an Unknown branch. */
+         * affect the result type). Defer on an Unknown branch. INCOMPATIBLE
+         * arms (`i == 0 ? [1] : 7` - a null join) are a genuine runtime
+         * VARIANT: the type is `dyn` (opt if either arm is), the `int OP
+         * dyn` philosophy - so a plain var bound to it gets the ordinary
+         * DynRequiredEx "declare it dyn" and `var dyn q = ...` works. NOT a
+         * premature dyn (the defer invariant): both arms are SETTLED
+         * concrete kinds, a conflict cannot converge in a later round. (The
+         * null used to escape into contribute/is_dyn - a pre-existing
+         * SEGFAULT, found by the lever-1 step-5 sync-call test.) */
         StaticTypeRef tt = static_type_resolve(type_of(te->thenExpr.get()));
         StaticTypeRef el = static_type_resolve(type_of(te->elseExpr.get()));
         if (is_unknown(tt) || is_unknown(el))
             return bottom;
-        return A.join(tt, el);
+        StaticTypeRef j = A.join(tt, el);
+        if (!j)
+            j = A.with_opt(A.dyn_ty(), tt->opt || el->opt);
+        return j;
     }
 
     if (auto *co = dynamic_cast<const CoalesceExpr *>(e)) {
@@ -2651,7 +2662,11 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
             return tb;                      /* a is always none -> b */
         if (!ta->opt)
             return ta;                      /* a is never none -> a (b dead) */
-        return A.join(A.with_opt(ta, false), tb);
+        StaticTypeRef j = A.join(A.with_opt(ta, false), tb);
+        if (!j)                             /* incompatible sides: a runtime
+                                             * variant - dyn (see ternary) */
+            j = A.with_opt(A.dyn_ty(), tb->opt);
+        return j;
     }
 
     if (auto *e14 = dynamic_cast<const Expr14 *>(e)) {

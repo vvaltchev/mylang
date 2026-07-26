@@ -3453,6 +3453,24 @@ static const std::vector<test> tests =
       { "var a; a = 3; a = \"x\";" }, &typeid(TypeMismatchEx) },
 
     /* ---- ternary ?: and null-coalescing ?? ---- */
+    /* Incompatible-arm ternary -> dyn (a runtime variant), not a null
+     * static type. The null used to escape type_of into contribute's
+     * is_dyn - a SEGFAULT (pre-existing; found by the lever-1 step-5
+     * sync-call test). A plain var gets DynRequiredEx. */
+    { "ternary: incompatible arms make a dyn value (var dyn required)",
+      { "var i = 1;",
+        "var dyn q = i == 0 ? [1, 2] : 7;",
+        "assert(q == 7);",
+        "var dyn w = i == 1 ? \"s\" : [1];",
+        "assert(w == \"s\");" } },
+    { "ternary: incompatible arms + plain var is DynRequiredEx",
+      { "var i = 1;",
+        "var q = i == 0 ? [1] : 7;" },
+      &typeid(DynRequiredEx) },
+    { "coalesce: incompatible sides make a dyn value",
+      { "var opt a;",
+        "var dyn q = a ?? 7;",
+        "assert(q == 7);" } },
     /* A boxed ternary as a CALL ARGUMENT: compile_to_run_slot's
      * retarget-last-op rewrote ONLY the else arm's join MoveV (MoveV was
      * in op_writes_pure_target, but a join temp has TWO producers), so
