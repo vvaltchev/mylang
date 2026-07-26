@@ -15115,6 +15115,15 @@ static bool jit_op_nativized()
             "  return a[3];",
             "}",
             "assert(f(runtime([]), 5) == 6);" } },
+        /* CallBuiltinLV: a mutating lvalue-ABI builtin (insert/pop) each loop
+         * iteration runs native (jit_call_builtin_lv -> vm_call_builtin_lv_rest
+         * for insert, func_lv for pop). `dyn a` keeps arg0 a runtime lvalue. */
+        { OpCode::CallBuiltinLV, {
+            "func f(dyn a, int n) {",
+            "  for (var i = 0; i < n; i++) { insert(a, 0, i); pop(a); }",
+            "  return len(a);",
+            "}",
+            "assert(f(runtime([1, 2, 3]), 20) == 3);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

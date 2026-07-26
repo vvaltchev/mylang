@@ -358,6 +358,15 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
 extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
                           int_type dst_slot, const void *bc) noexcept;
 
+/* model-flip (nativize-ops): CallBuiltinLV - a mutating lvalue-ABI builtin
+ * (pop/insert/erase/sort/reverse/intptr). Forms arg0 from kind + arg0_slot;
+ * rest_base >= 0 = the value-args run base (vm_call_builtin_lv_rest), -1 = no
+ * value args (func_lv, empty rest). All throws are RuntimeExceptions ->
+ * g_vm_jit_exc + return 1. `bc` = &chunk.builtin_calls[idx]. */
+extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
+                                   int_type dst_slot, int_type rest_base,
+                                   const void *bc) noexcept;
+
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
  * the native code for each op actually RAN (not merely that the op is
