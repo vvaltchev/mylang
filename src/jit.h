@@ -558,6 +558,11 @@ extern "C" int jit_check_callable(int_type slot) noexcept;
  * loc-less into g_vm_jit_exc (the emit's exc-stamp adds the caret), so the
  * int div/mod/shift arms convey instead of signalling g_vm_jit_raise. */
 extern "C" void jit_raise_kind_exc(int kind) noexcept;
+
+/* Re-raise deletability: ThrowRuntimeV builds its pooled exception natively
+ * (`t` = a baked &chunk.throws[idx]) - Runtime kinds via g_vm_jit_exc,
+ * plain kinds via g_vm_jit_eptr, each with its pooled caret. */
+extern "C" int jit_throw_runtime(const void *t) noexcept;
 extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
                                       int_type nargs, const void *cs,
                                       const void *mkeys,

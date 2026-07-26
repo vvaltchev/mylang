@@ -3562,6 +3562,41 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
     return 0;
 }
 
+/* Re-raise deletability (ThrowRuntimeV): build the POOLED exception
+ * natively - `tv` is a baked &chunk.throws[idx] (kind + the exact caret +
+ * the name). The two RUNTIME kinds ride g_vm_jit_exc; the three PLAIN
+ * kinds (UndefinedVariableEx / CannotRebind*) ride g_vm_jit_eptr - the
+ * channel that did not exist when the op's old unconditional-exit
+ * (re-run-to-throw) form was chosen. Every kind carries its pooled loc at
+ * CONSTRUCTION, so the caret is pc-independent and the op is deletable. */
+extern "C" int jit_throw_runtime(const void *tv) noexcept
+{
+    ML_JIT_OP_RAN(ThrowRuntimeV);
+    const Chunk::ThrowSite &t = *static_cast<const Chunk::ThrowSite *>(tv);
+    switch (t.kind) {
+    case Chunk::ThrowKind::not_lvalue:
+        g_vm_jit_exc = std::make_unique<NotLValueEx>(t.start, t.end);
+        break;
+    case Chunk::ThrowKind::bad_args:
+        g_vm_jit_exc =
+            std::make_unique<InvalidNumberOfArgsEx>(t.start, t.end);
+        break;
+    case Chunk::ThrowKind::undefined_var:
+        g_vm_jit_eptr = std::make_exception_ptr(
+            UndefinedVariableEx(t.name->val, t.start, t.end));
+        break;
+    case Chunk::ThrowKind::rebind_builtin:
+        g_vm_jit_eptr = std::make_exception_ptr(
+            CannotRebindBuiltinEx(t.start, t.end));
+        break;
+    case Chunk::ThrowKind::rebind_const:
+        g_vm_jit_eptr = std::make_exception_ptr(
+            CannotRebindConstEx(t.start, t.end));
+        break;
+    }
+    return 1;
+}
+
 /* Re-raise deletability (the raise-kind ops): build the JR-kind exception
  * LOC-LESS into g_vm_jit_exc from the fragment's cold raise branch; the
  * emit's exc-stamp then adds the op's own caret, so the op CONVEYS like

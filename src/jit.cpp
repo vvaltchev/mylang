@@ -895,13 +895,12 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::Reraise:
     case OpCode::Throw:
         return true;
-    /* model-flip (nativize-ops): an ALWAYS-THROWING construct. Its exception
-     * mix includes NON-Runtime ones (UndefinedVariableEx/CannotRebindBuiltin)
-     * that cannot ride g_vm_jit_exc, so the native form is simply an
-     * unconditional exit at the op - the interpreter re-runs the
-     * side-effect-free throw op and raises with exact semantics for every
-     * kind. The value is run-shape: the ops BEFORE it fragment together
-     * instead of splitting at the throw. NOT op_fully_native. */
+    /* model-flip (nativize-ops): an ALWAYS-THROWING construct - the helper
+     * builds the POOLED exception natively (Runtime kinds via g_vm_jit_exc,
+     * plain kinds - UndefinedVariableEx/CannotRebind* - via the M5
+     * g_vm_jit_eptr channel, which postdates the op's old re-run-to-throw
+     * exit form) with its pooled caret. Conveys, never re-executes ->
+     * op_fully_native (deletable); never leaf-safe (it always exits). */
     case OpCode::ThrowRuntimeV:
         return true;
     /* model-flip (nativize-ops): a slice READ base[start:end] via jit_slice (the
@@ -3590,13 +3589,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::ThrowRuntimeV:
-        /* An always-throwing construct whose exception mix includes
-         * NON-Runtime ones (UndefinedVariableEx) that cannot ride
-         * g_vm_jit_exc: exit unconditionally at the op - the interpreter
-         * re-runs the side-effect-free throw op with exact semantics for
-         * every kind. The point is run-shape: the ops before it fragment
-         * together instead of splitting at the throw. */
-        e.bump_op(OpCode::ThrowRuntimeV);
+        /* jit_throw_runtime(&ck.throws[target]) builds the pooled exception
+         * (Runtime -> g_vm_jit_exc, plain -> g_vm_jit_eptr) with its exact
+         * pooled caret, then the unconditional exit lands in EnterNative's
+         * conveyance branches - never a re-run, so the op is deletable.
+         * (The helper bumps the coverage counter; no emit-side bump.) */
+        emit_call_prologue(e);
+        e.movabs(RDI, reinterpret_cast<uint64_t>(&ck.throws[in.target]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_throw_runtime) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
         e.exit_pc(pc);
         return true;
 
@@ -4803,6 +4806,9 @@ static bool op_fully_native(const Instr &in)
     /* FloatBin div/mod convey their zero-divisor throw (the add/sub/mul
      * arms are already never-exits) - every FloatBin arm is deletable. */
     case OpCode::FloatBin:
+    /* ThrowRuntimeV: builds its pooled exception natively (exc/eptr by
+     * kind, pooled caret) - conveys, never re-executes. */
+    case OpCode::ThrowRuntimeV:
         return true;
     /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
      * DictStore / StoreElem2V: convey-only helpers, cold-side caret.
