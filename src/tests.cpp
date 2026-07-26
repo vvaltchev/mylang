@@ -14706,6 +14706,71 @@ static bool jit_native_return()
 #endif
 }
 
+/* Struct BAKED-LAYOUT fast paths (the 64_struct_create fix): the member
+ * read and the planned ctor emit INLINE machine code whose execution is
+ * proven by g_jit_member_fast / g_jit_ctor_fast - counters bumped by the
+ * EMITTED code itself, not the slow helpers (which bump g_jit_op_run).
+ * Also asserts the RESULT (int + float fields, bool form, H1 reuse loop),
+ * so a silently-dead fast path (the H1 get<> trap's failure mode) or a
+ * wrong offset both fail loudly. */
+static bool jit_struct_baked()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long m0 = g_jit_member_fast, c0 = g_jit_ctor_fast;
+    if (!run({
+            "struct P { int x; float f; bool b; }",
+            "func go(int n) {",
+            "  var si = 0;",
+            "  var sf = 0.0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var p = P(i, i * 2.5, i % 2 == 1);",
+            "    si += p.x + p.b;",
+            "    sf += p.f;",
+            "  }",
+            "  return si * 1000 + int(sf);",
+            "}",
+            "assert(go(runtime(4)) == 8015);" }))
+        return false;
+    if (g_jit_member_fast <= m0) {
+        fprintf(stderr, "jit_struct_baked: member fast path DID NOT RUN\n");
+        return false;
+    }
+    if (g_jit_ctor_fast <= c0) {
+        fprintf(stderr, "jit_struct_baked: ctor fast path DID NOT RUN\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 /*
  * Cross-compile determinism of M8 specialization. A concrete, typed function's
  * body must specialize to the SAME native/typed bytecode no matter what was
@@ -14772,7 +14837,7 @@ static bool ccs_compile(const std::vector<const char *> &lines,
                 if (in.op == OpCode::BinOpV) binopv++;
             }
         }
-        /* Run it end-to-end (matches the driver: infer -> optimize -> run). */
+/* Run it end-to-end (matches the driver: infer -> optimize -> run). */
         vm_execute(root.get());
     } catch (...) {
         ok = false;
@@ -15613,12 +15678,17 @@ static bool jit_op_nativized()
          * (a local `p`, not a foreach-array element - that is
          * LoadStructFieldInt's shape). The body avoids `s += p.x` (the
          * StructFieldAddInt fusion) via a non-accumulator use. */
+        /* LoadMemberInt/Float: a BOXED struct (the array field) keeps the
+         * baked offset unavailable (b_dual_lo == -1), so the read runs the
+         * generic HELPER - the path this counter proves. The baked POD fast
+         * path is proven separately by jit_struct_baked (g_jit_member_fast,
+         * bumped by the emitted inline code). */
         { OpCode::LoadMemberInt, {
-            "struct M { int x; float y; }",
+            "struct M { int x; float y; array a; }",
             "func f(int n) {",
             "  var s = 0;",
             "  for (var i = 0; i < n; i++) {",
-            "    var p = M(i, 1.5);",
+            "    var p = M(i, 1.5, []);",
             "    var t = p.x * 2;",
             "    s += t;",
             "  }",
@@ -15626,11 +15696,11 @@ static bool jit_op_nativized()
             "}",
             "assert(f(runtime(5)) == 20);" } },
         { OpCode::LoadMemberFloat, {
-            "struct M2 { int x; float y; }",
+            "struct M2 { int x; float y; array a; }",
             "func f(int n) {",
             "  var s = 0.0;",
             "  for (var i = 0; i < n; i++) {",
-            "    var p = M2(i, 1.5);",
+            "    var p = M2(i, 1.5, []);",
             "    var t = p.y * 2.0;",
             "    s += t;",
             "  }",
@@ -17462,6 +17532,8 @@ static const std::vector<extra_check> extra_checks =
       jit_op_nativized },
     { "jit: a throwing (conveying) op never enters a native_leaf",
       jit_leaf_never_exits },
+    { "jit: struct baked member read + planned ctor run INLINE natively",
+      jit_struct_baked },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",

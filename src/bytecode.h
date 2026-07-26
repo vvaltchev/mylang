@@ -1579,6 +1579,13 @@ struct Chunk {
         bool optional;            /* `a?.b` short-circuits a none base */
         Loc mstart, mend;         /* the member-expr caret (most errors) */
         Loc bstart, bend;         /* the base caret ("Expected dict object") */
+        /* Compile-baked field resolution (the 64_struct_create fix): when
+         * the site's base was PROVEN a struct (MemberExpr::base_struct_def),
+         * the field slot is a static fact - consumers use it behind a
+         * def-identity check instead of the slot_of name scan. Serializable
+         * like the other def-holding pools (a struct_defs-style pointer). */
+        const StructTypeDef *bake_def = nullptr;
+        int bake_slot = -1;
     };
     std::vector<MemberKey> member_keys;
 
@@ -1609,6 +1616,22 @@ struct Chunk {
         Loc start, end;
     };
     std::vector<BoxedOp> boxed_ops;
+
+    /*
+     * CTOR PLAN POOL (StructCtorV, the 64_struct_create fix, 2026-07-26).
+     * A POD construction whose args are all compile-proven scalars needs NO
+     * runtime coercion/validation - the per-field action is a STATIC fact:
+     * {byte offset, act} where act 0 = raw 8-byte int store (a bool arg's
+     * payload is already 0/1), 1 = float store (the slot read promotes
+     * int/bool exactly like read_float_slot), 2 = bool byte store. The
+     * interpreted op runs a lean plan loop (no coerce_struct_field calls,
+     * no EvalValue buffer); the JIT emits direct stores. A ctor with a
+     * nested-struct field arg gets NO plan (b_dual_hi == -1 -> the generic
+     * path). The def rides target2 (struct_defs) - serializable.
+     */
+    struct CtorPlanField { int32_t off; uint8_t act; };
+    struct CtorPlan { std::vector<CtorPlanField> f; };
+    std::vector<CtorPlan> ctor_plans;
 
     /*
      * CHECKED-INC-DEC SITE POOL (IncDecElemCheckedV / IncDecMemberCheckedV).

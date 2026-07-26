@@ -32,6 +32,7 @@
 #include "bytecode.h"
 #include "evalvalue.h"
 #include "funcdesc.h"   /* FuncDescriptor::vm_chunk (native-call gate, STEP 2.1) */
+#include "structtype.h" /* StructObject layout probe (baked member/ctor) */
 #include "eval.h"       /* builtin_slot (the LoadBuiltinV emit-time bytes) */
 
 #include <algorithm>
@@ -40,6 +41,13 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+
+#ifdef TESTS
+/* struct baked-fast-path execution proof (see jit.h) */
+extern "C" {
+unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
+}
+#endif
 
 #if defined(__x86_64__) && !defined(_WIN32)
 #  define ML_JIT_SUPPORTED 1
@@ -131,6 +139,14 @@ struct JitLayout {
     int desc_vm_chunk;    /* FuncDescriptor::vm_chunk */
     int chunk_native_base;/* Chunk::native.base */
     int chunk_native_entry;/* Chunk::native_entry_off */
+    /* Struct baked layout (the 64_struct_create fix): the member-read /
+     * planned-ctor fast paths navigate a StructObject directly. */
+    const void *t_struct; /* the struct-instance Type singleton */
+    int sobj_def;         /* StructObject::def offset */
+    int sobj_ro;          /* StructObject::readonly offset */
+    int sobj_bytes;       /* StructObject::bytes (vector; data ptr at +0) */
+    int sobj_rc;          /* RefCounted::intr_refcount offset (H1 use_count) */
+    bool sobj_ok;         /* the vector-data-at-+0 probe held */
 };
 
 /* Runtime-computed via public accessors (LValue mixes access specifiers,
@@ -204,6 +220,28 @@ static const JitLayout &jit_layout()
         l.desc_vm_chunk = static_cast<int>(jit_off_desc_vm_chunk());
         l.chunk_native_base = static_cast<int>(jit_off_chunk_native_base());
         l.chunk_native_entry = static_cast<int>(jit_off_chunk_native_entry());
+        /* Struct baked layout: direct member offsets (public members, so a
+         * co-located JitProbe isn't needed - a layout change relocates these
+         * live members and the probe below still measures them). The
+         * vector-data-at-+0 check guards the libstdc++/libc++ assumption the
+         * bytes-pointer load bakes; if it ever fails, both fast paths are
+         * disabled (helper fallbacks only). */
+        {
+            auto sp = make_intrusive<StructObject>();
+            LValue slv(EvalValue(intrusive_ptr<StructObject>(sp)), false);
+            l.t_struct = slv.get().get_type();
+            const char *sb = reinterpret_cast<const char *>(sp.get());
+            l.sobj_def = static_cast<int>(
+                reinterpret_cast<const char *>(&sp->def) - sb);
+            l.sobj_ro = static_cast<int>(
+                reinterpret_cast<const char *>(&sp->readonly) - sb);
+            l.sobj_bytes = static_cast<int>(
+                reinterpret_cast<const char *>(&sp->bytes) - sb);
+            l.sobj_rc = static_cast<int>(
+                reinterpret_cast<const char *>(&sp->intr_refcount) - sb);
+            std::vector<char> vp(3, 'x');
+            l.sobj_ok = *reinterpret_cast<char *const *>(&vp) == vp.data();
+        }
         return l;
     }();
     return L;
@@ -1765,11 +1803,12 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.target);
             break;
         case OpCode::StructCtorV:
-            /* jit_struct_ctor reads the FIELD run [a_lit, a_lit+b_lit) from
+            /* jit_struct_ctor reads the FIELD run [a_lit, a_lit+nf) from
              * MEMORY (a field arg can be a cached int counter - `P(i, i*2)`)
-             * and reads+writes dst (the H1 reuse inspects the current value). */
-            for (int_type i = 0; i < in.b_lit(); i++)
-                bad(static_cast<int>(in.a_lit() + i));
+             * and reads+writes dst (the H1 reuse inspects the current value).
+             * b is DUAL: lo = nfields, hi = the ctor plan idx. */
+            for (int i = 0; i < in.b_dual_lo(); i++)
+                bad(static_cast<int>(in.a_lit()) + i);
             bad(in.target);
             break;
         case OpCode::LoadElemBool:
@@ -3248,7 +3287,105 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         return true;
 
-    case OpCode::StructCtorV:
+    case OpCode::StructCtorV: {
+        const int32_t plan = in.b_dual_hi();
+        if (plan >= 0) {
+            /* THE PLANNED CTOR (the 64_struct_create fix): every field act
+             * is a compile-proven {offset, act}, so the hot path is the H1
+             * reuse guards + direct byte stores into the instance - the C++
+             * shape. Guards (any miss -> the never-throwing planned helper,
+             * which allocates fresh / handles an aliased dst): dst holds a
+             * struct, same def, use_count == 1, not readonly. NEVER exits
+             * (op_never_exits), so the run stays leaf-safe/deletable. */
+            const JitLayout &L = jit_layout();
+            const Chunk::CtorPlan &cp = ck.ctor_plans[plan];
+            size_t j_done = 0;
+            bool have_fast = false;
+            if (L.sobj_ok) {
+                have_fast = true;
+                const SlotAddr d = slot_addr(in.target);
+                e.load(RAX, d.type);
+                e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_struct));
+                e.cmp_rax_rcx();
+                const size_t js1 = e.j32(0x75);
+                e.load(RAX, d.payload);           /* rax = StructObject* */
+                e.movabs(RCX, reinterpret_cast<uint64_t>(
+                                  ck.struct_defs[in.target2]));
+                /* cmp [rax + sobj_def], rcx */
+                e.u8(0x48); e.u8(0x39); e.u8(0x88);
+                e.u32(static_cast<uint32_t>(L.sobj_def));
+                const size_t js2 = e.j32(0x75);
+                /* cmp dword [rax + sobj_rc], 1  (use_count == 1) */
+                e.u8(0x83); e.u8(0xB8);
+                e.u32(static_cast<uint32_t>(L.sobj_rc)); e.u8(0x01);
+                const size_t js3 = e.j32(0x75);
+                /* cmp byte [rax + sobj_ro], 0  (not readonly) */
+                e.u8(0x80); e.u8(0xB8);
+                e.u32(static_cast<uint32_t>(L.sobj_ro)); e.u8(0x00);
+                const size_t js4 = e.j32(0x75);
+#ifdef TESTS
+                e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_ctor_fast));
+                e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+#endif
+                /* r9 = bytes data (vector _M_start at +0, probed) */
+                e.u8(0x4C); e.u8(0x8B); e.u8(0x88);
+                e.u32(static_cast<uint32_t>(L.sobj_bytes));
+                for (size_t fi = 0; fi < cp.f.size(); fi++) {
+                    const Chunk::CtorPlanField &pf = cp.f[fi];
+                    const int slot = static_cast<int>(in.a_lit())
+                                     + static_cast<int>(fi);
+                    const SlotAddr s = slot_addr(slot);
+                    switch (pf.act) {
+                    case 0:                        /* raw int (bool = 0/1) */
+                        e.load(RAX, s.payload);
+                        /* mov [r9 + off], rax */
+                        e.u8(0x49); e.u8(0x89); e.u8(0x81);
+                        e.u32(static_cast<uint32_t>(pf.off));
+                        break;
+                    case 1:               /* float (int/bool promote, r8) */
+                        emit_float_load(e, X0, false, 0, slot, pc,
+                                        /*no_bail=*/true);
+                        /* movsd [r9 + off], xmm0 */
+                        e.u8(0xF2); e.u8(0x41); e.u8(0x0F); e.u8(0x11);
+                        e.u8(0x81); e.u32(static_cast<uint32_t>(pf.off));
+                        break;
+                    default:              /* bool byte (payload is 0/1) */
+                        /* movzx eax, byte [rdi + payload] */
+                        e.u8(0x0F); e.u8(0xB6); e.u8(0x87);
+                        e.u32(static_cast<uint32_t>(s.payload));
+                        /* mov [r9 + off], al */
+                        e.u8(0x41); e.u8(0x88); e.u8(0x81);
+                        e.u32(static_cast<uint32_t>(pf.off));
+                        break;
+                    }
+                }
+                j_done = e.j32(0xEB);
+                e.patch32_here(js1);
+                e.patch32_here(js2);
+                e.patch32_here(js3);
+                e.patch32_here(js4);
+            }
+            /* slow: jit_struct_ctor_planned(def, plan, base, dst) - the
+             * interpreter's planned body (fresh alloc / aliased dst).
+             * NEVER throws -> no test/exit. */
+            emit_call_prologue(e);
+            e.movabs(RDI,
+                     reinterpret_cast<uint64_t>(ck.struct_defs[in.target2]));
+            e.movabs(RSI, reinterpret_cast<uint64_t>(&ck.ctor_plans[plan]));
+            e.movabs(RDX, static_cast<uint64_t>(in.a_lit()));
+            e.movabs(RCX,
+                     static_cast<uint64_t>(static_cast<int_type>(in.target)));
+            e.call_relocs.push_back(
+                { e.pos(), reinterpret_cast<const void *>(
+                               jit_struct_ctor_planned) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            if (have_fast)
+                e.patch32_here(j_done);
+            return true;
+        }
+    }
+        [[fallthrough]];
     case OpCode::MakeStructArrayV:
         /* jit_struct_ctor / jit_make_struct_array(def, run base, n, dst):
          * rdi = the struct_defs[target2] StructTypeDef* baked as a VALUE (a
@@ -3259,7 +3396,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_prologue(e);
         e.movabs(RDI, reinterpret_cast<uint64_t>(ck.struct_defs[in.target2]));
         e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
-        e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+        e.movabs(RDX, static_cast<uint64_t>(
+                          in.op == OpCode::StructCtorV
+                              ? static_cast<int_type>(in.b_dual_lo())
+                              : in.b_lit()));
         e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(
@@ -4089,11 +4229,77 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::LoadMemberInt:
-    case OpCode::LoadMemberFloat:
-        /* the H1 typed member read `p.x` via jit_load_member(dst, base_slot,
-         * mk, is_int) - the POD byte fast path + the member_read_core
-         * fallback (which can throw -> test eax + exit_pc re-raise; the
-         * throw carries the member caret from the pool). */
+    case OpCode::LoadMemberFloat: {
+        /* THE BAKED MEMBER READ (the 64_struct_create fix): try_member_
+         * scalar resolved the field at COMPILE time (b dual: lo = byte
+         * offset, hi = struct_defs idx << 2 | form) - the fast path is
+         * type-tag + def-identity guards and ONE byte read, no name scan,
+         * no helper call. Forms: 0 int, 1 float, 2 bool -> 0/1, 3 int
+         * promoted to float. Any guard miss -> the generic helper below
+         * (which can throw -> test eax + exit_pc re-raise). */
+        const JitLayout &L = jit_layout();
+        const int32_t moff = in.b_dual_lo();
+        size_t j_done = 0;
+        bool have_fast = false;
+        if (moff >= 0 && L.sobj_ok) {
+            have_fast = true;
+            const int form = in.b_dual_hi() & 3;
+            const SlotAddr b = slot_addr(in.target2);
+            e.load(RAX, b.type);
+            e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_struct));
+            e.cmp_rax_rcx();
+            const size_t js1 = e.j32(0x75);
+            e.load(RAX, b.payload);            /* rax = StructObject* */
+            e.movabs(RCX, reinterpret_cast<uint64_t>(
+                              ck.struct_defs[in.b_dual_hi() >> 2]));
+            /* cmp [rax + sobj_def], rcx */
+            e.u8(0x48); e.u8(0x39); e.u8(0x88);
+            e.u32(static_cast<uint32_t>(L.sobj_def));
+            const size_t js2 = e.j32(0x75);
+#ifdef TESTS
+            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_member_fast));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);    /* inc qword [rcx] */
+#endif
+            /* rax = bytes data (vector _M_start at +0, probed) */
+            e.u8(0x48); e.u8(0x8B); e.u8(0x80);
+            e.u32(static_cast<uint32_t>(L.sobj_bytes));
+            switch (form) {
+            case 0:                                   /* int field */
+                /* mov rax, [rax + moff] */
+                e.u8(0x48); e.u8(0x8B); e.u8(0x80);
+                e.u32(static_cast<uint32_t>(moff));
+                store_dst(e, ck, RAX, in.target, pc);
+                break;
+            case 1:                                   /* float field */
+                /* movsd xmm0, [rax + moff] */
+                e.u8(0xF2); e.u8(0x0F); e.u8(0x10); e.u8(0x80);
+                e.u32(static_cast<uint32_t>(moff));
+                emit_float_store(e, ck, X0, in.target, pc);
+                break;
+            case 2:                                   /* bool -> 0/1 int */
+                /* movzx eax, byte [rax + moff] */
+                e.u8(0x0F); e.u8(0xB6); e.u8(0x80);
+                e.u32(static_cast<uint32_t>(moff));
+                e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+                e.u8(0x0F); e.u8(0x95); e.u8(0xC0);   /* setne al */
+                e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);   /* movzx eax, al */
+                store_dst(e, ck, RAX, in.target, pc);
+                break;
+            default:                       /* int field read as float */
+                /* mov rax, [rax + moff] */
+                e.u8(0x48); e.u8(0x8B); e.u8(0x80);
+                e.u32(static_cast<uint32_t>(moff));
+                /* cvtsi2sd xmm0, rax */
+                e.u8(0xF2); e.u8(0x48); e.u8(0x0F); e.u8(0x2A); e.u8(0xC0);
+                emit_float_store(e, ck, X0, in.target, pc);
+                break;
+            }
+            j_done = e.j32(0xEB);
+            e.patch32_here(js1);
+            e.patch32_here(js2);
+        }
+        /* the generic helper (slot_of + kind dispatch + member_read_core
+         * fallback) - now the COLD path */
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.movabs(RSI, static_cast<uint64_t>(
@@ -4111,7 +4317,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
+        if (have_fast)
+            e.patch32_here(j_done);
         return true;
+    }
 
     case OpCode::MemberV: {
         /* dst = base.member via jit_member(base*, dst*, mk) - SysV rdi=base,
@@ -4591,7 +4800,16 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
         case OpCode::LoadElemFloat:      /* writes a float -> needs r8 */
         case OpCode::MathFnV:            /* N6a: writes a float -> needs r8 */
         case OpCode::StoreElemFloat:     /* reads a float rhs -> needs r8 */
+        case OpCode::LoadMemberFloat:    /* baked fast path: float store */
             return true;
+        case OpCode::StructCtorV:        /* a planned float field reads via
+                                          * emit_float_load -> needs r8 */
+            if (ck.code[pc].b_dual_hi() >= 0)
+                for (const Chunk::CtorPlanField &pf :
+                         ck.ctor_plans[ck.code[pc].b_dual_hi()].f)
+                    if (pf.act == 1)
+                        return true;
+            break;
         default:
             break;
         }
@@ -4638,6 +4856,13 @@ static bool op_never_exits(const Instr &in)
         default:                       /* div/mod/shl/shr/ushr raise */
             return false;
         }
+    /* A PLANNED StructCtorV (the 64_struct_create fix) NEVER exits: the
+     * native fast path is guards + direct byte stores, and its slow branch
+     * calls jit_struct_ctor_planned - vm_struct_ctor_planned never throws
+     * (every field act was compile-proven). Leaf-safe AND deletable. An
+     * UNPLANNED ctor (nested-struct field) keeps the defensive-throw exit. */
+    case OpCode::StructCtorV:
+        return in.b_dual_hi() >= 0;
     /* FLOAT arith (the no_bail tier, 2026-07-25): the operand reads
      * promote int/bool exactly like read_float_slot (the 2-way no_bail
      * form), so add/sub/mul cannot exit at all - never-exits, leaf-safe.

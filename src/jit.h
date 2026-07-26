@@ -396,6 +396,9 @@ extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
                                      const void *bc) noexcept;
 extern "C" int jit_make_struct_array(const void *def, int_type base,
                                      int_type n, int_type dst) noexcept;
+/* the planned POD ctor's slow branch (never throws -> void) */
+extern "C" void jit_struct_ctor_planned(const void *def, const void *plan,
+                                        int_type base, int_type dst) noexcept;
 
 /* model-flip (nativize-ops): the FOREACH element/field LOADS. The `idx` arrives
  * as a VALUE (the emitter materializes the op's slot-or-literal operand with the
@@ -606,6 +609,12 @@ extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
  * "prove the code ran" rule). Read per-op by a `jit:` test. Bumps are gated to
  * TESTS via ML_JIT_OP_RAN so a release build pays nothing. */
 extern unsigned long g_jit_op_run[];
+#ifdef TESTS
+/* Execution-proof counters for the struct BAKED fast paths - bumped by the
+ * EMITTED inline code itself (the helpers bump g_jit_op_run), so a test can
+ * prove the inline path ran, not just the slow helper. */
+extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
+#endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
 #else

@@ -1723,6 +1723,10 @@ void Inferencer::annotate_hints(Construct *n)
         mem->base_dict = bt->kind == StaticTypeKind::Dict;
         /* a non-opt struct instance base -> native field store (StoreMemberV) */
         mem->base_struct = bt->kind == StaticTypeKind::Struct && !bt->opt;
+        mem->base_struct_def = mem->base_struct
+            ? static_cast<const StructTypeDef *>(bt->struct_def) : nullptr;
+        mem->field_slot = mem->base_struct_def && mem->memUid
+            ? mem->base_struct_def->slot_of(mem->memUid) : -1;
     }
 
     /* VM native-call hint: the callee is a user FUNCTION (Func static type -

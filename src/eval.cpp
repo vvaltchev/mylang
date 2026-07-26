@@ -3643,14 +3643,18 @@ LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
 EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
                           const EvalValue &value,
                           const Loc &mstart, const Loc &mend,
-                          const Loc &bstart, const Loc &bend)
+                          const Loc &bstart, const Loc &bend,
+                          const StructTypeDef *bake_def, int bake_slot)
 {
     const EvalValue &dval = base_lv->get();
     if (!dval.is<intrusive_ptr<StructObject>>())
         throw TypeErrorEx("Expected struct object", bstart, bend);
 
-    StructObject &obj = *dval.get<intrusive_ptr<StructObject>>().get();
-    const int slot = obj.def->slot_of(memUid);
+    StructObject &obj = *dval.get_ref<intrusive_ptr<StructObject>>().get();
+    /* the compile-baked field slot (behind the def-identity check) skips
+     * the slot_of name scan - the 64_struct_create fix */
+    const int slot = obj.def == bake_def && bake_slot >= 0
+        ? bake_slot : obj.def->slot_of(memUid);
     if (slot < 0)
         throw TypeErrorEx(
             intern_msg("Struct '" + string(obj.def->name->val) +
@@ -5243,7 +5247,7 @@ EvalValue member_read_core(const EvalValue &dval, const EvalValue &memId,
 
     if (dval.is<intrusive_ptr<StructObject>>()) {
 
-        const auto &obj = dval.get<intrusive_ptr<StructObject>>();
+        const auto &obj = dval.get_ref<intrusive_ptr<StructObject>>();
         const int slot = obj->def->slot_of(memUid);
 
         if (slot >= 0)
@@ -5313,8 +5317,10 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
      */
     if (dval.is<intrusive_ptr<StructObject>>()) {
 
-        const auto &obj = dval.get<intrusive_ptr<StructObject>>();
-        const int slot = obj->def->slot_of(memUid);
+        const auto &obj = dval.get_ref<intrusive_ptr<StructObject>>();
+        /* the compile-baked field slot (def-identity-checked): no name scan */
+        const int slot = obj->def == base_struct_def && field_slot >= 0
+            ? field_slot : obj->def->slot_of(memUid);
 
         /*
          * A rooted, mutable, boxed field -> an assignable field lvalue (so
@@ -5450,8 +5456,11 @@ int_type MemberExpr::eval_int(EvalContext *ctx) const
 
     const EvalValue base = RValue(what->eval(ctx));
     if (base.is<intrusive_ptr<StructObject>>()) {
-        const StructObject &o = *base.get<intrusive_ptr<StructObject>>().get();
-        const int slot = o.def->slot_of(memUid);
+        const StructObject &o =
+            *base.get_ref<intrusive_ptr<StructObject>>().get();
+        /* the compile-baked field slot (def-identity-checked): no name scan */
+        const int slot = o.def == base_struct_def && field_slot >= 0
+            ? field_slot : o.def->slot_of(memUid);
         if (slot >= 0 && o.is_pod()) {
             const FieldDef &f = o.def->fields[slot];
             const char *p = o.bytes.data() + f.offset;
@@ -5485,8 +5494,11 @@ float_type MemberExpr::eval_float(EvalContext *ctx) const
 
     const EvalValue base = RValue(what->eval(ctx));
     if (base.is<intrusive_ptr<StructObject>>()) {
-        const StructObject &o = *base.get<intrusive_ptr<StructObject>>().get();
-        const int slot = o.def->slot_of(memUid);
+        const StructObject &o =
+            *base.get_ref<intrusive_ptr<StructObject>>().get();
+        /* the compile-baked field slot (def-identity-checked): no name scan */
+        const int slot = o.def == base_struct_def && field_slot >= 0
+            ? field_slot : o.def->slot_of(memUid);
         if (slot >= 0 && o.is_pod()) {
             const FieldDef &f = o.def->fields[slot];
             const char *p = o.bytes.data() + f.offset;

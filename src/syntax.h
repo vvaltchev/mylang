@@ -1715,6 +1715,14 @@ public:
     /* Set by the inferencer when `what` is statically a STRUCT instance (so
      * `s.f = v` is a field store). Gates the VM's native StoreMemberV. */
     bool base_struct = false;
+    /* The proven base's StructTypeDef (with base_struct) - lets codegen
+     * resolve the field's slot/offset at COMPILE time (the 64_struct_create
+     * fix: no runtime name scan). Null when base_struct is false. */
+    const StructTypeDef *base_struct_def = nullptr;
+    /* The field's slot in base_struct_def, resolved at COMPILE time by the
+     * inferencer (-1 = not a field / unproven). Runtime uses it behind a
+     * def-identity check, so no name scan runs on a proven member access. */
+    int field_slot = -1;
 
     MemberExpr() : Construct("MemberExpr") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1731,6 +1739,8 @@ public:
         c->optional = optional;
         c->base_dict = base_dict;
         c->base_struct = base_struct;
+        c->base_struct_def = base_struct_def;
+        c->field_slot = field_slot;
         return c;
     }
 };
