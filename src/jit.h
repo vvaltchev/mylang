@@ -137,15 +137,25 @@ extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
                                   size_t callv_pc) noexcept;
 
 /* M5: the SYNCHRONOUS native call - run a CallV's callee to completion
- * inside the helper (the vm_try_invoke boundary machinery), so the CALLER
+ * inside the helper (the LEAN SYNC ENTER: a non-boundary frame whose
+ * ret_chunk is the sentinel stop chunk - see vm.cpp), so the CALLER
  * fragment continues natively across the call. 0 = done (dst written);
  * 1 = bail pre-side-effect (the interpreter re-runs the op); 2 = the callee
  * threw (g_vm_jit_exc, or g_vm_jit_eptr for a plain exception).
  * `site_packed` = the call-site loc (line << 32 | col) for the backtrace's
- * innermost frame. */
+ * innermost frame. jit_call_sync_cached is CachedCallV (probes the caller's
+ * per-frame pure cache first; a miss's key rides the callee record and is
+ * stored by the normal return pop); jit_call_sync_value is CallValueV (the
+ * callee VALUE sits in a frame temp, not a global slot). */
 extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
                              int_type nargs, int_type dst,
                              int_type site_packed) noexcept;
+extern "C" int jit_call_sync_cached(int_type callee_slot, int_type argbase,
+                                    int_type nargs, int_type dst,
+                                    int_type site_packed) noexcept;
+extern "C" int jit_call_sync_value(int_type callee_temp, int_type argbase,
+                                   int_type nargs, int_type dst,
+                                   int_type site_packed) noexcept;
 
 /* #55 STEP 2.1: native CallVs SET UP process-wide (a `jit:` coverage counter -
  * proves the native call path actually ran). */

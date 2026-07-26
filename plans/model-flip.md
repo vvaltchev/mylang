@@ -755,18 +755,61 @@ The order:
    than the lean in-VM `vm_enter_call` (record REUSE - the N6 win) it
    displaces, and in call-dominated loops the caller-stays-native saving
    cannot cover it. Slower = wrong-or-unfinished -> reverted same-turn.
-   **THE FIX DESIGN (the real M5 increment 2): a LEAN SYNC ENTER** - reuse
-   vm_enter_call's own record/window mechanics (non-boundary push, reused
-   records, fast_bind straight from the caller's slot run - no arg copy)
-   and then drive vm_dispatch in a RUN-UNTIL-POP loop (stop when the
-   record count returns to the entry level), so the sync call costs
-   vm_enter_call + one depth check instead of the boundary-invoke
-   protocol. The conveyance pieces (baked site, g_vm_jit_eptr, the depth
-   cap) all carry over. Note plain CallV's sync form has the SAME
-   displacement issue in principle - its measurements were neutral only
-   because the shapes it fires on are cold; revisit it with the lean
-   enter too. Also still open: indirect mutual recursion past the cap
-   pays the bail round-trip (rare; per-pc entry points would absorb it).
+   **THE LEAN SYNC ENTER - DONE (M5 increment 3, 2026-07-25).** Built as
+   designed but with a SENTINEL instead of the run-until-pop loop (zero
+   dispatch-loop changes - no per-op depth check): jit_call_sync[_cached/
+   _value] push the callee via `vm_frame_setup` (non-boundary record,
+   record REUSE, fast_bind straight from the caller's slot run - no arg
+   copy) with **ret_chunk = the SENTINEL STOP CHUNK** (`vm_sync_stop_
+   chunk()`: ExitBlock at pc 0 AND 1; rec.ret_pc = 1 by the ret_pc+1
+   convention, pc 0 exists only for the walk's ret_pc-1 view), so the
+   callee's ORDINARY return pop (`vm_frame_leave` - which also does a
+   CachedCallV's cache store for free) resumes at the sentinel's
+   ExitBlock and vm_dispatch RETURNS to the helper. A new
+   `VmCallRec::sync_stop` flag (reset per push - record reuse) makes
+   `vm_unwind_walk` stop there like a boundary but WITH a pop (capture
+   the callee frame loc-less - the helper stamps the baked site - +
+   restore captures + pop + g_vm_exc_pending + false), covering BOTH
+   raise paths (vm_raise and the C++ landing pad) with one check.
+   NON-OBVIOUS DECISIONS (for review):
+   - Arity/bind/StackOverflow throws from vm_frame_setup -> BAIL (ret 1),
+     not conveyance: they are pre-side-effect and idempotent (setup pops
+     its half-frame), so the interpreted re-run re-throws byte-
+     identically - much less machinery than site-stamped conveyance.
+   - CachedCallV ALLOWS direct self-recursion (unlike CallV's gate):
+     tree recursion is cache-bounded (the per-frame PureCache dedups the
+     frontier - fib's effective depth is ~n), and gating it would
+     exclude the flagship fib shape entirely; the depth cap (shared, 200)
+     nets pathology. CallValueV also eligible (value self-calls are rare;
+     cap nets them). The cache probe was factored (`vm_cache_probe_vals`)
+     and the miss key rides rec.cache_key - stored by the normal pop.
+   - **DIRECT FRAGMENT ENTRY** (the load-bearing second half): the first
+     dispatch-path measurement REGRESSED tiny callees (11_closure_counter
+     +6.0%, 76 +0.9% - the per-call vm_dispatch entry/exit + sentinel
+     round-trip ~60 Ir dwarfs a 3-op body; profiled, not guessed). Fix:
+     when the callee chunk STARTS with EnterNative (the common whole-
+     native-body shape; subsumes native_leaf), the helper jit_enter's the
+     fragment DIRECTLY and replicates EnterNative's post-exit faithfully:
+     JIT_RET_SENTINEL -> done (frame popped, dst written, NO dispatch at
+     all); a conveyed raise -> vm_raise (caret from the callee loc table,
+     same-frame handler first, else the walk stops at sync_stop); a
+     dispatched handler or a plain bail -> ONE `vm_dispatch(start_pc)`
+     continuation (what the dispatch path always paid). ⚠ the depth
+     counter MUST wrap the direct entry too - a nested direct chain
+     (fib) grows the C stack with no dispatch frame, so skipping the
+     counter would unbound it.
+   - Plain (non-Runtime) exceptions still C++-propagate out of
+     vm_dispatch -> caught -> g_vm_jit_eptr; the records above die with
+     the invocation (the interpreted plain-throw contract, mirrored).
+   MEASURED (callgrind Ir vs the pre-inc-1 baseline 2064987, plain
+   releases): 76_funcval_dispatch **0.959**, 09_fib_recursive **0.970**,
+   11_closure_counter **0.983**, 12/10/08 neutral (12's map/filter is
+   VmInvoker's loop, untouched; 10 stays self-gated; 08 was leaf-
+   covered). vs inc-2's reverted boundary form: 76 +16% -> -4.1%, 11
+   +17% -> -1.7%. Full battery green (3x -rt, bench+samples differential,
+   fuzzer 300, backtrace through nested sync calls byte-identical).
+   Still open: indirect mutual recursion past the cap pays the bail
+   round-trip (rare; per-pc entry points would absorb it).
 Plus the standing structural item: per-op loc conveyance so the side-table
 re-raise ops (SubscriptV/DictLoad/boxed-arith/...) become DELETABLE (their
 carets currently collide on the EnterNative pc when a run is deleted).
