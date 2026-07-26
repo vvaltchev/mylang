@@ -672,13 +672,16 @@ static bool jit_op_eligible(const Instr &in)
      * none result). A run TERMINATOR, never a branch. Never throws. */
     case OpCode::Halt:
         return true;
-    /* N3: the SSE float tier. add/sub/mul only (div/mod THROW on 0 /
-     * are a libm call -> interpreted); a float READ handles an int-in-a-
-     * float-slot via cvtsi2sd (matching read_float_slot) and BAILS on
-     * bool/other. */
+    /* N3: the SSE float tier. add/sub/mul/div (div RAISES DivisionByZeroEx
+     * on a +-0.0 divisor via JR_DIV0 - a sign-stripped bits test, exactly
+     * TypeFloat::div's fpclassify FP_ZERO check - then divsd); mod stays
+     * interpreted (an fmod libm call + the same zero check - do when it
+     * shows up in real code, 0 bench occurrences). A float READ handles an
+     * int-in-a-float-slot via cvtsi2sd (matching read_float_slot) and BAILS
+     * on bool/other. */
     case OpCode::FloatBin:
         return in.aop == Op::plus || in.aop == Op::minus
-            || in.aop == Op::times;
+            || in.aop == Op::times || in.aop == Op::div;
     case OpCode::FloatAddRR: case OpCode::FloatSubRR:
     case OpCode::FloatMulRR: case OpCode::FloatAddRI:
     case OpCode::FloatSubRI: case OpCode::FloatMulRI:
@@ -1994,18 +1997,36 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::FloatAddRR: case OpCode::FloatSubRR:
     case OpCode::FloatMulRR: case OpCode::FloatAddRI:
     case OpCode::FloatSubRI: case OpCode::FloatMulRI: {
-        uint8_t fop;   /* 0x58 addsd / 0x5C subsd / 0x59 mulsd */
+        uint8_t fop;   /* 0x58 addsd / 0x5C subsd / 0x59 mulsd / 0x5E divsd */
         switch (in.op) {
         case OpCode::FloatAddRR: case OpCode::FloatAddRI: fop = 0x58; break;
         case OpCode::FloatSubRR: case OpCode::FloatSubRI: fop = 0x5C; break;
         case OpCode::FloatMulRR: case OpCode::FloatMulRI: fop = 0x59; break;
-        default:   /* FloatBin: by aop (add/sub/mul only - eligible) */
+        default:   /* FloatBin: by aop (add/sub/mul/div - eligible) */
             fop = in.aop == Op::plus ? 0x58
-                : in.aop == Op::minus ? 0x5C : 0x59;
+                : in.aop == Op::minus ? 0x5C
+                : in.aop == Op::times ? 0x59 : 0x5E;
             break;
         }
+        if (fop == 0x5E)
+            e.bump_op(OpCode::FloatBin);   /* execution proof for the div arm
+                                            * (BEFORE any load - bump_op
+                                            * clobbers rax) */
         emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
         emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
+        if (fop == 0x5E) {
+            /* float DIV throws DivisionByZeroEx on a +-0.0 divisor
+             * (TypeFloat::div: fpclassify(rhs) == FP_ZERO). Test the
+             * divisor's BITS with the sign stripped: movq rax, xmm1;
+             * shl rax, 1 - zero iff the value is +-0.0 (NaN/inf/denormal
+             * bits stay nonzero and divide, exactly fpclassify's answer).
+             * A bits test avoids a ucomisd NaN pitfall (unordered sets ZF,
+             * so a bare `je` would wrongly raise on a NaN divisor). */
+            e.u8(0x66); e.u8(0x48); e.u8(0x0F); e.u8(0x7E);
+            e.u8(0xC8);                            /* movq rax, xmm1 */
+            e.u8(0x48); e.u8(0xD1); e.u8(0xE0);    /* shl rax, 1 */
+            raise_unless(e, 0x75 /* jnz */, JR_DIV0, pc);
+        }
         e.farith(fop);
         emit_float_store(e, ck, X0, in.target, pc);
         return true;
