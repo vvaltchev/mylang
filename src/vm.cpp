@@ -2215,6 +2215,32 @@ extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
     ctx->frame->at(dst).put(std::move(v));
 }
 
+/* model-flip (nativize-ops): the native MakeDictV body - the interpreter's exact
+ * `frame[dst] = vm_make_dict(ctx, base, npairs)`: build a dict LITERAL from the
+ * INTERLEAVED key/value run [base, base + 2*npairs) via the shared
+ * build_dict_from_pairs (which FREEZES each key with make_const_clone, so the
+ * VM and the tree-walker share one builder). Unlike MakeArrayV this CAN throw:
+ * freezing/inserting a key HASHES it, and an UNHASHABLE key (a function value
+ * laundered through `dyn`) raises TypeErrorEx - a RuntimeException, so it rides
+ * g_vm_jit_exc LOC-LESS and EnterNative re-raises stamping the `{...}` literal's
+ * caret from the loc side table (recorded by extract_locs). Hence NOT
+ * op_fully_native. The pair buffer lives in vm_make_dict's frame ON PURPOSE
+ * (the recursion-depth reason - see vm_make_array). */
+extern "C" int jit_make_dict(int_type dst, int_type base,
+                             int_type npairs) noexcept
+{
+    ML_JIT_OP_RAN(MakeDictV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        EvalValue v = vm_make_dict(*ctx, base, npairs);
+        ctx->frame->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" int jit_dict_load(int_type dst, int_type base_slot,
                              const EvalValue *key, int is_int) noexcept
 {
@@ -4678,9 +4704,17 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_CASE(MakeDictV): {
 
             /* Build a dict LITERAL via vm_make_dict (key/value buffer kept out
-             * of vm_run_chunk's frame). Never throws (all values hashable). */
-            ctx.frame->at(in->target).put(
-                vm_make_dict(ctx, in->a_lit(), in->b_lit()));
+             * of vm_run_chunk's frame). It FREEZES + HASHES each key, so an
+             * UNHASHABLE key (a function value laundered through `dyn`) throws
+             * TypeErrorEx - stamp the literal's caret from the loc side table,
+             * matching the tree-walker's Construct::eval stamp. */
+            try {
+                ctx.frame->at(in->target).put(
+                    vm_make_dict(ctx, in->a_lit(), in->b_lit()));
+            } catch (Exception &e) {
+                vm_stamp_loc(*chunk, pc, e);
+                throw;
+            }
             pc++;
         }
         VM_NEXT;

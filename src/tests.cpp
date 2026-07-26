@@ -3112,6 +3112,16 @@ static const std::vector<test> tests =
      * pool under -vm, the node in the tree-walker — must be byte-identical):
      * a subscript-INTERNAL throw (missing key) marks the SUBSCRIPT `dd["z"]`,
      * the inc-dec's OWN throw (non-numeric value) the WHOLE `dd["a"]++`. */
+    /* An UNHASHABLE dict-literal key (a function laundered through `dyn`) throws
+     * from the key freeze/hash in build_dict_from_pairs. The caret must mark the
+     * `{...}` LITERAL - the VM's MakeDictV used to assume "never throws", so it
+     * recorded no loc and reported the error with NO caret at all (line 0) while
+     * the tree-walker pointed at the literal. Both engines now agree. */
+    { "err loc: unhashable dict-literal key marks the literal",
+      { "func g(int x) => x + 1;",
+        "func f(dyn k) { var dyn d = {k: 1}; return d; }",
+        "f(runtime(g));" },
+      &typeid(TypeErrorEx), 29, 2, 36, 2 },
     { "err loc: dyn elem ++ missing key marks the subscript",
       { "func mkd() { var d = {\"a\": 1}; return d; }",
         "var dyn dd = mkd(); dd[\"z\"]++;" },
@@ -14684,13 +14694,13 @@ static bool jit_native_call()
  * calls bumps, the "prove the code ran" rule) with a correct result, AND that a
  * throw propagates + is catchable. dyn params keep the body boxed; the block
  * body keeps it above the inline threshold (so it stays a real call, not inlined
- * away). The ISLAND op is a DICT LITERAL `{"k": a}` (MakeDictV) - as the
- * nativize-ops path made BinOpV/CmpV/CompoundV/MoveV/LogV/UnaryV/CoerceNumV,
- * SliceV and MakeArrayV all NATIVE, MakeDictV is the container gate's remaining
- * still-boxed island source (the source hops to the next still-boxed simple op
- * each time one is nativized). A straight-line container needs total island ops
- * >= MIN_CONTAINER_ISLAND, so subtest (1) chains 6 dict literals (each its own
- * 1-op island; total 6 >= 5). */
+ * away). The ISLAND op is a BOXED STRUCT construction `B(a)` (StructCtorBoxedV)
+ * - as the nativize-ops path made BinOpV/CmpV/CompoundV/MoveV/LogV/UnaryV/
+ * CoerceNumV, SliceV, MakeArrayV and MakeDictV all NATIVE, StructCtorBoxedV is
+ * the container gate's remaining still-boxed island source (the source hops to
+ * the next still-boxed simple op each time one is nativized). A straight-line
+ * container needs total island ops >= MIN_CONTAINER_ISLAND, so subtest (1)
+ * chains 6 constructions (each its own 1-op island; total 6 >= 5). */
 static bool jit_container()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -14722,21 +14732,23 @@ static bool jit_container()
     };
 
     const unsigned long b0 = g_jit_container_calls;
-    /* (1) a straight-line boxed-island container; correct result. Six dict
-     * literals `{"k": a}` of a dyn value = six MakeDictV islands (total >=
-     * MIN_CONTAINER_ISLAND). Returns {"k": a}, whose ["k"] is a. runtime() keeps
-     * the arg non-const so the pure call isn't folded away (else cleaf never runs
-     * -> no container). MakeDictV is the container gate's island source now that
-     * the simple scalar ops, SliceV AND MakeArrayV are all nativized. */
-    if (!run({ "func cleaf(dyn a) {",
-               "  var dyn t = {\"k\": a};",
-               "  var dyn u = {\"k\": a};",
-               "  var dyn v = {\"k\": a};",
-               "  var dyn w = {\"k\": a};",
-               "  var dyn x = {\"k\": a};",
-               "  return {\"k\": a};",
+    /* (1) a straight-line boxed-island container; correct result. Six BOXED
+     * struct constructions `B(a)` (B has an `opt` field, so it is non-POD ->
+     * StructCtorBoxedV) = six islands (total >= MIN_CONTAINER_ISLAND). Returns
+     * B(a), whose .v is a. runtime() keeps the arg non-const so the pure call
+     * isn't folded away (else cleaf never runs -> no container).
+     * StructCtorBoxedV is the container gate's island source now that the simple
+     * scalar ops, SliceV, MakeArrayV AND MakeDictV are all nativized. */
+    if (!run({ "struct B { dyn? v; }",
+               "func cleaf(dyn a) {",
+               "  var dyn t = B(a);",
+               "  var dyn u = B(a);",
+               "  var dyn v = B(a);",
+               "  var dyn w = B(a);",
+               "  var dyn x = B(a);",
+               "  return B(a);",
                "}",
-               "assert(cleaf(runtime(\"hello\"))[\"k\"] == \"hello\");" }))
+               "assert(cleaf(runtime(\"hello\")).v == \"hello\");" }))
         return false;
     if (g_jit_container_calls <= b0)
         return false;   /* the container's island call did NOT run */
@@ -14754,18 +14766,19 @@ static bool jit_container()
         return false;
     /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
      * (native ops + the for.step back edge) iterates in machine code, only the
-     * island `{"k": a}` (MakeDictV) calls jit_exec_block; `var j = i + 1` is
-     * native. last = {"k": a} each iteration, whose ["k"] is a. */
+     * island `B(a)` (StructCtorBoxedV) calls jit_exec_block; `var j = i + 1` is
+     * native. last = B(a) each iteration, whose .v is a. */
     const unsigned long b1 = g_jit_container_calls;
-    if (!run({ "func lc(dyn a, int n) {",
-               "  var dyn last = {\"k\": a};",
+    if (!run({ "struct B2 { dyn? v; }",
+               "func lc(dyn a, int n) {",
+               "  var dyn last = B2(a);",
                "  for (var i = 0; i < n; i++) {",
-               "    last = {\"k\": a};",
+               "    last = B2(a);",
                "    var j = i + 1;",
                "  }",
                "  return last;",
                "}",
-               "assert(lc(runtime(\"hello\"), 5)[\"k\"] == \"hello\");" }))
+               "assert(lc(runtime(\"hello\"), 5).v == \"hello\");" }))
         return false;
     if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
         return false;
@@ -15153,6 +15166,15 @@ static bool jit_op_nativized()
             "func f(int n) {",
             "  var s = 0;",
             "  for (var i = 0; i < n; i++) { var p = [i, i * 2]; s += p[1]; }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(10)) == 90);" } },
+        /* MakeDictV: a per-iteration dict LITERAL `{i: i * 2}` builds natively
+         * (jit_make_dict -> build_dict_from_pairs over the interleaved run). */
+        { OpCode::MakeDictV, {
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) { var d = {i: i * 2}; s += d[i]; }",
             "  return s;",
             "}",
             "assert(f(runtime(10)) == 90);" } },

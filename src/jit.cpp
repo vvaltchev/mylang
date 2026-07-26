@@ -735,6 +735,12 @@ static bool jit_op_eligible(const Instr &in)
      * never throws -> op_fully_native. */
     case OpCode::MakeArrayV:
         return true;
+    /* model-flip (nativize-ops): a dict LITERAL `{k: v, ...}` via jit_make_dict
+     * (build_dict_from_pairs over the interleaved key/value run). An UNHASHABLE
+     * key (a dyn-laundered func) CAN throw -> re-raise, so NOT op_fully_native
+     * (its caret comes from the pc-keyed loc side table). */
+    case OpCode::MakeDictV:
+        return true;
     /* model-flip (nativize-ops): the boxed-arith ops (dyn/string operands) via
      * jit_boxed_* + the boxed_ops pool (target2 = the pool index, set by
      * build_boxed_ops). vm_num_binop CAN throw (div0/type) -> NOT
@@ -1191,6 +1197,14 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * are both in the instruction), so disqualify it precisely instead
              * of turning caching off for the whole run. */
             for (int_type i = 0; i < in.b_lit(); i++)
+                bad(static_cast<int>(in.a_lit() + i));
+            bad(in.target);
+            break;
+        case OpCode::MakeDictV:
+            /* same, over the INTERLEAVED key/value run [a_lit, a_lit+2*b_lit)
+             * (b_lit is the PAIR count) - a key or value can be a cached int
+             * counter (`{i: i * 2}` in a loop). */
+            for (int_type i = 0; i < 2 * in.b_lit(); i++)
                 bad(static_cast<int>(in.a_lit() + i));
             bad(in.target);
             break;
@@ -1989,6 +2003,27 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         return true;
 
+    case OpCode::MakeDictV:
+        /* dst = build_dict_from_pairs(run[a_lit .. +2*b_lit), b_lit pairs) via
+         * jit_make_dict (rdi=dst, rsi=run base, rdx=npairs). An unhashable key
+         * throws -> test eax + exit_pc so EnterNative re-raises with the
+         * literal's caret from the loc side table. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_make_dict) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
     case OpCode::BinOpV:
     case OpCode::CmpV:
     case OpCode::CompoundV:
@@ -2657,22 +2692,24 @@ static constexpr size_t MIN_CONTAINER_ISLAND = 5;
 static bool op_is_simple_island(OpCode op)
 {
     switch (op) {
-    /* The simple boxed SCALAR ops (and SliceV, MakeArrayV) are ALL
+    /* The simple boxed SCALAR ops (and SliceV, MakeArrayV, MakeDictV) are ALL
      * op_run_eligible now (the nativize-ops path), so op_run_eligible (checked
      * FIRST in the gate) wins - they never reach here as islands. They stay
      * listed for documentation / a `-nj` build (where op_run_eligible is false).
-     * The one op here that is STILL boxed (not jit_op_eligible) is MakeDictV (a
-     * dict literal `{k: v}`, a container build - not yet on the nativize-ops
-     * path) - the container gate's remaining island source, so the
-     * jit_exec_block mechanism (M2-M4) stays exercised. (The source was SliceV,
-     * then MakeArrayV, before each was nativized - it hops to the next
-     * still-boxed simple op each time.) */
+     * The one op here that is STILL boxed (not jit_op_eligible) is
+     * StructCtorBoxedV (a NON-POD struct construction with runtime args - the
+     * rarest remaining container build) - the container gate's island source, so
+     * the jit_exec_block mechanism (M2-M4) stays exercised. (The source was
+     * SliceV, then MakeArrayV, then MakeDictV, before each was nativized - it
+     * hops to the next still-boxed simple op each time, and each hop is
+     * perf-checked by probing bench/ + samples/ for containers formed.) */
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
     case OpCode::UnaryV: case OpCode::MoveV: case OpCode::CompoundV:
     case OpCode::LoadConstV: case OpCode::CoerceNumV:
     case OpCode::SliceV:
     case OpCode::MakeArrayV:
     case OpCode::MakeDictV:
+    case OpCode::StructCtorBoxedV:
         return true;
     default:
         return false;
