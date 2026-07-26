@@ -14315,6 +14315,21 @@ static bool jit_delete_originals()
     bool en_a = false; size_t io_a = 0;
     if (!compile_loop(arr, true, en_a, io_a)) return false;
     if (!en_a || io_a == 0) return false;   /* native, but ops KEPT (not deletable) */
+
+    /* A `k - i` (imm - reg) loop: the generic non-throwing IntBin path. `0 - i`
+     * stays a GENERIC IntBin (no imm-reg specialized shape; subtraction can't
+     * swap to RI), and the JIT now emits it (load_operand on both operands +
+     * op_rr). It never throws -> op_fully_native -> the loop is DELETABLE, so
+     * JIT-on DROPS the int ops (proving the generic IntBin ran native - the
+     * interpreted original is gone, no fallback). */
+    const std::vector<const char *> neg = {
+        "var s = 0;",
+        "for (var i = 0; i < 100; i++) { s = s + (0 - i); s = (50 - s) - i; }" };
+    bool en_n = false, en_n2 = false; size_t io_n = 0, io_n2 = 0;
+    if (!compile_loop(neg, false, en_n2, io_n2)) return false;
+    if (!compile_loop(neg, true,  en_n,  io_n))  return false;
+    if (en_n2 || io_n2 == 0)       return false;   /* off: generic IntBins present */
+    if (!en_n || io_n >= io_n2)    return false;   /* on: deleted -> ran native */
     return true;
 #else
     return true;
