@@ -746,14 +746,27 @@ The order:
    across its own call. MEASURED: neutral on the current benches - the
    hot plain-CallV shapes were already leaf-covered (08), self-recursive
    (10), or cold (43's setup call); the container-plan test's main island
-   migrated CallV -> CheckFuncV/MapFilterV (the arc again). The PAYOFF
-   increments on this foundation: **CachedCallV** (fib's 12 islands: the
-   sync helper + a cache probe/store around it keeps the unrolled body
-   native across the frontier calls) and **CallValueV** (12_higher_order/
-   76: same helper shape with the callee from a frame slot +
-   NotCallableEx). Also still open: indirect mutual recursion past the
-   cap pays the bail round-trip (rare; the per-pc entry points backlog
-   item would absorb it).
+   migrated CallV -> CheckFuncV/MapFilterV (the arc again). **Increment 2
+   (CachedCallV + CallValueV via the same sync core) was IMPLEMENTED,
+   MEASURED, and REVERTED (2026-07-25)**: 76_funcval_dispatch **+16%**,
+   11_closure_counter **+17%**, fib +3.2% - the vm_try_invoke boundary
+   machinery (window push + RAII + captures switch + rebind + the arg
+   copy; a stack arg buffer recovered only a little) is HEAVIER per call
+   than the lean in-VM `vm_enter_call` (record REUSE - the N6 win) it
+   displaces, and in call-dominated loops the caller-stays-native saving
+   cannot cover it. Slower = wrong-or-unfinished -> reverted same-turn.
+   **THE FIX DESIGN (the real M5 increment 2): a LEAN SYNC ENTER** - reuse
+   vm_enter_call's own record/window mechanics (non-boundary push, reused
+   records, fast_bind straight from the caller's slot run - no arg copy)
+   and then drive vm_dispatch in a RUN-UNTIL-POP loop (stop when the
+   record count returns to the entry level), so the sync call costs
+   vm_enter_call + one depth check instead of the boundary-invoke
+   protocol. The conveyance pieces (baked site, g_vm_jit_eptr, the depth
+   cap) all carry over. Note plain CallV's sync form has the SAME
+   displacement issue in principle - its measurements were neutral only
+   because the shapes it fires on are cold; revisit it with the lean
+   enter too. Also still open: indirect mutual recursion past the cap
+   pays the bail round-trip (rare; per-pc entry points would absorb it).
 Plus the standing structural item: per-op loc conveyance so the side-table
 re-raise ops (SubscriptV/DictLoad/boxed-arith/...) become DELETABLE (their
 carets currently collide on the EnterNative pc when a run is deleted).
