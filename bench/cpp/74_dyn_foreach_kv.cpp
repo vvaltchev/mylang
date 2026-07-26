@@ -8,27 +8,38 @@
  * (the honest ceiling for "iterate this map N times"). The k+v sum is
  * order-independent, so the unordered iteration order is irrelevant. */
 #include "bench.h"
-#include <unordered_map>
+#include "bench_value.h"
+
+/* BENCH-FAIR (class D): the .my dict is laundered through `dyn` (a
+ * runtime array-vs-dict dispatch per foreach entry) and the accumulator
+ * is dyn - every k + v runs on runtime-tagged fat values, and the dict
+ * itself is Value-keyed (MyLang dict keys are EvalValues hashed by
+ * runtime tag). The old twin iterated a static unordered_map<long,long>:
+ * a different program. */
 
 int main(int argc, char **argv)
 {
     long scale = bench_scale(argc, argv);
     long N = 200000L * scale;
 
-    std::unordered_map<long, long> d;
+    VDict d = std::make_shared<VDictObj>();
     for (long i = 0; i < 100; i++)
-        d[i] = i * 2;
+        d->m[Value(i)] = Value(i * 2);
+    Value dd(d);                        /* the dyn-laundered container */
 
-    long total = 0;
+    Value total((long)0);               /* dyn accumulator */
 
     for (long r = 0; r < N; r++) {
-        /* Break the compiler's proof that d is unchanged, so the inner
-         * foreach is actually re-iterated each rep (not hoisted to C*N). */
-        bench_sink_ptr(&d);
-        for (const auto &kv : d)
-            total += kv.first + kv.second;
+        bench_sink_ptr(d.get());        /* keep the re-iteration honest */
+        /* the per-entry runtime shape dispatch (array vs dict) */
+        if (auto *dict = std::get_if<VDict>(&dd.v)) {
+            for (const auto &kv : (*dict)->m)
+                total = vadd(total, vadd(kv.first, kv.second));
+        } else {
+            value_type_error();
+        }
     }
 
-    printf("result: %ld\n", total % 1000000007);
+    printf("result: %ld\n", vlong(total) % 1000000007);
     return 0;
 }

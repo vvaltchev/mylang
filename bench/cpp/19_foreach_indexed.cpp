@@ -3,6 +3,12 @@
  * over a 1M-element array, repeated R times; accumulates i*e, mod per pass. */
 #include "bench.h"
 
+/* BENCH-FAIR (plans/bench-fairness.md, class C): g++ -O3 auto-VECTORIZED
+ * the hot loop (asm-verified packed ops) - 2-16 lanes per instruction vs
+ * MyLang's scalar native loop. The comparison is meant to be scalar
+ * shape-vs-shape; revisit if MyLang ever vectorizes. */
+#pragma GCC optimize ("no-tree-vectorize", "no-tree-slp-vectorize")
+
 int main(int argc, char **argv)
 {
     long scale = bench_scale(argc, argv);

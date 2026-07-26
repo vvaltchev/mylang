@@ -7,13 +7,19 @@
  * the compiler would close-form to N*(N+1)/2, so bench_sink(s) per iteration
  * (rule a) keeps the per-call work real and the loop O(N). */
 #include "bench.h"
+#include <functional>
 
 int main(int argc, char **argv)
 {
     long scale = bench_scale(argc, argv);
 
-    /* mk(0): a closure over a mutable captured `start` (initially 0). */
-    auto c = [start = 0L]() mutable { start++; return start; };
+    /* mk(0): a closure over a mutable captured `start` (initially 0).
+     * BENCH-FAIR (class B): the raw `auto` lambda DISSOLVED at -O3 into a
+     * two-instruction register loop (asm-verified) - the counterpart of
+     * an inlined call, not of MyLang's heap-backed FuncObject VALUE
+     * called indirectly. std::function is C++'s type-erased closure
+     * value with the same flexibility - the fair twin. */
+    std::function<long()> c = [start = 0L]() mutable { start++; return start; };
 
     long N = 1000000L * scale;
     long s = 0;
