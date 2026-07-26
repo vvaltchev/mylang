@@ -1207,6 +1207,21 @@ static const std::vector<test> tests =
     },
 
     {
+        /* use-before-def of a global CONTAINER base in a store loop: exercises
+         * StoreElemValue's undefined-global BAIL (kind==1, the base slot
+         * undefined -> return 1 with NO g_vm_jit_exc -> the interpreter re-runs
+         * the store + throws UndefinedVariableEx, a plain Exception). f writes
+         * g[i] before `var g` runs. */
+        "use-before-def global store (StoreElemValue bail)",
+        {
+            "func f() { for (var i = 0; i < 20; i++) g[i] = i; }",
+            "f();",
+            "var g = [0, 0, 0];",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
         "defined() builtin",
         {
             "assert(defined(a) == 0);",
@@ -14987,6 +15002,17 @@ static bool jit_op_nativized()
             "  return last;",
             "}",
             "assert(f(runtime(\"hello\"), 5) == \"he\");" } },
+        /* StoreElemValue: the UNIVERSAL subscript store `a[i] = v` on a dyn /
+         * general array each loop iteration runs native (jit_store_elem_value ->
+         * vm_subscript_store). The loop fragments; the store's original is kept
+         * (re-raises / bails, not op_fully_native) but the fragment runs the
+         * native helper. */
+        { OpCode::StoreElemValue, {
+            "func f(dyn a, int n) {",
+            "  for (var i = 0; i < n; i++) a[i] = i * 2;",
+            "  return a[3];",
+            "}",
+            "assert(f(runtime([0, 0, 0, 0, 0]), 5) == 6);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

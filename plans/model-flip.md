@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (21 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (22 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -370,7 +370,10 @@ defined case native, the rare undefined case BAILS to the interpreter, N4-style,
 so NO exception-model change - see its backlog entry). And **SliceV**
 (`jit_slice` - a slice `base[start:end]` via the runtime Type::slice; only
 TypeErrorEx is thrown, a RuntimeException -> re-raise; the jit_container test's
-island moved to MakeArrayV - see its backlog entry).
+island moved to MakeArrayV - see its backlog entry). And **StoreElemValue**
+(`jit_store_elem_value` - the UNIVERSAL subscript store `a[i]=v`, ANY base incl.
+global/capture via a `kind` arg; an undefined-global base bails, a subscript
+throw re-raises - see its backlog entry).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -528,7 +531,27 @@ to do LATER, separately (don't forget these):
   caret). **The jit_container test's island moved from SliceV to MakeArrayV** (an
   array literal `[a]` - now the container gate's only non-op_run_eligible
   op_is_simple_island source; ALL simple scalar ops AND SliceV are nativized).
-- **The remaining container stores** — the other boxed ops still splitting runs.
+- **StoreElemValue** — DONE (2026-07-23). The UNIVERSAL subscript store
+  `a[i] = v` / `a[i] OP= v` (flat / general / dict, ANY base) via
+  jit_store_elem_value -> the interpreter's exact vm_subscript_store. Unlike
+  StoreElemInt/DictStore (a LOCAL frame-slot base lea'd in the emit), the base
+  may be GLOBAL/CAPTURE, so the emit passes `kind` (0/1/2, from `target`) + the
+  base slot and the helper forms the LValue*. TWO throw sources, both `return 1`
+  (EnterNative distinguishes by whether g_vm_jit_exc is set): (1) an UNDEFINED
+  GLOBAL base bails-to-reinterpret (no exc, N4-style like LoadGlobalV -> the
+  interpreter re-runs + throws UndefinedVariableEx); (2) vm_subscript_store's
+  OOB/KeyNotFound/TypeError/NotLValue (all RuntimeException) -> g_vm_jit_exc ->
+  re-raise. NOT op_fully_native. aop is passed in r8 (5th arg; re-materialised to
+  t_float by the epilogue after the call). EXECUTION-PROVEN: jit_op_nativized
+  StoreElemValue case (general-array store loop) + verified all 4 paths
+  (general/global native, OOB re-raise byte-identical, undefined-global bail
+  vm==nj) + a use-before-def-global-store `tests` entry.
+- **The remaining container stores** (StoreMemberV `s.f=v`, StoreCaptureV
+  `cap=v`, StoreElem2V/StoreElemChainV/StoreLValueChainV nested chains) — 0x in
+  benches, less common; the same shape (vm_member_store / the chain walks; watch
+  CannotChangeConstEx - a plain Exception, but a const-container store throws
+  NotLValueEx not CannotChangeConstEx, and the undefined-global bail covers the
+  base).
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);
