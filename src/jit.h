@@ -191,6 +191,14 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept;
 extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
                              LValue *dst) noexcept;
 
+/* model-flip (nativize-ops): the native SliceV `dst = base[start:end]` via the
+ * runtime Type::slice (COW-registered sub-view). base/start/end/dst are frame
+ * slots (start/end == -1 -> none); frame via g_current_ctx. Only TypeErrorEx
+ * (RuntimeException) is thrown -> caught loc-less into g_vm_jit_exc, non-0
+ * return; EnterNative re-raises (caret from the loc side table). */
+extern "C" int jit_slice(int_type base_slot, int_type start_slot,
+                         int_type end_slot, int_type dst_slot) noexcept;
+
 /* model-flip (nativize-ops): LoadBuiltinV natively - `slots[dst] =
  * builtin_slot[idx].get()` (the program-wide builtin table; a trivial value,
  * never throws). `slots` = the frame base (rdi). */

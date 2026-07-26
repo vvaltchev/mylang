@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (20 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (21 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -367,7 +367,10 @@ single blocker at 83 island occurrences) - see its backlog entry for the
 in-VM/boundary paths + why "native_leaf needs a trailing ReturnV" was a
 non-issue. And **LoadGlobalV** (`jit_load_global` - a global read; the common
 defined case native, the rare undefined case BAILS to the interpreter, N4-style,
-so NO exception-model change - see its backlog entry).
+so NO exception-model change - see its backlog entry). And **SliceV**
+(`jit_slice` - a slice `base[start:end]` via the runtime Type::slice; only
+TypeErrorEx is thrown, a RuntimeException -> re-raise; the jit_container test's
+island moved to MakeArrayV - see its backlog entry).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -516,8 +519,16 @@ to do LATER, separately (don't forget these):
   EXECUTION-PROVEN: jit_op_nativized LoadGlobalV case (hot loop reading a defined
   global, counter bumps) + a use-before-def-global `tests` entry (the bail throws
   UndefinedVariableEx on both engines).
-- **SliceV / the remaining container stores** — the other boxed ops still
-  splitting runs.
+- **SliceV** — DONE (2026-07-23). A slice `base[start:end]` runs native via
+  jit_slice (the runtime Type::slice - the COW-registered sub-view; start/end ==
+  -1 -> none). Only TypeErrorEx (a non-int bound / non-sliceable base) is thrown
+  (slices CLAMP out-of-range, no OOB), and it is a RuntimeException -> caught
+  loc-less into g_vm_jit_exc + re-raised (byte-identical caret across
+  vm/nj/tw, VERIFIED, + catchable in a fragment). NOT op_fully_native (side-table
+  caret). **The jit_container test's island moved from SliceV to MakeArrayV** (an
+  array literal `[a]` - now the container gate's only non-op_run_eligible
+  op_is_simple_island source; ALL simple scalar ops AND SliceV are nativized).
+- **The remaining container stores** — the other boxed ops still splitting runs.
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);
