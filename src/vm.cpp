@@ -4414,6 +4414,72 @@ vm_frame_setup(VmActivation &act, EvalContext &ctx, const Chunk *ret_chunk,
 }
 
 /*
+ * LEVER 1 STEP 2 (plans/native-gap-roadmap.md) - the COMMON-SHAPE call
+ * push. The callgrind split on 10_recursion_deep put ~500 Ir of protocol
+ * on EVERY call: vm_frame_setup 232 (of which ~30 was just the prologue/
+ * epilogue - the unique_ptr<PureCacheKey> PARAMETER drags in exception
+ * scaffolding and a fat spill frame even when it is always null),
+ * vm_frame_leave ~174, jit_ret ~64, and the vm_enter_call wrapper ~36 (a
+ * second NOINLINE layer whose only job was two assignments). This twin is
+ * the same push with the cold machinery hoisted by its GATE instead of
+ * re-decided per call: the caller checks `d->fast_bind` (no coerced
+ * params -> the bind is a plain copy loop that CANNOT throw, so no
+ * try/cleanup), and there is NO cache-key parameter at all (a plain CallV
+ * / a value call never has one; a CachedCallV with a live miss-key takes
+ * the general path). push_window itself measured lean already (its
+ * segment/record-reuse branches are predicted) - it is shared, not
+ * duplicated. rec.cache_key is left untouched: a reused record's was
+ * reset by pop_window, a fresh one default-constructs null (checked).
+ * ALWAYS_INLINE: inlined into the two NOINLINE users below/in the sync
+ * core, so the call depth stays ONE out-of-line call per VM call op.
+ */
+static ML_ALWAYS_INLINE Frame *
+vm_frame_setup_lean(VmActivation &act, EvalContext &ctx,
+                    const Chunk *ret_chunk, size_t ret_pc, FuncObject &fo,
+                    const Chunk *cck, int_type argbase, size_t nargs,
+                    int_type dst)
+{
+    const FuncDescriptor *d = fo.func;
+    const size_t nparams = d->params.size();
+    if (nargs > nparams || nargs < static_cast<size_t>(d->min_args))
+        throw InvalidNumberOfArgsEx();
+
+    LValue *argrun = nargs ? &ctx.frame->at(argbase) : nullptr;
+    const int_type total =
+        d->frame_size + static_cast<int_type>(cck->n_temps);
+    Frame *w = act.push_window(total, cck, /*boundary=*/false);
+    VmCallRec &rec = act.back_rec();
+    rec.ret_chunk = ret_chunk;
+    rec.ret_pc = ret_pc + 1;
+    rec.dst = dst;
+    rec.desc = d;
+    rec.caller_captures = ctx.captures;
+    ML_CHECK(!rec.cache_key);            /* pop reset it / fresh is null */
+
+    for (size_t i = 0; i < nargs; i++)
+        w->at(static_cast<int_type>(i)).rebind(argrun[i].get());
+    for (size_t i = nargs; i < nparams; i++)
+        w->at(static_cast<int_type>(i)).rebind(EvalValue());
+
+    ctx.captures = &fo.capture_slots;
+    return w;
+}
+
+/* The lean twin of vm_enter_call (the common shape: fast_bind + no cache
+ * key). ONE out-of-line call from the dispatch loop (the loop-body text
+ * rule), with the setup inlined - the old shape paid a second nested
+ * NOINLINE call plus the null unique_ptr's ABI. */
+static ML_NOINLINE void
+vm_enter_call_lean(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
+                   size_t &pc, FuncObject &fo, const Chunk *cck,
+                   int_type argbase, size_t nargs, int_type dst)
+{
+    vm_frame_setup_lean(act, ctx, chunk, pc, fo, cck, argbase, nargs, dst);
+    chunk = cck;
+    pc = 0;
+}
+
+/*
  * The interpreter's in-VM CALL: the frame-setup core plus the chunk/pc SWITCH
  * to the callee (the loop then dispatches the callee's ops). The native-call
  * path (plans/native-aot.md #55) will instead `call` the callee's fragment
@@ -4441,6 +4507,22 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
  * on those locals: the native ReturnV will read a slot into `res`, call this,
  * and ret a SENTINEL that makes EnterNative apply the same globals.
  */
+/* The CACHED-call tail (cold): the unique_ptr key handling lives OUT of
+ * the hot leave below - a unique_ptr local drags exception scaffolding
+ * and a fat spill frame into every return otherwise (the same disease
+ * the lean setup cured on the push side; lever 1). */
+static ML_NOINLINE void
+vm_frame_leave_cached(VmActivation &act, EvalContext &ctx, EvalValue &&res,
+                      int_type dst)
+{
+    std::unique_ptr<PureCacheKey> ckey = std::move(act.back_rec().cache_key);
+    act.pop_window();
+    if (res.get_type()->t < Type::t_str)
+        ctx.frame->ensure_pure_cache().emplace(std::move(*ckey), res);
+    if (dst >= 0)
+        ctx.frame->at(dst).put(std::move(res));
+}
+
 static ML_NOINLINE void
 vm_frame_leave(VmActivation &act, EvalContext &ctx, EvalValue res)
 {
@@ -4449,10 +4531,11 @@ vm_frame_leave(VmActivation &act, EvalContext &ctx, EvalValue res)
     g_vm_resume_chunk = dead.ret_chunk;
     g_vm_resume_pc = dead.ret_pc;
     const int_type dst = dead.dst;
-    std::unique_ptr<PureCacheKey> ckey = std::move(dead.cache_key);
+    if (dead.cache_key) {                        /* cold: a CachedCallV miss */
+        vm_frame_leave_cached(act, ctx, std::move(res), dst);
+        return;
+    }
     act.pop_window();
-    if (ckey && res.get_type()->t < Type::t_str)
-        ctx.frame->ensure_pure_cache().emplace(std::move(*ckey), res);
     if (dst >= 0)                /* -1 = a DISCARDED call statement's dst
                                   * (the peephole's dead-dst rule) */
         ctx.frame->at(dst).put(std::move(res));
@@ -4661,9 +4744,14 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
      * interpreted op re-run and re-throw byte-identically. */
     Frame *w;
     try {
-        w = vm_frame_setup(act, ctx, &vm_sync_stop_chunk(), /*ret_pc=*/0,
-                           fo, cck, argbase, static_cast<size_t>(nargs),
-                           dst, std::move(key));
+        if (d->fast_bind && !key)        /* lever 1: the lean push */
+            w = vm_frame_setup_lean(act, ctx, &vm_sync_stop_chunk(),
+                                    /*ret_pc=*/0, fo, cck, argbase,
+                                    static_cast<size_t>(nargs), dst);
+        else
+            w = vm_frame_setup(act, ctx, &vm_sync_stop_chunk(), /*ret_pc=*/0,
+                               fo, cck, argbase, static_cast<size_t>(nargs),
+                               dst, std::move(key));
     } catch (...) {
         return 1;
     }
@@ -6750,9 +6838,18 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                     pc++;
                     VM_NEXT;
                 }
-                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
-                              static_cast<size_t>(in->b_lit()), in->target,
-                              std::move(pending_key));
+                /* lever 1: the common shape (plain-copy bind, no live
+                 * cache miss-key) takes the lean push - no unique_ptr
+                 * ABI, one call layer. */
+                if (fo.func->fast_bind && !pending_key)
+                    vm_enter_call_lean(act, ctx, chunk, pc, fo, cck,
+                                       in->a_lit(),
+                                       static_cast<size_t>(in->b_lit()),
+                                       in->target);
+                else
+                    vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
+                                  static_cast<size_t>(in->b_lit()),
+                                  in->target, std::move(pending_key));
                 code = chunk->code.data();
                 VM_NEXT;
             }
@@ -6804,9 +6901,15 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             }
             if (const Chunk *cck =
                     static_cast<const Chunk *>(fo.func->vm_chunk)) {
-                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
-                              static_cast<size_t>(in->b_lit()), in->target,
-                              nullptr);
+                if (fo.func->fast_bind)          /* lever 1: lean push */
+                    vm_enter_call_lean(act, ctx, chunk, pc, fo, cck,
+                                       in->a_lit(),
+                                       static_cast<size_t>(in->b_lit()),
+                                       in->target);
+                else
+                    vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
+                                  static_cast<size_t>(in->b_lit()),
+                                  in->target, nullptr);
                 code = chunk->code.data();
                 VM_NEXT;
             }

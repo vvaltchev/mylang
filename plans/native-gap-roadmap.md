@@ -21,7 +21,20 @@ those classes in impact order.
 
 ## The six levers (impact x feasibility order)
 
-1. **Nativize the call protocol's fast path.** The single biggest class:
+1. **Nativize the call protocol's fast path.** STEP 1+2 LANDED
+   2026-07-26 (the profile split + the lean C++ push/leave; see
+   CLAUDE.md "LEVER 1"): the measured per-call protocol was ~500 Ir
+   (setup 232 incl. ~30 prologue from the unique_ptr param ABI, leave
+   ~174, jit_ret ~64, the enter wrapper ~36). vm_frame_setup_lean /
+   vm_enter_call_lean (fast_bind + no cache key -> no unique_ptr, no
+   coerce branch, one call layer) + vm_frame_leave's cached tail split
+   cold. 10_recursion_deep Ir -9.5% (wall -15%), 11 -2.9%, 63 -1.5%;
+   fib +0.9% Ir (cached tail's extra layer, wall-neutral). REMAINING
+   per-call fat (next steps): vm_frame_leave's LValue::put on the dst
+   (~29) + pop_window's ref-scan (~29) + jit_ret's result copy chain;
+   then the record-push INLINE in the fragment (the true native call,
+   needs the sync-stop/dispatch handoff translated to machine code).
+   (original analysis follows) The single biggest class:
    10_recursion_deep (94x), 11_closure_counter (76x), 63_closures (53x),
    76_funcval (26x), 08/09, every call-heavy program.
    vm_frame_setup (~135 Ir) + vm_frame_leave (~92 Ir) per call; the
