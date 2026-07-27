@@ -14991,6 +14991,23 @@ static bool jit_native_stack_deep()
                         "run native\n");
         return false;
     }
+    /* M5c: the CACHED call's inline path - a fib shape's CachedCallV
+     * sites take the probe + inline push (warm second call; the caching
+     * caller's live pure_cache no longer declines - the stash is inline).
+     * The counter is the site's emitted inc, so growth proves the
+     * cached fast path specifically. */
+    const unsigned long f0 = g_jit_sync_inline;
+    if (!run({
+            "func fib(n) { if (n < 2) { return n; }",
+            "  return fib(n - 1) + fib(n - 2); }",
+            "assert(fib(20) == 6765);",
+            "assert(fib(20) == 6765);" }))
+        return false;
+    if (g_jit_sync_inline <= f0) {
+        fprintf(stderr, "jit_native_stack_deep: cached calls did not take "
+                        "the inline path\n");
+        return false;
+    }
     /* the TYPED-param shape: helper-path native depth (coerce bind) */
     const unsigned long c0 =
         g_jit_op_run[static_cast<size_t>(OpCode::CallV)];

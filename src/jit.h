@@ -161,6 +161,9 @@ extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
  * handles a direct-entered callee's non-sentinel exit (shared with the
  * helper path's direct branch). */
 extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept;
+extern "C" int jit_cached_probe(const void *desc, int_type argbase,
+                                int_type nargs, int_type dst) noexcept;
+void *jit_addr_pending_key();
 void *jit_addr_sync_depth();
 int jit_sync_depth_cap();
 void jit_set_sync_depth_cap(int cap);   /* M5a: raised when the native
@@ -185,7 +188,8 @@ struct JitPushLayout {
     ptrdiff_t rec_window, rec_nslots, rec_seg, rec_seg_top_before,
               rec_run_chunk, rec_ret_chunk, rec_ret_pc, rec_dst, rec_desc,
               rec_caller_caps, rec_handler_base, rec_diter_base,
-              rec_dyiter_base, rec_boundary, rec_sync_stop;
+              rec_dyiter_base, rec_boundary, rec_sync_stop,
+              rec_cache_key, rec_caller_cache;
     /* FuncDescriptor */
     ptrdiff_t desc_params, desc_frame_size, desc_fast_bind;
     size_t param_desc_size;
