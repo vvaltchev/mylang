@@ -120,7 +120,16 @@ private:
             tvec_type tvec;    /* kind == strs */
         };
 
-        std::unordered_set<SharedArrayObjTempl *> slices;
+        /* Lever 3 inc 1 (2026-07-27): POOLED nodes - the per-slice
+         * register/unregister was ~27% malloc/free on the slice-loop
+         * bench (a hashtable node per insert). Same drop-in as the dict's
+         * inner_type (H2 v2): node-POINTER stability untouched, ASan
+         * pass-through via the pool itself. Elements are raw pointers -
+         * no held-node invariants beyond the container's own. */
+        std::unordered_set<SharedArrayObjTempl *,
+                           std::hash<SharedArrayObjTempl *>,
+                           std::equal_to<SharedArrayObjTempl *>,
+                           PoolAlloc<SharedArrayObjTempl *>> slices;
 
         /*
          * When set, this array's data is read-only: it backs a `const` value,
