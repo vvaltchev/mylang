@@ -14842,13 +14842,18 @@ static bool jit_container()
         return ok;
     };
 
-    const unsigned long b0 = g_jit_container_calls;
-    /* (1) a boxed-island container; correct result. Discarded DYN-callee
-     * calls are the island source (CheckCallableV + CallValueGenericV - the
-     * last still-boxed sequential pair, now that the scalar ops, SliceV,
-     * the container/struct builds, DeclConstV AND map/filter are all
-     * nativized; AST-FREE like every op - it reads the call_sites pool -
-     * just not yet given an emit case); their array args compile to ELIGIBLE ops, so the islands
+    /* THE ISLAND-SOURCE HOP CHAIN IS EXHAUSTED (2026-07-25): with the
+     * dyn-callee pair (CheckCallableV/CallValueGenericV) nativized, NO
+     * sequential op remains that op_is_simple_island admits but
+     * op_run_eligible rejects - so jit_try_container can no longer form a
+     * container from real code, and these former container shapes now
+     * compile FULLY NATIVE. The g_jit_container_calls assertions are
+     * therefore retired; the vm_exec_block machinery (M2) stays covered by
+     * the synthetic vm_exec_block_selftest, and the container path remains
+     * in place for future un-nativizable ops. These cases stay as
+     * correctness pins for the shapes themselves.
+     *
+     * (1) discarded DYN-callee calls (formerly the island source); their array args compile to ELIGIBLE ops, so the islands
      * are the check+call pairs. Returns the arg. runtime() keeps the call
      * non-const so the pure call isn't folded away (else cleaf never runs
      * -> no container). */
@@ -14862,8 +14867,6 @@ static bool jit_container()
                "}",
                "assert(cleaf(runtime(\"hello\")) == \"hello\");" }))
         return false;
-    if (g_jit_container_calls <= b0)
-        return false;   /* the container's island call did NOT run */
     /* (2) a JIT-thrown div-by-zero (native BinOpV `x / b` -> jit_boxed_binop
      * catches div0 -> g_vm_jit_exc -> EnterNative re-raises) is catchable. */
     if (!run({ "func cx(dyn a, dyn b) {",
@@ -14876,14 +14879,8 @@ static bool jit_container()
                "catch (DivisionByZeroEx) { caught = true; }",
                "assert(caught);" }))
         return false;
-    /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
-     * (native ops + the for.step back edge) iterates in machine code, only the
-     * island (the dyn call `f([1, 2])` - CheckCallableV/CallValueGenericV,
-     * the still-boxed pair) calls jit_exec_block; `var j = i + 1` is native.
-     * The arg is returned. (The island was `const c = [..]` / DeclConstV,
-     * then `map(...)`, until each went native - the recurring island-source
-     * hop.) */
-    const unsigned long b1 = g_jit_container_calls;
+    /* (3) a native LOOP whose body holds a dyn call - formerly a container
+     * with a per-iteration island, now fully native end to end. */
     if (!run({ "func lc(dyn a, int n) {",
                "  var dyn last = a;",
                "  var dyn f = len;",
@@ -14894,8 +14891,6 @@ static bool jit_container()
                "  return last;",
                "}",
                "assert(lc(runtime(\"hello\"), 5) == \"hello\");" }))
-        return false;
-    if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
         return false;
     /* (4) MULTIPLE fragments/regions in one body - an init `[a]` and a body
      * `[a]` (MakeArrayV, native since the nativize-ops pass; kept as a
@@ -15917,6 +15912,31 @@ static bool jit_op_nativized()
             "  s = s + m[1];",
             "}",
             "assert(s == 12);" } },
+        /* The dyn-callee generic call: a dyn BUILTIN callee dispatched by
+         * Kind, and a dyn CLOSURE callee via the lean sync core. */
+        { OpCode::CallValueGenericV, {
+            "var dyn f = len;",
+            "var s = 0;",
+            "for (var i = 0; i < 5; i++) s += f([1, 2, i]);",
+            "assert(s == 15);",
+            "func mk(start) => func [start] { start++; return start; };",
+            "var dyn c = mk(0);",
+            "var t = 0;",
+            "for (var i = 0; i < 4; i++) t += c();",
+            "assert(t == 10);" } },
+        /* CheckCallableV's throw: a dyn NON-callable callee raises
+         * NotCallableEx with the callee caret BEFORE the args evaluate
+         * (script-caught). */
+        { OpCode::CheckCallableV, {
+            "func f(dyn v, int n) {",
+            "  var r = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { var dyn q = v(i); r += 1; }",
+            "    catch (NotCallableEx) { r += 2; }",
+            "  }",
+            "  return r;",
+            "}",
+            "assert(f(runtime(5), 3) == 6);" } },
         /* CheckFuncV's throw: a dyn non-func arg0 raises BEFORE arg1's
          * code runs, with arg0's caret (script-caught). */
         { OpCode::CheckFuncV, {
@@ -16896,17 +16916,16 @@ static bool vm_disasm_container_plan()
         const Block *b = dynamic_cast<const Block *>(root.get());
         if (b) {
             const std::string d = disassemble_program(b);
-            /* main: a MIXED chunk -> NOT ready + at least one island line.
-             * The island is now the discarded DYN call `dcf(...)` - the
-             * CheckCallableV/CallValueGenericV pair, the last still-boxed
-             * op family (AST-free like all ops; no emit case yet). (The island source hopped again: it was
-             * the CallV until the M5 sync call, then map()'s CheckFuncV/
-             * MapFilterV until those went native - each migration is the
-             * nativize-ops arc working.) */
+            /* main: with the dyn-callee pair nativized (the LAST formerly
+             * boxed sequential ops), every op in main is native-eligible -
+             * the container plan is READY and NO island line exists. The
+             * island-source hop chain (SliceV -> ... -> map/filter -> the
+             * dyn call) is EXHAUSTED; a NOT-ready plan reappearing here
+             * means a new un-nativizable op entered real code. */
             const std::string mn = section(d, "; ===== main");
             const bool mixed_ok =
-                mn.find("container plan: NOT ready") != std::string::npos
-                && mn.find("island [pc") != std::string::npos;
+                mn.find("container plan: READY") != std::string::npos
+                && mn.find("island [pc") == std::string::npos;
             /* add: with MIN_RUN removed (2026-07-25) its 2-op body forms a
              * run, becomes a NATIVE_LEAF (whole body -> one call-able
              * fragment, #55) and its interpreted ops are DELETED - so the
