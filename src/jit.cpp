@@ -6382,10 +6382,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * not attempted execution, unlike a bail at its OWN pc). A RUN-HEAD
      * target needs no insertion (the head EnterNative exists); an
      * INTERIOR entry pc gets an EnterNative inserted DIRECTLY BEFORE its
-     * op + a stub. PushHandler/CatchTest targets are EXCLUDED from
-     * entry mapping: a handler's first op (CatchTest) is an exit-at-op
-     * native, so entering there would be enter->exit->reinterpret -
-     * pure overhead; the catch flow rejoins native at the back edge.
+     * op + a stub. PushHandler's target (the MATCHER pc) is EXCLUDED
+     * from entry mapping: a handler's first op (CatchTest) is an
+     * exit-at-op native, so entering there would be
+     * enter->exit->reinterpret - pure overhead. A CatchTest's target
+     * (the CATCH BODY) is an ordinary resume and IS entry-mapped
+     * (#74 inc 2), so a matched catch runs its body natively instead
+     * of interpreting until the back edge.
      *
      * THE DUAL REMAP: `remap` (bails, exit-at-own-pc, side tables) maps
      * an entry pc to its ORIGINAL op - a bailed op must re-run
@@ -6425,12 +6428,19 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             case OpCode::JumpUnlessElemInt:
             case OpCode::IntAddStep:
             case OpCode::ForStepElemInt:
+            /* #74 inc 2: a CatchTest's target is the CATCH BODY - an
+             * ordinary resume (the matcher matched, bound, and jumps
+             * there), so the body runs NATIVE instead of interpreting to
+             * the back edge. Only the matcher pc itself (PushHandler's
+             * target) stays excluded - entering THERE would be
+             * enter->exit-at-op->reinterpret, pure overhead. */
+            case OpCode::CatchTest:
                 if (in.target >= 0
                         && interior_of_kept(static_cast<size_t>(in.target)))
                     entries.push_back(
                         { static_cast<size_t>(in.target), 0 });
                 break;
-            default:                    /* PushHandler/CatchTest excluded */
+            default:                    /* PushHandler excluded (matcher pc) */
                 break;
             }
         }
@@ -6672,14 +6682,17 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             case OpCode::JumpUnlessElemInt:
             case OpCode::IntAddStep:
             case OpCode::ForStepElemInt:
+            /* #74 inc 2: CatchTest's target = the CATCH BODY, a resume
+             * like any branch target - route it to the entry map so a
+             * matched catch runs its body natively. */
+            case OpCode::CatchTest:
                 /* control-flow targets = RESUMES -> the entry map (a run
                  * head's EnterNative / an interior entry's inserted one) */
                 if (in.target >= 0 && static_cast<size_t>(in.target) <= n)
                     in.target = entry_remap[in.target];
                 break;
-            case OpCode::CatchTest:
             case OpCode::PushHandler:
-                /* exception-machinery targets stay on the ORIGINALS: a
+                /* the MATCHER chain's pc stays on the ORIGINALS: a
                  * handler's first op (CatchTest) is an exit-at-op native,
                  * so entering it natively is enter->exit->reinterpret */
                 if (in.target >= 0 && static_cast<size_t>(in.target) <= n)
