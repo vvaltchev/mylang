@@ -15766,6 +15766,44 @@ static bool jit_op_nativized()
             "  return r;",
             "}",
             "assert(f(runtime([[1, 2, 3]])) == 9);" } },
+        /* M5 inc 3 (LEAN SYNC ENTER): CachedCallV - the recursion-unroll's
+         * frontier calls run sync from the caller's fragment; the cache
+         * probe (hit AND miss + record-riding key store) both exercise. */
+        { OpCode::CachedCallV, {
+            "func fib(n) => n < 2 ? n : fib(n-1) + fib(n-2);",
+            "var s = 0;",
+            "for (var i = 0; i < 3; i++) s += fib(runtime(15));",
+            "assert(s == 1830);" } },
+        /* CachedCallV's throw path: the callee raises deep in the sync
+         * NEST (each level a helper+dispatch), the walk stops at each sync
+         * record, and the top CALLER's same-frame handler catches. (The
+         * callee must stay PURE - n/(n-n) not n/runtime(0) - else it is
+         * not cacheable and no CachedCallV exists at all.) */
+        { OpCode::CachedCallV, {
+            "func t(n) => n < 2 ? n / (n - n) : t(n-1) + t(n-2);",
+            "var c = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  try { c += t(runtime(5)); }",
+            "  catch (DivisionByZeroEx) { c += 1; }",
+            "}",
+            "assert(c == 3);" } },
+        /* CallValueV: an indirect func-VALUE call (a value-used lambda -
+         * dispatched from an array, so no template redirect) runs sync. */
+        { OpCode::CallValueV, {
+            "var ops = [func (x) => x + 1, func (x) => x * 2];",
+            "var s = 0;",
+            "for (var i = 0; i < 6; i++) { var f = ops[i % 2]; s += f(i); }",
+            "assert(s == 27);" } },
+        /* CallValueV's throw path: the value-called lambda raises; the
+         * sync conveyance dispatches the caller's same-frame handler. */
+        { OpCode::CallValueV, {
+            "var ops = [func (x) => x / (x - x)];",
+            "var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var f = ops[0];",
+            "  try { s += f(i); } catch (DivisionByZeroEx) { s += 2; }",
+            "}",
+            "assert(s == 6);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

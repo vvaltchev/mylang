@@ -1293,6 +1293,41 @@ static void emit_call_epilogue(Emitter &e)
     e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
 }
 
+/* M5: emit a SYNC call op (CallV / CachedCallV / CallValueV - one emit
+ * shape, only the helper differs): jit_call_sync*(target2, argbase, nargs,
+ * dst, site) runs the callee to completion via the lean sync enter (vm.cpp)
+ * and the caller continues natively on 0. Non-0 -> exit (a bail re-runs the
+ * interpreted op; a throw rides g_vm_jit_exc / g_vm_jit_eptr). The baked
+ * site = the op's side-table loc start (the lazy in-VM backtrace capture's
+ * loc); the loc table is still OLD-pc-keyed at emission (the side tables
+ * are remapped AFTER), so look up with old_pc, not the remapped pc (a
+ * remapped lookup silently found nothing and baked site 0, which showed as
+ * `at line 0` in a backtrace). */
+static void emit_sync_call(Emitter &e, const Chunk &ck, const Instr &in,
+                           uint32_t pc, size_t old_pc, const void *helper,
+                           OpCode op)
+{
+    Loc ls, le;
+    ck.loc_at(old_pc, ls, le);
+    const uint64_t site =
+        (static_cast<uint64_t>(static_cast<uint32_t>(ls.line)) << 32)
+        | static_cast<uint32_t>(ls.col);
+    e.bump_op(op);
+    emit_call_prologue(e);
+    e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+    e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+    e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+    e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+    e.movabs_r8(site);
+    e.call_relocs.push_back({ e.pos(), helper });
+    e.u8(0xE8); e.u32(0);
+    emit_call_epilogue(e);
+    e.u8(0x85); e.u8(0xC0);                   /* test eax, eax */
+    const size_t j_ok = e.j8(0x74);
+    e.exit_pc(pc);
+    e.patch8(j_ok, e.pos());
+}
+
 /* Emit a call to the INT put helper: rdi = &frame->slots[slot], rsi = the
  * int value (src_reg). rdi still = the slots base after the prologue's
  * pushes, so lea computes &slot; src_reg (rax/rdx) is not among the saved
@@ -3839,42 +3874,33 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xC3);                                        /* ret (rax=sentinel)*/
         return true;
 
+    case OpCode::CachedCallV:
+        /* M5 inc 3 (LEAN SYNC ENTER): the cached recursive call - the helper
+         * probes the caller's per-frame pure cache, else pushes the callee
+         * frame (the miss key riding its record) and runs it to completion;
+         * the caller continues natively either way. */
+        emit_sync_call(e, ck, in, pc, old_pc,
+                       reinterpret_cast<const void *>(jit_call_sync_cached),
+                       OpCode::CachedCallV);
+        return true;
+
+    case OpCode::CallValueV:
+        /* M5 inc 3: the indirect func-VALUE call (closure/lambda/func var -
+         * the callee was evaluated into the target2 temp). A non-func value
+         * bails to the interpreted op's NotCallableEx. */
+        emit_sync_call(e, ck, in, pc, old_pc,
+                       reinterpret_cast<const void *>(jit_call_sync_value),
+                       OpCode::CallValueV);
+        return true;
+
     case OpCode::CallV: {
         if (!callv_native_ok(in, jc)) {
             /* M5: the SYNC call - jit_call_sync(callee_slot, argbase, nargs,
              * dst, site) runs the callee to completion (its own fragments
-             * active inside); this fragment continues natively on 0. The
-             * baked site = the CallV's side-table loc start (the lazy in-VM
-             * backtrace capture's loc). Non-0 -> exit (bail re-runs the op;
-             * a throw rides g_vm_jit_exc / g_vm_jit_eptr). */
-            /* the loc table is still OLD-pc-keyed at emission (the side
-             * tables are remapped AFTER) - look up with old_pc, not the
-             * remapped pc (a remapped lookup silently found nothing and
-             * baked site 0, which showed as `at line 0` in a backtrace). */
-            Loc ls, le;
-            ck.loc_at(old_pc, ls, le);
-            const uint64_t site =
-                (static_cast<uint64_t>(static_cast<uint32_t>(ls.line)) << 32)
-                | static_cast<uint32_t>(ls.col);
-            e.bump_op(OpCode::CallV);
-            emit_call_prologue(e);
-            e.movabs(RDI, static_cast<uint64_t>(
-                              static_cast<int_type>(in.target2)));
-            e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
-            e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
-            e.movabs(RCX, static_cast<uint64_t>(
-                              static_cast<int_type>(in.target)));
-            e.movabs_r8(site);
-            e.call_relocs.push_back(
-                { e.pos(), reinterpret_cast<const void *>(jit_call_sync) });
-            e.u8(0xE8); e.u32(0);
-            emit_call_epilogue(e);
-            e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
-            {
-                const size_t j_ok = e.j8(0x74);
-                e.exit_pc(pc);
-                e.patch8(j_ok, e.pos());
-            }
+             * active inside); this fragment continues natively on 0. */
+            emit_sync_call(e, ck, in, pc, old_pc,
+                           reinterpret_cast<const void *>(jit_call_sync),
+                           OpCode::CallV);
             return true;
         }
         /* #55 STEP 2.1: a NATIVE direct call (the run builder included it only
@@ -4418,8 +4444,17 @@ static bool op_run_eligible(const Instr &in, const JitCtx *jc)
      * a self-recursive caller gains nothing from staying native across
      * the call - ineligible keeps the pre-M5 shape (the op splits the
      * run; the lean interpreted vm_enter_call runs it). NOT
-     * op_fully_native. CachedCallV / CallValueV are the next
-     * increments. */
+     * op_fully_native.
+     *
+     * Inc 3 (lean sync enter): CachedCallV and CallValueV are eligible
+     * too. CachedCallV is by definition SELF-recursive (a cacheable
+     * recursive func), but its recursion is TREE-shaped and cache-bounded
+     * (the per-frame PureCache dedups the frontier), so the effective
+     * depth is small (fib-class) and the depth cap only nets pathology;
+     * gating it like CallV's self-rule would exclude the flagship fib
+     * shape entirely. CallValueV's callee is a runtime VALUE (unknown at
+     * compile time) - a self-call through a value is rare and the depth
+     * cap bails it. */
     if (in.op == OpCode::CallV) {
         if (callv_native_ok(in, jc))
             return true;
@@ -4430,6 +4465,8 @@ static bool op_run_eligible(const Instr &in, const JitCtx *jc)
             return false;                  /* direct self-recursion */
         return true;
     }
+    if (in.op == OpCode::CachedCallV || in.op == OpCode::CallValueV)
+        return true;
     return jit_op_eligible(in) || callv_native_ok(in, jc);
 }
 
@@ -4603,8 +4640,10 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     bool in_island = false, has_branch = false;
     for (size_t p = 0; p < n; p++) {
         const OpCode op = chunk.code[p].op;
-        if (op == OpCode::CallV || op == OpCode::CachedCallV)
-            return false;                  /* M5 territory */
+        if (op == OpCode::CallV || op == OpCode::CachedCallV
+                || op == OpCode::CallValueV)
+            return false;                  /* M5 territory (containers stay
+                                            * call-free for now) */
         /* op_run_eligible FIRST (native) - an op that the JIT can emit is NATIVE
          * in the container, NOT an island. This ORDER is load-bearing: a
          * newly-nativized op (MoveV/LoadConstV/...) is ALSO in the stale

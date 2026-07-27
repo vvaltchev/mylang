@@ -1296,6 +1296,14 @@ struct VmCallRec {
 
     unsigned char boundary = 0;
 
+    /* M5 LEAN SYNC ENTER (plans/model-flip.md): this frame was pushed by a
+     * native caller's jit_call_sync* helper - its ret_chunk is the SENTINEL
+     * stop chunk, so a normal return dispatches the sentinel's ExitBlock
+     * (vm_dispatch returns to the helper), and the unwind walk STOPS here
+     * like a boundary (capture this frame, pop, convert to g_vm_exc_pending)
+     * instead of walking into the native caller's record. */
+    unsigned char sync_stop = 0;
+
     /* The CALLER's per-frame pure-call cache, stashed while a callee runs:
      * eval.cpp reaches the cache as `ctx->frame->pure_cache`, and the view
      * Frame is SHARED across the whole activation - without the stash the
@@ -1404,6 +1412,8 @@ struct VmActivation {
         rec.seg = cur_seg;
         rec.seg_top_before = sg->top;
         rec.boundary = boundary;
+        rec.sync_stop = 0;               /* a REUSED record must not carry a
+                                          * stale lean-sync stop mark */
         rec.run_chunk = ck;
         rec.handler_base = static_cast<uint32_t>(handlers.size());
         rec.diter_base = static_cast<uint32_t>(dict_iters.size());
@@ -4206,70 +4216,191 @@ ptrdiff_t jit_off_gft_defined()
          - reinterpret_cast<const char *>(&g);
 }
 
-/* M5 increment 1: the SYNCHRONOUS native call - a fragment's CallV runs the
- * callee TO COMPLETION inside this helper (the vm_try_invoke boundary
- * machinery builtin callbacks already use: one window push, bind, re-enter
- * vm_dispatch - the callee's own fragments run within), writes dst, and the
- * CALLER CONTINUES NATIVELY (the whole point: no post-call interior-resume).
+/* CachedCallV's cache probe over an explicit (argbase, n, dst) triple - the
+ * shared core of the interpreted probe (vm_cache_probe below) and the lean
+ * sync helper. Hit -> dst written, true. Miss -> `pending` carries the key
+ * (it rides the callee record and is stored by vm_frame_leave). */
+static bool
+vm_cache_probe_vals(EvalContext &ctx, const FuncDescriptor *d,
+                    int_type argbase, size_t n, int_type dst,
+                    std::unique_ptr<PureCacheKey> &pending)
+{
+    std::vector<EvalValue> vals;
+    vals.reserve(n);
+    const LValue *ap0 = n ? &ctx.frame->at(argbase) : nullptr;
+    for (size_t i = 0; i < n; i++)
+        vals.push_back(ap0[i].get());
+    PureCacheKey key{ d, std::move(vals) };
+    PureCache &cache = ctx.frame->ensure_pure_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        ctx.frame->at(dst).put(EvalValue(it->second));
+        return true;
+    }
+    pending = std::make_unique<PureCacheKey>(std::move(key));
+    return false;
+}
+
+/*
+ * M5 LEAN SYNC ENTER (inc 3; plans/model-flip.md): a fragment's call op runs
+ * the callee to completion INSIDE the helper and the CALLER CONTINUES
+ * NATIVELY. Inc 1 used vm_try_invoke's BOUNDARY machinery (arg value copy,
+ * boundary window, flow round-trip) - measured heavier than the interpreted
+ * vm_enter_call it displaces (76_funcval 1.16x, 11_closure 1.23x). This
+ * reuses the interpreted call's OWN lean protocol: vm_frame_setup pushes a
+ * NON-boundary record (record REUSE, fast_bind straight from the caller's
+ * contiguous slot run - no arg copy) whose ret_chunk is the SENTINEL STOP
+ * CHUNK below, so the callee's ordinary ReturnV/Halt pop (vm_frame_leave)
+ * writes the caller's dst - and performs a CachedCallV's cache store for
+ * free - then "resumes after the call op", which IS the sentinel's
+ * ExitBlock: vm_dispatch returns to the helper. The record's sync_stop flag
+ * makes vm_unwind_walk stop there (capture + pop + g_vm_exc_pending), so an
+ * uncaught RuntimeException also returns here; a PLAIN (non-Runtime)
+ * exception C++-propagates out of vm_dispatch and rides g_vm_jit_eptr
+ * (records above die with the dying invocation, as interpreted).
+ *
  * The C stack grows one helper+dispatch level per NESTED sync call
  * (recursion through native call sites), so a depth cap bails the deep tail
- * to the interpreted CallV, whose flat in-VM record stack is unbounded.
+ * to the interpreted call op, whose flat in-VM record stack is unbounded.
  * Returns 0 = done (dst written); 1 = BAIL pre-side-effect (undefined /
- * non-callable callee, no invoke ctx, chunk-less callee, depth cap - the
- * interpreter re-runs the op); 2 = the callee threw: a RuntimeException
+ * non-callable callee, chunk-less callee, depth cap, an arity/bind/
+ * StackOverflow throw - all idempotent, the interpreter re-runs the op and
+ * re-throws byte-identically); 2 = the callee threw: a RuntimeException
  * rides g_vm_jit_exc (its backtrace's innermost frame gets the BAKED
  * call-site loc the lazy in-VM capture would have used), anything else
- * rides g_vm_jit_eptr. */
+ * rides g_vm_jit_eptr.
+ */
 static int g_jit_sync_depth = 0;
 static constexpr int JIT_SYNC_DEPTH_CAP = 200;
 
-extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
-                             int_type nargs, int_type dst,
-                             int_type site_packed) noexcept
+/* The SENTINEL STOP CHUNK: one ExitBlock at the resume pc. A sync frame's
+ * rec.ret_pc = 1 (vm_frame_setup's ret_pc+1 with ret_pc = 0), so every
+ * return shape - interpreted ReturnV/Halt (vm_leave_call switches to the
+ * resume globals) AND the native ReturnV (jit_ret's sentinel makes
+ * EnterNative apply the same globals) - lands on code[1] = ExitBlock, which
+ * returns from vm_dispatch to the helper. code[0] exists only so the
+ * walk-side ret_pc-1 view stays in range (never executed; loc_at finds
+ * nothing on either pc - the capture is deliberately loc-less). */
+static const Chunk &vm_sync_stop_chunk()
 {
-    ML_JIT_OP_RAN(CallV);
-    EvalContext *ctx = g_current_ctx;
-    if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
-        return 1;                          /* deep tail -> interpreted */
-    if (!ctx->gfuncs->defined[callee_slot])
-        return 1;                          /* undefined -> interpreted throw */
-    const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
-    if (!cv.is<intrusive_ptr<FuncObject>>())
-        return 1;                          /* not callable -> interpreted */
-    FuncObject &fo = *cv.get<intrusive_ptr<FuncObject>>().get();
+    static const Chunk ck = [] {
+        Chunk c;
+        Instr ex{};
+        ex.op = OpCode::ExitBlock;
+        Operand o;
+        o.is_lit = true;
+        o.lit = 0;                       /* the (unused) block-resume pc */
+        ex.set_a(o);
+        c.code.push_back(ex);
+        c.code.push_back(ex);
+        return c;
+    }();
+    return ck;
+}
 
-    /* the arg VALUES from the contiguous slot run (one copy; the bind inside
-     * vm_try_invoke is the second - the interpreted path pays one, measured
-     * acceptable for the caller staying native) */
-    EvalValue abuf[8];
-    std::vector<EvalValue> aheap;
-    const EvalValue *argv;
-    Frame *f = ctx->frame;
-    if (nargs <= 8) {
-        for (int_type i = 0; i < nargs; i++)
-            abuf[i] = f->at(argbase + i).get();
-        argv = abuf;
-    } else {
-        aheap.reserve(static_cast<size_t>(nargs));
-        for (int_type i = 0; i < nargs; i++)
-            aheap.push_back(f->at(argbase + i).get());
-        argv = aheap.data();
+static int
+jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
+                   int_type dst, int_type site_packed, bool cached) noexcept
+{
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    const FuncDescriptor *d = fo.func;
+    if (!d->vm_chunk_tried || !d->vm_chunk)
+        return 1;                          /* AOT net -> interpreted */
+    const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
+
+    std::unique_ptr<PureCacheKey> key;
+    if (cached && ctx.frame && g_pure_cache_enabled
+            && vm_cache_probe_vals(ctx, d, argbase,
+                                   static_cast<size_t>(nargs), dst, key))
+        return 0;                          /* cache hit - dst written */
+
+    /* The push. An arity/bind-coerce/StackOverflow throw is PRE-side-effect
+     * and idempotent (setup pops its half-built frame) - bail and let the
+     * interpreted op re-run and re-throw byte-identically. */
+    Frame *w;
+    try {
+        w = vm_frame_setup(act, ctx, &vm_sync_stop_chunk(), /*ret_pc=*/0,
+                           fo, cck, argbase, static_cast<size_t>(nargs),
+                           dst, std::move(key));
+    } catch (...) {
+        return 1;
     }
 
-    EvalValue out;
+    act.back_rec().sync_stop = 1;
+
     g_jit_sync_depth++;
     try {
-        const bool ran = vm_try_invoke(ctx, fo, argv,
-                                       static_cast<size_t>(nargs), out);
+        /* DIRECT FRAGMENT ENTRY: when the callee body STARTS with an
+         * EnterNative (the common shape - a whole-native body is a bare
+         * `enter.nat`), hoist that first op out of vm_dispatch: enter the
+         * fragment via jit_enter (the fragment head sets its own tag
+         * registers) and replicate EnterNative's post-exit handling here.
+         * The 3-op-callee dispatch entry/exit + sentinel round-trip was
+         * the measured cost that made a tiny closure callee REGRESS
+         * (11_closure_counter +6% Ir); a fully-native callee (its ReturnV
+         * in the fragment -> jit_ret pops + writes dst + rets the
+         * sentinel) now runs with NO dispatch at all, and a bail/handler
+         * continuation pays ONE dispatch re-entry - what the dispatch
+         * path paid always. */
+        if (cck->native.base && !cck->code.empty()
+                && cck->code[0].op == OpCode::EnterNative) {
+            const size_t r =
+                jit_enter(static_cast<const char *>(cck->native.base)
+                              + cck->code[0].a_lit(),
+                          w->slots);
+            if (r == JIT_RET_SENTINEL) {   /* native ReturnV: frame popped,
+                                            * dst written - done */
+                g_jit_sync_depth--;
+                return 0;
+            }
+            /* r = an exit pc (JIT_RET_BOUNDARY is impossible - this record
+             * is non-boundary by construction). EnterNative's post-exit,
+             * faithfully: a conveyed raise dispatches via vm_raise (caret
+             * from the callee's loc table, same-frame handler first, else
+             * the walk stops at our sync_stop record); a plain bail (or a
+             * dispatched handler) continues INTERPRETED at the resolved
+             * pc via the start_pc dispatch re-entry. */
+            const Chunk *c2 = cck;
+            size_t p2 = r;
+            bool cont = true;
+            if (g_vm_jit_raise) {
+                const int kind = g_vm_jit_raise;
+                g_vm_jit_raise = 0;
+                cont = vm_raise(c2, p2, act, ctx,
+                    kind == JR_OOB
+                      ? std::unique_ptr<RuntimeException>(
+                            new OutOfBoundsEx())
+                      : kind == JR_DIV0
+                      ? std::unique_ptr<RuntimeException>(
+                            new DivisionByZeroEx())
+                      : std::unique_ptr<RuntimeException>(
+                            new InvalidValueEx("negative shift count")));
+            } else if (g_vm_jit_exc) {
+                cont = vm_raise(c2, p2, act, ctx, std::move(g_vm_jit_exc));
+            } else if (g_vm_jit_eptr) {
+                /* a nested sync callee's plain exception: convey upward
+                 * as-is (the records above die with the invocation,
+                 * exactly the dispatch path's rethrow contract). */
+                g_jit_sync_depth--;
+                return 2;
+            }
+            if (cont)
+                vm_dispatch(*c2, ctx, act, p2);
+            /* !cont: the walk reached our sync record - popped, pending
+             * set; fall through to the conveyance below. */
+        } else {
+            vm_dispatch(*cck, ctx, act);
+        }
         g_jit_sync_depth--;
-        if (!ran)
-            return 1;                      /* no invoke ctx / no chunk */
     } catch (Exception &e) {
+        /* A PLAIN exception (a RuntimeException is walked inside
+         * vm_dispatch, never C++-escapes it): capture the callee frame +
+         * stamp the baked site, exactly what the walk + the pending path
+         * below produce for a RuntimeException. */
         g_jit_sync_depth--;
-        /* the innermost frame was captured LOC-LESS by vm_try_invoke's
-         * vm_capture_desc_frame; give it the baked call-site loc the lazy
-         * in-VM capture (loc_at(ret_chunk, ret_pc-1)) would have used. */
-        if (!e.backtrace.empty() && e.backtrace.back().desc == fo.func
+        vm_capture_desc_frame(e, d);
+        if (!e.backtrace.empty() && e.backtrace.back().desc == d
                 && !e.backtrace.back().call_site.line)
             e.backtrace.back().call_site =
                 Loc(static_cast<int>(site_packed >> 32),
@@ -4284,9 +4415,79 @@ extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
         g_vm_jit_eptr = std::current_exception();
         return 2;
     }
-    if (dst >= 0)
-        ctx->frame->at(dst).put(std::move(out));
-    return 0;
+
+    if (g_vm_exc_pending) {
+        /* The walk stopped at our sync_stop record: the callee frame was
+         * captured LOC-LESS (the sentinel has no locs); stamp the baked
+         * call-site loc the lazy in-VM capture (loc_at(ret_chunk,
+         * ret_pc-1)) would have used. EnterNative re-raises at the call
+         * op's pc, so the caller-side handler dispatch / inline-frame flush
+         * runs exactly as an interpreted cross-frame throw. */
+        Exception &e = *g_vm_exc_pending;
+        if (!e.backtrace.empty() && e.backtrace.back().desc == d
+                && !e.backtrace.back().call_site.line)
+            e.backtrace.back().call_site =
+                Loc(static_cast<int>(site_packed >> 32),
+                    static_cast<int>(site_packed & 0xffffffff));
+        g_vm_jit_exc = std::move(g_vm_exc_pending);
+        return 2;
+    }
+    return 0;                              /* dst written by vm_frame_leave */
+}
+
+extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
+                             int_type nargs, int_type dst,
+                             int_type site_packed) noexcept
+{
+    ML_JIT_OP_RAN(CallV);
+    EvalContext *ctx = g_current_ctx;
+    if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
+        return 1;                          /* deep tail -> interpreted */
+    if (!ctx->gfuncs->defined[callee_slot])
+        return 1;                          /* undefined -> interpreted throw */
+    const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
+    if (!cv.is<intrusive_ptr<FuncObject>>())
+        return 1;                          /* not callable -> interpreted */
+    return jit_call_sync_core(*cv.get<intrusive_ptr<FuncObject>>().get(),
+                              argbase, nargs, dst, site_packed,
+                              /*cached=*/false);
+}
+
+extern "C" int jit_call_sync_cached(int_type callee_slot, int_type argbase,
+                                    int_type nargs, int_type dst,
+                                    int_type site_packed) noexcept
+{
+    ML_JIT_OP_RAN(CachedCallV);
+    EvalContext *ctx = g_current_ctx;
+    if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
+        return 1;
+    if (!ctx->gfuncs->defined[callee_slot])
+        return 1;
+    const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
+    if (!cv.is<intrusive_ptr<FuncObject>>())
+        return 1;
+    return jit_call_sync_core(*cv.get<intrusive_ptr<FuncObject>>().get(),
+                              argbase, nargs, dst, site_packed,
+                              /*cached=*/true);
+}
+
+extern "C" int jit_call_sync_value(int_type callee_temp, int_type argbase,
+                                   int_type nargs, int_type dst,
+                                   int_type site_packed) noexcept
+{
+    ML_JIT_OP_RAN(CallValueV);
+    EvalContext *ctx = g_current_ctx;
+    if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
+        return 1;
+    /* the callee VALUE was evaluated into a temp slot (CallValueV's
+     * target2); a dyn-laundered non-func bails to the interpreted op's
+     * NotCallableEx (its caret from the loc side table). */
+    const EvalValue &cv = ctx->frame->at(callee_temp).get();
+    if (!cv.is<intrusive_ptr<FuncObject>>())
+        return 1;
+    return jit_call_sync_core(*cv.get<intrusive_ptr<FuncObject>>().get(),
+                              argbase, nargs, dst, site_packed,
+                              /*cached=*/false);
 }
 
 /* Step 7a (the INLINE exception ops): the activation-side layout the
@@ -4406,21 +4607,9 @@ static ML_NOINLINE bool
 vm_cache_probe(EvalContext &ctx, const Instr *in, const FuncDescriptor *d,
                std::unique_ptr<PureCacheKey> &pending)
 {
-    std::vector<EvalValue> vals;
-    const size_t n = static_cast<size_t>(in->b_lit());
-    vals.reserve(n);
-    const LValue *ap0 = n ? &ctx.frame->at(in->a_lit()) : nullptr;
-    for (size_t i = 0; i < n; i++)
-        vals.push_back(ap0[i].get());
-    PureCacheKey key{ d, std::move(vals) };
-    PureCache &cache = ctx.frame->ensure_pure_cache();
-    auto it = cache.find(key);
-    if (it != cache.end()) {
-        ctx.frame->at(in->target).put(EvalValue(it->second));
-        return true;
-    }
-    pending = std::make_unique<PureCacheKey>(std::move(key));
-    return false;
+    return vm_cache_probe_vals(ctx, d, in->a_lit(),
+                               static_cast<size_t>(in->b_lit()), in->target,
+                               pending);
 }
 
 /*
@@ -4444,6 +4633,19 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
             return true;
         }
         if (cur.boundary) {
+            g_vm_exc_pending = std::move(ex);
+            return false;
+        }
+        if (cur.sync_stop) {
+            /* M5 lean sync enter: this frame's C++ owner is a native
+             * caller's jit_call_sync* helper, not a parent record - capture
+             * the callee frame (site LOC-LESS: the sentinel ret_chunk has no
+             * locs; the helper stamps the baked call-site loc), pop it, and
+             * convert like a boundary so the helper's vm_dispatch re-entry
+             * returns with g_vm_exc_pending set. */
+            vm_capture_rec_frame(*ex, cur);
+            ctx.captures = cur.caller_captures;
+            act.pop_window();
             g_vm_exc_pending = std::move(ex);
             return false;
         }
