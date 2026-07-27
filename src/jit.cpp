@@ -713,14 +713,15 @@ static bool jit_op_eligible(const Instr &in)
         return true;
     /* N3: the SSE float tier. add/sub/mul/div (div RAISES DivisionByZeroEx
      * on a +-0.0 divisor via JR_DIV0 - a sign-stripped bits test, exactly
-     * TypeFloat::div's fpclassify FP_ZERO check - then divsd); mod stays
-     * interpreted (an fmod libm call + the same zero check - do when it
-     * shows up in real code, 0 bench occurrences). A float READ handles an
-     * int-in-a-float-slot via cvtsi2sd (matching read_float_slot) and BAILS
-     * on bool/other. */
+     * TypeFloat::div's fpclassify FP_ZERO check - then divsd); mod is the
+     * same zero check + an fmod LIBM call (the exact function
+     * TypeFloat::mod runs, so NaN/inf semantics are byte-identical). A
+     * float READ handles an int-in-a-float-slot via cvtsi2sd (matching
+     * read_float_slot) and BAILS on bool/other. */
     case OpCode::FloatBin:
         return in.aop == Op::plus || in.aop == Op::minus
-            || in.aop == Op::times || in.aop == Op::div;
+            || in.aop == Op::times || in.aop == Op::div
+            || in.aop == Op::mod;
     case OpCode::FloatAddRR: case OpCode::FloatSubRR:
     case OpCode::FloatMulRR: case OpCode::FloatAddRI:
     case OpCode::FloatSubRI: case OpCode::FloatMulRI:
@@ -2444,25 +2445,27 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::FloatMulRR: case OpCode::FloatAddRI:
     case OpCode::FloatSubRI: case OpCode::FloatMulRI: {
         uint8_t fop;   /* 0x58 addsd / 0x5C subsd / 0x59 mulsd / 0x5E divsd */
+        const bool is_mod =
+            in.op == OpCode::FloatBin && in.aop == Op::mod;
         switch (in.op) {
         case OpCode::FloatAddRR: case OpCode::FloatAddRI: fop = 0x58; break;
         case OpCode::FloatSubRR: case OpCode::FloatSubRI: fop = 0x5C; break;
         case OpCode::FloatMulRR: case OpCode::FloatMulRI: fop = 0x59; break;
-        default:   /* FloatBin: by aop (add/sub/mul/div - eligible) */
+        default:   /* FloatBin: by aop (add/sub/mul/div/mod - eligible) */
             fop = in.aop == Op::plus ? 0x58
                 : in.aop == Op::minus ? 0x5C
                 : in.aop == Op::times ? 0x59 : 0x5E;
             break;
         }
-        if (fop == 0x5E)
-            e.bump_op(OpCode::FloatBin);   /* execution proof for the div arm
-                                            * (BEFORE any load - bump_op
+        if (fop == 0x5E || is_mod)
+            e.bump_op(OpCode::FloatBin);   /* execution proof for the div/mod
+                                            * arms (BEFORE any load - bump_op
                                             * clobbers rax) */
         emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
         emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
-        if (fop == 0x5E) {
-            /* float DIV throws DivisionByZeroEx on a +-0.0 divisor
-             * (TypeFloat::div: fpclassify(rhs) == FP_ZERO). Test the
+        if (fop == 0x5E || is_mod) {
+            /* float DIV and MOD throw DivisionByZeroEx on a +-0.0 divisor
+             * (TypeFloat::div/mod: fpclassify(rhs) == FP_ZERO). Test the
              * divisor's BITS with the sign stripped: movq rax, xmm1;
              * shl rax, 1 - zero iff the value is +-0.0 (NaN/inf/denormal
              * bits stay nonzero and divide, exactly fpclassify's answer).
@@ -2473,7 +2476,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.u8(0x48); e.u8(0xD1); e.u8(0xE0);    /* shl rax, 1 */
             raise_unless(e, 0x75 /* jnz */, JR_DIV0, pc);
         }
-        e.farith(fop);
+        if (is_mod)
+            /* the exact libm call TypeFloat::mod makes - x in xmm0, y in
+             * xmm1 (the SysV float args); the prologue/epilogue inside
+             * save rdi + any pinned cache regs. */
+            emit_libm_call(e, reinterpret_cast<const void *>(
+                static_cast<double (*)(double, double)>(&::fmod)));
+        else
+            e.farith(fop);
         emit_float_store(e, ck, X0, in.target, pc);
         return true;
     }
