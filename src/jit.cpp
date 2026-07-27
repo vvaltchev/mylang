@@ -4808,10 +4808,11 @@ static bool op_is_simple_island(OpCode op)
      * nativize-ops path), so op_run_eligible (checked FIRST in the gate)
      * wins - they never reach here as islands. They stay listed for
      * documentation / a `-nj` build (where op_run_eligible is false). The
-     * ONLY genuinely-still-boxed sequential ops are the dyn-callee generic
-     * call pair below (CheckCallableV + CallValueGenericV - the one
-     * remaining AST-holding op, inherently node-based until the F1
-     * descriptor work) - the container gate's island source, so the
+     * ONLY still-boxed sequential ops are the dyn-callee generic call pair
+     * below (CheckCallableV + CallValueGenericV - fully AST-FREE since F1
+     * step 2, reading the serializable call_sites pool; simply not yet
+     * given an emit case, as its by-Kind dispatch is the most involved
+     * remaining one) - the container gate's island source, so the
      * jit_exec_block mechanism (M2-M4) stays exercised on real dyn-dispatch
      * code. (The island-source hop chain: SliceV -> MakeArrayV -> MakeDictV
      * -> StructCtorBoxedV -> DeclConstV -> CheckFuncV/MapFilterV -> this

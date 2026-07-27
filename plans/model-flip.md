@@ -820,10 +820,18 @@ The order:
      island pair: bench/ is now **97 READY / 3 NOT-ready chunks** (the two
      compile-time-gated self-recursive CallVs + main's map pair before this
      - now just the self-gated pair). The container tests' island source
-     migrated to the ONLY genuinely-still-boxed sequential ops - the
-     AST-holding dyn-callee pair (CheckCallableV + CallValueGenericV, now
-     in op_is_simple_island), keeping jit_exec_block exercised on real
-     dyn-dispatch code.
+     migrated to the ONLY still-boxed sequential ops - the dyn-callee pair
+     (CheckCallableV + CallValueGenericV, now in op_is_simple_island),
+     keeping jit_exec_block exercised on real dyn-dispatch code.
+     CORRECTION (2026-07-25, maintainer question): this pair is fully
+     AST-FREE like every op (F1 step 2, 2026-07-14 - it reads the
+     serializable call_sites pool; the earlier "AST-holding" wording here
+     and in the code comments was WRONG and has been fixed). The VM's
+     zero-AST guarantee (vm_ast_teardown + live_nodes == 0, machine-proven
+     per run) is intact and the JIT added no AST dependency - fragments
+     bake only pool-buffer addresses and program-lifetime pointers and run
+     AFTER the teardown. Nativizing this pair is an ORDINARY emit-case
+     step, not gated on any descriptor work.
    - **FloatBin mod arm** (3a1137a): the div arm's sign-stripped +-0.0
      bits test (JR_DIV0) + the exact fmod libm call TypeFloat::mod makes
      (emit_libm_call - the bracket saves rdi + pinned regs). The last
