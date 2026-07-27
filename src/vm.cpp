@@ -442,11 +442,12 @@ vm_store_elem_float_body(LValue &alv, int_type idx, float_type rhs, Op aop,
 /* The MULTI-ASSIGN strict-unpack length error (F-1) - the same message the
  * tree-walker's handle_single_expr14 throws, WITHOUT the "foreach:" prefix. */
 [[noreturn]] static ML_COLD void
-vm_throw_multi_unpack_len(const Chunk &chunk, size_t pc, size_type m,
+vm_throw_multi_unpack_len(const Chunk *chunk, size_t pc, size_type m,
                           size_t nvars)
 {
     Loc s, en;
-    chunk.loc_at(pc, s, en);
+    if (chunk)
+        chunk->loc_at(pc, s, en);
     throw TypeErrorEx(intern_msg("cannot unpack an array of length " +
                                  std::to_string(m) + " into " +
                                  std::to_string(nvars) + " variables"), s, en);
@@ -2692,6 +2693,160 @@ extern "C" int jit_dict_load(int_type dst, int_type base_slot,
     return 0;
 }
 
+/* The SHARED UnpackElem* body (the STRICT foreach-unpack of pairs[i] into N
+ * loop vars): ONE implementation for the four interpreter handlers AND
+ * jit_unpack_elem. `kind` 0 = int (flat-ints fast path), 1 = float, 2 =
+ * value; `targets` non-null = the per-position slot list (UnpackElemTargets,
+ * -1 == `_`), else the consecutive run dst_base..dst_base+N-1. The two
+ * strict errors throw loc-less when `chunk` is null (the JIT; the re-raise
+ * stamps the same side-table caret). */
+static void
+vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
+                    int_type N, int kind, int_type dst_base,
+                    const std::vector<int32_t> *targets,
+                    const Chunk *chunk, size_t pc)
+{
+    ML_VM_CHECK(base_v.is<SharedArrayObj>());
+    const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
+    const EvalValue &elem = outer.get_vec()[outer.offset() + idx].get();
+    if (!elem.is<SharedArrayObj>())
+        vm_throw_unpack_nonarray(chunk, pc, N);
+    const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
+    if (sub.size() != static_cast<size_type>(N))
+        vm_throw_unpack_len(chunk, pc, sub.size(), N);
+    if (targets) {
+        for (int_type k = 0; k < N; k++) {
+            if ((*targets)[k] >= 0)
+                ctx.frame->at((*targets)[k]).put(
+                    vm_arr_elem(elem, static_cast<size_type>(k)));
+        }
+        return;
+    }
+    const size_type off = sub.offset();
+    const auto sk = sub.skind();
+    if (kind == 0 && sk == SharedArrayObj::Storage::ints) {
+        for (int_type k = 0; k < N; k++)
+            write_int_slot(&ctx, dst_base + k, sub.flat_ints()[off + k]);
+    } else if (kind == 1 && sk == SharedArrayObj::Storage::floats) {
+        for (int_type k = 0; k < N; k++)
+            write_float_slot(&ctx, dst_base + k, sub.flat_floats()[off + k]);
+    } else {
+        /* UnpackElemValue, OR a flat op whose sub-array's storage is NOT the
+         * expected kind (a mixed-numeric literal built GENERAL, or the other
+         * scalar kind): bind each element's ACTUAL boxed value - identical
+         * to do_iter's bind_loop_var. */
+        for (int_type k = 0; k < N; k++)
+            ctx.frame->at(dst_base + k).put(
+                vm_arr_elem(elem, static_cast<size_type>(k)));
+    }
+}
+
+/* The SHARED MultiUnpackV body (the multi-assign strict destructure /
+ * spread): ONE implementation for the interpreter handler AND
+ * jit_multi_unpack. A null `chunk` makes the throws loc-less (the JIT; the
+ * re-raise stamps the same side-table caret vm_stamp_loc would). */
+static void
+vm_multi_unpack_body(EvalContext &ctx, const EvalValue &rval,
+                     const std::vector<int32_t> &targets,
+                     const std::vector<unsigned char> *coerce, Op aop,
+                     const Chunk *chunk, size_t pc)
+{
+    const bool compound = aop != Op::invalid;
+    size_t ti = 0;
+    const auto store = [&](int32_t t, const EvalValue &v) {
+        if (!compound) {
+            if (coerce && (*coerce)[ti]) {
+                try {
+                    ctx.frame->at(t).put(vm_coerce_decl_num(
+                        v, (*coerce)[ti] == 2));
+                } catch (Exception &e) {
+                    if (chunk)
+                        vm_stamp_loc(*chunk, pc, e);
+                    throw;
+                }
+                return;
+            }
+            ctx.frame->at(t).put(v);
+            return;
+        }
+        EvalValue nv = ctx.frame->at(t).get();
+        try {
+            vm_num_binop(nv, v, aop);
+        } catch (Exception &e) {
+            if (chunk)
+                vm_stamp_loc(*chunk, pc, e);
+            throw;
+        }
+        ctx.frame->at(t).put(std::move(nv));
+    };
+    if (rval.is<SharedArrayObj>()) {
+        const size_type m = rval.get_ref<SharedArrayObj>().size();
+        if (m != static_cast<size_type>(targets.size()))
+            vm_throw_multi_unpack_len(chunk, pc, m, targets.size());
+        for (size_t i = 0; i < targets.size(); i++) {
+            ti = i;
+            if (targets[i] >= 0)
+                store(targets[i], vm_arr_elem(rval,
+                                              static_cast<size_type>(i)));
+        }
+    } else {
+        for (size_t i = 0; i < targets.size(); i++) {
+            ti = i;
+            if (targets[i] >= 0)
+                store(targets[i], rval);
+        }
+    }
+}
+
+/* model-flip (nativize-ops): the native UnpackElem* / MultiUnpackV bodies -
+ * the shared strict-unpack cores above. `targets` / `coerce` are baked pool
+ * BUFFER addresses. Throws -> g_vm_jit_exc + return 1 (the loc-less throw
+ * gets the side-table caret at the re-raise); 0 on success. */
+extern "C" int jit_unpack_elem(int_type dst_base, int_type base_slot,
+                               int_type idx, int_type n_kind,
+                               const void *targets) noexcept
+{
+#ifdef TESTS
+    {
+        const int k = static_cast<int>(n_kind >> 8);
+        g_jit_op_run[static_cast<size_t>(
+            targets ? OpCode::UnpackElemTargets
+                    : k == 0 ? OpCode::UnpackElemInt
+                    : k == 1 ? OpCode::UnpackElemFloat
+                             : OpCode::UnpackElemValue)]++;
+    }
+#endif
+    EvalContext *ctx = g_current_ctx;
+    try {
+        vm_unpack_elem_body(
+            *ctx, ctx->frame->at(base_slot).get(), idx,
+            n_kind & 0xff, static_cast<int>(n_kind >> 8), dst_base,
+            static_cast<const std::vector<int32_t> *>(targets), nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_multi_unpack(int_type rval_slot, const void *targets,
+                                const void *coerce, int_type aop) noexcept
+{
+    ML_JIT_OP_RAN(MultiUnpackV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        vm_multi_unpack_body(
+            *ctx, ctx->frame->at(rval_slot).get(),
+            *static_cast<const std::vector<int32_t> *>(targets),
+            static_cast<const std::vector<unsigned char> *>(coerce),
+            static_cast<Op>(aop), nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* The SHARED LoadMemberInt/Float body (H1 - the typed standalone struct-member
  * read `p.x`, th==i/f): the POD fast path reads the scalar straight from the
  * instance's bytes; anything else (boxed struct / dict / const member / a dyn
@@ -4828,80 +4983,27 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_CASE(UnpackElemFloat):
         VM_CASE(UnpackElemValue): {
 
-            /* STRICT foreach-unpack: read pairs[i] (a general outer element = a
-             * sub-array), check it is an array of EXACTLY N, write its N scalars
-             * into the consecutive loop-var slots base..base+N-1 - matching
-             * do_iter's strict destructure element for element. `i` is the loop
-             * counter (in-range), so the outer read never OOB; the only throws
-             * are the two strict errors. */
-            const bool is_int = in->op == OpCode::UnpackElemInt;
-            const bool is_float = in->op == OpCode::UnpackElemFloat;
-            const EvalValue &base_v = ctx.frame->at(in->target2).get();
-            ML_VM_CHECK(base_v.is<SharedArrayObj>());
-            const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in->a(), &ctx);
-            const EvalValue &elem =
-                outer.get_vec()[outer.offset() + idx].get();
-            const int_type N = in->b_lit();
-            if (!elem.is<SharedArrayObj>())
-                vm_throw_unpack_nonarray(chunk, pc, N);
-            const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
-            if (sub.size() != static_cast<size_type>(N))
-                vm_throw_unpack_len(chunk, pc, sub.size(), N);
-            const size_type off = sub.offset();
-            const auto sk = sub.skind();
-            if (is_int && sk == SharedArrayObj::Storage::ints) {
-                for (int_type k = 0; k < N; k++) {
-                    write_int_slot(&ctx, in->target + k,
-                                   sub.flat_ints()[off + k]);
-                }
-            } else if (is_float && sk == SharedArrayObj::Storage::floats) {
-                for (int_type k = 0; k < N; k++) {
-                    write_float_slot(&ctx, in->target + k,
-                                     sub.flat_floats()[off + k]);
-                }
-            } else {
-                /* UnpackElemValue (a general/dyn/str/mixed sub-array), OR a flat
-                 * op whose sub-array's storage is NOT the expected kind (a
-                 * mixed-numeric `[int, float]` literal - inference types it
-                 * array<float> by int|float join but builds GENERAL - or a flat
-                 * array of the OTHER scalar kind). Bind each element's ACTUAL
-                 * boxed value (vm_arr_elem is skind-dispatched) - byte-identical
-                 * to do_iter's bind_loop_var, so an int stays int / a str stays
-                 * str. */
-                for (int_type k = 0; k < N; k++) {
-                    ctx.frame->at(in->target + k).put(
-                        vm_arr_elem(elem, static_cast<size_type>(k)));
-                }
-            }
+            /* STRICT foreach-unpack: pairs[i] must be an array of EXACTLY N,
+             * its scalars written to the consecutive loop-var slots - the
+             * shared body (also jit_unpack_elem's). `i` is the loop counter
+             * (in-range), so the outer read never OOB. */
+            const int kind = in->op == OpCode::UnpackElemInt ? 0
+                           : in->op == OpCode::UnpackElemFloat ? 1 : 2;
+            vm_unpack_elem_body(ctx, ctx.frame->at(in->target2).get(),
+                                read_int_operand(in->a(), &ctx), in->b_lit(),
+                                kind, in->target, nullptr, chunk, pc);
             pc++;
         }
         VM_NEXT;
 
         VM_CASE(UnpackElemTargets): {
-            /* STRICT foreach-unpack with a per-position target list (a `_`
-             * placeholder / non-consecutive slots): read pairs[i] (a general
-             * outer element = a sub-array), check length == N, then bind each
-             * element box-free (vm_arr_elem) to targets[k] (skip -1 == `_`). */
-            const EvalValue &base_v = ctx.frame->at(in->target2).get();
-            ML_VM_CHECK(base_v.is<SharedArrayObj>());
-            const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in->a(), &ctx);
-            const EvalValue &elem =
-                outer.get_vec()[outer.offset() + idx].get();
-            const int_type N = in->b_lit();
-            if (!elem.is<SharedArrayObj>())
-                vm_throw_unpack_nonarray(chunk, pc, N);
-            const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
-            if (sub.size() != static_cast<size_type>(N))
-                vm_throw_unpack_len(chunk, pc, sub.size(), N);
-            const std::vector<int32_t> &targets =
-                chunk->unpack_targets[in->target];
-            for (int_type k = 0; k < N; k++) {
-                if (targets[k] >= 0)
-                    ctx.frame->at(targets[k]).put(
-                        vm_arr_elem(elem, static_cast<size_type>(k)));
-                }
+            /* STRICT foreach-unpack with a per-position target list (`_` /
+             * non-consecutive slots) - the shared body over the
+             * unpack_targets pool entry. */
+            vm_unpack_elem_body(ctx, ctx.frame->at(in->target2).get(),
+                                read_int_operand(in->a(), &ctx), in->b_lit(),
+                                /*kind=*/2, /*dst_base=*/-1,
+                                &chunk->unpack_targets[in->target], chunk, pc);
             pc++;
         }
         VM_NEXT;
@@ -5072,66 +5174,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 
         VM_CASE(MultiUnpackV): {
 
-            /* Multi-assign `a, b, c = <rvalue>` (F-1): the tree-walker's STRICT
-             * destructure, AST-free. An ARRAY rvalue must have EXACTLY as many
-             * elements as targets (else the length TypeErrorEx, caret from the
-             * side table); each element (box-free for a flat scalar via
-             * vm_arr_elem) writes to its target slot (-1 == `_`, skipped). A
-             * NON-array rvalue SPREADS to every target. */
-            const EvalValue &rval = ctx.frame->at(in->a_slot()).get();
-            const std::vector<int32_t> &targets =
-                chunk->unpack_targets[in->target];
-            /* Typed targets (R5): a PLAIN assign coerces each stored value
-             * per target (widen / dyn-narrowing throw, Expr14-span caret);
-             * a compound doesn't coerce. Kinds from the unpack_coerce pool. */
-            const std::vector<unsigned char> *coerce =
-                in->b_is_lit() ? &chunk->unpack_coerce[in->b_lit()] : nullptr;
-            /* A COMPOUND `a, b OP= rhs` (in->aop != invalid): each target reads
-             * its CURRENT value, applies the op with its element/scalar, writes
-             * back — else a plain distribute. */
-            const bool compound = in->aop != Op::invalid;
-            size_t ti = 0;
-            auto store = [&](int32_t t, const EvalValue &v) {
-                if (!compound) {
-                    if (coerce && (*coerce)[ti]) {
-                        try {
-                            ctx.frame->at(t).put(vm_coerce_decl_num(
-                                v, (*coerce)[ti] == 2));
-                        } catch (Exception &e) {
-                            vm_stamp_loc(*chunk, pc, e);
-                            throw;
-                        }
-                        return;
-                    }
-                    ctx.frame->at(t).put(v);
-                    return;
-                }
-                EvalValue nv = ctx.frame->at(t).get();
-                try {
-                    vm_num_binop(nv, v, in->aop);
-                } catch (Exception &e) {
-                    vm_stamp_loc(*chunk, pc, e);
-                    throw;
-                }
-                ctx.frame->at(t).put(std::move(nv));
-            };
-            if (rval.is<SharedArrayObj>()) {
-                const size_type m = rval.get_ref<SharedArrayObj>().size();
-                if (m != static_cast<size_type>(targets.size()))
-                    vm_throw_multi_unpack_len(*chunk, pc, m, targets.size());
-                for (size_t i = 0; i < targets.size(); i++) {
-                    ti = i;
-                    if (targets[i] >= 0)
-                        store(targets[i],
-                              vm_arr_elem(rval, static_cast<size_type>(i)));
-                }
-            } else {
-                for (size_t i = 0; i < targets.size(); i++) {
-                    ti = i;
-                    if (targets[i] >= 0)
-                        store(targets[i], rval);
-                }
-            }
+            /* Multi-assign `a, b, c = <rvalue>` (F-1): the tree-walker's
+             * STRICT destructure / spread, via the shared body (also
+             * jit_multi_unpack's). Typed targets coerce per the
+             * unpack_coerce pool; a compound applies the base op per
+             * target. */
+            vm_multi_unpack_body(
+                ctx, ctx.frame->at(in->a_slot()).get(),
+                chunk->unpack_targets[in->target],
+                in->b_is_lit() ? &chunk->unpack_coerce[in->b_lit()] : nullptr,
+                in->aop, chunk, pc);
             pc++;
         }
         VM_NEXT;

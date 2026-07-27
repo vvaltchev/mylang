@@ -15576,6 +15576,62 @@ static bool jit_op_nativized()
             "}",
             "assert(f(runtime(4)) == 4);",
             "assert(rd() == 1);" } },
+        /* The STRICT-unpack family: the foreach 2-var unpack over proven
+         * array<array<T>> (int/float/value), the `_` targets variant, and
+         * the multi-assign MultiUnpackV. */
+        { OpCode::UnpackElemInt, {
+            "func f(array<array<int>> a) {",
+            "  var s = 0;",
+            "  foreach (x, y in a) s = s + x * y;",
+            "  return s;",
+            "}",
+            "assert(f(runtime([[1, 2], [3, 4]])) == 14);" } },
+        { OpCode::UnpackElemFloat, {
+            "func f(array<array<float>> a) {",
+            "  var s = 0.0;",
+            "  foreach (x, y in a) s = s + x * y;",
+            "  return s;",
+            "}",
+            "assert(f(runtime([[1.5, 2.0], [0.5, 4.0]])) == 5.0);" } },
+        { OpCode::UnpackElemValue, {
+            "func f(array<array<str>> a) {",
+            "  var s = \"\";",
+            "  foreach (x, y in a) s = s + x + y;",
+            "  return s;",
+            "}",
+            "assert(f(runtime([[\"a\", \"b\"], [\"c\", \"d\"]])) ==",
+            "       \"abcd\");" } },
+        { OpCode::UnpackElemTargets, {
+            "func f(array<array<int>> a) {",
+            "  var s = 0;",
+            "  foreach (x, _, z in a) s = s + x + z;",
+            "  return s;",
+            "}",
+            "assert(f(runtime([[1, 9, 2], [3, 9, 4]])) == 10);" } },
+        /* typed targets (the unpack_coerce pool path): a dyn rvalue
+         * destructured into int locals per iteration. (Bare `var a, b = p`
+         * with a dyn rvalue is a compile-time DynRequiredEx.) */
+        { OpCode::MultiUnpackV, {
+            "func f(dyn p, int n) {",
+            "  var s = 0;",
+            "  int a = 0; int b = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    a, b = p;",
+            "    s += a + b;",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime([3, 4]), 5) == 35);" } },
+        /* a strict-length unpack throw from the fragment, script-caught. */
+        { OpCode::MultiUnpackV, {
+            "func f(dyn p) {",
+            "  var r = 0;",
+            "  int a = 0; int b = 0;",
+            "  try { a, b = p; r = a + b; }",
+            "  catch (TypeErrorEx) { r = 42; }",
+            "  return r;",
+            "}",
+            "assert(f(runtime([1, 2, 3])) == 42);" } },
         /* The iterator THROW paths, script-caught: a non-container init and a
          * strict-unpack next each ride g_vm_jit_exc out of the fragment and
          * dispatch to the same-frame handler. */

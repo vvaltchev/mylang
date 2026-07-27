@@ -386,6 +386,18 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
  *    g_vm_jit_exc + return 1 (loc side table), else 0.
  *  - jit_foreach_dyn_next: 1 = bound, 0 = end, -1 = THREW (the strict N-var
  *    unpack's TypeErrorEx via g_vm_jit_exc, loc side table). */
+/* model-flip (nativize-ops): the STRICT-unpack ops. jit_unpack_elem serves
+ * all four UnpackElem* (n_kind = N | kind << 8, kind 0 int / 1 float / 2
+ * value; `targets` = the baked &chunk.unpack_targets[idx] for the Targets
+ * variant, else null and the consecutive run at dst_base). jit_multi_unpack
+ * is MultiUnpackV (targets/coerce = baked pool entries; aop = the compound
+ * base op or Op::invalid). Throws -> g_vm_jit_exc + return 1. */
+extern "C" int jit_unpack_elem(int_type dst_base, int_type base_slot,
+                               int_type idx, int_type n_kind,
+                               const void *targets) noexcept;
+extern "C" int jit_multi_unpack(int_type rval_slot, const void *targets,
+                                const void *coerce, int_type aop) noexcept;
+
 /* model-flip (nativize-ops): DeclConstV (bind a const decl's slot, local or
  * global; never throws) and DefinedGlobalV (`defined(g)` = the slot's
  * defined-flag as a bool; never throws). */

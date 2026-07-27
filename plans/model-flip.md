@@ -604,9 +604,28 @@ The order:
    controls showed +0.8-1.4% on UNTOUCHED paths incl. `-nr` parse-only -
    byte-identical bytecode, so it is LTO/inlining drift (the documented
    cross-binary noise class), not a change cost.
-   Remaining tail: UnpackElemInt/Float/Value/Targets + MultiUnpackV (the
-   ForeachDyn bodies are 90% of the work), IncDecCheckedV/ElemChecked/
-   MemberChecked/ChainV.
+   Second batch **DONE (2026-07-25)**: the STRICT-unpack family -
+   UnpackElemInt/Float/Value/Targets via ONE jit_unpack_elem (n_kind =
+   N | kind << 8; the Targets variant bakes &unpack_targets[idx]) +
+   MultiUnpackV via jit_multi_unpack (targets/coerce pool bakes; the
+   compound aop rides an arg) - both over SHARED bodies
+   (vm_unpack_elem_body / vm_multi_unpack_body) the interpreter handlers
+   also run; vm_throw_multi_unpack_len went nullable-chunk like the
+   unpack throwers. N5: the consecutive-run variants disqualify
+   [target, target+N) precisely (N = b_lit, enumerable); Targets/Multi
+   mark_barrier. MEASURED: 73_multi_unpack **0.739x**,
+   20_foreach_unpack 0.988x, 22_multi_assign/controls 1.000;
+   **75_indexed_unpack +1.1% same-binary** (jit-effect 0.899 -> 0.909:
+   the merged run's helper protocol + some lost pinning trade slightly
+   negative on that shape) - a follow-up lean-up candidate, net across
+   the family strongly positive. Test-shape note: `var a, b = <dyn>` is
+   a compile DynRequiredEx - the MultiUnpackV cases use typed int
+   targets (which also exercises the unpack_coerce path).
+   Remaining tail: IncDecCheckedV/ElemChecked/MemberChecked (helpers;
+   the undefined-global cases BAIL like LoadGlobalV since
+   UndefinedVariableEx is not conveyable) + IncDecChainV
+   (vm_incdec_chain_op takes (chunk, Instr) - needs the pool-entry
+   refactor the nested-chain stores got).
 6. **DE-HELPERIZE the trivial-value ops** (perf-parity today, but the road
    to REMOVING ALL HELPERS): MoveV / LoadConstV / LoadCaptureV /
    LoadBuiltinV / plain StoreGlobalV / StoreCaptureV currently CALL a
