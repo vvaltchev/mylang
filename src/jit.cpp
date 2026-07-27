@@ -2279,9 +2279,8 @@ static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc)
 }
 
 static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
-                            uint32_t pc, bool is_float)
+                            uint32_t pc, size_t old_pc, bool is_float)
 {
-    (void)ck;
     const void *fn = is_float
         ? reinterpret_cast<const void *>(jit_store_elem_float)
         : reinterpret_cast<const void *>(jit_store_elem_int);
@@ -2309,6 +2308,7 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
 
     e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
     const size_t j_ok = e.j8(0x74);       /* jz -> continue (0 = no raise) */
+    emit_lep_store(e, ck, old_pc);        /* cold: the op's own caret */
     e.exit_pc(pc);                        /* raised: EnterNative raises exc */
     e.patch8(j_ok, e.pos());
 }
@@ -2320,7 +2320,8 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
  * (the key/val leas read rdi=slots). The key/val/base slots are disqualified
  * from register caching (pick_cached_slots) so their slots hold CURRENT
  * EvalValues - a cached int key (a counter used as d[i]) would be stale. */
-static void emit_dict_store(Emitter &e, const Instr &in, uint32_t pc)
+static void emit_dict_store(Emitter &e, const Chunk &ck, const Instr &in,
+                            uint32_t pc, size_t old_pc)
 {
     const auto off = [](int slot) {
         return static_cast<int32_t>(static_cast<long>(slot)
@@ -2337,6 +2338,7 @@ static void emit_dict_store(Emitter &e, const Instr &in, uint32_t pc)
     emit_call_epilogue(e);
     e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
     const size_t j_ok = e.j8(0x74);
+    emit_lep_store(e, ck, old_pc);        /* cold: the op's own caret */
     e.exit_pc(pc);
     e.patch8(j_ok, e.pos());
 }
@@ -2597,13 +2599,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::StoreElemInt:
-        emit_store_elem(e, ck, in, pc, /*is_float=*/false);
+        emit_store_elem(e, ck, in, pc, old_pc, /*is_float=*/false);
         return true;
     case OpCode::StoreElemFloat:
-        emit_store_elem(e, ck, in, pc, /*is_float=*/true);
+        emit_store_elem(e, ck, in, pc, old_pc, /*is_float=*/true);
         return true;
     case OpCode::DictStore:
-        emit_dict_store(e, in, pc);
+        emit_dict_store(e, ck, in, pc, old_pc);
         return true;
 
     case OpCode::StoreElemValue:
@@ -2627,6 +2629,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
+            if (in.target != 1)               /* a GLOBAL base can BAIL (undefined,
+                                   * no exc) - a lep stored on that
+                                   * path would go STALE and poison a
+                                   * later loc-less raise; a non-
+                                   * global base is convey-only */
+                emit_lep_store(e, ck, old_pc);
             e.exit_pc(pc);                    /* raise (exc set) or bail (unset) */
             e.patch8(j_ok, e.pos());
         }
@@ -2675,6 +2683,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_lep_store(e, ck, old_pc);  /* cold: own caret */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -2699,6 +2708,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            if (in.a_dual_hi() != 1)               /* a GLOBAL base can BAIL (undefined,
+                                   * no exc) - a lep stored on that
+                                   * path would go STALE and poison a
+                                   * later loc-less raise; a non-
+                                   * global base is convey-only */
+                emit_lep_store(e, ck, old_pc);
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -2724,6 +2739,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            if (in.a_dual_hi() != 1)               /* a GLOBAL base can BAIL (undefined,
+                                   * no exc) - a lep stored on that
+                                   * path would go STALE and poison a
+                                   * later loc-less raise; a non-
+                                   * global base is convey-only */
+                emit_lep_store(e, ck, old_pc);
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -4561,6 +4582,36 @@ static bool op_fully_native(const Instr &in)
     case OpCode::CoerceNumV:
     case OpCode::MemberV:
     case OpCode::LoadGlobalV:
+        return true;
+    /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
+     * DictStore / StoreElem2V: convey-only helpers, cold-side lep caret.
+     * StoreElemFloat is EXCLUDED: its emitted VALUE load (emit_float_load)
+     * can structurally BAIL on a non-numeric tag - unreachable when
+     * inference is right, but a bail in a deleted run re-runs the fragment
+     * head (the double-execution hazard), so the original stays. */
+    case OpCode::StoreElemInt:
+    case OpCode::DictStore:
+    case OpCode::StoreElem2V:
+        return true;
+    /* A GLOBAL base (kind 1) BAILS on an undefined slot -> non-deletable
+     * (and its emit skips the lep store for the same reason: the shared
+     * failure branch would leave a STALE lep on the bail path). A local /
+     * capture base is convey-only. StoreMemberV needs no lep at all (its
+     * helper stamps every loc-less throw with the member_keys pool caret,
+     * the interpreted catch's exact rule). */
+    case OpCode::StoreElemValue:
+    case OpCode::StoreMemberV:
+        return in.target != 1;
+    case OpCode::StoreElemChainV:
+    case OpCode::StoreLValueChainV:
+        return in.a_dual_hi() != 1;
+    /* The COMPOUND global/capture stores (the PLAIN forms are never-exit,
+     * gated in op_never_exits): both stamp their num_bin_op throw from the
+     * BoxedOp pool's start/end, and the global's old undefined-slot bail
+     * became an eptr conveyance of the exact UndefinedVariableEx (name +
+     * pool caret) - convey-only now, so deletable. */
+    case OpCode::StoreGlobalV:
+    case OpCode::StoreCaptureV:
         return true;
     default:
         return false;

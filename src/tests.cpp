@@ -6686,6 +6686,20 @@ static const std::vector<test> tests =
         },
         &typeid(OutOfBoundsEx), 39, 3, 44, 3,
     },
+    {
+        /* the store-family increment: an OOB STORE in a DELETED run - the
+         * caret rides jit_store_elem_value's cold-side lep conveyance. */
+        "err loc: a DELETED run's subscript STORE keeps its own caret",
+        {
+            "func f(dyn a, int n) {",
+            "  for (var i = 0; i < n; i++)",
+            "    a[i] = i;",
+            "  return 0;",
+            "}",
+            "f(runtime([1, 2]), 4);",
+        },
+        &typeid(OutOfBoundsEx), 5, 3, 10, 3,
+    },
 
     {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",
