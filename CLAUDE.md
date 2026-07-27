@@ -313,6 +313,27 @@ cumulative -20% / -26% from the pre-#60 baseline). Pure-loop I-count flat; a
 residual `55_float_sum` wall-clock signal (~a few %, I-count-neutral) is the
 unavoidable `vm_dispatch`-growth layout tax any new op pays.
 
+**#60 - the JIT-inline INT-INT fast tier for the BOXED ops (2026-07-28).**
+The emitted BinOpV/CmpV/CompoundV site paid a full helper call (~80 Ir:
+marshal + EvalValue copies + vm_num_binop + put) even when both runtime
+operands are plain ints - the overwhelmingly common shape in a dyn
+accumulator loop. The emit now inlines type-tag GUARDS (operand slots'
+type word == t_int; an int literal needs none) + payload arithmetic
+(op_rr: add/sub/imul/and/or/xor) + the ref-aware store_dst; CmpV is the
+CmpIntV setcc shape yielding a REAL bool; CompoundV's fast store writes
+the PAYLOAD only (the guard proved the dst already holds an int - nothing
+to release, no type store). ANY other shape - a float/bool/string/mixed
+operand, the throwing aops (div/mod/shifts), a float/bool literal - falls
+to the EXACT jit_boxed_* helper tier, byte-identical incl. carets; guards
+precede every mutation so the decline is idempotent. Execution-proven by
+`g_jit_boxed_fast` (bumped by the EMITTED fast path; the
+`jit_boxed_int_fast` test asserts BinOpV, CmpV+CompoundV, and the
+mid-loop int->float guard-decline separately). Measured (callgrind Ir,
+same-session A/B): 74_dyn_foreach_kv **-58.6%** (wall 0.63s -> 0.24s),
+66_dyn_foreach **-24.6%** (wall -17%); 34/35/62 exactly neutral (their
+hot compares were already CmpIntV). Suite my/py geomean 9.44x ->
+**9.81x**.
+
 **D1 - `AppendV` (the append/push fast op).** `append(a, x)`/`push(a, x)`
 with one value arg emits `AppendV` (CallBuiltinLV's operand layout: the
 builtin_calls pool idx, arg0's kind+slot, the value's slot) instead of

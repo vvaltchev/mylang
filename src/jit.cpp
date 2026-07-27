@@ -46,6 +46,7 @@
 /* struct baked-fast-path execution proof (see jit.h) */
 extern "C" {
 unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
+unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 }
@@ -4481,10 +4482,92 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::CmpV:
     case OpCode::CompoundV:
     case OpCode::UnaryV: {
-        /* jit_boxed_* / jit_unary (bop) where bop = &ck.boxed_ops[in.target2]
-         * (a stable pool-buffer address; build_boxed_ops stored the index in
-         * target2). rdi = bop. Can throw -> test eax + exit_pc so EnterNative
-         * re-raises with the op's caret from the loc side table. */
+        /* #60 (the value-model campaign): the INT-INT FAST TIER, inline.
+         * The dyn/boxed arithmetic ops paid a full helper call (~80 Ir:
+         * marshal + EvalValue copies + vm_num_binop + put) even when both
+         * runtime operands are plain ints - the overwhelmingly common case
+         * in a dyn accumulator loop (66_dyn_foreach's `s = (s+e) % M`).
+         * Emit type-tag guards + payload arithmetic + the ref-aware store
+         * at the site; ANY other shape (float/bool/string/mixed operand, a
+         * throwing aop - div/mod/shifts) falls to the EXACT helper path
+         * below, byte-identical incl. carets. Guards precede every
+         * mutation, so the decline is idempotent. CompoundV's fast store
+         * writes the PAYLOAD only (the guard proved the dst already holds
+         * an int, so the type word is already t_int and there is nothing
+         * to release). CmpV yields a REAL bool (is_true of the 0/1 int),
+         * the CmpIntV setcc shape. */
+        const Chunk::BoxedOp &bo = ck.boxed_ops[in.target2];
+        const bool comp = in.op == OpCode::CompoundV;
+        const bool cmp = in.op == OpCode::CmpV;
+        const auto arith_ok = [](Op o) {
+            return o == Op::plus || o == Op::minus || o == Op::times
+                || o == Op::band || o == Op::bor || o == Op::bxor;
+        };
+        const auto cmp_ok = [](Op o) {
+            return o == Op::lt || o == Op::gt || o == Op::le || o == Op::ge
+                || o == Op::eq || o == Op::noteq;
+        };
+        const auto opnd_ok = [](const Operand &o) {
+            return !o.is_lit || o.lit_kind == Operand::LitKind::i;
+        };
+        const bool fast = in.op != OpCode::UnaryV
+            && (cmp ? cmp_ok(bo.aop) : arith_ok(bo.aop))
+            && opnd_ok(bo.b) && (comp || opnd_ok(bo.a));
+        size_t j_slow_a = 0, j_slow_b = 0, j_done = 0;
+        if (fast) {
+            e.movabs(RCX, reinterpret_cast<uint64_t>(jit_layout().t_int));
+            if (comp) {
+                e.load(RAX, slot_addr(in.target).type);
+                e.cmp_rax_rcx();
+                j_slow_a = e.j32(0x75);
+            } else if (!bo.a.is_lit) {
+                e.load(RAX, slot_addr(bo.a.slot).type);
+                e.cmp_rax_rcx();
+                j_slow_a = e.j32(0x75);
+            }
+            if (!bo.b.is_lit) {
+                e.load(RAX, slot_addr(bo.b.slot).type);
+                e.cmp_rax_rcx();
+                j_slow_b = e.j32(0x75);
+            }
+#ifdef TESTS
+            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_boxed_fast));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x02);    /* inc qword [rdx] */
+#endif
+            /* payloads: rax = lhs, rcx = rhs (guard value dead now) */
+            if (comp)
+                e.load(RAX, slot_addr(in.target).payload);
+            else if (bo.a.is_lit)
+                e.movabs(RAX, static_cast<uint64_t>(bo.a.lit));
+            else
+                e.load(RAX, slot_addr(bo.a.slot).payload);
+            if (bo.b.is_lit)
+                e.movabs(RCX, static_cast<uint64_t>(bo.b.lit));
+            else
+                e.load(RCX, slot_addr(bo.b.slot).payload);
+            if (cmp) {
+                e.cmp_rax_rcx();
+                e.u8(0x0F);
+                e.u8(static_cast<uint8_t>(cc_for(bo.aop).near_op + 0x10));
+                e.u8(0xC0);                           /* setcc al */
+                e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);   /* movzx eax, al */
+                store_dst_bool(e, ck, RAX, in.target);
+            } else {
+                op_rr(e, bo.aop);
+                if (comp) {
+                    e.store(RAX, slot_addr(in.target).payload);
+                } else {
+                    e.movabs(RSI,
+                             reinterpret_cast<uint64_t>(jit_layout().t_int));
+                    store_dst(e, ck, RAX, in.target, pc);
+                }
+            }
+            j_done = e.j32(0xEB);
+            if (j_slow_a) e.patch32_here(j_slow_a);
+            if (j_slow_b) e.patch32_here(j_slow_b);
+        }
+        /* the slow tier: the interpreter-exact helpers (any operand shape,
+         * the throwing aops) */
         const void *fn = in.op == OpCode::BinOpV
             ? reinterpret_cast<const void *>(jit_boxed_binop)
             : in.op == OpCode::CmpV
@@ -4502,6 +4585,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const size_t j_ok = e.j8(0x74);       /* jz -> continue (0 = no raise) */
         e.exit_pc(pc);                        /* raised: EnterNative re-raises */
         e.patch8(j_ok, e.pos());
+        if (j_done) e.patch32_here(j_done);
         return true;
     }
 

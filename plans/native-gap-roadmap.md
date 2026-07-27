@@ -404,3 +404,28 @@ Measured (callgrind Ir, same-session A/B, scale 1): 74_dyn_foreach_kv
 #60/N7 arc), 20_foreach_unpack / 26_dict_iterate (typed paths) neutral.
 The remaining 66/74 headroom is the boxed `s = (s+e) % M` chain
 (jit_boxed_binop + puts ~40% of 66), not the iterator.
+
+## #60 resumed - the JIT-inline int-int fast tier for boxed ops (2026-07-28)
+
+BinOpV/CmpV/CompoundV emit sites gain an inline INT-INT fast path: type-tag
+guards on the slot operands (t_int compare; int literals guard-free), payload
+arithmetic via op_rr (plus/minus/times/band/bor/bxor), ref-aware store_dst
+(BinOpV), the CmpIntV setcc bool shape (CmpV), a payload-only store
+(CompoundV - the guard proved dst already int, nothing to release). Any other
+shape (float/bool/string operand, div/mod/shifts, f/b literals) falls to the
+exact jit_boxed_* helpers - guards precede mutations, decline idempotent.
+UnaryV/LogV unchanged (helper-only).
+
+Execution proof: g_jit_boxed_fast bumped by the emitted path;
+jit_boxed_int_fast asserts each op kind + the mid-loop int->float
+guard-decline fallback.
+
+Measured (callgrind Ir, same-session A/B, scale 1):
+74_dyn_foreach_kv 8.37B -> 3.47B (**-58.6%**; wall 0.63 -> 0.24s),
+66_dyn_foreach 9.77B -> 7.37B (**-24.6%**; wall 1.00 -> 0.83s);
+34/35/62 exactly neutral (their compares are already CmpIntV). Suite
+my/py geomean 0.106x -> 0.102x (**9.44x -> 9.81x** vs CPython).
+
+Remaining #60 headroom in 66: the iterator + put churn now dominates
+(vm_dyn_next_arr_gen on the GENERAL dyn-destination array); a flat-on-
+dyn-destination revisit or unboxed loop-var binds would be next.
