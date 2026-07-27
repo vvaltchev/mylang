@@ -4594,6 +4594,19 @@ string fallback (a subclass without the override). A user struct
 NAMED like a builtin still matches identically (same canonical intern).
 Measured: 70_exc a further **-13.5%** Ir (string machinery 13% ->
 0.1%), 42 -1.4%; cumulative #74: 155.7M -> 87.5M (**-43.8%**).
+**#74 increment 4 - the lean per-throw lifecycle:** (1) the POOL's
+single-element alloc/free fast paths moved INLINE into poolalloc.h
+(the size at an ML_POOL_NEW_DELETE site is a compile-time constant, so
+the size class folds and the hot path is a 4-5 instruction freelist
+pop/push; the refill + out-of-range tiers stay out-of-line in
+types.cpp - pool_alloc_slow/pool_free_slow - and the pool STATE stays
+defined there, the global-mutable-state home; the ASan pass-through is
+unchanged); (2) `vm_flush_inline` is an ML_ALWAYS_INLINE empty-gate
+(`chunk.inline_ctxs.empty()` - the common no-inlining chunk skips the
+call + pc search, ~27 Ir per raise) over the ML_NOINLINE walk.
+Measured: 70_exc a further **-15.5%** Ir; the pool inlining also pays
+on the dict-node paths - 23_dict_insert -4.1%, 67_make_dict -4.8%;
+10/62 neutral. Cumulative #74: 155.7M -> 73.9M (**-52.5%**).
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by

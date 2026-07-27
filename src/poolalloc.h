@@ -41,11 +41,53 @@
 #  endif
 #endif
 
-/* The pool core (defined in types.cpp - the global-mutable-state home).
- * Size classes: 16-byte steps up to ML_POOL_MAX; larger sizes fall back to
- * operator new inside pool_alloc_one itself, so callers never branch. */
-void *pool_alloc_one(size_t size);
-void pool_free_one(void *p, size_t size) noexcept;
+/* The pool STATE lives in types.cpp (the global-mutable-state home); the
+ * single-element FAST PATHS are inline here (#74's per-throw-allocation
+ * increment): every ML_POOL_NEW_DELETE call site passes a COMPILE-TIME
+ * size, so the size class folds to a constant and the hot alloc/free is
+ * 4-5 instructions (freelist pop/push) instead of an out-of-line call +
+ * a runtime class computation (~45 Ir round trip, measured on the
+ * per-throw exception objects; the dict-node and PureCache paths gain
+ * identically). The refill and the out-of-range sizes stay out-of-line
+ * (pool_alloc_slow / pool_free_slow, types.cpp). */
+struct PoolFreeNode { PoolFreeNode *next; };
+constexpr size_t ML_POOL_CLASS_STEP = 16;
+constexpr size_t ML_POOL_NCLASSES = 16;   /* classes: 16..256 bytes */
+extern PoolFreeNode *g_pool_free[ML_POOL_NCLASSES];   /* types.cpp */
+void *pool_alloc_slow(size_t size);            /* refill / out-of-range */
+void pool_free_slow(void *p, size_t size) noexcept;   /* out-of-range */
+
+inline void *pool_alloc_one(size_t size)
+{
+#ifdef ML_POOLALLOC_PASSTHROUGH
+    return ::operator new(size);     /* ASan: keep full UAF coverage */
+#else
+    const size_t cls = (size + ML_POOL_CLASS_STEP - 1) / ML_POOL_CLASS_STEP;
+    if (cls == 0 || cls > ML_POOL_NCLASSES)
+        return pool_alloc_slow(size);     /* out-of-range: plain heap */
+    PoolFreeNode *n = g_pool_free[cls - 1];
+    if (!n)
+        return pool_alloc_slow(size);     /* refill (cold) */
+    g_pool_free[cls - 1] = n->next;
+    return n;
+#endif
+}
+
+inline void pool_free_one(void *p, size_t size) noexcept
+{
+#ifdef ML_POOLALLOC_PASSTHROUGH
+    ::operator delete(p);
+#else
+    const size_t cls = (size + ML_POOL_CLASS_STEP - 1) / ML_POOL_CLASS_STEP;
+    if (cls == 0 || cls > ML_POOL_NCLASSES) {
+        pool_free_slow(p, size);
+        return;
+    }
+    auto *n = static_cast<PoolFreeNode *>(p);
+    n->next = g_pool_free[cls - 1];
+    g_pool_free[cls - 1] = n;
+#endif
+}
 
 /*
  * Class-scope pooled allocation (top-10 #6): the runtime's small, fixed-size

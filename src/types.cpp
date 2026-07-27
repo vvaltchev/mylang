@@ -229,33 +229,31 @@ std::set<UniqueId, UniqueId::Comparator> UniqueId::unique_set;
  * static destruction touches only the POD free-list heads + block
  * memory (the blocks are never freed). Compiled to pass-through under
  * ASan (see poolalloc.h - reuse would mask a node use-after-free). */
+/* The pool STATE (the fast paths are inline in poolalloc.h - #74; the
+ * classes: 16..256 bytes, #6 raised from 160: FuncObject is ~176-200). */
+PoolFreeNode *g_pool_free[ML_POOL_NCLASSES];
+
 namespace {
 
-struct PoolFreeNode { PoolFreeNode *next; };
-constexpr size_t POOL_CLASS_STEP = 16;
-constexpr size_t POOL_NCLASSES = 16;      /* classes: 16..256 bytes (#6
-                                           * raised it from 160: FuncObject
-                                           * is ~176-200) */
 constexpr size_t POOL_BLOCK_BYTES = 4096;
-PoolFreeNode *g_pool_free[POOL_NCLASSES];
 std::vector<void *> g_pool_blocks;        /* leak-checker visibility */
 
 } /* anon namespace */
 
-void *pool_alloc_one(size_t size)
+/* The COLD tiers behind the inline fast paths: the arena refill for an
+ * empty class freelist, and the plain-heap fallback for an out-of-range
+ * size (the inline path never reaches here for a warm class). */
+void *pool_alloc_slow(size_t size)
 {
-#ifdef ML_POOLALLOC_PASSTHROUGH
-    return ::operator new(size);     /* ASan: keep full UAF coverage */
-#endif
-    const size_t cls = (size + POOL_CLASS_STEP - 1) / POOL_CLASS_STEP;
+    const size_t cls = (size + ML_POOL_CLASS_STEP - 1) / ML_POOL_CLASS_STEP;
 
-    if (cls == 0 || cls > POOL_NCLASSES)
+    if (cls == 0 || cls > ML_POOL_NCLASSES)
         return ::operator new(size);      /* out-of-range: plain heap */
 
     PoolFreeNode *&head = g_pool_free[cls - 1];
 
     if (!head) {
-        const size_t csz = cls * POOL_CLASS_STEP;
+        const size_t csz = cls * ML_POOL_CLASS_STEP;
         const size_t count = POOL_BLOCK_BYTES / csz;
         char *block = static_cast<char *>(::operator new(count * csz));
         g_pool_blocks.push_back(block);
@@ -271,22 +269,9 @@ void *pool_alloc_one(size_t size)
     return n;
 }
 
-void pool_free_one(void *p, size_t size) noexcept
+void pool_free_slow(void *p, size_t size) noexcept
 {
-#ifdef ML_POOLALLOC_PASSTHROUGH
-    ::operator delete(p);
-    return;
-#endif
-    const size_t cls = (size + POOL_CLASS_STEP - 1) / POOL_CLASS_STEP;
-
-    if (cls == 0 || cls > POOL_NCLASSES) {
-        ::operator delete(p);
-        return;
-    }
-
-    auto *n = static_cast<PoolFreeNode *>(p);
-    n->next = g_pool_free[cls - 1];
-    g_pool_free[cls - 1] = n;
+    ::operator delete(p);                 /* out-of-range only */
 }
 
 inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
