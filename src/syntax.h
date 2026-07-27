@@ -1152,6 +1152,13 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     int_type eval_int(EvalContext *ctx) const override;
     float_type eval_float(EvalContext *ctx) const override;
+    /* the un-wrapped bodies; eval_int/eval_float add the inlined-at frame
+     * flush for a node inside an inlined body (task #75 - the typed path
+     * bypasses Construct::eval, so without this an error thrown through a
+     * typed chain lost its virtual backtrace frames; chain-less nodes call
+     * the body directly, zero cost) */
+    int_type eval_int_body(EvalContext *ctx) const;
+    float_type eval_float_body(EvalContext *ctx) const;
     void serialize(ostream &s, int level = 0) const override;
 
     unique_ptr<Construct> clone() const override {

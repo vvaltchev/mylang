@@ -2002,6 +2002,15 @@ is sound). **SOUND for int ONLY** — `+`/`-`/`*` are associative & commutative 
 (concatenation) is never touched. `/` and `%` are excluded (truncating int
 division isn't associative). A rebuilt chain's base op is `Op::invalid` (asserted
 in `eval_first_rvalue`, so a structural mistake aborts rather than miscomputes).
+**A rebuilt chain carries the ORIGINAL's base fields** (task #75, 2026-07-28):
+fold_addsub/fold_mul/make_int_mul copy_base_fields from the node they replace -
+a fresh chain with EMPTY fields lost the caret AND the inlined-at chain for
+errors thrown through it, which (compounded by the TYPED eval path bypassing
+Construct::eval's flush hook) made the tree-walker render NO backtrace where
+the VM rendered the virtual frames. TypedScalarExpr::eval_int/eval_float now
+flush their own chain on an unwinding exception (a chain-less node calls the
+un-wrapped *_body directly - zero cost); pinned by the
+typed_inlined_backtrace_parity test (byte-identical engines).
 This is the type-narrowed realization of the long-deferred "algebraic
 simplification" pass, now safe because inference proved the type. **Caveat:** an
 UNTYPED template base
