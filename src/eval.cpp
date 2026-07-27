@@ -4722,7 +4722,8 @@ do_catch(EvalContext *ctx,
         return true;
     }
 
-    ExceptionObject *exObj = dynamic_cast<ExceptionObject *>(saved_ex);
+    ExceptionObject *exObj = saved_ex->is_exception_object()
+        ? static_cast<ExceptionObject *>(saved_ex) : nullptr;
     string_view ex_name = exObj ? exObj->get_name() : saved_ex->name;
 
     for (const unique_ptr<Identifier> &id : exList->elems) {
