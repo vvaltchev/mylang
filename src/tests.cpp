@@ -1388,6 +1388,16 @@ static const std::vector<test> tests =
         &typeid(OutOfBoundsEx), 13, 2, 18, 2,
     },
     {
+        /* #76: a TYPED div/mod's div0 carets the DIVISOR operand - the
+         * boxed ladder's operand-precise convention, unified across BOTH
+         * engines and lowering paths (the VM records the divisor's loc,
+         * the tree-walker's TypedScalarExpr throws with its span). */
+        "err loc: typed div0 carets the DIVISOR operand",
+        { "var z = [0];",
+          "var y = 10 / z[0];" },
+        &typeid(DivisionByZeroEx), 14, 2, 19, 2,
+    },
+    {
         /* A dyn-laundered arg declines the fusion (vm_len_kind == 0 /
          * base_str unset) and keeps the generic builtin - results and
          * runtime type errors are unchanged. */

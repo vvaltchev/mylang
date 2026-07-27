@@ -374,6 +374,26 @@ semantics - and arity/type errors are compile-time-excluded), so it is
 loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
 0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
 
+**#76 - the UNIFIED div0 caret convention (2026-07-28).** Per-path the
+engines agreed but their CONVENTIONS differed: the boxed ladders (both
+engines) caret the offending DIVISOR operand, the TYPED paths careted
+the whole chain - so when the engines chose DIFFERENT lowerings for
+the same code (a comparator body: tw typed, VM boxed via a global
+base), the carets diverged. Unified on OPERAND-PRECISE everywhere:
+TypedScalarExpr::eval_int/eval_float's div/mod throw with the DIVISOR
+element's span, and the codegen's typed IntBin/FloatBin div/mod record
+the divisor's loc via the NEW `CgInstr::loc_node_idx` - a
+codegen-transient SECOND node handle for the LOC record only, because
+the op's inlined-at chain must stay the CHAIN node's (a
+substituted-arg divisor can carry a SHALLOWER chain, which dropped
+virtual frames - the #75 parity test caught it). extract_locs reads +
+clears loc_node_idx UNCONDITIONALLY up front: a peephole FUSION copies
+the source Instr struct (IntAddModRI from an IntBin mod), so the field
+rides into ops whose extract branch never touches it - a FUZZER-caught
+verify_ast_free abort (71/400 diverged; -rt alone was green - the
+fuzzer is load-bearing for codegen-field changes). Pinned by the
+"typed div0 carets the DIVISOR operand" test + the comparator smoke.
+
 **LEVER 4b (2026-07-27, plans/native-gap-roadmap.md) - native `len()` +
 the fused `ord(s[i])`.** `len(x)` whose arg the inferencer proved a
 non-opt ARRAY/STRING lowers to the EXISTING `ArrLen`/`StrLen` op (no
@@ -778,8 +798,8 @@ append loop's chunk is a bare enter.nat). Error parity pinned:
 const-rebind + flat-mismatch carets byte-identical through the deleted
 form; a THROWING COMPARATOR revealed a PRE-EXISTING (parent-verified,
 JIT-independent) caret divergence - the VM carets the offending
-DIVISOR `z[0]`, the tree-walker the whole `x / z[0]` chain - noted,
-not this increment's doing. Ir neutral (13/34/47 +-0.00%). Corpus:
+DIVISOR `z[0]`, the tree-walker the whole `x / z[0]` chain - FIXED
+(#76, next paragraph). Ir neutral (13/34/47 +-0.00%). Corpus:
 45 -> 41 kept runs. Remaining blockers: the calls (38),
 Catch/Reraise/Throw (12), StructFieldAddInt (5), MultiUnpackV (3).
 
