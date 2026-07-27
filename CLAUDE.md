@@ -232,6 +232,17 @@ first-descent grows the record high-water through the slow tier by
 design). M5b measured (Ir): 10_recursion_deep -30.4%, 11 -15.5%,
 63 -15.6%; wall ~0.90x each; 10 CUMULATIVE -46% Ir from pre-lever-1.
 See plans/native-gap-roadmap.md for the full per-step record.
+**Sync-depth accounting (fixed 2026-07-27):** the depth DEC runs AFTER
+`jit_sync_postexit` - at the emitted inline site AND in
+`jit_call_sync_core`'s direct-entry branch - because the postexit's
+INTERPRETED continuation is one `vm_dispatch` C frame per level (~77KB
+under clang ASan: per-case locals + redzones, no scoped-local overlap);
+decrementing first let a deep recursion of mid-body-exiting fragments
+stack un-capped C frames (a clang-ASan-lane stack overflow; invisible
+armed - frames land on the 1GB reserve - and marginal under lean plain
+frames). A SANITIZED build's unarmed cap is **32**, not 200
+(`jit_native_stack_init`'s #else): past the cap a sync call falls
+interpreted (in-VM, flat), so there the cap is purely a perf knob.
 **`Chunk::ref_slots` (2026-07-18 profile #2):** the audited list of frame
 slots that can EVER hold a >= t_str value (non-coerced params + every dst
 of a non-`op_writes_scalar` op; a chunk with a use-def BARRIER op lists

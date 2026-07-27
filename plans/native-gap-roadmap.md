@@ -336,3 +336,18 @@ a cmov tier for simple select shapes may apply).
 Per-call cost anchor: 10_recursion_deep = 2.7M real calls in 0.085s =
 ~31ns/call (frame_setup+leave+sync overhead) vs C++'s loop-converted
 ~0.4ns/iteration.
+
+## Sync postexit depth accounting (pre-existing bug, fixed 2026-07-27)
+
+Found by the clang-ASan lane during the lever 4b battery (pre-existing at
+HEAD): the emitted sync call site and jit_call_sync_core decremented
+g_jit_sync_depth BEFORE jit_sync_postexit, so the postexit's interpreted
+vm_dispatch continuation ran depth-UNCOUNTED - a deep recursion whose
+bodies exit to the interpreter mid-body stacked one un-capped ~77KB
+(clang-ASan) C frame per level -> stack overflow at depth ~100. Invisible
+when the native stack is armed (frames land on the 1GB reserve) and
+marginal under lean plain frames. Fix: DEC after the postexit on both
+paths; plus the sanitized unarmed default cap is 32 (was 200) - past the
+cap a sync call falls interpreted (in-VM, flat), so the cap is a perf
+knob the correctness lanes don't care about. The jit_post_call_entry pin
+is 32 accordingly.

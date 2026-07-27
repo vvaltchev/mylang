@@ -5025,11 +5025,19 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
             jit_enter_deep(static_cast<const char *>(cck->native.base)
                                + cck->sync_entry_off,
                            w->slots);
-        g_jit_sync_depth--;
-        if (r == JIT_RET_SENTINEL)     /* native ReturnV: frame popped,
+        if (r == JIT_RET_SENTINEL) {   /* native ReturnV: frame popped,
                                         * dst written - done */
+            g_jit_sync_depth--;
             return 0;
-        return jit_sync_postexit(r, site_packed);
+        }
+        /* the DEC runs AFTER the postexit: its interpreted continuation
+         * (a vm_dispatch C frame per level) must stay depth-COUNTED, or
+         * a deep recursion of mid-body-exiting fragments stacks un-capped
+         * C frames (the clang-ASan stack overflow; see the emitted site's
+         * twin comment in jit.cpp). */
+        const int pr = jit_sync_postexit(r, site_packed);
+        g_jit_sync_depth--;
+        return pr;
     }
     try {
         vm_dispatch(*cck, ctx, act);
