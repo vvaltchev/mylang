@@ -3300,42 +3300,94 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat: {
-        /* a[i] from a flat int/float array (N4). Navigate slot -> shobj
-         * -> kind + data, bounds-check, read the raw scalar. Every
-         * failing precondition BAILS (the interpreter re-runs the op with
-         * its exact OutOfBounds/type handling). target2 = the array slot,
-         * a() = the int index, target = the dst. r9 = t_arr then the
-         * index; rcx = data start; rdx = element count. */
+        /* a[i] from a flat int/float array (N4; #56 delete-originals form).
+         * The inline fast path serves the proven flat non-slice in-range
+         * shape; EVERY declined precondition - non-array, a slice,
+         * general/strs/wrong-kind storage, a negative index, OOB - jumps
+         * to the SLOW TIER: a call to jit_load_elem_int/float (the
+         * interpreter's exact core), whose OOB CONVEYS with the op's
+         * exc-stamped caret. The op never re-interprets, so its run's
+         * originals are deletable. target2 = the array slot, a() = the
+         * int index, target = the dst. */
         const JitLayout &L = jit_layout();
         const bool is_float = in.op == OpCode::LoadElemFloat;
         const SlotAddr base = slot_addr(in.target2);
+        std::vector<size_t> j_slows;
+        size_t j_done = 0;
 
         e.load(RAX, base.type);                  /* base an array? */
         e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
         e.cmp_rax_r9();
-        e.bail_unless(0x74, pc);                 /* je (== t_arr) */
+        j_slows.push_back(e.j32(0x75));          /* jne -> slow */
         e.cmp_byte_rdi(base.payload + L.slice_off, 0);   /* not a slice? */
-        e.bail_unless(0x74, pc);                 /* je (slice==0) */
+        j_slows.push_back(e.j32(0x75));
         e.load(RAX, base.payload);               /* rax = shobj ptr */
         if (is_float) {
             e.cmp_byte_rax(L.kind_off, L.kind_floats);
-            e.bail_unless(0x74, pc);             /* je (kind matches) */
+            j_slows.push_back(e.j32(0x75));
             e.mov_rcx_rax(L.data_off);           /* rcx = _M_start */
             e.mov_rdx_rax(L.data_off + 8);       /* rdx = _M_finish */
             e.sub_rdx_rcx();
             e.sar_rdx_3();                        /* rdx = element count */
             load_index_r9(e, in);                 /* cache-aware index */
-            /* hot unsigned bounds check; cold negative wrap / OOB raise
-             * (raising OOB for a[-1] was the same pre-existing divergence) */
-            emit_elem_bounds_or_wrap(e, pc);
+            e.cmp_r9_rdx();
+            j_slows.push_back(e.j32(0x73));      /* jae (wrap/OOB) -> slow */
             e.load_elem_float();                 /* movsd xmm0,[rcx+r9*8] */
             emit_float_store(e, ck, X0, in.target, pc);
-            return true;
+            j_done = e.j32(0xEB);
+        } else {
+            e.cmp_byte_rax(L.kind_off, L.kind_ints);
+            const size_t j_ints = e.j32(0x74);
+            e.cmp_byte_rax(L.kind_off, L.kind_bools);
+            j_slows.push_back(e.j32(0x75));
+            /* flat bools: byte elements (no sar), movzx load */
+            e.mov_rcx_rax(L.data_off);
+            e.mov_rdx_rax(L.data_off + 8);
+            e.sub_rdx_rcx();
+            load_index_r9(e, in);
+            e.cmp_r9_rdx();
+            j_slows.push_back(e.j32(0x73));
+            e.load_elem_byte();
+            const size_t j_store = e.j32(0xEB);
+            e.patch32_here(j_ints);              /* flat ints */
+            e.mov_rcx_rax(L.data_off);
+            e.mov_rdx_rax(L.data_off + 8);
+            e.sub_rdx_rcx();
+            e.sar_rdx_3();
+            load_index_r9(e, in);
+            e.cmp_r9_rdx();
+            j_slows.push_back(e.j32(0x73));
+            e.load_elem_int();
+            e.patch32_here(j_store);
+            write_slot(e, ck, RAX, in.target, pc);
+            j_done = e.j32(0xEB);
         }
-        /* The int-semantics read (ints + bools storage) is shared with the
-         * JumpUnlessElemInt fusion - see emit_elem_int_read. */
-        emit_elem_int_read(e, in, pc);
-        write_slot(e, ck, RAX, in.target, pc);
+        /* slow: the interpreter-core helper; OOB/type conveys */
+        for (const size_t j : j_slows)
+            e.patch32_here(j);
+        emit_call_prologue(e);
+        load_operand(e, RSI, in.a_is_lit(), in.a_lit(), in.a_slot());
+        e.lea(RDX, static_cast<int32_t>(
+                       static_cast<long>(in.target)
+                       * static_cast<long>(sizeof(LValue))));
+        e.lea_rdi(static_cast<int32_t>(
+                      static_cast<long>(in.target2)
+                      * static_cast<long>(sizeof(LValue))));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(
+                           is_float
+                               ? jit_load_elem_float
+                               : jit_load_elem_int) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);       /* the op's own caret */
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        e.patch32_here(j_done);
         return true;
     }
 
@@ -5774,6 +5826,13 @@ static bool op_fully_native(const Instr &in)
      * interpreted InternalErrorEx via eptr - no bail left. */
     case OpCode::LoadElemValue:
         return true;
+    /* #56 delete-originals: LoadElemInt/Float - the inline fast path's
+     * every decline (slice/kind/wrap/OOB) goes to the jit_load_elem_*
+     * slow tier (the interpreter's exact core; OOB conveys, the
+     * InternalErrorEx net rides eptr) - no bail, no re-interpret. */
+    case OpCode::LoadElemInt:
+    case OpCode::LoadElemFloat:
+        return true;
     /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
      * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the
      * exc-stamp instead of the g_vm_jit_raise signal (whose exception got
@@ -6312,6 +6371,17 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     if (runs.empty())
         return;
 
+    /* op -> enum NAME (the audit's label; from the X-macro, so it can
+     * never drift from the opcode list) */
+    static const auto jit_op_name = [](OpCode op) -> const char * {
+        switch (op) {
+#define X(o) case OpCode::o: return #o;
+        ML_FOR_EACH_OPCODE(X)
+#undef X
+        default: return "?";
+        }
+    };
+
     /* Approach A: a run is DELETABLE (its interpreted originals removed - no
      * double copy) iff the fragment NEVER returns an interior pc, i.e. every
      * op is `op_fully_native` (no re-interpret bail, no jit_raise) AND the
@@ -6354,6 +6424,36 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             }
         }
         deletable[r] = ok;
+
+        /* #56 delete-originals AUDIT (env MYLANG_DELAUDIT=1): print each
+         * NON-deletable run's blocking reason + opcodes, so the corpus-wide
+         * histogram says what to nativize/relax next (the M1-plan pattern:
+         * an audit surface first, then the increments). Dev-only output;
+         * zero cost when the env is unset. */
+        if (!ok && getenv("MYLANG_DELAUDIT")) {
+            std::string why, ops_s;
+            bool full = true;
+            for (size_t p = b; p < en; p++)
+                if (!op_fully_native(chunk.code[p])) {
+                    full = false;
+                    ops_s += std::string(" ")
+                        + jit_op_name(chunk.code[p].op);
+                }
+            if (!full)
+                why = "bail-op:";
+            else {
+                bool multi = false;
+                for (size_t p = 0; p < n && !multi; p++) {
+                    const int t = branch_pc_target(chunk.code[p]);
+                    if (t > static_cast<int>(b) && t < static_cast<int>(en)
+                            && (p < b || p >= en))
+                        multi = true;
+                }
+                why = multi ? "multi-entry" : "inline-raise";
+            }
+            fprintf(stderr, "DELAUDIT run[%zu,%zu) %s%s\n",
+                    b, en, why.c_str(), ops_s.c_str());
+        }
     }
 
     /* pc remap: every run head gains one inserted EnterNative; a DELETABLE

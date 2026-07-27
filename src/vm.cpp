@@ -2492,6 +2492,99 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
     return 0;
 }
 
+/* #56 delete-originals: the SHARED LoadElemInt/LoadElemFloat scalar-read
+ * cores - ONE implementation for the interpreter case and the JIT slow
+ * tier, so the two cannot drift. `chunk` null (the helpers) makes the OOB
+ * LOC-LESS - the fragment's exc-stamp conveys the op's caret. Returns the
+ * scalar; the CALLER writes its slot (the interpreter via write_*_slot,
+ * the helper via the dst LValue). A non-array base is the InternalErrorEx
+ * net (base_array is proven; rides g_vm_jit_eptr from the helper). */
+static ML_ALWAYS_INLINE int_type
+vm_load_elem_int_core(const EvalValue &base, int_type idx,
+                      const Chunk *chunk, size_t pc)
+{
+    if (!base.is<SharedArrayObj>())
+        throw InternalErrorEx();
+    const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+    if (idx < 0)
+        idx += arr.size();
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+        Loc ls, le;
+        if (chunk)
+            chunk->loc_at(pc, ls, le);
+        throw OutOfBoundsEx(ls, le);
+    }
+    const size_type at = arr.offset() + idx;
+    if (arr.skind() == SharedArrayObj::Storage::ints)
+        return arr.flat_ints()[at];
+    if (arr.skind() == SharedArrayObj::Storage::bools)
+        return arr.flat_bools()[at] ? 1 : 0;
+    return arr.get_vec()[at].getval<int_type>();
+}
+
+static ML_ALWAYS_INLINE float_type
+vm_load_elem_float_core(const EvalValue &base, int_type idx,
+                        const Chunk *chunk, size_t pc)
+{
+    if (!base.is<SharedArrayObj>())
+        throw InternalErrorEx();
+    const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+    if (idx < 0)
+        idx += arr.size();
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+        Loc ls, le;
+        if (chunk)
+            chunk->loc_at(pc, ls, le);
+        throw OutOfBoundsEx(ls, le);
+    }
+    const size_type at = arr.offset() + idx;
+    if (arr.skind() == SharedArrayObj::Storage::floats)
+        return arr.flat_floats()[at];
+    if (arr.skind() == SharedArrayObj::Storage::ints)
+        return static_cast<float_type>(arr.flat_ints()[at]);
+    return arr.get_vec()[at].getval<float_type>();
+}
+
+/* The JIT slow tiers (#56): every shape the inline fast path declines - a
+ * slice, general/strs storage, a wrong flat kind, negative wrap, OOB - runs
+ * the interpreter's exact core; a RuntimeException (OOB) conveys via
+ * g_vm_jit_exc, anything else (the InternalErrorEx net) via g_vm_jit_eptr.
+ * With these, LoadElemInt/LoadElemFloat never re-interpret - their runs'
+ * originals are deletable. */
+extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
+                                 LValue *dst) noexcept
+{
+    ML_JIT_OP_RAN(LoadElemInt);
+    try {
+        dst->put(EvalValue(vm_load_elem_int_core(base_lv->get(), idx,
+                                                 nullptr, 0)));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_load_elem_float(LValue *base_lv, int_type idx,
+                                   LValue *dst) noexcept
+{
+    ML_JIT_OP_RAN(LoadElemFloat);
+    try {
+        dst->put(EvalValue(vm_load_elem_float_core(base_lv->get(), idx,
+                                                   nullptr, 0)));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" int jit_ord_char(LValue *base_lv, int_type idx,
                             LValue *dst) noexcept
 {
@@ -6450,68 +6543,24 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         }
         VM_NEXT;
 
-        VM_CASE(LoadElemInt): {
-
-            /* a[i] into a temp (mirrors Subscript::eval_int for a flat array;
-             * a dict / general base falls back to the node). */
-            const EvalValue &base = ctx.frame->at(in->target2).get();
-            if (base.is<SharedArrayObj>()) {
-                const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                int_type idx = read_int_operand(in->a(), &ctx);
-                if (idx < 0)
-                    idx += arr.size();
-                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
-                    Loc ls, le;
-                    chunk->loc_at(pc, ls, le);
-                    throw OutOfBoundsEx(ls, le);
-                }
-                const size_type at = arr.offset() + idx;
-                int_type v;
-                if (arr.skind() == SharedArrayObj::Storage::ints)
-                    v = arr.flat_ints()[at];
-                else if (arr.skind() == SharedArrayObj::Storage::bools)
-                    v = arr.flat_bools()[at] ? 1 : 0;
-                else
-                    v = arr.get_vec()[at].getval<int_type>();
-                write_int_slot(&ctx, in->target, v);
-            } else {
-                /* base_array is PROVEN at this op, so the base is always an
-                 * array here - the old node->eval_int fallback was unreachable
-                 * (an invariant net; freeing it dropped the op's node). */
-                throw InternalErrorEx();
-            }
+        VM_CASE(LoadElemInt):
+            /* a[i] into a temp - the shared core (also the JIT slow tier's,
+             * #56; the non-array arm is the proven-base InternalErrorEx
+             * net). */
+            write_int_slot(&ctx, in->target,
+                           vm_load_elem_int_core(
+                               ctx.frame->at(in->target2).get(),
+                               read_int_operand(in->a(), &ctx), chunk, pc));
             pc++;
-        }
-        VM_NEXT;
+            VM_NEXT;
 
-        VM_CASE(LoadElemFloat): {
-
-            const EvalValue &base = ctx.frame->at(in->target2).get();
-            if (base.is<SharedArrayObj>()) {
-                const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                int_type idx = read_int_operand(in->a(), &ctx);
-                if (idx < 0)
-                    idx += arr.size();
-                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
-                    Loc ls, le;
-                    chunk->loc_at(pc, ls, le);
-                    throw OutOfBoundsEx(ls, le);
-                }
-                const size_type at = arr.offset() + idx;
-                float_type v;
-                if (arr.skind() == SharedArrayObj::Storage::floats)
-                    v = arr.flat_floats()[at];
-                else if (arr.skind() == SharedArrayObj::Storage::ints)
-                    v = static_cast<float_type>(arr.flat_ints()[at]);
-                else
-                    v = arr.get_vec()[at].getval<float_type>();
-                write_float_slot(&ctx, in->target, v);
-            } else {
-                throw InternalErrorEx();   /* unreachable: base_array proven */
-            }
+        VM_CASE(LoadElemFloat):
+            write_float_slot(&ctx, in->target,
+                             vm_load_elem_float_core(
+                                 ctx.frame->at(in->target2).get(),
+                                 read_int_operand(in->a(), &ctx), chunk, pc));
             pc++;
-        }
-        VM_NEXT;
+            VM_NEXT;
 
         VM_CASE(LoadElemBool): {
             /* bool-foreach loop var: bind a[i] as a real BOOL (not 0/1), so
