@@ -1737,6 +1737,10 @@ struct Chunk {
      * carries -1). Strings, so serializable as-is.
      */
     std::vector<std::vector<std::string>> catch_types;
+    /* DERIVED from catch_types (#74 inc 3): the same names as interned
+     * UniqueId pointers, for the CatchTest pointer matcher. NOT primary
+     * serializable data - a .myv load re-interns from catch_types. */
+    std::vector<std::vector<const UniqueId *>> catch_uids;
 
     /*
      * Baked const array/dict/struct literals (LoadLiteralObjV). The op reads

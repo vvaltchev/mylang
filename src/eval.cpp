@@ -4370,7 +4370,8 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
     if (e.is<intrusive_ptr<StructObject>>()) {
         throw ExceptionObject(
             string(e.get<intrusive_ptr<StructObject>>()->def->name->val),
-            e
+            e,
+            e.get<intrusive_ptr<StructObject>>()->def->name
         );
     }
 
@@ -4725,10 +4726,13 @@ do_catch(EvalContext *ctx,
     ExceptionObject *exObj = saved_ex->is_exception_object()
         ? static_cast<ExceptionObject *>(saved_ex) : nullptr;
     string_view ex_name = exObj ? exObj->get_name() : saved_ex->name;
+    /* interned-pointer matching when available (#74 inc 3); the catch
+     * clause ids are interned already, so pointer == string equality */
+    const UniqueId *ex_uid = saved_ex->match_uid();
 
     for (const unique_ptr<Identifier> &id : exList->elems) {
 
-        if (id->get_str() != ex_name)
+        if (ex_uid ? (id->uid != ex_uid) : (id->get_str() != ex_name))
             continue;
 
         try {

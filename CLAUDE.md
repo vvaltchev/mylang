@@ -4583,6 +4583,17 @@ the fragment at the body instead of interpreting to the back edge. Only
 PushHandler's target (the MATCHER pc, an exit-at-op native) keeps the
 exclusion. Measured: 70_exc a further -4.5% Ir (vm_dispatch self -24%),
 42_exceptions -2.0%, 69/71/72 neutral.
+**#74 increment 3 - the INTERNED catch matcher:** `match_uid()` (a per-
+class lazy-static interned name via the DECL_RUNTIME_EX macro; an
+ExceptionObject carries the thrown struct's already-interned def->name)
++ the DERIVED `Chunk::catch_uids` pool (interned twins of catch_types -
+NOT primary serializable data, a .myv load re-interns) let CatchTest and
+do_catch compare POINTERS - the per-match string_view(name) paid a
+strlen + memcmp, ~13% of the catch bench. nullptr match_uid = the
+string fallback (a subclass without the override). A user struct
+NAMED like a builtin still matches identically (same canonical intern).
+Measured: 70_exc a further **-13.5%** Ir (string machinery 13% ->
+0.1%), 42 -1.4%; cumulative #74: 155.7M -> 87.5M (**-43.8%**).
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
