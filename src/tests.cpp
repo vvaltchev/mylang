@@ -14812,18 +14812,20 @@ static bool jit_container()
     };
 
     const unsigned long b0 = g_jit_container_calls;
-    /* (1) a boxed-island container; correct result. Discarded `map(...)`
-     * statements are the island source (CheckFuncV + MapFilterV, the last
-     * still-boxed simple ops now that the scalar ops, SliceV, the container/
-     * struct builds AND DeclConstV are all nativized); their closure/array
-     * args compile to ELIGIBLE ops, so the islands are the check+map pairs.
-     * Returns the arg. runtime() keeps the call non-const so the pure call
-     * isn't folded away (else cleaf never runs -> no container). */
+    /* (1) a boxed-island container; correct result. Discarded DYN-callee
+     * calls are the island source (CheckCallableV + CallValueGenericV - the
+     * one remaining AST-holding pair, now that the scalar ops, SliceV, the
+     * container/struct builds, DeclConstV AND map/filter are all
+     * nativized); their array args compile to ELIGIBLE ops, so the islands
+     * are the check+call pairs. Returns the arg. runtime() keeps the call
+     * non-const so the pure call isn't folded away (else cleaf never runs
+     * -> no container). */
     if (!run({ "func cleaf(dyn a) {",
-               "  map(func (e) => e, [1, 2]);",
-               "  map(func (e) => e, [3, 4]);",
-               "  map(func (e) => e, [5, 6]);",
-               "  map(func (e) => e, [7, 8]);",
+               "  var dyn f = len;",
+               "  f([1, 2]);",
+               "  f([3, 4]);",
+               "  f([5, 6]);",
+               "  f([7, 8]);",
                "  return a;",
                "}",
                "assert(cleaf(runtime(\"hello\")) == \"hello\");" }))
@@ -14844,15 +14846,17 @@ static bool jit_container()
         return false;
     /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
      * (native ops + the for.step back edge) iterates in machine code, only the
-     * island `map(...)` (CheckFuncV/MapFilterV, the still-boxed pair) calls
-     * jit_exec_block; `var j = i + 1` is native. The arg is returned.
-     * (The island was `const c = [..]` / DeclConstV until that op went
-     * native - the recurring island-source hop.) */
+     * island (the dyn call `f([1, 2])` - CheckCallableV/CallValueGenericV,
+     * the AST-holding pair) calls jit_exec_block; `var j = i + 1` is native.
+     * The arg is returned. (The island was `const c = [..]` / DeclConstV,
+     * then `map(...)`, until each went native - the recurring island-source
+     * hop.) */
     const unsigned long b1 = g_jit_container_calls;
     if (!run({ "func lc(dyn a, int n) {",
                "  var dyn last = a;",
+               "  var dyn f = len;",
                "  for (var i = 0; i < n; i++) {",
-               "    map(func (e) => e, [1, 2]);",
+               "    f([1, 2]);",
                "    var j = i + 1;",
                "  }",
                "  return last;",
@@ -14861,8 +14865,9 @@ static bool jit_container()
         return false;
     if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
         return false;
-    /* (4) model-flip M4b: MULTIPLE islands - an init `[a]` and a body `[a]`
-     * (MakeArrayV), each its own `call jit_exec_block`. */
+    /* (4) MULTIPLE fragments/regions in one body - an init `[a]` and a body
+     * `[a]` (MakeArrayV, native since the nativize-ops pass; kept as a
+     * correctness shape - no island assertion). */
     if (!run({ "func lc2(dyn a, int n) {",
                "  var dyn s = [a];",
                "  for (var i = 0; i < n; i++) {",
@@ -15804,6 +15809,28 @@ static bool jit_op_nativized()
             "  try { s += f(i); } catch (DivisionByZeroEx) { s += 2; }",
             "}",
             "assert(s == 6);" } },
+        /* The map/filter pair (the last non-call island): the guard + the
+         * shared vm_map_filter body (callback re-enters vm_dispatch). */
+        { OpCode::MapFilterV, {
+            "var a = [runtime(1), 2, 3, 4];",
+            "var dyn s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var m = map(func (x) => x * 2, a);",
+            "  s = s + m[1];",
+            "}",
+            "assert(s == 12);" } },
+        /* CheckFuncV's throw: a dyn non-func arg0 raises BEFORE arg1's
+         * code runs, with arg0's caret (script-caught). */
+        { OpCode::CheckFuncV, {
+            "func f(dyn v, dyn a, int n) {",
+            "  var r = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { var m = map(v, a); r = 1; }",
+            "    catch (TypeErrorEx) { r += 2; }",
+            "  }",
+            "  return r;",
+            "}",
+            "assert(f(runtime(5), runtime([1]), 3) == 6);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
@@ -16745,7 +16772,8 @@ static bool vm_disasm_container_plan()
             "  foreach (w in words) d[w] = 1;",
             "  return d;",
             "}",
-            "map(func (e) => e, [runtime(1), 2]);",
+            "var dyn dcf = len;",
+            "dcf([runtime(1), 2]);",
             "print(add(runtime(2), 3));",
             "print(wc([\"a\"]));" }) {
         if (!src.empty())
@@ -16771,11 +16799,12 @@ static bool vm_disasm_container_plan()
         if (b) {
             const std::string d = disassemble_program(b);
             /* main: a MIXED chunk -> NOT ready + at least one island line.
-             * The island is now the discarded map() statement's CheckFuncV/
-             * MapFilterV pair (the deliberately-kept island source) - the
-             * CallV that used to be the island became ELIGIBLE with the M5
-             * sync call, another island migration of the arc working. (Before
-             * that, `wc`'s dict foreach was the mixed example.) */
+             * The island is now the discarded DYN call `dcf(...)` - the
+             * CheckCallableV/CallValueGenericV pair, the one remaining
+             * AST-holding op family. (The island source hopped again: it was
+             * the CallV until the M5 sync call, then map()'s CheckFuncV/
+             * MapFilterV until those went native - each migration is the
+             * nativize-ops arc working.) */
             const std::string mn = section(d, "; ===== main");
             const bool mixed_ok =
                 mn.find("container plan: NOT ready") != std::string::npos
