@@ -102,6 +102,33 @@ write_bool_slot(EvalContext *ctx, int_type slot, bool v)
         lv.put(EvalValue(v));
 }
 
+/* OrdCharV body (the fused ord(s[i]) - lever 4b): TypeStr::subscript's
+ * negative-wrap + bounds check, then the raw byte as int. ML_NOINLINE off
+ * vm_dispatch's frame - the loop-body TEXT RULE, plus stack hygiene: an
+ * inline case's locals (view/Locs + sanitizer redzones) grow EVERY
+ * recursive vm_dispatch frame (the clang-ASan lane overflowed the pinned
+ * depth-200 sync-recursion test with the body inline). The base is a
+ * PROVEN non-opt string (Subscript::base_str); OOB is the only throw. */
+ML_NOINLINE static void
+vm_ord_char(const Chunk *chunk, size_t pc, const Instr *in, EvalContext *ctx)
+{
+    const EvalValue &sv = ctx->frame->at(in->target2).get();
+    if (!sv.is<SharedStr>())
+        throw InternalErrorEx();
+    const std::string_view view = sv.get_ref<SharedStr>().get_view();
+    int_type idx = read_int_operand(in->a(), ctx);
+    if (idx < 0)
+        idx += static_cast<int_type>(view.size());
+    if (idx < 0 || static_cast<size_t>(idx) >= view.size()) {
+        Loc ls, le;
+        chunk->loc_at(pc, ls, le);
+        throw OutOfBoundsEx(ls, le);
+    }
+    write_int_slot(ctx, in->target,
+                   static_cast<int_type>(
+                       static_cast<unsigned char>(view[idx])));
+}
+
 /* CmpIntV / CmpFloatV bodies (the VALUE form of a typed int/float compare ->
  * bool). ML_NOINLINE off vm_run_chunk's frame (the loop-body TEXT RULE): the
  * dispatch core must not grow, or an UNTOUCHED pure loop regresses via code
@@ -2327,6 +2354,28 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
     try {
         Type *t = base_lv->get().get_type();
         dst->put(RValue(t->subscript(EvalValue(base_lv), *idx, false)));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_ord_char(LValue *base_lv, int_type idx,
+                            LValue *dst) noexcept
+{
+    ML_JIT_OP_RAN(OrdCharV);
+    try {
+        /* the base is compile-proven a non-opt string (Subscript::base_str),
+         * so the raw proven-type read is the N0 contract */
+        const std::string_view view =
+            base_lv->get().get_ref<SharedStr>().get_view();
+        if (idx < 0)
+            idx += static_cast<int_type>(view.size());
+        if (idx < 0 || static_cast<size_t>(idx) >= view.size())
+            throw OutOfBoundsEx();   /* loc-less; the fragment exc-stamps */
+        dst->put(EvalValue(static_cast<int_type>(
+                     static_cast<unsigned char>(view[idx]))));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -7487,6 +7536,13 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             pc++;
         }
         VM_NEXT;
+
+        VM_CASE(OrdCharV):
+            /* ord(s[i]) fused (lever 4b) - the ML_NOINLINE body (loop-body
+             * text rule + recursion stack hygiene; see vm_ord_char). */
+            vm_ord_char(chunk, pc, in, &ctx);
+            pc++;
+            VM_NEXT;
 
         VM_CASE(LoadImmInt):
             ctx.frame->at(in->target).put(

@@ -4339,6 +4339,7 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                 d->map_filter_kind = id->get_str() == "map"    ? 1
                                    : id->get_str() == "filter" ? 2 : 0;
                 d->tq_folded = call->tq_folded;   /* folded type query -> elide */
+                d->vm_len_kind = call->vm_len_kind;  /* lever 4b: native len() */
                 d->what = std::move(call->what);
                 d->args = std::move(call->args);
                 d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();

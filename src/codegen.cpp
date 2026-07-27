@@ -237,7 +237,8 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::SliceV:
     case OpCode::CallV:       case OpCode::CachedCallV:
     case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
-    case OpCode::ArrLen:
+    case OpCode::ArrLen:      case OpCode::StrLen:
+    case OpCode::OrdCharV:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElemValue: case OpCode::MakeArrayV:
     case OpCode::MakeDictV:      case OpCode::MakeClosureV:
@@ -1509,6 +1510,10 @@ struct Codegen {
             if (try_native_defined_expr(bc, out_slot, ops))
                 return true;
             if (try_native_map_filter(bc, out_slot, ops))
+                return true;
+            if (try_native_len(bc, out_slot, ops))
+                return true;
+            if (try_native_ord(bc, out_slot, ops))
                 return true;
             if (try_native_builtin(bc, out_slot, ops))
                 return true;
@@ -2883,6 +2888,87 @@ struct Codegen {
         return false;
     }
 
+    /* Lever 4b: `len(x)` whose arg the inferencer proved a non-opt ARRAY or
+     * STRING (CallExpr::vm_len_kind; the DirectBuiltinCallExpr node itself
+     * proves the callee is the unshadowed builtin) lowers to the existing
+     * ArrLen/StrLen op - size() / get_view().size(), exactly TypeArr::len /
+     * TypeStr::len - instead of the whole CallBuiltinV marshal. Wrong arity
+     * / an unproven or opt arg keeps the generic path (its throws). */
+    bool try_native_len(const DirectBuiltinCallExpr *dc, int &out_slot,
+                        std::vector<CgInstr> &ops)
+    {
+        static const UniqueId *len_uid = UniqueId::get("len");
+        if (dc->vm_len_kind == 0 || !dc->args || dc->lvalue_arg0
+            || dc->args->elems.size() != 1)
+            return false;
+        const Identifier *bid =
+            dynamic_cast<const Identifier *>(dc->what.get());
+        if (!bid || bid->uid != len_uid)
+            return false;
+        const size_t mark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        int base;
+        if (!compile_boxed_expr(dc->args->elems[0].get(), base, ops)) {
+            ops.resize(mark);
+            chunk.consts.resize(cmark);
+            next_temp = save_top;
+            return false;
+        }
+        const int dst = alloc_temp();
+        CgInstr in;
+        in.op = dc->vm_len_kind == 1 ? OpCode::ArrLen : OpCode::StrLen;
+        in.target = dst;
+        in.target2 = base;
+        ops.push_back(in);
+        out_slot = dst;
+        return true;
+    }
+
+    /* Lever 4b: `ord(s[i])` with a statically-proven non-opt STRING base
+     * (Subscript::base_str) and an int-compilable index fuses to OrdCharV -
+     * the byte read straight off the view (TypeStr::subscript's wrap +
+     * bounds, OOB caret = the subscript's), no 1-char SharedStr, no builtin
+     * call. builtin_ord's arity/type/1-char throws are compile-excluded
+     * (exact arity gated here; a subscript of a string is always 1 char). */
+    bool try_native_ord(const DirectBuiltinCallExpr *dc, int &out_slot,
+                        std::vector<CgInstr> &ops)
+    {
+        static const UniqueId *ord_uid = UniqueId::get("ord");
+        if (!dc->args || dc->lvalue_arg0 || dc->args->elems.size() != 1)
+            return false;
+        const Identifier *bid =
+            dynamic_cast<const Identifier *>(dc->what.get());
+        if (!bid || bid->uid != ord_uid)
+            return false;
+        const Subscript *sub =
+            dynamic_cast<const Subscript *>(dc->args->elems[0].get());
+        if (!sub || !sub->base_str)
+            return false;
+        const size_t mark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        int base;
+        Operand idx;
+        if (!compile_boxed_expr(sub->what.get(), base, ops)
+            || !compile_int_expr(sub->index.get(), idx, ops)) {
+            ops.resize(mark);
+            chunk.consts.resize(cmark);
+            next_temp = save_top;
+            return false;
+        }
+        const int dst = alloc_temp();
+        CgInstr in;
+        in.op = OpCode::OrdCharV;
+        in.node_idx = add_ast_node(sub);   /* the subscript's OOB caret */
+        in.target = dst;
+        in.target2 = base;
+        in.set_a(idx);
+        ops.push_back(in);
+        out_slot = dst;
+        return true;
+    }
+
     bool try_native_builtin(const DirectBuiltinCallExpr *dc, int &out_slot,
                             std::vector<CgInstr> &ops)
     {
@@ -3817,6 +3903,8 @@ struct Codegen {
                 int t;
                 if (try_native_defined_global(bc, t, ops)   /* defined(global) */
                         || try_native_defined_expr(bc, t, ops)
+                        || try_native_len(bc, t, ops)      /* lever 4b */
+                        || try_native_ord(bc, t, ops)
                         || try_native_builtin(bc, t, ops)) { /* value ABI */
                     out = slot_op(t);
                     return true;
@@ -6838,6 +6926,7 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
                                           * OOB caret */
         case OpCode::ForStepElemInt:     /* #9 fusion - the embedded back-edge
                                           * load's OOB caret */
+        case OpCode::OrdCharV:       /* node = the s[i] subscript (OOB caret) */
         case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:
@@ -7202,6 +7291,8 @@ static bool visit_use_def(const Instr &in, U u, D d)
         u(in.target2); d(in.target); return true;
     case OpCode::ArrLen: case OpCode::StrLen:
         u(in.target2); d(in.target); return true;
+    case OpCode::OrdCharV:
+        u(in.target2); opnd(in.a()); d(in.target); return true;
     case OpCode::SliceV:
         u(in.target2);
         if (in.a_slot() >= 0) u(static_cast<int>(in.a_slot()));
@@ -7265,6 +7356,7 @@ static bool retargetable_dst(OpCode op)
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadStrChar: case OpCode::ArrLen: case OpCode::StrLen:
+    case OpCode::OrdCharV:
     case OpCode::SliceV: case OpCode::CallV: case OpCode::CachedCallV:
     case OpCode::CallValueV: case OpCode::CallBuiltinV:
     case OpCode::MakeArrayV: case OpCode::MakeDictV: case OpCode::StructCtorV:
@@ -7749,7 +7841,7 @@ static bool op_writes_scalar(OpCode op)
     case OpCode::IntAddModRI: case OpCode::IntAddStep:
     case OpCode::ForLoopStep: case OpCode::ForStepElemInt:
     case OpCode::StructFieldAddInt: case OpCode::MathFnV:
-    case OpCode::ArrLen: case OpCode::StrLen:
+    case OpCode::ArrLen: case OpCode::StrLen: case OpCode::OrdCharV:
     case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElemBool:

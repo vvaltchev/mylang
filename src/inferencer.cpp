@@ -1714,6 +1714,7 @@ void Inferencer::annotate_hints(Construct *n)
         StaticTypeRef bt = static_type_resolve(type_of(sub->what.get()));
         sub->base_array = bt->kind == StaticTypeKind::Array;
         sub->base_dict = bt->kind == StaticTypeKind::Dict;
+        sub->base_str = bt->kind == StaticTypeKind::Str && !bt->opt;
     }
 
     /* Lever 3: a slice over a statically-proven non-opt array/string can
@@ -1745,6 +1746,19 @@ void Inferencer::annotate_hints(Construct *n)
     if (auto *call = dynamic_cast<CallExpr *>(n)) {
         StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
         call->vm_direct_func = ct->kind == StaticTypeKind::Func;
+        /* lever 4b: len(x)'s arg proven a non-opt array/string - the
+         * BUILTIN-ness proof is codegen's (DirectBuiltinCallExpr + the
+         * `len` uid), so this stamp alone triggers nothing. */
+        if (call->args && call->args->elems.size() == 1) {
+            StaticTypeRef at = static_type_resolve(
+                type_of(call->args->elems[0].get()));
+            if (!at->opt) {
+                if (at->kind == StaticTypeKind::Array)
+                    call->vm_len_kind = 1;
+                else if (at->kind == StaticTypeKind::Str)
+                    call->vm_len_kind = 2;
+            }
+        }
         /* A `dyn` callee is resolved at runtime (func / builtin / struct desc /
          * non-callable): the VM dispatches it generically (CallValueGenericV). */
         call->vm_dyn_callee = ct->kind == StaticTypeKind::Dyn;
