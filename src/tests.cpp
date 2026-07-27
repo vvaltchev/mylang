@@ -6669,6 +6669,23 @@ static const std::vector<test> tests =
         },
         &typeid(TypeErrorEx), 34, 1, 36, 1,
     },
+    {
+        /* re-raise deletability: under the JIT this boxed loop's originals
+         * are DELETED (the run collapses onto its EnterNative), so the OOB
+         * caret comes from jit_subscript's BAKED LocEntry conveyance, not a
+         * pc lookup - it must pin the subscript byte-identically in both
+         * engines (a wrong/absent stamp fails the col pins). */
+        "err loc: a DELETED run's subscript throw keeps its own caret",
+        {
+            "func f(dyn a, int n) {",
+            "  var dyn s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + a[i];",
+            "  return s;",
+            "}",
+            "f(runtime([1, 2]), 4);",
+        },
+        &typeid(OutOfBoundsEx), 39, 3, 44, 3,
+    },
 
     {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",
@@ -14892,6 +14909,55 @@ static bool jit_container()
  * op] bumped (so the op landed in a fragment and its jit_* helper was called).
  * If a counter fails to bump, the op is nativized but NOT actually emitted/run
  * in that shape - a real gap this test surfaces. */
+/* Re-raise deletability (plans/model-flip.md): a native_leaf must be
+ * EXIT-FREE (op_never_exits), because the #55 direct call IGNORES the callee
+ * fragment's return value. Pre-fix, a non-inlined `len(dyn)` leaf's
+ * CallBuiltinV conveyed its throw, the direct caller dropped it (stale dst,
+ * callee frame left pushed) and the program HUNG. Inlining is disabled so
+ * the callee stays a real call (the `-ni` shape that found it); the fixed
+ * gate routes it through the sync path, which handles the throw. */
+static bool jit_leaf_never_exits()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : {
+            "func lf(dyn x) => len(x);",
+            "func caller(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { s += lf(runtime(5)); } catch (TypeErrorEx) { s += 1; }",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(caller(runtime(3)) == 3);" }) {
+        if (!src.empty())
+            src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get(), /*enable_inline=*/false);
+        vm_execute(root.get());
+    } catch (...) {
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_op_nativized()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -17276,6 +17342,8 @@ static const std::vector<extra_check> extra_checks =
       jit_container },
     { "jit: nativized ops actually run natively (g_jit_op_calls bumps)",
       jit_op_nativized },
+    { "jit: a throwing (conveying) op never enters a native_leaf",
+      jit_leaf_never_exits },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",

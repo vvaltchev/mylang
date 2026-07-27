@@ -1601,6 +1601,12 @@ struct Chunk {
                                    * compare op (CmpV) */
         Operand a;                /* left operand (unused by CompoundV) */
         Operand b;                /* right operand */
+        /* The op's OWN caret (from the loc side table at build time). The
+         * jit helpers stamp a conveyed throw with it, so the caret no
+         * longer depends on the pc-keyed table - the re-raise DELETABILITY
+         * requirement (a deleted run collapses every pc onto its
+         * EnterNative, where a table lookup would be wrong). */
+        Loc start, end;
     };
     std::vector<BoxedOp> boxed_ops;
 

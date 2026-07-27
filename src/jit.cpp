@@ -1302,6 +1302,44 @@ static void emit_call_epilogue(Emitter &e)
     e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
 }
 
+/* Re-raise DELETABILITY: the op's own LocEntry (`&ck.locs[i]`, a stable
+ * pool-buffer address) baked as a helper arg, so a conveying helper stamps
+ * the caret itself - pc-independent, which is what lets the op's interpreted
+ * original be DELETED (a deleted run collapses its pcs onto the EnterNative,
+ * where a table lookup would be wrong). The loc table is OLD-pc-keyed at
+ * emission (the side tables are remapped after). Null if the op recorded no
+ * loc (then nothing anywhere holds a caret for it - both engines loc-less). */
+static const void *loc_entry_addr(const Chunk &ck, size_t old_pc)
+{
+    size_t lo = 0, hi = ck.locs.size();
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (ck.locs[mid].pc < old_pc)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < ck.locs.size() && ck.locs[lo].pc == old_pc)
+        return &ck.locs[lo];
+    return nullptr;
+}
+
+/* The COLD-side loc handoff: on a conveying helper's failure branch (taken
+ * only when the op THREW), store the op's baked LocEntry into g_vm_jit_lep
+ * for vm_raise to consume - zero instructions on the success path, unlike a
+ * helper ARG (which stays live across the helper's try and cost a measured
+ * +4 Ir per CALL in an extra callee-saved spill). rax/rcx are dead here
+ * (exit_pc's cache flush uses rdi/rsi/r8/r10/r11; eax is set after). */
+static void emit_lep_store(Emitter &e, const Chunk &ck, size_t old_pc)
+{
+    const void *lep = loc_entry_addr(ck, old_pc);
+    if (!lep)
+        return;                    /* no loc recorded - stays loc-less */
+    e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_lep()));
+    e.movabs(RCX, reinterpret_cast<uint64_t>(lep));
+    e.u8(0x48); e.u8(0x89); e.u8(0x08);      /* mov [rax], rcx */
+}
+
 /* M5: emit a SYNC call op (CallV / CachedCallV / CallValueV - one emit
  * shape, only the helper differs): jit_call_sync*(target2, argbase, nargs,
  * dst, site) runs the callee to completion via the lean sync enter (vm.cpp)
@@ -2818,13 +2856,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::LoadGlobalV:
         /* dst = gfuncs->slots[gslot] via jit_load_global (rdi=dst=target,
-         * rsi=gslot=target2). Returns 0 = ok, 1 = BAIL (undefined global):
-         * exit_pc so the interpreter re-runs LoadGlobalV + throws
-         * UndefinedVariableEx (the N4 bail-to-reinterpret; NOT a raise -
-         * nothing set g_vm_jit_exc/raise, so EnterNative resumes interpreted). */
+         * rsi=gslot=target2, rdx=&locs[i]). Returns 0 = ok, 1 = CONVEYED
+         * (undefined global -> UndefinedVariableEx with the name + the baked
+         * caret rides g_vm_jit_eptr; EnterNative rethrows - the exact
+         * interpreted throw, pc-independent -> deletable). */
         emit_call_prologue(e);
-        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RDI, (static_cast<uint64_t>(static_cast<uint32_t>(in.target2))
+                       << 32)
+                      | static_cast<uint32_t>(in.target));
+        e.movabs(RSI, reinterpret_cast<uint64_t>(loc_entry_addr(ck, old_pc)));
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_load_global) });
         e.u8(0xE8); e.u32(0);
@@ -2855,6 +2895,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = no raise) */
+            emit_lep_store(e, ck, old_pc);    /* cold: the op's own caret */
             e.exit_pc(pc);                    /* raised: EnterNative re-raises */
             e.patch8(j_ok, e.pos());
         }
@@ -2952,13 +2993,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                             * static_cast<long>(sizeof(LValue))));
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
-        e.movabs(RCX, in.op == OpCode::DictLoadInt ? 1u : 0u);
         e.call_relocs.push_back(
-            { e.pos(), reinterpret_cast<const void *>(jit_dict_load) });
+            { e.pos(), in.op == OpCode::DictLoadInt
+                  ? reinterpret_cast<const void *>(jit_dict_load_int)
+                  : reinterpret_cast<const void *>(jit_dict_load_float) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         const size_t j_ok = e.j8(0x74);       /* jz -> continue (0 = no raise) */
+        emit_lep_store(e, ck, old_pc);        /* cold: the op's own caret */
         e.exit_pc(pc);                        /* raised: EnterNative re-raises */
         e.patch8(j_ok, e.pos());
         return true;
@@ -3602,9 +3645,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::CoerceNumV: {
-        /* jit_coerce_num(dst, src_slot, is_float) - rdi=dst=target,
-         * rsi=src=a_slot, rdx=is_float=(target2!=0). Uses g_current_ctx->frame,
-         * not the slots arg. CAN throw -> test eax + exit_pc. */
+        /* jit_coerce_num(dst, src_slot, is_float, lep) - rdi=dst=target,
+         * rsi=src=a_slot, rdx=is_float=(target2!=0), rcx=&locs[i]. Uses
+         * g_current_ctx->frame, not the slots arg. CAN throw -> conveyed with
+         * the baked caret; test eax + exit_pc. */
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.a_slot())));
@@ -3615,6 +3659,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         const size_t j_ok_cn = e.j8(0x74);
+        emit_lep_store(e, ck, old_pc);        /* cold: the op's own caret */
         e.exit_pc(pc);
         e.patch8(j_ok_cn, e.pos());
         return true;
@@ -3838,10 +3883,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::SubscriptV: {
-        /* dst = base[idx] via jit_subscript(base_lv, idx*, dst*) - SysV rdi=
-         * base_lv, rsi=idx, rdx=dst. leas from rdi (slots base); rdi is set LAST
-         * (it overwrites the base ptr). A non-0 return = threw -> exit to pc so
-         * EnterNative re-raises g_vm_jit_exc. */
+        /* dst = base[idx] via jit_subscript(base_lv, idx*, dst*, lep) - SysV
+         * rdi=base_lv, rsi=idx, rdx=dst, rcx=&locs[i] (the op's own caret,
+         * conveyed on throw -> deletable). leas from rdi (slots base); rdi is
+         * set LAST (it overwrites the base ptr). A non-0 return = threw ->
+         * exit to pc so EnterNative re-raises g_vm_jit_exc. */
         const auto off = [](int slot) {
             return static_cast<int32_t>(static_cast<long>(slot)
                                         * static_cast<long>(sizeof(LValue)));
@@ -3856,6 +3902,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
         const size_t j_ok = e.j8(0x74);     /* jz ok (0 = no throw) */
+        emit_lep_store(e, ck, old_pc);      /* cold: the op's own caret */
         e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
         e.patch8(j_ok, e.pos());
         return true;
@@ -4376,7 +4423,19 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
  * originals must stay): reg-shift (negative-count raise), LoadElem (slice/
  * kind re-interpret + OOB raise), every float op (float_load's bool/other
  * safety-net bail), generic IntBin (div/mod can throw). */
-static bool op_fully_native(const Instr &in)
+/*
+ * The op NEVER EXITS its fragment mid-run - no throw, no raise, no bail;
+ * at most a terminal resume SENTINEL (ReturnV/Halt). This is the
+ * NATIVE_LEAF bar: the #55 direct call IGNORES the callee fragment's
+ * return value, so a leaf body must be provably exit-free - a
+ * conveying-throw op inside a leaf DROPPED its exception with the callee
+ * frame still pushed (a `-ni` non-inlined `len(dyn)` leaf printed a stale
+ * dst and HUNG - found while widening op_fully_native for the re-raise
+ * deletability pass, 2026-07-25; CallBuiltinV had been on the old combined
+ * list, so the hole predates the pass). Deletability (op_fully_native
+ * below) is the WEAKER bar: never-exits OR conveys-with-own-loc.
+ */
+static bool op_never_exits(const Instr &in)
 {
     switch (in.op) {
     /* generic IntBin: the NON-THROWING arms never return an interior pc ->
@@ -4452,14 +4511,6 @@ static bool op_fully_native(const Instr &in)
     case OpCode::PushHandler:
     case OpCode::PopHandler:
     case OpCode::SetPend:
-    /* CallBuiltinV THROWS, but it RE-RAISES (g_vm_jit_exc), never re-executing
-     * its interpreted original - so deleting the original is sound. And unlike
-     * the side-table throwing ops (Subscript/DictLoad), it conveys its OWN loc
-     * from the builtin_calls pool (stamped in jit_call_builtin before stashing),
-     * so a deleted CallBuiltinV's caret is byte-correct regardless of the
-     * pc-keyed loc table collapsing onto the EnterNative pc. Hence deletable.
-     * See plans/callbuiltinv-nativization.md #2. */
-    case OpCode::CallBuiltinV:
         return true;
     /* A PLAIN global/capture store (aop invalid) never throws -> deletable; a
      * COMPOUND one (`g OP=`/`cap OP=`) throws (num_bin_op) OR bails (undefined
@@ -4467,6 +4518,50 @@ static bool op_fully_native(const Instr &in)
     case OpCode::StoreGlobalV:
     case OpCode::StoreCaptureV:
         return in.aop == Op::invalid;
+    default:
+        return false;
+    }
+}
+
+/* DELETABLE (the interpreted original can be dropped from the rebuilt
+ * bytecode): never-exits, OR a CONVEY-WITH-OWN-LOC throwing op. The latter's
+ * contract (plans/model-flip.md, the re-raise deletability pass): the helper
+ * (1) stamps its throw from a BAKED loc - the BoxedOp pool's start/end, a
+ * baked &locs[i] LocEntry, the builtin_calls / member_keys pool carets - so
+ * the caret is pc-INDEPENDENT (a deleted run collapses every pc onto its
+ * EnterNative, where a table lookup would be wrong); (2) never re-executes
+ * (a re-raise, not a re-interpret); and (3) never BAILS - a bail resumes AT
+ * the exit pc, which in a deleted run is the EnterNative itself, so the
+ * fragment would RE-RUN from the head (double execution). A conveyed exit
+ * is SAFE despite the collapsed pc because EnterNative handles the raise
+ * flags right after jit_enter returns - control never re-dispatches to the
+ * exit pc. LoadGlobalV's old undefined-global bail became an eptr
+ * conveyance of the exact interpreted UndefinedVariableEx (name + baked
+ * caret) to qualify. NOTE these ops must NEVER enter a native_leaf
+ * (op_never_exits above): the #55 direct caller ignores the fragment's
+ * return, so a mid-body conveyed exit would be dropped. */
+static bool op_fully_native(const Instr &in)
+{
+    if (op_never_exits(in))
+        return true;
+    switch (in.op) {
+    /* CallBuiltinV conveys its OWN loc from the builtin_calls pool (stamped
+     * in jit_call_builtin before stashing) - the family's model; see
+     * plans/callbuiltinv-nativization.md #2. */
+    case OpCode::CallBuiltinV:
+    case OpCode::BinOpV:
+    case OpCode::CmpV:
+    case OpCode::LogV:
+    case OpCode::UnaryV:
+    case OpCode::CompoundV:
+    case OpCode::SubscriptV:
+    case OpCode::SliceV:
+    case OpCode::DictLoadInt:
+    case OpCode::DictLoadFloat:
+    case OpCode::CoerceNumV:
+    case OpCode::MemberV:
+    case OpCode::LoadGlobalV:
+        return true;
     default:
         return false;
     }
@@ -4573,8 +4668,15 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk)
         return false;
     for (size_t pc = 0; pc < n; pc++)
         if (!jit_op_eligible(chunk.code[pc])
-                || !op_fully_native(chunk.code[pc]))
-            return false;
+                || !op_never_exits(chunk.code[pc]))
+            return false;                     /* op_never_exits, NOT
+                                               * op_fully_native: the #55
+                                               * direct caller ignores the
+                                               * fragment's return, so a leaf
+                                               * must be exit-FREE (a
+                                               * conveying throw would be
+                                               * dropped - the -ni len(dyn)
+                                               * hang) */
     return true;
 }
 
@@ -4958,6 +5060,28 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             if (t > static_cast<int>(b) && t < static_cast<int>(en)
                     && (p < b || p >= en))
                 ok = false;                       /* external -> interior */
+        }
+        /* Re-raise deletability guard: an op spliced from an INLINED body
+         * carries an inline_ctxs entry (pc -> inlined-at chain). Deleting
+         * the run collapses every such pc onto the EnterNative - DISTINCT
+         * chains would merge onto one pc, so a RAISE's virtual-frame flush
+         * (vm_raise's vm_flush_inline at the collapsed exit pc) could emit
+         * the WRONG chain. Only a run that CAN raise cares (a conveying op:
+         * fully-native but not never-exits); an all-never-exits run hosts
+         * no raise, so its inline entries are never flushed from within. */
+        if (ok) {
+            bool can_raise = false;
+            for (size_t p = b; p < en && !can_raise; p++)
+                if (!op_never_exits(chunk.code[p]))
+                    can_raise = true;
+            if (can_raise) {
+                for (const auto &ie : chunk.inline_ctxs) {
+                    if (ie.pc >= b && ie.pc < en) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
         }
         deletable[r] = ok;
     }

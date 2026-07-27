@@ -7628,7 +7628,8 @@ static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
  * already built. */
 static void build_boxed_ops(Chunk &chunk)
 {
-    for (Instr &in : chunk.code) {
+    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
+        Instr &in = chunk.code[pc];
         const bool boxed_arith =
             in.op == OpCode::BinOpV || in.op == OpCode::CmpV
             || in.op == OpCode::CompoundV || in.op == OpCode::LogV
@@ -7643,7 +7644,13 @@ static void build_boxed_ops(Chunk &chunk)
             && in.aop != Op::invalid;
         if (boxed_arith || compound_store) {
             in.target2 = static_cast<int>(chunk.boxed_ops.size());
-            chunk.boxed_ops.push_back({ in.target, in.aop, in.a(), in.b() });
+            /* the op's own caret, from the (already-extracted) loc table -
+             * the jit helpers stamp a conveyed throw with it, making these
+             * ops' carets pc-independent (re-raise deletability). */
+            Loc s, en;
+            chunk.loc_at(pc, s, en);
+            chunk.boxed_ops.push_back(
+                { in.target, in.aop, in.a(), in.b(), s, en });
         }
     }
 }
