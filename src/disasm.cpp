@@ -487,7 +487,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         }
         const int32_t d = (mod == 2) ? rd32()
                         : (mod == 1) ? int8_t(c[p++]) : 0;
-        rm = mem_disp((m & 7), d, nm);
+        rm = mem_disp(rmf, d, nm);   /* REX.B-extended base (r9 chains) */
     };
     int regf; std::string rm;
 
@@ -548,6 +548,9 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
           << rm << ", " << int(imm);
         break; }
+    case 0xC6: { modrm(regf, rm);   /* /0: mov BYTE [rm], imm8 (the
+                                     * defined[gslot]=1 store) */
+        o << "mov byte " << rm << ", " << int(c[p++]); break; }
     case 0xC7: { modrm(regf, rm);   /* /0: mov r/m, imm32 (emit_raise's
                                      * kind store `mov dword [rax], kind`) */
         uint32_t imm = 0;
