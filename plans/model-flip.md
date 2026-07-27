@@ -891,17 +891,31 @@ latent noexcept std::terminate in jit_dict_load's present-key write
 (a dyn-laundered wrong-typed value hit get<>'s throw outside the try).
 
 **INCREMENT 2 LANDED (8596ef0, 2026-07-25)** - the store family:
-StoreElemInt/DictStore/StoreElem2V (convey-only, cold-side lep);
+StoreElemInt/DictStore/StoreElem2V (convey-only, cold-side caret);
 StoreElemValue/StoreMemberV/chains deletable for a LOCAL/CAPTURE base
-only (a GLOBAL base bails on undefined - and the emit SKIPS the lep on
-those kinds: the shared failure branch would leave a STALE lep on the
-bail path that could poison a later loc-less raise - the one new hazard
-class this increment surfaced); StoreMemberV lep-free (helper already
-pool-stamps); compound StoreGlobalV/StoreCaptureV via the BoxedOp pool
-locs + the global's undefined bail -> eptr UndefinedVariableEx.
-StoreElemFloat EXCLUDED (its emitted value load can structurally bail).
-bench/ surviving convey-family ops 222 -> 161; store-bench Ir neutral
-(deletion is structural), 25 0.984 / 09 0.970 held.
+only (a GLOBAL base bails on undefined); StoreMemberV needs no stamp
+(helper already pool-stamps); compound StoreGlobalV/StoreCaptureV via
+the BoxedOp pool locs + the global's undefined bail -> eptr
+UndefinedVariableEx. StoreElemFloat EXCLUDED (its emitted value load can
+structurally bail). bench/ surviving convey-family ops 222 -> 161;
+store-bench Ir neutral (deletion is structural), 25 0.984 / 09 0.970
+held.
+
+**THE SIDE-GLOBAL REMOVED (848e06e)** - increment 2 first shipped the
+caret handoff through a second global (`g_vm_jit_lep`, consumed by
+vm_raise), which created a NEW hazard class: an op whose one failure
+branch serves BOTH a bail (no exception) and a convey could leave the
+global set with no consumer, mislabeling a later unrelated loc-less
+raise - patched initially by gating the emit per compile-time kind plus
+a 'never store on a bail path' convention. The maintainer asked for a
+real fix: `emit_exc_stamp` now writes the baked start/end Locs DIRECTLY
+into the exception object in g_vm_jit_exc, guarded IN THE EMITTED CODE
+by a null check (bail/eptr -> nothing written) and a loc-already-set
+check. No side state exists at all, the per-site gates and the
+convention are gone, and vm_raise lost its consumption block. The
+emitter bakes jit_addr_exc() (the unique_ptr's storage,
+static_asserted one raw pointer) + the probed Exception loc offsets;
+-vdj shows the stamp qwords decoding to the exact pinned caret.
 
 NEXT INCREMENTS: the IncDec family (their pools already carry dual
 carets), ThrowRuntimeV (build the pooled exception natively), the
