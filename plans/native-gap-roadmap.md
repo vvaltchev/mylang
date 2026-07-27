@@ -236,15 +236,18 @@ those classes in impact order.
    13 flat; the pool-ACTIVE debug lane (ASAN=0 UBSAN=0 OPT=0 TESTS=1)
    green. 29_str's residual is NOT slice machinery: ~25% ord()
    builtin calls + the 1-char-SharedStr-per-subscript - lever 4b
-   territory (native ord/len), recorded. THE FOLLOW-UP FORK (the
-   remaining ~16% insert/erase logic on 15 + the true borrow vision):
-   (a) loop-invariant slice HOISTING (fr_immutable-style analysis:
-   base unmutated in-loop + the slice never written-through ->
-   evaluate once above the loop; kills ~all of 15/29's residual slice
-   cost; moderate optimizer work); (b) slot-level BORROWED views (a
-   non-escaping slice local skips registration entirely; value-model
-   soundness cliffs); (c) stop here (the class is now 0.76x wall).
-   Maintainer's pick.
+   territory (native ord/len), recorded. INCREMENT 2 (the fork's (a):
+   LOOP-INVARIANT SLICE HOISTING) LANDED same day - see CLAUDE.md's
+   optimizer section for the full gate set (the COW-DETACH content
+   hazard, the base_sliceable zero-iteration-throw proof, the
+   literal-base case bench 29 needed - its auto-const string base
+   inlines to a literal, so fr_base_id is null). Measured: 15 -40.3%
+   Ir / 0.612x wall ON TOP of the pool (lever-3 CUMULATIVE: -56% Ir,
+   ~0.46x wall), 29 -20.9% Ir, 16/47 flat (their slices are
+   iteration-dependent - correctly not hoisted). Lever 3 COMPLETE;
+   option (b) (slot-level borrowing) explicitly NOT pursued - the
+   residual prize no longer justifies the value-model cliffs. 29's
+   remaining gap is ord()+1-char-SharedStr = lever 4b.
    (original analysis follows) A loop-local slice that provably does
    not escape skips the SharedArrayObj/SharedStr allocation + COW slice
    registration and becomes base+offset+len (15/29 slice_readonly

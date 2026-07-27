@@ -1716,6 +1716,16 @@ void Inferencer::annotate_hints(Construct *n)
         sub->base_dict = bt->kind == StaticTypeKind::Dict;
     }
 
+    /* Lever 3: a slice over a statically-proven non-opt array/string can
+     * only clamp, never throw (given int/absent bounds) - the hoist's
+     * zero-iteration safety fact. */
+    if (auto *sl = dynamic_cast<Slice *>(n)) {
+        StaticTypeRef bt = static_type_resolve(type_of(sl->what.get()));
+        sl->base_sliceable = !bt->opt
+            && (bt->kind == StaticTypeKind::Array
+                || bt->kind == StaticTypeKind::Str);
+    }
+
     /* Mark `d.k` whose base is statically a DICT (vs a struct), so the VM
      * compiles a native typed dict read (P3) rather than a boxed MemberV. */
     if (auto *mem = dynamic_cast<MemberExpr *>(n)) {
@@ -4982,10 +4992,150 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
     return fr;
 }
 
+/* Does `c` reference identifier `uid` anywhere? (The hoist's cond/inc
+ * guard - a use of the slice var BEFORE its decl must keep the original
+ * undefined-read semantics.) Complete via for_each_child. */
+static bool hoist_refs_uid(Construct *c, const UniqueId *uid)
+{
+    if (!c)
+        return false;
+    if (auto *id = dynamic_cast<Identifier *>(c))
+        if (id->uid == uid)
+            return true;
+    bool found = false;
+    Inferencer::for_each_child(c, [&](Construct *ch) {
+        if (!found && hoist_refs_uid(ch, uid))
+            found = true;
+    });
+    return found;
+}
+
+/*
+ * LEVER 3 increment 2 (plans/native-gap-roadmap.md) - LOOP-INVARIANT
+ * SLICE HOISTING. `for (...) { var sl = base[a:b]; ...reads... }`
+ * evaluates an identical slice VIEW every iteration - the registration/
+ * refcount churn is the loop's cost (the pooled set halved it; this
+ * removes it). The decl statement hoists ABOVE the loop when every part
+ * is provably iteration-independent AND the transform is unobservable:
+ *
+ *  - base: a slotted LOCAL, not in mut_len (reassign/impure-call: the
+ *    view would rebind per iteration) AND NOT IN mut_content - the
+ *    subtle one: an element write to a base with a LIVE slice COWs the
+ *    BASE AWAY (clone_aliased_slices), so a hoisted view would keep
+ *    reading the detached OLD storage while per-iteration fresh views
+ *    see the new one;
+ *  - bounds: absent, or fr_immutable (side-effect-free, loop-stable)
+ *    AND int-proven (th == i / an int literal) - with base_sliceable
+ *    (a statically non-opt array/str) the slice then CANNOT throw
+ *    (pure clamping), so hoisting is safe even for a ZERO-iteration
+ *    loop (the throw would otherwise move from "never" to "before");
+ *  - sl: written exactly by its decl (not in mut_len/mut_content - no
+ *    reassign, no write-through, no mutating builtin), and not
+ *    referenced by the loop's cond/inc (a pre-decl read must keep its
+ *    original undefined-read semantics). Escaping READS are fine: a
+ *    slice view's identity is unobservable (intptr shows the SHARED
+ *    storage) and copies register independently.
+ *
+ * The transform: Block{decl..., loop} with scope_free (the decl's slot
+ * is function-frame-wide; resolution already happened). Both engines
+ * benefit (the VM compiles the block as decl-then-loop). Only DIRECT
+ * body statements are considered (no try-crossing, no nested blocks).
+ */
+static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
+{
+    Construct *body_c = nullptr;
+    Construct *cond1 = nullptr, *cond2 = nullptr;
+    if (auto *f = dynamic_cast<ForStmt *>(n.get())) {
+        body_c = f->body.get();
+        cond1 = f->cond.get();
+        cond2 = f->inc.get();
+    } else if (auto *w = dynamic_cast<WhileStmt *>(n.get())) {
+        body_c = w->body.get();
+        cond1 = w->condExpr.get();
+    } else {
+        return n;
+    }
+    Block *body = dynamic_cast<Block *>(body_c);
+    if (!body)
+        return n;
+
+    std::unordered_set<const UniqueId *> mut_len, mut_content;
+    fr_collect_mutated(n.get(), mut_len, mut_content);
+
+    std::vector<unique_ptr<Construct>> hoisted;
+    for (size_t i = 0; i < body->elems.size(); ) {
+        auto *e14 = dynamic_cast<Expr14 *>(body->elems[i].get());
+        const Identifier *lhs;
+        const Slice *sl;
+        if (e14 && e14->op == Op::assign && (e14->fl & pFlags::pInDecl)
+            && !(e14->fl & pFlags::pInConstDecl)
+            && (lhs = dynamic_cast<Identifier *>(e14->lvalue.get()))
+            && lhs->sym.kind == SymKind::local
+            && lhs->decl_type != DeclType::i && lhs->decl_type != DeclType::f
+            && !lhs->is_underscore()
+            && (sl = dynamic_cast<Slice *>(e14->rvalue.get()))
+            && sl->base_sliceable
+            /* base: an inlined scalar LITERAL (an auto-const string -
+             * bench 29's shape) is trivially invariant; else the
+             * identifier must be length- AND content-stable (content:
+             * the COW-detach hazard - see the header comment) */
+            && (dynamic_cast<LiteralStr *>(sl->what.get()) != nullptr
+                || (fr_base_id(sl->what.get())
+                    && mut_len.find(fr_base_id(sl->what.get()))
+                           == mut_len.end()
+                    && mut_content.find(fr_base_id(sl->what.get()))
+                           == mut_content.end()
+                    && fr_immutable(sl->what.get(), mut_len, mut_content,
+                                    nullptr)))
+            && mut_len.find(lhs->uid) == mut_len.end()
+            && mut_content.find(lhs->uid) == mut_content.end()
+            && !hoist_refs_uid(cond1, lhs->uid)
+            && !hoist_refs_uid(cond2, lhs->uid)) {
+            const auto bound_ok = [&](const Construct *b) {
+                if (!b)
+                    return true;              /* absent -> clamp */
+                if (!fr_immutable(b, mut_len, mut_content, nullptr))
+                    return false;
+                return b->th == TypeHint::i
+                    || dynamic_cast<const LiteralInt *>(b) != nullptr;
+            };
+            if (bound_ok(sl->start_idx.get()) && bound_ok(sl->end_idx.get())) {
+                hoisted.push_back(std::move(body->elems[i]));
+                body->elems.erase(body->elems.begin()
+                                  + static_cast<long>(i));
+                continue;
+            }
+        }
+        i++;
+    }
+    if (hoisted.empty())
+        return n;
+
+    auto blk = make_unique<Block>();
+    n->copy_base_fields(*blk);            /* the loop's loc for carets */
+    blk->scope_free = true;
+    for (auto &h : hoisted)
+        blk->elems.push_back(std::move(h));
+    blk->elems.push_back(std::move(n));
+    return blk;
+}
+
 static unique_ptr<Construct> specialize(unique_ptr<Construct> n)
 {
     if (!n)
         return n;
+    /* lever 3: hoist loop-invariant slice decls FIRST (the loop keeps its
+     * raw form for try_for_range below; the wrapper block's children then
+     * specialize individually). */
+    if (dynamic_cast<ForStmt *>(n.get())
+            || dynamic_cast<WhileStmt *>(n.get())) {
+        n = try_hoist_loop_slices(std::move(n));
+        if (auto *blk = dynamic_cast<Block *>(n.get())) {
+            for (auto &e : blk->elems)
+                e = specialize(std::move(e));
+            return n;
+        }
+    }
     /* a counted for-loop -> ForRangeStmt (matched on the raw form, BEFORE its
      * cond/inc are specialized away). */
     if (dynamic_cast<ForStmt *>(n.get())) {

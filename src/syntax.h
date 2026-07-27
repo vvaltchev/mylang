@@ -1522,6 +1522,11 @@ public:
     unique_ptr<Construct> what;
     unique_ptr<Construct> start_idx;
     unique_ptr<Construct> end_idx;
+    /* Set by the inferencer when `what` is statically a non-opt ARRAY or
+     * STRING: with int(-proven)/absent bounds such a slice CANNOT throw
+     * (pure clamping semantics) - the loop-invariant hoist's
+     * zero-iteration safety gate (lever 3). */
+    bool base_sliceable = false;
 
     Slice() : Construct("Slice") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1533,6 +1538,7 @@ public:
         c->what = clone_as(what);
         c->start_idx = clone_as(start_idx);
         c->end_idx = clone_as(end_idx);
+        c->base_sliceable = base_sliceable;
         return c;
     }
 };

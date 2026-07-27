@@ -2439,6 +2439,31 @@ case (a REPL retains a post-specialization body a later-input clone re-enters
 inference on) — a defensive robustness fix (the inliner already handles
 cross-input `TypedScalarExpr`).
 
+**Loop-invariant slice hoisting (`try_hoist_loop_slices`,
+inferencer.cpp; lever 3 inc 2, 2026-07-27).** A DIRECT loop-body decl
+`var sl = base[a:b]` hoists ABOVE a For/While loop (a `Block{decl,
+loop}` with scope_free; the decl's slot is frame-wide and resolution
+already happened, so both engines just run decl-then-loop) when every
+part is provably iteration-independent AND unobservable: base is an
+inlined scalar LITERAL (an auto-const string) or a slotted local
+NEITHER in `mut_len` NOR in `mut_content` - the content half is the
+COW-DETACH hazard: an element write to a base with a LIVE slice clones
+the base away (clone_aliased_slices), so a hoisted view would keep
+reading the detached OLD storage while per-iteration fresh views see
+the new one (pinned by the "base content write keeps per-iteration
+views" test); bounds are absent or fr_immutable AND int-proven; and
+with `Slice::base_sliceable` (a new inferencer stamp: statically
+non-opt array/str) the slice CANNOT throw (pure clamping), so hoisting
+is safe even for a ZERO-iteration loop. The slice var itself must be
+written only by its decl (no write-through/mutating builtin - those
+would COW the view privately, diverging from fresh-view-per-iteration)
+and unreferenced by cond/inc. Escaping READS are fine (a view's
+identity is unobservable - intptr shows the SHARED storage). Runs in
+`specialize()` BEFORE try_for_range (the wrapper block's children then
+specialize individually, so the loop still becomes a ForRangeStmt).
+Measured with the pooled slices set (inc 1): 15_array_slice_readonly
+-56% Ir / ~0.46x wall combined, 29_str -20.9% Ir; 16/47 flat.
+
 **Counted-loop specialization (`ForRangeStmt`).** Also in `specialize_types`
 (via `try_for_range`, run on the RAW `for` before its cond/inc are specialized),
 the four hottest loop shapes are rewritten to a dedicated `ForRangeStmt`
