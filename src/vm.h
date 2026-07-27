@@ -75,6 +75,10 @@ void vm_window_pop();
 #ifdef TESTS
 /* lever 2 execution proof: VmInvoker's DIRECT fragment entries */
 extern unsigned long g_jit_invoke_direct;
+/* lever 4 execution proof: per-element runs of the SPECIALIZED dyn-foreach
+ * Next bodies (resolved once at ForeachDynInit): 0 int / 1 float / 2 bool /
+ * 3 gen / 4 dict */
+extern unsigned long g_dyn_foreach_fast[5];
 #endif
 
 /*

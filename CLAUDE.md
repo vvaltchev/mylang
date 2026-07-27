@@ -4308,7 +4308,23 @@ and ABORTED (container hardening; UB in a plain release); it now binds
 nothing beyond the index, consistent with the dict path. **~1.8x
 CPython** on `66_dyn_foreach` (single-var; VM 0.59x the tree-walker) and **~3x
 CPython** on `74_dyn_foreach_kv` (2-var dict; VM 0.54x the tree-walker) — the
-box-free bind is the win. **User-function calls** go
+box-free bind is the win. **Lever 4 (2026-07-28, shape
+specialization):** ForeachDynInit resolves a per-shape **`DynIterState::
+next` FUNCTION POINTER** once - a single-var non-indexed array picks a
+per-`skind` body (flat int/float/bool: raw scalar read + bind through the
+baked `slot0`; general/strs/structs keep the per-element `arr_elem_at`
+dispatch - strs may PROMOTE mid-loop), a non-indexed 1/2-var dict binds
+key/value through baked slots, everything else (indexed / `_` / N-var
+unpack) keeps the generic body - so the per-element Next stops re-reading
+targets/shape/nvars. Kind-stable by construction (flat int/float/bool
+never promotes) and every fast body still re-derefs the container per
+element (growth during the loop behaves as before). NOTE a `var dyn a =
+range(N)` DESTINATION is GENERAL storage (the ArrHint rule) -> the gen
+body; the flat bodies serve dyn ALIASES of typed arrays. Execution-proven
+per body (`g_dyn_foreach_fast[5]`, the `dyn_foreach_fast_shapes` test).
+Measured (callgrind Ir): 74_dyn_foreach_kv **-10.3%** (wall -8.6%),
+66_dyn_foreach -7.0% (wall ~flat - its time is the boxed body arith,
+the #60/N7 arc); 20/26 (typed paths) neutral. **User-function calls** go
 native via `CallV`: a call
 proved a user function (`CallExpr::vm_direct_func`, a Func static type — not a
 struct constructor / builtin) that devirtualized to a global slot evaluates its

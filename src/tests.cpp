@@ -15277,6 +15277,75 @@ static bool jit_invoke_direct_entry()
  * + the fused ord(s[i]) (OrdCharV). Proven by g_jit_op_run - each op's JIT
  * helper bumps its slot, so a bump proves the NATIVE path executed, not just
  * that the result was right (the interpreter produces the same result). */
+/* Lever 4: the dyn-foreach SPECIALIZED Next bodies actually run -
+ * g_dyn_foreach_fast is bumped per element by the per-shape bodies
+ * ForeachDynInit resolved (never by the generic fallback), so a growth of
+ * >= the element count proves the specialization engaged, not just that
+ * the result was right (the generic body produces the same result). */
+static bool dyn_foreach_fast_shapes()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    unsigned long f0[5];
+    for (int i = 0; i < 5; i++)
+        f0[i] = g_dyn_foreach_fast[i];
+    /* A `var dyn a = <creator>` DESTINATION is GENERAL storage (the ArrHint
+     * rule), so the flat bodies are reached via dyn ALIASES of TYPED
+     * arrays; the dyn-destination array exercises the gen body. */
+    if (!run({
+            "var ia = range(50); var dyn ai = ia;    # flat ints, aliased",
+            "var fa = [1.5, 2.5, 3.5]; var dyn af = fa;",
+            "var ba = [true, false, true]; var dyn ab = ba;",
+            "var dyn ag = [\"x\", \"y\"];      # dyn dest -> the gen body",
+            "var dyn d = {\"a\": 1, \"b\": 2};",
+            "var dyn s = 0; var r = \"\";",
+            "foreach (var e in ai) s += e;",
+            "foreach (var f in af) s += int(f);",
+            "foreach (var b in ab) s += b;",
+            "foreach (var g in ag) r += g;",
+            "foreach (k, v in d) s += v + len(k);",
+            "assert(s == 1225 + 6 + 2 + 5);",
+            "assert(r == \"xy\");" }))
+        return false;
+    /* per-shape minima: 50 ints, 3 floats, 3 bools, 2 gen, 2 dict pairs */
+    static const unsigned long need[5] = {50, 3, 3, 2, 2};
+    static const char *const nm[5] = {"int", "float", "bool", "gen", "dict"};
+    for (int i = 0; i < 5; i++) {
+        if (g_dyn_foreach_fast[i] < f0[i] + need[i]) {
+            fprintf(stderr, "dyn_foreach_fast_shapes: the %s Next body "
+                            "DID NOT RUN\n", nm[i]);
+            return false;
+        }
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_len_ord()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -18163,6 +18232,8 @@ static const std::vector<extra_check> extra_checks =
       jit_struct_baked },
     { "jit: native len() + fused ord(s[i]) run natively (lever 4b)",
       jit_len_ord },
+    { "vm: dyn-foreach specialized Next bodies run (lever 4)",
+      dyn_foreach_fast_shapes },
     { "jit: fragment-inline sync call runs (direct push + call rdx)",
       jit_sync_inline_call },
     { "jit: post-call entry stub re-enters native on interpreted return",

@@ -374,3 +374,33 @@ paths; plus the sanitized unarmed default cap is 32 (was 200) - past the
 cap a sync call falls interpreted (in-VM, flat), so the cap is a perf
 knob the correctness lanes don't care about. The jit_post_call_entry pin
 is 32 accordingly.
+
+## Lever 4 - dyn-foreach shape specialization (LANDED 2026-07-28)
+
+ForeachDynInit resolves DynIterState::next (a function pointer) ONCE:
+- array, non-indexed, single real var: per-skind body - flat int/float/
+  bool read the raw scalar and bind through the baked slot0; general/
+  strs/structs keep per-element arr_elem_at (strs may promote mid-loop).
+- dict, non-indexed, 1/2 vars: bind key/value through baked slot0/slot1.
+- everything else (indexed, `_` single var, N-var strict unpack, >2-var
+  dict): the generic body, unchanged.
+The per-element Next (interpreter case + jit_foreach_dyn_next) just calls
+st.next - no per-element targets/shape/nvars re-reads. Soundness: flat
+int/float/bool kinds cannot change at runtime (no promotion; wrong-type
+mutation throws); every fast body re-derefs the container per element, so
+growth/realloc during the loop behaves exactly as the generic body; the
+size snapshot and dict iterator semantics are untouched.
+
+GOTCHA: a `var dyn a = range(N)` DESTINATION is GENERAL storage (the
+ArrHint dyn-destination rule), so 66-class code runs the gen body; the
+flat bodies serve dyn ALIASES of typed arrays. The execution-proof
+counter is per-body (g_dyn_foreach_fast[5]) for exactly this reason -
+one aggregate counter could not tell the flat bodies from the gen
+fallback (dyn_foreach_fast_shapes asserts all five).
+
+Measured (callgrind Ir, same-session A/B, scale 1): 74_dyn_foreach_kv
+9.33B -> 8.37B (**-10.3%**, wall -8.6%), 66_dyn_foreach 10.51B -> 9.77B
+(**-7.0%**, wall ~flat - 66 is bound by the boxed body arithmetic, the
+#60/N7 arc), 20_foreach_unpack / 26_dict_iterate (typed paths) neutral.
+The remaining 66/74 headroom is the boxed `s = (s+e) % M` chain
+(jit_boxed_binop + puts ~40% of 66), not the iterator.
