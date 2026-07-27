@@ -1440,3 +1440,16 @@ Corpus: 58 -> 45 kept runs. Ir: 15_slice -32.2%, 18_foreach -10.1%,
 14 -3.0%, 43/46 neutral. Next: AppendV (same helper pattern), then the
 call ops (need an EnterNative-performs-the-call design), then
 Catch/Reraise/Throw (exit-at-op natives).
+
+## Delete-originals increment 2 (2026-07-28) - the LV-builtin family
+
+AppendV/CallBuiltinLV/CallBuiltinLVElem/CallBuiltinLVMember classified
+op_fully_native: their helpers already run the full interpreter path and
+pool-stamp their carets (collapse-safe); added the catch(...) ->
+g_vm_jit_eptr net (a plain Exception would std::terminate the noexcept
+helper) + an emit-side exc-stamp layer + the classification. Corpus
+45 -> 41 kept runs; Ir neutral. PRE-EXISTING finding (parent-verified):
+a throwing sort-comparator's div0 caret diverges between engines (VM =
+the divisor operand, tw = the whole chain) - a tw stamp-granularity
+item, untracked. Remaining: calls 38 (needs the EnterNative-performs-
+the-call design), exceptions 12, StructFieldAddInt 5, MultiUnpackV 3.

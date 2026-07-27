@@ -4848,6 +4848,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -4874,6 +4875,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -4903,6 +4905,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -5832,6 +5835,16 @@ static bool op_fully_native(const Instr &in)
      * InternalErrorEx net rides eptr) - no bail, no re-interpret. */
     case OpCode::LoadElemInt:
     case OpCode::LoadElemFloat:
+        return true;
+    /* #56 inc 2: the LV-builtin family - the helpers run the full
+     * interpreter path (fast append + the pooled-caret fallback / the
+     * shared LV dispatch) and every throw now CONVEYS with the op's
+     * exc-stamped caret (plus the eptr net for a plain Exception). No
+     * bail, no re-interpret -> deletable. */
+    case OpCode::AppendV:
+    case OpCode::CallBuiltinLV:
+    case OpCode::CallBuiltinLVElem:
+    case OpCode::CallBuiltinLVMember:
         return true;
     /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
      * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the

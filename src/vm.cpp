@@ -4137,6 +4137,11 @@ extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
+    } catch (...) {
+        /* a plain (non-Runtime) Exception: the eptr channel - the noexcept
+         * would std::terminate otherwise (#56 inc 2) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
     }
     return 0;
 }
@@ -4186,6 +4191,11 @@ extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
     } catch (RuntimeException &e) {
         if (!e.loc_start) { e.loc_start = bc->start; e.loc_end = bc->end; }
         g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain (non-Runtime) Exception: the eptr channel - the noexcept
+         * would std::terminate otherwise (#56 inc 2) */
+        g_vm_jit_eptr = std::current_exception();
         return 1;
     }
     return 0;
@@ -4247,6 +4257,11 @@ extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
         }
         g_vm_jit_exc.reset(e.clone());
         return 1;
+    } catch (...) {
+        /* a plain (non-Runtime) Exception: the eptr channel - the noexcept
+         * would std::terminate otherwise (#56 inc 2) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
     }
     return 0;
 }
@@ -4300,6 +4315,11 @@ extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
             e.loc_end = bc->args[0].end;
         }
         g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain (non-Runtime) Exception: the eptr channel - the noexcept
+         * would std::terminate otherwise (#56 inc 2) */
+        g_vm_jit_eptr = std::current_exception();
         return 1;
     }
     return 0;
