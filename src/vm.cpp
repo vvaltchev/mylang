@@ -1908,6 +1908,13 @@ unsigned long g_jit_native_returns = 0;
  * whose type + message + caret can't be reconstructed from a kind. */
 static std::unique_ptr<RuntimeException> g_vm_jit_exc;
 
+/* M5: a PLAIN (non-Runtime) exception crossing a fragment - e.g. a callee's
+ * UndefinedVariableEx surfacing from a native sync call. It has no clone()
+ * (only RuntimeException does), so it rides a std::exception_ptr; EnterNative
+ * rethrows it, after which it propagates out of vm_dispatch exactly like the
+ * interpreted in-VM call's own throw (non-catchable, top-level render). */
+static std::exception_ptr g_vm_jit_eptr;
+
 /* The approach-A container-store JIT helpers (declared in jit.h). A native
  * a[i]=v fragment marshals the base LValue*, index and value and CALLS one of
  * these instead of splitting the run at the store - keeping the surrounding
@@ -4199,6 +4206,89 @@ ptrdiff_t jit_off_gft_defined()
          - reinterpret_cast<const char *>(&g);
 }
 
+/* M5 increment 1: the SYNCHRONOUS native call - a fragment's CallV runs the
+ * callee TO COMPLETION inside this helper (the vm_try_invoke boundary
+ * machinery builtin callbacks already use: one window push, bind, re-enter
+ * vm_dispatch - the callee's own fragments run within), writes dst, and the
+ * CALLER CONTINUES NATIVELY (the whole point: no post-call interior-resume).
+ * The C stack grows one helper+dispatch level per NESTED sync call
+ * (recursion through native call sites), so a depth cap bails the deep tail
+ * to the interpreted CallV, whose flat in-VM record stack is unbounded.
+ * Returns 0 = done (dst written); 1 = BAIL pre-side-effect (undefined /
+ * non-callable callee, no invoke ctx, chunk-less callee, depth cap - the
+ * interpreter re-runs the op); 2 = the callee threw: a RuntimeException
+ * rides g_vm_jit_exc (its backtrace's innermost frame gets the BAKED
+ * call-site loc the lazy in-VM capture would have used), anything else
+ * rides g_vm_jit_eptr. */
+static int g_jit_sync_depth = 0;
+static constexpr int JIT_SYNC_DEPTH_CAP = 200;
+
+extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
+                             int_type nargs, int_type dst,
+                             int_type site_packed) noexcept
+{
+    ML_JIT_OP_RAN(CallV);
+    EvalContext *ctx = g_current_ctx;
+    if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
+        return 1;                          /* deep tail -> interpreted */
+    if (!ctx->gfuncs->defined[callee_slot])
+        return 1;                          /* undefined -> interpreted throw */
+    const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
+    if (!cv.is<intrusive_ptr<FuncObject>>())
+        return 1;                          /* not callable -> interpreted */
+    FuncObject &fo = *cv.get<intrusive_ptr<FuncObject>>().get();
+
+    /* the arg VALUES from the contiguous slot run (one copy; the bind inside
+     * vm_try_invoke is the second - the interpreted path pays one, measured
+     * acceptable for the caller staying native) */
+    EvalValue abuf[8];
+    std::vector<EvalValue> aheap;
+    const EvalValue *argv;
+    Frame *f = ctx->frame;
+    if (nargs <= 8) {
+        for (int_type i = 0; i < nargs; i++)
+            abuf[i] = f->at(argbase + i).get();
+        argv = abuf;
+    } else {
+        aheap.reserve(static_cast<size_t>(nargs));
+        for (int_type i = 0; i < nargs; i++)
+            aheap.push_back(f->at(argbase + i).get());
+        argv = aheap.data();
+    }
+
+    EvalValue out;
+    g_jit_sync_depth++;
+    try {
+        const bool ran = vm_try_invoke(ctx, fo, argv,
+                                       static_cast<size_t>(nargs), out);
+        g_jit_sync_depth--;
+        if (!ran)
+            return 1;                      /* no invoke ctx / no chunk */
+    } catch (Exception &e) {
+        g_jit_sync_depth--;
+        /* the innermost frame was captured LOC-LESS by vm_try_invoke's
+         * vm_capture_desc_frame; give it the baked call-site loc the lazy
+         * in-VM capture (loc_at(ret_chunk, ret_pc-1)) would have used. */
+        if (!e.backtrace.empty() && e.backtrace.back().desc == fo.func
+                && !e.backtrace.back().call_site.line)
+            e.backtrace.back().call_site =
+                Loc(static_cast<int>(site_packed >> 32),
+                    static_cast<int>(site_packed & 0xffffffff));
+        if (auto *re = dynamic_cast<RuntimeException *>(&e))
+            g_vm_jit_exc.reset(re->clone());
+        else
+            g_vm_jit_eptr = std::current_exception();
+        return 2;
+    } catch (...) {
+        g_jit_sync_depth--;
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    if (dst >= 0)
+        ctx->frame->at(dst).put(std::move(out));
+    return 0;
+}
+
 /* Step 7a (the INLINE exception ops): the activation-side layout the
  * PushHandler/PopHandler/SetPend inlines walk - &g_vm_act, the handlers /
  * records / rec_n member offsets, the record stride and its pend offset.
@@ -4994,6 +5084,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 if (!vm_raise(chunk, pc, act, ctx, std::move(g_vm_jit_exc)))
                     return;                    /* boundary: signal set */
                 code = chunk->code.data();     /* dispatched to a handler */
+            }
+            /* M5: a PLAIN (non-Runtime) exception from a native sync call
+             * (a callee's UndefinedVariableEx - no clone(), so it rode a
+             * std::exception_ptr). Rethrow: it propagates out of
+             * vm_dispatch exactly like the interpreted in-VM call's own
+             * throw (non-catchable, rendered at the top level). */
+            else if (g_vm_jit_eptr) {
+                std::exception_ptr p = std::move(g_vm_jit_eptr);
+                g_vm_jit_eptr = nullptr;
+                std::rethrow_exception(p);
             }
         }
         VM_NEXT;
