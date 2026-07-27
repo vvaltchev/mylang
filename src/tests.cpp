@@ -14959,10 +14959,16 @@ static bool jit_native_stack_deep()
      * body local; a literal spec-clones instead. The recursive-pure
      * exclusion keeps the call a real runtime recursion (never eagerly
      * folded). */
+    /* TWO calls each: the inline push REUSES records (rec_n < recs_high)
+     * - a first-ever descent grows the high-water mark one level at a
+     * time through the SLOW tier (the cold emplace), so call #1 is
+     * all-slow by design and call #2 flies inline. (The M5b prove-it
+     * catch: the single-call draft measured 0 inline calls.) */
     const unsigned long b0 = g_jit_sync_inline;
     if (!run({
             "func s(n) { if (n < 1) { return 0; }",
             "  var t = s(n - 1); return t + n; }",
+            "assert(s(5000) == 12502500);",
             "assert(s(5000) == 12502500);" }))
         return false;
     if (g_jit_sync_inline < b0 + 5000) {
@@ -14977,6 +14983,7 @@ static bool jit_native_stack_deep()
             "  var t = od(n - 1); return t + 1; }",
             "func od(n) { if (n < 1) { return 0; }",
             "  var t = ev(n - 1); return t + 1; }",
+            "assert(ev(5000) == 5000);",
             "assert(ev(5000) == 5000);" }))
         return false;
     if (g_jit_sync_inline < b1 + 5000) {
@@ -14990,9 +14997,10 @@ static bool jit_native_stack_deep()
     if (!run({
             "func st(int n) { if (n < 1) { return 0; }",
             "  var t = st(n - 1); return t + n; }",
+            "assert(st(3000) == 4501500);",
             "assert(st(3000) == 4501500);" }))
         return false;
-    if (g_jit_op_run[static_cast<size_t>(OpCode::CallV)] < c0 + 3000) {
+    if (g_jit_op_run[static_cast<size_t>(OpCode::CallV)] < c0 + 6000) {
         fprintf(stderr, "jit_native_stack_deep: typed-param recursion did "
                         "not stay on the sync path\n");
         return false;

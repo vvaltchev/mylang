@@ -156,25 +156,48 @@ extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
  * per-frame pure cache first; a miss's key rides the callee record and is
  * stored by the normal return pop); jit_call_sync_value is CallValueV (the
  * callee VALUE sits in a frame temp, not a global slot). */
-/* Lever 1 step 5 - the fragment-INLINE sync call (see vm.cpp). The push
- * returns {callee window slots, callee fragment entry} in rax:rdx (SysV
- * two-pointer struct); {null, null} = any cold shape -> the fragment falls
- * back to the full jit_call_sync* helper below. jit_sync_postexit handles
- * a direct-entered callee's non-sentinel exit (shared with the helper
- * path's direct branch). */
-struct JitSyncPush { LValue *win; const void *entry; };
-extern "C" JitSyncPush jit_sync_push_slot(int_type callee_slot,
-                                          int_type argbase, int_type nargs,
-                                          int_type dst) noexcept;
-extern "C" JitSyncPush jit_sync_push_value(int_type callee_temp,
-                                           int_type argbase, int_type nargs,
-                                           int_type dst) noexcept;
+/* Lever 1 step 5 + M5b: the sync call is fully emitted at the site (the
+ * push inline via emit_sync_push_native/JitPushLayout); jit_sync_postexit
+ * handles a direct-entered callee's non-sentinel exit (shared with the
+ * helper path's direct branch). */
 extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept;
 void *jit_addr_sync_depth();
 int jit_sync_depth_cap();
 void jit_set_sync_depth_cap(int cap);   /* M5a: raised when the native
                                          * stack arms; tests pin it low */
 void jit_native_stack_init();
+
+/* M5b - the FULLY-INLINE record push: every offset/size the emitted push
+ * needs, probed from REAL objects in vm.cpp (the TU that owns
+ * VmActivation/VmCallRec/VmStackSeg) - the SharedArrayObj::jit_probe
+ * philosophy: measured from live members, so a layout change cannot
+ * silently drift. Filled once by jit_fill_push_layout. */
+struct JitPushLayout {
+    /* VmActivation */
+    ptrdiff_t act_segs, act_cur_seg, act_recs_high, act_diters_n,
+              act_dyiters_n, act_used, act_cap, act_top_rec, act_vframe,
+              act_handlers2;
+    /* Frame (the view) */
+    ptrdiff_t frame_slots, frame_size, frame_pure_cache;
+    /* VmStackSeg */
+    ptrdiff_t seg_slots, seg_top;
+    /* VmCallRec */
+    ptrdiff_t rec_window, rec_nslots, rec_seg, rec_seg_top_before,
+              rec_run_chunk, rec_ret_chunk, rec_ret_pc, rec_dst, rec_desc,
+              rec_caller_caps, rec_handler_base, rec_diter_base,
+              rec_dyiter_base, rec_boundary, rec_sync_stop;
+    /* FuncDescriptor */
+    ptrdiff_t desc_params, desc_frame_size, desc_fast_bind;
+    size_t param_desc_size;
+    /* Chunk */
+    ptrdiff_t ck_n_temps, ck_n_dict_iters, ck_n_dyn_iters, ck_sync_entry;
+    /* FuncObject */
+    ptrdiff_t fo_func, fo_capture_slots;
+    /* singletons/constants */
+    const void *t_func;
+    const void *stop_chunk;           /* &vm_sync_stop_chunk() */
+};
+void jit_fill_push_layout(JitPushLayout *out);
 
 extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
                              int_type nargs, int_type dst,
