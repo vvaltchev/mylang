@@ -6700,6 +6700,22 @@ static const std::vector<test> tests =
         },
         &typeid(OutOfBoundsEx), 5, 3, 10, 3,
     },
+    {
+        /* JumpUnlessTrueV deletability: the boxed condition's is_true throw
+         * in a DELETED run keeps the enclosing-if caret via the cold-side
+         * exc-stamp (a no-bool-conversion builtin value as the condition). */
+        "err loc: a DELETED run's boxed-condition throw keeps its caret",
+        {
+            "func h(dyn v, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++)",
+            "    if (v) { s += 1; }",
+            "  return s;",
+            "}",
+            "h(runtime(print), 2);",
+        },
+        &typeid(TypeErrorEx), 5, 4, 3, 5,
+    },
 
     {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",

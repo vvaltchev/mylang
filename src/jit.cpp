@@ -1031,8 +1031,9 @@ static bool jit_op_eligible(const Instr &in)
      * evaluates it and the FRAGMENT jumps (emit_branch). This was the top
      * blocker for foreach/if bodies: an un-nativized branch SPLIT the run, so
      * the loop's back edge fell outside the fragment and every iteration after
-     * the first ran interpreted. is_true CAN throw -> re-raise, so NOT
-     * op_fully_native (the caret comes from the pc-keyed loc side table). */
+     * the first ran interpreted. is_true CAN throw -> the slow path conveys,
+     * exc-stamped with the condition caret (deletable; the inline int/bool
+     * fast path cannot fault and the op never bails). */
     case OpCode::JumpUnlessTrueV:
         return true;
     /* model-flip (nativize-ops): the boxed-arith ops (dyn/string operands) via
@@ -4280,6 +4281,9 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                                                   * 0/1 on the success paths) */
         {
             const size_t j_ok = e.j8(0x79);      /* jns -> did not throw */
+            emit_exc_stamp(e, ck, pc);           /* cold: the condition caret
+                                                  * (pc-independent -> the op
+                                                  * is deletable) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -4663,6 +4667,8 @@ static bool op_fully_native(const Instr &in)
     case OpCode::MemberV:
     case OpCode::LoadGlobalV:
     case OpCode::CheckCallableV:    /* convey-only guard, exc-stamped caret */
+    case OpCode::JumpUnlessTrueV:   /* inline int/bool test; the is_true slow
+                                     * path conveys, exc-stamped - no bail */
         return true;
     /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
      * DictStore / StoreElem2V: convey-only helpers, cold-side lep caret.
