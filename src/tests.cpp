@@ -15341,6 +15341,22 @@ static bool jit_boxed_int_fast()
                 "jit_boxed_int_fast: CompoundV/CmpV inline DID NOT RUN\n");
         return false;
     }
+    c0 = g_jit_boxed_fast;
+    /* div/mod: an imm divisor (66's `% M` shape) and a REG divisor inline;
+     * a runtime 0/-1 divisor declines to the throwing/exact helper */
+    if (!run({ "var dyn s = 0; var dyn d = 7;",
+               "for (var i = 1; i <= 40; i++) {",
+               "  var dyn x = i * 13;",
+               "  s = (s + x / d + x % 5) % 1000000007;",
+               "}",
+               "var dyn m = -1; var dyn q = 17;",
+               "assert(q % m == 0); assert(q / m == -17);",
+               "assert(s == 1585);" }))
+        return false;
+    if (g_jit_boxed_fast <= c0) {
+        fprintf(stderr, "jit_boxed_int_fast: div/mod inline DID NOT RUN\n");
+        return false;
+    }
     /* mid-loop int->float flip: the guard DECLINES per element and the
      * helper computes the exact promoted result (byte-identical) */
     if (!run({ "var dyn vals = dynarray([1, 2.5, 3, 4.5]);",

@@ -429,3 +429,22 @@ my/py geomean 0.106x -> 0.102x (**9.44x -> 9.81x** vs CPython).
 Remaining #60 headroom in 66: the iterator + put churn now dominates
 (vm_dyn_next_arr_gen on the GENERAL dyn-destination array); a flat-on-
 dyn-destination revisit or unboxed loop-var binds would be next.
+
+## #60 increment 2 - div/mod join the inline tier (2026-07-28)
+
+66's `% 1000000007` was the excluded throwing aop - its BinOpV still paid
+the helper chain (~21% of the bench). Inline rules: IMM divisor iff not
+0/-1 (IntModRI's idiv-trap exclusion); REG divisor with runtime 0/-1
+guards declining to the helper (byte-identical throw / -1 semantics).
+cqo+idiv; mod takes rdx. Measured: 66 -45.3% Ir on top of increment 1
+(7.37B -> 4.03B; cumulative -58.7%), 74 unchanged (a +1.75% reading was
+an LTO relink layout swing in vm_dyn_next_dict - same call counts).
+Suite my/py geomean 9.81x -> **10.25x - the 10x goal crossed**.
+
+PROCESS LESSON (cost a red CI): the first tier's battery checked only
+the differential tail line, not the headline/exit code, so the
+jit_op_nativized failure (its BinOpV case asserts the HELPER counter,
+which the inline tier legitimately bypasses) was invisible locally and
+caught by CI. Batteries must check `Tests passed` + the exit code; the
+coverage loop now accepts the inline tier as "ran natively" for
+BinOpV/CmpV/CompoundV. Fixed as a fixup into the guilty commit.

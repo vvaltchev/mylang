@@ -332,7 +332,16 @@ mid-loop int->float guard-decline separately). Measured (callgrind Ir,
 same-session A/B): 74_dyn_foreach_kv **-58.6%** (wall 0.63s -> 0.24s),
 66_dyn_foreach **-24.6%** (wall -17%); 34/35/62 exactly neutral (their
 hot compares were already CmpIntV). Suite my/py geomean 9.44x ->
-**9.81x**.
+**9.81x**. **div/mod joined the tier next** (66's `% M` was the excluded
+throwing aop): an IMM divisor inlines when it is neither 0 nor -1 (the
+IntModRI idiv-trap exclusion); a REG divisor gets runtime 0/-1 guards
+DECLINING to the helper (which throws / computes the -1 case exactly as
+the interpreter's C++); cqo+idiv, mod's remainder from rdx. 66 a further
+**-45.3%** (cumulative -58.7%); suite **10.25x vs CPython - the 10x goal
+crossed**. The jit_op_nativized coverage loop accepts the INLINE tier as
+"ran natively" for BinOpV/CmpV/CompoundV (their helpers legitimately
+stop bumping when the emitted fast path serves int-int - the deeper form
+of native, not a gap).
 
 **D1 - `AppendV` (the append/push fast op).** `append(a, x)`/`push(a, x)`
 with one value arg emits `AppendV` (CallBuiltinLV's operand layout: the

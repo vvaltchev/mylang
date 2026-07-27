@@ -4503,6 +4503,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             return o == Op::plus || o == Op::minus || o == Op::times
                 || o == Op::band || o == Op::bor || o == Op::bxor;
         };
+        /* div/mod join the fast tier when they provably cannot trap or
+         * need the throw: an IMM divisor must be neither 0 nor -1 (the
+         * IntModRI idiv-trap exclusion - INT64_MIN % -1); a REG divisor
+         * gets runtime 0/-1 guards that DECLINE to the helper (which
+         * throws DivisionByZeroEx / computes the -1 case exactly as the
+         * interpreter's C++ does). */
+        const auto divmod_ok = [](Op o, const Operand &b) {
+            return (o == Op::div || o == Op::mod)
+                && (!b.is_lit || (b.lit != 0 && b.lit != -1));
+        };
         const auto cmp_ok = [](Op o) {
             return o == Op::lt || o == Op::gt || o == Op::le || o == Op::ge
                 || o == Op::eq || o == Op::noteq;
@@ -4510,25 +4520,27 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const auto opnd_ok = [](const Operand &o) {
             return !o.is_lit || o.lit_kind == Operand::LitKind::i;
         };
+        const bool dv = !cmp && divmod_ok(bo.aop, bo.b);
         const bool fast = in.op != OpCode::UnaryV
-            && (cmp ? cmp_ok(bo.aop) : arith_ok(bo.aop))
+            && (cmp ? cmp_ok(bo.aop) : (arith_ok(bo.aop) || dv))
             && opnd_ok(bo.b) && (comp || opnd_ok(bo.a));
-        size_t j_slow_a = 0, j_slow_b = 0, j_done = 0;
+        std::vector<size_t> j_slows;
+        size_t j_done = 0;
         if (fast) {
             e.movabs(RCX, reinterpret_cast<uint64_t>(jit_layout().t_int));
             if (comp) {
                 e.load(RAX, slot_addr(in.target).type);
                 e.cmp_rax_rcx();
-                j_slow_a = e.j32(0x75);
+                j_slows.push_back(e.j32(0x75));
             } else if (!bo.a.is_lit) {
                 e.load(RAX, slot_addr(bo.a.slot).type);
                 e.cmp_rax_rcx();
-                j_slow_a = e.j32(0x75);
+                j_slows.push_back(e.j32(0x75));
             }
             if (!bo.b.is_lit) {
                 e.load(RAX, slot_addr(bo.b.slot).type);
                 e.cmp_rax_rcx();
-                j_slow_b = e.j32(0x75);
+                j_slows.push_back(e.j32(0x75));
             }
 #ifdef TESTS
             e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_boxed_fast));
@@ -4553,7 +4565,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);   /* movzx eax, al */
                 store_dst_bool(e, ck, RAX, in.target);
             } else {
-                op_rr(e, bo.aop);
+                if (dv) {
+                    if (!bo.b.is_lit) {
+                        /* runtime 0 / -1 divisor -> the helper tier */
+                        e.u8(0x48); e.u8(0x83); e.u8(0xF9); e.u8(0x00);
+                        j_slows.push_back(e.j32(0x74));   /* je slow */
+                        e.u8(0x48); e.u8(0x83); e.u8(0xF9); e.u8(0xFF);
+                        j_slows.push_back(e.j32(0x74));   /* je slow */
+                    }
+                    e.u8(0x48); e.u8(0x99);              /* cqo */
+                    e.u8(0x48); e.u8(0xF7); e.u8(0xF9);  /* idiv rcx */
+                    if (bo.aop == Op::mod)
+                        e.mov_rr(RAX, RDX);              /* the remainder */
+                } else {
+                    op_rr(e, bo.aop);
+                }
                 if (comp) {
                     e.store(RAX, slot_addr(in.target).payload);
                 } else {
@@ -4563,8 +4589,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 }
             }
             j_done = e.j32(0xEB);
-            if (j_slow_a) e.patch32_here(j_slow_a);
-            if (j_slow_b) e.patch32_here(j_slow_b);
+            for (const size_t j : j_slows)
+                e.patch32_here(j);
         }
         /* the slow tier: the interpreter-exact helpers (any operand shape,
          * the throwing aops) */
