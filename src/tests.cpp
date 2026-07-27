@@ -15668,6 +15668,48 @@ static bool jit_op_nativized()
             "  return r;",
             "}",
             "assert(f(runtime(\"nope\")) == 8);" } },
+        /* Step 7a - the INLINE simple exception ops: the hot NO-THROW try
+         * path (handler push/pop per entry/exit) and the finally pend
+         * flag. (The helper-call form was measured +8% and reverted; these
+         * counters prove the INLINE forms run.) */
+        { OpCode::PushHandler, {
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { s += i; } catch (TypeErrorEx) { s = -1; }",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 10);" } },
+        { OpCode::PopHandler, {
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { s += i; } catch (TypeErrorEx) { s = -1; }",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(6)) == 15);" } },
+        { OpCode::SetPend, {
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { s += i; } finally { s += 1; }",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(4)) == 10);" } },
+        /* a THROWING try under the inline handler push: the raise (still
+         * interpreted) must dispatch to the pushed (remapped) catch pc. */
+        { OpCode::PushHandler, {
+            "func f(dyn d, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { s += i / d; } catch (DivisionByZeroEx) { s += 100; }",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(0), 3) == 300);" } },
         /* The iterator THROW paths, script-caught: a non-container init and a
          * strict-unpack next each ride g_vm_jit_exc out of the fragment and
          * dispatch to the same-frame handler. */

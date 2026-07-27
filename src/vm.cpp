@@ -4199,6 +4199,52 @@ ptrdiff_t jit_off_gft_defined()
          - reinterpret_cast<const char *>(&g);
 }
 
+/* Step 7a (the INLINE exception ops): the activation-side layout the
+ * PushHandler/PopHandler/SetPend inlines walk - &g_vm_act, the handlers /
+ * records / rec_n member offsets, the record stride and its pend offset.
+ * Probed from real objects so they cannot drift. The vector-internals
+ * layout (_M_start +0 / _M_finish +8 / _M_end_of_storage +16) is the same
+ * three-pointer fact the flat-array reads already rely on. */
+VmActivation **jit_addr_vm_act()
+{
+    return &g_vm_act;
+}
+ptrdiff_t jit_off_act_handlers()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.handlers)
+         - reinterpret_cast<const char *>(&a);
+}
+ptrdiff_t jit_off_act_records()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.records)
+         - reinterpret_cast<const char *>(&a);
+}
+ptrdiff_t jit_off_act_rec_n()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.rec_n)
+         - reinterpret_cast<const char *>(&a);
+}
+ptrdiff_t jit_sizeof_vm_rec()
+{
+    return static_cast<ptrdiff_t>(sizeof(VmCallRec));
+}
+ptrdiff_t jit_off_rec_pend()
+{
+    VmCallRec r;
+    return reinterpret_cast<const char *>(&r.pend)
+         - reinterpret_cast<const char *>(&r);
+}
+
+/* The COLD grow path of the inline PushHandler: the handlers vector is at
+ * capacity - do the real push_back (realloc). Never throws in practice. */
+extern "C" void jit_push_handler_grow(int_type catch_pc) noexcept
+{
+    g_vm_act->handlers.push_back({ static_cast<uint32_t>(catch_pc) });
+}
+
 ptrdiff_t jit_off_desc_vm_chunk()
 {
     FuncDescriptor fd;
