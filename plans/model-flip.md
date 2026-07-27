@@ -925,10 +925,29 @@ emitter bakes jit_addr_exc() (the unique_ptr's storage,
 static_asserted one raw pointer) + the probed Exception loc offsets;
 -vdj shows the stamp qwords decoding to the exact pinned caret.
 
+**INCREMENT 3 LANDED (3f32b72 + 4218ae9, 2026-07-25)** - the dyn-callee
+generic call pair NATIVIZED (jit_check_callable: convey-only guard,
+exc-stamped, deletable; jit_call_value_generic: the interpreter's exact
+by-Kind dispatch over the baked CallSite pool - FuncObject via the lean
+sync core after filling run[0], Builtin by Kind with the func_lv arg0
+LValue* re-derive, struct via construct_struct_v; loc-less throws
+self-stamped with the pool's args caret; bails: depth cap / chunkless /
+undefined-global arg0 base). THE ISLAND-SOURCE HOP CHAIN IS EXHAUSTED:
+no sequential op remains that op_is_simple_island admits but
+op_run_eligible rejects - jit_try_container forms no containers on real
+code (the two container tests retired their g_jit_container_calls
+assertions; vm_exec_block stays covered by the synthetic selftest; the
+machinery kept for future un-nativizable ops). And JumpUnlessTrueV -
+ALREADY fully nativized (inline int/bool + jit_is_true; the 5-task list
+wrongly called it un-nativized) - became DELETABLE via the cold-side
+exc-stamp, so `while (dyn_flag)` bodies delete to a bare enter.nat
+(caret err-loc pinned, multi-line span).
+
 NEXT INCREMENTS: the IncDec family (their pools already carry dual
 carets), ThrowRuntimeV (build the pooled exception natively), the
-raise-kind ops (IntBin div/mod + shifts via a lep-style kind+loc
-handoff), JumpUnlessTrueV, LoadElemValue (bounds-check bail -> convey).
+raise-kind ops (IntBin div/mod + shifts via an exc-build-with-loc cold
+helper), LoadElemValue (bounds-check bail -> convey), StoreElemFloat
+(remove the value-load bail).
 
 (Historical note - the older tally below predates the iterator ops.)
 CallBuiltinV (~294) is DONE (see
