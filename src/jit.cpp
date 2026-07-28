@@ -4234,6 +4234,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -4796,6 +4797,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         const size_t j_ok_cf = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
         e.exit_pc(pc);
         e.patch8(j_ok_cf, e.pos());
         return true;
@@ -4820,6 +4822,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         const size_t j_ok_mf = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
         e.exit_pc(pc);
         e.patch8(j_ok_mf, e.pos());
         return true;
@@ -5172,6 +5175,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* belt: pooled carets (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -5788,6 +5792,10 @@ static bool op_never_exits(const Instr &in)
     case OpCode::LoadStructFieldInt:
     case OpCode::LoadStructFieldFloat:
     case OpCode::LoadStructElemV:
+    /* #56: dst = other + a[i].f - the helper is never-throwing (the field
+     * read is inference-proven no-fault) and the add/store run in the
+     * fragment; no exit of any kind. */
+    case OpCode::StructFieldAddInt:
     /* the dict foreach iterator pair: the dict is PROVEN, the frame-slot binds
      * have no COW path - neither op can throw or bail, so both are deletable
      * (the Next's end_pc branch exits via the remapped exit_pc like any
@@ -5905,6 +5913,15 @@ static bool op_fully_native(const Instr &in)
     case OpCode::CallV:
     case OpCode::CachedCallV:
     case OpCode::CallValueV:
+        return true;
+    /* #56 (the small-batch increment): throws convey with exc-stamped /
+     * pooled carets; MapFilterV's plain callback throws ride eptr; no
+     * bail in any of them. */
+    case OpCode::MultiUnpackV:
+    case OpCode::CheckFuncV:
+    case OpCode::MapFilterV:
+    case OpCode::LoadMemberInt:
+    case OpCode::LoadMemberFloat:
         return true;
     /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
      * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the
