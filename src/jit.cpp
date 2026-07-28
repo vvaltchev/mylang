@@ -2962,8 +2962,18 @@ static void load_index_r9(Emitter &e, const Instr &in)
  * wrapped element, a REAL pre-existing divergence) + a re-check; a
  * non-negative or still-negative-after-wrap index RAISES OutOfBounds (this
  * pc's caret), matching the interpreter's `idx < 0 ||` check. */
-static void emit_elem_bounds_or_wrap(Emitter &e, uint32_t pc)
+static void emit_elem_bounds_or_wrap(Emitter &e, uint32_t pc,
+                                    std::vector<size_t> *slows = nullptr)
 {
+    if (slows) {
+        /* #56: DECLINE out-of-range (a negative wrap or a genuine OOB) to
+         * the caller's slow tier - the interpreter core does the wrap and
+         * throws CONVEYED (the raise path's loc_at would resolve against a
+         * DELETED run's collapsed pcs). */
+        e.cmp_r9_rdx();
+        slows->push_back(e.j32(0x73));       /* jae -> slow */
+        return;
+    }
     e.cmp_r9_rdx();
     const size_t j_load = e.j32(0x72);       /* jb: in range -> the load */
     /* cold: unsigned out-of-range - negative (wrap) or genuine OOB */
@@ -2986,7 +2996,8 @@ static void emit_elem_bounds_or_wrap(Emitter &e, uint32_t pc)
  * Shared by every flat int/bool element reader so the semantics cannot
  * drift. */
 static void emit_flat_int_tail(Emitter &e, uint32_t pc, bool bools,
-                               const Instr *idx_in, int idx_slot)
+                               const Instr *idx_in, int idx_slot,
+                               std::vector<size_t> *slows = nullptr)
 {
     const JitLayout &L = jit_layout();
     e.mov_rcx_rax(L.data_off);
@@ -2998,7 +3009,7 @@ static void emit_flat_int_tail(Emitter &e, uint32_t pc, bool bools,
         load_index_r9(e, *idx_in);
     else
         load_slot_r9(e, idx_slot);
-    emit_elem_bounds_or_wrap(e, pc);
+    emit_elem_bounds_or_wrap(e, pc, slows);
     if (bools)
         e.load_elem_byte();                  /* movzx eax,[rcx+r9] */
     else
@@ -3015,28 +3026,37 @@ static void emit_flat_int_tail(Emitter &e, uint32_t pc, bool bools,
  * negative); an out-of-range index RAISES OutOfBounds with the op's caret
  * (approach A - no re-interpret). Clobbers rax/rcx/rdx/r9.
  */
-static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc)
+static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc,
+                               std::vector<size_t> *slows = nullptr)
 {
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(in.target2);
+    const auto decline = [&](uint8_t pass_short, uint8_t fail_near) {
+        /* #56: with a slow tier, a declined guard JUMPS there (the helper
+         * runs the interpreter core); without one, the old bail. */
+        if (slows)
+            slows->push_back(e.j32(fail_near));
+        else
+            e.bail_unless(pass_short, pc);
+    };
     e.load(RAX, base.type);                  /* base an array? */
     e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
     e.cmp_rax_r9();
-    e.bail_unless(0x74, pc);                 /* je (== t_arr) */
+    decline(0x74, 0x75);                     /* je (== t_arr) */
     e.cmp_byte_rdi(base.payload + L.slice_off, 0);   /* not a slice? */
-    e.bail_unless(0x74, pc);                 /* je (slice==0) */
+    decline(0x74, 0x75);                     /* je (slice==0) */
     e.load(RAX, base.payload);               /* rax = shobj ptr */
     e.cmp_byte_rax(L.kind_off, L.kind_ints);
     const size_t j_ints = e.j32(0x74);       /* je -> the 8-byte path */
     e.cmp_byte_rax(L.kind_off, L.kind_bools);
-    e.bail_unless(0x74, pc);                 /* je (bools) else BAIL */
+    decline(0x74, 0x75);                     /* je (bools) else decline */
     /* flat bools: 1-byte elements, so the count is the raw pointer difference
      * (no sar) and the load is a movzx. */
-    emit_flat_int_tail(e, pc, /*bools=*/true, &in, -1);
+    emit_flat_int_tail(e, pc, /*bools=*/true, &in, -1, slows);
     const size_t j_done = e.j32(0xEB);
     /* flat ints */
     e.patch32_here(j_ints);
-    emit_flat_int_tail(e, pc, /*bools=*/false, &in, -1);
+    emit_flat_int_tail(e, pc, /*bools=*/false, &in, -1, slows);
     e.patch32_here(j_done);
 }
 
@@ -3044,21 +3064,28 @@ static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc)
  * int/bool array. ForStepElemInt must run every bail-able check BEFORE it
  * steps the counter - a bail re-runs the WHOLE op, and a post-step bail would
  * DOUBLE-STEP. Clobbers rax/r9. */
-static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc)
+static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc,
+                                std::vector<size_t> *slows = nullptr)
 {
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(base_slot);
+    const auto decline = [&](uint8_t pass_short, uint8_t fail_near) {
+        if (slows)
+            slows->push_back(e.j32(fail_near));   /* #56: -> the slow tier */
+        else
+            e.bail_unless(pass_short, pc);
+    };
     e.load(RAX, base.type);
     e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
     e.cmp_rax_r9();
-    e.bail_unless(0x74, pc);
+    decline(0x74, 0x75);
     e.cmp_byte_rdi(base.payload + L.slice_off, 0);
-    e.bail_unless(0x74, pc);
+    decline(0x74, 0x75);
     e.load(RAX, base.payload);
     e.cmp_byte_rax(L.kind_off, L.kind_ints);
     const size_t j_ok = e.j8(0x74);
     e.cmp_byte_rax(L.kind_off, L.kind_bools);
-    e.bail_unless(0x74, pc);
+    decline(0x74, 0x75);
     e.patch8(j_ok, e.pos());
 }
 
@@ -5516,8 +5543,18 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         const JitLayout &L = jit_layout();
         const bool up = in.aop == Op::lt || in.aop == Op::le;
         const SlotAddr base = slot_addr(in.b_dual_lo());
+        const auto off = [](int slot) {
+            return static_cast<int32_t>(static_cast<long>(slot)
+                                        * static_cast<long>(sizeof(LValue)));
+        };
+        /* #56: TWO slow tiers, because the gate must precede the step (a
+         * re-run would double-step): a GATE decline runs the FULL op in
+         * jit_for_step_elem (step + test + read, the interpreted body), a
+         * post-step READ decline (wrap/OOB/kind) runs jit_elem_int_value
+         * on the already-stepped counter. Neither bails -> deletable. */
+        std::vector<size_t> gate_slows, read_slows;
         e.bump_op(OpCode::ForStepElemInt);   /* before any loads (rax!) */
-        emit_elem_base_gate(e, in.b_dual_lo(), pc);
+        emit_elem_base_gate(e, in.b_dual_lo(), pc, &gate_slows);
         read_slot(e, RAX, in.target2);
         e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8);   /* inc/dec rax */
         write_slot(e, ck, RAX, in.target2, pc);
@@ -5528,12 +5565,15 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         e.load(RAX, base.payload);            /* rax = shobj */
         e.cmp_byte_rax(L.kind_off, L.kind_bools);
         const size_t j_bools = e.j32(0x74);
-        emit_flat_int_tail(e, pc, /*bools=*/false, nullptr, in.target2);
+        emit_flat_int_tail(e, pc, /*bools=*/false, nullptr, in.target2,
+                           &read_slows);
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_bools);
-        emit_flat_int_tail(e, pc, /*bools=*/true, nullptr, in.target2);
+        emit_flat_int_tail(e, pc, /*bools=*/true, nullptr, in.target2,
+                           &read_slows);
         e.patch32_here(j_done);
         write_slot(e, ck, RAX, in.b_dual_hi(), pc);
+        std::vector<size_t> j_takens;
         {
             const size_t tgt = static_cast<size_t>(in.target);
             if (tgt >= begin && tgt < end) {
@@ -5543,6 +5583,85 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             } else {
                 e.exit_pc(static_cast<uint32_t>(remap[in.target]));
             }
+        }
+        /* SLOW A - the post-step READ decline: the counter is already
+         * stepped and the branch is taken; read via the interpreter core,
+         * write the elem slot, then take the same branch. */
+        if (!read_slows.empty()) {
+            for (const size_t j : read_slows)
+                e.patch32_here(j);
+            read_slot(e, RAX, in.target2);           /* the stepped counter */
+            emit_call_prologue(e);
+            e.mov_rr(RSI, RAX);
+            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
+            e.lea_rdi(off(in.b_dual_lo()));
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_elem_int_value) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            e.u8(0x85); e.u8(0xC0);
+            {
+                const size_t j_ok = e.j8(0x74);
+                emit_exc_stamp(e, ck, old_pc);
+                e.exit_pc(pc);
+                e.patch8(j_ok, e.pos());
+            }
+            e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
+            e.u8(0x48); e.u8(0x8B); e.u8(0x00);      /* mov rax,[rax] */
+            write_slot(e, ck, RAX, in.b_dual_hi(), pc);
+            const size_t tgt = static_cast<size_t>(in.target);
+            if (tgt >= begin && tgt < end) {
+                e.u8(0xE9);
+                fixups.push_back({ e.pos(), tgt });
+                e.u32(0);
+            } else {
+                e.exit_pc(static_cast<uint32_t>(remap[in.target]));
+            }
+        }
+        /* SLOW B - the GATE decline (nothing stepped yet): the FULL op in
+         * jit_for_step_elem. 0 = fell through, 1 = taken (elem written),
+         * 2 = threw. */
+        if (!gate_slows.empty()) {
+            for (const size_t j : gate_slows)
+                e.patch32_here(j);
+            load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+            emit_call_prologue(e);
+            e.mov_rr(RSI, RAX);                      /* the bound VALUE */
+            e.movabs(RDI, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target2)));
+            e.movabs(RDX, static_cast<uint64_t>(static_cast<int>(in.aop)));
+            e.movabs(RCX, static_cast<uint64_t>(
+                              static_cast<int_type>(in.b_dual_lo())));
+            e.movabs_r8(static_cast<uint64_t>(
+                            static_cast<int_type>(in.b_dual_hi())));
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_for_step_elem) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            e.u8(0x83); e.u8(0xF8); e.u8(0x02);      /* cmp eax, 2 */
+            {
+                const size_t j_nothrow = e.j8(0x75);
+                emit_exc_stamp(e, ck, old_pc);
+                e.exit_pc(pc);
+                e.patch8(j_nothrow, e.pos());
+            }
+            e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+            j_takens.push_back(e.j32(0x75));         /* jnz -> taken */
+            const size_t j_ff = e.j32(0xEB);         /* jmp fall-through */
+            for (const size_t j : j_takens) {
+                e.patch32_here(j);
+                const size_t tgt = static_cast<size_t>(in.target);
+                if (tgt >= begin && tgt < end) {
+                    e.u8(0xE9);
+                    fixups.push_back({ e.pos(), tgt });
+                    e.u32(0);
+                } else {
+                    e.exit_pc(static_cast<uint32_t>(remap[in.target]));
+                }
+            }
+            e.patch32_here(j_ff);
         }
         e.patch32_here(j_fall);
         return;
@@ -5598,10 +5717,46 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::JumpUnlessElemInt: {
         /* E4 fusion `if (arr[i])`: read the element with the shared
-         * int-semantics path (flat ints or bools; a bail re-runs the op, an
-         * OOB raises with its caret) and jump to target when it is FALSE.
-         * Nothing is written - the fused temp was proven dead on both paths. */
-        emit_elem_int_read(e, in, pc);
+         * int-semantics path (flat ints or bools) and jump to target when
+         * it is FALSE. Nothing is written - the fused temp was proven dead
+         * on both paths. #56: every DECLINED shape (non-array/slice/
+         * general/wrong kind, negative wrap, OOB) calls jit_elem_int_value
+         * (the interpreter core, conveying) instead of bailing, so the op
+         * never re-interprets and its run's originals delete. Both paths
+         * CONVERGE with the value in rax before the branch. */
+        std::vector<size_t> slows;
+        emit_elem_int_read(e, in, pc, &slows);
+        const size_t j_conv = e.j32(0xEB);          /* jmp converge */
+        for (const size_t j : slows)
+            e.patch32_here(j);
+        {   /* slow: rdi = &slot[base], rsi = idx, rdx = &g_jit_elem_tmp
+             * (a file-static scratch - no rsp juggling inside the
+             * prologue's frame). The status/value convention mirrors the
+             * other conveying helpers: the epilogue runs FIRST (rax + the
+             * scratch survive it), then test / stamp / exit. */
+            const auto off = [](int slot) {
+                return static_cast<int32_t>(static_cast<long>(slot)
+                                            * static_cast<long>(sizeof(LValue)));
+            };
+            load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+            emit_call_prologue(e);
+            e.mov_rr(RSI, RAX);                     /* the index value */
+            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
+            e.lea_rdi(off(in.target2));             /* rdi = &slot[base] */
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_elem_int_value) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            e.u8(0x85); e.u8(0xC0);                 /* test eax, eax */
+            const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);          /* the op's own caret */
+            e.exit_pc(pc);                          /* threw -> re-raise */
+            e.patch8(j_ok, e.pos());
+            e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
+            e.u8(0x48); e.u8(0x8B); e.u8(0x00);     /* mov rax, [rax] */
+        }
+        e.patch32_here(j_conv);                     /* converge: */
         e.test_rax_rax();
         emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
                            static_cast<size_t>(in.target), begin, end,
@@ -5930,6 +6085,14 @@ static bool op_fully_native(const Instr &in)
      * caret; the exhausted/bound paths are fragment-local branches. */
     case OpCode::ForeachDynInit:
     case OpCode::ForeachDynNext:
+        return true;
+    /* #56: the #9 fusions - both keep their inline flat fast paths and
+     * route EVERY decline (base gate, kind, negative wrap, OOB) to a slow
+     * tier running the interpreter core (jit_elem_int_value; the gate
+     * decline of ForStepElemInt to the full-op jit_for_step_elem, since
+     * the gate precedes the step). Throws convey exc-stamped; no bail. */
+    case OpCode::JumpUnlessElemInt:
+    case OpCode::ForStepElemInt:
         return true;
     /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
      * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the

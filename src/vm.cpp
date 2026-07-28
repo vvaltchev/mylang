@@ -2583,6 +2583,72 @@ vm_load_elem_float_core(const EvalValue &base, int_type idx,
  * g_vm_jit_exc, anything else (the InternalErrorEx net) via g_vm_jit_eptr.
  * With these, LoadElemInt/LoadElemFloat never re-interpret - their runs'
  * originals are deletable. */
+/* #56: the ELEMENT-VALUE slow tier shared by the two #9 fusions - every
+ * shape their inline fast paths decline (a non-array/slice/general or
+ * wrong-kind base, a negative index needing the wrap, OOB) runs the
+ * interpreter's exact core and hands the scalar back; a throw CONVEYS
+ * (the fragment exc-stamps the op's caret), so neither fusion bails and
+ * their runs' originals delete. */
+/* #56: the fusions' slow-tier scratch (single-threaded; written by the
+ * helper, read by the emitted code immediately after - no lifetime span). */
+int_type g_jit_elem_tmp = 0;
+
+extern "C" int jit_elem_int_value(LValue *base_lv, int_type idx,
+                                  int_type *out) noexcept
+{
+    try {
+        *out = vm_load_elem_int_core(base_lv->get(), idx, nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/* #56: the FULL-OP slow tier for ForStepElemInt, used when the base GATE
+ * declines BEFORE the counter is stepped (the gate must precede the step -
+ * a bail would double-step). Runs the interpreted op's exact body: step,
+ * test, and on a taken branch the element read into `elem_slot`.
+ * Returns 0 = not taken (fall through), 1 = taken (elem written),
+ * 2 = threw (conveyed). */
+extern "C" int jit_for_step_elem(int_type i_slot, int_type bound, int aop_i,
+                                 int_type base_slot,
+                                 int_type elem_slot) noexcept
+{
+    EvalContext *ctx = g_current_ctx;
+    const Op aop = static_cast<Op>(aop_i);
+    LValue &ilv = ctx->frame->at(i_slot);
+    int_type i = ilv.getval<int_type>();
+    i = (aop == Op::lt || aop == Op::le) ? i + 1 : i - 1;
+    ilv.getval<int_type>() = i;
+
+    bool go;
+    switch (aop) {
+    case Op::lt: go = i <  bound; break;
+    case Op::le: go = i <= bound; break;
+    case Op::ge: go = i >= bound; break;
+    default:     go = i >  bound; break;   /* gt */
+    }
+    if (!go)
+        return 0;
+
+    try {
+        const int_type v = vm_load_elem_int_core(
+            ctx->frame->at(base_slot).get(), i, nullptr, 0);
+        write_int_slot(ctx, elem_slot, v);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    return 1;
+}
+
 extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
                                  LValue *dst) noexcept
 {

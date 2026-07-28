@@ -14792,16 +14792,21 @@ static bool jit_delete_originals()
     if (en_off || io_off == 0)          return false;   /* off: ops present */
     if (!en_on || io_on >= io_off)      return false;   /* on: deleted */
 
-    /* An array-read loop is NOT deletable (LoadElem's slice/kind bail
-     * re-interprets), so it keeps its interpreted ops even JIT-on. */
+    /* An array-read loop IS deletable since #56: LoadElem and the #9
+     * fusions route every declined shape (slice/kind/wrap/OOB) to a slow
+     * tier running the interpreter core instead of bailing, so nothing
+     * re-interprets - JIT-on drops the int ops exactly like a pure-int
+     * loop (JIT-off keeps them). */
     const std::vector<const char *> arr = {
         "var a = [1, 2, 3, 4, 5];",
         "var s = 0;",
         "for (var i = 0; i < 5; i++) { s = s + a[i] + i * i; }",
         "print(s);" };
-    bool en_a = false; size_t io_a = 0;
+    bool en_a = false, en_a_off = false; size_t io_a = 0, io_a_off = 0;
+    if (!compile_loop(arr, false, en_a_off, io_a_off)) return false;
     if (!compile_loop(arr, true, en_a, io_a)) return false;
-    if (!en_a || io_a == 0) return false;   /* native, but ops KEPT (not deletable) */
+    if (en_a_off || io_a_off == 0)   return false;   /* off: ops present */
+    if (!en_a || io_a >= io_a_off)   return false;   /* on: DELETED */
 
     /* A `k - i` (imm - reg) loop: the generic non-throwing IntBin path. `0 - i`
      * stays a GENERIC IntBin (no imm-reg specialized shape; subtraction can't
