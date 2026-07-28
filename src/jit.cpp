@@ -1942,6 +1942,13 @@ static void emit_nstack_switch_post(Emitter &e)
     e.u8(0x4C); e.u8(0x89); e.u8(0x09);               /* mov [rcx], r9 */
 }
 
+/* #56 step 3: the CURRENT chunk's entry_remap, visible to
+ * emit_sync_call_inline so it can bake the call's POST-CALL entry-stub pc
+ * (the SWITCH record's resume). Set around the fragment-emission loop in
+ * jit_compile_chunk; the compiler is single-threaded and non-reentrant
+ * (the disasm replay runs sequentially), so a file-static is safe. */
+static const std::vector<int> *g_cur_entry_remap = nullptr;
+
 static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                   const Instr &in, uint32_t pc,
                                   size_t old_pc, bool is_value,
@@ -2005,12 +2012,26 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * stacked one un-capped C frame per level - a stack overflow the
      * clang-ASan lane caught (sanitized vm_dispatch frames are ~77KB). */
     e.u8(0x48); e.u8(0x83); e.u8(0xF8); e.u8(0xFF); /* cmp rax, -1 */
-    const size_t j_notsent = e.j32(0x75);          /* jne cold */
+    const size_t j_notsent = e.j32(0x75);          /* jne notsent */
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x09);                        /* dec dword [rcx] */
     const size_t j_done1 = e.j32(0xEB);            /* jmp done */
+    e.patch32_here(j_notsent);                     /* notsent: */
+    /* #56 step 3: the callee returned JIT_RET_SWITCH (a deeper capped sync
+     * call was pushed interpreted-flat). Our C frame dies too; balance the
+     * depth (the flat continuation is uncounted by design) and propagate -
+     * the record chain re-enters this fragment at OUR post-call stub. */
+    e.u8(0x48); e.u8(0x83); e.u8(0xF8); e.u8(0xFD); /* cmp rax, -3 */
+    {
+        const size_t j_nsw = e.j32(0x75);          /* jne cold */
+        e.movabs(RCX, depth_addr);
+        e.u8(0xFF); e.u8(0x09);                    /* dec dword [rcx] */
+        emit_call_epilogue(e);
+        e.movabs(RAX, static_cast<uint64_t>(-3));
+        e.u8(0xC3);                                /* ret (propagate) */
+        e.patch32_here(j_nsw);
+    }
     /* cold: the shared post-exit (raise/continuation/pending) */
-    e.patch32_here(j_notsent);
     e.mov_rr(RDI, RAX);
     e.movabs(RSI, site);
     e.call_relocs.push_back(
@@ -2030,8 +2051,15 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     for (const size_t j : j_slows)
         e.patch32_here(j);
     e.movabs(RDI, static_cast<uint64_t>(callee_arg));
-    e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
-    e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+    /* #56 step 3: argbase|nargs<<32 packed into ONE arg; the freed reg
+     * carries the POST-CALL entry-stub pc (the SWITCH record's resume). */
+    e.movabs(RSI, static_cast<uint64_t>(
+                      static_cast<uint64_t>(in.a_lit())
+                      | (static_cast<uint64_t>(in.b_lit()) << 32)));
+    e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(
+                      g_cur_entry_remap
+                          ? (*g_cur_entry_remap)[old_pc + 1]
+                          : static_cast<int>(pc) + 1)));
     e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
     e.movabs_r8(site);
     {
@@ -2044,6 +2072,17 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.u8(0xE8); e.u32(0);
     e.u8(0x85); e.u8(0xC0);                        /* test eax, eax */
     const size_t j_done3 = e.j32(0x74);            /* jz done */
+    /* status 3 = SWITCH: the callee was pushed interpreted-flat; this
+     * fragment returns JIT_RET_SWITCH - its consumer drives the callee and
+     * the record's baked resume re-enters us at the post-call stub. */
+    e.u8(0x83); e.u8(0xF8); e.u8(0x03);            /* cmp eax, 3 */
+    {
+        const size_t j_sw = e.j32(0x75);           /* jne exc_path */
+        emit_call_epilogue(e);
+        e.movabs(RAX, static_cast<uint64_t>(-3));  /* JIT_RET_SWITCH */
+        e.u8(0xC3);                                /* ret */
+        e.patch32_here(j_sw);
+    }
     emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56 step 1) */
     emit_call_epilogue(e);
     e.exit_pc(pc);
@@ -5858,6 +5897,15 @@ static bool op_fully_native(const Instr &in)
     case OpCode::CallBuiltinLVElem:
     case OpCode::CallBuiltinLVMember:
         return true;
+    /* #56 step 4: the sync CALLS - every decline is gone (errors convey
+     * with baked/stamped carets; the chunk-less callee runs as a boundary
+     * call IN the helper; the depth cap SWITCHES interpreted-flat with the
+     * record resuming at the post-call stub). NEVER op_never_exits (they
+     * exit by convey/switch - not leaf-safe). */
+    case OpCode::CallV:
+    case OpCode::CachedCallV:
+    case OpCode::CallValueV:
+        return true;
     /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
      * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the
      * exc-stamp instead of the g_vm_jit_raise signal (whose exception got
@@ -6530,8 +6578,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             return false;
         };
         for (size_t r = 0; r < runs.size(); r++) {
-            if (deletable[r])
-                continue;
+            /* #56 step 4: DELETABLE runs get post-call stubs too - the
+             * SWITCH protocol's records resume there (a stub is the ONLY
+             * pc emitted inside a deleted span). */
             for (size_t p = runs[r].begin; p + 1 < runs[r].end; p++) {
                 const OpCode op = chunk.code[p].op;
                 if (op == OpCode::CallV || op == OpCode::CachedCallV
@@ -6589,7 +6638,17 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 if (deletable[r]) {
                     for (size_t p = b; p < en; p++) {
                         remap[p] = en_pc;         /* all -> EnterNative */
-                        entry_remap[p] = en_pc;
+                        if (pe < entries.size()
+                                && entries[pe].first == p) {
+                            /* #56 step 4: a post-call resume STUB - the
+                             * only pc materialized in a deleted span
+                             * (bails don't exist here; only the SWITCH
+                             * record's ret_pc lands on it). */
+                            entry_remap[p] = np++;
+                            pe++;
+                        } else {
+                            entry_remap[p] = en_pc;
+                        }
                     }
                 } else {
                     for (size_t p = b; p < en; p++) {
@@ -6618,6 +6677,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         }
     }
 
+    g_cur_entry_remap = &entry_remap;   /* #56: the emits bake resume pcs */
     /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
      * across the loop - no op clobbers it - so the native back edge, a
      * jump to label[begin] AFTER this movabs, keeps it live); record each
@@ -6778,7 +6838,27 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 const bool del = deletable[r];
                 const size_t rend = runs[r].end;
                 r++;
-                if (del) { pc = rend; continue; }  /* drop the originals */
+                if (del) {
+                    /* #56 step 4: the originals drop, but any post-call
+                     * resume STUBS inside the span materialize (the SWITCH
+                     * records' ret_pcs land on them; nothing else does). */
+                    const size_t rb = pc;
+                    for (pc = rb; pc < rend; pc++) {
+                        if (pe < entries.size() && pc == entries[pe].first) {
+                            Instr sen;
+                            sen.op = OpCode::EnterNative;
+                            Operand soff;
+                            soff.is_lit = true;
+                            soff.lit_kind = Operand::LitKind::i;
+                            soff.lit =
+                                static_cast<int_type>(entries[pe].second);
+                            sen.set_a(soff);
+                            nc.push_back(sen);
+                            pe++;
+                        }
+                    }
+                    continue;
+                }
             }
             /* an interior entry pc: the EnterNative (its stub) sits
              * BEFORE the original - branch targets/ret_pcs land on it,
@@ -6837,6 +6917,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &ic : chunk.inline_ctxs)
         ic.pc = static_cast<uint32_t>(remap[ic.pc]);
+
+    g_cur_entry_remap = nullptr;        /* #56: emission done */
 
     /* Trampoline pool (out-of-line, one per DISTINCT libm fn): the rare
      * rel32-out-of-range fallback for a call (and the arm64-style veneer a

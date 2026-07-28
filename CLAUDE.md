@@ -802,6 +802,36 @@ DIVISOR `z[0]`, the tree-walker the whole `x / z[0]` chain - FIXED
 (#76, next paragraph). Ir neutral (13/34/47 +-0.00%). Corpus:
 45 -> 41 kept runs. Remaining blockers: the calls (38),
 Catch/Reraise/Throw (12), StructFieldAddInt (5), MultiUnpackV (3).
+**Steps 2-4 - the CALLS are deletable (2026-07-28,
+plans/model-flip.md "The CALLS deletability design"):** every sync-call
+decline is gone. The chunk-less callee (the old AOT-net bail) first
+LAZY-tries vm_func_chunk (the interpreted op's own net) then runs the
+BOUNDARY call inside the helper (jit_sync_boundary_call - the
+interpreted tail verbatim, the pending conversion stamping the baked
+site). Past the DEPTH CAP the call SWITCHES interpreted-flat
+(jit_call_sync_switch): the interpreted op's exact in-VM push with
+`rec.ret_pc` = the call's POST-CALL ENTRY-STUB pc (baked by the emit
+via the per-chunk `g_cur_entry_remap`) + the resume globals -> status 3
+-> the emitted site returns **JIT_RET_SWITCH ((size_t)-3)**; consumers:
+EnterNative (switch chunk/pc - ZERO new C frames, the interpreted-call
+shape), the inline call-rdx site + the core's direct branch (dec depth
++ PROPAGATE -3 - their C frames die; the record chain re-enters each
+fragment at its own stub), vm_invoke_postexit (branch on -3 FIRST).
+g_jit_sync_depth is untouched by a switch (the continuation is FLAT).
+Backtrace: `VmCallRec::call_site_packed` (the baked site; zeroed by
+both interpreted setups, gated on !sync_stop so an emitted-M5b-push
+record can't leak a stale value) preferred by vm_capture_rec_frame - a
+deleted run's loc_at(ret_pc-1) would resolve against collapsed pcs.
+Classification: the three call ops are op_fully_native (NEVER
+op_never_exits); post-call entry STUBS now materialize INSIDE deleted
+spans (the only pcs there - the entries/dual-remap/rebuild
+generalization), so a call loop's chunk is enter.nat + stub enter.nats
+and `call.v` is GONE from -vd (the pin updated). Execution-proven:
+g_jit_sync_switch (the cap-4 mutual-recursion + deep-throw test) +
+g_jit_sync_boundary_call. Corpus: 41 -> **27 kept runs**; call benches
+Ir -0.0-0.4%. Remaining: Catch/Reraise/Throw (12), StructFieldAddInt
+(5), MultiUnpackV (3), LoadMemberInt/Float guard-miss carets (3),
+JumpUnlessElemInt (3), MapFilterV (2), the inline-raise guard (5).
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat
