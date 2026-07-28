@@ -1504,3 +1504,22 @@ missed -3 consumer (add a guard in jit_sync_postexit); parked-key
 hygiene (defensive clear); pin caps before target chunks compile in
 tests. Expected end state: corpus kept runs 41 -> ~5 (exceptions +
 MultiUnpackV remain).
+
+## Calls step 1 LANDED (2026-07-28) - the error declines convey
+
+D2/D5 (undefined callee): UndefinedVariableEx constructed WITH the baked
+callee caret (the new `lep` = &chunk.locs[i] sixth helper arg) -> the
+g_vm_jit_eptr channel; D3/D6/D8 (non-callable): NotCallableEx ->
+g_vm_jit_exc + the slow tail's new emit_exc_stamp; D10 (setup throws:
+arity/bind-coerce/StackOverflow): the core's catch conveys (Runtime ->
+exc, plain -> eptr) instead of declining. The #55 direct-call null
+branch gained the exc-stamp too. Status protocol: 2 = conveyed (the
+existing EnterNative flag dispatch); 1 = decline remains ONLY for the
+depth cap (D1/D4/D7) and the chunk-less net (D9) until the SWITCH step.
+Parity: undefined/not-callable/arity/value-callee errors byte-identical
+vm == jit-off == tw (except a PRE-EXISTING VM-wide gap, verified at
+HEAD: an uncaught PLAIN exception thrown mid-call-stack renders NO
+backtrace under the VM while the tree-walker prints frames - the plain-
+exception unwind never captured in-VM record frames; a #75-class
+follow-up, untracked). 10_recursion_deep Ir neutral (the lep movabs is
+cold-path only).
