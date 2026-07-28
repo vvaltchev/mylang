@@ -1453,3 +1453,54 @@ a throwing sort-comparator's div0 caret diverges between engines (VM =
 the divisor operand, tw = the whole chain) - a tw stamp-granularity
 item, untracked. Remaining: calls 38 (needs the EnterNative-performs-
 the-call design), exceptions 12, StructFieldAddInt 5, MultiUnpackV 3.
+
+## The CALLS deletability design (#56; agent-planned 2026-07-28, steps 1-4)
+
+Decline inventory (all `return 1` in vm.cpp; the emitted sequence itself
+never bails): D1/D4/D7 = the depth cap (jit_call_sync/_cached/_value
+heads); D2/D5 = undefined global callee; D3/D6/D8 = non-callable callee;
+D9 = chunk-less callee (core; NOTE the helper never tries the lazy
+vm_func_chunk the interpreted op does); D10 = a vm_frame_setup throw
+(arity/bind-coerce/StackOverflow). Plus the #55 direct native_leaf CallV
+(already conveys, loc-less) and the compile-time unarmed self-recursion
+gate (not a decline; sanitized builds just delete fewer runs).
+
+Mechanisms:
+1. ERRORS (D2/3/5/6/8/10 + #55 stamp) -> CONVEY: NotCallable/arity/
+   StackOverflow are RuntimeExceptions -> g_vm_jit_exc + emit-side
+   exc-stamp; UndefinedVariableEx is PLAIN -> construct with the baked
+   callee caret (a locs-entry pointer arg) + g_vm_jit_eptr (rethrown
+   uncatchable at EnterNative - the LoadGlobalV precedent). Bind throws
+   record no callee frame interpreted -> same conveyed (parity).
+2. D9 -> the helper first LAZY-tries vm_func_chunk (the interpreted op's
+   own net), then PERFORMS the boundary call itself (vm_call_func /
+   vm_cached_call with null chunk - the interpreted op's tail verbatim),
+   converting g_vm_exc_pending with the baked site (the code already in
+   the core's pending block); catch(...) -> eptr net.
+3. D1/D4/D7 (the cap) -> the new resume status JIT_RET_SWITCH
+   ((size_t)-3): the helper does the interpreted op's own in-VM FLAT push
+   (vm_frame_setup with ret_pc = the baked post-call ENTRY-STUB pc via
+   entry_remap[old_pc+1]; CachedCallV probes the cache first, the miss
+   key rides rec.cache_key) and returns -3; consumers: EnterNative
+   (switch chunk/pc, ZERO new C frames - the flat interpreted-call
+   shape), the inline call-rdx site + the core's direct branch (one
+   TRANSIENT dispatch frame at the cap transition via a shared
+   jit_sync_dispatch_switch), vm_invoke_postexit (branch on -3 BEFORE
+   pc-interpretation; VmInvoker's sentinel ML_CHECK stays valid). C-stack
+   bound unchanged (cap x per-level frames + O(1)). Backtrace caret: a
+   deleted run's loc_at(ret_pc-1) collapses -> VmCallRec gains a packed
+   `call_site` (baked site_packed; zeroed in vm_frame_setup*, gated
+   !sync_stop) preferred by vm_capture_rec_frame.
+4. Classification: op_fully_native += the three calls (NEVER
+   op_never_exits); generalize the entries/dual-remap/rebuild so stubs
+   emit INSIDE deleted runs; thread entry_remap into emit_sync_call_
+   inline; jit_call_value_generic keeps the old bail via a core mode
+   flag (CallValueGenericV migrates later).
+
+Risks recorded: VmCallRec::call_site staleness on record reuse (zero on
+push + !sync_stop gate + a reuse backtrace test); two extra stores on
+the hot interpreted call path (callgrind 10_recursion_deep gate); a
+missed -3 consumer (add a guard in jit_sync_postexit); parked-key
+hygiene (defensive clear); pin caps before target chunks compile in
+tests. Expected end state: corpus kept runs 41 -> ~5 (exceptions +
+MultiUnpackV remain).
