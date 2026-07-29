@@ -1566,3 +1566,20 @@ IDEAS SAVED for that redesign (maintainer deferred it 2026-07-28):
    clause matched" tail of the same chain.
 Prerequisite for both: the handler-table data must be built at codegen
 (it exists implicitly in PushHandler's target + the CatchTest chain).
+
+## Delete-originals: the FINAL batch (2026-07-28) - corpus 58 -> 7
+
+EmplaceStruct / MakeStructArrayV / UnpackElem{Int,Float,Value,Targets}
+classified fully-native (exc-stamps + eptr nets; their carets already
+pooled). The inline-raise guard relaxed to "DISTINCT chains" - one
+chain in a run is harmless (all entries remap to the head EnterNative
+with the same index; inline_frame_at finds the right one), which is the
+common one-inlined-body-per-run shape.
+
+Corpus history: 58 (audit baseline) -> 45 (LoadElem) -> 41 (LV family)
+-> 27 (calls) -> 22 (small batch) -> 20 (ForeachDyn) -> 16 (#9 fusions)
+-> 15 (native throw) -> **7**. The residue is EXACTLY the deferred
+catch-dispatch work: 5 CatchTest + 4 Reraise + 1 EndFinally (its cold
+reraise bails) + 2 runs with genuinely distinct inline chains. See "The
+native throw + the CATCH-DISPATCH redesign (deferred)" above for the
+saved design ideas.

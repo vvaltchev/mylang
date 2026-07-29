@@ -3132,6 +3132,11 @@ extern "C" int jit_make_struct_array(const void *defv, int_type base,
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (#56 - the noexcept would
+         * std::terminate otherwise) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
     }
     return 0;
 }
@@ -3832,6 +3837,11 @@ extern "C" int jit_emplace_struct(int_type dst, int_type base_slot,
         ctx->frame->at(dst).put(vm_do_emplace(*ctx, site, target, run_base));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (#56 - the noexcept would
+         * std::terminate otherwise) */
+        g_vm_jit_eptr = std::current_exception();
         return 1;
     }
     return 0;
