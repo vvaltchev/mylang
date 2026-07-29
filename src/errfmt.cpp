@@ -58,6 +58,13 @@ dump_loc_in_error(ostream &o, const Exception &e,
               << ", col " << e.loc_end.col - 1;
     }
 
+    /* .myv --strip-source: no source text, so print the located header
+     * only - the caret block needs the LINE, which a Loc cannot supply. */
+    if (lines.empty()) {
+        o << "\n";
+        return;
+    }
+
     o << "\n\n";
 
     for (int ln = e.loc_start.line;

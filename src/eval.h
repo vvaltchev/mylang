@@ -349,6 +349,10 @@ LValue &builtin_slot(int index);
  * entry (a Builtin function OR a value like `argv`). For the
  * disassembler's `load.builtin` annotation. */
 std::string_view builtin_slot_name(int index);
+/* .myv: a fingerprint of the builtin SET - a stored image's baked builtin
+ * SLOT indices are only valid for the same set (see types.cpp). */
+uint64_t builtin_set_fingerprint();
+
 /* did the builtin come from const_builtins (visible during const-eval)? */
 bool builtin_is_const(int index);
 

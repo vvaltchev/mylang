@@ -13,6 +13,7 @@
 #include "errfmt.h"
 #include "trace.h"
 #include "vm.h"
+#include "serialize.h"
 #include "jit.h"
 #include "disasm.h"
 
@@ -41,6 +42,11 @@ static bool opt_repl;
 static bool opt_vm;   /* -vm: explicit VM (the DEFAULT since 2026-07-18) */
 static bool opt_tw;   /* -tw: run via the TREE-WALKER instead of the VM */
 static bool opt_vm_disasm;   /* -vd: print the bytecode disassembly, no run */
+static bool opt_compile;     /* -c: write a .myv image, then exit (no run) */
+static bool opt_strip_source;/* -c --strip-source: omit the embedded source */
+static string opt_out_path;  /* -o <path> (default: the source's .myv twin) */
+static string opt_script_path;   /* the FILE argument (source or image) */
+static bool opt_run_image;       /* the file argument is a .myv image */
 
 static std::vector<string> lines;
 static std::vector<Tok> tokens;
@@ -218,6 +224,24 @@ parse_args(int argc, char **argv)
             opt_inline_threshold = atoi(argv[1]);
             argc--; argv++;   /* consume the value; the loop skips it too */
 
+        } else if (!strcmp(arg, "-c")) {
+
+            /* .myv: compile to stored bytecode and EXIT (implies the VM) */
+            opt_compile = true;
+
+        } else if (!strcmp(arg, "-o")) {
+
+            if (argc < 2) {
+                cout << "-o requires an output path" << endl;
+                exit(1);
+            }
+            opt_out_path = argv[1];
+            argc--; argv++;
+
+        } else if (!strcmp(arg, "--strip-source")) {
+
+            opt_strip_source = true;
+
         } else if (!strcmp(arg, "-nr")) {
 
             opt_no_run = true;
@@ -317,7 +341,38 @@ parse_args(int argc, char **argv)
 
         } else {
 
-            read_script(arg);
+            /* .myv: an IMAGE is detected by CONTENT (magic), not extension -
+             * it is loaded, not parsed (no source, no optimizer passes). */
+            opt_script_path = arg;
+            if (myv_is_image(arg))
+                opt_run_image = true;
+            else
+                read_script(arg);
+
+            /* Under -c the remaining args are the COMPILER's, not the
+             * script's (there is no run): `mylang -c file.my -o out.myv
+             * [--strip-source]`, the documented form. */
+            if (opt_compile) {
+                /* register `argv` (empty) FIRST: it is a builtin, and the
+                 * builtin SET decides every baked builtin slot - a compile
+                 * must see exactly what a run sees. */
+                EvalContext::builtins.emplace(
+                    make_pair(UniqueId::get("argv"),
+                              LValue(SharedArrayObj(
+                                         SharedArrayObj::vec_type()), true)));
+                for (int i = 1; i < argc; i++) {
+                    if (!strcmp(argv[i], "-o") && i + 1 < argc)
+                        opt_out_path = argv[++i];
+                    else if (!strcmp(argv[i], "--strip-source"))
+                        opt_strip_source = true;
+                    else {
+                        cout << "unexpected argument after -c: "
+                             << argv[i] << endl;
+                        exit(1);
+                    }
+                }
+                return;
+            }
 
             SharedArrayObj::vec_type vec;
 
@@ -374,6 +429,22 @@ int main(int argc, char **argv)
 
         if (opt_repl)
             return run_repl();
+
+        if (opt_run_image) {
+            /* .myv: LOAD AND GO - no lexer, no parser, no optimizer passes.
+             * The AOT native tier runs inside the loader (only the VM image
+             * is stored). `prog` is declared outside the try for the same
+             * reason a compiled one is: exception payloads and lazy
+             * backtrace frames reference its defs/descriptors. */
+            g_exec_engine = ExecEngine::Vm;
+            prog = myv_read(opt_script_path, lines);
+            if (opt_vm_disasm) {
+                cout << disassemble_image(prog);
+                return 0;
+            }
+            vm_run(prog);
+            return 0;
+        }
 
         ParseContext ctx(TokenStream(tokens), !opt_no_const_eval);
 
@@ -485,6 +556,31 @@ int main(int argc, char **argv)
              * plans/bytecode-vm.md. g_exec_engine tells do_func_call to
              * run function bodies via the VM too, not just the top-level
              * chunk. */
+            if (opt_compile) {
+                /* .myv (plans/myv-serializer.md): the full pipeline, then
+                 * SERIALIZE and exit - no execution. Only the VM image is
+                 * stored; the native tier re-runs at load. */
+                g_exec_engine = ExecEngine::Vm;
+                prog = vm_compile(root.get(), /*jit=*/false);
+                string out = opt_out_path;
+                if (out.empty()) {
+                    out = opt_script_path;
+                    const size_t dot = out.find_last_of('.');
+                    const size_t slash = out.find_last_of('/');
+                    if (dot != string::npos
+                            && (slash == string::npos || dot > slash))
+                        out = out.substr(0, dot);
+                    out += ".myv";
+                }
+                string src_text;
+                if (!opt_strip_source)
+                    for (size_t i = 0; i < lines.size(); i++) {
+                        if (i) src_text += '\n';
+                        src_text += lines[i];
+                    }
+                myv_write(prog, out, src_text);
+                return 0;
+            }
             if (!opt_tw) {
                 g_exec_engine = ExecEngine::Vm;
                 prog = vm_compile(root.get());

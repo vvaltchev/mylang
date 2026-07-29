@@ -4,6 +4,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 
 #ifdef TESTS
@@ -27,6 +28,7 @@
 #include "vm.h"
 #include "jit.h"
 #include "codegen.h"
+#include "serialize.h"
 #include "disasm.h"
 
 #include <typeinfo>
@@ -15537,6 +15539,114 @@ static bool dyn_foreach_fast_shapes()
  * boundary: an inlined chain spliced as a UNIT (one chain in the run)
  * deletes and still renders its virtual frames, so a backtrace through
  * it must be byte-identical to the tree-walker's. */
+/* .myv (plans/myv-serializer.md): the stored-bytecode ROUND TRIP -
+ * compile a program to an image, load it back, and require BOTH the
+ * disassembly (the design's oracle) and the executed result to match the
+ * in-memory compile. Also pins determinism (two compiles are byte-
+ * identical) and the corrupt-file refusal. */
+static bool myv_round_trip()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; int y; }",
+        "func dist2(P p) { return p.x * p.x + p.y * p.y; }",
+        "func mk(int n) { return P(n, n + 1); }",
+        "var pts = [];",
+        "for (var i = 0; i < 5; i++) { append(pts, mk(i)); }",
+        "var s = 0;",
+        "foreach (var p in pts) { s += dist2(p); }",
+        "var d = { \"a\": 1 };",
+        "var t = 0;",
+        "try { throw P(1, 2); } catch (P as e) { t = e.y; }",
+        "print(s, t, d[\"a\"], len(pts));" };
+
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = false;
+    const std::string path = "/tmp/mylang-myv-test.myv";
+    const std::string path2 = "/tmp/mylang-myv-test2.myv";
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+
+        /* ONE compile: vm_compile MOVES the descriptors/defs out of the
+         * AST, so it is not repeatable on the same tree. Write FIRST (the
+         * image stores PRE-jit bytecode), then run the load-time tier on
+         * the same program to get the comparable dump. */
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        myv_write(prog, path, src);
+        myv_write(prog, path2, src);            /* determinism */
+        vm_jit_loaded_image(prog);              /* the tier a load runs */
+        const std::string dump_mem = disassemble_image(prog);
+
+        std::ifstream f1(path, std::ios::binary), f2(path2, std::ios::binary);
+        const std::string b1((std::istreambuf_iterator<char>(f1)),
+                             std::istreambuf_iterator<char>());
+        const std::string b2((std::istreambuf_iterator<char>(f2)),
+                             std::istreambuf_iterator<char>());
+        if (b1 != b2) {
+            fprintf(stderr, "myv: two compiles are NOT byte-identical\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        if (!myv_is_image(path)) {
+            g_exec_engine = saved;
+            return false;
+        }
+
+        std::vector<std::string> img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        const std::string dump_img = disassemble_image(loaded);
+        if (dump_mem != dump_img) {
+            fprintf(stderr, "myv: the loaded image's disassembly DIFFERS\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        if (img_src.size() != sizeof(lines_arr) / sizeof(lines_arr[0])) {
+            fprintf(stderr, "myv: the embedded source did not round-trip\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        vm_run(loaded);                         /* it must RUN */
+        ok = true;
+    } catch (...) {
+        ok = false;
+    }
+    g_exec_engine = saved;
+
+    /* a truncated image is refused with a clean error, never UB */
+    if (ok) {
+        std::ofstream bad(path2, std::ios::binary | std::ios::trunc);
+        bad << "MYLV" << std::string(16, '\0');
+        bad.close();
+        bool refused = false;
+        try {
+            std::vector<std::string> s2;
+            VmProgram p3 = myv_read(path2, s2);
+            (void)p3;
+        } catch (const Exception &) {
+            refused = true;
+        }
+        if (!refused) {
+            fprintf(stderr, "myv: a corrupt image was NOT refused\n");
+            ok = false;
+        }
+    }
+    remove(path.c_str());
+    remove(path2.c_str());
+    return ok;
+}
+
 static bool jit_final_batch_deletable()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -18706,6 +18816,8 @@ static const std::vector<extra_check> extra_checks =
       jit_native_throw },
     { "jit: struct/unpack builders + relaxed inline guard (#56 final)",
       jit_final_batch_deletable },
+    { "myv: stored-bytecode round trip (dump + run + determinism)",
+      myv_round_trip },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",

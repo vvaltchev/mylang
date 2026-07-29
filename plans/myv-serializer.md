@@ -1,6 +1,18 @@
 # The `.myv` serializer — stored bytecode (design, 2026-07-18)
 
-Status: DESIGNED, not started. This is the endgame artifact the whole
+Status: **IMPLEMENTED (v1, 2026-07-28)** - `-c` writes, a magic-sniffed
+file argument loads and runs, `-vd` dumps a loaded image, the round-trip
+oracle + determinism + corrupt-file refusal are pinned by `-rt`
+(`myv_round_trip`). See CLAUDE.md's ".myv STORED-BYTECODE FORMAT" for the
+implementation shape. Deltas from this design: the section TOC was not
+needed (a linear reader suffices at these sizes); a BUILTIN-SET
+FINGERPRINT was ADDED after finding that builtin slot indices were
+pointer-ordered (fixed by sorting the table by name); `slot_names` is
+stored unconditionally (it keeps `-vd` faithful and costs little).
+Remaining v1 residual: 2 of 83 corpus dumps differ only in a const dict's
+printed entry ORDER (unordered by spec).
+
+Original status: DESIGNED, not started. This is the endgame artifact the whole
 zero-AST campaign built toward (`[[vm-endgame]]`): `mylang -c file.my`
 writes a binary the interpreter runs with NO source, NO parse, NO
 optimizer passes — load and go. Every prerequisite is proven: the

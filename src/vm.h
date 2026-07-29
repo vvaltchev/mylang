@@ -41,6 +41,18 @@ extern std::unique_ptr<RuntimeException> g_vm_exc_pending;
  * native-call gate sees every callee's native_leaf flag - #55 STEP 2). */
 const Chunk *vm_func_chunk(const FuncDescriptor *fdesc, bool jit = true);
 
+/* .myv LOAD (plans/myv-serializer.md): install a deserialized chunk as a
+ * descriptor's body - the loader's equivalent of what vm_precompile_all
+ * does for a fresh compile (own the chunk, stamp vm_chunk/vm_chunk_tried).
+ * The AOT native tier is (re-)run here too: only the VM image is stored. */
+void vm_install_func_chunk(const FuncDescriptor *fdesc, Chunk &&ck);
+
+
+
+/* .myv LOAD: re-resolve a builtin by NAME against the singleton table
+ * (a stored image names its builtins; an unknown name is refused). */
+bool vm_lookup_builtin(const UniqueId *name, Builtin &out);
+
 /*
  * Drive a chunk against `ctx` (a function body's args context, or main). Runs
  * until Halt or an in-flight `return`; the caller reads ctx->flow->value.
@@ -152,6 +164,10 @@ struct VmProgram {
     Chunk root;
     int root_slot_count = 0;
     std::vector<const UniqueId *> global_func_names;
+    /* the root block's per-global-slot "may be reassigned" flags - the
+     * native-call gate reads them, so a .myv carries them (else a loaded
+     * image could not rebuild the same native tier). */
+    std::vector<char> global_slot_reassigned;
     std::vector<std::unique_ptr<FuncDescriptor>> funcs;
     std::vector<std::unique_ptr<StructTypeDef>> structs;
 };
@@ -174,7 +190,16 @@ struct VmProgram {
  * teardown proof in mylang.cpp). vm_execute = compile + run (the -rt
  * harness's path, AST retained for the differential oracle).
  */
-VmProgram vm_compile(const Construct *root);
+/* `jit` false: skip the native AOT tier - the .myv WRITER stores PRE-jit
+ * bytecode (the JIT rewrites code in place: EnterNative ops whose fragments
+ * are NOT serialized), and the LOADER re-runs the tier itself. */
+/* .myv LOAD: run the AOT native tier over a fully-read image - the loader's
+ * equivalent of vm_precompile_all's two passes (set every native_leaf flag,
+ * then jit each body with a JitCtx rebuilt from the image), so a loaded
+ * program gets the IDENTICAL native tier a fresh compile does. */
+void vm_jit_loaded_image(VmProgram &prog);
+
+VmProgram vm_compile(const Construct *root, bool jit = true);
 void vm_run(VmProgram &prog);
 void vm_execute(const Construct *root);
 

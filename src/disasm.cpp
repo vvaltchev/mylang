@@ -2,6 +2,7 @@
 
 #include "disasm.h"
 #include "codegen.h"
+#include "vm.h"
 #include "eval.h"      /* builtin_slot / builtin_slot_name */
 #include "jit.h"       /* jit_type_singletons (-vdj); JitCtx (native calls) */
 #include "funcdesc.h"  /* FuncDescriptor::vm_chunk (faithful native-call dump) */
@@ -1553,6 +1554,45 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
      * stores exactly these) - printed after the code, non-empty ones only. */
     dump_chunk_pools(chunk, s);
 
+    return s.str();
+}
+
+/*
+ * The LOADED-IMAGE dump (.myv): the same sections disassemble_program emits,
+ * but read from a VmProgram instead of re-compiling an AST - no AST exists
+ * after a load. Titles come from the descriptors (the same `func <name>` /
+ * `closure#N` / `lambda#N` scheme), so a round-trip dump is byte-identical
+ * to the source-side one.
+ */
+std::string disassemble_image(const VmProgram &prog)
+{
+    std::ostringstream s;
+
+    if (!prog.structs.empty()) {
+        s << "; ===== types (" << prog.structs.size() << ") =====\n";
+        for (const auto &sd : prog.structs)
+            dump_struct_type(sd.get(), s);
+        s << "\n";
+    }
+
+    s << disassemble(prog.root, "main");
+
+    int anon = 0;
+    for (const auto &d : prog.funcs) {
+        if (!d->vm_chunk)
+            continue;
+        std::vector<std::string> cap_names;
+        for (const auto &c : d->captures)
+            cap_names.push_back(std::string(c.name->val));
+        std::string title;
+        if (d->name)
+            title = "func " + std::string(d->name->val);
+        else
+            title = (cap_names.empty() ? "lambda#" : "closure#")
+                    + std::to_string(anon++);
+        s << "\n" << disassemble(*static_cast<const Chunk *>(d->vm_chunk),
+                                 title, cap_names);
+    }
     return s.str();
 }
 
