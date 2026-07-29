@@ -1539,3 +1539,30 @@ throw from depth 50 below the cap - g_jit_sync_switch bumps, catch
 byte-identical). Remaining blockers: the exception trio (12),
 StructFieldAddInt (5), MultiUnpackV (3), LoadMember guard-miss (3),
 JumpUnlessElemInt (3), MapFilterV (2), inline-raise guard (5).
+
+## The native `throw` + the CATCH-DISPATCH redesign (deferred) - 2026-07-28
+
+`Throw` is now fully native/deletable (jit_throw: build + vm_raise; the
+three outcomes dispatched / boundary / conveyed - see CLAUDE.md). What
+remains of the "exception trio" is CatchTest + Reraise, whose originals
+CANNOT be deleted with the current design because the raise machinery
+DISPATCHES INTO THEM BY PC: vm_dispatch_exc sets pc to the handler's
+CatchTest, and a deleted run has no such pc (every pc collapses onto the
+head EnterNative).
+
+IDEAS SAVED for that redesign (maintainer deferred it 2026-07-28):
+1. MOVE THE MATCHER INTO THE RAISE PATH. The catch-type list is already
+   a serializable pool (catch_types + the #74 catch_uids); vm_raise could
+   walk a per-chunk HANDLER TABLE ({try-region pc range -> clause list,
+   bind slot, body pc}) and jump straight to the BODY, which is ordinary
+   code (already entry-mapped since #74 inc 2). CatchTest/Reraise then
+   disappear from the bytecode entirely rather than becoming deletable -
+   the cleanest end state, and it also removes the per-throw op dispatch.
+2. HANDLER ENTRY STUBS. Keep the ops but give each handler pc an
+   EnterNative stub like the post-call resumes, so a deleted run still
+   has a real pc to dispatch to. Cheaper to build; keeps the matcher in
+   bytecode.
+3. Either way `rethrow` (Reraise) follows the matcher: it is the "no
+   clause matched" tail of the same chain.
+Prerequisite for both: the handler-table data must be built at codegen
+(it exists implicitly in PushHandler's target + the CatchTest chain).
