@@ -30,6 +30,7 @@
 #include "vm.h"
 #include "eval.h"
 #include "jit.h"
+#include "env.h"
 
 #include <cstdio>
 #include <cstring>
@@ -493,8 +494,26 @@ std::vector<ArgLoc> read_arglocs(Reader &r)
 /* Chunks                                                               */
 /* ------------------------------------------------------------------ */
 
+/* dev-only byte accounting (env MYLANG_MYVSTATS=1): which sections the
+ * image's bytes actually go to - the ROI surface for shrinking the format. */
+void myv_stat(const char *what, size_t bytes)
+{
+    /* env_get, not getenv: MSVC deprecates getenv and the build is
+     * warnings-as-errors on all three compilers (CLAUDE.md) */
+    static bool on = env_get("MYLANG_MYVSTATS").has_value();
+    if (on)
+        fprintf(stderr, "MYVSTAT %-22s %8zu\n", what, bytes);
+}
+
+void myv_stat_ext(const char *what, size_t bytes) { myv_stat(what, bytes); }
+
 void write_chunk(Writer &w, const Chunk &c)
 {
+    size_t cm = w.buf.size();
+    const auto ct = [&](const char *what) {
+        myv_stat_ext(what, w.buf.size() - cm);
+        cm = w.buf.size();
+    };
     /* code: FIELD-WISE (Instr has padding whose content is indeterminate) */
     w.u32v(static_cast<uint32_t>(c.code.size()));
     for (const Instr &in : c.code) {
@@ -506,6 +525,7 @@ void write_chunk(Writer &w, const Chunk &c)
         w.i64v(in.pa);
         w.i64v(in.pb);
     }
+    ct("  code");
     w.u32v(static_cast<uint32_t>(c.slot_count));
     w.u32v(static_cast<uint32_t>(c.n_temps));
     w.u32v(static_cast<uint32_t>(c.n_dict_iters));
@@ -519,11 +539,13 @@ void write_chunk(Writer &w, const Chunk &c)
     for (const EvalValue &v : c.consts)
         write_value(w, v);
 
+    ct("  consts+refslots");
     w.u32v(static_cast<uint32_t>(c.locs.size()));
     for (const auto &l : c.locs) {
         w.u32v(l.pc); w.locv(l.start); w.locv(l.end);
     }
 
+    ct("  locs");
     w.u32v(static_cast<uint32_t>(c.inline_frames.size()));
     for (const auto &f : c.inline_frames) {
         w.strv(f.callee_name);
@@ -538,6 +560,7 @@ void write_chunk(Writer &w, const Chunk &c)
         w.u32v(e.pc); w.u32v(static_cast<uint32_t>(e.frame));
     }
 
+    ct("  inline_frames");
     w.u32v(static_cast<uint32_t>(c.member_keys.size()));
     for (const auto &m : c.member_keys) {
         write_value(w, m.memId);
@@ -551,6 +574,7 @@ void write_chunk(Writer &w, const Chunk &c)
         w.u32v(static_cast<uint32_t>(m.bake_slot));
     }
 
+    ct("  member_keys");
     w.u32v(static_cast<uint32_t>(c.boxed_ops.size()));
     for (const auto &b : c.boxed_ops) {
         w.u32v(static_cast<uint32_t>(b.target));
@@ -673,6 +697,7 @@ void write_chunk(Writer &w, const Chunk &c)
             w.u8v(b);
     }
 
+    ct("  pools(mid)");
     w.u32v(static_cast<uint32_t>(c.builtin_calls.size()));
     for (const auto &bc : c.builtin_calls) {
         w.uidv(bc.name);                 /* re-resolved at load */
@@ -694,10 +719,12 @@ void write_chunk(Writer &w, const Chunk &c)
         w.uidv(cs.a0_name);
     }
 
+    ct("  builtin+callsites");
     /* slot_names: DEBUG only (-vd); kept so a loaded image dumps identically */
     w.u32v(static_cast<uint32_t>(c.slot_names.size()));
     for (const auto &s : c.slot_names)
         w.strv(s);
+    ct("  slot_names");
 }
 
 void read_chunk(Reader &r, Chunk &c)
@@ -999,6 +1026,11 @@ void myv_write(const VmProgram &prog, const std::string &path,
                const std::string &src)
 {
     Writer w;
+    size_t mark = 0;
+    const auto tick = [&](const char *what) {
+        myv_stat(what, w.buf.size() - mark);
+        mark = w.buf.size();
+    };
 
     /* Index tables FIRST: values and pools reference defs/descs by index,
      * and the writer must be able to resolve any of them (dependency order
@@ -1032,6 +1064,8 @@ void myv_write(const VmProgram &prog, const std::string &path,
         }
     }
 
+    tick("structs");
+
     /* descriptors (their chunks follow, same order) */
     w.u32v(static_cast<uint32_t>(prog.funcs.size()));
     for (const auto &d : prog.funcs) {
@@ -1060,11 +1094,16 @@ void myv_write(const VmProgram &prog, const std::string &path,
         w.boolv(d->vm_chunk != nullptr);
     }
 
+    tick("descriptors");
+
     /* chunks: the root, then one per descriptor that has one */
     write_chunk(w, prog.root);
+    tick("chunk:root");
     for (const auto &d : prog.funcs)
-        if (d->vm_chunk)
+        if (d->vm_chunk) {
             write_chunk(w, *static_cast<const Chunk *>(d->vm_chunk));
+            tick("chunk:func");
+        }
 
     /* globals */
     w.u32v(static_cast<uint32_t>(prog.global_slot_reassigned.size()));
@@ -1074,6 +1113,8 @@ void myv_write(const VmProgram &prog, const std::string &path,
     w.u32v(static_cast<uint32_t>(prog.global_func_names.size()));
     for (const UniqueId *u : prog.global_func_names)
         w.uidv(u);
+
+    tick("globals");
 
     /* The header + string table go in FRONT: the body's writes populated
      * the table, so it can only be emitted now (the loader reads it first
@@ -1087,6 +1128,10 @@ void myv_write(const VmProgram &prog, const std::string &path,
     h.u32v(static_cast<uint32_t>(w.strs.size()));
     for (const std::string &s : w.strs)
         h.raw(s);
+
+    myv_stat("header+strings", h.buf.size());
+    myv_stat("source-embedded", src.size());
+    myv_stat("TOTAL", h.buf.size() + w.buf.size());
 
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f)

@@ -49,3 +49,7 @@ bench/results.csv
 # Python bytecode cache (e.g. from importing the bench runner)
 __pycache__/
 *.pyc
+
+# compiled bytecode images (mylang -c) - build artifacts
+*.myv
+*.myv.zst
