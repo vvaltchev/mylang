@@ -2779,7 +2779,24 @@ drained per round), an ARG-position value use (any call/builtin arg -
 `map(f, ...)`, `runtime(f)`), or a capture-list use - an untracked call
 site could reach the typed instance with a mismatched signature, so an
 escaped template keeps its boxed base (sound, as before). Non-uniform
-signatures across sites → no instantiation. All value uses redirect to
+signatures across sites → no instantiation. **An UNINFORMATIVE signature
+is declined too** — a `dyn` param (the clone would be just as boxed) or a
+container carrying the BOTTOM `none` element type (`type_has_bottom_elem`:
+`array<none>` / `dict<none,none>`, what an empty `[]`/`{}` infers and what
+a container symbol KEEPS while nothing the inferencer can see writes it —
+a callee filling it through its reference param contributes to the PARAM's
+symbol, never back to the caller's). That case is not merely useless but
+HARMFUL: the clone's params are seeded from the signature, so a body that
+only READS the container types every element `none` and an ordinary use of
+one (`k + ":"`) becomes a spurious `NullabilityEx` — even though the
+container is non-empty at runtime, filled by a SIBLING function
+(`samples/phonebook`: `cmd_add` fills `data`, `cmd_view` iterates it; a
+WRITER body repairs its param type by contribution, a reader cannot). The
+decline is a DEFER, not a veto — a later fixpoint round that settles the
+element type instantiates. (The DIRECT-call `instantiate_round` has the
+same bottom-signature blind spot, pre-dating this feature; there a
+container arg is usually written by the callee, which repairs the type.)
+All value uses redirect to
 ONE instance, so `ops[0] == add_op` identities hold. v1 is INPUT-LOCAL
 in the REPL (a prior input's array called later keeps the base -
 correct, unoptimized; pinned by a `repl:` test). This closed the last

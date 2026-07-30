@@ -73,8 +73,52 @@ CPython's dynamic dispatch is its home turf; we pay dispatch AND boxing.
   instantiation, program byte-identical.
 - ESCAPE cases: template value into a `dyn` var then called with a
   DIFFERENT signature → still works (boxed base; the escape mark must
-  catch it). Dict-stored (phonebook-shape) → v1 unchanged (escape).
+  catch it). Dict-stored (phonebook-shape) → NOT an escape after all:
+  the finfo set rides a dict-literal value join intact (both members are
+  Funcs), so those sites ARE attributed and the templates DO instantiate
+  when the signature is settled. (This line used to claim "v1 unchanged
+  (escape)"; the implementation tracks further than the design text
+  assumed. What actually protects the phonebook shape is the
+  uninformative-signature decline below, not an escape.)
 - Direct + value use MIXED (a direct float call + uniform int value
   calls) → both instances coexist.
 - REPL cross-input: define the templates + array in one input, call
   indirectly from a later one.
+
+## Fix (2026-07-29): decline an UNINFORMATIVE signature
+
+`samples/phonebook` regressed the moment this feature landed: its `cmd_*`
+templates live in a dict and are called `cmdfunc(data)` with
+`var data = {}` — a container the CALLER has no element info for, because
+the only writes go through a *callee's* reference param (`cmd_add`'s
+`data[n] = ...` contributes to that PARAM's symbol; nothing flows back to
+main's `data`). So the attributed signature was the BOTTOM
+`dict<none,none>`, uniform across the sites → both templates were
+instantiated on it, the clones' params were seeded with it, and
+`cmd_view`'s `foreach (var k, v in data)` typed `k`/`v` as `none` — making
+its `print(k+":", join(v, ","))` a compile-time `NullabilityEx` on a
+program that is perfectly correct at runtime. (Pre-feature the param was
+plain `dyn` and the base body was never checked.)
+
+`value_instantiate_round` now treats such a signature like a `dyn` one:
+not settled, so **no instantiation — the boxed base keeps running**. The
+predicate is `Inferencer::type_has_bottom_elem` (an `array`/`dict` whose
+elem/key/val is the bottom `none`, recursively). It is a DEFER: a later
+fixpoint round that settles the element type still gets the instance, and
+a real signature (bench 76's `array<int>, int`) is unaffected — verified
+by `-T template` on both. A WRITER body would have repaired its own param
+type by contribution; a READER body cannot, which is why declining is the
+only sound answer here rather than "instantiate and let the body fix it".
+
+Regression tests: `value-templates decline an empty-container signature
+(phonebook)` + the array-stored twin (src/tests.cpp), both engines.
+
+Note the DIRECT-call `instantiate_round` has the same blind spot and it
+PRE-DATES this feature (`func v(d){foreach(k,e in d) print(k+":");}` called
+directly with an empty `{}` has always been rejected). Left alone here: a
+direct container arg is usually written by the callee (which repairs the
+type), so gating it would cost real monomorphization on the common
+fill-a-fresh-array shape. A candidate v2 item — the principled fix is to
+make an element READ out of a bottom container yield `dyn`, not `none`,
+which is a lattice change (it would turn `var x = empty[0]` into a
+`DynRequiredEx`) and needs maintainer sign-off.

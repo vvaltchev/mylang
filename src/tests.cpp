@@ -1110,6 +1110,50 @@ static const std::vector<test> tests =
     },
 
     {
+        /* REGRESSION (samples/phonebook): an EMPTY-container signature is
+         * NOT settled - `var data = {}` filled only by a CALLEE (through its
+         * reference param, which contributes to the param's symbol, never
+         * back to the caller's) keeps the bottom type `dict<none,none>`.
+         * Value-instantiating on it seeded the clone's param with that type,
+         * so a READER body typed every element `none` and its ordinary use
+         * (`k + ":"`) became a spurious compile-time NullabilityEx - the
+         * dict IS non-empty at runtime. The base must keep running (boxed).
+         * See type_has_bottom_elem / value_instantiate_round. */
+        "value-templates decline an empty-container signature (phonebook)",
+        {
+            "func fill(d) { d[\"a\"] = [\"1\", \"2\"]; }",
+            "func view(d) {",
+            "    var out = \"\";",
+            "    foreach (var k, v in d) out += k + \":\" + join(v, \",\");",
+            "    return out;",
+            "}",
+            "var cmds = { \"f\": fill, \"v\": view };",
+            "var data = {};",
+            "var f = cmds[\"f\"];",
+            "f(data);",
+            "var g = cmds[\"v\"];",
+            "assert(g(data) == \"a:1,2\");",
+        },
+    },
+
+    {
+        /* The array-stored twin of the above (the rule generalizes: the
+         * signature carries no element info either way). */
+        "value-templates decline an empty-array signature",
+        {
+            "func addit(a) { append(a, 7); }",
+            "func total(a) { var s = 0; foreach (var e in a) s += e;",
+            "                return s; }",
+            "var ops = [addit, total];",
+            "var arr = [];",
+            "var f = ops[0];",
+            "f(arr); f(arr);",
+            "var g = ops[1];",
+            "assert(g(arr) == 14);",
+        },
+    },
+
+    {
         /* Top-10 #5 (vm_make_struct_array_op's dst reuse): a loop-carried
          * flat struct-array LITERAL whose previous value is still ALIASED
          * must build fresh - the alias keeps its contents. */

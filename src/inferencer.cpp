@@ -274,6 +274,7 @@ private:
     void reject_dev_builtins(Construct *n);     /* DEV-only builtins in a script */
     void enforce_nonnull_params();   /* the mandatory-`opt` rule for params */
     static bool type_has_dyn(StaticTypeRef t, bool deep);
+    static bool type_has_bottom_elem(StaticTypeRef t);
 
     /* type computation (reads stable `type`) */
     StaticTypeRef type_of(const Construct *e);
@@ -1036,13 +1037,29 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
         if (!ok || first)
             continue;
 
-        /* A dyn in the signature would make the clone no better than the
-         * base - leave the base running. */
-        bool has_dyn = false;
+        /*
+         * A signature that cannot improve on the base - leave the base
+         * running (boxed, exactly as before this feature):
+         *  - a `dyn` param: the clone would be just as boxed.
+         *  - a container carrying the BOTTOM `none` element type (an empty
+         *    `[]`/`{}` the caller has no element info for - see
+         *    type_has_bottom_elem). This one is not merely useless but
+         *    HARMFUL: the clone's params are seeded from the signature, so a
+         *    body that only READS the container types every element as `none`,
+         *    and an ordinary use of one (`k + ":"`) becomes a spurious
+         *    NullabilityEx - even though the container is non-empty at
+         *    runtime, having been filled by a SIBLING function through its
+         *    reference param (samples/phonebook: `cmd_add` fills `data`,
+         *    `cmd_view` iterates it). A writer body repairs the type by
+         *    contribution; a reader body cannot, so declining is the only
+         *    sound answer. Deferred, not vetoed: a later fixpoint round may
+         *    settle the element type, and then the instance is made.
+         */
+        bool bad_sig = false;
         for (StaticTypeRef t : sig)
-            if (type_has_dyn(t, /*deep=*/false))
-                has_dyn = true;
-        if (has_dyn)
+            if (type_has_dyn(t, /*deep=*/false) || type_has_bottom_elem(t))
+                bad_sig = true;
+        if (bad_sig)
             continue;
 
         /* 4) Get-or-make the instance (the ordinary template machinery). */
@@ -1517,6 +1534,30 @@ bool Inferencer::type_has_dyn(StaticTypeRef t, bool deep)
 
     if (t->kind == StaticTypeKind::Dict)
         return type_has_dyn(t->key, true) || type_has_dyn(t->val, true);
+
+    return false;
+}
+
+/*
+ * True if `t` carries NO element information: a container whose element (or
+ * key/value) type is the BOTTOM `none` - what an empty `[]` / `{}` infers, and
+ * what a container symbol KEEPS for as long as nothing the inferencer can see
+ * writes into it (a callee filling it through its reference param contributes
+ * to the PARAM's symbol, never back to the caller's - so `var data = {}` filled
+ * only by a callee stays `dict<none,none>`). Such a type is a placeholder, not
+ * a settled signature: monomorphizing on it types every element READ in the
+ * clone as `none`. Recurses through containers; a Func carries no elements.
+ */
+bool Inferencer::type_has_bottom_elem(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+
+    if (t->kind == StaticTypeKind::Array)
+        return is_none(t->elem) || type_has_bottom_elem(t->elem);
+
+    if (t->kind == StaticTypeKind::Dict)
+        return is_none(t->key) || is_none(t->val)
+            || type_has_bottom_elem(t->key) || type_has_bottom_elem(t->val);
 
     return false;
 }
