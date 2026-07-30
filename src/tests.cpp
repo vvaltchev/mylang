@@ -28,6 +28,7 @@
 #include "vm.h"
 #include "jit.h"
 #include "codegen.h"
+#include "env.h"
 #include "serialize.h"
 #include "disasm.h"
 
@@ -15570,8 +15571,17 @@ static bool myv_round_trip()
     const ExecEngine saved = g_exec_engine;
     g_exec_engine = ExecEngine::Vm;
     bool ok = false;
-    const std::string path = "/tmp/mylang-myv-test.myv";
-    const std::string path2 = "/tmp/mylang-myv-test2.myv";
+    /* PORTABLE temp dir (Windows has no /tmp - the CI lane that caught the
+     * first version); same rule as the tmpdir() builtin. */
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-test.myv";
+    const std::string path2 = tdir + "/mylang-myv-test2.myv";
     try {
         ParseContext pc(TokenStream(toks), true);
         unique_ptr<Construct> root = pBlock(pc);
