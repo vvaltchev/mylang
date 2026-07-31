@@ -1624,7 +1624,13 @@ struct Chunk {
      * address, stable across the chunk's std::move) and jit_boxed_* reads it.
      * The interpreter ignores `target2` for these ops (it reads target/a/b/aop
      * directly), so populating it is invisible to the tree-walker path.
-     * Serializable (plain values + Operands), so `.myv`-ready.
+     *
+     * NOT SERIALIZED (a `.myv` v4 change): the pool is DERIVED - a pure
+     * function of the final code + the loc side table - so the image stores
+     * none of it and the loader calls `build_boxed_ops` (codegen.h), the very
+     * function codegen uses, once a chunk is read. That saved 49 bytes per
+     * entry (14% of a sample image) and, more importantly, keeps ONE
+     * implementation: a hand-written reader could drift from the builder.
      */
     struct BoxedOp {
         int target;               /* dst frame slot */
