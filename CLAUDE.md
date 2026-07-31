@@ -4334,6 +4334,8 @@ the proof. Before calling it done:
 > **THE `.myv` STORED-BYTECODE FORMAT (`serialize.{h,cpp}`; design +
 phases in plans/myv-serializer.md) — THE ENDGAME ARTIFACT.**
 `mylang -c file.my [-o out.myv] [--strip-source]` runs the full pipeline
+(run-side flags: `--source ROOT`, `-f`/`--force` - see the SOURCE
+REFERENCE below)
 (parse → infer → optimize → `vm_compile(root, jit=false)`) and writes the
 VM image; `mylang file.myv` runs it with NO lexer, NO parser, NO optimizer
 — the file argument is detected by CONTENT (`myv_is_image`, the "MYLV"
@@ -4353,8 +4355,9 @@ serialized `VmProgram::global_slot_reassigned`), then main. That is what
 makes a loaded image's `-vd` byte-identical to a fresh compile's.
 **The format** (all little-endian, fixed records, NO compression - the
 no-deps rule): magic + `MYV_FORMAT_VERSION` (exact match) + an endian mark
-+ a **BUILTIN-SET FINGERPRINT** + the embedded source + the string table,
-then structs, descriptors, chunks (root first), globals. Cross-references
++ a **BUILTIN-SET FINGERPRINT** + the **SOURCE REFERENCE** + the string
+table, then structs, descriptors, chunks (root first), globals.
+Cross-references
 are INDICES or NAMES, never pointers: a `UniqueId*` is a string index (the
 loader re-interns), a `Builtin` is its NAME (`vm_lookup_builtin` re-resolves;
 an unknown name is refused), struct defs / descriptors are table indices.
@@ -4372,15 +4375,48 @@ builtin SET), and the image carries `builtin_set_fingerprint()` (count + a
 name hash) so a binary with a different set is refused instead of silently
 calling the wrong builtin. `-c` also registers `argv` before compiling, so
 the compile sees exactly the run's builtin set.
-Errors from an image are byte-identical to the source run (the embedded
-source feeds the caret block; `--strip-source` prints the located header +
-backtrace, `errfmt`'s no-source mode). Compiling twice is byte-identical
-(pinned). A corrupt/truncated/incompatible file is a clean `MyvError`.
-Verified: 83/83 of bench/ + samples/ run identically from an image, 81/83
-also dump byte-identically (the 2 residuals differ ONLY in the printed
-ORDER of a const dict's entries - MyLang dicts are unordered by spec, and
-a rebuilt hash map's iteration order legitimately differs). The REPL is
-out of scope (it retains ASTs).
+**THE SOURCE REFERENCE (v2, 2026-07-29) - the image does NOT embed the
+program text.** v1 embedded the whole source so an error could quote the
+offending line; that made the text the second-largest section of an image
+(21% of samples/shopping) and meant a `.myv` could never be smaller than
+its `.my`. It now stores a `MyvSourceRef` (serialize.h): `root` (the
+project root) + `rel` (the source path relative to it) + `abs` (the
+compile-time absolute path) + a **CRC32** and byte SIZE of the file -
+~100 bytes instead of the program. `myv_source_ref(path)` builds it at
+`-c` time; the ROOT is the compile-time CWD when the source lives under
+it, else the source's OWN directory, so `rel` is ALWAYS non-empty and an
+image is RELOCATABLE (a `rel` full of `..` hops would not be).
+`resolve_source` (serialize.cpp) then decides at LOAD time: `--source
+ROOT` given -> look ONLY under it (an explicit root that lacks the file
+is a mistake worth reporting, not a reason to fall back to a stale
+absolute path); else the stored `abs`, then `root/rel`. A file that is
+THERE but whose size/CRC32 differs is REFUSED with a warning (a caret
+drawn on the wrong text is worse than no caret) unless `-f`/`--force`,
+which uses it and warns that carets may be misplaced. An ABSENT file is
+SILENT - shipping an image alone is ordinary. `MyvSource` carries
+`{lines, name, warning}`; the driver prints the warning to stderr and
+passes `name` into `format_exception`, which now takes an optional
+`src_name` and renders " at FILE, line L, col C" (a plain SCRIPT run
+passes its path too, so the two forms agree; `-e`/the REPL pass "" and
+are unchanged). CRC32 is the textbook reflected form computed a bit at a
+time in `crc32_of` (no table to carry; it runs twice per file lifetime).
+`--strip-source` now stores NO reference at all - so such an image also
+leaks no local paths. Path math is hand-rolled (`is_absolute`/`cwd_path`/
+`join_path`, `getcwd` behind an `#ifdef _WIN32`): `<filesystem>` would
+need `-lstdc++fs` on the older GCCs CI still builds with.
+Errors from an image are byte-identical to the source run when the
+reference resolves (pinned by a byte-compare); with no usable source the
+located header + backtrace still name file/line/func, `errfmt`'s
+no-source mode. Compiling twice is byte-identical (pinned). A
+corrupt/truncated/incompatible file is a clean `MyvError`. Verified:
+83/84 of bench/ + samples/ run identically from an image (the one
+exception, rand_sort, calls `rand()`), 84/86 also dump byte-identically
+(the 2
+residuals differ ONLY in the printed ORDER of a const dict's entries -
+MyLang dicts are unordered by spec, and a rebuilt hash map's iteration
+order legitimately differs). Sizes vs the source: fib 4.05x, shopping
+3.79x, gcd 1.77x (v1 was 4.7x / 4.76x / 2.72x). The REPL is out of scope
+(it retains ASTs).
 
 **THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,
 > plans/vm-ast-free-runtime.md): the call model runs on the serializable

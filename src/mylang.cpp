@@ -43,12 +43,19 @@ static bool opt_vm;   /* -vm: explicit VM (the DEFAULT since 2026-07-18) */
 static bool opt_tw;   /* -tw: run via the TREE-WALKER instead of the VM */
 static bool opt_vm_disasm;   /* -vd: print the bytecode disassembly, no run */
 static bool opt_compile;     /* -c: write a .myv image, then exit (no run) */
-static bool opt_strip_source;/* -c --strip-source: omit the embedded source */
+static bool opt_strip_source;/* -c --strip-source: store no source reference */
 static string opt_out_path;  /* -o <path> (default: the source's .myv twin) */
 static string opt_script_path;   /* the FILE argument (source or image) */
 static bool opt_run_image;       /* the file argument is a .myv image */
+static string opt_source_root;   /* --source ROOT: find an image's source
+                                  * under THIS root, not the stored path */
+static bool opt_force;           /* -f: use a source whose CRC32 mismatches */
 
 static std::vector<string> lines;
+/* The source file to NAME in errors ("" for -e / the REPL, which have none).
+ * For a .myv image it is what the stored reference resolved to - the ONLY
+ * source identity such a run has, and the whole point of storing it. */
+static string src_name;
 static std::vector<Tok> tokens;
 /* The whole source as one buffer (lines re-joined with '\n'). The lexer scans
  * it in one pass so strings / block comments can span lines; token string_views
@@ -85,9 +92,19 @@ void help()
     cout << "  -c       Compile to a .myv bytecode file, then exit" << endl;
     cout << "  -o FILE  Output path for -c (default: the source's .myv twin)"
          << endl;
-    cout << "  --strip-source  With -c: omit the embedded source (errors"
+    cout << "  --strip-source  With -c: store no source reference at all"
          << endl;
-    cout << "                  then print no source line / caret)" << endl;
+    cout << "                  (errors then print no source line / caret,"
+         << endl;
+    cout << "                  and the image carries no local paths)" << endl;
+    cout << "  --source ROOT   Find a .myv image's source under ROOT instead"
+         << endl;
+    cout << "                  of the path stored when it was compiled"
+         << endl;
+    cout << "  -f       Render carets from a source whose CRC32 does not"
+         << endl;
+    cout << "           match the image (--force; a warning is printed)"
+         << endl;
     cout << "  -vm      Execute via the bytecode VM (the DEFAULT)." << endl;
     cout << "  -nj      Disable the native x86-64 AOT tier (also"
          << endl;
@@ -248,6 +265,22 @@ parse_args(int argc, char **argv)
 
             opt_strip_source = true;
 
+        } else if (!strcmp(arg, "--source")) {
+
+            /* .myv: resolve the stored RELATIVE source path under this root
+             * instead of the compile-time paths (a moved / re-checked-out
+             * tree, or a build machine's paths on a different host) */
+            if (argc < 2) {
+                cout << "--source requires a project-root path" << endl;
+                exit(1);
+            }
+            opt_source_root = argv[1];
+            argc--; argv++;
+
+        } else if (!strcmp(arg, "-f") || !strcmp(arg, "--force")) {
+
+            opt_force = true;   /* trust a CRC32-mismatched source anyway */
+
         } else if (!strcmp(arg, "-nr")) {
 
             opt_no_run = true;
@@ -350,10 +383,12 @@ parse_args(int argc, char **argv)
             /* .myv: an IMAGE is detected by CONTENT (magic), not extension -
              * it is loaded, not parsed (no source, no optimizer passes). */
             opt_script_path = arg;
-            if (myv_is_image(arg))
+            if (myv_is_image(arg)) {
                 opt_run_image = true;
-            else
+            } else {
                 read_script(arg);
+                src_name = arg;   /* name it in errors, like any compiler */
+            }
 
             /* Under -c the remaining args are the COMPILER's, not the
              * script's (there is no run): `mylang -c file.my -o out.myv
@@ -443,7 +478,22 @@ int main(int argc, char **argv)
              * reason a compiled one is: exception payloads and lazy
              * backtrace frames reference its defs/descriptors. */
             g_exec_engine = ExecEngine::Vm;
-            prog = myv_read(opt_script_path, lines);
+
+            /* The image stores a source REFERENCE, not the text: the loader
+             * looks for the file (under --source ROOT if given) and uses it
+             * only when its CRC32 still matches. Absent or changed => errors
+             * render without the quoted line + caret, naming file/line and
+             * the backtrace. */
+            MyvLoadOpts lo;
+            lo.root = opt_source_root;
+            lo.force = opt_force;
+            MyvSource msrc;
+            prog = myv_read(opt_script_path, msrc, lo);
+            lines = std::move(msrc.lines);
+            src_name = msrc.name;
+            if (!msrc.warning.empty())
+                cerr << msrc.warning << endl;
+
             if (opt_vm_disasm) {
                 cout << disassemble_image(prog);
                 return 0;
@@ -578,13 +628,14 @@ int main(int argc, char **argv)
                         out = out.substr(0, dot);
                     out += ".myv";
                 }
-                string src_text;
+                /* Store a source REFERENCE (path + CRC32), not the text:
+                 * error carets then cost ~100 bytes instead of the whole
+                 * program, and a run verifies the file is still the one
+                 * compiled. --strip-source stores nothing at all. */
+                MyvSourceRef ref;
                 if (!opt_strip_source)
-                    for (size_t i = 0; i < lines.size(); i++) {
-                        if (i) src_text += '\n';
-                        src_text += lines[i];
-                    }
-                myv_write(prog, out, src_text);
+                    ref = myv_source_ref(opt_script_path);
+                myv_write(prog, out, ref);
                 return 0;
             }
             if (!opt_tw) {
@@ -611,12 +662,12 @@ int main(int argc, char **argv)
             e.loc_end = tokens.back().loc + 2;
         }
 
-        format_exception(cerr, e, lines);
+        format_exception(cerr, e, lines, src_name);
         return 1;
 
     } catch (const Exception &e) {
 
-        format_exception(cerr, e, lines);
+        format_exception(cerr, e, lines, src_name);
         return 1;
     }
 

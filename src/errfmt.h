@@ -20,9 +20,16 @@ struct Exception;   /* a struct (errors.h); MSVC mangles struct != class */
 void dump_line_with_caret(std::ostream &o, const std::string &ln,
                           int from, int to);
 
-/* " at line L, col C[:E]" then the source line(s) with carets for `e`'s loc. */
+/*
+ * " at [FILE, ]line L, col C[:E]" then the source line(s) with carets for
+ * `e`'s loc. `src_name` names the file when the caller knows it (a script or
+ * a .myv image); "" for -e and the REPL, which have no file. An EMPTY `lines`
+ * (a .myv whose source is absent or has changed) prints the located header
+ * alone - no quoted line, no caret, since a Loc cannot supply the text.
+ */
 void dump_loc_in_error(std::ostream &o, const Exception &e,
-                       const std::vector<std::string> &lines);
+                       const std::vector<std::string> &lines,
+                       const std::string &src_name = std::string());
 
 /*
  * Format any thrown Exception (dispatching on its concrete type for the
@@ -30,4 +37,5 @@ void dump_loc_in_error(std::ostream &o, const Exception &e,
  * payload, etc.) plus its backtrace, into `o`.
  */
 void format_exception(std::ostream &o, const Exception &e,
-                      const std::vector<std::string> &lines);
+                      const std::vector<std::string> &lines,
+                      const std::string &src_name = std::string());

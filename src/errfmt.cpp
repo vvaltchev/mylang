@@ -34,14 +34,17 @@ dump_line_with_caret(ostream &o, const string &ln, int from, int to)
 
 void
 dump_loc_in_error(ostream &o, const Exception &e,
-                  const std::vector<string> &lines)
+                  const std::vector<string> &lines, const string &src_name)
 {
     if (!e.loc_start.col) {
         o << "\n";
         return;
     }
 
-    o << " at line " << e.loc_start.line << ", col " << e.loc_start.col;
+    o << " at ";
+    if (!src_name.empty())
+        o << src_name << ", ";
+    o << "line " << e.loc_start.line << ", col " << e.loc_start.col;
 
     /* loc_end.col is one past the last char + 1, so the last char is at
      * loc_end.col - 2 and the printed end column is loc_end.col - 1. */
@@ -58,8 +61,11 @@ dump_loc_in_error(ostream &o, const Exception &e,
               << ", col " << e.loc_end.col - 1;
     }
 
-    /* .myv --strip-source: no source text, so print the located header
-     * only - the caret block needs the LINE, which a Loc cannot supply. */
+    /* No source text (a .myv whose source is absent, changed, or was never
+     * referenced): print the located header only - the caret block needs the
+     * LINE, which a Loc cannot supply. The file name above plus the
+     * backtrace's per-frame "func(params) at line N" still locate the error
+     * exactly; only the quoted text is missing. */
     if (lines.empty()) {
         o << "\n";
         return;
@@ -79,12 +85,12 @@ dump_loc_in_error(ostream &o, const Exception &e,
 
 void
 format_exception(ostream &o, const Exception &e,
-                 const std::vector<string> &lines)
+                 const std::vector<string> &lines, const string &src_name)
 {
     if (auto *se = dynamic_cast<const SyntaxErrorEx *>(&e)) {
 
         o << "SyntaxError";
-        dump_loc_in_error(o, e, lines);
+        dump_loc_in_error(o, e, lines, src_name);
         o << se->msg;
 
         if (se->op != Op::invalid) {
@@ -113,7 +119,7 @@ format_exception(ostream &o, const Exception &e,
         o << "Undefined variable '" << ue->name << "'";
         if (ue->in_pure_func)
             o << " while evaluating a PURE function";
-        dump_loc_in_error(o, e, lines);
+        dump_loc_in_error(o, e, lines, src_name);
         o << format_backtrace(e);
         return;
     }
@@ -124,18 +130,19 @@ format_exception(ostream &o, const Exception &e,
         const EvalValue &data = xo->get_data();
         if (!data.is<NoneVal>())
             o << ", data: " << data.get_type()->to_string(data);
-        dump_loc_in_error(o, e, lines);
+        dump_loc_in_error(o, e, lines, src_name);
         o << format_backtrace(e);
         return;
     }
 
     if (auto *it = dynamic_cast<const InvalidTokenEx *>(&e)) {
         o << "Invalid token: " << it->val;
-        dump_loc_in_error(o, e, lines);   /* caret when a loc is set */
+        /* a caret only when a loc is set */
+        dump_loc_in_error(o, e, lines, src_name);
         return;
     }
 
     o << e.name << ": " << (e.msg ? e.msg : "");
-    dump_loc_in_error(o, e, lines);
+    dump_loc_in_error(o, e, lines, src_name);
     o << format_backtrace(e);
 }

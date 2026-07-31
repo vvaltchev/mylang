@@ -7,6 +7,13 @@
 #include <fstream>
 #include <sstream>
 
+/* mkdir(), for the .myv source-reference relocation test */
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+
 #ifdef TESTS
 
 #include "parser.h"
@@ -15626,6 +15633,26 @@ static bool myv_round_trip()
         tdir.pop_back();
     const std::string path = tdir + "/mylang-myv-test.myv";
     const std::string path2 = tdir + "/mylang-myv-test2.myv";
+    /* v2: the image stores a source REFERENCE (path + CRC32), not the text,
+     * so the source must exist as a real FILE for any of it to resolve. */
+    const std::string sdir = tdir + "/mylang-myv-src";
+    const std::string spath = tdir + "/mylang-myv-test.my";
+    const std::string spath_moved = sdir + "/mylang-myv-test.my";
+    {
+        std::ofstream sf(spath, std::ios::binary | std::ios::trunc);
+        sf << src << "\n";
+    }
+#ifdef _WIN32
+    _mkdir(sdir.c_str());
+#else
+    mkdir(sdir.c_str(), 0700);
+#endif
+    {
+        /* the SAME text under a DIFFERENT root: the --source relocation */
+        std::ofstream sf(spath_moved, std::ios::binary | std::ios::trunc);
+        sf << src << "\n";
+    }
+    const size_t nlines = sizeof(lines_arr) / sizeof(lines_arr[0]);
     try {
         ParseContext pc(TokenStream(toks), true);
         unique_ptr<Construct> root = pBlock(pc);
@@ -15638,8 +15665,14 @@ static bool myv_round_trip()
          * image stores PRE-jit bytecode), then run the load-time tier on
          * the same program to get the comparable dump. */
         VmProgram prog = vm_compile(root.get(), /*jit=*/false);
-        myv_write(prog, path, src);
-        myv_write(prog, path2, src);            /* determinism */
+        const MyvSourceRef ref = myv_source_ref(spath);
+        if (ref.abs.empty() || ref.rel.empty() || !ref.crc || !ref.size) {
+            fprintf(stderr, "myv: the source reference is incomplete\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        myv_write(prog, path, ref);
+        myv_write(prog, path2, ref);            /* determinism */
         vm_jit_loaded_image(prog);              /* the tier a load runs */
         const std::string dump_mem = disassemble_image(prog);
 
@@ -15658,7 +15691,7 @@ static bool myv_round_trip()
             return false;
         }
 
-        std::vector<std::string> img_src;
+        MyvSource img_src;
         VmProgram loaded = myv_read(path, img_src);
         const std::string dump_img = disassemble_image(loaded);
         if (dump_mem != dump_img) {
@@ -15666,17 +15699,123 @@ static bool myv_round_trip()
             g_exec_engine = saved;
             return false;
         }
-        if (img_src.size() != sizeof(lines_arr) / sizeof(lines_arr[0])) {
-            fprintf(stderr, "myv: the embedded source did not round-trip\n");
+        /* the reference RESOLVED: the file is still the one compiled, so the
+         * loader hands back its text (error carets work) with no warning */
+        if (img_src.lines.size() != nlines || !img_src.warning.empty()
+                || img_src.name.empty()) {
+            fprintf(stderr, "myv: the source reference did not resolve\n");
             g_exec_engine = saved;
             return false;
         }
+        /* --strip-source: an EMPTY reference stores nothing - no text, no
+         * name, and no local path leaked into the image */
+        const std::string path3 = tdir + "/mylang-myv-test3.myv";
+        myv_write(prog, path3, MyvSourceRef());
+        MyvSource s3;
+        VmProgram stripped = myv_read(path3, s3);
+        (void)stripped;
+        std::ifstream f3(path3, std::ios::binary);
+        const std::string b3((std::istreambuf_iterator<char>(f3)),
+                             std::istreambuf_iterator<char>());
+        f3.close();
+        remove(path3.c_str());
+        if (!s3.lines.empty() || !s3.name.empty() || !s3.warning.empty()
+                || b3.find(spath) != std::string::npos) {
+            fprintf(stderr, "myv: --strip-source still stored a reference\n");
+            g_exec_engine = saved;
+            return false;
+        }
+
         vm_run(loaded);                         /* it must RUN */
         ok = true;
     } catch (...) {
         ok = false;
     }
     g_exec_engine = saved;
+
+    /*
+     * The SOURCE-REFERENCE rules (v2). Each case loads the SAME image; only
+     * what is on disk / in the options changes.
+     */
+    if (ok) {
+        /* (a) --source ROOT relocates: the stored root is gone from the
+         *     picture, the same text under another root is found + verified */
+        MyvLoadOpts lo;
+        lo.root = sdir;
+        MyvSource s;
+        try {
+            VmProgram p = myv_read(path, s, lo);
+            (void)p;
+        } catch (const Exception &) { s = MyvSource(); }
+        if (s.lines.size() != nlines || !s.warning.empty()) {
+            fprintf(stderr, "myv: --source did not relocate the source\n");
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        /* (b) the source CHANGED: refused (no text) with a warning, because a
+         *     caret drawn on the wrong text is worse than no caret */
+        std::ofstream sf(spath, std::ios::binary | std::ios::app);
+        sf << "print(\"appended\");\n";
+        sf.close();
+
+        MyvSource s;
+        try {
+            VmProgram p = myv_read(path, s);
+            (void)p;
+        } catch (const Exception &) { s = MyvSource(); }
+        if (!s.lines.empty() || s.warning.empty()) {
+            fprintf(stderr, "myv: a CHANGED source was not refused\n");
+            ok = false;
+        }
+
+        /* (c) ... unless -f/--force, which uses it and still warns */
+        MyvLoadOpts lo;
+        lo.force = true;
+        MyvSource s2;
+        try {
+            VmProgram p = myv_read(path, s2, lo);
+            (void)p;
+        } catch (const Exception &) { s2 = MyvSource(); }
+        if (s2.lines.size() != nlines + 1 || s2.warning.empty()) {
+            fprintf(stderr, "myv: -f did not use the changed source\n");
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        /* (d) the source is GONE: silent (shipping an image alone is normal),
+         *     but the NAME survives for the error header */
+        remove(spath.c_str());
+        remove(spath_moved.c_str());
+
+        MyvSource s;
+        try {
+            VmProgram p = myv_read(path, s);
+            (void)p;
+        } catch (const Exception &) { s = MyvSource(); }
+        if (!s.lines.empty() || !s.warning.empty() || s.name.empty()) {
+            fprintf(stderr, "myv: an ABSENT source was not handled\n");
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        /* (e) the reference IS in the image - and it is a PATH, not the text:
+         *     the whole point of v2 (the program text must NOT be there) */
+        std::ifstream f(path, std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(f)),
+                                std::istreambuf_iterator<char>());
+        if (bytes.find(spath) == std::string::npos) {
+            fprintf(stderr, "myv: the image does not carry its source path\n");
+            ok = false;
+        }
+        if (bytes.find("func dist2(P p)") != std::string::npos) {
+            fprintf(stderr, "myv: the image still EMBEDS the source text\n");
+            ok = false;
+        }
+    }
 
     /* a truncated image is refused with a clean error, never UB */
     if (ok) {
@@ -15685,7 +15824,7 @@ static bool myv_round_trip()
         bad.close();
         bool refused = false;
         try {
-            std::vector<std::string> s2;
+            MyvSource s2;
             VmProgram p3 = myv_read(path2, s2);
             (void)p3;
         } catch (const Exception &) {
@@ -15698,6 +15837,8 @@ static bool myv_round_trip()
     }
     remove(path.c_str());
     remove(path2.c_str());
+    remove(spath.c_str());
+    remove(spath_moved.c_str());
     return ok;
 }
 
