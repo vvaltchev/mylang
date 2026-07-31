@@ -15629,7 +15629,17 @@ static bool myv_round_trip()
         "var d = { \"a\": 1 };",
         "var t = 0;",
         "try { throw P(1, 2); } catch (P as e) { t = e.y; }",
-        "print(s, t, d[\"a\"], len(pts));" };
+        /* COMPACT-ENCODING edge values (the width codes + the
+         * default-vs-value subtlety): a literal -1 is the same bit pattern
+         * as the "field absent" sentinel, so it MUST survive; the wide ints
+         * exercise the 2/4/8-byte codes and the floats the 8-byte payload. */
+        "func edge(int n, float x) {",
+        "    return str(n * -1) + str(n + -1) + str(-1)",
+        "           + str(n * 2147483647) + str(n - 2147483648)",
+        "           + str(n * -32769) + str(n + 4611686018427387903)",
+        "           + str(x * 2.5) + str(x + -1.0);",
+        "}",
+        "print(s, t, d[\"a\"], len(pts), edge(runtime(3), runtime(1.5)));" };
 
     std::string src;
     std::vector<Tok> toks;

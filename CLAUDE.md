@@ -4366,6 +4366,32 @@ storage kind + readonly/dict + default/struct instance/struct descriptor/
 FuncObject) that ABORTS on an unlisted type - an image is never silently
 lossy. Struct LAYOUT is recomputed at load (`compute_layout`), never
 stored.
+**THE COMPACT INSTRUCTION ENCODING (v3, 2026-07-29).** The fixed 27-byte
+field-wise record was 37% of an image; an instruction is now
+`op:u8 flags:u16 [the present fields]`, where the flags word gives a
+per-field WIDTH CODE - `pa`/`pb` 3 bits each (0 = at its default and NOT
+stored, else 1/2/4/8 bytes), `target`/`target2` 2 bits each (0/1/2/4
+bytes), one bit each for `aop` and `opflags`, and bits 12-15 RESERVED
+(the reader REFUSES a nonzero, so a later version can spend them without
+a v3 reader misreading the file). Chosen from a CENSUS over bench/ +
+samples/ (3483 instructions): `target` present 95% / one byte in 97% of
+those, `target2` default 48%, `pa` default 32% + one byte 66%, `pb`
+default 54% - so the dominant instruction is 5-6 bytes, not 27. Two
+notes: (1) it is SELF-DESCRIBING on purpose - a per-opcode "which fields
+does this op use" table would save the flags word, but this codebase has
+a history of per-opcode tables going stale when an op is added
+(`visit_use_def`, `op_writes_scalar`, `visit_pc_fields`) and here a stale
+entry would mean SILENT DATA LOSS in a stored image; (2) `pa == -1` is
+both "unset slot" and the literal -1, which is NOT ambiguous on disk -
+the field is not stored and the reader's default restores exactly -1,
+while `opflags` separately says whether the operand is a literal (pinned
+by the round-trip test's edge-value program: a `-1` literal, every int
+width, 8-byte float payloads). Still NOT in-format compression (no
+dictionary, no entropy coding, no cross-field bit packing; every field is
+a plain little-endian integer at a byte boundary, O(1) decode, two
+compiles byte-identical) - the no-compression decision record stands.
+Measured: shopping's code section 4741 -> 1086 bytes, the image
+10243 -> 6588 (-36%); gcd is now 1.14x its source, shopping 2.44x.
 **THE BUILTIN-SLOT HAZARD (found + fixed here):** `SymbolsType` is a
 `std::map<const UniqueId *, ...>` keyed by the interned POINTER, so the
 builtin table's slot order differed PER PROCESS - a baked
@@ -4414,9 +4440,9 @@ exception, rand_sort, calls `rand()`), 84/86 also dump byte-identically
 (the 2
 residuals differ ONLY in the printed ORDER of a const dict's entries -
 MyLang dicts are unordered by spec, and a rebuilt hash map's iteration
-order legitimately differs). Sizes vs the source: fib 4.05x, shopping
-3.79x, gcd 1.77x (v1 was 4.7x / 4.76x / 2.72x). The REPL is out of scope
-(it retains ASTs).
+order legitimately differs). Sizes vs the source (after v3's compact
+instructions): fib 2.73x, shopping 2.44x, gcd 1.14x (v1 was
+4.7x / 4.76x / 2.72x). The REPL is out of scope (it retains ASTs).
 
 **THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,
 > plans/vm-ast-free-runtime.md): the call model runs on the serializable

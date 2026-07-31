@@ -257,16 +257,8 @@ records) - samples/shopping, 2700-byte source, 12847-byte image:
 
 RANKED, MEASURED ROI (shopping numbers; the ratios hold across samples):
 
-1. **Compact instruction records - 4741 -> 895 bytes (-81% of code,
-   -30% of the file).** The record is 27 fixed bytes (op1 + aop1 +
-   opflags1 + target4 + target2 4 + pa8 + pb8) but the fields are mostly
-   absent or tiny: over the 147 instructions of shopping, target2 is
-   used in 75%, pa in 50%, pb in 37%, and almost every used value fits
-   in 1-2 bytes. A per-record presence/width byte + the narrowest of
-   1/2/4/8 bytes per present field measures 895 bytes. This is NOT
-   in-format compression (no dictionary, no entropy coding, O(1)
-   decode, still deterministic) - the format's no-compression decision
-   record does not cover it.
+1. **Compact instruction records - DONE in v3, see below** (4741 ->
+   1086 bytes, -77% of the code section).
 2. **Delta + narrow `locs` - 796 -> 195 (-75%).** The table is
    pc-ascending and lines/cols are small: pc as a delta, line as a delta,
    col as one byte (with an escape).
@@ -329,3 +321,58 @@ gcd 4920 -> 3197 (2.72x -> 1.77x), fib 1125 -> 971, primes2 4073 -> 3339,
 strloop 727 -> 695. Every image shrank by its source size less ~100
 bytes. Items 1-5 above are unaffected and still stand; with the source
 gone, the projected combined result for shopping is ~4.8 KB raw.
+
+## v3 (2026-07-29): the COMPACT instruction encoding
+
+DONE - item 1 of the ROI list. The fixed 27-byte record
+(`op` + `aop` + `opflags` + `target` + `target2` + `pa` + `pb`, written
+field-wise) became
+
+```
+op:u8  flags:u16  [the present fields, in order]
+
+  bits 0-2   pa       width code 0..4  (0 / 1 / 2 / 4 / 8 bytes)
+  bits 3-5   pb       width code 0..4
+  bits 6-7   target   width code 0..3  (0 / 1 / 2 / 4 bytes)
+  bits 8-9   target2  width code 0..3
+  bit  10    aop      stored (else Op::invalid)
+  bit  11    opflags  stored (else 0)
+  bits 12-15 RESERVED, must be zero (the reader REFUSES a nonzero, so a
+             later version can spend them without a v3 reader silently
+             misreading the file)
+```
+
+Width code 0 means "the field is at its DEFAULT and is not stored".
+
+CHOSEN FROM A CENSUS, not a guess (a temporary tally over bench/ +
+samples/, 3483 instructions): `target` is present in 95% of instructions
+and fits in ONE byte in 97% of those (92 need two, none need four);
+`target2` is at its default in 48% and one byte in 50% (35 need four);
+`pa` default in 32%, one byte in 66% (27 are 8-byte float payloads);
+`pb` default in 54%, one byte in 40%. So the dominant instruction is
+`op + flags + 1-3 payload bytes` - about 5-6 bytes instead of 27.
+
+Two design notes worth keeping:
+- **Self-describing, NOT table-driven.** An obvious alternative was a
+  per-opcode table of "which fields does this op use", which would save
+  the flags word entirely. Rejected: this codebase has a history of
+  per-opcode tables silently going stale when an op is added
+  (`visit_use_def`, `op_writes_scalar`, `visit_pc_fields`), and here a
+  stale entry would mean SILENT DATA LOSS in a stored image. The flags
+  word costs ~2 bytes per instruction and cannot drift.
+- **The default-vs-value subtlety.** `pa == -1` is both "unset slot" and
+  the literal -1. That is fine and NOT ambiguous on disk: the field is
+  simply not stored, and the reader's default restores exactly -1;
+  `opflags` independently records whether the operand is a literal. The
+  round-trip test pins it (a `-1` literal, wide ints of every width, and
+  8-byte float payloads).
+- Still NOT in-format compression: no dictionary, no entropy coding, no
+  bit-level packing across fields. Every field is a plain little-endian
+  integer at a byte boundary, decoded in O(1) with no state, and two
+  compiles stay byte-identical. The decision record above stands.
+
+MEASURED: shopping's code section 4741 -> **1086** bytes, the whole image
+**10243 -> 6588** (-36%). Per sample (image/source): gcd 3197 -> 2067
+(**1.14x** the source), shopping 6588 (2.44x), primes2 2059 (2.49x),
+rand_sort 684, fib 655, strloop 506. Cumulative from v1: shopping
+12847 -> 6588 (-49%), gcd 4920 -> 2067 (-58%).
