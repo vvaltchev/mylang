@@ -6243,6 +6243,17 @@ omitting it is a compile error.
   change a clean `make clean && make` must show ZERO warnings on g++ AND clang
   (`make CXX=clang++`); MSVC's set is only visible on the Windows CI lane, so
   read its log after a build-touching change.
+  **WINDOWS IS LLP64: `long` is 32 BITS there** (64 on Linux/macOS), so any
+  `long`-typed conversion of an `int_type` value SILENTLY behaves differently
+  per platform — no warning, no test failure until the Windows lane runs.
+  `parser.cpp` parsed integer literals with `stol`, which made every literal
+  in `[2^31, 2^63)` a "Integer literal out of range" SYNTAX ERROR on Windows
+  alone (`const BIG = 4611686018427387903;` compiled everywhere else). Use
+  **`stoll`** — or the `sizeof(int_type)`-dispatched `if constexpr` chain that
+  `int()` (builtins/num.cpp.h) already uses, which is correct — and then
+  range-check the fit into `int_type`. The reason nothing caught it: the only
+  literal-range test used a value beyond `2^63`, which EVERY platform
+  refuses; when testing a LIMIT, cover the range on BOTH sides of it.
 - Every file starts with `/* SPDX-License-Identifier: BSD-2-Clause */`.
 - Core typedefs (`defs.h`): `int_type = intptr_t`, `float_type = double`
   (printf/snprintf with `%f`/`%.*f`; the comment warns to update the format
