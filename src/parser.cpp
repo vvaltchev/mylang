@@ -566,13 +566,27 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
     if (*c == TokType::integer) {
 
         const string s(c.get_str());
-        int_type ival;
+        long long v64 = 0;
 
+        /*
+         * stoll, NOT stol: `long` is 32 bits on Windows (LLP64) and 64 on
+         * Linux/macOS, so `stol` REJECTED every literal above 2^31-1 on
+         * Windows only - while `int_type` (intptr_t) holds it fine there, and
+         * the language promises 64-bit wrapping ints (README). Found when a
+         * .myv test with a big literal failed the Windows CI lane alone.
+         */
         try {
-            ival = stol(s);
+            v64 = stoll(s);
         } catch (const std::out_of_range &) {
             throw SyntaxErrorEx(start, "Integer literal out of range");
         }
+
+        /* and it must still fit int_type - the same error, so a 32-bit
+         * target refuses a 64-bit literal instead of silently truncating */
+        const int_type ival = static_cast<int_type>(v64);
+
+        if (static_cast<long long>(ival) != v64)
+            throw SyntaxErrorEx(start, "Integer literal out of range");
 
         v.reset(new LiteralInt(ival));
         v->start = start;
