@@ -261,10 +261,8 @@ RANKED, MEASURED ROI (shopping numbers; the ratios hold across samples):
    1086 bytes, -77% of the code section).
 2. **Delta + narrow `locs` - DONE in v5, see below** (796 -> 212).
 3. **Stop storing DERIVED pools - DONE in v4, see below** (947 bytes).
-4. **Narrow the Locs inside the caret pools (~10% more).** `ArgLoc` is
-   16 bytes (two Locs of two u32s) and every builtin_call / call_site /
-   member_key / chain step carries several; the same delta/narrow
-   treatment as (2) applies.
+4. **Narrow the Locs inside the caret pools - DONE in v6, see below**
+   (1618 corpus Locs, 12944 bytes -> 4854).
 5. **Drop `slot_names` unless asked (88 bytes, 0.7%).** Debug-only
    (`-vd` labels); the design already called it the one optional
    section. Cheapest change of the set.
@@ -463,3 +461,38 @@ MEASURED: shopping's loc section 796 -> **212** bytes, the image
 image SMALLER than the .my it came from**, shopping 1.87x, strloop 356,
 fib 603. Cumulative from v1: shopping 12847 -> 5057 (**-61%**),
 gcd 4920 -> 1765 (**-64%**).
+
+## v6 (2026-07-29): NARROW pool Locs
+
+DONE - item 4, and the smallest change of the set for the largest
+remaining win, because every caret pool writes its Locs through ONE
+function. `Writer::locv` / `Reader::locv` went from two `u32`s (8 bytes)
+to **`u16` line + `u8` col = 3 bytes**, each field with the same
+whole-byte sentinel escape to a plain 4-byte int32. Changing that single
+pair narrowed EVERY pool at once - `member_keys`, `builtin_calls`,
+`call_sites`, `emplace_sites`, `incdec_sites`, `incdec_chains`,
+`chain_locs`, `throws`, `boxed_ctors`, `inline_frames`.
+
+WHY u16 for the line and not a byte: these Locs are ABSOLUTE. Unlike the
+loc TABLE's (v5), a caret pool's entries have no ordering relationship to
+each other, so there is nothing to delta against - and a one-byte line
+would escape in any file over 254 lines, which is most of them. Measured
+over bench/ + samples/: 1618 pool Locs, widest line 206, widest column
+77, nothing negative - so NOTHING escapes in practice, and the corpus
+saves 8090 bytes (12944 -> 4854).
+
+VERIFIED, including the paths a normal program never reaches. The escape
+test now covers ALL FOUR Loc escapes in one program - the table's
+(column > 254, line delta > 127) and a pool's (column > 254, line >
+65534) - by indenting a statement 320 columns and putting 65600 filler
+lines before an indented `append(arr, s.v + 1)`, whose carets land in the
+builtin_calls and member_keys pools at a huge line AND a wide column. It
+ASSERTS each of the four was actually taken (so it cannot pass on an
+unexercised path) and compares both the loc tables and the pool Locs
+entry-for-entry (`myv_pool_locs_equal`). A 65605-line source compiles in
+9 ms, so the suite is unaffected (-rt still 0.7 s).
+
+MEASURED: shopping 5057 -> **4327** (-14%), i.e. **1.60x** its source;
+**gcd 1580 = 0.87x**, primes2 2.03x, rand_sort 2.03x, phonebook 2.24x,
+fib 543. Cumulative from v1: shopping 12847 -> 4327 (**-66%**),
+gcd 4920 -> 1580 (**-68%**).

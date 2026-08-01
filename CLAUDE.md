@@ -4445,6 +4445,26 @@ write FIRST, then `vm_jit_loaded_image` the in-memory side (what
 `myv_round_trip` already did). Measured: the loc section 796 -> 212,
 the image 5641 -> 5057; **gcd 1765 = 0.98x its source, an image SMALLER
 than the .my**; cumulative from v1 shopping -61%, gcd -64%.
+**NARROW POOL LOCS (v6, same day).** Every caret pool writes its Locs
+through ONE function, so narrowing `Writer::locv`/`Reader::locv` from two
+`u32`s (8 bytes) to **`u16` line + `u8` col (3 bytes)** - same whole-byte
+sentinel escapes to a plain 4-byte int32 - shrank `member_keys`,
+`builtin_calls`, `call_sites`, `emplace_sites`, `incdec_sites`,
+`incdec_chains`, `chain_locs`, `throws`, `boxed_ctors` and
+`inline_frames` at once. `u16` for the line, NOT a byte, because these
+Locs are ABSOLUTE: unlike the loc TABLE's they have no ordering
+relationship to delta against, and a one-byte line would escape in any
+file over 254 lines. Measured over bench/ + samples/: 1618 pool Locs,
+widest line 206, widest column 77, so nothing escapes in practice
+(12944 -> 4854 bytes corpus-wide). The escape test now covers ALL FOUR
+Loc escapes in one program - the table's (col > 254, line delta > 127)
+and a pool's (col > 254, line > 65534) - via a 320-column indent plus
+65600 filler lines before an indented `append(arr, s.v + 1)` whose carets
+land in builtin_calls/member_keys; it ASSERTS each of the four fired and
+compares tables AND pools entry-for-entry (`myv_pool_locs_equal`). A
+65605-line source compiles in 9ms, so `-rt` stays at 0.7s. Measured:
+shopping 5057 -> 4327 = **1.60x** its source, **gcd 1580 = 0.87x**;
+cumulative from v1 shopping **-66%**, gcd **-68%**.
 **THE BUILTIN-SLOT HAZARD (found + fixed here):** `SymbolsType` is a
 `std::map<const UniqueId *, ...>` keyed by the interned POINTER, so the
 builtin table's slot order differed PER PROCESS - a baked
@@ -4494,9 +4514,9 @@ exception, rand_sort, calls `rand()`), 84/86 also dump byte-identically
 residuals differ ONLY in the printed ORDER of a const dict's entries -
 MyLang dicts are unordered by spec, and a rebuilt hash map's iteration
 order legitimately differs). Sizes vs the source (after v3's compact
-instructions, v4's dropped derived pool, v5's delta locs): fib 2.51x,
-shopping 1.87x, gcd 0.98x - SMALLER than its source (v1 was
-4.7x / 4.76x / 2.72x). The REPL is out of scope
+instructions, v4's dropped derived pool, v5's delta locs, v6's narrow
+pool Locs): fib 2.26x, shopping 1.60x, gcd 0.87x - SMALLER than its
+source (v1 was 4.7x / 4.76x / 2.72x). The REPL is out of scope
 (it retains ASTs).
 
 **THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,

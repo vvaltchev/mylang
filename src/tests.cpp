@@ -15648,6 +15648,51 @@ static bool myv_locs_equal(const Chunk &x, const Chunk &y)
     return true;
 }
 
+/*
+ * The caret POOLS' Locs, entry for entry - they ride the NARROW u16+u8
+ * encoding (Writer::locv), and the `-vd` dump does not print all of them.
+ * member_keys + builtin_calls are the representative pair.
+ */
+static bool myv_pool_locs_equal(const Chunk &x, const Chunk &y)
+{
+    auto eq = [](const Loc &a, const Loc &b) {
+        return a.line == b.line && a.col == b.col;
+    };
+
+    if (x.member_keys.size() != y.member_keys.size()
+            || x.builtin_calls.size() != y.builtin_calls.size())
+        return false;
+
+    for (size_t i = 0; i < x.member_keys.size(); i++) {
+        const Chunk::MemberKey &a = x.member_keys[i];
+        const Chunk::MemberKey &b = y.member_keys[i];
+        if (!eq(a.mstart, b.mstart) || !eq(a.mend, b.mend)
+                || !eq(a.bstart, b.bstart) || !eq(a.bend, b.bend)) {
+            fprintf(stderr, "myv: member_key[%zu] caret differs\n", i);
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < x.builtin_calls.size(); i++) {
+        const auto &a = x.builtin_calls[i];
+        const auto &b = y.builtin_calls[i];
+        if (!eq(a.start, b.start) || !eq(a.end, b.end)
+                || a.args.size() != b.args.size()) {
+            fprintf(stderr, "myv: builtin_call[%zu] caret differs\n", i);
+            return false;
+        }
+        for (size_t j = 0; j < a.args.size(); j++)
+            if (!eq(a.args[j].start, b.args[j].start)
+                    || !eq(a.args[j].end, b.args[j].end)) {
+                fprintf(stderr, "myv: builtin_call[%zu] arg %zu caret "
+                                "differs\n", i, j);
+                return false;
+            }
+    }
+
+    return true;
+}
+
 static bool myv_round_trip()
 {
     const char *lines_arr[] = {
@@ -15850,6 +15895,24 @@ static bool myv_round_trip()
             return false;
         }
 
+        /* the NARROW pool Locs (Writer::locv), same treatment */
+        bool pool_ok = myv_pool_locs_equal(prog.root, loaded.root);
+
+        for (size_t i = 0; pool_ok && i < prog.funcs.size(); i++) {
+            const Chunk *a =
+                static_cast<const Chunk *>(prog.funcs[i]->vm_chunk);
+            const Chunk *b =
+                static_cast<const Chunk *>(loaded.funcs[i]->vm_chunk);
+            if (a && b && !myv_pool_locs_equal(*a, *b))
+                pool_ok = false;
+        }
+
+        if (!pool_ok) {
+            fprintf(stderr, "myv: a caret POOL Loc did not round-trip\n");
+            g_exec_engine = saved;
+            return false;
+        }
+
         /* the reference RESOLVED: the file is still the one compiled, so the
          * loader hands back its text (error carets work) with no warning */
         if (img_src.lines.size() != nlines || !img_src.warning.empty()
@@ -16004,25 +16067,37 @@ static bool myv_round_trip()
 }
 
 /*
- * The loc table's delta coding has two ESCAPE paths that no program in
- * bench/ or samples/ reaches (measured: the widest caret column there is 99
- * and the largest line delta 19): a caret column past 254, and a line delta
- * past 127. Both must round-trip EXACTLY - the byte form is an optimization
- * for the common case, never a cap on what a source file may contain. Build a
- * program with both and compare the loc tables entry-for-entry.
+ * The image's two Loc encodings have FOUR escape paths, none of which any
+ * program in bench/ or samples/ reaches (measured there: widest caret column
+ * 99, largest line delta 19, widest pool-Loc line 206):
+ *
+ *   the loc TABLE (delta-coded): a column past 254, a line delta past 127
+ *   a POOL Loc (narrow u16+u8):  a column past 254, a line past 65534
+ *
+ * All four must round-trip EXACTLY - the byte forms are optimizations for the
+ * common case, never caps on what a source file may contain. One program
+ * covers all four: a statement indented 320 columns, and 65600 filler lines
+ * before a second one (which also makes the table's line delta huge). The
+ * test ASSERTS each escape was actually taken, so it cannot pass vacuously,
+ * then compares the tables entry-for-entry.
  */
 static bool myv_loc_escapes()
 {
     /* 320 spaces before the statement: its caret column exceeds 254 */
     const std::string pad(320, ' ');
-    std::string src = "func f(dyn a, dyn b) {\n";
+    std::string src = "struct S { int v; }\nvar arr = [];\nvar s = S(4);\n";
+    src += "func f(dyn a, dyn b) {\n";
     src += pad + "return a / b;\n}\n";
 
-    /* ... then 200 filler lines, so the NEXT loc entry's line delta > 127 */
-    for (int i = 0; i < 200; i++)
-        src += "# filler\n";
+    /* ... then filler lines past 65534, so the next loc entry's line DELTA
+     * exceeds 127 AND the pool Locs below need the u16 line escape */
+    for (int i = 0; i < 65600; i++)
+        src += "# f\n";
 
     src += "func g(dyn a, dyn b) { return a % b; }\n";
+    /* an indented builtin call + member read: their carets land in the
+     * builtin_calls / member_keys POOLS, at a wide column AND a huge line */
+    src += pad + "append(arr, s.v + 1);\n";
     /* `dyn` params make the results dyn, so the destination must say so */
     src += "var dyn r = f(runtime(6), runtime(3))\n";
     src += "            + g(runtime(7), runtime(4));\n";
@@ -16062,11 +16137,18 @@ static bool myv_loc_escapes()
         MyvSource s;
         VmProgram loaded = myv_read(path, s);
 
-        /* prove the escapes were actually EXERCISED, else this test is
-         * vacuous: some entry must have a wide column, and some a big
-         * line delta */
-        bool wide_col = false, big_jump = false;
+        /* prove each escape was actually EXERCISED, else this test is
+         * vacuous - the whole point is the paths a normal program misses */
+        bool wide_col = false, big_jump = false;      /* the loc TABLE */
+        bool pool_wide = false, pool_bigline = false; /* a POOL Loc */
         int prev_line = 0;
+
+        auto pool_loc = [&](const Loc &l) {
+            if (l.col > 254)
+                pool_wide = true;
+            if (l.line > 65534)
+                pool_bigline = true;
+        };
 
         auto scan = [&](const Chunk &c) {
             for (const auto &l : c.locs) {
@@ -16077,6 +16159,17 @@ static bool myv_loc_escapes()
                     big_jump = true;
                 prev_line = l.start.line;
             }
+            /* the caret POOLS this program populates */
+            for (const auto &m : c.member_keys) {
+                pool_loc(m.mstart); pool_loc(m.mend);
+                pool_loc(m.bstart); pool_loc(m.bend);
+            }
+            for (const auto &bc : c.builtin_calls) {
+                pool_loc(bc.start); pool_loc(bc.end);
+                for (const auto &a : bc.args) {
+                    pool_loc(a.start); pool_loc(a.end);
+                }
+            }
         };
         scan(prog.root);
         for (const auto &d : prog.funcs)
@@ -16085,16 +16178,18 @@ static bool myv_loc_escapes()
                 scan(*static_cast<const Chunk *>(d->vm_chunk));
             }
 
-        if (!wide_col || !big_jump) {
-            fprintf(stderr, "myv: the escape test hit no escape "
-                            "(wide col %d, big jump %d)\n",
-                    (int)wide_col, (int)big_jump);
+        if (!wide_col || !big_jump || !pool_wide || !pool_bigline) {
+            fprintf(stderr, "myv: the escape test hit no escape (table: wide "
+                            "col %d, big jump %d; pool: wide col %d, big line "
+                            "%d)\n", (int)wide_col, (int)big_jump,
+                    (int)pool_wide, (int)pool_bigline);
             g_exec_engine = saved;
             remove(path.c_str());
             return false;
         }
 
         ok = myv_locs_equal(prog.root, loaded.root)
+             && myv_pool_locs_equal(prog.root, loaded.root)
              && prog.funcs.size() == loaded.funcs.size();
 
         for (size_t i = 0; ok && i < prog.funcs.size(); i++) {
@@ -16102,12 +16197,13 @@ static bool myv_loc_escapes()
                 static_cast<const Chunk *>(prog.funcs[i]->vm_chunk);
             const Chunk *b =
                 static_cast<const Chunk *>(loaded.funcs[i]->vm_chunk);
-            if (a && b && !myv_locs_equal(*a, *b))
+            if (a && b && (!myv_locs_equal(*a, *b)
+                           || !myv_pool_locs_equal(*a, *b)))
                 ok = false;
         }
 
         if (!ok)
-            fprintf(stderr, "myv: an ESCAPED loc entry did not round-trip\n");
+            fprintf(stderr, "myv: an ESCAPED Loc did not round-trip\n");
 
     } catch (const Exception &e) {
         fprintf(stderr, "myv: loc-escape test threw %s: %s\n", e.name,
@@ -19294,7 +19390,7 @@ static const std::vector<extra_check> extra_checks =
       jit_final_batch_deletable },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
-    { "myv: loc-table delta escapes (wide column, big line jump)",
+    { "myv: Loc escapes - delta table + narrow pool Locs",
       myv_loc_escapes },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
