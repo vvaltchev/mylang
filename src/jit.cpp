@@ -1076,9 +1076,10 @@ static bool jit_op_eligible(const Instr &in)
      * fragments (the interior-entry defect class); merged, the whole loop
      * is one run and the back edge is a fragment-local jump. (#78 step D
      * removed its two companions - CatchTest and Reraise are gone, the
-     * raise path matches the handler table directly.) NOT
-     * op_fully_native. */
+     * raise path matches the handler table directly.) #80 gave `rethrow`
+     * the same treatment, so it no longer splits a run either. */
     case OpCode::Throw:
+    case OpCode::Rethrow:
         return true;
     /* model-flip (nativize-ops): an ALWAYS-THROWING construct - the helper
      * builds the POOLED exception natively (Runtime kinds via g_vm_jit_exc,
@@ -2672,6 +2673,7 @@ pick_cached_slots(const Chunk &ck, size_t begin,
         case OpCode::EndFinally:
             break;                       /* pure activation state - no slots */
         case OpCode::Throw:
+        case OpCode::Rethrow:
             break;                       /* an unconditional exit - no slots */
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
@@ -4633,6 +4635,48 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xC3);                               /* ret (the handler pc) */
         return true;
 
+    case OpCode::Rethrow:
+        /* #80: the NATIVE `rethrow` - jit_rethrow runs the interpreted op's
+         * exact body (take the caught exception out of the enclosing
+         * catch's region slot, restamp it with the RETHROW SITE's caret,
+         * vm_raise). It never falls through, so the shape is Throw's
+         * exactly: 0 = dispatched (return the parked handler pc as an
+         * external exit - the op already ran), 1 = boundary, 2 = conveyed.
+         * The LocEntry and the inlined-at chain are BAKED here because a
+         * deleted run's pcs collapse onto the head EnterNative. */
+        e.bump_op(in.op);
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_lit())));
+        e.movabs(RSI, static_cast<uint64_t>(pc));
+        e.movabs(RDX, reinterpret_cast<uint64_t>(loc_entry_addr(ck, old_pc)));
+        e.movabs(RCX, static_cast<uint64_t>(
+                          static_cast<int_type>(ck.inline_frame_at(old_pc))));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_rethrow) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x83); e.u8(0xF8); e.u8(0x02);       /* cmp eax, 2 */
+        {
+            const size_t j_not2 = e.j8(0x75);
+            emit_exc_stamp(e, ck, old_pc);
+            e.exit_pc(pc);
+            e.patch8(j_not2, e.pos());
+        }
+        e.u8(0x85); e.u8(0xC0);                   /* test eax, eax */
+        {
+            const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
+            e.flush_cache();                      /* every raw ret must */
+            e.movabs(RAX, static_cast<uint64_t>(-2));   /* JIT_RET_BOUNDARY */
+            e.u8(0xC3);
+            e.patch8(j_disp, e.pos());
+        }
+        e.flush_cache();
+        e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x00);       /* mov rax, [rax] */
+        e.u8(0xC3);                               /* ret (the handler pc) */
+        return true;
+
     case OpCode::DeclConstV:
         /* const decl bind via jit_decl_const(dst, is_global, src). */
         emit_call_prologue(e);
@@ -6285,8 +6329,11 @@ static bool op_fully_native(const Instr &in)
     /* #78 step E: EndFinally's cold RERAISE arm calls jit_end_finally,
      * which runs the interpreted body's vm_raise and reports
      * dispatched / boundary / conveyed like the native `throw` - no bail
-     * left, so a try/FINALLY region deletes like everything else. */
+     * left, so a try/FINALLY region deletes like everything else.
+     * #80: `rethrow` is the same shape (jit_rethrow), plus the site's
+     * caret restamp. */
     case OpCode::EndFinally:
+    case OpCode::Rethrow:
         return true;
     /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
      * DictStore / StoreElem2V: convey-only helpers, cold-side caret.

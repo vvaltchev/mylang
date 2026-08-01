@@ -120,6 +120,9 @@ extern "C" void jit_push_handler_grow(int_type region) noexcept;
  * 2 conveyed / 3 nothing pending). See the definition in vm.cpp. */
 extern "C" int jit_end_finally(int_type region, int_type pc,
                                int_type inline_chain) noexcept;
+/* #80: the native `rethrow` - same 0/1/2 contract as jit_throw. */
+extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
+                           int_type inline_chain) noexcept;
 
 /* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
 class EvalContext;
@@ -247,6 +250,8 @@ extern unsigned long g_jit_inline_baked;
  * jit_end_finally, vm.cpp) - the coverage counter for the arm that used
  * to bail to the interpreter. */
 extern unsigned long g_jit_end_finally_reraise;
+/* #80: times the native `rethrow` ran (see jit_rethrow, vm.cpp). */
+extern unsigned long g_jit_rethrow_native;
 #endif
 
 /*

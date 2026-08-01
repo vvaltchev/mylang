@@ -4984,6 +4984,74 @@ extern "C" int jit_end_finally(int_type region, int_type pc,
     return 0;
 }
 
+/*
+ * #80: the native `rethrow`.
+ *
+ * Structurally EndFinally's reraise arm plus a loc stamp: take the caught
+ * exception out of the ENCLOSING catch's region slot, restamp it with the
+ * RETHROW SITE's caret, and run the shared vm_raise. Reports exactly as
+ * jit_throw / jit_end_finally: 0 = dispatched (g_vm_resume_chunk/pc parked
+ * and returned as an ordinary external exit), 1 = boundary, 2 = conveyed.
+ * It never falls through - a rethrow always raises.
+ *
+ * `lep` is the op's BAKED LocEntry and `inline_chain` its inlined-at chain,
+ * both resolved at COMPILE time: the interpreted op reads them via
+ * loc_at(pc) / inline_frame_at(pc), which a DELETED run's collapsed pcs
+ * cannot resolve (every op of the run shares the head EnterNative's pc).
+ *
+ * The slot is guaranteed non-empty by construction: a region whose catch
+ * bodies contain a `rethrow` has has_rethrow set, which is precisely when
+ * the dispatch PARKS the exception there.
+ */
+extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
+                           int_type inline_chain) noexcept
+{
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    VmCallRec &rec = act.back_rec();
+    VmPendState &ps = act.pend_at(rec, region);
+
+#ifdef TESTS
+    g_jit_rethrow_native++;
+#endif
+    ML_VM_CHECK(ps.exc != nullptr);
+    std::unique_ptr<RuntimeException> ex = std::move(ps.exc);
+    if (!ex) {
+        /* unreachable by the has_rethrow invariant - be LOUD, not silent */
+        try {
+            throw InternalErrorEx();
+        } catch (...) {
+            g_vm_jit_eptr = std::current_exception();
+        }
+        return 2;
+    }
+
+    const Chunk::LocEntry *le = static_cast<const Chunk::LocEntry *>(lep);
+    if (le) {                          /* the rethrow SITE's caret, as the
+                                        * interpreted op stamps it */
+        ex->loc_start = le->start;
+        ex->loc_end = le->end;
+    }
+    if (inline_chain >= 0 && ex->jit_inline_frame < 0)
+        ex->jit_inline_frame = static_cast<int32_t>(inline_chain);
+
+    const Chunk *c2 = rec.run_chunk;
+    size_t p2 = static_cast<size_t>(pc);
+    try {
+        if (!vm_raise(c2, p2, act, ctx, std::move(ex)))
+            return 1;                  /* boundary: signal set */
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    g_vm_resume_chunk = c2;
+    g_vm_resume_pc = p2;
+    return 0;
+}
+
 /* The desc-based twin of do_func_call's vm_capture_frame for the invoke
  * boundary: name/params/pure tag; the call site is loc-less (builtin
  * callbacks pass no call site - matching eval_func's captures today). */
@@ -5599,6 +5667,8 @@ unsigned long g_vm_table_dispatch = 0;
  * this bumped is what proves the deletable form actually executes rather
  * than the interpreter re-running a kept original. */
 unsigned long g_jit_end_finally_reraise = 0;
+/* #80: times the native `rethrow` ran IN THE FRAGMENT (jit_rethrow). */
+unsigned long g_jit_rethrow_native = 0;
 #endif
 
 /* model-flip M3: native-container island calls set up process-wide (coverage -
