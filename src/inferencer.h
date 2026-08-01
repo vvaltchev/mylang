@@ -66,6 +66,39 @@ void specialize_types(Construct *root, bool enable = true,
                       AnalysisInfo *analyze = nullptr);
 
 /*
+ * PER-PASS KILL SWITCHES for the AST transforms specialize_types performs.
+ *
+ * These exist for TESTABILITY as much as debugging. An AST transform rewrites
+ * the tree BEFORE either engine sees it, so the tree-walker-vs-VM differential
+ * - the project's main correctness net - cannot see a bug in one: both engines
+ * faithfully run the same wrong tree. The only oracle is the SAME program with
+ * the transform turned off, which is what these switches provide inside ONE
+ * binary (the `-nj` JIT kill switch is the same idea one layer down).
+ *
+ * `opt_layer_equivalence` (-rt) runs a corpus through every single-pass-off
+ * configuration AND the all-off one, on BOTH engines, requiring identical
+ * output and identical exceptions. A new AST transform belongs here on the day
+ * it is written - see CLAUDE.md "Testing an AST transform".
+ *
+ * CLI: `--no-opt <name>[,<name>...]` (mylang.cpp).
+ */
+enum OptPass : unsigned {
+    opt_licm        = 1u << 0,   /* try_hoist_loop_subscripts (LICM)     */
+    opt_slice_hoist = 1u << 1,   /* try_hoist_loop_slices                */
+    opt_for_range   = 1u << 2,   /* try_for_range -> ForRangeStmt        */
+    opt_typed       = 1u << 3,   /* M8 TypedScalarExpr specialization    */
+    opt_all_passes  = 0xfu,
+};
+
+/* Bitmask of DISABLED passes; 0 (the default) = everything on. */
+extern unsigned g_opt_disabled;
+
+/* Map a CLI name ("licm", "slice-hoist", "for-range", "typed", "all") to its
+ * bit. Returns false for an unknown name. `names` for --help/diagnostics. */
+bool opt_pass_bit(const std::string &name, unsigned &bit);
+const char *opt_pass_names();
+
+/*
  * REPL incremental type inference + checking. A persistent type-checker that
  * runs the REAL inference per input over an EXPANDABLE global scope: each input
  * is checked against the globals committed by prior inputs (their types PINNED,

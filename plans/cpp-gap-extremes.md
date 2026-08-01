@@ -143,17 +143,39 @@ Worth recording as the general shape: **the mutation sets model REASSIGNMENT,
 not DEFINEDNESS**, so any pass that moves code above a loop needs its own
 declared-in-body check.
 
-### Deliberately stricter than fr_immutable
+### Calls in the body: precise, not blanket
 
-Any call that is not a pure USER function disqualifies the loop
-(`licm_has_opaque_call`). A const BUILTIN is NOT exempted, though
-`fr_immutable` exempts one: the higher-order builtins take a callback and
-`fr_collect_mutated` stops at a `FuncDeclStmt`, so a lambda appending to
-the base array taints nothing. `try_for_range` lives with that gap because
-it hoists an INT; this pass keeps a live REFERENCE across every iteration,
-so it refuses instead. The realistic cost is a `len()` call in an inner
-body - and the counted-loop BOUND, where `len()` usually sits, is outside
-the body and unaffected.
+The first version refused the loop on ANY call that was not a pure user
+function - including `len(arr)`. That was too blunt, and the maintainer
+rejected it: a const builtin should be fine.
+
+It IS fine, except for the higher-order ones (map/filter/sort/make_array/
+make_dict/find), which run a CALLBACK that `fr_collect_mutated` cannot see
+(it stops at a `FuncDeclStmt`), so a lambda appending to the base array
+would taint nothing and the base would look invariant.
+
+The discriminator is a new inferencer stamp, **`CallExpr::
+callable_arg_mask`**: bit i set when argument i's static type is a `Func`
+or a `dyn` that might hold one. Stamped in `annotate_hints`, because only
+the TYPE question is answerable there - `effective_pure` is the RESOLVER's
+answer and does not exist yet when the inferencer runs. LICM then requires
+each masked argument to be provably pure: an inline lambda whose
+`desc->effective_pure` holds, or a name in `g_fr_pure`. `effective_pure`
+is exactly the right proof - a pure function has no capture list, reads
+only consts and its own params, and cannot mutate a reference parameter,
+so it cannot reach the enclosing frame at all.
+
+Everything else - `len(arr)`, `abs(x)`, `str(v)` - has a mask of 0 and
+costs nothing. A callback that is neither an inline lambda nor a named
+pure function (a local variable holding one) is unprovable and refuses.
+
+The mask DEFAULTS to `~0u`, so an unstamped call reads as "every argument
+may be callable" and declines. That default earned itself immediately:
+the resolver's devirtualization swap builds a DirectBuiltinCallExpr
+field-by-field and dropped the new field, so every builtin call read as
+opaque. Fixed at the root with `CallExpr::copy_call_fields` - ONE place
+that enumerates the CallExpr analysis fields, used by `clone()` and all
+three swap sites. `vm_len_kind` had been lost the same way once before.
 
 ### Measured
 

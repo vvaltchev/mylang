@@ -15774,6 +15774,248 @@ static bool hoist_slice_shapes()
 }
 
 /*
+ * OPTIMIZER-LAYER EQUIVALENCE - the net for AST transforms.
+ *
+ * The project's main correctness net is the tree-walker-vs-VM differential.
+ * It CANNOT see a bug in an AST transform: the transform rewrites the tree
+ * before either engine touches it, so both engines faithfully run the same
+ * wrong tree and agree perfectly. That is not hypothetical - the subscript
+ * LICM pass shipped with exactly such a bug in its first version, and only a
+ * binary WITHOUT the pass exposed it.
+ *
+ * So: run each program under every single-pass-off configuration, and the
+ * all-off one, on BOTH engines, and require identical stdout and identical
+ * exception behaviour. Any transform that changes observable behaviour fails
+ * here, at the layer it broke, naming the pass.
+ *
+ * A new AST transform gets a bit in OptPass and a program here on the day it
+ * is written.
+ */
+struct OptLayerCase {
+    const char *name;
+    std::vector<const char *> lines;
+};
+
+/* Run `src` with the given engine + disabled-pass mask; capture stdout and the
+ * exception type name ("" when it completed). Returns false only if the
+ * pipeline itself could not be run. */
+static bool opt_layer_run(const std::string &src, ExecEngine eng,
+                          unsigned disabled, std::string &out,
+                          std::string &exname)
+{
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+
+    const ExecEngine saved_eng = g_exec_engine;
+    const unsigned saved_dis = g_opt_disabled;
+    g_exec_engine = eng;
+    g_opt_disabled = disabled;
+
+    std::ostringstream cap;
+    std::streambuf *saved_buf = cout.rdbuf(cap.rdbuf());
+    exname.clear();
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        run_optimizers(root.get());
+        if (eng == ExecEngine::Vm)
+            vm_execute(root.get());
+        else
+            root->eval(nullptr);
+    } catch (const Exception &e) {
+        exname = e.name ? e.name : "?";
+    } catch (...) {
+        exname = "<non-Exception>";
+    }
+    cout.rdbuf(saved_buf);
+    g_exec_engine = saved_eng;
+    g_opt_disabled = saved_dis;
+    out = cap.str();
+    return true;
+}
+
+static bool opt_layer_equivalence()
+{
+    const std::vector<OptLayerCase> cases = {
+        /* the LICM target: an invariant row read in a counted inner loop */
+        { "2-D row read (LICM's target shape)", {
+            "var m = [[1,2,3],[4,5,6]]; var s = 0;",
+            "for (var i = 0; i < 2; i++)",
+            "  for (var j = 0; j < 3; j++) s += m[i][j];",
+            "print(s);" } },
+        /*
+         * The bug LICM shipped with: a body-local base is STALE above the
+         * loop. The read must yield a CONTAINER for the pass to consider it
+         * (a scalar element is skipped), so the map here returns rows - the
+         * shape that actually reproduces. Verified to FAIL when the
+         * declared-in-body check is removed.
+         */
+        { "body-local base from a call (the map() regression)", {
+            "var a = [[1,2],[3,4]];",
+            "var dyn s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var m = map(func (r) => r, a);",
+            "  s = s + m[1][0];",
+            "}",
+            "print(s);" } },
+        /* the same hazard without any call: a body-local container literal */
+        { "body-local base from a literal", {
+            "var z = [1,2]; var n = len(z); var s = 0;",
+            "for (var k = 0; k < n; k++) {",
+            "  var m = [[1,2],[3,4]];",
+            "  s += m[0][k];",
+            "}",
+            "print(s);" } },
+        /* a body-local whose value CHANGES per iteration - hoisting it would
+         * freeze iteration 1's row */
+        { "body-local base that changes each iteration", {
+            "var rows = [[1,2],[30,40],[500,600]];",
+            "var n = 3; var s = 0;",
+            "for (var k = 0; k < n; k++) {",
+            "  var r = rows[k];",
+            "  s += r[0];",
+            "}",
+            "print(s);" } },
+        /* the guarded preheader: a zero-trip loop must evaluate nothing */
+        { "zero-trip loop with an out-of-range row index", {
+            "var a = [[1,2],[3,4]];",
+            "var z = []; append(z, 7);",
+            "var n = len(z) - 1;",
+            "var i = 99; var s = 0;",
+            "for (var k = 0; k < n; k++) s += a[i][k];",
+            "print(\"ok\", s);" } },
+        /* ... and an ENTERED one must still throw, at the same place */
+        { "entered loop still throws out of bounds", {
+            "var a = [[1,2],[3,4]];",
+            "var z = []; append(z, 7);",
+            "var n = len(z);",
+            "var i = 99; var s = 0;",
+            "try {",
+            "  for (var k = 0; k < n; k++) s += a[i][k];",
+            "} catch (OutOfBoundsEx) { print(\"caught\"); }",
+            "print(s);" } },
+        /* the hoisted row must stay an ALIAS: a write through another alias
+         * made inside the body has to be visible through it */
+        { "alias write through the hoisted row", {
+            "var a = [[10,20],[30,40]];",
+            "var z = [1,2]; var n = len(z);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) {",
+            "  var q = a[i];",
+            "  q[0] = q[0] + 100;",
+            "  s += a[i][k];",
+            "}",
+            "print(s, a[0][0]);" } },
+        /* a pure callback is allowed through; the loop must still be right */
+        { "const builtins + a pure callback in the body", {
+            "var a = [[1,2],[3,4]]; var b = [3,1,2];",
+            "var z = [1,2]; var n = len(z);",
+            "var i = 1; var s = 0;",
+            "for (var k = 0; k < n; k++) {",
+            "  var d = map(func (x) => x * 2, b);",
+            "  s += a[i][k] + len(b) + abs(0 - k) + d[0];",
+            "}",
+            "print(s);" } },
+        /* an IMPURE (capturing) callback rebinds the row mid-loop: whatever the
+         * answer is, every layer must agree on it */
+        { "capturing callback rebinds the base row", {
+            "var a = [[1,2],[3,4]]; var b = [1,2];",
+            "var z = [1,2]; var n = len(z);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) {",
+            "  var d = map(func[a](x) { a[0] = [7,8]; return x; }, b);",
+            "  s += a[i][k];",
+            "}",
+            "print(s, a[0]);" } },
+        /* the slice hoister's shape, and its COW-detach guard */
+        { "slice hoist + a base content write", {
+            "var base = [10,20,30,40];",
+            "var out = \"\";",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[0:2];",
+            "  base[0] = i * 100;",
+            "  out = out + str(sl[0]) + \",\";",
+            "}",
+            "print(out);" } },
+        /* counted-loop + typed-scalar shapes, incl. a float accumulator, a
+         * descending loop and a break/continue */
+        { "counted loops, typed scalars, flow", {
+            "var s = 0; var f = 0.0;",
+            "for (var i = 0; i < 10; i++) {",
+            "  if (i == 3) continue;",
+            "  if (i == 8) break;",
+            "  s += i * i; f += 0.5;",
+            "}",
+            "for (var d = 5; d > 0; d -= 2) s += d;",
+            "print(s, f);" } },
+        /* nested containers written through, so a wrong hoist would show */
+        { "nested container writes", {
+            "var g = [[0,0],[0,0]];",
+            "for (var i = 0; i < 2; i++)",
+            "  for (var j = 0; j < 2; j++)",
+            "    g[i][j] = i * 10 + j;",
+            "print(g);" } },
+        /* a function body (a different frame - the fsize threading) */
+        { "hoist inside a function body", {
+            "func dot(a, b, n) {",
+            "  var s = 0; var i = 0;",
+            "  for (var k = 0; k < n; k++) s += a[i][k] * b[k];",
+            "  return s;",
+            "}",
+            "print(dot([[1,2],[3,4]], [10,20], 2));" } },
+    };
+
+    /* every single pass off, plus all of them - each isolates one layer */
+    const unsigned masks[] = {
+        0,
+        opt_licm, opt_slice_hoist, opt_for_range, opt_typed,
+        opt_all_passes,
+    };
+    const char *mask_name[] = {
+        "(all on)", "-licm", "-slice-hoist", "-for-range", "-typed",
+        "(all off)",
+    };
+    const ExecEngine engines[] = { ExecEngine::TreeWalk, ExecEngine::Vm };
+    const char *eng_name[] = { "tw", "vm" };
+
+    for (const OptLayerCase &c : cases) {
+        std::string src;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i) src += '\n';
+            src += c.lines[i];
+        }
+        std::string ref_out, ref_ex;
+        bool have_ref = false;
+        for (size_t mi = 0; mi < sizeof(masks) / sizeof(masks[0]); mi++) {
+            for (size_t ei = 0; ei < 2; ei++) {
+                std::string out, ex;
+                if (!opt_layer_run(src, engines[ei], masks[mi], out, ex)) {
+                    fprintf(stderr, "opt_layer: '%s' could not run\n", c.name);
+                    return false;
+                }
+                if (!have_ref) {
+                    ref_out = out; ref_ex = ex; have_ref = true;
+                    continue;
+                }
+                if (out != ref_out || ex != ref_ex) {
+                    fprintf(stderr,
+                            "opt_layer: '%s' DIVERGED at %s/%s\n"
+                            "  reference (all on/tw): out=[%s] ex=[%s]\n"
+                            "  this config          : out=[%s] ex=[%s]\n",
+                            c.name, mask_name[mi], eng_name[ei],
+                            ref_out.c_str(), ref_ex.c_str(),
+                            out.c_str(), ex.c_str());
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/*
  * LICM (try_hoist_loop_subscripts): a loop-invariant CONTAINER-yielding
  * subscript is hoisted into a synthetic `$licm<N>` temp above the loop, behind
  * a guard that reproduces the loop's own entry test. Shape assertions - the
@@ -20511,6 +20753,8 @@ static const std::vector<extra_check> extra_checks =
       jit_native_stack_deep },
     { "jit: VmInvoker enters callback fragments directly (lever 2)",
       jit_invoke_direct_entry },
+    { "opt: every AST transform is behaviour-preserving (layer equivalence)",
+      opt_layer_equivalence },
     { "opt: loop-invariant container-subscript hoisting shapes (LICM)",
       hoist_subscript_shapes },
     { "opt: loop-invariant slice hoisting shapes (lever 3)",

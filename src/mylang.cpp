@@ -220,6 +220,8 @@ void help()
          << endl;
     cout << "  -nc      No const eval (debug)" << endl;
     cout << "  -ni      No function inlining (debug)" << endl;
+    cout << "  --no-opt L  Disable AST transforms (comma-separated): "
+         << opt_pass_names() << endl;
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
          << endl;
     cout << "  -nr      Don't run, just validate" << endl;
@@ -373,6 +375,34 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "-npc")) {
 
             g_pure_cache_enabled = false;   /* recursion unroll, no per-frame cache */
+
+        } else if (!strcmp(arg, "--no-opt")) {
+
+            /* Turn OFF one or more AST transforms - the same-binary A/B lever
+             * for an optimizer that rewrites the tree before either engine
+             * runs it (see OptPass in inferencer.h). */
+            if (argc < 2) {
+                cout << "error: --no-opt requires a pass list ("
+                     << opt_pass_names() << ")" << endl;
+                exit(1);
+            }
+            argc--; argv++;
+            std::string spec(*argv), one;
+            for (size_t i = 0; i <= spec.size(); i++) {
+                if (i == spec.size() || spec[i] == ',') {
+                    unsigned bit;
+                    if (!one.empty() && !opt_pass_bit(one, bit)) {
+                        cout << "error: unknown --no-opt pass '" << one
+                             << "' (known: " << opt_pass_names() << ")" << endl;
+                        exit(1);
+                    }
+                    if (!one.empty())
+                        g_opt_disabled |= bit;
+                    one.clear();
+                } else {
+                    one += spec[i];
+                }
+            }
 
         } else if (!strcmp(arg, "-it")) {
 

@@ -4340,6 +4340,7 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                  * map-resident (sym.kind isn't builtin). */
                 auto d = make_unique<DirectBuiltinCallExpr>();
                 call->copy_base_fields(*d);
+                call->copy_call_fields(*d);   /* incl. tq_folded, vm_len_kind */
                 d->lvalue_arg0 = is_lvalue_arg_builtin(id->get_str());
                 d->lvalue_rest_native =
                     is_lvalue_rest_native_builtin(id->get_str());
@@ -4347,8 +4348,6 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                     is_lvalue_rest_capable_builtin(id->get_str());
                 d->map_filter_kind = id->get_str() == "map"    ? 1
                                    : id->get_str() == "filter" ? 2 : 0;
-                d->tq_folded = call->tq_folded;   /* folded type query -> elide */
-                d->vm_len_kind = call->vm_len_kind;  /* lever 4b: native len() */
                 d->what = std::move(call->what);
                 d->args = std::move(call->args);
                 d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();
@@ -4364,12 +4363,9 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                         ? unique_ptr<DirectCallExpr>(new CachedCallExpr())
                         : make_unique<DirectCallExpr>();
                 call->copy_base_fields(*d);
+                call->copy_call_fields(*d);
                 d->what = std::move(call->what);
                 d->args = std::move(call->args);
-                d->direct_func_slot = call->direct_func_slot;
-                d->vm_direct_func = call->vm_direct_func;
-                d->vm_struct_ctor_def = call->vm_struct_ctor_def;
-                d->vm_struct_boxed_def = call->vm_struct_boxed_def;
                 slot = std::move(d);
             }
         }
