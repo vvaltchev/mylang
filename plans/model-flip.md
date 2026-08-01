@@ -951,10 +951,19 @@ the cold-side exc-stamp, safe on the shared bail branch because the
 increment to benefit from the structural fix). A dyn `d++` loop body
 deletes to a bare enter.nat, caret pinned.
 
+**INCREMENT 5 LANDED (2026-07-25):** LoadElemValue (OOB conveys
+exc-stamped; the unreachable non-array tail conveys the interpreted
+InternalErrorEx via eptr - no bail left; a 2-D read loop deletes, caret
+pinned) + StoreElemFloat (emit_float_load gained a no_bail 2-way form -
+float -> movsd, else -> cvtsi2sd, byte-faithful to read_float_slot's
+int/bool promotion since a bool payload is 0/1 zero-extended).
+
 NEXT INCREMENTS: ThrowRuntimeV (build the pooled exception natively),
 the raise-kind ops (IntBin div/mod + shifts via an exc-build-with-loc
-cold helper), LoadElemValue (bounds-check bail -> convey),
-StoreElemFloat (remove the value-load bail).
+cold helper), and the FLOAT ARITH tier's no_bail conversion (FloatBin +
+the RR/RI forms still carry the 3-way bailing operand load, which keeps
+all-float loop bodies non-deletable - the same no_bail argument applies:
+their operands are compile-proven float).
 
 (Historical note - the older tally below predates the iterator ops.)
 CallBuiltinV (~294) is DONE (see
