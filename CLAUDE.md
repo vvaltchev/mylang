@@ -5124,9 +5124,19 @@ deletes it. Structurally this is the goal: with no matcher pc to dispatch
 into, a try/catch region DELETES like any other run -
 70_exc_runtime_error's main chunk goes 35 ops -> **2**, 42_exceptions'
 -> 3, and the corpus audit (`MYLANG_DELAUDIT=1` over bench/ + samples/)
-goes from 9 kept runs to **1** - all 9 were the catch dispatch. The lone
-survivor is 72_exc_finally's, blocked by `EndFinally`, whose cold
-RERAISE arm still bails (it needs vm_raise's dynamic resume). Two fixes landed from measurement:
+goes from 9 kept runs to **1** - all 9 were the catch dispatch. **Step E
+took it to ZERO:** EndFinally's cold RERAISE arm calls `jit_end_finally`
+(the interpreted body's shared `vm_raise`), reporting like `jit_throw` -
+0 dispatched (handler pc parked + returned as an external exit; the op
+already ran, so it is a RESUME), 1 boundary, 2 conveyed, 3 nothing
+pending - while the HOT normal arm stays the inline byte compare. Its
+`inline_chain` argument is `inline_frame_at(old_pc)` resolved at COMPILE
+time and stamped on the exception before the raise (a deleted run's pcs
+collapse onto the head EnterNative, where the pc lookup cannot
+discriminate). TRAP: the cold arm outruns a short jump (`emit_exc_stamp`
+alone does), so the normal/nothing-pending jumps are rel32 - the first
+build asserted in `Emitter::patch8`. Execution-proven by
+`g_jit_end_finally_reraise` over all three outcomes plus a loop shape. Two fixes landed from measurement:
 **the FAST REJECT** - the frame WALK calls the dispatch once per POPPED
 frame and almost none of those frames have a live try; pre-#78 the
 dispatch inlined so the reject was free, and paying a call frame per

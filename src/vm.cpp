@@ -4925,6 +4925,65 @@ extern "C" int jit_throw(int_type val_slot, int_type pc,
     return 0;
 }
 
+/*
+ * #78 step E: the cold RERAISE arm of EndFinally.
+ *
+ * The hot NORMAL arm stays an inline byte compare in the fragment; only
+ * "the finally did NOT handle the exception" reaches here, and it runs the
+ * interpreted op's exact body (the shared vm_raise), reporting like
+ * jit_throw:
+ *    0 = dispatched to a handler - g_vm_resume_chunk/pc are parked and the
+ *        fragment returns that pc as an ordinary external exit (the op
+ *        already ran: this is a RESUME, not a re-run);
+ *    1 = boundary reached (the signal is set; the invocation stops);
+ *    2 = a C++ throw escaped the walk, conveyed via g_vm_jit_exc/eptr;
+ *    3 = nothing to re-raise - fall through, as the normal arm would.
+ *
+ * This was the LAST bail in the exception ops, and hence the corpus' last
+ * kept run (72_exc_finally): with it conveying, a run containing
+ * EndFinally is op_fully_native and its interpreted originals DELETE.
+ *
+ * `inline_chain` is the op's inlined-at chain index, resolved at COMPILE
+ * time from its pre-collapse pc: a deleted run's pcs all collapse onto the
+ * head EnterNative, where vm_raise's own pc lookup cannot discriminate
+ * (Exception::jit_inline_frame - the same bake a conveying fragment does).
+ */
+extern "C" int jit_end_finally(int_type region, int_type pc,
+                               int_type inline_chain) noexcept
+{
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    VmCallRec &rec = act.back_rec();
+    VmPendState &ps = act.pend_at(rec, region);
+
+#ifdef TESTS
+    g_jit_end_finally_reraise++;
+#endif
+    ML_VM_CHECK(ps.pend == Pend::reraise);
+    std::unique_ptr<RuntimeException> ex = std::move(ps.exc);
+    if (!ex)
+        return 3;                      /* nothing pending - fall through */
+
+    if (inline_chain >= 0 && ex->jit_inline_frame < 0)
+        ex->jit_inline_frame = static_cast<int32_t>(inline_chain);
+
+    const Chunk *c2 = rec.run_chunk;
+    size_t p2 = static_cast<size_t>(pc);
+    try {
+        if (!vm_raise(c2, p2, act, ctx, std::move(ex)))
+            return 1;                  /* boundary: signal set */
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    g_vm_resume_chunk = c2;
+    g_vm_resume_pc = p2;
+    return 0;
+}
+
 /* The desc-based twin of do_func_call's vm_capture_frame for the invoke
  * boundary: name/params/pure tag; the call site is loc-less (builtin
  * callbacks pass no call site - matching eval_func's captures today). */
@@ -5535,6 +5594,11 @@ unsigned long g_jit_inline_baked = 0;
 /* #78 step C: catch dispatches served by the HANDLER TABLE (the coverage
  * counter proving the table path - not the CatchTest chain - ran). */
 unsigned long g_vm_table_dispatch = 0;
+/* #78 step E: times EndFinally's cold RERAISE arm ran IN THE FRAGMENT
+ * (jit_end_finally). It is the arm that used to bail, so a test asserting
+ * this bumped is what proves the deletable form actually executes rather
+ * than the interpreter re-running a kept original. */
+unsigned long g_jit_end_finally_reraise = 0;
 #endif
 
 /* model-flip M3: native-container island calls set up process-wide (coverage -
