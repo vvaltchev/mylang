@@ -187,6 +187,26 @@ of `chunk->code.data()` - a double-load per dispatch, front-end-amplified;
 refreshed only at the four chunk-change sites). Zero-copy arg binding was
 MEASURED AND DECLINED (the bind is ~2 instructions per 1-arg call; the
 protocol around it is what costs - see the plan's Phase E verdict).
+**LEVER 1 (2026-07-26, plans/native-gap-roadmap.md) - the LEAN
+CALL PUSH/LEAVE:** the callgrind split on 10_recursion_deep showed
+~500 Ir of protocol per call, ~30 of it just vm_frame_setup's
+prologue/epilogue - the unique_ptr<PureCacheKey> PARAMETER drags
+exception scaffolding + a fat spill frame into every call even when
+always null, and vm_enter_call was a second NOINLINE layer for two
+assignments. The COMMON shape (`fast_bind`, no live cache miss-key)
+now takes `vm_frame_setup_lean`/`vm_enter_call_lean` (no key
+parameter, no coerce branch, ONE out-of-line call; push_window is
+SHARED - it measured lean already) from the interpreted
+CallV/CallValueV cases and jit_call_sync_core; the return side's
+cached tail (the unique_ptr key handling) moved OUT of
+vm_frame_leave into the cold NOINLINE vm_frame_leave_cached, gated
+on rec.cache_key. Measured (callgrind Ir / wall best-of-7):
+10_recursion_deep -9.5% / -15%, 11_closure_counter -2.9% / -4.2%,
+63_closures -1.5%; fib +0.9% Ir (the cached return pays one extra
+call layer - wall-neutral), 76 +0.5% Ir (typed params aren't
+fast_bind, the gate branch buys nothing there). Next lever-1 steps:
+the leave's LValue::put + ref-scan trims, then the record-push
+inline in the fragment (the true native call).
 **`Chunk::ref_slots` (2026-07-18 profile #2):** the audited list of frame
 slots that can EVER hold a >= t_str value (non-coerced params + every dst
 of a non-`op_writes_scalar` op; a chunk with a use-def BARRIER op lists
