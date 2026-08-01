@@ -1152,6 +1152,107 @@ struct Codegen {
                         break;
                     }
                 if (all_typed) {
+                    /* THE CTOR PLAN (the 64_struct_create fix): every arg
+                     * is compile-proven, so bake a per-field {offset, src
+                     * slot, act} list - the runtime does raw slot reads +
+                     * direct byte stores, ZERO coerce_struct_field calls,
+                     * and the planned op NEVER throws. THE src_slot
+                     * EXTENSION: a bare resolved-LOCAL id arg is read
+                     * straight from ITS OWN slot at ctor time (no staging
+                     * MoveV into a run) - sound only when EVERY arg is
+                     * side-effect-free (else a later arg's `x++` would
+                     * mutate the local before the deferred read; with any
+                     * impure arg ALL args stage in source order, exactly
+                     * the old run semantics). Computed args go to a
+                     * CONTIGUOUS temp mini-run recorded in a (DUAL: lo =
+                     * run base or -1, hi = count) for visit_use_def. A
+                     * nested-struct field arg gets NO plan (b_dual_hi
+                     * == -1 -> the generic run path below). */
+                    const size_t nf = sdef->fields.size();
+                    std::vector<uint8_t> acts;
+                    bool plannable = true;
+                    for (const FieldDef &fd : sdef->fields) {
+                        if (fd.kind == FieldKind::f_int)
+                            acts.push_back(0);
+                        else if (fd.kind == FieldKind::f_float)
+                            acts.push_back(1);
+                        else if (fd.kind == FieldKind::f_bool)
+                            acts.push_back(2);
+                        else {
+                            plannable = false;
+                            break;
+                        }
+                    }
+                    if (plannable) {
+                        bool args_pure = true;
+                        for (const auto &el : ce->args->elems)
+                            if (!construct_no_side_effects(el.get())) {
+                                args_pure = false;
+                                break;
+                            }
+                        const size_t mark = ops.size();
+                        const int save_top = next_temp;
+                        const size_t cmark = chunk.consts.size();
+                        std::vector<int32_t> srcs(nf, -1);
+                        std::vector<size_t> comp;
+                        for (size_t ai = 0; ai < nf; ai++) {
+                            const Identifier *aid =
+                                dynamic_cast<const Identifier *>(
+                                    ce->args->elems[ai].get());
+                            if (args_pure && aid
+                                && aid->sym.kind == SymKind::local)
+                                srcs[ai] =
+                                    static_cast<int32_t>(aid->sym.slot);
+                            else
+                                comp.push_back(ai);
+                        }
+                        const int cbase = next_temp;
+                        next_temp += static_cast<int>(comp.size());
+                        if (next_temp > max_temp)
+                            max_temp = next_temp;
+                        bool ok = true;
+                        for (size_t j = 0; j < comp.size(); j++) {
+                            srcs[comp[j]] =
+                                static_cast<int32_t>(cbase)
+                                + static_cast<int32_t>(j);
+                            if (!compile_to_run_slot(
+                                    ce->args->elems[comp[j]].get(),
+                                    cbase + static_cast<int>(j), ops)) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (!ok) {
+                            ops.resize(mark);
+                            next_temp = save_top;
+                            chunk.consts.resize(cmark);
+                        } else {
+                            Chunk::CtorPlan cp;
+                            for (size_t ai = 0; ai < nf; ai++)
+                                cp.f.push_back(
+                                    {static_cast<int32_t>(
+                                         sdef->fields[ai].offset),
+                                     srcs[ai], acts[ai]});
+                            const int plan_idx = static_cast<int>(
+                                chunk.ctor_plans.size());
+                            chunk.ctor_plans.push_back(std::move(cp));
+                            const int dst = alloc_temp();
+                            CgInstr in;
+                            in.op = OpCode::StructCtorV;
+                            in.node_idx = add_ast_node(ce);
+                            in.target = dst;
+                            in.set_a_dual(
+                                comp.empty() ? -1 : cbase,
+                                static_cast<int>(comp.size()));
+                            in.set_b_dual(static_cast<int>(nf), plan_idx);
+                            in.target2 = add_struct_def(sdef);
+                            ops.push_back(in);
+                            out_slot = dst;
+                            return true;
+                        }
+                    }
+                    /* unplanned (nested-struct field / a computed arg that
+                     * failed to lower): the old contiguous-run form */
                     const size_t cmark = chunk.consts.size();
                     int base;
                     if (!emit_args_range(ce->args->elems, base, ops)) {
@@ -1161,44 +1262,11 @@ struct Codegen {
                     const int dst = alloc_temp();
                     CgInstr in;
                     in.op = OpCode::StructCtorV;
-                    in.node_idx = add_ast_node(ce);   /* loc for a defensive throw (nulled) */
+                    in.node_idx = add_ast_node(ce);   /* defensive-throw loc */
                     in.target = dst;
                     in.set_a(int_lit(base));
-                    /* THE CTOR PLAN (the 64_struct_create fix): every arg
-                     * is compile-proven, so bake the per-field {offset,
-                     * act} list - the runtime does raw slot reads + direct
-                     * byte stores, ZERO coerce_struct_field calls, and the
-                     * planned op NEVER throws. A nested-struct field arg
-                     * keeps the generic path (plan idx -1). b is DUAL:
-                     * lo = nfields, hi = ctor_plans idx. */
-                    int plan_idx = -1;
-                    {
-                        Chunk::CtorPlan cp;
-                        bool plannable = true;
-                        for (const FieldDef &fd : sdef->fields) {
-                            uint8_t act;
-                            if (fd.kind == FieldKind::f_int)
-                                act = 0;
-                            else if (fd.kind == FieldKind::f_float)
-                                act = 1;
-                            else if (fd.kind == FieldKind::f_bool)
-                                act = 2;
-                            else {
-                                plannable = false;
-                                break;
-                            }
-                            cp.f.push_back(
-                                {static_cast<int32_t>(fd.offset), act});
-                        }
-                        if (plannable) {
-                            plan_idx =
-                                static_cast<int>(chunk.ctor_plans.size());
-                            chunk.ctor_plans.push_back(std::move(cp));
-                        }
-                    }
                     in.set_b_dual(
-                        static_cast<int>(ce->args->elems.size()),
-                        plan_idx);
+                        static_cast<int>(ce->args->elems.size()), -1);
                     in.target2 = add_struct_def(sdef);
                     ops.push_back(in);
                     out_slot = dst;
@@ -7143,7 +7211,16 @@ static bool visit_use_def(const Instr &in, U u, D d)
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
     case OpCode::StructCtorV:      /* b is DUAL: lo = nfields, hi = plan */
-        run(static_cast<int>(in.a_lit()), in.b_dual_lo());
+        if (in.b_dual_hi() >= 0) {
+            /* PLANNED: a is DUAL (lo = computed-run base or -1, hi =
+             * count). Direct-LOCAL plan srcs are < slot_count, so they
+             * are irrelevant to the TEMP liveness this feeds; the
+             * computed mini-run covers every temp read. */
+            if (in.a_dual_lo() >= 0)
+                run(in.a_dual_lo(), in.a_dual_hi());
+        } else {
+            run(static_cast<int>(in.a_lit()), in.b_dual_lo());
+        }
         d(in.target); return true;
     case OpCode::MakeDictV:
         run(static_cast<int>(in.a_lit()), 2 * static_cast<int>(in.b_lit()));

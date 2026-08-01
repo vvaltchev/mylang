@@ -70,12 +70,14 @@ those classes in impact order.
    Construction: Chunk::ctor_plans + vm_struct_ctor_planned + inline JIT
    H1 fast path (planned ctor = op_never_exits). Measured: 64 callgrind
    Ir -86.6% JIT-on / -50.8% interpreter-only; my/cpp 41.6x -> ~12x.
-   RESIDUAL to reach <=4x (recorded, N7/lever-5 territory): per-dst
-   type-tag two-stores + ref-list checks (~40 Ir/iter here), float
-   operand type-guard loads, per-value staging moves; a plan-src_slot
-   extension (read ctor args straight from source slots, skipping the
-   staging MoveV) needs visit_use_def to see the chunk (plan srcs are
-   uses) - do it with the barrier rules in hand.
+   src_slot extension DONE too (same day): plan fields carry the source
+   SLOT (a bare-local arg reads from its own slot at ctor time, gated on
+   ALL args side-effect-free; computed args in a mini-run recorded in
+   the op's a-dual for visit_use_def - no chunk access needed, since
+   direct srcs are locals and temp liveness only tracks temps).
+   64 Ir 146M -> 137.8M. RESIDUAL to reach <=4x (N7/lever-5 territory):
+   per-dst type-tag two-stores + ref-list checks (~40 Ir/iter here),
+   float operand type-guard loads, float slot round-trips between ops.
    (original analysis follows) (from the 64_struct_create
    audit, 2026-07-26; C++ twin verified fair - stores + reloads through
    memory every iteration, 24 instr/iter vs OUR ~2,180). Two mechanisms,
