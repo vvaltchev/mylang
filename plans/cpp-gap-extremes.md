@@ -268,3 +268,68 @@ the hottest protocol in the VM without a reason to be in there.
 **Item 3 (borrowed container args) is untouched** and still belongs with
 the N7 arc: binding an array parameter costs an `intrusive_ptr`
 retain/release per call, and removing it needs an escape analysis.
+
+
+## The my/cpp tail, re-measured 2026-08-01 after LICM + the frame-pop work
+
+    35_map_filter        10.0x     63_closures          21.1x
+    73_multi_unpack      10.7x     11_closure_counter   21.8x
+    34_sort_custom_cmp   13.7x     46_matrix_mult       23.2x
+    77_struct_array_lit  16.8x     76_funcval_dispatch  23.4x
+    10_recursion_deep    17.9x     75_indexed_unpack    19.8x
+
+Three distinct causes, not one:
+
+  - CALLS - 10, 11, 63, 76. The largest cluster.
+  - the VALUE MODEL (boxed EvalValue + intrusive_ptr per container touch) -
+    46 after LICM, and the tail of the callback benches.
+  - per-op cost in their own ops - 73/75 (unpack), 77 (struct array build).
+
+### THE FINDING: the inline push refuses any call with a reference argument
+
+M5b's fully-inline record push (emit_sync_push_native, jit.cpp) has an
+arg-triviality gate - "each arg's current value must be TRIVIAL (the
+inline copy is a raw payload copy - a reference needs the helper's
+retain)". So a call passing an array/string/dict/struct declines it
+ENTIRELY and takes the C++ slow tier, `jit_call_sync_core`.
+
+Measured, same machinery, opposite outcomes:
+
+    10_recursion_deep   sumto(n - 1)   int arg     jit_call_sync_core
+                                                   called ONCE in 2.7M
+                                                   calls (the first
+                                                   descent, by design)
+    76_funcval_dispatch fn(st, i)      ARRAY arg   called 1,000,000x -
+                                                   EVERY call, 55% of the
+                                                   benchmark's Ir
+
+M5b was measured on 10/11/63 - all scalar-arg calls - so its landing
+numbers were real but its REACH was never checked. This is the
+prove-the-code-ran rule again: "the inline push works" was true of the
+shapes it was tested on, and false of the shape most real code has.
+
+The fix is to emit the retain inline for a reference argument (a refcount
+increment on the payload's RefCounted header, which the fragment can
+already address) rather than declining the whole push. Everything else in
+the inline push already handles it - only the copy is scalar-only.
+
+### The other half of the call: there is no inline POP
+
+The push is emitted inline (when it fires); the RETURN is still a `call`
+into C++ (`jit_ret` / `jit_halt` -> the leave body -> pop_window), ~112 Ir
+after the 2026-08-01 work. Symmetric to M5b, and untried. 10_recursion_deep
+gets the inline push on ~every call and is STILL 17.9x, which bounds what
+the push alone can buy - the remaining per-call protocol is mostly the
+return.
+
+### Honest assessment of "can these reach <= 5x"
+
+The two call items above are concrete, measured, and bounded. They will
+not by themselves take a 23x bench to 5x: at 5x, 76 would have ~260 Ir per
+ITERATION total, and the call protocol alone is ~300 today. Reaching 5x on
+the call benches needs the protocol to become a handful of instructions -
+i.e. the frame push/pop reduced to what a C++ call does - which is the
+whole point of the native-call arc, not one increment of it.
+46_matrix_mult and the callback benches additionally need the value model
+(N7): a boxed EvalValue + an intrusive_ptr retain/release per container
+touch is the floor there, and no amount of call work moves it.
