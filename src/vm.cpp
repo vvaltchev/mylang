@@ -2243,8 +2243,9 @@ vm_make_thrown_exc(const EvalValue &v, Loc estart, Loc eend)
  * interning, so pointer equality == string equality); a subclass without
  * match_uid takes the string fallback.
  */
-static bool vm_catch_match(const Chunk &chunk, int_type types_idx,
-                           const RuntimeException *exc)
+static ML_ALWAYS_INLINE bool vm_catch_match(const Chunk &chunk,
+                                           int_type types_idx,
+                                           const RuntimeException *exc)
 {
     if (types_idx < 0)
         return true;                              /* catch-all */
@@ -2263,24 +2264,111 @@ static bool vm_catch_match(const Chunk &chunk, int_type types_idx,
     return false;
 }
 
-/* P8: pop the innermost handler OF THE CURRENT FRAME (entries below the
- * record's watermark belong to outer frames - those are reached by the
- * boundary catch's frame walk, never here), PARK the exception in the
- * handler's per-region slot (#78: where the CatchTest chain, `rethrow` and
- * a finally's reraise read it - keyed by the try's region id so same-frame
- * nesting cannot clobber it), and set `pc` to its catch-dispatch; false
- * (pc and `ex` untouched) if this frame has none. */
+/*
+ * #78 step C: THE CATCH DISPATCH. Pop the innermost handler OF THE CURRENT
+ * FRAME (entries below the record's watermark belong to outer frames - those
+ * are reached by the frame walk, never here), MATCH the in-flight exception
+ * against that try region's clauses from the HANDLER TABLE, bind
+ * `catch (T as e)`, and set `pc` to the catch BODY - ordinary, entry-mapped
+ * code. False (pc and `ex` untouched) when this frame handles nothing.
+ *
+ * This is the redesign's point. The matcher used to be INTERPRETED ops: the
+ * dispatch jumped to a CatchTest chain, each op decoding operands, re-reading
+ * the region slot and re-dispatching, with a Reraise at the end whose whole
+ * job was to re-enter this function for the next handler out. All of that is
+ * now one C++ loop, and - once step D stops emitting those ops - the chain's
+ * un-deletable "matcher pc" disappears with them, which is what frees a
+ * try/catch run to delete its interpreted originals.
+ *
+ * Three exits per handler:
+ *   - a clause MATCHES: bind + jump to its body. The exception is PARKED in
+ *     the region's slot ONLY when the site's catch/finally bodies contain a
+ *     `rethrow` (the static has_rethrow flag) - the overwhelmingly common
+ *     site never rethrows and skips the move entirely.
+ *   - NO clause matches but the try has a FINALLY: park + pend=reraise and
+ *     jump to it; its EndFinally re-raises (that is what the SetPend+Jump
+ *     tail of the old chain did).
+ *   - NO clause, NO finally: fall to the NEXT handler out in this frame -
+ *     the loop below, which is exactly what the old Reraise round trip
+ *     achieved, minus the round trip.
+ */
+#ifdef TESTS
+extern unsigned long g_vm_table_dispatch;
+#endif
+
+/*
+ * #78 step C: dispatch a raised exception against THIS frame's live handler
+ * stack using the HANDLER TABLE (Chunk::handler_sites) - the region each
+ * PushHandler recorded names its clause list directly, so a catch is a
+ * TABLE LOOKUP instead of a jump to an interpreted CatchTest chain.
+ *
+ * Returns true (and sets `pc` to the resume point - a catch body, or a
+ * finally that will re-raise) iff this frame handles it; false when the
+ * frame's handlers are exhausted and the walk must pop to the caller.
+ *
+ * ONE out-of-line function, called from vm_raise and the boxed-throw sites.
+ * Measured alternatives, both WORSE on 42_exceptions: inlining it at the
+ * call sites (+3.6M Ir - it grows vm_dispatch's text, the loop-body text
+ * rule), and splitting a cold tail out of it (+2.7M - the extra call and
+ * the argument marshalling cost more than the leaner frame saves).
+ */
 static bool vm_dispatch_exc(VmActivation &act, const VmCallRec &cur,
-                            size_t &pc,
+                            EvalContext &ctx, size_t &pc,
                             std::unique_ptr<RuntimeException> &ex)
 {
-    if (act.handlers.size() <= cur.handler_base)
-        return false;
-    const VmHandler h = act.handlers.back();
-    act.handlers.pop_back();
-    act.pend_at(cur, static_cast<int_type>(h.region)).exc = std::move(ex);
-    pc = h.catch_pc;
-    return true;
+    const Chunk *ck = cur.run_chunk;
+
+    while (act.handlers.size() > cur.handler_base) {
+
+        const VmHandler h = act.handlers.back();
+        act.handlers.pop_back();
+
+        ML_VM_CHECK(ck && h.region < ck->handler_sites.size());
+        const Chunk::HandlerSite &site = ck->handler_sites[h.region];
+
+        for (const Chunk::HandlerClause &cl : site.clauses) {
+
+            if (!vm_catch_match(*ck, cl.types_idx, ex.get()))
+                continue;
+
+            if (cl.bind_slot >= 0)
+                ctx.frame->at(cl.bind_slot).put(vm_catch_bind_val(ex.get()));
+
+            /*
+             * Park the exception for a `rethrow` ONLY when this try's catch
+             * bodies actually contain one (codegen's has_rethrow): the park
+             * is an owning move + a later release, and the overwhelmingly
+             * common catch does not rethrow.
+             */
+            if (site.has_rethrow)
+                act.pend_at(cur, static_cast<int_type>(h.region)).exc =
+                    std::move(ex);
+
+#ifdef TESTS
+            g_vm_table_dispatch++;
+#endif
+            pc = static_cast<size_t>(cl.body_pc);
+            return true;
+        }
+
+        if (site.fin_pc >= 0) {
+            /*
+             * No clause matched, but this try has a finally: run it, then
+             * re-raise (EndFinally reads both fields back).
+             */
+            VmPendState &ps = act.pend_at(cur, static_cast<int_type>(h.region));
+            ps.pend = Pend::reraise;
+            ps.exc = std::move(ex);
+#ifdef TESTS
+            g_vm_table_dispatch++;
+#endif
+            pc = static_cast<size_t>(site.fin_pc);
+            return true;
+        }
+        /* neither: keep walking OUT to the next enclosing handler */
+    }
+
+    return false;
 }
 
 /*
@@ -4761,7 +4849,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
      * only this dispatch; routing it through the cold-section walk cost a
      * measured +12% there). Not cold-marked itself for the same reason. */
     VmCallRec &cur = act.back_rec();
-    if (vm_dispatch_exc(act, cur, pc, ex))
+    if (vm_dispatch_exc(act, cur, ctx, pc, ex))
         return true;                       /* chunk unchanged; ex parked */
     return vm_unwind_walk(act, ctx, chunk, pc, std::move(ex));
 }
@@ -5415,6 +5503,11 @@ extern "C" size_t jit_halt() noexcept
 /* #55 STEP 2.1: native CallVs set up process-wide (coverage - see jit.h). */
 unsigned long g_jit_native_calls = 0;
 unsigned long g_jit_inline_baked = 0;
+#ifdef TESTS
+/* #78 step C: catch dispatches served by the HANDLER TABLE (the coverage
+ * counter proving the table path - not the CatchTest chain - ran). */
+unsigned long g_vm_table_dispatch = 0;
+#endif
 
 /* model-flip M3: native-container island calls set up process-wide (coverage -
  * proves a container's jit_exec_block path actually ran; a `jit:` test asserts
@@ -6526,7 +6619,7 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 {
     for (;;) {
         VmCallRec &cur = act.back_rec();
-        if (vm_dispatch_exc(act, cur, pc, ex))
+        if (vm_dispatch_exc(act, cur, ctx, pc, ex))
             return true;                       /* ex parked per-region */
         if (cur.boundary) {
             g_vm_exc_pending = std::move(ex);
@@ -8087,7 +8180,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * as the exception passes through. */
             if (g_vm_exc_pending) {
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
-                if (vm_dispatch_exc(act, cur_rec(), pc,
+                if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
                                     g_vm_exc_pending)) {
                     VM_NEXT_COLD;
                 }
@@ -8138,7 +8231,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                                          pc);
             if (g_vm_exc_pending) {                /* Inc v2: cross-frame */
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);   /* Inc 4 */
-                if (vm_dispatch_exc(act, cur_rec(), pc,
+                if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
                                     g_vm_exc_pending)) {
                     VM_NEXT_COLD;
                 }
@@ -8299,7 +8392,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             }
             if (g_vm_exc_pending) {                /* FuncObject cross-frame */
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
-                if (vm_dispatch_exc(act, cur_rec(), pc,
+                if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
                                     g_vm_exc_pending)) {
                     VM_NEXT_COLD;
                 }

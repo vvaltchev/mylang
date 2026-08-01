@@ -6964,6 +6964,29 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                         { static_cast<size_t>(in.target), 0 });
             }
         }
+
+        /*
+         * #78 step C: EVERY HANDLER-TABLE pc IS A RESUME. The dispatch now
+         * jumps STRAIGHT to a clause's body_pc or to the region's fin_pc, so
+         * both need a real entry point when they land inside a run - a stub
+         * if the run is DELETED (else the pc collapses onto the head
+         * EnterNative and the region re-runs: the step-1 hang, which
+         * resurfaced through fin_pc the moment the table drove dispatch),
+         * and an interior entry if the run is KEPT (what #74 inc 2 already
+         * did for CatchTest's target, now sourced from the table instead).
+         */
+        for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+            const auto add = [&](int32_t t) {
+                if (t < 0)
+                    return;
+                const size_t tt = static_cast<size_t>(t);
+                if (interior_of_kept(tt) || interior_of_deleted(tt))
+                    entries.push_back({ tt, 0 });
+            };
+            for (const Chunk::HandlerClause &cl : hs.clauses)
+                add(cl.body_pc);
+            add(hs.fin_pc);
+        }
         for (size_t p = 0; p < n; p++) {          /* branch targets */
             const Instr &in = chunk.code[p];
             switch (in.op) {

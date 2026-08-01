@@ -16587,6 +16587,10 @@ static bool myv_loc_escapes()
  * ASSERTS-build verify_handler_sites separately pins that it still agrees
  * with the chain after every pc remap.
  */
+#ifdef TESTS
+extern unsigned long g_vm_table_dispatch;   /* #78 step C coverage */
+#endif
+
 static bool vm_handler_table()
 {
     struct Case {
@@ -16689,6 +16693,63 @@ static bool vm_handler_table()
         ci++;
     }
     g_jit_enabled = jit_was;
+
+    /*
+     * #78 step C: PROVE the TABLE served the dispatch, not the CatchTest
+     * chain (which is still emitted until step D, so a green suite alone
+     * would not distinguish them). Run programs whose every dispatch shape
+     * differs - a match, a no-match falling to an outer try IN THE SAME
+     * FRAME (the old Reraise round trip), and a no-match into a finally -
+     * and require the counter to have moved for each.
+     */
+    const std::vector<std::vector<const char *>> shapes = {
+        { "struct A { int v; }",
+          "var r = 0;",
+          "try { throw A(1); } catch (A as e) { r = e.v; }",
+          "assert(r == 1);" },
+        { "struct A { int v; } struct B { int v; }",
+          "var r = 0;",
+          "try {",
+          "  try { throw B(2); } catch (A) { r = -1; }",
+          "} catch (B as e) { r = e.v; }",
+          "assert(r == 2);" },
+        { "struct A { int v; } struct B { int v; }",
+          "var trc = [];",
+          "try {",
+          "  try { throw B(3); } catch (A) { append(trc, -1); }",
+          "  finally { append(trc, 1); }",
+          "} catch (B) { append(trc, 2); }",
+          "assert(trc == [1, 2]);" },
+    };
+    for (const auto &lines : shapes) {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const unsigned long before = g_vm_table_dispatch;
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            g_exec_engine = saved;
+            cout << "  table-dispatch shape threw\n";
+            return false;
+        }
+        g_exec_engine = saved;
+        if (g_vm_table_dispatch == before) {
+            cout << "  the HANDLER TABLE did not serve the dispatch\n";
+            return false;
+        }
+    }
     return true;
 }
 

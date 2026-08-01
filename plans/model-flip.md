@@ -1652,7 +1652,12 @@ handler-pc HANG fix + the per-try-region pend/exc state (myv v7).
 The pend-state change measured, base = step 1 (763d30f):
 
     72_exc_finally   36,296,545 -> 36,798,579   +1.38%  = +1 Ir/iter
-    42_exceptions   245,180,886 -> 251,191,026  +2.45%  = +20 Ir/iter
+    42_exceptions   245,180,886 -> 251,191,026  +2.45%  = +30 Ir/iter
+
+(42's per-iteration figure was first written as +20 by dividing by the
+PRINTED `caught` (300000 = 100k*1 + 100k*2), not the loop count: 42 runs
+N = 200000*scale iterations, one throw each. Corrected here and used
+consistently below.)
 
 72's ENTIRE delta is one instruction: the region dword store in the
 native inline PushHandler. SetPend/EndFinally net ZERO - the new pends
@@ -1718,6 +1723,85 @@ my walk did not model - the table was right, the checker was wrong.
 finally presence, has_rethrow, body pcs in range) over five shapes,
 including that region ids follow COMPILE order, so an outer try holds a
 LOWER id than a try nested in its body.
+
+### Step C (2026-07-31): the raise path dispatches from the TABLE
+
+`vm_dispatch_exc` no longer parks the exception and jumps to the
+CatchTest chain. It now OWNS the whole same-frame decision: pop the
+handler, index `handler_sites[region]`, run `vm_catch_match` over the
+clauses, bind (`bind_slot`), PARK ONLY IF `has_rethrow`, and set `pc` to
+the winning `body_pc`; on no match, `fin_pc >= 0` parks a `reraise` and
+resumes in the finally, else it keeps walking OUT to the next enclosing
+handler in the same frame before returning false to the frame walk.
+
+CatchTest/Reraise are still EMITTED (step D deletes them) but are no
+longer EXECUTED - nothing jumps to them.
+
+Two things had to move with it:
+  - the JIT ENTRY SET is now sourced from the handler table (every
+    clause's `body_pc` and every `fin_pc`), not from CatchTest's target.
+    Without the `fin_pc` half a throw resumed at a pc INSIDE a deleted
+    run, collapsed onto the run's head EnterNative - the step-1 hang,
+    resurfacing from the other side.
+  - `vm_catch_match` is ML_ALWAYS_INLINE. Left out-of-line it cost
+    +40 Ir per throw on 42 (258.4M vs 253.9M) - a call for two loads and
+    a pointer compare.
+
+FORM: ONE out-of-line `vm_dispatch_exc`, called from vm_raise and the
+boxed-throw sites. Two leaner-looking alternatives measured WORSE and
+were reverted:
+    inline at the 5 call sites   42 = 257,460,346  (+3.6M)
+    cold-tail split inside it    42 = 256,560,736  (+2.7M)
+The first is the loop-body TEXT rule again (3 of the sites are inside
+`vm_dispatch`); the second pays a call + argument marshalling for a
+frame it barely shrinks.
+
+### The instruction-count question, answered with the full chain
+
+The maintainer's standing objection - an efficient nativization must not
+ADD instructions - measured across every #78 commit, one session, clean
+same-flag OPT=1 builds (42 = 200k throws, 72 = 500k iterations):
+
+    commit            42_exceptions    /throw     72_exc_finally   /iter
+    3dc7118 pre-#78    245,249,461         -        36,356,944        -
+    763d30f step 1     245,180,788      -0.3        36,296,404     -0.1
+    067cbfc step 2     251,190,917     +30.0        36,798,434     +1.0
+    bc002f6 step B     252,233,683      +5.2        36,893,036     +0.2
+    HEAD    step C     253,860,801      +8.1        36,935,079     +0.1
+                                       -----                      -----
+                                       +43.1                       +1.2
+
+So the FLIP ITSELF (step C) is +8 Ir/throw, and the bulk of the
+regression is NOT the nativization at all:
+
+  step 2 (+30/throw) is the CORRECTNESS fix - the per-try-region state
+  that closed 3 real clobber bugs. Its cost is almost entirely
+  `vm_dispatch` SELF growth: +7,200,004 Ir = +36/throw, i.e. MORE than
+  the step's whole delta (the rest nets -1.2M). That is the region
+  operand widening the exception op cases in the dispatch switch - the
+  front-end/code-layout tax, not work being done.
+
+  step B (+5.2/throw) does NOTHING at runtime (it only BUILDS and
+  verifies the table at compile time, on a 2-chunk program) - pure
+  layout drift from the added code.
+
+WHERE IT COMES BACK (step D, the next commit): deleting CatchTest and
+Reraise removes exactly the two dispatch-switch cases that step 2 grew,
+and PushHandler drops its target pc. That is the mechanism for the +36
+and the +5.2 - the two layout items - and it is testable, not a hope:
+if `vm_dispatch` self does not fall back to ~its step-1 value, the
+claim was wrong and gets recorded as wrong.
+
+Also still on the table for D: PushHandler resets its region's pend, so
+`SetPend(normal)` can leave the normal path entirely (~-8 Ir/iter on
+72's shape).
+
+Residual after that, by construction: `vm_dispatch_exc` self is
+116 Ir/throw, of which 32 are in nested-vector addressing
+(`handlers`/`handler_sites`/`clauses`/`catch_uids`, three levels of
+indirection). Flattening the clause list into one chunk-level vector
+with (start,count) per site is the obvious next cut - deferred, since it
+changes the myv layout again and step D must land first.
 
 ## The original scoping (kept for the record - superseded above)
 
