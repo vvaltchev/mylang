@@ -3613,6 +3613,47 @@ static const std::vector<test> tests =
         "var s = 0;",
         "for (var i = 0; i < n; i++) { var sl = base[1:3]; s += sl[0]; }",
         "assert(s == 0);" } },
+    /*
+     * LICM (try_hoist_loop_subscripts): the GUARDED PREHEADER's whole reason
+     * to exist. `a[i]` CAN throw, so hoisting it above a loop that runs ZERO
+     * times would turn "never evaluated" into "throws before the loop". The
+     * guard reproduces the loop's entry test, so an out-of-range row index in
+     * a never-entered loop must still throw NOTHING - and must still throw
+     * when the loop DOES run.
+     */
+    { "licm: zero-iteration loop does not evaluate the hoisted read",
+      { "var a = [[1, 2], [3, 4]];",
+        "var zarr = [];",
+        "append(zarr, 7);",
+        "var n = len(zarr) - 1;",      /* a runtime int 0 (not dyn) */
+        "var i = 99;",                 /* out of range for a */
+        "var s = 0;",
+        "for (var k = 0; k < n; k++) s += a[i][k];",
+        "assert(s == 0);" } },
+    { "licm: an entered loop still throws on the out-of-range read",
+      { "var a = [[1, 2], [3, 4]];",
+        "var zarr = [];",
+        "append(zarr, 7);",
+        "var n = len(zarr);",          /* a runtime int 1 */
+        "var i = 99;",
+        "var s = 0;",
+        "for (var k = 0; k < n; k++) s += a[i][k];" },
+      &typeid(OutOfBoundsEx) },
+    /* The hoisted temp ALIASES the row (mylang containers are references), so
+     * a write through another alias made in the body is seen through it -
+     * exactly as re-reading `a[i]` every iteration was. */
+    { "licm: the hoisted row stays an alias, not a copy",
+      { "var a = [[10, 20], [30, 40]];",
+        "var zarr = [1, 2];",
+        "var n = len(zarr);",
+        "var i = 0; var s = 0;",
+        "for (var k = 0; k < n; k++) {",
+        "  var q = a[i];",
+        "  q[0] = q[0] + 100;",
+        "  s += a[i][k];",
+        "}",
+        "assert(s == 130);",
+        "assert(a[0][0] == 210);" } },
     { "ternary: incompatible arms make a dyn value (var dyn required)",
       { "var i = 1;",
         "var dyn q = i == 0 ? [1, 2] : 7;",
@@ -15732,6 +15773,142 @@ static bool hoist_slice_shapes()
     return true;
 }
 
+/*
+ * LICM (try_hoist_loop_subscripts): a loop-invariant CONTAINER-yielding
+ * subscript is hoisted into a synthetic `$licm<N>` temp above the loop, behind
+ * a guard that reproduces the loop's own entry test. Shape assertions - the
+ * OBSERVABLE half (a zero-trip loop with an out-of-range index must still not
+ * throw) is pinned separately in the `tests` table, and both engines run the
+ * same transformed tree, so a shape check is what proves the transform fired.
+ */
+static bool hoist_subscript_shapes()
+{
+    struct Case {
+        const char *name;
+        std::vector<const char *> lines;
+        bool expect_hoist;
+        bool expect_guard;     /* only meaningful when expect_hoist */
+    };
+    const std::vector<Case> cases = {
+        /* the target shape: `a[i]` invariant in the inner loop's counter */
+        { "hoist: 2-D row read (46_matrix_mult's inner loop)", {
+            "var a = [[1,2],[3,4]]; var arr = [7,8]; var n = len(arr);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) s += a[i][k];" }, true, true },
+        /* both bounds literal -> the guard is decided at compile time */
+        { "hoist: literal bounds need no guard", {
+            "var a = [[1,2],[3,4]]; var i = 0; var s = 0;",
+            "for (var k = 0; k < 2; k++) s += a[i][k];" }, true, false },
+        /* two occurrences share ONE temp */
+        { "hoist: repeated occurrences share one temp", {
+            "var a = [[1,2],[3,4]]; var arr = [7,8]; var n = len(arr);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) { s += a[i][k]; s += a[i][k]*2; }" },
+          true, true },
+        /* a literal-false guard means the body never runs: nothing to hoist */
+        { "no hoist: loop provably never entered", {
+            "var a = [[1,2],[3,4]]; var i = 0; var s = 0;",
+            "for (var k = 5; k < 2; k++) s += a[i][k];" }, false, false },
+        /* the base's ELEMENT is rewritten -> the row identity can change */
+        { "no hoist: base element rewritten", {
+            "var a = [[1,2],[3,4]]; var arr = [7,8]; var n = len(arr);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) { s += a[i][k]; a[i] = [9,9]; }" },
+          false, false },
+        /* the INDEX moves */
+        { "no hoist: index mutated in the body", {
+            "var a = [[1,2],[3,4]]; var arr = [7,8]; var n = len(arr);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) { s += a[i][k]; i = 1 - i; }" },
+          false, false },
+        /* an opaque call could reach the base through an alias */
+        { "no hoist: opaque call in the body", {
+            "func bump(x) { print(x); }",
+            "var a = [[1,2],[3,4]]; var arr = [7,8]; var n = len(arr);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) { s += a[i][k]; bump(k); }" },
+          false, false },
+        /* CONDITIONAL evaluation: hoisting would evaluate what the loop may
+         * never evaluate (and `a[i]` can throw) */
+        { "no hoist: guarded by an if", {
+            "var a = [[1,2],[3,4]]; var arr = [7,8]; var n = len(arr);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) { if (k > 0) s += a[i][k]; }" },
+          false, false },
+        { "no hoist: inside a ternary arm", {
+            "var a = [[1,2],[3,4]]; var arr = [7,8]; var n = len(arr);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) s += (k > 0) ? a[i][k] : 0;" },
+          false, false },
+        /* the base is DECLARED IN the body: above the loop its slot is stale
+         * (the -rt suite caught exactly this via map()) */
+        { "no hoist: base declared inside the body", {
+            "var arr = [7,8]; var n = len(arr);",
+            "var s = 0;",
+            "for (var k = 0; k < n; k++) {",
+            "  var m = [[1,2],[3,4]]; s += m[0][k];",
+            "}" },
+          false, false },
+        /* a SCALAR element is already a raw slot read - nothing to share */
+        { "no hoist: scalar element", {
+            "var a = [1,2,3]; var arr = [7,8]; var n = len(arr);",
+            "var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) s += a[i] + k;" }, false, false },
+    };
+    for (const Case &c : cases) {
+        std::string s;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i) s += '\n';
+            s += c.lines[i];
+        }
+        lexer(s, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        std::ostringstream out;
+        root->serialize(out);
+        const std::string t = out.str();
+
+        const size_t decl_at = t.find("Id(\"$licm0\")");
+        const bool hoisted = decl_at != std::string::npos;
+        if (hoisted != c.expect_hoist) {
+            fprintf(stderr, "hoist_subscript_shapes: '%s' expected %s\n",
+                    c.name, c.expect_hoist ? "HOIST" : "no hoist");
+            return false;
+        }
+        if (!hoisted)
+            continue;
+        /* the temp must be DECLARED before the loop it was lifted out of */
+        const size_t loop_at = std::min(t.find("ForRangeStmt"),
+                                        t.find("ForStmt"));
+        if (loop_at == std::string::npos || decl_at > loop_at) {
+            fprintf(stderr, "hoist_subscript_shapes: '%s' not above the loop\n",
+                    c.name);
+            return false;
+        }
+        /* the guard is an IfStmt wrapping the decl - present exactly when the
+         * entry test is not decidable at compile time */
+        const size_t if_at = t.find("IfStmt");
+        const bool guarded = if_at != std::string::npos && if_at < decl_at;
+        if (guarded != c.expect_guard) {
+            fprintf(stderr, "hoist_subscript_shapes: '%s' expected %s\n",
+                    c.name, c.expect_guard ? "a GUARD" : "no guard");
+            return false;
+        }
+        /* one temp per distinct expression: `$licm1` only if there were two */
+        const bool two = t.find("Id(\"$licm1\")") != std::string::npos;
+        if (two) {
+            fprintf(stderr, "hoist_subscript_shapes: '%s' made 2 temps for "
+                            "one expression\n", c.name);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Lever 2 (VmInvoker direct fragment entry): per callback ELEMENT the
  * invoker calls jit_enter directly instead of re-entering vm_dispatch -
  * g_jit_invoke_direct counts those entries, so growth ~ the element
@@ -19095,10 +19272,14 @@ static bool vm_codegen_shapes()
         cs.storei == 1 && cs.loadei == 1 && cs.forstepel == 1
         && cs.flstep == 0;
 
-    /* 13) a 2-D read `m[i][j]` in nested loops lowers fully native: the outer
-     * m[i] via LoadElemValue, the inner [j] via LoadElemInt, two ForLoopStep,
-     * no fallback. (A plain 2-D sum has no array-building to force a fallback.)
-     */
+    /* 13) a 2-D read `m[i][j]` in nested loops lowers fully native, and the
+     * INVARIANT row read `m[i]` is HOISTED out of the inner loop (LICM): it
+     * becomes one SubscriptV into a `$licm0` temp above the inner loop, so the
+     * inner body is a single LoadElemInt. The per-iteration LoadElemValue that
+     * used to materialize the row - a boxed EvalValue + an intrusive_ptr
+     * retain/release every iteration - is GONE (loadev == 0), which is the
+     * whole point of the pass. Here `0 < 3` is decidable at compile time, so
+     * no guard is emitted either (juic stays 2: the two loop tests). */
     VmOpCounts d2;
     if (!codegen_counts({
             "var m = [[1,2,3],[4,5,6]]; var s = 0;",
@@ -19109,8 +19290,8 @@ static bool vm_codegen_shapes()
     /* the inner `s += t` + step fuse to IntAddStep (#9); the outer
      * step stays a plain ForLoopStep. */
     const bool read_2d_ok =
-        d2.loadev == 1 && d2.loadei == 1 && d2.flstep == 1
-        && d2.iaddstep == 1;
+        d2.loadev == 0 && d2.subscriptv == 1 && d2.loadei == 1
+        && d2.flstep == 1 && d2.iaddstep == 1 && d2.juic == 2;
 
     /* 14) a scalar-returning migrated BUILTIN in a loop body (`s += sqrt(i)`)
      * lowers native - and a MATH builtin gets the typed MathFnV (F1), not
@@ -20330,6 +20511,8 @@ static const std::vector<extra_check> extra_checks =
       jit_native_stack_deep },
     { "jit: VmInvoker enters callback fragments directly (lever 2)",
       jit_invoke_direct_entry },
+    { "opt: loop-invariant container-subscript hoisting shapes (LICM)",
+      hoist_subscript_shapes },
     { "opt: loop-invariant slice hoisting shapes (lever 3)",
       hoist_slice_shapes },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",

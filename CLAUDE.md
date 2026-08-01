@@ -2809,6 +2809,63 @@ specialize individually, so the loop still becomes a ForRangeStmt).
 Measured with the pooled slices set (inc 1): 15_array_slice_readonly
 -56% Ir / ~0.46x wall combined, 29_str -20.9% Ir; 16/47 flat.
 
+**Loop-invariant CONTAINER-SUBSCRIPT hoisting - LICM
+(`try_hoist_loop_subscripts`, inferencer.cpp, 2026-08-01).** The sibling
+of the slice hoister for a nested-container READ. `for (var k = 0; k < n;
+k++) s += a[i][k] * b[k][j]` re-materializes the ROW `a[i]` every
+iteration - a boxed EvalValue plus an intrusive_ptr retain/release, about
+half of 46_matrix_mult's inner loop - although nothing in the loop can
+change it. It is hoisted into a SYNTHETIC temp (unlike the slice hoister,
+which moves an existing decl, there is no decl here: `$licm<N>` gets a
+fresh frame slot, so `specialize()`/`specialize_children`/`try_for_range`
+now thread an `int *fsize` - the root Block's `slot_count` for main, else
+`FuncDescriptor::frame_size`, exactly as the Inliner's `walk` does; null
+= unresolved = no hoisting, capped at 64 slots):
+`Block(scope_free){ if (0 < n) { var $licm0 = a[i]; } for (...) s +=
+$licm0[k] * b[k][j]; }`.
+**THE GUARD is the load-bearing part.** A slice only CLAMPS, so the slice
+hoister is safe for a zero-trip loop; a SUBSCRIPT throws on OOB, and
+hoisting one above a loop that runs zero times turns "never evaluated"
+into "throws before the loop". The guard is the loop's own entry test
+with the loop variable replaced by the init value (`COND[k := INIT]`), so
+a zero-trip loop still evaluates nothing and a >=1-trip loop evaluates it
+exactly once - the value iteration 1 would have read. Restricted to the
+counted shape `for (var k = INIT; k CMP BOUND; ...)` with INIT and BOUND
+both `fr_immutable` (hence side-effect-free), which makes the guard
+literally `INIT CMP BOUND` - no substitution machinery and no risk of
+duplicating a side effect into it. Two int literals decide it at compile
+time: false means the body never runs (no hoist at all), true means no
+guard is emitted. **The ForStmt is left UNTOUCHED and merely WRAPPED** -
+try_for_range runs next and must still match the counted shape, and
+losing `ForRangeStmt` would cost more than the hoist gains.
+Gates on the candidate: `base_array` (not a dict/string), a CONTAINER
+result (`th` neither i nor f - a scalar element is already a raw slot
+read), `fr_immutable` with the loop var's uid (which also requires the
+base absent from `mut_content`, so an element write anywhere in the loop
+disqualifies it - that is what rules out the COW-detach hazard), no
+reference to anything DECLARED INSIDE the body (`licm_collect_decls`:
+above the loop such a slot is stale - `fr_collect_mutated` deliberately
+SKIPS a pInDecl assignment, so a body-local `var m = map(..)` taints
+nothing and `m[1]` looked invariant; the -rt suite caught exactly this),
+and UNCONDITIONAL evaluation (the scan stops at the first body statement
+that is not a plain expression statement, and never descends into a
+ternary arm / `??` rhs / `&&`-`||` tail). Stricter than `fr_immutable`
+in one place: **any call that is not a pure USER function disqualifies
+the loop** (`licm_has_opaque_call`) - a const BUILTIN is not exempted
+because the higher-order ones take a callback and `fr_collect_mutated`
+stops at a FuncDeclStmt, so a lambda appending to the base would taint
+nothing; try_for_range lives with that gap because it hoists an INT,
+while this keeps a live REFERENCE across every iteration. Occurrences of
+the same expression share one temp (`licm_expr_equal`). The result is
+expressible MyLang - `:show` renders the guard and the decl as real code.
+Measured (callgrind Ir, `OPT=1 ASSERTS=0`): 46_matrix_mult whole-program
+-24.1% at scale 1, and **369 -> 233 Ir per inner iteration** (the
+scale-1-vs-scale-3 delta, so compile time is excluded); wall-clock
+interleaved A/B **0.68x**, suite geomean cur/base 0.998x. It fires on
+exactly ONE program in bench/ + samples/ (46) - a narrow blast radius by
+construction, and every other program's output is byte-identical to the
+pre-LICM binary.
+
 **Counted-loop specialization (`ForRangeStmt`).** Also in `specialize_types`
 (via `try_for_range`, run on the RAW `for` before its cond/inc are specialized),
 the four hottest loop shapes are rewritten to a dedicated `ForRangeStmt`
