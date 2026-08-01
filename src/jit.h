@@ -349,6 +349,17 @@ extern "C" int jit_store_lvalue_chain(int_type kind, int_type base_slot,
 extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept;
 
 /*
+ * Bind ONE reference argument for the fragment-inline sync push. The inline
+ * push copies a scalar argument as raw bytes and used to DECLINE the whole
+ * push when any argument held a reference; it now calls this instead. The
+ * copy cannot be an inlined refcount bump - a SLICE registers itself in its
+ * parent's `slices` set on copy - so this runs fast_bind's exact per-argument
+ * step. `g_jit_ref_arg_binds` is the execution proof (TESTS builds).
+ */
+extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src) noexcept;
+extern unsigned long g_jit_ref_arg_binds;
+
+/*
  * model-flip (nativize-ops): SubscriptV natively - `dst = base[idx]` via the
  * runtime Type::subscript (any base: array/dict/string), the interpreter's
  * EXACT read. base_lv/dst are frame-slot LValue*s, idx the index slot's
