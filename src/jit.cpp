@@ -6879,6 +6879,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                     return true;
             return false;
         };
+        const auto interior_of_deleted = [&](size_t t) -> bool {
+            for (size_t r = 0; r < runs.size(); r++)
+                if (deletable[r] && t > runs[r].begin && t < runs[r].end)
+                    return true;
+            return false;
+        };
         for (size_t r = 0; r < runs.size(); r++) {
             /* #56 step 4: DELETABLE runs get post-call stubs too - the
              * SWITCH protocol's records resume there (a stub is the ONLY
@@ -6888,6 +6894,30 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 if (op == OpCode::CallV || op == OpCode::CachedCallV
                         || op == OpCode::CallValueV)
                     entries.push_back({ p + 1, 0 });
+            }
+            /*
+             * THE DELETED-HANDLER-PC HANG FIX (task #78 step 1, 2026-07-30).
+             * A raise DISPATCHES to the pushed handler pc (PushHandler's
+             * target). In a KEPT run that pc survives (the CatchTest chain,
+             * deliberately excluded from the entry set - entering there
+             * would be enter->exit->reinterpret). But a try/FINALLY with NO
+             * catch clauses has no CatchTest keeping its run alive: the
+             * whole region can DELETE, the handler pc (the Lcatch SetPend)
+             * collapses onto the head EnterNative, and a throw then resumes
+             * at the run START - re-runs the throw - and loops FOREVER
+             * (found by the task-#78 test battery; `try { throw ... }
+             * finally { return 5; }` hung, JIT-on only). Such a target
+             * needs a REAL resume point: an interior entry stub, exactly
+             * like a post-call resume. A target at a deleted run's HEAD
+             * needs nothing (the head EnterNative IS the right resume).
+             */
+            for (size_t p = runs[r].begin; p < runs[r].end; p++) {
+                const Instr &in = chunk.code[p];
+                if (in.op == OpCode::PushHandler && in.target >= 0
+                        && interior_of_deleted(
+                               static_cast<size_t>(in.target)))
+                    entries.push_back(
+                        { static_cast<size_t>(in.target), 0 });
             }
         }
         for (size_t p = 0; p < n; p++) {          /* branch targets */
@@ -7199,11 +7229,15 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                     in.target = entry_remap[in.target];
                 break;
             case OpCode::PushHandler:
-                /* the MATCHER chain's pc stays on the ORIGINALS: a
-                 * handler's first op (CatchTest) is an exit-at-op native,
-                 * so entering it natively is enter->exit->reinterpret */
+                /* the handler pc: through the ENTRY map, so a target inside
+                 * a DELETED span lands on its stub (the hang fix above)
+                 * instead of collapsing onto the head EnterNative and
+                 * re-running the region. For a KEPT run this differs from
+                 * the old plain-remap routing only at the run HEAD (one
+                 * enter->exit->reinterpret bounce on the cold dispatch
+                 * path); interior kept pcs are identical by construction. */
                 if (in.target >= 0 && static_cast<size_t>(in.target) <= n)
-                    in.target = remap[in.target];
+                    in.target = entry_remap[in.target];
                 break;
             default:
                 break;
