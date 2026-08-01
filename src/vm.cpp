@@ -3562,6 +3562,22 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
     return 0;
 }
 
+/* Re-raise deletability (the raise-kind ops): build the JR-kind exception
+ * LOC-LESS into g_vm_jit_exc from the fragment's cold raise branch; the
+ * emit's exc-stamp then adds the op's own caret, so the op CONVEYS like
+ * the rest of the family instead of signalling g_vm_jit_raise (whose
+ * exception EnterNative builds with a loc_at(pc) caret - wrong at a
+ * deleted run's collapsed pc). The construction mirrors EnterNative's
+ * exactly. Cold - called only when the div/shift actually faults. */
+extern "C" void jit_raise_kind_exc(int kind) noexcept
+{
+    g_vm_jit_exc.reset(
+        kind == JR_DIV0
+            ? static_cast<RuntimeException *>(new DivisionByZeroEx())
+            : static_cast<RuntimeException *>(
+                  new InvalidValueEx("negative shift count")));
+}
+
 /* model-flip (nativize-ops): the native CheckCallableV - an indirect
  * call's callable guard (FuncObject / Builtin / struct type descriptor),
  * run BEFORE the arg run evaluates (the tree-walker's dispatch order). A

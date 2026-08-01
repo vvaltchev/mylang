@@ -2147,13 +2147,47 @@ static void raise_unless(Emitter &e, uint8_t pass_cond, int kind, uint32_t pc)
     e.patch8(sk, e.pos());
 }
 
+/* The CONVEY form of emit_raise (re-raise deletability): a cold call to
+ * jit_raise_kind_exc builds the exception into g_vm_jit_exc, the exc-stamp
+ * adds the op's own caret, and the exit lands in EnterNative's
+ * g_vm_jit_exc branch - pc-independent, so the op can be deleted. Used by
+ * the INT div/mod/shift arms; the float div/mod and the elem-OOB sites
+ * keep the g_vm_jit_raise signal (their ops are non-deletable anyway -
+ * bailing operand loads / base gates). The prologue/epilogue bracket
+ * preserves rdi + any N5-pinned regs for the exit flush. */
+static void emit_raise_convey(Emitter &e, const Chunk &ck, int kind,
+                              uint32_t pc, size_t old_pc)
+{
+    emit_call_prologue(e);
+    e.movabs(RDI, static_cast<uint64_t>(kind));
+    e.call_relocs.push_back(
+        { e.pos(), reinterpret_cast<const void *>(jit_raise_kind_exc) });
+    e.u8(0xE8); e.u32(0);
+    emit_call_epilogue(e);
+    emit_exc_stamp(e, ck, old_pc);
+    e.exit_pc(pc);
+}
+
+static void raise_convey_unless(Emitter &e, const Chunk &ck,
+                                uint8_t pass_cond, int kind, uint32_t pc,
+                                size_t old_pc)
+{
+    /* NEAR jcc: the convey sequence (helper bracket + exc-stamp + exit) is
+     * ~100 bytes - far past a short jump's +127 (a patch8 assert caught the
+     * first build). */
+    const size_t sk = e.j32(pass_cond);
+    emit_raise_convey(e, ck, kind, pc, old_pc);
+    e.patch32_here(sk);
+}
+
 /* The shared REG-COUNT shift core (rax = value, rcx = count): a negative
  * count RAISES InvalidValueEx (JR_NEG_SHIFT), a count >= 64 SATURATES (0 for
  * shl/ushr, a full sign-fill for the arithmetic shr), else the machine shift
  * by cl - exactly bit_shl/bit_shr/bit_ushr (bitops.h). Used by the IntShlRR/
  * IntShrRR reg branch AND the generic-IntBin shift arms, so the two cannot
  * drift. Result in rax. */
-static void emit_reg_shift(Emitter &e, Op aop, uint32_t pc)
+static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
+                           size_t old_pc)
 {
     /* D3 /4 shl, /7 sar (signed shr), /5 shr (ushr); C1 imm forms same /r */
     const uint8_t modrm = aop == Op::shl ? 0xE0
@@ -2174,9 +2208,10 @@ static void emit_reg_shift(Emitter &e, Op aop, uint32_t pc)
     e.u8(0xE9);
     const size_t jdone = e.pos(); e.u32(0);
     e.patch32(js, static_cast<uint32_t>(e.pos() - (js + 4)));
-    emit_raise(e, JR_NEG_SHIFT, pc);                     /* negative count:
-                                                          * RAISE InvalidValue
-                                                          * (no re-interpret) */
+    emit_raise_convey(e, ck, JR_NEG_SHIFT, pc, old_pc);  /* negative count:
+                                                          * CONVEY InvalidValue
+                                                          * with the op's own
+                                                          * caret (deletable) */
     e.patch32(jl, static_cast<uint32_t>(e.pos() - (jl + 4)));
     e.u8(0x48); e.u8(0xD3); e.u8(modrm);                 /* shl/sar/shr rax,cl */
     e.patch32(jdone, static_cast<uint32_t>(e.pos() - (jdone + 4)));
@@ -2461,15 +2496,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
         switch (in.aop) {
         case Op::div: case Op::mod:
-            /* test rcx,rcx; raise DIV0 unless nonzero */
+            /* test rcx,rcx; CONVEY DIV0 unless nonzero (deletable) */
             e.u8(0x48); e.u8(0x85); e.u8(0xC9);
-            raise_unless(e, 0x75 /* jnz */, JR_DIV0, pc);
+            raise_convey_unless(e, ck, 0x75 /* jnz */, JR_DIV0, pc, old_pc);
             e.u8(0x48); e.u8(0x99);              /* cqo */
             e.u8(0x48); e.u8(0xF7); e.u8(0xF9);  /* idiv rcx */
             write_slot(e, ck, in.aop == Op::div ? RAX : RDX, in.target, pc);
             return true;
         case Op::shl: case Op::shr: case Op::ushr:
-            emit_reg_shift(e, in.aop, pc);
+            emit_reg_shift(e, ck, in.aop, pc, old_pc);
             break;
         default:
             op_rr(e, in.aop);
@@ -2502,7 +2537,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             read_slot(e, RCX, in.b_slot());   /* cache-aware (the classifier
                                                * counts this shift count as a
                                                * cacheable int use) */
-            emit_reg_shift(e, shl ? Op::shl : Op::shr, pc);
+            emit_reg_shift(e, ck, shl ? Op::shl : Op::shr, pc, old_pc);
         }
         write_slot(e, ck, RAX, in.target, pc);
         return true;
@@ -4577,13 +4612,13 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
 static bool op_never_exits(const Instr &in)
 {
     switch (in.op) {
-    /* generic IntBin: the NON-THROWING arms never return an interior pc ->
-     * deletable. The div/mod/shift arms RAISE (JR_DIV0/JR_NEG_SHIFT) with a
-     * caret from the pc-keyed loc side table, so their originals must stay
-     * (a deleted run collapses every pc onto the EnterNative - the caret
-     * would be wrong), exactly like the reg-shift RR forms. (Own case, NOT
-     * part of the fall-through chain below - the nested switch would
-     * swallow the chain's earlier labels.) */
+    /* generic IntBin: the NON-THROWING arms never return an interior pc.
+     * The div/mod/shift arms EXIT (they convey JR_DIV0/JR_NEG_SHIFT via
+     * jit_raise_kind_exc + the exc-stamp) - deletable, but NOT leaf-safe,
+     * so they stay out of this predicate and live in op_fully_native's
+     * convey section, like the reg-shift RR forms. (Own case, NOT part of
+     * the fall-through chain below - the nested switch would swallow the
+     * chain's earlier labels.) */
     case OpCode::IntBin:
         switch (in.aop) {
         case Op::plus: case Op::minus: case Op::times:
@@ -4724,6 +4759,18 @@ static bool op_fully_native(const Instr &in)
      * unreachable-by-inference non-array/wrong-kind tail conveys the
      * interpreted InternalErrorEx via eptr - no bail left. */
     case OpCode::LoadElemValue:
+        return true;
+    /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
+     * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the
+     * exc-stamp instead of the g_vm_jit_raise signal (whose exception got
+     * its caret from loc_at at the exit pc - wrong once collapsed). The
+     * non-throwing IntBin arms were already never-exits; with the throwing
+     * arms conveying, EVERY IntBin arm is deletable, as are the RR shifts
+     * (the RI shifts were never-exits all along - a negative imm count is
+     * compile-excluded). */
+    case OpCode::IntBin:
+    case OpCode::IntShlRR:
+    case OpCode::IntShrRR:
         return true;
     /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
      * DictStore / StoreElem2V: convey-only helpers, cold-side caret.

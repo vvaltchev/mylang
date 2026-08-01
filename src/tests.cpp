@@ -6751,6 +6751,23 @@ static const std::vector<test> tests =
         },
         &typeid(OutOfBoundsEx), 13, 4, 18, 4,
     },
+    {
+        /* raise-kind deletability: a zero-divisor div in a DELETED run
+         * keeps the divisor caret - the fragment conveys the exception
+         * (jit_raise_kind_exc) + exc-stamps it, instead of the old
+         * g_vm_jit_raise signal whose caret came from the collapsed pc. */
+        "err loc: a DELETED run's div-by-zero keeps the divisor caret",
+        {
+            "func d(int a, dyn b, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++)",
+            "    s += a / b;",
+            "  return s;",
+            "}",
+            "d(runtime(9), runtime(0), 2);",
+        },
+        &typeid(DivisionByZeroEx), 14, 4, 16, 4,
+    },
 
     {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",
