@@ -2,7 +2,7 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 7.  This document describes the on-disk image exhaustively:
+Format version 8.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
 
 It is the specification of what `mylang -c FILE` writes and what `mylang
@@ -326,6 +326,8 @@ Each chunk is:
                                     frame's per-region exception-state
                                     slice, exactly as n_dict_iters sizes
                                     the dict-iterator slice (v7)
+    N x HandlerSite handler_sites   the per-try-region catch table (v8),
+                                    section 9.18
     N x u32  ref_slots              (signed) slots that may hold a reference
     N x value consts
     N x LocEntry locs               9.2
@@ -576,6 +578,29 @@ re-resolves it through `vm_lookup_builtin`; an unknown name is refused.
     u32      a0_slot        (signed)
     u32      a0_operand     (signed) elem: index temp; member: key index
     uid      a0_name        undef form only
+
+9.18  HandlerSite - the per-region catch table
+
+    N x Clause                      one per catch clause, in source order
+        u32  types_idx              (signed) catch_types index, -1 = the
+                                    parenless catch-all
+        u32  bind_slot              (signed) `catch (T as e)` frame slot,
+                                    -1 when the clause binds nothing
+        u32  body_pc                the clause's catch body
+    u32   fin_pc                    (signed) the shared finally, or -1 when
+                                    the try has none (a no-match then
+                                    re-raises to the next handler out)
+    bool  has_rethrow               any catch/finally body may `rethrow`,
+                                    so the dispatch must PARK the caught
+                                    exception in the region's slot
+
+Indexed by TRY REGION ID - the same id the exception ops carry - so entry
+i describes region i.  A try whose native lowering bailed leaves an EMPTY
+entry (zero clauses, fin_pc -1): a hole in the id space, harmless.
+
+This is PRIMARY data, not derived: it is what the raise path matches
+against, and the interpreted CatchTest/Reraise chain that currently
+mirrors it is being removed.
 
 9.17  slot_names
 

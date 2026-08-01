@@ -903,6 +903,21 @@ void write_chunk(Writer &w, const Chunk &c)
     w.u32v(static_cast<uint32_t>(c.n_dyn_iters));
     w.u32v(static_cast<uint32_t>(c.n_trys));          /* #78 (v7) */
 
+    /* #78 step B (v8): the HANDLER TABLE - PRIMARY data (step D deletes the
+     * CatchTest/Reraise chain it could otherwise be derived from). Indexed
+     * by region id; a bailed try leaves an EMPTY entry (a hole). */
+    w.u32v(static_cast<uint32_t>(c.handler_sites.size()));
+    for (const auto &hs : c.handler_sites) {
+        w.u32v(static_cast<uint32_t>(hs.clauses.size()));
+        for (const auto &cl : hs.clauses) {
+            w.u32v(static_cast<uint32_t>(cl.types_idx));
+            w.u32v(static_cast<uint32_t>(cl.bind_slot));
+            w.u32v(static_cast<uint32_t>(cl.body_pc));
+        }
+        w.u32v(static_cast<uint32_t>(hs.fin_pc));
+        w.boolv(hs.has_rethrow);
+    }
+
     w.u32v(static_cast<uint32_t>(c.ref_slots.size()));
     for (int32_t s : c.ref_slots)
         w.u32v(static_cast<uint32_t>(s));
@@ -1190,6 +1205,24 @@ void read_chunk(Reader &r, Chunk &c)
     c.n_dict_iters = static_cast<int>(static_cast<int32_t>(r.u32v()));
     c.n_dyn_iters = static_cast<int>(static_cast<int32_t>(r.u32v()));
     c.n_trys = static_cast<int>(static_cast<int32_t>(r.u32v()));
+
+    /* the HANDLER TABLE (write side: above) */
+    {
+        const uint32_t nh = r.u32v();
+        c.handler_sites.resize(nh);
+        for (uint32_t i = 0; i < nh; i++) {
+            Chunk::HandlerSite &hs = c.handler_sites[i];
+            const uint32_t nc2 = r.u32v();
+            hs.clauses.resize(nc2);
+            for (uint32_t j = 0; j < nc2; j++) {
+                hs.clauses[j].types_idx = static_cast<int32_t>(r.u32v());
+                hs.clauses[j].bind_slot = static_cast<int32_t>(r.u32v());
+                hs.clauses[j].body_pc = static_cast<int32_t>(r.u32v());
+            }
+            hs.fin_pc = static_cast<int32_t>(r.u32v());
+            hs.has_rethrow = r.boolv();
+        }
+    }
 
     uint32_t n = r.u32v();
     c.ref_slots.reserve(n);

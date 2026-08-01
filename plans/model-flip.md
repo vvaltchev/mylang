@@ -1688,6 +1688,37 @@ DELETE or bypass -
 PROJECTION: both benches end BELOW the pre-#78 baseline; measured at
 each step against these exact numbers.
 
+### Step A + B (2026-07-31): the shared matcher + the handler TABLE
+
+A: the CatchTest handler's match logic became `vm_catch_match(chunk,
+types_idx, exc)` - the one function the table dispatch will call, so the
+two cannot drift while both exist.
+
+B: `Chunk::handler_sites` - per try REGION, the clause list
+({types_idx, bind_slot, body_pc}), the shared `fin_pc` (-1 = none), and a
+`has_rethrow` flag. PRIMARY data (step D deletes the chain it could be
+derived from), so it is SERIALIZED (myv v8, documented + doc-checker
+extended) and REMAPPED everywhere a pc moves:
+  - the peephole: jump THREADING, the branch-target map (a table pc is an
+    entry - a no-op today since the CatchTest targets mark the same pcs,
+    load-bearing at step D), and the compaction prefix-sum;
+  - JIT remap 1 (the M3/M4 container path): plain `remap`;
+  - JIT remap 2 (the delete-originals rebuild): `entry_remap`, the map
+    CatchTest's target already takes (#74 inc 2) - a body pc is a RESUME.
+`peephole_chunk` takes the chunk non-const now (it mutates the table).
+
+THE SAFETY NET: `verify_handler_sites` (ASSERTS-only) re-walks each
+PushHandler's chain and asserts the table still describes it exactly -
+after codegen and after BOTH JIT remaps. It earned its keep immediately:
+the first run aborted because the peephole DELETES the no-match `Jump`
+when the shared finally is the next pc (E3's jump-to-next), a chain shape
+my walk did not model - the table was right, the checker was wrong.
+
+`-vd` renders the table; a new test pins its CONTENT (clause counts,
+finally presence, has_rethrow, body pcs in range) over five shapes,
+including that region ids follow COMPILE order, so an outer try holds a
+LOWER id than a try nested in its body.
+
 ## The original scoping (kept for the record - superseded above)
 
 SCOPED 2026-07-29, before the implementation showed one store sufficed.

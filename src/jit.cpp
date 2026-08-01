@@ -29,6 +29,7 @@
  */
 
 #include "jit.h"
+#include "codegen.h"
 #include "bytecode.h"
 #include "evalvalue.h"
 #include "funcdesc.h"   /* FuncDescriptor::vm_chunk (native-call gate, STEP 2.1) */
@@ -6724,6 +6725,17 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &ic : chunk.inline_ctxs)
         ic.pc = static_cast<uint32_t>(remap[ic.pc]);
+    /* #78: the handler table's pcs are resumes into ordinary code, remapped
+     * exactly like the branch targets above (this path keeps every original,
+     * so there is no entry map here). */
+    for (Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (Chunk::HandlerClause &cl : hs.clauses)
+            if (cl.body_pc >= 0 && static_cast<size_t>(cl.body_pc) <= n)
+                cl.body_pc = static_cast<int32_t>(remap[cl.body_pc]);
+        if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) <= n)
+            hs.fin_pc = static_cast<int32_t>(remap[hs.fin_pc]);
+    }
+    verify_handler_sites(chunk);
 
     chunk.native.base = mem;
     chunk.native.len = len;
@@ -7285,6 +7297,17 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &ic : chunk.inline_ctxs)
         ic.pc = static_cast<uint32_t>(remap[ic.pc]);
+    /* #78: the handler table's pcs are RESUMES (a catch body / the shared
+     * finally), so they take entry_remap - the same map CatchTest's target
+     * takes (#74 inc 2), NOT the bail map. */
+    for (Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (Chunk::HandlerClause &cl : hs.clauses)
+            if (cl.body_pc >= 0 && static_cast<size_t>(cl.body_pc) <= n)
+                cl.body_pc = static_cast<int32_t>(entry_remap[cl.body_pc]);
+        if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) <= n)
+            hs.fin_pc = static_cast<int32_t>(entry_remap[hs.fin_pc]);
+    }
+    verify_handler_sites(chunk);
 
     g_cur_entry_remap = nullptr;        /* #56: emission done */
 
