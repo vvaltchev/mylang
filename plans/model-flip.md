@@ -958,12 +958,24 @@ pinned) + StoreElemFloat (emit_float_load gained a no_bail 2-way form -
 float -> movsd, else -> cvtsi2sd, byte-faithful to read_float_slot's
 int/bool promotion since a bool payload is 0/1 zero-extended).
 
+**INCREMENT 6 LANDED (52af95b, 2026-07-25):** the raise-kind INT arms.
+IntBin div/mod + the reg-count shifts convey via a cold
+jit_raise_kind_exc (builds the exact EnterNative-constructed exception
+loc-less into g_vm_jit_exc) + the exc-stamp - every IntBin arm and the
+RR shifts are deletable now, kept OUT of op_never_exits (they exit by
+conveying -> never leaf-safe). GOTCHA: the convey sequence is ~100 bytes
+-> raise_convey_unless needs a NEAR jcc (patch8 asserted on the short
+form). A div/mod/shift loop deletes to a bare enter.nat, zero-divisor
+caret pinned. Int benches neutral (cold-only). The 44_primes_sqrt -9.7%
+in the spot-check is the LEAN SYNC win (ff00437) surfacing on a bench
+outside that increment's list - profiled + attributed.
+
 NEXT INCREMENTS: ThrowRuntimeV (build the pooled exception natively),
-the raise-kind ops (IntBin div/mod + shifts via an exc-build-with-loc
-cold helper), and the FLOAT ARITH tier's no_bail conversion (FloatBin +
-the RR/RI forms still carry the 3-way bailing operand load, which keeps
-all-float loop bodies non-deletable - the same no_bail argument applies:
-their operands are compile-proven float).
+and the FLOAT ARITH tier's no_bail conversion (FloatBin + the RR/RI
+forms still carry the 3-way bailing operand load, which keeps all-float
+loop bodies non-deletable - the same no_bail argument applies: their
+operands are compile-proven float; float div/mod's raise then converts
+like the int arms).
 
 (Historical note - the older tally below predates the iterator ops.)
 CallBuiltinV (~294) is DONE (see
