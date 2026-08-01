@@ -6768,6 +6768,22 @@ static const std::vector<test> tests =
         },
         &typeid(DivisionByZeroEx), 14, 4, 16, 4,
     },
+    {
+        /* the float-tier no_bail conversion: a FLOAT zero-divisor div in a
+         * DELETED run keeps the divisor caret (raise_convey_unless + the
+         * exc-stamp, like the int arms). */
+        "err loc: a DELETED run's float div-by-zero keeps its caret",
+        {
+            "func d(float a, dyn z, int n) {",
+            "  var s = 0.0;",
+            "  for (var i = 0; i < n; i++)",
+            "    s += a / z;",
+            "  return s;",
+            "}",
+            "d(2.5, runtime(0.0), 2);",
+        },
+        &typeid(DivisionByZeroEx), 14, 4, 16, 4,
+    },
 
     {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",
