@@ -984,8 +984,23 @@ smoke initially FAILED TO COMPILE (var q = a/z -> DynRequiredEx) and
 "all three engines agree" was agreement on the ERROR - the -vd deletion
 probe exposed it; always confirm the probe shows real chunks.
 
-NEXT: ThrowRuntimeV (build the pooled exception natively) - the last
-recorded deletability increment.
+**INCREMENT 8 LANDED (2a1233f, 2026-07-26): ThrowRuntimeV.**
+jit_throw_runtime builds the exact pooled exception with its pooled
+caret - Runtime kinds (NotLValue/InvalidNumberOfArgs) via g_vm_jit_exc,
+plain kinds (UndefinedVariable/CannotRebind*) via g_vm_jit_eptr (the M5
+channel postdating the op's old re-run-to-throw exit form). Deletable;
+never leaf-safe. THE RECORDED DELETABILITY LIST IS CLOSED.
+
+**Coverage after the 8 increments (bench/, JIT-off vs on):** TOTAL
+runtime ops 2886 -> 1862 (-35% of all interpreted originals deleted);
+the convey-family survivors sit in runs blocked by their remaining
+non-deletable neighbors - chiefly the call ops (CallV/CachedCallV/
+CallValueV sync forms bail at the depth cap / chunkless callee, so they
+can never delete under the current contract), the iterator/foreach
+helper pairs, and the boxed-branch/handler mix in try-heavy bodies. The
+next structural steps toward whole-body deletion everywhere are the M6
+question (can a sync call op's bail be eliminated so calls delete?) and
+per-pc fragment entry points.
 
 (Historical note - the older tally below predates the iterator ops.)
 CallBuiltinV (~294) is DONE (see
