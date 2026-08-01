@@ -1,6 +1,8 @@
 # The my/cpp extremes: two causes, not many
 
-Status: **cause 2 FIXED (subscript LICM, 2026-08-01); cause 1 OPEN.**
+Status: **cause 2 FIXED (subscript LICM); cause 1 PARTLY fixed - the
+frame pop is 129 -> ~112 Ir, the ref-slot scan is what remains.** Both
+2026-08-01.
 Investigated 2026-08-01 at the maintainer's request ("why so many cases
 > 10x, and why 20-30x?"). All figures callgrind Ir on an `OPT=1
 ASSERTS=0` build.
@@ -205,10 +207,64 @@ All `OPT=1 ASSERTS=0`, both binaries built the same session.
   hoists the container half instead.
 - **Dict bases**: `base_dict` reads have vivify/`for_write` subtleties.
 
-## Item 2 - the call return path: STILL OPEN
+## Item 2 - the call RETURN path: two increments landed 2026-08-01
 
-Unchanged from the diagnosis above, and now the largest remaining item in
-the my/cpp tail: `vm_frame_leave` is the #1 or #2 self-cost in every
-call-heavy bench (10/11/63/76). Ideas, still unvalidated: a single
-precomputed "plain frame" flag replacing `pop_window`'s four watermark
-compares, and skipping the `ref_slots` scan when the list is empty.
+Both ideas from the list above were built. The return was 129 Ir; it is
+now ~112, and the two call/recursion benches that live on it moved 8-14%.
+
+**(1) `Chunk::plain_frame`.** A DERIVED flag (never serialized - the
+loader recomputes it from the three counts it is made of, the same shape
+`catch_uids` uses) meaning the chunk owns no per-frame side state: no try
+regions, no dict iterators, no dyn iterators. Such a frame provably moved
+NONE of the four watermarks between push and pop:
+
+  - `handlers` is only moved by a PushHandler, which exists only in a
+    chunk with `n_trys > 0`;
+  - the `dict_iters` / `dyn_iters` / `pends` slices are grown by
+    push_window ONLY by this chunk's own counts, and every deeper frame's
+    pop trims back to its own base, which is >= ours.
+
+So four comparisons became one flag test. A VM_HARDENING build
+ML_VM_CHECKs all four are really unmoved - so an op that starts pushing
+per-frame state without a chunk count fails loudly rather than leaking it
+into the caller's frame. Also removed a dead `cur_seg` store, overwritten
+from the new top on every return that had a caller.
+
+**(2) The leave body inlined into its three callers** (`jit_ret`,
+`jit_halt`, `vm_leave_call`). Each is already an out-of-line function and
+NONE is inside `vm_dispatch`'s loop body - `vm_leave_call` is itself
+ML_NOINLINE - so the dispatch text does not grow. The frame this removed
+was not small: 13 Ir of prologue + 11 of epilogue against a body doing
+~10 Ir of real work, because the `EvalValue res` BY-VALUE parameter is a
+32-byte type with a non-trivial destructor, which drags a spill slot and
+cleanup scaffolding into the callee. Same disease as
+`vm_dispatch_exc_frame` (#82) and the `unique_ptr` parameter lever 1
+removed from the PUSH side; same cure.
+
+### What is left, and why it was NOT taken
+
+The `ref_slots` reference-release scan is now **50 of the ~112 Ir**, about
+25 per listed slot. That per-slot cost is near-irreducible: it is two
+DEPENDENT loads - the slot's type pointer, then its tag - which is the
+value model's shape, not this loop's (the N7 arc, not here).
+
+The lever is therefore the LENGTH of the list. In `add_op$0` it holds two
+entries, and one of them is an inferred-`int` parameter that can never
+hold a reference - the merge only excludes a param whose `decl_type` is
+explicitly i/f, because there `bind_param`'s coerce is a RUNTIME
+guarantee. Excluding a param on its INFERRED type instead would trade a
+memory-lifetime guarantee for the inference stack being airtight, and the
+failure mode is silent: a retained reference, visible only as a
+lifetime/`use_count` difference, caught only by a hardened build's
+re-scan. Worth ~25 Ir per return; deliberately left for a separate
+decision rather than folded into this session.
+
+Two smaller safe ones also left on the table: hoisting the per-element
+`s >= rec.nslots` bound out of the loop (the chunk knows the total it was
+built against), and storing byte offsets instead of slot indices to drop
+the x48 per element. Together ~10 Ir - not worth another edit cycle on
+the hottest protocol in the VM without a reason to be in there.
+
+**Item 3 (borrowed container args) is untouched** and still belongs with
+the N7 arc: binding an array parameter costs an `intrusive_ptr`
+retain/release per call, and removing it needs an escape analysis.

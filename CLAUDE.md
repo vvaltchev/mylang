@@ -234,6 +234,45 @@ first-descent grows the record high-water through the slow tier by
 design). M5b measured (Ir): 10_recursion_deep -30.4%, 11 -15.5%,
 63 -15.6%; wall ~0.90x each; 10 CUMULATIVE -46% Ir from pre-lever-1.
 See plans/native-gap-roadmap.md for the full per-step record.
+**THE RETURN SIDE (2026-08-01, plans/cpp-gap-extremes.md cause 1).** A
+profile of the my/cpp tail found `vm_frame_leave`/`pop_window` the #1 or
+#2 SELF cost in every call-heavy bench (10/11/63/76) - 129 Ir per return,
+against a C++ return's ~0. Two changes, both of the "the protocol around
+the work costs more than the work" family:
+(1) **`Chunk::plain_frame`** - a DERIVED flag (never serialized; the
+loader recomputes it beside the three counts it is made of, like
+catch_uids) meaning the chunk owns no per-frame side state: no try
+regions, no dict iterators, no dyn iterators. Such a frame provably moved
+NONE of the four watermarks between its push and its pop - only a
+PushHandler moves `handlers` and those exist only where n_trys > 0, and
+push_window grows the iterator/pend slices ONLY by this chunk's own
+counts while every deeper frame's pop trims to its own base (>= ours). So
+pop_window's four comparisons became ONE flag test; a VM_HARDENING build
+ML_VM_CHECKs all four are really unmoved, so a future op that pushes
+per-frame state without a chunk count fails loudly instead of leaking it
+into the caller. Also removed a dead `cur_seg` store (it was overwritten
+from the new top on every return that had a caller). Measured: 10 -4.5%,
+11 -3.0%, 63 -2.3%, 76 -1.4%.
+(2) **The leave body is INLINED into its three callers** (`jit_ret`,
+`jit_halt`, `vm_leave_call` - each already an out-of-line function, and
+NONE inside `vm_dispatch`'s loop body, so the dispatch text does not
+grow). `vm_frame_leave`'s own frame was 13 Ir of prologue + 11 of
+epilogue against a body doing ~10 Ir of real work: the `EvalValue res`
+BY-VALUE parameter is a 32-byte type with a non-trivial destructor, which
+drags a spill slot and cleanup scaffolding into the callee - the same
+disease as `vm_dispatch_exc_frame` (#82) and the `unique_ptr` parameter
+lever 1 removed from the PUSH side. Measured (cumulative with (1)):
+10_recursion_deep **-14.0%**, 11_closure_counter **-9.5%**,
+63_closures **-7.7%**, 76_funcval_dispatch -2.8%; fib -0.6%,
+08_func_call neutral.
+The largest remaining item in the return is the `ref_slots`
+reference-release scan (**50 of the ~112 Ir left**, ~25 per listed slot:
+two DEPENDENT loads - the slot's type pointer, then its tag - which the
+value model makes irreducible). Narrowing the LIST is the lever - an
+inferred-int param sits in it although it can never hold a reference -
+but that trades a memory-lifetime guarantee for inference being airtight,
+where the failure mode is a silently retained reference. Left as a
+separate, discussable step; see plans/cpp-gap-extremes.md.
 **Sync-depth accounting (fixed 2026-07-27):** the depth DEC runs AFTER
 `jit_sync_postexit` - at the emitted inline site AND in
 `jit_call_sync_core`'s direct-entry branch - because the postexit's

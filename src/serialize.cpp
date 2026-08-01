@@ -1205,6 +1205,9 @@ void read_chunk(Reader &r, Chunk &c)
     c.n_dict_iters = static_cast<int>(static_cast<int32_t>(r.u32v()));
     c.n_dyn_iters = static_cast<int>(static_cast<int32_t>(r.u32v()));
     c.n_trys = static_cast<int>(static_cast<int32_t>(r.u32v()));
+    /* DERIVED, never stored: the loader recomputes it from the three counts
+     * just read, the same rebuild-a-derived-twin shape catch_uids uses. */
+    c.set_plain_frame();
 
     /* the HANDLER TABLE (write side: above) */
     {
