@@ -705,8 +705,14 @@ struct Codegen {
         /* the finally body (or null): a flow op crossing this try INLINES it at
          * the flow-op site (Inc 2c), so it needs the AST here. */
         const Construct *finally_body = nullptr;
+        /* #78: this try's chunk-static REGION ID - baked into its exception
+         * ops; keys the per-frame {exc, pend} slot (Chunk::n_trys). */
+        int region = 0;
     };
     std::vector<TryFrame> trys;
+    /* #78: the monotonic try-region allocator (nested/sequential trys get
+     * distinct ids; each INLINED finally copy's nested trys re-allocate). */
+    int next_try_region = 0;
 
     /* An INLINED-CALL return boundary (InlinedCallExpr): the callee's body runs
      * with its OWN return scope - a `return v` inside it yields THIS expression's
@@ -3571,11 +3577,21 @@ struct Codegen {
     }
 
     /* P8 Inc 2a: `rethrow` (only in a catch body) -> a native Rethrow op
-     * (re-raise vm_exc with the rethrow-site loc). Always succeeds. */
+     * (re-raise the caught exception with the rethrow-site loc). #78: bakes
+     * the region id of the try whose CATCH BODY lexically contains the
+     * rethrow (the innermost in_catch entry) - that region's slot holds the
+     * exception being handled, immune to inner regions' traffic. */
     void emit_rethrow(const RethrowStmt *rt, std::vector<CgInstr> &ops)
     {
+        int region = -1;
+        for (size_t i = trys.size(); i-- > 0; )
+            if (trys[i].in_catch) { region = trys[i].region; break; }
+        /* the parser gates `rethrow` to catch bodies, so an enclosing
+         * in_catch try must exist here */
+        ML_CHECK(region >= 0);
         CgInstr in;
         in.op = OpCode::Rethrow;
+        in.set_a(int_lit(region));
         in.node_idx = add_ast_node(rt);                 /* rethrow-site loc (extract_locs) */
         ops.push_back(in);
     }
@@ -5604,11 +5620,13 @@ struct Codegen {
      *   Lcb: <catch B> ; Jump Lend
      *   Lend:
      */
-    /* Emit SetPend <p> (Inc 2b): the pending action a following finally runs. */
-    void emit_setpend(Pend p)
+    /* Emit SetPend <p> (Inc 2b): the pending action a following finally
+     * runs, in try region `region`'s slot (#78). */
+    void emit_setpend(int region, Pend p)
     {
         CgInstr in;
         in.op = OpCode::SetPend;
+        in.set_a(int_lit(region));
         in.target = static_cast<int>(p);
         code.push_back(in);
     }
@@ -5626,6 +5644,10 @@ struct Codegen {
         const size_t start = code.size();
         const size_t ct_start = chunk.catch_types.size();
         const size_t trys_depth = trys.size();
+        /* #78: this try's region id. NOT rolled back by bail() - a bailed
+         * try leaves a hole in the id space, which only costs an unused
+         * pends slot (self-consistent either way). */
+        const int region = next_try_region++;
 
         /* Jumps to the finally block / to Lend, backpatched at the end. With a
          * finally, every exit path sets the pending action + jumps to Lfin
@@ -5633,10 +5655,11 @@ struct Codegen {
         std::vector<size_t> to_fin, to_end;
         auto exit_to = [&](Pend p) {
             if (has_fin) {
-                emit_setpend(p);
+                emit_setpend(region, p);
                 to_fin.push_back(emit(OpCode::Jump));
             } else if (p == Pend::reraise) {
-                emit(OpCode::Reraise);
+                const size_t rr = emit(OpCode::Reraise);
+                code[rr].set_a(int_lit(region));   /* #78: whose exc */
             } else {
                 to_end.push_back(emit(OpCode::Jump));
             }
@@ -5650,11 +5673,12 @@ struct Codegen {
         };
 
         const size_t ph = emit(OpCode::PushHandler);   /* target=catch_pc (patch) */
+        code[ph].set_a(int_lit(region));               /* #78: the region id */
         /* Register this try so a flow op in the body/catch (Inc 2c) can inline
          * this finally + pop this handler. `in_catch` starts false (the body's
          * handler is live); flipped true before the catch bodies. */
         trys.push_back({ has_fin, has_fin ? &to_fin : nullptr, false,
-                         t->finallyBody.get() });
+                         t->finallyBody.get(), region });
         if (!compile_scalar_body(body_stmts(t->tryBody.get()), false))
             return bail();
         emit(OpCode::PopHandler);
@@ -5680,6 +5704,7 @@ struct Codegen {
             CgInstr in;
             in.op = OpCode::CatchTest;
             in.set_a(int_lit(types_idx));
+            in.set_b(int_lit(region));                 /* #78: whose exc */
             in.target2 = asId ? asId->sym.slot : -1;   /* bind slot / -1 */
             tests.push_back(code.size());         /* patch .target below */
             code.push_back(in);
@@ -5707,7 +5732,8 @@ struct Codegen {
                 code[j].target = lfin;
             if (!compile_scalar_body(body_stmts(t->finallyBody.get()), false))
                 return bail();
-            emit(OpCode::EndFinally);
+            const size_t ef = emit(OpCode::EndFinally);
+            code[ef].set_a(int_lit(region));           /* #78: whose pend */
         }
 
         const int lend = static_cast<int>(here());
@@ -7987,6 +8013,7 @@ codegen_chunk(const Block *block, int slot_count, bool jit)
     cg.chunk.n_temps = cg.max_temp - slot_count;
     cg.chunk.n_dict_iters = cg.max_dict_iters;
     cg.chunk.n_dyn_iters = cg.max_dyn_iters;
+    cg.chunk.n_trys = cg.next_try_region;             /* #78: region count */
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
     peephole_chunk(cg.code, cg.chunk);   /* E1-E4 - BEFORE extract_locs, so

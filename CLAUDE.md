@@ -142,10 +142,12 @@ binds args with a `fast_bind` copy loop (or the coercing loop for typed
 params), switches `chunk`/`pc`/`captures`, and dispatches; `ReturnV`/`Halt`
 pop the record and write the parent's result slot directly (FlowState is
 gone from in-VM returns; the deleted `LoopBackEdge` was its last reader).
-Per-frame state (handler stack, dict/dyn iterator pools, in-flight caught
-exception, finally-pend, the per-frame `PureCache` - stashed/restored so
-the shared view Frame can't leak it into global memoization) lives in the
-records as watermarked slices of shared stacks. **The record stack is
+Per-frame state (handler stack, dict/dyn iterator pools, the per-frame
+`PureCache` - stashed/restored so the shared view Frame can't leak it
+into global memoization) lives in the records as watermarked slices of
+shared stacks; the caught-exception/finally-pend state is PER TRY
+REGION, not per record (#78 step 2 - see the paragraph after #74's).
+**The record stack is
 REUSE-based (N6 call-path lean):** `records` is PHYSICAL storage grown only
 to the high-water mark, and a live-count `rec_n` indexes it - a push REUSES
 the already-constructed record (`records[rec_n++]`), so the ~140-byte
@@ -5031,6 +5033,43 @@ lazy init replaces it. 70_exc -1.6%. CAMPAIGN TOTAL: 155.7M -> 72.7M
 (**-53.3%**); the residue is the CatchTest/EnterNative dispatch, the
 same-frame vm_raise machinery (~40 Ir/raise), and the per-throw
 ctor/dtor - each next step architectural for cold-path returns.
+
+**#78 steps 1-2 (2026-07-30) - the DELETED-HANDLER-PC HANG + the
+per-try-REGION exception state.** The catch-dispatch redesign began with
+a ~40-test battery (the `catchd:` block) pinning dispatch-order
+semantics, which immediately found FIVE pre-existing bugs. (1) A JIT
+HANG shipped with the #56 final batch: a try/FINALLY with NO catch
+clauses has no CatchTest keeping its run alive, so the region deletes
+and the handler pc a raise dispatches to (PushHandler's target)
+collapsed onto the head EnterNative - the throw resumed at the run
+start and looped FOREVER. Fixed: such a target gets an interior entry
+STUB (the post-call-resume machinery, generic) and PushHandler.target
+routes through entry_remap. (2-4) The nested pend/exc CLOBBER class:
+ONE per-record {exc, pend} pair served every try region of a frame, so
+same-frame nesting clobbered it - a try/catch inside a FINALLY body let
+the pending exception ESCAPE, a try/FINALLY inside a finally silently
+LOST it, and a caught inner try corrupted what `rethrow` re-raises (the
+tree-walker was immune: its state lives in TryCatchStmt::do_eval C++
+locals, nested by recursion). Fixed by PER-TRY-REGION slots: each `try`
+gets a chunk-static monotonic REGION ID (`Chunk::n_trys`, serialized -
+myv v7) baked into PushHandler(a)/SetPend(a)/EndFinally(a)/CatchTest(b)/
+Reraise(a)/Rethrow(a = the innermost in_catch try's region); the runtime
+state is `act.pends[rec.pend_base + region]` (`VmPendState {exc, pend}`,
+the dict_iters watermark pattern; `vm_dispatch_exc` PARKS the exception
+in the handler's region slot - `VmHandler` grew to {catch_pc, region},
+8 bytes, so the emitted M5b handler_base bake shifts by 3 now). A
+record's `pend_base` is VALID ONLY when run_chunk->n_trys != 0: the M5b
+inline push DECLINES try-bearing callees (like the iter pools), so
+try-free records may carry a stale pend_base - every reader (pend_at,
+pop_window's trim) is gated on n_trys. The nested-rethrow semantics fell
+out CORRECT for free (the outer region's slot still holds its exception
+while an inner region traffics). (5) The finally-body FLOW spec was
+pinned from the tree-walker: a flow signal raised INSIDE a finally body
+REPLACES the pending action (`return`/`break` win, the exception is
+abandoned). ONE deliberate residue, flagged as a DESIGN FORK, not fixed:
+`rethrow` inside an inner TRY body within a catch body - the tree-walker
+propagates from the OWNING try, the VM (like Python/C#) raises at the
+rethrow SITE and the inner catch intercepts; maintainer to rule.
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by

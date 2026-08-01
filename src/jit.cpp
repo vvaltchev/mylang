@@ -266,7 +266,13 @@ struct JitLayout {
     int act_records;      /* VmActivation::records (vector<VmCallRec>) */
     int act_rec_n;        /* VmActivation::rec_n (size_t) */
     int rec_size;         /* sizeof(VmCallRec) */
-    int rec_pend;         /* VmCallRec::pend (a byte enum) */
+    int act_top_rec;      /* VmActivation::top_rec (the cached &back_rec -
+                           * maintained by every push/pop incl. the emitted
+                           * M5b push, ML_VM_CHECK-verified) */
+    int act_pends;        /* VmActivation::pends (vector<VmPendState>) */
+    int rec_pend_base;    /* VmCallRec::pend_base (u32) */
+    int pend_state_size;  /* sizeof(VmPendState) */
+    int pend_state_pend;  /* VmPendState::pend (a byte enum) */
     /* #55 STEP 2.1 native-call member offsets (via the vm.cpp probes) */
     int desc_vm_chunk;    /* FuncDescriptor::vm_chunk */
     int chunk_native_base;/* Chunk::native.base */
@@ -348,7 +354,11 @@ static const JitLayout &jit_layout()
         l.act_records = static_cast<int>(jit_off_act_records());
         l.act_rec_n = static_cast<int>(jit_off_act_rec_n());
         l.rec_size = static_cast<int>(jit_sizeof_vm_rec());
-        l.rec_pend = static_cast<int>(jit_off_rec_pend());
+        l.act_top_rec = static_cast<int>(jit_off_act_top_rec());
+        l.act_pends = static_cast<int>(jit_off_act_pends());
+        l.rec_pend_base = static_cast<int>(jit_off_rec_pend_base());
+        l.pend_state_size = static_cast<int>(jit_sizeof_pend_state());
+        l.pend_state_pend = static_cast<int>(jit_off_pend_state_pend());
         l.desc_vm_chunk = static_cast<int>(jit_off_desc_vm_chunk());
         l.chunk_native_base = static_cast<int>(jit_off_chunk_native_base());
         l.chunk_native_entry = static_cast<int>(jit_off_chunk_native_entry());
@@ -1036,7 +1046,7 @@ static bool jit_op_eligible(const Instr &in)
      * measured +8% on the no-throw try path and reverted - the call
      * protocol exceeded the dispatch it replaced for a 4-byte vector
      * push/pop). PushHandler = a capacity check + store + bump (the cold
-     * grow falls to jit_push_handler_grow); PopHandler = `finish -= 4`;
+     * grow falls to jit_push_handler_grow); PopHandler = `finish -= 8`;
      * SetPend = a byte store into records[rec_n-1].pend. None can throw ->
      * op_fully_native. PushHandler routes through emit_branch (its pushed
      * catch_pc is a PC needing remap[]). The raise-side ops (Throw/
@@ -1797,6 +1807,10 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     j_slow.push_back(e.j32(0x75));                    /* jne slow */
     cmp_d_imm8(RCX, static_cast<int32_t>(P.ck_n_dyn_iters), 0);
     j_slow.push_back(e.j32(0x75));                    /* jne slow */
+    /* #78: a callee with TRY regions needs rec.pend_base + a pends slice -
+     * push_window's job; the inline push declines (like the iter pools). */
+    cmp_d_imm8(RCX, static_cast<int32_t>(P.ck_n_trys), 0);
+    j_slow.push_back(e.j32(0x75));                    /* jne slow */
     /* rsi = total = frame_size + n_temps */
     if (!cached) {
         /* a PLAIN call from a cache-carrying caller declines (the stash
@@ -1883,7 +1897,8 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     st(R10, static_cast<int32_t>(P.rec_caller_caps), RAX);
     ld(RAX, R8R, static_cast<int32_t>(P.act_handlers2) + 8);
     modrm(0x2B, RAX, R8R, static_cast<int32_t>(P.act_handlers2), true);
-    e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(0x02);   /* shr rax, 2 */
+    e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(0x03);   /* shr rax, 3 (#78:
+                                                       * 8-byte VmHandler) */
     st32(R10, static_cast<int32_t>(P.rec_handler_base), RAX);
     ld32(RAX, R8R, static_cast<int32_t>(P.act_diters_n));
     st32(R10, static_cast<int32_t>(P.rec_diter_base), RAX);
@@ -4422,62 +4437,74 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::PopHandler: {
-        /* INLINE handler pop (step 7a): `finish -= 4` - a VmHandler is a
-         * trivial 4-byte struct, so vector pop_back is exactly the finish
-         * decrement (never empty at a PopHandler by codegen construction).
-         * Never throws. */
+        /* INLINE handler pop (step 7a): `finish -= 8` - a VmHandler is a
+         * trivial 8-byte {catch_pc, region} struct (#78), so vector
+         * pop_back is exactly the finish decrement (never empty at a
+         * PopHandler by codegen construction). Never throws. */
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::PopHandler);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
         e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));
-        e.u8(0x48); e.u8(0x83); e.u8(0xE9); e.u8(4);   /* sub rcx, 4 */
+        e.u8(0x48); e.u8(0x83); e.u8(0xE9); e.u8(8);   /* sub rcx, 8 */
         e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));
         return true;
     }
 
     case OpCode::SetPend: {
-        /* INLINE finally-pend store (step 7a): a byte store into
-         * records[rec_n - 1].pend (target = the Pend ENUM value, not a
-         * pc). Never throws. */
+        /* INLINE finally-pend store (step 7a; #78 re-addressed): a byte
+         * store into pends[rec.pend_base + region].pend, the try's
+         * per-REGION slot (a = the region id, target = the Pend ENUM
+         * value - neither is a pc). Never throws. */
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::SetPend);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+recs+0] */
-        e.u32(static_cast<uint32_t>(L.act_records));   /* _M_start */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x90);        /* mov rdx, [rax+rec_n] */
-        e.u32(static_cast<uint32_t>(L.act_rec_n));
-        e.u8(0x48); e.u8(0xFF); e.u8(0xCA);        /* dec rdx */
-        e.u8(0x48); e.u8(0x69); e.u8(0xD2);        /* imul rdx, rdx, size */
-        e.u32(static_cast<uint32_t>(L.rec_size));
-        e.u8(0x48); e.u8(0x01); e.u8(0xD1);        /* add rcx, rdx */
-        e.u8(0xC6); e.u8(0x81);                    /* mov byte [rcx+pend], v */
-        e.u32(static_cast<uint32_t>(L.rec_pend));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+toprec] */
+        e.u32(static_cast<uint32_t>(L.act_top_rec));   /* = &back_rec */
+        e.u8(0x8B); e.u8(0x91);                    /* mov edx, [rcx+pbase] */
+        e.u32(static_cast<uint32_t>(L.rec_pend_base));
+        if (in.a_lit()) {
+            e.u8(0x81); e.u8(0xC2);                /* add edx, region */
+            e.u32(static_cast<uint32_t>(in.a_lit()));
+        }
+        ML_CHECK(L.pend_state_size == 16);
+        e.u8(0x48); e.u8(0xC1); e.u8(0xE2); e.u8(4);   /* shl rdx, 4 */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x80);        /* mov rax, [rax+pends] */
+        e.u32(static_cast<uint32_t>(L.act_pends)); /* _M_start */
+        e.u8(0x48); e.u8(0x01); e.u8(0xD0);        /* add rax, rdx = entry */
+        e.u8(0xC6); e.u8(0x80);                    /* mov byte [rax+off], v */
+        e.u32(static_cast<uint32_t>(L.pend_state_pend));
         e.u8(static_cast<uint8_t>(in.target));
         return true;
     }
 
     case OpCode::EndFinally: {
-        /* INLINE the NORMAL path: records[rec_n-1].pend == normal (0) ->
-         * fall through to Lend; RERAISE -> bail (the interpreter re-runs
-         * EndFinally and raises via vm_raise). */
+        /* INLINE the NORMAL path: pends[rec.pend_base + region].pend ==
+         * normal (0) -> fall through to Lend; RERAISE -> bail (the
+         * interpreter re-runs EndFinally and raises via vm_raise).
+         * (a = the region id, #78.) */
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::EndFinally);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+recs+0] */
-        e.u32(static_cast<uint32_t>(L.act_records));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x90);        /* mov rdx, [rax+rec_n] */
-        e.u32(static_cast<uint32_t>(L.act_rec_n));
-        e.u8(0x48); e.u8(0xFF); e.u8(0xCA);        /* dec rdx */
-        e.u8(0x48); e.u8(0x69); e.u8(0xD2);        /* imul rdx, rdx, size */
-        e.u32(static_cast<uint32_t>(L.rec_size));
-        e.u8(0x48); e.u8(0x01); e.u8(0xD1);        /* add rcx, rdx */
-        e.u8(0x80); e.u8(0xB9);                    /* cmp byte [rcx+pend], 0 */
-        e.u32(static_cast<uint32_t>(L.rec_pend));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+toprec] */
+        e.u32(static_cast<uint32_t>(L.act_top_rec));   /* = &back_rec */
+        e.u8(0x8B); e.u8(0x91);                    /* mov edx, [rcx+pbase] */
+        e.u32(static_cast<uint32_t>(L.rec_pend_base));
+        if (in.a_lit()) {
+            e.u8(0x81); e.u8(0xC2);                /* add edx, region */
+            e.u32(static_cast<uint32_t>(in.a_lit()));
+        }
+        ML_CHECK(L.pend_state_size == 16);
+        e.u8(0x48); e.u8(0xC1); e.u8(0xE2); e.u8(4);   /* shl rdx, 4 */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x80);        /* mov rax, [rax+pends] */
+        e.u32(static_cast<uint32_t>(L.act_pends));
+        e.u8(0x48); e.u8(0x01); e.u8(0xD0);        /* add rax, rdx = entry */
+        e.u8(0x80); e.u8(0xB8);                    /* cmp byte [rax+off], 0 */
+        e.u32(static_cast<uint32_t>(L.pend_state_pend));
         e.u8(0);
         e.bail_unless(0x74, pc);      /* je (normal) else BAIL (reraise) */
         return true;
@@ -5576,6 +5603,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * finish. Never throws. */
         const JitLayout &L = jit_layout();
         const uint32_t tgt = static_cast<uint32_t>(remap[in.target]);
+        const uint32_t region = static_cast<uint32_t>(in.a_lit());  /* #78 */
         e.bump_op(OpCode::PushHandler);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] (act) */
@@ -5586,13 +5614,17 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
         e.u8(0xC7); e.u8(0x01);                    /* mov dword [rcx], tgt */
         e.u32(tgt);
-        e.u8(0x48); e.u8(0x83); e.u8(0xC1); e.u8(4);   /* add rcx, 4 */
+        e.u8(0xC7); e.u8(0x41); e.u8(4);           /* mov dword [rcx+4], rg */
+        e.u32(region);
+        e.u8(0x48); e.u8(0x83); e.u8(0xC1); e.u8(8);   /* add rcx, 8 */
         e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_grow);
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(tgt)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(region)));
         e.call_relocs.push_back(
             { e.pos(),
               reinterpret_cast<const void *>(jit_push_handler_grow) });

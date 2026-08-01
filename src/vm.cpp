@@ -1455,9 +1455,40 @@ vm_dyn_next_dict(DynIterState &st, Frame &frame, const Chunk *, size_t)
 }
 
 /* P8 Inc 0: an active `try` region on the VM handler stack. `catch_pc` is where
- * the boundary jumps on a caught exception (the CatchTest chain). */
+ * the boundary jumps on a caught exception (the CatchTest chain); `region` is
+ * the try's chunk-static REGION ID - the index of its per-frame pend/exc
+ * state slot (task #78 step 2, below). */
 struct VmHandler {
     uint32_t catch_pc;
+    uint32_t region;
+};
+
+/*
+ * Per-TRY-REGION exception state (task #78 step 2). The caught exception a
+ * catch body's `rethrow` re-raises, and the pending action + exception a
+ * `finally` resumes, used to be ONE {exc, pend} pair on the call record -
+ * which the tree-walker never needed because ITS state lives in
+ * TryCatchStmt::do_eval C++ locals, nested for free by recursion. The single
+ * slot CLOBBERED under same-frame nesting (all found by the #78 battery,
+ * tree-walker = the oracle):
+ *   - try/catch inside a FINALLY body overwrote the pending exception (the
+ *     outer catch then missed it - it escaped);
+ *   - try/FINALLY inside a finally overwrote the pending ACTION - the
+ *     exception was silently LOST;
+ *   - a caught try/catch inside a CATCH body overwrote the exception a
+ *     later `rethrow` re-raises (the wrong one was rethrown).
+ * The fix: one {exc, pend} slot PER TRY REGION, keyed by a chunk-static
+ * monotonic region id the codegen bakes into the exception ops (the
+ * dict-iterator pattern: `Chunk::n_trys` sizes a per-frame slice of the
+ * activation's shared `pends` stack, watermarked by VmCallRec::pend_base).
+ * Distinct regions cannot clobber; a loop re-entering the SAME region reuses
+ * its slot (each cycle completes or is abandoned before the next); an
+ * abandoned slot (flow out of a catch body) is dead until the region reruns
+ * (overwrite) or the frame pops (trim) - bounded, no leak.
+ */
+struct VmPendState {
+    std::unique_ptr<RuntimeException> exc;
+    Pend pend = Pend::normal;
 };
 
 /*
@@ -1507,8 +1538,12 @@ struct VmCallRec {
      * stacks now). */
     uint32_t handler_base = 0;
     uint32_t diter_base = 0, dyiter_base = 0;
-    std::unique_ptr<RuntimeException> exc;  /* in-flight caught exception */
-    Pend pend = Pend::normal;               /* finally resume action */
+    /* The frame's slice of the activation's per-try-region pend/exc stack
+     * (VmPendState above). VALID ONLY when run_chunk->n_trys != 0: the
+     * emitted M5b inline push does not set it (such chunks decline the
+     * inline push), so on a try-free chunk's record it may be STALE - every
+     * reader is gated on n_trys, including pop_window's trim. */
+    uint32_t pend_base = 0;
 
     /* CachedCallV: the {func, args} key to store the (scalar) result under
      * in the CALLER's cache when this frame pops. */
@@ -1600,6 +1635,23 @@ struct VmActivation {
     std::vector<VmHandler> handlers;
     std::vector<DictIterState> dict_iters;
     std::vector<DynIterState> dyn_iters;
+    std::vector<VmPendState> pends;   /* per-try-region exc/pend (#78) */
+    uint32_t pends_n = 0;             /* == pends.size() (mirror) */
+
+    /* The region's pend/exc slot for `rec`'s frame. Callers are all ops of
+     * a chunk WITH trys (n_trys > 0), so pend_base is valid (see the field's
+     * comment). */
+    ML_ALWAYS_INLINE VmPendState &pend_at(const VmCallRec &rec,
+                                          int_type region)
+    {
+        ML_VM_CHECK(pends_n == pends.size());
+        ML_VM_CHECK(rec.run_chunk && rec.run_chunk->n_trys > 0);
+        ML_VM_CHECK(region >= 0
+                    && region < static_cast<int_type>(
+                           rec.run_chunk->n_trys));
+        ML_VM_CHECK(rec.pend_base + static_cast<uint32_t>(region) < pends_n);
+        return pends[rec.pend_base + static_cast<uint32_t>(region)];
+    }
     Frame view_frame;                 /* the loop's window into the stack */
     int_type used = 0;                /* live slots, for the depth cap */
     int_type cap;                     /* MYLANG_VM_STACK (slots) */
@@ -1692,6 +1744,12 @@ struct VmActivation {
             dyiters_n += static_cast<uint32_t>(ck->n_dyn_iters);
             dyn_iters.resize(dyiters_n);
         }
+        if (ck->n_trys) {
+            ML_VM_CHECK(pends_n == pends.size());
+            rec.pend_base = pends_n;
+            pends_n += static_cast<uint32_t>(ck->n_trys);
+            pends.resize(pends_n);
+        }
         sg->top += n;
         used += n;
         /* Stash the CALLER's pure cache; the callee's frame starts with
@@ -1769,15 +1827,19 @@ struct VmActivation {
             view_frame.pure_cache = std::move(rec.caller_cache);
 
         /* Free any owning state the frame still holds - the reuse-equivalent
-         * of the old pop_back dtor. On the HOT path all three are already
-         * null (cache_key moved out by vm_leave_call, caller_cache moved out
-         * above, exc never set), so these are cheap null resets; the
-         * exceptional-walk / cached-call paths may leave one set, and freeing
-         * it here matches the old dtor exactly. pend must reset so a reused
-         * record does not inherit a stale finally-pend. */
-        rec.exc.reset();
+         * of the old pop_back dtor. On the HOT path both are already null
+         * (cache_key moved out by vm_leave_call, caller_cache moved out
+         * above); the cached-call path may leave one set, and freeing it
+         * here matches the old dtor exactly. The per-region exc/pend state
+         * is TRIMMED above with the other watermarked slices (#78) - gated
+         * on n_trys because an M5b-inline-pushed record's pend_base is
+         * stale (see the field's comment). */
+        if (rec.run_chunk && rec.run_chunk->n_trys
+                && pends_n != rec.pend_base) {
+            pends.resize(rec.pend_base);
+            pends_n = rec.pend_base;
+        }
         rec.cache_key.reset();
-        rec.pend = Pend::normal;
         rec_n--;
 
         if (rec_n) {
@@ -2174,15 +2236,21 @@ vm_make_thrown_exc(const EvalValue &v, Loc estart, Loc eend)
 
 /* P8: pop the innermost handler OF THE CURRENT FRAME (entries below the
  * record's watermark belong to outer frames - those are reached by the
- * boundary catch's frame walk, never here) and set `pc` to its
- * catch-dispatch; false (pc unchanged) if this frame has none. */
+ * boundary catch's frame walk, never here), PARK the exception in the
+ * handler's per-region slot (#78: where the CatchTest chain, `rethrow` and
+ * a finally's reraise read it - keyed by the try's region id so same-frame
+ * nesting cannot clobber it), and set `pc` to its catch-dispatch; false
+ * (pc and `ex` untouched) if this frame has none. */
 static bool vm_dispatch_exc(VmActivation &act, const VmCallRec &cur,
-                            size_t &pc)
+                            size_t &pc,
+                            std::unique_ptr<RuntimeException> &ex)
 {
     if (act.handlers.size() <= cur.handler_base)
         return false;
-    pc = act.handlers.back().catch_pc;
+    const VmHandler h = act.handlers.back();
     act.handlers.pop_back();
+    act.pend_at(cur, static_cast<int_type>(h.region)).exc = std::move(ex);
+    pc = h.catch_pc;
     return true;
 }
 
@@ -4664,10 +4732,8 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
      * only this dispatch; routing it through the cold-section walk cost a
      * measured +12% there). Not cold-marked itself for the same reason. */
     VmCallRec &cur = act.back_rec();
-    if (vm_dispatch_exc(act, cur, pc)) {
-        cur.exc = std::move(ex);
-        return true;                       /* chunk unchanged */
-    }
+    if (vm_dispatch_exc(act, cur, pc, ex))
+        return true;                       /* chunk unchanged; ex parked */
     return vm_unwind_walk(act, ctx, chunk, pc, std::move(ex));
 }
 
@@ -6267,6 +6333,8 @@ void jit_fill_push_layout(JitPushLayout *L)
         reinterpret_cast<const char *>(&ck.n_dict_iters) - cb;
     L->ck_n_dyn_iters =
         reinterpret_cast<const char *>(&ck.n_dyn_iters) - cb;
+    L->ck_n_trys =
+        reinterpret_cast<const char *>(&ck.n_trys) - cb;
     L->ck_sync_entry =
         reinterpret_cast<const char *>(&ck.sync_entry_off) - cb;
     {
@@ -6281,8 +6349,9 @@ void jit_fill_push_layout(JitPushLayout *L)
                 make_intrusive<FuncObject>(&fd, &probe_root))).get_type();
     }
     L->stop_chunk = &vm_sync_stop_chunk();
-    /* the emitted handler_base computation shifts by 2 */
-    static_assert(sizeof(VmHandler) == 4, "handler_base >> 2 bake");
+    /* the emitted handler_base computation shifts by 3 (#78: VmHandler
+     * grew to {catch_pc, region}) */
+    static_assert(sizeof(VmHandler) == 8, "handler_base >> 3 bake");
     /* the emitted seg/rec addressing */
     static_assert(sizeof(std::unique_ptr<VmStackSeg>) == sizeof(void *),
                   "segs[i] raw-pointer load");
@@ -6298,18 +6367,42 @@ ptrdiff_t jit_sizeof_vm_rec()
 {
     return static_cast<ptrdiff_t>(sizeof(VmCallRec));
 }
-ptrdiff_t jit_off_rec_pend()
+ptrdiff_t jit_off_act_top_rec()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.top_rec)
+         - reinterpret_cast<const char *>(&a);
+}
+ptrdiff_t jit_off_act_pends()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.pends)
+         - reinterpret_cast<const char *>(&a);
+}
+ptrdiff_t jit_off_rec_pend_base()
 {
     VmCallRec r;
-    return reinterpret_cast<const char *>(&r.pend)
+    return reinterpret_cast<const char *>(&r.pend_base)
          - reinterpret_cast<const char *>(&r);
+}
+ptrdiff_t jit_sizeof_pend_state()
+{
+    return static_cast<ptrdiff_t>(sizeof(VmPendState));
+}
+ptrdiff_t jit_off_pend_state_pend()
+{
+    VmPendState ps;
+    return reinterpret_cast<const char *>(&ps.pend)
+         - reinterpret_cast<const char *>(&ps);
 }
 
 /* The COLD grow path of the inline PushHandler: the handlers vector is at
  * capacity - do the real push_back (realloc). Never throws in practice. */
-extern "C" void jit_push_handler_grow(int_type catch_pc) noexcept
+extern "C" void jit_push_handler_grow(int_type catch_pc,
+                                      int_type region) noexcept
 {
-    g_vm_act->handlers.push_back({ static_cast<uint32_t>(catch_pc) });
+    g_vm_act->handlers.push_back({ static_cast<uint32_t>(catch_pc),
+                                   static_cast<uint32_t>(region) });
 }
 
 ptrdiff_t jit_off_desc_vm_chunk()
@@ -6404,10 +6497,8 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 {
     for (;;) {
         VmCallRec &cur = act.back_rec();
-        if (vm_dispatch_exc(act, cur, pc)) {
-            cur.exc = std::move(ex);           /* like saved_ex */
-            return true;
-        }
+        if (vm_dispatch_exc(act, cur, pc, ex))
+            return true;                       /* ex parked per-region */
         if (cur.boundary) {
             g_vm_exc_pending = std::move(ex);
             return false;
@@ -7967,8 +8058,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * as the exception passes through. */
             if (g_vm_exc_pending) {
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
-                if (vm_dispatch_exc(act, cur_rec(), pc)) {
-                    cur_rec().exc = std::move(g_vm_exc_pending);
+                if (vm_dispatch_exc(act, cur_rec(), pc,
+                                    g_vm_exc_pending)) {
                     VM_NEXT_COLD;
                 }
                 return;
@@ -8018,8 +8109,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                                          pc);
             if (g_vm_exc_pending) {                /* Inc v2: cross-frame */
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);   /* Inc 4 */
-                if (vm_dispatch_exc(act, cur_rec(), pc)) {
-                    cur_rec().exc = std::move(g_vm_exc_pending);
+                if (vm_dispatch_exc(act, cur_rec(), pc,
+                                    g_vm_exc_pending)) {
                     VM_NEXT_COLD;
                 }
                 return;
@@ -8179,8 +8270,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             }
             if (g_vm_exc_pending) {                /* FuncObject cross-frame */
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
-                if (vm_dispatch_exc(act, cur_rec(), pc)) {
-                    cur_rec().exc = std::move(g_vm_exc_pending);
+                if (vm_dispatch_exc(act, cur_rec(), pc,
+                                    g_vm_exc_pending)) {
                     VM_NEXT_COLD;
                 }
                 return;
@@ -8678,7 +8769,10 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         }
 
         VM_CASE(PushHandler):
-            act.handlers.push_back({ static_cast<uint32_t>(in->target) });
+            /* #78: {catch_pc, region} - the region id keys the try's
+             * per-frame pend/exc slot for the eventual dispatch. */
+            act.handlers.push_back({ static_cast<uint32_t>(in->target),
+                                     static_cast<uint32_t>(in->a_lit()) });
             pc++;
             VM_NEXT;
 
@@ -8694,11 +8788,14 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * the catch body (target). Else fall to the next CatchTest /
              * Reraise. vm_exc is KEPT (not cleared) so a `rethrow` in the catch
              * body can re-raise it; a new throw overwrites it. */
+            /* #78: the caught exception lives in the try's per-REGION slot
+             * (b = the region id), parked there by vm_dispatch_exc. */
+            VmPendState &ps =
+                act.pend_at(cur_rec(), in->b_lit());
             bool match;
             if (in->a_lit() < 0) {
                 match = true;
-            } else if (const UniqueId *eu =
-                           cur_rec().exc->match_uid()) {
+            } else if (const UniqueId *eu = ps.exc->match_uid()) {
                 /* #74 inc 3: interned-POINTER matching (the per-match
                  * string_view over the const char* name paid a strlen +
                  * memcmp). catch_uids is derived from catch_types (same
@@ -8713,7 +8810,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 /* a subclass without match_uid: the string fallback */
                 const std::vector<std::string> &names =
                     chunk->catch_types[in->a_lit()];
-                const std::string_view en = vm_exc_name(cur_rec().exc.get());
+                const std::string_view en = vm_exc_name(ps.exc.get());
                 match = false;
                 for (const std::string &nm : names) {
                     if (nm == en) { match = true; break; }
@@ -8722,7 +8819,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             if (match) {
                 if (in->target2 >= 0)
                     ctx.frame->at(in->target2).put(
-                        vm_catch_bind_val(cur_rec().exc.get()));
+                        vm_catch_bind_val(ps.exc.get()));
                 pc = static_cast<size_t>(in->target);
             } else {
                 pc++;
@@ -8736,7 +8833,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * (G1: no C++ throw; the walk's first step IS the old same-frame
              * dispatch, and the boundary catch used to flush the reraise pc's
              * inlined frames + clone - vm_raise does the flush, sans clone). */
-            if (!vm_raise(chunk, pc, act, ctx, std::move(cur_rec().exc)))
+            if (!vm_raise(chunk, pc, act, ctx,
+                          std::move(act.pend_at(cur_rec(),
+                                                in->a_lit()).exc)))
                 return;                 /* boundary: signal set */
             code = chunk->code.data();
             VM_NEXT;
@@ -8746,21 +8845,29 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * the rethrow-site loc (like do_catch's RethrowEx handling), to the
              * OUTER handler (native) or C++-propagate. */
             {
+                /* #78: a = the ENCLOSING catch's region id (baked by the
+                 * codegen: the innermost try whose catch body lexically
+                 * contains this `rethrow`) - its slot holds the caught
+                 * exception, immune to inner regions' traffic. */
+                VmPendState &ps = act.pend_at(cur_rec(), in->a_lit());
+                ML_VM_CHECK(ps.exc != nullptr);
                 Loc ls, le;
                 chunk->loc_at(pc, ls, le);
-                cur_rec().exc->loc_start = ls;
-                cur_rec().exc->loc_end = le;
+                ps.exc->loc_start = ls;
+                ps.exc->loc_end = le;
+                if (!vm_raise(chunk, pc, act, ctx, std::move(ps.exc)))
+                    return;             /* boundary: signal set */
             }
-            if (!vm_raise(chunk, pc, act, ctx, std::move(cur_rec().exc)))
-                return;                 /* boundary: signal set */
             code = chunk->code.data();
             VM_NEXT;
 
         VM_CASE(SetPend):
             /* Record what the shared `finally` must resume - normal or reraise
-             * (Inc 2b). Flow ops inline their finally, so ret/brk/cont never
-             * reach the shared finally. */
-            cur_rec().pend = static_cast<Pend>(in->target);
+             * (Inc 2b) - in the try's per-REGION slot (a = region id, #78).
+             * Flow ops inline their finally, so ret/brk/cont never reach the
+             * shared finally. */
+            act.pend_at(cur_rec(), in->a_lit()).pend =
+                static_cast<Pend>(in->target);
             pc++;
             VM_NEXT;
 
@@ -8769,16 +8876,18 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * the NORMAL and RERAISE exits reach here - a return/break/continue
              * crossing this try INLINES its own copy of the finally (Inc 2c),
              * so `vm_pend` is only ever normal or reraise here. */
-            if (cur_rec().pend == Pend::reraise) {
-                /* finally didn't handle the exception → re-raise it (the
-                 * native walk, like Reraise - G1). */
-                if (!vm_raise(chunk, pc, act, ctx,
-                              std::move(cur_rec().exc)))
-                    return;             /* boundary: signal set */
-                code = chunk->code.data();
-                VM_NEXT;
-            } else {
-                pc++;                                 /* fall through to Lend */
+            {
+                VmPendState &ps = act.pend_at(cur_rec(), in->a_lit());
+                if (ps.pend == Pend::reraise) {
+                    /* finally didn't handle the exception → re-raise it (the
+                     * native walk, like Reraise - G1). */
+                    if (!vm_raise(chunk, pc, act, ctx, std::move(ps.exc)))
+                        return;         /* boundary: signal set */
+                    code = chunk->code.data();
+                    VM_NEXT;
+                } else {
+                    pc++;                             /* fall through to Lend */
+                }
             }
             VM_NEXT;
 
