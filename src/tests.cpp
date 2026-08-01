@@ -6734,6 +6734,23 @@ static const std::vector<test> tests =
         },
         &typeid(TypeErrorEx), 5, 4, 8, 4,
     },
+    {
+        /* LoadElemValue deletability: the 2-D general-array read's OOB in
+         * a DELETED run keeps the inner-subscript caret via the cold-side
+         * exc-stamp (its former unproven-base bail now conveys the
+         * interpreted InternalErrorEx via eptr, so no exit remains). */
+        "err loc: a DELETED run's 2-D element read keeps its OOB caret",
+        {
+            "func h(dyn m, int n) {",
+            "  var dyn s = 0;",
+            "  for (var i = 0; i < n; i++)",
+            "    s = s + m[i][0];",
+            "  return s;",
+            "}",
+            "h(runtime([[1], [2]]), 5);",
+        },
+        &typeid(OutOfBoundsEx), 13, 4, 18, 4,
+    },
 
     {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",

@@ -2730,21 +2730,30 @@ extern "C" void jit_load_struct_elem(int_type dst, int_type base,
  * whose index is not the loop counter) - an OOB raises OutOfBoundsEx LOC-LESS
  * -> g_vm_jit_exc, and EnterNative re-raises with the loc side table's caret.
  * The interpreter's unreachable non-general tail is an InternalErrorEx there;
- * here it BAILS (return 1 with no exception set) so the interpreter re-runs the
- * op and raises it identically. */
+ * here the SAME InternalErrorEx is conveyed via g_vm_jit_eptr (no clone() -
+ * a plain exception) so the op has NO bail and is deletable. */
 extern "C" int jit_load_elem_value(int_type dst, int_type base,
                                    int_type idx) noexcept
 {
     ML_JIT_OP_RAN(LoadElemValue);
     Frame *f = g_current_ctx->frame;
     const EvalValue &basev = f->at(base).get();
-    if (!basev.is<SharedArrayObj>())
-        return 1;                          /* bail: interpreter re-raises */
+    if (!basev.is<SharedArrayObj>()) {
+        /* the interpreted handler's unreachable tail (base_array proven):
+         * CONVEY the same InternalErrorEx via eptr (a DECL_SIMPLE
+         * exception, no clone()) instead of the old bail - deletability
+         * forbids a re-run exit, and the propagation is identical (a
+         * non-catchable hard error either way). */
+        g_vm_jit_eptr = std::make_exception_ptr(InternalErrorEx());
+        return 1;
+    }
     const SharedArrayObj &arr = basev.get_ref<SharedArrayObj>();
     const SharedArrayObj::Storage k = arr.skind();
     if (k != SharedArrayObj::Storage::general
-            && k != SharedArrayObj::Storage::strs)
-        return 1;                          /* bail: interpreter re-raises */
+            && k != SharedArrayObj::Storage::strs) {
+        g_vm_jit_eptr = std::make_exception_ptr(InternalErrorEx());
+        return 1;
+    }
     int_type i = idx;
     if (i < 0)
         i += arr.size();
