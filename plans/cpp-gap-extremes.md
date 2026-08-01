@@ -96,6 +96,42 @@ libstdc++/libc symbol is in a hot loop.
    param the callee never stores would remove it - but that needs an
    escape analysis, so it belongs with the N7 arc, not here.
 
-Item 1 is self-contained and has a shipped precedent. Item 2 is the
-higher-value one (four benches) but touches the hottest protocol in the
-VM, so it wants its own session and the full battery.
+Item 2 is the higher-value one (four benches) but touches the hottest
+protocol in the VM, so it wants its own session and the full battery.
+
+## Item 1 in detail — subscript LICM, scoped 2026-08-01
+
+I started this and stopped at the design, because it is NOT the small
+extension of the slice hoister it looks like. Two obstacles, both real:
+
+**(a) There is no decl to hoist.** `try_hoist_loop_slices` moves an
+EXISTING statement - `var sl = base[a:b];` - so the hoisted value already
+owns a frame slot and an `Identifier` with a resolved `sym`. In 46 the
+invariant is a SUB-EXPRESSION (`a[i]` inside `s += a[i][k] * b[k][j]`),
+so the transform must SYNTHESISE a temp: allocate a fresh frame slot,
+build an `Identifier` with `sym.kind = local` + the right `th`/static
+type, emit `var $licm0 = a[i];` above the loop, and rewrite each
+occurrence. Allocating a slot post-resolve needs the enclosing
+`FuncDeclStmt` (to bump `frame_size`, capped at 64 like the tail
+inliner's local remap) - and `specialize()` is a free function with no
+current-function handle. So it needs threading, or the pass has to move.
+
+**(b) A subscript CAN throw; a slice cannot.** The slice hoister is sound
+for a ZERO-iteration loop precisely because slicing only clamps
+(`base_sliceable` + int bounds => cannot throw), so moving it before the
+loop cannot introduce an error. `a[i]` throws on OOB. Hoisting it out of
+a loop that runs zero times turns "never evaluated" into "throws before
+the loop" - observable, and wrong. So it needs EITHER a proof the loop
+executes at least once (for a counted `for` with literal/immutable
+bounds this is often provable), OR a proof the index is in range.
+
+Neither is a blocker, but together they make this a real optimizer
+change rather than a 30-line extension, and it should start fresh.
+
+A genuinely small down-payment, if a partial win is wanted first:
+extend `try_hoist_loop_slices` to accept a `Subscript` rvalue (not only
+a `Slice`) that yields a CONTAINER - i.e. hoist an explicit
+`var row = a[i];` written by the user in the loop body. Same safety
+analysis, same transform, no synthetic temp, no slot allocation. It does
+NOT help 46 as written (which has no such decl), but it is the correct
+first half and it makes the hand-written form fast.
