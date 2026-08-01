@@ -128,6 +128,79 @@ bounds this is often provable), OR a proof the index is in range.
 Neither is a blocker, but together they make this a real optimizer
 change rather than a 30-line extension, and it should start fresh.
 
+### The soundness fix: a GUARDED PREHEADER
+
+Obstacle (b) is solvable and this is the design to build. The hoist is
+unsound only when the loop may run ZERO times, so give the hoisted decl
+the loop's own entry condition:
+
+    for (var k = 0; k < n; k++)  s += a[i][k] * b[k][j];
+
+becomes
+
+    Block(scope_free) {
+        if (0 < n) { var $licm0 = a[i]; }        // the GUARD
+        for (var k = 0; k < n; k++) s += $licm0[k] * b[k][j];
+    }
+
+The guard is the loop's `cond` CLONED with the loop variable substituted
+by the init's rvalue - for `for (var k = INIT; COND; ...)` it is
+`COND[k := INIT]`, here `0 < n`. Then:
+
+  - loop runs >= 1 time  -> the guard is true, `a[i]` is evaluated
+    exactly once, exactly as before (it was evaluated on iteration 1);
+  - loop runs 0 times    -> the guard is false, `a[i]` is NOT evaluated,
+    so an OOB `i` still throws never. The observable behaviour is
+    identical, including which errors occur and in what order.
+
+`$licm0` is only READ inside the loop body, which the guard proves is
+only entered when the decl ran - so the "declared in an inner block" is
+not a problem (its slot is frame-wide; resolution is by slot).
+
+Cost when the loop does run: one extra comparison before the loop,
+against 343,000 saved boxed reads on 46.
+
+CRITICAL: the guard must be built WITHOUT restructuring the `ForStmt`
+itself. An earlier idea - moving `init` out and leaving `for (; cond;
+inc)` - would stop `try_for_range` from matching the counted-loop shape,
+losing the `ForRangeStmt` specialization, which is worth more than the
+hoist. The wrapper Block + an untouched ForStmt keeps that intact (the
+slice hoister already relies on this ordering).
+
+### What remains to build
+
+1. **Thread a frame-size pointer through `specialize()`** exactly as the
+   Inliner's `walk(slot, depth, int *fsize, no_block)` already does
+   (resolver.cpp:3130) - `(*fsize)++` is the fresh-slot allocator, and
+   `FuncDeclStmt::desc->frame_size` is the per-function counter. Cap at
+   64 like the tail inliner. `specialize()` (inferencer.cpp:5178) is
+   currently a free function with no such parameter.
+2. **Find the candidates**: a `Subscript` appearing in a DIRECT statement
+   of the loop body (unconditional per iteration - NOT nested in an `if`
+   or an inner loop, or hoisting could evaluate what never would have),
+   whose base and index are both loop-invariant by the existing
+   `fr_collect_mutated` / `fr_immutable` analysis, and whose static type
+   is a CONTAINER (hoisting a scalar buys nothing - the win is the
+   `intrusive_ptr` copy).
+3. **Synthesise** the `Identifier` (fresh uid `$licm<N>`,
+   `sym.kind = local`, the new slot, `th`/static type copied from the
+   subscript) and the `Expr14` decl, plus the guard `IfStmt`.
+4. **Substitute** every occurrence of the subscript in the body with the
+   temp - `for_each_child_slot` already does this shape of rewrite for
+   the inliner's param substitution.
+5. **Tests**: the zero-trip case (an OOB index in a loop that never runs
+   must still NOT throw - this is the whole point of the guard), a
+   mutated base, a mutated index, an aliasing write through the hoisted
+   row, plus a `-vd` shape pin and the differential.
+
+### Session note (2026-08-01)
+
+Design complete, implementation NOT started. Stopped deliberately: the
+change is ~200 lines across the specialize pass plus the fsize threading
+and its tests, and it was scoped at the end of a long session with too
+little room to land it and run the full battery. Starting it and leaving
+it half-applied in the optimizer would be worse than not starting.
+
 A genuinely small down-payment, if a partial win is wanted first:
 extend `try_hoist_loop_slices` to accept a `Subscript` rvalue (not only
 a `Slice`) that yields a CONTAINER - i.e. hoist an explicit
