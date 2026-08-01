@@ -1423,6 +1423,26 @@ binaries, plus the my/py geomean, which run.py prints with THREE digits
 for >=2 interleaved A/B/A/B runs to cancel machine drift; that is HIS call, not
 a routine default. A phase does not land on a probe geomean.
 
+**THE ASSERTS=0 MEASUREMENT RULE (maintainer-set, 2026-08-01).** EVERY
+performance measurement — callgrind Ir or wall-clock, a one-off A/B or a
+full-suite run — is taken with **`OPT=1 ASSERTS=0` on BOTH sides**. A plain
+`make -j` is `ASSERTS=1` (the default), and **an ASSERTS=1 delta CANNOT be
+extrapolated to ASSERTS=0**: assertion cost is NOT a uniform multiplier. It
+lands unevenly per code path (the per-op `ML_VM_CHECK` tier;
+`_GLIBCXX_ASSERTIONS` bounds-checking every `vector::operator[]`), so a change
+that MOVES work between paths measures better or worse purely because of where
+the asserts happen to sit. This is not theoretical — both directions were
+measured on the same day: **#81** read **+0.22%** at ASSERTS=1 and **+1.14%**
+at ASSERTS=0 (5x the delta — the nested baseline was the side paying the
+hardened access, so removing hardening exposed the flat form's real cost), and
+**69_exc_crossframe** read **−2.36%** at ASSERTS=1 but **+0.22%** at ASSERTS=0
+— a SIGN FLIP, i.e. a "2.4% win" that was mostly the removal of hardened
+container access, not the mechanism it was credited to. Corollary for the
+code: with hardening on, `vector::operator[]` in a hot scan is NOT free —
+read through `.data()` when you have already proven the range (a flattened
+pool indexed with `operator[]` cost +28 Ir per throw versus the nested form
+it replaced).
+
 **THE "PROVE THE CODE RAN + DISTRUST A SURPRISING RESULT" HARD RULE
 (maintainer-set, 2026-07-19).** Two joined rules, both learned the hard way in
 ONE investigation:
