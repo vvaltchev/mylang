@@ -4331,7 +4331,8 @@ the proof. Before calling it done:
 >     pointers, NO indexes, NO tables — the AST is FREED and the script runs on
 >     bytecode + pooled data alone.**
 >
-> **THE `.myv` STORED-BYTECODE FORMAT (`serialize.{h,cpp}`; design +
+> **THE `.myv` STORED-BYTECODE FORMAT (`serialize.{h,cpp}`; the byte-level
+SPEC is docs/myv-format.txt — read it before touching the format; design +
 phases in plans/myv-serializer.md) — THE ENDGAME ARTIFACT.**
 `mylang -c file.my [-o out.myv] [--strip-source]` runs the full pipeline
 (run-side flags: `--source ROOT`, `-f`/`--force` - see the SOURCE

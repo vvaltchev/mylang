@@ -1,11 +1,18 @@
 # The `.myv` serializer — stored bytecode (design, 2026-07-18)
 
-Status: **IMPLEMENTED (v2, 2026-07-29)** - `-c` writes, a magic-sniffed
+> The byte-level SPECIFICATION of the on-disk image is
+> **docs/myv-format.txt** (validated by tests/myv_doc_check.py, an
+> independent reader written from that document). This file is the
+> DESIGN record and the per-version measurements.
+
+Status: **IMPLEMENTED (v6, 2026-07-29)** - `-c` writes, a magic-sniffed
 file argument loads and runs, `-vd` dumps a loaded image, the round-trip
 oracle + determinism + corrupt-file refusal are pinned by `-rt`
-(`myv_round_trip`). v2 replaced the embedded source text with a verified
-SOURCE REFERENCE (see the section at the end); `MYV_FORMAT_VERSION` is 2
-and a v1 file is refused. See CLAUDE.md's ".myv STORED-BYTECODE FORMAT" for the
+(`myv_round_trip`, `myv_loc_escapes`). Versions since v1, each with its own
+section at the end of this file: v2 a verified SOURCE REFERENCE instead of
+the embedded text, v3 compact instructions, v4 the derived boxed_ops pool
+dropped, v5 the delta-coded loc table, v6 narrow pool Locs.
+`MYV_FORMAT_VERSION` is 6 and any older file is refused. See CLAUDE.md's ".myv STORED-BYTECODE FORMAT" for the
 implementation shape. Deltas from this design: the section TOC was not
 needed (a linear reader suffices at these sizes); a BUILTIN-SET
 FINGERPRINT was ADDED after finding that builtin slot indices were
