@@ -767,8 +767,21 @@ struct Codegen {
     {
         chunk.member_keys.push_back(
             {m->memId, m->memUid, m->optional,
-             m->start, m->end, m->what->start, m->what->end});
+             m->start, m->end, m->what->start, m->what->end,
+             m->field_slot >= 0 ? m->base_struct_def : nullptr,
+             m->field_slot});
         return static_cast<int>(chunk.member_keys.size()) - 1;
+    }
+
+    /* Pool a StructTypeDef (deduped by pointer identity) - the baked-def
+     * index the member-read fast path / ctor plan compare against. */
+    int add_struct_def(const StructTypeDef *sd)
+    {
+        for (size_t i = 0; i < chunk.struct_defs.size(); i++)
+            if (chunk.struct_defs[i] == sd)
+                return static_cast<int>(i);
+        chunk.struct_defs.push_back(sd);
+        return static_cast<int>(chunk.struct_defs.size()) - 1;
     }
 
     /* Pool a checked inc-dec's dual carets (+ the member key for the member
@@ -1151,10 +1164,42 @@ struct Codegen {
                     in.node_idx = add_ast_node(ce);   /* loc for a defensive throw (nulled) */
                     in.target = dst;
                     in.set_a(int_lit(base));
-                    in.set_b(int_lit(
-                        static_cast<int>(ce->args->elems.size())));
-                    in.target2 = static_cast<int>(chunk.struct_defs.size());
-                    chunk.struct_defs.push_back(sdef);
+                    /* THE CTOR PLAN (the 64_struct_create fix): every arg
+                     * is compile-proven, so bake the per-field {offset,
+                     * act} list - the runtime does raw slot reads + direct
+                     * byte stores, ZERO coerce_struct_field calls, and the
+                     * planned op NEVER throws. A nested-struct field arg
+                     * keeps the generic path (plan idx -1). b is DUAL:
+                     * lo = nfields, hi = ctor_plans idx. */
+                    int plan_idx = -1;
+                    {
+                        Chunk::CtorPlan cp;
+                        bool plannable = true;
+                        for (const FieldDef &fd : sdef->fields) {
+                            uint8_t act;
+                            if (fd.kind == FieldKind::f_int)
+                                act = 0;
+                            else if (fd.kind == FieldKind::f_float)
+                                act = 1;
+                            else if (fd.kind == FieldKind::f_bool)
+                                act = 2;
+                            else {
+                                plannable = false;
+                                break;
+                            }
+                            cp.f.push_back(
+                                {static_cast<int32_t>(fd.offset), act});
+                        }
+                        if (plannable) {
+                            plan_idx =
+                                static_cast<int>(chunk.ctor_plans.size());
+                            chunk.ctor_plans.push_back(std::move(cp));
+                        }
+                    }
+                    in.set_b_dual(
+                        static_cast<int>(ce->args->elems.size()),
+                        plan_idx);
+                    in.target2 = add_struct_def(sdef);
                     ops.push_back(in);
                     out_slot = dst;
                     return true;
@@ -3470,6 +3515,44 @@ struct Codegen {
         in.target = tt;
         in.target2 = bid->sym.slot;
         in.set_a(int_lit(add_member_key(m)));
+        /* THE COMPILE-TIME FIELD RESOLUTION (the 64_struct_create fix,
+         * 2026-07-26): base_struct is PROVEN, so the field's byte offset
+         * and kind are static facts - resolve them HERE, once, and bake
+         * them into the op (b dual: lo = offset, hi = struct_defs idx << 2
+         * | kind 0 int/1 float/2 bool). The runtime fast path is then a
+         * def-identity check + a direct byte read - NO name scan
+         * (StructTypeDef::slot_of ran per READ before). lo == -1 -> the
+         * generic path (a const member / non-POD / unresolved field). */
+        int32_t off = -1, hi = -1;
+        const StructTypeDef *sd = m->base_struct_def;
+        if (sd && sd->is_pod()) {
+            const int fs = sd->slot_of(m->memUid);
+            if (fs >= 0) {
+                const FieldDef &fd = sd->fields[static_cast<size_t>(fs)];
+                /* The 2-bit LOAD FORM = (op x field kind), so the runtime
+                 * needs no op/kind dispatch at all: 0 = int read, 1 = float
+                 * read, 2 = bool read as 0/1, 3 = int read promoted to
+                 * float (matching vm_load_member_scalar's arms). */
+                int form = -1;
+                if (op == OpCode::LoadMemberInt) {
+                    if (fd.kind == FieldKind::f_int)
+                        form = 0;
+                    else if (fd.kind == FieldKind::f_bool)
+                        form = 2;
+                } else {
+                    if (fd.kind == FieldKind::f_float)
+                        form = 1;
+                    else if (fd.kind == FieldKind::f_int)
+                        form = 3;
+                }
+                if (form >= 0) {
+                    off = static_cast<int32_t>(fd.offset);
+                    hi = static_cast<int32_t>(add_struct_def(sd)) << 2
+                       | form;
+                }
+            }
+        }
+        in.set_b_dual(off, hi);
         ops.push_back(in);
         out = slot_op(tt);
         return true;
@@ -7056,8 +7139,11 @@ static bool visit_use_def(const Instr &in, U u, D d)
         u(in.target2);
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
-    case OpCode::MakeArrayV: case OpCode::StructCtorV:
+    case OpCode::MakeArrayV:
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
+        d(in.target); return true;
+    case OpCode::StructCtorV:      /* b is DUAL: lo = nfields, hi = plan */
+        run(static_cast<int>(in.a_lit()), in.b_dual_lo());
         d(in.target); return true;
     case OpCode::MakeDictV:
         run(static_cast<int>(in.a_lit()), 2 * static_cast<int>(in.b_lit()));

@@ -241,7 +241,24 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         for (size_t i = 0; i < ch.member_keys.size(); i++) {
             const auto &mk = ch.member_keys[i];
             s << ";   [" << i << "]" << "  " << (mk.optional ? "?." : ".")
-              << mk.memId.get_type()->to_string(mk.memId) << "\n";
+              << mk.memId.get_type()->to_string(mk.memId);
+            if (mk.bake_def && mk.bake_slot >= 0)
+                s << "  (baked " << mk.bake_def->name->val
+                  << " slot " << mk.bake_slot << ")";
+            s << "\n";
+        }
+    }
+    if (!ch.ctor_plans.empty()) {
+        /* the planned POD ctor's per-field {offset, act} (StructCtorV's
+         * b_dual_hi indexes this) - act 0 int, 1 float, 2 bool */
+        s << "; -- ctor_plans (" << ch.ctor_plans.size() << ") --\n";
+        for (size_t i = 0; i < ch.ctor_plans.size(); i++) {
+            s << ";   [" << i << "] ";
+            for (const auto &pf : ch.ctor_plans[i].f)
+                s << " {+" << pf.off << " "
+                  << (pf.act == 0 ? "int" : pf.act == 1 ? "float" : "bool")
+                  << "}";
+            s << "\n";
         }
     }
     if (!ch.boxed_ops.empty()) {
@@ -1348,7 +1365,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::StructCtorV:
             row << "struct.ctor  " << D(in.target) << " = struct_defs["
                 << in.target2 << "]("
-                << arglist(chunk, in.a_lit(), in.b_lit()) << ")";
+                << arglist(chunk, in.a_lit(), in.b_dual_lo()) << ")";
+            if (in.b_dual_hi() >= 0)
+                row << " plan[" << in.b_dual_hi() << "]";
             break;
         case OpCode::StructCtorBoxedV: {
             const Chunk::BoxedCtor &bc = chunk.boxed_ctors[in.target2];
@@ -1473,6 +1492,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << D(in.target) << " = " << D(in.target2) << "."
                 << chunk.member_keys[in.a_lit()].memId.get_type()
                        ->to_string(chunk.member_keys[in.a_lit()].memId);
+            if (in.b_dual_lo() >= 0)
+                row << " @+" << in.b_dual_lo();     /* baked byte offset */
             break;
         case OpCode::SliceV:
             row << "slice.v      " << D(in.target) << " = " << D(in.target2)

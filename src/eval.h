@@ -527,7 +527,9 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
 EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
                           const EvalValue &value,
                           const Loc &mstart, const Loc &mend,
-                          const Loc &bstart, const Loc &bend);
+                          const Loc &bstart, const Loc &bend,
+                          const StructTypeDef *bake_def = nullptr,
+                          int bake_slot = -1);
 
 /* The boxed field LValue* of `base.member` for a mutating builtin arg0
  * (`append(s.f, x)` — CallBuiltinLVMember). See eval.cpp. */

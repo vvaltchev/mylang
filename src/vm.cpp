@@ -578,6 +578,59 @@ vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
     build(heapbuf.data());
 }
 
+/* THE PLANNED POD CTOR (the 64_struct_create fix, 2026-07-26). Every arg
+ * was compile-proven (the StructCtorV typed gate), so the per-field work is
+ * a STATIC plan: {byte offset, act} - act 0 = raw int store (a bool arg's
+ * payload is already 0/1; matches coerce's bool->int widen), 1 = float
+ * store with read_float_slot's exact promote ladder (float raw, int/bool
+ * cvt), 2 = bool byte store. NO coerce_struct_field calls, NO EvalValue
+ * marshal buffer; H1 dst-slot reuse kept. NEVER throws (make_intrusive's
+ * bad_alloc is terminal anyway), so the op needs no defensive catch. */
+static ML_NOINLINE void
+vm_struct_ctor_planned(EvalContext &ctx, StructTypeDef *def,
+                       const Chunk::CtorPlan &cp, int_type base, int_type dst)
+{
+    LValue &d = ctx.frame->at(dst);
+    StructObject *o = nullptr;
+    const EvalValue &cur = d.get();
+    if (cur.is<intrusive_ptr<StructObject>>()) {
+        const intrusive_ptr<StructObject> &so =
+            cur.get_ref<intrusive_ptr<StructObject>>();
+        if (so->def == def && !so->readonly && so.use_count() == 1)
+            o = so.get();
+    }
+    intrusive_ptr<StructObject> fresh;
+    if (!o) {
+        fresh = make_intrusive<StructObject>(def);
+        o = fresh.get();
+    }
+    char *bytes = o->bytes.data();
+    for (size_t i = 0; i < cp.f.size(); i++) {
+        const Chunk::CtorPlanField &pf = cp.f[i];
+        const LValue &s = ctx.frame->at(base + static_cast<int_type>(i));
+        switch (pf.act) {
+        case 0: {                                   /* int (or bool) -> int */
+            const EvalValue &v = s.get();
+            const int_type iv = v.is<bool>() ? (v.get<bool>() ? 1 : 0)
+                                             : v.get<int_type>();
+            std::memcpy(bytes + pf.off, &iv, sizeof iv);
+            break;
+        }
+        case 1: {                              /* float (int/bool promote) */
+            const float_type fv =
+                read_float_slot(&ctx, base + static_cast<int_type>(i));
+            std::memcpy(bytes + pf.off, &fv, sizeof fv);
+            break;
+        }
+        default:                                            /* bool byte */
+            bytes[pf.off] = s.get().get<bool>() ? 1 : 0;
+            break;
+        }
+    }
+    if (fresh)
+        d.put(EvalValue(intrusive_ptr<StructObject>(std::move(fresh))));
+}
+
 /* Construct a BOXED struct `B(a, x)` from its field-arg run [base, base+nargs).
  * ML_NOINLINE + off vm_run_chunk's frame (recursion-stack reason). Unlike the
  * POD ctor, a field coerce CAN throw - the caller passes `locs` so the throw
@@ -2054,7 +2107,8 @@ extern "C" int jit_store_member(int_type kind, int_type base_slot,
     const EvalValue &val = ctx->frame->at(val_slot).get();
     try {
         vm_member_store(blv, mk->memUid, static_cast<Op>(aop), val,
-                        mk->mstart, mk->mend, mk->bstart, mk->bend);
+                        mk->mstart, mk->mend, mk->bstart, mk->bend,
+                        mk->bake_def, mk->bake_slot);
     } catch (RuntimeException &e) {
         if (!e.loc_start) {                  /* a compound div/mod is loc-less */
             e.loc_start = mk->mstart;
@@ -2567,6 +2621,20 @@ extern "C" int jit_struct_ctor(const void *defv, int_type base, int_type nf,
         return 1;
     }
     return 0;
+}
+
+/* The planned StructCtorV's SLOW branch (fresh alloc / aliased dst /
+ * layout-probe-off): the interpreter's planned body - lean raw-slot
+ * reads + direct byte stores, NEVER throws, so the fragment emits no
+ * status test. The FAST inline path bumps g_jit_ctor_fast instead. */
+extern "C" void jit_struct_ctor_planned(const void *defv, const void *planv,
+                                        int_type base, int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(StructCtorV);
+    vm_struct_ctor_planned(
+        *g_current_ctx,
+        const_cast<StructTypeDef *>(static_cast<const StructTypeDef *>(defv)),
+        *static_cast<const Chunk::CtorPlan *>(planv), base, dst);
 }
 
 /* model-flip (nativize-ops): the native StructCtorBoxedV body - a BOXED (non-POD)
@@ -3107,6 +3175,54 @@ extern "C" int jit_incdec_chain(int_type root_kind, int_type root_slot,
         return 1;
     }
     return 0;
+}
+
+/* The BAKED member read (the 64_struct_create fix): try_member_scalar
+ * resolved the field at COMPILE time (b dual: lo = byte offset or -1,
+ * hi = struct_defs idx << 2 | form) - so the hot path is a def-identity
+ * check + one byte read, NO name scan (slot_of compared interned names
+ * over the fields vector on EVERY read before). Forms: 0 int, 1 float,
+ * 2 bool->0/1, 3 int promoted to float. Returns false (untouched dst) on
+ * any mismatch -> the generic vm_load_member_scalar below. */
+static ML_ALWAYS_INLINE bool
+vm_load_member_baked(EvalContext &ctx, const Instr *in, const Chunk *chunk)
+{
+    const int32_t off = in->b_dual_lo();
+    if (off < 0)
+        return false;
+    const EvalValue &b = ctx.frame->at(in->target2).get();
+    if (!b.is<intrusive_ptr<StructObject>>())
+        return false;
+    const int32_t hi = in->b_dual_hi();
+    const StructObject &o = *b.get_ref<intrusive_ptr<StructObject>>().get();
+    if (o.def != chunk->struct_defs[hi >> 2])
+        return false;
+    const char *p = o.bytes.data() + off;
+    switch (hi & 3) {
+    case 0: {
+        int_type v;
+        std::memcpy(&v, p, sizeof v);
+        write_int_slot(&ctx, in->target, v);
+        break;
+    }
+    case 1: {
+        float_type v;
+        std::memcpy(&v, p, sizeof v);
+        write_float_slot(&ctx, in->target, v);
+        break;
+    }
+    case 2:
+        write_int_slot(&ctx, in->target,
+                       static_cast<unsigned char>(*p) != 0 ? 1 : 0);
+        break;
+    default: {                                  /* int field read as float */
+        int_type v;
+        std::memcpy(&v, p, sizeof v);
+        write_float_slot(&ctx, in->target, static_cast<float_type>(v));
+        break;
+    }
+    }
+    return true;
 }
 
 /* The SHARED LoadMemberInt/Float body (H1 - the typed standalone struct-member
@@ -6272,11 +6388,20 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * ctor's loc (side table). */
             StructTypeDef *def =
                 const_cast<StructTypeDef *>(chunk->struct_defs[in->target2]);
-            try {
-                vm_struct_ctor(ctx, def, in->a_lit(), in->b_lit(), in->target);
-            } catch (Exception &e) {
-                vm_stamp_loc(*chunk, pc, e);
-                throw;
+            const int32_t plan = in->b_dual_hi();
+            if (plan >= 0) {
+                /* the baked plan: raw reads + direct byte stores, no
+                 * coerce calls, never throws */
+                vm_struct_ctor_planned(ctx, def, chunk->ctor_plans[plan],
+                                       in->a_lit(), in->target);
+            } else {
+                try {
+                    vm_struct_ctor(ctx, def, in->a_lit(), in->b_dual_lo(),
+                                   in->target);
+                } catch (Exception &e) {
+                    vm_stamp_loc(*chunk, pc, e);
+                    throw;
+                }
             }
             pc++;
         }
@@ -7259,16 +7384,20 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * shared body (also jit_load_member's): the POD fast path reads
              * the scalar straight from the instance's bytes, anything else
              * falls to member_read_core + write_scalar_slot. */
-            vm_load_member_scalar(ctx, chunk->member_keys[in->a_lit()],
-                                  in->target2, in->target, /*is_int=*/true);
+            if (!vm_load_member_baked(ctx, in, chunk))
+                vm_load_member_scalar(ctx, chunk->member_keys[in->a_lit()],
+                                      in->target2, in->target,
+                                      /*is_int=*/true);
             pc++;
         }
         VM_NEXT;
 
         VM_CASE(LoadMemberFloat): {
             /* the eval_float twin (th==f) - the shared body */
-            vm_load_member_scalar(ctx, chunk->member_keys[in->a_lit()],
-                                  in->target2, in->target, /*is_int=*/false);
+            if (!vm_load_member_baked(ctx, in, chunk))
+                vm_load_member_scalar(ctx, chunk->member_keys[in->a_lit()],
+                                      in->target2, in->target,
+                                      /*is_int=*/false);
             pc++;
         }
         VM_NEXT;

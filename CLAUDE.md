@@ -431,6 +431,47 @@ member residue falls to the shared `member_read_core` +
 caret). Measured (both, full-suite interleaved A/B): 64_struct_create
 0.095->0.074s (0.779x; my/py 0.63x -> 0.48x), suite VM-wall 0.999.
 
+**STRUCT BAKED LAYOUT (2026-07-26, the 64_struct_create fix; roadmap
+lever 4c).** Field access + POD construction resolve at COMPILE time -
+NO runtime name scan (`StructTypeDef::slot_of`, a linear interned-name
+compare over the fields vector, used to run per member READ/STORE), no
+per-field coerce calls in a proven ctor. Mechanisms: (1) the inferencer
+stamps `MemberExpr::base_struct_def` + `field_slot` (resolved next to
+`base_struct`); the TREE-WALKER's eval_int/eval_float/do_eval and the
+VM's StoreMemberV (via `MemberKey::bake_def/bake_slot`, set by
+add_member_key) pick the baked slot behind a DEF-IDENTITY check, falling
+to slot_of on mismatch (a dyn-laundered other-def base stays correct).
+(2) `try_member_scalar` bakes byte offset + LOAD FORM into
+LoadMemberInt/Float (b DUAL: lo = offset or -1, hi = struct_defs idx
+<< 2 | form 0 int/1 float/2 bool/3 int-as-float): the interpreted op
+runs `vm_load_member_baked` (type-tag + def check + one byte read), the
+JIT emits it FULLY INLINE (guards + `mov rax,[bytes+off]`; guard miss ->
+the old helper). (3) `Chunk::ctor_plans` (serializable pool): a
+StructCtorV whose fields are all scalar gets a per-field {offset, act}
+plan (act 0 raw int - a bool arg's payload is already 0/1; 1 float via
+read_float_slot's promote; 2 bool byte); the interpreted
+`vm_struct_ctor_planned` does raw slot reads + direct byte stores (NO
+coerce_struct_field, NO EvalValue marshal buffer, H1 dst-reuse kept),
+and the JIT emits the H1 guards (type/def/refcount==1/!readonly) +
+direct stores inline, slow branch -> the NEVER-THROWING
+jit_struct_ctor_planned - so a PLANNED StructCtorV is op_never_exits
+(leaf-safe, deletable); an unplanned one (nested-struct field) keeps
+the old path (StructCtorV's b is now DUAL: lo = nfields - every b_lit
+reader was updated: visit_use_def, pick_cached_slots, disasm, the
+fallback emit). StructObject layout offsets are probed in jit_layout()
+(public members, + a vector-data-at-+0 probe `sobj_ok` gating both fast
+paths). Execution-proven by `g_jit_member_fast`/`g_jit_ctor_fast` -
+counters bumped by the EMITTED code, asserted by the `jit:` test
+jit_struct_baked (the helpers bump g_jit_op_run, so the old
+LoadMemberInt/Float counter cases were repointed at a BOXED struct,
+which stays helper-served). Measured (callgrind Ir, 64_struct_create):
+JIT-on 1.09B -> 146M (-86.6%; ~265 Ir/iter, 90.6% inside the fragment),
+interpreter-only 1.388B -> 683M (-50.8%); my/cpp 41.6x -> ~12x
+(scale-40 best-of-5). 58/65/77 neutral (they use the flat-ARRAY paths).
+The residual vs C++ (~24 Ir/iter) is type-tag two-stores + ref-checks
+per dst + float type-guard loads - the N7 unboxing arc, not struct-
+specific.
+
 **TYPED TERNARY (M8 + codegen).** `specialize_children` (the M8
 specializer's recursion, inferencer.cpp) descends into `TernaryExpr` /
 `CoalesceExpr` - previously ABSENT, so a ternary's cond/arms were never

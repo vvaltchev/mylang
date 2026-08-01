@@ -63,7 +63,20 @@ those classes in impact order.
    builtin calls in loops); kills most of 75's residue and helps every
    len()-bounded loop.
 
-4c. **Struct baked-layout nativization** (from the 64_struct_create
+4c. **Struct baked-layout nativization - DONE 2026-07-26** (see
+   CLAUDE.md "STRUCT BAKED LAYOUT"). Member reads: baked offset/form in
+   LoadMemberInt/Float + inline JIT fast path + tree-walker/StoreMemberV
+   baked slots (slot_of scan gone from every proven hot path).
+   Construction: Chunk::ctor_plans + vm_struct_ctor_planned + inline JIT
+   H1 fast path (planned ctor = op_never_exits). Measured: 64 callgrind
+   Ir -86.6% JIT-on / -50.8% interpreter-only; my/cpp 41.6x -> ~12x.
+   RESIDUAL to reach <=4x (recorded, N7/lever-5 territory): per-dst
+   type-tag two-stores + ref-list checks (~40 Ir/iter here), float
+   operand type-guard loads, per-value staging moves; a plan-src_slot
+   extension (read ctor args straight from source slots, skipping the
+   staging MoveV) needs visit_use_def to see the chunk (plan srcs are
+   uses) - do it with the barrier rules in hand.
+   (original analysis follows) (from the 64_struct_create
    audit, 2026-07-26; C++ twin verified fair - stores + reloads through
    memory every iteration, 24 instr/iter vs OUR ~2,180). Two mechanisms,
    both compile-time-known facts resolved at RUNTIME today:
