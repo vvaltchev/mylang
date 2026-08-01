@@ -58,6 +58,22 @@ make -j BUILD_DIR=other    # out-of-tree build
 make clean
 ```
 
+> **⛔ CLAUDE BUILDS ONLY UNDER `build-claude/` (maintainer rule,
+> 2026-07-26).** Every build Claude makes goes in a subdirectory of
+> `build-claude/` — e.g. `make -j BUILD_DIR=build-claude/release`,
+> `BUILD_DIR=build-claude/dbg`, `BUILD_DIR=build-claude/meas-<sha>` — NEVER
+> in `build/`, `build-rel/`, or any other top-level directory. The
+> maintainer's own build dirs (whatever he creates: `build`, `build-rel`,
+> ...) are OFF-LIMITS: never build into, measure with, or delete them.
+> Name the lanes descriptively and DELETE throwaway measurement lanes when
+> the measurement is done — 40+ stale `build-meas*` dirs once littered the
+> repo root, which is what triggered this rule. Standard lanes:
+> `build-claude/release` (plain `make OPT=1` — the ONLY binary to
+> benchmark), `build-claude/dbg` (gcc `TESTS=1 OPT=0`, ASan+UBSan),
+> `build-claude/clang` (`CXX=clang++ TESTS=1 OPT=0`),
+> `build-claude/rel-hard` (`TESTS=1 OPT=1 VM_HARDENING=1` — tests only,
+> never benchmarked).
+
 `OPT` defaults to 1 (`-O3`); `OPT=0` drops it. `TESTS=1` adds `-DTESTS`, which
 is what compiles the
 `-rt` suite into the binary. Base flags:
