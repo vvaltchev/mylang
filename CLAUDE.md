@@ -1391,6 +1391,25 @@ warranted. For ordinary OPTIMIZATION work the default is lean:
   cache made py-mode abort on variance where a fresh cpp cache did not — the
   inline re-run is now impossible). MyLang itself is NEVER cached (its time is
   the whole point). Cuts a normal suite run's wall-time roughly IN HALF.
+- **The cache carries a MACHINE-SPEED MARKER, and a mismatch WARNS (2026-07-31,
+  warning-only by maintainer instruction — it never blocks a run).** Caching the
+  comparison creates one asymmetry the halved wall-time is worth: MyLang is
+  timed LIVE and the comparison is read from disk, so a box that is merely
+  SLOWER TODAY reads as a MyLang REGRESSION with no code change. That is not
+  hypothetical — it cost a full false-alarm investigation: the suite geomean
+  read 8.2x where it had read 10.7x, while an interleaved `--baseline` A/B
+  proved HEAD was 1.02x FASTER than the 10.7x binary and callgrind Ir was flat
+  or better on 13 benches; re-timing the byte-identical `.py` scripts showed
+  CPython itself **1.148x slower** than the Jul-20 cache (median 1.205x). So a
+  whole-cache `--recompute` stores a `__machine__` entry (best-of-3 of a fixed
+  in-process CPU loop, ~0.1s), and a measure run re-times it and prints — above
+  the table AND under the geomean — how far off the box is plus the CORRECTION
+  FACTOR to apply to the printed "x faster" figures. A cache with no marker gets
+  a one-line note. **A PARTIAL recompute (`--filter`, or stale-only) does NOT
+  stamp**: most entries would still be from the old machine, and a fresh marker
+  would wrongly certify them — a false negative is worse than no marker. The
+  lasting lesson: **`cur/base` from `--baseline` is the trustworthy number**
+  (both binaries timed interleaved, so drift cancels); my/py alone is not.
 
 **THE FULL-SUITE MEASUREMENT HARD RULE (maintainer-set, 2026-07-16; applies to
 DEEP, maintainer-initiated perf sessions — see the 1-vs-1 default above).** Any
