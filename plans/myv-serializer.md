@@ -259,9 +259,7 @@ RANKED, MEASURED ROI (shopping numbers; the ratios hold across samples):
 
 1. **Compact instruction records - DONE in v3, see below** (4741 ->
    1086 bytes, -77% of the code section).
-2. **Delta + narrow `locs` - 796 -> 195 (-75%).** The table is
-   pc-ascending and lines/cols are small: pc as a delta, line as a delta,
-   col as one byte (with an escape).
+2. **Delta + narrow `locs` - DONE in v5, see below** (796 -> 212).
 3. **Stop storing DERIVED pools - DONE in v4, see below** (947 bytes).
 4. **Narrow the Locs inside the caret pools (~10% more).** `ArgLoc` is
    16 bytes (two Locs of two u32s) and every builtin_call / call_site /
@@ -409,3 +407,59 @@ and from source.
 MEASURED: shopping 6588 -> **5641** (-14%), gcd 2067 -> **1957** = 1.08x
 its source, strloop 506 -> 404, phonebook 8863 -> 8284. Cumulative from
 v1: shopping 12847 -> 5641 (**-56%**), gcd 4920 -> 1957 (-60%).
+
+## v5 (2026-07-29): the DELTA-CODED loc table
+
+DONE - item 2. The old record was `{u32 pc, u32 line, u32 col, u32 line,
+u32 col}` = **20 bytes**, of which ~19 were zero: over bench/ + samples/
+(969 entries) the pc delta never exceeded **19** and the widest caret
+column was **99**. The entry is now FOUR bytes:
+
+```
+pcd   u8  pc - prev_pc                    255  = escape
+lined i8  start.line - prev_line          -128 = escape
+col   u8  start.col                       255  = escape
+ecol  u8  end.col, IMPLYING end.line == start.line
+                                          255  = escape, then the FULL
+          end Loc (i32 line, i32 col) follows
+```
+
+NO NEW MECHANISM, and deliberately no odd widths: a field is EITHER one
+byte OR the reserved sentinel byte followed by a plain 4-byte
+little-endian int32 (`put_u8_esc` / `put_i8_esc`). Nothing in the format
+is a 5-byte or otherwise non-multiple-of-8-bit integer needing a shifted
+top byte - that was the maintainer's explicit constraint, and it also
+rules out LEB128/varints (byte-granular but bit-TAGGED, and the same
+variable-length decode machinery the 16-byte-instruction experiment
+already rejected).
+
+Folding the end LINE into `ecol`'s escape is what got this to four bytes
+instead of five: 97.7% of entries end on the line they start, so a
+dedicated end-line byte would serve 22 entries of 969. A multi-line span
+costs 4 + 8; the worst case (all four fields escaped) is 24 bytes vs the
+old 20 - it needs a pc delta > 254 AND a line jump > 127 AND a column >
+254 AND a multi-line end in ONE entry, which the measured maxima put out
+of reach. Only 4 of 969 entries escape at all.
+
+ON-DISK ONLY: the loader rebuilds the same `vector<LocEntry>`, so
+`loc_at`'s binary search on the throw path is untouched.
+
+VERIFICATION - again the `-vd` oracle is INSUFFICIENT: the dump prints
+`pc -> start.line:col` and NEVER `end`, so byte-identical dumps cannot
+see a mangled end Loc, which is half of every caret. So the round-trip
+test compares loc tables ENTRY-FOR-ENTRY (`myv_locs_equal`, naming the
+first mismatch), and a NEW test (`myv_loc_escapes`) builds a program that
+forces BOTH escapes - a statement indented 320 columns and a 200-line gap
+between two throwing ops - asserts the escapes were actually taken (else
+it would pass vacuously), and compares the tables. That test earned its
+keep immediately: it caught a pre-jit-vs-post-jit pc mismatch in its own
+setup (the load-time JIT inserts EnterNative and REMAPS every pc,
+including the loc table's), which is a trap for any future test comparing
+a written image against an in-memory program - write first, then jit, as
+`myv_round_trip` does.
+
+MEASURED: shopping's loc section 796 -> **212** bytes, the image
+5641 -> **5057** (-10%). Per sample: **gcd 1765 = 0.98x its source - an
+image SMALLER than the .my it came from**, shopping 1.87x, strloop 356,
+fib 603. Cumulative from v1: shopping 12847 -> 5057 (**-61%**),
+gcd 4920 -> 1765 (**-64%**).

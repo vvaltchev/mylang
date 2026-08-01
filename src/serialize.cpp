@@ -689,6 +689,52 @@ EvalValue read_value(Reader &r)
  * derived pool was its only user, and an `Instr`'s own operands ride the
  * compact instruction encoding, not this fat 14-byte form.) */
 
+/*
+ * ONE delta-coded loc FIELD (the write/read pair; used by the `locs` table).
+ * A field is EITHER a single byte holding the value, OR the reserved sentinel
+ * byte followed by the value as a plain 4-byte little-endian int32. There is
+ * deliberately NO in-between width: nothing in this format is a 5-byte (or
+ * any non-multiple-of-8-bit) integer that would need a shifted top byte.
+ *
+ * The unsigned form: 0..254 direct, 255 = escape.
+ * The signed form: -127..127 direct (as a two's-complement byte), -128 = esc.
+ */
+void put_u8_esc(Writer &w, int64_t v)
+{
+    if (v >= 0 && v <= 254) {
+        w.u8v(static_cast<uint8_t>(v));
+        return;
+    }
+    w.u8v(0xff);
+    w.u32v(static_cast<uint32_t>(static_cast<int32_t>(v)));
+}
+
+int64_t get_u8_esc(Reader &r)
+{
+    const uint8_t b = r.u8v();
+    if (b != 0xff)
+        return static_cast<int64_t>(b);
+    return static_cast<int64_t>(static_cast<int32_t>(r.u32v()));
+}
+
+void put_i8_esc(Writer &w, int64_t v)
+{
+    if (v >= -127 && v <= 127) {
+        w.u8v(static_cast<uint8_t>(static_cast<uint64_t>(v) & 0xff));
+        return;
+    }
+    w.u8v(0x80);
+    w.u32v(static_cast<uint32_t>(static_cast<int32_t>(v)));
+}
+
+int64_t get_i8_esc(Reader &r)
+{
+    const uint8_t b = r.u8v();
+    if (b != 0x80)
+        return static_cast<int64_t>(static_cast<int8_t>(b));
+    return static_cast<int64_t>(static_cast<int32_t>(r.u32v()));
+}
+
 void write_arglocs(Writer &w, const std::vector<ArgLoc> &v)
 {
     w.u32v(static_cast<uint32_t>(v.size()));
@@ -815,9 +861,52 @@ void write_chunk(Writer &w, const Chunk &c)
         write_value(w, v);
 
     ct("  consts+refslots");
+    /*
+     * locs: DELTA-CODED - FOUR bytes for the overwhelmingly common entry,
+     * where the fixed `{u32 pc, u32 line, u32 col, u32 line, u32 col}` record
+     * spent 20 (and ~19 of them zero: over bench/ + samples/, 969 entries, the
+     * pc delta never exceeded 19 and the widest column was 99).
+     *
+     *     pcd   u8  pc - prev_pc                      255  = escape
+     *     lined i8  start.line - prev_line            -128 = escape
+     *     col   u8  start.col                         255  = escape
+     *     ecol  u8  end.col, IMPLYING end.line == start.line
+     *                                                 255  = escape, and then
+     *               the FULL end Loc (i32 line, i32 col) follows
+     *
+     * A byte's reserved value means "did not fit": the value follows as a
+     * plain 4-byte int32 (put_u8_esc / put_i8_esc). So a 100k-line file or a
+     * 5000-column line round-trips EXACTLY - the byte form is an optimization
+     * for the common case, never a cap - at 8-12 bytes for those entries.
+     * (Measured: 97.7% of entries end on the line they start, so folding the
+     * end LINE into ecol's escape pays for itself; only 4 of 969 entries
+     * needed any escape at all.) Worst case, an entry escaping all four
+     * fields is 24 bytes vs the old 20 - unreachable in practice.
+     *
+     * ON-DISK ONLY: the loader rebuilds the same `vector<LocEntry>`, so
+     * `loc_at`'s binary search on the throw path is untouched.
+     */
     w.u32v(static_cast<uint32_t>(c.locs.size()));
-    for (const auto &l : c.locs) {
-        w.u32v(l.pc); w.locv(l.start); w.locv(l.end);
+    {
+        int64_t prev_pc = 0, prev_line = 0;
+
+        for (const auto &l : c.locs) {
+            put_u8_esc(w, static_cast<int64_t>(l.pc) - prev_pc);
+            put_i8_esc(w, static_cast<int64_t>(l.start.line) - prev_line);
+            put_u8_esc(w, l.start.col);
+
+            if (l.end.line == l.start.line
+                    && l.end.col >= 0 && l.end.col <= 254) {
+                w.u8v(static_cast<uint8_t>(l.end.col));
+            } else {
+                w.u8v(0xff);
+                w.u32v(static_cast<uint32_t>(l.end.line));
+                w.u32v(static_cast<uint32_t>(l.end.col));
+            }
+
+            prev_pc = static_cast<int64_t>(l.pc);
+            prev_line = l.start.line;
+        }
     }
 
     ct("  locs");
@@ -1061,15 +1150,41 @@ void read_chunk(Reader &r, Chunk &c)
         c.consts.push_back(read_value(r));
 
     n = r.u32v();
+    /* locs: the DELTA-CODED form - the field layout and the escape rule are
+     * documented at the write site in write_chunk (the pairing rule). */
     c.locs.reserve(n);
-    for (uint32_t i = 0; i < n; i++) {
-        Chunk::LocEntry l;
-        l.pc = r.u32v();
-        l.start = r.locv();
-        l.end = r.locv();
-        if (l.pc > c.code.size())
-            bad_image("corrupt .myv (loc pc)");
-        c.locs.push_back(l);
+    {
+        int64_t prev_pc = 0, prev_line = 0;
+
+        for (uint32_t i = 0; i < n; i++) {
+            Chunk::LocEntry l;
+
+            const int64_t pc = prev_pc + get_u8_esc(r);
+            const int64_t line = prev_line + get_i8_esc(r);
+
+            if (pc < 0 || line < 0)
+                bad_image("corrupt .myv (loc delta)");
+
+            l.pc = static_cast<uint32_t>(pc);
+            l.start = Loc(line, get_u8_esc(r));
+
+            const uint8_t ecol = r.u8v();
+
+            if (ecol != 0xff) {
+                l.end = Loc(line, ecol);
+            } else {
+                const int32_t el = static_cast<int32_t>(r.u32v());
+                const int32_t ec = static_cast<int32_t>(r.u32v());
+                l.end = Loc(el, ec);
+            }
+
+            if (l.pc > c.code.size())
+                bad_image("corrupt .myv (loc pc)");
+
+            prev_pc = pc;
+            prev_line = line;
+            c.locs.push_back(l);
+        }
     }
 
     n = r.u32v();
