@@ -6716,6 +6716,24 @@ static const std::vector<test> tests =
         },
         &typeid(TypeErrorEx), 5, 4, 3, 5,
     },
+    {
+        /* IncDec-family deletability: a dyn scalar ++ in a DELETED run
+         * keeps its inc-dec caret via the cold-side exc-stamp (the
+         * loc-less int/float-required TypeError). */
+        "err loc: a DELETED run's checked inc-dec keeps its caret",
+        {
+            "func g(dyn d, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    d++;",
+            "    s += 1;",
+            "  }",
+            "  return s;",
+            "}",
+            "g(runtime(\"oops\"), 2);",
+        },
+        &typeid(TypeErrorEx), 5, 4, 8, 4,
+    },
 
     {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",
