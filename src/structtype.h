@@ -118,7 +118,7 @@ bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
  * by layout()) holds general info + an `array<StructField>`; each `StructField`
  * has name/type/offset/size/align. Built once, program-lifetime. The inferencer
  * registers them in struct_by_name so field access on the result type-checks.
- * Defined in eval.cpp. See plans/reflection.md.
+ * Defined in eval.cpp. See plans/archived/reflection.md.
  */
 const StructTypeDef *native_struct_field_def();
 const StructTypeDef *native_struct_layout_def();

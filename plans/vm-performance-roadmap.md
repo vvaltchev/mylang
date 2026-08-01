@@ -535,7 +535,7 @@ broad + ~1.7x on 10. The plan below is sized accordingly.
 ### E. A post-codegen optimizer (the "LLVM pass" the maintainer invited)
 
 **DONE (2026-07-16) — `peephole_chunk` (codegen.cpp), design + field
-tables in `plans/vm-peephole.md`.** Runs BEFORE `extract_locs` (so the
+tables in `plans/archived/vm-peephole.md`.** Runs BEFORE `extract_locs` (so the
 loc/inline_ctxs side tables build from the compacted code — no side-table
 remap, only Instr pc fields), iterated ≤4 rounds. MEASURED (full-suite
 interleaved A/B vs 6ee507c): **VM-wall geomean 0.987** (a broad −4-14%
@@ -784,7 +784,7 @@ across ~17 benches; my/py 4.41-4.44 → 4.45x), bench+samples instrs
 ## Part 4 — top-10 by expected geomean impact
 
 1. **C1 native in-VM call stack — ✅ DONE (2026-07-16), including C2/D.**
-   Landed as plans/vm-native-call-stack.md phases A-E: in-VM calls,
+   Landed as plans/archived/vm-native-call-stack.md phases A-E: in-VM calls,
    VmInvoker for builtin callbacks, catchable StackOverflowEx, O(1)
    C-stack. Final interleaved full-suite A/B vs 69fef27: PARITY
    (VM-wall 0.999-1.008 across rounds) with recursion 0.68x, sort 0.85x,

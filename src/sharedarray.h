@@ -84,7 +84,7 @@ public:
     };
 
     /*
-     * Backing-storage kind (see plans/typed-arrays.md). A homogeneous
+     * Backing-storage kind (see plans/archived/typed-arrays.md). A homogeneous
      * int/float/bool array keeps an *unboxed* vector instead of vector<LValue>
      * (48-byte slots), which makes bulk ops (reverse/sort/sum/foreach) move far
      * less memory: int/float are 8-byte slots, bool is a single byte (48x
@@ -209,7 +209,7 @@ public:
         , slice(false)
     { }
 
-    /* Flat (unboxed) int/float storage - see plans/typed-arrays.md. */
+    /* Flat (unboxed) int/float storage - see plans/archived/typed-arrays.md. */
     SharedArrayObjTempl(ivec_type &&arr)
         : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)

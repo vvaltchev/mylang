@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 /*
- * BENCH-FAIR (plans/bench-fairness.md, class D): the FAT DYNAMIC VALUE for
+ * BENCH-FAIR (plans/archived/bench-fairness.md, class D): the FAT DYNAMIC VALUE for
  * the dyn-bench C++ twins. A MyLang `dyn` variable holds a runtime-tagged
  * value with EvalValue's flexibility (none/int/float/bool/str/array/dict),
  * every operation dispatching on the runtime tag - the C++ twin of a dyn

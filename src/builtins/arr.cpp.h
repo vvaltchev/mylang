@@ -33,7 +33,7 @@ static const char *const flat_array_violation_msg =
 /*
  * array(N)        -> N elements of `none` (general storage).
  * array(N, value) -> N elements all equal to `value`. The fill value drives the
- *                    storage (value-driven, see plans/typed-arrays.md): an int
+ *                    storage (value-driven, see plans/archived/typed-arrays.md): an int
  *                    -> flat int, a float -> flat float, else general. For a
  *                    callback-built array use make_array().
  */

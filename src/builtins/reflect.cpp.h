@@ -349,7 +349,7 @@ EvalValue builtin_signature(EvalContext *ctx, const ArgLocs *exprList,
 
 /*
  * Build a StructLayout reflection value (a native composite type, see
- * plans/reflection.md) describing `qdef`: name, size, align, pod, and an
+ * plans/archived/reflection.md) describing `qdef`: name, size, align, pod, and an
  * array<StructField> with each field's name/type/offset/size/align (the last
  * three are -1 for a boxed field, which has no byte layout).
  */

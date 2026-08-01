@@ -985,7 +985,7 @@ static const std::vector<test> tests =
     },
 
     {
-        /* #9 FUSION BATCH (roadmap; plans/vm-peephole.md): IntAddStep (an
+        /* #9 FUSION BATCH (roadmap; plans/archived/vm-peephole.md): IntAddStep (an
          * accumulate tail fused into the counted-loop step), ForStepElemInt
          * (the back-edge a[i] load fused into the step; the original load
          * stays for the entry path), StructFieldAddInt (a struct-field
@@ -5314,7 +5314,7 @@ static const std::vector<test> tests =
     },
 
     /*
-     * Flat (unboxed) typed-array storage (plans/typed-arrays.md).
+     * Flat (unboxed) typed-array storage (plans/archived/typed-arrays.md).
      * array_storage() exposes the representation so these pin it.
      */
     {
@@ -10549,7 +10549,7 @@ static const std::vector<test> tests =
     },
 
     /* =========================================================== *
-     *  Type inference + checking (plans/type-inference.md)         *
+     *  Type inference + checking (plans/archived/type-inference.md)         *
      * =========================================================== */
 
     /* ---- MUST ACCEPT: well-typed programs run without error ---- */
@@ -12295,7 +12295,7 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
         /* Run the program under the harness's selected engine. The VM lowers
          * the SAME optimized `root`, so the outcome (result / exception / loc)
          * must be identical - the differential-testing pillar (see run_tests
-         * below and plans/bytecode-vm.md). */
+         * below and plans/archived/bytecode-vm.md). */
         if (g_exec_engine == ExecEngine::Vm)
             vm_execute(root.get());
         else
@@ -13421,7 +13421,7 @@ inliner_folds_const_global()
 }
 
 /*
- * M0 of the type-inference feature (plans/type-inference.md): unit-check the
+ * M0 of the type-inference feature (plans/archived/type-inference.md): unit-check the
  * static-type lattice (statictype.h / statictype.cpp) directly in C++, since it
  * has no AST wiring yet. These exercise the rules the inferencer relies on.
  */
@@ -14915,7 +14915,7 @@ static bool frame_over_64_slots()
  *     IntBin), NO tree-walker fallback;
  *   - a `while` whose body isn't compilable (a nested func decl) -> ONE
  *     whole-statement EvalStmt (EvalToSlot/JumpIfFalse are deleted).
- * See plans/bytecode-vm.md.
+ * See plans/archived/bytecode-vm.md.
  */
 struct VmOpCounts {
     size_t jmp = 0, juic = 0, intbin = 0, halt = 0;
@@ -19143,7 +19143,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool mathfn_ok = mf.mathfnv == 5 && mf.callbuiltinv == 0;
 
-    /* 14c) the E1-E4 PEEPHOLE (plans/vm-peephole.md): a RUNTIME ternary's
+    /* 14c) the E1-E4 PEEPHOLE (plans/archived/vm-peephole.md): a RUNTIME ternary's
      * arms produce STRAIGHT into the assignment's dst - the join-point
      * MoveV is eliminated by retargeting BOTH arm producers (liveness-
      * checked) - leaving one arm-skip Jump and zero moves. (The source
@@ -20547,7 +20547,7 @@ void run_tests(bool dump_syntax_tree)
      * the identical outcome; since the VM falls back to the tree-walker for any
      * construct not yet lowered natively, this is green by construction in
      * Phase 0 and stays a regression net as native opcodes replace fallbacks
-     * (see plans/bytecode-vm.md).
+     * (see plans/archived/bytecode-vm.md).
      */
     g_exec_engine = ExecEngine::Vm;
     size_t vm_pass = 0;

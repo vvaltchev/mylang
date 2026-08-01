@@ -75,7 +75,7 @@ bool vm_exec_block_selftest();
 
 /*
  * Allocate / release a callee frame WINDOW on the current activation's
- * segmented slot stack (plans/vm-native-call-stack.md): do_func_call binds a
+ * segmented slot stack (plans/archived/vm-native-call-stack.md): do_func_call binds a
  * chunked body's params into the returned view Frame instead of constructing
  * a per-call Frame. push returns null when no activation is live (the caller
  * falls back to a plain Frame); throws the catchable StackOverflowEx at the
@@ -150,7 +150,7 @@ private:
 void vm_window_pop();
 
 /*
- * The COMPLETE compiled program image (plans/vm-ast-free-runtime.md): the root
+ * The COMPLETE compiled program image (plans/archived/vm-ast-free-runtime.md): the root
  * chunk, the root-context data the run needs (slot count + the global table's
  * names), and - crucially - OWNERSHIP of every FuncDescriptor and
  * StructTypeDef, MOVED here from the AST by vm_compile. After that transfer
@@ -173,7 +173,7 @@ struct VmProgram {
 };
 
 /*
- * The runtime bytecode VM - the -vm execution engine (plans/bytecode-vm.md).
+ * The runtime bytecode VM - the -vm execution engine (plans/archived/bytecode-vm.md).
  * `root` is the OPTIMIZED program AST (post infer / resolve_names /
  * specialize_types), exactly what the tree-walker's root->eval(nullptr) runs.
  * vm_execute lowers it to bytecode and drives it through the SAME root context

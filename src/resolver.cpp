@@ -462,7 +462,7 @@ private:
      * non-identifier arg (`defined(a[0])`, a rare misuse) is still left as a
      * runtime `defined()` call. Returns true iff it folded. Closes the
      * AST-builtin fold gap that made `s + defined(p)` emit a VM node
-     * fallback (see plans/vm-fallback-elimination.md).
+     * fallback (see plans/archived/vm-fallback-elimination.md).
      */
     bool try_fold_defined(unique_ptr<Construct> &slot, CallExpr *ce)
     {
@@ -2165,7 +2165,7 @@ Resolver::walk(Construct *c, FuncState *cur)
 
 /*
  * Size-only inlining of expression-bodied, top-level, non-capturing,
- * non-recursive functions at direct call sites (plans/function-inlining.md).
+ * non-recursive functions at direct call sites (plans/archived/function-inlining.md).
  * Splices the callee body in place of the call, substituting parameters with
  * the arguments. Spliced nodes carry an InlineCtx so the backtrace is identical
  * with inlining on or off (the Construct::eval / do_func_call flush points

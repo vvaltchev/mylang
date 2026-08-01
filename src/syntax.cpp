@@ -126,7 +126,7 @@ void Construct::operator delete(void *p) noexcept
  * whole AST, asserts live_nodes == 0, and any residual Construct* now reads
  * zeroed, freed memory - a loud crash, not a silent tree-walk. Plain
  * malloc-backed new/delete otherwise (the sized delete gives memset its
- * length with no header). See plans/vm-ast-free-runtime.md.
+ * length with no header). See plans/archived/vm-ast-free-runtime.md.
  */
 #include <cstdlib>
 #include <cstring>

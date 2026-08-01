@@ -133,7 +133,7 @@ template <bool is_max>
 EvalValue b_min_max_arr(const SharedArrayObj &arr)
 {
     /* Flat fast path: scan the unboxed int/float vector directly, no promotion
-     * and no per-element virtual compare (see plans/typed-arrays.md).
+     * and no per-element virtual compare (see plans/archived/typed-arrays.md).
      * strs/structs take the general path below (a LOCAL handle promote -
      * min/max of strings compares lexically as before; the else-chain here
      * would misread their union member). */

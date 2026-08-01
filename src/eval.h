@@ -123,7 +123,7 @@ struct Frame {
     }
 
     /*
-     * VIEW mode (the VM activation, plans/vm-native-call-stack.md): point
+     * VIEW mode (the VM activation, plans/archived/vm-native-call-stack.md): point
      * this frame at EXTERNALLY-OWNED slot storage (a window of the
      * activation's slot stack). The frame owns nothing in this mode - the
      * dtor destroys only placement-built inline slots (none here; the
@@ -377,7 +377,7 @@ extern bool g_dev_builtins_allowed;
  * but the callee of a direct call) is a COMPILE-TIME error (the inferencer's
  * reject_dev_builtins walk, same g_dev_builtins_allowed gate: the REPL keeps
  * the AST and allows the indirect form, like `show`). Maintainer-decided rule
- * (2026-07-14) - see plans/vm-fallback-elimination.md, fork F1.
+ * (2026-07-14) - see plans/archived/vm-fallback-elimination.md, fork F1.
  */
 bool is_lazy_builtin(const UniqueId *uid);
 

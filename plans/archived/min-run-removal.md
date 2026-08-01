@@ -60,7 +60,7 @@ excludes are mostly whole *tiny function bodies* — a comparator or predicate
 `func(a, b) => a < b` is exactly two ops (`i.cmp.v`, `return.v`). Such a body,
 when it is a single fully-native run ending in `ReturnV`, becomes a
 **`native_leaf`**, which a caller fragment `call`s DIRECTLY (#55,
-`plans/native-call-impl.md`) — paying **no `EnterNative` at all**. The MIN_RUN
+`plans/archived/native-call-impl.md`) — paying **no `EnterNative` at all**. The MIN_RUN
 rationale simply does not apply to them, and MIN_RUN is what stops them from
 qualifying (`jit_chunk_is_native_leaf` rejects `n < MIN_RUN`).
 

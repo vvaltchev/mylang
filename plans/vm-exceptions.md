@@ -2,7 +2,7 @@
 
 **Goal.** Make `try` / `catch` / `finally` / `throw` / `rethrow` and the
 built-in runtime errors run as **native VM ops**, so:
-1. **`.myv` serialization** (`plans/bytecode-vm.md` END GOAL): a `try` currently
+1. **`.myv` serialization** (`plans/archived/bytecode-vm.md` END GOAL): a `try` currently
    compiles to ONE `EvalStmt` (an AST reference) — categorically disallowed in a
    serialized image. Exceptions is the **last construct-level fallback** and
    thus a hard PREREQUISITE for `.myv`.
@@ -11,7 +11,7 @@ built-in runtime errors run as **native VM ops**, so:
    `42_exceptions` (200k throw/catch in a loop) is the single most-dramatic
    per-bench win.
 
-This expands the sketch in `plans/bytecode-vm.md` (lines ~771). See
+This expands the sketch in `plans/archived/bytecode-vm.md` (lines ~771). See
 `[[vm-endgame]]`.
 
 ---

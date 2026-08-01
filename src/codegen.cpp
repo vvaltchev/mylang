@@ -548,7 +548,7 @@ bool boxed_literal(const Construct *e, EvalValue &out)
  * (Phase 1); a `while` whose condition + body are resolved-local int ops
  * compiles to the register machine (Phase 2), the VM's registers being the
  * frame slots. Nested int expressions use scratch TEMP slots laid out above the
- * resolved locals. See plans/bytecode-vm.md.
+ * resolved locals. See plans/archived/bytecode-vm.md.
  */
 struct Codegen {
 
@@ -3742,7 +3742,7 @@ struct Codegen {
 
     /*
      * A TYPED ternary VALUE `cond ? a : b` with th==i/f (F-class follow-up
-     * from plans/vm-peephole.md): a typed-compare condition emits ONE native
+     * from plans/archived/vm-peephole.md): a typed-compare condition emits ONE native
      * JumpUnless{Int,Float}Cmp to the else arm (any other condition boxes to
      * a JumpUnlessTrueV - same shape as the boxed ternary's, arms still
      * typed); each arm compiles through the TYPED compilers and lands in a
@@ -7246,7 +7246,7 @@ static void specialize_arith_ops(Chunk &ck)
 
 /* ============ The post-codegen PEEPHOLE pass (roadmap E1-E4) ============
  *
- * plans/vm-peephole.md. Runs BEFORE extract_locs, so the loc/inline_ctxs
+ * plans/archived/vm-peephole.md. Runs BEFORE extract_locs, so the loc/inline_ctxs
  * side tables are built from the ALREADY-compacted code and the pass only
  * ever rewrites Instr pc fields (every pool is operand-indexed, never
  * pc-indexed; Instr::node_idx handles ride inside the moved Instr structs).

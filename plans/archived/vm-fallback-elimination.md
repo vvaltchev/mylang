@@ -801,7 +801,7 @@ From `codegen_func_body`'s gates (codegen.cpp:5859):
 
 ### Tier 4 — the runtime call model itself is AST-anchored
 
-> ✅ **DONE (2026-07-15) — see `plans/vm-ast-free-runtime.md`.** All four
+> ✅ **DONE (2026-07-15) — see `plans/archived/vm-ast-free-runtime.md`.** All four
 > items landed: `FuncObject`/`do_func_call`/`closure_defs` run on the
 > serializable `FuncDescriptor`; `StructTypeDef` ownership moves into the
 > `VmProgram` at `vm_compile`; `node_table` was already deleted with the

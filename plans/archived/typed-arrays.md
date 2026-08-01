@@ -7,7 +7,7 @@ the proven static type and never converted at runtime: `promote_to_general` was
 **deleted**, `get_vec()`/`get_view()` are general-only (they throw on a flat
 array), every op handles flat directly, and the one residual case (mutating a
 flat array to a non-fitting type via a `dyn` alias) raises a `TypeError` instead
-of promoting. See `plans/type-driven-specialization.md` and CLAUDE.md's flat-
+of promoting. See `plans/archived/type-driven-specialization.md` and CLAUDE.md's flat-
 storage bullet for the live design; the text below describes the original M1.
 
 **Chosen design: approach B (tagged storage in `SharedObject`), NOT approach A

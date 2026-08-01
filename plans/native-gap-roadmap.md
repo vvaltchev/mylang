@@ -3,7 +3,7 @@
 Status: RECORDED 2026-07-26 (maintainer-reviewed direction). This is the
 "what do we need" program distilled from the my/cpp >10x investigation
 (the C++ disassembly audit of the worst benches). The companion effort is
-plans/bench-fairness.md - some of the >10x ratios are benchmark-side
+plans/archived/bench-fairness.md - some of the >10x ratios are benchmark-side
 (the C++ compiler transforming the code shape); the items below are the
 MyLang-side levers that remain real regardless.
 

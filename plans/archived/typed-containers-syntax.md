@@ -73,5 +73,5 @@ Inference already gives `array<Point>` from an initializer (`var a =
   (a real capability the bare `array pts;` cannot express).
 - **Documentation / explicit checking** at the declaration site.
 
-See also: `plans/type-driven-specialization.md` (flat storage), the "Explicit
+See also: `plans/archived/type-driven-specialization.md` (flat storage), the "Explicit
 types" section of `README.md`, and the struct-annotation work in `CLAUDE.md`.

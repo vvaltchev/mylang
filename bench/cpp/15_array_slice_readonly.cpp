@@ -6,7 +6,7 @@
 #include "bench.h"
 #include <set>
 
-/* BENCH-FAIR (plans/bench-fairness.md, class E): a MyLang slice is NOT a
+/* BENCH-FAIR (plans/archived/bench-fairness.md, class E): a MyLang slice is NOT a
  * raw pointer pair - it is a managed VALUE with CoW semantics: an
  * intrusive refcount bump on the shared body plus REGISTRATION of the
  * live slice in the parent's slices set (a node-allocating std::set

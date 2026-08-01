@@ -15,11 +15,7 @@ differential + `tests/nested_fuzz.py`.
 
 ## Open
 
-- **Per-chunk "possibly-reference slots" list** (roadmap #1's residual):
-  `vm_leave_call`'s O(nslots) reset scan could skip all-scalar frames
-  (the fib-class) if codegen recorded which slots can ever hold a
-  non-trivial value.
-- **E2 — peephole temp renumbering** (`plans/vm-peephole.md`):
+- **E2 — peephole temp renumbering** (`plans/archived/vm-peephole.md`):
   evaluated + deferred — the native call stack made per-call temp cost
   ~nil, so compacting `n_temps` buys little. Revisit only if a profile
   shows frame-size cost.
@@ -30,23 +26,34 @@ differential + `tests/nested_fuzz.py`.
   (`plans/value-template-instantiation.md` known gap): an input-1 array
   called indirectly from input 2 keeps the boxed base (correct,
   unoptimized; pinned by a `repl:` test).
+- **Dead-STORE deletion** (carried forward from `vm-peephole.md`, now
+  archived): a side-effect-free op in the `retargetable_dst` whitelist
+  whose dst temp is dead on every successor path could be deleted
+  outright, not just retargeted. The peephole already computes the
+  liveness this needs. Never built.
+- **Tail-call elision at `ReturnV(CallV)` pairs** (carried forward from
+  `vm-native-call-stack.md`, now archived): a `return f(args)` could
+  REUSE the current frame's window instead of pushing a second one -
+  "a natural follow-up, not v1". Verified unbuilt (no tail-call
+  machinery in src/).
 - **C3 residual — builtin arg-view ABI**: pass the frame run to
   `func_v` by view instead of copying into the stack `EvalValue[8]`.
   Marginal (scalar args copy cheap; only non-trivial args pay a
   refcount bump) and touches all ~84 signatures; its valuable half
   (AST-free carets) already shipped as `ArgLocs`/`builtin_calls`.
-- **Machine-code JIT (x86-64)** — now DESIGNED as the incremental
-  baseline-AOT tier: `plans/native-aot.md` (2026-07-18; EnterNative +
-  per-chunk RX side buffer, run-granularity fragments over the audited
-  scalar tier, bail-to-interpreter, never-throws rule, phases N0-N5).
-  Runs on-the-fly post-codegen/post-`.myv`-load; never serialized.
-- **A PMU box.** WSL2 has no hardware counters, so front-end/layout
-  effects (the dominant residual on dispatch-bound loops — see
-  `[[vm-dispatch-frontend-regression]]`) only show as wall-clock deltas
-  whose cause can't be confirmed. Any further layout-sensitive work
-  wants `perf stat` on bare metal.
 
 ## Rejected (do not revisit without new evidence)
+
+- **Splitting the cold handlers out of `vm_run_chunk`** (measured,
+  carried forward from `vm-ast-free.md`, now archived): shrinking the
+  dispatch function 6952 -> 5803 instructions made the front-end
+  regression WORSE, not better (geomean 1.168 vs 1.125). The "smaller
+  dispatch text is faster" intuition is not reliable here - this is the
+  same loop-body TEXT effect that later cost +3.6M Ir when the catch
+  dispatch was inlined into `vm_dispatch`.
+- **Converting the dispatch switch to a `.rodata` jump table**
+  (measured, same source): ~2-3% SLOWER than the compiler's own switch
+  lowering. Computed-goto (`CGOTO`) is the form that did pay.
 
 - **The two-tier 16-byte instruction (B3 stage 3) — BUILT, MEASURED,
   REVERTED (2026-07-18).** The full design was implemented and proven

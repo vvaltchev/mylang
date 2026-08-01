@@ -132,7 +132,7 @@ a mystery segfault. Still gated by `ASSERTS` (a no-op under `NDEBUG`). CMake:
 `-DVM_HARDENING=ON/OFF` (default follows the build type). See *Invariants &
 hazards*.
 
-**THE NATIVE IN-VM CALL STACK (plans/vm-native-call-stack.md, phases A-F
+**THE NATIVE IN-VM CALL STACK (plans/archived/vm-native-call-stack.md, phases A-F
 complete).** A VM->VM call (`CallV`/`CachedCallV`/`CallValueV` with a
 chunked callee) is a STATE CHANGE inside the dispatch loop, not a C++
 call: `vm_enter_call` pushes a **call record** + a frame **window** on the
@@ -661,7 +661,7 @@ op into that table, not only visit_pc_fields). Measured: 65_struct_
 field_sum 0.783x, 02_for_loop 0.75x, suite VM-wall geomean 0.987,
 my/py **4.89-4.93x**.
 
-**E4 FUSIONS (in the peephole; plans/vm-peephole.md).** Two profile-
+**E4 FUSIONS (in the peephole; plans/archived/vm-peephole.md).** Two profile-
 chosen superinstructions (a scratch op-pair profiler counted 760M
 executed adjacent pairs over the suite; the distribution is flat, so
 only the caret-safe top pairs shipped): **`IntAddModRI`** (`dst =
@@ -678,7 +678,7 @@ is). Measured: 68_nested/60_bit_sieve -4%, suite VM-wall 0.981, my/py
 4.75x.
 
 **THE POST-CODEGEN PEEPHOLE (`peephole_chunk`, codegen.cpp; design +
-field tables in plans/vm-peephole.md).** Runs in `codegen_chunk` BEFORE
+field tables in plans/archived/vm-peephole.md).** Runs in `codegen_chunk` BEFORE
 `extract_locs` - the load-bearing ordering: the loc/`inline_ctxs` side
 tables are built from the ALREADY-compacted code, so the pass only ever
 rewrites Instr pc fields (every pool is operand-indexed; `node_idx`
@@ -1078,7 +1078,7 @@ group-1 `cmp`/`sub imm`, and shows big `movabs` constants in hex (a `call rax`
 had rendered as `dec rax`; a helper-call `lea rdi` had cascade-misdecoded as
 `mov edi`).
 
-**#55 STEP 1 — NATIVE `ReturnV` (plans/native-call-impl.md).** A fully-native
+**#55 STEP 1 — NATIVE `ReturnV` (plans/archived/native-call-impl.md).** A fully-native
 LEAF body's `ReturnV` runs IN the fragment instead of the interpreter: the
 fragment `flush_cache`s (so the result slot is in memory), then
 `call jit_ret(res_slot); ret`. **`jit_ret`** (vm.cpp, `extern "C" noexcept`,
@@ -1102,7 +1102,7 @@ always disqualified by the float op that produced it, so it is never int-cached
 here). Coverage: `g_jit_native_returns` (a `jit:` test asserts both the in-VM
 and the boundary path ran).
 
-**#55 STEP 2 — NATIVE `CallV` (plans/native-call-impl.md).** A function->
+**#55 STEP 2 — NATIVE `CallV` (plans/archived/native-call-impl.md).** A function->
 function direct call to a `native_leaf` runs as a native `call` from the caller
 fragment, not an interpreted CallV. **2.0 (ordering foundation):**
 `jit_compile_chunk` moved OUT of `codegen_chunk` for the precompile - `codegen`
@@ -1241,7 +1241,7 @@ site).
 record per declared identifier — `name, kind (var|const|param|func), line, col,
 const, type, uses(line:col,...)` — then exits without running. It is the audit
 tool for the mandatory-`dyn` / type-driven work (see
-`plans/type-driven-specialization.md`): used to find identifiers inferred `dyn`
+`plans/archived/type-driven-specialization.md`): used to find identifiers inferred `dyn`
 / `array<dyn>` and decide whether each is justified (annotate with `dyn`) or an
 inference gap (fix the inferencer).
 
@@ -1294,7 +1294,7 @@ perturb the measured nodes or the loop count) and timing each in a tight C++
 loop; per-node marginal cost is isolated by subtracting child-subtree costs and
 printed relative to a slot read. The **CALL** weight is the reference for the
 planned inliner benefit function (inline a body when the sum of its node weights
-is below the call weight — see `plans/function-inlining.md`). Re-run when the
+is below the call weight — see `plans/archived/function-inlining.md`). Re-run when the
 interpreter changes; reusable for the eventual bytecode VM (the weights change,
 the benefit function does not). Current (`OPT=1 ASSERTS=0`): id/lit/add/cmp ≈ 1,
 return ≈ 3, if ≈ 7, assign ≈ 11, **CALL ≈ 21** (×id-read).
@@ -1514,7 +1514,7 @@ with `--baseline <the same post-flip binary>`, `--vm` gives the baseline
 `-tw`, so the `cur/base` column and geomean are **VM / tree-walker** (<1 ==
 VM faster). This is the
 per-phase performance gate for the VM build-out (see "Execution strategy" +
-`plans/bytecode-vm.md`): run it release + `ASSERTS=0` at the end of each phase;
+`plans/archived/bytecode-vm.md`): run it release + `ASSERTS=0` at the end of each phase;
 a phase must not regress the tree-walker unless the regression is flagged as
 temporary + tracked to a later phase that erases it. Phase 0 (pure fallback) is
 neutral (geomean 1.00x), as it must be.
@@ -1556,7 +1556,7 @@ nothing to register).
   identity (name/params/captures/frame data/purity/chunk pointer), plus the
   `DeclType`/`SymKind`/`ResolvedSym` enums it needs (moved here from
   syntax.h). The runtime call model reads ONLY this - see the value-model
-  section and plans/vm-ast-free-runtime.md.
+  section and plans/archived/vm-ast-free-runtime.md.
 - `syntax.h` / `syntax.cpp` — the `Construct` AST node hierarchy, its
   `serialize()` (what `-s` prints), and `clone()` (a deep copy of a subtree,
   used by inlining; pure virtual so every concrete node must provide one — see
@@ -1572,7 +1572,7 @@ nothing to register).
   same file also hosts the **auto-const** folder (the `AutoConst` class), run at
   the end of `resolve_names` (see the const-evaluation section), and the
   **inliner** (the `Inliner` class), run after it (gated by `-ni`; see the value
-  model section / `plans/function-inlining.md`).
+  model section / `plans/archived/function-inlining.md`).
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
@@ -1582,7 +1582,7 @@ nothing to register).
   `resolve`/`unify`/`assignable`/`join`/`equal`/
   `to_string`). Distinct from the runtime `Type *` ops table — this is what the
   compile-time inferencer reasons over (type variables, nullability `opt`,
-  structural array/dict/func shapes). See `plans/type-inference.md`.
+  structural array/dict/func shapes). See `plans/archived/type-inference.md`.
 - `inferencer.cpp` / `inferencer.h` — `infer_types(root)`, the **whole-program
   static type inference + checking** pass (see the dedicated section below).
 - `backtrace.cpp` / `backtrace.h` — `format_backtrace()`, which renders an
@@ -1619,7 +1619,7 @@ reflection objects. The two native `StructTypeDef`s are built in C++
 inferencer registers them in `struct_by_name` (`setup()`) and types `layout()`
 via `builtin_result`, and `reflect_make_layout` (reflect.cpp.h) constructs the
 boxed instance. This is the mechanism `Type` objects (the planned
-`type()`/`decltype()` return value) will reuse — see `plans/reflection.md`.
+`type()`/`decltype()` return value) will reuse — see `plans/archived/reflection.md`.
 
 **Why so many headers are templates.** `type.h` (`TypeTemplate`),
 `sharedarray.h`
@@ -2069,7 +2069,7 @@ auto-const params. All four are registered as runtime builtins (with fallback
 bodies) so the names resolve even when the pass doesn't fold them.
 
 **In progress: function inlining & specialization.** Designed and being built;
-see `plans/function-inlining.md` for the full plan and task order. Three aims:
+see `plans/archived/function-inlining.md` for the full plan and task order. Three aims:
 (1) *specialization* — propagate a const/auto-const argument into a (possibly
 non-pure) function and fold (the missing half of const-parameter propagation,
 since today only pure/auto-pure whole-call folding crosses a call); (2) *inline
@@ -2345,7 +2345,7 @@ tables,
 so it
 leaves the tree untouched for the later passes (the one exception is the
 named-argument desugaring below, a deliberate lowering). Full design + the
-decisions behind it: `plans/type-inference.md`,
+decisions behind it: `plans/archived/type-inference.md`,
 `plans/type-inference-questions.md`.
 
 - **Named-argument desugaring (`lower_named_args`).** A call may pass arguments
@@ -2578,7 +2578,7 @@ decisions behind it: `plans/type-inference.md`,
   array<int> by the fixpoint) start flat — the whole grow-from-empty class
   ran on general 48-byte LValues before (bench 13: 3x faster fixed). Generic `array a` /
   `dict d` (no `<...>`) are unchanged (element inferred). See
-  `plans/typed-containers-syntax.md`.
+  `plans/archived/typed-containers-syntax.md`.
 - **Compile-time TYPE QUERIES: `type`/`decltype` (-> `Type` object),
   `typestr`/`kindstr` (-> string).** All four are non-const builtins with an
   **UNEVALUATED operand** (like C++ `decltype`/`sizeof` - the arg is never
@@ -2645,7 +2645,7 @@ decisions behind it: `plans/type-inference.md`,
   into containers. Skips params (a never-called func's param is legitimately
   `dyn`), foreach loop vars (type derived from the container), and func names.
   Runs **after** the check pass, so a var that is `dyn` *because of* a real type
-  error surfaces that error first. See `plans/type-driven-specialization.md`.
+  error surfaces that error first. See `plans/archived/type-driven-specialization.md`.
 - **dyn-into-concrete COERCION** (a plain `var` accepts a `dyn` value). `int OP
   dyn` is `dyn` (above), so `var s = 0; s = s + x` (x `dyn`) contributes `dyn`
   to `s`. Rather than widen `s` to dyn (which mandatory-`dyn` would then
@@ -2774,7 +2774,7 @@ boxing between them. **Effect:** ~2.8x on `bench/44_primes_sqrt`, ~2x on
 float-heavy reductions; the once-slower-than-Python primes benchmark is now
 faster. `th` is copied by `copy_base_fields` (clones/inliner preserve it), and
 the typed eval's `get<int_type>()` throws `TypeError` if inference were ever
-wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
+wrong (a safety net, not silent corruption). See `plans/archived/type-inference.md` M8.
 **A base template's body is NOT specialized** (`FuncDeclStmt::is_template`,
 skipped in `specialize_types`): it is a monomorphization shell, cloned per
 signature (each clone specialized separately) and run boxed for indirect
@@ -2909,7 +2909,7 @@ call-site signature** as a typed clone the ordinary concrete-function path
 handles. So `func f(x){var t=x+1; return t;}` never needs `var dyn t`, a
 never-called template never errors, and `f(1); f("s")` makes two instances not a
 type conflict. `dyn` is the explicit one-instance-any-type param. Full design +
-deferrals: `plans/function-templates.md`.
+deferrals: `plans/archived/function-templates.md`.
 
 **`opt`/typed params coexist with template params** and just `join` within each
 clone — the signature is keyed by the *template params only*. So `func f(a, opt
@@ -3658,8 +3658,8 @@ are unchanged.
   `get_view()`/`get_vec()` (now they'd throw on flat anyway). `array()` is a
   **non-const** builtin (never folds to a baked literal, so `array(N)` is always
   a runtime call the hint reaches, and a huge `array(1000000)` isn't baked). See
-  `plans/typed-arrays.md` (approach B) and
-  `plans/type-driven-specialization.md`.
+  `plans/archived/typed-arrays.md` (approach B) and
+  `plans/archived/type-driven-specialization.md`.
 - **`DictObject`** (`shareddict.h`): the value handle is
   `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map is a
   **`std::unordered_map<EvalValue, LValue>`** inside it — an O(1) hashmap (NOT a
@@ -4006,7 +4006,7 @@ and two macros:
   inlined code) emits the chain once and sets the flag, and `do_func_call`'s
   catch (a real call made *from* inlined code) flushes the call-site chain
   unconditionally and sets the flag so the enclosing `CallExpr` doesn't re-emit.
-  `format_backtrace` is untouched. See `plans/function-inlining.md`.
+  `format_backtrace` is untouched. See `plans/archived/function-inlining.md`.
 - **Tests** pin caret spans via the `test` struct's
   `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
   see the "err loc:" tests in `tests.cpp`); the "backtrace:" `extra_checks`
@@ -4618,7 +4618,7 @@ source (v1 was 4.7x / 4.76x / 2.72x). The REPL is out of scope
 (it retains ASTs).
 
 **THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,
-> plans/vm-ast-free-runtime.md): the call model runs on the serializable
+> plans/archived/vm-ast-free-runtime.md): the call model runs on the serializable
 > **`FuncDescriptor`** (funcdesc.h) — `FuncObject::func` points at it, never
 > at a `FuncDeclStmt`; params bind from its `ParamDesc` snapshot, captures
 > snapshot via its resolved kind/slot list (`read_sym`), backtraces and the
@@ -4631,8 +4631,8 @@ source (v1 was 4.7x / 4.76x / 2.72x). The REPL is out of scope
 > `memset(0)`ed by the Construct class `operator delete` — and
 > `Construct::live_nodes == 0` is ML_CHECKed. The VM then runs with the AST
 > provably gone. The historical inventory lives in
-> `plans/vm-fallback-elimination.md`; the descriptor/teardown design in
-> `plans/vm-ast-free-runtime.md`.
+> `plans/archived/vm-fallback-elimination.md`; the descriptor/teardown design in
+> `plans/archived/vm-ast-free-runtime.md`.
 
 MyLang's performance philosophy is a two-front strategy, in this deliberate
 order — the same order a real C/C++ compiler works in:
@@ -5358,7 +5358,7 @@ which throws BEFORE evaluating any arg — is a bare
 With `try_fold_defined` (identifiers) + `DefinedGlobalV` (globals), every
 `defined` form is now fold/native.
 **The read-only builtin migration to `func_v` is
-complete** (see `plans/builtin-abi-migration.md`): every read-only builtin whose
+complete** (see `plans/archived/builtin-abi-migration.md`): every read-only builtin whose
 args are plain values now dispatches via `CallBuiltinV`. **`sort`/`rev_sort`/
 `reverse`** — whose arg0 is an `LValue` (slice write-back + a const's copy) —
 migrated to a **const-capable lvalue ABI**: `make_const_builtin_lv` registers a
@@ -5421,7 +5421,7 @@ forms are since DELETED; `LoopBackEdge` is DELETED too — once the no-fail
 codegen removed every fallback body, nothing could set a brk/cont/ret
 FlowState inside a chunk and codegen had already stopped emitting it, so
 the VM's only remaining FlowState use is ReturnV's value hand-off to
-do_func_call — see plans/vm-native-call-stack.md Phase A.)
+do_func_call — see plans/archived/vm-native-call-stack.md Phase A.)
 **Phase 2** is a **REGISTER machine over the frame slots** (the VM's registers
 ARE the resolved-local slots — NO value stack), with fused superinstructions:
 `IntBin` (3-address `dst = a <arith> b`, operands = slot or int immediate) and
@@ -5527,7 +5527,7 @@ back: `68_nested` 0.22x, `65_struct_field_sum` 0.22x vs the tree-walker). The
 register choice (over a stack machine, which the
 already-M8-optimized tree-walker would beat) is also the right IR for the
 eventual native x86-64 codegen. Full roadmap + phase order:
-`plans/bytecode-vm.md`.
+`plans/archived/bytecode-vm.md`.
 
 **Build the VM FOUNDATIONS before optimizing a construct — do NOT bolt a native
 op onto an incomplete architecture.** A native lowering that lacks the
@@ -5554,7 +5554,7 @@ the goal is outstanding end-state results, not an immediate delta.** The
 foundations to build first: an **AST-free instruction** (op-data in a constant
 pool as indices, loop vars as slot operands, locs in a `pc→loc` side table — so
 `Instr` drops the `node` field and shrinks), and a **box-free value/slot flow**.
-See `plans/vm-fallback-elimination.md` (the foreach negative-result note) and
+See `plans/archived/vm-fallback-elimination.md` (the foreach negative-result note) and
 `[[vm-nativization-heuristic]]`.
 
 **Foundation step 1 — the loc SIDE TABLE (`Chunk::locs`, done).** An op that can
@@ -5614,7 +5614,7 @@ became an `InternalErrorEx` net). The builtin-call ops
 is the single fallback op (`EvalStmt`) — `CallValueGenericV` reads the
 `call_sites` pool. P8
 exceptions are fully native (they no longer reach a fallback op). The FALLBACK-OP
-AUDIT (`plans/vm-fallback-elimination.md`) that followed found LIVE `EvalStmt`
+AUDIT (`plans/archived/vm-fallback-elimination.md`) that followed found LIVE `EvalStmt`
 fallbacks in several more shapes — **F-1..F-4, all now NATIVE**: the multi-assign
 / IdList forms (`MultiUnpackV`), the residual `foreach` shapes (2-var dyn
 container, indexed general-value unpack), the discarded-result indirect call
@@ -6007,7 +6007,7 @@ This is the ONE remaining non-serializable side table (the loc / member-key /
 catch-type / literal-obj / closure-def / struct-def / unpack-target / chain-locs
 / inline-frames pools are all plain data or by-name-re-internable). The
 node-drop was ~orthogonal to the VM-exception work (see
-`plans/vm-fallback-elimination.md`).
+`plans/archived/vm-fallback-elimination.md`).
 
 **A THIRD side table — `Chunk::inline_ctxs` (`pc → inline_frames index`, P8 Inc
 4).** Same shape/cost as `locs` (sorted, binary-searched, throw path only),
@@ -6137,7 +6137,7 @@ island ops + the BRANCHED island-exit (boxed conditions) + a leaner island
 executor — only then do real mixed functions become winning containers. Proven
 by the `jit_container` `-rt` test (`g_jit_container_calls` coverage + a
 throw-from-island + a loop container) + differential + fuzzer + `-vdj`. Builds on
-`plans/native-call-impl.md` (v1 native calls) and `plans/native-aot.md`
+`plans/archived/native-call-impl.md` (v1 native calls) and `plans/native-aot.md`
 (approach A, the fragment ABI).
 
 ## Invariants & hazards (defense in depth)
@@ -6147,7 +6147,7 @@ This project deliberately builds many overlapping correctness layers (a
 *different* blind spots make a bug clear them all very unlikely). The rules
 below came out of a real, nasty bug — an MSVC-only, non-deterministic
 wrong-result in cross-input REPL template instantiation, root-caused via CI
-instrumentation (see `plans/function-templates.md`).
+instrumentation (see `plans/archived/function-templates.md`).
 
 - **A red test on ANY platform is a real bug — never route around it.** A
   one-platform CI failure you can't reproduce locally is NOT "flakiness" to

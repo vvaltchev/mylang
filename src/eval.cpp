@@ -1004,7 +1004,7 @@ coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
 }
 
 /*
- * Native composite types for reflection (see plans/reflection.md). Built once
+ * Native composite types for reflection (see plans/archived/reflection.md). Built once
  * (lazy static, program-lifetime), boxed (they have str/array fields), slots in
  * declaration order. `StructLayout`'s `fields` carries a TypeAnnot of
  * `array<StructField>` so the inferencer types `layout(S).fields[0]` as a

@@ -6,7 +6,7 @@ were the last builtin group on the fallback because their arg0 is an **lvalue**
 (a mutable reference to the caller's container), which the value ABI destroys by
 pre-evaluating.
 
-See CLAUDE.md "The value & type model" (Builtin ABI) and `plans/bytecode-vm.md`.
+See CLAUDE.md "The value & type model" (Builtin ABI) and `plans/archived/bytecode-vm.md`.
 
 ## Phase 1 — DONE (commit `3e94b5b`)
 

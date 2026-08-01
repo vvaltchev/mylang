@@ -172,7 +172,7 @@ class Gen:
         self.py.append(p)
 
     # A weighted menu of side-effect kinds - (method, weight). New structural
-    # constructs are added here (see plans/fuzz-variability.md).
+    # constructs are added here (see plans/archived/fuzz-variability.md).
     def se_menu(self):
         return [
             (self.se_scalar,  30),
