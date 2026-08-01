@@ -33,7 +33,9 @@ endif
 # Build with LTO=0 to disable. -flto=auto is accepted by both GCC and clang, and
 # must be present at both compile and link (the link line passes BASE_FLAGS).
 ifeq ($(LTO),1)
-	BASE_FLAGS += -flto=auto
+	BASE_FLAGS += -flto=auto -DML_LTO=1
+else
+	BASE_FLAGS += -DML_LTO=0
 endif
 
 # AddressSanitizer / UndefinedBehaviorSanitizer. Both default ON for a debug
