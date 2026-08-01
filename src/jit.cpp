@@ -3928,8 +3928,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::MakeDictV:
         /* dst = build_dict_from_pairs(run[a_lit .. +2*b_lit), b_lit pairs) via
          * jit_make_dict (rdi=dst, rsi=run base, rdx=npairs). An unhashable key
-         * throws -> test eax + exit_pc so EnterNative re-raises with the
-         * literal's caret from the loc side table. */
+         * throws -> test eax + the collapse-safe exc-stamp + exit_pc, so the
+         * re-raise carries the literal's caret WITHOUT a pc lookup: that is
+         * what makes the op CONVEY rather than bail, hence deletable (#56 -
+         * the same treatment its MakeArrayV/MakeStructArrayV siblings have). */
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
@@ -3941,6 +3943,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -6164,6 +6167,13 @@ static bool op_fully_native(const Instr &in)
     case OpCode::UnpackElemFloat:
     case OpCode::UnpackElemValue:
     case OpCode::UnpackElemTargets:
+    /* ... and the dict LITERAL, the same shape (jit_make_dict runs the shared
+     * build_dict_from_pairs; an UNHASHABLE key is its only throw and conveys
+     * with the exc-stamped caret).  Its MakeArrayV twin is never-exits - a
+     * dict differs only in that it FREEZES + HASHES each key.  This one was
+     * invisible until samples/phonebook started compiling again (the
+     * value-template inference fix), which is why it missed the batch. */
+    case OpCode::MakeDictV:
         return true;
     /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
      * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the

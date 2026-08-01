@@ -23,6 +23,7 @@
 #include "eval.h"
 #include "resolver.h"
 #include "backtrace.h"
+#include "errfmt.h"
 #include "statictype.h"
 #include "inferencer.h"
 #include "repl.h"
@@ -16265,6 +16266,58 @@ static bool jit_final_batch_deletable()
         cout << "  tw:\n" << tw << "  vm:\n" << vm;
         return false;
     }
+    /*
+     * MakeDictV CONVEYS (2026-07-29): a dict literal's only throw is an
+     * UNHASHABLE key, and it must arrive with the literal's own caret - baked
+     * by emit_exc_stamp, NOT looked up at the (collapsed) exit pc - which is
+     * what makes the op deletable. Compare the whole rendered error against
+     * the tree-walker, the oracle: a wrong caret or a lost backtrace shows up
+     * as a mismatch. (samples/phonebook is the shape that exposed the gap.)
+     */
+    auto run_err = [](const std::vector<const char *> &lines,
+                      ExecEngine eng) -> std::string {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = eng;
+        std::string out;
+        try {
+            if (eng == ExecEngine::Vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (const Exception &e) {
+            std::ostringstream os;
+            format_exception(os, e, {});     /* header + carets-less + frames */
+            out = os.str();
+        }
+        g_exec_engine = saved;
+        return out;
+    };
+    const std::vector<const char *> dk = {
+        "func mk(dyn k) {",
+        "    var i = 0;",
+        "    while (i < 3) { i++; }",
+        "    return { k: 1, \"b\": 2 };",
+        "}",
+        "print(mk(runtime(len)));" };
+    const std::string dk_tw = run_err(dk, ExecEngine::TreeWalk);
+    const std::string dk_vm = run_err(dk, ExecEngine::Vm);
+    if (dk_tw.empty() || dk_tw != dk_vm) {
+        cout << "  MakeDictV convey - tw:\n" << dk_tw << "  vm:\n" << dk_vm;
+        return false;
+    }
+
     /* the builders: emplace, a flat struct-array literal, strict unpack */
     const unsigned long e0 =
         g_jit_op_run[static_cast<size_t>(OpCode::EmplaceStruct)];

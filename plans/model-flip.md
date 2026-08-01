@@ -1578,8 +1578,73 @@ common one-inlined-body-per-run shape.
 
 Corpus history: 58 (audit baseline) -> 45 (LoadElem) -> 41 (LV family)
 -> 27 (calls) -> 22 (small batch) -> 20 (ForeachDyn) -> 16 (#9 fusions)
--> 15 (native throw) -> **7**. The residue is EXACTLY the deferred
-catch-dispatch work: 5 CatchTest + 4 Reraise + 1 EndFinally (its cold
-reraise bails) + 2 runs with genuinely distinct inline chains. See "The
-native throw + the CATCH-DISPATCH redesign (deferred)" above for the
-saved design ideas.
+-> 15 (native throw) -> **7**.
+
+## MakeDictV + the FINAL audit (2026-07-29) - corpus 11
+
+RE-AUDITED after samples/phonebook started compiling again (the
+value-template inference fix that same day): it had contributed NOTHING
+to the "7" above, because it did not compile. With it the corpus is 12,
+and one of its two runs exposed a REAL gap the final batch had missed -
+`MakeDictV`, the dict-literal builder. Its `MakeArrayV` twin is
+never-exits ("no error path"); a dict differs only in that it FREEZES and
+HASHES each key, so an UNHASHABLE key (a func) throws. It got the
+ordinary convey treatment - `emit_exc_stamp` on the failure branch plus a
+`catch (...)` -> eptr net in jit_make_dict - and joined op_fully_native.
+Pinned: the unhashable-key error is byte-identical across engines AND
+through an image. Corpus 12 -> **11**.
+
+THE REMAINING 11, exactly:
+
+    8  CatchTest + Reraise    42_exceptions, 69, 70, 71, primes2,
+                              phonebook, shopping x2
+    1  EndFinally             72_exc_finally (its cold reraise bails)
+    2  distinct inline chains 09_fib_recursive
+
+The first 9 are the DEFERRED catch-dispatch work (see the section above).
+
+## The DISTINCT-INLINE-CHAINS residue: what it would take
+
+SCOPED 2026-07-29, NOT implemented - the cost/benefit is a maintainer
+call, so here is the finding.
+
+The guard keeps a run whose `inline_ctxs` entries name DIFFERENT chains,
+because deleting it collapses every pc onto the head EnterNative and
+`vm_flush_inline`'s pc-keyed `inline_frame_at` would then emit the WRONG
+virtual frames in a backtrace. Both remaining runs are in fib's unrolled
+body, and their raising ops are:
+
+    run[0,50)   8x CachedCallV                     (calls only)
+    run[0,40)   SubscriptV, CallBuiltinV, 4x CachedCallV
+
+So a fix must cover BOTH a raise conveyed by a non-call op AND an
+exception propagating THROUGH a call - a partial fix unblocks neither
+run. Two mechanisms, both cold-path:
+
+ 1. NON-CALL conveying ops: bake the chain index the way the CARET is
+    already baked. `emit_exc_stamp` writes the op's Locs straight into
+    the exception object on the cold failure branch; one more store would
+    write an `Exception::jit_inline_frame`, and `vm_flush_inline` would
+    prefer it over the pc lookup. Zero hot-path cost, symmetric with the
+    existing design.
+
+ 2. CALLS: `vm_unwind_walk` flushes at `cur.ret_pc - 1`, which is
+    ambiguous once collapsed. The zero-cost route is the POST-CALL ENTRY
+    STUB pc, which is unique per call site and already stored as
+    `rec.ret_pc`: emit an `inline_ctxs` entry keyed by the stub pc during
+    the delete/remap pass, and have the walk try `ret_pc` before
+    `ret_pc - 1`. The alternative - baking the index into the call
+    RECORD - is rejected: that puts a store on the emitted M5b push, i.e.
+    the hot call path lever 1 fought to strip.
+
+WHY IT IS NOT OBVIOUSLY WORTH IT: the benefit is ~90 interpreted
+instructions of bytecode in ONE bench and the word "universally"; there
+is NO runtime gain, since the native code runs either way and this is all
+cold-path. The cost is ~100-150 lines touching the exception object, the
+exc-stamp emitter, the delete/remap pass (which carries a
+`ML_CHECK(pe == entries.size())` invariant and a dual remap) and the
+unwind walk - the area with the most subtle past bugs (a stale caret, the
+byte-identical backtrace pins, the fuzzer-caught codegen-field bug) - in
+the hottest recursion bench. A parity test (throw through a distinct-chain
+deleted run, backtrace byte-compared against the tree-walker) would be
+mandatory.

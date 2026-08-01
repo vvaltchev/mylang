@@ -909,10 +909,30 @@ whose entries all name the SAME chain (the common shape - one inlined
 body spliced as a unit) is safe, since every entry remaps to the head
 EnterNative with that one correct index. Ir neutral (58/20/75/09
 +-0.01%, 77 +0.23%); the backtrace THROUGH a deleted inlined chain is
-pinned byte-identical (jit_final_batch_deletable). **Everything that
-remains is the deferred catch dispatch** - 5 CatchTest + 4 Reraise +
-1 EndFinally (its cold reraise path bails) + 2 runs whose inline
-chains genuinely differ.
+pinned byte-identical (jit_final_batch_deletable).
+**MakeDictV + the FINAL audit (2026-07-29) - the corpus is 11.** The "7"
+above predated samples/phonebook COMPILING again (the value-template
+inference fix the same day), so phonebook had contributed nothing to the
+audit; with it the corpus is 12, and one of its runs exposed a real gap
+the batch had missed - **`MakeDictV`**, the dict-literal builder. Its
+`MakeArrayV` twin is op_never_exits ("no error path"); a dict differs
+only in that it FREEZES and HASHES each key, so an UNHASHABLE key (a
+func) throws. Given the ordinary convey treatment - `emit_exc_stamp` on
+the failure branch + a `catch (...)` -> eptr net in jit_make_dict - it
+joined op_fully_native; the unhashable-key error is pinned byte-identical
+across engines AND through a `.myv` image. Corpus 12 -> **11**: 8
+CatchTest+Reraise runs, 1 EndFinally (its cold reraise bails), and the 2
+fib runs whose inline chains genuinely differ. The first 9 are the
+DEFERRED catch dispatch. The last 2 were SCOPED and NOT done - a fix must
+cover both a non-call conveying raise (bake the chain index into the
+exception object, exactly as the CARET already is) AND an exception
+propagating through a CALL (key an `inline_ctxs` entry by the post-call
+entry-STUB pc, which is unique per site and already in `rec.ret_pc`;
+baking it into the call RECORD instead would put a store on the hot M5b
+push that lever 1 fought to strip), so a partial fix unblocks neither
+run - for ~90 interpreted instructions in one bench and NO runtime gain.
+See plans/model-flip.md ("The DISTINCT-INLINE-CHAINS residue") for the
+full write-up.
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat
