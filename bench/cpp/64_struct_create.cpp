@@ -27,9 +27,16 @@ int main(int argc, char **argv)
 
     for (long i = 0; i < N; i++) {
         Point p{i, i * 2};                          /* int-POD construction */
+        /* BENCH-FAIR (class B): without the escape, SRoA dissolved both
+         * structs into registers (asm-verified: no stores) - MyLang
+         * materializes a real object (H1 reuses its bytes, but the object
+         * and its field stores exist). Escaping the address forces the
+         * construction to memory, the same logical shape. */
+        asm volatile("" : : "r"(&p) : "memory");
         sx += p.x + p.y;
         bench_sink(sx);
         Vec3 v{i * 1.0, i * 2.0, i * 3.0};          /* float-POD construction */
+        asm volatile("" : : "r"(&v) : "memory");
         fs += v.x + v.y + v.z;
     }
 

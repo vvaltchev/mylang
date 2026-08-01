@@ -8,6 +8,13 @@
  * live so none are dead-code-eliminated. */
 #include "bench.h"
 
+/* BENCH-FAIR (plans/bench-fairness.md, class B): MyLang executes a REAL
+ * depth-900 call chain here; g++ -O3 converted this accumulator recursion
+ * into a plain loop (zero calls - asm-verified), which benches loop adds
+ * against a call protocol. noinline keeps the entry a call, and
+ * no-optimize-sibling-calls gates GCC's tail-recursion(+accumulator)
+ * elimination so each level performs a real call. */
+__attribute__((noinline, optimize("no-optimize-sibling-calls")))
 static long sumto(long n)
 {
     if (n == 0)

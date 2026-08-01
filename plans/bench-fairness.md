@@ -1,6 +1,8 @@
 # Fair C++ benchmarks: same code shape, same semantics, same flexibility
 
-Status: PLAN (maintainer-directed, 2026-07-26). Not implemented yet.
+Status: IMPLEMENTED (2026-07-26) - see the Log at the bottom; the
+classification sections below are the original plan, kept for the
+rationale (amendments recorded in the Log).
 Companion: plans/native-gap-roadmap.md (the MyLang-side levers that stay
 real regardless of bench fairness).
 
@@ -138,4 +140,57 @@ runtime:**
 
 ## Log
 
-(append per-bench results here as the work lands)
+**FULL PASS LANDED (2026-07-26).** my/cpp geomean **4.06x -> 3.662x**.
+All fixes asm-verified (call present / no packed arithmetic / stores per
+iteration / indirect calls); all 16 changed twins re-verified to print
+byte-identical results to their .my benches; the cpp cache recomputed
+(same-day as the mylang measurements, so my/cpp is immune to the stale-
+python-cache host-drift trap).
+
+Class B (shape restored), before -> after my/cpp:
+- 10_recursion_deep  93.7x -> 25.5x  (noinline + no-optimize-sibling-calls;
+  `call sumto` back in the asm; residual = the call protocol, roadmap 1)
+- 11_closure_counter 76.5x -> 30.6x  (std::function value; 3 indirect
+  calls/iter in asm)
+- 63_closures        52.9x -> 30.3x  (std::function + noinline factories;
+  first attempt devirtualized - 0 calls - and needed the noinline)
+- 64_struct_create   56.0x -> 41.6x  (asm-escape both structs; stores per
+  iteration verified; the big residual is OUR ctor cost - roadmap 5)
+- 76_funcval_dispatch audited FAIR as-is (1 indirect call/iter in asm)
+- 09_fib_recursive audited FAIR as-is (real calls; note: MyLang's
+  unroll+cache is OUR legal transform - the asymmetry is in our favor)
+- 77_struct_array_lit audited FAIR as-is (operator new in the loop)
+
+Class C (auto-vectorization disabled; packed-arith-after = 0, verified):
+- 30_str_index_iterate 43.0x -> 28.7x (residual: MyLang allocates a
+  1-char STRING per subscript read - a real language-side cost)
+- 43_sieve 9.3x -> 7.0x; 56_sieve_bool 7.0x -> 6.4x; 57_bool_reduce
+  7.2x -> 4.2x; 14_array_subscript 2.2x -> 2.0x; 18/19/20 foreach
+  ~unchanged (their vector uses were setup, not the hot loop).
+- 46_matrix_mult RECLASSIFIED: not vectorized (asm-audited) - its 33.3x
+  is a GENUINE MyLang gap (boxed array-of-arrays vs flat doubles).
+- 54_mandelbrot / 55_float_sum: not vectorized (audited) - left alone.
+
+Class D (fat-variant twins, bench_value.h):
+- 66_dyn_foreach   10.5x -> 5.7x  (Value array + dyn accumulator +
+  per-entry shape dispatch)
+- 74_dyn_foreach_kv 19.0x -> 7.4x (Value-keyed dict, Value k/v arith)
+- 75_indexed_unpack RECLASSIFIED to class F: its rows are STATICALLY
+  typed in the .my (array<array<str>>) - the 88.9x is a MyLang-side
+  pathology (roadmap 4 says profile it first).
+
+Class E (managed-slice twins; DEVIATION from the plan: embedding the
+runtime was rejected after scoping - types.cpp's extern graph drags the
+whole 22-TU interpreter into a single-file bench (plus a second main) -
+the twins instead MIRROR the exact mechanics: refcount + slices-set
+registration per array slice (SharedArrayObj's design; the set insert IS
+in the asm), refcounted view + fresh 1-char string per char read for
+strings):
+- 15_array_slice_readonly 21.3x -> 8.6x
+- 29_str_slice_readonly   18.8x -> 19.6x (~unchanged: the twin's 1-char
+  strings are SSO-cheap in C++; MyLang's SharedStr-per-char is the real
+  cost - a language-side item, pairs with the 30 residual)
+
+NEW HONEST WORST LIST (the roadmap's targets): 75 88.9x (profile!),
+64 41.6x, 46 33.3x, 63 30.3x, 11 30.6x, 30 28.7x, 10 25.5x, 76 24.7x,
+77 17.2x, 73 9.9x, 68 7.8x, 60 7.5x, 74 7.4x.
