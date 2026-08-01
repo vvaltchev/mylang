@@ -5223,9 +5223,28 @@ walked frame cost 162 Ir/frame = **+6.4% on 69_exc_crossframe**, fixed
 by an ML_ALWAYS_INLINE emptiness wrapper over the ML_NOINLINE loop
 (69: +6.37% -> **-2.36%**) - and **do/while**, since the wrapper already
 proved the first iteration's condition (+6 Ir/throw otherwise).
-PERF, measured end to end vs the pre-#78 baseline: 72_exc_finally
-**-1.42%**, 69_exc_crossframe **-2.36%**, 42_exceptions **+3.11%**,
-70_exc_runtime_error **+11.02%**. The step-C projection (that deleting
+PERF (all figures ASSERTS=0 - see THE ASSERTS=0 MEASUREMENT RULE; the
+ASSERTS=1 readings this paragraph first carried were not extrapolable and
+one flipped sign). End to end vs the pre-#78 baseline, AFTER the hot-path
+fix below: 72_exc_finally **-1.28%**, 69_exc_crossframe **+0.30%**,
+42_exceptions **+0.71%**, 70_exc_runtime_error **+2.04%** (they were
++2.83% and +9.47% before that fix). **THE FIX - `vm_dispatch_exc_hot`:**
+an ASSERTS=0 profile of 70 (361 Ir per throw once the 4.13M startup floor
+is subtracted) showed `vm_dispatch_exc_frame`'s own PROLOGUE+EPILOGUE at
+**28 Ir/throw** (17 in `{`, 11 in `}`) against a body doing ~15 Ir of
+real work - the frame was nearly twice the function. `vm_raise` now uses
+an INLINED copy of the shared body while the boxed-throw sites inside
+`vm_dispatch` keep the out-of-line one (inlining THERE measured +3.6M -
+the loop-body text rule); vm_raise is reached from the throw HELPERS, not
+the dispatch loop, so it costs no loop text. Worth **-6.79%** on 70 and
+**-2.06%** on 42. Two profile findings that looked alarming were NOT
+throw-path costs: `__dynamic_cast` and `__strcmp_avx2` fire 27k/71k times
+against 200k throws - they are COMPILE-time (the RTTI-free matcher is
+intact). The fragment round trip (39 Ir/throw; the fragment is entered
+exactly once per throw) is now the largest single remaining item and
+would need a direct fragment-to-fragment `jmp` on a dispatched throw -
+never a `call`, which would nest a C frame per iteration and overflow.
+The step-C projection (that deleting
 the two dispatch-switch cases would return step 2's +36 Ir/throw) was
 **WRONG** - it returned 0.5M of 7.2M - and is recorded as wrong. Split by
 the JIT kill switch, the residual is: a DESIGN cost (+1.4% / +4.2% with

@@ -2316,7 +2316,7 @@ extern unsigned long g_vm_table_dispatch;
  * text rule), and splitting a cold tail out of it +2.7M (a second call and
  * its argument marshalling, for a frame it barely shrinks).
  */
-static ML_NOINLINE bool vm_dispatch_exc_frame(
+static ML_ALWAYS_INLINE bool vm_dispatch_exc_body(
         VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
         size_t &pc, std::unique_ptr<RuntimeException> &ex)
 {
@@ -2380,6 +2380,19 @@ static ML_NOINLINE bool vm_dispatch_exc_frame(
 }
 
 /*
+ * The OUT-OF-LINE form, for the boxed-throw sites INSIDE vm_dispatch. Those
+ * must not inline the body: growing the dispatch loop's text measured +3.6M
+ * Ir on 42_exceptions (the loop-body text rule). vm_raise takes the inlined
+ * form instead - see vm_dispatch_exc_hot.
+ */
+static ML_NOINLINE bool vm_dispatch_exc_frame(
+        VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
+        size_t &pc, std::unique_ptr<RuntimeException> &ex)
+{
+    return vm_dispatch_exc_body(act, cur, ctx, pc, ex);
+}
+
+/*
  * THE FAST REJECT, inline at every call site: "does this frame have a live
  * try at all?" - two loads and a compare.
  *
@@ -2397,6 +2410,26 @@ static ML_ALWAYS_INLINE bool vm_dispatch_exc(
     if (act.handlers.size() <= cur.handler_base)
         return false;                 /* no try here - no call, no frame */
     return vm_dispatch_exc_frame(act, cur, ctx, pc, ex);
+}
+
+/*
+ * The HOT form, used ONLY by vm_raise - the same body, INLINED.
+ *
+ * Measured: the out-of-line call cost 28 Ir per throw in prologue+epilogue
+ * alone (17 in `{`, 11 in `}` on 70_exc_runtime_error), against a body whose
+ * real work is ~15 - the frame was nearly twice the function. vm_raise is
+ * reached from the throw HELPERS, not from the dispatch loop, so inlining
+ * here grows a cold-ish function rather than the loop text; the
+ * vm_dispatch-internal sites keep the out-of-line form above. One shared
+ * body either way, so the two cannot drift.
+ */
+static ML_ALWAYS_INLINE bool vm_dispatch_exc_hot(
+        VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
+        size_t &pc, std::unique_ptr<RuntimeException> &ex)
+{
+    if (act.handlers.size() <= cur.handler_base)
+        return false;
+    return vm_dispatch_exc_body(act, cur, ctx, pc, ex);
 }
 
 /*
@@ -4877,7 +4910,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
      * only this dispatch; routing it through the cold-section walk cost a
      * measured +12% there). Not cold-marked itself for the same reason. */
     VmCallRec &cur = act.back_rec();
-    if (vm_dispatch_exc(act, cur, ctx, pc, ex))
+    if (vm_dispatch_exc_hot(act, cur, ctx, pc, ex))
         return true;                       /* chunk unchanged; ex parked */
     return vm_unwind_walk(act, ctx, chunk, pc, std::move(ex));
 }
