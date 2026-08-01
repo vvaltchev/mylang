@@ -920,19 +920,32 @@ only in that it FREEZES and HASHES each key, so an UNHASHABLE key (a
 func) throws. Given the ordinary convey treatment - `emit_exc_stamp` on
 the failure branch + a `catch (...)` -> eptr net in jit_make_dict - it
 joined op_fully_native; the unhashable-key error is pinned byte-identical
-across engines AND through a `.myv` image. Corpus 12 -> **11**: 8
-CatchTest+Reraise runs, 1 EndFinally (its cold reraise bails), and the 2
-fib runs whose inline chains genuinely differ. The first 9 are the
-DEFERRED catch dispatch. The last 2 were SCOPED and NOT done - a fix must
-cover both a non-call conveying raise (bake the chain index into the
-exception object, exactly as the CARET already is) AND an exception
-propagating through a CALL (key an `inline_ctxs` entry by the post-call
-entry-STUB pc, which is unique per site and already in `rec.ret_pc`;
-baking it into the call RECORD instead would put a store on the hot M5b
-push that lever 1 fought to strip), so a partial fix unblocks neither
-run - for ~90 interpreted instructions in one bench and NO runtime gain.
-See plans/model-flip.md ("The DISTINCT-INLINE-CHAINS residue") for the
-full write-up.
+across engines AND through a `.myv` image. Corpus 12 -> **11**.
+**DISTINCT INLINE CHAINS (2026-07-30) - corpus 11 -> 9, and the guard is
+GONE.** A run whose `inline_ctxs` entries named DIFFERENT inlined bodies
+was kept, because deletion collapses every one of those pcs onto the head
+EnterNative and the pc-keyed `inline_frame_at` could then flush the WRONG
+virtual frames. The fix is ONE store: `emit_exc_stamp` already ran at
+every conveying exit INCLUDING the emitted sync call, so it now bakes the
+op's chain index (`Exception::jit_inline_frame`, one
+`mov dword [rax+off], imm32` on the cold branch, guarded like the caret -
+null object, and first-conveyor-wins) beside the caret it already baked,
+and `vm_flush_inline` PREFERS it over the pc lookup. The stamp was
+restructured so the chain still lands for an exception that carries a
+caret but no frames yet, and for an op with a chain but no loc entry.
+PROVEN rather than assumed: on a program whose throwing call sits in the
+chain listed SECOND, instrumenting the flush printed `baked=1 pc=0
+pc_lookup=0` - the pc lookup WOULD have named the wrong body. Pinned in
+jit_final_batch_deletable (engines' backtraces equal, the frame is `snd`
+and never `fst`, and the `g_jit_inline_baked` counter must bump, so the
+test cannot pass by luck or on an unexercised path). `fib$0` is now 9
+instructions. NOTE the earlier scoping (in plans/model-flip.md) predicted
+a SECOND mechanism for the call case - a stub-pc `inline_ctxs` entry or a
+field on the call record - which turned out unnecessary: the emitted call
+site's own exc-stamp runs BEFORE `vm_unwind_walk`'s flush, and that flush
+is `inline_origin_emitted`-guarded, so the baked chain is already in
+place. **All 9 remaining kept runs are now the DEFERRED catch dispatch**
+(8 CatchTest+Reraise, 1 EndFinally whose cold reraise bails).
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat

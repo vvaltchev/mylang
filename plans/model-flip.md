@@ -1603,10 +1603,48 @@ THE REMAINING 11, exactly:
 
 The first 9 are the DEFERRED catch-dispatch work (see the section above).
 
-## The DISTINCT-INLINE-CHAINS residue: what it would take
+## DISTINCT INLINE CHAINS - DONE (2026-07-30), corpus 11 -> 9
 
-SCOPED 2026-07-29, NOT implemented - the cost/benefit is a maintainer
-call, so here is the finding.
+The fix turned out to be ONE store, not the two mechanisms scoped below:
+`emit_exc_stamp` already ran at every conveying exit **including the
+emitted sync call**, so making it bake the op's chain index next to the
+caret it already bakes covered BOTH cases at once. Concretely:
+
+  * `Exception::jit_inline_frame` (int32, -1 = "look it up by pc"), stamped
+    by the fragment on its cold failure branch with one
+    `mov dword [rax+off], imm32`, guarded like the caret (skip when the
+    object is null - a bail/eptr - and when already set, so the first
+    conveyor wins). `emit_exc_stamp` was restructured so the chain store
+    still runs for an exception that already carries a CARET but whose
+    frames are not yet emitted, and so an op with a chain but no loc entry
+    is still stamped.
+  * `vm_flush_inline` prefers it over `Chunk::inline_frame_at(pc)`.
+  * The deletability guard's distinct-chain check is GONE.
+
+PROVEN, not assumed. The test shape puts the throwing call in the chain
+listed SECOND, so the collapsed pc resolves to the FIRST one: instrumenting
+the flush on that program printed `baked=1 pc=0 pc_lookup=0`, i.e. the pc
+lookup WOULD have named the wrong inlined body and the baked index named
+the right one. Pinned in `jit_final_batch_deletable`: the two engines'
+backtraces must match, the frame must be `snd` and never `fst`, and
+`g_jit_inline_baked` must have been bumped - so the test cannot pass on
+luck (two engines agreeing because the correct body happened to be first)
+nor on an unexercised path.
+
+Effect: fib's two runs delete - `fib$0` is 9 instructions - and the corpus
+is 9 kept runs, ALL of them the deferred catch dispatch. A throw through
+fib's unrolled body stays byte-identical across engines.
+
+WHY THE ESTIMATE BELOW WAS WRONG: it assumed the call case needed its own
+route (a stub-pc `inline_ctxs` entry, or a field on the call record) because
+`vm_unwind_walk` flushes at `ret_pc - 1`. That flush is guarded by
+`inline_origin_emitted`, and the emitted call site's own exc-stamp runs
+FIRST, so the baked chain is already in place by the time the walk looks -
+no second mechanism, no touching the remap pass or the record.
+
+## The original scoping (kept for the record - superseded above)
+
+SCOPED 2026-07-29, before the implementation showed one store sufficed.
 
 The guard keeps a run whose `inline_ctxs` entries name DIFFERENT chains,
 because deleting it collapses every pc onto the head EnterNative and

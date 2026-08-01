@@ -2582,6 +2582,16 @@ ptrdiff_t jit_off_exc_loc_end()
          - reinterpret_cast<char *>(b);
 }
 
+/* #56: the baked INLINED-AT chain index a conveying fragment stamps (see
+ * Exception::jit_inline_frame) - probed like the Locs above, never assumed. */
+ptrdiff_t jit_off_exc_inline_frame()
+{
+    DivisionByZeroEx e;
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->jit_inline_frame)
+         - reinterpret_cast<char *>(b);
+}
+
 /* model-flip (nativize-ops): the native SubscriptV body - the interpreter's
  * exact `dst = RValue(base.subscript(idx, for_write=false))`. base_lv is passed
  * as an LValue* (like Subscript::do_eval, for COW identity). Throws -> conveyed
@@ -4579,8 +4589,19 @@ vm_flush_inline_walk(const Chunk &chunk, size_t pc, Exception &e)
 {
     if (e.inline_origin_emitted)
         return;
-    int32_t idx = chunk.inline_frame_at(pc);
-    if (idx < 0)
+    /* #56: a conveying FRAGMENT bakes its op's chain (Exception::
+     * jit_inline_frame) because a deleted run's pcs have collapsed onto the
+     * head EnterNative - prefer it over the pc lookup, which cannot
+     * discriminate there. */
+    int32_t idx = e.jit_inline_frame;
+    if (idx >= 0) {
+#ifdef TESTS
+        g_jit_inline_baked++;
+#endif
+    } else {
+        idx = chunk.inline_frame_at(pc);
+    }
+    if (idx < 0 || static_cast<size_t>(idx) >= chunk.inline_frames.size())
         return;
     /* Walk the flattened inline_frames pool by parent index (innermost callee
      * first) - same BacktraceFrames as flush_inline_frames over the InlineCtx
@@ -5298,6 +5319,7 @@ extern "C" size_t jit_halt() noexcept
 
 /* #55 STEP 2.1: native CallVs set up process-wide (coverage - see jit.h). */
 unsigned long g_jit_native_calls = 0;
+unsigned long g_jit_inline_baked = 0;
 
 /* model-flip M3: native-container island calls set up process-wide (coverage -
  * proves a container's jit_exec_block path actually ran; a `jit:` test asserts

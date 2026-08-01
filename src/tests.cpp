@@ -16266,6 +16266,51 @@ static bool jit_final_batch_deletable()
         cout << "  tw:\n" << tw << "  vm:\n" << vm;
         return false;
     }
+
+    /*
+     * DISTINCT chains in ONE deleted run (2026-07-30). `f` inlines TWO
+     * different bodies, so its run carries inline_ctxs entries naming two
+     * chains - and deletion collapses every one of those pcs onto the head
+     * EnterNative, which is why such runs used to be KEPT: a pc-keyed
+     * inline_frame_at can no longer say which body a raise came from.
+     *
+     * THE SHAPE IS CHOSEN SO THE PC LOOKUP IS WRONG: the throwing call sits
+     * in the chain listed SECOND, so the collapsed pc resolves to the FIRST
+     * (`fst`) while the correct frame is `snd`. Verified before the fix that
+     * the pc lookup returns 0 here and the baked index 1. The frames now come
+     * from Exception::jit_inline_frame, stamped by the fragment beside the
+     * caret - so the tree-walker (the ORACLE) and the VM must agree exactly.
+     */
+    const std::vector<const char *> two = {
+        "func boom(dyn x) {",
+        "    var i = 0;",
+        "    while (i < 2) { i++; }",
+        "    return x / 0;",
+        "}",
+        "func fst(dyn x) => x + 2;",
+        "func snd(dyn x) => boom(x) + 1;",
+        "func f(dyn x) => fst(x) + snd(x);",
+        "print(f(runtime(7)));" };
+    const std::string tw2 = run_bt(two, ExecEngine::TreeWalk);
+    const unsigned long baked0 = g_jit_inline_baked;
+    const std::string vm2 = run_bt(two, ExecEngine::Vm);
+    if (tw2.empty() || tw2 != vm2
+            || tw2.find("snd") == std::string::npos) {
+        cout << "  distinct chains - tw:\n" << tw2 << "  vm:\n" << vm2;
+        return false;
+    }
+    if (tw2.find("fst") != std::string::npos) {
+        /* the WRONG chain would name fst - the pc-lookup answer */
+        cout << "  distinct chains: the WRONG chain was flushed:\n" << vm2;
+        return false;
+    }
+    /* ... and PROVE the collapse-safe path is what produced it: without the
+     * baked chain the two engines could still agree by luck (if the correct
+     * body happened to be the first entry at the collapsed pc). */
+    if (g_jit_inline_baked == baked0) {
+        cout << "  distinct chains: the BAKED chain was never used\n";
+        return false;
+    }
     /*
      * MakeDictV CONVEYS (2026-07-29): a dict literal's only throw is an
      * UNHASHABLE key, and it must arrive with the literal's own caret - baked

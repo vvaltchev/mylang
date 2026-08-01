@@ -123,6 +123,7 @@ EvalContext **jit_addr_current_ctx();   /* &g_current_ctx (file-static) */
 void **jit_addr_exc();
 ptrdiff_t jit_off_exc_loc_start();
 ptrdiff_t jit_off_exc_loc_end();
+ptrdiff_t jit_off_exc_inline_frame();
 ptrdiff_t jit_off_ctx_captures();       /* EvalContext::captures */
 ptrdiff_t jit_off_ctx_gfuncs();         /* EvalContext::gfuncs */
 ptrdiff_t jit_off_gft_slots();          /* GlobalFuncTable::slots */
@@ -223,6 +224,12 @@ extern unsigned long g_jit_native_calls;
 /* model-flip M3: native-container island calls (jit_exec_block) run process-wide
  * - a coverage counter proving the container path executed. */
 extern unsigned long g_jit_container_calls;
+
+/* #56: times an inlined-frame flush used the chain BAKED by a fragment
+ * (Exception::jit_inline_frame) instead of the pc lookup - the coverage
+ * counter proving the collapse-safe path ran, since a deleted run's pcs
+ * cannot discriminate between two inlined bodies. */
+extern unsigned long g_jit_inline_baked;
 
 /*
  * #55 STEP 2: is this chunk's WHOLE body a single fully-native run ending in

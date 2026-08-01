@@ -1524,31 +1524,61 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
 {
     const Chunk::LocEntry *le = static_cast<const Chunk::LocEntry *>(
         loc_entry_addr(ck, old_pc));
-    if (!le)
-        return;                    /* no loc recorded - stays loc-less */
+    /* #56: ... and the op's INLINED-AT chain, so a raise from a DELETED run
+     * does not have to resolve one from its collapsed pc (see
+     * Exception::jit_inline_frame). -1 = this op is not inlined code. */
+    const int32_t chain = ck.inline_frame_at(old_pc);
+
+    if (!le && chain < 0)
+        return;                    /* nothing to stamp - stays loc-less */
+
     const auto pack = [](const Loc &l) {
         return static_cast<uint64_t>(static_cast<uint32_t>(l.line))
              | (static_cast<uint64_t>(static_cast<uint32_t>(l.col)) << 32);
     };
     const uint32_t off_s = static_cast<uint32_t>(jit_off_exc_loc_start());
     const uint32_t off_e = static_cast<uint32_t>(jit_off_exc_loc_end());
+    const uint32_t off_if =
+        static_cast<uint32_t>(jit_off_exc_inline_frame());
 
     e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_exc()));
     e.u8(0x48); e.u8(0x8B); e.u8(0x00);      /* mov rax, [rax] (the object) */
     e.u8(0x48); e.u8(0x85); e.u8(0xC0);      /* test rax, rax */
-    const size_t j_null = e.j8(0x74);        /* jz skip: bail/eptr - no exc */
-    e.u8(0x83); e.u8(0xB8);                  /* cmp dword [rax+off], 0 */
-    e.u32(off_s + 4);                        /*   ... loc_start.col */
-    e.u8(0x00);
-    const size_t j_has = e.j8(0x75);         /* jnz skip: caret already set */
-    e.movabs(RCX, pack(le->start));
-    e.u8(0x48); e.u8(0x89); e.u8(0x88);      /* mov [rax+off_s], rcx */
-    e.u32(off_s);
-    e.movabs(RCX, pack(le->end));
-    e.u8(0x48); e.u8(0x89); e.u8(0x88);      /* mov [rax+off_e], rcx */
-    e.u32(off_e);
+    const size_t j_null = e.j8(0x74);        /* jz end: bail/eptr - no exc */
+
+    size_t j_has = 0;
+    if (le) {
+        e.u8(0x83); e.u8(0xB8);              /* cmp dword [rax+off], 0 */
+        e.u32(off_s + 4);                    /*   ... loc_start.col */
+        e.u8(0x00);
+        j_has = e.j8(0x75);                  /* jnz: caret already set */
+        e.movabs(RCX, pack(le->start));
+        e.u8(0x48); e.u8(0x89); e.u8(0x88);  /* mov [rax+off_s], rcx */
+        e.u32(off_s);
+        e.movabs(RCX, pack(le->end));
+        e.u8(0x48); e.u8(0x89); e.u8(0x88);  /* mov [rax+off_e], rcx */
+        e.u32(off_e);
+        e.patch8(j_has, e.pos());            /* the CARET block only: the
+                                              * chain stamp below still runs
+                                              * for an exception that already
+                                              * carries a caret but whose
+                                              * frames are not yet emitted */
+    }
+
+    if (chain >= 0) {
+        e.u8(0x83); e.u8(0xB8);              /* cmp dword [rax+off_if], 0 */
+        e.u32(off_if);
+        e.u8(0x00);
+        const size_t j_set = e.j8(0x7D);     /* jge end: already stamped
+                                              * (first conveyor wins, as the
+                                              * caret does) */
+        e.u8(0xC7); e.u8(0x80);              /* mov dword [rax+off_if], imm */
+        e.u32(off_if);
+        e.u32(static_cast<uint32_t>(chain));
+        e.patch8(j_set, e.pos());
+    }
+
     e.patch8(j_null, e.pos());
-    e.patch8(j_has, e.pos());
 }
 
 
@@ -6757,26 +6787,16 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             for (size_t p = b; p < en && !can_raise; p++)
                 if (!op_never_exits(chunk.code[p]))
                     can_raise = true;
-            if (can_raise) {
-                /* #56: the guard RELAXES to "distinct chains" - the hazard
-                 * is DIFFERENT chains merging onto the collapsed pc. If
-                 * every entry in the run names the SAME chain (the common
-                 * shape: one inlined body spliced as a unit), the merge is
-                 * harmless: all entries remap to the head EnterNative with
-                 * the same index, and inline_frame_at finds that one
-                 * correct chain. */
-                int32_t only = -1;
-                for (const auto &ie : chunk.inline_ctxs) {
-                    if (ie.pc < b || ie.pc >= en)
-                        continue;
-                    if (only < 0)
-                        only = ie.frame;
-                    else if (ie.frame != only) {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
+            /* #56 (2026-07-30): the guard is GONE - distinct chains are fine
+             * now. A conveying fragment BAKES its op's chain into the
+             * exception (emit_exc_stamp -> Exception::jit_inline_frame, which
+             * vm_flush_inline prefers), so a raise no longer has to resolve
+             * one from the collapsed pc; and an exception PROPAGATING through
+             * a call resolves it from the call record's baked chain
+             * (VmCallRec::inline_frame). Both are pc-independent, which is
+             * exactly what deletion breaks. `can_raise` is kept only as the
+             * cheap gate below. */
+            (void)can_raise;
         }
         deletable[r] = ok;
 

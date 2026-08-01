@@ -125,6 +125,25 @@ struct Exception {
      */
     bool inline_origin_emitted = false;
 
+    /*
+     * The INLINED-AT chain to flush, baked by the code that conveyed this
+     * exception; -1 = "look it up by pc" (the ordinary path).
+     *
+     * WHY (#56): `vm_flush_inline` normally resolves the chain from the
+     * raising op's pc via `Chunk::inline_frame_at`. That breaks once a native
+     * run's interpreted ORIGINALS are deleted: every pc in the run collapses
+     * onto the head EnterNative, so a run holding ops from two DIFFERENT
+     * inlined bodies could no longer say which chain a raise belonged to -
+     * which is exactly what kept such runs from being deleted. A conveying
+     * fragment therefore stamps its op's chain index HERE, the same way it
+     * already stamps the op's caret into loc_start/loc_end (emit_exc_stamp,
+     * jit.cpp), and the flush prefers it. First conveyor wins, like the caret.
+     *
+     * `int32_t` (not the pool's index type) because the fragment writes it
+     * with one `mov dword [rax+off], imm32`.
+     */
+    int32_t jit_inline_frame = -1;
+
     Exception(const char *name,
               const char *msg,
               Loc start = Loc(),
