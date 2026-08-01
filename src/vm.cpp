@@ -2234,6 +2234,35 @@ vm_make_thrown_exc(const EvalValue &v, Loc estart, Loc eend)
     throw TypeErrorEx("Can only throw a struct instance", estart, eend);
 }
 
+/*
+ * #78 step A: the CLAUSE MATCHER - does this clause (a catch_types index, or
+ * -1 = the parenless catch-all) match the in-flight exception? ONE shared
+ * implementation for the interpreted CatchTest and (step C) the handler-table
+ * dispatch, so the two can never drift. The interned-pointer fast path (#74
+ * inc 3: catch_uids is derived from catch_types by the same canonical
+ * interning, so pointer equality == string equality); a subclass without
+ * match_uid takes the string fallback.
+ */
+static bool vm_catch_match(const Chunk &chunk, int_type types_idx,
+                           const RuntimeException *exc)
+{
+    if (types_idx < 0)
+        return true;                              /* catch-all */
+
+    if (const UniqueId *eu = exc->match_uid()) {
+        for (const UniqueId *u : chunk.catch_uids[types_idx])
+            if (u == eu)
+                return true;
+        return false;
+    }
+
+    const std::string_view en = vm_exc_name(exc);
+    for (const std::string &nm : chunk.catch_types[types_idx])
+        if (nm == en)
+            return true;
+    return false;
+}
+
 /* P8: pop the innermost handler OF THE CURRENT FRAME (entries below the
  * record's watermark belong to outer frames - those are reached by the
  * boundary catch's frame walk, never here), PARK the exception in the
@@ -8789,33 +8818,13 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * Reraise. vm_exc is KEPT (not cleared) so a `rethrow` in the catch
              * body can re-raise it; a new throw overwrites it. */
             /* #78: the caught exception lives in the try's per-REGION slot
-             * (b = the region id), parked there by vm_dispatch_exc. */
+             * (b = the region id), parked there by vm_dispatch_exc; the
+             * clause match is the SHARED vm_catch_match (step A - the same
+             * function the handler-table dispatch will call). */
             VmPendState &ps =
                 act.pend_at(cur_rec(), in->b_lit());
-            bool match;
-            if (in->a_lit() < 0) {
-                match = true;
-            } else if (const UniqueId *eu = ps.exc->match_uid()) {
-                /* #74 inc 3: interned-POINTER matching (the per-match
-                 * string_view over the const char* name paid a strlen +
-                 * memcmp). catch_uids is derived from catch_types (same
-                 * canonical interning), so pointer == string equality. */
-                const std::vector<const UniqueId *> &uids =
-                    chunk->catch_uids[in->a_lit()];
-                match = false;
-                for (const UniqueId *u : uids) {
-                    if (u == eu) { match = true; break; }
-                }
-            } else {
-                /* a subclass without match_uid: the string fallback */
-                const std::vector<std::string> &names =
-                    chunk->catch_types[in->a_lit()];
-                const std::string_view en = vm_exc_name(ps.exc.get());
-                match = false;
-                for (const std::string &nm : names) {
-                    if (nm == en) { match = true; break; }
-                }
-            }
+            const bool match =
+                vm_catch_match(*chunk, in->a_lit(), ps.exc.get());
             if (match) {
                 if (in->target2 >= 0)
                     ctx.frame->at(in->target2).put(
