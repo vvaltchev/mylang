@@ -32,18 +32,27 @@ Archived 2026-08-01 after auditing every plan against the source.
 | `bench-fairness.md` | making the C++ twins a fair comparison. Full pass landed; hands its worst-list off to `native-gap-roadmap.md`. |
 | `fuzz-variability.md` | structural variety in the differential fuzzer. All six constructs landed, with a final 1500-program validation. |
 
+`vm-optimizations-rejected.md` is not a moved plan but a SPLIT: the
+"Rejected (do not revisit)" list and the merged-entry ledger were taken
+out of the still-live `plans/vm-optimizations-deferred.md`, which now
+holds only OPEN items. Read it before re-proposing a VM optimization -
+several of its entries were fully built and proven correct before being
+reverted on measurement, and that measurement is the reason not to try
+again.
+
 ## Carried forward before archiving
 
-Three items would have been buried, so they were moved into
-`plans/vm-optimizations-deferred.md` (which is still live):
+Three items would have been buried by the move, so they were lifted out
+first:
 
-- **dead-STORE deletion** — the one peephole rule never built, and not
-  tracked anywhere else (from `vm-peephole.md`);
+- **dead-STORE deletion** — the one peephole rule never built, and
+  tracked nowhere else (from `vm-peephole.md`). Now an OPEN entry in the
+  live `plans/vm-optimizations-deferred.md`.
 - **tail-call elision at `ReturnV(CallV)` pairs** (from
-  `vm-native-call-stack.md`);
+  `vm-native-call-stack.md`). Also now an OPEN entry there.
 - two **measured negative results** that existed only in
   `vm-ast-free.md` — splitting the cold handlers out of the dispatch
   loop made the front-end regression WORSE, and a `.rodata` jump table
-  was ~2-3% slower than the compiler's own switch lowering. Both are now
-  in that file's "Rejected (do not revisit)" list so they are not
-  re-attempted.
+  was ~2-3% slower than the compiler's own switch lowering. These are
+  not open work, so they went into the rejected record
+  (`vm-optimizations-rejected.md`) rather than the live backlog.
