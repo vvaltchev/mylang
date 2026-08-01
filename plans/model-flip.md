@@ -1803,6 +1803,107 @@ indirection). Flattening the clause list into one chunk-level vector
 with (start,count) per site is the obvious next cut - deferred, since it
 changes the myv layout again and step D must land first.
 
+### Step D (2026-07-31): CatchTest and Reraise DELETED
+
+D1 stops emitting them; D2 removes the opcodes. What went with them:
+  - PushHandler's target pc (it carries only its region id), so it left
+    `visit_pc_fields`, `op_is_branch` and `branch_pc_target`, and its
+    emit moved from emit_branch to emit_op;
+  - `VmHandler` is a bare 4-byte region id again, so the emitted inline
+    push/pop store/step 4 bytes and the handler_base bake shifts by 2;
+  - the "no clause matched" bytecode exit (`Reraise`, or SetPend(reraise)
+    + Jump Lfin): vm_dispatch_exc does that itself now, so a plain
+    try/finally emits ONE SetPend where it used to emit two;
+  - the step-1 entry-stub fix for PushHandler's target - the handler-table
+    entry loop is its general form;
+  - `verify_handler_sites`' table-vs-chain walk, which has no second
+    description to compare against any more. It was rewritten as the
+    REMAP net it was really for (every table pc in range, every region
+    resolvable, no empty site), still run after codegen and both remaps.
+  - myv v9: deleting two opcodes renumbers the rest.
+
+THE LOAD-BEARING NEW ROOT: the peephole's reachability DFS seeds from the
+handler table. A catch body's only predecessor was the CatchTest jumping
+to it; with that gone the DFS would call every catch body dead and DELETE
+it. (Threading, the branch-target map and the compaction remap already
+took the table into account from step B.)
+
+STRUCTURALLY THIS IS THE GOAL: with no matcher pc to dispatch into, a
+try/catch region DELETES like any other run. 70_exc_runtime_error's main
+chunk goes from 35 ops to **2** (`enter.nat` + one resume `enter.nat`),
+42_exceptions' to 3. The corpus audit (MYLANG_DELAUDIT=1 over bench/ +
+samples/) goes from 9 kept runs to **1** - every one of the 9 was the
+catch dispatch. The single survivor is 72_exc_finally's, blocked by
+`EndFinally`, whose cold RERAISE arm still BAILS (it needs vm_raise's
+dynamic resume); making it convey is step E.
+
+(An earlier count here said ZERO. That was a measurement error, not a
+result: the audit prints from jit_compile_chunk, and I ran it under
+`-nr`, which never reaches the JIT - so "0" meant "nothing ran". The
+numbers above are from real runs. This is the prove-the-code-ran rule
+biting on the very claim the step is judged by.)
+
+### PERF: the step-C projection was WRONG, and here is the real story
+
+I projected that deleting the two dispatch-switch cases would return
+step 2's +36 Ir/throw of `vm_dispatch` text growth on 42_exceptions, and
+committed to recording it as wrong if it did not. **It did not**: D2
+returned 0.5M of the 7.2M.
+
+Full chain (callgrind Ir, one session, clean same-flag OPT=1 builds;
+42 = 200k throws, 72 = 500k iters, 69 = 20k throws x 17 frames,
+70 = 200k throws):
+
+                   42_exc      72_fin      69_cross     70_runtime
+    pre-#78     245,249,461  36,356,944  327,486,167   72,179,755
+    step 1      245,180,788  36,296,404
+    step 2      251,190,917  36,798,434
+    step B      252,233,683  36,893,036
+    step C      253,860,801  36,935,079
+    step D1     253,609,197  35,881,073
+    step D2     253,068,587  35,840,484  348,347,014   80,333,384
+    + reject    254,268,207  35,840,208  319,906,087   81,533,082
+    + do/while  252,868,134  35,840,159  319,766,236   80,133,016
+    vs pre-#78       +3.11%      -1.42%       -2.36%      +11.02%
+
+Two fixes landed inside step D from these measurements:
+
+  THE FAST REJECT. The frame WALK calls the dispatch once per POPPED
+  frame, and almost every one of those frames has no live try. Pre-#78
+  the dispatch was two loads and a compare, so it inlined and the reject
+  was free; the table version is a real function, and paying a call
+  frame per walked frame cost 162 Ir per frame - **+6.4% on
+  69_exc_crossframe**. Restoring the emptiness test as an
+  ML_ALWAYS_INLINE wrapper over an ML_NOINLINE loop took 69 from +6.37%
+  to -2.36%.
+
+  DO/WHILE. With the wrapper proving the first iteration's condition,
+  repeating it in the loop head cost +6 Ir per throw on the same-frame
+  benches (42, 70); the loop is a do/while.
+
+WHERE THE RESIDUAL IS, split by the JIT kill switch (`-nj`):
+
+                  JIT off (design)   JIT on (shipped)
+    42_exceptions      +1.41%             +3.11%
+    70_runtime         +4.15%            +11.02%
+
+  - The DESIGN cost (+1.4% / +4.2%) is `vm_dispatch_exc_frame`: 89-116 Ir
+    per throw where the interpreted CatchTest chain cost ~50. Roughly 32
+    of those are NESTED-VECTOR addressing - `handler_sites` holds a
+    `vector<HandlerClause>` per site and `catch_uids` a
+    `vector<const UniqueId *>` per clause, so a match walks three levels
+    of indirection. Flattening both into chunk-level arrays with
+    (start,count) per site is the next step, and is now unblocked (it
+    was deferred behind step D because it changes the myv layout).
+  - The JIT-shape cost (the other ~1.7 / ~6.9 points) is the delete
+    itself: a loop that throws EVERY iteration now leaves and re-enters
+    ONE big fragment per iteration (exit -> vm_raise -> dispatch ->
+    EnterNative at the resume), where before it stepped through several
+    small fragments with the try region interpreted between them. That is
+    inherent to delete-originals on a throw-every-iteration shape - these
+    two microbenches are the worst case for it, not the typical one (72
+    and 69, which do real work per iteration, both IMPROVED).
+
 ## The original scoping (kept for the record - superseded above)
 
 SCOPED 2026-07-29, before the implementation showed one store sufficed.

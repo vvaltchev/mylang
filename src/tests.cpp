@@ -14929,7 +14929,10 @@ struct VmOpCounts {
     size_t memberv = 0, callv = 0, callbuiltinv = 0, callbuiltinlv = 0;
     size_t dictstore = 0, dictloadi = 0, dictloadf = 0, storememberv = 0;
     size_t storeelem2 = 0, storeev = 0;
-    size_t pushhandler = 0, catchtest = 0, throwop = 0;
+    size_t pushhandler = 0, throwop = 0;
+    /* #78 step D: the catch clauses are DATA, not ops - so the
+     * shape assertions count handler_sites entries/clauses. */
+    size_t handler_sites = 0, handler_clauses = 0;
     size_t setpend = 0, endfinally = 0;
     size_t mathfnv = 0;
     size_t iaddstep = 0, forstepel = 0, sfadd = 0;   /* #9 fusions */
@@ -14978,6 +14981,12 @@ static bool codegen_counts(const std::vector<const char *> &lines,
  * codegen_func_counts (a function-body chunk). */
 static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
 {
+        /* #78 step D: the catch clauses left the instruction stream for
+         * Chunk::handler_sites, so a try/catch shape assertion counts
+         * TABLE entries alongside the ops. */
+        c.handler_sites += chunk.handler_sites.size();
+        for (const Chunk::HandlerSite &hs : chunk.handler_sites)
+            c.handler_clauses += hs.clauses.size();
         for (const Instr &in : chunk.code) {
             switch (in.op) {
             case OpCode::Jump:             c.jmp++;    break;
@@ -15033,7 +15042,6 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
             case OpCode::StoreElem2V:      c.storeelem2++; break;
             case OpCode::StoreElemValue:   c.storeev++; break;
             case OpCode::PushHandler:      c.pushhandler++; break;
-            case OpCode::CatchTest:        c.catchtest++; break;
             case OpCode::Throw:            c.throwop++; break;
             case OpCode::SetPend:          c.setpend++; break;
             case OpCode::EndFinally:       c.endfinally++; break;
@@ -19173,9 +19181,12 @@ static bool vm_codegen_shapes()
         return false;
     const bool universal_store_ok = uv.storeev >= 1;
 
-    /* 38) a try/catch region (P8 Inc 0) lowers natively: PushHandler + one
-     * CatchTest per clause + the enclosing counted loop stays native
-     * (for.step); the `throw` inside is a native Throw op (P8 Inc 1). */
+    /* 38) a try/catch region (P8 Inc 0) lowers natively: PushHandler +
+     * the enclosing counted loop stays native (for.step); the `throw`
+     * inside is a native Throw op (P8 Inc 1). #78 step D: there is NO
+     * CatchTest any more - the clause list lives in Chunk::handler_sites
+     * and the raise path matches against it directly (the table's CONTENT
+     * is pinned by the `vm: handler table` test). */
     VmOpCounts tc;
     if (!codegen_counts({
             "struct E { int v; }",
@@ -19187,11 +19198,14 @@ static bool vm_codegen_shapes()
     /* P8 Inc 1: the `throw` is now a native Throw op (not an EvalStmt); the
      * whole try/catch loop has ZERO fallback. */
     const bool try_native_ok =
-        tc.pushhandler == 1 && tc.catchtest == 1 && tc.flstep == 1
-        && tc.throwop == 1;
+        tc.pushhandler == 1 && tc.flstep == 1 && tc.throwop == 1
+        && tc.handler_sites == 1 && tc.handler_clauses == 1;
 
     /* P8 Inc 2b: try/finally lowers natively - a handler region + SetPend on
-     * each exit + one EndFinally, zero fallback. */
+     * each exit + one EndFinally, zero fallback. #78 step D: the "no clause
+     * matched" exit (SetPend(reraise) + Jump Lfin) is GONE from the
+     * bytecode - vm_dispatch_exc parks the reraise and resumes at the
+     * table's fin_pc itself - so the plain shape now has ONE SetPend. */
     VmOpCounts tf;
     if (!codegen_counts({
             "var c = 0;",
@@ -19200,12 +19214,12 @@ static bool vm_codegen_shapes()
         }, tf))
         return false;
     const bool try_finally_native_ok =
-        tf.pushhandler == 1 && tf.endfinally == 1 && tf.setpend >= 2
+        tf.pushhandler == 1 && tf.endfinally == 1 && tf.setpend == 1
        ;
 
     /* P8 Inc 2c: a `return` crossing a finally is native - it INLINES the
-     * finally at the return site (so `setpend` stays the plain-finally
-     * normal+reraise pair of 2, NOT a flow SetPend), then ReturnV; ZERO
+     * finally at the return site (it does not set a pend of its own),
+     * then ReturnV; ZERO
      * fallback (a fallback EvalStmt-return would skip the finally). Compiled as
      * a function body (codegen_program only covers main). */
     VmOpCounts fr;
@@ -19216,12 +19230,14 @@ static bool vm_codegen_shapes()
             "}",
         }, fr))
         return false;
-    /* ONE SetPend: the try body always returns (the return INLINES its
+    /* ZERO SetPend: the try body always returns (the return INLINES its
      * finally), so the normal fall-out path (try.pop + set.pend normal +
-     * jmp) is unreachable and the peephole deletes it - only the handler
-     * entry's `set.pend reraise` + the shared finally remain. */
+     * jmp) is unreachable and the peephole deletes it - and #78 step D
+     * removed the handler entry's `set.pend reraise` (the dispatch parks
+     * the reraise itself). Only the shared finally block remains, reached
+     * from the handler table's fin_pc. */
     const bool ret_finally_native_ok =
-        fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend == 1
+        fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend == 0
        ;
 
     /* A `break` crossing a finally likewise INLINES the finally at the break
@@ -19240,8 +19256,11 @@ static bool vm_codegen_shapes()
             "}",
         }, bf))
         return false;
+    /* ONE SetPend (#78 step D): the normal try exit's. The "no clause
+     * matched" reraise exit is gone; the break INLINES the finally rather
+     * than setting a pend. */
     const bool break_finally_native_ok =
-        bf.pushhandler == 1 && bf.endfinally == 1 && bf.setpend == 2
+        bf.pushhandler == 1 && bf.endfinally == 1 && bf.setpend == 1
         && bf.intbin >= 3;
 
     /* Chaining: a return crossing TWO nested finallys is native - each is

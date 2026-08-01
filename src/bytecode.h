@@ -951,14 +951,12 @@ enum class OpCode : unsigned char {
      * region; `throw` + runtime errors still go through the C++ boundary in
      * vm_run_chunk, which routes them into the handler stack. All AST-free
      * (offsets + pool indices), so serializable.
-     *   PushHandler(target=catch_pc): push an active try region.
+     *   PushHandler(a=region id): push an active try region. The region
+     *            names its Chunk::handler_sites entry - the clause list the
+     *            RAISE PATH matches against (#78 step D; there is no
+     *            interpreted matcher chain any more) - and its per-frame
+     *            {exc, pend} slot.
      *   PopHandler: pop it (the try body exited normally).
-     *   CatchTest(a=catch_types idx or -1=catch-all, target2=bind slot or -1,
-     *             target=catch-body pc): if the in-flight exception's type name
-     *             matches, bind `catch (T as e)` + jump to the body; else fall
-     *             through to the next CatchTest / Reraise.
-     *   Reraise: no clause matched → re-raise the in-flight exception to the
-     *            OUTER handler (native jump) or propagate (C++ throw).
      *   Rethrow: `rethrow` in a catch body → re-raise vm_exc with the
      *            rethrow-site loc (from the loc side table).
      *   Throw(a=value slot): raise the value (Inc 1). A same-frame catch is a
@@ -973,8 +971,6 @@ enum class OpCode : unsigned char {
     Throw,
     PushHandler,
     PopHandler,
-    CatchTest,
-    Reraise,
     Rethrow,
     SetPend,
     EndFinally,
@@ -1172,7 +1168,7 @@ enum class OpCode : unsigned char {
     X(MakeDictV) X(MakeClosureV) X(StructCtorV) X(StructCtorBoxedV) \
     X(ThrowRuntimeV) X(CallValueGenericV) X(CheckCallableV) \
     X(MakeStructArrayV) X(JumpUnlessTrueV) X(JumpIfNotNoneV) X(Throw) \
-    X(PushHandler) X(PopHandler) X(CatchTest) X(Reraise) X(Rethrow) \
+    X(PushHandler) X(PopHandler) X(Rethrow) \
     X(SetPend) X(EndFinally) X(Halt) \
     X(IntAddRR) X(IntAddRI) X(IntSubRR) X(IntSubRI) X(IntMulRR) \
     X(IntMulRI) X(IntAndRR) X(IntAndRI) X(IntOrRR) X(IntOrRI) \
@@ -1457,20 +1453,21 @@ struct Chunk {
      * #78 step B: the HANDLER TABLE - one entry per try REGION (indexed by
      * the region id the exception ops carry), describing the region's catch
      * clauses and its shared finally as DATA rather than as the interpreted
-     * CatchTest/Reraise chain.
+     * CatchTest/Reraise chain that step D deleted.
      *
      * This is the redesign's point: the raise path MATCHES here and jumps
      * straight to a catch BODY (ordinary, entry-mapped code), so the matcher
-     * ops leave the bytecode entirely - a deleted native run then has no
+     * ops left the bytecode entirely - a deleted native run then has no
      * un-deletable "matcher pc" to dispatch into, which is what kept every
      * try/catch run interpreted (plans/model-flip.md).
      *
-     * PRIMARY data (built by compile_native_try, not derived): step D deletes
-     * the chain it would otherwise be derived from. While BOTH exist, an
-     * ASSERTS-build verifier (verify_handler_sites) re-walks the chain after
-     * every transformation - the peephole's threading/compaction and both JIT
-     * remaps - and asserts the table still agrees, so a missed remap is a
-     * loud abort rather than a wrong catch at runtime.
+     * PRIMARY data (built by compile_native_try, not derived - the chain it
+     * could have been derived from is gone), hence serialized. Every pc in
+     * it is REMAPPED by each transformation that moves code (the peephole's
+     * threading + compaction, both JIT remaps) and range-checked afterwards
+     * by verify_handler_sites (ASSERTS-only), so a missed remap is a loud
+     * abort rather than a wrong catch at runtime. It is also a ROOT of the
+     * peephole's reachability DFS: a catch body has no in-code predecessor.
      */
     struct HandlerClause {
         int32_t types_idx;   /* catch_types index, or -1 = the catch-all */
@@ -1490,7 +1487,7 @@ struct Chunk {
     /*
      * #78 step 2: the number of TRY REGIONS in this chunk. Each `try` gets a
      * chunk-static monotonic REGION ID baked into its exception ops
-     * (PushHandler/SetPend/EndFinally/CatchTest/Reraise/Rethrow), indexing
+     * (PushHandler/SetPend/EndFinally/Rethrow), indexing
      * the frame's slice of the activation's per-region {exc, pend} stack -
      * the nesting-correct home of the caught exception a `rethrow`
      * re-raises and the pending action a `finally` resumes (one shared
@@ -1790,14 +1787,14 @@ struct Chunk {
 
     /*
      * CATCH-TYPE POOL (P8). One entry per `catch (A, B, ...)` clause with a type
-     * list: the interned type NAMES a CatchTest matches the in-flight
+     * list: the interned type NAMES a catch clause matches the in-flight
      * exception's name against (a user struct-type name or a built-in error
-     * name). A catch-all clause (`catch`/`catch (e)`) has no entry (CatchTest
+     * name). A catch-all clause (`catch`/`catch (e)`) has no entry (the clause
      * carries -1). Strings, so serializable as-is.
      */
     std::vector<std::vector<std::string>> catch_types;
     /* DERIVED from catch_types (#74 inc 3): the same names as interned
-     * UniqueId pointers, for the CatchTest pointer matcher. NOT primary
+     * UniqueId pointers, for vm_catch_match's pointer compare. NOT primary
      * serializable data - a .myv load re-interns from catch_types. */
     std::vector<std::vector<const UniqueId *>> catch_uids;
 

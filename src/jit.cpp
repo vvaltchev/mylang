@@ -1047,12 +1047,12 @@ static bool jit_op_eligible(const Instr &in)
      * measured +8% on the no-throw try path and reverted - the call
      * protocol exceeded the dispatch it replaced for a 4-byte vector
      * push/pop). PushHandler = a capacity check + store + bump (the cold
-     * grow falls to jit_push_handler_grow); PopHandler = `finish -= 8`;
-     * SetPend = a byte store into records[rec_n-1].pend. None can throw ->
-     * op_fully_native. PushHandler routes through emit_branch (its pushed
-     * catch_pc is a PC needing remap[]). The raise-side ops (Throw/
-     * CatchTest/Reraise/EndFinally) need the dynamic-resume design and
-     * stay interpreted. */
+     * grow falls to jit_push_handler_grow); PopHandler = `finish -= 4`;
+     * SetPend = a byte store into the try region's pend slot. None can
+     * throw -> op_fully_native. (#78 step D: PushHandler carries only the
+     * region id now, so it emits from emit_op like any other non-branch
+     * op.) The raise-side ops need the dynamic-resume design and stay
+     * interpreted. */
     case OpCode::PushHandler:
     case OpCode::PopHandler:
     case OpCode::SetPend:
@@ -1071,13 +1071,13 @@ static bool jit_op_eligible(const Instr &in)
      * ENTERED via vm_raise's handler dispatch (the interpreter is already
      * driving there), and Throw always raises - so their native form is an
      * unconditional EXIT at the op (the ThrowRuntimeV pattern; the kept
-     * originals run interpreted). Eligibility is the point: they were the
-     * run SPLITTERS that left a try/catch loop's back edge crossing
+     * originals run interpreted). Eligibility is the point: Throw was a
+     * run SPLITTER that left a try/catch loop's back edge crossing
      * fragments (the interior-entry defect class); merged, the whole loop
-     * is one run and the back edge is a fragment-local jump. NOT
+     * is one run and the back edge is a fragment-local jump. (#78 step D
+     * removed its two companions - CatchTest and Reraise are gone, the
+     * raise path matches the handler table directly.) NOT
      * op_fully_native. */
-    case OpCode::CatchTest:
-    case OpCode::Reraise:
     case OpCode::Throw:
         return true;
     /* model-flip (nativize-ops): an ALWAYS-THROWING construct - the helper
@@ -1898,8 +1898,8 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     st(R10, static_cast<int32_t>(P.rec_caller_caps), RAX);
     ld(RAX, R8R, static_cast<int32_t>(P.act_handlers2) + 8);
     modrm(0x2B, RAX, R8R, static_cast<int32_t>(P.act_handlers2), true);
-    e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(0x03);   /* shr rax, 3 (#78:
-                                                       * 8-byte VmHandler) */
+    e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(0x02);   /* shr rax, 2
+                                                       * (4-byte VmHandler) */
     st32(R10, static_cast<int32_t>(P.rec_handler_base), RAX);
     ld32(RAX, R8R, static_cast<int32_t>(P.act_diters_n));
     st32(R10, static_cast<int32_t>(P.rec_diter_base), RAX);
@@ -2671,10 +2671,8 @@ pick_cached_slots(const Chunk &ck, size_t begin,
         case OpCode::SetPend:
         case OpCode::EndFinally:
             break;                       /* pure activation state - no slots */
-        case OpCode::CatchTest:
-        case OpCode::Reraise:
         case OpCode::Throw:
-            break;                       /* unconditional exits - no slots */
+            break;                       /* an unconditional exit - no slots */
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
         case OpCode::UnpackElemValue:
@@ -4437,9 +4435,46 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::PushHandler: {
+        /* INLINE try-handler push (step 7a): load the handlers vector's
+         * finish; at capacity -> the cold jit_push_handler_grow; else store
+         * the REGION ID (a 4-byte VmHandler) and bump finish. Never throws.
+         * #78 step D: the pushed handler is JUST the region now - the
+         * dispatch reads the clause pcs off Chunk::handler_sites - so this
+         * op has no pc operand and no longer needs the branch emitter's
+         * remap[] (it moved here from emit_branch, and left op_is_branch). */
+        const JitLayout &L = jit_layout();
+        const uint32_t region = static_cast<uint32_t>(in.a_lit());
+        e.bump_op(OpCode::PushHandler);
+        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] (act) */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
+        e.u32(static_cast<uint32_t>(L.act_handlers + 8));    /* finish */
+        e.u8(0x48); e.u8(0x3B); e.u8(0x88);        /* cmp rcx, [rax+h+16] */
+        e.u32(static_cast<uint32_t>(L.act_handlers + 16));   /* end cap */
+        const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
+        e.u8(0xC7); e.u8(0x01);                    /* mov dword [rcx], rg */
+        e.u32(region);
+        e.u8(0x48); e.u8(0x83); e.u8(0xC1); e.u8(4);   /* add rcx, 4 */
+        e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
+        e.u32(static_cast<uint32_t>(L.act_handlers + 8));
+        const size_t j_done = e.j32(0xEB);
+        e.patch32_here(j_grow);
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(region)));
+        e.call_relocs.push_back(
+            { e.pos(),
+              reinterpret_cast<const void *>(jit_push_handler_grow) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.patch32_here(j_done);
+        return true;
+    }
+
     case OpCode::PopHandler: {
         /* INLINE handler pop (step 7a): `finish -= 8` - a VmHandler is a
-         * trivial 8-byte {catch_pc, region} struct (#78), so vector
+         * trivial 4-byte {region} struct (#78 step D), so vector
          * pop_back is exactly the finish decrement (never empty at a
          * PopHandler by codegen construction). Never throws. */
         const JitLayout &L = jit_layout();
@@ -4448,7 +4483,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
         e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));
-        e.u8(0x48); e.u8(0x83); e.u8(0xE9); e.u8(8);   /* sub rcx, 8 */
+        e.u8(0x48); e.u8(0x83); e.u8(0xE9); e.u8(4);   /* sub rcx, 4 */
         e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));
         return true;
@@ -4510,16 +4545,6 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.bail_unless(0x74, pc);      /* je (normal) else BAIL (reraise) */
         return true;
     }
-
-    case OpCode::CatchTest:
-    case OpCode::Reraise:
-        /* cold catch-region ops: an unconditional exit - the interpreter
-         * re-runs the kept original (the handler-dispatch machinery jumps
-         * to these pcs, so they cannot be deleted; see the "exception
-         * trio" note in plans/model-flip.md). */
-        e.bump_op(in.op);
-        e.exit_pc(pc);
-        return true;
 
     case OpCode::Throw:
         /* #56: the NATIVE `throw` - jit_throw(val_slot, pc, &locs[i]) runs
@@ -5597,44 +5622,6 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         return;
     }
 
-    case OpCode::PushHandler: {
-        /* INLINE try-handler push (step 7a): load the handlers vector's
-         * finish; at capacity -> the cold jit_push_handler_grow; else store
-         * the REMAPPED catch-dispatch pc (a 4-byte VmHandler) and bump
-         * finish. Never throws. */
-        const JitLayout &L = jit_layout();
-        const uint32_t tgt = static_cast<uint32_t>(remap[in.target]);
-        const uint32_t region = static_cast<uint32_t>(in.a_lit());  /* #78 */
-        e.bump_op(OpCode::PushHandler);
-        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] (act) */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
-        e.u32(static_cast<uint32_t>(L.act_handlers + 8));    /* finish */
-        e.u8(0x48); e.u8(0x3B); e.u8(0x88);        /* cmp rcx, [rax+h+16] */
-        e.u32(static_cast<uint32_t>(L.act_handlers + 16));   /* end cap */
-        const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
-        e.u8(0xC7); e.u8(0x01);                    /* mov dword [rcx], tgt */
-        e.u32(tgt);
-        e.u8(0xC7); e.u8(0x41); e.u8(4);           /* mov dword [rcx+4], rg */
-        e.u32(region);
-        e.u8(0x48); e.u8(0x83); e.u8(0xC1); e.u8(8);   /* add rcx, 8 */
-        e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
-        e.u32(static_cast<uint32_t>(L.act_handlers + 8));
-        const size_t j_done = e.j32(0xEB);
-        e.patch32_here(j_grow);
-        emit_call_prologue(e);
-        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(tgt)));
-        e.movabs(RSI, static_cast<uint64_t>(
-                          static_cast<int_type>(region)));
-        e.call_relocs.push_back(
-            { e.pos(),
-              reinterpret_cast<const void *>(jit_push_handler_grow) });
-        e.u8(0xE8); e.u32(0);
-        emit_call_epilogue(e);
-        e.patch32_here(j_done);
-        return;
-    }
-
     case OpCode::JumpIfNotNoneV: {
         /* `a ?? b`: jump to target when the lhs slot is NOT none - one
          * type-tag compare against the none singleton. Never throws. */
@@ -5924,10 +5911,7 @@ static bool op_is_branch(OpCode op)
          * to the loop target when the loop continues. */
         || op == OpCode::ForStepElemInt
         /* the `??` short-circuit: jump when the lhs is NOT none. */
-        || op == OpCode::JumpIfNotNoneV
-        /* NOT a real branch - routed here because its pushed catch_pc is a
-         * PC needing remap[] (emit_op has no remap). */
-        || op == OpCode::PushHandler;
+        || op == OpCode::JumpIfNotNoneV;
 }
 
 static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
@@ -6374,7 +6358,6 @@ static int branch_pc_target(const Instr &in)
     case OpCode::JumpUnlessFloatCmp: case OpCode::JumpUnlessTrueV:
     case OpCode::JumpIfNotNoneV: case OpCode::ForLoopStep:
     case OpCode::DictIterNext: case OpCode::ForeachDynNext:
-    case OpCode::CatchTest: case OpCode::PushHandler:
     case OpCode::JumpUnlessElemInt: case OpCode::IntAddStep:
     case OpCode::ForStepElemInt:
         return in.target;
@@ -6940,29 +6923,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                     entries.push_back({ p + 1, 0 });
             }
             /*
-             * THE DELETED-HANDLER-PC HANG FIX (task #78 step 1, 2026-07-30).
-             * A raise DISPATCHES to the pushed handler pc (PushHandler's
-             * target). In a KEPT run that pc survives (the CatchTest chain,
-             * deliberately excluded from the entry set - entering there
-             * would be enter->exit->reinterpret). But a try/FINALLY with NO
-             * catch clauses has no CatchTest keeping its run alive: the
-             * whole region can DELETE, the handler pc (the Lcatch SetPend)
-             * collapses onto the head EnterNative, and a throw then resumes
-             * at the run START - re-runs the throw - and loops FOREVER
-             * (found by the task-#78 test battery; `try { throw ... }
-             * finally { return 5; }` hung, JIT-on only). Such a target
-             * needs a REAL resume point: an interior entry stub, exactly
-             * like a post-call resume. A target at a deleted run's HEAD
-             * needs nothing (the head EnterNative IS the right resume).
+             * #78 step D: the step-1 hang fix (a stub for PushHandler's
+             * target when it landed inside a deleted span) is GONE with the
+             * target itself - a pushed handler is just a region id now, and
+             * the table loop below gives EVERY handler pc (clause bodies
+             * and the shared finally) its resume point, deleted span or
+             * not. That loop is the general form of the same fix.
              */
-            for (size_t p = runs[r].begin; p < runs[r].end; p++) {
-                const Instr &in = chunk.code[p];
-                if (in.op == OpCode::PushHandler && in.target >= 0
-                        && interior_of_deleted(
-                               static_cast<size_t>(in.target)))
-                    entries.push_back(
-                        { static_cast<size_t>(in.target), 0 });
-            }
         }
 
         /*
@@ -7001,19 +6968,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             case OpCode::JumpUnlessElemInt:
             case OpCode::IntAddStep:
             case OpCode::ForStepElemInt:
-            /* #74 inc 2: a CatchTest's target is the CATCH BODY - an
-             * ordinary resume (the matcher matched, bound, and jumps
-             * there), so the body runs NATIVE instead of interpreting to
-             * the back edge. Only the matcher pc itself (PushHandler's
-             * target) stays excluded - entering THERE would be
-             * enter->exit-at-op->reinterpret, pure overhead. */
-            case OpCode::CatchTest:
-                if (in.target >= 0
-                        && interior_of_kept(static_cast<size_t>(in.target)))
-                    entries.push_back(
-                        { static_cast<size_t>(in.target), 0 });
-                break;
-            default:                    /* PushHandler excluded (matcher pc) */
+            /* #74 inc 2 gave the CATCH BODY an entry via CatchTest's
+             * target; #78 step D deleted that op, and the handler-table
+             * loop below supplies the same pcs (plus every fin_pc). */
+            default:
                 break;
             }
         }
@@ -7286,23 +7244,24 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             case OpCode::JumpUnlessElemInt:
             case OpCode::IntAddStep:
             case OpCode::ForStepElemInt:
-            /* #74 inc 2: CatchTest's target = the CATCH BODY, a resume
-             * like any branch target - route it to the entry map so a
-             * matched catch runs its body natively. */
-            case OpCode::CatchTest:
-                /* control-flow targets = RESUMES -> the entry map (a run
-                 * head's EnterNative / an interior entry's inserted one) */
-                if (in.target >= 0 && static_cast<size_t>(in.target) <= n)
-                    in.target = entry_remap[in.target];
-                break;
-            case OpCode::PushHandler:
-                /* the handler pc: through the ENTRY map, so a target inside
-                 * a DELETED span lands on its stub (the hang fix above)
-                 * instead of collapsing onto the head EnterNative and
-                 * re-running the region. For a KEPT run this differs from
-                 * the old plain-remap routing only at the run HEAD (one
-                 * enter->exit->reinterpret bounce on the cold dispatch
-                 * path); interior kept pcs are identical by construction. */
+                /*
+                 * A control-flow target is a RESUME, so it takes the ENTRY
+                 * map (a run head's EnterNative, or an interior entry's
+                 * inserted stub) - not the bail map, which points at the
+                 * surviving original.
+                 *
+                 * KEEP A BODY ATTACHED TO THESE LABELS. They carry no code
+                 * of their own; until this commit they fell through into
+                 * `case OpCode::CatchTest:`, which owned the only copy of
+                 * it. Deleting an opcode whose body is shared by
+                 * fall-through silently turns every label above it into a
+                 * no-op - here that would leave a surviving branch pointing
+                 * into the PRE-insertion pc space.
+                 *
+                 * #78 step D: the handler pcs now live in
+                 * Chunk::handler_sites, remapped through entry_remap right
+                 * after this loop.
+                 */
                 if (in.target >= 0 && static_cast<size_t>(in.target) <= n)
                     in.target = entry_remap[in.target];
                 break;
