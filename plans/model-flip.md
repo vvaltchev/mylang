@@ -970,12 +970,22 @@ caret pinned. Int benches neutral (cold-only). The 44_primes_sqrt -9.7%
 in the spot-check is the LEAN SYNC win (ff00437) surfacing on a bench
 outside that increment's list - profiled + attributed.
 
-NEXT INCREMENTS: ThrowRuntimeV (build the pooled exception natively),
-and the FLOAT ARITH tier's no_bail conversion (FloatBin + the RR/RI
-forms still carry the 3-way bailing operand load, which keeps all-float
-loop bodies non-deletable - the same no_bail argument applies: their
-operands are compile-proven float; float div/mod's raise then converts
-like the int arms).
+**INCREMENT 7 LANDED (162906f, 2026-07-25): the float-arith no_bail
+tier.** Every float operand read -> the 2-way no_bail form (FloatBin +
+RR/RI, CmpFloatV, JumpUnlessFloatCmp, MathFnV incl. libm selectors);
+FloatBin div/mod raise -> convey (the int-arm pattern). The non-throwing
+float ops join op_never_exits (LEAF-safe: all-float bodies can be
+native_leafs + direct-called); FloatBin div/mod op_fully_native only. An
+all-float sqrt/pow/fmod loop deletes to a bare enter.nat, float div0
+caret pinned. BONUS: the 2-way load shortens the hot INT-PROMOTE path
+(one type compare, no jump) - 05_mixed_arith -5.9% Ir, 55_float_sum
+-1.5%, 40 -0.6%. ⚠ a vacuous-smoke trap caught mid-verify: the float
+smoke initially FAILED TO COMPILE (var q = a/z -> DynRequiredEx) and
+"all three engines agree" was agreement on the ERROR - the -vd deletion
+probe exposed it; always confirm the probe shows real chunks.
+
+NEXT: ThrowRuntimeV (build the pooled exception natively) - the last
+recorded deletability increment.
 
 (Historical note - the older tally below predates the iterator ops.)
 CallBuiltinV (~294) is DONE (see
