@@ -332,6 +332,10 @@ extern int g_vm_jit_raise;
  * arg: the fragment can't hold a chunk pointer (stack-built, moved out). */
 extern "C" int jit_store_elem_int(LValue *base, int_type idx, int_type rhs,
                                   int aop) noexcept;
+/* #92 prep: the COW clone alone, so the emitted store can RESUME the
+ * fast path (see vm.cpp). 0 = normalized, retry; 1 = go to the full
+ * helper. */
+extern "C" int jit_store_elem_prep(LValue *base, int_type idx) noexcept;
 extern "C" int jit_store_elem_float(LValue *base, int_type idx,
                                     double rhs, int aop) noexcept;
 /* d[k] = v / d[k] OP= v: base dict LValue* + the key/value slot EvalValue*s
@@ -790,6 +794,7 @@ extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
 /* #92: element stores served by the EMITTED inline tier, never the helper -
  * the only thing that can prove the fast path executed. */
 extern "C" unsigned long g_jit_store_fast;
+extern "C" unsigned long g_jit_store_prep;
 extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
 extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
 extern "C" unsigned long g_jit_sync_inline;

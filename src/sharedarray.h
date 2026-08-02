@@ -460,6 +460,13 @@ public:
     int_type use_count() const { return shobj.use_count(); }
 
     bool is_readonly() const { return shobj && shobj->readonly; }
+    /* #92: true iff a raw in-place store needs NO copy-on-write work -
+     * not a slice view itself, and no live slice views over the storage.
+     * The prep helper re-checks this after cloning so the emitted retry
+     * loop can NEVER spin: prep either normalizes or reports "go slow". */
+    bool jit_cow_clean() const
+    { return !slice && (!shobj || !shobj->has_slices); }
+
     /* #92: ASSERTS-only - the mirror must equal the set it mirrors. */
     bool jit_has_slices_mirror_ok() const
     { return !shobj || shobj->has_slices == !shobj->slices.empty(); }

@@ -49,6 +49,7 @@ extern "C" {
 unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
 unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
+unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 }
@@ -782,6 +783,10 @@ struct Emitter {
     { u8(0xC6); u8(0x80); u32(uint32_t(d)); u8(imm); }
     size_t jmp32()                     /* jmp rel32 -> patch32_here */
     { u8(0xE9); const size_t at = pos(); u32(0); return at; }
+    /* jmp rel32 to a KNOWN (earlier) position - the prep retry loop */
+    void jmp32_to(size_t target)
+    { u8(0xE9); u32(static_cast<uint32_t>(target - (pos() + 4))); }
+    void mov_rsi_r9() { u8(0x4C); u8(0x89); u8(0xCE); }
     /* cmp rax, rcx / test rax, rax */
     void cmp_rax_rcx() { u8(0x48); u8(0x39); u8(0xC8); }
     void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
@@ -3572,15 +3577,26 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
 
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(in.target2);
+    const int32_t base_off = static_cast<int32_t>(
+        static_cast<long>(in.target2) * static_cast<long>(sizeof(LValue)));
     const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
+    std::vector<size_t> preps;
 
+    /*
+     * The RETRY loop head. The two COW guards below jump to a PREP stub
+     * (jit_store_elem_prep, the clone alone) and come back HERE, so a
+     * store that needed the clone still finishes on the fast path - the
+     * interpreter pays the clone once and stores raw ever after, and now
+     * so does the emitted code. The loop cannot spin: prep returns 0 only
+     * when jit_cow_clean() holds, which makes both COW guards pass.
+     * The head re-loads the VALUE because the stub's call clobbers rdi.
+     */
+    const size_t retry = e.pos();
     load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
 
     e.load(RAX, base.type);                        /* an array? */
     e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
     e.cmp_rax_r9();
-    decline_ne();
-    e.cmp_byte_slot(base.payload + L.slice_off, 0);          /* not a slice */
     decline_ne();
     e.cmp_byte_slot(base.type + (L.lv_const_off - L.off_type), 0);
     decline_ne();                                            /* const slot */
@@ -3588,8 +3604,17 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.load(RAX, base.payload);                     /* rax = the SharedObject */
     e.cmp_byte_rax(L.ro_off, 0);
     decline_ne();                                            /* readonly */
-    e.cmp_byte_rax(L.slices_off, 0);
-    decline_ne();                        /* live slice views -> the COW path */
+
+    /*
+     * The COW guards - PREP-able, and deliberately AFTER const/readonly:
+     * the interpreter throws on those WITHOUT cloning, so prepping first
+     * would detach slices for a store that never happens (observable via
+     * `intptr`, which the COW tests pin as spec).
+     */
+    e.cmp_byte_slot(base.payload + L.slice_off, 0);   /* base IS a slice */
+    preps.push_back(e.j32(0x75));
+    e.cmp_byte_rax(L.slices_off, 0);                  /* live slice views */
+    preps.push_back(e.j32(0x75));
 
     e.cmp_byte_rax(L.kind_off, L.kind_ints);
     const size_t j_ints = e.j32(0x74);
@@ -3627,6 +3652,26 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.store_elem_int_rdi();
     e.mov_byte_rax_imm(L.hashv_off, 0);
     dones.push_back(e.jmp32());
+
+    /*
+     * The PREP stub: rdi = &slots[base], rsi = the index (cache-aware -
+     * a pinned loop counter reads its register; the prologue pushes the
+     * cache regs but they still hold their values inside the bracket).
+     * Nonzero -> the full helper; zero -> normalized, RETRY the fast path.
+     */
+    for (const size_t j : preps)
+        e.patch32_here(j);
+    emit_call_prologue(e);
+    e.lea_rdi(base_off);
+    load_index_r9(e, in);
+    e.mov_rsi_r9();
+    e.call_relocs.push_back(
+        { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
+    e.u8(0xE8); e.u32(0);
+    emit_call_epilogue(e);
+    e.u8(0x85); e.u8(0xC0);                    /* test eax, eax */
+    slows.push_back(e.j32(0x75));              /* jnz -> the full helper */
+    e.jmp32_to(retry);
     return true;
 }
 
