@@ -2534,11 +2534,22 @@ pick_cached_slots(const Chunk &ck, size_t begin,
             bad(in.b_slot()); bad(in.target);
             break;
         case OpCode::MoveV:
-            /* jit_move reads/writes slots[src]/slots[dst] from MEMORY, so both
-             * must be current (not pinned in a register). Disqualify them; the
-             * rest of the run can still cache (the call saves/restores r10/r11).
-             * A MoveV also copies any type - never an int-scalar cache anyway. */
-            bad(in.target); bad(in.target2);
+            /* CACHE-AWARE ON THE SOURCE SIDE (see the emit). A pinned source
+             * is a proven int, so the move is just the ordinary int store and
+             * the register is read directly - which is why target2 is NOT
+             * disqualified here.
+             *
+             * It is NOT counted either (no usei), and that omission is the
+             * SOUNDNESS ANCHOR. A MoveV is the BOXED move: the bytecode says
+             * nothing about the value's type, so it can never be the evidence
+             * that a slot holds an int. Contributing zero weight means a slot
+             * reaches the cache only if some genuine int op qualified it - and
+             * once it has, every write to it in this run is an int write, so
+             * the value this MoveV reads really is an int.
+             *
+             * The DEST stays memory-only: a MoveV can write ANY type, so a
+             * pinned dst could silently stop holding an int. */
+            bad(in.target);
             break;
         case OpCode::SubscriptV:
             /* the fragment leas &slot for base/idx/dst - all must be current. */
@@ -3827,6 +3838,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const SlotAddr src = slot_addr(in.target2);
         const SlotAddr dst = slot_addr(in.target);
         e.bump_op(OpCode::MoveV);
+        /* CACHE-AWARE SOURCE: when the source slot is pinned in an N5
+         * register its LIVE value is there (memory is stale until the next
+         * flush), so reading memory here would move the WRONG value - the
+         * op had to disqualify the slot before this existed, and one
+         * trailing `move r5 = a` then cost `a` its register for the whole
+         * fragment. A pinned slot is a proven int (only a genuine int op
+         * can qualify one - a MoveV contributes no weight), so this is the
+         * ordinary int store: the two-store fast path, or the release
+         * helper when the dst is ref-listed. No reference check is needed
+         * on either side - the source cannot be a reference. */
+        if (const int sreg = e.creg(in.target2); sreg >= 0) {
+            store_dst(e, ck, static_cast<uint8_t>(sreg), in.target, pc);
+            return true;
+        }
         std::vector<size_t> jhelp;
         jhelp.push_back(emit_ref_check_jae(e, src.type));
         if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),

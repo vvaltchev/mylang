@@ -1132,6 +1132,34 @@ helper calls AROUND hot int locals - precisely the spill this deletes.
 The `>= 3`-uses heuristic still limits how much of the pool gets used; a
 LIVE-RANGE allocator is the next step and is what the wider pool is for.
 
+**`MoveV` IS CACHE-AWARE ON ITS SOURCE SIDE (2026-08-01,
+plans/jit-registers.md step 2b).** The register pool went four wide and
+still would not FILL, and the reason was not the ranking: an op whose emit
+touches a slot through MEMORY must DISQUALIFY it (`bad(...)` in
+`pick_cached_slots`) for the WHOLE fragment, because a pinned slot's live
+value is in a register and memory is stale until the next flush. `MoveV`
+did that to BOTH its slots, so one trailing `move r5 = a` - the arg-setup
+move in front of any call - cost `a` its register for the entire
+fragment. A four-accumulator loop pinned ONE register, its counter.
+The SOURCE side is now read from the register: `store_dst(sreg, dst)`, the
+same two-store used for any int result (or the release helper when the dst
+is ref-listed), and NO reference check on either side. **What makes that
+sound is that a MoveV contributes NO WEIGHT to the selection** - it does
+not call `usei`, only stops calling `bad`. A MoveV is the BOXED move, so
+the bytecode says nothing about the value's type and it can never be the
+evidence that a slot holds an int; contributing zero means a slot reaches
+the cache only when a genuine int op qualified it, and once it has, every
+write to it in the run is an int write - so the value the MoveV reads
+really is an int. The DEST stays memory-only for the mirror reason: a
+MoveV can write ANY type, so a pinned dst could silently stop holding one.
+Measured (callgrind Ir, `OPT=1 ASSERTS=0`): 01_while_loop **-5.92%**,
+07_nested_loops **-5.43%**, 03_int_arith **-4.00%**; everything else
+within +-0.09% (43_sieve +0.09%, 46_matrix_mult +0.05%, the call and
+callback benches exactly neutral). `MoveV` was picked first because
+arg-setup moves surround every call; the OTHER `bad()` sites are the same
+kind of opportunity and the same treatment applies - each needs its own
+argument for why a pinned operand is type-safe there.
+
 **N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to `MAX_CACHED` hot
 int-scalar slots are pinned in `r12`-`r15` per fragment
 (`pick_cached_slots`, jit.cpp):

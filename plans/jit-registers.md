@@ -210,12 +210,38 @@ yet ONLY `i` gets pinned. Not because of the threshold - because the
 
 **So the next increment is to make the disqualifying ops CACHE-AWARE**, one
 at a time, exactly as the model flip nativized ops one at a time to shrink
-its islands. Rank the `bad()` sites by how often they fire on real
-fragments first (instrument `pick_cached_slots` and run bench/ + samples/)
-- `MoveV` is the obvious first candidate, since arg-setup moves surround
-every call. Only once the candidate sets are big enough for the choice to
+its islands. Only once the candidate sets are big enough for the choice to
 matter does a smarter ranking pay, and THEN the live-range work above can
 come back off the shelf.
+
+### DONE: MoveV (the first one)
+
+The source side reads the register - `store_dst(sreg, dst)`, the same
+two-store as any int result, no reference check on either side - so
+`bad(in.target2)` is gone. The four-accumulator loop above now pins all
+four accumulators instead of only the counter.
+
+**The soundness anchor is that a MoveV contributes NO WEIGHT.** It stopped
+calling `bad`; it does NOT start calling `usei`. A MoveV is the BOXED move,
+so the bytecode says nothing about the value's type and it must never be
+the evidence that a slot holds an int. Zero weight means a slot reaches the
+cache only when a genuine int op qualified it - and once it has, every
+write to it in the run is an int write, so the value read here really is an
+int. The DEST stays memory-only for the mirror reason: a MoveV can write
+ANY type, so a pinned dst could silently stop holding one.
+
+Measured (callgrind Ir, `OPT=1 ASSERTS=0`, this change alone):
+01_while_loop **-5.92%**, 07_nested_loops **-5.43%**, 03_int_arith
+**-4.00%**; everything else within +-0.09%.
+
+### Next: the other bad() sites, ranked by what actually fires
+
+Instrument `pick_cached_slots` (count disqualifications per opcode) and run
+bench/ + samples/ - do NOT guess the order. Each op needs its own argument
+for why a pinned operand is type-safe there; `MoveV`'s was "the source is
+int-proven by something else, and I add no evidence of my own". `SubscriptV`
+(leas &slot for base/idx/dst) and the boxed `CompoundV`/`UnaryV` are the
+obvious next reads, but the instrumentation decides.
 
 Recorded rather than kept, because shipping a measurable-but-negative
 change that provably does not do its job is worse than a written finding.
