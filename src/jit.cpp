@@ -151,6 +151,16 @@ void jit_native_stack_init()
     g_nstack_top = static_cast<char *>(m) + RESERVE;
     g_nstack_cur = g_nstack_top;
     jit_set_sync_depth_cap(500000);
+#else
+    /* SANITIZED build (the stack is pass-through): every sync level below
+     * the cap is a C-stack frame whose vm_dispatch alone is ~77KB under
+     * clang ASan (per-case locals + redzones, no scoped-local overlap) -
+     * the historical 200 was ~15MB of frames and overflowed the 8MB
+     * default stack in the pinned-cap recursion test. 32 levels (~4MB
+     * worst-case) leaves real margin; past the cap a sync call falls
+     * interpreted (in-VM, no C recursion), so this is a perf knob the
+     * correctness lanes don't care about. */
+    jit_set_sync_depth_cap(32);
 #endif
 }
 #else
@@ -1982,17 +1992,27 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.u8(0xFF); e.u8(0xD2);                    /* call rdx (plain) */
         e.patch32_here(j_over);
     }
+    /* sentinel? (JIT_RET_SENTINEL == (size_t)-1). The depth DEC runs on
+     * each path AFTER it completes - decrementing before the postexit
+     * (as this site originally did) let the postexit's INTERPRETED
+     * continuation (a fat vm_dispatch C frame) run depth-UNCOUNTED, so
+     * a deep recursion whose bodies exit to the interpreter mid-body
+     * stacked one un-capped C frame per level - a stack overflow the
+     * clang-ASan lane caught (sanitized vm_dispatch frames are ~77KB). */
+    e.u8(0x48); e.u8(0x83); e.u8(0xF8); e.u8(0xFF); /* cmp rax, -1 */
+    const size_t j_notsent = e.j32(0x75);          /* jne cold */
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x09);                        /* dec dword [rcx] */
-    /* sentinel? (JIT_RET_SENTINEL == (size_t)-1) */
-    e.u8(0x48); e.u8(0x83); e.u8(0xF8); e.u8(0xFF); /* cmp rax, -1 */
-    const size_t j_done1 = e.j32(0x74);            /* je done */
+    const size_t j_done1 = e.j32(0xEB);            /* jmp done */
     /* cold: the shared post-exit (raise/continuation/pending) */
+    e.patch32_here(j_notsent);
     e.mov_rr(RDI, RAX);
     e.movabs(RSI, site);
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_sync_postexit) });
     e.u8(0xE8); e.u32(0);
+    e.movabs(RCX, depth_addr);
+    e.u8(0xFF); e.u8(0x09);                        /* dec dword [rcx] */
     e.u8(0x85); e.u8(0xC0);                        /* test eax, eax */
     const size_t j_done2 = e.j32(0x74);            /* jz done */
     emit_call_epilogue(e);

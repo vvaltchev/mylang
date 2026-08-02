@@ -14882,7 +14882,16 @@ static bool jit_post_call_entry()
      * below). The test's subject is the interpreted-resume entry path,
      * which needs interpreted calls to exercise. */
     const int saved_cap = jit_sync_depth_cap();
-    jit_set_sync_depth_cap(200);
+    /* 32, not the historical 200: under ASan the native stack is
+     * pass-through, so every sync level below the cap is a C-stack frame
+     * (jit_call_sync + jit_sync_postexit + a SANITIZED vm_dispatch frame,
+     * tens of KB each under clang ASan) - depth 200 sat within ~1x of the
+     * 8MB default stack and overflowed the clang-ASan lane. The test's
+     * subject (the interpreted-resume entry stub) only needs the cap
+     * EXCEEDED - calls past it run interpreted and resume through the
+     * stub identically at any cap value (32 == the sanitized-build
+     * unarmed default, jit_native_stack_init). */
+    jit_set_sync_depth_cap(32);
     const unsigned long b0 = g_jit_entry_resume;
     /* MUTUAL recursion, deliberately: a SELF-recursive CallV is excluded
      * from runs (the run builder's self-gate), so it is an island whose
