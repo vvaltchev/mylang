@@ -839,5 +839,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    jit_cache_audit_report();   /* no-op unless MYLANG_CACHEAUDIT=1 */
     return 0;
 }

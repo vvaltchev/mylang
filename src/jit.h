@@ -273,6 +273,11 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk);
  * here, so the arg is void* (the real ABI is size_t(LValue*)).
  */
 size_t jit_enter(const void *frag, void *slots);
+
+/* Register-cache audit (env MYLANG_CACHEAUDIT=1): print, per opcode, how
+ * many slot candidacies its disqualification killed. The "what to make
+ * cache-aware next" surface - see pick_cached_slots. */
+void jit_cache_audit_report();
 /* the SWITCHING entry (M5a): jit_call_sync_core's direct callee entry -
  * brackets its level's native-stack switch; plain when already active */
 size_t jit_enter_deep(const void *frag, void *slots);
