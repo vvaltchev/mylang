@@ -1,6 +1,7 @@
 # JIT registers: kill the pins, then allocate
 
-Status: **SCOPED, not started.** Direction set by the maintainer
+Status: **STEP 1 LANDED (the slots base); step 2 (the allocator) next.**
+Direction set by the maintainer
 2026-08-01: *"minimize the number of pinned registers, ideally to 0 but 1
 is also acceptable. All the other ones should be allocated depending on
 availability by the codegen. When we need more registers than what the CPU
@@ -36,14 +37,49 @@ base. That is the whole reason for the push.
 
 ## Step 1 - move the pins to callee-saved registers
 
-    slots base   RDI -> RBX
-    t_int        RSI -> R12
-    t_float      R8  -> R13
-    N5 cache     R10/R11 -> R14/R15
+    slots base   RDI -> RBX      <-- DONE
+    t_int        RSI -> R12      <-- not done; see "what step 1 left"
+    t_float      R8  -> R13      <-- not done
+    N5 cache     R10/R11 -> R14/R15   <-- SUBSUMED by step 2
 
 Then `emit_call_prologue` / `emit_call_epilogue` become **no-ops**: the
 callee preserves all four/five, and RSI/R8/R10/R11/RDI become free
 scratch and argument registers.
+
+### What landed, and what it actually measured
+
+The base moved to RBX exactly as sketched below. `emit_call_prologue` no
+longer touches the base at all; what remains in it is the N5 cache spill,
+which step 2 deletes.
+
+MEASURED (callgrind Ir, `OPT=1 ASSERTS=0` on both sides): 43_sieve
+**-1.31%**, 76_funcval_dispatch -0.75%, 11_closure_counter -0.59%,
+46_matrix_mult -0.52%, 63_closures -0.38%, 10_recursion_deep -0.31%;
+01_while_loop and 09_fib_recursive EXACTLY neutral; 35_map_filter +0.30%
+and 34_sort_custom_cmp +0.25%.
+
+**The ~3% estimate below was WRONG and the reason is worth keeping.** The
+saving is 2 instructions (`push rdi`/`pop rdi`) per helper CALL, but the
+cost is 2 instructions (`push rbx`/`pop rbx`) per fragment ENTRY - and in
+the shapes that matter those frequencies are similar. Deep recursion
+enters a fragment per call; the callback benches (map/filter/sort) re-enter
+one PER ELEMENT through `VmInvoker`, which is why those two went slightly
+the wrong way. Only where a fragment makes several helper calls per entry
+(a sieve's inner loop) does it pay clearly.
+
+So step 1 is not a perf change. It is the enabling change: an allocator
+over four caller-saved registers would have to spill everything around
+every helper call, which is most of what an allocator is for.
+
+### What step 1 deliberately left alone
+
+`rsi` (t_int) and `r8` (t_float) are still pinned and still re-materialised
+by `emit_call_epilogue`. They are NOT worth moving to r12/r13 on their own:
+they are two `movabs` of a compile-time constant, i.e. rematerialisable at
+zero cost, and holding them in callee-saved registers would take two
+registers away from the allocator to save two instructions per call. The
+right treatment is to let step 2's allocator own them as ordinary
+rematerialisable constants and spend r12/r13 on live values instead.
 
 ### The change surface is small - it is NOT the ~213 raw mentions
 
@@ -86,7 +122,7 @@ per call should pay one push/pop, not five - otherwise this LOSES on the
 call benches, where the callee fragment is entered per call while the
 caller's is entered once per loop.
 
-### Expected payoff
+### Expected payoff (PREDICTED ~3%; the real figure was ~0.5% - see above)
 
 Removing ~4-8 instructions from every helper call. On 76 that is four
 helper calls per iteration, so roughly 3% of that benchmark - modest by
@@ -94,6 +130,24 @@ itself. The real reason to do it first is that it is the PREREQUISITE for
 step 2: with the pins in callee-saved registers, an allocator has a real
 register file to work with instead of four scratch registers it must
 spill around every call.
+
+### Two traps found while doing it
+
+1. **Helpers took the slot window as their first argument IMPLICITLY**,
+   because the base already WAS rdi. Moving the base broke seven of them
+   with a null-deref inside `LValue::put` - caught by `-rt` on the first
+   run, but it would have been a silent wrong-address write if the slot
+   arithmetic had happened to land somewhere mapped. Those sites now say
+   `slots_to_arg0()`. Putting the move in the prologue instead was
+   measured to be dead code at 64 of 73 call sites.
+2. **The 16-alignment parity INVERTED.** Entry is `rsp % 16 == 8`, so the
+   body used to need an ODD push count at a call and now needs an EVEN
+   one. `emit_call_prologue`'s pad rule survives unchanged only because
+   exactly one push left it and exactly one entered at `frag_entry`; the
+   two hand-spilling sites in the inline call push each had to swap a
+   live `push rdi` for a `sub rsp,8` pad. A miss here is not a crash on
+   x86-64 until some callee uses an aligned SSE store - i.e. exactly the
+   kind of bug that hides.
 
 ## Step 2 - a real fragment register allocator
 

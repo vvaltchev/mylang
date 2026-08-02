@@ -294,8 +294,10 @@ registers itself in its parent's `slices` set on copy
 would corrupt that set - deferring to the real C++ copy is correct by
 construction for every reference type, present and future. FOUR pushes
 around the call (an even count preserves the site's 16-byte alignment);
-rdi/rdx/rcx/r9 are read after the bind, r8 is not, and rsi/rax are dead
-(emit_call_epilogue reloads the type singletons anyway). Execution-proven
+rdx/rcx/r9 are read after the bind and the fourth is a PAD, r8 is not
+read, and rsi/rax are dead (emit_call_epilogue reloads the type
+singletons anyway); the slots base is in callee-saved rbx, which the
+helper preserves for free. Execution-proven
 by `g_jit_ref_arg_binds` + the `jit_ref_arg_bind` test (array / string /
 SLICE, the last with a live-view base write). Measured (callgrind Ir):
 76_funcval_dispatch **-11.1%** (1202M -> 1069M; the slow tier 1,000,000
@@ -1046,6 +1048,51 @@ codegen ONLY when `g_jit_annotate` (set by `-vdj`) - zero cost on a
 normal run. The one dev tool that lets a human read the generated
 machine code alongside the bytecode.
 
+**THE SLOTS BASE LIVES IN A CALLEE-SAVED REGISTER (2026-08-01,
+plans/jit-registers.md step 1).** The frame-slot window used to sit in
+`rdi`, which is both CALLER-saved and the ABI's first argument register.
+Both halves hurt: a helper call could clobber it, and forming a pointer
+argument (`lea rdi, [rdi+off]`) DESTROYED it - so `emit_call_prologue`
+pushed it and `emit_call_epilogue` popped it around EVERY helper call.
+The base is now **`rbx`**, callee-saved, so a helper preserves it and the
+prologue emits nothing for it. A fragment is entered with the window in
+`rdi` (from `jit_enter`, an emitted sync `call rdx`, or a `native_leaf`
+direct call) and begins with `frag_entry` = `push rbx; mov rbx, rdi`;
+every exit ends with `frag_ret`/`exit_pc` = `pop rbx; ret`. **An entry
+STUB is an entry too** and gets the same pair, so either way in pushes
+exactly once and either way out pops exactly once. Mechanically the
+change is ~10 modrm byte constants: every slot access goes through five
+Emitter encoders whose addressing byte was `[rdi+disp32]` (mod 10, rm
+111 = `0x87`) and is now `[rbx+disp32]` (rm 011 = `MODRM_SLOT`, `0x83`).
+**16-ALIGNMENT moved with it and is the part to keep in mind:** a
+fragment is entered at `rsp % 16 == 8`, so before this the body was at 8
+and a call site needed an ODD number of pushes; `frag_entry`'s single
+push makes the body 0 - already call-ready - so a call site now needs an
+EVEN number. `emit_call_prologue`'s pad rule (`pad iff ncache is odd`) is
+UNCHANGED because exactly one push was removed from it and exactly one
+added at entry; the two hand-spilling sites in the inline call push
+(around `jit_cached_probe` and `jit_bind_ref_arg`) each lost a live `rdi`
+push and gained an explicit `sub rsp,8` pad in its place. **`rdi` is NOT
+materialised by the prologue**: a helper whose first parameter is
+`LValue *slots` used to get it for free, and now says so with
+`slots_to_arg0()` - measured over jit.cpp, 64 of 73 call sites load `rdi`
+with something else immediately after, so a blanket move would have been
+dead code at seven sites out of eight. `-vdj`'s slot LABELS follow the
+base (disasm.cpp's `mem_disp` keys on rbx now), so the dump still reads
+`mov r10, i` rather than `mov r10, [rbx+0x30]`. Measured (callgrind Ir,
+`OPT=1 ASSERTS=0` both sides): 43_sieve **-1.31%**, 76_funcval_dispatch
+-0.75%, 11_closure_counter -0.59%, 46_matrix_mult -0.52%, 63_closures
+-0.38%, 10_recursion_deep -0.31%; 01_while_loop and fib EXACTLY neutral;
+35_map_filter +0.30% and 34_sort_custom_cmp +0.25% - the callback benches
+re-enter a fragment PER ELEMENT, so they pay the entry push/pop more
+often than they save helper-call spills. NOTE the plan predicted ~3% on
+76 and that was WRONG: the removed `push rdi`/`pop rdi` is 2
+instructions per helper CALL, but the added `push rbx`/`pop rbx` is 2 per
+fragment ENTRY, and the two nearly cancel wherever entries are as
+frequent as calls. **The reason to do it is not this number** - it is
+that four caller-saved registers cannot host a register ALLOCATOR (every
+value would spill around every call), and the allocator is the next step.
+
 **N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to 2 hot int-scalar slots
 are pinned in `r10`/`r11` per fragment (`pick_cached_slots`, jit.cpp):
 loaded ONCE at the fragment head (the native back edge jumps AFTER the
@@ -1112,9 +1159,10 @@ re-interpreting; and **delete-originals** - a run that is `op_fully_native`
 DROPPED from the bytecode (the remap maps every run pc to the EnterNative),
 so `-vd` of a native int loop is just `enter.nat` (`-vdj` shows the fragment)
 - a `.myv`-ready no-double-copy shape. A HELPER CALL clobbers r10/r11 (the N5
-cache), so rdi + the active cache regs are pushed/popped around EVERY helper/
+cache), so the active cache regs are pushed/popped around EVERY helper/
 libm call (a nested_fuzz-found reg-clobber; a float/libm run caches nothing,
-which masked it at first).
+which masked it at first). The SLOTS BASE needs no such save - see the
+register plan below.
 **CONTAINER-STORE helper ops (LANDED):** `StoreElemInt`/`StoreElemFloat`
 (`a[i] = v` / `a[i] OP= v`, a flat mutable int/bool/float array, LOCAL base)
 are JIT-native - the fragment marshals base `LValue*` + (cache-aware) index +
@@ -1188,7 +1236,7 @@ write-once global slot, callee `native_leaf`, function caller); `op_run_eligible
 folds it into run-building (since the MIN_RUN removal EVERY run forms, so the
 old call-bearing-run exemption — `run_has_native_call` — is gone; the boxed
 arg-setup MoveVs still split a call loop into short runs, each now a
-fragment). The emit: `push rdi`; call **`jit_call_setup`**
+fragment). The emit: call **`jit_call_setup`**
 (vm.cpp - resolves the callee FuncObject from its global slot, `vm_frame_setup`
 with `ret_chunk = caller_desc->vm_chunk`, `ret_pc = pc+1`; catches
 StackOverflow/bind throw -> `g_vm_jit_exc` + null return); `test/jnz` (null ->
@@ -1208,7 +1256,7 @@ path). **`-vd`/`-vdj` are FAITHFUL:** `disassemble_program` (disasm.cpp)
 replicates the precompile's two-pass + `JitCtx` on throwaway chunks (pointing
 each `desc->vm_chunk` at its local chunk for the gate, save/restored after), so
 a native call shows as `enter.nat` at the caller's call site and `-vdj` decodes
-the full sequence (`push rdi` / `call jit_call_setup` / `test`+`jne` / the
+the full sequence (`call jit_call_setup` / `test`+`jne` / the
 `vm_chunk`->`native.base`+`entry` loads / `call rcx` / epilogue). **v1 non-native
 cases (always a correct interpreted fallback):** a call FROM MAIN (main has no
 stable descriptor for the record's ret_chunk). `CachedCallV` is excluded too,

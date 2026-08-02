@@ -474,12 +474,13 @@ std::string hex2(uint8_t v)
     return std::string(1, h[v >> 4]) + std::string(1, h[v & 15]);
 }
 
-/* [rdi+disp] -> the slot's NAME (via `nm`, the chunk's slot-namer),
- * else [base+0xNN]. The frame window base is rdi. */
+/* [rbx+disp] -> the slot's NAME (via `nm`, the chunk's slot-namer),
+ * else [base+0xNN]. The frame window base is rbx (callee-saved; it was
+ * rdi before the JIT moved the pins off the caller-saved registers). */
 using SlotNamer = std::function<std::string(int)>;
 std::string mem_disp(int base_reg, int32_t disp, const SlotNamer &nm)
 {
-    if (base_reg == 7 /*rdi*/) {
+    if (base_reg == 3 /*rbx*/) {
         const int stride = 48, poff = 0, toff = 24;
         if (disp >= 0 && disp % stride == poff)
             return nm(disp / stride);
@@ -720,7 +721,7 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
 {
     const void *ti = nullptr, *tf = nullptr, *ta = nullptr;
     jit_type_singletons(ti, tf, ta);
-    s << "       . ---- native x86-64 (rdi=frame slots, rsi=int-tag,"
+    s << "       . ---- native x86-64 (rbx=frame slots, rsi=int-tag,"
       << " r8=float-tag; xmm=SSE) ----\n";
     uint32_t p = 0, mi = 0;
     bool first = true;
