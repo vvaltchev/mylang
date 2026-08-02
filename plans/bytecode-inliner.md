@@ -238,9 +238,17 @@ zero across bench/ - but every one was off by only ONE OR TWO ops and
 none landed out of range, so no test observed a difference. The splice is
 what makes it fatal: it produces a chunk that KEEPS interpreted branches
 (the CallV islands stop the run being deletable) while shortening the
-code enough that a stale target lands past the end. `-nj` and the
-tree-walker were always right, which is why the engine differential never
-saw it.
+code enough that a stale target lands past the end.
+
+The differential's failure here is a COVERAGE gap, not a structural one,
+and the distinction matters: the tree-walker has NO JIT path (the only
+pipeline is AST -> bytecode -> native), so tw-vs-VM is already a JIT-free
+oracle against a JIT-on engine and CAN catch a JIT miscompile. It missed
+this one because in the default config nothing was observable - an
+in-range stale target lands on a preceding op or an inserted EnterNative,
+re-enters interpreted and computes the same answer - and because the
+configuration that goes out of range needs `-bi`, which is default-off.
+Running `-rt` with the splice forced on is what closes it.
 
 Fixed at the origin (`f0391fb` amended - exp-work only, 39 back, the
 hunk untouched since). Two nets on top: an ASSERTS-only invariant that
