@@ -17951,6 +17951,143 @@ static bool bc_inline_order_independent()
 }
 
 /*
+ * THE COUNTED-LOOP FUSIONS' OPERAND LAYOUT SURVIVES A SPLICE (#87).
+ *
+ * `IntAddStep` packs TWO things into one operand: `a_dual_lo` is always a
+ * frame slot (the accumulate dst) while `a_dual_hi` is a LITERAL VALUE or
+ * a SLOT depending on `a_is_lit()` - and `set_a_dual` CLEARS that flag as
+ * a side effect. A remapper that writes the halves back without restoring
+ * it turns a literal loop bound into a slot INDEX, and the loop then reads
+ * its bound out of whatever slot that number names.
+ *
+ * WHY THIS TEST IS STRUCTURAL RATHER THAN A VALUE COMPARISON: removing the
+ * restore was verified to corrupt the bytecode - `if r6 < 4` became
+ * `if r6 < r4` - while the program still PRINTED THE RIGHT ANSWER, because
+ * the slot it wrongly named happened to hold a value that produced the
+ * same result. The whole 1689-test suite passed with the defect in. A
+ * value oracle cannot see this class; the invariant has to be asserted
+ * directly.
+ */
+static bool bc_inline_fusion_operands()
+{
+    const std::vector<const char *> src = {
+        "func c(x) {",
+        "    var s = 0;",
+        "    for (var i = 0; i < 4; i++) { s = s + i * x; }",
+        "    return s;",
+        "}",
+        "func u(a) { var r = c(a); return r; }",
+        "print(u(3));" };
+
+    const bool sb = g_bc_inline_enabled;
+    const ExecEngine se = g_exec_engine;
+    g_bc_inline_enabled = true;
+    g_exec_engine = ExecEngine::Vm;
+
+    bool ok = true, found_callee_lit = false, found_spliced_lit = false;
+    size_t spliced_steps = 0;
+    try {
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        Block *rb = dynamic_cast<Block *>(root.get());
+        if (!rb)
+            throw 0;
+        std::vector<const FuncDeclStmt *> funcs;
+        collect_funcs(root.get(), funcs);
+        for (const FuncDeclStmt *fn : funcs) {
+            bool fast = true;
+            for (const auto &p : fn->desc->params)
+                if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+                    fast = false;
+            const_cast<FuncDescriptor *>(fn->desc)->fast_bind = fast;
+        }
+        std::vector<const FuncDescriptor *> slot_desc(
+            rb->global_func_names.size(), nullptr);
+        for (const FuncDeclStmt *fn : funcs)
+            if (fn->id && fn->id->sym.kind == SymKind::global) {
+                const int sl = fn->id->sym.slot;
+                if (sl >= 0 && static_cast<size_t>(sl) < slot_desc.size())
+                    slot_desc[sl] = fn->desc;
+            }
+        std::vector<std::pair<std::string, Chunk>> built;
+        for (const FuncDeclStmt *fn : funcs) {
+            Chunk ch;
+            if (!codegen_func_body(fn, ch, /*jit=*/false))
+                continue;
+            built.emplace_back(fn->desc && fn->desc->name
+                                   ? std::string(fn->desc->name->val)
+                                   : std::string("?"),
+                               std::move(ch));
+        }
+        for (auto &p : built)
+            for (const FuncDeclStmt *fn : funcs)
+                if (fn->desc && fn->desc->name
+                        && std::string(fn->desc->name->val) == p.first)
+                    const_cast<FuncDescriptor *>(fn->desc)->vm_chunk =
+                        &p.second;
+
+        /* the CALLEE, pre-splice: it must contain a literal-bound
+         * IntAddStep, or this program stopped exercising the layout */
+        for (const auto &p : built)
+            for (const Instr &in : p.second.code)
+                if (in.op == OpCode::IntAddStep && in.a_is_lit())
+                    found_callee_lit = true;
+
+        BcInlineSnapshots snaps;
+        for (const auto &p : built)
+            bc_inline_snapshot(p.second, snaps);
+        for (auto &p : built)
+            bc_inline_chunk(p.second, slot_desc, snaps);
+
+        /* the CALLER, post-splice: the copied IntAddStep must still say
+         * "my bound is a literal" */
+        for (const auto &p : built) {
+            if (p.first.find('u') == std::string::npos)
+                continue;
+            for (const Instr &in : p.second.code)
+                if (in.op == OpCode::IntAddStep) {
+                    spliced_steps++;
+                    if (in.a_is_lit())
+                        found_spliced_lit = true;
+                }
+        }
+        for (const FuncDeclStmt *fn : funcs)
+            const_cast<FuncDescriptor *>(fn->desc)->vm_chunk = nullptr;
+    } catch (...) {
+        ok = false;
+    }
+    g_bc_inline_enabled = sb;
+    g_exec_engine = se;
+
+    if (!ok) {
+        cout << "  fusion operands: the program did not compile\n";
+        return false;
+    }
+    if (!found_callee_lit) {
+        cout << "  fusion operands: the CALLEE has no literal-bound "
+                "IntAddStep - the shape stopped exercising the layout\n";
+        return false;
+    }
+    if (spliced_steps == 0) {
+        cout << "  fusion operands: nothing was spliced into the caller\n";
+        return false;
+    }
+    if (!found_spliced_lit) {
+        cout << "  fusion operands: the spliced IntAddStep LOST its "
+                "is-literal flag - its bound is now read from a SLOT\n";
+        return false;
+    }
+    return true;
+}
+
+/*
  * THE SPLICE SHAPE MATRIX (#91) - direct tests for every shape the splice
  * transforms, rather than hoping the corpus or the fuzzer wanders into
  * them.
@@ -18024,27 +18161,27 @@ static bool bc_inline_shape_matrix()
           "func u(a) { var r = c(a); return r; }",
           "print(u(4)); print(u(7)); print(u(40));" }, true },
 
-      /* DECLINES: the peephole fuses a counted loop into IntAddStep /
-       * ForLoopStep, which the whitelist EXCLUDES on purpose - their
-       * operand layout was never audited against the remapper. This is
-       * the single biggest reach limit the matrix found, and it is a
-       * decision, not a defect: `for` loops in callees are simply out. */
-      { "callee with a FOR loop (declines: op:IntAddStep, not whitelisted)",
+      /* Was the matrix's biggest finding - a counted loop fuses to
+       * IntAddStep / ForLoopStep, which the whitelist excluded, so EVERY
+       * `for` loop in a callee declined. Those two ops were audited into
+       * the remapper on 2026-08-02 and these rows now splice; the matrix
+       * is what caught the flip, since it asserts the direction either
+       * way rather than only that the answer is right. */
+      { "callee with a FOR loop (counted-loop fusion, remapped)",
         { "func c(x) { var s = 0;",
           "            for (var i = 0; i < 4; i++) { s = s + i * x; }",
           "            return s; }",
           "func u(a) { var r = c(a); return r; }",
-          "print(u(3));" }, false },
+          "print(u(3));" }, true },
 
-      /* same reason as the FOR row - counted loops fuse to a
-       * non-whitelisted op */
-      { "callee with NESTED for loops (declines: fused counted-loop op)",
+      /* two fused counters in one body, both rebased over the caller */
+      { "callee with NESTED for loops (two fused counters)",
         { "func c(x) { var s = 0;",
           "            for (var i = 0; i < 3; i++) {",
           "              for (var j = 0; j < 2; j++) { s = s + i * j + x; } }",
           "            return s; }",
           "func u(a) { var r = c(a); return r; }",
-          "print(u(2));" }, false },
+          "print(u(2));" }, true },
 
       { "callee with if/else",
         { "func c(x) { var s = 0; var i = 0; while (i < 2) { i++; }",
@@ -22266,6 +22403,9 @@ static const std::vector<extra_check> extra_checks =
     { "codegen: the bytecode splice SHAPE MATRIX - every shape it "
       "transforms, in every JIT/splice mode, each proven to splice",
       bc_inline_shape_matrix },
+    { "codegen: a spliced IntAddStep keeps its is-LITERAL bound flag "
+      "(set_a_dual clears it; a value oracle cannot see this)",
+      bc_inline_fusion_operands },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",

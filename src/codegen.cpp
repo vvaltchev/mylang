@@ -8442,11 +8442,14 @@ static bool bc_inline_op_ok(OpCode op)
     case OpCode::Jump:
     case OpCode::JumpUnlessIntCmp:
     case OpCode::JumpUnlessFloatCmp:
-    /* ForLoopStep / IntAddStep are deliberately ABSENT: their target is a
-     * pc and their target2 a counter slot, but the operand layout wants
-     * checking against their emit sites before either carries a splice.
-     * Excluding them costs reach and nothing else - the whitelist's whole
-     * contract. */
+    /* The COUNTED-LOOP fusions. Admitted 2026-08-02 after their layouts
+     * were read off the VM cases and cross-checked against visit_use_def
+     * and the pc-field table (see bc_remap_slots for both, and for the
+     * is-literal flag set_a_dual silently clears). They were the biggest
+     * limit on reach: a `for` loop in a callee fuses to one of these, so
+     * every counted loop declined while they were out. */
+    case OpCode::ForLoopStep:
+    case OpCode::IntAddStep:
     /* the boundary + the nested call (its target2 is a GLOBAL slot, not a
      * frame slot - the remapper must leave it alone, and does) */
     case OpCode::ReturnV:
@@ -8633,6 +8636,52 @@ static void bc_remap_slots(Instr &in, int base)
          * arrive must have an entry, and a correct one costs nothing. */
         ra();
         break;
+
+    /*
+     * THE COUNTED-LOOP FUSIONS. Their layouts were read off the VM cases
+     * (vm.cpp) and cross-checked against `visit_use_def` and the pc-field
+     * table, which is the bar the plan set before either could carry a
+     * splice - a `for` loop in a callee fuses to one of these, so without
+     * them any counted loop declines and that was the biggest single limit
+     * on the splice's reach.
+     *
+     * NOTE `target` is a PC for both, NOT a slot: `visit_pc_fields` owns it
+     * and the splice's own pass remaps it. Calling rt() here would corrupt
+     * it into a frame slot.
+     */
+    case OpCode::ForLoopStep:
+        /* target2 = the COUNTER slot; a = the bound operand; b = step */
+        if (in.target2 >= 0)
+            in.target2 += base;
+        ra(); rb();
+        break;
+
+    case OpCode::IntAddStep: {
+        /*
+         * target2 = the COUNTER slot; b = the added value operand; and `a`
+         * is a DUAL that is NOT uniform:
+         *     lo = the accumulate DST - ALWAYS a frame slot,
+         *     hi = the bound - a LITERAL VALUE when a_is_lit(), else a SLOT
+         * (vm.cpp reads it as `a_is_lit() ? (int_type)a_dual_hi()
+         *                                 : read_int_slot(a_dual_hi())`).
+         *
+         * THE TRAP: `set_a_dual` CLEARS the is-literal bits as a side
+         * effect. Writing the halves back without restoring the flag would
+         * turn a literal bound into a SLOT INDEX, and the VM would then
+         * read the loop bound out of whatever slot that number names - a
+         * silent wrong-iteration-count, not a crash. So save and restore.
+         */
+        if (in.target2 >= 0)
+            in.target2 += base;
+        const bool lit = in.a_is_lit();
+        const int lo = in.a_dual_lo() + base;
+        const int hi = lit ? in.a_dual_hi() : in.a_dual_hi() + base;
+        in.set_a_dual(lo, hi);
+        if (lit)
+            in.opflags = static_cast<uint8_t>(in.opflags | 1u);
+        rb();
+        break;
+    }
     case OpCode::CallV:
         /* target2 is a GLOBAL-table slot, NOT a frame slot - leaving it
          * alone is the whole reason this is written by hand. `a` is the
