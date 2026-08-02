@@ -3943,7 +3943,16 @@ struct Codegen {
                 const int tt = alloc_temp();
                 CgInstr in;
                 in.op = OpCode::IntBin;
+                /* div/mod's div0 carets the DIVISOR operand (#76 - the
+                 * boxed ladder's operand-precise convention, matching the
+                 * tree-walker's typed throw). The op NODE stays the chain
+                 * (its inlined-at ctx; a substituted-arg divisor can carry
+                 * a shallower chain); only the LOC comes from the divisor. */
                 in.node_idx = add_ast_node(e);
+                if (t->elems[i].first == Op::div
+                        || t->elems[i].first == Op::mod)
+                    in.loc_node_idx =
+                        add_ast_node(t->elems[i].second.get());
                 in.target = tt;
                 in.set_a(acc);
                 in.set_b(rhs);
@@ -4847,6 +4856,10 @@ struct Codegen {
                 CgInstr in;
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(e);
+                if (t->elems[i].first == Op::div
+                        || t->elems[i].first == Op::mod)   /* #76 */
+                    in.loc_node_idx =
+                        add_ast_node(t->elems[i].second.get());
                 in.target = tt;
                 in.set_a(acc);
                 in.set_b(rhs);
@@ -6880,6 +6893,12 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
     for (size_t pc = 0; pc < code.size(); pc++) {
         CgInstr &in = code[pc];
         const Construct *node = node_at(in.node_idx);
+        /* #76: read + clear the loc twin UNCONDITIONALLY - a peephole
+         * FUSION copies the source Instr struct (IntAddModRI from an
+         * IntBin mod, ...), so the field can ride into an op whose branch
+         * below never touches it (a fuzzer-caught verify_ast_free abort). */
+        const Construct *locnode = node_at(in.loc_node_idx);
+        in.loc_node_idx = -1;
         if (!node)
             continue;
         /* P8 Inc 4: an op spliced from an INLINED body records that body's
@@ -6960,9 +6979,27 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold
              * undefined-global error - the operation itself is AST-free):
-             * record the loc -> AST-free. */
-            chunk.locs.push_back(
-                {static_cast<uint32_t>(pc), node->start, node->end});
+             * record the loc -> AST-free. #76: a div/mod's loc comes from
+             * the DIVISOR (loc_node_idx) while the inline chain above used
+             * the CHAIN node. */
+            {
+                /*
+                 * #76 carets a div/mod at its DIVISOR - but a divisor the
+                 * FOLDER synthesized carries no Loc at all (`1 / (n - n)`
+                 * with n substituted folds the divisor to a bare `0`), and
+                 * an empty one recorded here makes the VM throw with NO
+                 * location: no caret, no "at line/col", and a backtrace
+                 * whose innermost frame reads "line 0". The tree-walker
+                 * never shows this because Construct::eval stamps the
+                 * ENCLOSING node's loc onto any exception that arrives
+                 * without one - so fall back to exactly that node, which
+                 * is what that wrapper would have supplied.
+                 */
+                const Construct *ln =
+                    (locnode && locnode->start) ? locnode : node;
+                chunk.locs.push_back(
+                    {static_cast<uint32_t>(pc), ln->start, ln->end});
+            }
             in.node_idx = -1;
             break;
         case OpCode::JumpUnlessIntCmp:
@@ -7037,6 +7074,7 @@ static void verify_ast_free(const std::vector<CgInstr> &code)
 {
     for (const CgInstr &in : code) {
         ML_CHECK(in.node_idx == -1);
+        ML_CHECK(in.loc_node_idx == -1);   /* #76: the loc twin too */
         (void)in;
     }
 }

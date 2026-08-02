@@ -1389,6 +1389,12 @@ static_assert(sizeof(Instr) == 32,
  */
 struct CgInstr : Instr {
     int32_t node_idx = -1;
+    /* #76: an optional SEPARATE node for the LOC record only - a div/mod's
+     * div0 carets the DIVISOR operand, but the op's inlined-at chain must
+     * stay the CHAIN node's (a substituted-arg divisor can carry a
+     * SHALLOWER chain, which would drop virtual frames). -1 = the loc comes
+     * from node_idx as before. Codegen-transient like node_idx. */
+    int32_t loc_node_idx = -1;
     CgInstr() = default;
     CgInstr(const Instr &i) : Instr(i) {}
 };

@@ -2725,11 +2725,18 @@ int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
                     case Op::plus:  acc += r; break;
                     case Op::minus: acc -= r; break;
                     case Op::times: acc *= r; break;
+                    /* div0 carets the DIVISOR operand (#76) - the boxed
+                     * ladder's operand-precise convention, so the engines
+                     * agree regardless of which path lowered the chain */
                     case Op::div:
-                        if (r == 0) throw DivisionByZeroEx(start, end);
+                        if (r == 0)
+                            throw DivisionByZeroEx(elems[i].second->start,
+                                                   elems[i].second->end);
                         acc /= r; break;
                     case Op::mod:
-                        if (r == 0) throw DivisionByZeroEx(start, end);
+                        if (r == 0)
+                            throw DivisionByZeroEx(elems[i].second->start,
+                                                   elems[i].second->end);
                         acc %= r; break;
                     case Op::band: acc &= r; break;
                     case Op::bor:  acc |= r; break;
@@ -2782,10 +2789,14 @@ float_type TypedScalarExpr::eval_float_body(EvalContext *ctx) const
                     case Op::minus: acc -= r; break;
                     case Op::times: acc *= r; break;
                     case Op::div:
-                        if (r == 0.0) throw DivisionByZeroEx(start, end);
+                        if (r == 0.0)
+                            throw DivisionByZeroEx(elems[i].second->start,
+                                                   elems[i].second->end);
                         acc /= r; break;
                     case Op::mod:
-                        if (r == 0.0) throw DivisionByZeroEx(start, end);
+                        if (r == 0.0)
+                            throw DivisionByZeroEx(elems[i].second->start,
+                                                   elems[i].second->end);
                         acc = fmod(acc, r); break;
                     default: throw InternalErrorEx();
                 }
