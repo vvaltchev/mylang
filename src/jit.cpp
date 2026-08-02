@@ -7804,6 +7804,27 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     }
     chunk.code = std::move(nc);
 
+    /*
+     * Every surviving branch target must be a pc of the NEW code. The
+     * rebuild inserts EnterNative heads, so a target that was not remapped
+     * points into the pre-insertion pc space - at best one op early, at
+     * worst past the end, where the dispatch reads whatever follows and
+     * jumps through a garbage opcode.
+     *
+     * The switch above is the only thing standing between those two, and
+     * its remap body is shared by fall-through across eleven opcodes - a
+     * shape that already lost that body once when an opcode above it was
+     * deleted. Assert the outcome rather than trust the next edit to it.
+     */
+#ifndef NDEBUG
+    for (const Instr &bi : chunk.code)
+        if (op_is_branch(bi.op))
+            ML_CHECK_MSG(bi.target >= 0
+                             && static_cast<size_t>(bi.target)
+                                    <= chunk.code.size(),
+                         "jit rebuild: branch target outside the new code");
+#endif
+
     for (auto &l : chunk.locs)
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &ic : chunk.inline_ctxs)

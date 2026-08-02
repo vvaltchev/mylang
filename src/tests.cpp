@@ -17847,6 +17847,85 @@ static bool bc_inline_order_independent()
     return true;
 }
 
+/*
+ * TWO SPLICES IN ONE CHUNK, UNDER THE JIT (plans/bytecode-inliner.md
+ * defect 2) - which turned out NOT to be a splice bug at all.
+ *
+ * The JIT's rebuild inserts EnterNative heads, so every surviving pc moves;
+ * a branch op that survives must have its target remapped. Eleven branch
+ * opcodes shared ONE remap body by fall-through, and #78 step D deleted the
+ * `case OpCode::CatchTest:` label that body was attached to - silently
+ * making all eleven no-ops. A stale target then points into the
+ * PRE-insertion pc space: usually one op early (harmless enough that the
+ * whole corpus missed it for 39 commits), but past the end of a chunk the
+ * splice shortened, where the dispatch jumps through a garbage opcode.
+ *
+ * Ackermann is the trigger because it puts TWO self-calls in one body, so
+ * its chunk keeps interpreted branches AND shifts them far. `-nj` and the
+ * tree-walker were always right; only the JIT was wrong, which is why the
+ * differential alone never caught it.
+ */
+static bool bc_inline_two_splices_jit()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    const std::vector<const char *> src = {
+        "func ack(m, n) {",
+        "    if (m == 0) return n + 1;",
+        "    if (n == 0) return ack(m - 1, 1);",
+        "    return ack(m - 1, ack(m, n - 1));",
+        "}",
+        "print(ack(2, 3));" };
+    const bool saved_bi = g_bc_inline_enabled;
+    bool ok = true;
+    /* both splice states must agree, and both must equal the tree-walker:
+     * the splice is an optimization, so it may not change the answer */
+    std::string out[3];
+    for (int k = 0; k < 3 && ok; k++) {
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = (k == 0) ? ExecEngine::TreeWalk : ExecEngine::Vm;
+        g_bc_inline_enabled = (k == 2);
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (k == 0)
+                root->eval(nullptr);
+            else
+                vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        cout.rdbuf(old);
+        g_exec_engine = saved;
+        out[k] = cap.str();
+    }
+    g_bc_inline_enabled = saved_bi;
+    if (!ok || out[0].find('9') == std::string::npos) {
+        cout << "  two splices: the program did not run (tw=[" << out[0]
+             << "])\n";
+        return false;
+    }
+    if (out[1] != out[0] || out[2] != out[0]) {
+        cout << "  two splices: tw=[" << out[0] << "] vm=[" << out[1]
+             << "] vm+splice=[" << out[2] << "]\n";
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_final_batch_deletable()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -21321,6 +21400,9 @@ static const std::vector<extra_check> extra_checks =
     { "codegen: the bytecode splice is INDEPENDENT of the order the chunk "
       "map is iterated (a->b->c chain; both orders must agree)",
       bc_inline_order_independent },
+    { "jit: TWO splices in one chunk - surviving branch targets survive the "
+      "EnterNative insertion (ackermann; tw == vm == vm+splice)",
+      bc_inline_two_splices_jit },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",
