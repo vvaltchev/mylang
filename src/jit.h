@@ -345,6 +345,12 @@ extern "C" int jit_load_elem_float(LValue *base_lv, int_type idx,
 /* #56: the #9 fusions' slow tiers - the shared element-value read (every
  * inline-declined shape; conveys) and ForStepElemInt's full-op form (the
  * gate declines BEFORE the step, so the helper does step+test+read). */
+/* #56: the native `throw` (the interpreted op's body; 0 = dispatched to a
+ * same-frame handler at g_vm_resume_pc, 1 = boundary, 2 = conveyed). */
+extern "C" int jit_throw(int_type val_slot, int_type pc,
+                         const void *lep) noexcept;
+void *jit_addr_resume_pc();         /* the parked handler pc's address */
+
 extern int_type g_jit_elem_tmp;     /* the slow tiers' value scratch */
 extern "C" int jit_elem_int_value(LValue *base_lv, int_type idx,
                                   int_type *out) noexcept;

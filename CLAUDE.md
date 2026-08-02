@@ -877,6 +877,27 @@ value in rax before the fused branch; the full-op tier returns
 runs**; 43_sieve +0.2%, 56_sieve_bool +0.3% (the extra converge jump),
 18/65 exactly neutral. The `jit_delete_originals` test's array-read
 case FLIPPED to asserting deletion (it pinned the old bail behavior).
+**The native `throw` (#56, the exception trio's first third):**
+`jit_throw(val_slot, pc, &locs[i])` runs the interpreted op's exact body
+- vm_make_thrown_exc + the SHARED vm_raise - and reports one of three
+outcomes: **dispatched** (a same-frame handler; the handler pc is parked
+in g_vm_resume_pc and the fragment RETURNS it as an ordinary external
+exit - the op already ran, so this is a resume, not a re-run),
+**boundary** (the walk stopped at this frame's sync_stop/boundary record
+with g_vm_exc_pending set; the fragment returns JIT_RET_BOUNDARY, which
+the sync sites now route into `jit_sync_postexit`'s existing pending
+CONVERSION - each sync site IS a stop boundary, so it converts rather
+than propagating), or **conveyed** (a non-struct value's TypeErrorEx).
+Two traps: the raw `ret` paths must `flush_cache()` like exit_pc does
+(a stale N5-pinned slot SEGV'd cross-frame throws), and the thrown
+object must be STAMPED from the baked LocEntry - vm_make_thrown_exc
+builds it loc-less and vm_raise would stamp it from `loc_at(pc)`, but a
+DELETED run collapses several ops onto one pc, where loc_at returns the
+FIRST entry (the ctor's, in `throw E(9)`). CatchTest/Reraise stay KEPT:
+the handler dispatch JUMPS to their pcs (the catch-dispatch redesign is
+scoped in plans/model-flip.md, deferred). Corpus: 16 -> **15 kept
+runs**; 42_exceptions **-9.7%** Ir (the native raise replaces an
+interpreted dispatch per throw), 69 -0.9%, 10_recursion neutral.
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat

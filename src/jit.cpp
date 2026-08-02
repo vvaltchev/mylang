@@ -2023,7 +2023,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * the record chain re-enters this fragment at OUR post-call stub. */
     e.u8(0x48); e.u8(0x83); e.u8(0xF8); e.u8(0xFD); /* cmp rax, -3 */
     {
-        const size_t j_nsw = e.j32(0x75);          /* jne cold */
+        const size_t j_nsw = e.j32(0x75);          /* jne next */
         e.movabs(RCX, depth_addr);
         e.u8(0xFF); e.u8(0x09);                    /* dec dword [rcx] */
         emit_call_epilogue(e);
@@ -2031,6 +2031,13 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.u8(0xC3);                                /* ret (propagate) */
         e.patch32_here(j_nsw);
     }
+    /* #56 (native Throw): the callee raised past THIS sync frame - the
+     * walk stopped at our sync_stop record and set the pending signal.
+     * Each sync site is such a stop boundary, so it CONVERTS (rather than
+     * propagating): fall into the shared postexit below, whose tail does
+     * exactly that (pending -> g_vm_jit_exc + the baked site stamp). The
+     * resume-pc argument is irrelevant on that path - the conversion
+     * happens before any dispatch - so -2 needs no special case here. */
     /* cold: the shared post-exit (raise/continuation/pending) */
     e.mov_rr(RDI, RAX);
     e.movabs(RSI, site);
@@ -4442,13 +4449,56 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::CatchTest:
     case OpCode::Reraise:
-    case OpCode::Throw:
-        /* cold catch-region / raise ops: an unconditional exit - the
-         * interpreter re-runs the kept original (dispatch/raise machinery).
-         * Reached natively only via a fall-through that in practice is the
-         * handler-dispatch entry, already interpreted. */
+        /* cold catch-region ops: an unconditional exit - the interpreter
+         * re-runs the kept original (the handler-dispatch machinery jumps
+         * to these pcs, so they cannot be deleted; see the "exception
+         * trio" note in plans/model-flip.md). */
         e.bump_op(in.op);
         e.exit_pc(pc);
+        return true;
+
+    case OpCode::Throw:
+        /* #56: the NATIVE `throw` - jit_throw(val_slot, pc, &locs[i]) runs
+         * the interpreted op's exact body (build + the shared vm_raise).
+         * 0 = dispatched to a same-frame handler: return the parked
+         * handler pc as an ordinary external exit (the op ALREADY ran -
+         * this is a resume, not a re-run); 1 = boundary: return
+         * JIT_RET_BOUNDARY so the invocation stops, as the interpreted
+         * `if (!vm_raise(...)) return;`; 2 = the builder's TypeErrorEx,
+         * conveyed. No re-interpret -> the original is deletable. */
+        e.bump_op(in.op);
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.movabs(RSI, static_cast<uint64_t>(pc));
+        e.movabs(RDX, reinterpret_cast<uint64_t>(loc_entry_addr(ck, old_pc)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_throw) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x83); e.u8(0xF8); e.u8(0x02);       /* cmp eax, 2 */
+        {
+            const size_t j_not2 = e.j8(0x75);
+            emit_exc_stamp(e, ck, old_pc);        /* (already located) */
+            e.exit_pc(pc);
+            e.patch8(j_not2, e.pos());
+        }
+        e.u8(0x85); e.u8(0xC0);                   /* test eax, eax */
+        {
+            const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
+            /* the N5 register cache MUST be flushed before ANY return -
+             * exit_pc does it implicitly; these raw rets must do it
+             * explicitly or the interpreter reads stale pinned slots
+             * (a cross-frame-throw SEGV caught it). */
+            e.flush_cache();
+            e.movabs(RAX, static_cast<uint64_t>(-2));   /* JIT_RET_BOUNDARY */
+            e.u8(0xC3);                           /* ret */
+            e.patch8(j_disp, e.pos());
+        }
+        e.flush_cache();
+        e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x00);       /* mov rax, [rax] */
+        e.u8(0xC3);                               /* ret (the handler pc) */
         return true;
 
     case OpCode::DeclConstV:
@@ -6093,6 +6143,13 @@ static bool op_fully_native(const Instr &in)
      * the gate precedes the step). Throws convey exc-stamped; no bail. */
     case OpCode::JumpUnlessElemInt:
     case OpCode::ForStepElemInt:
+        return true;
+    /* #56: the native `throw` - jit_throw runs the interpreted body (build
+     * + vm_raise) and the fragment either resumes at the handler pc, stops
+     * the invocation (boundary), or conveys the builder's TypeErrorEx. It
+     * never returns its OWN pc for a re-run -> deletable. (CatchTest and
+     * Reraise stay kept: the handler dispatch JUMPS to their pcs.) */
+    case OpCode::Throw:
         return true;
     /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
      * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the

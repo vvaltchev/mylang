@@ -2583,6 +2583,23 @@ vm_load_elem_float_core(const EvalValue &base, int_type idx,
  * g_vm_jit_exc, anything else (the InternalErrorEx net) via g_vm_jit_eptr.
  * With these, LoadElemInt/LoadElemFloat never re-interpret - their runs'
  * originals are deletable. */
+/* #56: the native `throw` - the interpreted op's exact body, so its
+ * original can be DELETED. Builds the exception from the value slot
+ * (vm_make_thrown_exc; a non-struct value's TypeErrorEx is CONVEYED, as
+ * the interpreted op's C++ throw would be by the landing pad), then runs
+ * the SHARED vm_raise:
+ *   0 = dispatched to a SAME-FRAME handler - the handler pc is parked in
+ *       g_vm_resume_pc and the fragment returns it as an ordinary
+ *       external exit (control resumes interpreted AT THE HANDLER; the
+ *       op already ran, so this is a resume, not a re-run);
+ *   1 = the raise reached the activation BOUNDARY (g_vm_exc_pending set)
+ *       - the fragment returns JIT_RET_BOUNDARY, stopping the invocation
+ *       exactly as the interpreted `if (!vm_raise(...)) return;`;
+ *   2 = the BUILDER threw - conveyed (the emit's exc-stamp is a no-op
+ *       here: the TypeErrorEx already carries the throw-site caret).
+ * `pc` is the op's RUNTIME pc, used only for vm_flush_inline's lookup;
+ * a DELETED run has no inline_ctxs entries by the deletability guard, so
+ * the collapse cannot mis-key it. */
 /* #56: the ELEMENT-VALUE slow tier shared by the two #9 fusions - every
  * shape their inline fast paths decline (a non-array/slice/general or
  * wrong-kind base, a negative index needing the wrap, OOB) runs the
@@ -4542,6 +4559,49 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
     return vm_unwind_walk(act, ctx, chunk, pc, std::move(ex));
 }
 
+/* the parked handler pc's ADDRESS (g_vm_resume_pc is TU-local), baked by
+ * the Throw emit so the fragment can return it without a second call. */
+void *jit_addr_resume_pc()
+{
+    return &g_vm_resume_pc;
+}
+
+extern "C" int jit_throw(int_type val_slot, int_type pc,
+                         const void *lep) noexcept
+{
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    const Chunk::LocEntry *le = static_cast<const Chunk::LocEntry *>(lep);
+    std::unique_ptr<RuntimeException> ex;
+    try {
+        ex = vm_make_thrown_exc(ctx.frame->at(val_slot).get(),
+                                le ? le->start : Loc(),
+                                le ? le->end : Loc());
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    /* STAMP the throw-site caret from the BAKED entry: vm_make_thrown_exc
+     * builds the ExceptionObject loc-less and vm_raise would stamp it from
+     * loc_at(pc) - but a DELETED run collapses every op's pc onto the head
+     * EnterNative, where loc_at returns the FIRST entry at that pc (the
+     * ctor's, in `throw E(9)`). The baked entry is pc-independent. */
+    if (le && !ex->loc_start) {
+        ex->loc_start = le->start;
+        ex->loc_end = le->end;
+    }
+    const Chunk *c2 = act.back_rec().run_chunk;
+    size_t p2 = static_cast<size_t>(pc);
+    if (!vm_raise(c2, p2, act, ctx, std::move(ex)))
+        return 1;                          /* boundary: signal set */
+    g_vm_resume_chunk = c2;                /* same-frame: the handler pc */
+    g_vm_resume_pc = p2;
+    return 0;
+}
+
 /* The desc-based twin of do_func_call's vm_capture_frame for the invoke
  * boundary: name/params/pure tag; the call site is loc-less (builtin
  * callbacks pass no call site - matching eval_func's captures today). */
@@ -5306,7 +5366,12 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
         const Chunk *c2 = cck;
         size_t p2 = r;
         bool cont = true;
-        if (g_vm_jit_raise) {
+        if (r == static_cast<size_t>(-2)) {
+            /* #56 (native Throw): the callee's raise already walked to
+             * our sync_stop record (pending set) - no dispatch, just the
+             * conveyance tail below. */
+            cont = false;
+        } else if (g_vm_jit_raise) {
             const int kind = g_vm_jit_raise;
             g_vm_jit_raise = 0;
             cont = vm_raise(c2, p2, act, ctx,
@@ -5616,6 +5681,24 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
              * continuation is flat interpretation via the record chain). */
             g_jit_sync_depth--;
             return 3;
+        }
+        if (r == JIT_RET_BOUNDARY) {
+            /* #56 (native Throw): the callee raised past this sync frame -
+             * vm_raise's walk stopped at our sync_stop record and set the
+             * pending signal. Convert it exactly as the interpreted tail
+             * below does (stamp the baked site on the innermost frame). */
+            g_jit_sync_depth--;
+            if (g_vm_exc_pending) {
+                Exception &e = *g_vm_exc_pending;
+                if (!e.backtrace.empty() && e.backtrace.back().desc == d
+                        && !e.backtrace.back().call_site.line)
+                    e.backtrace.back().call_site =
+                        Loc(static_cast<int>(site_packed >> 32),
+                            static_cast<int>(site_packed & 0xffffffff));
+                g_vm_jit_exc = std::move(g_vm_exc_pending);
+                return 2;
+            }
+            return 0;
         }
         /* the DEC runs AFTER the postexit: its interpreted continuation
          * (a vm_dispatch C frame per level) must stay depth-COUNTED, or

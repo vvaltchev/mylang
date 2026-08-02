@@ -15526,6 +15526,64 @@ static bool dyn_foreach_fast_shapes()
  * its post-call stub. g_jit_sync_switch is bumped by the switch push
  * itself, so growth proves the protocol ran; the deep result + a throw
  * from BELOW the cap prove the record chain + unwind are sound. */
+/* #56: the native `throw` - jit_throw runs the interpreted body (build +
+ * the shared vm_raise), so the op's original DELETES. The three paths:
+ * a same-frame catch (dispatch -> resume at the handler pc), a
+ * cross-frame catch (the boundary conveyance up the sync chain), and a
+ * non-struct value (the builder's TypeErrorEx, conveyed + catchable).
+ * g_jit_op_run[Throw] proves the native helper ran. */
+static bool jit_native_throw()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long t0 = g_jit_op_run[static_cast<size_t>(OpCode::Throw)];
+    if (!run({
+            "struct E { int c; }",
+            "func deep(int n) { if (n > 0) { throw E(n); } return 0; }",
+            "var t = 0;",
+            "for (var i = 1; i <= 20; i++) {",
+            "  try { throw E(i); } catch (E as e) { t += e.c; }   # same frame",
+            "  try { deep(i); } catch (E as e) { t += e.c; }      # cross frame",
+            "}",
+            "var dyn bad = 5;",
+            "try { throw bad; } catch (TypeErrorEx) { t += 1000; }",
+            "assert(t == 210 + 210 + 1000);" }))
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::Throw)] <= t0) {
+        fprintf(stderr, "jit_native_throw: the native throw DID NOT RUN\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_call_switch_protocol()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -18548,6 +18606,8 @@ static const std::vector<extra_check> extra_checks =
       jit_load_elem_slow_tier },
     { "jit: capped sync calls SWITCH interpreted-flat (#56 step 3)",
       jit_call_switch_protocol },
+    { "jit: native throw (same-frame / cross-frame / non-struct) (#56)",
+      jit_native_throw },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",
