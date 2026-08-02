@@ -3365,6 +3365,11 @@ extern "C" int jit_multi_unpack(int_type rval_slot, const void *targets,
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (the noexcept would
+         * std::terminate otherwise - #56) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
     }
     return 0;
 }
@@ -3632,6 +3637,11 @@ extern "C" int jit_load_member(int_type dst, int_type base_slot,
         vm_load_member_scalar(*ctx, *mk, base_slot, dst, is_int != 0);
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (the noexcept would
+         * std::terminate otherwise - #56) */
+        g_vm_jit_eptr = std::current_exception();
         return 1;
     }
     return 0;

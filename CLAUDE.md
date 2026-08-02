@@ -832,6 +832,17 @@ g_jit_sync_boundary_call. Corpus: 41 -> **27 kept runs**; call benches
 Ir -0.0-0.4%. Remaining: Catch/Reraise/Throw (12), StructFieldAddInt
 (5), MultiUnpackV (3), LoadMemberInt/Float guard-miss carets (3),
 JumpUnlessElemInt (3), MapFilterV (2), the inline-raise guard (5).
+**The small-batch increment (same day):** StructFieldAddInt joins
+op_never_exits (its helper is never-throwing, the add/store fragment-
+local); MultiUnpackV / CheckFuncV / MapFilterV / LoadMemberInt/Float
+join the convey family (exc-stamps added at their exits - LoadMember's
+is a belt over its POOLED member carets; eptr nets added to
+jit_multi_unpack/jit_load_member for plain callback/dyn throws).
+Corpus: 27 -> **22 kept runs**; 65/35/64 Ir neutral, 73_multi_unpack
++0.9% (the deletion reshapes its fragments - the layout-tax class).
+Remaining: the exception trio (12), ForeachDynInit/Next (4, side-table
+carets - the same treatment next), JumpUnlessElemInt (3, needs a
+branch-resolving slow tier), the inline-raise guard (5).
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat
