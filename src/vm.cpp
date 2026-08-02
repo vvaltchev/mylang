@@ -4220,7 +4220,8 @@ extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
  * propagates through a call op (a call FROM inlined code). Cold: error path
  * only. No-op for a chunk with no inlined ops (inline_ctx_at returns null).
  */
-static void vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
+static ML_NOINLINE void
+vm_flush_inline_walk(const Chunk &chunk, size_t pc, Exception &e)
 {
     if (e.inline_origin_emitted)
         return;
@@ -4235,6 +4236,17 @@ static void vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
         e.backtrace.push_back({f.callee_name, f.params, f.call_site});
     }
     e.inline_origin_emitted = true;
+}
+
+static ML_ALWAYS_INLINE void
+vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
+{
+    /* the common no-inlining chunk: skip the call + pc search entirely
+     * (~27 Ir per raise measured on 70_exc, which never inlines); the
+     * walk stays out-of-line (the loop-body text rule). */
+    if (chunk.inline_ctxs.empty())
+        return;
+    vm_flush_inline_walk(chunk, pc, e);
 }
 
 /* fwd (defined below CachedCallV's probe) - vm_raise now walks natively. */
