@@ -25,7 +25,42 @@ Two side findings from the same profile: `size()` appears as its OWN
 symbol (8.3%), so it is not being inlined into the helper at all; and
 `clone_aliased_slices` runs on the hot store path.
 
-## What was built, and why it was REVERTED
+## LANDED 2026-08-02
+
+    bench                    before        after   delta    my/cpp
+    43_sieve            452,745,568  175,222,664  -61.3%   27.2x -> 10.5x
+    14_array_subscript  181,497,449   94,600,524  -47.9%   10.0x -> 5.2x
+    46_matrix_mult      122,046,979  121,484,093   -0.5%   23.4x -> 23.3x
+    18_foreach_array    158,367,308  158,448,632   +0.1%    6.0x -> 6.1x
+
+**88.9 Ir saved per element store.** `jit_store_elem_int` is GONE from the
+sieve's profile - it is now 82.8% native code, and what is left is COMPILE
+time (`dynamic_cast` + `strcmp` in the optimizer), not the program. The two
+read-heavy benches are neutral, as expected: this is the store side.
+
+The guard that made it work is `has_slices`, NOT `use_count() == 1` - see
+the root-cause section below, which is why the first attempt was dead.
+
+### What is proven, and what is not
+
+PROVEN load-bearing (removed, watched the test fail):
+  - the **COW guard**. Without it a live slice observes a value it should
+    have been cloned away from: `7007` against the tree-walker's `1007`.
+    Silent, and the whole 1690-test suite passed with it removed until the
+    case was built correctly - see the test-trap note at the end.
+
+NOT proven by an isolated case, and recorded rather than claimed:
+  - the **slice-base** guard (storing THROUGH a slice, where elements live
+    at `shobj->off`);
+  - the **readonly** guard.
+  Both are emitted and both match the interpreter's own conditions
+  (`!arr.is_slice()`, `!arr.is_readonly()`), and the whole differential is
+  green with them in - but every shape built to reach a JIT-COMPILED store
+  through them either declined earlier for another reason or made the VM
+  error where the tree-walker did not. The latter is worth its own look:
+  it is either an invalid program or a separate divergence.
+
+## The first attempt, and why it was reverted
 
 A full inline tier was written and is correct - guards + the raw store
 emitted at the call site, the helper kept as the slow tier, every guard

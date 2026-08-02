@@ -48,6 +48,7 @@
 extern "C" {
 unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
 unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
+unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 }
@@ -257,6 +258,11 @@ struct JitLayout {
     int data_off;         /* SharedObject: &elem_vec - shobj (the vector's
                            * _M_start is at +0, _M_finish at +8) */
     unsigned char kind_ints, kind_floats, kind_bools;  /* Storage values */
+    /* #92 the inline STORE tier (see SharedArrayObj::JitProbe) */
+    int ro_off;        /* SharedObject: &readonly   - shobj */
+    int hashv_off;     /* SharedObject: &hash_valid - shobj */
+    int slices_off;    /* SharedObject: &has_slices - shobj */
+    int lv_const_off;  /* LValue: &is_const - &slot */
     int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
     int t_str_val;        /* Type::t_str: types >= this hold a REFERENCE */
     /* De-helperize 6b: the ctx-indirect chain (via the vm.cpp probes) */
@@ -340,6 +346,15 @@ static const JitLayout &jit_layout()
             SharedArrayObj::Storage::floats);
         l.kind_bools = static_cast<unsigned char>(
             SharedArrayObj::Storage::bools);
+        l.ro_off = static_cast<int>(
+            static_cast<const char *>(jp.readonly) - so);
+        l.hashv_off = static_cast<int>(
+            static_cast<const char *>(jp.hash_valid) - so);
+        l.slices_off = static_cast<int>(
+            static_cast<const char *>(jp.has_slices) - so);
+        l.lv_const_off = static_cast<int>(
+            reinterpret_cast<const char *>(&alv.jit_const_probe()) -
+            reinterpret_cast<const char *>(&alv));
         /* Type::t offset + the t_str boundary: a slot whose current type has
          * t >= t_str holds a REFERENCE (needs a C++ release before overwrite);
          * < t_str is a trivial value (overwrite in place). */
@@ -752,6 +767,21 @@ struct Emitter {
      * writing eax zeroes rax's high half, so rax is a clean 0/1). */
     void load_elem_byte()
     { u8(0x42); u8(0x0F); u8(0xB6); u8(0x04); u8(0x09); }
+
+    /* ---- #92, the inline element-STORE tier ----
+     * The value lives in RDI, and that is load-bearing: rax/rcx/rdx/r9 are
+     * all live (shobj/data/count/index) and RSI IS RESERVED - it carries
+     * the fragment's t_int singleton, so clobbering it makes every later
+     * slot write stamp a garbage type (an immediate SEGV, found that way).
+     * rdi is free once frag_entry has moved the slots base into rbx. */
+    void store_elem_int_rdi()          /* mov [rcx + r9*8], rdi */
+    { u8(0x4A); u8(0x89); u8(0x3C); u8(0xC9); }
+    void store_elem_byte_dil()         /* mov [rcx + r9], dil */
+    { u8(0x42); u8(0x88); u8(0x3C); u8(0x09); }
+    void mov_byte_rax_imm(int32_t d, uint8_t imm)   /* mov byte [rax+d],i */
+    { u8(0xC6); u8(0x80); u32(uint32_t(d)); u8(imm); }
+    size_t jmp32()                     /* jmp rel32 -> patch32_here */
+    { u8(0xE9); const size_t at = pos(); u32(0); return at; }
     /* cmp rax, rcx / test rax, rax */
     void cmp_rax_rcx() { u8(0x48); u8(0x39); u8(0xC8); }
     void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
@@ -3504,6 +3534,102 @@ static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc,
     e.patch8(j_ok, e.pos());
 }
 
+/*
+ * #92 - the INLINE tier for a flat int/bool element STORE.
+ *
+ * `a[i] = v` was a bare call to jit_store_elem_int, and that helper redoes
+ * the whole managed model per store: type tag, storage kind, const +
+ * readonly, negative wrap, size() TWICE, slice check, use_count(), the
+ * store, invalidate_hash(). Measured at 85 Ir PER ELEMENT STORE - 66% of
+ * 43_sieve, the suite's worst bench at 27.2x the C++ that writes one byte.
+ *
+ * So emit the guards and the store inline, as the READ side and the boxed
+ * int-int arithmetic tier already do, and keep the helper as the SLOW
+ * TIER. Every guard DECLINES to it rather than raising, so everything this
+ * tier does not take stays byte-identical: the negative-index wrap, the
+ * OOB caret, the COW clone, a readonly/const target, compound ops, floats.
+ *
+ * THE GUARD THAT IS NOT OBVIOUS: not `use_count() == 1`. `var a =
+ * array(32)` compiles to `call.blt.v r4 = array(..)` + `move a = r4`, and
+ * MoveV COPIES the handle - so a dead temp keeps the count at 2 for the
+ * rest of the function and a sole-owner guard declines essentially all
+ * array code (the first version of this tier was dead for exactly that
+ * reason). The helper's own condition shows the real one: it calls
+ * clone_aliased_slices, which ITERATES shobj->slices, so it is a NO-OP
+ * when no slice VIEWS exist. A refcount > 1 with no slices is harmless -
+ * two variables sharing an array is MyLang's reference semantics and a
+ * plain store is correct. Hence the `has_slices` mirror.
+ *
+ * Registers: rax = shobj, rcx = data, rdx = count, r9 = index, rdi = the
+ * value (NOT rsi - see the encoders).
+ */
+static bool emit_store_elem_inline(Emitter &e, const Instr &in,
+                                   std::vector<size_t> &slows,
+                                   std::vector<size_t> &dones)
+{
+    if (in.aop != Op::invalid)
+        return false;              /* compound: read-modify-write, later */
+
+    const JitLayout &L = jit_layout();
+    const SlotAddr base = slot_addr(in.target2);
+    const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
+
+    load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
+
+    e.load(RAX, base.type);                        /* an array? */
+    e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rax_r9();
+    decline_ne();
+    e.cmp_byte_slot(base.payload + L.slice_off, 0);          /* not a slice */
+    decline_ne();
+    e.cmp_byte_slot(base.type + (L.lv_const_off - L.off_type), 0);
+    decline_ne();                                            /* const slot */
+
+    e.load(RAX, base.payload);                     /* rax = the SharedObject */
+    e.cmp_byte_rax(L.ro_off, 0);
+    decline_ne();                                            /* readonly */
+    e.cmp_byte_rax(L.slices_off, 0);
+    decline_ne();                        /* live slice views -> the COW path */
+
+    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    const size_t j_ints = e.j32(0x74);
+    e.cmp_byte_rax(L.kind_off, L.kind_bools);
+    decline_ne();
+
+    /* --- BOOLS: 1-byte elements, count = finish - start --- */
+    e.mov_rcx_rax(L.data_off);
+    e.mov_rdx_rax(L.data_off + 8);
+    e.sub_rdx_rcx();
+    load_index_r9(e, in);
+    e.cmp_r9_rdx();
+    slows.push_back(e.j32(0x73));        /* jae: negative OR >= count */
+#ifdef TESTS
+    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
+    e.u8(0x48); e.u8(0xFF); e.u8(0x02);              /* inc qword [rdx] */
+#endif
+    e.store_elem_byte_dil();
+    e.mov_byte_rax_imm(L.hashv_off, 0);             /* invalidate_hash() */
+    dones.push_back(e.jmp32());
+
+    /* --- INTS: 8-byte elements, count = (finish - start) / 8 --- */
+    e.patch32_here(j_ints);
+    e.mov_rcx_rax(L.data_off);
+    e.mov_rdx_rax(L.data_off + 8);
+    e.sub_rdx_rcx();
+    e.sar_rdx_3();
+    load_index_r9(e, in);
+    e.cmp_r9_rdx();
+    slows.push_back(e.j32(0x73));
+#ifdef TESTS
+    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
+    e.u8(0x48); e.u8(0xFF); e.u8(0x02);
+#endif
+    e.store_elem_int_rdi();
+    e.mov_byte_rax_imm(L.hashv_off, 0);
+    dones.push_back(e.jmp32());
+    return true;
+}
+
 static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
                             uint32_t pc, size_t old_pc, bool is_float)
 {
@@ -3512,6 +3638,13 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
         : reinterpret_cast<const void *>(jit_store_elem_int);
     const int32_t base_off = static_cast<int32_t>(
         static_cast<long>(in.target2) * static_cast<long>(sizeof(LValue)));
+
+    /* #92: the INLINE fast tier first; every guard it fails jumps here,
+     * to the helper, which is the exact interpreter semantics. */
+    std::vector<size_t> slows, dones;
+    if (!is_float && emit_store_elem_inline(e, in, slows, dones))
+        for (const size_t j : slows)
+            e.patch32_here(j);
 
     /* idx -> rsi (an int operand), read before the cache regs spill */
     load_operand(e, RSI, in.a_is_lit(), in.a_lit(), in.a_slot());
@@ -3541,6 +3674,8 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
     emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
     e.exit_pc(pc);                        /* raised: EnterNative raises exc */
     e.patch8(j_ok, e.pos());
+    for (const size_t j : dones)          /* #92: the inline tails rejoin */
+        e.patch32_here(j);
 }
 
 /* Approach A: a dict element store d[k] = v as a CALL to jit_dict_store. The

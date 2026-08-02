@@ -787,6 +787,9 @@ extern unsigned long g_jit_op_run[];
  * prove the inline path ran, not just the slow helper. */
 extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
 extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
+/* #92: element stores served by the EMITTED inline tier, never the helper -
+ * the only thing that can prove the fast path executed. */
+extern "C" unsigned long g_jit_store_fast;
 extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
 extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
 extern "C" unsigned long g_jit_sync_inline;

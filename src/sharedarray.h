@@ -132,6 +132,22 @@ private:
                            PoolAlloc<SharedArrayObjTempl *>> slices;
 
         /*
+         * MIRROR of `!slices.empty()`, maintained by slices_add/slices_del
+         * below - EVERY mutation of the set goes through those two, so this
+         * cannot drift, and an ASSERTS-only check in the interpreted store
+         * body (vm_store_elem_int_body) re-verifies it on every store.
+         *
+         * It exists because the JIT's inline element-store tier must ask
+         * "are there live slice VIEWS?" from machine code: a store through
+         * an aliased array is fine (two variables sharing an array is
+         * MyLang's reference semantics) but a store that would be visible
+         * through a live SLICE needs clone_aliased_slices first. The set's
+         * own size lives at a libstdc++-internal offset, so it is not
+         * safely machine-checkable; this byte is.
+         */
+        bool has_slices = false;
+
+        /*
          * When set, this array's data is read-only: it backs a `const` value,
          * so element writes, `+=`, append/insert/erase/pop and sort-in-place
          * are rejected. The flag lives on the shared object so it travels with
@@ -251,13 +267,26 @@ public:
         , slice(false)
     { }
 
+    /* THE ONLY two places shobj->slices is mutated from this class - see
+     * SharedObject::has_slices for why the mirror must not drift. */
+    void slices_add(SharedArrayObjTempl *p)
+    {
+        shobj->slices.insert(p);
+        shobj->has_slices = true;
+    }
+    void slices_del(SharedArrayObjTempl *p)
+    {
+        shobj->slices.erase(p);
+        shobj->has_slices = !shobj->slices.empty();
+    }
+
     SharedArrayObjTempl(const SharedArrayObjTempl &obj, size_type off, size_type len)
         : shobj(obj.shobj)
         , off(off)
         , len(len)
         , slice(true)
     {
-        shobj->slices.insert(this);
+        slices_add(this);
     }
 
     /* Regular constructors */
@@ -271,7 +300,7 @@ public:
         , slice(obj.slice)
     {
         if (slice)
-            shobj->slices.insert(this);
+            slices_add(this);
     }
 
     SharedArrayObjTempl(SharedArrayObjTempl &&obj)
@@ -281,8 +310,8 @@ public:
         , slice(obj.slice)
     {
         if (slice) {
-            shobj->slices.erase(&obj);
-            shobj->slices.insert(this);
+            slices_del(&obj);
+            slices_add(this);
             obj.slice = false;
         }
     }
@@ -296,7 +325,7 @@ public:
          * overwritten with another value, is exactly this path (a tree-walker
          * temporary is torn down via the dtor instead, which masked it. */
         if (slice)
-            shobj->slices.erase(this);
+            slices_del(this);
 
         shobj = obj.shobj;
         off = obj.off;
@@ -304,7 +333,7 @@ public:
         slice = obj.slice;
 
         if (slice)
-            shobj->slices.insert(this);
+            slices_add(this);
 
         return *this;
     }
@@ -312,7 +341,7 @@ public:
     SharedArrayObjTempl &operator=(SharedArrayObjTempl &&obj)
     {
         if (slice)                     /* unregister THIS from its old shobj */
-            shobj->slices.erase(this);
+            slices_del(this);
 
         shobj = std::move(obj.shobj);
         off = obj.off;
@@ -320,8 +349,8 @@ public:
         slice = obj.slice;
 
         if (slice) {
-            shobj->slices.erase(&obj);
-            shobj->slices.insert(this);
+            slices_del(&obj);
+            slices_add(this);
             obj.slice = false;
         }
 
@@ -331,7 +360,7 @@ public:
     ~SharedArrayObjTempl()
     {
         if (slice)
-            shobj->slices.erase(this);
+            slices_del(this);
     }
 
     void clone_internal_vec();
@@ -431,6 +460,9 @@ public:
     int_type use_count() const { return shobj.use_count(); }
 
     bool is_readonly() const { return shobj && shobj->readonly; }
+    /* #92: ASSERTS-only - the mirror must equal the set it mirrors. */
+    bool jit_has_slices_mirror_ok() const
+    { return !shobj || shobj->has_slices == !shobj->slices.empty(); }
     void set_readonly() { shobj->readonly = true; }
 
     /*
@@ -484,11 +516,21 @@ public:
         const void *kind;       /* &shobj->kind */
         const void *elem_vec;   /* &shobj->ivec (== the union base;
                                  * fvec/etc. alias it) */
+        /* #92 (the inline STORE tier): the three a store needs that a read
+         * does not - it must refuse a read-only array, must not write past
+         * a live slice VIEW without cloning it away, and must invalidate
+         * the cached hash. */
+        const void *readonly;    /* &shobj->readonly   (bool) */
+        const void *hash_valid;  /* &shobj->hash_valid (bool) */
+        const void *has_slices;  /* &shobj->has_slices (bool, the mirror) */
     };
     JitProbe jit_probe() const {
         return { static_cast<const void *>(shobj.get()),
                  static_cast<const void *>(&shobj->kind),
-                 static_cast<const void *>(&shobj->ivec) };
+                 static_cast<const void *>(&shobj->ivec),
+                 static_cast<const void *>(&shobj->readonly),
+                 static_cast<const void *>(&shobj->hash_valid),
+                 static_cast<const void *>(&shobj->has_slices) };
     }
     size_type offset() const { return slice ? off : 0; }
 

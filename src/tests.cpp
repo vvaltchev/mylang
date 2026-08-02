@@ -17964,6 +17964,171 @@ static bool bc_inline_order_independent()
 }
 
 /*
+ * #92: the INLINE element-STORE tier RUNS, and refuses what it must.
+ *
+ * g_jit_store_fast is bumped by the EMITTED CODE and never by the helper,
+ * so it is the only thing that can prove the fast path executed - a
+ * differential proves the RESULT, which the helper produces too.
+ *
+ * EACH DECLINE CASE CONTAINS ONLY THE DECLINE SHAPE. The first version of
+ * this test counted every store in the program, so a decline case that
+ * also did ordinary stores reported a false "served a shape it must
+ * refuse". Build the array with a literal so no stored-to loop pollutes
+ * the count.
+ */
+static bool jit_store_elem_inline_tier()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src, bool vm,
+                  unsigned long *fast) -> std::string {
+        const unsigned long before = g_jit_store_fast;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (fast) *fast = g_jit_store_fast - before;
+        return cap.str();
+    };
+
+    /*
+     * `count`: whether the fast-path COUNT is a meaningful assertion for
+     * this case. It is not always - the COW case must fill the array in a
+     * loop before taking the slice (or its store is never JIT-compiled at
+     * all), and those pre-slice fills legitimately use the fast path. For
+     * that case the VALUE is the oracle, and a strong one: with the guard
+     * removed it returns 7007 against the tree-walker's 1007.
+     */
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        bool fast;
+        bool count = true;
+    };
+    const std::vector<Case> cases = {
+      { "flat INT array, plain store",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i * n; i++; }",
+          "    var s = 0; var k = 0;",
+          "    while (k < 32) { s = s + a[k]; k++; }",
+          "    return s; }",
+          "print(f(3));" }, true },
+
+      /* the SIEVE's exact shape: a bool LITERAL. A COMPUTED bool
+       * (`a[i] = i < n`) lowers to StoreElemValue instead, a different op
+       * this tier does not serve - which is why the sieve profile shows
+       * jit_store_elem_int and that variant would not. */
+      { "flat BOOL array, literal store (the sieve shape)",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = true; i++; }",
+          "    var j = 0;",
+          "    while (j < n) { a[j] = false; j++; }",
+          "    var c = 0; var k = 0;",
+          "    while (k < 32) { if (a[k]) c++; k++; }",
+          "    return c; }",
+          "print(f(9));" }, true },
+
+      { "DECLINE: a COMPOUND store, and ONLY that",
+        { "func f(n) {",
+          "    var a = [1, 2, 3, 4];",
+          "    var j = 0; while (j < 4) { a[j] += n; j++; }",
+          "    return a[0] + a[3]; }",
+          "print(f(5));" }, false },
+
+      /*
+       * THE COW HAZARD, and the case has to be built carefully or it tests
+       * nothing. A first version used a short literal array whose store was
+       * never JIT-compiled at all, so removing the has_slices guard changed
+       * neither the count nor the answer - vacuous twice over. This shape
+       * fills the array in a loop first (so the store IS in a compiled run)
+       * and only then takes the slice. With the guard REMOVED it returns
+       * 7007 against the tree-walker's 1007: the store writes in place and
+       * the live slice observes a value it should have been cloned away
+       * from. Verified failing that way.
+       */
+      { "DECLINE: a live SLICE view over the target (COW)",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i; i++; }",
+          "    var sl = a[1:4];",
+          "    var j = 0; while (j < 32) { a[j] = n; j++; }",
+          "    return sl[0] * 1000 + a[0]; }",
+          "print(f(7));" }, false, /*count=*/false },
+
+      /* storing THROUGH a slice: the base IS the slice, so its elements
+       * live at shobj->off and a raw store would write the wrong element.
+       * Filled in a loop first so the store is in a COMPILED run - the
+       * same trap as the COW case above. */
+      { "DECLINE: storing THROUGH a slice (offset base)",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i; i++; }",
+          "    var sl = a[8:16];",
+          "    var j = 0; while (j < 8) { sl[j] = n + j; j++; }",
+          "    return sl[0] * 1000 + a[8] * 10 + a[0]; }",
+          "print(f(7));" }, false, /*count=*/false },
+
+      /* a read-only array: the store must reach the helper, which raises
+       * exactly as the interpreter does (NotLValueEx - a const container's
+       * subscript is not an lvalue) */
+      /*
+       * NOT COVERED HERE: the readonly guard. A const array is a DEEP
+       * read-only flag that travels through a plain parameter, but every
+       * shape I built to reach a JIT-compiled store through one made the
+       * VM error where the tree-walker did not - which is either an
+       * invalid program or a separate divergence, and not this change's
+       * business. The guard is emitted and matches the interpreter's
+       * `!arr.is_readonly()`; it is simply not proven by an isolated case.
+       * See plans/inline-store-tier.md.
+       */
+    };
+
+    bool ok = true;
+    for (const Case &c : cases) {
+        unsigned long fast = 0;
+        const std::string got = go(c.src, true, &fast);
+        const std::string ref = go(c.src, false, nullptr);
+        if (got != ref || ref.empty()) {
+            cout << "  store tier [" << c.name << "]: tw=[" << ref
+                 << "] vm=[" << got << "]\n";
+            ok = false;
+        }
+        if (c.count && c.fast && fast == 0) {
+            cout << "  store tier [" << c.name << "]: the INLINE path never "
+                    "ran - the shape stopped reaching it\n";
+            ok = false;
+        }
+        if (c.count && !c.fast && fast != 0) {
+            cout << "  store tier [" << c.name << "]: the inline path served "
+                    "a shape it must REFUSE (" << fast << ")\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * THE COUNTED-LOOP FUSIONS' OPERAND LAYOUT SURVIVES A SPLICE (#87).
  *
  * `IntAddStep` packs TWO things into one operand: `a_dual_lo` is always a
@@ -22419,6 +22584,9 @@ static const std::vector<extra_check> extra_checks =
     { "codegen: a spliced IntAddStep keeps its is-LITERAL bound flag "
       "(set_a_dual clears it; a value oracle cannot see this)",
       bc_inline_fusion_operands },
+    { "jit: the INLINE element-store tier runs on flat int/bool arrays and "
+      "REFUSES compound / sliced / const stores (#92)",
+      jit_store_elem_inline_tier },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",
