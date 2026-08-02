@@ -1075,6 +1075,21 @@ the new path, and `jit_final_batch_deletable` now accepts EITHER baked
 counter - #88 legitimately moved its shape from the raise-site field to the
 call-site channel, which is where a frame for a call inside an inlined body
 belongs.
+COST (callgrind Ir, `OPT=1 ASSERTS=0` both sides): everything EXACTLY
+neutral except **69_exc_crossframe +1.58%** - 42/70/72_exc, fib and
+10_recursion_deep all +-0.01%. Two gates got it there from an initial
++1.92%/+0.82% spread, and both are the same idea - do nothing where nothing
+can go wrong: the **-2 marker is emitted only when the chunk HAS inlined
+ops** (in a chunk with none, the pc lookup it defends against returns -1
+anyway, so the block was dead weight on a cold path every conveying op
+carries - this alone recovered 70_exc_runtime_error to zero), and the
+**side-channel stores are emitted only when the site HAS a chain**, which
+is safe because each helper CLAIMS the pair (reads and RESETS it) and a
+store always sits immediately before its own call - so a site with no chain
+can only ever observe the cleared value. The residual on 69 is the -2 stamp
+running per frame-crossing in a chunk that does inline; 69 throws 20k
+CAUGHT exceptions across 16 frames each, i.e. the worst case for any
+per-crossing bookkeeping, and it is the only bench that moves.
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat
