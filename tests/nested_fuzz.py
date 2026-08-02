@@ -662,15 +662,16 @@ def main():
         # the same wrong tree. Re-running with every transform OFF is the
         # only oracle, and random deep-nested programs are where a transform's
         # gates get combinations no hand-written test covers.
-        # THE BYTECODE SPLICE (-bi). It is opt-in and default-off, so no
-        # other lane exercises it; and it only ever transforms non-main
-        # chunks, which is why the generator emits functions that call each
-        # other. Both JIT states: a splice bug can live in the bytecode it
-        # produces or in how the JIT consumes it.
+        # THE BYTECODE SPLICE. It went DEFAULT-ON on 2026-08-02, so the `vm`
+        # lane above already runs it - what needs its own lane now is the
+        # OFF state (-nbi), which is still a configuration users can select
+        # and must therefore not be the untested one. Both JIT states: a
+        # splice bug can live in the bytecode it produces or in how the JIT
+        # consumes it.
         if "bi" in engines:
-            results["vm-bi"] = run([args.mylang, "-vm", "-bi"], my_path)
-            results["vm-bi-nj"] = run([args.mylang, "-vm", "-bi", "-nj"],
-                                      my_path)
+            results["vm-nbi"] = run([args.mylang, "-vm", "-nbi"], my_path)
+            results["vm-nbi-nj"] = run([args.mylang, "-vm", "-nbi", "-nj"],
+                                       my_path)
         if "noopt" in engines:
             results["vm-noopt"] = run([args.mylang, "-vm",
                                        "--no-opt", "all"], my_path)

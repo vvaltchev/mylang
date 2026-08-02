@@ -1490,6 +1490,14 @@ Running scripts:
                                  # its POOLS (consts/catch_types/…/side tables);
                                  # closures + their capture struct shown, 256-
                                  # color syntax-highlighted on a TTY
+./build/mylang -nbi FILE         # disable the bytecode-level INLINER (the
+                                 # "splice": a callee's BYTECODE pasted into
+                                 # the caller's chunk, so the call protocol
+                                 # disappears). DEFAULT ON since 2026-08-02;
+                                 # -bi forces it on, MYLANG_BCINLINE=0/1.
+                                 # The same-binary A/B lever - the
+                                 # un-inlined bytecode is a splice's only
+                                 # oracle (plans/bytecode-inliner.md)
 ./build/mylang -vdj FILE         # -vd + the native x86-64 disassembly of
                                  # each JIT fragment, interleaved under its
                                  # `enter.nat` line with `; vm pc N` markers
@@ -1594,15 +1602,17 @@ mode. ALL must be green to `exit(0)`:
    construction.
 2. **the bytecode VM, JIT OFF** (`vm:`) — pure interpreted bytecode.
 3. **the bytecode VM, JIT ON** (`jit:`) — native code; the script default.
-4. **JIT OFF + the bytecode SPLICE** (`vm+bi:`) — the opt-in inliner.
-5. **JIT ON + the bytecode SPLICE** (`jit+bi:`).
+4. **JIT OFF, splice ON** (`vm:`).
+5. **JIT ON, splice ON** (`jit:`) — **the script DEFAULT**.
 
-Modes 4-5 exist because the splice is default-OFF, so without them the
-whole suite says NOTHING about it — and "the configuration nobody runs"
-is exactly how a disabled branch remap survived 39 commits. Two of them,
-not one: a splice bug can live in the bytecode it PRODUCES (visible with
-the JIT off) or in how the JIT CONSUMES it (visible only with it on).
-The full suite is green in all five; `-rt` costs ~17s in the debug lane.
+Modes 1-3 run with the splice OFF (`-nbi`) and 4-5 with it ON. BOTH SHIP
+— the bytecode splice went default-ON on 2026-08-02 and `-nbi` turns it
+off — so each is a configuration a user can select and neither may be the
+untested one. ("The configuration nobody runs" is exactly how a disabled
+branch remap survived 39 commits.) Two passes per splice state, not one:
+a splice bug can live in the bytecode it PRODUCES (visible with the JIT
+off) or in how the JIT CONSUMES it (visible only with it on). The full
+suite is green in all five; `-rt` costs ~17s in the debug lane.
 
 **WHY MODE 2 IS NOT OPTIONAL.** With only tw-vs-VM, a codegen bug and a
 JIT bug are the SAME SYMPTOM, and a JIT bug that happens to be
