@@ -47,6 +47,7 @@
 extern "C" {
 unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
+unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 }
 #endif
 
@@ -5710,9 +5711,34 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     /* pc remap: every run head gains one inserted EnterNative; a DELETABLE
      * run's interior ops are removed, so every one of its pcs maps to the
      * EnterNative (only the head is ever a target - single-entry). */
+    /* PER-PC ENTRY POINTS, increment 1 (post-call resume; plans/native-gap-
+     * roadmap.md lever 1): every in-VM call op (CallV/CachedCallV/
+     * CallValueV) inside a KEPT run gets an EnterNative inserted DIRECTLY
+     * AFTER it, pointing at a per-entry STUB (tag + cache entry loads +
+     * a jump to the following op's fragment offset). An interpreted
+     * return's resume pc is computed at RUNTIME as call_pc + 1, so it
+     * LANDS ON the inserted op and re-enters native - no runtime lookup,
+     * no remap ambiguity (no old pc maps to the inserted op; bails of the
+     * following op still reach its original; loc_at(ret_chunk, ret_pc-1)
+     * still hits the call op, so backtraces are untouched). A call as a
+     * run's LAST op needs none (the next pc is outside the run). Deletable
+     * runs can't contain a call (not op_fully_native), so entries live in
+     * kept runs only. */
+    std::vector<std::pair<size_t, size_t>> post_entries;  /* call pc, stub */
+    for (size_t r = 0; r < runs.size(); r++) {
+        if (deletable[r])
+            continue;
+        for (size_t p = runs[r].begin; p + 1 < runs[r].end; p++) {
+            const OpCode op = chunk.code[p].op;
+            if (op == OpCode::CallV || op == OpCode::CachedCallV
+                    || op == OpCode::CallValueV)
+                post_entries.push_back({ p, 0 });
+        }
+    }
+
     std::vector<int> remap(n + 1);
     {
-        size_t r = 0, pc = 0;
+        size_t r = 0, pc = 0, pe = 0;
         int np = 0;                               /* next NEW pc */
         while (pc <= n) {
             if (r < runs.size() && pc == runs[r].begin) {
@@ -5722,8 +5748,16 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                     for (size_t p = b; p < en; p++)
                         remap[p] = en_pc;         /* all -> EnterNative */
                 } else {
-                    for (size_t p = b; p < en; p++)
+                    for (size_t p = b; p < en; p++) {
                         remap[p] = np++;          /* ops kept after it */
+                        if (pe < post_entries.size()
+                                && post_entries[pe].first == p) {
+                            np++;      /* the inserted post-call EnterNative
+                                        * (UNMAPPED - only a runtime ret_pc
+                                        * ever lands on it) */
+                            pe++;
+                        }
+                    }
                 }
                 pc = en;
                 r++;
@@ -5754,16 +5788,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * the loop keeps them in registers; every exit flushes them). */
         e.cache.clear();
         std::vector<char> cache_barrier(end - begin, 0);
-        {
-            static const uint8_t cregs[2] = { 10, 11 };
-            const std::vector<int> hot =
-                pick_cached_slots(chunk, begin, end, chunk.slot_count,
-                                  &cache_barrier);
-            for (size_t h = 0; h < hot.size(); h++) {
-                const SlotAddr a = slot_addr(hot[h]);
-                e.cache.push_back({ hot[h], a.payload, a.type, cregs[h] });
-                e.load(cregs[h], a.payload);     /* entry load */
-            }
+        static const uint8_t cregs[2] = { 10, 11 };
+        const std::vector<int> hot =
+            pick_cached_slots(chunk, begin, end, chunk.slot_count,
+                              &cache_barrier);
+        for (size_t h = 0; h < hot.size(); h++) {
+            const SlotAddr a = slot_addr(hot[h]);
+            e.cache.push_back({ hot[h], a.payload, a.type, cregs[h] });
+            e.load(cregs[h], a.payload);     /* entry load */
         }
 
         std::vector<size_t> label(end - begin, 0);
@@ -5816,6 +5848,36 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.patch32(f.site,
                       static_cast<uint32_t>(dst - (f.site + 4)));
         }
+
+        /* PER-PC ENTRY STUBS (post-call resume): an interior offset cannot
+         * be entered raw - fragment code assumes the HEAD's register
+         * contract (rsi = t_int, r8 = t_float on a float run, the N5 cache
+         * regs loaded). Each post-call entry gets a stub replaying exactly
+         * the head's establishment sequence, then jumping to the op AFTER
+         * the call. Sound: cache slots are resolved locals and memory is
+         * CURRENT at any resume (every native exit flushes; interpreted
+         * ops write memory). Emitted after the run body (labels final, so
+         * the jump is a direct backward rel32); unmarked in -vdj (the
+         * decoder resyncs at the next fragment's marks). */
+        for (auto &pe : post_entries) {
+            if (pe.first < begin || pe.first >= end)
+                continue;
+            pe.second = e.pos();
+            e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
+            if (run_has_float(chunk, begin, end))
+                e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+            for (size_t h = 0; h < hot.size(); h++)
+                e.load(cregs[h], e.cache[h].payload);
+#ifdef TESTS
+            e.movabs(RCX,
+                     reinterpret_cast<uint64_t>(&g_jit_entry_resume));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+#endif
+            const size_t tgt = label[pe.first + 1 - begin];
+            e.u8(0xE9);
+            e.u32(static_cast<uint32_t>(
+                tgt - (e.pos() + 4)));            /* jmp (backward) */
+        }
         if (g_jit_annotate)
             chunk.native.frags.push_back(
                 { static_cast<uint32_t>(frag_off[r]), 0, std::move(marks) });
@@ -5846,9 +5908,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     /* Rebuild the code vector with the EnterNative heads inserted and
      * every pc field remapped; then remap the pc-keyed side tables. */
     std::vector<Instr> nc;
-    nc.reserve(n + runs.size());
+    nc.reserve(n + runs.size() + post_entries.size());
     {
-        size_t r = 0, pc = 0;
+        size_t r = 0, pc = 0, pe = 0;
         while (pc < n) {
             if (r < runs.size() && pc == runs[r].begin) {
                 Instr en;
@@ -5886,8 +5948,24 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 break;
             }
             nc.push_back(in);
+            /* the post-call resume entry: an EnterNative pointing at this
+             * call's stub, DIRECTLY after it - a runtime ret_pc (call pc
+             * + 1) lands here and re-enters native (see the entry-set
+             * comment above the remap). */
+            if (pe < post_entries.size() && pc == post_entries[pe].first) {
+                Instr en;
+                en.op = OpCode::EnterNative;
+                Operand off;
+                off.is_lit = true;
+                off.lit_kind = Operand::LitKind::i;
+                off.lit = static_cast<int_type>(post_entries[pe].second);
+                en.set_a(off);
+                nc.push_back(en);
+                pe++;
+            }
             pc++;
         }
+        ML_CHECK(pe == post_entries.size());
     }
     chunk.code = std::move(nc);
 

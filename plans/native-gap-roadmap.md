@@ -67,9 +67,26 @@ those classes in impact order.
    bench 11's +-5% swing. Finding both real bugs below outvalued the
    delta: the step's test surfaced a WRONG-CODE call-arg ternary
    miscompile + an inferencer null-type segfault (fixed in the two
-   commits preceding it). The remaining multiplier is per-pc fragment
-   entry points + native non-leaf calls (M5 proper: checked-return
-   unwind + growable native stack).
+   commits preceding it). PER-PC ENTRIES INCREMENT 1 (post-call
+   resume) LANDED 2026-07-26: an EnterNative is inserted DIRECTLY after
+   every in-VM call op (CallV/CachedCallV/CallValueV) inside a kept
+   run, pointing at a per-entry STUB (the head's tag + N5 cache
+   establishment, then a jump to the following op's offset) - a runtime
+   ret_pc (call pc + 1) LANDS on it, so an interpreted return re-enters
+   native mid-run with no lookup and no remap ambiguity (the inserted
+   pc is unmapped; bails still reach originals; loc_at(ret_pc-1) still
+   hits the call). Proven by g_jit_entry_resume (stub-bumped) + a
+   mutual-recursion-past-the-depth-cap jit: test. LEARNED: a
+   SELF-recursive CallV is run-EXCLUDED (island), so its following
+   run's head already sat at ret_pc - bench 10's resume was ALREADY
+   native (the first test draft used self-recursion and the counter
+   rightly stayed 0; the honest counter caught it). Measured: a mutual-
+   recursion depth bench -1.4% Ir; 10/11 flat; fib's apparent +2% was
+   isolated to __strcmp_avx2 ALIGNMENT (identical 698,762 call counts,
+   longer per-call path after relink - Ir-level layout noise, worth
+   knowing). INCREMENT 2 (handler-pc entries, the dual remap) next;
+   then native non-leaf calls (M5 proper: checked-return unwind +
+   growable native stack).
    (original analysis follows) The single biggest class:
    10_recursion_deep (94x), 11_closure_counter (76x), 63_closures (53x),
    76_funcval (26x), 08/09, every call-heavy program.

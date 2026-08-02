@@ -14819,6 +14819,66 @@ static bool jit_sync_inline_call()
 #endif
 }
 
+/* Per-pc entry points, increment 1 (post-call resume): g_jit_entry_resume
+ * is bumped by the ENTRY STUB itself, so a bump proves an interpreted
+ * return actually re-entered native code mid-run. Recursion PAST the sync
+ * depth cap (200) forces the calls interpreted (the fragment-inline guard
+ * falls to the slow helper, which caps too), so every return resumes at
+ * the inserted post-call EnterNative. Result asserted too. */
+static bool jit_post_call_entry()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long b0 = g_jit_entry_resume;
+    /* MUTUAL recursion, deliberately: a SELF-recursive CallV is excluded
+     * from runs (the run builder's self-gate), so it is an island whose
+     * FOLLOWING run's head EnterNative already sits at ret_pc - its resume
+     * was native before this increment (the first test draft used self-
+     * recursion and the counter rightly stayed 0). A non-self CallV sits
+     * INSIDE a run, which is exactly what the post-call entry serves. The
+     * +1 after the call keeps the resume mid-run (non-tail). */
+    if (!run({
+            "func ev(int n) { if (n < 1) { return 0; }",
+            "  var t = od(n - 1); return t + 1; }",
+            "func od(int n) { if (n < 1) { return 0; }",
+            "  var t = ev(n - 1); return t + 1; }",
+            "assert(ev(runtime(501)) == 501);" }))
+        return false;
+    if (g_jit_entry_resume <= b0) {
+        fprintf(stderr, "jit_post_call_entry: entry stub DID NOT RUN\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 /* Struct BAKED-LAYOUT fast paths (the 64_struct_create fix): the member
  * read and the planned ctor emit INLINE machine code whose execution is
  * proven by g_jit_member_fast / g_jit_ctor_fast - counters bumped by the
@@ -17649,6 +17709,8 @@ static const std::vector<extra_check> extra_checks =
       jit_struct_baked },
     { "jit: fragment-inline sync call runs (direct push + call rdx)",
       jit_sync_inline_call },
+    { "jit: post-call entry stub re-enters native on interpreted return",
+      jit_post_call_entry },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",
