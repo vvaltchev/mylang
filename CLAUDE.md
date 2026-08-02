@@ -859,6 +859,24 @@ again. Also: Init's non-container TypeErrorEx now uses the
 tree-walker's exact wording (byte parity; the VM's was ALSO loc-less
 in the compiled shape pre-stamp - both fixed). Corpus: 22 -> 20 kept
 runs; 66 +0.5% / 74 +2.4% Ir (the flag + the relink swing).
+**The #9 FUSIONS deletable (JumpUnlessElemInt / ForStepElemInt, same
+day):** both keep their inline flat fast paths, but the shared emit
+helpers (emit_elem_base_gate / emit_elem_int_read / emit_flat_int_tail)
+gained an optional DECLINE LIST - with one, a failing guard (non-array/
+slice/general/wrong-kind) and the out-of-range branch JUMP to a slow
+tier instead of bailing/`emit_raise`-ing (the raise's loc_at would
+resolve against a DELETED run's collapsed pcs). The tiers:
+`jit_elem_int_value` (the shared element read via
+vm_load_elem_int_core, conveying) for JumpUnlessElemInt and for
+ForStepElemInt's POST-STEP read declines, and the FULL-OP
+`jit_for_step_elem` (step + test + read, the interpreted body verbatim)
+for ForStepElemInt's GATE decline - because the gate must precede the
+step, so a re-entry there would DOUBLE-STEP. Both paths CONVERGE on the
+value in rax before the fused branch; the full-op tier returns
+0 = fell through / 1 = taken / 2 = threw. Corpus: 20 -> **16 kept
+runs**; 43_sieve +0.2%, 56_sieve_bool +0.3% (the extra converge jump),
+18/65 exactly neutral. The `jit_delete_originals` test's array-read
+case FLIPPED to asserting deletion (it pinned the old bail behavior).
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat

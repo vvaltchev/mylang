@@ -342,6 +342,16 @@ extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
 extern "C" int jit_load_elem_float(LValue *base_lv, int_type idx,
                                    LValue *dst) noexcept;
 
+/* #56: the #9 fusions' slow tiers - the shared element-value read (every
+ * inline-declined shape; conveys) and ForStepElemInt's full-op form (the
+ * gate declines BEFORE the step, so the helper does step+test+read). */
+extern int_type g_jit_elem_tmp;     /* the slow tiers' value scratch */
+extern "C" int jit_elem_int_value(LValue *base_lv, int_type idx,
+                                  int_type *out) noexcept;
+extern "C" int jit_for_step_elem(int_type i_slot, int_type bound, int aop_i,
+                                 int_type base_slot,
+                                 int_type elem_slot) noexcept;
+
 /* model-flip (nativize-ops): the native SliceV `dst = base[start:end]` via the
  * runtime Type::slice (COW-registered sub-view). base/start/end/dst are frame
  * slots (start/end == -1 -> none); frame via g_current_ctx. Only TypeErrorEx
