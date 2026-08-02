@@ -230,3 +230,59 @@ TU) so the pair can't drift; any format change bumps
 - A combined archive (multiple scripts per file).
 - mmap-zero-copy loading (the sized-read loader is plenty; revisit
   only if load time ever measures as a problem).
+
+## SIZE analysis (2026-07-29, measured on samples/)
+
+The v1 format is FAT: an image is 4-6x its source, and even `zstd -3`
+leaves it above the source's size. Where the bytes actually go (env
+`MYLANG_MYVSTATS=1` prints the per-section accounting the writer now
+records) - samples/shopping, 2700-byte source, 12847-byte image:
+
+| section                | bytes | share |
+|------------------------|-------|-------|
+| code (Instr records)   | 4741  | 37%   |
+| header + string table  | 3020  | 24% (of which the embedded SOURCE 2699) |
+| builtin_calls + call_sites | 1642 | 13% |
+| the mid pools (boxed_ops, literal_objs, catch_types, closure_defs, ...) | 1554 | 12% |
+| locs                   |  796  | 6%    |
+| consts + ref_slots     |  766  | 6%    |
+| descriptors            |  156  | 1%    |
+| slot_names (debug)     |   88  | 0.7%  |
+
+RANKED, MEASURED ROI (shopping numbers; the ratios hold across samples):
+
+1. **Compact instruction records - 4741 -> 895 bytes (-81% of code,
+   -30% of the file).** The record is 27 fixed bytes (op1 + aop1 +
+   opflags1 + target4 + target2 4 + pa8 + pb8) but the fields are mostly
+   absent or tiny: over the 147 instructions of shopping, target2 is
+   used in 75%, pa in 50%, pb in 37%, and almost every used value fits
+   in 1-2 bytes. A per-record presence/width byte + the narrowest of
+   1/2/4/8 bytes per present field measures 895 bytes. This is NOT
+   in-format compression (no dictionary, no entropy coding, O(1)
+   decode, still deterministic) - the format's no-compression decision
+   record does not cover it.
+2. **Delta + narrow `locs` - 796 -> 195 (-75%).** The table is
+   pc-ascending and lines/cols are small: pc as a delta, line as a delta,
+   col as one byte (with an escape).
+3. **Stop storing DERIVED pools - 931 bytes for shopping (7%).**
+   `boxed_ops` is built by `build_boxed_ops(chunk)` from the CODE + the
+   loc table alone (49 bytes/entry on disk, 19 entries here); `-vd`
+   already labels it "derived". Rebuild it at load, exactly as
+   `catch_uids` is already rebuilt from `catch_types`.
+4. **Narrow the Locs inside the caret pools (~10% more).** `ArgLoc` is
+   16 bytes (two Locs of two u32s) and every builtin_call / call_site /
+   member_key / chain step carries several; the same delta/narrow
+   treatment as (2) applies.
+5. **Drop `slot_names` unless asked (88 bytes, 0.7%).** Debug-only
+   (`-vd` labels); the design already called it the one optional
+   section. Cheapest change of the set.
+
+Projected combined (1+2+3+5): 12847 -> **~7.4 KB**; with (4) ~6 KB;
+with `--strip-source` on top ~**3.3-4.8 KB** for a 2700-byte source,
+which `zstd` then takes to ~1.0-1.3 KB.
+
+THE FRAMING POINT: with the source EMBEDDED (the default, because error
+carets need the text) an image contains the source PLUS the bytecode, so
+it can NEVER be smaller than the source. Size comparisons should use
+`--strip-source`; today that is already at parity compressed (2661 vs
+2700 for shopping) and the changes above put it well below.

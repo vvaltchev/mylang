@@ -82,6 +82,12 @@ void help()
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
          << endl;
     cout << "  -nr      Don't run, just validate" << endl;
+    cout << "  -c       Compile to a .myv bytecode file, then exit" << endl;
+    cout << "  -o FILE  Output path for -c (default: the source's .myv twin)"
+         << endl;
+    cout << "  --strip-source  With -c: omit the embedded source (errors"
+         << endl;
+    cout << "                  then print no source line / caret)" << endl;
     cout << "  -vm      Execute via the bytecode VM (the DEFAULT)." << endl;
     cout << "  -nj      Disable the native x86-64 AOT tier (also"
          << endl;
