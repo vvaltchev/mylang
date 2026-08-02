@@ -4030,6 +4030,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -4165,6 +4166,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -4242,6 +4244,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -6151,6 +6154,17 @@ static bool op_fully_native(const Instr &in)
      * Reraise stay kept: the handler dispatch JUMPS to their pcs.) */
     case OpCode::Throw:
         return true;
+    /* #56: the struct/unpack builders - their helpers run the shared
+     * interpreter cores (vm_do_emplace / construct_struct_from_values /
+     * the strict unpack) and every throw conveys with the exc-stamped
+     * caret (the per-field/arg carets ride their own pools); no bail. */
+    case OpCode::EmplaceStruct:
+    case OpCode::MakeStructArrayV:
+    case OpCode::UnpackElemInt:
+    case OpCode::UnpackElemFloat:
+    case OpCode::UnpackElemValue:
+    case OpCode::UnpackElemTargets:
+        return true;
     /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
      * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the
      * exc-stamp instead of the g_vm_jit_raise signal (whose exception got
@@ -6734,8 +6748,20 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 if (!op_never_exits(chunk.code[p]))
                     can_raise = true;
             if (can_raise) {
+                /* #56: the guard RELAXES to "distinct chains" - the hazard
+                 * is DIFFERENT chains merging onto the collapsed pc. If
+                 * every entry in the run names the SAME chain (the common
+                 * shape: one inlined body spliced as a unit), the merge is
+                 * harmless: all entries remap to the head EnterNative with
+                 * the same index, and inline_frame_at finds that one
+                 * correct chain. */
+                int32_t only = -1;
                 for (const auto &ie : chunk.inline_ctxs) {
-                    if (ie.pc >= b && ie.pc < en) {
+                    if (ie.pc < b || ie.pc >= en)
+                        continue;
+                    if (only < 0)
+                        only = ie.frame;
+                    else if (ie.frame != only) {
                         ok = false;
                         break;
                     }

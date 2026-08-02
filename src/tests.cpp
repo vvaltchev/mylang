@@ -15532,6 +15532,102 @@ static bool dyn_foreach_fast_shapes()
  * cross-frame catch (the boundary conveyance up the sync chain), and a
  * non-struct value (the builder's TypeErrorEx, conveyed + catchable).
  * g_jit_op_run[Throw] proves the native helper ran. */
+/* #56 (the final batch): the struct/unpack builders + the RELAXED
+ * inline-raise guard. Beyond results, this pins the guard's soundness
+ * boundary: an inlined chain spliced as a UNIT (one chain in the run)
+ * deletes and still renders its virtual frames, so a backtrace through
+ * it must be byte-identical to the tree-walker's. */
+static bool jit_final_batch_deletable()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run_bt = [](const std::vector<const char *> &lines,
+                     ExecEngine eng) -> std::string {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = eng;
+        std::string bt;
+        try {
+            if (eng == ExecEngine::Vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (const Exception &e) {
+            bt = format_backtrace(e);
+        }
+        g_exec_engine = saved;
+        return bt;
+    };
+    /* an INLINED chain inside a deletable run: the frames must survive */
+    const std::vector<const char *> inl = {
+        "func inner(x) => 10 / x;",
+        "func outer(x) => inner(x) + 1;",
+        "var z = [0];",
+        "print(outer(z[0]));" };
+    const std::string tw = run_bt(inl, ExecEngine::TreeWalk);
+    const std::string vm = run_bt(inl, ExecEngine::Vm);
+    if (tw.empty() || tw != vm) {
+        cout << "  tw:\n" << tw << "  vm:\n" << vm;
+        return false;
+    }
+    /* the builders: emplace, a flat struct-array literal, strict unpack */
+    const unsigned long e0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::EmplaceStruct)];
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : {
+            "struct P { int x; int y; }",
+            "var a = [];",
+            "for (var i = 0; i < 8; i++) { append(a, P(i, i * 2)); }",
+            "var lit = [P(1, 2), P(3, 4)];",
+            "var ps = [[1, 2], [3, 4], [5, 6]];",
+            "var s = 0;",
+            "foreach (u, v in ps) { s += u * v; }",
+            "assert(len(a) == 8); assert(a[7].y == 14);",
+            "assert(lit[1].x == 3); assert(s == 2 + 12 + 30);" }) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (...) {
+        ok = false;
+    }
+    g_exec_engine = saved;
+    if (!ok)
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::EmplaceStruct)] <= e0) {
+        fprintf(stderr, "jit_final_batch: EmplaceStruct DID NOT RUN\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_native_throw()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -18608,6 +18704,8 @@ static const std::vector<extra_check> extra_checks =
       jit_call_switch_protocol },
     { "jit: native throw (same-frame / cross-frame / non-struct) (#56)",
       jit_native_throw },
+    { "jit: struct/unpack builders + relaxed inline guard (#56 final)",
+      jit_final_batch_deletable },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",

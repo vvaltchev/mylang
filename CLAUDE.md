@@ -898,6 +898,21 @@ the handler dispatch JUMPS to their pcs (the catch-dispatch redesign is
 scoped in plans/model-flip.md, deferred). Corpus: 16 -> **15 kept
 runs**; 42_exceptions **-9.7%** Ir (the native raise replaces an
 interpreted dispatch per throw), 69 -0.9%, 10_recursion neutral.
+**The FINAL batch (same day) - 15 -> 7 kept runs corpus-wide:** the
+struct/unpack builders (EmplaceStruct, MakeStructArrayV, the four
+UnpackElem variants) join the convey family (exc-stamps + the
+catch(...) eptr nets; their per-field/arg carets already ride their own
+pools), and the INLINE-RAISE GUARD RELAXES from "the run has any
+inline_ctxs entry" to "the run has entries naming DIFFERENT chains":
+the hazard was distinct chains merging onto the collapsed pc, so a run
+whose entries all name the SAME chain (the common shape - one inlined
+body spliced as a unit) is safe, since every entry remaps to the head
+EnterNative with that one correct index. Ir neutral (58/20/75/09
++-0.01%, 77 +0.23%); the backtrace THROUGH a deleted inlined chain is
+pinned byte-identical (jit_final_batch_deletable). **Everything that
+remains is the deferred catch dispatch** - 5 CatchTest + 4 Reraise +
+1 EndFinally (its cold reraise path bails) + 2 runs whose inline
+chains genuinely differ.
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat
