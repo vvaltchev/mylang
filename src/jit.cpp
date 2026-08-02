@@ -81,6 +81,82 @@ bool g_jit_enabled = false;
  * gcc has no such value, so disable all of UBSan for this one-line
  * helper (no_sanitize_undefined). Both are no-ops without the
  * sanitizer. */
+/*
+ * M5a - THE DEDICATED NATIVE STACK (plans/native-gap-roadmap.md /
+ * plans/model-flip.md M5). Each native call level (the sync-inline
+ * `call rdx`, the #55 direct call) nests a machine frame; on the C stack
+ * that forced the tiny sync depth cap (200). Fragments now execute on a
+ * RESERVED 1GB MAP_NORESERVE region (virtual only - lazy commit means RSS
+ * = pages actually touched; a PROT_NONE guard page at the LOW end
+ * backstops the checked cap), switched to at the OUTERMOST jit_enter
+ * (g_on_nstack: helper-called C++ and its jit_enter re-entries stay on
+ * the native stack; the dispatch loop and everything outside run on the
+ * C stack as before). With the stack armed the sync depth cap is raised
+ * to ~500k (the per-level cost is a few hundred bytes: the caller's
+ * prologue pushes + the call ra + the push-helper's transient frame; the
+ * 32MB slack absorbs one full interpreted excursion's C++ frames), so
+ * deep recursion stays native instead of falling interpreted at 200 -
+ * and the CallV SELF-gate lifts (op_run_eligible), since its rationale
+ * was exactly the cap round-trip pathology.
+ *
+ * OFF under ASan (running C++ on a custom stack trips its stack
+ * machinery - the PoolAlloc pass-through philosophy: the debug lanes
+ * keep their bug-finding power) and via MYLANG_NATIVE_STACK=0 (the
+ * same-binary A/B lever, like MYLANG_JIT=0). Off means the old cap and
+ * the old self-gate - behavior identical to pre-M5a.
+ */
+#if ML_JIT_SUPPORTED
+#if defined(__SANITIZE_ADDRESS__)
+#  define ML_NSTACK_OFF 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define ML_NSTACK_OFF 1
+#  endif
+#endif
+/* ONE variable carries both states (the per-element VmInvoker re-entry
+ * pays this check per callback, so it is kept to one load + two stores):
+ * null = not armed OR currently ACTIVE (either way: plain call on the
+ * current stack); else = the armed, inactive stack's top. */
+static char *g_nstack_cur = nullptr;
+static char *g_nstack_top = nullptr;    /* the armed top (a baked imm in
+                                         * emitted site switches) */
+static void *g_nstack_saved_rsp = nullptr;  /* the OUTERMOST emitted site's
+                                             * C rsp (single-threaded; nested
+                                             * sites are plain by cur==null) */
+
+/* M5a: PAUSE the native stack for a builtin->callback ELEMENT LOOP
+ * (VmInvoker): the per-fragment-entry stack switch measured ~1% on the
+ * map/filter/sort benches, and a per-element callee never needs the deep
+ * stack. Paused entries run plainly on the C stack; correctness of the
+ * baked 500k guard is restored by the AUTHORITATIVE runtime cap check in
+ * jit_sync_push_common + jit_call_sync* (the cap is lowered to the
+ * C-stack-safe 200 for the pause's duration - VmInvoker's ctor/dtor
+ * bracket the whole loop, ONE flip per loop). */
+void jit_native_stack_init()
+{
+    static bool done = false;
+    if (done)
+        return;
+    done = true;
+#ifndef ML_NSTACK_OFF
+    const char *e = getenv("MYLANG_NATIVE_STACK");
+    if (e && e[0] == '0' && e[1] == 0)
+        return;
+    const size_t RESERVE = 1ull << 30;                    /* 1GB virtual */
+    void *m = mmap(nullptr, RESERVE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED)
+        return;                       /* no stack -> old cap, old gate */
+    mprotect(m, 4096, PROT_NONE);     /* low guard (the stack grows DOWN) */
+    g_nstack_top = static_cast<char *>(m) + RESERVE;
+    g_nstack_cur = g_nstack_top;
+    jit_set_sync_depth_cap(500000);
+#endif
+}
+#else
+void jit_native_stack_init() { }
+#endif
+
 #if defined(__clang__)
 __attribute__((no_sanitize("function")))
 #elif defined(__GNUC__)
@@ -88,7 +164,50 @@ __attribute__((no_sanitize_undefined))
 #endif
 size_t jit_enter(const void *frag, void *slots)
 {
+    /* PLAIN, byte-identical to pre-M5a - this runs per FRAGMENT ENTRY
+     * (millions per second in a callback loop; even a 3-instruction
+     * conditional here measured ~1% on map/filter/sort). The native-
+     * stack switch lives where the NESTING happens instead: the emitted
+     * sync call site (outermost-only, see emit_sync_call_inline) and
+     * jit_enter_deep (the helper path's direct entry, below). */
     typedef size_t (*NativeFrag)(void *);
+    return reinterpret_cast<NativeFrag>(const_cast<void *>(frag))(slots);
+}
+
+/* The switching entry for jit_call_sync_core's DIRECT callee entry (the
+ * helper path - a coerced-bind/cached callee): each core level brackets
+ * its own switch; nested levels see the nulled g_nstack_cur and stay
+ * plain (already on the native stack). r12 (callee-saved: preserved by
+ * every C++ helper a fragment calls; never used by the emitter) carries
+ * the C rsp across; mmap page alignment + the `call`'s ra push give the
+ * fragment the rsp % 16 == 8 entry contract. */
+#if defined(__clang__)
+__attribute__((no_sanitize("function")))
+#elif defined(__GNUC__)
+__attribute__((no_sanitize_undefined))
+#endif
+size_t jit_enter_deep(const void *frag, void *slots)
+{
+    typedef size_t (*NativeFrag)(void *);
+#if ML_JIT_SUPPORTED
+    if (char *top = g_nstack_cur) {
+        g_nstack_cur = nullptr;
+        size_t r;
+        asm volatile(
+            "movq %%rsp, %%r12\n\t"
+            "movq %2, %%rsp\n\t"
+            "callq *%1\n\t"
+            "movq %%r12, %%rsp\n\t"
+            : "=a"(r)
+            : "r"(frag), "r"(top), "D"(slots)
+            : "r12", "rcx", "rdx", "rsi", "r8", "r9", "r10", "r11",
+              "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6",
+              "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13",
+              "xmm14", "xmm15", "memory", "cc");
+        g_nstack_cur = top;
+        return r;
+    }
+#endif
     return reinterpret_cast<NativeFrag>(const_cast<void *>(frag))(slots);
 }
 
@@ -1468,6 +1587,35 @@ static void emit_sync_call(Emitter &e, const Chunk &ck, const Instr &in,
  * must see the RELOADED cache regs, the bracket discipline the plain
  * helper emit established).
  */
+/* M5a site-switch halves (see the use in emit_sync_call_inline). PRE:
+ * rax/rdx hold the push's {win, entry} and rdi the callee window - only
+ * rcx/r9 are free. cur == null -> jump to the plain path (returned fixup);
+ * else mark active, save rsp, switch to the baked top. POST: restore rsp
+ * + re-arm cur (runs on the outermost path only). */
+static size_t emit_nstack_switch_pre(Emitter &e)
+{
+    e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_cur));
+    e.u8(0x48); e.u8(0x83); e.u8(0x39); e.u8(0x00);   /* cmp qword [rcx],0 */
+    const size_t j_plain = e.j32(0x74);               /* je plain */
+    /* mov qword [rcx], 0  (cur = null: active) */
+    e.u8(0x48); e.u8(0xC7); e.u8(0x01); e.u32(0);
+    e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_saved_rsp));
+    e.u8(0x48); e.u8(0x89); e.u8(0x21);               /* mov [rcx], rsp */
+    e.movabs(RCX, reinterpret_cast<uint64_t>(g_nstack_top));
+    e.u8(0x48); e.u8(0x89); e.u8(0xCC);               /* mov rsp, rcx */
+    return j_plain;
+}
+
+static void emit_nstack_switch_post(Emitter &e)
+{
+    e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_saved_rsp));
+    e.u8(0x48); e.u8(0x8B); e.u8(0x21);               /* mov rsp, [rcx] */
+    e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_cur));
+    /* cur = top (re-arm): movabs r9, top; mov [rcx], r9 */
+    e.movabs_r9(reinterpret_cast<uint64_t>(g_nstack_top));
+    e.u8(0x4C); e.u8(0x89); e.u8(0x09);               /* mov [rcx], r9 */
+}
+
 static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                   const Instr &in, uint32_t pc,
                                   size_t old_pc, const void *push_helper,
@@ -1506,7 +1654,22 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.u8(0x48); e.u8(0xFF); e.u8(0x01);            /* inc qword [rcx] */
 #endif
     e.mov_rr(RDI, RAX);
-    e.u8(0xFF); e.u8(0xD2);                        /* call rdx */
+    /* THE OUTERMOST-ONLY STACK SWITCH (M5a): nesting happens HERE (the
+     * direct callee call), so the native-stack switch lives here - not in
+     * jit_enter, whose per-fragment-entry conditional measured ~1% on the
+     * callback benches. cur == null (not armed, or already active) ->
+     * plain call; else switch rsp to the baked top around the call
+     * (nested sites see null and stay plain; the restore runs BEFORE the
+     * sentinel branch, so the exception path unwinds it too). */
+    {
+        const size_t j_plain = emit_nstack_switch_pre(e);
+        e.u8(0xFF); e.u8(0xD2);                    /* call rdx (switched) */
+        emit_nstack_switch_post(e);
+        const size_t j_over = e.j32(0xEB);
+        e.patch32_here(j_plain);
+        e.u8(0xFF); e.u8(0xD2);                    /* call rdx (plain) */
+        e.patch32_here(j_over);
+    }
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x09);                        /* dec dword [rcx] */
     /* sentinel? (JIT_RET_SENTINEL == (size_t)-1) */
@@ -5247,7 +5410,14 @@ static bool op_run_eligible(const Instr &in, const JitCtx *jc)
                 && in.target2 >= 0
                 && static_cast<size_t>(in.target2) < jc->slot_desc->size()
                 && (*jc->slot_desc)[in.target2] == jc->caller_desc)
-            return false;                  /* direct self-recursion */
+            /* M5a: the exclusion's rationale was the CAP round-trip
+             * pathology (every level past 200 paid enter->bail->exit->
+             * re-dispatch, +14% on 10) - with the native stack armed the
+             * cap is ~500k and unreachable in practice, so direct
+             * self-recursion becomes a native fragment self-call. The
+             * old gate stays when the stack is off (ASan / kill switch /
+             * mmap failure). */
+            return jit_sync_depth_cap() > 1000;
         return true;
     }
     if (in.op == OpCode::CachedCallV || in.op == OpCode::CallValueV)
@@ -5626,6 +5796,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
 
 void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 {
+    jit_native_stack_init();   /* M5a: arm the stack + raise the cap BEFORE
+                                * any guard bakes jit_sync_depth_cap() */
     if (!g_jit_enabled || chunk.code.empty())
         return;
 

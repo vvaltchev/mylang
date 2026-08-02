@@ -14854,6 +14854,14 @@ static bool jit_post_call_entry()
         g_exec_engine = saved;
         return ok;
     };
+    /* M5a raised the sync depth cap to ~500k (the native stack), so
+     * depth-501 recursion no longer falls interpreted on its own - PIN
+     * the cap to the old 200 for this test (the chunks compile inside
+     * run(), so the emitted guards bake the pinned value; restored
+     * below). The test's subject is the interpreted-resume entry path,
+     * which needs interpreted calls to exercise. */
+    const int saved_cap = jit_sync_depth_cap();
+    jit_set_sync_depth_cap(200);
     const unsigned long b0 = g_jit_entry_resume;
     /* MUTUAL recursion, deliberately: a SELF-recursive CallV is excluded
      * from runs (the run builder's self-gate), so it is an island whose
@@ -14893,6 +14901,100 @@ static bool jit_post_call_entry()
     if (g_jit_entry_resume < b1 + 3) {
         fprintf(stderr, "jit_post_call_entry: branch-target entries did "
                         "not re-enter per iteration\n");
+        jit_set_sync_depth_cap(saved_cap);
+        return false;
+    }
+    jit_set_sync_depth_cap(saved_cap);
+    return true;
+#else
+    return true;
+#endif
+}
+
+/* M5a (the dedicated native stack): with the sync depth cap raised to
+ * ~500k and the CallV self-gate lifted, DEEP self- and mutual recursion
+ * runs as native fragment self-calls on the reserved stack - proven by
+ * g_jit_sync_inline growing by >= the recursion depth (the counter is
+ * bumped by the EMITTED code before each direct `call rdx`). Skipped
+ * when the stack is not armed (ASan / kill switch / mmap failure - the
+ * old cap keeps the old behavior, covered by jit_post_call_entry). */
+static bool jit_native_stack_deep()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled || jit_sync_depth_cap() <= 1000)
+        return true;                   /* stack not armed - nothing to prove */
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    /* UNTYPED params: the template instance binds fast_bind (the plain
+     * copy loop), so the calls take the INLINE fast path - the counter
+     * bumps per level. An explicitly-TYPED param (int n) coerces at bind,
+     * declining the inline push to the jit_call_sync helper - still
+     * native on the big stack (asserted below via g_jit_op_run[CallV],
+     * which BOTH the helper and the push bump). */
+    /* LITERAL args (bench 10's exact pipeline: a const-arg spec clone
+     * with unannotated -> fast_bind params). runtime(5000) would make
+     * the arg DYN -> a dyn template instance -> DynRequiredEx on the
+     * body local; a literal spec-clones instead. The recursive-pure
+     * exclusion keeps the call a real runtime recursion (never eagerly
+     * folded). */
+    const unsigned long b0 = g_jit_sync_inline;
+    if (!run({
+            "func s(n) { if (n < 1) { return 0; }",
+            "  var t = s(n - 1); return t + n; }",
+            "assert(s(5000) == 12502500);" }))
+        return false;
+    if (g_jit_sync_inline < b0 + 5000) {
+        fprintf(stderr, "jit_native_stack_deep: self-recursion did not run "
+                        "native (%lu inline calls)\n",
+                g_jit_sync_inline - b0);
+        return false;
+    }
+    const unsigned long b1 = g_jit_sync_inline;
+    if (!run({
+            "func ev(n) { if (n < 1) { return 0; }",
+            "  var t = od(n - 1); return t + 1; }",
+            "func od(n) { if (n < 1) { return 0; }",
+            "  var t = ev(n - 1); return t + 1; }",
+            "assert(ev(5000) == 5000);" }))
+        return false;
+    if (g_jit_sync_inline < b1 + 5000) {
+        fprintf(stderr, "jit_native_stack_deep: mutual recursion did not "
+                        "run native\n");
+        return false;
+    }
+    /* the TYPED-param shape: helper-path native depth (coerce bind) */
+    const unsigned long c0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::CallV)];
+    if (!run({
+            "func st(int n) { if (n < 1) { return 0; }",
+            "  var t = st(n - 1); return t + n; }",
+            "assert(st(3000) == 4501500);" }))
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::CallV)] < c0 + 3000) {
+        fprintf(stderr, "jit_native_stack_deep: typed-param recursion did "
+                        "not stay on the sync path\n");
         return false;
     }
     return true;
@@ -17733,6 +17835,8 @@ static const std::vector<extra_check> extra_checks =
       jit_sync_inline_call },
     { "jit: post-call entry stub re-enters native on interpreted return",
       jit_post_call_entry },
+    { "jit: deep recursion runs native on the dedicated stack (M5a)",
+      jit_native_stack_deep },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",

@@ -4732,7 +4732,12 @@ vm_cache_probe_vals(EvalContext &ctx, const FuncDescriptor *d,
  * rides g_vm_jit_eptr.
  */
 static int g_jit_sync_depth = 0;
-static constexpr int JIT_SYNC_DEPTH_CAP = 200;
+/* M5a: 200 = the C-stack-safe cap; jit_native_stack_init raises it to
+ * ~500k when the dedicated native stack is armed (jit.cpp). A VARIABLE:
+ * the emitted guards bake it at chunk-compile time (the init runs before
+ * any emission), the helper wrappers read it at runtime, and a test can
+ * pin it low to exercise the interpreted-fallback paths. */
+static int g_jit_sync_cap = 200;
 
 /* The SENTINEL STOP CHUNK: one ExitBlock at the resume pc. A sync frame's
  * rec.ret_pc = 1 (vm_frame_setup's ret_pc+1 with ret_pc = 0), so every
@@ -4861,6 +4866,12 @@ jit_sync_push_common(FuncObject &fo, int_type argbase, int_type nargs,
 {
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
+    /* Runtime cap check: the emitted inline guard bakes the cap at
+     * chunk-compile time (a fast filter); this is the AUTHORITATIVE one -
+     * a test pins the cap below baked values (jit_set_sync_depth_cap),
+     * and any future context-varied cap is enforced here. */
+    if (g_jit_sync_depth >= g_jit_sync_cap)
+        return { nullptr, nullptr };
     const FuncDescriptor *d = fo.func;
     const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
     if (!cck || cck->sync_entry_off < 0 || !d->fast_bind)
@@ -4931,7 +4942,12 @@ void *jit_addr_sync_depth()
 
 int jit_sync_depth_cap()
 {
-    return JIT_SYNC_DEPTH_CAP;
+    return g_jit_sync_cap;
+}
+
+void jit_set_sync_depth_cap(int cap)
+{
+    g_jit_sync_cap = cap;
 }
 
 static int
@@ -4981,9 +4997,9 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
      * helper it calls conveys), so the entry sits OUTSIDE the try. */
     if (cck->sync_entry_off >= 0) {
         const size_t r =
-            jit_enter(static_cast<const char *>(cck->native.base)
-                          + cck->sync_entry_off,
-                      w->slots);
+            jit_enter_deep(static_cast<const char *>(cck->native.base)
+                               + cck->sync_entry_off,
+                           w->slots);
         g_jit_sync_depth--;
         if (r == JIT_RET_SENTINEL)     /* native ReturnV: frame popped,
                                         * dst written - done */
@@ -5041,7 +5057,7 @@ extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
 {
     ML_JIT_OP_RAN(CallV);
     EvalContext *ctx = g_current_ctx;
-    if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
+    if (g_jit_sync_depth >= g_jit_sync_cap)
         return 1;                          /* deep tail -> interpreted */
     if (!ctx->gfuncs->defined[callee_slot])
         return 1;                          /* undefined -> interpreted throw */
@@ -5059,7 +5075,7 @@ extern "C" int jit_call_sync_cached(int_type callee_slot, int_type argbase,
 {
     ML_JIT_OP_RAN(CachedCallV);
     EvalContext *ctx = g_current_ctx;
-    if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
+    if (g_jit_sync_depth >= g_jit_sync_cap)
         return 1;
     if (!ctx->gfuncs->defined[callee_slot])
         return 1;
@@ -5077,7 +5093,7 @@ extern "C" int jit_call_sync_value(int_type callee_temp, int_type argbase,
 {
     ML_JIT_OP_RAN(CallValueV);
     EvalContext *ctx = g_current_ctx;
-    if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
+    if (g_jit_sync_depth >= g_jit_sync_cap)
         return 1;
     /* the callee VALUE was evaluated into a temp slot (CallValueV's
      * target2); a dyn-laundered non-func bails to the interpreted op's
@@ -5166,7 +5182,7 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
     };
 
     if (callee.is<intrusive_ptr<FuncObject>>()) {
-        if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
+        if (g_jit_sync_depth >= g_jit_sync_cap)
             return 1;                       /* deep tail -> interpreted */
         if (n) {
             try {

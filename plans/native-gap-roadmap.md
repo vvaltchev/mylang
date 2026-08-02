@@ -104,8 +104,38 @@ those classes in impact order.
    draft self-defeated - auto-pure + const arg folded the WHOLE loop at
    compile time, unwind Ir identical on both sides, counter rightly 0 -
    use runtime(n) in exception benches); 42_exceptions -4.2% Ir; 69 /
-   pure loops flat. Next: native non-leaf calls (M5 proper:
-   checked-return unwind + growable native stack); interior entries
+   pure loops flat. M5a (THE DEDICATED NATIVE STACK) LANDED
+   2026-07-27: a 1GB MAP_NORESERVE reservation (lazy commit; PROT_NONE
+   guard page at the LOW end) hosts the native call nesting; the sync
+   depth cap became a VARIABLE (g_jit_sync_cap: 200 unarmed, 500k
+   armed; emitted guards bake it - the init runs before any emission -
+   and jit_sync_push_common's runtime check is AUTHORITATIVE, which
+   also lets tests pin it low); the CallV SELF-gate lifts when armed
+   (its rationale was the cap round-trip pathology), so self-recursion
+   is a native fragment self-call. THE SWITCH PLACEMENT WAR (three
+   designs measured): (1) a conditional switch in jit_enter = ~3 Ir
+   per FRAGMENT ENTRY = -1% on the callback benches (34/35, millions
+   of entries); (2) + a VmInvoker pause did NOT recover it (the check
+   itself is the cost); (3) FINAL: jit_enter stays byte-identical-
+   plain, the switch lives at the SYNC CALL SITE (emitted, outermost-
+   only: cur == null -> plain nested call; else save rsp / switch to
+   the baked top / restore around `call rdx` - the restore precedes
+   the sentinel branch so the exception path unwinds it) +
+   jit_enter_deep for the helper path's direct entry. ASan =
+   pass-through (a custom stack trips its machinery; the PoolAlloc
+   philosophy); MYLANG_NATIVE_STACK=0 = the same-binary kill switch.
+   Measured (Ir vs pre-M5a): 34/35/09/12 FLAT, 10 +2.7%, 11 -1.9%
+   (its top-of-chain calls each pay the ~15-instr switched path;
+   mitigations recorded: lever 2's direct invoke entry, or an
+   ~11-instr switch via a single-base global block). Deep recursion
+   (100k) native end to end; overflow stays catchable
+   StackOverflowEx; counter-proven (jit_native_stack_deep: >= depth
+   inline-call bumps, self AND mutual, + the typed-param helper-path
+   assert). M5a is the ENABLER: the per-call payoff is M5b (the
+   fully-inline record push - the push helper measured ~equal to the
+   old interpreted lean path, which is why 10 gained only ~3%); then
+   M5c (CachedCallV fast path). The "checked-return unwind" half of
+   M5 proper PRE-EXISTED (the sync sentinel protocol); interior entries
    also unlock RELAXING the single-entry deletion constraint (an
    external interior branch can enter a stub instead of blocking
    deletion) - recorded for M6.

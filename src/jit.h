@@ -172,6 +172,9 @@ extern "C" JitSyncPush jit_sync_push_value(int_type callee_temp,
 extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept;
 void *jit_addr_sync_depth();
 int jit_sync_depth_cap();
+void jit_set_sync_depth_cap(int cap);   /* M5a: raised when the native
+                                         * stack arms; tests pin it low */
+void jit_native_stack_init();
 
 extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
                              int_type nargs, int_type dst,
@@ -210,6 +213,9 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk);
  * here, so the arg is void* (the real ABI is size_t(LValue*)).
  */
 size_t jit_enter(const void *frag, void *slots);
+/* the SWITCHING entry (M5a): jit_call_sync_core's direct callee entry -
+ * brackets its level's native-stack switch; plain when already active */
+size_t jit_enter_deep(const void *frag, void *slots);
 
 /* Approach A: a native fragment that hits a proven EXCEPTION condition
  * (a[i] out of bounds, a negative shift count) does NOT re-interpret the
