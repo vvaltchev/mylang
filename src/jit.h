@@ -203,8 +203,8 @@ struct JitPushLayout {
 };
 void jit_fill_push_layout(JitPushLayout *out);
 
-extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
-                             int_type nargs, int_type dst,
+extern "C" int jit_call_sync(int_type callee_slot, int_type ab_n,
+                             int_type resume_pc, int_type dst,
                              int_type site_packed,
                              const void *lep) noexcept;
 extern "C" int jit_call_sync_cached(int_type callee_slot, int_type argbase,
@@ -681,6 +681,8 @@ extern unsigned long g_jit_op_run[];
  * prove the inline path ran, not just the slow helper. */
 extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
 extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
+extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
+extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
 extern "C" unsigned long g_jit_sync_inline;
 extern "C" unsigned long g_jit_entry_resume;
 #endif

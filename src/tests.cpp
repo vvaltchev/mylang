@@ -15515,6 +15515,74 @@ static bool dyn_foreach_fast_shapes()
  * slow tier (which bumps g_jit_op_run), so the op never re-interprets
  * and its runs' originals are deletable. The counter growth proves the
  * SLOW tier executed for the declined shapes. */
+/* #56 step 3: the SWITCH protocol - past the depth cap a sync call is
+ * PUSHED interpreted-flat (status 3 -> the JIT_RET_SWITCH fragment
+ * return) and the record's baked resume re-enters the caller fragment at
+ * its post-call stub. g_jit_sync_switch is bumped by the switch push
+ * itself, so growth proves the protocol ran; the deep result + a throw
+ * from BELOW the cap prove the record chain + unwind are sound. */
+static bool jit_call_switch_protocol()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const int saved_cap = jit_sync_depth_cap();
+    jit_set_sync_depth_cap(4);
+    const unsigned long s0 = g_jit_sync_switch;
+    /* MUTUAL recursion (a self-recursive CallV is run-excluded), depth 60
+     * >> cap 4: the first levels run native sync, then every deeper call
+     * SWITCHES; the result proves the full chain, the resume stubs prove
+     * the caller fragments re-entered. */
+    bool ok = run({
+        "func aa(int n) { if (n < 1) { return 0; } return bb(n - 1) + 1; }",
+        "func bb(int n) { if (n < 1) { return 0; } return aa(n - 1) + 1; }",
+        "assert(aa(runtime(60)) == 60);" });
+    if (ok && g_jit_sync_switch <= s0) {
+        fprintf(stderr,
+                "jit_call_switch_protocol: the SWITCH push DID NOT RUN\n");
+        ok = false;
+    }
+    /* a THROW from far below the cap: the walk crosses switch-pushed
+     * records - the caret and catch must be byte-identical semantics */
+    if (ok)
+        ok = run({
+            "func ca(int n) { if (n < 1) { return 100 / n; }",
+            "  return cb(n - 1); }",
+            "func cb(int n) { return ca(n - 1); }",
+            "var got = 0;",
+            "try { ca(runtime(50)); } catch (DivisionByZeroEx) { got = 7; }",
+            "assert(got == 7);" });
+    jit_set_sync_depth_cap(saved_cap);
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_load_elem_slow_tier()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -17933,15 +18001,17 @@ static bool vm_disasm_native_call()
         const Block *b = dynamic_cast<const Block *>(root.get());
         if (b) {
             const std::string d = disassemble_program(b);
-            /* nc's OWN section: the native call shows as enter.nat, and the
-             * interpreted call.v survives (non-deletable). */
+            /* nc's OWN section: the native call shows as enter.nat and -
+             * #56 step 4 - the interpreted call.v is DELETED (the sync
+             * call's every decline conveys/switches; the post-call resume
+             * stub is a second enter.nat). */
             const size_t p = d.find("; ===== func nc");
             if (p != std::string::npos) {
                 const size_t e = d.find("; =====", p + 20);
                 const std::string sec = d.substr(
                     p, e == std::string::npos ? std::string::npos : e - p);
                 ok = sec.find("enter.nat") != std::string::npos
-                    && sec.find("call.v") != std::string::npos;
+                    && sec.find("call.v") == std::string::npos;
             }
         }
     } catch (...) {
@@ -18471,6 +18541,8 @@ static const std::vector<extra_check> extra_checks =
       jit_len_ord },
     { "jit: LoadElem slow tier serves declined shapes (#56 inc 1)",
       jit_load_elem_slow_tier },
+    { "jit: capped sync calls SWITCH interpreted-flat (#56 step 3)",
+      jit_call_switch_protocol },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",

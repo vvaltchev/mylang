@@ -1523,3 +1523,19 @@ backtrace under the VM while the tree-walker prints frames - the plain-
 exception unwind never captured in-VM record frames; a #75-class
 follow-up, untracked). 10_recursion_deep Ir neutral (the lep movabs is
 cold-path only).
+
+## Calls steps 2-4 LANDED (2026-07-28)
+
+Step 2: jit_sync_boundary_call (the chunk-less callee runs the
+interpreted tail in the helper; lazy vm_func_chunk first). Step 3: the
+SWITCH protocol exactly as designed (JIT_RET_SWITCH=-3;
+jit_call_sync_switch pushes with ret_pc = the baked post-call stub pc;
+EnterNative/inline-site/core/invoke consumers; depth untouched - flat
+continuation; VmCallRec::call_site_packed for collapsed-loc backtraces).
+Step 4: op_fully_native += the calls; stubs materialize inside deleted
+spans. Corpus 41 -> 27 kept runs; call benches Ir flat-to--0.4%. The
+switch is execution-proven at cap 4 (mutual recursion depth 60 + a
+throw from depth 50 below the cap - g_jit_sync_switch bumps, catch
+byte-identical). Remaining blockers: the exception trio (12),
+StructFieldAddInt (5), MultiUnpackV (3), LoadMember guard-miss (3),
+JumpUnlessElemInt (3), MapFilterV (2), inline-raise guard (5).
