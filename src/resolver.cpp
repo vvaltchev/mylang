@@ -2795,6 +2795,11 @@ private:
         auto lit = make_unique<LiteralInt>(k);
         lit->th = TypeHint::i;
         auto mul = make_unique<Expr03>();
+        /* carry the TERM's loc + inlined-at chain onto the synthetic node -
+         * a rebuilt chain with EMPTY base fields loses the caret AND the
+         * virtual backtrace frames for any error thrown through it (the
+         * tw-vs-VM backtrace divergence, task #75) */
+        e->copy_base_fields(*mul);
         mul->th = TypeHint::i;
         mul->elems.emplace_back(Op::invalid, std::move(lit));
         mul->elems.emplace_back(Op::times, std::move(e));
@@ -2888,6 +2893,9 @@ private:
             if (out[i].first > 0) { base_i = static_cast<int>(i); break; }
 
         auto chain = make_unique<Expr04>();
+        /* base fields from the ORIGINAL chain (loc + inline_ctx - see the
+         * make_int_mul note; slot is still the original node here) */
+        slot->copy_base_fields(*chain);
         chain->th = TypeHint::i;
         if (base_i < 0) {                    /* all negative: 0 - a - b ... */
             auto z = make_unique<LiteralInt>(0);
@@ -2955,6 +2963,7 @@ private:
 
         /* rebuild factor0 (* factor1 ...) (* product) */
         auto chain = make_unique<Expr03>();
+        slot->copy_base_fields(*chain);      /* loc + inline_ctx (see above) */
         chain->th = TypeHint::i;
         chain->elems.emplace_back(Op::invalid, std::move(factors[0]));
         for (size_t i = 1; i < factors.size(); i++)

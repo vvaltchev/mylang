@@ -12261,6 +12261,71 @@ vm_inlined_backtrace_parity()
 }
 
 /*
+ * Task #75: the TYPED-chain twin of the parity check above - the throw
+ * happens inside an M8 TypedScalarExpr spliced from TWO inline levels
+ * (inner into outer, outer into main) whose enclosing `+` chain the
+ * int-algebra fold REBUILDS. Pins the two fixed bugs: the rebuilt chain
+ * must carry the original's loc + inlined-at chain (fold_addsub/fold_mul/
+ * make_int_mul copy_base_fields), and the typed eval path - which
+ * bypasses Construct::eval - must flush the innermost node's chain
+ * (TypedScalarExpr::eval_int/eval_float wrappers). Both engines must
+ * render the identical [inner$0, outer$0, main] backtrace.
+ */
+static bool
+typed_inlined_backtrace_parity()
+{
+    const char *src_lines[] = {
+        "func inner(x) => 10 / x;",
+        "func outer(x) => inner(x) + 1;",
+        "var z = [0];",
+        "print(outer(z[0]));",
+    };
+
+    auto run = [&](ExecEngine eng) -> std::string {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < sizeof(src_lines) / sizeof(src_lines[0]); i++) {
+            if (i)
+                src += '\n';
+            src += src_lines[i];
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = eng;
+        std::string bt;
+        try {
+            if (eng == ExecEngine::Vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (const Exception &e) {
+            bt = format_backtrace(e);
+        }
+        g_exec_engine = saved;
+        return bt;
+    };
+
+    const std::string tw = run(ExecEngine::TreeWalk);
+    const std::string vm = run(ExecEngine::Vm);
+    const auto npos = std::string::npos;
+
+    bool ok = !tw.empty() && tw == vm
+              && tw.find("inner") != npos
+              && tw.find("outer") != npos;
+    if (!ok) {
+        cout << "  tw:\n" << tw << "  vm:\n" << vm;
+    }
+    return ok;
+}
+
+/*
  * AST deep-clone (Construct::clone): cloning a parsed + resolved program must
  * produce a structurally identical tree (same serialization) that is a separate
  * object graph and still evaluates correctly on its own (its internal assert
@@ -18469,6 +18534,8 @@ static const std::vector<extra_check> extra_checks =
     { "backtrace: inlined virtual frames", backtrace_inline_frames },
     { "backtrace: VM inlined-frame parity (Inc 4)",
       vm_inlined_backtrace_parity },
+    { "backtrace: typed-chain inlined-frame parity (#75)",
+      typed_inlined_backtrace_parity },
     { "static_type: ground caching & with_opt", static_type_ground_caching },
     { "static_type: assignable rules", static_type_assignable_rules },
     { "static_type: join (LUB) rules", static_type_join_rules },

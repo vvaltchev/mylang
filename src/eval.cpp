@@ -2703,7 +2703,7 @@ static inline int_type typed_cmp(Op op, T a, T b)
     }
 }
 
-int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
+int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
 {
     switch (cat) {
 
@@ -2717,7 +2717,7 @@ int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
 
         case Cat::arith: {
             if (kind == TypeHint::f)
-                return static_cast<int_type>(eval_float(ctx));
+                return static_cast<int_type>(eval_float_body(ctx));
             int_type acc = elems[0].second->eval_int(ctx);
             for (size_t i = 1; i < elems.size(); i++) {
                 const int_type r = elems[i].second->eval_int(ctx);
@@ -2766,7 +2766,7 @@ int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
     return 0;
 }
 
-float_type TypedScalarExpr::eval_float(EvalContext *ctx) const
+float_type TypedScalarExpr::eval_float_body(EvalContext *ctx) const
 {
     switch (cat) {
 
@@ -2794,7 +2794,43 @@ float_type TypedScalarExpr::eval_float(EvalContext *ctx) const
         }
 
         default:   /* cmp / logical / lnot yield int */
-            return static_cast<float_type>(eval_int(ctx));
+            return static_cast<float_type>(eval_int_body(ctx));
+    }
+}
+
+/* Task #75: the typed evals bypass Construct::eval, so a node spliced from
+ * an inlined body must flush its own "inlined-at" chain when an exception
+ * unwinds through it - the innermost typed node on the unwind path wins
+ * (exactly Construct::eval's protocol, keyed off inline_origin_emitted).
+ * A chain-less node (the overwhelmingly common case) takes the direct
+ * call - no try scaffolding on its path. */
+int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
+{
+    if (!inline_ctx)
+        return eval_int_body(ctx);
+    try {
+        return eval_int_body(ctx);
+    } catch (Exception &ex) {
+        if (!ex.inline_origin_emitted) {
+            flush_inline_frames(inline_ctx, ex);
+            ex.inline_origin_emitted = true;
+        }
+        throw;
+    }
+}
+
+float_type TypedScalarExpr::eval_float(EvalContext *ctx) const
+{
+    if (!inline_ctx)
+        return eval_float_body(ctx);
+    try {
+        return eval_float_body(ctx);
+    } catch (Exception &ex) {
+        if (!ex.inline_origin_emitted) {
+            flush_inline_frames(inline_ctx, ex);
+            ex.inline_origin_emitted = true;
+        }
+        throw;
     }
 }
 
