@@ -2072,7 +2072,7 @@ vm_make_thrown_exc(const EvalValue &v, Loc estart, Loc eend)
     if (v.is<intrusive_ptr<StructObject>>())
         return std::unique_ptr<RuntimeException>(new ExceptionObject(
             std::string(v.get<intrusive_ptr<StructObject>>()->def->name->val),
-            v));
+            v, v.get<intrusive_ptr<StructObject>>()->def->name));
     if (v.is<intrusive_ptr<ExceptionObject>>())
         return std::unique_ptr<RuntimeException>(
             v.get<intrusive_ptr<ExceptionObject>>()->clone());
@@ -8084,7 +8084,20 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             bool match;
             if (in->a_lit() < 0) {
                 match = true;
+            } else if (const UniqueId *eu =
+                           cur_rec().exc->match_uid()) {
+                /* #74 inc 3: interned-POINTER matching (the per-match
+                 * string_view over the const char* name paid a strlen +
+                 * memcmp). catch_uids is derived from catch_types (same
+                 * canonical interning), so pointer == string equality. */
+                const std::vector<const UniqueId *> &uids =
+                    chunk->catch_uids[in->a_lit()];
+                match = false;
+                for (const UniqueId *u : uids) {
+                    if (u == eu) { match = true; break; }
+                }
             } else {
+                /* a subclass without match_uid: the string fallback */
                 const std::vector<std::string> &names =
                     chunk->catch_types[in->a_lit()];
                 const std::string_view en = vm_exc_name(cur_rec().exc.get());

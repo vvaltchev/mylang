@@ -3,6 +3,7 @@
 #pragma once
 
 #include "defs.h"
+#include "uniqueid.h"
 #include "poolalloc.h"
 #include "flatval.h"
 #include "errors.h"
@@ -16,16 +17,22 @@ template <class EvalValueT>
 class ExceptionObjectTempl : public RuntimeException, public RefCounted {
 
     std::string dyn_name;
+    const UniqueId *dyn_uid;     /* interned dyn_name (#74 inc 3) */
     EvalValueT data;
 
 public:
 
     ML_POOL_NEW_DELETE
 
+    /* `uid`: the already-interned type name when the caller has it (a
+     * thrown struct's def->name - the hot path); else the ctor interns
+     * (the cold built-in wrapper path). Always non-null after. */
     ExceptionObjectTempl(const std::string &name,
-                         const EvalValueT &data = EvalValueT())
+                         const EvalValueT &data = EvalValueT(),
+                         const UniqueId *uid = nullptr)
         : RuntimeException("DynamicExceptionEx", nullptr)
         , dyn_name(name)
+        , dyn_uid(uid ? uid : UniqueId::get(name))
         , data(data)
     { }
 
@@ -39,6 +46,10 @@ public:
 
     bool is_exception_object() const override {
         return true;
+    }
+
+    const UniqueId *match_uid() const override {
+        return dyn_uid;
     }
 
     const EvalValueT &get_data() const {

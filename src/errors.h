@@ -3,6 +3,7 @@
 
 #include "defs.h"
 #include "poolalloc.h"
+#include "uniqueid.h"
 
 #include <string>
 #include <string_view>
@@ -172,6 +173,15 @@ struct RuntimeException : public Exception {
      * class overrides it), so callers may static_cast. */
     virtual std::string_view match_name() const { return name; }
     virtual bool is_exception_object() const { return false; }
+
+    /* The catch-matching name as an INTERNED pointer (#74 inc 3): the
+     * matcher compares pointers instead of strings (the per-match
+     * string_view(name) paid a strlen + memcmp, ~13% of the catch
+     * bench). The DECL_RUNTIME_EX macro overrides this with a per-class
+     * lazy static; ExceptionObjectTempl carries the thrown struct's
+     * already-interned type name. nullptr = "match by string" - the
+     * safe fallback for any subclass without the override. */
+    virtual const UniqueId *match_uid() const { return nullptr; }
 };
 
 #define DECL_SIMPLE_EX(name, msg)                  \
@@ -198,6 +208,11 @@ struct RuntimeException : public Exception {
                                                           \
         name *clone() const override {                    \
             return new name(*this);                       \
+        }                                                 \
+                                                          \
+        const UniqueId *match_uid() const override {      \
+            static const UniqueId *u = UniqueId::get(#name); \
+            return u;                                     \
         }                                                 \
                                                           \
         [[ noreturn ]] void rethrow() const override {    \

@@ -5631,6 +5631,7 @@ struct Codegen {
         auto bail = [&]() {
             code.resize(start);
             chunk.catch_types.resize(ct_start);
+            chunk.catch_uids.resize(ct_start);
             trys.resize(trys_depth);
             return false;
         };
@@ -5653,10 +5654,14 @@ struct Codegen {
             int types_idx = -1;
             if (cs.first.exList) {
                 std::vector<std::string> names;
-                for (const auto &id : cs.first.exList->elems)
+                std::vector<const UniqueId *> uids;
+                for (const auto &id : cs.first.exList->elems) {
                     names.push_back(std::string(id->get_str()));
+                    uids.push_back(id->uid);   /* derived twin (#74) */
+                }
                 types_idx = static_cast<int>(chunk.catch_types.size());
                 chunk.catch_types.push_back(std::move(names));
+                chunk.catch_uids.push_back(std::move(uids));
             }
             const Identifier *asId = cs.first.asId.get();
             CgInstr in;
