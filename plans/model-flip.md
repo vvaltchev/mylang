@@ -1391,3 +1391,37 @@ to do LATER, separately (don't forget these):
 - SUPERSEDES the #55 v2/v3 open items (throwing/recursive/dyn callees) — they
   become container-to-container calls (M5).
 - Is the PLATFORM for N7 (unboxing) — the whole-function native IR it needs.
+
+## Fresh M4b measurement (2026-07-28, post-10x) - THE PRIZE IS COLLECTED
+
+Question: with today's op coverage, would resuming M4b (multi-island exit
+dispatch, richer islands, leaner executor) pay?
+
+Static landscape (the M1 container-plan over ALL of bench/ + samples/):
+**100% of chunks are READY** - 100/100 bench chunks, 18/18 sample chunks,
+every op native-ELIGIBLE. At M1-landing time real loops were multi-island
+(init+body split, boxed ops, calls); the nativize-ops arc emptied it.
+
+Dynamic residue (callgrind vm_dispatch SELF, exclusive, scale 1):
+**47 instructions TOTAL** - a constant (invocation entry + Halt) - on
+01_while, 09_fib, 10_recursion, 11_closures, 31_str, 34_sort, 35_map,
+43_sieve, 46_matrix, 47_wordcount, 62_dict, 66_dyn_foreach. The
+interpreter loop does not execute in the steady state ANYWHERE on the
+suite; the runtime already IS "native driving, C++ helpers for the hard
+ops" - reached from the bytecode side by growing the islands to cover
+everything, instead of flipping the driver.
+
+The one nonzero residue: 70_exc_runtime_error - vm_dispatch self 10.02%
+(the post-throw handler/resume runs interpreted until the next
+EnterNative) + ~28% RTTI dyncast + ~9% strcmp (catch-type matching).
+An exception-PATH cost, cold in real programs; a #60-class item
+(RTTI/name-matching lean-out), NOT a flip target.
+
+CONCLUSION: M4b as a PERF item is moot - there is no dispatch left to
+capture (<0.01% suite-wide). What remains of the flip is the
+ARCHITECTURE milestone only: M5-flip is largely subsumed by the M5b/c
+native sync calls; the live remainder is **M6** - delete-originals
+universally + the `.myv` serializer (the interior entry points from the
+per-pc work already relaxed the old single-entry deletion constraint).
+Disposition of task #56 is the maintainer's call: recommend retiring
+"M4b/M5" and re-scoping #56 to M6/.myv.
