@@ -85,11 +85,27 @@ of a guess.
 
 ## Increments for A
 
-1. **Instrument the reach FIRST.** Count the `load.elem.v` -> `load.elem.*`
-   pairs, and their share of executed instructions, across bench/ +
-   samples/. This is the cache-audit lesson from the same day: I guessed
-   twice about where the constraint was and was wrong both times, and the
-   audit settled it in one run. Do not size this from one benchmark.
+1. **Instrument the reach FIRST.** DONE, and the answer is small:
+
+       3  bench/my/46_matrix_mult.my
+       total fusable sites: 3
+
+   Across ALL of bench/ + samples/, the `load.elem.v` -> `load.elem.*`
+   pair occurs in ONE program, at three sites, and only ONE of the three
+   is in a hot loop (the other two are the checksum reads, executed twice
+   per scale iteration). So the fusion would fire on exactly one hot site
+   in the whole corpus.
+
+   **Read that carefully before concluding it is not worth doing.** bench/
+   is a construct-by-construct suite: it has one array-of-arrays program
+   because someone wrote one, not because nested containers are rare in
+   real code - grids, boards, images, tables and adjacency lists are
+   ordinary MyLang shapes. The number measures the SUITE's coverage, not
+   the language's usage. And the STORE side (StoreElem2V) was judged worth
+   building on reach that cannot have been better.
+
+   What it does settle: the SUITE geomean will not move, so do not expect
+   one, and do not justify the work with it.
 
 2. **`LoadElem2Int`** - `dst = base[i][j]`, base proven
    `array<array<int>>`, both indices int-compilable, both storages flat.
