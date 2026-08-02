@@ -15378,7 +15378,7 @@ static bool codegen_func_counts(const std::vector<const char *> &lines,
 
 static bool jit_engagement()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     /* A straight-line int-arith body must produce >= 1 native fragment
      * (and run correctly through it - the value check is the point: the
      * fragment computed it, not the interpreter). */
@@ -15444,7 +15444,7 @@ static bool jit_engagement()
  * JIT-on and compare the interpreted int-op count. */
 static bool jit_delete_originals()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     auto compile_loop = [](const std::vector<const char *> &lines, bool jit,
                            bool &has_enter, size_t &int_ops) -> bool {
         std::string src;
@@ -15538,7 +15538,7 @@ static bool jit_delete_originals()
  * we assert the native return path actually executed). */
 static bool jit_native_return()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;   /* JIT off (e.g. MYLANG_JIT=0): nothing to prove */
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -15621,7 +15621,7 @@ static bool jit_native_return()
  * caught by the caller (the jit_sync_postexit conveyance). */
 static bool jit_sync_inline_call()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -15685,7 +15685,7 @@ static bool jit_sync_inline_call()
  * the inserted post-call EnterNative. Result asserted too. */
 static bool jit_post_call_entry()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -15787,7 +15787,7 @@ static bool jit_post_call_entry()
  * old cap keeps the old behavior, covered by jit_post_call_entry). */
 static bool jit_native_stack_deep()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled || jit_sync_depth_cap() <= 1000)
         return true;                   /* stack not armed - nothing to prove */
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -16378,7 +16378,7 @@ static bool hoist_subscript_shapes()
  * throwing-comparator round through vm_invoke_postexit's raise path). */
 static bool jit_invoke_direct_entry()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -16450,7 +16450,7 @@ static bool jit_invoke_direct_entry()
  * flip pins the guard-decline fallback's correctness. */
 static bool jit_boxed_int_fast()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -16533,7 +16533,7 @@ static bool jit_boxed_int_fast()
 
 static bool dyn_foreach_fast_shapes()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     auto run = [](const std::vector<const char *> &lines) -> bool {
         std::string src;
         std::vector<Tok> toks;
@@ -17416,7 +17416,7 @@ static bool vm_handler_table()
  */
 static bool jit_end_finally_native()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
 
@@ -17538,7 +17538,7 @@ static bool jit_end_finally_native()
  */
 static bool jit_rethrow_native()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
 
@@ -17867,7 +17867,7 @@ static bool bc_inline_order_independent()
  */
 static bool bc_inline_two_splices_jit()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     const std::vector<const char *> src = {
@@ -17928,7 +17928,7 @@ static bool bc_inline_two_splices_jit()
 
 static bool jit_final_batch_deletable()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run_bt = [](const std::vector<const char *> &lines,
@@ -18123,7 +18123,7 @@ static bool jit_final_batch_deletable()
 
 static bool jit_native_throw()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -18175,7 +18175,7 @@ static bool jit_native_throw()
 
 static bool jit_call_switch_protocol()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -18237,7 +18237,7 @@ static bool jit_call_switch_protocol()
 
 static bool jit_load_elem_slow_tier()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -18305,7 +18305,7 @@ static bool jit_load_elem_slow_tier()
  */
 static bool jit_load_elem2_native()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -18366,7 +18366,7 @@ static bool jit_load_elem2_native()
 
 static bool jit_len_ord()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -18427,7 +18427,7 @@ static bool jit_len_ord()
 
 static bool jit_struct_baked()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -18608,7 +18608,7 @@ static bool cross_compile_specialize_stable()
  * specialized to a clone (a const arg -> nleaf$0, a not-yet-native case). */
 static bool jit_native_call()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -18678,7 +18678,7 @@ static bool jit_native_call()
  */
 static bool jit_ref_arg_bind()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -18783,7 +18783,7 @@ static bool jit_ref_arg_bind()
  * chains 6 const decls (each its own 1-op island; total 6 >= 5). */
 static bool jit_container()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -18897,7 +18897,7 @@ static bool jit_container()
  * gate routes it through the sync path, which handles the throw. */
 static bool jit_leaf_never_exits()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     std::string src;
@@ -18939,7 +18939,7 @@ static bool jit_leaf_never_exits()
 
 static bool jit_op_nativized()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
     auto run = [](const std::vector<const char *> &lines) -> bool {
@@ -20816,7 +20816,7 @@ static bool vm_disasm_shape()
  * interpreted call.v). runtime() keeps the arg non-const (no const-fold). */
 static bool vm_disasm_native_call()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;   /* JIT off: no native call to show */
     std::string src;
@@ -20881,7 +20881,7 @@ static bool vm_disasm_native_call()
  * DUMP-ONLY; no emission consumes it yet. */
 static bool vm_disasm_container_plan()
 {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;   /* JIT off: no container plan emitted */
     std::string src;
@@ -21643,44 +21643,85 @@ void run_tests(bool dump_syntax_tree)
     cout << (pass_count == total ? "[ PASS ]" : "[ FAIL ]") << endl;
 
     /*
-     * Differential VM pass: rerun the SAME functional `tests` list under the
-     * bytecode VM (the -vm engine) - not a separate set of tests, the same list
-     * a second time, so it is NOT added to the count above. Each must produce
-     * the identical outcome; since the VM falls back to the tree-walker for any
-     * construct not yet lowered natively, this is green by construction in
-     * Phase 0 and stays a regression net as native opcodes replace fallbacks
-     * (see plans/archived/bytecode-vm.md).
+     * THE 3-WAY DIFFERENTIAL (maintainer-set, 2026-08-02).
+     *
+     * Rerun the SAME functional `tests` list in every EXECUTION MODE the
+     * project ships - not separate test sets, the same list again, so none
+     * of these is added to the count above. The three modes are genuinely
+     * different implementations of the language and each pair is an oracle
+     * for the other:
+     *
+     *   1. the AST tree-walker      (the reference; has no JIT path at all)
+     *   2. the bytecode VM, JIT OFF (pure interpreted bytecode)
+     *   3. the bytecode VM, JIT ON  (native code)
+     *
+     * WHY THE MIDDLE ONE IS NOT OPTIONAL: with only tw-vs-VM, a bug that
+     * lives in the JIT and one that lives in the codegen are the same
+     * symptom, and a JIT bug that happens to be unobservable in the default
+     * corpus is invisible - which is exactly how a disabled branch remap
+     * survived 39 commits (plans/bytecode-inliner.md defect 2). Splitting
+     * the VM into with- and without-native says WHICH LAYER broke.
+     *
+     * Mode 3 runs only where the JIT exists (ML_JIT_SUPPORTED - Linux
+     * x86-64 today; see jit.h). Everywhere else mode 2 IS what the VM does,
+     * so running it twice would prove nothing.
      */
+    struct VmMode {
+        const char *tag;      /* the per-test line prefix */
+        const char *label;    /* the summary line */
+        bool jit;
+    };
+    std::vector<VmMode> modes = {
+        { "vm", "bytecode VM, JIT OFF (pure bytecode)", false },
+    };
+    if (ML_JIT_SUPPORTED)
+        modes.push_back(
+            { "jit", "bytecode VM, JIT ON (native, the script DEFAULT)",
+              true });
+
+    const bool saved_jit = g_jit_enabled;
+    std::vector<size_t> mode_pass(modes.size(), 0);
     g_exec_engine = ExecEngine::Vm;
-    size_t vm_pass = 0;
 
-    for (const auto &test : tests) {
+    for (size_t m = 0; m < modes.size(); m++) {
+        g_jit_enabled = modes[m].jit;
+        for (const auto &test : tests) {
 
-        cout << "[ RUN  ] vm: " << test.name << endl;
+            cout << "[ RUN  ] " << modes[m].tag << ": " << test.name << endl;
 
-        err_line = 0;
-        if (check(test, err_line, dump_syntax_tree)) {
+            err_line = 0;
+            if (check(test, err_line, dump_syntax_tree)) {
 
-            cout << "[ PASS ]";
-            vm_pass++;
+                cout << "[ PASS ]";
+                mode_pass[m]++;
 
-        } else {
+            } else {
 
-            dump_test_source(test, err_line);
-            cout << "[ FAIL ]";
+                dump_test_source(test, err_line);
+                cout << "[ FAIL ]";
+            }
+
+            cout << endl << endl;
         }
-
-        cout << endl << endl;
     }
 
+    g_jit_enabled = saved_jit;
     g_exec_engine = ExecEngine::TreeWalk;
 
-    cout << "VM differential (same " << tests.size()
-         << " tests via the -vm engine, the script DEFAULT): "
-         << vm_pass << "/" << tests.size() << " ";
-    cout << (vm_pass == tests.size() ? "[ PASS ]" : "[ FAIL ]") << endl;
+    bool all_modes_ok = true;
+    for (size_t m = 0; m < modes.size(); m++) {
+        const bool ok = mode_pass[m] == tests.size();
+        all_modes_ok = all_modes_ok && ok;
+        cout << "Differential (same " << tests.size() << " tests) - "
+             << modes[m].label << ": " << mode_pass[m] << "/"
+             << tests.size() << " " << (ok ? "[ PASS ]" : "[ FAIL ]")
+             << endl;
+    }
+    if (!ML_JIT_SUPPORTED)
+        cout << "  (no JIT on this platform - see ML_JIT_SUPPORTED, jit.h)"
+             << endl;
 
-    if (pass_count != total || vm_pass != tests.size())
+    if (pass_count != total || !all_modes_ok)
         exit(1);
 
     exit(0);

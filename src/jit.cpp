@@ -53,13 +53,13 @@ unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 }
 #endif
 
-#if defined(__x86_64__) && !defined(_WIN32)
-#  define ML_JIT_SUPPORTED 1
+/* ML_JIT_SUPPORTED is the POLICY, defined once in jit.h - see the comment
+ * there for which platforms and why. */
+#if ML_JIT_SUPPORTED
 #  include <sys/mman.h>
 #  include <unistd.h>
 #  include <cstdlib>
 #else
-#  define ML_JIT_SUPPORTED 0
 #endif
 
 unsigned long g_jit_frags = 0;

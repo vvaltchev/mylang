@@ -185,7 +185,7 @@ static void show_build_config()
 #endif
          << "        (adversarial node allocator)" << endl;
     cout << "  jit               "
-#if defined(__x86_64__) && !defined(_WIN32)
+#if ML_JIT_SUPPORTED
          << "1"
 #else
          << "0"
