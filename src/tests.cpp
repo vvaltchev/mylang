@@ -15499,6 +15499,70 @@ static bool dyn_foreach_fast_shapes()
 #endif
 }
 
+/* #56 delete-originals inc 1: LoadElemInt/Float are fully native - the
+ * inline fast path serves flat in-range reads, and EVERY declined shape
+ * (slice/general storage/negative wrap/OOB) runs the jit_load_elem_*
+ * slow tier (which bumps g_jit_op_run), so the op never re-interprets
+ * and its runs' originals are deletable. The counter growth proves the
+ * SLOW tier executed for the declined shapes. */
+static bool jit_load_elem_slow_tier()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long i0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::LoadElemInt)];
+    const unsigned long f0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::LoadElemFloat)];
+    if (!run({
+            "var a = range(20);",
+            "var sl = a[5:15];                 # a SLICE declines inline",
+            "var fa = [1.5, 2.5, 3.5]; fa[0] += 0.5;",
+            "var s = 0; var fs = 0.0;",
+            "for (var i = 0; i < 10; i++) s += sl[i];",
+            "for (var i = 0; i < 3; i++) fs += fa[i - 3];   # negative wrap",
+            "assert(s == 95); assert(fs == 8.0);" }))
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::LoadElemInt)] <= i0) {
+        fprintf(stderr,
+                "jit_load_elem_slow_tier: the INT slow tier DID NOT RUN\n");
+        return false;
+    }
+    if (g_jit_op_run[static_cast<size_t>(OpCode::LoadElemFloat)] <= f0) {
+        fprintf(stderr,
+                "jit_load_elem_slow_tier: the FLOAT slow tier DID NOT RUN\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_len_ord()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -18395,6 +18459,8 @@ static const std::vector<extra_check> extra_checks =
       jit_struct_baked },
     { "jit: native len() + fused ord(s[i]) run natively (lever 4b)",
       jit_len_ord },
+    { "jit: LoadElem slow tier serves declined shapes (#56 inc 1)",
+      jit_load_elem_slow_tier },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",

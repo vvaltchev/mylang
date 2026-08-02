@@ -747,6 +747,27 @@ THROWS on 0; mod is a libm call). Measured (same-binary JIT off vs on):
 VM-wall geomean **0.812**, my/py 5.00x -> **5.55x**; 54_mandelbrot
 **0.344x**, 55_float_sum 0.867x.
 
+**#56 DELETE-ORIGINALS (started 2026-07-28; the re-purposed model
+flip).** The corpus AUDIT (env `MYLANG_DELAUDIT=1`: each non-deletable
+run's reason + blocking opcodes to stderr) found 58 kept runs across
+bench/+samples - 0 multi-entry (the per-pc entries already cover those),
+2 inline-raise, 56 bail-op, led by LoadElemInt/Float (46), the call ops
+(38), AppendV (10), the exception trio (16). **Increment 1 -
+LoadElemInt/Float fully native:** the inline flat fast path keeps its
+guards but every DECLINE (non-array/slice/general-or-wrong-kind
+storage/negative wrap/OOB) jumps to a SLOW TIER - jit_load_elem_int/
+float (vm.cpp), the interpreter's exact shared core
+(vm_load_elem_int/float_core, used by the VM_CASEs too so they cannot
+drift) - whose OOB CONVEYS with the op's exc-stamped caret; the
+InternalErrorEx net rides g_vm_jit_eptr. No bail, no re-interpret ->
+op_fully_native -> the runs' originals DELETE (a flat read loop's chunk
+is a bare enter.nat). Execution-proven (g_jit_op_run bumps in the slow
+tier; the jit_load_elem_slow_tier test covers slice + negative-wrap
+shapes). Measured (callgrind Ir): 15_array_slice_readonly **-32.2%**
+(sliced reads run the helper instead of splitting/bailing per element),
+18_foreach_array **-10.1%**, 14 -3.0%; 43/46 neutral. Remaining
+blockers: the calls, AppendV, StructFieldAddInt, Catch/Reraise/Throw.
+
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat
 vector's data/finish pointers, unsigned-bounds-checks the index, and

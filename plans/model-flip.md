@@ -1425,3 +1425,18 @@ universally + the `.myv` serializer (the interior entry points from the
 per-pc work already relaxed the old single-entry deletion constraint).
 Disposition of task #56 is the maintainer's call: recommend retiring
 "M4b/M5" and re-scoping #56 to M6/.myv.
+
+## Delete-originals increment 1 (2026-07-28) - LoadElemInt/Float
+
+Audit tool: MYLANG_DELAUDIT=1 prints each non-deletable run + reason +
+blocking ops. Corpus baseline: 58 kept runs (0 multi-entry, 2
+inline-raise, 56 bail-op: LoadElem* 46, calls 38, AppendV 10,
+exceptions 16, StructFieldAddInt 5, misc).
+
+Inc 1: LoadElemInt/Float lose their bails - inline flat fast path +
+a slow-tier helper (the interpreter's exact shared core; OOB conveys,
+InternalErrorEx via eptr) -> op_fully_native -> originals delete.
+Corpus: 58 -> 45 kept runs. Ir: 15_slice -32.2%, 18_foreach -10.1%,
+14 -3.0%, 43/46 neutral. Next: AppendV (same helper pattern), then the
+call ops (need an EnterNative-performs-the-call design), then
+Catch/Reraise/Throw (exit-at-op natives).

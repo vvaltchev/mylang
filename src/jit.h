@@ -332,6 +332,13 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
 extern "C" int jit_ord_char(LValue *base_lv, int_type idx,
                             LValue *dst) noexcept;
 
+/* #56 delete-originals: the LoadElemInt/LoadElemFloat slow tiers (every
+ * inline-declined shape via the interpreter's exact core; OOB conveys). */
+extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
+                                 LValue *dst) noexcept;
+extern "C" int jit_load_elem_float(LValue *base_lv, int_type idx,
+                                   LValue *dst) noexcept;
+
 /* model-flip (nativize-ops): the native SliceV `dst = base[start:end]` via the
  * runtime Type::slice (COW-registered sub-view). base/start/end/dst are frame
  * slots (start/end == -1 -> none); frame via g_current_ctx. Only TypeErrorEx
