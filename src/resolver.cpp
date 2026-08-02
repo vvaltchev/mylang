@@ -855,8 +855,42 @@ private:
      */
     void fold_lvalue_reads(unique_ptr<Construct> &lvalue, FCtx &fc)
     {
-        if (lvalue && !lvalue->is_id() && !lvalue->is_idlist())
-            fold_reads(lvalue, fc);
+        if (!lvalue || lvalue->is_id() || lvalue->is_idlist())
+            return;
+        /*
+         * Fold the INTERIOR reads of a write chain - the indexes - but
+         * never the chain's BASE SPINE (`arr` in `arr[j] = v`, `a` in
+         * `a[i][j] = v`, `s` in `s.f = v`).
+         *
+         * Before specialization relaxed the base block this distinction was
+         * moot: a subscript/member base was blocked from promotion
+         * entirely, so an id on the spine never had a const to fold and
+         * folding "the whole lvalue" only ever touched the indexes. The
+         * relaxed seed set (block_subscript_bases=false) lets a seeded
+         * const ARRAY fold into subscript bases - sound for READS, but
+         * folding it into a WRITE target's base turns `arr[j] = n` into
+         * `Obj([...])[j] = n`. The tree-walker happened to survive that
+         * (evaluating the read-only literal's subscript for write throws
+         * the same NotLValueEx the un-specialized call throws), but the
+         * NO-FAIL CODEGEN cannot lower a store whose base is a literal -
+         * so a legal program (pass a const array to a function that writes
+         * its param; must THROW at runtime) was refused at COMPILE time
+         * with NotLoweredEx.
+         */
+        Construct *c = lvalue.get();
+        while (c) {
+            if (auto *sub = dynamic_cast<Subscript *>(c)) {
+                fold_reads(sub->index, fc);      /* the index is a READ */
+                c = sub->what.get();             /* descend the spine */
+            } else if (auto *mem = dynamic_cast<MemberExpr *>(c)) {
+                c = mem->what.get();             /* nothing to fold here */
+            } else {
+                /* the spine's root: an Identifier stays (the whole point),
+                 * and any other rvalue root (`f()[0] = v`) is left alone
+                 * too, exactly as refold leaves assignment targets */
+                break;
+            }
+        }
     }
 
     /*

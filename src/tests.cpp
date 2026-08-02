@@ -171,6 +171,38 @@ static const std::vector<test> tests =
     },
 
     {
+        /*
+         * The SPECIALIZER used to fold a seeded const array into the BASE
+         * of an assignment target: `arr[j] = n` in the g$sN clone became
+         * `Obj([...])[j] = n`. The tree-walker survived it (a read-only
+         * literal's subscript-for-write throws the same NotLValueEx the
+         * un-specialized call throws), but the NO-FAIL codegen cannot
+         * lower a store whose base is a literal - so this LEGAL program
+         * (it must THROW at runtime, per the const model) was REFUSED at
+         * compile time with NotLoweredEx. fold_lvalue_reads now folds a
+         * write chain's interior reads (the indexes) but never its base
+         * spine. This entry runs in all five differential modes, and the
+         * VM modes are the ones that used to fail.
+         */
+        "specialize: a const array passed to a param the callee WRITES "
+        "compiles and throws at runtime (not NotLoweredEx)",
+        {
+            "const C = [1, 2, 3, 4, 5, 6, 7, 8];",
+            "func g(arr, n) {",
+            "    var j = 0;",
+            "    while (j < 8) { arr[j] = n; j++; }",
+            "    return arr[0];",
+            "}",
+            "var M = [1, 2, 3, 4, 5, 6, 7, 8];",
+            "assert(g(M, 5) == 5);",
+            "var t = 0;",
+            "try { t = g(C, 5); } catch (NotLValueEx) { t = 99; }",
+            "assert(t == 99);",
+            "assert(C[0] == 1);",
+        },
+    },
+
+    {
         "variable decl",
         {
             "var a = 1;",
