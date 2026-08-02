@@ -50,6 +50,7 @@ unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
 unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
+unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 }
@@ -259,6 +260,7 @@ struct JitLayout {
     int data_off;         /* SharedObject: &elem_vec - shobj (the vector's
                            * _M_start is at +0, _M_finish at +8) */
     unsigned char kind_ints, kind_floats, kind_bools;  /* Storage values */
+    unsigned char kind_general;   /* #93: the nested read's OUTER array */
     /* #92 the inline STORE tier (see SharedArrayObj::JitProbe) */
     int ro_off;        /* SharedObject: &readonly   - shobj */
     int hashv_off;     /* SharedObject: &hash_valid - shobj */
@@ -347,6 +349,8 @@ static const JitLayout &jit_layout()
             SharedArrayObj::Storage::floats);
         l.kind_bools = static_cast<unsigned char>(
             SharedArrayObj::Storage::bools);
+        l.kind_general = static_cast<unsigned char>(
+            SharedArrayObj::Storage::general);
         l.ro_off = static_cast<int>(
             static_cast<const char *>(jp.readonly) - so);
         l.hashv_off = static_cast<int>(
@@ -787,6 +791,14 @@ struct Emitter {
     void jmp32_to(size_t target)
     { u8(0xE9); u32(static_cast<uint32_t>(target - (pos() + 4))); }
     void mov_rsi_r9() { u8(0x4C); u8(0x89); u8(0xCE); }
+    /* ---- #93, the inline nested-READ tier (rcx = a row LValue*) ---- */
+    void mov_rax_rcx_d(int32_t d)      /* mov rax, [rcx+disp] */
+    { u8(0x48); u8(0x8B); u8(0x81); u32(uint32_t(d)); }
+    void cmp_byte_rcx(int32_t d, uint8_t imm)  /* cmp byte [rcx+d], imm */
+    { u8(0x80); u8(0xB9); u32(uint32_t(d)); u8(imm); }
+    void imul_r9_imm8(uint8_t k)       /* imul r9, r9, imm8 (row stride) */
+    { u8(0x4D); u8(0x6B); u8(0xC9); u8(k); }
+    void add_rcx_r9() { u8(0x4C); u8(0x01); u8(0xC9); }
     /* cmp rax, rcx / test rax, rax */
     void cmp_rax_rcx() { u8(0x48); u8(0x39); u8(0xC8); }
     void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
@@ -3675,6 +3687,94 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     return true;
 }
 
+/*
+ * #93 - the INLINE tier for the fused nested READ `dst = base[i][j]`
+ * (LoadElem2Int; the float twin stays helper-only for now).
+ *
+ * The helper redoes both levels of the managed model per read - ~87 Ir
+ * where -O3 C++ uses one mov (profiled at 22%+ of 46_matrix_mult's total,
+ * with EvalValue::operator= adding another 11% for the dst boxing). The
+ * fast shape emits the two navigations directly:
+ *
+ *   OUTER  an array, NOT a slice, GENERAL storage (a matrix's rows are
+ *          boxed LValues at stride sizeof(LValue)); index in range by an
+ *          unsigned BYTE-length compare (idx*48 < finish-start), which
+ *          also catches a negative index.
+ *   ROW    the LValue at data + idx*48: an array, NOT a slice (a slice
+ *          row's elements live at shobj->off - decline rather than add
+ *          the offset path), flat INT storage (bools/floats/strs/general
+ *          decline; the helper serves them byte-identically, including
+ *          the per-level OOB carets from the baked chain_locs pair).
+ *   INNER  bounds via the shared count compare, then mov rax,[rcx+r9*8],
+ *          then the ref-aware store_dst (the same dst path every int
+ *          producer uses).
+ *
+ * Registers: rax scratch/element, rcx walks outer-data -> row -> inner
+ * data, rdx byte-length/count, r9 the two indexes then the t_arr
+ * immediate. rsi (t_int) and r8 (t_float) are RESERVED; no call on the
+ * fast path, so nothing needs saving.
+ */
+static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
+                                   const Instr &in, uint32_t pc,
+                                   std::vector<size_t> &slows,
+                                   std::vector<size_t> &dones)
+{
+    const JitLayout &L = jit_layout();
+    const SlotAddr base = slot_addr(in.target2);
+    const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
+
+    /* OUTER: array, not a slice, general storage */
+    e.load(RAX, base.type);
+    e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rax_r9();
+    decline_ne();
+    e.cmp_byte_slot(base.payload + L.slice_off, 0);
+    decline_ne();
+    e.load(RAX, base.payload);                 /* outer SharedObject */
+    e.cmp_byte_rax(L.kind_off, L.kind_general);
+    decline_ne();
+
+    /* the row: data + oidx * sizeof(LValue), bounds by byte length */
+    e.mov_rcx_rax(L.data_off);
+    e.mov_rdx_rax(L.data_off + 8);
+    e.sub_rdx_rcx();                           /* rdx = byte length */
+    load_slot_r9(e, in.a_dual_lo());           /* the outer index (slot) */
+    e.imul_r9_imm8(static_cast<uint8_t>(sizeof(LValue)));
+    e.cmp_r9_rdx();
+    slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
+    e.add_rcx_r9();                            /* rcx = &row (LValue) */
+
+    /* ROW: an array, not a slice, flat ints */
+    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_type));
+    e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rax_r9();
+    decline_ne();
+    e.cmp_byte_rcx(static_cast<int32_t>(L.off_payload) + L.slice_off, 0);
+    decline_ne();
+    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_payload));  /* row shobj */
+    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    decline_ne();
+
+    /* INNER: bounds, read, store */
+    e.mov_rcx_rax(L.data_off);
+    e.mov_rdx_rax(L.data_off + 8);
+    e.sub_rdx_rcx();
+    e.sar_rdx_3();
+    if (in.b_is_lit())
+        e.movabs_r9(static_cast<uint64_t>(in.b_lit()));
+    else
+        load_slot_r9(e, in.b_slot());
+    e.cmp_r9_rdx();
+    slows.push_back(e.j32(0x73));
+    e.load_elem_int();                         /* rax = [rcx + r9*8] */
+#ifdef TESTS
+    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem2_fast));
+    e.u8(0x48); e.u8(0xFF); e.u8(0x02);        /* inc qword [rdx] */
+#endif
+    store_dst(e, ck, RAX, in.target, pc);
+    dones.push_back(e.jmp32());
+}
+
 static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
                             uint32_t pc, size_t old_pc, bool is_float)
 {
@@ -4068,7 +4168,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * oidx=a_dual_lo (cache-aware), iidx=b(), dst=&slot[target],
          * locs=chain_locs[a_dual_hi].data()). The helper BORROWS the row -
          * the point of the op - and throws WITH the per-level caret, so
-         * the stamp below only supplies the inlined-at chain. */
+         * the stamp below only supplies the inlined-at chain.
+         * #93: the INT form gets an INLINE fast tier first; every guard
+         * it fails lands here, on the helper. */
+        {
+        std::vector<size_t> e2_slows, e2_dones;
+        if (in.op == OpCode::LoadElem2Int) {
+            emit_load_elem2_inline(e, ck, in, pc, e2_slows, e2_dones);
+            for (const size_t j : e2_slows)
+                e.patch32_here(j);
+        }
         emit_call_prologue(e);
         e.lea_rdi(static_cast<int32_t>(
                       static_cast<long>(in.target2)
@@ -4093,6 +4202,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_exc_stamp(e, ck, old_pc);
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
+        }
+        for (const size_t j : e2_dones)      /* #93: fast tail rejoins */
+            e.patch32_here(j);
         }
         return true;
 

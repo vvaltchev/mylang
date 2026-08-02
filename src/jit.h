@@ -795,6 +795,7 @@ extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
  * the only thing that can prove the fast path executed. */
 extern "C" unsigned long g_jit_store_fast;
 extern "C" unsigned long g_jit_store_prep;
+extern "C" unsigned long g_jit_elem2_fast;
 extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
 extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
 extern "C" unsigned long g_jit_sync_inline;
