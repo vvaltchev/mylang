@@ -8570,6 +8570,11 @@ void bc_inline_audit(const Chunk &caller, const char *caller_name,
  * that branch, so a test cannot pass by taking some other route. */
 unsigned long g_bc_inline_caller_frames = 0;
 
+/* #91: total call SITES spliced. Lets a shape-matrix test assert that each
+ * shape it believes is spliceable actually was - without it a "all modes
+ * agree" table is satisfied by a pass that inlines nothing. */
+unsigned long g_bc_inline_splices = 0;
+
 bool g_bc_inline_enabled = [] {
     const char *e = getenv("MYLANG_BCINLINE");
     return e && e[0] == '1';
@@ -8778,6 +8783,10 @@ bool bc_inline_chunk(Chunk &ck,
     }
     if (sites.empty())
         return false;
+#ifdef TESTS
+    /* unsigned long is 32-bit on LLP64 (Windows) - C4267 without the cast */
+    g_bc_inline_splices += static_cast<unsigned long>(sites.size());
+#endif
 
     /* the caller's own pc -> loc, so a copied op keeps its caret */
     std::vector<Instr> nc;
