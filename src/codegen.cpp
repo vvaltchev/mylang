@@ -8400,8 +8400,11 @@ static bool bc_inline_op_ok(OpCode op)
     case OpCode::Jump:
     case OpCode::JumpUnlessIntCmp:
     case OpCode::JumpUnlessFloatCmp:
-    case OpCode::ForLoopStep:
-    case OpCode::IntAddStep:
+    /* ForLoopStep / IntAddStep are deliberately ABSENT: their target is a
+     * pc and their target2 a counter slot, but the operand layout wants
+     * checking against their emit sites before either carries a splice.
+     * Excluding them costs reach and nothing else - the whitelist's whole
+     * contract. */
     /* the boundary + the nested call (its target2 is a GLOBAL slot, not a
      * frame slot - the remapper must leave it alone, and does) */
     case OpCode::ReturnV:
