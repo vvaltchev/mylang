@@ -2201,6 +2201,16 @@ vm_precompile_all(const Block *root, bool jit)
                 slot_desc[slot] = fn->desc;
         }
 
+    /* THE BYTECODE INLINER's corpus audit (env MYLANG_INLAUDIT=1): with
+     * every chunk codegen'd and the slot->descriptor map built, report what
+     * a splice would reach. See plans/bytecode-inliner.md - the measured
+     * reach is what decides the gate, and the DELAUDIT precedent is to put
+     * the audit surface in before the transform. Dev-only. */
+    for (auto &kv : g_func_chunks)
+        bc_inline_audit(kv.second,
+                        kv.first->name ? kv.first->name->val.c_str() : "?",
+                        slot_desc);
+
     /* Pass B: JIT every compiled body, each with its own JitCtx (caller_desc =
      * the descriptor keying its chunk). Order-independent (all native_leaf
      * flags set in Pass A; a caller bakes the callee DESCRIPTOR and loads its

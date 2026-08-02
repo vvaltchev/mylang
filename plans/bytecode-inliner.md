@@ -54,6 +54,34 @@ exactly the closure-factory case) - and bodies that only become small
 after specialisation. By bytecode time a nested function is just a
 `closure_defs` entry, so the shape objection is gone.
 
+## The corpus audit says the same thing (MYLANG_INLAUDIT=1, landed)
+
+The gate + audit shipped first, DELAUDIT-style. Over bench/ + samples/,
+**19 non-main call sites**:
+
+    10  runtime-callee     CallValueV / CachedCallV - needs a GUARD
+     5  no-tail-return
+     3  OK                 splice-able today
+     1  too-big
+
+and the three are exactly what the hand analysis predicted:
+
+    sumto$0  pc4  -> sumto$0  (7 ops)     the self-recursion
+    sumto$s0 pc1  -> sumto$0  (7 ops)     the specialized entry
+    lcm$0    pc4  -> gcd$0    (6 ops)     samples/gcd
+
+**One thing the audit does NOT see: MAIN.** `vm_precompile_all` runs it
+over `g_func_chunks`, and main's chunk is built afterwards by
+`vm_compile`. That matters, because 63's two factory calls are in main -
+so the transform will need main covered too, and the same v1 limitation
+already applies to the #55 native call ("main has no stable descriptor
+for the record's ret_chunk"). Count it as a known gap, not a surprise.
+
+Read together with the reach section: the first increment's whole
+measurable target is `10_recursion_deep`. That is a deliberate, narrow
+landing, not an accident - and it is worth doing because that bench is
+19.1x C++ on call protocol alone.
+
 ## The design, and the one hazard that shapes all of it
 
 Splicing chunk B into chunk A means rewriting, in B's instructions:
