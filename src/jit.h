@@ -388,6 +388,19 @@ extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
 extern "C" int jit_load_elem_float(LValue *base_lv, int_type idx,
                                    LValue *dst) noexcept;
 
+/* The NESTED-READ FUSION `dst = base[i][j]` (plans/unboxing.md option A):
+ * the row is BORROWED inside the helper, never boxed into a frame slot.
+ * `locs` is the baked chain_locs pair - [0] carets an OOB on the outer
+ * index, [1] one on the inner - so these throw WITH a caret rather than
+ * loc-less like the single-level tiers above. (`locs` is a `void *` for the
+ * same reason the store helpers' is: jit.h does not pull in errors.h.) */
+extern "C" int jit_load_elem2_int(LValue *base_lv, int_type oidx,
+                                  int_type iidx, LValue *dst,
+                                  const void *locs) noexcept;
+extern "C" int jit_load_elem2_float(LValue *base_lv, int_type oidx,
+                                    int_type iidx, LValue *dst,
+                                    const void *locs) noexcept;
+
 /* #56: the #9 fusions' slow tiers - the shared element-value read (every
  * inline-declined shape; conveys) and ForStepElemInt's full-op form (the
  * gate declines BEFORE the step, so the helper does step+test+read). */

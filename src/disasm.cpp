@@ -1029,6 +1029,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "load.elem.f  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a(), false) << "]";
             break;
+        case OpCode::LoadElem2Int:
+        case OpCode::LoadElem2Float:
+            /* the fused nested read - the row is BORROWED, never boxed */
+            row << (in.op == OpCode::LoadElem2Int ? "load.elem2.i "
+                                                  : "load.elem2.f ")
+                << D(in.target) << " = " << D(in.target2)
+                << "[" << D(in.a_dual_lo()) << "]["
+                << RI(in.b(), false) << "]   ; locs[" << in.a_dual_hi()
+                << "]";
+            break;
         case OpCode::LoadElemBool:
             row << "load.elem.b  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a(), false) << "]   ; bool";

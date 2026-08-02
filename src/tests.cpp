@@ -1443,6 +1443,107 @@ static const std::vector<test> tests =
         &typeid(OutOfBoundsEx), 13, 2, 18, 2,
     },
     {
+        /*
+         * THE NESTED-READ FUSION (LoadElem2Int/Float, plans/unboxing.md
+         * option A). The fused op fires when the OUTER index is not loop-
+         * invariant - `m[j][i]` with `j` the inner counter - because LICM
+         * hoists `m[i][j]`'s row out of the loop before codegen sees it.
+         * The row is BORROWED, so what these pin is that borrowing changes
+         * no observable behaviour: values, negative wrap at BOTH levels,
+         * ragged rows, and a SLICE base (whose offset() must be honoured
+         * at both levels).
+         */
+        "elem2: fused nested read - values, wrap, ragged, slice base",
+        { "var m = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];",
+          "var s = 0;",
+          "for (var i = 0; i < 3; i++)",
+          "    for (var j = 0; j < 3; j++)",
+          "        s += m[j][i];",
+          "assert(s == 45);",
+          "var w = 0;",
+          "for (var i = 0; i < 3; i++)",
+          "    for (var j = 0; j < 3; j++)",
+          "        w += m[j - 3][i - 3];        # negative wrap, both levels",
+          "assert(w == 45);",
+          "var rag = [[1, 2], [3], [4, 5, 6]];",
+          "var r = 0;",
+          "for (var j = 0; j < 3; j++)",
+          "    r += rag[j][0];",
+          "assert(r == 8);",
+          "var sl = m[1:3];                     # a SLICE of the outer",
+          "var t = 0;",
+          "for (var i = 0; i < 2; i++)",
+          "    for (var j = 0; j < 2; j++)",
+          "        t += sl[j][i];",
+          "assert(t == 24);" },
+    },
+    {
+        /* The float twin - same shape, and an INT inner element must still
+         * promote (vm_load_elem_float_core's ints arm) through the fusion. */
+        "elem2: the float twin, incl. an int element promoting",
+        { "var m = [[1.5, 2.5], [3.5, 4.5]];",
+          "var s = 0.0;",
+          "for (var i = 0; i < 2; i++)",
+          "    for (var j = 0; j < 2; j++)",
+          "        s += m[j][i];",
+          "assert(s == 12.0);",
+          "var mix = [[1, 2], [3, 4]];",
+          "var f = 0.0;",
+          "for (var i = 0; i < 2; i++)",
+          "    for (var j = 0; j < 2; j++)",
+          "        f += mix[j][i] * 1.0;",
+          "assert(f == 10.0);" },
+    },
+    {
+        /* An OOB on the OUTER index carets the INNER subscript's span
+         * (`m[j]`), NOT the whole expression - locs[0] of the op's
+         * chain_locs pair. Byte-identical to the unfused pair, which is
+         * what the tree-walker still runs. */
+        "elem2: an OUTER-index OOB carets the inner subscript",
+        { "var m = [[1, 2], [3, 4]];",
+          "var s = 0;",
+          "for (var i = 0; i < 1; i++)",
+          "    for (var j = 0; j < 4; j++)",
+          "        s += m[j][i];" },
+        &typeid(OutOfBoundsEx), 14, 5, 19, 5,
+    },
+    {
+        /* An OOB on the INNER index carets the WHOLE `m[j][i]` - locs[1].
+         * A ragged second row makes the inner index overrun while the
+         * outer stays in range. */
+        "elem2: an INNER-index OOB carets the whole expression",
+        { "var m = [[1, 2], [3]];",
+          "var s = 0;",
+          "for (var i = 0; i < 2; i++)",
+          "    for (var j = 0; j < 2; j++)",
+          "        s += m[j][i];" },
+        &typeid(OutOfBoundsEx), 14, 5, 22, 5,
+    },
+    {
+        /* The DECLINE paths, each falling back to the byte-identical
+         * unfused pair: a LITERAL outer index (it cannot ride the `a`
+         * dual the chain_locs index spends), a DICT level (not
+         * base_array), and a 3-deep chain (whose outermost level still
+         * materialises via compile_array_base while the last two fuse). */
+        "elem2: the declines keep the unfused pair's answers",
+        { "var m = [[1, 2], [3, 4]];",
+          "var s = 0;",
+          "for (var i = 0; i < 2; i++)",
+          "    s += m[0][i];                    # literal outer index",
+          "assert(s == 3);",
+          "var d = {\"a\": [5, 6]};",
+          "var t = 0;",
+          "for (var i = 0; i < 2; i++)",
+          "    t += d[\"a\"][i];                 # a dict level",
+          "assert(t == 11);",
+          "var c = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]];",
+          "var u = 0;",
+          "for (var i = 0; i < 2; i++)",
+          "    for (var j = 0; j < 2; j++)",
+          "        u += c[0][j][i];             # 3 deep",
+          "assert(u == 10);" },
+    },
+    {
         /* #76: a TYPED div/mod's div0 carets the DIVISOR operand - the
          * boxed ladder's operand-precise convention, unified across BOTH
          * engines and lowering paths (the VM records the divisor's loc,
@@ -17810,6 +17911,77 @@ static bool jit_load_elem_slow_tier()
 #endif
 }
 
+/*
+ * THE NESTED-READ FUSION ran NATIVELY. jit_load_elem2_int/float are called
+ * ONLY from emitted code (the interpreted VM_CASE goes straight to the
+ * shared core and bumps nothing), so a counter that moved proves the
+ * fragment executed - a matching RESULT would not, since the interpreter
+ * produces the same one. Per the verify-native-emission rule.
+ *
+ * Note the shape: the outer index must vary with the INNER loop, else LICM
+ * hoists the row out before codegen ever sees a nested read.
+ */
+static bool jit_load_elem2_native()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long i0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::LoadElem2Int)];
+    const unsigned long f0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::LoadElem2Float)];
+    if (!run({
+            "var m = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];",
+            "var fm = [[1.5, 2.5], [3.5, 4.5]];",
+            "var s = 0; var fs = 0.0;",
+            "for (var i = 0; i < 3; i++)",
+            "    for (var j = 0; j < 3; j++)",
+            "        s += m[j][i];",
+            "for (var i = 0; i < 2; i++)",
+            "    for (var j = 0; j < 2; j++)",
+            "        fs += fm[j][i];",
+            "assert(s == 45); assert(fs == 12.0);" }))
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::LoadElem2Int)] <= i0) {
+        fprintf(stderr,
+                "jit_load_elem2_native: the INT fusion DID NOT RUN\n");
+        return false;
+    }
+    if (g_jit_op_run[static_cast<size_t>(OpCode::LoadElem2Float)] <= f0) {
+        fprintf(stderr,
+                "jit_load_elem2_native: the FLOAT fusion DID NOT RUN\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_len_ord()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -20835,6 +21007,8 @@ static const std::vector<extra_check> extra_checks =
       jit_len_ord },
     { "jit: LoadElem slow tier serves declined shapes (#56 inc 1)",
       jit_load_elem_slow_tier },
+    { "jit: the nested-read fusion a[i][j] runs natively (unboxing A)",
+      jit_load_elem2_native },
     { "jit: capped sync calls SWITCH interpreted-flat (#56 step 3)",
       jit_call_switch_protocol },
     { "jit: native throw (same-frame / cross-frame / non-struct) (#56)",
