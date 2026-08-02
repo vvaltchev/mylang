@@ -670,6 +670,7 @@ extern unsigned long g_jit_op_run[];
  * EMITTED inline code itself (the helpers bump g_jit_op_run), so a test can
  * prove the inline path ran, not just the slow helper. */
 extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
+extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
 extern "C" unsigned long g_jit_sync_inline;
 extern "C" unsigned long g_jit_entry_resume;
 #endif

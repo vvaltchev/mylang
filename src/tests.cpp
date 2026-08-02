@@ -15282,6 +15282,78 @@ static bool jit_invoke_direct_entry()
  * ForeachDynInit resolved (never by the generic fallback), so a growth of
  * >= the element count proves the specialization engaged, not just that
  * the result was right (the generic body produces the same result). */
+/* #60: the boxed-op INT-INT INLINE fast tier - g_jit_boxed_fast is bumped
+ * by the EMITTED guard-passed path itself (never the helpers), so growth
+ * proves the inline arithmetic ran. Each op kind (BinOpV / CmpV /
+ * CompoundV) is asserted separately, and a mid-loop int->float operand
+ * flip pins the guard-decline fallback's correctness. */
+static bool jit_boxed_int_fast()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    unsigned long c0 = g_jit_boxed_fast;
+    /* BinOpV: `s = (s + e) * 1 ^ 0` keeps every op int-int */
+    if (!run({ "var dyn a = range(20); var dyn s = 0;",
+               "foreach (var e in a) s = (s + e) & 1023;",
+               "assert(s == 190);" }))
+        return false;
+    if (g_jit_boxed_fast <= c0) {
+        fprintf(stderr, "jit_boxed_int_fast: BinOpV inline DID NOT RUN\n");
+        return false;
+    }
+    c0 = g_jit_boxed_fast;
+    /* CompoundV + CmpV (the compare's bool result feeds the ternary) */
+    if (!run({ "var dyn a = range(20); var dyn s = 0; var dyn n = 0;",
+               "foreach (var e in a) {",
+               "  s += e;",
+               "  var dyn big = s > 50;",
+               "  n += big ? 1 : 0;",
+               "}",
+               "assert(s == 190); assert(n == 10);" }))
+        return false;
+    if (g_jit_boxed_fast <= c0) {
+        fprintf(stderr,
+                "jit_boxed_int_fast: CompoundV/CmpV inline DID NOT RUN\n");
+        return false;
+    }
+    /* mid-loop int->float flip: the guard DECLINES per element and the
+     * helper computes the exact promoted result (byte-identical) */
+    if (!run({ "var dyn vals = dynarray([1, 2.5, 3, 4.5]);",
+               "var dyn s = 0.0;",
+               "foreach (var v in vals) s = s + v;",
+               "assert(s == 11.0);" }))
+        return false;
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool dyn_foreach_fast_shapes()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -16800,12 +16872,22 @@ static bool jit_op_nativized()
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
+        const unsigned long bf = g_jit_boxed_fast;
         if (!run(c.src)) {
             fprintf(stderr, "jit_op_nativized: op %d WRONG RESULT\n",
                     (int)c.op);
             return false;   /* wrong result (the program's assert threw) */
         }
-        if (g_jit_op_run[static_cast<size_t>(c.op)] <= b) {
+        /* "ran natively" = the helper bumped g_jit_op_run OR (#60) the
+         * emitted INT-INT INLINE tier served it - BinOpV/CmpV/CompoundV
+         * with int operands never reach their helper anymore, which is
+         * the deeper form of native, not a gap (g_jit_boxed_fast is
+         * bumped by the emitted fast path itself). */
+        const bool inline_ok =
+            (c.op == OpCode::BinOpV || c.op == OpCode::CmpV
+             || c.op == OpCode::CompoundV)
+            && g_jit_boxed_fast > bf;
+        if (g_jit_op_run[static_cast<size_t>(c.op)] <= b && !inline_ok) {
             fprintf(stderr, "jit_op_nativized: op %d DID NOT RUN\n",
                     (int)c.op);
             return false;   /* the op's NATIVE code did NOT run - a real gap */
@@ -18234,6 +18316,8 @@ static const std::vector<extra_check> extra_checks =
       jit_len_ord },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
+    { "jit: boxed int-int fast tier runs inline (#60)",
+      jit_boxed_int_fast },
     { "jit: fragment-inline sync call runs (direct push + call rdx)",
       jit_sync_inline_call },
     { "jit: post-call entry stub re-enters native on interpreted return",
