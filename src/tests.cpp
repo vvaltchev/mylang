@@ -17848,6 +17848,172 @@ static bool bc_inline_order_independent()
 }
 
 /*
+ * THE SPLICE'S DECLINE GATES (found by gcov, 2026-08-02).
+ *
+ * A coverage build over `-rt` + the samples showed several gates in
+ * bc_inline_chunk had NEVER been taken - they were written from the spec
+ * and never executed, which on this codebase is the same risk class as an
+ * unclassified opcode. Each one here is a shape the splice must REFUSE:
+ *
+ *   - a call that omits a trailing `opt` param: the bind loop only moves
+ *     what was passed, so an omitted param would be left unbound;
+ *   - a callee whose frame would push the caller past
+ *     BC_INLINE_MAX_FRAME: a bound, since every recursion level allocates
+ *     the whole frame.
+ *
+ * NOT VACUOUS: it asserts the splice fired on a CONTROL shape and did not
+ * on each gate shape - equal outputs alone would be satisfied by a pass
+ * that inlines nothing at all.
+ */
+static bool bc_inline_decline_gates()
+{
+    const bool saved_bi = g_bc_inline_enabled;
+    const ExecEngine saved = g_exec_engine;
+
+    /* build every function body, splice, and report how many chunks the
+     * pass actually changed */
+    auto splices = [&](const std::vector<const char *> &src) -> int {
+        g_bc_inline_enabled = true;
+        g_exec_engine = ExecEngine::Vm;
+        int changed = -1;
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            Block *rb = dynamic_cast<Block *>(root.get());
+            if (!rb)
+                return -1;
+            std::vector<const FuncDeclStmt *> funcs;
+            collect_funcs(root.get(), funcs);
+            for (const FuncDeclStmt *fn : funcs) {
+                bool fast = true;
+                for (const auto &p : fn->desc->params)
+                    if (p.decl_type == DeclType::i
+                            || p.decl_type == DeclType::f)
+                        fast = false;
+                const_cast<FuncDescriptor *>(fn->desc)->fast_bind = fast;
+            }
+            std::vector<const FuncDescriptor *> slot_desc(
+                rb->global_func_names.size(), nullptr);
+            for (const FuncDeclStmt *fn : funcs)
+                if (fn->id && fn->id->sym.kind == SymKind::global) {
+                    const int sl = fn->id->sym.slot;
+                    if (sl >= 0 && static_cast<size_t>(sl) < slot_desc.size())
+                        slot_desc[sl] = fn->desc;
+                }
+            std::vector<std::pair<std::string, Chunk>> built;
+            for (const FuncDeclStmt *fn : funcs) {
+                Chunk ch;
+                if (!codegen_func_body(fn, ch, /*jit=*/false))
+                    continue;
+                built.emplace_back(fn->desc && fn->desc->name
+                                       ? std::string(fn->desc->name->val)
+                                       : std::string("?"),
+                                   std::move(ch));
+            }
+            for (auto &p : built)
+                for (const FuncDeclStmt *fn : funcs)
+                    if (fn->desc && fn->desc->name
+                            && std::string(fn->desc->name->val) == p.first)
+                        const_cast<FuncDescriptor *>(fn->desc)->vm_chunk =
+                            &p.second;
+            BcInlineSnapshots snaps;
+            for (const auto &p : built)
+                bc_inline_snapshot(p.second, snaps);
+            changed = 0;
+            for (auto &p : built)
+                if (bc_inline_chunk(p.second, slot_desc, snaps))
+                    changed++;
+            for (const FuncDeclStmt *fn : funcs)
+                const_cast<FuncDescriptor *>(fn->desc)->vm_chunk = nullptr;
+        } catch (...) {
+            changed = -1;
+        }
+        return changed;
+    };
+
+    /* the CONTROL: a plain two-arg callee the splice does take */
+    const int ctl = splices({
+        "func add2(x, y) {",
+        "    var s = x + y; var i = 0;",
+        "    while (i < 2) { s = s + 1; i++; }",
+        "    return s;",
+        "}",
+        "func use(a) { var r = add2(a, 3); return r + 1; }",
+        "print(use(4));" });
+
+    /* GATE 1: the call omits a trailing opt param */
+    const int g_opt = splices({
+        "func add2(x, opt y) {",
+        "    var s = x; var i = 0;",
+        "    while (i < 2) { s = s + 1; i++; }",
+        "    return s;",
+        "}",
+        "func use(a) { var r = add2(a); return r + 1; }",
+        "print(use(4));" });
+
+    /* GATE 2: the callee's frame would push the caller past
+     * BC_INLINE_MAX_FRAME. Built with enough live locals to exceed it -
+     * a bound rather than a tuning knob, since every recursion level
+     * allocates the whole frame.
+     *
+     * (The third gate gcov flagged - a ReturnV whose operand is a LITERAL
+     * - is NOT reachable and is not tested here: codegen always emits
+     * `LoadImmInt` + `ReturnV <slot>`, so `return 7` yields a slot. It is
+     * defensive against a future lowering, like the whitelist's `default:`
+     * ML_CHECK, and a test that "covers" it would have to fake a chunk.) */
+    std::vector<const char *> big;
+    std::vector<std::string> keep;
+    /* RESERVE: `big` holds c_str() pointers INTO `keep`, so a reallocation
+     * would dangle every one of them (ASan caught exactly that here). */
+    keep.reserve(256);
+    big.push_back("func fat(x) {");
+    for (int i = 0; i < 60; i++) {
+        keep.push_back("    var v" + std::to_string(i) + " = x + "
+                       + std::to_string(i) + ";");
+        big.push_back(keep.back().c_str());
+    }
+    std::string sum = "    var s = 0;";
+    keep.push_back(sum);
+    big.push_back(keep.back().c_str());
+    for (int i = 0; i < 60; i++) {
+        keep.push_back("    s = s + v" + std::to_string(i) + ";");
+        big.push_back(keep.back().c_str());
+    }
+    big.push_back("    return s;");
+    big.push_back("}");
+    big.push_back("func usef(a) { var r = fat(a); return r + 1; }");
+    big.push_back("print(usef(4));");
+    const int g_lit = splices(big);
+
+    g_bc_inline_enabled = saved_bi;
+    g_exec_engine = saved;
+
+    if (ctl < 1) {
+        cout << "  decline gates: the CONTROL shape did not splice (" << ctl
+             << ") - the test proves nothing\n";
+        return false;
+    }
+    if (g_opt != 0) {
+        cout << "  decline gates: an OMITTED OPT PARAM was spliced ("
+             << g_opt << ")\n";
+        return false;
+    }
+    if (g_lit != 0) {
+        cout << "  decline gates: a callee over BC_INLINE_MAX_FRAME was "
+                "spliced (" << g_lit << ")\n";
+        return false;
+    }
+    return true;
+}
+
+/*
  * TWO SPLICES IN ONE CHUNK, UNDER THE JIT (plans/bytecode-inliner.md
  * defect 2) - which turned out NOT to be a splice bug at all.
  *
@@ -21403,6 +21569,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: TWO splices in one chunk - surviving branch targets survive the "
       "EnterNative insertion (ackermann; tw == vm == vm+splice)",
       bc_inline_two_splices_jit },
+    { "codegen: the bytecode splice REFUSES the shapes it must (omitted opt "
+      "param, an over-budget frame) - gcov-found gates",
+      bc_inline_decline_gates },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",
