@@ -225,7 +225,27 @@ those classes in impact order.
    67_make_dict). VmInvoker already owns the window + captures for the
    loop; the per-element cost to remove is the dispatch entry/exit.
 
-3. **Borrowed read-only slices.** A loop-local slice that provably does
+3. **Borrowed read-only slices - INCREMENT 1 LANDED 2026-07-27** (the
+   evidence-first scope cut): profiling showed 15's cost was ~27%
+   malloc/free + ~16% hashtable insert/erase - the live-slices
+   REGISTRATION, not the view itself - so increment 1 is the PoolAlloc
+   treatment for SharedObject::slices (the H2 v2 shareddict drop-in;
+   elements are raw pointers, node-pointer stability untouched, ASan
+   pass-through free). ONE type change. Measured (Ir): 15 -26.5%
+   (wall 0.758x), 16_array_slice_write -14.9%, 14 -4.7%, 47 -0.9%,
+   13 flat; the pool-ACTIVE debug lane (ASAN=0 UBSAN=0 OPT=0 TESTS=1)
+   green. 29_str's residual is NOT slice machinery: ~25% ord()
+   builtin calls + the 1-char-SharedStr-per-subscript - lever 4b
+   territory (native ord/len), recorded. THE FOLLOW-UP FORK (the
+   remaining ~16% insert/erase logic on 15 + the true borrow vision):
+   (a) loop-invariant slice HOISTING (fr_immutable-style analysis:
+   base unmutated in-loop + the slice never written-through ->
+   evaluate once above the loop; kills ~all of 15/29's residual slice
+   cost; moderate optimizer work); (b) slot-level BORROWED views (a
+   non-escaping slice local skips registration entirely; value-model
+   soundness cliffs); (c) stop here (the class is now 0.76x wall).
+   Maintainer's pick.
+   (original analysis follows) A loop-local slice that provably does
    not escape skips the SharedArrayObj/SharedStr allocation + COW slice
    registration and becomes base+offset+len (15/29 slice_readonly
    21x/19x, the string benches, 47_wordcount). Needs a small escape
