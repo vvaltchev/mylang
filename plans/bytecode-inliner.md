@@ -163,8 +163,17 @@ return n + sumto(n-1); }` it emits the textbook form (`-vd`, one level):
       13  i.bin        r3 = r0 + r2     <- the join
       14  return.v     r3
 
-and it runs correctly with the JIT off. It is DEFAULT OFF because of two
-defects, both found by the battery, neither yet fixed:
+and it runs correctly with the JIT off. **All three defects below are now
+FIXED (2026-08-02), and NONE of them was the splice's own bug** - one was
+a pair of interpreted-path backtrace bugs, one a JIT remap silently
+disabled 39 commits earlier, one this pass's own reproducibility. With
+the splice FORCED ON the whole battery is green: `-rt` 1680/1680 +
+1486/1486, the fuzzer 200/200 with 0 diverged, and every sample
+byte-identical to the splice-off run (bar `rand_sort`, which uses
+`rand()`). It remains DEFAULT OFF pending a flip decision, which is a
+value question rather than a correctness one - see the reach note.
+
+The three, as found:
 
 **(1) [NOT THE SPLICE'S BUG - root-caused and mostly FIXED 2026-08-02 in
 `9fe3783` + `c1310ed`; the JIT residual moved to
