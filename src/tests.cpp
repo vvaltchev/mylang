@@ -7,11 +7,14 @@
 #include <fstream>
 #include <sstream>
 
-/* mkdir(), for the .myv source-reference relocation test */
+/* mkdir(), for the .myv source-reference relocation test; dup2()/close(),
+ * for the audit test's stderr capture (POSIX only - it self-skips on
+ * Windows) */
 #ifdef _WIN32
 #include <direct.h>
 #else
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #ifdef TESTS
@@ -17948,6 +17951,292 @@ static bool bc_inline_order_independent()
 }
 
 /*
+ * THE CORPUS AUDIT reports what a splice would reach (#91).
+ *
+ * `bc_inline_audit` is the dev tool (MYLANG_INLAUDIT=1) whose histogram
+ * decided this feature's whole scope - the "one bench, not four" finding
+ * came out of it. gcov showed it entirely uncovered, which matters more
+ * than for ordinary dev code: a MEASUREMENT TOOL that silently reports
+ * the wrong thing is worse than one that does not run, because its output
+ * is what the design decisions rest on.
+ *
+ * It is env-gated and writes to stderr, so the test sets the variable and
+ * redirects fd 2 for the duration. Asserts each verdict it can produce
+ * against a program built to elicit exactly that verdict.
+ */
+static bool bc_inline_audit_reports()
+{
+#ifdef _WIN32
+    return true;                  /* the capture below is POSIX dup2 */
+#else
+    const std::vector<const char *> src = {
+        /* -> OK: a plain callee the gate accepts */
+        "func good(x) {",
+        "    var s = 0; var i = 0;",
+        "    while (i < 3) { s = s + x; i++; }",
+        "    return s;",
+        "}",
+        /* -> op:<name>, the REJECTION REASON - the histogram's whole point
+         * is which opcode is blocking, so a wrong reason is worse than no
+         * report. A string local puts a non-whitelisted op in the body. */
+        "func strf(x) {",
+        "    var a = [1, 2, 3];",
+        "    a[0] = x;",
+        "    var i = 0; while (i < 2) { i++; }",
+        "    return a[0] + i;",
+        "}",
+        /* -> runtime-callee: an indirect call, which no splice can reach */
+        "func viafn(f, x) { var r = f(x); return r; }",
+        "func use(a) {",
+        "    var q = good(a);",
+        "    var w = strf(a);",
+        "    return q + w;",
+        "}",
+        "print(use(4) + viafn(good, 2));" };
+
+    std::string captured;
+    bool built = false;
+    fflush(stderr);
+    const int saved_fd = dup(fileno(stderr));
+    FILE *tmp = tmpfile();
+    if (saved_fd < 0 || !tmp) {
+        if (saved_fd >= 0) close(saved_fd);
+        if (tmp) fclose(tmp);
+        cout << "  audit: could not redirect stderr\n";
+        return false;
+    }
+    dup2(fileno(tmp), fileno(stderr));
+    setenv("MYLANG_INLAUDIT", "1", 1);
+
+    const ExecEngine se = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    try {
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        Block *rb = dynamic_cast<Block *>(root.get());
+        if (rb) {
+            std::vector<const FuncDeclStmt *> funcs;
+            collect_funcs(root.get(), funcs);
+            for (const FuncDeclStmt *fn : funcs) {
+                bool fast = true;
+                for (const auto &p : fn->desc->params)
+                    if (p.decl_type == DeclType::i
+                            || p.decl_type == DeclType::f)
+                        fast = false;
+                const_cast<FuncDescriptor *>(fn->desc)->fast_bind = fast;
+            }
+            std::vector<const FuncDescriptor *> slot_desc(
+                rb->global_func_names.size(), nullptr);
+            for (const FuncDeclStmt *fn : funcs)
+                if (fn->id && fn->id->sym.kind == SymKind::global) {
+                    const int sl = fn->id->sym.slot;
+                    if (sl >= 0 && static_cast<size_t>(sl) < slot_desc.size())
+                        slot_desc[sl] = fn->desc;
+                }
+            std::vector<std::pair<std::string, Chunk>> chunks;
+            for (const FuncDeclStmt *fn : funcs) {
+                Chunk ch;
+                if (!codegen_func_body(fn, ch, /*jit=*/false))
+                    continue;
+                chunks.emplace_back(fn->desc && fn->desc->name
+                                        ? std::string(fn->desc->name->val)
+                                        : std::string("?"),
+                                    std::move(ch));
+            }
+            for (auto &p : chunks)
+                for (const FuncDeclStmt *fn : funcs)
+                    if (fn->desc && fn->desc->name
+                            && std::string(fn->desc->name->val) == p.first)
+                        const_cast<FuncDescriptor *>(fn->desc)->vm_chunk =
+                            &p.second;
+            for (const auto &p : chunks)
+                bc_inline_audit(p.second, p.first.c_str(), slot_desc);
+            for (const FuncDeclStmt *fn : funcs)
+                const_cast<FuncDescriptor *>(fn->desc)->vm_chunk = nullptr;
+            built = true;
+        }
+    } catch (...) {
+        built = false;
+    }
+    g_exec_engine = se;
+
+    unsetenv("MYLANG_INLAUDIT");
+    fflush(stderr);
+    dup2(saved_fd, fileno(stderr));
+    close(saved_fd);
+    rewind(tmp);
+    {
+        char buf[512];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), tmp)) > 0)
+            captured.append(buf, n);
+    }
+    fclose(tmp);
+
+    if (!built) {
+        cout << "  audit: the program did not compile\n";
+        return false;
+    }
+    if (captured.find("INLAUDIT") == std::string::npos) {
+        cout << "  audit: produced NO output with MYLANG_INLAUDIT set\n";
+        return false;
+    }
+    if (captured.find("-> good") == std::string::npos
+            || captured.find("OK") == std::string::npos) {
+        cout << "  audit: no OK verdict for the accept-able callee:\n"
+             << captured;
+        return false;
+    }
+    if (captured.find("runtime-callee") == std::string::npos) {
+        cout << "  audit: an INDIRECT call was not reported as a runtime "
+                "callee:\n" << captured;
+        return false;
+    }
+    if (captured.find("op:") == std::string::npos) {
+        cout << "  audit: a callee blocked by an opcode was not reported "
+                "with its REASON - the histogram's whole purpose:\n"
+             << captured;
+        return false;
+    }
+    return true;
+#endif
+}
+
+/*
+ * SPLICING INTO A CALLER THAT ALREADY CARRIES INLINED-AT FRAMES (#91).
+ *
+ * gcov showed this path never ran, and the fuzzer never generates it: it
+ * needs a caller holding BOTH an AST-inlined call (which gives its chunk
+ * `inline_ctxs` entries) and a call the BYTECODE splice takes. The two
+ * inliners then meet in one chunk, and the splice must carry the caller's
+ * existing frame indices across its rebuild - if it dropped or renumbered
+ * them, a throw would render the wrong virtual frames.
+ *
+ * Checks three things: the VALUE is right in every splice/JIT
+ * combination, a throw from inside the spliced callee renders a backtrace
+ * byte-identical to the tree-walker's, and `g_bc_inline_caller_frames`
+ * actually moved - the last so the test cannot pass on an unexercised
+ * path, which is the whole reason it exists.
+ */
+static bool bc_inline_caller_with_frames()
+{
+    const std::vector<const char *> src = {
+        "func small(x) => x * 2 + 1;",
+        "func big(x) {",
+        "    var s = 0; var i = 0;",
+        "    while (i < 3) { s = s + x; i++; }",
+        "    return s;",
+        "}",
+        "func caller(a) {",
+        "    var p = small(a);",
+        "    var q = big(a);",
+        "    return p + q;",
+        "}",
+        "print(caller(4));" };
+    /* the same shape, but the spliced callee THROWS - the backtrace must
+     * survive the two inliners meeting */
+    const std::vector<const char *> thr = {
+        "func small(x) => x * 2 + 1;",
+        "func big(x) {",
+        "    var s = 0; var i = 0;",
+        "    while (i < 3) { s = s + x; i++; }",
+        "    return s / (x - x);",
+        "}",
+        "func caller(a) {",
+        "    var p = small(a);",
+        "    var q = big(a);",
+        "    return p + q;",
+        "}",
+        "print(caller(4));" };
+
+    auto run = [&](const std::vector<const char *> &s, bool vm, bool jit,
+                   bool splice) -> std::string {
+        const ExecEngine se = g_exec_engine;
+        const bool sj = g_jit_enabled, sb = g_bc_inline_enabled;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        g_jit_enabled = jit;
+        g_bc_inline_enabled = splice;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        std::string out;
+        try {
+            std::string joined;
+            for (const char *l : s) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+            out = cap.str();
+        } catch (Exception &e) {
+            out = format_backtrace(e);
+        } catch (...) {
+            out = "<other>";
+        }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        g_jit_enabled = sj;
+        g_bc_inline_enabled = sb;
+        return out;
+    };
+
+    const unsigned long before = g_bc_inline_caller_frames;
+    const std::string tw = run(src, false, false, false);
+    bool ok = !tw.empty();
+    /* every VM combination must agree with the tree-walker */
+    const bool jits[2] = { false, true };
+    for (int j = 0; j < (ML_JIT_SUPPORTED ? 2 : 1) && ok; j++)
+        for (int b = 0; b < 2 && ok; b++) {
+            const std::string got = run(src, true, jits[j], b != 0);
+            if (got != tw) {
+                cout << "  caller-frames: value differs (jit=" << jits[j]
+                     << " splice=" << b << ")\n    tw=[" << tw
+                     << "]\n    vm=[" << got << "]\n";
+                ok = false;
+            }
+        }
+    if (!ok)
+        return false;
+
+    /* ... and the BACKTRACE through the spliced callee */
+    const std::string btw = run(thr, false, false, false);
+    if (btw.find("big") == std::string::npos) {
+        cout << "  caller-frames: the throwing shape did not backtrace\n";
+        return false;
+    }
+    for (int j = 0; j < (ML_JIT_SUPPORTED ? 2 : 1); j++)
+        for (int b = 0; b < 2; b++) {
+            const std::string got = run(thr, true, jits[j], b != 0);
+            if (got != btw) {
+                cout << "  caller-frames: BACKTRACE differs (jit="
+                     << jits[j] << " splice=" << b << ")\n    tw:\n" << btw
+                     << "    vm:\n" << got;
+                return false;
+            }
+        }
+
+    if (g_bc_inline_caller_frames == before) {
+        cout << "  caller-frames: the path never ran - the shape stopped "
+                "producing an AST-inlined caller with a spliced call\n";
+        return false;
+    }
+    return true;
+}
+
+/*
  * THE SPLICE'S DECLINE GATES (found by gcov, 2026-08-02).
  *
  * A coverage build over `-rt` + the samples showed several gates in
@@ -18058,38 +18347,33 @@ static bool bc_inline_decline_gates()
         "func use(a) { var r = add2(a); return r + 1; }",
         "print(use(4));" });
 
-    /* GATE 2: the callee's frame would push the caller past
-     * BC_INLINE_MAX_FRAME. Built with enough live locals to exceed it -
-     * a bound rather than a tuning knob, since every recursion level
-     * allocates the whole frame.
-     *
-     * (The third gate gcov flagged - a ReturnV whose operand is a LITERAL
-     * - is NOT reachable and is not tested here: codegen always emits
-     * `LoadImmInt` + `ReturnV <slot>`, so `return 7` yields a slot. It is
-     * defensive against a future lowering, like the whitelist's `default:`
-     * ML_CHECK, and a test that "covers" it would have to fake a chunk.) */
+    /* GATE 2: the frame budget. THE CALLEE MUST BE SMALL - a fat callee is
+     * rejected by BC_INLINE_MAX_OPS long before the frame check, which is
+     * how the first version of this test passed for the wrong reason (it
+     * measured `too-big`, not the budget). So the CALLER carries the slots
+     * and the callee is a few ops, which is exactly the shape the bound
+     * exists for: every recursion level allocates the whole frame. */
     std::vector<const char *> big;
     std::vector<std::string> keep;
-    /* RESERVE: `big` holds c_str() pointers INTO `keep`, so a reallocation
-     * would dangle every one of them (ASan caught exactly that here). */
-    keep.reserve(256);
-    big.push_back("func fat(x) {");
-    for (int i = 0; i < 60; i++) {
-        keep.push_back("    var v" + std::to_string(i) + " = x + "
+    keep.reserve(256);          /* `big` holds c_str()s INTO keep */
+    big.push_back("func small2(x) {");
+    big.push_back("    var s = x + 1;");
+    big.push_back("    return s;");
+    big.push_back("}");
+    big.push_back("func fatcaller(a) {");
+    for (int i = 0; i < 90; i++) {
+        keep.push_back("    var v" + std::to_string(i) + " = a + "
                        + std::to_string(i) + ";");
         big.push_back(keep.back().c_str());
     }
-    std::string sum = "    var s = 0;";
-    keep.push_back(sum);
-    big.push_back(keep.back().c_str());
-    for (int i = 0; i < 60; i++) {
-        keep.push_back("    s = s + v" + std::to_string(i) + ";");
+    big.push_back("    var r = small2(a);");
+    for (int i = 0; i < 90; i++) {
+        keep.push_back("    r = r + v" + std::to_string(i) + ";");
         big.push_back(keep.back().c_str());
     }
-    big.push_back("    return s;");
+    big.push_back("    return r;");
     big.push_back("}");
-    big.push_back("func usef(a) { var r = fat(a); return r + 1; }");
-    big.push_back("print(usef(4));");
+    big.push_back("print(fatcaller(1));");
     const int g_lit = splices(big);
 
     g_bc_inline_enabled = saved_bi;
@@ -21672,6 +21956,12 @@ static const std::vector<extra_check> extra_checks =
     { "codegen: the bytecode splice REFUSES the shapes it must (omitted opt "
       "param, an over-budget frame) - gcov-found gates",
       bc_inline_decline_gates },
+    { "codegen: splice into a caller that ALREADY carries inlined-at frames "
+      "(AST inliner + bytecode splice in one chunk; value + backtrace)",
+      bc_inline_caller_with_frames },
+    { "codegen: the corpus AUDIT reports each verdict (MYLANG_INLAUDIT) - "
+      "the measurement tool this feature's scope was decided from",
+      bc_inline_audit_reports },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",

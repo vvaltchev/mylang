@@ -159,3 +159,6 @@ bool bc_inline_chunk(Chunk &ck,
 /* The splice's kill switch (-nbi / MYLANG_BCINLINE=0): the same-binary
  * A/B, since the un-inlined bytecode is the only oracle for a splice. */
 extern bool g_bc_inline_enabled;
+
+/* Execution proof for the caller-frame path - see codegen.cpp. */
+extern unsigned long g_bc_inline_caller_frames;

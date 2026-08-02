@@ -8480,6 +8480,34 @@ bool bc_inline_callee_ok(const Chunk &callee, std::string *why)
     if (callee.n_dict_iters != 0 || callee.n_dyn_iters != 0)
         return no("frame-iterators");
 
+    /*
+     * NO BRANCH MAY POINT PAST THE CALLEE'S END. Such a target means "fall
+     * off the end", i.e. the implicit `return none` - and a splice CANNOT
+     * express that: it would map onto the join and leave the call's dst
+     * slot UNWRITTEN, so the caller reads whatever was there before (a
+     * stale previous result, not none). That was a real miscompile before
+     * the trailing-Halt fix, which is what made these callees reachable.
+     *
+     * Today codegen gives such a body a Halt and `no-tail-return` above
+     * already rejects it, so this is belt-and-braces - but it states the
+     * requirement DIRECTLY instead of depending on another pass's side
+     * effect, and it is what lets the splice's own remap ASSERT that every
+     * target is in range rather than silently mapping it to the join.
+     */
+    {
+        const size_t nb = callee.code.size();
+        for (const Instr &bin : callee.code) {
+            bool oor = false;
+            Instr tmp = bin;
+            visit_pc_fields(tmp, [&](int &t) {
+                if (t < 0 || static_cast<size_t>(t) >= nb)
+                    oor = true;
+            });
+            if (oor)
+                return no("branch-past-end");
+        }
+    }
+
     for (const Instr &in : callee.code)
         if (!bc_inline_op_ok(in.op)) {
             if (why)
@@ -8536,6 +8564,12 @@ void bc_inline_audit(const Chunk &caller, const char *caller_name,
  * working transform. The switch is also the same-binary A/B a splice
  * needs, since the un-inlined bytecode is its only oracle.
  */
+/* #91 coverage: proof that the CALLER-FRAME path ran - a splice into a
+ * caller that already carries inlined-at frames of its own (an AST-inlined
+ * call plus a bytecode-spliced one in the same body). Bumped only from
+ * that branch, so a test cannot pass by taking some other route. */
+unsigned long g_bc_inline_caller_frames = 0;
+
 bool g_bc_inline_enabled = [] {
     const char *e = getenv("MYLANG_BCINLINE");
     return e && e[0] == '1';
@@ -8817,10 +8851,19 @@ bool bc_inline_chunk(Chunk &ck,
                 Instr bi = S.body[j];
                 bc_remap_slots(bi, S.base);
                 visit_pc_fields(bi, [&](int &t) {
-                    if (t >= 0 && static_cast<size_t>(t) < nb)
-                        t = static_cast<int>(body_base + lmap[t]);
-                    else
-                        t = static_cast<int>(join);   /* a tail target */
+                    /*
+                     * The gate's `branch-past-end` rejection means every
+                     * target is a real pc of this body. It did NOT always:
+                     * this used to map an out-of-range target to the join,
+                     * which SILENTLY left the call's dst unwritten - the
+                     * caller then read a stale value where the callee
+                     * would have returned none. So assert rather than
+                     * "handle" it: the handling was the bug, and a loud
+                     * abort is what a revived shape should get.
+                     */
+                    ML_CHECK_MSG(t >= 0 && static_cast<size_t>(t) < nb,
+                                 "bc splice: callee branch past its end");
+                    t = static_cast<int>(body_base + lmap[t]);
                 });
                 if (has_loc)
                     nlocs.push_back({ static_cast<uint32_t>(nc.size()),
@@ -8836,8 +8879,16 @@ bool bc_inline_chunk(Chunk &ck,
         if (caller_loc(pc, s, e))
             nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
         const int32_t f = ck.inline_frame_at(pc);
-        if (f >= 0)
+        if (f >= 0) {
+#ifdef TESTS
+            g_bc_inline_caller_frames++;
+#endif
+            /* a CALLER op that is itself inlined-at code keeps its frame
+             * index: the caller's own chains must survive the splice, or
+             * a throw from AST-inlined code in a spliced body renders the
+             * wrong virtual frames */
             nctx.push_back({ static_cast<uint32_t>(nc.size()), f });
+        }
         nc.push_back(ck.code[pc]);
         from_caller.push_back(1);
     }

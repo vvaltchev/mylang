@@ -341,13 +341,41 @@ source so the next reader does not "fix" the coverage:
     `LoadImmInt` + `ReturnV <slot>`, so `return 7` produces a slot. A
     test would have to fake a chunk to reach it.
 
-STILL UNCOVERED - the remaining work before any flip decision:
-  - the tail-target rewrite (`t = join` in the body's `visit_pc_fields`):
-    needs a callee whose branch targets the one-past-the-end pc;
-  - splicing into a caller that ALREADY carries `inline_ctxs` entries
-    (the `nctx.push_back` for a caller op with an existing frame) - i.e.
-    an AST-inlined caller plus a bytecode splice in one chunk;
-  - `bc_inline_audit` in full (dev-only, env-gated).
+NOW TESTED (second pass, same day):
+  - **the caller-frame path** - a splice into a caller that ALREADY
+    carries `inline_ctxs` entries, i.e. the AST inliner and the bytecode
+    splice meeting in one chunk. The fuzzer never generates it; it needs a
+    caller holding both an AST-inlined call and a spliceable one.
+    `bc_inline_caller_with_frames` checks the VALUE in every JIT/splice
+    combination, checks a throw from inside the spliced callee renders a
+    backtrace byte-identical to the tree-walker's, and asserts
+    `g_bc_inline_caller_frames` moved so it cannot pass unexercised.
+  - **the corpus audit** (`bc_inline_audit_reports`), asserting all three
+    verdicts it can print - OK, `runtime-callee`, and `op:<name>` - by
+    building a program that elicits each. A measurement tool that silently
+    reports the wrong thing is worse than one that does not run, since its
+    histogram is what this feature's scope was decided from. Verified by
+    sabotaging the reason string and watching the test fail.
+  - **the frame budget**, properly this time. The first version used a fat
+    CALLEE, which `BC_INLINE_MAX_OPS` rejects long before the frame check -
+    so it passed while measuring the wrong gate. It now uses a fat CALLER
+    and a 2-op callee, and the audit confirms that callee is reported `OK`
+    (i.e. the decline really is the budget).
+
+THE TAIL-TARGET REWRITE IS GONE, not merely uncovered. It mapped a callee
+branch pointing past the end onto the join, which LEFT THE CALL'S DST
+UNWRITTEN - the caller then read a stale value where the callee returns
+`none`. That was a real miscompile, reachable until the trailing-Halt fix
+(see CLAUDE.md). The requirement is now stated DIRECTLY as a gate
+(`branch-past-end`, verified to reject on its own with the Halt fix
+temporarily reverted) and the rewrite ASSERTS instead of "handling" it -
+the handling was the bug, so a revived shape should abort loudly rather
+than silently miscompile.
+
+REMAINING UNCOVERED, all deliberate: the `empty` and `branch-past-end`
+gates and `bc_remap_slots`'s `ReturnV`/`default` cases (unreachable by
+construction - a whitelist's belt-and-braces), the literal-return gate
+(codegen always emits a slot), and the audit's `unresolved-callee`.
 
 ## What must NOT be inlined
 
