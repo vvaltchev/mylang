@@ -3473,6 +3473,27 @@ static const std::vector<test> tests =
      * static type. The null used to escape type_of into contribute's
      * is_dyn - a SEGFAULT (pre-existing; found by the lever-1 step-5
      * sync-call test's dyn-arg shape). A plain var gets DynRequiredEx. */
+    /* Lever 3: the COW-detach semantics the hoist gate protects (an
+     * element write to a base with a live slice clones the base away;
+     * per-iteration fresh views must see the new storage) + hoisted
+     * zero-iteration safety (the moved slice cannot throw). */
+    { "slice hoist: base content write keeps per-iteration views",
+      { "var base = [10, 20, 30, 40];",
+        "var out = \"\";",
+        "for (var i = 0; i < 3; i++) {",
+        "  var sl = base[0:2];",
+        "  base[0] = i * 100;",
+        "  out = out + str(sl[0]) + \",\";",
+        "}",
+        "assert(out == \"10,0,100,\");" } },
+    { "slice hoist: zero-iteration loop stays throw-free",
+      { "var base = [1, 2, 3];",
+        "var zarr = [];",
+        "append(zarr, 7);",
+        "var n = len(zarr) - 1;",      /* a runtime int 0 (not dyn) */
+        "var s = 0;",
+        "for (var i = 0; i < n; i++) { var sl = base[1:3]; s += sl[0]; }",
+        "assert(s == 0);" } },
     { "ternary: incompatible arms make a dyn value (var dyn required)",
       { "var i = 1;",
         "var dyn q = i == 0 ? [1, 2] : 7;",
@@ -15028,6 +15049,104 @@ static bool jit_native_stack_deep()
 #endif
 }
 
+/* Lever 3 inc 2 (loop-invariant slice hoisting): the optimized-tree
+ * SHAPE tests - a hoistable `var sl = base[a:b]` moves ABOVE the loop
+ * (serialize shows the decl before the For/While node), and each gate
+ * violation keeps it inside: a length mutation, a CONTENT mutation (the
+ * COW-detach hazard - an element write to a base with a live slice
+ * clones the base away, so a hoisted view would read stale storage), a
+ * write-through of the slice var, a dyn base (no non-throw proof), a
+ * counter-dependent bound. Runtime semantics ride the ordinary -rt
+ * differential + the pinned COW test below. */
+static bool hoist_slice_shapes()
+{
+    struct Case {
+        const char *name;
+        std::vector<const char *> lines;
+        bool expect_hoist;
+    };
+    const std::vector<Case> cases = {
+        { "hoist: basic for", {
+            "var base = [1, 2, 3, 4, 5];",
+            "var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; s += sl[0];",
+            "}" }, true },
+        { "hoist: while + len bound", {
+            "var base = [1, 2, 3, 4, 5];",
+            "var s = 0; var i = 0;",
+            "while (i < 3) {",
+            "  var sl = base[1:len(base) - 1]; s += sl[0]; i += 1;",
+            "}" }, true },
+        { "hoist: auto-const string-literal base (bench 29's shape)", {
+            "var base = \"0123456789\";",
+            "var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sub = base[1:9]; s += ord(sub[0]);",
+            "}" }, true },
+        { "no hoist: base append (mut_len)", {
+            "var base = [1, 2, 3, 4, 5];",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; append(base, i);",
+            "}" }, false },
+        { "no hoist: base element write (COW detach)", {
+            "var base = [1, 2, 3, 4, 5];",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; base[0] = i;",
+            "}" }, false },
+        { "no hoist: slice written through", {
+            "var base = [1, 2, 3, 4, 5];",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; sl[0] = i;",
+            "}" }, false },
+        { "no hoist: dyn base (no non-throw proof)", {
+            "var dyn base = runtime([1, 2, 3, 4, 5]);",
+            "for (var i = 0; i < 3; i++) {",
+            "  var dyn sl = base[1:4];",
+            "}" }, false },
+        { "no hoist: counter-dependent bound", {
+            "var base = [1, 2, 3, 4, 5];",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[i:4];",
+            "}" }, false },
+    };
+    for (const Case &c : cases) {
+        std::string s;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i) s += '\n';
+            s += c.lines[i];
+        }
+        lexer(s, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        std::ostringstream out;
+        root->serialize(out);
+        const std::string t = out.str();
+        /* HOISTED == the Slice appears BEFORE the loop node in the
+         * serialized tree; else after (still inside the body). */
+        const size_t slice_at = t.find("Slice(");
+        const size_t loop_at = std::min(t.find("ForRangeStmt"),
+                                        std::min(t.find("ForStmt"),
+                                                 t.find("WhileStmt")));
+        if (slice_at == std::string::npos || loop_at == std::string::npos) {
+            fprintf(stderr, "hoist_slice_shapes: '%s' missing nodes\n",
+                    c.name);
+            return false;
+        }
+        const bool hoisted = slice_at < loop_at;
+        if (hoisted != c.expect_hoist) {
+            fprintf(stderr, "hoist_slice_shapes: '%s' expected %s\n",
+                    c.name, c.expect_hoist ? "HOIST" : "no hoist");
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Lever 2 (VmInvoker direct fragment entry): per callback ELEMENT the
  * invoker calls jit_enter directly instead of re-entering vm_dispatch -
  * g_jit_invoke_direct counts those entries, so growth ~ the element
@@ -17920,6 +18039,8 @@ static const std::vector<extra_check> extra_checks =
       jit_native_stack_deep },
     { "jit: VmInvoker enters callback fragments directly (lever 2)",
       jit_invoke_direct_entry },
+    { "opt: loop-invariant slice hoisting shapes (lever 3)",
+      hoist_slice_shapes },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",
