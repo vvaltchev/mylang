@@ -1188,7 +1188,41 @@ struct DynIterState {
     size_type idx = 0, size = 0;               /* array cursor + snapshot */
     int_type counter = 0;                      /* dict `indexed` counter */
     DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
+    /* Lever 4 (shape specialization): the per-element Next body, RESOLVED
+     * ONCE at Init - a flat int/float/bool single-var array binds the raw
+     * scalar, a 1/2-var dict binds through the baked slot0/slot1, anything
+     * else keeps the generic body. Kind-stable by construction: a flat
+     * int/float/bool array can never change storage kind at runtime (no
+     * promotion; a wrong-type mutation throws), and every fast body still
+     * re-derefs the container per element, so growth/realloc during the
+     * loop behaves exactly as the generic body did. */
+    bool (*next)(DynIterState &, Frame &, const Chunk *, size_t) = nullptr;
+    int32_t slot0 = -1, slot1 = -1;            /* baked target slots */
 };
+
+static bool vm_foreach_dyn_next_body(DynIterState &, Frame &,
+                                     const Chunk *, size_t);
+static bool vm_dyn_next_arr_int(DynIterState &, Frame &,
+                                const Chunk *, size_t);
+static bool vm_dyn_next_arr_float(DynIterState &, Frame &,
+                                  const Chunk *, size_t);
+static bool vm_dyn_next_arr_bool(DynIterState &, Frame &,
+                                 const Chunk *, size_t);
+static bool vm_dyn_next_arr_gen(DynIterState &, Frame &,
+                                const Chunk *, size_t);
+static bool vm_dyn_next_dict(DynIterState &, Frame &,
+                             const Chunk *, size_t);
+#ifdef TESTS
+/* lever 4 execution proof: per-element runs of EACH specialized body
+ * (0 int / 1 float / 2 bool / 3 gen / 4 dict) - one aggregate counter
+ * could not tell the flat bodies from the gen fallback (a `var dyn a =
+ * range(N)` DESTINATION is general storage by the ArrHint rule; only a
+ * dyn ALIAS of a typed array reaches the flat bodies). */
+unsigned long g_dyn_foreach_fast[5] = {0};
+#  define ML_DYN_FAST_RAN(k) (g_dyn_foreach_fast[k]++)
+#else
+#  define ML_DYN_FAST_RAN(k) ((void)0)
+#endif
 
 /* The SHARED iterator-op bodies (model-flip nativize-ops): ONE implementation
  * each for the interpreter handler AND its jit_* twin, so the two cannot
@@ -1239,14 +1273,43 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
     st.indexed = (shape >> 8) != 0;
     st.targets = targets;
     st.counter = 0;
+    st.next = &vm_foreach_dyn_next_body;     /* the generic default */
+    st.slot0 = st.slot1 = -1;
+    const std::vector<int32_t> &tg = *targets;
+    const size_t tb = st.indexed ? 1 : 0;
+    const size_t nv = static_cast<size_t>(st.nvars) - tb;
     if (st.container.is<SharedArrayObj>()) {
         st.is_dict = false;
         st.idx = 0;
         st.size = st.container.get<SharedArrayObj>().size();
+        /* lever 4: the single-var, non-indexed array loop binds per-skind
+         * (a `_` var / indexed / N-var unpack keeps the generic body). */
+        if (!st.indexed && nv == 1 && tg[0] >= 0) {
+            st.slot0 = tg[0];
+            switch (st.container.get_ref<SharedArrayObj>().skind()) {
+            case SharedArrayObj::Storage::ints:
+                st.next = &vm_dyn_next_arr_int; break;
+            case SharedArrayObj::Storage::floats:
+                st.next = &vm_dyn_next_arr_float; break;
+            case SharedArrayObj::Storage::bools:
+                st.next = &vm_dyn_next_arr_bool; break;
+            default:      /* general/strs/structs: strs may PROMOTE mid-
+                           * loop, so the per-element arr_elem_at dispatch
+                           * is kept (still shape-specialized). */
+                st.next = &vm_dyn_next_arr_gen; break;
+            }
+        }
     } else if (st.container.is<intrusive_ptr<DictObject>>()) {
         st.is_dict = true;
         st.it = st.container.get<intrusive_ptr<DictObject>>()
                     ->get_ref().begin();
+        /* lever 4: the non-indexed 1/2-var dict loop binds key/value
+         * through the baked slots (>2 vars = none-padding -> generic). */
+        if (!st.indexed && nv >= 1 && nv <= 2) {
+            st.slot0 = tg[0];
+            st.slot1 = nv == 2 ? tg[1] : -1;
+            st.next = &vm_dyn_next_dict;
+        }
     } else {
         Loc s, en;
         if (chunk)
@@ -1310,6 +1373,75 @@ vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
             bind(tb + i, none);
         ++st.it;
     }
+    return true;
+}
+
+/* Lever 4 - the SPECIALIZED Next bodies (selected once at Init; see
+ * DynIterState::next). Each mirrors the generic body's semantics for its
+ * shape EXACTLY: the size snapshot bounds the loop, the container is
+ * re-derefed per element (growth/realloc during the loop behaves as
+ * before), and a flat scalar binds as the same boxed value arr_elem_at
+ * produces (a flat bool binds a REAL bool). None of them throw. */
+static bool
+vm_dyn_next_arr_int(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    if (st.idx >= st.size)
+        return false;
+    ML_DYN_FAST_RAN(0);
+    const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    frame.at(st.slot0).put(EvalValue(a.flat_ints()[a.offset() + st.idx]));
+    st.idx++;
+    return true;
+}
+
+static bool
+vm_dyn_next_arr_float(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    if (st.idx >= st.size)
+        return false;
+    ML_DYN_FAST_RAN(1);
+    const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    frame.at(st.slot0).put(EvalValue(a.flat_floats()[a.offset() + st.idx]));
+    st.idx++;
+    return true;
+}
+
+static bool
+vm_dyn_next_arr_bool(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    if (st.idx >= st.size)
+        return false;
+    ML_DYN_FAST_RAN(2);
+    const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    frame.at(st.slot0).put(EvalValue(
+        static_cast<bool>(a.flat_bools()[a.offset() + st.idx])));
+    st.idx++;
+    return true;
+}
+
+static bool
+vm_dyn_next_arr_gen(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    if (st.idx >= st.size)
+        return false;
+    ML_DYN_FAST_RAN(3);
+    frame.at(st.slot0).put(vm_arr_elem(st.container, st.idx));
+    st.idx++;
+    return true;
+}
+
+static bool
+vm_dyn_next_dict(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    DictObject &d = *st.container.get<intrusive_ptr<DictObject>>();
+    if (st.it == d.get_ref().end())
+        return false;
+    ML_DYN_FAST_RAN(4);
+    if (st.slot0 >= 0)
+        frame.at(st.slot0).put(st.it->first);
+    if (st.slot1 >= 0)
+        frame.at(st.slot1).put(st.it->second.get());
+    ++st.it;
     return true;
 }
 
@@ -2672,9 +2804,8 @@ extern "C" int jit_foreach_dyn_next(int_type iter_id) noexcept
 {
     ML_JIT_OP_RAN(ForeachDynNext);
     try {
-        return vm_foreach_dyn_next_body(jit_dyiter(iter_id),
-                                        *g_current_ctx->frame,
-                                        nullptr, 0) ? 1 : 0;
+        DynIterState &st = jit_dyiter(iter_id);
+        return st.next(st, *g_current_ctx->frame, nullptr, 0) ? 1 : 0;
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return -1;
@@ -6490,8 +6621,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * binds key [, value [, none...]] (do_iter's count=2 padding). */
             ML_VM_CHECK(in->target2 >= 0
                 && in->target2 < static_cast<int_type>(chunk->n_dyn_iters));
-            if (!vm_foreach_dyn_next_body(dyiter(in->target2), *ctx.frame,
-                                          chunk, pc)) {
+            DynIterState &dst_ = dyiter(in->target2);
+            if (!dst_.next(dst_, *ctx.frame, chunk, pc)) {
                 pc = static_cast<size_t>(in->target);
                 VM_NEXT;
             }
