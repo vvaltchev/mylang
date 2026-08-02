@@ -211,7 +211,13 @@ struct RuntimeException : public Exception {
         }                                                 \
                                                           \
         const UniqueId *match_uid() const override {      \
-            static const UniqueId *u = UniqueId::get(#name); \
+            /* hand-rolled lazy init: a plain zero-init   \
+             * pointer, no __cxa_guard acquire (the       \
+             * interpreter is single-threaded; the guard  \
+             * measured 18 Ir per catch on 70_exc) */     \
+            static const UniqueId *u;                     \
+            if (!u)                                       \
+                u = UniqueId::get(#name);                 \
             return u;                                     \
         }                                                 \
                                                           \

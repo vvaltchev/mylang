@@ -4616,6 +4616,14 @@ call + pc search, ~27 Ir per raise) over the ML_NOINLINE walk.
 Measured: 70_exc a further **-15.5%** Ir; the pool inlining also pays
 on the dict-node paths - 23_dict_insert -4.1%, 67_make_dict -4.8%;
 10/62 neutral. Cumulative #74: 155.7M -> 73.9M (**-52.5%**).
+**#74 increment 5 (final) - the guard-free match_uid:** the macro's
+function-local `static const UniqueId *u = get(...)` paid an
+__cxa_guard acquire per catch (~18 Ir - thread-safe statics in a
+single-threaded interpreter); a plain zero-init pointer + null-check
+lazy init replaces it. 70_exc -1.6%. CAMPAIGN TOTAL: 155.7M -> 72.7M
+(**-53.3%**); the residue is the CatchTest/EnterNative dispatch, the
+same-frame vm_raise machinery (~40 Ir/raise), and the per-throw
+ctor/dtor - each next step architectural for cold-path returns.
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
