@@ -145,6 +145,63 @@ and the check fires. That uses the existing audited table as a CHECKER
 instead of duplicating it - duplication being exactly how the other
 tables drifted.
 
+## STATUS: the splice is WRITTEN and OPT-IN (`-bi` / MYLANG_BCINLINE=1)
+
+It produces correct bytecode. On `func sumto(n) { if (n==0) return 0;
+return n + sumto(n-1); }` it emits the textbook form (`-vd`, one level):
+
+       3  i.bin        r1 = r0 - 1
+       4  move         r4 = r1          <- the arg bind
+       5  i.jmp.ifnot  r4 == 0, L9      <- the body, slots +4
+       6  load         r5, 0
+       7  move         r2 = r5          <- ReturnV -> move to the call's dst
+       8  jmp          L13              <- ... and jump to the join
+       9  i.bin        r5 = r4 - 1
+      10  call.v       r6 = g0(r5)      <- the recursion, now 2 levels down
+      11  i.bin        r7 = r4 + r6
+      12  move         r2 = r7          <- the TAIL return just falls through
+      13  i.bin        r3 = r0 + r2     <- the join
+      14  return.v     r3
+
+and it runs correctly with the JIT off. It is DEFAULT OFF because of two
+defects, both found by the battery, neither yet fixed:
+
+**(1) A spliced frame's VIRTUAL backtrace frame is dropped.** A throwing
+`sumto(4)` renders 5 frames spliced against 6 un-spliced - the level that
+was inlined into a physical frame contributes nothing. Diagnosed: the
+per-record flush in `vm_unwind_walk` calls `vm_flush_inline`, which is
+guarded by `Exception::inline_origin_emitted`, so only the FIRST flush of
+an unwind emits. That guard is right for the AST inliner, where a nested
+splice is one PARENT CHAIN emitted at the innermost node - but a chunk
+that appears on the stack MORE THAN ONCE (a recursion whose body was
+spliced) has a SEPARATE chain per activation.
+
+The fix is the one the tree-walker already uses: its `do_func_call` catch
+flushes UNCONDITIONALLY (CLAUDE.md: "each physical call's flush stays
+unconditional (multi-level inlined call sites all show)") while only the
+raise-site flush is once-guarded. So `vm_unwind_walk` needs a `vm_flush_
+inline_call` variant that does the pc lookup, pushes the chain, and does
+NOT consult the guard - and must NOT prefer `Exception::jit_inline_frame`
+there, since that baked index belongs to the RAISE site, not this call.
+
+**(2) A chunk with TWO splices miscompiles UNDER THE JIT.** Ackermann
+(two self-calls in one body) dispatches a garbage opcode - UBSan:
+`index 190 out of bounds for type 'void *[128]'` at the computed-goto
+table. NOT root-caused. What IS established: the bytecode is correct
+(`-nj` runs it right, and the 48-op `-vd` form checks out by hand - both
+splices, slots remapped +7 and +14, joins at 29 and 47); one splice is
+fine under the JIT; the failure needs the JIT and two sites. So the bug
+is in how the JIT consumes the spliced chunk, not in the splice. Next
+probes: whether it survives with delete-originals disabled, and whether
+the per-pc entry stubs cover the two joins.
+
+**(3) The pass order is NON-DETERMINISTIC** - it iterates `g_func_chunks`,
+an unordered_map, so whether a callee is snapshotted before or after its
+OWN splice varies run to run. Self-recursion is unaffected (the snapshot
+is taken before that chunk is touched), but a compile must be
+reproducible - CLAUDE.md pins "compiling twice is byte-identical". Fix:
+snapshot every callee body up front, or iterate a sorted order.
+
 ### Increment 2 - the return boundary
 
 B's `ReturnV` becomes `MoveV dst = result` + `Jump` past the splice, the

@@ -8483,3 +8483,320 @@ void bc_inline_audit(const Chunk &caller, const char *caller_name,
                 ok ? "" : why.c_str());
     }
 }
+
+/*
+ * OPT-IN (-bi / MYLANG_BCINLINE=1), and DEFAULT OFF until the two
+ * defects in plans/bytecode-inliner.md are fixed - the splice's bytecode
+ * is correct (it runs right with the JIT off, and -vd shows the textbook
+ * form) but (1) a spliced frame's VIRTUAL backtrace frame is dropped and
+ * (2) a chunk with TWO splices miscompiles under the JIT. Shipping it on
+ * would be a correctness regression; deleting it would throw away a
+ * working transform. The switch is also the same-binary A/B a splice
+ * needs, since the un-inlined bytecode is its only oracle.
+ */
+bool g_bc_inline_enabled = [] {
+    const char *e = getenv("MYLANG_BCINLINE");
+    return e && e[0] == '1';
+}();
+
+/*
+ * Remap every FRAME SLOT field of a whitelisted op by +base.
+ *
+ * The layouts are read off each op's emit site and its VM_CASE, and are
+ * written down in plans/bytecode-inliner.md so nobody re-derives them.
+ * The net below is what makes that safe without a SECOND audited table:
+ * `visit_use_def` independently enumerates this op's slots, and every
+ * callee-local slot is < base, so a field this function MISSED is still
+ * below base and the check fires. The audited table is used as a CHECKER
+ * rather than duplicated - duplication is exactly how the other per-op
+ * tables drifted.
+ */
+static void bc_remap_slots(Instr &in, int base)
+{
+    const auto ra = [&]() {
+        if (!in.a_is_lit() && in.a_slot() >= 0) {
+            Operand o = in.a();
+            o.slot += base;
+            in.set_a(o);
+        }
+    };
+    const auto rb = [&]() {
+        if (!in.b_is_lit() && in.b_slot() >= 0) {
+            Operand o = in.b();
+            o.slot += base;
+            in.set_b(o);
+        }
+    };
+    const auto rt = [&]() { if (in.target >= 0) in.target += base; };
+
+    switch (in.op) {
+    case OpCode::Jump:
+        break;                          /* target is a pc, not a slot */
+    case OpCode::JumpUnlessIntCmp:
+    case OpCode::JumpUnlessFloatCmp:
+        ra(); rb();                     /* target is a pc */
+        break;
+    case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
+        rt();                           /* a is the immediate */
+        break;
+    case OpCode::MoveV:
+        rt();
+        if (in.target2 >= 0)
+            in.target2 += base;
+        break;
+    case OpCode::ReturnV:
+        ra();
+        break;
+    case OpCode::CallV:
+        /* target2 is a GLOBAL-table slot, NOT a frame slot - leaving it
+         * alone is the whole reason this is written by hand. `a` is the
+         * ARG RUN's base, a frame slot carried as a literal. */
+        rt();
+        in.set_a(int_lit(in.a_lit() + base));
+        break;
+    case OpCode::IntBin:      case OpCode::FloatBin:
+    case OpCode::IntAddRR:    case OpCode::IntAddRI:
+    case OpCode::IntSubRR:    case OpCode::IntSubRI:
+    case OpCode::IntMulRR:    case OpCode::IntMulRI:
+    case OpCode::IntAndRR:    case OpCode::IntAndRI:
+    case OpCode::IntOrRR:     case OpCode::IntOrRI:
+    case OpCode::IntXorRR:    case OpCode::IntXorRI:
+    case OpCode::IntShlRR:    case OpCode::IntShlRI:
+    case OpCode::IntShrRR:    case OpCode::IntShrRI:
+    case OpCode::IntModRI:    case OpCode::IntAddModRI:
+    case OpCode::FloatAddRR:  case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR:  case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR:  case OpCode::FloatMulRI:
+    case OpCode::CmpIntV:     case OpCode::CmpFloatV:
+        /* IntAddModRI's target2 is the IMM, not a slot - untouched */
+        ra(); rb(); rt();
+        break;
+    default:
+        /* unreachable: bc_inline_callee_ok gates on the same whitelist */
+        ML_CHECK_MSG(false, "bc_remap_slots: op not on the whitelist");
+        break;
+    }
+
+#ifndef NDEBUG
+    visit_use_def(in,
+                  [&](int s) { ML_CHECK(s >= base); },
+                  [&](int s) { ML_CHECK(s >= base); });
+#endif
+}
+
+/* The frame a splice may grow the caller to. A bound, not a tuning knob:
+ * every level of a recursion allocates the whole frame, so an unbounded
+ * splice trades call count for stack. */
+static const int BC_INLINE_MAX_FRAME = 96;
+
+/*
+ * Splice every inline-able CallV in `ck`. ONE level - a self-recursive
+ * callee is spliced from a SNAPSHOT of its pre-splice code, so the body
+ * cannot compound (the AST inliner's `rec_orig` rule, one layer down).
+ *
+ * Returns true if anything changed.
+ */
+bool bc_inline_chunk(Chunk &ck,
+                     const std::vector<const FuncDescriptor *> &slot_desc)
+{
+    if (!g_bc_inline_enabled)
+        return false;
+    /* a caller try region would need its handler table's body/fin pcs
+     * remapped too - a later increment, gated out rather than guessed */
+    if (ck.n_trys != 0)
+        return false;
+
+    struct Site {
+        size_t pc;
+        int base;                       /* the callee frame's slot base */
+        int nargs;
+        int argbase;                    /* the caller's arg run */
+        int dst;                        /* the call's result slot */
+        std::vector<Instr> body;        /* SNAPSHOT (self-recursion) */
+        std::vector<Chunk::LocEntry> locs;
+        std::vector<int32_t> ref_slots;
+        Chunk::InlineFrame frame;
+    };
+    std::vector<Site> sites;
+    int next_base = ck.slot_count + ck.n_temps;
+
+    for (size_t pc = 0; pc < ck.code.size(); pc++) {
+        const Instr &in = ck.code[pc];
+        if (in.op != OpCode::CallV)
+            continue;
+        const int g = in.target2;
+        const FuncDescriptor *d =
+            (g >= 0 && static_cast<size_t>(g) < slot_desc.size())
+                ? slot_desc[g] : nullptr;
+        if (!d || !d->vm_chunk || !d->fast_bind)
+            continue;                   /* typed params need coercion */
+        const Chunk *cc = static_cast<const Chunk *>(d->vm_chunk);
+        if (!bc_inline_callee_ok(*cc, nullptr))
+            continue;
+        if (!cc->inline_ctxs.empty())
+            continue;                   /* re-parenting the callee's own
+                                         * chains is a later increment */
+        const int nargs = static_cast<int>(in.b_lit());
+        if (nargs != static_cast<int>(d->params.size()))
+            continue;                   /* an omitted trailing opt param
+                                         * binds none - the bind loop here
+                                         * only moves what was passed */
+        if (cc->code.back().a_is_lit())
+            continue;                   /* ReturnV always emits a slot;
+                                         * a literal would need a load */
+        const int cframe = cc->slot_count + cc->n_temps;
+        if (next_base + cframe > BC_INLINE_MAX_FRAME)
+            continue;
+
+        Site s;
+        s.pc = pc;
+        s.base = next_base;
+        s.nargs = nargs;
+        s.argbase = static_cast<int>(in.a_lit());
+        s.dst = in.target;
+        s.body = cc->code;              /* snapshot BEFORE any mutation */
+        s.locs = cc->locs;
+        s.ref_slots = cc->ref_slots;
+        /* the virtual frame, built to render EXACTLY as the physical one
+         * would (backtrace.cpp's frame_display over the descriptor) */
+        s.frame.callee_name = !d->display_name.empty()
+                                  ? d->display_name
+                                  : d->name ? std::string(d->name->val)
+                                            : std::string("<lambda>");
+        for (const auto &p : d->params)
+            s.frame.params.push_back(std::string(p.name->val));
+        Loc ls, le;
+        ck.loc_at(pc, ls, le);
+        s.frame.call_site = ls;
+        s.frame.parent = ck.inline_frame_at(pc);
+        sites.push_back(std::move(s));
+        next_base += cframe;
+    }
+    if (sites.empty())
+        return false;
+
+    /* the caller's own pc -> loc, so a copied op keeps its caret */
+    std::vector<Instr> nc;
+    std::vector<Chunk::LocEntry> nlocs;
+    std::vector<Chunk::InlineEntry> nctx;
+    std::vector<char> from_caller;
+    std::vector<uint32_t> old2new(ck.code.size() + 1);
+
+    const auto caller_loc = [&](size_t pc, Loc &s, Loc &e) -> bool {
+        for (const auto &le : ck.locs)
+            if (le.pc == pc) { s = le.start; e = le.end; return true; }
+        return false;
+    };
+
+    size_t si = 0;
+    for (size_t pc = 0; pc < ck.code.size(); pc++) {
+        old2new[pc] = static_cast<uint32_t>(nc.size());
+        if (si < sites.size() && sites[si].pc == pc) {
+            const Site &S = sites[si++];
+            const int32_t fidx = static_cast<int32_t>(ck.inline_frames.size());
+            ck.inline_frames.push_back(S.frame);
+
+            /* the arg bind: the interpreted call's fast_bind, as MoveVs
+             * (frame slots have no container back-pointer, so put() is
+             * rebind()) */
+            for (int i = 0; i < S.nargs; i++) {
+                Instr mv;
+                mv.op = OpCode::MoveV;
+                mv.target = S.base + i;
+                mv.target2 = S.argbase + i;
+                nc.push_back(mv);
+                from_caller.push_back(0);
+            }
+            /* pass 1: the body's local pc map (a non-tail ReturnV becomes
+             * TWO ops - the result move and a jump to the join) */
+            const size_t nb = S.body.size();
+            std::vector<uint32_t> lmap(nb);
+            size_t emitted = 0;
+            for (size_t j = 0; j < nb; j++) {
+                lmap[j] = static_cast<uint32_t>(emitted);
+                emitted += (S.body[j].op == OpCode::ReturnV
+                            && j + 1 != nb) ? 2 : 1;
+            }
+            const size_t body_base = nc.size();
+            const size_t join = body_base + emitted;
+            /* pass 2: emit */
+            for (size_t j = 0; j < nb; j++) {
+                Loc bs, be;
+                bool has_loc = false;
+                for (const auto &le : S.locs)
+                    if (le.pc == j) {
+                        bs = le.start; be = le.end; has_loc = true; break;
+                    }
+                if (S.body[j].op == OpCode::ReturnV) {
+                    Instr mv;
+                    mv.op = OpCode::MoveV;
+                    mv.target = S.dst;
+                    mv.target2 = S.body[j].a_slot() + S.base;
+                    nctx.push_back({ static_cast<uint32_t>(nc.size()), fidx });
+                    nc.push_back(mv);
+                    from_caller.push_back(0);
+                    if (j + 1 != nb) {
+                        Instr jm;
+                        jm.op = OpCode::Jump;
+                        jm.target = static_cast<int>(join);
+                        nc.push_back(jm);
+                        from_caller.push_back(0);
+                    }
+                    continue;
+                }
+                Instr bi = S.body[j];
+                bc_remap_slots(bi, S.base);
+                visit_pc_fields(bi, [&](int &t) {
+                    if (t >= 0 && static_cast<size_t>(t) < nb)
+                        t = static_cast<int>(body_base + lmap[t]);
+                    else
+                        t = static_cast<int>(join);   /* a tail target */
+                });
+                if (has_loc)
+                    nlocs.push_back({ static_cast<uint32_t>(nc.size()),
+                                      bs, be });
+                nctx.push_back({ static_cast<uint32_t>(nc.size()), fidx });
+                nc.push_back(bi);
+                from_caller.push_back(0);
+            }
+            ML_CHECK(nc.size() == join);
+            continue;
+        }
+        Loc s, e;
+        if (caller_loc(pc, s, e))
+            nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        const int32_t f = ck.inline_frame_at(pc);
+        if (f >= 0)
+            nctx.push_back({ static_cast<uint32_t>(nc.size()), f });
+        nc.push_back(ck.code[pc]);
+        from_caller.push_back(1);
+    }
+    old2new[ck.code.size()] = static_cast<uint32_t>(nc.size());
+
+    /* the caller's OWN branches move; the spliced ops already hold
+     * absolute new pcs, which is why from_caller exists */
+    for (size_t k = 0; k < nc.size(); k++)
+        if (from_caller[k])
+            visit_pc_fields(nc[k], [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) < old2new.size())
+                    t = static_cast<int>(old2new[t]);
+            });
+
+    ck.code = std::move(nc);
+    ck.locs = std::move(nlocs);
+    ck.inline_ctxs = std::move(nctx);
+    ck.n_temps = next_base - ck.slot_count;
+    for (const Site &S : sites)
+        for (const int32_t r : S.ref_slots)
+            ck.ref_slots.push_back(r + S.base);
+    std::sort(ck.ref_slots.begin(), ck.ref_slots.end());
+    ck.ref_slots.erase(std::unique(ck.ref_slots.begin(), ck.ref_slots.end()),
+                       ck.ref_slots.end());
+    ck.set_plain_frame();
+    /* boxed_ops is DERIVED from the final code + locs - rebuild rather
+     * than re-base (the .myv loader's rule, for the same reason) */
+    ck.boxed_ops.clear();
+    build_boxed_ops(ck);
+    ck.native_leaf = jit_chunk_is_native_leaf(ck);
+    return true;
+}

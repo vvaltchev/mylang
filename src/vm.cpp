@@ -2211,6 +2211,13 @@ vm_precompile_all(const Block *root, bool jit)
                         kv.first->name ? kv.first->name->val.c_str() : "?",
                         slot_desc);
 
+    /* THE SPLICE, before any jit: it produces bytecode, so the JIT (and a
+     * `.myv` writer, which stores this same pre-jit code) sees the inlined
+     * form. One pass, one level - the snapshot rule keeps a self-recursive
+     * body from compounding. */
+    for (auto &kv : g_func_chunks)
+        bc_inline_chunk(kv.second, slot_desc);
+
     /* Pass B: JIT every compiled body, each with its own JitCtx (caller_desc =
      * the descriptor keying its chunk). Order-independent (all native_leaf
      * flags set in Pass A; a caller bakes the callee DESCRIPTOR and loads its
