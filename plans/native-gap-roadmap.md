@@ -29,11 +29,20 @@ those classes in impact order.
    vm_enter_call_lean (fast_bind + no cache key -> no unique_ptr, no
    coerce branch, one call layer) + vm_frame_leave's cached tail split
    cold. 10_recursion_deep Ir -9.5% (wall -15%), 11 -2.9%, 63 -1.5%;
-   fib +0.9% Ir (cached tail's extra layer, wall-neutral). REMAINING
-   per-call fat (next steps): vm_frame_leave's LValue::put on the dst
-   (~29) + pop_window's ref-scan (~29) + jit_ret's result copy chain;
-   then the record-push INLINE in the fragment (the true native call,
-   needs the sync-stop/dispatch handoff translated to machine code).
+   fib +0.9% Ir (cached tail's extra layer, wall-neutral). STEP 3
+   LANDED same day: the return-side RESULT is MOVED out of the dying
+   callee window (LValue::steal_value - jit_ret + both interpreted
+   ReturnV paths; the copy was a retain/release pair for a reference
+   result), and every callee resolve switched get<intrusive_ptr<
+   FuncObject>> -> get_ref (the H1 refcount-churn trap: the by-value
+   handle copy was ~28 Ir/call of pure churn, and its dead-at-semicolon
+   temporary never protected the callee anyway). 10 -4.7% Ir
+   (cumulative -13.8% from pre-lever), 11 -3.6%, 63 -4.6%, 76 -2.4%,
+   fib -0.7% (both step-2 costs recovered). REMAINING per-call fat:
+   vm_frame_leave's put on the dst (~29) + pop_window's ref-scan
+   (~29); then the record-push INLINE in the fragment (the true native
+   call, needs the sync-stop/dispatch handoff translated to machine
+   code).
    (original analysis follows) The single biggest class:
    10_recursion_deep (94x), 11_closure_counter (76x), 63_closures (53x),
    76_funcval (26x), 08/09, every call-heavy program.

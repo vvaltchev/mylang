@@ -682,6 +682,18 @@ public:
      * measured per-call hot spot on every VM arg bind (#60 Tier 1). `val = v`
      * (copy or move) releases any old ref the slot held.
      */
+    /*
+     * MOVE the value OUT of a slot that is about to DIE - the callee
+     * window's result slot at a return (the frame pops right after; lever
+     * 1: the return path paid a full EvalValue COPY - a retain/release
+     * pair for a reference result - per call). The slot is left holding
+     * the moved-from value (none), which also spares pop_window's release
+     * for it. NEVER use on a slot that stays live.
+     */
+    EvalValue steal_value() {
+        return static_cast<EvalValue &&>(val);
+    }
+
     void rebind(const EvalValue &v) {
         val = v;
         container = nullptr;
