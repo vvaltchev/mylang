@@ -843,6 +843,22 @@ Corpus: 27 -> **22 kept runs**; 65/35/64 Ir neutral, 73_multi_unpack
 Remaining: the exception trio (12), ForeachDynInit/Next (4, side-table
 carets - the same treatment next), JumpUnlessElemInt (3, needs a
 branch-resolving slow tier), the inline-raise guard (5).
+**ForeachDynInit/Next deletable (same day):** both join the convey
+family (exc-stamps at their threw exits; `old_pc` threaded into
+emit_branch for Next's). TWO measured traps: (1) a catch(...)'s
+exception_ptr temp made -fstack-protector-strong add a CANARY to the
+hot Next helper - **+7 Ir PER ELEMENT** (66/74 +3.5-4% Ir,
+callgrind-diagnosed via the helper's self cost at constant call
+counts) - so the throwing tier lives in an ML_NOINLINE slow twin
+(jit_foreach_dyn_next_slow) and the hot helper carries NO EH state,
+gated by `DynIterState::next_throws` (only the GENERIC body throws;
+the five specialized bodies skip the try entirely, ~+1 Ir/element
+residual - the price of deletability); (2) the recurring
+vm_dyn_next_dict 503<->564M LTO relink oscillation muddied 74's A/B
+again. Also: Init's non-container TypeErrorEx now uses the
+tree-walker's exact wording (byte parity; the VM's was ALSO loc-less
+in the compiled shape pre-stamp - both fixed). Corpus: 22 -> 20 kept
+runs; 66 +0.5% / 74 +2.4% Ir (the flag + the relink swing).
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat

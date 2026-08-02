@@ -1198,6 +1198,11 @@ struct DynIterState {
      * loop behaves exactly as the generic body did. */
     bool (*next)(DynIterState &, Frame &, const Chunk *, size_t) = nullptr;
     int32_t slot0 = -1, slot1 = -1;            /* baked target slots */
+    /* #56: only the GENERIC body can throw (the strict N-var unpack /
+     * the InternalErrorEx net); the five specialized bodies never do -
+     * the JIT helper skips its try/catch for them (the extra catch
+     * clause measured +7 Ir PER ELEMENT on the hot path's codegen). */
+    bool next_throws = true;
 };
 
 static bool vm_foreach_dyn_next_body(DynIterState &, Frame &,
@@ -1274,6 +1279,7 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
     st.targets = targets;
     st.counter = 0;
     st.next = &vm_foreach_dyn_next_body;     /* the generic default */
+    st.next_throws = true;
     st.slot0 = st.slot1 = -1;
     const std::vector<int32_t> &tg = *targets;
     const size_t tb = st.indexed ? 1 : 0;
@@ -1286,6 +1292,7 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
          * (a `_` var / indexed / N-var unpack keeps the generic body). */
         if (!st.indexed && nv == 1 && tg[0] >= 0) {
             st.slot0 = tg[0];
+            st.next_throws = false;
             switch (st.container.get_ref<SharedArrayObj>().skind()) {
             case SharedArrayObj::Storage::ints:
                 st.next = &vm_dyn_next_arr_int; break;
@@ -1309,12 +1316,14 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
             st.slot0 = tg[0];
             st.slot1 = nv == 2 ? tg[1] : -1;
             st.next = &vm_dyn_next_dict;
+            st.next_throws = false;
         }
     } else {
         Loc s, en;
         if (chunk)
             chunk->loc_at(pc, s, en);
-        throw TypeErrorEx("foreach: expected an array or dict", s, en);
+        /* the tree-walker's exact wording (do_iter) - byte parity (#56) */
+        throw TypeErrorEx("Unsupported container type by foreach()", s, en);
     }
 }
 
@@ -2908,6 +2917,11 @@ extern "C" int jit_foreach_dyn_init(int_type iter_id, int_type cont_slot,
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (the noexcept would
+         * std::terminate otherwise - #56) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
     }
     return 0;
 }
@@ -2915,16 +2929,36 @@ extern "C" int jit_foreach_dyn_init(int_type iter_id, int_type cont_slot,
 /* ForeachDynNext: 1 = bound, 0 = exhausted (jump to end_pc), -1 = THREW (the
  * strict N-var unpack's TypeErrorEx rides g_vm_jit_exc LOC-LESS; EnterNative
  * stamps the container's caret from the loc side table). */
-extern "C" int jit_foreach_dyn_next(int_type iter_id) noexcept
+/* The GENERIC-body tier of jit_foreach_dyn_next: the only body that can
+ * throw (the strict N-var unpack / the InternalErrorEx net). Out-of-line
+ * so the hot helper carries no EH state (see its comment). */
+static ML_NOINLINE int
+jit_foreach_dyn_next_slow(DynIterState &st) noexcept
 {
-    ML_JIT_OP_RAN(ForeachDynNext);
     try {
-        DynIterState &st = jit_dyiter(iter_id);
         return st.next(st, *g_current_ctx->frame, nullptr, 0) ? 1 : 0;
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return -1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (the noexcept would
+         * std::terminate otherwise - #56) */
+        g_vm_jit_eptr = std::current_exception();
+        return -1;
     }
+}
+
+extern "C" int jit_foreach_dyn_next(int_type iter_id) noexcept
+{
+    ML_JIT_OP_RAN(ForeachDynNext);
+    DynIterState &st = jit_dyiter(iter_id);
+    if (!st.next_throws)
+        /* a SPECIALIZED body: never throws - and keeping ALL EH state out
+         * of THIS function matters: the catch-all's exception_ptr temp
+         * made -fstack-protector-strong add a canary, +7 Ir per element
+         * on the hot path (#56, callgrind-diagnosed). */
+        return st.next(st, *g_current_ctx->frame, nullptr, 0) ? 1 : 0;
+    return jit_foreach_dyn_next_slow(st);
 }
 
 /* model-flip (nativize-ops): the native StructCtorV body - a standalone POD

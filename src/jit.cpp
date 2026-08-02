@@ -3945,6 +3945,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -5334,7 +5335,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                         uint32_t pc, size_t begin, size_t end,
                         const std::vector<int> &remap,
-                        std::vector<Fixup> &fixups)
+                        std::vector<Fixup> &fixups, size_t old_pc)
 {
     switch (in.op) {
 
@@ -5585,6 +5586,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                                                   * -1 is negative here) */
         {
             const size_t j_ok = e.j8(0x79);      /* jns -> did not throw */
+            emit_exc_stamp(e, ck, old_pc);       /* collapse-safe (#56) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -5922,6 +5924,12 @@ static bool op_fully_native(const Instr &in)
     case OpCode::MapFilterV:
     case OpCode::LoadMemberInt:
     case OpCode::LoadMemberFloat:
+        return true;
+    /* #56: the dyn-foreach pair - Init's non-container TypeErrorEx and
+     * Next's strict-unpack throws convey with the exc-stamped container
+     * caret; the exhausted/bound paths are fragment-local branches. */
+    case OpCode::ForeachDynInit:
+    case OpCode::ForeachDynNext:
         return true;
     /* The raise-kind int arms: div/mod (a zero divisor) and the reg-count
      * shifts (a negative count) now CONVEY via jit_raise_kind_exc + the
@@ -6329,7 +6337,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         label[pc] = e.pos();
         if (op_is_branch(chunk.code[pc].op))
             emit_branch(e, chunk, chunk.code[pc],
-                        static_cast<uint32_t>(remap[pc]), 0, n, remap, fixups);
+                        static_cast<uint32_t>(remap[pc]), 0, n, remap, fixups,
+                        pc);
         else if (!emit_op(e, chunk, chunk.code[pc],
                           static_cast<uint32_t>(remap[pc]), jc, pc))
             return false;                  /* selection miss: chunk pristine */
@@ -6760,7 +6769,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                  * enter the target run natively); the op's OWN pc (arg 4,
                  * its bail) stays ordinary remap */
                 emit_branch(e, chunk, in, static_cast<uint32_t>(remap[pc]),
-                            begin, end, entry_remap, fixups);
+                            begin, end, entry_remap, fixups, pc);
             } else if (!emit_op(e, chunk, in,
                                 static_cast<uint32_t>(remap[pc]), jc, pc)) {
                 e.b.clear();
