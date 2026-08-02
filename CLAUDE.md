@@ -219,8 +219,19 @@ mirror counters (those vectors mutate only inside push/pop_window;
 `handlers` is NOT mirrored - fragments push/pop it natively);
 ML_VM_CHECK re-verifies every mirror. 10 -7.5% Ir (cum -20.3%
 pre-lever, wall -4%), 11 -8.2%, fib -1.0%. The C++ side of lever 1
-is ~exhausted; the next multiplier is the fragment-inline record
-push + per-pc fragment entry points (post-call native resume).
+is ~exhausted; the arc continued in machine code: step 5 (the
+fragment-inline sync call), per-pc entry points (post-call + branch-
+target resume stubs), M5a (the 1GB dedicated native stack - cap
+500k, the CallV self-gate lifted, the switch living at the SYNC CALL
+SITE after a measured placement war), and M5b (the FULLY-INLINE
+record push: emit_sync_push_native emits resolve/gates/push_window's
+hot shape/record fill/unrolled fast_bind/captures at the call site,
+offsets via the JitPushLayout co-located probe; guards all precede
+mutations so declines fall to the idempotent jit_call_sync* tier; a
+first-descent grows the record high-water through the slow tier by
+design). M5b measured (Ir): 10_recursion_deep -30.4%, 11 -15.5%,
+63 -15.6%; wall ~0.90x each; 10 CUMULATIVE -46% Ir from pre-lever-1.
+See plans/native-gap-roadmap.md for the full per-step record.
 **`Chunk::ref_slots` (2026-07-18 profile #2):** the audited list of frame
 slots that can EVER hold a >= t_str value (non-coerced params + every dst
 of a non-`op_writes_scalar` op; a chunk with a use-def BARRIER op lists

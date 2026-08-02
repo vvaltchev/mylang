@@ -131,10 +131,32 @@ those classes in impact order.
    (100k) native end to end; overflow stays catchable
    StackOverflowEx; counter-proven (jit_native_stack_deep: >= depth
    inline-call bumps, self AND mutual, + the typed-param helper-path
-   assert). M5a is the ENABLER: the per-call payoff is M5b (the
-   fully-inline record push - the push helper measured ~equal to the
-   old interpreted lean path, which is why 10 gained only ~3%); then
-   M5c (CachedCallV fast path). The "checked-return unwind" half of
+   assert). M5b (THE FULLY-INLINE RECORD PUSH) LANDED
+   2026-07-27, the arc's payoff: emit_sync_push_native emits the whole
+   sync push at the call site - callee resolve (gfuncs walk / temp tag
+   check), the gate battery, push_window's hot shape (segment fit +
+   record REUSE), the ~15-store record fill, the UNROLLED fast_bind
+   copies (trivial payloads; a reference arg declines - guarded), the
+   captures switch - ending with rdi = window, rdx = entry; offsets
+   from JitPushLayout (jit_fill_push_layout, vm.cpp - real members,
+   the co-located-probe rule; the FuncObject probe constructs one over
+   a static root ctx). EVERY guard precedes EVERY mutation, so every
+   decline (undefined/non-func callee, non-fast_bind, arity, overflow,
+   segment advance, record HIGH-WATER growth, iter chunks, pending
+   cache stash, a reference arg) jumps to the idempotent jit_call_sync*
+   tier; the jit_sync_push_* helpers are DELETED. KNOWN SHAPE: a
+   first-ever DESCENT grows the record high-water one level at a time
+   through the slow tier (cold emplace), so call #1 of a deep recursion
+   is all-slow and call #2 flies - the counter test warms up with two
+   calls (the single-call draft measured 0 inline calls - the prove-it
+   rule again). Measured (Ir vs M5a): 10 -30.4%, 11 -15.5%, 63 -15.6%,
+   fib -1.0%, 08/12/34/76 flat; wall (interleaved best-of-9): 10
+   0.897x, 11 0.915x, 63 0.903x. CUMULATIVE from pre-lever-1: 10 -46%
+   Ir. -vdj verified END TO END (note: the decoder's SIB print shows a
+   bogus *8 scale and falls to .byte on sub-from-mem/movsxd - bytes
+   hand-verified correct; a decoder polish item). Next: M5c (CachedCallV
+   fast path); 12/34/35 remain lever 2 (VmInvoker direct fragment
+   entry). The "checked-return unwind" half of
    M5 proper PRE-EXISTED (the sync sentinel protocol); interior entries
    also unlock RELAXING the single-entry deletion constraint (an
    external interior branch can enter a stub instead of blocking

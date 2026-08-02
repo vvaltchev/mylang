@@ -4847,92 +4847,10 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
     return 0;                              /* dst written by vm_frame_leave */
 }
 
-/*
- * Lever 1 step 5 - the fragment-INLINE sync push: the flat NOEXCEPT twin
- * of vm_frame_setup_lean for the emitted call path. Every throw shape is
- * a PRE-CHECK returning {null, null} (the fragment falls back to the full
- * jit_call_sync* helper, which re-runs everything and produces the
- * byte-identical throw through the interpreted op): arity, stack
- * overflow, a non-fast_bind callee, a body that does not START native
- * (sync_entry_off < 0 - the dispatch path). On success the callee record
- * is a sync_stop frame and the return is {callee window slots, the
- * fragment entry address} (SysV: rax:rdx), so the caller fragment `call`s
- * the callee DIRECTLY - no jit_enter layer, no core layering, no cache-
- * probe branch, no try scaffolding.
- */
-static ML_ALWAYS_INLINE JitSyncPush
-jit_sync_push_common(FuncObject &fo, int_type argbase, int_type nargs,
-                     int_type dst)
-{
-    EvalContext &ctx = *g_current_ctx;
-    VmActivation &act = *g_vm_act;
-    /* Runtime cap check: the emitted inline guard bakes the cap at
-     * chunk-compile time (a fast filter); this is the AUTHORITATIVE one -
-     * a test pins the cap below baked values (jit_set_sync_depth_cap),
-     * and any future context-varied cap is enforced here. */
-    if (g_jit_sync_depth >= g_jit_sync_cap)
-        return { nullptr, nullptr };
-    const FuncDescriptor *d = fo.func;
-    const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
-    if (!cck || cck->sync_entry_off < 0 || !d->fast_bind)
-        return { nullptr, nullptr };
-    const size_t nparams = d->params.size();
-    if (static_cast<size_t>(nargs) > nparams
-            || nargs < static_cast<int_type>(d->min_args))
-        return { nullptr, nullptr };
-    const int_type total =
-        d->frame_size + static_cast<int_type>(cck->n_temps);
-    if (act.used + total > act.cap)
-        return { nullptr, nullptr };   /* overflow -> interpreted throw */
-    LValue *argrun = nargs ? &ctx.frame->at(argbase) : nullptr;
-    Frame *w = act.push_window(total, cck, /*boundary=*/false);
-    VmCallRec &rec = act.back_rec();
-    rec.ret_chunk = &vm_sync_stop_chunk();
-    rec.ret_pc = 1;                    /* setup's ret_pc + 1 with ret_pc 0 */
-    rec.dst = dst;
-    rec.desc = d;
-    rec.caller_captures = ctx.captures;
-    rec.sync_stop = 1;
-    ML_CHECK(!rec.cache_key);          /* pop reset it / fresh is null */
-    for (int_type i = 0; i < nargs; i++)
-        w->at(i).rebind(argrun[i].get());
-    for (size_t i = static_cast<size_t>(nargs); i < nparams; i++)
-        w->at(static_cast<int_type>(i)).rebind(EvalValue());
-    ctx.captures = &fo.capture_slots;
-    return { w->slots,
-             static_cast<const char *>(cck->native.base)
-                 + cck->sync_entry_off };
-}
-
-extern "C" JitSyncPush jit_sync_push_slot(int_type callee_slot,
-                                          int_type argbase, int_type nargs,
-                                          int_type dst) noexcept
-{
-    ML_JIT_OP_RAN(CallV);
-    EvalContext *ctx = g_current_ctx;
-    if (!ctx->gfuncs->defined[callee_slot])
-        return { nullptr, nullptr };   /* undefined -> interpreted throw */
-    const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
-    if (!cv.is<intrusive_ptr<FuncObject>>())
-        return { nullptr, nullptr };   /* not callable -> interpreted */
-    return jit_sync_push_common(
-        *cv.get_ref<intrusive_ptr<FuncObject>>().get(),
-        argbase, nargs, dst);
-}
-
-extern "C" JitSyncPush jit_sync_push_value(int_type callee_temp,
-                                           int_type argbase, int_type nargs,
-                                           int_type dst) noexcept
-{
-    ML_JIT_OP_RAN(CallValueV);
-    EvalContext *ctx = g_current_ctx;
-    const EvalValue &cv = ctx->frame->at(callee_temp).get();
-    if (!cv.is<intrusive_ptr<FuncObject>>())
-        return { nullptr, nullptr };   /* dyn non-func -> NotCallableEx */
-    return jit_sync_push_common(
-        *cv.get_ref<intrusive_ptr<FuncObject>>().get(),
-        argbase, nargs, dst);
-}
+/* M5b: the jit_sync_push_* HELPERS are gone - the push is emitted INLINE
+ * at the call site (emit_sync_push_native, jit.cpp; offsets from
+ * jit_fill_push_layout below). Declines go straight to the full
+ * jit_call_sync* tier. */
 
 /* the emitted depth guard's address (g_jit_sync_depth is TU-local) */
 void *jit_addr_sync_depth()
@@ -5336,6 +5254,90 @@ ptrdiff_t jit_off_act_records()
     return reinterpret_cast<const char *>(&a.records)
          - reinterpret_cast<const char *>(&a);
 }
+/* M5b: the aggregated push-layout probe (see jit.h). Real objects, real
+ * members - the co-located-probe rule. The FuncObject probe needs a live
+ * root EvalContext (its ctor walks get_root_ctx); a throwaway root is
+ * cheap (a script root loads no builtins into the map). */
+void jit_fill_push_layout(JitPushLayout *L)
+{
+    VmActivation a;
+    const char *ab = reinterpret_cast<const char *>(&a);
+    L->act_segs = reinterpret_cast<const char *>(&a.segs) - ab;
+    L->act_cur_seg = reinterpret_cast<const char *>(&a.cur_seg) - ab;
+    L->act_recs_high = reinterpret_cast<const char *>(&a.recs_high) - ab;
+    L->act_diters_n = reinterpret_cast<const char *>(&a.diters_n) - ab;
+    L->act_dyiters_n = reinterpret_cast<const char *>(&a.dyiters_n) - ab;
+    L->act_used = reinterpret_cast<const char *>(&a.used) - ab;
+    L->act_cap = reinterpret_cast<const char *>(&a.cap) - ab;
+    L->act_top_rec = reinterpret_cast<const char *>(&a.top_rec) - ab;
+    L->act_vframe = reinterpret_cast<const char *>(&a.view_frame) - ab;
+    L->act_handlers2 = reinterpret_cast<const char *>(&a.handlers) - ab;
+    Frame &f = a.view_frame;
+    const char *fb = reinterpret_cast<const char *>(&f);
+    L->frame_slots = reinterpret_cast<const char *>(&f.slots) - fb;
+    L->frame_size = reinterpret_cast<const char *>(&f.size) - fb;
+    L->frame_pure_cache =
+        reinterpret_cast<const char *>(&f.pure_cache) - fb;
+    VmStackSeg sg(1);
+    const char *sb = reinterpret_cast<const char *>(&sg);
+    L->seg_slots = reinterpret_cast<const char *>(&sg.slots) - sb;
+    L->seg_top = reinterpret_cast<const char *>(&sg.top) - sb;
+    VmCallRec r;
+    const char *rb = reinterpret_cast<const char *>(&r);
+    L->rec_window = reinterpret_cast<const char *>(&r.window) - rb;
+    L->rec_nslots = reinterpret_cast<const char *>(&r.nslots) - rb;
+    L->rec_seg = reinterpret_cast<const char *>(&r.seg) - rb;
+    L->rec_seg_top_before =
+        reinterpret_cast<const char *>(&r.seg_top_before) - rb;
+    L->rec_run_chunk = reinterpret_cast<const char *>(&r.run_chunk) - rb;
+    L->rec_ret_chunk = reinterpret_cast<const char *>(&r.ret_chunk) - rb;
+    L->rec_ret_pc = reinterpret_cast<const char *>(&r.ret_pc) - rb;
+    L->rec_dst = reinterpret_cast<const char *>(&r.dst) - rb;
+    L->rec_desc = reinterpret_cast<const char *>(&r.desc) - rb;
+    L->rec_caller_caps =
+        reinterpret_cast<const char *>(&r.caller_captures) - rb;
+    L->rec_handler_base =
+        reinterpret_cast<const char *>(&r.handler_base) - rb;
+    L->rec_diter_base = reinterpret_cast<const char *>(&r.diter_base) - rb;
+    L->rec_dyiter_base =
+        reinterpret_cast<const char *>(&r.dyiter_base) - rb;
+    L->rec_boundary = reinterpret_cast<const char *>(&r.boundary) - rb;
+    L->rec_sync_stop = reinterpret_cast<const char *>(&r.sync_stop) - rb;
+    static FuncDescriptor fd;         /* static: fo.func may outlive scope */
+    const char *db = reinterpret_cast<const char *>(&fd);
+    L->desc_params = reinterpret_cast<const char *>(&fd.params) - db;
+    L->desc_frame_size =
+        reinterpret_cast<const char *>(&fd.frame_size) - db;
+    L->desc_fast_bind = reinterpret_cast<const char *>(&fd.fast_bind) - db;
+    L->param_desc_size = sizeof(FuncDescriptor::ParamDesc);
+    Chunk ck;
+    const char *cb = reinterpret_cast<const char *>(&ck);
+    L->ck_n_temps = reinterpret_cast<const char *>(&ck.n_temps) - cb;
+    L->ck_n_dict_iters =
+        reinterpret_cast<const char *>(&ck.n_dict_iters) - cb;
+    L->ck_n_dyn_iters =
+        reinterpret_cast<const char *>(&ck.n_dyn_iters) - cb;
+    L->ck_sync_entry =
+        reinterpret_cast<const char *>(&ck.sync_entry_off) - cb;
+    {
+        static EvalContext probe_root(nullptr, false, false);
+        FuncObject fo(&fd, &probe_root);
+        const char *ob = reinterpret_cast<const char *>(&fo);
+        L->fo_func = reinterpret_cast<const char *>(&fo.func) - ob;
+        L->fo_capture_slots =
+            reinterpret_cast<const char *>(&fo.capture_slots) - ob;
+        L->t_func =
+            EvalValue(intrusive_ptr<FuncObject>(
+                make_intrusive<FuncObject>(&fd, &probe_root))).get_type();
+    }
+    L->stop_chunk = &vm_sync_stop_chunk();
+    /* the emitted handler_base computation shifts by 2 */
+    static_assert(sizeof(VmHandler) == 4, "handler_base >> 2 bake");
+    /* the emitted seg/rec addressing */
+    static_assert(sizeof(std::unique_ptr<VmStackSeg>) == sizeof(void *),
+                  "segs[i] raw-pointer load");
+}
+
 ptrdiff_t jit_off_act_rec_n()
 {
     VmActivation a;
