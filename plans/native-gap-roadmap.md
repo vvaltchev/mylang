@@ -38,11 +38,24 @@ those classes in impact order.
    handle copy was ~28 Ir/call of pure churn, and its dead-at-semicolon
    temporary never protected the callee anyway). 10 -4.7% Ir
    (cumulative -13.8% from pre-lever), 11 -3.6%, 63 -4.6%, 76 -2.4%,
-   fib -0.7% (both step-2 costs recovered). REMAINING per-call fat:
-   vm_frame_leave's put on the dst (~29) + pop_window's ref-scan
-   (~29); then the record-push INLINE in the fragment (the true native
-   call, needs the sync-stop/dispatch handoff translated to machine
-   code).
+   fib -0.7% (both step-2 costs recovered). STEP 4 LANDED same day
+   (the vector-size split): back_rec's records[rec_n-1] was an IMUL by
+   the 136-byte record stride at ~23 sites (several per call) - now a
+   cached top_rec pointer (native code READS rec_n but never writes
+   it, so a fragment can't stale it); records.size() (another per-push
+   IMUL), dict_iters/dyn_iters sizes (dyn's 72-byte stride divided per
+   push AND pop) are mirrored by plain counters - those vectors are
+   mutated only inside push/pop_window. handlers is NOT mirrored
+   (fragments push/pop it natively; 4-byte stride = a shift anyway).
+   ML_VM_CHECK re-verifies every mirror (the CI-release net). 10 -7.5%
+   Ir (cumulative -20.3% from pre-lever; wall -4%), 11 -8.2% Ir, fib
+   -1.0%. LEVER 1's C++ side is now ~exhausted: what remains per call
+   (~430 Ir on bench 10) is vm_frame_leave's dst put (~29, inherent
+   ref-release semantics), pop_window's ref-scan (~29, correctness),
+   dispatch stepping, and the protocol's irreducible record/bind
+   work - the NEXT multiplier is the record-push INLINE in the
+   fragment + per-pc fragment entry points (post-call native resume),
+   an M5-class project, not a trim.
    (original analysis follows) The single biggest class:
    10_recursion_deep (94x), 11_closure_counter (76x), 63_closures (53x),
    76_funcval (26x), 08/09, every call-heavy program.
