@@ -154,9 +154,30 @@ those classes in impact order.
    0.897x, 11 0.915x, 63 0.903x. CUMULATIVE from pre-lever-1: 10 -46%
    Ir. -vdj verified END TO END (note: the decoder's SIB print shows a
    bogus *8 scale and falls to .byte on sub-from-mem/movsxd - bytes
-   hand-verified correct; a decoder polish item). Next: M5c (CachedCallV
-   fast path); 12/34/35 remain lever 2 (VmInvoker direct fragment
-   entry). The "checked-return unwind" half of
+   hand-verified correct; a decoder polish item). M5c (THE CACHED-CALL FAST PATH) LANDED
+   2026-07-27: CachedCallV routes through the inline site - a lean
+   jit_cached_probe C++ helper (the map lookup is inherently C++; HIT
+   -> dst written, the fragment continues past the call) whose MISS
+   parks the constructed key in g_jit_pending_key for the inline push
+   to store into rec.cache_key (3 emitted movs, ownership transfer);
+   every decline between probe and store falls to jit_call_sync_cached,
+   whose core CONSUMES the parked key instead of re-probing (no leak,
+   no double probe). The pure-cache handling is PER-SITE: a CACHED site
+   stashes the caller's cache into rec.caller_cache inline (a caching
+   caller holds a live cache by definition - the M5b decline guard
+   would have killed its fast path entirely); a PLAIN site keeps the
+   guard (an unconditional stash measured -0.3..-0.5% on 10/11/63).
+   TWO lessons paid for in blood: (1) the probe C++ call clobbers
+   EVERY caller-saved register - r8/r9 (act/ctx) were not rebuilt
+   after it, a RELEASE-ONLY SEGV (dbg helpers happened to preserve
+   them; the faulting `mov 0x258(%r8),%r10` under gdb pinpointed it);
+   (2) sources were edited while a background battery compiled - the
+   battery was discarded and rerun clean (the serialization rule
+   applies to BATTERIES too). Measured (Ir vs M5b): fib -2.3%,
+   10/11/63 flat (after the conditional stash). emit_sync_call (the
+   old plain helper site) deleted - every sync op now emits the inline
+   site. Remaining: lever 2 (VmInvoker direct fragment entry -
+   12/34/35), the -vdj decoder polish, M6. The "checked-return unwind" half of
    M5 proper PRE-EXISTED (the sync sentinel protocol); interior entries
    also unlock RELAXING the single-entry deletion constraint (an
    external interior branch can enter a stub instead of blocking

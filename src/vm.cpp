@@ -4847,6 +4847,38 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
     return 0;                              /* dst written by vm_frame_leave */
 }
 
+/* M5c - the CachedCallV fast path's probe. The map lookup is inherently
+ * C++ (PureCacheKey hash/eq over arg values); the emitted site calls this
+ * lean helper: a HIT writes the dst slot and returns 1 (the fragment
+ * continues past the call); a MISS constructs the key ONCE and parks the
+ * released pointer in g_jit_pending_key for the INLINE push to store into
+ * rec.cache_key (3 emitted movs). Any decline between the probe and that
+ * store jumps to the full jit_call_sync_cached tier, whose core CONSUMES
+ * the pending key instead of re-probing - no leak, no double probe. A
+ * disabled/unavailable cache is a plain miss with no pending key. */
+static PureCacheKey *g_jit_pending_key = nullptr;
+
+extern "C" int jit_cached_probe(const void *descv, int_type argbase,
+                                int_type nargs, int_type dst) noexcept
+{
+    EvalContext &ctx = *g_current_ctx;
+    const FuncDescriptor *d =
+        static_cast<const FuncDescriptor *>(descv);
+    if (!ctx.frame || !g_pure_cache_enabled)
+        return 0;
+    std::unique_ptr<PureCacheKey> key;
+    if (vm_cache_probe_vals(ctx, d, argbase,
+                            static_cast<size_t>(nargs), dst, key))
+        return 1;                          /* hit - dst written */
+    g_jit_pending_key = key.release();
+    return 0;
+}
+
+void *jit_addr_pending_key()
+{
+    return &g_jit_pending_key;
+}
+
 /* M5b: the jit_sync_push_* HELPERS are gone - the push is emitted INLINE
  * at the call site (emit_sync_push_native, jit.cpp; offsets from
  * jit_fill_push_layout below). Declines go straight to the full
@@ -4880,7 +4912,13 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
     const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
 
     std::unique_ptr<PureCacheKey> key;
-    if (cached && ctx.frame && g_pure_cache_enabled
+    if (cached && g_jit_pending_key) {
+        /* M5c: the emitted probe already ran (miss) and parked the key -
+         * consume it instead of re-probing (the inline push declined
+         * between the probe and the record store). */
+        key.reset(g_jit_pending_key);
+        g_jit_pending_key = nullptr;
+    } else if (cached && ctx.frame && g_pure_cache_enabled
             && vm_cache_probe_vals(ctx, d, argbase,
                                    static_cast<size_t>(nargs), dst, key))
         return 0;                          /* cache hit - dst written */
@@ -5303,6 +5341,9 @@ void jit_fill_push_layout(JitPushLayout *L)
         reinterpret_cast<const char *>(&r.dyiter_base) - rb;
     L->rec_boundary = reinterpret_cast<const char *>(&r.boundary) - rb;
     L->rec_sync_stop = reinterpret_cast<const char *>(&r.sync_stop) - rb;
+    L->rec_cache_key = reinterpret_cast<const char *>(&r.cache_key) - rb;
+    L->rec_caller_cache =
+        reinterpret_cast<const char *>(&r.caller_cache) - rb;
     static FuncDescriptor fd;         /* static: fo.func may outlive scope */
     const char *db = reinterpret_cast<const char *>(&fd);
     L->desc_params = reinterpret_cast<const char *>(&fd.params) - db;

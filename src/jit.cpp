@@ -1536,39 +1536,6 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
     e.patch8(j_has, e.pos());
 }
 
-/* M5: emit a SYNC call op (CallV / CachedCallV / CallValueV - one emit
- * shape, only the helper differs): jit_call_sync*(target2, argbase, nargs,
- * dst, site) runs the callee to completion via the lean sync enter (vm.cpp)
- * and the caller continues natively on 0. Non-0 -> exit (a bail re-runs the
- * interpreted op; a throw rides g_vm_jit_exc / g_vm_jit_eptr). The baked
- * site = the op's side-table loc start (the lazy in-VM backtrace capture's
- * loc); the loc table is still OLD-pc-keyed at emission (the side tables
- * are remapped AFTER), so look up with old_pc, not the remapped pc (a
- * remapped lookup silently found nothing and baked site 0, which showed as
- * `at line 0` in a backtrace). */
-static void emit_sync_call(Emitter &e, const Chunk &ck, const Instr &in,
-                           uint32_t pc, size_t old_pc, const void *helper,
-                           OpCode op)
-{
-    Loc ls, le;
-    ck.loc_at(old_pc, ls, le);
-    const uint64_t site =
-        (static_cast<uint64_t>(static_cast<uint32_t>(ls.line)) << 32)
-        | static_cast<uint32_t>(ls.col);
-    emit_call_prologue(e);
-    e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
-    e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
-    e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
-    e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-    e.movabs_r8(site);
-    e.call_relocs.push_back({ e.pos(), helper });
-    e.u8(0xE8); e.u32(0);
-    emit_call_epilogue(e);
-    e.u8(0x85); e.u8(0xC0);                   /* test eax, eax */
-    const size_t j_ok = e.j8(0x74);
-    e.exit_pc(pc);
-    e.patch8(j_ok, e.pos());
-}
 
 /*
  * Lever 1 step 5 - the fragment-INLINE sync call. The hot shape emits:
@@ -1617,8 +1584,9 @@ static const JitPushLayout &jit_push_layout()
 }
 
 static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
-                                  int callee_arg,
-                                  std::vector<size_t> &j_slow)
+                                  bool cached, int callee_arg,
+                                  std::vector<size_t> &j_slow,
+                                  std::vector<size_t> &j_done)
 {
     const JitPushLayout &P = jit_push_layout();
     const JitLayout &L = jit_layout();
@@ -1733,6 +1701,38 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         ld(RDX, RDI, callee_arg * 48);                /* rdx = fo */
     }
     ld(RAX, RDX, static_cast<int32_t>(P.fo_func));    /* rax = desc */
+    if (cached) {
+        /* M5c: probe the caller's per-frame cache (a map lookup - C++).
+         * HIT -> dst written, jump to the site's done label; MISS -> the
+         * key is PARKED in g_jit_pending_key for the record store below
+         * (any decline in between jumps to the slow tier, which consumes
+         * it). fo is spilled around the call (the probe clobbers the
+         * resolve registers); desc re-derives from it. */
+        e.push_reg(RDX);                  /* fo */
+        e.push_reg(RDI);                  /* caller slots (rdi = arg 1 next) */
+        e.mov_rr(RDI, RAX);               /* rdi = desc */
+        e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+        e.movabs(RCX,
+                 static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_cached_probe) });
+        e.u8(0xE8); e.u32(0);
+        e.pop_reg(RDI);                   /* caller slots back */
+        e.pop_reg(RDX);                   /* fo back */
+        e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
+        j_done.push_back(e.j32(0x75));    /* jnz done (hit) */
+        /* the C++ call clobbered EVERY caller-saved register - rebuild
+         * r9 = ctx and r8 = act too, not just fo/desc (the miss path's
+         * remaining guards and the whole mutation phase read them; the
+         * un-rebuilt r8 was a release-only SEGV - dbg helpers happened
+         * to preserve it) */
+        e.movabs(RCX, reinterpret_cast<uint64_t>(L.addr_ctx));
+        ld(R9R, RCX, 0);
+        e.movabs(RCX, reinterpret_cast<uint64_t>(L.addr_act));
+        ld(R8R, RCX, 0);
+        ld(RAX, RDX, static_cast<int32_t>(P.fo_func));  /* rax = desc */
+    }
     cmp_b_imm8(RAX, static_cast<int32_t>(P.desc_fast_bind), 0);
     j_slow.push_back(e.j32(0x74));                    /* je slow */
     /* nparams == NARGS via the vector's byte length */
@@ -1753,6 +1753,17 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     cmp_d_imm8(RCX, static_cast<int32_t>(P.ck_n_dyn_iters), 0);
     j_slow.push_back(e.j32(0x75));                    /* jne slow */
     /* rsi = total = frame_size + n_temps */
+    if (!cached) {
+        /* a PLAIN call from a cache-carrying caller declines (the stash
+         * costs ~2 Ir on every push and only cached-call chains carry
+         * caches as a rule - measured -0.3..-0.5% on 10/11/63 when
+         * unconditional); a CACHED site stashes inline below instead
+         * (its caller holds a live cache by definition). */
+        cmp_q_imm8(R8R,
+                   static_cast<int32_t>(P.act_vframe + P.frame_pure_cache),
+                   0);
+        j_slow.push_back(e.j32(0x75));                /* jne slow */
+    }
     ld32sx(RSI, RAX, static_cast<int32_t>(P.desc_frame_size));
     ld32sx(R10, RCX, static_cast<int32_t>(P.ck_n_temps));
     e.u8(0x4C); e.u8(0x01); e.u8(0xD6);               /* add rsi, r10 */
@@ -1762,10 +1773,6 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     modrm(0x3B, R10, R8R, static_cast<int32_t>(P.act_cap), true);
                                                       /* cmp r10,[act+cap] */
     j_slow.push_back(e.j32(0x7F));                    /* jg slow */
-    /* a pending pure-cache stash -> slow */
-    cmp_q_imm8(R8R, static_cast<int32_t>(P.act_vframe + P.frame_pure_cache),
-               0);
-    j_slow.push_back(e.j32(0x75));                    /* jne slow */
     /* record REUSE available: rec_n != recs_high (else the cold grow) */
     ld(R10, R8R, static_cast<int32_t>(L.act_rec_n));
     ld32(R11, R8R, static_cast<int32_t>(P.act_recs_high));
@@ -1839,6 +1846,27 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     st32(R10, static_cast<int32_t>(P.rec_dyiter_base), RAX);
     st_b_imm8(R10, static_cast<int32_t>(P.rec_boundary), 0);
     st_b_imm8(R10, static_cast<int32_t>(P.rec_sync_stop), 1);
+    if (cached) {
+        /* the caller's pure-cache STASH (per-frame scoping):
+         * rec.caller_cache = move(view_frame.pure_cache) - a raw pointer
+         * move (rec's field is null on a reused record: pop moved it
+         * out). Cached sites only: a caching caller holds a live cache
+         * by definition, and M5b's decline guard would kill their fast
+         * path entirely; plain sites keep the guard (above). */
+        ld(RAX, R8R,
+           static_cast<int32_t>(P.act_vframe + P.frame_pure_cache));
+        st(R10, static_cast<int32_t>(P.rec_caller_cache), RAX);
+        st_q_imm32(
+            R8R, static_cast<int32_t>(P.act_vframe + P.frame_pure_cache),
+            0);
+    }
+    if (cached) {
+        /* rec.cache_key = the probe's parked key (ownership transfer) */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_pending_key()));
+        ld(R11, RAX, 0);
+        st(R10, static_cast<int32_t>(P.rec_cache_key), R11);
+        st_q_imm32(RAX, 0, 0);
+    }
     /* the view frame */
     st(R8R, static_cast<int32_t>(P.act_vframe + P.frame_slots), RDX);
     st32(R8R, static_cast<int32_t>(P.act_vframe + P.frame_size), RSI);
@@ -1918,14 +1946,16 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.movabs(RAX, depth_addr);
     e.u8(0x81); e.u8(0x38);
     e.u32(static_cast<uint32_t>(jit_sync_depth_cap()));
-    std::vector<size_t> j_slows;
+    std::vector<size_t> j_slows, j_dones;
     j_slows.push_back(e.j32(0x7D));                /* jge slow */
-    /* M5b: THE FULLY-INLINE PUSH - resolve/gates/push_window's hot shape/
-     * record fill/unrolled bind/captures, ending with rdi = the callee
-     * window and rdx = the fragment entry; every decline jumped to slow
-     * BEFORE any mutation. */
+    /* M5b/M5c: THE FULLY-INLINE PUSH - resolve/gates/(cached: probe)/
+     * push_window's hot shape/record fill/unrolled bind/captures, ending
+     * with rdi = the callee window and rdx = the fragment entry; every
+     * decline jumped to slow BEFORE any mutation; a cache HIT jumped to
+     * done (dst already written by the probe). */
     emit_sync_push_native(e, in, is_value,
-                          static_cast<int>(callee_arg), j_slows);
+                          in.op == OpCode::CachedCallV,
+                          static_cast<int>(callee_arg), j_slows, j_dones);
     /* depth++ (the callee is committed) */
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x01);                        /* inc dword [rcx] */
@@ -1985,6 +2015,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.patch32_here(j_done1);
     e.patch32_here(j_done2);
     e.patch32_here(j_done3);
+    for (const size_t j : j_dones)
+        e.patch32_here(j);                /* the cached probe's HIT path */
     emit_call_epilogue(e);
 }
 
@@ -4939,13 +4971,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::CachedCallV:
-        /* M5 inc 3 (LEAN SYNC ENTER): the cached recursive call - the helper
-         * probes the caller's per-frame pure cache, else pushes the callee
-         * frame (the miss key riding its record) and runs it to completion;
-         * the caller continues natively either way. */
-        emit_sync_call(e, ck, in, pc, old_pc,
+        /* M5c: the cached recursive call, fully inline - the emitted site
+         * calls the lean jit_cached_probe (hit -> dst written, continue),
+         * and a miss rides the parked key through the M5b inline push
+         * (rec.cache_key store); declines fall to jit_call_sync_cached,
+         * which CONSUMES the parked key instead of re-probing. */
+        emit_sync_call_inline(e, ck, in, pc, old_pc, /*is_value=*/false,
                        reinterpret_cast<const void *>(jit_call_sync_cached),
-                       OpCode::CachedCallV);
+                       static_cast<int_type>(in.target2));
         return true;
 
     case OpCode::CallValueV:
