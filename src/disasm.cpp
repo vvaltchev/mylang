@@ -1700,8 +1700,11 @@ std::string disassemble_program(const Block *root)
     /* THE SPLICE, before the jit pass, exactly as vm_precompile_all does -
      * otherwise -vd would dump the un-inlined bytecode and lie about what
      * runs (the dump is the audit surface for the .myv image). */
+    BcInlineSnapshots bc_snaps;
+    for (const auto &kv : chunks)
+        bc_inline_snapshot(kv.second, bc_snaps);
     for (auto &kv : chunks)
-        bc_inline_chunk(kv.second, slot_desc);
+        bc_inline_chunk(kv.second, slot_desc, bc_snaps);
 
     /* Pass B: jit each body with its JitCtx (caller_desc = its own descriptor).
      * Main gets no JitCtx - a call from main is never native (as at runtime). */

@@ -17670,6 +17670,183 @@ static bool jit_rethrow_native()
 #endif
 }
 
+/*
+ * THE SPLICE IS ORDER-INDEPENDENT (plans/bytecode-inliner.md defect 3).
+ *
+ * The pass iterates an unordered_map of chunks and MUTATES them as it goes,
+ * so reading a callee's body live made the result depend on that order -
+ * two compiles of one program could differ, which "compiling twice is
+ * byte-identical" forbids. Not a correctness hazard (a spliced callee gains
+ * inline_ctxs, which the gate rejects, so the worst case is a MISSED
+ * inline), but a reproducibility one.
+ *
+ * THE SHAPE MATTERS: it needs a three-level chain a -> b -> c, where the
+ * middle function is both a caller and a callee. With a two-level chain the
+ * callee is a leaf, splicing it changes nothing, and both orders agree
+ * whether or not the bug is present - which is exactly what a first
+ * attempt at this test did on samples/gcd, passing on the BROKEN build.
+ * Here, splicing b first makes a decline it; splicing a first inlines the
+ * pristine b. Verified failing with the fix reverted.
+ *
+ * Bodies carry a loop so the AST inliner (which runs long before this)
+ * leaves the calls alone - the audit must report both sites OK or the test
+ * proves nothing.
+ */
+static bool bc_inline_order_independent()
+{
+    const bool saved_bi = g_bc_inline_enabled;
+    g_bc_inline_enabled = true;
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+
+    /* Splice every body in `rev`-or-forward order; return a flat signature
+     * of ALL resulting code, ordered by function name so the signature
+     * itself cannot depend on the iteration order under test. */
+    auto sign = [&](bool rev, size_t *sites) -> std::vector<int> {
+        std::vector<int> out;
+        const std::vector<const char *> src = {
+            "func c(x) {",
+            "    var s = 0; var i = 0;",
+            "    while (i < 3) { s = s + x; i++; }",
+            "    return s;",
+            "}",
+            "func b(x) {",
+            "    var t = c(x); var i = 0;",
+            "    while (i < 2) { t = t + 1; i++; }",
+            "    return t;",
+            "}",
+            "func a(x) {",
+            "    var u = b(x); var i = 0;",
+            "    while (i < 2) { u = u + 1; i++; }",
+            "    return u;",
+            "}",
+            "print(a(5));" };
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        Block *rb = dynamic_cast<Block *>(root.get());
+        if (!rb)
+            return out;
+
+        std::vector<const FuncDeclStmt *> funcs;
+        collect_funcs(root.get(), funcs);
+        /* the runtime sets this during the push; the -vd path sets it by
+         * hand for the same reason - without it every callee declines and
+         * the test would pass by measuring nothing */
+        for (const FuncDeclStmt *fn : funcs) {
+            bool fast = true;
+            for (const auto &p : fn->desc->params)
+                if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+                    fast = false;
+            const_cast<FuncDescriptor *>(fn->desc)->fast_bind = fast;
+        }
+        std::vector<const FuncDescriptor *> slot_desc(
+            rb->global_func_names.size(), nullptr);
+        for (const FuncDeclStmt *fn : funcs)
+            if (fn->id && fn->id->sym.kind == SymKind::global) {
+                const int sl = fn->id->sym.slot;
+                if (sl >= 0 && static_cast<size_t>(sl) < slot_desc.size())
+                    slot_desc[sl] = fn->desc;
+            }
+
+        /* codegen every body, keeping a name-sorted view for the signature
+         * and a separate order for the splice itself */
+        std::vector<std::pair<std::string, Chunk>> built;
+        for (const FuncDeclStmt *fn : funcs) {
+            Chunk ch;
+            if (!codegen_func_body(fn, ch, /*jit=*/false))
+                continue;
+            const std::string nm = fn->desc && fn->desc->name
+                                       ? std::string(fn->desc->name->val)
+                                       : std::string("?");
+            /* the descriptor must point at the chunk we are about to
+             * splice, or a caller resolves the callee to a stale body */
+            built.emplace_back(nm, std::move(ch));
+        }
+        for (auto &p : built)
+            for (const FuncDeclStmt *fn : funcs)
+                if (fn->desc && fn->desc->name
+                        && std::string(fn->desc->name->val) == p.first)
+                    const_cast<FuncDescriptor *>(fn->desc)->vm_chunk =
+                        &p.second;
+
+        BcInlineSnapshots snaps;
+        for (const auto &p : built)
+            bc_inline_snapshot(p.second, snaps);
+
+        std::vector<size_t> order(built.size());
+        for (size_t i = 0; i < order.size(); i++)
+            order[i] = i;
+        if (rev)
+            std::reverse(order.begin(), order.end());
+        size_t n = 0;
+        for (const size_t i : order)
+            if (bc_inline_chunk(built[i].second, slot_desc, snaps))
+                n++;
+        if (sites)
+            *sites = n;
+
+        std::sort(built.begin(), built.end(),
+                  [](const std::pair<std::string, Chunk> &l,
+                     const std::pair<std::string, Chunk> &r) {
+                      return l.first < r.first;
+                  });
+        for (const auto &p : built) {
+            out.push_back(static_cast<int>(p.second.code.size()));
+            for (const Instr &in : p.second.code) {
+                out.push_back(static_cast<int>(in.op));
+                out.push_back(in.target);
+                out.push_back(in.target2);
+            }
+        }
+        /* the descriptors point into `built`, which dies here */
+        for (const FuncDeclStmt *fn : funcs)
+            const_cast<FuncDescriptor *>(fn->desc)->vm_chunk = nullptr;
+        return out;
+    };
+
+    size_t nf = 0, nr = 0;
+    const std::vector<int> fwd = sign(false, &nf);
+    const std::vector<int> rev = sign(true, &nr);
+    g_bc_inline_enabled = saved_bi;
+    g_exec_engine = saved;
+
+    if (fwd.empty()) {
+        cout << "  order-independence: nothing was compiled\n";
+        return false;
+    }
+    /* The BUG'S FINGERPRINT: the two orders spliced a different number of
+     * sites, because splicing the middle function first makes the outer one
+     * decline it. Checked before the equality below so the failure names
+     * the cause rather than "some bytes differ". */
+    if (nf != nr) {
+        cout << "  order-independence: the two orders spliced DIFFERENT "
+                "numbers of sites (fwd=" << nf << " rev=" << nr
+             << ") - the pass is reading callees live\n";
+        return false;
+    }
+    /* NOT VACUOUS: the splice must actually have fired - two identical
+     * no-op passes would agree trivially. */
+    if (nf < 2) {
+        cout << "  order-independence: the splice fired only " << nf
+             << " times - the chain shape stopped working\n";
+        return false;
+    }
+    if (fwd != rev) {
+        cout << "  order-independence: forward and reverse splice orders "
+                "produced DIFFERENT bytecode (" << fwd.size() << " vs "
+             << rev.size() << " signature words)\n";
+        return false;
+    }
+    return true;
+}
+
 static bool jit_final_batch_deletable()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -21141,6 +21318,9 @@ static const std::vector<extra_check> extra_checks =
       jit_native_throw },
     { "jit: struct/unpack builders + relaxed inline guard (#56 final)",
       jit_final_batch_deletable },
+    { "codegen: the bytecode splice is INDEPENDENT of the order the chunk "
+      "map is iterated (a->b->c chain; both orders must agree)",
+      bc_inline_order_independent },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",

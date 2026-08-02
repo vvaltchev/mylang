@@ -2215,8 +2215,11 @@ vm_precompile_all(const Block *root, bool jit)
      * `.myv` writer, which stores this same pre-jit code) sees the inlined
      * form. One pass, one level - the snapshot rule keeps a self-recursive
      * body from compounding. */
+    BcInlineSnapshots bc_snaps;
+    for (const auto &kv : g_func_chunks)
+        bc_inline_snapshot(kv.second, bc_snaps);
     for (auto &kv : g_func_chunks)
-        bc_inline_chunk(kv.second, slot_desc);
+        bc_inline_chunk(kv.second, slot_desc, bc_snaps);
 
     /* Pass B: JIT every compiled body, each with its own JitCtx (caller_desc =
      * the descriptor keying its chunk). Order-independent (all native_leaf

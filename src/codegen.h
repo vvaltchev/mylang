@@ -109,18 +109,52 @@ void bc_inline_audit(const Chunk &caller, const char *caller_name,
                      const std::vector<const FuncDescriptor *> &slot_desc);
 
 /*
+ * THE PRE-SPLICE SNAPSHOT of one callee body, and the map of them.
+ *
+ * The splice reads a callee's finished chunk, but the pass mutates chunks
+ * as it goes - so reading LIVE makes the result depend on the order the
+ * caller iterates its chunk map. That map is an `unordered_map`, so the
+ * order varies run to run and two compiles of one program could differ,
+ * which "compiling twice is byte-identical" forbids. It is not a
+ * correctness hazard (a spliced callee gains `inline_ctxs` entries, which
+ * the gate rejects, so the worst case is an inline that silently does not
+ * happen) but it is a reproducibility one.
+ *
+ * Snapshotting every body BEFORE any of them is touched fixes both halves
+ * at once: the order stops mattering, and every splice takes the ORIGINAL
+ * body - which is what "ONE level" already claimed and only accidentally
+ * got. `eligible` is the gate's verdict on the PRISTINE body for the same
+ * reason.
+ */
+struct BcInlineSnapshot {
+    std::vector<Instr> code;
+    std::vector<Chunk::LocEntry> locs;
+    std::vector<int32_t> ref_slots;
+    int slot_count = 0;
+    int n_temps = 0;
+    bool eligible = false;
+};
+typedef std::unordered_map<const Chunk *, BcInlineSnapshot> BcInlineSnapshots;
+
+/* Record `ck`'s pristine body into `out`. Call for EVERY chunk of the
+ * program before the first bc_inline_chunk. */
+void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out);
+
+/*
  * THE SPLICE. Replace every inline-able CallV in `ck` with the callee's
  * body - arg binds as MoveVs, the body slot-remapped into a fresh range
  * above the caller's frame, each ReturnV rewritten to "move the result to
- * the call's dst, jump to the join". ONE level, from a SNAPSHOT of the
- * callee's code, so a self-recursive body cannot compound.
+ * the call's dst, jump to the join". ONE level, from the pre-pass SNAPSHOT
+ * of the callee's code, so neither a self-recursive body nor an
+ * already-spliced callee can compound.
  *
  * Runs after every chunk is codegen'd and before any is jit'd
  * (vm_precompile_all), because it needs the callees' finished chunks and
  * produces bytecode the JIT then sees. Returns true if it changed `ck`.
  */
 bool bc_inline_chunk(Chunk &ck,
-                     const std::vector<const FuncDescriptor *> &slot_desc);
+                     const std::vector<const FuncDescriptor *> &slot_desc,
+                     const BcInlineSnapshots &snaps);
 
 /* The splice's kill switch (-nbi / MYLANG_BCINLINE=0): the same-binary
  * A/B, since the un-inlined bytecode is the only oracle for a splice. */
