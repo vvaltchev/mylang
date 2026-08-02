@@ -189,10 +189,14 @@ size_t jit_enter(const void *frag, void *slots)
 /* The switching entry for jit_call_sync_core's DIRECT callee entry (the
  * helper path - a coerced-bind/cached callee): each core level brackets
  * its own switch; nested levels see the nulled g_nstack_cur and stay
- * plain (already on the native stack). r12 (callee-saved: preserved by
- * every C++ helper a fragment calls; never used by the emitter) carries
- * the C rsp across; mmap page alignment + the `call`'s ra push give the
- * fragment the rsp % 16 == 8 entry contract. */
+ * plain (already on the native stack). r12 carries the C rsp across the
+ * switch. It is CALLEE-SAVED, which is what makes that safe - every C++
+ * helper preserves it, and so does a fragment: r12 is in the emitter's
+ * N5 cache pool now, so a fragment that pins it pushes it at frag_entry
+ * and pops it at every exit. (Before the pool moved to the callee-saved
+ * registers this comment said "never used by the emitter"; the guarantee
+ * is now save/restore rather than avoidance.) mmap page alignment + the
+ * `call`'s ra push give the fragment the rsp % 16 == 8 entry contract. */
 #if defined(__clang__)
 __attribute__((no_sanitize("function")))
 #elif defined(__GNUC__)
@@ -451,8 +455,9 @@ struct Emitter {
 
     /* N5 register cache: a hot int slot pinned in a GP register for the
      * fragment's life (load once at entry, flush type+payload at EVERY
-     * exit/bail). reg is a caller-saved GP (r10/r11) - free, so no
-     * prologue. */
+     * exit/bail). reg is a CALLEE-saved GP (r12-r15), so a helper call
+     * preserves it: the save is one push at frag_entry instead of a
+     * push/pop around every call. */
     struct CacheEnt { int slot; int32_t payload, type; uint8_t reg; };
     std::vector<CacheEnt> cache;
 
@@ -537,20 +542,88 @@ struct Emitter {
     {
         u8(0x48); u8(static_cast<uint8_t>(0xB8 | reg)); u64(imm);
     }
+    /* The CALLEE-SAVED registers this fragment took over, beyond the base:
+     * the N5 cache registers. Set once at the entry, replayed in reverse
+     * at every exit. Empty for a fragment that caches nothing. */
+    std::vector<uint8_t> saved;
+
+    /* Total pushes at entry, including the base and any 8-byte pad. A
+     * fragment is entered at rsp % 16 == 8, so an ODD count lands the body
+     * at 0 - which IS the call-ready state every emitted call site assumes.
+     * Hence the pad when 1 + saved.size() is even. */
+    bool entry_pad() const { return (1 + saved.size()) % 2 == 0; }
+
     /* THE FRAGMENT ENTRY: the window arrives in rdi (from jit_enter, an
-     * emitted sync `call rdx`, or a native_leaf direct call). rbx is
-     * callee-saved, so save the caller's and take it over as the base.
-     * The push also turns the entry rsp % 16 == 8 into the call-ready 0. */
+     * emitted sync `call rdx`, or a native_leaf direct call). rbx and the
+     * cache registers are callee-saved, so save the caller's and take them
+     * over. Called AFTER `saved` is filled (the cache pick decides it). */
     void frag_entry()
-    { push_reg(REG_SLOTS_BASE); mov_rr(REG_SLOTS_BASE, REG_ARG0); }
-    /* THE FRAGMENT RETURN: restore the caller's base, then ret. rax (the
-     * resume pc / sentinel) is already set by the caller of this. */
-    void frag_ret() { pop_reg(REG_SLOTS_BASE); u8(0xC3); }
-    /* mov eax, imm32; ret - the exit/bail: flush the register cache
-     * (N5) so the interpreter sees the up-to-date slots (it reads through
-     * rbx, so pop AFTER), then return the resume pc. */
+    {
+        push_reg(REG_SLOTS_BASE);
+        for (const uint8_t r : saved)
+            push_reg(r);
+        if (entry_pad())
+            { u8(0x48); u8(0x83); u8(0xEC); u8(0x08); }       /* sub rsp,8 */
+        mov_rr(REG_SLOTS_BASE, REG_ARG0);
+    }
+    /* THE FRAGMENT RETURN: give the caller its registers back, then ret.
+     * rax (the resume pc / sentinel) is already set by the caller of this,
+     * and neither pop nor the pad adjustment touches it. */
+    void frag_ret()
+    {
+        if (entry_pad())
+            { u8(0x48); u8(0x83); u8(0xC4); u8(0x08); }       /* add rsp,8 */
+        for (size_t i = saved.size(); i-- > 0; )
+            pop_reg(saved[i]);
+        pop_reg(REG_SLOTS_BASE);
+        u8(0xC3);
+    }
+    /* Pending `jmp <epilogue>` sites, split by whether the exit must
+     * FLUSH the register cache. Patched (and cleared) per fragment by
+     * emit_epilogues. */
+    std::vector<size_t> epi_flush, epi_bare;
+
+    /* THE EXIT/BAIL: `mov eax, pc; jmp <epilogue>` - a CONSTANT 10 bytes.
+     * It used to inline the whole tail (flush the N5 cache, restore, ret),
+     * which grew with the cache: at four pinned slots the flush alone is
+     * 56 bytes, and the short jcc that several guards use to hop OVER an
+     * exit ran out of its 8-bit displacement. Sharing one epilogue per
+     * fragment makes every exit the same small size again, and stops the
+     * flush being duplicated at ~100 sites.
+     *
+     * TWO epilogues, because a barrier'd op EMPTIES the cache across its
+     * emission on purpose: such an op's exit must NOT flush (the helper
+     * already wrote those slots, and flushing would clobber its writes
+     * with the stale pre-call register values). The choice is exactly
+     * "is the cache live right now", which is what `cache` already says. */
     void exit_pc(uint32_t pc)
-    { flush_cache(); pop_reg(REG_SLOTS_BASE); u8(0xB8); u32(pc); u8(0xC3); }
+    {
+        u8(0xB8); u32(pc);                                /* mov eax, pc */
+        u8(0xE9);
+        (cache.empty() ? epi_bare : epi_flush).push_back(pos());
+        u32(0);                                           /* jmp rel32 */
+    }
+
+    /* Emit this fragment's epilogue(s) and patch the exits that need them.
+     * Called once per fragment, after its body and entry stubs. */
+    void emit_epilogues()
+    {
+        if (!epi_flush.empty()) {
+            const size_t at = pos();
+            flush_cache();
+            frag_ret();
+            for (const size_t s : epi_flush)
+                patch32(s, static_cast<uint32_t>(at - (s + 4)));
+            epi_flush.clear();
+        }
+        if (!epi_bare.empty()) {
+            const size_t at = pos();
+            frag_ret();
+            for (const size_t s : epi_bare)
+                patch32(s, static_cast<uint32_t>(at - (s + 4)));
+            epi_bare.clear();
+        }
+    }
 
     /* ---- N3 SSE float ---- (xmm0=a/acc, xmm1=b; r8 = t_float) */
     /* movsd xmm<r>, [rbx+disp] */
@@ -1504,39 +1577,43 @@ static void jit_put_bool(LValue *lv, int_type v) noexcept
 }
 
 /* A helper CALL clobbers every caller-saved GP reg. The fragment relies on
- * rbx (slots base), rsi (t_int), r8 (t_float) AND the N5 cache regs
- * r10/r11 (which hold a hot slot's LIVE in-register value). rbx is
- * CALLEE-SAVED, so the callee preserves it and nothing is emitted for it
- * here - that is the whole point of the base living there. The cache regs
- * are PUSHED across the call and popped after; rsi/r8 are constant
- * singletons, re-materialised. (rax/rcx/rdx are per-op scratch - the store
- * is the last thing in an op, so the next op reloads them.) 16-alignment:
- * frag_entry's push left rsp % 16 == 0, which IS call-ready, so an EVEN
- * number of pushes keeps it: pad iff ncache is odd.
+ * the slots base, the N5 cache registers (which hold a hot slot's LIVE
+ * in-register value) and rsi/r8 (the type singletons). The first two now
+ * live in CALLEE-SAVED registers - rbx for the base, r12-r15 for the cache
+ * - so the callee preserves them and the prologue emits NOTHING; only
+ * rsi/r8 are re-materialised, and they are constants. (rax/rcx/rdx are
+ * per-op scratch - the store is the last thing in an op, so the next op
+ * reloads them.)
  *
- * MISSING THIS was a correctness bug: the int-store helper clobbered a
- * cached accumulator/counter (r10/r11) in an int run (a float/libm run
- * caches nothing, so it was masked), a nested_fuzz find. */
+ * The registers are saved ONCE per fragment, at frag_entry, instead of
+ * around each of its calls. SPILLING THEM AT ALL was once a correctness
+ * bug: the int-store helper clobbered a cached accumulator/counter in an
+ * int run (a float/libm run caches nothing, so it was masked), a
+ * nested_fuzz find. Moving them callee-side keeps that guarantee by
+ * construction rather than by remembering to bracket each call. */
 static void emit_call_prologue(Emitter &e)
 {
-    for (const Emitter::CacheEnt &c : e.cache)
-        e.push_reg(c.reg);
-    if (e.cache.size() % 2 == 1)               /* pad: keep rsp % 16 == 0 */
-        { e.u8(0x48); e.u8(0x83); e.u8(0xEC); e.u8(0x08); }   /* sub rsp,8 */
-    /* NOTE the prologue does NOT materialise rdi. A helper that takes the
+    /* NOTHING. Both things this used to do are gone: the slots base is in
+     * callee-saved rbx and the N5 cache registers are callee-saved too, so
+     * a helper call preserves all of them, and rsp is already call-ready
+     * (frag_entry made the body rsp % 16 == 0). Kept as a named no-op
+     * because it MARKS the call sites - a future pin in a caller-saved
+     * register would spill here, and the epilogue below is still real.
+     *
+     * NOTE it does NOT materialise rdi either. A helper that takes the
      * slot window as its first argument used to get it for free, because
      * the base WAS rdi; such a site now says so explicitly with
      * slots_to_arg0(). Measured on this file: 64 of 73 call sites load rdi
      * with something else immediately after, so putting the move here
      * would be dead code at seven sites out of eight. */
+    (void)e;
 }
 
 static void emit_call_epilogue(Emitter &e)
 {
-    if (e.cache.size() % 2 == 1)
-        { e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08); }   /* add rsp,8 */
-    for (size_t i = e.cache.size(); i-- > 0; )
-        e.pop_reg(e.cache[i].reg);
+    /* Only the two type singletons need restoring - they are compile-time
+     * constants held in CALLER-saved rsi/r8, so re-materialising is
+     * cheaper than a register pair the allocator could otherwise use. */
     e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
     e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
 }
@@ -2304,11 +2381,18 @@ static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
     store_dst(e, ck, src, slot, bail_pc);
 }
 
-/* N5: pick up to 2 hot INT-scalar slots to pin in registers for a run.
+/* How many hot slots a fragment may pin: one per available CALLEE-SAVED
+ * register (r12-r15). They survive a helper call for free, so the pool
+ * costs one push/pop per fragment ENTRY instead of one per CALL - which
+ * is what let it grow from two registers to four at the same time. */
+static const uint8_t CACHE_REGS[] = { 12, 13, 14, 15 };
+static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
+
+/* N5: pick up to MAX_CACHED hot INT-scalar slots to pin for a run.
  * A slot qualifies iff it is a RESOLVED LOCAL (< slot_count) and EVERY use
  * in [begin,end) is an int-scalar read/write (the int-arith / loop ops);
  * any float / array / member touch DISQUALIFIES it. Ranked by use count
- * (>= 3), top 2 chosen.
+ * (>= 3), the top MAX_CACHED chosen.
  *
  * TEMPS (>= slot_count) are EXCLUDED: a temp is scratch the VM REUSES for
  * different roles across run boundaries - an int scratch inside one JIT
@@ -2807,7 +2891,7 @@ pick_cached_slots(const Chunk &ck, size_t begin,
                                             : a.second < b.second;
               });
     std::vector<int> out;
-    for (size_t i = 0; i < cand.size() && i < 2; i++)
+    for (size_t i = 0; i < cand.size() && i < MAX_CACHED; i++)
         out.push_back(cand[i].second);
     return out;
 }
@@ -6811,7 +6895,9 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         e.patch32(f.site,
                   static_cast<uint32_t>(label[f.target_pc] - (f.site + 4)));
     /* The body ends in a native ReturnV (emit_op emitted its `ret`); every
-     * other exit is a branch to an in-body label, so no trailing exit_pc. */
+     * other exit is a branch to an in-body label, so no trailing exit_pc.
+     * An island call CAN exit though (RAISED), so the shared tail follows. */
+    e.emit_epilogues();
 
     /* Finalize: trampolines for out-of-range calls, mmap W^X, patch call
      * rel32s, flip RX. (Self-contained - does NOT touch the per-run path.) */
@@ -7219,24 +7305,32 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     for (size_t r = 0; r < runs.size(); r++) {
         const size_t begin = runs[r].begin, end = runs[r].end;
         frag_off[r] = e.pos();
-        e.frag_entry();                          /* push rbx; rbx = rdi */
+
+        /* N5: pin up to MAX_CACHED hot int slots for this run. The PICK
+         * runs BEFORE the entry is emitted, because it decides which
+         * callee-saved registers this fragment takes over and therefore
+         * what frag_entry must push (and what every exit must pop). */
+        e.cache.clear();
+        e.saved.clear();
+        std::vector<char> cache_barrier(end - begin, 0);
+        const std::vector<int> hot =
+            pick_cached_slots(chunk, begin, end, chunk.slot_count,
+                              &cache_barrier);
+        for (size_t h = 0; h < hot.size(); h++)
+            e.saved.push_back(CACHE_REGS[h]);
+
+        e.frag_entry();               /* push rbx + the cache regs; rbx=rdi */
         e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
         if (run_has_float(chunk, begin, end))     /* r8 = t_float (N3) */
             e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
 
-        /* N5: pin up to 2 hot int slots in r10/r11 for this run - load
-         * each ONCE here (the back edge jumps to the first op below, so
-         * the loop keeps them in registers; every exit flushes them). */
-        e.cache.clear();
-        std::vector<char> cache_barrier(end - begin, 0);
-        static const uint8_t cregs[2] = { 10, 11 };
-        const std::vector<int> hot =
-            pick_cached_slots(chunk, begin, end, chunk.slot_count,
-                              &cache_barrier);
+        /* Load each pinned slot ONCE here (the back edge jumps to the
+         * first op below, so the loop keeps them in registers; every exit
+         * flushes them back). */
         for (size_t h = 0; h < hot.size(); h++) {
             const SlotAddr a = slot_addr(hot[h]);
-            e.cache.push_back({ hot[h], a.payload, a.type, cregs[h] });
-            e.load(cregs[h], a.payload);     /* entry load */
+            e.cache.push_back({ hot[h], a.payload, a.type, CACHE_REGS[h] });
+            e.load(CACHE_REGS[h], a.payload);     /* entry load */
         }
 
         std::vector<size_t> label(end - begin, 0);
@@ -7313,7 +7407,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             if (run_has_float(chunk, begin, end))
                 e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
             for (size_t h = 0; h < hot.size(); h++)
-                e.load(cregs[h], e.cache[h].payload);
+                e.load(CACHE_REGS[h], e.cache[h].payload);
 #ifdef TESTS
             e.movabs(RCX,
                      reinterpret_cast<uint64_t>(&g_jit_entry_resume));
@@ -7324,6 +7418,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.u32(static_cast<uint32_t>(
                 tgt - (e.pos() + 4)));            /* jmp (backward) */
         }
+        e.emit_epilogues();      /* the shared exit tail(s) for THIS run */
         if (g_jit_annotate)
             chunk.native.frags.push_back(
                 { static_cast<uint32_t>(frag_off[r]), 0, std::move(marks) });

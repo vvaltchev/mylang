@@ -1093,8 +1093,48 @@ frequent as calls. **The reason to do it is not this number** - it is
 that four caller-saved registers cannot host a register ALLOCATOR (every
 value would spill around every call), and the allocator is the next step.
 
-**N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to 2 hot int-scalar slots
-are pinned in `r10`/`r11` per fragment (`pick_cached_slots`, jit.cpp):
+**THE CACHE POOL IS CALLEE-SAVED AND FOUR WIDE (2026-08-01,
+plans/jit-registers.md step 2a).** The N5 registers were `r10`/`r11` -
+CALLER-saved, so `emit_call_prologue` pushed each one and
+`emit_call_epilogue` popped it around EVERY helper call, and a fragment
+could hold at most two. They are `r12`-`r15` now (`CACHE_REGS`,
+`MAX_CACHED`): callee-saved, so a helper preserves them for free. The
+saves move from once per CALL to once per fragment ENTRY - `frag_entry`
+pushes the base plus each pinned register (plus an 8-byte pad when the
+count would leave rsp mis-aligned, since the body must sit at
+`rsp % 16 == 0`), and every exit undoes it. **`emit_call_prologue` is now
+an empty named marker** and the epilogue is just the two type-singleton
+`movabs`es. The pick necessarily runs BEFORE the entry is emitted, since
+it decides which registers the fragment takes over.
+**THE EXIT HAD TO BE SHARED, and that is the trap worth remembering.**
+`exit_pc` used to INLINE the whole tail - flush the cache, restore, ret -
+so its size grew with the pool: at four pinned slots the flush alone is
+56 bytes, and the short `jcc` that several guards use to hop OVER an exit
+ran out of its 8-bit displacement (a `patch8` assertion, caught by `-rt`).
+An exit is now `mov eax, pc; jmp <epilogue>` - a CONSTANT 10 bytes - and
+each fragment emits its tail ONCE at the end (`emit_epilogues`), which
+also stops ~100 sites duplicating the flush. **TWO** epilogues, because a
+barrier'd op deliberately EMPTIES the cache across its emission: such an
+op's exit must not flush (the helper already wrote those slots and the
+stale registers would clobber its writes), so the emit picks the bare
+tail exactly when `cache` is empty. NOTE `jit_enter_deep`'s asm carries
+the C `rsp` across the stack switch in **r12**, which is now in the pool -
+still correct, but by save/restore rather than by the emitter never
+touching it, and the comment there says so. Measured (callgrind Ir,
+`OPT=1 ASSERTS=0`, CUMULATIVE with the rbx move): 43_sieve **-5.07%**,
+14_array_subscript **-3.20%**, 46_matrix_mult **-2.82%**,
+76_funcval_dispatch -0.75%, 11_closure_counter -0.59%, 63_closures
+-0.39%, 10_recursion_deep -0.31%; 01_while_loop / 07_nested_loops exactly
+neutral; 35_map_filter +0.30% / 34_sort_custom_cmp +0.25% (a callback
+re-enters a fragment per ELEMENT, so it pays the entry push/pop most
+often). The array/store-heavy benches gain most because their loops make
+helper calls AROUND hot int locals - precisely the spill this deletes.
+The `>= 3`-uses heuristic still limits how much of the pool gets used; a
+LIVE-RANGE allocator is the next step and is what the wider pool is for.
+
+**N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to `MAX_CACHED` hot
+int-scalar slots are pinned in `r12`-`r15` per fragment
+(`pick_cached_slots`, jit.cpp):
 loaded ONCE at the fragment head (the native back edge jumps AFTER the
 entry loads, keeping them live across the loop), read/written straight
 from the register (`read_slot`/`write_slot`/`load_operand` are all

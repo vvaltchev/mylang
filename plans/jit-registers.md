@@ -71,6 +71,34 @@ So step 1 is not a perf change. It is the enabling change: an allocator
 over four caller-saved registers would have to spill everything around
 every helper call, which is most of what an allocator is for.
 
+## Step 2a - the cache pool moves to r12-r15 and widens (LANDED)
+
+The N5 cache registers were r10/r11 (caller-saved, spilled around every
+helper call, at most two slots). They are now r12-r15 (`CACHE_REGS` /
+`MAX_CACHED`): callee-saved, so the spill moves from once per CALL to one
+push at `frag_entry`, and the pool is twice as wide. `emit_call_prologue`
+became an empty marker; the epilogue is just the two singleton `movabs`es.
+
+**The exit had to be shared.** `exit_pc` inlined the whole tail, so its
+size grew with the pool - at four pinned slots the flush alone is 56
+bytes, and the short `jcc` several guards use to hop OVER an exit ran out
+of its 8-bit displacement (a `patch8` assertion, caught by `-rt`). An exit
+is now `mov eax, pc; jmp <epilogue>`, a constant 10 bytes, with the tail
+emitted ONCE per fragment. TWO tails: a barrier'd op empties the cache on
+purpose and its exit must NOT flush.
+
+Measured (callgrind Ir, cumulative with the rbx move): 43_sieve **-5.07%**,
+14_array_subscript **-3.20%**, 46_matrix_mult **-2.82%**,
+76_funcval_dispatch -0.75%, 11_closure_counter -0.59%, 63_closures -0.39%,
+10_recursion_deep -0.31%; 01_while_loop / 07_nested_loops exactly neutral;
+35_map_filter +0.30%, 34_sort_custom_cmp +0.25%.
+
+**The pool is not full, and that is the point of step 2b.** A four-wide
+pool fed by a "used >= 3 times, top N by count" heuristic still pins ONE
+register in a loop with four hot accumulators, because `a += i` counts as
+two uses of `a` and the threshold rejects it. The registers are available
+now; what is missing is an allocator that decides from LIVE RANGES.
+
 ### What step 1 deliberately left alone
 
 `rsi` (t_int) and `r8` (t_float) are still pinned and still re-materialised
