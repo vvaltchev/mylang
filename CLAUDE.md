@@ -1594,6 +1594,15 @@ mode. ALL must be green to `exit(0)`:
    construction.
 2. **the bytecode VM, JIT OFF** (`vm:`) — pure interpreted bytecode.
 3. **the bytecode VM, JIT ON** (`jit:`) — native code; the script default.
+4. **JIT OFF + the bytecode SPLICE** (`vm+bi:`) — the opt-in inliner.
+5. **JIT ON + the bytecode SPLICE** (`jit+bi:`).
+
+Modes 4-5 exist because the splice is default-OFF, so without them the
+whole suite says NOTHING about it — and "the configuration nobody runs"
+is exactly how a disabled branch remap survived 39 commits. Two of them,
+not one: a splice bug can live in the bytecode it PRODUCES (visible with
+the JIT off) or in how the JIT CONSUMES it (visible only with it on).
+The full suite is green in all five; `-rt` costs ~17s in the debug lane.
 
 **WHY MODE 2 IS NOT OPTIONAL.** With only tw-vs-VM, a codegen bug and a
 JIT bug are the SAME SYMPTOM, and a JIT bug that happens to be
@@ -5954,11 +5963,22 @@ temps-only frame (`do_func_call`'s chunk hook is NOT gated on `resolved`),
 and the one genuinely un-compilable body — the pathological un-slottable
 >64-param function (its blocks are never `scope_free`) — is a loud
 compile-time `NotLoweredEx`, never a silent tree-walk. A function chunk
-(`codegen_chunk`) whose body ends in a `ReturnV`
-OMITS the trailing `Halt`: `ReturnV` already `return`s from `vm_run_chunk`, so
-the `Halt` would be dead AND unreferenced (the codegen emits no jump to the
-chunk end past a return — an if whose branches all return leaves no merge
-`Jump`, a loop-exit targets the following op). A FALL-THROUGH body (`main`, a
+(`codegen_chunk`) whose body ends in a `ReturnV` **and whose end nothing
+BRANCHES TO** omits the trailing `Halt`: `ReturnV` already `return`s from
+`vm_run_chunk`, so such a `Halt` is dead and unreferenced. **The second
+half of that condition was missing until 2026-08-02** and the comment
+asserted in prose that "the codegen emits no jump to the chunk end past a
+return" — FALSE for a body whose last statement is a conditional return,
+`func f(x) { ...; if (s > 0) return s; }`, where the `if`'s false arm (the
+implicit `return none`) targets exactly the pc the `Halt` would occupy.
+Dropping it left that branch one past the last instruction, so taking it
+made `vm_dispatch` READ `code[n]`: an ASan-confirmed heap-buffer-overflow
+yielding garbage (`-1`, or a STALE dst slot) instead of `none`, in the
+DEFAULT build. Now checked (`visit_pc_fields` over the emitted code) rather
+than asserted, with an ASSERTS-only invariant after the peephole that no pc
+field points past the last instruction. Found by pushing coverage on the
+bytecode splice — the shape reaches the splice's own tail-target rewrite.
+A FALL-THROUGH body (`main`, a
 void function, a trailing loop/if) keeps the `Halt` as its implicit-return-
 `none` terminator + jump target. Recursion with arith stays ~neutral (`fib`
 −0.08%).

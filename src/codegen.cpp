@@ -8208,15 +8208,38 @@ codegen_chunk(const Block *block, int slot_count, bool jit)
     cg.temp_base = cg.next_temp = cg.max_temp = slot_count;
     cg.gen_stmts(block->elems);
     /* A body that ends in a ReturnV needs no Halt terminator: ReturnV already
-     * stops the chunk (vm_run_chunk `return`s), so a trailing Halt is dead AND
-     * unreferenced - the codegen emits no jump to the chunk end past a
-     * return (an if whose branches all return leaves no merge Jump; a loop
-     * exit targets the following op, not the end). A FALL-THROUGH body (last op
-     * not a ReturnV - a void fn, a trailing loop/if) keeps the Halt as
-     * its implicit-return-`none` terminator + jump target. Saves one dead instr
-     * per always-returning function. */
+     * stops the chunk (vm_run_chunk `return`s), so a trailing Halt is dead.
+     * A FALL-THROUGH body (last op not a ReturnV - a void fn, a trailing
+     * loop/if) keeps the Halt as its implicit-return-`none` terminator +
+     * jump target. Saves one dead instr per always-returning function.
+     *
+     * ... UNLESS SOMETHING BRANCHES TO THE END, which is the second half of
+     * the condition and was missing (fixed 2026-08-02). This comment used
+     * to claim "the codegen emits no jump to the chunk end past a return",
+     * and that is simply FALSE for a body whose last statement is a
+     * conditional return with nothing after it:
+     *
+     *     func f(x) { ...; if (s > 0) return s; }
+     *
+     * The `if` emits `JumpUnlessIntCmp -> <end>` for the false arm - the
+     * implicit `return none` - and <end> is exactly the pc the Halt would
+     * have occupied. Dropping it left that branch pointing one past the
+     * last instruction, so taking it made `vm_dispatch` READ code[n]: a
+     * heap-buffer-overflow (ASan-confirmed) that returned garbage instead
+     * of none. So the Halt is dead only when it is also UNREFERENCED, and
+     * that has to be checked rather than asserted in prose. */
+    bool end_is_targeted = false;
+    {
+        const size_t endpc = cg.code.size();
+        for (CgInstr &in : cg.code)
+            visit_pc_fields(in, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) >= endpc)
+                    end_is_targeted = true;
+            });
+    }
     if (cg.code.empty()
-        || cg.code.back().op != OpCode::ReturnV)
+        || cg.code.back().op != OpCode::ReturnV
+        || end_is_targeted)
         cg.emit(OpCode::Halt);
     cg.chunk.n_temps = cg.max_temp - slot_count;
     cg.chunk.n_dict_iters = cg.max_dict_iters;
@@ -8231,6 +8254,25 @@ codegen_chunk(const Block *block, int slot_count, bool jit)
                                           * side-table remap) */
     extract_locs(cg.code, cg.chunk, cg.ast_nodes);   /* carets -> loc table */
     verify_ast_free(cg.code);     /* every node handle consumed */
+    /*
+     * NO BRANCH MAY POINT PAST THE LAST INSTRUCTION. Taking one makes
+     * vm_dispatch read code[n] - an out-of-bounds read that returns
+     * whatever byte follows the vector, which is how a conditional return
+     * with nothing after it silently produced garbage instead of `none`
+     * (see the Halt condition above). Checked AFTER the peephole, which
+     * moves and deletes pcs, so it covers what the emit-time condition
+     * cannot see.
+     */
+#ifndef NDEBUG
+    {
+        const size_t endpc = cg.code.size();
+        for (CgInstr &in : cg.code)
+            visit_pc_fields(in, [&](int &t) {
+                ML_CHECK_MSG(t < 0 || static_cast<size_t>(t) < endpc,
+                             "codegen: a branch targets past the last instr");
+            });
+    }
+#endif
     /* B3 stage 2: SLICE the runtime Instr sub-objects out of the codegen's
      * CgInstr vector - the runtime Chunk cannot hold a node handle AT THE
      * TYPE LEVEL (CgInstr, bytecode.h). */

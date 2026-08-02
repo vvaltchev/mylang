@@ -67,6 +67,106 @@ struct test {
 
 static const std::vector<test> tests =
 {
+    /*
+     * FALL OFF THE END: a body whose last statement is a conditional
+     * return, so the false arm is the implicit `return none`.
+     *
+     * codegen used to drop the trailing Halt whenever the last op was a
+     * ReturnV, on the stated grounds that nothing ever branches past a
+     * return. These shapes do: the `if`'s false arm targets exactly the pc
+     * the Halt would have occupied, so dropping it left a branch pointing
+     * one past the last instruction and `vm_dispatch` READ code[n] - an
+     * ASan-confirmed heap-buffer-overflow that yielded garbage (`-1`, or a
+     * STALE dst) instead of `none`. Fixed 2026-08-02.
+     *
+     * These live in the `tests` table rather than a `jit:` helper on
+     * purpose: every entry here runs in ALL FIVE differential modes, and
+     * this bug showed differently in each - correct under the tree-walker,
+     * an out-of-bounds read with the JIT off, a wrong value with it on.
+     */
+    {
+        "fall-through: conditional return, fresh dst",
+        {
+            "func f(x) {",
+            "    var s = 0; var i = 0;",
+            "    while (i < 3) { s = s + x; i++; }",
+            "    if (s > 0) return s;",
+            "}",
+            "assert(f(2) == 6);",
+            "assert(f(-1) == none);",
+        },
+    },
+
+    {
+        /* the sharp one: the dst slot is REUSED, so a splice that leaves
+         * it unwritten leaks the previous call's value rather than none */
+        "fall-through: conditional return, REUSED dst",
+        {
+            "func f(x) {",
+            "    var s = 0; var i = 0;",
+            "    while (i < 3) { s = s + x; i++; }",
+            "    if (s > 0) return s;",
+            "}",
+            "func use(a) {",
+            "    var r = f(2);",
+            "    assert(r == 6);",
+            "    r = f(a);",
+            "    return r;",
+            "}",
+            "assert(use(-1) == none);",
+            "assert(use(3) == 9);",
+        },
+    },
+
+    {
+        "fall-through: nested ifs, several tail returns",
+        {
+            "func g(x) {",
+            "    var i = 0;",
+            "    while (i < 2) { i++; }",
+            "    if (x > 10) { if (x > 20) return 2; return 1; }",
+            "}",
+            "assert(g(30) == 2);",
+            "assert(g(15) == 1);",
+            "assert(g(5) == none);",
+        },
+    },
+
+    {
+        "fall-through: loop then conditional return",
+        {
+            "func h(x) {",
+            "    var s = 0;",
+            "    for (var i = 0; i < 4; i++) { s = s + i; }",
+            "    if (s == 6) return x * 2;",
+            "}",
+            "assert(h(5) == 10);",
+            "func h2(x) {",
+            "    var s = 0;",
+            "    for (var i = 0; i < 4; i++) { s = s + i; }",
+            "    if (s == 999) return x * 2;",
+            "}",
+            "assert(h2(5) == none);",
+        },
+    },
+
+    {
+        "fall-through: the value is USED, not just compared",
+        {
+            "func f(x) {",
+            "    var i = 0; while (i < 2) { i++; }",
+            "    if (x > 0) return x;",
+            "}",
+            "func use(a) {",
+            "    var r = f(a);",
+            "    if (r == none) return 0-1;",
+            "    return r + 100;",
+            "}",
+            "assert(use(5) == 105);",
+            "assert(use(0-3) == 0-1);",
+        },
+    },
+
     {
         "variable decl",
         {
@@ -21839,21 +21939,37 @@ void run_tests(bool dump_syntax_tree)
         const char *tag;      /* the per-test line prefix */
         const char *label;    /* the summary line */
         bool jit;
+        bool splice;          /* the bytecode inliner (-bi), default OFF */
     };
     std::vector<VmMode> modes = {
-        { "vm", "bytecode VM, JIT OFF (pure bytecode)", false },
+        { "vm", "bytecode VM, JIT OFF (pure bytecode)", false, false },
     };
     if (ML_JIT_SUPPORTED)
         modes.push_back(
             { "jit", "bytecode VM, JIT ON (native, the script DEFAULT)",
-              true });
+              true, false });
+    /*
+     * ... and the same again with the BYTECODE SPLICE on. It is opt-in and
+     * default-off, so without these passes the entire suite says nothing
+     * about it - and "the configuration nobody runs" is precisely how a
+     * disabled branch remap survived 39 commits. Two passes, not one: a
+     * splice bug can live in the bytecode it produces (visible with the
+     * JIT off) or in how the JIT consumes it (visible only with it on),
+     * and those are different layers.
+     */
+    modes.push_back({ "vm+bi", "VM, JIT OFF + bytecode SPLICE", false, true });
+    if (ML_JIT_SUPPORTED)
+        modes.push_back(
+            { "jit+bi", "VM, JIT ON + bytecode SPLICE", true, true });
 
     const bool saved_jit = g_jit_enabled;
+    const bool saved_bi = g_bc_inline_enabled;
     std::vector<size_t> mode_pass(modes.size(), 0);
     g_exec_engine = ExecEngine::Vm;
 
     for (size_t m = 0; m < modes.size(); m++) {
         g_jit_enabled = modes[m].jit;
+        g_bc_inline_enabled = modes[m].splice;
         for (const auto &test : tests) {
 
             cout << "[ RUN  ] " << modes[m].tag << ": " << test.name << endl;
@@ -21875,6 +21991,7 @@ void run_tests(bool dump_syntax_tree)
     }
 
     g_jit_enabled = saved_jit;
+    g_bc_inline_enabled = saved_bi;
     g_exec_engine = ExecEngine::TreeWalk;
 
     bool all_modes_ok = true;
