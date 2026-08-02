@@ -831,7 +831,10 @@ Key rules:
     never collide.
   * **Ternary conditional** `cond ? a : b` — evaluates `cond` (any truthy value,
     like `if`), then **only** the taken branch (short-circuit). Its type is the
-    join of the two branches (`c ? 1 : 2.0` is `float`). Right-associative, so
+    join of the two branches (`c ? 1 : 2.0` is `float`); branches of
+    **incompatible** types (`c ? [1] : 7`) make the result `dyn` — a runtime
+    variant — so a plain `var` bound to it needs an explicit `dyn`
+    (`var dyn q = c ? [1] : 7;`), exactly like any other dyn-typed value. Right-associative, so
     `a ? b : c ? d : e` is `a ? b : (c ? d : e)`. A const condition folds to the
     taken branch at compile time. It is looser than every operator above and
     tighter than `=`; a ternary used as a slice bound needs parens
