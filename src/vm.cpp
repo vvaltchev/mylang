@@ -5016,10 +5016,16 @@ vm_flush_inline_walk(const Chunk &chunk, size_t pc, Exception &e)
      * head EnterNative - prefer it over the pc lookup, which cannot
      * discriminate there. */
     int32_t idx = e.jit_inline_frame;
-    if (idx >= 0) {
+    if (idx != -1) {
+        /* #88: BAKED. >= 0 is a chain; -2 is the fragment saying "this op
+         * is not inlined code" - an answer, not a missing value, so do NOT
+         * fall back to the pc lookup, which on a deleted run would resolve
+         * against collapsed pcs and invent someone else's chain. */
 #ifdef TESTS
         g_jit_inline_baked++;
 #endif
+        if (idx < 0)
+            return;
     } else {
         idx = chunk.inline_frame_at(pc);
     }
@@ -5065,17 +5071,27 @@ vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
  * Always the pc lookup, never the baked Exception::jit_inline_frame: that
  * index names the op that RAISED, which is not this call site.
  */
+/* The walk itself, over the flattened pool by parent index (innermost
+ * first). Taken by BASE POINTER rather than by Chunk so a native caller,
+ * which has only a baked pool address, shares this exact code (#88). */
+static ML_NOINLINE void
+vm_flush_inline_call_pool(const Chunk::InlineFrame *frames, int32_t idx,
+                          Exception &e)
+{
+    for (int32_t i = idx; i >= 0; i = frames[i].parent) {
+        const Chunk::InlineFrame &f = frames[i];
+        e.backtrace.push_back({f.callee_name, f.params, f.call_site});
+    }
+    e.inline_origin_emitted = true;
+}
+
 static ML_NOINLINE void
 vm_flush_inline_call_walk(const Chunk &chunk, size_t pc, Exception &e)
 {
     const int32_t idx = chunk.inline_frame_at(pc);
     if (idx < 0 || static_cast<size_t>(idx) >= chunk.inline_frames.size())
         return;
-    for (int32_t i = idx; i >= 0; i = chunk.inline_frames[i].parent) {
-        const Chunk::InlineFrame &f = chunk.inline_frames[i];
-        e.backtrace.push_back({f.callee_name, f.params, f.call_site});
-    }
-    e.inline_origin_emitted = true;
+    vm_flush_inline_call_pool(chunk.inline_frames.data(), idx, e);
 }
 
 static ML_ALWAYS_INLINE void
@@ -5084,6 +5100,60 @@ vm_flush_inline_call(const Chunk &chunk, size_t pc, Exception &e)
     if (chunk.inline_ctxs.empty())
         return;
     vm_flush_inline_call_walk(chunk, pc, e);
+}
+
+/*
+ * #88 - the native sync call's baked call site, passed by SIDE CHANNEL.
+ *
+ * A sync_stop record cannot resolve its call site's inlined-at chain the
+ * way the walk's ordinary pop does: its ret_chunk is the loc-less sentinel
+ * and its C++ owner is a native fragment, whose pcs have all collapsed onto
+ * the head EnterNative once the run's originals were deleted. So the
+ * EMITTED call site bakes the two halves - the chain index (from its
+ * pre-collapse old_pc) and the pool base - and stores them here immediately
+ * before the call, the g_jit_pending_key pattern.
+ *
+ * WHY A GLOBAL AND NOT A PARAMETER: jit_call_sync_core already uses all six
+ * SysV argument registers, so two more would spill to the stack on EVERY
+ * sync call to fix a backtrace-only defect. The side channel costs the
+ * emitted site two stores on the SLOW tier's path only.
+ *
+ * THE NESTING RULE, which is what makes a global safe here: each helper
+ * copies both values into its own frame AT ENTRY, before it can dispatch a
+ * callee that would overwrite them, and uses only that copy afterwards. The
+ * globals are a parameter hand-off, never live state.
+ *
+ * The base is inline_frames.data() and NEVER a Chunk * - codegen_chunk
+ * builds the chunk on the stack and moves it out, so the chunk address
+ * dangles while the vector's heap buffer survives (the &ck.locs[i]
+ * argument).
+ */
+static int32_t g_jit_call_inline_chain = -1;
+static const void *g_jit_call_inline_pool = nullptr;
+
+/*
+ * Stamp the baked call-site loc onto the innermost captured frame, then
+ * flush that call site's virtual frames - the pair the walk's ordinary pop
+ * performs (vm_capture_rec_frame + vm_flush_inline_call). Shared by every
+ * sync-call exit that converts an exception, so the two halves cannot drift
+ * apart at one of them.
+ */
+static ML_NOINLINE void
+vm_jit_stamp_call_site(Exception &e, const FuncDescriptor *d,
+                       int_type site_packed, int32_t chain, const void *pool)
+{
+    if (!e.backtrace.empty() && e.backtrace.back().desc == d
+            && !e.backtrace.back().call_site.line)
+        e.backtrace.back().call_site =
+            Loc(static_cast<int>(site_packed >> 32),
+                static_cast<int>(site_packed & 0xffffffff));
+    if (chain >= 0 && pool) {
+#ifdef TESTS
+        g_jit_inline_call_baked++;
+#endif
+        vm_flush_inline_call_pool(
+            static_cast<const Chunk::InlineFrame *>(pool), chain, e);
+    }
 }
 
 /* fwd (defined below CachedCallV's probe) - vm_raise now walks natively. */
@@ -5923,6 +5993,7 @@ extern "C" size_t jit_halt() noexcept
 /* #55 STEP 2.1: native CallVs set up process-wide (coverage - see jit.h). */
 unsigned long g_jit_native_calls = 0;
 unsigned long g_jit_inline_baked = 0;
+unsigned long g_jit_inline_call_baked = 0;
 #ifdef TESTS
 /* #78 step C: catch dispatches served by the HANDLER TABLE (the coverage
  * counter proving the table path - not the CatchTest chain - ran). */
@@ -6086,6 +6157,10 @@ static const Chunk &vm_sync_stop_chunk()
  */
 extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
 {
+    /* #88: claim the baked call site BEFORE dispatching anything - a nested
+     * call would overwrite the globals (see g_jit_call_inline_chain). */
+    const int32_t inl_chain = g_jit_call_inline_chain;
+    const void *inl_pool = g_jit_call_inline_pool;
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
     const FuncDescriptor *d = act.back_rec().desc;
@@ -6129,11 +6204,8 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
          * site, exactly what the walk + the pending path produce for a
          * RuntimeException. */
         vm_capture_desc_frame(e, d);
-        if (!e.backtrace.empty() && e.backtrace.back().desc == d
-                && !e.backtrace.back().call_site.line)
-            e.backtrace.back().call_site =
-                Loc(static_cast<int>(site_packed >> 32),
-                    static_cast<int>(site_packed & 0xffffffff));
+        vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
+                               inl_pool);
         if (auto *re = dynamic_cast<RuntimeException *>(&e))
             g_vm_jit_exc.reset(re->clone());
         else
@@ -6145,11 +6217,8 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
     }
     if (g_vm_exc_pending) {
         Exception &e = *g_vm_exc_pending;
-        if (!e.backtrace.empty() && e.backtrace.back().desc == d
-                && !e.backtrace.back().call_site.line)
-            e.backtrace.back().call_site =
-                Loc(static_cast<int>(site_packed >> 32),
-                    static_cast<int>(site_packed & 0xffffffff));
+        vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
+                               inl_pool);
         g_vm_jit_exc = std::move(g_vm_exc_pending);
         return 2;
     }
@@ -6186,6 +6255,18 @@ extern "C" int jit_cached_probe(const void *descv, int_type argbase,
 void *jit_addr_pending_key()
 {
     return &g_jit_pending_key;
+}
+
+/* #88: the emitted sync call stores its baked call site here (see
+ * g_jit_call_inline_chain's comment for why this is a side channel). */
+void *jit_addr_call_inline_chain()
+{
+    return &g_jit_call_inline_chain;
+}
+
+void *jit_addr_call_inline_pool()
+{
+    return &g_jit_call_inline_pool;
 }
 
 /* M5b: the jit_sync_push_* HELPERS are gone - the push is emitted INLINE
@@ -6327,6 +6408,10 @@ static int
 jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
                    int_type dst, int_type site_packed, bool cached) noexcept
 {
+    /* #88: claim the baked call site BEFORE dispatching the callee, which
+     * would overwrite the globals (see g_jit_call_inline_chain). */
+    const int32_t inl_chain = g_jit_call_inline_chain;
+    const void *inl_pool = g_jit_call_inline_pool;
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
     const FuncDescriptor *d = fo.func;
@@ -6418,11 +6503,8 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
             g_jit_sync_depth--;
             if (g_vm_exc_pending) {
                 Exception &e = *g_vm_exc_pending;
-                if (!e.backtrace.empty() && e.backtrace.back().desc == d
-                        && !e.backtrace.back().call_site.line)
-                    e.backtrace.back().call_site =
-                        Loc(static_cast<int>(site_packed >> 32),
-                            static_cast<int>(site_packed & 0xffffffff));
+                vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
+                                       inl_pool);
                 g_vm_jit_exc = std::move(g_vm_exc_pending);
                 return 2;
             }
@@ -6433,6 +6515,10 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
          * a deep recursion of mid-body-exiting fragments stacks un-capped
          * C frames (the clang-ASan stack overflow; see the emitted site's
          * twin comment in jit.cpp). */
+        /* hand OUR saved call site back through the side channel: the
+         * callee we just ran may have overwritten the globals. */
+        g_jit_call_inline_chain = inl_chain;
+        g_jit_call_inline_pool = inl_pool;
         const int pr = jit_sync_postexit(r, site_packed);
         g_jit_sync_depth--;
         return pr;
@@ -6447,11 +6533,8 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
          * below produce for a RuntimeException. */
         g_jit_sync_depth--;
         vm_capture_desc_frame(e, d);
-        if (!e.backtrace.empty() && e.backtrace.back().desc == d
-                && !e.backtrace.back().call_site.line)
-            e.backtrace.back().call_site =
-                Loc(static_cast<int>(site_packed >> 32),
-                    static_cast<int>(site_packed & 0xffffffff));
+        vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
+                               inl_pool);
         if (auto *re = dynamic_cast<RuntimeException *>(&e))
             g_vm_jit_exc.reset(re->clone());
         else
@@ -6471,11 +6554,8 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
          * op's pc, so the caller-side handler dispatch / inline-frame flush
          * runs exactly as an interpreted cross-frame throw. */
         Exception &e = *g_vm_exc_pending;
-        if (!e.backtrace.empty() && e.backtrace.back().desc == d
-                && !e.backtrace.back().call_site.line)
-            e.backtrace.back().call_site =
-                Loc(static_cast<int>(site_packed >> 32),
-                    static_cast<int>(site_packed & 0xffffffff));
+        vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
+                               inl_pool);
         g_vm_jit_exc = std::move(g_vm_exc_pending);
         return 2;
     }

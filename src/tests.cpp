@@ -12952,7 +12952,7 @@ inlined_recursion_backtrace_parity()
      * (defect 2). A first version of this test used only depth 4 and PASSED
      * with defect 1 put back.
      */
-    auto run = [&](ExecEngine eng, int depth) -> std::string {
+    auto run = [&](ExecEngine eng, int depth, bool jit) -> std::string {
         const std::string src =
             std::string("func f(n) {\n")
             + "    if (n < 2) return 1 / (n - n);\n"
@@ -12971,7 +12971,7 @@ inlined_recursion_backtrace_parity()
         const ExecEngine saved = g_exec_engine;
         const bool saved_jit = g_jit_enabled;
         g_exec_engine = eng;
-        g_jit_enabled = false;
+        g_jit_enabled = jit;
         std::string out;
         try {
             if (eng == ExecEngine::Vm)
@@ -12992,9 +12992,21 @@ inlined_recursion_backtrace_parity()
     const auto npos = std::string::npos;
     bool ok = true;
 
-    for (const int depth : { 2, 4 }) {
-        const std::string tw = run(ExecEngine::TreeWalk, depth);
-        const std::string vm = run(ExecEngine::Vm, depth);
+    for (const int depth : { 2, 3, 4 }) {
+        const std::string tw = run(ExecEngine::TreeWalk, depth, false);
+        const std::string vm = run(ExecEngine::Vm, depth, false);
+        /* #88: and with the JIT ON, which reaches these frames by a wholly
+         * different route - the baked call site + the baked raise-site
+         * chain, since a deleted run's collapsed pcs can resolve neither.
+         * Depth 3 is the one that catches a PHANTOM frame (the JIT used to
+         * invent an f$0 the other two engines do not render); depth 4 the
+         * MISSING ones. */
+        const std::string jv = run(ExecEngine::Vm, depth, true);
+        if (jv != tw) {
+            cout << "  depth=" << depth << " JIT differs\n  tw:\n" << tw
+                 << "  jit:\n" << jv;
+            ok = false;
+        }
 
         /* Count the VIRTUAL (inlined) frames: a physical frame renders the
          * template's display_name `f`, an inlined one the instance name
@@ -17731,6 +17743,7 @@ static bool jit_final_batch_deletable()
         "print(f(runtime(7)));" };
     const std::string tw2 = run_bt(two, ExecEngine::TreeWalk);
     const unsigned long baked0 = g_jit_inline_baked;
+    const unsigned long cbaked0 = g_jit_inline_call_baked;
     const std::string vm2 = run_bt(two, ExecEngine::Vm);
     if (tw2.empty() || tw2 != vm2
             || tw2.find("snd") == std::string::npos) {
@@ -17745,7 +17758,13 @@ static bool jit_final_batch_deletable()
     /* ... and PROVE the collapse-safe path is what produced it: without the
      * baked chain the two engines could still agree by luck (if the correct
      * body happened to be the first entry at the collapsed pc). */
-    if (g_jit_inline_baked == baked0) {
+    /* EITHER baked mechanism satisfies the intent - what must not have
+     * produced the frames is the pc lookup. #88 moved this shape from the
+     * raise-site field to the CALL-SITE side channel, which is where the
+     * `snd` frame actually belongs: the throwing call sits inside snd's
+     * inlined body, so it is a call site, not the raise site. */
+    if (g_jit_inline_baked == baked0
+            && g_jit_inline_call_baked == cbaked0) {
         cout << "  distinct chains: the BAKED chain was never used\n";
         return false;
     }

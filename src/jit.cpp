@@ -1668,8 +1668,9 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
      * Exception::jit_inline_frame). -1 = this op is not inlined code. */
     const int32_t chain = ck.inline_frame_at(old_pc);
 
-    if (!le && chain < 0)
-        return;                    /* nothing to stamp - stays loc-less */
+    /* #88: the chain is stamped even when there ISN'T one, so no early-out
+     * here - see the chain block below for why the absence has to be
+     * written down rather than left as a default. */
 
     const auto pack = [](const Loc &l) {
         return static_cast<uint64_t>(static_cast<uint32_t>(l.line))
@@ -1704,22 +1705,77 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
                                               * frames are not yet emitted */
     }
 
-    if (chain >= 0) {
-        e.u8(0x83); e.u8(0xB8);              /* cmp dword [rax+off_if], 0 */
-        e.u32(off_if);
-        e.u8(0x00);
-        const size_t j_set = e.j8(0x7D);     /* jge end: already stamped
-                                              * (first conveyor wins, as the
-                                              * caret does) */
+    /*
+     * #88: ALWAYS stamp, using -2 for "this op is NOT inlined code".
+     *
+     * -1 used to mean both "no fragment baked anything" and "a fragment
+     * baked: there is no chain", and the flush could not tell them apart -
+     * so on the second reading it fell back to a pc lookup, which on a
+     * DELETED run resolves against collapsed pcs and invents a chain that
+     * belongs to some other op. That is a phantom virtual frame in the
+     * backtrace (visible at recursion depth 3), the mirror of the missing
+     * ones. Recording the absence removes the guess.
+     */
+    {
+        size_t j_set;
+        if (chain >= 0) {
+            /* A REAL chain outranks the -2 marker: stamp whenever the field
+             * is still negative (unset -1 or "no chain" -2). Unchanged for
+             * -1, which is what keeps first-real-conveyor-wins intact. */
+            e.u8(0x83); e.u8(0xB8);          /* cmp dword [rax+off_if], 0 */
+            e.u32(off_if);
+            e.u8(0x00);
+            j_set = e.j8(0x7D);              /* jge end: a chain is set */
+        } else {
+            /* The marker only fills a VACANCY - it must never overwrite a
+             * chain, and must not block one either: an exception can be
+             * conveyed by an op that is not the one that raised (a C++
+             * throw crossing a fragment exit), and that conveyor's "I am
+             * not inlined" says nothing about the raise site. */
+            e.u8(0x83); e.u8(0xB8);          /* cmp dword [rax+off_if], -1 */
+            e.u32(off_if);
+            e.u8(0xFF);
+            j_set = e.j8(0x75);              /* jne end: anything is set */
+        }
         e.u8(0xC7); e.u8(0x80);              /* mov dword [rax+off_if], imm */
         e.u32(off_if);
-        e.u32(static_cast<uint32_t>(chain));
+        e.u32(static_cast<uint32_t>(chain >= 0 ? chain : -2));
         e.patch8(j_set, e.pos());
     }
 
     e.patch8(j_null, e.pos());
 }
 
+
+/*
+ * #88: hand this call site's INLINED-AT chain to the sync helpers through
+ * the side-channel globals (vm.cpp), which they claim on entry. Baked from
+ * the PRE-COLLAPSE old_pc for the same reason the caret is: once the run's
+ * interpreted originals are deleted every pc lands on the head EnterNative,
+ * where a lookup cannot tell two inlined bodies apart. The POOL BASE, never
+ * a Chunk * - the chunk is moved out of codegen_chunk and its address
+ * dangles, while the vector's heap buffer survives (as &ck.locs[i] does).
+ *
+ * ALWAYS emitted, even for a chain of -1: the store is what CLEARS a value
+ * some earlier call site left behind, so "this site is not inlined code"
+ * has to be written down rather than left implicit.
+ *
+ * Clobbers rax/rcx - emit only where both are dead.
+ */
+static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
+{
+    const int32_t chain = ck.inline_frame_at(old_pc);
+    const uint64_t pool =
+        ck.inline_frames.empty()
+            ? 0
+            : reinterpret_cast<uint64_t>(ck.inline_frames.data());
+    e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_call_inline_chain()));
+    e.u8(0xC7); e.u8(0x00);                  /* mov dword [rax], imm32 */
+    e.u32(static_cast<uint32_t>(chain));
+    e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_call_inline_pool()));
+    e.movabs(RCX, pool);
+    e.u8(0x48); e.u8(0x89); e.u8(0x08);      /* mov [rax], rcx */
+}
 
 /*
  * Lever 1 step 5 - the fragment-INLINE sync call. The hot shape emits:
@@ -2242,6 +2298,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * happens before any dispatch - so -2 needs no special case here. */
     /* cold: the shared post-exit (raise/continuation/pending) */
     e.mov_rr(RDI, RAX);
+    /* #88: AFTER the callee ran - it may have made calls of its own and
+     * overwritten the globals, so this site re-claims them. rax is dead
+     * once the exit pc has moved to rdi. */
+    emit_bake_call_site(e, ck, old_pc);
     e.movabs(RSI, site);
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_sync_postexit) });
@@ -2259,6 +2319,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * the exc-stamp below). */
     for (const size_t j : j_slows)
         e.patch32_here(j);
+    /* #88: the slow tier reads the same side channel. Reached only from a
+     * GUARD decline, i.e. before the callee runs, so nothing can have
+     * clobbered the globals between here and the helper. */
+    emit_bake_call_site(e, ck, old_pc);
     e.movabs(RDI, static_cast<uint64_t>(callee_arg));
     /* #56 step 3: argbase|nargs<<32 packed into ONE arg; the freed reg
      * carries the POST-CALL entry-stub pc (the SWITCH record's resume). */

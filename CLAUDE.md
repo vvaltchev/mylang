@@ -1016,11 +1016,65 @@ and never `fst`, and the `g_jit_inline_baked` counter must bump, so the
 test cannot pass by luck or on an unexercised path). `fib$0` is now 9
 instructions. NOTE the earlier scoping (in plans/model-flip.md) predicted
 a SECOND mechanism for the call case - a stub-pc `inline_ctxs` entry or a
-field on the call record - which turned out unnecessary: the emitted call
-site's own exc-stamp runs BEFORE `vm_unwind_walk`'s flush, and that flush
-is `inline_origin_emitted`-guarded, so the baked chain is already in
-place. **All 9 remaining kept runs are now the DEFERRED catch dispatch**
-(8 CatchTest+Reraise, 1 EndFinally whose cold reraise bails).
+field on the call record - and this paragraph used to record it as
+UNNECESSARY, reasoning that the emitted call site's own exc-stamp runs
+before `vm_unwind_walk`'s `inline_origin_emitted`-guarded flush. **That
+was WRONG and #88 below is the correction** - the one field can hold only
+the RAISE site's chain, so every call site the exception crossed after it
+was silently dropped. **All 9 remaining kept runs are now the DEFERRED
+catch dispatch** (8 CatchTest+Reraise, 1 EndFinally whose cold reraise
+bails).
+
+**#88 - THE CALL SITE'S CHAIN, AND THE -2 SENTINEL (2026-08-02).** With
+the JIT on, a recursion inlined into itself rendered FEWER frames than
+either other engine (3 where `-tw`/`-nj` render 5) and misattributed the
+bottom one: `main()` took the line of the row that went missing, naming a
+line inside `f`. Two independent defects, each with its own fix and its
+own depth in the pinning test.
+**(1) THE CALL SITE HAD NO MECHANISM.** `vm_unwind_walk`'s ordinary pop
+resolves a call site's chain from the caller's chunk + the call op's pc,
+but its `sync_stop` branch - the record a NATIVE caller owns - cannot: the
+sentinel `ret_chunk` is loc-less and the C++ owner is a fragment whose pcs
+collapsed onto the head EnterNative. It already stamped the baked call-site
+LOC there and simply never stamped the CHAIN. The emitted sync call now
+bakes both halves (chain index from the pre-collapse `old_pc`, plus
+`inline_frames.data()` - NEVER a `Chunk *`, which dangles once
+`codegen_chunk` moves the chunk out) and hands them to the helpers through
+**side-channel globals** (`g_jit_call_inline_chain`/`_pool`, the
+`g_jit_pending_key` pattern), because `jit_call_sync_core` already uses all
+six SysV argument registers and two more would spill on EVERY sync call to
+fix a backtrace-only defect. **THE NESTING RULE makes the global safe:**
+each helper copies both into its own frame AT ENTRY, before it can dispatch
+a callee that would overwrite them, and `jit_call_sync_core` re-publishes
+its copy before delegating to `jit_sync_postexit`. The shared
+`vm_jit_stamp_call_site` performs the loc stamp and the flush together so
+the pair cannot drift apart at one of the five exits.
+**(2) `-1` MEANT TWO THINGS.** `Exception::jit_inline_frame` used -1 for
+both "no fragment baked anything" and "a fragment baked: no chain here", so
+the flush fell back to a pc lookup that, on a deleted run, invented a chain
+belonging to another op - a PHANTOM virtual frame. `emit_exc_stamp` now
+stamps **-2** for "this op is not inlined code", and `vm_flush_inline_walk`
+treats it as an answer. The two stamps have DIFFERENT first-wins guards and
+that asymmetry is load-bearing: a real chain stamps whenever the field is
+negative (so it still outranks a -2), while -2 stamps only over -1 - an
+exception can be conveyed by an op that is not the one that raised, and
+that conveyor's "I am not inlined" says nothing about the raise site.
+Getting this backwards made the whole batch stamp -2 first and blocked
+every real chain (caught immediately by `jit_final_batch_deletable`'s
+counter assertion).
+MEASURED, not assumed: the first version fixed only the emitted-inline
+call and moved the repro by ZERO frames - instrumenting with a distinct
+sentinel proved this shape is served by the SLOW tier
+(`jit_call_sync_core`), so the side channel had to reach that too. Pinned
+by `inlined_recursion_backtrace_parity`, which now runs the JIT ON at
+depths 2/3/4 and requires byte-equality with the tree-walker; **each defect
+was reintroduced and the test confirmed failing, at DIFFERENT depths**
+(depth 4 catches the missing frames, depth 3 the phantom one), so neither
+depth is redundant. `g_jit_inline_call_baked` is the execution proof for
+the new path, and `jit_final_batch_deletable` now accepts EITHER baked
+counter - #88 legitimately moved its shape from the raise-site field to the
+call-site channel, which is where a frame for a call inside an inlined body
+belongs.
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat

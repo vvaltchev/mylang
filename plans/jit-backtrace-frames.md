@@ -1,21 +1,40 @@
 # The JIT loses a call site's virtual backtrace frames (task #88)
 
-## Status
+## Status: DONE (2026-08-02)
 
-Two of the three defects in this area are FIXED and pinned - the
-loc-less throw at its origin in `9fe3783` (#76), the dropped call-site
-frames in `c1310ed`, both by one two-depth parity test -
-both were interpreted-path bugs and both reproduce with `-nj`:
+Both remaining defects are fixed and pinned with the JIT ON. The design
+below stands, with two corrections the implementation forced - recorded
+because both were predictions this plan got wrong.
 
-1. a folder-synthesized divisor carried no `Loc`, so the VM threw with no
-   location at all (fixed in `extract_locs`);
-2. the four call-site flushes went through the once-guarded raise-site
-   helper, dropping every virtual frame after the first (fixed by
-   `vm_flush_inline_call`).
+**Correction 1 - the tier.** The plan named `jit_sync_postexit` and
+`jit_call_sync_core` as the two homes without saying which matters. Doing
+only the first (the emitted inline call site) moved the repro by ZERO
+frames: instrumenting with a distinct sentinel proved this shape is served
+by the SLOW tier, which re-runs the call in C++ and has no baked call site
+of its own. Check which tier a shape uses BEFORE writing the bake.
 
-**What remains is JIT-only.** With the JIT on, a recursion whose self-call
-sits inside an inlined region still renders fewer frames than the
-tree-walker, and the innermost frame can be misnamed.
+**Correction 2 - the sentinel's guard.** Stamping -2 with the same
+first-wins guard as a real chain BLOCKS every real chain, because an
+exception is often conveyed first by an op that did not raise it. The two
+stamps need different guards: a real chain stamps over any negative value,
+-2 only over -1. `jit_final_batch_deletable`'s counter caught this
+immediately.
+
+**How it was done.** The signature growth this plan worried about was
+avoided entirely: the baked pair travels in side-channel globals
+(`g_jit_call_inline_chain`/`_pool`), which each helper claims into its own
+frame at entry so nesting cannot corrupt it. See the #88 paragraph in
+CLAUDE.md for the mechanism and the nesting rule.
+
+**Proof.** `inlined_recursion_backtrace_parity` runs the JIT ON at depths
+2/3/4 against the tree-walker; each defect was reintroduced and the test
+confirmed failing, at DIFFERENT depths (4 = missing frames, 3 = the
+phantom frame), so neither depth is redundant. `g_jit_inline_call_baked`
+proves the new path executes rather than the result agreeing by luck.
+
+---
+
+## Original analysis (kept for the reasoning)
 
 ## The repro
 
@@ -87,38 +106,6 @@ Bake both missing cases, mirroring the caret's existing treatment.
    dangles. Bake `ck.inline_frames.data()` instead: a vector's heap buffer
    survives the move, which is the same argument that makes the existing
    `&ck.locs[i]` bake safe.
-
-## MEASURED 2026-08-02: which path actually runs (do this first)
-
-The two halves above are NOT equally urgent, and the repro says which.
-Half 2 was built for `jit_sync_postexit` only - the chain + the pool base
-baked at `emit_inline_sync_call` (one extra `movabs` pair on its COLD
-post-exit branch, zero hot-path cost) - and it **did not move the repro at
-all**. Instrumenting the helper proved why:
-
-```
-[postexit r=0 chain=-7]      <- -7 = the sentinel passed from the SLOW tier
-```
-
-So in this program the sync call is served by **`jit_call_sync_core`**,
-which re-runs the call in C++ and forwards to `jit_sync_postexit` with no
-call site of its own. The emitted-inline path never fires here. **Bake the
-chain into the SLOW tier first** - that is the half that pays.
-
-That is more plumbing than the fast path was: `jit_call_sync_core` already
-takes 6 args (all six SysV registers), so a 7th/8th spill to the stack, and
-the three wrappers (`jit_call_sync`, `jit_call_sync_cached`,
-`jit_call_sync_value`) plus their emit sites each need the two baked values
-threaded through. Options worth weighing before writing it: pack chain+pool
-into ONE arg (the pool base is 8-byte aligned, the chain is a small
-non-negative index, but a packed pointer is a trap of its own), or park the
-pair in two globals the emitted site stores before the call (the
-`g_jit_pending_key` precedent) so no signature changes at all.
-
-The work was REVERTED rather than left in the tree half-proven: it compiled
-and the suite stayed green, but "prove the code ran" was not satisfiable for
-it, and an unexercised mechanism is exactly what that rule exists to keep
-out. Redoing it is ~20 lines once the tier question above is settled.
 
 ## Testing
 
