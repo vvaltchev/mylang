@@ -196,7 +196,29 @@ those classes in impact order.
    (exactly what g++ does to sumto - accumulator rotation); then
    10-class code becomes a native loop.
 
-2. **Direct fragment calls from callback builtins.** sort/map/filter/
+2. **Direct fragment calls from callback builtins - LANDED
+   2026-07-27.** VmInvoker's ctor caches the callee's fragment entry
+   when the body STARTS native (sync_entry_off >= 0 - the whole-body-
+   native common case); invoke() then calls jit_enter DIRECTLY per
+   element - the per-element vm_dispatch entry/exit + the EnterNative
+   op dispatch are gone from the loop. A BOUNDARY sentinel falls
+   through to the existing flow read (native ReturnV set flow, native
+   Halt left it none - unchanged contracts); a non-sentinel exit takes
+   the standalone cold vm_invoke_postexit (vm_raise for a conveyed
+   raise - same-frame handler or the boundary-pending conversion
+   invoke() already handles; the eptr rethrow; a bail/handler
+   continuation via ONE vm_dispatch re-entry, which the old path paid
+   ALWAYS). A body that does not start native keeps the dispatch
+   fallback; vm_try_invoke (single-shot) deliberately untouched.
+   Proven by g_jit_invoke_direct (>= element-count growth over
+   map/sort + a throwing-comparator round through the postexit raise
+   path). Measured (Ir): 34_sort_custom_cmp -13.8%, 35_map_filter
+   -15.3%, 67_make_dict -8.1%; wall 0.938x/0.936x/0.975x
+   (interleaved best-of-9). 12_higher_order flat - EXPLAINED: its
+   calls are CallValueV (func values called directly), already served
+   by the sync-inline path, not VmInvoker. fib's apparent -1% was
+   __strcmp_avx2 relink alignment again (attribution checked).
+   (original analysis follows) sort/map/filter/
    make_dict/find with a native_leaf callback should `call` the fragment
    per element instead of re-entering vm_dispatch through VmInvoker
    (34_sort_custom_cmp 13x, 35_map_filter 10.5x, 12_higher_order 8.8x,

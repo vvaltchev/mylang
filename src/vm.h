@@ -72,6 +72,11 @@ bool vm_exec_block_selftest();
 Frame *vm_window_push(int_type nslots, const Chunk *ck);
 void vm_window_pop();
 
+#ifdef TESTS
+/* lever 2 execution proof: VmInvoker's DIRECT fragment entries */
+extern unsigned long g_jit_invoke_direct;
+#endif
+
 /*
  * Phase D: run a builtin's USER-CALLBACK (eval_func's funnel) as a boundary
  * frame on the current activation - no per-element do_func_call/
@@ -122,6 +127,9 @@ private:
     /* Loop-fixed arity fields (hoisted from desc_ - read once, not per call). */
     size_t nparams_ = 0;
     size_t min_args_ = 0;
+    /* Lever 2: the callee fragment's DIRECT entry (body starts native),
+     * cached once per loop; null = the vm_dispatch fallback. */
+    const char *entry_ = nullptr;
 };
 void vm_window_pop();
 

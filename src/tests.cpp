@@ -15028,6 +15028,62 @@ static bool jit_native_stack_deep()
 #endif
 }
 
+/* Lever 2 (VmInvoker direct fragment entry): per callback ELEMENT the
+ * invoker calls jit_enter directly instead of re-entering vm_dispatch -
+ * g_jit_invoke_direct counts those entries, so growth ~ the element
+ * count proves the direct path ran (map + a sort comparator + a
+ * throwing-comparator round through vm_invoke_postexit's raise path). */
+static bool jit_invoke_direct_entry()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long b0 = g_jit_invoke_direct;
+    if (!run({
+            "var a = make_array(50, func(i) => i * 3);",
+            "var m = map(func(dyn x) { return x + 1; }, a);",
+            "sort(a, func(x, y) { return y < x; });",
+            "assert(m[49] == 148 && a[0] == 147);",
+            "var s = 0;",
+            "try { sort(a, func(x, y) => x / (y - y) < 1); }",
+            "catch (DivisionByZeroEx) { s = 1; }",
+            "assert(s == 1);" }))
+        return false;
+    if (g_jit_invoke_direct < b0 + 50) {
+        fprintf(stderr, "jit_invoke_direct_entry: direct path ran only "
+                        "%lu times\n", g_jit_invoke_direct - b0);
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 /* Struct BAKED-LAYOUT fast paths (the 64_struct_create fix): the member
  * read and the planned ctor emit INLINE machine code whose execution is
  * proven by g_jit_member_fast / g_jit_ctor_fast - counters bumped by the
@@ -17862,6 +17918,8 @@ static const std::vector<extra_check> extra_checks =
       jit_post_call_entry },
     { "jit: deep recursion runs native on the dedicated stack (M5a)",
       jit_native_stack_deep },
+    { "jit: VmInvoker enters callback fragments directly (lever 2)",
+      jit_invoke_direct_entry },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",

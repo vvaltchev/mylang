@@ -4233,6 +4233,50 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
  * pops the window and restores the shared invoke context's captures on any
  * exit path (including a throw unwinding the builtin's loop).
  */
+#ifdef TESTS
+unsigned long g_jit_invoke_direct = 0;   /* lever 2 execution proof */
+#endif
+
+/* Lever 2's COLD exit path: the invoker's direct-entered fragment exited
+ * at an interior pc. Mirrors EnterNative's post-exit for a BOUNDARY frame
+ * (standalone rather than sharing jit_sync_postexit - the sync version's
+ * pending-conveyance/site-stamping halves are sync_stop semantics that do
+ * not apply here): a conveyed raise dispatches via vm_raise (same-frame
+ * handler, else the walk stops at the boundary record and sets
+ * g_vm_exc_pending - which invoke()'s existing check converts); a plain
+ * eptr rethrows (propagates out of invoke like the dispatch path's own
+ * throw); a bail or a dispatched handler continues INTERPRETED at the
+ * resolved pc - the one dispatch re-entry the old path paid ALWAYS. */
+static ML_NOINLINE void
+vm_invoke_postexit(const Chunk &cck, EvalContext &ctx, VmActivation &act,
+                   size_t r)
+{
+    const Chunk *c2 = &cck;
+    size_t p2 = r;
+    bool cont = true;
+    if (g_vm_jit_raise) {
+        const int kind = g_vm_jit_raise;
+        g_vm_jit_raise = 0;
+        cont = vm_raise(c2, p2, act, ctx,
+            kind == JR_OOB
+              ? std::unique_ptr<RuntimeException>(new OutOfBoundsEx())
+              : kind == JR_DIV0
+              ? std::unique_ptr<RuntimeException>(new DivisionByZeroEx())
+              : std::unique_ptr<RuntimeException>(
+                    new InvalidValueEx("negative shift count")));
+    } else if (g_vm_jit_exc) {
+        cont = vm_raise(c2, p2, act, ctx, std::move(g_vm_jit_exc));
+    } else if (g_vm_jit_eptr) {
+        std::exception_ptr p = std::move(g_vm_jit_eptr);
+        g_vm_jit_eptr = nullptr;
+        std::rethrow_exception(p);
+    }
+    if (cont)
+        vm_dispatch(*c2, ctx, act, p2);
+    /* !cont: the walk stopped at the boundary record - g_vm_exc_pending
+     * is set for invoke()'s existing conversion. */
+}
+
 VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj)
 {
     if (g_exec_engine != ExecEngine::Vm || !g_vm_act
@@ -4245,6 +4289,13 @@ VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj)
     c_ = act_->invoke_ctx.get();
     desc_ = obj.func;
     cck_ = static_cast<const Chunk *>(desc_->vm_chunk);
+    /* Lever 2 (plans/native-gap-roadmap.md): a body that STARTS native
+     * (the whole-body-native common case) is entered DIRECTLY per element
+     * - jit_enter, no vm_dispatch entry/exit, no EnterNative op dispatch.
+     * Computed once per LOOP. */
+    entry_ = cck_->sync_entry_off >= 0
+        ? static_cast<const char *>(cck_->native.base) + cck_->sync_entry_off
+        : nullptr;
     fast_bind_ = desc_->fast_bind;
     nparams_ = desc_->params.size();
     min_args_ = static_cast<size_t>(desc_->min_args);
@@ -4293,11 +4344,29 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
 
     c_->flow->type = FlowState::none;
 
-    /* #60 (b): re-enter the dispatch loop DIRECTLY - the ctor already owns the
-     * activation, the boundary window (w_), the captures switch and
-     * g_current_ctx, so no per-element vm_run_chunk entry setup is paid. */
+    /* Lever 2: DIRECT fragment entry per element - the whole vm_dispatch
+     * entry/exit + the EnterNative op dispatch removed from the hot loop.
+     * A BOUNDARY sentinel (native ReturnV set flow / native Halt left it
+     * none) falls straight through to the flow read below; a non-sentinel
+     * exit takes the cold vm_invoke_postexit (raise dispatch or the ONE
+     * interpreted continuation the dispatch path always paid). #60 (b)'s
+     * dispatch re-entry remains the fallback for a body that does not
+     * start native. */
     try {
-        vm_dispatch(*cck_, *c_, *act_);
+        if (entry_) {
+#ifdef TESTS
+            g_jit_invoke_direct++;
+#endif
+            const size_t r = jit_enter(entry_, w_->slots);
+            /* an IN-VM sentinel is impossible here (this frame is a
+             * BOUNDARY record; jit_ret/jit_halt return the boundary form)
+             * - a surfaced one would mean ignored resume globals */
+            ML_CHECK(r != JIT_RET_SENTINEL);
+            if (r != JIT_RET_BOUNDARY)
+                vm_invoke_postexit(*cck_, *c_, *act_, r);
+        } else {
+            vm_dispatch(*cck_, *c_, *act_);
+        }
     } catch (Exception &e) {
         vm_capture_desc_frame(e, d);
         throw;
