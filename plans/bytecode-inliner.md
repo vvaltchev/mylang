@@ -166,11 +166,13 @@ return n + sumto(n-1); }` it emits the textbook form (`-vd`, one level):
 and it runs correctly with the JIT off. It is DEFAULT OFF because of two
 defects, both found by the battery, neither yet fixed:
 
-**(1) [RE-DIAGNOSED 2026-08-02 - it is NOT the splice's bug, and it is
-NOT the flush guard.]** The first reading was that a spliced frame's
-virtual backtrace frame was dropped by `vm_unwind_walk`'s once-guarded
-flush. Both halves of that are wrong, and the correction matters more
-than the original claim:
+**(1) [NOT THE SPLICE'S BUG - root-caused and mostly FIXED 2026-08-02 in
+`9fe3783` + `c1310ed`; the JIT residual moved to
+plans/jit-backtrace-frames.md.]** The
+first reading was that a spliced frame's virtual backtrace frame was
+dropped by `vm_unwind_walk`'s once-guarded flush. The "splice" half was
+wrong; the "guard" half turned out to be RIGHT, but for the interpreted
+path rather than the one being looked at:
 
   - **The splice's backtrace is CORRECT.** With the JIT off, `-bi` and
     `-nbi` and `-tw` all render a throwing `sumto(4)` byte-identically
@@ -188,29 +190,26 @@ than the original claim:
     tree-walker and `-nj` both render 6 frames; the JIT renders 4, and
     its last frame reads `main() at line 4` where it should read `line
     6`. So a frame is not merely missing - one is MISATTRIBUTED.
-  - **Making the flushes unconditional does NOT fix it.** Tried at
-    `vm_unwind_walk`'s pop and at the three call-op propagation sites;
-    no change. So the frames are lost on a path that does not flush at
-    all.
+  - **BUT the guard was real on the interpreted path.** Comparing `-tw`
+    against `-nj` (not two JIT runs) at depths 2..7 showed the VM
+    diverging at every depth, for TWO independent reasons - a loc-less
+    throw from a folder-synthesized divisor, and the once-guarded flush
+    dropping every call site's frames after the first. The first is
+    fixed at its origin in `9fe3783` (#76), the second in `c1310ed`;
+    one two-depth parity test pins both.
+  - **The JIT residual survives**, and its cause is not the guard: once a
+    run's originals are deleted every op collapses onto the head
+    `EnterNative` (54 loc entries at `pc0` in this program), so every
+    pc-keyed side-table lookup on the JIT's exception path is degenerate.
+    The designed answer is baking, which today covers only the raise site
+    and only when the op has a chain. Design + acceptance test:
+    **plans/jit-backtrace-frames.md**.
+  - Attempting a pc lookup at `EnterNative` was tried and REJECTED - it
+    recovered a frame on one shape by luck and broke another.
 
-**The leading hypothesis, and where to look next.** `vm_unwind_walk`'s
-`sync_stop` branch - the record shape the JIT's EMITTED sync call pushes -
-captures the frame, pops the window and converts to the pending signal
-**with no `vm_flush_inline` call anywhere in it**, unlike the in-VM branch
-right below it, which flushes at the parent's call pc. That is a
-structural gap, not a guard problem. The complication that makes it worth
-designing rather than patching: at that point `chunk` is the CALLEE's, so
-there is no caller pc to look up, and the only thing naming the caller's
-chain is `Exception::jit_inline_frame`, baked by the emitted call site's
-`emit_exc_stamp`. Consuming it there would also have to CLEAR it so the
-next level's stamp can take effect, and would have to resolve
-`inline_frames` against the CALLER's chunk, which the record does not
-carry. That is a real protocol decision - do not patch it blind.
-
-Also worth fixing regardless: the `-rt` suite has no test for this shape
-(a recursion whose recursive call sits inside an inlined region, throwing
-deep), which is how a tw-vs-VM backtrace divergence survived. Add one to
-the differential, with the JIT on.
+The missing-test gap is closed: `inlined_recursion_backtrace_parity`
+(tests.cpp) pins this shape on both engines. It forces the JIT off for
+now; removing that line is the acceptance test for the residual.
 
 **(2) A chunk with TWO splices miscompiles UNDER THE JIT.** Ackermann
 (two self-calls in one body) dispatches a garbage opcode - UBSan:
