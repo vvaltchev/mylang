@@ -765,8 +765,23 @@ is a bare enter.nat). Execution-proven (g_jit_op_run bumps in the slow
 tier; the jit_load_elem_slow_tier test covers slice + negative-wrap
 shapes). Measured (callgrind Ir): 15_array_slice_readonly **-32.2%**
 (sliced reads run the helper instead of splitting/bailing per element),
-18_foreach_array **-10.1%**, 14 -3.0%; 43/46 neutral. Remaining
-blockers: the calls, AppendV, StructFieldAddInt, Catch/Reraise/Throw.
+18_foreach_array **-10.1%**, 14 -3.0%; 43/46 neutral. **Increment 2 - the
+LV-BUILTIN family deletable (AppendV / CallBuiltinLV / LVElem /
+LVMember):** their jit helpers already ran the FULL interpreter path
+(fast append + the pooled-caret fallback / the shared LV dispatch) and
+stamp their own carets from the builtin_calls POOL - collapse-safe by
+construction; what they lacked was the classification, a
+plain-Exception net (catch(...) -> g_vm_jit_eptr - the noexcept would
+std::terminate), and a belt-and-suspenders emit-side exc-stamp. Now
+op_fully_native -> an append/sort/pop loop's originals DELETE (an
+append loop's chunk is a bare enter.nat). Error parity pinned:
+const-rebind + flat-mismatch carets byte-identical through the deleted
+form; a THROWING COMPARATOR revealed a PRE-EXISTING (parent-verified,
+JIT-independent) caret divergence - the VM carets the offending
+DIVISOR `z[0]`, the tree-walker the whole `x / z[0]` chain - noted,
+not this increment's doing. Ir neutral (13/34/47 +-0.00%). Corpus:
+45 -> 41 kept runs. Remaining blockers: the calls (38),
+Catch/Reraise/Throw (12), StructFieldAddInt (5), MultiUnpackV (3).
 
 **N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
 fragment that navigates the base slot -> SharedObject -> kind + the flat
