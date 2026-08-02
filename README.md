@@ -21,6 +21,7 @@ as well.
   * [Maintainance](#maintainance)
     * [Building MyLang](#building-mylang)
     * [Testing MyLang](#testing-mylang)
+    * [Compiled scripts (.myv)](#compiled-scripts-myv)
   * [Syntax](#syntax)
     * [Core concepts](#core-concepts)
     * [Declaring variables](#declaring-variables)
@@ -111,6 +112,38 @@ better, right? :-)
 
 [GoogleTest]: https://github.com/google/googletest
 [Boost.Test]: https://www.boost.org/doc/libs/1_75_0/libs/test/doc/html/index.html
+
+### Compiled scripts (.myv)
+
+MyLang can store a compiled script and run it later with no source, no
+parsing and no optimizer passes:
+
+```
+./mylang -c script.my                 # writes script.myv
+./mylang -c script.my -o out.myv      # explicit output path
+./mylang -c script.my --strip-source  # omit the embedded source
+./mylang script.myv                   # run it (detected by content)
+./mylang -vd script.myv               # disassemble a stored image
+```
+
+What a `.myv` holds is the **bytecode VM image** — the instructions and
+their data pools (constants, source locations for error carets, struct
+type definitions, function descriptors). It does **not** hold machine
+code: the native compiler runs again when the file is loaded, so an image
+is portable across machines and keeps working as the native tier
+improves.
+
+By default the original source text is embedded, because error messages
+print the offending line with a caret under it. `--strip-source` drops it;
+errors from such an image still report the exception, the line/column and
+the full backtrace, just without the quoted source line.
+
+An image is tied to the interpreter that wrote it: a different format
+version, a different endianness, or a binary with a different set of
+builtins is refused with a clear message asking you to recompile from
+source. A truncated or corrupted file is refused the same way rather than
+misbehaving. Compiling the same source twice produces byte-identical
+files.
 
 ### The interactive REPL
 

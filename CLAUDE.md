@@ -1424,12 +1424,13 @@ neutral (geomean 1.00x), as it must be.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty-two
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty-three
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
 `eval.cpp`, `types.cpp`, `statictype.cpp`, `trace.cpp`, `coderender.cpp`,
 `backtrace.cpp`, `errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`,
-`repl.cpp`, `codegen.cpp`, `vm.cpp`, `jit.cpp`, `disasm.cpp`, `mylang.cpp`, `tests.cpp`
+`repl.cpp`, `codegen.cpp`, `vm.cpp`, `jit.cpp`, `disasm.cpp`, `serialize.cpp`,
+`mylang.cpp`, `tests.cpp`
 (six of them are the REPL — see "The interactive REPL" below; `trace.cpp` is the
 diagnostic tracer and `coderender.cpp` the optimized-AST "decompiler", both used
 by the REPL; `codegen.cpp`/`vm.cpp` are the bytecode-VM engine and `disasm.cpp`
@@ -4313,7 +4314,58 @@ the proof. Before calling it done:
 >     pointers, NO indexes, NO tables — the AST is FREED and the script runs on
 >     bytecode + pooled data alone.**
 >
-> **THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,
+> **THE `.myv` STORED-BYTECODE FORMAT (`serialize.{h,cpp}`; design +
+phases in plans/myv-serializer.md) — THE ENDGAME ARTIFACT.**
+`mylang -c file.my [-o out.myv] [--strip-source]` runs the full pipeline
+(parse → infer → optimize → `vm_compile(root, jit=false)`) and writes the
+VM image; `mylang file.myv` runs it with NO lexer, NO parser, NO optimizer
+— the file argument is detected by CONTENT (`myv_is_image`, the "MYLV"
+magic), never by extension. `-vd file.myv` disassembles a LOADED image via
+**`disassemble_image`** (disasm.cpp), the loaded twin of
+`disassemble_program` — the ROUND-TRIP ORACLE.
+**ONLY the VM image is stored, never native code:** the JIT rewrites code
+IN PLACE (inserting `EnterNative`, deleting originals) against fragments
+that cannot be relocated, so `-c` compiles with `jit=false` (the new
+`vm_compile(root, jit)` / `vm_precompile_all(root, jit)` parameter) and the
+LOADER re-runs the tier — **`vm_jit_loaded_image`** (vm.cpp) mirrors
+`vm_precompile_all`'s TWO PASSES: recompute every chunk's `native_leaf`
+(derived from the ops - `jit_chunk_is_native_leaf`, so it is never stored),
+then jit each body with a `JitCtx` REBUILT from the image (global slot →
+descriptor resolved BY NAME through `global_func_names`, plus the newly
+serialized `VmProgram::global_slot_reassigned`), then main. That is what
+makes a loaded image's `-vd` byte-identical to a fresh compile's.
+**The format** (all little-endian, fixed records, NO compression - the
+no-deps rule): magic + `MYV_FORMAT_VERSION` (exact match) + an endian mark
++ a **BUILTIN-SET FINGERPRINT** + the embedded source + the string table,
+then structs, descriptors, chunks (root first), globals. Cross-references
+are INDICES or NAMES, never pointers: a `UniqueId*` is a string index (the
+loader re-interns), a `Builtin` is its NAME (`vm_lookup_builtin` re-resolves;
+an unknown name is refused), struct defs / descriptors are table indices.
+Values go through a recursive codec (none/bool/int/float/str/array WITH its
+storage kind + readonly/dict + default/struct instance/struct descriptor/
+FuncObject) that ABORTS on an unlisted type - an image is never silently
+lossy. Struct LAYOUT is recomputed at load (`compute_layout`), never
+stored.
+**THE BUILTIN-SLOT HAZARD (found + fixed here):** `SymbolsType` is a
+`std::map<const UniqueId *, ...>` keyed by the interned POINTER, so the
+builtin table's slot order differed PER PROCESS - a baked
+`SymKind::builtin` slot would resolve to a DIFFERENT builtin after a load.
+`build_builtin_table_once` now sorts by NAME (deterministic given the
+builtin SET), and the image carries `builtin_set_fingerprint()` (count + a
+name hash) so a binary with a different set is refused instead of silently
+calling the wrong builtin. `-c` also registers `argv` before compiling, so
+the compile sees exactly the run's builtin set.
+Errors from an image are byte-identical to the source run (the embedded
+source feeds the caret block; `--strip-source` prints the located header +
+backtrace, `errfmt`'s no-source mode). Compiling twice is byte-identical
+(pinned). A corrupt/truncated/incompatible file is a clean `MyvError`.
+Verified: 83/83 of bench/ + samples/ run identically from an image, 81/83
+also dump byte-identically (the 2 residuals differ ONLY in the printed
+ORDER of a const dict's entries - MyLang dicts are unordered by spec, and
+a rebuilt hash map's iteration order legitimately differs). The REPL is
+out of scope (it retains ASTs).
+
+**THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,
 > plans/vm-ast-free-runtime.md): the call model runs on the serializable
 > **`FuncDescriptor`** (funcdesc.h) — `FuncObject::func` points at it, never
 > at a `FuncDeclStmt`; params bind from its `ParamDesc` snapshot, captures

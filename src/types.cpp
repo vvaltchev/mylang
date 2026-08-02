@@ -765,11 +765,46 @@ build_builtin_table_once()
         g_builtin_is_const.push_back(is_const ? 1 : 0);
     };
 
+    /* NAME order, NOT map order: SymbolsType is keyed by the interned
+     * UniqueId POINTER, whose values differ per process - so a pointer-
+     * ordered table would give a builtin a DIFFERENT slot index in the
+     * compiling process than in the loading one, and a `.myv`'s baked
+     * SymKind::builtin slots would resolve to the WRONG builtin
+     * (plans/myv-serializer.md). Sorting by name makes the table a
+     * deterministic function of the builtin SET; the image additionally
+     * carries a fingerprint of that set and refuses a mismatch. */
+    std::vector<std::pair<const UniqueId *, bool>> all;
     for (const auto &kv : EvalContext::const_builtins)
-        add(kv.first, kv.second, /*is_const=*/true);
-
+        all.push_back({ kv.first, true });
     for (const auto &kv : EvalContext::builtins)
-        add(kv.first, kv.second, /*is_const=*/false);
+        all.push_back({ kv.first, false });
+    std::sort(all.begin(), all.end(),
+              [](const std::pair<const UniqueId *, bool> &a,
+                 const std::pair<const UniqueId *, bool> &b) {
+                  return a.first->val < b.first->val;
+              });
+    for (const auto &e : all) {
+        const auto &m = e.second ? EvalContext::const_builtins
+                                 : EvalContext::builtins;
+        add(e.first, m.find(e.first)->second, e.second);
+    }
+}
+
+/* A fingerprint of the BUILTIN SET (count + a name hash), stored in a .myv
+ * and checked at load: a file compiled by a binary with a different builtin
+ * set has stale slot indices, and is refused with "recompile from source"
+ * instead of silently calling the wrong builtin. */
+uint64_t builtin_set_fingerprint()
+{
+    build_builtin_table_once();
+    uint64_t h = 1469598103934665603ull;             /* FNV-1a basis */
+    for (const UniqueId *u : g_builtin_names)
+        for (char c : u->val) {
+            h ^= static_cast<unsigned char>(c);
+            h *= 1099511628211ull;
+        }
+    h ^= g_builtin_names.size();
+    return h;
 }
 
 int

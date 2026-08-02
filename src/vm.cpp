@@ -1144,7 +1144,7 @@ static bool g_vm_executing = false;
  */
 static std::unordered_map<const FuncDescriptor *, Chunk> g_func_chunks;
 
-static void vm_precompile_all(const Block *root);   /* AOT: defined below */
+static void vm_precompile_all(const Block *root, bool jit = true);
 
 /*
  * Execute the optimized program via the bytecode VM. It builds the program's
@@ -1812,8 +1812,80 @@ void vm_window_pop()
     g_vm_act->pop_window();
 }
 
+/* .myv LOAD: re-resolve a builtin by NAME against the singleton table (a
+ * stored image names its builtins, never their addresses). False = the file
+ * names a builtin this binary does not have -> the loader refuses it. */
+bool vm_lookup_builtin(const UniqueId *name, Builtin &out)
+{
+    if (!name)
+        return false;
+    auto it = EvalContext::const_builtins.find(name);
+    if (it == EvalContext::const_builtins.end()) {
+        it = EvalContext::builtins.find(name);
+        if (it == EvalContext::builtins.end())
+            return false;
+    }
+    if (!it->second.get().is<Builtin>())
+        return false;
+    out = it->second.get().get<Builtin>();
+    return true;
+}
+
+/* .myv LOAD (plans/myv-serializer.md): own a deserialized chunk and stamp
+ * it on its descriptor - the loader's equivalent of vm_precompile_all's end
+ * state for a fresh compile. The AOT NATIVE tier re-runs here: only the VM
+ * image is stored, so machine code is (re-)generated per load. */
+void vm_install_func_chunk(const FuncDescriptor *fdesc, Chunk &&ck)
+{
+    Chunk &owned = g_func_chunks.emplace(fdesc, std::move(ck)).first->second;
+    /* NOT jit'd here: the tier runs once over the WHOLE image
+     * (vm_jit_loaded_image), because a caller's native-call gate needs
+     * every callee's flag set first - vm_precompile_all's two passes. */
+    (void)owned;
+    fdesc->vm_chunk = &owned;
+    fdesc->vm_chunk_tried = true;
+    bool fast = true;                      /* == vm_precompile_all's rule */
+    for (const auto &p : fdesc->params)
+        if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+            fast = false;
+    fdesc->fast_bind = fast;
+}
+
+/* .myv LOAD: the AOT native tier over a loaded image - the two-pass shape
+ * of vm_precompile_all. Pass A recomputes each chunk's native_leaf flag
+ * (codegen sets it on a fresh compile; it is derived from the ops, so it is
+ * recomputed rather than stored - no drift surface). Pass B jits every body
+ * with a JitCtx rebuilt from the image (global slot -> descriptor by NAME,
+ * plus the stored reassigned flags), then main. */
+void vm_jit_loaded_image(VmProgram &prog)
+{
+    for (auto &kv : g_func_chunks)
+        kv.second.native_leaf = jit_chunk_is_native_leaf(kv.second);
+
+    std::vector<const FuncDescriptor *> slot_desc(
+        prog.global_func_names.size(), nullptr);
+    for (size_t s = 0; s < prog.global_func_names.size(); s++) {
+        const UniqueId *nm = prog.global_func_names[s];
+        if (!nm)
+            continue;
+        for (const auto &d : prog.funcs)
+            if (d->name == nm && d->vm_chunk) {
+                slot_desc[s] = d.get();
+                break;
+            }
+    }
+    for (auto &kv : g_func_chunks) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &prog.global_slot_reassigned;
+        jc.caller_desc = kv.first;
+        jit_compile_chunk(kv.second, &jc);
+    }
+    jit_compile_chunk(prog.root);
+}
+
 VmProgram
-vm_compile(const Construct *root_c)
+vm_compile(const Construct *root_c, bool jit)
 {
     const Block *root = static_cast<const Block *>(root_c);
     ExecGuard exec_guard;
@@ -1832,15 +1904,17 @@ vm_compile(const Construct *root_c)
      * maintainer's no-lazy rule + a `.myv`-serialization prerequisite. After
      * this, do_func_call reads a precomputed vm_chunk and never compiles.
      * Pass A codegens all bodies (flags set), Pass B jits them. */
-    vm_precompile_all(root);
+    vm_precompile_all(root, jit);
 
     /* Now jit main - every function's native_leaf flag is set (Pass A), so
      * main's top-level native calls can see them (#55 STEP 2). */
-    jit_compile_chunk(prog.root);
+    if (jit)
+        jit_compile_chunk(prog.root);
 
     /* Root-context data the run needs, copied OUT of the root Block. */
     prog.root_slot_count = root->slot_count;
     prog.global_func_names = root->global_func_names;
+    prog.global_slot_reassigned = root->global_slot_reassigned;
 
     /* OWNERSHIP TRANSFER (plans/vm-ast-free-runtime.md): move every function
      * descriptor and struct type def out of the AST into the program image,
@@ -2011,7 +2085,7 @@ vm_func_chunk(const FuncDescriptor *fdesc, bool jit)
  * (g_vm_executing true, the AST final), so vm_func_chunk's guard is satisfied.
  */
 static void
-vm_precompile_all(const Block *root)
+vm_precompile_all(const Block *root, bool jit)
 {
     std::vector<const FuncDeclStmt *> funcs;
     for (const auto &e : root->elems)
@@ -2051,6 +2125,8 @@ vm_precompile_all(const Block *root)
      * native entry at RUNTIME, by when every body is jit'd). Main is jit'd by
      * vm_compile after this (with no JitCtx -> no native call from main in v1,
      * since main has no stable descriptor for the record's ret_chunk). */
+    if (!jit)
+        return;                 /* the .myv writer stores PRE-jit bytecode */
     for (auto &kv : g_func_chunks) {
         JitCtx jc;
         jc.slot_desc = &slot_desc;
