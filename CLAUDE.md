@@ -4576,6 +4576,13 @@ multiple-inheritance ExceptionObjectTempl graph (~25% of
 105.9M); the remaining residue is the interpreted catch-body resume
 (vm_dispatch 13% - catch targets are excluded from per-pc entry stubs),
 the name memcmp (~7%), and the per-throw pooled alloc + raise walk.
+**#74 increment 2 - the NATIVE catch body:** a CatchTest's TARGET (the
+catch body) is an ordinary RESUME - it joined the per-pc entry set and
+its target field routes through entry_remap, so a matched catch enters
+the fragment at the body instead of interpreting to the back edge. Only
+PushHandler's target (the MATCHER pc, an exit-at-op native) keeps the
+exclusion. Measured: 70_exc a further -4.5% Ir (vm_dispatch self -24%),
+42_exceptions -2.0%, 69/71/72 neutral.
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
