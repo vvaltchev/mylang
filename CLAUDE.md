@@ -4855,6 +4855,38 @@ AST transform joins **all three** on the day it is written:
 > not watched it catch is decoration. (Same rule as "prove the code ran" for
 > a perf measurement, applied to correctness.)
 
+> **⛔ THE VACUOUS-TEST TRAP: THE OPTIMIZER EATS YOUR TEST SHAPE.** The
+> reintroduce-the-defect proof above keeps catching the SAME failure: a
+> test whose shape never REACHES the code under test, because an earlier
+> pass transformed it away - the test then passes with the defect in,
+> vacuously. One session (2026-08-02) hit this FIVE times. Before writing
+> any test of a VM/JIT/codegen path, defeat the known shape-eaters UP
+> FRONT instead of rediscovering them one reintroduction at a time:
+>
+> 1. **A tail call `return f(x)` never reaches codegen as a call** - the
+>    AST tail-inliner splices it first. Use `var r = f(x); return r;`.
+> 2. **Const-folding deletes const-arg constructs at PARSE time.** A
+>    literal-bounds slice of a const (`C[1:4]`) folds to a baked literal -
+>    no live runtime slice exists; a 0-arg pure call folds away entirely
+>    (no args == const args). Defeat with `runtime()` in an operand.
+> 3. **A store/read must sit INSIDE a JIT-compiled run** to exercise an
+>    emitted tier - a short literal array's single store never compiles.
+>    Fill the array in a loop first, then exercise the shape.
+> 4. **The "same" source can lower to a DIFFERENT op**: `a[i] = true` is
+>    StoreElemInt, `a[i] = i < n` is StoreElemValue; `M[k][j]` fuses to
+>    LoadElem2Int only when the pcs are adjacent, and LICM hoists the row
+>    unless the outer index varies with the inner loop. Check `-vd` for
+>    the opcode the test actually produces.
+> 5. **Attribute counters PER SHAPE, never program-wide** - a decline
+>    case's ordinary stores otherwise mask (or fake) the signal. And an
+>    env-gated tool toggled by one test leaks into the next: save/restore.
+>
+> The mechanical safeguards, both mandatory: an **EMITTED-code counter**
+> (the `g_jit_store_fast` pattern - the helper's counter also counts
+> declines, so it cannot prove the fast path ran), and the
+> reintroduce-the-defect run, which is what catches whatever this list
+> does not yet name. When it does, ADD THE NEW EATER HERE.
+
 **A caret/backtrace check needs the same treatment**: an AST transform can
 move a `Loc` without changing any value, so compare the rendered error
 POSITION across layers too, not just the exception type.
