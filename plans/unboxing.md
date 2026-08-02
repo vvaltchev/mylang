@@ -237,3 +237,51 @@ the INNER index must produce byte-identical carets to the unfused pair,
 and a MUTATION of the outer array between iterations must behave
 identically - write those before the op, and confirm they FAIL against a
 deliberately wrong caret, per the "prove the test catches the bug" rule.
+
+
+## The residual after BOTH inline tiers (measured 2026-08-02)
+
+46_matrix_mult sits at 91.5 Ir per inner iteration (from 221.5 pre-fusion
+and 170.5 with the helper tier). Probe loops decompose it - each probe is
+the same doubly-nested shape, scale-1-vs-3 delta, OPT=1 ASSERTS=0:
+
+    s += j          (no reads)      11.0 Ir/iter   addstep + branch
+    s += r[k]                       34.0           +23 single-level read
+    s += b[k][j%3]                  67.9           +~53 nested read
+                                                    (~4 of it the %)
+
+**There is NO boxed accumulate** - `s += a[i][k] * b[k][j]` is four
+native ops with the accumulate fused into IntAddStep. The claim that the
+residual was "the boxed accumulate around the read" was WRONG; the money
+is in two structural places:
+
+1. **Invariant re-verification.** The nested read re-runs `b`'s
+   type/slice/kind guards and reloads its data/len EVERY element, for a
+   base that cannot change inside the loop. Same for the row's guards
+   (though those genuinely vary with k) and the single-level read's. C++
+   proves these facts once per program; we re-derive them per element.
+2. **Temp slots as the pipe between ops.** Each op is emitted
+   independently, so a value flows producer -> temp slot (2 stores, and a
+   ref-check when the temp is ref-listed - matmul's r10/r11 both are,
+   having held rows earlier) -> consumer (1-2 loads). Adjacent
+   dead-temp pairs (elem2 -> mul -> addstep) round-trip ~7 Ir/iter.
+
+The levers, ranked by yield against cost:
+
+  A. **Adjacent dead-temp FORWARDING** (~7-8 of 91.5, ~8%): producer
+     leaves the value in rax, consumer skips the load, the slot write is
+     skipped when the temp is provably dead - requires the consumer to
+     never bail (IntBin RR / IntAddStep qualify) and a redefined-before-
+     use scan; the slow-path rejoin must reload rax from the slot. This
+     is the first concrete slice of the register-allocator step
+     plans/jit-registers.md already names as next.
+  B. **Loop-preheader guard hoisting** (~10-15): verify an invariant
+     base's guards once before the back-edge target. Needs a spare
+     callee-saved register or scratch slots, and a proof no op in the
+     loop can mutate the base - the full allocator/dataflow problem in
+     miniature. Do not start it as a one-off.
+  C. **Typed-invariant arrays** (the endgame): stop re-deriving per
+     element what inference already proved. The N7 arc; not a JIT patch.
+
+The honest framing: both inline tiers took the EASY 60% (447 -> 91.5 on
+the sieve-class costs). What remains is the architecture, not a helper.
