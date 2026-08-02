@@ -209,6 +209,18 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
  * single `<produce rD>` (see emit_args_range). Excludes a jump/branch (whose
  * `.target` is a code label), a store (writes memory), CompoundV (reads its
  * target), and the loop back-edges.
+ *
+ * MoveV is EXCLUDED (2026-07-26, a WRONG-CODE fix): the caller's soundness
+ * additionally requires ops.back() to be the SOLE producer of the temp,
+ * and every JOIN shape violates that through a trailing MoveV - a boxed
+ * ternary/coalesce compiles each arm into the join temp via its own MoveV
+ * (an InlinedCallExpr's return-redirects likewise), so retargeting only
+ * the LAST one strands the other arm's value in the dead temp. A ternary
+ * passed as a CALL ARGUMENT (`lf(c ? "ab" : "c")`) silently read an
+ * undefined slot when the then branch was taken. The single-producer ops
+ * below cannot be a join tail (codegen funnels every join through MoveV),
+ * and the E1 peephole's join-move rule - which checks EVERY predecessor -
+ * cleans the extra move correctly afterwards.
  */
 bool op_writes_pure_target(OpCode op)
 {
@@ -217,7 +229,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::LoadLiteralObjV:
     case OpCode::LoadImmFloat: case OpCode::LoadGlobalV:
     case OpCode::LoadCaptureV: case OpCode::LoadBuiltinV:
-    case OpCode::MoveV:       case OpCode::BinOpV:
+    case OpCode::BinOpV:
     case OpCode::CmpV:        case OpCode::LogV:
     case OpCode::IntBin:      case OpCode::FloatBin:
     case OpCode::CmpIntV:     case OpCode::CmpFloatV:
