@@ -4563,6 +4563,19 @@ inclusive of INLINED virtual frames (`Chunk::inline_ctxs`, flushed by
 throws the VM can't pre-detect (OOB / KeyNotFound / a boxed `TypeErrorEx`):
 a same-frame catch of those is native (boundary dispatch), a cross-frame one
 pays one landing-pad to the boundary before the walk takes over.
+**#74 increment 1 (2026-07-28) - the RTTI-free catch MATCHER:**
+`RuntimeException` gained two cheap virtuals - `match_name()` (the
+catch-matching name: a user struct exception's type name, else the
+built-in `name`) and `is_exception_object()` (true only on
+`ExceptionObjectTempl`, so callers may static_cast) - replacing the
+`dynamic_cast<ExceptionObject*>` the VM's CatchTest matcher
+(vm_exc_name/vm_catch_bind_val) and the tree-walker's do_catch ran per
+caught exception: the RTTI cast measured ~218 Ir per call on the
+multiple-inheritance ExceptionObjectTempl graph (~25% of
+70_exc_runtime_error). Measured: 70_exc **-32.0%** Ir (155.7M ->
+105.9M); the remaining residue is the interpreted catch-body resume
+(vm_dispatch 13% - catch targets are excluded from per-pc entry stubs),
+the name memcmp (~7%), and the per-throw pooled alloc + raise walk.
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by

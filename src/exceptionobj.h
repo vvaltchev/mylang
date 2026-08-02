@@ -33,6 +33,14 @@ public:
         return dyn_name;
     };
 
+    std::string_view match_name() const override {
+        return dyn_name;
+    }
+
+    bool is_exception_object() const override {
+        return true;
+    }
+
     const EvalValueT &get_data() const {
         return data;
     };

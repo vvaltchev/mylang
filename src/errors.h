@@ -161,6 +161,17 @@ struct RuntimeException : public Exception {
 
     virtual RuntimeException *clone() const = 0;
     [[ noreturn ]] virtual void rethrow() const = 0;
+
+    /* The catch-matching NAME (a user struct exception's type name, else
+     * the built-in `name`) and the ExceptionObject discriminator - cheap
+     * VIRTUALS, not dynamic_cast: the catch matcher runs these once per
+     * caught exception, and the RTTI cast measured ~218 Ir per call on the
+     * multiple-inheritance ExceptionObjectTempl graph (70_exc profile,
+     * task #74) vs a ~3 Ir virtual dispatch. `is_exception_object()`
+     * true guarantees the object IS an ExceptionObjectTempl (only that
+     * class overrides it), so callers may static_cast. */
+    virtual std::string_view match_name() const { return name; }
+    virtual bool is_exception_object() const { return false; }
 };
 
 #define DECL_SIMPLE_EX(name, msg)                  \

@@ -2047,16 +2047,15 @@ vm_precompile_all(const Block *root)
  * exception's type name, else the built-in name). Mirrors do_catch's ex_name. */
 static std::string_view vm_exc_name(const RuntimeException *ex)
 {
-    if (auto *eo = dynamic_cast<const ExceptionObject *>(ex))
-        return eo->get_name();
-    return ex->name;
+    return ex->match_name();     /* virtual, no RTTI (see errors.h, #74) */
 }
 
 /* The value `catch (T as e)` binds: a thrown struct's instance (so `e.field`
  * works), else a fresh ExceptionObject. Mirrors do_catch's bind_val. */
 static EvalValue vm_catch_bind_val(RuntimeException *ex)
 {
-    auto *eo = dynamic_cast<ExceptionObject *>(ex);
+    auto *eo = ex->is_exception_object()
+        ? static_cast<ExceptionObject *>(ex) : nullptr;
     if (eo && eo->get_data().is<intrusive_ptr<StructObject>>())
         return eo->get_data();
     return EvalValue(make_intrusive<ExceptionObject>(
