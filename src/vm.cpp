@@ -5309,8 +5309,17 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
             w = vm_frame_setup(act, ctx, &vm_sync_stop_chunk(), /*ret_pc=*/0,
                                fo, cck, argbase, static_cast<size_t>(nargs),
                                dst, std::move(key));
+    } catch (RuntimeException &e) {
+        /* #56 step 1: a setup throw (arity / bind-coerce / StackOverflow)
+         * is pre-side-effect and idempotent - CONVEY it (the emit's
+         * exc-stamp gives the loc-less ones the call's caret) instead of
+         * declining to a re-run. No callee backtrace frame, exactly as
+         * the interpreted push (setup pops its half-frame pre-capture). */
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
     } catch (...) {
-        return 1;
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
     }
 
     act.back_rec().sync_stop = 1;
@@ -5388,19 +5397,38 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
     return 0;                              /* dst written by vm_frame_leave */
 }
 
+/* #56 calls step 1: the ERROR declines CONVEY instead of re-interpreting.
+ * `lep` = the baked &chunk.locs[i] for this call op (the callee-identifier
+ * caret) - an UndefinedVariableEx is a PLAIN exception (uncatchable, rides
+ * g_vm_jit_eptr, the LoadGlobalV precedent) and needs its caret at
+ * CONSTRUCTION; a NotCallableEx (Runtime) conveys loc-less and the emit's
+ * exc-stamp writes the same caret. The DEPTH CAP and the core's chunk-less
+ * net remain declines (return 1) until the SWITCH-protocol step. */
 extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
                              int_type nargs, int_type dst,
-                             int_type site_packed) noexcept
+                             int_type site_packed, const void *lep) noexcept
 {
     ML_JIT_OP_RAN(CallV);
     EvalContext *ctx = g_current_ctx;
     if (g_jit_sync_depth >= g_jit_sync_cap)
         return 1;                          /* deep tail -> interpreted */
-    if (!ctx->gfuncs->defined[callee_slot])
-        return 1;                          /* undefined -> interpreted throw */
+    if (!ctx->gfuncs->defined[callee_slot]) {
+        const Chunk::LocEntry *le =
+            static_cast<const Chunk::LocEntry *>(lep);
+        try {
+            throw UndefinedVariableEx(ctx->gfuncs->names[callee_slot]->val,
+                                      le ? le->start : Loc(),
+                                      le ? le->end : Loc());
+        } catch (...) {
+            g_vm_jit_eptr = std::current_exception();
+        }
+        return 2;
+    }
     const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
-    if (!cv.is<intrusive_ptr<FuncObject>>())
-        return 1;                          /* not callable -> interpreted */
+    if (!cv.is<intrusive_ptr<FuncObject>>()) {
+        g_vm_jit_exc = std::make_unique<NotCallableEx>();
+        return 2;                          /* loc: the emit's exc-stamp */
+    }
     return jit_call_sync_core(*cv.get_ref<intrusive_ptr<FuncObject>>().get(),
                               argbase, nargs, dst, site_packed,
                               /*cached=*/false);
@@ -5408,17 +5436,30 @@ extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
 
 extern "C" int jit_call_sync_cached(int_type callee_slot, int_type argbase,
                                     int_type nargs, int_type dst,
-                                    int_type site_packed) noexcept
+                                    int_type site_packed,
+                                    const void *lep) noexcept
 {
     ML_JIT_OP_RAN(CachedCallV);
     EvalContext *ctx = g_current_ctx;
     if (g_jit_sync_depth >= g_jit_sync_cap)
         return 1;
-    if (!ctx->gfuncs->defined[callee_slot])
-        return 1;
+    if (!ctx->gfuncs->defined[callee_slot]) {
+        const Chunk::LocEntry *le =
+            static_cast<const Chunk::LocEntry *>(lep);
+        try {
+            throw UndefinedVariableEx(ctx->gfuncs->names[callee_slot]->val,
+                                      le ? le->start : Loc(),
+                                      le ? le->end : Loc());
+        } catch (...) {
+            g_vm_jit_eptr = std::current_exception();
+        }
+        return 2;
+    }
     const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
-    if (!cv.is<intrusive_ptr<FuncObject>>())
-        return 1;
+    if (!cv.is<intrusive_ptr<FuncObject>>()) {
+        g_vm_jit_exc = std::make_unique<NotCallableEx>();
+        return 2;
+    }
     return jit_call_sync_core(*cv.get_ref<intrusive_ptr<FuncObject>>().get(),
                               argbase, nargs, dst, site_packed,
                               /*cached=*/true);
@@ -5426,18 +5467,22 @@ extern "C" int jit_call_sync_cached(int_type callee_slot, int_type argbase,
 
 extern "C" int jit_call_sync_value(int_type callee_temp, int_type argbase,
                                    int_type nargs, int_type dst,
-                                   int_type site_packed) noexcept
+                                   int_type site_packed,
+                                   const void *lep) noexcept
 {
     ML_JIT_OP_RAN(CallValueV);
+    (void)lep;
     EvalContext *ctx = g_current_ctx;
     if (g_jit_sync_depth >= g_jit_sync_cap)
         return 1;
     /* the callee VALUE was evaluated into a temp slot (CallValueV's
-     * target2); a dyn-laundered non-func bails to the interpreted op's
-     * NotCallableEx (its caret from the loc side table). */
+     * target2); a dyn-laundered non-func CONVEYS the interpreted op's
+     * NotCallableEx (its caret from the emit's exc-stamp). */
     const EvalValue &cv = ctx->frame->at(callee_temp).get();
-    if (!cv.is<intrusive_ptr<FuncObject>>())
-        return 1;
+    if (!cv.is<intrusive_ptr<FuncObject>>()) {
+        g_vm_jit_exc = std::make_unique<NotCallableEx>();
+        return 2;
+    }
     return jit_call_sync_core(*cv.get_ref<intrusive_ptr<FuncObject>>().get(),
                               argbase, nargs, dst, site_packed,
                               /*cached=*/false);

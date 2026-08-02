@@ -2022,7 +2022,11 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     const size_t j_done2 = e.j32(0x74);            /* jz done */
     emit_call_epilogue(e);
     e.exit_pc(pc);                                 /* exception -> re-raise */
-    /* slow: the full helper (identical to the plain emit_sync_call tail) */
+    /* slow: the full helper (identical to the plain emit_sync_call tail).
+     * r9 = the baked &locs[i] for THIS call op (#56 step 1: the
+     * undefined-callee UndefinedVariableEx is constructed WITH the
+     * callee-identifier caret; the Runtime conveys get the same caret from
+     * the exc-stamp below). */
     for (const size_t j : j_slows)
         e.patch32_here(j);
     e.movabs(RDI, static_cast<uint64_t>(callee_arg));
@@ -2030,10 +2034,17 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
     e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
     e.movabs_r8(site);
+    {
+        const Chunk::LocEntry *lep = nullptr;
+        for (const auto &l : ck.locs)
+            if (l.pc == old_pc) { lep = &l; break; }
+        e.movabs_r9(reinterpret_cast<uint64_t>(lep));
+    }
     e.call_relocs.push_back({ e.pos(), slow_helper });
     e.u8(0xE8); e.u32(0);
     e.u8(0x85); e.u8(0xC0);                        /* test eax, eax */
     const size_t j_done3 = e.j32(0x74);            /* jz done */
+    emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56 step 1) */
     emit_call_epilogue(e);
     e.exit_pc(pc);
     /* done: */
@@ -5246,6 +5257,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);               /* call jit_call_setup -> rax */
         e.u8(0x48); e.u8(0x85); e.u8(0xC0); /* test rax, rax */
         const size_t j_ok = e.j8(0x75);     /* jnz over_SO (rax != null) */
+        emit_exc_stamp(e, ck, old_pc);      /* collapse-safe caret (#56) */
         emit_call_epilogue(e);              /* SO: restore rdi, re-mat rsi/r8 */
         e.exit_pc(pc);                      /* -> EnterNative raises g_vm_jit_exc*/
         e.patch8(j_ok, e.pos());            /* over_SO: */

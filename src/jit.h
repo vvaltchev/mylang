@@ -205,13 +205,16 @@ void jit_fill_push_layout(JitPushLayout *out);
 
 extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
                              int_type nargs, int_type dst,
-                             int_type site_packed) noexcept;
+                             int_type site_packed,
+                             const void *lep) noexcept;
 extern "C" int jit_call_sync_cached(int_type callee_slot, int_type argbase,
                                     int_type nargs, int_type dst,
-                                    int_type site_packed) noexcept;
+                                    int_type site_packed,
+                             const void *lep) noexcept;
 extern "C" int jit_call_sync_value(int_type callee_temp, int_type argbase,
                                    int_type nargs, int_type dst,
-                                   int_type site_packed) noexcept;
+                                   int_type site_packed,
+                             const void *lep) noexcept;
 
 /* #55 STEP 2.1: native CallVs SET UP process-wide (a `jit:` coverage counter -
  * proves the native call path actually ran). */
