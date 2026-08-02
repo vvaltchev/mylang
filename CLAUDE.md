@@ -344,6 +344,36 @@ semantics - and arity/type errors are compile-time-excluded), so it is
 loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
 0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
 
+**LEVER 4b (2026-07-27, plans/native-gap-roadmap.md) - native `len()` +
+the fused `ord(s[i])`.** `len(x)` whose arg the inferencer proved a
+non-opt ARRAY/STRING lowers to the EXISTING `ArrLen`/`StrLen` op (no
+CallBuiltinV marshal): the stamp is `CallExpr::vm_len_kind` (1 array /
+2 str, set in the annotate walk; COPIED by the devirt swap - the
+resolver's field-by-field DirectBuiltinCallExpr build DROPS any
+uncopied CallExpr field, the bug the first `-vd` run exposed), and the
+codegen's `try_native_len` separately proves the callee is the
+UNSHADOWED builtin (the DirectBuiltinCallExpr node + the `len` uid), so
+the stamp alone triggers nothing. `ord(s[i])` with a proven non-opt
+string base (`Subscript::base_str`, stamped beside base_array/
+base_dict) and an int-compilable index fuses to **`OrdCharV`**
+(`try_native_ord`): TypeStr::subscript's exact negative-wrap + bounds
+check, then the raw BYTE as int - no 1-char SharedStr, no builtin call;
+OOB is its only throw (arity/type/1-char are compile-excluded), caret =
+the SUBSCRIPT's via the loc side table. The interpreted body is the
+ML_NOINLINE `vm_ord_char` (the loop-body TEXT rule + recursion stack
+hygiene - an inline case's locals + sanitizer redzones grow EVERY
+recursive vm_dispatch frame); the JIT emit is the SubscriptV convey
+shape (`jit_ord_char`, cache-aware index via load_operand; conveys ->
+deletable). Classified in ALL the tables (visit_use_def,
+op_writes_scalar, op_writes_pure_target - which also GAINED the missing
+StrLen - the E1 retarget list, the jit convey/classifier lists).
+Execution-proven (g_jit_op_run asserts in the `jit_len_ord` test) +
+5 dual-engine `lever4b:` tests (slice base, negative wrap, OOB caret,
+dyn fallback, shadowed len). Measured (callgrind Ir, same-session A/B):
+30_str_index_iterate **-82.9%**, 29_str_slice_readonly **-79.3%**
+(jit_call_builtin's ~186M marshal gone; jit_ord_char ~9 Ir/char),
+31/47 neutral; suite my/py geomean 8.93x -> **9.53x**.
+
 **H2 v2 - THE unordered_map NODE POOL (`PoolAlloc`, poolalloc.h; the
 core in types.cpp - the global-mutable-state home).** A chained
 `unordered_map` heap-allocates a ~96-byte node PER INSERT (hash + the

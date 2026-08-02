@@ -1362,6 +1362,60 @@ static const std::vector<test> tests =
           "var r = defined(a, b);" },
         &typeid(InvalidNumberOfArgsEx), 17, 2, 22, 2,
     },
+    {
+        /* Lever 4b: native len() (ArrLen/StrLen) + the fused ord(s[i])
+         * (OrdCharV) - results, negative-index wrap, and a slice base (the
+         * view offset must be honored). Runs on both engines. */
+        "lever4b: len()/ord(s[i]) results incl. negative idx + slice base",
+        { "var a = [3, 1, 4]; append(a, 1);",
+          "var s = \"hello\"; s += \"!\";",
+          "assert(len(a) == 4);",
+          "assert(len(s) == 6);",
+          "var n = 0;",
+          "for (var i = 0; i < len(s); i++) { n += ord(s[i]); }",
+          "assert(n == 565);",
+          "assert(ord(s[-1]) == 33);       # negative wrap: '!'",
+          "var t = s[1:4];                 # a SLICE view",
+          "assert(len(t) == 3);",
+          "assert(ord(t[0]) == 101);       # 'e' via the view offset" },
+    },
+    {
+        /* The fused ord(s[i])'s OOB throws with the SUBSCRIPT's caret,
+         * exactly like the unfused TypeStr::subscript. */
+        "lever4b: ord(s[i]) OOB carets the subscript",
+        { "var s = \"abc\"; s += \"d\";",
+          "var n = ord(s[9]);" },
+        &typeid(OutOfBoundsEx), 13, 2, 18, 2,
+    },
+    {
+        /* A dyn-laundered arg declines the fusion (vm_len_kind == 0 /
+         * base_str unset) and keeps the generic builtin - results and
+         * runtime type errors are unchanged. */
+        "lever4b: dyn args keep the generic len/ord path",
+        { "var dyn d = \"xy\";",
+          "assert(len(d) == 2);",
+          "assert(ord(d[0]) == 120);",
+          "var dyn e = [1, 2, 3];",
+          "assert(len(e) == 3);" },
+    },
+    {
+        /* A user `func len` shadows the builtin (SymKind::global, never a
+         * DirectBuiltinCallExpr) - the vm_len_kind stamp must not misfire. */
+        "lever4b: a shadowing user len() wins over the native lowering",
+        { "func len(x) { return 42; }",
+          "var a = [1, 2];",
+          "assert(len(a) == 42);" },
+    },
+    {
+        /* ord() of a whole 1-char string (not a subscript) stays the
+         * builtin; wrong-length still throws its InvalidValueEx. */
+        "lever4b: whole-string ord keeps the builtin incl. its throws",
+        { "var s = \"x\"; s += \"\";",
+          "assert(ord(s) == 120);",
+          "var l = \"long\"; l += \"er\";",
+          "var n = ord(l);" },
+        &typeid(InvalidValueEx), 13, 4, 15, 4,
+    },
 
     {
         /* A template used as a VALUE (stored/passed, dispatched INDIRECTLY) is
@@ -15219,6 +15273,71 @@ static bool jit_invoke_direct_entry()
  * Also asserts the RESULT (int + float fields, bool form, H1 reuse loop),
  * so a silently-dead fast path (the H1 get<> trap's failure mode) or a
  * wrong offset both fail loudly. */
+/* Lever 4b: native len() (ArrLen/StrLen instead of the CallBuiltinV marshal)
+ * + the fused ord(s[i]) (OrdCharV). Proven by g_jit_op_run - each op's JIT
+ * helper bumps its slot, so a bump proves the NATIVE path executed, not just
+ * that the result was right (the interpreter produces the same result). */
+static bool jit_len_ord()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long a0 = g_jit_op_run[static_cast<size_t>(OpCode::ArrLen)];
+    const unsigned long s0 = g_jit_op_run[static_cast<size_t>(OpCode::StrLen)];
+    const unsigned long o0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::OrdCharV)];
+    if (!run({
+            "var a = [3, 1, 4, 1, 5];",
+            "var s = \"hello\";",
+            "append(a, 9);              # non-const, len can't fold",
+            "s += \"!\";",
+            "var n = 0;",
+            "for (var i = 0; i < len(a); i++) { n += a[i]; }",
+            "for (var i = 0; i < len(s); i++) { n += ord(s[i]); }",
+            "assert(n == 23 + 565);" }))
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::ArrLen)] <= a0) {
+        fprintf(stderr, "jit_len_ord: native ArrLen DID NOT RUN\n");
+        return false;
+    }
+    if (g_jit_op_run[static_cast<size_t>(OpCode::StrLen)] <= s0) {
+        fprintf(stderr, "jit_len_ord: native StrLen DID NOT RUN\n");
+        return false;
+    }
+    if (g_jit_op_run[static_cast<size_t>(OpCode::OrdCharV)] <= o0) {
+        fprintf(stderr, "jit_len_ord: native OrdCharV DID NOT RUN\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_struct_baked()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -17089,14 +17208,16 @@ static bool vm_codegen_shapes()
     const bool callv_ok = cv.callv == 1;
 
     /* 28) a migrated read-only builtin (value ABI) -> CallBuiltinV, not a
-     * fallback. `len(a)` with a non-const `a` (not folded). */
+     * fallback (`sum(a)` has no dedicated lowering). `len(a)` on a proven
+     * array lowers PAST the marshal to ArrLen (lever 4b). */
     VmOpCounts cbv;
     if (!codegen_counts({
             "var a = [1, 2, 3];",
-            "var dyn x = len(a);",
+            "var dyn x = sum(a);",
+            "var y = len(a);",
         }, cbv))
         return false;
-    const bool callbuiltinv_ok = cbv.callbuiltinv == 1;
+    const bool callbuiltinv_ok = cbv.callbuiltinv == 1 && cbv.arrlen == 1;
 
     /* 29) a MUTATING builtin over a slotted-identifier target (`append(a, x)`)
      * -> CallBuiltinLV (the lvalue ABI), not the EvalStmt fallback. */
@@ -18040,6 +18161,8 @@ static const std::vector<extra_check> extra_checks =
       jit_leaf_never_exits },
     { "jit: struct baked member read + planned ctor run INLINE natively",
       jit_struct_baked },
+    { "jit: native len() + fused ord(s[i]) run natively (lever 4b)",
+      jit_len_ord },
     { "jit: fragment-inline sync call runs (direct push + call rdx)",
       jit_sync_inline_call },
     { "jit: post-call entry stub re-enters native on interpreted return",

@@ -326,6 +326,12 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept;
 extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
                              LValue *dst) noexcept;
 
+/* Lever 4b - the fused ord(s[i]) body: TypeStr::subscript's wrap + bounds
+ * (the OOB conveys loc-less -> the fragment's exc-stamp), then the raw byte
+ * as int into dst. The base is compile-proven a non-opt string. */
+extern "C" int jit_ord_char(LValue *base_lv, int_type idx,
+                            LValue *dst) noexcept;
+
 /* model-flip (nativize-ops): the native SliceV `dst = base[start:end]` via the
  * runtime Type::slice (COW-registered sub-view). base/start/end/dst are frame
  * slots (start/end == -1 -> none); frame via g_current_ctx. Only TypeErrorEx

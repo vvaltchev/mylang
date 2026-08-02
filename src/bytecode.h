@@ -227,6 +227,18 @@ enum class OpCode : unsigned char {
     LoadStrChar,
 
     /*
+     * Lever 4b - the fused `ord(s[i])`: slot[target] = the i-th BYTE of the
+     * string in slot[target2] as an int (`a` = the int index operand). Runs
+     * TypeStr::subscript's exact negative-wrap + bounds check (OOB caret =
+     * the subscript's, via the loc side table), then reads the raw byte -
+     * no 1-char SharedStr, no builtin marshal. builtin_ord's other checks
+     * can't fire (the base is a PROVEN non-opt string - Subscript::base_str
+     * - and a subscript result is exactly 1 char), so OOB is the op's only
+     * throw.
+     */
+    OrdCharV,
+
+    /*
      * Native array-VALUE-element read `a[i]` into a temp slot (Phase 5, for a
      * nested subscript `a[i][j]`): `target2` = the (general) array slot, `a` =
      * the int index, `target` = the dst temp; `node` = the Subscript. Reads the
@@ -1143,7 +1155,7 @@ enum class OpCode : unsigned char {
     X(StoreLValueChainV) X(JumpUnlessIntCmp) X(FloatBin) \
     X(JumpUnlessFloatCmp) X(CmpIntV) X(CmpFloatV) \
     X(ForLoopStep) X(LoadElemInt) X(LoadElemFloat) \
-    X(LoadElemBool) X(ArrLen) X(StrLen) X(LoadStrChar) X(LoadElemValue) \
+    X(LoadElemBool) X(ArrLen) X(StrLen) X(LoadStrChar) X(OrdCharV) X(LoadElemValue) \
     X(LoadStructFieldInt) X(LoadStructFieldFloat) X(LoadStructElemV) \
     X(DictIterInit) X(DictIterNext) X(ForeachDynInit) X(ForeachDynNext) \
     X(UnpackElemInt) X(UnpackElemFloat) X(UnpackElemValue) \

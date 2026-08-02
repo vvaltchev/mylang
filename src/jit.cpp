@@ -955,6 +955,10 @@ static bool jit_op_eligible(const Instr &in)
      * originals - like the store ops. */
     case OpCode::SubscriptV:
         return true;
+    /* lever 4b: the fused ord(s[i]) via jit_ord_char (the proven-string byte
+     * read; its only throw - OOB - conveys with the op's exc-stamped caret). */
+    case OpCode::OrdCharV:
+        return true;
     /* model-flip (nativize-ops): a member READ base.member via jit_member (the
      * shared member_read_core; throws -> exit -> EnterNative re-raises). Not
      * op_fully_native (it can bail on a throw). */
@@ -2222,6 +2226,8 @@ pick_cached_slots(const Chunk &ck, size_t begin,
             bad(in.target);
             break;
         case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+        case OpCode::OrdCharV:      /* same shape: idx cache-aware (a VALUE
+                                     * arg to jit_ord_char), base/dst leas */
             /* the INDEX is read cache-aware (load_index_r9), so it stays a
              * countable int use - it is the loop counter, the slot most worth
              * pinning. dst/base are written/read in memory. */
@@ -4839,6 +4845,32 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::OrdCharV: {
+        /* dst = ord(base_str[idx]) via jit_ord_char(base_lv, idx, dst_lv) -
+         * SysV rdi = &slot[base], rsi = the int index VALUE (cache-aware
+         * load_operand), rdx = &slot[dst]. The only throw (OOB) conveys ->
+         * exc-stamp with the subscript's caret -> exit_pc re-raise. rdi is
+         * set LAST (it overwrites the slots-base pointer). */
+        const auto off = [](int slot) {
+            return static_cast<int32_t>(static_cast<long>(slot)
+                                        * static_cast<long>(sizeof(LValue)));
+        };
+        emit_call_prologue(e);
+        load_operand(e, RSI, in.a_is_lit(), in.a_lit(), in.a_slot());
+        e.lea(RDX, off(in.target));         /* rdx = &slot[dst] */
+        e.lea_rdi(off(in.target2));         /* rdi = &slot[base] (LAST) */
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_ord_char) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
+        const size_t j_ok = e.j8(0x74);     /* jz ok (0 = no throw) */
+        emit_exc_stamp(e, ck, old_pc);      /* cold: the subscript's caret */
+        e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
+        e.patch8(j_ok, e.pos());
+        return true;
+    }
+
     case OpCode::LoadMemberInt:
     case OpCode::LoadMemberFloat: {
         /* THE BAKED MEMBER READ (the 64_struct_create fix): try_member_
@@ -5601,6 +5633,7 @@ static bool op_fully_native(const Instr &in)
     case OpCode::UnaryV:
     case OpCode::CompoundV:
     case OpCode::SubscriptV:
+    case OpCode::OrdCharV:          /* only OOB, conveyed + exc-stamped */
     case OpCode::SliceV:
     case OpCode::DictLoadInt:
     case OpCode::DictLoadFloat:

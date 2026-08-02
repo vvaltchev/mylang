@@ -337,6 +337,29 @@ Per-call cost anchor: 10_recursion_deep = 2.7M real calls in 0.085s =
 ~31ns/call (frame_setup+leave+sync overhead) vs C++'s loop-converted
 ~0.4ns/iteration.
 
+## Lever 4b - native len() + fused ord(s[i]) (LANDED 2026-07-27)
+
+- `len(x)`, arg statically a non-opt array/str -> the existing ArrLen/StrLen
+  op instead of the CallBuiltinV marshal. Stamp: `CallExpr::vm_len_kind`
+  (inferencer annotate walk); builtin-ness proven at codegen
+  (DirectBuiltinCallExpr + the `len` uid) so the stamp alone is inert.
+  TRAP FOUND: the resolver's devirt swap builds DirectBuiltinCallExpr
+  field-by-field - a new CallExpr field MUST be copied there or it is
+  silently dropped (the first -vd run showed len still in builtin_calls).
+- `ord(s[i])` with `Subscript::base_str` (new stamp) + int index -> the new
+  OrdCharV op: TypeStr::subscript's wrap+bounds (OOB caret = the
+  subscript's), then the raw byte as int. No 1-char SharedStr per char, no
+  builtin call. Interpreter body ML_NOINLINE (vm_ord_char); JIT = the
+  SubscriptV convey shape (jit_ord_char), deletable.
+- Execution-proven: g_jit_op_run[ArrLen/StrLen/OrdCharV] asserts
+  (jit_len_ord); jit_ord_char = 44% of bench 30's new profile, the old
+  jit_call_builtin (186M Ir) gone.
+- Measured (callgrind Ir, same-session A/B, scale 1):
+  30_str_index_iterate 639.5M -> 109.4M (**-82.9%**),
+  29_str_slice_readonly 350.8M -> 72.7M (**-79.3%**), 31/47 neutral,
+  09/10/11 neutral. Suite (one run per binary): my/py geomean
+  0.112x -> 0.105x (**8.93x -> 9.53x** vs CPython).
+
 ## Sync postexit depth accounting (pre-existing bug, fixed 2026-07-27)
 
 Found by the clang-ASan lane during the lever 4b battery (pre-existing at

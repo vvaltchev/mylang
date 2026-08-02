@@ -721,6 +721,11 @@ public:
      * into an EmplaceStruct that coerces the ctor's arg values into the
      * flat struct array's bytes - no temporary StructObject. */
     const StructTypeDef *vm_struct_ctor_def = nullptr;
+    /* Lever 4b: `len(x)` with x statically a non-opt ARRAY (1) or STRING
+     * (2) - codegen (which separately proves the callee is the unshadowed
+     * len builtin via DirectBuiltinCallExpr) then emits the existing
+     * ArrLen/StrLen op instead of the CallBuiltinV marshal. 0 = no proof. */
+    unsigned char vm_len_kind = 0;
 
     /* Analogue for a BOXED (non-POD) struct construction: the inferencer stamps
      * the constructed `StructTypeDef *` here (null for POD - that uses
@@ -759,6 +764,7 @@ public:
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
+        c->vm_len_kind = vm_len_kind;
         c->vm_struct_boxed_def = vm_struct_boxed_def;
         c->vm_dyn_callee = vm_dyn_callee;
         c->tq_folded = tq_folded;
@@ -791,6 +797,7 @@ public:
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
+        c->vm_len_kind = vm_len_kind;
         c->vm_struct_boxed_def = vm_struct_boxed_def;
         c->vm_dyn_callee = vm_dyn_callee;
         return c;
@@ -818,6 +825,7 @@ public:
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
+        c->vm_len_kind = vm_len_kind;
         c->vm_struct_boxed_def = vm_struct_boxed_def;
         c->vm_dyn_callee = vm_dyn_callee;
         return c;
@@ -1497,6 +1505,9 @@ public:
      * only when this holds - the runtime type + COW + vivify are handled by
      * the shared Type::subscript path. */
     bool base_dict = false;
+    /* Lever 4b: `what` is statically a non-opt STRING - gates the fused
+     * ord(s[i]) lowering (OrdCharV: the byte read, no 1-char SharedStr). */
+    bool base_str = false;
 
     Subscript() : Construct("Subscript", false, ConstructType::subscript) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1510,6 +1521,7 @@ public:
         c->what = clone_as(what);
         c->index = clone_as(index);
         c->base_array = base_array;
+        c->base_str = base_str;
         c->base_dict = base_dict;
         return c;
     }

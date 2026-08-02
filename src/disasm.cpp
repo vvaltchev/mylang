@@ -1096,6 +1096,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "load.strchar " << D(in.target) << " = "
                 << D(in.target2) << "[" << RI(in.a(), false) << "]";
             break;
+        case OpCode::OrdCharV:
+            row << "ord.char     " << D(in.target) << " = ord("
+                << D(in.target2) << "[" << RI(in.a(), false) << "])";
+            break;
         case OpCode::StoreElemInt:
             row << "store.elem.i " << bref(in.target, in.target2) << "["
                 << RI(in.a(), false) << "] " << store_op(in.aop) << " "
