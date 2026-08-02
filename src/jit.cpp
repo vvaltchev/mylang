@@ -5724,39 +5724,105 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * run's LAST op needs none (the next pc is outside the run). Deletable
      * runs can't contain a call (not op_fully_native), so entries live in
      * kept runs only. */
-    std::vector<std::pair<size_t, size_t>> post_entries;  /* call pc, stub */
-    for (size_t r = 0; r < runs.size(); r++) {
-        if (deletable[r])
-            continue;
-        for (size_t p = runs[r].begin; p + 1 < runs[r].end; p++) {
-            const OpCode op = chunk.code[p].op;
-            if (op == OpCode::CallV || op == OpCode::CachedCallV
-                    || op == OpCode::CallValueV)
-                post_entries.push_back({ p, 0 });
+    /* Increment 2 (branch-target re-entry) UNIFIES the entry set: an
+     * entry pc is any KEPT-run pc where control RESUMES from interpreted
+     * flow - (a) the pc after an in-VM call op (a runtime ret_pc lands
+     * there), (b) an INTERPRETED branch's target (the post-exception /
+     * post-bail loop back edge - after one bail the old code walked the
+     * whole remaining loop interpreted, the 42/70-class gap), (c) a
+     * NATIVE branch's external exit (a resume too - the target op has
+     * not attempted execution, unlike a bail at its OWN pc). A RUN-HEAD
+     * target needs no insertion (the head EnterNative exists); an
+     * INTERIOR entry pc gets an EnterNative inserted DIRECTLY BEFORE its
+     * op + a stub. PushHandler/CatchTest targets are EXCLUDED from
+     * entry mapping: a handler's first op (CatchTest) is an exit-at-op
+     * native, so entering there would be enter->exit->reinterpret -
+     * pure overhead; the catch flow rejoins native at the back edge.
+     *
+     * THE DUAL REMAP: `remap` (bails, exit-at-own-pc, side tables) maps
+     * an entry pc to its ORIGINAL op - a bailed op must re-run
+     * interpreted, never re-enter (which would loop). `entry_remap`
+     * (branch-target fields, native external exits) maps a run head to
+     * its head EnterNative and an interior entry pc to its inserted
+     * EnterNative; every other pc is identical to `remap`. */
+    std::vector<std::pair<size_t, size_t>> entries;   /* entry pc, stub */
+    {
+        const auto interior_of_kept = [&](size_t t) -> bool {
+            for (size_t r = 0; r < runs.size(); r++)
+                if (!deletable[r] && t > runs[r].begin && t < runs[r].end)
+                    return true;
+            return false;
+        };
+        for (size_t r = 0; r < runs.size(); r++) {
+            if (deletable[r])
+                continue;
+            for (size_t p = runs[r].begin; p + 1 < runs[r].end; p++) {
+                const OpCode op = chunk.code[p].op;
+                if (op == OpCode::CallV || op == OpCode::CachedCallV
+                        || op == OpCode::CallValueV)
+                    entries.push_back({ p + 1, 0 });
+            }
         }
+        for (size_t p = 0; p < n; p++) {          /* branch targets */
+            const Instr &in = chunk.code[p];
+            switch (in.op) {
+            case OpCode::Jump:
+            case OpCode::JumpUnlessIntCmp:
+            case OpCode::JumpUnlessFloatCmp:
+            case OpCode::JumpUnlessTrueV:
+            case OpCode::JumpIfNotNoneV:
+            case OpCode::ForLoopStep:
+            case OpCode::DictIterNext:
+            case OpCode::ForeachDynNext:
+            case OpCode::JumpUnlessElemInt:
+            case OpCode::IntAddStep:
+            case OpCode::ForStepElemInt:
+                if (in.target >= 0
+                        && interior_of_kept(static_cast<size_t>(in.target)))
+                    entries.push_back(
+                        { static_cast<size_t>(in.target), 0 });
+                break;
+            default:                    /* PushHandler/CatchTest excluded */
+                break;
+            }
+        }
+        std::sort(entries.begin(), entries.end());
+        entries.erase(std::unique(entries.begin(), entries.end(),
+                                  [](const auto &a, const auto &b) {
+                                      return a.first == b.first;
+                                  }),
+                      entries.end());
     }
 
     std::vector<int> remap(n + 1);
+    std::vector<int> entry_remap(n + 1);
     {
         size_t r = 0, pc = 0, pe = 0;
         int np = 0;                               /* next NEW pc */
         while (pc <= n) {
             if (r < runs.size() && pc == runs[r].begin) {
                 const size_t b = runs[r].begin, en = runs[r].end;
-                const int en_pc = np++;           /* the EnterNative */
+                const int en_pc = np++;           /* the head EnterNative */
                 if (deletable[r]) {
-                    for (size_t p = b; p < en; p++)
+                    for (size_t p = b; p < en; p++) {
                         remap[p] = en_pc;         /* all -> EnterNative */
+                        entry_remap[p] = en_pc;
+                    }
                 } else {
                     for (size_t p = b; p < en; p++) {
-                        remap[p] = np++;          /* ops kept after it */
-                        if (pe < post_entries.size()
-                                && post_entries[pe].first == p) {
-                            np++;      /* the inserted post-call EnterNative
-                                        * (UNMAPPED - only a runtime ret_pc
-                                        * ever lands on it) */
+                        if (pe < entries.size()
+                                && entries[pe].first == p) {
+                            /* the inserted interior EnterNative sits
+                             * BEFORE the original: branches/resumes land
+                             * on it, bails land past it */
+                            entry_remap[p] = np++;
                             pe++;
+                        } else {
+                            entry_remap[p] =
+                                p == b ? en_pc : np;  /* head -> its
+                                                       * EnterNative */
                         }
+                        remap[p] = np++;          /* the original op */
                     }
                 }
                 pc = en;
@@ -5764,6 +5830,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 continue;
             }
             remap[pc] = np++;
+            entry_remap[pc] = remap[pc];
             pc++;
         }
     }
@@ -5829,8 +5896,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 e.cache.clear();
             }
             if (op_is_branch(in.op)) {
+                /* targets get entry_remap (an external exit is a RESUME -
+                 * enter the target run natively); the op's OWN pc (arg 4,
+                 * its bail) stays ordinary remap */
                 emit_branch(e, chunk, in, static_cast<uint32_t>(remap[pc]),
-                            begin, end, remap, fixups);
+                            begin, end, entry_remap, fixups);
             } else if (!emit_op(e, chunk, in,
                                 static_cast<uint32_t>(remap[pc]), jc, pc)) {
                 e.b.clear();
@@ -5859,9 +5929,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * ops write memory). Emitted after the run body (labels final, so
          * the jump is a direct backward rel32); unmarked in -vdj (the
          * decoder resyncs at the next fragment's marks). */
-        for (auto &pe : post_entries) {
-            if (pe.first < begin || pe.first >= end)
-                continue;
+        for (auto &pe : entries) {
+            if (pe.first <= begin || pe.first >= end)
+                continue;                /* interior entries only (a head
+                                          * uses its run's own entry) */
             pe.second = e.pos();
             e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
             if (run_has_float(chunk, begin, end))
@@ -5873,7 +5944,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                      reinterpret_cast<uint64_t>(&g_jit_entry_resume));
             e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
 #endif
-            const size_t tgt = label[pe.first + 1 - begin];
+            const size_t tgt = label[pe.first - begin];
             e.u8(0xE9);
             e.u32(static_cast<uint32_t>(
                 tgt - (e.pos() + 4)));            /* jmp (backward) */
@@ -5908,7 +5979,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     /* Rebuild the code vector with the EnterNative heads inserted and
      * every pc field remapped; then remap the pc-keyed side tables. */
     std::vector<Instr> nc;
-    nc.reserve(n + runs.size() + post_entries.size());
+    nc.reserve(n + runs.size() + entries.size());
     {
         size_t r = 0, pc = 0, pe = 0;
         while (pc < n) {
@@ -5926,6 +5997,20 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 r++;
                 if (del) { pc = rend; continue; }  /* drop the originals */
             }
+            /* an interior entry pc: the EnterNative (its stub) sits
+             * BEFORE the original - branch targets/ret_pcs land on it,
+             * bail exits land past it on the original (dual remap) */
+            if (pe < entries.size() && pc == entries[pe].first) {
+                Instr en;
+                en.op = OpCode::EnterNative;
+                Operand off;
+                off.is_lit = true;
+                off.lit_kind = Operand::LitKind::i;
+                off.lit = static_cast<int_type>(entries[pe].second);
+                en.set_a(off);
+                nc.push_back(en);
+                pe++;
+            }
             Instr in = chunk.code[pc];
             switch (in.op) {
             case OpCode::Jump:
@@ -5936,11 +6021,19 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             case OpCode::ForLoopStep:
             case OpCode::DictIterNext:
             case OpCode::ForeachDynNext:
-            case OpCode::CatchTest:
-            case OpCode::PushHandler:
             case OpCode::JumpUnlessElemInt:
             case OpCode::IntAddStep:
             case OpCode::ForStepElemInt:
+                /* control-flow targets = RESUMES -> the entry map (a run
+                 * head's EnterNative / an interior entry's inserted one) */
+                if (in.target >= 0 && static_cast<size_t>(in.target) <= n)
+                    in.target = entry_remap[in.target];
+                break;
+            case OpCode::CatchTest:
+            case OpCode::PushHandler:
+                /* exception-machinery targets stay on the ORIGINALS: a
+                 * handler's first op (CatchTest) is an exit-at-op native,
+                 * so entering it natively is enter->exit->reinterpret */
                 if (in.target >= 0 && static_cast<size_t>(in.target) <= n)
                     in.target = remap[in.target];
                 break;
@@ -5948,24 +6041,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 break;
             }
             nc.push_back(in);
-            /* the post-call resume entry: an EnterNative pointing at this
-             * call's stub, DIRECTLY after it - a runtime ret_pc (call pc
-             * + 1) lands here and re-enters native (see the entry-set
-             * comment above the remap). */
-            if (pe < post_entries.size() && pc == post_entries[pe].first) {
-                Instr en;
-                en.op = OpCode::EnterNative;
-                Operand off;
-                off.is_lit = true;
-                off.lit_kind = Operand::LitKind::i;
-                off.lit = static_cast<int_type>(post_entries[pe].second);
-                en.set_a(off);
-                nc.push_back(en);
-                pe++;
-            }
             pc++;
         }
-        ML_CHECK(pe == post_entries.size());
+        ML_CHECK(pe == entries.size());
     }
     chunk.code = std::move(nc);
 

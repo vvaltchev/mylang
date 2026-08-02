@@ -84,9 +84,31 @@ those classes in impact order.
    recursion depth bench -1.4% Ir; 10/11 flat; fib's apparent +2% was
    isolated to __strcmp_avx2 ALIGNMENT (identical 698,762 call counts,
    longer per-call path after relink - Ir-level layout noise, worth
-   knowing). INCREMENT 2 (handler-pc entries, the dual remap) next;
-   then native non-leaf calls (M5 proper: checked-return unwind +
-   growable native stack).
+   knowing). INCREMENT 2 LANDED same day - REVISED
+   from the design during implementation: the handler PC itself is the
+   WRONG entry point (CatchTest's native form is exit-at-op, so a
+   handler entry would be enter->exit->reinterpret, pure overhead); the
+   real gap was the BRANCH TARGET - after one bail/caught throw the
+   interpreted back edge targeted remap[head] = the ORIGINAL op, so the
+   loop never rejoined native. Increment 2 = branch-target re-entry via
+   THE DUAL REMAP: `entry_remap` (branch-target fields + native
+   external exits = RESUMES) maps a kept run's head to its head
+   EnterNative and an interior target to an inserted EnterNative+stub
+   (unified with increment 1's post-call entries - one insertion
+   mechanism, entry BEFORE the original); ordinary `remap` (bails,
+   exit-at-own-pc, side tables) keeps pointing at originals - a bailed
+   op must re-run interpreted, never re-enter (loop). PushHandler/
+   CatchTest targets DELIBERATELY stay ordinary. Proven by the -rt
+   counter test (>= 1 bump per post-catch iteration) + a -28.1% Ir
+   fold-proof try-loop bench (i1 331.9M -> 238.7M; the first bench
+   draft self-defeated - auto-pure + const arg folded the WHOLE loop at
+   compile time, unwind Ir identical on both sides, counter rightly 0 -
+   use runtime(n) in exception benches); 42_exceptions -4.2% Ir; 69 /
+   pure loops flat. Next: native non-leaf calls (M5 proper:
+   checked-return unwind + growable native stack); interior entries
+   also unlock RELAXING the single-entry deletion constraint (an
+   external interior branch can enter a stub instead of blocking
+   deletion) - recorded for M6.
    (original analysis follows) The single biggest class:
    10_recursion_deep (94x), 11_closure_counter (76x), 63_closures (53x),
    76_funcval (26x), 08/09, every call-heavy program.
