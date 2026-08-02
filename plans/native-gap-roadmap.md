@@ -53,9 +53,23 @@ those classes in impact order.
    (~430 Ir on bench 10) is vm_frame_leave's dst put (~29, inherent
    ref-release semantics), pop_window's ref-scan (~29, correctness),
    dispatch stepping, and the protocol's irreducible record/bind
-   work - the NEXT multiplier is the record-push INLINE in the
-   fragment + per-pc fragment entry points (post-call native resume),
-   an M5-class project, not a trim.
+   work - STEP 5 (the fragment-inline sync call)
+   LANDED 2026-07-26: CallV/CallValueV emit the depth guard + a flat
+   NOEXCEPT push (jit_sync_push_slot/_value -> {window, entry} in
+   rax:rdx; arity/overflow/non-fast_bind/dispatch-body are null-return
+   pre-checks, no try scaffolding) + a DIRECT `call rdx` into the callee
+   fragment (no jit_enter layer) + an inline sentinel test; cold tails =
+   the shared jit_sync_postexit (refactored out of jit_call_sync_core's
+   direct branch) or the full old helper. Chunk::sync_entry_off (set
+   post-JIT) is the direct-entry gate. Measured: 11 -2.2% Ir, 63 -1.4%,
+   76 -0.4%; 10 flat (depth>200 runs interpreted - the per-pc-entry
+   item), 34/35 flat (VmInvoker path - lever 2); wall neutral within
+   bench 11's +-5% swing. Finding both real bugs below outvalued the
+   delta: the step's test surfaced a WRONG-CODE call-arg ternary
+   miscompile + an inferencer null-type segfault (fixed in the two
+   commits preceding it). The remaining multiplier is per-pc fragment
+   entry points + native non-leaf calls (M5 proper: checked-return
+   unwind + growable native stack).
    (original analysis follows) The single biggest class:
    10_recursion_deep (94x), 11_closure_counter (76x), 63_closures (53x),
    76_funcval (26x), 08/09, every call-heavy program.

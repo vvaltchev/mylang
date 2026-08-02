@@ -46,6 +46,7 @@
 /* struct baked-fast-path execution proof (see jit.h) */
 extern "C" {
 unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
+unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 }
 #endif
 
@@ -1447,6 +1448,98 @@ static void emit_sync_call(Emitter &e, const Chunk &ck, const Instr &in,
     const size_t j_ok = e.j8(0x74);
     e.exit_pc(pc);
     e.patch8(j_ok, e.pos());
+}
+
+/*
+ * Lever 1 step 5 - the fragment-INLINE sync call. The hot shape emits:
+ * a depth guard, the flat noexcept push (jit_sync_push_slot/_value ->
+ * {window, entry} in rax:rdx), a DIRECT `call rdx` into the callee
+ * fragment (no jit_enter layer - machine code calling machine code, so
+ * the UBSan CFI concern does not apply), an inline sentinel compare, and
+ * only then the cold tails: jit_sync_postexit on a non-sentinel exit, or
+ * the FULL jit_call_sync* helper when any guard/push declines (depth cap,
+ * undefined/non-func callee, non-fast_bind, dispatch-path body, arity/
+ * overflow - the helper re-runs everything and its interpreted-op
+ * fallback produces the byte-identical throw). The depth counter is
+ * bumped inline ONLY around the direct callee call; the slow helper owns
+ * its own bookkeeping. Everything sits in ONE prologue/epilogue bracket
+ * (three epilogue copies - one per exit - because exit_pc's flush_cache
+ * must see the RELOADED cache regs, the bracket discipline the plain
+ * helper emit established).
+ */
+static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
+                                  const Instr &in, uint32_t pc,
+                                  size_t old_pc, const void *push_helper,
+                                  const void *slow_helper,
+                                  int_type callee_arg)
+{
+    Loc ls, le;
+    ck.loc_at(old_pc, ls, le);
+    const uint64_t site =
+        (static_cast<uint64_t>(static_cast<uint32_t>(ls.line)) << 32)
+        | static_cast<uint32_t>(ls.col);
+    const uint64_t depth_addr =
+        reinterpret_cast<uint64_t>(jit_addr_sync_depth());
+
+    emit_call_prologue(e);
+    /* depth guard: cmp dword [&g_jit_sync_depth], CAP; jge slow */
+    e.movabs(RAX, depth_addr);
+    e.u8(0x81); e.u8(0x38);
+    e.u32(static_cast<uint32_t>(jit_sync_depth_cap()));
+    const size_t j_slow1 = e.j32(0x7D);            /* jge slow */
+    /* the push: rdi = callee slot/temp, rsi = argbase, rdx = nargs,
+     * rcx = dst */
+    e.movabs(RDI, static_cast<uint64_t>(callee_arg));
+    e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+    e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+    e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+    e.call_relocs.push_back({ e.pos(), push_helper });
+    e.u8(0xE8); e.u32(0);
+    e.u8(0x48); e.u8(0x85); e.u8(0xC0);            /* test rax, rax */
+    const size_t j_slow2 = e.j32(0x74);            /* jz slow */
+    /* depth++; call the callee fragment (rdi = its window, entry in rdx) */
+    e.movabs(RCX, depth_addr);
+    e.u8(0xFF); e.u8(0x01);                        /* inc dword [rcx] */
+#ifdef TESTS
+    e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_sync_inline));
+    e.u8(0x48); e.u8(0xFF); e.u8(0x01);            /* inc qword [rcx] */
+#endif
+    e.mov_rr(RDI, RAX);
+    e.u8(0xFF); e.u8(0xD2);                        /* call rdx */
+    e.movabs(RCX, depth_addr);
+    e.u8(0xFF); e.u8(0x09);                        /* dec dword [rcx] */
+    /* sentinel? (JIT_RET_SENTINEL == (size_t)-1) */
+    e.u8(0x48); e.u8(0x83); e.u8(0xF8); e.u8(0xFF); /* cmp rax, -1 */
+    const size_t j_done1 = e.j32(0x74);            /* je done */
+    /* cold: the shared post-exit (raise/continuation/pending) */
+    e.mov_rr(RDI, RAX);
+    e.movabs(RSI, site);
+    e.call_relocs.push_back(
+        { e.pos(), reinterpret_cast<const void *>(jit_sync_postexit) });
+    e.u8(0xE8); e.u32(0);
+    e.u8(0x85); e.u8(0xC0);                        /* test eax, eax */
+    const size_t j_done2 = e.j32(0x74);            /* jz done */
+    emit_call_epilogue(e);
+    e.exit_pc(pc);                                 /* exception -> re-raise */
+    /* slow: the full helper (identical to the plain emit_sync_call tail) */
+    e.patch32_here(j_slow1);
+    e.patch32_here(j_slow2);
+    e.movabs(RDI, static_cast<uint64_t>(callee_arg));
+    e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+    e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+    e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+    e.movabs_r8(site);
+    e.call_relocs.push_back({ e.pos(), slow_helper });
+    e.u8(0xE8); e.u32(0);
+    e.u8(0x85); e.u8(0xC0);                        /* test eax, eax */
+    const size_t j_done3 = e.j32(0x74);            /* jz done */
+    emit_call_epilogue(e);
+    e.exit_pc(pc);
+    /* done: */
+    e.patch32_here(j_done1);
+    e.patch32_here(j_done2);
+    e.patch32_here(j_done3);
+    emit_call_epilogue(e);
 }
 
 /* Emit a call to the INT put helper: rdi = &frame->slots[slot], rsi = the
@@ -4410,22 +4503,26 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::CallValueV:
-        /* M5 inc 3: the indirect func-VALUE call (closure/lambda/func var -
-         * the callee was evaluated into the target2 temp). A non-func value
-         * bails to the interpreted op's NotCallableEx. */
-        emit_sync_call(e, ck, in, pc, old_pc,
+        /* M5 inc 3 + lever 1 step 5: the indirect func-VALUE call (closure/
+         * lambda/func var - the callee was evaluated into the target2 temp),
+         * now the fragment-INLINE shape (direct push + `call rdx`). A
+         * non-func value falls to the slow helper -> the interpreted op's
+         * NotCallableEx. */
+        emit_sync_call_inline(e, ck, in, pc, old_pc,
+                       reinterpret_cast<const void *>(jit_sync_push_value),
                        reinterpret_cast<const void *>(jit_call_sync_value),
-                       OpCode::CallValueV);
+                       static_cast<int_type>(in.target2));
         return true;
 
     case OpCode::CallV: {
         if (!callv_native_ok(in, jc)) {
-            /* M5: the SYNC call - jit_call_sync(callee_slot, argbase, nargs,
-             * dst, site) runs the callee to completion (its own fragments
-             * active inside); this fragment continues natively on 0. */
-            emit_sync_call(e, ck, in, pc, old_pc,
+            /* M5 + lever 1 step 5: the SYNC call, fragment-INLINE shape
+             * (direct push + `call rdx`; the full jit_call_sync helper is
+             * the cold fallback). */
+            emit_sync_call_inline(e, ck, in, pc, old_pc,
+                           reinterpret_cast<const void *>(jit_sync_push_slot),
                            reinterpret_cast<const void *>(jit_call_sync),
-                           OpCode::CallV);
+                           static_cast<int_type>(in.target2));
             return true;
         }
         /* #55 STEP 2.1: a NATIVE direct call (the run builder included it only
@@ -5842,6 +5939,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     }
     chunk.native.base = mem;
     chunk.native.len = len;
+    /* lever 1 step 5: a body that STARTS native is direct-`call`able by a
+     * sync caller fragment (jit_sync_push_* returns base + this). */
+    if (!chunk.code.empty() && chunk.code[0].op == OpCode::EnterNative)
+        chunk.sync_entry_off = static_cast<int64_t>(chunk.code[0].a_lit());
 }
 
 #else   /* !ML_JIT_SUPPORTED */

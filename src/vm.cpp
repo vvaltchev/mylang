@@ -4759,6 +4759,181 @@ static const Chunk &vm_sync_stop_chunk()
     return ck;
 }
 
+/*
+ * Lever 1 step 5 (plans/native-gap-roadmap.md) - the post-exit of a
+ * DIRECT-ENTERED sync callee fragment, shared by jit_call_sync_core's
+ * direct branch and the fragment-INLINE call path (which emits the push +
+ * the `call` + the sentinel test in machine code and calls this only on a
+ * non-sentinel exit). `r` = the exit pc (JIT_RET_BOUNDARY impossible - a
+ * sync record is non-boundary). The callee record is still TOP here (a
+ * bail does not pop), so the callee desc/chunk are read from it. Faithful
+ * EnterNative post-exit: a conveyed raise dispatches via vm_raise (caret
+ * from the callee's loc table; same-frame handler first, else the walk
+ * stops at the sync_stop record), a plain bail / dispatched handler
+ * continues INTERPRETED at the resolved pc; the walk's pending exception
+ * converts to g_vm_jit_exc with the baked call-site loc stamped (the lazy
+ * in-VM capture's loc_at would have produced it - the sentinel stop chunk
+ * is loc-less). Depth is the CALLER's business (already decremented).
+ */
+extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
+{
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    const FuncDescriptor *d = act.back_rec().desc;
+    const Chunk *cck = act.back_rec().run_chunk;
+    try {
+        const Chunk *c2 = cck;
+        size_t p2 = r;
+        bool cont = true;
+        if (g_vm_jit_raise) {
+            const int kind = g_vm_jit_raise;
+            g_vm_jit_raise = 0;
+            cont = vm_raise(c2, p2, act, ctx,
+                kind == JR_OOB
+                  ? std::unique_ptr<RuntimeException>(new OutOfBoundsEx())
+                  : kind == JR_DIV0
+                  ? std::unique_ptr<RuntimeException>(
+                        new DivisionByZeroEx())
+                  : std::unique_ptr<RuntimeException>(
+                        new InvalidValueEx("negative shift count")));
+        } else if (g_vm_jit_exc) {
+            cont = vm_raise(c2, p2, act, ctx, std::move(g_vm_jit_exc));
+        } else if (g_vm_jit_eptr) {
+            /* a nested sync callee's plain exception: convey upward as-is
+             * (the records above die with the invocation, exactly the
+             * dispatch path's rethrow contract). */
+            return 2;
+        }
+        if (cont)
+            vm_dispatch(*c2, ctx, act, p2);
+        /* !cont: the walk reached the sync record - popped, pending set;
+         * fall through to the conveyance below. */
+    } catch (Exception &e) {
+        /* A PLAIN exception from the interpreted continuation (a
+         * RuntimeException is walked inside vm_dispatch, never
+         * C++-escapes it): capture the callee frame + stamp the baked
+         * site, exactly what the walk + the pending path produce for a
+         * RuntimeException. */
+        vm_capture_desc_frame(e, d);
+        if (!e.backtrace.empty() && e.backtrace.back().desc == d
+                && !e.backtrace.back().call_site.line)
+            e.backtrace.back().call_site =
+                Loc(static_cast<int>(site_packed >> 32),
+                    static_cast<int>(site_packed & 0xffffffff));
+        if (auto *re = dynamic_cast<RuntimeException *>(&e))
+            g_vm_jit_exc.reset(re->clone());
+        else
+            g_vm_jit_eptr = std::current_exception();
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    if (g_vm_exc_pending) {
+        Exception &e = *g_vm_exc_pending;
+        if (!e.backtrace.empty() && e.backtrace.back().desc == d
+                && !e.backtrace.back().call_site.line)
+            e.backtrace.back().call_site =
+                Loc(static_cast<int>(site_packed >> 32),
+                    static_cast<int>(site_packed & 0xffffffff));
+        g_vm_jit_exc = std::move(g_vm_exc_pending);
+        return 2;
+    }
+    return 0;                              /* dst written by vm_frame_leave */
+}
+
+/*
+ * Lever 1 step 5 - the fragment-INLINE sync push: the flat NOEXCEPT twin
+ * of vm_frame_setup_lean for the emitted call path. Every throw shape is
+ * a PRE-CHECK returning {null, null} (the fragment falls back to the full
+ * jit_call_sync* helper, which re-runs everything and produces the
+ * byte-identical throw through the interpreted op): arity, stack
+ * overflow, a non-fast_bind callee, a body that does not START native
+ * (sync_entry_off < 0 - the dispatch path). On success the callee record
+ * is a sync_stop frame and the return is {callee window slots, the
+ * fragment entry address} (SysV: rax:rdx), so the caller fragment `call`s
+ * the callee DIRECTLY - no jit_enter layer, no core layering, no cache-
+ * probe branch, no try scaffolding.
+ */
+static ML_ALWAYS_INLINE JitSyncPush
+jit_sync_push_common(FuncObject &fo, int_type argbase, int_type nargs,
+                     int_type dst)
+{
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    const FuncDescriptor *d = fo.func;
+    const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
+    if (!cck || cck->sync_entry_off < 0 || !d->fast_bind)
+        return { nullptr, nullptr };
+    const size_t nparams = d->params.size();
+    if (static_cast<size_t>(nargs) > nparams
+            || nargs < static_cast<int_type>(d->min_args))
+        return { nullptr, nullptr };
+    const int_type total =
+        d->frame_size + static_cast<int_type>(cck->n_temps);
+    if (act.used + total > act.cap)
+        return { nullptr, nullptr };   /* overflow -> interpreted throw */
+    LValue *argrun = nargs ? &ctx.frame->at(argbase) : nullptr;
+    Frame *w = act.push_window(total, cck, /*boundary=*/false);
+    VmCallRec &rec = act.back_rec();
+    rec.ret_chunk = &vm_sync_stop_chunk();
+    rec.ret_pc = 1;                    /* setup's ret_pc + 1 with ret_pc 0 */
+    rec.dst = dst;
+    rec.desc = d;
+    rec.caller_captures = ctx.captures;
+    rec.sync_stop = 1;
+    ML_CHECK(!rec.cache_key);          /* pop reset it / fresh is null */
+    for (int_type i = 0; i < nargs; i++)
+        w->at(i).rebind(argrun[i].get());
+    for (size_t i = static_cast<size_t>(nargs); i < nparams; i++)
+        w->at(static_cast<int_type>(i)).rebind(EvalValue());
+    ctx.captures = &fo.capture_slots;
+    return { w->slots,
+             static_cast<const char *>(cck->native.base)
+                 + cck->sync_entry_off };
+}
+
+extern "C" JitSyncPush jit_sync_push_slot(int_type callee_slot,
+                                          int_type argbase, int_type nargs,
+                                          int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(CallV);
+    EvalContext *ctx = g_current_ctx;
+    if (!ctx->gfuncs->defined[callee_slot])
+        return { nullptr, nullptr };   /* undefined -> interpreted throw */
+    const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
+    if (!cv.is<intrusive_ptr<FuncObject>>())
+        return { nullptr, nullptr };   /* not callable -> interpreted */
+    return jit_sync_push_common(
+        *cv.get_ref<intrusive_ptr<FuncObject>>().get(),
+        argbase, nargs, dst);
+}
+
+extern "C" JitSyncPush jit_sync_push_value(int_type callee_temp,
+                                           int_type argbase, int_type nargs,
+                                           int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(CallValueV);
+    EvalContext *ctx = g_current_ctx;
+    const EvalValue &cv = ctx->frame->at(callee_temp).get();
+    if (!cv.is<intrusive_ptr<FuncObject>>())
+        return { nullptr, nullptr };   /* dyn non-func -> NotCallableEx */
+    return jit_sync_push_common(
+        *cv.get_ref<intrusive_ptr<FuncObject>>().get(),
+        argbase, nargs, dst);
+}
+
+/* the emitted depth guard's address (g_jit_sync_depth is TU-local) */
+void *jit_addr_sync_depth()
+{
+    return &g_jit_sync_depth;
+}
+
+int jit_sync_depth_cap()
+{
+    return JIT_SYNC_DEPTH_CAP;
+}
+
 static int
 jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
                    int_type dst, int_type site_packed, bool cached) noexcept
@@ -4796,68 +4971,27 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
     act.back_rec().sync_stop = 1;
 
     g_jit_sync_depth++;
+    /* DIRECT FRAGMENT ENTRY: when the callee body STARTS with an
+     * EnterNative (the common shape - a whole-native body is a bare
+     * `enter.nat`), hoist that first op out of vm_dispatch: enter the
+     * fragment (its head sets its own tag registers) and hand any
+     * non-sentinel exit to the SHARED jit_sync_postexit (which the
+     * fragment-INLINE call path also uses - lever 1 step 5). A fragment
+     * cannot C++-throw (machine-code frames are non-unwindable; every
+     * helper it calls conveys), so the entry sits OUTSIDE the try. */
+    if (cck->sync_entry_off >= 0) {
+        const size_t r =
+            jit_enter(static_cast<const char *>(cck->native.base)
+                          + cck->sync_entry_off,
+                      w->slots);
+        g_jit_sync_depth--;
+        if (r == JIT_RET_SENTINEL)     /* native ReturnV: frame popped,
+                                        * dst written - done */
+            return 0;
+        return jit_sync_postexit(r, site_packed);
+    }
     try {
-        /* DIRECT FRAGMENT ENTRY: when the callee body STARTS with an
-         * EnterNative (the common shape - a whole-native body is a bare
-         * `enter.nat`), hoist that first op out of vm_dispatch: enter the
-         * fragment via jit_enter (the fragment head sets its own tag
-         * registers) and replicate EnterNative's post-exit handling here.
-         * The 3-op-callee dispatch entry/exit + sentinel round-trip was
-         * the measured cost that made a tiny closure callee REGRESS
-         * (11_closure_counter +6% Ir); a fully-native callee (its ReturnV
-         * in the fragment -> jit_ret pops + writes dst + rets the
-         * sentinel) now runs with NO dispatch at all, and a bail/handler
-         * continuation pays ONE dispatch re-entry - what the dispatch
-         * path paid always. */
-        if (cck->native.base && !cck->code.empty()
-                && cck->code[0].op == OpCode::EnterNative) {
-            const size_t r =
-                jit_enter(static_cast<const char *>(cck->native.base)
-                              + cck->code[0].a_lit(),
-                          w->slots);
-            if (r == JIT_RET_SENTINEL) {   /* native ReturnV: frame popped,
-                                            * dst written - done */
-                g_jit_sync_depth--;
-                return 0;
-            }
-            /* r = an exit pc (JIT_RET_BOUNDARY is impossible - this record
-             * is non-boundary by construction). EnterNative's post-exit,
-             * faithfully: a conveyed raise dispatches via vm_raise (caret
-             * from the callee's loc table, same-frame handler first, else
-             * the walk stops at our sync_stop record); a plain bail (or a
-             * dispatched handler) continues INTERPRETED at the resolved
-             * pc via the start_pc dispatch re-entry. */
-            const Chunk *c2 = cck;
-            size_t p2 = r;
-            bool cont = true;
-            if (g_vm_jit_raise) {
-                const int kind = g_vm_jit_raise;
-                g_vm_jit_raise = 0;
-                cont = vm_raise(c2, p2, act, ctx,
-                    kind == JR_OOB
-                      ? std::unique_ptr<RuntimeException>(
-                            new OutOfBoundsEx())
-                      : kind == JR_DIV0
-                      ? std::unique_ptr<RuntimeException>(
-                            new DivisionByZeroEx())
-                      : std::unique_ptr<RuntimeException>(
-                            new InvalidValueEx("negative shift count")));
-            } else if (g_vm_jit_exc) {
-                cont = vm_raise(c2, p2, act, ctx, std::move(g_vm_jit_exc));
-            } else if (g_vm_jit_eptr) {
-                /* a nested sync callee's plain exception: convey upward
-                 * as-is (the records above die with the invocation,
-                 * exactly the dispatch path's rethrow contract). */
-                g_jit_sync_depth--;
-                return 2;
-            }
-            if (cont)
-                vm_dispatch(*c2, ctx, act, p2);
-            /* !cont: the walk reached our sync record - popped, pending
-             * set; fall through to the conveyance below. */
-        } else {
-            vm_dispatch(*cck, ctx, act);
-        }
+        vm_dispatch(*cck, ctx, act);
         g_jit_sync_depth--;
     } catch (Exception &e) {
         /* A PLAIN exception (a RuntimeException is walked inside

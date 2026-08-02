@@ -3453,24 +3453,6 @@ static const std::vector<test> tests =
       { "var a; a = 3; a = \"x\";" }, &typeid(TypeMismatchEx) },
 
     /* ---- ternary ?: and null-coalescing ?? ---- */
-    /* Incompatible-arm ternary -> dyn (a runtime variant), not a null
-     * static type. The null used to escape type_of into contribute's
-     * is_dyn - a SEGFAULT (pre-existing; found by the lever-1 step-5
-     * sync-call test). A plain var gets DynRequiredEx. */
-    { "ternary: incompatible arms make a dyn value (var dyn required)",
-      { "var i = 1;",
-        "var dyn q = i == 0 ? [1, 2] : 7;",
-        "assert(q == 7);",
-        "var dyn w = i == 1 ? \"s\" : [1];",
-        "assert(w == \"s\");" } },
-    { "ternary: incompatible arms + plain var is DynRequiredEx",
-      { "var i = 1;",
-        "var q = i == 0 ? [1] : 7;" },
-      &typeid(DynRequiredEx) },
-    { "coalesce: incompatible sides make a dyn value",
-      { "var opt a;",
-        "var dyn q = a ?? 7;",
-        "assert(q == 7);" } },
     /* A boxed ternary as a CALL ARGUMENT: compile_to_run_slot's
      * retarget-last-op rewrote ONLY the else arm's join MoveV (MoveV was
      * in op_writes_pure_target, but a join temp has TWO producers), so
@@ -3487,6 +3469,24 @@ static const std::vector<test> tests =
         "  return s;",
         "}",
         "assert(drive(runtime(4)) == 6);" } },
+    /* Incompatible-arm ternary -> dyn (a runtime variant), not a null
+     * static type. The null used to escape type_of into contribute's
+     * is_dyn - a SEGFAULT (pre-existing; found by the lever-1 step-5
+     * sync-call test's dyn-arg shape). A plain var gets DynRequiredEx. */
+    { "ternary: incompatible arms make a dyn value (var dyn required)",
+      { "var i = 1;",
+        "var dyn q = i == 0 ? [1, 2] : 7;",
+        "assert(q == 7);",
+        "var dyn w = i == 1 ? \"s\" : [1];",
+        "assert(w == \"s\");" } },
+    { "ternary: incompatible arms + plain var is DynRequiredEx",
+      { "var i = 1;",
+        "var q = i == 0 ? [1] : 7;" },
+      &typeid(DynRequiredEx) },
+    { "coalesce: incompatible sides make a dyn value",
+      { "var opt a;",
+        "var dyn q = a ?? 7;",
+        "assert(q == 7);" } },
     { "ternary: basic true / false branches",
       { "assert((1 > 0 ? 10 : 20) == 10);",
         "assert((1 < 0 ? 10 : 20) == 20);" } },
@@ -14754,6 +14754,71 @@ static bool jit_native_return()
 #endif
 }
 
+/* Lever 1 step 5: the fragment-INLINE sync call - g_jit_sync_inline is
+ * bumped by the EMITTED code right before the direct `call rdx` into the
+ * callee fragment, so a bump proves the inline path (guards + flat push +
+ * direct call) actually executed - not the jit_call_sync fallback (which
+ * bumps only g_jit_op_run). Covers both the global-slot (CallV) and the
+ * func-value (CallValueV) shapes, plus a throw INSIDE a sync callee
+ * caught by the caller (the jit_sync_postexit conveyance). */
+static bool jit_sync_inline_call()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long b0 = g_jit_sync_inline;
+    if (!run({
+            /* a closure counter (CallValueV; not inlinable) + a throwing
+             * dyn callee (postexit conveyance through the caller's catch) */
+            "func mk(int st) { var c = st; return func [c] () { c += 1;",
+            "  return c; }; }",
+            "func lf(dyn x) { return len(x); }",
+            "func drive(int n) {",
+            "  var cnt = mk(5);",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    s += cnt();",
+            "    try { s += lf(runtime(i % 2 == 0 ? [1, 2] : 7)); }",
+            "    catch (TypeErrorEx) { s += 100; }",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(drive(runtime(4)) == 234);" }))
+        return false;
+    if (g_jit_sync_inline <= b0) {
+        fprintf(stderr, "jit_sync_inline_call: inline path DID NOT RUN\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 /* Struct BAKED-LAYOUT fast paths (the 64_struct_create fix): the member
  * read and the planned ctor emit INLINE machine code whose execution is
  * proven by g_jit_member_fast / g_jit_ctor_fast - counters bumped by the
@@ -17582,6 +17647,8 @@ static const std::vector<extra_check> extra_checks =
       jit_leaf_never_exits },
     { "jit: struct baked member read + planned ctor run INLINE natively",
       jit_struct_baked },
+    { "jit: fragment-inline sync call runs (direct push + call rdx)",
+      jit_sync_inline_call },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",

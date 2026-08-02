@@ -156,6 +156,23 @@ extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
  * per-frame pure cache first; a miss's key rides the callee record and is
  * stored by the normal return pop); jit_call_sync_value is CallValueV (the
  * callee VALUE sits in a frame temp, not a global slot). */
+/* Lever 1 step 5 - the fragment-INLINE sync call (see vm.cpp). The push
+ * returns {callee window slots, callee fragment entry} in rax:rdx (SysV
+ * two-pointer struct); {null, null} = any cold shape -> the fragment falls
+ * back to the full jit_call_sync* helper below. jit_sync_postexit handles
+ * a direct-entered callee's non-sentinel exit (shared with the helper
+ * path's direct branch). */
+struct JitSyncPush { LValue *win; const void *entry; };
+extern "C" JitSyncPush jit_sync_push_slot(int_type callee_slot,
+                                          int_type argbase, int_type nargs,
+                                          int_type dst) noexcept;
+extern "C" JitSyncPush jit_sync_push_value(int_type callee_temp,
+                                           int_type argbase, int_type nargs,
+                                           int_type dst) noexcept;
+extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept;
+void *jit_addr_sync_depth();
+int jit_sync_depth_cap();
+
 extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
                              int_type nargs, int_type dst,
                              int_type site_packed) noexcept;
@@ -614,6 +631,7 @@ extern unsigned long g_jit_op_run[];
  * EMITTED inline code itself (the helpers bump g_jit_op_run), so a test can
  * prove the inline path ran, not just the slow helper. */
 extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
+extern "C" unsigned long g_jit_sync_inline;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
