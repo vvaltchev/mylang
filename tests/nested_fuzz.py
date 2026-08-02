@@ -69,6 +69,12 @@ class Gen:
         # a stack of loop variables currently in scope (for use in expressions)
         self.loopvars = []
         self.tempcount = 0
+        # RANDOM helper functions: [(name, arity)], generated per program.
+        # They exist for the BYTECODE SPLICE, which only ever sees non-main
+        # chunks - a call in main's rep loop can never be spliced, so the
+        # generated functions have to call EACH OTHER for the fuzzer to
+        # reach it at all. See emit_random_funcs.
+        self.rfuncs = []
 
     # ---- expression builders (every result is a non-negative int < MOD).
     # NOTE: expr()/operand() return a string used VERBATIM for BOTH engines -
@@ -130,6 +136,14 @@ class Gen:
             if fn == "gcd":
                 return "gcd(%s %% 50, %s %% 50)" % (self.leaf(), self.leaf())
             return "comp(%s)" % self.leaf()
+        if d < 2 and r < 0.86 and self.rfuncs:
+            # a RANDOM generated helper (the splice's shapes). Main is never
+            # spliced itself, but these calls make the generated functions
+            # actually RUN, so a bad splice inside one shows up as a wrong
+            # value here.
+            name, arity = self.rng.choice(self.rfuncs)
+            return "%s(%s)" % (name,
+                               ", ".join([self.leaf() for _ in range(arity)]))
         return self.leaf()
 
     def emit_helpers(self):
@@ -150,6 +164,80 @@ class Gen:
         self.emit("", "    return gcd(b, a % b)")
         self.emit("func comp(x) => mix(x, x, 2);",
                   "def comp(x): return mix(x, x, 2)")
+
+    def emit_random_funcs(self):
+        """RANDOM multi-function programs, for the bytecode splice.
+
+        The four fixed helpers above are one shape each; the splice's risk is
+        in SLOT REMAPPING (a callee's frame rebased over its caller's), the
+        multi-return join and arg binding, and those need many shapes with
+        differing arities, local counts and control flow.
+
+        Rules that keep every body both equivalent and spliceable:
+          - `while`, never `for`: a counted loop fuses to IntAddStep, which
+            the splice's whitelist excludes, so a `for` body would only ever
+            test the DECLINE path;
+          - callee i may call callee j only for j < i - no cycles, so every
+            body terminates without a depth argument;
+          - the call is `var t = rfj(..);`, never `return rfj(..);` - a tail
+            call is taken by the AST inliner first and no CallV survives;
+          - every value stays non-negative and < MOD, the fuzzer's
+            equivalence subset.
+        """
+        n = self.rng.randint(2, 4)
+        for i in range(n):
+            arity = self.rng.randint(1, 3)
+            name = "rf%d" % i
+            ps = ["p%d" % k for k in range(arity)]
+            self.emit("func %s(%s) {" % (name, ", ".join(ps)),
+                      "def %s(%s):" % (name, ", ".join(ps)))
+            # a local seeded from the params
+            seed = " + ".join(ps) if arity > 1 else ps[0]
+            self.emit("  var v = (%s) %% %d;" % (seed, MOD),
+                      "    v = (%s) %% %d" % (seed, MOD))
+            # optionally consume an EARLIER function (non-tail, so the call
+            # survives to codegen as a real CallV)
+            if i > 0 and self.rng.random() < 0.7:
+                j = self.rng.randrange(i)
+                jar = self.rfuncs[j][1]
+                args = ", ".join(["(v + %d) %% %d" % (k, MOD)
+                                  for k in range(jar)])
+                self.emit("  var t = rf%d(%s);" % (j, args),
+                          "    t = rf%d(%s)" % (j, args))
+                self.emit("  v = (v + t) %% %d;" % MOD,
+                          "    v = (v + t) %% %d" % MOD)
+            # a bounded while loop - the shape the splice actually takes
+            iters = self.rng.randint(1, 4)
+            self.emit("  var i = 0;", "    i = 0")
+            self.emit("  while (i < %d) {" % iters,
+                      "    while i < %d:" % iters)
+            mul = self.rng.randint(1, 5)   # ONCE - both sides must match
+            self.emit("    v = (v + i * %d + 1) %% %d;" % (mul, MOD),
+                      "        v = (v + i * %d + 1) %% %d" % (mul, MOD))
+            self.emit("    i++;", "        i += 1")
+            self.emit("  }", "")
+            # an EARLY return roughly half the time - two ReturnVs, so the
+            # splice has to build a real join
+            if self.rng.random() < 0.5:
+                thr = self.rng.randint(10, 90)
+                self.emit("  if (v > %d) return (v + 3) %% %d;" % (thr, MOD),
+                          "    if v > %d: return (v + 3) %% %d" % (thr, MOD))
+            self.emit("  return v;", "    return v")
+            self.emit("}", "")
+            self.rfuncs.append((name, arity))
+
+        # CALL EVERY ONE at least once, from main, with fixed args.
+        #
+        # Without this the chain does not exist at all: an un-called
+        # function is an un-instantiated TEMPLATE, which is excluded from
+        # codegen entirely - so rf2 -> rf1 -> rf0 produced exactly one
+        # compiled chunk (rf0, the only one main happened to call) and the
+        # splice saw nothing. Folding the results into s0 keeps them in the
+        # final aggregation, so a wrong value cannot be silently dropped.
+        for i, (name, arity) in enumerate(self.rfuncs):
+            args = ", ".join([str(3 + 2 * k + i) for k in range(arity)])
+            self.emit("s0 = (s0 + %s(%s)) %% %d;" % (name, args, MOD),
+                      "s0 = (s0 + %s(%s)) %% %d" % (name, args, MOD))
 
     def expr(self, d=0):
         """A short non-negative expression `(...) % MOD`, MyLang/Python-identical.
@@ -420,6 +508,7 @@ class Gen:
                   "var s4 = 4; var s5 = 5; var s6 = 6;",
                   "s0 = 0; s1 = 1; s2 = 2; s3 = 3; s4 = 4; s5 = 5; s6 = 6")
         self.emit_helpers()
+        self.emit_random_funcs()
         self.emit("for (var rep = 0; rep < %d; rep++) {" % reps,
                   "for rep in range(%d):" % reps)
         self.build(0, "  ", "    ")
@@ -491,8 +580,8 @@ def main():
                     help="pick a fresh random base seed each run (for casual "
                          "--show inspection); the chosen seed is printed so you "
                          "can reproduce it with --seed")
-    ap.add_argument("--engines", default="tw,vm,py,noopt",
-                    help="comma list of engines to compare: tw,vm,py,noopt "
+    ap.add_argument("--engines", default="tw,vm,py,noopt,bi",
+                    help="comma list of engines to compare: tw,vm,py,noopt,bi "
                          "(noopt re-runs both engines with every AST "
                          "transform disabled - the only oracle for an "
                          "optimizer that rewrites the tree)")
@@ -573,6 +662,15 @@ def main():
         # the same wrong tree. Re-running with every transform OFF is the
         # only oracle, and random deep-nested programs are where a transform's
         # gates get combinations no hand-written test covers.
+        # THE BYTECODE SPLICE (-bi). It is opt-in and default-off, so no
+        # other lane exercises it; and it only ever transforms non-main
+        # chunks, which is why the generator emits functions that call each
+        # other. Both JIT states: a splice bug can live in the bytecode it
+        # produces or in how the JIT consumes it.
+        if "bi" in engines:
+            results["vm-bi"] = run([args.mylang, "-vm", "-bi"], my_path)
+            results["vm-bi-nj"] = run([args.mylang, "-vm", "-bi", "-nj"],
+                                      my_path)
         if "noopt" in engines:
             results["vm-noopt"] = run([args.mylang, "-vm",
                                        "--no-opt", "all"], my_path)
