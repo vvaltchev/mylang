@@ -901,6 +901,7 @@ void write_chunk(Writer &w, const Chunk &c)
     w.u32v(static_cast<uint32_t>(c.n_temps));
     w.u32v(static_cast<uint32_t>(c.n_dict_iters));
     w.u32v(static_cast<uint32_t>(c.n_dyn_iters));
+    w.u32v(static_cast<uint32_t>(c.n_trys));          /* #78 (v7) */
 
     w.u32v(static_cast<uint32_t>(c.ref_slots.size()));
     for (int32_t s : c.ref_slots)
@@ -1188,6 +1189,7 @@ void read_chunk(Reader &r, Chunk &c)
     c.n_temps = static_cast<int>(static_cast<int32_t>(r.u32v()));
     c.n_dict_iters = static_cast<int>(static_cast<int32_t>(r.u32v()));
     c.n_dyn_iters = static_cast<int>(static_cast<int32_t>(r.u32v()));
+    c.n_trys = static_cast<int>(static_cast<int32_t>(r.u32v()));
 
     uint32_t n = r.u32v();
     c.ref_slots.reserve(n);

@@ -2,7 +2,7 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 6.  This document describes the on-disk image exhaustively:
+Format version 7.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
 
 It is the specification of what `mylang -c FILE` writes and what `mylang
@@ -322,6 +322,10 @@ Each chunk is:
     u32   n_temps                   (signed)
     u32   n_dict_iters              (signed)
     u32   n_dyn_iters               (signed)
+    u32   n_trys                    (signed) try-REGION count: sizes the
+                                    frame's per-region exception-state
+                                    slice, exactly as n_dict_iters sizes
+                                    the dict-iterator slice (v7)
     N x u32  ref_slots              (signed) slots that may hold a reference
     N x value consts
     N x LocEntry locs               9.2
@@ -860,6 +864,9 @@ Measured on samples/, image bytes versus source bytes:
     gcd            1809    1580   0.87x
     shopping       2700    4327   1.60x
     phonebook      2908    6506   2.24x
+
+Version 7 added the chunk's try-region count (one u32) for the
+per-region exception state.
 
 Version 1 of the format was 4-6x the source; the five encoding changes since
 (a source reference instead of the embedded text, compact instructions, the

@@ -108,8 +108,15 @@ ptrdiff_t jit_off_act_handlers();       /* VmActivation::handlers */
 ptrdiff_t jit_off_act_records();        /* VmActivation::records */
 ptrdiff_t jit_off_act_rec_n();          /* VmActivation::rec_n */
 ptrdiff_t jit_sizeof_vm_rec();          /* sizeof(VmCallRec) */
-ptrdiff_t jit_off_rec_pend();           /* VmCallRec::pend */
-extern "C" void jit_push_handler_grow(int_type catch_pc) noexcept;
+/* #78: the per-try-region pend/exc addressing (VmPendState, vm.cpp) -
+ * pends[rec.pend_base + region], entry stride jit_sizeof_pend_state(). */
+ptrdiff_t jit_off_act_top_rec();
+ptrdiff_t jit_off_act_pends();
+ptrdiff_t jit_off_rec_pend_base();
+ptrdiff_t jit_sizeof_pend_state();
+ptrdiff_t jit_off_pend_state_pend();           /* VmCallRec::pend */
+extern "C" void jit_push_handler_grow(int_type catch_pc,
+                                      int_type region) noexcept;
 
 /* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
 class EvalContext;
@@ -195,7 +202,8 @@ struct JitPushLayout {
     ptrdiff_t desc_params, desc_frame_size, desc_fast_bind;
     size_t param_desc_size;
     /* Chunk */
-    ptrdiff_t ck_n_temps, ck_n_dict_iters, ck_n_dyn_iters, ck_sync_entry;
+    ptrdiff_t ck_n_temps, ck_n_dict_iters, ck_n_dyn_iters, ck_n_trys,
+              ck_sync_entry;
     /* FuncObject */
     ptrdiff_t fo_func, fo_capture_slots;
     /* singletons/constants */

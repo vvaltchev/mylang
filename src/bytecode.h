@@ -1454,6 +1454,19 @@ struct Chunk {
     int n_dict_iters = 0;
 
     /*
+     * #78 step 2: the number of TRY REGIONS in this chunk. Each `try` gets a
+     * chunk-static monotonic REGION ID baked into its exception ops
+     * (PushHandler/SetPend/EndFinally/CatchTest/Reraise/Rethrow), indexing
+     * the frame's slice of the activation's per-region {exc, pend} stack -
+     * the nesting-correct home of the caught exception a `rethrow`
+     * re-raises and the pending action a `finally` resumes (one shared
+     * per-record pair CLOBBERED under same-frame nesting; see VmPendState,
+     * vm.cpp). Sizes the slice exactly like n_dict_iters sizes the
+     * dict-iterator slice. Serialized (a .myv restores it).
+     */
+    int n_trys = 0;
+
+    /*
      * 2026-07-18 profile #2: the slots of THIS chunk's frame that can EVER
      * hold a NON-TRIVIAL (>= t_str, refcounted) value - the param slots
      * (minus int/float-coerced ones) plus every dst of a non-scalar-writing

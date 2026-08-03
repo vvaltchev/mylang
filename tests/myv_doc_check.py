@@ -94,7 +94,7 @@ def chunk(r):
         if flags & (1 << 11): r.u8()              # opflags
         for w in (wt, wt2, wa, wb):
             if w: r.p += 1 << (w - 1)
-    for _ in range(4): r.u32()                    # slot_count..n_dyn_iters
+    for _ in range(5): r.u32()                    # slot_count..n_trys
     r.nx(r.u32)                                   # ref_slots
     r.nx(lambda: value(r))                        # consts
     for _ in range(r.u32()):                      # 9.2 delta loc table

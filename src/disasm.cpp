@@ -863,7 +863,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "throw        " << D(in.a_slot());
             break;
         case OpCode::PushHandler:
-            row << "try.push     catch=L" << in.target;
+            row << "try.push     catch=L" << in.target
+                << "  region=" << in.a_lit();
             break;
         case OpCode::PopHandler:
             row << "try.pop";
@@ -879,23 +880,24 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             }
             if (in.target2 >= 0)
                 row << " as " << reg(chunk, in.target2);
-            row << " -> L" << in.target;
+            row << " -> L" << in.target << "  region=" << in.b_lit();
             break;
         }
         case OpCode::Reraise:
-            row << "reraise";
+            row << "reraise      region=" << in.a_lit();
             break;
         case OpCode::Rethrow:
-            row << "rethrow";
+            row << "rethrow      region=" << in.a_lit();
             break;
         case OpCode::SetPend:
             /* Only the shared finally's exits: normal or reraise (a flow op
              * inlines its own finally, so it never sets a pending action). */
             row << "set.pend     "
-                << (in.target == 0 ? "normal" : "reraise");
+                << (in.target == 0 ? "normal" : "reraise")
+                << "  region=" << in.a_lit();
             break;
         case OpCode::EndFinally:
-            row << "end.finally";
+            row << "end.finally  region=" << in.a_lit();
             break;
 
         case OpCode::IntBin:
