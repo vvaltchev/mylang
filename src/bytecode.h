@@ -1280,7 +1280,15 @@ struct Operand {
 struct Instr {
     OpCode op;
     Op aop = Op::invalid;   /* IntBin: arith op; JumpUnlessIntCmp: compare op */
-    /* a: bit0 = is_lit, bits1-2 = lit_kind; b: bit3 = is_lit, bits4-5. */
+    /* a: bit0 = is_lit, bits1-2 = lit_kind; b: bit3 = is_lit, bits4-5.
+     * bit6 (C1c): the ELEM-BOOL hint on StoreElemInt - codegen proved
+     * the stored value a BOOL literal, so the base is (almost always)
+     * an array<bool>; the JIT's hoist pick guards kind bools instead of
+     * ints. ADVISORY only: a wrong hint fails the runtime kind guard
+     * and the loop runs its cold twin - semantics never depend on it.
+     * Rides the stored opflags byte in a .myv unchanged (the byte was
+     * always stored whole); set_a/set_b mask only their own bits.
+     * bit7 remains free. */
     uint8_t opflags = 0;
     int target = -1;    /* Jump dest; IntBin dst
                          * slot; JumpUnlessIntCmp jump dest */
@@ -1292,6 +1300,8 @@ struct Instr {
     int64_t pb = -1;
 
     bool a_is_lit() const { return opflags & 1; }
+    bool elem_bool_hint() const { return opflags & 0x40; }
+    void set_elem_bool_hint() { opflags |= 0x40; }
     bool b_is_lit() const { return opflags & 8; }
     Operand::LitKind a_kind() const {
         return static_cast<Operand::LitKind>((opflags >> 1) & 3);

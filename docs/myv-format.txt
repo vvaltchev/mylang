@@ -403,6 +403,13 @@ integer literal -1.  That is not ambiguous on disk: the field is simply not
 stored and the reader's default restores exactly -1, while `opflags`
 independently records whether the operand is a literal.  Nothing is lost.
 
+OPFLAGS BIT 6 (C1c, 2026-08-03) is the ELEM-BOOL hint on StoreElemInt - an
+ADVISORY compile-time note (the JIT's hoist pick guards the bools kind
+instead of ints; a wrong hint merely fails a runtime guard).  It rides the
+stored opflags byte with no format change: the byte was always stored whole,
+and an older reader simply carries the bit through untouched.  Bit 7 remains
+free.
+
 This is NOT in-format compression: no dictionary, no entropy coding, no
 bit-level packing of values, no decoder state.  Each field is a plain integer
 at a byte boundary, decoded in O(1), and two compiles remain byte-identical.

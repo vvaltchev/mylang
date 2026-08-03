@@ -115,14 +115,35 @@ tier serves them - and g_jit_hoist 0): their arrays are BOOLS
 INTS (the Instr does not carry the element kind - StoreElemInt serves
 both), and the runtime kind guard sends every entry to the cold twin.
 
-**C1c - the BOOLS kind (next).** Two candidate designs: (a) a second
-HOT copy guarded `kind == bools` (byte stride, movzx/byte-store forms;
-region text grows to 3 copies), or (b) a compile-time element-kind
-stamp on StoreElemInt/LoadElemInt (codegen KNOWS the proven kind when
-it emits; one operand bit, no text growth, touches the .myv encoding).
-(b) is cleaner; scope both against 43/56 before choosing. The
-hoisted-COMPOUND store form is the other listed follow-up (compound
-ops keep the ordinary tier inside a region today).
+**C1c - the BOOLS kind. LANDED 2026-08-03, design (b)** (the
+maintainer's pick): a compile-time ELEM-BOOL hint in the previously
+free opflags bit 6 of StoreElemInt, stamped by codegen when a PLAIN
+bool-LITERAL store compiles - the checker rejects int->bool, so bool
+arrays only ever receive bool values, and the one mislabel (#96's bool
+into an int-joined array) fails the runtime kind guard and goes cold:
+the hint is ADVISORY, semantics never depend on it. No .myv version
+bump: the opflags byte was always stored whole, so the bit rides. The
+pick maps a hinted store to kind 3 (bools): the preheader guards
+kind_bools, the count is BYTES (no sar - like general), and the
+hoisted store is a BYTE write (`mov [r10+r9], dil` - the value is
+always a 0/1 literal, since only literal bool values reach
+StoreElemInt).
+
+MEASURED: 43_sieve **-45.3%**/scale (150.4M -> 82.3M), 56_sieve_bool
+**-44.3%** (216.9M -> 120.7M); 46/14 byte-identical. The stride was
+sabotage-verified with maximum volume (8-byte stores into the byte
+array: ASan SEGV).
+
+Remaining follow-ups on the C1 family, in value order:
+  - the hoisted-COMPOUND store form (compound ops keep the ordinary
+    tier inside a region);
+  - the ELEM-BOOL hint on the READ side (LoadElemInt has no value
+    signal; a bool store + read of one base in one region is a kind
+    CONFLICT today - pinned by a test - and the read-only bool loop
+    stays cold). Needs an inferencer stamp (`Subscript` elem-kind), or
+    the same bit set from the base's static type at the read site;
+  - a bool-array read via the fusions (JumpUnlessElemInt) is not a
+    candidate op at all.
 
 ### C2 - widen the register cache beyond int slots
 

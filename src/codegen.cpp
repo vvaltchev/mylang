@@ -4629,9 +4629,11 @@ struct Codegen {
                      * 0/1. A bool VAR / comparison RHS compiles via compile_int_
                      * expr (th==i). rhs-before-index order is preserved. */
                     bool vok;
+                    bool bool_rhs = false;
                     if (const LiteralBool *lb =
                             dynamic_cast<const LiteralBool *>(e->rvalue.get())) {
                         val = int_lit(lb->bval() ? 1 : 0);
+                        bool_rhs = true;
                         vok = true;
                     } else {
                         vok = compile_int_expr(e->rvalue.get(), val, ops);
@@ -4655,6 +4657,14 @@ struct Codegen {
                         in.set_a(idx);
                         in.set_b(val);
                         in.aop = aop;
+                        /* C1c: a plain bool-LITERAL store marks the base
+                         * (almost always) an array<bool> - the checker
+                         * rejects int->bool, so bool arrays only ever
+                         * receive bool values; the one mislabel (#96's
+                         * bool into an int-joined array) fails the JIT's
+                         * runtime kind guard and goes cold - advisory. */
+                        if (bool_rhs && aop == Op::invalid)
+                            in.set_elem_bool_hint();
                         ops.push_back(in);
                         return true;
                     }

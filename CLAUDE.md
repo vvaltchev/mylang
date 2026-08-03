@@ -1324,10 +1324,21 @@ loop). Measured: 14_array_subscript a further **-29.0%**/iter
 STILL do not move and the mechanism is live-counter-proven (the
 ordinary #92 tier serves their 3.1M stores; g_jit_hoist 0): their
 arrays are BOOLS and the pick stamps StoreElemInt candidates kind
-INTS - the Instr does not carry the element kind. **C1c** (the bools
-kind: a second hot copy, or - cleaner - a compile-time kind stamp on
-the store/load ops) and the hoisted-COMPOUND store form are the
-scoped follow-ups; C2/C3 per the plan. The C1b sabotages each
+INTS - the Instr does not carry the element kind. **C1c LANDED (same
+day, design b - maintainer's pick):** a compile-time ELEM-BOOL hint in
+StoreElemInt's previously free opflags bit 6, stamped when a PLAIN
+bool-LITERAL store compiles (the checker rejects int->bool, so the one
+mislabel - #96's bool into an int-joined array - just fails the kind
+guard and goes cold: ADVISORY, semantics never depend on it; no .myv
+bump - the opflags byte was always stored whole). The pick maps a
+hinted store to kind 3: the preheader guards kind_bools, the count is
+BYTES, the hoisted store is a byte write of dil (only 0/1 LITERALS
+reach StoreElemInt on bools). Measured: 43_sieve **-45.3%**/scale,
+56_sieve_bool **-44.3%**; 46/14 byte-identical; the stride sabotage
+(8-byte stores into the byte array) died as an ASan SEGV. Follow-ups
+per the plan: the hoisted-COMPOUND store form, the read-side bool hint
+(a bool store + read of one base in one region is a kind CONFLICT
+today, pinned by a test), then C2/C3. The C1b sabotages each
 required defeating a fresh shape-eater first: a bare `runtime()`
 argument is DYN, which lowers `arr[j] = n` to StoreElemValue - no
 candidate, a vacuous case - `int(runtime(5))` keeps the store

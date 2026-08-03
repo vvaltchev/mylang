@@ -19190,6 +19190,33 @@ static bool jit_hoist_c1()
           "    return s; }",
           "print(f(mk(8), mkb(16), 12));" }, -1, 2 },
 
+      /* C1c: a BOOL array's store loops hoist via the compile-time
+       * ELEM-BOOL hint (a plain bool-literal store stamps the op; the
+       * pick guards kind bools, byte stride). The 43_sieve shape. */
+      { "a BOOL store loop hoists (the sieve shape, byte stride)",
+        { "func f(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = true; i++; }",
+          "    var j = 0;",
+          "    while (j < n) { a[j] = false; j += 3; }",
+          "    var c = 0; var k = 0;",
+          "    while (k < n) { if (a[k]) c++; k++; }",
+          "    return c; }",
+          "print(f(64));" }, 1 },
+
+      /* a region that STORES bools and READS the same base: the store
+       * stamps kind 3, the read is unstamped kind 0 - a KIND CONFLICT
+       * drops the candidate (safe; the read stamp is a follow-up).
+       * Values are the oracle; no exact count (the fills hoist). */
+      { "bool store + read of one base in one region: kind conflict",
+        { "func f(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = true; i++; }",
+          "    var c = 0; var k = 0;",
+          "    while (k < n) { c += a[k]; a[k] = false; k++; }",
+          "    return c * 100 + a[1]; }",
+          "print(f(32));" }, 1 },
+
       /* C1b: a PURE store loop (the 43_sieve marking shape, non-unit
        * step) hoists - bounds + raw write off the pinned registers */
       { "a pure store loop hoists (the sieve marking shape)",

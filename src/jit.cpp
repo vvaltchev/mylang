@@ -891,6 +891,13 @@ struct Emitter {
         if ((hr & 7) == 5) { u8(0x44); u8(0xCD); u8(0x00); }
         else { u8(0x04); u8(static_cast<uint8_t>(0xC8 | (hr & 7))); }
     }
+    /* C1c: mov [rH + r9], dil  (a bool element - 1 byte, scale 1) */
+    void store_elem_byte_hr(uint8_t hr)
+    {
+        u8(0x43); u8(0x88);
+        if ((hr & 7) == 5) { u8(0x7C); u8(0x0D); u8(0x00); }
+        else { u8(0x3C); u8(static_cast<uint8_t>(0x08 | (hr & 7))); }
+    }
     /* ---- #95, the SLICE read arms + the elem2 promote arm ---- */
     /* cvtsi2sd xmm0, qword [rcx + r9*8]  (an int element promotes) */
     void cvtsi2sd_x0_elem()
@@ -1806,8 +1813,8 @@ static void emit_call_epilogue(Emitter &e)
         e.mov_hr_rcx(g_hoist.rdata, L.data_off);
         e.mov_hr_rcx(g_hoist.rcount, L.data_off + 8);
         e.sub_hr_hr(g_hoist.rcount, g_hoist.rdata);
-        if (g_hoist.kind != 2)                /* elements, not bytes */
-            e.sar_hr_3(g_hoist.rcount);
+        if (g_hoist.kind == 0 || g_hoist.kind == 1)
+            e.sar_hr_3(g_hoist.rcount);       /* 2/3 count BYTES */
     }
 }
 
@@ -2985,11 +2992,15 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
             case OpCode::LoadElemFloat: add(in.target2, 1, false); break;
             case OpCode::LoadElem2Int:
             case OpCode::LoadElem2Float: add(in.target2, 2, false); break;
-            /* store candidates: the kind is the op's PROVEN element
-             * kind for a flat store; a runtime BOOL base under
-             * StoreElemInt fails the ints entry guard -> cold (the
-             * bools kind is a listed follow-up) */
-            case OpCode::StoreElemInt:   add(in.target2, 0, true); break;
+            /* store candidates. StoreElemInt in a RUN always has a
+             * LOCAL base (jit_op_eligible admits target == 0 only), so
+             * target2 is a frame slot like the readers'. C1c: the
+             * compile-time ELEM-BOOL hint picks the bools kind (3) -
+             * without it a bool array (43/56_sieve) failed the ints
+             * guard every entry and ran its cold twin. */
+            case OpCode::StoreElemInt:
+                add(in.target2, in.elem_bool_hint() ? 3 : 0, true);
+                break;
             case OpCode::StoreElemFloat: add(in.target2, 1, true); break;
             default: break;
             }
@@ -4133,9 +4144,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
      * Compound stores keep the ordinary tier below (the RMW + divisor
      * guards; a hoisted-compound form is a listed follow-up).
      */
+    const int hoist_want = is_float ? 1
+                         : in.elem_bool_hint() ? 3 : 0;
     if (!compound && g_hoist.active && g_hoist.store_ok
             && in.target2 == g_hoist.base
-            && g_hoist.kind == (is_float ? 1 : 0)) {
+            && g_hoist.kind == hoist_want) {
         if (is_float)
             emit_float_load(e, X0, in.b_is_lit(), in.b_flit(),
                             in.b_slot(), 0, /*no_bail=*/true);
@@ -4150,6 +4163,8 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
 #endif
         if (is_float)
             e.store_elem_float_hr(g_hoist.rdata);
+        else if (hoist_want == 3)
+            e.store_elem_byte_hr(g_hoist.rdata); /* 0/1 literal -> dil */
         else
             e.store_elem_int_hr(g_hoist.rdata);
         dones.push_back(e.jmp32());
@@ -9253,6 +9268,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 e.cmp_byte_rax(L.kind_off,
                                hr.kind == 0 ? L.kind_ints
                              : hr.kind == 1 ? L.kind_floats
+                             : hr.kind == 3 ? L.kind_bools
                                             : L.kind_general);
                 cold.push_back(e.j32(0x75));
                 if (hr.has_store) {
@@ -9274,8 +9290,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 e.mov_hr_rax(g_hoist.rdata, L.data_off);
                 e.mov_hr_rax(g_hoist.rcount, L.data_off + 8);
                 e.sub_hr_hr(g_hoist.rcount, g_hoist.rdata);
-                if (g_hoist.kind != 2)            /* elements, not bytes */
-                    e.sar_hr_3(g_hoist.rcount);
+                if (g_hoist.kind == 0 || g_hoist.kind == 1)
+                    e.sar_hr_3(g_hoist.rcount);   /* 8-byte elements;
+                                                   * general (2) and
+                                                   * bools (3) count
+                                                   * BYTES */
 #ifdef TESTS
                 e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_hoist));
                 e.u8(0x48); e.u8(0xFF); e.u8(0x02);
