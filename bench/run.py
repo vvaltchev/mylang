@@ -541,6 +541,65 @@ def save_cache(lang, cache):
         pass
 
 
+# --- BUILD-CONFIG GATE (this one DOES block, unless --force) ---------------
+#
+# A performance number is only meaningful from an OPT=1 ASSERTS=0 build, and
+# a plain `make -j` is ASSERTS=1. Assertion cost is NOT a uniform multiplier -
+# it sits unevenly across code paths (the per-op ML_VM_CHECK tier,
+# _GLIBCXX_ASSERTIONS bounds-checking every container access) - so an
+# ASSERTS=1 A/B cannot be scaled to the shipping config and has been observed
+# FLIPPING THE SIGN of a result. Measuring a wrongly-built binary does not
+# produce a rough number, it produces a misleading one.
+#
+# So: ask each binary how it was built (`mylang -v`) and REFUSE to run unless
+# every one of them is OPT=1 ASSERTS=0. --force overrides, loudly.
+def build_config(binary):
+    """Parse `mylang -v` -> {key: value}. Empty when the binary is too old to
+    support -v (then the gate reports it as unknown rather than guessing)."""
+    try:
+        out = subprocess.run([binary, "-v"], capture_output=True, text=True,
+                             timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    cfg = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and not line.startswith(" " * 20):
+            cfg[parts[0].strip()] = parts[1].strip()
+    return cfg
+
+
+def build_config_problem(binary, label):
+    """None when `binary` is a proper performance build, else a one-line
+    description of what is wrong with it."""
+    cfg = build_config(binary)
+    if not cfg or "opt" not in cfg or "asserts" not in cfg:
+        return ("%s (%s): cannot read its build config - too old for `-v`?"
+                % (label, binary))
+    if cfg.get("opt") != "1" or cfg.get("asserts") != "0":
+        return ("%s (%s): built OPT=%s ASSERTS=%s, need OPT=1 ASSERTS=0"
+                % (label, binary, cfg.get("opt"), cfg.get("asserts")))
+    return None
+
+
+FORCE_BANNER = (
+    "\n"
+    "  ############################################################\n"
+    "  ##   WARNING: THESE NUMBERS ARE NOT A VALID MEASUREMENT   ##\n"
+    "  ##   OF MyLang's PERFORMANCE.                             ##\n"
+    "  ##                                                        ##\n"
+    "  ##   --force was passed, so the build-config gate was     ##\n"
+    "  ##   SKIPPED. A performance run REQUIRES every binary     ##\n"
+    "  ##   to be built  OPT=1 ASSERTS=0.                        ##\n"
+    "  ##                                                        ##\n"
+    "  ##   Assertion cost is NOT a uniform multiplier: it       ##\n"
+    "  ##   lands unevenly across code paths and has been        ##\n"
+    "  ##   seen to FLIP THE SIGN of an A/B result. Do not       ##\n"
+    "  ##   compare these numbers against properly-built         ##\n"
+    "  ##   ones, and do not record them anywhere.               ##\n"
+    "  ############################################################\n")
+
+
 # --- MACHINE-SPEED CALIBRATION (a WARNING only - it never blocks a run) ----
 #
 # The my/<lang> column divides a LIVE MyLang timing by a CACHED comparison
@@ -718,7 +777,10 @@ def main():
                          "comparison is ever re-timed - the comparison sources "
                          "rarely change, so you rarely need it.")
     ap.add_argument("--force", action="store_true",
-                    help="with --recompute: force-recompute EVERY selected "
+                    help="on a MEASURE run: skip the OPT=1 ASSERTS=0 build "
+                         "gate (prints a big WARNING at both ends - the "
+                         "numbers are NOT a valid measurement). "
+                         "With --recompute: force-recompute EVERY selected "
                          "bench (not just stale ones). Ignored otherwise.")
     ap.add_argument("--timeout", type=float, default=120.0,
                     help="per-run timeout in seconds (default 120)")
@@ -834,12 +896,40 @@ def main():
     # inline meaning anymore (a measure run never re-times) - it applies to
     # --recompute only.
     if args.force:
-        sys.exit("--force applies to --recompute only (a measure run is "
-                 "cache-only).\n  Run:  bench/run.py -cl %s --recompute "
-                 "--force%s" % (lobj.name, filt))
+        pass          # on a MEASURE run --force means "skip the build gate"
     if not mylang:
         sys.exit("error: mylang binary not found; build it (make -j) or pass "
                  "--mylang")
+
+    # BUILD-CONFIG GATE. Every binary that will be TIMED must be a genuine
+    # performance build; anything else yields a misleading number rather than
+    # a rough one. Checks the baseline too - a mixed-config A/B (one side
+    # ASSERTS=0, the other ASSERTS=1) is precisely the trap this exists for.
+    build_problems = [pr for pr in (
+        build_config_problem(mylang, "mylang"),
+        (build_config_problem(args.baseline, "baseline")
+         if args.baseline else None),
+    ) if pr]
+    forced_build = False
+    if build_problems:
+        if not args.force:
+            sys.exit(
+                "error: refusing to measure - not a performance build\n  "
+                + "\n  ".join(build_problems)
+                + "\n\nRebuild with OPT=1 ASSERTS=0, e.g.\n"
+                  "  make -j OPT=1 ASSERTS=0 BUILD_DIR=build-perf\n"
+                  "  bench/run.py --mylang build-perf/mylang\n\n"
+                  "`mylang -v` reports how a binary was built. Assertion cost "
+                  "is not a\nuniform multiplier - it lands unevenly across "
+                  "code paths and has been\nseen to flip the SIGN of an A/B "
+                  "result - so an ASSERTS=1 number cannot\nbe scaled to the "
+                  "shipping config. Pass --force only if you know\nexactly "
+                  "why you want an invalid measurement.")
+        forced_build = True
+        print(FORCE_BANNER)
+        for pr in build_problems:
+            print("  %s" % pr)
+        print("")
 
     # UP-FRONT staleness gate: verify EVERY selected comparison is cached +
     # fresh BEFORE timing anything. A stale/missing entry fails FAST with the
@@ -1061,6 +1151,14 @@ def main():
     # without any code changing.
     if calib_msg:
         print("\n" + calib_msg)
+
+    # And repeat the --force banner. It is printed at BOTH ends deliberately:
+    # this output is routinely piped through head or tail, and a reader who
+    # sees only one end must still learn the numbers are invalid.
+    if forced_build:
+        print(FORCE_BANNER)
+        for pr in build_problems:
+            print("  %s" % pr)
 
     if args.sorted:
         # Ascending: biggest win first, worst regression last. Order by cur/base

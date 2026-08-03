@@ -1198,6 +1198,14 @@ Running scripts:
 ./build/mylang -npc FILE         # disable the per-frame pure-call cache
                                  # (recursion still unrolls; for measurement)
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
+./build/mylang -v                # how THIS binary was built (opt, asserts,
+                                 # lto, sanitizers, vm_hardening, cgoto,
+                                 # tests, recycle, jit, compiler) - one
+                                 # `key value` line each, read from
+                                 # COMPILER-SET macros (`__OPTIMIZE__`,
+                                 # `NDEBUG`, ...) so it cannot drift from
+                                 # what was compiled. bench/run.py parses
+                                 # it; see the ASSERTS=0 rule below
 ./build/mylang -nr FILE          # parse/validate only, don't run
 ./build/mylang -vm FILE          # execute via the bytecode VM — the
                                  # DEFAULT engine (flipped 2026-07-18);
@@ -1442,6 +1450,21 @@ code: with hardening on, `vector::operator[]` in a hot scan is NOT free —
 read through `.data()` when you have already proven the range (a flattened
 pool indexed with `operator[]` cost +28 Ir per throw versus the nested form
 it replaced).
+
+**THE BUILD-CONFIG GATE — AND `--force` IS THE MAINTAINER'S ALONE
+(maintainer-set, 2026-08-01).** `bench/run.py` runs `mylang -v` on EVERY
+binary it will time (the current one AND `--baseline`) and **REFUSES to run**
+unless each reports `opt 1` and `asserts 0` — a mixed-config A/B is exactly
+the trap, so the baseline is checked too. The refusal names the rebuild
+command. **`--force` skips the gate and is RESERVED FOR THE MAINTAINER:
+⛔ CLAUDE MUST NEVER PASS `--force` TO `bench/run.py`.** There is no
+situation in which Claude should produce, quote, or record a forced number —
+if the gate refuses, REBUILD (`make -j OPT=1 ASSERTS=0
+BUILD_DIR=build-claude/perf`) and measure properly. When the maintainer uses
+it, a full-width WARNING banner prints at the START and again at the END of
+the output (both ends deliberately: this output is routinely piped through
+`head` or `tail`, and a reader who sees only one end must still learn the
+numbers are invalid).
 
 **THE "PROVE THE CODE RAN + DISTRUST A SURPRISING RESULT" HARD RULE
 (maintainer-set, 2026-07-19).** Two joined rules, both learned the hard way in

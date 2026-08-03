@@ -77,6 +77,138 @@ lex_all()
 
 void run_tests(bool dump_syntax_tree);
 
+/*
+ * `-v`: report HOW THIS BINARY WAS BUILT.
+ *
+ * The two lines that matter are `opt` and `asserts`: a performance number is
+ * only meaningful from an OPT=1 ASSERTS=0 build, and mixing configs silently
+ * invalidates a comparison (assertion cost is not a uniform multiplier - it
+ * sits unevenly across code paths, so it can flip the SIGN of an A/B). The
+ * bench runner parses this and refuses to measure a wrongly-built binary.
+ *
+ * Everything here is read from a COMPILER-SET or build-system macro rather
+ * than a hand-maintained string, so it cannot drift from what was actually
+ * compiled. `__OPTIMIZE__` and `NDEBUG` in particular are set by the
+ * toolchain itself, which is exactly the property the gate needs.
+ *
+ * Format: one `key value` line per fact, so it stays trivially parseable.
+ */
+static void show_build_config()
+{
+#if defined(__OPTIMIZE__)
+    const char *opt = "1";
+#elif defined(_MSC_VER)
+    const char *opt = "unknown";     /* MSVC sets no such macro */
+#else
+    const char *opt = "0";
+#endif
+
+#ifdef NDEBUG
+    const char *asserts = "0";
+#else
+    const char *asserts = "1";
+#endif
+
+#if defined(_GLIBCXX_ASSERTIONS) || defined(_LIBCPP_HARDENING_MODE)
+    const char *stdlib_hardening = "1";
+#else
+    const char *stdlib_hardening = "0";
+#endif
+
+#if defined(__SANITIZE_ADDRESS__)
+    const char *asan = "1";
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+    const char *asan = "1";
+#  else
+    const char *asan = "0";
+#  endif
+#else
+    const char *asan = "0";
+#endif
+
+#if defined(__SANITIZE_UNDEFINED__)
+    const char *ubsan = "1";
+#elif defined(__has_feature)
+#  if __has_feature(undefined_behavior_sanitizer)
+    const char *ubsan = "1";
+#  else
+    const char *ubsan = "0";
+#  endif
+#else
+    const char *ubsan = "0";
+#endif
+
+#ifdef ML_LTO
+    const char *lto = ML_LTO ? "1" : "0";
+#else
+    const char *lto = "unknown";     /* no macro (e.g. a CMake build) */
+#endif
+
+    cout << "mylang build configuration" << endl;
+    cout << "  opt               " << opt
+         << "        (optimized: -O3)" << endl;
+    cout << "  asserts           " << asserts
+         << "        (C assert + ML_CHECK)" << endl;
+    cout << "  stdlib_hardening  " << stdlib_hardening
+         << "        (bounds-checked container access)" << endl;
+    cout << "  lto               " << lto << endl;
+    cout << "  asan              " << asan << endl;
+    cout << "  ubsan             " << ubsan << endl;
+    cout << "  vm_hardening      "
+#if defined(ML_VM_HARDENING) && ML_VM_HARDENING
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (per-op slot/type checks)" << endl;
+    cout << "  cgoto             "
+#ifdef ML_NO_CGOTO
+         << "0"
+#else
+         << "1"
+#endif
+         << "        (computed-goto dispatch)" << endl;
+    cout << "  tests             "
+#ifdef TESTS
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (-rt suite compiled in)" << endl;
+    cout << "  recycle           "
+#ifdef RECYCLE_ALLOC
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (adversarial node allocator)" << endl;
+    cout << "  jit               "
+#if defined(__x86_64__) && !defined(_WIN32)
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (native x86-64 codegen)" << endl;
+    cout << "  compiler          "
+#if defined(__clang__)
+         << "clang " << __clang_major__ << "." << __clang_minor__
+#elif defined(__GNUC__)
+         << "gcc " << __GNUC__ << "." << __GNUC_MINOR__
+#elif defined(_MSC_VER)
+         << "msvc " << _MSC_VER
+#else
+         << "unknown"
+#endif
+         << endl;
+    cout << endl;
+    if (strcmp(opt, "1") || strcmp(asserts, "0"))
+        cout << "NOT a performance build - measure only with "
+                "OPT=1 ASSERTS=0." << endl;
+    else
+        cout << "This is a performance build (OPT=1 ASSERTS=0)." << endl;
+}
+
 void help()
 {
     cout << "Syntax:" << endl;
@@ -84,6 +216,8 @@ void help()
     cout << endl;
     cout << "   -t      Show all tokens" << endl;
     cout << "   -s      Dump the syntax tree" << endl;
+    cout << "   -v      Show how this binary was BUILT (opt, asserts, ...)"
+         << endl;
     cout << "  -nc      No const eval (debug)" << endl;
     cout << "  -ni      No function inlining (debug)" << endl;
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
@@ -207,6 +341,10 @@ parse_args(int argc, char **argv)
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
 
             help(); exit(0);
+
+        } else if (!strcmp(arg, "-v") || !strcmp(arg, "--version")) {
+
+            show_build_config(); exit(0);
 
         } else if (!strcmp(arg, "-rt")) {
 
