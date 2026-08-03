@@ -1,0 +1,871 @@
+================================================================================
+THE .myv STORED-BYTECODE FORMAT
+================================================================================
+
+Format version 6.  This document describes the on-disk image exhaustively:
+every record, in order, with its exact byte encoding.
+
+It is the specification of what `mylang -c FILE` writes and what `mylang
+FILE.myv` reads.  The implementation is src/serialize.{h,cpp}; the design
+history and the per-version measurements are in plans/myv-serializer.md, and
+the implementation-shape summary is in CLAUDE.md (".myv STORED-BYTECODE
+FORMAT").
+
+--------------------------------------------------------------------------------
+1.  WHAT AN IMAGE IS
+--------------------------------------------------------------------------------
+
+An image is the bytecode VM's runtime state, serialized: instructions, their
+data pools, function descriptors, struct type definitions, and the global
+table's names.  Loading one skips the lexer, the parser, and every optimizer
+pass - the program runs straight from the file.
+
+    mylang -c script.my                 # writes script.myv
+    mylang -c script.my -o out.myv      # explicit output path
+    mylang -c script.my --strip-source  # store no source reference
+    mylang script.myv                   # run (detected by CONTENT, not name)
+    mylang --source ~/proj script.myv   # find the source under another root
+    mylang -f script.myv                # accept a CRC32-mismatched source
+    mylang -vd script.myv               # disassemble a loaded image
+
+WHAT IS NOT IN AN IMAGE
+
+  * NATIVE MACHINE CODE.  The AOT tier rewrites bytecode in place (inserting
+    EnterNative, deleting originals) against fragments that cannot be
+    relocated, so `-c` compiles with the JIT off and the LOADER re-runs the
+    whole tier (vm_jit_loaded_image).  An image is therefore portable across
+    machines and keeps working as the native tier evolves.  Storing fragments
+    would need a relocating linker - a deliberate later increment.
+
+  * THE AST.  Nothing in the runtime image references a Construct; that is the
+    zero-AST invariant the whole VM was built to satisfy (CLAUDE.md).  A
+    descriptor's compile-only `decl` back-pointer is written as nothing and set
+    to null at load.
+
+  * THE SOURCE TEXT.  Only a verified REFERENCE to the source file (section 5).
+
+  * DERIVED DATA.  Anything recomputable is recomputed at load, never stored:
+    see section 12.
+
+TRUST MODEL.  An image is TRUSTED input, like a .pyc.  The loader does
+structural validation - magic, version, endianness, builtin-set fingerprint,
+every index and pc bounds-checked, every read length-checked - so a corrupt or
+truncated file produces a clean "MyvError", never undefined behaviour.  A
+MALICIOUSLY CRAFTED file is out of scope: an attacker who can write your .myv
+can equally write your .my.
+
+--------------------------------------------------------------------------------
+2.  CONVENTIONS AND PRIMITIVES
+--------------------------------------------------------------------------------
+
+All integers are LITTLE-ENDIAN.  Big-endian hosts are refused at load via the
+endianness marker (section 4).
+
+Every field is a whole number of bytes on a byte boundary.  NOTHING in this
+format is a 5-byte - or any non-multiple-of-8-bit - integer, and there are no
+LEB128/varint fields (byte-granular but bit-tagged) anywhere.  The ONLY
+sub-byte fields in the entire format are the width CODES inside the
+instruction flags word (section 9.1); every value they describe is itself
+byte-aligned.
+
+Notation used throughout this document:
+
+    u8            one byte
+    u16           two bytes
+    u32           four bytes
+    i64           eight bytes, two's complement
+    f64           eight bytes: the IEEE-754 double's bit pattern as i64
+    bool          u8, 0 or 1 (any nonzero reads as true)
+    str           u32 length, then that many raw bytes, INLINE (not a table
+                  reference).  May contain NUL and newlines.
+    sid           u32 index into the string table (section 6)
+    uid           u32 index into the string table, or 0xFFFFFFFF for null.
+                  The loader re-interns the string into a UniqueId.
+    sref          u32 index into the struct table, or 0xFFFFFFFF for null
+    dref          u32 index into the descriptor table
+    loc           a source location, 3 bytes in the common case (section 2.1)
+    value         a runtime value, recursive (section 11)
+    arglocs       u32 count, then that many { loc start; loc end } pairs
+    N x REC       a u32 count immediately followed by N records
+    signed u32    a u32 whose bit pattern is read back as an int32; used for
+                  fields that are `int` in memory and may be -1
+
+Counts are u32 and always immediately precede the records they count.  There
+is no section table and no padding: the file is read strictly sequentially.
+
+2.1  loc - a source location
+
+A Loc is a (line, column) pair; both are 1-based in practice, and a
+default/absent Loc is (0, 0).  On disk:
+
+    u16 line          0..65534 direct;  65535 (0xFFFF) = ESCAPE
+    [u32]             present only when line escaped: the line as an int32
+    u8  col           0..254 direct;    255 (0xFF)     = ESCAPE
+    [u32]             present only when col escaped: the column as an int32
+
+So a loc is 3 bytes normally, 7 or 9 if one or both fields escape.  The byte
+forms are an OPTIMIZATION FOR THE COMMON CASE, never a cap: a 70000-line file
+or a 300-column caret round-trips exactly.
+
+Rationale for u16 (not u8) on the line: these Locs are ABSOLUTE.  Unlike the
+loc TABLE's (section 9.2), a caret pool's Locs have no ordering relationship
+to delta against, and a one-byte line would escape in any file over 254
+lines - which is most of them.  Measured over bench/ + samples/: 1618 pool
+Locs, widest line 206, widest column 77, so nothing escapes in practice.
+
+Every pool in section 9 writes its Locs through this one encoding.
+
+--------------------------------------------------------------------------------
+3.  TOP-LEVEL LAYOUT
+--------------------------------------------------------------------------------
+
+    +----------------------------------------------------------+
+    |  HEADER            (section 4)                           |
+    |  SOURCE REFERENCE  (section 5)                           |
+    |  STRING TABLE      (section 6)                           |
+    +----------------------------------------------------------+
+    |  STRUCT TABLE      (section 7)                           |
+    |  DESCRIPTOR TABLE  (section 8)                           |
+    |  CHUNKS            (section 9)  root first, then one per |
+    |                                 descriptor that has one  |
+    |  GLOBALS           (section 10)                          |
+    +----------------------------------------------------------+
+
+The writer emits the second group FIRST into a separate buffer, because
+writing it is what POPULATES the string table; the header group is then built
+and the two are concatenated with the header in front.  A reader therefore
+sees the string table before any index that refers to it.
+
+--------------------------------------------------------------------------------
+4.  HEADER
+--------------------------------------------------------------------------------
+
+    char[4]   magic                 "MYLV"
+    u32       format_version        must EXACTLY equal the reader's
+    u32       endian_mark           0x01020304
+    i64       builtin_fingerprint   builtin_set_fingerprint()
+
+magic - `myv_is_image()` reads these 4 bytes alone, which is how a file
+argument is recognized as an image BY CONTENT rather than by extension.
+
+format_version - no cross-version compatibility: a mismatch is refused with
+"incompatible .myv version - recompile from source".  Any change to any record
+in this document bumps it.
+
+endian_mark - a byte-order canary.  A big-endian host reads 0x04030201 and is
+refused.
+
+builtin_fingerprint - a hash of the builtin SET: FNV-1a over every builtin
+name in table order (which is sorted by name), xor'd with the count.  It
+exists because instruction operands can name a
+builtin by SLOT: `SymKind::builtin` references are baked indices into the
+program-wide builtin table.  That table is now sorted BY NAME, so its order is
+deterministic given the set - but a binary built with a different set of
+builtins would resolve a baked slot to the WRONG builtin, so such an image is
+refused rather than silently misinterpreted.
+
+(This was a real bug: the builtin table used to be keyed by interned POINTER
+order, which differs per process, making baked slots unstable across runs of
+the same binary.  Sorting by name fixed it; the fingerprint guards the rest.)
+
+--------------------------------------------------------------------------------
+5.  SOURCE REFERENCE
+--------------------------------------------------------------------------------
+
+    str   root      the project root, absolute
+    str   rel       the source path relative to `root`
+    str   abs       the source's absolute path at compile time
+    u32   crc       CRC-32 of the source bytes
+    i64   size      the source's size in bytes
+
+An image does NOT embed the program text.  It records where the text WAS plus
+enough to prove a file found there is still the one that was compiled.  ~100
+bytes, versus the whole program.
+
+`--strip-source` writes all three strings empty and crc/size zero, which means
+"no reference": errors then print no source line, and the image carries no
+local paths at all.
+
+HOW THE WRITER PICKS root/rel (myv_source_ref):  `root` is the compile-time
+working directory when the source lives under it - the usual `mylang -c
+samples/phonebook` from the project root - otherwise the source's own
+directory.  Either way `rel` is non-empty, which is what makes an image
+RELOCATABLE: a `rel` full of ".." hops would not survive relocation, so one is
+never built.
+
+HOW THE LOADER RESOLVES IT (resolve_source):
+
+  * `--source ROOT` given: look ONLY under it, at ROOT/rel.  An explicit root
+    that lacks the file is a mistake worth reporting, not a reason to fall
+    back silently to a stale absolute path.
+  * otherwise: try `abs`, then `root`/`rel`.
+
+Then, for the first candidate that exists:
+
+  * size and CRC32 both match -> use it.  Errors are then byte-identical to
+    the same error from a source run.
+  * they differ -> print a warning and REFUSE the file (no quoted line, no
+    caret), because a caret drawn on the wrong text is worse than no caret.
+    `-f` / `--force` uses it anyway and warns that carets may be misplaced.
+  * no candidate exists -> silence.  Shipping an image without its source is
+    an ordinary thing to do; the error header still names the file and line
+    and the backtrace still names every function.
+
+CRC-32 is the standard reflected form (polynomial 0xEDB88320, initial and
+final inversion), computed a bit at a time - no table to carry.  It runs twice
+per file lifetime, so speed is irrelevant; detecting an edited source is the
+whole point.
+
+--------------------------------------------------------------------------------
+6.  STRING TABLE
+--------------------------------------------------------------------------------
+
+    N x str
+
+Deduplicated, in first-use (insertion) order, so it is deterministic for a
+given write order.  `sid` and `uid` fields elsewhere are indices into it; the
+loader re-interns every entry into a UniqueId, so identifier identity is
+restored by NAME rather than by a stored pointer.
+
+Note that `str` payloads INSIDE values (section 11) are written inline, not
+through this table: a string CONSTANT is data, not an identifier.
+
+--------------------------------------------------------------------------------
+7.  STRUCT TABLE
+--------------------------------------------------------------------------------
+
+    N x StructDef
+
+    StructDef:
+        uid   name
+        M x Field
+        K x Const
+
+    Field:
+        uid   name
+        u8    kind          FieldKind, section 13
+        uid   struct_ty     the field's struct type NAME, if any
+        sref  struct_def    the resolved struct type, or null
+        bool  is_opt
+        u32   slot          (signed) the boxed-layout slot index
+
+    Const:
+        uid   name
+        value value         the folded `const NAME = expr;` member
+
+Structs are written in definition order.  A field's `struct_def` can only
+reference an EARLIER struct (inline fields only go backwards - a parser
+invariant enforced by the recursive-struct rejection), so no forward reference
+is possible.
+
+THE LAYOUT IS NOT STORED.  size, align, the POD/boxed decision and every byte
+offset are RECOMPUTED at load by `compute_layout()`, deterministically from
+the field kinds.  Storing them would only add drift surface.
+
+The loader constructs all N definitions first, then fills them, so a field may
+reference any of them during the fill.
+
+--------------------------------------------------------------------------------
+8.  DESCRIPTOR TABLE
+--------------------------------------------------------------------------------
+
+A FuncDescriptor is the serializable runtime identity of a function - the
+whole call model reads it, never an AST node.
+
+    N x Descriptor
+
+    Descriptor:
+        uid   name
+        sid   display_name          the original name for a `$N` clone
+        P x Param
+        C x Capture
+        bool  resolved
+        u32   frame_size            (signed)
+        u32   min_args              (signed)
+        bool  explicit_pure
+        bool  effective_pure
+        bool  cache_results
+        bool  pure_ctx
+        bool  is_template_base
+        bool  fast_bind
+        bool  has_chunk             false for a dead template base
+
+    Param:
+        uid   name
+        bool  opt
+        bool  cnst
+        bool  dyn_mod
+        u8    decl_type             DeclType, section 13
+
+    Capture:
+        uid   name
+        u8    kind                  SymKind, section 13
+        u32   slot                  (signed)
+
+`has_chunk` is what pairs a descriptor with its chunk in section 9: the chunks
+follow in exactly this order, skipping descriptors whose flag is false.  A
+false flag makes the loader mark the descriptor `vm_chunk_tried`, so nothing
+tries to compile it later.
+
+Like structs, descriptors are constructed first and filled second, because a
+chunk's `closure_defs` may reference any of them.
+
+--------------------------------------------------------------------------------
+9.  CHUNKS
+--------------------------------------------------------------------------------
+
+The root chunk comes first, then one chunk per descriptor with `has_chunk`.
+Each chunk is:
+
+    N x Instr                       9.1
+    u32   slot_count                (signed)
+    u32   n_temps                   (signed)
+    u32   n_dict_iters              (signed)
+    u32   n_dyn_iters               (signed)
+    N x u32  ref_slots              (signed) slots that may hold a reference
+    N x value consts
+    N x LocEntry locs               9.2
+    N x InlineFrame inline_frames   9.3
+    N x InlineCtx inline_ctxs       9.3
+    N x MemberKey member_keys       9.4
+    N x CtorPlan ctor_plans         9.5
+    N x IncDecSite incdec_sites     9.6
+    N x StepList chain_steps        9.7
+    N x IncDecChain incdec_chains   9.7
+    N x ChainLocs chain_locs        9.8
+    N x CatchTypes catch_types      9.9
+    N x LiteralObj literal_objs     9.10
+    N x dref closure_defs
+    N x sref struct_defs
+    N x BoxedCtor boxed_ctors       9.11
+    N x EmplaceSite emplace_sites   9.12
+    N x ThrowSite throws            9.13
+    N x SlotList unpack_targets     9.14
+    N x ByteList unpack_coerce      9.14
+    N x BuiltinCall builtin_calls   9.15
+    N x CallSite call_sites         9.16
+    N x sid slot_names              9.17
+
+`boxed_ops` is ABSENT from this list on purpose - see section 12.
+
+9.1  Instr - the compact instruction encoding
+
+An in-memory Instr is 32 bytes with 27 meaningful ones (op, aop, opflags,
+target, target2, pa, pb).  It is never memcpy'd to disk (its padding is
+indeterminate); each field is written individually, and only when it is not at
+its default:
+
+    u8    op                        the opcode
+    u16   flags                     which optional fields follow, and how wide
+    [u8]  aop                       iff flags bit 10
+    [u8]  opflags                   iff flags bit 11
+    [..]  target                    iff its width code is nonzero
+    [..]  target2                   iff its width code is nonzero
+    [..]  pa                        iff its width code is nonzero
+    [..]  pb                        iff its width code is nonzero
+
+The flags word:
+
+    bits 0-2    pa       width code 0..4
+    bits 3-5    pb       width code 0..4
+    bits 6-7    target   width code 0..3
+    bits 8-9    target2  width code 0..3
+    bit  10     aop is stored     (else Op::invalid)
+    bit  11     opflags is stored (else 0)
+    bits 12-15  RESERVED, MUST BE ZERO
+
+A width code is:  0 = the field is at its DEFAULT and is not stored at all;
+1 = 1 byte; 2 = 2 bytes; 3 = 4 bytes; 4 = 8 bytes.  A stored field is a plain
+little-endian signed integer of that width, sign-extended on read.  The
+default is -1 for target, target2, pa and pb.
+
+The reader REFUSES a nonzero in bits 12-15, so a later version can spend them
+without a version-6 reader silently misreading such a file.  It also refuses
+a width code above 4, and an opcode at or above OpCount_.
+
+Field order on disk is exactly as listed above (aop, opflags, target,
+target2, pa, pb) - not the order of the flag bits.
+
+WHY.  Measured over bench/ + samples/ (3483 instructions): the fixed 27-byte
+record was 37% of an image, yet `target` is present in 95% of instructions and
+fits in ONE byte in 97% of those; `target2` and `pb` are at their default in
+roughly half; `pa` fits in one byte in two thirds.  The typical instruction is
+therefore 5-6 bytes rather than 27.
+
+THE DEFAULT-VS-VALUE SUBTLETY.  `pa == -1` means both "unset slot" and the
+integer literal -1.  That is not ambiguous on disk: the field is simply not
+stored and the reader's default restores exactly -1, while `opflags`
+independently records whether the operand is a literal.  Nothing is lost.
+
+This is NOT in-format compression: no dictionary, no entropy coding, no
+bit-level packing of values, no decoder state.  Each field is a plain integer
+at a byte boundary, decoded in O(1), and two compiles remain byte-identical.
+
+9.2  LocEntry - the delta-coded loc table
+
+`locs` maps the pc of an op that can throw to the source span its caret
+covers.  Entries are pc-ascending.  Each is FOUR bytes in the common case:
+
+    u8    pcd       pc - previous pc            255  = escape
+    i8    lined     start.line - previous line  -128 = escape
+    u8    col       start.col                   255  = escape
+    u8    ecol      end.col, IMPLYING end.line == start.line
+                                                255  = escape
+
+An escape means: that byte is the reserved sentinel, and the value follows as
+a plain 4-byte little-endian int32.  The `ecol` escape is special - it carries
+the FULL end Loc, two int32s (line then column) - which is how a span that
+crosses lines is represented:
+
+    ecol == 255  ->  i32 end.line, i32 end.column
+
+"Previous" starts at 0 for both running values, per chunk.  Note this is the
+loc table's OWN delta encoding, unrelated to the pool `loc` of section 2.1.
+
+WHY FOUR AND NOT FIVE.  A dedicated end-line byte would serve only the 2.3%
+of entries whose span crosses a line, so it is folded into `ecol`'s escape
+instead.  Measured over 969 corpus entries: the pc delta never exceeded 19,
+the widest column was 99, 97.7% of spans end on the line they start, and only
+4 entries needed any escape at all.  The old record was 20 bytes.
+
+WORST CASE, honestly: an entry escaping all four fields is 24 bytes, four more
+than the old fixed record.  It requires a pc delta over 254 AND a line jump
+over 127 AND a column over 254 AND a multi-line span in ONE entry, which the
+measured maxima put out of reach.
+
+ON-DISK ONLY.  The loader rebuilds the same in-memory vector<LocEntry>, so
+`Chunk::loc_at`'s binary search on the throw path is completely unaffected.
+
+The reader rejects a negative reconstructed pc or line, and a pc past the end
+of the code.
+
+9.3  Inline frames - virtual backtrace frames
+
+    InlineFrame:
+        sid   callee_name
+        N x sid  params
+        loc   call_site
+        u32   parent            index into this same pool, or 0xFFFFFFFF
+
+    InlineCtx:
+        u32   pc
+        u32   frame             index into inline_frames
+
+Together these reproduce the "inlined-at" chains that make an inlined call
+appear in a backtrace even though no physical call happened.  A parent always
+has a LOWER index than its child, so the pool is topologically ordered and can
+be walked without recursion.
+
+9.4  MemberKey - a member access's key and carets
+
+        value memId             the name as a dict-key VALUE (so a dict
+                                member read `d.k` needs no conversion)
+        uid   memUid            the interned field/const name
+        bool  optional          `a?.b` short-circuits a none base
+        loc   mstart, mend      the member expression's caret
+        loc   bstart, bend      the base's caret
+        sref  bake_def          the compile-proven struct type, or null
+        u32   bake_slot         (signed) its resolved field slot
+
+`bake_def`/`bake_slot` are the compile-baked field resolution: a consumer uses
+the slot behind a def-identity check instead of a runtime name scan.
+
+9.5  CtorPlan - a planned POD struct construction
+
+    CtorPlan:
+        N x { u32 off; u32 src; u8 act }
+
+Per field: the byte offset in the instance, the source frame slot, and the
+action (0 = raw int, 1 = float via promotion, 2 = bool byte).
+
+9.6  IncDecSite
+
+    loc   lstart, lend      the lvalue's caret
+    loc   istart, iend      the inc-dec's own caret
+    value memId             the member name as a dict-key value
+    uid   memUid
+
+Two distinct carets because a subscript-internal throw (out of bounds, key not
+found) and the inc-dec's own throw (not an lvalue, const, type error) must
+report different spans - which a single loc-per-pc table cannot express.
+
+9.7  Chain steps and inc-dec chains
+
+    StepList:
+        N x { bool is_member; u32 operand (signed); loc lstart, lend }
+
+`operand` is a member_keys index when `is_member`, else the frame slot of the
+temp holding the subscript key.  Each step carries its own caret so a throw at
+that step reports the same span the tree-walker would.
+
+    IncDecChain:
+        StepList steps
+        bool  tier2             the operand is a proven int/float
+        bool  is_prefix
+        bool  allow_flat
+        bool  allow_pod
+        loc   id_start, id_end
+        loc   kstart, kend
+
+9.8  ChainLocs
+
+    N x { loc; loc }
+
+One caret pair per step of a subscript chain store, innermost first.
+
+9.9  CatchTypes
+
+    N x sid
+
+One list per try region: the catch clause type names, in order.  Their
+interned twins (`catch_uids`) are DERIVED - re-interned at load, not stored
+(section 12).
+
+9.10  LiteralObj - a baked const array/dict/struct literal
+
+    value value
+    bool  immutable         a const decl, or an already-read-only value
+    u8    arr_hint          ArrHint, section 13
+    sref  arr_hint_struct   the POD struct type for a flat struct array
+
+9.11  BoxedCtor
+
+    sref     def
+    arglocs  arg_locs       per-field carets for a boxed construction
+
+9.12  EmplaceSite - a construct-in-place append
+
+    sref     def
+    uid      bname          the callee name (append/push)
+    loc      a0_start, a0_end     the container argument's caret
+    arglocs  field_locs           per-field coerce carets
+
+9.13  ThrowSite - a compiled always-throwing construct
+
+    u8    kind              ThrowKind, section 13
+    loc   start, end
+    uid   name              used by undefined_var only
+
+9.14  Unpack targets and coercions
+
+    SlotList:   N x u32     (signed) per-position frame slot; -1 = `_`
+    ByteList:   N x u8      per-position numeric coercion
+
+9.15  BuiltinCall
+
+    uid      name           the builtin's NAME, re-resolved at load
+    loc      start, end     the whole-args caret
+    u8       arr_hint       ArrHint, section 13
+    arglocs  args           per-argument carets
+    uid      member         arg0's field name for `append(s.f, x)`, else null
+
+A builtin is stored BY NAME, never as a function pointer.  The loader
+re-resolves it through `vm_lookup_builtin`; an unknown name is refused.
+
+9.16  CallSite - an indirect call's carets plus arg0's lvalue descriptor
+
+    loc      start, end
+    arglocs  args
+    u8       arr_hint       ArrHint, section 13
+    u8       a0_form        CallSite::A0, section 13
+    u32      a0_kind        0 local / 1 global / 2 capture / 3 builtin
+    u32      a0_slot        (signed)
+    u32      a0_operand     (signed) elem: index temp; member: key index
+    uid      a0_name        undef form only
+
+9.17  slot_names
+
+    N x sid
+
+DEBUG data: the `-vd` disassembly labels frame slots with these.  It is stored
+unconditionally so a loaded image dumps byte-identically to a fresh compile -
+the round-trip oracle - which is worth its ~2% of an image.  It is the one
+section that could be dropped without losing behaviour.
+
+--------------------------------------------------------------------------------
+10.  GLOBALS
+--------------------------------------------------------------------------------
+
+    N x u8   global_slot_reassigned    per global slot: written more than once?
+    u32      root_slot_count           (signed)
+    N x uid  global_func_names         the global table's slot -> name list
+
+`global_slot_reassigned` is what lets the load-time JIT rebuild its compile
+context: a write-once global slot may be baked, a reassigned one may not.
+`global_func_names` both sizes the global table and backs the `globals()`
+reflection builtin - and it is how the loader maps a global slot back to a
+descriptor BY NAME when rebuilding the JIT context.
+
+--------------------------------------------------------------------------------
+11.  THE VALUE CODEC
+--------------------------------------------------------------------------------
+
+Used by chunk `consts`, `literal_objs`, struct `consts`, member keys, dict
+keys and values, and recursively by itself.
+
+    u8 tag, then a payload:
+
+    0  none         (nothing)
+    1  boolean      bool
+    2  integer      i64
+    3  flt          f64
+    4  str          str
+    5  arr          see 11.1
+    6  dict         see 11.2
+    7  strct        see 11.3
+    8  structtype   sref
+    9  func         dref     (a capture-free FuncObject)
+
+The writer ABORTS on any other type - "unserializable value type in a chunk
+pool".  An image is never silently lossy.
+
+11.1  arr
+
+    u8    storage kind      Storage, section 13
+    bool  readonly          the deep-const flag
+    u32   n                 element count
+    then, per kind:
+        ints      n x i64
+        floats    n x f64
+        bools     n x bool
+        strs      n x str
+        structs   sref def; u32 stride; then n*stride RAW BYTES
+        general   n x value
+
+The STORAGE KIND round-trips, because `array_storage()` is script-observable:
+a flat array must load back flat.
+
+SLICES ARE NOT STORED.  A stored array is materialized as its own storage -
+offset 0, no parent, no live-slice registration - exactly as the in-memory
+const pool holds a self-contained value.
+
+11.2  dict
+
+    bool  readonly
+    bool  has_default
+    [value default]         iff has_default
+    u32   n
+    n x { value key; value value }
+
+MyLang dicts are UNORDERED by specification, and the pair order here is the
+writer's hash-map iteration order.  A rebuilt map may therefore iterate
+differently than the map that was written.  That is legitimate and observable
+only in the ORDER a const dict prints - the one respect in which a loaded
+image's `-vd` dump can differ from a fresh compile's (2 of 86 corpus files).
+
+11.3  strct
+
+    sref  def
+    bool  readonly
+    bool  pod
+    if pod:      u32 nbytes;  then nbytes RAW BYTES
+    else:        u32 nfields; then nfields x value
+
+PORTABILITY NOTE.  A POD instance's bytes are written as laid out by the
+writing host, and a flat struct array's element bytes likewise.  The layout
+rules (pod_field_size / pod_field_align, structtype.h) depend only on
+sizeof(int_type), and the endianness marker already refuses a differently-
+ordered host - so an image with POD struct constants is portable between hosts
+that agree on int_type's width, which is every 64-bit target MyLang builds
+for.  A 32-bit host would need its own image.
+
+--------------------------------------------------------------------------------
+12.  DERIVED DATA - PRESENT IN MEMORY, ABSENT FROM THE FILE
+--------------------------------------------------------------------------------
+
+Anything a load can recompute is recomputed, for size and - more importantly -
+to keep ONE implementation of it.  Each is rebuilt by calling the SAME function
+that built it during compilation; a hand-written reader would be a second
+implementation free to drift.
+
+    Chunk::boxed_ops      The JIT-bakeable operand pool for the boxed
+                          arithmetic ops.  A pure function of the final code
+                          plus the loc table, so `read_chunk` calls
+                          `build_boxed_ops` (codegen.h) after reading a chunk -
+                          last, since it needs `locs`.  It also stamps each
+                          such op's `target2` with the pool index, overwriting
+                          the stored value with an identical one.
+                          49 bytes per entry saved.
+
+    Chunk::catch_uids     The interned twins of `catch_types`; re-interned
+                          inline as the names are read.
+
+    Chunk::native, native_leaf, native_entry_off
+                          The native tier: recomputed by
+                          `vm_jit_loaded_image` at the end of the load.
+                          `native_leaf` is derived from the ops
+                          (`jit_chunk_is_native_leaf`).
+
+    StructTypeDef layout  size, align, the POD decision and every field
+                          offset: `compute_layout()`.
+
+    FuncDescriptor::decl  A compile-only AST back-pointer; always null at
+                          runtime.
+
+--------------------------------------------------------------------------------
+13.  BAKED ENUM ORDINALS
+--------------------------------------------------------------------------------
+
+These enumerations are stored as their NUMERIC values, so REORDERING OR
+INSERTING A MEMBER IS A FORMAT CHANGE and must bump the format version.  (The
+same is true of OpCode and Op, which appear in every instruction.)
+
+    Storage (sharedarray.h)
+        0 general   1 ints   2 floats   3 bools   4 structs   5 strs
+
+    FieldKind (structtype.h)
+        0 f_bool  1 f_int  2 f_float  3 f_str  4 f_array  5 f_dict
+        6 f_dyn   7 f_struct
+
+    DeclType (funcdesc.h)
+        0 none  1 b  2 i  3 f  4 s  5 arr  6 dict  7 strct  8 dyn
+
+    SymKind (funcdesc.h)
+        0 unresolved  1 local  2 global  3 capture  4 builtin
+
+    ArrHint (syntax.h)
+        0 dflt  1 general  2 flat_i  3 flat_f  4 flat_b  5 flat_s
+
+    ThrowKind (bytecode.h)
+        0 undefined_var  1 not_lvalue  2 rebind_builtin  3 rebind_const
+        4 bad_args
+
+    CallSite::A0 (bytecode.h)
+        0 none  1 slot  2 elem  3 member  4 undef
+
+    VTag (serialize.cpp, section 11)
+        0 none  1 boolean  2 integer  3 flt  4 str  5 arr  6 dict
+        7 strct  8 structtype  9 func
+
+--------------------------------------------------------------------------------
+14.  LOADING
+--------------------------------------------------------------------------------
+
+`myv_read` performs, in order:
+
+     1. read the whole file into memory
+     2. magic, format version, endianness, builtin fingerprint
+     3. the source reference; resolve and verify it (section 5)
+     4. the string table -> re-interned UniqueIds
+     5. struct definitions: construct all, fill all, compute_layout each
+     6. descriptors: construct all, fill all
+     7. the root chunk, then each descriptor's chunk, installing it
+        (each chunk's derived pools rebuilt at the end of read_chunk)
+     8. the globals
+     9. vm_jit_loaded_image(prog) - the native tier, both passes, exactly as a
+        fresh compile runs them
+    10. return the VmProgram
+
+The caller OWNS the returned program and must keep it alive for the whole run:
+exception payloads and lazily-rendered backtrace frames reference its struct
+definitions and descriptors.
+
+VALIDATION.  Every read is length-checked (a short file is "corrupt or
+incompatible .myv (truncated)").  Every table index is bounds-checked against
+the table it names.  Opcodes are range-checked, instruction width codes are
+range-checked, reserved instruction flag bits must be zero, loc pcs must be
+within the code, and reconstructed loc deltas must not go negative.  Any
+failure throws a plain `MyvError` Exception; the driver prints it and exits
+non-zero.
+
+--------------------------------------------------------------------------------
+15.  DETERMINISM
+--------------------------------------------------------------------------------
+
+Compiling the same source twice produces a BYTE-IDENTICAL file - pinned by a
+test - provided both compiles run from the same working directory, since the
+source reference contains paths.  `--strip-source` makes an image
+path-independent and therefore reproducible from anywhere.
+
+There is no timestamp, no build id, and no address anywhere in the format.
+
+The `-vd` disassembly of a loaded image is byte-identical to that of a fresh
+in-memory compile.  This is the format's primary ORACLE, and it holds for 84
+of 86 files in bench/ + samples/; the 2 exceptions differ only in the printed
+ORDER of a const dict's entries (section 11.2).
+
+15.1  Is THIS DOCUMENT correct?
+
+`tests/myv_doc_check.py` is an independent reader written from this document
+and deliberately NOT from serialize.cpp.  If it consumes an image to exactly
+EOF, the document is complete: every byte is accounted for by some record
+described here.  A leftover byte means the doc and the format have drifted -
+precisely what a reader of the doc would hit.
+
+    for f in samples/* bench/my/*.my; do
+        ./mylang -c "$f" -o /tmp/i/$(basename "$f").myv
+    done
+    tests/myv_doc_check.py /tmp/i/*.myv
+
+As of version 6 it reads all 89 corpus images to exactly EOF, including a
+`--strip-source` image, a struct-bearing one, and one built to force all four
+Loc escapes.  Keep it in step with THIS FILE, never with the C++ - updating it
+by reading serialize.cpp would defeat its purpose.
+
+--------------------------------------------------------------------------------
+16.  CHANGING THE FORMAT
+--------------------------------------------------------------------------------
+
+Rules, in force:
+
+  1. BUMP `MYV_FORMAT_VERSION` (serialize.h) IN THE SAME COMMIT.  There is no
+     compatibility shim; an old image is refused with a clear message.
+
+  2. THE PAIRING RULE: a record's write and its read live ADJACENT in
+     serialize.cpp, in the same order, so the two cannot drift.  Where a
+     record is complex (instructions, the loc table), the write site carries
+     the documentation and the read site points at it.
+
+  3. NO ODD WIDTHS.  A field is one byte, two, four or eight - or a sentinel
+     byte followed by a plain 4-byte int32.  No 5-byte integers, no
+     bit-straddling values, no LEB128.
+
+  4. DERIVED DATA IS NOT STORED, and is rebuilt by calling the producer's own
+     function rather than a reimplementation (section 12).
+
+  5. NEVER memcpy a struct.  Padding content is indeterminate and would make
+     images non-deterministic; every field is written individually.
+
+  6. THE `-vd` DUMP IS A PARTIAL ORACLE.  It does not print every boxed_ops
+     field, nor a loc entry's `end`, nor most pool carets - so byte-identical
+     dumps alone do NOT prove a Loc or an operand round-tripped.  The tests
+     therefore compare those structures FIELD-FOR-FIELD (`myv_locs_equal`,
+     `myv_pool_locs_equal`, and the boxed_ops comparison in
+     `myv_round_trip`), and each such check ASSERTS it had something to
+     compare, so it cannot pass vacuously on two empty pools.
+
+  7. TEST A LIMIT ON BOTH SIDES.  Every escape path has a test that forces it
+     and asserts it fired (`myv_loc_escapes` covers all four Loc escapes).
+     An encoding whose escape is never exercised is an untested encoding.
+
+  8. TRAP TO REMEMBER: `myv_read` runs the load-time JIT, which inserts
+     EnterNative ops and REMAPS every pc - the loc table included.  A test
+     comparing a written image against an in-memory program must therefore
+     WRITE FIRST and then run `vm_jit_loaded_image` on the in-memory side, or
+     it will report an off-by-one pc that is not a format bug.
+
+--------------------------------------------------------------------------------
+17.  SIZE
+--------------------------------------------------------------------------------
+
+Measured on samples/, image bytes versus source bytes:
+
+    sample       source   image   ratio
+    strloop         126     356   2.83x
+    loop            166     543   3.27x
+    fib             240     543   2.26x
+    rand_sort       275     558   2.03x
+    primes          419    1037   2.47x
+    primes2         828    1677   2.03x
+    gcd            1809    1580   0.87x
+    shopping       2700    4327   1.60x
+    phonebook      2908    6506   2.24x
+
+Version 1 of the format was 4-6x the source; the five encoding changes since
+(a source reference instead of the embedded text, compact instructions, the
+derived pool dropped, delta-coded locs, narrow pool Locs) took shopping from
+12847 to 4327 bytes and gcd from 4920 to 1580 - an image smaller than the
+program it came from.
+
+`MYLANG_MYVSTATS=1 mylang -c FILE` prints the per-section byte accounting used
+for these measurements.

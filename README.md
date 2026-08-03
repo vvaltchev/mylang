@@ -173,6 +173,9 @@ never be drawn on text that has moved:
 `--strip-source` stores no reference at all, so such an image carries no
 local paths and its errors never quote source.
 
+The binary layout is specified byte by byte in
+[docs/myv-format.txt](docs/myv-format.txt).
+
 An image is tied to the interpreter that wrote it: a different format
 version, a different endianness, or a binary with a different set of
 builtins is refused with a clear message asking you to recompile from
