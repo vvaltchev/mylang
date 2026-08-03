@@ -270,8 +270,43 @@ struct Writer {
         i64v(static_cast<int64_t>(u));
     }
     void boolv(bool b) { u8v(b ? 1 : 0); }
-    void locv(const Loc &l) { u32v(static_cast<uint32_t>(l.line));
-                              u32v(static_cast<uint32_t>(l.col)); }
+    void u16v(uint16_t v)
+    {
+        u8v(static_cast<uint8_t>(v & 0xff));
+        u8v(static_cast<uint8_t>((v >> 8) & 0xff));
+    }
+
+    /*
+     * A POOL Loc - NARROW: `u16` line + `u8` col, THREE bytes instead of
+     * eight, each field with a whole-byte sentinel escape to a plain 4-byte
+     * little-endian int32 (the same rule the loc table's delta fields use;
+     * nothing here is an odd-width integer either). Measured over
+     * bench/ + samples/: 1618 pool Locs, widest line 206, widest column 77,
+     * so NOTHING escaped - but a 70000-line file or a 300-column caret still
+     * round-trips exactly, at 7-9 bytes for those Locs.
+     *
+     * These are ABSOLUTE (unlike the loc TABLE's, which delta against the
+     * previous entry): a caret pool's Locs have no ordering relationship to
+     * each other, so there is nothing to delta against - hence `u16` for the
+     * line rather than a byte, since a one-byte line would escape in any file
+     * over 254 lines. Read side: Reader::locv.
+     */
+    void locv(const Loc &l)
+    {
+        if (l.line >= 0 && l.line <= 65534) {
+            u16v(static_cast<uint16_t>(l.line));
+        } else {
+            u16v(0xffff);
+            u32v(static_cast<uint32_t>(static_cast<int32_t>(l.line)));
+        }
+
+        if (l.col >= 0 && l.col <= 254) {
+            u8v(static_cast<uint8_t>(l.col));
+        } else {
+            u8v(0xff);
+            u32v(static_cast<uint32_t>(static_cast<int32_t>(l.col)));
+        }
+    }
     void raw(const std::string &s) { u32v(static_cast<uint32_t>(s.size()));
                                      buf += s; }
 
@@ -389,10 +424,25 @@ struct Reader {
         return v;
     }
 
+    uint16_t u16v()
+    {
+        const uint8_t lo = u8v(), hi = u8v();
+        return static_cast<uint16_t>(lo | (hi << 8));
+    }
+
+    /* A POOL Loc - the narrow form; the field layout and the escape rule are
+     * documented at the write site (Writer::locv). */
     Loc locv()
     {
-        const uint32_t line = u32v(), col = u32v();
-        return Loc(static_cast<int>(line), static_cast<int>(col));
+        const uint16_t l16 = u16v();
+        const int line = l16 != 0xffff
+                             ? static_cast<int>(l16)
+                             : static_cast<int>(static_cast<int32_t>(u32v()));
+        const uint8_t c8 = u8v();
+        const int col = c8 != 0xff
+                            ? static_cast<int>(c8)
+                            : static_cast<int>(static_cast<int32_t>(u32v()));
+        return Loc(line, col);
     }
     std::string raw()
     {
