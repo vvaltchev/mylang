@@ -182,9 +182,32 @@ assertion fires; both hoisted reads' byte stride forced to 8 ->
 value divergence; the bounds check dropped -> the negative-index
 case diverges.
 
-Remaining follow-ups on the C1 family, in value order:
-  - the hoisted-COMPOUND store form (compound ops keep the ordinary
-    tier inside a region).
+**C1e - the hoisted-COMPOUND store. LANDED 2026-08-03.** The C1b
+hoisted arm now serves `a[i] OP= v` too: value load, the runtime
+divisor 0/-1 guards (before the bounds check, as the ordinary tier's
+precede prep - a div-by-zero store must throw in the helper without
+storing), bounds-vs-r11, then the RMW - `mov rcx, r10` lets the
+ordinary tier's [rcx+r9*8] tails serve verbatim, minus the per-element
+hash store (done once at the preheader) and the whole nav. The
+emit-time refusals (float `%=`, literal 0/-1 divisors) moved ahead of
+the arm and hold for both tiers; a hint-3 compound never hoists (a
+compound on BOOL storage is compile-unreachable - the ordinary tier's
+ints kind guard raises the exact error). Execution-proven by the
+arm's OWN counter `g_jit_hoist_rmw` - g_jit_store_fast also counts
+the ordinary tier, so it cannot prove this arm ran (the per-shape
+attribution rule). Sabotages watched failing: the int RMW op swapped
+(value divergence), the zero-divisor guard dropped (a hardware #DE in
+the fragment), the float farith swapped (divergence). The -1 guard is
+NOT sabotage-provable today: INT_MIN/-1 SIGFPEs the helper too - a
+PRE-EXISTING, engine-uniform hole this step's test exposed (task
+#103: TypeInt::div/mod and the VM store bodies raw-divide with only a
+zero check; even the parse-time const-fold crashes; -fwrapv does not
+define division overflow). MEASURED: the corpus is byte-flat per
+scale (no suite bench compounds into an element - reach + parity,
+like prep); a 1M-compound-store probe reads **-29.5%** whole-program
+(64.4M -> 45.4M, ~19 Ir per store).
+
+The C1 family is COMPLETE. Next: C2/C3 below.
 
 ### C2 - widen the register cache beyond int slots
 

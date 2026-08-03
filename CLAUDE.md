@@ -1376,8 +1376,23 @@ Measured (callgrind Ir/scale, OPT=1 ASSERTS=0): 57_bool_reduce
 **-41.6%** (360.6M -> 210.6M), 18_foreach_array **-37.1%** (the
 temp-base unlock), 56_sieve_bool **-24.8%**, 43_sieve **-18.2%**
 (their count loops joined); 68_nested exactly neutral (its foreach
-arrays are tiny); 46/14/01/02/09/15 byte-flat per scale. Remaining on
-the family: the hoisted-COMPOUND store form; then C2/C3 per the plan.
+arrays are tiny); 46/14/01/02/09/15 byte-flat per scale.
+**C1e - the hoisted-COMPOUND store (same day; the family's last
+rung).** The hoisted store arm serves `a[i] OP= v` too: divisor
+0/-1 guards (before bounds - a div0 store must throw in the helper
+WITHOUT storing), bounds-vs-r11, then the RMW via `mov rcx, r10` so
+the ordinary tier's [rcx+r9*8] tails serve verbatim - minus the
+per-element hash store (preheader, once) and the nav. Hint-3
+compounds never hoist (compound-on-bools is compile-unreachable).
+Execution-proven by the arm's OWN `g_jit_hoist_rmw` (g_jit_store_fast
+counts the ordinary tier too - it cannot prove this arm). Corpus
+byte-flat (no bench compounds into an element); a 1M-compound-store
+probe reads -29.5% (~19 Ir/store). The C1e divisor test EXPOSED a
+pre-existing engine-uniform hole: **INT_MIN / -1 SIGFPEs every
+engine incl. the parse-time fold** (TypeInt::div/mod + the VM store
+bodies raw-divide with only a zero check; -fwrapv does not define
+division overflow) - task #103, maintainer to rule wrap-vs-throw.
+Next on the staircase: C2/C3 per the plan.
 MEASUREMENT-HARNESS NOTE: shopping/phonebook fed </dev/null spin
 forever on EOF re-printing their menus - a `timeout`-truncated
 JIT-on-vs-off byte compare then "diverges" purely by SPEED; feed `q`

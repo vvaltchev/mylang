@@ -50,6 +50,7 @@ extern "C" {
 unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
 unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
+unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
@@ -4191,41 +4192,8 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     const bool compound = aop != Op::invalid;
     const bool divmod = aop == Op::div || aop == Op::mod;
 
-    /*
-     * C1b: the HOISTED plain store - the preheader proved the base AND
-     * the store guards (const/readonly/no live views) and invalidated
-     * the hash once, so the element is a bounds check + a raw write off
-     * the pinned registers. Negative/OOB declines to the full helper
-     * (which re-derives everything from memory - never stale).
-     * Compound stores keep the ordinary tier below (the RMW + divisor
-     * guards; a hoisted-compound form is a listed follow-up).
-     */
-    const int hoist_want = is_float ? 1
-                         : in.elem_bool_hint() ? 3 : 0;
-    if (!compound && g_hoist.active && g_hoist.store_ok
-            && in.target2 == g_hoist.base
-            && g_hoist.kind == hoist_want) {
-        if (is_float)
-            emit_float_load(e, X0, in.b_is_lit(), in.b_flit(),
-                            in.b_slot(), 0, /*no_bail=*/true);
-        else
-            load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
-        load_index_r9(e, in);
-        e.cmp_r9_hr(g_hoist.rcount);
-        slows.push_back(e.j32(0x73));            /* jae -> the helper */
-#ifdef TESTS
-        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x02);      /* the tier's counter */
-#endif
-        if (is_float)
-            e.store_elem_float_hr(g_hoist.rdata);
-        else if (hoist_want == 3)
-            e.store_elem_byte_hr(g_hoist.rdata); /* 0/1 literal -> dil */
-        else
-            e.store_elem_int_hr(g_hoist.rdata);
-        dones.push_back(e.jmp32());
-        return true;
-    }
+    /* The compound emit-time refusals FIRST (they hold for the hoisted
+     * arm too - a refused shape takes the full helper either way). */
     if (compound) {
         if (aop != Op::plus && aop != Op::minus && aop != Op::times
             && !divmod)
@@ -4238,6 +4206,99 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         if (aop == Op::div && is_float && in.b_is_lit()
             && in.b_flit() == 0.0)
             return false;
+    }
+
+    /*
+     * C1b: the HOISTED store - the preheader proved the base AND the
+     * store guards (const/readonly/no live views) and invalidated the
+     * hash once, so a plain store is a bounds check + a raw write off
+     * the pinned registers, and (C1e) a COMPOUND is bounds + an RMW
+     * off them: `mov rcx, r10` lets the ordinary tier's [rcx+r9*8]
+     * tails serve unchanged, minus the per-element hash store (done
+     * once at the preheader) and minus the whole nav. The runtime
+     * divisor guards precede the bounds check exactly as the ordinary
+     * tier's precede prep: a div-by-zero store must throw (in the
+     * helper) without storing. Negative/OOB declines to the full
+     * helper (which re-derives everything from memory - never stale).
+     * A hint-3 compound never hoists: a compound on BOOL storage is
+     * compile-unreachable (the store pins the base to array<int>), and
+     * the ordinary tier's ints kind guard raises the exact error.
+     */
+    const int hoist_want = is_float ? 1
+                         : in.elem_bool_hint() ? 3 : 0;
+    if (g_hoist.active && g_hoist.store_ok
+            && in.target2 == g_hoist.base
+            && g_hoist.kind == hoist_want
+            && !(compound && hoist_want == 3)) {
+        if (is_float)
+            emit_float_load(e, X0, in.b_is_lit(), in.b_flit(),
+                            in.b_slot(), 0, /*no_bail=*/true);
+        else
+            load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
+        if (compound && divmod && !in.b_is_lit()) {
+            /* the slot-divisor 0 / -1 declines (the helper throws /
+             * computes the -1 case as the interpreter's C++ does) */
+            if (!is_float) {
+                e.cmp_rdi_imm8(0);
+                slows.push_back(e.j32(0x74));    /* je (== 0) */
+                e.cmp_rdi_imm8(-1);
+                slows.push_back(e.j32(0x74));    /* je (== -1) */
+            } else {
+                e.pxor_x1();
+                e.ucomisd(X0, X1);
+                const size_t j_nan = e.j8(0x7A); /* jp -> not zero */
+                slows.push_back(e.j32(0x74));    /* je (== 0.0) */
+                e.patch8(j_nan, e.pos());
+            }
+        }
+        load_index_r9(e, in);
+        e.cmp_r9_hr(g_hoist.rcount);
+        slows.push_back(e.j32(0x73));            /* jae -> the helper */
+#ifdef TESTS
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x02);      /* the tier's counter */
+#endif
+        if (!compound) {
+            if (is_float)
+                e.store_elem_float_hr(g_hoist.rdata);
+            else if (hoist_want == 3)
+                e.store_elem_byte_hr(g_hoist.rdata); /* 0/1 lit -> dil */
+            else
+                e.store_elem_int_hr(g_hoist.rdata);
+        } else {
+#ifdef TESTS
+            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_hoist_rmw));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x02);  /* the ARM's own counter
+                                                  * (g_jit_store_fast also
+                                                  * counts the ordinary
+                                                  * tier - it cannot prove
+                                                  * THIS arm ran) */
+#endif
+            e.mov_rr(RCX, g_hoist.rdata);        /* the [rcx+r9*8] tails */
+            if (is_float) {
+                e.load_elem_float_x1();          /* xmm1 = elem */
+                e.farith_x1_x0(aop == Op::plus  ? 0x58
+                             : aop == Op::minus ? 0x5C
+                             : aop == Op::times ? 0x59 : 0x5E);
+                e.store_elem_float_x1();
+            } else if (divmod) {
+                e.load_elem_int();               /* rax = elem */
+                e.cqo();
+                e.idiv_rdi();
+                if (aop == Op::div)
+                    e.store_elem_int_rax();
+                else
+                    e.store_elem_int_rdx();      /* remainder */
+            } else {
+                e.load_elem_int();
+                if (aop == Op::plus)       e.add_rax_rdi();
+                else if (aop == Op::minus) e.sub_rax_rdi();
+                else                       e.imul_rax_rdi();
+                e.store_elem_int_rax();
+            }
+        }
+        dones.push_back(e.jmp32());
+        return true;
     }
 
     const JitLayout &L = jit_layout();
