@@ -1,9 +1,11 @@
 # The `.myv` serializer — stored bytecode (design, 2026-07-18)
 
-Status: **IMPLEMENTED (v1, 2026-07-28)** - `-c` writes, a magic-sniffed
+Status: **IMPLEMENTED (v2, 2026-07-29)** - `-c` writes, a magic-sniffed
 file argument loads and runs, `-vd` dumps a loaded image, the round-trip
 oracle + determinism + corrupt-file refusal are pinned by `-rt`
-(`myv_round_trip`). See CLAUDE.md's ".myv STORED-BYTECODE FORMAT" for the
+(`myv_round_trip`). v2 replaced the embedded source text with a verified
+SOURCE REFERENCE (see the section at the end); `MYV_FORMAT_VERSION` is 2
+and a v1 file is refused. See CLAUDE.md's ".myv STORED-BYTECODE FORMAT" for the
 implementation shape. Deltas from this design: the section TOC was not
 needed (a linear reader suffices at these sizes); a BUILTIN-SET
 FINGERPRINT was ADDED after finding that builtin slot indices were
@@ -129,13 +131,17 @@ at a fixed stride, read back into a default-constructed `Instr`.
 [Debug]     slot_names per chunk           — OPTIONAL, strippable
 ```
 
-**Source embedding**: error rendering prints the offending source line
-+ caret (`dumpLocInError`) — that TEXT isn't derivable from a `Loc`.
-Default: `-c` EMBEDS the source (error quality is core to this
-project; the cost is the script's own size). `-c --strip-source`
-omits it; `errfmt` gains a no-source mode that prints
-`line N, col A:B: <Ex>: msg` without the caret block. Backtraces need
-no source (names come from descriptors, lines from Locs).
+**Source embedding** (⚠ SUPERSEDED IN v2 — see "the SOURCE REFERENCE"
+at the end of this file; kept here as the original design): error
+rendering prints the offending source line + caret (`dumpLocInError`) —
+that TEXT isn't derivable from a `Loc`. Default: `-c` EMBEDS the source
+(error quality is core to this project; the cost is the script's own
+size). `-c --strip-source` omits it; `errfmt` gains a no-source mode
+that prints `line N, col A:B: <Ex>: msg` without the caret block.
+Backtraces need no source (names come from descriptors, lines from
+Locs). v2 keeps the no-source mode but stores a verified path + CRC32
+instead of the text, so the caret works without the image carrying the
+program.
 
 **Determinism goal**: compiling the same source twice yields
 byte-identical `.myv` (codegen is single-threaded and pool orders are
@@ -241,9 +247,9 @@ records) - samples/shopping, 2700-byte source, 12847-byte image:
 | section                | bytes | share |
 |------------------------|-------|-------|
 | code (Instr records)   | 4741  | 37%   |
-| header + string table  | 3020  | 24% (of which the embedded SOURCE 2699) |
+| header + string table  | 3020  | 24% (SOURCE 2699 - gone in v2) |
 | builtin_calls + call_sites | 1642 | 13% |
-| the mid pools (boxed_ops, literal_objs, catch_types, closure_defs, ...) | 1554 | 12% |
+| mid pools (boxed_ops, literal_objs, catch_types, ...) | 1554 | 12% |
 | locs                   |  796  | 6%    |
 | consts + ref_slots     |  766  | 6%    |
 | descriptors            |  156  | 1%    |
@@ -281,8 +287,45 @@ Projected combined (1+2+3+5): 12847 -> **~7.4 KB**; with (4) ~6 KB;
 with `--strip-source` on top ~**3.3-4.8 KB** for a 2700-byte source,
 which `zstd` then takes to ~1.0-1.3 KB.
 
-THE FRAMING POINT: with the source EMBEDDED (the default, because error
+THE FRAMING POINT: with the source EMBEDDED (v1's default, because error
 carets need the text) an image contains the source PLUS the bytecode, so
-it can NEVER be smaller than the source. Size comparisons should use
-`--strip-source`; today that is already at parity compressed (2661 vs
-2700 for shopping) and the changes above put it well below.
+it can NEVER be smaller than the source. That framing is what led to the
+first change below.
+
+## v2 (2026-07-29): the SOURCE REFERENCE replaces the embedded text
+
+DONE - the 24%-of-the-image string-table entry above is gone. Instead of
+the program text an image stores a `MyvSourceRef`: the project ROOT, the
+source path RELATIVE to it, the compile-time ABSOLUTE path, and a CRC32 +
+byte size of the file (~100 bytes total). At load time `resolve_source`
+finds the file and uses it ONLY if the CRC32 still matches, so a caret is
+never drawn on text that has changed underneath the image.
+
+Rules (README documents them for users):
+- `--source ROOT` looks ONLY under that root (`ROOT/rel`) - an explicit
+  root that lacks the file is a mistake worth reporting, not a reason to
+  silently fall back to a stale absolute path. Otherwise: the stored
+  `abs`, then `root/rel`.
+- The ROOT is the compile-time CWD when the source lives under it, else
+  the source's own directory - so `rel` is ALWAYS non-empty and an image
+  is relocatable. A `rel` full of `..` hops would not survive relocation,
+  so one is never built.
+- Present + matching -> the error is BYTE-IDENTICAL to the source run's
+  (pinned by a byte-compare). Present + CHANGED -> warning, and the file
+  is REFUSED (no caret) unless `-f`/`--force`, which uses it and warns
+  that carets may be misplaced. ABSENT -> silent (shipping an image alone
+  is ordinary); the header still names file/line and the backtrace still
+  names each function.
+- `--strip-source` now stores NO reference at all, so such an image also
+  carries no local paths.
+
+The error header gained the file name (`format_exception`'s new optional
+`src_name`): " at FILE, line L, col C". A plain script run passes its
+path too, so an image and its source produce the same text; `-e` and the
+REPL have no file and are unchanged.
+
+MEASURED (image / source): shopping 12847 -> **10243** (4.76x -> 3.79x),
+gcd 4920 -> 3197 (2.72x -> 1.77x), fib 1125 -> 971, primes2 4073 -> 3339,
+strloop 727 -> 695. Every image shrank by its source size less ~100
+bytes. Items 1-5 above are unaffected and still stand; with the source
+gone, the projected combined result for shopping is ~4.8 KB raw.

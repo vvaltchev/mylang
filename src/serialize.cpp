@@ -32,12 +32,20 @@
 #include "jit.h"
 #include "env.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <string>
 #include <vector>
+
+/* getcwd(), for the source reference's project root */
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -47,6 +55,185 @@ constexpr uint32_t MYV_ENDIAN_MARK = 0x01020304u;
 [[noreturn]] void bad_image(const char *what)
 {
     throw Exception("MyvError", what);
+}
+
+/* ------------------------------------------------------------------ */
+/* The SOURCE REFERENCE: CRC32 + path math (no <filesystem>: it would  */
+/* need -lstdc++fs on the older GCCs the CI still builds with)         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * CRC-32 (the reflected form: polynomial 0xedb88320, init/final inverted) -
+ * computed a bit at a time, so there is no 1KB table to carry. It runs once
+ * per compile and once per image load over a source file, so speed is
+ * irrelevant; what matters is that a source edited after `-c` is DETECTED.
+ */
+uint32_t crc32_of(const std::string &data)
+{
+    uint32_t c = 0xffffffffu;
+
+    for (unsigned char b : data) {
+        c ^= b;
+        for (int i = 0; i < 8; i++) {
+            /* subtract the low bit as a MASK: branch-free, and it keeps the
+             * conditional xor obvious */
+            c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
+        }
+    }
+
+    return ~c;
+}
+
+/* Read a whole file; false if it cannot be opened. */
+bool read_file(const std::string &path, std::string &out)
+{
+    std::ifstream f(path, std::ios::binary);
+
+    if (!f)
+        return false;
+
+    out.assign((std::istreambuf_iterator<char>(f)),
+               std::istreambuf_iterator<char>());
+    return true;
+}
+
+/* '/' is accepted as a separator by both platforms; Windows also takes '\'. */
+bool is_sep(char c)
+{
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+bool is_absolute(const std::string &p)
+{
+    if (p.empty())
+        return false;
+#ifdef _WIN32
+    if (p.size() >= 3 && p[1] == ':' && is_sep(p[2]))
+        return true;                      /* C:\... or C:/... */
+    return is_sep(p[0]);                  /* \\server\share, \abs */
+#else
+    return p[0] == '/';
+#endif
+}
+
+std::string cwd_path()
+{
+    /* PATH_MAX is not portable (and Hurd has none), so grow until it fits -
+     * but only while the failure IS "too small" (ERANGE); any other errno is
+     * permanent and would just spin through every size. */
+    for (size_t cap = 512; cap <= (1u << 16); cap *= 2) {
+        std::vector<char> buf(cap);
+        errno = 0;
+#ifdef _WIN32
+        if (_getcwd(buf.data(), static_cast<int>(cap)))
+#else
+        if (getcwd(buf.data(), cap))
+#endif
+            return std::string(buf.data());
+        if (errno != ERANGE)
+            break;
+    }
+    return std::string();   /* no root: the source's own dir is used */
+}
+
+std::string join_path(const std::string &dir, const std::string &rel)
+{
+    if (dir.empty())
+        return rel;
+    if (is_sep(dir.back()))
+        return dir + rel;
+    return dir + "/" + rel;
+}
+
+/*
+ * Resolve + VERIFY the source of an image being loaded, per the reference and
+ * the load options. The rules (README / plans/myv-serializer.md):
+ *  - `--source ROOT` given: look ONLY under it (`ROOT/rel`) - an explicit
+ *    root that does not have the file is a mistake worth reporting, not a
+ *    reason to silently fall back to a stale absolute path.
+ *  - else: the stored absolute path, then the stored `root/rel` (identical
+ *    by construction, but explicit - and the pair is what a future relocation
+ *    scheme would key on).
+ * A file that is THERE but whose size/CRC32 differs is REFUSED (warning, no
+ * text) unless `force`, because a caret drawn on the wrong text is worse than
+ * no caret. A file that is simply ABSENT is silent: shipping an image without
+ * its source is a supported, ordinary thing to do.
+ */
+void resolve_source(const MyvSourceRef &ref, const MyvLoadOpts &opts,
+                    MyvSource &out)
+{
+    if (ref.rel.empty() && ref.abs.empty())
+        return;                           /* --strip-source: no reference */
+
+    out.name = !ref.rel.empty() ? ref.rel : ref.abs;
+
+    std::vector<std::string> cands;
+
+    if (!opts.root.empty()) {
+        if (!ref.rel.empty())
+            cands.push_back(join_path(opts.root, ref.rel));
+    } else {
+        if (!ref.abs.empty())
+            cands.push_back(ref.abs);
+        if (!ref.root.empty() && !ref.rel.empty()) {
+            const std::string p = join_path(ref.root, ref.rel);
+            if (cands.empty() || p != cands.front())
+                cands.push_back(p);
+        }
+    }
+
+    std::string text;
+    std::string found;
+
+    for (const std::string &c : cands)
+        if (read_file(c, text)) { found = c; break; }
+
+    if (found.empty())
+        return;                           /* absent: plain errors, no fuss */
+
+    /* `out.name` stays the RELATIVE path (set above), not `found`: it is what
+     * a compiler prints, it is machine-independent, and it makes an image's
+     * error output byte-identical to the same error from the source. Which
+     * copy was read only matters when it MISMATCHES - the warning says so. */
+
+    if (text.size() != ref.size || crc32_of(text) != ref.crc) {
+
+        out.warning = "warning: '" + found + "' has changed since the image "
+                      "was compiled";
+
+        if (!opts.force) {
+            out.warning += " - ignoring it (pass -f to use it anyway)";
+            return;                       /* no text: no misplaced carets */
+        }
+
+        out.warning += " - using it anyway (-f): carets may be misplaced";
+    }
+
+    /* Split exactly as mylang.cpp's read_script does (getline semantics: a
+     * trailing newline does NOT add an empty last line), and drop a CR so a
+     * CRLF checkout renders the same carets as an LF one. */
+    std::string line;
+
+    for (char ch : text) {
+        if (ch == '\n') {
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            out.lines.push_back(line);
+            line.clear();
+        } else {
+            line.push_back(ch);
+        }
+    }
+
+    if (!line.empty()) {
+        if (line.back() == '\r')
+            line.pop_back();
+        out.lines.push_back(line);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1023,7 +1210,7 @@ void read_chunk(Reader &r, Chunk &c)
 /* ------------------------------------------------------------------ */
 
 void myv_write(const VmProgram &prog, const std::string &path,
-               const std::string &src)
+               const MyvSourceRef &src)
 {
     Writer w;
     size_t mark = 0;
@@ -1124,13 +1311,23 @@ void myv_write(const VmProgram &prog, const std::string &path,
     h.u32v(MYV_FORMAT_VERSION);
     h.u32v(MYV_ENDIAN_MARK);
     h.i64v(static_cast<int64_t>(builtin_set_fingerprint()));
-    h.raw(src);                                /* embedded source (may be "") */
+
+    /* the SOURCE REFERENCE (v2): where the text WAS + a CRC32 to prove the
+     * file on disk is still it. NOT the text itself. Read side: myv_read. */
+    const size_t ref_mark = h.buf.size();
+    h.raw(src.root);
+    h.raw(src.rel);
+    h.raw(src.abs);
+    h.u32v(src.crc);
+    h.i64v(static_cast<int64_t>(src.size));
+    const size_t ref_bytes = h.buf.size() - ref_mark;
+
     h.u32v(static_cast<uint32_t>(w.strs.size()));
     for (const std::string &s : w.strs)
         h.raw(s);
 
     myv_stat("header+strings", h.buf.size());
-    myv_stat("source-embedded", src.size());
+    myv_stat("source-ref", ref_bytes);
     myv_stat("TOTAL", h.buf.size() + w.buf.size());
 
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -1140,6 +1337,54 @@ void myv_write(const VmProgram &prog, const std::string &path,
     f.write(w.buf.data(), static_cast<long>(w.buf.size()));
     if (!f)
         throw Exception("MyvError", "cannot write the .myv image");
+}
+
+MyvSourceRef myv_source_ref(const std::string &path)
+{
+    MyvSourceRef ref;
+    std::string text;
+
+    if (!read_file(path, text))
+        return ref;                       /* empty ref: no reference stored */
+
+    ref.crc = crc32_of(text);
+    ref.size = text.size();
+    ref.abs = is_absolute(path) ? path : join_path(cwd_path(), path);
+
+    /*
+     * The ROOT is the compile-time CWD when the source lives under it (the
+     * usual `mylang -c samples/phonebook` run from the project root), else
+     * the source's OWN directory. Either way `rel` ends up non-empty, which
+     * is what lets `--source ROOT` relocate the image: a `rel` full of ".."
+     * hops would not survive relocation, so we never build one.
+     */
+    const std::string cwd = cwd_path();
+    const std::string under = join_path(cwd, "");
+
+    if (!cwd.empty() && ref.abs.size() > under.size()
+            && ref.abs.compare(0, under.size(), under) == 0) {
+
+        ref.root = cwd;
+        ref.rel = ref.abs.substr(under.size());
+
+    } else {
+
+        size_t slash = std::string::npos;
+
+        for (size_t i = ref.abs.size(); i-- > 0; )
+            if (is_sep(ref.abs[i])) { slash = i; break; }
+
+        if (slash == std::string::npos) {
+            ref.root = ".";
+            ref.rel = ref.abs;
+        } else {
+            /* keep the root's leading separator when it IS the root dir */
+            ref.root = ref.abs.substr(0, slash ? slash : 1);
+            ref.rel = ref.abs.substr(slash + 1);
+        }
+    }
+
+    return ref;
 }
 
 bool myv_is_image(const std::string &path)
@@ -1152,7 +1397,8 @@ bool myv_is_image(const std::string &path)
     return f.gcount() == 4 && memcmp(m, MYV_MAGIC, 4) == 0;
 }
 
-VmProgram myv_read(const std::string &path, std::vector<std::string> &out_src)
+VmProgram myv_read(const std::string &path, MyvSource &out_src,
+                   const MyvLoadOpts &opts)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f)
@@ -1172,18 +1418,16 @@ VmProgram myv_read(const std::string &path, std::vector<std::string> &out_src)
     if (static_cast<uint64_t>(r.i64v()) != builtin_set_fingerprint())
         bad_image("incompatible .myv (builtin set) - recompile from source");
 
-    /* the embedded source, split into lines for error rendering */
-    const std::string src = r.raw();
-    out_src.clear();
-    if (!src.empty()) {
-        std::string line;
-        for (char ch : src) {
-            if (ch == '\n') { out_src.push_back(line); line.clear(); }
-            else            { line.push_back(ch); }
-        }
-        if (!line.empty())
-            out_src.push_back(line);
-    }
+    /* the SOURCE REFERENCE (write side: myv_write's header block) */
+    MyvSourceRef ref;
+    ref.root = r.raw();
+    ref.rel = r.raw();
+    ref.abs = r.raw();
+    ref.crc = r.u32v();
+    ref.size = static_cast<uint64_t>(r.i64v());
+
+    out_src = MyvSource();
+    resolve_source(ref, opts, out_src);
 
     /* strings -> interned uids */
     uint32_t n = r.u32v();

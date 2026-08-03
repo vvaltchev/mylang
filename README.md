@@ -121,8 +121,10 @@ parsing and no optimizer passes:
 ```
 ./mylang -c script.my                 # writes script.myv
 ./mylang -c script.my -o out.myv      # explicit output path
-./mylang -c script.my --strip-source  # omit the embedded source
+./mylang -c script.my --strip-source  # store no source reference
 ./mylang script.myv                   # run it (detected by content)
+./mylang --source ~/proj script.myv   # find the source under another root
+./mylang -f script.myv                # trust a source the CRC32 rejects
 ./mylang -vd script.myv               # disassemble a stored image
 ```
 
@@ -133,17 +135,51 @@ code: the native compiler runs again when the file is loaded, so an image
 is portable across machines and keeps working as the native tier
 improves.
 
-By default the original source text is embedded, because error messages
-print the offending line with a caret under it. `--strip-source` drops it;
-errors from such an image still report the exception, the line/column and
-the full backtrace, just without the quoted source line.
+#### Where the source line in an error comes from
+
+An image does **not** embed your program text. It stores a small *source
+reference* instead — the path (relative to the project root, plus the
+absolute one) and a **CRC32** of the file. When an error needs to print
+the offending line with a caret under it, the interpreter looks for that
+file and uses it **only if the CRC32 still matches**, so the caret can
+never be drawn on text that has moved:
+
+- **File there and unchanged** → the error looks exactly as it would from
+  a normal source run, byte for byte:
+
+  ```
+  DivisionByZeroEx: Division by zero at sub/boom.my, line 2, col 16:17
+
+      return n / d;
+                 ^
+
+  Backtrace (most recent call first):
+    [0] inner(n, d) at line 2
+    [1] main()      at line 8
+  ```
+
+  (Running a *script* names the file the same way; `-e` and the REPL have
+  no file, so they print just `at line L, col C`.)
+- **File missing** → the error still names the file, the line, the column
+  and the full backtrace; only the quoted line and caret are gone. No
+  warning: shipping an image without its source is an ordinary thing to
+  do.
+- **File changed since it was compiled** → a warning, and the file is
+  *refused* (no caret) — pass `-f` / `--force` to use it anyway and accept
+  that carets may point at the wrong place.
+- **Source tree moved / another machine** → point `--source ROOT` at the
+  new project root; the stored *relative* path is resolved under it.
+
+`--strip-source` stores no reference at all, so such an image carries no
+local paths and its errors never quote source.
 
 An image is tied to the interpreter that wrote it: a different format
 version, a different endianness, or a binary with a different set of
 builtins is refused with a clear message asking you to recompile from
 source. A truncated or corrupted file is refused the same way rather than
 misbehaving. Compiling the same source twice produces byte-identical
-files.
+files — from the same directory, since the stored source paths are part
+of the image (`--strip-source` makes an image path-independent).
 
 ### The interactive REPL
 
