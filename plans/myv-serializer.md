@@ -262,11 +262,7 @@ RANKED, MEASURED ROI (shopping numbers; the ratios hold across samples):
 2. **Delta + narrow `locs` - 796 -> 195 (-75%).** The table is
    pc-ascending and lines/cols are small: pc as a delta, line as a delta,
    col as one byte (with an escape).
-3. **Stop storing DERIVED pools - 931 bytes for shopping (7%).**
-   `boxed_ops` is built by `build_boxed_ops(chunk)` from the CODE + the
-   loc table alone (49 bytes/entry on disk, 19 entries here); `-vd`
-   already labels it "derived". Rebuild it at load, exactly as
-   `catch_uids` is already rebuilt from `catch_types`.
+3. **Stop storing DERIVED pools - DONE in v4, see below** (947 bytes).
 4. **Narrow the Locs inside the caret pools (~10% more).** `ArgLoc` is
    16 bytes (two Locs of two u32s) and every builtin_call / call_site /
    member_key / chain step carries several; the same delta/narrow
@@ -376,3 +372,40 @@ MEASURED: shopping's code section 4741 -> **1086** bytes, the whole image
 (**1.14x** the source), shopping 6588 (2.44x), primes2 2059 (2.49x),
 rand_sort 684, fib 655, strloop 506. Cumulative from v1: shopping
 12847 -> 6588 (-49%), gcd 4920 -> 2067 (-58%).
+
+## v4 (2026-07-29): the DERIVED `boxed_ops` pool is not stored
+
+DONE - item 3 of the ROI list, and the cheapest of the set: pure
+deletion. `boxed_ops` (the JIT-bakeable operand data for BinOpV / CmpV /
+CompoundV / LogV / UnaryV + a compound global/capture store) is a PURE
+FUNCTION of the final code plus the loc side table, so the image stores
+none of its 49-byte entries and `read_chunk` calls **`build_boxed_ops`**
+- exported from codegen.h for exactly this - once a chunk is read (last,
+since it needs `locs`). Same shape as `catch_uids`, which was already
+rebuilt from `catch_types` at load.
+
+THE POINT IS SINGLE-SOURCE-OF-TRUTH, not only bytes: the loader calls the
+function CODEGEN uses. A hand-written reader would be a second
+implementation free to drift, and a drifted pool would feed the JIT wrong
+operands or a wrong caret.
+
+Fell out of it: the `Operand` read/write codec in serialize.cpp is GONE -
+the derived pool was its only user (an `Instr`'s own operands ride the v3
+compact encoding, not that fat 14-byte form). `-Werror=unused-function`
+pointed this out, which is the warnings-as-errors rule paying for itself.
+
+VERIFICATION worth noting, because the obvious oracle is INSUFFICIENT:
+`-vd` prints only each entry's `target` + `aop`, so byte-identical dumps
+do NOT prove the rebuilt operands or carets. The round-trip test therefore
+compares the pools FIELD-FOR-FIELD (target, aop, both Operands - the live
+union member per `lit_kind` - and both Locs) across the root chunk and
+every function chunk, and it counts the entries so that an edit to the
+test program cannot make the comparison vacuously pass on two empty
+pools (the program yields 8). Separately confirmed end to end: a `dyn`
+div-by-zero inside a JIT'd loop - whose caret the JIT stamps STRAIGHT
+from `boxed_ops[i].start/end` - renders byte-identically from an image
+and from source.
+
+MEASURED: shopping 6588 -> **5641** (-14%), gcd 2067 -> **1957** = 1.08x
+its source, strloop 506 -> 404, phonebook 8863 -> 8284. Cumulative from
+v1: shopping 12847 -> 5641 (**-56%**), gcd 4920 -> 1957 (-60%).

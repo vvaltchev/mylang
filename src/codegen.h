@@ -53,3 +53,19 @@ Chunk codegen_program(const Block *root, bool jit = true);
  * shared by the VM's AOT precompile (vm.cpp) and the -vd dump (disasm.cpp).
  */
 bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit = true);
+
+/*
+ * Build `chunk.boxed_ops` (the JIT-bakeable operand pool for BinOpV / CmpV /
+ * CompoundV / LogV / UnaryV + a compound global/capture store) and stamp each
+ * such op's otherwise-unused `target2` with its pool index. See
+ * Chunk::BoxedOp.
+ *
+ * DERIVED DATA: it is a pure function of the FINAL code plus the loc side
+ * table, so the `.myv` loader does NOT store the pool - it calls THIS
+ * function after reading a chunk. Exposed for exactly that reason: the loader
+ * must rebuild what codegen built, and a second implementation would be free
+ * to drift (the round-trip dump oracle would catch it, but only after the
+ * fact). Runs at the END of codegen (post-peephole, post-extract_locs) and,
+ * at load, after `locs` is read.
+ */
+void build_boxed_ops(Chunk &chunk);

@@ -15731,6 +15731,74 @@ static bool myv_round_trip()
             g_exec_engine = saved;
             return false;
         }
+        /*
+         * The DERIVED `boxed_ops` pool is NOT in the file - the loader calls
+         * codegen's build_boxed_ops. Prove the rebuild is FIELD-FOR-FIELD
+         * what the compile produced: the -vd dump prints only each entry's
+         * target + aop, so the dump oracle alone would miss a wrong operand
+         * or a wrong caret (and the caret is what a JIT'd boxed throw stamps).
+         */
+        auto same_boxed = [](const Chunk &x, const Chunk &y) {
+            auto same_op = [](const Operand &a, const Operand &b) {
+                if (a.is_lit != b.is_lit || a.lit_kind != b.lit_kind)
+                    return false;
+                if (!a.is_lit)
+                    return a.slot == b.slot;
+                /* lit/flit share a union: compare the LIVE member */
+                if (a.lit_kind == Operand::LitKind::f)
+                    return a.flit == b.flit;
+                return a.lit == b.lit;
+            };
+            auto same_loc = [](const Loc &a, const Loc &b) {
+                return a.line == b.line && a.col == b.col;
+            };
+            if (x.boxed_ops.size() != y.boxed_ops.size())
+                return false;
+            for (size_t i = 0; i < x.boxed_ops.size(); i++) {
+                const Chunk::BoxedOp &a = x.boxed_ops[i];
+                const Chunk::BoxedOp &b = y.boxed_ops[i];
+                if (a.target != b.target || a.aop != b.aop
+                        || !same_op(a.a, b.a) || !same_op(a.b, b.b)
+                        || !same_loc(a.start, b.start)
+                        || !same_loc(a.end, b.end))
+                    return false;
+            }
+            return true;
+        };
+
+        bool boxed_ok = same_boxed(prog.root, loaded.root)
+                        && prog.funcs.size() == loaded.funcs.size();
+
+        /* ... and count them, so an edit to the program above cannot make the
+         * comparison VACUOUS (empty == empty passes trivially) */
+        size_t nboxed = prog.root.boxed_ops.size();
+
+        for (size_t i = 0; boxed_ok && i < prog.funcs.size(); i++) {
+            const Chunk *a =
+                static_cast<const Chunk *>(prog.funcs[i]->vm_chunk);
+            const Chunk *b =
+                static_cast<const Chunk *>(loaded.funcs[i]->vm_chunk);
+            if (!a != !b) {
+                boxed_ok = false;
+            } else if (a) {
+                nboxed += a->boxed_ops.size();
+                if (!same_boxed(*a, *b))
+                    boxed_ok = false;
+            }
+        }
+
+        if (!boxed_ok) {
+            fprintf(stderr, "myv: the REBUILT boxed_ops pool differs\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        if (!nboxed) {
+            fprintf(stderr, "myv: no boxed_ops to compare - the program above "
+                            "no longer exercises the rebuild\n");
+            g_exec_engine = saved;
+            return false;
+        }
+
         /* the reference RESOLVED: the file is still the one compiled, so the
          * loader hands back its text (error carets work) with no warning */
         if (img_src.lines.size() != nlines || !img_src.warning.empty()

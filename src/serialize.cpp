@@ -30,6 +30,7 @@
 #include "vm.h"
 #include "eval.h"
 #include "jit.h"
+#include "codegen.h"
 #include "env.h"
 
 #include <cerrno>
@@ -684,29 +685,9 @@ EvalValue read_value(Reader &r)
 /* Small shared records                                                 */
 /* ------------------------------------------------------------------ */
 
-void write_operand(Writer &w, const Operand &o)
-{
-    w.boolv(o.is_lit);
-    w.u8v(static_cast<uint8_t>(o.lit_kind));
-    w.u32v(static_cast<uint32_t>(o.slot));
-    if (o.is_lit && o.lit_kind == Operand::LitKind::f)
-        w.f64v(static_cast<double>(o.flit));
-    else
-        w.i64v(static_cast<int64_t>(o.lit));
-}
-
-Operand read_operand(Reader &r)
-{
-    Operand o;
-    o.is_lit = r.boolv();
-    o.lit_kind = static_cast<Operand::LitKind>(r.u8v());
-    o.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
-    if (o.is_lit && o.lit_kind == Operand::LitKind::f)
-        o.flit = static_cast<float_type>(r.f64v());
-    else
-        o.lit = static_cast<int_type>(r.i64v());
-    return o;
-}
+/* (The `Operand` codec that lived here is GONE with the boxed_ops pool - the
+ * derived pool was its only user, and an `Instr`'s own operands ride the
+ * compact instruction encoding, not this fat 14-byte form.) */
 
 void write_arglocs(Writer &w, const std::vector<ArgLoc> &v)
 {
@@ -869,14 +850,16 @@ void write_chunk(Writer &w, const Chunk &c)
     }
 
     ct("  member_keys");
-    w.u32v(static_cast<uint32_t>(c.boxed_ops.size()));
-    for (const auto &b : c.boxed_ops) {
-        w.u32v(static_cast<uint32_t>(b.target));
-        w.u8v(static_cast<uint8_t>(b.aop));
-        write_operand(w, b.a);
-        write_operand(w, b.b);
-        w.locv(b.start); w.locv(b.end);
-    }
+
+    /*
+     * `boxed_ops` is NOT STORED (v4): it is DERIVED - `build_boxed_ops`
+     * (codegen.h) recomputes it from the final code + the loc side table, so
+     * the loader calls that same function instead of reading 49 bytes per
+     * entry (931 of samples/shopping's bytes, 14% of the image). The read
+     * side is the build_boxed_ops call at the END of read_chunk, after `locs`
+     * (which it needs) has been read - the same rebuild-a-derived-twin shape
+     * `catch_uids` already uses.
+     */
 
     w.u32v(static_cast<uint32_t>(c.ctor_plans.size()));
     for (const auto &p : c.ctor_plans) {
@@ -1126,17 +1109,9 @@ void read_chunk(Reader &r, Chunk &c)
         c.member_keys.push_back(std::move(m));
     }
 
-    n = r.u32v();
-    c.boxed_ops.reserve(n);
-    for (uint32_t i = 0; i < n; i++) {
-        Chunk::BoxedOp b;
-        b.target = static_cast<int>(static_cast<int32_t>(r.u32v()));
-        b.aop = static_cast<Op>(r.u8v());
-        b.a = read_operand(r);
-        b.b = read_operand(r);
-        b.start = r.locv(); b.end = r.locv();
-        c.boxed_ops.push_back(b);
-    }
+    /* `boxed_ops` is DERIVED and NOT in the file - see the write side. It is
+     * rebuilt by build_boxed_ops at the end of this function (it needs the
+     * loc table, which is read further down). */
 
     n = r.u32v();
     c.ctor_plans.reserve(n);
@@ -1333,6 +1308,15 @@ void read_chunk(Reader &r, Chunk &c)
     c.slot_names.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         c.slot_names.push_back(r.strv());
+
+    /*
+     * REBUILD the derived pools, LAST - both need data read above. The
+     * loader calls the codegen's OWN function (codegen.h), never a private
+     * copy, so what a load produces cannot drift from what a compile did.
+     * (`catch_uids`'s twin is re-interned inline where catch_types is read;
+     * boxed_ops needs the loc table, hence here.)
+     */
+    build_boxed_ops(c);
 }
 
 }  /* anon namespace */

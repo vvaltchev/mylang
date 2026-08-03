@@ -7936,7 +7936,9 @@ static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
  * (post-peephole/specialize) UNCONDITIONALLY: the interpreter ignores target2
  * for these ops, and the VM precompile jits in a LATER pass that needs the pool
  * already built. */
-static void build_boxed_ops(Chunk &chunk)
+/* Declared in codegen.h - the `.myv` loader calls it to REBUILD this derived
+ * pool instead of storing it (see the header comment). */
+void build_boxed_ops(Chunk &chunk)
 {
     for (size_t pc = 0; pc < chunk.code.size(); pc++) {
         Instr &in = chunk.code[pc];

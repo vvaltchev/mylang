@@ -4392,6 +4392,28 @@ a plain little-endian integer at a byte boundary, O(1) decode, two
 compiles byte-identical) - the no-compression decision record stands.
 Measured: shopping's code section 4741 -> 1086 bytes, the image
 10243 -> 6588 (-36%); gcd is now 1.14x its source, shopping 2.44x.
+**DERIVED POOLS ARE NOT STORED (v4, same day).** `boxed_ops` is a pure
+function of the final code + the loc side table, so the image holds none
+of its 49-byte entries: `read_chunk` calls **`build_boxed_ops`** - now
+exported from codegen.h for exactly this - once a chunk is read (LAST,
+since it needs `locs`), the same rebuild-a-derived-twin shape
+`catch_uids` already used. The point is SINGLE SOURCE OF TRUTH as much as
+bytes: the loader runs the function CODEGEN runs, so the pool the JIT
+bakes `&boxed_ops[target2]` against cannot drift from what a compile
+produced. `target2` (the pool index) is still stored and simply
+overwritten with the identical value. The `Operand` read/write codec fell
+out of serialize.cpp with it - the derived pool was its only user, which
+`-Werror=unused-function` pointed out. **The obvious oracle is
+INSUFFICIENT and the test says so:** `-vd` prints only each entry's
+`target` + `aop`, so byte-identical dumps do NOT cover the rebuilt
+operands or carets - the round-trip test compares the pools
+FIELD-FOR-FIELD (both Operands' live union member per `lit_kind`, both
+Locs) over the root and every function chunk, and COUNTS them so an edit
+to its program cannot make the check vacuously pass on two empty pools;
+separately, a `dyn` div0 in a JIT'd loop (whose caret the JIT stamps
+straight from `boxed_ops[i].start/end`) renders byte-identically from an
+image and from source. Measured: shopping 6588 -> 5641, gcd 1957 = 1.08x
+its source; cumulative from v1 shopping -56%, gcd -60%.
 **THE BUILTIN-SLOT HAZARD (found + fixed here):** `SymbolsType` is a
 `std::map<const UniqueId *, ...>` keyed by the interned POINTER, so the
 builtin table's slot order differed PER PROCESS - a baked
@@ -4441,8 +4463,9 @@ exception, rand_sort, calls `rand()`), 84/86 also dump byte-identically
 residuals differ ONLY in the printed ORDER of a const dict's entries -
 MyLang dicts are unordered by spec, and a rebuilt hash map's iteration
 order legitimately differs). Sizes vs the source (after v3's compact
-instructions): fib 2.73x, shopping 2.44x, gcd 1.14x (v1 was
-4.7x / 4.76x / 2.72x). The REPL is out of scope (it retains ASTs).
+instructions + v4's dropped derived pool): fib 2.71x, shopping 2.09x,
+gcd 1.08x (v1 was 4.7x / 4.76x / 2.72x). The REPL is out of scope
+(it retains ASTs).
 
 **THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,
 > plans/vm-ast-free-runtime.md): the call model runs on the serializable
