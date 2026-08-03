@@ -5071,6 +5071,49 @@ abandoned). ONE deliberate residue, flagged as a DESIGN FORK, not fixed:
 propagates from the OWNING try, the VM (like Python/C#) raises at the
 rethrow SITE and the inner catch intercepts; maintainer to rule.
 
+**#78 steps A-C - the HANDLER TABLE, and the raise path dispatching
+from it.** The catch chain (an interpreted `CatchTest` per clause, each
+re-deciding at runtime what the compiler already knew) is replaced by
+COMPILE-TIME data: **`Chunk::handler_sites`**, one entry per try REGION
+holding its clause list (`HandlerClause {types_idx, bind_slot,
+body_pc}`), the shared `fin_pc` (-1 = none), and a **`has_rethrow`**
+flag (does any catch body of this try contain a `rethrow`?). PRIMARY
+data - step D deletes the chain it could be derived from - so it is
+SERIALIZED (myv v8) and REMAPPED at every pc-moving transformation (the
+peephole's threading + branch-target map + compaction prefix-sum, and
+BOTH JIT remaps: `remap` for the container path, `entry_remap` for the
+delete-originals rebuild, since a clause body is a RESUME pc).
+`peephole_chunk` takes the chunk non-const for it. The net is
+**`verify_handler_sites`** (ASSERTS-only, run after codegen and after
+both remaps): it re-walks each PushHandler's interpreted chain and
+asserts the table still describes it exactly - it fired on its first run
+(the peephole DELETES the no-match `Jump` when the shared finally is the
+next pc; the table was right, the checker's chain model was wrong).
+**Step C flips the dispatch:** `vm_dispatch_exc` now owns the whole
+same-frame decision - pop the handler, index `handler_sites[region]`,
+run the shared `vm_catch_match` (step A, ML_ALWAYS_INLINE - left
+out-of-line it cost +40 Ir per throw) over the clauses, bind, **park the
+exception ONLY IF `has_rethrow`** (the park is an owning move + a later
+free, and the overwhelmingly common catch does not rethrow), resume at
+the winning `body_pc`; no match with a `fin_pc` parks a `reraise` and
+resumes in the finally; else it keeps walking OUT to the next enclosing
+handler before returning false to the frame walk. CatchTest/Reraise are
+still emitted but never EXECUTED (step D deletes them). **The JIT entry
+set is now sourced FROM THE TABLE** (every `body_pc` and every
+`fin_pc`), not from CatchTest's target - without the `fin_pc` half a
+throw resumed at a pc inside a DELETED run, collapsed onto its head
+EnterNative: the step-1 hang from the other side. FORM: ONE
+out-of-line function - inlining it at its 5 call sites (3 inside
+`vm_dispatch`) measured **+3.6M Ir** on 42_exceptions, the loop-body
+TEXT rule, and splitting a cold tail out of it +2.7M; both reverted.
+Measured across the whole chain (42 = 200k throws): pre-#78 245.2M ->
+step 1 245.2M -> step 2 **251.2M** -> step B 252.2M -> step C 253.9M.
+The FLIP is +8 Ir/throw; the bulk is the step-2 CORRECTNESS fix, whose
+delta is almost entirely `vm_dispatch` SELF growth (+7.2M = +36/throw,
+more than the step's whole delta) - the region operand widening the
+exception op cases, i.e. the code-layout tax, not work. Step D deletes
+exactly those two cases.
+
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
 **`try_multi_literal_store`** (codegen) NOT by building the array and unpacking,
