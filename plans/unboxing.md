@@ -285,3 +285,8 @@ The levers, ranked by yield against cost:
 
 The honest framing: both inline tiers took the EASY 60% (447 -> 91.5 on
 the sieve-class costs). What remains is the architecture, not a helper.
+
+**The route was picked (2026-08-02): C, incrementally.** The staircase
+lives in plans/typed-invariant-arrays.md - B is folded in as its first
+step (C1); A is orthogonal (register territory, not type territory) and
+lands first as its own change.
