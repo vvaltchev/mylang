@@ -5,14 +5,14 @@ and `[[vm-endgame]]`. This file is the self-contained design + the staged,
 each-step-lands-green execution guide, written to survive a context compact.
 
 > Read first: `plans/native-aot.md` (the JIT design, approach A, the native-call
-> arc) and `plans/native-call-impl.md` (the v1 native-call machine code — the
+> arc) and `plans/archived/native-call-impl.md` (the v1 native-call machine code — the
 > pieces this builds on). This file assumes both.
 
 ## The inversion (what "model flip" means)
 
 **Today = BYTECODE with native ISLANDS.** A function body is a bytecode `Chunk`.
 `jit_compile_chunk` finds maximal runs of `jit_op_eligible` ops (every run —
-the MIN_RUN=4 floor was removed 2026-07-25, see plans/min-run-removal.md),
+the MIN_RUN=4 floor was removed 2026-07-25, see plans/archived/min-run-removal.md),
 replaces each with an `EnterNative` op pointing at a machine-code fragment, and
 (for a fully-native single-entry run) deletes the interpreted originals. The
 **interpreter (`vm_dispatch`) is the DRIVER**: it dispatches op-by-op and, when
@@ -98,7 +98,7 @@ dispatch win where the time is in the C++ the island calls.
 - **Run analysis + insertion** (`jit_compile_chunk`): maximal `op_run_eligible`
   runs, `deletable` (fully-native single-entry), `EnterNative` insertion, pc
   remap over `visit_pc_fields`.
-- **native_leaf + native calls v1** (`plans/native-call-impl.md`): the whole-body
+- **native_leaf + native calls v1** (`plans/archived/native-call-impl.md`): the whole-body
   single-run predicate; `jit_call_setup`/`jit_ret`/`jit_frame_setup/leave`; the
   checked exit (`g_vm_jit_exc` → null → `exit_pc` → `EnterNative` re-raises).
 - **Exception signalling** (`vm.cpp`): `g_vm_jit_raise` (a KIND a fragment sets),
@@ -1386,7 +1386,7 @@ to do LATER, separately (don't forget these):
   Evaluate when hand-assembly hurts, not before.
 
 ## Relationship to the other plans
-- Builds ON `plans/native-call-impl.md` (v1 native calls) and `plans/native-aot.md`
+- Builds ON `plans/archived/native-call-impl.md` (v1 native calls) and `plans/native-aot.md`
   (approach A, the fragment ABI, the exception signalling).
 - SUPERSEDES the #55 v2/v3 open items (throwing/recursive/dyn callees) — they
   become container-to-container calls (M5).

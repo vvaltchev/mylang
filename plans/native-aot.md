@@ -171,7 +171,7 @@ dispatch-bound tier.
    branches become fragment-local labels — a run containing its own
    back edge iterates natively. (Runs shorter than `MIN_RUN` (~4) were
    originally skipped; the floor was removed 2026-07-25 — every run
-   compiles, see plans/min-run-removal.md.)
+   compiles, see plans/archived/min-run-removal.md.)
 3. For each run: emit the fragment (two passes for label fixups —
    emit with rel32 placeholders, patch); every exit and every bail
    site is `mov eax, <resume pc>; ret`.
@@ -421,7 +421,7 @@ design above, gated on fully-native callee bodies.
 ### #55 — the STAGED implementation plan (careful analysis)
 
 > **The step-by-step EXECUTION guide (do-this-next, self-contained) is
-> `plans/native-call-impl.md`** — it has the exact emitter ABI, the native
+> `plans/archived/native-call-impl.md`** — it has the exact emitter ABI, the native
 > `ReturnV`/`CallV` machine-code recipe, the helpers, ASSERTs, and tests. This
 > section is the design rationale behind it.
 

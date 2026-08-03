@@ -28,7 +28,7 @@
 Status: **designed, ready to build.** The prerequisites the original version of
 this plan was waiting on have all landed, which changes the design materially:
 
-- **Static type inference** (`plans/type-inference.md`) is in.
+- **Static type inference** (`plans/archived/type-inference.md`) is in.
   `StaticTypeKind::Struct`
   + the `struct_def` slot are already reserved in `statictype.h`. Field access
   can be

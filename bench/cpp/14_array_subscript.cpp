@@ -3,7 +3,7 @@
  * random-access write pass then a read/reduce pass (subscript hot path). */
 #include "bench.h"
 
-/* BENCH-FAIR (plans/bench-fairness.md, class C): g++ -O3 auto-VECTORIZED
+/* BENCH-FAIR (plans/archived/bench-fairness.md, class C): g++ -O3 auto-VECTORIZED
  * the hot loop (asm-verified packed ops) - 2-16 lanes per instruction vs
  * MyLang's scalar native loop. The comparison is meant to be scalar
  * shape-vs-shape; revisit if MyLang ever vectorizes. */

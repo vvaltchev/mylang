@@ -739,7 +739,7 @@ extern "C" unsigned long g_jit_entry_resume;
 #endif
 
 /*
- * #55 native calls (plans/native-call-impl.md): a fully-native LEAF body's
+ * #55 native calls (plans/archived/native-call-impl.md): a fully-native LEAF body's
  * ReturnV runs IN the fragment. The fragment flushes its register cache and
  * calls this with the result value's frame slot; jit_ret reads that slot from
  * the CURRENT callee window, then either pops the frame (an in-VM call -

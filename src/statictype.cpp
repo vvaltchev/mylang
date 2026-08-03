@@ -7,7 +7,7 @@
 
 /*
  * M0 of the type-inference feature: the static-type lattice and its operations.
- * See statictype.h for the data model and plans/type-inference.md sections 2 &
+ * See statictype.h for the data model and plans/archived/type-inference.md sections 2 &
  * 4 for the rules these implement.
  */
 
@@ -327,7 +327,7 @@ static bool static_type_same_underlying(StaticTypeRef a, StaticTypeRef b)
              * yields false positives on ordinary higher-order code (e.g.
              * apply(sq, i)). Calls through the function are still checked at
              * their own site, and the body type-checks independently. Precise
-             * function subtyping is deferred (plans/type-inference.md). */
+             * function subtyping is deferred (plans/archived/type-inference.md). */
             return a->params.size() == b->params.size();
 
         case StaticTypeKind::Struct:

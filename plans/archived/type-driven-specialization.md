@@ -32,11 +32,11 @@ more M8 scalar specialization). That is only sound once the inferencer is
 and auditing type inference — gated behind a hard rule that forces the issue.
 
 This supersedes the "deferred type-driven representation" note in
-`plans/typed-arrays.md` and the `[[typed-arrays-track]]` memo.
+`plans/archived/typed-arrays.md` and the `[[typed-arrays-track]]` memo.
 
 ## The end goal (why)
 
-Today array storage is **value-driven** (`plans/typed-arrays.md`, approach B):
+Today array storage is **value-driven** (`plans/archived/typed-arrays.md`, approach B):
 `range()`/`array(N,v)`/`make_array` pick flat vs general from the runtime value,
 and a flat array that turns out polymorphic just *promotes* (an O(N) cost).
 The waste: we specialize arrays we never proved monomorphic, then pay to undo

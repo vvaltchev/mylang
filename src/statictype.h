@@ -10,7 +10,7 @@
 class UniqueId;
 
 /*
- * Static types for MyLang's type-inference pass (see plans/type-inference.md).
+ * Static types for MyLang's type-inference pass (see plans/archived/type-inference.md).
  *
  * An StaticType is a node in the inference type graph. It is distinct from
      the runtime
@@ -30,7 +30,7 @@ class UniqueId;
  * operations (resolve / unify / assignable / join / equal / to_string), with no
  * AST wiring yet. The lattice rules (none-nullability, int<=float promotion,
  * mixed containers falling to dyn, type conflicts being errors) are specified
- * in plans/type-inference.md sections 2 and 4.
+ * in plans/archived/type-inference.md sections 2 and 4.
  */
 
 enum class StaticTypeKind {

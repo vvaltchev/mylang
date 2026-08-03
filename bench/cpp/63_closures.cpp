@@ -8,7 +8,7 @@
 #include "bench.h"
 #include <functional>
 
-/* BENCH-FAIR (plans/bench-fairness.md, class B): with `auto` lambdas the
+/* BENCH-FAIR (plans/archived/bench-fairness.md, class B): with `auto` lambdas the
  * whole loop inlined into a register computation at -O3 (asm-verified:
  * zero calls in main) - MyLang creates a real closure OBJECT per
  * iteration and calls it INDIRECTLY. std::function is the type-erased

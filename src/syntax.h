@@ -49,7 +49,7 @@ enum class TypeHint : unsigned char { none, i, f };
  * the inferencer from the DESTINATION's inferred type so the array is built in
  * its final representation at creation - no runtime promotion. `dflt` =
  * value-driven (build flat iff the elements are homogeneous int/float). See
- * plans/type-driven-specialization.md.
+ * plans/archived/type-driven-specialization.md.
  */
 enum class ArrHint : unsigned char {
     dflt, general, flat_i, flat_f, flat_b, flat_s
@@ -57,7 +57,7 @@ enum class ArrHint : unsigned char {
 
 /* DeclType / SymKind / ResolvedSym / FuncDescriptor moved to funcdesc.h (the
  * serializable runtime function descriptor lives outside the AST headers'
- * node classes - see plans/vm-ast-free-runtime.md). */
+ * node classes - see plans/archived/vm-ast-free-runtime.md). */
 
 struct InlineCtx;
 
@@ -94,7 +94,7 @@ public:
      * node - the backing for the -vm AST-teardown proof (vm_ast_teardown:
      * after codegen the whole AST is destroyed, the count must hit ZERO, and
      * any residual pointer reads zeroed, freed memory). Defined in syntax.cpp.
-     * See plans/vm-ast-free-runtime.md. (RECYCLE has its own new/delete above,
+     * See plans/archived/vm-ast-free-runtime.md. (RECYCLE has its own new/delete above,
      * which maintain the same counter + ASan-poison the freed node.)
      */
     static void *operator new(std::size_t n);
@@ -594,7 +594,7 @@ public:
     bool auto_const_param = false;
 
     /*
-     * Type-inference modifiers (see plans/type-inference.md). Set by the parser
+     * Type-inference modifiers (see plans/archived/type-inference.md). Set by the parser
      * for a param or a var/const declared `opt` (nullable: may hold `none`) or
      * `dyn` (dynamically typed: behaves as today, inference does not constrain
      * it). Only meaningful on a declaration / parameter identifier.

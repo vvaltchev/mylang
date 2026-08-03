@@ -8,7 +8,7 @@
  * live so none are dead-code-eliminated. */
 #include "bench.h"
 
-/* BENCH-FAIR (plans/bench-fairness.md, class B): MyLang executes a REAL
+/* BENCH-FAIR (plans/archived/bench-fairness.md, class B): MyLang executes a REAL
  * depth-900 call chain here; g++ -O3 converted this accumulator recursion
  * into a plain loop (zero calls - asm-verified), which benches loop adds
  * against a call protocol. noinline keeps the entry a call, and

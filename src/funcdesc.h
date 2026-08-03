@@ -9,7 +9,7 @@
 #include <vector>
 
 /*
- * The SERIALIZABLE runtime function descriptor (plans/vm-ast-free-runtime.md).
+ * The SERIALIZABLE runtime function descriptor (plans/archived/vm-ast-free-runtime.md).
  *
  * FuncDescriptor is the RUNTIME identity of a function: everything
  * do_func_call, closure creation, backtraces, the per-frame pure cache, and

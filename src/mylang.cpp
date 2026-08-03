@@ -245,7 +245,7 @@ void help()
     cout << "           MYLANG_JIT=0). See plans/native-aot.md" << endl;
     cout << "  -tw      Execute via the tree-walking interpreter instead"
          << endl;
-    cout << "           of the VM. See plans/bytecode-vm.md" << endl;
+    cout << "           of the VM. See plans/archived/bytecode-vm.md" << endl;
     cout << "  -vd      Dump the VM bytecode disassembly, then exit" << endl;
     cout << "  -vdj     Like -vd, plus the native x86-64 disassembly of"
          << endl;
@@ -747,7 +747,7 @@ int main(int argc, char **argv)
              * bench geomean, the two documented flip conditions), or the
              * tree-walker under -tw. The VM runs the SAME optimized AST
              * (it lowers `root`), so behavior is identical - see
-             * plans/bytecode-vm.md. g_exec_engine tells do_func_call to
+             * plans/archived/bytecode-vm.md. g_exec_engine tells do_func_call to
              * run function bodies via the VM too, not just the top-level
              * chunk. */
             if (opt_compile) {

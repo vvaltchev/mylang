@@ -98,7 +98,7 @@ struct BacktraceFrame {
  * callee first, outer callers via `parent`) lets the backtrace reconstruct the
  * call frames that have no physical do_func_call frame. Each element maps 1:1
  * to a BacktraceFrame. See flush_inline_frames() in backtrace.cpp and the
- * plans/function-inlining.md design. (No inliner emits these yet.)
+ * plans/archived/function-inlining.md design. (No inliner emits these yet.)
  */
 struct InlineCtx {
     std::string callee_name;
@@ -284,7 +284,7 @@ DECL_RUNTIME_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
 DECL_RUNTIME_EX(CannotChangeConstEx, "Cannot change constant")
 
 /*
- * Compile-time type-inference errors (see plans/type-inference.md). They are
+ * Compile-time type-inference errors (see plans/archived/type-inference.md). They are
  * plain Exceptions (NOT RuntimeExceptions), so script `try/catch` cannot catch
  * them: a type violation fails the build, like a SyntaxError. Each takes a
  * custom message (the inferencer interns it so it outlives the throw) and the
@@ -312,7 +312,7 @@ struct WrongArgCountEx : public Exception {
  * A plain `var`/`const` whose type the inferencer could only conclude is `dyn`.
  * Under the mandatory-dyn rule a plain declaration must have a concrete static
  * type; a genuinely dynamic one must be declared `dyn` (see
- * plans/type-driven-specialization.md). Compile-time, uncatchable.
+ * plans/archived/type-driven-specialization.md). Compile-time, uncatchable.
  */
 struct DynRequiredEx : public Exception {
     DynRequiredEx(const char *m = "Declaration requires an explicit 'dyn'",

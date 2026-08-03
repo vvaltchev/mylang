@@ -22,7 +22,7 @@
 #include <cstdio>
 
 /*
- * Whole-program static type inference + checking. See plans/type-inference.md
+ * Whole-program static type inference + checking. See plans/archived/type-inference.md
  * and plans/type-inference-questions.md for the design and decisions.
  *
  * Pipeline (Inferencer::run):
@@ -131,7 +131,7 @@ struct FuncInfo {
      * A TEMPLATE: at least one parameter is un-annotated and not explicitly
      * `dyn`, so its type is not fixed by the declaration. Such a function is
      * not type-checked in isolation; it is instantiated per call-site signature
-     * as a typed clone (see plans/function-templates.md). A `dyn` param is not
+     * as a typed clone (see plans/archived/function-templates.md). A `dyn` param is not
      * a template parameter - it is the explicit "one instantiation, any type".
      */
     bool is_template = false;
@@ -298,7 +298,7 @@ private:
     void accumulate_foreach(ForeachStmt *fe);
     void spread_idlist(IdList *idl, Construct *rvalue);
 
-    /* monomorphization (templates - see plans/function-templates.md) */
+    /* monomorphization (templates - see plans/archived/function-templates.md) */
     void mark_lambda_templates();   /* safe var-bound lambdas -> templates */
     void run_fixpoint(Block *root);             /* the Jacobi loop, extracted */
     bool instantiate_round(Block *root);     /* clone + redirect; progress? */
@@ -1675,7 +1675,7 @@ void Inferencer::enforce_nonnull_params()
 /*
  * --debug-ti: dump every declared identifier's inferred type and use sites in a
  * machine-readable, tab-separated form. Used to audit the corpus for spurious
- * `dyn`s (plans/type-driven-specialization.md). One `ti` record per symbol:
+ * `dyn`s (plans/archived/type-driven-specialization.md). One `ti` record per symbol:
  *   ti<TAB>name<TAB>kind<TAB>line<TAB>col<TAB>const<TAB>type<TAB>uses
  * where kind is var|const|param|func, const is 0|1, type is the rendered static
  * type (int, opt float, array<int>, array<dyn>, func(int)->int, dyn, ...), and
@@ -2162,7 +2162,7 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
      * So `func f(a, opt b)` is a template over `a` (b joins), while `func
      * f(opt x)` (no template param) keeps the join model. (A lambda has no name
      * to redirect a call to, so it also keeps the join model - v1; see
-     * plans/function-templates.md.)
+     * plans/archived/function-templates.md.)
      */
     if (fd->id && fd->params)
         for (auto &p : fd->params->elems)
@@ -2533,7 +2533,7 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
             /*
              * Flat (unboxed) storage already pins the element type, so read it
              * from the kind - crucially WITHOUT get_view(), which would promote
-             * the const value to general (see plans/typed-arrays.md).
+             * the const value to general (see plans/archived/typed-arrays.md).
              */
             if (arr.skind() == SharedArrayObj::Storage::bools)
                 return A.array_of(A.bool_ty());

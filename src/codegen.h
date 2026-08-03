@@ -24,7 +24,7 @@ void collect_funcs(const Construct *c,
  * Lower a Block's statements to a bytecode Chunk. `slot_count` is the frame's
  * resolved-local count (register-machine temps grow above it, at
  * [slot_count, slot_count + chunk.n_temps)). Used for both the root/main block
- * and a function body (Phase 4). See plans/bytecode-vm.md.
+ * and a function body (Phase 4). See plans/archived/bytecode-vm.md.
  */
 /*
  * `jit` (default true): run jit_compile_chunk at the end (native-AOT). The VM

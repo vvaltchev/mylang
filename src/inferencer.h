@@ -15,7 +15,7 @@ class EvalContext;
 struct AnalysisInfo;
 
 /*
- * Whole-program static type inference + checking (see plans/type-inference.md).
+ * Whole-program static type inference + checking (see plans/archived/type-inference.md).
  *
  * Runs after parsing (and parse-time const-folding) but BEFORE resolve_names,
  * on the clean source tree. It infers a fixed static type for every variable,
@@ -35,7 +35,7 @@ void infer_types(Construct *root, bool enable = true, bool strict = true);
  * --debug-ti: run inference (non-strict) and dump every declared identifier's
  * inferred type + use sites (machine-readable, tab-separated) to `os`. Used to
  * audit the corpus for spurious `dyn`s. See
- * plans/type-driven-specialization.md.
+ * plans/archived/type-driven-specialization.md.
  */
 void dump_type_info(Construct *root, std::ostream &os);
 
@@ -55,7 +55,7 @@ void for_each_child_of(Construct *c,
  * into TypedScalarExpr, which evaluates without num_bin_op dispatch or
  * intermediate EvalValue boxing. Run AFTER resolve_names (it benefits from
  * resolved slots via Identifier's typed fast paths). A no-op when inference is
- * disabled (no TypeHints are set). See plans/type-inference.md M8.
+ * disabled (no TypeHints are set). See plans/archived/type-inference.md M8.
  *
  * `analyze` (the `-a`/`:analyze` pipeline only; null in a normal run) gets a
  * counted_for annotation on each `for` keyword this pass rewrites to a

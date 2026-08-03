@@ -8,7 +8,7 @@
  * the inner scan runs each of the N passes - matching the .my's per-pass work. */
 #include "bench.h"
 
-/* BENCH-FAIR (plans/bench-fairness.md, class E - re-audited after the
+/* BENCH-FAIR (plans/archived/bench-fairness.md, class E - re-audited after the
  * 88.9x result was challenged): the C++ loop itself is honest (asm: 8
  * scalar instructions/row, re-run every rep - no hoisting, no SIMD), but
  * `const auto &row` binds by REFERENCE, which MyLang's unpack semantics

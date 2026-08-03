@@ -8,7 +8,7 @@
 #include <vector>
 
 /*
- * The runtime bytecode for the -vm execution engine (see plans/bytecode-vm.md).
+ * The runtime bytecode for the -vm execution engine (see plans/archived/bytecode-vm.md).
  * The VM consumes the ALREADY-OPTIMIZED AST (post infer / resolve_names /
  * specialize_types) and lowers it to a flat instruction list, removing the
  * tree-walker's per-node virtual-dispatch tax. It is built strictly
@@ -23,7 +23,7 @@
  * slots (the VM's registers ARE the resolved-local slots, so there is no value
  * stack) with native int ops (IntBin / JumpUnlessIntCmp) and fused
  * superinstructions, so a resolved-local int scalar loop runs with no
- * tree-walker fallback. See plans/bytecode-vm.md.
+ * tree-walker fallback. See plans/archived/bytecode-vm.md.
  *
  * (Named OpCode, not Op: `Op` is already the operator enum in operators.h.)
  */
@@ -46,7 +46,7 @@ enum class OpCode : unsigned char {
      * since the no-fail codegen removed every fallback body, nothing set a
      * brk/cont/ret FlowState inside a chunk, and codegen had already
      * stopped emitting it. Native loops branch with Jump/JumpUnless*;
-     * `return` is ReturnV. See plans/vm-native-call-stack.md Phase A.) */
+     * `return` is ReturnV. See plans/archived/vm-native-call-stack.md Phase A.) */
 
     /*
      * Native 3-address int op (register machine): slot[target] = a <aop> b,
@@ -1049,7 +1049,7 @@ enum class OpCode : unsigned char {
     LoadMemberInt, LoadMemberFloat,
 
     /*
-     * E4 FUSIONS (plans/vm-peephole.md) - adjacent-pair superinstructions the
+     * E4 FUSIONS (plans/archived/vm-peephole.md) - adjacent-pair superinstructions the
      * peephole's fusion rules synthesize, CHOSEN FROM THE DYNAMIC PAIR
      * PROFILE (760M dispatches over the bench suite; each rule requires the
      * intermediate temp DEAD - the existing liveness - and no branch target

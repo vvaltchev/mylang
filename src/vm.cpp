@@ -1496,7 +1496,7 @@ struct VmPendState {
 };
 
 /*
- * The VM's SLOT STACK (plans/vm-native-call-stack.md): every VM frame is a
+ * The VM's SLOT STACK (plans/archived/vm-native-call-stack.md): every VM frame is a
  * WINDOW of a segment. SEGMENTED, not relocating, because C++ builtins hold
  * frame LValue* / EvalValue& ACROSS user-code callbacks (sort's arg0 over
  * its comparator calls, map/filter's container reference over per-element
@@ -1580,7 +1580,7 @@ struct VmCallRec {
 };
 
 /*
- * A VM ACTIVATION (plans/vm-native-call-stack.md): one run of VM frames
+ * A VM ACTIVATION (plans/archived/vm-native-call-stack.md): one run of VM frames
  * entered from C++ (vm_run). It owns the segmented slot stack, the call
  * records, and the VIEW Frame the dispatch loop + builtins access slots
  * through (Frame::point_at - a non-owning window; repointing per frame is
@@ -1982,7 +1982,7 @@ vm_compile(const Construct *root_c, bool jit)
     prog.global_func_names = root->global_func_names;
     prog.global_slot_reassigned = root->global_slot_reassigned;
 
-    /* OWNERSHIP TRANSFER (plans/vm-ast-free-runtime.md): move every function
+    /* OWNERSHIP TRANSFER (plans/archived/vm-ast-free-runtime.md): move every function
      * descriptor and struct type def out of the AST into the program image,
      * so the tree is droppable. The decls keep their raw aliases (desc/def),
      * which stay valid - a unique_ptr move does not relocate the pointee. The
@@ -5109,7 +5109,7 @@ static void vm_dispatch(const Chunk &chunk0, EvalContext &ctx,
                         VmActivation &act, size_t start_pc = 0);
 
 /*
- * Phase D (plans/vm-native-call-stack.md): a builtin's USER-CALLBACK call
+ * Phase D (plans/archived/vm-native-call-stack.md): a builtin's USER-CALLBACK call
  * (map/filter/sort's comparator/make_dict's generator/find's keyfunc, via
  * eval_func) runs the callee as a BOUNDARY frame on the CURRENT activation
  * - the per-element do_func_call + EvalContext construction is gone; the
@@ -5443,7 +5443,7 @@ vm_enter_invocation(const Chunk *chunk, std::unique_ptr<VmActivation> &own,
 }
 
 /*
- * THE IN-VM CALL (plans/vm-native-call-stack.md): push the callee's frame
+ * THE IN-VM CALL (plans/archived/vm-native-call-stack.md): push the callee's frame
  * window + record and continue the loop in the callee's chunk - no
  * do_func_call, no EvalContext, no C++ recursion. Arity = two compares
  * (the same InvalidNumberOfArgsEx, reaching the unwind walk like any bind

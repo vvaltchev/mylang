@@ -6,7 +6,7 @@ solution" choice; flag any you want changed.
 ## Decisions made (deviations from / refinements of the plan)
 
 ### Q1. Pass order: inference runs BEFORE resolve_names (not after).
-plans/type-inference.md D9 said "after resolve_names". I changed to **after
+plans/archived/type-inference.md D9 said "after resolve_names". I changed to **after
 parse(+const-fold), before resolve_names**. Reasons: (a) the inliner (part of
 resolve_names, on by default) rewrites the tree and remaps slots — a clean
 lexical-scope inferencer is far simpler on the un-mangled parse tree; (b) type

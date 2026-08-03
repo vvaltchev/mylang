@@ -1,7 +1,7 @@
 # Builtin ABI migration (value ABI, `-vm`)
 
 Finishing the builtin side of the "remove every `node->eval` fallback" directive
-([[vm-endgame]], `plans/bytecode-vm.md`). Three `Builtin` ABIs (evalvalue.h),
+([[vm-endgame]], `plans/archived/bytecode-vm.md`). Three `Builtin` ABIs (evalvalue.h),
 one union so `Builtin` stays 2 pointers / `EvalValue` 32 bytes:
 
 - **`func`** — the ORIGINAL: gets the unevaluated `ExprList`, self-evaluates.
@@ -14,7 +14,7 @@ one union so `Builtin` stays 2 pointers / `EvalValue` 32 bytes:
   arity/loc/`ArrHint`. Dispatched natively by `CallBuiltinV`. `make_*_builtin_v`.
 - **`func_lv(ctx, exprList, LValue *target)`** — MUTATING (arg0 an lvalue):
   `append`/`push`/`pop`/`insert`/`erase`/`intptr`. `CallBuiltinLV`. See
-  `plans/mutating-builtins-native.md` (its Phase 2 = value-args-native + emplace,
+  `plans/archived/mutating-builtins-native.md` (its Phase 2 = value-args-native + emplace,
   separate from this file).
 
 ## Migration = mechanical
