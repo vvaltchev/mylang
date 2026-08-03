@@ -1843,6 +1843,40 @@ result: the audit prints from jit_compile_chunk, and I ran it under
 numbers above are from real runs. This is the prove-the-code-ran rule
 biting on the very claim the step is judged by.)
 
+### Step E (2026-07-31): EndFinally conveys - the corpus reaches ZERO
+
+`jit_end_finally(region, pc, inline_chain)` runs the interpreted op's
+exact reraise body (the shared vm_raise) and reports like `jit_throw`:
+0 = dispatched (the handler pc parked in g_vm_resume_chunk/pc and
+returned as an ordinary external exit - the op ALREADY ran, so this is a
+resume), 1 = boundary, 2 = conveyed, 3 = nothing pending (fall through).
+The HOT normal arm is untouched - still an inline byte compare falling
+through - and only the cold arm calls out, so the shape that made
+EndFinally eligible in the first place is preserved.
+
+`inline_chain` is `inline_frame_at(old_pc)` resolved AT COMPILE TIME and
+stamped onto the exception before the raise: a deleted run's pcs have
+all collapsed onto the head EnterNative, where vm_raise's own pc lookup
+cannot discriminate between two inlined bodies (the same bake a
+conveying fragment does - Exception::jit_inline_frame).
+
+With no bail left, EndFinally is op_fully_native. **The delete-originals
+corpus audit over bench/ + samples/ is now 0 kept runs** (72_exc_finally's
+main chunk: 2 ops), verified with REAL runs. Perf is neutral by
+construction (72 -1.41%, unchanged from step D: its hot loop never takes
+the reraise arm).
+
+TRAP: the cold arm is far past a short jump's reach - `emit_exc_stamp`
+alone exceeds it - so the normal-path and nothing-pending jumps are
+rel32. The first build asserted in `Emitter::patch8`.
+
+Execution-proven by `g_jit_end_finally_reraise`, bumped only inside
+jit_end_finally, asserted by a `jit:` test over all three outcomes
+(same-frame dispatch, a CALLER's catch via the native walk, and the
+boundary conversion of an uncaught reraise) plus a loop shape that
+re-enters the region 5 times. A green suite alone could not tell the
+native arm from the interpreter re-running a kept original.
+
 ### PERF: the step-C projection was WRONG, and here is the real story
 
 I projected that deleting the two dispatch-switch cases would return

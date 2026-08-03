@@ -116,6 +116,10 @@ ptrdiff_t jit_off_rec_pend_base();
 ptrdiff_t jit_sizeof_pend_state();
 ptrdiff_t jit_off_pend_state_pend();           /* VmCallRec::pend */
 extern "C" void jit_push_handler_grow(int_type region) noexcept;
+/* #78 step E: EndFinally's cold reraise arm (0 dispatched / 1 boundary /
+ * 2 conveyed / 3 nothing pending). See the definition in vm.cpp. */
+extern "C" int jit_end_finally(int_type region, int_type pc,
+                               int_type inline_chain) noexcept;
 
 /* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
 class EvalContext;
@@ -237,6 +241,13 @@ extern unsigned long g_jit_container_calls;
  * counter proving the collapse-safe path ran, since a deleted run's pcs
  * cannot discriminate between two inlined bodies. */
 extern unsigned long g_jit_inline_baked;
+
+#ifdef TESTS
+/* #78 step E: times EndFinally's cold RERAISE arm ran natively (see
+ * jit_end_finally, vm.cpp) - the coverage counter for the arm that used
+ * to bail to the interpreter. */
+extern unsigned long g_jit_end_finally_reraise;
+#endif
 
 /*
  * #55 STEP 2: is this chunk's WHOLE body a single fully-native run ending in

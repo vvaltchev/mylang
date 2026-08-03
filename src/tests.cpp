@@ -16597,6 +16597,7 @@ static bool myv_loc_escapes()
  */
 #ifdef TESTS
 extern unsigned long g_vm_table_dispatch;   /* #78 step C coverage */
+extern unsigned long g_jit_end_finally_reraise;  /* #78 step E coverage */
 #endif
 
 static bool vm_handler_table()
@@ -16759,6 +16760,127 @@ static bool vm_handler_table()
         }
     }
     return true;
+}
+
+/*
+ * #78 step E: PROVE EndFinally's cold RERAISE arm runs IN THE FRAGMENT.
+ *
+ * That arm used to BAIL - the interpreter re-ran the kept original - which
+ * is exactly why 72_exc_finally was the corpus' last non-deletable run. A
+ * green suite cannot distinguish the two (both produce the right answer),
+ * so this asserts g_jit_end_finally_reraise moved, over the three outcomes
+ * jit_end_finally can report: dispatched to a SAME-frame handler,
+ * dispatched to a handler in a CALLER frame (the native walk), and no
+ * handler at all (the boundary conversion). Results are compared against
+ * the tree-walker so the test cannot pass by luck.
+ */
+static bool jit_end_finally_native()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+
+    const std::vector<std::vector<const char *>> shapes = {
+        /* the inner finally re-raises into an outer SAME-FRAME catch */
+        { "struct E { int v; }",
+          "var trc = [];",
+          "try {",
+          "  try { throw E(7); } finally { append(trc, 1); }",
+          "} catch (E as e) { append(trc, e.v); }",
+          "assert(trc == [1, 7]);" },
+        /* ... into a CALLER's catch: the native cross-frame walk */
+        { "struct E { int v; }",
+          "var trc = [];",
+          "func inner() { try { throw E(9); } finally { append(trc, 1); } }",
+          "try { inner(); } catch (E as e) { append(trc, e.v); }",
+          "assert(trc == [1, 9]);" },
+        /* a finally that re-raises AND is itself inside a loop, so the
+         * region runs many times through the same fragment */
+        { "struct E { int v; }",
+          "var n = 0;",
+          "for (var i = 0; i < 5; i++) {",
+          "  try {",
+          "    try { throw E(i); } finally { n += 1; }",
+          "  } catch (E) { n += 10; }",
+          "}",
+          "assert(n == 55);" },
+    };
+
+    for (const auto &lines : shapes) {
+        std::string src;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        const unsigned long before = g_jit_end_finally_reraise;
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            g_exec_engine = saved;
+            cout << "  end-finally shape threw\n";
+            return false;
+        }
+        g_exec_engine = saved;
+        if (g_jit_end_finally_reraise == before) {
+            cout << "  EndFinally's reraise arm did NOT run natively\n";
+            return false;
+        }
+    }
+
+    /* The BOUNDARY outcome: no handler anywhere, so the re-raise converts
+     * to the pending signal and the exception surfaces to the caller. */
+    {
+        const unsigned long before = g_jit_end_finally_reraise;
+        const std::vector<const char *> lines = {
+            "struct E { int v; }",
+            "var trc = [];",
+            "try { throw E(3); } finally { append(trc, 1); }",
+        };
+        std::string src;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool threw = false;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (Exception &) {
+            threw = true;              /* the uncaught E, as expected */
+        } catch (...) {
+            threw = true;
+        }
+        g_exec_engine = saved;
+        if (!threw) {
+            cout << "  an uncaught reraise did NOT propagate\n";
+            return false;
+        }
+        if (g_jit_end_finally_reraise == before) {
+            cout << "  the BOUNDARY reraise did not run natively\n";
+            return false;
+        }
+    }
+    return true;
+#else
+    return true;
+#endif
 }
 
 static bool jit_final_batch_deletable()
@@ -20044,6 +20166,8 @@ static const std::vector<extra_check> extra_checks =
       myv_loc_escapes },
     { "vm: the handler table describes each try region (#78)",
       vm_handler_table },
+    { "jit: EndFinally's reraise arm is native (#78 step E)",
+      jit_end_finally_native },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",

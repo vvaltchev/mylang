@@ -1058,13 +1058,13 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::SetPend:
         return true;
     /* Step 7a: EndFinally - the hot NORMAL path is a byte compare + fall
-     * through; the cold RERAISE path BAILS to the interpreter (the raise
-     * needs vm_raise's dynamic resume). Eligibility matters beyond its own
-     * dispatch: EndFinally was the run SPLITTER that left a try-loop's back
-     * edge landing on an INTERIOR pc (interpreted body every iteration -
-     * the fragment-head defect class); with it eligible the whole loop is
-     * one run and the back edge is a fragment-local jump. NOT
-     * op_fully_native (the bail re-runs the op). */
+     * through. Eligibility matters beyond its own dispatch: EndFinally was
+     * the run SPLITTER that left a try-loop's back edge landing on an
+     * INTERIOR pc (interpreted body every iteration - the fragment-head
+     * defect class); with it eligible the whole loop is one run and the
+     * back edge is a fragment-local jump. #78 step E made its cold RERAISE
+     * arm CONVEY (jit_end_finally) instead of bail, so it is
+     * op_fully_native too. */
     case OpCode::EndFinally:
         return true;
     /* Step 7a: the COLD catch-region ops. CatchTest/Reraise are only ever
@@ -4519,8 +4519,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::EndFinally: {
         /* INLINE the NORMAL path: pends[rec.pend_base + region].pend ==
-         * normal (0) -> fall through to Lend; RERAISE -> bail (the
-         * interpreter re-runs EndFinally and raises via vm_raise).
+         * normal (0) -> fall through to Lend. #78 step E: the RERAISE path
+         * no longer BAILS - it calls jit_end_finally, which runs the
+         * interpreted op's exact body (the shared vm_raise) and reports
+         * dispatched / boundary / conveyed exactly as the native `throw`
+         * does. That removed the last bail in the exception ops, so a run
+         * containing EndFinally is op_fully_native and deletable.
          * (a = the region id, #78.) */
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::EndFinally);
@@ -4542,7 +4546,46 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x80); e.u8(0xB8);                    /* cmp byte [rax+off], 0 */
         e.u32(static_cast<uint32_t>(L.pend_state_pend));
         e.u8(0);
-        e.bail_unless(0x74, pc);      /* je (normal) else BAIL (reraise) */
+        /* rel32: the cold arm below is far bigger than a short jump's
+         * reach (emit_exc_stamp alone exceeds it). */
+        const size_t j_norm = e.j32(0x74);  /* je -> the NORMAL fall-through */
+
+        /* the COLD reraise arm */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_lit())));
+        e.movabs(RSI, static_cast<uint64_t>(pc));
+        e.movabs(RDX, static_cast<uint64_t>(
+                          static_cast<int_type>(ck.inline_frame_at(old_pc))));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_end_finally) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+
+        e.u8(0x83); e.u8(0xF8); e.u8(0x03);       /* cmp eax, 3 */
+        const size_t j_none = e.j32(0x74);        /* je -> fall through */
+        e.u8(0x83); e.u8(0xF8); e.u8(0x02);       /* cmp eax, 2 */
+        {
+            const size_t j_not2 = e.j8(0x75);
+            emit_exc_stamp(e, ck, old_pc);        /* (already located) */
+            e.exit_pc(pc);
+            e.patch8(j_not2, e.pos());
+        }
+        e.u8(0x85); e.u8(0xC0);                   /* test eax, eax */
+        {
+            const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
+            e.flush_cache();                      /* every raw ret must */
+            e.movabs(RAX, static_cast<uint64_t>(-2));   /* JIT_RET_BOUNDARY */
+            e.u8(0xC3);
+            e.patch8(j_disp, e.pos());
+        }
+        e.flush_cache();
+        e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x00);       /* mov rax, [rax] */
+        e.u8(0xC3);                               /* ret (the handler pc) */
+
+        e.patch32_here(j_none);
+        e.patch32_here(j_norm);
         return true;
     }
 
@@ -6239,6 +6282,11 @@ static bool op_fully_native(const Instr &in)
     /* ThrowRuntimeV: builds its pooled exception natively (exc/eptr by
      * kind, pooled caret) - conveys, never re-executes. */
     case OpCode::ThrowRuntimeV:
+    /* #78 step E: EndFinally's cold RERAISE arm calls jit_end_finally,
+     * which runs the interpreted body's vm_raise and reports
+     * dispatched / boundary / conveyed like the native `throw` - no bail
+     * left, so a try/FINALLY region deletes like everything else. */
+    case OpCode::EndFinally:
         return true;
     /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
      * DictStore / StoreElem2V: convey-only helpers, cold-side caret.
