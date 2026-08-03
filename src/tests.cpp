@@ -16579,6 +16579,119 @@ static bool myv_loc_escapes()
     return ok;
 }
 
+/*
+ * #78 step B: the HANDLER TABLE describes each try region exactly - clause
+ * order, per-clause type/bind/body, the shared finally, and the has_rethrow
+ * flag that lets the dispatch skip parking the exception. The table is
+ * PRIMARY data (step D deletes the chain), so this pins its CONTENT; the
+ * ASSERTS-build verify_handler_sites separately pins that it still agrees
+ * with the chain after every pc remap.
+ */
+static bool vm_handler_table()
+{
+    struct Case {
+        std::vector<const char *> src;
+        size_t regions;
+        std::vector<size_t> clause_counts;   /* per region */
+        std::vector<bool> has_fin;
+        std::vector<bool> rethrow;
+    };
+    const std::vector<Case> cases = {
+        /* one region, three clauses, no finally, no rethrow */
+        { { "struct A { int v; } struct B { int v; }",
+            "var r = 0;",
+            "try { throw A(1); }",
+            "catch (A) { r = 1; } catch (B as e) { r = e.v; }",
+            "catch { r = 3; }" },
+          1, { 3 }, { false }, { false } },
+        /* try/finally with NO clauses */
+        { { "var c = 0;",
+            "try { c += 1; } finally { c += 2; }" },
+          1, { 0 }, { true }, { false } },
+        /* clauses AND a finally */
+        { { "struct A { int v; }",
+            "var r = 0;",
+            "try { throw A(1); } catch (A) { r = 1; } finally { r += 10; }" },
+          1, { 1 }, { true }, { false } },
+        /* A rethrow in the catch body sets the flag - on the INNER try's
+         * region. Region ids follow COMPILE order, and compile_native_try
+         * allocates the outer try's id before descending into its body, so
+         * region 0 is the OUTER try and region 1 the inner one. */
+        { { "struct A { int v; }",
+            "var r = 0;",
+            "try {",
+            "  try { throw A(1); } catch (A) { r = 1; rethrow; }",
+            "} catch (A) { r = 2; }" },
+          2, { 1, 1 }, { false, false }, { false, true } },
+        /* two SEQUENTIAL trys -> two regions, neither rethrows */
+        { { "struct A { int v; } struct B { int v; }",
+            "var r = 0;",
+            "try { throw A(1); } catch (A) { r = 1; }",
+            "try { throw B(2); } catch (B) { r = 2; }" },
+          2, { 1, 1 }, { false, false }, { false, false } },
+    };
+
+    const bool jit_was = g_jit_enabled;
+    g_jit_enabled = false;                 /* pin the CODEGEN shape */
+    size_t ci = 0;
+    for (const Case &cs : cases) {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < cs.src.size(); i++) {
+            if (i) src += '\n';
+            src += cs.src[i];
+        }
+        lexer(src, 1, toks);
+        Chunk chunk;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get());
+            resolve_names(root.get());
+            specialize_types(root.get());
+            const Block *b = dynamic_cast<const Block *>(root.get());
+            if (!b) { g_jit_enabled = jit_was; return false; }
+            chunk = codegen_program(b);
+        } catch (...) {
+            cout << "  case " << ci << ": codegen threw\n";
+            g_jit_enabled = jit_was;
+            return false;
+        }
+
+        bool ok = chunk.handler_sites.size() == cs.regions
+                  && static_cast<size_t>(chunk.n_trys) == cs.regions;
+        for (size_t r = 0; ok && r < cs.regions; r++) {
+            const auto &hs = chunk.handler_sites[r];
+            ok = hs.clauses.size() == cs.clause_counts[r]
+                 && (hs.fin_pc >= 0) == cs.has_fin[r]
+                 && hs.has_rethrow == cs.rethrow[r];
+            /* every body pc must be a real, in-range instruction */
+            for (const auto &cl : hs.clauses)
+                ok = ok && cl.body_pc >= 0
+                     && static_cast<size_t>(cl.body_pc) < chunk.code.size();
+            if (hs.fin_pc >= 0)
+                ok = ok && static_cast<size_t>(hs.fin_pc) < chunk.code.size();
+        }
+        if (!ok) {
+            cout << "  handler table mismatch, case " << ci << ": "
+                 << chunk.handler_sites.size() << " regions (want "
+                 << cs.regions << ")\n";
+            for (size_t r = 0; r < chunk.handler_sites.size(); r++)
+                cout << "    [" << r << "] clauses "
+                     << chunk.handler_sites[r].clauses.size()
+                     << " fin " << chunk.handler_sites[r].fin_pc
+                     << " rethrow " << chunk.handler_sites[r].has_rethrow
+                     << "\n";
+            g_jit_enabled = jit_was;
+            return false;
+        }
+        ci++;
+    }
+    g_jit_enabled = jit_was;
+    return true;
+}
+
 static bool jit_final_batch_deletable()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -19849,6 +19962,8 @@ static const std::vector<extra_check> extra_checks =
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",
       myv_loc_escapes },
+    { "vm: the handler table describes each try region (#78)",
+      vm_handler_table },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",

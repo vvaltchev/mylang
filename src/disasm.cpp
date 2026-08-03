@@ -283,6 +283,41 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << "\n";
         }
     }
+    if (!ch.handler_sites.empty()) {
+        /* #78: the per-try-region catch table - what the raise path matches
+         * against (the CatchTest/Reraise chain in the code above mirrors it
+         * until step D removes those ops). */
+        s << "; -- handler_sites: try region -> clauses ("
+          << ch.handler_sites.size() << ") --\n";
+        for (size_t i = 0; i < ch.handler_sites.size(); i++) {
+            const auto &hs = ch.handler_sites[i];
+            s << ";   [" << i << "]  ";
+            if (hs.clauses.empty() && hs.fin_pc < 0) {
+                s << "(none)\n";
+                continue;
+            }
+            for (size_t j = 0; j < hs.clauses.size(); j++) {
+                const auto &cl = hs.clauses[j];
+                s << (j ? " | " : "");
+                if (cl.types_idx < 0)
+                    s << "(any)";
+                else {
+                    const auto &nm = ch.catch_types[cl.types_idx];
+                    for (size_t k = 0; k < nm.size(); k++)
+                        s << (k ? "|" : "") << nm[k];
+                }
+                if (cl.bind_slot >= 0)
+                    s << " as " << reg(ch, cl.bind_slot);
+                s << " -> L" << cl.body_pc;
+            }
+            if (hs.fin_pc >= 0)
+                s << (hs.clauses.empty() ? "" : "  ")
+                  << "finally L" << hs.fin_pc;
+            if (hs.has_rethrow)
+                s << "  [rethrow]";
+            s << "\n";
+        }
+    }
     if (!ch.literal_objs.empty()) {
         s << "; -- literal_objs (" << ch.literal_objs.size() << ") --\n";
         for (size_t i = 0; i < ch.literal_objs.size(); i++) {

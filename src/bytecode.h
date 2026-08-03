@@ -1454,6 +1454,40 @@ struct Chunk {
     int n_dict_iters = 0;
 
     /*
+     * #78 step B: the HANDLER TABLE - one entry per try REGION (indexed by
+     * the region id the exception ops carry), describing the region's catch
+     * clauses and its shared finally as DATA rather than as the interpreted
+     * CatchTest/Reraise chain.
+     *
+     * This is the redesign's point: the raise path MATCHES here and jumps
+     * straight to a catch BODY (ordinary, entry-mapped code), so the matcher
+     * ops leave the bytecode entirely - a deleted native run then has no
+     * un-deletable "matcher pc" to dispatch into, which is what kept every
+     * try/catch run interpreted (plans/model-flip.md).
+     *
+     * PRIMARY data (built by compile_native_try, not derived): step D deletes
+     * the chain it would otherwise be derived from. While BOTH exist, an
+     * ASSERTS-build verifier (verify_handler_sites) re-walks the chain after
+     * every transformation - the peephole's threading/compaction and both JIT
+     * remaps - and asserts the table still agrees, so a missed remap is a
+     * loud abort rather than a wrong catch at runtime.
+     */
+    struct HandlerClause {
+        int32_t types_idx;   /* catch_types index, or -1 = the catch-all */
+        int32_t bind_slot;   /* `catch (T as e)` frame slot, or -1 */
+        int32_t body_pc;     /* the clause's catch body */
+    };
+    struct HandlerSite {
+        std::vector<HandlerClause> clauses;
+        int32_t fin_pc = -1;      /* the shared finally (Lfin), or -1 when
+                                   * the try has none: then a no-match
+                                   * RE-RAISES to the next handler out */
+        bool has_rethrow = false; /* any catch body may `rethrow` - only then
+                                   * must the dispatch PARK the exception */
+    };
+    std::vector<HandlerSite> handler_sites;   /* indexed by region id */
+
+    /*
      * #78 step 2: the number of TRY REGIONS in this chunk. Each `try` gets a
      * chunk-static monotonic REGION ID baked into its exception ops
      * (PushHandler/SetPend/EndFinally/CatchTest/Reraise/Rethrow), indexing

@@ -95,6 +95,9 @@ def chunk(r):
         for w in (wt, wt2, wa, wb):
             if w: r.p += 1 << (w - 1)
     for _ in range(5): r.u32()                    # slot_count..n_trys
+    for _ in range(r.u32()):                      # 9.18 handler_sites
+        for _ in range(r.u32()): r.u32(); r.u32(); r.u32()   # clauses
+        r.u32(); r.boolv()                        # fin_pc, has_rethrow
     r.nx(r.u32)                                   # ref_slots
     r.nx(lambda: value(r))                        # consts
     for _ in range(r.u32()):                      # 9.2 delta loc table

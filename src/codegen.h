@@ -69,3 +69,12 @@ bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit = true);
  * at load, after `locs` is read.
  */
 void build_boxed_ops(Chunk &chunk);
+
+/*
+ * #78 step B: assert the HANDLER TABLE still describes the interpreted
+ * CatchTest/Reraise chain (see Chunk::handler_sites). Called after every
+ * pc-moving transformation while both representations exist - the
+ * peephole's compaction and both JIT remaps - so a missed remap is a loud
+ * compile-time abort, never a wrong catch at runtime. ASSERTS-only.
+ */
+void verify_handler_sites(const Chunk &chunk);

@@ -5631,6 +5631,43 @@ struct Codegen {
         code.push_back(in);
     }
 
+    /*
+     * #78 step B: does any CATCH BODY of this try contain a `rethrow`? Only
+     * then must the dispatch PARK the caught exception in the region slot
+     * (the common site never rethrows, so the park - a unique_ptr move plus
+     * the eventual free - is skippable there). Conservative and CHEAP: a
+     * complete walk (for_each_child_of, the walker whose hand-rolled
+     * predecessor once missed try bodies), NOT descending into a nested
+     * FUNCTION (its `rethrow` belongs to its own frame's regions) and not
+     * into a nested try's CATCH bodies (they have their own region and
+     * park independently) - though counting those would only be
+     * pessimistic, never wrong.
+     */
+    static bool subtree_has_rethrow(const Construct *c)
+    {
+        if (!c)
+            return false;
+        if (dynamic_cast<const RethrowStmt *>(c))
+            return true;
+        if (dynamic_cast<const FuncDeclStmt *>(c))
+            return false;                     /* another frame's regions */
+        bool found = false;
+        for_each_child_of(const_cast<Construct *>(c), [&](Construct *ch) {
+            if (!found && subtree_has_rethrow(ch))
+                found = true;
+        });
+        return found;
+    }
+    static bool has_rethrow_in_catches(const TryCatchStmt *t)
+    {
+        for (const auto &cs : t->catchStmts)
+            if (subtree_has_rethrow(cs.second.get()))
+                return true;
+        /* a `rethrow` in the FINALLY body re-raises the region's exception
+         * too (it runs with the pend live), so it counts as well */
+        return subtree_has_rethrow(t->finallyBody.get());
+    }
+
     bool compile_native_try(const TryCatchStmt *t)
     {
         const bool has_fin = t->finallyBody != nullptr;
@@ -5669,6 +5706,10 @@ struct Codegen {
             chunk.catch_types.resize(ct_start);
             chunk.catch_uids.resize(ct_start);
             trys.resize(trys_depth);
+            /* #78: drop this region's half-built site (the region ID is not
+             * reclaimed - a hole costs one unused table + pends slot) */
+            if (static_cast<size_t>(region) < chunk.handler_sites.size())
+                chunk.handler_sites[region] = Chunk::HandlerSite();
             return false;
         };
 
@@ -5685,6 +5726,15 @@ struct Codegen {
         exit_to(Pend::normal);                         /* normal try exit */
 
         code[ph].target = static_cast<int>(here());   /* Lcatch */
+
+        /* #78 step B: the site is filled as the chain is emitted (the two
+         * describe the SAME region; a verifier cross-checks them). */
+        if (static_cast<size_t>(region) >= chunk.handler_sites.size())
+            chunk.handler_sites.resize(static_cast<size_t>(region) + 1);
+        Chunk::HandlerSite &site = chunk.handler_sites[region];
+        site.clauses.clear();
+        site.fin_pc = -1;
+        site.has_rethrow = has_rethrow_in_catches(t);
 
         std::vector<size_t> tests;
         for (const auto &cs : t->catchStmts) {
@@ -5708,6 +5758,9 @@ struct Codegen {
             in.target2 = asId ? asId->sym.slot : -1;   /* bind slot / -1 */
             tests.push_back(code.size());         /* patch .target below */
             code.push_back(in);
+            site.clauses.push_back({ types_idx,
+                                     asId ? asId->sym.slot : -1,
+                                     -1 });        /* body_pc patched below */
         }
         exit_to(Pend::reraise);                        /* no clause matched */
 
@@ -5717,6 +5770,7 @@ struct Codegen {
         size_t ci = 0;
         for (const auto &cs : t->catchStmts) {
             code[tests[ci]].target = static_cast<int>(here());  /* body_pc */
+            site.clauses[ci].body_pc = static_cast<int32_t>(here());
             if (!compile_scalar_body(body_stmts(cs.second.get()), false))
                 return bail();
             exit_to(Pend::normal);                     /* catch body done */
@@ -5728,6 +5782,7 @@ struct Codegen {
             /* The SHARED finally block, reached by the NORMAL and RERAISE exits
              * only (flow ops inline their own copy - Inc 2c). */
             const int lfin = static_cast<int>(here());
+            site.fin_pc = static_cast<int32_t>(lfin);
             for (size_t j : to_fin)
                 code[j].target = lfin;
             if (!compile_scalar_body(body_stmts(t->finallyBody.get()), false))
@@ -7436,7 +7491,10 @@ static bool retargetable_dst(OpCode op)
     }
 }
 
-static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
+/* #78: `chunk` is non-const now - the pass remaps the HANDLER TABLE's pcs
+ * alongside the instruction pc fields (threading, target marking,
+ * compaction). Everything else it reads stays read-only. */
+static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
 {
     if (code.empty())
         return;
@@ -7457,13 +7515,13 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
          * chunk has handlers, every op may (via a throw) continue at any
          * handler pc, so each op's live-out absorbs the handlers' live-in.
          */
-        if (ck.n_temps > 0 && ck.n_temps <= 64) {
+        if (chunk.n_temps > 0 && chunk.n_temps <= 64) {
 
-            const int tbase = ck.slot_count;
-            const uint64_t all = ck.n_temps == 64
-                ? ~uint64_t(0) : ((uint64_t(1) << ck.n_temps) - 1);
+            const int tbase = chunk.slot_count;
+            const uint64_t all = chunk.n_temps == 64
+                ? ~uint64_t(0) : ((uint64_t(1) << chunk.n_temps) - 1);
             const auto bit = [&](int slot) -> uint64_t {
-                return (slot >= tbase && slot < tbase + ck.n_temps)
+                return (slot >= tbase && slot < tbase + chunk.n_temps)
                     ? (uint64_t(1) << (slot - tbase)) : 0;
             };
 
@@ -7783,6 +7841,19 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                     changed = true;
                 }
             });
+        /* #78: the HANDLER TABLE's pcs are the same targets (a clause body,
+         * the shared finally) and must thread identically - they are the
+         * only reference to them once the chain is deleted (step D). */
+        for (Chunk::HandlerSite &hs : chunk.handler_sites) {
+            for (Chunk::HandlerClause &cl : hs.clauses) {
+                const int nt = pp_thread(code, cl.body_pc);
+                if (nt != cl.body_pc) { cl.body_pc = nt; changed = true; }
+            }
+            if (hs.fin_pc >= 0) {
+                const int nt = pp_thread(code, hs.fin_pc);
+                if (nt != hs.fin_pc) { hs.fin_pc = nt; changed = true; }
+            }
+        }
 
         /* Branch-target map (post-threading). */
         std::vector<char> is_tgt(n + 1, 0);
@@ -7791,6 +7862,16 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 if (t >= 0 && static_cast<size_t>(t) <= n)
                     is_tgt[t] = 1;
             });
+        /* #78: a handler-table pc is an ENTRY the raise path jumps to, so it
+         * counts as a branch target (identical to the CatchTest targets
+         * today - a no-op here, load-bearing once the chain is gone). */
+        for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+            for (const Chunk::HandlerClause &cl : hs.clauses)
+                if (cl.body_pc >= 0 && static_cast<size_t>(cl.body_pc) <= n)
+                    is_tgt[cl.body_pc] = 1;
+            if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) <= n)
+                is_tgt[hs.fin_pc] = 1;
+        }
 
         std::vector<char> del(n, 0);
 
@@ -7890,6 +7971,14 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                     if (t >= 0 && static_cast<size_t>(t) <= n)
                         t = newpc[t];
                 });
+            for (Chunk::HandlerSite &hs : chunk.handler_sites) {   /* #78 */
+                for (Chunk::HandlerClause &cl : hs.clauses)
+                    if (cl.body_pc >= 0
+                            && static_cast<size_t>(cl.body_pc) <= n)
+                        cl.body_pc = newpc[cl.body_pc];
+                if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) <= n)
+                    hs.fin_pc = newpc[hs.fin_pc];
+            }
             code = std::move(out);
         }
 
@@ -7962,6 +8051,71 @@ static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
  * (post-peephole/specialize) UNCONDITIONALLY: the interpreter ignores target2
  * for these ops, and the VM precompile jits in a LATER pass that needs the pool
  * already built. */
+/*
+ * #78 step B: the TABLE-vs-CHAIN verifier. While both exist, re-walk each
+ * PushHandler's interpreted chain (CatchTest* then Reraise, or SetPend +
+ * Jump to the shared finally) and assert the handler table still describes
+ * exactly that region: same clause count, same {types_idx, bind_slot,
+ * body_pc} per clause, same fin_pc. Run after EVERY transformation that can
+ * move a pc - the peephole's threading/compaction and both JIT remaps - so
+ * a missed remap aborts loudly at compile time instead of dispatching to
+ * the wrong catch body at runtime. ASSERTS-only (a no-op under ASSERTS=0),
+ * and it disappears with the chain in step D.
+ */
+void verify_handler_sites(const Chunk &chunk)
+{
+#ifndef NDEBUG
+    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
+        const Instr &ph = chunk.code[pc];
+        if (ph.op != OpCode::PushHandler)
+            continue;
+        const int region = static_cast<int>(ph.a_lit());
+        ML_CHECK(region >= 0
+                 && static_cast<size_t>(region) < chunk.handler_sites.size());
+        const Chunk::HandlerSite &site = chunk.handler_sites[region];
+
+        size_t p = static_cast<size_t>(ph.target);
+        size_t ci = 0;
+        for (; p < chunk.code.size()
+                 && chunk.code[p].op == OpCode::CatchTest; p++, ci++) {
+            const Instr &ct = chunk.code[p];
+            ML_CHECK(ci < site.clauses.size());
+            const Chunk::HandlerClause &cl = site.clauses[ci];
+            ML_CHECK(cl.types_idx == static_cast<int32_t>(ct.a_lit()));
+            ML_CHECK(cl.bind_slot == static_cast<int32_t>(ct.target2));
+            ML_CHECK(cl.body_pc == static_cast<int32_t>(ct.target));
+            ML_CHECK(static_cast<int>(ct.b_lit()) == region);
+        }
+        ML_CHECK(ci == site.clauses.size());
+        ML_CHECK(p < chunk.code.size());
+
+        if (chunk.code[p].op == OpCode::Reraise) {
+            ML_CHECK(site.fin_pc < 0);        /* no finally */
+            ML_CHECK(static_cast<int>(chunk.code[p].a_lit()) == region);
+        } else {
+            /* The no-match exit of a try WITH a finally: SetPend(reraise)
+             * then a Jump to the shared Lfin - EXCEPT that the peephole
+             * deletes that Jump when Lfin is the very next pc (E3's
+             * jump-to-next rule), leaving the finally body inline after the
+             * SetPend. Both shapes are correct; fin_pc is the Jump's target
+             * or simply p + 1. */
+            ML_CHECK(chunk.code[p].op == OpCode::SetPend);
+            ML_CHECK(static_cast<int>(chunk.code[p].a_lit()) == region);
+            ML_CHECK(chunk.code[p].target
+                     == static_cast<int>(Pend::reraise));
+            const int32_t expect =
+                (p + 1 < chunk.code.size()
+                 && chunk.code[p + 1].op == OpCode::Jump)
+                    ? static_cast<int32_t>(chunk.code[p + 1].target)
+                    : static_cast<int32_t>(p + 1);
+            ML_CHECK(site.fin_pc == expect);
+        }
+    }
+#else
+    (void)chunk;
+#endif
+}
+
 /* Declared in codegen.h - the `.myv` loader calls it to REBUILD this derived
  * pool instead of storing it (see the header comment). */
 void build_boxed_ops(Chunk &chunk)
@@ -8036,6 +8190,9 @@ codegen_chunk(const Block *block, int slot_count, bool jit)
     build_boxed_ops(cg.chunk);        /* model-flip: BinOpV/CmpV/CompoundV pool
                                        * (stable JIT-bakeable operand data;
                                        * stores the pool index in target2) */
+    /* #78 step B: the handler table must still describe the (now compacted,
+     * threaded, specialized) chain - a missed remap aborts HERE. */
+    verify_handler_sites(cg.chunk);
     /* #55 STEP 2: set the native_leaf FLAG from the (now final, specialized)
      * ops - BEFORE jit, so the precompile can defer jit and still have every
      * callee's flag for a caller's native-call gate. jit_compile_chunk reads
