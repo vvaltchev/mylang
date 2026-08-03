@@ -3012,6 +3012,11 @@ extern "C" int jit_make_dict(int_type dst, int_type base,
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (#56 - the noexcept would
+         * std::terminate otherwise) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
     }
     return 0;
 }
