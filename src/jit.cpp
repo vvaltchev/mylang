@@ -891,6 +891,14 @@ struct Emitter {
         if ((hr & 7) == 5) { u8(0x44); u8(0xCD); u8(0x00); }
         else { u8(0x04); u8(static_cast<uint8_t>(0xC8 | (hr & 7))); }
     }
+    /* C1c: movzx eax, byte [rH + r9]  (a bool element read - a clean
+     * 0/1 in rax, matching the ordinary bool tail's int semantics) */
+    void load_elem_byte_hr(uint8_t hr)
+    {
+        u8(0x43); u8(0x0F); u8(0xB6);
+        if ((hr & 7) == 5) { u8(0x44); u8(0x0D); u8(0x00); }
+        else { u8(0x04); u8(static_cast<uint8_t>(0x08 | (hr & 7))); }
+    }
     /* C1c: mov [rH + r9], dil  (a bool element - 1 byte, scale 1) */
     void store_elem_byte_hr(uint8_t hr)
     {
@@ -2988,7 +2996,9 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
         for (size_t p = T; p <= L; p++) {
             const Instr &in = chunk.code[p];
             switch (in.op) {
-            case OpCode::LoadElemInt:   add(in.target2, 0, false); break;
+            case OpCode::LoadElemInt:
+                add(in.target2, in.elem_bool_hint() ? 3 : 0, false);
+                break;
             case OpCode::LoadElemFloat: add(in.target2, 1, false); break;
             case OpCode::LoadElem2Int:
             case OpCode::LoadElem2Float: add(in.target2, 2, false); break;
@@ -5227,8 +5237,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * read. Negative/OOB declines to the slow tier, which reads
          * MEMORY (never stale - the registers are the only derived
          * state). */
+        const int hoist_want = is_float ? 1
+                             : in.elem_bool_hint() ? 3 : 0;
         const bool hoisted = g_hoist.active && in.target2 == g_hoist.base
-            && g_hoist.kind == (is_float ? 1 : 0);
+            && g_hoist.kind == hoist_want;
         if (hoisted) {
             load_index_r9(e, in);
             e.cmp_r9_hr(g_hoist.rcount);
@@ -5237,7 +5249,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.load_elem_float_hr(g_hoist.rdata);
                 emit_float_store(e, ck, X0, in.target, pc);
             } else {
-                e.load_elem_int_hr(g_hoist.rdata);
+                if (hoist_want == 3)             /* C1c: byte read, 0/1 */
+                    e.load_elem_byte_hr(g_hoist.rdata);
+                else
+                    e.load_elem_int_hr(g_hoist.rdata);
                 dst_write();
             }
             j_dones.push_back(e.j32(0xEB));

@@ -1756,6 +1756,10 @@ void Inferencer::annotate_hints(Construct *n)
         sub->base_array = bt->kind == StaticTypeKind::Array;
         sub->base_dict = bt->kind == StaticTypeKind::Dict;
         sub->base_str = bt->kind == StaticTypeKind::Str && !bt->opt;
+        if (sub->base_array && bt->elem) {
+            StaticTypeRef et = static_type_resolve(bt->elem);
+            sub->elem_bool = et->kind == StaticTypeKind::Bool && !et->opt;
+        }
     }
 
     /* Lever 3: a slice over a statically-proven non-opt array/string can

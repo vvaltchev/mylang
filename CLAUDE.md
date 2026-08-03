@@ -1335,10 +1335,17 @@ hinted store to kind 3: the preheader guards kind_bools, the count is
 BYTES, the hoisted store is a byte write of dil (only 0/1 LITERALS
 reach StoreElemInt on bools). Measured: 43_sieve **-45.3%**/scale,
 56_sieve_bool **-44.3%**; 46/14 byte-identical; the stride sabotage
-(8-byte stores into the byte array) died as an ASan SEGV. Follow-ups
-per the plan: the hoisted-COMPOUND store form, the read-side bool hint
-(a bool store + read of one base in one region is a kind CONFLICT
-today, pinned by a test), then C2/C3. The C1b sabotages each
+(8-byte stores into the byte array) died as an ASan SEGV. **The READ-side
+hint landed (same day):** the truth source moved to the inferencer -
+`Subscript::elem_bool`, stamped beside base_array from the base's
+static type and copied by clone(); the STORE site switched to it too
+(one source of truth, no #96 mislabel). LoadElemInt carries the hint,
+kind 3's hoisted read is a movzx byte (stride sabotage-verified), and
+the former store+read kind CONFLICT now agrees and hoists both ways
+(the pinned test flipped). Reaches NO bench - 57_bool_reduce's read is
+the JumpUnlessElemInt FUSION, not a candidate op: making the FUSIONS
+hoist-aware is the next rung (57's 360M/scale + 43/56's count loops),
+then the hoisted-COMPOUND store form, then C2/C3 per the plan. The C1b sabotages each
 required defeating a fresh shape-eater first: a bare `runtime()`
 argument is DYN, which lowers `arr[j] = n` to StoreElemValue - no
 candidate, a vacuous case - `int(runtime(5))` keeps the store

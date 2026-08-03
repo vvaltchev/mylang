@@ -134,16 +134,28 @@ MEASURED: 43_sieve **-45.3%**/scale (150.4M -> 82.3M), 56_sieve_bool
 sabotage-verified with maximum volume (8-byte stores into the byte
 array: ASan SEGV).
 
+**The READ-side hint LANDED (2026-08-03).** The truth source moved to
+the INFERENCER: `Subscript::elem_bool`, stamped beside base_array from
+the base's static type (array<bool>, non-opt elem), cloned with the
+node. The STORE site switched to it too - one source of truth, and it
+removes the value-heuristic's #96 mislabel entirely. LoadElemInt
+carries the hint; the pick maps it to kind 3; the hoisted read is
+`movzx eax, byte [r10+r9]` - identical int semantics to the ordinary
+bool tail. The former kind-CONFLICT (a bool store + read of one base
+in one region) now AGREES on kind 3 and hoists both ways - the pinned
+test flipped to assert exactly that; the read stride was
+sabotage-verified (an 8-byte read of packed bools diverges).
+HONESTY NOTE: the hint reaches NO bench - 57_bool_reduce, the corpus's
+bool-read loop, is the `if (arr[i])` FUSION (JumpUnlessElemInt), which
+is not a candidate op. The value is the conflict resolution + plain
+bool reads (reach, like prep).
+
 Remaining follow-ups on the C1 family, in value order:
+  - the FUSIONS as hoist candidates (JumpUnlessElemInt /
+    ForStepElemInt: hoist-aware base gates + element reads) - that is
+    where 57_bool_reduce's 360M/scale sits, and 43/56's count loops;
   - the hoisted-COMPOUND store form (compound ops keep the ordinary
-    tier inside a region);
-  - the ELEM-BOOL hint on the READ side (LoadElemInt has no value
-    signal; a bool store + read of one base in one region is a kind
-    CONFLICT today - pinned by a test - and the read-only bool loop
-    stays cold). Needs an inferencer stamp (`Subscript` elem-kind), or
-    the same bit set from the base's static type at the read site;
-  - a bool-array read via the fusions (JumpUnlessElemInt) is not a
-    candidate op at all.
+    tier inside a region).
 
 ### C2 - widen the register cache beyond int slots
 

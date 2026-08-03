@@ -19204,18 +19204,19 @@ static bool jit_hoist_c1()
           "    return c; }",
           "print(f(64));" }, 1 },
 
-      /* a region that STORES bools and READS the same base: the store
-       * stamps kind 3, the read is unstamped kind 0 - a KIND CONFLICT
-       * drops the candidate (safe; the read stamp is a follow-up).
-       * Values are the oracle; no exact count (the fills hoist). */
-      { "bool store + read of one base in one region: kind conflict",
+      /* a region that STORES bools and READS the same base: both carry
+       * the ELEM-BOOL hint now (the read side stamps from the base's
+       * static type), so the kinds AGREE and the mixed region hoists -
+       * exactly 2 navs (the fill + the mixed loop). Before the
+       * read-side hint this was a kind CONFLICT that refused. */
+      { "bool store + read of one base in one region BOTH hoist",
         { "func f(n) {",
           "    var a = array(n); var i = 0;",
           "    while (i < n) { a[i] = true; i++; }",
           "    var c = 0; var k = 0;",
           "    while (k < n) { c += a[k]; a[k] = false; k++; }",
           "    return c * 100 + a[1]; }",
-          "print(f(32));" }, 1 },
+          "print(f(32));" }, -1, 2 },
 
       /* C1b: a PURE store loop (the 43_sieve marking shape, non-unit
        * step) hoists - bounds + raw write off the pinned registers */
