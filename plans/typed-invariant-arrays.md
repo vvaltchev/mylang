@@ -91,14 +91,38 @@ MEASURED (callgrind Ir, OPT=1 ASSERTS=0, scale-1-vs-3 delta):
 **-15.9%**/iter; 01/03/07/18/62/fib all within +-0.01%; 15 (a runtime
 slice base every entry - the cold twin runs) exactly neutral.
 
-**C1b - the STORE side (the next increment).** 43/56_sieve pick a
-region but do not move: their hot loops are store-dominated, and the
-store tiers do not consult the hoisted registers. Extending them needs
-the entry navigation to ALSO prove const/readonly/has_slices (the
-store-specific guards, all region-stable - nothing in a region can
-freeze, rebind, or create views) and a pinned SHOBJ (the hash-byte
-invalidation needs it; pin (shobj, count) and derive data per element
-at +1, or spend a third register). Scope it against 43's profile.
+**C1b - the STORE side. LANDED 2026-08-03**, with two design points
+that beat the sketch above:
+- No pinned shobj and no third register: the hash byte is invalidated
+  ONCE at the preheader (setting hash_valid=0 early only means
+  "recompute later" - unobservable), so the per-element store is
+  bounds + raw write off the same (data, count) pair.
+- The store guard set (const slot / readonly / has_slices - all
+  region-stable) is emitted ONLY when the region stores to the base
+  (`HoistRegion::has_store`): unconditional store guards would send a
+  read-only loop over a CONST base cold, losing C1's read hoisting.
+Plus MULTI-REGION: 43 has three hot loops and a one-region pick served
+only the tiny fill; regions are now greedy innermost-first,
+non-overlapping, sorted by T for the emission walk, r10/r11 reused
+across them (disjoint lifetimes).
+
+MEASURED: 14_array_subscript a further **-29.0%**/iter (69.0M ->
+49.0M per scale; cumulative -40% across C1+C1b); 46/15/18/01 neutral.
+**43/56_sieve still do not move, and the mechanism is now precisely
+known** (live-counter proof: g_jit_store_fast 3.1M - the ordinary #92
+tier serves them - and g_jit_hoist 0): their arrays are BOOLS
+(`primes[i] = true`), the pick stamps StoreElemInt candidates kind
+INTS (the Instr does not carry the element kind - StoreElemInt serves
+both), and the runtime kind guard sends every entry to the cold twin.
+
+**C1c - the BOOLS kind (next).** Two candidate designs: (a) a second
+HOT copy guarded `kind == bools` (byte stride, movzx/byte-store forms;
+region text grows to 3 copies), or (b) a compile-time element-kind
+stamp on StoreElemInt/LoadElemInt (codegen KNOWS the proven kind when
+it emits; one operand bit, no text growth, touches the .myv encoding).
+(b) is cleaner; scope both against 43/56 before choosing. The
+hoisted-COMPOUND store form is the other listed follow-up (compound
+ops keep the ordinary tier inside a region today).
 
 ### C2 - widen the register cache beyond int slots
 

@@ -878,6 +878,19 @@ struct Emitter {
         if ((hr & 7) == 5) { u8(0x44); u8(0xCD); u8(0x00); }
         else { u8(0x04); u8(static_cast<uint8_t>(0xC8 | (hr & 7))); }
     }
+    /* C1b: mov [rH + r9*8], rdi / movsd [rH + r9*8], xmm0 */
+    void store_elem_int_hr(uint8_t hr)
+    {
+        u8(0x4B); u8(0x89);
+        if ((hr & 7) == 5) { u8(0x7C); u8(0xCD); u8(0x00); }
+        else { u8(0x3C); u8(static_cast<uint8_t>(0xC8 | (hr & 7))); }
+    }
+    void store_elem_float_hr(uint8_t hr)
+    {
+        u8(0xF2); u8(0x4B); u8(0x0F); u8(0x11);
+        if ((hr & 7) == 5) { u8(0x44); u8(0xCD); u8(0x00); }
+        else { u8(0x04); u8(static_cast<uint8_t>(0xC8 | (hr & 7))); }
+    }
     /* ---- #95, the SLICE read arms + the elem2 promote arm ---- */
     /* cvtsi2sd xmm0, qword [rcx + r9*8]  (an int element promotes) */
     void cvtsi2sd_x0_elem()
@@ -1771,6 +1784,10 @@ struct JitHoist {
     uint8_t rcount = 0;   /* r11: element count (ints/floats) / BYTE
                            * length (general - the elem2 outer compare) */
     bool active = false;  /* emitting the HOT region now */
+    bool store_ok = false;/* C1b: the preheader ALSO proved the store
+                           * guards (const/readonly/no live views) and
+                           * invalidated the hash ONCE - plain stores
+                           * may write raw off the pinned registers */
 };
 static JitHoist g_hoist;
 
@@ -2865,25 +2882,27 @@ static void jit_hoist_op_defs(const Instr &in, D d)
 }
 
 /*
- * Pick a LOOP REGION [T, L] and ONE base to hoist for the run
- * [begin, end). A region is a backward branch's span (the branch at L
- * targets T <= L); regions are tried INNERMOST-first (smallest span)
- * and the first that passes every gate with a candidate wins:
- *
- *  - every op in [T, L] is on the read-only-for-storage whitelist
- *    (ops BEFORE the region - array() calls, anything - are harmless:
- *    the navigation runs at the PREHEADER, after them);
- *  - no branch from OUTSIDE [T, L] targets INSIDE it, and no handler
- *    resume or entry-stub pc lands in it - the only ways in are the
- *    fall-through preheader (which runs the navigation) and the back
- *    edges (which target the post-navigation label);
- *  - the base is a resolved LOCAL, one consistent kind, never defined
- *    inside the region.
+ * Pick the LOOP REGIONS to hoist for the run [begin, end). A region is
+ * a backward branch's span [T, L]; candidates are tried INNERMOST-first
+ * (smallest span), each accepted region excludes overlapping ones
+ * (multi-region: 43_sieve has three hot loops - a one-region pick
+ * served only the tiny fill loop). Per region, one base with one
+ * consistent kind, from the element READERS and (C1b) the plain STORE
+ * ops; `has_store` records that the region writes the base, which is
+ * what makes the preheader emit the store guards + the one-shot hash
+ * invalidation (emitting those unconditionally would send a read-only
+ * loop over a CONST base to the cold twin - losing the read hoisting).
+ * The returned list is sorted by T for the emission walk.
  */
-static bool jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
-                           const std::vector<std::pair<size_t, size_t>> &entries,
-                           size_t &t_out, size_t &l_out,
-                           int &base_out, int &kind_out)
+struct HoistRegion {
+    size_t T, L;
+    int base, kind;
+    bool has_store;
+};
+
+static std::vector<HoistRegion>
+jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
+               const std::vector<std::pair<size_t, size_t>> &entries)
 {
     static const bool dbg = getenv("MYLANG_HOISTDBG") != nullptr;
 
@@ -2901,9 +2920,13 @@ static bool jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
                   return (a.second - a.first) < (b.second - b.first);
               });
 
+    std::vector<HoistRegion> out;
     for (const auto &rg : regions) {
         const size_t T = rg.first, L = rg.second;
         bool ok = true;
+        for (const HoistRegion &acc : out)       /* no overlap/nesting */
+            if (T <= acc.L && acc.T <= L)
+                ok = false;
         for (size_t p = T; p <= L && ok; p++)
             if (!jit_hoist_op_ok(chunk.code[p])) {
                 if (dbg) fprintf(stderr,
@@ -2937,27 +2960,37 @@ static bool jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
         if (!ok)
             continue;
 
-        /* candidates: base slot -> {kind, uses}; a kind conflict drops */
-        struct Cand { int kind; int uses; bool dead; };
+        /* candidates: base slot -> {kind, uses, store}; kind conflicts
+         * drop. Stores are candidates too (C1b) - a PLAIN store's
+         * hoisted form is bounds + raw write. */
+        struct Cand { int kind; int uses; bool dead; bool store; };
         std::map<int, Cand> cands;
-        const auto add = [&](int slot, int kind) {
+        const auto add = [&](int slot, int kind, bool store) {
             if (slot < 0 || slot >= chunk.slot_count)
                 return;                          /* locals only */
             auto it = cands.find(slot);
             if (it == cands.end())
-                cands[slot] = { kind, 1, false };
+                cands[slot] = { kind, 1, false, store };
             else if (it->second.kind != kind)
                 it->second.dead = true;
-            else
+            else {
                 it->second.uses++;
+                it->second.store |= store;
+            }
         };
         for (size_t p = T; p <= L; p++) {
             const Instr &in = chunk.code[p];
             switch (in.op) {
-            case OpCode::LoadElemInt:   add(in.target2, 0); break;
-            case OpCode::LoadElemFloat: add(in.target2, 1); break;
+            case OpCode::LoadElemInt:   add(in.target2, 0, false); break;
+            case OpCode::LoadElemFloat: add(in.target2, 1, false); break;
             case OpCode::LoadElem2Int:
-            case OpCode::LoadElem2Float: add(in.target2, 2); break;
+            case OpCode::LoadElem2Float: add(in.target2, 2, false); break;
+            /* store candidates: the kind is the op's PROVEN element
+             * kind for a flat store; a runtime BOOL base under
+             * StoreElemInt fails the ints entry guard -> cold (the
+             * bools kind is a listed follow-up) */
+            case OpCode::StoreElemInt:   add(in.target2, 0, true); break;
+            case OpCode::StoreElemFloat: add(in.target2, 1, true); break;
             default: break;
             }
         }
@@ -2969,27 +3002,32 @@ static bool jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
             });
 
         int best = -1, best_uses = 0, best_kind = 0;
+        bool best_store = false;
         for (const auto &kv : cands) {
             if (kv.second.dead)
                 continue;
+            /* a STORE candidate with kind 2 cannot exist (no general
+             * store op feeds cands) - belt below anyway */
             if (kv.second.uses > best_uses) {
                 best = kv.first;
                 best_uses = kv.second.uses;
                 best_kind = kv.second.kind;
+                best_store = kv.second.store;
             }
         }
         if (best < 0)
             continue;
-        t_out = T;
-        l_out = L;
-        base_out = best;
-        kind_out = best_kind;
+        out.push_back({ T, L, best, best_kind, best_store });
         if (dbg) fprintf(stderr,
-                         "hoist[%zu,%zu): PICKED slot %d kind %d\n",
-                         T, L, best, best_kind);
-        return true;
+                         "hoist[%zu,%zu): PICKED slot %d kind %d%s\n",
+                         T, L, best, best_kind,
+                         best_store ? " +store" : "");
     }
-    return false;
+    std::sort(out.begin(), out.end(),
+              [](const HoistRegion &a, const HoistRegion &b) {
+                  return a.T < b.T;
+              });
+    return out;
 }
 
 /* THE REGISTER-CACHE AUDIT (env MYLANG_CACHEAUDIT=1). Which opcode
@@ -4085,6 +4123,38 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     const Op aop = in.aop;
     const bool compound = aop != Op::invalid;
     const bool divmod = aop == Op::div || aop == Op::mod;
+
+    /*
+     * C1b: the HOISTED plain store - the preheader proved the base AND
+     * the store guards (const/readonly/no live views) and invalidated
+     * the hash once, so the element is a bounds check + a raw write off
+     * the pinned registers. Negative/OOB declines to the full helper
+     * (which re-derives everything from memory - never stale).
+     * Compound stores keep the ordinary tier below (the RMW + divisor
+     * guards; a hoisted-compound form is a listed follow-up).
+     */
+    if (!compound && g_hoist.active && g_hoist.store_ok
+            && in.target2 == g_hoist.base
+            && g_hoist.kind == (is_float ? 1 : 0)) {
+        if (is_float)
+            emit_float_load(e, X0, in.b_is_lit(), in.b_flit(),
+                            in.b_slot(), 0, /*no_bail=*/true);
+        else
+            load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
+        load_index_r9(e, in);
+        e.cmp_r9_hr(g_hoist.rcount);
+        slows.push_back(e.j32(0x73));            /* jae -> the helper */
+#ifdef TESTS
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x02);      /* the tier's counter */
+#endif
+        if (is_float)
+            e.store_elem_float_hr(g_hoist.rdata);
+        else
+            e.store_elem_int_hr(g_hoist.rdata);
+        dones.push_back(e.jmp32());
+        return true;
+    }
     if (compound) {
         if (aop != Op::plus && aop != Op::minus && aop != Op::times
             && !divmod)
@@ -9032,22 +9102,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * unused there (only the M5b push emitter touches them).
          */
         g_hoist = JitHoist{};
-        size_t h_T = 0, h_L = 0;
-        int h_base = -1, h_kind = 0;
-        const bool hoisting =
-            jit_hoist_pick(chunk, begin, end, entries, h_T, h_L,
-                           h_base, h_kind);
+        const std::vector<HoistRegion> hregs =
+            jit_hoist_pick(chunk, begin, end, entries);
         const std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
                               &cache_barrier);
         for (size_t h = 0; h < hot.size(); h++)
             e.saved.push_back(CACHE_REGS[h]);
-        if (hoisting) {
-            g_hoist.base = h_base;
-            g_hoist.kind = h_kind;
-            g_hoist.rdata = 10;
-            g_hoist.rcount = 11;
-        }
 
         e.frag_entry();               /* push rbx + the cache regs; rbx=rdi */
         e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
@@ -9079,10 +9140,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          */
         std::vector<Fixup> fixups;
         std::vector<Fixup> *cur_fix = &fixups;
-        std::vector<size_t> h_cold;              /* the failed-guard jnes */
+        /* per REGION: the failed-guard jnes -> that region's cold copy */
+        std::vector<std::vector<size_t>> h_cold(hregs.size());
         g_fwd = JitFwd{};
         bool emit_ok = true;
-        const auto emit_one = [&](size_t pc, bool in_cold) {
+        const auto emit_one = [&](size_t pc, bool in_cold,
+                                  size_t cold_end) {
             const Instr &in = chunk.code[pc];
             if (g_jit_annotate)
                 marks.push_back({ static_cast<uint32_t>(e.pos() - frag_off[r]),
@@ -9099,9 +9162,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             g_fwd.skip_write = false;
             g_fwd.armed = false;
             int fdst;
+            bool next_is_preheader = false;
+            for (const HoistRegion &hr : hregs)
+                if (pc + 1 == hr.T)
+                    next_is_preheader = true;
             if (pc + 1 < end
-                    && !(hoisting && !in_cold && pc + 1 == h_T)
-                    && !(in_cold && pc + 1 > h_L)
+                    && !(!in_cold && next_is_preheader)
+                    && !(in_cold && pc + 1 > cold_end)
                     && !cache_barrier[pc - begin]
                     && !cache_barrier[pc + 1 - begin]
                     && jit_fwd_producer(in, fdst)
@@ -9159,24 +9226,51 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             }
         };
 
+        size_t hri = 0;                       /* the next region to enter */
         for (size_t pc = begin; pc < end && emit_ok; pc++) {
-            if (hoisting && pc == h_T) {
+            if (g_hoist.active && hri > 0
+                    && pc == hregs[hri - 1].L + 1)
+                g_hoist.active = false;
+            if (hri < hregs.size() && pc == hregs[hri].T) {
                 /* the PREHEADER: guards + (data, count) derivation. Back
-                 * edges target label[h_T], recorded AFTER these bytes. */
+                 * edges target label[T], recorded AFTER these bytes. */
+                const HoistRegion &hr = hregs[hri];
+                g_hoist.base = hr.base;
+                g_hoist.kind = hr.kind;
+                g_hoist.rdata = 10;
+                g_hoist.rcount = 11;
+                g_hoist.store_ok = hr.has_store;
                 const JitLayout &L = jit_layout();
-                const SlotAddr hb = slot_addr(g_hoist.base);
+                const SlotAddr hb = slot_addr(hr.base);
+                std::vector<size_t> &cold = h_cold[hri];
                 e.load(RAX, hb.type);
                 e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
                 e.cmp_rax_r9();
-                h_cold.push_back(e.j32(0x75));
+                cold.push_back(e.j32(0x75));
                 e.cmp_byte_slot(hb.payload + L.slice_off, 0);
-                h_cold.push_back(e.j32(0x75));
+                cold.push_back(e.j32(0x75));
                 e.load(RAX, hb.payload);
                 e.cmp_byte_rax(L.kind_off,
-                               g_hoist.kind == 0 ? L.kind_ints
-                             : g_hoist.kind == 1 ? L.kind_floats
-                                                 : L.kind_general);
-                h_cold.push_back(e.j32(0x75));
+                               hr.kind == 0 ? L.kind_ints
+                             : hr.kind == 1 ? L.kind_floats
+                                            : L.kind_general);
+                cold.push_back(e.j32(0x75));
+                if (hr.has_store) {
+                    /* C1b: the STORE guard set, all region-stable
+                     * (nothing in a region can freeze, rebind, or
+                     * create views), and the hash invalidated ONCE -
+                     * setting hash_valid=0 early only means "recompute
+                     * later", so the per-element store needs neither
+                     * the shobj nor a third register. */
+                    e.cmp_byte_slot(hb.type + (L.lv_const_off
+                                               - L.off_type), 0);
+                    cold.push_back(e.j32(0x75));  /* const slot */
+                    e.cmp_byte_rax(L.ro_off, 0);
+                    cold.push_back(e.j32(0x75));  /* readonly */
+                    e.cmp_byte_rax(L.slices_off, 0);
+                    cold.push_back(e.j32(0x75));  /* live views */
+                    e.mov_byte_rax_imm(L.hashv_off, 0);
+                }
                 e.mov_hr_rax(g_hoist.rdata, L.data_off);
                 e.mov_hr_rax(g_hoist.rcount, L.data_off + 8);
                 e.sub_hr_hr(g_hoist.rcount, g_hoist.rdata);
@@ -9188,11 +9282,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 #endif
                 g_fwd = JitFwd{};                 /* the nav clobbered rax */
                 g_hoist.active = true;
+                hri++;
             }
-            if (hoisting && pc == h_L + 1)
-                g_hoist.active = false;
             label[pc - begin] = e.pos();
-            emit_one(pc, /*in_cold=*/false);
+            emit_one(pc, /*in_cold=*/false, end);
         }
         g_hoist.active = false;
         if (!emit_ok) {
@@ -9209,38 +9302,41 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                       static_cast<uint32_t>(dst - (f.site + 4)));
         }
 
-        /* the COLD region copy: the ordinary emission of [h_T, h_L]
-         * alone; its region-internal branches patch against its own
-         * labels, its exits against the main stream's, and its
-         * fall-through end rejoins after the region. */
-        if (hoisting && emit_ok) {
-            for (const size_t j : h_cold)
+        /* the COLD region copies: the ordinary emission of each region
+         * alone; region-internal branches patch against the copy's own
+         * labels, exits against the main stream's, and the fall-through
+         * end rejoins after the region. */
+        for (size_t ri = 0; ri < hregs.size() && emit_ok; ri++) {
+            const size_t cT = hregs[ri].T, cL = hregs[ri].L;
+            for (const size_t j : h_cold[ri])
                 e.patch32_here(j);
             g_fwd = JitFwd{};
-            std::vector<size_t> cold_label(h_L - h_T + 1, 0);
+            std::vector<size_t> cold_label(cL - cT + 1, 0);
             std::vector<Fixup> cold_fix;
             cur_fix = &cold_fix;
-            for (size_t pc = h_T; pc <= h_L && emit_ok; pc++) {
-                cold_label[pc - h_T] = e.pos();
-                emit_one(pc, /*in_cold=*/true);
+            for (size_t pc = cT; pc <= cL && emit_ok; pc++) {
+                cold_label[pc - cT] = e.pos();
+                emit_one(pc, /*in_cold=*/true, cL + 1);
             }
             cur_fix = &fixups;
-            if (!emit_ok) {
-                g_hoist = JitHoist{};
-                e.b.clear();
-                return;
-            }
+            if (!emit_ok)
+                break;
             /* fall through off the region end -> the shared stream */
-            e.jmp32_to(h_L + 1 == end ? exit_pos
-                                      : label[h_L + 1 - begin]);
+            e.jmp32_to(cL + 1 == end ? exit_pos
+                                     : label[cL + 1 - begin]);
             for (const Fixup &f : cold_fix) {
                 const size_t dst =
-                    (f.target_pc >= h_T && f.target_pc <= h_L)
-                        ? cold_label[f.target_pc - h_T]
+                    (f.target_pc >= cT && f.target_pc <= cL)
+                        ? cold_label[f.target_pc - cT]
                         : label[f.target_pc - begin];
                 e.patch32(f.site,
                           static_cast<uint32_t>(dst - (f.site + 4)));
             }
+        }
+        if (!emit_ok) {
+            g_hoist = JitHoist{};
+            e.b.clear();
+            return;
         }
         g_hoist = JitHoist{};
 

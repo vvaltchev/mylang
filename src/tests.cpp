@@ -19100,7 +19100,11 @@ static bool jit_hoist_c1()
     struct Case {
         const char *name;
         std::vector<const char *> src;
-        long hoist_min;     /* >=1: must hoist; 0: must NOT (exact) */
+        long hoist_min;     /* >=1: must hoist; -1: use hoist_exact */
+        long hoist_exact = -1;  /* the EXACT entry count - the refusal
+                                 * cases' fills hoist too (C1b store
+                                 * candidates), so "did not hoist" is
+                                 * only assertable as fills == total */
     };
 
     #define MK_ARR \
@@ -19158,8 +19162,9 @@ static bool jit_hoist_c1()
           "print(f(mk(64), 64));" }, 1 },
 
       /* a runtime SLICE base: the entry's slice guard fails -> the COLD
-       * twin runs the whole loop (the ordinary emission, slice arm
-       * included) - the counter must NOT move */
+       * twin runs the whole loop. mk's fill loop (a store region, C1b)
+       * legitimately hoists ONCE - so exactly 1: a broken slice guard
+       * reads 2. */
       { "a runtime slice base falls to the COLD twin (no hoist entry)",
         { MK_ARR,
           "func f(a, n) {",
@@ -19167,10 +19172,12 @@ static bool jit_hoist_c1()
           "    for (var k = 0; k < n; k++) s += a[k];",
           "    return s; }",
           "var big = mk(64);",
-          "print(f(big[runtime(8):40], 32));" }, 0 },
+          "print(f(big[runtime(8):40], 32));" }, -1, 1 },
 
       /* the base REBOUND mid-loop: the def scan refuses hoisting
        * entirely (a MoveV onto the base) - values right, zero hoists */
+      /* the rebind loop must NOT hoist (the def scan); the two fill
+       * loops hoist once each -> exactly 2 (a broken scan reads 3) */
       { "a mid-loop base rebind refuses hoisting (the def scan)",
         { MK_ARR,
           "func mkb(n) {",
@@ -19181,7 +19188,72 @@ static bool jit_hoist_c1()
           "    var s = 0;",
           "    for (var k = 0; k < n; k++) { s += a[0]; a = b; }",
           "    return s; }",
-          "print(f(mk(8), mkb(16), 12));" }, 0 },
+          "print(f(mk(8), mkb(16), 12));" }, -1, 2 },
+
+      /* C1b: a PURE store loop (the 43_sieve marking shape, non-unit
+       * step) hoists - bounds + raw write off the pinned registers */
+      { "a pure store loop hoists (the sieve marking shape)",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var i = 2;",
+          "    while (i * i < n) {",
+          "        var j = i * i;",
+          "        while (j < n) { a[j] = 0; j += i; }",
+          "        i++; }",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k];",
+          "    return s; }",
+          "print(f(mk(64), 64));" }, 1 },
+
+      /*
+       * C1b's HASH contract: the preheader invalidates the cached hash
+       * ONCE (per-element stores write raw, with no shobj at hand). The
+       * oracle: hash(a) is CACHED before the loop, the hoisted stores
+       * change the content, and hash(a) afterwards must equal the
+       * fresh deepclone's - a skipped invalidation returns the STALE
+       * cache here.
+       */
+      { "the preheader hash invalidation (stale-cache oracle)",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var h0 = hash(a);",              /* caches the hash */
+          "    var j = 0;",
+          "    while (j < n) { a[j] = j * 3 + 1; j++; }",
+          "    var t = 0;",
+          "    if (hash(a) == hash(deepclone(a))) t = 1;",
+          "    if (hash(a) != h0) t += 2;",
+          "    return t; }",
+          "print(f(mk(32), 32));" }, 1 },
+
+      /* a store loop with a LIVE SLICE: the has_slices store guard
+       * fails -> the cold twin (whose ordinary tier preps) - the slice
+       * keeps its pre-detach elements; exactly the fill's 1 nav */
+      { "a store loop with a live slice goes COLD (the view oracle)",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var sl = a[1:4];",
+          "    var j = 0;",
+          "    while (j < n) { a[j] = 500 + j; j++; }",
+          "    return sl[0] * 100000 + a[1]; }",
+          "print(f(mk(32), 32));" }, -1, 1 },
+
+      /* a store loop on a DEEP-CONST base behind a plain param: the
+       * readonly store guard sends it cold; the ordinary tier raises
+       * the exact error. Exactly the fill's 1 nav. */
+      /* the value must be int(runtime(...)): a bare runtime() arg is
+       * DYN, which lowers the store to StoreElemValue - no candidate,
+       * and the case proved nothing (found by the sabotage run) */
+      { "a store loop on a readonly base goes COLD (error parity)",
+        { MK_ARR,
+          "const C = [9, 8, 7, 6, 5, 4, 3, 2];",
+          "func g(arr, n) {",
+          "    var t = 0;",
+          "    try {",
+          "        var j = 0;",
+          "        while (j < 8) { arr[j] = n; j++; }",
+          "    } catch (NotLValueEx) { t = 77; }",
+          "    return t + arr[0]; }",
+          "print(g(C, int(runtime(5))) + mk(4)[0]);" }, -1, 1 },
 
       /* a PLAIN store in the loop HOISTS - stores write the same memory
        * the pinned data pointer reads (a plain element store can never
@@ -19215,9 +19287,10 @@ static bool jit_hoist_c1()
                     "never ran\n";
             ok = false;
         }
-        if (c.hoist_min == 0 && hoist != 0) {
-            cout << "  hoist [" << c.name << "]: hoisted a shape it must "
-                    "REFUSE (" << hoist << ")\n";
+        if (c.hoist_exact >= 0
+            && hoist != static_cast<unsigned long>(c.hoist_exact)) {
+            cout << "  hoist [" << c.name << "]: entries " << hoist
+                 << " != expected " << c.hoist_exact << "\n";
             ok = false;
         }
     }
