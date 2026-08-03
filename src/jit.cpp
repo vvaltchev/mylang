@@ -258,6 +258,10 @@ struct JitLayout {
     const void *t_none;   /* the none Type singleton (JumpIfNotNoneV) */
     const void *t_arr;    /* the array Type singleton (N4) */
     int slice_off;        /* SharedArrayObj: offset of `slice` (from payload) */
+    int arr_off_off;      /* SharedArrayObj: offset of `off` (u32; #95 slice
+                           * reads - elements live at data + (off + i)) */
+    int arr_len_off;      /* SharedArrayObj: offset of `len` (u32; a slice's
+                           * element count - its bounds, NOT the vector's) */
     int kind_off;         /* SharedObject: &kind - shobj */
     int data_off;         /* SharedObject: &elem_vec - shobj (the vector's
                            * _M_start is at +0, _M_finish at +8) */
@@ -338,6 +342,12 @@ static const JitLayout &jit_layout()
          * the EvalValue union, so &arr.slice - &arr is the byte offset. */
         l.slice_off = static_cast<int>(
             reinterpret_cast<const char *>(&arr.slice) -
+            reinterpret_cast<const char *>(&arr));
+        l.arr_off_off = static_cast<int>(
+            reinterpret_cast<const char *>(&arr.off) -
+            reinterpret_cast<const char *>(&arr));
+        l.arr_len_off = static_cast<int>(
+            reinterpret_cast<const char *>(&arr.len) -
             reinterpret_cast<const char *>(&arr));
         const SharedArrayObj::JitProbe jp = arr.jit_probe();
         const char *so = static_cast<const char *>(jp.shobj);
@@ -833,6 +843,23 @@ struct Emitter {
     void cmp_rdx_r8()  { u8(0x4C); u8(0x39); u8(0xC2); }
     void cmp_rdx_r9()  { u8(0x4C); u8(0x39); u8(0xCA); }
     void mov_rdi_rcx() { u8(0x48); u8(0x89); u8(0xCF); }  /* prep: &row */
+    /* ---- #95, the SLICE read arms + the elem2 promote arm ---- */
+    /* cvtsi2sd xmm0, qword [rcx + r9*8]  (an int element promotes) */
+    void cvtsi2sd_x0_elem()
+    { u8(0xF2); u8(0x4A); u8(0x0F); u8(0x2A); u8(0x04); u8(0xC9); }
+    /* mov e<dx|ax>, dword [rbx+disp]  (a slice handle's u32 off/len,
+     * zero-extended - the handle lives in the slot's payload) */
+    void mov_edx_slot(int32_t d)
+    { u8(0x8B); u8(MODRM_SLOT | (2 << 3)); u32(uint32_t(d)); }
+    void mov_eax_slot(int32_t d)
+    { u8(0x8B); u8(MODRM_SLOT); u32(uint32_t(d)); }
+    /* mov e<dx|ax>, dword [rcx+disp]  (the elem2 ROW handle's off/len) */
+    void mov_edx_rcx(int32_t d)
+    { u8(0x8B); u8(0x91); u32(uint32_t(d)); }
+    void mov_eax_rcx(int32_t d)
+    { u8(0x8B); u8(0x81); u32(uint32_t(d)); }
+    void add_r9_rax() { u8(0x49); u8(0x01); u8(0xC1); }
+    void add_r9_rdx() { u8(0x49); u8(0x01); u8(0xD1); }
     /* cmp rax, rcx / test rax, rax */
     void cmp_rax_rcx() { u8(0x48); u8(0x39); u8(0xC8); }
     void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
@@ -3877,11 +3904,13 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
  *          boxed LValues at stride sizeof(LValue)); index in range by an
  *          unsigned BYTE-length compare (idx*48 < finish-start), which
  *          also catches a negative index.
- *   ROW    the LValue at data + idx*48: an array, NOT a slice (a slice
- *          row's elements live at shobj->off - decline rather than add
- *          the offset path), flat INT storage (bools/floats/strs/general
- *          decline; the helper serves them byte-identically, including
- *          the per-level OOB carets from the baked chain_locs pair).
+ *   ROW    the LValue at data + idx*48: an array, flat INT storage
+ *          (strs/general decline; the helper serves them
+ *          byte-identically, including the per-level OOB carets from
+ *          the baked chain_locs pair). #95 grew the arms: a SLICE
+ *          outer/row takes its offset-aware arm (bounds = the handle's
+ *          LEN, elements at data + off + i), and an INT row under the
+ *          FLOAT op takes the cvtsi2sd promote arm.
  *   INNER  bounds via the shared count compare, then mov rax,[rcx+r9*8],
  *          then the ref-aware store_dst (the same dst path every int
  *          producer uses).
@@ -3901,13 +3930,13 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     const SlotAddr base = slot_addr(in.target2);
     const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
 
-    /* OUTER: array, not a slice, general storage */
+    /* OUTER: array, general storage; a SLICE outer takes its arm (#95) */
     e.load(RAX, base.type);
     e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
     e.cmp_rax_r9();
     decline_ne();
     e.cmp_byte_slot(base.payload + L.slice_off, 0);
-    decline_ne();
+    const size_t j_oslice = e.j32(0x75);       /* -> the outer-slice arm */
     e.load(RAX, base.payload);                 /* outer SharedObject */
     e.cmp_byte_rax(L.kind_off, L.kind_general);
     decline_ne();
@@ -3922,13 +3951,15 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
     e.add_rcx_r9();                            /* rcx = &row (LValue) */
 
-    /* ROW: an array, not a slice, flat ints */
+    /* ROW: an array; a SLICE row takes its arm (#95); the arms below
+     * rejoin here, so `row_sec` is the common &row entry. */
+    const size_t row_sec = e.pos();
     e.mov_rax_rcx_d(static_cast<int32_t>(L.off_type));
     e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
     e.cmp_rax_r9();
     decline_ne();
     e.cmp_byte_rcx(static_cast<int32_t>(L.off_payload) + L.slice_off, 0);
-    decline_ne();
+    const size_t j_rslice = e.j32(0x75);       /* -> the row-slice arm */
     e.mov_rax_rcx_d(static_cast<int32_t>(L.off_payload));  /* row shobj */
 
     const auto inner_idx_r9 = [&]() {
@@ -3955,11 +3986,20 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     };
 
     if (is_float) {
-        /* FLOAT rows only; an INT row (which the helper PROMOTES via
-         * cvtsi2sd) declines - the promote arm can join later if a bench
-         * ever shows it hot. */
+        /* FLOAT rows, and (#95 case 3) an INT row PROMOTES via cvtsi2sd
+         * - the helper's own behaviour (the mixed-rows shape:
+         * `[[1.0,2.0],[3,4]]` joins to float while one row's storage
+         * stays flat INT). */
         e.cmp_byte_rax(L.kind_off, L.kind_floats);
+        const size_t j_frow = e.j32(0x74);
+        e.cmp_byte_rax(L.kind_off, L.kind_ints);
         decline_ne();
+        count_and_idx(/*bytes=*/false);
+        e.cvtsi2sd_x0_elem();                  /* xmm0 = (double)elem */
+        bump();
+        emit_float_store(e, ck, X0, in.target, pc);
+        dones.push_back(e.jmp32());
+        e.patch32_here(j_frow);
         count_and_idx(/*bytes=*/false);
         e.load_elem_float();                   /* xmm0 = [rcx + r9*8] */
         bump();
@@ -3986,6 +4026,58 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     e.load_elem_int();                         /* rax = [rcx + r9*8] */
     bump();
     store_dst(e, ck, RAX, in.target, pc);
+    dones.push_back(e.jmp32());
+
+    /*
+     * #95 case 4 - the OUTER-SLICE arm: a slice of a general array (its
+     * rows live at data + (off + oidx) * 48, bounds are the slice's
+     * LEN). Rejoins the common row section, so a slice-of-slices shape
+     * (slice outer AND slice row) composes with the row arm below.
+     */
+    e.patch32_here(j_oslice);
+    e.load(RAX, base.payload);
+    e.cmp_byte_rax(L.kind_off, L.kind_general);
+    decline_ne();
+    e.mov_rcx_rax(L.data_off);                 /* data, before rax dies */
+    e.mov_edx_slot(base.payload + L.arr_len_off);
+    load_slot_r9(e, in.a_dual_lo());
+    e.cmp_r9_rdx();
+    slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
+    e.mov_eax_slot(base.payload + L.arr_off_off);
+    e.add_r9_rax();                            /* oidx += off */
+    e.imul_r9_imm8(static_cast<uint8_t>(sizeof(LValue)));
+    e.add_rcx_r9();                            /* rcx = &row */
+    e.jmp32_to(row_sec);
+
+    /*
+     * The ROW-SLICE arm: the row's elements live at its shobj's data +
+     * (off + iidx), bounds its LEN. Strict kinds only (float op: float
+     * rows; int op: int rows - no bool tail, no promote in the slice
+     * arm; those decline to the helper).
+     */
+    e.patch32_here(j_rslice);
+    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_payload));  /* row shobj */
+    e.cmp_byte_rax(L.kind_off,
+                   is_float ? L.kind_floats : L.kind_ints);
+    decline_ne();
+    e.mov_edx_rcx(static_cast<int32_t>(L.off_payload) + L.arr_len_off);
+    inner_idx_r9();
+    e.cmp_r9_rdx();
+    slows.push_back(e.j32(0x73));
+    e.mov_edx_rcx(static_cast<int32_t>(L.off_payload) + L.arr_off_off);
+    e.add_r9_rdx();                            /* iidx += off */
+    e.mov_rcx_rax(L.data_off);                 /* rcx = row data */
+#ifdef TESTS
+    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem_slice_fast));
+    e.u8(0x48); e.u8(0xFF); e.u8(0x02);        /* inc qword [rdx] */
+#endif
+    if (is_float) {
+        e.load_elem_float();
+        emit_float_store(e, ck, X0, in.target, pc);
+    } else {
+        e.load_elem_int();
+        store_dst(e, ck, RAX, in.target, pc);
+    }
     dones.push_back(e.jmp32());
 }
 
@@ -4560,14 +4652,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const bool is_float = in.op == OpCode::LoadElemFloat;
         const SlotAddr base = slot_addr(in.target2);
         std::vector<size_t> j_slows;
-        size_t j_done = 0;
+        size_t j_done = 0, j_done2 = 0;
 
         e.load(RAX, base.type);                  /* base an array? */
         e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
         e.cmp_rax_r9();
         j_slows.push_back(e.j32(0x75));          /* jne -> slow */
-        e.cmp_byte_slot(base.payload + L.slice_off, 0);   /* not a slice? */
-        j_slows.push_back(e.j32(0x75));
+        e.cmp_byte_slot(base.payload + L.slice_off, 0);
+        const size_t j_slice = e.j32(0x75);      /* #95: -> the slice arm */
         e.load(RAX, base.payload);               /* rax = shobj ptr */
         if (is_float) {
             e.cmp_byte_rax(L.kind_off, L.kind_floats);
@@ -4609,6 +4701,38 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             write_slot(e, ck, RAX, in.target, pc);
             j_done = e.j32(0xEB);
         }
+        /*
+         * #95 case 4 - the SLICE arm: elements live at data + (off + i),
+         * bounds are the slice's LEN (a u32 in the handle, NOT the
+         * vector's size - the sabotage that reads past the slice's end
+         * is exactly what the len bound refuses). A negative index
+         * declines (the helper wraps); a bool/other-kind slice declines
+         * (int/float slices only - the reach case, 15_array_slice).
+         */
+        e.patch32_here(j_slice);
+        e.load(RAX, base.payload);               /* rax = shobj ptr */
+        e.cmp_byte_rax(L.kind_off,
+                       is_float ? L.kind_floats : L.kind_ints);
+        j_slows.push_back(e.j32(0x75));
+        e.mov_edx_slot(base.payload + L.arr_len_off);   /* count = len */
+        load_index_r9(e, in);
+        e.cmp_r9_rdx();
+        j_slows.push_back(e.j32(0x73));          /* jae: negative OR OOB */
+        e.mov_rcx_rax(L.data_off);               /* rcx = vector data */
+        e.mov_eax_slot(base.payload + L.arr_off_off);   /* rax = off */
+        e.add_r9_rax();                          /* idx += off */
+#ifdef TESTS
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem_slice_fast));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x02);      /* inc qword [rdx] */
+#endif
+        if (is_float) {
+            e.load_elem_float();
+            emit_float_store(e, ck, X0, in.target, pc);
+        } else {
+            e.load_elem_int();
+            write_slot(e, ck, RAX, in.target, pc);
+        }
+        j_done2 = e.j32(0xEB);
         /* slow: the interpreter-core helper; OOB/type conveys */
         for (const size_t j : j_slows)
             e.patch32_here(j);
@@ -4635,6 +4759,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.patch8(j_ok, e.pos());
         }
         e.patch32_here(j_done);
+        e.patch32_here(j_done2);
         return true;
     }
 

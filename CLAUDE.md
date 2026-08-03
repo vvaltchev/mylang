@@ -1369,8 +1369,8 @@ twins still paid the full helper per element. Now: StoreElemFloat takes
 the same guards with an SSE tail (`movsd [rcx+r9*8], xmm0`, value loaded
 via emit_float_load at the retry head since prep clobbers xmm0; prep is
 kind-agnostic and shared), LoadElem2Float mirrors the int navigation with
-float rows + `emit_float_store` (an INT row, which the helper PROMOTES,
-declines - the promote arm is a listed follow-up), and LoadElem2Int
+float rows + `emit_float_store` (an INT row now takes the #95 cvtsi2sd
+PROMOTE arm - it was a listed follow-up), and LoadElem2Int
 gained the 1-byte BOOLS tail (byte count, movzx). `run_has_float` gained
 LoadElem2Float so r8 = t_float is live in its runs. The float kind
 guard's catching shape is MIXED rows (`[[1.0,2.0],[3,4]]` - the joined
@@ -1442,6 +1442,33 @@ via compile_int_expr into an int operand - every float reader
 `definitely_int` gates it (a bool payload is not a float operand).
 Pinned by a 5-mode differential entry that fails as NotLoweredEx with
 the arm reverted (verified).
+**#95 cases 3 + 4 - the PROMOTE arm and the SLICE read arms
+(2026-08-02, completing the element-tier matrix):** LoadElem2Float's INT
+row promotes inline (`cvtsi2sd xmm0, [rcx+r9*8]` - the mixed-rows shape
+the helper used to serve), and SLICE bases read inline: the single-level
+LoadElemInt/Float slice arm and the nested read's OUTER-slice and
+ROW-slice arms (the outer arm rejoins the common row section, so
+slice-of-slices composes). A slice's elements live at `data + (off+i)`
+and its BOUNDS are the handle's u32 `len` - NOT the vector's size
+(probed as `JitLayout::arr_off_off/arr_len_off` beside `slice_off`); a
+negative index and bool/other-kind slices decline to the helper, as does
+the promote-under-slice combination. Execution-proven by
+`g_jit_elem_slice_fast` (single-level + row arms; the outer arm proves
+via `g_jit_elem2_fast` on an only-sliced-outer shape) with EXACT
+per-shape counts; sabotage-verified: the promote arm (16->0), the OFF
+addition in both the single and row arms (parent-element value
+divergence), and the LEN bound (a vector-size bound silently served
+`sl[len]` - count 17 and a missed OOB). The #56 slow-tier test's proof
+shape moved from the slice (now inline) to the NEGATIVE WRAP, which
+still declines. Measured (callgrind Ir, `OPT=1 ASSERTS=0` both sides):
+15_array_slice_readonly **-41.0%** (63.4M -> 37.4M - the per-element
+helper call gone); 14/43/46/18/01/16 all +-0.01% neutral, and the
+case-1/2 store restructure itself measured neutral-to-slightly-better
+against pre-#95 (43 -0.05%). With these, the element-tier MATRIX is
+COMPLETE: reads and stores, single and nested, int/bool/float, plain
+and compound, slice bases, COW-prepped - every cell either inline or a
+deliberate, documented helper decline (float `%=`, nested float
+div/mod, chain stores, bool slices, promote-under-slice).
 The **DICT store** `d[k] = v` / `d[k] OP= v` (LOCAL base) is the same shape -
 `DictStore` -> `jit_dict_store` (vm.cpp), which runs the interpreter's exact
 `vm_subscript_store`. The key/value are BOXED EvalValues in frame slots, so

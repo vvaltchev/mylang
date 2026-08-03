@@ -18724,6 +18724,167 @@ static bool jit_store_elem2_inline_tier()
 }
 
 /*
+ * #95 cases 3 + 4 - the SLICE read arms (single-level + the nested
+ * read's outer/row arms) and the nested read's int-row PROMOTE arm.
+ * Counters: g_jit_elem_slice_fast is bumped ONLY by the single-level
+ * and row-slice arms; the outer-slice arm rejoins the common row tail,
+ * so its proof is g_jit_elem2_fast on a shape whose ONLY nested reads
+ * go through a sliced outer (they used to decline to the helper, which
+ * bumps neither). Exact counts attribute per shape.
+ *
+ * Shape-eaters defeated: the outer index VARIES with the inner loop
+ * (else LICM hoists the row and no nested read exists); reads sit in
+ * filled/JIT-compiled loops; the promote shape's float join comes from
+ * an UNREAD float row so every counted read hits an INT row.
+ */
+static bool jit_elem_slice_and_promote()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src, bool vm,
+                  unsigned long *slice, unsigned long *e2) -> std::string {
+        const unsigned long s0 = g_jit_elem_slice_fast;
+        const unsigned long e0 = g_jit_elem2_fast;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (slice) *slice = g_jit_elem_slice_fast - s0;
+        if (e2) *e2 = g_jit_elem2_fast - e0;
+        return cap.str();
+    };
+
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        long slice_exact;   /* -1 dont-care */
+        long e2_exact;      /* -1 dont-care */
+    };
+    const std::vector<Case> cases = {
+      /*
+       * Single-level INT slice reads: 16 in-range (the arm), a NEGATIVE
+       * index (declines - the helper wraps it), and a read at len(sl)
+       * (declines - the helper throws OOB; the arm's bound is the
+       * slice's LEN, so a bound-against-the-vector sabotage silently
+       * serves this read instead of throwing).
+       */
+      { "single-level INT slice reads (16; negative + OOB decline)",
+        { "func f(a, n) {",
+          "    var sl = a[8:24];",
+          "    var s = 0; var i = 0;",
+          "    while (i < 16) { s = s + sl[i]; i++; }",
+          "    s = s + sl[0 - 2];",
+          "    var t = 0;",
+          "    try { s = s + sl[16]; } catch (OutOfBoundsEx) { t = 1; }",
+          "    return t * 100000 + s; }",
+          "var a = range(32);",
+          "print(f(a, 32));" }, 16, -1 },
+
+      { "single-level FLOAT slice reads (8)",
+        { "func f(a) {",
+          "    var sl = a[4:12];",
+          "    var s = 0.0; var i = 0;",
+          "    while (i < 8) { s = s + sl[i]; i++; }",
+          "    return s; }",
+          "func mk(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i * 0.5; i++; }",
+          "    return a; }",
+          "print(f(mk(32)));" }, 8, -1 },
+
+      /* the OUTER-slice arm: every nested read goes through a sliced
+       * outer, rejoining the common row tail (g_jit_elem2_fast) */
+      { "nested reads through a SLICED outer (16 via the row tail)",
+        { "func mk(n) {",
+          "    var m = array(n); var i = 0;",
+          "    while (i < n) {",
+          "        var row = array(8); var j = 0;",
+          "        while (j < 8) { row[j] = i * 100 + j; j++; }",
+          "        m[i] = row; i++; }",
+          "    return m; }",
+          "func f(m) {",
+          "    var ms = m[2:6];",
+          "    var s = 0; var j = 0;",
+          "    while (j < 16) { s = s + ms[j % 4][j % 8]; j++; }",
+          "    return s; }",
+          "print(f(mk(8)));" }, 0, 16 },
+
+      /* the ROW-slice arm: rows ARE slices of one backing array */
+      { "nested reads over SLICE rows (16 via the row-slice arm)",
+        { "func mk() {",
+          "    var big = range(64);",
+          "    var m = array(4); var i = 0;",
+          "    while (i < 4) { m[i] = big[i * 8 : i * 8 + 8]; i++; }",
+          "    return m; }",
+          "func f(m) {",
+          "    var s = 0; var j = 0;",
+          "    while (j < 16) { s = s + m[j % 4][j % 8]; j++; }",
+          "    return s; }",
+          "print(f(mk()));" }, 16, 0 },
+
+      /*
+       * Case 3, the PROMOTE arm: the float join comes from an unread
+       * float row, so all 16 counted reads hit INT rows under
+       * LoadElem2Float - each is a cvtsi2sd promote (they used to
+       * decline; with the arm removed this exact count reads 0).
+       */
+      { "nested float reads over INT rows: the cvtsi2sd promote arm",
+        { "var m = [[9.5],",
+          "         [30, 31, 32, 33, 34, 35, 36, 37],",
+          "         [40, 41, 42, 43, 44, 45, 46, 47]];",
+          "func f(m) {",
+          "    var s = 0.0; var j = 0;",
+          "    while (j < 16) { s = s + m[1 + (j % 2)][j % 8]; j++; }",
+          "    return s; }",
+          "print(f(m));" }, 0, 16 },
+    };
+
+    bool ok = true;
+    for (const Case &c : cases) {
+        unsigned long slice = 0, e2 = 0;
+        const std::string got = go(c.src, true, &slice, &e2);
+        const std::string ref = go(c.src, false, nullptr, nullptr);
+        if (got != ref || ref.empty()) {
+            cout << "  slice arms [" << c.name << "]: tw=[" << ref
+                 << "] vm=[" << got << "]\n";
+            ok = false;
+        }
+        if (c.slice_exact >= 0
+            && slice != static_cast<unsigned long>(c.slice_exact)) {
+            cout << "  slice arms [" << c.name << "]: slice count "
+                 << slice << " != expected " << c.slice_exact << "\n";
+            ok = false;
+        }
+        if (c.e2_exact >= 0
+            && e2 != static_cast<unsigned long>(c.e2_exact)) {
+            cout << "  slice arms [" << c.name << "]: elem2 count "
+                 << e2 << " != expected " << c.e2_exact << "\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * THE COUNTED-LOOP FUSIONS' OPERAND LAYOUT SURVIVES A SPLICE (#87).
  *
  * `IntAddStep` packs TWO things into one operand: `a_dual_lo` is always a
@@ -20025,18 +20186,19 @@ static bool jit_load_elem_slow_tier()
         g_exec_engine = saved;
         return ok;
     };
+    /* #95 flipped the SLICE read to an inline arm, so the slow tier's
+     * proof shape is the NEGATIVE WRAP (both kinds) - still a decline. */
     const unsigned long i0 =
         g_jit_op_run[static_cast<size_t>(OpCode::LoadElemInt)];
     const unsigned long f0 =
         g_jit_op_run[static_cast<size_t>(OpCode::LoadElemFloat)];
     if (!run({
             "var a = range(20);",
-            "var sl = a[5:15];                 # a SLICE declines inline",
             "var fa = [1.5, 2.5, 3.5]; fa[0] += 0.5;",
             "var s = 0; var fs = 0.0;",
-            "for (var i = 0; i < 10; i++) s += sl[i];",
+            "for (var i = 0; i < 10; i++) s += a[i - 20];   # negative wrap",
             "for (var i = 0; i < 3; i++) fs += fa[i - 3];   # negative wrap",
-            "assert(s == 95); assert(fs == 8.0);" }))
+            "assert(s == 45); assert(fs == 8.0);" }))
         return false;
     if (g_jit_op_run[static_cast<size_t>(OpCode::LoadElemInt)] <= i0) {
         fprintf(stderr,
@@ -23209,6 +23371,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the INLINE nested-STORE tier (a[i][j] = / OP=) with prep, "
       "promote and fit/divisor decline order (#95)",
       jit_store_elem2_inline_tier },
+    { "jit: the SLICE read arms (single + nested outer/row) and the "
+      "nested int-row PROMOTE arm (#95)",
+      jit_elem_slice_and_promote },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",
