@@ -150,10 +150,39 @@ bool-read loop, is the `if (arr[i])` FUSION (JumpUnlessElemInt), which
 is not a candidate op. The value is the conflict resolution + plain
 bool reads (reach, like prep).
 
+**C1d - the FUSIONS as candidates + TEMP bases. LANDED 2026-08-03.**
+Three unlocks, each found by chasing where the previous one's reach
+ended (the census tool: `-nj -vd` - a plain `-vd` is POST-DELETION,
+where a fused run is a bare enter.nat, so the first corpus census of
+the fusion ops read zero everywhere):
+- `JumpUnlessElemInt` as a candidate (base/idx/hint ride the
+  mutated-in-place load's fields); the hoisted read went into the
+  SHARED `emit_elem_int_read` so the op's emit needed no change.
+- `ForStepElemInt` as a candidate - the fusion COPIES the step's
+  struct, so the load's ELEM-BOOL hint transfers by hand after
+  set_b_dual; the hoisted form skips the base gate (preheader proved
+  it; nothing bail-able precedes the step -> no double-step hazard)
+  and declines only the post-step read, to the existing
+  jit_elem_int_value tier. Its def list wrongly marked `target` (a
+  BRANCH PC) as a written slot - fixed.
+- TEMP bases admitted (a foreach-over-array's base is a snapshot
+  TEMP): the base is only READ at the preheader, the def scan kills
+  in-region rebinds, aliased stores cannot move storage. This is what
+  gave 18_foreach_array its first hoist.
+- `DictLoadInt/Float` whitelisted (weaker than the admitted
+  DictStore); 68_nested's ForStepElemInt regions unblocked.
+
+MEASURED (callgrind Ir/scale, OPT=1 ASSERTS=0): 57_bool_reduce
+**-41.6%** (360.6M -> 210.6M), 18_foreach_array **-37.1%**,
+56_sieve_bool **-24.8%**, 43_sieve **-18.2%**; 68_nested exactly
+neutral (tiny foreach arrays - the regions hoist, the loops are cold);
+46/14/01/02/09/15 byte-flat. Sabotages (each watched failing): the
+hint transfer dropped -> the kind guard goes cold and the counter
+assertion fires; both hoisted reads' byte stride forced to 8 ->
+value divergence; the bounds check dropped -> the negative-index
+case diverges.
+
 Remaining follow-ups on the C1 family, in value order:
-  - the FUSIONS as hoist candidates (JumpUnlessElemInt /
-    ForStepElemInt: hoist-aware base gates + element reads) - that is
-    where 57_bool_reduce's 360M/scale sits, and 43/56's count loops;
   - the hoisted-COMPOUND store form (compound ops keep the ordinary
     tier inside a region).
 

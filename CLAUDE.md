@@ -1342,14 +1342,46 @@ static type and copied by clone(); the STORE site switched to it too
 (one source of truth, no #96 mislabel). LoadElemInt carries the hint,
 kind 3's hoisted read is a movzx byte (stride sabotage-verified), and
 the former store+read kind CONFLICT now agrees and hoists both ways
-(the pinned test flipped). Reaches NO bench - 57_bool_reduce's read is
-the JumpUnlessElemInt FUSION, not a candidate op: making the FUSIONS
-hoist-aware is the next rung (57's 360M/scale + 43/56's count loops),
-then the hoisted-COMPOUND store form, then C2/C3 per the plan. The C1b sabotages each
+(the pinned test flipped). The C1b sabotages each
 required defeating a fresh shape-eater first: a bare `runtime()`
 argument is DYN, which lowers `arr[j] = n` to StoreElemValue - no
 candidate, a vacuous case - `int(runtime(5))` keeps the store
 StoreElemInt.
+**C1d - the FUSIONS as candidates + TEMP bases (same day).** Three
+unlocks, each found by chasing where the previous one's reach ended:
+(1) `JumpUnlessElemInt` (the fused sieve test) is a candidate - its
+base/idx/hint ride the mutated-in-place load's own fields - and the
+hoisted form lives in the SHARED `emit_elem_int_read` (bounds-vs-r11 +
+byte-or-int read off r10; declines land on the caller's conveying slow
+tier, which reads memory). (2) `ForStepElemInt` is a candidate (base =
+b_dual_lo) - but the fusion COPIES the step's struct, so the load's
+ELEM-BOOL hint must TRANSFER by hand after set_b_dual (which clears
+b's flag bits; sabotage: without it the pick stamps kind ints, the
+kind guard goes cold, the counter assertion catches it); its hoisted
+form skips the base gate entirely (the preheader proved it - and
+nothing bail-able precedes the step, so no double-step hazard, no
+SLOW-B) and the post-step read is bounds + read, declining to the
+existing jit_elem_int_value tier. Its old def list marked `target` - a
+BRANCH PC, not a slot - as a def (harmless-looking, but a pc-numbered
+slot was spuriously killed as a candidate); fixed. (3) **TEMP bases
+are admitted**: a foreach-over-array snapshots the container into a
+TEMP, so every foreach loop has one - N5's temp hazard (eager
+entry-load + exit-FLUSH) does not apply to a base that is only READ at
+the preheader, the def scan still kills an in-region rebind, and an
+aliased store cannot move the storage (#92's has_slices rule). Also
+whitelisted: `DictLoadInt/Float` - strictly weaker than the admitted
+DictStore (a vivify mutates the dict's own nodes, never an array's
+vector) - which unblocked 68_nested's ForStepElemInt regions.
+Measured (callgrind Ir/scale, OPT=1 ASSERTS=0): 57_bool_reduce
+**-41.6%** (360.6M -> 210.6M), 18_foreach_array **-37.1%** (the
+temp-base unlock), 56_sieve_bool **-24.8%**, 43_sieve **-18.2%**
+(their count loops joined); 68_nested exactly neutral (its foreach
+arrays are tiny); 46/14/01/02/09/15 byte-flat per scale. Remaining on
+the family: the hoisted-COMPOUND store form; then C2/C3 per the plan.
+MEASUREMENT-HARNESS NOTE: shopping/phonebook fed </dev/null spin
+forever on EOF re-printing their menus - a `timeout`-truncated
+JIT-on-vs-off byte compare then "diverges" purely by SPEED; feed `q`
+(they quit cleanly) before reading such a diff as real.
 
 **N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to `MAX_CACHED` hot
 int-scalar slots are pinned in `r12`-`r15` per fragment

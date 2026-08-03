@@ -7897,6 +7897,11 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                         f.set_b_dual(ld.target2 /* array */,
                                      ld.target  /* elem dst */);
                         f.node_idx = ld.node_idx;   /* the OOB caret */
+                        /* C1d: f copied the STEP's struct, so the LOAD's
+                         * ELEM-BOOL hint must transfer by hand (after
+                         * set_b_dual, which clears b's flag bits) */
+                        if (ld.elem_bool_hint())
+                            f.set_elem_bool_hint();
                         op1 = f;
                         changed = true;
                         continue;
