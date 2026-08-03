@@ -45,34 +45,60 @@ A/B at `OPT=1 ASSERTS=0`. No step requires the next.
 
 ### C1 - per-loop guard + navigation hoisting (~ the old B)
 
-Hoist an invariant array base's navigation OUT of the loop body: at the
-loop preheader (before the back-edge target), verify type/non-slice/
-kind ONCE and load data pointer + count into callee-saved registers;
-the per-element code indexes off the registers with only the bounds
-check left. On guard failure at the preheader, fall to the current
-per-element code for the WHOLE loop (approach A - a compile-time
-decline path, never a mid-loop bail with stale registers).
+**LANDED 2026-08-03**, after three designs, each decided by a
+measurement that contradicted the sketch here - the record matters more
+than the sketch did:
 
-- Soundness = INVARIANCE, proven the way LICM already proves it:
-  `fr_immutable` / `mut_len` / `mut_content` - the base's slot is not
-  reassigned in the loop and its content/length not mutated (an element
-  WRITE to the base disqualifies: COW detach would move the data
-  pointer). The pure-callback rules (`callable_arg_mask`) carry over
-  unchanged.
-- Register budget: the N5 pool is r12-r15 and `pick_cached_slots`
-  already arbitrates it; a hoisted base costs 2 registers (data,
-  count). Start with ONE hoisted base per loop (the hottest by use
-  count) so the int-counter pins keep their slots; widen later.
-- The bounds check stays per element (indices genuinely vary). What
-  disappears per element: the type-tag load+cmp, the slice-flag cmp,
-  the kind cmp, the shobj load, the data/finish loads and the count
-  subtraction - the measured ~10-15 of 91.5, more on nested shapes.
-- GOTCHA recorded up front: a helper call inside the loop preserves
-  r12-r15 (callee-saved) but a PREP/slow-tier path that CLONES the
-  base (COW) moves the data pointer - any loop containing a WRITE to
-  the hoisted base must not hoist it (the mut_content gate above
-  already excludes this; the sabotage test is a store-through-alias
-  shape).
+1. **Run-scoped, callee-saved regs** (this section's original plan):
+   whitelist over the RUN, nav at fragment entry, 2 regs reserved from
+   the N5 pool. Fired on ZERO benches - since the #56 call-deletability
+   work a run spans the whole function, so "no calls in the run" means
+   "no calls in the function" (matmul's `array(n)` at pc 1 killed it),
+   and any real loop pins 3+ scalars so the N5 pool never had 2 free.
+2. **Loop-REGION versioning, callee-saved regs + N5 capped at 2**: the
+   region [T, L] is a backward branch's span, gates checked over the
+   region only (ops BEFORE it - the calls - are harmless, the nav runs
+   at the preheader after them); a failed guard jumps to a COLD copy of
+   the region alone. This fired - and 46 measured -0.69 instead of -8
+   Ir/iter, then 43_sieve +3.3%: the CAP is fragment-wide while the
+   benefit is region-local, so every other loop in the fragment paid
+   two lost pins. Region-scoped pin RANKING recovered 46 (-6.4%) but
+   the sieve stayed regressed - the arbitration was unwinnable.
+3. **r10/r11 (the shipped design)**: the hoisted (data, count) live in
+   CALLER-saved registers the emitter freed when the N5 cache moved to
+   r12-r15 - no reservation, no cap, no arbitration. The price: any
+   helper call inside the region clobbers them; `emit_call_epilogue` -
+   the single choke point every helper-call emission pairs through -
+   re-derives both when a region is active (RAX untouched: it carries
+   the helper's status). A sync call would not re-derive, but calls
+   cannot be in a region, which is also what keeps r10/r11 unused
+   there (only the M5b push emitter touches them).
+
+What survived from the sketch: one base per region, innermost-first,
+the preheader guard model (back edges target the post-nav label, so
+only the fall-through entry pays it), bounds per element. What did
+NOT: the store exclusion - a PLAIN element store never moves a
+non-slice base's storage (clone_internal_vec needs the store's own
+base to be a slice, which the entry guard excludes; the aliased-slices
+clone detaches the VIEWS; growth is a builtin call, refused), so the
+whitelist admits the plain store family and 46's `row[j] = s` no
+longer poisons its loop. The `fr_immutable`/LICM machinery predicted
+here was never needed: run-shape soundness (whitelist + def-scan +
+no-jumps-in) replaces dataflow invariance entirely.
+
+MEASURED (callgrind Ir, OPT=1 ASSERTS=0, scale-1-vs-3 delta):
+46_matrix_mult **-12.0%**/iter (~89.5 -> ~78.7), 14_array_subscript
+**-15.9%**/iter; 01/03/07/18/62/fib all within +-0.01%; 15 (a runtime
+slice base every entry - the cold twin runs) exactly neutral.
+
+**C1b - the STORE side (the next increment).** 43/56_sieve pick a
+region but do not move: their hot loops are store-dominated, and the
+store tiers do not consult the hoisted registers. Extending them needs
+the entry navigation to ALSO prove const/readonly/has_slices (the
+store-specific guards, all region-stable - nothing in a region can
+freeze, rebind, or create views) and a pinned SHOBJ (the hash-byte
+invalidation needs it; pin (shobj, count) and derive data per element
+at +1, or spend a third register). Scope it against 43's profile.
 
 ### C2 - widen the register cache beyond int slots
 

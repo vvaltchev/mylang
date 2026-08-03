@@ -19057,6 +19057,177 @@ static bool jit_fwd_deadtemp()
 }
 
 /*
+ * C1 - PER-LOOP GUARD + NAVIGATION HOISTING (the typed-invariant-arrays
+ * staircase, plans/typed-invariant-arrays.md). An invariant base's
+ * type/slice/kind guards + data/count derivation run ONCE at the
+ * fragment entry; the per-element form is bounds + read. g_jit_hoist is
+ * bumped by the EMITTED entry navigation on SUCCESS - once per fragment
+ * entry, so a hoisted loop counts its ENTRIES, and a shape that must
+ * fall to the cold twin (a runtime slice) or must not hoist at all (a
+ * mid-loop base rebind, a store in the loop) counts ZERO.
+ */
+static bool jit_hoist_c1()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src, bool vm,
+                  unsigned long *hoist) -> std::string {
+        const unsigned long h0 = g_jit_hoist;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (hoist) *hoist = g_jit_hoist - h0;
+        return cap.str();
+    };
+
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        long hoist_min;     /* >=1: must hoist; 0: must NOT (exact) */
+    };
+
+    #define MK_ARR \
+        "func mk(n) {", \
+        "    var a = array(n); var i = 0;", \
+        "    while (i < n) { a[i] = i + 1; i++; }", \
+        "    return a; }"
+
+    const std::vector<Case> cases = {
+      { "a read-only int loop hoists its base (entry navigation runs)",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k] * 2;",
+          "    return s; }",
+          "print(f(mk(64), 64));" }, 1 },
+
+      { "a FLOAT loop hoists too",
+        { "func mkf(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i * 0.5; i++; }",
+          "    return a; }",
+          "func f(a, n) {",
+          "    var s = 0.0;",
+          "    for (var k = 0; k < n; k++) s = s + a[k];",
+          "    return s; }",
+          "print(f(mkf(64), 64));" }, 1 },
+
+      /* the elem2 OUTER hoists (general kind, byte-length count); the
+       * outer index varies with the inner loop so LICM cannot eat the
+       * nested read (the trap list's shape rule) */
+      { "the nested read's OUTER hoists (the matmul shape)",
+        { "func mkm(n) {",
+          "    var m = array(n); var i = 0;",
+          "    while (i < n) {",
+          "        var row = array(8); var j = 0;",
+          "        while (j < 8) { row[j] = i * 10 + j; j++; }",
+          "        m[i] = row; i++; }",
+          "    return m; }",
+          "func f(m) {",
+          "    var s = 0;",
+          "    for (var j = 0; j < 32; j++) s += m[j % 4][j % 8];",
+          "    return s; }",
+          "print(f(mkm(4)));" }, 1 },
+
+      /* a NEGATIVE index inside a hoisted loop: the bounds check
+       * declines to the slow tier, which reads MEMORY - value parity is
+       * the oracle that the hoisted registers were not consulted */
+      { "negative indexes inside a hoisted loop take the slow tier",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k - 64];",
+          "    return s; }",
+          "print(f(mk(64), 64));" }, 1 },
+
+      /* a runtime SLICE base: the entry's slice guard fails -> the COLD
+       * twin runs the whole loop (the ordinary emission, slice arm
+       * included) - the counter must NOT move */
+      { "a runtime slice base falls to the COLD twin (no hoist entry)",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k];",
+          "    return s; }",
+          "var big = mk(64);",
+          "print(f(big[runtime(8):40], 32));" }, 0 },
+
+      /* the base REBOUND mid-loop: the def scan refuses hoisting
+       * entirely (a MoveV onto the base) - values right, zero hoists */
+      { "a mid-loop base rebind refuses hoisting (the def scan)",
+        { MK_ARR,
+          "func mkb(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i + 100; i++; }",
+          "    return a; }",
+          "func f(a, b, n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) { s += a[0]; a = b; }",
+          "    return s; }",
+          "print(f(mk(8), mkb(16), 12));" }, 0 },
+
+      /* a PLAIN store in the loop HOISTS - stores write the same memory
+       * the pinned data pointer reads (a plain element store can never
+       * move a non-slice base's storage; growth ops are calls, refused).
+       * The read-after-store value is the oracle that the pinned pointer
+       * and the stored-to memory are one. */
+      { "a plain store in the loop hoists (reads see the stores)",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) { s += a[k]; a[k] = s; }",
+          "    var t = 0;",
+          "    for (var k = 0; k < n; k++) t += a[k];",
+          "    return s * 7 + t; }",
+          "print(f(mk(32), 32));" }, 1 },
+    };
+    #undef MK_ARR
+
+    bool ok = true;
+    for (const Case &c : cases) {
+        unsigned long hoist = 0;
+        const std::string got = go(c.src, true, &hoist);
+        const std::string ref = go(c.src, false, nullptr);
+        if (got != ref || ref.empty()) {
+            cout << "  hoist [" << c.name << "]: tw=[" << ref
+                 << "] vm=[" << got << "]\n";
+            ok = false;
+        }
+        if (c.hoist_min >= 1 && hoist == 0) {
+            cout << "  hoist [" << c.name << "]: the entry navigation "
+                    "never ran\n";
+            ok = false;
+        }
+        if (c.hoist_min == 0 && hoist != 0) {
+            cout << "  hoist [" << c.name << "]: hoisted a shape it must "
+                    "REFUSE (" << hoist << ")\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * THE COUNTED-LOOP FUSIONS' OPERAND LAYOUT SURVIVES A SPLICE (#87).
  *
  * `IntAddStep` packs TWO things into one operand: `a_dual_lo` is always a
@@ -23549,6 +23720,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: adjacent dead-temp FORWARDING hands values in RAX "
       "(lever A; counter + slow-path rejoin)",
       jit_fwd_deadtemp },
+    { "jit: C1 per-loop navigation HOISTING (entry nav + cold twin + "
+      "refusals)",
+      jit_hoist_c1 },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",

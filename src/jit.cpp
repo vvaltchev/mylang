@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <unordered_map>
+#include <map>
 #include <unordered_set>
 #include <cstring>
 #include <cmath>
@@ -54,6 +55,7 @@ unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
 unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
 unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
+unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 }
@@ -844,6 +846,38 @@ struct Emitter {
     void cmp_rdx_r8()  { u8(0x4C); u8(0x39); u8(0xC2); }
     void cmp_rdx_r9()  { u8(0x4C); u8(0x39); u8(0xCA); }
     void mov_rdi_rcx() { u8(0x48); u8(0x89); u8(0xCF); }  /* prep: &row */
+    /* ---- C1, the hoisted-base navigation (r12-r15 operands) ---- */
+    /* mov rH, [rax+disp]  (the vector's start/finish into a hoist reg) */
+    void mov_hr_rax(uint8_t hr, int32_t d)
+    { u8(0x4C); u8(0x8B); u8(static_cast<uint8_t>(0x80 | ((hr & 7) << 3)));
+      u32(uint32_t(d)); }
+    void mov_hr_rcx(uint8_t hr, int32_t d)       /* mov rH, [rcx+d] */
+    { u8(0x4C); u8(0x8B);
+      u8(static_cast<uint8_t>(0x81 | ((hr & 7) << 3))); u32(uint32_t(d)); }
+    void sub_hr_hr(uint8_t dst, uint8_t src)     /* sub rHd, rHs */
+    { u8(0x4D); u8(0x29);
+      u8(static_cast<uint8_t>(0xC0 | ((src & 7) << 3) | (dst & 7))); }
+    void sar_hr_3(uint8_t hr)                    /* sar rH, 3 */
+    { u8(0x49); u8(0xC1); u8(static_cast<uint8_t>(0xF8 | (hr & 7)));
+      u8(0x03); }
+    void cmp_r9_hr(uint8_t hr)                   /* cmp r9, rH */
+    { u8(0x4D); u8(0x39);
+      u8(static_cast<uint8_t>(0xC1 | ((hr & 7) << 3))); }
+    /* mov rax, [rH + r9*8] / movsd xmm0, [rH + r9*8]. SIB base = r13
+     * (101b) with mod 00 means disp32-no-base - that case takes mod 01
+     * with a zero disp8 instead. */
+    void load_elem_int_hr(uint8_t hr)
+    {
+        u8(0x4B); u8(0x8B);
+        if ((hr & 7) == 5) { u8(0x44); u8(0xCD); u8(0x00); }
+        else { u8(0x04); u8(static_cast<uint8_t>(0xC8 | (hr & 7))); }
+    }
+    void load_elem_float_hr(uint8_t hr)
+    {
+        u8(0xF2); u8(0x4B); u8(0x0F); u8(0x10);
+        if ((hr & 7) == 5) { u8(0x44); u8(0xCD); u8(0x00); }
+        else { u8(0x04); u8(static_cast<uint8_t>(0xC8 | (hr & 7))); }
+    }
     /* ---- #95, the SLICE read arms + the elem2 promote arm ---- */
     /* cvtsi2sd xmm0, qword [rcx + r9*8]  (an int element promotes) */
     void cvtsi2sd_x0_elem()
@@ -1724,6 +1758,22 @@ static void emit_call_prologue(Emitter &e)
     (void)e;
 }
 
+/* C1 (see the runs loop): the hoisted base's (data ptr, count) live in
+ * CALLER-saved r10/r11 while a loop region emits, so any helper call
+ * inside the region clobbers them; emit_call_epilogue below is the
+ * single choke point every helper-call emission pairs through, and it
+ * re-derives both. The base's PROPERTIES (type/non-slice/kind, its slot
+ * binding) are region-stable - only the derived pointers need refresh. */
+struct JitHoist {
+    int base = -1;        /* the hoisted base's frame slot (-1 = none) */
+    int kind = 0;         /* 0 ints, 1 floats, 2 general (elem2 outer) */
+    uint8_t rdata = 0;    /* r10: the flat vector's data pointer */
+    uint8_t rcount = 0;   /* r11: element count (ints/floats) / BYTE
+                           * length (general - the elem2 outer compare) */
+    bool active = false;  /* emitting the HOT region now */
+};
+static JitHoist g_hoist;
+
 static void emit_call_epilogue(Emitter &e)
 {
     /* Only the two type singletons need restoring - they are compile-time
@@ -1731,6 +1781,17 @@ static void emit_call_epilogue(Emitter &e)
      * cheaper than a register pair the allocator could otherwise use. */
     e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
     e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+    if (g_hoist.active) {
+        /* re-derive via RCX - RAX carries the helper's status, which
+         * every call site tests right after this epilogue */
+        const JitLayout &L = jit_layout();
+        e.load(RCX, slot_addr(g_hoist.base).payload);   /* the shobj */
+        e.mov_hr_rcx(g_hoist.rdata, L.data_off);
+        e.mov_hr_rcx(g_hoist.rcount, L.data_off + 8);
+        e.sub_hr_hr(g_hoist.rcount, g_hoist.rdata);
+        if (g_hoist.kind != 2)                /* elements, not bytes */
+            e.sar_hr_3(g_hoist.rcount);
+    }
 }
 
 /* Re-raise DELETABILITY: the op's own LocEntry (`&ck.locs[i]`, a stable
@@ -2687,6 +2748,248 @@ static void emit_fwd_bump(Emitter &e)
     e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_fwd));
     e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
 #endif
+}
+
+/*
+ * ---- C1: PER-LOOP GUARD + NAVIGATION HOISTING ----
+ * (plans/typed-invariant-arrays.md, the staircase's first step)
+ *
+ * A loop's element ops re-derive the base's navigation EVERY element:
+ * type tag, slice flag, SharedObject, kind, data/finish, count - for a
+ * base that provably cannot change inside the loop. C1 verifies the
+ * guards ONCE at the fragment entry (the loop's preheader - the native
+ * back edge jumps past it) and pins (data pointer, count) in two
+ * callee-saved registers the N5 pick left free; the per-element form is
+ * bounds-check + read. A failed entry guard jumps to a COLD TWIN of the
+ * whole body - the unhoisted emission - so there is never a mid-loop
+ * bail with derived registers (approach A at loop granularity), and a
+ * DELETED run needs no interpreted original to fall back on.
+ *
+ * SOUNDNESS is run-shape, not dataflow: hoisting happens only when
+ * EVERY op in the run is on a READ-ONLY whitelist - no calls (arbitrary
+ * code), no stores (COW detach moves the data pointer), no boxed PMF
+ * ops (TypeArr::add MUTATES the left operand) - and no op DEFINES the
+ * base slot (a MoveV onto it would rebind it mid-loop). Within one
+ * run's execution nothing else runs (single-threaded, calls excluded),
+ * so memory the registers were derived from cannot move. The element
+ * ops' slow tiers (negative wrap, OOB) read MEMORY, which is never
+ * stale - only the registers are derived state, and the cold twin
+ * re-derives nothing (it is the ordinary emission).
+ *
+ * Entry-pc note: a hoistable run can contain no sync calls and no
+ * handler ops, so no post-call resume stub or handler resume can land
+ * inside it - jumping past the entry navigation is structurally
+ * impossible; the pick still scans `entries` as a belt.
+ */
+static bool op_is_branch(OpCode op);           /* defined below */
+
+/* The read-only whitelist: ops that cannot run user code, cannot mutate
+ * any array (so no COW detach can move a hoisted data pointer), and
+ * cannot rebind slots beyond their own scalar dsts. */
+static bool jit_hoist_op_ok(const Instr &in)
+{
+    switch (in.op) {
+    case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
+    case OpCode::MoveV:
+    case OpCode::IntBin:
+    case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+    case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+    case OpCode::IntShlRR: case OpCode::IntShrRR:
+    case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+    case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+    case OpCode::IntShlRI: case OpCode::IntShrRI:
+    case OpCode::IntModRI: case OpCode::IntAddModRI:
+    case OpCode::FloatBin:
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
+    case OpCode::Jump:
+    case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
+    case OpCode::JumpUnlessTrueV:  /* is_true: reads, throws, never
+                                    * mutates a container */
+    case OpCode::ForLoopStep: case OpCode::IntAddStep:
+    case OpCode::JumpUnlessElemInt: case OpCode::ForStepElemInt:
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+    case OpCode::ArrLen: case OpCode::StrLen: case OpCode::OrdCharV:
+    case OpCode::ReturnV:
+    /*
+     * The PLAIN store family is read-only FOR A HOISTED BASE'S STORAGE,
+     * which is the property that matters: flat_store_core /
+     * vm_subscript_store move a base's data ONLY via clone_internal_vec
+     * (the store's own base is a SLICE - our entry guard excludes that
+     * for the hoisted slot, and a slice ALIAS reseats its own handle,
+     * never our shobj) or a strs-kind promote (our kind guard excludes
+     * strs); clone_aliased_slices detaches the VIEWS and leaves the
+     * base's vector in place. What genuinely moves storage is GROWTH -
+     * append/insert/emplace - and those are builtin-call ops, refused
+     * above. The first version excluded stores wholesale and C1 fired
+     * on ZERO benches: real loops store somewhere (46's row[j] = s).
+     */
+    case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+    case OpCode::StoreElemValue: case OpCode::StoreElem2V:
+    case OpCode::DictStore:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The slots an op in the whitelist above can WRITE (its scalar dsts +
+ * the fusions' counters). Enumerated HERE, for the whitelist only - a
+ * new whitelisted op must be added to BOTH switches. */
+template <typename D>
+static void jit_hoist_op_defs(const Instr &in, D d)
+{
+    switch (in.op) {
+    case OpCode::MoveV:
+        d(in.target); break;
+    case OpCode::ForLoopStep:
+        d(in.target2); break;                    /* the counter */
+    case OpCode::IntAddStep:
+        d(in.a_dual_lo()); d(in.target2); break; /* acc + counter */
+    case OpCode::ForStepElemInt:
+        d(in.target); d(in.target2); break;
+    case OpCode::Jump:
+    case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
+    case OpCode::JumpUnlessElemInt: case OpCode::JumpUnlessTrueV:
+    case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+    case OpCode::StoreElemValue: case OpCode::StoreElem2V:
+    case OpCode::DictStore:
+        break;                                   /* no frame-slot writes */
+    default:
+        d(in.target);                            /* the scalar dst */
+        break;
+    }
+}
+
+/*
+ * Pick a LOOP REGION [T, L] and ONE base to hoist for the run
+ * [begin, end). A region is a backward branch's span (the branch at L
+ * targets T <= L); regions are tried INNERMOST-first (smallest span)
+ * and the first that passes every gate with a candidate wins:
+ *
+ *  - every op in [T, L] is on the read-only-for-storage whitelist
+ *    (ops BEFORE the region - array() calls, anything - are harmless:
+ *    the navigation runs at the PREHEADER, after them);
+ *  - no branch from OUTSIDE [T, L] targets INSIDE it, and no handler
+ *    resume or entry-stub pc lands in it - the only ways in are the
+ *    fall-through preheader (which runs the navigation) and the back
+ *    edges (which target the post-navigation label);
+ *  - the base is a resolved LOCAL, one consistent kind, never defined
+ *    inside the region.
+ */
+static bool jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
+                           const std::vector<std::pair<size_t, size_t>> &entries,
+                           size_t &t_out, size_t &l_out,
+                           int &base_out, int &kind_out)
+{
+    static const bool dbg = getenv("MYLANG_HOISTDBG") != nullptr;
+
+    std::vector<std::pair<size_t, size_t>> regions;   /* (T, L) */
+    for (size_t p = begin; p < end; p++) {
+        const Instr &in = chunk.code[p];
+        if (op_is_branch(in.op)
+                && in.target >= static_cast<int>(begin)
+                && in.target <= static_cast<int>(p))
+            regions.push_back({ static_cast<size_t>(in.target), p });
+    }
+    std::sort(regions.begin(), regions.end(),
+              [](const std::pair<size_t, size_t> &a,
+                 const std::pair<size_t, size_t> &b) {
+                  return (a.second - a.first) < (b.second - b.first);
+              });
+
+    for (const auto &rg : regions) {
+        const size_t T = rg.first, L = rg.second;
+        bool ok = true;
+        for (size_t p = T; p <= L && ok; p++)
+            if (!jit_hoist_op_ok(chunk.code[p])) {
+                if (dbg) fprintf(stderr,
+                                 "hoist[%zu,%zu): op %d at %zu\n",
+                                 T, L, (int)chunk.code[p].op, p);
+                ok = false;
+            }
+        if (!ok)
+            continue;
+        /* every jump INTO the region originates inside it */
+        for (size_t p = begin; p < end && ok; p++) {
+            const Instr &in = chunk.code[p];
+            if (op_is_branch(in.op)
+                    && in.target >= static_cast<int>(T)
+                    && in.target <= static_cast<int>(L)
+                    && (p < T || p > L))
+                ok = false;
+        }
+        for (const auto &pe : entries)
+            if (pe.first >= T && pe.first <= L)
+                ok = false;
+        for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+            for (const Chunk::HandlerClause &cl : hs.clauses)
+                if (cl.body_pc >= static_cast<int>(T)
+                        && cl.body_pc <= static_cast<int>(L))
+                    ok = false;
+            if (hs.fin_pc >= static_cast<int>(T)
+                    && hs.fin_pc <= static_cast<int>(L))
+                ok = false;
+        }
+        if (!ok)
+            continue;
+
+        /* candidates: base slot -> {kind, uses}; a kind conflict drops */
+        struct Cand { int kind; int uses; bool dead; };
+        std::map<int, Cand> cands;
+        const auto add = [&](int slot, int kind) {
+            if (slot < 0 || slot >= chunk.slot_count)
+                return;                          /* locals only */
+            auto it = cands.find(slot);
+            if (it == cands.end())
+                cands[slot] = { kind, 1, false };
+            else if (it->second.kind != kind)
+                it->second.dead = true;
+            else
+                it->second.uses++;
+        };
+        for (size_t p = T; p <= L; p++) {
+            const Instr &in = chunk.code[p];
+            switch (in.op) {
+            case OpCode::LoadElemInt:   add(in.target2, 0); break;
+            case OpCode::LoadElemFloat: add(in.target2, 1); break;
+            case OpCode::LoadElem2Int:
+            case OpCode::LoadElem2Float: add(in.target2, 2); break;
+            default: break;
+            }
+        }
+        for (size_t p = T; p <= L; p++)
+            jit_hoist_op_defs(chunk.code[p], [&](int s) {
+                auto it = cands.find(s);
+                if (it != cands.end())
+                    it->second.dead = true;      /* redefined in the loop */
+            });
+
+        int best = -1, best_uses = 0, best_kind = 0;
+        for (const auto &kv : cands) {
+            if (kv.second.dead)
+                continue;
+            if (kv.second.uses > best_uses) {
+                best = kv.first;
+                best_uses = kv.second.uses;
+                best_kind = kv.second.kind;
+            }
+        }
+        if (best < 0)
+            continue;
+        t_out = T;
+        l_out = L;
+        base_out = best;
+        kind_out = best_kind;
+        if (dbg) fprintf(stderr,
+                         "hoist[%zu,%zu): PICKED slot %d kind %d\n",
+                         T, L, best, best_kind);
+        return true;
+    }
+    return false;
 }
 
 /* THE REGISTER-CACHE AUDIT (env MYLANG_CACHEAUDIT=1). Which opcode
@@ -4055,13 +4358,26 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
         store_dst(e, ck, RAX, in.target, pc, fw);
     };
 
-    /* OUTER: array, general storage; a SLICE outer takes its arm (#95) */
+    /* OUTER: array, general storage; a SLICE outer takes its arm (#95).
+     * C1: a HOISTED outer skips the whole navigation - the entry
+     * proved array/non-slice/general and pinned (data, BYTE length). */
+    size_t j_oslice = SIZE_MAX;
+    const bool hoisted = g_hoist.active && in.target2 == g_hoist.base
+        && g_hoist.kind == 2;
+    if (hoisted) {
+        load_slot_r9(e, in.a_dual_lo());
+        e.imul_r9_imm8(static_cast<uint8_t>(sizeof(LValue)));
+        e.cmp_r9_hr(g_hoist.rcount);           /* vs the BYTE length */
+        slows.push_back(e.j32(0x73));          /* jae: negative OR OOB */
+        e.mov_rr(RCX, g_hoist.rdata);
+        e.add_rcx_r9();                        /* rcx = &row (LValue) */
+    } else {
     e.load(RAX, base.type);
     e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
     e.cmp_rax_r9();
     decline_ne();
     e.cmp_byte_slot(base.payload + L.slice_off, 0);
-    const size_t j_oslice = e.j32(0x75);       /* -> the outer-slice arm */
+    j_oslice = e.j32(0x75);                    /* -> the outer-slice arm */
     e.load(RAX, base.payload);                 /* outer SharedObject */
     e.cmp_byte_rax(L.kind_off, L.kind_general);
     decline_ne();
@@ -4075,6 +4391,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     e.cmp_r9_rdx();
     slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
     e.add_rcx_r9();                            /* rcx = &row (LValue) */
+    }
 
     /* ROW: an array; a SLICE row takes its arm (#95); the arms below
      * rejoin here, so `row_sec` is the common &row entry. */
@@ -4159,6 +4476,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
      * LEN). Rejoins the common row section, so a slice-of-slices shape
      * (slice outer AND slice row) composes with the row arm below.
      */
+    if (j_oslice != SIZE_MAX) {
     e.patch32_here(j_oslice);
     e.load(RAX, base.payload);
     e.cmp_byte_rax(L.kind_off, L.kind_general);
@@ -4173,6 +4491,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     e.imul_r9_imm8(static_cast<uint8_t>(sizeof(LValue)));
     e.add_rcx_r9();                            /* rcx = &row */
     e.jmp32_to(row_sec);
+    }
 
     /*
      * The ROW-SLICE arm: the row's elements live at its shobj's data +
@@ -4807,8 +5126,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const JitLayout &L = jit_layout();
         const bool is_float = in.op == OpCode::LoadElemFloat;
         const SlotAddr base = slot_addr(in.target2);
-        std::vector<size_t> j_slows;
-        size_t j_done = 0, j_done2 = 0;
+        std::vector<size_t> j_slows, j_dones;
         /* lever A producer: elide a dead temp's write on the fast arms
          * (the SLOW tier's helper always writes the slot; its rejoin
          * reloads RAX below, so the contract holds on both paths). */
@@ -4819,6 +5137,26 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             write_slot(e, ck, RAX, in.target, pc, fw);
         };
 
+        /* C1: the HOISTED form - the entry navigation proved the base
+         * and pinned (data, count); the element is a bounds check + a
+         * read. Negative/OOB declines to the slow tier, which reads
+         * MEMORY (never stale - the registers are the only derived
+         * state). */
+        const bool hoisted = g_hoist.active && in.target2 == g_hoist.base
+            && g_hoist.kind == (is_float ? 1 : 0);
+        if (hoisted) {
+            load_index_r9(e, in);
+            e.cmp_r9_hr(g_hoist.rcount);
+            j_slows.push_back(e.j32(0x73));      /* jae -> slow */
+            if (is_float) {
+                e.load_elem_float_hr(g_hoist.rdata);
+                emit_float_store(e, ck, X0, in.target, pc);
+            } else {
+                e.load_elem_int_hr(g_hoist.rdata);
+                dst_write();
+            }
+            j_dones.push_back(e.j32(0xEB));
+        } else {
         e.load(RAX, base.type);                  /* base an array? */
         e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
         e.cmp_rax_r9();
@@ -4838,7 +5176,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             j_slows.push_back(e.j32(0x73));      /* jae (wrap/OOB) -> slow */
             e.load_elem_float();                 /* movsd xmm0,[rcx+r9*8] */
             emit_float_store(e, ck, X0, in.target, pc);
-            j_done = e.j32(0xEB);
+            j_dones.push_back(e.j32(0xEB));
         } else {
             e.cmp_byte_rax(L.kind_off, L.kind_ints);
             const size_t j_ints = e.j32(0x74);
@@ -4864,7 +5202,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.load_elem_int();
             e.patch32_here(j_store);
             dst_write();
-            j_done = e.j32(0xEB);
+            j_dones.push_back(e.j32(0xEB));
         }
         /*
          * #95 case 4 - the SLICE arm: elements live at data + (off + i),
@@ -4897,7 +5235,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.load_elem_int();
             dst_write();
         }
-        j_done2 = e.j32(0xEB);
+        j_dones.push_back(e.j32(0xEB));
+        }                                        /* end of !hoisted */
         /* slow: the interpreter-core helper; OOB/type conveys */
         for (const size_t j : j_slows)
             e.patch32_here(j);
@@ -4927,8 +5266,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * reload (the fast dones jump PAST it, keeping their RAX) */
         if (fw)
             e.load(RAX, slot_addr(in.target).payload);
-        e.patch32_here(j_done);
-        e.patch32_here(j_done2);
+        for (const size_t j : j_dones)
+            e.patch32_here(j);
         if (fw)
             g_fwd.armed = true;
         return true;
@@ -8679,11 +9018,36 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         e.cache.clear();
         e.saved.clear();
         std::vector<char> cache_barrier(end - begin, 0);
+
+        /* C1: the hoisted (data, count) live in r10/r11 - CALLER-saved
+         * registers the emitter freed when the N5 cache moved to
+         * r12-r15, so hoisting costs the N5 pick NOTHING (an earlier
+         * version reserved two callee-saved regs and the fragment-wide
+         * pin loss ate the region-local win: 43_sieve +3.3%). The price
+         * is that any helper call INSIDE the region clobbers them -
+         * emit_call_epilogue re-derives both when g_hoist.active, the
+         * single choke point every helper-call emission goes through.
+         * A sync CALL would not re-derive, but calls cannot be in a
+         * region (the whitelist), which is also what keeps r10/r11
+         * unused there (only the M5b push emitter touches them).
+         */
+        g_hoist = JitHoist{};
+        size_t h_T = 0, h_L = 0;
+        int h_base = -1, h_kind = 0;
+        const bool hoisting =
+            jit_hoist_pick(chunk, begin, end, entries, h_T, h_L,
+                           h_base, h_kind);
         const std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
                               &cache_barrier);
         for (size_t h = 0; h < hot.size(); h++)
             e.saved.push_back(CACHE_REGS[h]);
+        if (hoisting) {
+            g_hoist.base = h_base;
+            g_hoist.kind = h_kind;
+            g_hoist.rdata = 10;
+            g_hoist.rcount = 11;
+        }
 
         e.frag_entry();               /* push rbx + the cache regs; rbx=rdi */
         e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
@@ -8699,27 +9063,45 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.load(CACHE_REGS[h], a.payload);     /* entry load */
         }
 
+
         std::vector<size_t> label(end - begin, 0);
-        std::vector<Fixup> fixups;
         std::vector<NativeCode::OpMark> marks;
-        for (size_t pc = begin; pc < end; pc++) {
-            label[pc - begin] = e.pos();
+        /*
+         * C1 is LOOP VERSIONING: the loop region [h_T, h_L] is emitted
+         * with the hoisted registers live, its PREHEADER (the bytes just
+         * before label[h_T] - only the fall-through entry runs them, the
+         * back edges target the label after) verifying the base and
+         * deriving (data, count); a failed guard jumps to a COLD copy of
+         * the region alone (emitted after the run), whose exits rejoin
+         * the shared stream. `emit_one` is the single per-op emitter both
+         * passes share, so the copies cannot drift; `fixups`/`label`
+         * belong to the MAIN stream, the cold pass swaps its own in.
+         */
+        std::vector<Fixup> fixups;
+        std::vector<Fixup> *cur_fix = &fixups;
+        std::vector<size_t> h_cold;              /* the failed-guard jnes */
+        g_fwd = JitFwd{};
+        bool emit_ok = true;
+        const auto emit_one = [&](size_t pc, bool in_cold) {
+            const Instr &in = chunk.code[pc];
             if (g_jit_annotate)
                 marks.push_back({ static_cast<uint32_t>(e.pos() - frag_off[r]),
                                   static_cast<uint32_t>(remap[pc]) });
-            const Instr &in = chunk.code[pc];
 
             /* Lever A protocol. in_rax is one-shot: it names the temp
              * whose value the JUST-EMITTED producer left in RAX (nothing
              * is emitted between two ops - labels and marks are
              * metadata - so RAX survives the boundary). Then decide
-             * whether THIS op produces for the next one. */
+             * whether THIS op produces for the next one - refused when
+             * the C1 preheader's navigation bytes would intervene. */
             g_fwd.in_rax = g_fwd.armed ? g_fwd.prod : -1;
             g_fwd.prod = -1;
             g_fwd.skip_write = false;
             g_fwd.armed = false;
             int fdst;
             if (pc + 1 < end
+                    && !(hoisting && !in_cold && pc + 1 == h_T)
+                    && !(in_cold && pc + 1 > h_L)
                     && !cache_barrier[pc - begin]
                     && !cache_barrier[pc + 1 - begin]
                     && jit_fwd_producer(in, fdst)
@@ -8766,17 +9148,59 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                  * enter the target run natively); the op's OWN pc (arg 4,
                  * its bail) stays ordinary remap */
                 emit_branch(e, chunk, in, static_cast<uint32_t>(remap[pc]),
-                            begin, end, entry_remap, fixups, pc);
+                            begin, end, entry_remap, *cur_fix, pc);
             } else if (!emit_op(e, chunk, in,
                                 static_cast<uint32_t>(remap[pc]), jc, pc)) {
-                e.b.clear();
-                return;                    /* selection bug: give up */
+                emit_ok = false;           /* selection bug: give up */
             }
             if (brk) {
                 e.cache = std::move(saved_cache);
                 e.reload_cache();
             }
+        };
+
+        for (size_t pc = begin; pc < end && emit_ok; pc++) {
+            if (hoisting && pc == h_T) {
+                /* the PREHEADER: guards + (data, count) derivation. Back
+                 * edges target label[h_T], recorded AFTER these bytes. */
+                const JitLayout &L = jit_layout();
+                const SlotAddr hb = slot_addr(g_hoist.base);
+                e.load(RAX, hb.type);
+                e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+                e.cmp_rax_r9();
+                h_cold.push_back(e.j32(0x75));
+                e.cmp_byte_slot(hb.payload + L.slice_off, 0);
+                h_cold.push_back(e.j32(0x75));
+                e.load(RAX, hb.payload);
+                e.cmp_byte_rax(L.kind_off,
+                               g_hoist.kind == 0 ? L.kind_ints
+                             : g_hoist.kind == 1 ? L.kind_floats
+                                                 : L.kind_general);
+                h_cold.push_back(e.j32(0x75));
+                e.mov_hr_rax(g_hoist.rdata, L.data_off);
+                e.mov_hr_rax(g_hoist.rcount, L.data_off + 8);
+                e.sub_hr_hr(g_hoist.rcount, g_hoist.rdata);
+                if (g_hoist.kind != 2)            /* elements, not bytes */
+                    e.sar_hr_3(g_hoist.rcount);
+#ifdef TESTS
+                e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_hoist));
+                e.u8(0x48); e.u8(0xFF); e.u8(0x02);
+#endif
+                g_fwd = JitFwd{};                 /* the nav clobbered rax */
+                g_hoist.active = true;
+            }
+            if (hoisting && pc == h_L + 1)
+                g_hoist.active = false;
+            label[pc - begin] = e.pos();
+            emit_one(pc, /*in_cold=*/false);
         }
+        g_hoist.active = false;
+        if (!emit_ok) {
+            g_hoist = JitHoist{};
+            e.b.clear();
+            return;
+        }
+        const size_t exit_pos = e.pos();
         e.exit_pc(static_cast<uint32_t>(remap[end]));   /* fall-through */
 
         for (const Fixup &f : fixups) {    /* patch internal jumps */
@@ -8784,6 +9208,41 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.patch32(f.site,
                       static_cast<uint32_t>(dst - (f.site + 4)));
         }
+
+        /* the COLD region copy: the ordinary emission of [h_T, h_L]
+         * alone; its region-internal branches patch against its own
+         * labels, its exits against the main stream's, and its
+         * fall-through end rejoins after the region. */
+        if (hoisting && emit_ok) {
+            for (const size_t j : h_cold)
+                e.patch32_here(j);
+            g_fwd = JitFwd{};
+            std::vector<size_t> cold_label(h_L - h_T + 1, 0);
+            std::vector<Fixup> cold_fix;
+            cur_fix = &cold_fix;
+            for (size_t pc = h_T; pc <= h_L && emit_ok; pc++) {
+                cold_label[pc - h_T] = e.pos();
+                emit_one(pc, /*in_cold=*/true);
+            }
+            cur_fix = &fixups;
+            if (!emit_ok) {
+                g_hoist = JitHoist{};
+                e.b.clear();
+                return;
+            }
+            /* fall through off the region end -> the shared stream */
+            e.jmp32_to(h_L + 1 == end ? exit_pos
+                                      : label[h_L + 1 - begin]);
+            for (const Fixup &f : cold_fix) {
+                const size_t dst =
+                    (f.target_pc >= h_T && f.target_pc <= h_L)
+                        ? cold_label[f.target_pc - h_T]
+                        : label[f.target_pc - begin];
+                e.patch32(f.site,
+                          static_cast<uint32_t>(dst - (f.site + 4)));
+            }
+        }
+        g_hoist = JitHoist{};
 
         /* PER-PC ENTRY STUBS (post-call resume): an interior offset cannot
          * be entered raw - fragment code assumes the HEAD's register
