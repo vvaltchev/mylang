@@ -9957,6 +9957,26 @@ static const std::vector<test> tests =
     },
 
     {
+        /* REGRESSION (Windows-only, 2026-07-29): integer literals were
+         * parsed with `stol`, whose `long` is 32 bits on Windows (LLP64) and
+         * 64 on Linux/macOS - so every literal in [2^31, 2^63) was rejected
+         * as "out of range" on Windows ALONE, though int_type holds it and
+         * the language promises 64-bit ints. The gap was invisible because
+         * the only literal-range test used a value beyond 2^63, which every
+         * platform refuses. Fixed by stoll + an explicit int_type fit check.
+         * (A .myv round-trip test with a big literal is what exposed it.) */
+        "an integer literal above 2^31 parses and computes (64-bit ints)",
+        {
+            "const BIG = 4611686018427387903;",
+            "assert(BIG / 3 == 1537228672809129301);",
+            "assert(2147483648 + 1 == 2147483649);",
+            "assert(-4611686018427387903 - 1 < 0);",
+            "var dyn n = runtime(2);",
+            "assert(n * 2305843009213693951 == 4611686018427387902);",
+        },
+    },
+
+    {
         "float literal out of range is a syntax error",
         {
             "var x = 1e999999;",
@@ -15687,6 +15707,8 @@ static bool myv_round_trip()
             return false;
         }
         if (!myv_is_image(path)) {
+            fprintf(stderr, "myv: '%s' is not recognized as an image\n",
+                    path.c_str());
             g_exec_engine = saved;
             return false;
         }
@@ -15728,7 +15750,17 @@ static bool myv_round_trip()
 
         vm_run(loaded);                         /* it must RUN */
         ok = true;
+    } catch (const Exception &e) {
+        /* NAME the exception: a silent catch-all here cost a CI round trip
+         * (the Windows lane failed with no reason in the log). */
+        fprintf(stderr, "myv: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "(no message)");
+        ok = false;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "myv: threw std::exception: %s\n", e.what());
+        ok = false;
     } catch (...) {
+        fprintf(stderr, "myv: threw an unknown exception\n");
         ok = false;
     }
     g_exec_engine = saved;
