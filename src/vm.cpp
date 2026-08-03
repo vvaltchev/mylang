@@ -1454,12 +1454,16 @@ vm_dyn_next_dict(DynIterState &st, Frame &frame, const Chunk *, size_t)
     return true;
 }
 
-/* P8 Inc 0: an active `try` region on the VM handler stack. `catch_pc` is where
- * the boundary jumps on a caught exception (the CatchTest chain); `region` is
- * the try's chunk-static REGION ID - the index of its per-frame pend/exc
- * state slot (task #78 step 2, below). */
+/*
+ * P8 Inc 0: an active `try` region on the VM handler stack. It used to carry
+ * the pc the raise path jumps to (the head of the interpreted CatchTest
+ * chain); #78 step D deleted that chain, so a live handler is now JUST its
+ * chunk-static REGION ID - the index of both its Chunk::handler_sites entry
+ * (the clause list the dispatch matches against) and its per-frame
+ * pend/exc slot. Back to 4 bytes, which the emitted inline push/pop and the
+ * handler_base bake all depend on (static_assert below).
+ */
 struct VmHandler {
-    uint32_t catch_pc;
     uint32_t region;
 };
 
@@ -2306,19 +2310,23 @@ extern unsigned long g_vm_table_dispatch;
  * finally that will re-raise) iff this frame handles it; false when the
  * frame's handlers are exhausted and the walk must pop to the caller.
  *
- * ONE out-of-line function, called from vm_raise and the boxed-throw sites.
- * Measured alternatives, both WORSE on 42_exceptions: inlining it at the
- * call sites (+3.6M Ir - it grows vm_dispatch's text, the loop-body text
- * rule), and splitting a cold tail out of it (+2.7M - the extra call and
- * the argument marshalling cost more than the leaner frame saves).
+ * SHAPE (measured; see the inline wrapper below): the LOOP is one
+ * out-of-line function. Inlining the whole thing at the call sites cost
+ * +3.6M Ir on 42_exceptions (it grows vm_dispatch's text - the loop-body
+ * text rule), and splitting a cold tail out of it +2.7M (a second call and
+ * its argument marshalling, for a frame it barely shrinks).
  */
-static bool vm_dispatch_exc(VmActivation &act, const VmCallRec &cur,
-                            EvalContext &ctx, size_t &pc,
-                            std::unique_ptr<RuntimeException> &ex)
+static ML_NOINLINE bool vm_dispatch_exc_frame(
+        VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
+        size_t &pc, std::unique_ptr<RuntimeException> &ex)
 {
     const Chunk *ck = cur.run_chunk;
 
-    while (act.handlers.size() > cur.handler_base) {
+    /* PRECONDITION: the inline wrapper below already proved this frame has
+     * at least one live handler - hence do/while, not while: repeating that
+     * test here measured +6 Ir per throw on the same-frame benches. */
+    ML_VM_CHECK(act.handlers.size() > cur.handler_base);
+    do {
 
         const VmHandler h = act.handlers.back();
         act.handlers.pop_back();
@@ -2366,9 +2374,29 @@ static bool vm_dispatch_exc(VmActivation &act, const VmCallRec &cur,
             return true;
         }
         /* neither: keep walking OUT to the next enclosing handler */
-    }
+    } while (act.handlers.size() > cur.handler_base);
 
     return false;
+}
+
+/*
+ * THE FAST REJECT, inline at every call site: "does this frame have a live
+ * try at all?" - two loads and a compare.
+ *
+ * It is load-bearing for the FRAME WALK, which calls this once per POPPED
+ * frame, and the overwhelming majority of those frames have no handler. The
+ * pre-#78 dispatch was small enough to inline whole, so the reject was free;
+ * the table version is not, and paying a full call frame per walked frame
+ * cost 162 Ir per frame - measured as +6.4% on 69_exc_crossframe (a throw 16
+ * frames deep) before this wrapper went back in.
+ */
+static ML_ALWAYS_INLINE bool vm_dispatch_exc(
+        VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
+        size_t &pc, std::unique_ptr<RuntimeException> &ex)
+{
+    if (act.handlers.size() <= cur.handler_base)
+        return false;                 /* no try here - no call, no frame */
+    return vm_dispatch_exc_frame(act, cur, ctx, pc, ex);
 }
 
 /*
@@ -6471,9 +6499,9 @@ void jit_fill_push_layout(JitPushLayout *L)
                 make_intrusive<FuncObject>(&fd, &probe_root))).get_type();
     }
     L->stop_chunk = &vm_sync_stop_chunk();
-    /* the emitted handler_base computation shifts by 3 (#78: VmHandler
-     * grew to {catch_pc, region}) */
-    static_assert(sizeof(VmHandler) == 8, "handler_base >> 3 bake");
+    /* the emitted handler_base computation shifts by 2 (#78 step D:
+     * VmHandler is back to a bare 4-byte region id) */
+    static_assert(sizeof(VmHandler) == 4, "handler_base >> 2 bake");
     /* the emitted seg/rec addressing */
     static_assert(sizeof(std::unique_ptr<VmStackSeg>) == sizeof(void *),
                   "segs[i] raw-pointer load");
@@ -6520,11 +6548,9 @@ ptrdiff_t jit_off_pend_state_pend()
 
 /* The COLD grow path of the inline PushHandler: the handlers vector is at
  * capacity - do the real push_back (realloc). Never throws in practice. */
-extern "C" void jit_push_handler_grow(int_type catch_pc,
-                                      int_type region) noexcept
+extern "C" void jit_push_handler_grow(int_type region) noexcept
 {
-    g_vm_act->handlers.push_back({ static_cast<uint32_t>(catch_pc),
-                                   static_cast<uint32_t>(region) });
+    g_vm_act->handlers.push_back({ static_cast<uint32_t>(region) });
 }
 
 ptrdiff_t jit_off_desc_vm_chunk()
@@ -8891,55 +8917,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         }
 
         VM_CASE(PushHandler):
-            /* #78: {catch_pc, region} - the region id keys the try's
-             * per-frame pend/exc slot for the eventual dispatch. */
-            act.handlers.push_back({ static_cast<uint32_t>(in->target),
-                                     static_cast<uint32_t>(in->a_lit()) });
+            /* #78: the region id - it keys BOTH the try's handler_sites
+             * entry (the clauses the dispatch matches) and its per-frame
+             * pend/exc slot. */
+            act.handlers.push_back({ static_cast<uint32_t>(in->a_lit()) });
             pc++;
             VM_NEXT;
 
         VM_CASE(PopHandler):
             act.handlers.pop_back();  /* the try body exited normally */
             pc++;
-            VM_NEXT;
-
-        VM_CASE(CatchTest): {
-            /* vm_exc holds the caught exception. Match its type name against
-             * this clause (a.lit = catch_types idx, or -1 = catch-all). On a
-             * match: bind `catch (T as e)` (target2 = slot, -1 if none), jump to
-             * the catch body (target). Else fall to the next CatchTest /
-             * Reraise. vm_exc is KEPT (not cleared) so a `rethrow` in the catch
-             * body can re-raise it; a new throw overwrites it. */
-            /* #78: the caught exception lives in the try's per-REGION slot
-             * (b = the region id), parked there by vm_dispatch_exc; the
-             * clause match is the SHARED vm_catch_match (step A - the same
-             * function the handler-table dispatch will call). */
-            VmPendState &ps =
-                act.pend_at(cur_rec(), in->b_lit());
-            const bool match =
-                vm_catch_match(*chunk, in->a_lit(), ps.exc.get());
-            if (match) {
-                if (in->target2 >= 0)
-                    ctx.frame->at(in->target2).put(
-                        vm_catch_bind_val(ps.exc.get()));
-                pc = static_cast<size_t>(in->target);
-            } else {
-                pc++;
-            }
-        }
-        VM_NEXT;
-
-        VM_CASE(Reraise):
-            /* No clause matched: re-raise vm_exc - the native WALK finds the
-             * outer handler (same or ANY caller frame) or reaches the boundary
-             * (G1: no C++ throw; the walk's first step IS the old same-frame
-             * dispatch, and the boundary catch used to flush the reraise pc's
-             * inlined frames + clone - vm_raise does the flush, sans clone). */
-            if (!vm_raise(chunk, pc, act, ctx,
-                          std::move(act.pend_at(cur_rec(),
-                                                in->a_lit()).exc)))
-                return;                 /* boundary: signal set */
-            code = chunk->code.data();
             VM_NEXT;
 
         VM_CASE(Rethrow):

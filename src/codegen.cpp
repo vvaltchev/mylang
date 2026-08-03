@@ -5690,13 +5690,17 @@ struct Codegen {
          * finally, every exit path sets the pending action + jumps to Lfin
          * (EndFinally resumes it); without, exits jump straight to Lend. */
         std::vector<size_t> to_fin, to_end;
-        auto exit_to = [&](Pend p) {
+        /*
+         * #78 step D: the only remaining exit kind is a NORMAL one (the try
+         * body ran to the end, a catch body finished). The "no clause
+         * matched" exit is GONE from the bytecode: vm_dispatch_exc reads
+         * that decision off the handler table - it parks a `reraise` and
+         * resumes at fin_pc itself, or returns false to the frame walk.
+         */
+        auto exit_to = [&]() {
             if (has_fin) {
-                emit_setpend(region, p);
+                emit_setpend(region, Pend::normal);
                 to_fin.push_back(emit(OpCode::Jump));
-            } else if (p == Pend::reraise) {
-                const size_t rr = emit(OpCode::Reraise);
-                code[rr].set_a(int_lit(region));   /* #78: whose exc */
             } else {
                 to_end.push_back(emit(OpCode::Jump));
             }
@@ -5713,7 +5717,11 @@ struct Codegen {
             return false;
         };
 
-        const size_t ph = emit(OpCode::PushHandler);   /* target=catch_pc (patch) */
+        /* #78 step D: PushHandler carries ONLY the region id - the pushed
+         * handler names its table entry, and the dispatch reads the clause
+         * pcs from there. It has no target pc (hence it is no longer in
+         * visit_pc_fields). */
+        const size_t ph = emit(OpCode::PushHandler);
         code[ph].set_a(int_lit(region));               /* #78: the region id */
         /* Register this try so a flow op in the body/catch (Inc 2c) can inline
          * this finally + pop this handler. `in_catch` starts false (the body's
@@ -5723,12 +5731,10 @@ struct Codegen {
         if (!compile_scalar_body(body_stmts(t->tryBody.get()), false))
             return bail();
         emit(OpCode::PopHandler);
-        exit_to(Pend::normal);                         /* normal try exit */
+        exit_to();                                     /* normal try exit */
 
-        code[ph].target = static_cast<int>(here());   /* Lcatch */
-
-        /* #78 step B: the site is filled as the chain is emitted (the two
-         * describe the SAME region; a verifier cross-checks them). */
+        /* #78 step D: the site IS the dispatch data now - no chain is
+         * emitted, so the catch bodies follow the try body directly. */
         if (static_cast<size_t>(region) >= chunk.handler_sites.size())
             chunk.handler_sites.resize(static_cast<size_t>(region) + 1);
         Chunk::HandlerSite &site = chunk.handler_sites[region];
@@ -5736,7 +5742,6 @@ struct Codegen {
         site.fin_pc = -1;
         site.has_rethrow = has_rethrow_in_catches(t);
 
-        std::vector<size_t> tests;
         for (const auto &cs : t->catchStmts) {
             int types_idx = -1;
             if (cs.first.exList) {
@@ -5751,29 +5756,20 @@ struct Codegen {
                 chunk.catch_uids.push_back(std::move(uids));
             }
             const Identifier *asId = cs.first.asId.get();
-            CgInstr in;
-            in.op = OpCode::CatchTest;
-            in.set_a(int_lit(types_idx));
-            in.set_b(int_lit(region));                 /* #78: whose exc */
-            in.target2 = asId ? asId->sym.slot : -1;   /* bind slot / -1 */
-            tests.push_back(code.size());         /* patch .target below */
-            code.push_back(in);
             site.clauses.push_back({ types_idx,
                                      asId ? asId->sym.slot : -1,
                                      -1 });        /* body_pc patched below */
         }
-        exit_to(Pend::reraise);                        /* no clause matched */
 
         /* Catch bodies run with THIS try's handler already popped (the
          * dispatch popped it), so a return here must not re-pop it. */
         trys.back().in_catch = true;
         size_t ci = 0;
         for (const auto &cs : t->catchStmts) {
-            code[tests[ci]].target = static_cast<int>(here());  /* body_pc */
             site.clauses[ci].body_pc = static_cast<int32_t>(here());
             if (!compile_scalar_body(body_stmts(cs.second.get()), false))
                 return bail();
-            exit_to(Pend::normal);                     /* catch body done */
+            exit_to();                                 /* catch body done */
             ci++;
         }
         trys.pop_back();                               /* body + catches done */
@@ -7279,8 +7275,6 @@ static void visit_pc_fields(Instr &in, F f)
     case OpCode::ForLoopStep:          /* target2 = the COUNTER SLOT */
     case OpCode::DictIterNext:
     case OpCode::ForeachDynNext:
-    case OpCode::CatchTest:            /* a.lit = catch_types idx */
-    case OpCode::PushHandler:          /* -> the runtime handler's catch_pc */
     case OpCode::JumpUnlessElemInt:    /* E4 fusion; target2 = the BASE slot */
     case OpCode::IntAddStep:           /* #9 fusion; target2 = COUNTER slot */
     case OpCode::ForStepElemInt:       /* #9 fusion; target2 = COUNTER slot */
@@ -7291,7 +7285,7 @@ static void visit_pc_fields(Instr &in, F f)
     }
 }
 
-/* Ops that never continue at pc+1. Throw/Reraise/Rethrow also never fall
+/* Ops that never continue at pc+1. Throw/Rethrow also never fall
  * through, but control can resume at handler pcs - keeping their fall-through
  * edge is CONSERVATIVE (it only keeps more ops alive / extends liveness). */
 static bool op_falls_through(OpCode op)
@@ -7357,7 +7351,7 @@ static bool visit_use_def(const Instr &in, U u, D d)
     switch (in.op) {
     case OpCode::Jump: case OpCode::Halt: case OpCode::PopHandler:
     case OpCode::PushHandler: case OpCode::SetPend: case OpCode::EndFinally:
-    case OpCode::Reraise: case OpCode::Rethrow: case OpCode::ThrowRuntimeV:
+    case OpCode::Rethrow: case OpCode::ThrowRuntimeV:
         return true;
     case OpCode::IntBin: case OpCode::FloatBin:
     case OpCode::CmpIntV: case OpCode::CmpFloatV:
@@ -7930,6 +7924,21 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                 }
             };
             push(0);
+            /*
+             * #78 step D: a catch body / shared finally is entered by the
+             * RAISE PATH, which reads its pc off the handler table - there
+             * is no longer a CatchTest jumping to it, so it has no
+             * in-code predecessor and this DFS would call it dead and
+             * DELETE it. The table pcs are roots, exactly like pc 0.
+             */
+            for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+                for (const Chunk::HandlerClause &cl : hs.clauses)
+                    if (cl.body_pc >= 0
+                            && static_cast<size_t>(cl.body_pc) < n)
+                        push(static_cast<size_t>(cl.body_pc));
+                if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) < n)
+                    push(static_cast<size_t>(hs.fin_pc));
+            }
             while (!stack.empty()) {
                 const size_t p = stack.back();
                 stack.pop_back();
@@ -8052,64 +8061,33 @@ static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
  * for these ops, and the VM precompile jits in a LATER pass that needs the pool
  * already built. */
 /*
- * #78 step B: the TABLE-vs-CHAIN verifier. While both exist, re-walk each
- * PushHandler's interpreted chain (CatchTest* then Reraise, or SetPend +
- * Jump to the shared finally) and assert the handler table still describes
- * exactly that region: same clause count, same {types_idx, bind_slot,
- * body_pc} per clause, same fin_pc. Run after EVERY transformation that can
- * move a pc - the peephole's threading/compaction and both JIT remaps - so
- * a missed remap aborts loudly at compile time instead of dispatching to
- * the wrong catch body at runtime. ASSERTS-only (a no-op under ASSERTS=0),
- * and it disappears with the chain in step D.
+ * #78: the handler-table REMAP net. Step B cross-checked the table against
+ * the interpreted CatchTest chain; step D deleted the chain, so there is no
+ * second description to compare against - what remains, and what the net was
+ * really for, is that every table pc survives each pc-MOVING transformation
+ * (the peephole's threading + compaction, and both JIT remaps). A missed
+ * remap leaves a pc that is out of range or lands past the code, so:
+ *   - every PushHandler's region indexes a real site;
+ *   - every site reachable that way has >= 1 clause or a finally (an empty
+ *     site would silently swallow nothing and fall to the frame walk);
+ *   - every clause body_pc and every fin_pc is a valid pc into `code`.
+ * Called after codegen and after both JIT remaps. ASSERTS-only.
  */
 void verify_handler_sites(const Chunk &chunk)
 {
 #ifndef NDEBUG
-    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
-        const Instr &ph = chunk.code[pc];
+    const int n = static_cast<int>(chunk.code.size());
+    for (const Instr &ph : chunk.code) {
         if (ph.op != OpCode::PushHandler)
             continue;
         const int region = static_cast<int>(ph.a_lit());
         ML_CHECK(region >= 0
                  && static_cast<size_t>(region) < chunk.handler_sites.size());
         const Chunk::HandlerSite &site = chunk.handler_sites[region];
-
-        size_t p = static_cast<size_t>(ph.target);
-        size_t ci = 0;
-        for (; p < chunk.code.size()
-                 && chunk.code[p].op == OpCode::CatchTest; p++, ci++) {
-            const Instr &ct = chunk.code[p];
-            ML_CHECK(ci < site.clauses.size());
-            const Chunk::HandlerClause &cl = site.clauses[ci];
-            ML_CHECK(cl.types_idx == static_cast<int32_t>(ct.a_lit()));
-            ML_CHECK(cl.bind_slot == static_cast<int32_t>(ct.target2));
-            ML_CHECK(cl.body_pc == static_cast<int32_t>(ct.target));
-            ML_CHECK(static_cast<int>(ct.b_lit()) == region);
-        }
-        ML_CHECK(ci == site.clauses.size());
-        ML_CHECK(p < chunk.code.size());
-
-        if (chunk.code[p].op == OpCode::Reraise) {
-            ML_CHECK(site.fin_pc < 0);        /* no finally */
-            ML_CHECK(static_cast<int>(chunk.code[p].a_lit()) == region);
-        } else {
-            /* The no-match exit of a try WITH a finally: SetPend(reraise)
-             * then a Jump to the shared Lfin - EXCEPT that the peephole
-             * deletes that Jump when Lfin is the very next pc (E3's
-             * jump-to-next rule), leaving the finally body inline after the
-             * SetPend. Both shapes are correct; fin_pc is the Jump's target
-             * or simply p + 1. */
-            ML_CHECK(chunk.code[p].op == OpCode::SetPend);
-            ML_CHECK(static_cast<int>(chunk.code[p].a_lit()) == region);
-            ML_CHECK(chunk.code[p].target
-                     == static_cast<int>(Pend::reraise));
-            const int32_t expect =
-                (p + 1 < chunk.code.size()
-                 && chunk.code[p + 1].op == OpCode::Jump)
-                    ? static_cast<int32_t>(chunk.code[p + 1].target)
-                    : static_cast<int32_t>(p + 1);
-            ML_CHECK(site.fin_pc == expect);
-        }
+        ML_CHECK(!site.clauses.empty() || site.fin_pc >= 0);
+        for (const Chunk::HandlerClause &cl : site.clauses)
+            ML_CHECK(cl.body_pc >= 0 && cl.body_pc < n);
+        ML_CHECK(site.fin_pc < 0 || site.fin_pc < n);
     }
 #else
     (void)chunk;

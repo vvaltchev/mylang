@@ -898,28 +898,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "throw        " << D(in.a_slot());
             break;
         case OpCode::PushHandler:
-            row << "try.push     catch=L" << in.target
-                << "  region=" << in.a_lit();
+            /* #78 step D: no catch pc - the region id names the
+             * handler_sites entry the raise path dispatches from. */
+            row << "try.push     region=" << in.a_lit();
             break;
         case OpCode::PopHandler:
             row << "try.pop";
-            break;
-        case OpCode::CatchTest: {
-            row << "catch.test   ";
-            if (in.a_lit() < 0)
-                row << "(any)";
-            else {
-                const auto &names = chunk.catch_types[in.a_lit()];
-                for (size_t i = 0; i < names.size(); i++)
-                    row << (i ? "|" : "") << names[i];
-            }
-            if (in.target2 >= 0)
-                row << " as " << reg(chunk, in.target2);
-            row << " -> L" << in.target << "  region=" << in.b_lit();
-            break;
-        }
-        case OpCode::Reraise:
-            row << "reraise      region=" << in.a_lit();
             break;
         case OpCode::Rethrow:
             row << "rethrow      region=" << in.a_lit();

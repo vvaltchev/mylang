@@ -2,7 +2,7 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 8.  This document describes the on-disk image exhaustively:
+Format version 9.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
 
 It is the specification of what `mylang -c FILE` writes and what `mylang
@@ -598,9 +598,12 @@ Indexed by TRY REGION ID - the same id the exception ops carry - so entry
 i describes region i.  A try whose native lowering bailed leaves an EMPTY
 entry (zero clauses, fin_pc -1): a hole in the id space, harmless.
 
-This is PRIMARY data, not derived: it is what the raise path matches
-against, and the interpreted CatchTest/Reraise chain that currently
-mirrors it is being removed.
+This is PRIMARY data, not derived: it IS what the raise path matches
+against.  The interpreted CatchTest/Reraise chain that used to mirror it
+was deleted in version 9 - those two opcodes no longer exist, and a
+PushHandler carries only its region id.  Every pc in this table is a
+RESUME the raise path jumps to, so the peephole treats them as roots and
+remaps them like any branch target.
 
 9.17  slot_names
 
@@ -766,6 +769,9 @@ same is true of OpCode and Op, which appear in every instruction.)
         0 none  1 boolean  2 integer  3 flt  4 str  5 arr  6 dict
         7 strct  8 structtype  9 func
 
+Version 9 is exactly such a change: deleting the CatchTest and Reraise
+opcodes renumbered every OpCode after them.
+
 --------------------------------------------------------------------------------
 14.  LOADING
 --------------------------------------------------------------------------------
@@ -826,7 +832,7 @@ precisely what a reader of the doc would hit.
     done
     tests/myv_doc_check.py /tmp/i/*.myv
 
-As of version 6 it reads all 89 corpus images to exactly EOF, including a
+As of version 9 it reads all 89 corpus images to exactly EOF, including a
 `--strip-source` image, a struct-bearing one, and one built to force all four
 Loc escapes.  Keep it in step with THIS FILE, never with the C++ - updating it
 by reading serialize.cpp would defeat its purpose.

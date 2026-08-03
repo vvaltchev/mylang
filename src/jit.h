@@ -115,8 +115,7 @@ ptrdiff_t jit_off_act_pends();
 ptrdiff_t jit_off_rec_pend_base();
 ptrdiff_t jit_sizeof_pend_state();
 ptrdiff_t jit_off_pend_state_pend();           /* VmCallRec::pend */
-extern "C" void jit_push_handler_grow(int_type catch_pc,
-                                      int_type region) noexcept;
+extern "C" void jit_push_handler_grow(int_type region) noexcept;
 
 /* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
 class EvalContext;
