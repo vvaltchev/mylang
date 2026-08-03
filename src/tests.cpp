@@ -203,6 +203,37 @@ static const std::vector<test> tests =
     },
 
     {
+        /*
+         * compile_float_expr had NO arm for a DEFINITELY-int
+         * SUBEXPRESSION - as_float_operand admits int LEAVES (a slot, a
+         * literal) but `(j + 1) * 1.5` carries an int CHAIN, and since
+         * the boxed catch-all leaves a proven-float flat store to
+         * compile_float_stmt, the refusal escalated to a NotLoweredEx
+         * on the whole enclosing loop: a LEGAL, ordinary program the
+         * compiler rejected (found by #95's float matrix builder). The
+         * int subterm now compiles as an int operand - every float
+         * reader promotes it at runtime. The VM modes are the ones
+         * that used to fail (the tree-walker never refused).
+         */
+        "codegen: a mixed float expr with a COMPUTED int subterm lowers "
+        "(row[j] = (j + 1) * 1.5 was NotLoweredEx)",
+        {
+            "func mk(n) {",
+            "    var row = array(n); var j = 0;",
+            "    while (j < n) { row[j] = (j + 1) * 1.5; j++; }",
+            "    return row;",
+            "}",
+            "var r = mk(8);",
+            "assert(r[0] == 1.5);",
+            "assert(r[7] == 12.0);",
+            "var s = 0.0; var acc = 2;",
+            "func f2(k, m) { return (k * m + 1) * 0.5 + (k - m) * 2.5; }",
+            "s = f2(runtime(4), acc);",
+            "assert(s == 9.5);",
+        },
+    },
+
+    {
         "variable decl",
         {
             "var a = 1;",
@@ -18442,6 +18473,257 @@ static bool jit_store_elem_inline_tier()
 }
 
 /*
+ * #95 case 2 - the INLINE nested-STORE tier (StoreElem2V). Same proof
+ * shape as the single-level tier: value parity against the tree-walker
+ * per case, the EMITTED-code counter (g_jit_store2_fast - the helper
+ * cannot bump it) with EXACT per-shape counts (the matrix builder uses
+ * single-level stores + StoreElemValue, so the nested counter counts
+ * ONLY the test's own nested stores), and prep attribution.
+ *
+ * Shape-eater notes: the matrix reaches the functions as a RUNTIME
+ * container argument (no const-arg specialization can eat the body);
+ * divisors are write-TWICE locals (the const-ARG eater); LICM cannot
+ * hoist `m[i]` out of a store loop (the store taints mut_content).
+ */
+static bool jit_store_elem2_inline_tier()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src, bool vm,
+                  unsigned long *fast, unsigned long *prep) -> std::string {
+        const unsigned long before = g_jit_store2_fast;
+        const unsigned long pbefore = g_jit_store_prep;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (fast) *fast = g_jit_store2_fast - before;
+        if (prep) *prep = g_jit_store_prep - pbefore;
+        return cap.str();
+    };
+
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        long fast_exact;    /* -1 = only require nonzero */
+        int prep = -1;      /* -1 dont-care, 0 must NOT run, 1 must run */
+    };
+
+    /* the shared int-matrix builder (single-level stores only) */
+    #define MK_INT \
+        "func mk(n) {", \
+        "    var m = array(n); var i = 0;", \
+        "    while (i < n) {", \
+        "        var row = array(n); var j = 0;", \
+        "        while (j < n) { row[j] = i * n + j; j++; }", \
+        "        m[i] = row; i++; }", \
+        "    return m; }"
+    #define MK_FLT \
+        "func mk(n) {", \
+        "    var m = array(n); var i = 0;", \
+        "    while (i < n) {", \
+        "        var row = array(n); var j = 0;", \
+        "        while (j < n) { row[j] = (i * n + j) * 1.5; j++; }", \
+        "        m[i] = row; i++; }", \
+        "    return m; }"
+
+    const std::vector<Case> cases = {
+      { "INT rows, plain nested stores (8x8 = 64)",
+        { MK_INT,
+          "func f(m, n) {",
+          "    var i = 0;",
+          "    while (i < n) {",
+          "        var j = 0;",
+          "        while (j < n) { m[i][j] = i + j * 2; j++; }",
+          "        i++; }",
+          "    var s = 0; var k = 0;",
+          "    while (k < n) { s = s + m[k][0] + m[0][k]; k++; }",
+          "    return s; }",
+          "print(f(mk(8), 8));" }, 64 },
+
+      { "INT rows, compound += -= *= /= %= (5*8 = 40)",
+        { MK_INT,
+          "func f(m, n) {",
+          "    var d = 0; d = n - 5;",           /* 3: slot, not literal */
+          "    var e = 0; e = n - 4;",           /* 4 */
+          "    var j = 0;",
+          "    while (j < n) {",
+          "        m[0][j] += n; m[1][j] -= d; m[2][j] *= e;",
+          "        m[3][j] /= d; m[4][j] %= e;",
+          "        j++; }",
+          "    var s = 0; var k = 0;",
+          "    while (k < 5) { s = s + m[k][2] + m[k][5]; k++; }",
+          "    return s; }",
+          "print(f(mk(8), 8));" }, 40 },
+
+      /* the float arm: a plain float, a plain INT (the cvtsi2sd promote
+       * arm), += and *= inline; /= is emit-refused for the nested float
+       * arm and must reach the helper (count stays 32, values right) */
+      { "FLOAT rows: plain + int-PROMOTE + compound; /= declines (32)",
+        { MK_FLT,
+          "func f(m, x) {",
+          "    var d = 0.0; d = x + 1.5;",
+          "    var j = 0;",
+          "    while (j < 8) {",
+          "        m[0][j] = j * 0.5;",
+          "        m[1][j] = j;",                /* int val -> promote */
+          "        m[2][j] += x; m[3][j] *= d;",
+          "        m[4][j] /= d;",               /* declined -> helper */
+          "        j++; }",
+          "    var s = 0.0; var k = 0;",
+          "    while (k < 5) { s = s + m[k][3]; k++; }",
+          "    return s; }",
+          "print(f(mk(8), 0.5));" }, 32 },
+
+      { "BOOL rows, plain nested stores (8)",
+        { "func mk(n) {",
+          "    var m = array(n); var i = 0;",
+          "    while (i < n) {",
+          "        var row = array(n); var j = 0;",
+          "        while (j < n) { row[j] = true; j++; }",
+          "        m[i] = row; i++; }",
+          "    return m; }",
+          "func f(m, n) {",
+          "    var j = 0;",
+          "    while (j < n) { m[1][j] = false; j++; }",
+          "    var s = 0; var k = 0;",
+          "    while (k < n) { if (m[1][k]) s++; if (m[0][k]) s++; k++; }",
+          "    return s; }",
+          "print(f(mk(8), 8));" }, 8 },
+
+      /*
+       * The value-FIT guard, and its ORDER against prep: a float value
+       * into an INT row throws the flat-mismatch TypeError WITHOUT
+       * cloning (flat_store_core checks `fits` before COW), so with a
+       * live slice over the row prep must NOT run (prep=0 is the
+       * assertion that catches a cow-before-fit misordering; the store
+       * itself must reach the helper: fast_exact=0).
+       */
+      { "DECLINE: float value into an INT row (fits before COW, slice)",
+        { MK_INT,
+          "func f(m, n) {",
+          "    var r1 = m[1];",
+          "    var sl = r1[runtime(1):3];",
+          "    var t = 0;",
+          "    try { m[1][0] = 2.5; } catch (TypeErrorEx) { t = 1; }",
+          "    return t * 1000 + sl[0]; }",
+          "print(f(mk(8), 8));" }, 0, /*prep=*/0 },
+
+      /* a const (deep read-only) nested array declines with the exact
+       * interpreter error and NO prep. NOTE which guard: sabotage showed
+       * the ROW-readonly guard SUBSUMES the outer one for every
+       * constructible shape (deep const freezes every level, so a
+       * readonly outer implies readonly rows) - the outer guard is
+       * defense in depth, unprovable by an isolated case today. */
+      { "DECLINE: a const nested array behind a plain param",
+        { "const M = [[1, 2, 3], [4, 5, 6]];",
+          "func g(arr, n) {",
+          "    var t = 0;",
+          "    try { arr[0][1] = n; } catch (NotLValueEx) { t = 9; }",
+          "    return t; }",
+          "print(g(M, runtime(5)));" }, 0, /*prep=*/0 },
+
+      /* the ROW's COW pair routes to the SHARED prep: the slice keeps
+       * its pre-detach elements (the oracle), the loop resumes fast */
+      { "ROW prep: a live slice over the row detaches, loop resumes",
+        { MK_INT,
+          "func f(m, n) {",
+          "    var r1 = m[1];",
+          "    var sl = r1[1:4];",
+          "    var j = 0;",
+          "    while (j < n) { m[1][j] = 100 + j; j++; }",
+          "    return sl[0] * 10000 + m[1][1]; }",
+          "print(f(mk(8), 8));" }, -1, /*prep=*/1 },
+
+      /*
+       * The runtime divisor guards decline BEFORE prep (a div0 compound
+       * throws without cloning - apply_compound_op runs before the COW
+       * in flat_store_core), and OOB outranks div0 via the helper's
+       * re-derivation. -1 declines to the helper's exact C++.
+       */
+      { "DECLINE: div/mod by runtime 0 and -1 (before prep, slice)",
+        { MK_INT,
+          "func f(m, n) {",
+          "    var r1 = m[1];",
+          "    var sl = r1[runtime(1):3];",
+          "    var z = 1; z = n - 8;",           /* 0 in a slot */
+          "    var w = 0; w = n - 9;",           /* -1 in a slot */
+          "    var t = 0;",
+          "    try { m[1][0] /= z; } catch (DivisionByZeroEx) { t = 1; }",
+          "    try { m[1][99] /= z; } catch (OutOfBoundsEx) { t += 2; }",
+          "    try { m[1][2] %= z; } catch (DivisionByZeroEx) { t += 4; }",
+          "    m[0][3] /= w; m[0][4] %= w;",
+          "    return t * 100000 + sl[0] * 100 + m[0][3] * 10 + m[0][4]; }",
+          "print(f(mk(8), 8));" }, 0, /*prep=*/0 },
+
+      /* a non-int inner key: the k2 type guard declines; the helper
+       * raises the interpreter's exact "Expected integer" error */
+      { "DECLINE: a dyn FLOAT inner index",
+        { MK_INT,
+          "func g(m, dyn k) {",
+          "    var t = 0;",
+          "    try { m[0][k] = 5; } catch (TypeErrorEx) { t = 7; }",
+          "    return t; }",
+          "print(g(mk(8), runtime(1.5)));" }, 0 },
+    };
+    #undef MK_INT
+    #undef MK_FLT
+
+    bool ok = true;
+    for (const Case &c : cases) {
+        unsigned long fast = 0, prep = 0;
+        const std::string got = go(c.src, true, &fast, &prep);
+        const std::string ref = go(c.src, false, nullptr, nullptr);
+        if (got != ref || ref.empty()) {
+            cout << "  store2 tier [" << c.name << "]: tw=[" << ref
+                 << "] vm=[" << got << "]\n";
+            ok = false;
+        }
+        if (c.fast_exact >= 0
+            && fast != static_cast<unsigned long>(c.fast_exact)) {
+            cout << "  store2 tier [" << c.name << "]: fast count "
+                 << fast << " != expected " << c.fast_exact << "\n";
+            ok = false;
+        }
+        if (c.fast_exact < 0 && fast == 0) {
+            cout << "  store2 tier [" << c.name << "]: the INLINE path "
+                    "never ran\n";
+            ok = false;
+        }
+        if (c.prep == 1 && prep == 0) {
+            cout << "  store2 tier [" << c.name << "]: PREP never ran\n";
+            ok = false;
+        }
+        if (c.prep == 0 && prep != 0) {
+            cout << "  store2 tier [" << c.name << "]: PREP ran on a "
+                    "shape that must throw WITHOUT cloning (" << prep
+                 << ")\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * THE COUNTED-LOOP FUSIONS' OPERAND LAYOUT SURVIVES A SPLICE (#87).
  *
  * `IntAddStep` packs TWO things into one operand: `a_dual_lo` is always a
@@ -21427,6 +21709,7 @@ static bool jit_op_nativized()
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
         const unsigned long bf = g_jit_boxed_fast;
+        const unsigned long s2 = g_jit_store2_fast;
         if (!run(c.src)) {
             fprintf(stderr, "jit_op_nativized: op %d WRONG RESULT\n",
                     (int)c.op);
@@ -21436,11 +21719,13 @@ static bool jit_op_nativized()
          * emitted INT-INT INLINE tier served it - BinOpV/CmpV/CompoundV
          * with int operands never reach their helper anymore, which is
          * the deeper form of native, not a gap (g_jit_boxed_fast is
-         * bumped by the emitted fast path itself). */
+         * bumped by the emitted fast path itself). StoreElem2V joined
+         * the same club with its #95 inline tier (g_jit_store2_fast). */
         const bool inline_ok =
-            (c.op == OpCode::BinOpV || c.op == OpCode::CmpV
-             || c.op == OpCode::CompoundV)
-            && g_jit_boxed_fast > bf;
+            ((c.op == OpCode::BinOpV || c.op == OpCode::CmpV
+              || c.op == OpCode::CompoundV)
+             && g_jit_boxed_fast > bf)
+            || (c.op == OpCode::StoreElem2V && g_jit_store2_fast > s2);
         if (g_jit_op_run[static_cast<size_t>(c.op)] <= b && !inline_ok) {
             fprintf(stderr, "jit_op_nativized: op %d DID NOT RUN\n",
                     (int)c.op);
@@ -22918,9 +23203,12 @@ static const std::vector<extra_check> extra_checks =
     { "codegen: a spliced IntAddStep keeps its is-LITERAL bound flag "
       "(set_a_dual clears it; a value oracle cannot see this)",
       bc_inline_fusion_operands },
-    { "jit: the INLINE element-store tier runs on flat int/bool arrays and "
-      "REFUSES compound / sliced / const stores (#92)",
+    { "jit: the INLINE element-store tier serves plain + COMPOUND stores "
+      "and REFUSES bad divisors / const stores (#92, #95)",
       jit_store_elem_inline_tier },
+    { "jit: the INLINE nested-STORE tier (a[i][j] = / OP=) with prep, "
+      "promote and fit/divisor decline order (#95)",
+      jit_store_elem2_inline_tier },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",

@@ -1399,6 +1399,49 @@ sabotage-verified; probing the bool shape exposed a PRE-EXISTING
 tw-vs-VM divergence (a bool literal stored into an int-JOINED array -
 tw throws, VM stores 1), filed separately. No suite bench compounds into
 an element (reach + parity, like prep).
+**#95 case 2 - the NESTED store `a[i][j] = v` / `OP= v` inline
+(emit_store_elem2_inline).** The read side (#93) had its tier; the store
+paid the full helper. The fast shape: int k1/k2 SLOTS (boxed - type-tag
+guarded against rsi/t_int), outer non-slice non-readonly GENERAL array
+(the #93 navigation + byte-length bounds -> &row in rcx), row non-const
+non-readonly flat int/bool/float, value FITTING the row's kind (int row:
+t_int only - a bool does NOT fit, the interpreter's rule; bool row:
+t_bool; float row: t_float or t_int, which PROMOTES via cvtsi2sd). The
+row's COW pair routes to the SHARED jit_store_elem_prep on &row (rcx is
+kept alive until the cow guards; the retry re-derives everything).
+GUARD ORDER is the invariant: everything the interpreter throws on
+WITHOUT cloning sits before the prep jumps - row const/ro, the row KIND
+(a structs row's type error precedes any clone), the value-FIT
+(flat_store_core checks `fits` before COW), a compound div/mod zero
+divisor (apply_compound_op precedes the clone). Compound maps the Expr14
+op to the base op and shares the RMW tails; the FLOAT arm refuses
+div/mod at emit (a zero test on a maybe-promoted boxed value); a bool
+row refuses any compound. StoreElem2V joined `run_has_float` (the float
+arm reads r8) and the jit_op_nativized inline-tier acceptance (its
+helper legitimately starves, like BinOpV's). Execution-proven by
+`g_jit_store2_fast` with EXACT per-shape counts (the matrix builders
+use single-level stores, so the counter attributes cleanly); sabotage-
+verified: row has_slices (slice-oracle value + prep), the promote arm
+(count 32->24), cow-before-fit and cow-before-divisor orderings (prep=0
+fired), divisor guards (ASan FPE). The OUTER-readonly guard is SUBSUMED
+by the row's for every constructible shape (deep const freezes every
+level) - kept as defense in depth, recorded as unprovable in isolation.
+N-level CHAIN stores (StoreElemChainV) stay helper-only by decision:
+the walk is data-driven (a pooled step list), rare, and an inline loop
+over steps buys little - revisit only if a profile ever names it.
+**The codegen gap the float coverage EXPOSED (fixed):**
+`compile_float_expr` had no arm for a DEFINITELY-int SUBEXPRESSION -
+`as_float_operand` admits int LEAVES, but `row[j] = (j + 1) * 1.5`
+carries an int CHAIN, and since the boxed catch-all leaves a
+proven-float flat store to compile_float_stmt, the refusal escalated to
+a NotLoweredEx on the WHOLE enclosing loop: a legal, ordinary program
+REFUSED at compile time (the no-fail contract's other failure mode,
+same class as the fold_lvalue_reads bug). The int subterm now compiles
+via compile_int_expr into an int operand - every float reader
+(read_float_operand, emit_float_load) promotes an int at runtime;
+`definitely_int` gates it (a bool payload is not a float operand).
+Pinned by a 5-mode differential entry that fails as NotLoweredEx with
+the arm reverted (verified).
 The **DICT store** `d[k] = v` / `d[k] OP= v` (LOCAL base) is the same shape -
 `DictStore` -> `jit_dict_store` (vm.cpp), which runs the interpreter's exact
 `vm_subscript_store`. The key/value are BOXED EvalValues in frame slots, so
