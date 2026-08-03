@@ -541,6 +541,80 @@ def save_cache(lang, cache):
         pass
 
 
+# --- MACHINE-SPEED CALIBRATION (a WARNING only - it never blocks a run) ----
+#
+# The my/<lang> column divides a LIVE MyLang timing by a CACHED comparison
+# timing, so a box that is merely slower today reads as a MyLang REGRESSION
+# with no code change at all. That cost a full false-alarm investigation once
+# (2026-07-31: this machine had drifted 1.148x slower than when python.json
+# was written, and the suite geomean read 8.2x where it had read 10.7x - while
+# an interleaved A/B proved the binaries were, if anything, slightly FASTER).
+#
+# So each cache records how fast the machine was when it was written, and a
+# measure run re-times the same fixed workload and says so when the two
+# disagree. It ONLY warns: every number is still measured and printed exactly
+# as before, and the run always completes.
+CALIB_KEY = "__machine__"        # reserved key - no bench can be named this
+CALIB_ITERS = 300000
+CALIB_TOLERANCE = 0.08           # +-8% before it is worth mentioning
+
+
+def machine_calibration():
+    """Best-of-3 seconds for a fixed CPU-bound loop - a cheap MACHINE-SPEED
+    marker. Runs IN-PROCESS (no subprocess, no toolchain), so it costs ~0.1s
+    and behaves identically for every comparison language."""
+    best = None
+    for _ in range(3):
+        t0 = time.perf_counter()
+        acc = 0
+        for i in range(CALIB_ITERS):
+            acc = (acc + i * 3) & 0xFFFFF
+        dt = time.perf_counter() - t0
+        if best is None or dt < best:
+            best = dt
+    return best
+
+
+def calibration_stamp():
+    """The marker stored beside a cache when it is (re)computed."""
+    return {"secs": machine_calibration(),
+            "python": "%d.%d.%d" % sys.version_info[:3]}
+
+
+def calibration_warning(cache, lang, filt=""):
+    """None, or a message saying this machine looks materially different from
+    the one the cache was timed on. NEVER blocks - the caller prints it and
+    carries on."""
+    ent = cache.get(CALIB_KEY)
+    if not isinstance(ent, dict) or not ent.get("secs"):
+        return ("note: %s.json has no machine marker, so its timings cannot be"
+                " checked\n  against this machine. Add one with:"
+                "  bench/run.py -cl %s --recompute --force%s"
+                % (lang, lang, filt))
+
+    now = machine_calibration()
+    ratio = now / ent["secs"]
+    if abs(ratio - 1.0) <= CALIB_TOLERANCE:
+        return None
+
+    # Slower now => MyLang is timed slow against a comparison that was cached
+    # fast, so the "x faster" figures READ LOW by about this factor (and the
+    # other way round when the box is faster). Spelling out the correction is
+    # the whole value of this warning.
+    pct = abs(ratio - 1.0) * 100.0
+    low_high = "LOW" if ratio > 1.0 else "HIGH"
+    return ("WARNING: this machine is running ~%.0f%% %s than when the %s "
+            "cache was timed\n  (calibration marker %.3fs then, %.3fs now). "
+            "MyLang is timed LIVE but the\n  comparison is CACHED, so the "
+            "\"x faster\" figures below READ %s -\n  multiply them by ~%.2f to "
+            "compare against numbers taken when the cache\n  was written. The "
+            "run itself is unaffected and complete.\n  To compare like with "
+            "like, re-time the comparison on this machine:\n      "
+            "bench/run.py -cl %s --recompute --force%s"
+            % (pct, "SLOWER" if ratio > 1.0 else "FASTER", lang,
+               ent["secs"], now, low_high, ratio, lang, filt))
+
+
 def cache_entry_fresh(lobj, bench, scale, cache):
     """True iff `bench`'s comparison cache entry is a genuine HIT: present AND
     for the current scale AND matching the current SOURCE-FILE hash. The `hash`
@@ -738,7 +812,22 @@ def main():
             save_cache(lobj.name, cache)     # persist incrementally
         if failed:
             sys.exit("recompute: %d bench(es) failed to time" % len(failed))
-        print("done - %d %s comparison result(s) cached." % (len(todo), lobj.name))
+        # Stamp how fast THIS machine is right now, so a later measure run
+        # can tell whether it is comparing against a comparable box.
+        #
+        # ONLY when this recompute re-timed the WHOLE cache: a filtered or
+        # stale-only run leaves most entries timed on the OLD machine, and a
+        # fresh marker would wrongly certify them (a false negative is worse
+        # than no marker - it is the exact confusion the marker exists to
+        # prevent). The mixed cache keeps its old marker and keeps warning.
+        whole = not args.filter and len(todo) == len(comparable)
+        if whole:
+            cache[CALIB_KEY] = calibration_stamp()
+            save_cache(lobj.name, cache)
+        print("done - %d %s comparison result(s) cached%s."
+              % (len(todo), lobj.name,
+                 "; machine marker updated" if whole
+                 else " (partial - machine marker left as is)"))
         return
 
     # MEASURE run: the comparison cache is READ-ONLY. --force has no
@@ -770,6 +859,12 @@ def main():
                  "a measure run):\n  bench/run.py -cl %s --recompute%s"
                  % (len(stale), len(comparable), lobj.name, lobj.name, shown,
                     lobj.name, filt))
+
+    # MACHINE-SPEED check: warn (never block) when this box no longer matches
+    # the one the comparison cache was timed on - see calibration_warning.
+    calib_msg = calibration_warning(cache, lobj.name, filt)
+    if calib_msg:
+        print(calib_msg + "\n")
 
     print("mylang : %s%s" % (mylang,
                              "  (engine: -vm bytecode VM)" if args.vm
@@ -960,6 +1055,12 @@ def main():
               % (len(noisy_unsettled), args.var_threshold * 100))
         for name, reps, v in noisy_unsettled:
             print("  %-24s %d reps, var %.1f%%" % (name, reps, v * 100))
+
+    # Repeat the machine-speed check under the geomean: the tail is what gets
+    # read, and this is exactly the line that explains a ratio that moved
+    # without any code changing.
+    if calib_msg:
+        print("\n" + calib_msg)
 
     if args.sorted:
         # Ascending: biggest win first, worst regression last. Order by cur/base
