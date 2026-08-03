@@ -4414,6 +4414,37 @@ separately, a `dyn` div0 in a JIT'd loop (whose caret the JIT stamps
 straight from `boxed_ops[i].start/end`) renders byte-identically from an
 image and from source. Measured: shopping 6588 -> 5641, gcd 1957 = 1.08x
 its source; cumulative from v1 shopping -56%, gcd -60%.
+**THE DELTA-CODED LOC TABLE (v5, same day).** `{u32 pc, u32 line, u32
+col, u32 line, u32 col}` = 20 bytes per entry, ~19 of them zero (over
+bench/ + samples/, 969 entries: the pc delta never exceeded 19, the
+widest caret column was 99), became FOUR bytes - `pcd` u8 (pc - prev_pc),
+`lined` i8 (start.line - prev_line), `col` u8, `ecol` u8 (end.col,
+IMPLYING end.line == start.line). NO odd widths: a field is EITHER one
+byte OR a reserved sentinel byte (255, or -128 for the signed one)
+followed by a plain 4-byte little-endian int32 - `put_u8_esc` /
+`put_i8_esc`. **Nothing in this format is a 5-byte (or any
+non-multiple-of-8-bit) integer needing a shifted top byte** - the
+maintainer's explicit constraint, which also rules out LEB128/varints
+(byte-granular but bit-TAGGED, the same variable-length machinery the
+16-byte-instruction experiment rejected). Folding the end LINE into
+`ecol`'s escape is what got 4 bytes rather than 5: 97.7% of entries end
+on the line they start, so a dedicated end-line byte would serve 22
+entries of 969; a multi-line span costs 4+8 and the (unreachable)
+all-four-escaped worst case 24. ON-DISK ONLY - the loader rebuilds the
+same `vector<LocEntry>`, so `loc_at`'s binary search is untouched.
+**The `-vd` oracle is again INSUFFICIENT** (the dump prints
+`pc -> start.line:col`, NEVER `end` - half of every caret), so
+`myv_locs_equal` compares tables ENTRY-FOR-ENTRY naming the first
+mismatch, and the new `myv_loc_escapes` test forces BOTH escapes (a
+statement indented 320 columns; a 200-line gap between two throwing ops),
+ASSERTS they were taken so it cannot pass vacuously, and compares. It
+caught a real trap on its first run: **`myv_read` runs the load-time JIT,
+which inserts EnterNative and REMAPS every pc including the loc table's**
+- so any test comparing a written image against an in-memory program must
+write FIRST, then `vm_jit_loaded_image` the in-memory side (what
+`myv_round_trip` already did). Measured: the loc section 796 -> 212,
+the image 5641 -> 5057; **gcd 1765 = 0.98x its source, an image SMALLER
+than the .my**; cumulative from v1 shopping -61%, gcd -64%.
 **THE BUILTIN-SLOT HAZARD (found + fixed here):** `SymbolsType` is a
 `std::map<const UniqueId *, ...>` keyed by the interned POINTER, so the
 builtin table's slot order differed PER PROCESS - a baked
@@ -4463,8 +4494,9 @@ exception, rand_sort, calls `rand()`), 84/86 also dump byte-identically
 residuals differ ONLY in the printed ORDER of a const dict's entries -
 MyLang dicts are unordered by spec, and a rebuilt hash map's iteration
 order legitimately differs). Sizes vs the source (after v3's compact
-instructions + v4's dropped derived pool): fib 2.71x, shopping 2.09x,
-gcd 1.08x (v1 was 4.7x / 4.76x / 2.72x). The REPL is out of scope
+instructions, v4's dropped derived pool, v5's delta locs): fib 2.51x,
+shopping 1.87x, gcd 0.98x - SMALLER than its source (v1 was
+4.7x / 4.76x / 2.72x). The REPL is out of scope
 (it retains ASTs).
 
 **THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,

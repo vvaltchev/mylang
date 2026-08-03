@@ -15616,6 +15616,38 @@ static bool dyn_foreach_fast_shapes()
  * disassembly (the design's oracle) and the executed result to match the
  * in-memory compile. Also pins determinism (two compiles are byte-
  * identical) and the corrupt-file refusal. */
+/*
+ * The loc tables must match ENTRY-FOR-ENTRY through a compile-load cycle.
+ * A dedicated check because the `-vd` dump prints only `pc -> start.line:col`
+ * and NEVER `end`, so byte-identical dumps cannot see a mangled end Loc - and
+ * `end` is half of every caret the interpreter draws.
+ */
+static bool myv_locs_equal(const Chunk &x, const Chunk &y)
+{
+    if (x.locs.size() != y.locs.size()) {
+        fprintf(stderr, "myv: loc count %zu != %zu\n", x.locs.size(),
+                y.locs.size());
+        return false;
+    }
+
+    for (size_t i = 0; i < x.locs.size(); i++) {
+        const Chunk::LocEntry &a = x.locs[i];
+        const Chunk::LocEntry &b = y.locs[i];
+        if (a.pc != b.pc
+                || a.start.line != b.start.line || a.start.col != b.start.col
+                || a.end.line != b.end.line || a.end.col != b.end.col) {
+            /* NAME the mismatch: a bare false costs a debugging cycle */
+            fprintf(stderr, "myv: loc[%zu] pc%u %d:%d..%d:%d != pc%u "
+                            "%d:%d..%d:%d\n", i, a.pc, a.start.line,
+                    a.start.col, a.end.line, a.end.col, b.pc, b.start.line,
+                    b.start.col, b.end.line, b.end.col);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool myv_round_trip()
 {
     const char *lines_arr[] = {
@@ -15799,6 +15831,25 @@ static bool myv_round_trip()
             return false;
         }
 
+        /* the DELTA-CODED loc table, entry for entry (see myv_locs_equal;
+         * the escape paths get their own test) */
+        bool locs_ok = myv_locs_equal(prog.root, loaded.root);
+
+        for (size_t i = 0; locs_ok && i < prog.funcs.size(); i++) {
+            const Chunk *a =
+                static_cast<const Chunk *>(prog.funcs[i]->vm_chunk);
+            const Chunk *b =
+                static_cast<const Chunk *>(loaded.funcs[i]->vm_chunk);
+            if (a && b && !myv_locs_equal(*a, *b))
+                locs_ok = false;
+        }
+
+        if (!locs_ok) {
+            fprintf(stderr, "myv: the loc table did not round-trip\n");
+            g_exec_engine = saved;
+            return false;
+        }
+
         /* the reference RESOLVED: the file is still the one compiled, so the
          * loader hands back its text (error carets work) with no warning */
         if (img_src.lines.size() != nlines || !img_src.warning.empty()
@@ -15949,6 +16000,126 @@ static bool myv_round_trip()
     remove(path2.c_str());
     remove(spath.c_str());
     remove(spath_moved.c_str());
+    return ok;
+}
+
+/*
+ * The loc table's delta coding has two ESCAPE paths that no program in
+ * bench/ or samples/ reaches (measured: the widest caret column there is 99
+ * and the largest line delta 19): a caret column past 254, and a line delta
+ * past 127. Both must round-trip EXACTLY - the byte form is an optimization
+ * for the common case, never a cap on what a source file may contain. Build a
+ * program with both and compare the loc tables entry-for-entry.
+ */
+static bool myv_loc_escapes()
+{
+    /* 320 spaces before the statement: its caret column exceeds 254 */
+    const std::string pad(320, ' ');
+    std::string src = "func f(dyn a, dyn b) {\n";
+    src += pad + "return a / b;\n}\n";
+
+    /* ... then 200 filler lines, so the NEXT loc entry's line delta > 127 */
+    for (int i = 0; i < 200; i++)
+        src += "# filler\n";
+
+    src += "func g(dyn a, dyn b) { return a % b; }\n";
+    /* `dyn` params make the results dyn, so the destination must say so */
+    src += "var dyn r = f(runtime(6), runtime(3))\n";
+    src += "            + g(runtime(7), runtime(4));\n";
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-esc.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = false;
+
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        myv_write(prog, path, MyvSourceRef());
+
+        /* Write FIRST (the image stores PRE-jit bytecode), THEN run the
+         * load-time tier on the in-memory program - myv_read runs it on the
+         * loaded one, and the JIT inserts EnterNative ops and REMAPS every
+         * pc, the loc table included. Comparing a pre-jit table against a
+         * post-jit one reports an off-by-one pc that is not a format bug. */
+        vm_jit_loaded_image(prog);
+
+        MyvSource s;
+        VmProgram loaded = myv_read(path, s);
+
+        /* prove the escapes were actually EXERCISED, else this test is
+         * vacuous: some entry must have a wide column, and some a big
+         * line delta */
+        bool wide_col = false, big_jump = false;
+        int prev_line = 0;
+
+        auto scan = [&](const Chunk &c) {
+            for (const auto &l : c.locs) {
+                if (l.start.col > 254 || l.end.col > 254)
+                    wide_col = true;
+                if (l.start.line - prev_line > 127
+                        || prev_line - l.start.line > 127)
+                    big_jump = true;
+                prev_line = l.start.line;
+            }
+        };
+        scan(prog.root);
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk) {
+                prev_line = 0;
+                scan(*static_cast<const Chunk *>(d->vm_chunk));
+            }
+
+        if (!wide_col || !big_jump) {
+            fprintf(stderr, "myv: the escape test hit no escape "
+                            "(wide col %d, big jump %d)\n",
+                    (int)wide_col, (int)big_jump);
+            g_exec_engine = saved;
+            remove(path.c_str());
+            return false;
+        }
+
+        ok = myv_locs_equal(prog.root, loaded.root)
+             && prog.funcs.size() == loaded.funcs.size();
+
+        for (size_t i = 0; ok && i < prog.funcs.size(); i++) {
+            const Chunk *a =
+                static_cast<const Chunk *>(prog.funcs[i]->vm_chunk);
+            const Chunk *b =
+                static_cast<const Chunk *>(loaded.funcs[i]->vm_chunk);
+            if (a && b && !myv_locs_equal(*a, *b))
+                ok = false;
+        }
+
+        if (!ok)
+            fprintf(stderr, "myv: an ESCAPED loc entry did not round-trip\n");
+
+    } catch (const Exception &e) {
+        fprintf(stderr, "myv: loc-escape test threw %s: %s\n", e.name,
+                e.msg ? e.msg : "(no message)");
+        ok = false;
+    } catch (...) {
+        fprintf(stderr, "myv: loc-escape test threw an unknown exception\n");
+        ok = false;
+    }
+
+    g_exec_engine = saved;
+    remove(path.c_str());
     return ok;
 }
 
@@ -19123,6 +19294,8 @@ static const std::vector<extra_check> extra_checks =
       jit_final_batch_deletable },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
+    { "myv: loc-table delta escapes (wide column, big line jump)",
+      myv_loc_escapes },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",
