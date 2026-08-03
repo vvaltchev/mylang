@@ -290,7 +290,33 @@ struct Writer {
         u32v(u ? sid(std::string(u->val)) : 0xffffffffu);
     }
     void strv(const std::string &s) { u32v(sid(s)); }
+
+    /* The COMPACT instruction fields: the narrowest of 1/2/4/8 bytes that
+     * holds `v` exactly. See the Instr write/read pair for the width codes. */
+    void narrowv(int64_t v, unsigned code)
+    {
+        const int bytes = 1 << (code - 1);   /* codes 1..4 -> 1/2/4/8 bytes */
+        const uint64_t u = static_cast<uint64_t>(v);
+        for (int i = 0; i < bytes; i++)
+            u8v(static_cast<uint8_t>((u >> (8 * i)) & 0xff));
+    }
 };
+
+/*
+ * The width CODE for a compact instruction field: the smallest signed width
+ * that round-trips `v` exactly. 0 is reserved for "the field is at its
+ * DEFAULT and is not stored at all".
+ */
+unsigned width_code(int64_t v)
+{
+    if (v >= -128 && v <= 127)
+        return 1;                                     /* 1 byte  */
+    if (v >= -32768 && v <= 32767)
+        return 2;                                     /* 2 bytes */
+    if (v >= -2147483648LL && v <= 2147483647LL)
+        return 3;                                     /* 4 bytes */
+    return 4;                                         /* 8 bytes */
+}
 
 struct Reader {
     const std::string &buf;
@@ -337,6 +363,31 @@ struct Reader {
         return d;
     }
     bool boolv() { return u8v() != 0; }
+
+    /* The write side is Writer::narrowv: read `code`'s bytes and SIGN-EXTEND
+     * from that width (all-unsigned arithmetic + a memcpy, so no
+     * implementation-defined shift or out-of-range signed cast). */
+    int64_t narrowv(unsigned code)
+    {
+        const int bytes = 1 << (code - 1);
+        need(static_cast<size_t>(bytes));
+        uint64_t u = 0;
+        for (int i = 0; i < bytes; i++)
+            u |= static_cast<uint64_t>(static_cast<uint8_t>(buf[p + i]))
+                 << (8 * i);
+        p += static_cast<size_t>(bytes);
+
+        if (bytes < 8) {
+            const uint64_t sign = 1ull << (8 * bytes - 1);
+            if (u & sign)
+                u |= ~((1ull << (8 * bytes)) - 1);
+        }
+
+        int64_t v;
+        memcpy(&v, &u, sizeof(v));
+        return v;
+    }
+
     Loc locv()
     {
         const uint32_t line = u32v(), col = u32v();
@@ -701,16 +752,72 @@ void write_chunk(Writer &w, const Chunk &c)
         myv_stat_ext(what, w.buf.size() - cm);
         cm = w.buf.size();
     };
-    /* code: FIELD-WISE (Instr has padding whose content is indeterminate) */
+    /*
+     * code: FIELD-WISE (Instr has padding whose content is indeterminate) and
+     * COMPACT - see read_chunk for the paired decode. An instruction is
+     *
+     *     op:u8  flags:u16  [present fields, narrowest-first order]
+     *
+     * where `flags` says which of the 6 optional fields are stored and how
+     * wide each one is (width code 0 == "at its default, not stored"):
+     *
+     *     bits 0-2   pa       width code 0..4  (0 / 1 / 2 / 4 / 8 bytes)
+     *     bits 3-5   pb       width code 0..4
+     *     bits 6-7   target   width code 0..3  (0 / 1 / 2 / 4 bytes)
+     *     bits 8-9   target2  width code 0..3
+     *     bit  10    aop      stored (else Op::invalid)
+     *     bit  11    opflags  stored (else 0)
+     *     bits 12-15 RESERVED, must be zero (the reader refuses a nonzero:
+     *                a later version may spend them, and a v2 reader must
+     *                not silently misread such a file)
+     *
+     * WHY (measured over bench/ + samples/, 3483 instructions): the fixed
+     * 27-byte record was 37% of an image, yet `target` fits in ONE byte 97%
+     * of the time, `target2` and `pb` are at their default in ~half the
+     * instructions, and `pa` fits in one byte in two thirds. This is NOT
+     * in-format compression (the decision record against that stands): no
+     * dictionary, no entropy coding, no bit-level packing - each field is
+     * still a plain little-endian integer at a byte boundary, decoded in
+     * O(1) with no state, and two compiles stay byte-identical.
+     *
+     * NOTE the DEFAULT-vs-value subtlety: `pa == -1` means both "unset slot"
+     * and the literal -1, and that is FINE - the field is simply not stored
+     * and the reader's default restores exactly -1. `opflags` independently
+     * records whether the operand is a literal, so no information is lost.
+     */
     w.u32v(static_cast<uint32_t>(c.code.size()));
     for (const Instr &in : c.code) {
+
+        const unsigned wa = in.pa == -1 ? 0 : width_code(in.pa);
+        const unsigned wb = in.pb == -1 ? 0 : width_code(in.pb);
+        const unsigned wt = in.target == -1 ? 0 : width_code(in.target);
+        const unsigned wt2 = in.target2 == -1 ? 0 : width_code(in.target2);
+        const bool has_aop = in.aop != Op::invalid;
+        const bool has_flags = in.opflags != 0;
+
+        /* target/target2 are `int`: 4 bytes always suffice (code <= 3) */
+        ML_CHECK(wt <= 3 && wt2 <= 3);
+
+        const uint32_t flags = wa | (wb << 3) | (wt << 6) | (wt2 << 8)
+                               | (has_aop ? 1u << 10 : 0u)
+                               | (has_flags ? 1u << 11 : 0u);
+
         w.u8v(static_cast<uint8_t>(in.op));
-        w.u8v(static_cast<uint8_t>(in.aop));
-        w.u8v(in.opflags);
-        w.u32v(static_cast<uint32_t>(in.target));
-        w.u32v(static_cast<uint32_t>(in.target2));
-        w.i64v(in.pa);
-        w.i64v(in.pb);
+        w.u8v(static_cast<uint8_t>(flags & 0xff));
+        w.u8v(static_cast<uint8_t>((flags >> 8) & 0xff));
+
+        if (has_aop)
+            w.u8v(static_cast<uint8_t>(in.aop));
+        if (has_flags)
+            w.u8v(in.opflags);
+        if (wt)
+            w.narrowv(in.target, wt);
+        if (wt2)
+            w.narrowv(in.target2, wt2);
+        if (wa)
+            w.narrowv(in.pa, wa);
+        if (wb)
+            w.narrowv(in.pb, wb);
     }
     ct("  code");
     w.u32v(static_cast<uint32_t>(c.slot_count));
@@ -916,17 +1023,42 @@ void write_chunk(Writer &w, const Chunk &c)
 
 void read_chunk(Reader &r, Chunk &c)
 {
+    /* code: the COMPACT encoding - the flags word and the field order are
+     * documented at the write site in write_chunk (the pairing rule). Every
+     * absent field keeps the default a fresh Instr already carries. */
     const uint32_t ncode = r.u32v();
     c.code.resize(ncode);
     for (uint32_t i = 0; i < ncode; i++) {
         Instr &in = c.code[i];
+
         in.op = static_cast<OpCode>(r.u8v());
-        in.aop = static_cast<Op>(r.u8v());
-        in.opflags = r.u8v();
-        in.target = static_cast<int>(static_cast<int32_t>(r.u32v()));
-        in.target2 = static_cast<int>(static_cast<int32_t>(r.u32v()));
-        in.pa = r.i64v();
-        in.pb = r.i64v();
+        const uint32_t lo = r.u8v();
+        const uint32_t flags = lo | (static_cast<uint32_t>(r.u8v()) << 8);
+
+        if (flags & 0xf000u)
+            bad_image("incompatible .myv (instruction flags) - recompile");
+
+        const unsigned wa = flags & 7;
+        const unsigned wb = (flags >> 3) & 7;
+        const unsigned wt = (flags >> 6) & 3;
+        const unsigned wt2 = (flags >> 8) & 3;
+
+        if (wa > 4 || wb > 4)
+            bad_image("corrupt .myv (instruction width)");
+
+        if (flags & (1u << 10))
+            in.aop = static_cast<Op>(r.u8v());
+        if (flags & (1u << 11))
+            in.opflags = r.u8v();
+        if (wt)
+            in.target = static_cast<int>(r.narrowv(wt));
+        if (wt2)
+            in.target2 = static_cast<int>(r.narrowv(wt2));
+        if (wa)
+            in.pa = r.narrowv(wa);
+        if (wb)
+            in.pb = r.narrowv(wb);
+
         if (static_cast<size_t>(in.op) >= static_cast<size_t>(OpCode::OpCount_))
             bad_image("corrupt .myv (opcode)");
     }
