@@ -2049,6 +2049,51 @@ false of the generated CODE when the outer element is already in hand.
 The residual +1.4/+4.2% interpreter-side dispatch cost from #78 is real;
 it is simply not here.
 
+### The exception-path residual, chased with a proper ASSERTS=0 profile
+
+The remaining #78 regression turned out NOT to be the thing I had blamed
+(the fragment exit/re-entry on throw-every-iteration loops). Profiling
+70_exc_runtime_error on an OPT=1 ASSERTS=0 build, per throw (361 Ir once
+the 4.13M startup floor is subtracted from 76.3M / 200k throws):
+
+    89  the native fragment itself
+    71  vm_dispatch_exc_frame        <-- of which 28 is its own FRAME
+    44  vm_raise
+    39  vm_dispatch (the interpreter round trip)
+    48  the exception object's ctor/dtor (pooled)
+    12  match_uid
+
+Two things that LOOKED alarming were neither: `__dynamic_cast` and
+`__strcmp_avx2` appear in the profile but at 27k and 71k calls against
+200k throws - they are COMPILE-time, not throw-path (the RTTI-free
+matcher is intact). And the fragment is entered exactly 200,000 times,
+i.e. ONE round trip per throw, not two.
+
+THE FIX: `vm_dispatch_exc_frame`'s prologue+epilogue measured **28 Ir per
+throw** (17 in `{`, 11 in `}`) against a body doing ~15 Ir of real work -
+the frame was nearly twice the function. vm_raise now uses an INLINED
+copy of the same body (`vm_dispatch_exc_hot`), while the boxed-throw
+sites inside `vm_dispatch` keep the out-of-line form - inlining THERE was
+already measured at +3.6M Ir (the loop-body text rule). One shared body,
+so the two cannot drift. vm_raise is reached from the throw HELPERS, not
+from the dispatch loop, so growing it costs no loop text.
+
+Measured (callgrind Ir, ASSERTS=0):
+
+                        before      now    vs pre-#78 (was)
+    70_exc_runtime      -6.79%             +2.04%  (was +9.47%)
+    42_exceptions       -2.06%             +0.71%  (was +2.83%)
+    69_exc_crossframe   +0.08%             +0.30%
+    72_exc_finally      +0.05%             -1.28%
+
+So the #78 regression is essentially closed on both benches that had one,
+WITHOUT touching the JIT. The fragment round trip (39 Ir/throw) is still
+there and is now the largest single remaining item; eliminating it needs
+a direct fragment-to-fragment jump on a dispatched throw (a `jmp`, never
+a `call` - a call would nest one C frame per iteration and overflow),
+which is real JIT machinery for ~11% of the per-throw cost. Deferred: the
+cheap C++-side win came first and took most of the gap.
+
 ## The original scoping (kept for the record - superseded above)
 
 SCOPED 2026-07-29, before the implementation showed one store sufficed.
