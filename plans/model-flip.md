@@ -1642,6 +1642,52 @@ route (a stub-pc `inline_ctxs` entry, or a field on the call record) because
 FIRST, so the baked chain is already in place by the time the walk looks -
 no second mechanism, no touching the remap pass or the record.
 
+## #78 steps 1-2: the battery's findings + the per-region state (2026-07-30)
+
+Recorded in CLAUDE.md (the #78 paragraph). Corpus-visible: the deleted-
+handler-pc HANG fix + the per-try-region pend/exc state (myv v7).
+
+### Step-2 perf decomposition (callgrind, CLEAN same-flags builds)
+
+The pend-state change measured, base = step 1 (763d30f):
+
+    72_exc_finally   36,296,545 -> 36,798,579   +1.38%  = +1 Ir/iter
+    42_exceptions   245,180,886 -> 251,191,026  +2.45%  = +20 Ir/iter
+
+72's ENTIRE delta is one instruction: the region dword store in the
+native inline PushHandler. SetPend/EndFinally net ZERO - the new pends
+indexing was paid for by switching their emitted rec addressing to the
+activation's cached top_rec pointer (which also made them cheaper than
+the old records+rec_n dance; the first cut without that was +12.4%).
+
+42's +20/iter, per-function (self-cost diff):
+    ~+10  the per-region indexed addressing where a fixed record field
+          used to be: pend_at's vector index (+5.3 attributed to the
+          return line) + the default build's _GLIBCXX_ASSERTIONS bounds
+          check on operator[] (+3.3) + the 8-byte VmHandler copy - paid
+          in the INTERPRETED CatchTest and the dispatch park
+    ~+4   vm_dispatch self growth (the CatchTest handler's new shape)
+    ~+2   vm_raise / the unique_ptr park-and-free churn
+    ~+1   PushHandler's region store
+    rest  fragment-layout attribution noise (nets ~0)
+
+WHY THIS IS TRANSITIONAL, not the end state (the maintainer's principle:
+an efficient nativization must not add net instructions): every line of
+42's delta except PushHandler's +1 sits in machinery the remaining steps
+DELETE or bypass -
+  - step C/D move the match into vm_dispatch_exc and DELETE CatchTest/
+    Reraise: the interpreted round trip (operand decode + dispatch +
+    pend_at re-read) goes away; the match+bind work remains but as one
+    direct C++ call on the raise path;
+  - the handler table makes "does any catch body rethrow?" a STATIC
+    per-site flag, so the park (the unique_ptr move + free) is SKIPPED
+    for the overwhelmingly common no-rethrow site;
+  - step D can drop SetPend(normal) from the normal path entirely
+    (PushHandler resets the region's pend), which on 72's shape is
+    roughly -8 Ir/iter against the +1 paid here.
+PROJECTION: both benches end BELOW the pre-#78 baseline; measured at
+each step against these exact numbers.
+
 ## The original scoping (kept for the record - superseded above)
 
 SCOPED 2026-07-29, before the implementation showed one store sufficed.
