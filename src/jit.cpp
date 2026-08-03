@@ -5140,8 +5140,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * (cache-aware for a slot). The non-throwing arms are a bare op_rr;
          * div/mod check the divisor and RAISE DivisionByZeroEx (JR_DIV0 -
          * caret from the loc side table at this pc, byte-identical to the
-         * interpreted throw) then cqo+idiv (an INT64_MIN/-1 divisor traps in
-         * idiv - EXACTLY the interpreter's own UB, see TypeInt::div); the
+         * interpreted throw), then the #103 INT_MIN/-1 pre-check (RAISES
+         * InvalidValueEx via JR_DIV_OVF - the interpreter throws too, so
+         * idiv can never trap), then cqo+idiv; the
          * shift arms share emit_reg_shift with the RR forms (negative count
          * -> JR_NEG_SHIFT raise, >= 64 saturates - the bit_shl/bit_shr/
          * bit_ushr semantics). Only the non-throwing arms are
@@ -5161,9 +5162,51 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
         switch (in.aop) {
         case Op::div: case Op::mod:
-            /* test rcx,rcx; CONVEY DIV0 unless nonzero (deletable) */
-            e.u8(0x48); e.u8(0x85); e.u8(0xC9);
-            raise_convey_unless(e, ck, 0x75 /* jnz */, JR_DIV0, pc, old_pc);
+            /*
+             * The edge-divisor checks (#103): 0 raises DivisionByZeroEx,
+             * -1 with an INT_MIN dividend raises InvalidValueEx (idiv
+             * would trap with a hardware #DE - the language THROWS via
+             * EXPLICIT pre-checks, never a signal handler). A LITERAL
+             * divisor decides at COMPILE time: an ordinary one emits NO
+             * runtime checks at all (the first #103 version - and the
+             * pre-#103 code - ran the zero test even on literals); a
+             * SLOT divisor pays ONE hot-path gate for both edges:
+             * rcx+1 unsigned <= 1 catches 0 and -1 in one cmp+ja, and
+             * the cold block (0 -> DIV0; -1: the INT_MIN compare)
+             * FALLS THROUGH into the division for a legitimate x / -1.
+             * Hot cost vs the pre-#103 zero-only test: ONE instruction
+             * (the lea). Measured: the first version's second
+             * compare+branch read +3.4%/+4.8% on 03/44; this shape
+             * halves it.
+             */
+            if (in.b_is_lit()) {
+                if (in.b_lit() == 0) {
+                    /* always-throws: test on the loaded literal */
+                    e.u8(0x48); e.u8(0x85); e.u8(0xC9);  /* test rcx,rcx */
+                    raise_convey_unless(e, ck, 0x75, JR_DIV0, pc, old_pc);
+                } else if (in.b_lit() == -1) {
+                    e.movabs(RDX, 0x8000000000000000ull);
+                    e.u8(0x48); e.u8(0x39); e.u8(0xD0);  /* cmp rax,rdx */
+                    raise_convey_unless(e, ck, 0x75 /* jne */, JR_DIV_OVF,
+                                        pc, old_pc);
+                }
+                /* any other literal: nothing can fault */
+            } else {
+                e.u8(0x48); e.u8(0x8D); e.u8(0x51); e.u8(0x01);
+                                                     /* lea rdx,[rcx+1] */
+                e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+                                                     /* cmp rdx,1 */
+                const size_t j_div = e.j32(0x77);    /* ja .div (hot) */
+                /* cold: rcx is 0 or -1 */
+                e.u8(0x48); e.u8(0x85); e.u8(0xC9);  /* test rcx,rcx */
+                raise_convey_unless(e, ck, 0x75, JR_DIV0, pc, old_pc);
+                e.movabs(RDX, 0x8000000000000000ull);
+                e.u8(0x48); e.u8(0x39); e.u8(0xD0);  /* cmp rax,rdx */
+                raise_convey_unless(e, ck, 0x75 /* jne */, JR_DIV_OVF,
+                                    pc, old_pc);
+                /* rcx == -1, rax != INT_MIN: fall into the division */
+                e.patch32_here(j_div);
+            }
             e.u8(0x48); e.u8(0x99);              /* cqo */
             e.u8(0x48); e.u8(0xF7); e.u8(0xF9);  /* idiv rcx */
             write_slot(e, ck, in.aop == Op::div ? RAX : RDX, in.target, pc);

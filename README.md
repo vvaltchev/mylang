@@ -754,7 +754,14 @@ runtime instead.
     `none`, and empty containers/strings are false, everything else true.
 
   * **Integer**
-    A *signed* pointer-size integer (e.g. `3`).
+    A *signed* pointer-size integer (e.g. `3`). Arithmetic wraps around at
+    64 bits (two's complement). The two division edge cases **throw** instead
+    of crashing or wrapping: dividing by zero throws `DivisionByZeroEx`, and
+    the one overflowing division — the most negative integer divided by `-1`
+    (`(1 << 63) / -1`, whose true result does not fit) — throws
+    `InvalidValueEx` ("integer overflow in division"); `%` follows the same
+    rule. Both are ordinary catchable runtime errors (and, like any
+    always-failing constant expression, a build error when fully constant).
 
   * **Float**
     A floating-point number (e.g. `1.23`). Internally, it's a C `double`

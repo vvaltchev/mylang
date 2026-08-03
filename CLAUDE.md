@@ -1388,11 +1388,44 @@ Execution-proven by the arm's OWN `g_jit_hoist_rmw` (g_jit_store_fast
 counts the ordinary tier too - it cannot prove this arm). Corpus
 byte-flat (no bench compounds into an element); a 1M-compound-store
 probe reads -29.5% (~19 Ir/store). The C1e divisor test EXPOSED a
-pre-existing engine-uniform hole: **INT_MIN / -1 SIGFPEs every
-engine incl. the parse-time fold** (TypeInt::div/mod + the VM store
-bodies raw-divide with only a zero check; -fwrapv does not define
-division overflow) - task #103, maintainer to rule wrap-vs-throw.
-Next on the staircase: C2/C3 per the plan.
+pre-existing engine-uniform hole, since FIXED - see the #103
+paragraph below. Next on the staircase: C2/C3 per the plan.
+
+**#103 - INT_MIN / -1 THROWS (2026-08-03, maintainer ruling:
+like division by zero - and NEVER via a signal handler).** It used to
+be UB: TypeInt::div/mod and the VM store bodies raw-divided with only
+a zero check (-fwrapv covers +,-,* only; x86 idiv raises a hardware
+#DE), so `(1 << 63) / -1` SIGFPE'd EVERY engine including the
+parse-time const-fold. Now `check_int_div_overflow` (bitops.h - the
+shift helpers' home, included by all three TUs) throws the catchable
+**InvalidValueEx("integer overflow in division")** at the five C++
+sites: TypeInt::div/mod, vm_num_binop's int fast path, the VM element
+-store compound switch, the interpreted IntBin div/mod (via vm_raise),
+and TypedScalarExpr::eval_int (divisor-span carets, #76). `% -1`
+throws too - one uniform rule (mathematically the remainder would be
+0; uniformity chosen, C#'s behavior). The JIT needed exactly ONE new
+emission - IntBin div/mod's inline idiv (every OTHER emitted division
+already carried explicit 0/-1 pre-checks declining to the now-fixed
+helpers) - and its COST WAS DRIVEN TO THE FLOOR by measurement: the
+first version's second compare+branch per division read +3.4%/+4.8%
+Ir on 03_int_arith/44_primes_sqrt, so (a) a LITERAL divisor now
+decides at COMPILE time and an ordinary one emits NO runtime checks
+at all - not even the zero test the pre-#103 code ran on literals, so
+03 lands at **-3.4%** vs pre-#103 - and (b) a SLOT divisor pays ONE
+gate: `lea rdx,[rcx+1]; cmp rdx,1; ja .div` catches 0 and -1 in one
+branch, the cold block (0 -> JR_DIV0; -1 -> the INT_MIN compare, the
+new **JR_DIV_OVF** kind) FALLING THROUGH into the division for a
+legitimate x / -1 - 44 lands at **+2.4%**, the +1-instruction floor
+for an explicit check. The FOUR copies of the kind->exception ternary
+collapsed into ONE `vm_jit_raise_kind_new`. IntModRI / the
+IntAddModRI fusion EXCLUDE an imm -1 at selection (their handlers are
+uncheck-fast; `% -1` falls to IntBin's checked path). Pinned by 5
+five-mode tests (div, mod, catch + the /-1-still-divides case - which
+exercises the cold fall-through - the element compound path, the
+fully-const BUILD failure) and the C1e -1-guard case now asserts the
+InvalidValueEx (previously sabotage-unprovable - the helper crashed
+too); the guards sabotage-verified on the final shape (each drop = an
+FPE abort). README documents the rule under Integer.
 MEASUREMENT-HARNESS NOTE: shopping/phonebook fed </dev/null spin
 forever on EOF re-printing their menus - a `timeout`-truncated
 JIT-on-vs-off byte compare then "diverges" purely by SPEED; feed `q`
