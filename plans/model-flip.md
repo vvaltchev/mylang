@@ -1938,6 +1938,39 @@ WHERE THE RESIDUAL IS, split by the JIT kill switch (`-nj`):
     two microbenches are the worst case for it, not the typical one (72
     and 69, which do real work per iteration, both IMPROVED).
 
+### #80 (2026-08-01): `rethrow` is native - the exception set is complete
+
+`Rethrow` was the last jit-INELIGIBLE exception op. An ineligible op is
+not merely interpreted: it SPLITS the run it sits in, so one `rethrow`
+kept its whole try region interpreted. Measured on the same program:
+
+    with    rethrow:  24 bytecode ops, 4 fragments
+    without rethrow:   3 bytecode ops, 3 fragments
+    with    rethrow (after #80):  3 ops, 3 fragments
+
+`jit_rethrow(region, pc, lep, inline_chain)` is jit_end_finally's shape
+plus the caret restamp: take the caught exception out of the ENCLOSING
+catch's region slot, stamp the RETHROW SITE's caret, run vm_raise;
+0 dispatched / 1 boundary / 2 conveyed, never falls through. The slot is
+non-empty by construction - a region whose catch bodies contain a
+`rethrow` has `has_rethrow`, which is exactly when the dispatch parks the
+exception there (a null would be a broken invariant, so the helper
+conveys an InternalErrorEx rather than silently swallowing).
+
+BOTH the LocEntry and the inlined-at chain are BAKED at compile time: the
+interpreted op reads them via loc_at(pc) / inline_frame_at(pc), and a
+DELETED run's pcs have all collapsed onto the head EnterNative.
+
+The test pins the counter over three outcomes (same-frame catch, a
+caller's catch via the native walk, boundary) AND checks CARET PARITY -
+tw == vm, and the position must be the `rethrow` line. That second check
+is the load-bearing one: a wrong bake leaves behavior perfectly correct
+and only moves the reported error position, which no other test in the
+suite would notice.
+
+With this, every exception construct - `throw`, runtime errors, `try`/
+`catch` entry and matching, `finally`, `rethrow` - is native.
+
 ## The original scoping (kept for the record - superseded above)
 
 SCOPED 2026-07-29, before the implementation showed one store sufficed.

@@ -5155,7 +5155,24 @@ collapse onto the head EnterNative, where the pc lookup cannot
 discriminate). TRAP: the cold arm outruns a short jump (`emit_exc_stamp`
 alone does), so the normal/nothing-pending jumps are rel32 - the first
 build asserted in `Emitter::patch8`. Execution-proven by
-`g_jit_end_finally_reraise` over all three outcomes plus a loop shape. Two fixes landed from measurement:
+`g_jit_end_finally_reraise` over all three outcomes plus a loop shape.
+**#80 finished the set: `rethrow` is native too.** It was the LAST
+jit-ineligible exception op, so it SPLIT the run it sat in and kept its
+whole try region interpreted (measured: the same program is 24 ops / 4
+fragments with a `rethrow`, 3 / 3 without). `jit_rethrow` is
+jit_end_finally's shape plus the site caret restamp: take the caught
+exception out of the ENCLOSING catch's region slot (guaranteed parked -
+that is exactly what `has_rethrow` gates), stamp the RETHROW SITE's
+caret, `vm_raise`; 0 dispatched / 1 boundary / 2 conveyed, never falls
+through. Both the LocEntry and the inlined-at chain are BAKED at compile
+time, since the interpreted op reads them via `loc_at(pc)` /
+`inline_frame_at(pc)` and a deleted run's pcs collapse. Pinned by
+`g_jit_rethrow_native` over the same three outcomes AND a CARET-PARITY
+check (tw == vm, and the position must be the `rethrow` line): a wrong
+bake would leave behavior correct and only move the error position,
+which nothing else would catch. With this, EVERY exception construct -
+`throw`, runtime errors, `try`/`catch` entry+matching, `finally`,
+`rethrow` - is native. Two fixes landed from measurement:
 **the FAST REJECT** - the frame WALK calls the dispatch once per POPPED
 frame and almost none of those frames have a live try; pre-#78 the
 dispatch inlined so the reject was free, and paying a call frame per

@@ -16598,6 +16598,7 @@ static bool myv_loc_escapes()
 #ifdef TESTS
 extern unsigned long g_vm_table_dispatch;   /* #78 step C coverage */
 extern unsigned long g_jit_end_finally_reraise;  /* #78 step E coverage */
+extern unsigned long g_jit_rethrow_native;       /* #80 coverage */
 #endif
 
 static bool vm_handler_table()
@@ -16874,6 +16875,153 @@ static bool jit_end_finally_native()
         }
         if (g_jit_end_finally_reraise == before) {
             cout << "  the BOUNDARY reraise did not run natively\n";
+            return false;
+        }
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #80: PROVE the native `rethrow` runs IN THE FRAGMENT, and that it still
+ * carries the RETHROW SITE's caret.
+ *
+ * Rethrow was the last jit-ineligible exception op, so it SPLIT the run it
+ * sat in and kept the whole try region interpreted (measured: 24 ops / 4
+ * fragments with a rethrow vs 3 / 3 without). The counter proves the native
+ * form executes; the caret check guards the part that could silently rot -
+ * the interpreted op reads its loc via loc_at(pc), which a DELETED run's
+ * collapsed pcs cannot resolve, so the emit BAKES the LocEntry instead. If
+ * that bake were wrong the program would still behave correctly and only
+ * the error position would move, which no other test would notice.
+ */
+static bool jit_rethrow_native()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+
+    const std::vector<std::vector<const char *>> shapes = {
+        /* caught by an outer SAME-frame try */
+        { "struct E { int v; }",
+          "var trc = [];",
+          "try {",
+          "  try { throw E(4); } catch (E) { append(trc, 1); rethrow; }",
+          "} catch (E as e) { append(trc, e.v); }",
+          "assert(trc == [1, 4]);" },
+        /* crossing a FRAME to the caller's catch (the native walk) */
+        { "struct E { int v; }",
+          "var trc = [];",
+          "func inner() {",
+          "  try { throw E(8); } catch (E) { append(trc, 1); rethrow; } }",
+          "try { inner(); } catch (E as e) { append(trc, e.v); }",
+          "assert(trc == [1, 8]);" },
+        /* in a LOOP, so the region re-enters the same fragment */
+        { "struct E { int v; }",
+          "var n = 0;",
+          "for (var i = 0; i < 4; i++) {",
+          "  try {",
+          "    try { throw E(i); } catch (E) { n += 1; rethrow; }",
+          "  } catch (E) { n += 10; }",
+          "}",
+          "assert(n == 44);" },
+    };
+
+    for (const auto &lines : shapes) {
+        std::string src;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        const unsigned long before = g_jit_rethrow_native;
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            g_exec_engine = saved;
+            cout << "  rethrow shape threw\n";
+            return false;
+        }
+        g_exec_engine = saved;
+        if (g_jit_rethrow_native == before) {
+            cout << "  `rethrow` did NOT run natively\n";
+            return false;
+        }
+    }
+
+    /* The BOUNDARY outcome + CARET PARITY: an uncaught rethrow must surface
+     * with the RETHROW SITE's position, byte-identical across engines. */
+    {
+        const std::vector<const char *> lines = {
+            "struct E { int v; }",
+            "func f() {",
+            "  try { throw E(1); } catch (E) { rethrow; }",
+            "}",
+            "f();",
+        };
+        std::string src;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        const auto pos_of = [&](ExecEngine eng, bool &ok) {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            const ExecEngine saved = g_exec_engine;
+            g_exec_engine = eng;
+            std::pair<int, int> p(-1, -1);
+            ok = false;
+            try {
+                ParseContext pc(TokenStream(toks), true);
+                unique_ptr<Construct> root = pBlock(pc);
+                mark_implicit_globals(root.get(), {});
+                infer_types(root.get(), true);
+                run_optimizers(root.get());
+                if (eng == ExecEngine::Vm)
+                    vm_execute(root.get());
+                else
+                    root->eval(nullptr);
+            } catch (Exception &e) {
+                p = { e.loc_start.line, e.loc_start.col };
+                ok = true;
+            } catch (...) {
+            }
+            g_exec_engine = saved;
+            return p;
+        };
+        bool ok_tw = false, ok_vm = false;
+        const unsigned long before = g_jit_rethrow_native;
+        const std::pair<int, int> tw = pos_of(ExecEngine::TreeWalk, ok_tw);
+        const std::pair<int, int> vm = pos_of(ExecEngine::Vm, ok_vm);
+        if (!ok_tw || !ok_vm) {
+            cout << "  an uncaught rethrow did NOT propagate\n";
+            return false;
+        }
+        if (tw != vm) {
+            cout << "  rethrow caret DIVERGED: tw " << tw.first << ":"
+                 << tw.second << " vs vm " << vm.first << ":" << vm.second
+                 << "\n";
+            return false;
+        }
+        /* line 3 is the `rethrow` line - pin it, so the two engines cannot
+         * agree on the WRONG position. */
+        if (tw.first != 3) {
+            cout << "  rethrow caret is line " << tw.first
+                 << ", expected the rethrow site (3)\n";
+            return false;
+        }
+        if (g_jit_rethrow_native == before) {
+            cout << "  the BOUNDARY rethrow did not run natively\n";
             return false;
         }
     }
@@ -20168,6 +20316,8 @@ static const std::vector<extra_check> extra_checks =
       vm_handler_table },
     { "jit: EndFinally's reraise arm is native (#78 step E)",
       jit_end_finally_native },
+    { "jit: `rethrow` is native + keeps its site caret (#80)",
+      jit_rethrow_native },
     { "vm: dyn-foreach specialized Next bodies run (lever 4)",
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",
