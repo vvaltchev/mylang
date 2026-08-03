@@ -1971,6 +1971,35 @@ suite would notice.
 With this, every exception construct - `throw`, runtime errors, `try`/
 `catch` entry and matching, `finally`, `rethrow` - is native.
 
+### CORRECTION: every #78/#80 number above was taken at ASSERTS=1
+
+The maintainer caught this. All the measurement lanes were plain
+`make -j OPT=1`, which defaults ASSERTS=1; the perf gate is ASSERTS=0.
+**An ASSERTS=1 delta cannot be extrapolated** - assertion cost is not a
+uniform multiplier, it lands unevenly per code path (the per-op
+ML_VM_CHECK tier, `_GLIBCXX_ASSERTIONS` on container access), so a change
+that MOVES work between paths can measure better or worse purely because
+of where the asserts sit.
+
+Re-measured, pre-#78 (3dc7118) -> HEAD (f4edb53), ASSERTS=0 both sides:
+
+                        ASSERTS=1   ASSERTS=0
+    42_exceptions          +3.11%      +2.83%
+    70_exc_runtime        +11.02%      +9.47%
+    69_exc_crossframe      -2.36%      +0.22%   <-- SIGN FLIP
+    72_exc_finally         -1.42%      -1.33%
+
+69_exc_crossframe is the warning. Under ASSERTS=1 the fast-reject fix
+looked like a 2.4% WIN; at ASSERTS=0 it is ~neutral. The win I recorded
+was substantially the removal of hardened container access on the walk
+path, not the call-frame saving I attributed it to. The other three hold
+their direction, and the honest headline is: 42 and 70 regress somewhat
+LESS than reported, 69 does not improve, 72 still improves.
+
+#81 shows the same effect from the other side: ASSERTS=1 said +0.22%,
+ASSERTS=0 said +1.14% for the identical change - a 5x difference in the
+delta. That one is measured BOTH ways below.
+
 ### #81 - flattening the handler table: MEASURED, NEGATIVE, NOT LANDED
 
 Parked on `wip/81-flatten-handler-table` (green: 1665/1665 + 1478/1478),
@@ -1979,13 +2008,19 @@ levels of dependent loads (table -> the site's clause vector -> the
 clause's type-name vector), ~32 Ir per throw, and that one flat pool per
 chunk with (base, count) per site would remove them.
 
-MEASURED vs f4edb53 (callgrind Ir):
+MEASURED vs f4edb53 (callgrind Ir), BOTH build configs:
 
-                        JIT on    JIT off
-    42_exceptions        +0.22%     +0.19%
-    70_exc_runtime       +0.55%     +0.36%
-    69_exc_crossframe    +0.01%     +0.03%
-    72_exc_finally       +0.12%     +0.03%
+                     A=1 jit-on  A=1 jit-off  A=0 jit-on  A=0 jit-off
+    42_exceptions       +0.22%      +0.19%      +1.14%      +1.01%
+    70_exc_runtime      +0.55%      +0.36%      +2.88%      +1.92%
+    69_exc_crossframe   +0.01%      +0.03%      +0.04%      +0.07%
+    72_exc_finally      +0.12%      +0.03%      -0.01%      -0.00%
+
+At ASSERTS=0 - the config that ships and the one the gate uses - it is
+FIVE TIMES worse than the ASSERTS=1 reading suggested, because the
+NESTED baseline was the side paying the hardened container access;
+remove hardening and the flat form's real extra work is all that is
+left. The decline is not close.
 
 Negative everywhere, after three rounds of tuning off a first cut at
 +1.76% / +3.96%. The two real lessons from those rounds:
