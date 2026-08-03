@@ -326,9 +326,15 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
 
     switch (arr.skind()) {
     case SharedArrayObj::Storage::ints:
-        if (!elem.is<int_type>())
+        /* #96: a bool WIDENS into numeric storage (the promotion chain
+         * bool <= int <= float) - the same rule as the element store
+         * (flat_store_core) and the decl/struct-field coerces. */
+        if (elem.is<int_type>())
+            arr.flat_ints().push_back(elem.get<int_type>());
+        else if (elem.is<bool>())
+            arr.flat_ints().push_back(elem.get<bool>() ? 1 : 0);
+        else
             return false;
-        arr.flat_ints().push_back(elem.get<int_type>());
         break;
     case SharedArrayObj::Storage::floats:
         if (elem.is<float_type>())
@@ -336,6 +342,8 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
         else if (elem.is<int_type>())
             arr.flat_floats().push_back(
                 static_cast<float_type>(elem.get<int_type>()));
+        else if (elem.is<bool>())
+            arr.flat_floats().push_back(elem.get<bool>() ? 1.0 : 0.0);
         else
             return false;
         break;
@@ -637,20 +645,27 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
 
     const size_type at = arr.offset() + index;
 
-    /* Flat in-place insert when the value matches the kind. A non-fitting value
-     * on a flat array is the dyn-laundering case - it errors below rather than
-     * promoting (an array<dyn> was built general by type-driven creation). */
-    if (arr.skind() == SharedArrayObj::Storage::ints && val.is<int_type>()) {
+    /* Flat in-place insert when the value matches the kind (#96: a bool
+     * WIDENS into numeric storage, like the element store and append).
+     * A non-fitting value on a flat array is the dyn-laundering case -
+     * it errors below rather than promoting (an array<dyn> was built
+     * general by type-driven creation). */
+    if (arr.skind() == SharedArrayObj::Storage::ints &&
+        (val.is<int_type>() || val.is<bool>())) {
         auto &v = arr.flat_ints();
-        v.insert(v.begin() + at, val.get<int_type>());
+        v.insert(v.begin() + at, val.is<bool>()
+            ? (val.get<bool>() ? 1 : 0)
+            : val.get<int_type>());
         return true;
     }
     if (arr.skind() == SharedArrayObj::Storage::floats &&
-        (val.is<float_type>() || val.is<int_type>())) {
+        (val.is<float_type>() || val.is<int_type>() || val.is<bool>())) {
         auto &v = arr.flat_floats();
         v.insert(v.begin() + at, val.is<int_type>()
             ? static_cast<float_type>(val.get<int_type>())
-            : val.get<float_type>());
+            : val.is<bool>()
+                ? (val.get<bool>() ? 1.0 : 0.0)
+                : val.get<float_type>());
         return true;
     }
     if (arr.skind() == SharedArrayObj::Storage::bools && val.is<bool>()) {

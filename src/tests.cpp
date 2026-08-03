@@ -204,6 +204,61 @@ static const std::vector<test> tests =
 
     {
         /*
+         * #96: a BOOL value WIDENS into flat numeric storage - the
+         * promotion chain bool <= int <= float, the rule the decl and
+         * struct-field coerces already followed; arrays were the
+         * outlier. The tree-walker's flat_store_core refused it while
+         * the VM's typed StoreElemInt path (a bool literal pre-widened
+         * to a 0/1 operand) stored it - a real engine DIVERGENCE, found
+         * probing #95's bool-compound shape and ruled VM-right by the
+         * maintainer. The fix is in the SHARED cores (flat_store_core,
+         * arr_append_fast, builtin_insert_arr), so all five modes agree
+         * by construction; the TREE-WALKER pass is the one that used to
+         * throw. The reverse direction (an int into an array<bool>) is
+         * a NARROWING and must STAY an error.
+         */
+        "arrays: a bool WIDENS into int/float storage (store, append, "
+        "insert; the int-into-bool narrowing still throws) (#96)",
+        {
+            /* the original repro: a[1] += n joins the elements to int,
+             * so storage is flat ints and the bool fills widen to 1 */
+            "func f(n) {",
+            "    var a = array(8); var i = 0;",
+            "    while (i < 8) { a[i] = true; i++; }",
+            "    a[1] += n;",
+            "    return a[0] * 100 + a[1]; }",
+            "assert(f(runtime(4)) == 105);",
+            /* a bool VARIABLE (the boxed StoreElemValue route), append,
+             * insert, and float storage */
+            "func g(flag) {",
+            "    var a = [10, 20, 30];",
+            "    a[0] = flag;",
+            "    append(a, flag);",
+            "    insert(a, 1, flag);",
+            "    var fa = [1.5, 2.5];",
+            "    fa[0] = flag;",
+            "    append(fa, flag);",
+            "    return a[0] + a[1] * 10 + a[4] * 100 + fa[0] + fa[2]; }",
+            "assert(g(runtime(1) == 1) == 113.0);",
+            /* compound with a bool rhs already widened via num_bin_op */
+            "func h(flag) {",
+            "    var a = [5, 6];",
+            "    a[0] += flag;",
+            "    return a[0]; }",
+            "assert(h(runtime(1) == 1) == 6);",
+            /* the NARROWING direction: an int into bool storage throws */
+            "func k(dyn d, n) {",
+            "    var t = 0;",
+            "    try { d[0] = n; } catch (TypeErrorEx) { t = 1; }",
+            "    try { append(d, n); } catch (TypeErrorEx) { t += 2; }",
+            "    return t; }",
+            "var ba = [true, false];",
+            "assert(k(ba, runtime(7)) == 3);",
+        },
+    },
+
+    {
+        /*
          * compile_float_expr had NO arm for a DEFINITELY-int
          * SUBEXPRESSION - as_float_operand admits int LEAVES (a slot, a
          * literal) but `(j + 1) * 1.5` carries an int CHAIN, and since

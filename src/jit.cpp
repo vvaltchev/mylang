@@ -4092,6 +4092,8 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
  * non-readonly flat int/bool/float array, the VALUE fitting the row's
  * kind (int row: t_int; bool row: t_bool; float row: t_float, or t_int
  * which PROMOTES via cvtsi2sd - the interpreter's own float-arm cast).
+ * A BOOL value on an int/float row declines to the helper, which
+ * #96-widens it (0/1) - the inline arms keep the narrow guards.
  * The row's COW pair (slice flag / live views) goes to the SHARED prep
  * (jit_store_elem_prep on &row - the row LValue address is stable
  * across the clone, but the retry re-derives it anyway).

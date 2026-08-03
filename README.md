@@ -2376,6 +2376,13 @@ from the very first element — even if its initializer looked like all ints (so
 operation (`append`/`pop`/`insert`/`erase`/`sort`/`map`/`filter`/slicing/…)
 preserves the representation.
 
+A **`bool` value widens into numeric storage** like everywhere else in the
+language (the promotion chain `bool <= int <= float`, the same rule as
+`int x = true;` or a struct's int field): storing, appending, or inserting a
+bool into an `array<int>` writes `0`/`1`, into an `array<float>` `0.0`/`1.0`.
+The reverse (an int into an `array<bool>`) stays a `TypeError` — that would be
+a narrowing, which the language never does implicitly.
+
 Because the representation is fixed, the *only* way to ask a flat
 (statically-typed) array to hold a value of a different type is to launder it
 through a `dyn` alias and mutate that (e.g. `var dyn d = int_array;
