@@ -1971,6 +1971,49 @@ suite would notice.
 With this, every exception construct - `throw`, runtime errors, `try`/
 `catch` entry and matching, `finally`, `rethrow` - is native.
 
+### #81 - flattening the handler table: MEASURED, NEGATIVE, NOT LANDED
+
+Parked on `wip/81-flatten-handler-table` (green: 1665/1665 + 1478/1478),
+not merged. The premise was that matching a catch clause walked three
+levels of dependent loads (table -> the site's clause vector -> the
+clause's type-name vector), ~32 Ir per throw, and that one flat pool per
+chunk with (base, count) per site would remove them.
+
+MEASURED vs f4edb53 (callgrind Ir):
+
+                        JIT on    JIT off
+    42_exceptions        +0.22%     +0.19%
+    70_exc_runtime       +0.55%     +0.36%
+    69_exc_crossframe    +0.01%     +0.03%
+    72_exc_finally       +0.12%     +0.03%
+
+Negative everywhere, after three rounds of tuning off a first cut at
++1.76% / +3.96%. The two real lessons from those rounds:
+
+  1. **`operator[]` is NOT free in this build.** ASSERTS is on by default
+     (release included), so `_GLIBCXX_ASSERTIONS` bounds-checks every
+     `vector::operator[]`. Indexing the flat pool put a size() compare on
+     EVERY element of the matcher scan, where the nested form paid one
+     check on the outer lookup and then iterated unchecked: **+28 Ir per
+     throw**. A flattening only pays if the hot scan goes through
+     `.data()`.
+  2. **A 12-byte element makes indexing cost a multiply.** `cls[ci]` on a
+     3 x int32 struct needs an imul per access; the old range-for was a
+     pointer increment. Worth another ~0.8% on 42.
+
+WHY THE PREMISE WAS WRONG (the part worth remembering): the inner
+vector's `_M_start`/`_M_finish` live INSIDE the site struct, which the
+dispatch has already loaded - so the nested range-for is a plain pointer
+loop with NO extra dependent load. The flat form must load
+`handler_clauses.data()` (a different cache line of Chunk) plus
+clause_base and n_clauses and then compute the base: strictly more work.
+The indirection I set out to remove was never being paid in the first
+place. "Nested vectors are three pointer hops" is true of the TYPE and
+false of the generated CODE when the outer element is already in hand.
+
+The residual +1.4/+4.2% interpreter-side dispatch cost from #78 is real;
+it is simply not here.
+
 ## The original scoping (kept for the record - superseded above)
 
 SCOPED 2026-07-29, before the implementation showed one store sufficed.
