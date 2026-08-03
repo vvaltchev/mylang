@@ -802,6 +802,30 @@ struct Emitter {
     /* movsd [rcx + r9*8], xmm0  (#94: the float element STORE) */
     void store_elem_float_x0()
     { u8(0xF2); u8(0x4A); u8(0x0F); u8(0x11); u8(0x04); u8(0xC9); }
+    /* ---- #95, the COMPOUND element store (read-modify-write) ----
+     * The element rides RAX (the shobj is done with it once the hash byte
+     * is invalidated - which happens FIRST, since past the guards nothing
+     * can fault); the rhs stays in RDI. */
+    void store_elem_int_rax()          /* mov [rcx + r9*8], rax */
+    { u8(0x4A); u8(0x89); u8(0x04); u8(0xC9); }
+    void store_elem_int_rdx()          /* mov [rcx + r9*8], rdx (mod) */
+    { u8(0x4A); u8(0x89); u8(0x14); u8(0xC9); }
+    void add_rax_rdi()  { u8(0x48); u8(0x01); u8(0xF8); }
+    void sub_rax_rdi()  { u8(0x48); u8(0x29); u8(0xF8); }
+    void imul_rax_rdi() { u8(0x48); u8(0x0F); u8(0xAF); u8(0xC7); }
+    void cqo()          { u8(0x48); u8(0x99); }
+    void idiv_rdi()     { u8(0x48); u8(0xF7); u8(0xFF); }
+    void cmp_rdi_imm8(int8_t v)        /* cmp rdi, imm8 (sign-extended) */
+    { u8(0x48); u8(0x83); u8(0xFF); u8(static_cast<uint8_t>(v)); }
+    /* movsd xmm1, [rcx + r9*8] / movsd [rcx + r9*8], xmm1 */
+    void load_elem_float_x1()
+    { u8(0xF2); u8(0x4A); u8(0x0F); u8(0x10); u8(0x0C); u8(0xC9); }
+    void store_elem_float_x1()
+    { u8(0xF2); u8(0x4A); u8(0x0F); u8(0x11); u8(0x0C); u8(0xC9); }
+    /* addsd/subsd/mulsd/divsd xmm1, xmm0 (op = 0x58/0x5C/0x59/0x5E) -
+     * the compound direction: el = el OP rhs, el in xmm1, rhs in xmm0 */
+    void farith_x1_x0(uint8_t op) { u8(0xF2); u8(0x0F); u8(op); u8(0xC8); }
+    void pxor_x1() { u8(0x66); u8(0x0F); u8(0xEF); u8(0xC9); }
     /* cmp rax, rcx / test rax, rax */
     void cmp_rax_rcx() { u8(0x48); u8(0x39); u8(0xC8); }
     void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
@@ -3588,14 +3612,45 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                                    std::vector<size_t> &dones,
                                    bool is_float)
 {
-    if (in.aop != Op::invalid)
-        return false;              /* compound: read-modify-write, later */
+    /*
+     * #95 case 1 - COMPOUND stores `a[i] OP= v` inline too, as a
+     * read-modify-write on the element. The op set is the interpreter
+     * body's own (plus/minus/times/div/mod); anything else was
+     * unreachable there (its default is InternalErrorEx). Refusals that
+     * stay on the helper, decided at EMIT time:
+     *   - float `%=` (an fmod libm call - not worth a call-bearing tail);
+     *   - a LITERAL 0 / -1 divisor: the helper runs the interpreter's
+     *     exact C++ (GCC may fold an imm-divisor division differently
+     *     than an emitted idiv would trap - the IntModRI exclusion);
+     * and at RUNTIME (a slot divisor): rdi == 0 / -1 declines, emitted
+     * BEFORE the prep jumps - a div-by-zero store throws WITHOUT cloning
+     * in the interpreter, so prep must not run first (`intptr`-observable).
+     * A compound on a BOOL array declines too (the interpreter's fast
+     * path excludes it: bool + int -> int does not fit the storage).
+     */
+    const Op aop = in.aop;
+    const bool compound = aop != Op::invalid;
+    const bool divmod = aop == Op::div || aop == Op::mod;
+    if (compound) {
+        if (aop != Op::plus && aop != Op::minus && aop != Op::times
+            && !divmod)
+            return false;
+        if (is_float && aop == Op::mod)
+            return false;                       /* fmod: helper */
+        if (divmod && !is_float && in.b_is_lit()
+            && (in.b_lit() == 0 || in.b_lit() == -1))
+            return false;
+        if (aop == Op::div && is_float && in.b_is_lit()
+            && in.b_flit() == 0.0)
+            return false;
+    }
 
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(in.target2);
     const int32_t base_off = static_cast<int32_t>(
         static_cast<long>(in.target2) * static_cast<long>(sizeof(LValue)));
     const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
+    const auto decline_if = [&](uint8_t cc) { slows.push_back(e.j32(cc)); };
     std::vector<size_t> preps;
 
     /*
@@ -3630,20 +3685,85 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     decline_ne();                                            /* readonly */
 
     /*
-     * The COW guards - PREP-able, and deliberately AFTER const/readonly:
-     * the interpreter throws on those WITHOUT cloning, so prepping first
-     * would detach slices for a store that never happens (observable via
-     * `intptr`, which the COW tests pin as spec).
+     * The RUNTIME divisor guards (compound div/mod, slot rhs) - BEFORE
+     * the prep jumps for the same reason prep sits after const/readonly:
+     * a div-by-zero store throws WITHOUT cloning in the interpreter, so
+     * the clone side effect must not run first. A decline itself is
+     * always safe (the helper re-derives everything in the right order).
      */
-    e.cmp_byte_slot(base.payload + L.slice_off, 0);   /* base IS a slice */
-    preps.push_back(e.j32(0x75));
-    e.cmp_byte_rax(L.slices_off, 0);                  /* live slice views */
-    preps.push_back(e.j32(0x75));
+    if (divmod && !in.b_is_lit()) {
+        if (!is_float) {
+            e.cmp_rdi_imm8(0);
+            decline_if(0x74);                         /* je (== 0) */
+            e.cmp_rdi_imm8(-1);
+            decline_if(0x74);                         /* je (== -1) */
+        } else {
+            /* xmm0 == 0.0 declines; NaN (unordered sets ZF too) must NOT
+             * - jp hops the decline first. -0.0 compares equal, matching
+             * the interpreter's `rhs == 0.0`. */
+            e.pxor_x1();
+            e.ucomisd(X0, X1);
+            const size_t j_nan = e.j8(0x7A);          /* jp -> not zero */
+            decline_if(0x74);                         /* je (== 0.0) */
+            e.patch8(j_nan, e.pos());
+        }
+    }
+
+    /*
+     * Per-kind arms. The KIND check now precedes the COW/prep guards
+     * (defense in depth: prep must never clone a base the interpreter
+     * would fault on without cloning - unreachable for this op's proven
+     * bases today, but the ordering is the invariant, not the reach).
+     * The COW guards themselves are per-arm and deliberately AFTER
+     * const/readonly: the interpreter throws on those WITHOUT cloning,
+     * so prepping first would detach slices for a store that never
+     * happens (observable via `intptr`, which the COW tests pin as spec).
+     */
+    const auto cow_guards = [&]() {
+        e.cmp_byte_slot(base.payload + L.slice_off, 0);  /* base a slice */
+        preps.push_back(e.j32(0x75));
+        e.cmp_byte_rax(L.slices_off, 0);                 /* live views */
+        preps.push_back(e.j32(0x75));
+    };
+    const auto bump = [&]() {
+#ifdef TESTS
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x02);              /* inc qword */
+#endif
+    };
+    /* The int RMW tail: the hash byte is invalidated FIRST (rax = shobj is
+     * then free for the element) - safe, because past the guards nothing
+     * can fault (div 0/-1 declined, bounds checked). */
+    const auto int_rmw = [&]() {
+        e.mov_byte_rax_imm(L.hashv_off, 0);              /* invalidate */
+        switch (aop) {
+        case Op::invalid:
+            e.store_elem_int_rdi();
+            return;
+        case Op::div: case Op::mod:
+            e.load_elem_int();                           /* rax = elem */
+            e.cqo();
+            e.idiv_rdi();
+            if (aop == Op::div)
+                e.store_elem_int_rax();
+            else
+                e.store_elem_int_rdx();                  /* remainder */
+            return;
+        default:
+            e.load_elem_int();
+            if (aop == Op::plus)       e.add_rax_rdi();
+            else if (aop == Op::minus) e.sub_rax_rdi();
+            else                       e.imul_rax_rdi();
+            e.store_elem_int_rax();
+            return;
+        }
+    };
 
     if (is_float) {
         /* --- FLOATS: one kind, one 8-byte tail --- */
         e.cmp_byte_rax(L.kind_off, L.kind_floats);
         decline_ne();
+        cow_guards();
         e.mov_rcx_rax(L.data_off);
         e.mov_rdx_rax(L.data_off + 8);
         e.sub_rdx_rcx();
@@ -3651,14 +3771,35 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         load_index_r9(e, in);
         e.cmp_r9_rdx();
         slows.push_back(e.j32(0x73));
-#ifdef TESTS
-        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x02);
-#endif
-        e.store_elem_float_x0();               /* movsd [rcx+r9*8], xmm0 */
+        bump();
         e.mov_byte_rax_imm(L.hashv_off, 0);
+        if (!compound) {
+            e.store_elem_float_x0();           /* movsd [rcx+r9*8], xmm0 */
+        } else {
+            e.load_elem_float_x1();            /* xmm1 = elem */
+            e.farith_x1_x0(aop == Op::plus  ? 0x58
+                         : aop == Op::minus ? 0x5C
+                         : aop == Op::times ? 0x59 : 0x5E);
+            e.store_elem_float_x1();
+        }
         dones.push_back(e.jmp32());
         /* fall through to the shared PREP stub below */
+    } else if (compound) {
+        /* --- compound INTS only (bools decline: bool+int -> int does
+         * not fit the storage; the helper raises the exact error) --- */
+        e.cmp_byte_rax(L.kind_off, L.kind_ints);
+        decline_ne();
+        cow_guards();
+        e.mov_rcx_rax(L.data_off);
+        e.mov_rdx_rax(L.data_off + 8);
+        e.sub_rdx_rcx();
+        e.sar_rdx_3();
+        load_index_r9(e, in);
+        e.cmp_r9_rdx();
+        slows.push_back(e.j32(0x73));
+        bump();
+        int_rmw();
+        dones.push_back(e.jmp32());
     } else {
     e.cmp_byte_rax(L.kind_off, L.kind_ints);
     const size_t j_ints = e.j32(0x74);
@@ -3666,22 +3807,21 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     decline_ne();
 
     /* --- BOOLS: 1-byte elements, count = finish - start --- */
+    cow_guards();
     e.mov_rcx_rax(L.data_off);
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
     load_index_r9(e, in);
     e.cmp_r9_rdx();
     slows.push_back(e.j32(0x73));        /* jae: negative OR >= count */
-#ifdef TESTS
-    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
-    e.u8(0x48); e.u8(0xFF); e.u8(0x02);              /* inc qword [rdx] */
-#endif
+    bump();
     e.store_elem_byte_dil();
     e.mov_byte_rax_imm(L.hashv_off, 0);             /* invalidate_hash() */
     dones.push_back(e.jmp32());
 
     /* --- INTS: 8-byte elements, count = (finish - start) / 8 --- */
     e.patch32_here(j_ints);
+    cow_guards();
     e.mov_rcx_rax(L.data_off);
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
@@ -3689,10 +3829,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     load_index_r9(e, in);
     e.cmp_r9_rdx();
     slows.push_back(e.j32(0x73));
-#ifdef TESTS
-    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
-    e.u8(0x48); e.u8(0xFF); e.u8(0x02);
-#endif
+    bump();
     e.store_elem_int_rdi();
     e.mov_byte_rax_imm(L.hashv_off, 0);
     dones.push_back(e.jmp32());

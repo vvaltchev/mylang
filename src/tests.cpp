@@ -18137,6 +18137,11 @@ static bool jit_store_elem_inline_tier()
         bool fast;
         bool count = true;
         int prep = -1;      /* -1 dont-care, 0 must NOT run, 1 must run */
+        /* >= 0: the EXACT fast-store count. The per-shape attribution the
+         * trap note below demands: a decline case must fill its array in a
+         * compiled loop (plain stores, all fast), so "the compound stores
+         * contributed ZERO" is only assertable as fills == total. */
+        long fast_exact = -1;
     };
     const std::vector<Case> cases = {
       { "flat INT array, plain store",
@@ -18175,12 +18180,145 @@ static bool jit_store_elem_inline_tier()
           "    return c; }",
           "print(f(9));" }, true },
 
-      { "DECLINE: a COMPOUND store, and ONLY that",
+      /*
+       * #95 case 1: COMPOUND stores are read-modify-write on the fast
+       * path now. The exact counts attribute per shape: 32 fill stores
+       * plus the compound ones, so a silently-declining compound reads
+       * as a count mismatch, not a vacuous pass.
+       */
+      { "COMPOUND int +=: served inline (32 fills + 4 compounds)",
         { "func f(n) {",
-          "    var a = [1, 2, 3, 4];",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i; i++; }",
           "    var j = 0; while (j < 4) { a[j] += n; j++; }",
           "    return a[0] + a[3]; }",
-          "print(f(5));" }, false },
+          "print(f(5));" }, true, true, -1, /*fast_exact=*/36 },
+
+      { "COMPOUND int -= *= /= %= by a SAFE slot divisor (32 + 8*4)",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i * 7 + 1; i++; }",
+          "    var d = n + 1; var m = n + 2;",       /* 3, 4: not 0/-1 */
+          "    var j = 0;",
+          "    while (j < 8) {",
+          "        a[j] -= n; a[j] *= m; a[j] /= d; a[j] %= m;",
+          "        j++; }",
+          "    var s = 0; var k = 0;",
+          "    while (k < 32) { s = s + a[k]; k++; }",
+          "    return s; }",
+          "print(f(2));" }, true, true, -1, /*fast_exact=*/64 },
+
+      /* the inc-dec lowering `a[i]++` == `a[i] += 1` (a literal rhs) */
+      { "COMPOUND: the a[i]++ inc-dec shape (32 + 8)",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i + n; i++; }",
+          "    var j = 0; while (j < 8) { a[j]++; j++; }",
+          "    var s = 0; var k = 0;",
+          "    while (k < 32) { s = s + a[k]; k++; }",
+          "    return s; }",
+          "print(f(3));" }, true, true, -1, /*fast_exact=*/40 },
+
+      /*
+       * The RUNTIME divisor guards, and their ORDER. A zero divisor must
+       * decline BEFORE the prep jumps: the interpreter throws div0
+       * WITHOUT cloning, so prep running first would detach the live
+       * slice observably (prep=0 is the assertion; the slice makes it
+       * load-bearing). And OOB outranks div0 - the interpreter checks
+       * bounds first - which the decline gets right by construction
+       * (the helper re-derives everything in order). fills=32 exact:
+       * both compound attempts must reach the helper, not the tier.
+       */
+      { "DECLINE: div by a runtime-ZERO divisor; OOB outranks div0",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i; i++; }",
+          "    var sl = a[1:4];",
+          /* write-TWICE keeps z a SLOT: a write-once `var z = n - n`
+           * is eaten by const-ARG specialization + auto-const (f(9)
+           * specializes to f$s0 with n=9, z folds to a LITERAL 0, and
+           * the emit-time refusal serves the case instead of the
+           * runtime guard - verified vacuous exactly that way) */
+          "    var z = 1; z = n - n;",               /* runtime zero */
+          "    var t = 0;",
+          "    try { a[1] /= z; } catch (DivisionByZeroEx) { t = 1; }",
+          "    try { a[99] /= z; } catch (OutOfBoundsEx) { t += 2; }",
+          "    try { a[2] %= z; } catch (DivisionByZeroEx) { t += 4; }",
+          "    return t * 10000 + sl[0] * 100 + a[1]; }",
+          "print(f(9));" }, true, true, /*prep=*/0, /*fast_exact=*/32 },
+
+      /* a slot divisor of -1: declines (the helper runs the exact
+       * interpreter C++ - the IntModRI idiv-trap convention) */
+      { "DECLINE: div/mod by a runtime -1 divisor",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i + 5; i++; }",
+          "    var m = 0; m = n - 10;",              /* -1, in a SLOT */
+          "    a[3] /= m; a[4] %= m;",
+          "    return a[3] * 10 + a[4]; }",
+          "print(f(9));" }, true, true, -1, /*fast_exact=*/32 },
+
+      /* LITERAL 0 / -1 divisors are refused at EMIT time (helper) */
+      { "DECLINE: literal 0 / -1 divisors (emit-refused)",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i + n; i++; }",
+          "    var t = 0;",
+          "    try { a[1] /= 0; } catch (DivisionByZeroEx) { t = 1; }",
+          "    a[2] %= 0 - 1;",
+          "    return t * 100 + a[2]; }",
+          "print(f(4));" }, true, true, -1, /*fast_exact=*/32 },
+
+      { "COMPOUND float += *= /= by a nonzero slot divisor (32 + 8*3)",
+        { "func f(x) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i * 1.5; i++; }",
+          "    var d = x + 1.0;",
+          "    var j = 0;",
+          "    while (j < 8) { a[j] += x; a[j] *= d; a[j] /= d; j++; }",
+          "    var s = 0.0; var k = 0;",
+          "    while (k < 32) { s = s + a[k]; k++; }",
+          "    return s; }",
+          "print(f(0.5));" }, true, true, -1, /*fast_exact=*/56 },
+
+      /* float /= 0.0 declines (div0 throw, no clone); a NaN divisor must
+       * stay FAST - ucomisd sets ZF on unordered too, and only the jp hop
+       * keeps NaN off the decline (removing it turns this exact count
+       * into 33-with-a-decline = 32). */
+      { "FLOAT divisors: runtime 0.0 declines, NaN stays fast",
+        { "func f(x) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i * 1.0; i++; }",
+          /* write-twice: keep both divisors SLOTS (see the int case) */
+          "    var z = 1.0; z = x - x;",             /* 0.0 at runtime */
+          "    var qn = 0.0;",
+          "    qn = sqrt(0.0 - (x + 0.5));",         /* sqrt(-1) = NaN */
+          "    var t = 0;",
+          "    try { a[1] /= z; } catch (DivisionByZeroEx) { t = 1; }",
+          "    a[2] /= qn;",
+          "    if (isnan(a[2])) t += 2;",
+          "    return t; }",
+          "print(f(0.5));" }, true, true, -1, /*fast_exact=*/33 },
+
+      /* NOTE a compound on runtime BOOL storage is COMPILE-unreachable
+       * (a compound int store pins the base to array<int>, so an
+       * array<bool> argument is a TypeMismatchEx) - the compound arm's
+       * kind==ints guard is defense in depth, not a testable shape.
+       * Probing for one exposed a PRE-EXISTING tw-vs-VM divergence
+       * (a bool literal stored into an int-JOINED array), filed as its
+       * own bug - it is not this tier's. */
+
+      /* compound + COW: the += loop preps the live slice away exactly as
+       * a plain store does (sl[0] keeps the pre-detach 1; removing the
+       * compound arm's has_slices guard makes it 1+n) */
+      { "COMPOUND + PREP: += while a slice lives",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i; i++; }",
+          "    var sl = a[1:4];",
+          "    var j = 0; while (j < 32) { a[j] += n; j++; }",
+          "    return sl[0] * 1000 + a[1]; }",
+          "print(f(7));" }, /*fast=*/true, /*count=*/true, /*prep=*/1 },
 
       /*
        * THE COW HAZARD, and the case has to be built carefully or it tests
@@ -18288,6 +18426,12 @@ static bool jit_store_elem_inline_tier()
         if (c.prep == 0 && prep != 0) {
             cout << "  store tier [" << c.name << "]: PREP ran on a shape "
                     "that must throw WITHOUT cloning (" << prep << ")\n";
+            ok = false;
+        }
+        if (c.fast_exact >= 0
+            && fast != static_cast<unsigned long>(c.fast_exact)) {
+            cout << "  store tier [" << c.name << "]: fast count "
+                 << fast << " != expected " << c.fast_exact << "\n";
             ok = false;
         }
     }
