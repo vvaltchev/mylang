@@ -290,3 +290,34 @@ the sieve-class costs). What remains is the architecture, not a helper.
 lives in plans/typed-invariant-arrays.md - B is folded in as its first
 step (C1); A is orthogonal (register territory, not type territory) and
 lands first as its own change.
+
+## Lever A LANDED (2026-08-03) - and its first version was measured WRONG
+
+Adjacent dead-temp forwarding: producer hands its int result to the
+next op IN RAX (whitelisted pairs; the consumer skips the slot load,
+a provably-dead non-ref temp's write is elided entirely; slow tiers
+reload RAX on their rejoin). Liveness comes from `jit_fwd_info`
+(codegen.cpp - the E1 machinery, so the emitter grew no second copy of
+visit_use_def/visit_pc_fields; building it found and fixed E1's
+handler absorption being EMPTY since #78 step D).
+
+**v1 measured +2 Ir/iter on 46 - the yield INVERTED.** The decomposition
+was exact: both hot temps are REF-LISTED, so skip_write never fires, and
+v1 paid an unconditional post-write RAX reload (+1) plus a move-aside
+`mov rcx, rax` (+1) against the one saved load (-1). v2 fixed both
+structurally: the reload lives in store_dst's COLD ref arm only (the hot
+two-store preserves RAX for free), and a COMMUTATIVE consumer with the
+`b` operand forwarded SWAPS the operand roles instead of moving RAX
+aside (only sub pays the move).
+
+MEASURED (callgrind Ir, OPT=1 ASSERTS=0, scale-1-vs-3 delta for the
+per-iteration numbers): 46_matrix_mult **-2.19%**/iter (31.37M ->
+30.69M per scale; ~91.5 -> ~89.5 Ir/iter), 14_array_subscript
+**-1.2%**/iter; whole-program 07_nested_loops **-2.83%**, 03_int_arith
+**-1.36%**, 15_array_slice_readonly -1.0%; everything else <= +0.04%,
+and the fib +0.2% reading is LINK NOISE (the -nj same-shape control
+carries +148K of the +176K; the -vdj diff is pure ASLR addresses).
+
+The write elision is throttled by ref_slots today (a reused temp that
+EVER holds a reference anywhere in the chunk is listed) - narrowing
+that list is C3's step, and it turns these pairs' -1/iter into -3.

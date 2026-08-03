@@ -18940,6 +18940,123 @@ static bool jit_elem_slice_and_promote()
 }
 
 /*
+ * Lever A - ADJACENT DEAD-TEMP FORWARDING (plans/unboxing.md). The
+ * producer hands its int result to the next op IN RAX; the consumer
+ * skips the slot load and a provably-dead temp's write is elided.
+ * g_jit_fwd is bumped by the EMITTED consumer at runtime - the only
+ * proof the forwarding executed (values are right either way). Exact
+ * counts attribute per shape.
+ */
+static bool jit_fwd_deadtemp()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src, bool vm,
+                  unsigned long *fwd) -> std::string {
+        const unsigned long f0 = g_jit_fwd;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (fwd) *fwd = g_jit_fwd - f0;
+        return cap.str();
+    };
+
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        long fwd_min;       /* the counter must reach at least this */
+    };
+    const std::vector<Case> cases = {
+      /* the canonical chain: load -> mulRI -> addstep, two forwards per
+       * iteration (the load's temp into the mul, the mul's into the
+       * accumulate) - 32 iterations = 64 */
+      { "load -> mul -> accumulate chain (2 forwards x 32)",
+        { "func f(a, n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k] * 2;",
+          "    return s; }",
+          "func mk(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i + 1; i++; }",
+          "    return a; }",
+          "print(f(mk(32), 32));" }, 64 },
+
+      /* the 46_matrix_mult inner shape: elem2 -> mul -> addstep */
+      { "nested-read -> mul -> accumulate (the matmul shape)",
+        { "func mk(n) {",
+          "    var m = array(n); var i = 0;",
+          "    while (i < n) {",
+          "        var row = array(8); var j = 0;",
+          "        while (j < 8) { row[j] = i + j + 1; j++; }",
+          "        m[i] = row; i++; }",
+          "    return m; }",
+          "func f(m, w) {",
+          "    var s = 0;",
+          "    for (var j = 0; j < 32; j++)",
+          "        s += m[j % 4][j % 8] * w[j % 8];",
+          "    return s; }",
+          "print(f(mk(4), mk(1)[0]));" }, 32 },
+
+      /*
+       * The SLOW-PATH REJOIN: a negative index declines the load to the
+       * helper EVERY iteration - the helper's status clobbers RAX, and
+       * the slow-path-only reload restores the element before the
+       * forwarded mul. Removing the reload makes this compute garbage
+       * (verified); the VALUE is the oracle, the counter proves the
+       * consumer still forwarded.
+       */
+      { "slow-path rejoin: negative-index loads feed a forwarded mul",
+        { "func f(a, n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k - 32] * 3;",
+          "    return s; }",
+          "func mk(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i + 1; i++; }",
+          "    return a; }",
+          "print(f(mk(32), 32));" }, 32 },
+    };
+
+    bool ok = true;
+    for (const Case &c : cases) {
+        unsigned long fwd = 0;
+        const std::string got = go(c.src, true, &fwd);
+        const std::string ref = go(c.src, false, nullptr);
+        if (got != ref || ref.empty()) {
+            cout << "  fwd [" << c.name << "]: tw=[" << ref
+                 << "] vm=[" << got << "]\n";
+            ok = false;
+        }
+        if (fwd < static_cast<unsigned long>(c.fwd_min)) {
+            cout << "  fwd [" << c.name << "]: forwarded " << fwd
+                 << " < expected " << c.fwd_min << "\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * THE COUNTED-LOOP FUSIONS' OPERAND LAYOUT SURVIVES A SPLICE (#87).
  *
  * `IntAddStep` packs TWO things into one operand: `a_dual_lo` is always a
@@ -23429,6 +23546,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the SLICE read arms (single + nested outer/row) and the "
       "nested int-row PROMOTE arm (#95)",
       jit_elem_slice_and_promote },
+    { "jit: adjacent dead-temp FORWARDING hands values in RAX "
+      "(lever A; counter + slow-path rejoin)",
+      jit_fwd_deadtemp },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",
