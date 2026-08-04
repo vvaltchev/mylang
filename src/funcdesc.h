@@ -90,6 +90,21 @@ struct FuncDescriptor {
         bool cnst;                   /* `const x` - binds as a const LValue */
         bool dyn_mod;                /* `dyn`/`~` (signature rendering only) */
         DeclType decl_type;          /* i/f trigger the bind-time coercion */
+        /*
+         * C3: the inference-PROVEN scalar kind of an UN-annotated param
+         * (i/f, else none). Stamped by the one-shot inferencer ONLY for
+         * a concrete, non-opt, non-dyn param of a non-template function
+         * that is NEVER used as a value (sym !value_used, finfo
+         * !value_escaped) - so every call path is compile-checked and
+         * the param can only ever receive that scalar. METADATA, not a
+         * coercion trigger (bind paths ignore it): its one consumer is
+         * codegen's ref_slots param join, which may then exclude the
+         * param from the return-path reference-release scan exactly
+         * like a coerced i/f param. The VM_HARDENING full-window audit
+         * at pop_window is the net: a wrongly-excluded param holding a
+         * reference fails the every-slot-trivial assert at frame pop.
+         */
+        DeclType proven_type = DeclType::none;
     };
 
     /* One capture-list entry, RESOLVED: closure creation snapshots the value

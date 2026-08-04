@@ -19150,6 +19150,97 @@ static bool jit_fwd_deadtemp()
  * shipped with: fragment 2 flushed fragment 1's never-loaded xmm pin
  * into the slot; sabotage = drop the per-run fcache.clear()).
  */
+/*
+ * C3 - PROVEN-TYPE PARAMS LEAVE ref_slots. The inferencer stamps
+ * ParamDesc::proven_type for an un-annotated param that can only ever
+ * receive one scalar kind (concrete instance type, never value-used,
+ * not escaped); codegen's param join then excludes it from the
+ * return-path release scan. Engagement is the TESTS counter (the
+ * codegen join bumps per excluded param); the SOUNDNESS net is the
+ * VM_HARDENING pop_window audit (every-slot-trivial after the scan),
+ * proven by the force-stamp sabotage. The gate case: a VALUE-used
+ * function's params stay listed (its calls are not all
+ * compile-checked), asserted here by the counter NOT growing.
+ */
+static bool ref_slots_proven_params()
+{
+    auto go = [&](const std::vector<const char *> &src)
+        -> std::pair<std::string, unsigned long> {
+        const unsigned long c0 = g_ref_slots_proven_excluded;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return { cap.str(), g_ref_slots_proven_excluded - c0 };
+    };
+    bool ok = true;
+    /* an int-instance recursion: both params proven -> excluded (>= 2;
+     * the exact count includes any other stamped bodies in the unit) */
+    {
+        auto [out, n] = go({
+            "func f(a, b) {",
+            "    if (a < 1) { return b; }",
+            "    var t = f(a - 1, b + a); return t; }",
+            "print(f(10, 0));" });
+        if (out != "55 \n" || n < 2) {
+            cout << "  c3 [recursion]: out=[" << out << "] excluded="
+                 << n << "\n";
+            ok = false;
+        }
+    }
+    /* the dyn-launder of the BASE is checked-safe: `h = g` escapes
+     * the TEMPLATE (never stamped), h(1) runs the boxed base; the
+     * direct-call instance g$0 stamps its (compile-checked) param -
+     * exactly 1 exclusion, and the values agree */
+    {
+        auto [out, n] = go({
+            "func g(a) { return a + a; }",
+            "var dyn h = g;",
+            "print(g(4) + h(1));" });
+        if (out != "10 \n" || n != 1) {
+            cout << "  c3 [dyn base launder]: out=[" << out
+                 << "] excluded=" << n << " (want 1)\n";
+            ok = false;
+        }
+    }
+    /* the GATE that matters: a VALUE-INSTANTIATED instance is reachable
+     * as a value (`ops[k]`), dyn-launderable, callable with unchecked
+     * args - the redirect marks its sym value_used, so NOTHING stamps
+     * (the counter must not grow) */
+    {
+        auto [out, n] = go({
+            "func add_op(a, b) { return a + b; }",
+            "func sub_op(a, b) { return a - b; }",
+            "var ops = [add_op, sub_op];",
+            "var s = 0;",
+            "for (var i = 0; i < 4; i++) {",
+            "    var f = ops[i % 2];",
+            "    s += f(10, i);",
+            "}",
+            "print(s);" });
+        if (out != "38 \n" || n != 0) {
+            cout << "  c3 [value-instantiated gate]: out=[" << out
+                 << "] excluded=" << n << " (want 0)\n";
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static bool jit_fcache_c2()
 {
 #if ML_JIT_SUPPORTED
@@ -24257,6 +24348,8 @@ static const std::vector<extra_check> extra_checks =
     { "jit: C2a - the FLOAT register cache (xmm4-7): pins, spills, "
       "run-splits",
       jit_fcache_c2 },
+    { "vm: C3 - inference-proven params leave the ref_slots release scan",
+      ref_slots_proven_params },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",

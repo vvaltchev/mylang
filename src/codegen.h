@@ -182,3 +182,4 @@ extern bool g_bc_inline_enabled;
 extern unsigned long g_bc_inline_caller_frames;
 /* Total call sites spliced - the shape matrix's non-vacuity check. */
 extern unsigned long g_bc_inline_splices;
+extern unsigned long g_ref_slots_proven_excluded;   /* C3 (TESTS) */

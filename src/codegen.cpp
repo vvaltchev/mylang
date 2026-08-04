@@ -8515,14 +8515,27 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
     out = codegen_chunk(body, fn->desc->frame_size, jit);
 
     /* Param slots join ref_slots unless the param is int/float-COERCED
-     * (bind_param's coerce guarantees those never hold a reference). The
-     * BIND writes refs into param slots, which no chunk op accounts for. */
+     * (bind_param's coerce guarantees those never hold a reference) or
+     * inference-PROVEN i/f (C3: ParamDesc::proven_type - every call
+     * path is compile-checked, see funcdesc.h; the VM_HARDENING
+     * pop_window audit is the net). The BIND writes refs into param
+     * slots, which no chunk op accounts for. */
     std::vector<int32_t> merged;
     const auto &params = fn->desc->params;
-    for (size_t i = 0; i < params.size(); i++)
+    for (size_t i = 0; i < params.size(); i++) {
         if (params[i].decl_type != DeclType::i
-            && params[i].decl_type != DeclType::f)
+            && params[i].decl_type != DeclType::f
+            && params[i].proven_type != DeclType::i
+            && params[i].proven_type != DeclType::f) {
             merged.push_back(static_cast<int32_t>(i));
+        }
+#ifdef TESTS
+        else if (params[i].proven_type == DeclType::i
+                 || params[i].proven_type == DeclType::f) {
+            g_ref_slots_proven_excluded++;   /* C3: the engagement proof */
+        }
+#endif
+    }
     merged.insert(merged.end(), out.ref_slots.begin(), out.ref_slots.end());
     std::sort(merged.begin(), merged.end());
     merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
@@ -8730,6 +8743,9 @@ unsigned long g_bc_inline_caller_frames = 0;
  * shape it believes is spliceable actually was - without it a "all modes
  * agree" table is satisfied by a pass that inlines nothing. */
 unsigned long g_bc_inline_splices = 0;
+unsigned long g_ref_slots_proven_excluded = 0;  /* C3 (TESTS): params the
+                                                 * proven-type stamp kept
+                                                 * out of ref_slots */
 
 bool g_bc_inline_enabled = [] {
     const auto e = env_get("MYLANG_BCINLINE");

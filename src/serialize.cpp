@@ -1582,6 +1582,7 @@ void myv_write(const VmProgram &prog, const std::string &path,
             w.uidv(p.name);
             w.boolv(p.opt); w.boolv(p.cnst); w.boolv(p.dyn_mod);
             w.u8v(static_cast<uint8_t>(p.decl_type));
+            w.u8v(static_cast<uint8_t>(p.proven_type));   /* C3, v11 */
         }
         w.u32v(static_cast<uint32_t>(d->captures.size()));
         for (const auto &cp : d->captures) {
@@ -1814,6 +1815,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             p.name = r.uidv();
             p.opt = r.boolv(); p.cnst = r.boolv(); p.dyn_mod = r.boolv();
             p.decl_type = static_cast<DeclType>(r.u8v());
+            p.proven_type = static_cast<DeclType>(r.u8v());  /* C3, v11 */
             d.params.push_back(p);
         }
         const uint32_t ncp = r.u32v();

@@ -268,11 +268,28 @@ lever 1 removed from the PUSH side. Measured (cumulative with (1)):
 The largest remaining item in the return is the `ref_slots`
 reference-release scan (**50 of the ~112 Ir left**, ~25 per listed slot:
 two DEPENDENT loads - the slot's type pointer, then its tag - which the
-value model makes irreducible). Narrowing the LIST is the lever - an
-inferred-int param sits in it although it can never hold a reference -
-but that trades a memory-lifetime guarantee for inference being airtight,
-where the failure mode is a silently retained reference. Left as a
-separate, discussable step; see plans/cpp-gap-extremes.md.
+value model makes irreducible). Narrowing the LIST was the lever - DONE
+2026-08-04 as **C3 increment 1** (plans/typed-invariant-arrays.md): the
+one-shot inferencer stamps `ParamDesc::proven_type` (i/f) for an
+UN-annotated param that can only ever receive that scalar - a concrete
+non-opt non-dyn param of a non-template, never-value-used
+(sym !value_used, finfo !value_escaped), global-scope function - and
+codegen's param join then excludes it from ref_slots exactly like a
+coerced i/f param. Every call path to such a function is
+compile-checked (direct CallV/CachedCallV only; `$` is not an
+identifier char and specializations()/globals() return NAMES, so an
+instance FuncObject is unreachable as a value outside the excluded
+uses). Metadata only - bind paths ignore it; serialized (myv v11).
+FIXED ALONG THE WAY: value_instantiate_round's redirect never marked
+the CLONE's sym value_used - a value-instantiated instance is
+reachable as `ops[k]`, dyn-launderable, callable with unchecked args,
+and would have been stamped (the pinned ops-array gate asserts ZERO
+exclusions there). THE NET is the existing VM_HARDENING pop_window
+audit (every-slot-trivial after the scan): the force-stamp sabotage
+aborts -rt on the first wrongly-excluded reference. Measured
+(Ir/scale, OPT=1 ASSERTS=0): 10_recursion_deep **-7.1%**, 63 -0.7%;
+11_closure_counter flat (lambdas not covered - a follow-up), 76 flat
+BY DESIGN (value-dispatched = the gate), 08/09/46/01 flat.
 **THE REFERENCE-ARGUMENT BIND (2026-08-01).** M5b's fully-inline push
 had an arg-triviality GATE - "each arg's current value must be TRIVIAL
 (the inline copy is a raw payload copy - a reference needs the helper's
