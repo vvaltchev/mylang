@@ -1236,6 +1236,24 @@ fragment entry). Measured (callgrind Ir/scale, OPT=1 ASSERTS=0):
 04_float_arith **-28.0%**, 54_mandelbrot **-22.5%**, 55_float_sum
 **-19.5%**, 40_math_builtins -2.6%; 44/46/43/01/09/34/35 byte-flat.
 
+**C2b - A SECOND HOISTED BASE PER REGION (2026-08-04).** A region's
+second-best candidate (a dot product's other array - 46's $licm0
+beside b) hoists into a CALLEE-saved pair from r12-r15: leftovers
+after the int picks, else the two weakest pins DISPLACED when
+12 x (region element-ops) beats their whole-run counts (12 = the
+measured per-element nav saving; the initial 8x was INERT on 46 -
+g_jit_hoist2 == 0, the prove-it-ran rule). Callee-saved: helper calls
+preserve the pair (no epilogue re-derive, unlike r10/r11); frag_entry
+pushes it; regions share one pair (disjoint lifetimes). All hoist
+emit arms go through ONE `hoist_match(base, kind)` lookup; the
+preheader is a per-base `nav` lambda; ANY base's failed guard sends
+the whole region cold INCLUDING base1 (the body cannot partially
+deactivate - a documented trade, pinned). Proven by g_jit_hoist2 +
+a wrong-base-nav sabotage (3 cases diverge); the pair-not-saved
+sabotage is NOT harness-provable (gcc keeps nothing in r14/r15
+across jit_enter here) - recorded. Measured: 46_matrix_mult
+**-3.4%**/scale; 14/43/57/18/01/55 byte-flat.
+
 **`MoveV` IS CACHE-AWARE ON ITS SOURCE SIDE (2026-08-01,
 plans/jit-registers.md step 2b).** The register pool went four wide and
 still would not FILL, and the reason was not the ranking: an op whose emit

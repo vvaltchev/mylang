@@ -52,6 +52,7 @@ unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
+unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
@@ -1845,6 +1846,23 @@ struct JitHoist {
                            * may write raw off the pinned registers */
 };
 static JitHoist g_hoist;
+/* C2b: the SECOND hoisted base of a region - its (data, count) pair
+ * lives in CALLEE-saved registers taken from the r12-r15 pool
+ * (leftovers after the int picks, else the two weakest pins displaced
+ * when the trade wins), so unlike r10/r11 a helper call PRESERVES it
+ * and the epilogue re-derives nothing. */
+static JitHoist g_hoist2;
+
+/* The one lookup every hoist-aware emit arm goes through: whichever
+ * active hoist serves (base, kind), or null. */
+static const JitHoist *hoist_match(int base, int kind)
+{
+    if (g_hoist.active && g_hoist.base == base && g_hoist.kind == kind)
+        return &g_hoist;
+    if (g_hoist2.active && g_hoist2.base == base && g_hoist2.kind == kind)
+        return &g_hoist2;
+    return nullptr;
+}
 
 static void emit_call_epilogue(Emitter &e)
 {
@@ -2967,6 +2985,14 @@ struct HoistRegion {
     size_t T, L;
     int base, kind;
     bool has_store;
+    /* C2b: the region's SECOND base (-1 = none) - hoisted into a
+     * callee-saved pair from the r12-r15 pool when the allocation in
+     * jit_compile_chunk grants one (leftovers after the int picks, or
+     * the two weakest pins displaced when the trade wins). uses2 is
+     * the region's element-op count on it - the trade's weight. */
+    int base2 = -1, kind2 = 0;
+    bool has_store2 = false;
+    int uses2 = 0;
 };
 
 static std::vector<HoistRegion>
@@ -3112,11 +3138,27 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
         }
         if (best < 0)
             continue;
-        out.push_back({ T, L, best, best_kind, best_store });
+        /* C2b: the SECOND-best candidate (a dot product's other array,
+         * 46's $licm0 beside b) - same rules, whichever kind it is */
+        int best2 = -1, best2_uses = 0, best2_kind = 0;
+        bool best2_store = false;
+        for (const auto &kv : cands) {
+            if (kv.second.dead || kv.first == best)
+                continue;
+            if (kv.second.uses > best2_uses) {
+                best2 = kv.first;
+                best2_uses = kv.second.uses;
+                best2_kind = kv.second.kind;
+                best2_store = kv.second.store;
+            }
+        }
+        out.push_back({ T, L, best, best_kind, best_store,
+                        best2, best2_kind, best2_store, best2_uses });
         if (dbg) fprintf(stderr,
-                         "hoist[%zu,%zu): PICKED slot %d kind %d%s\n",
+                         "hoist[%zu,%zu): PICKED slot %d kind %d%s%s\n",
                          T, L, best, best_kind,
-                         best_store ? " +store" : "");
+                         best_store ? " +store" : "",
+                         best2 >= 0 ? " (+2nd)" : "");
     }
     std::sort(out.begin(), out.end(),
               [](const HoistRegion &a, const HoistRegion &b) {
@@ -3218,7 +3260,8 @@ static std::vector<int>
 pick_cached_slots(const Chunk &ck, size_t begin,
                   size_t end, int slot_count,
                   std::vector<char> *barrier = nullptr,
-                  std::vector<int> *fhot = nullptr)
+                  std::vector<int> *fhot = nullptr,
+                  std::vector<int> *hot_counts = nullptr)
 {
     const std::vector<Instr> &code = ck.code;
     /* `barrier[pc-begin] = 1` marks an op that touches frame slots the emitter
@@ -3826,8 +3869,11 @@ pick_cached_slots(const Chunk &ck, size_t begin,
                                             : a.second < b.second;
               });
     std::vector<int> out;
-    for (size_t i = 0; i < cand.size() && i < MAX_CACHED; i++)
+    for (size_t i = 0; i < cand.size() && i < MAX_CACHED; i++) {
         out.push_back(cand[i].second);
+        if (hot_counts)
+            hot_counts->push_back(cand[i].first);   /* C2b: the weights */
+    }
 
     /* C2a: the float pool's picks - local, undisqualified, >= 3 uses,
      * and WRITTEN by a float op in the run (see the soundness note at
@@ -4235,15 +4281,16 @@ static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc,
      * hinted bools base). Declines land on the caller's slow tier,
      * which reads MEMORY - never stale. Only emitted when a slow list
      * exists (the bail-mode callers keep the full nav). */
-    if (slows && g_hoist.active && in.target2 == g_hoist.base
-            && g_hoist.kind == (in.elem_bool_hint() ? 3 : 0)) {
+    if (const JitHoist *H = slows
+            ? hoist_match(in.target2, in.elem_bool_hint() ? 3 : 0)
+            : nullptr) {
         load_index_r9(e, in);
-        e.cmp_r9_hr(g_hoist.rcount);
+        e.cmp_r9_hr(H->rcount);
         slows->push_back(e.j32(0x73));           /* jae -> slow */
-        if (g_hoist.kind == 3)
-            e.load_elem_byte_hr(g_hoist.rdata);
+        if (H->kind == 3)
+            e.load_elem_byte_hr(H->rdata);
         else
-            e.load_elem_int_hr(g_hoist.rdata);
+            e.load_elem_int_hr(H->rdata);
         return;                                  /* rax = the element */
     }
     const auto decline = [&](uint8_t pass_short, uint8_t fail_near) {
@@ -4392,10 +4439,8 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
      */
     const int hoist_want = is_float ? 1
                          : in.elem_bool_hint() ? 3 : 0;
-    if (g_hoist.active && g_hoist.store_ok
-            && in.target2 == g_hoist.base
-            && g_hoist.kind == hoist_want
-            && !(compound && hoist_want == 3)) {
+    const JitHoist *H = hoist_match(in.target2, hoist_want);
+    if (H && H->store_ok && !(compound && hoist_want == 3)) {
         if (is_float)
             emit_float_load(e, X0, in.b_is_lit(), in.b_flit(),
                             in.b_slot(), 0, /*no_bail=*/true);
@@ -4409,7 +4454,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             e.patch8(j_nan, e.pos());
         }
         load_index_r9(e, in);
-        e.cmp_r9_hr(g_hoist.rcount);
+        e.cmp_r9_hr(H->rcount);
         slows.push_back(e.j32(0x73));            /* jae -> the helper */
         if (compound && divmod && !in.b_is_lit() && !is_float) {
             /* the int divisor gate (#103 refinement), AFTER the bounds
@@ -4424,7 +4469,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             const size_t j_ok = e.j32(0x77);     /* ja .ok (hot) */
             e.u8(0x48); e.u8(0x85); e.u8(0xFF);  /* test rdi,rdi */
             slows.push_back(e.j32(0x74));        /* 0 -> the helper */
-            e.load_elem_int_hr(g_hoist.rdata);   /* rax = the element */
+            e.load_elem_int_hr(H->rdata);        /* rax = the element */
             e.movabs(RDX, 0x8000000000000000ull);
             e.u8(0x48); e.u8(0x39); e.u8(0xD0);  /* cmp rax,rdx */
             slows.push_back(e.j32(0x74));        /* INT_MIN -> helper */
@@ -4436,11 +4481,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
 #endif
         if (!compound) {
             if (is_float)
-                e.store_elem_float_hr(g_hoist.rdata);
+                e.store_elem_float_hr(H->rdata);
             else if (hoist_want == 3)
-                e.store_elem_byte_hr(g_hoist.rdata); /* 0/1 lit -> dil */
+                e.store_elem_byte_hr(H->rdata);      /* 0/1 lit -> dil */
             else
-                e.store_elem_int_hr(g_hoist.rdata);
+                e.store_elem_int_hr(H->rdata);
         } else {
 #ifdef TESTS
             e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_hoist_rmw));
@@ -4450,7 +4495,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                                                   * tier - it cannot prove
                                                   * THIS arm ran) */
 #endif
-            e.mov_rr(RCX, g_hoist.rdata);        /* the [rcx+r9*8] tails */
+            e.mov_rr(RCX, H->rdata);             /* the [rcx+r9*8] tails */
             if (is_float) {
                 e.load_elem_float_x1();          /* xmm1 = elem */
                 e.farith_x1_x0(aop == Op::plus  ? 0x58
@@ -4771,14 +4816,14 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
      * C1: a HOISTED outer skips the whole navigation - the entry
      * proved array/non-slice/general and pinned (data, BYTE length). */
     size_t j_oslice = SIZE_MAX;
-    const bool hoisted = g_hoist.active && in.target2 == g_hoist.base
-        && g_hoist.kind == 2;
+    const JitHoist *H2 = hoist_match(in.target2, 2);
+    const bool hoisted = H2 != nullptr;
     if (hoisted) {
         load_slot_r9(e, in.a_dual_lo());
         e.imul_r9_imm8(static_cast<uint8_t>(sizeof(LValue)));
-        e.cmp_r9_hr(g_hoist.rcount);           /* vs the BYTE length */
+        e.cmp_r9_hr(H2->rcount);               /* vs the BYTE length */
         slows.push_back(e.j32(0x73));          /* jae: negative OR OOB */
-        e.mov_rr(RCX, g_hoist.rdata);
+        e.mov_rr(RCX, H2->rdata);
         e.add_rcx_r9();                        /* rcx = &row (LValue) */
     } else {
     e.load(RAX, base.type);
@@ -5624,20 +5669,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * state). */
         const int hoist_want = is_float ? 1
                              : in.elem_bool_hint() ? 3 : 0;
-        const bool hoisted = g_hoist.active && in.target2 == g_hoist.base
-            && g_hoist.kind == hoist_want;
+        const JitHoist *H = hoist_match(in.target2, hoist_want);
+        const bool hoisted = H != nullptr;
         if (hoisted) {
             load_index_r9(e, in);
-            e.cmp_r9_hr(g_hoist.rcount);
+            e.cmp_r9_hr(H->rcount);
             j_slows.push_back(e.j32(0x73));      /* jae -> slow */
             if (is_float) {
-                e.load_elem_float_hr(g_hoist.rdata);
+                e.load_elem_float_hr(H->rdata);
                 emit_float_store(e, ck, X0, in.target, pc);
             } else {
                 if (hoist_want == 3)             /* C1c: byte read, 0/1 */
-                    e.load_elem_byte_hr(g_hoist.rdata);
+                    e.load_elem_byte_hr(H->rdata);
                 else
-                    e.load_elem_int_hr(g_hoist.rdata);
+                    e.load_elem_int_hr(H->rdata);
                 dst_write();
             }
             j_dones.push_back(e.j32(0xEB));
@@ -8104,9 +8149,9 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * kind dispatch; the read is bounds-vs-r11 + a read off r10, with
          * the post-step value tier (SLOW A) serving negative/OOB exactly
          * as before. */
-        const bool hoisted = g_hoist.active
-            && in.b_dual_lo() == g_hoist.base
-            && g_hoist.kind == (in.elem_bool_hint() ? 3 : 0);
+        const JitHoist *H =
+            hoist_match(in.b_dual_lo(), in.elem_bool_hint() ? 3 : 0);
+        const bool hoisted = H != nullptr;
         if (!hoisted)
             emit_elem_base_gate(e, in.b_dual_lo(), pc, &gate_slows);
         read_slot(e, RAX, in.target2);
@@ -8117,12 +8162,12 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         const size_t j_fall = e.j32(cc_for(cc_negate(in.aop)).short_op);
         if (hoisted) {
             load_slot_r9(e, in.target2);      /* the stepped counter */
-            e.cmp_r9_hr(g_hoist.rcount);
+            e.cmp_r9_hr(H->rcount);
             read_slows.push_back(e.j32(0x73));
-            if (g_hoist.kind == 3)
-                e.load_elem_byte_hr(g_hoist.rdata);
+            if (H->kind == 3)
+                e.load_elem_byte_hr(H->rdata);
             else
-                e.load_elem_int_hr(g_hoist.rdata);
+                e.load_elem_int_hr(H->rdata);
         } else {
         /* the trusted read: the gate proved kind is ints or bools */
         e.load(RAX, base.payload);            /* rax = shobj */
@@ -9569,14 +9614,58 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * unused there (only the M5b push emitter touches them).
          */
         g_hoist = JitHoist{};
+        g_hoist2 = JitHoist{};
         const std::vector<HoistRegion> hregs =
             jit_hoist_pick(chunk, begin, end, entries);
         std::vector<int> fhot;                    /* C2a float picks */
-        const std::vector<int> hot =
+        std::vector<int> hot_counts;
+        std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
-                              &cache_barrier, &fhot);
+                              &cache_barrier, &fhot, &hot_counts);
+        /*
+         * C2b: allocate a CALLEE-saved pair for the regions' SECOND
+         * bases (every region shares one pair - their lifetimes are
+         * disjoint). Leftover pool registers first; else DISPLACE the
+         * two weakest int pins when the trade wins: a hoisted element
+         * op saves the whole per-element navigation (~12-15 instrs -
+         * type/slice/kind guards + shobj + data/finish + sar + the
+         * memory bounds vs the hoisted 2) where an int pin saves ~1
+         * load per use, so the pair's weight is 12x its element-op
+         * count against the pins' raw WHOLE-RUN use counts - which
+         * overstate the pins' loss (their uses outside the innermost
+         * region run at lower frequency), i.e. the comparison is
+         * conservative in the displacement's favor being denied, not
+         * granted.
+         * With neither, the second bases are DROPPED (the C1 status
+         * quo). Callee-saved on purpose: a helper call preserves the
+         * pair (no epilogue re-derivation, unlike r10/r11) and
+         * frag_entry's existing push machinery covers the save.
+         */
+        int pair_lo = -1, pair_hi = -1;
+        {
+            long u2 = 0;
+            for (const HoistRegion &h : hregs)
+                if (h.base2 >= 0)
+                    u2 += h.uses2;
+            if (u2 > 0) {
+                if (MAX_CACHED - hot.size() >= 2) {
+                    pair_lo = CACHE_REGS[hot.size()];
+                    pair_hi = CACHE_REGS[hot.size() + 1];
+                } else if (hot.size() >= 2
+                           && 12 * u2 > hot_counts[hot.size() - 1]
+                                        + hot_counts[hot.size() - 2]) {
+                    hot.resize(hot.size() - 2);
+                    pair_lo = CACHE_REGS[hot.size()];
+                    pair_hi = CACHE_REGS[hot.size() + 1];
+                }
+            }
+        }
         for (size_t h = 0; h < hot.size(); h++)
             e.saved.push_back(CACHE_REGS[h]);
+        if (pair_lo >= 0) {
+            e.saved.push_back(static_cast<uint8_t>(pair_lo));
+            e.saved.push_back(static_cast<uint8_t>(pair_hi));
+        }
 
         e.frag_entry();               /* push rbx + the cache regs; rbx=rdi */
         e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
@@ -9718,71 +9807,98 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         size_t hri = 0;                       /* the next region to enter */
         for (size_t pc = begin; pc < end && emit_ok; pc++) {
             if (g_hoist.active && hri > 0
-                    && pc == hregs[hri - 1].L + 1)
+                    && pc == hregs[hri - 1].L + 1) {
                 g_hoist.active = false;
+                g_hoist2.active = false;
+            }
             if (hri < hregs.size() && pc == hregs[hri].T) {
-                /* the PREHEADER: guards + (data, count) derivation. Back
-                 * edges target label[T], recorded AFTER these bytes. */
+                /* the PREHEADER: guards + (data, count) derivation, per
+                 * BASE (C2b: a granted second base repeats the sequence
+                 * into its callee-saved pair; ANY base's failed guard
+                 * sends the whole region cold - both jump lists merge).
+                 * Back edges target label[T], recorded AFTER these
+                 * bytes. */
                 const HoistRegion &hr = hregs[hri];
+                const JitLayout &L = jit_layout();
+                std::vector<size_t> &cold = h_cold[hri];
+                const auto nav = [&](int base, int kind, bool has_store,
+                                     uint8_t rdata, uint8_t rcount) {
+                    const SlotAddr hb = slot_addr(base);
+                    e.load(RAX, hb.type);
+                    e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+                    e.cmp_rax_r9();
+                    cold.push_back(e.j32(0x75));
+                    e.cmp_byte_slot(hb.payload + L.slice_off, 0);
+                    cold.push_back(e.j32(0x75));
+                    e.load(RAX, hb.payload);
+                    e.cmp_byte_rax(L.kind_off,
+                                   kind == 0 ? L.kind_ints
+                                 : kind == 1 ? L.kind_floats
+                                 : kind == 3 ? L.kind_bools
+                                             : L.kind_general);
+                    cold.push_back(e.j32(0x75));
+                    if (has_store) {
+                        /* C1b: the STORE guard set, all region-stable
+                         * (nothing in a region can freeze, rebind, or
+                         * create views), and the hash invalidated ONCE -
+                         * setting hash_valid=0 early only means
+                         * "recompute later", so the per-element store
+                         * needs neither the shobj nor a third register. */
+                        e.cmp_byte_slot(hb.type + (L.lv_const_off
+                                                   - L.off_type), 0);
+                        cold.push_back(e.j32(0x75));  /* const slot */
+                        e.cmp_byte_rax(L.ro_off, 0);
+                        cold.push_back(e.j32(0x75));  /* readonly */
+                        e.cmp_byte_rax(L.slices_off, 0);
+                        cold.push_back(e.j32(0x75));  /* live views */
+                        e.mov_byte_rax_imm(L.hashv_off, 0);
+                    }
+                    e.mov_hr_rax(rdata, L.data_off);
+                    e.mov_hr_rax(rcount, L.data_off + 8);
+                    e.sub_hr_hr(rcount, rdata);
+                    if (kind == 0 || kind == 1)
+                        e.sar_hr_3(rcount);   /* 8-byte elements; general
+                                               * (2) and bools (3) count
+                                               * BYTES */
+                };
                 g_hoist.base = hr.base;
                 g_hoist.kind = hr.kind;
                 g_hoist.rdata = 10;
                 g_hoist.rcount = 11;
                 g_hoist.store_ok = hr.has_store;
-                const JitLayout &L = jit_layout();
-                const SlotAddr hb = slot_addr(hr.base);
-                std::vector<size_t> &cold = h_cold[hri];
-                e.load(RAX, hb.type);
-                e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
-                e.cmp_rax_r9();
-                cold.push_back(e.j32(0x75));
-                e.cmp_byte_slot(hb.payload + L.slice_off, 0);
-                cold.push_back(e.j32(0x75));
-                e.load(RAX, hb.payload);
-                e.cmp_byte_rax(L.kind_off,
-                               hr.kind == 0 ? L.kind_ints
-                             : hr.kind == 1 ? L.kind_floats
-                             : hr.kind == 3 ? L.kind_bools
-                                            : L.kind_general);
-                cold.push_back(e.j32(0x75));
-                if (hr.has_store) {
-                    /* C1b: the STORE guard set, all region-stable
-                     * (nothing in a region can freeze, rebind, or
-                     * create views), and the hash invalidated ONCE -
-                     * setting hash_valid=0 early only means "recompute
-                     * later", so the per-element store needs neither
-                     * the shobj nor a third register. */
-                    e.cmp_byte_slot(hb.type + (L.lv_const_off
-                                               - L.off_type), 0);
-                    cold.push_back(e.j32(0x75));  /* const slot */
-                    e.cmp_byte_rax(L.ro_off, 0);
-                    cold.push_back(e.j32(0x75));  /* readonly */
-                    e.cmp_byte_rax(L.slices_off, 0);
-                    cold.push_back(e.j32(0x75));  /* live views */
-                    e.mov_byte_rax_imm(L.hashv_off, 0);
-                }
-                e.mov_hr_rax(g_hoist.rdata, L.data_off);
-                e.mov_hr_rax(g_hoist.rcount, L.data_off + 8);
-                e.sub_hr_hr(g_hoist.rcount, g_hoist.rdata);
-                if (g_hoist.kind == 0 || g_hoist.kind == 1)
-                    e.sar_hr_3(g_hoist.rcount);   /* 8-byte elements;
-                                                   * general (2) and
-                                                   * bools (3) count
-                                                   * BYTES */
+                nav(hr.base, hr.kind, hr.has_store, 10, 11);
 #ifdef TESTS
                 e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_hoist));
                 e.u8(0x48); e.u8(0xFF); e.u8(0x02);
 #endif
-                g_fwd = JitFwd{};                 /* the nav clobbered rax */
                 g_hoist.active = true;
+                if (hr.base2 >= 0 && pair_lo >= 0) {
+                    g_hoist2.base = hr.base2;
+                    g_hoist2.kind = hr.kind2;
+                    g_hoist2.rdata = static_cast<uint8_t>(pair_lo);
+                    g_hoist2.rcount = static_cast<uint8_t>(pair_hi);
+                    g_hoist2.store_ok = hr.has_store2;
+                    nav(hr.base2, hr.kind2, hr.has_store2,
+                        static_cast<uint8_t>(pair_lo),
+                        static_cast<uint8_t>(pair_hi));
+#ifdef TESTS
+                    e.movabs(RDX,
+                             reinterpret_cast<uint64_t>(&g_jit_hoist2));
+                    e.u8(0x48); e.u8(0xFF); e.u8(0x02);
+#endif
+                    g_hoist2.active = true;
+                }
+                g_fwd = JitFwd{};                 /* the nav clobbered rax */
                 hri++;
             }
             label[pc - begin] = e.pos();
             emit_one(pc, /*in_cold=*/false, end);
         }
         g_hoist.active = false;
+        g_hoist2.active = false;
         if (!emit_ok) {
             g_hoist = JitHoist{};
+            g_hoist2 = JitHoist{};
             e.b.clear();
             return;
         }
@@ -9828,10 +9944,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         }
         if (!emit_ok) {
             g_hoist = JitHoist{};
+            g_hoist2 = JitHoist{};
             e.b.clear();
             return;
         }
         g_hoist = JitHoist{};
+        g_hoist2 = JitHoist{};
 
         /* PER-PC ENTRY STUBS (post-call resume): an interior offset cannot
          * be entered raw - fragment code assumes the HEAD's register

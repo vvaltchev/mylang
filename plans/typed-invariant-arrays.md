@@ -248,11 +248,36 @@ MEASURED (callgrind Ir/scale, OPT=1 ASSERTS=0): 04_float_arith
 **-28.0%**, 54_mandelbrot **-22.5%**, 55_float_sum **-19.5%**,
 40_math_builtins -2.6%; 44/46/43/01/09/34/35 byte-flat per scale.
 
-**C2b (the hoisted pointers as pool citizens) remains**: r10/r11 are
-fixed caller-saved today; making the C1-hoisted (data, count) pairs
-allocable would let a 2-base region (a dot product's two arrays) hoist
-both. Needs per-citizen kinds in the pool (a derived pin must not
-flush). A's forwarding machinery still feeds the eventual allocator
+**C2b (a SECOND base per region) LANDED 2026-08-04.** A region's
+second-best candidate hoists into a CALLEE-saved pair from the r12-r15
+pool: leftover registers after the int picks, else the two WEAKEST int
+pins are DISPLACED when the trade wins - the pair's weight is 12x its
+region element-op count (the measured per-element nav saving) against
+the pins' whole-run use counts, a comparison conservative in the
+displacement's favor being DENIED (the pins' counts overstate their
+innermost-frequency value). Callee-saved on purpose: a helper call
+preserves the pair (no epilogue re-derivation, unlike r10/r11) and
+frag_entry's push machinery covers the save; every region shares one
+pair (disjoint lifetimes). All six hoist-aware emit arms go through
+ONE lookup (`hoist_match(base, kind)`), and the preheader factored
+into a per-base `nav` lambda - any base's failed guard sends the WHOLE
+region cold, INCLUDING base1's hoisting (the documented trade: the
+body was emitted with both hoists live and cannot partially
+deactivate; the pinned slice-base2 test counts base1's bump
+preceding base2's failed guard). Execution-proven by `g_jit_hoist2`;
+sabotage: base2's nav derived from base1's storage = value divergence
+in 3 cases; the pair-not-saved sabotage is NOT provable by the
+harness (a register-contract violation bites only if the C++ caller
+keeps r14/r15 live across jit_enter, which gcc's frames here do not)
+- recorded, like C1e's -1 guard. The initial 8x weight was INERT on
+the target (g_jit_hoist2 == 0, the prove-it-ran rule): 46's int pool
+is full and the pins' whole-run counts beat 8x1; the measured-nav 12x
+fires.
+MEASURED (callgrind Ir/scale, OPT=1 ASSERTS=0): 46_matrix_mult
+**-3.4%** (both inner-loop bases hoisted - part of the nav saving is
+given back by the two displaced pins); 14/43/57/18/01/55 byte-flat.
+
+A's forwarding machinery still feeds the eventual allocator
 (a forwarded value is a register-resident value with a one-op
 lifetime - the allocator generalizes the lifetime).
 
