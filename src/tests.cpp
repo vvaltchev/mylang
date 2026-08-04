@@ -19136,6 +19136,129 @@ static bool jit_fwd_deadtemp()
  * fall to the cold twin (a runtime slice) or must not hoist at all (a
  * mid-loop base rebind, a store in the loop) counts ZERO.
  */
+/*
+ * C2a - THE FLOAT REGISTER CACHE (xmm4-7). Execution-proven by
+ * g_jit_fcache (bumped per ENTRY of a float-pinned fragment by emitted
+ * code - the g_jit_hoist pattern); value parity with the tree-walker is
+ * the corruption oracle. The shapes each pin a distinct hazard:
+ * the plain accumulator (the pool's bread and butter), the
+ * multi-accumulator (mandelbrot's zr/zi/t - fills the pool), the
+ * libm-call loop (xmm are CALLER-saved: the spill/reload around every
+ * helper call is what keeps the pin alive across sin()), and the
+ * RUN-SPLIT shape (floor/abs are jit-ineligible selectors, so the body
+ * splits into several fragments - the stale-fcache bug this feature
+ * shipped with: fragment 2 flushed fragment 1's never-loaded xmm pin
+ * into the slot; sabotage = drop the per-run fcache.clear()).
+ */
+static bool jit_fcache_c2()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto go = [&](const std::vector<const char *> &src, bool vm,
+                  unsigned long *fc) -> std::string {
+        const unsigned long c0 = g_jit_fcache;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (fc) *fc = g_jit_fcache - c0;
+        return cap.str();
+    };
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        long fc_min;        /* >=1: a float-pinned fragment must ENTER */
+    };
+    const std::vector<Case> cases = {
+      { "a float accumulator loop pins (the 55_float_sum shape)",
+        { "func f(n) {",
+          "    var s = 0.0; var z = 0.5;",
+          "    for (var k = 0; k < n; k++) {",
+          "        s = s + z * 1.5; z = z * 1.01; }",
+          "    return s; }",
+          "print(f(int(runtime(200))));" }, 1 },
+
+      { "multiple float accumulators pin (the mandelbrot shape)",
+        { "func f(n) {",
+          "    var zr = 0.0; var zi = 0.0; var cr = 0.3; var ci = 0.2;",
+          "    var k = 0;",
+          "    while (k < n) {",
+          "        var t = zr * zr - zi * zi + cr;",
+          "        zi = 2.0 * zr * zi + ci;",
+          "        zr = t; k++; }",
+          "    return zr + zi; }",
+          "print(f(int(runtime(100))));" }, 1 },
+
+      /* xmm are CALLER-saved: sin()'s libm call clobbers the pins;
+       * the shared prologue/epilogue spill-reload is what keeps s
+       * correct (sabotage: drop either half - this diverges) */
+      { "a libm call in the loop keeps the pinned accumulator (spill)",
+        { "func f(n) {",
+          "    var s = 0.0; var x = 0.1;",
+          "    for (var k = 0; k < n; k++) {",
+          "        s = s + sin(x) + s * 0.001; x = x + 0.05; }",
+          "    return s; }",
+          "print(f(int(runtime(150))));" }, 1 },
+
+      /* floor/abs are jit-INELIGIBLE selectors -> the body splits into
+       * several fragments; each run's pick is its OWN (the stale-fcache
+       * bug: without the per-run clear, fragment 2 flushed fragment 1's
+       * never-loaded pin into the slot - a wrong sum from iteration 3) */
+      { "a run-split body keeps per-run pins (the stale-fcache pin)",
+        { "var s = 0.0;",
+          "for (var i = 0; i < 5; i++) {",
+          "    var x = float(i);",
+          "    s += sqrt(x) + pow(x, 2.0) + floor(x) + abs(1.5 - x);",
+          "}",
+          "print(s);" }, 0 },
+
+      /* int + float pins together in one fragment (the pools are
+       * disjoint by construction; both flushes run at every exit) */
+      { "int and float pins coexist in one fragment",
+        { "func f(n) {",
+          "    var s = 0.0; var c = 0; var z = 1.5;",
+          "    for (var k = 0; k < n; k++) {",
+          "        s = s + z; c = c + k; z = z * 1.001; }",
+          "    return s + float(c); }",
+          "print(f(int(runtime(120))));" }, 1 },
+    };
+    bool ok = true;
+    for (const Case &c : cases) {
+        unsigned long fc = 0;
+        const std::string got = go(c.src, true, &fc);
+        const std::string ref = go(c.src, false, nullptr);
+        if (got != ref || ref.empty()) {
+            cout << "  fcache [" << c.name << "]: tw=[" << ref
+                 << "] vm=[" << got << "]\n";
+            ok = false;
+        }
+        if (c.fc_min >= 1 && fc == 0) {
+            cout << "  fcache [" << c.name << "]: no float-pinned "
+                    "fragment ever entered\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_hoist_c1()
 {
 #if ML_JIT_SUPPORTED
@@ -24052,6 +24175,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: C1 per-loop navigation HOISTING (entry nav + cold twin + "
       "refusals)",
       jit_hoist_c1 },
+    { "jit: C2a - the FLOAT register cache (xmm4-7): pins, spills, "
+      "run-splits",
+      jit_fcache_c2 },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",
