@@ -63,6 +63,7 @@ unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
 unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
+unsigned long g_jit_ret_inline = 0;    /* C4c: inline-pop returns run */
 }
 #endif
 
@@ -286,6 +287,11 @@ struct JitLayout {
     const void *addr_ctx; /* &g_current_ctx */
     int ctx_captures;     /* EvalContext::captures (a vector<LValue>*) */
     int ctx_gfuncs;       /* EvalContext::gfuncs (a GlobalFuncTable*) */
+    /* C4c: the inline BOUNDARY return (flow->value = res; flow->type = ret) */
+    int ctx_flow;         /* EvalContext::flow (a FlowState*) */
+    int fs_type;          /* FlowState::type (a byte enum) */
+    int fs_value;         /* FlowState::value (an EvalValue) */
+    int fs_ret;           /* FlowState::ret (the enum value) */
     int gft_slots;        /* GlobalFuncTable::slots (vector; data at +0) */
     int gft_defined;      /* GlobalFuncTable::defined (vector<char>) */
     /* Step 7a (inline exception ops): the activation-side layout */
@@ -392,6 +398,18 @@ static const JitLayout &jit_layout()
         l.addr_ctx = jit_addr_current_ctx();
         l.ctx_captures = static_cast<int>(jit_off_ctx_captures());
         l.ctx_gfuncs = static_cast<int>(jit_off_ctx_gfuncs());
+        /* C4c: the boundary return's flow layout */
+        l.ctx_flow = static_cast<int>(jit_off_ctx_flow());
+        {
+            FlowState fs;
+            l.fs_type = static_cast<int>(
+                reinterpret_cast<const char *>(&fs.type)
+                - reinterpret_cast<const char *>(&fs));
+            l.fs_value = static_cast<int>(
+                reinterpret_cast<const char *>(&fs.value)
+                - reinterpret_cast<const char *>(&fs));
+            l.fs_ret = static_cast<int>(FlowState::ret);
+        }
         l.gft_slots = static_cast<int>(jit_off_gft_slots());
         l.gft_defined = static_cast<int>(jit_off_gft_defined());
         l.addr_act = jit_addr_vm_act();
@@ -2684,6 +2702,332 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     for (const size_t j : j_dones)
         e.patch32_here(j);                /* the cached probe's HIT path */
     emit_call_epilogue(e);
+}
+
+/*
+ * C4c (plans/typed-invariant-arrays.md): the INLINE frame pop - the
+ * return-side twin of the M5b inline push above. jit_ret's common shape
+ * costs a C++ round trip per return (prologue, globals, steal, pop_window,
+ * dst put - the #1/#2 SELF cost of every call-heavy bench, ~35% of
+ * 10_recursion_deep); this emits that shape at the ReturnV/Halt site and
+ * keeps jit_ret as the SLOW TIER every guard declines to.
+ *
+ * EMIT-TIME gate (both are properties of the returning chunk itself):
+ * plain_frame (no trys/iterators -> pop_window's watermark trims provably
+ * do nothing) and a SHORT ref_slots list (<= RET_REF_GUARD_MAX). The list
+ * is NOT required empty - a recursion body's call dsts (`var t = f(..)`)
+ * are always ref-listed, so an empty-list gate would exclude exactly the
+ * motivating shape (measured: g_jit_ret_inline stayed 0 on the recursion
+ * test's first run). Instead each listed slot gets a GUARD mirroring the
+ * release scan's own check: current type < t_str -> nothing to release;
+ * a live reference declines to jit_ret, whose scan releases it properly.
+ * Outside the gate the old call-jit_ret shape is emitted unchanged.
+ *
+ * RUNTIME guards, all BEFORE any mutation (a decline re-runs jit_ret from
+ * scratch, byte-identically): every ref-listed slot trivial (above),
+ * non-boundary (the flow protocol is C++), no rec.cache_key (a
+ * CachedCallV miss stores into the caller's cache - a map emplace), no
+ * rec.caller_cache and no live vframe.pure_cache (the per-frame stash
+ * restore), and - when dst >= 0 - the parent dst slot's CURRENT value is
+ * trivial (overwriting a reference needs a C++ release; the parent's
+ * chunk is unknown at OUR emit time, so this one is runtime).
+ *
+ * Then the pop itself, mirroring pop_window's fast path + the leave body:
+ * result copy (payload + type; the dst LValue's container fields are its
+ * own, exactly like put()), resume globals (a native caller ignores them,
+ * an EnterNative consumer reads them - the callee cannot know which),
+ * captures restore, segment-top/used/rec_n/top_rec/view-frame/cur_seg.
+ * The parent record is top_rec - rec_size (the records vector is
+ * contiguous and never reallocates during a pop).
+ *
+ * res_slot == -1 means Halt: the result is the none singleton (payload
+ * zeroed), and the slow tier is jit_halt.
+ *
+ * A VM_HARDENING build emits a jit_ret_audit call first: the inline path
+ * skips pop_window's ML_VM_CHECK net - including the C3 every-slot-trivial
+ * re-scan - and the audit keeps that net alive on the SAME emitted path
+ * the release runs (never a hardened-only code shape).
+ */
+static constexpr size_t RET_REF_GUARD_MAX = 6;
+
+static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
+{
+    e.flush_cache();
+
+    std::vector<size_t> j_slow;
+    if (ck.plain_frame && ck.ref_slots.size() <= RET_REF_GUARD_MAX) {
+        const JitLayout &L = jit_layout();
+        const JitPushLayout &P = jit_push_layout();
+        const uint8_t R8R = 8, R9R = 9, R10 = 10, R11 = 11;
+        const auto modrm = [&](uint8_t op, uint8_t reg, uint8_t base,
+                               int32_t d, bool w) {
+            uint8_t rex = static_cast<uint8_t>(
+                (w ? 0x48 : 0x40) | (reg >= 8 ? 4 : 0) | (base >= 8 ? 1 : 0));
+            if (rex != 0x40)
+                e.u8(rex);
+            e.u8(op);
+            e.u8(static_cast<uint8_t>(0x80 | ((reg & 7) << 3) | (base & 7)));
+            e.u32(static_cast<uint32_t>(d));
+        };
+        const auto ld = [&](uint8_t r, uint8_t b, int32_t d) {
+            modrm(0x8B, r, b, d, true);            /* mov r, [b+d] */
+        };
+        const auto st = [&](uint8_t b, int32_t d, uint8_t r) {
+            modrm(0x89, r, b, d, true);            /* mov [b+d], r */
+        };
+        const auto ld32 = [&](uint8_t r, uint8_t b, int32_t d) {
+            modrm(0x8B, r, b, d, false);           /* mov r32, [b+d] */
+        };
+        const auto st32 = [&](uint8_t b, int32_t d, uint8_t r) {
+            modrm(0x89, r, b, d, false);           /* mov [b+d], r32 */
+        };
+        const auto cmp_b_imm8 = [&](uint8_t b, int32_t d, uint8_t imm) {
+            if (b >= 8) e.u8(0x41);
+            e.u8(0x80);                            /* cmp byte [b+d], imm8 */
+            e.u8(static_cast<uint8_t>(0xB8 | (b & 7)));
+            e.u32(static_cast<uint32_t>(d));
+            e.u8(imm);
+        };
+        const auto cmp_q_imm8 = [&](uint8_t b, int32_t d, int8_t imm) {
+            e.u8(static_cast<uint8_t>(0x48 | (b >= 8 ? 1 : 0)));
+            e.u8(0x83);                            /* cmp qword [b+d], imm8 */
+            e.u8(static_cast<uint8_t>(0xB8 | (b & 7)));
+            e.u32(static_cast<uint32_t>(d));
+            e.u8(static_cast<uint8_t>(imm));
+        };
+        const auto cmp_d_imm8 = [&](uint8_t b, int32_t d, int8_t imm) {
+            if (b >= 8) e.u8(0x41);
+            e.u8(0x83);                            /* cmp dword [b+d], imm8 */
+            e.u8(static_cast<uint8_t>(0xB8 | (b & 7)));
+            e.u32(static_cast<uint32_t>(d));
+            e.u8(static_cast<uint8_t>(imm));
+        };
+
+#if ML_VM_HARDENING
+        /* the audit call: rsp is call-ready at a terminator (frag_entry's
+         * discipline), nothing live yet, callee-saved regs preserved */
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_ret_audit) });
+        e.u8(0xE8); e.u32(0);
+#endif
+        /* r8 = act, r10 = top_rec (OUR record) */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
+        ld(R8R, RAX, 0);
+        ld(R10, R8R, static_cast<int32_t>(L.act_top_rec));
+        /* the record guards FIRST - guard order is decline-frequency, not
+         * per-guard cost: the common decliners are a BOUNDARY record (a
+         * VmInvoker callback - every comparator/map return) and a CACHED
+         * record (every fib-class return), and putting them first spares
+         * those shapes the ref-slot guard walk (34/35 measured +2.4-3.1%
+         * with the ref guards first; the fast path pays the same total
+         * either way). */
+        cmp_b_imm8(R10, static_cast<int32_t>(P.rec_boundary), 0);
+        const size_t j_bnd = e.j32(0x75);          /* jne boundary arm */
+        cmp_q_imm8(R10, static_cast<int32_t>(P.rec_cache_key), 0);
+        j_slow.push_back(e.j32(0x75));             /* jne slow */
+        cmp_q_imm8(R10, static_cast<int32_t>(P.rec_caller_cache), 0);
+        j_slow.push_back(e.j32(0x75));             /* jne slow */
+        cmp_q_imm8(R8R,
+                   static_cast<int32_t>(P.act_vframe + P.frame_pure_cache),
+                   0);
+        j_slow.push_back(e.j32(0x75));             /* jne slow */
+        /* the RESULT guard: if res_slot is ref-listed, its current value
+         * must be trivial - a reference result cannot be raw-moved (the
+         * slices set would keep pointing at the dying slot: the
+         * jit_bind_ref_arg lesson), so it declines to jit_ret's proper
+         * steal. Every OTHER ref-listed slot is handled by the release
+         * arm below (a mutation, not a guard), and unlisted slots are
+         * trivial by the ref_slots invariant - so the result copy is a
+         * raw move once this guard passes. */
+        const bool res_listed =
+            res_slot >= 0
+            && std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                                  static_cast<int32_t>(res_slot));
+        if (res_listed) {
+            ld(RAX, RBX, static_cast<int32_t>(
+                             res_slot
+                             * static_cast<int32_t>(sizeof(LValue)))
+                         + static_cast<int32_t>(L.off_type));
+            cmp_d_imm8(RAX, L.type_t_off, static_cast<int8_t>(L.t_str_val));
+            j_slow.push_back(e.j32(0x7D));         /* jge slow: a reference */
+        }
+        /* dst < 0 (a discarded call statement) -> no guard, no write */
+        ld(RDX, R10, static_cast<int32_t>(P.rec_dst));
+        e.u8(0x48); e.u8(0x85); e.u8(0xD2);        /* test rdx, rdx */
+        const size_t j_nowrite = e.j32(0x78);      /* js no_write */
+        /* rcx = &parent_win[dst]; parent rec = top_rec - rec_size */
+        e.u8(0x48); e.u8(0x69); e.u8(0xC2);        /* imul rax, rdx, 48 */
+        e.u32(static_cast<uint32_t>(sizeof(LValue)));
+        ld(RCX, R10, static_cast<int32_t>(P.rec_window) - L.rec_size);
+        e.u8(0x48); e.u8(0x01); e.u8(0xC1);        /* add rcx, rax */
+        /* the old dst value must be TRIVIAL (else: C++ release -> slow) */
+        ld(RAX, RCX, static_cast<int32_t>(L.off_type));
+        cmp_d_imm8(RAX, L.type_t_off, static_cast<int8_t>(L.t_str_val));
+        j_slow.push_back(e.j32(0x7D));             /* jge slow */
+        if (res_slot >= 0) {
+            /* raw 32-byte value copy (payload + type; ref_slots empty ->
+             * provably trivial, same as the push's scalar arg copy) */
+            const int32_t s = static_cast<int32_t>(
+                static_cast<long>(res_slot)
+                * static_cast<long>(sizeof(LValue)));
+            for (int32_t o = 0; o <= 24; o += 8) {
+                ld(R11, RBX, s + o);
+                st(RCX, o, R11);
+            }
+        } else {
+            /* Halt: the result is none - the none singleton's type, a
+             * zeroed payload */
+            e.movabs(RAX, reinterpret_cast<uint64_t>(L.t_none));
+            st(RCX, static_cast<int32_t>(L.off_type), RAX);
+            e.u8(0x31); e.u8(0xC0);                /* xor eax, eax */
+            for (int32_t o = 0; o < 24; o += 8)
+                st(RCX, o, RAX);
+        }
+        e.patch32_here(j_nowrite);                 /* no_write: */
+        /* the release scan, inline: each ref-listed slot holding a
+         * reference gets the C++ per-slot release (jit_release_slot -
+         * pop_window's exact scan body; an assignment, so slice
+         * unregistration is right by construction). A MUTATION, so it
+         * sits after every guard; r8/r10 are caller-saved, pushed around
+         * the call (two pushes keep the site 16-aligned). This is what
+         * serves a frame with live references - 76's array params -
+         * inline instead of declining the whole pop. */
+        for (const int32_t s : ck.ref_slots) {
+            if (res_listed && s == res_slot)
+                continue;              /* the res guard proved it trivial
+                                        * (a reference result - discarded
+                                        * or not - declined there) */
+            const int32_t d = static_cast<int32_t>(
+                s * static_cast<int32_t>(sizeof(LValue)));
+            ld(RAX, RBX, d + static_cast<int32_t>(L.off_type));
+            cmp_d_imm8(RAX, L.type_t_off, static_cast<int8_t>(L.t_str_val));
+            const size_t j_triv = e.j32(0x7C);     /* jl skip (trivial) */
+            e.push_reg(R8R);
+            e.push_reg(R10);
+            e.lea_rdi(d);                          /* rdi = &slot */
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_release_slot) });
+            e.u8(0xE8); e.u32(0);
+            e.pop_reg(R10);
+            e.pop_reg(R8R);
+            e.patch32_here(j_triv);                /* skip: */
+        }
+        /* resume globals (consumed by EnterNative; ignored by a native
+         * caller - the callee cannot know which entered it) */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_chunk()));
+        ld(RDX, R10, static_cast<int32_t>(P.rec_ret_chunk));
+        st(RAX, 0, RDX);
+        e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
+        ld(RDX, R10, static_cast<int32_t>(P.rec_ret_pc));
+        st(RAX, 0, RDX);
+        /* ctx.captures = rec.caller_captures */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
+        ld(R9R, RAX, 0);
+        ld(RDX, R10, static_cast<int32_t>(P.rec_caller_caps));
+        st(R9R, static_cast<int32_t>(L.ctx_captures), RDX);
+        /* segs[rec.seg]->top = rec.seg_top_before */
+        modrm(0x63, RAX, R10, static_cast<int32_t>(P.rec_seg), true);
+                                                   /* movsxd rax, [seg] */
+        ld(RCX, R8R, static_cast<int32_t>(P.act_segs));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x0C); e.u8(0xC1);
+                                                   /* mov rcx, [rcx+rax*8] */
+        ld(RDX, R10, static_cast<int32_t>(P.rec_seg_top_before));
+        st(RCX, static_cast<int32_t>(P.seg_top), RDX);
+        /* used -= nslots; rec_n-- */
+        ld(RDX, R10, static_cast<int32_t>(P.rec_nslots));
+        modrm(0x29, RDX, R8R, static_cast<int32_t>(P.act_used), true);
+                                                   /* sub [act+used], rdx */
+        e.u8(0x49); e.u8(0xFF); e.u8(0x88);        /* dec qword [r8+rec_n] */
+        e.u32(static_cast<uint32_t>(L.act_rec_n));
+        /* r11 = the parent record; top_rec/view/cur_seg from it */
+        modrm(0x8D, R11, R10, -L.rec_size, true);  /* lea r11,[r10-RECSZ] */
+        st(R8R, static_cast<int32_t>(P.act_top_rec), R11);
+        ld(RAX, R11, static_cast<int32_t>(P.rec_window));
+        st(R8R, static_cast<int32_t>(P.act_vframe + P.frame_slots), RAX);
+        ld32(RAX, R11, static_cast<int32_t>(P.rec_nslots));
+        st32(R8R, static_cast<int32_t>(P.act_vframe + P.frame_size), RAX);
+        ld32(RAX, R11, static_cast<int32_t>(P.rec_seg));
+        st32(R8R, static_cast<int32_t>(P.act_cur_seg), RAX);
+#ifdef TESTS
+        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_ret_inline));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x00);        /* inc qword [rax] */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_native_returns));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x00);        /* inc qword [rax] */
+#endif
+        /* rax = JIT_RET_SENTINEL ((size_t)-1); return to the caller */
+        e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
+        e.u32(0xFFFFFFFFu);                        /* mov rax, -1 */
+        e.frag_ret();
+
+        /* ---- the BOUNDARY arm (C4c): a VmInvoker/do_func_call callee.
+         * jit_ret's boundary path is two stores (flow->value = res,
+         * flow->type = ret) and the sentinel - the C++ OWNER pops the
+         * window, so there is no pop here. Halt's boundary contract is a
+         * BARE sentinel (flow untouched - a fall-through body's flow is
+         * none). The comparator/map callback benches decline here
+         * per ELEMENT, so serving it inline is what keeps them from
+         * paying a dead guard walk + the helper round trip. */
+        e.patch32_here(j_bnd);
+        if (res_slot >= 0) {
+            const int32_t s = static_cast<int32_t>(
+                static_cast<long>(res_slot)
+                * static_cast<long>(sizeof(LValue)));
+            if (std::binary_search(ck.ref_slots.begin(),
+                                   ck.ref_slots.end(),
+                                   static_cast<int32_t>(res_slot))) {
+                /* the result itself may hold a reference - a raw copy
+                 * would leave the slices set pointing at the dying slot
+                 * (the jit_bind_ref_arg lesson): decline to the C++
+                 * steal/move. */
+                ld(RAX, RBX, s + static_cast<int32_t>(L.off_type));
+                cmp_d_imm8(RAX, L.type_t_off,
+                           static_cast<int8_t>(L.t_str_val));
+                j_slow.push_back(e.j32(0x7D));     /* jge slow */
+            }
+            e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
+            ld(R9R, RAX, 0);                       /* r9 = ctx */
+            ld(RCX, R9R, L.ctx_flow);              /* rcx = flow */
+            /* flow->value's OLD value must be trivial (else: release) */
+            ld(RAX, RCX, L.fs_value
+                         + static_cast<int32_t>(EvalValue::jit_type_off()));
+            cmp_d_imm8(RAX, L.type_t_off, static_cast<int8_t>(L.t_str_val));
+            j_slow.push_back(e.j32(0x7D));         /* jge slow */
+            for (int32_t o = 0; o <= 24; o += 8) {
+                ld(R11, RBX, s + o);
+                st(RCX, L.fs_value + o, R11);
+            }
+            /* flow->type = FlowState::ret */
+            e.u8(0xC6);                            /* mov byte [rcx+d], imm8 */
+            e.u8(0x81);
+            e.u32(static_cast<uint32_t>(L.fs_type));
+            e.u8(static_cast<uint8_t>(L.fs_ret));
+        }
+#ifdef TESTS
+        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_ret_inline));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x00);        /* inc qword [rax] */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_native_returns));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x00);        /* inc qword [rax] */
+#endif
+        e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
+        e.u32(0xFFFFFFFEu);                        /* mov rax, -2 */
+        e.frag_ret();
+    }
+
+    /* slow (and the whole op outside the emit-time gate): the C++ tier */
+    for (const size_t j : j_slow)
+        e.patch32_here(j);
+    if (res_slot >= 0) {
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(res_slot)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_ret) });
+    } else {
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_halt) });
+    }
+    e.u8(0xE8); e.u32(0);                          /* call jit_ret/jit_halt */
+    e.frag_ret();                                  /* ret (rax = sentinel) */
 }
 
 /* Emit a call to the INT put helper: rdi = &frame->slots[slot], rsi = the
@@ -7957,33 +8301,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::ReturnV:
-        /* #55: flush the cache (jit_ret reads the result slot from MEMORY),
-         * then call jit_ret(res_slot) and RET its resume sentinel. rdi is
-         * free scratch, so it just carries the arg; jit_ret uses
-         * g_current_ctx->frame, not the base. No 16-alignment adjustment:
-         * frag_entry's push already left rsp % 16 == 0, which is exactly
-         * what the call needs. No prologue/epilogue: we ret, so only the
-         * caller's rbx needs restoring - frag_ret does that. */
-        e.flush_cache();
-        e.movabs(RDI, static_cast<uint64_t>(
-                          static_cast<int_type>(in.a_slot())));
-        e.call_relocs.push_back(
-            { e.pos(), reinterpret_cast<const void *>(jit_ret) });
-        e.u8(0xE8); e.u32(0);                             /* call jit_ret */
-        e.frag_ret();                              /* ret (rax = sentinel) */
+        /* #55 + C4c: the return - the INLINE frame pop for the common shape
+         * (emit_ret_native; guards decline to jit_ret). rsp is call-ready
+         * here: frag_entry's discipline leaves the body at rsp % 16 == 0. */
+        emit_ret_native(e, ck, static_cast<int>(in.a_slot()));
         return true;
 
     case OpCode::Halt:
-        /* model-flip (nativize-ops): the native `return none`. flush_cache so a
-         * later-bail path (there is none past a terminator, but stay uniform
-         * with ReturnV) has memory consistent, then call jit_halt() (no arg -
-         * the result is none) and RET its resume sentinel. Same stack
-         * discipline as ReturnV: already call-aligned, frag_ret restores. */
-        e.flush_cache();
-        e.call_relocs.push_back(
-            { e.pos(), reinterpret_cast<const void *>(jit_halt) });
-        e.u8(0xE8); e.u32(0);                             /* call jit_halt */
-        e.frag_ret();                              /* ret (rax = sentinel) */
+        /* model-flip (nativize-ops) + C4c: the native `return none` - the
+         * same inline pop with the result hard-wired to none (res_slot -1;
+         * the slow tier is jit_halt). */
+        emit_ret_native(e, ck, -1);
         return true;
 
     case OpCode::CachedCallV:

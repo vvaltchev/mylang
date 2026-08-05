@@ -163,6 +163,7 @@ ptrdiff_t jit_off_exc_loc_end();
 ptrdiff_t jit_off_exc_inline_frame();
 ptrdiff_t jit_off_ctx_captures();       /* EvalContext::captures */
 ptrdiff_t jit_off_ctx_gfuncs();         /* EvalContext::gfuncs */
+ptrdiff_t jit_off_ctx_flow();           /* EvalContext::flow (C4c) */
 ptrdiff_t jit_off_gft_slots();          /* GlobalFuncTable::slots */
 ptrdiff_t jit_off_gft_defined();        /* GlobalFuncTable::defined */
 
@@ -817,6 +818,10 @@ extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
 extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
 extern "C" unsigned long g_jit_sync_inline;
 extern "C" unsigned long g_jit_entry_resume;
+/* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
+ * bumped by the emitted code itself, so it proves the inline tier ran (the
+ * jit_ret helper's own counter also counts declines and cannot). */
+extern "C" unsigned long g_jit_ret_inline;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
@@ -836,6 +841,24 @@ extern "C" unsigned long g_jit_entry_resume;
  * baked as a call target by the emitter. noexcept: a fully-native leaf body is
  * throw-free, so the pop/leave here cannot throw. */
 extern "C" size_t jit_ret(int_type res_slot) noexcept;
+
+/* C4c: the address of the TU-local g_vm_resume_chunk (the pc twin is
+ * jit_addr_resume_pc above) - the emitted inline pop stores both resume
+ * globals directly instead of calling jit_ret. */
+void *jit_addr_resume_chunk();
+
+/* C4c: the per-slot release the emitted inline pop's cold arm calls for a
+ * ref-listed slot holding a live reference - pop_window's exact per-slot
+ * scan body (an LValue assignment, so slice unregistration is correct by
+ * construction). */
+extern "C" void jit_release_slot(LValue *lv) noexcept;
+
+/* C4c: the VM_HARDENING audit the emitted inline pop calls before its
+ * guards - re-runs the every-slot-trivial + plain-frame watermark checks
+ * pop_window's C++ path would have run (the C3 net stays alive on the
+ * hardened lanes while they exercise the same emitted path a release
+ * runs). A no-op body outside ML_VM_HARDENING builds. */
+extern "C" void jit_ret_audit() noexcept;
 
 /* model-flip (nativize-ops): the native Halt - a fall-through body's implicit
  * `return none`. Like jit_ret but the result is hard-wired to none (no slot).

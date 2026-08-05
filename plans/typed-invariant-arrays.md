@@ -394,12 +394,46 @@ registers. The route, in increasing depth:
   2. **C4b: expression-DAG registerization** - compile a float
      expression TREE into an xmm DAG with one store at the root (the
      actual N7 shape for floats; subsumes 1 when it lands);
-  3. **C4c: the return protocol** (10's ~35% jit_ret round trip - a
-     direct fragment-to-fragment continuation, the plans/model-flip
-     deferred piece);
+  3. **C4c: the return protocol** (10's ~35% jit_ret round trip) -
+     LANDED 2026-08-04, see below;
   4. **C4d: struct dst tags** (64's two-stores - the C3-elision idea
      applied to the ctor plans' dsts).
 Each is its own measured increment; 2 and 3 are the big ones.
+
+**C4c LANDED (2026-08-04): the INLINE frame pop** - the return-side
+twin of M5b's inline push (emit_ret_native, jit.cpp; jit_ret is the
+slow tier every guard declines to, before any mutation). Three
+measurement-driven course corrections, each its own lesson:
+  1. the emit gate started as `ref_slots.empty()` and the counter read
+     ZERO on the recursion test - a recursion body's call dsts are
+     always ref-listed, so the empty gate excluded the motivating
+     shape (prove-the-code-ran, again). The gate became "short list +
+     a per-slot triviality guard" (the scan's own check as a decline);
+  2. guards-first-by-cheapness was WRONG: the callback benches
+     (34/35, boundary declines per element) read +2.4-3.1% paying the
+     ref-guard walk before the boundary decline. Order is
+     DECLINE-FREQUENCY - and better, the boundary case became its own
+     inline ARM (flow->value copy + flow->type = ret, no pop - the
+     C++ owner pops), flipping 34/35 from +1.4-1.5% to -15.6/-17.1%;
+  3. the ref-slot GUARDS then became the release ARM (a cold
+     jit_release_slot call per live reference - pop_window's exact
+     per-slot assignment), flipping 76 from +1.5% to -7.9%: a frame
+     holding live references now pops inline too. A reference RESULT
+     still declines (a raw move would leave the slices set pointing
+     at the dying slot - the jit_bind_ref_arg lesson).
+Sabotage record: dst guard = LSan leak, ref handling = ASan UAF,
+boundary guard + seg-top restore = aborts, ALL watched failing;
+UNPROVABLE in isolation (kept as defense in depth): the cache_key
+guard (subsumed - cache_key implies a stashed caller_cache today), the
+release call (a skip only delays the release to slot-reuse/teardown),
+the boundary flow-old guard (every consumer moves flow->value out).
+MEASURED (Ir/scale, OPT=1 ASSERTS=0): 10_recursion_deep **-27.8%**,
+11 **-18.6%**, 35 **-17.1%**, 34 **-15.6%**, 63 **-8.2%**,
+76 **-7.9%**; 09_fib +0.18% (cached returns decline by design);
+08/01/46 byte-flat. The remaining return-path residue is the sync call
+SITE's sentinel round trip (call rdx -> ret -> cmp rax) and the
+depth/nstack bookkeeping - a direct fragment-to-fragment continuation
+(the model-flip deferred piece) would be the next, deeper cut.
 
 The endgame: a proven-int local IS a machine word (no 48-byte LValue
 round trip), a proven-flat-array base IS a (pointer, count) pair kept

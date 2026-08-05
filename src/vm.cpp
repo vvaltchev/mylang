@@ -13,6 +13,7 @@
 #include "env.h"    /* env_get - the MYLANG_VM_STACK cap */
 
 #include <memory>
+#include <algorithm> /* binary_search (the C4c ref_slots audit) */
 #include <cstdlib>   /* atoll */
 #include <cmath>
 #include <unordered_map>
@@ -5281,6 +5282,58 @@ void *jit_addr_resume_pc()
     return &g_vm_resume_pc;
 }
 
+/* C4c: the resume CHUNK's address too - the emitted inline pop (the fast
+ * jit_ret shape, emit_ret_native) stores both resume globals directly. */
+void *jit_addr_resume_chunk()
+{
+    return &g_vm_resume_chunk;
+}
+
+/*
+ * C4c: the hardened-build AUDIT for the emitted inline pop. The inline path
+ * necessarily skips pop_window's ML_VM_CHECK net - including the C3
+ * every-slot-trivial re-scan that is the LOAD-BEARING net for the proven-type
+ * ref_slots exclusions - so a VM_HARDENING build's emit adds a call to this
+ * right before the inline guards run. That keeps BOTH properties: the
+ * hardened lanes exercise the same emitted path a release runs (never "the
+ * configuration nobody runs"), and the audit stays alive exactly where the
+ * frames now pop. Runs on the still-live top record, before any mutation.
+ */
+/* C4c: release one frame slot's reference - the per-slot body of
+ * pop_window's release scan (the assignment unregisters a slice from its
+ * parent's set, which is why this CANNOT be an inline refcount dec - the
+ * jit_bind_ref_arg lesson from the push side). Called by the emitted
+ * inline pop's cold arm for a ref-listed slot whose current value is a
+ * reference; the emitted check mirrors the scan's own type test. */
+extern "C" void jit_release_slot(LValue *lv) noexcept
+{
+    *lv = LValue();
+}
+
+extern "C" void jit_ret_audit() noexcept
+{
+#if ML_VM_HARDENING
+    VmActivation &act = *g_vm_act;
+    VmCallRec &rec = act.back_rec();     /* also re-checks the top_rec mirror */
+    /* the C3 net, pre-release form: every slot holding a REFERENCE must be
+     * ref-listed (an unlisted one would leak - exactly what the ref_slots
+     * audit in pop_window catches after ITS release scan; here the scan
+     * has not run yet, so a listed slot may legitimately hold one). */
+    const Chunk *ck = rec.run_chunk;
+    ML_VM_CHECK(ck != nullptr);
+    for (int_type i = 0; i < rec.nslots; i++) {
+        if (rec.window[i].get().get_type()->t >= Type::t_str)
+            ML_VM_CHECK(std::binary_search(ck->ref_slots.begin(),
+                                           ck->ref_slots.end(),
+                                           static_cast<int32_t>(i)));
+    }
+    /* the emit gate was plain_frame: no watermark can have moved */
+    ML_VM_CHECK(act.handlers.size() == rec.handler_base);
+    ML_VM_CHECK(act.diters_n == rec.diter_base);
+    ML_VM_CHECK(act.dyiters_n == rec.dyiter_base);
+#endif
+}
+
 extern "C" int jit_throw(int_type val_slot, int_type pc,
                          const void *lep) noexcept
 {
@@ -6015,6 +6068,13 @@ vm_frame_leave_body(VmActivation &act, EvalContext &ctx, EvalValue &&res)
  * ReturnV boundary path) and return the boundary sentinel - EnterNative stops
  * the invocation; the C++ caller (vm_try_invoke / VmInvoker) pops the window.
  * noexcept: a fully-native leaf body is throw-free, so nothing here throws.
+ *
+ * C4c: the COMMON shape of this function (non-boundary, no cache key, no
+ * stashed pure cache, plain frame, empty ref_slots, trivial old dst) is now
+ * EMITTED INLINE at the ReturnV/Halt site (emit_ret_native, jit.cpp) - the
+ * return-side twin of the M5b inline push. This helper is that path's SLOW
+ * TIER: every emitted guard declines here BEFORE any mutation, so it always
+ * redoes the whole pop from scratch, byte-identically.
  */
 extern "C" size_t jit_ret(int_type res_slot) noexcept
 {
@@ -6104,6 +6164,14 @@ ptrdiff_t jit_off_ctx_gfuncs()
 {
     EvalContext c(nullptr, true);
     return reinterpret_cast<const char *>(&c.gfuncs)
+         - reinterpret_cast<const char *>(&c);
+}
+/* C4c: EvalContext::flow - the inline BOUNDARY return writes the flow
+ * state directly (the jit_ret boundary path's two stores). */
+ptrdiff_t jit_off_ctx_flow()
+{
+    EvalContext c(nullptr, true);
+    return reinterpret_cast<const char *>(&c.flow)
          - reinterpret_cast<const char *>(&c);
 }
 ptrdiff_t jit_off_gft_slots()
