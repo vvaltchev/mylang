@@ -19497,6 +19497,69 @@ static bool jit_fread_c4()
 #endif
 }
 
+/*
+ * C4a-i's AUDIT-TABLE net: `visit_use_def` (codegen.cpp) must know the
+ * B1/B2 SPECIALIZED arith family. It runs on PRE-specialization code in
+ * the peephole, so the family was never added there - but jit_fwd_info
+ * runs at JIT TIME, on the specialized code, where an op missing from
+ * that table is a use-def BARRIER: `lin = all`, every temp live-in at
+ * every pc. Both JIT-time consumers then silently do nothing (lever A's
+ * write elision; C4a-i's read-elision entry gate, which is why C4a-i
+ * first measured FLAT).
+ *
+ * The property, tested directly: on a chunk whose float chain runs
+ * through TEMPS, the read-elision set must ADMIT those temps.
+ * g_jit_fread cannot see this - it bumps per fragment ENTRY and the two
+ * LOCALS alone satisfy it - so the count is of admitted TEMPS.
+ */
+static bool jit_fread_temps_audited()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const unsigned long t0 = g_jit_fread_temps;
+    const ExecEngine se = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        /* the 55_float_sum chain: 7 float TEMPS, every one written by a
+         * SPECIALIZED FloatAdd/Sub/MulRR|RI (specialize_arith_ops
+         * rewrites all but the three divides) */
+        const char *lines[] = {
+            "func f(int n) {",
+            "    var total = 0.0;",
+            "    for (var i = 1; i < n; i++) {",
+            "        var x = i * 1.0;",
+            "        total += x / (x + 1.0) - 0.5 / x + 1.0 / (x * x);",
+            "    }",
+            "    return total; }",
+            "assert(f(int(runtime(50))) > 0.0);",
+        };
+        std::string joined;
+        for (const char *l : lines) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (...) { ok = false; }
+    g_exec_engine = se;
+    if (!ok)
+        return false;
+    if (g_jit_fread_temps <= t0) {
+        cout << "  fread: NO temp admitted to the read-elision set - a "
+                "specialized op is missing from visit_use_def\n";
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_fcache_c2()
 {
 #if ML_JIT_SUPPORTED
@@ -24550,6 +24613,8 @@ static const std::vector<extra_check> extra_checks =
       jit_native_return },
     { "jit: C4c inline frame pop serves the common return shape",
       jit_ret_inline_c4c },
+    { "jit: the JIT-time liveness knows the specialized arith family",
+      jit_fread_temps_audited },
     { "jit: native CallV (function->function call in the fragment)",
       jit_native_call },
     { "jit: the inline push binds a REFERENCE argument (no slow-tier decline)",

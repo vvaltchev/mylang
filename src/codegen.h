@@ -73,21 +73,30 @@ bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit = true);
 void build_boxed_ops(Chunk &chunk);
 
 /*
- * Lever A (dead-temp forwarding, plans/unboxing.md): per-pc TEMP live-out
- * masks + branch-target flags over the chunk's FINAL code, for the JIT's
- * adjacent-pair forwarding. Computed HERE, with the audited enumerations
- * (visit_use_def / visit_pc_fields / the handler table) the E1 liveness
- * already uses, so the emitter cannot grow a second, drifting copy of
- * them. `liveout[pc] & (1 << (t - slot_count))` == temp t is read on some
- * path after op pc (throw-resume paths included via the handler
- * absorption). `is_tgt[pc]` == some branch or handler RESUME can enter at
- * pc (post-call resume stubs are the JIT's own and are checked there).
- * Returns false when temp liveness is not computable (no temps, or > 64):
- * liveout is empty and the caller may forward reads but never elide a
- * write. is_tgt is filled either way. Runs at JIT time on the final code,
- * AFTER any bytecode splice - never cached across transformations.
+ * Lever A (dead-temp forwarding, plans/unboxing.md): per-pc TEMP
+ * live-out AND live-in masks + branch-target flags over the chunk's
+ * FINAL code, for the JIT's adjacent-pair forwarding. Computed HERE,
+ * with the audited enumerations (visit_use_def / visit_pc_fields / the
+ * handler table) the E1 liveness already uses, so the emitter cannot
+ * grow a second, drifting copy of them.
+ * `liveout[pc] & (1 << (t - slot_count))` == temp t is read on some
+ * path AFTER op pc (throw-resume paths included via the handler
+ * absorption) - the deadness test for a write elision.
+ * `livein[pc]` is the same mask BEFORE op pc - "a value from outside
+ * reaches this pc", which is the test an ENTRY pc needs (C4a-i's
+ * elision gate; using liveout there was a real bug - at a run head
+ * whose first op writes the temp, live-out includes that very temp, so
+ * every float temp read as excluded and the elision measured flat).
+ * `is_tgt[pc]` == some branch or handler RESUME can enter at pc
+ * (post-call resume stubs are the JIT's own and are checked there).
+ * Returns false when temp liveness is not computable (no temps, or
+ * > 64): both vectors are empty and the caller may forward reads but
+ * never elide a write. is_tgt is filled either way. Runs at JIT time on
+ * the final code, AFTER any bytecode splice - never cached across
+ * transformations.
  */
 bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
+                  std::vector<uint64_t> &livein,
                   std::vector<char> &is_tgt);
 
 /*

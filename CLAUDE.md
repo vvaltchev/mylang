@@ -1331,6 +1331,39 @@ pool) reads **-6.8%**. Lambda-param coverage was assessed and DROPPED
 as vacuous (11's closure has NO params; every passed lambda is
 value-escaped by design - recorded in the plan).
 
+**⛔ THE AUDIT-TABLE STAGE TRAP (2026-08-04) - `visit_use_def` did not
+know the B1/B2 SPECIALIZED family, and NOTHING could see it.** The
+table (codegen.cpp) is consulted by the PEEPHOLE's E1 liveness and by
+`compute_ref_slots`, and BOTH run before `specialize_arith_ops` - so
+the 23 specialized opcodes (IntAddRR .. FloatMulRI) simply never
+reached it and their absence was invisible. But **`jit_fwd_info` runs
+at JIT TIME**, on the specialized code, and its contract for an
+unaudited op is the conservative BARRIER `lin = all` - every temp live
+at every pc. So both of its consumers were silently inert: lever A's
+`skip_write` (whose own note already suspected it) and C4a-i's
+read-elision entry gate, which refused every float temp and made the
+whole increment measure FLAT. C4a-i had a second, smaller bug of the
+same family - it tested `fwd_lout` (live-OUT) where it meant live-IN,
+so a run head whose first op writes the temp trivially "read" it as
+live; `jit_fwd_info` now exports the fixpoint's own `livein` beside
+`liveout`. FIXED: the family joined the table. Measured (Ir/scale,
+OPT=1 ASSERTS=0): **55_float_sum -15.0%**, 40_math_builtins -3.2%;
+54/04 byte-flat (C2a already pinned their float locals), every int
+bench byte-flat (`skip_write` stays blocked there by ref_slots'
+conservatism - lever A's documented throttle). PINNED by
+`jit_fread_temps_audited` over a compile-time `g_jit_fread_temps`
+count of admitted TEMPS: `g_jit_fread` cannot see this - it bumps per
+fragment ENTRY, which the two LOCALS alone satisfy - and removing the
+family from the table again fails the test (watched).
+**THE RULE this earns:** a table is "audited" only for the PIPELINE
+STAGES that existed when it was written. A pass added later, at a
+DIFFERENT stage, sees a different opcode universe - and a conservative
+fallback means the gap costs silence, not failure. When you add a
+consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
+(the way `visit_pc_fields`' remap net and the `ref_slots` audit do),
+or the next such gap will also be found only by someone reading a
+disassembly for an unrelated reason.
+
 **C2b - A SECOND HOISTED BASE PER REGION (2026-08-04).** A region's
 second-best candidate (a dot product's other array - 46's $licm0
 beside b) hoists into a CALLEE-saved pair from r12-r15: leftovers
@@ -1403,7 +1436,12 @@ accepts must honor `g_fwd.in_rax` in its emit - grow both sides in the
 same change. skip_write is defense in depth today (forcing it survives
 suite + fuzzer: current pairs' temps are consumed exactly once); it is
 what makes GROWING the consumer whitelist safe (a counted loop's BOUND
-temp is live every iteration). Execution-proven by `g_jit_fwd` (bumped
+temp is live every iteration). **And it was INERT until 2026-08-04 for
+a reason that had nothing to do with ref_slots: `visit_use_def` did not
+know the B1/B2 SPECIALIZED family, so at JIT time - the only place that
+family exists - every op was a use-def BARRIER and the liveness read
+`all` (see THE AUDIT-TABLE STAGE TRAP below).** Execution-proven by
+`g_jit_fwd` (bumped
 by emitted consumers; the jit_fwd_deadtemp test pins the chain, the
 matmul shape, and the slow-path rejoin - all sabotage-verified).
 Measured (callgrind Ir, OPT=1 ASSERTS=0): 46_matrix_mult -2.19%/iter,

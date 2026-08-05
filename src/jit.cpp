@@ -64,6 +64,14 @@ unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 unsigned long g_jit_ret_inline = 0;    /* C4c: inline-pop returns run */
+/* C4a-i: TEMP slots admitted to the float read-elision set, process-wide.
+ * A COMPILE-TIME count, unlike its siblings, because the property under
+ * test is the AUDIT TABLE's completeness: a specialized arith op missing
+ * from visit_use_def makes jit_fwd_info report every temp live-in at
+ * every pc, so the entry gate refuses them ALL and this reads 0 while
+ * g_jit_fread (per-fragment-entry, satisfied by the LOCALS alone) still
+ * bumps happily. See jit_fread_temps_audited. */
+unsigned long g_jit_fread_temps = 0;
 }
 #endif
 
@@ -9740,9 +9748,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * FINAL code (post-splice - this runs at JIT time), from codegen's
      * audited enumerations. Without computable liveness the pairs still
      * forward READS; only the write elision needs deadness. */
-    std::vector<uint64_t> fwd_lout;
+    std::vector<uint64_t> fwd_lout, fwd_lin;
     std::vector<char> fwd_tgt;
-    const bool fwd_live_ok = jit_fwd_info(chunk, fwd_lout, fwd_tgt);
+    const bool fwd_live_ok =
+        jit_fwd_info(chunk, fwd_lout, fwd_lin, fwd_tgt);
     g_fwd = JitFwd{};
 
     /* op -> enum NAME (the audit's label; from the X-macro, so it can
@@ -10168,14 +10177,23 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             if (!fwd_live_ok || tb >= 64)
                 continue;
             const uint64_t bit = uint64_t(1) << tb;
-            bool live_at_entry = (begin < fwd_lout.size()
-                                  && (fwd_lout[begin] & bit));
+            /* LIVE-IN, not live-out: the question is "does a value from
+             * OUTSIDE this run reach this entry pc", and live-out at a
+             * run head whose first op writes the temp trivially includes
+             * that temp - which is why C4a-i's first version excluded
+             * EVERY float temp and measured flat. */
+            bool live_at_entry = (begin < fwd_lin.size()
+                                  && (fwd_lin[begin] & bit));
             for (const auto &pe : entries)
                 if (pe.first > begin && pe.first < end
-                        && (fwd_lout[pe.first] & bit))
+                        && (fwd_lin[pe.first] & bit))
                     live_at_entry = true;
-            if (!live_at_entry)
+            if (!live_at_entry) {
                 e.fread.push_back(s);
+#ifdef TESTS
+                g_jit_fread_temps++;
+#endif
+            }
         }
 #ifdef TESTS
         if (!e.fread.empty()) {

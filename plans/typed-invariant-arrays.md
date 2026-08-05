@@ -370,18 +370,43 @@ scalar), 54_mandelbrot **7.3x** / 55_float_sum **6.3x** (86-95% inside
 the fragments - the float class), 62_dict 5.3x, 43_sieve 4.5x,
 01 3.3x, 14 3.1x, 03/07 ~1.9x.
 
-**C4a-i (float read-dispatch elision) LANDED - and measured ~FLAT,
-with the correction that matters recorded:** the "23 type dispatches
-per iteration" that motivated it was a STATIC whole-dump count never
-verified executed (the prove-the-code-ran rule, violated by its own
-author); the hot loop's reads were already nearly dispatch-free
-(x/total pinned or fdst-served; the one remaining dispatch is i's
-promote arm, which is correct). The elision is sound (locals by the
-fdst/none-payload argument; temps gated dead-at-entry via fwd_lout),
-engaged (g_jit_fread; 15 static dispatches deleted - cold/off-path),
-sabotage-verified (eliding everything = 15 suite failures), and KEPT:
-zero cost, and `fread` is exactly the proven-float set the
-registerizer below needs.
+**C4a-i (float read-dispatch elision) LANDED - measured ~FLAT, and the
+NEXT SESSION FOUND OUT WHY: it was serving almost nothing.** Two
+defects, both mine, both invisible to every net we had:
+  (a) the temp entry gate read `fwd_lout[entry]` - jit_fwd_info exports
+      live-OUT, and the test wants live-IN ("does a value from outside
+      reach this pc"). At a run head whose first op writes the temp,
+      live-out trivially contains it. `jit_fwd_info` now exports the
+      fixpoint's own `live_in` too;
+  (b) far worse: **`visit_use_def` never knew the B1/B2 SPECIALIZED
+      arith family** (IntAddRR .. FloatMulRI, 23 opcodes). That table
+      is consulted by the peephole and compute_ref_slots, both of which
+      run BEFORE specialize_arith_ops - so nothing noticed. But
+      jit_fwd_info runs at JIT TIME, on specialized code, where an
+      unknown op is a use-def BARRIER: `lin = all`, every temp live at
+      every pc. So BOTH JIT-time liveness consumers were silently inert
+      - C4a-i's gate refused every temp, and lever A's `skip_write` (its
+      own CLAUDE.md note already suspected it: "defense in depth today")
+      could never have fired either.
+The motivating "23 dispatches per iteration" figure was ALSO wrong (a
+static whole-dump count never verified executed - the prove-the-code-ran
+rule violated by its own author), but the mechanism was right and the
+measurement was reading a broken gate.
+MEASURED once fixed (Ir/scale, OPT=1 ASSERTS=0): 55_float_sum
+**-15.0%**, 40_math_builtins **-3.2%**; 54/04 byte-flat (their float
+locals were already pinned by C2a), every int bench byte-flat
+(`skip_write` stays blocked there by ref_slots' conservatism - the
+throttle lever A already documented). PINNED by
+`jit_fread_temps_audited` + a compile-time `g_jit_fread_temps` count of
+admitted TEMPS - `g_jit_fread` cannot see this, it bumps per fragment
+ENTRY and the two LOCALS alone satisfy it. Removing the family from the
+table again fails that test.
+THE LASTING LESSON: an audit table can be complete for the passes that
+existed when it was written and INCOMPLETE for a pass added later at a
+different pipeline stage. `visit_use_def`'s barrier fallback is
+"correct" (conservative), which is exactly why nothing failed - the
+cost was silent and unmeasurable from outside. Any new consumer of an
+audited enumeration should assert the table COVERS its input.
 
 **THE REAL C4 DECOMPOSITION** (55 at 107 Ir/iter vs C++ 17): no
 single dominator - 9 FloatBins each pay temp two-stores (~14/iter),
