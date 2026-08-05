@@ -1364,6 +1364,44 @@ consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
 or the next such gap will also be found only by someone reading a
 disassembly for an unrelated reason.
 
+**C4a-ii - FLOAT DEAD-TEMP FORWARDING (2026-08-04, lever A's twin).**
+A float expression chain round-trips every intermediate through a temp
+SLOT (a type store + a payload store, then a load) although the value
+is alive for exactly one instruction - 21 of 55_float_sum's 67
+hot-path instructions. A whitelisted float PRODUCER now hands its
+result over in **XMM0**, which is simply where the emitted shape
+already leaves it (load a->xmm0, load b->xmm1, arith xmm0, store
+xmm0), and a dead non-ref-listed temp skips the store. The whitelist
+is the ARITHMETIC family only (FloatBin + the six specialized
+RR/RI forms) on BOTH sides - deliberately narrower than the int
+lever's, because those ops have **no slow tier that rejoins after
+writing the dst** (the div/mod zero arm EXITS), so the "reload the
+forwarding register on the slow-path rejoin" case that the int
+LoadElem* producers need does not arise. The b-OPERAND case - which is
+EVERY pair in the corpus chain, since a chain accumulates on the left
+- moves the value ASIDE (`movsd xmm1, xmm0`) before `a` is loaded into
+xmm0; the int side instead swaps operand roles for a commutative op,
+and that is sound here too (the opcode enum already records that NaN
+payloads are not observable in-language), but a 4-byte move needs no
+such argument and keeps `sub`/`div` order-correct by construction.
+Guards, deadness and the one-shot arming are lever A's, verbatim, on
+parallel `fin_x0`/`fprod`/`fskip_write`/`farmed` state (an op is an int
+producer or a float one, never both). NOT admitted as a producer: an
+op whose dst is float-PINNED - the store is a register move into the
+pin and skipping it would strand it; moot today (only TEMPS forward
+and the C2a pool is locals-only), so it is an invariant to keep rather
+than a runtime check. Execution-proven by `g_jit_ffwd` (bumped by the
+emitted consumer); the `jit_ffwd_c4aii` test pins the chain AND an
+order-sensitive `a - b` / `a / b` shape, both sabotage-verified (the
+aside-move dropped = 10 suite failures; the operand roles swapped =
+11). Forcing `fskip_write` unconditionally survives suite + fuzzer -
+the SAME honest status as the int side's, recorded not claimed: the
+current pairs' temps are consumed exactly once, and the deadness test
+is what makes GROWING the whitelist safe. Measured (callgrind Ir/scale,
+OPT=1 ASSERTS=0): 54_mandelbrot **-17.4%**, 55_float_sum **-15.4%**,
+04_float_arith **-13.9%**, 40_math_builtins -0.6%; 46/01 byte-flat.
+55's hot path 67 -> 57 instructions per iteration.
+
 **C2b - A SECOND HOISTED BASE PER REGION (2026-08-04).** A region's
 second-best candidate (a dot product's other array - 46's $licm0
 beside b) hoists into a CALLEE-saved pair from r12-r15: leftovers

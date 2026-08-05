@@ -19560,6 +19560,89 @@ static bool jit_fread_temps_audited()
 #endif
 }
 
+/*
+ * C4a-ii: FLOAT dead-temp forwarding (lever A's twin). A float chain's
+ * producer leaves its result in XMM0 and the adjacent consumer takes it
+ * there - the b-operand case moving it ASIDE to xmm1 first, since
+ * loading `a` into xmm0 would clobber it. g_jit_ffwd is bumped by the
+ * EMITTED code at each forwarded consumer, so growth proves the pairs
+ * actually ran.
+ *
+ * The value check is the real net: the aside-move and the operand ORDER
+ * are what a mistake here breaks, and `-` and `/` are order-sensitive
+ * (the chain has three divides and a subtract precisely so a swapped
+ * pair cannot produce the right number by luck).
+ */
+static bool jit_ffwd_c4aii()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto go = [](const std::vector<const char *> &src) -> std::string {
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return cap.str();
+    };
+
+    /* the 55_float_sum chain: 5 adjacent pairs, EVERY one with the temp
+     * at operand b (so the aside-move runs 5x per iteration) */
+    const unsigned long f0 = g_jit_ffwd;
+    const std::string got = go({
+        "func work(int n) {",
+        "  var total = 0.0;",
+        "  for (var i = 1; i < n; i++) {",
+        "    var x = i * 1.0;",
+        "    total += x / (x + 1.0) - 0.5 / x + 1.0 / (x * x);",
+        "  }",
+        "  return total; }",
+        "print(str(work(int(runtime(400))), 6));" });
+    if (got != "391.788786 \n") {     /* the tree-walker's answer */
+        cout << "  ffwd: got [" << got << "]\n";
+        return false;
+    }
+    if (g_jit_ffwd <= f0) {
+        cout << "  ffwd: no float pair forwarded\n";
+        return false;
+    }
+
+    /* ORDER, isolated: `a - b` and `a / b` through a forwarded b. If the
+     * aside-move or the operand roles were wrong these read as b - a /
+     * b / a, which differ for these values. */
+    const std::string ord = go({
+        "func f(int k) {",
+        "  var r = 0.0;",
+        "  for (var i = 1; i < k; i++) {",
+        "    var a = i * 4.0;",
+        "    r += a - (a / 8.0) + a / (a - 1.0);",
+        "  }",
+        "  return r; }",
+        "print(str(f(int(runtime(20))), 6));" });
+    if (ord != "685.010871 \n") {
+        cout << "  ffwd order: got [" << ord << "]\n";
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_fcache_c2()
 {
 #if ML_JIT_SUPPORTED
@@ -24615,6 +24698,8 @@ static const std::vector<extra_check> extra_checks =
       jit_ret_inline_c4c },
     { "jit: the JIT-time liveness knows the specialized arith family",
       jit_fread_temps_audited },
+    { "jit: C4a-ii float dead-temp forwarding (xmm0 hand-off)",
+      jit_ffwd_c4aii },
     { "jit: native CallV (function->function call in the fragment)",
       jit_native_call },
     { "jit: the inline push binds a REFERENCE argument (no slow-tier decline)",
