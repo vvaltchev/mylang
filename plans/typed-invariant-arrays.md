@@ -360,6 +360,47 @@ garbage type pointer. Prerequisites, in order:
 
 ### C4 - unboxed typed locals end to end (N7)
 
+**THE FRESH PROFILE (2026-08-04, per this plan's own discipline).**
+Callgrind Ir/scale, my vs `g++ -O3` twins (bench/cpp, rebuilt):
+10_recursion_deep **18.2x** (53.8% fragment + ~35% in the jit_ret C++
+round trip - the return protocol is nearly the whole gap),
+64_struct_create **10.0x** (89% fragment - dst tag two-stores + guard
+loads), 46_matrix_mult 9.3x (vs VECTORIZED C++ at 8.2 Ir/iter; ~3x vs
+scalar), 54_mandelbrot **7.3x** / 55_float_sum **6.3x** (86-95% inside
+the fragments - the float class), 62_dict 5.3x, 43_sieve 4.5x,
+01 3.3x, 14 3.1x, 03/07 ~1.9x.
+
+**C4a-i (float read-dispatch elision) LANDED - and measured ~FLAT,
+with the correction that matters recorded:** the "23 type dispatches
+per iteration" that motivated it was a STATIC whole-dump count never
+verified executed (the prove-the-code-ran rule, violated by its own
+author); the hot loop's reads were already nearly dispatch-free
+(x/total pinned or fdst-served; the one remaining dispatch is i's
+promote arm, which is correct). The elision is sound (locals by the
+fdst/none-payload argument; temps gated dead-at-entry via fwd_lout),
+engaged (g_jit_fread; 15 static dispatches deleted - cold/off-path),
+sabotage-verified (eliding everything = 15 suite failures), and KEPT:
+zero cost, and `fread` is exactly the proven-float set the
+registerizer below needs.
+
+**THE REAL C4 DECOMPOSITION** (55 at 107 Ir/iter vs C++ 17): no
+single dominator - 9 FloatBins each pay temp two-stores (~14/iter),
+literal movabs+movq re-materialization (~8), div zero bit-tests (~9),
+plus per-op movsd traffic. C++ keeps the WHOLE expression in
+registers. The route, in increasing depth:
+  1. **C4a-ii: float forwarding** - lever A's twin (FloatBin
+     producer -> consumer hands xmm0; 55's chain has 4-5 adjacent
+     pairs, est. -15-20% there);
+  2. **C4b: expression-DAG registerization** - compile a float
+     expression TREE into an xmm DAG with one store at the root (the
+     actual N7 shape for floats; subsumes 1 when it lands);
+  3. **C4c: the return protocol** (10's ~35% jit_ret round trip - a
+     direct fragment-to-fragment continuation, the plans/model-flip
+     deferred piece);
+  4. **C4d: struct dst tags** (64's two-stores - the C3-elision idea
+     applied to the ctor plans' dsts).
+Each is its own measured increment; 2 and 3 are the big ones.
+
 The endgame: a proven-int local IS a machine word (no 48-byte LValue
 round trip), a proven-flat-array base IS a (pointer, count) pair kept
 in registers across its live range, boxing only at genuine dyn/ref

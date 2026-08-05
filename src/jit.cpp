@@ -54,6 +54,7 @@ unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
+unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
@@ -525,6 +526,24 @@ struct Emitter {
      * list), so an interpreted helper mid-run reads valid memory. */
     struct TypedEnt { int slot; int32_t type; bool flt; };
     std::vector<TypedEnt> tflush;
+    /* C4a-i: slots whose READS skip emit_float_load's 3-way type
+     * dispatch - every in-run writer is a float op, so the type word
+     * is t_float whenever a read runs (writes still STORE it; this is
+     * read-side only, no staleness). Locals qualify by the C2a fdst
+     * argument (a pre-first-write `none` has a ZEROED payload, so the
+     * raw movsd and the dispatch's answer agree); TEMPS additionally
+     * require NOT-live-at-entry (fwd_lout), or a cross-run value -
+     * an array snapshot - would be movsd'd raw where the dispatch
+     * would have promoted or bailed. 55_float_sum ran 23 dispatches
+     * per iteration; this deletes them. */
+    std::vector<int> fread;
+    bool fread_ok(int s) const
+    {
+        for (const int x : fread)
+            if (x == s)
+                return true;
+        return false;
+    }
     bool telided(int slot, bool flt) const
     {
         for (const TypedEnt &t : tflush)
@@ -3286,7 +3305,8 @@ pick_cached_slots(const Chunk &ck, size_t begin,
                   std::vector<int> *fhot = nullptr,
                   std::vector<int> *hot_counts = nullptr,
                   std::vector<int> *typed_extra = nullptr,
-                  std::vector<int> *typed_extra_f = nullptr)
+                  std::vector<int> *typed_extra_f = nullptr,
+                  std::vector<int> *fread = nullptr)
 {
     const std::vector<Instr> &code = ck.code;
     /* `barrier[pc-begin] = 1` marks an op that touches frame slots the emitter
@@ -3958,6 +3978,16 @@ pick_cached_slots(const Chunk &ck, size_t begin,
                            == fhot->end())
                     typed_extra_f->push_back(kv.first);
         }
+        /* C4a-i: the READ-dispatch elision set - float-written,
+         * undisqualified, not full-value-read; TEMPS INCLUDED (the
+         * caller applies the entry-liveness gate to those). Pinned /
+         * type-elided slots are already served earlier in
+         * emit_float_load; overlap is harmless. */
+        if (fread) {
+            for (const int s : fdst)
+                if (!disq_f.count(s) && !full_read.count(s))
+                    fread->push_back(s);
+        }
     }
 
     /* AUDIT: a slot LOST to disqualification is one that is a resolved
@@ -4041,7 +4071,7 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
      * dispatch (the guard-elision win; reading the stale word took the
      * wrong arm - a `none` type cvtsi2sd'd a double's bits, the
      * mandelbrot `inf`). */
-    if (e.telided(slot, /*flt=*/true)) {
+    if (e.telided(slot, /*flt=*/true) || e.fread_ok(slot)) {
         e.fload(xr, a.payload);
         return;
     }
@@ -9199,6 +9229,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     e.cache.clear();                       /* no N5 register cache in a container*/
     e.fcache.clear();                      /* C2a: nor a float one */
     e.tflush.clear();                      /* C3: nor type elision */
+    e.fread.clear();                       /* C4a-i: nor read elision */
     std::vector<NativeCode::OpMark> marks;  /* -vdj: op-boundary annotations */
     std::vector<size_t> label(n, 0);        /* fragment offset of each body pc */
     std::vector<Fixup> fixups;              /* fragment-local branch fixups */
@@ -9668,6 +9699,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * what frag_entry must push (and what every exit must pop). */
         e.cache.clear();
         e.tflush.clear();       /* C3: per-RUN like the pools */
+        e.fread.clear();        /* C4a-i: per-RUN */
         e.fcache.clear();       /* C2a: per-RUN state like the GP pool - a
                                  * stale entry from the previous fragment
                                  * would flush a never-loaded xmm into the
@@ -9697,10 +9729,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         std::vector<int> fhot;                    /* C2a float picks */
         std::vector<int> hot_counts;
         std::vector<int> textra, textra_f;        /* C3: type-elided */
+        std::vector<int> fread_raw;               /* C4a-i */
         std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
                               &cache_barrier, &fhot, &hot_counts,
-                              &textra, &textra_f);
+                              &textra, &textra_f, &fread_raw);
         /*
          * C2b: allocate a CALLEE-saved pair for the regions' SECOND
          * bases (every region shares one pair - their lifetimes are
@@ -9787,6 +9820,38 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 #ifdef TESTS
         if (!e.tflush.empty()) {
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_telide));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+        }
+#endif
+        /*
+         * C4a-i: the float READ-dispatch elision set. A LOCAL is safe
+         * by the fdst argument alone; a TEMP additionally must be DEAD
+         * at the run head and at every interior entry-stub pc
+         * (fwd_lout = live-in per pc, temps only) - a live-at-entry
+         * temp's value crossed a run boundary and may be anything (the
+         * N5 foreach-snapshot class). No liveness info -> locals only.
+         */
+        for (const int s : fread_raw) {
+            if (s < chunk.slot_count) {
+                e.fread.push_back(s);
+                continue;
+            }
+            const int tb = s - chunk.slot_count;
+            if (!fwd_live_ok || tb >= 64)
+                continue;
+            const uint64_t bit = uint64_t(1) << tb;
+            bool live_at_entry = (begin < fwd_lout.size()
+                                  && (fwd_lout[begin] & bit));
+            for (const auto &pe : entries)
+                if (pe.first > begin && pe.first < end
+                        && (fwd_lout[pe.first] & bit))
+                    live_at_entry = true;
+            if (!live_at_entry)
+                e.fread.push_back(s);
+        }
+#ifdef TESTS
+        if (!e.fread.empty()) {
+            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fread));
             e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
         }
 #endif

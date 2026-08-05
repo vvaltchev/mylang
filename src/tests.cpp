@@ -19304,6 +19304,64 @@ static bool jit_telide_c3()
 #endif
 }
 
+/*
+ * C4a-i - the float READ-dispatch elision. 55_float_sum's iteration ran
+ * 23 type-dispatch sequences (load_type + cmp + jne per float operand
+ * read); a slot whose every in-run writer is a float op reads with a
+ * bare movsd instead. The dense-arithmetic shape below (55's own) is
+ * the parity + engagement case; the sabotage is eliding INT-written
+ * slots too, which movsd's int bits as doubles.
+ */
+static bool jit_fread_c4()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const unsigned long f0 = g_jit_fread;
+    const ExecEngine se = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    std::ostringstream cap;
+    std::streambuf *old = cout.rdbuf(cap.rdbuf());
+    try {
+        const char *lines[] = {
+            "func f(n) {",
+            "    var total = 0.0;",
+            "    for (var i = 1; i < n; i++) {",
+            "        var x = i * 1.0;",
+            "        total += x / (x + 1.0) - 0.5 / x + 1.0 / (x * x);",
+            "    }",
+            "    return total; }",
+            "print(str(f(int(runtime(500))), 6));",
+        };
+        std::string joined;
+        for (const char *l : lines) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (...) { }
+    cout.rdbuf(old);
+    g_exec_engine = se;
+    const std::string got = cap.str();
+    /* the tree-walker's answer for n=500, 6 digits */
+    if (got != "491.454697 \n") {
+        cout << "  fread: got [" << got << "]\n";
+        return false;
+    }
+    if (g_jit_fread == f0) {
+        cout << "  fread: no read-elided fragment ever entered\n";
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_fcache_c2()
 {
 #if ML_JIT_SUPPORTED
@@ -24416,6 +24474,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: C3 - type-elided slots (write elision + the exit/barrier "
       "type flush)",
       jit_telide_c3 },
+    { "jit: C4a - float reads skip the type dispatch (proven-float "
+      "slots + dead-at-entry temps)",
+      jit_fread_c4 },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",
