@@ -73,6 +73,10 @@ unsigned long g_jit_ret_inline = 0;    /* C4c: inline-pop returns run */
  * g_jit_fread (per-fragment-entry, satisfied by the LOCALS alone) still
  * bumps happily. See jit_fread_temps_audited. */
 unsigned long g_jit_fread_temps = 0;
+/* C3 inc 3: TEMP slots admitted to the float TYPE-STORE elision (also a
+ * compile-time count - the same audit-table dependence as its read-side
+ * sibling, plus the !ref_listed condition a temp needs). */
+unsigned long g_jit_telide_temps = 0;
 }
 #endif
 
@@ -10263,19 +10267,6 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
         }
 #endif
-        /* C3 inc 2: the type-elided slots (see Emitter::tflush) - no
-         * entry state at all, only the write-side elision + the flush's
-         * one type store per exit. */
-        for (const int s : textra)
-            e.tflush.push_back({ s, slot_addr(s).type, false });
-        for (const int s : textra_f)
-            e.tflush.push_back({ s, slot_addr(s).type, true });
-#ifdef TESTS
-        if (!e.tflush.empty()) {
-            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_telide));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
-        }
-#endif
         /*
          * C4a-i: the float READ-dispatch elision set. A LOCAL is safe
          * by the fdst argument alone; a TEMP additionally must be DEAD
@@ -10311,6 +10302,44 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 #endif
             }
         }
+
+        /* C3 inc 2 + inc 3: the type-elided slots (see Emitter::tflush)
+         * - no entry state at all, only the write-side elision + the
+         * flush's one type store per exit.
+         *
+         * inc 3 admits TEMPS, which inc 2 excluded outright (its
+         * producer is gated `< slot_count`). A temp needs the read
+         * gate's condition - dead-in at every entry, so no foreign
+         * value is read through the elided form - PLUS one more that a
+         * LOCAL does not: **not ref-listed**. The flush stamps t_float
+         * at EVERY exit, including one taken before the run's first
+         * write to the slot. For a local that window holds the pre-decl
+         * `none` (trivial, harmless). A temp is SCRATCH REUSED ACROSS
+         * RUNS and can still hold a reference left by an earlier run in
+         * the same frame - stamping t_float over its type word would
+         * hide it from pop_window's release scan (which tests
+         * `type->t >= t_str` on the ref_slots members) and LEAK it.
+         * `!ref_listed` is exactly "this slot provably never holds a
+         * reference" - the audited invariant a VM_HARDENING build
+         * re-verifies over the whole window on every pop.
+         */
+        for (const int s : textra)
+            e.tflush.push_back({ s, slot_addr(s).type, false });
+        for (const int s : textra_f)
+            e.tflush.push_back({ s, slot_addr(s).type, true });
+        for (const int s : e.fread)
+            if (s >= chunk.slot_count && !jit_slot_ref_listed(chunk, s)) {
+                e.tflush.push_back({ s, slot_addr(s).type, true });
+#ifdef TESTS
+                g_jit_telide_temps++;
+#endif
+            }
+#ifdef TESTS
+        if (!e.tflush.empty()) {
+            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_telide));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+        }
+#endif
 #ifdef TESTS
         if (!e.fread.empty()) {
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fread));

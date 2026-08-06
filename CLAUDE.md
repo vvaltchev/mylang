@@ -1364,6 +1364,32 @@ consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
 or the next such gap will also be found only by someone reading a
 disassembly for an unrelated reason.
 
+**C3 inc 3 - TEMPS JOIN THE FLOAT TYPE-STORE ELISION (2026-08-04).**
+inc 2's producer was gated `< slot_count`, LOCALS ONLY, so every float
+TEMP still stored its type word on every write. A temp qualifies on the
+C4a-i READ gate's condition (dead-in at every entry, so no foreign
+value is read through the elided form) **plus one a local does not
+need: NOT REF-LISTED.** The flush stamps t_float at EVERY exit,
+including one taken before the run's first write to the slot; for a
+local that window holds the pre-decl `none` (trivial, harmless), but a
+temp is SCRATCH REUSED ACROSS RUNS and can still hold a reference an
+earlier run left in the same frame - stamping t_float over its type
+word hides it from `pop_window`'s release scan (which tests
+`type->t >= t_str` over the ref_slots members) and LEAKS it.
+`!ref_listed` is exactly "provably never holds a reference", the
+audited invariant a VM_HARDENING build re-verifies over the whole
+window on every pop. **That guard is not theoretical: `main` reuses its
+low temps for the `argv` subscript AND for a float chain**, so
+55_float_sum's own r5/r6 are ref-listed and correctly keep their type
+stores while r7/r8 elide - dropping the condition fails the suite AND
+trips LeakSanitizer (both watched). Proven by `g_jit_telide_temps` +
+the `jit_telide_temps_c3` test (a function-local chain that elides,
+and the mixed array/float shape that must not). Measured: 55_float_sum
+**-1.3%**, 40_math_builtins -0.6%, the rest byte-flat - SMALL because
+C4a-ii landed first and had already deleted 5 of the 7 writes; a
+non-adjacent-temp probe (where forwarding cannot fire) reads **-3.1%**,
+64 -> 62 hot-path instructions. Reach + architecture, like inc 2.
+
 **C4a-ii - FLOAT DEAD-TEMP FORWARDING (2026-08-04, lever A's twin).**
 A float expression chain round-trips every intermediate through a temp
 SLOT (a type store + a payload store, then a load) although the value
