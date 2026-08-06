@@ -830,6 +830,8 @@ extern "C" unsigned long g_jit_fread_temps;
 extern "C" unsigned long g_jit_ffwd;
 /* C3 inc 3: TEMP slots admitted to the float TYPE-STORE elision. */
 extern "C" unsigned long g_jit_telide_temps;
+/* C4b: fragment entries that pinned float literals in registers. */
+extern "C" unsigned long g_jit_flit;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)

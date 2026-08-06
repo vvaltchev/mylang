@@ -61,6 +61,7 @@ unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
 unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
 unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
 unsigned long g_jit_ffwd = 0;          /* C4a-ii: FLOAT forwarded runs */
+unsigned long g_jit_flit = 0;          /* C4b: literal-pinned frag entries */
 unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
@@ -557,6 +558,50 @@ struct Emitter {
      * list), so an interpreted helper mid-run reads valid memory. */
     struct TypedEnt { int slot; int32_t type; bool flt; };
     std::vector<TypedEnt> tflush;
+    /*
+     * C4b: FLOAT LITERALS pinned in registers for the run. A float
+     * literal costs TWO instructions to materialise (`movabs rax, bits`
+     * + `movq xmm, rax`) and a loop re-materialises it EVERY iteration
+     * although it is the most loop-invariant value there is - 8 of
+     * 55_float_sum's 55 hot-path instructions. Loaded once at the
+     * fragment entry, they are read straight out of the register: as an
+     * arith SOURCE that is now free (see farith), and as operand `a` it
+     * is one move instead of two.
+     *
+     * xmm regs are ALL caller-saved, so a helper call clobbers them -
+     * emit_call_epilogue re-materialises each, exactly as it already
+     * does for the rsi/r8 type singletons. The pick's cost model
+     * charges that back (see pick_float_lits).
+     */
+    struct FLit { double val; uint8_t reg; };
+    std::vector<FLit> flits;
+    /* the register holding `v`, or -1 */
+    int flitreg(double v) const
+    {
+        for (const FLit &f : flits)
+            if (std::memcmp(&f.val, &v, sizeof v) == 0)   /* bitwise: -0.0
+                                                           * is not 0.0 */
+                return f.reg;
+        return -1;
+    }
+    /*
+     * Materialise a pinned literal. Through RCX, NEVER rax: this also
+     * runs in emit_call_epilogue, and RAX there carries the helper's
+     * STATUS, which every call site tests immediately after (the
+     * epilogue's own hoist re-derive already goes through RCX for
+     * exactly this reason). Using rax cost a real, silent
+     * miscompilation - a float store to a ref-listed dst calls
+     * jit_put_float, the epilogue clobbered its status, and the caller
+     * read a bogus one; it surfaced as a spurious DivisionByZeroEx.
+     * rcx is caller-saved, so no call site can rely on it either way.
+     */
+    void flit_load(const FLit &f)
+    {
+        uint64_t bits;
+        std::memcpy(&bits, &f.val, sizeof bits);
+        movabs(1 /*rcx*/, bits);
+        movq_xmm_from(f.reg, 1 /*rcx*/);
+    }
     /* C4a-i: slots whose READS skip emit_float_load's 3-way type
      * dispatch - every in-run writer is a float op, so the type word
      * is t_float whenever a read runs (writes still STORE it; this is
@@ -775,7 +820,19 @@ struct Emitter {
         u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
     }
     /* addsd/subsd/mulsd xmm0, xmm1 (op = 0x58/0x5C/0x59) */
-    void farith(uint8_t op) { u8(0xF2); u8(0x0F); u8(op); u8(0xC1); }
+    /* addsd/subsd/mulsd/divsd xmm0, xmm<src> (op = 0x58/0x5C/0x59/0x5E).
+     * C4b: the SOURCE is a parameter now. SSE arithmetic can read any
+     * xmm register directly, so a value that ALREADY lives in one - a
+     * C2a-pinned local, a pinned float literal - needs no move into
+     * xmm1 first. src < 8 (no REX): the pools live in xmm2-xmm7. */
+    void farith(uint8_t op, uint8_t src = 1)
+    { u8(0xF2); u8(0x0F); u8(op); u8(static_cast<uint8_t>(0xC0 | src)); }
+    /* movq rax, xmm<src> - the div0 bit test's read (C4b: any source). */
+    void movq_rax_x(uint8_t src)
+    {
+        u8(0x66); u8(0x48); u8(0x0F); u8(0x7E);
+        u8(static_cast<uint8_t>(0xC0 | (src << 3)));
+    }
     /* movsd xmm<dst>, xmm<src> (reg-reg; both < 8, no REX needed) */
     void fmov_rr(uint8_t dst, uint8_t src)
     { u8(0xF2); u8(0x0F); u8(0x10);
@@ -811,10 +868,13 @@ struct Emitter {
         u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
     }
     /* movq xmm<r>, rax  (double bits GP -> xmm) */
-    void movq_xmm(uint8_t r)
+    void movq_xmm(uint8_t r) { movq_xmm_from(r, 0 /*rax*/); }
+    /* movq xmm<r>, <gp> (C4b: the source GP register is a parameter -
+     * the literal pool materialises through rcx, see flit_load) */
+    void movq_xmm_from(uint8_t r, uint8_t gp)
     {
         u8(0x66); u8(0x48); u8(0x0F); u8(0x6E);
-        u8(static_cast<uint8_t>(0xC0 | (r << 3)));
+        u8(static_cast<uint8_t>(0xC0 | (r << 3) | gp));
     }
     /* ucomisd xmm<d>, xmm<s> */
     void ucomisd(uint8_t d, uint8_t s)
@@ -1947,6 +2007,16 @@ static void emit_call_epilogue(Emitter &e)
      * register pair the allocator could otherwise use. */
     e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
     e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+    /* C4b: the pinned float LITERALS, same argument - caller-saved and
+     * compile-time constant. THIS is where their correctness lives, not
+     * in pick_float_lits' opcode whitelist: a call can be
+     * RUNTIME-conditional and invisible to any opcode scan (a float
+     * store to a ref-listed dst calls jit_put_float and CONTINUES),
+     * so the choke point every helper-call emission already pairs
+     * through must restore them. The whitelist is then purely a COST
+     * heuristic, and being wrong about it can only cost instructions. */
+    for (const Emitter::FLit &fl : e.flits)
+        e.flit_load(fl);
     if (g_hoist.active) {
         /* re-derive via RCX - RAX carries the helper's status, which
          * every call site tests right after this epilogue */
@@ -4521,7 +4591,8 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
  * through jit_put_float (release + store); a trivial current value takes
  * the fast two-store. NEVER bails (see emit_ref_check). */
 static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
-                             int dst, uint32_t bail_pc)
+                             int dst, uint32_t bail_pc,
+                             bool keep_x0 = false)
 {
     (void)bail_pc;                        /* no bail: helper on the ref path */
     /* C2a: a float-PINNED dst is a register write - no type store, no
@@ -4538,6 +4609,17 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
         const size_t jb_fast = emit_ref_check(e, a.type);
         emit_put_scalar_call(e, reinterpret_cast<const void *>(jit_put_float),
                              dst);            /* xmm0 holds the value */
+        /* C4a-ii: jit_put_float TAKES its value in xmm0 and, being an
+         * ordinary C++ call, leaves it clobbered - so a producer whose
+         * pair armed the FORWARD must reload it here. Exactly the int
+         * side's `keep_rax` in store_dst, and for exactly the same
+         * reason; the float twin shipped without it, which a
+         * ref-listed float dst holding a live reference at the store
+         * turned into a garbage divisor (a spurious
+         * DivisionByZeroEx). COLD arm only - the fast two-store path
+         * leaves xmm0 alone, so the hot path pays nothing. */
+        if (keep_x0)
+            e.fload(xr, a.payload);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch8(jb_fast, e.pos());           /* fast: */
         e.store_r8_type(a.type);
@@ -4548,6 +4630,144 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
     if (!e.telided(dst, /*flt=*/true))
         e.store_r8_type(a.type);          /* type = t_float */
     e.fstore(xr, a.payload);              /* payload = the double */
+}
+
+/*
+ * C4b: does this op emit a helper call whose epilogue runs on a
+ * CONTINUING path? (A div/mod ZERO arm calls too, but only after the
+ * pass-jcc, i.e. cold - it exits, it never rejoins.) A pure COST
+ * heuristic for the float-literal pool: correctness is emit_call_
+ * epilogue's job (it re-materialises the pool, like the rsi/r8 type
+ * singletons), because a call can be RUNTIME-conditional and invisible
+ * to any opcode scan. What this decides is only whether pinning PAYS -
+ * a run full of helper calls would re-materialise more often than it
+ * saves. A conservative WHITELIST of the never-calling ops, so an
+ * unlisted or future opcode declines rather than silently costing.
+ */
+static bool op_calls_on_hot_path(const Instr &in)
+{
+    switch (in.op) {
+    case OpCode::FloatBin:
+        /* add/sub/mul/div stay in SSE; MOD is an fmod libm call */
+        return in.aop == Op::mod;
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+    case OpCode::LoadImmFloat: case OpCode::LoadImmInt:
+    case OpCode::IntBin:
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::IntAndRR: case OpCode::IntAndRI:
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:
+    case OpCode::IntXorRR: case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShlRI:
+    case OpCode::IntShrRR: case OpCode::IntShrRI:
+    case OpCode::IntModRI: case OpCode::IntAddModRI:
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
+    case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
+    case OpCode::Jump: case OpCode::ForLoopStep: case OpCode::IntAddStep:
+    case OpCode::MoveV:
+    /* ReturnV/Halt DO call (jit_ret / its inline pop's slow tier) but
+     * they never CONTINUE - the fragment rets - so a clobbered pool is
+     * unobservable past them. Listing them matters: a function body is
+     * one run ending in ReturnV, so treating it as a caller declined
+     * every float function outright. */
+    case OpCode::ReturnV: case OpCode::Halt:
+        return false;
+    default:
+        return true;
+    }
+}
+
+/*
+ * C4b: pick the float literals worth a register for this run. A literal
+ * operand costs TWO instructions to materialise every time it is read
+ * (`movabs rax, bits` + `movq xmm, rax`), and in a loop that is per
+ * ITERATION - for the most loop-invariant value in the program. Held in
+ * a register instead, an operand-b literal is FREE (the arith reads it
+ * directly, see farith) and an operand-a literal is one move.
+ *
+ * The gate is deliberately binary rather than a cost model: a run with
+ * ANY hot-path helper call does not pin at all, because the registers
+ * are caller-saved and each continuing epilogue would re-materialise
+ * every one of them. That covers the pure-arithmetic float loops this
+ * exists for and cannot regress the libm-calling ones. Widening it to
+ * a real trade (the C2b pattern) is a later step if it measures worth
+ * it. Ranked by weighted use, capped at FLIT_REGS.
+ */
+static const uint8_t FLIT_REGS[] = { 2, 3 };
+static const size_t MAX_FLITS = sizeof FLIT_REGS / sizeof FLIT_REGS[0];
+
+static std::vector<Emitter::FLit>
+pick_float_lits(const Chunk &chunk, size_t begin, size_t end)
+{
+    /*
+     * EVERYTHING here is scoped to LOOP BODIES, and that is the whole
+     * accounting. A literal use inside a loop costs its two
+     * instructions per ITERATION; a helper call inside a loop
+     * re-materialises the pool per iteration. Outside a loop both are
+     * one-time and irrelevant. Scanning the whole RUN instead measured
+     * the difference between a win and nothing: since delete-originals
+     * a run spans a whole function, so `main`'s argv/print calls - long
+     * before the loop - declined the pool on 55_float_sum's real
+     * bench shape while the identical loop inside a function pinned
+     * fine.
+     *
+     * The loop set is the union of [target, pc] over the run's BACKWARD
+     * branches - the same "region" notion C1's hoister uses, computed
+     * inline here because this needs no guard analysis, only extent.
+     */
+    std::vector<char> in_loop(end - begin, 0);
+    for (size_t pc = begin; pc < end; pc++) {
+        const Instr &in = chunk.code[pc];
+        if (op_is_branch(in.op)
+                && in.target >= static_cast<int>(begin)
+                && in.target <= static_cast<int>(pc))
+            for (size_t q = static_cast<size_t>(in.target); q <= pc; q++)
+                in_loop[q - begin] = 1;
+    }
+    for (size_t pc = begin; pc < end; pc++)
+        if (in_loop[pc - begin] && op_calls_on_hot_path(chunk.code[pc]))
+            return {};
+
+    /* weight: an operand-b literal saves BOTH instructions, an
+     * operand-a literal saves one (it still has to reach xmm0) */
+    std::vector<std::pair<double, int>> w;      /* value -> weight */
+    const auto add = [&](double v, int gain) {
+        for (auto &e : w)
+            if (std::memcmp(&e.first, &v, sizeof v) == 0)
+                { e.second += gain; return; }
+        w.push_back({ v, gain });
+    };
+    for (size_t pc = begin; pc < end; pc++) {
+        if (!in_loop[pc - begin])
+            continue;                  /* a one-time use pays nothing */
+        const Instr &in = chunk.code[pc];
+        switch (in.op) {
+        case OpCode::FloatBin:
+        case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+        case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+        case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+            if (in.a_is_lit()) add(in.a_flit(), 1);
+            if (in.b_is_lit()) add(in.b_flit(), 2);
+            break;
+        default:
+            break;
+        }
+    }
+    std::stable_sort(w.begin(), w.end(),
+                     [](const std::pair<double, int> &a,
+                        const std::pair<double, int> &b) {
+                         return a.second > b.second;
+                     });
+    std::vector<Emitter::FLit> out;
+    for (size_t i = 0; i < w.size() && i < MAX_FLITS; i++) {
+        if (w[i].second < 2)
+            break;                     /* a single a-use is a wash */
+        out.push_back({ w[i].first, FLIT_REGS[i] });
+    }
+    return out;
 }
 
 /*
@@ -4563,29 +4783,59 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
  *                  4-byte move needs no such argument.)
  *   both same t  - xmm0 has it: copy to xmm1, load nothing.
  */
-static void emit_float_operands(Emitter &e, const Instr &in, uint32_t pc)
+/*
+ * C4b: RETURNS the register operand b ended up in. It is xmm1 as
+ * before whenever b had to be materialised, but when b ALREADY lives in
+ * a register - a C2a-pinned local (xmm4-7) or a pinned float literal
+ * (xmm2-3) - nothing is emitted at all and its own register is
+ * returned, because SSE arithmetic reads any source directly. That
+ * deletes a `movsd xmm1, xmm<n>` per such operand, which on a float
+ * chain is most of them.
+ *
+ * `force_x1` is for the fmod arm, whose libm call needs y in xmm1 by
+ * the SysV float-argument order.
+ */
+static uint8_t emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
+                                   bool force_x1 = false)
 {
     const int f = g_fwd.fin_x0;
     const bool fa = f >= 0 && !in.a_is_lit() && in.a_slot() == f;
     const bool fb = f >= 0 && !in.b_is_lit() && in.b_slot() == f;
+    /* where b already lives, if anywhere (forwarding takes priority -
+     * it is in xmm0 and must move before `a` lands there) */
+    int breg = -1;
+    if (!fb && !force_x1) {
+        if (in.b_is_lit())
+            breg = e.flitreg(in.b_flit());
+        else if (const int fr = e.fcreg(in.b_slot()); fr >= 0)
+            breg = fr;
+    }
+    /* likewise for a - it must END in xmm0, so a register source is one
+     * move rather than two instructions */
+    const auto load_a = [&]() {
+        if (fa) { emit_fwd_fbump(e); return; }
+        if (in.a_is_lit()) {
+            if (const int lr = e.flitreg(in.a_flit()); lr >= 0) {
+                e.fmov_rr(X0, static_cast<uint8_t>(lr));
+                return;
+            }
+        }
+        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+                        /*no_bail=*/true);
+    };
     if (fb) {
         e.fmov_rr(X1, X0);               /* aside, BEFORE a lands in xmm0 */
         emit_fwd_fbump(e);
         if (!fa)
-            emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(),
-                            pc, /*no_bail=*/true);
-        return;
+            load_a();
+        return X1;
     }
-    if (fa) {
-        emit_fwd_fbump(e);               /* xmm0 already holds a */
-        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
-                        /*no_bail=*/true);
-        return;
-    }
-    emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
-                    /*no_bail=*/true);
+    load_a();
+    if (breg >= 0)
+        return static_cast<uint8_t>(breg);   /* already in a register */
     emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
                     /*no_bail=*/true);
+    return X1;
 }
 
 /* N6a: call a libm function `fn` (arg(s) already in xmm0[/xmm1], result
@@ -6146,9 +6396,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.bump_op(OpCode::FloatBin);   /* execution proof for the div/mod
                                             * arms (BEFORE any load - bump_op
                                             * clobbers rax) */
-        /* C4a-ii: the operand loads, forwarding-aware (a pair armed by
-         * the previous op hands its value over in XMM0). */
-        emit_float_operands(e, in, pc);
+        /* C4a-ii + C4b: the operand loads - forwarding-aware (a pair
+         * armed by the previous op hands its value over in XMM0), and
+         * returning the register operand b actually landed in (its own,
+         * when it already lived in a pin or the literal pool). */
+        const uint8_t breg = emit_float_operands(e, in, pc, is_mod);
         if (fop == 0x5E || is_mod) {
             /* float DIV and MOD throw DivisionByZeroEx on a +-0.0 divisor
              * (TypeFloat::div/mod: fpclassify(rhs) == FP_ZERO). Test the
@@ -6157,8 +6409,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * bits stay nonzero and divide, exactly fpclassify's answer).
              * A bits test avoids a ucomisd NaN pitfall (unordered sets ZF,
              * so a bare `je` would wrongly raise on a NaN divisor). */
-            e.u8(0x66); e.u8(0x48); e.u8(0x0F); e.u8(0x7E);
-            e.u8(0xC8);                            /* movq rax, xmm1 */
+            e.movq_rax_x(breg);                    /* movq rax, xmm<b> */
             e.u8(0x48); e.u8(0xD1); e.u8(0xE0);    /* shl rax, 1 */
             raise_convey_unless(e, ck, 0x75 /* jnz */, JR_DIV0, pc, old_pc);
         }
@@ -6169,18 +6420,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_libm_call(e, reinterpret_cast<const void *>(
                 static_cast<double (*)(double, double)>(&::fmod)));
         else
-            e.farith(fop);
+            e.farith(fop, breg);
         /* C4a-ii: the result is in XMM0 - arm the pair, and when the
          * temp is provably dead after the consumer, skip the store
          * entirely (the two-store round trip this lever exists to
          * delete). Nothing is emitted between two ops, so XMM0 carries
          * across the boundary. */
-        if (g_fwd.fprod == in.target) {
+        const bool fwd_arm = g_fwd.fprod == in.target;
+        if (fwd_arm) {
             g_fwd.farmed = true;
             if (g_fwd.fskip_write)
                 return true;
         }
-        emit_float_store(e, ck, X0, in.target, pc);
+        emit_float_store(e, ck, X0, in.target, pc, /*keep_x0=*/fwd_arm);
         return true;
     }
 
@@ -10157,6 +10409,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         e.cache.clear();
         e.tflush.clear();       /* C3: per-RUN like the pools */
         e.fread.clear();        /* C4a-i: per-RUN */
+        e.flits.clear();        /* C4b: per-RUN (a stale entry would let
+                                 * the next fragment read a register it
+                                 * never loaded - the C2a fcache bug) */
         e.fcache.clear();       /* C2a: per-RUN state like the GP pool - a
                                  * stale entry from the previous fragment
                                  * would flush a never-loaded xmm into the
@@ -10264,6 +10519,17 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             /* the execution proof: bumped per ENTRY of a float-pinned
              * fragment (the g_jit_hoist pattern) */
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fcache));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+        }
+#endif
+        /* C4b: the float LITERAL pool - materialised once here (and at
+         * every entry stub, below) instead of at each use. */
+        e.flits = pick_float_lits(chunk, begin, end);
+        for (const Emitter::FLit &fl : e.flits)
+            e.flit_load(fl);
+#ifdef TESTS
+        if (!e.flits.empty()) {
+            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_flit));
             e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
         }
 #endif
@@ -10665,6 +10931,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 e.load(CACHE_REGS[h], e.cache[h].payload);
             for (const Emitter::CacheEnt &c : e.fcache)
                 e.fload(c.reg, c.payload);        /* C2a float pins */
+            for (const Emitter::FLit &fl : e.flits)
+                e.flit_load(fl);                  /* C4b literal pool */
 #ifdef TESTS
             e.movabs(RCX,
                      reinterpret_cast<uint64_t>(&g_jit_entry_resume));
