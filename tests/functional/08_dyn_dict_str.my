@@ -1,0 +1,16 @@
+# Boxed/dyn values, dict insert+update+read, and string building - the
+# tiers that stay helper-served, so their register discipline is
+# exercised alongside the inline ones.
+var d = {};
+var words = split("the quick brown fox the fox", " ");
+foreach (var w in words) {
+    if (defined(d) && len(w) > 0) {
+        var cur = 0;
+        try { cur = d[w]; } catch (KeyNotFoundEx) { cur = 0; }
+        d[w] = cur + 1;
+    }
+}
+var dyn z = runtime(7);
+var acc = 0;
+for (var i = 0; i < 5; i++) { acc = acc + z; z = z + 1; }
+print("dyn:", d["the"], d["fox"], len(keys(d)), acc, join(words, "-"));

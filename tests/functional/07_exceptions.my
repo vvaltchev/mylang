@@ -1,0 +1,21 @@
+# The exception path: throw/catch by type, a payload struct, finally
+# ordering, rethrow, and a runtime error (div by zero) caught in a loop.
+struct BadInput { str why; }
+func risky(int k) {
+    if (k == 2) { throw BadInput("two"); }
+    return 100 / k;
+}
+var hist = "";
+for (var i = 0; i < 4; i++) {
+    try {
+        var v = risky(i);
+        hist = hist + "v" + str(v);
+    } catch (DivisionByZeroEx) {
+        hist = hist + "d";
+    } catch (BadInput as e) {
+        hist = hist + "b" + str(e.why);
+    } finally {
+        hist = hist + ".";
+    }
+}
+print("exc:", hist);

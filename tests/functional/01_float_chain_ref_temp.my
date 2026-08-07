@@ -1,0 +1,18 @@
+# A float expression chain at MAIN level whose temps are SHARED with the
+# reference-producing prologue (an array subscript feeding int()). That
+# collision - a live reference in the very temp an arithmetic op writes -
+# is what makes the ref-listed store take its cold arm, and it is the
+# shape two JIT register bugs needed. Deliberate here; in bench code it
+# happened only by accident.
+var av = dynarray(["3"]);
+var scale = 1;
+if (len(av) > 0)
+    scale = int(av[0]);
+var N = 4 * scale;
+var total = 0.0;
+for (var i = 1; i < N; i++) {
+    var x = i * 1.0;
+    total += x / (x + 1.0) - 0.5 / x + 1.0 / (x * x);
+}
+print("chain:", str(total, 6));
+assert(str(total, 6) == "8.944883");

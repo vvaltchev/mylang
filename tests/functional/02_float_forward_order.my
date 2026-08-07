@@ -1,0 +1,14 @@
+# Adjacent producer/consumer float pairs (the C4a-ii / C4b forwarding
+# path) using ORDER-SENSITIVE operators, so a swapped operand or a
+# wrong result register cannot produce the right number by luck.
+func f(int k) {
+  var r = 0.0;
+  for (var i = 1; i < k; i++) {
+    var a = i * 4.0;
+    r += a - (a / 8.0) + a / (a - 1.0);
+  }
+  return r;
+}
+var v = f(int(runtime(6)));
+print("fwd:", str(v, 6));
+assert(str(v, 6) == "58.186398");

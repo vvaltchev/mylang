@@ -173,15 +173,16 @@ bool g_jit_enabled = false;
  *                                 its PROFITABILITY, which is exactly
  *                                 how C4b's epilogue restore was
  *                                 verified (by hand, then).
- * `MYLANG_JIT_OFF=all` / `MYLANG_JIT_FORCE=all` select everything.
+ *   MYLANG_JIT_COLD=tier[,...]    force a guarded tier to take its
+ *                                 DECLINE arm, so a path normally
+ *                                 reached only by a rare runtime
+ *                                 coincidence becomes the ONLY path.
+ *                                 This is the RECYCLE=1 philosophy -
+ *                                 make the hostile case deterministic -
+ *                                 applied to the JIT, and it is the
+ *                                 knob that reaches axis 2.
  *
- * A third knob - forcing a guarded inline tier to take its DECLINE arm,
- * so a rare cold path becomes the only path - is DESIGNED but NOT here:
- * a first attempt overrode the SHARED `emit_ref_check`, which several
- * call sites use with different fall-through expectations, and
- * 43_sieve raised OutOfBounds. It needs per-CALL-SITE opt-in, and a
- * bounded run lane (forcing every scalar store through a helper made
- * `-rt` go from 2.6s to over 10 minutes). See the task.
+ * `MYLANG_JIT_OFF=all` / `FORCE=all` / `COLD=all` select everything.
  */
 enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
@@ -227,6 +228,35 @@ static bool jit_lever_off(JitLever l) { return jit_off_mask() & (1u << l); }
 static bool jit_lever_forced(JitLever l)
 {
     return !jit_lever_off(l) && (jit_force_mask() & (1u << l));
+}
+
+/*
+ * The forceable COLD TIERS. Each names a guarded fast path whose
+ * DECLINE arm REJOINS (so forcing it is semantically transparent -
+ * which is exactly the contract worth testing). A tier whose decline
+ * EXITS - a div0 raise, an OOB convey - must never appear here:
+ * forcing those would change observable behaviour rather than test it.
+ *
+ * `refstore`: the ref-listed SCALAR STORE (store_dst / store_dst_bool /
+ * emit_float_store). Their fast arm is the two-store; their cold arm
+ * calls jit_put_{int,bool,float} to release the old reference first.
+ * Normally that arm runs only when the slot HAPPENS to hold a
+ * reference at that op - a slot-allocation coincidence a hand-written
+ * test essentially never reproduces, and the precondition of both JIT
+ * register bugs found on 2026-08-04. Forced, every scalar store
+ * exercises the helper call and its register discipline.
+ */
+enum JitColdTier { JC_REFSTORE, JC_COUNT };
+static const char *const jit_cold_names[JC_COUNT] = { "refstore" };
+static unsigned jit_cold_mask()
+{
+    static const unsigned m =
+        jit_parse_mask("MYLANG_JIT_COLD", jit_cold_names, JC_COUNT);
+    return m;
+}
+static bool jit_cold_forced(JitColdTier t)
+{
+    return jit_cold_mask() & (1u << t);
 }
 
 #if defined(__SANITIZE_ADDRESS__)
@@ -1924,14 +1954,30 @@ static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
  * interpreter (the bench-40 bug: iteration 1 finds the temp holding a
  * stale ref). emit_ref_check emits the test and returns the `jb` to be
  * patched to the fast path. Uses rcx as scratch (dead at every store). */
-static size_t emit_ref_check(Emitter &e, int32_t type_off)
+/*
+ * `cold` opts THIS call site into MYLANG_JIT_COLD forcing. It is a
+ * PARAMETER, not a global read inside the helper: a first version
+ * overrode emit_ref_check for every caller at once, which is the wrong
+ * granularity for a knob whose whole purpose is to isolate one tier.
+ *
+ * Forced, the comparison is against 0 instead of t_str: `jb` is
+ * UNSIGNED, so "below zero" is never true and the jump to the fast
+ * label is never taken - while every emitted byte, and so every patch8
+ * displacement downstream, is unchanged. (Emitting a bare `jmp` forces
+ * the FAST arm instead - the returned jump is the one TO the fast
+ * label. My first attempt had that backwards and a coverage counter
+ * caught it.)
+ */
+static size_t emit_ref_check(Emitter &e, int32_t type_off,
+                             JitColdTier cold = JC_COUNT)
 {
     const JitLayout &L = jit_layout();
+    const bool force = cold != JC_COUNT && jit_cold_forced(cold);
     e.load(RCX, type_off);                    /* rcx = current Type* */
     e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
     e.u32(static_cast<uint32_t>(L.type_t_off));
-    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
-    e.u32(static_cast<uint32_t>(L.t_str_val));
+    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str/0 */
+    e.u32(force ? 0u : static_cast<uint32_t>(L.t_str_val));
     return e.j8(0x72);                         /* jb -> fast (trivial value) */
 }
 
@@ -3242,14 +3288,26 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
     const SlotAddr a = slot_addr(dst);
     if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                            static_cast<int32_t>(dst))) {
-        const size_t jb_fast = emit_ref_check(e, a.type);
+        const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_int),
                           dst, src_reg);
-        if (keep_rax)                         /* lever A: the put call
-                                               * clobbered RAX - COLD-arm
-                                               * reload (the hot two-store
-                                               * preserves it for free) */
-            e.load(RAX, a.payload);
+        /*
+         * The put call clobbered RAX, and this arm ALWAYS reloads it -
+         * `keep_rax` used to gate it (lever A asked for the reload; no
+         * other caller did). That was wrong: `ForLoopStep`/`IntAddStep`
+         * store the counter and then `cmp rax, <bound>` for the loop
+         * test, so a ref-listed counter taking this arm compared
+         * GARBAGE and the loop ran the wrong number of times - an
+         * OutOfBounds a few statements later. It survived because the
+         * arm needs the slot to actually HOLD a reference at the store,
+         * which is a slot-allocation coincidence; MYLANG_JIT_COLD=
+         * refstore makes it the only path and it failed in 0.7s.
+         * Unconditional here costs the HOT path nothing (the two-store
+         * arm below preserves RAX for free), so there is no reason to
+         * make every caller reason about it.
+         */
+        (void)keep_rax;
+        e.load(RAX, a.payload);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch8(jb_fast, e.pos());           /* fast: */
         e.store(RSI, a.type);                 /* the int Type singleton */
@@ -3273,7 +3331,7 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
     const uint64_t tb = reinterpret_cast<uint64_t>(jit_layout().t_bool);
     if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                            static_cast<int32_t>(dst))) {
-        const size_t jb_fast = emit_ref_check(e, a.type);
+        const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_bool),
                           dst, src_reg);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
@@ -4717,7 +4775,7 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
     const SlotAddr a = slot_addr(dst);
     if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                            static_cast<int32_t>(dst))) {
-        const size_t jb_fast = emit_ref_check(e, a.type);
+        const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
         /* C4b inc 2: jit_put_float takes its value in XMM0 by the SysV
          * float-argument order, and the result register is no longer
          * always xmm0 - move it there first. (Missing this stored the

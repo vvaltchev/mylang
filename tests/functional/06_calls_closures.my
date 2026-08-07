@@ -1,0 +1,12 @@
+# The call protocol: direct calls, recursion (the C4c inline frame pop),
+# a cached recursive call, a closure with captured state, and a callback
+# through a builtin (the VmInvoker boundary path).
+func add(a, b) { var t = a + b; return t; }
+func sumto(n) { if (n == 0) { return 0; } var t = sumto(n - 1); return t + n; }
+func fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
+func mk(int start) { return func [start] (int d) { start = start + d; return start; }; }
+var c = mk(10);
+var r = [add(2, 3), sumto(6), fib(9), c(5), c(7)];
+var arr = [5, 2, 8, 1, 9];
+sort(arr, func(a, b) => a < b);
+print("calls:", r[0], r[1], r[2], r[3], r[4], arr[0], arr[4]);
