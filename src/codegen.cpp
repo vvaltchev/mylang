@@ -7904,6 +7904,25 @@ bool jit_struct_facts(const Chunk &chunk, const std::vector<int> &entry_pcs,
     return true;
 }
 
+/*
+ * C4e: the audited enumeration itself, for an emitter policy that has to
+ * ask "does this op touch slot S, and how". Exported rather than copied
+ * into jit.cpp for the reason jit_fwd_info/jit_struct_facts are: a second
+ * per-op slot table would be free to drift from this one, and the trap
+ * that costs (THE AUDIT-TABLE STAGE TRAP) is silence, not failure.
+ * Returns false for an op the table does not know - the caller must then
+ * treat it as touching EVERYTHING.
+ */
+bool jit_op_slot_refs(const Instr &in, std::vector<int> &uses,
+                      std::vector<int> &defs)
+{
+    uses.clear();
+    defs.clear();
+    return visit_use_def(in,
+                         [&](int s) { uses.push_back(s); },
+                         [&](int s) { defs.push_back(s); });
+}
+
 static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
 {
     if (code.empty())

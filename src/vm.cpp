@@ -3661,6 +3661,32 @@ extern "C" void jit_struct_ctor_planned(const void *defv, const void *planv,
         *static_cast<const Chunk::CtorPlan *>(planv), dst);
 }
 
+/*
+ * C4e: make the H1 reuse invariant TRUE, once, in a loop's preheader, so
+ * the ctors inside it need no guards at all. Idempotent and deliberately
+ * NON-destructive when the slot is already reusable: that is what keeps a
+ * re-entered loop (an inner loop of a nest) at exactly ONE allocation for
+ * the whole program, and what makes running it before the first iteration
+ * indistinguishable from what that iteration's own slow tier would do.
+ * The emitter only calls this where entering the preheader PROVES the
+ * ctor executes (see jit_pick_ctor_establish).
+ */
+extern "C" void jit_struct_ctor_establish(const void *defv,
+                                          int_type dst) noexcept
+{
+    StructTypeDef *const def =
+        const_cast<StructTypeDef *>(static_cast<const StructTypeDef *>(defv));
+    LValue &d = g_current_ctx->frame->at(dst);
+    const EvalValue &cur = d.get();
+    if (cur.is<intrusive_ptr<StructObject>>()) {
+        const intrusive_ptr<StructObject> &so =
+            cur.get_ref<intrusive_ptr<StructObject>>();
+        if (so->def == def && !so->readonly && so.use_count() == 1)
+            return;                          /* already reusable */
+    }
+    d.put(EvalValue(make_intrusive<StructObject>(def)));
+}
+
 /* model-flip (nativize-ops): the native StructCtorBoxedV body - a BOXED (non-POD)
  * struct construction `B(a, x)` with runtime args, via vm_struct_ctor_boxed (it
  * also doubles as the CHECKED POD ctor). `bcv` is a baked

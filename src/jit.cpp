@@ -64,6 +64,7 @@ unsigned long g_jit_ffwd = 0;          /* C4a-ii: FLOAT forwarded runs */
 unsigned long g_jit_flit = 0;          /* C4b: literal-pinned frag entries */
 unsigned long g_jit_fstore_movx0 = 0;  /* C4b inc 2: ref-arm result move */
 unsigned long g_jit_member_noguard = 0; /* C4d: guard-elided member reads */
+unsigned long g_jit_ctor_est = 0;      /* C4e: established ctor preheaders */
 unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
@@ -188,11 +189,11 @@ bool g_jit_enabled = false;
 enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
-    JL_COUNT
+    JL_CEST, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
-    "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact"
+    "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -2157,6 +2158,16 @@ static bool struct_fact_at(size_t pc, int slot, const StructTypeDef *def)
             return true;
     return false;
 }
+
+/*
+ * C4e: the ctors whose H1 invariant a loop PREHEADER established, so the
+ * per-iteration form is `mov rax, dst.payload; mov r9, [rax+bytes]` and
+ * the four guards are gone. Keyed by the ORIGINAL (pre-collapse) pc, the
+ * same handle C4d's facts use. `g_est_at[T]` lists the ctor pcs whose
+ * establish calls the preheader at T must emit.
+ */
+static std::vector<char> g_est_pc;                    /* pc -> established */
+static std::map<size_t, std::vector<size_t>> g_est_at;   /* T -> ctor pcs */
 
 /* The one lookup every hoist-aware emit arm goes through: whichever
  * active hoist serves (base, kind), or null. */
@@ -7604,35 +7615,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             const Chunk::CtorPlan &cp = ck.ctor_plans[plan];
             size_t j_done = 0;
             bool have_fast = false;
-            if (L.sobj_ok) {
-                have_fast = true;
-                const SlotAddr d = slot_addr(in.target);
-                e.load(RAX, d.type);
-                e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_struct));
-                e.cmp_rax_rcx();
-                const size_t js1 = e.j32(0x75);
-                e.load(RAX, d.payload);           /* rax = StructObject* */
-                e.movabs(RCX, reinterpret_cast<uint64_t>(
-                                  ck.struct_defs[in.target2]));
-                /* cmp [rax + sobj_def], rcx */
-                e.u8(0x48); e.u8(0x39); e.u8(0x88);
-                e.u32(static_cast<uint32_t>(L.sobj_def));
-                const size_t js2 = e.j32(0x75);
-                /* cmp dword [rax + sobj_rc], 1  (use_count == 1) */
-                e.u8(0x83); e.u8(0xB8);
-                e.u32(static_cast<uint32_t>(L.sobj_rc)); e.u8(0x01);
-                const size_t js3 = e.j32(0x75);
-                /* cmp byte [rax + sobj_ro], 0  (not readonly) */
-                e.u8(0x80); e.u8(0xB8);
-                e.u32(static_cast<uint32_t>(L.sobj_ro)); e.u8(0x00);
-                const size_t js4 = e.j32(0x75);
-#ifdef TESTS
-                e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_ctor_fast));
-                e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
-#endif
-                /* r9 = bytes data (vector _M_start at +0, probed) */
-                e.u8(0x4C); e.u8(0x8B); e.u8(0x88);
-                e.u32(static_cast<uint32_t>(L.sobj_bytes));
+
+            /* the field stores off r9 (the instance's byte buffer) -
+             * shared by the guarded path and C4e's established one so
+             * the two can never drift */
+            const auto emit_ctor_fields = [&]() {
                 for (size_t fi = 0; fi < cp.f.size(); fi++) {
                     const Chunk::CtorPlanField &pf = cp.f[fi];
                     const SlotAddr s = slot_addr(pf.src);
@@ -7667,6 +7654,56 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         break;
                     }
                 }
+            };
+
+            /*
+             * C4e: a loop preheader ran jit_struct_ctor_establish on this
+             * slot, so the four H1 guards are already true and stay true
+             * for the whole region (jit_pick_ctor_establish proved nothing
+             * in it can rebind the slot or retain the instance). Two
+             * instructions, and no slow tier - the guards were the only
+             * thing that could decline.
+             */
+            if (L.sobj_ok && old_pc < g_est_pc.size() && g_est_pc[old_pc]) {
+                const SlotAddr d = slot_addr(in.target);
+                e.load(RAX, d.payload);        /* rax = StructObject* */
+                /* r9 = bytes data (vector _M_start at +0, probed) */
+                e.u8(0x4C); e.u8(0x8B); e.u8(0x88);
+                e.u32(static_cast<uint32_t>(L.sobj_bytes));
+                emit_ctor_fields();
+                return true;
+            }
+
+            if (L.sobj_ok) {
+                have_fast = true;
+                const SlotAddr d = slot_addr(in.target);
+                e.load(RAX, d.type);
+                e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_struct));
+                e.cmp_rax_rcx();
+                const size_t js1 = e.j32(0x75);
+                e.load(RAX, d.payload);           /* rax = StructObject* */
+                e.movabs(RCX, reinterpret_cast<uint64_t>(
+                                  ck.struct_defs[in.target2]));
+                /* cmp [rax + sobj_def], rcx */
+                e.u8(0x48); e.u8(0x39); e.u8(0x88);
+                e.u32(static_cast<uint32_t>(L.sobj_def));
+                const size_t js2 = e.j32(0x75);
+                /* cmp dword [rax + sobj_rc], 1  (use_count == 1) */
+                e.u8(0x83); e.u8(0xB8);
+                e.u32(static_cast<uint32_t>(L.sobj_rc)); e.u8(0x01);
+                const size_t js3 = e.j32(0x75);
+                /* cmp byte [rax + sobj_ro], 0  (not readonly) */
+                e.u8(0x80); e.u8(0xB8);
+                e.u32(static_cast<uint32_t>(L.sobj_ro)); e.u8(0x00);
+                const size_t js4 = e.j32(0x75);
+#ifdef TESTS
+                e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_ctor_fast));
+                e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+#endif
+                /* r9 = bytes data (vector _M_start at +0, probed) */
+                e.u8(0x4C); e.u8(0x8B); e.u8(0x88);
+                e.u32(static_cast<uint32_t>(L.sobj_bytes));
+                emit_ctor_fields();
                 j_done = e.j32(0xEB);
                 e.patch32_here(js1);
                 e.patch32_here(js2);
@@ -9744,6 +9781,162 @@ static bool op_never_exits(const Instr &in)
     }
 }
 
+/*
+ * C4e: PICK THE CTORS A LOOP PREHEADER CAN ESTABLISH.
+ *
+ * A planned StructCtorV spends 13 instructions before it can touch a
+ * byte - dst holds a struct / same def / sole owner / not readonly / load
+ * the buffer - and in a loop all four are true from iteration 2 on. C4d's
+ * dataflow cannot reach them: at the loop head the fact dies in the meet
+ * with the preheader, CORRECTLY, since iteration 1 must really check.
+ *
+ * So make the invariant true instead of proving it. The preheader calls
+ * jit_struct_ctor_establish once and every iteration then emits
+ * `mov rax, dst.payload; mov r9, [rax+bytes]`. There is no cold twin and
+ * no versioning: the establish cannot fail.
+ *
+ * THE SAFETY ARGUMENT, in the order the checks below enforce it:
+ *
+ *  - the establish WRITES the slot, so it must be unobservable. Reaching
+ *    the preheader falls through into T, and a region with no internal
+ *    branch and no exiting op runs EVERY op in it - so the ctor runs, and
+ *    the establish does exactly what that first ctor's own slow tier
+ *    would have done. (This is why a top-tested `while` is refused: its
+ *    T is the condition, and the body may never run.)
+ *  - the reuse invariant must SURVIVE the loop. The refcount is what can
+ *    break it - a MoveV copy, a store into a container, an arg bind all
+ *    retain the value and H1 would then have to allocate - so the slot
+ *    may appear in the region ONLY as this ctor's dst and as a baked
+ *    member read's BASE, which reads bytes and retains nothing. `readonly`
+ *    has no in-region setter and the def is a compile-time constant.
+ *  - an op the audited table does not know refuses the whole region: it
+ *    could reference the slot in a way this scan cannot see.
+ *
+ * Deliberately NOT handled (each would need its own argument): a slot
+ * constructed by two ctors in one region, a TEMP dst (scratch reused
+ * across runs), and StoreMemberV (a field write is retain-free, but it
+ * wants its own proof that the base cannot be the ctor's dst under a
+ * different alias).
+ */
+static void jit_pick_ctor_establish(
+    const Chunk &chunk, size_t begin, size_t end,
+    const std::vector<std::pair<size_t, size_t>> &entries,
+    std::vector<char> &est_pc, std::map<size_t, std::vector<size_t>> &est_at)
+{
+    static const bool dbg = getenv("MYLANG_ESTDBG") != nullptr;
+
+    for (size_t L = begin; L < end; L++) {
+        const Instr &bi = chunk.code[L];
+        if (!op_is_branch(bi.op) || bi.target < static_cast<int>(begin)
+                || bi.target > static_cast<int>(L))
+            continue;                                  /* not a back edge */
+        const size_t T = static_cast<size_t>(bi.target);
+
+        /*
+         * Every op runs once per iteration: no branch but the back edge,
+         * and nothing that can exit part-way through. A C4d-ELIDED member
+         * read counts as never-exiting even though the opcode does not -
+         * that is the honest test, because with its guards proved away it
+         * emits a raw byte read with no slow tier and literally cannot
+         * throw. Using the static op_never_exits here instead refused
+         * every real struct loop (64's five reads are all elided).
+         */
+        const auto cannot_exit = [&](size_t p) {
+            const Instr &in = chunk.code[p];
+            if (op_never_exits(in))
+                return true;
+            if ((in.op == OpCode::LoadMemberInt
+                 || in.op == OpCode::LoadMemberFloat)
+                    && in.b_dual_lo() >= 0 && (in.b_dual_hi() >> 2) >= 0
+                    && static_cast<size_t>(in.b_dual_hi() >> 2)
+                           < chunk.struct_defs.size())
+                return struct_fact_at(p, in.target2,
+                                      chunk.struct_defs[in.b_dual_hi() >> 2]);
+            return false;
+        };
+        bool ok = true;
+        for (size_t p = T; p < L && ok; p++)
+            if (op_is_branch(chunk.code[p].op) || !cannot_exit(p)) {
+                if (dbg) fprintf(stderr, "est[%zu,%zu): op %d at %zu\n",
+                                 T, L, (int)chunk.code[p].op, p);
+                ok = false;
+            }
+        if (!ok || !op_never_exits(bi))
+            continue;
+        /* a RESUME inside the region would skip the preheader */
+        for (const auto &pe : entries)
+            if (pe.first >= T && pe.first <= L)
+                ok = false;
+        for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+            for (const Chunk::HandlerClause &cl : hs.clauses)
+                if (cl.body_pc >= static_cast<int>(T)
+                        && cl.body_pc <= static_cast<int>(L))
+                    ok = false;
+            if (hs.fin_pc >= static_cast<int>(T)
+                    && hs.fin_pc <= static_cast<int>(L))
+                ok = false;
+        }
+        /* and no jump into it from outside */
+        for (size_t p = begin; p < end && ok; p++) {
+            const Instr &in = chunk.code[p];
+            if (op_is_branch(in.op) && in.target >= static_cast<int>(T)
+                    && in.target <= static_cast<int>(L)
+                    && (p < T || p > L))
+                ok = false;
+        }
+        if (!ok)
+            continue;
+
+        /* the candidate ctors, then the per-slot appearance scan */
+        std::vector<size_t> cands;
+        for (size_t p = T; p <= L; p++) {
+            const Instr &in = chunk.code[p];
+            if (in.op == OpCode::StructCtorV && in.b_dual_hi() >= 0
+                    && in.target >= 0 && in.target < chunk.slot_count
+                    && in.target2 >= 0
+                    && static_cast<size_t>(in.target2)
+                           < chunk.struct_defs.size()
+                    && chunk.struct_defs[in.target2])
+                cands.push_back(p);
+        }
+        std::vector<int> uses, defs;
+        std::vector<size_t> keep;
+        for (size_t cp : cands) {
+            const int S = chunk.code[cp].target;
+            bool good = true;
+            for (size_t p = T; p <= L && good; p++) {
+                if (p == cp)
+                    continue;
+                const Instr &in = chunk.code[p];
+                if (!jit_op_slot_refs(in, uses, defs)) {
+                    good = false;                      /* unaudited op */
+                    break;
+                }
+                for (int d : defs)
+                    if (d == S)
+                        good = false;                  /* a second writer */
+                for (int u : uses)
+                    if (u == S
+                            && !((in.op == OpCode::LoadMemberInt
+                                  || in.op == OpCode::LoadMemberFloat)
+                                 && in.target2 == S))
+                        good = false;                  /* may RETAIN it */
+            }
+            if (good)
+                keep.push_back(cp);
+            else if (dbg)
+                fprintf(stderr, "est[%zu,%zu): slot %d refused\n", T, L, S);
+        }
+        if (keep.empty())
+            continue;
+        for (size_t cp : keep)
+            est_pc[cp] = 1;
+        est_at[T] = keep;
+        if (dbg) fprintf(stderr, "est[%zu,%zu): PICKED %zu ctor(s)\n",
+                         T, L, keep.size());
+    }
+}
+
 /* DELETABLE (the interpreted original can be dropped from the rebuilt
  * bytecode): never-exits, OR a CONVEY-WITH-OWN-LOC throwing op. The latter's
  * contract (plans/model-flip.md, the re-raise deletability pass): the helper
@@ -10425,6 +10618,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     g_sf_slot.clear();
     g_sf_def.clear();
     g_sf_in.clear();
+    g_est_pc.assign(chunk.code.size(), 0);
+    g_est_at.clear();
 
     /* model-flip M3: try the native-container path first (a narrow gate); on a
      * match it emits the whole-function container and we're done. Otherwise the
@@ -10797,6 +10992,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         g_hoist2 = JitHoist{};
         std::vector<HoistRegion> hregs =
             jit_hoist_pick(chunk, begin, end, entries);
+        /* C4e: the ctors this run's loop preheaders can establish */
+        g_est_at.clear();
+        if (!jit_lever_off(JL_CEST))
+            jit_pick_ctor_establish(chunk, begin, end, entries,
+                                    g_est_pc, g_est_at);
         if (jit_lever_off(JL_HOIST))
             hregs.clear();
         else if (jit_lever_off(JL_HOIST2))
@@ -11221,6 +11421,34 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 }
                 g_fwd = JitFwd{};                 /* the nav clobbered rax */
                 hri++;
+            }
+            /* C4e: this loop's PREHEADER - establish each picked ctor's H1
+             * invariant once. Emitted before label[pc], so only the
+             * fall-through entry pays (a back edge targets the label), and
+             * reaching here proves the region's ops run at least once. */
+            {
+                const auto ea = g_est_at.find(pc);
+                if (ea != g_est_at.end()) {
+                    for (size_t cp : ea->second) {
+                        const Instr &ci = chunk.code[cp];
+                        emit_call_prologue(e);
+                        e.movabs(RDI, reinterpret_cast<uint64_t>(
+                                          chunk.struct_defs[ci.target2]));
+                        e.movabs(RSI, static_cast<uint64_t>(
+                                          static_cast<int_type>(ci.target)));
+                        e.call_relocs.push_back(
+                            { e.pos(), reinterpret_cast<const void *>(
+                                           jit_struct_ctor_establish) });
+                        e.u8(0xE8); e.u32(0);
+                        emit_call_epilogue(e);
+#ifdef TESTS
+                        e.movabs(RCX, reinterpret_cast<uint64_t>(
+                                          &g_jit_ctor_est));
+                        e.u8(0x48); e.u8(0xFF); e.u8(0x01);
+#endif
+                    }
+                    g_fwd = JitFwd{};             /* the calls clobbered rax */
+                }
             }
             label[pc - begin] = e.pos();
             emit_one(pc, /*in_cold=*/false, end);

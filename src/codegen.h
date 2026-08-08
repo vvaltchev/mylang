@@ -122,6 +122,16 @@ bool jit_struct_facts(const Chunk &chunk, const std::vector<int> &entry_pcs,
                       std::vector<uint32_t> &in);
 
 /*
+ * C4e: one op's frame-slot reads and writes, from the SAME audited
+ * enumeration (visit_use_def) the peephole and jit_fwd_info use. Returns
+ * false for an op the table does not know - the caller must then treat it
+ * as touching every slot. Exported so an emitter policy that needs
+ * per-slot facts cannot grow a second, drifting copy of the table.
+ */
+bool jit_op_slot_refs(const Instr &in, std::vector<int> &uses,
+                      std::vector<int> &defs);
+
+/*
  * #78 step B: assert the HANDLER TABLE still describes the interpreted
  * CatchTest/Reraise chain (see Chunk::handler_sites). Called after every
  * pc-moving transformation while both representations exist - the
