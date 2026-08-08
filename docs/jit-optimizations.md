@@ -2290,3 +2290,58 @@ Making them typed also turned the CONSUMING arithmetic typed - the loop's
 `bin.v` + `compound.v` became `i.bin` - so the win is the whole expression,
 not the reads alone. Reach is still one program: `member.v` occurs only in
 77 across bench/ + samples/.
+
+## G3 (2026-08-06): skip the IDENTITY field coercion when building a struct
+
+After G4, 77_struct_array_lit's remaining cost is the BUILD - 68% of the
+bench, ~1089 Ir per iteration. The per-element ALLOCATION is already gone
+(top-10 #5's dst-reuse overwrites the previous iteration's bytes), so what
+was left is per-FIELD:
+
+    vm_make_struct_array_op   737
+    coerce_struct_field       196
+    pod_store_field            80
+    coerce_to_decl_type        76
+
+`coerce_struct_field` takes its `EvalValue` **BY VALUE** - a 32-byte
+non-trivial type, so a copy in and a copy out - and then calls
+`coerce_to_decl_type`, which does the same again. That is the
+by-value-parameter disease `vm_frame_leave` (#82) and lever 1 were cured
+of, running once per FIELD of every struct built. For a field that already
+holds its declared kind the whole thing is identity.
+
+`field_exact_scalar` (structtype.h) answers "is this already exactly the
+field's scalar kind", and the two build loops then call `pod_store_field`
+(which takes a const reference) directly. **EXACT match only**: every real
+widening - bool -> int, bool/int -> float - still goes through the real
+coercion, as do `none` into an opt field and every non-scalar kind.
+
+**THE TEST SHAPE IS THE WHOLE DIFFICULTY.** The edit is in
+`vm_make_struct_array_op`'s DST-REUSE arm, which only runs once the slot
+ALREADY holds a matching array - i.e. from the second iteration of a
+LOOP-CARRIED literal. A one-shot `var a = [W(..)]` takes
+`vm_make_struct_array` instead and never reaches it, so a non-loop test is
+vacuous; the first one written here was exactly that and the sabotage
+sailed through it.
+
+And the sabotage's failure is **VM-ONLY**: the tree-walker does not use
+this op at all, so the headline `Tests passed: N/N` (the tree-walker pass)
+stays green and only the four Differential lines flip - plus the exit code.
+Read those lines, not the headline, when the change is VM-side.
+
+Sabotage watched failing: accepting a bool as an exact int (so a real
+widening gets skipped and the raw payload is stored) -> 1531/1532 in all
+four differential modes, exit 1.
+
+Measured (`OPT=1 ASSERTS=0`, callgrind Ir):
+
+    77_struct_array_lit   797M -> 602M   -24.52%
+    64_struct_create / 58_structs / 65_struct_field_sum    +0.00%
+
+Cumulative for 77 across G4 + G3: **1571M -> 602M, -61.7%**.
+
+**SIBLINGS NOT TAKEN:** `vm_make_struct_array` (the FRESH-build path, what a
+non-loop-carried literal uses) and `construct_struct_from_values`
+(StructCtorV) have the same per-field identity coercion. The latter got the
+same treatment here; the fresh array path did not, and is why
+64_struct_create is flat.

@@ -302,3 +302,28 @@ public:
         pod_store_field(def->fields[slot], bytes.data(), v);
     }
 };
+
+/*
+ * G3: does this value ALREADY hold exactly the field's declared scalar
+ * kind, so coerce_struct_field would hand it straight back?
+ *
+ * Worth a predicate because that coercion is NOT cheap for a no-op: it
+ * takes its EvalValue BY VALUE - a 32-byte non-trivial type, so a copy in
+ * and a copy out - and then calls coerce_to_decl_type, which does the same
+ * again. That is the by-value-parameter disease vm_frame_leave (#82) and
+ * lever 1 were cured of; here it ran once PER FIELD of every struct built.
+ *
+ * EXACT-match only, deliberately. Every real conversion still goes through
+ * coerce_struct_field: bool -> int, bool/int -> float (all supported and
+ * kept working), `none` into an opt field, and every non-scalar kind. This
+ * skips the identity case and nothing else.
+ */
+inline bool field_exact_scalar(const FieldDef &fd, const EvalValue &v)
+{
+    switch (fd.kind) {
+        case FieldKind::f_int:   return v.is<int_type>();
+        case FieldKind::f_float: return v.is<float_type>();
+        case FieldKind::f_bool:  return v.is<bool>();
+        default:                 return false;
+    }
+}

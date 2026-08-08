@@ -906,11 +906,19 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
                 char *out = ma.flat_structs().buf.data();
                 for (size_t i = 0; i < static_cast<size_t>(n); i++) {
                     char *b = out + i * static_cast<size_t>(stride);
-                    for (size_t j = 0; j < M; j++)
-                        pod_store_field(def->fields[j], b,
-                            coerce_struct_field(def->fields[j],
-                                                vals[i * M + j],
-                                                Loc(), Loc()));
+                    for (size_t j = 0; j < M; j++) {
+                        const FieldDef &fd = def->fields[j];
+                        const EvalValue &fv = vals[i * M + j];
+                        /* G3: skip the IDENTITY coercion (see
+                         * field_exact_scalar, structtype.h) - it copies a
+                         * 32-byte EvalValue in and out for nothing. Every
+                         * real widening still takes the call below. */
+                        if (field_exact_scalar(fd, fv))
+                            pod_store_field(fd, b, fv);
+                        else
+                            pod_store_field(fd, b,
+                                coerce_struct_field(fd, fv, Loc(), Loc()));
+                    }
                 }
                 return;
             }
