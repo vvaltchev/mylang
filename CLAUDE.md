@@ -3294,6 +3294,23 @@ and two macros:
   "Static type inference"). Plain `Exception`s (not `RuntimeException`s), so
   **not catchable** from script; each carries a custom interned message + `Loc`.
   A statically provable type error is reported here, before the program runs.
+- **The ASSIGNABLE-SHAPE rule (maintainer's call, 2026-08-06).** When
+  not-an-lvalue is decidable from the target's SHAPE, it is a COMPILE failure
+  (`SyntaxErrorEx`, from `pExpr14` in the PARSER - so it needs no type
+  information and no pass a flag can disable); when it depends on a runtime
+  VALUE it stays the catchable `NotLValueEx`. Exactly four forms can denote a
+  location: `Identifier`, `IdList`, `Subscript`, `MemberExpr`. A literal, a
+  call result, an arith/compare/logical chain, a ternary and a SLICE are
+  values, so `s[0:1] = v` / `(a+b) = 3` / `f() = 3` are refused at compile
+  time. A CONST element target lands there too, because the parser already
+  folded `K[0]` to its literal - which is right: it IS decidable. The same
+  const reached through a PARAMETER is not folded, keeps its Subscript shape,
+  and still raises the runtime `NotLValueEx`. This closed two divergences: the
+  tree-walker reported a slice target as `TypeErrorEx` "does NOT support slice
+  operator []" (misleading - the type slices fine, the RESULT is not a
+  location), and the no-fail codegen could lower neither a slice nor an
+  arithmetic target, so the VM raised a NON-catchable `InternalErrorEx` where
+  the tree-walker raised a catchable `NotLValueEx`.
 - `DECL_RUNTIME_EX` — subclasses of `RuntimeException` (adds `clone()` +
   `[[noreturn]] rethrow()`):
   `DivisionByZeroEx`, `TypeErrorEx`, `OutOfBoundsEx`, `KeyNotFoundEx`,

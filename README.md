@@ -648,6 +648,26 @@ s[0] = 9;         # error: NotLValueEx
 s = [9, 9];       # OK: rebinding the name s is allowed
 ```
 
+**What can appear on the left of `=`.** Exactly four forms denote a location:
+a variable, an id list (`a, b = ...`), an element `a[i]`, and a field `a.f`.
+Anything else — a literal, a call result, an arithmetic/comparison/logical
+expression, a ternary, or a **slice** `a[i:j]` — is a value, not a place, so
+assigning to it is a **compile error**:
+
+```C#
+0 = 99;             # compile error: not an assignable location
+(a + b) = 3;        # compile error
+f() = 3;            # compile error
+s[0:2] = "xy";      # compile error: a slice is a value (there is no
+                    # slice-assignment; build a new string instead)
+```
+
+The rule is: when the target cannot possibly be a location *because of its
+shape*, the compiler rejects it. When assignability depends on the **value**
+at run time — writing through a `const` container, or through a `dyn` that
+happens to hold a read-only one — it stays a catchable `NotLValueEx`, as in
+the example above.
+
 To get a mutable copy you must ask for one explicitly: `clone(x)` makes a
 **shallow** mutable copy (only the top level is copied; nested objects are
 shared, so nested objects of a const stay read-only), while `deepclone(x)` makes

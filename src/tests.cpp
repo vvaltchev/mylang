@@ -6681,12 +6681,16 @@ static const std::vector<test> tests =
         },
     },
     {
-        "array<bool>: mutating a const bool array throws",
+        /* A CONST element target folds to its literal at parse time, so it
+         * is decidable at COMPILE time - a SyntaxError since 2026-08-06.
+         * The same const reached through a PARAMETER is not folded and
+         * still raises the runtime NotLValueEx (see the const-arg tests). */
+        "array<bool>: mutating a const bool array is a compile error",
         {
             "const K = [true, false];",
             "K[0] = false;",
         },
-        &typeid(NotLValueEx),
+        &typeid(SyntaxErrorEx),
     },
     {
         "array<bool>: dyn-launder mutation with a non-bool throws",
@@ -7313,10 +7317,61 @@ static const std::vector<test> tests =
      * (not an EvalStmt fallback): the caret must stay byte-identical to the
      * tree-walker's runtime throw. The differential runs each under -vm too. */
     {
-        "err loc: assigning to a literal is a not-an-lvalue error",
+        "err loc: assigning to a literal is a compile error",
         { "0 = 99;" },
-        &typeid(NotLValueEx), 1, 0, 3, 0,
+        &typeid(SyntaxErrorEx), 1, 0, 3, 0,
     },
+
+    /*
+     * THE ASSIGNABLE-SHAPE RULE (maintainer's call, 2026-08-06): when
+     * not-an-lvalue is decidable from the target's SHAPE alone it is a
+     * COMPILE failure; when it depends on a runtime VALUE it stays the
+     * catchable NotLValueEx it has always been.
+     *
+     * Only four forms can ever denote a location: a variable, an id list,
+     * an element `a[i]`, a field `a.f`. Before this, a SLICE target
+     * reported the tree-walker's misleading TypeErrorEx "does NOT support
+     * slice operator []" (the type slices fine - the result is just not a
+     * location) and the no-fail codegen could lower neither a slice nor an
+     * arithmetic target, so the VM raised a NON-catchable InternalErrorEx
+     * where the tree-walker raised a catchable NotLValueEx.
+     */
+    { "lvalue shape: a string slice target is a compile error",
+      { "func f(x) { x[0:1] = \"z\"; }", "f(\"abc\");" },
+      &typeid(SyntaxErrorEx) },
+    { "lvalue shape: an array slice target is a compile error",
+      { "func f(x) { x[0:2] = [9, 9]; }", "f([1, 2, 3]);" },
+      &typeid(SyntaxErrorEx) },
+    { "lvalue shape: a compound slice target is a compile error",
+      { "func f(x) { x[0:1] += \"z\"; }", "f(\"abc\");" },
+      &typeid(SyntaxErrorEx) },
+    { "lvalue shape: an arithmetic target is a compile error",
+      { "var a = 1; var b = 2;", "(a + b) = 3;" },
+      &typeid(SyntaxErrorEx) },
+    { "lvalue shape: a call result target is a compile error",
+      { "func g() { return 1; }", "g() = 3;" },
+      &typeid(SyntaxErrorEx) },
+    { "lvalue shape: a ternary target is a compile error",
+      { "var a = 1; var b = 2; var c = 1;", "(c > 0 ? a : b) = 3;" },
+      &typeid(SyntaxErrorEx) },
+    /* The four ASSIGNABLE shapes must keep working. */
+    { "lvalue shape: variable / element / field / id-list still assign",
+      { "var a = [1, 2, 3];", "struct P { int x; int y; }",
+        "var p = P(1, 2);", "var d = {};",
+        "var v = 0; v = 5;             assert(v == 5);",
+        "a[0] = 9;                     assert(a[0] == 9);",
+        "p.x = 7;                      assert(p.x == 7);",
+        "d[\"k\"] = 3;                  assert(d[\"k\"] == 3);",
+        "var q, r = [1, 2];            assert(q == 1 && r == 2);" } },
+    /* VALUE-determined: NOT decidable at compile time, so it MUST stay a
+     * catchable runtime exception. A const container reaches the write
+     * through a PARAMETER, so nothing is folded and the shape is legal. */
+    { "lvalue value: writing a const array through a param still throws",
+      { "const C = [1, 2, 3];",
+        "func h(p) { p[0] = 9; }",
+        "var caught = 0;",
+        "try { h(C); } catch (NotLValueEx) { caught = 1; }",
+        "assert(caught == 1);" } },
     {
         "err loc: rebinding a builtin marks the builtin name",
         { "print = 5;" },
@@ -11008,9 +11063,9 @@ static const std::vector<test> tests =
             "const big = range(10);",
             "const a = big[0:3];",
             "const b = big[0:3];",
-            "a[0] = 99;",
+            "a[0] = 99;",      /* folds to a literal -> compile error */
         },
-        &typeid(NotLValueEx),
+        &typeid(SyntaxErrorEx),
     },
 
     {
