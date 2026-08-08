@@ -18106,6 +18106,114 @@ static bool jit_native_call()
 #endif
 }
 
+/*
+ * The fragment-inline sync push binds a REFERENCE argument (an array, string,
+ * dict or struct) instead of declining the whole push to the C++ slow tier.
+ * That decline used to fire on EVERY call passing a container - most real code
+ * - and cost 55% of 76_funcval_dispatch's instructions.
+ *
+ * PROVE the native path served it: g_jit_ref_arg_binds is bumped only by
+ * jit_bind_ref_arg, which only the EMITTED push calls. A result check alone
+ * would pass with the old decline, since the slow tier computes the same
+ * answer - the whole point is WHICH path ran.
+ *
+ * The SLICE case is the reason the bind is a call and not an inlined refcount
+ * bump: a slice registers itself in its parent's `slices` set on copy, so a
+ * raw payload copy plus a retain would corrupt that set. It is exercised here
+ * and its result checked against the un-jitted engine's.
+ */
+static bool jit_ref_arg_bind()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    /* An ARRAY argument through a DIRECT call. The body is deliberately
+     * several statements: a small one is INLINED away by the optimizer, so
+     * there is no call left to bind - which is how the first version of this
+     * test managed to exercise nothing. */
+    unsigned long b0 = g_jit_ref_arg_binds;
+    if (!run({ "func addto(a, x) {",
+               "  var t = a[0] + x;",
+               "  var u = t * 2;",
+               "  var v = u - t;",
+               "  a[0] = v;",
+               "  return v;",
+               "}",
+               "var st = [0];",
+               "for (var i = 0; i < 40; i++) addto(st, i);",
+               "assert(st[0] == 780);" }))
+        return false;
+    if (g_jit_ref_arg_binds <= b0)
+        return false;         /* the inline push still DECLINED the call */
+
+    /* a STRING argument, and an indirect call through a func value */
+    b0 = g_jit_ref_arg_binds;
+    if (!run({ "func f1(s, k) { return len(s) + k; }",
+               "func f2(s, k) { return len(s) - k; }",
+               "var ops = [f1, f2];",
+               "var acc = 0;",
+               "for (var i = 0; i < 40; i++) {",
+               "  var fn = ops[i % 2];",
+               "  acc = acc + fn(\"abcde\", i);",
+               "}",
+               "assert(acc == 180);" }))
+        return false;
+    if (g_jit_ref_arg_binds <= b0)
+        return false;
+
+    /* a SLICE argument: the copy must register the new view in the parent's
+     * slices set, which only the real C++ copy does. Mutating the base while
+     * views are live is what makes a corrupted set observable. */
+    b0 = g_jit_ref_arg_binds;
+    if (!run({ "func first(a, k) {",
+               "  var t = a[0] + k;",
+               "  var u = t * 3 - k;",
+               "  var v = u - t - t;",
+               "  return t + v - v;",
+               "}",
+               "var base = [10, 20, 30, 40, 50];",
+               "var s = 0;",
+               "for (var i = 0; i < 20; i++) {",
+               "  var sl = base[1:4];",
+               "  s += first(sl, i);",
+               "  base[1] = base[1] + 1;",
+               "}",
+               "assert(s == 190 + 590);",
+               "assert(base[1] == 40);" }))
+        return false;
+    if (g_jit_ref_arg_binds <= b0)
+        return false;
+    return true;
+#else
+    return true;
+#endif
+}
+
 /* model-flip M3 (plans/model-flip.md): a straight-line boxed LEAF compiles to a
  * native CONTAINER - one EnterNative drives the body, the boxed ISLAND is a
  * `call jit_exec_block`, the ReturnV is native. PROVE it ran (g_jit_container_
@@ -20713,6 +20821,8 @@ static const std::vector<extra_check> extra_checks =
       jit_native_return },
     { "jit: native CallV (function->function call in the fragment)",
       jit_native_call },
+    { "jit: the inline push binds a REFERENCE argument (no slow-tier decline)",
+      jit_ref_arg_bind },
     { "jit: native container + bytecode island (model-flip M3)",
       jit_container },
     { "jit: nativized ops actually run natively (g_jit_op_calls bumps)",

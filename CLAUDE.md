@@ -273,6 +273,38 @@ inferred-int param sits in it although it can never hold a reference -
 but that trades a memory-lifetime guarantee for inference being airtight,
 where the failure mode is a silently retained reference. Left as a
 separate, discussable step; see plans/cpp-gap-extremes.md.
+**THE REFERENCE-ARGUMENT BIND (2026-08-01).** M5b's fully-inline push
+had an arg-triviality GATE - "each arg's current value must be TRIVIAL
+(the inline copy is a raw payload copy - a reference needs the helper's
+retain)" - so a call passing an array/string/dict/struct DECLINED the
+whole inline push and took the C++ slow tier. That is most real code.
+Measured on the SAME indirect func-value shape:
+`jit_call_sync_value` ran ONCE in 1M calls with an int argument and
+1,000,000 times with an ARRAY argument, where the slow tier cost 55% of
+76_funcval_dispatch's instructions. M5b's landing numbers (10/11/63) were
+all scalar-arg calls, so they were real but its REACH was never checked -
+the prove-the-code-ran rule one level up.
+The gate is GONE; the decision moved to the copy loop, per argument: a
+scalar takes the raw 32-byte copy as before, a reference calls
+**`jit_bind_ref_arg`** (vm.cpp), which runs `fast_bind`'s exact
+per-argument step (`dst->rebind(src->get())`) so the two paths cannot
+drift. It is a CALL and not an inlined refcount bump ON PURPOSE: a SLICE
+registers itself in its parent's `slices` set on copy
+(SharedArrayObjTempl's copy ctor), so a raw payload copy plus a retain
+would corrupt that set - deferring to the real C++ copy is correct by
+construction for every reference type, present and future. FOUR pushes
+around the call (an even count preserves the site's 16-byte alignment);
+rdi/rdx/rcx/r9 are read after the bind, r8 is not, and rsi/rax are dead
+(emit_call_epilogue reloads the type singletons anyway). Execution-proven
+by `g_jit_ref_arg_binds` + the `jit_ref_arg_bind` test (array / string /
+SLICE, the last with a live-view base write). Measured (callgrind Ir):
+76_funcval_dispatch **-11.1%** (1202M -> 1069M; the slow tier 1,000,000
+calls -> 1); 10/63 +0.1-0.3% (the per-arg type test moved from the gate
+into the copy loop). NOTE a small DIRECT callee is INLINED away by the
+optimizer, so the reference bind is reached by indirect/value calls and
+by callees too big to inline - the first version of its test exercised
+nothing for exactly that reason.
+
 **Sync-depth accounting (fixed 2026-07-27):** the depth DEC runs AFTER
 `jit_sync_postexit` - at the emitted inline site AND in
 `jit_call_sync_core`'s direct-entry branch - because the postexit's

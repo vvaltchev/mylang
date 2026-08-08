@@ -1729,14 +1729,11 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     const uint8_t R10 = 10, R11 = 11, R8R = 8, R9R = 9;
 
     /* ---------------- GUARDS (no mutation before these pass) ----------- */
-    /* each arg's current value must be TRIVIAL (the inline copy is a raw
-     * payload copy - a reference needs the helper's retain) */
-    for (int i = 0; i < NARGS; i++) {
-        ld(RAX, RDI, (ARGBASE + i) * 48 + 24);        /* type* */
-        cmp_d_imm8(RAX, static_cast<int32_t>(L.type_t_off),
-                   static_cast<int8_t>(L.t_str_val));
-        j_slow.push_back(e.j32(0x7D));                /* jge slow */
-    }
+    /* NOTE there is no arg-triviality GATE here any more. A reference
+     * argument used to decline the whole inline push to the C++ slow tier -
+     * which meant EVERY call passing an array/string/dict/struct, i.e. most
+     * real code. It is now bound per-argument at the copy loop below, so the
+     * decision moved to where the copy happens and stopped being a decline. */
     e.movabs(RCX, reinterpret_cast<uint64_t>(L.addr_ctx));
     ld(R9R, RCX, 0);                                  /* r9 = ctx */
     e.movabs(RCX, reinterpret_cast<uint64_t>(L.addr_act));
@@ -1936,10 +1933,35 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      * 24B payload + 8B type copied, container/idx/flags zeroed */
     for (int i = 0; i < NARGS; i++) {
         const int32_t s = (ARGBASE + i) * 48, d = i * 48;
-        for (int32_t o = 0; o <= 24; o += 8) {
+        ld(RAX, RDI, s + 24);                         /* rax = type* */
+        cmp_d_imm8(RAX, static_cast<int32_t>(L.type_t_off),
+                   static_cast<int8_t>(L.t_str_val));
+        const size_t j_ref = e.j32(0x7D);             /* jge -> reference */
+        for (int32_t o = 0; o <= 24; o += 8) {        /* scalar: raw copy */
             ld(R11, RDI, s + o);
             st(RDX, d + o, R11);
         }
+        const size_t j_done = e.j32(0xEB);
+        e.patch32_here(j_ref);
+        /*
+         * A REFERENCE: defer to the real C++ copy (jit_bind_ref_arg). It
+         * cannot be inlined as a refcount bump - a SLICE registers itself in
+         * its parent's `slices` set on copy - so the helper runs fast_bind's
+         * exact per-argument step. FOUR pushes: an even count preserves the
+         * 16-byte alignment this site already has (emit_call_prologue made it
+         * call-ready and the two live pushes here - fo, desc - keep it so).
+         * rdi/rdx/rcx/r9 are all read after the bind; r8 is not, and rsi/rax
+         * are dead (emit_call_epilogue reloads the type singletons anyway).
+         */
+        e.push_reg(RCX); e.push_reg(R9R);
+        e.push_reg(RDX); e.push_reg(RDI);
+        modrm(0x8D, RSI, RDI, s, true);               /* rsi = &src (arg 2) */
+        modrm(0x8D, RDI, RDX, d, true);               /* rdi = &dst (arg 1) */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(&jit_bind_ref_arg));
+        e.call_rax();
+        e.pop_reg(RDI); e.pop_reg(RDX);
+        e.pop_reg(R9R); e.pop_reg(RCX);
+        e.patch32_here(j_done);
     }
     e.u8(0x45); e.u8(0x31); e.u8(0xDB);               /* xor r11d, r11d */
     for (int i = 0; i < NARGS; i++) {

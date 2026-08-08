@@ -2799,6 +2799,40 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
     slots[dst].put(slots[src].get());
 }
 
+/* Reference ARGUMENTS bound by the emitted inline push (coverage - see
+ * jit_bind_ref_arg; the counter proves the native path served a call whose
+ * argument is an array/string/dict/struct, which used to decline entirely). */
+unsigned long g_jit_ref_arg_binds = 0;
+
+/*
+ * Bind ONE reference argument for the fragment-inline sync push (M5b).
+ *
+ * The inline push copies a scalar argument as raw bytes - 24 bytes of payload
+ * plus the type word - and used to DECLINE the whole push when any argument
+ * held a reference, sending the call to the C++ slow tier. That decline was
+ * not a micro-cost: it is 100% of the calls in any code that passes an array,
+ * string, dict or struct, i.e. most real code (measured: 76_funcval_dispatch
+ * took the slow tier on all 1,000,000 of its calls, 55% of the benchmark's
+ * instructions, while the same shape with an int argument took it ONCE).
+ *
+ * The copy cannot be inlined as a refcount bump, which is why it is a call: a
+ * SLICE registers itself in its parent's `slices` set on copy
+ * (SharedArrayObjTempl's copy ctor), so a raw payload copy plus a retain would
+ * corrupt that set. Deferring to the real C++ copy is correct by construction
+ * for every reference type, present and future.
+ *
+ * This is `fast_bind`'s per-argument step verbatim (vm_frame_setup_lean's
+ * `w->at(i).rebind(argrun[i].get())`), so the two paths cannot drift.
+ * noexcept: a copy-assign of an EvalValue does not throw.
+ */
+extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src) noexcept
+{
+#ifdef TESTS
+    g_jit_ref_arg_binds++;
+#endif
+    dst->rebind(src->get());
+}
+
 /*
  * Re-raise DELETABILITY (plans/model-flip.md): a conveying op's caret must
  * be pc-INDEPENDENT (a DELETED run collapses every pc onto its EnterNative,

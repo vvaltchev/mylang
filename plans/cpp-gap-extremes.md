@@ -308,10 +308,20 @@ numbers were real but its REACH was never checked. This is the
 prove-the-code-ran rule again: "the inline push works" was true of the
 shapes it was tested on, and false of the shape most real code has.
 
-The fix is to emit the retain inline for a reference argument (a refcount
-increment on the payload's RefCounted header, which the fragment can
-already address) rather than declining the whole push. Everything else in
-the inline push already handles it - only the copy is scalar-only.
+FIXED 2026-08-01 - but NOT by an inline retain, which would be WRONG: a
+SLICE registers itself in its parent's `slices` set on copy
+(SharedArrayObjTempl's copy ctor), so a raw payload copy plus a refcount
+bump corrupts that set. The gate is gone and the decision moved into the
+copy loop, per argument: a scalar keeps the raw 32-byte copy, a reference
+calls `jit_bind_ref_arg`, which runs fast_bind's exact per-argument step.
+Measured: 76_funcval_dispatch 1202M -> 1069M Ir (**-11.1%**), the slow
+tier 1,000,000 calls -> 1. The remaining top item there is
+`jit_subscript` at 274 Ir for ONE general-array element read - the value
+model, not the call.
+
+A note for whoever writes the next test here: a small DIRECT callee is
+INLINED AWAY by the optimizer, so no call remains to bind. The first
+version of `jit_ref_arg_bind` used one and exercised nothing.
 
 ### The other half of the call: there is no inline POP
 
