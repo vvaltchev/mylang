@@ -1807,23 +1807,43 @@ struct VmActivation {
             }
         }
 
-        /* Per-frame state dies with the frame. A normal return has already
+        /*
+         * Per-frame state dies with the frame. A normal return has already
          * popped its handlers (the codegen emits the crossed-try pops); the
-         * exceptional walk truncates whatever is left. */
-        if (handlers.size() != rec.handler_base)
-            handlers.resize(rec.handler_base);
-        if (diters_n != rec.diter_base) {
-            dict_iters.resize(rec.diter_base);
-            diters_n = rec.diter_base;
-        }
-        if (dyiters_n != rec.dyiter_base) {
-            dyn_iters.resize(rec.dyiter_base);
-            dyiters_n = rec.dyiter_base;
+         * exceptional walk truncates whatever is left.
+         *
+         * A PLAIN frame (no trys, no iterators - see Chunk::plain_frame) can
+         * provably have moved none of the four watermarks, so one flag test
+         * replaces four comparisons. A hardened build re-checks all four, so
+         * an op that starts pushing per-frame state without a chunk count
+         * fails loudly rather than leaking it into the caller.
+         */
+        if (!rec.run_chunk || !rec.run_chunk->plain_frame) {
+            if (handlers.size() != rec.handler_base)
+                handlers.resize(rec.handler_base);
+            if (diters_n != rec.diter_base) {
+                dict_iters.resize(rec.diter_base);
+                diters_n = rec.diter_base;
+            }
+            if (dyiters_n != rec.dyiter_base) {
+                dyn_iters.resize(rec.dyiter_base);
+                dyiters_n = rec.dyiter_base;
+            }
+            /* The per-region exc/pend slice (#78) - gated on n_trys because an
+             * M5b-inline-pushed record's pend_base is stale (see the field). */
+            if (rec.run_chunk && rec.run_chunk->n_trys
+                    && pends_n != rec.pend_base) {
+                pends.resize(rec.pend_base);
+                pends_n = rec.pend_base;
+            }
+        } else {
+            ML_VM_CHECK(handlers.size() == rec.handler_base);
+            ML_VM_CHECK(diters_n == rec.diter_base);
+            ML_VM_CHECK(dyiters_n == rec.dyiter_base);
         }
 
         segs[rec.seg]->top = rec.seg_top_before;
         used -= rec.nslots;
-        cur_seg = rec.seg;
 
         /* The popped frame's cache dies HERE (per-frame scoping); the
          * caller's stashed cache comes back into the view. */
@@ -1834,18 +1854,13 @@ struct VmActivation {
          * of the old pop_back dtor. On the HOT path both are already null
          * (cache_key moved out by vm_leave_call, caller_cache moved out
          * above); the cached-call path may leave one set, and freeing it
-         * here matches the old dtor exactly. The per-region exc/pend state
-         * is TRIMMED above with the other watermarked slices (#78) - gated
-         * on n_trys because an M5b-inline-pushed record's pend_base is
-         * stale (see the field's comment). */
-        if (rec.run_chunk && rec.run_chunk->n_trys
-                && pends_n != rec.pend_base) {
-            pends.resize(rec.pend_base);
-            pends_n = rec.pend_base;
-        }
+         * here matches the old dtor exactly. */
         rec.cache_key.reset();
         rec_n--;
 
+        /* `cur_seg` is set from the NEW top below; only an empty stack keeps
+         * the dead frame's segment (the old unconditional write was dead
+         * whenever a caller remained - i.e. on every hot return). */
         if (rec_n) {
             const VmCallRec &tp = records[rec_n - 1];
             top_rec = &records[rec_n - 1];
@@ -1853,6 +1868,7 @@ struct VmActivation {
             cur_seg = tp.seg;
         } else {
             top_rec = nullptr;
+            cur_seg = rec.seg;
         }
     }
 };
@@ -5618,8 +5634,22 @@ vm_frame_leave_cached(VmActivation &act, EvalContext &ctx, EvalValue &&res,
         ctx.frame->at(dst).put(std::move(res));
 }
 
-static ML_NOINLINE void
-vm_frame_leave(VmActivation &act, EvalContext &ctx, EvalValue res)
+/*
+ * The leave BODY, inlined into each of its three callers (jit_ret, jit_halt,
+ * vm_leave_call). Each is already an out-of-line function with its own frame,
+ * and NONE is inside vm_dispatch's loop body - vm_leave_call is itself
+ * ML_NOINLINE - so absorbing this costs the dispatch loop no text while it
+ * removes a call plus a prologue/epilogue from every return.
+ *
+ * That frame was NOT small: the `EvalValue res` parameter is a 32-byte type
+ * with a non-trivial destructor, which drags a spill slot and cleanup
+ * scaffolding into the callee - measured 13 Ir of prologue plus 11 of
+ * epilogue per return, against a body doing ~10 Ir of real work. Same disease
+ * as vm_dispatch_exc_frame (#82) and the unique_ptr parameter lever 1 removed
+ * from the push side; same cure.
+ */
+static ML_ALWAYS_INLINE void
+vm_frame_leave_body(VmActivation &act, EvalContext &ctx, EvalValue &&res)
 {
     VmCallRec &dead = act.back_rec();
     ctx.captures = dead.caller_captures;
@@ -5635,6 +5665,7 @@ vm_frame_leave(VmActivation &act, EvalContext &ctx, EvalValue res)
                                   * (the peephole's dead-dst rule) */
         ctx.frame->at(dst).put(std::move(res));
 }
+
 
 /*
  * #55 native calls: the native ReturnV. The fragment flushed its register
@@ -5662,7 +5693,7 @@ extern "C" size_t jit_ret(int_type res_slot) noexcept
         ctx.flow->type = FlowState::ret;
         return JIT_RET_BOUNDARY;
     }
-    vm_frame_leave(act, ctx, std::move(res));
+    vm_frame_leave_body(act, ctx, std::move(res));
     return JIT_RET_SENTINEL;
 }
 
@@ -5684,7 +5715,8 @@ extern "C" size_t jit_halt() noexcept
     VmActivation &act = *g_vm_act;
     if (act.back_rec().boundary)
         return JIT_RET_BOUNDARY;             /* flow stays none -> caller none */
-    vm_frame_leave(act, ctx, EvalValue());   /* return none to the parent */
+    EvalValue none_res;
+    vm_frame_leave_body(act, ctx, std::move(none_res));  /* none to parent */
     return JIT_RET_SENTINEL;
 }
 
@@ -6779,7 +6811,7 @@ static ML_NOINLINE void
 vm_leave_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
               size_t &pc, EvalValue res)
 {
-    vm_frame_leave(act, ctx, std::move(res));
+    vm_frame_leave_body(act, ctx, std::move(res));
     chunk = g_vm_resume_chunk;
     pc = g_vm_resume_pc;
 }

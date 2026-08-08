@@ -1533,6 +1533,30 @@ struct Chunk {
     /* Live dyn-foreach iterator state slots (max iter_id + 1); one per native
      * ForeachDyn in the chunk. See the ForeachDyn ops. */
     int n_dyn_iters = 0;
+
+    /*
+     * DERIVED (never serialized; recomputed by `set_plain_frame`): true when
+     * this chunk owns NO per-frame side state at all - no try regions, no dict
+     * iterators, no dyn iterators. Such a frame provably cannot have moved any
+     * of the four watermarks between its push and its pop:
+     *
+     *   - handlers: only a PushHandler moves it, and those exist only in a
+     *     chunk with n_trys > 0;
+     *   - dict_iters / dyn_iters / pends: push_window grows each slice ONLY by
+     *     this chunk's own count, and every deeper frame's pop trims back to
+     *     its own base, which is >= ours.
+     *
+     * So pop_window can replace FOUR watermark comparisons with one test of
+     * this flag (measured 15 -> 4 Ir per return; the frame pop is the #1 or #2
+     * self-cost in every call-heavy benchmark). A hardened build ASSERTS all
+     * four are actually unmoved, so a future op that pushes per-frame state
+     * without a chunk count fails loudly instead of leaking it into the
+     * caller's frame.
+     */
+    bool plain_frame = true;
+    void set_plain_frame() {
+        plain_frame = !n_trys && !n_dict_iters && !n_dyn_iters;
+    }
     /*
      * The BOXED general-value path's constant pool: literal EvalValues baked at
      * codegen (a machine-code backend would put these in the data section),

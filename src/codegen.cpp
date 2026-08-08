@@ -8146,6 +8146,7 @@ codegen_chunk(const Block *block, int slot_count, bool jit)
     cg.chunk.n_dict_iters = cg.max_dict_iters;
     cg.chunk.n_dyn_iters = cg.max_dyn_iters;
     cg.chunk.n_trys = cg.next_try_region;             /* #78: region count */
+    cg.chunk.set_plain_frame();   /* DERIVED from the three counts above */
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
     peephole_chunk(cg.code, cg.chunk);   /* E1-E4 - BEFORE extract_locs, so
