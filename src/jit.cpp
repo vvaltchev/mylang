@@ -3282,7 +3282,7 @@ static void emit_put_int_call(Emitter &e, const void *fn, int slot,
  * store); everything else is the branchless two-store (contract 3).
  */
 static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
-                      int dst, uint32_t bail_pc, bool keep_rax = false)
+                      int dst, uint32_t bail_pc)
 {
     (void)bail_pc;                       /* no bail: helper on the ref path */
     const SlotAddr a = slot_addr(dst);
@@ -3292,21 +3292,23 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_int),
                           dst, src_reg);
         /*
-         * The put call clobbered RAX, and this arm ALWAYS reloads it -
-         * `keep_rax` used to gate it (lever A asked for the reload; no
-         * other caller did). That was wrong: `ForLoopStep`/`IntAddStep`
-         * store the counter and then `cmp rax, <bound>` for the loop
-         * test, so a ref-listed counter taking this arm compared
-         * GARBAGE and the loop ran the wrong number of times - an
-         * OutOfBounds a few statements later. It survived because the
-         * arm needs the slot to actually HOLD a reference at the store,
-         * which is a slot-allocation coincidence; MYLANG_JIT_COLD=
-         * refstore makes it the only path and it failed in 0.7s.
-         * Unconditional here costs the HOT path nothing (the two-store
-         * arm below preserves RAX for free), so there is no reason to
-         * make every caller reason about it.
+         * APPROACH 3: RESTORE RAX HERE, ALWAYS - the caller is not asked
+         * to know. There used to be a `keep_rax` parameter, which only
+         * lever A ever set, and that was the bug: `ForLoopStep` /
+         * `IntAddStep` store the loop counter and then `cmp rax,
+         * <bound>` for the loop test, so a ref-listed counter taking
+         * this arm compared GARBAGE and the loop ran the wrong number of
+         * times (an OutOfBounds a few statements later). It survived
+         * because the arm needs the slot to actually HOLD a reference at
+         * the store - a slot-allocation coincidence - until
+         * MYLANG_JIT_COLD=refstore made it the only path and it failed
+         * in 0.7 seconds.
+         *
+         * The parameter is GONE rather than defaulted, so no caller can
+         * believe it still decides anything. Unconditional costs the HOT
+         * path nothing: the two-store arm below preserves RAX for free,
+         * and this is the cold arm.
          */
-        (void)keep_rax;
         e.load(RAX, a.payload);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch8(jb_fast, e.pos());           /* fast: */
@@ -3351,14 +3353,14 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
  * payload only; the type flushes at exit) if pinned, else store_dst's
  * memory two-store / ref-bail. */
 static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
-                       uint32_t bail_pc, bool keep_rax = false)
+                       uint32_t bail_pc)
 {
     const int cr = e.creg(slot);
     if (cr >= 0) {
         e.mov_rr(static_cast<uint8_t>(cr), src);
         return;
     }
-    store_dst(e, ck, src, slot, bail_pc, keep_rax);
+    store_dst(e, ck, src, slot, bail_pc);
 }
 
 /*
@@ -4688,8 +4690,36 @@ static void jit_put_float(LValue *lv, double v) noexcept
 
 /* Emit a call to the FLOAT put helper: rdi = &frame->slots[slot] (the arg),
  * the value already in xmm0 (a GP-reg save can't touch it). */
-static void emit_put_scalar_call(Emitter &e, const void *fn, int slot)
+/*
+ * APPROACH 3 - THE HELPER'S REGISTER ABI IS THE EMITTER'S JOB.
+ *
+ * `jit_put_float(LValue *, double)` takes its value in XMM0 by the SysV
+ * float-argument order. That requirement used to live in a COMMENT, and
+ * three separate bugs came from a caller not honouring one of these
+ * implicit contracts:
+ *   - C4a-ii forwarded a value in xmm0 across a store whose cold arm
+ *     called this helper, which clobbers xmm0 (missing reload);
+ *   - C4b inc 2 let the result live in xmm1 and handed THAT to a helper
+ *     reading xmm0 (bench/my/55 off by 1.5);
+ *   - the cold ref arm clobbered RAX, which ForLoopStep reads right
+ *     after for its loop test (an OutOfBounds).
+ * All three are one shape: an implicit register contract violated by a
+ * caller. So the emitter now MATERIALISES the argument itself - pass
+ * whichever register holds the value and it lands in xmm0 - and states
+ * what it clobbers. A caller can no longer get the ABI wrong by
+ * forgetting; it can only get it wrong by passing the wrong value,
+ * which is an ordinary bug rather than an invisible one.
+ *
+ * CLOBBERS: rax (the call's return slot - reload it if you need it
+ * afterwards; store_dst's cold arm does), rcx, rdi, rsi, and every
+ * caller-saved xmm. The N5/C2a pins and the C4b literal pool are
+ * restored by emit_call_epilogue.
+ */
+static void emit_put_scalar_call(Emitter &e, const void *fn, int slot,
+                                 uint8_t value_reg)
 {
+    if (value_reg != X0)
+        e.fmov_rr(X0, value_reg);        /* the helper reads XMM0 */
     emit_call_prologue(e);               /* save the cache regs, align */
     e.lea_rdi(static_cast<int32_t>(static_cast<long>(slot)
                                    * static_cast<long>(sizeof(LValue))));
@@ -4776,26 +4806,23 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
     if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                            static_cast<int32_t>(dst))) {
         const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
-        /* C4b inc 2: jit_put_float takes its value in XMM0 by the SysV
-         * float-argument order, and the result register is no longer
-         * always xmm0 - move it there first. (Missing this stored the
-         * stale xmm0 instead: caught as a 1.5-off result on
-         * bench/my/55, which -rt does not run.) */
-        if (xr != X0) {
-            e.fmov_rr(X0, xr);
 #ifdef TESTS
-            /* the execution proof for this arm: it is reached only when
-             * a ref-listed float dst HOLDS a reference at the store AND
-             * the result landed outside xmm0 - a combination that
-             * depends on slot allocation, so a test must be able to
-             * assert it happened rather than hope. rcx is scratch here
-             * (the ref check used rax; the helper's args come after). */
+        /* the execution proof for the non-xmm0 case: it is reached only
+         * when a ref-listed float dst HOLDS a reference at the store AND
+         * the result landed outside xmm0 - a slot-allocation-dependent
+         * combination, so a test must be able to ASSERT it happened
+         * rather than hope. rcx is scratch here (the ref check used rax;
+         * the helper's args come after). */
+        if (xr != X0) {
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fstore_movx0));
             e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
-#endif
         }
+#endif
+        /* the value register is an ARGUMENT now - the emitter puts it
+         * in xmm0 for us (approach 3), so this site cannot get the
+         * helper's ABI wrong by forgetting to. */
         emit_put_scalar_call(e, reinterpret_cast<const void *>(jit_put_float),
-                             dst);            /* xmm0 holds the value */
+                             dst, xr);
         /* C4a-ii: jit_put_float TAKES its value in xmm0 and, being an
          * ordinary C++ call, leaves it clobbered - so a producer whose
          * pair armed the FORWARD must reload it here. Exactly the int
@@ -5867,7 +5894,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     const auto dst_write = [&]() {
         if (fw && g_fwd.skip_write)
             return;
-        store_dst(e, ck, RAX, in.target, pc, fw);
+        store_dst(e, ck, RAX, in.target, pc);
     };
 
     /* OUTER: array, general storage; a SLICE outer takes its arm (#95).
@@ -6464,7 +6491,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * (ref-listed) write reloads RAX in store_dst's COLD arm only. */
         const bool fw = g_fwd.prod == in.target;
         if (!(fw && g_fwd.skip_write))
-            write_slot(e, ck, RAX, in.target, pc, fw);
+            write_slot(e, ck, RAX, in.target, pc);
         if (fw)
             g_fwd.armed = true;
         return true;
@@ -6732,7 +6759,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const auto dst_write = [&]() {
             if (fw && g_fwd.skip_write)
                 return;
-            write_slot(e, ck, RAX, in.target, pc, fw);
+            write_slot(e, ck, RAX, in.target, pc);
         };
 
         /* C1: the HOISTED form - the entry navigation proved the base

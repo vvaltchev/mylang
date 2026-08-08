@@ -1364,6 +1364,24 @@ consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
 or the next such gap will also be found only by someone reading a
 disassembly for an unrelated reason.
 
+**⛔ A HELPER'S REGISTER ABI IS THE EMITTER'S JOB, NOT THE CALLER'S
+(2026-08-05).** THREE bugs in two days were one shape - an implicit
+register contract violated by a caller: C4a-ii forwarded a value in
+xmm0 across a store whose cold arm calls jit_put_float, which clobbers
+xmm0; C4b inc 2 let the result live in xmm1 and handed THAT to the same
+helper (bench/my/55 off by 1.5); and store_dst's cold arm clobbered RAX,
+which ForLoopStep reads immediately after for its loop test (an
+OutOfBounds). Detectors kept finding them one at a time, so the
+contracts moved INTO the emitter: `emit_put_scalar_call` takes the
+VALUE REGISTER and materialises xmm0 itself, and store_dst's cold arm
+restores RAX unconditionally - its `keep_rax` parameter is DELETED
+rather than defaulted, so no caller can believe it still decides
+anything. A caller can still pass the wrong value; it can no longer
+forget an ABI. Measured byte-flat (55/46/01 per scale) - the cold arm
+already paid the move, and the hot two-store path preserves RAX free.
+**When you add a helper the emitter calls, make its argument registers
+PARAMETERS and say what it clobbers.**
+
 **⛔ BENCHMARKS ARE NOT FUNCTIONAL TESTS (maintainer-set, 2026-08-05).**
 `bench/` measures THROUGHPUT - millions of iterations - and must NEVER
 be used as a correctness corpus. A JIT bug shows on iteration 1 or not
