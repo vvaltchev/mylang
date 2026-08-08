@@ -177,7 +177,50 @@ spill around every call.
    x86-64 until some callee uses an aligned SSE store - i.e. exactly the
    kind of bug that hides.
 
-## Step 2 - a real fragment register allocator
+## Step 2b - the allocator: ATTEMPTED, and the finding that stopped it
+
+I built the selection half of a linear-scan allocator - live ranges per
+slot plus a spill cost weighted by LOOP-NESTING DEPTH (back edges give the
+depth, a use is worth 8x per level), replacing the flat "used >= 3 times,
+top N by raw count". It is the textbook heuristic and it ranked correctly.
+
+**It was inert, and I reverted it.** Isolated on its own (both binaries
+`OPT=1 ASSERTS=0`, callgrind Ir): 44_primes_sqrt **+0.208%**, 46_matrix_mult
++0.035%, 68_nested -0.018%. Net slightly NEGATIVE, and - the point - the
+register pool still did not fill.
+
+**THE BINDING CONSTRAINT IS NOT THE RANKING. It is per-op cache-awareness.**
+`pick_cached_slots` DISQUALIFIES a slot outright, for the whole fragment,
+if any op in the run reads or writes it from MEMORY rather than through
+the cache (`bad(...)` - 59 call sites). So the candidate set is small
+before ranking ever runs, and a better ordering has almost nothing to
+choose between.
+
+The demonstration is a four-accumulator loop:
+
+    var a = 0; var b = 0; var c = 0; var d = 0;
+    for (var i = 0; i < 100; i++) { a += i; b += a; c += b; d += c; }
+    print(a, b, c, d);
+
+Four registers are free and every accumulator is used twice per iteration,
+yet ONLY `i` gets pinned. Not because of the threshold - because the
+`print` lowers to `move r5 = a` ... and `MoveV`'s emit copies a whole
+32-byte EvalValue from memory, so it calls `bad()` on `a`, `b`, `c` and
+`d`. One trailing op costs them the register for the entire fragment.
+
+**So the next increment is to make the disqualifying ops CACHE-AWARE**, one
+at a time, exactly as the model flip nativized ops one at a time to shrink
+its islands. Rank the `bad()` sites by how often they fire on real
+fragments first (instrument `pick_cached_slots` and run bench/ + samples/)
+- `MoveV` is the obvious first candidate, since arg-setup moves surround
+every call. Only once the candidate sets are big enough for the choice to
+matter does a smarter ranking pay, and THEN the live-range work above can
+come back off the shelf.
+
+Recorded rather than kept, because shipping a measurable-but-negative
+change that provably does not do its job is worse than a written finding.
+
+## Step 2c - a real fragment register allocator (unchanged plan)
 
 Replace `pick_cached_slots` (which picks at most two int locals by a
 heuristic) with linear-scan allocation over the run's live ranges:
