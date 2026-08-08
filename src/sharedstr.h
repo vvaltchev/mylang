@@ -72,6 +72,49 @@ public:
     inner_type &get_ref() { return obj->s; }
     const inner_type &get_ref() const { return obj->s; }
 
+    /*
+     * THE WINDOW MODEL (2026-08-06). EVERY SharedStr is a window
+     * [offset(), offset()+size()) over a shared, APPEND-ONLY buffer - what
+     * a slice always was; a "full" string is just the window that happens
+     * to cover the whole buffer. Because the buffer only ever GROWS (the
+     * one in-place mutation is TypeStr::append, below), a window taken at
+     * any moment keeps denoting the same characters forever. That single
+     * fact is the whole soundness argument, and it is what gives strings
+     * their documented VALUE semantics with no copy-on-write clone at all:
+     * after `var b = a; a += "!"`, `a`'s window grew and `b`'s did not, so
+     * b still reads "hi" while sharing the same buffer.
+     *
+     * `len` is therefore AUTHORITATIVE for both forms - hence size() below
+     * is a plain field read rather than a dependent load through `obj`.
+     *
+     * owns_whole_buffer() is the precondition for appending IN PLACE: this
+     * window must end where the buffer ends, or growing the buffer would
+     * silently extend a window that is only a prefix of it.
+     */
+    bool owns_whole_buffer() const {
+        return !slice && obj && len == obj->s.size();
+    }
+
+    /*
+     * Fix up this window after the ONE in-place mutation there is: append
+     * growing a buffer this window wholly owns. Every other path builds a
+     * fresh SharedStr, whose ctor sets `len`.
+     *
+     * BOTH steps are load-bearing. Re-deriving `len` keeps the window on
+     * the new end. Dropping `hash_valid` is what the DICT depends on: the
+     * cache is the hash of the WHOLE buffer, and the buffer just changed,
+     * so every window that covers it - including this one - would
+     * otherwise keep answering with the PRE-append hash. Without this, a
+     * string used as a key, appended to, and inserted into a second dict
+     * lands under the old hash and is unfindable by its own value (it
+     * still prints and compares equal - the map is simply corrupt).
+     */
+    void after_inplace_append() {
+        ML_CHECK(!slice);
+        len = static_cast<size_type>(obj->s.size());
+        obj->hash_valid = false;
+    }
+
     std::string_view get_view() const {
         ML_CHECK(offset() <= obj->s.size() &&
                  size() <= obj->s.size() - offset());
@@ -80,14 +123,21 @@ public:
 
     bool is_slice() const { return slice; }
     size_type offset() const { return slice ? off : 0; }
-    size_type size() const { return slice ? len : obj->s.size(); }
+    /* `len` is authoritative for BOTH forms - see THE WINDOW MODEL above.
+     * (A default-constructed SharedStr has no `obj`; returning `len` == 0
+     * is also what makes that case safe rather than a null deref.) */
+    size_type size() const { return len; }
 
     /*
      * Hash of the string's value. A full (non-slice) string caches it on the
      * shared StrObj (computed once); a slice hashes its sub-view on demand.
      */
     size_t hash() const {
-        if (!slice) {
+        /* The StrObj's cache is the hash of the WHOLE buffer, so it may
+         * only be used by a window that covers it - a prefix window must
+         * hash its own view. (Before the window model a "non-slice" always
+         * covered the buffer, so `!slice` alone was the same test.) */
+        if (owns_whole_buffer()) {
             if (!obj->hash_valid) {
                 obj->hash_cache = std::hash<std::string_view>()(
                     std::string_view(obj->s.data(), obj->s.size()));

@@ -790,6 +790,10 @@ runtime instead.
   * **String**
     A string like "hello". Strings are immutable and support slices (e.g.
     `s[3:5]` or `s[3:]` or `s[-2:]`, having the same meaning as in `Python`).
+    Immutability holds through aliases, exactly as in Python: after
+    `var b = a; a += "!"`, `b` is unchanged. `s += x` is still amortized
+    O(n) for the usual accumulator loop - it appends in place when it can
+    do so unobservably (see *Copy-on-write* below).
     A `"..."` literal **may span multiple lines**, and the line breaks are kept
     as `\n` in the value (Ruby-style); the usual escapes (`\n`, `\t`, `\"`,
     `\\`, …) work too. An unterminated string (no closing `"` before

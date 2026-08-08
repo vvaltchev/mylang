@@ -2926,12 +2926,33 @@ fresh count, never the original's (else it would never be freed). `use_count()`
 keeps shared_ptr's meaning (handles sharing the pointee), so the `> 1` COW tests
 are unchanged.
 
-- **`SharedStr`** (`sharedstr.h`): immutable `intrusive_ptr<StrObj{string}>` +
-  `off`/`len` slice view (StrObj just wraps the string so it can carry the
-  count). Slices are
-  cheap views; strings are never mutated in place. Copies are forbidden
-  (`= delete`), only moves —
-  enforcing the no-accidental-copy intent.
+- **`SharedStr`** (`sharedstr.h`): an `intrusive_ptr<StrObj{string}>` plus an
+  `off`/`len` WINDOW (StrObj just wraps the string so it can carry the count).
+  Copies are forbidden (`= delete`), only moves — enforcing the
+  no-accidental-copy intent.
+  **THE WINDOW MODEL (2026-08-06):** EVERY SharedStr is a window over a
+  shared, APPEND-ONLY buffer — what a slice always was; a "full" string is
+  just the window that covers the whole buffer. Because the buffer only ever
+  GROWS (the one in-place mutation is `TypeStr::append`), a window taken at
+  any moment keeps denoting the same characters forever — that single fact is
+  the entire soundness argument, and it is what gives strings their
+  documented VALUE semantics with **no copy-on-write clone at all**: after
+  `var b = a; a += "!"`, `a`'s window grew and `b`'s did not, so `b` still
+  reads "hi" while sharing the buffer. Three things to preserve: `len` is
+  AUTHORITATIVE for both forms (so `size()` is a field read, not a load
+  through `obj`); `append` may grow in place ONLY when `owns_whole_buffer()`
+  (this window ends where the buffer ends — otherwise it would swallow the
+  bytes past a PREFIX window, so it rebuilds); and `after_inplace_append()`
+  must BOTH resync `len` AND drop `obj->hash_valid`, because the StrObj's
+  cached hash is the hash of the WHOLE buffer — without that, a string used as
+  a dict key and then appended to lands under a stale hash and becomes
+  findable by NO key while still printing and comparing equal.
+  Before this, `append` grew the shared string with NO test, so an alias, a
+  bound parameter, an array element and even `clone()` saw a later `+=`,
+  contradicting the README. The naive fix (`use_count() == 1`) is WRONG and
+  was measured: the compound path copies the value out of the slot first, so
+  the count is never 1 and every append rebuilds — 28_str_concat **+18268%
+  Ir**, O(n²).
 - **`SharedArrayObj`** (`sharedarray.h`):
   `intrusive_ptr<SharedObject{ vec, set<live slices> }>` +
   `off`/`len`/`slice`. A slice registers itself in the parent's `slices` set
