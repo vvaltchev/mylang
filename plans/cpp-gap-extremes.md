@@ -666,3 +666,77 @@ and every `is_slice()` consumer assuming non-slice == whole string.
 
 The four failing tests are written and were watched failing (1725/1729)
 against the current code; they go in with the fix.
+
+## G1 PREPARATION (2026-08-06) - where the 219 Ir actually sit
+
+Not implemented, as instructed. This is the measurement the arc needs
+before anyone edits the hottest protocol in the VM.
+
+**The caller side is 77 EMITTED instructions per indirect call**, counted
+straight out of `-vdj` for the q_proto probe (one closure call whose body
+is `return 1`), split by phase:
+
+    record fill           32   (42%)
+    status dispatch       20   (26%)
+    arg / target setup     8
+    native-stack switch    8
+    stack restore          7
+    call rdx               1
+    depth counter          1
+                          ---
+                           77
+
+Two phases are two thirds of it, and each has a concrete attack.
+
+### (1) The record fill - 9 of its 32 are already provably dead
+
+The fill writes ~14 fields. THREE of them are the watermark bases, and
+they cost 9 instructions because two need a load and one a load + sub +
+shift:
+
+    +2518  mov rax,[r8+0x68] / sub / cmp / shr 2 / mov [r10+0x50]   handler_base
+    +2543  mov rax,[r8+0x4c]                    / mov [r10+0x54]    diter_base
+    +2557  mov rax,[r8+0x50]                    / mov [r10+0x58]    dyiter_base
+
+Those exist ONLY so the pop can trim the watermarks back. But
+`Chunk::plain_frame` - the DERIVED flag the 2026-08-01 session added and
+which the POP side already trusts (four compares became one flag test) -
+proves the callee moves NONE of them: `handlers` is only moved by a
+PushHandler, which exists only in a chunk with `n_trys > 0`, and the
+diter/dyiter/pend slices are grown by push_window only by the chunk's own
+counts, while every deeper frame's pop trims to its own base, which is
+>= ours.
+
+So for a plain_frame callee the three fields need not be written at all.
+The flag is computed, serialized-free (the loader recomputes it), and
+already load-bearing on the other side of the same protocol - this is
+using an existing proof one step earlier, not a new one. **~9 of 77
+instructions, on every call to a plain-frame callee.** That is the
+smallest useful first increment.
+
+### (2) The status dispatch - 20 instructions, mostly cold
+
+After `call rdx` the emitted code runs a three-way `cmp rax` chain
+(`-1` = raised, `-3` = a boundary return, else a resume pc) with BOTH
+cold arms laid out INLINE between the hot path and the next op. The hot
+outcome needs one test. Moving the cold arms out of line (the emitter
+already does this elsewhere - the ref-check helper arms, the C5 preheader)
+would leave ~3 in the hot path and take the I-cache footprint of a call
+site down with it.
+
+### What this does NOT buy, stated plainly
+
+A perfect version of both is ~26 of 77 caller instructions, i.e. the call
+goes from 219 Ir to maybe ~180. 76_funcval_dispatch at 898 Ir/iteration
+would move ~4%. **Reaching <=5x on the call benches still needs the frame
+record itself to become a handful of stores**, which is the 2026-08-01
+conclusion and nothing measured since contradicts it: at 5x, bench 76 gets
+~260 Ir per ITERATION in total, and the protocol alone is ~300 today.
+
+The structural question the arc has to answer is therefore NOT "which
+field can we drop" but "what does a callee that needs no VM frame record
+look like" - a leaf, plain-frame, fixed-arity callee whose params are
+scalars could in principle run on the native stack with no record at all,
+and the record could be reconstructed lazily only if an exception or a
+backtrace actually asks for it. That is a design fork for the maintainer,
+not an increment.
