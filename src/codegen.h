@@ -132,6 +132,18 @@ bool jit_op_slot_refs(const Instr &in, std::vector<int> &uses,
                       std::vector<int> &defs);
 
 /*
+ * C5: does this opcode write its dst as a plain SCALAR (int/float/bool)?
+ *
+ * THE SAME predicate compute_ref_slots uses to build `ref_slots` - a slot
+ * is ref-listed precisely because some op that is NOT in this set writes
+ * it (or because a barrier op forced the whole frame onto the list).
+ * Exported so an emitter policy that needs "after this op the slot
+ * provably holds a trivial value" asks the one table that already
+ * defines that, rather than growing a second one free to drift from it.
+ */
+bool op_writes_scalar(OpCode op);
+
+/*
  * #78 step B: assert the HANDLER TABLE still describes the interpreted
  * CatchTest/Reraise chain (see Chunk::handler_sites). Called after every
  * pc-moving transformation while both representations exist - the

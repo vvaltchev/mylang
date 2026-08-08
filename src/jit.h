@@ -843,6 +843,11 @@ extern "C" unsigned long g_jit_member_noguard;
 /* C4e: loop preheaders that established a ctor's H1 invariant (so the
  * ctors inside emitted no guards at all). */
 extern "C" unsigned long g_jit_ctor_est;
+/* C5: fragment entries / entry stubs that RELEASED a ref-listed temp. */
+extern "C" unsigned long g_jit_release_entry;
+/* C5: scalar store sites emitted with no ref guard (compile-time - the
+ * partner proof to g_jit_release_entry, see the definition). */
+extern "C" unsigned long g_jit_relent_stores;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
