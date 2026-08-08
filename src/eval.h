@@ -575,6 +575,14 @@ int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
 float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
                                  int_type fidx);
 
+/* G4: the CHECKED subscript form - `a[i].f`. Does the negative-index wrap +
+ * bounds check itself (throwing OutOfBoundsEx LOC-LESS) and serves BOTH flat
+ * struct storage and a PROMOTED general array. See eval.cpp. */
+int_type vm_struct_elem_field_int(const EvalValue &arrv, int_type idx,
+                                  int_type fidx);
+float_type vm_struct_elem_field_float(const EvalValue &arrv, int_type idx,
+                                      int_type fidx);
+
 /* Materialize element `idx` of a flat array<PodStruct> as a fresh StructObject
  * (the VM's LoadStructElemV - the whole-`p` foreach bind). See eval.cpp. */
 EvalValue vm_struct_elem(const EvalValue &arrv, int_type idx);

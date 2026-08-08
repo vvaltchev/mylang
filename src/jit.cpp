@@ -58,6 +58,7 @@ unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_strlen_fast = 0;   /* G5: inline len(str) runs */
+unsigned long g_jit_sfield_checked = 0;/* G4: checked a[i].f runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
 unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
 unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
@@ -8636,11 +8637,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.movabs(RCX, static_cast<uint64_t>(in.b_lit()));
             e.movabs_r8(in.op == OpCode::LoadStructFieldFloat ? 1u : 0u);
         }
+        /* G4: the CHECKED subscript form takes its own helper, which can
+         * RAISE (index OOB) - the status check below mirrors
+         * LoadElemValue's. */
+        const bool sfield_checked = is_field && in.struct_checked();
         const void *fn =
             in.op == OpCode::LoadElemBool
                 ? reinterpret_cast<const void *>(jit_load_elem_bool)
           : in.op == OpCode::LoadStrChar
                 ? reinterpret_cast<const void *>(jit_load_str_char)
+          : sfield_checked
+                ? reinterpret_cast<const void *>(jit_load_struct_elem_field)
           : is_field
                 ? reinterpret_cast<const void *>(jit_load_struct_field)
           : in.op == OpCode::LoadStructElemV
@@ -8649,7 +8656,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.call_relocs.push_back({ e.pos(), fn });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        if (in.op == OpCode::LoadElemValue) {
+        if (in.op == OpCode::LoadElemValue || sfield_checked) {
             e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* cold: the OOB caret (the

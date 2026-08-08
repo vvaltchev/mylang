@@ -3728,6 +3728,66 @@ struct Codegen {
     }
 
     /*
+     * G4: `a[i].f` - the SUBSCRIPT form of the struct-field read.
+     * try_sfe_field covers a struct-FOREACH loop var and try_member_scalar a
+     * plain local struct base; nothing covered a SUBSCRIPT base, so
+     * `row[0].x` lowered to a boxed subscript (materialising a whole
+     * StructObject per read) plus a boxed member read.
+     *
+     * The op is the same LoadStructFieldInt/Float with `struct_checked` set:
+     * unlike the foreach form, a subscript proves neither the storage kind
+     * (a flat array<PodStruct> auto-promotes to general on any cold op) nor
+     * the index, so the runtime does the wrap + bounds check and serves both
+     * storages. The caret is the SUBSCRIPT's node, which is the span the
+     * boxed pair reported - so the default engine's OOB message does not
+     * move (task #125 tracks the pre-existing tree-walker divergence).
+     */
+    bool try_struct_elem_field(const MemberExpr *m, Operand &out,
+                               std::vector<CgInstr> &ops, OpCode op)
+    {
+        if (m->optional || !m->base_struct)
+            return false;
+        const Subscript *sub =
+            dynamic_cast<const Subscript *>(m->what.get());
+        if (!sub || !sub->base_array || sub->base_dict || sub->base_str)
+            return false;
+        const StructTypeDef *sd = m->base_struct_def;
+        if (!sd || !sd->is_pod())
+            return false;
+        const int fs = sd->slot_of(m->memUid);
+        if (fs < 0)
+            return false;
+        if (sd->fields[static_cast<size_t>(fs)].offset < 0)
+            return false;   /* a non-POD (boxed) field */
+        /* The base must be a resolved LOCAL slot: the op reads it directly,
+         * so it is evaluated exactly once and cannot re-run a side effect. */
+        const Identifier *bid =
+            dynamic_cast<const Identifier *>(sub->what.get());
+        if (!bid || bid->sym.kind != SymKind::local)
+            return false;
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+        Operand idx;
+        if (!compile_int_expr(sub->index.get(), idx, ops)) {
+            ops.resize(mark);
+            next_temp = save_top;
+            return false;
+        }
+        const int tt = alloc_temp();
+        CgInstr in;
+        in.op = op;
+        in.node_idx = add_ast_node(sub);   /* the OOB caret: the SUBSCRIPT */
+        in.target = tt;
+        in.target2 = bid->sym.slot;
+        in.set_a(idx);
+        in.set_b(int_lit(fs));
+        in.set_struct_checked();
+        ops.push_back(in);
+        out = slot_op(tt);
+        return true;
+    }
+
+    /*
      * H1: the TYPED standalone struct-member read `p.x` (th==i/f) - a proven
      * non-opt STRUCT base (`MemberExpr::base_struct`) in a resolved LOCAL
      * slot lowers to LoadMemberInt/Float: the POD fast path reads the scalar
@@ -3926,6 +3986,9 @@ struct Codegen {
         if (e->th == TypeHint::i)
             if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
                 if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldInt))
+                    return true;
+                if (try_struct_elem_field(m, out, ops,
+                                          OpCode::LoadStructFieldInt))
                     return true;
                 if (try_member_scalar(m, out, ops, OpCode::LoadMemberInt))
                     return true;
@@ -4866,6 +4929,9 @@ struct Codegen {
         if (e->th == TypeHint::f)
             if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
                 if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldFloat))
+                    return true;
+                if (try_struct_elem_field(m, out, ops,
+                                          OpCode::LoadStructFieldFloat))
                     return true;
                 if (try_member_scalar(m, out, ops, OpCode::LoadMemberFloat))
                     return true;
@@ -7080,6 +7146,23 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         in.loc_node_idx = -1;
         if (!node)
             continue;
+        /*
+         * G4: the CHECKED `a[i].f` form is the ONE faultable use of
+         * LoadStructFieldInt/Float, so it needs a caret while the
+         * struct-foreach form (proven no-fault) still records none - a
+         * distinction the per-opcode switch below cannot express, since
+         * both share an opcode. Recorded here, from the SUBSCRIPT node the
+         * gate stamped, so an index OOB reports the span the boxed pair
+         * reported before.
+         */
+        if ((in.op == OpCode::LoadStructFieldInt
+             || in.op == OpCode::LoadStructFieldFloat)
+            && in.struct_checked()) {
+            chunk.locs.push_back(
+                {static_cast<uint32_t>(pc), node->start, node->end});
+            in.node_idx = -1;
+            continue;
+        }
         /* P8 Inc 4: an op spliced from an INLINED body records that body's
          * inlined-at chain (FLATTENED into inline_frames), so a backtrace
          * crossing it shows the virtual frames. Recorded BEFORE the switch nulls
@@ -8209,8 +8292,19 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                  * dead-after temp -> StructFieldAddInt
                  * `dst = other + a[i].f`. EXACTLY one operand is t (both
                  * == t would read the pre-load value). No-fault read +
-                 * wrapping add - node-free. */
+                 * wrapping add - node-free.
+                 *
+                 * G4: the CHECKED (subscript) form is EXCLUDED. This fusion
+                 * is sound only because the foreach form cannot fault - it
+                 * even drops the caret (`node_idx = -1`) - whereas
+                 * `a[i].f` bounds-checks and can raise OutOfBoundsEx, and
+                 * StructFieldAddInt's helper is the UNCHECKED reader. Fusing
+                 * it read past the end of the buffer: ASan caught a
+                 * heap-buffer-overflow on `acc += row[i].x + row[j].y` with
+                 * j out of range, the very first time this gate let the new
+                 * form through. */
                 if (op1.op == OpCode::LoadStructFieldInt
+                    && !op1.struct_checked()
                     && op2.op == OpCode::IntBin && op2.aop == Op::plus
                     && !op2.a_is_lit() && !op2.b_is_lit()
                     && (op2.a_slot() == op1.target)

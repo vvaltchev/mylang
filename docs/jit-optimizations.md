@@ -2226,3 +2226,67 @@ Measured (`OPT=1 ASSERTS=0`, callgrind Ir, both sides built this session):
 
 75_indexed_unpack was the WORST bench against C++ (20.03x) and calls
 `len()` twice per row, which is where the whole 17% sits.
+
+## G4 (2026-08-06): the CHECKED `a[i].f` struct-field read
+
+`LoadStructFieldInt/Float` already read a scalar straight from flat
+struct-array bytes, but it was emitted ONLY by `try_sfe_field`, whose gate
+is a struct-FOREACH loop var. A SUBSCRIPT base fell all the way back to a
+boxed subscript - materialising a whole `StructObject` per read - plus a
+boxed member read, which is why `row[0].x + row[1].y` cost ~490 Ir.
+
+**It is not a gate widening.** `vm_struct_field_int` is UNCHECKED by
+construction ("the codegen proved it flat-struct + idx in range - the
+counted loop - so no checks"), and a subscript proves NEITHER: a flat
+`array<PodStruct>` AUTO-PROMOTES to general storage on any cold op
+(insert/sort/map via `get_vec()`), and the index is arbitrary. So the new
+form wraps a negative index, bounds-checks, and serves BOTH storages - the
+general arm reading the same FIELD INDEX out of the boxed StructObject,
+which is valid because the element is a POD struct either way.
+
+`struct_checked` is `opflags` bit 7 - the last free bit in a byte that is
+ALREADY serialized - so it rides the same opcode: no ordinal moves and no
+`.myv` version bump.
+
+**CARET-NEUTRAL by design.** The op stamps the SUBSCRIPT node, which is the
+span the boxed pair reported, so the default engine's OOB message does not
+move. The tree-walker reports the MemberExpr's span here instead, a
+PRE-EXISTING divergence this change deliberately neither widens nor
+resolves - task #125, found while scoping this.
+
+### Two traps, one of them a bug I introduced
+
+**(1) THE NO-FAULT FUSION ATE IT.** #9 F-C fuses `LoadStructFieldInt t;
+IntBin(+) dst = other + t` into `StructFieldAddInt`, sound only because the
+foreach form cannot fault - it even drops the caret (`node_idx = -1`) - and
+`StructFieldAddInt`'s helper is the UNCHECKED reader. The checked form
+flowed straight into it, and ASan reported a **heap-buffer-overflow** on
+`s += a[i].x + a[j].y` with `j` out of range the FIRST time the gate let it
+through. The fusion now excludes `struct_checked()`. General shape worth
+remembering: **when you make an existing opcode faultable, re-audit every
+peephole that fused it BECAUSE it could not fault.**
+
+**(2) A FAULTABLE OP NEEDS A LOC ENTRY, and the switch could not say so.**
+`extract_locs` is per-OPCODE, and `LoadStructField*` was classified
+no-fault, so it recorded no caret - the interpreted VM threw with NO
+location at all (no file, no line, no caret). Since both forms share an
+opcode, the distinction cannot be a `case` label: the loc is recorded by an
+explicit pre-switch check on `struct_checked()`.
+
+Also worth noting: the declaration of the new helper went inside jit.h's
+`#ifdef TESTS` block by mistake. The DEBUG lane built fine and the release
+lane did not - the non-TESTS build gap, the same family as the non-JIT
+platform gap.
+
+### Measured (`OPT=1 ASSERTS=0`, callgrind Ir, both sides this session)
+
+    77_struct_array_lit   1571M -> 797M   -49.26%
+    65_struct_field_sum                    +0.00%   (foreach form, untouched)
+    58_structs                             +0.00%
+
+**-49% is far more than the ~16% the scoping predicted**, and the estimate
+was wrong in an instructive way: it counted only the two boxed member reads.
+Making them typed also turned the CONSUMING arithmetic typed - the loop's
+`bin.v` + `compound.v` became `i.bin` - so the win is the whole expression,
+not the reads alone. Reach is still one program: `member.v` occurs only in
+77 across bench/ + samples/.

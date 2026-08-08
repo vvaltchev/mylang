@@ -599,6 +599,11 @@ extern "C" void jit_load_str_char(int_type dst, int_type base,
                                   int_type idx) noexcept;
 extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
                                       int_type fidx, int is_float) noexcept;
+/* G4: the CHECKED (subscript) twin - `a[i].f`. Returns non-zero when it
+ * raised, conveying a loc-less OutOfBoundsEx like jit_load_elem_value. */
+extern "C" int jit_load_struct_elem_field(int_type dst, int_type base,
+                                          int_type idx, int_type fidx,
+                                          int is_float) noexcept;
 extern "C" void jit_load_struct_elem(int_type dst, int_type base,
                                      int_type idx) noexcept;
 extern "C" int jit_load_elem_value(int_type dst, int_type base,
@@ -800,6 +805,8 @@ extern "C" unsigned long g_jit_elem2_fast;
 /* G5: emitted-code proof that the INLINE len(str) ran (the helper is gone
  * for a proven-string base, so jit_str_len's own counter cannot say). */
 extern "C" unsigned long g_jit_strlen_fast;
+/* G4: execution proof for the CHECKED a[i].f helper (the subscript form). */
+extern "C" unsigned long g_jit_sfield_checked;
 extern "C" unsigned long g_jit_store2_fast;   /* #95: nested-store tier */
 extern "C" unsigned long g_jit_elem_slice_fast; /* #95: slice-read arms */
 extern "C" unsigned long g_jit_fwd;           /* lever A: fwd consumers */
