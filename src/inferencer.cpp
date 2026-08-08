@@ -4636,84 +4636,88 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
     return n;
 }
 
-static unique_ptr<Construct> specialize(unique_ptr<Construct> n);
+static unique_ptr<Construct> specialize(unique_ptr<Construct> n,
+                                        int *fsize);
 
 /* Recurse into every unique_ptr<Construct> child, specializing it in place. */
-static void specialize_children(Construct *n)
+static void specialize_children(Construct *n, int *fsize)
 {
     if (auto *e = dynamic_cast<Expr14 *>(n)) {
-        e->lvalue = specialize(std::move(e->lvalue));
-        e->rvalue = specialize(std::move(e->rvalue));
+        e->lvalue = specialize(std::move(e->lvalue), fsize);
+        e->rvalue = specialize(std::move(e->rvalue), fsize);
         return;
     }
     if (auto *c = dynamic_cast<CallExpr *>(n)) {
-        c->what = specialize(std::move(c->what));
+        c->what = specialize(std::move(c->what), fsize);
         for (auto &a : c->args->elems)
-            a = specialize(std::move(a));
+            a = specialize(std::move(a), fsize);
         return;
     }
     if (auto *m = dynamic_cast<MemberExpr *>(n)) {
-        m->what = specialize(std::move(m->what));
+        m->what = specialize(std::move(m->what), fsize);
         return;
     }
     if (auto *s = dynamic_cast<Subscript *>(n)) {
-        s->what = specialize(std::move(s->what));
-        s->index = specialize(std::move(s->index));
+        s->what = specialize(std::move(s->what), fsize);
+        s->index = specialize(std::move(s->index), fsize);
         return;
     }
     if (auto *s = dynamic_cast<Slice *>(n)) {
-        s->what = specialize(std::move(s->what));
-        if (s->start_idx) s->start_idx = specialize(std::move(s->start_idx));
-        if (s->end_idx)   s->end_idx = specialize(std::move(s->end_idx));
+        s->what = specialize(std::move(s->what), fsize);
+        if (s->start_idx)
+            s->start_idx = specialize(std::move(s->start_idx), fsize);
+        if (s->end_idx)
+            s->end_idx = specialize(std::move(s->end_idx), fsize);
         return;
     }
     if (auto *i = dynamic_cast<IfStmt *>(n)) {
-        i->condExpr = specialize(std::move(i->condExpr));
-        i->thenBlock = specialize(std::move(i->thenBlock));
-        if (i->elseBlock) i->elseBlock = specialize(std::move(i->elseBlock));
+        i->condExpr = specialize(std::move(i->condExpr), fsize);
+        i->thenBlock = specialize(std::move(i->thenBlock), fsize);
+        if (i->elseBlock)
+            i->elseBlock = specialize(std::move(i->elseBlock), fsize);
         return;
     }
     if (auto *w = dynamic_cast<WhileStmt *>(n)) {
-        w->condExpr = specialize(std::move(w->condExpr));
-        if (w->body) w->body = specialize(std::move(w->body));
+        w->condExpr = specialize(std::move(w->condExpr), fsize);
+        if (w->body) w->body = specialize(std::move(w->body), fsize);
         return;
     }
     if (auto *f = dynamic_cast<ForStmt *>(n)) {
-        if (f->init) f->init = specialize(std::move(f->init));
-        if (f->cond) f->cond = specialize(std::move(f->cond));
-        if (f->inc)  f->inc = specialize(std::move(f->inc));
-        if (f->body) f->body = specialize(std::move(f->body));
+        if (f->init) f->init = specialize(std::move(f->init), fsize);
+        if (f->cond) f->cond = specialize(std::move(f->cond), fsize);
+        if (f->inc)  f->inc = specialize(std::move(f->inc), fsize);
+        if (f->body) f->body = specialize(std::move(f->body), fsize);
         return;
     }
     if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
-        fe->container = specialize(std::move(fe->container));
-        if (fe->body) fe->body = specialize(std::move(fe->body));
+        fe->container = specialize(std::move(fe->container), fsize);
+        if (fe->body) fe->body = specialize(std::move(fe->body), fsize);
         return;
     }
     if (auto *t = dynamic_cast<TryCatchStmt *>(n)) {
-        if (t->tryBody) t->tryBody = specialize(std::move(t->tryBody));
+        if (t->tryBody) t->tryBody = specialize(std::move(t->tryBody), fsize);
         for (auto &cs : t->catchStmts)
-            if (cs.second) cs.second = specialize(std::move(cs.second));
+            if (cs.second) cs.second = specialize(std::move(cs.second), fsize);
         if (t->finallyBody)
-            t->finallyBody = specialize(std::move(t->finallyBody));
+            t->finallyBody = specialize(std::move(t->finallyBody), fsize);
         return;
     }
     if (auto *r = dynamic_cast<ReturnStmt *>(n)) {
-        if (r->elem) r->elem = specialize(std::move(r->elem));
+        if (r->elem) r->elem = specialize(std::move(r->elem), fsize);
         return;
     }
     if (auto *te = dynamic_cast<TernaryExpr *>(n)) {
         /* Previously ABSENT - a ternary's cond/arms were never M8-specialized
          * (both engines ran them boxed; the recursion-unroll's guard ternaries
          * were the visible cost). Same for `??` below. */
-        te->condExpr = specialize(std::move(te->condExpr));
-        te->thenExpr = specialize(std::move(te->thenExpr));
-        te->elseExpr = specialize(std::move(te->elseExpr));
+        te->condExpr = specialize(std::move(te->condExpr), fsize);
+        te->thenExpr = specialize(std::move(te->thenExpr), fsize);
+        te->elseExpr = specialize(std::move(te->elseExpr), fsize);
         return;
     }
     if (auto *co = dynamic_cast<CoalesceExpr *>(n)) {
-        co->lhs = specialize(std::move(co->lhs));
-        co->rhs = specialize(std::move(co->rhs));
+        co->lhs = specialize(std::move(co->lhs), fsize);
+        co->rhs = specialize(std::move(co->rhs), fsize);
         return;
     }
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
@@ -4721,30 +4725,35 @@ static void specialize_children(Construct *n)
          * specialized (see FuncDeclStmt::is_template): it is cloned per concrete
          * signature (each clone specializes separately) and, when value-used,
          * run boxed for indirect dispatch. Specializing it would corrupt those. */
+        /* A nested function owns a SEPARATE frame: walk its body with that
+         * function's frame size, so a hoisted LICM temp lands in the right
+         * frame (nullptr when unresolved - no frame to grow, no hoisting). */
         if (fd->body && !fd->is_template)
-            fd->body = specialize(std::move(fd->body));
+            fd->body = specialize(std::move(fd->body),
+                                  fd->desc->resolved ? &fd->desc->frame_size
+                                                     : nullptr);
         return;
     }
     if (auto *ld = dynamic_cast<LiteralDict *>(n)) {
         for (auto &kv : ld->elems) {
-            kv->key = specialize(std::move(kv->key));
-            kv->value = specialize(std::move(kv->value));
+            kv->key = specialize(std::move(kv->key), fsize);
+            kv->value = specialize(std::move(kv->value), fsize);
         }
         return;
     }
     if (auto *sc = dynamic_cast<SingleChildConstruct *>(n)) {
-        if (sc->elem) sc->elem = specialize(std::move(sc->elem));
+        if (sc->elem) sc->elem = specialize(std::move(sc->elem), fsize);
         return;
     }
     if (auto *mo = dynamic_cast<MultiOpConstruct *>(n)) {
         for (auto &pr : mo->elems)
-            pr.second = specialize(std::move(pr.second));
+            pr.second = specialize(std::move(pr.second), fsize);
         return;
     }
     if (auto *me = dynamic_cast<MultiElemConstruct<> *>(n)) {
         /* Block, LiteralArray, ExprList */
         for (auto &e : me->elems)
-            e = specialize(std::move(e));
+            e = specialize(std::move(e), fsize);
         return;
     }
 }
@@ -4957,7 +4966,8 @@ static bool fr_immutable(
  * unchanged. Matched on the RAW for (before its cond/inc are specialized), so
  * the pattern is a plain Expr06 / Expr14 / IncDecExpr.
  */
-static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
+static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n,
+                                          int *fsize)
 {
     auto *f = dynamic_cast<ForStmt *>(n.get());
     if (!f || !f->init || !f->cond || !f->inc || !f->body)
@@ -5034,11 +5044,11 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
     fr->end = f->end;
     fr->i_slot = i_slot;
     fr->cmp_op = cmp_op;
-    fr->bound = specialize(std::move(cond->elems[1].second));
+    fr->bound = specialize(std::move(cond->elems[1].second), fsize);
     if (step)
-        fr->step = specialize(std::move(inc14->rvalue));
-    fr->init = specialize(std::move(f->init));
-    fr->body = specialize(std::move(f->body));
+        fr->step = specialize(std::move(inc14->rvalue), fsize);
+    fr->init = specialize(std::move(f->init), fsize);
+    fr->body = specialize(std::move(f->body), fsize);
 
     /* -a/--analyze: green the `for` keyword of a specialized counted loop. */
     if (g_specialize_analyze)
@@ -5175,7 +5185,443 @@ static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
     return blk;
 }
 
-static unique_ptr<Construct> specialize(unique_ptr<Construct> n)
+/* ------------- loop-invariant CONTAINER-SUBSCRIPT hoisting (LICM) -------- */
+
+/*
+ * The synthetic temps are named `$licm<N>` (the `f$0` / `name$sN` convention -
+ * `$` cannot occur in a source identifier, so a collision is impossible).
+ * Monotonic per specialize_types run; only ever read back through the resolved
+ * slot, never by name.
+ */
+static int g_licm_counter = 0;
+
+/* The frame-slot ceiling for a hoist, matching the tail inliner's cap. */
+static const int LICM_MAX_FRAME_SLOTS = 64;
+
+/*
+ * Structural equality over the side-effect-free expression grammar
+ * `fr_immutable` admits - enough to recognize two occurrences of the SAME
+ * invariant subscript (`a[i]` written twice in one body) so both share one
+ * hoisted temp. Deliberately conservative: an unrecognized node kind compares
+ * UNEQUAL, which costs a duplicate temp, never a wrong substitution.
+ */
+static bool licm_expr_equal(const Construct *x, const Construct *y)
+{
+    if (x == y)
+        return true;
+    if (!x || !y)
+        return false;
+    if (auto *ix = dynamic_cast<const Identifier *>(x)) {
+        auto *iy = dynamic_cast<const Identifier *>(y);
+        return iy && ix->uid == iy->uid && ix->sym.kind == iy->sym.kind
+               && ix->sym.slot == iy->sym.slot;
+    }
+    if (auto *lx = dynamic_cast<const LiteralInt *>(x)) {
+        auto *ly = dynamic_cast<const LiteralInt *>(y);
+        return ly && lx->ival() == ly->ival();
+    }
+    if (auto *sx = dynamic_cast<const Subscript *>(x)) {
+        auto *sy = dynamic_cast<const Subscript *>(y);
+        return sy && licm_expr_equal(sx->what.get(), sy->what.get())
+               && licm_expr_equal(sx->index.get(), sy->index.get());
+    }
+    if (auto *mx = dynamic_cast<const MemberExpr *>(x)) {
+        auto *my = dynamic_cast<const MemberExpr *>(y);
+        return my && mx->memUid == my->memUid
+               && licm_expr_equal(mx->what.get(), my->what.get());
+    }
+    if (auto *cx = dynamic_cast<const SingleChildConstruct *>(x)) {
+        auto *cy = dynamic_cast<const SingleChildConstruct *>(y);
+        return cy && licm_expr_equal(cx->elem.get(), cy->elem.get());
+    }
+    if (auto *ox = dynamic_cast<const MultiOpConstruct *>(x)) {
+        auto *oy = dynamic_cast<const MultiOpConstruct *>(y);
+        if (!oy || typeid(*x) != typeid(*y) || ox->elems.size()
+                                                   != oy->elems.size())
+            return false;
+        for (size_t i = 0; i < ox->elems.size(); i++)
+            if (ox->elems[i].first != oy->elems[i].first
+                || !licm_expr_equal(ox->elems[i].second.get(),
+                                    oy->elems[i].second.get()))
+                return false;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Does `c` contain a call this pass cannot vouch for? Only a call to an
+ * effectively-pure USER function is allowed: `pure` forbids reading globals AND
+ * mutating a reference parameter, so such a call cannot touch the hoisted
+ * container by ANY route.
+ *
+ * A const BUILTIN is deliberately NOT exempted, even though `fr_immutable`
+ * exempts one. Two of them - the higher-order builtins (`map`/`filter`/`sort`/
+ * `make_array`/`find`) - take a CALLBACK, and `fr_collect_mutated` stops at a
+ * FuncDeclStmt, so a lambda that appends to the base array taints nothing and
+ * the base would look invariant. try_for_range lives with that because it
+ * hoists an INT; a hoisted CONTAINER keeps a live reference across every
+ * iteration, so this pass refuses instead. The cost is that a loop body
+ * containing any builtin call gets no hoist - `len()` in an inner body is the
+ * realistic loss, and the counted-loop BOUND (where it usually sits) is
+ * outside the body and unaffected.
+ */
+static bool licm_has_opaque_call(Construct *c)
+{
+    if (!c || dynamic_cast<FuncDeclStmt *>(c))
+        return false;
+    if (auto *ce = dynamic_cast<CallExpr *>(c))
+        if (!fr_is_pure_func(ce->what.get()))
+            return true;
+    bool found = false;
+    Inferencer::for_each_child(c, [&](Construct *ch) {
+        if (!found && licm_has_opaque_call(ch))
+            found = true;
+    });
+    return found;
+}
+
+/*
+ * Every name DECLARED inside the loop body - a `var`/`const` decl, a foreach
+ * loop var, a catch variable, a nested func/struct name. A hoisted expression
+ * may not reference one: the hoist runs BEFORE the loop, where such a slot
+ * still holds its previous (or default `none`) value.
+ *
+ * This is NOT covered by fr_collect_mutated, which deliberately SKIPS a
+ * pInDecl assignment - so a body-local `var m = ...` taints nothing and `m[1]`
+ * looked perfectly invariant. That is exactly what the -rt suite caught.
+ */
+static void licm_collect_decls(Construct *c,
+                               std::unordered_set<const UniqueId *> &out)
+{
+    if (!c)
+        return;
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (fd->id)
+            out.insert(fd->id->uid);
+        return;                       /* its params/locals are not visible */
+    }
+    if (auto *sd = dynamic_cast<StructDeclStmt *>(c)) {
+        if (sd->id)
+            out.insert(sd->id->uid);
+        return;
+    }
+    if (auto *e = dynamic_cast<Expr14 *>(c)) {
+        if (e->fl & pFlags::pInDecl) {
+            if (auto *il = dynamic_cast<IdList *>(e->lvalue.get())) {
+                for (auto &p : il->elems)
+                    out.insert(p->uid);
+            } else if (auto *id = dynamic_cast<Identifier *>(e->lvalue.get())) {
+                out.insert(id->uid);
+            }
+        }
+    } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        if (fe->ids)
+            for (auto &p : fe->ids->elems)
+                out.insert(p->uid);
+    } else if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+        for (auto &cs : tc->catchStmts)
+            if (cs.first.asId)
+                out.insert(cs.first.asId->uid);
+    }
+    Inferencer::for_each_child(c, [&](Construct *ch) {
+        licm_collect_decls(ch, out);
+    });
+}
+
+/* Does `e` reference any of `names`? */
+static bool licm_refs_any(const Construct *e,
+                          const std::unordered_set<const UniqueId *> &names)
+{
+    if (!e)
+        return false;
+    if (auto *id = dynamic_cast<const Identifier *>(e))
+        return names.find(id->uid) != names.end();
+    bool found = false;
+    Inferencer::for_each_child(const_cast<Construct *>(e), [&](Construct *ch) {
+        if (!found && licm_refs_any(ch, names))
+            found = true;
+    });
+    return found;
+}
+
+/* Is `sub` worth hoisting, and provably the same value every iteration? */
+static bool licm_candidate(
+    const Subscript *sub,
+    const std::unordered_set<const UniqueId *> &mut_len,
+    const std::unordered_set<const UniqueId *> &mut_content,
+    const std::unordered_set<const UniqueId *> &body_decls,
+    const UniqueId *i_uid)
+{
+    /* Only an ARRAY read: a dict read has vivify/`for_write` subtleties and a
+     * string subscript yields a fresh 1-char string (nothing to share). */
+    if (!sub->base_array)
+        return false;
+    /* Only a CONTAINER result - the win is the intrusive_ptr copy + the boxed
+     * element materialization. A proven scalar element is already a raw slot
+     * read; hoisting one would buy a load and cost a slot. */
+    if (sub->th == TypeHint::i || sub->th == TypeHint::f)
+        return false;
+    /* Nothing declared INSIDE the body: above the loop its slot is stale. */
+    if (licm_refs_any(sub, body_decls))
+        return false;
+    /* Loop-invariant: base and index unchanged, and NO element/field write to
+     * the base anywhere in the loop (mut_content, checked inside fr_immutable)
+     * - that is also what rules out the COW-detach hazard the slice hoister
+     * documents, since any write reachable to the base taints it. Passing
+     * i_uid rejects any use of the loop variable, at any depth. */
+    return fr_immutable(sub, mut_len, mut_content, i_uid);
+}
+
+/*
+ * Collect the hoistable subscript SLOTS of one statement. Descends only through
+ * positions that are evaluated UNCONDITIONALLY whenever the statement runs: a
+ * ternary arm, a `??` rhs and a `&&`/`||` tail are short-circuited, so hoisting
+ * out of one could evaluate - and throw on - something the loop never would.
+ * Stops at a chosen subscript (does not descend into it), so the collected
+ * slots are pairwise disjoint and substituting one cannot dangle another.
+ */
+static void licm_collect(
+    unique_ptr<Construct> &slot,
+    const std::unordered_set<const UniqueId *> &mut_len,
+    const std::unordered_set<const UniqueId *> &mut_content,
+    const std::unordered_set<const UniqueId *> &body_decls,
+    const UniqueId *i_uid,
+    std::vector<unique_ptr<Construct> *> &out)
+{
+    Construct *c = slot.get();
+    if (!c)
+        return;
+    if (dynamic_cast<TernaryExpr *>(c) || dynamic_cast<CoalesceExpr *>(c)
+        || dynamic_cast<Expr11 *>(c) || dynamic_cast<Expr12 *>(c)
+        || dynamic_cast<FuncDeclStmt *>(c) || dynamic_cast<Block *>(c))
+        return;
+    if (auto *sub = dynamic_cast<Subscript *>(c))
+        if (licm_candidate(sub, mut_len, mut_content, body_decls, i_uid)) {
+            out.push_back(&slot);
+            return;
+        }
+    for_each_child_slot(c, [&](unique_ptr<Construct> &ch) {
+        licm_collect(ch, mut_len, mut_content, body_decls, i_uid, out);
+    });
+}
+
+/* Build a use of the hoisted temp: a resolved-local Identifier at the
+ * subscript's own source location (so a caret inside the loop is unmoved). */
+static unique_ptr<Construct>
+licm_make_use(const UniqueId *name, int slot, const Construct *at)
+{
+    auto id = make_unique<Identifier>(name->val);
+    id->sym.kind = SymKind::local;
+    id->sym.slot = slot;
+    id->start = at->start;
+    id->end = at->end;
+    return id;
+}
+
+/*
+ * LOOP-INVARIANT CONTAINER-SUBSCRIPT HOISTING. A nested-container read whose
+ * base and index do not change across the loop - `a[i]` in
+ * `for (var k = 0; k < n; k++) s += a[i][k] * b[k][j];` - re-materializes a
+ * boxed row EvalValue (an intrusive_ptr retain/release plus the element read)
+ * on every iteration. Roughly half of 46_matrix_mult's inner loop was that.
+ * The read is hoisted into a synthetic temp above the loop:
+ *
+ *     Block(scope_free) {
+ *         if (0 < n) { var $licm0 = a[i]; }          // the GUARD
+ *         for (var k = 0; k < n; k++) s += $licm0[k] * b[k][j];
+ *     }
+ *
+ * THE GUARD is what makes this sound. `a[i]` CAN throw (OOB), unlike the slice
+ * hoister's pure-clamping slice, so an unguarded hoist would turn "never
+ * evaluated" into "throws before the loop" for a ZERO-iteration loop. The guard
+ * is the loop's own entry test with the loop variable replaced by the init
+ * value - `COND[k := INIT]` - so:
+ *   - the loop runs >= 1 time -> the guard holds and `a[i]` is evaluated once,
+ *     exactly as it was on iteration 1;
+ *   - the loop runs 0 times   -> the guard fails, `a[i]` is not evaluated, and
+ *     an OOB index still throws never.
+ * The temp is READ only inside the body, which runs only when the guard held.
+ *
+ * Restricted to the counted shape `for (var k = INIT; k CMP BOUND; ...)` with
+ * INIT and BOUND both `fr_immutable` (hence side-effect-free), which makes the
+ * guard exactly `INIT CMP BOUND` - no general substitution, and no risk of
+ * duplicating a side effect into it. A `while` loop is not handled (its
+ * condition would have to be proven side-effect-free separately).
+ *
+ * The ForStmt itself is left UNTOUCHED and merely wrapped: try_for_range runs
+ * next and must still recognize the counted shape, and losing ForRangeStmt
+ * would cost more than the hoist gains.
+ */
+static unique_ptr<Construct>
+try_hoist_loop_subscripts(unique_ptr<Construct> n, int *fsize)
+{
+    if (!fsize || *fsize >= LICM_MAX_FRAME_SLOTS)
+        return n;                     /* no frame to grow, or no room in it */
+    auto *f = dynamic_cast<ForStmt *>(n.get());
+    if (!f || !f->init || !f->cond || !f->inc || !f->body)
+        return n;
+
+    /* init: `var k = INIT`, k a slotted-local int */
+    auto *init = dynamic_cast<Expr14 *>(f->init.get());
+    if (!init || !(init->fl & pFlags::pInDecl) || init->op != Op::assign)
+        return n;
+    auto *ivar = dynamic_cast<Identifier *>(init->lvalue.get());
+    if (!ivar || ivar->sym.kind != SymKind::local || ivar->th != TypeHint::i)
+        return n;
+    const UniqueId *i_uid = ivar->uid;
+
+    /* cond: `k CMP BOUND` (the raw pre-specialization form, as try_for_range
+     * matches it) */
+    auto *cond = dynamic_cast<Expr06 *>(f->cond.get());
+    if (!cond || cond->elems.size() != 2)
+        return n;
+    auto *cleft = dynamic_cast<Identifier *>(cond->elems[0].second.get());
+    if (!cleft || cleft->uid != i_uid)
+        return n;
+    const Op cmp = cond->elems[1].first;
+    if (cmp != Op::lt && cmp != Op::le && cmp != Op::gt && cmp != Op::ge)
+        return n;
+
+    /* A call this pass cannot vouch for can invalidate the hoisted reference
+     * through a route the mutation sets do not model. */
+    if (licm_has_opaque_call(f->body.get()))
+        return n;
+
+    std::unordered_set<const UniqueId *> mut_len, mut_content;
+    fr_collect_mutated(n.get(), mut_len, mut_content);
+    std::unordered_set<const UniqueId *> body_decls;
+    licm_collect_decls(f->body.get(), body_decls);
+
+    /* Both halves of the guard must be side-effect-free (it is evaluated once
+     * BEFORE the loop's own init) and free of the loop variable. */
+    Construct *bound = cond->elems[1].second.get();
+    Construct *init_rv = init->rvalue.get();
+    if (!fr_immutable(bound, mut_len, mut_content, i_uid)
+        || !fr_immutable(init_rv, mut_len, mut_content, i_uid))
+        return n;
+
+    /*
+     * A guard over two int LITERALS is decidable here (the bounds are const but
+     * AutoConst has already run, so nothing else would fold it): false means
+     * the loop body never runs, so there is nothing to hoist; true means the
+     * guard is unconditional and can be dropped entirely.
+     */
+    bool guard_needed = true;
+    if (auto *li = dynamic_cast<LiteralInt *>(init_rv))
+        if (auto *lb = dynamic_cast<LiteralInt *>(bound)) {
+            const int_type x = li->ival(), y = lb->ival();
+            const bool enters = cmp == Op::lt ? x <  y
+                              : cmp == Op::le ? x <= y
+                              : cmp == Op::gt ? x >  y
+                                              : x >= y;
+            if (!enters)
+                return n;
+            guard_needed = false;
+        }
+
+    /*
+     * Scan the body's DIRECT statements in order, stopping at the first one
+     * that is not a plain expression statement: anything else (an `if`, a
+     * nested loop, a `return`/`break`, a `try`) either evaluates its parts
+     * conditionally or can skip the statements after it, so nothing beyond it
+     * is guaranteed to run on every iteration.
+     */
+    std::vector<unique_ptr<Construct> *> sites;
+    std::vector<unique_ptr<Construct> *> stmts;
+    if (auto *b = dynamic_cast<Block *>(f->body.get())) {
+        for (auto &e : b->elems)
+            stmts.push_back(&e);
+    } else {
+        stmts.push_back(&f->body);
+    }
+    for (unique_ptr<Construct> *sp : stmts) {
+        Construct *s = sp->get();
+        if (!dynamic_cast<Expr14 *>(s) && !dynamic_cast<IncDecExpr *>(s))
+            break;
+        licm_collect(*sp, mut_len, mut_content, body_decls, i_uid, sites);
+    }
+    if (sites.empty())
+        return n;
+
+    /* One temp per DISTINCT expression; every occurrence reads that temp. */
+    struct Group {
+        const Construct *rep;      /* owned by the decl below - stable */
+        const UniqueId *name;
+        int slot;
+    };
+    std::vector<Group> groups;
+    std::vector<unique_ptr<Construct>> decls;
+
+    for (unique_ptr<Construct> *sp : sites) {
+        int gi = -1;
+        for (size_t g = 0; g < groups.size(); g++)
+            if (licm_expr_equal(groups[g].rep, sp->get())) {
+                gi = static_cast<int>(g);
+                break;
+            }
+        if (gi >= 0) {
+            *sp = licm_make_use(groups[gi].name, groups[gi].slot, sp->get());
+            continue;
+        }
+        if (*fsize >= LICM_MAX_FRAME_SLOTS)
+            break;                              /* frame budget exhausted */
+
+        const int slot = (*fsize)++;
+        const std::string nm = "$licm" + std::to_string(g_licm_counter++);
+        auto decl_id = licm_make_use(UniqueId::get(nm), slot, sp->get());
+        const UniqueId *name =
+            static_cast<Identifier *>(decl_id.get())->uid;
+
+        auto d = make_unique<Expr14>();
+        d->op = Op::assign;
+        d->fl = pFlags::pInDecl;
+        d->start = (*sp)->start;
+        d->end = (*sp)->end;
+        d->lvalue = std::move(decl_id);
+        auto use = licm_make_use(name, slot, sp->get());
+        d->rvalue = std::move(*sp);            /* the subscript itself */
+        groups.push_back({d->rvalue.get(), name, slot});
+        decls.push_back(std::move(d));
+        *sp = std::move(use);
+    }
+    if (decls.empty())
+        return n;
+
+    auto blk = make_unique<Block>();
+    n->copy_base_fields(*blk);            /* the loop's loc for carets */
+    blk->scope_free = true;
+
+    if (guard_needed) {
+        /* The guard: the loop's condition with the loop variable replaced by
+         * the init value. Cloned, so the loop's own cond is untouched. */
+        auto guard = f->cond->clone();
+        auto *gm = static_cast<MultiOpConstruct *>(guard.get());
+        gm->elems[0].second = init->rvalue->clone();
+
+        auto then_blk = make_unique<Block>();
+        then_blk->scope_free = true;
+        then_blk->start = f->start;
+        then_blk->end = f->end;
+        for (auto &d : decls)
+            then_blk->elems.push_back(std::move(d));
+
+        auto iff = make_unique<IfStmt>();
+        iff->start = f->start;
+        iff->end = f->end;
+        iff->condExpr = std::move(guard);
+        iff->thenBlock = std::move(then_blk);
+        blk->elems.push_back(std::move(iff));
+    } else {
+        for (auto &d : decls)
+            blk->elems.push_back(std::move(d));
+    }
+
+    blk->elems.push_back(std::move(n));
+    return blk;
+}
+
+static unique_ptr<Construct> specialize(unique_ptr<Construct> n, int *fsize)
 {
     if (!n)
         return n;
@@ -5185,20 +5631,25 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n)
     if (dynamic_cast<ForStmt *>(n.get())
             || dynamic_cast<WhileStmt *>(n.get())) {
         n = try_hoist_loop_slices(std::move(n));
+        /* then the invariant container reads INSIDE the loop (a `for` only).
+         * If the slice hoist already produced a wrapper Block, the recursion
+         * below re-enters specialize() on the loop and it gets its turn. */
+        if (dynamic_cast<ForStmt *>(n.get()))
+            n = try_hoist_loop_subscripts(std::move(n), fsize);
         if (auto *blk = dynamic_cast<Block *>(n.get())) {
             for (auto &e : blk->elems)
-                e = specialize(std::move(e));
+                e = specialize(std::move(e), fsize);
             return n;
         }
     }
     /* a counted for-loop -> ForRangeStmt (matched on the raw form, BEFORE its
      * cond/inc are specialized away). */
     if (dynamic_cast<ForStmt *>(n.get())) {
-        n = try_for_range(std::move(n));
+        n = try_for_range(std::move(n), fsize);
         if (dynamic_cast<ForRangeStmt *>(n.get()))
             return n;     /* matched: sub-trees already specialized */
     }
-    specialize_children(n.get());     /* bottom-up: children first */
+    specialize_children(n.get(), fsize);     /* bottom-up: children first */
     return try_specialize(std::move(n));
 }
 
@@ -5359,6 +5810,10 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
         return;
 
     g_specialize_analyze = analyze;   /* null in a normal run (no recording) */
+    /* Reset per run, NOT monotonic across the process: two compiles of the
+     * same program must produce byte-identical trees (the .myv determinism
+     * property, and cross_compile_specialize_stable). */
+    g_licm_counter = 0;
 
     /* a for-range bound may call a pure user function (with scalar args) -
      * collect this program's effectively-pure functions first, plus (in the
@@ -5379,8 +5834,11 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
         }
     }
 
+    /* Top-level statements run in "main", whose frame is the root block's
+     * slot_count - the frame a LICM hoist there grows (Block::do_eval and the
+     * codegen both size main's frame from it). */
     for (auto &e : blk->elems)
-        e = specialize(std::move(e));
+        e = specialize(std::move(e), &blk->slot_count);
 
     /* The tree is FINAL now - fold every foldable show() (see above), so the
      * codegen never sees the one remaining node-ABI builtin. */

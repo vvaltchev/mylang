@@ -1,8 +1,9 @@
 # The my/cpp extremes: two causes, not many
 
-Status: **DIAGNOSED, nothing built.** Investigated 2026-08-01 at the
-maintainer's request ("why so many cases > 10x, and why 20-30x?").
-All figures callgrind Ir on an `OPT=1 ASSERTS=0` build.
+Status: **cause 2 FIXED (subscript LICM, 2026-08-01); cause 1 OPEN.**
+Investigated 2026-08-01 at the maintainer's request ("why so many cases
+> 10x, and why 20-30x?"). All figures callgrind Ir on an `OPT=1
+ASSERTS=0` build.
 
 The suite geomean vs C++ is ~3x, but the tail runs to 32x. The tail is
 NOT many separate problems. Every bench above 19x traces to one of two
@@ -99,112 +100,93 @@ libstdc++/libc symbol is in a hot loop.
 Item 2 is the higher-value one (four benches) but touches the hottest
 protocol in the VM, so it wants its own session and the full battery.
 
-## Item 1 in detail — subscript LICM, scoped 2026-08-01
+## Item 1 - subscript LICM: BUILT 2026-08-01
 
-I started this and stopped at the design, because it is NOT the small
-extension of the slice hoister it looks like. Two obstacles, both real:
+Landed as `try_hoist_loop_subscripts` (inferencer.cpp), the sibling of the
+slice hoister. Design notes kept because two of the obstacles are the
+reason the code looks the way it does.
 
-**(a) There is no decl to hoist.** `try_hoist_loop_slices` moves an
-EXISTING statement - `var sl = base[a:b];` - so the hoisted value already
-owns a frame slot and an `Identifier` with a resolved `sym`. In 46 the
-invariant is a SUB-EXPRESSION (`a[i]` inside `s += a[i][k] * b[k][j]`),
-so the transform must SYNTHESISE a temp: allocate a fresh frame slot,
-build an `Identifier` with `sym.kind = local` + the right `th`/static
-type, emit `var $licm0 = a[i];` above the loop, and rewrite each
-occurrence. Allocating a slot post-resolve needs the enclosing
-`FuncDeclStmt` (to bump `frame_size`, capped at 64 like the tail
-inliner's local remap) - and `specialize()` is a free function with no
-current-function handle. So it needs threading, or the pass has to move.
+**(a) There was no decl to hoist.** `try_hoist_loop_slices` MOVES an
+existing statement, so the value already owns a frame slot. Here the
+invariant is a SUB-EXPRESSION, so the pass SYNTHESISES `$licm<N>`:
+a fresh slot, an `Identifier` with `sym.kind = local`, a `pInDecl`
+`Expr14`, and a rewrite of each occurrence. Allocating a slot post-resolve
+needed the enclosing function's frame counter, so `specialize()`,
+`specialize_children()` and `try_for_range()` now thread an `int *fsize`
+(the root Block's `slot_count` for main, `FuncDescriptor::frame_size` for
+a function, null when unresolved) - the same parameter the Inliner's
+`walk` already carried.
 
-**(b) A subscript CAN throw; a slice cannot.** The slice hoister is sound
-for a ZERO-iteration loop precisely because slicing only clamps
-(`base_sliceable` + int bounds => cannot throw), so moving it before the
-loop cannot introduce an error. `a[i]` throws on OOB. Hoisting it out of
-a loop that runs zero times turns "never evaluated" into "throws before
-the loop" - observable, and wrong. So it needs EITHER a proof the loop
-executes at least once (for a counted `for` with literal/immutable
-bounds this is often provable), OR a proof the index is in range.
+**(b) A subscript CAN throw; a slice cannot.** Solved by the GUARDED
+PREHEADER: the hoisted decl gets the loop's own entry test with the loop
+variable replaced by the init value (`COND[k := INIT]`), so a zero-trip
+loop evaluates nothing and a >=1-trip loop evaluates it exactly once. The
+counted-shape restriction (`for (var k = INIT; k CMP BOUND; ...)` with
+both `fr_immutable`) is what makes the guard literally `INIT CMP BOUND` -
+no substitution walk, no chance of duplicating a side effect into it.
+Two int literals decide it at compile time (false -> no hoist, the body
+never runs; true -> no guard emitted).
 
-Neither is a blocker, but together they make this a real optimizer
-change rather than a 30-line extension, and it should start fresh.
+The ForStmt is left untouched and merely WRAPPED, so `try_for_range` still
+matches the counted shape - losing `ForRangeStmt` would cost more than the
+hoist gains. That ordering is why the slice hoister works the same way.
 
-### The soundness fix: a GUARDED PREHEADER
+### What the -rt suite caught
 
-Obstacle (b) is solvable and this is the design to build. The hoist is
-unsound only when the loop may run ZERO times, so give the hoisted decl
-the loop's own entry condition:
+The first version hoisted `m[1]` out of `for (...) { var m = map(f, a);
+s = s + m[1]; }`. `m` is declared INSIDE the body, and `fr_collect_mutated`
+deliberately SKIPS a pInDecl assignment - so `m` was tainted by nothing and
+`m[1]` looked perfectly invariant. Above the loop its slot is still `none`.
+Fixed with `licm_collect_decls` (every name declared in the body: decls,
+foreach vars, catch vars, nested func/struct names) plus a reference check.
+Worth recording as the general shape: **the mutation sets model REASSIGNMENT,
+not DEFINEDNESS**, so any pass that moves code above a loop needs its own
+declared-in-body check.
 
-    for (var k = 0; k < n; k++)  s += a[i][k] * b[k][j];
+### Deliberately stricter than fr_immutable
 
-becomes
+Any call that is not a pure USER function disqualifies the loop
+(`licm_has_opaque_call`). A const BUILTIN is NOT exempted, though
+`fr_immutable` exempts one: the higher-order builtins take a callback and
+`fr_collect_mutated` stops at a `FuncDeclStmt`, so a lambda appending to
+the base array taints nothing. `try_for_range` lives with that gap because
+it hoists an INT; this pass keeps a live REFERENCE across every iteration,
+so it refuses instead. The realistic cost is a `len()` call in an inner
+body - and the counted-loop BOUND, where `len()` usually sits, is outside
+the body and unaffected.
 
-    Block(scope_free) {
-        if (0 < n) { var $licm0 = a[i]; }        // the GUARD
-        for (var k = 0; k < n; k++) s += $licm0[k] * b[k][j];
-    }
+### Measured
 
-The guard is the loop's `cond` CLONED with the loop variable substituted
-by the init's rvalue - for `for (var k = INIT; COND; ...)` it is
-`COND[k := INIT]`, here `0 < n`. Then:
+All `OPT=1 ASSERTS=0`, both binaries built the same session.
 
-  - loop runs >= 1 time  -> the guard is true, `a[i]` is evaluated
-    exactly once, exactly as before (it was evaluated on iteration 1);
-  - loop runs 0 times    -> the guard is false, `a[i]` is NOT evaluated,
-    so an OOB `i` still throws never. The observable behaviour is
-    identical, including which errors occur and in what order.
+- callgrind Ir, 46_matrix_mult: 187.9M -> 142.7M at scale 1 (**-24.1%**),
+  441.2M -> 302.4M at scale 3. Per scale unit that is 126.6M -> 79.9M
+  (**-36.9%**), i.e. over 343,000 inner iterations, **369 -> 233 Ir per
+  iteration** - the diagnosis above predicted ~200, so the estimate was
+  a little optimistic but the mechanism is exactly as scoped.
+- wall clock, interleaved A/B: **0.68x** on 46 (0.102s -> 0.069s).
+- suite geomean cur/base **0.998x** over 77 benches - neutral, as it must
+  be: the pass fires on exactly ONE program in bench/ + samples/.
+- output over bench/ + samples/ (83 programs): byte-identical to the
+  pre-LICM binary, and VM == tree-walker on every one. Worth stating why
+  the usual tw-vs-vm differential is NOT sufficient here: this is an AST
+  transform, so both engines run the SAME transformed tree. The oracle
+  has to be a binary without the pass.
 
-`$licm0` is only READ inside the loop body, which the guard proves is
-only entered when the decl ran - so the "declared in an inner block" is
-not a problem (its slot is frame-wide; resolution is by slot).
+### Follow-ups not taken
 
-Cost when the loop does run: one extra comparison before the loop,
-against 343,000 saved boxed reads on 46.
+- **`while` loops**: the guard would have to be the condition itself,
+  which needs a separate side-effect-free proof. Only `for` is handled.
+- **Scalar elements**: `a[i][j]` with both indices invariant and an int
+  result is a real (smaller) win, but it needs a typed temp (`th`) and
+  interacts with the flat-store paths. The pass descends past it and
+  hoists the container half instead.
+- **Dict bases**: `base_dict` reads have vivify/`for_write` subtleties.
 
-CRITICAL: the guard must be built WITHOUT restructuring the `ForStmt`
-itself. An earlier idea - moving `init` out and leaving `for (; cond;
-inc)` - would stop `try_for_range` from matching the counted-loop shape,
-losing the `ForRangeStmt` specialization, which is worth more than the
-hoist. The wrapper Block + an untouched ForStmt keeps that intact (the
-slice hoister already relies on this ordering).
+## Item 2 - the call return path: STILL OPEN
 
-### What remains to build
-
-1. **Thread a frame-size pointer through `specialize()`** exactly as the
-   Inliner's `walk(slot, depth, int *fsize, no_block)` already does
-   (resolver.cpp:3130) - `(*fsize)++` is the fresh-slot allocator, and
-   `FuncDeclStmt::desc->frame_size` is the per-function counter. Cap at
-   64 like the tail inliner. `specialize()` (inferencer.cpp:5178) is
-   currently a free function with no such parameter.
-2. **Find the candidates**: a `Subscript` appearing in a DIRECT statement
-   of the loop body (unconditional per iteration - NOT nested in an `if`
-   or an inner loop, or hoisting could evaluate what never would have),
-   whose base and index are both loop-invariant by the existing
-   `fr_collect_mutated` / `fr_immutable` analysis, and whose static type
-   is a CONTAINER (hoisting a scalar buys nothing - the win is the
-   `intrusive_ptr` copy).
-3. **Synthesise** the `Identifier` (fresh uid `$licm<N>`,
-   `sym.kind = local`, the new slot, `th`/static type copied from the
-   subscript) and the `Expr14` decl, plus the guard `IfStmt`.
-4. **Substitute** every occurrence of the subscript in the body with the
-   temp - `for_each_child_slot` already does this shape of rewrite for
-   the inliner's param substitution.
-5. **Tests**: the zero-trip case (an OOB index in a loop that never runs
-   must still NOT throw - this is the whole point of the guard), a
-   mutated base, a mutated index, an aliasing write through the hoisted
-   row, plus a `-vd` shape pin and the differential.
-
-### Session note (2026-08-01)
-
-Design complete, implementation NOT started. Stopped deliberately: the
-change is ~200 lines across the specialize pass plus the fsize threading
-and its tests, and it was scoped at the end of a long session with too
-little room to land it and run the full battery. Starting it and leaving
-it half-applied in the optimizer would be worse than not starting.
-
-A genuinely small down-payment, if a partial win is wanted first:
-extend `try_hoist_loop_slices` to accept a `Subscript` rvalue (not only
-a `Slice`) that yields a CONTAINER - i.e. hoist an explicit
-`var row = a[i];` written by the user in the loop body. Same safety
-analysis, same transform, no synthetic temp, no slot allocation. It does
-NOT help 46 as written (which has no such decl), but it is the correct
-first half and it makes the hand-written form fast.
+Unchanged from the diagnosis above, and now the largest remaining item in
+the my/cpp tail: `vm_frame_leave` is the #1 or #2 self-cost in every
+call-heavy bench (10/11/63/76). Ideas, still unvalidated: a single
+precomputed "plain frame" flag replacing `pop_window`'s four watermark
+compares, and skipping the `ref_slots` scan when the list is empty.
