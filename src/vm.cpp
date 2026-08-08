@@ -1382,7 +1382,7 @@ vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
                 vm_throw_unpack_len(chunk, pc, sub.size(),
                                     static_cast<int>(nv));
             for (size_t i = 0; i < nv; i++)
-                bind(tb + i, vm_arr_elem(elem, static_cast<size_type>(i)));
+                bind(tb + i, vm_arr_elem(sub, static_cast<size_type>(i)));
         }
         st.idx++;
     } else {
@@ -3994,7 +3994,7 @@ vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
         for (int_type k = 0; k < N; k++) {
             if ((*targets)[k] >= 0)
                 ctx.frame->at((*targets)[k]).put(
-                    vm_arr_elem(elem, static_cast<size_type>(k)));
+                    vm_arr_elem(sub, static_cast<size_type>(k)));
         }
         return;
     }
@@ -4013,7 +4013,7 @@ vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
          * to do_iter's bind_loop_var. */
         for (int_type k = 0; k < N; k++)
             ctx.frame->at(dst_base + k).put(
-                vm_arr_elem(elem, static_cast<size_type>(k)));
+                vm_arr_elem(sub, static_cast<size_type>(k)));
     }
 }
 
@@ -4056,13 +4056,14 @@ vm_multi_unpack_body(EvalContext &ctx, const EvalValue &rval,
         ctx.frame->at(t).put(std::move(nv));
     };
     if (rval.is<SharedArrayObj>()) {
-        const size_type m = rval.get_ref<SharedArrayObj>().size();
+        const SharedArrayObj &ra = rval.get_ref<SharedArrayObj>();
+        const size_type m = ra.size();
         if (m != static_cast<size_type>(targets.size()))
             vm_throw_multi_unpack_len(chunk, pc, m, targets.size());
         for (size_t i = 0; i < targets.size(); i++) {
             ti = i;
             if (targets[i] >= 0)
-                store(targets[i], vm_arr_elem(rval,
+                store(targets[i], vm_arr_elem(ra,
                                               static_cast<size_type>(i)));
         }
     } else {

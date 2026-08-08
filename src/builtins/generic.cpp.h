@@ -484,6 +484,15 @@ EvalValue vm_arr_elem(const EvalValue &arr_val, size_type i)
     return arr_elem_at(arr_val.get_ref<SharedArrayObj>(), i);
 }
 
+/* The same read for a caller that ALREADY holds the extracted array - every
+ * unpack site does, since it had to check the element count first. Saves the
+ * per-element type-tag check + cast that re-deriving it from the EvalValue
+ * costs, which in a 2-var unpack is two of them per row. */
+EvalValue vm_arr_elem(const SharedArrayObj &arr, size_type i)
+{
+    return arr_elem_at(arr, i);
+}
+
 /* map/filter validate arg0 (the function) BEFORE evaluating arg1 (the
  * container) - a TESTED order (`map(5, undefined_var)` is a type error on the
  * 5, not undefined-var on arg1), so they stay on the `func` ABI (the eager
