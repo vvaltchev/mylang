@@ -740,3 +740,24 @@ scalars could in principle run on the native stack with no record at all,
 and the record could be reconstructed lazily only if an exception or a
 backtrace actually asks for it. That is a design fork for the maintainer,
 not an increment.
+
+## #125 RESOLVED 2026-08-06: the VM's caret wins
+
+An index OOB in a TYPED `a[i].f` read carets the SUBSCRIPT, not the whole
+member expression. Maintainer's call, and the argument for it: the fault is
+the INDEX rather than the field, and it is what every other element read
+already reports - struct or not. The tree-walker's MemberExpr span was an
+artifact of which node happened to own the carets at that call site, not a
+choice: `member_pod_array_scalar` was handed the enclosing MemberExpr's
+`start`/`end`. It now takes `sub->start`/`sub->end`.
+
+The bug hid for two reasons worth remembering. In an UNTYPED context the
+tree-walker never takes that fast path, so both engines agreed there. And
+the 5-mode differential compares thrown exception TYPES, not caret columns -
+so the only net that can catch a span regression is an `err loc:` test with
+EXPLICIT columns, which this shape did not have. It has one now, and the
+sabotage (restoring the MemberExpr span) fails it: expected 56, got 57.
+
+Note the convention when writing such a test: the harness checks the RAW
+`loc_end.col`, which is "last char + 2", while the renderer prints
+`loc_end.col - 1`. A caret shown as `51:55` is stored as 51..56.

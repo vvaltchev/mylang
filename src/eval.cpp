@@ -5607,7 +5607,14 @@ int_type MemberExpr::eval_int(EvalContext *ctx) const
 {
     if (auto *sub = dynamic_cast<const Subscript *>(what.get())) {
         int_type v;
-        if (member_pod_array_scalar(sub, ctx, memUid, start, end, v))
+        /* #125: the OOB caret is the SUBSCRIPT's span, not this
+         * MemberExpr's - the fault is the INDEX, not the field, and it is
+         * what every other element read reports (and what the VM has always
+         * reported for this shape). Passing `start, end` here spanned
+         * `row[i].y` and made the two engines disagree; nothing caught it,
+         * because the differential compares exception TYPES, not columns. */
+        if (member_pod_array_scalar(sub, ctx, memUid,
+                                    sub->start, sub->end, v))
             return v;
     }
 
@@ -5645,7 +5652,14 @@ float_type MemberExpr::eval_float(EvalContext *ctx) const
 {
     if (auto *sub = dynamic_cast<const Subscript *>(what.get())) {
         float_type v;
-        if (member_pod_array_scalar(sub, ctx, memUid, start, end, v))
+        /* #125: the OOB caret is the SUBSCRIPT's span, not this
+         * MemberExpr's - the fault is the INDEX, not the field, and it is
+         * what every other element read reports (and what the VM has always
+         * reported for this shape). Passing `start, end` here spanned
+         * `row[i].y` and made the two engines disagree; nothing caught it,
+         * because the differential compares exception TYPES, not columns. */
+        if (member_pod_array_scalar(sub, ctx, memUid,
+                                    sub->start, sub->end, v))
             return v;
     }
 
