@@ -491,8 +491,11 @@ def main():
                     help="pick a fresh random base seed each run (for casual "
                          "--show inspection); the chosen seed is printed so you "
                          "can reproduce it with --seed")
-    ap.add_argument("--engines", default="tw,vm,py",
-                    help="comma list of engines to compare: tw,vm,py")
+    ap.add_argument("--engines", default="tw,vm,py,noopt",
+                    help="comma list of engines to compare: tw,vm,py,noopt "
+                         "(noopt re-runs both engines with every AST "
+                         "transform disabled - the only oracle for an "
+                         "optimizer that rewrites the tree)")
     ap.add_argument("--keep-failures", default=None,
                     help="directory to save diverging .my/.py for debugging")
     ap.add_argument("--check-fallbacks", action="store_true",
@@ -564,6 +567,17 @@ def main():
             results["vm"] = run([args.mylang, "-vm"], my_path)
         if "py" in engines:
             results["py"] = run([args.python], py_path)
+        # The OPTIMIZER LAYER. An AST transform (LICM, the slice hoist, the
+        # counted-loop rewrite, M8) rewrites the tree BEFORE either engine
+        # runs it, so tw-vs-vm cannot see a bug in one - both faithfully run
+        # the same wrong tree. Re-running with every transform OFF is the
+        # only oracle, and random deep-nested programs are where a transform's
+        # gates get combinations no hand-written test covers.
+        if "noopt" in engines:
+            results["vm-noopt"] = run([args.mylang, "-vm",
+                                       "--no-opt", "all"], my_path)
+            results["tw-noopt"] = run([args.mylang, "-tw",
+                                       "--no-opt", "all"], my_path)
 
         vals = list(results.values())
         ok = all(v == vals[0] for v in vals) and not vals[0].startswith("<")
@@ -594,7 +608,9 @@ def main():
              (", %d fallbacks" % fallbacks) if args.check_fallbacks else ""))
     bad = failures + (fallbacks if args.check_fallbacks else 0)
     if bad == 0:
-        print("ALL AGREE - tree-walker == VM == CPython on every program.")
+        print("ALL AGREE - tree-walker == VM == CPython"
+              + (" == optimizers-off" if "noopt" in engines else "")
+              + " on every program.")
     return 1 if bad else 0
 
 

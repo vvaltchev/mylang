@@ -1787,6 +1787,32 @@ void Inferencer::annotate_hints(Construct *n)
     if (auto *call = dynamic_cast<CallExpr *>(n)) {
         StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
         call->vm_direct_func = ct->kind == StaticTypeKind::Func;
+
+        /*
+         * Which arguments could the call INVOKE? Bit i is set when argument
+         * i's static type is a `Func` or a `dyn` that might hold one - the
+         * higher-order builtins (map/filter/sort/make_array/make_dict/find)
+         * are exactly the calls that end up with a bit set. A caller that
+         * needs the callback to be harmless (the LICM hoist) then checks
+         * purity on just those arguments; everything else - `len(arr)`,
+         * `abs(x)`, `str(v)` - reads as a mask of 0. Only the TYPE question
+         * is answerable here: `effective_pure` is the resolver's, and the
+         * resolver has not run yet.
+         */
+        uint32_t cmask = 0;
+        const size_t na = call->args ? call->args->elems.size() : 0;
+        if (na > 32) {
+            cmask = ~0u;                /* no room to be precise: assume all */
+        } else {
+            for (size_t i = 0; i < na; i++) {
+                StaticTypeRef at = static_type_resolve(
+                    type_of(call->args->elems[i].get()));
+                if (at->kind == StaticTypeKind::Func
+                    || at->kind == StaticTypeKind::Dyn)
+                    cmask |= 1u << i;
+            }
+        }
+        call->callable_arg_mask = cmask;
         /* lever 4b: len(x)'s arg proven a non-opt array/string - the
          * BUILTIN-ness proof is codegen's (DirectBuiltinCallExpr + the
          * `len` uid), so this stamp alone triggers nothing. */
@@ -5250,29 +5276,83 @@ static bool licm_expr_equal(const Construct *x, const Construct *y)
 }
 
 /*
- * Does `c` contain a call this pass cannot vouch for? Only a call to an
- * effectively-pure USER function is allowed: `pure` forbids reading globals AND
- * mutating a reference parameter, so such a call cannot touch the hoisted
- * container by ANY route.
+ * Is `f` a function VALUE this pass can prove harmless - one that cannot reach
+ * the enclosing function's locals at all? `effective_pure` (the resolver's
+ * `func_body_is_pure`) is exactly that proof: a pure function has NO capture
+ * list, reads only consts + its own params + other pure functions, and does
+ * not mutate a reference parameter. So it cannot see, let alone rebind, the
+ * array a hoisted row was read from.
  *
- * A const BUILTIN is deliberately NOT exempted, even though `fr_immutable`
- * exempts one. Two of them - the higher-order builtins (`map`/`filter`/`sort`/
- * `make_array`/`find`) - take a CALLBACK, and `fr_collect_mutated` stops at a
- * FuncDeclStmt, so a lambda that appends to the base array taints nothing and
- * the base would look invariant. try_for_range lives with that because it
- * hoists an INT; a hoisted CONTAINER keeps a live reference across every
- * iteration, so this pass refuses instead. The cost is that a loop body
- * containing any builtin call gets no hoist - `len()` in an inner body is the
- * realistic loss, and the counted-loop BOUND (where it usually sits) is
- * outside the body and unaffected.
+ * Two spellings reach here - an INLINE lambda (`map(func(x) => x*2, a)`, a
+ * FuncDeclStmt sitting in the argument list) and a NAME (`sort(a, cmp)`).
+ */
+static bool licm_pure_callback(const Construct *arg)
+{
+    if (auto *fd = dynamic_cast<const FuncDeclStmt *>(arg))
+        return fd->desc && fd->desc->effective_pure;
+    return fr_is_pure_func(arg);
+}
+
+/*
+ * `fr_is_const_builtin` matches the NAME against const_builtins without
+ * checking that the builtin is unshadowed - a `func len(x)` of one's own still
+ * answers true there (a pre-existing looseness in try_for_range's bound
+ * analysis, left alone: tightening it would also change the REPL, where
+ * builtins are map-resident and carry no `builtin` SymKind). This pass wants
+ * the real proof, so it additionally requires the resolver's verdict.
+ */
+static bool licm_is_const_builtin(const Construct *callee)
+{
+    auto *id = dynamic_cast<const Identifier *>(callee);
+    return id && id->sym.kind == SymKind::builtin
+           && fr_is_const_builtin(callee);
+}
+
+/*
+ * Does `c` contain a call this pass cannot vouch for?
+ *
+ * Allowed: a call to an effectively-pure USER function, and a call to a CONST
+ * BUILTIN whose callable arguments are all provably pure. The second clause is
+ * why `len(arr)` / `abs(x)` / `str(v)` in a loop body cost nothing - their
+ * `callable_arg_mask` is 0, so there is nothing to prove.
+ *
+ * The mask is what makes this safe rather than optimistic. A HIGHER-ORDER
+ * builtin (map/filter/sort/make_array/make_dict/find) runs a callback that
+ * `fr_collect_mutated` cannot see - it stops at a FuncDeclStmt - so a lambda
+ * that appends to the base array would taint nothing and the base would look
+ * invariant. The inferencer stamps which arguments could BE that callback
+ * (a `Func` or a `dyn` static type); each one must then be provably pure.
+ * A callback that is neither an inline lambda nor a named pure function - a
+ * local variable holding one, say - is unprovable here, and refused.
+ *
+ * try_for_range has the same blind spot and lives with it because it hoists an
+ * INT. This pass keeps a live REFERENCE across every iteration, so it checks.
  */
 static bool licm_has_opaque_call(Construct *c)
 {
     if (!c || dynamic_cast<FuncDeclStmt *>(c))
         return false;
-    if (auto *ce = dynamic_cast<CallExpr *>(c))
-        if (!fr_is_pure_func(ce->what.get()))
-            return true;
+    if (auto *ce = dynamic_cast<CallExpr *>(c)) {
+        if (!fr_is_pure_func(ce->what.get())) {
+            if (!licm_is_const_builtin(ce->what.get()))
+                return true;
+            const uint32_t m = ce->callable_arg_mask;
+            const size_t na = ce->args ? ce->args->elems.size() : 0;
+            if (na > 31)
+                return true;
+            /* A bit OUTSIDE the argument range means the mask was never
+             * stamped (it defaults to ~0u) - treat the call as opaque. */
+            const uint32_t valid = na ? ((1u << na) - 1u) : 0u;
+            if (m & ~valid)
+                return true;
+            for (size_t i = 0; i < na; i++)
+                if ((m & (1u << i))
+                    && !licm_pure_callback(ce->args->elems[i].get()))
+                    return true;
+        }
+        /* fall through: the ARGUMENTS still get walked below - an impure call
+         * nested inside a pure call's argument list must still disqualify. */
+    }
     bool found = false;
     Inferencer::for_each_child(c, [&](Construct *ch) {
         if (!found && licm_has_opaque_call(ch))
@@ -5630,11 +5710,13 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n, int *fsize)
      * specialize individually). */
     if (dynamic_cast<ForStmt *>(n.get())
             || dynamic_cast<WhileStmt *>(n.get())) {
-        n = try_hoist_loop_slices(std::move(n));
+        if (!(g_opt_disabled & opt_slice_hoist))
+            n = try_hoist_loop_slices(std::move(n));
         /* then the invariant container reads INSIDE the loop (a `for` only).
          * If the slice hoist already produced a wrapper Block, the recursion
          * below re-enters specialize() on the loop and it gets its turn. */
-        if (dynamic_cast<ForStmt *>(n.get()))
+        if (!(g_opt_disabled & opt_licm)
+            && dynamic_cast<ForStmt *>(n.get()))
             n = try_hoist_loop_subscripts(std::move(n), fsize);
         if (auto *blk = dynamic_cast<Block *>(n.get())) {
             for (auto &e : blk->elems)
@@ -5644,12 +5726,15 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n, int *fsize)
     }
     /* a counted for-loop -> ForRangeStmt (matched on the raw form, BEFORE its
      * cond/inc are specialized away). */
-    if (dynamic_cast<ForStmt *>(n.get())) {
+    if (!(g_opt_disabled & opt_for_range)
+        && dynamic_cast<ForStmt *>(n.get())) {
         n = try_for_range(std::move(n), fsize);
         if (dynamic_cast<ForRangeStmt *>(n.get()))
             return n;     /* matched: sub-trees already specialized */
     }
     specialize_children(n.get(), fsize);     /* bottom-up: children first */
+    if (g_opt_disabled & opt_typed)
+        return n;
     return try_specialize(std::move(n));
 }
 
@@ -5797,6 +5882,27 @@ static void fold_show_calls(Block *root)
 {
     for (auto &e : root->elems)
         fold_show_slot(e, root);
+}
+
+unsigned g_opt_disabled = 0;
+
+bool opt_pass_bit(const std::string &name, unsigned &bit)
+{
+    static const struct { const char *n; unsigned b; } tbl[] = {
+        { "licm",        opt_licm        },
+        { "slice-hoist", opt_slice_hoist },
+        { "for-range",   opt_for_range   },
+        { "typed",       opt_typed       },
+        { "all",         opt_all_passes  },
+    };
+    for (const auto &e : tbl)
+        if (name == e.n) { bit = e.b; return true; }
+    return false;
+}
+
+const char *opt_pass_names()
+{
+    return "licm, slice-hoist, for-range, typed, all";
 }
 
 void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,

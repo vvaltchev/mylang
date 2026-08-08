@@ -1197,6 +1197,13 @@ Running scripts:
 ./build/mylang -ni FILE          # disable function inlining (debug)
 ./build/mylang -npc FILE         # disable the per-frame pure-call cache
                                  # (recursion still unrolls; for measurement)
+./build/mylang --no-opt LIST F   # disable AST transforms (comma-separated:
+                                 # licm, slice-hoist, for-range, typed, all).
+                                 # The same-binary A/B lever for a pass that
+                                 # rewrites the tree - see "Testing an AST
+                                 # TRANSFORM": the engine differential cannot
+                                 # see a bug in one, so the only oracle is the
+                                 # same program with the pass off
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
 ./build/mylang -v                # how THIS binary was built (opt, asserts,
                                  # lto, sanitizers, vm_hardening, cgoto,
@@ -2846,18 +2853,35 @@ disqualifies it - that is what rules out the COW-detach hazard), no
 reference to anything DECLARED INSIDE the body (`licm_collect_decls`:
 above the loop such a slot is stale - `fr_collect_mutated` deliberately
 SKIPS a pInDecl assignment, so a body-local `var m = map(..)` taints
-nothing and `m[1]` looked invariant; the -rt suite caught exactly this),
-and UNCONDITIONAL evaluation (the scan stops at the first body statement
-that is not a plain expression statement, and never descends into a
-ternary arm / `??` rhs / `&&`-`||` tail). Stricter than `fr_immutable`
-in one place: **any call that is not a pure USER function disqualifies
-the loop** (`licm_has_opaque_call`) - a const BUILTIN is not exempted
-because the higher-order ones take a callback and `fr_collect_mutated`
-stops at a FuncDeclStmt, so a lambda appending to the base would taint
-nothing; try_for_range lives with that gap because it hoists an INT,
-while this keeps a live REFERENCE across every iteration. Occurrences of
-the same expression share one temp (`licm_expr_equal`). The result is
-expressible MyLang - `:show` renders the guard and the decl as real code.
+nothing and `m[1][0]` looked invariant; the -rt suite caught exactly
+this), and UNCONDITIONAL evaluation (the scan stops at the first body
+statement that is not a plain expression statement, and never descends
+into a ternary arm / `??` rhs / `&&`-`||` tail). Occurrences of the same
+expression share one temp (`licm_expr_equal`). The result is expressible
+MyLang - `:show` renders the guard and the decl as real code.
+**CALLS IN THE BODY - `licm_has_opaque_call` + `CallExpr::
+callable_arg_mask`.** A pure USER function is always fine (`pure` forbids
+captures, global reads AND mutating a reference param, so it cannot reach
+the enclosing frame at all). A CONST BUILTIN is fine too - `len(arr)`,
+`abs(x)`, `str(v)` cost nothing - EXCEPT that the higher-order ones
+(map/filter/sort/make_array/make_dict/find) run a CALLBACK that
+`fr_collect_mutated` cannot see (it stops at a FuncDeclStmt), so a lambda
+appending to the base would taint nothing and the base would look
+invariant. The discriminator is a new inferencer stamp,
+**`CallExpr::callable_arg_mask`** (bit i = argument i's static type is a
+`Func`, or a `dyn` that might hold one) - stamped in `annotate_hints`
+where types are live, because only the TYPE question is answerable there:
+`effective_pure` is the RESOLVER's answer and does not exist yet. LICM
+then requires each masked argument to be provably pure - an inline lambda
+whose `desc->effective_pure` holds, or a name in `g_fr_pure`. Anything
+else (a local variable holding a lambda, an impure named callback) is
+unprovable and refuses the loop. **The mask DEFAULTS to `~0u`** so an
+unstamped call - no inference ran, a node a later pass built, a field a
+copy forgot - reads as "every argument may be callable" and declines.
+`licm_is_const_builtin` additionally requires `sym.kind == builtin`,
+since `fr_is_const_builtin` matches the NAME only and a user's own
+`func len(x)` answers true there (a pre-existing looseness in
+try_for_range's bound analysis, left alone).
 Measured (callgrind Ir, `OPT=1 ASSERTS=0`): 46_matrix_mult whole-program
 -24.1% at scale 1, and **369 -> 233 Ir per inner iteration** (the
 scale-1-vs-scale-3 delta, so compile time is excluded); wall-clock
@@ -4382,6 +4406,50 @@ exercised; the **`lineedit:`** / **`highlight:`** `extra_checks` feed byte
 scripts / strings to the pure cores. Only `read_line`'s few syscalls are not
 unit-tested. **Not yet (Phase 5):** an IRB-style dropdown completion menu,
 reverse-search / bracketed paste, and the Windows raw-input backend.
+
+## Testing an AST TRANSFORM (the differential does NOT cover it)
+
+> **⛔ THE TREE-WALKER-vs-VM DIFFERENTIAL CANNOT VALIDATE AN AST
+> TRANSFORM.** A transform that rewrites the tree (LICM, the slice hoist,
+> the counted-loop rewrite, M8, inlining, auto-const, DCE) runs BEFORE
+> either engine sees the tree, so both engines faithfully execute the same
+> WRONG tree and agree perfectly. The project's main correctness net is
+> blind here by construction. This is not hypothetical: subscript LICM
+> shipped with a real bug in its first version and the 1481-test
+> differential was fully green on it.
+
+**The only oracle is the same program with the transform OFF.** Hence the
+per-pass kill switches (`OptPass` / `g_opt_disabled`, inferencer.h; CLI
+`--no-opt licm,slice-hoist,for-range,typed,all`) - the same-binary A/B
+lever the JIT has as `-nj`, one layer up. Three nets use them, and a new
+AST transform joins **all three** on the day it is written:
+
+1. **`opt_layer_equivalence` (`-rt`)** - a corpus run through EVERY
+   single-pass-off configuration, plus the all-off one, on BOTH engines,
+   requiring identical stdout AND identical exception behaviour. A
+   divergence names the pass and the layer. Give a new transform a bit in
+   `OptPass`, a case in the corpus, and cases for whatever its gates
+   REFUSE (a refusal that silently stops refusing is the dangerous
+   direction).
+2. **`tests/nested_fuzz.py`** - its `noopt` engine (on by default) re-runs
+   each random deep-nested program with every transform disabled, on both
+   engines. Random programs hit gate COMBINATIONS no hand-written case
+   covers.
+3. **A shape test** (`hoist_subscript_shapes` / `hoist_slice_shapes`) -
+   asserting the transform FIRED where it should and did NOT where it
+   must not. Equivalence alone is satisfied by a transform that never
+   fires.
+
+> **⛔ AND PROVE THE TEST CATCHES THE BUG.** Write the test, then REINTRODUCE
+> the defect and confirm it FAILS. The first version of the layer-equivalence
+> corpus PASSED with the LICM bug put back - its case used a scalar element,
+> which the pass skips, so it exercised nothing. A test for a bug you have
+> not watched it catch is decoration. (Same rule as "prove the code ran" for
+> a perf measurement, applied to correctness.)
+
+**A caret/backtrace check needs the same treatment**: an AST transform can
+move a `Loc` without changing any value, so compare the rendered error
+POSITION across layers too, not just the exception type.
 
 ## Optimizations must generalize (the bar is a compiler, not an example)
 

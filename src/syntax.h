@@ -751,23 +751,56 @@ public:
      * needed. */
     bool tq_folded = false;
 
+    /*
+     * Bit i is set when argument i's STATIC TYPE could be a callable value (a
+     * `Func`, or a `dyn` that might hold one) - i.e. this call might INVOKE it.
+     * Stamped by the inferencer (annotate_hints, where types are live); args
+     * beyond bit 31 fold into bit 31.
+     *
+     * DEFAULT ~0u ON PURPOSE: an unstamped call (no inference ran, a node a
+     * later pass built, a field a field-by-field copy forgot) must read as
+     * "every argument may be callable", which every consumer treats as the
+     * conservative case. Purity of the named callback is decided LATER, in
+     * specialize_types - `effective_pure` is the RESOLVER's answer and does not
+     * exist yet when this is stamped.
+     */
+    uint32_t callable_arg_mask = ~0u;
+
     CallExpr() : Construct("CallExpr") { }
     explicit CallExpr(const char *name) : Construct(name) { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
+    /*
+     * Copy every CallExpr-level analysis field (NOT `what`/`args`, which the
+     * caller moves or clones). THE SINGLE PLACE that enumerates them - both
+     * `clone()` and the resolver's devirtualization swap (which builds a
+     * DirectCallExpr / CachedCallExpr / DirectBuiltinCallExpr and moves the
+     * children over) go through here.
+     *
+     * A field-by-field copy at each swap site is how `vm_len_kind` was once
+     * silently dropped, and how `callable_arg_mask` was dropped the day it was
+     * added - each time producing a node that merely LOOKS un-analyzed, so the
+     * consumer quietly declines an optimization instead of failing. Add a new
+     * field HERE and every path gets it.
+     */
+    void copy_call_fields(CallExpr &d) const {
+        d.direct_func_slot = direct_func_slot;
+        d.vm_direct_func = vm_direct_func;
+        d.vm_struct_ctor_def = vm_struct_ctor_def;
+        d.vm_len_kind = vm_len_kind;
+        d.vm_struct_boxed_def = vm_struct_boxed_def;
+        d.vm_dyn_callee = vm_dyn_callee;
+        d.tq_folded = tq_folded;
+        d.callable_arg_mask = callable_arg_mask;
+    }
+
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<CallExpr>();
         copy_base_fields(*c);
+        copy_call_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
-        c->direct_func_slot = direct_func_slot;
-        c->vm_direct_func = vm_direct_func;
-        c->vm_struct_ctor_def = vm_struct_ctor_def;
-        c->vm_len_kind = vm_len_kind;
-        c->vm_struct_boxed_def = vm_struct_boxed_def;
-        c->vm_dyn_callee = vm_dyn_callee;
-        c->tq_folded = tq_folded;
         return c;
     }
 };
