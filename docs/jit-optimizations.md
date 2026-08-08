@@ -1,0 +1,2167 @@
+MyLang — the JIT / VM optimization record
+=========================================
+
+This is the per-change record of how the bytecode VM and its native
+x86-64 tier reached their present shape: what each optimization does,
+what it MEASURED, which guard makes it sound, which sabotage was watched
+failing, and — for the ones that did not pay — why they were declined.
+
+CLAUDE.md keeps the RULES that came out of this work, because a rule has
+to be obeyed before you know you are in the area it governs. This file
+keeps the RECORDS, because they only help once you are already editing
+the subsystem.
+
+READ THE RELEVANT ENTRY BEFORE CHANGING ITS SUBSYSTEM. Almost every one
+of them documents a trap that cost real time to find: a guard that looks
+redundant and is not, a counter that proves a path actually ran, a
+measurement that came out the opposite of what the mechanism predicted.
+Grep for the lever name (`cache`, `fcache`, `telide`, `fread`, `flit`,
+`fwd`, `ffwd`, `resreg`, `hoist`, `hoist2`, `mfact`, `cest`, `relent`),
+the opcode, or the task number (#56, #74, #78, #88, #92-#96, #103).
+
+KEEP IT IN SYNC. A change to the JIT or the VM's op set updates THIS
+file, in the same commit, exactly as CLAUDE.md's doc-sync rule requires
+of CLAUDE.md itself.
+
+**THE NATIVE IN-VM CALL STACK (plans/archived/vm-native-call-stack.md, phases A-F
+complete).** A VM->VM call (`CallV`/`CachedCallV`/`CallValueV` with a
+chunked callee) is a STATE CHANGE inside the dispatch loop, not a C++
+call: `vm_enter_call` pushes a **call record** + a frame **window** on the
+activation's SEGMENTED slot stack (segments never move - C++ builtins hold
+frame pointers across user callbacks, so windows must be address-stable),
+binds args with a `fast_bind` copy loop (or the coercing loop for typed
+params), switches `chunk`/`pc`/`captures`, and dispatches; `ReturnV`/`Halt`
+pop the record and write the parent's result slot directly (FlowState is
+gone from in-VM returns; the deleted `LoopBackEdge` was its last reader).
+Per-frame state (handler stack, dict/dyn iterator pools, the per-frame
+`PureCache` - stashed/restored so the shared view Frame can't leak it
+into global memoization) lives in the records as watermarked slices of
+shared stacks; the caught-exception/finally-pend state is PER TRY
+REGION, not per record (#78 step 2 - see the paragraph after #74's).
+**The record stack is
+REUSE-based (N6 call-path lean):** `records` is PHYSICAL storage grown only
+to the high-water mark, and a live-count `rec_n` indexes it - a push REUSES
+the already-constructed record (`records[rec_n++]`), so the ~140-byte
+`VmCallRec`'s 3 `unique_ptr`s are NOT default-constructed/destructed per
+call (the `emplace_back` construct was ~6% of a deep-recursion profile, and
+reuse also kills the vector realloc-move churn - `10_recursion_deep`
+**-18%** JIT-off, suite-neutral). A pop frees any owning field the
+exceptional/cache path left set (`exc`/`cache_key` reset, `pend` normalized
+- RAII kept, the reuse-equivalent of the old `pop_back` dtor) then
+decrements; a BOUNDARY push clears the resume fields `vm_enter_call` would
+otherwise set, so a reused record carries no stale resume state. The exceptional path is a
+FRAME WALK at the activation's single landing pad: dispatch to a handler in
+the current frame, else capture that record's backtrace frame (descriptor
+name/params + `loc_at(ret_chunk, ret_pc-1)` + the pure tag), pop, flush the
+call op's inlined frames, continue - byte-identical backtraces
+(differential-pinned). Boundary frames (main, `do_func_call` entries)
+convert to the `g_vm_exc_pending` signal as before. Builtin->callback loops
+(map/filter/sort's comparator/make_dict/find/make_array) use
+**`VmInvoker`** (vm.h): the callee frame is pushed ONCE per loop and each
+element just rebinds the param slots through the activation's reusable
+invoke context (its OWN FlowState - reusing the caller's would let a
+callback's boundary return corrupt the enclosing frame's flow); single-shot
+callbacks use `vm_try_invoke` (eval_func's gate). **#60 (b): the dispatch
+loop is split into a file-local `vm_dispatch(chunk, ctx, act)`** - the
+`vm_run_chunk` entry (EntryGuard + `vm_enter_invocation_fast` + the
+`g_current_ctx` CtxGuard) is per-INVOCATION, so `VmInvoker::invoke` /
+`vm_try_invoke` (which already own the activation, boundary window, captures
+switch, and - set once for the whole loop - `g_current_ctx`) re-enter
+`vm_dispatch` DIRECTLY per element, paying ZERO entry setup (the per-element
+EntryGuard dtor was 4.6% of a map/filter profile). Measured whole-program Ir
+vs the pre-#60 baseline: 35_map_filter **-10.2%**, 34_sort_custom_cmp
+**-9.0%**, 67_make_dict **-6.5%**; pure loops neutral (the function split did
+not perturb the dispatch code layout - I-count flat, wall-clock neutral).
+Runaway recursion throws
+the CATCHABLE **`StackOverflowEx`** at the `MYLANG_VM_STACK` slot cap
+(default 1M; README) instead of exhausting the C stack. The `code` pointer
+is cached LOOP STATE (making `chunk` reseatable killed the compiler's hoist
+of `chunk->code.data()` - a double-load per dispatch, front-end-amplified;
+refreshed only at the four chunk-change sites). Zero-copy arg binding was
+MEASURED AND DECLINED (the bind is ~2 instructions per 1-arg call; the
+protocol around it is what costs - see the plan's Phase E verdict).
+**LEVER 1 (2026-07-26, plans/native-gap-roadmap.md) - the LEAN
+CALL PUSH/LEAVE:** the callgrind split on 10_recursion_deep showed
+~500 Ir of protocol per call, ~30 of it just vm_frame_setup's
+prologue/epilogue - the unique_ptr<PureCacheKey> PARAMETER drags
+exception scaffolding + a fat spill frame into every call even when
+always null, and vm_enter_call was a second NOINLINE layer for two
+assignments. The COMMON shape (`fast_bind`, no live cache miss-key)
+now takes `vm_frame_setup_lean`/`vm_enter_call_lean` (no key
+parameter, no coerce branch, ONE out-of-line call; push_window is
+SHARED - it measured lean already) from the interpreted
+CallV/CallValueV cases and jit_call_sync_core; the return side's
+cached tail (the unique_ptr key handling) moved OUT of
+vm_frame_leave into the cold NOINLINE vm_frame_leave_cached, gated
+on rec.cache_key. Measured (callgrind Ir / wall best-of-7):
+10_recursion_deep -9.5% / -15%, 11_closure_counter -2.9% / -4.2%,
+63_closures -1.5%; fib +0.9% Ir (the cached return pays one extra
+call layer - wall-neutral), 76 +0.5% Ir (typed params aren't
+fast_bind, the gate branch buys nothing there). Step 3 (same day):
+the return RESULT is MOVED out of the dying callee window
+(`LValue::steal_value` - jit_ret + both interpreted ReturnV paths)
+and every callee resolve uses get_ref, not get<> (the H1
+refcount-churn trap - the by-value FuncObject handle was ~28
+Ir/call of retain/release, and the dead-at-semicolon temporary
+never protected the callee anyway): a further 10 -4.7% / 11 -3.6%
+/ 63 -4.6% / 76 -2.4% Ir, fib recovered. Step 4 (same day): back_rec's
+records[rec_n-1] IMUL (136-byte stride, ~23 sites) -> a cached
+`top_rec` pointer (native code reads rec_n, never writes - can't
+stale it); records.size()/dict_iters/dyn_iters sizes -> plain
+mirror counters (those vectors mutate only inside push/pop_window;
+`handlers` is NOT mirrored - fragments push/pop it natively);
+ML_VM_CHECK re-verifies every mirror. 10 -7.5% Ir (cum -20.3%
+pre-lever, wall -4%), 11 -8.2%, fib -1.0%. The C++ side of lever 1
+is ~exhausted; the arc continued in machine code: step 5 (the
+fragment-inline sync call), per-pc entry points (post-call + branch-
+target resume stubs), M5a (the 1GB dedicated native stack - cap
+500k, the CallV self-gate lifted, the switch living at the SYNC CALL
+SITE after a measured placement war), and M5b (the FULLY-INLINE
+record push: emit_sync_push_native emits resolve/gates/push_window's
+hot shape/record fill/unrolled fast_bind/captures at the call site,
+offsets via the JitPushLayout co-located probe; guards all precede
+mutations so declines fall to the idempotent jit_call_sync* tier; a
+first-descent grows the record high-water through the slow tier by
+design). M5b measured (Ir): 10_recursion_deep -30.4%, 11 -15.5%,
+63 -15.6%; wall ~0.90x each; 10 CUMULATIVE -46% Ir from pre-lever-1.
+See plans/native-gap-roadmap.md for the full per-step record.
+**THE RETURN SIDE (2026-08-01, plans/cpp-gap-extremes.md cause 1).** A
+profile of the my/cpp tail found `vm_frame_leave`/`pop_window` the #1 or
+#2 SELF cost in every call-heavy bench (10/11/63/76) - 129 Ir per return,
+against a C++ return's ~0. Two changes, both of the "the protocol around
+the work costs more than the work" family:
+(1) **`Chunk::plain_frame`** - a DERIVED flag (never serialized; the
+loader recomputes it beside the three counts it is made of, like
+catch_uids) meaning the chunk owns no per-frame side state: no try
+regions, no dict iterators, no dyn iterators. Such a frame provably moved
+NONE of the four watermarks between its push and its pop - only a
+PushHandler moves `handlers` and those exist only where n_trys > 0, and
+push_window grows the iterator/pend slices ONLY by this chunk's own
+counts while every deeper frame's pop trims to its own base (>= ours). So
+pop_window's four comparisons became ONE flag test; a VM_HARDENING build
+ML_VM_CHECKs all four are really unmoved, so a future op that pushes
+per-frame state without a chunk count fails loudly instead of leaking it
+into the caller. Also removed a dead `cur_seg` store (it was overwritten
+from the new top on every return that had a caller). Measured: 10 -4.5%,
+11 -3.0%, 63 -2.3%, 76 -1.4%.
+(2) **The leave body is INLINED into its three callers** (`jit_ret`,
+`jit_halt`, `vm_leave_call` - each already an out-of-line function, and
+NONE inside `vm_dispatch`'s loop body, so the dispatch text does not
+grow). `vm_frame_leave`'s own frame was 13 Ir of prologue + 11 of
+epilogue against a body doing ~10 Ir of real work: the `EvalValue res`
+BY-VALUE parameter is a 32-byte type with a non-trivial destructor, which
+drags a spill slot and cleanup scaffolding into the callee - the same
+disease as `vm_dispatch_exc_frame` (#82) and the `unique_ptr` parameter
+lever 1 removed from the PUSH side. Measured (cumulative with (1)):
+10_recursion_deep **-14.0%**, 11_closure_counter **-9.5%**,
+63_closures **-7.7%**, 76_funcval_dispatch -2.8%; fib -0.6%,
+08_func_call neutral.
+The largest remaining item in the return is the `ref_slots`
+reference-release scan (**50 of the ~112 Ir left**, ~25 per listed slot:
+two DEPENDENT loads - the slot's type pointer, then its tag - which the
+value model makes irreducible). Narrowing the LIST was the lever - DONE
+2026-08-04 as **C3 increment 1** (plans/typed-invariant-arrays.md): the
+one-shot inferencer stamps `ParamDesc::proven_type` (i/f) for an
+UN-annotated param that can only ever receive that scalar - a concrete
+non-opt non-dyn param of a non-template, never-value-used
+(sym !value_used, finfo !value_escaped), global-scope function - and
+codegen's param join then excludes it from ref_slots exactly like a
+coerced i/f param. Every call path to such a function is
+compile-checked (direct CallV/CachedCallV only; `$` is not an
+identifier char and specializations()/globals() return NAMES, so an
+instance FuncObject is unreachable as a value outside the excluded
+uses). Metadata only - bind paths ignore it; serialized (myv v11).
+FIXED ALONG THE WAY: value_instantiate_round's redirect never marked
+the CLONE's sym value_used - a value-instantiated instance is
+reachable as `ops[k]`, dyn-launderable, callable with unchecked args,
+and would have been stamped (the pinned ops-array gate asserts ZERO
+exclusions there). THE NET is the existing VM_HARDENING pop_window
+audit (every-slot-trivial after the scan): the force-stamp sabotage
+aborts -rt on the first wrongly-excluded reference. Measured
+(Ir/scale, OPT=1 ASSERTS=0): 10_recursion_deep **-7.1%**, 63 -0.7%;
+11_closure_counter flat (lambdas not covered - a follow-up), 76 flat
+BY DESIGN (value-dispatched = the gate), 08/09/46/01 flat.
+**THE REFERENCE-ARGUMENT BIND (2026-08-01).** M5b's fully-inline push
+had an arg-triviality GATE - "each arg's current value must be TRIVIAL
+(the inline copy is a raw payload copy - a reference needs the helper's
+retain)" - so a call passing an array/string/dict/struct DECLINED the
+whole inline push and took the C++ slow tier. That is most real code.
+Measured on the SAME indirect func-value shape:
+`jit_call_sync_value` ran ONCE in 1M calls with an int argument and
+1,000,000 times with an ARRAY argument, where the slow tier cost 55% of
+76_funcval_dispatch's instructions. M5b's landing numbers (10/11/63) were
+all scalar-arg calls, so they were real but its REACH was never checked -
+the prove-the-code-ran rule one level up.
+The gate is GONE; the decision moved to the copy loop, per argument: a
+scalar takes the raw 32-byte copy as before, a reference calls
+**`jit_bind_ref_arg`** (vm.cpp), which runs `fast_bind`'s exact
+per-argument step (`dst->rebind(src->get())`) so the two paths cannot
+drift. It is a CALL and not an inlined refcount bump ON PURPOSE: a SLICE
+registers itself in its parent's `slices` set on copy
+(SharedArrayObjTempl's copy ctor), so a raw payload copy plus a retain
+would corrupt that set - deferring to the real C++ copy is correct by
+construction for every reference type, present and future. FOUR pushes
+around the call (an even count preserves the site's 16-byte alignment);
+rdx/rcx/r9 are read after the bind and the fourth is a PAD, r8 is not
+read, and rsi/rax are dead (emit_call_epilogue reloads the type
+singletons anyway); the slots base is in callee-saved rbx, which the
+helper preserves for free. Execution-proven
+by `g_jit_ref_arg_binds` + the `jit_ref_arg_bind` test (array / string /
+SLICE, the last with a live-view base write). Measured (callgrind Ir):
+76_funcval_dispatch **-11.1%** (1202M -> 1069M; the slow tier 1,000,000
+calls -> 1); 10/63 +0.1-0.3% (the per-arg type test moved from the gate
+into the copy loop). NOTE a small DIRECT callee is INLINED away by the
+optimizer, so the reference bind is reached by indirect/value calls and
+by callees too big to inline - the first version of its test exercised
+nothing for exactly that reason.
+
+**C4c - THE INLINE FRAME POP (2026-08-04,
+plans/typed-invariant-arrays.md route item 3) - the return-side twin of
+M5b's inline push.** jit_ret's C++ round trip (globals, steal,
+pop_window, dst put) was ~35% of 10_recursion_deep; the common shape is
+now EMITTED at the ReturnV/Halt site (emit_ret_native, jit.cpp) and
+jit_ret is its SLOW TIER - every guard declines BEFORE any mutation, so
+a decline re-runs the whole pop from scratch, byte-identically. EMIT
+gate: the returning chunk's own `plain_frame` + `ref_slots.size() <= 6`
+(the list must NOT be required empty - a recursion body's call dsts are
+always ref-listed, so an empty gate excludes exactly the motivating
+shape; the first run's counter read 0). RUNTIME guards: `boundary` is
+NOT a decline but a branch to the BOUNDARY ARM (jit_ret's boundary path
+- flow->value raw copy + flow->type = ret - emitted inline; NO pop, the
+C++ owner pops; Halt's boundary is a bare -2 sentinel with flow
+untouched); no `cache_key` (a CachedCallV miss's cache store is a map
+emplace); no `caller_cache` / live vframe.pure_cache (the stash
+restore); the RESULT, if ref-listed, currently trivial (a reference
+result cannot be raw-moved - the slices set would keep pointing at the
+dying slot, the jit_bind_ref_arg lesson - so it declines to jit_ret's
+proper steal); and the parent dst slot's OLD value trivial (a release
+needs C++). A ref-listed slot HOLDING a reference is NOT a decline
+either: the release scan is emitted per listed slot as a type check +
+a cold `jit_release_slot` call (pop_window's exact per-slot assignment,
+slice-unregistration correct by construction) - which is what serves
+76's array-param frames inline. GUARD ORDER is DECLINE-FREQUENCY, not
+per-guard cost: boundary/cached first - the first version put the
+ref-slot guards first and the callback benches read +2.4-3.1% paying a
+dead guard walk per element. The mutations mirror pop_window's fast
+path: raw 32-byte result copy (guards proved both sides trivial),
+resume globals (a native caller ignores them, an EnterNative consumer
+reads them - the callee cannot know which entered it), captures, seg
+top / used / rec_n / top_rec / view frame / cur_seg; the parent record
+is `top_rec - rec_size` (the records vector is contiguous and cannot
+realloc during a pop). A VM_HARDENING build emits a `jit_ret_audit`
+call first, so the C3 every-reference-is-listed net stays alive on the
+SAME emitted path a release runs (never a hardened-only code shape).
+Execution-proven by `g_jit_ret_inline` (emitted incs; the
+jit_ret_inline_c4c test pins the recursion, Halt, discarded-dst, and
+live-reference/release-arm shapes plus the decline-correctness pair);
+sabotage-verified: dst guard (LSan leak), the ref handling (ASan UAF),
+boundary guard (abort), seg-top restore (abort); recorded UNPROVABLE in
+isolation and kept as defense in depth: the cache_key guard (a record
+with a cache key always also carries a stashed caller cache today), the
+release call (skipping it only DELAYS the release to slot-reuse /
+teardown), and the boundary flow-old-value guard (every consumer moves
+flow->value out, leaving none). jit_halt legitimately STARVES (both its
+arms are inline) - the Halt coverage case accepts g_jit_ret_inline as
+"ran natively", the BinOpV-precedent. Measured (callgrind Ir/scale,
+OPT=1 ASSERTS=0 both sides): 10_recursion_deep **-27.8%**,
+11_closure_counter **-18.6%**, 35_map_filter **-17.1%**,
+34_sort_custom_cmp **-15.6%**, 63_closures **-8.2%**,
+76_funcval_dispatch **-7.9%**; 09_fib +0.18% (a cached return pays the
+record guards then declines - the cache store is inherently C++);
+08/01/46 byte-flat per scale.
+
+**Sync-depth accounting (fixed 2026-07-27):** the depth DEC runs AFTER
+`jit_sync_postexit` - at the emitted inline site AND in
+`jit_call_sync_core`'s direct-entry branch - because the postexit's
+INTERPRETED continuation is one `vm_dispatch` C frame per level (~77KB
+under clang ASan: per-case locals + redzones, no scoped-local overlap);
+decrementing first let a deep recursion of mid-body-exiting fragments
+stack un-capped C frames (a clang-ASan-lane stack overflow; invisible
+armed - frames land on the 1GB reserve - and marginal under lean plain
+frames). A SANITIZED build's unarmed cap is **32**, not 200
+(`jit_native_stack_init`'s #else): past the cap a sync call falls
+interpreted (in-VM, flat), so there the cap is purely a perf knob.
+**`Chunk::ref_slots` (2026-07-18 profile #2):** the audited list of frame
+slots that can EVER hold a >= t_str value (non-coerced params + every dst
+of a non-`op_writes_scalar` op; a chunk with a use-def BARRIER op lists
+all slots). `pop_window`'s and `VmInvoker::invoke`'s reference-release
+scans iterate ONLY these — the fib-class all-scalar frame and the
+per-element comparator skip the O(nslots) walk; a VM_HARDENING build
+re-scans the full window and ASSERTS the list missed nothing (the audit
+net, green across the differential). A NEW op that writes a frame slot
+must join `visit_use_def` AND be classified in `op_writes_scalar`.
+Net (interleaved full-suite A/B): suite parity with the pre-C1 baseline
+plus recursion 0.68x, sort/map 0.85x, make_dict 0.88x, fib 0.86x.
+
+**B1/B2 SPECIALIZED ARITHMETIC (`specialize_arith_ops`, codegen.cpp).** 23
+per-operator, per-shape variants of `IntBin`/`FloatBin` (Int Add/Sub/Mul/
+And/Or/Xor/Shl/Shr x RR/RI, IntModRI nonzero-imm only, Float Add/Sub/Mul x
+RR/RI - see the enum comment in bytecode.h), selected by an IN-PLACE
+post-codegen rewrite run AFTER `extract_locs` (opcode swap + a lit-first
+commutative op's operand swap into RI; no pc shifts, no loc/pool
+interaction). Each removes IntBin's inner 11-way `aop` switch AND both
+`is_lit` operand-decode branches. Div/mod-by-reg keep the checked IntBin
+path; shifts call `bit_shl`/`bit_shr`. Measured: VM-wall geomean -6.3%,
+suite 4.09-4.17x -> **4.45-4.48x vs CPython** (01_while_loop -25%,
+03_int_arith -20%, mandelbrot -19%, bit benches -18%).
+
+**#60 lever 2 - the BOXED-arith int-int fast path (`vm_num_binop`, vm.cpp).**
+The B1/B2 native arith above is for a PROVEN int/float NODE; a DYN/general
+operand - or a comparison used as a VALUE (`x % 3 == 0` as a return value has
+no native typed-VALUE compare, only the branch form `JumpUnlessIntCmp`) - still
+lowers to the BOXED `BinOpV`/`CompoundV`/`CmpV` (plus the compound global/
+capture stores + the dyn inc-dec), which paid `num_bin_op`'s promotion-check
+chain + an INDIRECT PMF call (`&Type::add`...) + TypeInt's own dispatch. The
+~7 sites now route through **`vm_num_binop(a, b, aop)`**: when BOTH runtime
+operands are plain int (the common case), it computes the result inline via a
+switch on the Op ENUM (the VM has it; the PMF hid it) - a comparison yields int
+0/1, which the CmpV caller wraps with `is_true()` exactly as `TypeInt::lt`
+does; any other shape (float/bool/string/mixed) falls back to the EXACT
+`num_bin_op` PMF path, byte-identical incl. div/mod-by-zero + bad-shift/type
+throws (the caller's catch stamps the loc). `ML_NOINLINE` (a single out-of-line
+copy - `num_bin_op` no longer inlines at each site, so `vm_dispatch` doesn't
+grow; a DIRECT call replaces the removed INDIRECT PMF). Measured (callgrind
+whole-program Ir): 34_sort_custom_cmp **-7.4%**, 67_make_dict **-5.6%**,
+35_map_filter **-5.0%** (`num_bin_op`+`TypeInt::eq` 6.8% -> `vm_num_binop`
+2.9%); pure loops NEUTRAL (they use native IntBin; I-count flat, wall-clock
+0.98-1.00). The tree-walker keeps the plain `num_bin_op` PMF path (the
+differential ORACLE - an independent arithmetic impl).
+
+**#60 native typed-VALUE compare (`CmpIntV`/`CmpFloatV`, vm.cpp/codegen.cpp).**
+M8's native typed compare existed ONLY as a BRANCH (`JumpUnless{Int,Float}Cmp`,
+for a loop/if condition); a comparison used as a VALUE (`x % 3 == 0` returned /
+`(a<b)+(a>b)` / a predicate func / a sort comparator's `a<b`) still boxed via
+`CmpV`. The two new ops read two int/float Operands and write a real BOOL slot
+(`write_bool_slot`) - no box, no `num_bin_op`, no `is_true`. Codegen:
+`try_native_cmp_value` (in `compile_boxed_expr`'s `Cat::cmp` path) reuses
+`compile_int_cond`/`compile_float_cond` to read the operands + the cmp Op from a
+2-operand `TypedScalarExpr` (`kind==i/f`), else falls through to the boxed
+`CmpV` (a dyn/string operand, a >2-operand chain). NEVER THROW (a compare can't
+fault) -> loc- and node-free; the float form uses plain C++ compares (IEEE NaN
+semantics match TypeFloat). Classified like `IntBin` in every codegen table
+(`op_writes_scalar`, `visit_use_def`, the two retarget lists) so the E1 peephole
+can retarget the bool temp into a return/dst slot. **Op bodies are `ML_NOINLINE`
+(`vm_cmp_int_v`/`vm_cmp_float_v`) - the LOOP-BODY TEXT RULE:** inlining the two
+handlers into `vm_dispatch` cost `55_float_sum` +0.6% I-count / ~3% wall via
+code-layout with NO bytecode change (the front-end effect the roadmap A2 notes
+warn about); off-frame helpers restore I-count neutrality. Measured (callgrind
+Ir vs the lever-2 baseline): 34_sort_custom_cmp **-10.5%**, 35_map_filter
+**-11.5%** (the boxed `CmpV`/`num_bin_op`/`is_true` GONE from the profile;
+cumulative -20% / -26% from the pre-#60 baseline). Pure-loop I-count flat; a
+residual `55_float_sum` wall-clock signal (~a few %, I-count-neutral) is the
+unavoidable `vm_dispatch`-growth layout tax any new op pays.
+
+**#60 - the JIT-inline INT-INT fast tier for the BOXED ops (2026-07-28).**
+The emitted BinOpV/CmpV/CompoundV site paid a full helper call (~80 Ir:
+marshal + EvalValue copies + vm_num_binop + put) even when both runtime
+operands are plain ints - the overwhelmingly common shape in a dyn
+accumulator loop. The emit now inlines type-tag GUARDS (operand slots'
+type word == t_int; an int literal needs none) + payload arithmetic
+(op_rr: add/sub/imul/and/or/xor) + the ref-aware store_dst; CmpV is the
+CmpIntV setcc shape yielding a REAL bool; CompoundV's fast store writes
+the PAYLOAD only (the guard proved the dst already holds an int - nothing
+to release, no type store). ANY other shape - a float/bool/string/mixed
+operand, the throwing aops (div/mod/shifts), a float/bool literal - falls
+to the EXACT jit_boxed_* helper tier, byte-identical incl. carets; guards
+precede every mutation so the decline is idempotent. Execution-proven by
+`g_jit_boxed_fast` (bumped by the EMITTED fast path; the
+`jit_boxed_int_fast` test asserts BinOpV, CmpV+CompoundV, and the
+mid-loop int->float guard-decline separately). Measured (callgrind Ir,
+same-session A/B): 74_dyn_foreach_kv **-58.6%** (wall 0.63s -> 0.24s),
+66_dyn_foreach **-24.6%** (wall -17%); 34/35/62 exactly neutral (their
+hot compares were already CmpIntV). Suite my/py geomean 9.44x ->
+**9.81x**. **div/mod joined the tier next** (66's `% M` was the excluded
+throwing aop): an IMM divisor inlines when it is neither 0 nor -1 (the
+IntModRI idiv-trap exclusion); a REG divisor gets runtime 0/-1 guards
+DECLINING to the helper (which throws / computes the -1 case exactly as
+the interpreter's C++); cqo+idiv, mod's remainder from rdx. 66 a further
+**-45.3%** (cumulative -58.7%); suite **10.25x vs CPython - the 10x goal
+crossed**. The jit_op_nativized coverage loop accepts the INLINE tier as
+"ran natively" for BinOpV/CmpV/CompoundV (their helpers legitimately
+stop bumping when the emitted fast path serves int-int - the deeper form
+of native, not a gap).
+
+**D1 - `AppendV` (the append/push fast op).** `append(a, x)`/`push(a, x)`
+with one value arg emits `AppendV` (CallBuiltinLV's operand layout: the
+builtin_calls pool idx, arg0's kind+slot, the value's slot) instead of
+`CallBuiltinLV`+rest-run: the handler forms arg0's `LValue*` from the slot
+and runs **`arr_append_fast`** (arr.cpp.h) inline - the shared
+NEVER-THROWING append core (flat int/float/bool/POD-struct-match/general +
+`arr_append_maintain_hash`; returns false for null/non-array/const/
+readonly/slice/flat-mismatch) that `builtin_append` itself now uses after
+its slice-clone step, so both engines share ONE append implementation. Any
+decline falls back to the full `vm_call_builtin_lv_rest`, byte-identical
+(the flat-mismatch TypeErrorEx, COW, carets). Measured: VM-wall 0.983,
+13_array_append 0.82x, suite 4.49-4.50x.
+
+**F1 - `MathFnV` (typed math-builtin calls).** A float-proven math-builtin
+call (`sqrt`/`cbrt`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`exp`/`exp2`/
+`log`/`log2`/`log10`/`ceil`/`floor`/`trunc`/`float`/`abs`-on-float +
+2-arg `pow`) whose args compile as float expressions lowers to `MathFnV`
+(`target2` = a `MathFn` selector, bytecode.h): raw operand read
+(`read_float_operand` - an int arg promotes), a direct libm call in the
+ML_NOINLINE `vm_math_fn` (loop-body text rule), raw `write_float_slot` -
+the whole `CallBuiltinV` marshal (per-arg boxed moves into the run, the
+arg-buffer copy, ArgLocs, the builtin fn-pointer call, the boxed store)
+is deleted. Selected by `try_math_fn` (codegen.cpp) ahead of the generic
+lowering; gated on an unshadowed builtin, EXACT arity (a wrong-arity call
+must throw -> generic path), and `th == f` on the call node (so
+`abs(int)` -> int result and `float("str")` -> parse stay generic). The
+op NEVER THROWS (the float builtins have no domain checks - libm NaN/inf
+semantics - and arity/type errors are compile-time-excluded), so it is
+loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
+0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
+
+**#76 - the UNIFIED div0 caret convention (2026-07-28).** Per-path the
+engines agreed but their CONVENTIONS differed: the boxed ladders (both
+engines) caret the offending DIVISOR operand, the TYPED paths careted
+the whole chain - so when the engines chose DIFFERENT lowerings for
+the same code (a comparator body: tw typed, VM boxed via a global
+base), the carets diverged. Unified on OPERAND-PRECISE everywhere:
+TypedScalarExpr::eval_int/eval_float's div/mod throw with the DIVISOR
+element's span, and the codegen's typed IntBin/FloatBin div/mod record
+the divisor's loc via the NEW `CgInstr::loc_node_idx` - a
+codegen-transient SECOND node handle for the LOC record only, because
+the op's inlined-at chain must stay the CHAIN node's (a
+substituted-arg divisor can carry a SHALLOWER chain, which dropped
+virtual frames - the #75 parity test caught it). extract_locs reads +
+clears loc_node_idx UNCONDITIONALLY up front: a peephole FUSION copies
+the source Instr struct (IntAddModRI from an IntBin mod), so the field
+rides into ops whose extract branch never touches it - a FUZZER-caught
+verify_ast_free abort (71/400 diverged; -rt alone was green - the
+fuzzer is load-bearing for codegen-field changes). Pinned by the
+"typed div0 carets the DIVISOR operand" test + the comparator smoke.
+
+**LEVER 4b (2026-07-27, plans/native-gap-roadmap.md) - native `len()` +
+the fused `ord(s[i])`.** `len(x)` whose arg the inferencer proved a
+non-opt ARRAY/STRING lowers to the EXISTING `ArrLen`/`StrLen` op (no
+CallBuiltinV marshal): the stamp is `CallExpr::vm_len_kind` (1 array /
+2 str, set in the annotate walk; COPIED by the devirt swap - the
+resolver's field-by-field DirectBuiltinCallExpr build DROPS any
+uncopied CallExpr field, the bug the first `-vd` run exposed), and the
+codegen's `try_native_len` separately proves the callee is the
+UNSHADOWED builtin (the DirectBuiltinCallExpr node + the `len` uid), so
+the stamp alone triggers nothing. `ord(s[i])` with a proven non-opt
+string base (`Subscript::base_str`, stamped beside base_array/
+base_dict) and an int-compilable index fuses to **`OrdCharV`**
+(`try_native_ord`): TypeStr::subscript's exact negative-wrap + bounds
+check, then the raw BYTE as int - no 1-char SharedStr, no builtin call;
+OOB is its only throw (arity/type/1-char are compile-excluded), caret =
+the SUBSCRIPT's via the loc side table. The interpreted body is the
+ML_NOINLINE `vm_ord_char` (the loop-body TEXT rule + recursion stack
+hygiene - an inline case's locals + sanitizer redzones grow EVERY
+recursive vm_dispatch frame); the JIT emit is the SubscriptV convey
+shape (`jit_ord_char`, cache-aware index via load_operand; conveys ->
+deletable). Classified in ALL the tables (visit_use_def,
+op_writes_scalar, op_writes_pure_target - which also GAINED the missing
+StrLen - the E1 retarget list, the jit convey/classifier lists).
+Execution-proven (g_jit_op_run asserts in the `jit_len_ord` test) +
+5 dual-engine `lever4b:` tests (slice base, negative wrap, OOB caret,
+dyn fallback, shadowed len). Measured (callgrind Ir, same-session A/B):
+30_str_index_iterate **-82.9%**, 29_str_slice_readonly **-79.3%**
+(jit_call_builtin's ~186M marshal gone; jit_ord_char ~9 Ir/char),
+31/47 neutral; suite my/py geomean 8.93x -> **9.53x**.
+
+**H2 v2 - THE unordered_map NODE POOL (`PoolAlloc`, poolalloc.h; the
+core in types.cpp - the global-mutable-state home).** A chained
+`unordered_map` heap-allocates a ~96-byte node PER INSERT (hash + the
+32-byte EvalValue key + 48-byte LValue + next) and frees it on erase.
+`PoolAlloc` serves single-element allocations from PROGRAM-LIFETIME
+per-size-class free lists over chunked arenas (single-threaded, no
+locks; multi-element allocations - the bucket-pointer arrays - pass
+through to operator new; arena blocks stay reachable for leak
+checkers; teardown-order-safe: the free-list heads are POD). Wired
+into BOTH hot maps: the dict's `inner_type` (shareddict.h) and the
+per-frame `PureCache` (eval.h). Node-POINTER STABILITY is untouched
+(rehash moves only the bucket array), so every held-LValue*/iterator
+invariant holds - a pure drop-in; the FLAT open-addressing map was
+REJECTED by the maintainer for exactly that stability reason.
+**UNDER ASAN THE POOL COMPILES TO PASS-THROUGH** (poolalloc.h: pooled
+reuse would mask a node use-after-free from AddressSanitizer - the
+RECYCLE philosophy from the other direction), so the ASan lanes keep
+their bug-finding power; test a pool-ACTIVE debug build with
+`make ASAN=0 UBSAN=0 OPT=0 TESTS=1`. Measured: 67_make_dict 0.770x,
+23_dict_insert 0.929x, 10_recursion_deep 0.968x, suite VM-wall 0.987,
+my/py 4.70-4.71x.
+
+**POOLING `std::vector`/`std::string` WAS INVESTIGATED AND REJECTED
+(2026-07-19).** The idea (extend `PoolAlloc` to the hot ELEMENT vectors -
+`SharedArrayObj`'s int/float/general/struct vectors, `std::string`,
+boxed-struct fields - to cut malloc churn + bench jitter) does NOT pay,
+for two MEASURED reasons: **(1) a custom allocator DEFEATS libstdc++'s
+trivially-copyable memmove fast path.** libstdc++ only bulk-`memcpy`s a
+vector grow/copy when the allocator is `std::allocator` (the
+`__is_default_allocator` check in `stl_uninitialized.h`); a
+`vector<int_type, PoolAlloc<>>` reserve/clone/concat falls back to an
+ELEMENT-WISE scalar copy loop - **+56% instructions on 17_array_concat**
+(callgrind: `__memcpy_avx_unaligned_erms` 35% -> `vector::reserve`
+element-wise 37%). So pooling can only ever apply to NON-trivial element
+types (`LValue`, `SharedStr`), where the copy is already element-wise -
+and there the win is ~0.5% (the malloc is a sliver of a non-trivial
+copy). The only way to pool the flat numeric arrays + strings without the
+memmove regression is a GLOBAL `operator new`/`delete` replacement (keeps
+`std::allocator`, so memmove survives) - a bigger, riskier change
+(reentrancy, size-header, global blast radius) that STILL wouldn't help,
+because **(2) the bench jitter is SCHEDULING-bound, not allocation-bound.**
+The benches that abort the variance gate or need a scale bump
+(04_float_arith, 01_while_loop, 26_dict_iterate, 52_cse_dedup) barely
+allocate - 04_float_arith allocates NOTHING in its hot loop and still
+swings 5%+ run-to-run. Pooling cannot touch scheduling/frequency noise;
+`nice` + best-of-N + the adaptive rep gate (bench/run.py) are the only
+levers for it. **Net: `malloc` is NOT the value-model bottleneck.** The
+suite geomean was flat (0.999x) even before the memmove regression was
+scoped out. The real gap to native C++ (my/cpp ~4.6x) is the value
+model's per-op cost: **EvalValue boxing/unboxing, intrusive_ptr
+retain/release churn, and virtual `Type`-op dispatch** - that is where
+performance work belongs, not the allocator. (Don't re-attempt container
+pooling; see poolalloc.h.)
+
+**B3 - THE 32-BYTE PACKED `Instr` (bytecode.h).** `sizeof(Instr) == 32`
+(static_asserted), down from 56: `slot` and `lit` are mutually exclusive
+(is_lit discriminates), so each operand is ONE 8-byte payload (`pa`/`pb`,
+default -1 = the old unset slot); the per-operand tag bits live in the
+shared `opflags` byte; `Op` is `: unsigned char`. Exactly two
+instructions per cache line. `Operand` SURVIVES as the codegen-side
+VALUE type (int_lit()/slot_op()/float_lit(), all compile_* plumbing
+unchanged) - an Instr packs one via `set_a()`/`set_b()` and unpacks via
+`a()`/`b()` (the cold pass-by-const-ref sites); the HOT readers use the
+direct accessors `a_slot()`/`a_lit()`/`a_flit()`/`a_is_lit()`/`a_kind()`.
+SEVEN ops (the CallBuiltinLV family incl. AppendV, and the chain stores
+StoreElem2V/StoreElemChainV/StoreLValueChainV) used the fat Operand's
+slot AND lit as TWO independent ints at once - they use the DUAL view
+(`set_a_dual(lo, hi)`, `a_dual_lo()`/`a_dual_hi()`: int32 halves of the
+payload; an op uses EITHER the plain view OR the dual view, never both).
+Measured: VM-wall geomean 0.970 (broad -2-4%), my/py 4.67-4.68x.
+**Stage 2: the runtime `Instr` has NO `node_idx` AT ALL** - codegen
+builds a `vector<CgInstr>` (`CgInstr : Instr` + the transient handle,
+implicitly constructible from Instr so plain emit sites are unchanged),
+`extract_locs`/`verify_ast_free` consume it, and `codegen_chunk` SLICES
+the Instr sub-objects into `Chunk::code` (specialize_arith_ops runs on
+the sliced chunk) - the zero-AST-at-runtime rule is enforced by the TYPE
+SYSTEM for instructions. A refactor of this kind is verified by
+BYTE-IDENTICAL `-vd` dumps over bench/ + samples/ (which caught
+pp_thread still reading the now-empty Chunk::code - a silent peephole
+WEAKENING that -rt cannot see; dump-diff output-preserving refactors).
+
+**H3 - join/split reserve + borrow (engine-shared, str.cpp.h).**
+`builtin_join` on GENERAL storage (a string array is always general)
+borrows each element by const ref (no boxed copy / SharedStr refcount
+round-trip per part) and RESERVES the exact result size from a
+type-checking pre-pass, so the append loop never reallocates; the flat-
+storage branch keeps the kind-aware `arr_elem_at` loop (same TypeError,
+empty flat still ""). `builtin_split` pre-counts the pieces (a memchr
+scan, no stores) and reserves its LValue result vector. Measured:
+47_wordcount 0.882x (my/py 0.51x), suite VM-wall 0.990, my/py
+4.59-4.60x; 31_str_split_join ~flat (growth was already amortized there
+- the residual is the inherent per-piece slice LValue).
+
+**H2 - the dict/slot-write micro pair (engine-shared).** From bench 62's
+callgrind profile (`counts[key] += 1` cost ~1130 instrs; the insert-alloc
+hypothesis was wrong - 62 is UPDATE-bound): (1) **`LValue::put` has an
+INLINE fast path** (evalvalue.h) - a put with no container back-pointer
+(frame slots, dict values, globals, captures - the overwhelmingly common
+case) assigns directly; only the array-element COW path calls the
+out-of-line `put_slow` (every put used to pay an out-of-line
+`get_value_for_put()` call, on every slot write VM-wide). (2) **String
+equality has an IDENTITY shortcut** (`str_views_eq`, str.cpp.h): equal
+data pointer + size == equal, no memcmp - the hot case is a string-keyed
+dict probe, whose stored key is the SAME StrObj as the probing value (the
+key freeze returns strings as-is). Measured: 62_dict_word_count 0.896x
+(my/py 0.42x), broad -4-10%, suite VM-wall 0.992, my/py 4.57-4.58x. The
+design-level flat open-addressing dict (23_dict_insert's node allocs)
+stays a maintainer-sign-off item - roadmap H2 v2.
+
+**H1 - STRUCT CREATION (dst-slot reuse + typed member reads).** Two
+pieces (plans/vm-performance-roadmap.md H1): (1) **`vm_struct_ctor`
+constructs INTO the dst slot with REUSE** - when the slot's current value
+is a same-def, non-readonly POD instance with `use_count() == 1` (the
+slot's handle is the only owner), the fields are coerced into a stack
+buffer (BEFORE dst is touched - throw-safety) and written over ITS bytes:
+zero allocations in the steady-state `var p = Point(...)`-in-a-loop
+shape (the same overwrite-in-place + COW-guard trick the flat-struct-
+array foreach uses; an aliased/const/other-def dst takes the fresh path,
+pinned by a dedicated aliasing test). **GOTCHA (fixed 2026-07-19): the
+reuse check must read the dst handle via `get_ref<T>()`, NEVER
+`get<T>()`** - a by-value `get<>` COPIES the intrusive_ptr, bumping
+`use_count()` to 2, so `use_count() == 1` was never true and H1 was
+SILENTLY DEAD (a fresh StructObject + `bytes` vector malloc'd every
+`var p = Point(..)` iteration, unmeasured until a value-model profile).
+The fix restored it: **64_struct_create -28% instructions / 0.16->0.12s**.
+Any `use_count()`-based reuse/COW guard has this trap - the sibling
+container-literal H1 already used `get_ref`. `coerce_struct_field` is exported
+from eval.cpp for the pre-coercion; the fresh path stores the coerced
+bytes directly (construct_struct_from_values would coerce twice).
+(2) **`LoadMemberInt`/`LoadMemberFloat`** - the MEASURED discovery was
+that allocation was NOT the dominant cost: bench 64's body was 5
+`member.v` + 6 boxed arith per iteration, because a STANDALONE struct
+member read had no typed lowering (only the foreach-array
+LoadStructField* and dict DictLoad* pairs existed). The new pair (the VM
+analog of the tree-walker's M8 `MemberExpr::eval_int/eval_float`,
+`try_member_scalar` in codegen.cpp: th==i/f + `MemberExpr::base_struct`
++ a resolved-LOCAL base) reads a POD field's scalar straight from the
+instance's bytes via the member_keys pool; the boxed-struct/dict/const-
+member residue falls to the shared `member_read_core` +
+`write_scalar_slot` (fallback throws stamped with the pooled member
+caret). Measured (both, full-suite interleaved A/B): 64_struct_create
+0.095->0.074s (0.779x; my/py 0.63x -> 0.48x), suite VM-wall 0.999.
+
+**STRUCT BAKED LAYOUT (2026-07-26, the 64_struct_create fix; roadmap
+lever 4c).** Field access + POD construction resolve at COMPILE time -
+NO runtime name scan (`StructTypeDef::slot_of`, a linear interned-name
+compare over the fields vector, used to run per member READ/STORE), no
+per-field coerce calls in a proven ctor. Mechanisms: (1) the inferencer
+stamps `MemberExpr::base_struct_def` + `field_slot` (resolved next to
+`base_struct`); the TREE-WALKER's eval_int/eval_float/do_eval and the
+VM's StoreMemberV (via `MemberKey::bake_def/bake_slot`, set by
+add_member_key) pick the baked slot behind a DEF-IDENTITY check, falling
+to slot_of on mismatch (a dyn-laundered other-def base stays correct).
+(2) `try_member_scalar` bakes byte offset + LOAD FORM into
+LoadMemberInt/Float (b DUAL: lo = offset or -1, hi = struct_defs idx
+<< 2 | form 0 int/1 float/2 bool/3 int-as-float): the interpreted op
+runs `vm_load_member_baked` (type-tag + def check + one byte read), the
+JIT emits it FULLY INLINE (guards + `mov rax,[bytes+off]`; guard miss ->
+the old helper). (3) `Chunk::ctor_plans` (serializable pool): a
+StructCtorV whose fields are all scalar gets a per-field {offset, src
+slot, act} plan (act 0 raw int - a bool arg's payload is already 0/1;
+1 float via read_float_slot's promote; 2 bool byte). THE src_slot RULE:
+a bare resolved-LOCAL id arg is read straight from ITS OWN slot at ctor
+time (no staging MoveV into a run) - sound ONLY when EVERY arg is
+side-effect-free (construct_no_side_effects; else a later arg's `x++`
+would mutate the local before the deferred read - with any impure arg
+ALL args stage in source order, the old run semantics; pinned by the
+"ctor arg snapshot order" test). Computed args go to a contiguous temp
+mini-run recorded in `a` (DUAL: lo = base or -1, hi = count - what
+visit_use_def enumerates; direct-LOCAL srcs are < slot_count, invisible
+to temp liveness by design). pick_cached_slots takes the CHUNK now (an
+act-0 plan src is a countable int USE read cache-aware by the emit - a
+pinned loop counter feeds `P(i, ..)` from its register; act-1/2 srcs
+and dst are bad; the slow branch flush_cache()s first). The interpreted
+`vm_struct_ctor_planned` does raw src-slot reads + direct byte stores
+(NO coerce_struct_field, NO EvalValue marshal buffer, H1 dst-reuse
+kept),
+and the JIT emits the H1 guards (type/def/refcount==1/!readonly) +
+direct stores inline, slow branch -> the NEVER-THROWING
+jit_struct_ctor_planned - so a PLANNED StructCtorV is op_never_exits
+(leaf-safe, deletable); an unplanned one (nested-struct field) keeps
+the old path (StructCtorV's b is now DUAL: lo = nfields - every b_lit
+reader was updated: visit_use_def, pick_cached_slots, disasm, the
+fallback emit). StructObject layout offsets are probed in jit_layout()
+(public members, + a vector-data-at-+0 probe `sobj_ok` gating both fast
+paths). Execution-proven by `g_jit_member_fast`/`g_jit_ctor_fast` -
+counters bumped by the EMITTED code, asserted by the `jit:` test
+jit_struct_baked (the helpers bump g_jit_op_run, so the old
+LoadMemberInt/Float counter cases were repointed at a BOXED struct,
+which stays helper-served). Measured (callgrind Ir, 64_struct_create):
+JIT-on 1.09B -> 146M -> 137.8M with src_slot (-87.4% total; the staging
+`move r5 = i` gone), interpreter-only 1.388B -> 679M (-51.1%); my/cpp
+41.6x -> ~12x (scale-40 best-of-5). 58/65/77 neutral (flat-ARRAY
+paths).
+The residual vs C++ (~24 Ir/iter) is type-tag two-stores + ref-checks
+per dst + float type-guard loads - the N7 unboxing arc, not struct-
+specific.
+
+**TYPED TERNARY (M8 + codegen).** `specialize_children` (the M8
+specializer's recursion, inferencer.cpp) descends into `TernaryExpr` /
+`CoalesceExpr` - previously ABSENT, so a ternary's cond/arms were never
+M8-specialized and BOTH engines ran them boxed (the recursion-unroll's
+guard ternaries - fib's whole body - were the visible cost). And a
+th==i/f `TernaryExpr` VALUE lowers natively (`try_typed_ternary`,
+codegen.cpp): a typed-compare condition emits one
+`JumpUnless{Int,Float}Cmp` to the else arm (any other condition boxes
+to `JumpUnlessTrueV`, arms still typed), both arms compile through the
+typed compilers into a common dst via MoveV/LoadImm, and the peephole's
+E1 join-move rule retargets the movs away - so fib$0's unrolled body is
+FULLY native (50 instrs of i.bin/i.jmp.ifnot/call.cached; zero boxed
+ops). Measured (full-suite interleaved A/B): 09_fib_recursive
+0.006->0.004s (**0.67x**), suite VM-wall geomean 0.990 (broad -3-9%
+on the arith/call benches).
+
+**THE #9 FUSION BATCH (2026-07-17, the top-10 list's last item).**
+Three more pair-profile superinstructions in the peephole's fusion
+block: **`IntAddStep`** (an int accumulate tail `s = s + x` fused into
+the counted-loop `ForLoopStep` - add+step+test+branch in ONE dispatch;
+never fires when a `continue` targets the step, since that pc is a
+branch target), **`ForStepElemInt`** (the back-edge `a[i]` load,
+indexed BY THE COUNTER, fused into the step: the original load stays
+in place for the loop-entry path and the fused op's target lands past
+it; the load's OOB caret rides the fused pc - and the ascending scan +
+the is_tgt map make it compose safely with JumpUnlessElemInt), and
+**`StructFieldAddInt`** (`dst = other + a[i].f`, GENERAL 3-address -
+the struct reduction chains adds through temps, so an accumulator-only
+shape would never fire; b_dual = field idx + other slot). The batch's
+ROOT-CAUSE bonus: `LoadStructFieldInt/Float`, `LoadMemberInt/Float`,
+`LoadStructElemV`, `LoadElemBool` were MISSING from `visit_use_def` -
+liveness BARRIERS that made every temp look live in a struct-loop body
+and silently blocked IntAddModRI there since E4 landed (audit any new
+op into that table, not only visit_pc_fields). Measured: 65_struct_
+field_sum 0.783x, 02_for_loop 0.75x, suite VM-wall geomean 0.987,
+my/py **4.89-4.93x**.
+
+**E4 FUSIONS (in the peephole; plans/archived/vm-peephole.md).** Two profile-
+chosen superinstructions (a scratch op-pair profiler counted 760M
+executed adjacent pairs over the suite; the distribution is flat, so
+only the caret-safe top pairs shipped): **`IntAddModRI`** (`dst =
+(a+b) % IMM`, the checksum shape - never throws: imm nonzero +
+int32-gated in `target2`, the add wraps; loc/node-free) and
+**`JumpUnlessElemInt`** (`if (arr[i]) ...` - LoadElemInt +
+JumpUnlessTrueV in one dispatch; keeps the LOAD's node in place so the
+OOB caret is byte-identical; the elem temp must be liveness-dead on
+BOTH successor paths). The fusion rules run inside the peephole's
+liveness block; `BinOpV→CompoundV` was REJECTED - two throw sources
+with different carets can't share one pc's loc entry. A NEW fusion op
+with a pc field MUST be added to `visit_pc_fields` (JumpUnlessElemInt
+is). Measured: 68_nested/60_bit_sieve -4%, suite VM-wall 0.981, my/py
+4.75x.
+
+**THE POST-CODEGEN PEEPHOLE (`peephole_chunk`, codegen.cpp; design +
+field tables in plans/archived/vm-peephole.md).** Runs in `codegen_chunk` BEFORE
+`extract_locs` - the load-bearing ordering: the loc/`inline_ctxs` side
+tables are built from the ALREADY-compacted code, so the pass only ever
+rewrites Instr pc fields (every pool is operand-indexed; `node_idx`
+handles ride inside the moved Instr structs). Iterated <=4 rounds, each:
+(E1) **MoveV elimination** - backward TEMP liveness (a single-word
+bitset over `[slot_count, slot_count+n_temps)`; >64 temps skips; an op
+not in the audited `visit_use_def` table is a BARRIER that reads every
+temp; when the chunk has handlers every op's live-out absorbs the
+handler pcs' live-in, since any throw may resume there), then
+`<producer dst=tX>; MoveV d=tX` (adjacent, tX a dead-after temp, no
+branch entering the move, producer in the audited `retargetable_dst`
+whitelist) retargets the producer to d and deletes the move; (E3)
+jump-chain threading, INT-only branch-over-jump inversion (float
+compares don't invert under NaN), jump-to-next deletion, reachability
+DFS, then compaction with a prefix-sum pc remap over `visit_pc_fields`.
+**`visit_pc_fields` is THE single audited pc-field enumeration** (a
+"target" field is NOT always a pc - `ForLoopStep::target2` is the
+COUNTER SLOT, `JumpUnlessTrueV::target2` the value slot,
+`SetPend::target` a Pend enum; the E-v1 fuzzer catch) - a new branching
+op MUST be added there, and ALWAYS run tests/nested_fuzz.py after a
+codegen-pass change. E2 (temp renumbering) was evaluated + DEFERRED (the
+native call stack made per-call temp cost ~nil - see the plan); E4 =
+this pass IS the fusion framework (no new fusions shipped). Measured
+(full-suite interleaved A/B): VM-wall geomean **0.987**, instrs -4.6%,
+MoveVs -31%, fib$0's chunk 68->56; the earlier STANDALONE
+threading-without-deletion attempt was a measured DECLINE (+3.2%, 1/77
+benches affected - roadmap E3 records it).
+
+**NATIVE x86-64 AOT — N0/N1 (plans/native-aot.md; `jit.{h,cpp}`).** The
+incremental baseline tier: `jit_compile_chunk` runs LAST in
+`codegen_chunk` (after specialize_arith_ops; a `.myv` load will call it
+the same way), finds maximal STRAIGHT-LINE runs (EVERY run compiles — the
+old `MIN_RUN` >= 4 floor was REMOVED 2026-07-25: with most ops nativized,
+the short runs it excluded were mostly whole TINY bodies — a 2-op
+comparator `func(a,b) => a < b` — which become `native_leaf` and get
+CALLED directly by a caller fragment, paying no `EnterNative` at all;
+measured callgrind Ir: sort_custom_cmp 0.93x, map_filter 0.95x,
+bool_reduce 0.97x, loop/recursion benches neutral; any branch or
+branch TARGET splits a run) of the never-throwing int tier (the B1/B2
+specialized arithmetic, IntModRI/IntAddModRI with the imm 0/-1 idiv-trap
+exclusions, imm shifts with negative counts left interpreted,
+LoadImmInt), hand-emits each into a per-chunk mmap'd W^X buffer
+(`Chunk::native`, move-only, never serialized), INSERTS an `EnterNative`
+op at each run head (pc fields + locs/inline_ctxs remapped; the run's
+ORIGINAL ops stay in place), and flips the buffer RX. The three
+contracts: fragments NEVER throw or call anything that can (frameless
+leaves - every exceptional condition, e.g. a negative reg shift count,
+BAILS by returning the op's pc, and the interpreter re-executes it,
+throwing with the exact caret); reads are the release interpreter's raw
+proven-type loads (a bool payload is fully zeroed, so the raw int read
+is 0/1); writes to a dst OUTSIDE `Chunk::ref_slots` are TWO UNCONDITIONAL
+stores (type singleton + payload - sound: such a slot only ever holds
+trivial values), while a ref-listed dst (a reused temp that may hold a
+reference NOW - releasing it needs C++) gets a type-check + bail. Layout
+facts (LValue stride 48, payload/type offsets via
+`EvalValue::jit_payload_off/jit_type_off` + a runtime probe, the int
+Type singleton) are baked as immediates. Gated on
+`ML_JIT_SUPPORTED` (jit.h - **Linux x86-64 ONLY**, maintainer decision
+2026-08-02: a platform is supported once it is TESTED there, and CI tests
+Linux. FreeBSD x86-64 after it is tested; Darwin x86-64 NEVER, a
+deprecated platform; Windows VM-only for a long time; aarch64 on all
+three when that backend lands). ONE macro, because a policy stated in 28
+places drifts. Kill switch `-nj` / `MYLANG_JIT=0` (the same-binary A/B
+lever); off-platform the tier compiles out and `g_jit_enabled` is always
+false, which is the same thing `-nj` selects.
+The indirect call into a fragment goes through
+`jit_enter` (no_sanitize("function") / gcc no_sanitize_undefined):
+UBSan's -fsanitize=function would else read a CFI type signature from
+the (absent) word before the fragment and fault on the guard page - a
+CI-only crash root-caused via a `setarch -R` (ASLR-off) repro.
+**N2 - the NATIVE BACK EDGE:** a run may contain
+Jump/JumpUnlessIntCmp/ForLoopStep/IntAddStep and interior branch
+targets (`op_is_branch` + `emit_branch`), so a whole int loop iterates
+in machine code - internal branches are fragment-local jcc/jmp patched
+from a per-run `label[]` (`emit_cond_jump`; signed `cc_for`/`cc_negate`
+tables), a target outside the run is an `exit_pc`. NO single-entry
+constraint: every interior op survives as its interpreted original, so
+an external branch or a bail simply resumes interpreted. Measured
+(SAME-BINARY JIT off vs on, the cleanest control): VM-wall geomean
+**0.895**, my/py 4.97x → **5.47x**; 01_while_loop 0.190x,
+50_autoconst_dce 0.227x, 02_for_loop 0.333x, 06_if_branch 0.450x,
+68_nested 0.692x. (Cross-binary A/B tiny-magnitude per-bench deltas are
+NOISE - always confirm JIT deltas same-binary via the kill switch.)
+**N3 - the SSE FLOAT tier:** FloatBin(add/sub/mul) +
+FloatAdd/Sub/MulRR/RI, LoadImmFloat, JumpUnlessFloatCmp lower to
+movsd/addsd/subsd/mulsd/ucomisd. A float slot READ type-dispatches
+(float -> movsd fast path; int -> cvtsi2sd promote; bool/other ->
+BAIL - matching read_float_slot); a WRITE is the two-store (t_float
+singleton held in r8, set once at entry when the run has float ops, +
+movsd payload). Float ORDERING compares (lt/le/gt/ge; eq/noteq not
+eligible) use the ucomisd OPERAND-SWAP trick so an unordered (NaN)
+compare correctly does NOT satisfy it and jumps - byte-identical to the
+tree-walker's IEEE semantics. div/mod stay interpreted (float div
+THROWS on 0; mod is a libm call). Measured (same-binary JIT off vs on):
+VM-wall geomean **0.812**, my/py 5.00x -> **5.55x**; 54_mandelbrot
+**0.344x**, 55_float_sum 0.867x.
+
+**#56 DELETE-ORIGINALS (started 2026-07-28; the re-purposed model
+flip).** The corpus AUDIT (env `MYLANG_DELAUDIT=1`: each non-deletable
+run's reason + blocking opcodes to stderr) found 58 kept runs across
+bench/+samples - 0 multi-entry (the per-pc entries already cover those),
+2 inline-raise, 56 bail-op, led by LoadElemInt/Float (46), the call ops
+(38), AppendV (10), the exception trio (16). **Increment 1 -
+LoadElemInt/Float fully native:** the inline flat fast path keeps its
+guards but every DECLINE (non-array/slice/general-or-wrong-kind
+storage/negative wrap/OOB) jumps to a SLOW TIER - jit_load_elem_int/
+float (vm.cpp), the interpreter's exact shared core
+(vm_load_elem_int/float_core, used by the VM_CASEs too so they cannot
+drift) - whose OOB CONVEYS with the op's exc-stamped caret; the
+InternalErrorEx net rides g_vm_jit_eptr. No bail, no re-interpret ->
+op_fully_native -> the runs' originals DELETE (a flat read loop's chunk
+is a bare enter.nat). Execution-proven (g_jit_op_run bumps in the slow
+tier; the jit_load_elem_slow_tier test covers slice + negative-wrap
+shapes). Measured (callgrind Ir): 15_array_slice_readonly **-32.2%**
+(sliced reads run the helper instead of splitting/bailing per element),
+18_foreach_array **-10.1%**, 14 -3.0%; 43/46 neutral. **Increment 2 - the
+LV-BUILTIN family deletable (AppendV / CallBuiltinLV / LVElem /
+LVMember):** their jit helpers already ran the FULL interpreter path
+(fast append + the pooled-caret fallback / the shared LV dispatch) and
+stamp their own carets from the builtin_calls POOL - collapse-safe by
+construction; what they lacked was the classification, a
+plain-Exception net (catch(...) -> g_vm_jit_eptr - the noexcept would
+std::terminate), and a belt-and-suspenders emit-side exc-stamp. Now
+op_fully_native -> an append/sort/pop loop's originals DELETE (an
+append loop's chunk is a bare enter.nat). Error parity pinned:
+const-rebind + flat-mismatch carets byte-identical through the deleted
+form; a THROWING COMPARATOR revealed a PRE-EXISTING (parent-verified,
+JIT-independent) caret divergence - the VM carets the offending
+DIVISOR `z[0]`, the tree-walker the whole `x / z[0]` chain - FIXED
+(#76, next paragraph). Ir neutral (13/34/47 +-0.00%). Corpus:
+45 -> 41 kept runs. Remaining blockers: the calls (38),
+Catch/Reraise/Throw (12), StructFieldAddInt (5), MultiUnpackV (3).
+**Steps 2-4 - the CALLS are deletable (2026-07-28,
+plans/model-flip.md "The CALLS deletability design"):** every sync-call
+decline is gone. The chunk-less callee (the old AOT-net bail) first
+LAZY-tries vm_func_chunk (the interpreted op's own net) then runs the
+BOUNDARY call inside the helper (jit_sync_boundary_call - the
+interpreted tail verbatim, the pending conversion stamping the baked
+site). Past the DEPTH CAP the call SWITCHES interpreted-flat
+(jit_call_sync_switch): the interpreted op's exact in-VM push with
+`rec.ret_pc` = the call's POST-CALL ENTRY-STUB pc (baked by the emit
+via the per-chunk `g_cur_entry_remap`) + the resume globals -> status 3
+-> the emitted site returns **JIT_RET_SWITCH ((size_t)-3)**; consumers:
+EnterNative (switch chunk/pc - ZERO new C frames, the interpreted-call
+shape), the inline call-rdx site + the core's direct branch (dec depth
++ PROPAGATE -3 - their C frames die; the record chain re-enters each
+fragment at its own stub), vm_invoke_postexit (branch on -3 FIRST).
+g_jit_sync_depth is untouched by a switch (the continuation is FLAT).
+Backtrace: `VmCallRec::call_site_packed` (the baked site; zeroed by
+both interpreted setups, gated on !sync_stop so an emitted-M5b-push
+record can't leak a stale value) preferred by vm_capture_rec_frame - a
+deleted run's loc_at(ret_pc-1) would resolve against collapsed pcs.
+Classification: the three call ops are op_fully_native (NEVER
+op_never_exits); post-call entry STUBS now materialize INSIDE deleted
+spans (the only pcs there - the entries/dual-remap/rebuild
+generalization), so a call loop's chunk is enter.nat + stub enter.nats
+and `call.v` is GONE from -vd (the pin updated). Execution-proven:
+g_jit_sync_switch (the cap-4 mutual-recursion + deep-throw test).
+**THE BOUNDARY CALL IS NOT EXECUTION-PROVEN, and this line used to claim
+it was (corrected 2026-08-05, task #114).** `g_jit_sync_boundary_call`
+reads ZERO after the whole suite. Its only trigger is a CHUNK-LESS
+callee, and since the no-fail codegen the ONLY chunk-less function is a
+template BASE (`is_template_base`) - which the inferencer sets exactly
+when the base is NEVER value-used, i.e. when every call to it was
+redirected to an instance. The two residual routes the inferencer's own
+comment names were both BUILT and neither reaches the emitted sync site:
+a D4 overflow (70 struct signatures - the ">64 instantiations" warning
+fires, the base runs, the counter stays 0) and an uninstantiable direct
+call (a dyn arg, a bottom-element `[]` - both instantiated after all).
+Those calls tree-walk, as that comment says, rather than arriving at a
+JIT'd call site. So the helper is a live SAFETY NET with no constructible
+in-suite trigger - and it must stay: since #56 deleted the interpreted
+originals there is no re-run to decline to, so a chunk-less callee
+reaching an emitted site with this gone would be a crash, not a
+slowdown. Corpus: 41 -> **27 kept runs**; call benches
+Ir -0.0-0.4%. Remaining: Catch/Reraise/Throw (12), StructFieldAddInt
+(5), MultiUnpackV (3), LoadMemberInt/Float guard-miss carets (3),
+JumpUnlessElemInt (3), MapFilterV (2), the inline-raise guard (5).
+**The small-batch increment (same day):** StructFieldAddInt joins
+op_never_exits (its helper is never-throwing, the add/store fragment-
+local); MultiUnpackV / CheckFuncV / MapFilterV / LoadMemberInt/Float
+join the convey family (exc-stamps added at their exits - LoadMember's
+is a belt over its POOLED member carets; eptr nets added to
+jit_multi_unpack/jit_load_member for plain callback/dyn throws).
+Corpus: 27 -> **22 kept runs**; 65/35/64 Ir neutral, 73_multi_unpack
++0.9% (the deletion reshapes its fragments - the layout-tax class).
+Remaining: the exception trio (12), ForeachDynInit/Next (4, side-table
+carets - the same treatment next), JumpUnlessElemInt (3, needs a
+branch-resolving slow tier), the inline-raise guard (5).
+**ForeachDynInit/Next deletable (same day):** both join the convey
+family (exc-stamps at their threw exits; `old_pc` threaded into
+emit_branch for Next's). TWO measured traps: (1) a catch(...)'s
+exception_ptr temp made -fstack-protector-strong add a CANARY to the
+hot Next helper - **+7 Ir PER ELEMENT** (66/74 +3.5-4% Ir,
+callgrind-diagnosed via the helper's self cost at constant call
+counts) - so the throwing tier lives in an ML_NOINLINE slow twin
+(jit_foreach_dyn_next_slow) and the hot helper carries NO EH state,
+gated by `DynIterState::next_throws` (only the GENERIC body throws;
+the five specialized bodies skip the try entirely, ~+1 Ir/element
+residual - the price of deletability); (2) the recurring
+vm_dyn_next_dict 503<->564M LTO relink oscillation muddied 74's A/B
+again. Also: Init's non-container TypeErrorEx now uses the
+tree-walker's exact wording (byte parity; the VM's was ALSO loc-less
+in the compiled shape pre-stamp - both fixed). Corpus: 22 -> 20 kept
+runs; 66 +0.5% / 74 +2.4% Ir (the flag + the relink swing).
+**The #9 FUSIONS deletable (JumpUnlessElemInt / ForStepElemInt, same
+day):** both keep their inline flat fast paths, but the shared emit
+helpers (emit_elem_base_gate / emit_elem_int_read / emit_flat_int_tail)
+gained an optional DECLINE LIST - with one, a failing guard (non-array/
+slice/general/wrong-kind) and the out-of-range branch JUMP to a slow
+tier instead of bailing/`emit_raise`-ing (the raise's loc_at would
+resolve against a DELETED run's collapsed pcs). The tiers:
+`jit_elem_int_value` (the shared element read via
+vm_load_elem_int_core, conveying) for JumpUnlessElemInt and for
+ForStepElemInt's POST-STEP read declines, and the FULL-OP
+`jit_for_step_elem` (step + test + read, the interpreted body verbatim)
+for ForStepElemInt's GATE decline - because the gate must precede the
+step, so a re-entry there would DOUBLE-STEP. Both paths CONVERGE on the
+value in rax before the fused branch; the full-op tier returns
+0 = fell through / 1 = taken / 2 = threw. Corpus: 20 -> **16 kept
+runs**; 43_sieve +0.2%, 56_sieve_bool +0.3% (the extra converge jump),
+18/65 exactly neutral. The `jit_delete_originals` test's array-read
+case FLIPPED to asserting deletion (it pinned the old bail behavior).
+**The native `throw` (#56, the exception trio's first third):**
+`jit_throw(val_slot, pc, &locs[i])` runs the interpreted op's exact body
+- vm_make_thrown_exc + the SHARED vm_raise - and reports one of three
+outcomes: **dispatched** (a same-frame handler; the handler pc is parked
+in g_vm_resume_pc and the fragment RETURNS it as an ordinary external
+exit - the op already ran, so this is a resume, not a re-run),
+**boundary** (the walk stopped at this frame's sync_stop/boundary record
+with g_vm_exc_pending set; the fragment returns JIT_RET_BOUNDARY, which
+the sync sites now route into `jit_sync_postexit`'s existing pending
+CONVERSION - each sync site IS a stop boundary, so it converts rather
+than propagating), or **conveyed** (a non-struct value's TypeErrorEx).
+Two traps: the raw `ret` paths must `flush_cache()` like exit_pc does
+(a stale N5-pinned slot SEGV'd cross-frame throws), and the thrown
+object must be STAMPED from the baked LocEntry - vm_make_thrown_exc
+builds it loc-less and vm_raise would stamp it from `loc_at(pc)`, but a
+DELETED run collapses several ops onto one pc, where loc_at returns the
+FIRST entry (the ctor's, in `throw E(9)`). CatchTest/Reraise stay KEPT:
+the handler dispatch JUMPS to their pcs (the catch-dispatch redesign is
+scoped in plans/model-flip.md, deferred). Corpus: 16 -> **15 kept
+runs**; 42_exceptions **-9.7%** Ir (the native raise replaces an
+interpreted dispatch per throw), 69 -0.9%, 10_recursion neutral.
+**The FINAL batch (same day) - 15 -> 7 kept runs corpus-wide:** the
+struct/unpack builders (EmplaceStruct, MakeStructArrayV, the four
+UnpackElem variants) join the convey family (exc-stamps + the
+catch(...) eptr nets; their per-field/arg carets already ride their own
+pools), and the INLINE-RAISE GUARD RELAXES from "the run has any
+inline_ctxs entry" to "the run has entries naming DIFFERENT chains":
+the hazard was distinct chains merging onto the collapsed pc, so a run
+whose entries all name the SAME chain (the common shape - one inlined
+body spliced as a unit) is safe, since every entry remaps to the head
+EnterNative with that one correct index. Ir neutral (58/20/75/09
++-0.01%, 77 +0.23%); the backtrace THROUGH a deleted inlined chain is
+pinned byte-identical (jit_final_batch_deletable).
+**MakeDictV + the FINAL audit (2026-07-29) - the corpus is 11.** The "7"
+above predated samples/phonebook COMPILING again (the value-template
+inference fix the same day), so phonebook had contributed nothing to the
+audit; with it the corpus is 12, and one of its runs exposed a real gap
+the batch had missed - **`MakeDictV`**, the dict-literal builder. Its
+`MakeArrayV` twin is op_never_exits ("no error path"); a dict differs
+only in that it FREEZES and HASHES each key, so an UNHASHABLE key (a
+func) throws. Given the ordinary convey treatment - `emit_exc_stamp` on
+the failure branch + a `catch (...)` -> eptr net in jit_make_dict - it
+joined op_fully_native; the unhashable-key error is pinned byte-identical
+across engines AND through a `.myv` image. Corpus 12 -> **11**.
+**DISTINCT INLINE CHAINS (2026-07-30) - corpus 11 -> 9, and the guard is
+GONE.** A run whose `inline_ctxs` entries named DIFFERENT inlined bodies
+was kept, because deletion collapses every one of those pcs onto the head
+EnterNative and the pc-keyed `inline_frame_at` could then flush the WRONG
+virtual frames. The fix is ONE store: `emit_exc_stamp` already ran at
+every conveying exit INCLUDING the emitted sync call, so it now bakes the
+op's chain index (`Exception::jit_inline_frame`, one
+`mov dword [rax+off], imm32` on the cold branch, guarded like the caret -
+null object, and first-conveyor-wins) beside the caret it already baked,
+and `vm_flush_inline` PREFERS it over the pc lookup. The stamp was
+restructured so the chain still lands for an exception that carries a
+caret but no frames yet, and for an op with a chain but no loc entry.
+PROVEN rather than assumed: on a program whose throwing call sits in the
+chain listed SECOND, instrumenting the flush printed `baked=1 pc=0
+pc_lookup=0` - the pc lookup WOULD have named the wrong body. Pinned in
+jit_final_batch_deletable (engines' backtraces equal, the frame is `snd`
+and never `fst`, and the `g_jit_inline_baked` counter must bump, so the
+test cannot pass by luck or on an unexercised path). `fib$0` is now 9
+instructions. NOTE the earlier scoping (in plans/model-flip.md) predicted
+a SECOND mechanism for the call case - a stub-pc `inline_ctxs` entry or a
+field on the call record - and this paragraph used to record it as
+UNNECESSARY, reasoning that the emitted call site's own exc-stamp runs
+before `vm_unwind_walk`'s `inline_origin_emitted`-guarded flush. **That
+was WRONG and #88 below is the correction** - the one field can hold only
+the RAISE site's chain, so every call site the exception crossed after it
+was silently dropped. **All 9 remaining kept runs are now the DEFERRED
+catch dispatch** (8 CatchTest+Reraise, 1 EndFinally whose cold reraise
+bails).
+
+**#88 - THE CALL SITE'S CHAIN, AND THE -2 SENTINEL (2026-08-02).** With
+the JIT on, a recursion inlined into itself rendered FEWER frames than
+either other engine (3 where `-tw`/`-nj` render 5) and misattributed the
+bottom one: `main()` took the line of the row that went missing, naming a
+line inside `f`. Two independent defects, each with its own fix and its
+own depth in the pinning test.
+**(1) THE CALL SITE HAD NO MECHANISM.** `vm_unwind_walk`'s ordinary pop
+resolves a call site's chain from the caller's chunk + the call op's pc,
+but its `sync_stop` branch - the record a NATIVE caller owns - cannot: the
+sentinel `ret_chunk` is loc-less and the C++ owner is a fragment whose pcs
+collapsed onto the head EnterNative. It already stamped the baked call-site
+LOC there and simply never stamped the CHAIN. The emitted sync call now
+bakes both halves (chain index from the pre-collapse `old_pc`, plus
+`inline_frames.data()` - NEVER a `Chunk *`, which dangles once
+`codegen_chunk` moves the chunk out) and hands them to the helpers through
+**side-channel globals** (`g_jit_call_inline_chain`/`_pool`, the
+`g_jit_pending_key` pattern), because `jit_call_sync_core` already uses all
+six SysV argument registers and two more would spill on EVERY sync call to
+fix a backtrace-only defect. **THE NESTING RULE makes the global safe:**
+each helper copies both into its own frame AT ENTRY, before it can dispatch
+a callee that would overwrite them, and `jit_call_sync_core` re-publishes
+its copy before delegating to `jit_sync_postexit`. The shared
+`vm_jit_stamp_call_site` performs the loc stamp and the flush together so
+the pair cannot drift apart at one of the five exits.
+**(2) `-1` MEANT TWO THINGS.** `Exception::jit_inline_frame` used -1 for
+both "no fragment baked anything" and "a fragment baked: no chain here", so
+the flush fell back to a pc lookup that, on a deleted run, invented a chain
+belonging to another op - a PHANTOM virtual frame. `emit_exc_stamp` now
+stamps **-2** for "this op is not inlined code", and `vm_flush_inline_walk`
+treats it as an answer. The two stamps have DIFFERENT first-wins guards and
+that asymmetry is load-bearing: a real chain stamps whenever the field is
+negative (so it still outranks a -2), while -2 stamps only over -1 - an
+exception can be conveyed by an op that is not the one that raised, and
+that conveyor's "I am not inlined" says nothing about the raise site.
+Getting this backwards made the whole batch stamp -2 first and blocked
+every real chain (caught immediately by `jit_final_batch_deletable`'s
+counter assertion).
+MEASURED, not assumed: the first version fixed only the emitted-inline
+call and moved the repro by ZERO frames - instrumenting with a distinct
+sentinel proved this shape is served by the SLOW tier
+(`jit_call_sync_core`), so the side channel had to reach that too. Pinned
+by `inlined_recursion_backtrace_parity`, which now runs the JIT ON at
+depths 2/3/4 and requires byte-equality with the tree-walker; **each defect
+was reintroduced and the test confirmed failing, at DIFFERENT depths**
+(depth 4 catches the missing frames, depth 3 the phantom one), so neither
+depth is redundant. `g_jit_inline_call_baked` is the execution proof for
+the new path, and `jit_final_batch_deletable` now accepts EITHER baked
+counter - #88 legitimately moved its shape from the raise-site field to the
+call-site channel, which is where a frame for a call inside an inlined body
+belongs.
+COST (callgrind Ir, `OPT=1 ASSERTS=0` both sides): everything EXACTLY
+neutral except **69_exc_crossframe +1.58%** - 42/70/72_exc, fib and
+10_recursion_deep all +-0.01%. Two gates got it there from an initial
++1.92%/+0.82% spread, and both are the same idea - do nothing where nothing
+can go wrong: the **-2 marker is emitted only when the chunk HAS inlined
+ops** (in a chunk with none, the pc lookup it defends against returns -1
+anyway, so the block was dead weight on a cold path every conveying op
+carries - this alone recovered 70_exc_runtime_error to zero), and the
+**side-channel stores are emitted only when the site HAS a chain**, which
+is safe because each helper CLAIMS the pair (reads and RESETS it) and a
+store always sits immediately before its own call - so a site with no chain
+can only ever observe the cleared value. The residual on 69 is the -2 stamp
+running per frame-crossing in a chunk that does inline; 69 throws 20k
+CAUGHT exceptions across 16 frames each, i.e. the worst case for any
+per-crossing bookkeeping, and it is the only bench that moves.
+
+**N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
+fragment that navigates the base slot -> SharedObject -> kind + the flat
+vector's data/finish pointers, unsigned-bounds-checks the index, and
+reads the raw scalar (`mov rax,[rcx+r9*8]` / `movsd`). A non-array,
+SLICE, wrong-kind (bool/general/str), OOB, or negative-index base BAILS
+(the interpreter re-runs the op with its exact OutOfBounds/type throw +
+caret). The fragile SharedObject layout is obtained via a co-located
+`SharedArrayObj::jit_probe()` accessor (sharedarray.h) that reads the
+real members - so the JIT bakes RUNTIME-correct offsets that can't
+silently drift. Measured (same-binary JIT off vs on): VM-wall geomean
+**0.897**, my/py 5.05x -> **5.7x**; 18_foreach_array 0.650x,
+19_foreach_indexed 0.565x (foreach-over-array is a counted loop +
+LoadElemInt), sieve/matrix reads 0.92-0.95x.
+
+**`-vdj` - the post-JIT dump (jit disassembler, disasm.cpp).** Like
+`-vd` but each `enter.nat` line is followed by its FRAGMENT's x86-64
+disassembly - hex bytes + mnemonics, `; vm pc N` markers linking the
+native code back to the VM ops it implements, and `slotN`/`slotN.type`
+labels for the frame-window accesses. A self-contained decoder for
+exactly the forms the emitter produces (unknown byte -> `.byte`, the
+next op mark resyncs); slot-window layout (stride 48, payload +0, type
++24) mirrored for the labels. The op-boundary MARKS are recorded during
+codegen ONLY when `g_jit_annotate` (set by `-vdj`) - zero cost on a
+normal run. The one dev tool that lets a human read the generated
+machine code alongside the bytecode.
+
+**THE SLOTS BASE LIVES IN A CALLEE-SAVED REGISTER (2026-08-01,
+plans/jit-registers.md step 1).** The frame-slot window used to sit in
+`rdi`, which is both CALLER-saved and the ABI's first argument register.
+Both halves hurt: a helper call could clobber it, and forming a pointer
+argument (`lea rdi, [rdi+off]`) DESTROYED it - so `emit_call_prologue`
+pushed it and `emit_call_epilogue` popped it around EVERY helper call.
+The base is now **`rbx`**, callee-saved, so a helper preserves it and the
+prologue emits nothing for it. A fragment is entered with the window in
+`rdi` (from `jit_enter`, an emitted sync `call rdx`, or a `native_leaf`
+direct call) and begins with `frag_entry` = `push rbx; mov rbx, rdi`;
+every exit ends with `frag_ret`/`exit_pc` = `pop rbx; ret`. **An entry
+STUB is an entry too** and gets the same pair, so either way in pushes
+exactly once and either way out pops exactly once. Mechanically the
+change is ~10 modrm byte constants: every slot access goes through five
+Emitter encoders whose addressing byte was `[rdi+disp32]` (mod 10, rm
+111 = `0x87`) and is now `[rbx+disp32]` (rm 011 = `MODRM_SLOT`, `0x83`).
+**16-ALIGNMENT moved with it and is the part to keep in mind:** a
+fragment is entered at `rsp % 16 == 8`, so before this the body was at 8
+and a call site needed an ODD number of pushes; `frag_entry`'s single
+push makes the body 0 - already call-ready - so a call site now needs an
+EVEN number. `emit_call_prologue`'s pad rule (`pad iff ncache is odd`) is
+UNCHANGED because exactly one push was removed from it and exactly one
+added at entry; the two hand-spilling sites in the inline call push
+(around `jit_cached_probe` and `jit_bind_ref_arg`) each lost a live `rdi`
+push and gained an explicit `sub rsp,8` pad in its place. **`rdi` is NOT
+materialised by the prologue**: a helper whose first parameter is
+`LValue *slots` used to get it for free, and now says so with
+`slots_to_arg0()` - measured over jit.cpp, 64 of 73 call sites load `rdi`
+with something else immediately after, so a blanket move would have been
+dead code at seven sites out of eight. `-vdj`'s slot LABELS follow the
+base (disasm.cpp's `mem_disp` keys on rbx now), so the dump still reads
+`mov r10, i` rather than `mov r10, [rbx+0x30]`. Measured (callgrind Ir,
+`OPT=1 ASSERTS=0` both sides): 43_sieve **-1.31%**, 76_funcval_dispatch
+-0.75%, 11_closure_counter -0.59%, 46_matrix_mult -0.52%, 63_closures
+-0.38%, 10_recursion_deep -0.31%; 01_while_loop and fib EXACTLY neutral;
+35_map_filter +0.30% and 34_sort_custom_cmp +0.25% - the callback benches
+re-enter a fragment PER ELEMENT, so they pay the entry push/pop more
+often than they save helper-call spills. NOTE the plan predicted ~3% on
+76 and that was WRONG: the removed `push rdi`/`pop rdi` is 2
+instructions per helper CALL, but the added `push rbx`/`pop rbx` is 2 per
+fragment ENTRY, and the two nearly cancel wherever entries are as
+frequent as calls. **The reason to do it is not this number** - it is
+that four caller-saved registers cannot host a register ALLOCATOR (every
+value would spill around every call), and the allocator is the next step.
+
+**THE CACHE POOL IS CALLEE-SAVED AND FOUR WIDE (2026-08-01,
+plans/jit-registers.md step 2a).** The N5 registers were `r10`/`r11` -
+CALLER-saved, so `emit_call_prologue` pushed each one and
+`emit_call_epilogue` popped it around EVERY helper call, and a fragment
+could hold at most two. They are `r12`-`r15` now (`CACHE_REGS`,
+`MAX_CACHED`): callee-saved, so a helper preserves them for free. The
+saves move from once per CALL to once per fragment ENTRY - `frag_entry`
+pushes the base plus each pinned register (plus an 8-byte pad when the
+count would leave rsp mis-aligned, since the body must sit at
+`rsp % 16 == 0`), and every exit undoes it. **`emit_call_prologue` is now
+an empty named marker** and the epilogue is just the two type-singleton
+`movabs`es. The pick necessarily runs BEFORE the entry is emitted, since
+it decides which registers the fragment takes over.
+**THE EXIT HAD TO BE SHARED, and that is the trap worth remembering.**
+`exit_pc` used to INLINE the whole tail - flush the cache, restore, ret -
+so its size grew with the pool: at four pinned slots the flush alone is
+56 bytes, and the short `jcc` that several guards use to hop OVER an exit
+ran out of its 8-bit displacement (a `patch8` assertion, caught by `-rt`).
+An exit is now `mov eax, pc; jmp <epilogue>` - a CONSTANT 10 bytes - and
+each fragment emits its tail ONCE at the end (`emit_epilogues`), which
+also stops ~100 sites duplicating the flush. **TWO** epilogues, because a
+barrier'd op deliberately EMPTIES the cache across its emission: such an
+op's exit must not flush (the helper already wrote those slots and the
+stale registers would clobber its writes), so the emit picks the bare
+tail exactly when `cache` is empty. NOTE `jit_enter_deep`'s asm carries
+the C `rsp` across the stack switch in **r12**, which is now in the pool -
+still correct, but by save/restore rather than by the emitter never
+touching it, and the comment there says so. Measured (callgrind Ir,
+`OPT=1 ASSERTS=0`, CUMULATIVE with the rbx move): 43_sieve **-5.07%**,
+14_array_subscript **-3.20%**, 46_matrix_mult **-2.82%**,
+76_funcval_dispatch -0.75%, 11_closure_counter -0.59%, 63_closures
+-0.39%, 10_recursion_deep -0.31%; 01_while_loop / 07_nested_loops exactly
+neutral; 35_map_filter +0.30% / 34_sort_custom_cmp +0.25% (a callback
+re-enters a fragment per ELEMENT, so it pays the entry push/pop most
+often). The array/store-heavy benches gain most because their loops make
+helper calls AROUND hot int locals - precisely the spill this deletes.
+The `>= 3`-uses heuristic still limits how much of the pool gets used; a
+LIVE-RANGE allocator is the next step and is what the wider pool is for.
+
+**C2a - THE FLOAT REGISTER CACHE (2026-08-04, xmm4-7;
+plans/typed-invariant-arrays.md).** The N5 pool's float half: hot
+float LOCALS pin in xmm4-7 (xmm0/1 stay scratch) - parallel accounting
+in `pick_cached_slots` (usef/badi/badf; the pools are DISJOINT: an int
+use disqualifies the float side and vice versa), entry loads at the
+head + every entry stub, flush (r8 type + movsd payload) / reload /
+barrier-bracket extended, and - xmm being ALL caller-saved - a
+payload-only spill to the slot around EVERY helper call via the shared
+emit_call_prologue/epilogue (sound: a pinned slot is never memory-read
+by any op in the run; a real exit flushes type+payload properly).
+THE QUALIFICATION RULE: only a slot some float op WROTE in the run
+(`fdst`) - a float op can READ a definitely-int slot via the promote
+arm, and pinning one would movsd int bits as a double. ReturnV does
+not disqualify (the emit flushes before jit_ret); MoveV's SOURCE is
+float-aware at ZERO weight (04's accumulator was killed by its final
+str(x,4) arg-staging move - the int pool's four-accumulator lesson
+replayed); MathFnV joined the classifier (previously UNLISTED - one
+math builtin disabled pinning for its whole run). SHIPPED BUG caught
+by -rt: `e.fcache` was not cleared per RUN - jit-ineligible selectors
+(floor/abs) split a body into fragments and fragment 2's epilogue
+flushed fragment 1's never-loaded pin into the slot. Pinned by the
+run-split test; 4 sabotages watched failing (no per-run clear, no
+spill, no flush - a suite abort - wrong-register read).
+Execution-proven by `g_jit_fcache` (emitted inc per float-pinned
+fragment entry). Measured (callgrind Ir/scale, OPT=1 ASSERTS=0):
+04_float_arith **-28.0%**, 54_mandelbrot **-22.5%**, 55_float_sum
+**-19.5%**, 40_math_builtins -2.6%; 44/46/43/01/09/34/35 byte-flat.
+
+**C3 inc 2 - TYPE-ELIDED SLOTS (2026-08-04).** A
+qualified-but-unpinned local (pool overflow + sub-threshold - the
+same bad() soundness as an N5 pin, minus the register) skips the
+per-write TYPE store; every exit's flush stamps the singleton once
+(`Emitter::tflush`), the barrier bracket restores it before helpers
+that read full values, and an elided FLOAT slot's read skips
+emit_float_load's dispatch (provably t_float). THREE suite-caught
+holes, each pinned + sabotage-verified: a ReturnV-only slot (an ARRAY
+result) qualified - the >= 3 pin threshold had silently protected the
+pool from that, so the elision gate is int-WRITTEN-in-run (idst);
+MoveV's cache-aware SOURCE is a full-value memory read (stale type
+propagation) - sources leave both elision sets (full_read); and the
+barrier bracket fired only on a non-empty INT cache - a
+closure-capture snapshot of an elided dyn local read a `none` type
+(the bracket now fires for float pins + tflush; float pins had been
+accidentally safe via the prologue payload spill). Proven by
+g_jit_telide; the test needed runtime() armor (const-arg pure fold -
+trap #2 again). MEASURED: corpus BYTE-FLAT (hot writes are pinned or
+forwarded already); a 6-accumulator probe (more hot ints than the
+pool) reads **-6.8%**. Lambda-param coverage was assessed and DROPPED
+as vacuous (11's closure has NO params; every passed lambda is
+value-escaped by design - recorded in the plan).
+
+
+
+
+
+
+**C4b inc 2 - THE FLOAT RESULT PICKS ITS REGISTER (2026-08-04).**
+SSE2 arithmetic is TWO-operand (`dst = dst OP src`), so one operand must
+occupy the result register. Forcing that to be xmm0 meant a value
+ALREADY in xmm0 - a C4a-ii forwarded temp, which is every pair in a
+float chain - had to be moved ASIDE before `a` could land there.
+`farith` takes its DESTINATION as a parameter now and
+`emit_float_operands` returns the `{dst, src}` PAIR: with b forwarded,
+`a` is built in the OTHER scratch and the result lands there, so the two
+scratches ALTERNATE down the chain and the aside-move is gone.
+`JitFwd` carries the register (`fin_reg`/`fres_reg`) rather than
+assuming xmm0. The `a`-forwarded case computes over the forwarded
+scratch in place (its temp is dead), and `t OP t` needs no load at all
+(`dst == src == its register`). fmod is the one forced shape - its libm
+call wants x/y in xmm0/xmm1 by the SysV float order.
+**THE BUG THIS COST, and the net that caught it:** jit_put_float takes
+its value in XMM0, and `emit_float_store`'s ref-listed arm passed
+whatever register it was handed - so once the result could be xmm1, that
+arm stored a STALE xmm0. `-rt` stayed green; **bench/my/55 was off by
+1.5**. That is the second time in one day a corpus program caught what
+the suite could not, so the corpus differential (tw vs the default
+engine over bench/ + samples/, 83 programs) is now part of the routine,
+not an afterthought. Reproducing it in a TEST took real work - the
+trigger needs a reference living in exactly the temp whose op has a
+forwarded b, which depends on slot allocation: a local-bound array
+shifts the numbering and the case goes vacuous, `argv` is empty under
+`-rt`, and `clone([...])` misses while `dynarray([...])` hits. Hence
+`g_jit_fstore_movx0`, an emitted-code counter the test ASSERTS, so the
+coverage is provable rather than lucky.
+Measured (Ir/scale, OPT=1 ASSERTS=0): 55_float_sum **-6.7%**,
+54_mandelbrot **-3.1%**, 40_math_builtins -0.8%, 46_matrix_mult -0.02%;
+04/01 byte-flat.
+
+**C4b - FLOAT LITERAL REGISTERS + REGISTER ARITH SOURCES (2026-08-04).**
+Two halves of one idea - a value that already lives in a register should
+be READ there. (1) **`farith` takes its SOURCE register as a parameter**
+instead of hardcoding `xmm0, xmm1`: SSE arithmetic reads any xmm
+directly, so an operand b that is a C2a-pinned local or a pinned literal
+needs no `movsd xmm1, xmm<n>` first. `emit_float_operands` RETURNS where
+b landed, and the div0 bit test reads that register too
+(`movq_rax_x`). (2) **A per-run FLOAT LITERAL POOL in xmm2/xmm3**: a
+literal costs TWO instructions to materialise (`movabs` + `movq`) at
+EVERY use, i.e. per ITERATION for the most loop-invariant value there
+is - 8 of 55_float_sum's 55 hot-path instructions. Loaded once at the
+fragment entry (and at every entry stub), an operand-b literal is then
+FREE and an operand-a one is a single move.
+**THE GATE IS LOOP-SCOPED, and that is the whole accounting**: a use or
+a clobbering call INSIDE a loop costs per iteration, outside it costs
+once. Scanning the whole RUN instead measured the difference between a
+win and nothing - since delete-originals a run spans a whole function,
+so `main`'s argv/print calls, long before the loop, declined the pool on
+55's real bench shape while the identical loop inside a function pinned
+fine. **CORRECTNESS is `emit_call_epilogue`'s job, NOT the gate's**: the
+pool is caller-saved and a call can be RUNTIME-CONDITIONAL and invisible
+to any opcode scan (a float store to a ref-listed dst calls
+jit_put_float and CONTINUES), so the choke point every helper-call
+emission already pairs through re-materialises the pool exactly as it
+does the rsi/r8 type singletons - verified by turning the gate off
+entirely and watching the suite stay green. Through **RCX, never rax**:
+the epilogue runs immediately before every call site's `test rax, rax`,
+and materialising through rax silently destroyed the helper's status
+(it surfaced as a spurious DivisionByZeroEx).
+**A LATENT C4a-ii BUG SURFACED HERE AND IS FIXED:** `emit_float_store`'s
+ref-listed COLD arm calls jit_put_float, which TAKES its value in xmm0
+and leaves it clobbered - so a producer whose pair armed the forward
+handed the consumer garbage. The int side had solved this from the
+start (`store_dst`'s `keep_rax` reload); the float twin shipped without
+it. Now `keep_x0`, cold-arm only, so the hot path pays nothing. It bites
+only when a ref-listed float dst actually HOLDS a reference at the
+store, which `main`'s temp reuse produces and `-rt` did not - the shape
+is now a test (reproduced down to the named bound local: with the bound
+inlined an int op writes the temp first, releases the reference, and the
+case goes vacuous).
+Proven by `g_jit_flit`; the `jit_flit_c4b` test pins an
+order-sensitive two-literal chain, the ref-listed-dst shape, and a
+libm loop that must DECLINE. Measured (Ir/scale, OPT=1 ASSERTS=0):
+04_float_arith **-25.0%**, 55_float_sum **-9.2%**, 54_mandelbrot
+**-6.4%**; 40_math_builtins flat (its loop calls libm - the gate
+declining, by design), 46/01 byte-flat. 55's hot path 55 -> 48 in a
+function, 75 -> 68 at main level.
+
+**C4d - THE CTOR-DOMINATED MEMBER READ DROPS ITS GUARDS (2026-08-05,
+`jit_struct_facts`, codegen.cpp).** A baked member read re-checked
+`slot holds a struct` + `that struct's def is D` - 7 instructions -
+before every single field read, although in the shape those ops exist
+for (`var p = Point(i, i*2); s += p.x + p.y`) a PLANNED StructCtorV on
+that very slot has just established both. The read is now three
+instructions (`mov rax, p; mov rax,[rax+bytes]; mov rax,[rax+off]`) and
+has NO slow arm at all - the guards were the only thing that could
+decline, and a raw byte read cannot throw, so the cold helper block is
+not emitted either.
+**THE SCOPE WAS RE-MEASURED, and the plan's was wrong.** C4d was scoped
+as hoisting the CTOR's four H1 guards (2x13 Ir); reading the actual
+`-vdj` showed the READS are the bigger and far safer half - 64 has five
+of them (2 int + 3 float) against two ctors.
+**THE MECHANISM is a forward MUST dataflow, not a peephole and not a C1
+region.** Facts are (slot, def) pairs, <= 32, one bit each.
+GEN: a planned StructCtorV on slot S with def D generates (S, D) on BOTH
+arms - the emitted fast path only rewrites the reused instance's bytes,
+and the slow tier `vm_struct_ctor_planned` either reuses that same-def
+instance or puts a FRESH `def` one in the slot, so neither can leave
+anything else there and neither throws. That both-arms property is what
+makes the fact reach the reads with no join subtlety. KILL: any write to
+S, from `visit_use_def` - the same audited enumeration E1 and
+jit_fwd_info use, with the same "an unaudited op is a BARRIER" contract.
+MEET: intersection over predecessors (the fall-through edge plus every
+branch naming the pc via `visit_pc_fields`, the audited enumeration since
+a "target" is not always a pc); an over-enumerated predecessor can only
+SHRINK the set, so that direction is the safe one. BOTTOM at pc 0, every
+handler body/finally pc, every per-pc entry stub, and every UNREACHABLE
+pc - the iteration starts at TOP so a loop-carried fact survives the back
+edge, and without the reachability pass an entry-less strongly-connected
+region could keep a fact alive forever (it can never run, but it would
+still be EMITTED).
+**WHAT THIS DOES NOT COVER, and why:** the CTOR's own guards. At a loop
+head the fact dies in the meet between the preheader (where the slot has
+not been constructed yet) and the back edge - correctly, since iteration
+1 really must check. Getting them needs loop VERSIONING (a preheader +
+cold twin, C1's structure), which is a separate mechanism; ~26 of 64's
+remaining 194 Ir.
+**THE SABOTAGE RESULTS ARE THE INTERESTING PART, recorded as measured.**
+Forcing the elision unconditionally fails TWO tests (the param read in
+`jit_member_fact_c4d` must stay guarded; `jit_struct_baked`'s too), and
+removing the KILL fails the rebind case. But the VM_HARDENING net
+(`jit_member_fact_audit`, which re-checks the proved fact at runtime on
+the SAME emitted path a release takes) does NOT fire under either, across
+`-rt` AND the corpus - because for a baked read the base's STATIC type
+already implies the def, so no constructible program can put a different
+one there. That is not a hole in the nets: it means the guards were pure
+insurance against a checker hole, and the elision REPLACES "trust the
+checker" with "a ctor just put a def-D object in this slot", which is
+strictly stronger evidence. The dataflow and the KILL are what keep that
+true if a future op can rebind a struct-typed slot; the entry-pc bottom
+is belt (a post-call resume's fact is valid anyway, since the callee has
+its own window) and is recorded as sabotage-unprovable.
+A TRAP worth naming: the first KILL test case used `p = mk(i)` and was
+VACUOUS - a small callee is inlined/spliced away long before codegen and
+the reads then read the inlined body's OWN slot, so the no-KILL sabotage
+changed nothing (4 emitted def guards either way). The MoveV form
+`p = q` is the one that measures (4 -> 2). Execution-proven by
+`g_jit_member_noguard` (the guarded `g_jit_member_fast` counts the old
+form, so only a separate counter can prove the elided one ran) and by
+requiring BOTH counters to move in one program - asserting only the
+elided one would pass just as happily if every read in the process lost
+its guards. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0, cross-binary):
+**64_struct_create 234 -> 194 Ir/iteration (-17.1%)**; 58/65/77 byte-flat
+(they read through LoadStructField*/the foreach direct read, not
+LoadMemberInt - a different op), 46/01/09/55 byte-flat, so the new emit
+arm costs no layout tax.
+
+
+**C5 - THE LOOP-PREHEADER RELEASE (2026-08-05,
+`jit_pick_release_slots`, jit.cpp) - C4e's trick on the STORE side.**
+A scalar store to a REF-LISTED slot cannot just overwrite the two
+words: the slot may currently hold a reference, and releasing one needs
+C++. So every such store emits a 4-instruction test first (`mov rcx,
+type; mov ecx,[rcx+t]; cmp ecx, t_str; jb fast`) plus a cold
+`jit_put_*` block - on a property that, inside a loop, is false on
+every iteration but at most the first.
+**`main`'s temps are the case, and they are ref-listed WHOLESALE:**
+`compute_ref_slots` bails to "every slot" the moment a chunk holds one
+op whose defs it cannot enumerate, which any argv/print call is - so a
+hot loop in main pays the test on every store although nothing in the
+LOOP puts a reference anywhere. The loop PREHEADER now releases the
+slot once (`if (type >= t_str) jit_release_slot`, leaving a trivial
+`none`) and every store inside drops its test: ~5 instructions per loop
+ENTRY for 4 per store execution.
+**THE PLACEMENT WAS MEASURED, NOT ASSUMED.** The plan scoped this at
+the FRAGMENT ENTRY; built that way it picked **nothing** on the shape
+it exists for - since delete-originals a run spans a whole function, so
+main's argv prologue and closing print reuse the very temps the loop
+stores to, and "no non-scalar def anywhere in the run" is false for all
+of them. Scoped to the loop, the same slots qualify. This is C4b's
+loop-scoped lesson, in the same place, for the same reason.
+THE GATE: a ref-listed TEMP (locals are not scratch, and
+`jit_fwd_info`'s liveness tracks temps only); EVERY def of it inside
+the region is `op_writes_scalar` - the same table that decided
+ref_slots - so nothing can put a reference back and the invariant holds
+at every pc, not merely at the top (an op the use-def table does not
+know refuses the whole region); DEAD-IN at the region head, so the
+released value is one nobody reads (live-IN, not live-out - C4a-i's
+trap); and the preheader must be the only way in, which is
+`region_preheader_reached`, FACTORED OUT of C4e so the two cannot
+drift. Regions are taken outermost-first (a slot an enclosing region
+released is already trivial inside). At an exit the slot holds `none`
+or a scalar, so `pop_window`'s release scan correctly skips it -
+nothing leaks, because whatever was there was released HERE.
+The COLD copy of a C1 hoist region is entered by a failed guard whose
+jump precedes this preheader, so it clears the released set and keeps
+every guard. `MYLANG_RELDBG=1` prints each region's picks (the
+MYLANG_ESTDBG / MYLANG_HOISTDBG pattern).
+SABOTAGE, recorded as measured. The DEAD-IN gate needed a REFUSAL
+assertion, not a value check: a `foreach`'s counter is a temp that is
+live-in AND ForLoopStep-written, so only that gate refuses it - but
+`jit_release_slot` assigns `LValue()`, whose payload is ZERO, and a
+freshly-initialised counter is zero too, so the wrongly-released loop
+still prints the right answer (watched, on the test and on both corpus
+programs that expose it). The test therefore asserts nothing was
+released. The SCALAR-DEF gate dies as a **LeakSanitizer** report (71KB
+in 813 allocations - a reference written into the temp inside the loop,
+then overwritten unreleased). `region_preheader_reached` and the cold
+clear are recorded UNPROVABLE: removing them changes which slots are
+picked (2 sites corpus-wide for the first) but no corpus program's
+output, since the failure needs a resume - or a failed C1 guard - to
+land where the slot happens to hold a reference right then.
+Execution-proven by TWO counters that prove different halves:
+`g_jit_release_entry` (emitted preheader) says the release ran,
+`g_jit_relent_stores` (compile-time) says a store actually dropped its
+guard - a broken `relok()` would leave the first bumping happily.
+It also starved `g_jit_fstore_movx0`: that shape got its reference from
+main's prologue and the cold arm ran ONCE, which C5 now clears, so the
+C4b test grew an IN-LOOP reference and exercises the arm per iteration
+instead. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0):
+**18_foreach_array -18.2%**, **55_float_sum -12.5%**,
+**65_struct_field_sum -11.4%**, **46_matrix_mult -10.3%**,
+**14_array_subscript -8.2%**, 64_struct_create -2.4%; 01/43/54/04/34/
+35/10/62/15/57/19/42/58/68 byte-flat. Lever `relent`.
+
+**C4e - THE LOOP-ESTABLISHED CTOR (2026-08-05,
+`jit_pick_ctor_establish`, jit.cpp).** A planned StructCtorV spends 13
+instructions before it can touch a byte - dst holds a struct / same def /
+sole owner / not readonly / load the buffer - and inside a loop all four
+are true from iteration 2 on. C4d's dataflow cannot reach them: at the
+loop head the fact dies in the meet with the preheader, CORRECTLY, since
+iteration 1 must really check. **So make the invariant true instead of
+proving it.** The loop's preheader calls `jit_struct_ctor_establish`
+once (idempotent, and NON-destructive when the slot already holds a
+reusable instance - which is what keeps a re-entered inner loop at ONE
+allocation for the whole program), and every iteration then emits
+`mov rax, dst.payload; mov r9, [rax+bytes]`. There is NO cold twin and
+no versioning, because the establish cannot fail.
+**THE SAFETY ARGUMENT is placement.** The establish WRITES the slot, so
+it must be unobservable. It is emitted before `label[T]` - a back edge
+targets the label, so only the FALL-THROUGH entry pays - and a region
+with no internal branch and no exiting op runs every op in it, so the
+ctor runs and the establish does exactly what that first ctor's own slow
+tier would have done. A top-tested `while` is refused by construction:
+its T is the condition and the region would contain that branch.
+**THE SECOND CONDITION is the appearance scan.** The refcount is what can
+break reuse - a MoveV copy, a container store, an arg bind all retain the
+instance and H1 would then have to allocate - so the dst slot may appear
+in the region ONLY as this ctor's dst and as a baked member read's BASE
+(which reads bytes and retains nothing). Both come from
+`jit_op_slot_refs`, a thin export of `visit_use_def` added for exactly
+this, so the emitter grows no second per-op slot table; an op the table
+does not know refuses the region.
+**A C4d-ELIDED MEMBER READ COUNTS AS NEVER-EXITING** even though the
+opcode does not: with its guards proved away it emits a raw byte read
+with no slow tier and literally cannot throw. Using the static
+`op_never_exits` there instead refused every real struct loop - 64's five
+reads are all elided - so C4e only exists because C4d landed first.
+**SABOTAGE STATUS, recorded as measured.** Emitting the establish at the
+FRAGMENT HEAD instead of the preheader fails the test - but only after
+the zero-trip case was rewritten to take the struct as a PARAM: a local
+declared before the loop is re-initialised by its own decl, which masks
+the mis-placement entirely (the first version passed). The APPEARANCE
+scan is defense in depth today and could not be made to diverge: the ops
+that would retain the instance (`append` -> CallBuiltinLV is unaudited,
+`arr[i] = p` -> StoreElemValue can throw) are already refused by the
+unaudited-op and never-exits gates, and the ones that survive both
+(MoveV, MakeArrayV) overwrite their alias every iteration, so no wrong
+value results. Execution-proven by `g_jit_ctor_est`; `jit_struct_baked`
+keeps the GUARDED form alive with an `if` in the body (a branch refuses
+the region), and the jit_op_nativized coverage loop accepts the
+established tier for StructCtorV - its helper legitimately starves, the
+BinOpV precedent. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0):
+**64_struct_create 194 -> 170 Ir/iteration (-12.4%)**, cumulative with
+C4d **234 -> 170 (-27.4%)**; 58/01 byte-flat, 46 +3 instructions
+whole-program (the picker running at compile time).
+
+**C3 inc 3 - TEMPS JOIN THE FLOAT TYPE-STORE ELISION (2026-08-04).**
+inc 2's producer was gated `< slot_count`, LOCALS ONLY, so every float
+TEMP still stored its type word on every write. A temp qualifies on the
+C4a-i READ gate's condition (dead-in at every entry, so no foreign
+value is read through the elided form) **plus one a local does not
+need: NOT REF-LISTED.** The flush stamps t_float at EVERY exit,
+including one taken before the run's first write to the slot; for a
+local that window holds the pre-decl `none` (trivial, harmless), but a
+temp is SCRATCH REUSED ACROSS RUNS and can still hold a reference an
+earlier run left in the same frame - stamping t_float over its type
+word hides it from `pop_window`'s release scan (which tests
+`type->t >= t_str` over the ref_slots members) and LEAKS it.
+`!ref_listed` is exactly "provably never holds a reference", the
+audited invariant a VM_HARDENING build re-verifies over the whole
+window on every pop. **That guard is not theoretical: `main` reuses its
+low temps for the `argv` subscript AND for a float chain**, so
+55_float_sum's own r5/r6 are ref-listed and correctly keep their type
+stores while r7/r8 elide - dropping the condition fails the suite AND
+trips LeakSanitizer (both watched). Proven by `g_jit_telide_temps` +
+the `jit_telide_temps_c3` test (a function-local chain that elides,
+and the mixed array/float shape that must not). Measured: 55_float_sum
+**-1.3%**, 40_math_builtins -0.6%, the rest byte-flat - SMALL because
+C4a-ii landed first and had already deleted 5 of the 7 writes; a
+non-adjacent-temp probe (where forwarding cannot fire) reads **-3.1%**,
+64 -> 62 hot-path instructions. Reach + architecture, like inc 2.
+
+**C4a-ii - FLOAT DEAD-TEMP FORWARDING (2026-08-04, lever A's twin).**
+A float expression chain round-trips every intermediate through a temp
+SLOT (a type store + a payload store, then a load) although the value
+is alive for exactly one instruction - 21 of 55_float_sum's 67
+hot-path instructions. A whitelisted float PRODUCER now hands its
+result over in **XMM0**, which is simply where the emitted shape
+already leaves it (load a->xmm0, load b->xmm1, arith xmm0, store
+xmm0), and a dead non-ref-listed temp skips the store. The whitelist
+is the ARITHMETIC family only (FloatBin + the six specialized
+RR/RI forms) on BOTH sides - deliberately narrower than the int
+lever's, because those ops have **no slow tier that rejoins after
+writing the dst** (the div/mod zero arm EXITS), so the "reload the
+forwarding register on the slow-path rejoin" case that the int
+LoadElem* producers need does not arise. The b-OPERAND case - which is
+EVERY pair in the corpus chain, since a chain accumulates on the left
+- moves the value ASIDE (`movsd xmm1, xmm0`) before `a` is loaded into
+xmm0; the int side instead swaps operand roles for a commutative op,
+and that is sound here too (the opcode enum already records that NaN
+payloads are not observable in-language), but a 4-byte move needs no
+such argument and keeps `sub`/`div` order-correct by construction.
+Guards, deadness and the one-shot arming are lever A's, verbatim, on
+parallel `fin_x0`/`fprod`/`fskip_write`/`farmed` state (an op is an int
+producer or a float one, never both). NOT admitted as a producer: an
+op whose dst is float-PINNED - the store is a register move into the
+pin and skipping it would strand it; moot today (only TEMPS forward
+and the C2a pool is locals-only), so it is an invariant to keep rather
+than a runtime check. Execution-proven by `g_jit_ffwd` (bumped by the
+emitted consumer); the `jit_ffwd_c4aii` test pins the chain AND an
+order-sensitive `a - b` / `a / b` shape, both sabotage-verified (the
+aside-move dropped = 10 suite failures; the operand roles swapped =
+11). Forcing `fskip_write` unconditionally survives suite + fuzzer -
+the SAME honest status as the int side's, recorded not claimed: the
+current pairs' temps are consumed exactly once, and the deadness test
+is what makes GROWING the whitelist safe. Measured (callgrind Ir/scale,
+OPT=1 ASSERTS=0): 54_mandelbrot **-17.4%**, 55_float_sum **-15.4%**,
+04_float_arith **-13.9%**, 40_math_builtins -0.6%; 46/01 byte-flat.
+55's hot path 67 -> 57 instructions per iteration.
+
+**C2b - A SECOND HOISTED BASE PER REGION (2026-08-04).** A region's
+second-best candidate (a dot product's other array - 46's $licm0
+beside b) hoists into a CALLEE-saved pair from r12-r15: leftovers
+after the int picks, else the two weakest pins DISPLACED when
+12 x (region element-ops) beats their whole-run counts (12 = the
+measured per-element nav saving; the initial 8x was INERT on 46 -
+g_jit_hoist2 == 0, the prove-it-ran rule). Callee-saved: helper calls
+preserve the pair (no epilogue re-derive, unlike r10/r11); frag_entry
+pushes it; regions share one pair (disjoint lifetimes). All hoist
+emit arms go through ONE `hoist_match(base, kind)` lookup; the
+preheader is a per-base `nav` lambda; ANY base's failed guard sends
+the whole region cold INCLUDING base1 (the body cannot partially
+deactivate - a documented trade, pinned). Proven by g_jit_hoist2 +
+a wrong-base-nav sabotage (3 cases diverge); the pair-not-saved
+sabotage is NOT harness-provable (gcc keeps nothing in r14/r15
+across jit_enter here) - recorded. Measured: 46_matrix_mult
+**-3.4%**/scale; 14/43/57/18/01/55 byte-flat.
+
+**`MoveV` IS CACHE-AWARE ON ITS SOURCE SIDE (2026-08-01,
+plans/jit-registers.md step 2b).** The register pool went four wide and
+still would not FILL, and the reason was not the ranking: an op whose emit
+touches a slot through MEMORY must DISQUALIFY it (`bad(...)` in
+`pick_cached_slots`) for the WHOLE fragment, because a pinned slot's live
+value is in a register and memory is stale until the next flush. `MoveV`
+did that to BOTH its slots, so one trailing `move r5 = a` - the arg-setup
+move in front of any call - cost `a` its register for the entire
+fragment. A four-accumulator loop pinned ONE register, its counter.
+The SOURCE side is now read from the register: `store_dst(sreg, dst)`, the
+same two-store used for any int result (or the release helper when the dst
+is ref-listed), and NO reference check on either side. **What makes that
+sound is that a MoveV contributes NO WEIGHT to the selection** - it does
+not call `usei`, only stops calling `bad`. A MoveV is the BOXED move, so
+the bytecode says nothing about the value's type and it can never be the
+evidence that a slot holds an int; contributing zero means a slot reaches
+the cache only when a genuine int op qualified it, and once it has, every
+write to it in the run is an int write - so the value the MoveV reads
+really is an int. The DEST stays memory-only for the mirror reason: a
+MoveV can write ANY type, so a pinned dst could silently stop holding one.
+Measured (callgrind Ir, `OPT=1 ASSERTS=0`): 01_while_loop **-5.92%**,
+07_nested_loops **-5.43%**, 03_int_arith **-4.00%**; everything else
+within +-0.09% (43_sieve +0.09%, 46_matrix_mult +0.05%, the call and
+callback benches exactly neutral). `MoveV` was picked first because
+arg-setup moves surround every call; the OTHER `bad()` sites are the same
+kind of opportunity and the same treatment applies - each needs its own
+argument for why a pinned operand is type-safe there.
+
+**LEVER A - ADJACENT DEAD-TEMP FORWARDING (2026-08-03,
+plans/unboxing.md).** A whitelisted int PRODUCER (LoadElemInt,
+LoadElem2Int, the specialized IntBin RR/RI family) immediately followed
+by a whitelisted CONSUMER (the RR/RI family, IntAddStep) reading its
+TEMP dst hands the value over IN RAX: the consumer skips the slot load
+(a COMMUTATIVE op with the `b` operand forwarded SWAPS the operand
+roles - rax = b OP a - instead of moving RAX aside; only sub pays a
+mov), and when the temp is provably DEAD after the consumer and not
+ref-listed, the producer skips the two-store entirely. Deadness comes
+from **`jit_fwd_info`** (codegen.cpp/.h) - the E1 liveness machinery
+(visit_use_def / visit_pc_fields / handler absorption) run at JIT time
+on the FINAL post-splice code, so jit.cpp grew no second per-op table;
+building it found E1's handler absorption EMPTY since #78 step D
+(PushHandler.target went -1; now collected from handler_sites - fixed,
+conservative direction, measured neutral). Guards: same run, adjacent
+pcs, consumer not a branch/handler target or entry pc, TEMPS only, no
+cache barriers; a producer's SLOW tier reloads RAX on its rejoin (the
+helper's status clobbers it), and a REF-LISTED dst keeps its write with
+the reload in store_dst's COLD ref arm only - the v1 hot-path reload +
+move-aside MEASURED the whole yield away (+2 Ir/iter on 46 against the
+predicted -2; the scale-delta A/B caught it, the distrust-a-surprising-
+result rule in action). The `jit_fwd_consumer` CONTRACT: every op it
+accepts must honor `g_fwd.in_rax` in its emit - grow both sides in the
+same change. skip_write is defense in depth today (forcing it survives
+suite + fuzzer: current pairs' temps are consumed exactly once); it is
+what makes GROWING the consumer whitelist safe (a counted loop's BOUND
+temp is live every iteration). **And it was INERT until 2026-08-04 for
+a reason that had nothing to do with ref_slots: `visit_use_def` did not
+know the B1/B2 SPECIALIZED family, so at JIT time - the only place that
+family exists - every op was a use-def BARRIER and the liveness read
+`all` (see THE AUDIT-TABLE STAGE TRAP below).** Execution-proven by
+`g_jit_fwd` (bumped
+by emitted consumers; the jit_fwd_deadtemp test pins the chain, the
+matmul shape, and the slow-path rejoin - all sabotage-verified).
+Measured (callgrind Ir, OPT=1 ASSERTS=0): 46_matrix_mult -2.19%/iter,
+14_array_subscript -1.2%/iter, 07_nested_loops -2.83%, 03_int_arith
+-1.36% whole-program; the rest <= +0.04% (link noise per the -nj
+control). The write elision is throttled by ref_slots' conservatism -
+narrowing it is C3 (plans/typed-invariant-arrays.md).
+
+**C1 - PER-LOOP NAVIGATION HOISTING (2026-08-03,
+plans/typed-invariant-arrays.md - the typed-invariant staircase's first
+step).** A loop's element ops re-derive the base's navigation EVERY
+element (type tag, slice flag, shobj, kind, data/finish, count) for a
+base that cannot change inside the loop. C1 is LOOP VERSIONING:
+`jit_hoist_pick` finds a backward branch's REGION [T, L]
+(innermost-first) whose ops are all on a read-only-FOR-STORAGE
+whitelist - no calls, no boxed PMFs (TypeArr::add mutates), but PLAIN
+element stores are admitted (they never move a non-slice base's
+storage; growth is a builtin call, refused) - with no jump into the
+region from outside, no entry-stub/handler pc inside, and one
+consistent-kind LOCAL base never defined in the region. The PREHEADER
+(bytes before label[T] - back edges target the label, so only the
+fall-through entry pays) verifies type/non-slice/kind once and derives
+(data, count) into **r10/r11 - CALLER-saved**, so the N5 pool is
+untouched (two earlier designs died by measurement: run-scoped gating
+fired on zero benches - a post-#56 run spans the whole function, calls
+included - and reserving callee-saved regs cost every OTHER loop in
+the fragment two pins, 43_sieve +3.3%). Any helper call inside the
+region clobbers r10/r11: `emit_call_epilogue` - the choke point all 83
+helper-call emissions pair through - re-derives both when a region is
+active (via RCX; RAX carries the helper's status). A failed preheader
+guard jumps to a COLD copy of the region alone (the ordinary emission,
+emitted after the run; region-internal branches patch against its own
+labels, exits rejoin the shared stream) - never a mid-loop bail, and
+deletion needs no interpreted original. The hoisted element forms:
+LoadElemInt/Float = bounds-vs-r11 + read-off-r10; the elem2 OUTER
+(kind general, byte-length count) = imul+bounds+lea, rejoining the
+common row section. Execution-proven by `g_jit_hoist` (the emitted
+preheader bumps on success; refusal shapes assert ZERO) +
+MYLANG_HOISTDBG=1 (per-region refusal reasons, the DELAUDIT pattern).
+Sabotage-verified: the slice guard (a runtime slice read the parent's
+elements), the def scan (a mid-loop rebind kept stale registers), the
+epilogue re-derivation (ASan SEGV - clobbered r10 as a data pointer).
+Measured (callgrind Ir, OPT=1 ASSERTS=0, scale-delta):
+46_matrix_mult **-12.0%**/iter (~89.5 -> ~78.7), 14_array_subscript
+**-15.9%**/iter; everything else within +-0.01% incl. 15 (a runtime
+slice base - the cold twin serves it at no cost).
+**C1b - the STORE side (same day).** A region that STORES to its base
+(`HoistRegion::has_store`) gets three more preheader guards - const
+slot, readonly, has_slices, all region-stable - and a ONE-SHOT hash
+invalidation there (hash_valid=0 early only means "recompute later",
+so the per-element store needs neither the shobj nor a third
+register): the element is bounds + raw write. The store guards are
+emitted ONLY for storing regions - unconditionally they would send a
+read-only loop over a CONST base cold, losing the read hoisting. Plus
+MULTI-REGION (greedy innermost-first, non-overlapping, r10/r11 reused
+across disjoint regions - a one-region pick served only 43's tiny fill
+loop). Measured: 14_array_subscript a further **-29.0%**/iter
+(cumulative -40% across C1+C1b); 46/15/18/01 neutral. 43/56_sieve
+STILL do not move and the mechanism is live-counter-proven (the
+ordinary #92 tier serves their 3.1M stores; g_jit_hoist 0): their
+arrays are BOOLS and the pick stamps StoreElemInt candidates kind
+INTS - the Instr does not carry the element kind. **C1c LANDED (same
+day, design b - maintainer's pick):** a compile-time ELEM-BOOL hint in
+StoreElemInt's previously free opflags bit 6, stamped when a PLAIN
+bool-LITERAL store compiles (the checker rejects int->bool, so the one
+mislabel - #96's bool into an int-joined array - just fails the kind
+guard and goes cold: ADVISORY, semantics never depend on it; no .myv
+bump - the opflags byte was always stored whole). The pick maps a
+hinted store to kind 3: the preheader guards kind_bools, the count is
+BYTES, the hoisted store is a byte write of dil (only 0/1 LITERALS
+reach StoreElemInt on bools). Measured: 43_sieve **-45.3%**/scale,
+56_sieve_bool **-44.3%**; 46/14 byte-identical; the stride sabotage
+(8-byte stores into the byte array) died as an ASan SEGV. **The READ-side
+hint landed (same day):** the truth source moved to the inferencer -
+`Subscript::elem_bool`, stamped beside base_array from the base's
+static type and copied by clone(); the STORE site switched to it too
+(one source of truth, no #96 mislabel). LoadElemInt carries the hint,
+kind 3's hoisted read is a movzx byte (stride sabotage-verified), and
+the former store+read kind CONFLICT now agrees and hoists both ways
+(the pinned test flipped). The C1b sabotages each
+required defeating a fresh shape-eater first: a bare `runtime()`
+argument is DYN, which lowers `arr[j] = n` to StoreElemValue - no
+candidate, a vacuous case - `int(runtime(5))` keeps the store
+StoreElemInt.
+**C1d - the FUSIONS as candidates + TEMP bases (same day).** Three
+unlocks, each found by chasing where the previous one's reach ended:
+(1) `JumpUnlessElemInt` (the fused sieve test) is a candidate - its
+base/idx/hint ride the mutated-in-place load's own fields - and the
+hoisted form lives in the SHARED `emit_elem_int_read` (bounds-vs-r11 +
+byte-or-int read off r10; declines land on the caller's conveying slow
+tier, which reads memory). (2) `ForStepElemInt` is a candidate (base =
+b_dual_lo) - but the fusion COPIES the step's struct, so the load's
+ELEM-BOOL hint must TRANSFER by hand after set_b_dual (which clears
+b's flag bits; sabotage: without it the pick stamps kind ints, the
+kind guard goes cold, the counter assertion catches it); its hoisted
+form skips the base gate entirely (the preheader proved it - and
+nothing bail-able precedes the step, so no double-step hazard, no
+SLOW-B) and the post-step read is bounds + read, declining to the
+existing jit_elem_int_value tier. Its old def list marked `target` - a
+BRANCH PC, not a slot - as a def (harmless-looking, but a pc-numbered
+slot was spuriously killed as a candidate); fixed. (3) **TEMP bases
+are admitted**: a foreach-over-array snapshots the container into a
+TEMP, so every foreach loop has one - N5's temp hazard (eager
+entry-load + exit-FLUSH) does not apply to a base that is only READ at
+the preheader, the def scan still kills an in-region rebind, and an
+aliased store cannot move the storage (#92's has_slices rule). Also
+whitelisted: `DictLoadInt/Float` - strictly weaker than the admitted
+DictStore (a vivify mutates the dict's own nodes, never an array's
+vector) - which unblocked 68_nested's ForStepElemInt regions.
+Measured (callgrind Ir/scale, OPT=1 ASSERTS=0): 57_bool_reduce
+**-41.6%** (360.6M -> 210.6M), 18_foreach_array **-37.1%** (the
+temp-base unlock), 56_sieve_bool **-24.8%**, 43_sieve **-18.2%**
+(their count loops joined); 68_nested exactly neutral (its foreach
+arrays are tiny); 46/14/01/02/09/15 byte-flat per scale.
+**C1e - the hoisted-COMPOUND store (same day; the family's last
+rung).** The hoisted store arm serves `a[i] OP= v` too: divisor
+0/-1 guards (before bounds - a div0 store must throw in the helper
+WITHOUT storing), bounds-vs-r11, then the RMW via `mov rcx, r10` so
+the ordinary tier's [rcx+r9*8] tails serve verbatim - minus the
+per-element hash store (preheader, once) and the nav. Hint-3
+compounds never hoist (compound-on-bools is compile-unreachable).
+Execution-proven by the arm's OWN `g_jit_hoist_rmw` (g_jit_store_fast
+counts the ordinary tier too - it cannot prove this arm). Corpus
+byte-flat (no bench compounds into an element); a 1M-compound-store
+probe reads -29.5% (~19 Ir/store). The C1e divisor test EXPOSED a
+pre-existing engine-uniform hole, since FIXED - see the #103
+paragraph below. Next on the staircase: C2/C3 per the plan.
+
+**#103 - INT_MIN / -1 THROWS (2026-08-03, maintainer ruling:
+like division by zero - and NEVER via a signal handler).** It used to
+be UB: TypeInt::div/mod and the VM store bodies raw-divided with only
+a zero check (-fwrapv covers +,-,* only; x86 idiv raises a hardware
+#DE), so `(1 << 63) / -1` SIGFPE'd EVERY engine including the
+parse-time const-fold. Now `check_int_div_overflow` (bitops.h - the
+shift helpers' home, included by all three TUs) throws the catchable
+**InvalidValueEx("integer overflow in division")** at the five C++
+sites: TypeInt::div/mod, vm_num_binop's int fast path, the VM element
+-store compound switch, the interpreted IntBin div/mod (via vm_raise),
+and TypedScalarExpr::eval_int (divisor-span carets, #76). `% -1`
+throws too - one uniform rule (mathematically the remainder would be
+0; uniformity chosen, C#'s behavior). The JIT needed exactly ONE new
+emission - IntBin div/mod's inline idiv (every OTHER emitted division
+already carried explicit 0/-1 pre-checks declining to the now-fixed
+helpers) - and its COST WAS DRIVEN TO THE FLOOR by measurement: the
+first version's second compare+branch per division read +3.4%/+4.8%
+Ir on 03_int_arith/44_primes_sqrt, so (a) a LITERAL divisor now
+decides at COMPILE time and an ordinary one emits NO runtime checks
+at all - not even the zero test the pre-#103 code ran on literals, so
+03 lands at **-3.4%** vs pre-#103 - and (b) a SLOT divisor pays ONE
+gate: `lea rdx,[rcx+1]; cmp rdx,1; ja .div` catches 0 and -1 in one
+branch, the cold block (0 -> JR_DIV0; -1 -> the INT_MIN compare, the
+new **JR_DIV_OVF** kind) FALLING THROUGH into the division for a
+legitimate x / -1 - 44 lands at **+2.4%**, the +1-instruction floor
+for an explicit check. The FOUR copies of the kind->exception ternary
+collapsed into ONE `vm_jit_raise_kind_new`. IntModRI / the
+IntAddModRI fusion EXCLUDE an imm -1 at selection (their handlers are
+uncheck-fast; `% -1` falls to IntBin's checked path). Pinned by 5
+five-mode tests (div, mod, catch + the /-1-still-divides case - which
+exercises the cold fall-through - the element compound path, the
+fully-const BUILD failure) and the C1e -1-guard case now asserts the
+InvalidValueEx (previously sabotage-unprovable - the helper crashed
+too); the guards sabotage-verified on the final shape (each drop = an
+FPE abort). README documents the rule under Integer.
+**The -1 REFINEMENT (same day, maintainer-directed):** a runtime -1
+divisor no longer declines WHOLESALE anywhere - only the ONE dividend
+that overflows does. All four decline-based tiers (the boxed int-int
+inline tier, the ordinary + nested element-store tiers, the C1e
+hoisted arm) now use IntBin's shape: the hot path is the single
+lea/cmp/ja gate; the cold side declines 0, then reads the ACTUAL
+dividend - rax for the boxed tier, the ELEMENT for the store tiers
+(which is why the store gates moved AFTER their kind proof; the
+nested tier's cold path must not clobber rcx = &row, so it forms
+&elem in rdx with a TWO-sided pointer bounds compare - a negative
+index wraps below data) - and declines ONLY INT_MIN; an ordinary
+x / -1 rejoins the native path. Proven by counters (the #95 tests'
+fast counts ROSE by exactly the formerly-declined stores; the C1e
+INT_MIN case now requires rmw >= 1 - the sane elements before the
+throwing one run the hoisted RMW) and by four cold-check sabotages
+(each skip = an FPE abort in -rt). Measured: element-compound and
+boxed /-1 probes **-52.6% / -54.9%** whole-program; 03/44 byte-flat.
+MEASUREMENT-HARNESS NOTE: shopping/phonebook fed </dev/null spin
+forever on EOF re-printing their menus - a `timeout`-truncated
+JIT-on-vs-off byte compare then "diverges" purely by SPEED; feed `q`
+(they quit cleanly) before reading such a diff as real.
+
+**N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to `MAX_CACHED` hot
+int-scalar slots are pinned in `r12`-`r15` per fragment
+(`pick_cached_slots`, jit.cpp):
+loaded ONCE at the fragment head (the native back edge jumps AFTER the
+entry loads, keeping them live across the loop), read/written straight
+from the register (`read_slot`/`write_slot`/`load_operand` are all
+cache-aware), and FLUSHED - the `t_int` singleton (held in rsi) to the
+type word + the register to the payload, two stores - at EVERY exit/bail
+(`flush_cache`, called by `exit_pc`). The accumulator/counter locals of
+an int loop never touch memory in the steady state (`01_while` 0.098x
+same-binary at the loop-bound extreme, scale 200 best-of-3). **SOUNDNESS - only resolved
+LOCALS are cached, never TEMPS.** A slot qualifies iff every use in the
+run is an int-scalar op AND it is a resolved local (`< slot_count`). A
+TEMP (`>= slot_count`) is scratch the VM REUSES across run boundaries -
+an int scratch inside one JIT run, a `foreach` general-array SNAPSHOT /
+dict-iterator base / slice temp between runs - so the eager
+entry-load/exit-flush (which assumes the register OWNS the slot for the
+whole fragment) would overwrite a temp still LIVE as an array with the
+int register + the `t_int` tag, corrupting the snapshot -> a later
+`LoadElemValue` `InternalErrorEx`. A resolved local has a stable identity
+and (counted only via proven-int ops) a stable int type. This corruption
+was a `tests/nested_fuzz.py` find, NOT a `-rt` one (the aliasing needs a
+specific temp-slot coincidence a hand-written test rarely hits), pinned
+by two `jit:` regression tests. The classifier's operand extraction must
+EXACTLY match the emitter's per-op layout: an earlier `IntAddStep`
+mismatch counted a literal rhs VALUE as a slot index (a phantom that
+could cache/corrupt whatever slot it collided with), and the
+shift-by-register handler read its count raw - both fixed. The only raw
+`slot_addr` reads left are on `bad()`-disqualified `LoadElem` base/index
+slots (never cached). See plans/native-aot.md.
+
+**N6a - NATIVE MATH BUILTINS (`MathFnV`) + the REF-STORE FIX.** A typed
+math-builtin (`sqrt`/`sin`/`cos`/`log`/`exp`/`pow`/... - `MathFnV`) is now
+JIT-eligible: `sqrt`/float-cast lower to a pure SSE `sqrtsd`/`cvtsi2sd`, the
+transcendentals to a libm CALL. **The call is a bare 5-byte `E8 rel32`, no
+NOP padding** - patched after mmap to libm DIRECTLY (the anon `mmap(nullptr)`
+lands within +-2GB of libm - MEASURED, and how the kernel lays anon maps
+next to the loaded libs) or, out of range, to an out-of-line TRAMPOLINE in
+the same buffer (`movabs rax,fn; jmp rax`, always reachable - also the
+arm64-`BL`-veneer shape). **THE LOAD-BEARING FIX** (found because callgrind
+showed the interpreter STILL running bench 40 under JIT-on): a ref-listed
+scalar store (`store_dst`/`emit_float_store` - a reused temp that later
+holds a string, so it CAN hold a reference) used to `cmp type == t_int/
+t_float; jne BAIL`. That bailed on a TRIVIAL current value too (`none` on
+iteration 1), so the fragment bailed at the first store and the interpreter
+ran the WHOLE loop - the native code was UNUSED, and every "native builtins
+are perf-neutral" measurement was interpreter-vs-interpreter. The fix
+(**approach A**: a compile-time-proven native path, never a runtime bail):
+test `type->t >= t_str` (a REAL reference - offset + `t_str` value probed
+into `JitLayout`); a reference calls a noexcept C++ helper (`jit_put_int`/
+`jit_put_float` - release + store, STAY native, cold/once-per-temp), a
+trivial value takes the fast two-store. Effect (same-binary JIT off vs on):
+the JIT was silently bailing across the suite - `08_func_call` **0.49x**,
+`07_nested_loops` **0.58x**, `40_math_builtins` **0.72x** (my/py 5.6x ->
+**7.7x**), `49_autoconst_fold`/`51_purefunc_fold` ~0.7x, broad -3-7%; no
+regressions. This is the model for the whole JIT (approach A, see
+plans/native-aot.md): call the SAME C++ the interpreter calls (arrays/dicts/
+exceptions) from native, prove handling at COMPILE time, and DELETE the
+interpreted original - no double copy, no runtime re-interpret. **Landed on
+that model:** **`jit_raise`** - an OOB / negative-shift fragment stores a
+`JitRaiseKind` to `g_vm_jit_raise` + exits to the op's pc, and `EnterNative`
+raises via `vm_raise` (caret from the loc table, catchable) instead of
+re-interpreting; and **delete-originals** - a run that is `op_fully_native`
+(every op a non-throwing int op) AND single-entry has its interpreted ops
+DROPPED from the bytecode (the remap maps every run pc to the EnterNative),
+so `-vd` of a native int loop is just `enter.nat` (`-vdj` shows the fragment)
+- a `.myv`-ready no-double-copy shape. A HELPER CALL clobbers r10/r11 (the N5
+cache), so the active cache regs are pushed/popped around EVERY helper/
+libm call (a nested_fuzz-found reg-clobber; a float/libm run caches nothing,
+which masked it at first). The SLOTS BASE needs no such save - see the
+register plan below.
+**CONTAINER-STORE helper ops (LANDED):** `StoreElemInt`/`StoreElemFloat`
+(`a[i] = v` / `a[i] OP= v`, a flat mutable int/bool/float array, LOCAL base)
+are JIT-native - the fragment marshals base `LValue*` + (cache-aware) index +
+value and CALLS `jit_store_elem_int/float` (vm.cpp), which run the SHARED
+`vm_store_elem_*_body` (`ML_ALWAYS_INLINE`, the interpreter's EXACT store:
+COW + bounds + the universal `vm_subscript_store` fallback). The store no
+longer SPLITS the run - the whole matrix/sieve WRITE loop iterates natively.
+**A raise is thrown LOC-LESS** (the helper runs the body with a NULL chunk),
+caught into `g_vm_jit_exc` (an owned `RuntimeException`; complements
+`g_vm_jit_raise`, a KIND a fragment signals itself), returned non-0; the
+fragment `test eax; jnz` exits to the op's pc and `EnterNative` re-raises it,
+stamping the caret from the LIVE chunk's loc table. A fragment CANNOT bake a
+chunk pointer: `codegen_chunk` builds the chunk on the STACK and `std::move`s
+it out AFTER `jit_compile_chunk`, so `&chunk` dangles (an ASan SEGV the
+OOB-store regression test caught). Measured (same-binary before/after, both
+JIT-on): 43_sieve 0.63-0.69x, 14_array_subscript 0.74-0.78x, 46_matrix 0.82x,
+56_sieve_bool 0.79-0.90x (~1.3x on write benches); suite geomean 0.97-0.99x.
+**#92 - the INLINE element-store tier + PREP (2026-08-02).** The
+StoreElemInt/Float helper call above redid the whole managed model PER
+STORE - type tag, storage kind, const + readonly, negative wrap, size()
+twice, slice check, use_count(), the store, invalidate_hash() - measured
+at **85 Ir to store one bool**, 66% of 43_sieve (the suite's worst bench,
+27.2x C++). The guards + the raw store are now EMITTED INLINE for a plain
+(aop invalid) int/bool store, the helper kept as the slow tier; every
+guard DECLINES to it, so the negative wrap, OOB caret, COW, compound ops
+and floats stay byte-identical. Measured: 43_sieve **-61.3%** Ir
+(27.2x -> 10.5x C++), 14_array_subscript **-47.9%** (10.0x -> 5.2x);
+88.9 Ir saved per store, the helper GONE from the sieve's profile (82.8%
+native).
+**THE GUARD IS `has_slices`, NOT `use_count() == 1`** - a MoveV-copied
+dead temp keeps the refcount at 2 for essentially all array code, so a
+sole-owner guard made the first version DEAD (caught by the emitted-code
+counter `g_jit_store_fast`, the prove-it-ran rule). `clone_aliased_slices`
+iterates `shobj->slices`, a no-op when no slice VIEWS exist - so
+`SharedObject::has_slices` MIRRORS `!slices.empty()`, every set mutation
+funneled through `slices_add`/`slices_del` (one iterator-erase in
+`clone_aliased_slices` refreshes it itself), and the interpreted store
+body ML_CHECKs `mirror == !slices.empty()` on every store.
+**PREP - the COW clone as its OWN slow path, the store RESUMES native**
+(maintainer's design): the two COW guards (slice base / live views) jump
+to a stub calling `jit_store_elem_prep` - the interpreter's exact
+normalization (clone_internal_vec for a slice base, else
+clone_aliased_slices at the OVERLAPPED index only - cloning all slices
+early is observable via `intptr`, which the COW tests pin) - then jump
+BACK to the fast path's retry head. The interpreter pays the clone once
+and stores raw ever after; now so does the emitted code. Prep runs only
+AFTER the const/readonly guards (those throw WITHOUT cloning) and
+bounds-checks in C++ before cloning (an OOB store must not detach). The
+retry CANNOT spin: prep returns 0 only when `jit_cow_clean()` holds.
+Sabotage-verified: clone-skipped-belt-intact degrades to correct-but-slow
+(the helper's own clone takes over); readonly-guard-removed corrupts a
+const array (value-divergence caught); COW-before-readonly ordering runs
+prep on a must-throw store (the prep=0 assertion caught it - once the
+test's slice used a `runtime()` index, since literal-bound slices of a
+const FOLD at parse time and the first version was vacuous). `rsi` is
+RESERVED (the fragment's t_int); the value rides `rdi`.
+**#94 - FLOAT + BOOL PARITY (2026-08-02, maintainer-caught gap):** the
+store tier shipped int/bool-only and the nested read int-only - the float
+twins still paid the full helper per element. Now: StoreElemFloat takes
+the same guards with an SSE tail (`movsd [rcx+r9*8], xmm0`, value loaded
+via emit_float_load at the retry head since prep clobbers xmm0; prep is
+kind-agnostic and shared), LoadElem2Float mirrors the int navigation with
+float rows + `emit_float_store` (an INT row now takes the #95 cvtsi2sd
+PROMOTE arm - it was a listed follow-up), and LoadElem2Int
+gained the 1-byte BOOLS tail (byte count, movzx). `run_has_float` gained
+LoadElem2Float so r8 = t_float is live in its runs. The float kind
+guard's catching shape is MIXED rows (`[[1.0,2.0],[3,4]]` - the joined
+elem type is float while one row's storage stays flat INT, so the READ is
+LoadElem2Float over an int row); the pure-int-rows "promote" case reads
+through LoadElem2INT and only promotes at the multiply - another
+shape-eater, now listed. No suite bench exercises float element stores or
+nested float reads (parity + reach, like prep); 46/43 neutral.
+**#95 case 1 - COMPOUND element stores inline (2026-08-02):** `a[i] OP= v`
+(incl. the `a[i]++` lowering) is a read-modify-write on the fast path -
+same guards, then the element in RAX (hash byte invalidated FIRST so the
+shobj register frees; past the guards nothing faults) with add/sub/imul
+or cqo+idiv (quotient/remainder), floats via `xmm1 = elem OP xmm0`.
+Refused at EMIT time: float `%=` (an fmod libm call), a LITERAL 0/-1
+divisor (the helper runs the interpreter's exact C++ - the IntModRI
+convention). RUNTIME divisor guards (a slot rhs, div/mod only) decline on
+0 and -1, and are emitted BEFORE the prep jumps - a div-by-zero store
+throws WITHOUT cloning, so prep must not run first; the float zero test
+is `ucomisd` with a `jp` hop so a NaN divisor (unordered sets ZF) stays
+fast. A compound on runtime BOOL storage is COMPILE-unreachable (the
+store pins the base to array<int>), so the compound arm's ints-only kind
+guard is defense in depth. The KIND checks moved BEFORE the prep jumps
+for every arm (same invariant: prep must never clone a base the
+interpreter would fault on without cloning). All four guard families
+sabotage-verified; probing the bool shape exposed a PRE-EXISTING
+tw-vs-VM divergence (a bool literal stored into an int-JOINED array -
+tw threw, VM stored 1), since FIXED as #96 (maintainer-ruled VM-right):
+**a bool WIDENS into flat numeric storage** - 0/1 into ints, 0.0/1.0
+into floats, the promotion chain the decl/struct-field coerces already
+followed - at all three engine-SHARED value-entry points
+(flat_store_core, arr_append_fast, builtin_insert_arr; the JIT's inline
+arms keep their narrow t_int/t_bool guards and decline a bool to the
+helper, which widens). The reverse (an int into an array<bool>) stays a
+TypeError - a narrowing. README documents the rule; a 5-mode entry pins
+it, the tree-walker pass being the one that used to throw. No suite
+bench compounds into an element (reach + parity, like prep).
+**#95 case 2 - the NESTED store `a[i][j] = v` / `OP= v` inline
+(emit_store_elem2_inline).** The read side (#93) had its tier; the store
+paid the full helper. The fast shape: int k1/k2 SLOTS (boxed - type-tag
+guarded against rsi/t_int), outer non-slice non-readonly GENERAL array
+(the #93 navigation + byte-length bounds -> &row in rcx), row non-const
+non-readonly flat int/bool/float, value FITTING the row's kind (int row:
+t_int only - a bool does NOT fit, the interpreter's rule; bool row:
+t_bool; float row: t_float or t_int, which PROMOTES via cvtsi2sd). The
+row's COW pair routes to the SHARED jit_store_elem_prep on &row (rcx is
+kept alive until the cow guards; the retry re-derives everything).
+GUARD ORDER is the invariant: everything the interpreter throws on
+WITHOUT cloning sits before the prep jumps - row const/ro, the row KIND
+(a structs row's type error precedes any clone), the value-FIT
+(flat_store_core checks `fits` before COW), a compound div/mod zero
+divisor (apply_compound_op precedes the clone). Compound maps the Expr14
+op to the base op and shares the RMW tails; the FLOAT arm refuses
+div/mod at emit (a zero test on a maybe-promoted boxed value); a bool
+row refuses any compound. StoreElem2V joined `run_has_float` (the float
+arm reads r8) and the jit_op_nativized inline-tier acceptance (its
+helper legitimately starves, like BinOpV's). Execution-proven by
+`g_jit_store2_fast` with EXACT per-shape counts (the matrix builders
+use single-level stores, so the counter attributes cleanly); sabotage-
+verified: row has_slices (slice-oracle value + prep), the promote arm
+(count 32->24), cow-before-fit and cow-before-divisor orderings (prep=0
+fired), divisor guards (ASan FPE). The OUTER-readonly guard is SUBSUMED
+by the row's for every constructible shape (deep const freezes every
+level) - kept as defense in depth, recorded as unprovable in isolation.
+N-level CHAIN stores (StoreElemChainV) stay helper-only by decision:
+the walk is data-driven (a pooled step list), rare, and an inline loop
+over steps buys little - revisit only if a profile ever names it.
+**The codegen gap the float coverage EXPOSED (fixed):**
+`compile_float_expr` had no arm for a DEFINITELY-int SUBEXPRESSION -
+`as_float_operand` admits int LEAVES, but `row[j] = (j + 1) * 1.5`
+carries an int CHAIN, and since the boxed catch-all leaves a
+proven-float flat store to compile_float_stmt, the refusal escalated to
+a NotLoweredEx on the WHOLE enclosing loop: a legal, ordinary program
+REFUSED at compile time (the no-fail contract's other failure mode,
+same class as the fold_lvalue_reads bug). The int subterm now compiles
+via compile_int_expr into an int operand - every float reader
+(read_float_operand, emit_float_load) promotes an int at runtime;
+`definitely_int` gates it (a bool payload is not a float operand).
+Pinned by a 5-mode differential entry that fails as NotLoweredEx with
+the arm reverted (verified).
+**#95 cases 3 + 4 - the PROMOTE arm and the SLICE read arms
+(2026-08-02, completing the element-tier matrix):** LoadElem2Float's INT
+row promotes inline (`cvtsi2sd xmm0, [rcx+r9*8]` - the mixed-rows shape
+the helper used to serve), and SLICE bases read inline: the single-level
+LoadElemInt/Float slice arm and the nested read's OUTER-slice and
+ROW-slice arms (the outer arm rejoins the common row section, so
+slice-of-slices composes). A slice's elements live at `data + (off+i)`
+and its BOUNDS are the handle's u32 `len` - NOT the vector's size
+(probed as `JitLayout::arr_off_off/arr_len_off` beside `slice_off`); a
+negative index and bool/other-kind slices decline to the helper, as does
+the promote-under-slice combination. Execution-proven by
+`g_jit_elem_slice_fast` (single-level + row arms; the outer arm proves
+via `g_jit_elem2_fast` on an only-sliced-outer shape) with EXACT
+per-shape counts; sabotage-verified: the promote arm (16->0), the OFF
+addition in both the single and row arms (parent-element value
+divergence), and the LEN bound (a vector-size bound silently served
+`sl[len]` - count 17 and a missed OOB). The #56 slow-tier test's proof
+shape moved from the slice (now inline) to the NEGATIVE WRAP, which
+still declines. Measured (callgrind Ir, `OPT=1 ASSERTS=0` both sides):
+15_array_slice_readonly **-41.0%** (63.4M -> 37.4M - the per-element
+helper call gone); 14/43/46/18/01/16 all +-0.01% neutral, and the
+case-1/2 store restructure itself measured neutral-to-slightly-better
+against pre-#95 (43 -0.05%). With these, the element-tier MATRIX is
+COMPLETE: reads and stores, single and nested, int/bool/float, plain
+and compound, slice bases, COW-prepped - every cell either inline or a
+deliberate, documented helper decline (float `%=`, nested float
+div/mod, chain stores, bool slices, promote-under-slice).
+The **DICT store** `d[k] = v` / `d[k] OP= v` (LOCAL base) is the same shape -
+`DictStore` -> `jit_dict_store` (vm.cpp), which runs the interpreter's exact
+`vm_subscript_store`. The key/value are BOXED EvalValues in frame slots, so
+the fragment just leas their addresses (no marshaling; an EvalValue is the
+first `LValue` member); the base/key/value slots are DISQUALIFIED from N5
+register caching (a cached int key - a counter used as `d[i]` - would leave
+its slot stale). So a dict insert/update loop stays native instead of
+splitting at the store. Measured (`23_dict_insert`, resolved with the
+DETERMINISTIC callgrind I-count + a 25-run min+median after wall-clock noise
+first mis-read it as 0%): **~6.5% wall / 12% fewer instructions** - dispatch
+IS a real chunk of the dict tier, but the BIGGER headroom is the boxed-value/
+alloc model (`my/cpp` ~5x in `bench/cpp/` - the N7 arc), not dispatch.
+**`-vdj`:** decodes `push`/`pop`/`call`/`sqrtsd`/`nop`/`E8`-rel32/`lea`/`test`/
+group-1 `cmp`/`sub imm`, and shows big `movabs` constants in hex (a `call rax`
+had rendered as `dec rax`; a helper-call `lea rdi` had cascade-misdecoded as
+`mov edi`).
+
+**#55 STEP 1 — NATIVE `ReturnV` (plans/archived/native-call-impl.md).** A fully-native
+LEAF body's `ReturnV` runs IN the fragment instead of the interpreter: the
+fragment `flush_cache`s (so the result slot is in memory), then
+`call jit_ret(res_slot); ret`. **`jit_ret`** (vm.cpp, `extern "C" noexcept`,
+baked as a call target) reads the result from the CURRENT callee window via
+`g_current_ctx->frame` (the running `vm_run_chunk`'s ctx - set + restored per
+invocation by a `CtxGuard`; a builtin callback re-enters with the invoke ctx),
+then either **pops the in-VM frame** (`vm_frame_leave` - writes the parent's dst
++ sets the `g_vm_resume_chunk/pc` globals) OR, at a **BOUNDARY** frame
+(`g_vm_act->back_rec().boundary` - a `do_func_call`/callback callee), sets
+`ctx.flow` (the callback contract, exactly the interpreted ReturnV's two paths).
+It returns a resume **SENTINEL** (`static_cast<size_t>(-1)` in-VM, `-2` boundary
+- a pc no remapped chunk pc can equal); `EnterNative`, on the sentinel, switches
+`chunk`/`pc`/`code` to the parent, or `return`s to stop the invocation. A whole
+body that is a single fully-native run ending in `ReturnV` is a
+**`Chunk::native_leaf`** (fragment offset in `native_entry_off`; shown in `-vd`)
+- a LEAF (makes no calls, C-stack-bounded) a caller fragment can `call`
+directly (STEP 2). `ReturnV` is `jit_op_eligible` + `op_fully_native` (rets a
+sentinel, never an interior pc, so its interpreted original is deletable) + in
+`pick_cached_slots` (its result slot is an int use; a FLOAT result slot is
+always disqualified by the float op that produced it, so it is never int-cached
+here). Coverage: `g_jit_native_returns` (a `jit:` test asserts both the in-VM
+and the boundary path ran).
+
+**#55 STEP 2 — NATIVE `CallV` (plans/archived/native-call-impl.md).** A function->
+function direct call to a `native_leaf` runs as a native `call` from the caller
+fragment, not an interpreted CallV. **2.0 (ordering foundation):**
+`jit_compile_chunk` moved OUT of `codegen_chunk` for the precompile - `codegen`
+sets the `native_leaf` FLAG (`jit_chunk_is_native_leaf`, from ops) and takes a
+`jit` param, and `vm_precompile_all` codegens ALL bodies THEN jits ALL, so every
+callee's flag exists before any caller is jit'd (a caller bakes the callee
+`FuncDescriptor*` and loads its `native.base+native_entry_off` at RUNTIME - the
+flag is the only compile-time need). **2.1 (the call):** a `JitCtx` (slot->desc
+map, `global_slot_reassigned`, the chunk's own `caller_desc`) is threaded into
+`jit_compile_chunk`; `callv_native_ok` is the COMPILE-TIME gate (a plain CallV,
+write-once global slot, callee `native_leaf`, function caller); `op_run_eligible`
+folds it into run-building (since the MIN_RUN removal EVERY run forms, so the
+old call-bearing-run exemption — `run_has_native_call` — is gone; the boxed
+arg-setup MoveVs still split a call loop into short runs, each now a
+fragment). The emit: call **`jit_call_setup`**
+(vm.cpp - resolves the callee FuncObject from its global slot, `vm_frame_setup`
+with `ret_chunk = caller_desc->vm_chunk`, `ret_pc = pc+1`; catches
+StackOverflow/bind throw -> `g_vm_jit_exc` + null return); `test/jnz` (null ->
+`exit_pc` so EnterNative re-raises); load `callee->vm_chunk->native.base +
+native_entry_off` and `call` it directly (the callee's native ReturnV/jit_ret
+pops + writes OUR dst + rets a sentinel we IGNORE - a native_leaf never bails
+post-setup); epilogue. A call run is NOT N5-cached (`pick_cached_slots` -> {}),
+so args are in memory and no reload is needed; a call-bearing fragment is
+non-leaf (never native-CALLED), so its StackOverflow exit always returns to
+EnterNative. Layout offsets (`FuncDescriptor::vm_chunk`, `Chunk::native.base`,
+`Chunk::native_entry_off`) are probed in vm.cpp. C-stack is bounded (F2 v1):
+only LEAF callees are native-called, so a native call adds one fixed C frame; a
+recursive/non-leaf callee isn't `native_leaf` -> interpreted CallV. Coverage:
+`g_jit_native_calls` (a `jit:` test). Measured ~9% on an all-calls microbench
+(the win is dispatch removal; `vm_frame_setup` is shared with the interpreted
+path). **`-vd`/`-vdj` are FAITHFUL:** `disassemble_program` (disasm.cpp)
+replicates the precompile's two-pass + `JitCtx` on throwaway chunks (pointing
+each `desc->vm_chunk` at its local chunk for the gate, save/restored after), so
+a native call shows as `enter.nat` at the caller's call site and `-vdj` decodes
+the full sequence (`call jit_call_setup` / `test`+`jne` / the
+`vm_chunk`->`native.base`+`entry` loads / `call rcx` / epilogue). **v1 non-native
+cases (always a correct interpreted fallback):** a call FROM MAIN (main has no
+stable descriptor for the record's ret_chunk). `CachedCallV` is excluded too,
+but MOOT (its callee is a cacheable RECURSIVE func, never a `native_leaf`). A
+CONST-ARG call is NOT a gap: a pure callee folds at compile time (optimal - no
+call), an impure caller / runtime arg still native-calls, and a native_leaf
+rarely specializes to a clone (const-arg propagation on a small int body doesn't
+shrink it) - all verified.
