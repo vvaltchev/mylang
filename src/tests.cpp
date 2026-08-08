@@ -1139,6 +1139,53 @@ static const std::vector<test> tests =
     },
 
     {
+        /*
+         * G1: the emitted inline push copies BOTH iterator watermark bases
+         * into the call record - as one qword, since the two u32s are
+         * adjacent on each side. Catching a half-copy needs the SAME record
+         * slot reused under two DIFFERENT correct bases, which no ordinary
+         * program produces: the slice is sized at FRAME push by the chunk's
+         * own count, so within one frame the watermark never moves.
+         *
+         * So `A` owns a dyn foreach (dyiters_n is higher for as long as A
+         * runs) and `B` owns none; both call the same zero-arg CLOSURE, whose
+         * record therefore alternates between two legitimate bases at the
+         * same depth. A push that carries only the low half leaves the other
+         * one behind and pop_window's hardened audit sees
+         * dyiters_n != rec.dyiter_base (watched failing).
+         *
+         * The closure is what makes the call reach the push at all: it cannot
+         * be inlined or folded away, it takes no argument (so the callee is
+         * fast_bind), and the loop's repetition is what frees a record for
+         * REUSE - a first descent always declines to the C++ tier.
+         */
+        "jit: the inline push carries both iterator watermarks (G1)",
+        {
+            "var g = 7;",
+            "func mkq() {",
+            "    var z = 1;",
+            "    return func[z]() { return z + g; };",
+            "}",
+            "var q = mkq();",
+            "func A(dyn m) {",
+            "    var t = 0;",
+            "    foreach (k, v in m) { t = t + q() + v; }",
+            "    return t;",
+            "}",
+            "func B() {",
+            "    var t = 0;",
+            "    t = t + q();",
+            "    t = t + q();",
+            "    return t;",
+            "}",
+            "var dyn mm = {\"a\": 1, \"b\": 2, \"c\": 3};",
+            "var s = 0;",
+            "for (var i = 0; i < 40; i++) { s = s + A(mm) + B(); }",
+            "assert(s == 1840);",
+        },
+    },
+
+    {
         /* an OOB index inside a JIT array-read run throws OutOfBoundsEx
          * (the fragment bails; the interpreter re-runs the load) with the
          * byte-identical caret. */

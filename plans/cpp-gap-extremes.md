@@ -808,3 +808,145 @@ It is a pure refactor - the same object, the same read - so there is no new
 guard to break. The sabotage that DOES mean something is a mix-up between
 the outer array and the sub-array, and the suite catches that hard: aborting
 with exit 134 under the hardened debug build.
+
+## G1 increment 1 LANDED 2026-08-07 - and the PREPARATION's split was wrong
+
+The first thing this increment produced is a CORRECTION. The G1 PREPARATION
+above reported "77 emitted instructions per indirect call", split as record
+fill 32 / status dispatch 20 / setup 8 / stack switch 8 / restore 7. Counted
+again from `-vdj` against the executed path, and cross-checked against
+callgrind (the probe's caller fragment costs 159 Ir per iteration, of which
+~23 are the loop's own arithmetic), the real split of the caller side is:
+
+    guards (no mutation yet)   63   (46%)
+    record fill + mutations    51   (37%)
+    native-stack switch + call 15   (11%)
+    status dispatch             5    (4%)
+    epilogue (2 type tags)      2
+                              ----
+                              136
+
+Two corrections matter for the arc:
+
+- **The GUARDS are the biggest phase, not the record fill.** 63 instructions
+  re-prove, on every call, facts that are properties of the callee chunk and
+  cannot change between iterations.
+- **The status dispatch is NOT 20 executed instructions - it is 5.**
+  `JIT_RET_SENTINEL == -1` is the NORMAL return, so the hot outcome is
+  `cmp/jne/movabs/dec/jmp`; the other ~15 are the two cold arms laid out
+  inline. Increment 2 as written ("move the cold arms out of line") therefore
+  buys ~ZERO Ir and only I-cache, which - per the guard-elision ceiling rule
+  in CLAUDE.md - is not something to push on instruction-count evidence.
+
+### What landed: four precomputes, no new proof obligation
+
+Every piece replaces a per-call recomputation with a value that was already
+derivable, so none of them needs a new soundness argument:
+
+1. **`Chunk::plain_frame` replaces three dword compares** (n_dict_iters,
+   n_dyn_iters, n_trys) with one byte test. That flag already means exactly
+   "owns no per-frame side state", and the POP side has trusted it since
+   2026-08-01; this is the identical proof one step earlier. **-4**
+2. **`VmStackSeg::cap_slots`.** The segment fit test compared BYTE extents:
+   imul the slot sum by 48, then rebuild the vector's length from its two
+   pointers - which needed a second register spilled. `slots` is sized once
+   and never resized (windows hold raw pointers into it), so its capacity is
+   a constant of the segment; the test is now one compare in slot units.
+   **-5**
+3. **`diter_base` + `dyiter_base` in ONE qword move.** Both are adjacent u32
+   pairs (the activation's two mirror counters, the record's two bases), so
+   the copy is exact on this little-endian target. The emitter CHECKS the
+   adjacency rather than assuming it and falls back to the two-move form.
+   **-2**
+4. **The `xor r11d, r11d` for the arg-zeroing constant is emitted only when
+   there are args.** A zero-arg callee had it dead. **-1**
+
+### Measured (callgrind Ir, `OPT=1 ASSERTS=0`, both binaries this session)
+
+The probe (`q_proto`: one indirect call per iteration to a zero-arg closure
+whose body is `return z`) is 2M calls:
+
+    caller fragment   318.0M -> 294.0M   -7.55%   (159 -> 147 Ir/iter,
+                                                   i.e. exactly -12 instrs)
+    callee fragment   168.0M -> 168.0M    0.00%   (the pop is untouched)
+    whole program     496.1M -> 472.1M   -4.84%
+
+bench/:
+
+    10_recursion_deep    372.9M -> 358.1M   -3.99%
+    11_closure_counter   415.7M -> 403.7M   -2.89%
+    63_closures          497.9M -> 486.5M   -2.29%
+    76_funcval_dispatch  898.9M -> 887.9M   -1.22%
+    09_fib_recursive      88.3M ->  88.1M   -0.14%
+
+Flat to the last digit, as they must be - none of them reaches this push:
+08_func_call, 12_higher_order, 34_sort_custom_cmp, 35_map_filter,
+67_make_dict (the callback benches enter fragments through lever 2's
+VmInvoker), 01_while_loop, 43_sieve, 46_matrix_mult, 54_mandelbrot,
+24_dict_lookup. No vm_dispatch layout tax.
+
+### Sabotage - each one watched failing
+
+- **Remove the `plain_frame` gate** (every callee takes the inline push):
+  `-rt` **aborts, exit 134**, `jit_dyiter`'s
+  `dyiter_base + i < dyn_iters.size()` assertion - a callee owning dyn
+  iterators got no slice.
+- **`cap_slots` wrong in C++** (x4): the ML_VM_CHECK added at `push_window`
+  fires, so the field cannot drift from `slots.size()`.
+- **Point the emitted fit test at `seg_top` instead of `seg_cap`** (it then
+  always declines - silently correct, only slower): caught by the EXISTING
+  coverage tests, `jit_sync_inline_call: inline path DID NOT RUN`, 1747/1750.
+  That is the execution proof for this one: a wrong offset cannot hide behind
+  a correct result.
+- **Copy only the low half of the fused watermark move**: needs a new test
+  (below) - and with it, `-rt` **aborts, exit 134**, `jit_ret_audit`'s
+  `dyiters_n == rec.dyiter_base`.
+
+### The new test, and why it had to be built the way it is
+
+A half-copy of the watermark pair is invisible to every existing program,
+because the iterator slice is sized at FRAME push from the chunk's own count:
+**within one frame the watermark never moves**, so the stale value and the
+live value are equal and nothing can tell them apart. The catching shape needs
+the SAME record slot reused under two DIFFERENT correct bases, so
+`jit: the inline push carries both iterator watermarks (G1)` alternates two
+depth-1 callees at the same depth - `A` owns a dyn foreach (dyiters_n is
+higher for as long as it runs), `B` owns none - both calling one zero-arg
+CLOSURE.
+
+Three shape-eaters had to be defeated first, and they are the reason the test
+looks contrived. The callee must be a **closure** (a named function is folded
+or inlined away) taking **no argument** (a coercing int/float param makes
+`fast_bind` false, which declines the whole inline push), and it must be
+called from a **loop** - the record-reuse guard `rec_n != recs_high` means a
+FIRST descent always declines to the C++ tier.
+
+### The reach measurement this produced, which the arc should keep
+
+While hunting for a shape that would exercise the fit test, an instrumented
+`g_jit_sync_inline` showed **zero inline pushes for ordinary recursion**:
+
+    q_proto (closure called in a loop)     2,000,000 inline pushes
+    down(n) with an int param                      0
+    down(dyn n)                                    0
+    zero-arg self-recursion, 3000 deep             0
+
+Two independent gates cause this: `fast_bind` is FALSE for any callee with an
+`int`/`float`-declared param (they need a coercion, not a copy), and the
+record-reuse guard declines a monotonically-deepening call chain. So the
+emitted push - the thing this increment made cheaper - serves the
+**repeat-call** shape, not the **descend-deeper** shape. That is a bigger
+finding than the increment: it says the 219 Ir figure the arc quotes is the
+INLINE path, and a large fraction of real calls never reach it at all.
+
+### What is left, honestly sized
+
+The guard phase is still 51 instructions and most of it is re-proving
+callee-chunk properties. The obvious next increment is a **monomorphic callee
+cache** - one 8-byte cell per call site holding the last `desc`; on a hit,
+`fast_bind`, the arity compare and the sync-entry test all follow (~13
+instructions), leaving a `movabs/cmp/jne`. It is a real inline cache, so it
+wants the maintainer's sign-off rather than being folded into a precompute
+batch. The design fork stated in the PREPARATION is unchanged and is still
+the only route to <=5x: what does a callee that needs NO VM frame record
+look like?

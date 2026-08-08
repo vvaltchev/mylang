@@ -1529,7 +1529,18 @@ struct VmPendState {
 struct VmStackSeg {
     std::vector<LValue> slots;
     int_type top = 0;                 /* allocation watermark */
-    explicit VmStackSeg(size_t cap) : slots(cap) { }
+    /*
+     * `slots` is sized ONCE at construction and never resized - live windows
+     * hold raw pointers into it ("segments never move"), so its capacity is a
+     * constant of the segment. Precomputed because the EMITTED push's fit test
+     * rebuilt it every call from the vector's two pointers plus an imul by 48
+     * (it compared byte extents); against this field the same test is one
+     * compare in slot units. ML_VM_CHECKed against slots.size() at each C++
+     * push.
+     */
+    int_type cap_slots;
+    explicit VmStackSeg(size_t cap)
+        : slots(cap), cap_slots(static_cast<int_type>(cap)) { }
 };
 
 /*
@@ -1707,7 +1718,11 @@ struct VmActivation {
             throw StackOverflowEx();
 
         VmStackSeg *sg = cur_seg >= 0 ? segs[cur_seg].get() : nullptr;
-        if (!sg || sg->top + n > static_cast<int_type>(sg->slots.size())) {
+        /* the emitted push's fit test compares against cap_slots instead of
+         * re-deriving the vector's extent - keep the two provably equal */
+        ML_VM_CHECK(!sg || sg->cap_slots
+                               == static_cast<int_type>(sg->slots.size()));
+        if (!sg || sg->top + n > sg->cap_slots) {
             /* Advance to (or create) a segment with room. Reuse an already-
              * allocated successor when its capacity fits (the common pop/
              * push cycle at a segment edge); else append a fresh one. */
@@ -7128,6 +7143,7 @@ void jit_fill_push_layout(JitPushLayout *L)
     const char *sb = reinterpret_cast<const char *>(&sg);
     L->seg_slots = reinterpret_cast<const char *>(&sg.slots) - sb;
     L->seg_top = reinterpret_cast<const char *>(&sg.top) - sb;
+    L->seg_cap = reinterpret_cast<const char *>(&sg.cap_slots) - sb;
     VmCallRec r;
     const char *rb = reinterpret_cast<const char *>(&r);
     L->rec_window = reinterpret_cast<const char *>(&r.window) - rb;
@@ -7162,12 +7178,8 @@ void jit_fill_push_layout(JitPushLayout *L)
     Chunk ck;
     const char *cb = reinterpret_cast<const char *>(&ck);
     L->ck_n_temps = reinterpret_cast<const char *>(&ck.n_temps) - cb;
-    L->ck_n_dict_iters =
-        reinterpret_cast<const char *>(&ck.n_dict_iters) - cb;
-    L->ck_n_dyn_iters =
-        reinterpret_cast<const char *>(&ck.n_dyn_iters) - cb;
-    L->ck_n_trys =
-        reinterpret_cast<const char *>(&ck.n_trys) - cb;
+    L->ck_plain_frame =
+        reinterpret_cast<const char *>(&ck.plain_frame) - cb;
     L->ck_sync_entry =
         reinterpret_cast<const char *>(&ck.sync_entry_off) - cb;
     {
