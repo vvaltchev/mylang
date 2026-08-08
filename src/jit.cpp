@@ -63,6 +63,7 @@ unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
 unsigned long g_jit_ffwd = 0;          /* C4a-ii: FLOAT forwarded runs */
 unsigned long g_jit_flit = 0;          /* C4b: literal-pinned frag entries */
 unsigned long g_jit_fstore_movx0 = 0;  /* C4b inc 2: ref-arm result move */
+unsigned long g_jit_member_noguard = 0; /* C4d: guard-elided member reads */
 unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
@@ -186,11 +187,12 @@ bool g_jit_enabled = false;
  */
 enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
-    JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_COUNT
+    JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
+    JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
-    "fwd", "ffwd", "resreg", "hoist", "hoist2"
+    "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -2131,6 +2133,30 @@ static JitHoist g_hoist;
  * when the trade wins), so unlike r10/r11 a helper call PRESERVES it
  * and the epilogue re-derives nothing. */
 static JitHoist g_hoist2;
+
+/*
+ * C4d: the chunk's STRUCT-IDENTITY facts (jit_struct_facts, codegen.cpp),
+ * recomputed per chunk in jit_compile_chunk. Unlike the hoist state above
+ * this is pure COMPILE-TIME knowledge about a SLOT's contents, not a
+ * register binding - so no helper call, no exit and no cache barrier can
+ * invalidate it, and it needs no epilogue re-derivation.
+ */
+static std::vector<int> g_sf_slot;
+static std::vector<const StructTypeDef *> g_sf_def;
+static std::vector<uint32_t> g_sf_in;
+
+/* Does a dominating planned ctor prove `slot` holds a `def` struct at pc? */
+static bool struct_fact_at(size_t pc, int slot, const StructTypeDef *def)
+{
+    if (jit_lever_off(JL_MFACT) || pc >= g_sf_in.size() || !def)
+        return false;
+    const uint32_t m = g_sf_in[pc];
+    for (size_t f = 0; f < g_sf_slot.size(); f++)
+        if ((m & (uint32_t(1) << f)) && g_sf_slot[f] == slot
+                && g_sf_def[f] == def)
+            return true;
+    return false;
+}
 
 /* The one lookup every hoist-aware emit arm goes through: whichever
  * active hoist serves (base, kind), or null. */
@@ -8844,27 +8870,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * (which can throw -> test eax + exit_pc re-raise). */
         const JitLayout &L = jit_layout();
         const int32_t moff = in.b_dual_lo();
+        const int form = in.b_dual_hi() & 3;
+        const int defi = in.b_dual_hi() >> 2;
         size_t j_done = 0;
         bool have_fast = false;
-        if (moff >= 0 && L.sobj_ok) {
-            have_fast = true;
-            const int form = in.b_dual_hi() & 3;
-            const SlotAddr b = slot_addr(in.target2);
-            e.load(RAX, b.type);
-            e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_struct));
-            e.cmp_rax_rcx();
-            const size_t js1 = e.j32(0x75);
-            e.load(RAX, b.payload);            /* rax = StructObject* */
-            e.movabs(RCX, reinterpret_cast<uint64_t>(
-                              ck.struct_defs[in.b_dual_hi() >> 2]));
-            /* cmp [rax + sobj_def], rcx */
-            e.u8(0x48); e.u8(0x39); e.u8(0x88);
-            e.u32(static_cast<uint32_t>(L.sobj_def));
-            const size_t js2 = e.j32(0x75);
-#ifdef TESTS
-            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_member_fast));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);    /* inc qword [rcx] */
-#endif
+
+        /* rax = the instance's byte buffer -> the field, in the read form
+         * the codegen baked. Shared by the guarded path and C4d's elided
+         * one so the two can never drift. */
+        const auto emit_field_read = [&]() {
             /* rax = bytes data (vector _M_start at +0, probed) */
             e.u8(0x48); e.u8(0x8B); e.u8(0x80);
             e.u32(static_cast<uint32_t>(L.sobj_bytes));
@@ -8899,6 +8913,61 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 emit_float_store(e, ck, X0, in.target, pc);
                 break;
             }
+        };
+
+        /*
+         * C4d: a dominating PLANNED StructCtorV on this very slot already
+         * established both guards - `p = Point(..)` then `p.x`, `p.y`,
+         * which is the entire reason a baked read exists. With the fact
+         * proved at COMPILE time the read is three instructions and has no
+         * slow arm at all: the guards were the only thing that could
+         * decline, and the byte read cannot throw.
+         */
+        if (moff >= 0 && L.sobj_ok && defi >= 0
+                && static_cast<size_t>(defi) < ck.struct_defs.size()
+                && struct_fact_at(old_pc, in.target2,
+                                  ck.struct_defs[defi])) {
+            const SlotAddr b = slot_addr(in.target2);
+#if ML_VM_HARDENING
+            /* re-check the proved fact at runtime, on the same emitted
+             * path a release takes (see jit_member_fact_audit) */
+            emit_call_prologue(e);
+            e.movabs(RDI, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target2)));
+            e.movabs(RSI, reinterpret_cast<uint64_t>(ck.struct_defs[defi]));
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_member_fact_audit) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+#endif
+#ifdef TESTS
+            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_member_noguard));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);    /* inc qword [rcx] */
+#endif
+            e.load(RAX, b.payload);            /* rax = StructObject* */
+            emit_field_read();
+            return true;
+        }
+
+        if (moff >= 0 && L.sobj_ok) {
+            have_fast = true;
+            const SlotAddr b = slot_addr(in.target2);
+            e.load(RAX, b.type);
+            e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_struct));
+            e.cmp_rax_rcx();
+            const size_t js1 = e.j32(0x75);
+            e.load(RAX, b.payload);            /* rax = StructObject* */
+            e.movabs(RCX, reinterpret_cast<uint64_t>(ck.struct_defs[defi]));
+            /* cmp [rax + sobj_def], rcx */
+            e.u8(0x48); e.u8(0x39); e.u8(0x88);
+            e.u32(static_cast<uint32_t>(L.sobj_def));
+            const size_t js2 = e.j32(0x75);
+#ifdef TESTS
+            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_member_fast));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);    /* inc qword [rcx] */
+#endif
+            emit_field_read();
             j_done = e.j32(0xEB);
             e.patch32_here(js1);
             e.patch32_here(js2);
@@ -10351,6 +10420,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * and a stale prod/in_rax from a previous chunk's last op would
      * otherwise leak into its cases. */
     g_fwd = JitFwd{};
+    /* C4d: same reason - the facts are indexed by THIS chunk's pcs, and
+     * the container path emits before the per-run path computes them. */
+    g_sf_slot.clear();
+    g_sf_def.clear();
+    g_sf_in.clear();
 
     /* model-flip M3: try the native-container path first (a narrow gate); on a
      * match it emits the whole-function container and we're done. Otherwise the
@@ -10607,6 +10681,20 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                       return a.first == b.first;
                                   }),
                       entries.end());
+    }
+
+    /* C4d: the struct-identity facts, over the FINAL code and with the
+     * entry-stub pcs (bottom - a resume brings no history) now known. */
+    {
+        std::vector<int> epcs;
+        epcs.reserve(entries.size());
+        for (const auto &pe : entries)
+            epcs.push_back(static_cast<int>(pe.first));
+        if (!jit_struct_facts(chunk, epcs, g_sf_slot, g_sf_def, g_sf_in)) {
+            g_sf_slot.clear();
+            g_sf_def.clear();
+            g_sf_in.clear();
+        }
     }
 
     std::vector<int> remap(n + 1);

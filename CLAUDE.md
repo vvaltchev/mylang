@@ -1448,7 +1448,7 @@ collision). Three nets now:
   JIT analogue of `--no-opt`, which CLAUDE.md already mandates for AST
   transforms for the same reason (`-nj` is all-or-nothing and localises
   nothing). Levers: cache, fcache, telide, fread, flit, fwd, ffwd,
-  resreg, hoist, hoist2, `all`. `tests/corpus_diff.sh BIN --levers`
+  resreg, hoist, hoist2, mfact, `all`. `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
   matrix runs against the CORPUS, not the suite.
@@ -1545,6 +1545,75 @@ libm loop that must DECLINE. Measured (Ir/scale, OPT=1 ASSERTS=0):
 **-6.4%**; 40_math_builtins flat (its loop calls libm - the gate
 declining, by design), 46/01 byte-flat. 55's hot path 55 -> 48 in a
 function, 75 -> 68 at main level.
+
+**C4d - THE CTOR-DOMINATED MEMBER READ DROPS ITS GUARDS (2026-08-05,
+`jit_struct_facts`, codegen.cpp).** A baked member read re-checked
+`slot holds a struct` + `that struct's def is D` - 7 instructions -
+before every single field read, although in the shape those ops exist
+for (`var p = Point(i, i*2); s += p.x + p.y`) a PLANNED StructCtorV on
+that very slot has just established both. The read is now three
+instructions (`mov rax, p; mov rax,[rax+bytes]; mov rax,[rax+off]`) and
+has NO slow arm at all - the guards were the only thing that could
+decline, and a raw byte read cannot throw, so the cold helper block is
+not emitted either.
+**THE SCOPE WAS RE-MEASURED, and the plan's was wrong.** C4d was scoped
+as hoisting the CTOR's four H1 guards (2x13 Ir); reading the actual
+`-vdj` showed the READS are the bigger and far safer half - 64 has five
+of them (2 int + 3 float) against two ctors.
+**THE MECHANISM is a forward MUST dataflow, not a peephole and not a C1
+region.** Facts are (slot, def) pairs, <= 32, one bit each.
+GEN: a planned StructCtorV on slot S with def D generates (S, D) on BOTH
+arms - the emitted fast path only rewrites the reused instance's bytes,
+and the slow tier `vm_struct_ctor_planned` either reuses that same-def
+instance or puts a FRESH `def` one in the slot, so neither can leave
+anything else there and neither throws. That both-arms property is what
+makes the fact reach the reads with no join subtlety. KILL: any write to
+S, from `visit_use_def` - the same audited enumeration E1 and
+jit_fwd_info use, with the same "an unaudited op is a BARRIER" contract.
+MEET: intersection over predecessors (the fall-through edge plus every
+branch naming the pc via `visit_pc_fields`, the audited enumeration since
+a "target" is not always a pc); an over-enumerated predecessor can only
+SHRINK the set, so that direction is the safe one. BOTTOM at pc 0, every
+handler body/finally pc, every per-pc entry stub, and every UNREACHABLE
+pc - the iteration starts at TOP so a loop-carried fact survives the back
+edge, and without the reachability pass an entry-less strongly-connected
+region could keep a fact alive forever (it can never run, but it would
+still be EMITTED).
+**WHAT THIS DOES NOT COVER, and why:** the CTOR's own guards. At a loop
+head the fact dies in the meet between the preheader (where the slot has
+not been constructed yet) and the back edge - correctly, since iteration
+1 really must check. Getting them needs loop VERSIONING (a preheader +
+cold twin, C1's structure), which is a separate mechanism; ~26 of 64's
+remaining 194 Ir.
+**THE SABOTAGE RESULTS ARE THE INTERESTING PART, recorded as measured.**
+Forcing the elision unconditionally fails TWO tests (the param read in
+`jit_member_fact_c4d` must stay guarded; `jit_struct_baked`'s too), and
+removing the KILL fails the rebind case. But the VM_HARDENING net
+(`jit_member_fact_audit`, which re-checks the proved fact at runtime on
+the SAME emitted path a release takes) does NOT fire under either, across
+`-rt` AND the corpus - because for a baked read the base's STATIC type
+already implies the def, so no constructible program can put a different
+one there. That is not a hole in the nets: it means the guards were pure
+insurance against a checker hole, and the elision REPLACES "trust the
+checker" with "a ctor just put a def-D object in this slot", which is
+strictly stronger evidence. The dataflow and the KILL are what keep that
+true if a future op can rebind a struct-typed slot; the entry-pc bottom
+is belt (a post-call resume's fact is valid anyway, since the callee has
+its own window) and is recorded as sabotage-unprovable.
+A TRAP worth naming: the first KILL test case used `p = mk(i)` and was
+VACUOUS - a small callee is inlined/spliced away long before codegen and
+the reads then read the inlined body's OWN slot, so the no-KILL sabotage
+changed nothing (4 emitted def guards either way). The MoveV form
+`p = q` is the one that measures (4 -> 2). Execution-proven by
+`g_jit_member_noguard` (the guarded `g_jit_member_fast` counts the old
+form, so only a separate counter can prove the elided one ran) and by
+requiring BOTH counters to move in one program - asserting only the
+elided one would pass just as happily if every read in the process lost
+its guards. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0, cross-binary):
+**64_struct_create 234 -> 194 Ir/iteration (-17.1%)**; 58/65/77 byte-flat
+(they read through LoadStructField*/the foreach direct read, not
+LoadMemberInt - a different op), 46/01/09/55 byte-flat, so the new emit
+arm costs no layout tax.
 
 **C3 inc 3 - TEMPS JOIN THE FLOAT TYPE-STORE ELISION (2026-08-04).**
 inc 2's producer was gated `< slot_count`, LOCALS ONLY, so every float

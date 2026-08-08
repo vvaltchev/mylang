@@ -7724,6 +7724,186 @@ bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
     return true;
 }
 
+/*
+ * C4d: THE STRUCT-IDENTITY FACTS (plans/typed-invariant-arrays.md).
+ *
+ * A baked member read (LoadMemberInt/Float) guards `slot holds a struct`
+ * + `that struct's def is D` before every single byte read - 7
+ * instructions - although in the shape those ops exist for the answer is
+ * a compile-time certainty: a PLANNED StructCtorV on the same slot just
+ * established it. This is the MUST dataflow that says so.
+ *
+ * A fact is a (slot, def) pair, one bit each, capped at 32 (past that the
+ * analysis declines rather than losing precision silently).
+ *
+ * GEN - a planned StructCtorV on slot S with def D generates (S, D) on
+ * BOTH of its arms, which is what makes the fact reach the reads that
+ * follow it with no join subtlety: the emitted fast path only rewrites
+ * the reused instance's BYTES, and the slow tier is
+ * vm_struct_ctor_planned, which either reuses that same-def instance or
+ * puts a FRESH `def` one in the slot. Neither can leave the slot holding
+ * anything else, and neither throws.
+ *
+ * KILL - any write to S. Taken from `visit_use_def`, the same audited
+ * enumeration E1 and jit_fwd_info use, with the same contract: an op the
+ * table does not know is a BARRIER that kills every fact. That is the
+ * load-bearing conservatism here - a builtin that rebinds its lvalue arg0
+ * through a pool, a chain store, an unpack, all of them barrier out. Note
+ * a fact survives a CALL: a callee gets its own window and cannot reach
+ * our slots, and the call's own dst is enumerated.
+ *
+ * MEET is intersection over predecessors: the fall-through edge (unless
+ * the previous op cannot reach pc+1) plus every branch whose pc field -
+ * `visit_pc_fields`, the audited enumeration, since a "target" is not
+ * always a pc - names this op. An extra predecessor can only SHRINK the
+ * fact set, so the conservative direction is to over-enumerate.
+ *
+ * ENTRY pcs are bottom: pc 0, every handler body and finally pc, and
+ * every per-pc entry stub the caller passes (a resume arrives with no
+ * history the dataflow modelled). Unreachable pcs are bottom too - a
+ * strongly-connected region with no entry path would otherwise let the
+ * optimistic initialisation keep a fact alive forever; it can never run,
+ * but it would still be EMITTED, so the reachability pass removes the
+ * whole class rather than reasoning about it.
+ *
+ * The iteration starts at TOP (all facts) and only shrinks, which is what
+ * lets a loop-carried fact survive the back edge.
+ */
+bool jit_struct_facts(const Chunk &chunk, const std::vector<int> &entry_pcs,
+                      std::vector<int> &fact_slot,
+                      std::vector<const StructTypeDef *> &fact_def,
+                      std::vector<uint32_t> &in)
+{
+    const size_t n = chunk.code.size();
+    fact_slot.clear();
+    fact_def.clear();
+    in.clear();
+    if (!n)
+        return false;
+
+    /* the GEN sites */
+    std::vector<int> gen_of(n, -1);
+    for (size_t p = 0; p < n; p++) {
+        const Instr &i = chunk.code[p];
+        if (i.op != OpCode::StructCtorV || i.b_dual_hi() < 0)
+            continue;                              /* not a PLANNED ctor */
+        if (i.target < 0 || i.target2 < 0
+                || static_cast<size_t>(i.target2) >= chunk.struct_defs.size())
+            continue;
+        const StructTypeDef *const def = chunk.struct_defs[i.target2];
+        if (!def)
+            continue;
+        int idx = -1;
+        for (size_t f = 0; f < fact_slot.size(); f++)
+            if (fact_slot[f] == i.target && fact_def[f] == def) {
+                idx = static_cast<int>(f);
+                break;
+            }
+        if (idx < 0) {
+            if (fact_slot.size() >= 32)
+                return false;                      /* out of bits */
+            idx = static_cast<int>(fact_slot.size());
+            fact_slot.push_back(i.target);
+            fact_def.push_back(def);
+        }
+        gen_of[p] = idx;
+    }
+    if (fact_slot.empty())
+        return false;
+
+    const size_t nf = fact_slot.size();
+    const uint32_t all = nf == 32 ? ~uint32_t(0)
+                                  : ((uint32_t(1) << nf) - 1);
+
+    std::vector<uint32_t> kill(n, 0);
+    for (size_t p = 0; p < n; p++) {
+        uint32_t k = 0;
+        const bool known = visit_use_def(chunk.code[p],
+            [](int) {},
+            [&](int s) {
+                for (size_t f = 0; f < nf; f++)
+                    if (fact_slot[f] == s)
+                        k |= uint32_t(1) << f;
+            });
+        kill[p] = known ? k : all;                 /* unaudited = barrier */
+    }
+
+    /* entry pcs (bottom) + the predecessor lists */
+    std::vector<char> is_entry(n, 0);
+    is_entry[0] = 1;
+    for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : hs.clauses)
+            if (cl.body_pc >= 0 && static_cast<size_t>(cl.body_pc) < n)
+                is_entry[cl.body_pc] = 1;
+        if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) < n)
+            is_entry[hs.fin_pc] = 1;
+    }
+    for (int ep : entry_pcs)
+        if (ep >= 0 && static_cast<size_t>(ep) < n)
+            is_entry[ep] = 1;
+
+    std::vector<std::vector<int>> preds(n);
+    for (size_t p = 0; p < n; p++) {
+        /* visit_pc_fields takes Instr& (the remaps write through it); this
+         * read-only walk borrows it via a const_cast, mutating nothing. */
+        Instr &i = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(i, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) < n)
+                preds[t].push_back(static_cast<int>(p));
+        });
+        if (op_falls_through(i.op) && p + 1 < n)
+            preds[p + 1].push_back(static_cast<int>(p));
+    }
+
+    /* reachability from the entry pcs (see the header comment) */
+    std::vector<char> live(n, 0);
+    std::vector<int> stack;
+    for (size_t p = 0; p < n; p++)
+        if (is_entry[p]) {
+            live[p] = 1;
+            stack.push_back(static_cast<int>(p));
+        }
+    while (!stack.empty()) {
+        const size_t p = static_cast<size_t>(stack.back());
+        stack.pop_back();
+        const auto reach = [&](int t) {
+            if (t >= 0 && static_cast<size_t>(t) < n && !live[t]) {
+                live[t] = 1;
+                stack.push_back(t);
+            }
+        };
+        Instr &i = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(i, [&](int &t) { reach(t); });
+        if (op_falls_through(i.op) && p + 1 < n)
+            reach(static_cast<int>(p + 1));
+    }
+
+    in.assign(n, 0);
+    std::vector<uint32_t> out(n, all);
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (size_t p = 0; p < n; p++) {
+            uint32_t v = 0;
+            if (live[p] && !is_entry[p] && !preds[p].empty()) {
+                v = all;
+                for (int q : preds[p])
+                    v &= out[q];
+            }
+            uint32_t o = v & ~kill[p];
+            if (gen_of[p] >= 0)
+                o |= uint32_t(1) << gen_of[p];
+            if (!live[p])
+                o = 0;
+            if (v != in[p] || o != out[p]) {
+                in[p] = v;
+                out[p] = o;
+                changed = true;
+            }
+        }
+    }
+    return true;
+}
+
 static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
 {
     if (code.empty())

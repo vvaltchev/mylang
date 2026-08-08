@@ -421,7 +421,9 @@ registers. The route, in increasing depth:
   3. **C4c: the return protocol** (10's ~35% jit_ret round trip) -
      LANDED 2026-08-04, see below;
   4. **C4d: struct dst tags** - INVESTIGATED 2026-08-05 and found
-     ALREADY DONE; the real residual is different, see below.
+     ALREADY DONE; RE-SCOPED to the ctor-dominated member read and
+     LANDED the same day (-17.1% on 64), see below. The ctor's own
+     guards remain - they need loop versioning.
 Each is its own measured increment; 2 and 3 are the big ones.
 
 **C4a-ii LANDED (2026-08-04): float forwarding** - a float producer
@@ -632,14 +634,41 @@ LOOP-INVARIANT**: the dst holds the SAME reused StructObject each
 iteration, the def is a compile-time constant, and neither readonly nor
 the refcount changes inside the loop.
 
-So the real step is not a tag elision but **C1-family loop-invariant
-guard hoisting applied to the ctor**: verify the four guards once in a
-preheader, keep the byte buffer pointer in a register across the loop,
-and send a failed guard to a cold twin of the region - exactly C1's
-structure, with the ctor's dst slot playing the role of C1's base. That
-is a real mechanism (preheader + cold twin + a def-scan proving nothing
-in the region rebinds the dst), NOT a peephole, which is why it is
-recorded here rather than half-built.
+x2 ctors = ~26 of the 234. But the 234 also contains FIVE baked member
+reads (`p.x`, `p.y`, `v.x`, `v.y`, `v.z`), and each of those re-checks
+guards 1 and 2 - the SAME two guards, on the SAME slot the ctor above
+it just wrote - for 8 instructions before it can touch a byte. That is
+~40 Ir, a bigger and much safer half, and it is what shipped.
 
-The other 200 Ir are the field reads, the arithmetic, and the loop
-tail - N7 territory, not struct-specific.
+### C4d LANDED (2026-08-05): the ctor-dominated member read
+
+`jit_struct_facts` (codegen.cpp) - a forward MUST dataflow whose facts
+are (slot, def) pairs. GEN at a planned StructCtorV on BOTH arms (the
+emitted fast path rewrites only the reused instance's bytes; the slow
+tier `vm_struct_ctor_planned` either reuses that same-def instance or
+puts a fresh `def` one in the slot - neither can leave anything else
+there, and neither throws). KILL on any write to the slot, from
+`visit_use_def`, with its "an unaudited op is a BARRIER" contract. MEET
+= intersection over predecessors (`visit_pc_fields` + the fall-through
+edge). BOTTOM at pc 0, handler/finally pcs, every per-pc entry stub and
+every unreachable pc; the iteration starts at TOP so a loop-carried fact
+survives the back edge.
+
+A proven read emits three instructions and NO slow arm at all - the
+guards were its only decline path. Measured 234 -> 194 Ir/iteration
+(**-17.1%**), everything else byte-flat cross-binary. Lever `mfact`.
+
+**Still open - the CTOR's own guards (~26 Ir).** At the loop head the
+fact dies in the meet between the preheader (the slot is not
+constructed yet) and the back edge, and that is CORRECT: iteration 1
+really must check. Reaching them needs loop VERSIONING - a preheader
+that verifies once, the byte-buffer pointer live in a register across
+the loop, and a cold twin of the region for a failed guard: exactly
+C1's structure with the ctor's dst slot playing C1's base, plus a scan
+proving nothing in the region rebinds the dst or takes a reference to
+it (a MoveV copy raises the refcount and H1's sole-owner guard must
+then fail). A real mechanism, not a peephole - hence recorded rather
+than half-built, as before.
+
+The other ~170 Ir are the field reads' remaining loads, the arithmetic,
+and the loop tail - N7 territory, not struct-specific.

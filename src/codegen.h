@@ -100,6 +100,28 @@ bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
                   std::vector<char> &is_tgt);
 
 /*
+ * C4d (plans/typed-invariant-arrays.md): the per-pc STRUCT-IDENTITY facts
+ * a PLANNED StructCtorV establishes, so a baked member read on the same
+ * slot can skip the type-tag + def-identity guards it would otherwise
+ * re-check on every single field read.
+ *
+ * `fact_slot[f]`/`fact_def[f]` name fact f; `in[pc] & (1 << f)` == on
+ * EVERY path reaching pc, that slot holds a struct of that def. A forward
+ * MUST dataflow (meet = intersection) over the chunk's FINAL code, on the
+ * same audited enumerations as jit_fwd_info - see the definition for the
+ * GEN/KILL argument and why an unaudited op is a barrier. `entry_pcs` is
+ * the JIT's per-pc entry-stub set: a resume arrives with no history, so
+ * those are bottom like the handler pcs.
+ *
+ * Returns false (and empties everything) when there is nothing to say -
+ * no planned ctor, or more than 32 distinct facts.
+ */
+bool jit_struct_facts(const Chunk &chunk, const std::vector<int> &entry_pcs,
+                      std::vector<int> &fact_slot,
+                      std::vector<const StructTypeDef *> &fact_def,
+                      std::vector<uint32_t> &in);
+
+/*
  * #78 step B: assert the HANDLER TABLE still describes the interpreted
  * CatchTest/Reraise chain (see Chunk::handler_sites). Called after every
  * pc-moving transformation while both representations exist - the
