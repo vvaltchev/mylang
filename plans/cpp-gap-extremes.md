@@ -950,3 +950,99 @@ wants the maintainer's sign-off rather than being folded into a precompute
 batch. The design fork stated in the PREPARATION is unchanged and is still
 the only route to <=5x: what does a callee that needs NO VM frame record
 look like?
+
+## G1 increment 2 LANDED 2026-08-07 - the two-entry callee cache
+
+The guard phase (63 instructions before increment 1, 51 after) spends most of
+itself re-proving properties of the CALLEE that cannot change: is the
+descriptor `fast_bind`, does its arity match this site, does it have a
+compiled chunk with a native sync entry and no per-frame side state. Each is
+fixed once the descriptor and its chunk exist - `vm_chunk` is write-once under
+`vm_chunk_tried`, `fast_bind` is set with it, `params` is frozen at
+`sync_params`, and `sync_entry_off`/`plain_frame` are set by the tier that
+compiled the chunk. So a site that watched THIS descriptor pass them once
+needs only a pointer compare to re-establish all five.
+
+Per emitted inline call site: one `Chunk::CalleeCache` cell, heap-allocated so
+its address (baked as an immediate) cannot move as later sites are added, and
+DERIVED - never serialized, so a loaded image's JIT pass builds its own.
+
+**It keys on the `FuncDescriptor *`, not the `FuncObject *`.** Keying on the
+object would be one instruction cheaper (it would subsume the type check too)
+and WRONG: a FuncObject is refcounted, and a later closure allocated at a
+freed one's address would hit an entry describing a different function -
+exactly the stale-pointer identity bug CLAUDE.md warns about. A descriptor is
+program-lifetime, one of the codebase's stable identities.
+
+### TWO entries, and 76_funcval_dispatch is the reason
+
+The one-entry version was built and measured first. It reads:
+
+    10_recursion_deep    -3.40%
+    11_closure_counter   -2.23%
+    63_closures          -1.85%
+    76_funcval_dispatch  **+0.56%**
+
+76 dispatches through `ops[i % 2]`, so it MISSES on every call and pays the
+lookup for nothing - the textbook monomorphic-inline-cache failure, landing on
+the one bench this arc is named after. A second entry costs a monomorphic site
+NOTHING (entry 0 is tested first, with the same three instructions) and turns
+an alternating pair into steady-state hits after two calls. 76 goes
+**+0.56% -> -0.90%**.
+
+**The shift order is MRU and that is load-bearing.** The first two-entry
+version filled entry 1 and shifted down to entry 0, which put a MONOMORPHIC
+callee permanently behind a compare it could never pass: +2 instructions per
+call, forever, with every answer still correct. The probe caught it as
+138 -> 140 Ir/call. It is now a test (below), not just a measurement.
+
+### Measured (callgrind Ir, `OPT=1 ASSERTS=0`, both binaries this session)
+
+Baseline is increment 1 (10e0b81), so these compound with it.
+
+    probe caller fragment  294.0M -> 276.0M   -6.12%  (147 -> 138 Ir/call,
+                                                       i.e. -9 instructions)
+    probe whole program    472.1M -> 454.1M   -3.81%
+
+    10_recursion_deep      358.1M -> 345.9M   -3.40%
+    11_closure_counter     403.7M -> 394.7M   -2.23%
+    63_closures            486.5M -> 477.5M   -1.85%
+    76_funcval_dispatch    887.9M -> 879.9M   -0.90%
+    09_fib_recursive        88.1M ->  88.1M   -0.09%
+
+Flat (<= +0.06%): 08_func_call, 12_higher_order, 34_sort_custom_cmp,
+67_make_dict, 01_while_loop, 46_matrix_mult, 24_dict_lookup, 43_sieve,
+54_mandelbrot.
+
+Cumulative for G1 so far: the probe's caller fragment **159 -> 138 Ir per
+indirect call (-13.2%)**, 10_recursion_deep **-7.3%**, 11 **-5.1%**, 63
+**-4.1%**, 76 **-2.1%**.
+
+### Sabotage - all three watched failing
+
+- **Collapse to one entry** (drop the second compare and the shift) ->
+  `the SECOND entry is dead (0)`, 1751/1752.
+- **Always hit** (compare rax with itself, so the guards are skipped for every
+  callee) -> `-rt` **aborts, exit 134**, `jit_dyiter`'s slice bound. The
+  pointer compare is what keeps the skip sound. NOTE the headline still read
+  `Tests passed: 1752/1752` - that is the TREE-WALKER pass; the failure is in
+  the differential modes and the exit code, the documented VM-only shape.
+- **Reverse the shift to LRU** -> `hit arm DID NOT RUN (0)`: every hit of the
+  monomorphic site came from entry 1.
+
+The third only became catchable because the two hit arms are counted
+SEPARATELY (`g_jit_callee_cache` / `g_jit_callee_cache2`, TESTS builds only;
+a release patches both jumps to one address and emits neither). A single
+counter cannot see WHICH entry answered, and the answers are correct either
+way - so without the split this would have stayed a number in a measurement
+log, which is precisely the class of thing that rots.
+
+### A vacuous test caught in the making
+
+The first polymorphic case built its two callees from ONE lambda decl
+(`mk(3)` and `mk(8)` of the same `func [k] () ...`). Two closures of one decl
+SHARE a FuncDescriptor - and the cache keys on the descriptor - so the site
+was monomorphic after all and the second entry was never exercised. The test
+now uses two distinct lambda decls. Same family as the shape-eaters already
+listed in CLAUDE.md, one level up: the eater here was not an optimizer pass
+but the KEY the mechanism uses.

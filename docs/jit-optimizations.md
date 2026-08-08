@@ -2418,3 +2418,57 @@ at `push_window`; the fit test pointed at `seg_top` instead of `seg_cap` (it
 then always declines - silently correct, only slower) -> the EXISTING
 coverage test, `jit_sync_inline_call: inline path DID NOT RUN`; the half-copy
 -> the new test above.
+
+## G1 increment 2 (2026-08-07): the two-entry callee cache
+
+One `Chunk::CalleeCache` cell per emitted inline call site. A hit skips the
+five callee-PROPERTY guards - `fast_bind`, the arity match, a compiled chunk,
+a native sync entry, `plain_frame` - because every one of them is fixed once
+the descriptor and its chunk exist (`vm_chunk` write-once under
+`vm_chunk_tried`, `fast_bind` set with it, `params` frozen at `sync_params`,
+`sync_entry_off`/`plain_frame` set by the compiling tier). 13 instructions
+become 4 (entry 0) or 6 (entry 1).
+
+**Key on the `FuncDescriptor *`, never the `FuncObject *`.** The object key
+would be one instruction cheaper - it subsumes the type check - and it is the
+stale-pointer identity bug: a FuncObject is refcounted, so a later closure at
+a freed one's address would hit an entry describing a different function. A
+descriptor is program-lifetime.
+
+### RULE: a one-entry inline cache regresses the shape it was written for
+
+The one-entry version measured 10 -3.40%, 11 -2.23%, 63 -1.85% and
+**76_funcval_dispatch +0.56%** - and 76 (`ops[i % 2]`) is the bench the whole
+arc is named after. A second entry costs a monomorphic site NOTHING (entry 0
+is tested first, same three instructions) and takes 76 to **-0.90%**. If you
+add an inline cache here, measure the ALTERNATING shape before believing the
+monomorphic one.
+
+**The shift is MRU and it is load-bearing**: new callee to entry 0, old one
+down to entry 1. Filling entry 1 first leaves a monomorphic callee behind a
+compare it can never pass - +2 instructions per call forever, every answer
+still correct. The probe read it as 138 -> 140 Ir/call.
+
+### The two hit arms are counted SEPARATELY, and that is why the order is
+### testable
+
+`g_jit_callee_cache` (entry 0) and `g_jit_callee_cache2` (entry 1), TESTS
+builds only - a release patches both jumps to one address and emits neither.
+One counter cannot see WHICH entry answered, and a backwards shift changes no
+result, so a single counter would have left the MRU order as a number in a
+measurement log. Sabotages watched failing: collapse to one entry ->
+`the SECOND entry is dead (0)`; always hit (cmp rax,rax) -> `-rt` exit 134 on
+`jit_dyiter`'s slice bound; reverse the shift -> `hit arm DID NOT RUN (0)`.
+
+### THE VACUOUS-TEST TRAP, one level up: the eater was the KEY
+
+The first polymorphic test built its two callees from ONE lambda decl. Two
+closures of one decl SHARE a FuncDescriptor, and the cache keys on the
+descriptor - so the "polymorphic" site was monomorphic and the second entry
+was never exercised. Add to the shape-eater list: it is not only an optimizer
+pass that can eat a test shape, it is any identity the mechanism keys on.
+
+Measured (callgrind Ir, `OPT=1 ASSERTS=0`), on top of increment 1: probe
+caller fragment 147 -> 138 Ir/call (**-6.12%**); 10_recursion_deep -3.40%,
+11_closure_counter -2.23%, 63_closures -1.85%, 76_funcval_dispatch -0.90%,
+09_fib -0.09%; nine unrelated benches flat.

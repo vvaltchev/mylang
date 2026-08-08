@@ -70,6 +70,8 @@ unsigned long g_jit_ctor_est = 0;      /* C4e: established ctor preheaders */
 unsigned long g_jit_release_entry = 0; /* C5: entries that released a temp */
 unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
+unsigned long g_jit_callee_cache = 0;  /* G1: callee-cache HITS (emitted) */
+unsigned long g_jit_callee_cache2 = 0; /* G1: hits on the SECOND entry */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 unsigned long g_jit_ret_inline = 0;    /* C4c: inline-pop returns run */
 /* C4a-i: TEMP slots admitted to the float read-elision set, process-wide.
@@ -2470,7 +2472,8 @@ static const JitPushLayout &jit_push_layout()
 static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
                                   bool cached, int callee_arg,
                                   std::vector<size_t> &j_slow,
-                                  std::vector<size_t> &j_done)
+                                  std::vector<size_t> &j_done,
+                                  Chunk::CalleeCache *cache_cell)
 {
     const JitPushLayout &P = jit_push_layout();
     const JitLayout &L = jit_layout();
@@ -2553,6 +2556,9 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.u8(static_cast<uint8_t>(0xC0 | ((r & 7) << 3) | (r & 7)));
         e.u32(static_cast<uint32_t>(imm));
     };
+    const auto movabs_r11 = [&](uint64_t imm) {       /* movabs r11, imm64 */
+        e.u8(0x49); e.u8(0xBB); e.u64(imm);
+    };
     const uint8_t R10 = 10, R11 = 11, R8R = 8, R9R = 9;
 
     /* ---------------- GUARDS (no mutation before these pass) ----------- */
@@ -2615,6 +2621,44 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         ld(R8R, RCX, 0);
         ld(RAX, RDX, static_cast<int32_t>(P.fo_func));  /* rax = desc */
     }
+    /*
+     * G1 THE MONOMORPHIC CALLEE CACHE. The five guards below all ask about
+     * the CALLEE - is it fast_bind, does its arity match THIS site, does it
+     * have a compiled chunk with a native sync entry and no per-frame side
+     * state - and every one of those is fixed once the descriptor and its
+     * chunk exist (`vm_chunk` is write-once under `vm_chunk_tried`;
+     * `fast_bind` is set with it; `params` is frozen at `sync_params`;
+     * `sync_entry_off` and `plain_frame` are set by the tier that compiled
+     * the chunk). So a site that saw THIS descriptor pass them once needs
+     * only a pointer compare to re-establish all five.
+     *
+     * The cell is written ONLY after the full chain passes, and it holds a
+     * `FuncDescriptor *` - a program-lifetime, STABLE identity. Caching the
+     * `FuncObject *` instead would be one instruction cheaper (it would
+     * subsume the type check too) and WRONG: a FuncObject is refcounted, and
+     * a later closure allocated at a freed one's address would hit a cache
+     * entry describing a different function - the stale-pointer identity bug
+     * CLAUDE.md warns about.
+     *
+     * TWO entries (see Chunk::CalleeCache): a one-entry version missed on
+     * every call of 76_funcval_dispatch's `ops[i % 2]` and measured +0.56%
+     * there. Entry 0 costs a hit exactly what one entry did, so the second
+     * is free for a monomorphic site and turns an alternating pair from
+     * always-miss into always-hit.
+     *
+     * An entry-0 hit pays 4 instructions (the address, the compare, the
+     * branch, and re-deriving `cck`) instead of 13; entry 1 pays 6.
+     */
+    const uint64_t cache_addr = cache_cell
+        ? reinterpret_cast<uint64_t>(&cache_cell->desc[0]) : 0;
+    size_t j_hit0 = 0, j_hit1 = 0, j_over = 0;
+    if (cache_addr) {
+        movabs_r11(cache_addr);
+        modrm(0x3B, RAX, R11, 0, true);               /* cmp rax, [r11] */
+        j_hit0 = e.j32(0x74);                         /* je hit */
+        modrm(0x3B, RAX, R11, 8, true);               /* cmp rax, [r11+8] */
+        j_hit1 = e.j32(0x74);                         /* je hit */
+    }
     cmp_b_imm8(RAX, static_cast<int32_t>(P.desc_fast_bind), 0);
     j_slow.push_back(e.j32(0x74));                    /* je slow */
     /* nparams == NARGS via the vector's byte length */
@@ -2644,6 +2688,41 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      */
     cmp_b_imm8(RCX, static_cast<int32_t>(P.ck_plain_frame), 0);
     j_slow.push_back(e.j32(0x74));                    /* je slow */
+    if (cache_addr) {
+        /* The whole chain passed - remember this callee, shifting so an
+         * alternating pair settles into both entries instead of evicting
+         * each other. MRU ORDER, and it is load-bearing: the new callee
+         * goes to entry 0 and the old one down to entry 1, so a
+         * MONOMORPHIC site tests one entry forever. Filling entry 1 first
+         * instead measured +2 instructions per call on the probe - the
+         * single callee sat behind a compare it could never pass.
+         * r11 still holds the cell address, and r10 is not live until the
+         * frame-size arithmetic below. */
+        ld(R10, R11, 0);                              /* r10 = entry 0 */
+        st(R11, 8, R10);                              /* entry 1 = entry 0 */
+        st(R11, 0, RAX);                              /* entry 0 = desc */
+        j_over = e.j32(0xEB);                         /* jmp over the hit */
+#ifdef TESTS
+        /* The two arms are counted SEPARATELY so a test can tell WHICH
+         * entry answered - that is what pins the MRU shift order (a
+         * monomorphic site must settle in entry 0; filling entry 1 first
+         * leaves it one compare behind forever). A release build patches
+         * both jumps to the same address and emits none of this. */
+        e.patch32_here(j_hit0);                       /* hit, entry 0: */
+        movabs_r11(reinterpret_cast<uint64_t>(&g_jit_callee_cache));
+        e.u8(0x49); e.u8(0xFF); e.u8(0x03);           /* inc qword [r11] */
+        const size_t j_shared = e.j32(0xEB);
+        e.patch32_here(j_hit1);                       /* hit, entry 1: */
+        movabs_r11(reinterpret_cast<uint64_t>(&g_jit_callee_cache2));
+        e.u8(0x49); e.u8(0xFF); e.u8(0x03);           /* inc qword [r11] */
+        e.patch32_here(j_shared);
+#else
+        e.patch32_here(j_hit0);                       /* hit: */
+        e.patch32_here(j_hit1);
+#endif
+        ld(RCX, RAX, static_cast<int32_t>(L.desc_vm_chunk)); /* rcx = cck */
+        e.patch32_here(j_over);
+    }
     /* rsi = total = frame_size + n_temps */
     if (!cached) {
         /* a PLAIN call from a cache-carrying caller declines (the stash
@@ -2871,6 +2950,14 @@ static void emit_nstack_switch_post(Emitter &e)
  * (the disasm replay runs sequentially), so a file-static is safe. */
 static const std::vector<int> *g_cur_entry_remap = nullptr;
 
+/* G1: the CURRENT chunk's callee-cache cells (Chunk::call_caches), so
+ * emit_sync_call_inline can allocate one per emitted inline call site. Set
+ * beside g_cur_entry_remap around the same fragment-emission loop, and safe
+ * as a file-static for the same reason. Null (no chunk) simply emits the
+ * un-cached guard chain. */
+static std::vector<std::unique_ptr<Chunk::CalleeCache>> *g_cur_call_caches
+    = nullptr;
+
 static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                   const Instr &in, uint32_t pc,
                                   size_t old_pc, bool is_value,
@@ -2897,9 +2984,16 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * with rdi = the callee window and rdx = the fragment entry; every
      * decline jumped to slow BEFORE any mutation; a cache HIT jumped to
      * done (dst already written by the probe). */
+    Chunk::CalleeCache *cell = nullptr;
+    if (g_cur_call_caches) {
+        g_cur_call_caches->push_back(
+            std::unique_ptr<Chunk::CalleeCache>(new Chunk::CalleeCache()));
+        cell = g_cur_call_caches->back().get();
+    }
     emit_sync_push_native(e, in, is_value,
                           in.op == OpCode::CachedCallV,
-                          static_cast<int>(callee_arg), j_slows, j_dones);
+                          static_cast<int>(callee_arg), j_slows, j_dones,
+                          cell);
     /* depth++ (the callee is committed) */
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x01);                        /* inc dword [rcx] */
@@ -11256,6 +11350,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     }
 
     g_cur_entry_remap = &entry_remap;   /* #56: the emits bake resume pcs */
+    /* G1: fresh cells for this compile - a re-emitted chunk must not keep
+     * the previous run's, whose addresses the discarded code baked. */
+    chunk.call_caches.clear();
+    g_cur_call_caches = &chunk.call_caches;
     /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
      * across the loop - no op clobbers it - so the native back edge, a
      * jump to label[begin] AFTER this movabs, keeps it live); record each
@@ -12045,6 +12143,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     verify_handler_sites(chunk);
 
     g_cur_entry_remap = nullptr;        /* #56: emission done */
+    g_cur_call_caches = nullptr;
 
     /* Trampoline pool (out-of-line, one per DISTINCT libm fn): the rare
      * rel32-out-of-range fallback for a call (and the arm64-style veneer a
