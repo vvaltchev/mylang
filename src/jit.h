@@ -595,7 +595,6 @@ extern "C" int jit_is_true(int_type cond_slot) noexcept;
 
 extern "C" void jit_load_elem_bool(int_type dst, int_type base,
                                    int_type idx) noexcept;
-extern "C" void jit_str_len(int_type dst, int_type base) noexcept;
 extern "C" void jit_load_str_char(int_type dst, int_type base,
                                   int_type idx) noexcept;
 extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
@@ -798,6 +797,9 @@ extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
 extern "C" unsigned long g_jit_store_fast;
 extern "C" unsigned long g_jit_store_prep;
 extern "C" unsigned long g_jit_elem2_fast;
+/* G5: emitted-code proof that the INLINE len(str) ran (the helper is gone
+ * for a proven-string base, so jit_str_len's own counter cannot say). */
+extern "C" unsigned long g_jit_strlen_fast;
 extern "C" unsigned long g_jit_store2_fast;   /* #95: nested-store tier */
 extern "C" unsigned long g_jit_elem_slice_fast; /* #95: slice-read arms */
 extern "C" unsigned long g_jit_fwd;           /* lever A: fwd consumers */

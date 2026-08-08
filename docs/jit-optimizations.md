@@ -2165,3 +2165,64 @@ CONST-ARG call is NOT a gap: a pure callee folds at compile time (optimal - no
 call), an impure caller / runtime arg still native-calls, and a native_leaf
 rarely specializes to a clone (const-arg propagation on a small int body doesn't
 shrink it) - all verified.
+
+## G5 (2026-08-06): `len(str)` emitted INLINE - one load, no call
+
+`StrLen` was a helper call at ~48 Ir. The split, by the file each inlined
+frame came from, is the interesting part:
+
+    evalvalue.h   21   the boxed LValue::put of the RESULT
+    vm.cpp        14   the helper body + the call frame
+    eval.h         8   Frame::at x2
+    sharedstr.h    5   the actual string access
+    basic_string.h 1
+
+So the string access was never the cost - the CALL and the BOXED STORE
+were. The inline tier removes both: one zero-extending 4-byte load of the
+window length, then the ordinary ref-aware `store_dst` (which C3/C5 can
+then elide like any other scalar store).
+
+**What unblocked it.** An inline read needs the length in a FIELD, and
+before THE WINDOW MODEL (#123, sharedstr.h) `size()` was
+`slice ? len : obj->s.size()` - a dependent load through `obj` that no
+emitter can do without baking libstdc++'s std::string layout, which the
+co-located-probe pattern cannot supply (there is no portable way to take
+the address of a std::string's size field). With `len` authoritative for
+every SharedStr, the emit is one instruction. **The correctness fix and
+the optimization were the same change**, which is why G5 sat blocked
+until #123 landed.
+
+**No type guard**, deliberately: codegen emits `StrLen` only where
+`vm_len_kind` proved the argument is a string - the same stamp that picks
+`ArrLen` - exactly as ArrLen's helper trusts its proven array.
+
+The offset comes from `SharedStr::jit_probe()`, a co-located probe reading
+the real member (the field is private, hence the accessor), so `jit.cpp`
+cannot grow a second copy of the layout that drifts.
+
+**The helper is DELETED** (delete-originals): the interpreter has its own
+`VM_CASE(StrLen)`, so `jit_str_len` became unreachable. Its
+`ML_JIT_OP_RAN` slot went with it, so `StrLen` is out of the nativized-ops
+coverage table; the execution proof is the emit-side `g_jit_strlen_fast`,
+asserted by `jit_len_ord`.
+
+**A VACUOUS SABOTAGE, worth recording.** The first attempt swapped
+`str_len_off` for `arr_len_off` - and the suite stayed GREEN, because
+`SharedStr` and `SharedArrayObj` have the same head layout
+(`intrusive_ptr` + `off` + `len` + `slice`), so the two offsets are
+EQUAL. The discriminating sabotage is `arr_off_off` (the window OFFSET,
+a different field), which fails 3 tests. `jit_len_ord` also gained a
+SLICE case - a window with a non-zero `off` is precisely where reading
+`len` and reading `off` diverge.
+
+Measured (`OPT=1 ASSERTS=0`, callgrind Ir, both sides built this session):
+
+    75_indexed_unpack     2414M -> 2004M   -16.98%
+    29_str_slice_readonly 56.8M -> 47.8M   -15.84%
+    30_str_index_iterate                    -0.01%   (its len() is the
+                                                      for-range bound -
+                                                      evaluated ONCE)
+    31_split_join / 47_wordcount / 41_str_int_conv    +-0.00%
+
+75_indexed_unpack was the WORST bench against C++ (20.03x) and calls
+`len()` twice per row, which is where the whole 17% sits.
