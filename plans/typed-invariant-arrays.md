@@ -682,6 +682,56 @@ so C4e only exists because C4d landed first.
 Measured 194 -> 170 Ir/iteration (**-12.4%**), cumulative with C4d
 **234 -> 170 (-27.4%)**. Lever `cest`.
 
+### C5 (DESIGNED, not built): release-at-entry unlocks the ref-listed temps
+
+Scoping #116 - "peel the first iteration so the hot copy can assume what
+one iteration established" - found that the leading case does NOT need a
+peel. It needs C4e's trick a second time: **make the invariant true at
+the fragment entry instead of proving it per store.**
+
+THE COST. `store_dst` emits a 4-instruction guard (`mov rcx, dst.type;
+mov rcx, [rcx+8]; cmp rcx, 8; jb`) before the two-store whenever the dst
+is REF-LISTED, plus a cold `jit_put_int` block in the fragment text. In
+64 that is 5 sites x 4 = 20 of the remaining 170 Ir/iteration, and it
+fires on `main`-level loops generally, because main reuses its low temps
+for argv/print so they are all ref-listed.
+
+THE MECHANISM. At the fragment entry (and every entry stub), for each
+qualifying temp emit the SAME check once - `if (type >= t_str) call
+jit_release_slot` - after which the slot provably holds a trivial value.
+Every store to it in the run then skips the guard: 6 instructions per
+store become 2, at a one-off ~4 per entry.
+
+THE GATE, all of it already computed:
+ - a REF-LISTED TEMP (`slot >= slot_count`) - locals are not scratch and
+   are covered by C3 already;
+ - `idst`/`fdst` and NOT `disq`/`disq_f` from `pick_cached_slots` - "an
+   int/float op writes it in this run and nothing touches it through
+   memory in a way the emitter cannot account for", the identical
+   soundness C3 inc 2's type elision already relies on;
+ - dead-in at the run head AND at every entry stub (`jit_fwd_info`'s
+   `livein`, C4a-i's gate) - the release must not destroy a live value;
+ - stored inside a LOOP in the run (C4b's loop-scoped profitability
+   rule), or the entry cost is not repaid.
+
+WHY THIS IS THE SAME IDEA AS C3 INC 3. That increment admitted temps to
+the float type-store elision but required `!ref_listed`, because the
+flush stamps t_float at every exit including one taken before the run's
+first write, which would hide a reference an earlier run left there from
+`pop_window`'s release scan and LEAK it. A release at entry removes
+exactly that objection - so the same change plausibly unlocks the type
+elision for these temps too, and both should be measured together.
+
+Nets it will need: an emitted-code counter (the guarded form must stay
+covered by a shape that does NOT qualify), a LeakSanitizer run (the
+release is the whole soundness argument), and `MYLANG_JIT_COLD=refstore`,
+which forces the arm this deletes.
+
+NOT the peel. A first-iteration peel is still the general answer for a
+property that is false on iteration 1 and true after, and doubles a
+region's fragment text to get it; it stays on the list, but it is not
+what this case wants.
+
 **What the C-series leaves on 64.** The remaining ~170 Ir are, per the
 emitted code: the five member reads' ref-listed STORE guards (5 sites x
 4 instructions - `store_dst`'s "does the dst temp currently hold a
