@@ -8458,6 +8458,31 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
 bool op_writes_scalar(OpCode op)
 {
     switch (op) {
+    /*
+     * THE B1/B2 SPECIALIZED FAMILY. They exist only AFTER
+     * specialize_arith_ops, which runs after compute_ref_slots below -
+     * so for THAT consumer listing them changes nothing. They are here
+     * for the consumers that ask at JIT time, on the specialized code
+     * (C5's release picker), where their absence made the conservative
+     * "not a scalar write" answer decline most real arithmetic.
+     *
+     * This is the AUDIT-TABLE STAGE TRAP (CLAUDE.md) a second time, on
+     * the sibling table: `visit_use_def` was fixed for this exact family
+     * on 2026-08-04, and this one was not, because at the stage it was
+     * written for it cannot see them either.
+     */
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::IntAndRR: case OpCode::IntAndRI:
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:
+    case OpCode::IntXorRR: case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShlRI:
+    case OpCode::IntShrRR: case OpCode::IntShrRI:
+    case OpCode::IntModRI:
+    case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR: case OpCode::FloatMulRI:
     case OpCode::IntBin: case OpCode::FloatBin:
     case OpCode::CmpIntV: case OpCode::CmpFloatV:
     case OpCode::IntAddModRI: case OpCode::IntAddStep:

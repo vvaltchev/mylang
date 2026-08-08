@@ -1371,6 +1371,23 @@ conservatism - lever A's documented throttle). PINNED by
 count of admitted TEMPS: `g_jit_fread` cannot see this - it bumps per
 fragment ENTRY, which the two LOCALS alone satisfy - and removing the
 family from the table again fails the test (watched).
+**IT RECURRED ON THE SIBLING TABLE (2026-08-05), and that is the
+strongest possible argument for the rule below.** `op_writes_scalar`
+lives in the SAME file, is consulted by `compute_ref_slots` at the SAME
+pre-specialization stage, and was NOT fixed when `visit_use_def` was -
+because at that stage it cannot see the family either, so its absence
+was equally invisible. **C5** is the first consumer to ask it at JIT
+time, on the specialized code, and its conservative "not a scalar
+write" answer silently refused most real arithmetic: 64_struct_create
+kept every store guard it was supposed to lose. Adding the 23 opcodes
+changed NOTHING for `compute_ref_slots` (they do not exist at its
+stage - `-vd` dumps are byte-identical) and read **-32.0% on
+54_mandelbrot, -28.1% on 03_int_arith, -24.1% on 64_struct_create,
+-16.7% on 06_if_branch, -15.4% on 07_nested_loops, -14.8% on
+04_float_arith**, -7.1% / -5.8% / -1.2% on 55/46/40, everything else
+byte-flat. The net is a `jit_release_c5` case whose qualifying temps
+are written ONLY by the specialized family, so the table losing them
+again fails a test instead of costing 20% in silence.
 **THE RULE this earns:** a table is "audited" only for the PIPELINE
 STAGES that existed when it was written. A pass added later, at a
 DIFFERENT stage, sees a different opcode universe - and a conservative

@@ -22401,6 +22401,41 @@ static bool jit_release_c5()
      * answer.) So the assertion is that NOTHING was released here, which
      * is exactly what the gate decides.
      */
+    /*
+     * THE B1/B2 SPECIALIZED FAMILY, asserted through C5's own pick -
+     * this is the audit-table net, not just another value case.
+     *
+     * `op_writes_scalar` is consulted by compute_ref_slots, which runs
+     * BEFORE specialize_arith_ops, so the 23 specialized opcodes never
+     * reach it there and their absence from the table is invisible at
+     * that stage. C5 asks the SAME table at JIT time, on the specialized
+     * code, where the conservative "not a scalar write" answer refuses
+     * the temp. This loop's qualifying temps are written ONLY by
+     * IntMulRI / IntAddRI / IntSubRR / IntAddRR, so if the family leaves
+     * the table again nothing is released here and this fails - which is
+     * exactly how the gap was found (64_struct_create silently kept its
+     * store guards).
+     */
+    const unsigned long r2 = g_jit_release_entry;
+    if (!run({
+            "var av = [\"6\"];",
+            "var n = int(av[0]);",
+            "var s = 0;",
+            "for (var i = 0; i < n; i++) {",
+            "    var a = i * 3 + 1;",
+            "    var b = a * 2 - i;",
+            "    s += a + b;",
+            "}",
+            "assert(s == 138);",
+            "print(av[0]);" }))
+        return false;
+    if (g_jit_release_entry <= r2) {
+        fprintf(stderr, "jit_release_c5: nothing released in a loop whose "
+                        "temps are written by the SPECIALIZED arith family "
+                        "- op_writes_scalar has lost them again\n");
+        return false;
+    }
+
     const unsigned long r1 = g_jit_release_entry;
     if (!run({
             "var av = [\"3\"];",
