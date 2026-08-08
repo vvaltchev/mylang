@@ -1545,7 +1545,7 @@ struct VmCallRec {
     int_type dst = -1;                /* parent slot for the return value */
     const FuncDescriptor *desc = nullptr;   /* callee (backtrace); null for
                                              * the root/main frame */
-    std::vector<LValue> *caller_captures = nullptr;  /* ctx.captures to
+    CaptureSlots *caller_captures = nullptr;  /* ctx.captures to
                                                       * restore on pop */
 
     /* Per-FRAME exception/iterator state (was vm_run_chunk locals - one
@@ -5595,7 +5595,7 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
     struct Restore {
         VmActivation &a;
         EvalContext &c;
-        std::vector<LValue> *caps;
+        CaptureSlots *caps;
         EvalContext *gctx;                 /* #60: saved g_current_ctx */
         ~Restore() {
             g_current_ctx = gctx;

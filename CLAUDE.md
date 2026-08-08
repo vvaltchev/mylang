@@ -2528,7 +2528,8 @@ sanitizers never reproduced it.)
   not a `dynamic_cast`.
 - **Top-level functions AND escaped variables are slotted in a GLOBAL table
   (`SymKind::global`).** A global symbol can't be a *frame* slot — a function
-  body runs parented to its definition scope (`capture_ctx` → root), not the
+  body runs parented to its definition scope (`capture_root`, the program
+  root), not the
   call site, so a global reference from deep in a recursion isn't in the current
   `frame`. Instead each top-level function AND each top-level variable some
   function reads gets a static slot in a program-wide **`GlobalFuncTable`**
@@ -2639,7 +2640,7 @@ sanitizers never reproduced it.)
   emplaces into a discarded map). A genuinely-undefined name at runtime reaches
   `lookup` on an empty map → `UndefinedId` → `UndefinedVariableEx`, as before.
 - **Captured variables are slotted (`SymKind::capture`).** A closure's explicit
-  `[x,y]` capture list is snapshot into a per-instance `vector<LValue>`
+  `[x,y]` capture list is snapshot into a per-instance **`CaptureSlots`**
   **`FuncObject::capture_slots`** at closure creation (`func.cpp.h`), in
   declaration order; a body reference to a captured name resolves to
   `SymKind::capture` + its index there, read/written via **`EvalContext::
@@ -2659,9 +2660,16 @@ sanitizers never reproduced it.)
   / global / capture assignment fast paths). `clone()` of a capturing
   `FuncObject` deep-copies `capture_slots` (independent per clone); a
   non-capturing one clones to itself (the `capture_slots.empty()` check in
-  `TypeFunc::clone`). `capture_ctx` survives only as the empty linking context
-  that parents the body's args-context to root (for `gfuncs` + the builtins
-  map).
+  `TypeFunc::clone`). **`CaptureSlots` (eval.h) is a hand-rolled tiny vector,
+  not a `std::vector`** (G2, 2026-08-06): `inline_cap` (2) slots live inside
+  the `FuncObject`, so the common closure — every capture list in bench/,
+  samples/ and tests/functional/ is exactly ONE name — allocates NOTHING,
+  and only a wider list takes a heap buffer. **Its data pointer MUST stay the
+  FIRST member**: the JIT walks `ctx->captures->data()` as a bare
+  `mov r9,[rax+0]` (`emit_ctx_chain_r9`), which is where libstdc++ puts
+  `vector`'s `_M_start`; a `static_assert` in `layout_contract()` enforces it.
+  A `CaptureSlots` is neither movable nor assignable, since its pointer may
+  point into itself.
 - **Builtins are slotted (`SymKind::builtin`).** A builtin reference the
   resolver couldn't shadow with a user symbol resolves to `SymKind::builtin`
   plus an index into the program-wide **builtin table** (`builtin_slot`,
@@ -2738,14 +2746,19 @@ sanitizers never reproduced it.)
   Override `do_eval`, not `eval`.
 - **Function call scoping is lexical/closure-based, and the call model is
   AST-FREE.** `do_func_call` binds params into an `args_ctx` whose parent is
-  the function's **`capture_ctx`**, not the call site. A `FuncObject` holds a
+  the function's **`capture_root`**, not the call site. A `FuncObject` holds a
   **`const FuncDescriptor *`** (funcdesc.h — NEVER a `FuncDeclStmt*`), the
   per-instance **`capture_slots`** (captured values, read via
   `SymKind::capture`; snapshot at creation from the descriptor's RESOLVED
   capture kind/slot list via `read_sym`, the descriptor twin of
-  `Identifier::do_eval` — no capture Identifier is evaluated), and that
-  `capture_ctx` — an empty context parented to the *root* whose only job is
-  to link the body's `args_ctx` to root (for `gfuncs` + the builtins map).
+  `Identifier::do_eval` — no capture Identifier is evaluated), and
+  **`capture_root`** — the program root (`get_root_ctx` at creation), which
+  the body's `args_ctx` parents to so it reaches `gfuncs` + the builtins map.
+  That used to be an `EvalContext capture_ctx` BY VALUE, an empty node whose
+  only job was to be that parent; constructing one cost ~39 Ir per closure and
+  carried a `std::map` nobody wrote, and since the ctor inherits
+  repl_mode/frame/gfuncs/captures from the parent and the node passed all four
+  through unchanged, parenting straight to the root is byte-identical (G2).
   Binding reads the descriptor's `ParamDesc` snapshot (uid, opt, const,
   decl_type); the tree-walker reaches the body via `desc->decl` (null after
   the `-vm` AST teardown, where every call runs the compiled chunk). The

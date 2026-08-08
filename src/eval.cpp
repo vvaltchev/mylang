@@ -659,8 +659,11 @@ do_func_call(EvalContext *ctx,
              size_t call_pc = 0,
              bool as_signal = false)
 {
-    /* func_ctx == true gives this call its own FlowState (see eval.h) */
-    EvalContext args_ctx(&obj.capture_ctx, false, true);
+    /* func_ctx == true gives this call its own FlowState (see eval.h).
+     * The parent is the closure's captured ROOT (G2): the empty link context
+     * that used to sit between them passed root's fields through unchanged -
+     * see FuncObject::capture_root. */
+    EvalContext args_ctx(obj.capture_root, false, true);
 
     /*
      * A SymKind::capture reference in the body reads this closure's
