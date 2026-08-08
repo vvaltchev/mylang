@@ -234,14 +234,52 @@ Measured (callgrind Ir, `OPT=1 ASSERTS=0`, this change alone):
 01_while_loop **-5.92%**, 07_nested_loops **-5.43%**, 03_int_arith
 **-4.00%**; everything else within +-0.09%.
 
-### Next: the other bad() sites, ranked by what actually fires
+### The audit exists now: MYLANG_CACHEAUDIT=1
 
-Instrument `pick_cached_slots` (count disqualifications per opcode) and run
-bench/ + samples/ - do NOT guess the order. Each op needs its own argument
-for why a pinned operand is type-safe there; `MoveV`'s was "the source is
-int-proven by something else, and I add no evidence of my own". `SubscriptV`
-(leas &slot for base/idx/dst) and the boxed `CompoundV`/`UnaryV` are the
-obvious next reads, but the instrumentation decides.
+`pick_cached_slots` counts, per opcode, the slot candidacies its `bad()`
+killed - a slot that is a resolved local and used often enough to have
+cleared the threshold, so only the disqualification stopped it. Printed at
+exit. Over bench/ + samples/ (85 programs), AFTER the MoveV change:
+
+    pinned 177   lost 27
+
+    MoveV             6      (the DEST side, which must stay memory-only)
+    StoreElemValue    6
+    FloatMulRI        5      | float slots - correctly disqualified,
+    CompoundV         4      | an int cache can never hold them
+    DictStore         4
+    SubscriptV        2
+    FloatSubRR        1
+    BinOpV            1
+
+Two things that reads off immediately: the remaining opportunity is SMALL
+(27 lost against 177 pinned, and ~6 of the 27 are float slots an int cache
+could never take), and no single site is worth much.
+
+### THE RULE for which bad() sites are worth removing
+
+There are two kinds, and only one is addressable:
+
+  - the op can read the REGISTER (MoveV: the copy is just an int store).
+    Removing its bad() is free and a clear win.
+  - the op's helper must see MEMORY - anything taking `&slot`, or reading
+    the frame through `g_current_ctx`: the container stores, the boxed
+    ladder, the subscript read. Keeping the value in a register then means
+    writing it back before EVERY execution of that op.
+
+The second case was BUILT AND MEASURED - flush the one operand at the emit
+(two stores, no reload, much cheaper than marking the op a barrier, which
+flushes and reloads the whole pool) and stop disqualifying it. It does not
+pay: 23_dict_insert -0.42%, but 46_matrix_mult +0.27%, 43_sieve +0.04%,
+14_array_subscript +0.03%, 56_sieve_bool +0.01%, 62_dict_word_count
++0.00%. The flush costs 2 stores per ITERATION while the register saves
+~1 load per other use of the counter, so it lands on zero. **The
+disqualification at those sites is the RIGHT trade, not an oversight** -
+reverted, and the reason is recorded above `pick_cached_slots`.
+
+So the cache-awareness arc is DONE unless a new op appears that can read
+its operand from a register. Check the audit first, then check which kind
+the site is.
 
 Recorded rather than kept, because shipping a measurable-but-negative
 change that provably does not do its job is worse than a written finding.

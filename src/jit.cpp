@@ -2381,6 +2381,45 @@ static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
     store_dst(e, ck, src, slot, bail_pc);
 }
 
+/* THE REGISTER-CACHE AUDIT (env MYLANG_CACHEAUDIT=1). Which opcode
+ * DISQUALIFIED a slot that would otherwise have been pinned - the "what to
+ * make cache-aware next" surface. A bad() site only matters in proportion
+ * to the candidates it actually kills, and that is not readable off the
+ * source: it depends on which shapes real programs compile to. Off by
+ * default, so a normal compile pays one already-loaded bool test per
+ * bad(). Printed at exit by cache_audit_report (mylang.cpp / the harness).
+ */
+bool g_cache_audit = getenv("MYLANG_CACHEAUDIT") != nullptr;
+static std::unordered_map<int, long> g_cache_killed;   /* opcode -> kills */
+static long g_cache_pinned = 0, g_cache_lost = 0;
+
+static const char *jit_op_name(OpCode op)
+{
+#define ML_OPCODE_NAMEV(N) #N,
+    static const char *const names[] = { ML_FOR_EACH_OPCODE(ML_OPCODE_NAMEV) };
+#undef ML_OPCODE_NAMEV
+    const size_t i = static_cast<size_t>(op);
+    return i < sizeof(names) / sizeof(names[0]) ? names[i] : "?";
+}
+
+void jit_cache_audit_report()
+{
+    if (!g_cache_audit)
+        return;
+    std::vector<std::pair<long, int>> v;
+    for (const auto &kv : g_cache_killed)
+        v.push_back({ kv.second, kv.first });
+    std::sort(v.begin(), v.end(),
+              [](const std::pair<long,int> &x, const std::pair<long,int> &y)
+              { return x.first != y.first ? x.first > y.first
+                                          : x.second < y.second; });
+    fprintf(stderr, "CACHEAUDIT pinned %ld lost %ld\n",
+            g_cache_pinned, g_cache_lost);
+    for (const auto &pr : v)
+        fprintf(stderr, "CACHEAUDIT %-26s %ld\n",
+                jit_op_name(static_cast<OpCode>(pr.second)), pr.first);
+}
+
 /* How many hot slots a fragment may pin: one per available CALLEE-SAVED
  * register (r12-r15). They survive a helper call for free, so the pool
  * costs one push/pop per fragment ENTRY instead of one per CALL - which
@@ -2404,6 +2443,29 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * later LoadElemValue InternalErrorEx). A resolved local has a stable
  * identity and (being counted here only via proven-int ops) a stable int
  * type, so it is safely owned. */
+/* WHICH bad() SITES ARE WORTH REMOVING - the rule, from measurement.
+ *
+ * There are two kinds. An op that can read the REGISTER (MoveV: the copy
+ * is just an int store) becomes cache-aware for free, and removing its
+ * bad() is a clear win - 01_while_loop -5.92%, 07_nested_loops -5.43%.
+ * An op whose helper must see MEMORY - anything taking &slot, or reading
+ * the frame through g_current_ctx (the container stores, the boxed
+ * ladder, the subscript read) - cannot: keeping the value in a register
+ * means writing it back before EVERY execution of that op.
+ *
+ * That second case was BUILT AND MEASURED (flush the one operand at the
+ * emit, two stores, no reload - much cheaper than marking the op a
+ * barrier, which flushes and reloads the whole pool). It does not pay:
+ * 23_dict_insert -0.42% but 46_matrix_mult +0.27%, 43_sieve +0.04%,
+ * 14_array_subscript +0.03%, 56_sieve_bool +0.01%, 62_dict_word_count
+ * +0.00%. The flush costs 2 stores per ITERATION while the register saves
+ * ~1 load per other use of the counter, so it lands on zero. The
+ * disqualification these sites do is the RIGHT trade, not an oversight.
+ *
+ * So: a bad() site is worth removing only when the op can be taught to
+ * read the register itself. MYLANG_CACHEAUDIT=1 ranks the sites by
+ * candidacies killed; check that FIRST, then check which kind it is.
+ */
 static std::vector<int>
 pick_cached_slots(const Chunk &ck, size_t begin,
                   size_t end, int slot_count,
@@ -2422,10 +2484,27 @@ pick_cached_slots(const Chunk &ck, size_t begin,
     std::unordered_map<int, int> use;    /* slot -> int-scalar use count */
     std::unordered_set<int> disq;
     const auto usei = [&](int s) { if (s >= 0) use[s]++; };
-    const auto bad  = [&](int s) { if (s >= 0) disq.insert(s); };
+    /* CACHE AUDIT (env MYLANG_CACHEAUDIT=1): which opcode DISQUALIFIED a
+     * slot that would otherwise have been pinned. This is the "what to make
+     * cache-aware next" surface - a bad() site only matters in proportion
+     * to the candidates it actually kills, which is not guessable from the
+     * source (MoveV looked obvious and was; the rest is an open question).
+     * Recorded only when the audit is on, so a normal compile pays one
+     * null test per bad(). */
+    std::unordered_map<int, std::vector<OpCode>> killed_by;
+    const bool audit = g_cache_audit;
+    OpCode cur_op = OpCode::Halt;
+    const auto bad  = [&](int s) {
+        if (s < 0)
+            return;
+        disq.insert(s);
+        if (audit)
+            killed_by[s].push_back(cur_op);
+    };
 
     for (size_t pc = begin; pc < end; pc++) {
         const Instr &in = code[pc];
+        cur_op = in.op;
         switch (in.op) {
         case OpCode::IntBin:
         case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
@@ -2508,14 +2587,18 @@ pick_cached_slots(const Chunk &ck, size_t begin,
         case OpCode::DictStore:
             /* the fragment passes &slot for base/key/value, so those slots
              * must hold CURRENT EvalValues - a cached int key (a counter used
-             * as d[i]) would leave its slot stale. Disqualify all three. */
+             * as d[i]) would leave its slot stale. Disqualify all three -
+             * flushing them at the emit instead was measured and REJECTED,
+             * see the note above pick_cached_slots. */
             bad(in.target2); bad(in.a_slot()); bad(in.b_slot());
             break;
         case OpCode::StoreElemValue:
             /* jit_store_elem_value reads idx (a_slot) + val (b_slot) - and a
-             * LOCAL base (target2) - from MEMORY via g_current_ctx; a cached int
-             * index (a counter used as a[i]) would be stale. The base is a frame
-             * slot only for a LOCAL base (kind == target == 0). */
+             * LOCAL base (target2) - from MEMORY via g_current_ctx. The idx and
+             * index (a counter used as a[i]) would be stale. FLUSHING it at the
+             * emit instead was measured and REJECTED - see the note above
+             * pick_cached_slots. The base is a frame slot only for a LOCAL
+             * base (kind == target == 0). */
             if (in.target == 0) bad(in.target2);
             bad(in.a_slot()); bad(in.b_slot());
             break;
@@ -2904,6 +2987,26 @@ pick_cached_slots(const Chunk &ck, size_t begin,
     std::vector<int> out;
     for (size_t i = 0; i < cand.size() && i < MAX_CACHED; i++)
         out.push_back(cand[i].second);
+
+    /* AUDIT: a slot LOST to disqualification is one that is a resolved
+     * local and used often enough to have cleared the threshold - i.e. it
+     * would have been a candidate, and only bad() stopped it. Attribute it
+     * to EVERY opcode that disqualified it (they share the blame; making
+     * just one cache-aware may not free the slot on its own, which is
+     * itself worth seeing in the numbers). */
+    if (audit) {
+        g_cache_pinned += static_cast<long>(out.size());
+        for (const auto &kv : use) {
+            if (kv.first >= slot_count || kv.second < 3
+                    || !disq.count(kv.first))
+                continue;
+            g_cache_lost++;
+            std::unordered_set<int> seen;
+            for (const OpCode o : killed_by[kv.first])
+                if (seen.insert(static_cast<int>(o)).second)
+                    g_cache_killed[static_cast<int>(o)]++;
+        }
+    }
     return out;
 }
 
@@ -7656,6 +7759,10 @@ ContainerPlan jit_container_plan(const Chunk &, const JitCtx *)
 void jit_type_singletons(const void *&ti, const void *&tf, const void *&ta)
 {
     ti = tf = ta = nullptr;
+}
+
+void jit_cache_audit_report()
+{
 }
 
 #endif
