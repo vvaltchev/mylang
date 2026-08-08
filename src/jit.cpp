@@ -72,6 +72,8 @@ unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_callee_cache = 0;  /* G1: callee-cache HITS (emitted) */
 unsigned long g_jit_callee_cache2 = 0; /* G1: hits on the SECOND entry */
+unsigned long g_jit_bind_coerce = 0;   /* G1: inline pushes to a callee
+                                        * with a coercing param */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 unsigned long g_jit_ret_inline = 0;    /* C4c: inline-pop returns run */
 /* C4a-i: TEMP slots admitted to the float read-elision set, process-wide.
@@ -2651,7 +2653,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      */
     const uint64_t cache_addr = cache_cell
         ? reinterpret_cast<uint64_t>(&cache_cell->desc[0]) : 0;
-    size_t j_hit0 = 0, j_hit1 = 0, j_over = 0;
+    size_t j_hit0 = 0, j_hit1 = 0;
     if (cache_addr) {
         movabs_r11(cache_addr);
         modrm(0x3B, RAX, R11, 0, true);               /* cmp rax, [r11] */
@@ -2659,8 +2661,6 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         modrm(0x3B, RAX, R11, 8, true);               /* cmp rax, [r11+8] */
         j_hit1 = e.j32(0x74);                         /* je hit */
     }
-    cmp_b_imm8(RAX, static_cast<int32_t>(P.desc_fast_bind), 0);
-    j_slow.push_back(e.j32(0x74));                    /* je slow */
     /* nparams == NARGS via the vector's byte length */
     ld(RCX, RAX, static_cast<int32_t>(P.desc_params) + 8);
     modrm(0x2B, RCX, RAX, static_cast<int32_t>(P.desc_params), true);
@@ -2688,6 +2688,31 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      */
     cmp_b_imm8(RCX, static_cast<int32_t>(P.ck_plain_frame), 0);
     j_slow.push_back(e.j32(0x74));                    /* je slow */
+    /*
+     * THE BIND PLAN. `fast_bind` means no parameter needs bind-time work, so
+     * the unrolled copy loop below IS the whole bind - that path is unchanged
+     * and gets cached. Otherwise some parameter is declared `int`/`float` and
+     * wants coerce_to_decl_type, which the plain copy would skip.
+     *
+     * That used to decline the entire call to the C++ tier - and measured
+     * 1.61x on an otherwise identical closure call, i.e. ANNOTATING a
+     * parameter, the thing the language encourages, made every call to it 61%
+     * more expensive. But the coercion is the IDENTITY whenever the argument
+     * already holds the declared type, which is what the inferencer normally
+     * produces, so the check belongs here (pre-mutation, where a decline is
+     * still possible) rather than in the flag.
+     *
+     * A widening argument (bool into an int param, int/bool into a float one)
+     * and a `none` still DECLINE: they are the rare shapes, and doing the
+     * conversion would have to happen in the copy loop, which runs after the
+     * record is pushed and so can no longer decline.
+     *
+     * Such a callee is deliberately NOT cached: the cache re-establishes
+     * DESCRIPTOR properties, and this one depends on the ARGUMENT VALUES,
+     * which change per call.
+     */
+    cmp_b_imm8(RAX, static_cast<int32_t>(P.desc_fast_bind), 0);
+    const size_t j_coerce = e.j32(0x74);              /* je -> coercing */
     if (cache_addr) {
         /* The whole chain passed - remember this callee, shifting so an
          * alternating pair settles into both entries instead of evicting
@@ -2697,13 +2722,39 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * instead measured +2 instructions per call on the probe - the
          * single callee sat behind a compare it could never pass.
          * r11 still holds the cell address, and r10 is not live until the
-         * frame-size arithmetic below. */
+         * frame-size arithmetic below. Only a fast_bind callee is cached:
+         * the coercing arm's checks depend on the ARGUMENT VALUES, which a
+         * descriptor match cannot re-establish. */
         ld(R10, R11, 0);                              /* r10 = entry 0 */
         st(R11, 8, R10);                              /* entry 1 = entry 0 */
         st(R11, 0, RAX);                              /* entry 0 = desc */
-        j_over = e.j32(0xEB);                         /* jmp over the hit */
+    }
+    const size_t j_plain = e.j32(0xEB);               /* jmp -> done */
+    /*
+     * The coercing arm: every parameter whose bind_req is set must find its
+     * argument ALREADY holding that type, or the plain copy below would skip
+     * a real conversion. rcx still carries the callee chunk, so the scratch
+     * here is r11 (the cache cell address is dead on this path) and r10.
+     */
+    e.patch32_here(j_coerce);                         /* coercing: */
+    ld(R11, RAX, static_cast<int32_t>(P.desc_bind_req));
+    for (int i = 0; i < NARGS; i++) {
+        ld(R10, R11, i * 8);                          /* the required Type* */
+        e.u8(0x4D); e.u8(0x85); e.u8(0xD2);           /* test r10, r10 */
+        const size_t j_next = e.j32(0x74);            /* je next (no coerce) */
+        modrm(0x39, R10, RBX,
+              (ARGBASE + i) * 48 + 24, true);         /* cmp [arg.type], r10 */
+        j_slow.push_back(e.j32(0x75));                /* jne slow */
+        e.patch32_here(j_next);
+    }
 #ifdef TESTS
-        /* The two arms are counted SEPARATELY so a test can tell WHICH
+    movabs_r11(reinterpret_cast<uint64_t>(&g_jit_bind_coerce));
+    e.u8(0x49); e.u8(0xFF); e.u8(0x03);               /* inc qword [r11] */
+#endif
+    if (cache_addr) {
+        const size_t j_coerce_done = e.j32(0xEB);     /* jmp -> done */
+#ifdef TESTS
+        /* The two hit arms are counted SEPARATELY so a test can tell WHICH
          * entry answered - that is what pins the MRU shift order (a
          * monomorphic site must settle in entry 0; filling entry 1 first
          * leaves it one compare behind forever). A release build patches
@@ -2720,9 +2771,11 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.patch32_here(j_hit0);                       /* hit: */
         e.patch32_here(j_hit1);
 #endif
-        ld(RCX, RAX, static_cast<int32_t>(L.desc_vm_chunk)); /* rcx = cck */
-        e.patch32_here(j_over);
+        /* the HIT path alone still needs the callee chunk */
+        ld(RCX, RAX, static_cast<int32_t>(L.desc_vm_chunk));
+        e.patch32_here(j_coerce_done);
     }
+    e.patch32_here(j_plain);                          /* done: */
     /* rsi = total = frame_size + n_temps */
     if (!cached) {
         /* a PLAIN call from a cache-carrying caller declines (the stash

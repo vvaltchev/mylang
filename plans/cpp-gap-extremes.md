@@ -1046,3 +1046,107 @@ was monomorphic after all and the second entry was never exercised. The test
 now uses two distinct lambda decls. Same family as the shape-eaters already
 listed in CLAUDE.md, one level up: the eater here was not an optimizer pass
 but the KEY the mechanism uses.
+
+## G1 increment 3 LANDED 2026-08-07 - an annotated param no longer costs the
+## whole call
+
+The reach finding from increment 1 said `fast_bind` is false for any callee
+with an `int`/`float`-declared param. Measured properly, that is not a detail:
+
+    the same closure called 2,000,000 times, ONLY the annotation differs
+      func[z](dyn k) { return z + k; }     742.6M Ir     (371 per call)
+      func[z](int k) { return z + k; }   1,194.6M Ir     (597 per call)
+
+**1.61x - annotating a parameter, the thing the language encourages, made
+every call to it 61% more expensive.** `jit_call_sync_core` is 180M of that:
+the entire inline push declines, because a typed param needs
+`coerce_to_decl_type` and the emitted copy loop is a raw copy.
+
+But the coercion is the IDENTITY whenever the argument already holds the
+declared type - which is exactly what the inferencer produces for
+`func f(int x); f(<int expr>)`. So the question belongs in the GUARD phase
+(pre-mutation, where a decline is still possible), not in a per-descriptor
+flag.
+
+`FuncDescriptor::bind_req` is that plan: per parameter, the Type singleton
+its coercion requires (`t_int`/`t_float`, null for none), populated only when
+`fast_bind` is false. The emitted push tests `fast_bind` as before; on the
+false arm it walks the arguments and requires each to already hold its
+parameter's type, then falls into the SAME copy loop. Everything else - a
+widening (bool into int, int into float), a `none`, a wrong type - declines
+to the C++ tier exactly as before, correct and merely slower.
+
+**One derivation, four callers.** `fast_bind` was recomputed inline at three
+sites (vm_bind_chunk, vm_precompile_all pass A, the -vd splice pass) and now
+a fourth thing has to agree with it - the audit-table trap in miniature. So
+`compute_bind_flags` (eval.cpp) is the ONE place that reads `decl_type`, and
+all four call it, the fourth being the .myv reader: `bind_req` is derived and
+not stored, and recomputing `fast_bind` beside it turns the stored byte into
+a free cross-check of the param round trip (ML_CHECKed).
+
+**The coercing callee is deliberately NOT cached** (increment 2's cache
+re-establishes DESCRIPTOR properties; this one depends on the ARGUMENT
+VALUES, which change per call), so it runs the property chain plus ~5
+instructions per argument each time - against ~216 Ir for the C++ tier it
+used to take.
+
+A trap caught while reviewing the diff: the first version nested the whole
+bind plan inside the `if (cache_addr)` branch that emits the cache, so a
+site emitted WITHOUT a cell would have lost the `fast_bind` test altogether
+and raw-copied a coercing callee's arguments. The plan is now emitted
+unconditionally and only the cache store and hit stubs are conditional. It
+was latent rather than live (every site currently gets a cell), which is
+exactly why it was worth removing.
+
+### Measured (callgrind Ir, `OPT=1 ASSERTS=0`, both binaries this session)
+
+    q_int  (func[z](int k))   1,194.6M -> 602.6M   **-49.56%**
+    q_dyn  (func[z](dyn k))     742.6M -> 742.6M    +0.00%
+    q_proto (zero-arg)          454.1M -> 454.1M    -0.00%
+
+597 -> 301 Ir per call. The annotated version is now FASTER than the `dyn`
+one (602M vs 742M), which is the right order: a typed param also spares the
+body its boxed arithmetic.
+
+**bench/ is FLAT on all 14 call-heavy and control benches** (worst +0.06% on
+09_fib, inside compile-time noise) - and that is a finding about bench/, not
+about the change: NO benchmark annotates a parameter on a call-heavy path, so
+the suite cannot see a 1.61x that any annotated program pays. Worth a bench.
+
+### Sabotage - both watched failing
+
+- **Drop the per-argument type check** (accept any argument): the JIT-ON
+  differential modes fail, 1534/1535 - a `dyn` float raw-copied into an
+  `int` param, where the C++ tier throws. NOTE the headline stayed
+  `Tests passed: 1753/1753`: that is the TREE-WALKER pass, the documented
+  VM-only shape.
+- **Swap the required types** (an `int` param demands t_float and vice
+  versa): every call then declines - still CORRECT, only slower, so no
+  differential can see it. The counter does:
+  `g_jit_bind_coerce is ZERO after the whole suite - the lever is dead or
+  untested`.
+
+That second one is the reason the counter exists. A guard that is too strict
+is invisible to every correctness net in the project, because declining is
+always right.
+
+### The sibling case, measured and NOT taken: a WIDENING argument
+
+`func f(float x)` called as `f(i)` with an int `i` - an ordinary shape, and
+one the inferencer accepts - still declines on every call
+(`g_jit_bind_coerce` reads **0** for a 30-iteration loop of exactly that,
+against 100 for the exact-type twin). So the annotated-parameter penalty is
+removed for the exact case and remains in full for the widening one.
+
+Why it was not taken here: a widening (bool -> int, int -> float,
+bool -> float) is TOTAL - it cannot throw - so it could be done inline, but
+it has to happen in the COPY LOOP, which runs after the record is pushed.
+That means the guard phase would have to accept a SET of types per parameter
+(exact-or-widenable-or-none) and the copy loop would need a per-argument
+conversion arm. Two emitted pieces instead of one, for a case that is
+strictly rarer than the exact one. The genuinely un-inlinable residue is
+only the NARROWING throw (a float into an `int` param), which must stay a
+decline because it raises before the frame exists.
+
+Sized for whoever picks it up: it is the same ~296 Ir per call the exact
+case just won back, on the `f(<int>)`-into-`float` shape.

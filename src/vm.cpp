@@ -1960,11 +1960,7 @@ void vm_install_func_chunk(const FuncDescriptor *fdesc, Chunk &&ck)
     (void)owned;
     fdesc->vm_chunk = &owned;
     fdesc->vm_chunk_tried = true;
-    bool fast = true;                      /* == vm_precompile_all's rule */
-    for (const auto &p : fdesc->params)
-        if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
-            fast = false;
-    fdesc->fast_bind = fast;
+    compute_bind_flags(fdesc);             /* fast_bind + bind_req */
 }
 
 /* .myv LOAD: the AOT native tier over a loaded image - the two-pass shape
@@ -2215,11 +2211,7 @@ vm_precompile_all(const Block *root, bool jit)
         /* compiles + caches (or null); stamped on the DESCRIPTOR */
         fn->desc->vm_chunk = vm_func_chunk(fn->desc, /*jit=*/false);
         fn->desc->vm_chunk_tried = true;
-        bool fast = true;
-        for (const auto &p : fn->desc->params)
-            if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
-                fast = false;
-        fn->desc->fast_bind = fast;
+        compute_bind_flags(fn->desc);
     }
 
     /* #55 STEP 2.1: the global slot -> callee FuncDescriptor* map, so a
@@ -7174,6 +7166,7 @@ void jit_fill_push_layout(JitPushLayout *L)
     L->desc_frame_size =
         reinterpret_cast<const char *>(&fd.frame_size) - db;
     L->desc_fast_bind = reinterpret_cast<const char *>(&fd.fast_bind) - db;
+    L->desc_bind_req = reinterpret_cast<const char *>(&fd.bind_req) - db;
     L->param_desc_size = sizeof(FuncDescriptor::ParamDesc);
     Chunk ck;
     const char *cb = reinterpret_cast<const char *>(&ck);

@@ -1186,6 +1186,47 @@ static const std::vector<test> tests =
     },
 
     {
+        /*
+         * G1: a parameter declared `int`/`float` needs coerce_to_decl_type at
+         * bind, which used to decline the whole call to the C++ tier. The
+         * emitted push now checks, before any mutation, that the argument
+         * ALREADY holds the declared type - the coercion is then the identity
+         * and the plain copy is exact.
+         *
+         * Every case the check must REFUSE is here too, and each one is a
+         * real widening or error that the C++ tier still performs: a bool
+         * into an int param widens to 1, an int into a float param widens to
+         * 2.5, and a `dyn` float into an int param is the documented
+         * narrowing THROW. `runtime()` is what keeps those three dynamic - a
+         * literal would be folded or statically coerced and never reach the
+         * bind.
+         *
+         * The callees are CLOSURES, and the fast half runs in a LOOP: a named
+         * function is inlined or folded before codegen, and a first call
+         * declines on record reuse.
+         */
+        "jit: an int/float-declared param binds inline (G1 coercing bind)",
+        {
+            "func mki() { var b = 100;",
+            "  return func[b](int k) { return b + k; }; }",
+            "func mkf() { var b = 0.5;",
+            "  return func[b](float x) { return b + x; }; }",
+            "var fi = mki();",
+            "var ff = mkf();",
+            "var s = 0;",
+            "var t = 0.0;",
+            "for (var i = 0; i < 50; i++) { s = s + fi(i); t = t + ff(1.5); }",
+            "assert(s == 6225);",
+            "assert(t == 100.0);",
+            "assert(fi(runtime(true)) == 101);",     /* bool widens */
+            "assert(ff(runtime(2)) == 2.5);",        /* int widens */
+            "var caught = 0;",
+            "try { fi(runtime(2.5)); } catch (TypeErrorEx) { caught = 1; }",
+            "assert(caught == 1);",                  /* float never narrows */
+        },
+    },
+
+    {
         /* an OOB index inside a JIT array-read run throws OutOfBoundsEx
          * (the fragment bails; the interpreter re-runs the load) with the
          * byte-identical caret. */
@@ -23424,6 +23465,7 @@ static bool jit_counter_coverage()
         { "sync_inline",      &g_jit_sync_inline,      nullptr },
         { "callee_cache",     &g_jit_callee_cache,     nullptr },
         { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
+        { "bind_coerce",      &g_jit_bind_coerce,      nullptr },
         { "entry_resume",     &g_jit_entry_resume,     nullptr },
         { "ret_inline",       &g_jit_ret_inline,       nullptr },
         { "member_fast",      &g_jit_member_fast,      nullptr },
