@@ -4586,6 +4586,47 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
     );
 }
 
+/*
+ * Is this statement a NAMED func/struct declaration - one that must be BOUND
+ * at scope entry rather than when the statement is reached (#134)?
+ *
+ * Sound because such a declaration cannot depend on the enclosing frame: the
+ * grammar REJECTS a capture list on a named func (`func f[a](x)` is a
+ * SyntaxError - captures are for closure EXPRESSIONS only), and a named
+ * func's body is parented to `capture_root`, the program root, so it cannot
+ * read an enclosing local either (verified: it reports "Undefined variable").
+ * A struct is simpler still - its descriptor is computed at parse time.
+ *
+ * So creating the FuncObject / binding the descriptor at scope entry instead
+ * of at the statement is UNOBSERVABLE, and it is what makes a call to a
+ * function declared BELOW the call work - mutual recursion, "helpers at the
+ * bottom", a struct constructed above its `struct` line.
+ *
+ * A LAMBDA is deliberately NOT included: `var f = func(x) {...}` is an
+ * `Expr14` var declaration, not a FuncDeclStmt statement, so it keeps its
+ * declaration-point binding and its temporal dead zone - its capture
+ * snapshot must happen exactly where it is written.
+ */
+static bool is_hoistable_decl(const Construct *c)
+{
+    if (const auto *fd = dynamic_cast<const FuncDeclStmt *>(c))
+        return fd->id != nullptr;
+    if (const auto *sd = dynamic_cast<const StructDeclStmt *>(c))
+        return sd->id != nullptr;
+    return false;
+}
+
+/* Bind this block's named func/struct declarations before any statement runs
+ * (see is_hoistable_decl). Re-run on every ENTRY, so a decl in a loop body is
+ * still re-bound per iteration exactly as it was when the statement did it. */
+static void bind_hoistable_decls(const std::vector<unique_ptr<Construct>> &el,
+                                 EvalContext *ctx)
+{
+    for (const auto &e : el)
+        if (is_hoistable_decl(e.get()))
+            e->eval(ctx);
+}
+
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 {
     /*
@@ -4599,7 +4640,12 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
      */
     if (scope_free && ctx) {
 
+        bind_hoistable_decls(elems, ctx);
+
         for (const auto &e : elems) {
+
+            if (is_hoistable_decl(e.get()))
+                continue;               /* already bound above */
 
             EvalValue &&tmp = e->eval(ctx);
 
@@ -4651,7 +4697,12 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
      * is never observed.
      */
 
+    bind_hoistable_decls(elems, &curr);
+
     for (const auto &e: elems) {
+
+        if (is_hoistable_decl(e.get()))
+            continue;                   /* already bound above */
 
         EvalValue &&tmp = e->eval(&curr);
 
