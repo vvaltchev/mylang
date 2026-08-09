@@ -2638,3 +2638,58 @@ both JIT-ON differential modes. The removed guard itself is unfalsifiable at
 the emitted site (a slot can only be unbound on a site's FIRST executions,
 which decline on record reuse anyway) - which is exactly why the safety
 argument lives in the store/mark pairing, which is falsifiable.
+
+## G1 reach (2026-08-09): `MYLANG_JITSTATS=1`, and the PREPARATION's reach
+## claim is now STALE
+
+The arc kept needing one number and kept not having it: **which tier does a
+call on a REAL program actually take?** Every JIT counter exists and every
+JIT test asserts on one, but they were readable only from inside `-rt`, so
+"does ordinary recursion reach the inline push, or decline to the C++ tier?"
+could be asked of a hand-written probe and of nothing else. That is how the
+G1 PREPARATION came to quote a per-call cost for a path it then measured a
+large fraction of real calls never taking.
+
+`jit_stats_report()` (jit.cpp, called from the driver) prints the
+emitted-code counters after a script run when `MYLANG_JITSTATS=1`. A
+**TESTS=1 build only** - the bumps are `#ifdef TESTS` emitted code, so a
+release has no counters and printing zeros would be a lie; it says so
+instead. Inert otherwise: one `getenv` at exit.
+
+### What it says, `TESTS=1 OPT=1 ASSERTS=0`, scale 1
+
+    bench                sync_inline  cache  cache2  coerce_cached  ret_inline
+    10_recursion_deep      1,352,549  1,352,997    -            -   1,353,001
+    45_gcd                   149,998    149,998    -            -     150,000
+    76_funcval_dispatch      999,999    499,999  499,999        -   1,000,000
+    78_typed_param_call    2,000,001          -        -  1,999,998   1,999,999
+    09_fib_recursive          10,687     10,689    -            -           0
+
+**The PREPARATION's reach finding no longer holds.** It recorded
+
+    down(n) with an int param      0 inline pushes
+    zero-arg self-recursion        0
+
+and concluded the emitted push "serves the repeat-call shape, not the
+descend-deeper shape". Increments 3-5 closed both gates: 10_recursion_deep
+and 45_gcd now take the inline push on **essentially every call**, with a
+~100% callee-cache hit rate and an inline return to match. So the arc's
+per-call savings DO reach ordinary recursion, and the sentence saying they
+do not should not be quoted again.
+
+Two details the table settles, both by design rather than gaps:
+- **76** splits 50/50 across the two cache entries - the strict `add_op`/
+  `sub_op` alternation with MRU promotion, hitting on every call after the
+  first. That is exactly what the second entry was added for.
+- **78** hits neither entry: a coercing callee lives in the THIRD entry
+  (increment 5), and `coerce_cached` accounts for all 2M calls.
+
+### The one shape with NO inline return, and why it is not a bug
+
+**09_fib_recursive: 10,687 inline pushes, ZERO inline returns.** The
+inline pop declines when the record carries a `cache_key` or the frame has
+a live `pure_cache` - both documented gates - and `fib` is a
+`cache_results` function, so every one of its returns is the slow tier by
+construction. Not worth attacking: the AST recursion-unroll plus the
+per-frame pure-call cache already removed **99.4%** of fib's calls
+(~1.7M -> 10,687), so the return path there is no longer hot.

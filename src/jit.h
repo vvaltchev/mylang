@@ -313,6 +313,22 @@ size_t jit_enter(const void *frag, void *slots);
  * many slot candidacies its disqualification killed. The "what to make
  * cache-aware next" surface - see pick_cached_slots. */
 void jit_cache_audit_report();
+/*
+ * REACH (env MYLANG_JITSTATS=1): print the emitted-code counters after a
+ * script run - which TIER each shape actually took, on a real program.
+ *
+ * The arc kept needing this and kept not having it. The counters exist and
+ * every JIT test asserts on them, but they were readable only from INSIDE
+ * `-rt`, so a question like "does ordinary recursion reach the inline call
+ * push, or decline to the C++ tier?" could be asked of a hand-written probe
+ * and of nothing else. That is how the G1 preparation came to quote a per-
+ * call cost for a path a large fraction of real calls never take.
+ *
+ * A TESTS=1 build only: the bumps are `#ifdef TESTS` emitted code, so a
+ * release genuinely has no counters and printing zeros would be a lie. Say
+ * so rather than print them.
+ */
+void jit_stats_report();
 /* the SWITCHING entry (M5a): jit_call_sync_core's direct callee entry -
  * brackets its level's native-stack switch; plain when already active */
 size_t jit_enter_deep(const void *frag, void *slots);

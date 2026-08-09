@@ -4291,6 +4291,41 @@ static const char *jit_op_name(OpCode op)
     return i < sizeof(names) / sizeof(names[0]) ? names[i] : "?";
 }
 
+void jit_stats_report()
+{
+    if (!getenv("MYLANG_JITSTATS"))
+        return;
+#ifndef TESTS
+    fprintf(stderr, "jit stats: unavailable - the counter bumps are "
+                    "#ifdef TESTS. Rebuild with TESTS=1.\n");
+#else
+    struct Ent { const char *name; const unsigned long *v; };
+    /* Grouped by the question each group answers, not alphabetically. */
+    const Ent ents[] = {
+        /* how much ran natively at all */
+        { "frags",            &g_jit_frags },
+        { "native_calls",     &g_jit_native_calls },
+        { "native_returns",   &g_jit_native_returns },
+        /* THE CALL PROTOCOL - which tier each call took */
+        { "sync_inline",      &g_jit_sync_inline },
+        { "sync_switch",      &g_jit_sync_switch },
+        { "sync_boundary",    &g_jit_sync_boundary_call },
+        { "callee_cache",     &g_jit_callee_cache },
+        { "callee_cache2",    &g_jit_callee_cache2 },
+        { "coerce_cached",    &g_jit_coerce_cached },
+        { "bind_coerce",      &g_jit_bind_coerce },
+        { "bind_widen",       &g_jit_bind_widen },
+        { "ref_arg_binds",    &g_jit_ref_arg_binds },
+        { "ret_inline",       &g_jit_ret_inline },
+        { "entry_resume",     &g_jit_entry_resume },
+    };
+    fprintf(stderr, "jit stats\n");
+    for (const Ent &e : ents)
+        if (*e.v)
+            fprintf(stderr, "  %-16s %lu\n", e.name, *e.v);
+#endif
+}
+
 void jit_cache_audit_report()
 {
     if (!g_cache_audit)
@@ -12439,6 +12474,10 @@ void jit_type_singletons(const void *&ti, const void *&tf, const void *&ta)
 }
 
 void jit_cache_audit_report()
+{
+}
+
+void jit_stats_report()
 {
 }
 
