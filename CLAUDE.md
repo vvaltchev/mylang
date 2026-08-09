@@ -2443,9 +2443,15 @@ bound, and folded with DCE via `AutoConst::fold_specialized` (which *catches*
 const errors and discards, so a runtime error never becomes a compile one) then
 `refold`. Both **scalar** and **deep read-only array/dict** const args seed a
 specialization: a read-only array/dict is sound to substitute because it is
-only ever folded in read positions (`fold_reads` never rewrites an assignment
-lvalue or an lvalue builtin's first arg) and any *mutation* of it throws the
-same error at runtime as the un-specialized call (`prescan_blocked` gained a
+only ever folded in read positions - `fold_reads` never rewrites an assignment
+lvalue or an lvalue builtin's first arg, and (fixed 2026-08-02)
+`fold_lvalue_reads` folds only a write chain's INTERIOR reads (the indexes),
+never its base spine: folding the seed into `arr[j] = n`'s base produced
+`Obj([...])[j] = n`, which the tree-walker survived (same NotLValueEx as the
+un-specialized call) but the NO-FAIL codegen refused with NotLoweredEx - a
+compile refusal of a legal must-throw-at-runtime program. Any *mutation* of
+the seed throws the same error at runtime as the un-specialized call
+(`prescan_blocked` gained a
 `block_subscript_bases` flag; the relaxed seed set keeps the genuinely-unsafe
 blocks — capture, lvalue-builtin first arg, callee, foreach var — but lets a
 subscript/member READ base fold, since the
