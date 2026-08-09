@@ -371,6 +371,22 @@ This holds for every declaration (`var`, `const`, `func`, `struct`), and whether
 or not the condition is a compile-time constant. Declare the name *above* the
 statement if you need it afterwards.
 
+**A name declared nowhere is a compile error.** A misspelled or missing
+variable is refused before the program runs, not when execution reaches it:
+
+```C#
+var scaled = 10;
+var total = scaled * heigth;    # ERROR at compile time: undefined variable
+print(total);                   #        'heigth'
+```
+
+This costs nothing: a script resolves every name it can reach, so such a name
+was guaranteed to fail at run time anyway. A name declared *later* is a
+different matter and is still accepted (a function may read a global declared
+below it). The query builtins are exempt - `defined(x)`, `isconst(x)` and
+`isconstdecl(x)` never evaluate their argument, so asking about a name that
+exists nowhere is legal and answers `false`.
+
 **Top-level variables have an implicit `var`.** At the outermost scope (a
 statement directly in the program/REPL, not inside any block or function), a
 plain assignment to a name that hasn't been declared yet *is* its declaration —

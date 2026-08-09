@@ -96,6 +96,21 @@ struct Scope {
         DeclType type;
     };
     std::vector<Decl> decls;
+
+    /*
+     * Every name this scope's block DECLARES, including declarations
+     * lexically BELOW the current walk position. Filled by
+     * collect_scope_names BEFORE the block's statements are walked.
+     *
+     * Used ONLY by the FIX-1 check ("is this name declared anywhere in an
+     * enclosing scope?") - never by resolution, which still walks forward
+     * and so still reads an OUTER binding for a name shadowed later. That
+     * separation is deliberate: FIX-1 must distinguish "declared nowhere"
+     * (a typo - a compile error) from "declared below" (legal today, and
+     * what step 3's TDZ will turn into UseBeforeBindingEx), and
+     * `unresolved AT THIS POINT` cannot tell them apart.
+     */
+    std::vector<const UniqueId *> all_names;
 };
 
 /*
@@ -1200,12 +1215,24 @@ public:
          * global slot, stamp the function-side use sites recorded in pass 1: a
          * user global wins, else a builtin gets its table slot, else the name
          * stays unresolved (the runtime map -> UndefinedVariableEx). */
-        for (Identifier *id : escaped_refs) {
+        for (const EscapedRef &er : escaped_refs) {
+            Identifier *id = er.id;
             auto it = global_func_slots.find(id->uid);
-            if (it != global_func_slots.end())
+            if (it != global_func_slots.end()) {
                 id->sym = ResolvedSym{ SymKind::global, it->second };
-            else
-                stamp_builtin(id);
+                continue;
+            }
+            stamp_builtin(id);
+
+            /* FIX-1: not a global, not a builtin, and neither this function
+             * nor the top level declares the name anywhere - it can never
+             * bind. `root_decl_names` is the top-level scope's own pre-scan,
+             * kept because that scope is popped by the time we get here. */
+            if (!repl_mode && !er.lazy_arg && !id->is_underscore()
+                    && id->sym.kind == SymKind::unresolved
+                    && !er.declared_later
+                    && !root_decl_names.count(id->uid))
+                fix1_undefined(id);
         }
 
         /* Publish the global table's slot->name list to the root block, which
@@ -1242,7 +1269,25 @@ private:
      * assigned global slots). After pass 2, each is stamped SymKind::global if
      * its name turned out to be a top-level var (else left for the map: a
      * builtin / genuinely-undefined name). */
-    std::vector<Identifier *> escaped_refs;
+    /* FIX-1: every name the OUTERMOST top-level scope declares (its
+     * collect_scope_names pre-scan). Kept as a member because that scope is
+     * popped by the time the escaped_refs post-pass runs, and a function
+     * body's free name may legitimately refer to a global declared BELOW it. */
+    std::unordered_set<const UniqueId *> root_decl_names;
+
+    struct EscapedRef {
+        Identifier *id;
+        bool declared_later;    /* the function itself declares this name
+                                 * below the use - a forward LOCAL ref, so
+                                 * FIX-1 must not call it undefined */
+        bool lazy_arg;          /* the use is a LAZY builtin's argument
+                                 * (defined/isconst/isconstdecl): a question
+                                 * about the name, never a read */
+    };
+
+    /* Set while walking a lazy builtin's arguments - see the CallExpr walk. */
+    bool no_undef_check = false;
+    std::vector<EscapedRef> escaped_refs;
     /*
      * The GLOBAL table: every top-level function (hoisted up front so a forward
      * / mutually-recursive reference resolves) AND every top-level variable a
@@ -1442,6 +1487,72 @@ private:
         }
     }
 
+    /* Record every name an lvalue declares into `s` (see collect_scope_names).
+     * `_` IS recorded: it is never bound, but a reference to it must report
+     * "undefined", not "declared nowhere", and the two messages differ. */
+    static void collect_lvalue_names(Construct *lvalue, Scope &s)
+    {
+        if (auto *id = dynamic_cast<Identifier *>(lvalue)) {
+            s.all_names.push_back(id->uid);
+        } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
+            for (auto &id : il->elems)
+                s.all_names.push_back(id->uid);
+        }
+    }
+
+    /*
+     * Pre-scan a block's DIRECT statements for the names they declare, into
+     * the freshly-pushed scope. Mirrors the parser's pStmtDeclaresName: only
+     * a func decl, a struct decl and a var/const decl (an `Expr14` carrying
+     * pInDecl) can introduce a name into the scope that contains them - a
+     * nested if/loop/try declares only inside its OWN body, which gets its
+     * own scope and its own pre-scan.
+     *
+     * ADD TO THIS if a new declaring statement form appears: a missing kind
+     * makes FIX-1 report "declared nowhere" for a name that IS declared,
+     * i.e. it refuses a legal program.
+     */
+    static void collect_scope_names(Block *b, Scope &s)
+    {
+        for (auto &e : b->elems) {
+            Construct *c = e.get();
+
+            if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+                if (fd->id)
+                    s.all_names.push_back(fd->id->uid);
+            } else if (auto *sd = dynamic_cast<StructDeclStmt *>(c)) {
+                if (sd->id)
+                    s.all_names.push_back(sd->id->uid);
+            } else if (auto *ex = dynamic_cast<Expr14 *>(c)) {
+                if (ex->fl & pFlags::pInDecl)
+                    collect_lvalue_names(ex->lvalue.get(), s);
+            }
+        }
+    }
+
+    /* Is `uid` declared ANYWHERE in a live scope of `cur` - including below
+     * the current walk position? The FIX-1 "declared nowhere" test. */
+    static bool declared_in_live_scopes(const FuncState *cur,
+                                        const UniqueId *uid)
+    {
+        if (!cur)
+            return false;
+
+        for (const auto &s : cur->scopes) {
+            for (const UniqueId *n : s.all_names)
+                if (n == uid)
+                    return true;
+            /* A name already DECLARED (walked past) is in decls, not
+             * all_names, when the scope was pushed without a block
+             * pre-scan (a for/foreach/catch scope). */
+            for (const auto &d : s.decls)
+                if (d.name == uid)
+                    return true;
+        }
+
+        return false;
+    }
+
     /* Throw AlreadyDefinedEx if `id` is already declared in this scope. */
     void check_no_redecl(FuncState *cur, Identifier *id) const
     {
@@ -1503,7 +1614,9 @@ private:
              * it (global, else builtin, else leave for the map) after pass 2.
              */
             escaped.insert(id->uid);
-            escaped_refs.push_back(id);
+            escaped_refs.push_back(
+                EscapedRef{ id, declared_in_live_scopes(cur, id->uid),
+                            no_undef_check });
             return;
         }
 
@@ -1515,6 +1628,27 @@ private:
          * Not in the REPL, where builtins stay map-resident (redefinable).
          */
         stamp_builtin(id);
+
+        /* FIX-1: still unresolved, and no enclosing scope declares this name
+         * ANYWHERE (below included) - so it can never bind. Refuse now
+         * instead of failing at run time. */
+        if (!repl_mode && !no_undef_check && !id->is_underscore()
+                && id->sym.kind == SymKind::unresolved
+                && !declared_in_live_scopes(cur, id->uid))
+            fix1_undefined(id);
+    }
+
+    /*
+     * FIX-1 (#130): a name declared in NO scope is a COMPILE error.
+     *
+     * Free, because a SCRIPT's runtime symbols map is empty and asserted
+     * (eval.h), so such a name is GUARANTEED to fail at run time - this only
+     * moves a certain runtime failure to compile time. Never in the REPL,
+     * which is open-world: a later input may declare it.
+     */
+    [[noreturn]] static void fix1_undefined(const Identifier *id)
+    {
+        throw UndefinedVariableEx(id->uid->val, id->start, id->end);
     }
 
     /* Stamp `id` SymKind::builtin if its name is a builtin (and not in REPL
@@ -2065,8 +2199,15 @@ Resolver::walk(Construct *c, FuncState *cur)
         const bool track = cur && cur->slottable;
         const int start = track ? cur->next_slot : 0;
 
-        if (track)
+        if (track) {
             cur->scopes.emplace_back();
+            /* FIX-1: record what this block declares, INCLUDING below the
+             * walk position, before any statement resolves against it. */
+            collect_scope_names(b, cur->scopes.back());
+            if (cur->is_main && cur->scopes.size() == 1)
+                for (const UniqueId *n : cur->scopes.back().all_names)
+                    root_decl_names.insert(n);
+        }
 
         /* Hoist non-capturing nested funcs / structs into THIS scope first, so a
          * forward / mutual reference within the block resolves to its (block-
@@ -2173,9 +2314,25 @@ Resolver::walk(Construct *c, FuncState *cur)
     /* --- call: resolve callee + args, then devirtualize a global callee --- */
     if (auto *call = dynamic_cast<CallExpr *>(c)) {
         walk(call->what.get(), cur);
+
+        /* A LAZY builtin (`defined`/`isconst`/`isconstdecl`) never EVALUATES
+         * its argument - it asks a question ABOUT the name. So a name that
+         * exists nowhere is a legitimate question with the answer `false`,
+         * NOT a FIX-1 error; suppress the check for the duration of the
+         * argument walk (the name still resolves normally when it exists,
+         * which is what lets try_fold_defined fold it). */
+        const Identifier *cid = dynamic_cast<Identifier *>(call->what.get());
+        const bool lazy = cid && is_lazy_builtin(cid->uid);
+        const bool saved_nc = no_undef_check;
+
+        if (lazy)
+            no_undef_check = true;
+
         if (call->args)
             for (auto &a : call->args->elems)
                 walk(a.get(), cur);
+
+        no_undef_check = saved_nc;
 
         /* If the callee resolved to a global-table slot (a top-level / scoped
          * function, or a struct descriptor), record it so do_eval can read the
