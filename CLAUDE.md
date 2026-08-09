@@ -808,9 +808,16 @@ trivial values), while a ref-listed dst (a reused temp that may hold a
 reference NOW - releasing it needs C++) gets a type-check + bail. Layout
 facts (LValue stride 48, payload/type offsets via
 `EvalValue::jit_payload_off/jit_type_off` + a runtime probe, the int
-Type singleton) are baked as immediates. Gated
-`#if __x86_64__ && !_WIN32`; kill switch `-nj` / `MYLANG_JIT=0` (the
-same-binary A/B lever). The indirect call into a fragment goes through
+Type singleton) are baked as immediates. Gated on
+`ML_JIT_SUPPORTED` (jit.h - **Linux x86-64 ONLY**, maintainer decision
+2026-08-02: a platform is supported once it is TESTED there, and CI tests
+Linux. FreeBSD x86-64 after it is tested; Darwin x86-64 NEVER, a
+deprecated platform; Windows VM-only for a long time; aarch64 on all
+three when that backend lands). ONE macro, because a policy stated in 28
+places drifts. Kill switch `-nj` / `MYLANG_JIT=0` (the same-binary A/B
+lever); off-platform the tier compiles out and `g_jit_enabled` is always
+false, which is the same thing `-nj` selects.
+The indirect call into a fragment goes through
 `jit_enter` (no_sanitize("function") / gcc no_sanitize_undefined):
 UBSan's -fsanitize=function would else read a CFI type signature from
 the (absent) word before the fragment and fault on the guard page - a
@@ -1574,20 +1581,35 @@ exception is matched against the *static* C++ type; a user-level
 `throw <struct>` always surfaces as `ExceptionObject` (a.k.a.
 `DynamicExceptionEx`), not a distinct C++ type.
 
-**The `tests` list runs TWICE — once per execution engine (`g_exec_engine`) —
-but is COUNTED ONCE.** The headline `Tests passed: N/total` is unchanged
-(`total = tests + extra_checks + repl_tests`, the tree-walker pass). After it,
-`run_tests` reruns the **same** `tests` list under the **bytecode VM**
-(`vm_execute`, marked `vm:` in the output) and prints a **separate** line,
-`VM differential (same K tests via -vm): M/K` — it is the same tests a second
-time, not a new set, so it is *not* added to the headline total. Both must be
-green to `exit(0)`. This is the **differential-testing pillar** of the VM
-build-out (see "Execution strategy" + the plan): `check()` dispatches its final
-run on `g_exec_engine`, with the tree-walker as the oracle. Because the VM
-falls back to `do_eval` for any construct not yet lowered natively, the
-differential pass is green by construction today and stays a regression net as
-native opcodes land. A new functional test therefore auto-covers both engines
-with no extra work.
+**THE 3-WAY DIFFERENTIAL (maintainer-set, 2026-08-02): the `tests` list
+runs in EVERY EXECUTION MODE, but is COUNTED ONCE.** The headline
+`Tests passed: N/total` is unchanged (`total = tests + extra_checks +
+repl_tests`, the tree-walker pass). After it, `run_tests` reruns the
+**same** list — not a new set, so not added to the headline — in each
+mode, printing one `Differential (same K tests) - <mode>: M/K` line per
+mode. ALL must be green to `exit(0)`:
+
+1. **the AST tree-walker** — the reference. It has NO JIT path: the only
+   pipeline is AST → bytecode → native, so this is a JIT-free oracle by
+   construction.
+2. **the bytecode VM, JIT OFF** (`vm:`) — pure interpreted bytecode.
+3. **the bytecode VM, JIT ON** (`jit:`) — native code; the script default.
+
+**WHY MODE 2 IS NOT OPTIONAL.** With only tw-vs-VM, a codegen bug and a
+JIT bug are the SAME SYMPTOM, and a JIT bug that happens to be
+unobservable in the default corpus is invisible — which is exactly how a
+silently-disabled branch remap survived 39 commits (see the switch
+fall-through note under *Invariants & hazards*). Splitting the VM into
+with- and without-native says WHICH LAYER broke: PROVEN by injecting a
+JIT-only fault (an off-by-one in the loc remap), which fails mode 3
+`1483/1486` while mode 2 stays `1486/1486`.
+
+**Mode 3 runs only where `ML_JIT_SUPPORTED`** (jit.h — Linux x86-64
+today); elsewhere mode 2 IS what the VM does, so a third pass would prove
+nothing, and the summary says so. `check()` dispatches its final run on
+`g_exec_engine`, and the harness sets `g_jit_enabled` per mode
+(save/restored). A new functional test therefore auto-covers all three
+modes with no extra work.
 
 ## Benchmarks
 

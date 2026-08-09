@@ -28,6 +28,30 @@
 struct Chunk;
 class LValue;
 
+/*
+ * THE JIT'S SUPPORTED PLATFORMS - one macro, because the condition is a
+ * POLICY and a policy stated in 28 places drifts.
+ *
+ * Linux x86-64 ONLY today. The emitter itself only needs x86-64 and a
+ * non-Windows ABI, but "the code would probably run" is not the bar for
+ * shipping a code generator - a platform is supported once it is TESTED
+ * there, and CI tests Linux. The others, by maintainer decision
+ * (2026-08-02):
+ *
+ *   FreeBSD x86-64  - to be enabled after it is actually tested there.
+ *   Darwin  x86-64  - NEVER. A deprecated platform; not worth the risk.
+ *   Windows (any)   - VM-only for a long time.
+ *   aarch64         - when the arm64 backend lands, on all three.
+ *
+ * Off-platform the whole tier compiles out and `g_jit_enabled` is always
+ * false, so the VM runs pure bytecode - the same thing `-nj` selects.
+ */
+#if defined(__linux__) && defined(__x86_64__)
+#  define ML_JIT_SUPPORTED 1
+#else
+#  define ML_JIT_SUPPORTED 0
+#endif
+
 /* The kill switch: -nj / MYLANG_JIT=0; always false off-platform. */
 extern bool g_jit_enabled;
 
