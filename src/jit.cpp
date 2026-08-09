@@ -3345,6 +3345,10 @@ static std::vector<std::unique_ptr<Chunk::CalleeCache>> *g_cur_call_caches
  * set beside g_cur_call_caches. Null (no chunk / lever off) emits no
  * site and no verification - byte-identical to the pre-step-1 code. */
 static std::vector<std::unique_ptr<NorecSite>> *g_cur_norec_sites = nullptr;
+/* STEP 3b: the function whose chunk is being emitted, baked into each
+ * NorecSite as caller_desc. From the JitCtx (null for main); file-static
+ * like g_cur_norec_sites, safe for the same single-threaded reason. */
+static const FuncDescriptor *g_cur_caller_desc = nullptr;
 
 static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                   const Instr &in, uint32_t pc,
@@ -3392,6 +3396,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         ns->dst = static_cast<int32_t>(in.target);
         ns->site_loc = site;
         ns->op = static_cast<uint8_t>(in.op);
+        ns->caller_desc = g_cur_caller_desc;   /* step 3b */
     }
     emit_sync_push_native(e, in, is_value,
                           in.op == OpCode::CachedCallV,
@@ -4557,6 +4562,7 @@ void jit_stats_report()
         { "norec_frame",      &g_jit_norec_frame_verify },
         { "norec_stamp",      &g_jit_norec_stamp_verify },
         { "norec_walk",       &g_jit_norec_walk_frames },
+        { "norec_desc",       &g_jit_norec_desc_chain },
         { "norec_audit",      &g_jit_norec_audit_frames },
     };
     /* G1 reach probe (vm.cpp): the no-record tier's candidate gates.
@@ -10083,6 +10089,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             lns->call_pc = static_cast<uint32_t>(old_pc);
             lns->dst = static_cast<int32_t>(in.target);
             lns->op = static_cast<uint8_t>(in.op);
+            lns->caller_desc = g_cur_caller_desc;   /* step 3b */
             lns->leaf = true;
             lns->off_plain = e.pos();
             lns->off_switched = e.pos();    /* one call: both keys equal */
@@ -11891,6 +11898,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     g_cur_call_caches = &chunk.call_caches;
     chunk.norec_sites.clear();          /* G1: recompile hygiene */
     g_cur_norec_sites = &chunk.norec_sites;
+    g_cur_caller_desc = jc ? jc->caller_desc : nullptr;   /* step 3b */
     /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
      * across the loop - no op clobbers it - so the native back edge, a
      * jump to label[begin] AFTER this movabs, keeps it live); record each
@@ -12684,6 +12692,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     g_cur_entry_remap = nullptr;        /* #56: emission done */
     g_cur_call_caches = nullptr;
     g_cur_norec_sites = nullptr;
+    g_cur_caller_desc = nullptr;
 
     /* Trampoline pool (out-of-line, one per DISTINCT libm fn): the rare
      * rel32-out-of-range fallback for a call (and the arm64-style veneer a

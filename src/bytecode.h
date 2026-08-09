@@ -1508,6 +1508,15 @@ struct NorecSite {
     int32_t dst = -1;                /* caller slot for the result */
     uint64_t site_loc = 0;           /* baked line<<32|col (#88's) */
     uint8_t op = 0;                  /* the call's OpCode, as u8 */
+    const void *caller_desc = nullptr;  /* STEP 3b: the FuncDescriptor of
+                                      * the function whose chunk contains
+                                      * this call - known at emit time.
+                                      * The frame BELOW a call is this
+                                      * function, so a frame's descriptor
+                                      * is reconstructible from the site of
+                                      * the frame ABOVE it. null for main
+                                      * (no stable descriptor), matching
+                                      * main's null-desc boundary record. */
     bool leaf = false;               /* a #55 native-leaf direct call - no
                                       * record is pushed at all; registered
                                       * so the entry RA check can resolve

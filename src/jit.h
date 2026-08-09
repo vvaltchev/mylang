@@ -890,6 +890,9 @@ extern unsigned long g_jit_norec_frame_verify;
 extern unsigned long g_jit_norec_stamp_verify;
 /* step 3: frames the rbp-chain shadow walk matched against records. */
 extern unsigned long g_jit_norec_walk_frames;
+/* step 3b: frames whose descriptor was reconstructed from the site chain
+ * (site.caller_desc == the frame below's desc) and matched the record. */
+extern unsigned long g_jit_norec_desc_chain;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
  * bumped by the emitted code itself, so it proves the inline tier ran (the
  * jit_ret helper's own counter also counts declines and cannot). */

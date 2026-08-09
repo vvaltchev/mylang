@@ -2641,6 +2641,7 @@ static ML_ALWAYS_INLINE bool vm_dispatch_exc_hot(
 unsigned long g_jit_norec_frame_verify = 0;
 unsigned long g_jit_norec_stamp_verify = 0;
 unsigned long g_jit_norec_walk_frames = 0;
+unsigned long g_jit_norec_desc_chain = 0;
 #ifdef TESTS
 [[noreturn]] static void norec_fail(const char *what, const void *a,
                                     const void *b)
@@ -7720,6 +7721,28 @@ extern "C" void jit_norec_push_verify(const void *site,
             if (r.native_rbp != link)
                 norec_fail("record anchor != the chain link", link,
                            r.native_rbp);
+            /*
+             * STEP 3b - THE DESCRIPTOR CHAIN. A backtrace frame names its
+             * function; the site does not carry the CALLEE, but it carries
+             * the CALLER (caller_desc, known at emit time). r was called
+             * from the frame BELOW it, so that frame's function IS
+             * rs->caller_desc. record[idx-2] is that frame - and its desc
+             * must equal rs->caller_desc, whether or not it has a site (the
+             * gluing point across a segment boundary is a desc match too).
+             * This is exactly how step 4 names each reconstructed frame:
+             * desc(frame below) = site(this frame).caller_desc. main has a
+             * null descriptor and a null-desc boundary record, so null ==
+             * null closes the bottom.
+             */
+            if (idx >= 2) {
+                if (rs->caller_desc
+                        != static_cast<const void *>(
+                               act->records[idx - 2].desc))
+                    norec_fail("site caller_desc != the frame below's "
+                               "desc", rs->caller_desc,
+                               act->records[idx - 2].desc);
+                g_jit_norec_desc_chain++;
+            }
             fp = link;
             idx--;
             g_jit_norec_walk_frames++;
