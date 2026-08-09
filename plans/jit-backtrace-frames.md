@@ -88,6 +88,38 @@ Bake both missing cases, mirroring the caret's existing treatment.
    survives the move, which is the same argument that makes the existing
    `&ck.locs[i]` bake safe.
 
+## MEASURED 2026-08-02: which path actually runs (do this first)
+
+The two halves above are NOT equally urgent, and the repro says which.
+Half 2 was built for `jit_sync_postexit` only - the chain + the pool base
+baked at `emit_inline_sync_call` (one extra `movabs` pair on its COLD
+post-exit branch, zero hot-path cost) - and it **did not move the repro at
+all**. Instrumenting the helper proved why:
+
+```
+[postexit r=0 chain=-7]      <- -7 = the sentinel passed from the SLOW tier
+```
+
+So in this program the sync call is served by **`jit_call_sync_core`**,
+which re-runs the call in C++ and forwards to `jit_sync_postexit` with no
+call site of its own. The emitted-inline path never fires here. **Bake the
+chain into the SLOW tier first** - that is the half that pays.
+
+That is more plumbing than the fast path was: `jit_call_sync_core` already
+takes 6 args (all six SysV registers), so a 7th/8th spill to the stack, and
+the three wrappers (`jit_call_sync`, `jit_call_sync_cached`,
+`jit_call_sync_value`) plus their emit sites each need the two baked values
+threaded through. Options worth weighing before writing it: pack chain+pool
+into ONE arg (the pool base is 8-byte aligned, the chain is a small
+non-negative index, but a packed pointer is a trap of its own), or park the
+pair in two globals the emitted site stores before the call (the
+`g_jit_pending_key` precedent) so no signature changes at all.
+
+The work was REVERTED rather than left in the tree half-proven: it compiled
+and the suite stayed green, but "prove the code ran" was not satisfiable for
+it, and an unexercised mechanism is exactly what that rule exists to keep
+out. Redoing it is ~20 lines once the tier question above is settled.
+
 ## Testing
 
 `inlined_recursion_backtrace_parity` (tests.cpp) already runs the two
