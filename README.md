@@ -405,17 +405,38 @@ func later() { return 7; }
 That applies at every scope, not just the top level. A *lambda* is an ordinary
 variable, though, so `var f = func(x) => x;` binds where it is written.
 
-Where the compiler *cannot* decide, the check happens at run time and is
-catchable. A function body reading a global may run at any moment:
+**Where the failure is provable, the compiler refuses the program.** If a call
+is evaluated unconditionally and the function it names unconditionally reads a
+global declared further down, that call can only ever fail — so it is rejected
+before the program runs:
 
 ```C#
 func fetch() { return g; }
-var dyn t = fetch();     # UnboundSymbolEx: 'g' is not bound yet
+var dyn t = fetch();     # ERROR: this call always fails: g is not bound
+var g = 5;               #        until later
+```
+
+This holds **even inside a `try`** — the failure is certain, so there is
+nothing to handle:
+
+```C#
+func fetch() { return g; }
+try { var dyn t = fetch(); } catch (UnboundSymbolEx) { print("no"); }
+var g = 5;               # ERROR, same as above
+```
+
+Where the compiler *cannot* decide, the check happens at run time and is
+catchable. Anything conditional is in that group — the call may never happen,
+or the callee may never reach the read:
+
+```C#
+func fetch() { return g; }
+if (ready()) { var dyn t = fetch(); }   # may or may not fail: run-time check
 var g = 5;
 ```
 
-Catching `UnboundSymbolEx` should be very rare: where the failure is provable,
-the compiler refuses the program instead.
+Catching `UnboundSymbolEx` should be **very rare** in real code. It exists for
+the residue the compiler cannot decide; the provable cases never get that far.
 
 **A name declared nowhere is a compile error.** A misspelled or missing
 variable is refused before the program runs, not when execution reaches it:

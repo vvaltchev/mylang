@@ -455,7 +455,23 @@ Each lands as its OWN commit.
    NOT testable in `-rt`: the F1 value-use rule (`var dyn q = isbound;`),
    because `reject_dev_builtins` - which owns it - is skipped by the
    harness. Verified by hand.
-7. **Prover conservatism**, then **`--strict`**.
+7. **Prover conservatism** - **TIER 2 LANDED** (`prove_unbound_calls`,
+   resolver.cpp). An unconditional call to a function that
+   unconditionally reads a later-declared global is a compile error,
+   `try` included. Sound because only UNCONDITIONAL code counts on both
+   sides; runs on the CLEAN tree (before AutoConst/the inliner) so the
+   answer cannot depend on which optimizations ran.
+   **It changed 15 existing tests** - every runtime-`UnboundSymbolEx`
+   test was written in exactly the shape the prover now refuses, and each
+   had to grow a `runtime()` guard to keep exercising the runtime path.
+   That is the feature working, not a regression, but it is the cost to
+   expect. It also found TWO bugs: a lazy builtin's argument counted as a
+   read (`isbound(g)` is how a program AVOIDS the error - refusing it
+   would refuse the correct code), and **#138**, that `&&`/`||` do not
+   short-circuit at run time although the const-fold assumes they do.
+   STILL OPEN in step 7: transitivity (a global read by a function the
+   callee calls), call sites below the top level, the WARNING tier for
+   the merely suspicious, and **`--strict`**.
 
 ## Known residuals (accepted)
 

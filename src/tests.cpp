@@ -1201,7 +1201,10 @@ static const std::vector<test> tests =
         "jit: an unbound global callee still raises UnboundSymbolEx",
         {
             "func run() { var r = fn(); return r; }",
-            "var t = run();",
+            /* the call is guarded so the step-7 prover cannot prove the
+             * failure - the point here is the RUNTIME raise, which survives
+             * for every call the prover declines */
+            "var t = runtime(1) > 0 ? run() : 0;",
             "var fn = func() { return 1; };",
         },
         &typeid(UnboundSymbolEx),
@@ -1838,7 +1841,7 @@ static const std::vector<test> tests =
         "use-before-def global store (StoreElemValue bail)",
         {
             "func f() { for (var i = 0; i < 20; i++) g[i] = i; }",
-            "f();",
+            "if (runtime(1) > 0) { f(); }",
             "var g = [0, 0, 0];",
         },
         &typeid(UnboundSymbolEx),
@@ -1852,7 +1855,7 @@ static const std::vector<test> tests =
         "use-before-def global compound store (StoreGlobalV bail)",
         {
             "func f() { for (var i = 0; i < 20; i++) g += i; }",
-            "f();",
+            "if (runtime(1) > 0) { f(); }",
             "var g = 0;",
         },
         &typeid(UnboundSymbolEx),
@@ -4072,7 +4075,7 @@ static const std::vector<test> tests =
      * identifier caret. */
     { "err loc: dyn elem ++ on an unbound global base marks the base",
       { "func f() { g[0]++; }",
-        "f();",
+        "if (runtime(1) > 0) { f(); }",
         "var dyn g = [1];" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
 
@@ -4087,23 +4090,23 @@ static const std::vector<test> tests =
      * the whole subscript in every one of them.
      */
     { "err loc: unbound global base - flat int elem store",
-      { "func f() { g[0] = 1; }", "f();", "var g = [1];" },
+      { "func f() { g[0] = 1; }", "if (runtime(1) > 0) { f(); }", "var g = [1];" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     { "err loc: unbound global base - flat float elem store",
-      { "func f() { g[0] = 1.5; }", "f();", "var g = [1.0];" },
+      { "func f() { g[0] = 1.5; }", "if (runtime(1) > 0) { f(); }", "var g = [1.0];" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     { "err loc: unbound global base - COMPOUND elem store",
-      { "func f() { g[0] += 1; }", "f();", "var g = [1];" },
+      { "func f() { g[0] += 1; }", "if (runtime(1) > 0) { f(); }", "var g = [1];" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     { "err loc: unbound global base - dict store",
-      { "func f() { g[\"k\"] = 1; }", "f();", "var g = {\"k\": 1};" },
+      { "func f() { g[\"k\"] = 1; }", "if (runtime(1) > 0) { f(); }", "var g = {\"k\": 1};" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     { "err loc: unbound global base - struct member store",
-      { "func f() { g.x = 1; }", "f();", "struct P { int x; }",
+      { "func f() { g.x = 1; }", "if (runtime(1) > 0) { f(); }", "struct P { int x; }",
         "var g = P(0);" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     { "err loc: unbound global base - member ++",
-      { "func f() { g.x++; }", "f();", "struct P { int x; }",
+      { "func f() { g.x++; }", "if (runtime(1) > 0) { f(); }", "struct P { int x; }",
         "var g = P(0);" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     /*
@@ -4113,14 +4116,14 @@ static const std::vector<test> tests =
      * reading "line 0"), not merely a too-wide one.
      */
     { "err loc: unbound global base - nested elem chain store",
-      { "func f() { g[0][1] = 1; }", "f();", "var g = [[1, 2]];" },
+      { "func f() { g[0][1] = 1; }", "if (runtime(1) > 0) { f(); }", "var g = [[1, 2]];" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     { "err loc: unbound global base - mixed lvalue chain store",
-      { "func f() { g.a[0] = 1; }", "f();", "struct Q { array a; }",
+      { "func f() { g.a[0] = 1; }", "if (runtime(1) > 0) { f(); }", "struct Q { array a; }",
         "var g = Q([1, 2]);" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     { "err loc: unbound global base - nested chain ++",
-      { "func f() { g[0][1]++; }", "f();", "var g = [[1, 2]];" },
+      { "func f() { g[0][1]++; }", "if (runtime(1) > 0) { f(); }", "var g = [[1, 2]];" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     /*
      * The OTHER half of the split, and the reason base_locs cannot simply
@@ -4153,7 +4156,7 @@ static const std::vector<test> tests =
         "    g[0] = b;",
         "    return b;",
         "}",
-        "var z = f(int(runtime(3)));",
+        "var z = runtime(1) > 0 ? f(int(runtime(3))) : 0;",
         "var g = [1];" },
       &typeid(UnboundSymbolEx), 5, 11, 7, 11 },
 
@@ -4551,7 +4554,9 @@ static const std::vector<test> tests =
     { "TDZ: reading an unbound global is a CATCHABLE runtime error",
       { "func fetch() { return g; }",
         "var out = 0;",
-        "try { var dyn t = fetch(); } catch (UnboundSymbolEx) { out = 1; }",
+        "if (runtime(1) > 0) {",
+        "  try { var dyn t = fetch(); } catch (UnboundSymbolEx) { out = 1; }",
+        "}",
         "assert(out == 1);",
         "var g = 5;",
         "assert(fetch() == 5);" } },
@@ -4575,10 +4580,90 @@ static const std::vector<test> tests =
         "var dyn h = mk();",
         "var g = 5;" },
       &typeid(UnboundSymbolEx), 26, 1, 28, 1 },
+    /*
+     * STEP 7 tier 2 - THE PROVER. A call that is GUARANTEED to raise
+     * UnboundSymbolEx is refused at COMPILE time. The guard on every RUNTIME
+     * test above ("if (runtime(1) > 0)") exists because of this: an
+     * unconditional call to a function that unconditionally reads a
+     * later-declared global no longer runs at all.
+     */
+    { "prover: an unconditional call that always fails is refused",
+      { "func fetch() { return g; }",
+        "var dyn t = fetch();",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    { "prover: refused EVEN INSIDE A TRY (the two exception kinds exist "
+      "so this is expressible)",
+      { "func fetch() { return g; }",
+        "try { var dyn t = fetch(); } catch (UnboundSymbolEx) { }",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    { "prover: a bare braced block is unconditional too",
+      { "func fetch() { return g; }",
+        "{ var dyn t = fetch(); }",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    { "prover: a STORE through the global counts as a read of it",
+      { "func f() { g[0] = 1; }",
+        "f();",
+        "var g = [1];" },
+      &typeid(UseBeforeBindingEx) },
+    /*
+     * The DECLINES - the direction that matters most, because a false
+     * "provable" refuses a program that would have run. Each of these must
+     * still COMPILE; whether it then raises at run time is not the point.
+     */
+    { "prover: declines when the global is declared FIRST",
+      { "func fetch() { return g; }",
+        "var g = 5;",
+        "var dyn t = fetch();",
+        "assert(t == 5);" } },
+    { "prover: declines a CONDITIONAL call (the failure is not guaranteed)",
+      { "func fetch() { return g; }",
+        "var out = 0;",
+        "if (runtime(0) > 0) { var dyn t = fetch(); out = 1; }",
+        "assert(out == 0);",
+        "var g = 5;" } },
+    { "prover: declines a CONDITIONAL read inside the callee",
+      { "func fetch() { if (runtime(0) > 0) { return g; } return 7; }",
+        "var t = fetch();",
+        "assert(t == 7);",
+        "var g = 5;" } },
+    { "prover: declines a call in an `&&` TAIL",
+      { /* the tail is a position the prover treats as conditional, so it
+         * must not refuse. NOTE it still RAISES at run time, because
+         * MyLang's `&&` does not actually short-circuit (#138) - the point
+         * of this case is the COMPILE decision, so the raise is caught. */
+        "func fetch() { return g; }",
+        "var out = 0;",
+        "try { var ok = runtime(0) > 1 && fetch() > 0; }",
+        "catch (UnboundSymbolEx) { out = 1; }",
+        "assert(out == 1);",
+        "var g = 5;" } },
+    { "prover: declines a lazy builtin's ARGUMENT (it is not a read)",
+      { /* isbound(g)/defined(g) are exactly how a program avoids the error
+         * being proven - treating the argument as a read would refuse the
+         * code that got it right */
+        "func probe() { var a = isbound(g); var b = defined(g); "
+        "return [a, b]; }",
+        "var r = probe();",
+        "assert(r[0] == false);",
+        "assert(r[1] == true);",
+        "var g = 5;" } },
+    { "prover: declines a call to a function declared BELOW the global",
+      { /* a func NAME binds at scope entry (#134), so the ORDER of the two
+         * declarations does not matter - only where the CALL sits */
+        "var g = 5;",
+        "var t = fetch();",
+        "func fetch() { return g; }",
+        "assert(t == 5);" } },
+
     { "TDZ: a store through an unbound global base",
       { "func f() { g[0] = 1; }",
         "var out = 0;",
-        "try { f(); } catch (UnboundSymbolEx) { out = 1; }",
+        "if (runtime(1) > 0) {",
+        "  try { f(); } catch (UnboundSymbolEx) { out = 1; }",
+        "}",
         "assert(out == 1);",
         "var g = [0, 0];" } },
 

@@ -1317,6 +1317,16 @@ public:
                     rb->global_slot_reassigned[static_cast<size_t>(s)] = 1;
         }
 
+        /*
+         * Step 7 tier 2: refuse a call that PROVABLY cannot work. Runs on the
+         * CLEAN tree, BEFORE AutoConst/the inliner, on purpose - see
+         * prove_unbound_calls for why that is what makes it optimization-
+         * invariant (RULE 2).
+         */
+        if (!repl_mode)
+            if (auto *rb = dynamic_cast<Block *>(root))
+                prove_unbound_calls(rb);
+
         /* Promote write-once scalar vars to constants and fold (uses the write
          * counts just collected; the top-level frame's in main_st.writes).
          * prior_pure seeds the fold context so cross-input pure calls fold. */
@@ -1325,6 +1335,197 @@ public:
     }
 
 private:
+
+    /* ------------------------------------------------------------------
+     * STEP 7 tier 2 - THE PROVER: a call that is GUARANTEED to raise
+     * UnboundSymbolEx is a COMPILE error, not a runtime one.
+     *
+     *     func fetch() { return g; }
+     *     var dyn t = fetch();          <- refused: `g` cannot be bound yet
+     *     var g = 5;
+     *
+     * and, deliberately, EVEN INSIDE A TRY (maintainer, 2026-08-08) - the two
+     * exception kinds exist so this is expressible, `UseBeforeBindingEx` being
+     * the uncatchable compile one:
+     *
+     *     try { var dyn t = fetch(); } catch (UnboundSymbolEx) { ... }
+     *     var g = 5;                    <- still refused
+     *
+     * WHAT MAKES IT SOUND, and it is one idea: only UNCONDITIONALLY evaluated
+     * code is considered, on BOTH sides. If the call might not run, or the
+     * callee might not reach the read, the failure is not guaranteed and the
+     * prover must stay silent - a false "provable" refuses a program that
+     * would have worked, which is the one outcome worse than a late error.
+     *
+     * WHY IT RUNS ON THE CLEAN TREE (before AutoConst / the inliner). Whether
+     * a program COMPILES must not depend on which optimizations ran (RULE 2),
+     * and both directions of that trap are real here: run it after DCE and
+     * `if (false) { fetch(); }` compiles while `-nc` refuses it; run it after
+     * the inliner and the callee body may have been spliced into main, so the
+     * shape being analysed differs between `-ni` and the default. Restricting
+     * to unconditional code removes the question entirely - a const-false
+     * branch is CONDITIONAL, so it is skipped either way - and running before
+     * every transform means the tree is the one the user wrote.
+     *
+     * INCREMENT 1 (what is NOT here yet, all of it the silent direction):
+     * no transitivity (a global read by a function the callee calls), no
+     * call sites below the top level, and no WARNING tier for the merely
+     * suspicious - those keep today's runtime UnboundSymbolEx.
+     * ------------------------------------------------------------------ */
+
+    /*
+     * Visit the sub-constructs of `c` that are UNCONDITIONALLY evaluated when
+     * `c` is. The exclusions ARE the soundness argument, so they are listed
+     * rather than left to a default:
+     *   - if/while/for/foreach bodies (and everything under them): may not run
+     *   - a catch or finally body: only on the exceptional path
+     *   - a ternary arm, a `??` right side, an `&&`/`||` tail: short-circuited
+     *   - a function BODY: runs when CALLED, not where it is declared
+     * A try BODY is included: it always runs.
+     */
+    template <typename F>
+    static void for_each_unconditional(Construct *c, const F &f)
+    {
+        if (!c)
+            return;
+
+        /* Block and Expr14 are NOT in for_each_child - walk() handles them
+         * itself, so a generic descent silently stops at `var t = f();` and
+         * at every braced block. Both are unconditional; take them here. */
+        if (auto *bl = dynamic_cast<Block *>(c)) {
+            for (auto &e : bl->elems)
+                f(e.get());
+            return;
+        }
+        if (auto *ex = dynamic_cast<Expr14 *>(c)) {
+            f(ex->lvalue.get());
+            f(ex->rvalue.get());
+            return;
+        }
+        if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+            f(tc->tryBody.get());
+            return;
+        }
+        /* A LAZY builtin does not EVALUATE its argument - `isbound(g)` and
+         * `defined(g)` ask a question ABOUT the name and are exactly what a
+         * careful program uses to avoid the error being proven here. Visiting
+         * the argument would make every such guard "a read" and refuse the
+         * program that got it right. (Caught by the isbound/defined tests.) */
+        if (auto *call = dynamic_cast<CallExpr *>(c)) {
+            auto *cid = dynamic_cast<Identifier *>(call->what.get());
+            if (cid && is_lazy_builtin(cid->uid)) {
+                f(call->what.get());
+                return;
+            }
+        }
+        if (dynamic_cast<IfStmt *>(c) || dynamic_cast<WhileStmt *>(c)
+                || dynamic_cast<ForStmt *>(c) || dynamic_cast<ForeachStmt *>(c)
+                || dynamic_cast<FuncDeclStmt *>(c)
+                || dynamic_cast<TernaryExpr *>(c)
+                || dynamic_cast<CoalesceExpr *>(c)
+                || dynamic_cast<Expr11 *>(c) || dynamic_cast<Expr12 *>(c))
+            return;
+
+        for_each_child(c, [&](Construct *ch) { f(ch); });
+    }
+
+    /* Walk `c` unconditionally, calling `f` on every node reached. */
+    template <typename F>
+    static void walk_unconditional(Construct *c, const F &f)
+    {
+        if (!c)
+            return;
+        f(c);
+        for_each_unconditional(c, [&](Construct *ch) {
+            walk_unconditional(ch, f);
+        });
+    }
+
+    /* The GLOBAL VARIABLES `fd` reads on every path through its body. Only
+     * names in `global_decl_stmt` count - a func/struct name binds at scope
+     * entry (#134), so it is never unbound. */
+    void unconditional_global_reads(
+        FuncDeclStmt *fd,
+        const std::unordered_map<const UniqueId *, size_t> &global_decl_stmt,
+        std::vector<Identifier *> &out)
+    {
+        walk_unconditional(fd->body.get(), [&](Construct *n) {
+            auto *id = dynamic_cast<Identifier *>(n);
+            if (id && id->sym.kind == SymKind::global
+                    && global_decl_stmt.count(id->uid))
+                out.push_back(id);
+        });
+    }
+
+    void prove_unbound_calls(Block *rb)
+    {
+        /* the top-level statement index of each global VAR/CONST decl, and
+         * every top-level named function (the possible call targets) */
+        std::unordered_map<const UniqueId *, size_t> global_decl_stmt;
+        std::unordered_map<const UniqueId *, FuncDeclStmt *> top_funcs;
+
+        for (size_t i = 0; i < rb->elems.size(); i++) {
+            Construct *e = rb->elems[i].get();
+            if (auto *fd = dynamic_cast<FuncDeclStmt *>(e)) {
+                if (fd->id)
+                    top_funcs[fd->id->uid] = fd;
+                continue;
+            }
+            auto *ex = dynamic_cast<Expr14 *>(e);
+            if (!ex || !(ex->fl & pFlags::pInDecl))
+                continue;
+            auto *lv = dynamic_cast<Identifier *>(ex->lvalue.get());
+            if (lv && lv->sym.kind == SymKind::global)
+                global_decl_stmt.emplace(lv->uid, i);
+        }
+
+        if (global_decl_stmt.empty() || top_funcs.empty())
+            return;
+
+        /* memoized per callee: a body is walked once however often it is
+         * called */
+        std::unordered_map<FuncDeclStmt *, std::vector<Identifier *>> reads;
+
+        for (size_t i = 0; i < rb->elems.size(); i++) {
+
+            if (dynamic_cast<FuncDeclStmt *>(rb->elems[i].get()))
+                continue;               /* a declaration calls nothing */
+
+            walk_unconditional(rb->elems[i].get(), [&](Construct *n) {
+                auto *call = dynamic_cast<CallExpr *>(n);
+                if (!call)
+                    return;
+                auto *cid = dynamic_cast<Identifier *>(call->what.get());
+                if (!cid)
+                    return;
+                auto ft = top_funcs.find(cid->uid);
+                if (ft == top_funcs.end())
+                    return;
+
+                auto rit = reads.find(ft->second);
+                if (rit == reads.end()) {
+                    std::vector<Identifier *> v;
+                    unconditional_global_reads(ft->second, global_decl_stmt,
+                                               v);
+                    rit = reads.emplace(ft->second, std::move(v)).first;
+                }
+
+                for (Identifier *g : rit->second) {
+                    auto dit = global_decl_stmt.find(g->uid);
+                    if (dit != global_decl_stmt.end() && dit->second > i)
+                        /* the caret marks the CALL: that is the statement the
+                         * user must move, and the read inside the callee is
+                         * correct code for every other caller */
+                        throw UseBeforeBindingEx(
+                            intern_msg(
+                                "this call always fails: "
+                                + std::string(g->get_str())
+                                + " is not bound until later"),
+                            call->start, call->end);
+                }
+            });
+        }
+    }
 
     /* Names a function reads from outer scope (so they are GLOBALs, not the
      * function's locals): a top-level VARIABLE among them gets a global-table

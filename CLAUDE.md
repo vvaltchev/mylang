@@ -1130,6 +1130,28 @@ and it lives *inside the parser*. Mechanics:
   `CallExpr` folds when
   the callee and all args are const — that's how
   `sort(arr, pure func(a,b) => a<b)` runs at parse time.
+- **THE PROVER: a call that is GUARANTEED to fail is a COMPILE error
+  (step 7 tier 2, `prove_unbound_calls` in resolver.cpp).** An
+  unconditionally-evaluated call to a function that unconditionally reads a
+  global declared further down can only ever raise `UnboundSymbolEx`, so it is
+  refused — **even inside a `try`** (maintainer's call; the two exception
+  kinds exist so this is expressible, `UseBeforeBindingEx` being the
+  uncatchable compile one). **The whole soundness argument is one idea: only
+  UNCONDITIONAL code counts, on BOTH sides** — a false "provable" refuses a
+  program that would have worked, which is worse than a late error. So
+  `for_each_unconditional`'s exclusion list IS the proof: if/loop bodies,
+  catch/finally, ternary arms, `??` and `&&`/`||` tails, a function body, and
+  **a lazy builtin's argument** (`isbound(g)` is how a careful program AVOIDS
+  this error — counting it as a read refuses the code that got it right).
+  Two traps: `for_each_child` does NOT descend into `Block` or `Expr14`
+  (`walk()` handles them), so a generic descent silently stops at
+  `var t = f();`; and it runs on the **CLEAN tree, before AutoConst and the
+  inliner**, because whether a program COMPILES must not depend on which
+  optimizations ran (RULE 2) — after DCE, `if (false) { fetch(); }` would
+  compile while `-nc` refused it; after the inliner, the analysed shape would
+  differ between `-ni` and the default. **INCREMENT 1**: no transitivity, no
+  call sites below the top level, no WARNING tier — all silent directions, so
+  those keep today's runtime error.
 - **`isbound(name)` — the TDZ pair's runtime half (#131 step 6).**
   `defined(name)` asks whether the name EXISTS (true throughout its scope,
   ABOVE the declaration included — the name is declared, merely unbound);
