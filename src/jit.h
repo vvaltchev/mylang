@@ -144,10 +144,12 @@ extern "C" void jit_push_handler_grow(int_type region) noexcept;
 /* #78 step E: EndFinally's cold reraise arm (0 dispatched / 1 boundary /
  * 2 conveyed / 3 nothing pending). See the definition in vm.cpp. */
 extern "C" int jit_end_finally(int_type region, int_type pc,
-                               int_type inline_chain) noexcept;
+                               int_type inline_chain,
+                               const void *frag_rbp) noexcept;
 /* #80: the native `rethrow` - same 0/1/2 contract as jit_throw. */
 extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
-                           int_type inline_chain) noexcept;
+                           int_type inline_chain,
+                           const void *frag_rbp) noexcept;
 
 /* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
 class EvalContext;
@@ -465,7 +467,7 @@ extern "C" int jit_load_elem2_float(LValue *base_lv, int_type oidx,
 /* #56: the native `throw` (the interpreted op's body; 0 = dispatched to a
  * same-frame handler at g_vm_resume_pc, 1 = boundary, 2 = conveyed). */
 extern "C" int jit_throw(int_type val_slot, int_type pc,
-                         const void *lep) noexcept;
+                         const void *lep, const void *frag_rbp) noexcept;
 void *jit_addr_resume_pc();         /* the parked handler pc's address */
 
 extern int_type g_jit_elem_tmp;     /* the slow tiers' value scratch */
@@ -909,6 +911,13 @@ extern unsigned long g_jit_norec_gate_ok;
 extern unsigned long g_jit_norec_gate_cached;
 extern unsigned long g_jit_norec_gate_plain;
 extern unsigned long g_jit_norec_gate_body;
+/* step 4-ii: raises whose walk anchored on the fragment's LIVE rbp (the
+ * helpers pass it; interpreted raisers pass null and skip). */
+extern unsigned long g_jit_norec_raise_walk;
+/* ... and the FRAMES those raise walks traversed - separable from the
+ * push walks so a dead anchor (a walk that silently floors at level 0)
+ * is a test failure, not a hidden regression. */
+extern unsigned long g_jit_norec_raise_frames;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
  * bumped by the emitted code itself, so it proves the inline tier ran (the
  * jit_ret helper's own counter also counts declines and cannot). */

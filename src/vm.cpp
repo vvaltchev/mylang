@@ -2647,6 +2647,14 @@ unsigned long g_jit_norec_gate_ok = 0;
 unsigned long g_jit_norec_gate_cached = 0;
 unsigned long g_jit_norec_gate_plain = 0;
 unsigned long g_jit_norec_gate_body = 0;
+unsigned long g_jit_norec_raise_walk = 0;
+unsigned long g_jit_norec_raise_frames = 0;
+#ifdef TESTS
+/* the shared chain walk (defined beside jit_norec_push_verify below);
+ * vm_raise runs it from the raise site since step 4-ii */
+static size_t norec_walk_chain(VmActivation *act, const char *fp,
+                               size_t idx, const void *ns);
+#endif
 #ifdef TESTS
 [[noreturn]] static void norec_fail(const char *what, const void *a,
                                     const void *b)
@@ -5574,7 +5582,8 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
  */
 static bool
 vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
-         std::unique_ptr<RuntimeException> ex)
+         std::unique_ptr<RuntimeException> ex,
+         const void *frag_rbp = nullptr)
 {
     if (!ex->loc_start) {
         Loc s, en;
@@ -5583,6 +5592,23 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
         ex->loc_end = en;
     }
     vm_flush_inline(*chunk, pc, *ex);      /* frames if raised in inlined */
+#ifdef TESTS
+    /*
+     * G1 step 4-ii: THE RAISE-TIME CHAIN WALK. `frag_rbp` is the RAISING
+     * fragment's frame pointer (null from every interpreted raiser), so
+     * the frame at it is the CURRENT frame - records[rec_n-1]. The same
+     * traversal the push verification runs, at a DIFFERENT moment: after
+     * arbitrary body execution, which is what proves rbp still holds the
+     * fragment's frame (callee-saved + never emitted) at exactly the
+     * point step 4's record-less unwind will anchor on it.
+     */
+    if (frag_rbp && act.rec_n) {
+        g_jit_norec_raise_frames +=
+            norec_walk_chain(&act, static_cast<const char *>(frag_rbp),
+                             act.rec_n, nullptr);
+        g_jit_norec_raise_walk++;
+    }
+#endif
 
     /* The SAME-FRAME fast path first (the pre-G1 shape, kept out of the
      * ML_COLD walk: a same-frame `throw`+catch loop - 42_exceptions - pays
@@ -5691,7 +5717,7 @@ extern "C" void jit_ret_audit() noexcept
 }
 
 extern "C" int jit_throw(int_type val_slot, int_type pc,
-                         const void *lep) noexcept
+                         const void *lep, const void *frag_rbp) noexcept
 {
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
@@ -5719,7 +5745,7 @@ extern "C" int jit_throw(int_type val_slot, int_type pc,
     }
     const Chunk *c2 = act.back_rec().run_chunk;
     size_t p2 = static_cast<size_t>(pc);
-    if (!vm_raise(c2, p2, act, ctx, std::move(ex)))
+    if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp))
         return 1;                          /* boundary: signal set */
     g_vm_resume_chunk = c2;                /* same-frame: the handler pc */
     g_vm_resume_pc = p2;
@@ -5750,7 +5776,8 @@ extern "C" int jit_throw(int_type val_slot, int_type pc,
  * (Exception::jit_inline_frame - the same bake a conveying fragment does).
  */
 extern "C" int jit_end_finally(int_type region, int_type pc,
-                               int_type inline_chain) noexcept
+                               int_type inline_chain,
+                               const void *frag_rbp) noexcept
 {
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
@@ -5771,7 +5798,7 @@ extern "C" int jit_end_finally(int_type region, int_type pc,
     const Chunk *c2 = rec.run_chunk;
     size_t p2 = static_cast<size_t>(pc);
     try {
-        if (!vm_raise(c2, p2, act, ctx, std::move(ex)))
+        if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp))
             return 1;                  /* boundary: signal set */
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
@@ -5805,7 +5832,8 @@ extern "C" int jit_end_finally(int_type region, int_type pc,
  * the dispatch PARKS the exception there.
  */
 extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
-                           int_type inline_chain) noexcept
+                           int_type inline_chain,
+                           const void *frag_rbp) noexcept
 {
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
@@ -5839,7 +5867,7 @@ extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
     const Chunk *c2 = rec.run_chunk;
     size_t p2 = static_cast<size_t>(pc);
     try {
-        if (!vm_raise(c2, p2, act, ctx, std::move(ex)))
+        if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp))
             return 1;                  /* boundary: signal set */
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
@@ -7650,6 +7678,112 @@ static void norec_check_rec(const VmCallRec &rec, const NorecSite *ns)
 }
 #endif
 
+#ifdef TESTS
+/* THE CHAIN WALK - the shared shadow traversal (steps 3a/3b/3c): the
+ * frame at `fp` has record records[idx-1]; verify site / anchor / desc
+ * / window per level down to the segment floor. Two callers, two
+ * MOMENTS: the PUSH verification (fp = the pushing caller's rbp,
+ * idx = rec_n-1, before the callee runs) and - since 4-ii - the RAISE
+ * path (fp = the raising fragment's rbp, idx = rec_n): the same chain
+ * read after arbitrary body execution, proving rbp survives the body
+ * untouched (it is callee-saved and the Reg enum omits it, so no
+ * emitted code can clobber it - this walk is what would catch a
+ * violation). `ns` is failure context only. */
+static size_t norec_walk_chain(VmActivation *act, const char *fp,
+                               size_t idx, const void *ns)
+{
+    size_t levels = 0;
+    for (int guard = 0; idx; guard++) {
+        if (guard > 100000)
+            norec_fail("shadow walk did not terminate", fp, ns);
+        const VmCallRec &r = act->records[idx - 1];
+        const void *ra =
+            *reinterpret_cast<const void *const *>(fp + 8);
+        /*
+         * The rbp chain covers only the TOPMOST CONTIGUOUS native
+         * call segment. A C++ return address is that segment's floor:
+         * the fragment was entered from the interpreter (jit_enter),
+         * or a deeper call declined to the C++ tier (the sync depth
+         * cap runs interpreted-flat - exactly ackermann). Below it
+         * the record stack continues with earlier segments the rbp
+         * chain cannot reach, so STOP - do not walk into a C++ rbp
+         * link. The cross-segment ORDER is step 4's concern, checked
+         * with the records still present.
+         */
+        if (!jit_norec_frag_for(ra))
+            break;
+        /* an EMITTED return address means an emitted `call` created
+         * this frame, so its record MUST carry that call's site */
+        if (!r.norec_site)
+            norec_fail("emitted RA but the record has no site",
+                       ra, ns);
+        const auto *rs =
+            static_cast<const NorecSite *>(r.norec_site);
+        if (ra != rs->ret_plain && ra != rs->ret_switched)
+            norec_fail("walk RA is not the record's site", ra, rs);
+        if (jit_norec_site_for(ra) != rs)
+            norec_fail("walk RA resolves to a different site",
+                       ra, rs);
+        /* r.native_rbp is r's CALLER's rbp - the NEXT link up, i.e.
+         * [fp], not fp itself (fp is r's own frame pointer). */
+        const char *link =
+            *reinterpret_cast<const char *const *>(fp);
+        if (r.native_rbp != link)
+            norec_fail("record anchor != the chain link", link,
+                       r.native_rbp);
+        /*
+         * STEP 3b - THE DESCRIPTOR CHAIN. A backtrace frame names its
+         * function; the site does not carry the CALLEE, but it carries
+         * the CALLER (caller_desc, known at emit time). r was called
+         * from the frame BELOW it, so that frame's function IS
+         * rs->caller_desc. record[idx-2] is that frame - and its desc
+         * must equal rs->caller_desc, whether or not it has a site (the
+         * gluing point across a segment boundary is a desc match too).
+         * This is exactly how step 4 names each reconstructed frame:
+         * desc(frame below) = site(this frame).caller_desc. main has a
+         * null descriptor and a null-desc boundary record, so null ==
+         * null closes the bottom.
+         */
+        if (idx >= 2) {
+            if (rs->caller_desc
+                    != static_cast<const void *>(
+                           act->records[idx - 2].desc))
+                norec_fail("site caller_desc != the frame below's "
+                           "desc", rs->caller_desc,
+                           act->records[idx - 2].desc);
+            g_jit_norec_desc_chain++;
+            /*
+             * STEP 3c - THE WINDOW CHAIN. frag_entry saves the
+             * caller's rbx (the frame-base register) FIRST after
+             * `push rbp`, so [fp-8] is the WINDOW of the frame
+             * BELOW - readable from the native frame alone. This is
+             * step 4's DISCRIMINATION mechanism: a frame is
+             * record-ful iff the top record's window matches the
+             * frame's own window (windows are unique among live
+             * frames), and the walk learns each next frame's window
+             * as it descends - so the mixed unwind walk needs NO new
+             * release-mode record field to tell the two frame kinds
+             * apart. Verified here against the full record stack
+             * while it still exists. The rbx-first prologue order is
+             * LOAD-BEARING (comment in frag_entry).
+             */
+            const void *below_win =
+                *reinterpret_cast<const void *const *>(fp - 8);
+            if (act->records[idx - 2].window != below_win)
+                norec_fail("frame-below window != [fp-8]",
+                           act->records[idx - 2].window, below_win);
+            g_jit_norec_win_chain++;
+        }
+        fp = link;
+        idx--;
+        g_jit_norec_walk_frames++;
+        levels++;
+    }
+    return levels;
+}
+
+#endif
+
 extern "C" void jit_norec_push_verify(const void *site,
                                       const void *rbp) noexcept
 {
@@ -7716,93 +7850,8 @@ extern "C" void jit_norec_push_verify(const void *site,
         if (callee.native_rbp != rbp)
             norec_fail("callee anchor != the push rbp",
                        callee.native_rbp, rbp);
-        const char *fp = static_cast<const char *>(rbp);
-        size_t idx = act->rec_n - 1;   /* record for the frame AT fp */
-        for (int guard = 0; idx; guard++) {
-            if (guard > 100000)
-                norec_fail("shadow walk did not terminate", rbp, ns);
-            const VmCallRec &r = act->records[idx - 1];
-            const void *ra =
-                *reinterpret_cast<const void *const *>(fp + 8);
-            /*
-             * The rbp chain covers only the TOPMOST CONTIGUOUS native
-             * call segment. A C++ return address is that segment's floor:
-             * the fragment was entered from the interpreter (jit_enter),
-             * or a deeper call declined to the C++ tier (the sync depth
-             * cap runs interpreted-flat - exactly ackermann). Below it
-             * the record stack continues with earlier segments the rbp
-             * chain cannot reach, so STOP - do not walk into a C++ rbp
-             * link. The cross-segment ORDER is step 4's concern, checked
-             * with the records still present.
-             */
-            if (!jit_norec_frag_for(ra))
-                break;
-            /* an EMITTED return address means an emitted `call` created
-             * this frame, so its record MUST carry that call's site */
-            if (!r.norec_site)
-                norec_fail("emitted RA but the record has no site",
-                           ra, ns);
-            const auto *rs =
-                static_cast<const NorecSite *>(r.norec_site);
-            if (ra != rs->ret_plain && ra != rs->ret_switched)
-                norec_fail("walk RA is not the record's site", ra, rs);
-            if (jit_norec_site_for(ra) != rs)
-                norec_fail("walk RA resolves to a different site",
-                           ra, rs);
-            /* r.native_rbp is r's CALLER's rbp - the NEXT link up, i.e.
-             * [fp], not fp itself (fp is r's own frame pointer). */
-            const char *link =
-                *reinterpret_cast<const char *const *>(fp);
-            if (r.native_rbp != link)
-                norec_fail("record anchor != the chain link", link,
-                           r.native_rbp);
-            /*
-             * STEP 3b - THE DESCRIPTOR CHAIN. A backtrace frame names its
-             * function; the site does not carry the CALLEE, but it carries
-             * the CALLER (caller_desc, known at emit time). r was called
-             * from the frame BELOW it, so that frame's function IS
-             * rs->caller_desc. record[idx-2] is that frame - and its desc
-             * must equal rs->caller_desc, whether or not it has a site (the
-             * gluing point across a segment boundary is a desc match too).
-             * This is exactly how step 4 names each reconstructed frame:
-             * desc(frame below) = site(this frame).caller_desc. main has a
-             * null descriptor and a null-desc boundary record, so null ==
-             * null closes the bottom.
-             */
-            if (idx >= 2) {
-                if (rs->caller_desc
-                        != static_cast<const void *>(
-                               act->records[idx - 2].desc))
-                    norec_fail("site caller_desc != the frame below's "
-                               "desc", rs->caller_desc,
-                               act->records[idx - 2].desc);
-                g_jit_norec_desc_chain++;
-                /*
-                 * STEP 3c - THE WINDOW CHAIN. frag_entry saves the
-                 * caller's rbx (the frame-base register) FIRST after
-                 * `push rbp`, so [fp-8] is the WINDOW of the frame
-                 * BELOW - readable from the native frame alone. This is
-                 * step 4's DISCRIMINATION mechanism: a frame is
-                 * record-ful iff the top record's window matches the
-                 * frame's own window (windows are unique among live
-                 * frames), and the walk learns each next frame's window
-                 * as it descends - so the mixed unwind walk needs NO new
-                 * release-mode record field to tell the two frame kinds
-                 * apart. Verified here against the full record stack
-                 * while it still exists. The rbx-first prologue order is
-                 * LOAD-BEARING (comment in frag_entry).
-                 */
-                const void *below_win =
-                    *reinterpret_cast<const void *const *>(fp - 8);
-                if (act->records[idx - 2].window != below_win)
-                    norec_fail("frame-below window != [fp-8]",
-                               act->records[idx - 2].window, below_win);
-                g_jit_norec_win_chain++;
-            }
-            fp = link;
-            idx--;
-            g_jit_norec_walk_frames++;
-        }
+        norec_walk_chain(act, static_cast<const char *>(rbp),
+                         act->rec_n - 1, ns);
     }
     static const bool env_audit =
         env_get("MYLANG_NOREC_AUDIT").has_value();

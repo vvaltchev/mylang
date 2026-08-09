@@ -591,6 +591,27 @@ entirely in C++.
          records still written (the walk prefers reconstruction for a
          qualifying frame and cross-checks the record it still has -
          the §7-step-3 sabotage, now with the real walk).
+         (a) DONE (2026-08-10): jit_throw / jit_rethrow / jit_end_finally
+         carry the fragment's rbp (mov rcx/r8, rbp at the emit; vm_raise
+         gained a defaulted frag_rbp, null from every interpreted
+         raiser), and vm_raise runs the SHARED chain walk from the raise
+         point - the same traversal as the push verification, factored
+         into norec_walk_chain, at a DIFFERENT moment: after arbitrary
+         body execution, proving rbp still holds the fragment's frame
+         exactly where the record-less unwind will anchor. Counters:
+         norec_raise_walk (invocations) + norec_raise_frames (levels) -
+         the FRAMES counter is the load-bearing half, because a dead
+         anchor floors the walk at level 0 SILENTLY. Sabotage watched
+         failing: mov rcx,rsp -> "4 raise walks traversed 0 frames".
+         Probe: the deep-throw shape walks ~14 frames per raise (+85
+         over the pre-4-ii binary); 42/69's raising frames are C++-
+         entered (jit_enter) so their walks correctly floor at level 0 -
+         69 is native-top/interpreted-middle/native-bottom, its throw
+         frame a 1-frame segment.
+         (b) REMAINS: the unwind CAPTURE path consumes the chain -
+         reconstruct each popped frame's backtrace entry from the site
+         (site_loc + caller_desc) and cross-check byte-for-byte against
+         vm_capture_rec_frame's record-based output.
   4-iii. The callee return's record-less arm + the call-site residue,
          behind MYLANG_JIT_FORCE=norec (records still written but
          IGNORED by the return - the A/B lever).

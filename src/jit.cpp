@@ -4608,6 +4608,8 @@ void jit_stats_report()
         { "norec_walk",       &g_jit_norec_walk_frames },
         { "norec_desc",       &g_jit_norec_desc_chain },
         { "norec_win",        &g_jit_norec_win_chain },
+        { "norec_raise_walk", &g_jit_norec_raise_walk },
+        { "norec_raise_frames",&g_jit_norec_raise_frames },
         { "norec_audit",      &g_jit_norec_audit_frames },
         /* step 4 gate reach, classified per M5b inline push: would the
          * CALLEE qualify for the no-record tier? (see push_verify) */
@@ -9050,6 +9052,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.movabs(RSI, static_cast<uint64_t>(pc));
         e.movabs(RDX, static_cast<uint64_t>(
                           static_cast<int_type>(ck.inline_frame_at(old_pc))));
+        e.u8(0x48); e.u8(0x89); e.u8(0xE9);       /* mov rcx, rbp - the
+                                                   * raise anchor (4-ii) */
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_end_finally) });
         e.u8(0xE8); e.u32(0);
@@ -9097,6 +9101,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                           static_cast<int_type>(in.a_slot())));
         e.movabs(RSI, static_cast<uint64_t>(pc));
         e.movabs(RDX, reinterpret_cast<uint64_t>(loc_entry_addr(ck, old_pc)));
+        e.u8(0x48); e.u8(0x89); e.u8(0xE9);       /* mov rcx, rbp - the
+                                                   * raise anchor (4-ii) */
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_throw) });
         e.u8(0xE8); e.u32(0);
@@ -9143,6 +9149,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.movabs(RDX, reinterpret_cast<uint64_t>(loc_entry_addr(ck, old_pc)));
         e.movabs(RCX, static_cast<uint64_t>(
                           static_cast<int_type>(ck.inline_frame_at(old_pc))));
+        e.u8(0x49); e.u8(0x89); e.u8(0xE8);       /* mov r8, rbp - the
+                                                   * raise anchor (4-ii) */
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_rethrow) });
         e.u8(0xE8); e.u32(0);
