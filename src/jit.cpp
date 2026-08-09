@@ -74,6 +74,7 @@ unsigned long g_jit_callee_cache = 0;  /* G1: callee-cache HITS (emitted) */
 unsigned long g_jit_callee_cache2 = 0; /* G1: hits on the SECOND entry */
 unsigned long g_jit_bind_coerce = 0;   /* G1: inline pushes to a callee
                                         * with a coercing param */
+unsigned long g_jit_bind_widen = 0;    /* G1: arguments WIDENED inline */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 unsigned long g_jit_ret_inline = 0;    /* C4c: inline-pop returns run */
 /* C4a-i: TEMP slots admitted to the float read-elision set, process-wide.
@@ -440,6 +441,8 @@ struct JitLayout {
     int lv_const_off;  /* LValue: &is_const - &slot */
     int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
     int t_str_val;        /* Type::t_str: types >= this hold a REFERENCE */
+    /* G1's widening bind compares KIND bytes, not singleton pointers */
+    int t_none_val, t_int_val, t_float_val, t_bool_val;
     /* De-helperize 6b: the ctx-indirect chain (via the vm.cpp probes) */
     const void *addr_ctx; /* &g_current_ctx */
     int ctx_captures;     /* EvalContext::captures (a vector<LValue>*) */
@@ -559,6 +562,13 @@ static const JitLayout &jit_layout()
                 &static_cast<const Type *>(l.t_int)->t)
             - reinterpret_cast<const char *>(l.t_int));
         l.t_str_val = static_cast<int>(Type::t_str);
+        /* G1 widening bind: the four scalar TypeE values the coercing arm
+         * compares (it reads the KIND byte rather than the singleton
+         * pointer, so one load answers "which of these is it"). */
+        l.t_none_val = static_cast<int>(Type::t_none);
+        l.t_int_val = static_cast<int>(Type::t_int);
+        l.t_float_val = static_cast<int>(Type::t_float);
+        l.t_bool_val = static_cast<int>(Type::t_bool);
         /* #55 STEP 2.1: native-call member offsets (vm.cpp probes) */
         l.addr_ctx = jit_addr_current_ctx();
         l.ctx_captures = static_cast<int>(jit_off_ctx_captures());
@@ -2561,6 +2571,9 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     const auto movabs_r11 = [&](uint64_t imm) {       /* movabs r11, imm64 */
         e.u8(0x49); e.u8(0xBB); e.u64(imm);
     };
+    const auto movabs_r10 = [&](uint64_t imm) {       /* movabs r10, imm64 */
+        e.u8(0x49); e.u8(0xBA); e.u64(imm);
+    };
     const uint8_t R10 = 10, R11 = 11, R8R = 8, R9R = 9;
 
     /* ---------------- GUARDS (no mutation before these pass) ----------- */
@@ -2739,13 +2752,94 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     e.patch32_here(j_coerce);                         /* coercing: */
     ld(R11, RAX, static_cast<int32_t>(P.desc_bind_req));
     for (int i = 0; i < NARGS; i++) {
+        const int32_t s = (ARGBASE + i) * 48;
+        std::vector<size_t> j_next;
         ld(R10, R11, i * 8);                          /* the required Type* */
         e.u8(0x4D); e.u8(0x85); e.u8(0xD2);           /* test r10, r10 */
-        const size_t j_next = e.j32(0x74);            /* je next (no coerce) */
-        modrm(0x39, R10, RBX,
-              (ARGBASE + i) * 48 + 24, true);         /* cmp [arg.type], r10 */
+        j_next.push_back(e.j32(0x74));                /* je next (no coerce) */
+        modrm(0x39, R10, RBX, s + 24, true);          /* cmp [arg.type], r10 */
+        j_next.push_back(e.j32(0x74));                /* je next (EXACT) */
+        /*
+         * NOT exact - so this is a WIDENING, a `none`, or an error. The
+         * widenings are TOTAL (bool -> int, int/bool -> float), so they are
+         * performed HERE, in the caller's own argument temp, and the copy
+         * loop below then finds an exact value and stays a raw copy. Two
+         * things make writing that temp sound: `emit_args_range` gives every
+         * argument a FRESH temp compiled immediately before the call, so
+         * nothing reads it afterwards; and the write is precisely what
+         * `coerce_to_decl_type` would have produced at bind, so a LATER
+         * guard declining to the C++ tier still binds the right value (its
+         * own coercion is then the identity).
+         *
+         * Doing it here rather than in the copy loop is what keeps the
+         * fast_bind path byte-identical: the loop needs no extra branch, and
+         * nothing can throw after the record is pushed.
+         *
+         * Only a NARROWING (float into an `int` param) and a non-numeric
+         * remain declines - those must raise, and raising is exactly what
+         * cannot happen once the frame exists.
+         */
+        /*
+         * SCRATCH: rsi and r10 only. rax still holds the DESCRIPTOR, which
+         * the frame-size read below and the cache-hit arm both need - the
+         * first version of this used rax here and every call died on
+         * Frame::at's bounds assert. rsi currently carries the fragment's
+         * pinned int tag and is overwritten with `total` a few instructions
+         * later, so it is dead-then-redefined; r10 is not live until the
+         * record fill.
+         */
+        ld(RSI, RBX, s + 24);                         /* rsi = arg type */
+        e.u8(0x0F); e.u8(0xB6); e.u8(0xB6);           /* movzx esi, byte
+                                                       * [rsi+t_off] */
+        e.u32(static_cast<uint32_t>(L.type_t_off));
+        e.u8(0x83); e.u8(0xFE);                       /* cmp esi, imm8 */
+        e.u8(static_cast<uint8_t>(L.t_none_val));
+        j_next.push_back(e.j32(0x74));                /* none passes through */
+        e.u8(0x45); e.u8(0x0F); e.u8(0xB6); e.u8(0x92);  /* movzx r10d,
+                                                          * byte [r10+off] */
+        e.u32(static_cast<uint32_t>(L.type_t_off));
+        e.u8(0x41); e.u8(0x83); e.u8(0xFA);           /* cmp r10d, imm8 */
+        e.u8(static_cast<uint8_t>(L.t_float_val));
+        const size_t j_to_float = e.j32(0x74);        /* je -> to float */
+        /* required INT: only a bool widens, and its payload is ALREADY the
+         * int 0/1 (the EvalValue(bool) ctor zeroes the whole word), so the
+         * widening is a pure RETAG. */
+        e.u8(0x83); e.u8(0xFE);                       /* cmp esi, imm8 */
+        e.u8(static_cast<uint8_t>(L.t_bool_val));
         j_slow.push_back(e.j32(0x75));                /* jne slow */
-        e.patch32_here(j_next);
+        movabs_r10(reinterpret_cast<uint64_t>(L.t_int));
+        st(RBX, s + 24, R10);
+        const size_t j_retagged = e.j32(0xEB);
+        /* required FLOAT: an int or a bool - both read as an int payload. */
+        e.patch32_here(j_to_float);
+        e.u8(0x83); e.u8(0xFE);                       /* cmp esi, imm8 */
+        e.u8(static_cast<uint8_t>(L.t_int_val));
+        const size_t j_cvt = e.j32(0x74);
+        e.u8(0x83); e.u8(0xFE);                       /* cmp esi, imm8 */
+        e.u8(static_cast<uint8_t>(L.t_bool_val));
+        j_slow.push_back(e.j32(0x75));                /* jne slow */
+        e.patch32_here(j_cvt);
+        /* cvtsi2sd xmm0, [rbx+s] ; movsd [rbx+s], xmm0. xmm0 is free: the
+         * call prologue already spilled the C2a float pins, and the call
+         * about to happen clobbers every xmm anyway. */
+        e.u8(0xF2); e.u8(0x48); e.u8(0x0F); e.u8(0x2A); e.u8(0x83);
+        e.u32(static_cast<uint32_t>(s));
+        e.u8(0xF2); e.u8(0x0F); e.u8(0x11); e.u8(0x83);
+        e.u32(static_cast<uint32_t>(s));
+        movabs_r10(reinterpret_cast<uint64_t>(L.t_float));
+        st(RBX, s + 24, R10);
+        e.patch32_here(j_retagged);
+#ifdef TESTS
+        /* Only the two CONVERSION arms reach here - the exact / none /
+         * no-coercion jumps are patched after this - so the counter
+         * separates "a widening actually ran" from "the coercing push
+         * ran". Without the split a guard that quietly stopped widening
+         * would keep both correct AND counted. */
+        movabs_r10(reinterpret_cast<uint64_t>(&g_jit_bind_widen));
+        e.u8(0x49); e.u8(0xFF); e.u8(0x02);           /* inc qword [r10] */
+#endif
+        for (const size_t j : j_next)
+            e.patch32_here(j);
     }
 #ifdef TESTS
     movabs_r11(reinterpret_cast<uint64_t>(&g_jit_bind_coerce));

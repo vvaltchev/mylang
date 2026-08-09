@@ -2521,6 +2521,9 @@ FASTER than the `dyn` twin; q_dyn and the zero-arg probe byte-flat.
 finding about bench/: no benchmark annotates a parameter on a call-heavy
 path, so the suite cannot see a 1.61x that any annotated program pays.
 
+**SIBLING TAKEN the same day - see the next entry.** The note below is kept
+because it states the constraint that increment had to design around.
+
 **SIBLING NOT TAKEN**: a WIDENING argument (`func f(float x)` called as
 `f(i)` with an int `i`) still declines every call - `g_jit_bind_coerce` reads
 0 for a loop of exactly that, against 100 for the exact-type twin. A widening
@@ -2530,3 +2533,46 @@ then have to accept a SET of types per parameter and the copy loop would need
 a conversion arm - two emitted pieces instead of one. The only genuinely
 un-inlinable residue is the NARROWING throw (a float into an `int` param),
 which raises before the frame exists.
+
+## G1 increment 4 (2026-08-07): the widening argument converts in the
+## caller's own temp
+
+A conversion in the COPY LOOP would happen after the record is pushed, where
+a decline is no longer possible - that is why increment 3 left widenings
+declining. The way out: the widenings are TOTAL (bool -> int is a pure RETAG,
+since a bool's payload is already the int 0/1; int/bool -> float is one
+`cvtsi2sd`), so nothing about them needs to happen late. They now run EARLY,
+in the guard phase's coercing arm, writing the caller's own argument temp;
+the copy loop then finds an exact value and is untouched.
+
+**Why writing that temp is sound**: `emit_args_range` gives every argument a
+FRESH temp compiled immediately before the call, so nothing reads it
+afterwards - and the value written is exactly what `coerce_to_decl_type`
+would have produced at bind, so a LATER guard declining to the C++ tier still
+binds the right thing (its own coercion is then the identity). Only the
+NARROWING and a non-numeric remain declines: they must RAISE, which is
+precisely what cannot happen once the frame exists.
+
+### THE REGISTER TRAP: `rax` is the DESCRIPTOR through the whole guard phase
+
+The first version used `rax` as the scratch for the argument's kind byte and
+**every call died on `Frame::at`'s bounds assert** - the frame-size read and
+the cache-hit arm both still need the descriptor. The arm uses `rsi` (it
+carries the fragment's pinned int tag and is overwritten with `total` a few
+instructions later - dead-then-redefined) and `r10` (not live until the
+record fill). Same family as the ABI traps above: an implicit register
+contract, violated by an addition to a long function.
+
+### The counter has to be an extra_check, not a `tests` entry
+
+`jit_counter_coverage` runs during the TREE-WALKER pass, before the
+differential modes have executed any native code - so a source-table test
+cannot feed a `g_jit_*` counter in time. The first attempt was exactly that
+and the coverage assertion reported the lever dead. Anything that must PROVE
+an emitted path ran needs an extra_check that drives `vm_execute` itself.
+
+Measured: 4M widening calls 3182.0M -> 1978.0M (**-37.84%**, 796 -> 495 Ir
+per call); the exact, dyn and zero-arg probes byte-flat, fourteen benches
+flat. Sabotages watched failing: skip the int -> float conversion -> the
+extra_check AND the differential (1534/1535); accept a narrowing -> the two
+JIT-ON differential modes (1534/1535) while the headline stays green.

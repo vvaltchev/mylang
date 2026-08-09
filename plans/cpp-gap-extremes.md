@@ -1130,6 +1130,11 @@ That second one is the reason the counter exists. A guard that is too strict
 is invisible to every correctness net in the project, because declining is
 always right.
 
+### The sibling case, TAKEN the same day (see "G1 increment 4" below)
+
+What follows was written when the widening was still a decline; it is kept
+because it states the constraint the increment then had to design around.
+
 ### The sibling case, measured and NOT taken: a WIDENING argument
 
 `func f(float x)` called as `f(i)` with an int `i` - an ordinary shape, and
@@ -1150,3 +1155,76 @@ decline because it raises before the frame exists.
 
 Sized for whoever picks it up: it is the same ~296 Ir per call the exact
 case just won back, on the `f(<int>)`-into-`float` shape.
+
+## G1 increment 4 LANDED 2026-08-07 - the widening argument, converted in the
+## caller's own temp
+
+Increment 3 left `func f(float x)` called as `f(i)` with an int `i` declining
+on every call, and the reason was a real constraint: a conversion in the COPY
+LOOP happens after the record is pushed, where a decline is no longer
+possible. The way out is that the widenings are TOTAL - bool -> int is a pure
+RETAG (a bool's payload is already the int 0/1, the `EvalValue(bool)` ctor
+zeroes the whole word), and int/bool -> float is one `cvtsi2sd` - so nothing
+about them needs to happen late.
+
+**So they happen EARLY, in the caller's own argument temp**, inside the
+guard phase's coercing arm. The copy loop then finds an exact value and stays
+the raw copy it always was. Two facts make writing that temp sound:
+
+- `emit_args_range` (codegen.cpp) gives every argument a FRESH temp, compiled
+  immediately before the call, so nothing reads it afterwards;
+- the value written is precisely what `coerce_to_decl_type` would have
+  produced at bind, so a LATER guard declining to the C++ tier still binds
+  the right thing - that tier's own coercion is then the identity.
+
+Only the NARROWING (a float into an `int` param) and a non-numeric remain
+declines. Those must RAISE, and raising is exactly what cannot happen once
+the frame exists.
+
+**The fast_bind path is byte-identical**: no branch was added to the copy
+loop, and the whole arm sits behind the `fast_bind` test increment 3 already
+emitted.
+
+### Measured (callgrind Ir, `OPT=1 ASSERTS=0`, both binaries this session)
+
+4,000,000 widening calls (2M int -> float, 2M bool -> int):
+
+    widen2   3,182.0M -> 1,978.0M   **-37.84%**   (796 -> 495 Ir per call)
+
+    q_int (exact int param)    602.6M -> 602.6M   +0.00%
+    q_dyn (dyn param)          742.6M -> 742.6M   +0.00%
+    q_proto (zero-arg)         454.1M -> 454.1M   +0.00%
+
+Fourteen benches flat (worst +0.03% on 09_fib), for the same reason increment
+3 was flat: bench/ annotates no parameter on a call-heavy path.
+
+### The register trap, and what caught it
+
+The first version used `rax` as the scratch for the argument's kind byte.
+`rax` holds the DESCRIPTOR, which the frame-size read and the cache-hit arm
+both still need - **every call died on `Frame::at`'s bounds assert**, in the
+debug build, on the first program run. The arm now uses `rsi` (which carries
+the fragment's pinned int tag and is overwritten with `total` a few
+instructions later, so it is dead-then-redefined) and `r10` (not live until
+the record fill). It is the same family as the ABI traps already recorded
+here: an implicit register contract, violated by an addition.
+
+### Sabotage - both watched failing
+
+- **Skip the int -> float conversion** (retag only): the extra_check fails
+  AND the differential fails, 1534/1535.
+- **Accept a NARROWING** (drop the `jne slow` on the int-param arm, so a
+  float is retagged as an int): the headline stays 1754/1754 - the
+  tree-walker pass - and the two JIT-ON differential modes fail 1534/1535.
+  The narrowing must throw and did not.
+
+`g_jit_bind_widen` is bumped ONLY by the two conversion arms, so it separates
+"a widening ran inline" from "the coercing push ran" - which
+`g_jit_bind_coerce` alone cannot, and which matters for the same reason as
+increment 3: a guard that quietly stopped widening would still be CORRECT
+(it would decline) and still be counted.
+
+It had to be an **extra_check**, not a `tests` entry: the counter-coverage
+assertion runs during the TREE-WALKER pass, before the differential modes
+have executed any native code, so a source-table test cannot feed it. The
+first attempt was exactly that and reported the counter dead.
