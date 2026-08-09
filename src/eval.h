@@ -212,6 +212,30 @@ struct GlobalFuncTable {
         slots.resize(nm.size());
         defined.assign(nm.size(), 0);
     }
+
+    /*
+     * THE ONLY TWO WAYS TO WRITE A GLOBAL SLOT. Marking `defined` in the same
+     * statement as the store is not a convenience - it is the invariant the
+     * EMITTED call site depends on:
+     *
+     *     an UNDEFINED slot holds the default-constructed LValue, i.e.
+     *     `none`, whose type can never pass a FuncObject check.
+     *
+     * So the inline call push tests only the TYPE and lets an undefined
+     * callee decline to the C++ tier, which raises UndefinedVariableEx with
+     * its caret exactly as before - the separate `defined` probe it used to
+     * emit (a load from a DIFFERENT vector, hence a second cache line) is
+     * redundant. Route every new write through these, or that stops being
+     * true silently.
+     */
+    void define(size_t slot, LValue &&v) {
+        slots[slot] = std::move(v);
+        defined[slot] = 1;
+    }
+    void put_defined(size_t slot, EvalValue &&v) {
+        slots[slot].put(std::move(v));
+        defined[slot] = 1;
+    }
 };
 
 class EvalContext {

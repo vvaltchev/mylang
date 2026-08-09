@@ -2602,3 +2602,39 @@ match -> the widening extra_check's own assertion (`the coercing callee is
 NOT CACHED (0)`) AND the coverage sweep (`g_jit_coerce_cached is ZERO`),
 1752/1754. Both are counter-based of necessity: a cache that never hits is
 CORRECT, so no differential, corpus, fuzzer or lever configuration sees it.
+
+## G1 increment 6 (2026-08-07): the callee-resolution `defined` probe
+
+The global-slot call form resolved its callee in nine instructions, three of
+them a `defined` probe - a load of a SECOND vector's data pointer and a byte
+test on a different cache line from the slot it precedes.
+
+It is redundant, and making that TRUE rather than likely is the substance:
+**`GlobalFuncTable::define` / `put_defined` are now the only two ways to
+write a global slot**, each marking `defined` in the same statement as the
+store, so an unbound slot still holds the default `none` and the type test
+declines it. The C++ tier then raises UndefinedVariableEx with its caret
+exactly as before. Six writers routed through them; the emitted StoreGlobalV
+writes both natively and is unchanged. `jit_call_sync` - which every decline
+and every FIRST call at a site reaches - ML_VM_CHECKs the invariant.
+
+Measured: 10_recursion_deep **-1.17%**, 45_gcd -0.36%, 63_closures -0.25%,
+09_fib -0.08%; everything else flat. Ir understates it - the call path also
+stops touching a second cache line.
+
+### RULE: the G1 probes measure the VALUE call form, bench/ the GLOBAL one
+
+`q_proto`, `q_int` and `widen2` all read -0.00% here and briefly looked like
+a build that had not recompiled. They had; the emitted code is provably three
+instructions shorter. Those probes call a closure held in a TOP-LEVEL VAR -
+which main reads itself, so it is a main-frame LOCAL and the call is
+CallValueV, a form that never had a `defined` probe. A named top-level
+function called from inside another function is the global-slot form, and it
+lives in the benches. **Check which form a measurement exercises before
+concluding a call-protocol change did nothing.**
+
+Sabotage watched failing: drop the mark from `define()` -> 1359/1754 plus
+both JIT-ON differential modes. The removed guard itself is unfalsifiable at
+the emitted site (a slot can only be unbound on a site's FIRST executions,
+which decline on record reuse anyway) - which is exactly why the safety
+argument lives in the store/mark pairing, which is falsifiable.

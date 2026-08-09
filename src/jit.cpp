@@ -2589,10 +2589,18 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     e.movabs(RCX, reinterpret_cast<uint64_t>(L.addr_act));
     ld(R8R, RCX, 0);                                  /* r8 = act */
     if (!is_value) {
+        /*
+         * NO `defined` PROBE. It used to load a second vector's data pointer
+         * and test a byte there - a different cache line from the slot it was
+         * about to read - to catch an undefined callee. It is redundant:
+         * every write to a global slot goes through GlobalFuncTable::define /
+         * put_defined, which mark `defined` in the SAME statement, so an
+         * undefined slot still holds the default-constructed `none` and the
+         * type test below declines it. The C++ tier then raises
+         * UndefinedVariableEx with its caret exactly as before - it is the
+         * one that owns that error, and it is unchanged.
+         */
         ld(RAX, R9R, static_cast<int32_t>(L.ctx_gfuncs));
-        ld(RCX, RAX, static_cast<int32_t>(L.gft_defined));
-        cmp_b_imm8(RCX, callee_arg, 0);
-        j_slow.push_back(e.j32(0x74));                /* je slow */
         ld(RCX, RAX, static_cast<int32_t>(L.gft_slots));
         e.movabs(RAX, reinterpret_cast<uint64_t>(P.t_func));
         modrm(0x39, RAX, RCX, callee_arg * 48 + 24, true); /* cmp [..],rax */

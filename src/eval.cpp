@@ -4094,9 +4094,9 @@ handle_single_expr14(EvalContext *ctx,
         if (const Identifier *id = as_resolved_global(lvalue)) {
 
             if (GlobalFuncTable *gf = ctx->gfuncs) {
-                gf->slots[id->sym.slot] =
-                    LValue(RValue(rval), ctx->const_ctx || lvalue->is_const);
-                gf->defined[id->sym.slot] = 1;
+                gf->define(id->sym.slot,
+                           LValue(RValue(rval),
+                                  ctx->const_ctx || lvalue->is_const));
                 return rval;
             }
         }
@@ -4699,9 +4699,8 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
          * O(1) slot, no map) - like a top-level function. Script-only (the REPL
          * keeps structs in the redefinable map; gfuncs is null there). */
         if (id->sym.kind == SymKind::global && ctx->gfuncs) {
-            GlobalFuncTable *gf = ctx->gfuncs;
-            gf->slots[id->sym.slot] = LValue(std::move(desc), true /* const */);
-            gf->defined[id->sym.slot] = 1;
+            ctx->gfuncs->define(id->sym.slot,
+                                LValue(std::move(desc), true /* const */));
             return none;
         }
 
@@ -4734,9 +4733,8 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
          * in the map, so this path is script-only).
          */
         if (id->sym.kind == SymKind::global && ctx->gfuncs) {
-            GlobalFuncTable *gf = ctx->gfuncs;
-            gf->slots[id->sym.slot] = LValue(std::move(func), ctx->const_ctx);
-            gf->defined[id->sym.slot] = 1;
+            ctx->gfuncs->define(id->sym.slot,
+                                LValue(std::move(func), ctx->const_ctx));
             return none;
         }
 

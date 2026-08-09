@@ -1305,3 +1305,87 @@ NOTE for the next person to run the suite: `bench/.bench_cache/` is
 git-ignored, so a machine that has not seen this bench will fail fast on the
 missing comparison entry and name the `--recompute` command, exactly as it
 should for any newly added bench.
+
+## G1 increment 6 LANDED 2026-08-07 - the callee-resolution guards
+
+The last item in the guard phase's list. The global-slot call form resolved
+its callee in nine instructions, three of which were a `defined` probe:
+
+    mov rax,[r9+gfuncs]
+    mov rcx,[rax+gft_defined]     <-- a SECOND vector's data pointer
+    cmp byte [rcx+slot],0         <-- on a different cache line
+    je slow
+    mov rcx,[rax+gft_slots]
+    movabs rax,t_func
+    cmp [rcx+slot*48+24],rax
+    jne slow
+    mov rdx,[rcx+slot*48]
+
+The probe is redundant, and making that TRUE rather than merely likely is the
+substance of the increment: **`GlobalFuncTable::define` / `put_defined` are
+now the only two ways to write a global slot**, and each marks `defined` in
+the same statement as the store. So an unbound slot still holds the
+default-constructed `none`, whose type can never pass the FuncObject test -
+the call declines to the C++ tier, which raises UndefinedVariableEx with its
+caret exactly as before. Six writers were routed through them (three in
+eval.cpp, three in vm.cpp); the emitted StoreGlobalV writes both natively and
+is unchanged.
+
+`jit_call_sync` - which every decline and every FIRST call at a site reaches -
+ML_VM_CHECKs the invariant.
+
+### Measured (callgrind Ir, `OPT=1 ASSERTS=0`, both binaries this session)
+
+    10_recursion_deep   345.9M -> 341.9M   **-1.17%**
+    45_gcd              123.6M -> 123.2M   -0.36%
+    63_closures         477.6M -> 476.4M   -0.25%
+    09_fib_recursive     88.1M ->  88.1M   -0.08%
+
+Everything else flat. The Ir understates it: the removed load was from a
+DIFFERENT vector than the slot it precedes, so it is also a cache line the
+call path no longer touches.
+
+### THE PROBE-COVERAGE GAP this found, worth keeping
+
+`q_proto`, `q_int` and `widen2` all read **-0.00%** - and for a while that
+looked like the change had not compiled. It had; the emitted code is provably
+three instructions shorter. **Those probes call a closure held in a TOP-LEVEL
+VAR, which main reads itself - so it is a main-frame LOCAL, the call is
+CallValueV, and the value form never had a `defined` probe to remove.** The
+global-slot form lives in the BENCHES (a named top-level function called from
+inside another function).
+
+So: the G1 probes measure the VALUE call form; bench/ measures the
+GLOBAL-SLOT one. Before concluding a call-protocol change "did not compile",
+check which of the two the measurement actually exercises.
+
+### Sabotage watched failing
+
+Drop the mark from `define()` (the store stays): **1359/1754**, plus both
+JIT-ON differential modes. The pairing is what the removal rests on, and it
+is load-bearing to the tune of 395 tests.
+
+The removed guard ITSELF is unfalsifiable at the emitted site, and honestly
+so: a slot can only be unbound on a site's FIRST executions, which decline on
+the record-reuse guard anyway. That is why the safety argument was moved into
+the store/mark pairing - which IS falsifiable - and backed by the ML_VM_CHECK
+rather than left as a claim about the emitted code.
+
+### Two more resolution guards considered and DECLINED
+
+- **`cur_seg >= 0`** (2 instructions): provably true whenever a fragment is
+  running, since the caller's own frame occupies a window in `segs[cur_seg]`.
+  Kept anyway - it guards a raw `[segs + cur_seg*8]` load, and the project's
+  defensive-check preference outweighs 1.4% on one probe. Overturnable.
+- **Co-locating `g_current_ctx` and `g_vm_act`** so one `movabs` reaches both
+  (1 instruction): needs 151 renames in vm.cpp, or a macro, or a
+  reference-alias whose folding is not guaranteed at -O0. Not worth it.
+
+### A PRE-EXISTING divergence found while testing (NOT caused here, not fixed)
+
+For an unbound global callee the tree-walker prints a backtrace and the VM
+does not - verified byte-identical against the pre-change binary, so it
+predates this work. `jit_call_sync`'s UndefinedVariableEx is constructed
+without the frames the tree-walker captures. Same family as #75/#88, and
+tracked as **#126**. The new test pins the exception TYPE across all five
+modes; the RENDERING gap is what #126 is for.
