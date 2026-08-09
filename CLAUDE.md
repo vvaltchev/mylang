@@ -1224,8 +1224,27 @@ and it lives *inside the parser*. Mechanics:
   with it BOTH the reads and the CALLS are the unconditional ones and a global
   enters a set only if every step from the call to the read is guaranteed — a
   conditional link ANYWHERE drops the case to the warning tier, and all three
-  positions (outer call, inner call, read) are pinned. Still open: call sites
-  below the top level.
+  positions (outer call, inner call, read) are pinned.
+  **IT SEES THROUGH A WRITE-ONCE NAME** (#140, 2026-08-09): `var f = fetch;
+  var t = f();` is refused exactly like the direct `fetch()` spelling, at the
+  top level and through a call hop alike (`index_func_aliases` +
+  `callee_of`, consulted by BOTH tiers and by the fixpoint's call edges).
+  Sound for the same reason AutoConst's promotion is: the declaration is the
+  ONLY write, so wherever the name is bound at all it holds that one
+  function — proven from the write counters the resolver has already
+  collected (`writes[slot] == 1` for a main-frame local, absence from
+  `reassigned_globals` for a global), and a reassignment at any depth in any
+  scope disqualifies it. A capture cannot defeat it: captures are BY VALUE.
+  **The decline direction is the one that matters** — a false alias refuses a
+  program that RUNS (`var f = fetch; f = other; f();` where `other` never
+  reads the global), which is why the write-once sabotage is watched failing
+  on a case that asserts its own result, not merely that it compiled. Two
+  deliberate limits, both silent: a top-level call ABOVE the binding is left
+  alone (the failure there is the unbound NAME, and reporting what it will
+  later hold would name the wrong cause — the TDZ already refuses it), and
+  a callee that needs a real callee-SET analysis to bound — a container
+  element (`ops[0]()`), a parameter, an alias CHAIN (`var f2 = f;`) — keeps
+  today's runtime `UnboundSymbolEx`.
 - **`isbound(name)` — the TDZ pair's runtime half (#131 step 6).**
   `defined(name)` asks whether the name EXISTS (true throughout its scope,
   ABOVE the declaration included — the name is declared, merely unbound);
@@ -3671,9 +3690,12 @@ and two macros:
   own output. The driver drains the list and renders each with the same caret
   machinery an error uses; `-rt` reads the vector instead. **A warning that
   cannot be located is barely a warning** — the test asserts every one carries
-  a loc and a message. NOT transitive: a global read one hop away (the callee
-  calls something that reads it) is reported by neither tier — pinned by a
-  test that expects ZERO, so adding transitivity has something that notices.
+  a loc and a message. It is TRANSITIVE and resolves write-once aliases
+  exactly like the error tier — the two share `build_reachable_reads` and
+  `callee_of` and differ only in which paths count. The one-hop case in that
+  table expected ZERO until the call-graph fixpoint landed, and the pin
+  worked as intended: it FAILED the moment the behaviour improved, instead of
+  letting the improvement go unnoticed. Keep writing them that way.
 - **⛔ NO INPUT MAY CRASH THE INTERPRETER (#137, 2026-08-09).** Every `.my`
   file ends in a DEFINED outcome — a compile refusal, a thrown exception, or a
   clean run. Two real crashes were found by simply trying degenerate inputs:

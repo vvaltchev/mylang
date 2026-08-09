@@ -1343,8 +1343,9 @@ public:
             if (auto *rb = dynamic_cast<Block *>(root)) {
                 if (g_strict_mode)      /* --strict: FIX-2's original shape */
                     strict_forward_globals(rb);
-                prove_unbound_calls(rb);
-                warn_unbound_calls(rb);   /* tier 3: the residue it declined */
+                prove_unbound_calls(rb, main_st.writes);
+                /* tier 3: the residue it declined */
+                warn_unbound_calls(rb, main_st.writes);
             }
 
         /* Promote write-once scalar vars to constants and fold (uses the write
@@ -1531,10 +1532,14 @@ private:
      * branch is CONDITIONAL, so it is skipped either way - and running before
      * every transform means the tree is the one the user wrote.
      *
-     * INCREMENT 1 (what is NOT here yet, all of it the silent direction):
-     * no transitivity (a global read by a function the callee calls), no
-     * call sites below the top level, and no WARNING tier for the merely
-     * suspicious - those keep today's runtime UnboundSymbolEx.
+     * WHAT IT SEES, and what it still does not. Transitivity through the
+     * call graph is here (build_reachable_reads), the WARNING tier for the
+     * merely suspicious is here (warn_unbound_calls), and a callee named
+     * indirectly through a write-once binding is here (index_func_aliases).
+     * What remains silent is a callee that needs a real callee-SET analysis
+     * to bound - a container element (`ops[0]()`), a parameter, an alias
+     * CHAIN (`var f2 = f;`). Those keep today's runtime UnboundSymbolEx,
+     * which is correct, merely late.
      * ------------------------------------------------------------------ */
 
     /*
@@ -1638,8 +1643,10 @@ private:
      * for_each_child plus the containers it skips) while the prover walks
      * only unconditional code, and why the two cannot double-report.
      *
-     * Still NOT transitive: a global read by a function the callee calls is
-     * reported by neither tier. That gap is silent, not wrong.
+     * It is TRANSITIVE like the error tier (the same build_reachable_reads,
+     * asked for every path rather than the guaranteed ones) and it resolves
+     * the same write-once aliases, so the two tiers see one call graph and
+     * differ only in which paths count.
      */
     template <typename F>
     static void walk_every(Construct *c, const F &f)
@@ -1679,7 +1686,7 @@ private:
         for_each_child(c, [&](Construct *ch) { walk_every(ch, f); });
     }
 
-    void warn_unbound_calls(Block *rb)
+    void warn_unbound_calls(Block *rb, const std::vector<int> &main_writes)
     {
         DeclIndex global_decl_stmt;
         FuncIndex top_funcs;
@@ -1688,11 +1695,14 @@ private:
         if (global_decl_stmt.empty() || top_funcs.empty())
             return;
 
+        AliasIndex aliases;
+        index_func_aliases(rb, top_funcs, main_writes, aliases);
+
         /* every global a call may reach, on ANY path and through ANY number
          * of hops - the conditional read and the deeper one are what this
          * tier exists to catch */
         ReadSets reads;
-        build_reachable_reads(top_funcs, global_decl_stmt,
+        build_reachable_reads(top_funcs, global_decl_stmt, aliases,
                               /*unconditional_only=*/false, reads);
 
         for (size_t i = 0; i < rb->elems.size(); i++) {
@@ -1704,14 +1714,12 @@ private:
                 auto *call = dynamic_cast<CallExpr *>(n);
                 if (!call)
                     return;
-                auto *cid = dynamic_cast<Identifier *>(call->what.get());
-                if (!cid)
-                    return;
-                auto ft = top_funcs.find(cid->uid);
-                if (ft == top_funcs.end())
+                FuncDeclStmt *fd = callee_of(call, top_funcs, aliases,
+                                             static_cast<ptrdiff_t>(i));
+                if (!fd)
                     return;
 
-                for (const UniqueId *g : reads[ft->second]) {
+                for (const UniqueId *g : reads[fd]) {
                     auto dit = global_decl_stmt.find(g);
                     if (dit != global_decl_stmt.end() && dit->second > i) {
                         compile_warn(
@@ -1729,6 +1737,9 @@ private:
     typedef std::unordered_map<const UniqueId *, FuncDeclStmt *> FuncIndex;
     typedef std::unordered_map<FuncDeclStmt *,
                                std::vector<const UniqueId *>> ReadSets;
+    /* name -> (the function it always holds, the stmt that bound it) */
+    struct Alias { FuncDeclStmt *fd; size_t decl_stmt; };
+    typedef std::unordered_map<const UniqueId *, Alias> AliasIndex;
 
     /* The top-level statement index of each global VAR/CONST decl, plus every
      * top-level named function - the two things both tiers index by. */
@@ -1748,6 +1759,107 @@ private:
             if (lv && lv->sym.kind == SymKind::global)
                 decls.emplace(lv->uid, i);
         }
+    }
+
+    /*
+     * WRITE-ONCE NAMES THAT ALWAYS HOLD ONE NAMED FUNCTION (#140).
+     *
+     *     func fetch() { return g; }
+     *     var f = fetch;               <- f can only ever be `fetch`
+     *     var t = f();                 <- so this call always fails
+     *     var g = 5;
+     *
+     * Without this the callee is not an Identifier the FuncIndex knows, both
+     * tiers give up, and the program dies at RUN time on line 1 - even though
+     * the failure is exactly as certain as the direct `fetch()` spelling,
+     * which is refused at compile time.
+     *
+     * WHAT MAKES IT SOUND is write-once, the same argument AutoConst's
+     * promotion rests on: the declaration is the ONLY write, so at every
+     * point where the name is bound at all it holds that one function. A
+     * reassignment anywhere - in any scope, at any depth - disqualifies it,
+     * and the two write counters the resolver has ALREADY collected by now
+     * are what proves that: `writes[slot] == 1` for a main-frame local (the
+     * decl itself is write #1) and absence from `reassigned_globals` for a
+     * global (a decl never reaches count_write, so any entry is a reassign).
+     *
+     * A capture cannot defeat it: captures are BY VALUE, so a closure that
+     * reassigns its copy leaves this binding alone - and that write is a
+     * capture-slot write, counted against neither table.
+     *
+     * NOT chased through a chain (`var f = fetch; var f2 = f;` leaves f2
+     * unresolved) and not through a container (`ops[0]()`): both need a
+     * callee-set analysis, and the value the resolver can see here is one
+     * name. The limit costs a diagnostic, never an answer.
+     */
+    void index_func_aliases(Block *rb, const FuncIndex &funcs,
+                            const std::vector<int> &main_writes,
+                            AliasIndex &out)
+    {
+        for (size_t i = 0; i < rb->elems.size(); i++) {
+
+            auto *ex = dynamic_cast<Expr14 *>(rb->elems[i].get());
+            if (!ex || !(ex->fl & pFlags::pInDecl) || ex->op != Op::assign)
+                continue;
+
+            /* `var a, b = ...` binds a list: no single function value */
+            auto *lv = dynamic_cast<Identifier *>(ex->lvalue.get());
+            auto *rv = dynamic_cast<Identifier *>(ex->rvalue.get());
+            if (!lv || !rv || rv->sym.kind != SymKind::global)
+                continue;
+
+            auto ft = funcs.find(rv->uid);
+            if (ft == funcs.end())
+                continue;               /* not a top-level named function */
+
+            if (lv->sym.kind == SymKind::local) {
+                const int s = lv->sym.slot;
+                if (s < 0 || s >= static_cast<int>(main_writes.size())
+                        || main_writes[static_cast<size_t>(s)] != 1)
+                    continue;           /* reassigned somewhere */
+            } else if (lv->sym.kind == SymKind::global) {
+                if (reassigned_globals.count(lv->sym.slot))
+                    continue;
+            } else {
+                continue;               /* not a plain top-level binding */
+            }
+
+            out.emplace(lv->uid, Alias{ ft->second, i });
+        }
+    }
+
+    /*
+     * The function a call site invokes, or null when that is not decidable.
+     * `stmt` is the top-level statement index the call sits in, or -1 when it
+     * sits inside a function BODY (which may run at any time).
+     */
+    static FuncDeclStmt *callee_of(CallExpr *call, const FuncIndex &funcs,
+                                   const AliasIndex &aliases,
+                                   ptrdiff_t stmt)
+    {
+        auto *cid = dynamic_cast<Identifier *>(call->what.get());
+        if (!cid)
+            return nullptr;             /* `ops[0]()`, a call result, ... */
+
+        auto ft = funcs.find(cid->uid);
+        if (ft != funcs.end())
+            return ft->second;
+
+        auto at = aliases.find(cid->uid);
+        if (at == aliases.end())
+            return nullptr;
+        /*
+         * A top-level call ABOVE the binding reaches an unbound name, so the
+         * failure is that name, not anything the function it will later hold
+         * reads - staying silent leaves the (correct) runtime error rather
+         * than reporting the wrong cause. From inside a BODY there is nothing
+         * to compare against, and nothing to check either: a body can only
+         * read a GLOBAL, which is in `global_decl_stmt`, so an alias that is
+         * not bound yet is already caught as an ordinary unbound read.
+         */
+        if (stmt >= 0 && at->second.decl_stmt > static_cast<size_t>(stmt))
+            return nullptr;
+        return at->second.fd;
     }
 
     static void add_uniq(std::vector<const UniqueId *> &v, const UniqueId *u)
@@ -1782,6 +1894,7 @@ private:
      * false and takes every path.
      */
     void build_reachable_reads(const FuncIndex &funcs, const DeclIndex &decls,
+                               const AliasIndex &aliases,
                                bool unconditional_only, ReadSets &out)
     {
         std::unordered_map<FuncDeclStmt *, std::vector<FuncDeclStmt *>> callees;
@@ -1799,16 +1912,13 @@ private:
                 auto *call = dynamic_cast<CallExpr *>(n);
                 if (!call)
                     return;
-                auto *cid = dynamic_cast<Identifier *>(call->what.get());
-                if (!cid)
-                    return;
-                auto it = funcs.find(cid->uid);
-                if (it != funcs.end() && it->second != fd) {
+                FuncDeclStmt *h = callee_of(call, funcs, aliases, -1);
+                if (h && h != fd) {
                     bool seen = false;
-                    for (FuncDeclStmt *h : calls)
-                        if (h == it->second) { seen = true; break; }
+                    for (FuncDeclStmt *k : calls)
+                        if (k == h) { seen = true; break; }
                     if (!seen)
-                        calls.push_back(it->second);
+                        calls.push_back(h);
                 }
             };
 
@@ -1835,7 +1945,7 @@ private:
         }
     }
 
-    void prove_unbound_calls(Block *rb)
+    void prove_unbound_calls(Block *rb, const std::vector<int> &main_writes)
     {
         DeclIndex global_decl_stmt;
         FuncIndex top_funcs;
@@ -1844,9 +1954,12 @@ private:
         if (global_decl_stmt.empty() || top_funcs.empty())
             return;
 
+        AliasIndex aliases;
+        index_func_aliases(rb, top_funcs, main_writes, aliases);
+
         /* what a call can REACH, not just what its callee's own body reads */
         ReadSets reads;
-        build_reachable_reads(top_funcs, global_decl_stmt,
+        build_reachable_reads(top_funcs, global_decl_stmt, aliases,
                               /*unconditional_only=*/true, reads);
 
         for (size_t i = 0; i < rb->elems.size(); i++) {
@@ -1858,14 +1971,12 @@ private:
                 auto *call = dynamic_cast<CallExpr *>(n);
                 if (!call)
                     return;
-                auto *cid = dynamic_cast<Identifier *>(call->what.get());
-                if (!cid)
-                    return;
-                auto ft = top_funcs.find(cid->uid);
-                if (ft == top_funcs.end())
+                FuncDeclStmt *fd = callee_of(call, top_funcs, aliases,
+                                             static_cast<ptrdiff_t>(i));
+                if (!fd)
                     return;
 
-                for (const UniqueId *g : reads[ft->second]) {
+                for (const UniqueId *g : reads[fd]) {
                     auto dit = global_decl_stmt.find(g);
                     if (dit != global_decl_stmt.end() && dit->second > i)
                         /* the caret marks the CALL: that is the statement the
