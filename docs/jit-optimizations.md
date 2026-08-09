@@ -3032,3 +3032,39 @@ through their records, so the slow helper's flat arm must MATERIALIZE
 records for record-less frames on the rbp chain before going flat (cold,
 cap-exceeded only). Step 4 builds in five sub-steps, 4-i..4-v, each
 lever-gated.
+
+## G1 no-record tier STEP 4-i (2026-08-10): resume_pc + the real gate -
+## and the resume-semantics lesson the first assertion taught
+
+Mechanical prerequisites of record removal, both shadow-verified.
+
+**NorecSite::resume_pc** - the POST-CALL entry-stub pc the flat
+(JIT_RET_SWITCH) driver re-enters the caller at, which the -3
+materializer (design 4d) needs to rebuild a record-less frame's record.
+ONE local at the emit site now feeds both the site field and the slow
+helper's rdx (previously computed inline), so the two readings of "where
+does this call resume" cannot drift. Leaf sites bake none (a leaf callee
+makes no calls, so no -3 originates below one).
+
+**jit_chunk_norec_ok** (jit.cpp, beside jit_chunk_is_native_leaf; stub
+false off-platform) - the real step-4 callee gate: plain_frame + fully
+deleted + ref_slots <= RET_REF_GUARD_MAX, per-call exclusions left to
+the site. The push_verify reach classifier now calls IT instead of its
+inline mirror (which duplicated the ref bound as a literal - the exact
+audit-table drift hazard); reach numbers byte-identical after the swap.
+
+**THE LESSON, watched first-hand:** the registration-time verification
+of resume_pc initially asserted "names an EnterNative entry stub"
+unconditionally - and aborted within one -rt run on a KEPT-run site
+(resume_pc 1 of 3 ops). The real semantics: in a NON-deleted caller the
+interpreted original at that pc IS the resume target (vm_dispatch just
+interprets from there); the stub is guaranteed only where originals are
+deleted - which is precisely the gate-passing callers whose sites the
+materializer will consume, so the conditional form verifies exactly what
+step 4 depends on. A belief about the resume protocol was falsified by
+its own verification net before any code depended on it - the arc
+working as designed. Sabotage (bake resume+1): "out of bounds" abort on
+10_recursion_deep's first registration.
+
+Lanes: dbg/clang/rel-hard -rt 1867/1867, corpus 14/14, non-JIT probe
+(g++ + clang) builds and passes, plain release builds and runs.

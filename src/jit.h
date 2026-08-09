@@ -961,6 +961,12 @@ extern bool g_norec_audit;
  * fragment is placed); the non-JIT build gets null-returning stubs. */
 const NorecSite *jit_norec_site_for(const void *ret_addr);
 const Chunk *jit_norec_frag_for(const void *addr);
+/* G1 step 4's CALLEE gate (design doc 4b): plain_frame + FULLY DELETED
+ * (every op EnterNative - the record is the interpreter's only resume
+ * vehicle, so a record-less frame may never run interpreted) + a short
+ * ref_slots list (the C4c return arm's bound). Per-CALL exclusions (a
+ * cached call) are the site's business. False off-platform. */
+bool jit_chunk_norec_ok(const Chunk &chunk);
 /*
  * A compiled chunk that MOVES to its final storage (codegen_chunk returns
  * by value; the lazy vm_func_chunk net jits a stack local and emplaces it)
