@@ -118,6 +118,33 @@ the exact failure mode above - generalise it to a MUTATING visitor and
 have the liveness pass keep using the read-only form. ONE table, two
 uses.
 
+**The remapper, with the layouts already verified** (from each op's emit
+site + `visit_use_def`, so the next session does not re-derive them):
+
+    IntBin FloatBin + every specialized RR/RI + IntModRI + IntAddModRI
+    CmpIntV CmpFloatV        a, b, target        (IntAddModRI's target2
+                                                  is the IMM - leave it)
+    JumpUnlessIntCmp/Float   a, b                (target is a pc)
+    Jump                     nothing             (target is a pc)
+    LoadImmInt/Float         target              (a is the literal)
+    MoveV                    target, target2
+    ReturnV                  a
+    CallV                    target, a_lit(+base = the ARG RUN base)
+                             -- target2 is a GLOBAL slot: do NOT remap
+
+`ForLoopStep` and `IntAddStep` were dropped from the whitelist rather
+than guessed at: their `target` is a pc and their `target2` a counter
+slot, but the operand layout wants checking against their emit sites
+before they carry a splice. Dropping them costs reach, nothing else.
+
+**And the net that makes this safe without a second audited table:**
+after remapping an instruction, run `visit_use_def` on it and ML_CHECK
+that every slot it reports is `>= base`. The callee's own slots are all
+`< callee_frame`, so any field the remapper MISSED is still below `base`
+and the check fires. That uses the existing audited table as a CHECKER
+instead of duplicating it - duplication being exactly how the other
+tables drifted.
+
 ### Increment 2 - the return boundary
 
 B's `ReturnV` becomes `MoveV dst = result` + `Jump` past the splice, the
