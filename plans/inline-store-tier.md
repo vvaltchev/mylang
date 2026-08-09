@@ -60,6 +60,55 @@ NOT proven by an isolated case, and recorded rather than claimed:
   error where the tree-walker did not. The latter is worth its own look:
   it is either an invalid program or a separate divergence.
 
+## PREP - clone in C++, resume native (landed 2026-08-02)
+
+The maintainer's design: instead of DECLINING every store while a slice
+exists (85 Ir each, forever), the COW guards call `jit_store_elem_prep` -
+the clone ALONE - and jump back to the fast path's retry head. The
+interpreter pays the clone once and stores raw ever after; now the emitted
+code does too.
+
+The rules, each load-bearing and each sabotage-verified:
+
+  - prep runs only AFTER the const + readonly guards: the interpreter
+    throws on those WITHOUT cloning, and a clone is observable via
+    `intptr`. Proven by inverting the order and watching the readonly
+    case's prep=0 assertion fire - but ONLY once the test's slice used a
+    `runtime()` index: `C[1:4]` with literal bounds const-folds at parse
+    time, no live slice ever exists, and the first ordering sabotage
+    PASSED vacuously.
+  - prep bounds-checks in C++ BEFORE cloning: an OOB store must not
+    detach anything (the interpreter checks bounds first).
+  - prep clones only the OVERLAPPED index's slices, never all: early
+    detach of a non-overlapping slice is observable via `intptr`. Such a
+    store stays on the slow helper until the loop reaches the slice's
+    range - exactly the interpreter's per-store behaviour.
+  - the retry CANNOT spin: prep returns 0 only when `jit_cow_clean()`
+    holds. Clone-skipped-with-belt-intact degrades to correct-but-slow
+    (the helper's own clone takes over, then fast resumes) - verified. A
+    wrong value requires sabotaging BOTH the clone and the belt, and that
+    combination HANGS (the retry spins) rather than corrupts - found by
+    doing exactly that double-sabotage by accident.
+
+MEASURED: 16_array_slice_write only -1.2%, and that is the honest number -
+the bench takes a FRESH slice per iteration and writes ONCE, so its cost
+IS the mandatory 1000-element clone, which prep relocates but cannot
+remove. No suite bench has the shape prep serves (a write loop over an
+array while a slice lives); the value is REACH - a slice no longer
+permanently disables the fast path - proven functionally by the tier test
+(fast-count + prep-count + value, per shape).
+
+THE READONLY GUARD IS NOW PROVEN too (it was recorded as unproven): the
+blocker was the specializer folding a const array into a write target's
+base, fixed as its own bug (fold_lvalue_reads). With that fixed, the
+readonly case reaches a compiled store through a plain param, and removing
+the guard corrupts the const array - value-divergence caught.
+
+The SLICE-BASE guard remains formally redundant with has_slices (a slice
+registers ITSELF in its parent's set, so slice implies has_slices) - both
+now route to prep, so the question dissolved: either check reaching prep
+gives the same behaviour, decided in C++ by arr.is_slice().
+
 ## The first attempt, and why it was reverted
 
 A full inline tier was written and is correct - guards + the raw store

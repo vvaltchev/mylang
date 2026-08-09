@@ -2589,6 +2589,56 @@ extern "C" int jit_store_elem_int(LValue *base, int_type idx, int_type rhs,
     return 0;
 }
 
+/*
+ * #92 prep - the COW work as its OWN slow path, so the store can RESUME
+ * natively (maintainer's design, 2026-08-02). The inline tier used to
+ * DECLINE to the full helper whenever a live slice existed - every store,
+ * forever, 85 Ir each - although the interpreter itself pays the clone
+ * exactly ONCE and then stores raw. Prep is that clone alone: the emitted
+ * guards detect slice/has_slices, call here, and jump BACK to re-run the
+ * fast path, which now passes.
+ *
+ * SEMANTICS ARE THE INTERPRETER'S, BIT FOR BIT, and each rule is
+ * load-bearing:
+ *   - called only AFTER the const + readonly guards passed: the
+ *     interpreter throws on those WITHOUT cloning, and a clone changes
+ *     observable identity (`intptr`, which the COW tests pin as spec);
+ *   - a negative or out-of-range index returns 1 UNCLONED: the
+ *     interpreter bounds-checks BEFORE it clones, so a store that only
+ *     throws OOB must not detach anything - the full helper then wraps /
+ *     raises with the exact caret;
+ *   - clones ONLY the slices overlapping the written index
+ *     (clone_aliased_slices(offset+idx)), never all of them: detaching a
+ *     non-overlapping slice early is observable via `intptr`;
+ *   - the return value re-checks jit_cow_clean(), so the native retry
+ *     loop CANNOT spin: prep either normalized the array or the store
+ *     goes to the full helper. A non-overlapping slice therefore keeps
+ *     THAT store on the slow path - exactly the interpreter's per-store
+ *     behaviour - and the fast path resumes once the loop reaches the
+ *     slice's range and detaches it.
+ */
+extern "C" int jit_store_elem_prep(LValue *base, int_type idx) noexcept
+{
+    if (!base->is<SharedArrayObj>())
+        return 1;
+    SharedArrayObj &arr = base->getval<SharedArrayObj>();
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+        return 1;
+    try {
+        if (arr.is_slice())
+            arr.clone_internal_vec();
+        else
+            arr.clone_aliased_slices(
+                arr.offset() + static_cast<size_type>(idx));
+    } catch (...) {
+        return 1;
+    }
+#ifdef TESTS
+    g_jit_store_prep++;
+#endif
+    return arr.jit_cow_clean() ? 0 : 1;
+}
+
 extern "C" int jit_store_elem_float(LValue *base, int_type idx, double rhs,
                                     int aop) noexcept
 {

@@ -18015,8 +18015,9 @@ static bool jit_store_elem_inline_tier()
         return true;
 
     auto go = [&](const std::vector<const char *> &src, bool vm,
-                  unsigned long *fast) -> std::string {
+                  unsigned long *fast, unsigned long *prep) -> std::string {
         const unsigned long before = g_jit_store_fast;
+        const unsigned long pbefore = g_jit_store_prep;
         const ExecEngine se = g_exec_engine;
         g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
         std::ostringstream cap;
@@ -18036,6 +18037,7 @@ static bool jit_store_elem_inline_tier()
         cout.rdbuf(old);
         g_exec_engine = se;
         if (fast) *fast = g_jit_store_fast - before;
+        if (prep) *prep = g_jit_store_prep - pbefore;
         return cap.str();
     };
 
@@ -18052,6 +18054,7 @@ static bool jit_store_elem_inline_tier()
         std::vector<const char *> src;
         bool fast;
         bool count = true;
+        int prep = -1;      /* -1 dont-care, 0 must NOT run, 1 must run */
     };
     const std::vector<Case> cases = {
       { "flat INT array, plain store",
@@ -18095,49 +18098,79 @@ static bool jit_store_elem_inline_tier()
        * 7007 against the tree-walker's 1007: the store writes in place and
        * the live slice observes a value it should have been cloned away
        * from. Verified failing that way.
+       *
+       * Since PREP landed this is no longer a permanent decline: the store
+       * at the slice's first overlapped index detaches it (exactly the
+       * clone the interpreter does), and the rest of the loop runs the
+       * fast path. The VALUE stays the oracle for the hazard - 1007 means
+       * the slice kept its pre-detach elements.
        */
-      { "DECLINE: a live SLICE view over the target (COW)",
+      { "live SLICE view: PREP detaches it, the loop resumes fast (COW)",
         { "func f(n) {",
           "    var a = array(32); var i = 0;",
           "    while (i < 32) { a[i] = i; i++; }",
           "    var sl = a[1:4];",
           "    var j = 0; while (j < 32) { a[j] = n; j++; }",
           "    return sl[0] * 1000 + a[0]; }",
-          "print(f(7));" }, false, /*count=*/false },
+          "print(f(7));" }, /*fast=*/true, /*count=*/true, /*prep=*/1 },
 
       /* storing THROUGH a slice: the base IS the slice, so its elements
        * live at shobj->off and a raw store would write the wrong element.
-       * Filled in a loop first so the store is in a COMPILED run - the
-       * same trap as the COW case above. */
-      { "DECLINE: storing THROUGH a slice (offset base)",
+       * PREP runs the interpreter's own first-store behaviour -
+       * clone_internal_vec detaches the slice into a standalone array -
+       * and the rest of the loop stores fast. Filled in a loop first so
+       * the store is in a COMPILED run. */
+      { "store THROUGH a slice: PREP detaches, then fast",
         { "func f(n) {",
           "    var a = array(32); var i = 0;",
           "    while (i < 32) { a[i] = i; i++; }",
           "    var sl = a[8:16];",
           "    var j = 0; while (j < 8) { sl[j] = n + j; j++; }",
           "    return sl[0] * 1000 + a[8] * 10 + a[0]; }",
-          "print(f(7));" }, false, /*count=*/false },
+          "print(f(7));" }, /*fast=*/true, /*count=*/true, /*prep=*/1 },
 
       /* a read-only array: the store must reach the helper, which raises
        * exactly as the interpreter does (NotLValueEx - a const container's
        * subscript is not an lvalue) */
       /*
-       * NOT COVERED HERE: the readonly guard. A const array is a DEEP
-       * read-only flag that travels through a plain parameter, but every
-       * shape I built to reach a JIT-compiled store through one made the
-       * VM error where the tree-walker did not - which is either an
-       * invalid program or a separate divergence, and not this change's
-       * business. The guard is emitted and matches the interpreter's
-       * `!arr.is_readonly()`; it is simply not proven by an isolated case.
-       * See plans/inline-store-tier.md.
+       * The READONLY guard - provable at last: the "VM error where the
+       * tree-walker did not" that blocked this case was the specializer
+       * folding a const array into a write target's base (fixed as its
+       * own bug; see fold_lvalue_reads). const-ness is DEEP - it travels
+       * through the plain param - so only the readonly guard stands
+       * between the inline store and corrupting C. prep=0 is load-bearing
+       * too: the interpreter throws WITHOUT cloning, so prep running here
+       * would detach slices of a const array observably.
        */
+      { "DECLINE: a read-only array behind a plain param",
+        { "const C = [1, 2, 3, 4, 5, 6, 7, 8];",
+          /* the slice makes prep=0 LOAD-BEARING for guard ORDER: with a
+           * live slice over C, misordering the COW guards before the
+           * readonly guard would run prep on a must-throw store - cloning
+           * a const array's slices observably. Without it, prep would be
+           * unreachable for C regardless of order. The runtime() index is
+           * ESSENTIAL: `C[1:4]` with literal bounds const-folds at parse
+           * time into a baked literal, so no live slice over C's runtime
+           * storage would exist and the assertion would be vacuous -
+           * verified exactly that way (the ordering sabotage passed until
+           * the fold was defeated). */
+          "var sl = C[runtime(1):4];",
+          "func g(arr, n) {",
+          "    var j = 0;",
+          "    while (j < 8) { arr[j] = n; j++; }",
+          "    return arr[0]; }",
+          "func f(n) {",
+          "    var t = 0;",
+          "    try { t = g(C, n); } catch (NotLValueEx) { t = 99; }",
+          "    return t + sl[0]; }",
+          "print(f(5));" }, /*fast=*/false, /*count=*/true, /*prep=*/0 },
     };
 
     bool ok = true;
     for (const Case &c : cases) {
-        unsigned long fast = 0;
-        const std::string got = go(c.src, true, &fast);
-        const std::string ref = go(c.src, false, nullptr);
+        unsigned long fast = 0, prep = 0;
+        const std::string got = go(c.src, true, &fast, &prep);
+        const std::string ref = go(c.src, false, nullptr, nullptr);
         if (got != ref || ref.empty()) {
             cout << "  store tier [" << c.name << "]: tw=[" << ref
                  << "] vm=[" << got << "]\n";
@@ -18151,6 +18184,16 @@ static bool jit_store_elem_inline_tier()
         if (c.count && !c.fast && fast != 0) {
             cout << "  store tier [" << c.name << "]: the inline path served "
                     "a shape it must REFUSE (" << fast << ")\n";
+            ok = false;
+        }
+        if (c.prep == 1 && prep == 0) {
+            cout << "  store tier [" << c.name << "]: PREP never ran - the "
+                    "shape stopped exercising the clone-and-resume path\n";
+            ok = false;
+        }
+        if (c.prep == 0 && prep != 0) {
+            cout << "  store tier [" << c.name << "]: PREP ran on a shape "
+                    "that must throw WITHOUT cloning (" << prep << ")\n";
             ok = false;
         }
     }

@@ -1324,6 +1324,45 @@ it out AFTER `jit_compile_chunk`, so `&chunk` dangles (an ASan SEGV the
 OOB-store regression test caught). Measured (same-binary before/after, both
 JIT-on): 43_sieve 0.63-0.69x, 14_array_subscript 0.74-0.78x, 46_matrix 0.82x,
 56_sieve_bool 0.79-0.90x (~1.3x on write benches); suite geomean 0.97-0.99x.
+**#92 - the INLINE element-store tier + PREP (2026-08-02).** The
+StoreElemInt/Float helper call above redid the whole managed model PER
+STORE - type tag, storage kind, const + readonly, negative wrap, size()
+twice, slice check, use_count(), the store, invalidate_hash() - measured
+at **85 Ir to store one bool**, 66% of 43_sieve (the suite's worst bench,
+27.2x C++). The guards + the raw store are now EMITTED INLINE for a plain
+(aop invalid) int/bool store, the helper kept as the slow tier; every
+guard DECLINES to it, so the negative wrap, OOB caret, COW, compound ops
+and floats stay byte-identical. Measured: 43_sieve **-61.3%** Ir
+(27.2x -> 10.5x C++), 14_array_subscript **-47.9%** (10.0x -> 5.2x);
+88.9 Ir saved per store, the helper GONE from the sieve's profile (82.8%
+native).
+**THE GUARD IS `has_slices`, NOT `use_count() == 1`** - a MoveV-copied
+dead temp keeps the refcount at 2 for essentially all array code, so a
+sole-owner guard made the first version DEAD (caught by the emitted-code
+counter `g_jit_store_fast`, the prove-it-ran rule). `clone_aliased_slices`
+iterates `shobj->slices`, a no-op when no slice VIEWS exist - so
+`SharedObject::has_slices` MIRRORS `!slices.empty()`, every set mutation
+funneled through `slices_add`/`slices_del` (one iterator-erase in
+`clone_aliased_slices` refreshes it itself), and the interpreted store
+body ML_CHECKs `mirror == !slices.empty()` on every store.
+**PREP - the COW clone as its OWN slow path, the store RESUMES native**
+(maintainer's design): the two COW guards (slice base / live views) jump
+to a stub calling `jit_store_elem_prep` - the interpreter's exact
+normalization (clone_internal_vec for a slice base, else
+clone_aliased_slices at the OVERLAPPED index only - cloning all slices
+early is observable via `intptr`, which the COW tests pin) - then jump
+BACK to the fast path's retry head. The interpreter pays the clone once
+and stores raw ever after; now so does the emitted code. Prep runs only
+AFTER the const/readonly guards (those throw WITHOUT cloning) and
+bounds-checks in C++ before cloning (an OOB store must not detach). The
+retry CANNOT spin: prep returns 0 only when `jit_cow_clean()` holds.
+Sabotage-verified: clone-skipped-belt-intact degrades to correct-but-slow
+(the helper's own clone takes over); readonly-guard-removed corrupts a
+const array (value-divergence caught); COW-before-readonly ordering runs
+prep on a must-throw store (the prep=0 assertion caught it - once the
+test's slice used a `runtime()` index, since literal-bound slices of a
+const FOLD at parse time and the first version was vacuous). `rsi` is
+RESERVED (the fragment's t_int); the value rides `rdi`.
 The **DICT store** `d[k] = v` / `d[k] OP= v` (LOCAL base) is the same shape -
 `DictStore` -> `jit_dict_store` (vm.cpp), which runs the interpreter's exact
 `vm_subscript_store`. The key/value are BOXED EvalValues in frame slots, so
