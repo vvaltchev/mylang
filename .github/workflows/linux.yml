@@ -48,6 +48,23 @@ jobs:
           | sudo tee /proc/sys/kernel/core_pattern
         ./mylang -rt
 
+    # docs/myv-format.txt is the .myv SPECIFICATION, not a description of it -
+    # a third party must be able to write a reader from it alone. This script
+    # is that reader: written from the DOCUMENT and deliberately not from
+    # serialize.cpp, so consuming every image to exactly EOF is what proves
+    # the doc complete. It drifted three versions unnoticed once (the doc said
+    # v10 while the format was at v13); running it here is what stops that
+    # recurring. Stdlib-only Python, no deps.
+    - name: Docs - the .myv spec still describes the format
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run: |
+        mkdir -p myvdoc
+        for f in $GITHUB_WORKSPACE/samples/* $GITHUB_WORKSPACE/bench/my/*.my; do
+          ./mylang -c "$f" -o "myvdoc/$(basename "$f" .my).myv"
+        done
+        python3 $GITHUB_WORKSPACE/tests/myv_doc_check.py myvdoc/*.myv
+
     # On a crash: print a full backtrace from the core (immediately visible in
     # the log) and upload the core + the exact binary as an artifact, so the
     # failure can be debugged offline without re-reproducing it.

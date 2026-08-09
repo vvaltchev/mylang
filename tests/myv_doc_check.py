@@ -100,11 +100,14 @@ def chunk(r):
         r.u32(); r.boolv()                        # fin_pc, has_rethrow
     r.nx(r.u32)                                   # ref_slots
     r.nx(lambda: value(r))                        # consts
-    for _ in range(r.u32()):                      # 9.2 delta loc table
-        if r.u8() == 0xff: r.i32()                # pcd   (u8, 255 escapes)
-        if r.u8() == 0x80: r.i32()                # lined (i8, -128 escapes)
-        if r.u8() == 0xff: r.i32()                # col   (u8, 255 escapes)
-        if r.u8() == 0xff: r.i32(); r.i32()       # ecol escape: full end Loc
+    def loc_table():                              # 9.2 delta loc table
+        for _ in range(r.u32()):
+            if r.u8() == 0xff: r.i32()            # pcd   (u8, 255 escapes)
+            if r.u8() == 0x80: r.i32()            # lined (i8, -128 escapes)
+            if r.u8() == 0xff: r.i32()            # col   (u8, 255 escapes)
+            if r.u8() == 0xff: r.i32(); r.i32()   # ecol escape: full end Loc
+    loc_table()                                   # locs
+    loc_table()                                   # base_locs (v13)
     for _ in range(r.u32()):                      # 9.3 inline_frames
         r.sid(); r.nx(r.sid); r.loc(); r.u32()
     for _ in range(r.u32()): r.u32(); r.u32()     # inline_ctxs
@@ -164,8 +167,10 @@ def main(path):
     for _ in range(ndesc):
         r.uid(); r.sid()
         for _ in range(r.u32()):                  # params
-            r.uid(); r.boolv(); r.boolv(); r.boolv(); r.u8()
-        for _ in range(r.u32()): r.uid(); r.u8(); r.u32()   # captures
+            r.uid(); r.boolv(); r.boolv(); r.boolv()
+            r.u8(); r.u8()                        # decl_type, proven_type
+        for _ in range(r.u32()):                  # captures
+            r.uid(); r.u8(); r.u32(); r.loc(); r.loc()
         r.boolv(); r.u32(); r.u32()
         for _ in range(6): r.boolv()   # pure/effective/cache/pure_ctx/tmpl/fast
         has_chunk.append(r.boolv())
