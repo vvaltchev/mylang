@@ -3,8 +3,35 @@
 These are standalone test *programs*, separate from the built-in `-rt` unit
 suite (`src/tests.cpp`). They exist for kinds of testing that can't be
 exhaustively hard-coded — mainly **differential fuzzing** of the interpreter
-against CPython. They are not wired into `make`/CI and have no third-party
-dependencies (Python 3 standard library only).
+against CPython — or that `-rt` structurally cannot reach. They have no
+third-party dependencies (Python 3 standard library only, or POSIX `sh`).
+
+Two of them run in CI (`.github/workflows/linux.yml`); the rest are run by
+hand. The full set:
+
+- **`nested_fuzz.py`** — random deeply-nested programs, compared across
+  tree-walker / VM / CPython / optimizers-off.
+- **`corpus_diff.sh`** — tree-walker vs the default engine over
+  `tests/functional/` + `samples/`, plus the `--levers` / `--cold` JIT
+  matrices.
+- **`myv_fuzz.py`** — a mutated `.myv` must never crash or hang the loader.
+- **`repl_fuzz.py`** — template-generated REPL sessions (the REPL has its
+  own inferencer, retained ASTs and open-world globals).
+- **`myv_doc_check.py`** — *CI*. A reader written from `docs/myv-format.txt`
+  alone must consume every image to exactly EOF.
+- **`driver_checks.sh`** — *CI*. The CLI flags do what they say.
+
+### Why `driver_checks.sh` exists
+
+`-rt` runs **in-process**: it calls lexer/parser/infer/resolve directly and
+never goes through `mylang.cpp`'s argument handling. So a flag wired to the
+wrong side of an `if` is invisible to every one of its ~1866 tests. That is
+not hypothetical — `-nr` ("compile and validate, don't run") called
+`run_optimizers` only when it was going to *run*, so the step 7 prover, the
+whole warning tier, FIX-1, the TDZ and the duplicate-decl check were all
+skipped, and `-nr` exited 0 in silence on a program a plain run refuses
+(#147). Reverting that wiring fails 7 of its 9 checks while `-rt` stays
+green at 1866/1866.
 
 ## `nested_fuzz.py` — deep-nesting differential fuzzer
 

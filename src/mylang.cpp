@@ -227,7 +227,7 @@ void help()
          << endl;
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
          << endl;
-    cout << "  -nr      Don't run, just validate" << endl;
+    cout << "  -nr      Compile and validate, don't run" << endl;
     cout << "  -c       Compile to a .myv bytecode file, then exit" << endl;
     cout << "  -o FILE  Output path for -c (default: the source's .myv twin)"
          << endl;
@@ -760,44 +760,59 @@ int main(int argc, char **argv)
          * compile-time exception here. Validation-only (-nr) still runs it. */
         infer_types(root.get(), !opt_no_type_infer);
 
-        if (!opt_no_run) {
-            /* Run the optimizer pipeline (resolve_names + specialize_types -
-             * the SAME helper the REPL uses), then run the script. The root
-             * block builds its own "main" Frame for slotted top-level vars. */
-            run_optimizers(root.get(), !opt_no_inline, opt_inline_threshold,
-                           !opt_no_type_infer);
+        /*
+         * Run the optimizer pipeline (resolve_names + specialize_types - the
+         * SAME helper the REPL uses). The root block later builds its own
+         * "main" Frame for the slotted top-level vars.
+         *
+         * ⛔ THIS RUNS UNDER `-nr` TOO (#147, 2026-08-09), and skipping it
+         * was the bug: `-nr` says "don't run, just VALIDATE", but half the
+         * validation lives in resolve_names - the step 7 PROVER, the whole
+         * warning tier, FIX-1's undefined-name refusal, the TDZ, the
+         * same-scope duplicate check. So `mylang -nr prog.my` exited 0 in
+         * silence on a program `mylang prog.my` refuses outright, which is
+         * precisely backwards for the flag a CI job reaches for. The cost is
+         * that -nr is no longer a cheap parse: it now does the whole
+         * compile, minus execution.
+         */
+        run_optimizers(root.get(), !opt_no_inline, opt_inline_threshold,
+                       !opt_no_type_infer);
 
-            /*
-             * Step 7 tier 3: render whatever the compile SUSPECTED but could
-             * not prove. To stderr, so a script's own stdout is untouched,
-             * and with the same caret machinery an error uses - a warning the
-             * reader cannot locate is barely a warning.
-             */
-            for (const CompileWarning &w : g_warnings) {
-                cerr << "warning: " << w.msg;
-                if (w.start)
-                    cerr << " at line " << w.start.line
-                         << ", col " << w.start.col;
+        /*
+         * Step 7 tier 3: render whatever the compile SUSPECTED but could
+         * not prove. To stderr, so a script's own stdout is untouched,
+         * and with the same caret machinery an error uses - a warning the
+         * reader cannot locate is barely a warning.
+         */
+        for (const CompileWarning &w : g_warnings) {
+            cerr << "warning: " << w.msg;
+            if (w.start)
+                cerr << " at line " << w.start.line
+                     << ", col " << w.start.col;
+            cerr << endl;
+            if (w.start && w.start.line >= 1
+                    && w.start.line <= static_cast<int>(lines.size())) {
                 cerr << endl;
-                if (w.start && w.start.line >= 1
-                        && w.start.line <= static_cast<int>(lines.size())) {
-                    cerr << endl;
-                    dump_line_with_caret(
-                        cerr, lines[static_cast<size_t>(w.start.line - 1)],
-                        w.start.col,
-                        w.end.line == w.start.line ? w.end.col - 1 : 0);
-                    cerr << endl;
-                }
+                dump_line_with_caret(
+                    cerr, lines[static_cast<size_t>(w.start.line - 1)],
+                    w.start.col,
+                    w.end.line == w.start.line ? w.end.col - 1 : 0);
+                cerr << endl;
             }
+        }
 
-            /* -s also dumps the tree AFTER the optimizer (inlining, unroll,
-             * specialization) so the actual optimized AST is inspectable. */
-            if (opt_show_syntax_tree) {
-                cout << "Optimized syntax tree" << endl;
-                cout << "--------------------------" << endl;
-                cout << *root << endl;
-                cout << "--------------------------" << endl;
-            }
+        /* -s also dumps the tree AFTER the optimizer (inlining, unroll,
+         * specialization) so the actual optimized AST is inspectable. Under
+         * -nr as well, now that there IS an optimized tree there: -s
+         * promises both dumps, and printing one of them was the same gap. */
+        if (opt_show_syntax_tree) {
+            cout << "Optimized syntax tree" << endl;
+            cout << "--------------------------" << endl;
+            cout << *root << endl;
+            cout << "--------------------------" << endl;
+        }
+
+        if (!opt_no_run) {
 
             /* -vd: dump the bytecode disassembly (the bytecode analogue of -s)
              * and do NOT run. See disasm.{h,cpp}. */
