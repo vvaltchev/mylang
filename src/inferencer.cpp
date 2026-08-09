@@ -6021,6 +6021,12 @@ static void fold_show_calls(Block *root)
 }
 
 unsigned g_opt_disabled = 0;
+/* `--strict` (step 7): every non-local must be DECLARED ABOVE its first use.
+ * Off by default - it refuses programs that are correct today, so it is the
+ * place for rules too aggressive to impose on everyone. Read by the resolver
+ * (strict_forward_globals); a global for the same reason g_opt_disabled is -
+ * threading a flag through run_optimizers' callers buys nothing. */
+bool g_strict_mode = false;
 
 bool opt_pass_bit(const std::string &name, unsigned &bit)
 {

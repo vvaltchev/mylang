@@ -391,6 +391,22 @@ Running scripts:
                                  # TRANSFORM": the engine differential cannot
                                  # see a bug in one, so the only oracle is the
                                  # same program with the pass off
+./build/mylang --strict FILE     # require every NON-LOCAL to be DECLARED
+                                 # above its first use (step 7's opt-in half,
+                                 # FIX-2's original shape). Off by default: it
+                                 # refuses programs that are CORRECT today -
+                                 # "helpers at the top, configuration at the
+                                 # bottom" - so it is the place for rules too
+                                 # aggressive to impose on everyone. What it
+                                 # buys is that UnboundSymbolEx becomes
+                                 # UNREACHABLE. FUNC/STRUCT names are exempt
+                                 # (they bind at SCOPE ENTRY, #134, so a
+                                 # forward call is not a forward reference and
+                                 # requiring order would forbid mutual
+                                 # recursion), as is a LAZY builtin's argument
+                                 # (`isbound(g)` is how a program COPES with
+                                 # an order it cannot fix). Measured: 0 of the
+                                 # 95 corpus programs trip it
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
 ./build/mylang -v                # how THIS binary was built (opt, asserts,
                                  # lto, sanitizers, vm_hardening, cgoto,

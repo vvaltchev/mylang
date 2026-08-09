@@ -470,9 +470,22 @@ Each lands as its OWN commit.
    would refuse the correct code), and **#138**, that `&&`/`||` do not
    short-circuit at run time although the const-fold assumes they do
    (FIXED the same day - they short-circuit now, in all three engines).
+   **`--strict` LANDED** too (`strict_forward_globals`): every non-local
+   must be declared above its first use - FIX-2's original shape, behind
+   a flag because it refuses programs that are CORRECT today. Exempt:
+   FUNC/STRUCT names (they bind at scope entry since #134, so requiring
+   order would forbid mutual recursion and buy nothing) and a LAZY
+   builtin's argument. That last one needed a signal WIDER than the
+   FIX-1 exemption - `isbound(zz)` on a nowhere-declared name is still
+   an error, but `isbound(g)` is not a USE of g - hence
+   `EscapedRef::lazy_any` beside `lazy_arg`.
+   **Measured: 0 of 95 corpus programs trip `--strict`**, so the
+   ergonomic cost the plan worried about does not appear in this corpus
+   (which does not prove it is rare in general - the corpus was written
+   by one author).
    STILL OPEN in step 7: transitivity (a global read by a function the
-   callee calls), call sites below the top level, the WARNING tier for
-   the merely suspicious, and **`--strict`**.
+   callee calls), call sites below the top level, and the WARNING tier
+   for the merely suspicious.
 
 ## Known residuals (accepted)
 

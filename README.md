@@ -438,6 +438,24 @@ var g = 5;
 Catching `UnboundSymbolEx` should be **very rare** in real code. It exists for
 the residue the compiler cannot decide; the provable cases never get that far.
 
+**`--strict` removes the residue entirely.** With that option every *non-local*
+must be declared above its first use, so no function can reach a global that is
+not bound yet and `UnboundSymbolEx` becomes unreachable:
+
+```C#
+func total(a) { return a + base; }
+var base = 100;
+print(total(1));       # 101 by default; --strict refuses it - move `base` up
+```
+
+It is off by default because it refuses programs that are correct — the usual
+"helpers at the top, configuration at the bottom" layout is exactly the shape
+it rejects. Function and struct *names* are exempt (they bind when their scope
+is entered, so a forward call is not a forward reference — mutual recursion
+keeps working), and so is a lazy builtin's argument: `isbound(g)` asks *about*
+`g` rather than reading it, which is how a program copes with an order it
+cannot change.
+
 **A name declared nowhere is a compile error.** A misspelled or missing
 variable is refused before the program runs, not when execution reaches it:
 
