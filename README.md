@@ -355,6 +355,22 @@ var a = 42;
 # But here we cannot see `b`.
 ```
 
+**A brace-less body is a scope too.** The body of an `if`/`else`/`while`/`for`/
+`foreach` written *without* braces is a scope exactly like the braced form, so a
+declaration inside it is not visible afterwards:
+
+```C#
+if (c) var x = 5;
+print(x);               # ERROR: undefined variable 'x'
+
+if (c) { var x = 5; }
+print(x);               # ERROR too - the two forms behave identically
+```
+
+This holds for every declaration (`var`, `const`, `func`, `struct`), and whether
+or not the condition is a compile-time constant. Declare the name *above* the
+statement if you need it afterwards.
+
 **Top-level variables have an implicit `var`.** At the outermost scope (a
 statement directly in the program/REPL, not inside any block or function), a
 plain assignment to a name that hasn't been declared yet *is* its declaration —
