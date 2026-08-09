@@ -9054,6 +9054,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                           static_cast<int_type>(ck.inline_frame_at(old_pc))));
         e.u8(0x48); e.u8(0x89); e.u8(0xE9);       /* mov rcx, rbp - the
                                                    * raise anchor (4-ii) */
+        e.movabs_r8(reinterpret_cast<uint64_t>(g_cur_caller_desc));
+                                                  /* the raising desc */
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_end_finally) });
         e.u8(0xE8); e.u32(0);
@@ -9103,6 +9105,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.movabs(RDX, reinterpret_cast<uint64_t>(loc_entry_addr(ck, old_pc)));
         e.u8(0x48); e.u8(0x89); e.u8(0xE9);       /* mov rcx, rbp - the
                                                    * raise anchor (4-ii) */
+        /* 4-ii(b): the RAISING function's desc - the one backtrace datum
+         * no site can supply (a site names its CALLER); null for main,
+         * matching main's null-desc boundary record. */
+        e.movabs_r8(reinterpret_cast<uint64_t>(g_cur_caller_desc));
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_throw) });
         e.u8(0xE8); e.u32(0);
@@ -9151,6 +9157,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                           static_cast<int_type>(ck.inline_frame_at(old_pc))));
         e.u8(0x49); e.u8(0x89); e.u8(0xE8);       /* mov r8, rbp - the
                                                    * raise anchor (4-ii) */
+        e.movabs_r9(reinterpret_cast<uint64_t>(g_cur_caller_desc));
+                                                  /* the raising desc */
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_rethrow) });
         e.u8(0xE8); e.u32(0);

@@ -18232,6 +18232,117 @@ static bool jit_norec_shadow()
                         "(< the recursion depth)\n", calls);
         return false;
     }
+    /*
+     * STEP 4-ii(b) - THE END-TO-END RECONSTRUCTION COMPARE. The recon
+     * (g_norec_recon, built at the last rbp-anchored raise from hardware
+     * + baked constants only - zero record fields) must match the
+     * exception's REAL captured backtrace frame-for-frame. The per-level
+     * invariants (3a/3b/3c + the build-time record checks) verify each
+     * FIELD; only this compare verifies the COMPOSITION - ordering, the
+     * loc-less-capture-then-stamp flow, which frames get entries at all.
+     * The warm-up try loop defeats the cold-peak shape-eater (iteration
+     * 1's pushes all decline on the record-reuse guard, which would
+     * leave the final segment C++-pushed and the recon empty); the LAST
+     * raise - the uncaught one - is the recon the compare reads.
+     */
+    {
+        const std::vector<const char *> lines = {
+            "struct YE { int x; }",
+            "func inn2(int n) {",
+            "  if (n == 0) { throw YE(3); }",
+            "  if (n < 0) { return 0; }",
+            "  var r = out3(n - 1);",
+            "  return r; }",
+            "func out3(int n) {",
+            "  var r = inn2(n);",
+            "  return r + 1; }",
+            "var hits = 0;",
+            "for (var k = 0; k < 3; k++) {",
+            "  try { hits += inn2(runtime(10)); }",
+            "  catch (YE) { hits += 1; } }",
+            "var t = inn2(runtime(10));",
+            "print(t);" };
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved2 = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool threw = false;
+        std::vector<BacktraceFrame> frames;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (RuntimeException &e) {
+            threw = true;
+            frames = e.backtrace;
+        } catch (...) {}
+        g_exec_engine = saved2;
+        if (!threw) {
+            fprintf(stderr, "jit_norec_shadow: the uncaught throw did "
+                            "not reach the harness\n");
+            return false;
+        }
+        if (g_norec_recon.size() < 8) {
+            fprintf(stderr, "jit_norec_shadow: recon covered %zu frames "
+                            "- the raise segment was not reconstructed\n",
+                    g_norec_recon.size());
+            return false;
+        }
+        size_t pi = 0;
+        for (size_t i = 0; i < g_norec_recon.size(); i++) {
+            /* virtual (inlined) frames have no desc - skip them; the
+             * recon models only the physical frames */
+            while (pi < frames.size() && !frames[pi].desc)
+                pi++;
+            if (pi >= frames.size()) {
+                fprintf(stderr, "jit_norec_shadow: recon has %zu frames, "
+                                "the backtrace only %zu physical\n",
+                        g_norec_recon.size(), pi);
+                return false;
+            }
+            const BacktraceFrame &bf = frames[pi++];
+            const unsigned long long packed =
+                (static_cast<unsigned long long>(
+                     static_cast<uint32_t>(bf.call_site.line)) << 32)
+                | static_cast<uint32_t>(bf.call_site.col);
+            /*
+             * INDEX 0 IS SPECIAL, and the first run of this compare is
+             * what taught it (the dump showed every index matching
+             * EXCEPT [0].call_site == 0): the innermost frame's M5b
+             * capture is loc-less and its stamp never lands (the
+             * caller's postexit compares back().desc against the desc
+             * it read AFTER the walk popped the raising frame - the
+             * caller's, never the callee's). UNOBSERVABLE by design:
+             * format_backtrace renders frame [0]'s line from
+             * ex.loc_start and never reads its call_site. So the recon
+             * knows MORE than the record path materializes; the compare
+             * checks [0]'s desc and PINS the stored loc at 0 - if the
+             * record path ever starts stamping it, this fails and the
+             * step-4 capture rule ("leave [0] loc-less, byte-identical")
+             * must be revisited with it.
+             */
+            const bool loc_ok =
+                i == 0 ? packed == 0 : packed == g_norec_recon[i].site_loc;
+            if (static_cast<const void *>(bf.desc)
+                        != g_norec_recon[i].desc || !loc_ok) {
+                fprintf(stderr,
+                        "jit_norec_shadow: recon frame %zu diverges: "
+                        "desc %p vs %p, loc %llx vs %llx\n", i,
+                        static_cast<const void *>(bf.desc),
+                        g_norec_recon[i].desc, packed,
+                        g_norec_recon[i].site_loc);
+                return false;
+            }
+        }
+    }
     if (g_jit_norec_audit_frames - a0 < calls * 4) {
         fprintf(stderr, "jit_norec_shadow: audit walked %lu frames for "
                         "%lu calls - NOT the full stack\n",

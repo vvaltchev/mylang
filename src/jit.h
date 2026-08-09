@@ -145,11 +145,13 @@ extern "C" void jit_push_handler_grow(int_type region) noexcept;
  * 2 conveyed / 3 nothing pending). See the definition in vm.cpp. */
 extern "C" int jit_end_finally(int_type region, int_type pc,
                                int_type inline_chain,
-                               const void *frag_rbp) noexcept;
+                               const void *frag_rbp,
+                               const void *raise_desc) noexcept;
 /* #80: the native `rethrow` - same 0/1/2 contract as jit_throw. */
 extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
                            int_type inline_chain,
-                           const void *frag_rbp) noexcept;
+                           const void *frag_rbp,
+                           const void *raise_desc) noexcept;
 
 /* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
 class EvalContext;
@@ -467,7 +469,8 @@ extern "C" int jit_load_elem2_float(LValue *base_lv, int_type oidx,
 /* #56: the native `throw` (the interpreted op's body; 0 = dispatched to a
  * same-frame handler at g_vm_resume_pc, 1 = boundary, 2 = conveyed). */
 extern "C" int jit_throw(int_type val_slot, int_type pc,
-                         const void *lep, const void *frag_rbp) noexcept;
+                         const void *lep, const void *frag_rbp,
+                         const void *raise_desc) noexcept;
 void *jit_addr_resume_pc();         /* the parked handler pc's address */
 
 extern int_type g_jit_elem_tmp;     /* the slow tiers' value scratch */
@@ -918,6 +921,20 @@ extern unsigned long g_jit_norec_raise_walk;
  * push walks so a dead anchor (a walk that silently floors at level 0)
  * is a test failure, not a hidden regression. */
 extern unsigned long g_jit_norec_raise_frames;
+/* step 4-ii(b): the backtrace prefix RECONSTRUCTED at the last
+ * rbp-anchored raise, from hardware + baked emit-time constants ONLY
+ * (the chain's return addresses -> sites -> site_loc/caller_desc, seeded
+ * by the raise helper's baked desc) - zero record fields. Each entry is
+ * one physical frame of the topmost native segment, innermost first,
+ * cross-checked against the records at build time; the -rt harness
+ * compares it END-TO-END against the caught exception's actual captured
+ * backtrace (the composition check the per-level invariants cannot do:
+ * ordering, stamps, which frames get entries at all). */
+struct NorecReconFrame {
+    const void *desc;
+    unsigned long long site_loc;
+};
+extern std::vector<NorecReconFrame> g_norec_recon;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
  * bumped by the emitted code itself, so it proves the inline tier ran (the
  * jit_ret helper's own counter also counts declines and cannot). */
