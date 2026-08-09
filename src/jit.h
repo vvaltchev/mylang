@@ -864,36 +864,7 @@ extern "C" unsigned long g_jit_bind_widen;
 extern "C" unsigned long g_jit_coerce_cached;
 extern "C" unsigned long g_jit_sync_inline;
 extern "C" unsigned long g_jit_entry_resume;
-/*
- * G1 NO-RECORD TIER, STEP 1 (plans/g1-no-record-tier.md). The side table
- * is emitted in every build; the VERIFICATION - the shadow-oracle seed -
- * runs only where the counters exist:
- *   norec_sites         table entries REGISTERED (compile-time)
- *   norec_verify        emitted verify calls RUN (one per inline push)
- *   norec_audit_frames  live records re-verified by the FULL-STACK audit
- *                       (g_norec_audit; the transient-corruption net)
- * All three defined in vm.cpp beside the helper that bumps them, so the
- * non-JIT platforms link without stubs.
- */
-extern unsigned long g_jit_norec_sites;
-extern unsigned long g_jit_norec_verify;
-extern unsigned long g_jit_norec_audit_frames;
-extern bool g_norec_audit;
-/* ret-address -> site, and address -> owning fragment's chunk. Real
- * implementations live in jit.cpp (the registries are filled when a
- * fragment is placed); the non-JIT build gets null-returning stubs. */
-const NorecSite *jit_norec_site_for(const void *ret_addr);
-const Chunk *jit_norec_frag_for(const void *addr);
-/*
- * A compiled chunk that MOVES to its final storage (codegen_chunk returns
- * by value; the lazy vm_func_chunk net jits a stack local and emplaces it)
- * leaves every site's `caller` and the range registry's chunk pointer at
- * the OLD address - the audit's chain check found exactly that on its
- * first -rt run (a 0x7ffc... stack address where a chunk belonged). Call
- * this at every move DESTINATION; the chain check is the net for a missed
- * one. No-op when the chunk has no native code.
- */
-void jit_norec_rebind(Chunk &chunk);
+
 /* The TESTS-emitted per-push verification (defined in vm.cpp - it reads
  * the activation's top record, which only vm.cpp can see). NEVER throws
  * (the #142 rule); a mismatch is a deliberate located abort. */
@@ -946,6 +917,37 @@ extern "C" unsigned long g_jit_release_entry;
  * partner proof to g_jit_release_entry, see the definition). */
 extern "C" unsigned long g_jit_relent_stores;
 #endif
+
+/*
+ * G1 NO-RECORD TIER, STEP 1 (plans/g1-no-record-tier.md). The side table
+ * is emitted in every build; the VERIFICATION - the shadow-oracle seed -
+ * runs only where the counters exist:
+ *   norec_sites         table entries REGISTERED (compile-time)
+ *   norec_verify        emitted verify calls RUN (one per inline push)
+ *   norec_audit_frames  live records re-verified by the FULL-STACK audit
+ *                       (g_norec_audit; the transient-corruption net)
+ * All three defined in vm.cpp beside the helper that bumps them, so the
+ * non-JIT platforms link without stubs.
+ */
+extern unsigned long g_jit_norec_sites;
+extern unsigned long g_jit_norec_verify;
+extern unsigned long g_jit_norec_audit_frames;
+extern bool g_norec_audit;
+/* ret-address -> site, and address -> owning fragment's chunk. Real
+ * implementations live in jit.cpp (the registries are filled when a
+ * fragment is placed); the non-JIT build gets null-returning stubs. */
+const NorecSite *jit_norec_site_for(const void *ret_addr);
+const Chunk *jit_norec_frag_for(const void *addr);
+/*
+ * A compiled chunk that MOVES to its final storage (codegen_chunk returns
+ * by value; the lazy vm_func_chunk net jits a stack local and emplaces it)
+ * leaves every site's `caller` and the range registry's chunk pointer at
+ * the OLD address - the audit's chain check found exactly that on its
+ * first -rt run (a 0x7ffc... stack address where a chunk belonged). Call
+ * this at every move DESTINATION; the chain check is the net for a missed
+ * one. No-op when the chunk has no native code.
+ */
+void jit_norec_rebind(Chunk &chunk);
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
 #else
