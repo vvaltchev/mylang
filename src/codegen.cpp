@@ -7621,14 +7621,28 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
             };
 
             std::vector<char> is_tgt(n + 1, 0);
-            std::vector<int> handler_pcs;
             for (CgInstr &in : code) {
                 visit_pc_fields(in, [&](int &t) {
                     if (t >= 0 && static_cast<size_t>(t) <= n)
                         is_tgt[t] = 1;
                 });
-                if (in.op == OpCode::PushHandler)
-                    handler_pcs.push_back(in.target);
+            }
+            /* The pcs a THROW can resume at. #78 step D moved them off
+             * PushHandler (which now carries only its region id in `a`,
+             * target = -1) into the handler TABLE - reading in.target
+             * here collected -1s that the `h >= 0` filter dropped, so
+             * the handler absorption was silently EMPTY from step D
+             * until this fix (found building the jit dead-after pass,
+             * which shares this machinery). No exploit shape is known -
+             * codegen does not keep a temp live from a try body into a
+             * catch body - but the belt exists because that is a
+             * structural claim about today's codegen, not an invariant. */
+            std::vector<int> handler_pcs;
+            for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+                for (const Chunk::HandlerClause &cl : hs.clauses)
+                    handler_pcs.push_back(cl.body_pc);
+                if (hs.fin_pc >= 0)
+                    handler_pcs.push_back(hs.fin_pc);
             }
 
             std::vector<uint64_t> live_in(n, 0);
