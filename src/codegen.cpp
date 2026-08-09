@@ -8545,6 +8545,11 @@ static void bc_remap_slots(Instr &in, int base)
             in.target2 += base;
         break;
     case OpCode::ReturnV:
+        /* UNREACHABLE today, and gcov says so: the emit loop rewrites a
+         * ReturnV into "move to the call's dst [+ jump to the join]" and
+         * `continue`s before it can reach here. Kept because this is a
+         * whitelist - the `default:` below ABORTS, so an op that ever does
+         * arrive must have an entry, and a correct one costs nothing. */
         ra();
         break;
     case OpCode::CallV:

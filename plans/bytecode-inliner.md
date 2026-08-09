@@ -314,6 +314,41 @@ One pool at a time, each with its own whitelist entry naming the field
 that holds its index. `closure_defs` first (it unlocks the factories),
 `consts` second.
 
+## Coverage (2026-08-02) - what is exercised, what is not
+
+Method: `cmake -DTESTS=1 -DGCOV=ON -DASAN=OFF`, then `-rt` (all three
+differential modes), `-rt` again with `MYLANG_BCINLINE=1`, and every
+sample with the splice on. `codegen.cpp` overall: **88.2% of 5032 lines**.
+
+The splice's own gates were the interesting part - several had NEVER been
+taken, i.e. written from the spec and never executed, which on this
+codebase is the same risk class as an unclassified opcode.
+
+NOW TESTED (`bc_inline_decline_gates`, which also asserts a CONTROL shape
+DOES splice so it cannot pass vacuously):
+  - a call omitting a trailing `opt` param (the bind loop only moves what
+    was passed);
+  - a callee whose frame would push the caller past
+    `BC_INLINE_MAX_FRAME`.
+
+UNREACHABLE BY DESIGN - deliberately NOT tested, and annotated in the
+source so the next reader does not "fix" the coverage:
+  - `bc_remap_slots`'s `case OpCode::ReturnV`: the emit loop rewrites a
+    ReturnV and `continue`s before it can arrive. Kept because the
+    `default:` ABORTS - this is a whitelist, so an entry that costs
+    nothing is cheaper than an abort.
+  - the `ReturnV yields a LITERAL` gate: codegen always emits
+    `LoadImmInt` + `ReturnV <slot>`, so `return 7` produces a slot. A
+    test would have to fake a chunk to reach it.
+
+STILL UNCOVERED - the remaining work before any flip decision:
+  - the tail-target rewrite (`t = join` in the body's `visit_pc_fields`):
+    needs a callee whose branch targets the one-past-the-end pc;
+  - splicing into a caller that ALREADY carries `inline_ctxs` entries
+    (the `nctx.push_back` for a caller op with an existing frame) - i.e.
+    an AST-inlined caller plus a bytecode splice in one chunk;
+  - `bc_inline_audit` in full (dev-only, env-gated).
+
 ## What must NOT be inlined
 
   - a callee with try REGIONS (`n_trys != 0`): region ids are chunk-static
