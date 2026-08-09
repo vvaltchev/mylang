@@ -1228,3 +1228,46 @@ It had to be an **extra_check**, not a `tests` entry: the counter-coverage
 assertion runs during the TREE-WALKER pass, before the differential modes
 have executed any native code, so a source-table test cannot feed it. The
 first attempt was exactly that and reported the counter dead.
+
+## G1 increment 5 LANDED 2026-08-07 - the coercing callee joins the cache
+
+Increment 3 left one loose end it created: a coercing callee was never
+CACHED, so it re-ran the five descriptor-property guards on every single
+call. Increment 2's cache could not hold it, because a plain hit goes
+straight to the push while a coercing one must still run the per-argument
+checks - and those are about the ARGUMENT VALUES, which no descriptor match
+can re-establish.
+
+The fix is to keep the two kinds of hit APART: `Chunk::CalleeCache` gains a
+THIRD entry, `coerce`, tested only after both plain entries have missed. So a
+fast_bind site pays for it exactly never on a hit (the two plain compares
+still come first) and one compare on a miss.
+
+A coercing hit then skips the whole property chain - the arity compare, the
+chunk load and test, the sync-entry test, plain_frame, and the fast_bind test
+itself - and only re-derives the callee chunk before falling into the
+per-argument checks, which still run every call.
+
+Predicted 10 instructions; measured exactly 10:
+
+    q_int  (exact int param)   602.6M -> 582.6M   **-3.32%**  (301 -> 291)
+    widen2 (widening args)    1978.0M -> 1938.0M  **-2.02%**  (495 -> 485)
+    q_dyn / q_proto            byte-flat, both
+
+Twelve benches flat (worst +0.01% on 09_fib) - bench/ still annotates no
+parameter on a call-heavy path.
+
+The cell's three displacements are measured from the REAL members rather
+than written as 0/8/16 (the co-located-probe rule), so a future field cannot
+silently shift what the emitted compares read.
+
+### Sabotage watched failing
+
+Point the third compare at a register that cannot match, so the entry is
+never hit: **two** nets fire - the widening extra_check's own assertion
+(`the coercing callee is NOT CACHED (0)`) and the coverage sweep
+(`g_jit_coerce_cached is ZERO after the whole suite`). 1752/1754.
+
+It needs both to be counter-based for the reason increment 3 established: a
+cache that never hits is CORRECT - the full chain simply runs - so no
+differential, corpus, fuzzer or lever configuration can see it.
