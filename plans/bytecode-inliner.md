@@ -211,16 +211,35 @@ The missing-test gap is closed: `inlined_recursion_backtrace_parity`
 (tests.cpp) pins this shape on both engines. It forces the JIT off for
 now; removing that line is the acceptance test for the residual.
 
-**(2) A chunk with TWO splices miscompiles UNDER THE JIT.** Ackermann
-(two self-calls in one body) dispatches a garbage opcode - UBSan:
-`index 190 out of bounds for type 'void *[128]'` at the computed-goto
-table. NOT root-caused. What IS established: the bytecode is correct
-(`-nj` runs it right, and the 48-op `-vd` form checks out by hand - both
-splices, slots remapped +7 and +14, joins at 29 and 47); one splice is
-fine under the JIT; the failure needs the JIT and two sites. So the bug
-is in how the JIT consumes the spliced chunk, not in the splice. Next
-probes: whether it survives with delete-originals disabled, and whether
-the per-pc entry stubs cover the two joins.
+**(2) [ROOT-CAUSED AND FIXED 2026-08-02 - NOT THE SPLICE'S BUG.]** A
+chunk with two splices dispatched a garbage opcode under the JIT (UBSan:
+`index 190 out of bounds for type 'void *[128]'`).
+
+The JIT's rebuild inserts an `EnterNative` head per run, so every
+surviving pc moves and a surviving branch op must have its target
+remapped through `entry_remap`. Eleven branch opcodes shared ONE remap
+body BY FALL-THROUGH, and #78 step D (`f0391fb`) deleted the
+`case OpCode::CatchTest:` label that body was attached to - silently
+turning all eleven into no-ops. A stale target then points into the
+pre-insertion pc space.
+
+WHY NOTHING CAUGHT IT FOR 39 COMMITS: instrumenting the restored remap
+showed the default corpus DOES hit it - 39 stale targets across `-rt`,
+zero across bench/ - but every one was off by only ONE OR TWO ops and
+none landed out of range, so no test observed a difference. The splice is
+what makes it fatal: it produces a chunk that KEEPS interpreted branches
+(the CallV islands stop the run being deletable) while shortening the
+code enough that a stale target lands past the end. `-nj` and the
+tree-walker were always right, which is why the engine differential never
+saw it.
+
+Fixed at the origin (`f0391fb` amended - exp-work only, 39 back, the
+hunk untouched since). Two nets on top: an ASSERTS-only invariant that
+every surviving branch target is in range, asserted right after the
+rebuild, and `bc_inline_two_splices_jit`, which runs ackermann as
+tw / vm / vm+splice and requires all three to agree. Both were verified
+failing with the fix reverted (the invariant aborts at the site; with
+`ASSERTS=0` the test reaches the original garbage dispatch).
 
 **(3) [FIXED 2026-08-02.] The pass order was NON-DETERMINISTIC** - it
 iterates `g_func_chunks`, an unordered_map, and read each callee's body
