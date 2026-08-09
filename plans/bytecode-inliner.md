@@ -222,12 +222,35 @@ is in how the JIT consumes the spliced chunk, not in the splice. Next
 probes: whether it survives with delete-originals disabled, and whether
 the per-pc entry stubs cover the two joins.
 
-**(3) The pass order is NON-DETERMINISTIC** - it iterates `g_func_chunks`,
-an unordered_map, so whether a callee is snapshotted before or after its
-OWN splice varies run to run. Self-recursion is unaffected (the snapshot
-is taken before that chunk is touched), but a compile must be
-reproducible - CLAUDE.md pins "compiling twice is byte-identical". Fix:
-snapshot every callee body up front, or iterate a sorted order.
+**(3) [FIXED 2026-08-02.] The pass order was NON-DETERMINISTIC** - it
+iterates `g_func_chunks`, an unordered_map, and read each callee's body
+LIVE, so whether a callee was seen before or after its own splice varied.
+Never a correctness hazard (a spliced callee gains `inline_ctxs`, which
+the gate rejects, so the worst case was a MISSED inline) but a
+reproducibility one, and CLAUDE.md pins "compiling twice is
+byte-identical".
+
+Fixed with the first of the two options - **snapshot every body up front**
+(`BcInlineSnapshot`, taken for every chunk before the first splice, and
+carrying the gate's verdict on the PRISTINE body). Chosen over sorted
+iteration because it makes the pass order-INDEPENDENT rather than merely
+order-stable, and because it makes the "ONE level, from a snapshot"
+contract in the header true rather than accidental. It also converges on
+the BETTER of the two orders: every caller now inlines the pristine
+callee, where the unlucky order used to decline.
+
+PROVEN, since re-running a binary could not show it - the map order is
+stable on this machine, so both `samples/gcd` and 40 repeat runs agreed
+either way. A temporary reverse-order switch in both splice loops made it
+visible, and the shape matters: **a two-level chain cannot show it** (the
+callee is a leaf; splicing it changes nothing), so `gcd` "passed" on the
+broken build. It takes a three-level chain `a -> b -> c` where the middle
+function is both caller and callee. Pinned by
+`bc_inline_order_independent` (tests.cpp), which splices one program in
+both orders and compares all resulting bytecode; it asserts the splice
+actually FIRED (a pass that inlines nothing agrees trivially) and reports
+the bug's fingerprint - the two orders splicing a DIFFERENT NUMBER of
+sites. Verified failing with the fix reverted.
 
 ### Increment 2 - the return boundary
 

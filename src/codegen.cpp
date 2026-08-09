@@ -8596,8 +8596,24 @@ static const int BC_INLINE_MAX_FRAME = 96;
  *
  * Returns true if anything changed.
  */
+void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
+{
+    BcInlineSnapshot s;
+    s.code = ck.code;
+    s.locs = ck.locs;
+    s.ref_slots = ck.ref_slots;
+    s.slot_count = ck.slot_count;
+    s.n_temps = ck.n_temps;
+    /* The gate runs on the PRISTINE body: after a splice the chunk gains
+     * inline_ctxs entries (and different ops), so asking it later would
+     * answer about a body no caller is going to inline anyway. */
+    s.eligible = bc_inline_callee_ok(ck, nullptr) && ck.inline_ctxs.empty();
+    out.emplace(&ck, std::move(s));
+}
+
 bool bc_inline_chunk(Chunk &ck,
-                     const std::vector<const FuncDescriptor *> &slot_desc)
+                     const std::vector<const FuncDescriptor *> &slot_desc,
+                     const BcInlineSnapshots &snaps)
 {
     if (!g_bc_inline_enabled)
         return false;
@@ -8631,20 +8647,27 @@ bool bc_inline_chunk(Chunk &ck,
         if (!d || !d->vm_chunk || !d->fast_bind)
             continue;                   /* typed params need coercion */
         const Chunk *cc = static_cast<const Chunk *>(d->vm_chunk);
-        if (!bc_inline_callee_ok(*cc, nullptr))
-            continue;
-        if (!cc->inline_ctxs.empty())
-            continue;                   /* re-parenting the callee's own
-                                         * chains is a later increment */
+        /* the PRE-PASS snapshot, never the live chunk: by now an earlier
+         * iteration may have spliced this callee, and which one that is
+         * depends on an unordered_map's order (see BcInlineSnapshot). */
+        const auto snap_it = snaps.find(cc);
+        if (snap_it == snaps.end())
+            continue;                   /* not part of this pass (main) */
+        const BcInlineSnapshot &snap = snap_it->second;
+        if (!snap.eligible)
+            continue;                   /* gate ran on the pristine body,
+                                         * incl. "no inline_ctxs" - the
+                                         * callee's own chains would need
+                                         * re-parenting (a later step) */
         const int nargs = static_cast<int>(in.b_lit());
         if (nargs != static_cast<int>(d->params.size()))
             continue;                   /* an omitted trailing opt param
                                          * binds none - the bind loop here
                                          * only moves what was passed */
-        if (cc->code.back().a_is_lit())
+        if (snap.code.back().a_is_lit())
             continue;                   /* ReturnV always emits a slot;
                                          * a literal would need a load */
-        const int cframe = cc->slot_count + cc->n_temps;
+        const int cframe = snap.slot_count + snap.n_temps;
         if (next_base + cframe > BC_INLINE_MAX_FRAME)
             continue;
 
@@ -8654,9 +8677,9 @@ bool bc_inline_chunk(Chunk &ck,
         s.nargs = nargs;
         s.argbase = static_cast<int>(in.a_lit());
         s.dst = in.target;
-        s.body = cc->code;              /* snapshot BEFORE any mutation */
-        s.locs = cc->locs;
-        s.ref_slots = cc->ref_slots;
+        s.body = snap.code;             /* the PRISTINE body (see above) */
+        s.locs = snap.locs;
+        s.ref_slots = snap.ref_slots;
         /* the virtual frame, built to render EXACTLY as the physical one
          * would (backtrace.cpp's frame_display over the descriptor) */
         s.frame.callee_name = !d->display_name.empty()
