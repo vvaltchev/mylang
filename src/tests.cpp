@@ -4397,6 +4397,39 @@ static const std::vector<test> tests =
         "var a1, _, d1 = [1, 2, 3];",
         "assert(a1 == 1 && d1 == 3);" } },
 
+    /*
+     * UncatchableRuntimeException: an error a script may NEVER handle, but
+     * which still travels the VM/JIT conveyance so it gets a message, a
+     * caret and backtrace frames instead of a std::terminate.
+     *
+     * COMPILE-TIME half: naming one in a catch clause is refused, rather
+     * than silently never matching.
+     */
+    { "uncatchable: `catch (InternalErrorEx)` is a compile error",
+      { "try { print(1); } catch (InternalErrorEx) { print(\"no\"); }" },
+      &typeid(SyntaxErrorEx) },
+    { "uncatchable: `catch (UndefinedVariable)` is a compile error",
+      { "try { print(1); } catch (UndefinedVariable) { print(\"no\"); }" },
+      &typeid(SyntaxErrorEx) },
+    /* ...and the ordinary catch machinery is untouched: a named clause, the
+     * parenless catch-all, a multi-type clause and a user struct exception
+     * all still work. (The RUN-TIME half - is_catchable() defeating the
+     * catch-all - has no script-visible test here because FIX-1 makes the
+     * only uncatchable a script can produce a COMPILE error; it is covered
+     * by the REPL, where the name error is still a runtime one.) */
+    { "uncatchable: ordinary catches still work",
+      { "var out = 0;",
+        "try { var a = [1]; print(a[9]); } catch (OutOfBoundsEx) { out = 1; }",
+        "assert(out == 1);",
+        "try { var a = [1]; print(a[9]); } catch { out = 2; }",
+        "assert(out == 2);",
+        "try { var a = [1]; print(a[9]); }"
+        " catch (KeyNotFoundEx, OutOfBoundsEx) { out = 3; }",
+        "assert(out == 3);",
+        "struct E { int x; }",
+        "try { throw E(7); } catch (E as e) { out = e.x; }",
+        "assert(out == 7);" } },
+
     /* ...and the body still RUNS, with the declaration visible inside it. */
     { "a scoped brace-less body still runs and sees its own decl",
       { "var dyn c = runtime(1);",
@@ -14701,6 +14734,19 @@ static const std::vector<repl_test> repl_tests =
         { "var vv_f = vv_ops[0]", "" },
         { "vv_f(vv_st, 7)", "" },
         { "vv_st[0]", "=> 7" } } },
+
+    /*
+     * The RUN-TIME half of UncatchableRuntimeException. The REPL is the only
+     * place a name error is still a RUNTIME error (FIX-1 makes it a compile
+     * error in a script), so it is where this is observable: the parenless
+     * catch-all must NOT swallow it, and it must render with FRAMES - which
+     * is what being a RuntimeException (rather than a plain Exception) buys.
+     */
+    { "uncatchable: a catch-all does not swallow it, and frames survive",
+      { { "try { print(zzz_nope); } catch { print(\"SWALLOWED\"); }",
+          "Undefined variable 'zzz_nope'" },
+        { "func ur() { var dyn r = zzz_nope2(); return r; }", "" },
+        { "var dyn urt = ur()", "[0] ur()" } } },
 
     { "a var persists across inputs",
       { { "var x = 5", "=> 5" },

@@ -2313,6 +2313,13 @@ static ML_ALWAYS_INLINE bool vm_catch_match(const Chunk &chunk,
                                            int_type types_idx,
                                            const RuntimeException *exc)
 {
+    /* An UNCATCHABLE runtime exception travels the conveyance (so it gets
+     * frames + a caret instead of a std::terminate) but a script may NEVER
+     * handle it - not even with the parenless catch-all. Checked FIRST, so
+     * the catch-all below cannot swallow it. */
+    if (!exc->is_catchable())
+        return false;
+
     if (types_idx < 0)
         return true;                              /* catch-all */
 

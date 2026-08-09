@@ -3366,6 +3366,28 @@ and two macros:
   location), and the no-fail codegen could lower neither a slice nor an
   arithmetic target, so the VM raised a NON-catchable `InternalErrorEx` where
   the tree-walker raised a catchable `NotLValueEx`.
+- **`UncatchableRuntimeException` (2026-08-08) — a RUNTIME exception a
+  script may NEVER handle.** `RuntimeException` used to conflate two
+  unrelated things: *"travels the VM/JIT conveyance, so it gets frames and a
+  caret"* (an IMPLEMENTATION property) and *"a `catch` clause may name it"*
+  (a LANGUAGE property). They are split now, because the two channels out of
+  a JIT fragment are NOT equal: `g_vm_jit_exc` is typed on `RuntimeException`
+  and re-raises through `vm_raise` (frames + the baked caret), while a plain
+  `Exception` is not carried at all and propagates as a raw C++ throw through
+  JIT-generated code — which has **no unwind information**, so the unwinder
+  finds no handler and calls `std::terminate`. That was a real SIGABRT
+  (`var c = func[zz]() => zz;`, exit 134).
+  Members: **`InternalErrorEx`** (an interpreter-BUG tripwire — `get_vec()`
+  on a flat array, `pod_get` field validity, a `default:` over a closed enum,
+  the codegen-proved arms in vm.cpp; it must RENDER, never abort) and
+  **`UndefinedVariableEx`** (REPL-only since FIX-1 #130 makes it a compile
+  error in a script). Declared with `DECL_UNCATCHABLE_EX`.
+  **Enforcement is BOTH ways**: naming one in a catch clause is a COMPILE
+  error (`is_uncatchable_ex_name`, checked in the parser's catch-clause
+  parse), and `is_catchable()` is tested by BOTH matchers
+  (`vm_catch_match`, `do_catch`) **before any name comparison**, so the
+  parenless catch-all cannot swallow one either. Both halves are
+  sabotage-pinned.
 - `DECL_RUNTIME_EX` — subclasses of `RuntimeException` (adds `clone()` +
   `[[noreturn]] rethrow()`):
   `DivisionByZeroEx`, `TypeErrorEx`, `OutOfBoundsEx`, `KeyNotFoundEx`,

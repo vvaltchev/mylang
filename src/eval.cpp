@@ -4897,6 +4897,11 @@ do_catch(EvalContext *ctx,
          Identifier *asId,
          Construct *catchBody)
 {
+    /* See vm_catch_match: an UNCATCHABLE runtime exception is never handled
+     * by a script, and the check must precede the catch-all. */
+    if (!saved_ex->is_catchable())
+        return false;
+
     if (!exList) {
 
         /* Catch-anything block */
