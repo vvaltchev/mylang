@@ -6157,10 +6157,14 @@ static const Chunk &vm_sync_stop_chunk()
  */
 extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
 {
-    /* #88: claim the baked call site BEFORE dispatching anything - a nested
-     * call would overwrite the globals (see g_jit_call_inline_chain). */
+    /* #88: CLAIM the baked call site - read it and reset, before anything
+     * is dispatched (see g_jit_call_inline_chain). Resetting is what lets a
+     * site with no chain emit no stores at all: it can then only observe
+     * the cleared value, never a previous site's. */
     const int32_t inl_chain = g_jit_call_inline_chain;
     const void *inl_pool = g_jit_call_inline_pool;
+    g_jit_call_inline_chain = -1;
+    g_jit_call_inline_pool = nullptr;
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
     const FuncDescriptor *d = act.back_rec().desc;
@@ -6408,10 +6412,12 @@ static int
 jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
                    int_type dst, int_type site_packed, bool cached) noexcept
 {
-    /* #88: claim the baked call site BEFORE dispatching the callee, which
-     * would overwrite the globals (see g_jit_call_inline_chain). */
+    /* #88: CLAIM the baked call site (read + reset) before dispatching the
+     * callee, which would otherwise overwrite it. */
     const int32_t inl_chain = g_jit_call_inline_chain;
     const void *inl_pool = g_jit_call_inline_pool;
+    g_jit_call_inline_chain = -1;
+    g_jit_call_inline_pool = nullptr;
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
     const FuncDescriptor *d = fo.func;

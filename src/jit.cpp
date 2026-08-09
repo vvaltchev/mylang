@@ -1668,9 +1668,17 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
      * Exception::jit_inline_frame). -1 = this op is not inlined code. */
     const int32_t chain = ck.inline_frame_at(old_pc);
 
-    /* #88: the chain is stamped even when there ISN'T one, so no early-out
-     * here - see the chain block below for why the absence has to be
-     * written down rather than left as a default. */
+    /*
+     * #88: the absence of a chain is stamped too (-2, below) - but ONLY
+     * where it can matter. The marker exists to stop `vm_flush_inline_walk`
+     * guessing via `inline_frame_at(pc)`; in a chunk with NO inlined ops
+     * that lookup returns -1 anyway, so there is nothing to prevent and the
+     * whole block is dead weight on a cold path every conveying op carries.
+     * Skipping it there measured back the +1.9% this cost 69_exc_crossframe.
+     */
+    const bool need_no_chain_marker = !ck.inline_ctxs.empty();
+    if (!le && chain < 0 && !need_no_chain_marker)
+        return;                    /* nothing to stamp - stays loc-less */
 
     const auto pack = [](const Loc &l) {
         return static_cast<uint64_t>(static_cast<uint32_t>(l.line))
@@ -1716,7 +1724,7 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
      * backtrace (visible at recursion depth 3), the mirror of the missing
      * ones. Recording the absence removes the guess.
      */
-    {
+    if (chain >= 0 || need_no_chain_marker) {
         size_t j_set;
         if (chain >= 0) {
             /* A REAL chain outranks the -2 marker: stamp whenever the field
@@ -1756,15 +1764,20 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
  * a Chunk * - the chunk is moved out of codegen_chunk and its address
  * dangles, while the vector's heap buffer survives (as &ck.locs[i] does).
  *
- * ALWAYS emitted, even for a chain of -1: the store is what CLEARS a value
- * some earlier call site left behind, so "this site is not inlined code"
- * has to be written down rather than left implicit.
+ * Emitted ONLY when this site HAS a chain. Nothing needs to be written to
+ * say "no chain": every helper CLAIMS the pair at entry, resetting it, and
+ * a store always sits immediately before its own call with nothing running
+ * in between - so a site without a chain can only ever observe the cleared
+ * value. That keeps two stores off every call in a chunk with no inlining,
+ * which is nearly all of them.
  *
  * Clobbers rax/rcx - emit only where both are dead.
  */
 static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
 {
     const int32_t chain = ck.inline_frame_at(old_pc);
+    if (chain < 0)
+        return;
     const uint64_t pool =
         ck.inline_frames.empty()
             ? 0
