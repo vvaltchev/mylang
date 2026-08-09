@@ -47,12 +47,41 @@ WHAT IS NOT IN AN IMAGE
   * DERIVED DATA.  Anything recomputable is recomputed at load, never stored:
     see section 12.
 
-TRUST MODEL.  An image is TRUSTED input, like a .pyc.  The loader does
-structural validation - magic, version, endianness, builtin-set fingerprint,
-every index and pc bounds-checked, every read length-checked - so a corrupt or
-truncated file produces a clean "MyvError", never undefined behaviour.  A
-MALICIOUSLY CRAFTED file is out of scope: an attacker who can write your .myv
-can equally write your .my.
+TRUST MODEL.  An image is TRUSTED input, like a .pyc.  A MALICIOUSLY CRAFTED
+file is out of scope: an attacker who can write your .myv can equally write
+your .my.  What IS in scope is that a corrupt or truncated file produces a
+clean "MyvError" - never a crash, a hang, or an unbounded allocation.  The
+loader validates in THREE layers, and the layering matters because each one
+sees a kind of field the others structurally cannot (#137):
+
+  1. THE BYTES.  Magic, version, endianness, builtin-set fingerprint; every
+     read length-checked (Reader::need); every ELEMENT COUNT bounded by the
+     bytes remaining (Reader::countv); every table REFERENCE required to name
+     a real entry (Reader::idx - the permissive idx_opt is opt-in, for a field
+     with a genuine null form).
+
+  2. THE STANDALONE COUNTS.  A count that no record array follows, so layer 1
+     has nothing to bound it against: a chunk's slot_count / n_temps, its
+     dict-iterator, dyn-iterator and try-region slices, a descriptor's
+     frame_size.  Each sizes something the VM allocates per activation, and
+     each is bounded by the WHOLE FILE (Reader::sizev) - each counts a thing
+     that must also appear somewhere in the image, and those bytes may lie
+     before the field as easily as after it.
+
+  3. THE INSTRUCTION OPERANDS (vm_verify_program -> verify_chunk, codegen.h).
+     Instructions are stored FIELD-WISE, so the reader cannot know which field
+     is a pool index, a frame slot, or a pc - the byte layers are blind here
+     by construction.  One switch over every opcode bounds each operand
+     against the table it indexes, plus the pc-keyed side tables (locs,
+     base_locs, inline_ctxs - which are REMAPPED by indexing, not merely
+     searched) and each closure descriptor's capture slots.  It runs BEFORE
+     the load-time JIT, which bakes pool ENTRY ADDRESSES into machine code.
+
+WHAT VALIDATION DOES NOT PROMISE.  A structurally valid image whose VALUES are
+nonsense is ACCEPTED, and may then fail at run time (a named ML_CHECK abort,
+never a wild pointer) or simply never terminate.  Proving that a slot holds
+the type an op expects would be a bytecode type-checker, and halting is
+undecidable; the contract stops at the load.
 
 --------------------------------------------------------------------------------
 2.  CONVENTIONS AND PRIMITIVES

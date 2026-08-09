@@ -200,6 +200,24 @@ struct VmProgram {
  * program gets the IDENTICAL native tier a fresh compile does. */
 void vm_jit_loaded_image(VmProgram &prog);
 
+/*
+ * #137: REFUSE a structurally impossible image, BEFORE the JIT or the
+ * interpreter indexes anything in it. Runs verify_chunk (codegen.h) over the
+ * root and every function body.
+ *
+ * It lives here, not in the loader, because the limits ARE VM facts: a
+ * chunk's frame is `frame_size + n_temps` slots and its captures come from
+ * the descriptor, so the bounds must be computed from the same expressions
+ * vm_run/do_func_call size the frame with - a second copy would be free to
+ * drift and would then either reject a valid image or accept a fatal one.
+ *
+ * THROWS (a plain "MyvError" Exception) - it guards hostile input, so it is
+ * on in a release build too. The `.myv` loader calls it unconditionally;
+ * vm_compile calls it under ASSERTS, where it is the net that proves the
+ * per-opcode table agrees with what codegen actually emits.
+ */
+void vm_verify_program(const VmProgram &prog);
+
 VmProgram vm_compile(const Construct *root, bool jit = true);
 void vm_run(VmProgram &prog);
 void vm_execute(const Construct *root);

@@ -393,6 +393,34 @@ struct Reader {
             bad_image("corrupt .myv (element count exceeds the file)");
         return n;
     }
+    /*
+     * #137: a STANDALONE count - one that sizes something the VM allocates
+     * but that no record array follows, so `countv`'s "no more entries than
+     * bytes remaining" does not apply: a chunk's frame slots and temps, its
+     * dict / dyn iterator slices, its try-region slice.
+     *
+     * They were read with a bare u32v and therefore had NO bound at all, and
+     * that is a HANG, not a crash: one mutated top byte turned n_dyn_iters
+     * into 234 million and n_trys into 1.8 billion, and the run sat there
+     * building the slices. Nothing else in the image changed - the two
+     * disassemblies were byte-identical - which is why only a fuzz run could
+     * have found it.
+     *
+     * The bound is the WHOLE FILE, not what remains: each of these counts one
+     * thing that must ALSO appear somewhere in the image (a slot is written
+     * or read by an op, or named by a param record; an iterator has its Init
+     * op; a try region has its PushHandler), and those bytes may lie before
+     * this field as easily as after it. Like `countv`, it is deliberately the
+     * weakest universally-true bound - it caps the damage at the file size
+     * and cannot drift when a record's encoding changes.
+     */
+    uint32_t sizev(const char *what)
+    {
+        const uint32_t n = u32v();
+        if (n > buf.size())
+            bad_image(what);
+        return n;
+    }
     uint8_t u8v() { need(1); return static_cast<uint8_t>(buf[p++]); }
     uint32_t u32v()
     {
@@ -1290,11 +1318,15 @@ void read_chunk(Reader &r, Chunk &c)
         if (static_cast<size_t>(in.op) >= static_cast<size_t>(OpCode::OpCount_))
             bad_image("corrupt .myv (opcode)");
     }
-    c.slot_count = static_cast<int>(static_cast<int32_t>(r.u32v()));
-    c.n_temps = static_cast<int>(static_cast<int32_t>(r.u32v()));
-    c.n_dict_iters = static_cast<int>(static_cast<int32_t>(r.u32v()));
-    c.n_dyn_iters = static_cast<int>(static_cast<int32_t>(r.u32v()));
-    c.n_trys = static_cast<int>(static_cast<int32_t>(r.u32v()));
+    /* the five STANDALONE counts - each sizes something the VM allocates
+     * per activation, so each is bounded by the file (Reader::sizev) */
+    c.slot_count = static_cast<int>(r.sizev("corrupt .myv (slot count)"));
+    c.n_temps = static_cast<int>(r.sizev("corrupt .myv (temp count)"));
+    c.n_dict_iters =
+        static_cast<int>(r.sizev("corrupt .myv (dict iterator count)"));
+    c.n_dyn_iters =
+        static_cast<int>(r.sizev("corrupt .myv (dyn iterator count)"));
+    c.n_trys = static_cast<int>(r.sizev("corrupt .myv (try region count)"));
     /* DERIVED, never stored: the loader recomputes it from the three counts
      * just read, the same rebuild-a-derived-twin shape catch_uids uses. */
     c.set_plain_frame();
@@ -1593,6 +1625,28 @@ void myv_write(const VmProgram &prog, const std::string &path,
         mark = w.buf.size();
     };
 
+    /*
+     * #137: ONLY PRE-JIT BYTECODE IS STORABLE. The native tier rewrites the
+     * code in place - it inserts EnterNative ops naming byte offsets into an
+     * mmap'd buffer and DELETES the interpreted originals - and fragments are
+     * deliberately not serialized (an image must stay portable). So an image
+     * written after the JIT ran holds EnterNative ops whose fragment does not
+     * exist in the file; the loader's verifier now refuses such an image,
+     * which is a load-time diagnosis of a WRITE-time mistake. Say it here,
+     * where the mistake is made. `-c` always compiles with jit=false, so this
+     * only guards an internal caller.
+     */
+    const auto pre_jit = [](const Chunk &ck) {
+        for (const Instr &in : ck.code)
+            ML_CHECK_MSG(in.op != OpCode::EnterNative,
+                         "myv_write: the program has been JIT-compiled; "
+                         "only PRE-jit bytecode is storable");
+    };
+    pre_jit(prog.root);
+    for (const auto &d : prog.funcs)
+        if (d->vm_chunk)
+            pre_jit(*static_cast<const Chunk *>(d->vm_chunk));
+
     /* Index tables FIRST: values and pools reference defs/descs by index,
      * and the writer must be able to resolve any of them (dependency order
      * is guaranteed by construction - inline struct fields only reference
@@ -1887,7 +1941,9 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             d.captures.push_back(cp);
         }
         d.resolved = r.boolv();
-        d.frame_size = static_cast<int>(static_cast<int32_t>(r.u32v()));
+        /* frame_size is the OTHER half of the frame the VM allocates (the
+         * chunk contributes n_temps), so it gets the same file bound. */
+        d.frame_size = static_cast<int>(r.sizev("corrupt .myv (frame size)"));
         d.min_args = static_cast<int>(static_cast<int32_t>(r.u32v()));
         d.explicit_pure = r.boolv(); d.effective_pure = r.boolv();
         d.cache_results = r.boolv(); d.pure_ctx = r.boolv();
@@ -1895,14 +1951,21 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         d.fast_bind = r.boolv();
         has_chunk[i] = r.boolv();
         d.decl = nullptr;                      /* compile-only back-pointer */
-        /* Rebuild the bind plan from the params just read: bind_req is
+        /*
+         * Rebuild the bind plan from the params just read: bind_req is
          * DERIVED and not stored, and recomputing fast_bind beside it makes
-         * the stored flag a free cross-check of the params round trip. */
+         * the stored flag a free cross-check of the params round trip.
+         *
+         * #137: a MISMATCH is an image problem, not an interpreter bug, so
+         * it is `bad_image` and not an ML_CHECK - a mutated param flag is
+         * ordinary hostile input, and asserting on input aborts the process
+         * where it should be reporting a corrupt file.
+         */
         {
             const bool stored = d.fast_bind;
             compute_bind_flags(&d);
-            ML_CHECK(d.fast_bind == stored);
-            (void)stored;              /* ML_CHECK compiles out at ASSERTS=0 */
+            if (d.fast_bind != stored)
+                bad_image("corrupt .myv (descriptor bind flags)");
         }
     }
 
@@ -1923,11 +1986,21 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
     for (uint32_t i = 0; i < nre; i++)
         prog.global_slot_reassigned.push_back(static_cast<char>(r.u8v()));
 
-    prog.root_slot_count = static_cast<int>(static_cast<int32_t>(r.u32v()));
+    prog.root_slot_count =            /* main's half of the frame */
+        static_cast<int>(r.sizev("corrupt .myv (root slot count)"));
     n = r.countv();
     prog.global_func_names.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         prog.global_func_names.push_back(r.uidv());
+
+    /*
+     * #137: VERIFY BEFORE ANYTHING INDEXES IT. Every check above bounds a
+     * field against the BYTES it was read from; this one bounds each
+     * instruction operand against the TABLE it will index. It has to come
+     * first: the JIT below bakes pool ENTRY ADDRESSES into machine code
+     * (`&struct_defs[target2]`), which is where a mutated operand crashed.
+     */
+    vm_verify_program(prog);
 
     /* the AOT native tier, re-run at LOAD over the WHOLE image (only the
      * VM image is stored) - the same two passes a fresh compile runs. */

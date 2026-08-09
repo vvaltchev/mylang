@@ -4496,7 +4496,41 @@ Errors from an image are byte-identical to the source run when the
 reference resolves (pinned by a byte-compare); with no usable source the
 located header + backtrace still name file/line/func, `errfmt`'s
 no-source mode. Compiling twice is byte-identical (pinned). A
-corrupt/truncated/incompatible file is a clean `MyvError`. Verified:
+corrupt/truncated/incompatible file is a clean `MyvError`.
+**THE LOADER IS HOSTILE-INPUT HARDENED (#137), in THREE layers, and the
+layering is the point** - each bounds a different KIND of field, and the
+first two cannot see what the third checks:
+(1) **`Reader::countv`** - an element count, by the bytes REMAINING;
+(2) **`Reader::sizev`** - a STANDALONE count that no record array follows
+    (a chunk's `slot_count`/`n_temps`, its dict/dyn iterator and try-region
+    slices, a descriptor's `frame_size`), by the WHOLE FILE. These had no
+    bound at all, and the failure was a HANG, not a crash: one mutated top
+    byte made `n_dyn_iters` 234 million and the run sat there building the
+    slice, with a BYTE-IDENTICAL disassembly either way;
+(3) **`vm_verify_program` -> `verify_chunk`** - every INSTRUCTION OPERAND,
+    against the table it indexes. This is the layer the byte-level ones
+    structurally cannot do: the format stores instructions field-wise, so
+    the reader cannot know which field is a pool index, a frame slot or a
+    pc. Run BEFORE the load-time JIT, which bakes pool ENTRY ADDRESSES into
+    machine code. It also bounds the pc-KEYED side tables - `locs`,
+    `base_locs`, `inline_ctxs` - which look harmless (they are only ever
+    binary-searched for an exact match) but are REMAPPED by indexing
+    (`l.pc = remap[l.pc]`), and a closure's CAPTURE descriptors, which
+    `read_sym` turns into frame/global/capture/builtin slot reads.
+Two producer-side rules fell out: **only PRE-JIT bytecode is storable**
+(`myv_write` ML_CHECKs it - the JIT rewrites code in place and fragments
+are not serialized, so a post-jit image names fragments that do not
+exist), and `vm_jit_loaded_image` iterates **this program's** chunks, not
+the process-global `g_func_chunks` (which nothing prunes, so it re-JIT'd
+freed programs' chunks). Measured over 2000 mutations of two images: **0
+crashes and 0 hangs in the LOAD**, from 19 hangs / 20 crashes. What
+remains, deliberately, is a structurally VALID image whose VALUES are
+nonsense: it can still trip a runtime `ML_CHECK` (a named abort, never a
+SIGSEGV) or loop forever - proving a slot's type at every pc would be a
+bytecode type-checker, and halting is undecidable. `-rt`'s
+`myv_corrupt_refused` is the net: it writes 0xFFFFFFFF over every
+4-byte-aligned word and requires each load to be a clean Exception,
+knowing nothing about which words are counts or indices. Verified:
 83/84 of bench/ + samples/ run identically from an image (the one
 exception, rand_sort, calls `rand()`), 84/86 also dump byte-identically
 (the 2
@@ -4571,6 +4605,19 @@ that writes a frame slot must join `visit_use_def` AND be classified in
 `op_writes_scalar`**, while one with a pc field must join
 `visit_pc_fields` — those tables are audited, and their consumers run at
 different pipeline stages (see THE AUDIT-TABLE STAGE TRAP).
+
+**A NEW OPCODE MUST ALSO BE CLASSIFIED IN `verify_chunk`** (codegen.cpp,
+#137) — the post-load structural verifier that bounds every operand against
+the table it indexes. That switch has **no `default` case on purpose**, so
+adding an opcode FAILS THE BUILD (`-Werror=switch`) until it is classified;
+do not "fix" that error with a default. It is the same audit-table trap in
+its worst form — a stale entry there is not a lost optimization but SILENT
+acceptance of an unchecked operand from a hostile file. `vm_compile` runs
+the verifier over its own output under ASSERTS, so a mis-classification
+fails the whole suite rather than a `.myv` in the field; that net caught
+three wrong entries the day it was written, and one real defect (the
+bytecode splice emitting a `MoveV` into frame slot **-1** when the callee's
+result is discarded).
 
 The register choice (over a stack machine, which the already-M8-optimized
 tree-walker would beat) is also the right IR for the native x86-64 tier.

@@ -826,6 +826,16 @@ builtin_slot(int index)
     return g_builtin_slots[index];
 }
 
+/* #137: the table's size - what a baked SymKind::builtin slot index must be
+ * below. Builds the table first, so an early caller (a `.myv` load happens
+ * before any script resolution) does not read an empty one. */
+size_t
+builtin_slot_count()
+{
+    build_builtin_table_once();
+    return g_builtin_slots.size();
+}
+
 /* The registered NAME of a builtin-table slot (works for any entry -
  * a Builtin function OR a value like `argv`, which find_builtin_name
  * cannot resolve). For the disassembler's `load.builtin` annotation. */

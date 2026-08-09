@@ -19211,8 +19211,16 @@ static bool myv_round_trip()
             g_exec_engine = saved;
             return false;
         }
+        /* EVERY write happens HERE, before the JIT: it rewrites the code in
+         * place (EnterNative ops whose fragments are not serializable), so a
+         * post-jit write stores an image nothing can load. The path3
+         * (--strip-source) write used to sit further down, past
+         * vm_jit_loaded_image, and produced exactly that - #137's verifier
+         * refused the result, which is how it was noticed. */
+        const std::string path3 = tdir + "/mylang-myv-test3.myv";
         myv_write(prog, path, ref);
         myv_write(prog, path2, ref);            /* determinism */
+        myv_write(prog, path3, MyvSourceRef()); /* --strip-source */
         vm_jit_loaded_image(prog);              /* the tier a load runs */
         const std::string dump_mem = disassemble_image(prog);
 
@@ -19368,9 +19376,8 @@ static bool myv_round_trip()
             return false;
         }
         /* --strip-source: an EMPTY reference stores nothing - no text, no
-         * name, and no local path leaked into the image */
-        const std::string path3 = tdir + "/mylang-myv-test3.myv";
-        myv_write(prog, path3, MyvSourceRef());
+         * name, and no local path leaked into the image (written above,
+         * with the other two) */
         MyvSource s3;
         VmProgram stripped = myv_read(path3, s3);
         (void)stripped;
@@ -19527,6 +19534,133 @@ static bool myv_round_trip()
  * test ASSERTS each escape was actually taken, so it cannot pass vacuously,
  * then compares the tables entry-for-entry.
  */
+/*
+ * #137: A MANGLED IMAGE IS REFUSED, NEVER OBEYED.
+ *
+ * The `.myv` reader bounds each field against the BYTES it was read from,
+ * but an INSTRUCTION OPERAND is a pool index / frame slot / pc whose bound
+ * is a TABLE, and nothing looked at those - so a mutated byte reached
+ * `struct_defs[target2]` inside the load-time JIT (a four-billion-element
+ * read) and `remap[loc.pc]` inside its pc remap. vm_verify_program is what
+ * closes that, and this is its regression net.
+ *
+ * The probe is deliberately DUMB: write 0xFFFFFFFF over every 4-byte-aligned
+ * word from the header on, and require every single result to be a clean
+ * Exception. It needs to know NOTHING about which words are counts, indices
+ * or slots - which is exactly why it keeps working when the format changes,
+ * and why it found both classes within seconds of being written.
+ *
+ * The bar is the LOAD (myv_read, the load-time JIT included), not the run: a
+ * structurally valid image whose VALUES are nonsense is still allowed to
+ * fail at run time, since proving a slot's type at every pc would be a
+ * bytecode type-checker, not a structural check.
+ */
+static bool myv_corrupt_refused()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; float y; }",
+        "func mk(int n) { return P(n, float(n) * 1.5); }",
+        "func dist(P p) { return p.x * p.x + int(p.y); }",
+        "var pts = [];",
+        "for (var i = 0; i < 4; i++) { append(pts, mk(i)); }",
+        "var s = 0;",
+        "foreach (var p in pts) { s += dist(p); }",
+        "var d = { \"a\": 1 };",
+        "d[\"b\"] = 2;",
+        "foreach (var k, v in d) { s += v; }",
+        "var cnt = 0;",
+        "var bump = func[cnt]() { cnt = cnt + 1; return cnt; };",
+        "s += bump();",
+        "try { throw P(1, 2.0); } catch (P as e) { s += e.x; }",
+        "print(s);" };
+
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-corrupt.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = false;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        myv_write(prog, path, MyvSourceRef());
+
+        std::ifstream f(path, std::ios::binary);
+        const std::string base((std::istreambuf_iterator<char>(f)),
+                               std::istreambuf_iterator<char>());
+        f.close();
+
+        /* The intact image must still LOAD - else every case below would
+         * "pass" for the wrong reason (the vacuous-test trap). */
+        {
+            MyvSource s0;
+            VmProgram good = myv_read(path, s0);
+            if (good.root.code.empty()) {
+                fprintf(stderr, "myv-corrupt: the intact image is empty\n");
+                g_exec_engine = saved;
+                return false;
+            }
+        }
+
+        int refused = 0, accepted = 0;
+        /* from 4: the magic itself is checked by myv_is_image, and a
+         * mangled magic is a different (already covered) rejection */
+        for (size_t off = 4; off + 4 <= base.size(); off += 4) {
+            std::string b = base;
+            for (int k = 0; k < 4; k++)
+                b[off + k] = static_cast<char>(0xFF);
+            {
+                std::ofstream o(path, std::ios::binary | std::ios::trunc);
+                o.write(b.data(),
+                        static_cast<std::streamsize>(b.size()));
+            }
+            try {
+                MyvSource s;
+                VmProgram bad = myv_read(path, s);
+                (void)bad;
+                accepted++;         /* fine: it may still be a valid image */
+            } catch (Exception &) {
+                refused++;          /* also fine - what must NOT happen is
+                                     * a crash, a hang, or a wild index */
+            }
+        }
+        /* Both outcomes are legal per-offset, but a run in which NOTHING is
+         * refused would mean the probe never reached a checked field. */
+        if (refused == 0) {
+            fprintf(stderr, "myv-corrupt: no offset was refused (%d "
+                            "accepted) - the probe is vacuous\n", accepted);
+            g_exec_engine = saved;
+            return false;
+        }
+        ok = true;
+    } catch (Exception &e) {
+        fprintf(stderr, "myv-corrupt: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+    }
+    remove(path.c_str());
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_loc_escapes()
 {
     /* 320 spaces before the statement: its caret column exceeds 254 */
@@ -27528,6 +27662,8 @@ static const std::vector<extra_check> extra_checks =
       jit_fread_c4 },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
+    { "myv: a mangled image is REFUSED, never obeyed (#137)",
+      myv_corrupt_refused },
     { "myv: Loc escapes - delta table + narrow pool Locs",
       myv_loc_escapes },
     { "vm: the handler table describes each try region (#78)",

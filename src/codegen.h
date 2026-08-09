@@ -153,6 +153,46 @@ bool op_writes_scalar(OpCode op);
 void verify_handler_sites(const Chunk &chunk);
 
 /*
+ * #137: the bounds every operand of a chunk's instructions is measured
+ * against. Everything here is EXTERNAL to the Chunk - the frame the VM will
+ * actually build, and three program-wide tables - so a corrupt image cannot
+ * widen its own limits by lying about them. vm_verify_program (vm.h) fills
+ * one in from the SAME expressions vm_run sizes the frame with.
+ */
+struct ChunkLimits {
+    int nslots = 0;           /* frame_size + n_temps: the frame's real size */
+    size_t nglobals = 0;      /* the program's global-slot table */
+    size_t ncaptures = 0;     /* this chunk's closure captures (0 for main) */
+    size_t nbuiltins = 0;     /* the program-wide builtin table */
+    size_t max_fields = 0;    /* the widest struct in the program (see
+                               * `field` in verify_chunk: a per-def bound is
+                               * not a compile-time fact, this is) */
+};
+
+/*
+ * #137: REFUSE a structurally impossible chunk, before anything indexes it.
+ *
+ * A `.myv` stores instructions FIELD-WISE - op, flags, then whatever fields
+ * are present - so the reader cannot know that some field is a pool index
+ * and others are frame slots or pcs. Nothing validated them, and a mutated
+ * byte therefore reached `struct_defs[target2]` inside the load-time JIT (a
+ * 4-billion-element read) or an out-of-range frame slot inside the
+ * interpreter. This is the pass that closes that: one switch over EVERY
+ * opcode, checking each field against the limit it belongs to.
+ *
+ * THROWS (a plain "MyvError" Exception) rather than asserting - it guards
+ * HOSTILE INPUT, not an internal invariant, so it must be on in a release
+ * build too. Cost is one pass over the code, at load only.
+ *
+ * ⛔ THE SWITCH HAS NO `default` CASE, DELIBERATELY. This is the
+ * AUDIT-TABLE STAGE TRAP (CLAUDE.md) in its most dangerous form: a stale
+ * entry here means SILENT acceptance of an unchecked operand. With no
+ * default, adding an opcode fails the BUILD (-Werror=switch) until it is
+ * classified. Do not "fix" that build error with a default case.
+ */
+void verify_chunk(const Chunk &chunk, const ChunkLimits &lim);
+
+/*
  * THE BYTECODE-LEVEL INLINER's gate (plans/bytecode-inliner.md).
  *
  * True iff `callee` may be SPLICED into a caller at a CallV: every op is on

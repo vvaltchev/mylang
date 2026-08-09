@@ -369,6 +369,9 @@ public:
  */
 int builtin_slot_index(const UniqueId *uid);
 LValue &builtin_slot(int index);
+/* The number of entries - the bound a stored `SymKind::builtin` index must
+ * satisfy (#137's verifier). Builds the table if it is not built yet. */
+size_t builtin_slot_count();
 
 /* The registered NAME of a builtin-table slot by index - works for ANY
  * entry (a Builtin function OR a value like `argv`). For the
