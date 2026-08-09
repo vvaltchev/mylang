@@ -5046,6 +5046,46 @@ vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
     vm_flush_inline_walk(chunk, pc, e);
 }
 
+/*
+ * The CALL-SITE flush - the record-based twin of do_func_call's catch, which
+ * flushes `call_site_inl` UNCONDITIONALLY. The two protocols differ and the
+ * difference is load-bearing:
+ *
+ *   - the RAISE site (vm_flush_inline above / Construct::eval) emits the
+ *     chain of the op that threw, ONCE, keyed off inline_origin_emitted;
+ *   - a PHYSICAL CALL that unwinds emits the chain of ITS OWN call op every
+ *     time, however many such calls the exception crosses - each one is a
+ *     distinct spliced site, and each one's virtual frames belong in the
+ *     backtrace.
+ *
+ * Routing the call sites through the once-guarded form dropped every virtual
+ * frame after the first (a recursion whose self-call sits inside an inlined
+ * region rendered 3 frames where the tree-walker rendered 5).
+ *
+ * Always the pc lookup, never the baked Exception::jit_inline_frame: that
+ * index names the op that RAISED, which is not this call site.
+ */
+static ML_NOINLINE void
+vm_flush_inline_call_walk(const Chunk &chunk, size_t pc, Exception &e)
+{
+    const int32_t idx = chunk.inline_frame_at(pc);
+    if (idx < 0 || static_cast<size_t>(idx) >= chunk.inline_frames.size())
+        return;
+    for (int32_t i = idx; i >= 0; i = chunk.inline_frames[i].parent) {
+        const Chunk::InlineFrame &f = chunk.inline_frames[i];
+        e.backtrace.push_back({f.callee_name, f.params, f.call_site});
+    }
+    e.inline_origin_emitted = true;
+}
+
+static ML_ALWAYS_INLINE void
+vm_flush_inline_call(const Chunk &chunk, size_t pc, Exception &e)
+{
+    if (chunk.inline_ctxs.empty())
+        return;
+    vm_flush_inline_call_walk(chunk, pc, e);
+}
+
 /* fwd (defined below CachedCallV's probe) - vm_raise now walks natively. */
 static ML_COLD bool
 vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
@@ -7028,7 +7068,7 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
         chunk = cur.ret_chunk;
         pc = cur.ret_pc - 1;                   /* the call op */
         act.pop_window();
-        vm_flush_inline(*chunk, pc, *ex);
+        vm_flush_inline_call(*chunk, pc, *ex);
     }
 }
 
@@ -8587,7 +8627,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * THIS call was spliced from inlined code, flush its virtual frames
              * as the exception passes through. */
             if (g_vm_exc_pending) {
-                vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
+                vm_flush_inline_call(*chunk, pc, *g_vm_exc_pending);
                 if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
                                     g_vm_exc_pending)) {
                     VM_NEXT_COLD;
@@ -8638,7 +8678,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             EvalValue res = vm_call_func(&ctx, fo, ap, in->b_lit(), chunk,
                                          pc);
             if (g_vm_exc_pending) {                /* Inc v2: cross-frame */
-                vm_flush_inline(*chunk, pc, *g_vm_exc_pending);   /* Inc 4 */
+                vm_flush_inline_call(*chunk, pc,
+                                     *g_vm_exc_pending);         /* Inc 4 */
                 if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
                                     g_vm_exc_pending)) {
                     VM_NEXT_COLD;
@@ -8799,7 +8840,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 throw;
             }
             if (g_vm_exc_pending) {                /* FuncObject cross-frame */
-                vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
+                vm_flush_inline_call(*chunk, pc, *g_vm_exc_pending);
                 if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
                                     g_vm_exc_pending)) {
                     VM_NEXT_COLD;

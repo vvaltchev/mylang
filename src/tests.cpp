@@ -12912,6 +12912,113 @@ typed_inlined_backtrace_parity()
 }
 
 /*
+ * Backtrace parity for a RECURSION whose self-call sits inside an INLINED
+ * region (what the AST inliner's recursion unroll produces for the fib
+ * shape). Two VM-only defects, both invisible under `-ni` and both found
+ * only by comparing the two engines' rendered backtraces:
+ *
+ *  (1) A folder-SYNTHESIZED divisor carries NO Loc - `1 / (n - n)` with the
+ *      argument substituted folds the divisor to a bare `0` - and #76's
+ *      divisor-precise caret recorded that empty Loc into the side table.
+ *      The VM then threw with NO LOCATION AT ALL: no caret, no
+ *      "at line/col" in the header, and an innermost frame reading
+ *      "at line 0". The tree-walker never shows this because
+ *      Construct::eval stamps the ENCLOSING node's loc onto any exception
+ *      that arrives without one; codegen now falls back to the same node.
+ *
+ *  (2) Every PHYSICAL call the exception crossed flushed its call site's
+ *      virtual frames through the ONCE-guarded RAISE-site helper, so only
+ *      the first one survived and the rest of the inlined frames were
+ *      dropped (rendering 3 frames where the tree-walker renders 5, with
+ *      main() attributed to the recursive call's line instead of its own).
+ *      do_func_call flushes a call site UNCONDITIONALLY; the VM's walk and
+ *      call-op propagation sites now use a matching unconditional helper.
+ *
+ * The JIT is disabled for this run: its native sync-call path bypasses the
+ * interpreted walk entirely and still loses these frames for its own,
+ * separate reason (the pc-keyed side-table lookup is degenerate once a run's
+ * originals are deleted - every op collapses onto the head EnterNative). See
+ * task #88.
+ */
+static bool
+inlined_recursion_backtrace_parity()
+{
+    /*
+     * BOTH depths are needed and neither substitutes for the other - the
+     * unroll produces a different shape at each. At depth 2 the whole call
+     * folds into main and the base case's divisor is the SYNTHESIZED literal
+     * that carries no Loc (defect 1); at depth 4 the divisor keeps its loc
+     * but the exception crosses a physical call made from inlined code
+     * (defect 2). A first version of this test used only depth 4 and PASSED
+     * with defect 1 put back.
+     */
+    auto run = [&](ExecEngine eng, int depth) -> std::string {
+        const std::string src =
+            std::string("func f(n) {\n")
+            + "    if (n < 2) return 1 / (n - n);\n"
+            + "    return f(n - 1) + f(n - 2);\n"
+            + "}\n"
+            + "print(f(" + std::to_string(depth) + "));";
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+
+        const ExecEngine saved = g_exec_engine;
+        const bool saved_jit = g_jit_enabled;
+        g_exec_engine = eng;
+        g_jit_enabled = false;
+        std::string out;
+        try {
+            if (eng == ExecEngine::Vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (const Exception &e) {
+            /* the LOC is half of what is under test (defect 1), so render
+             * it alongside the frames rather than the frames alone */
+            out = "loc " + std::to_string(e.loc_start.line) + ":"
+                + std::to_string(e.loc_start.col) + "\n" + format_backtrace(e);
+        }
+        g_jit_enabled = saved_jit;
+        g_exec_engine = saved;
+        return out;
+    };
+
+    const auto npos = std::string::npos;
+    bool ok = true;
+
+    for (const int depth : { 2, 4 }) {
+        const std::string tw = run(ExecEngine::TreeWalk, depth);
+        const std::string vm = run(ExecEngine::Vm, depth);
+
+        /* Count the VIRTUAL (inlined) frames: a physical frame renders the
+         * template's display_name `f`, an inlined one the instance name
+         * `f$0`. Requiring some keeps the test from passing vacuously if
+         * the unroll ever stops firing here - equality alone would then be
+         * satisfied by two engines that both inline nothing. */
+        size_t virt = 0;
+        for (size_t i = tw.find("f$0"); i != npos; i = tw.find("f$0", i + 1))
+            virt++;
+
+        const bool good = !tw.empty() && tw == vm
+                          && virt >= 2
+                          && tw.find("at line 0") == npos   /* defect 1 */
+                          && tw.find("loc 2:") == 0;        /* error site */
+        if (!good) {
+            cout << "  depth=" << depth << " virt=" << virt
+                 << "\n  tw:\n" << tw << "  vm:\n" << vm;
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+/*
  * AST deep-clone (Construct::clone): cloning a parsed + resolved program must
  * produce a structurally identical tree (same serialization) that is a separate
  * object graph and still evaluates correctly on its own (its internal assert
@@ -21170,6 +21277,9 @@ static const std::vector<extra_check> extra_checks =
       vm_inlined_backtrace_parity },
     { "backtrace: typed-chain inlined-frame parity (#75)",
       typed_inlined_backtrace_parity },
+    { "backtrace: a recursion inlined into itself renders identically "
+      "on both engines (loc + every call site's virtual frames)",
+      inlined_recursion_backtrace_parity },
     { "static_type: ground caching & with_opt", static_type_ground_caching },
     { "static_type: assignable rules", static_type_assignable_rules },
     { "static_type: join (LUB) rules", static_type_join_rules },
