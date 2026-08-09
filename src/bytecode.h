@@ -1508,6 +1508,10 @@ struct NorecSite {
     int32_t dst = -1;                /* caller slot for the result */
     uint64_t site_loc = 0;           /* baked line<<32|col (#88's) */
     uint8_t op = 0;                  /* the call's OpCode, as u8 */
+    bool leaf = false;               /* a #55 native-leaf direct call - no
+                                      * record is pushed at all; registered
+                                      * so the entry RA check can resolve
+                                      * its return address (step 2) */
     size_t off_switched = 0;         /* emit-time offsets of the two */
     size_t off_plain = 0;            /* return addresses            */
     const void *ret_switched = nullptr;  /* absolute - filled when the

@@ -936,6 +936,19 @@ struct Emitter {
      * over. Called AFTER `saved` is filled (the cache pick decides it). */
     void frag_entry()
     {
+#ifdef TESTS
+        /* G1 step 2: hand the HARDWARE return address to the table check
+         * before anything else runs. One push keeps the entry parity
+         * (rsp%16: 8 -> 0 == call-ready); rdi (the window argument) is
+         * the only live register at entry and is saved around the call. */
+        push_reg(REG_ARG0);                       /* save rdi */
+        u8(0x48); u8(0x8B); u8(0x7C); u8(0x24); u8(0x08);
+                                                  /* mov rdi, [rsp+8] */
+        movabs(0 /* RAX */, reinterpret_cast<uint64_t>(
+                                &jit_norec_ret_verify));
+        call_rax();
+        pop_reg(REG_ARG0);
+#endif
         push_reg(REG_SLOTS_BASE);
         for (const uint8_t r : saved)
             push_reg(r);
@@ -3253,6 +3266,33 @@ static void jit_norec_register(Chunk &chunk)
     }
 }
 
+/*
+ * G1 STEP 2 seed - the check the step-1 sabotage run proved missing: a
+ * corrupted ret-address OFFSET was self-consistent, because every lookup
+ * key came from the entry's own field. THIS key comes from the hardware:
+ * [rsp] at a fragment entry. If it lies in emitted code, the caller was
+ * a fragment-to-fragment call (a sync `call rdx` or a #55 leaf
+ * `call rcx`) and the table must resolve it to a site recording exactly
+ * that address; a C++ return address resolves to no fragment and passes.
+ */
+extern "C" void jit_norec_ret_verify(const void *ra) noexcept
+{
+#ifdef TESTS
+    if (!jit_norec_frag_for(ra))
+        return;                     /* jit_enter and friends - C++ */
+    const NorecSite *ns = jit_norec_site_for(ra);
+    if (!ns || (ns->ret_plain != ra && ns->ret_switched != ra)) {
+        fprintf(stderr, "NOREC RET MISMATCH: RA %p is in emitted code but "
+                        "resolves to %s\n", ra,
+                ns ? "a site with DIFFERENT addresses" : "no site");
+        abort();
+    }
+    g_jit_norec_ret_verify++;
+#else
+    (void)ra;
+#endif
+}
+
 /* #56 step 3: the CURRENT chunk's entry_remap, visible to
  * emit_sync_call_inline so it can bake the call's POST-CALL entry-stub pc
  * (the SWITCH record's resume). Set around the fragment-emission loop in
@@ -4478,6 +4518,7 @@ void jit_stats_report()
         /* G1 no-record tier step 1 (the shadow-verified side table) */
         { "norec_sites",      &g_jit_norec_sites },
         { "norec_verify",     &g_jit_norec_verify },
+        { "norec_ret",        &g_jit_norec_ret_verify },
         { "norec_audit",      &g_jit_norec_audit_frames },
     };
     /* G1 reach probe (vm.cpp): the no-record tier's candidate gates.
@@ -9991,6 +10032,23 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u32(static_cast<uint32_t>(L.chunk_native_entry));
         e.u8(0x48); e.u8(0x01); e.u8(0xD1); /* add rcx, rdx */
         e.u8(0xFF); e.u8(0xD1);             /* call rcx (the callee fragment) */
+        /* G1 step 2: a leaf call is the OTHER fragment-to-fragment call
+         * form, so its return address must be in the table or the entry
+         * RA check false-aborts on every leaf call. No record is pushed
+         * here (that is the leaf protocol's point) - the entry is address
+         * data only, marked `leaf`. */
+        if (g_cur_norec_sites && !jit_lever_off(JL_NOREC)) {
+            g_cur_norec_sites->push_back(
+                std::unique_ptr<NorecSite>(new NorecSite()));
+            NorecSite *lns = g_cur_norec_sites->back().get();
+            lns->caller = &ck;
+            lns->call_pc = static_cast<uint32_t>(old_pc);
+            lns->dst = static_cast<int32_t>(in.target);
+            lns->op = static_cast<uint8_t>(in.op);
+            lns->leaf = true;
+            lns->off_plain = e.pos();
+            lns->off_switched = e.pos();    /* one call: both keys equal */
+        }
         emit_call_epilogue(e);              /* re-mat rsi/r8 */
         return true;
     }
