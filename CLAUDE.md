@@ -1271,6 +1271,50 @@ Measured (callgrind Ir, OPT=1 ASSERTS=0): 46_matrix_mult -2.19%/iter,
 control). The write elision is throttled by ref_slots' conservatism -
 narrowing it is C3 (plans/typed-invariant-arrays.md).
 
+**C1 - PER-LOOP NAVIGATION HOISTING (2026-08-03,
+plans/typed-invariant-arrays.md - the typed-invariant staircase's first
+step).** A loop's element ops re-derive the base's navigation EVERY
+element (type tag, slice flag, shobj, kind, data/finish, count) for a
+base that cannot change inside the loop. C1 is LOOP VERSIONING:
+`jit_hoist_pick` finds a backward branch's REGION [T, L]
+(innermost-first) whose ops are all on a read-only-FOR-STORAGE
+whitelist - no calls, no boxed PMFs (TypeArr::add mutates), but PLAIN
+element stores are admitted (they never move a non-slice base's
+storage; growth is a builtin call, refused) - with no jump into the
+region from outside, no entry-stub/handler pc inside, and one
+consistent-kind LOCAL base never defined in the region. The PREHEADER
+(bytes before label[T] - back edges target the label, so only the
+fall-through entry pays) verifies type/non-slice/kind once and derives
+(data, count) into **r10/r11 - CALLER-saved**, so the N5 pool is
+untouched (two earlier designs died by measurement: run-scoped gating
+fired on zero benches - a post-#56 run spans the whole function, calls
+included - and reserving callee-saved regs cost every OTHER loop in
+the fragment two pins, 43_sieve +3.3%). Any helper call inside the
+region clobbers r10/r11: `emit_call_epilogue` - the choke point all 83
+helper-call emissions pair through - re-derives both when a region is
+active (via RCX; RAX carries the helper's status). A failed preheader
+guard jumps to a COLD copy of the region alone (the ordinary emission,
+emitted after the run; region-internal branches patch against its own
+labels, exits rejoin the shared stream) - never a mid-loop bail, and
+deletion needs no interpreted original. The hoisted element forms:
+LoadElemInt/Float = bounds-vs-r11 + read-off-r10; the elem2 OUTER
+(kind general, byte-length count) = imul+bounds+lea, rejoining the
+common row section. Execution-proven by `g_jit_hoist` (the emitted
+preheader bumps on success; refusal shapes assert ZERO) +
+MYLANG_HOISTDBG=1 (per-region refusal reasons, the DELAUDIT pattern).
+Sabotage-verified: the slice guard (a runtime slice read the parent's
+elements), the def scan (a mid-loop rebind kept stale registers), the
+epilogue re-derivation (ASan SEGV - clobbered r10 as a data pointer).
+Measured (callgrind Ir, OPT=1 ASSERTS=0, scale-delta):
+46_matrix_mult **-12.0%**/iter (~89.5 -> ~78.7), 14_array_subscript
+**-15.9%**/iter; everything else within +-0.01% incl. 15 (a runtime
+slice base - the cold twin serves it at no cost). 43/56_sieve pick but
+do not move - their hot loops are STORE-dominated and the store tiers
+do not consult the hoisted registers yet: **C1b** (the store-side
+hoist: entry guards grow const/ro/has_slices, a pinned shobj for the
+hash byte) is the scoped next increment; C2 (widen the register cache)
+and C3 (typed slots / ref_slots narrowing) follow per the plan.
+
 **N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to `MAX_CACHED` hot
 int-scalar slots are pinned in `r12`-`r15` per fragment
 (`pick_cached_slots`, jit.cpp):
