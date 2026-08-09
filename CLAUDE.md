@@ -3294,9 +3294,28 @@ was not. The residual splits as ~87 Ir inside the helper (two levels of
 `is<SharedArrayObj>` + `skind`/`size`/`offset`/`get_vec` + bounds, none of
 it visible through a call boundary), ~22 in `EvalValue::operator=(&&)`
 (the helper's `dst->put()` boxing an int the emit could `store_dst` in two
-stores), and ~54 native. An INLINE tier - the two guard/read sequences,
-helper kept as the slow tier - is worth ~60-80 of those and is scoped in
-plans/unboxing.md.
+stores), and ~54 native.
+**The INLINE tier LANDED (#93, 2026-08-02):** the two guard/read
+sequences emitted at the call site (general outer -> the LValue row at
+stride sizeof(LValue), bounds by an unsigned BYTE-length compare that
+also catches a negative index -> non-slice flat-INT row -> the shared
+count compare -> `mov rax,[rcx+r9*8]` -> the ref-aware store_dst), the
+helper kept as the slow tier for every decline - slice outer/row,
+non-general outer, bool/float/str/general rows, OOB (whose per-level
+carets stay the helper's baked chain_locs pair). Measured: 46_matrix_mult
+whole-program **-22.4%** and **170.5 -> 91.5 Ir per inner iteration** -
+the ~90 the plan named as the ceiling and the helper tier missed.
+Execution-proven by `g_jit_elem2_fast` (bumped by the EMITTED code; the
+fusion test requires it STRICTLY, since the helper makes the values right
+too). Two guards were sabotage-verified through new 5-mode `elem2:`
+entries, each needing a shape-eater defeated first: SLICE rows share the
+parent's SharedObject, so a raw read skipping `off` returns the PARENT's
+elements (608 vs 128 - and the corpus had no slice-ROW case at all); and
+BOOL rows fuse to LoadElem2Int too (a bool node is stamped `i`) but store
+ONE byte per element - the catching shape needs rows >= 8 wide (a
+3-element row is saved by accident: byte-length/8 rounds its count to 0
+and bounds decline anyway) and must SUM the elements, not branch on them
+(garbage truthiness matched an if-based version by luck).
 
 **Counted-loop specialization (`ForRangeStmt`).** Also in `specialize_types`
 (via `try_for_range`, run on the RAW `for` before its cond/inc are specialized),

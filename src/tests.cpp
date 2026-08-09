@@ -1613,6 +1613,71 @@ static const std::vector<test> tests =
           "assert(t == 24);" },
     },
     {
+        /*
+         * #93: SLICE rows. A slice SHARES its parent's SharedObject, so a
+         * raw data[j] read (skipping the slice's off) yields the PARENT's
+         * first elements - the exact corruption the inline tier's
+         * row-slice guard prevents, and it went UNCAUGHT when that guard
+         * was removed until this entry existed (608 vs 128 on this
+         * program). Shape rules per the vacuous-test checklist: base
+         * filled in a LOOP (the reads sit in a compiled run), the outer
+         * index VARIES with the loop (LICM would hoist an invariant row),
+         * and off != 0 with differing values so the raw read cannot agree
+         * by luck.
+         */
+        "elem2: SLICE rows through the fused pair (shared parent storage)",
+        {
+            "func f(n) {",
+            "    var base = array(16);",
+            "    var i = 0;",
+            "    while (i < 16) { base[i] = i * 10 + n; i++; }",
+            "    var M = [base[4:8], base[8:12]];",
+            "    var s = 0;",
+            "    var k = 0;",
+            "    while (k < 8) { s = s + M[k % 2][k % 4]; k++; }",
+            "    return s;",
+            "}",
+            "assert(f(1) == 608);",
+        },
+    },
+
+    {
+        /*
+         * #93: BOOL rows fuse to LoadElem2Int too (a bool node is stamped
+         * `i`), but the storage is ONE byte per element - an 8-byte read
+         * would return garbage from a bvec. The inline tier's row-KIND
+         * guard declines them to the helper; this pins the value through
+         * that decline.
+         */
+        "elem2: BOOL rows decline the int fast tier (1-byte storage)",
+        {
+            /* SUM the elements rather than branch on them, and use rows
+             * of >= 8: two guard-removal sabotages passed weaker forms -
+             * garbage TRUTHINESS matched an if-based version by luck, and
+             * a 3-element row was saved by accident (byte-length/8 rounds
+             * its count to 0, so the bounds check declined anyway). With
+             * 16-element rows an 8-byte-stride read slips the bounds and
+             * a garbage SUM cannot equal the exact total. */
+            "func f(n) {",
+            "    var r0 = array(16); var r1 = array(16);",
+            "    var i = 0;",
+            "    while (i < 16) {",
+            "        r0[i] = i % 2 == 0;",
+            "        r1[i] = i % 3 == 0;",
+            "        i++; }",
+            "    var m = [r0, r1];",
+            "    var s = 0;",
+            "    var k = 0;",
+            "    while (k < 32) {",
+            "        s = s + m[k % 2][k % 16];",
+            "        k++; }",
+            "    return s + n;",
+            "}",
+            "assert(f(10) == 32);",
+        },
+    },
+
+    {
         /* The float twin - same shape, and an INT inner element must still
          * promote (vm_load_elem_float_core's ints arm) through the fusion. */
         "elem2: the float twin, incl. an int element promoting",
@@ -19573,8 +19638,7 @@ static bool jit_load_elem2_native()
         g_exec_engine = saved;
         return ok;
     };
-    const unsigned long i0 =
-        g_jit_op_run[static_cast<size_t>(OpCode::LoadElem2Int)];
+    const unsigned long e2f0 = g_jit_elem2_fast;   /* #93 */
     const unsigned long f0 =
         g_jit_op_run[static_cast<size_t>(OpCode::LoadElem2Float)];
     if (!run({
@@ -19589,9 +19653,15 @@ static bool jit_load_elem2_native()
             "        fs += fm[j][i];",
             "assert(s == 45); assert(fs == 12.0);" }))
         return false;
-    if (g_jit_op_run[static_cast<size_t>(OpCode::LoadElem2Int)] <= i0) {
+    /* #93: the INT reads are served by the EMITTED inline tier, which
+     * never calls the helper (the BinOpV precedent: an inline tier is the
+     * deeper form of native, not a gap). This clean 3x3 int matrix must
+     * take the FAST path - requiring the inline counter strictly is what
+     * proves the emitted code runs, since the helper would make the values
+     * right too. */
+    if (g_jit_elem2_fast <= e2f0) {
         fprintf(stderr,
-                "jit_load_elem2_native: the INT fusion DID NOT RUN\n");
+                "jit_load_elem2_native: the INLINE int tier DID NOT RUN\n");
         return false;
     }
     if (g_jit_op_run[static_cast<size_t>(OpCode::LoadElem2Float)] <= f0) {
