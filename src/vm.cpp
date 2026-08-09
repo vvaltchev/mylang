@@ -8009,6 +8009,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * UBSan's -fsanitize=function does NOT read a CFI type
              * signature from before the JIT fragment (which has none -
              * the read faults on the guard page below `base`). */
+            /* #137: a fragment always has a frame - jit_compile_chunk
+             * refuses a chunk with no slots and no temps, which is the one
+             * shape for which vm_run skips the window push. Stated here
+             * because it is THIS line that would form a member address on a
+             * null pointer if that ever stopped holding. */
+            ML_VM_CHECK(ctx.frame != nullptr);
             pc = jit_enter(static_cast<char *>(chunk->native.base)
                                + in->a_lit(),
                            ctx.frame->slots);

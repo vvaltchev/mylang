@@ -11221,6 +11221,20 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     if (!g_jit_enabled || chunk.code.empty())
         return;
 
+    /*
+     * #137: a FRAMELESS chunk is never compiled. `vm_run` skips the window
+     * push for a zero-slot main (an empty file, a comment-only file, or a
+     * program the DCE emptied - `if (false) { print(1); }`), so `ctx.frame`
+     * is null there, and EnterNative's `ctx.frame->slots` formed a member
+     * address on a null pointer: UNDEFINED BEHAVIOUR, caught by UBSan and
+     * SILENT in a release build (nothing reads it - a frameless body has no
+     * slots to touch). Refusing to compile removes the situation instead of
+     * making the bad pointer look harmless, and it costs nothing: a chunk
+     * with no slots and no temps can hold no work worth nativizing.
+     */
+    if (chunk.slot_count + chunk.n_temps == 0)
+        return;
+
     /* Lever A: neutral forwarding state BEFORE any emission - the
      * container path below shares emit_op but not the pairing protocol,
      * and a stale prod/in_rax from a previous chunk's last op would

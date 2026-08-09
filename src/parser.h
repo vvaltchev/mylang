@@ -152,6 +152,22 @@ public:
      */
     int pending_gt = 0;
 
+    /*
+     * #137: NESTING DEPTH. The parser is recursive descent, so a deeply
+     * nested source recurses the C stack once per level - and `(((...1...)))`
+     * at ~800 levels BLEW IT: a SIGSEGV in the release build, an ASan
+     * DEADLYSIGNAL in the debug one. A crash is never an acceptable answer to
+     * an input file (RULE 1), so the depth is capped and a program past it is
+     * REFUSED with an ordinary syntax error.
+     *
+     * 256 is far above anything written or generated in practice (the corpus
+     * peaks in single digits) and far below the smallest stack this runs on -
+     * MSVC's debug frames are the fattest, which is why the margin is large
+     * rather than tuned to the measured Linux threshold.
+     */
+    int nest_depth = 0;
+    static const int MAX_NEST = 256;
+
     /* token operations */
     const Tok &operator*() const { return ts.get(); }
     const Tok &get_tok() const { return ts.get(); }

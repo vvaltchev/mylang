@@ -4581,6 +4581,27 @@ static const std::vector<test> tests =
         "var g = 5;" },
       &typeid(UnboundSymbolEx), 26, 1, 28, 1 },
     /*
+     * #137 - A DEGENERATE PROGRAM MUST NOT CRASH THE INTERPRETER. Every input
+     * ends in a DEFINED outcome - a compile refusal, a thrown exception, or a
+     * clean run - never a C-level crash (RULE 1).
+     */
+    {
+        /* an EMPTY main has no Frame, and EnterNative formed `ctx.frame->
+         * slots` on the null pointer: UB, caught by UBSan and SILENT in a
+         * release build. The DCE'd form is the one a user actually hits. */
+        "degenerate: an empty program runs",
+        { "" }
+    },
+    {
+        "degenerate: a program the DCE empties runs",
+        { "if (false) { print(1); }" }
+    },
+    {
+        "degenerate: a comment-only program runs",
+        { "# nothing here" }
+    },
+
+    /*
      * #138 - `&&` and `||` SHORT-CIRCUIT. The determining operand stops the
      * chain: the rest is not evaluated, so its side effects do not happen and
      * its errors are not raised. That is what makes the guard idiom work.
@@ -16750,6 +16771,82 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c);
  * of the option is the DIFFERENCE. A case that is refused either way, or
  * accepted either way, tests nothing about it.
  */
+/*
+ * #137: DEEP NESTING IS REFUSED, NOT A CRASH. The parser is recursive
+ * descent, so one level of source nesting is one level of C recursion -
+ * `(((...1...)))` at ~800 levels was a SIGSEGV in release and an ASan
+ * DEADLYSIGNAL in debug. Built here rather than as a `tests` entry because a
+ * 300-deep source is generated, not written.
+ *
+ * Both recursion points are covered: the expression primary (parens, array
+ * literals) and the block/statement chain - a bare `{ ... }` reaches pBlock
+ * from its own loop, never through pStmt, so the statement guard alone left
+ * `{{{...}}}` unbounded (watched: it crashed at 5000).
+ */
+static bool deep_nesting_refused()
+{
+    struct Case { const char *what; std::string src; };
+
+    std::string parens, arrays, blocks, ifs;
+    for (int i = 0; i < 400; i++) { parens += '('; arrays += '['; }
+    parens += '1';
+    arrays += '1';
+    for (int i = 0; i < 400; i++) { parens += ')'; arrays += ']'; }
+    parens += ';';
+    arrays += ';';
+    for (int i = 0; i < 400; i++) { blocks += '{'; ifs += "if (1) "; }
+    for (int i = 0; i < 400; i++) blocks += '}';
+    ifs += "print(1);";
+
+    const Case cases[] = {
+        { "nested parens",  parens },
+        { "nested arrays",  arrays },
+        { "nested blocks",  blocks },
+        { "nested ifs",     ifs    },
+    };
+
+    bool ok = true;
+
+    for (const Case &c : cases) {
+        bool refused = false;
+        try {
+            std::vector<Tok> toks;
+            lexer(c.src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+        } catch (const SyntaxErrorEx &) {
+            refused = true;
+        } catch (const Exception &) {
+            refused = true;      /* any clean refusal is fine - not a crash */
+        }
+        if (!refused) {
+            fprintf(stderr, "deep_nesting: '%s' was ACCEPTED - the guard is "
+                            "not covering this recursion point\n", c.what);
+            ok = false;
+        }
+    }
+
+    /* ... and the depth just BELOW the cap still parses, so the guard is a
+     * bound and not a blanket refusal */
+    std::string shallow;
+    for (int i = 0; i < 100; i++) shallow += '(';
+    shallow += '1';
+    for (int i = 0; i < 100; i++) shallow += ')';
+    shallow += ';';
+    try {
+        std::vector<Tok> toks;
+        lexer(shallow, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+    } catch (const Exception &e) {
+        fprintf(stderr, "deep_nesting: 100 levels REFUSED (%s) - the cap is "
+                        "too low\n", e.name);
+        ok = false;
+    }
+
+    return ok;
+}
+
 static bool strict_forward_decl_shapes()
 {
     struct Case {
@@ -27165,6 +27262,8 @@ static const std::vector<extra_check> extra_checks =
       vm_codegen_shapes },
     { "opt: --strict requires a non-local to be declared first",
       strict_forward_decl_shapes },
+    { "parser: deep nesting is REFUSED, never a crash (#137)",
+      deep_nesting_refused },
     { "builtins: dev-only show() reserved in a script",
       dev_builtin_reserved_in_script },
     { "builtins: lazy-arg builtins are not values in a script (F1)",

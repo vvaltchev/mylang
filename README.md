@@ -456,6 +456,11 @@ keeps working), and so is a lazy builtin's argument: `isbound(g)` asks *about*
 `g` rather than reading it, which is how a program copes with an order it
 cannot change.
 
+**Nesting is bounded.** Expressions and blocks may nest up to 256 levels; past
+that the program is refused with a syntax error. The limit is far above
+anything written or generated in practice, and exists so that a pathological
+input is *refused* rather than crashing the interpreter.
+
 **A name declared nowhere is a compile error.** A misspelled or missing
 variable is refused before the program runs, not when execution reaches it:
 
