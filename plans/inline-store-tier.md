@@ -182,6 +182,45 @@ emitted path trusts.
    (`g_jit_store_fast`, the `g_jit_boxed_fast` pattern) - the helper
    bumping `g_jit_op_run` cannot distinguish the tiers.
 
+## #95 case 1 - COMPOUND stores (landed 2026-08-02)
+
+`a[i] OP= v` (and the `a[i]++` lowering) joined the fast path as a
+read-modify-write: same guards, hash invalidated first (frees the shobj
+register - nothing can fault past the guards), then add/sub/imul or
+cqo+idiv on the element; floats do `xmm1 = elem OP xmm0`.
+
+The rules, each sabotage-verified:
+  - EMIT-time refusals: float `%=` (fmod), literal 0/-1 divisors (the
+    helper runs the exact interpreter C++ - the IntModRI convention).
+  - RUNTIME divisor guards (slot rhs, div/mod): decline on 0 and -1,
+    emitted BEFORE the prep jumps - div-by-zero throws WITHOUT cloning
+    in the interpreter, so the clone side effect must not run first
+    (prep=0 asserted with a live slice). OOB outranks div0 by
+    construction: a decline re-derives everything in the helper's order.
+  - the float zero test is ucomisd + a `jp` hop: unordered (NaN) sets
+    ZF, so without the hop a NaN divisor silently declines (caught as
+    fast-count 32 != 33).
+  - the KIND checks moved BEFORE the prep jumps in every arm - prep
+    must never clone a base the interpreter would fault on without
+    cloning. Unreachable for this op's proven bases; the ordering is
+    the invariant.
+  - compound on runtime BOOL storage is COMPILE-unreachable (the
+    compound int store pins the base to array<int>, so an array<bool>
+    argument is a TypeMismatchEx); the ints-only kind guard is defense
+    in depth. Probing for the shape exposed a PRE-EXISTING tw-vs-VM
+    divergence (bool literal into an int-JOINED array), filed as its
+    own bug.
+
+A NEW SHAPE-EATER found here (now in CLAUDE.md's trap list): const-ARG
+specialization + auto-const fold a param-derived write-once local
+(`var z = n - n` under `f(9)`) into a LITERAL operand, so a "runtime
+divisor" test exercises the emit-time refusal instead of the runtime
+guard - three cases were vacuous exactly that way. Defeat: write-TWICE
+locals (`var z = 1; z = n - n;`).
+
+No suite bench compounds into an array element (62's `+=` is a DICT
+store) - the value is reach + parity, like prep.
+
 ## A trap in the TEST, worth avoiding next time
 
 The first version of the decline cases counted every store in the whole

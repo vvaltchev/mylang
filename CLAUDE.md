@@ -1379,6 +1379,26 @@ LoadElem2Float over an int row); the pure-int-rows "promote" case reads
 through LoadElem2INT and only promotes at the multiply - another
 shape-eater, now listed. No suite bench exercises float element stores or
 nested float reads (parity + reach, like prep); 46/43 neutral.
+**#95 case 1 - COMPOUND element stores inline (2026-08-02):** `a[i] OP= v`
+(incl. the `a[i]++` lowering) is a read-modify-write on the fast path -
+same guards, then the element in RAX (hash byte invalidated FIRST so the
+shobj register frees; past the guards nothing faults) with add/sub/imul
+or cqo+idiv (quotient/remainder), floats via `xmm1 = elem OP xmm0`.
+Refused at EMIT time: float `%=` (an fmod libm call), a LITERAL 0/-1
+divisor (the helper runs the interpreter's exact C++ - the IntModRI
+convention). RUNTIME divisor guards (a slot rhs, div/mod only) decline on
+0 and -1, and are emitted BEFORE the prep jumps - a div-by-zero store
+throws WITHOUT cloning, so prep must not run first; the float zero test
+is `ucomisd` with a `jp` hop so a NaN divisor (unordered sets ZF) stays
+fast. A compound on runtime BOOL storage is COMPILE-unreachable (the
+store pins the base to array<int>), so the compound arm's ints-only kind
+guard is defense in depth. The KIND checks moved BEFORE the prep jumps
+for every arm (same invariant: prep must never clone a base the
+interpreter would fault on without cloning). All four guard families
+sabotage-verified; probing the bool shape exposed a PRE-EXISTING
+tw-vs-VM divergence (a bool literal stored into an int-JOINED array -
+tw throws, VM stores 1), filed separately. No suite bench compounds into
+an element (reach + parity, like prep).
 The **DICT store** `d[k] = v` / `d[k] OP= v` (LOCAL base) is the same shape -
 `DictStore` -> `jit_dict_store` (vm.cpp), which runs the interpreter's exact
 `vm_subscript_store`. The key/value are BOXED EvalValues in frame slots, so
@@ -4915,6 +4935,14 @@ AST transform joins **all three** on the day it is written:
 > 5. **Attribute counters PER SHAPE, never program-wide** - a decline
 >    case's ordinary stores otherwise mask (or fake) the signal. And an
 >    env-gated tool toggled by one test leaks into the next: save/restore.
+> 6. **Const-ARG specialization eats "runtime" values derived from a
+>    param.** `f(9)` specializes to `f$s0` with `n = 9` propagated, and
+>    auto-const then folds a write-once local (`var z = n - n`) to a
+>    LITERAL operand - so a test of a runtime-slot guard (a div-by-zero
+>    divisor) silently exercises the emit-time literal path instead;
+>    three divisor-guard cases were vacuous exactly this way. Defeat by
+>    making the local write-TWICE (`var z = 1; z = n - n;` - blocked
+>    from promotion), or by calling with a non-const argument.
 >
 > The mechanical safeguards, both mandatory: an **EMITTED-code counter**
 > (the `g_jit_store_fast` pattern - the helper's counter also counts
