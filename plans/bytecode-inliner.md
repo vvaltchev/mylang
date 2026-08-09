@@ -166,23 +166,51 @@ return n + sumto(n-1); }` it emits the textbook form (`-vd`, one level):
 and it runs correctly with the JIT off. It is DEFAULT OFF because of two
 defects, both found by the battery, neither yet fixed:
 
-**(1) A spliced frame's VIRTUAL backtrace frame is dropped.** A throwing
-`sumto(4)` renders 5 frames spliced against 6 un-spliced - the level that
-was inlined into a physical frame contributes nothing. Diagnosed: the
-per-record flush in `vm_unwind_walk` calls `vm_flush_inline`, which is
-guarded by `Exception::inline_origin_emitted`, so only the FIRST flush of
-an unwind emits. That guard is right for the AST inliner, where a nested
-splice is one PARENT CHAIN emitted at the innermost node - but a chunk
-that appears on the stack MORE THAN ONCE (a recursion whose body was
-spliced) has a SEPARATE chain per activation.
+**(1) [RE-DIAGNOSED 2026-08-02 - it is NOT the splice's bug, and it is
+NOT the flush guard.]** The first reading was that a spliced frame's
+virtual backtrace frame was dropped by `vm_unwind_walk`'s once-guarded
+flush. Both halves of that are wrong, and the correction matters more
+than the original claim:
 
-The fix is the one the tree-walker already uses: its `do_func_call` catch
-flushes UNCONDITIONALLY (CLAUDE.md: "each physical call's flush stays
-unconditional (multi-level inlined call sites all show)") while only the
-raise-site flush is once-guarded. So `vm_unwind_walk` needs a `vm_flush_
-inline_call` variant that does the pc lookup, pushes the chain, and does
-NOT consult the guard - and must NOT prefer `Exception::jit_inline_frame`
-there, since that baked index belongs to the RAISE site, not this call.
+  - **The splice's backtrace is CORRECT.** With the JIT off, `-bi` and
+    `-nbi` and `-tw` all render a throwing `sumto(4)` byte-identically
+    (6 frames). The 5-vs-6 reading came from comparing two JIT-ON runs.
+  - **The divergence is JIT-only and PRE-EXISTS the splice entirely.**
+    It reproduces on the DEFAULT build with the splice off, using only
+    the AST inliner's recursion unroll:
+
+        func f(n) {
+            if (n < 2) return 1 / (n - n);
+            return f(n - 1) + f(n - 2);
+        }
+        print(f(5));
+
+    tree-walker and `-nj` both render 6 frames; the JIT renders 4, and
+    its last frame reads `main() at line 4` where it should read `line
+    6`. So a frame is not merely missing - one is MISATTRIBUTED.
+  - **Making the flushes unconditional does NOT fix it.** Tried at
+    `vm_unwind_walk`'s pop and at the three call-op propagation sites;
+    no change. So the frames are lost on a path that does not flush at
+    all.
+
+**The leading hypothesis, and where to look next.** `vm_unwind_walk`'s
+`sync_stop` branch - the record shape the JIT's EMITTED sync call pushes -
+captures the frame, pops the window and converts to the pending signal
+**with no `vm_flush_inline` call anywhere in it**, unlike the in-VM branch
+right below it, which flushes at the parent's call pc. That is a
+structural gap, not a guard problem. The complication that makes it worth
+designing rather than patching: at that point `chunk` is the CALLEE's, so
+there is no caller pc to look up, and the only thing naming the caller's
+chain is `Exception::jit_inline_frame`, baked by the emitted call site's
+`emit_exc_stamp`. Consuming it there would also have to CLEAR it so the
+next level's stamp can take effect, and would have to resolve
+`inline_frames` against the CALLER's chunk, which the record does not
+carry. That is a real protocol decision - do not patch it blind.
+
+Also worth fixing regardless: the `-rt` suite has no test for this shape
+(a recursion whose recursive call sits inside an inlined region, throwing
+deep), which is how a tw-vs-VM backtrace divergence survived. Add one to
+the differential, with the JIT on.
 
 **(2) A chunk with TWO splices miscompiles UNDER THE JIT.** Ackermann
 (two self-calls in one body) dispatches a garbage opcode - UBSan:
