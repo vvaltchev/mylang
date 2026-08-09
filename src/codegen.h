@@ -4,11 +4,13 @@
 
 #include "bytecode.h"
 
+#include <string>
 #include <vector>
 
 class Block;
 class Construct;
 class FuncDeclStmt;
+struct FuncDescriptor;
 
 /*
  * Collect every FuncDeclStmt reachable from `c` - a COMPLETE walk, so a lambda
@@ -78,3 +80,30 @@ void build_boxed_ops(Chunk &chunk);
  * compile-time abort, never a wrong catch at runtime. ASSERTS-only.
  */
 void verify_handler_sites(const Chunk &chunk);
+
+/*
+ * THE BYTECODE-LEVEL INLINER's gate (plans/bytecode-inliner.md).
+ *
+ * True iff `callee` may be SPLICED into a caller at a CallV: every op is on
+ * the whitelist (its slot fields are enumerated by the remapper AND it
+ * carries no pool index), it ends in ReturnV with no Halt, it owns no
+ * per-frame side state, and it is small enough. `why`, when non-null, is
+ * filled with the FIRST blocking reason - that is what the corpus audit
+ * prints.
+ *
+ * A WHITELIST on purpose: an op nobody has classified declines the inline
+ * instead of corrupting a frame or reading the wrong pool entry. The three
+ * per-op tables this codebase already has (visit_use_def, op_writes_scalar,
+ * visit_pc_fields) have all gone stale at least once when an op was added;
+ * here that failure mode costs an optimization and nothing else.
+ */
+bool bc_inline_callee_ok(const Chunk &callee, std::string *why);
+
+/*
+ * The corpus audit (env MYLANG_INLAUDIT=1, the MYLANG_DELAUDIT pattern):
+ * report each CallV in `caller` with its callee's size and the gate's
+ * verdict, so the histogram says what the inliner reaches and what to
+ * unblock next. Dev-only; zero cost when the env is unset.
+ */
+void bc_inline_audit(const Chunk &caller, const char *caller_name,
+                     const std::vector<const FuncDescriptor *> &slot_desc);

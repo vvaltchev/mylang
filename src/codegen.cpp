@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "codegen.h"
+#include "env.h"
 #include "jit.h"
 #include "inferencer.h"
 #include "syntax.h"
@@ -8334,3 +8335,148 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
     return true;
 }
 
+
+/* ===================================================================
+ * THE BYTECODE-LEVEL INLINER (plans/bytecode-inliner.md)
+ * =================================================================== */
+
+/*
+ * The op WHITELIST. An op qualifies only if BOTH hold, verified by reading
+ * its emit site and its VM_CASE:
+ *   - every field of it that holds a FRAME SLOT is enumerated by the
+ *     remapper (so a splice can rebase them all), and
+ *   - it carries NO index into a chunk POOL (consts, member_keys,
+ *     closure_defs, chain_locs, ...), because a splice would have to
+ *     re-base that too and there is no audited table of which field holds
+ *     which pool's index.
+ *
+ * Everything else DECLINES. That direction is the whole point: this
+ * codebase has had visit_use_def, op_writes_scalar and visit_pc_fields go
+ * stale when an op was added, and here a forgotten op must cost an
+ * optimization rather than a corrupt frame or a wrong constant.
+ *
+ * `Halt` is deliberately NOT on the list even though it is pool-free: a
+ * spliced Halt would stop the CALLER. A fall-through body (which returns
+ * none) needs the return boundary to synthesize that none, and that is a
+ * later increment.
+ */
+/* The opcode's name, generated from THE list (bytecode.h), so it can never
+ * name an op that does not exist nor miss one that does. jit.cpp has its
+ * own copy for the delete-originals audit; this one exists so the inline
+ * audit does not have to reach into a JIT-only, off-platform-absent TU. */
+static const char *bc_op_name(OpCode op)
+{
+#define ML_BC_OPNAME(N) case OpCode::N: return #N;
+    switch (op) {
+    ML_FOR_EACH_OPCODE(ML_BC_OPNAME)
+    case OpCode::OpCount_: break;
+    }
+#undef ML_BC_OPNAME
+    return "?";
+}
+
+static bool bc_inline_op_ok(OpCode op)
+{
+    switch (op) {
+    /* the typed scalar core - B1/B2's specialized forms included, since
+     * specialize_arith_ops has already run by the time a chunk is seen */
+    case OpCode::IntBin:      case OpCode::FloatBin:
+    case OpCode::IntAddRR:    case OpCode::IntAddRI:
+    case OpCode::IntSubRR:    case OpCode::IntSubRI:
+    case OpCode::IntMulRR:    case OpCode::IntMulRI:
+    case OpCode::IntAndRR:    case OpCode::IntAndRI:
+    case OpCode::IntOrRR:     case OpCode::IntOrRI:
+    case OpCode::IntXorRR:    case OpCode::IntXorRI:
+    case OpCode::IntShlRR:    case OpCode::IntShlRI:
+    case OpCode::IntShrRR:    case OpCode::IntShrRI:
+    case OpCode::IntModRI:    case OpCode::IntAddModRI:
+    case OpCode::FloatAddRR:  case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR:  case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR:  case OpCode::FloatMulRI:
+    case OpCode::CmpIntV:     case OpCode::CmpFloatV:
+    case OpCode::LoadImmInt:  case OpCode::LoadImmFloat:
+    case OpCode::MoveV:
+    /* control flow: pcs are handled by visit_pc_fields, which IS audited */
+    case OpCode::Jump:
+    case OpCode::JumpUnlessIntCmp:
+    case OpCode::JumpUnlessFloatCmp:
+    case OpCode::ForLoopStep:
+    case OpCode::IntAddStep:
+    /* the boundary + the nested call (its target2 is a GLOBAL slot, not a
+     * frame slot - the remapper must leave it alone, and does) */
+    case OpCode::ReturnV:
+    case OpCode::CallV:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Max ops in a splice-able callee. Deliberately small for the first
+ * increment: the shapes this is for (a linear-recursion body, a closure
+ * factory) are under ten ops, and a bigger budget only grows the caller's
+ * frame and its I-cache footprint for calls that are not the bottleneck. */
+static const size_t BC_INLINE_MAX_OPS = 24;
+
+bool bc_inline_callee_ok(const Chunk &callee, std::string *why)
+{
+    const auto no = [&](const char *r) { if (why) *why = r; return false; };
+
+    if (callee.code.empty())
+        return no("empty");
+    if (callee.code.size() > BC_INLINE_MAX_OPS)
+        return no("too-big");
+    if (callee.code.back().op != OpCode::ReturnV)
+        return no("no-tail-return");
+    /* per-frame side state lives in watermarked slices of shared stacks,
+     * indexed per CALL RECORD - a splice has no record of its own */
+    if (callee.n_trys != 0)
+        return no("try-regions");
+    if (callee.n_dict_iters != 0 || callee.n_dyn_iters != 0)
+        return no("frame-iterators");
+
+    for (const Instr &in : callee.code)
+        if (!bc_inline_op_ok(in.op)) {
+            if (why)
+                *why = std::string("op:") + bc_op_name(in.op);
+            return false;
+        }
+    return true;
+}
+
+void bc_inline_audit(const Chunk &caller, const char *caller_name,
+                     const std::vector<const FuncDescriptor *> &slot_desc)
+{
+    if (!env_get("MYLANG_INLAUDIT"))
+        return;
+    for (size_t pc = 0; pc < caller.code.size(); pc++) {
+        const Instr &in = caller.code[pc];
+        if (in.op != OpCode::CallV && in.op != OpCode::CallValueV
+                && in.op != OpCode::CachedCallV)
+            continue;
+        if (in.op != OpCode::CallV) {
+            /* a runtime callee - unreachable without a GUARD, and 76/11
+             * are entirely this shape (plans/bytecode-inliner.md) */
+            fprintf(stderr, "INLAUDIT %s pc%zu %s: runtime-callee\n",
+                    caller_name, pc, bc_op_name(in.op));
+            continue;
+        }
+        const int gslot = in.target2;
+        const FuncDescriptor *d =
+            (gslot >= 0 && static_cast<size_t>(gslot) < slot_desc.size())
+                ? slot_desc[gslot] : nullptr;
+        const Chunk *cc = d ? static_cast<const Chunk *>(d->vm_chunk)
+                            : nullptr;
+        if (!cc) {
+            fprintf(stderr, "INLAUDIT %s pc%zu CallV: unresolved-callee\n",
+                    caller_name, pc);
+            continue;
+        }
+        std::string why;
+        const bool ok = bc_inline_callee_ok(*cc, &why);
+        fprintf(stderr, "INLAUDIT %s pc%zu CallV -> %s (%zu ops): %s%s\n",
+                caller_name, pc, d->name ? d->name->val.c_str() : "?",
+                cc->code.size(), ok ? "OK" : "no ",
+                ok ? "" : why.c_str());
+    }
+}
