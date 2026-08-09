@@ -492,7 +492,25 @@ struct Reader {
             bad_image("corrupt .myv (string index)");
         return strs[id];
     }
+    /*
+     * A MANDATORY table reference: it must name a real entry. This is the
+     * DEFAULT because the permissive form was, and three call sites indexed
+     * with the 0xffffffff "absent" sentinel it let through - a read four
+     * billion elements past the end. Strict-by-default means a new call site
+     * gets the safe one and has to ask for the other.
+     */
     uint32_t idx(size_t limit, const char *what)
+    {
+        const uint32_t v = u32v();
+        if (v >= limit)
+            bad_image(what);
+        return v;
+    }
+
+    /* An OPTIONAL reference: 0xffffffff means "none". Only for a field that
+     * genuinely has a null form - the CALLER must test for the sentinel
+     * before indexing. */
+    uint32_t idx_opt(size_t limit, const char *what)
     {
         const uint32_t v = u32v();
         if (v != 0xffffffffu && v >= limit)
@@ -1343,7 +1361,7 @@ void read_chunk(Reader &r, Chunk &c)
         m.optional = r.boolv();
         m.mstart = r.locv(); m.mend = r.locv();
         m.bstart = r.locv(); m.bend = r.locv();
-        const uint32_t bd = r.idx(r.structs.size(), "corrupt .myv (bake def)");
+        const uint32_t bd = r.idx_opt(r.structs.size(), "corrupt .myv (bake def)");
         m.bake_def = bd == 0xffffffffu ? nullptr : r.structs[bd];
         m.bake_slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
         c.member_keys.push_back(std::move(m));
@@ -1446,7 +1464,7 @@ void read_chunk(Reader &r, Chunk &c)
         lo.value = read_value(r);
         lo.immutable = r.boolv();
         lo.arr_hint = static_cast<ArrHint>(r.u8v());
-        const uint32_t si = r.idx(r.structs.size(), "corrupt .myv (hint)");
+        const uint32_t si = r.idx_opt(r.structs.size(), "corrupt .myv (hint)");
         lo.arr_hint_struct = si == 0xffffffffu ? nullptr : r.structs[si];
         c.literal_objs.push_back(std::move(lo));
     }
@@ -1466,7 +1484,7 @@ void read_chunk(Reader &r, Chunk &c)
     c.boxed_ctors.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::BoxedCtor bc;
-        const uint32_t di = r.idx(r.structs.size(), "corrupt .myv (ctor)");
+        const uint32_t di = r.idx_opt(r.structs.size(), "corrupt .myv (ctor)");
         bc.def = di == 0xffffffffu ? nullptr : r.structs[di];
         bc.arg_locs = read_arglocs(r);
         c.boxed_ctors.push_back(std::move(bc));
@@ -1476,7 +1494,7 @@ void read_chunk(Reader &r, Chunk &c)
     c.emplace_sites.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::EmplaceSite es;
-        const uint32_t di = r.idx(r.structs.size(), "corrupt .myv (emplace)");
+        const uint32_t di = r.idx_opt(r.structs.size(), "corrupt .myv (emplace)");
         es.def = di == 0xffffffffu ? nullptr : r.structs[di];
         es.bname = r.uidv();
         es.a0_start = r.locv(); es.a0_end = r.locv();
@@ -1819,7 +1837,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             fd.name = r.uidv();
             fd.kind = static_cast<FieldKind>(r.u8v());
             fd.struct_ty = r.uidv();
-            const uint32_t si = r.idx(n, "corrupt .myv (field struct)");
+            const uint32_t si = r.idx_opt(n, "corrupt .myv (field struct)");
             fd.struct_def = si == 0xffffffffu ? nullptr : r.structs[si];
             fd.is_opt = r.boolv();
             fd.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
