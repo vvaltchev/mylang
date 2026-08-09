@@ -2642,6 +2642,11 @@ unsigned long g_jit_norec_frame_verify = 0;
 unsigned long g_jit_norec_stamp_verify = 0;
 unsigned long g_jit_norec_walk_frames = 0;
 unsigned long g_jit_norec_desc_chain = 0;
+unsigned long g_jit_norec_win_chain = 0;
+unsigned long g_jit_norec_gate_ok = 0;
+unsigned long g_jit_norec_gate_cached = 0;
+unsigned long g_jit_norec_gate_plain = 0;
+unsigned long g_jit_norec_gate_body = 0;
 #ifdef TESTS
 [[noreturn]] static void norec_fail(const char *what, const void *a,
                                     const void *b)
@@ -7656,6 +7661,41 @@ extern "C" void jit_norec_push_verify(const void *site,
     norec_check_rec(act->back_rec(), ns);
     g_jit_norec_verify++;
     /*
+     * STEP 4 GATE REACH - classify this push against the no-record
+     * tier's CALLEE gate, per call on the real (native) path, so the
+     * numbers answer "how many of the calls that would skip their
+     * record actually may". No extra emit: this helper already runs on
+     * every M5b inline push. The gate, per the step-4 design
+     * (plans/g1-no-record-tier.md):
+     *   - not a CACHED call (the pure-cache exclusion - fib declines);
+     *   - callee plain_frame (no handler/iterator watermark, so the
+     *     unwind never searches the frame);
+     *   - callee FULLY DELETED - every op is EnterNative, so the frame
+     *     can never resume through the interpreter mid-body (the
+     *     record is the interpreter's only resume vehicle);
+     *   - callee ref_slots small (the C4c release-arm bound - a mirror
+     *     of jit.cpp's RET_REF_GUARD_MAX; step 4 unifies the two).
+     */
+    {
+        const VmCallRec &rec = act->back_rec();
+        const Chunk *cck = rec.run_chunk;
+        bool deleted = cck && !cck->code.empty();
+        if (deleted)
+            for (const Instr &i2 : cck->code)
+                if (i2.op != OpCode::EnterNative) {
+                    deleted = false;
+                    break;
+                }
+        if (rec.cache_key)
+            g_jit_norec_gate_cached++;
+        else if (!cck || !cck->plain_frame)
+            g_jit_norec_gate_plain++;
+        else if (!deleted || cck->ref_slots.size() > 6)
+            g_jit_norec_gate_body++;
+        else
+            g_jit_norec_gate_ok++;
+    }
+    /*
      * G1 STEP 3 - THE SHADOW WALK. `rbp` is the CALLER fragment's frame
      * pointer (the push runs BEFORE the callee is entered), so the frame
      * it points at is the one the record BELOW the just-pushed callee
@@ -7742,6 +7782,27 @@ extern "C" void jit_norec_push_verify(const void *site,
                                "desc", rs->caller_desc,
                                act->records[idx - 2].desc);
                 g_jit_norec_desc_chain++;
+                /*
+                 * STEP 3c - THE WINDOW CHAIN. frag_entry saves the
+                 * caller's rbx (the frame-base register) FIRST after
+                 * `push rbp`, so [fp-8] is the WINDOW of the frame
+                 * BELOW - readable from the native frame alone. This is
+                 * step 4's DISCRIMINATION mechanism: a frame is
+                 * record-ful iff the top record's window matches the
+                 * frame's own window (windows are unique among live
+                 * frames), and the walk learns each next frame's window
+                 * as it descends - so the mixed unwind walk needs NO new
+                 * release-mode record field to tell the two frame kinds
+                 * apart. Verified here against the full record stack
+                 * while it still exists. The rbx-first prologue order is
+                 * LOAD-BEARING (comment in frag_entry).
+                 */
+                const void *below_win =
+                    *reinterpret_cast<const void *const *>(fp - 8);
+                if (act->records[idx - 2].window != below_win)
+                    norec_fail("frame-below window != [fp-8]",
+                               act->records[idx - 2].window, below_win);
+                g_jit_norec_win_chain++;
             }
             fp = link;
             idx--;

@@ -893,6 +893,22 @@ extern unsigned long g_jit_norec_walk_frames;
 /* step 3b: frames whose descriptor was reconstructed from the site chain
  * (site.caller_desc == the frame below's desc) and matched the record. */
 extern unsigned long g_jit_norec_desc_chain;
+/* step 3c: frames whose WINDOW was recovered from the native frame alone
+ * ([fp-8] = the rbx the prologue saved = the frame BELOW's window) and
+ * matched the record. This is step 4's record-ful/record-less
+ * DISCRIMINATION mechanism, proven while both sources exist. */
+extern unsigned long g_jit_norec_win_chain;
+/* step 4 GATE REACH, classified per M5b inline push (in push_verify, so
+ * it costs no extra emit): would this call's CALLEE qualify for the
+ * no-record tier? ok = plain_frame + fully-deleted body (every op
+ * EnterNative - the frame can never resume through the interpreter
+ * mid-body) + a short ref_slots list (the C4c release-arm bound);
+ * cached = the pure-cache exclusion (fib's documented decline);
+ * plain / body = which gate refused the rest. */
+extern unsigned long g_jit_norec_gate_ok;
+extern unsigned long g_jit_norec_gate_cached;
+extern unsigned long g_jit_norec_gate_plain;
+extern unsigned long g_jit_norec_gate_body;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
  * bumped by the emitted code itself, so it proves the inline tier ran (the
  * jit_ret helper's own counter also counts declines and cannot). */

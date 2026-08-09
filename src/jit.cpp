@@ -961,6 +961,13 @@ struct Emitter {
          * code encodes it), and every exit funnels through frag_ret. */
         u8(0x55);                                     /* push rbp */
         u8(0x48); u8(0x89); u8(0xE5);                 /* mov rbp, rsp */
+        /* G1 step 3c: REG_SLOTS_BASE (rbx) is pushed FIRST after rbp,
+         * unconditionally - LOAD-BEARING. [rbp-8] of every native frame
+         * is therefore the caller's window (its rbx), which is how the
+         * no-record walk identifies the frame below without a record
+         * (the window chain, jit_norec_push_verify). Reordering these
+         * pushes breaks that identification silently in a build without
+         * the shadow checks - do not. */
         push_reg(REG_SLOTS_BASE);
         for (const uint8_t r : saved)
             push_reg(r);
@@ -4563,7 +4570,14 @@ void jit_stats_report()
         { "norec_stamp",      &g_jit_norec_stamp_verify },
         { "norec_walk",       &g_jit_norec_walk_frames },
         { "norec_desc",       &g_jit_norec_desc_chain },
+        { "norec_win",        &g_jit_norec_win_chain },
         { "norec_audit",      &g_jit_norec_audit_frames },
+        /* step 4 gate reach, classified per M5b inline push: would the
+         * CALLEE qualify for the no-record tier? (see push_verify) */
+        { "norec_gate_ok",    &g_jit_norec_gate_ok },
+        { "norec_gate_cached",&g_jit_norec_gate_cached },
+        { "norec_gate_plain", &g_jit_norec_gate_plain },
+        { "norec_gate_body",  &g_jit_norec_gate_body },
     };
     /* G1 reach probe (vm.cpp): the no-record tier's candidate gates.
      * Only meaningful with the JIT OFF - it sits on the C++ push path. */

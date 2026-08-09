@@ -436,3 +436,151 @@ step 4 (stop writing records). Steps 1-3 stay zero-behaviour; nothing
 gets faster until the nets exist. Days spent purely on these test arcs
 are budgeted and expected - the point is writing the hard code afterward
 without fear.
+
+# STEP 4 DESIGN FACTS (established 2026-08-10, before any emit)
+
+The full-protocol read that preceded step 4 settled every open mechanism
+question and found one NEW gate plus one NEW hazard the plan above did
+not know. Recorded here so step 4 is built against verified facts, not
+the §3b sketch.
+
+## 3c. The WINDOW CHAIN - discrimination without a release field
+
+§5 point 2 planned a native-SP field on record-ful records to order the
+mixed walk. NOT NEEDED. `frag_entry` pushes `rbx` (the frame-base
+register = the frame's WINDOW) FIRST after `push rbp`, unconditionally -
+so `[fp-8]` of every native frame is the WINDOW OF THE FRAME BELOW (the
+caller's rbx, saved by this frame's prologue). Two consequences:
+
+- **"Does this frame have a record?"** = `top_rec.window == the frame's
+  own window`. Windows are unique among live frames, C++-pushed records
+  carry real windows too, and a frame's record - when it has one - is
+  the top record at its own return/raise. Zero new record fields, in
+  any build.
+- **The walk learns each next frame's window as it descends** (read
+  `[fp-8]` before stepping `fp = [fp]`), so the record-ful/record-less
+  interleave is decided per frame with one compare.
+
+Verified as the SHADOW WINDOW CHAIN (`g_jit_norec_win_chain`, beside the
+desc chain in `jit_norec_push_verify`): `records[idx-2].window ==
+*(fp-8)` at every native-to-native level, across the whole suite and the
+protocol benches (lockstep with `norec_desc` - 53,328 on fib's audit
+run, 19,999 on 69_exc_crossframe). Sabotage: a checker reading [fp-16]
+aborts instantly ("frame-below window != [fp-8]"). The rbx-first
+prologue order is now LOAD-BEARING and commented so in `frag_entry`; an
+emitter-side reorder sabotage is structurally unfireable TODAY because
+no sync-call-containing fragment pins cache regs (`saved` is empty in
+every walkable frame - verified via -vdj on a loop+recursion shape), but
+the standing shadow walk catches it the day a pinning fragment appears.
+
+## 4b. The gate gains FULLY-DELETED, and the measured reach
+
+**The record is the interpreter's ONLY resume vehicle.** A frame that
+exits its fragment mid-body - an interpreted island, a bail - is resumed
+by `jit_sync_postexit` driving `vm_dispatch` through the frame's record
+(sync_stop + the baked resume stub). A record-less frame therefore may
+NEVER exit to the interpreter mid-body, and the only chunk shape that
+guarantees that is **fully deleted: every op is EnterNative** (the head
+plus the #64 post-call entry stubs). The gate becomes:
+
+    not cached  +  plain_frame  +  FULLY DELETED  +  ref_slots small
+                                                     (RET_REF_GUARD_MAX,
+                                                      the C4c return arm)
+
+Classified per M5b inline push (in push_verify, zero extra emit),
+MYLANG_JITSTATS rows `norec_gate_*`. Measured at scale 1:
+
+    bench                 pushes     gate_ok   declined by
+    45_gcd               149,998       100%    -
+    76_funcval_dispatch  999,999       100%    -
+    78_typed_param_call  2,000,001     100%    -
+    09_fib_recursive      10,687         0%    cached (as designed)
+    10_recursion_deep      5,998         50%   body: sumto$0 keeps an
+                                               interpreted CallV island
+    69_exc_crossframe     39,998         50%   body: same shape
+
+**The 50% rows correct §4's "up to 99.8%" prediction**: the plain_frame
+measurement could not see the fully-deleted requirement. Where a
+recursion partner keeps ONE interpreted op, its frames keep records -
+correct, and the record-less frames interleave with them (which the
+window chain handles). Raising those benches to 100% is a separate,
+later task: nativize the partner's residual op.
+
+## 4c. The record-less protocol, concretely
+
+**The call site** (in place of the ~51-instruction record fill):
+
+    push  <&caller_frame[dst]>    ; lea from rbx - baked; 0 for a
+                                  ; discarded result
+    push  <ctx.captures>          ; the caller's own captures value
+    call  <callee entry>          ; both paths: parity kept (2 pushes)
+    pop   -> ctx.captures         ; restore
+    add   rsp, 8                  ; drop dst_addr
+    ; restore act.vframe.slots/size from rbx + the CALLER's own baked
+    ; nslots (the callee cannot know them; the caller knows both at
+    ; emit time)
+
+The residue must be pushed AFTER the M5a stack switch (and popped before
+switch_post) or it lands on the wrong stack. §3b's `push seg_top_before`
+is NOT needed: an inline push never changes the segment (segment
+overflow declines to the slow C++ path), deeper frames restore their own
+tops by induction, so the CALLEE restores `seg->top -= my_total` and
+`act.used -= my_total` from its own compile-time totals.
+
+**The callee return** discriminates by `top_rec.window == rbx`:
+record-ful -> today's C4c inline pop, byte-identical; record-less -> a
+NEW arm that reads `[rbp+16]` (captures - unused here, the caller
+restores) and `[rbp+24]` (dst_addr), writes the result through dst_addr
+(old-dst-trivial + ref-result guards decline to a helper taking BOTH
+addresses), runs its own ref_slots release scan, restores seg-top/used
+from baked totals, and rets the sentinel. It must NOT touch the top
+record - that record belongs to an ancestor.
+
+**The unwind walk** (vm_raise + vm_unwind_walk) gains the raising
+fragment's rbp (a new argument from jit_throw / jit_rethrow /
+jit_end_finally's emit). Current frame record-less (window compare) ->
+reconstruct: backtrace frame from (chunk's desc via the descent,
+site.site_loc), release `seg->top` via the chunk's own totals, restore
+captures from the residue at [fp+16], step to the caller via [fp+8]
+(site) / [fp] (chain) / [fp-8] (next window). A record-ful frame runs
+today's body. The walk stays SEGMENT-LOCAL exactly as today: sync_stop
+conversion still bounces the status up the native stack, and each
+record-less post-call site's exception arm must CLEAN ITS OWN FRAME
+(capture + release + captures restore, a helper taking rbp + site)
+before propagating - an exception never crosses a record-less frame as
+a bare status.
+
+## 4d. The -3/SWITCH hazard - the one genuinely new mechanism
+
+The interpreted-flat protocol (JIT_RET_SWITCH, the sync depth cap -
+ackermann's path) resumes each native caller through ITS RECORD's baked
+resume stub after the flat callee completes. A record-less frame in that
+chain has no record and its native frame is unwound by the -3
+propagation - it would be UNRESUMABLE. The fix is the lazy-
+reconstruction thesis applied once more: **materialize the records at
+the moment the slow helper decides to go flat**. The helper (a C++ cold
+path) receives the deepest fragment's rbp, walks the chain
+innermost-to-outermost, discriminates by window (as the unwind walk
+does), and INSERTS a full record for each record-less frame at its
+chain position - below the already-pushed SWITCH record, ordered by the
+walk itself. Everything a record holds is reconstructible: the site
+gives dst / caller chunk / caller desc; the site must additionally
+carry the POST-CALL ENTRY-STUB pc (`NorecSite::resume_pc`, set from the
+same expression the slow path already bakes); captures come from the
+residue; totals from the chunk. Cold, rare (cap-exceeded only), and
+entirely in C++.
+
+## 4e. Build order within step 4
+
+  4-i.   NorecSite::resume_pc + jit_chunk_norec_ok() (the real gate
+         function, unifying the push_verify mirror) - mechanical.
+  4-ii.  The raise-helper rbp argument + the mixed unwind walk, WITH
+         records still written (the walk prefers reconstruction for a
+         qualifying frame and cross-checks the record it still has -
+         the §7-step-3 sabotage, now with the real walk).
+  4-iii. The callee return's record-less arm + the call-site residue,
+         behind MYLANG_JIT_FORCE=norec (records still written but
+         IGNORED by the return - the A/B lever).
+  4-iv.  The -3 materializer.
+  4-v.   Stop writing the record for gate-passing calls; flip the lever
+         default; Net 4 coverage gate; measure per shape + suite.
