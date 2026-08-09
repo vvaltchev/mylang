@@ -1649,7 +1649,11 @@ static const std::vector<test> tests =
          * guard declines them to the helper; this pins the value through
          * that decline.
          */
-        "elem2: BOOL rows decline the int fast tier (1-byte storage)",
+        /* #94 flipped this from a DECLINE to a FAST tail (1-byte count,
+         * movzx read) - the value stays the oracle either way, and the
+         * kind-guard sabotage that this case was built to catch still
+         * catches it (a bool row misread at 8-byte stride). */
+        "elem2: BOOL rows take the 1-byte fast tail (was: decline)",
         {
             /* SUM the elements rather than branch on them, and use rows
              * of >= 8: two guard-removal sabotages passed weaker forms -
@@ -1692,7 +1696,20 @@ static const std::vector<test> tests =
           "for (var i = 0; i < 2; i++)",
           "    for (var j = 0; j < 2; j++)",
           "        f += mix[j][i] * 1.0;",
-          "assert(f == 10.0);" },
+          "assert(f == 10.0);",
+          /* #94: the shape the ABOVE is not - `mix[j][i]` reads through
+           * LoadElem2INT (int rows, int elem; only the * promotes). MIXED
+           * rows make the joined elem type float while one row's storage
+           * stays flat INT, so THIS read is LoadElem2Float over an int
+           * row: the inline float tier must DECLINE it to the promoting
+           * helper - with its kind guard removed it reads int bits as a
+           * double, and this exact-sum assert catches that. */
+          "var mr = [[1.0, 2.0], [3, 4]];",
+          "var g = 0.0;",
+          "for (var i = 0; i < 2; i++)",
+          "    for (var j = 0; j < 2; j++)",
+          "        g += mr[j][i];",
+          "assert(g == 10.0);" },
     },
     {
         /* An OOB on the OUTER index carets the INNER subscript's span
@@ -18131,6 +18148,18 @@ static bool jit_store_elem_inline_tier()
           "    return s; }",
           "print(f(3));" }, true },
 
+      /* #94: the FLOAT store - same guards, movsd tail, prep shared */
+      { "flat FLOAT array, plain store",
+        { "func f(x) {",
+          "    var a = array(32); var q = 0;",
+          "    while (q < 32) { a[q] = 0.0; q++; }",
+          "    var i = 0;",
+          "    while (i < 32) { a[i] = i * x; i++; }",
+          "    var s = 0.0; var k = 0;",
+          "    while (k < 32) { s = s + a[k]; k++; }",
+          "    return s; }",
+          "print(f(1.5));" }, true },
+
       /* the SIEVE's exact shape: a bool LITERAL. A COMPUTED bool
        * (`a[i] = i < n`) lowers to StoreElemValue instead, a different op
        * this tier does not serve - which is why the sieve profile shows
@@ -19664,10 +19693,26 @@ static bool jit_load_elem2_native()
                 "jit_load_elem2_native: the INLINE int tier DID NOT RUN\n");
         return false;
     }
-    if (g_jit_op_run[static_cast<size_t>(OpCode::LoadElem2Float)] <= f0) {
-        fprintf(stderr,
-                "jit_load_elem2_native: the FLOAT fusion DID NOT RUN\n");
-        return false;
+    /* #94: the FLOAT twin is inline too - prove it on a float-ONLY
+     * program with its own baseline, since the shared counter cannot say
+     * which kind bumped it in the mixed program above. (f0, the helper's
+     * counter, would stay flat now - the tier starves it by design.) */
+    (void)f0;
+    {
+        const unsigned long ef1 = g_jit_elem2_fast;
+        if (!run({
+                "var fm = [[1.5, 2.5, 3.5], [4.5, 5.5, 6.5]];",
+                "var fs = 0.0;",
+                "for (var i = 0; i < 3; i++)",
+                "    for (var j = 0; j < 2; j++)",
+                "        fs += fm[j][i];",
+                "assert(fs == 24.0);" }))
+            return false;
+        if (g_jit_elem2_fast <= ef1) {
+            fprintf(stderr, "jit_load_elem2_native: the INLINE float tier "
+                            "DID NOT RUN\n");
+            return false;
+        }
     }
     return true;
 #else

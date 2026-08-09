@@ -1363,6 +1363,22 @@ prep on a must-throw store (the prep=0 assertion caught it - once the
 test's slice used a `runtime()` index, since literal-bound slices of a
 const FOLD at parse time and the first version was vacuous). `rsi` is
 RESERVED (the fragment's t_int); the value rides `rdi`.
+**#94 - FLOAT + BOOL PARITY (2026-08-02, maintainer-caught gap):** the
+store tier shipped int/bool-only and the nested read int-only - the float
+twins still paid the full helper per element. Now: StoreElemFloat takes
+the same guards with an SSE tail (`movsd [rcx+r9*8], xmm0`, value loaded
+via emit_float_load at the retry head since prep clobbers xmm0; prep is
+kind-agnostic and shared), LoadElem2Float mirrors the int navigation with
+float rows + `emit_float_store` (an INT row, which the helper PROMOTES,
+declines - the promote arm is a listed follow-up), and LoadElem2Int
+gained the 1-byte BOOLS tail (byte count, movzx). `run_has_float` gained
+LoadElem2Float so r8 = t_float is live in its runs. The float kind
+guard's catching shape is MIXED rows (`[[1.0,2.0],[3,4]]` - the joined
+elem type is float while one row's storage stays flat INT, so the READ is
+LoadElem2Float over an int row); the pure-int-rows "promote" case reads
+through LoadElem2INT and only promotes at the multiply - another
+shape-eater, now listed. No suite bench exercises float element stores or
+nested float reads (parity + reach, like prep); 46/43 neutral.
 The **DICT store** `d[k] = v` / `d[k] OP= v` (LOCAL base) is the same shape -
 `DictStore` -> `jit_dict_store` (vm.cpp), which runs the interpreter's exact
 `vm_subscript_store`. The key/value are BOXED EvalValues in frame slots, so

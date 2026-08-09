@@ -799,6 +799,9 @@ struct Emitter {
     void imul_r9_imm8(uint8_t k)       /* imul r9, r9, imm8 (row stride) */
     { u8(0x4D); u8(0x6B); u8(0xC9); u8(k); }
     void add_rcx_r9() { u8(0x4C); u8(0x01); u8(0xC9); }
+    /* movsd [rcx + r9*8], xmm0  (#94: the float element STORE) */
+    void store_elem_float_x0()
+    { u8(0xF2); u8(0x4A); u8(0x0F); u8(0x11); u8(0x04); u8(0xC9); }
     /* cmp rax, rcx / test rax, rax */
     void cmp_rax_rcx() { u8(0x48); u8(0x39); u8(0xC8); }
     void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
@@ -3582,7 +3585,8 @@ static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc,
  */
 static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                                    std::vector<size_t> &slows,
-                                   std::vector<size_t> &dones)
+                                   std::vector<size_t> &dones,
+                                   bool is_float)
 {
     if (in.aop != Op::invalid)
         return false;              /* compound: read-modify-write, later */
@@ -3604,7 +3608,15 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
      * The head re-loads the VALUE because the stub's call clobbers rdi.
      */
     const size_t retry = e.pos();
-    load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
+    /* the VALUE: rdi for ints (rsi is the t_int singleton), xmm0 for
+     * floats (compile-proven numeric, so no_bail - int/bool promote
+     * exactly as read_float_slot does). Loaded at the retry head because
+     * the prep stub's call clobbers both. */
+    if (is_float)
+        emit_float_load(e, X0, in.b_is_lit(), in.b_flit(), in.b_slot(), 0,
+                        /*no_bail=*/true);
+    else
+        load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
 
     e.load(RAX, base.type);                        /* an array? */
     e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
@@ -3628,6 +3640,26 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.cmp_byte_rax(L.slices_off, 0);                  /* live slice views */
     preps.push_back(e.j32(0x75));
 
+    if (is_float) {
+        /* --- FLOATS: one kind, one 8-byte tail --- */
+        e.cmp_byte_rax(L.kind_off, L.kind_floats);
+        decline_ne();
+        e.mov_rcx_rax(L.data_off);
+        e.mov_rdx_rax(L.data_off + 8);
+        e.sub_rdx_rcx();
+        e.sar_rdx_3();
+        load_index_r9(e, in);
+        e.cmp_r9_rdx();
+        slows.push_back(e.j32(0x73));
+#ifdef TESTS
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x02);
+#endif
+        e.store_elem_float_x0();               /* movsd [rcx+r9*8], xmm0 */
+        e.mov_byte_rax_imm(L.hashv_off, 0);
+        dones.push_back(e.jmp32());
+        /* fall through to the shared PREP stub below */
+    } else {
     e.cmp_byte_rax(L.kind_off, L.kind_ints);
     const size_t j_ints = e.j32(0x74);
     e.cmp_byte_rax(L.kind_off, L.kind_bools);
@@ -3664,6 +3696,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.store_elem_int_rdi();
     e.mov_byte_rax_imm(L.hashv_off, 0);
     dones.push_back(e.jmp32());
+    }                                          /* end of the int/bool arm */
 
     /*
      * The PREP stub: rdi = &slots[base], rsi = the index (cache-aware -
@@ -3717,7 +3750,8 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
 static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
                                    const Instr &in, uint32_t pc,
                                    std::vector<size_t> &slows,
-                                   std::vector<size_t> &dones)
+                                   std::vector<size_t> &dones,
+                                   bool is_float)
 {
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(in.target2);
@@ -3752,25 +3786,61 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     e.cmp_byte_rcx(static_cast<int32_t>(L.off_payload) + L.slice_off, 0);
     decline_ne();
     e.mov_rax_rcx_d(static_cast<int32_t>(L.off_payload));  /* row shobj */
-    e.cmp_byte_rax(L.kind_off, L.kind_ints);
-    decline_ne();
 
-    /* INNER: bounds, read, store */
-    e.mov_rcx_rax(L.data_off);
-    e.mov_rdx_rax(L.data_off + 8);
-    e.sub_rdx_rcx();
-    e.sar_rdx_3();
-    if (in.b_is_lit())
-        e.movabs_r9(static_cast<uint64_t>(in.b_lit()));
-    else
-        load_slot_r9(e, in.b_slot());
-    e.cmp_r9_rdx();
-    slows.push_back(e.j32(0x73));
-    e.load_elem_int();                         /* rax = [rcx + r9*8] */
+    const auto inner_idx_r9 = [&]() {
+        if (in.b_is_lit())
+            e.movabs_r9(static_cast<uint64_t>(in.b_lit()));
+        else
+            load_slot_r9(e, in.b_slot());
+    };
+    const auto count_and_idx = [&](bool bytes) {
+        e.mov_rcx_rax(L.data_off);
+        e.mov_rdx_rax(L.data_off + 8);
+        e.sub_rdx_rcx();
+        if (!bytes)
+            e.sar_rdx_3();
+        inner_idx_r9();
+        e.cmp_r9_rdx();
+        slows.push_back(e.j32(0x73));
+    };
+    const auto bump = [&]() {
 #ifdef TESTS
-    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem2_fast));
-    e.u8(0x48); e.u8(0xFF); e.u8(0x02);        /* inc qword [rdx] */
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem2_fast));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x02);    /* inc qword [rdx] */
 #endif
+    };
+
+    if (is_float) {
+        /* FLOAT rows only; an INT row (which the helper PROMOTES via
+         * cvtsi2sd) declines - the promote arm can join later if a bench
+         * ever shows it hot. */
+        e.cmp_byte_rax(L.kind_off, L.kind_floats);
+        decline_ne();
+        count_and_idx(/*bytes=*/false);
+        e.load_elem_float();                   /* xmm0 = [rcx + r9*8] */
+        bump();
+        emit_float_store(e, ck, X0, in.target, pc);
+        dones.push_back(e.jmp32());
+        return;
+    }
+
+    /* INT semantics accept flat ints AND flat bools, exactly as the
+     * single-level emit_elem_int_read does (a bool node is stamped `i`).
+     * A bool row stores ONE byte per element - byte count, byte read. */
+    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    const size_t j_ints = e.j32(0x74);
+    e.cmp_byte_rax(L.kind_off, L.kind_bools);
+    decline_ne();
+    count_and_idx(/*bytes=*/true);
+    e.load_elem_byte();                        /* movzx eax, [rcx + r9] */
+    bump();
+    store_dst(e, ck, RAX, in.target, pc);
+    dones.push_back(e.jmp32());
+
+    e.patch32_here(j_ints);
+    count_and_idx(/*bytes=*/false);
+    e.load_elem_int();                         /* rax = [rcx + r9*8] */
+    bump();
     store_dst(e, ck, RAX, in.target, pc);
     dones.push_back(e.jmp32());
 }
@@ -3784,10 +3854,10 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
     const int32_t base_off = static_cast<int32_t>(
         static_cast<long>(in.target2) * static_cast<long>(sizeof(LValue)));
 
-    /* #92: the INLINE fast tier first; every guard it fails jumps here,
-     * to the helper, which is the exact interpreter semantics. */
+    /* #92/#94: the INLINE fast tier first; every guard it fails jumps
+     * here, to the helper, which is the exact interpreter semantics. */
     std::vector<size_t> slows, dones;
-    if (!is_float && emit_store_elem_inline(e, in, slows, dones))
+    if (emit_store_elem_inline(e, in, slows, dones, is_float))
         for (const size_t j : slows)
             e.patch32_here(j);
 
@@ -4173,11 +4243,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * it fails lands here, on the helper. */
         {
         std::vector<size_t> e2_slows, e2_dones;
-        if (in.op == OpCode::LoadElem2Int) {
-            emit_load_elem2_inline(e, ck, in, pc, e2_slows, e2_dones);
-            for (const size_t j : e2_slows)
-                e.patch32_here(j);
-        }
+        emit_load_elem2_inline(e, ck, in, pc, e2_slows, e2_dones,
+                               in.op == OpCode::LoadElem2Float);
+        for (const size_t j : e2_slows)
+            e.patch32_here(j);
         emit_call_prologue(e);
         e.lea_rdi(static_cast<int32_t>(
                       static_cast<long>(in.target2)
@@ -6719,6 +6788,7 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
         case OpCode::LoadElemFloat:      /* writes a float -> needs r8 */
         case OpCode::MathFnV:            /* N6a: writes a float -> needs r8 */
         case OpCode::StoreElemFloat:     /* reads a float rhs -> needs r8 */
+        case OpCode::LoadElem2Float:     /* #94 inline tier: float dst */
         case OpCode::LoadMemberFloat:    /* baked fast path: float store */
             return true;
         case OpCode::StructCtorV:        /* a planned float field reads via
