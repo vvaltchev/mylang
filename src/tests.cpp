@@ -4925,6 +4925,33 @@ static const std::vector<test> tests =
      * RUNS, so each of these asserts its own result rather than merely
      * compiling.
      */
+    { "alias: a write-once name bound to a LAMBDA is refused",
+      { /* there is no NAMED function anywhere in this program - the lambda
+         * is the whole call graph, and nothing but the binding can reach
+         * it, so the failure is as certain as any */
+        "var f = func() { return g; };",
+        "var dyn t = f();",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    { "alias: a CHAIN of write-once names is refused",
+      { /* f2 -> f -> fetch. The chain resolves because the index is built
+         * in statement ORDER, so each link sees the one above it - which
+         * is also exactly when the link holds a value at all */
+        "func fetch() { return g; }",
+        "var f = fetch;",
+        "var f2 = f;",
+        "var dyn t = f2();",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    { "alias: a chain link declared BELOW its use does not resolve",
+      { /* `f2 = f` runs before `f` is bound, so f2 holds nothing this pass
+         * can name - the TDZ refuses the read of `f` first, and that is the
+         * correct cause to report */
+        "func fetch() { return g; }",
+        "var f2 = f;",
+        "var f = fetch;",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
     { "alias: declines when the name is REASSIGNED (not write-once)",
       { /* f holds `other` by the time it is called, and `other` never reads
          * g - so proving anything from `fetch` would be simply wrong */
@@ -17052,7 +17079,20 @@ static bool deep_nesting_refused()
  */
 static bool unbound_call_warnings()
 {
-    struct Case { const char *what; std::vector<const char *> lines; int n; };
+    /*
+     * `n` warnings, each containing `needle`. The needle is what separates
+     * the two STRENGTHS - "may fail" is the definite statement (the callee
+     * is known and provably reaches a later global on some path), "might
+     * fail" the weak one (the callee is NOT known, so the warning is
+     * allowed to be a false positive). A bare count cannot tell them apart,
+     * and a case that means one must not be satisfied by the other.
+     */
+    struct Case {
+        const char *what;
+        std::vector<const char *> lines;
+        int n;
+        const char *needle = "may fail";
+    };
 
     const Case cases[] = {
         { "a CONDITIONAL call to a function reading a later global",
@@ -17112,15 +17152,58 @@ static bool unbound_call_warnings()
             "var f = fetch;",
             "if (runtime(0) > 1) { var dyn t = f(); }",
             "var g = 5;" }, 1 },
-        { /* ... and a REASSIGNED name is no alias, so it must stay quiet:
-           * warning about `fetch` here would be warning about a function
-           * this call cannot reach */
-          "a reassigned name is not an alias",
+        { /* ... and a REASSIGNED name is no alias, so the DEFINITE statement
+           * cannot be made: `f` holds `other` here, which never reads g.
+           * It drops to the weak arm - the callee really is one this pass
+           * cannot name, which is what "might" says */
+          "a reassigned name drops to the weak arm",
           { "func fetch() { return g; }",
             "func other() { return 7; }",
             "var f = fetch;",
             "f = other;",
             "if (runtime(0) > 1) { var dyn t = f(); }",
+            "var g = 5;" }, 1, "might fail" },
+
+        /*
+         * THE WEAK ARM (#146). A callee this pass cannot name could run
+         * anything, so the honest statement names a global that SOME
+         * function reads and says "might". False positives are accepted
+         * here by design; what is NOT accepted is warning about a call that
+         * obviously reaches no MyLang code at all - see the quiet cases.
+         */
+        { "an element of a container",
+          { "func fetch() { return g; }",
+            "var ops = [fetch];",
+            "var dyn t = ops[0]();",
+            "var g = 5;" }, 1, "might fail" },
+        { "a callee that arrived as a PARAMETER",
+          { "func fetch() { return g; }",
+            "func run(fn) { var r = fn(); return r; }",
+            "var dyn t = run(fetch);",
+            "var g = 5;" }, 1, "might fail" },
+        { "an alias declared INSIDE a body (only top-level ones resolve)",
+          { "func fetch() { return g; }",
+            "func outer() { var f = fetch; var r = f(); return r; }",
+            "var dyn t = outer();",
+            "var g = 5;" }, 1, "might fail" },
+        /* ... and the quiet ones. A BUILTIN is C++ and reads no MyLang
+         * global; a STRUCT construction binds fields and calls nothing.
+         * Warning about either would fire on nearly every program and bury
+         * the diagnostic this tier exists to deliver. */
+        { "a builtin call is not an unknown callee",
+          { "func fetch() { return g; }",
+            "print(len(\"ab\"), abs(-3));",
+            "var g = 5;" }, 0 },
+        { "a struct construction is not an unknown callee",
+          { "struct P { int x; }",
+            "func fetch() { return g; }",
+            "var p = P(1);",
+            "var g = 5;" }, 0 },
+        { "no later global is READ anywhere, so nothing to warn about",
+          { /* the callee is just as unknown, but no function reads `g` -
+             * an opaque call cannot fail on a global nobody touches */
+            "var ops = [func() { return 1; }];",
+            "var dyn t = ops[0]();",
             "var g = 5;" }, 0 },
     };
 
@@ -17154,12 +17237,21 @@ static bool unbound_call_warnings()
             ok = false;
         }
         /* a warning with no location is barely a warning */
-        for (const CompileWarning &w : g_warnings)
+        for (const CompileWarning &w : g_warnings) {
             if (!w.start || !w.msg) {
                 fprintf(stderr, "warn: '%s': a warning with no loc/msg\n",
                         c.what);
                 ok = false;
+                continue;
             }
+            /* the STRENGTH must match: a "might" must not satisfy a case
+             * that means the definite statement, nor the other way round */
+            if (!strstr(w.msg, c.needle)) {
+                fprintf(stderr, "warn: '%s': expected '%s', got '%s'\n",
+                        c.what, c.needle, w.msg);
+                ok = false;
+            }
+        }
         g_warnings.clear();
     }
 
