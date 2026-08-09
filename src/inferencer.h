@@ -97,6 +97,26 @@ extern unsigned g_opt_disabled;
  * opt-in half - see strict_forward_globals in resolver.cpp). */
 extern bool g_strict_mode;
 
+/*
+ * COMPILE WARNINGS (step 7 tier 3). The three tiers are: a violation decided
+ * by a SPECIFIED rule is a hard error (FIX-1, the TDZ), a failure a heuristic
+ * can PROVE is a hard error too (prove_unbound_calls), and anything merely
+ * SUSPICIOUS is a warning, in GCC's spirit ("this variable might be
+ * uninitialized").
+ *
+ * COLLECTED, not printed at the raise site: the compiler has no diagnostic
+ * stream of its own, and a pass that wrote to stderr directly would be
+ * untestable and would interleave with a script's own output. The driver
+ * drains the list and renders each one with the same caret machinery errors
+ * use; the `-rt` harness reads it instead.
+ */
+struct CompileWarning {
+    const char *msg;    /* interned (intern_msg) - stable for the program */
+    Loc start, end;
+};
+extern std::vector<CompileWarning> g_warnings;
+void compile_warn(const char *msg, Loc start, Loc end);
+
 /* Map a CLI name ("licm", "slice-hoist", "for-range", "typed", "all") to its
  * bit. Returns false for an unknown name. `names` for --help/diagnostics. */
 bool opt_pass_bit(const std::string &name, unsigned &bit);

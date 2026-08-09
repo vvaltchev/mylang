@@ -488,9 +488,14 @@ Each lands as its OWN commit.
    ergonomic cost the plan worried about does not appear in this corpus
    (which does not prove it is rare in general - the corpus was written
    by one author).
-   STILL OPEN in step 7: transitivity (a global read by a function the
-   callee calls), call sites below the top level, and the WARNING tier
-   for the merely suspicious.
+   **The WARNING tier LANDED** (`warn_unbound_calls` + `g_warnings`):
+   the residue the prover declines - a conditional call, a conditional
+   read, a call in a loop body - is reported rather than left silent.
+   The two tiers cannot double-report, since the prover throws on
+   everything it proves. Measured: 0 of 95 corpus programs warn.
+   STILL OPEN in step 7: TRANSITIVITY (a global read by a function the
+   callee calls) - reported by neither tier, and pinned by a test that
+   expects zero so adding it has something that notices.
 
 ## Known residuals (accepted)
 

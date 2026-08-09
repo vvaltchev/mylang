@@ -435,6 +435,16 @@ if (ready()) { var dyn t = fetch(); }   # may or may not fail: run-time check
 var g = 5;
 ```
 
+Where it *cannot* decide but the shape is suspicious, the compile emits a
+**warning** (to stderr, with a caret, non-fatal) rather than staying silent:
+
+```
+warning: this call may fail: g is not bound until later at line 3, col 28
+
+    if (ready()) { var dyn t = fetch(); }
+                               ^^^^^^^^
+```
+
 Catching `UnboundSymbolEx` should be **very rare** in real code. It exists for
 the residue the compiler cannot decide; the provable cases never get that far.
 

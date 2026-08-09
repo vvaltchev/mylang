@@ -6028,6 +6028,13 @@ unsigned g_opt_disabled = 0;
  * threading a flag through run_optimizers' callers buys nothing. */
 bool g_strict_mode = false;
 
+std::vector<CompileWarning> g_warnings;
+
+void compile_warn(const char *msg, Loc start, Loc end)
+{
+    g_warnings.push_back(CompileWarning{ msg, start, end });
+}
+
 bool opt_pass_bit(const std::string &name, unsigned &bit)
 {
     static const struct { const char *n; unsigned b; } tbl[] = {
