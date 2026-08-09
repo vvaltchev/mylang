@@ -246,6 +246,34 @@ proven-float flat store has no boxed fallback by design). Fixed - the
 int subterm compiles as an int operand, which every float reader
 promotes; pinned by a 5-mode differential entry.
 
+## #95 cases 3 + 4 - promote + slice arms; THE MATRIX IS COMPLETE
+## (landed 2026-08-02)
+
+The nested read's INT row under LoadElem2Float promotes inline
+(cvtsi2sd), and SLICE bases read inline at all three sites: the
+single-level LoadElemInt/Float arm, and the nested read's OUTER-slice
+and ROW-slice arms (the outer arm rejoins the common row section, so
+slice-of-slices composes). A slice's elements live at data + (off + i)
+and its bounds are the handle's u32 LEN, not the vector's size (probed
+as arr_off_off/arr_len_off). Declines that stay on the helper: negative
+indexes (the wrap), bool/other-kind slices, promote-under-slice.
+
+Sabotage-verified: the promote arm (count 16 -> 0), the OFF addition in
+both slice arms (parent-element value divergence - the 608 pattern),
+and the LEN bound (a vector-size bound silently served sl[len]: count
+17 and a missed OOB). The #56 slow-tier test's proof shape moved from
+the slice to the negative wrap.
+
+MEASURED (callgrind Ir, OPT=1 ASSERTS=0 both sides):
+15_array_slice_readonly **-41.0%** (63.4M -> 37.4M); 14/43/46/18/01/16
+all +-0.01%; the case-1/2 store restructure itself neutral-to-better
+vs pre-#95.
+
+The matrix's remaining DELIBERATE helper declines, each documented at
+its emit site: float `%=` (fmod), nested float div/mod compound, chain
+stores (N-level, data-driven walk), bool slices, promote-under-slice,
+literal 0/-1 divisors. Dict load/store probes are a different arc.
+
 ## A trap in the TEST, worth avoiding next time
 
 The first version of the decline cases counted every store in the whole
