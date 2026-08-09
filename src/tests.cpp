@@ -4581,6 +4581,59 @@ static const std::vector<test> tests =
         "var g = 5;" },
       &typeid(UnboundSymbolEx), 26, 1, 28, 1 },
     /*
+     * #135 - `defined()`-GUARDED NARROWING. A name declared NOWHERE is a
+     * compile error (FIX-1), which left no way to feature-test one. The name
+     * that was CHECKED is tolerated - and nothing else, so the typo
+     * protection is intact. Dart's promote-after-a-test, not "dead code may
+     * say anything".
+     *
+     * The code still VANISHES: `defined(x)` on a nonexistent name folds to
+     * false and the DCE drops the branch. Narrowing only lets it COMPILE.
+     */
+    { "guard: defined(x) tolerates x in the THEN branch",
+      { "if (defined(x)) { print(x); }", "assert(1 == 1);" } },
+    { "guard: each name needs its own check",
+      { "if (defined(x) && defined(y)) { print(x, y); }",
+        "assert(1 == 1);" } },
+    { "guard: a later conjunct of the same && chain is covered",
+      { /* isbound is deliberately NOT FIX-1-exempt, so without this the
+         * idiom for a maybe-absent name would not compile */
+        "if (defined(x) && isbound(x)) { print(x); }",
+        "assert(1 == 1);" } },
+    /*
+     * The POLARITY cases - each must STILL be refused, or the narrowing has
+     * become the blanket rule the maintainer rejected.
+     *
+     * EVERY ONE USES A GUARD THAT IS *TRUE* (`v` exists), so the branch
+     * holding the bad name is NEVER TAKEN at run time. Without that the test
+     * is VACUOUS: a tolerated name in a script stays unresolved and throws
+     * UndefinedVariableEx at RUN time, the same type the compile refusal
+     * throws - so the assertion passes whether the compiler refused the
+     * program or merely let it fail later. Watched: with the polarity
+     * deliberately broken, the first version of these cases stayed green.
+     */
+    { "guard: an UNCHECKED name in the same branch is still an error",
+      { "var v = 1;", "if (defined(v)) { print(v, y); }" },
+      &typeid(UndefinedVariableEx) },
+    { "guard: the ELSE arm proves nothing",
+      { "var v = 1;", "if (defined(v)) { } else { print(x); }" },
+      &typeid(UndefinedVariableEx) },
+    { "guard: !defined(x) proves nothing",
+      { "var v = 1;", "if (!defined(v)) { print(v); } else { print(x); }" },
+      &typeid(UndefinedVariableEx) },
+    { "guard: an || branch proves nothing (it can be taken either way)",
+      { "var v = 1;",
+        "if (defined(x) || runtime(0) > 1) { print(x); }" },
+      &typeid(UndefinedVariableEx) },
+    { "guard: the guard does not outlive the branch",
+      { "var v = 1;", "if (defined(v)) { }",
+        "if (runtime(0) > 1) { print(x); }" },
+      &typeid(UndefinedVariableEx) },
+    { "guard: a name that DOES exist is unaffected",
+      { "var x = 7;", "var seen = 0;",
+        "if (defined(x)) { seen = x; }", "assert(seen == 7);" } },
+
+    /*
      * #137 - A DEGENERATE PROGRAM MUST NOT CRASH THE INTERPRETER. Every input
      * ends in a DEFINED outcome - a compile refusal, a thrown exception, or a
      * clean run - never a C-level crash (RULE 1).
@@ -16847,6 +16900,73 @@ static bool deep_nesting_refused()
     return ok;
 }
 
+/*
+ * #135 POLARITY: a `defined()` guard vouches for its name in the THEN branch
+ * and the rest of its own `&&` chain - NOWHERE else.
+ *
+ * Compiled ONLY (parse + infer + resolve, never run), which is the whole
+ * point: in a script a TOLERATED name stays unresolved and throws
+ * UndefinedVariableEx at RUN time - the same type the compile refusal throws.
+ * A `tests` entry cannot tell the two apart, so a polarity case written there
+ * passes whether the compiler refused the program or merely let it fail
+ * later. Watched: with the else-arm polarity deliberately broken, the
+ * `tests`-entry version of these stayed green.
+ */
+static bool defined_guard_polarity()
+{
+    struct Case { const char *what; const char *src; bool refused; };
+
+    const Case cases[] = {
+        /* the guard DOES cover these */
+        { "the THEN branch",
+          "if (defined(x)) { print(x); }", false },
+        { "a later conjunct of the same && chain",
+          "if (defined(x) && isbound(x)) { print(x); }", false },
+        { "each name checked separately",
+          "if (defined(x) && defined(y)) { print(x, y); }", false },
+        /* ... and NOT these */
+        { "an unchecked name in the guarded branch",
+          "if (defined(x)) { print(x, y); }", true },
+        { "the ELSE arm",
+          "if (defined(x)) { } else { print(x); }", true },
+        { "a negated guard",
+          "if (!defined(x)) { print(x); }", true },
+        { "an || chain (the branch can be taken either way)",
+          "if (defined(x) || runtime(1) > 0) { print(x); }", true },
+        { "after the if",
+          "if (defined(x)) { } print(x);", true },
+        { "a NESTED if's else, inside a guarded branch",
+          "if (defined(x)) { if (runtime(1) > 0) { } else { print(y); } }",
+          true },
+    };
+
+    bool ok = true;
+
+    for (const Case &c : cases) {
+        bool refused = false;
+        try {
+            std::vector<Tok> toks;
+            std::string src(c.src);
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get());
+            resolve_names(root.get());
+        } catch (const Exception &) {
+            refused = true;
+        }
+        if (refused != c.refused) {
+            fprintf(stderr, "guard polarity: '%s': %s, expected %s\n",
+                    c.what, refused ? "refused" : "accepted",
+                    c.refused ? "refused" : "accepted");
+            ok = false;
+        }
+    }
+
+    return ok;
+}
+
 static bool strict_forward_decl_shapes()
 {
     struct Case {
@@ -27264,6 +27384,7 @@ static const std::vector<extra_check> extra_checks =
       strict_forward_decl_shapes },
     { "parser: deep nesting is REFUSED, never a crash (#137)",
       deep_nesting_refused },
+    { "opt: defined()-guard polarity (#135)", defined_guard_polarity },
     { "builtins: dev-only show() reserved in a script",
       dev_builtin_reserved_in_script },
     { "builtins: lazy-arg builtins are not values in a script (F1)",

@@ -456,6 +456,21 @@ keeps working), and so is a lazy builtin's argument: `isbound(g)` asks *about*
 `g` rather than reading it, which is how a program copes with an order it
 cannot change.
 
+**`defined()` lets you feature-test a name.** Since a name declared nowhere is
+refused, `defined(x)` is the way to ask about one — and inside the branch it
+guards, *that* name is tolerated:
+
+```C#
+if (defined(x)) { print(x); }        # fine - `x` was checked
+if (defined(x)) { print(x, y); }     # ERROR: `y` was not
+if (defined(x) && defined(y)) { print(x, y); }   # fine - both were
+```
+
+Only the checked name, only in the branch the check proves: the `else` arm,
+`!defined(x)`, an `||` chain, and anything after the `if` are unaffected. When
+`x` really does not exist the guarded code is also *deleted* — `defined(x)`
+folds to `false` and the dead branch is dropped.
+
 **Nesting is bounded.** Expressions and blocks may nest up to 256 levels; past
 that the program is refused with a syntax error. The limit is far above
 anything written or generated in practice, and exists so that a pathological

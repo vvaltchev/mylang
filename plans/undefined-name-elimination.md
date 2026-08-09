@@ -284,6 +284,11 @@ lazy builtin (unevaluated argument -> `mark_lazy_builtin` + the F1 rule:
 callable directly, never usable as a value). Messages name the symbol:
 `Unbound symbol 'g'`, `Use before binding: 'g'`.
 
+**#135 LANDED 2026-08-09** in the revised (Dart-style narrowing) shape,
+not the early-DCE one - see the task. The polarity cases needed a
+COMPILE-ONLY oracle: a tolerated name throws UndefinedVariableEx at RUN
+time too, so a `tests` entry cannot tell a refusal from a late failure.
+
 **PARKED IDEA, NOT NOW:** a C-`#ifdef`-style `isdefined()` that can ask
 about a name declared NOWHERE without a compile error, so a script can
 feature-test. It needs EARLY dead-code elimination, so the body under the
