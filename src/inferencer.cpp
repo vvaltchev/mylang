@@ -2297,6 +2297,38 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
 
     if (auto *blk = dynamic_cast<Block *>(n)) {
         Scope *inner = new_scope(s);
+
+        /*
+         * PRE-DECLARE this block's NAMED func/struct declarations (#134/#136).
+         * They bind at SCOPE ENTRY at run time (bind_hoistable_decls /
+         * gen_stmts' decls-first emission), and the RESOLVER already hoists
+         * them (hoist_scoped_decls) - the inferencer was the one pass that
+         * still saw them in statement order, and only INSIDE a block:
+         * hoist_globals does exactly this for the root.
+         *
+         * That asymmetry was the bug. A call above the declaration got a
+         * callee whose static type had not settled to `Func`, so
+         * annotate_hints left `vm_direct_func` false and the codegen REFUSED
+         * to lower the call (NotLoweredEx) while the tree-walker ran it - and
+         * a struct used above its `struct` line typed as `none`, so `p.x`
+         * became a bogus NullabilityEx. Measurable as `typestr(inner)`:
+         * "func inner()" before the decl vs "func()->int" after it, where the
+         * top level said "func()->int" in both positions.
+         *
+         * Both declare_* are idempotent (declare_funcdecl returns early when
+         * func_of_decl already has the node; declare_structdecl re-finds the
+         * existing sym), so the in-order walk below is a no-op for these.
+         */
+        for (auto &e : blk->elems) {
+            if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get())) {
+                if (fd->id)
+                    declare_funcdecl(fd, inner);
+            } else if (auto *sd = dynamic_cast<StructDeclStmt *>(e.get())) {
+                if (sd->id)
+                    declare_structdecl(sd, inner);
+            }
+        }
+
         for (auto &e : blk->elems)
             walk_struct(e.get(), inner);
         return;
