@@ -4920,6 +4920,32 @@ struct Codegen {
                 }
             }
 
+        /*
+         * A DEFINITELY-int SUBEXPRESSION - the `(j + 1)` in
+         * `(j + 1) * 1.5`. as_float_operand admits int LEAVES (a slot,
+         * a literal) but an int CHAIN had no arm, so any mixed float
+         * expression with a computed int subterm REFUSED - and since
+         * the boxed catch-all deliberately leaves a proven-float flat
+         * store to compile_float_stmt, the refusal escalated into a
+         * NotLoweredEx on the WHOLE enclosing loop: a legal program the
+         * compiler rejected (found building #95's float matrix test).
+         * Compile it as an int; every float reader (read_float_operand,
+         * the JIT's emit_float_load) PROMOTES an int slot at runtime.
+         * definitely_int (never bool) is the gate: a bool payload is
+         * not a valid float operand. A literal result folds to a
+         * float literal (belt - const-folding already ate those).
+         */
+        if (definitely_int(e)) {
+            Operand iop;
+            if (compile_int_expr(e, iop, ops)) {
+                out = iop.is_lit
+                    ? float_lit(static_cast<float_type>(iop.lit))
+                    : iop;
+                return true;
+            }
+            return false;
+        }
+
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
         if (!t || t->kind != TypeHint::f)
             return false;

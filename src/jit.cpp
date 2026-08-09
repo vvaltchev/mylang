@@ -51,6 +51,8 @@ unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
+unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
+unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 }
@@ -826,6 +828,11 @@ struct Emitter {
      * the compound direction: el = el OP rhs, el in xmm1, rhs in xmm0 */
     void farith_x1_x0(uint8_t op) { u8(0xF2); u8(0x0F); u8(op); u8(0xC8); }
     void pxor_x1() { u8(0x66); u8(0x0F); u8(0xEF); u8(0xC9); }
+    /* ---- #95, the nested-STORE tier (boxed slot type guards in rdx) ---- */
+    void cmp_rdx_rsi() { u8(0x48); u8(0x39); u8(0xF2); }
+    void cmp_rdx_r8()  { u8(0x4C); u8(0x39); u8(0xC2); }
+    void cmp_rdx_r9()  { u8(0x4C); u8(0x39); u8(0xCA); }
+    void mov_rdi_rcx() { u8(0x48); u8(0x89); u8(0xCF); }  /* prep: &row */
     /* cmp rax, rcx / test rax, rax */
     void cmp_rax_rcx() { u8(0x48); u8(0x39); u8(0xC8); }
     void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
@@ -3982,6 +3989,267 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     dones.push_back(e.jmp32());
 }
 
+/*
+ * #95 case 2 - the INLINE tier for the nested STORE `a[i][j] = v` /
+ * `a[i][j] OP= v` (StoreElem2V). The read side (#93) got its tier; the
+ * store never did - every nested store paid the full helper, which
+ * redoes both levels of the managed model per element.
+ *
+ * The fast shape: k1/k2 INT slots, OUTER a non-slice non-readonly
+ * GENERAL array (rows are boxed LValues at stride 48), ROW a non-const
+ * non-readonly flat int/bool/float array, the VALUE fitting the row's
+ * kind (int row: t_int; bool row: t_bool; float row: t_float, or t_int
+ * which PROMOTES via cvtsi2sd - the interpreter's own float-arm cast).
+ * The row's COW pair (slice flag / live views) goes to the SHARED prep
+ * (jit_store_elem_prep on &row - the row LValue address is stable
+ * across the clone, but the retry re-derives it anyway).
+ *
+ * GUARD ORDER is the load-bearing part, same invariant as the
+ * single-level tier: every condition the interpreter throws on WITHOUT
+ * cloning must be checked (or declined) BEFORE the prep jumps - row
+ * const/readonly, the row KIND (a structs row throws its type error
+ * before any clone), the value-FIT (flat_store_core checks `fits`
+ * before COW), and a compound div/mod ZERO divisor (apply_compound_op
+ * throws before the clone). OOB is safe by construction: prep
+ * bounds-checks in C++ before cloning.
+ *
+ * Compound: the Expr14 op maps to the base op; the int arm does the
+ * same RMW as the single-level tier with the same 0/-1 runtime divisor
+ * declines; the FLOAT arm refuses div/mod at emit time (the zero test
+ * on a maybe-promoted boxed value is not worth the code - the helper
+ * serves it); a BOOL row refuses any compound (bool + int -> int does
+ * not fit, the interpreter's own exclusion).
+ *
+ * Registers: rax outer-type/outer-shobj/row-type/row-shobj, rcx
+ * outer-data -> &row (alive until the COW guards are done - prep needs
+ * it) -> inner data, rdx val-type guard then byte-length/count, r9
+ * t_arr/t_bool immediates + both indexes, rdi the int/bool value,
+ * xmm0/xmm1 the float value/element. rsi (t_int) and r8 (t_float) are
+ * RESERVED reads; the prep stub's epilogue re-materialises them.
+ */
+static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
+                                    std::vector<size_t> &slows,
+                                    std::vector<size_t> &dones)
+{
+    /* the Expr14 op -> the base op (Op::invalid == plain assign) */
+    Op bop;
+    switch (in.aop) {
+    case Op::assign: bop = Op::invalid; break;
+    case Op::addeq:  bop = Op::plus;    break;
+    case Op::subeq:  bop = Op::minus;   break;
+    case Op::muleq:  bop = Op::times;   break;
+    case Op::diveq:  bop = Op::div;     break;
+    case Op::modeq:  bop = Op::mod;     break;
+    default: return false;                     /* helper-only */
+    }
+    const bool compound = bop != Op::invalid;
+    const bool divmod = bop == Op::div || bop == Op::mod;
+
+    const JitLayout &L = jit_layout();
+    const SlotAddr base = slot_addr(in.target2);
+    const SlotAddr k1 = slot_addr(in.a_dual_lo());
+    const SlotAddr k2 = slot_addr(in.b_slot());
+    const SlotAddr val = slot_addr(in.target);
+    const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
+    const auto decline_if = [&](uint8_t cc) { slows.push_back(e.j32(cc)); };
+    std::vector<size_t> preps;
+
+    const size_t retry = e.pos();
+    /* both keys must be plain ints (boxed slots - the interpreter's
+     * "Expected integer as subscript" declines to the helper) */
+    e.load(RAX, k1.type);
+    e.cmp_rax_rsi();
+    decline_ne();
+    e.load(RAX, k2.type);
+    e.cmp_rax_rsi();
+    decline_ne();
+
+    /* OUTER: an array, not a slice, not readonly, GENERAL storage */
+    e.load(RAX, base.type);
+    e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rax_r9();
+    decline_ne();
+    e.cmp_byte_slot(base.payload + L.slice_off, 0);
+    decline_ne();
+    e.load(RAX, base.payload);                 /* outer SharedObject */
+    e.cmp_byte_rax(L.ro_off, 0);
+    decline_ne();                              /* readonly outer: rvalue */
+    e.cmp_byte_rax(L.kind_off, L.kind_general);
+    decline_ne();
+
+    /* the row: data + k1 * sizeof(LValue), bounds by byte length */
+    e.mov_rcx_rax(L.data_off);
+    e.mov_rdx_rax(L.data_off + 8);
+    e.sub_rdx_rcx();
+    load_slot_r9(e, in.a_dual_lo());
+    e.imul_r9_imm8(static_cast<uint8_t>(sizeof(LValue)));
+    e.cmp_r9_rdx();
+    slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
+    e.add_rcx_r9();                            /* rcx = &row (LValue) */
+
+    /* ROW: an array, not const, not readonly */
+    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_type));
+    e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rax_r9();
+    decline_ne();
+    e.cmp_byte_rcx(L.lv_const_off, 0);
+    decline_ne();
+    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_payload));  /* row shobj */
+    e.cmp_byte_rax(L.ro_off, 0);
+    decline_ne();
+
+    /* the row's COW pair -> prep; every arm shares one stub */
+    const auto cow_guards = [&]() {
+        e.cmp_byte_rcx(static_cast<int32_t>(L.off_payload) + L.slice_off, 0);
+        preps.push_back(e.j32(0x75));
+        e.cmp_byte_rax(L.slices_off, 0);
+        preps.push_back(e.j32(0x75));
+    };
+    const auto bump = [&]() {
+#ifdef TESTS
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store2_fast));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x02);
+#endif
+    };
+    /* inner data/count/index/bounds (clobbers rcx - after cow_guards) */
+    const auto inner_bounds = [&](bool bytes) {
+        e.mov_rcx_rax(L.data_off);
+        e.mov_rdx_rax(L.data_off + 8);
+        e.sub_rdx_rcx();
+        if (!bytes)
+            e.sar_rdx_3();
+        load_slot_r9(e, in.b_slot());
+        e.cmp_r9_rdx();
+        slows.push_back(e.j32(0x73));
+    };
+
+    /* per-kind arms; kind dispatch BEFORE the COW guards (see above) */
+    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    const size_t j_ints = e.j32(0x74);
+    if (!compound) {
+        e.cmp_byte_rax(L.kind_off, L.kind_bools);
+        const size_t j_bools = e.j32(0x74);
+        e.cmp_byte_rax(L.kind_off, L.kind_floats);
+        decline_ne();
+
+        /* --- FLOAT row, plain: value promotes like the interpreter --- */
+        e.load(RDX, val.type);
+        e.cmp_rdx_r8();                        /* t_float? */
+        const size_t j_vf = e.j8(0x74);
+        e.cmp_rdx_rsi();                       /* t_int? (promote) */
+        decline_ne();
+        e.cvt(X0, val.payload);                /* cvtsi2sd xmm0, [val] */
+        const size_t j_vgot = e.j8(0xEB);
+        e.patch8(j_vf, e.pos());
+        e.fload(X0, val.payload);              /* movsd xmm0, [val] */
+        e.patch8(j_vgot, e.pos());
+        cow_guards();
+        inner_bounds(/*bytes=*/false);
+        bump();
+        e.store_elem_float_x0();
+        e.mov_byte_rax_imm(L.hashv_off, 0);
+        dones.push_back(e.jmp32());
+
+        /* --- BOOL row, plain: value must BE a bool (an int does not
+         * fit - the interpreter's own rule); payload is already 0/1 --- */
+        e.patch32_here(j_bools);
+        e.load(RDX, val.type);
+        e.movabs_r9(reinterpret_cast<uint64_t>(L.t_bool));
+        e.cmp_rdx_r9();
+        decline_ne();
+        e.load(RDI, val.payload);
+        cow_guards();
+        inner_bounds(/*bytes=*/true);
+        bump();
+        e.store_elem_byte_dil();
+        e.mov_byte_rax_imm(L.hashv_off, 0);
+        dones.push_back(e.jmp32());
+    } else if (!divmod) {
+        /* compound float rows: add/sub/mul only (div/mod: the zero test
+         * on a maybe-promoted boxed value stays on the helper) */
+        e.cmp_byte_rax(L.kind_off, L.kind_floats);
+        const size_t j_floats = e.j32(0x74);
+        decline_if(0xEB);                      /* other kinds: helper */
+        e.patch32_here(j_floats);
+        e.load(RDX, val.type);
+        e.cmp_rdx_r8();
+        const size_t j_vf = e.j8(0x74);
+        e.cmp_rdx_rsi();
+        decline_ne();
+        e.cvt(X0, val.payload);
+        const size_t j_vgot = e.j8(0xEB);
+        e.patch8(j_vf, e.pos());
+        e.fload(X0, val.payload);
+        e.patch8(j_vgot, e.pos());
+        cow_guards();
+        inner_bounds(/*bytes=*/false);
+        bump();
+        e.mov_byte_rax_imm(L.hashv_off, 0);
+        e.load_elem_float_x1();                /* xmm1 = elem */
+        e.farith_x1_x0(bop == Op::plus  ? 0x58
+                     : bop == Op::minus ? 0x5C : 0x59);
+        e.store_elem_float_x1();
+        dones.push_back(e.jmp32());
+    } else {
+        decline_if(0xEB);                      /* div/mod: ints only */
+    }
+
+    /* --- INT row (plain or compound) --- */
+    e.patch32_here(j_ints);
+    e.load(RDX, val.type);
+    e.cmp_rdx_rsi();
+    decline_ne();
+    e.load(RDI, val.payload);
+    if (divmod) {
+        e.cmp_rdi_imm8(0);
+        decline_if(0x74);
+        e.cmp_rdi_imm8(-1);
+        decline_if(0x74);
+    }
+    cow_guards();
+    inner_bounds(/*bytes=*/false);
+    bump();
+    e.mov_byte_rax_imm(L.hashv_off, 0);
+    switch (bop) {
+    case Op::invalid:
+        e.store_elem_int_rdi();
+        break;
+    case Op::div: case Op::mod:
+        e.load_elem_int();
+        e.cqo();
+        e.idiv_rdi();
+        if (bop == Op::div)
+            e.store_elem_int_rax();
+        else
+            e.store_elem_int_rdx();
+        break;
+    default:
+        e.load_elem_int();
+        if (bop == Op::plus)       e.add_rax_rdi();
+        else if (bop == Op::minus) e.sub_rax_rdi();
+        else                       e.imul_rax_rdi();
+        e.store_elem_int_rax();
+        break;
+    }
+    dones.push_back(e.jmp32());
+
+    /* the shared PREP stub: rdi = &row, rsi = the inner index */
+    for (const size_t j : preps)
+        e.patch32_here(j);
+    emit_call_prologue(e);
+    e.mov_rdi_rcx();                           /* &row (still live here) */
+    load_slot_r9(e, in.b_slot());
+    e.mov_rsi_r9();
+    e.call_relocs.push_back(
+        { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
+    e.u8(0xE8); e.u32(0);
+    emit_call_epilogue(e);
+    e.u8(0x85); e.u8(0xC0);                    /* test eax, eax */
+    slows.push_back(e.j32(0x75));              /* jnz -> the full helper */
+    e.jmp32_to(retry);
+    return true;
+}
+
 static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
                             uint32_t pc, size_t old_pc, bool is_float)
 {
@@ -4478,7 +4746,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::StoreElem2V:
         /* a[i][j] = v via jit_store_elem2(base_slot=target2, k1=a_dual_lo,
          * k2=b_slot, val=target, aop, locs=chain_locs[a_dual_hi].data()). LOCAL
-         * base (no kind). r8=aop, r9=the per-step caret buffer (baked). */
+         * base (no kind). r8=aop, r9=the per-step caret buffer (baked).
+         * #95: the INLINE fast tier first; every declined guard lands on
+         * the helper, whose per-level OOB carets stay byte-identical. */
+        {
+        std::vector<size_t> s2_slows, s2_dones;
+        emit_store_elem2_inline(e, in, s2_slows, s2_dones);
+        for (const size_t j : s2_slows)
+            e.patch32_here(j);
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
         e.movabs(RSI, static_cast<uint64_t>(
@@ -4498,6 +4773,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_exc_stamp(e, ck, old_pc);  /* cold: own caret */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
+        }
+        for (const size_t j : s2_dones)       /* #95: fast tails rejoin */
+            e.patch32_here(j);
         }
         return true;
 
@@ -6926,6 +7204,8 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
         case OpCode::MathFnV:            /* N6a: writes a float -> needs r8 */
         case OpCode::StoreElemFloat:     /* reads a float rhs -> needs r8 */
         case OpCode::LoadElem2Float:     /* #94 inline tier: float dst */
+        case OpCode::StoreElem2V:        /* #95 inline tier: the float-row
+                                          * arm's val-type guard reads r8 */
         case OpCode::LoadMemberFloat:    /* baked fast path: float store */
             return true;
         case OpCode::StructCtorV:        /* a planned float field reads via

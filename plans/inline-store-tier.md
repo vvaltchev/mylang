@@ -221,6 +221,31 @@ locals (`var z = 1; z = n - n;`).
 No suite bench compounds into an array element (62's `+=` is a DICT
 store) - the value is reach + parity, like prep.
 
+## #95 case 2 - the NESTED store tier (landed 2026-08-02)
+
+`a[i][j] = v` / `OP= v` (StoreElem2V) gets the same treatment: the #93
+outer navigation (general array, byte-length bounds, &row), then the
+single-level store discipline on the row - const/readonly guards, KIND
+and value-FIT and divisor guards all BEFORE the prep jumps (everything
+the interpreter throws on without cloning), the shared prep on &row,
+per-kind tails with the int RMW and the cvtsi2sd promote arm for an int
+value into a float row. Chain stores (N-level) stay helper-only by
+decision: data-driven walk, rare shape.
+
+Sabotage-verified: row has_slices (slice oracle + prep), promote arm
+(exact count), BOTH prep orderings (fit-before-cow, divisor-before-cow:
+prep=0 fired each), divisor guards (ASan FPE). The OUTER-readonly guard
+turned out SUBSUMED by the row's (deep const freezes every level, so a
+readonly outer implies readonly rows) - kept as defense in depth,
+honestly recorded as unprovable in isolation.
+
+Building the float coverage EXPOSED a pre-existing no-fail-contract
+bug: `row[j] = (j + 1) * 1.5` was REFUSED at compile time
+(compile_float_expr had no arm for an int CHAIN subexpression, and a
+proven-float flat store has no boxed fallback by design). Fixed - the
+int subterm compiles as an int operand, which every float reader
+promotes; pinned by a 5-mode differential entry.
+
 ## A trap in the TEST, worth avoiding next time
 
 The first version of the decline cases counted every store in the whole
