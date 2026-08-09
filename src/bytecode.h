@@ -1128,6 +1128,37 @@ enum class OpCode : unsigned char {
     ExitBlock,
 
     /*
+     * The NESTED-READ FUSION (plans/unboxing.md option A): `dst =
+     * base[i][j]` in ONE op, the read-side twin of StoreElem2V. Without it
+     * the pair is `LoadElemValue t = base[i]` then `LoadElemInt dst = t[j]`
+     * - and materialising `t` costs a helper call, an intrusive_ptr retain,
+     * a 32-byte EvalValue copy, a live-slices registration and a release
+     * next iteration, for a row that is ALIVE FOR EXACTLY ONE INSTRUCTION.
+     * The fused op BORROWS the row instead: a raw `const EvalValue &` into
+     * the outer array's storage that never leaves the op.
+     *
+     * Sound because nothing can run in between: the borrow is taken and
+     * consumed inside one instruction (no user code, no allocation, no
+     * mutation, no unwinding), the OUTER array holds the row's reference
+     * throughout, the op only READS so it can trigger no copy-on-write
+     * detach, and it creates no VIEW so there is nothing to register in the
+     * parent's live-slices set.
+     *
+     * `target` = dst slot, `target2` = the base array slot, `a` DUAL =
+     * (the outer index SLOT, the chain_locs pool idx), `b` = the inner
+     * index operand (slot or int literal). The two levels need DIFFERENT
+     * carets - an OOB on `i` must report the `base[i]` span and one on `j`
+     * the whole `base[i][j]` span - which one loc-table entry per pc cannot
+     * hold, so the pair comes from `chain_locs` exactly as the store side's
+     * per-step carets do. That is also why the outer index is restricted to
+     * a slot: the dual spends `a`'s payload. Any other shape (a literal
+     * outer index, a non-array level, a dict) simply keeps the unfused
+     * pair, byte-identically.
+     */
+    LoadElem2Int,
+    LoadElem2Float,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1177,7 +1208,7 @@ enum class OpCode : unsigned char {
     X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV) X(MathFnV) \
     X(LoadMemberInt) X(LoadMemberFloat) X(IntAddModRI) X(JumpUnlessElemInt) \
     X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative) \
-    X(ExitBlock)
+    X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin

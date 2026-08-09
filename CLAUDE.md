@@ -3077,6 +3077,72 @@ exactly ONE program in bench/ + samples/ (46) - a narrow blast radius by
 construction, and every other program's output is byte-identical to the
 pre-LICM binary.
 
+**THE NESTED-READ FUSION - `LoadElem2Int`/`LoadElem2Float` (2026-08-01,
+plans/unboxing.md option A).** LICM above removes the row read whose index
+is loop-INVARIANT (`a[i][k]` in the k-loop). What it cannot touch is the
+one whose outer index VARIES with the inner loop - `b[k][j]` - and that is
+where 46_matrix_mult's remaining cost sat: a profile put **61% of the
+inner iteration inside C++ helpers**, ~134 Ir of it in the two-op pair
+`LoadElemValue t = b[k]` + `LoadElemInt dst = t[j]`. Materialising `t`
+costs a helper call, an `intrusive_ptr` retain, a 32-byte `EvalValue`
+copy, the `SharedArrayObjTempl` live-slices registration, and a release
+when the temp is overwritten next iteration - for a row that is **alive
+for exactly one instruction**. C++ gets the row with one `mov`.
+The fused op BORROWS it instead: `vm_elem2_borrow_row` returns a raw
+`const EvalValue &` into the outer array's storage and the scalar read
+runs off that, so nothing is boxed. **The soundness argument is short,
+which is the point:** the borrow is taken and consumed inside ONE
+instruction (no user code, no allocation, no mutation, no unwinding can
+run in between), the OUTER array holds the row's reference throughout,
+the op only READS so it can trigger no copy-on-write detach, and it
+creates no VIEW, so there is nothing to register in the parent's slices
+set. The scalar read itself is the SHARED single-level
+`vm_load_elem_int/float_core`, so the two levels cannot drift.
+**The asymmetry that made this a gap rather than a design choice:** the
+STORE side already did exactly this - `StoreElem2V` walks `a[i][j] = v`
+in one op and `StoreElemChainV` generalises it - and the read side simply
+never got the twin. It also reuses the store side's caret machinery: the
+two levels need DIFFERENT carets (an OOB on `i` reports the `base[i]`
+span, one on `j` the whole `base[i][j]` span) which ONE loc-table entry
+per pc cannot hold, so the pair comes from `chain_locs` exactly as the
+per-step store carets do. That is also what fixes the encoding: `a` is a
+DUAL (outer index SLOT, chain_locs idx), `b` the inner index operand,
+`target2` the base, `target` the dst - so a LITERAL outer index cannot
+ride it and DECLINES to the byte-identical unfused pair, as do a
+non-array level, a dict, and a `dyn` base. A deeper chain fuses its last
+two levels and materialises the rest through `compile_array_base`.
+The JIT emit is a plain helper call (`jit_load_elem2_int/float`): the win
+is the deleted materialisation, not the call, and both indices stay
+cache-aware VALUE args so a matrix loop keeps its counters pinned. It is
+`op_fully_native` - the helper throws WITH the baked per-level caret
+rather than loc-less, and the emit-side stamp (first conveyor wins)
+supplies only the inlined-at chain. myv **v10**: the two opcodes are
+APPENDED, so no ordinal moved and a v9 image would still decode - but the
+version bump is what stops a v9 BINARY from mis-dispatching a v10 image.
+Execution-proven by `g_jit_op_run` in the `jit_load_elem2_native` test
+(the counters are bumped ONLY from emitted code; the interpreted case
+goes straight to the core), plus dual-engine `elem2:` tests for values,
+negative wrap at both levels, ragged rows, a slice base, both OOB carets,
+and the declines. NOTE the test shape: the outer index must vary with the
+INNER loop, or LICM hoists the row before codegen sees a nested read.
+Measured (callgrind Ir, `OPT=1 ASSERTS=0` both sides, scale-1-vs-scale-3
+delta so compile time is excluded; n=70 -> 343k inner iterations per
+scale unit): 46_matrix_mult **221.5 -> 170.5 Ir per inner iteration
+(-23.0%)**, whole-program -12.3% / -17.9% at scale 1 / 3; everything else
+neutral (14_array_subscript +0.03%, 43_sieve +0.04%, 18_foreach_array
++0.02%, 01_while_loop +0.06%, 15_array_slice_readonly -0.55%), so the new
+opcode costs no `vm_dispatch` layout tax. The suite geomean does not move
+and was not expected to - the pair occurs in ONE corpus program, at three
+sites, one hot. **The plan predicted ~90 Ir/iter and that was WRONG:** the
+ceiling was right, the assumption that a HELPER-CALL tier would reach it
+was not. The residual splits as ~87 Ir inside the helper (two levels of
+`is<SharedArrayObj>` + `skind`/`size`/`offset`/`get_vec` + bounds, none of
+it visible through a call boundary), ~22 in `EvalValue::operator=(&&)`
+(the helper's `dst->put()` boxing an int the emit could `store_dst` in two
+stores), and ~54 native. An INLINE tier - the two guard/read sequences,
+helper kept as the slow tier - is worth ~60-80 of those and is scoped in
+plans/unboxing.md.
+
 **Counted-loop specialization (`ForRangeStmt`).** Also in `specialize_types`
 (via `try_for_range`, run on the RAW `for` before its cond/inc are specialized),
 the four hottest loop shapes are rewritten to a dedicated `ForRangeStmt`

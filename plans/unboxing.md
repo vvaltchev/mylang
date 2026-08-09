@@ -141,13 +141,27 @@ of a guess.
        src/disasm.cpp    1024
        src/tests.cpp     15054 (the op-coverage switch) + the new tests
 
-   The JIT emit is the only novel part: two `emit_elem_base_gate` /
-   `emit_elem_int_read` sequences back to back, with the inner base coming
-   from the outer read's general-storage element rather than from a frame
-   slot. Everything else is table plumbing.
+   **LANDED 2026-08-01, and BOTH kinds at once** - the int and float twins
+   share every table entry and one emit case, so splitting them would have
+   cost a second eight-file pass and a second format-version bump for
+   nothing.
 
-3. **`LoadElem2Float`** - the twin, once the int one is green and
-   measured.
+   Two things came out different from the sketch above:
+
+   - **The JIT emit is a plain HELPER CALL**, not the predicted two
+     inlined `emit_elem_base_gate` / `emit_elem_int_read` sequences. The
+     win being bought is the deleted MATERIALISATION (a helper call plus
+     a retain plus a 32-byte copy plus a slices registration plus a
+     release), not the call itself, so the call tier captures it at a
+     fraction of the emitter risk. An inline fast path stays available if
+     a later measurement asks for it.
+   - **The outer index must be a SLOT**, because `a`'s payload is spent
+     on the DUAL (outer index, chain_locs idx). A literal outer index
+     (`m[0][j]`) declines to the unfused pair. Materialising it into a
+     temp was considered and rejected: it trades the fusion's win for an
+     extra op on a shape that is not the target.
+
+3. ~~**`LoadElem2Float`**~~ - done with the int one, see above.
 
 4. **Decline paths.** A non-flat inner, a slice, a dict, a `dyn` base: fall
    to the existing `LoadElemValue` pair, byte-identical. The gate is
@@ -156,17 +170,62 @@ of a guess.
 5. **Measure, then decide** whether a general/`dyn` inner deserves a slow
    tier, and whether B is worth opening.
 
-## Honest expectations
+## Expectations, and what actually happened
 
-  - 46_matrix_mult: ~221 -> ~90 Ir/iter, so **27x -> ~11x**. That is the
-    one bench this targets squarely.
-  - The SUITE geomean will barely move. Very few programs in bench/ +
-    samples/ do nested container reads in a hot loop - step 1 exists to
-    find out exactly how few before any code is written.
-  - **It does NOT touch the other extremes.** 76_funcval_dispatch (23.8x),
+The prediction was **~221 -> ~90 Ir/iter, 27x -> ~11x**. The measurement,
+callgrind Ir at `OPT=1 ASSERTS=0` on both sides, scale-1-vs-scale-3 delta
+so the ~63M compile floor is excluded, n=70 so 343,000 inner iterations
+per scale unit:
+
+    base  75,962,673 Ir/scale   =  221.5 Ir/iter
+    new   58,472,122 Ir/scale   =  170.5 Ir/iter     -23.0%
+
+Whole-program -12.3% at scale 1, -17.9% at scale 3. Everything else is
+neutral: 14_array_subscript +0.028%, 43_sieve +0.037%, 18_foreach_array
++0.023%, 01_while_loop +0.061%, 15_array_slice_readonly -0.546%. So the
+new opcode costs no `vm_dispatch` layout tax.
+
+**The prediction was wrong - 170.5, not 90, so ~21x rather than ~11x.**
+What it got right was the ceiling; what it got wrong was assuming the
+HELPER-CALL tier would reach it. Profiling the result says exactly where
+the remaining 170 sits (scale 3, 1,029,000 inner iterations):
+
+    jit_load_elem2_int (all inlined headers)  89.5M   =  87 Ir/iter
+    EvalValue::operator=(&&)                  23.2M   =  22 Ir/iter
+    the native fragment                       55.3M   =  54 Ir/iter
+
+  - the **22** is `dst->put()` - the helper boxing an int result into the
+    dst LValue. An INLINE emit would `store_dst(rax, target)`: two stores.
+  - the **87** is two levels of `is<SharedArrayObj>` + `skind()` +
+    `size()` + `offset()` + `get_vec()` + bounds check, none of which the
+    emitted code can see through a call boundary.
+
+So the INLINE tier - the two `emit_elem_base_gate` / `emit_elem_int_read`
+sequences the original sketch called for, with the helper kept as the
+slow tier for every declined shape - is worth roughly another 60-80
+Ir/iter and would land near the original ~90 estimate. It is a
+well-scoped follow-up now rather than a guess, because the split above
+says which half of the cost it removes.
+
+Two things the fusion does NOT change, both known going in:
+
+  - The SUITE geomean does not move: the pair occurs in ONE program in
+    bench/ + samples/, at three sites, one of them hot (step 1).
+  - **It does not touch the other extremes.** 76_funcval_dispatch (23.8x),
     63_closures (23.7x), 11_closure_counter (21.8x) and
     10_recursion_deep (19.1x) are CALL PROTOCOL, not element access. They
-    need the separate arc recorded in plans/cpp-gap-extremes.md.
+    need the separate arc in plans/call-protocol-arc.md.
+
+## One trap, recorded because it cost time
+
+Proving the coverage test catches its bug (making the op JIT-INELIGIBLE
+and confirming `jit_load_elem2_native` fails) also made `-rt` HANG, in
+`opt_layer_equivalence` under `--no-opt all`, JIT-on only. The op was
+then `op_fully_native` while NOT `jit_op_eligible` - a combination the
+real tables never produce, and the shipped config passes that very test.
+It was not root-caused. If a future op needs the same negative check,
+flip BOTH predicates together, and treat a hang there as the artefact of
+the inconsistent pair rather than a bug in the op.
 
 ## Testing
 

@@ -240,6 +240,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::ArrLen:      case OpCode::StrLen:
     case OpCode::OrdCharV:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
     case OpCode::LoadElemValue: case OpCode::MakeArrayV:
     case OpCode::MakeDictV:      case OpCode::MakeClosureV:
     case OpCode::StructCtorV:
@@ -2441,6 +2442,58 @@ struct Codegen {
      * both indices native. READ path only - a 2-D WRITE via a temp would COW
      * the temp and never write back, so store codegen keeps as_array_slot.
      */
+    /*
+     * The NESTED-READ FUSION (plans/unboxing.md option A): lower a scalar
+     * `base[i][j]` to ONE LoadElem2Int/Float instead of the
+     * `LoadElemValue t = base[i]` + `LoadElem*(t[j])` pair, so the row is
+     * BORROWED at run time rather than materialised into a temp slot.
+     *
+     * `sub` is the OUTER subscript (the scalar read); its base must itself
+     * be a proven-array subscript. A deeper chain `a[i][j][k]` still fuses
+     * its last TWO levels - compile_array_base materialises `a[i]` as
+     * before and the fused op reads `[j][k]` off it.
+     *
+     * Declines (each leaves the byte-identical unfused pair): a LITERAL
+     * outer index, which cannot ride the `a` dual the chain_locs index
+     * spends; an index neither level can compile as an int; a non-array
+     * level (a dict, a `dyn`).
+     */
+    bool try_load_elem2(const Subscript *sub, TypeHint th, int &out_slot,
+                        std::vector<CgInstr> &ops)
+    {
+        const Subscript *outer =
+            dynamic_cast<const Subscript *>(sub->what.get());
+        if (!outer || !outer->base_array)
+            return false;
+        const size_t nops = ops.size();
+        const int save_temp = next_temp;
+        int bslot;
+        Operand oidx, iidx;
+        if (!compile_array_base(outer->what.get(), bslot, ops)
+            || !compile_int_expr(outer->index.get(), oidx, ops)
+            || oidx.is_lit
+            || !compile_int_expr(sub->index.get(), iidx, ops)) {
+            ops.resize(nops);
+            next_temp = save_temp;
+            return false;
+        }
+        const int tt = alloc_temp();
+        CgInstr in;
+        in.op = th == TypeHint::i ? OpCode::LoadElem2Int
+                                  : OpCode::LoadElem2Float;
+        in.node_idx = add_ast_node(sub);
+        in.target = tt;
+        in.target2 = bslot;
+        /* DUAL: lo = the outer index slot, hi = the chain_locs idx - the
+         * per-level carets (outer = the `base[i]` span, inner = the whole
+         * `base[i][j]` span), exactly the store side's convention. */
+        in.set_a_dual(oidx.slot, add_chain_locs({ outer, sub }));
+        in.set_b(iidx);
+        ops.push_back(in);
+        out_slot = tt;
+        return true;
+    }
+
     bool compile_array_base(const Construct *e, int &out_slot,
                             std::vector<CgInstr> &ops)
     {
@@ -3890,6 +3943,11 @@ struct Codegen {
         if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
             if (e->th != TypeHint::i || !sub->base_array)
                 return false;
+            int fused;
+            if (try_load_elem2(sub, TypeHint::i, fused, ops)) {
+                out = slot_op(fused);
+                return true;
+            }
             int aslot;
             Operand idx;
             if (!compile_array_base(sub->what.get(), aslot, ops)
@@ -4812,6 +4870,11 @@ struct Codegen {
         if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
             if (e->th != TypeHint::f || !sub->base_array)
                 return false;
+            int fused;
+            if (try_load_elem2(sub, TypeHint::f, fused, ops)) {
+                out = slot_op(fused);
+                return true;
+            }
             int aslot;
             Operand idx;
             if (!compile_array_base(sub->what.get(), aslot, ops)
@@ -7030,6 +7093,11 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::OrdCharV:       /* node = the s[i] subscript (OOB caret) */
         case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */
         case OpCode::LoadElemFloat:
+        /* the fused a[i][j]: the per-LEVEL carets come from chain_locs (one
+         * loc entry cannot hold two), so this records the whole-expression
+         * span only as the inlined-at anchor + a belt on the stamp. */
+        case OpCode::LoadElem2Int:
+        case OpCode::LoadElem2Float:
         case OpCode::LoadElemValue:
         case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
         case OpCode::StoreElemInt:   /* node = the SUBSCRIPT (plain: OOB/type) or
@@ -7404,6 +7472,11 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::LoadStructFieldInt: case OpCode::LoadStructFieldFloat:
     case OpCode::LoadStructElemV:
         u(in.target2); opnd(in.a()); d(in.target); return true;
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+        /* a DUAL = (outer index slot, chain_locs idx) - a_dual_lo is a
+         * real slot USE; b is the inner index operand. */
+        u(in.target2); u(in.a_dual_lo()); opnd(in.b()); d(in.target);
+        return true;
     case OpCode::LoadMemberInt: case OpCode::LoadMemberFloat:
         /* a = the member_keys pool idx (a lit), not a slot */
         u(in.target2); d(in.target); return true;
@@ -7473,6 +7546,7 @@ static bool retargetable_dst(OpCode op)
     case OpCode::SubscriptV: case OpCode::MemberV:
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
     case OpCode::LoadStrChar: case OpCode::ArrLen: case OpCode::StrLen:
     case OpCode::OrdCharV:
     case OpCode::SliceV: case OpCode::CallV: case OpCode::CachedCallV:
@@ -8011,6 +8085,7 @@ static bool op_writes_scalar(OpCode op)
     case OpCode::ArrLen: case OpCode::StrLen: case OpCode::OrdCharV:
     case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
     case OpCode::LoadElemBool:
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadStructFieldInt: case OpCode::LoadStructFieldFloat:

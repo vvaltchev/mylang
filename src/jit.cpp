@@ -1027,6 +1027,12 @@ static bool jit_op_eligible(const Instr &in)
      * caret). Unblocks the s += a[i] reduction loops. */
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
         return true;
+    /* The fused nested read `a[i][j]` - a straight call to
+     * jit_load_elem2_int/float, which BORROWS the row instead of boxing it
+     * into a slot. No inline fast path (yet): the win is the deleted
+     * LoadElemValue materialisation, not the call. */
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+        return true;
     /* Approach A: a flat-array element STORE `a[i] = v` / `a[i] OP= v`.
      * Marshals base/index/value and CALLS jit_store_elem_int/float (the
      * interpreter's EXACT store body - COW, bounds, universal fallback);
@@ -2574,6 +2580,15 @@ pick_cached_slots(const Chunk &ck, size_t begin,
             bad(in.target2); bad(in.target);
             if (!in.a_is_lit()) usei(in.a_slot());
             break;
+        case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+            /* BOTH indices are VALUE args to jit_load_elem2_* (read
+             * cache-aware), so they stay countable int uses - in a matrix
+             * loop they are the two loop counters, the slots most worth
+             * pinning. base/dst are leas -> memory. */
+            bad(in.target2); bad(in.target);
+            usei(in.a_dual_lo());
+            if (!in.b_is_lit()) usei(in.b_slot());
+            break;
         case OpCode::StoreElemInt:
             bad(in.target2);             /* base slot holds an array */
             if (!in.a_is_lit()) usei(in.a_slot());   /* index (int) */
@@ -3790,6 +3805,39 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.patch32_here(j_done);
         return true;
     }
+
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+        /* The fused nested read: jit_load_elem2_*(base_lv=&slot[target2],
+         * oidx=a_dual_lo (cache-aware), iidx=b(), dst=&slot[target],
+         * locs=chain_locs[a_dual_hi].data()). The helper BORROWS the row -
+         * the point of the op - and throws WITH the per-level caret, so
+         * the stamp below only supplies the inlined-at chain. */
+        emit_call_prologue(e);
+        e.lea_rdi(static_cast<int32_t>(
+                      static_cast<long>(in.target2)
+                      * static_cast<long>(sizeof(LValue))));
+        read_slot(e, RSI, in.a_dual_lo());
+        load_operand(e, RDX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        e.lea(RCX, static_cast<int32_t>(
+                       static_cast<long>(in.target)
+                       * static_cast<long>(sizeof(LValue))));
+        e.movabs_r8(reinterpret_cast<uint64_t>(
+                        ck.chain_locs[in.a_dual_hi()].data()));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(
+                           in.op == OpCode::LoadElem2Int
+                               ? jit_load_elem2_int
+                               : jit_load_elem2_float) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
 
     case OpCode::StoreElemInt:
         emit_store_elem(e, ck, in, pc, old_pc, /*is_float=*/false);
@@ -6530,6 +6578,12 @@ static bool op_fully_native(const Instr &in)
      * InternalErrorEx net rides eptr) - no bail, no re-interpret. */
     case OpCode::LoadElemInt:
     case OpCode::LoadElemFloat:
+        return true;
+    /* The fused nested read: one helper call, every shape handled inside
+     * it (the interpreter's exact cores), OOB conveying with the BAKED
+     * per-level caret and the InternalErrorEx net riding eptr. No bail. */
+    case OpCode::LoadElem2Int:
+    case OpCode::LoadElem2Float:
         return true;
     /* #56 inc 2: the LV-builtin family - the helpers run the full
      * interpreter path (fast append + the pooled-caret fallback / the

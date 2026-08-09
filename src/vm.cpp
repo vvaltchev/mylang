@@ -2915,7 +2915,8 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
  * net (base_array is proven; rides g_vm_jit_eptr from the helper). */
 static ML_ALWAYS_INLINE int_type
 vm_load_elem_int_core(const EvalValue &base, int_type idx,
-                      const Chunk *chunk, size_t pc)
+                      const Chunk *chunk, size_t pc,
+                      const std::pair<Loc, Loc> *lp = nullptr)
 {
     if (!base.is<SharedArrayObj>())
         throw InternalErrorEx();
@@ -2924,8 +2925,12 @@ vm_load_elem_int_core(const EvalValue &base, int_type idx,
         idx += arr.size();
     if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
         Loc ls, le;
-        if (chunk)
+        if (lp) {
+            ls = lp->first;
+            le = lp->second;
+        } else if (chunk) {
             chunk->loc_at(pc, ls, le);
+        }
         throw OutOfBoundsEx(ls, le);
     }
     const size_type at = arr.offset() + idx;
@@ -2938,7 +2943,8 @@ vm_load_elem_int_core(const EvalValue &base, int_type idx,
 
 static ML_ALWAYS_INLINE float_type
 vm_load_elem_float_core(const EvalValue &base, int_type idx,
-                        const Chunk *chunk, size_t pc)
+                        const Chunk *chunk, size_t pc,
+                        const std::pair<Loc, Loc> *lp = nullptr)
 {
     if (!base.is<SharedArrayObj>())
         throw InternalErrorEx();
@@ -2947,8 +2953,12 @@ vm_load_elem_float_core(const EvalValue &base, int_type idx,
         idx += arr.size();
     if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
         Loc ls, le;
-        if (chunk)
+        if (lp) {
+            ls = lp->first;
+            le = lp->second;
+        } else if (chunk) {
             chunk->loc_at(pc, ls, le);
+        }
         throw OutOfBoundsEx(ls, le);
     }
     const size_type at = arr.offset() + idx;
@@ -2957,6 +2967,63 @@ vm_load_elem_float_core(const EvalValue &base, int_type idx,
     if (arr.skind() == SharedArrayObj::Storage::ints)
         return static_cast<float_type>(arr.flat_ints()[at]);
     return arr.get_vec()[at].getval<float_type>();
+}
+
+/*
+ * The NESTED-READ FUSION's level 1 (plans/unboxing.md option A): resolve
+ * `base[oidx]` to a BORROWED row - a raw `const EvalValue &` into the outer
+ * array's storage - instead of the LoadElemValue pair's boxed temp slot
+ * (a helper call + retain + 32-byte copy + live-slices registration + a
+ * release next iteration, for a value alive one instruction).
+ *
+ * The borrow never leaves this call: the caller reads ONE scalar out of it
+ * and returns. Nothing can invalidate it in between - no user code, no
+ * allocation, no mutation, no unwinding - and the outer array holds the
+ * row's reference throughout.
+ *
+ * Behaviour is the unfused pair's, exactly: `locs[0]` is the INNER
+ * subscript's caret (LoadElemValue's), and a non-array / non-general outer
+ * is the same InternalErrorEx the pair raises (LoadElemValue rejects a
+ * non-general kind; a `strs` row would then fail the scalar core's
+ * is<SharedArrayObj> test - same exception, so it is short-circuited here
+ * rather than paying a SharedStr copy on the way to it).
+ */
+static ML_ALWAYS_INLINE const EvalValue &
+vm_elem2_borrow_row(const EvalValue &base, int_type oidx,
+                    const std::pair<Loc, Loc> *locs)
+{
+    if (!base.is<SharedArrayObj>())
+        throw InternalErrorEx();
+    const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+    if (arr.skind() != SharedArrayObj::Storage::general)
+        throw InternalErrorEx();
+    if (oidx < 0)
+        oidx += arr.size();
+    if (oidx < 0 || static_cast<size_t>(oidx) >= arr.size())
+        throw OutOfBoundsEx(locs[0].first, locs[0].second);
+    return arr.get_vec()[arr.offset() + oidx].get();
+}
+
+/* `dst = base[i][j]`, int/float element. `locs[0]` carets an OOB on the
+ * OUTER index (the `base[i]` span), `locs[1]` one on the INNER (the whole
+ * `base[i][j]` span) - the two the unfused pair produced, which is why the
+ * op carries a chain_locs entry rather than a single loc-table caret. The
+ * scalar read is the SHARED single-level core, so the levels cannot
+ * drift. */
+static ML_ALWAYS_INLINE int_type
+vm_load_elem2_int_core(const EvalValue &base, int_type oidx, int_type iidx,
+                       const std::pair<Loc, Loc> *locs)
+{
+    return vm_load_elem_int_core(vm_elem2_borrow_row(base, oidx, locs),
+                                 iidx, nullptr, 0, &locs[1]);
+}
+
+static ML_ALWAYS_INLINE float_type
+vm_load_elem2_float_core(const EvalValue &base, int_type oidx, int_type iidx,
+                         const std::pair<Loc, Loc> *locs)
+{
+    return vm_load_elem_float_core(vm_elem2_borrow_row(base, oidx, locs),
+                                   iidx, nullptr, 0, &locs[1]);
 }
 
 /* The JIT slow tiers (#56): every shape the inline fast path declines - a
@@ -3055,6 +3122,48 @@ extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
     try {
         dst->put(EvalValue(vm_load_elem_int_core(base_lv->get(), idx,
                                                  nullptr, 0)));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/* The fused nested read's helper tier. Unlike its single-level siblings it
+ * does NOT throw loc-less: the two levels need DIFFERENT carets, so the
+ * baked `locs` pair supplies them and the emit-side exc-stamp (first
+ * conveyor wins) leaves them alone. No bail -> op_fully_native. */
+extern "C" int jit_load_elem2_int(LValue *base_lv, int_type oidx,
+                                  int_type iidx, LValue *dst,
+                                  const void *locs) noexcept
+{
+    ML_JIT_OP_RAN(LoadElem2Int);
+    try {
+        dst->put(EvalValue(vm_load_elem2_int_core(
+            base_lv->get(), oidx, iidx,
+            static_cast<const std::pair<Loc, Loc> *>(locs))));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_load_elem2_float(LValue *base_lv, int_type oidx,
+                                    int_type iidx, LValue *dst,
+                                    const void *locs) noexcept
+{
+    ML_JIT_OP_RAN(LoadElem2Float);
+    try {
+        dst->put(EvalValue(vm_load_elem2_float_core(
+            base_lv->get(), oidx, iidx,
+            static_cast<const std::pair<Loc, Loc> *>(locs))));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -7583,6 +7692,29 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                              vm_load_elem_float_core(
                                  ctx.frame->at(in->target2).get(),
                                  read_int_operand(in->a(), &ctx), chunk, pc));
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(LoadElem2Int):
+            /* base[i][j] with the row BORROWED (the fused pair - see the
+             * opcode comment). a DUAL = (outer index slot, chain_locs idx);
+             * b = the inner index operand. */
+            write_int_slot(&ctx, in->target,
+                           vm_load_elem2_int_core(
+                               ctx.frame->at(in->target2).get(),
+                               read_int_slot(&ctx, in->a_dual_lo()),
+                               read_int_operand(in->b(), &ctx),
+                               chunk->chain_locs[in->a_dual_hi()].data()));
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(LoadElem2Float):
+            write_float_slot(&ctx, in->target,
+                             vm_load_elem2_float_core(
+                                 ctx.frame->at(in->target2).get(),
+                                 read_int_slot(&ctx, in->a_dual_lo()),
+                                 read_int_operand(in->b(), &ctx),
+                                 chunk->chain_locs[in->a_dual_hi()].data()));
             pc++;
             VM_NEXT;
 
