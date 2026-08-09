@@ -3266,6 +3266,18 @@ static void jit_norec_register(Chunk &chunk)
     }
 }
 
+void jit_norec_rebind(Chunk &chunk)
+{
+    if (!chunk.native.base)
+        return;
+    for (auto &up : chunk.norec_sites)
+        up->caller = &chunk;
+    auto it = norec_frag_map().find(
+        reinterpret_cast<uintptr_t>(chunk.native.base));
+    if (it != norec_frag_map().end())
+        it->second.second = &chunk;
+}
+
 /*
  * G1 STEP 2 seed - the check the step-1 sabotage run proved missing: a
  * corrupted ret-address OFFSET was self-consistent, because every lookup
@@ -4519,6 +4531,8 @@ void jit_stats_report()
         { "norec_sites",      &g_jit_norec_sites },
         { "norec_verify",     &g_jit_norec_verify },
         { "norec_ret",        &g_jit_norec_ret_verify },
+        { "norec_frame",      &g_jit_norec_frame_verify },
+        { "norec_stamp",      &g_jit_norec_stamp_verify },
         { "norec_audit",      &g_jit_norec_audit_frames },
     };
     /* G1 reach probe (vm.cpp): the no-record tier's candidate gates.
@@ -12734,6 +12748,10 @@ const NorecSite *jit_norec_site_for(const void *)
 const Chunk *jit_norec_frag_for(const void *)
 {
     return nullptr;
+}
+
+void jit_norec_rebind(Chunk &)
+{
 }
 
 #endif

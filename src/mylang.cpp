@@ -869,6 +869,7 @@ int main(int argc, char **argv)
             if (!opt_tw) {
                 g_exec_engine = ExecEngine::Vm;
                 prog = vm_compile(root.get());
+                jit_norec_rebind(prog.root);   /* the return-value move */
                 /* ASSERTS builds: free + zero the WHOLE AST and assert
                  * zero live nodes (no-op under ASSERTS=0) - the ZERO-AST
                  * proof; the VM runs without the tree. */

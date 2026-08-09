@@ -2011,6 +2011,7 @@ void vm_install_func_chunk(const FuncDescriptor *fdesc, Chunk &&ck)
      */
     Chunk &owned =
         g_func_chunks.insert_or_assign(fdesc, std::move(ck)).first->second;
+    jit_norec_rebind(owned);
     /* NOT jit'd here: the tier runs once over the WHOLE image
      * (vm_jit_loaded_image), because a caller's native-call gate needs
      * every callee's flag set first - vm_precompile_all's two passes. */
@@ -2240,6 +2241,13 @@ vm_execute(const Construct *root_c)
      */
     static std::vector<VmProgram> retained;
     retained.push_back(vm_compile(root_c));
+    /* G1: the program (and its root Chunk) just MOVED - twice, in fact:
+     * out of vm_compile's frame and into the retained vector, which may
+     * also REALLOCATE and move every EARLIER program's root. Rebind all
+     * of them, not just the new one - the audit's chain check caught a
+     * stack-stale site caller here on its first run. */
+    for (VmProgram &pr : retained)
+        jit_norec_rebind(pr.root);
     vm_run(retained.back());
 }
 
@@ -2299,7 +2307,10 @@ vm_func_chunk(const FuncDescriptor *fdesc, bool jit)
     ML_CHECK_MSG(fdesc->decl, "vm_func_chunk on a descriptor with no decl");
     if (!codegen_func_body(fdesc->decl, ck, jit))
         return nullptr;
-    return &g_func_chunks.emplace(fdesc, std::move(ck)).first->second;
+    Chunk &placed = g_func_chunks.emplace(fdesc,
+                                          std::move(ck)).first->second;
+    jit_norec_rebind(placed);   /* the lazy net jitted a STACK local */
+    return &placed;
 }
 
 /*
@@ -2618,6 +2629,27 @@ static ML_ALWAYS_INLINE bool vm_dispatch_exc_hot(
     return vm_dispatch_exc_body(act, cur, ctx, pc, ex);
 }
 
+/* G1 no-record tier - the step-2 counters, the walk stash, and the
+ * shared mismatch abort. Defined HERE (above the capture path that uses
+ * them); the push-side verification further down uses them too. */
+unsigned long g_jit_norec_frame_verify = 0;
+unsigned long g_jit_norec_stamp_verify = 0;
+#ifdef TESTS
+[[noreturn]] static void norec_fail(const char *what, const void *a,
+                                    const void *b)
+{
+    fprintf(stderr, "NOREC SHADOW MISMATCH: %s (%p vs %p)\n", what, a, b);
+    abort();
+}
+
+/* G1 step 2: the sync record the unwind walk just popped, so the NEXT
+ * postexit's baked site stamp can be compared against the TABLE's loc
+ * for that same frame. Reset at each walk start; only the walk's
+ * sync_stop pop sets it; only the first pending tail after it compares
+ * (upper -2 conveyance levels see null and skip). */
+static const NorecSite *g_norec_stash = nullptr;
+#endif
+
 /*
  * Append the frame a WALK is popping to the exception's backtrace - the
  * record-based twin of vm_capture_frame (eval.cpp): name/params from the
@@ -2641,6 +2673,41 @@ static void vm_capture_rec_frame(RuntimeException &e, const VmCallRec &rec)
                  static_cast<int>(rec.call_site_packed & 0xffffffff));
     else
         rec.ret_chunk->loc_at(rec.ret_pc - 1, cs, end_ignored);
+#ifdef TESTS
+    /* G1 STEP 2 - backtraces from the TABLE, verified while the record
+     * still exists. For an M5b-pushed frame the record path captures
+     * LOC-LESS (the sentinel has no locs; the postexit stamp supplies the
+     * site later) - the table already HAS both halves of the frame:
+     *   desc: the descriptor whose vm_chunk is the chunk the return
+     *         address (in the child) lands in - checked here as
+     *         desc->vm_chunk == run_chunk plus the range lookup;
+     *   loc:  ns->site_loc, compared against the actual STAMP by the
+     *         postexit (via g_norec_stash below).
+     * Each claim the record-less renderer will rely on is asserted at
+     * the moment the record-based renderer runs. */
+    if (rec.norec_site) {
+        const auto *ns = static_cast<const NorecSite *>(rec.norec_site);
+        if (!rec.sync_stop)
+            norec_fail("a norec-site record without sync_stop", ns,
+                       nullptr);
+        if (cs.line != 0 || cs.col != 0)
+            norec_fail("an M5b frame captured WITH a loc", ns, nullptr);
+        if (!ns->site_loc)
+            norec_fail("a site with no baked loc", ns, nullptr);
+        if (rec.desc
+                && static_cast<const Chunk *>(rec.desc->vm_chunk)
+                       != rec.run_chunk)
+            norec_fail("desc->vm_chunk != run_chunk", rec.desc,
+                       rec.run_chunk);
+        if (rec.run_chunk && rec.run_chunk->native.base
+                && jit_norec_frag_for(rec.run_chunk->native.base)
+                       != rec.run_chunk)
+            norec_fail("frame range lookup at capture",
+                       rec.run_chunk->native.base, rec.run_chunk);
+        g_norec_stash = ns;
+        g_jit_norec_frame_verify++;
+    }
+#endif
     e.backtrace.emplace_back(rec.desc, cs);
 }
 
@@ -6699,6 +6766,21 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
     }
     if (g_vm_exc_pending) {
         Exception &e = *g_vm_exc_pending;
+#ifdef TESTS
+        /* G1 step 2: the loc the RENDER path stamps into the loc-less
+         * frame must be the loc the TABLE stored for that same site -
+         * the two travelled from one emission through entirely different
+         * machinery (a baked immediate argument vs C++ bookkeeping). */
+        if (g_norec_stash) {
+            if (static_cast<uint64_t>(site_packed)
+                    != g_norec_stash->site_loc)
+                norec_fail("stamp != table site_loc",
+                           reinterpret_cast<const void *>(site_packed),
+                           g_norec_stash);
+            g_norec_stash = nullptr;
+            g_jit_norec_stamp_verify++;
+        }
+#endif
         vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
                                inl_pool);
         g_vm_jit_exc = std::move(g_vm_exc_pending);
@@ -7527,13 +7609,6 @@ unsigned long g_jit_norec_ret_verify = 0;
 bool g_norec_audit = false;
 
 #ifdef TESTS
-[[noreturn]] static void norec_fail(const char *what, const void *a,
-                                    const void *b)
-{
-    fprintf(stderr, "NOREC SHADOW MISMATCH: %s (%p vs %p)\n", what, a, b);
-    abort();
-}
-
 static void norec_check_rec(const VmCallRec &rec, const NorecSite *ns)
 {
     if (rec.norec_site != ns)
@@ -7579,8 +7654,14 @@ extern "C" void jit_norec_push_verify(const void *site) noexcept
             const VmCallRec &r = act->records[i];
             if (!r.norec_site)
                 continue;             /* a C++-pushed record has no site */
-            norec_check_rec(
-                r, static_cast<const NorecSite *>(r.norec_site));
+            const auto *rs = static_cast<const NorecSite *>(r.norec_site);
+            norec_check_rec(r, rs);
+            /* step 2, the CHAIN: the site's caller chunk must be the
+             * frame BELOW's run_chunk - the frame identity the mixed
+             * walk (step 3) will derive from interleave order */
+            if (i && rs->caller != act->records[i - 1].run_chunk)
+                norec_fail("site caller != parent frame's chunk",
+                           rs->caller, act->records[i - 1].run_chunk);
             g_jit_norec_audit_frames++;
         }
     }
@@ -7725,6 +7806,9 @@ static ML_COLD bool
 vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
                size_t &pc, std::unique_ptr<RuntimeException> ex)
 {
+#ifdef TESTS
+    g_norec_stash = nullptr;      /* G1 step 2: one stash per walk */
+#endif
     for (;;) {
         VmCallRec &cur = act.back_rec();
         if (vm_dispatch_exc(act, cur, ctx, pc, ex))

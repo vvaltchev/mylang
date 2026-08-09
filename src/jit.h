@@ -884,6 +884,16 @@ extern bool g_norec_audit;
  * fragment is placed); the non-JIT build gets null-returning stubs. */
 const NorecSite *jit_norec_site_for(const void *ret_addr);
 const Chunk *jit_norec_frag_for(const void *addr);
+/*
+ * A compiled chunk that MOVES to its final storage (codegen_chunk returns
+ * by value; the lazy vm_func_chunk net jits a stack local and emplaces it)
+ * leaves every site's `caller` and the range registry's chunk pointer at
+ * the OLD address - the audit's chain check found exactly that on its
+ * first -rt run (a 0x7ffc... stack address where a chunk belonged). Call
+ * this at every move DESTINATION; the chain check is the net for a missed
+ * one. No-op when the chunk has no native code.
+ */
+void jit_norec_rebind(Chunk &chunk);
 /* The TESTS-emitted per-push verification (defined in vm.cpp - it reads
  * the activation's top record, which only vm.cpp can see). NEVER throws
  * (the #142 rule); a mismatch is a deliberate located abort. */
@@ -901,6 +911,10 @@ extern "C" void jit_norec_push_verify(const void *site) noexcept;
  */
 extern "C" void jit_norec_ret_verify(const void *ra) noexcept;
 extern unsigned long g_jit_norec_ret_verify;
+/* step 2: frames verified at capture (the table had both halves), and
+ * postexit stamps that matched the table's loc for the popped frame. */
+extern unsigned long g_jit_norec_frame_verify;
+extern unsigned long g_jit_norec_stamp_verify;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
  * bumped by the emitted code itself, so it proves the inline tier ran (the
  * jit_ret helper's own counter also counts declines and cannot). */

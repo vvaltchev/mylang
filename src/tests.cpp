@@ -18136,6 +18136,40 @@ static bool jit_norec_shadow()
                 g_jit_norec_ret_verify - r0, calls);
         return false;
     }
+    /* STEP 2 - the backtrace path: a throw from a nested sync callee
+     * walks + pops the sync frames (frame_verify: the table had both
+     * halves at capture) and the postexit stamps the loc-less frame
+     * with the site the TABLE recorded (stamp_verify). The same
+     * driven-twice discipline as above: iteration 1 grows the record
+     * stack cold, later iterations push inline so the walk pops
+     * SITE-carrying records. */
+    const unsigned long f0 = g_jit_norec_frame_verify;
+    const unsigned long st0 = g_jit_norec_stamp_verify;
+    if (!run({
+        "struct XE { int x; }",
+        "func inner(int n) {",
+        "  if (n == 0) { throw XE(1); }",
+        "  if (n < 0) { return 0; }",
+        "  var r = outer2(n - 1);",
+        "  return r; }",
+        "func outer2(int n) {",
+        "  var r = inner(n);",
+        "  return r + 1; }",
+        "var hits = 0;",
+        "for (var k = 0; k < 4; k++) {",
+        "  try { var t = inner(runtime(8)); hits += t; }",
+        "  catch (XE) { hits += 1; }",
+        "}",
+        "assert(hits == 4);" }))
+        return false;
+    if (g_jit_norec_frame_verify - f0 < 4
+            || g_jit_norec_stamp_verify - st0 < 1) {
+        fprintf(stderr, "jit_norec_shadow: throw walked %lu site frames, "
+                        "%lu stamps - the backtrace path did not run\n",
+                g_jit_norec_frame_verify - f0,
+                g_jit_norec_stamp_verify - st0);
+        return false;
+    }
     if (calls < 20) {
         fprintf(stderr, "jit_norec_shadow: verify ran %lu times "
                         "(< the recursion depth)\n", calls);
@@ -25679,6 +25713,8 @@ static bool jit_counter_coverage()
         { "norec_sites",      &g_jit_norec_sites,      nullptr },
         { "norec_verify",     &g_jit_norec_verify,     nullptr },
         { "norec_ret",        &g_jit_norec_ret_verify,  nullptr },
+        { "norec_frame",      &g_jit_norec_frame_verify, nullptr },
+        { "norec_stamp",      &g_jit_norec_stamp_verify, nullptr },
         { "callee_cache",     &g_jit_callee_cache,     nullptr },
         { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
         { "bind_coerce",      &g_jit_bind_coerce,      nullptr },
