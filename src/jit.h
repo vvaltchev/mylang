@@ -178,6 +178,10 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept;
 extern "C" int jit_cached_probe(const void *desc, int_type argbase,
                                 int_type nargs, int_type dst) noexcept;
 void *jit_addr_pending_key();
+/* #88: the emitted sync call's baked call site (chain index + pool base),
+ * handed to the helper by side channel - see vm.cpp. */
+void *jit_addr_call_inline_chain();
+void *jit_addr_call_inline_pool();
 void *jit_addr_sync_depth();
 int jit_sync_depth_cap();
 void jit_set_sync_depth_cap(int cap);   /* M5a: raised when the native
@@ -244,6 +248,9 @@ extern unsigned long g_jit_container_calls;
  * counter proving the collapse-safe path ran, since a deleted run's pcs
  * cannot discriminate between two inlined bodies. */
 extern unsigned long g_jit_inline_baked;
+/* #88: the same proof for the CALL SITE's baked chain (the side channel) -
+ * the twin mechanism, counted separately so a test can tell which ran. */
+extern unsigned long g_jit_inline_call_baked;
 
 #ifdef TESTS
 /* #78 step E: times EndFinally's cold RERAISE arm ran natively (see
