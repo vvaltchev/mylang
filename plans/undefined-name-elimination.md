@@ -409,17 +409,25 @@ Each lands as its OWN commit.
      span at all before. It used to give THREE answers (tw: the whole
      `func[g]() => g`; `-nj`: no caret; jit: elsewhere entirely);
    - the FRAMES came back at step 2 (the RuntimeException base);
-   - **STILL OPEN: the STORE-base caret** (#127). The tree-walker carets
-     `g`, the VM carets `g[0]`. Fixing it needs a base-specific `Loc`,
-     because the op's `locs` entry is CORRECTLY the whole `a[i]` lvalue -
-     that is what its OOB and non-array-base errors caret, and those two
-     already agree across engines (measured). So the shared entry cannot
-     be narrowed. A new pc-keyed `base_locs` side table would have to be
-     produced at 17 `as_container_base` call sites (funnelled through
-     `emit()`), join the bytecode-splice pc-REMAP pass that rebuilds
-     `locs`, and be serialized - i.e. it is a new audited table in the
-     exact shape CLAUDE.md's AUDIT-TABLE STAGE TRAP warns about. Not
-     started; scaffolding deliberately NOT left behind.
+   - the STORE-base caret is FIXED (#127) - a second pc-keyed table,
+     `Chunk::base_locs` (myv v13). The op's `locs` entry could NOT be
+     narrowed: it is CORRECTLY the whole `a[i]` lvalue, which is what its
+     OOB and non-array-base errors caret, and those two already agree
+     across engines (measured). Twelve store forms diverged, and the
+     three CHAIN forms - whose per-step carets live in `chain_locs`, so
+     they record no `locs` entry at all - carried NO location whatsoever
+     (a backtrace rendering "line 0"), which is worse than a wide caret.
+     Two things came out smaller than the estimate above: the producer is
+     `CgInstr::base_node_idx` set through a one-line `add_base_node(kind,
+     base)` at the 12 emit sites that already hold the base from
+     `as_container_base` (a NON-global base records nothing, so the table
+     is sparse), and the pc-REMAP surface is three sites, all of the form
+     `l.pc = remap[l.pc]`. Watched failing, each in exactly the modes it
+     should: the consumer ignoring the table (9 caret tests, all four VM
+     modes), the JIT remap dropped (the two JIT-ON modes), the splice
+     rebuild dropped (the two splice-ON modes), the table unserialized
+     (the `-vd` oracle), and an end-only mangle (the field-for-field
+     round-trip compare, which is the one the dump CANNOT see).
 5. **Nested func/struct hoist with binding** (#134).
 6. **Const-fold poisoning + the `isbound()` builtin** (#133); `defined()`
    becomes REPL-only.

@@ -432,6 +432,16 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << ";   pc" << l.pc << " -> " << l.start.line << ":"
               << l.start.col << "\n";
     }
+    if (!ch.base_locs.empty()) {
+        /* #127: a container store's SECOND caret - the BASE identifier's own
+         * span, used when that base is an unbound global (`locs` holds the
+         * whole `g[0]` lvalue, for the OOB/type errors). */
+        s << "; -- base_locs: store pc -> base line:col ("
+          << ch.base_locs.size() << ") --\n";
+        for (const auto &l : ch.base_locs)
+            s << ";   pc" << l.pc << " -> " << l.start.line << ":"
+              << l.start.col << "\n";
+    }
     if (!ch.inline_ctxs.empty()) {
         s << "; -- inline_ctxs (" << ch.inline_ctxs.size() << ", "
           << ch.inline_frames.size() << " frames) --\n";

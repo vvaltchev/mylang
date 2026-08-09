@@ -3472,6 +3472,21 @@ and two macros:
 - **Multi-line spans**: `dumpLocInError` (`mylang.cpp`) renders every source
   line in `[loc_start.line, loc_end.line]` with a caret row per line (start from
   `loc_start.col` to EOL, full middle lines, end line up to `loc_end`).
+- **⛔ ONE OP CAN NEED TWO CARETS, AND `locs` HOLDS ONE (#127, 2026-08-08).**
+  A container store `g[0] = v` has two error spans: an OOB / key / type error
+  carets the WHOLE lvalue (`g[0]`), an UNBOUND-GLOBAL base carets only `g` —
+  because in the tree-walker they come from different nodes (the Subscript vs
+  the base `Identifier::do_eval`). `Chunk::locs` is keyed by pc, so it can
+  carry only one of them, and the VM reported the whole subscript for every
+  store form; the CHAIN stores, whose per-step carets live in `chain_locs` and
+  which therefore record NO `locs` entry, reported **no location at all** — a
+  backtrace reading "line 0". The fix is a SECOND pc-keyed table,
+  **`Chunk::base_locs`** (bytecode.h, `base_loc_at`), fed by
+  `CgInstr::base_node_idx` which the emit sites set through
+  `add_base_node(kind, base)` — a no-op for a non-global base, so the table
+  stays sparse. **When you add a store-like op, give it a base caret**: the
+  emit site has the base expression in hand from `as_container_base`, and it
+  is one line. Full note: *docs/vm-ops.md*, `Chunk::base_locs`.
 - **Context keywords**: `break`/`continue`/`return`/`rethrow` outside their
   valid context (gated by `pFlags` in `pStmt`) raise a clear `SyntaxErrorEx`
   ("... only allowed in a loop", etc.), not a generic "unexpected token".

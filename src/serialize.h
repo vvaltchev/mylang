@@ -23,7 +23,7 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 12;   /* v12: CaptureDesc Locs */
+constexpr unsigned MYV_FORMAT_VERSION = 13;   /* v13: Chunk::base_locs */
 
 /*
  * The stored SOURCE REFERENCE (v2). An image does NOT embed the source text -

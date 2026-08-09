@@ -200,6 +200,7 @@ void bc_inline_audit(const Chunk &caller, const char *caller_name,
 struct BcInlineSnapshot {
     std::vector<Instr> code;
     std::vector<Chunk::LocEntry> locs;
+    std::vector<Chunk::LocEntry> base_locs;   /* #127: the store-base carets */
     std::vector<int32_t> ref_slots;
     int slot_count = 0;
     int n_temps = 0;

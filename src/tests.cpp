@@ -4076,6 +4076,87 @@ static const std::vector<test> tests =
         "var dyn g = [1];" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
 
+    /*
+     * #127: EVERY container-store form carets an unbound GLOBAL base at the
+     * BASE IDENTIFIER (`g`, cols 12-12 -> the 12/14 span), never at the whole
+     * lvalue. The two spans are genuinely different and BOTH are needed: the
+     * `locs` entry stays the WHOLE `g[0]`, which is what an out-of-bounds or
+     * type error carets (pinned separately below), so the base caret is the
+     * SECOND table, `base_locs`. These run in all five modes, so they pin
+     * tree-walker/VM/JIT agreement by construction - the VM used to report
+     * the whole subscript in every one of them.
+     */
+    { "err loc: unbound global base - flat int elem store",
+      { "func f() { g[0] = 1; }", "f();", "var g = [1];" },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
+    { "err loc: unbound global base - flat float elem store",
+      { "func f() { g[0] = 1.5; }", "f();", "var g = [1.0];" },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
+    { "err loc: unbound global base - COMPOUND elem store",
+      { "func f() { g[0] += 1; }", "f();", "var g = [1];" },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
+    { "err loc: unbound global base - dict store",
+      { "func f() { g[\"k\"] = 1; }", "f();", "var g = {\"k\": 1};" },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
+    { "err loc: unbound global base - struct member store",
+      { "func f() { g.x = 1; }", "f();", "struct P { int x; }",
+        "var g = P(0);" },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
+    { "err loc: unbound global base - member ++",
+      { "func f() { g.x++; }", "f();", "struct P { int x; }",
+        "var g = P(0);" },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
+    /*
+     * The CHAIN stores are the sharp cases: their per-step carets live in
+     * chain_locs / chain_steps, so they record NO `locs` entry at all - the
+     * base throw used to carry NO location whatsoever (a rendered backtrace
+     * reading "line 0"), not merely a too-wide one.
+     */
+    { "err loc: unbound global base - nested elem chain store",
+      { "func f() { g[0][1] = 1; }", "f();", "var g = [[1, 2]];" },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
+    { "err loc: unbound global base - mixed lvalue chain store",
+      { "func f() { g.a[0] = 1; }", "f();", "struct Q { array a; }",
+        "var g = Q([1, 2]);" },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
+    { "err loc: unbound global base - nested chain ++",
+      { "func f() { g[0][1]++; }", "f();", "var g = [[1, 2]];" },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
+    /*
+     * The OTHER half of the split, and the reason base_locs cannot simply
+     * REPLACE the `locs` entry: with the base BOUND, an out-of-bounds store
+     * still carets the whole `a[n]` (cols 12-15 -> the 12/17 span).
+     */
+    { "err loc: a BOUND global base still carets the whole lvalue on OOB",
+      { "func f() { a[n] = 5; }", "var a = [1, 2];", "var n = 9;", "f();" },
+      &typeid(OutOfBoundsEx), 12, 1, 17, 1 },
+    /*
+     * The base caret must survive the BYTECODE SPLICE's pc rebuild. `add1` is
+     * deliberately too heavy for the AST inliner (4 statements, over
+     * CALL_WEIGHT) but a whitelisted bytecode callee, so its two call sites
+     * splice and shift every later pc - including the store's. Watched
+     * failing: clearing the rebuilt table leaves this case reporting the whole
+     * `g[0]` (col 5:9) with the splice ON and the base (col 5:6) with `-nbi`,
+     * so the modes disagree and the pair of splice modes fails.
+     */
+    { "err loc: unbound global base survives the bytecode splice",
+      { "func add1(k) {",
+        "    var t = k + 1;",
+        "    var u = t * 3;",
+        "    var v = u - 2;",
+        "    var w = v + k;",
+        "    return w;",
+        "}",
+        "func f(n) {",
+        "    var a = add1(n);",
+        "    var b = add1(a);",
+        "    g[0] = b;",
+        "    return b;",
+        "}",
+        "var z = f(int(runtime(3)));",
+        "var g = [1];" },
+      &typeid(UnboundSymbolEx), 5, 11, 7, 11 },
+
     /* ZERO-SLOT bodies (no params, no locals -> the resolver leaves them
      * `resolved == false`) now run their CHUNK under -vm (the chunk hook is
      * no longer gated on `resolved`) - post-AST-teardown the chunk is the
@@ -18061,23 +18142,25 @@ static bool dyn_foreach_fast_shapes()
  * and NEVER `end`, so byte-identical dumps cannot see a mangled end Loc - and
  * `end` is half of every caret the interpreter draws.
  */
-static bool myv_locs_equal(const Chunk &x, const Chunk &y)
+static bool myv_loc_table_equal(const char *what,
+                                const std::vector<Chunk::LocEntry> &xt,
+                                const std::vector<Chunk::LocEntry> &yt)
 {
-    if (x.locs.size() != y.locs.size()) {
-        fprintf(stderr, "myv: loc count %zu != %zu\n", x.locs.size(),
-                y.locs.size());
+    if (xt.size() != yt.size()) {
+        fprintf(stderr, "myv: %s count %zu != %zu\n", what, xt.size(),
+                yt.size());
         return false;
     }
 
-    for (size_t i = 0; i < x.locs.size(); i++) {
-        const Chunk::LocEntry &a = x.locs[i];
-        const Chunk::LocEntry &b = y.locs[i];
+    for (size_t i = 0; i < xt.size(); i++) {
+        const Chunk::LocEntry &a = xt[i];
+        const Chunk::LocEntry &b = yt[i];
         if (a.pc != b.pc
                 || a.start.line != b.start.line || a.start.col != b.start.col
                 || a.end.line != b.end.line || a.end.col != b.end.col) {
             /* NAME the mismatch: a bare false costs a debugging cycle */
-            fprintf(stderr, "myv: loc[%zu] pc%u %d:%d..%d:%d != pc%u "
-                            "%d:%d..%d:%d\n", i, a.pc, a.start.line,
+            fprintf(stderr, "myv: %s[%zu] pc%u %d:%d..%d:%d != pc%u "
+                            "%d:%d..%d:%d\n", what, i, a.pc, a.start.line,
                     a.start.col, a.end.line, a.end.col, b.pc, b.start.line,
                     b.start.col, b.end.line, b.end.col);
             return false;
@@ -18085,6 +18168,14 @@ static bool myv_locs_equal(const Chunk &x, const Chunk &y)
     }
 
     return true;
+}
+
+/* Both pc-keyed loc tables: `locs` and, since #127, the store-BASE carets
+ * (which the `-vd` dump prints only as `pc -> start`, same blind spot). */
+static bool myv_locs_equal(const Chunk &x, const Chunk &y)
+{
+    return myv_loc_table_equal("loc", x.locs, y.locs)
+           && myv_loc_table_equal("base_loc", x.base_locs, y.base_locs);
 }
 
 /*
@@ -18143,6 +18234,11 @@ static bool myv_round_trip()
         "var s = 0;",
         "foreach (var p in pts) { s += dist2(p); }",
         "var d = { \"a\": 1 };",
+        /* #127: a store whose BASE is a GLOBAL - the only shape that fills
+         * the `base_locs` table, which the count guard below requires. */
+        "var tbl = [0, 0];",
+        "func setrec(int i, int v) { tbl[i] = v; d[\"b\"] = v; }",
+        "setrec(1, 7);",
         "var t = 0;",
         "try { throw P(1, 2); } catch (P as e) { t = e.y; }",
         /* COMPACT-ENCODING edge values (the width codes + the
@@ -18155,7 +18251,8 @@ static bool myv_round_trip()
         "           + str(n * -32769) + str(n + 4611686018427387903)",
         "           + str(x * 2.5) + str(x + -1.0);",
         "}",
-        "print(s, t, d[\"a\"], len(pts), edge(runtime(3), runtime(1.5)));" };
+        "print(s, t, d[\"a\"], d[\"b\"], tbl[1], len(pts),",
+        "      edge(runtime(3), runtime(1.5)));" };
 
     std::string src;
     std::vector<Tok> toks;
@@ -18315,21 +18412,34 @@ static bool myv_round_trip()
             return false;
         }
 
-        /* the DELTA-CODED loc table, entry for entry (see myv_locs_equal;
+        /* the DELTA-CODED loc tables, entry for entry (see myv_locs_equal;
          * the escape paths get their own test) */
         bool locs_ok = myv_locs_equal(prog.root, loaded.root);
+        /* COUNT the base_locs entries for the same reason boxed_ops are
+         * counted: the table is SPARSE, so a program edit that drops the
+         * global-based store above would make its comparison vacuous. */
+        size_t nbase = prog.root.base_locs.size();
 
         for (size_t i = 0; locs_ok && i < prog.funcs.size(); i++) {
             const Chunk *a =
                 static_cast<const Chunk *>(prog.funcs[i]->vm_chunk);
             const Chunk *b =
                 static_cast<const Chunk *>(loaded.funcs[i]->vm_chunk);
-            if (a && b && !myv_locs_equal(*a, *b))
-                locs_ok = false;
+            if (a && b) {
+                nbase += a->base_locs.size();
+                if (!myv_locs_equal(*a, *b))
+                    locs_ok = false;
+            }
         }
 
         if (!locs_ok) {
-            fprintf(stderr, "myv: the loc table did not round-trip\n");
+            fprintf(stderr, "myv: a loc table did not round-trip\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        if (!nbase) {
+            fprintf(stderr, "myv: no base_locs to compare - the program "
+                            "above no longer stores through a global\n");
             g_exec_engine = saved;
             return false;
         }
