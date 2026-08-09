@@ -377,6 +377,56 @@ gates and `bc_remap_slots`'s `ReturnV`/`default` cases (unreachable by
 construction - a whitelist's belt-and-braces), the literal-return gate
 (codegen always emits a slot), and the audit's `unresolved-callee`.
 
+## The counted-loop fusions (lifted 2026-08-02)
+
+`ForLoopStep` and `IntAddStep` were excluded from the whitelist with the
+note that "the operand layout wants checking against their emit sites
+before either carries a splice". That audit is done and both are in. The
+layouts, read off the VM cases and cross-checked against `visit_use_def`
+and the pc-field table:
+
+    ForLoopStep   target  = a PC (visit_pc_fields owns it - NOT a slot)
+                  target2 = the COUNTER slot
+                  a       = the bound operand, b = the step operand
+
+    IntAddStep    target  = a PC
+                  target2 = the COUNTER slot
+                  b       = the added value operand
+                  a       = a DUAL, and NOT uniform:
+                              lo = accumulate dst - ALWAYS a slot
+                              hi = the bound - a LITERAL VALUE when
+                                   a_is_lit(), else a SLOT
+
+**THE TRAP, and it is a nasty one:** `set_a_dual` CLEARS the is-literal
+bits as a side effect. Writing the halves back without restoring the flag
+turns a literal bound into a slot INDEX, and the loop reads its bound out
+of whatever slot that number names.
+
+Removing the restore was verified to corrupt the bytecode - `if r6 < 4`
+became `if r6 < r4` - while the program STILL PRINTED THE RIGHT ANSWER,
+because the slot it wrongly named happened to hold a value giving the same
+result. The whole 1689-test suite passed with the defect in. That is why
+`bc_inline_fusion_operands` asserts the FLAG structurally instead of
+comparing values: a value oracle cannot see this class of corruption.
+
+**REACH: no measured gain on the corpus, and that is the honest result.**
+The capability is real (the shape matrix's `for` rows flipped from
+must-decline to must-splice), but the blocker histogram over bench/ +
+samples is unchanged at 3 OK sites - because nothing there was blocked by
+a counted loop in the first place. What blocks it now:
+
+    10  runtime-callee   - an indirect call; needs a GUARD (inline cache),
+                           a separate and much larger step
+     5  no-tail-return   - the callee falls off the end
+     3  OK
+     1  too-big
+
+So the dominant blocker by far is the runtime callee, which is exactly
+what plans/call-protocol-arc.md predicted and what 76/11/63 are made of.
+Lifting the counted-loop exclusion was worth doing - it removes a whole
+class of decline and the audit trail now says so - but it is NOT what
+widens this feature; an inline cache is.
+
 ## What must NOT be inlined
 
   - a callee with try REGIONS (`n_trys != 0`): region ids are chunk-static
