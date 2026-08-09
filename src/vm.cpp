@@ -32,9 +32,18 @@ read_int_slot(EvalContext *ctx, int_type slot)
         return lv.getval<bool>() ? 1 : 0;
     /* A th==i operand must hold an int here; anything else is an inference bug
      * or a corrupt/garbage slot (its type ptr won't match int) - caught before
-     * the raw getval misreads the union. */
+     * the raw getval misreads the union.
+     *
+     * #142: the miss returns a DEFINED value, it does NOT throw. `getval`
+     * would, and this reader runs inside `noexcept` JIT helpers that have no
+     * status test - an exception leaving one calls std::terminate, which is
+     * how a corrupt `.myv` aborted the process with no message. The type test
+     * is the same one `getval` does internally, so this costs nothing; only
+     * the miss branch changes, from a throw to a value. A VALID program never
+     * reaches it (the ML_VM_CHECK above is the net, and CI runs the release
+     * lanes with VM_HARDENING on). */
     ML_VM_CHECK(lv.is<int_type>());
-    return lv.getval<int_type>();
+    return lv.is<int_type>() ? lv.getval<int_type>() : 0;
 }
 
 static ML_ALWAYS_INLINE int_type
@@ -68,9 +77,11 @@ read_float_slot(EvalContext *ctx, int_type slot)
     if (lv.is<bool>())
         return lv.getval<bool>() ? 1.0 : 0.0;
     /* Likewise a th==f operand must hold a float here (int/bool promoted
-     * above); a wrong-typed / garbage slot fails before the raw union read. */
+     * above); a wrong-typed / garbage slot fails before the raw union read.
+     * The miss returns a DEFINED value rather than throwing - see the
+     * int twin above (#142). */
     ML_VM_CHECK(lv.is<float_type>());
-    return lv.getval<float_type>();
+    return lv.is<float_type>() ? lv.getval<float_type>() : 0.0;
 }
 
 static ML_ALWAYS_INLINE float_type
@@ -654,8 +665,12 @@ vm_struct_ctor_planned(EvalContext &ctx, StructTypeDef *def,
         switch (pf.act) {
         case 0: {                                   /* int (or bool) -> int */
             const EvalValue &v = ctx.frame->at(pf.src).get();
+            /* #142: `get<int_type>()` on a wrong-typed slot THROWS, and this
+             * whole function runs inside a noexcept JIT helper - see the
+             * contract note above. A corrupt image is the only way to get
+             * here with the wrong type, and it gets a defined value. */
             const int_type iv = v.is<bool>() ? (v.get<bool>() ? 1 : 0)
-                                             : v.get<int_type>();
+                              : v.is<int_type>() ? v.get<int_type>() : 0;
             std::memcpy(bytes + pf.off, &iv, sizeof iv);
             break;
         }
@@ -664,10 +679,11 @@ vm_struct_ctor_planned(EvalContext &ctx, StructTypeDef *def,
             std::memcpy(bytes + pf.off, &fv, sizeof fv);
             break;
         }
-        default:                                            /* bool byte */
-            bytes[pf.off] =
-                ctx.frame->at(pf.src).get().get<bool>() ? 1 : 0;
+        default: {                                          /* bool byte */
+            const EvalValue &v = ctx.frame->at(pf.src).get();
+            bytes[pf.off] = v.is<bool>() && v.get<bool>() ? 1 : 0;
             break;
+        }
         }
     }
     if (fresh)
@@ -3551,8 +3567,17 @@ extern "C" int jit_load_global(int_type dst_gslot,
 extern "C" void jit_arr_len(LValue *slots, int_type dst, int_type base) noexcept
 {
     ML_JIT_OP_RAN(ArrLen);
+    /* #142: `noexcept` with NO status test at the call site, so a throw here
+     * calls std::terminate. get_ref would throw on a non-array base, which
+     * only a corrupt image can produce - it gets `none`. The type test is
+     * the one get_ref does anyway, so the hit path is unchanged. */
+    const EvalValue &b = slots[base].get();
+    if (!b.is<SharedArrayObj>()) {
+        slots[dst].put(EvalValue());
+        return;
+    }
     slots[dst].put(EvalValue(static_cast<int_type>(
-        slots[base].get().get_ref<SharedArrayObj>().size())));
+        b.get_ref<SharedArrayObj>().size())));
 }
 
 /* model-flip (nativize-ops): the native DictLoadInt/Float body - the typed
@@ -3915,10 +3940,27 @@ extern "C" void jit_load_elem_bool(int_type dst, int_type base,
 {
     ML_JIT_OP_RAN(LoadElemBool);
     Frame *f = g_current_ctx->frame;
-    const SharedArrayObj &arr = f->at(base).get().get_ref<SharedArrayObj>();
-    const bool b = arr.skind() == SharedArrayObj::Storage::bools
-                       ? arr.flat_bools()[arr.offset() + idx] != 0
-                       : arr.get_view()[idx].get().get<bool>();
+    /* #142: `noexcept`, no status test - see jit_arr_len. Both the BASE's
+     * type and the INDEX are compile-proven for valid bytecode; a corrupt
+     * image can break either, and an unchecked flat read at a mangled index
+     * is a wild load, not merely a wrong answer. */
+    const EvalValue &bv = f->at(base).get();
+    if (!bv.is<SharedArrayObj>()) {
+        f->at(dst).put(EvalValue());
+        return;
+    }
+    const SharedArrayObj &arr = bv.get_ref<SharedArrayObj>();
+    if (idx < 0 || static_cast<size_type>(idx) >= arr.size()) {
+        f->at(dst).put(EvalValue());
+        return;
+    }
+    bool b;
+    if (arr.skind() == SharedArrayObj::Storage::bools) {
+        b = arr.flat_bools()[arr.offset() + idx] != 0;
+    } else {
+        const EvalValue &e = arr.get_view()[idx].get();
+        b = e.is<bool>() && e.get<bool>();
+    }
     f->at(dst).put(EvalValue(b));
 }
 
@@ -3929,8 +3971,19 @@ extern "C" void jit_load_str_char(int_type dst, int_type base,
 {
     ML_JIT_OP_RAN(LoadStrChar);
     Frame *f = g_current_ctx->frame;
-    const std::string_view view =
-        f->at(base).get().get_ref<SharedStr>().get_view();
+    /* #142: `noexcept`, no status test - see jit_arr_len. This one had BOTH
+     * hazards: get_ref throws on a non-string base, and `&view[idx]` was
+     * indexed with no bound at all (the tree-walker's `s[i]` does check). */
+    const EvalValue &bv = f->at(base).get();
+    if (!bv.is<SharedStr>()) {
+        f->at(dst).put(EvalValue());
+        return;
+    }
+    const std::string_view view = bv.get_ref<SharedStr>().get_view();
+    if (idx < 0 || static_cast<size_t>(idx) >= view.size()) {
+        f->at(dst).put(EvalValue());
+        return;
+    }
     f->at(dst).put(EvalValue(SharedStr(std::string(&view[idx], 1))));
 }
 
@@ -5488,10 +5541,16 @@ extern "C" void jit_member_fact_audit(int_type slot,
                                       const void *def) noexcept
 {
 #if ML_VM_HARDENING
+    /* #142: VM_HARDENING=1 with ASSERTS=0 is a real configuration (the CI
+     * release lanes are close to it), and there ML_VM_CHECK compiles away
+     * while the get_ref below does not - so the audit itself would throw
+     * out of a noexcept helper. Test structurally, assert on the result. */
     const EvalValue &v = g_current_ctx->frame->at(slot).get();
-    ML_VM_CHECK(v.is<intrusive_ptr<StructObject>>());
-    ML_VM_CHECK(v.get_ref<intrusive_ptr<StructObject>>()->def
-                == static_cast<const StructTypeDef *>(def));
+    const bool is_struct = v.is<intrusive_ptr<StructObject>>();
+    ML_VM_CHECK(is_struct);
+    ML_VM_CHECK(!is_struct
+                || v.get_ref<intrusive_ptr<StructObject>>()->def
+                       == static_cast<const StructTypeDef *>(def));
 #else
     (void)slot; (void)def;
 #endif
@@ -8215,13 +8274,23 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             /* bool-foreach loop var: bind a[i] as a real BOOL (not 0/1), so
              * `print(x)` shows true/false. `i` is loop-bounded (< ArrLen); the
              * base is a proven flat array<bool> (elem_is_bool). */
-            const SharedArrayObj &arr =
-                ctx.frame->at(in->target2).get().get_ref<SharedArrayObj>();
+            /* #142: the interpreted TWIN of jit_load_elem_bool - both the
+             * base's type and the index are compile-proven, and a corrupt
+             * image breaks either into a wild flat read. */
+            const EvalValue &bv = ctx.frame->at(in->target2).get();
             const int_type idx = read_int_operand(in->a(), &ctx);
-            const bool b =
-                arr.skind() == SharedArrayObj::Storage::bools
-                    ? arr.flat_bools()[arr.offset() + idx] != 0
-                    : arr.get_view()[idx].get().get<bool>();  /* general fallbk */
+            bool b = false;
+            if (bv.is<SharedArrayObj>()) {
+                const SharedArrayObj &arr = bv.get_ref<SharedArrayObj>();
+                if (idx >= 0 && static_cast<size_type>(idx) < arr.size()) {
+                    if (arr.skind() == SharedArrayObj::Storage::bools) {
+                        b = arr.flat_bools()[arr.offset() + idx] != 0;
+                    } else {                            /* general fallback */
+                        const EvalValue &e = arr.get_view()[idx].get();
+                        b = e.is<bool>() && e.get<bool>();
+                    }
+                }
+            }
             ctx.frame->at(in->target).put(EvalValue(b));
             pc++;
         }
@@ -9382,14 +9451,21 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             VM_NEXT;
         }
 
-        VM_CASE(ArrLen):
+        VM_CASE(ArrLen): {
             /* n = size(array). The base is a flat array (ForeachStmt::elem_th
-             * guarantees array<int>/array<float>), so read size() directly. */
-            ctx.frame->at(in->target).put(EvalValue(static_cast<int_type>(
-                ctx.frame->at(in->target2).get()
-                    .get_ref<SharedArrayObj>().size())));
+             * guarantees array<int>/array<float>), so read size() directly.
+             * #142: the interpreted TWIN of jit_arr_len - a corrupt image can
+             * break the proof, so the type test is explicit here too rather
+             * than left to get_ref's throw. */
+            const EvalValue &b = ctx.frame->at(in->target2).get();
+            ctx.frame->at(in->target).put(
+                b.is<SharedArrayObj>()
+                    ? EvalValue(static_cast<int_type>(
+                          b.get_ref<SharedArrayObj>().size()))
+                    : EvalValue());
             pc++;
-            VM_NEXT;
+        }
+        VM_NEXT;
 
         VM_CASE(StrLen):
             /* n = char count of the string (foreach bound over a proven str).
@@ -9404,11 +9480,19 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             /* x = a fresh 1-char string of the container's i-th char - matches
              * the tree-walker's SharedStr(string(&view[i], 1)). `i` is
              * loop-bounded (< StrLen), so view[i] is in range. */
-            const std::string_view view = ctx.frame->at(in->target2).get()
-                .get_ref<SharedStr>().get_view();
+            /* #142: the interpreted TWIN of jit_load_str_char. `i` being
+             * loop-bounded is a property of VALID bytecode; a corrupt image
+             * breaks it, and `&view[i]` unchecked is a WILD READ - worse
+             * than the wrong answer a mangled image is entitled to. */
+            const EvalValue &bv = ctx.frame->at(in->target2).get();
             const int_type i = read_int_operand(in->a(), &ctx);
+            const std::string_view view =
+                bv.is<SharedStr>() ? bv.get_ref<SharedStr>().get_view()
+                                   : std::string_view();
             ctx.frame->at(in->target).put(
-                EvalValue(SharedStr(std::string(&view[i], 1))));
+                i >= 0 && static_cast<size_t>(i) < view.size()
+                    ? EvalValue(SharedStr(std::string(&view[i], 1)))
+                    : EvalValue());
             pc++;
         }
         VM_NEXT;

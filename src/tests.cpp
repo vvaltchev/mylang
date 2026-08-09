@@ -19788,6 +19788,126 @@ static bool myv_untrusted_field_index()
 #endif
 }
 
+/*
+ * #142: a WRONG-TYPED base must not take the process down.
+ *
+ * Several ops read their base through an accessor that THROWS on a type
+ * miss - and some of them run inside `noexcept` JIT helpers the emitter
+ * gives no status test, where an escaping exception is std::terminate, not
+ * an error. Others index a string or a flat array with a compile-PROVEN
+ * index and no bound, which a corrupt image turns into a wild read.
+ *
+ * The proof is a compile-time one, so only a corrupt image breaks it. This
+ * retargets LoadStrChar's BASE at a slot holding an int - the shape that
+ * aborted the process with no message - and requires a defined outcome.
+ */
+static bool myv_wrong_typed_base()
+{
+    /* A `foreach` over a STRING emits LoadStrChar; one over a flat bool
+     * array emits ArrLen + LoadElemBool. Those are the three ops whose
+     * base/index proof #142 stopped trusting - all in one program, so the
+     * test covers the CLASS and not one member of it. */
+    const char *lines_arr[] = {
+        "var s = \"abcdef\";",
+        "var n = 0;",
+        "foreach (var c in s) { n += len(c); }",
+        "var bs = [true, false, true, true];",
+        "var bc = 0;",
+        "foreach (var b in bs) { if (b) bc += 1; }",
+        "print(n, bc);" };
+
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-wrongbase.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    g_exec_engine = ExecEngine::Vm;
+    /*
+     * Load with the JIT OFF so myv_read's load-time tier compiles NOTHING,
+     * retarget the ops, and only THEN jit. Otherwise the fragments would be
+     * built from the original operands and the run would never reach the
+     * `noexcept` helpers - which are the whole point, since an escaping
+     * exception is fatal there and merely an error in the interpreter.
+     */
+    g_jit_enabled = false;
+    bool ok = false;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        myv_write(prog, path, MyvSourceRef());
+        MyvSource s;
+        VmProgram loaded = myv_read(path, s);
+
+        /*
+         * Retarget every one of the three at a slot holding an INT - a
+         * type none of them accepts, and (as an index) far past any real
+         * string or array. Slot 0 is main's first local, which both
+         * `foreach`es have already left holding a counter or a container;
+         * whatever it holds, it is not the string LoadStrChar wants.
+         */
+        int patched = 0;
+        for (Instr &in : loaded.root.code) {
+            if (in.op == OpCode::LoadStrChar
+                || in.op == OpCode::ArrLen
+                || in.op == OpCode::LoadElemBool) {
+                in.target2 = 1;         /* base <- an int-holding local */
+                patched++;
+            }
+        }
+        /* THREE, not four: `str.len` (StrLen) is also in this program and
+         * also reads its base through get_ref, but it can only THROW - a
+         * defined outcome - and it has no noexcept helper, so it is not in
+         * this class and is deliberately left alone. */
+        if (patched != 3) {
+            fprintf(stderr, "myv-wrongbase: expected 3 base reads, found "
+                            "%d - the shape changed\n", patched);
+            g_exec_engine = saved;
+            g_jit_enabled = saved_jit;
+            remove(path.c_str());
+            return false;
+        }
+
+        g_jit_enabled = saved_jit;      /* now build the native tier... */
+        if (g_jit_enabled)
+            vm_jit_loaded_image(loaded);   /* ...from the RETARGETED ops */
+
+        /* ANY defined outcome passes - a value or a clean exception. What
+         * must not happen is a crash, which no return value can express:
+         * the process simply dies and the harness reports nothing. */
+        try {
+            vm_run(loaded);
+        } catch (Exception &) {
+        }
+        ok = true;
+    } catch (Exception &e) {
+        fprintf(stderr, "myv-wrongbase: setup threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+    }
+    remove(path.c_str());
+    g_exec_engine = saved;
+    g_jit_enabled = saved_jit;
+    return ok;
+}
+
 static bool myv_loc_escapes()
 {
     /* 320 spaces before the statement: its caret column exceeds 254 */
@@ -27793,6 +27913,8 @@ static const std::vector<extra_check> extra_checks =
       myv_corrupt_refused },
     { "myv: an UNTRUSTED image's out-of-range field index is caught (#137)",
       myv_untrusted_field_index },
+    { "myv: a WRONG-TYPED base does not take the process down (#142)",
+      myv_wrong_typed_base },
     { "myv: Loc escapes - delta table + narrow pool Locs",
       myv_loc_escapes },
     { "vm: the handler table describes each try region (#78)",
