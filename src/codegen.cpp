@@ -7589,6 +7589,98 @@ static bool retargetable_dst(OpCode op)
 /* #78: `chunk` is non-const now - the pass remaps the HANDLER TABLE's pcs
  * alongside the instruction pc fields (threading, target marking,
  * compaction). Everything else it reads stays read-only. */
+/* Lever A (see codegen.h): temp live-out + branch-target flags for the
+ * JIT's dead-temp forwarding, over the chunk's FINAL Instr code. The same
+ * fixpoint as the peephole's E1 block, on the same audited enumerations -
+ * kept here so jit.cpp never grows a drifting copy of visit_use_def /
+ * visit_pc_fields / the handler collection. */
+bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
+                  std::vector<char> &is_tgt)
+{
+    const size_t n = chunk.code.size();
+    liveout.clear();
+    is_tgt.assign(n + 1, 0);
+
+    std::vector<int> handler_pcs;
+    for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : hs.clauses)
+            handler_pcs.push_back(cl.body_pc);
+        if (hs.fin_pc >= 0)
+            handler_pcs.push_back(hs.fin_pc);
+    }
+    for (int h : handler_pcs)
+        if (h >= 0 && static_cast<size_t>(h) <= n)
+            is_tgt[h] = 1;
+    for (size_t p = 0; p < n; p++) {
+        /* visit_pc_fields takes Instr& (the remaps write through it); this
+         * read-only walk borrows it via a const_cast, mutating nothing. */
+        Instr &in = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(in, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) <= n)
+                is_tgt[t] = 1;
+        });
+    }
+
+    if (chunk.n_temps <= 0 || chunk.n_temps > 64)
+        return false;                    /* reads may forward; no elision */
+
+    const int tbase = chunk.slot_count;
+    const uint64_t all = chunk.n_temps == 64
+        ? ~uint64_t(0) : ((uint64_t(1) << chunk.n_temps) - 1);
+    const auto bit = [&](int slot) -> uint64_t {
+        return (slot >= tbase && slot < tbase + chunk.n_temps)
+            ? (uint64_t(1) << (slot - tbase)) : 0;
+    };
+
+    std::vector<uint64_t> live_in(n, 0);
+    for (bool changed = true; changed; ) {
+        changed = false;
+        uint64_t hlive = 0;
+        for (int h : handler_pcs)
+            if (h >= 0 && static_cast<size_t>(h) < n)
+                hlive |= live_in[h];
+        for (size_t r = 0; r < n; r++) {
+            const size_t p = n - 1 - r;
+            Instr &in = const_cast<Instr &>(chunk.code[p]);
+            uint64_t out = hlive;
+            visit_pc_fields(in, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) < n)
+                    out |= live_in[t];
+            });
+            if (op_falls_through(in.op) && p + 1 < n)
+                out |= live_in[p + 1];
+            uint64_t use = 0, def = 0;
+            const bool known = visit_use_def(in,
+                [&](int s) { use |= bit(s); },
+                [&](int s) { def |= bit(s); });
+            const uint64_t lin = known ? ((out & ~def) | use) : all;
+            if (lin != live_in[p]) {
+                live_in[p] = lin;
+                changed = true;
+            }
+        }
+    }
+
+    /* live-OUT per pc: successors' live-in + the handler absorption */
+    uint64_t hlive = 0;
+    for (int h : handler_pcs)
+        if (h >= 0 && static_cast<size_t>(h) < n)
+            hlive |= live_in[h];
+    liveout.assign(n, 0);
+    for (size_t p = 0; p < n; p++) {
+        Instr &in = const_cast<Instr &>(chunk.code[p]);
+        uint64_t out = hlive;
+        visit_pc_fields(in, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) < n)
+                out |= live_in[t];
+        });
+        if (op_falls_through(in.op) && p + 1 < n)
+            out |= live_in[p + 1];
+        liveout[p] = out;
+    }
+    return true;
+}
+
 static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
 {
     if (code.empty())

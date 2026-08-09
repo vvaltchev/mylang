@@ -1236,6 +1236,41 @@ arg-setup moves surround every call; the OTHER `bad()` sites are the same
 kind of opportunity and the same treatment applies - each needs its own
 argument for why a pinned operand is type-safe there.
 
+**LEVER A - ADJACENT DEAD-TEMP FORWARDING (2026-08-03,
+plans/unboxing.md).** A whitelisted int PRODUCER (LoadElemInt,
+LoadElem2Int, the specialized IntBin RR/RI family) immediately followed
+by a whitelisted CONSUMER (the RR/RI family, IntAddStep) reading its
+TEMP dst hands the value over IN RAX: the consumer skips the slot load
+(a COMMUTATIVE op with the `b` operand forwarded SWAPS the operand
+roles - rax = b OP a - instead of moving RAX aside; only sub pays a
+mov), and when the temp is provably DEAD after the consumer and not
+ref-listed, the producer skips the two-store entirely. Deadness comes
+from **`jit_fwd_info`** (codegen.cpp/.h) - the E1 liveness machinery
+(visit_use_def / visit_pc_fields / handler absorption) run at JIT time
+on the FINAL post-splice code, so jit.cpp grew no second per-op table;
+building it found E1's handler absorption EMPTY since #78 step D
+(PushHandler.target went -1; now collected from handler_sites - fixed,
+conservative direction, measured neutral). Guards: same run, adjacent
+pcs, consumer not a branch/handler target or entry pc, TEMPS only, no
+cache barriers; a producer's SLOW tier reloads RAX on its rejoin (the
+helper's status clobbers it), and a REF-LISTED dst keeps its write with
+the reload in store_dst's COLD ref arm only - the v1 hot-path reload +
+move-aside MEASURED the whole yield away (+2 Ir/iter on 46 against the
+predicted -2; the scale-delta A/B caught it, the distrust-a-surprising-
+result rule in action). The `jit_fwd_consumer` CONTRACT: every op it
+accepts must honor `g_fwd.in_rax` in its emit - grow both sides in the
+same change. skip_write is defense in depth today (forcing it survives
+suite + fuzzer: current pairs' temps are consumed exactly once); it is
+what makes GROWING the consumer whitelist safe (a counted loop's BOUND
+temp is live every iteration). Execution-proven by `g_jit_fwd` (bumped
+by emitted consumers; the jit_fwd_deadtemp test pins the chain, the
+matmul shape, and the slow-path rejoin - all sabotage-verified).
+Measured (callgrind Ir, OPT=1 ASSERTS=0): 46_matrix_mult -2.19%/iter,
+14_array_subscript -1.2%/iter, 07_nested_loops -2.83%, 03_int_arith
+-1.36% whole-program; the rest <= +0.04% (link noise per the -nj
+control). The write elision is throttled by ref_slots' conservatism -
+narrowing it is C3 (plans/typed-invariant-arrays.md).
+
 **N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to `MAX_CACHED` hot
 int-scalar slots are pinned in `r12`-`r15` per fragment
 (`pick_cached_slots`, jit.cpp):

@@ -53,6 +53,7 @@ unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
 unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
+unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 }
@@ -2511,7 +2512,7 @@ static void emit_put_int_call(Emitter &e, const void *fn, int slot,
  * store); everything else is the branchless two-store (contract 3).
  */
 static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
-                      int dst, uint32_t bail_pc)
+                      int dst, uint32_t bail_pc, bool keep_rax = false)
 {
     (void)bail_pc;                       /* no bail: helper on the ref path */
     const SlotAddr a = slot_addr(dst);
@@ -2520,6 +2521,11 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
         const size_t jb_fast = emit_ref_check(e, a.type);
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_int),
                           dst, src_reg);
+        if (keep_rax)                         /* lever A: the put call
+                                               * clobbered RAX - COLD-arm
+                                               * reload (the hot two-store
+                                               * preserves it for free) */
+            e.load(RAX, a.payload);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch8(jb_fast, e.pos());           /* fast: */
         e.store(RSI, a.type);                 /* the int Type singleton */
@@ -2562,14 +2568,125 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
  * payload only; the type flushes at exit) if pinned, else store_dst's
  * memory two-store / ref-bail. */
 static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
-                       uint32_t bail_pc)
+                       uint32_t bail_pc, bool keep_rax = false)
 {
     const int cr = e.creg(slot);
     if (cr >= 0) {
         e.mov_rr(static_cast<uint8_t>(cr), src);
         return;
     }
-    store_dst(e, ck, src, slot, bail_pc);
+    store_dst(e, ck, src, slot, bail_pc, keep_rax);
+}
+
+/*
+ * ---- Lever A: ADJACENT DEAD-TEMP FORWARDING (plans/unboxing.md) ----
+ *
+ * The measured shape: each op is emitted independently, so a value flows
+ * producer -> temp slot (two stores, plus a ref check when the temp is
+ * ref-listed) -> consumer (a load) even when the temp is alive for
+ * exactly one instruction (elem2 -> mul -> addstep round-trips ~7 of
+ * 46_matrix_mult's 91.5 Ir/iter). When a whitelisted PRODUCER (ends with
+ * its int result in RAX) is immediately followed by a whitelisted
+ * CONSUMER reading that temp, the value is handed over IN RAX: the
+ * consumer skips the slot load, and when the temp is provably DEAD after
+ * the consumer (jit_fwd_info's liveness - throw-resume paths included)
+ * and not ref-listed, the producer skips the slot write entirely.
+ *
+ * The guards, each load-bearing:
+ *  - SAME RUN, adjacent pcs; neither op cache-barrier'd.
+ *  - the consumer pc is NOT a branch/handler target (jit_fwd_info's
+ *    is_tgt) and NOT a post-call resume entry - a jump-in would arrive
+ *    with garbage RAX. (A resume entry after a non-call producer is
+ *    structurally impossible; the check is a belt.)
+ *  - TEMPS only (>= slot_count): a local is observable state and may be
+ *    N5-cached; a temp is neither.
+ *  - the consumer may read the temp ONLY at forwardable operand
+ *    positions (jit_fwd_consumer enumerates them per op) - any other
+ *    field naming it (a counter, a bound) reads the SLOT, which
+ *    skip_write may have left stale.
+ *  - a producer with a SLOW tier reloads RAX from the slot on the
+ *    slow-path rejoin (the helper wrote the slot but returns its status
+ *    in eax); write-skip stays fast-path-only, which is consistent -
+ *    the slot is stale only where nothing reads it.
+ *  - a REF-LISTED producer dst keeps its write (the release semantics);
+ *    store_dst's COLD ref arm - the jit_put_int call, which clobbers
+ *    RAX - reloads it there, so the hot two-store path pays nothing
+ *    (an unconditional post-write reload measured the whole yield away:
+ *    +2 Ir/iter on 46_matrix_mult against the predicted -2).
+ *
+ * HONESTY NOTE on the deadness net: forcing skip_write unconditionally
+ * survives the full suite AND a 200-program fuzz round - for the
+ * CURRENT whitelists, a temp consumed by the adjacent op is always dead
+ * (codegen's expression temps are consumed exactly once). The net is
+ * what makes GROWING the consumer whitelist safe: admitting, say,
+ * JumpUnlessIntCmp would pair a counted loop's BOUND temp, which is
+ * read every iteration - exactly the shape the liveness refuses. Keep
+ * the net; it is the invariant, not the reach.
+ *
+ * THE CONTRACT jit_fwd_consumer PINS: for every op it returns true for,
+ * that op's emit (emit_op / emit_branch) honors g_fwd.in_rax for exactly
+ * the operand positions the predicate accepted. Growing the whitelist
+ * means growing BOTH sides in the same change.
+ */
+struct JitFwd {
+    int in_rax = -1;    /* consumer side: RAX holds this TEMP's value */
+    int prod = -1;      /* producer side: this op's dst temp qualifies */
+    bool skip_write = false;
+    bool armed = false; /* the producer's emit confirmed RAX at its exit */
+};
+static JitFwd g_fwd;
+
+static bool jit_slot_ref_listed(const Chunk &ck, int slot)
+{
+    return std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                              static_cast<int32_t>(slot));
+}
+
+static bool jit_fwd_producer(const Instr &in, int &dst)
+{
+    switch (in.op) {
+    case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+    case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+    case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+    case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+    case OpCode::LoadElemInt:
+    case OpCode::LoadElem2Int:
+        dst = in.target;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool jit_fwd_consumer(const Instr &nx, int t)
+{
+    switch (nx.op) {
+    case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+    case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+        return nx.a_slot() == t
+            || (!nx.b_is_lit() && nx.b_slot() == t);
+    case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+    case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+        return nx.a_slot() == t;
+    case OpCode::IntAddStep:
+        /* the accumulate VALUE only; the accumulator, the counter and a
+         * slot bound all read their SLOTS */
+        return !nx.b_is_lit() && nx.b_slot() == t
+            && nx.a_dual_lo() != t && nx.target2 != t
+            && (nx.a_is_lit() || nx.a_dual_hi() != t);
+    default:
+        return false;
+    }
+}
+
+/* TESTS: the execution proof - forwarded consumers bump at RUNTIME (the
+ * emitted-code counter rule; rdx is dead at every bump site). */
+static void emit_fwd_bump(Emitter &e)
+{
+#ifdef TESTS
+    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_fwd));
+    e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
+#endif
 }
 
 /* THE REGISTER-CACHE AUDIT (env MYLANG_CACHEAUDIT=1). Which opcode
@@ -3929,6 +4046,14 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(in.target2);
     const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
+    /* lever A producer (the int tails; the CALLER reloads RAX on the
+     * slow-path rejoin and arms the state - see the LoadElem2 case) */
+    const bool fw = !is_float && g_fwd.prod == in.target;
+    const auto dst_write = [&]() {
+        if (fw && g_fwd.skip_write)
+            return;
+        store_dst(e, ck, RAX, in.target, pc, fw);
+    };
 
     /* OUTER: array, general storage; a SLICE outer takes its arm (#95) */
     e.load(RAX, base.type);
@@ -4018,14 +4143,14 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     count_and_idx(/*bytes=*/true);
     e.load_elem_byte();                        /* movzx eax, [rcx + r9] */
     bump();
-    store_dst(e, ck, RAX, in.target, pc);
+    dst_write();
     dones.push_back(e.jmp32());
 
     e.patch32_here(j_ints);
     count_and_idx(/*bytes=*/false);
     e.load_elem_int();                         /* rax = [rcx + r9*8] */
     bump();
-    store_dst(e, ck, RAX, in.target, pc);
+    dst_write();
     dones.push_back(e.jmp32());
 
     /*
@@ -4076,7 +4201,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
         emit_float_store(e, ck, X0, in.target, pc);
     } else {
         e.load_elem_int();
-        store_dst(e, ck, RAX, in.target, pc);
+        dst_write();
     }
     dones.push_back(e.jmp32());
 }
@@ -4450,10 +4575,39 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         case OpCode::IntOrRR:  case OpCode::IntOrRI:  aop = Op::bor;   break;
         default:                                      aop = Op::bxor;  break;
         }
-        read_slot(e, RAX, in.a_slot());
-        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        /* lever A, the CONSUMER side: a forwarded operand is already in
+         * RAX. A commutative op with the `b` operand forwarded SWAPS the
+         * roles (rax = b OP a == a OP b) instead of moving RAX aside -
+         * the swap costs nothing where the move-aside cost the saved
+         * load back (measured +2 Ir/iter on 46_matrix_mult, the first
+         * version's whole yield inverted). Only sub - non-commutative -
+         * pays the move. */
+        const int fin = g_fwd.in_rax;
+        const bool fa = fin >= 0 && in.a_slot() == fin;
+        const bool fb = fin >= 0 && !in.b_is_lit() && in.b_slot() == fin;
+        if (fa || fb)
+            emit_fwd_bump(e);
+        if (fa && fb) {
+            e.mov_rr(RCX, RAX);            /* t OP t */
+        } else if (fb && aop == Op::minus) {
+            e.mov_rr(RCX, RAX);
+            read_slot(e, RAX, in.a_slot());
+        } else if (fb) {
+            read_slot(e, RCX, in.a_slot());   /* commutative swap */
+        } else if (fa) {
+            load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        } else {
+            read_slot(e, RAX, in.a_slot());
+            load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        }
         op_rr(e, aop);
-        write_slot(e, ck, RAX, in.target, pc);
+        /* lever A, the PRODUCER side: elide a dead temp's write; a kept
+         * (ref-listed) write reloads RAX in store_dst's COLD arm only. */
+        const bool fw = g_fwd.prod == in.target;
+        if (!(fw && g_fwd.skip_write))
+            write_slot(e, ck, RAX, in.target, pc, fw);
+        if (fw)
+            g_fwd.armed = true;
         return true;
     }
 
@@ -4655,6 +4809,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const SlotAddr base = slot_addr(in.target2);
         std::vector<size_t> j_slows;
         size_t j_done = 0, j_done2 = 0;
+        /* lever A producer: elide a dead temp's write on the fast arms
+         * (the SLOW tier's helper always writes the slot; its rejoin
+         * reloads RAX below, so the contract holds on both paths). */
+        const bool fw = !is_float && g_fwd.prod == in.target;
+        const auto dst_write = [&]() {
+            if (fw && g_fwd.skip_write)
+                return;
+            write_slot(e, ck, RAX, in.target, pc, fw);
+        };
 
         e.load(RAX, base.type);                  /* base an array? */
         e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
@@ -4700,7 +4863,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             j_slows.push_back(e.j32(0x73));
             e.load_elem_int();
             e.patch32_here(j_store);
-            write_slot(e, ck, RAX, in.target, pc);
+            dst_write();
             j_done = e.j32(0xEB);
         }
         /*
@@ -4732,7 +4895,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_float_store(e, ck, X0, in.target, pc);
         } else {
             e.load_elem_int();
-            write_slot(e, ck, RAX, in.target, pc);
+            dst_write();
         }
         j_done2 = e.j32(0xEB);
         /* slow: the interpreter-core helper; OOB/type conveys */
@@ -4760,8 +4923,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
+        /* lever A: the helper's status clobbered RAX - slow-path-only
+         * reload (the fast dones jump PAST it, keeping their RAX) */
+        if (fw)
+            e.load(RAX, slot_addr(in.target).payload);
         e.patch32_here(j_done);
         e.patch32_here(j_done2);
+        if (fw)
+            g_fwd.armed = true;
         return true;
     }
 
@@ -4804,8 +4973,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
+        /* lever A: slow-path-only RAX reload (fast dones jump past it) */
+        const bool fw2 = in.op == OpCode::LoadElem2Int
+            && g_fwd.prod == in.target;
+        if (fw2)
+            e.load(RAX, slot_addr(in.target).payload);
         for (const size_t j : e2_dones)      /* #93: fast tail rejoins */
             e.patch32_here(j);
+        if (fw2)
+            g_fwd.armed = true;
         }
         return true;
 
@@ -6953,8 +7129,18 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * else slot). step is always 1. */
         const bool up = in.aop == Op::lt || in.aop == Op::le;
         const int adst = in.a_dual_lo();
-        read_slot(e, RAX, adst);
-        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        /* lever A consumer: the accumulate VALUE may arrive in RAX.
+         * `+` commutes, so SWAP the roles - the accumulator loads into
+         * RCX and rax = value + accumulator (no move-aside). */
+        const bool fb = g_fwd.in_rax >= 0 && !in.b_is_lit()
+            && in.b_slot() == g_fwd.in_rax;
+        if (fb) {
+            emit_fwd_bump(e);
+            read_slot(e, RCX, adst);
+        } else {
+            read_slot(e, RAX, adst);
+            load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        }
         op_rr(e, Op::plus);
         write_slot(e, ck, RAX, adst, pc);
         read_slot(e, RAX, in.target2);
@@ -8160,6 +8346,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     if (!g_jit_enabled || chunk.code.empty())
         return;
 
+    /* Lever A: neutral forwarding state BEFORE any emission - the
+     * container path below shares emit_op but not the pairing protocol,
+     * and a stale prod/in_rax from a previous chunk's last op would
+     * otherwise leak into its cases. */
+    g_fwd = JitFwd{};
+
     /* model-flip M3: try the native-container path first (a narrow gate); on a
      * match it emits the whole-function container and we're done. Otherwise the
      * chunk is pristine and the per-run path below runs unchanged. */
@@ -8194,6 +8386,15 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     }
     if (runs.empty())
         return;
+
+    /* Lever A: temp live-out + branch/handler-target flags over the
+     * FINAL code (post-splice - this runs at JIT time), from codegen's
+     * audited enumerations. Without computable liveness the pairs still
+     * forward READS; only the write elision needs deadness. */
+    std::vector<uint64_t> fwd_lout;
+    std::vector<char> fwd_tgt;
+    const bool fwd_live_ok = jit_fwd_info(chunk, fwd_lout, fwd_tgt);
+    g_fwd = JitFwd{};
 
     /* op -> enum NAME (the audit's label; from the X-macro, so it can
      * never drift from the opcode list) */
@@ -8507,6 +8708,38 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 marks.push_back({ static_cast<uint32_t>(e.pos() - frag_off[r]),
                                   static_cast<uint32_t>(remap[pc]) });
             const Instr &in = chunk.code[pc];
+
+            /* Lever A protocol. in_rax is one-shot: it names the temp
+             * whose value the JUST-EMITTED producer left in RAX (nothing
+             * is emitted between two ops - labels and marks are
+             * metadata - so RAX survives the boundary). Then decide
+             * whether THIS op produces for the next one. */
+            g_fwd.in_rax = g_fwd.armed ? g_fwd.prod : -1;
+            g_fwd.prod = -1;
+            g_fwd.skip_write = false;
+            g_fwd.armed = false;
+            int fdst;
+            if (pc + 1 < end
+                    && !cache_barrier[pc - begin]
+                    && !cache_barrier[pc + 1 - begin]
+                    && jit_fwd_producer(in, fdst)
+                    && fdst >= chunk.slot_count          /* a TEMP only */
+                    && jit_fwd_consumer(chunk.code[pc + 1], fdst)
+                    && !fwd_tgt[pc + 1]
+                    && !std::binary_search(
+                           entries.begin(), entries.end(),
+                           std::make_pair(pc + 1, size_t(0)),
+                           [](const std::pair<size_t, size_t> &x,
+                              const std::pair<size_t, size_t> &y) {
+                               return x.first < y.first;
+                           })) {
+                g_fwd.prod = fdst;
+                const int tb = fdst - chunk.slot_count;
+                g_fwd.skip_write = fwd_live_ok && tb < 64
+                    && !(fwd_lout[pc + 1] & (uint64_t(1) << tb))
+                    && !jit_slot_ref_listed(chunk, fdst);
+            }
+
             /* An op that touches slots the emitter cannot enumerate is
              * BRACKETED: flush the pinned registers so it reads current values,
              * reload after so anything it wrote is picked up (the ordinary
