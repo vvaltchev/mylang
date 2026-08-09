@@ -116,6 +116,36 @@ of a guess.
    already stores for the store side, so reuse the pool rather than
    inventing a second one.
 
+   **THE EXACT EDIT SITES** (located 2026-08-01, so the next session does
+   no rediscovery). A new opcode touches eight files; APPEND it to the
+   enum so nothing renumbers, and bump the format version anyway, because
+   an old binary would otherwise accept a new image and misread the op.
+
+       src/bytecode.h    the OpCode enum (append, near LoadElemInt:191)
+                         ML_FOR_EACH_OPCODE (append; line ~1153)
+                         -- the enum/list order is static_asserted
+       src/serialize.h   MYV_FORMAT_VERSION 9 -> 10   (line 26)
+       src/codegen.cpp   the LOWERING - codegen.cpp:4268 already comments
+                         that `a[i][j]` is base_array whose base is itself
+                         a subscript; that is the site. Plus the tables at
+                         242, 7031 (loc/caret extraction), 7386, 7462,
+                         8000
+       src/vm.cpp        the interpreted VM_CASE beside LoadElemInt:7570,
+                         and the shared core beside the existing
+                         vm_load_elem_int_core:2909
+       src/jit.cpp       1028 (op classification), 2568
+                         (pick_cached_slots - the base slots stay bad(),
+                         the two INDICES are countable int uses), 3702
+                         (the emit - extend emit_elem_base_gate /
+                         emit_elem_int_read to two levels), 6531
+       src/disasm.cpp    1024
+       src/tests.cpp     15054 (the op-coverage switch) + the new tests
+
+   The JIT emit is the only novel part: two `emit_elem_base_gate` /
+   `emit_elem_int_read` sequences back to back, with the inner base coming
+   from the outer read's general-storage element rather than from a frame
+   slot. Everything else is table plumbing.
+
 3. **`LoadElem2Float`** - the twin, once the int one is green and
    measured.
 
