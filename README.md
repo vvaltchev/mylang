@@ -1017,6 +1017,18 @@ Key rules:
     also return a `bool`. The logical operators `&& || !` return a `bool` too.
     A comparison/logical result therefore infers as `bool` (e.g. `var ok = a <
     b;` makes `ok` a `bool`), and an array of such results is `array<bool>`.
+  * **`&&` and `||` short-circuit.** The operand that *determines* the result
+    stops the chain — `false` for `&&`, `true` for `||` — so the rest is never
+    evaluated: its side effects do not happen and its errors are not raised.
+    That is what makes the guard idiom work:
+
+    ```C#
+    if (i < len(a) && a[i] > 0) { ... }   # no out-of-bounds when i is too big
+    if (p != none && p.x > 0) { ... }     # p.x is not read when p is none
+    ```
+
+    The *value* is unaffected — `a && b` is still `bool(a) && bool(b)`, so
+    `false || 5` is `true`, not `5` (unlike Python, which yields the operand).
   * **Bitwise / shift operators** `~ & ^ | << >> >>>` work like in C/C++, but on
     **`int` only** (a `bool` operand promotes to `int`; a `float`/`str`/... is a
     compile-time type error). The result is always `int`. `~` is bitwise NOT;

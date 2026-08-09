@@ -4581,6 +4581,122 @@ static const std::vector<test> tests =
         "var g = 5;" },
       &typeid(UnboundSymbolEx), 26, 1, 28, 1 },
     /*
+     * #138 - `&&` and `||` SHORT-CIRCUIT. The determining operand stops the
+     * chain: the rest is not evaluated, so its side effects do not happen and
+     * its errors are not raised. That is what makes the guard idiom work.
+     *
+     * NOTE these must be SIDE-EFFECT or ERROR assertions. The VALUE semantics
+     * did not change at all (`a && b` was already `bool(a) && bool(b)`), so a
+     * result-only test cannot tell the two lowerings apart - which is exactly
+     * how the eager form survived this long.
+     */
+    {
+        "short-circuit: && does not evaluate its tail when the lhs is false",
+        {
+            "var calls = 0;",
+            "func bump() { calls += 1; return true; }",
+            "var a = runtime(0) > 1 && bump();",
+            "assert(a == false);",
+            "assert(calls == 0);",
+            /* ... and DOES when the lhs is true */
+            "var b = runtime(1) > 0 && bump();",
+            "assert(b == true);",
+            "assert(calls == 1);",
+        }
+    },
+    {
+        "short-circuit: || does not evaluate its tail when the lhs is true",
+        {
+            "var calls = 0;",
+            "func bump() { calls += 1; return true; }",
+            "var a = runtime(1) > 0 || bump();",
+            "assert(a == true);",
+            "assert(calls == 0);",
+            "var b = runtime(0) > 1 || bump();",
+            "assert(b == true);",
+            "assert(calls == 1);",
+        }
+    },
+    {
+        /* the ERROR half - the tail is not merely unevaluated, it cannot
+         * throw. This is the shape that makes `&&` usable as a guard. */
+        "short-circuit: a skipped tail cannot raise",
+        {
+            "var a = [1];",
+            "var i = int(runtime(5));",
+            "var hit = 0;",
+            "if (i < len(a) && a[i] > 0) { hit = 1; }",   /* no OutOfBounds */
+            "assert(hit == 0);",
+            "var z = int(runtime(0));",
+            "var ok = z != 0 && 10 / z > 1;",             /* no div-by-zero */
+            "assert(ok == false);",
+        }
+    },
+    {
+        /* a CHAIN stops at the FIRST determining operand, not the last */
+        "short-circuit: a 3-operand chain stops at the first that decides",
+        {
+            "var calls = 0;",
+            "func bump() { calls += 1; return true; }",
+            "var a = runtime(1) > 0 && runtime(0) > 1 && bump();",
+            "assert(a == false);",
+            "assert(calls == 0);",
+        }
+    },
+    {
+        /* the M8 TYPED chain must agree with the boxed one operand for
+         * operand - which form a node gets is an inference detail the program
+         * cannot see, so a divergence there would be invisible until it bit */
+        "short-circuit: the TYPED (int) chain agrees with the boxed one",
+        {
+            "var calls = 0;",
+            "func bump() { calls += 1; return 1; }",
+            "var i = 0;",
+            "var n = 0;",
+            "while (i < 3) { if (i > 5 && bump() > 0) { n = 1; } i++; }",
+            "assert(n == 0);",
+            "assert(calls == 0);",
+        }
+    },
+    {
+        /*
+         * the BOXED tree-walker chain (Expr11/Expr12::do_eval), which a `dyn`
+         * operand forces - every other case here lands on the M8 TYPED form
+         * instead, so without this one the boxed path is untested. Watched:
+         * reverting only the boxed half left the whole suite green.
+         */
+        "short-circuit: the BOXED (dyn-operand) chain short-circuits too",
+        {
+            "var calls = 0;",
+            "func bump() { calls += 1; return true; }",
+            "var dyn d = runtime(0);",
+            "var a = d && bump();",
+            "assert(a == false);",
+            "assert(calls == 0);",
+            "var dyn e = runtime(1);",
+            "var b = e || bump();",
+            "assert(b == true);",
+            "assert(calls == 0);",
+        }
+    },
+    {
+        /* the CONST-folded spelling was already short-circuiting - that split
+         * IS the bug (#138). Both spellings in one case so they cannot drift
+         * apart again. */
+        "short-circuit: the const-folded and runtime spellings agree",
+        {
+            "var calls = 0;",
+            "func bump() { calls += 1; return true; }",
+            "const F = false;",
+            "var a = F && bump();",
+            "var b = runtime(0) > 1 && bump();",
+            "assert(a == false);",
+            "assert(b == false);",
+            "assert(calls == 0);",
+        }
+    },
+
+    /*
      * STEP 7 tier 2 - THE PROVER. A call that is GUARANTEED to raise
      * UnboundSymbolEx is refused at COMPILE time. The guard on every RUNTIME
      * test above ("if (runtime(1) > 0)") exists because of this: an
@@ -4629,16 +4745,15 @@ static const std::vector<test> tests =
         "var t = fetch();",
         "assert(t == 7);",
         "var g = 5;" } },
-    { "prover: declines a call in an `&&` TAIL",
-      { /* the tail is a position the prover treats as conditional, so it
-         * must not refuse. NOTE it still RAISES at run time, because
-         * MyLang's `&&` does not actually short-circuit (#138) - the point
-         * of this case is the COMPILE decision, so the raise is caught. */
+    { "prover: declines a call in an `&&` TAIL - which then never runs",
+      { /* the tail is a position the prover treats as conditional, so it must
+         * not refuse - and since #138 the tail is genuinely SKIPPED, so the
+         * program is not merely accepted, it is correct. Both halves in one
+         * case on purpose: the decline and the short-circuit have to agree,
+         * or the prover is reasoning about code that does run. */
         "func fetch() { return g; }",
-        "var out = 0;",
-        "try { var ok = runtime(0) > 1 && fetch() > 0; }",
-        "catch (UnboundSymbolEx) { out = 1; }",
-        "assert(out == 1);",
+        "var ok = runtime(0) > 1 && fetch() > 0;",
+        "assert(ok == false);",
         "var g = 5;" } },
     { "prover: declines a lazy builtin's ARGUMENT (it is not a read)",
       { /* isbound(g)/defined(g) are exactly how a program avoids the error
@@ -25762,8 +25877,24 @@ static bool vm_codegen_shapes()
     const bool boxed_cmp_ok =
         bxcmp.cmpv == 1 && bxcmp.jutv == 1;
 
-    /* 22) boxed LOGICAL condition: `if (x > 0 && x < 20)` (x dyn) -> two
-     * CmpV + a LogV + a JumpUnlessTrueV, no fallback. */
+    /*
+     * 22) boxed LOGICAL condition: `if (x > 0 && x < 20)` (x dyn). Since #138
+     * a logical chain SHORT-CIRCUITS, so it is no longer one LogV over two
+     * ready operands - it is a branch structure:
+     *
+     *     cmp.v        r3 = x > 0
+     *     log.v        r2 = r3 && r3      ; r2 = bool(r3)
+     *     jmp.ifnot.v  r2, L8             ; short-circuit: skip the rhs
+     *     cmp.v        r4 = x < 20
+     *     log.v        r2 = r4 && r4      ; r2 = bool(r4)
+     *  L8 jmp.ifnot.v  r2, ...            ; the `if`'s own branch
+     *
+     * so TWO of each, and no fallback. The chain's exit lands directly on the
+     * `if`'s branch, so a false chain costs one extra branch, not a join
+     * block. Pinning the counts is what would catch a regression to the eager
+     * form, which no VALUE assertion can see (short-circuiting changes only
+     * side effects and errors, never the result).
+     */
     VmOpCounts bxlog;
     if (!codegen_counts({
             "var dyn x = 5; x = x + 1;",
@@ -25771,7 +25902,7 @@ static bool vm_codegen_shapes()
         }, bxlog))
         return false;
     const bool boxed_log_ok =
-        bxlog.cmpv == 2 && bxlog.logv == 1 && bxlog.jutv == 1
+        bxlog.cmpv == 2 && bxlog.logv == 2 && bxlog.jutv == 2
        ;
 
     /* 23) a boxed NON-LOCAL leaf: `s = s + g` where g is a GLOBAL (read by a
