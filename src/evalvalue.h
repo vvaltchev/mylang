@@ -708,6 +708,13 @@ public:
     }
 
     bool is_const_var() const { return is_const; }
+
+    /* #92 Native-AOT layout probe, co-located with the member on purpose
+     * (the SharedArrayObj::jit_probe precedent): the inline STORE tier
+     * must refuse a const-bound slot and needs this flag's byte offset.
+     * Reading the real member means a layout change cannot move it out
+     * from under the emitter. Probe-only, never hot. */
+    const bool &jit_const_probe() const { return is_const; }
     const EvalValue &get() const { return val; }
     EvalValue get_rval() const { return val; }
     Type *valtype() const { return val.get_type(); }

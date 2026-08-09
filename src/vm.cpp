@@ -386,6 +386,12 @@ vm_store_elem_int_body(LValue &alv, int_type idx, int_type rhs, Op aop,
 {
     if (alv.is<SharedArrayObj>()) {
         SharedArrayObj &arr = alv.getval<SharedArrayObj>();
+        /* #92: the JIT's inline store tier trusts this mirror to decide
+         * whether it may skip clone_aliased_slices, and a stale `false`
+         * would let a live slice observe a value it should have been
+         * cloned away from - silently. Re-verify it here, on the path the
+         * JIT-off modes run for every store. */
+        ML_CHECK(arr.jit_has_slices_mirror_ok());
         const auto sk = arr.skind();
         const bool is_bool = sk == SharedArrayObj::Storage::bools;
         if ((sk == SharedArrayObj::Storage::ints

@@ -169,6 +169,12 @@ void SharedArrayObjTempl<LValueT>::clone_aliased_slices(size_type index)
             ++it;
         }
     }
+
+    /* keep the has_slices MIRROR true to the set - this is the one place
+     * that erases without going through SharedArrayObj::slices_del (it
+     * erases BY ITERATOR while walking), so it refreshes the flag itself.
+     * See SharedObject::has_slices. */
+    shobj->has_slices = !shobj->slices.empty();
 }
 
 /* Read element `i` (slice-relative) as a boxed EvalValue WITHOUT promoting flat
