@@ -95,6 +95,24 @@ ifeq ($(RECYCLE),1)
 	BASE_FLAGS += -DRECYCLE_ALLOC
 endif
 
+# Untrusted-bytecode checks (ML_UNTRUSTED_CHECK): the value-dependent guards a
+# corrupt `.myv` needs, gated at RUNTIME on where the bytecode came from rather
+# than at COMPILE time on the build type - so a release running a shipped image
+# keeps them, which is the one case that matters. NOT tied to ASSERTS.
+#
+# DEFAULT OFF FOR NOW. The tier is landing so its cost can be measured
+# (UNTRUSTED_CHECKS=1 is how the numbers in this commit were taken), but it is
+# not yet safe to enable: ml_untrusted_fail THROWS, and some of the sites it
+# guards are reached from `noexcept` JIT helpers the emitter gives no status
+# test - where an escaping exception is std::terminate, not an error. Enabled
+# once that is fixed. See ML_UNTRUSTED_CHECK in defs.h.
+UNTRUSTED_CHECKS ?= 0
+ifeq ($(UNTRUSTED_CHECKS),0)
+	BASE_FLAGS += -DML_UNTRUSTED_CHECKS=0
+else
+	BASE_FLAGS += -DML_UNTRUSTED_CHECKS=1
+endif
+
 # VM dispatch: computed-goto (direct-threaded) on GCC/clang, default ON.
 # `make CGOTO=0` forces the portable switch dispatch (what MSVC always
 # uses) - the A/B lever for measuring the threaded dispatch. See vm.cpp's

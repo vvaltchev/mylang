@@ -51,7 +51,7 @@ TRUST MODEL.  An image is TRUSTED input, like a .pyc.  A MALICIOUSLY CRAFTED
 file is out of scope: an attacker who can write your .myv can equally write
 your .my.  What IS in scope is that a corrupt or truncated file produces a
 clean "MyvError" - never a crash, a hang, or an unbounded allocation.  The
-loader validates in THREE layers, and the layering matters because each one
+loader validates in FOUR layers, and the layering matters because each one
 sees a kind of field the others structurally cannot (#137):
 
   1. THE BYTES.  Magic, version, endianness, builtin-set fingerprint; every
@@ -87,11 +87,22 @@ sees a kind of field the others structurally cannot (#137):
      emplace site, a flat struct array - must be POD and must have exactly
      the field count the site was compiled for.
 
+  4. THE VALUE-DEPENDENT RESIDUE (ML_UNTRUSTED_CHECK, defs.h).  A few facts
+     no load-time pass can decide, because they are properties of the VALUE a
+     slot holds rather than of the image: a flat array's storage-kind union
+     tag, a struct field index against the def the instance actually has.
+     Those sites check at RUN time, gated on `g_untrusted_bytecode` - set by
+     myv_read and false for bytecode this process compiled - so the cost
+     falls only on a run that loaded an image.  Deliberately NOT tied to
+     ASSERTS: the build that most needs the check is an optimized,
+     assert-free release running a shipped `.myv`.
+
 WHAT VALIDATION DOES NOT PROMISE.  A structurally valid image whose VALUES are
-nonsense is ACCEPTED, and may then fail at run time (a named ML_CHECK abort,
-never a wild pointer) or simply never terminate.  Proving that a slot holds
-the type an op expects would be a bytecode type-checker, and halting is
-undecidable; the contract stops at the load.
+nonsense is ACCEPTED, and may then fail at run time - as a located
+InternalErrorEx from layer 4 where one covers it, else a named ML_CHECK
+abort - or simply never terminate.  Proving that a slot holds the type an op
+expects at every pc would be a bytecode type-checker, and halting is
+undecidable.
 
 --------------------------------------------------------------------------------
 2.  CONVENTIONS AND PRIMITIVES

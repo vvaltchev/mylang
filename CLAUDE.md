@@ -4543,6 +4543,26 @@ first two cannot see what the third checks:
     `vm_aop_dispatchable`, so the two cannot drift), and a def a byte-level
     path writes through must be POD with the field count its site was
     compiled for.
+**TIER 2 - THE PROVENANCE GATE (`ML_UNTRUSTED_CHECK`, defs.h).** A few facts
+no load-time pass can decide, because they belong to the VALUE in a slot and
+not to the image: a flat array's storage-kind union tag, a struct field index
+against the def the instance actually holds. Those sites check at RUN time,
+gated on `g_untrusted_bytecode` - set by `myv_read`, FALSE for bytecode this
+process compiled. **NOT tied to `ASSERTS`**, deliberately: the build that most
+needs the check is an optimized, assert-free release running a shipped image,
+which is exactly the one an assert-gated check abandons. **DEFAULT OFF for
+now** (`UNTRUSTED_CHECKS=1` to enable, which is how the numbers below were
+taken): `ml_untrusted_fail` THROWS, and some guarded sites are reached from
+`noexcept` JIT helpers where an escaping exception is std::terminate - so the
+tier lands measurable but not yet armed. Measured (`OPT=1 ASSERTS=0` both
+sides, interleaved `--baseline`): suite geomean **1.006x**, the affected
+struct/array benches scattered 0.95-1.05x with no consistent penalty - but
+callgrind says the branch is REALLY there, **+9.4% Ir on 65_struct_field_sum**
+and +2.2% on 58_structs, flat elsewhere. The instruction-vs-time divergence
+again: a perfectly-predicted branch on a hot-cached global retires free beside
+the real work (the same finding as the guard-elision family). Judge it on the
+wall clock, and remember which number is which.
+
 Two producer-side rules fell out: **only PRE-JIT bytecode is storable**
 (`myv_write` ML_CHECKs it - the JIT rewrites code in place and fragments
 are not serialized, so a post-jit image names fragments that do not

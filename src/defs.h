@@ -156,3 +156,44 @@ typedef intptr_t int_type;
 #  define ML_VM_CHECK(cond)          ((void)0)
 #  define ML_VM_CHECK_MSG(cond, msg) ((void)0)
 #endif
+
+/*
+ * ML_UNTRUSTED_CHECK - the PROVENANCE tier (#137, maintainer-set 2026-08-09).
+ *
+ * The axis that matters for a corrupt `.myv` is not the BUILD TYPE, it is
+ * WHERE THE BYTECODE CAME FROM. Bytecode `vm_compile` just produced in this
+ * process is correct by construction and covered by the whole test suite;
+ * bytecode read off a disk is arbitrary bytes. Gating the defence on ASSERTS
+ * conflates those, and gets it exactly backwards: the build that most needs
+ * the check (an optimized, assert-free release running a shipped image) is
+ * the one that loses it.
+ *
+ * So this tier is NOT compiled out by ASSERTS. It is a test of one global,
+ * `g_untrusted_bytecode`, which is FALSE for a fresh compile and set only by
+ * myv_read. A trusted run pays a predictable, never-taken branch on a
+ * hot-cached global; an untrusted run pays the check.
+ *
+ * ⛔ USE IT ONLY where the condition is genuinely VALUE-DEPENDENT - where
+ * verify_chunk cannot decide it at load from the image alone. Anything
+ * statically decidable belongs THERE instead, at zero runtime cost (that is
+ * tier 1; see verify_chunk in codegen.cpp). This tier is the residue.
+ *
+ * It THROWS rather than asserting: a corrupt image is input, and an input
+ * error must be reported in every build, not aborted on in some.
+ * `UNTRUSTED_CHECKS=0` compiles the whole tier away - the A/B lever for
+ * measuring what the never-taken branch costs, NOT a shipping config.
+ */
+#ifndef ML_UNTRUSTED_CHECKS
+#  define ML_UNTRUSTED_CHECKS 1
+#endif
+#if ML_UNTRUSTED_CHECKS
+extern bool g_untrusted_bytecode;
+[[noreturn]] void ml_untrusted_fail(const char *what);
+#  define ML_UNTRUSTED_CHECK(cond, what)                                    \
+      do {                                                                  \
+          if (g_untrusted_bytecode && !(cond))                              \
+              ml_untrusted_fail(what);                                      \
+      } while (0)
+#else
+#  define ML_UNTRUSTED_CHECK(cond, what) ((void)0)
+#endif

@@ -416,43 +416,63 @@ public:
      * skind() first. (Compiled out of a plain release.)
      */
     ivec_type &flat_ints() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::ints,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::ints);
         return shobj->ivec;
     }
     fvec_type &flat_floats() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::floats,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::floats);
         return shobj->fvec;
     }
     bvec_type &flat_bools() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::bools,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::bools);
         return shobj->bvec;
     }
     const ivec_type &flat_ints() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::ints,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::ints);
         return shobj->ivec;
     }
     const fvec_type &flat_floats() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::floats,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::floats);
         return shobj->fvec;
     }
     const bvec_type &flat_bools() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::bools,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::bools);
         return shobj->bvec;
     }
     svec_type &flat_structs() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::structs,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::structs);
         return shobj->svec;
     }
     const svec_type &flat_structs() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::structs,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::structs);
         return shobj->svec;
     }
 
     tvec_type &flat_strs() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::strs,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::strs);
         return shobj->tvec;
     }
     const tvec_type &flat_strs() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::strs,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::strs);
         return shobj->tvec;
     }

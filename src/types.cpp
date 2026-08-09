@@ -820,6 +820,25 @@ builtin_slot_index(const UniqueId *uid)
     return it != g_builtin_index.end() ? it->second : -1;
 }
 
+#if ML_UNTRUSTED_CHECKS
+/*
+ * #137 tier 2 (provenance). FALSE for bytecode this process just compiled -
+ * which is every run except one that loaded a `.myv`. myv_read sets it, and
+ * nothing clears it: once an untrusted image is in the program, the checks
+ * stay on for the rest of the run.
+ */
+bool g_untrusted_bytecode = false;
+
+/* An InternalErrorEx: uncatchable by script (a corrupt image is not a
+ * condition a program can handle) but a normal exception to the driver, so
+ * it RENDERS and exits instead of aborting. */
+void ml_untrusted_fail(const char *what)
+{
+    throw InternalErrorEx(intern_msg("corrupt bytecode image (" 
+                                     + std::string(what) + ")"));
+}
+#endif
+
 LValue &
 builtin_slot(int index)
 {
