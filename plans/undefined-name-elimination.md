@@ -195,14 +195,27 @@ and passing it to `func show(int n)` is an `OptRequiredEx`.
 ## Settled details (maintainer, 2026-08-08)
 
 **FUNCS AND STRUCTS HOIST WITH THEIR BINDING, AT EVERY SCOPE.** Global
-scope and local scope must make NO difference for a function. This is
-already true at top level and is what keeps mutual recursion and the
-"helpers below main" layout legal:
+scope and local scope must make NO difference for a function.
 
-    var dyn t = f();  print(t);   func f() { return 5; }      -> 5
-    var p = P(1);  print(p.x);    struct P { int x; }         -> 1
+**CORRECTED 2026-08-08 (step 5): this is true NOWHERE today, and the
+claim below that "it is already true at top level" was WRONG** - it was
+an OPTIMIZATION ARTEFACT, the shape-eater trap hit twice. `func f() {
+return 5; }` is tiny, so the INLINER splices the body and no call
+survives; `P(1)` has a const argument, so the parser CONST-FOLDS the
+construction away. Defeat both and:
 
-It is BROKEN for a func/struct declared inside a function body (#134):
+    var dyn r = inner(); print(r);
+    func inner() { print("s"); return 7; }     # impure -> not inlined
+      tw / -nj / jit -> UnboundSymbolEx: 'inner' is not bound yet
+
+A func is hoisted for RESOLUTION (it gets a global slot) but BOUND only
+when its declaration statement runs. See #134 for the full measured
+matrix, including two ENGINE DIVERGENCES it exposed: a nested func in a
+function body makes the VM refuse to compile (InternalErrorEx), and a
+top-level STRUCT works in the VM but not in the tree-walker.
+
+The original (wrong) framing follows; the shapes are still the ones to
+fix, only the "top level already works" claim was false:
 
     func outer() { var dyn r = inner(); return r; func inner() { return 7; } }
       -tw -> Undefined variable 'inner'
