@@ -19919,6 +19919,99 @@ static bool myv_wrong_typed_base()
     return ok;
 }
 
+/*
+ * #144: a `.myv` FROM A BINARY WITH A DIFFERENT BUILTIN SET.
+ *
+ * A `SymKind::builtin` reference is a baked SLOT INDEX into the
+ * program-wide builtin table. If two binaries order that table differently
+ * - or simply have different builtins in it - the same index names a
+ * DIFFERENT builtin, and the image would silently call the wrong one. The
+ * defence is a fingerprint of the set, stored in the header and compared at
+ * load; the path existed but had never been exercised.
+ *
+ * Two halves, because the fingerprint alone is not the argument:
+ *   1. a mismatched fingerprint is REFUSED, and refused by NAME - not as
+ *      some generic downstream confusion;
+ *   2. the table is NAME-SORTED, which is what makes "same fingerprint =>
+ *      same slot for every builtin" true. Without the sort the table order
+ *      would follow interned-POINTER order, which differs per process, and
+ *      a matching fingerprint would prove nothing at all.
+ */
+static bool myv_builtin_set_guard()
+{
+    /* (2) first - it is the load-bearing invariant. */
+    for (int i = 1; ; i++) {
+        const std::string_view prev = builtin_slot_name(i - 1);
+        const std::string_view cur = builtin_slot_name(i);
+        if (cur == "?")                 /* past the end of the table */
+            break;
+        if (!(prev < cur)) {
+            fprintf(stderr, "myv-bset: the builtin table is NOT name-sorted "
+                            "at %d (%s then %s) - a baked slot index is no "
+                            "longer portable\n", i,
+                    std::string(prev).c_str(), std::string(cur).c_str());
+            return false;
+        }
+    }
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-bset.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = false;
+    try {
+        std::vector<Tok> toks;
+        const std::string src = "print(len(\"ab\"), abs(-3));";
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        myv_write(prog, path, MyvSourceRef());
+
+        std::ifstream f(path, std::ios::binary);
+        std::string b((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+        f.close();
+
+        /* The header is magic(4) version(4) endian(4) fingerprint(8): flip
+         * one bit of the fingerprint - the byte-for-byte stand-in for
+         * "compiled by a binary with a different builtin set". */
+        b[12] = static_cast<char>(b[12] ^ 1);
+        {
+            std::ofstream o(path, std::ios::binary | std::ios::trunc);
+            o.write(b.data(), static_cast<std::streamsize>(b.size()));
+        }
+        try {
+            MyvSource s;
+            VmProgram bad = myv_read(path, s);
+            (void)bad;
+            fprintf(stderr, "myv-bset: a foreign builtin set was ACCEPTED\n");
+        } catch (Exception &e) {
+            const std::string m = e.msg ? e.msg : "";
+            ok = m.find("builtin set") != std::string::npos;
+            if (!ok)
+                fprintf(stderr, "myv-bset: refused, but not for the builtin "
+                                "set: %s\n", m.c_str());
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "myv-bset: setup threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+    }
+    remove(path.c_str());
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_loc_escapes()
 {
     /* 320 spaces before the statement: its caret column exceeds 254 */
@@ -27926,6 +28019,8 @@ static const std::vector<extra_check> extra_checks =
       myv_untrusted_field_index },
     { "myv: a WRONG-TYPED base does not take the process down (#142)",
       myv_wrong_typed_base },
+    { "myv: an image from a different BUILTIN SET is refused (#144)",
+      myv_builtin_set_guard },
     { "myv: Loc escapes - delta table + narrow pool Locs",
       myv_loc_escapes },
     { "vm: the handler table describes each try region (#78)",
