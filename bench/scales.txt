@@ -80,3 +80,4 @@
 75_indexed_unpack        1
 76_funcval_dispatch      1
 77_struct_array_lit      1
+78_typed_param_call      4

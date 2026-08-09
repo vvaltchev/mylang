@@ -2517,9 +2517,11 @@ documented VM-only shape.
 
 Measured: q_int 1194.6M -> 602.6M (**-49.56%**, 597 -> 301 Ir per call), now
 FASTER than the `dyn` twin; q_dyn and the zero-arg probe byte-flat.
-**bench/ is flat on all 14 call-heavy and control benches** - and that is a
-finding about bench/: no benchmark annotates a parameter on a call-heavy
-path, so the suite cannot see a 1.61x that any annotated program pays.
+**bench/ was flat on all 14 call-heavy and control benches** - a finding
+about bench/, not the change: no benchmark annotated a parameter on a
+call-heavy path, so the suite could not see a 1.61x that any annotated
+program pays. FIXED the same day by `78_typed_param_call`, which reads
+cur/base 0.60x (1.67x faster) against the pre-G1 binary.
 
 **SIBLING TAKEN the same day - see the next entry.** The note below is kept
 because it states the constraint that increment had to design around.
