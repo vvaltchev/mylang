@@ -162,3 +162,5 @@ extern bool g_bc_inline_enabled;
 
 /* Execution proof for the caller-frame path - see codegen.cpp. */
 extern unsigned long g_bc_inline_caller_frames;
+/* Total call sites spliced - the shape matrix's non-vacuity check. */
+extern unsigned long g_bc_inline_splices;

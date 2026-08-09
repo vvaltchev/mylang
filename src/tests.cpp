@@ -17951,6 +17951,297 @@ static bool bc_inline_order_independent()
 }
 
 /*
+ * THE SPLICE SHAPE MATRIX (#91) - direct tests for every shape the splice
+ * transforms, rather than hoping the corpus or the fuzzer wanders into
+ * them.
+ *
+ * The measurement that motivated this: across the whole 1491-test suite
+ * the splice fired on 22 sites from SEVEN distinct callees, most of them
+ * written for the splice itself. "All modes agree" over that corpus is
+ * evidence the splice does not break things - largely because it rarely
+ * fires - and NOT evidence it is correct on what it transforms.
+ *
+ * Each row is run under the tree-walker (the oracle) and then in every
+ * VM/JIT/splice combination; all must agree byte-for-byte. A row marked
+ * `must_splice` additionally asserts the site count MOVED, so a row that
+ * silently stops being spliceable fails loudly instead of passing as a
+ * no-op - the failure mode the corpus measurement exposed.
+ *
+ * The rows are chosen by RISK, not by syntax coverage: slot remapping
+ * (the callee's frame is rebased over the caller's), the multi-return
+ * join, arg binding, and the dst slot's identity are what a splice can
+ * get wrong.
+ */
+static bool bc_inline_shape_matrix()
+{
+    struct Shape {
+        const char *name;
+        std::vector<const char *> src;
+        bool must_splice;
+    };
+    /* every callee here carries a loop so the AST inliner leaves it alone
+     * - otherwise there is no CallV left for the bytecode splice to take,
+     * and the row would test the AST inliner instead */
+    const std::vector<Shape> shapes = {
+      { "1 param, locals",
+        { "func c(x) { var s = x; var i = 0;",
+          "            while (i < 3) { s = s + x; i++; } return s; }",
+          "func u(a) { var r = c(a); return r + 1; }",
+          "print(u(4));" }, true },
+
+      { "2 params",
+        { "func c(x, y) { var s = x; var i = 0;",
+          "               while (i < 3) { s = s + y; i++; } return s; }",
+          "func u(a) { var r = c(a, 2); return r; }",
+          "print(u(4));" }, true },
+
+      { "3 params",
+        { "func c(x, y, z) { var s = x; var i = 0;",
+          "                  while (i < z) { s = s + y; i++; } return s; }",
+          "func u(a) { var r = c(a, 2, 3); return r; }",
+          "print(u(4));" }, true },
+
+      /* DECLINES, and correctly: a pure zero-arg call has const args by
+       * definition, so AutoConst folds the whole call to a literal long
+       * before codegen - there is no CallV left. The row stays for the
+       * VALUE check across modes. */
+      { "0 params (folded away by AutoConst - no CallV survives)",
+        { "func c() { var s = 0; var i = 0;",
+          "           while (i < 4) { s = s + i; i++; } return s; }",
+          "func u(a) { var r = c(); return r + a; }",
+          "print(u(4));" }, false },
+
+      { "EARLY return + tail return (two joins)",
+        { "func c(x) { var i = 0; while (i < 2) { i++; }",
+          "            if (x > 10) return 1; return 2; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(4)); print(u(40));" }, true },
+
+      { "THREE returns",
+        { "func c(x) { var i = 0; while (i < 2) { i++; }",
+          "            if (x > 10) return 1;",
+          "            if (x > 5) return 2; return 3; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(4)); print(u(7)); print(u(40));" }, true },
+
+      /* DECLINES: the peephole fuses a counted loop into IntAddStep /
+       * ForLoopStep, which the whitelist EXCLUDES on purpose - their
+       * operand layout was never audited against the remapper. This is
+       * the single biggest reach limit the matrix found, and it is a
+       * decision, not a defect: `for` loops in callees are simply out. */
+      { "callee with a FOR loop (declines: op:IntAddStep, not whitelisted)",
+        { "func c(x) { var s = 0;",
+          "            for (var i = 0; i < 4; i++) { s = s + i * x; }",
+          "            return s; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(3));" }, false },
+
+      /* same reason as the FOR row - counted loops fuse to a
+       * non-whitelisted op */
+      { "callee with NESTED for loops (declines: fused counted-loop op)",
+        { "func c(x) { var s = 0;",
+          "            for (var i = 0; i < 3; i++) {",
+          "              for (var j = 0; j < 2; j++) { s = s + i * j + x; } }",
+          "            return s; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(2));" }, false },
+
+      { "callee with if/else",
+        { "func c(x) { var s = 0; var i = 0; while (i < 2) { i++; }",
+          "            if (x > 3) { s = x * 2; } else { s = x + 100; }",
+          "            return s; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(1)); print(u(9));" }, true },
+
+      { "FLOAT callee",
+        { "func c(x) { var s = 0.0; var i = 0;",
+          "            while (i < 3) { s = s + x * 1.5; i++; } return s; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(2.0));" }, true },
+
+      { "callee returns a COMPARISON (bool)",
+        { "func c(x) { var i = 0; while (i < 2) { i++; } return x > 5; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(9)); print(u(1));" }, true },
+
+      { "the call is in a CALLER LOOP (body runs repeatedly)",
+        { "func c(x) { var s = x; var i = 0;",
+          "            while (i < 2) { s = s + 1; i++; } return s; }",
+          "func u(a) { var t = 0;",
+          "            for (var k = 0; k < 4; k++) { t = t + c(a + k); }",
+          "            return t; }",
+          "print(u(3));" }, true },
+
+      { "the call is inside an IF in the caller",
+        { "func c(x) { var s = x; var i = 0;",
+          "            while (i < 2) { s = s + 1; i++; } return s; }",
+          "func u(a) { var r = 0;",
+          "            if (a > 2) { r = c(a); } else { r = 99; }",
+          "            return r; }",
+          "print(u(5)); print(u(1));" }, true },
+
+      { "TWO calls to the SAME callee (two splices in one chunk)",
+        { "func c(x) { var s = x; var i = 0;",
+          "            while (i < 2) { s = s + 1; i++; } return s; }",
+          "func u(a) { var p = c(a); var q = c(a + 10); return p + q; }",
+          "print(u(3));" }, true },
+
+      { "two calls to DIFFERENT callees",
+        { "func c1(x) { var s = x; var i = 0;",
+          "             while (i < 2) { s = s + 1; i++; } return s; }",
+          "func c2(x) { var s = x; var i = 0;",
+          "             while (i < 3) { s = s * 2; i++; } return s; }",
+          "func u(a) { var r = c1(a) + c2(a); return r; }",
+          "print(u(3));" }, true },
+
+      { "the result is DISCARDED",
+        { "func c(x) { var s = x; var i = 0;",
+          "            while (i < 2) { s = s + 1; i++; } return s; }",
+          "func u(a) { c(a); return 7; }",
+          "print(u(3));" }, true },
+
+      { "arg is an EXPRESSION, not a local",
+        { "func c(x) { var s = x; var i = 0;",
+          "            while (i < 2) { s = s + 1; i++; } return s; }",
+          "func u(a) { var r = c(a * 2 + 1); return r; }",
+          "print(u(3));" }, true },
+
+      { "the dst slot is REUSED by two calls",
+        { "func c(x) { var s = x; var i = 0;",
+          "            while (i < 2) { s = s + 1; i++; } return s; }",
+          "func u(a) { var r = c(a); r = c(r); return r; }",
+          "print(u(3));" }, true },
+
+      { "the callee REASSIGNS its param (must not touch the caller's)",
+        { "func c(x) { var i = 0; while (i < 2) { i++; }",
+          "            x = x + 100; return x; }",
+          "func u(a) { var r = c(a); return r + a; }",
+          "print(u(5));" }, true },
+
+      { "the callee IGNORES its param",
+        { "func c(x) { var s = 0; var i = 0;",
+          "            while (i < 3) { s = s + i; i++; } return s; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(5));" }, true },
+
+      { "the call result feeds a DEEP expression",
+        { "func c(x) { var s = x; var i = 0;",
+          "            while (i < 2) { s = s + 1; i++; } return s; }",
+          "func u(a) { var r = (c(a)*2 + c(a+1)) % 97; return r; }",
+          "print(u(3));" }, true },
+
+      { "RECURSIVE callee - the self-call inside the splice stays a call",
+        { "func c(n) { if (n <= 0) return 0;",
+          "            var i = 0; while (i < 1) { i++; }",
+          "            return n + c(n - 1); }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(5));" }, true },
+
+      { "caller with MANY locals (frame growth, under budget)",
+        { "func c(x) { var s = x; var i = 0;",
+          "            while (i < 2) { s = s + 1; i++; } return s; }",
+          "func u(a) { var v0=a; var v1=a+1; var v2=a+2; var v3=a+3;",
+          "            var v4=a+4; var v5=a+5; var v6=a+6; var v7=a+7;",
+          "            var r = c(a);",
+          "            return r+v0+v1+v2+v3+v4+v5+v6+v7; }",
+          "print(u(2));" }, true },
+
+      /* --- shapes that must DECLINE, checked here too so the gate and the
+       *     value stay consistent in one place --- */
+      { "DECLINE: callee with a try region",
+        { "func c(x) { var s = 0;",
+          "            try { s = x / (x - x); } catch (DivisionByZeroEx) {",
+          "              s = 42; }",
+          "            var i = 0; while (i < 2) { i++; } return s; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(3));" }, false },
+
+      { "DECLINE: callee with a foreach (frame iterator)",
+        { "func c(x) { var s = 0;",
+          "            var arr = [1, 2, 3];",
+          "            foreach (var e in arr) { s = s + e * x; }",
+          "            return s; }",
+          "func u(a) { var r = c(a); return r; }",
+          "print(u(2));" }, false },
+    };
+
+    const bool jits[2] = { false, true };
+    const int njit = ML_JIT_SUPPORTED ? 2 : 1;
+    bool ok = true;
+
+    auto run = [&](const std::vector<const char *> &s, bool vm, bool jit,
+                   bool splice, std::string &out) -> bool {
+        const ExecEngine se = g_exec_engine;
+        const bool sj = g_jit_enabled, sb = g_bc_inline_enabled;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        g_jit_enabled = jit;
+        g_bc_inline_enabled = splice;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        bool good = true;
+        try {
+            std::string joined;
+            for (const char *l : s) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (...) {
+            good = false;
+        }
+        out = cap.str();
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        g_jit_enabled = sj;
+        g_bc_inline_enabled = sb;
+        return good;
+    };
+
+    for (const Shape &sh : shapes) {
+        std::string ref;
+        if (!run(sh.src, false, false, false, ref) || ref.empty()) {
+            cout << "  shape [" << sh.name << "]: the tree-walker could not "
+                    "run it\n";
+            ok = false;
+            continue;
+        }
+        unsigned long spliced = 0;
+        for (int j = 0; j < njit; j++)
+            for (int b = 0; b < 2; b++) {
+                const unsigned long before = g_bc_inline_splices;
+                std::string got;
+                const bool good = run(sh.src, true, jits[j], b != 0, got);
+                if (b)
+                    spliced += g_bc_inline_splices - before;
+                if (!good || got != ref) {
+                    cout << "  shape [" << sh.name << "] jit=" << jits[j]
+                         << " splice=" << b << ":\n    tw =[" << ref
+                         << "]\n    vm =[" << got << "]\n";
+                    ok = false;
+                }
+            }
+        if (sh.must_splice && spliced == 0) {
+            cout << "  shape [" << sh.name << "]: NOTHING was spliced - the "
+                    "row no longer tests the splice\n";
+            ok = false;
+        }
+        if (!sh.must_splice && spliced != 0) {
+            cout << "  shape [" << sh.name << "]: was spliced but must "
+                    "DECLINE (" << spliced << " sites)\n";
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+/*
  * THE CORPUS AUDIT reports what a splice would reach (#91).
  *
  * `bc_inline_audit` is the dev tool (MYLANG_INLAUDIT=1) whose histogram
@@ -18006,6 +18297,13 @@ static bool bc_inline_audit_reports()
         return false;
     }
     dup2(fileno(tmp), fileno(stderr));
+    /* SAVE the caller's value: unconditionally unsetting it at the end
+     * would silently disable the audit for every test that runs after
+     * this one - which is exactly what it did, and it invalidated a
+     * measurement of how much the suite exercises the splice. */
+    const char *prev_env = getenv("MYLANG_INLAUDIT");
+    const std::string prev = prev_env ? prev_env : "";
+    const bool had_prev = prev_env != nullptr;
     setenv("MYLANG_INLAUDIT", "1", 1);
 
     const ExecEngine se = g_exec_engine;
@@ -18067,7 +18365,10 @@ static bool bc_inline_audit_reports()
     }
     g_exec_engine = se;
 
-    unsetenv("MYLANG_INLAUDIT");
+    if (had_prev)
+        setenv("MYLANG_INLAUDIT", prev.c_str(), 1);
+    else
+        unsetenv("MYLANG_INLAUDIT");
     fflush(stderr);
     dup2(saved_fd, fileno(stderr));
     close(saved_fd);
@@ -21962,6 +22263,9 @@ static const std::vector<extra_check> extra_checks =
     { "codegen: the corpus AUDIT reports each verdict (MYLANG_INLAUDIT) - "
       "the measurement tool this feature's scope was decided from",
       bc_inline_audit_reports },
+    { "codegen: the bytecode splice SHAPE MATRIX - every shape it "
+      "transforms, in every JIT/splice mode, each proven to splice",
+      bc_inline_shape_matrix },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",
