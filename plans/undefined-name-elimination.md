@@ -493,9 +493,20 @@ Each lands as its OWN commit.
    read, a call in a loop body - is reported rather than left silent.
    The two tiers cannot double-report, since the prover throws on
    everything it proves. Measured: 0 of 95 corpus programs warn.
-   STILL OPEN in step 7: TRANSITIVITY (a global read by a function the
-   callee calls) - reported by neither tier, and pinned by a test that
-   expects zero so adding it has something that notices.
+   **TRANSITIVITY LANDED** too (`build_reachable_reads`): the globals a
+   call can reach are a FIXPOINT over the call graph, so a read two or
+   three hops down is proven where before only a direct one was. A
+   fixpoint because mutual recursion makes the graph cyclic. Soundness
+   rides on one switch - with `unconditional_only` both the reads AND
+   the calls are the unconditional ones, so a conditional link anywhere
+   along the chain drops the case to the warning tier; all three
+   positions (outer call, inner call, read) are pinned.
+   The zero-expecting pin from the warning tier DID its job: it failed
+   the moment the behaviour changed, which is the whole reason it was
+   written that way.
+   STILL OPEN in step 7: call sites below the top level (a call inside a
+   function body is analysed only when that function is itself called
+   from the top level).
 
 ## Known residuals (accepted)
 

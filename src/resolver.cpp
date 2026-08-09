@@ -1681,30 +1681,19 @@ private:
 
     void warn_unbound_calls(Block *rb)
     {
-        std::unordered_map<const UniqueId *, size_t> global_decl_stmt;
-        std::unordered_map<const UniqueId *, FuncDeclStmt *> top_funcs;
-
-        for (size_t i = 0; i < rb->elems.size(); i++) {
-            Construct *e = rb->elems[i].get();
-            if (auto *fd = dynamic_cast<FuncDeclStmt *>(e)) {
-                if (fd->id)
-                    top_funcs[fd->id->uid] = fd;
-                continue;
-            }
-            auto *ex = dynamic_cast<Expr14 *>(e);
-            if (!ex || !(ex->fl & pFlags::pInDecl))
-                continue;
-            auto *lv = dynamic_cast<Identifier *>(ex->lvalue.get());
-            if (lv && lv->sym.kind == SymKind::global)
-                global_decl_stmt.emplace(lv->uid, i);
-        }
+        DeclIndex global_decl_stmt;
+        FuncIndex top_funcs;
+        index_top_level(rb, global_decl_stmt, top_funcs);
 
         if (global_decl_stmt.empty() || top_funcs.empty())
             return;
 
-        /* every global a callee may read, on ANY path - the conditional read
-         * is half of what this tier exists to catch */
-        std::unordered_map<FuncDeclStmt *, std::vector<Identifier *>> reads;
+        /* every global a call may reach, on ANY path and through ANY number
+         * of hops - the conditional read and the deeper one are what this
+         * tier exists to catch */
+        ReadSets reads;
+        build_reachable_reads(top_funcs, global_decl_stmt,
+                              /*unconditional_only=*/false, reads);
 
         for (size_t i = 0; i < rb->elems.size(); i++) {
 
@@ -1722,24 +1711,11 @@ private:
                 if (ft == top_funcs.end())
                     return;
 
-                auto rit = reads.find(ft->second);
-                if (rit == reads.end()) {
-                    std::vector<Identifier *> v;
-                    walk_every(ft->second->body.get(), [&](Construct *m) {
-                        auto *id = dynamic_cast<Identifier *>(m);
-                        if (id && id->sym.kind == SymKind::global
-                                && global_decl_stmt.count(id->uid))
-                            v.push_back(id);
-                    });
-                    rit = reads.emplace(ft->second, std::move(v)).first;
-                }
-
-                for (Identifier *g : rit->second) {
-                    auto dit = global_decl_stmt.find(g->uid);
+                for (const UniqueId *g : reads[ft->second]) {
+                    auto dit = global_decl_stmt.find(g);
                     if (dit != global_decl_stmt.end() && dit->second > i) {
                         compile_warn(
-                            intern_msg("this call may fail: "
-                                       + std::string(g->get_str())
+                            intern_msg("this call may fail: " + g->val
                                        + " is not bound until later"),
                             call->start, call->end);
                         return;     /* one per call site, not per read */
@@ -1749,18 +1725,20 @@ private:
         }
     }
 
-    void prove_unbound_calls(Block *rb)
-    {
-        /* the top-level statement index of each global VAR/CONST decl, and
-         * every top-level named function (the possible call targets) */
-        std::unordered_map<const UniqueId *, size_t> global_decl_stmt;
-        std::unordered_map<const UniqueId *, FuncDeclStmt *> top_funcs;
+    typedef std::unordered_map<const UniqueId *, size_t> DeclIndex;
+    typedef std::unordered_map<const UniqueId *, FuncDeclStmt *> FuncIndex;
+    typedef std::unordered_map<FuncDeclStmt *,
+                               std::vector<const UniqueId *>> ReadSets;
 
+    /* The top-level statement index of each global VAR/CONST decl, plus every
+     * top-level named function - the two things both tiers index by. */
+    static void index_top_level(Block *rb, DeclIndex &decls, FuncIndex &funcs)
+    {
         for (size_t i = 0; i < rb->elems.size(); i++) {
             Construct *e = rb->elems[i].get();
             if (auto *fd = dynamic_cast<FuncDeclStmt *>(e)) {
                 if (fd->id)
-                    top_funcs[fd->id->uid] = fd;
+                    funcs[fd->id->uid] = fd;
                 continue;
             }
             auto *ex = dynamic_cast<Expr14 *>(e);
@@ -1768,15 +1746,108 @@ private:
                 continue;
             auto *lv = dynamic_cast<Identifier *>(ex->lvalue.get());
             if (lv && lv->sym.kind == SymKind::global)
-                global_decl_stmt.emplace(lv->uid, i);
+                decls.emplace(lv->uid, i);
         }
+    }
+
+    static void add_uniq(std::vector<const UniqueId *> &v, const UniqueId *u)
+    {
+        for (const UniqueId *x : v)
+            if (x == u)
+                return;
+        v.push_back(u);
+    }
+
+    /*
+     * WHICH GLOBALS A CALL CAN REACH - a fixpoint over the CALL GRAPH, not a
+     * one-level look at the callee's own body.
+     *
+     *     func fetch() { return g; }
+     *     func outer() { var r = fetch(); return r; }
+     *     var dyn t = outer();          <- `outer` does not read `g`...
+     *     var g = 5;                    <- ...but what it CALLS does
+     *
+     * Without this the two-hop program compiled and died at run time while
+     * the one-hop one was refused, though the failure is equally certain.
+     * `reads(F) = own(F) union reads(h) for every h that F calls`, iterated
+     * to a fixpoint - a fixpoint and not a walk because MUTUAL RECURSION
+     * makes the graph cyclic, and a cycle has no traversal order.
+     *
+     * `unconditional_only` picks which walker sees the body, and that ONE
+     * switch keeps the error tier sound: with it, both the reads and the
+     * CALLS are the unconditional ones, so a global enters F's set only if
+     * every step from F to the read is guaranteed. `outer` conditionally
+     * calling `fetch` puts `fetch` in no set of outer's; `fetch` reading `g`
+     * conditionally puts `g` in no set of fetch's. The warning tier passes
+     * false and takes every path.
+     */
+    void build_reachable_reads(const FuncIndex &funcs, const DeclIndex &decls,
+                               bool unconditional_only, ReadSets &out)
+    {
+        std::unordered_map<FuncDeclStmt *, std::vector<FuncDeclStmt *>> callees;
+
+        for (const auto &fp : funcs) {
+
+            FuncDeclStmt *fd = fp.second;
+            std::vector<const UniqueId *> reads;
+            std::vector<FuncDeclStmt *> calls;
+
+            const auto visit = [&](Construct *n) {
+                if (auto *id = dynamic_cast<Identifier *>(n))
+                    if (id->sym.kind == SymKind::global && decls.count(id->uid))
+                        add_uniq(reads, id->uid);
+                auto *call = dynamic_cast<CallExpr *>(n);
+                if (!call)
+                    return;
+                auto *cid = dynamic_cast<Identifier *>(call->what.get());
+                if (!cid)
+                    return;
+                auto it = funcs.find(cid->uid);
+                if (it != funcs.end() && it->second != fd) {
+                    bool seen = false;
+                    for (FuncDeclStmt *h : calls)
+                        if (h == it->second) { seen = true; break; }
+                    if (!seen)
+                        calls.push_back(it->second);
+                }
+            };
+
+            if (unconditional_only)
+                walk_unconditional(fd->body.get(), visit);
+            else
+                walk_every(fd->body.get(), visit);
+
+            out[fd] = std::move(reads);
+            callees[fd] = std::move(calls);
+        }
+
+        /* propagate along the call edges until nothing new arrives */
+        for (bool changed = true; changed; ) {
+            changed = false;
+            for (const auto &cp : callees)
+                for (FuncDeclStmt *h : cp.second)
+                    for (const UniqueId *u : out[h]) {
+                        const size_t before = out[cp.first].size();
+                        add_uniq(out[cp.first], u);
+                        if (out[cp.first].size() != before)
+                            changed = true;
+                    }
+        }
+    }
+
+    void prove_unbound_calls(Block *rb)
+    {
+        DeclIndex global_decl_stmt;
+        FuncIndex top_funcs;
+        index_top_level(rb, global_decl_stmt, top_funcs);
 
         if (global_decl_stmt.empty() || top_funcs.empty())
             return;
 
-        /* memoized per callee: a body is walked once however often it is
-         * called */
-        std::unordered_map<FuncDeclStmt *, std::vector<Identifier *>> reads;
+        /* what a call can REACH, not just what its callee's own body reads */
+        ReadSets reads;
+        build_reachable_reads(top_funcs, global_decl_stmt,
+                              /*unconditional_only=*/true, reads);
 
         for (size_t i = 0; i < rb->elems.size(); i++) {
 
@@ -1794,24 +1865,16 @@ private:
                 if (ft == top_funcs.end())
                     return;
 
-                auto rit = reads.find(ft->second);
-                if (rit == reads.end()) {
-                    std::vector<Identifier *> v;
-                    unconditional_global_reads(ft->second, global_decl_stmt,
-                                               v);
-                    rit = reads.emplace(ft->second, std::move(v)).first;
-                }
-
-                for (Identifier *g : rit->second) {
-                    auto dit = global_decl_stmt.find(g->uid);
+                for (const UniqueId *g : reads[ft->second]) {
+                    auto dit = global_decl_stmt.find(g);
                     if (dit != global_decl_stmt.end() && dit->second > i)
                         /* the caret marks the CALL: that is the statement the
-                         * user must move, and the read inside the callee is
-                         * correct code for every other caller */
+                         * user must move, and the read - which may be several
+                         * hops down - is correct code for every other
+                         * caller */
                         throw UseBeforeBindingEx(
                             intern_msg(
-                                "this call always fails: "
-                                + std::string(g->get_str())
+                                "this call always fails: " + g->val
                                 + " is not bound until later"),
                             call->start, call->end);
                 }

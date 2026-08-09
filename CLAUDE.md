@@ -1192,9 +1192,19 @@ and it lives *inside the parser*. Mechanics:
   inliner**, because whether a program COMPILES must not depend on which
   optimizations ran (RULE 2) — after DCE, `if (false) { fetch(); }` would
   compile while `-nc` refused it; after the inliner, the analysed shape would
-  differ between `-ni` and the default. **INCREMENT 1**: no transitivity, no
-  call sites below the top level, no WARNING tier — all silent directions, so
-  those keep today's runtime error.
+  differ between `-ni` and the default.
+  **IT IS TRANSITIVE** (2026-08-09): the globals a call can reach are a
+  FIXPOINT over the CALL GRAPH (`build_reachable_reads`), not a one-level look
+  at the callee's own body — `outer` calling `fetch` which reads `g` is
+  proven, where before the two-hop program compiled and died at run time while
+  the one-hop one was refused. A fixpoint and not a walk **because mutual
+  recursion makes the graph cyclic**, and a cycle has no traversal order. ONE
+  switch keeps the error tier sound: `unconditional_only` picks the walker, so
+  with it BOTH the reads and the CALLS are the unconditional ones and a global
+  enters a set only if every step from the call to the read is guaranteed — a
+  conditional link ANYWHERE drops the case to the warning tier, and all three
+  positions (outer call, inner call, read) are pinned. Still open: call sites
+  below the top level.
 - **`isbound(name)` — the TDZ pair's runtime half (#131 step 6).**
   `defined(name)` asks whether the name EXISTS (true throughout its scope,
   ABOVE the declaration included — the name is declared, merely unbound);
