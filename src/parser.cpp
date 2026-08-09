@@ -58,9 +58,59 @@ ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
     , cse(new CseCache)
 {
     pending_decl_type = DeclType::none;
+
+    /*
+     * #133: PRE-SCAN the token stream for every `func NAME` / `struct NAME`
+     * whose NAME is a const builtin, and shadow it for the whole parse.
+     *
+     * Why a whole-stream scan and not the declaration site: since #134 a named
+     * func/struct binds at SCOPE ENTRY, so a call ABOVE the declaration already
+     * means the user's function - and a single-pass parser folding that call
+     * has not seen the declaration yet. `print(abs(-1)); func abs(x) {...}`
+     * printed the BUILTIN's 1 where the un-folded run printed 42.
+     *
+     * DELIBERATELY over-broad: a `func abs` nested inside one body shadows the
+     * name everywhere, so a genuinely-builtin `abs(-1)` elsewhere is left for
+     * runtime instead of folding. That direction is free - the resolver binds
+     * it to the builtin and it computes the same answer, one fold later. The
+     * other direction (folding a call whose name is declared) is the bug.
+     *
+     * A `pure func` is skipped: it IS the const evaluator's own binding.
+     * PARAMS and foreach vars are NOT scanned here - they are genuinely
+     * scoped, and pAcceptFuncDecl / the foreach parse shadow them precisely.
+     */
+    TokenStream scan = ts;
+    bool prev_pure = false;
+
+    for (; !(scan.get() == TokType::invalid); scan.next()) {
+
+        const Tok &t = scan.get();
+
+        if ((t == Keyword::kw_func || t == Keyword::kw_struct) && !prev_pure) {
+            const Tok &nm = scan.peek(1);
+            if (nm == TokType::id)
+                shadow_add(UniqueId::get(nm.value));
+        }
+
+        prev_pure = (t == Keyword::kw_pure);
+    }
 }
 
 ParseContext::~ParseContext() = default;
+
+/*
+ * #133: record a declared name IFF it also names a CONST BUILTIN, so
+ * pAcceptId stops resolving it to that builtin for the extent of the scope.
+ * Anything else is dropped on the floor - which is what keeps the set empty
+ * (and `is_shadowed` a single compare) in every program that does not shadow
+ * one. A NON-const builtin (`print`) needs nothing: the const evaluator
+ * cannot see it, so it never folded a call to it in the first place.
+ */
+void ParseContext::shadow_add(const UniqueId *uid)
+{
+    if (uid && EvalContext::const_builtins.count(uid))
+        shadowed.push_back(uid);
+}
 
 /*
  * ----------------- Recursive Descent Parser -------------------
@@ -658,6 +708,12 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
     if (*c == TokType::id) {
 
         v.reset(new Identifier(c.get_str()));
+
+        /* #133: a DECLARATION in scope names this const builtin, so it is not
+         * the builtin here - leave the identifier alone and let the resolver
+         * bind it to the real declaration. */
+        if (c.is_shadowed(static_cast<Identifier *>(v.get())->uid))
+            resolve_const = false;
 
         if (c.const_eval && resolve_const) {
 
@@ -2114,6 +2170,7 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
     if (push_const_scope)
         c.const_ctx = &block_const_ctx; // push a new const eval context
     c.cse->push();                  // matching CSE cache scope
+    c.shadow_push();                // #133: matching shadowed-builtin scope
 
     if (!c.eoi()) {
 
@@ -2141,6 +2198,7 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
     }
 
     ret->end = c.get_loc();
+    c.shadow_pop();                    // #133
     c.cse->pop();                      // pop the CSE cache scope
     if (push_const_scope)
         c.const_ctx = c.const_ctx->parent; // restore the previous const ctx
@@ -2430,6 +2488,19 @@ pAcceptFuncDecl(ParseContext &c,
         pExpectOp(c, Op::parenR);
     }
 
+    /*
+     * #133: a PARAM named after a const builtin shadows it inside the body.
+     * The scope is pushed HERE, not in pBlock, because the `=> expr` sugar
+     * parses its body with pExpr14 and never reaches pBlock - and that is the
+     * form that showed the bug worst: `func g(abs) => abs + 1` const-folded
+     * `abs` to the BUILTIN and then refused `builtin + 1` as a COMPILE error.
+     */
+    c.shadow_push();
+    if (func->params)
+        for (const auto &pm : func->params->elems)
+            if (const auto *pid = dynamic_cast<const Identifier *>(pm.get()))
+                c.shadow_add(pid->uid);
+
     if (pAcceptOp(c, Op::arrow)) {
 
         /*
@@ -2459,6 +2530,7 @@ pAcceptFuncDecl(ParseContext &c,
             &c.get_tok()
         );
     }
+    c.shadow_pop();                    /* #133: the params' scope */
 
     func->end = c.get_loc() + 1;
 
@@ -3170,8 +3242,18 @@ pAcceptForeachStmt(ParseContext &c,
     stmt->start = start;
     stmt->end = c.get_loc();
 
+    /* #133: a loop VAR named after a const builtin shadows it in the body
+     * (`foreach (var abs in a) { abs(-1); }` folded to the BUILTIN, where the
+     * un-folded run correctly refuses to call an int). Pushed here, not in
+     * pBlock, because the var is declared OUTSIDE the body's own scope. */
+    c.shadow_push();
+    for (const auto &lv : stmt->ids->elems)
+        if (const auto *lid = dynamic_cast<const Identifier *>(lv.get()))
+            c.shadow_add(lid->uid);
+
     if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
         stmt->body = pBraceLessBody(c, fl | pFlags::pInLoop);
+    c.shadow_pop();
 
     if (c.const_eval && stmt->container->is_const) {
 

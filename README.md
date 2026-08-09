@@ -2017,6 +2017,24 @@ allowed as well.
 The following built-in functions will be evaluated during *parse-time* when
 const arguments are passed to them.
 
+**A declaration wins over the builtin it shadows.** A `var`/`const` may not
+take a const builtin's name at all (`var len = 7;` is a compile-time
+`CannotRebindBuiltinEx`), but a **function**, a **parameter** and a **foreach
+loop variable** may — and where such a declaration is visible, the name means
+*it*, never the builtin, in every position including a const-folded one:
+
+```
+func abs(x) { return 42; }
+print(abs(-1));                 # 42 - the function, not the builtin's 1
+func g(abs) => abs + 1;
+print(g(2));                    # 3  - the parameter
+```
+
+The name is taken from the builtin for the whole program, so a `func abs`
+declared anywhere means a call to `abs` elsewhere is no longer const-folded
+(it still computes the builtin's answer at run time — only the fold is lost).
+A `pure func` is unaffected: it *is* a compile-time binding and keeps folding.
+
 ### General builtins
 
 #### `defined(symbol)`

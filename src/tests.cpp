@@ -11596,6 +11596,115 @@ static const std::vector<test> tests =
     },
 
     /*
+     * #133 - A DECLARATION BEATS THE CONST BUILTIN IT SHADOWS. The parse-time
+     * const evaluator used to resolve a name straight to the const builtin
+     * without looking at what the program declared, so `abs(-1)` folded to the
+     * BUILTIN's 1 while `abs(runtime(-1))` called the user's function - the
+     * same call, two answers, and a RULE 2 violation (`-nc` printed 42 42).
+     *
+     * Each case therefore asserts the FOLDED and the UNFOLDABLE spelling agree;
+     * `runtime()` is what makes the second one unfoldable. The engine
+     * differential cannot see any of this - the fold happens before either
+     * engine runs - which is exactly why these are value assertions and not a
+     * tw-vs-VM comparison.
+     */
+    {
+        "shadow: a named func beats the const builtin (decl first)",
+        {
+            "func abs(x) { return 42; }",
+            "assert(abs(-1) == 42);",
+            "assert(abs(runtime(-1)) == 42);",
+        }
+    },
+    {
+        "shadow: a named func beats the const builtin (USED FIRST)",
+        {
+            /* since #134 the name binds at SCOPE ENTRY, so this call already
+             * means the user's function - but a single-pass parser has not
+             * seen the decl yet, which is why the token PRE-SCAN exists */
+            "var a = abs(-1);",
+            "var b = abs(runtime(-1));",
+            "func abs(x) { return 42; }",
+            "assert(a == 42);",
+            "assert(b == 42);",
+        }
+    },
+    {
+        "shadow: a PARAM beats the const builtin (=> body)",
+        {
+            /* the worst form: `abs + 1` folded to `<builtin> + 1` and was
+             * refused as a COMPILE error, so this test used to not even run */
+            "func g(abs) => abs + 1;",
+            "assert(g(2) == 3);",
+            "assert(g(runtime(2)) == 3);",
+        }
+    },
+    {
+        "shadow: a LAMBDA param beats the const builtin",
+        {
+            "var f = func(abs) => abs * 2;",
+            "assert(f(4) == 8);",
+        }
+    },
+    {
+        "shadow: a param beats the const builtin (braced body)",
+        {
+            "func h(len) { var r = len + 1; return r; }",
+            "assert(h(2) == 3);",
+        }
+    },
+    {
+        /*
+         * The loop var is an INT, so calling it is a compile error - and that
+         * IS the right answer. The folded spelling silently called the
+         * BUILTIN instead and returned 1. Asserting the ERROR is the only
+         * honest form here; a value assertion (`tot += abs`) is VACUOUS,
+         * because a non-const `+=` never folds and the resolver then binds
+         * the loop var correctly with or without the fix (watched passing
+         * with the shadow removed - the vacuous-test trap).
+         */
+        "shadow: a foreach loop var beats the const builtin",
+        {
+            "var tot = 0;",
+            "foreach (var abs in [3, 4]) { tot += abs(-1); }",
+        },
+        &typeid(TypeMismatchEx)
+    },
+    {
+        "shadow: the builtin still folds where nothing shadows it",
+        {
+            /* the other direction - the fix must not cost the fold */
+            "assert(abs(-1) == 1);",
+            "assert(len(\"abcd\") == 4);",
+            "assert(max(3, 9) == 9);",
+            "const K = abs(-7) + len(\"ab\");",
+            "assert(K == 9);",
+        }
+    },
+    {
+        "shadow: a PURE func keeps folding (it IS the const binding)",
+        {
+            /* a pure func registers itself in const_ctx, so shadowing it would
+             * only disable the fold it exists to enable */
+            "pure func p(x) => x * 2;",
+            "const C = p(3);",
+            "assert(C == 6);",
+        }
+    },
+    {
+        "shadow: a nested func shadows only where it is visible",
+        {
+            /* the pre-scan is deliberately over-broad (it shadows the name for
+             * the whole parse), which may cost a FOLD but never an answer:
+             * outside `helper` the name still resolves to the builtin */
+            "func helper() { func abs(x) { return 42; } var r = abs(-1);"
+            " return r; }",
+            "assert(helper() == 42);",
+            "assert(abs(-1) == 1);",
+        }
+    },
+
+    /*
      * Parse-time common-subexpression de-duplication (CSE). Identical const
      * array/dict expressions are evaluated once at parse time and the
      * resulting deep read-only value is shared, asserted here via intptr().

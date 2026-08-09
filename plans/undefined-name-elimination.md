@@ -429,8 +429,20 @@ Each lands as its OWN commit.
      (the `-vd` oracle), and an end-only mangle (the field-for-field
      round-trip compare, which is the one the dump CANNOT see).
 5. **Nested func/struct hoist with binding** (#134).
-6. **Const-fold poisoning + the `isbound()` builtin** (#133); `defined()`
-   becomes REPL-only.
+6. **Const-fold poisoning** (#133) - **LANDED.** Bigger than the plan's
+   `func abs` case: FIVE shapes diverged (the func name used after OR
+   before its decl, a param in a `=> expr` body - which folded
+   `<builtin> + 1` into a COMPILE error - a lambda param, and a foreach
+   var). `ParseContext::shadowed` + a token PRE-SCAN of every
+   `func NAME`/`struct NAME` (whole-parse: since #134 those bind at scope
+   entry, so a use ABOVE the decl already means the user's function and a
+   single-pass parser cannot know that at the use) + a scoped push/pop for
+   params and foreach vars. `pure func` excluded - it IS the const
+   evaluator's binding. Deliberately over-broad, because shadowing only
+   ever costs a FOLD, never an answer.
+   `defined()` needed NO work: it already matches the agreed table - it
+   fell out of step 3, which folds `SymKind::global` and `in_tdz` to true.
+   `isbound()` is what remains of this step.
 7. **Prover conservatism**, then **`--strict`**.
 
 ## Known residuals (accepted)
