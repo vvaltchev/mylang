@@ -4554,11 +4554,8 @@ against the def the instance actually holds. Those sites check at RUN time,
 gated on `g_untrusted_bytecode` - set by `myv_read`, FALSE for bytecode this
 process compiled. **NOT tied to `ASSERTS`**, deliberately: the build that most
 needs the check is an optimized, assert-free release running a shipped image,
-which is exactly the one an assert-gated check abandons. **DEFAULT OFF for
-now** (`UNTRUSTED_CHECKS=1` to enable, which is how the numbers below were
-taken): `ml_untrusted_fail` THROWS, and some guarded sites are reached from
-`noexcept` JIT helpers where an escaping exception is std::terminate - so the
-tier lands measurable but not yet armed. Measured (`OPT=1 ASSERTS=0` both
+which is exactly the one an assert-gated check abandons. `UNTRUSTED_CHECKS=0`
+is the A/B lever, not a shipping config. Measured (`OPT=1 ASSERTS=0` both
 sides, interleaved `--baseline`): suite geomean **1.006x**, the affected
 struct/array benches scattered 0.95-1.05x with no consistent penalty - but
 callgrind says the branch is REALLY there, **+9.4% Ir on 65_struct_field_sum**
@@ -4578,6 +4575,15 @@ a throwing `getval<T>()` behind an `ML_VM_CHECK` that a release compiles out.
 Two of them also indexed a string or a flat array with a compile-PROVEN index
 and no bound - a WILD READ, which is worse than a throw and is fatal in the
 interpreter too.
+**⛔ AND AN AUDIT OF OUR OWN CODEGEN IS A FALSE ALARM ON A DISK IMAGE.**
+`jit_ret_audit` and `jit_member_fact_audit` assert things about what
+CODEGEN emitted (that `ref_slots` lists every slot the emitted code can put
+a reference in; that a proven slot holds the struct it was proven to hold).
+On bytecode read off a disk that premise simply does not hold, so the
+assertion is not a bug report - it aborts the process over an image the
+loader deliberately accepted. Both now return early when
+`g_untrusted_bytecode`. A wrong `ref_slots` can then only LEAK a reference,
+never index out of range, because verify_chunk bounds each entry.
 **The rule:** in a helper the emitter cannot get a status from, a type miss or
 a bad index takes a DEFINED fallback (`none`, `0`), never a throw. The type
 test costs nothing - `get_ref` performs it anyway; only the miss branch
@@ -4604,7 +4610,16 @@ SIGSEGV) or loop forever - proving a slot's type at every pc would be a
 bytecode type-checker, and halting is undecidable. `-rt`'s
 `myv_corrupt_refused` is the net: it writes 0xFFFFFFFF over every
 4-byte-aligned word and requires each load to be a clean Exception,
-knowing nothing about which words are counts or indices. Verified:
+knowing nothing about which words are counts or indices. The BROAD net is
+**`tests/myv_fuzz.py BINARY`** (stdlib-only, like `nested_fuzz.py`): five
+mutation modes over a small and a fat image, a crash always failing the
+run and `--triage` telling a non-terminating PROGRAM (legitimate - it
+loads cleanly) from a hang in the LOADER (a bug). **Run it after any
+format or loader change**, against BOTH a debug (ASan+UBSan) and an
+`OPT=1 ASSERTS=0` build - they catch different things, and it found the
+tier-2 throw-through-noexcept and the codegen-audit false alarm below
+within minutes of being checked in. A finding is SAVED, because it cannot
+be regenerated from the seed: an image embeds its SOURCE PATH. Verified:
 83/84 of bench/ + samples/ run identically from an image (the one
 exception, rand_sort, calls `rand()`), 84/86 also dump byte-identically
 (the 2

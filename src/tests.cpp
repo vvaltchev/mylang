@@ -19766,17 +19766,28 @@ static bool myv_untrusted_field_index()
             return false;
         }
 
+        /*
+         * The read must produce the tier's DEFINED FALLBACK - not walk off
+         * the fields vector, and not throw either: these readers are
+         * reached from `noexcept` JIT helpers with no catch, where an
+         * exception is std::terminate (#142). So the assertion is on the
+         * VALUE, which is the stronger statement anyway and exactly what
+         * RULE 1 asks for: `s` (the WIDE loop, untouched) still sums
+         * 0+1+2+3 = 6, while `t` (the retargeted NARROW loop) sums four
+         * fallbacks = 0.
+         */
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
         try {
             vm_run(loaded);
-            fprintf(stderr, "myv-untrusted: the out-of-range field read was "
-                            "NOT caught\n");
-        } catch (Exception &e) {
-            /* An InternalErrorEx from ml_untrusted_fail - located, not an
-             * abort. Any clean exception means the tier did its job. */
-            ok = std::string(e.name) == "InternalErrorEx";
-            if (!ok)
-                fprintf(stderr, "myv-untrusted: wrong exception %s\n", e.name);
+        } catch (Exception &) {
         }
+        std::cout.rdbuf(old_buf);
+        const std::string out = cap.str();
+        ok = out.find("6 0") != std::string::npos;
+        if (!ok)
+            fprintf(stderr, "myv-untrusted: expected \"6 0\", got \"%s\"\n",
+                    out.c_str());
     } catch (Exception &e) {
         fprintf(stderr, "myv-untrusted: setup threw %s: %s\n", e.name,
                 e.msg ? e.msg : "");
