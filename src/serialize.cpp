@@ -369,6 +369,30 @@ struct Reader {
         if (p + n > buf.size())
             bad_image("corrupt or incompatible .myv (truncated)");
     }
+    /*
+     * #137 sweep: an ELEMENT COUNT, bounded by the input that is left.
+     *
+     * Every count in this format precedes records that each consume at least
+     * one byte, so a count larger than the remaining bytes cannot describe a
+     * real image - and reserving on it is what a corrupt file exploits. A
+     * 400-mutation fuzz over an 800-byte image produced 19 HANGS and 20
+     * CRASHES, and the dominant signature was exactly this: an
+     * AddressSanitizer allocator failure, or 5 GB of RSS in five seconds
+     * from one `reserve()` on a mangled u32.
+     *
+     * The bound is deliberately the WEAKEST universally-true one - "no more
+     * entries than bytes" - rather than a per-record minimum size, because
+     * that needs no knowledge of the record it guards and so cannot drift
+     * when a record's encoding changes. It caps the damage at the file size;
+     * a tighter per-site bound is a later refinement, not a prerequisite.
+     */
+    uint32_t countv()
+    {
+        const uint32_t n = u32v();
+        if (n > buf.size() - p)
+            bad_image("corrupt .myv (element count exceeds the file)");
+        return n;
+    }
     uint8_t u8v() { need(1); return static_cast<uint8_t>(buf[p++]); }
     uint32_t u32v()
     {
@@ -537,7 +561,7 @@ EvalValue read_array(Reader &r)
 {
     const auto kind = static_cast<SharedArrayObj::Storage>(r.u8v());
     const bool ro = r.boolv();
-    const uint32_t n = r.u32v();
+    const uint32_t n = r.countv();
     SharedArrayObj out;
     switch (kind) {
     case SharedArrayObj::Storage::ints: {
@@ -685,7 +709,7 @@ EvalValue read_value(Reader &r)
         auto d = make_intrusive<DictObject>();
         if (r.boolv())
             d->set_default(read_value(r));
-        const uint32_t n = r.u32v();
+        const uint32_t n = r.countv();
         for (uint32_t i = 0; i < n; i++) {
             EvalValue k = read_value(r);
             EvalValue val = read_value(r);
@@ -702,13 +726,13 @@ EvalValue read_value(Reader &r)
         auto so = make_intrusive<StructObject>();
         so->def = r.structs[di];
         if (pod) {
-            const uint32_t n = r.u32v();
+            const uint32_t n = r.countv();
             r.need(n);
             so->bytes.assign(r.buf.begin() + static_cast<long>(r.p),
                              r.buf.begin() + static_cast<long>(r.p + n));
             r.p += n;
         } else {
-            const uint32_t n = r.u32v();
+            const uint32_t n = r.countv();
             so->fields.reserve(n);
             for (uint32_t i = 0; i < n; i++)
                 so->fields.emplace_back(read_value(r), false);
@@ -840,7 +864,7 @@ void write_loc_table(Writer &w, const std::vector<Chunk::LocEntry> &tbl)
 void read_loc_table(Reader &r, std::vector<Chunk::LocEntry> &tbl,
                     size_t code_size)
 {
-    const uint32_t n = r.u32v();
+    const uint32_t n = r.countv();
     tbl.reserve(n);
 
     int64_t prev_pc = 0, prev_line = 0;
@@ -884,7 +908,7 @@ void write_arglocs(Writer &w, const std::vector<ArgLoc> &v)
 
 std::vector<ArgLoc> read_arglocs(Reader &r)
 {
-    const uint32_t n = r.u32v();
+    const uint32_t n = r.countv();
     std::vector<ArgLoc> v;
     v.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
@@ -1212,7 +1236,7 @@ void read_chunk(Reader &r, Chunk &c)
     /* code: the COMPACT encoding - the flags word and the field order are
      * documented at the write site in write_chunk (the pairing rule). Every
      * absent field keeps the default a fresh Instr already carries. */
-    const uint32_t ncode = r.u32v();
+    const uint32_t ncode = r.countv();
     c.code.resize(ncode);
     for (uint32_t i = 0; i < ncode; i++) {
         Instr &in = c.code[i];
@@ -1259,11 +1283,11 @@ void read_chunk(Reader &r, Chunk &c)
 
     /* the HANDLER TABLE (write side: above) */
     {
-        const uint32_t nh = r.u32v();
+        const uint32_t nh = r.countv();
         c.handler_sites.resize(nh);
         for (uint32_t i = 0; i < nh; i++) {
             Chunk::HandlerSite &hs = c.handler_sites[i];
-            const uint32_t nc2 = r.u32v();
+            const uint32_t nc2 = r.countv();
             hs.clauses.resize(nc2);
             for (uint32_t j = 0; j < nc2; j++) {
                 hs.clauses[j].types_idx = static_cast<int32_t>(r.u32v());
@@ -1275,12 +1299,12 @@ void read_chunk(Reader &r, Chunk &c)
         }
     }
 
-    uint32_t n = r.u32v();
+    uint32_t n = r.countv();
     c.ref_slots.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         c.ref_slots.push_back(static_cast<int32_t>(r.u32v()));
 
-    n = r.u32v();
+    n = r.countv();
     c.consts.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         c.consts.push_back(read_value(r));
@@ -1288,12 +1312,12 @@ void read_chunk(Reader &r, Chunk &c)
     read_loc_table(r, c.locs, c.code.size());
     read_loc_table(r, c.base_locs, c.code.size());     /* #127 */
 
-    n = r.u32v();
+    n = r.countv();
     c.inline_frames.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::InlineFrame f;
         f.callee_name = r.strv();
-        const uint32_t np = r.u32v();
+        const uint32_t np = r.countv();
         f.params.reserve(np);
         for (uint32_t j = 0; j < np; j++)
             f.params.push_back(r.strv());
@@ -1301,7 +1325,7 @@ void read_chunk(Reader &r, Chunk &c)
         f.parent = static_cast<int32_t>(r.u32v());
         c.inline_frames.push_back(std::move(f));
     }
-    n = r.u32v();
+    n = r.countv();
     c.inline_ctxs.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::InlineEntry e;
@@ -1310,7 +1334,7 @@ void read_chunk(Reader &r, Chunk &c)
         c.inline_ctxs.push_back(e);
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.member_keys.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::MemberKey m;
@@ -1329,11 +1353,11 @@ void read_chunk(Reader &r, Chunk &c)
      * rebuilt by build_boxed_ops at the end of this function (it needs the
      * loc table, which is read further down). */
 
-    n = r.u32v();
+    n = r.countv();
     c.ctor_plans.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::CtorPlan p;
-        const uint32_t nf = r.u32v();
+        const uint32_t nf = r.countv();
         p.f.reserve(nf);
         for (uint32_t j = 0; j < nf; j++) {
             Chunk::CtorPlanField f;
@@ -1345,7 +1369,7 @@ void read_chunk(Reader &r, Chunk &c)
         c.ctor_plans.push_back(std::move(p));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.incdec_sites.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::IncDecSite s;
@@ -1358,7 +1382,7 @@ void read_chunk(Reader &r, Chunk &c)
 
     const auto rsteps = [&]() {
         std::vector<Chunk::ChainStep> v;
-        const uint32_t ns = r.u32v();
+        const uint32_t ns = r.countv();
         v.reserve(ns);
         for (uint32_t j = 0; j < ns; j++) {
             Chunk::ChainStep s;
@@ -1369,12 +1393,12 @@ void read_chunk(Reader &r, Chunk &c)
         }
         return v;
     };
-    n = r.u32v();
+    n = r.countv();
     c.chain_steps.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         c.chain_steps.push_back(rsteps());
 
-    n = r.u32v();
+    n = r.countv();
     c.incdec_chains.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::IncDecChain ch;
@@ -1386,11 +1410,11 @@ void read_chunk(Reader &r, Chunk &c)
         c.incdec_chains.push_back(std::move(ch));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.chain_locs.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         std::vector<std::pair<Loc, Loc>> v;
-        const uint32_t m = r.u32v();
+        const uint32_t m = r.countv();
         v.reserve(m);
         for (uint32_t j = 0; j < m; j++) {
             const Loc a = r.locv(), b = r.locv();
@@ -1399,13 +1423,13 @@ void read_chunk(Reader &r, Chunk &c)
         c.chain_locs.push_back(std::move(v));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.catch_types.reserve(n);
     c.catch_uids.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         std::vector<std::string> v;
         std::vector<const UniqueId *> u;
-        const uint32_t m = r.u32v();
+        const uint32_t m = r.countv();
         v.reserve(m); u.reserve(m);
         for (uint32_t j = 0; j < m; j++) {
             v.push_back(r.strv());
@@ -1415,7 +1439,7 @@ void read_chunk(Reader &r, Chunk &c)
         c.catch_uids.push_back(std::move(u));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.literal_objs.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::LiteralObjEntry lo;
@@ -1427,18 +1451,18 @@ void read_chunk(Reader &r, Chunk &c)
         c.literal_objs.push_back(std::move(lo));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.closure_defs.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         c.closure_defs.push_back(
             r.descs[r.idx(r.descs.size(), "corrupt .myv (closure)")]);
-    n = r.u32v();
+    n = r.countv();
     c.struct_defs.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         c.struct_defs.push_back(
             r.structs[r.idx(r.structs.size(), "corrupt .myv (struct)")]);
 
-    n = r.u32v();
+    n = r.countv();
     c.boxed_ctors.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::BoxedCtor bc;
@@ -1448,7 +1472,7 @@ void read_chunk(Reader &r, Chunk &c)
         c.boxed_ctors.push_back(std::move(bc));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.emplace_sites.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::EmplaceSite es;
@@ -1460,7 +1484,7 @@ void read_chunk(Reader &r, Chunk &c)
         c.emplace_sites.push_back(std::move(es));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.throws.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::ThrowSite t;
@@ -1470,28 +1494,28 @@ void read_chunk(Reader &r, Chunk &c)
         c.throws.push_back(t);
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.unpack_targets.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         std::vector<int32_t> v;
-        const uint32_t m = r.u32v();
+        const uint32_t m = r.countv();
         v.reserve(m);
         for (uint32_t j = 0; j < m; j++)
             v.push_back(static_cast<int32_t>(r.u32v()));
         c.unpack_targets.push_back(std::move(v));
     }
-    n = r.u32v();
+    n = r.countv();
     c.unpack_coerce.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         std::vector<unsigned char> v;
-        const uint32_t m = r.u32v();
+        const uint32_t m = r.countv();
         v.reserve(m);
         for (uint32_t j = 0; j < m; j++)
             v.push_back(r.u8v());
         c.unpack_coerce.push_back(std::move(v));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.builtin_calls.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::BuiltinCall bc;
@@ -1505,7 +1529,7 @@ void read_chunk(Reader &r, Chunk &c)
         c.builtin_calls.push_back(std::move(bc));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.call_sites.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::CallSite cs;
@@ -1520,7 +1544,7 @@ void read_chunk(Reader &r, Chunk &c)
         c.call_sites.push_back(std::move(cs));
     }
 
-    n = r.u32v();
+    n = r.countv();
     c.slot_names.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         c.slot_names.push_back(r.strv());
@@ -1765,7 +1789,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
     resolve_source(ref, opts, out_src);
 
     /* strings -> interned uids */
-    uint32_t n = r.u32v();
+    uint32_t n = r.countv();
     r.strs.reserve(n);
     r.uids.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
@@ -1779,7 +1803,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
      * def), then wire + compute the layout - which is RECOMPUTED, never
      * stored (deterministic from the field kinds; storing it would only
      * add drift surface). */
-    n = r.u32v();
+    n = r.countv();
     for (uint32_t i = 0; i < n; i++)
         prog.structs.push_back(std::unique_ptr<StructTypeDef>(
             new StructTypeDef()));
@@ -1788,7 +1812,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
     for (uint32_t i = 0; i < n; i++) {
         StructTypeDef &sd = *prog.structs[i];
         sd.name = r.uidv();
-        const uint32_t nf = r.u32v();
+        const uint32_t nf = r.countv();
         sd.fields.reserve(nf);
         for (uint32_t j = 0; j < nf; j++) {
             FieldDef fd;
@@ -1801,7 +1825,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             fd.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
             sd.fields.push_back(std::move(fd));
         }
-        const uint32_t nc = r.u32v();
+        const uint32_t nc = r.countv();
         sd.consts.reserve(nc);
         for (uint32_t j = 0; j < nc; j++) {
             const UniqueId *cn = r.uidv();
@@ -1812,7 +1836,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
 
     /* descriptors: construct all, then fill (a chunk's closure_defs may
      * reference any of them) */
-    n = r.u32v();
+    n = r.countv();
     std::vector<bool> has_chunk(n, false);
     for (uint32_t i = 0; i < n; i++)
         prog.funcs.push_back(std::unique_ptr<FuncDescriptor>(
@@ -1823,7 +1847,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         FuncDescriptor &d = *prog.funcs[i];
         d.name = r.uidv();
         d.display_name = r.strv();
-        const uint32_t np = r.u32v();
+        const uint32_t np = r.countv();
         d.params.reserve(np);
         for (uint32_t j = 0; j < np; j++) {
             FuncDescriptor::ParamDesc p;
@@ -1833,7 +1857,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             p.proven_type = static_cast<DeclType>(r.u8v());  /* C3, v11 */
             d.params.push_back(p);
         }
-        const uint32_t ncp = r.u32v();
+        const uint32_t ncp = r.countv();
         d.captures.reserve(ncp);
         for (uint32_t j = 0; j < ncp; j++) {
             FuncDescriptor::CaptureDesc cp;
@@ -1882,7 +1906,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         prog.global_slot_reassigned.push_back(static_cast<char>(r.u8v()));
 
     prog.root_slot_count = static_cast<int>(static_cast<int32_t>(r.u32v()));
-    n = r.u32v();
+    n = r.countv();
     prog.global_func_names.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         prog.global_func_names.push_back(r.uidv());
