@@ -1040,6 +1040,13 @@ static NumBinOp cmp_pmf(Op op)
     }
 }
 
+/* Declared in vm.h (#137 tier 1) - the load-time verifier's question, asked
+ * of the same two tables the dispatch below uses. */
+bool vm_aop_dispatchable(Op aop)
+{
+    return binop_pmf(aop) != nullptr || cmp_pmf(aop) != nullptr;
+}
+
 /*
  * #60 lever 2: the boxed arith/compare handlers' (BinOpV / CompoundV / CmpV,
  * plus the compound global/capture stores and the dyn inc-dec) num_bin_op

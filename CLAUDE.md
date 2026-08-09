@@ -4537,14 +4537,24 @@ first two cannot see what the third checks:
     `base_locs`, `inline_ctxs` - which look harmless (they are only ever
     binary-searched for an exact match) but are REMAPPED by indexing
     (`l.pc = remap[l.pc]`), and a closure's CAPTURE descriptors, which
-    `read_sym` turns into frame/global/capture/builtin slot reads.
+    `read_sym` turns into frame/global/capture/builtin slot reads. Plus the
+    STATIC CROSS-FIELD facts: a boxed op's `aop` must be one `vm_num_binop`
+    can dispatch (asked of the dispatch's OWN tables via
+    `vm_aop_dispatchable`, so the two cannot drift), and a def a byte-level
+    path writes through must be POD with the field count its site was
+    compiled for.
 Two producer-side rules fell out: **only PRE-JIT bytecode is storable**
 (`myv_write` ML_CHECKs it - the JIT rewrites code in place and fragments
 are not serialized, so a post-jit image names fragments that do not
 exist), and `vm_jit_loaded_image` iterates **this program's** chunks, not
 the process-global `g_func_chunks` (which nothing prunes, so it re-JIT'd
 freed programs' chunks). Measured over 2000 mutations of two images: **0
-crashes and 0 hangs in the LOAD**, from 19 hangs / 20 crashes. What
+crashes and 0 hangs in the LOAD**, from 19 hangs / 20 crashes. **AND THE
+BUILD TYPE NO LONGER CHANGES THE ANSWER** - `OPT=1` and `OPT=1 ASSERTS=0`
+now behave IDENTICALLY on the corrupt corpus, where before the assert-free
+build turned named aborts into SIGSEGVs. That is the point of doing this
+at LOAD: a check that runs once, in every build, beats one that a release
+flag removes. What
 remains, deliberately, is a structurally VALID image whose VALUES are
 nonsense: it can still trip a runtime `ML_CHECK` (a named abort, never a
 SIGSEGV) or loop forever - proving a slot's type at every pc would be a
