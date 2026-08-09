@@ -1638,6 +1638,15 @@ struct VmCallRec {
      * cache would outlive its frame and become global memoization, which
      * the per-frame design explicitly forbids (see PureCache, eval.h). */
     std::unique_ptr<PureCache> caller_cache;
+
+    /* G1 no-record tier, STEP 1 (plans/g1-no-record-tier.md): the emitted
+     * sync-call SITE that pushed this record (a NorecSite*), stored by the
+     * M5b inline push UNDER TESTS so the shadow verification and the
+     * full-stack audit can associate a live record with its side-table
+     * entry. push_window nulls it for every C++-pushed record, so in a
+     * non-TESTS build (where the emitted store is not compiled) it is
+     * always null - and nothing reads it there. */
+    const void *norec_site = nullptr;
 };
 
 /*
@@ -1786,6 +1795,9 @@ struct VmActivation {
         rec.boundary = boundary;
         rec.sync_stop = 0;               /* a REUSED record must not carry a
                                           * stale lean-sync stop mark */
+        rec.norec_site = nullptr;        /* every C++ push nulls the G1 site
+                                          * (only the M5b emitted push, which
+                                          * bypasses this function, sets it) */
         rec.run_chunk = ck;
         rec.handler_base = static_cast<uint32_t>(handlers.size());
         ML_VM_CHECK(diters_n == dict_iters.size());
@@ -7449,6 +7461,8 @@ void jit_fill_push_layout(JitPushLayout *L)
     L->rec_cache_key = reinterpret_cast<const char *>(&r.cache_key) - rb;
     L->rec_caller_cache =
         reinterpret_cast<const char *>(&r.caller_cache) - rb;
+    L->rec_norec_site =
+        reinterpret_cast<const char *>(&r.norec_site) - rb;
     static FuncDescriptor fd;         /* static: fo.func may outlive scope */
     const char *db = reinterpret_cast<const char *>(&fd);
     L->desc_params = reinterpret_cast<const char *>(&fd.params) - db;
@@ -7482,6 +7496,96 @@ void jit_fill_push_layout(JitPushLayout *L)
     /* the emitted seg/rec addressing */
     static_assert(sizeof(std::unique_ptr<VmStackSeg>) == sizeof(void *),
                   "segs[i] raw-pointer load");
+}
+
+/*
+ * G1 NO-RECORD TIER, STEP 1 - the SHADOW VERIFICATION (the Net 1 seed,
+ * plans/g1-no-record-tier.md "THE TESTING PLAN").
+ *
+ * jit_norec_push_verify runs after EVERY M5b inline push in a TESTS
+ * build (the emitter inserts the call beside its other TESTS-only
+ * counter bumps), with the just-filled record on top of the activation.
+ * It compares the record against the side-table entry for the site that
+ * pushed it - the table built by the C++ emitter's bookkeeping against
+ * the record filled by the emitted instructions, two paths from the same
+ * emit-time knowledge, which is exactly the divergence that would poison
+ * the tier's later steps.
+ *
+ * A mismatch is a DELIBERATE, LOCATED abort: this is the testing
+ * contract ("SHADOW MISMATCH ... -> abort"), it must fire in the
+ * TESTS=1 OPT=1 ASSERTS=0 lane too (so not ML_CHECK), and per the #142
+ * rule the helper never throws.
+ *
+ * g_norec_audit additionally re-verifies EVERY live record's site
+ * association on every push - the full-stack audit (Net 1b), O(depth)
+ * per call, enabled per-test or via MYLANG_NOREC_AUDIT=1.
+ */
+unsigned long g_jit_norec_sites = 0;
+unsigned long g_jit_norec_verify = 0;
+unsigned long g_jit_norec_audit_frames = 0;
+bool g_norec_audit = false;
+
+#ifdef TESTS
+[[noreturn]] static void norec_fail(const char *what, const void *a,
+                                    const void *b)
+{
+    fprintf(stderr, "NOREC SHADOW MISMATCH: %s (%p vs %p)\n", what, a, b);
+    abort();
+}
+
+static void norec_check_rec(const VmCallRec &rec, const NorecSite *ns)
+{
+    if (rec.norec_site != ns)
+        norec_fail("record's site pointer", rec.norec_site, ns);
+    if (rec.dst != ns->dst)
+        norec_fail("dst", reinterpret_cast<const void *>(rec.dst),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(ns->dst)));
+    if (!rec.sync_stop)
+        norec_fail("sync_stop clear on an emitted push", nullptr, ns);
+    if (rec.ret_chunk != &vm_sync_stop_chunk() || rec.ret_pc != 1)
+        norec_fail("M5b sentinel resume fields", rec.ret_chunk, ns);
+    /* the registries: both return addresses must find THIS entry, and
+     * the callee chunk's code range must map back to the callee */
+    if (jit_norec_site_for(ns->ret_switched) != ns)
+        norec_fail("ret_switched lookup", ns->ret_switched, ns);
+    if (jit_norec_site_for(ns->ret_plain) != ns)
+        norec_fail("ret_plain lookup", ns->ret_plain, ns);
+    if (rec.run_chunk && rec.run_chunk->native.base
+            && jit_norec_frag_for(rec.run_chunk->native.base)
+                   != rec.run_chunk)
+        norec_fail("callee fragment-range lookup",
+                   rec.run_chunk->native.base, rec.run_chunk);
+}
+#endif
+
+extern "C" void jit_norec_push_verify(const void *site) noexcept
+{
+#ifdef TESTS
+    const NorecSite *ns = static_cast<const NorecSite *>(site);
+    VmActivation *act = g_vm_act;
+    if (!act || !act->rec_n || !ns)
+        norec_fail("no activation/record at a verify", act, ns);
+    norec_check_rec(act->back_rec(), ns);
+    g_jit_norec_verify++;
+    static const bool env_audit =
+        env_get("MYLANG_NOREC_AUDIT").has_value();
+    if (g_norec_audit || env_audit) {
+        /* the FULL-STACK audit: every live emitted-pushed record must
+         * still agree with its site - the net that can see a TRANSIENT
+         * corruption a normal pop never reads */
+        for (size_t i = 0; i < act->rec_n; i++) {
+            const VmCallRec &r = act->records[i];
+            if (!r.norec_site)
+                continue;             /* a C++-pushed record has no site */
+            norec_check_rec(
+                r, static_cast<const NorecSite *>(r.norec_site));
+            g_jit_norec_audit_frames++;
+        }
+    }
+#else
+    (void)site;
+#endif
 }
 
 ptrdiff_t jit_off_act_rec_n()

@@ -1488,6 +1488,33 @@ struct NativeCode {
     void release() noexcept;   /* munmap; jit.cpp (no-op when null) */
 };
 
+/*
+ * G1 NO-RECORD TIER, STEP 1 (plans/g1-no-record-tier.md): one entry per
+ * EMITTED sync-call site - the pc-keyed side table the tier will later
+ * rebuild frames from. At namespace scope (not nested in Chunk) so jit.h
+ * can name it through a forward declaration.
+ *
+ * ONE logical site has TWO return addresses: the M5a stack switch emits
+ * `call rdx` twice (the switched and the plain path), and both map back
+ * to this one entry.
+ *
+ * Entries are separately heap-allocated because their ADDRESS is baked
+ * into the fragment (the record's norec_site store and the verify call's
+ * argument) - the CalleeCache rule.
+ */
+struct NorecSite {
+    const Chunk *caller = nullptr;   /* the chunk whose code calls */
+    uint32_t call_pc = 0;            /* the call op's pc at emit time */
+    int32_t dst = -1;                /* caller slot for the result */
+    uint64_t site_loc = 0;           /* baked line<<32|col (#88's) */
+    uint8_t op = 0;                  /* the call's OpCode, as u8 */
+    size_t off_switched = 0;         /* emit-time offsets of the two */
+    size_t off_plain = 0;            /* return addresses            */
+    const void *ret_switched = nullptr;  /* absolute - filled when the
+                                          * fragment is placed */
+    const void *ret_plain = nullptr;
+};
+
 struct Chunk {
     std::vector<Instr> code;
     /*
@@ -1608,6 +1635,18 @@ struct Chunk {
         const void *coerce = nullptr;                /* the coercing one */
     };
     std::vector<std::unique_ptr<CalleeCache>> call_caches;
+
+    /*
+     * G1 NO-RECORD TIER, STEP 1: the emitted sync-call site table (the
+     * NorecSite struct is at namespace scope above Chunk so jit.h can name
+     * it through a forward declaration). Emitted in every build, and USED
+     * BY NOTHING except the TESTS shadow verification - the point of step
+     * 1 is that the table survives millions of comparisons against the
+     * live records before anything depends on it. DERIVED, never
+     * serialized: a loaded image's JIT pass re-emits the sites, exactly
+     * like `native` and `call_caches`.
+     */
+    std::vector<std::unique_ptr<NorecSite>> norec_sites;
 
     /*
      * #55 native calls: this chunk's WHOLE body is a single fully-native run

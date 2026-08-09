@@ -2758,3 +2758,43 @@ That is a materially harder design (the reconstruction needs the caller's
 resume pc and dst, which is most of what the record holds), and it is the
 question worth putting to the maintainer, rather than "should we build the
 leaf tier".
+
+## G1 no-record tier STEP 1 (2026-08-09): the shadow-verified side table
+
+plans/g1-no-record-tier.md steps 1 + nets 1/1b/5/6, zero behaviour: one
+NorecSite per emitted sync-call site ({caller, call_pc, dst, site_loc, op,
+two ret-address offsets - the M5a switch emits `call rdx` TWICE}), filled
+to absolutes where call_relocs are patched, registered in ret-addr -> site
+and range -> chunk maps (jit_norec_register; container chunks register
+their RANGE too - they can be sync CALLEES). TESTS builds store the site
+pointer into the record (rec_norec_site; push_window nulls it on every C++
+push) and call jit_norec_push_verify after EVERY inline push: dst,
+sync_stop, the M5b sentinel resume fields, both registry lookups, the
+callee's range lookup - a mismatch is a located abort. MYLANG_NOREC_AUDIT
+(or g_norec_audit) re-verifies EVERY live record per push - the full-stack
+audit. Lever: norec (site emission off). Measured reach: norec_verify ==
+sync_inline exactly (1,352,549 on 10_recursion_deep); the audit re-walked
+305,676,074 frames on that bench, all consistent.
+
+WHAT THE NET CAUGHT ON ITS FIRST RUN: my own purge loop dereferencing
+entries whose owning chunk had died (ASan UAF, jit_norec_register) -
+fixed by ADDRESS-RANGE-only purges, hooked into NativeCode::release
+(fragments are munmapped on chunk death; a recycled mmap range must evict
+stale entries).
+
+SABOTAGES: dst off-by-one, dropped record-site association, unregistered
+switched address - each watched failing with a named NOREC SHADOW
+MISMATCH. NOT falsifiable at step 1: a corrupted ret-address OFFSET - the
+verification's lookup keys come from the same field, so it is self-
+consistent by construction. THE FIRST THING STEP 2 MUST DO is compare a
+REAL stack-derived return address against the table, which is exactly the
+check that closes this hole.
+
+TWO SHAPE-EATERS found writing the -rt test, now in its comment: a FIRST
+descent is all new record-stack peaks (the reuse guard declines every
+level - a single deep call yields ZERO inline pushes), and direct SELF-
+recursion is sync-emitted only with the native stack armed (the ASan lane
+runs cap 32, unarmed) - the test drives MUTUAL recursion in a loop.
+
+PENDING (tomorrow): clang / rel-hard / stats lanes, corpus_diff,
+non-JIT platform probe, CMake build, nested_fuzz - run before push.

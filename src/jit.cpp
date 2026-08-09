@@ -205,12 +205,12 @@ bool g_jit_enabled = false;
 enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
-    JL_CEST, JL_RELENT, JL_COUNT
+    JL_CEST, JL_RELENT, JL_NOREC, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
-    "relent"
+    "relent", "norec"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -398,11 +398,21 @@ size_t jit_enter_deep(const void *frag, void *slots)
     return reinterpret_cast<NativeFrag>(const_cast<void *>(frag))(slots);
 }
 
+/* G1 step 1: drop every registry entry inside a dying fragment range -
+ * BY ADDRESS ONLY, never by dereferencing an entry (the entries are owned
+ * by the chunk and may already be freed when release runs; the first
+ * version's owner-pointer purge was an ASan-caught UAF on its very first
+ * -rt run - the shadow net catching its own scaffolding). Defined below
+ * the registries; forward-declared here for release(). */
+static void jit_norec_release_range(const void *base, size_t len) noexcept;
+
 void NativeCode::release() noexcept
 {
 #if ML_JIT_SUPPORTED
-    if (base)
+    if (base) {
+        jit_norec_release_range(base, len);
         munmap(base, len);
+    }
 #endif
     base = nullptr;
     len = 0;
@@ -2487,7 +2497,8 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
                                   bool cached, int callee_arg,
                                   std::vector<size_t> &j_slow,
                                   std::vector<size_t> &j_done,
-                                  Chunk::CalleeCache *cache_cell)
+                                  Chunk::CalleeCache *cache_cell,
+                                  const NorecSite *ns)
 {
     const JitPushLayout &P = jit_push_layout();
     const JitLayout &L = jit_layout();
@@ -2993,6 +3004,17 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     st_q_imm32(R10, static_cast<int32_t>(P.rec_ret_pc), 1);
     st_q_imm32(R10, static_cast<int32_t>(P.rec_dst),
                static_cast<int32_t>(in.target));
+#ifdef TESTS
+    /* G1 step 1: associate the record with its side-table site so the
+     * shadow verification and the full-stack audit can find the entry
+     * from a live record. rax is free here - the very next instruction
+     * reloads it from the desc spill. TESTS only: push_window nulls the
+     * field for every C++ push, so a non-TESTS record is always null. */
+    if (ns) {
+        e.movabs(RAX, reinterpret_cast<uint64_t>(ns));
+        st(R10, static_cast<int32_t>(P.rec_norec_site), RAX);
+    }
+#endif
     e.u8(0x48); e.u8(0x8B); e.u8(0x04); e.u8(0x24);  /* mov rax, [rsp]
                                                       * = the desc spill */
     st(R10, static_cast<int32_t>(P.rec_desc), RAX);
@@ -3134,6 +3156,81 @@ static void emit_nstack_switch_post(Emitter &e)
     e.u8(0x4C); e.u8(0x89); e.u8(0x09);               /* mov [rcx], r9 */
 }
 
+/*
+ * G1 NO-RECORD TIER, STEP 1 - the ret-address -> site and address ->
+ * owning-chunk registries (plans/g1-no-record-tier.md). Filled by
+ * jit_norec_register when a fragment buffer is placed (the base becomes
+ * known exactly where call_relocs are patched); read today ONLY by the
+ * TESTS shadow verification. Ordered maps: lookup performance is a
+ * step-3 concern, correctness is this step's.
+ *
+ * PURGE DISCIPLINE: registration first erases (a) any entries owned by
+ * the SAME chunk (a recompile - no in-tree path does it today, but a
+ * stale entry is silent wrongness of exactly the class #144 chased) and
+ * (b) any entries whose addresses OVERLAP the new range - a freed
+ * fragment's mmap range can be REUSED by a later one
+ * (NativeCode::release munmaps), and a stale entry at a recycled
+ * address would answer for the wrong site. A DEAD chunk's
+ * non-overlapped entries do linger; nothing queries dead addresses
+ * today, and the walk that might (step 2+) must revisit this.
+ */
+static std::map<uintptr_t, const NorecSite *> g_norec_ret;
+static std::map<uintptr_t,
+                std::pair<uintptr_t, const Chunk *>> g_norec_frag;
+
+const NorecSite *jit_norec_site_for(const void *ret_addr)
+{
+    const auto it = g_norec_ret.find(
+        reinterpret_cast<uintptr_t>(ret_addr));
+    return it == g_norec_ret.end() ? nullptr : it->second;
+}
+
+const Chunk *jit_norec_frag_for(const void *addr)
+{
+    const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
+    auto it = g_norec_frag.upper_bound(a);
+    if (it == g_norec_frag.begin())
+        return nullptr;
+    --it;
+    return a < it->second.first ? it->second.second : nullptr;
+}
+
+/* the range purge shared by fragment DEATH (NativeCode::release) and
+ * fragment BIRTH at a recycled address (jit_norec_register). Key-range
+ * tests only - a stale entry's pointee may be freed, so nothing here may
+ * dereference one. */
+static void jit_norec_release_range(const void *b, size_t n) noexcept
+{
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(b);
+    const uintptr_t hi = lo + n;
+    g_norec_ret.erase(g_norec_ret.lower_bound(lo),
+                      g_norec_ret.lower_bound(hi));
+    for (auto it = g_norec_frag.begin(); it != g_norec_frag.end(); )
+        it = (it->first < hi && it->second.first > lo)
+                 ? g_norec_frag.erase(it) : ++it;
+}
+
+static void jit_norec_register(Chunk &chunk)
+{
+    const char *base = static_cast<const char *>(
+        const_cast<const void *>(chunk.native.base));
+    if (!base)
+        return;
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+    jit_norec_release_range(base, chunk.native.len);
+    g_norec_frag.emplace(
+        lo, std::make_pair(lo + chunk.native.len,
+                           static_cast<const Chunk *>(&chunk)));
+    for (auto &up : chunk.norec_sites) {
+        NorecSite *ns = up.get();
+        ns->ret_switched = base + ns->off_switched;
+        ns->ret_plain = base + ns->off_plain;
+        g_norec_ret[reinterpret_cast<uintptr_t>(ns->ret_switched)] = ns;
+        g_norec_ret[reinterpret_cast<uintptr_t>(ns->ret_plain)] = ns;
+        g_jit_norec_sites++;
+    }
+}
+
 /* #56 step 3: the CURRENT chunk's entry_remap, visible to
  * emit_sync_call_inline so it can bake the call's POST-CALL entry-stub pc
  * (the SWITCH record's resume). Set around the fragment-emission loop in
@@ -3148,6 +3245,11 @@ static const std::vector<int> *g_cur_entry_remap = nullptr;
  * un-cached guard chain. */
 static std::vector<std::unique_ptr<Chunk::CalleeCache>> *g_cur_call_caches
     = nullptr;
+
+/* G1 step 1: the CURRENT chunk's NorecSite storage (Chunk::norec_sites),
+ * set beside g_cur_call_caches. Null (no chunk / lever off) emits no
+ * site and no verification - byte-identical to the pre-step-1 code. */
+static std::vector<std::unique_ptr<NorecSite>> *g_cur_norec_sites = nullptr;
 
 static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                   const Instr &in, uint32_t pc,
@@ -3181,10 +3283,25 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             std::unique_ptr<Chunk::CalleeCache>(new Chunk::CalleeCache()));
         cell = g_cur_call_caches->back().get();
     }
+    /* G1 step 1: one NorecSite per emitted site (plans/g1-no-record-
+     * tier.md). The ret-address offsets are captured after the two
+     * `call rdx` emissions below; the absolute addresses are filled when
+     * the buffer is placed (jit_norec_register). */
+    NorecSite *ns = nullptr;
+    if (g_cur_norec_sites && !jit_lever_off(JL_NOREC)) {
+        g_cur_norec_sites->push_back(
+            std::unique_ptr<NorecSite>(new NorecSite()));
+        ns = g_cur_norec_sites->back().get();
+        ns->caller = &ck;
+        ns->call_pc = static_cast<uint32_t>(old_pc);
+        ns->dst = static_cast<int32_t>(in.target);
+        ns->site_loc = site;
+        ns->op = static_cast<uint8_t>(in.op);
+    }
     emit_sync_push_native(e, in, is_value,
                           in.op == OpCode::CachedCallV,
                           static_cast<int>(callee_arg), j_slows, j_dones,
-                          cell);
+                          cell, ns);
     /* depth++ (the callee is committed) */
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x01);                        /* inc dword [rcx] */
@@ -3194,6 +3311,20 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.movabs(RCX, reinterpret_cast<uint64_t>(
                       &g_jit_op_run[static_cast<size_t>(in.op)]));
     e.u8(0x48); e.u8(0xFF); e.u8(0x01);            /* inc qword [rcx] */
+    /* G1 step 1: the SHADOW VERIFICATION - compare the record the push
+     * just filled against the side-table entry, every call, before the
+     * callee runs. Only rdi (the callee window) and rdx (the fragment
+     * entry) are live here - r8-r11/rsi/rax are dead until the post-call
+     * rebuild, rcx is already scratch for the counter bumps above - so
+     * two pushes (parity kept: 16 bytes) protect everything the helper's
+     * C++ can clobber. */
+    if (ns) {
+        e.push_reg(RDI); e.push_reg(RDX);
+        e.movabs(RDI, reinterpret_cast<uint64_t>(ns));
+        e.movabs(RAX, reinterpret_cast<uint64_t>(&jit_norec_push_verify));
+        e.call_rax();
+        e.pop_reg(RDX); e.pop_reg(RDI);
+    }
 #endif
     /* THE OUTERMOST-ONLY STACK SWITCH (M5a): nesting happens HERE (the
      * direct callee call), so the native-stack switch lives here - not in
@@ -3205,10 +3336,14 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     {
         const size_t j_plain = emit_nstack_switch_pre(e);
         e.u8(0xFF); e.u8(0xD2);                    /* call rdx (switched) */
+        if (ns)
+            ns->off_switched = e.pos();  /* G1: the hardware ret address */
         emit_nstack_switch_post(e);
         const size_t j_over = e.j32(0xEB);
         e.patch32_here(j_plain);
         e.u8(0xFF); e.u8(0xD2);                    /* call rdx (plain) */
+        if (ns)
+            ns->off_plain = e.pos();
         e.patch32_here(j_over);
     }
     /* sentinel? (JIT_RET_SENTINEL == (size_t)-1). The depth DEC runs on
@@ -4318,6 +4453,10 @@ void jit_stats_report()
         { "ref_arg_binds",    &g_jit_ref_arg_binds },
         { "ret_inline",       &g_jit_ret_inline },
         { "entry_resume",     &g_jit_entry_resume },
+        /* G1 no-record tier step 1 (the shadow-verified side table) */
+        { "norec_sites",      &g_jit_norec_sites },
+        { "norec_verify",     &g_jit_norec_verify },
+        { "norec_audit",      &g_jit_norec_audit_frames },
     };
     /* G1 reach probe (vm.cpp): the no-record tier's candidate gates.
      * Only meaningful with the JIT OFF - it sits on the C++ push path. */
@@ -11260,6 +11399,10 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
 
     chunk.native.base = mem;
     chunk.native.len = len;
+    /* G1: a container chunk emits no sync SITES, but it can be a sync
+     * CALLEE (its code[0] is EnterNative), so its code RANGE must be in
+     * the registry or the verification's frag lookup false-aborts. */
+    jit_norec_register(chunk);
     if (g_jit_annotate)
         chunk.native.frags.push_back(
             { 0, static_cast<uint32_t>(len), std::move(marks) });
@@ -11628,6 +11771,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * the previous run's, whose addresses the discarded code baked. */
     chunk.call_caches.clear();
     g_cur_call_caches = &chunk.call_caches;
+    chunk.norec_sites.clear();          /* G1: recompile hygiene */
+    g_cur_norec_sites = &chunk.norec_sites;
     /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
      * across the loop - no op clobbers it - so the native back edge, a
      * jump to label[begin] AFTER this movabs, keeps it live); record each
@@ -12420,6 +12565,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 
     g_cur_entry_remap = nullptr;        /* #56: emission done */
     g_cur_call_caches = nullptr;
+    g_cur_norec_sites = nullptr;
 
     /* Trampoline pool (out-of-line, one per DISTINCT libm fn): the rare
      * rel32-out-of-range fallback for a call (and the arm64-style veneer a
@@ -12464,6 +12610,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     }
     chunk.native.base = mem;
     chunk.native.len = len;
+    jit_norec_register(chunk);   /* G1: absolutes + the registries */
     /* lever 1 step 5: a body that STARTS native is direct-`call`able by a
      * sync caller fragment (jit_sync_push_* returns base + this). */
     if (!chunk.code.empty() && chunk.code[0].op == OpCode::EnterNative)
@@ -12497,6 +12644,16 @@ void jit_cache_audit_report()
 
 void jit_stats_report()
 {
+}
+
+const NorecSite *jit_norec_site_for(const void *)
+{
+    return nullptr;
+}
+
+const Chunk *jit_norec_frag_for(const void *)
+{
+    return nullptr;
 }
 
 #endif
