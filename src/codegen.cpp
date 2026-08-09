@@ -8579,8 +8579,9 @@ unsigned long g_bc_inline_caller_frames = 0;
 unsigned long g_bc_inline_splices = 0;
 
 bool g_bc_inline_enabled = [] {
-    const char *e = getenv("MYLANG_BCINLINE");
-    return e && e[0] == '1';
+    const auto e = env_get("MYLANG_BCINLINE");
+    return !(e && !e->empty() && (*e)[0] == '0');
+                                      /* DEFAULT ON since 2026-08-02 */
 }();
 
 /*

@@ -475,10 +475,18 @@ parse_args(int argc, char **argv)
 
         } else if (!strcmp(arg, "-bi")) {
 
-            g_bc_inline_enabled = true;   /* the bytecode SPLICE on - OPT-IN
-                                           * while it is unfinished, see
-                                           * plans/bytecode-inliner.md; also
+            g_bc_inline_enabled = true;   /* the bytecode SPLICE on - the
+                                           * DEFAULT since 2026-08-02, kept
+                                           * as the explicit form; also
                                            * MYLANG_BCINLINE=1 */
+
+        } else if (!strcmp(arg, "-nbi")) {
+
+            g_bc_inline_enabled = false;  /* the splice's kill switch - the
+                                           * same-binary A/B, since the
+                                           * un-inlined bytecode is a
+                                           * splice's only oracle; also
+                                           * MYLANG_BCINLINE=0 */
 
         } else if (!strcmp(arg, "-tw")) {
 

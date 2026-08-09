@@ -15934,6 +15934,19 @@ static bool jit_native_stack_deep()
      * time through the SLOW tier (the cold emplace), so call #1 is
      * all-slow by design and call #2 flies inline. (The M5b prove-it
      * catch: the single-call draft measured 0 inline calls.) */
+    /* The bytecode SPLICE is OFF for this test: its one proven shape is
+     * exactly this self-recursion, and a spliced body runs TWO levels
+     * per call - halving every inline-call count below (the CI Release
+     * lanes caught 2500 of 5000 when the splice went default-ON; the
+     * ASan lanes SKIP this test via the cap gate above, so no local
+     * debug run could see it). The counts are the M5b push's contract,
+     * not the splice's. */
+    const bool bi_saved = g_bc_inline_enabled;
+    g_bc_inline_enabled = false;
+    struct BiRestore {
+        bool v;
+        ~BiRestore() { g_bc_inline_enabled = v; }
+    } bi_restore{ bi_saved };
     const unsigned long b0 = g_jit_sync_inline;
     if (!run({
             "func s(n) { if (n < 1) { return 0; }",
@@ -22675,26 +22688,31 @@ void run_tests(bool dump_syntax_tree)
         bool jit;
         bool splice;          /* the bytecode inliner (-bi), default OFF */
     };
+    /*
+     * BOTH SPLICE STATES, because BOTH ship: the bytecode splice went
+     * default-ON on 2026-08-02 and `-nbi` turns it off, so each is a
+     * configuration a user can run and neither may be the untested one.
+     * (Before the flip these were the extra passes; the labels swapped,
+     * the coverage did not.)
+     *
+     * Two passes per splice state, not one: a splice bug can live in the
+     * bytecode it PRODUCES - visible with the JIT off - or in how the JIT
+     * CONSUMES it, visible only with it on. Those are different layers,
+     * and a JIT-only bug that is unobservable in the default corpus is
+     * exactly how a disabled branch remap survived 39 commits.
+     */
     std::vector<VmMode> modes = {
-        { "vm", "bytecode VM, JIT OFF (pure bytecode)", false, false },
+        { "vm-nbi", "VM, JIT OFF, splice OFF (-nbi)", false, false },
     };
     if (ML_JIT_SUPPORTED)
         modes.push_back(
-            { "jit", "bytecode VM, JIT ON (native, the script DEFAULT)",
-              true, false });
-    /*
-     * ... and the same again with the BYTECODE SPLICE on. It is opt-in and
-     * default-off, so without these passes the entire suite says nothing
-     * about it - and "the configuration nobody runs" is precisely how a
-     * disabled branch remap survived 39 commits. Two passes, not one: a
-     * splice bug can live in the bytecode it produces (visible with the
-     * JIT off) or in how the JIT consumes it (visible only with it on),
-     * and those are different layers.
-     */
-    modes.push_back({ "vm+bi", "VM, JIT OFF + bytecode SPLICE", false, true });
+            { "jit-nbi", "VM, JIT ON, splice OFF (-nbi)", true, false });
+    modes.push_back(
+        { "vm", "VM, JIT OFF, splice ON", false, true });
     if (ML_JIT_SUPPORTED)
         modes.push_back(
-            { "jit+bi", "VM, JIT ON + bytecode SPLICE", true, true });
+            { "jit", "VM, JIT ON, splice ON (the script DEFAULT)",
+              true, true });
 
     const bool saved_jit = g_jit_enabled;
     const bool saved_bi = g_bc_inline_enabled;
