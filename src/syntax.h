@@ -594,6 +594,16 @@ public:
     bool auto_const_param = false;
 
     /*
+     * TDZ (#131): this use names a symbol that IS declared in an enclosing
+     * scope but whose declaration has not been walked yet. Only ever set on
+     * a LAZY builtin's argument (`defined`/`isconst`/`isconstdecl`), because
+     * every other use in that position is a compile error
+     * (UseBeforeBindingEx). It is what makes `defined(a)` before `var a`
+     * fold to TRUE - the name exists; it is merely unbound.
+     */
+    bool in_tdz = false;
+
+    /*
      * Type-inference modifiers (see plans/archived/type-inference.md). Set by the parser
      * for a param or a var/const declared `opt` (nullable: may hold `none`) or
      * `dyn` (dynamically typed: behaves as today, inference does not constrain
@@ -635,6 +645,7 @@ public:
         copy_base_fields(*c);
         c->sym = sym;
         c->const_param = const_param;
+        c->in_tdz = in_tdz;
         c->auto_const_param = auto_const_param;
         c->opt_mod = opt_mod;
         c->dyn_mod = dyn_mod;

@@ -308,7 +308,12 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
         if (ctx->gfuncs->defined[sym.slot])
             return EvalValue(&ctx->gfuncs->slots[sym.slot]);
 
-        return UndefinedId{get_str()};
+        /* TDZ, runtime half (#131): the name IS declared - it has a global
+         * slot - but its declaration has not run yet. That is UNBOUND, not
+         * undefined, and it is a catchable RuntimeException. */
+        throw UnboundSymbolEx(
+            intern_msg("'" + std::string(get_str()) + "' is not bound yet"),
+            start, end);
     }
 
     if (sym.kind == SymKind::capture && ctx->captures) {
@@ -368,7 +373,9 @@ EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
         if (ctx->gfuncs->defined[slot])
             return EvalValue(&ctx->gfuncs->slots[slot]);
 
-        return UndefinedId{uid->val};
+        /* See Identifier::do_eval: declared (it has a slot) but not bound. */
+        throw UnboundSymbolEx(
+            intern_msg("'" + std::string(uid->val) + "' is not bound yet"));
     }
 
     if (kind == SymKind::capture && ctx->captures)

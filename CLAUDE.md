@@ -2502,13 +2502,16 @@ sanitizers never reproduced it.)
   ABOUT the name, answered `false`) and the `_` placeholder. A name declared
   BELOW its use is NOT this error - see `Scope::all_names`, the whole-scope
   pre-scan that distinguishes them. The resolver does a forward
-  lexical walk (no hoisting **for locals**, so `var x = x + 1` reads the outer
-  `x`; top-level *functions* ARE hoisted — see next bullet). **No per-slot
+  lexical walk (no hoisting **for locals**), but since the TDZ (#131) a use
+  that a LATER declaration in the same scope will shadow is a COMPILE error
+  (`UseBeforeBindingEx`) rather than a read of the outer binding - so
+  `var x = x + 1` is refused, where it used to read the outer `x`. Top-level
+  *functions* ARE hoisted, binding and all — see the next bullet. **No per-slot
   liveness**: a slot is default-constructed when the `Frame` is built, and a
   local can only *resolve* to its slot AFTER its decl (forward resolution), so a
   re-entered loop body re-binds its locals via their decls (which re-run each
-  iteration) and a use-before-decl resolves to an outer binding or errors via
-  the map — the slot's stale value is never observed. (This is why there is no
+  iteration) and a use-before-decl is a compile error (the TDZ, #131) — so the
+  slot's stale value is never observed. (This is why there is no
   script `undef`: removing a binding would need per-slot definedness; the REPL's
   `:undef` works on its map-resident globals instead.) Same-block duplicate
   declarations are caught here (`AlreadyDefinedEx`) so the runtime decl path can

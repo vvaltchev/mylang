@@ -120,7 +120,38 @@ fold only when the visible binding is NOT the const evaluator's own - a
 `pure func` IS that binding and must keep folding (`pure func p(x) => x*2;
 const C = p(3);` must stay 6).
 
-**`defined()` -> REPL-ONLY; new `isbound()` for scripts.** After FIX-1 a
+**REVISED 2026-08-08: `defined()` STAYS IN THE SCRIPT.** With the TDZ
+model the two questions are genuinely different and both are useful:
+
+| the name is... | `defined()` | `isbound()` |
+|---|---|---|
+| declared NOWHERE | `false` (folds; never fails) | compile error |
+| declared, decl NOT yet run | **`true`** | `false` |
+| declared, decl has run | `true` | `true` |
+
+    func f() { var b = defined(a); var a = 5; return b; }
+      today  -> false   (the resolver walks forward, so `a` is unresolved)
+      at the end of the arc -> TRUE (under TDZ the name is declared for the
+                                     whole scope; it is merely UNBOUND)
+
+**This falls out of step 3 for free**, which is worth knowing before
+touching it: `try_fold_defined` already folds to `true` for a
+`SymKind::local`, so once TDZ hoists names, `defined(a)` before the decl
+resolves to the local slot and folds `true` with NO change to that
+function. What must change is the TEST - `tests.cpp` currently asserts
+`defined(a) == 0` before `var a;` and will invert to `== 1`.
+
+And the runtime half already exists under the wrong name: today's comment
+in `try_fold_defined` says "a GLOBAL is a genuine runtime property (its
+decl may not have run) -> left for DefinedGlobalV". That IS the bound
+question, so **`DefinedGlobalV` simply changes owner from `defined()` to
+`isbound()`**; `defined()` of a declared global folds to `true`.
+
+**`isbound()` is the new builtin** - lazy (unevaluated argument, so
+`mark_lazy_builtin` + the F1 rule: callable directly, never usable as a
+value). The `.myv` builtin-set fingerprint changes.
+
+**(superseded note) `defined()` -> REPL-ONLY.** After FIX-1 a
 nonexistent name is a compile error, so the only false answer left in a
 script is "declared but not bound yet" - which is what `isbound()` names
 honestly. Both are lazy builtins (unevaluated argument), so `isbound`
@@ -346,8 +377,17 @@ Each lands as its OWN commit.
    from "a script may catch it". Small, independent, and it must come
    BEFORE steps 3-5 so their tests assert the final rendering rather than
    an intermediate one.
-3. **TDZ + `UnboundSymbolEx` + `UseBeforeBindingEx`** (#131) - hoist
-   names for real, split by decidability.
+3. **TDZ + `UnboundSymbolEx` + `UseBeforeBindingEx`** (#131) - **LANDED.**
+   Split by decidability, WITHOUT hoisting slots: the check consults
+   `Scope::var_names` (the var/const subset of the FIX-1 pre-scan) and
+   refuses the program in exactly the cases where hoisting would have
+   changed the answer, so resolution itself is untouched. `defined()`
+   folds TRUE for a TDZ name via `Identifier::in_tdz`, and for a global.
+   Two bugs fell out: `jit_make_closure` was a `void noexcept` helper
+   documented as "never throws" (that, not missing unwind info, was the
+   SIGABRT), and capture descriptors were snapshotted BEFORE pass 2
+   stamped escaped globals, so a captured global silently fell back to
+   the by-name map walk.
 4. **Carets** (#126/#127/#128) - incl. a `Loc` per `CaptureDesc`, so a
    `.myv` format bump.
 5. **Nested func/struct hoist with binding** (#134).
