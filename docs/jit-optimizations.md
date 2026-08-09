@@ -2892,3 +2892,48 @@ site_loc" on the first -rt run. The -rt test gained a throwing phase
 (mutual recursion, struct exception, caught at top, driven 4x past the
 cold-grow) asserting frame_verify and stamp_verify both advanced.
 Counters: norec_frame / norec_stamp, in coverage + MYLANG_JITSTATS.
+
+## G1 no-record tier STEP 3a (2026-08-10): the rbp chain, shadow-walked
+
+The frame-pointer chain the maintainer chose lands here. Every fragment
+now maintains rbp - `push rbp; mov rbp, rsp` at frag_entry, `pop rbp`
+before every `ret` (the entry-pad parity flipped: 2 pushes + saved, not
+1). So [rbp] = the caller's rbp, [rbp+8] = the return address, and a
+contiguous run of fragment-to-fragment calls is walkable with two loads
+per level - which is the whole mechanism step 4 reconstructs frames from.
+rbp was audited FREE: the Reg enum omits 4/rsp and 5/rbp, no emitted
+instruction encodes it, and every `ret` funnels through frag_ret (the
+audit is `grep u8(0xC3)` -> exactly one, inside frag_ret).
+
+THE SHADOW WALK (jit_norec_push_verify, TESTS): every push now also
+receives the pushing fragment's rbp and walks the REAL chain, requiring
+it to match the record stack frame-for-frame - each frame's site return
+address at [fp+8] resolving to the record's site, and the record's
+stored anchor equal to the chain link [fp]. The anchor is a record field
+(native_rbp) written by the emitted push UNDER TESTS ONLY - step 4
+removes the record for these frames, so a stored anchor has no release
+consumer; release pays only the rbp prologue.
+
+THE INVARIANT THIS TAUGHT, and it is the one step 4 stands on: the rbp
+chain covers only the TOPMOST CONTIGUOUS NATIVE SEGMENT. A C++ return
+address is that segment's floor - a fragment entered from the interpreter
+(jit_enter), or a deeper call that declined to the C++ tier because the
+sync depth cap runs interpreted-flat (exactly ackermann, which aborted
+the first over-eager walk). The record stack continues BELOW with earlier
+segments the rbp chain cannot reach. So the walk stops at the first C++
+RA and asserts nothing about the record there; the cross-segment ORDER is
+step 4's job, checked with the records present.
+
+Reach: 10_recursion_deep walks 304,323,525 frames (the deep segment per
+push); a depth-1 call (45_gcd, 76) walks 0 - its caller is C++, so the
+walk stops immediately, correctly. Sabotage watched failing: storing the
+anchor as rbp+8 dies "callee anchor != the push rbp" on the first run.
+The -rt test asserts walk_frames >= the call count on the mutual
+recursion, so a walk silently stopping at frame 1 fails.
+
+COST (callgrind Ir, OPT=1 ASSERTS=0, one 1-vs-1): 10_recursion_deep
++1.98% (the 3-instruction prologue per recursion level), 01_while_loop
++0.00%, 09_fib_recursive +0.04%. The regression is confined to pure
+fragment-recursion - the exact path step 4 relieves of the ~51-
+instruction record fill, which dwarfs this. Steps 1-3 buy nothing by
+design; this is the mechanism, not a win.

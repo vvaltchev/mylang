@@ -234,7 +234,8 @@ struct JitPushLayout {
               rec_run_chunk, rec_ret_chunk, rec_ret_pc, rec_dst, rec_desc,
               rec_caller_caps, rec_handler_base, rec_diter_base,
               rec_dyiter_base, rec_boundary, rec_sync_stop,
-              rec_cache_key, rec_caller_cache, rec_norec_site;
+              rec_cache_key, rec_caller_cache, rec_norec_site,
+              rec_native_rbp;
     /* FuncDescriptor */
     /* desc_bind_req: FuncDescriptor::bind_req (vector; data at +0) - the
      * per-parameter required Type singleton, read only when !fast_bind */
@@ -868,7 +869,8 @@ extern "C" unsigned long g_jit_entry_resume;
 /* The TESTS-emitted per-push verification (defined in vm.cpp - it reads
  * the activation's top record, which only vm.cpp can see). NEVER throws
  * (the #142 rule); a mismatch is a deliberate located abort. */
-extern "C" void jit_norec_push_verify(const void *site) noexcept;
+extern "C" void jit_norec_push_verify(const void *site,
+                                      const void *rbp) noexcept;
 /*
  * G1 STEP 2 seed: the HARDWARE return address vs the table. Emitted at
  * the top of EVERY fragment entry (TESTS): if [rsp] at entry lies in
@@ -886,6 +888,8 @@ extern unsigned long g_jit_norec_ret_verify;
  * postexit stamps that matched the table's loc for the popped frame. */
 extern unsigned long g_jit_norec_frame_verify;
 extern unsigned long g_jit_norec_stamp_verify;
+/* step 3: frames the rbp-chain shadow walk matched against records. */
+extern unsigned long g_jit_norec_walk_frames;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
  * bumped by the emitted code itself, so it proves the inline tier ran (the
  * jit_ret helper's own counter also counts declines and cannot). */

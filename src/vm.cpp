@@ -1647,6 +1647,11 @@ struct VmCallRec {
      * non-TESTS build (where the emitted store is not compiled) it is
      * always null - and nothing reads it there. */
     const void *norec_site = nullptr;
+    /* STEP 3: the pushing FRAGMENT's frame pointer (rbp) at push time -
+     * the native anchor by which the mixed walk orders record-ful and
+     * record-less frames. Written UNCONDITIONALLY by the emitted push
+     * (the step-4 walk needs it in every build); null on C++ pushes. */
+    const void *native_rbp = nullptr;
 };
 
 /*
@@ -1798,6 +1803,7 @@ struct VmActivation {
         rec.norec_site = nullptr;        /* every C++ push nulls the G1 site
                                           * (only the M5b emitted push, which
                                           * bypasses this function, sets it) */
+        rec.native_rbp = nullptr;        /* likewise the step-3 anchor */
         rec.run_chunk = ck;
         rec.handler_base = static_cast<uint32_t>(handlers.size());
         ML_VM_CHECK(diters_n == dict_iters.size());
@@ -2634,6 +2640,7 @@ static ML_ALWAYS_INLINE bool vm_dispatch_exc_hot(
  * them); the push-side verification further down uses them too. */
 unsigned long g_jit_norec_frame_verify = 0;
 unsigned long g_jit_norec_stamp_verify = 0;
+unsigned long g_jit_norec_walk_frames = 0;
 #ifdef TESTS
 [[noreturn]] static void norec_fail(const char *what, const void *a,
                                     const void *b)
@@ -7545,6 +7552,8 @@ void jit_fill_push_layout(JitPushLayout *L)
         reinterpret_cast<const char *>(&r.caller_cache) - rb;
     L->rec_norec_site =
         reinterpret_cast<const char *>(&r.norec_site) - rb;
+    L->rec_native_rbp =
+        reinterpret_cast<const char *>(&r.native_rbp) - rb;
     static FuncDescriptor fd;         /* static: fo.func may outlive scope */
     const char *db = reinterpret_cast<const char *>(&fd);
     L->desc_params = reinterpret_cast<const char *>(&fd.params) - db;
@@ -7635,7 +7644,8 @@ static void norec_check_rec(const VmCallRec &rec, const NorecSite *ns)
 }
 #endif
 
-extern "C" void jit_norec_push_verify(const void *site) noexcept
+extern "C" void jit_norec_push_verify(const void *site,
+                                      const void *rbp) noexcept
 {
 #ifdef TESTS
     const NorecSite *ns = static_cast<const NorecSite *>(site);
@@ -7644,6 +7654,77 @@ extern "C" void jit_norec_push_verify(const void *site) noexcept
         norec_fail("no activation/record at a verify", act, ns);
     norec_check_rec(act->back_rec(), ns);
     g_jit_norec_verify++;
+    /*
+     * G1 STEP 3 - THE SHADOW WALK. `rbp` is the CALLER fragment's frame
+     * pointer (the push runs BEFORE the callee is entered), so the frame
+     * it points at is the one the record BELOW the just-pushed callee
+     * describes. Two facts anchor the correspondence:
+     *
+     *   - the just-pushed callee's record stored `rbp` as its anchor:
+     *     records[rec_n-1].native_rbp == rbp (tautological - same reg -
+     *     but it confirms the emitted store hit the right offset);
+     *   - for each frame at fp: its RETURN address sits at [fp+8], and
+     *     its record's anchor R.native_rbp is the NEXT link up == [fp]
+     *     (R's caller's rbp), NOT fp itself.
+     *
+     * The chain covers only the TOPMOST CONTIGUOUS native segment (the
+     * stop below): a C++ return address is its floor. Within the segment,
+     * a frame with an emitted return address must have a record carrying
+     * that call's site, the site must resolve, and the anchor must equal
+     * the chain link. A C++ frame's rbp is NEVER dereferenced - the stop
+     * is decided by the return address alone, so garbage C++ rbp values
+     * (frames built without frame pointers) are unreachable.
+     */
+    {
+        const VmCallRec &callee = act->records[act->rec_n - 1];
+        if (callee.native_rbp != rbp)
+            norec_fail("callee anchor != the push rbp",
+                       callee.native_rbp, rbp);
+        const char *fp = static_cast<const char *>(rbp);
+        size_t idx = act->rec_n - 1;   /* record for the frame AT fp */
+        for (int guard = 0; idx; guard++) {
+            if (guard > 100000)
+                norec_fail("shadow walk did not terminate", rbp, ns);
+            const VmCallRec &r = act->records[idx - 1];
+            const void *ra =
+                *reinterpret_cast<const void *const *>(fp + 8);
+            /*
+             * The rbp chain covers only the TOPMOST CONTIGUOUS native
+             * call segment. A C++ return address is that segment's floor:
+             * the fragment was entered from the interpreter (jit_enter),
+             * or a deeper call declined to the C++ tier (the sync depth
+             * cap runs interpreted-flat - exactly ackermann). Below it
+             * the record stack continues with earlier segments the rbp
+             * chain cannot reach, so STOP - do not walk into a C++ rbp
+             * link. The cross-segment ORDER is step 4's concern, checked
+             * with the records still present.
+             */
+            if (!jit_norec_frag_for(ra))
+                break;
+            /* an EMITTED return address means an emitted `call` created
+             * this frame, so its record MUST carry that call's site */
+            if (!r.norec_site)
+                norec_fail("emitted RA but the record has no site",
+                           ra, ns);
+            const auto *rs =
+                static_cast<const NorecSite *>(r.norec_site);
+            if (ra != rs->ret_plain && ra != rs->ret_switched)
+                norec_fail("walk RA is not the record's site", ra, rs);
+            if (jit_norec_site_for(ra) != rs)
+                norec_fail("walk RA resolves to a different site",
+                           ra, rs);
+            /* r.native_rbp is r's CALLER's rbp - the NEXT link up, i.e.
+             * [fp], not fp itself (fp is r's own frame pointer). */
+            const char *link =
+                *reinterpret_cast<const char *const *>(fp);
+            if (r.native_rbp != link)
+                norec_fail("record anchor != the chain link", link,
+                           r.native_rbp);
+            fp = link;
+            idx--;
+            g_jit_norec_walk_frames++;
+        }
+    }
     static const bool env_audit =
         env_get("MYLANG_NOREC_AUDIT").has_value();
     if (g_norec_audit || env_audit) {

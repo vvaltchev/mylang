@@ -18087,6 +18087,7 @@ static bool jit_norec_shadow()
     const unsigned long s0 = g_jit_norec_sites;
     const unsigned long a0 = g_jit_norec_audit_frames;
     const unsigned long r0 = g_jit_norec_ret_verify;
+    const unsigned long w0 = g_jit_norec_walk_frames;
     const bool saved_audit = g_norec_audit;      /* save/restore: an
                                                   * env-gated tool toggled
                                                   * by one test must not
@@ -18145,6 +18146,17 @@ static bool jit_norec_shadow()
      * SITE-carrying records. */
     const unsigned long f0 = g_jit_norec_frame_verify;
     const unsigned long st0 = g_jit_norec_stamp_verify;
+    /* step 3: the rbp-chain shadow walk must have covered the deep
+     * native segment of the mutual recursion above - many frames per
+     * push, so it dwarfs the call count. If it were 0 the walk is
+     * silently stopping at the first frame (a broken anchor/link). */
+    const unsigned long w_after = g_jit_norec_walk_frames;
+    if (w_after - w0 < calls) {
+        fprintf(stderr, "jit_norec_shadow: the rbp shadow walk covered "
+                        "%lu frames for %lu calls - not the segment\n",
+                w_after - w0, calls);
+        return false;
+    }
     if (!run({
         "struct XE { int x; }",
         "func inner(int n) {",
@@ -25715,6 +25727,7 @@ static bool jit_counter_coverage()
         { "norec_ret",        &g_jit_norec_ret_verify,  nullptr },
         { "norec_frame",      &g_jit_norec_frame_verify, nullptr },
         { "norec_stamp",      &g_jit_norec_stamp_verify, nullptr },
+        { "norec_walk",       &g_jit_norec_walk_frames,  nullptr },
         { "callee_cache",     &g_jit_callee_cache,     nullptr },
         { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
         { "bind_coerce",      &g_jit_bind_coerce,      nullptr },
