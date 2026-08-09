@@ -107,3 +107,21 @@ bool bc_inline_callee_ok(const Chunk &callee, std::string *why);
  */
 void bc_inline_audit(const Chunk &caller, const char *caller_name,
                      const std::vector<const FuncDescriptor *> &slot_desc);
+
+/*
+ * THE SPLICE. Replace every inline-able CallV in `ck` with the callee's
+ * body - arg binds as MoveVs, the body slot-remapped into a fresh range
+ * above the caller's frame, each ReturnV rewritten to "move the result to
+ * the call's dst, jump to the join". ONE level, from a SNAPSHOT of the
+ * callee's code, so a self-recursive body cannot compound.
+ *
+ * Runs after every chunk is codegen'd and before any is jit'd
+ * (vm_precompile_all), because it needs the callees' finished chunks and
+ * produces bytecode the JIT then sees. Returns true if it changed `ck`.
+ */
+bool bc_inline_chunk(Chunk &ck,
+                     const std::vector<const FuncDescriptor *> &slot_desc);
+
+/* The splice's kill switch (-nbi / MYLANG_BCINLINE=0): the same-binary
+ * A/B, since the un-inlined bytecode is the only oracle for a splice. */
+extern bool g_bc_inline_enabled;

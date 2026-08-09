@@ -13,6 +13,7 @@
 #include "errfmt.h"
 #include "trace.h"
 #include "vm.h"
+#include "codegen.h"   /* g_bc_inline_enabled (-nbi) */
 #include "serialize.h"
 #include "jit.h"
 #include "disasm.h"
@@ -471,6 +472,13 @@ parse_args(int argc, char **argv)
 
             g_jit_enabled = false;   /* native-AOT off (plans/native-aot.md);
                                       * also MYLANG_JIT=0 */
+
+        } else if (!strcmp(arg, "-bi")) {
+
+            g_bc_inline_enabled = true;   /* the bytecode SPLICE on - OPT-IN
+                                           * while it is unfinished, see
+                                           * plans/bytecode-inliner.md; also
+                                           * MYLANG_BCINLINE=1 */
 
         } else if (!strcmp(arg, "-tw")) {
 

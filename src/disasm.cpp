@@ -1685,6 +1685,24 @@ std::string disassemble_program(const Block *root)
                 slot_desc[slot] = fn->desc;
         }
 
+    /* `fast_bind` is computed by vm_precompile_all's pass A and the SPLICE
+     * gates on it (a typed param needs the coercing bind, which a MoveV is
+     * not) - so it must be set here too, or a -vd dump would decline an
+     * inline that execution performs. */
+    for (const FuncDeclStmt *fn : funcs) {
+        bool fast = true;
+        for (const auto &p : fn->desc->params)
+            if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+                fast = false;
+        fn->desc->fast_bind = fast;
+    }
+
+    /* THE SPLICE, before the jit pass, exactly as vm_precompile_all does -
+     * otherwise -vd would dump the un-inlined bytecode and lie about what
+     * runs (the dump is the audit surface for the .myv image). */
+    for (auto &kv : chunks)
+        bc_inline_chunk(kv.second, slot_desc);
+
     /* Pass B: jit each body with its JitCtx (caller_desc = its own descriptor).
      * Main gets no JitCtx - a call from main is never native (as at runtime). */
     for (auto &kv : chunks) {
