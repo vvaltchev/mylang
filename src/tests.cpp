@@ -11919,14 +11919,29 @@ static const std::vector<test> tests =
         }
     },
     {
-        /* FIX-1 is NOT waived for isbound: `defined` may ask about a name that
-         * exists nowhere (answer false), but asking whether something that can
-         * never exist is BOUND is the ordinary compile error. */
-        "isbound: a name declared NOWHERE is still a compile error",
+        /*
+         * A name that exists NOWHERE answers `false` (maintainer, 2026-08-09
+         * - it used to be a compile error). That makes `isbound(x)` alone the
+         * feature test, where the conjunction `defined(x) && isbound(x)` was
+         * needed before. The typo hazard it accepts is one `defined()` already
+         * had - `defined(confg)` folds to false in silence - so the two lazy
+         * queries are now consistent rather than one erroring where its twin
+         * folds.
+         */
+        "isbound: a name declared NOWHERE answers false",
         {
-            "print(isbound(zz));",
-        },
-        &typeid(UndefinedVariableEx)
+            "var r = isbound(zz);",
+            "assert(r == false);",
+        }
+    },
+    {
+        /* ... and it NARROWS, or the short form would not compile: the
+         * `print(x)` inside its own guard would still be refused */
+        "isbound: the short feature test compiles and narrows",
+        {
+            "if (isbound(x)) { print(x); }",
+            "assert(1 == 1);",
+        }
     },
     {
         /* the arg-shape rules are COMPILE errors, so both engines agree - the
@@ -16938,6 +16953,15 @@ static bool defined_guard_polarity()
         { "a NESTED if's else, inside a guarded branch",
           "if (defined(x)) { if (runtime(1) > 0) { } else { print(y); } }",
           true },
+        /* `isbound` guards too (2026-08-09) - it answers false for a name
+         * that exists nowhere, so it IS the short feature test, and the same
+         * polarity rules must hold for it */
+        { "isbound's THEN branch",
+          "if (isbound(x)) { print(x); }", false },
+        { "isbound's ELSE arm",
+          "if (isbound(x)) { } else { print(x); }", true },
+        { "a negated isbound guard",
+          "if (!isbound(x)) { print(x); }", true },
     };
 
     bool ok = true;
