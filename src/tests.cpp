@@ -19661,6 +19661,133 @@ static bool myv_corrupt_refused()
     return ok;
 }
 
+/*
+ * #137 TIER 2: the PROVENANCE-gated runtime checks (ML_UNTRUSTED_CHECK).
+ *
+ * The shape here is the whole justification for the tier existing, so it is
+ * worth stating exactly. A struct FIELD INDEX rides an instruction operand,
+ * but the def it indexes is whatever the base slot holds AT RUN TIME - so
+ * verify_chunk, which sees only the image, can bound it by nothing tighter
+ * than the WIDEST struct in the program. Give the program a WIDE struct and
+ * a NARROW one, then point the narrow read at a field index that is legal
+ * for the wide one: tier 1 accepts it (it is under max_fields) and the read
+ * walks off the narrow def's fields vector. Only a runtime check can catch
+ * that, and only a provenance-gated one can do it without taxing every
+ * trusted run.
+ *
+ * The corruption is applied to the LOADED CHUNK rather than to a file byte
+ * on purpose: it targets the exact operand with no dependence on the
+ * encoding, so it cannot rot into a vacuous test when the format changes.
+ * myv_read has already set g_untrusted_bytecode, which is what arms the
+ * check - that is the real mechanism, not a flag the test flips itself.
+ */
+static bool myv_untrusted_field_index()
+{
+#if !ML_UNTRUSTED_CHECKS
+    return true;                    /* the tier is compiled out (the A/B) */
+#else
+    const char *lines_arr[] = {
+        /* WIDE: 5 fields. NARROW: 1. Both POD + flat-array'd, so the reads
+         * lower to LoadStructFieldInt over the flat bytes. */
+        "struct Wide { int a; int b; int c; int d; int e; }",
+        "struct Narrow { int only; }",
+        "var ws = [];",
+        "var ns = [];",
+        "for (var i = 0; i < 4; i++) { append(ws, Wide(i,i,i,i,i)); }",
+        "for (var i = 0; i < 4; i++) { append(ns, Narrow(i)); }",
+        "var s = 0;",
+        "foreach (var w in ws) { s += w.e; }",
+        "var t = 0;",
+        "foreach (var n in ns) { t += n.only; }",
+        "print(s, t);" };
+
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-untrusted.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    g_exec_engine = ExecEngine::Vm;
+    /* The JIT compiled the fragment from the ORIGINAL operand during
+     * myv_read, so the retarget below would not reach emitted code. The
+     * checked helper is on the interpreted path, which is where the tier
+     * lives. */
+    g_jit_enabled = false;
+    bool ok = false;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        myv_write(prog, path, MyvSourceRef());
+
+        MyvSource s;
+        VmProgram loaded = myv_read(path, s);
+
+        /*
+         * Retarget the NARROW read: field 4 exists in Wide, not in Narrow.
+         * Both reductions fuse to StructFieldAddInt (#9), whose field index
+         * is `b_dual_lo` - NOT b_lit, which is the whole 64-bit payload with
+         * the other slot in its high half. Write only the low 32 bits, so
+         * b_dual_hi and the operand flags survive (set_b_dual would clear
+         * the is-lit bits - the documented trap).
+         */
+        int patched = 0;
+        for (Instr &in : loaded.root.code) {
+            if (in.op == OpCode::StructFieldAddInt && in.b_dual_lo() == 0) {
+                in.pb = (in.pb & ~static_cast<int64_t>(0xffffffff)) | 4;
+                patched++;
+            }
+        }
+        if (patched != 1) {
+            /* Not a pass: without exactly the one narrow read, the run
+             * below proves nothing (the vacuous-test trap). */
+            fprintf(stderr, "myv-untrusted: expected 1 narrow field read, "
+                            "found %d - the shape changed\n", patched);
+            g_exec_engine = saved;
+            g_jit_enabled = saved_jit;
+            remove(path.c_str());
+            return false;
+        }
+
+        try {
+            vm_run(loaded);
+            fprintf(stderr, "myv-untrusted: the out-of-range field read was "
+                            "NOT caught\n");
+        } catch (Exception &e) {
+            /* An InternalErrorEx from ml_untrusted_fail - located, not an
+             * abort. Any clean exception means the tier did its job. */
+            ok = std::string(e.name) == "InternalErrorEx";
+            if (!ok)
+                fprintf(stderr, "myv-untrusted: wrong exception %s\n", e.name);
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "myv-untrusted: setup threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+    }
+    remove(path.c_str());
+    g_exec_engine = saved;
+    g_jit_enabled = saved_jit;
+    return ok;
+#endif
+}
+
 static bool myv_loc_escapes()
 {
     /* 320 spaces before the statement: its caret column exceeds 254 */
@@ -27664,6 +27791,8 @@ static const std::vector<extra_check> extra_checks =
       myv_round_trip },
     { "myv: a mangled image is REFUSED, never obeyed (#137)",
       myv_corrupt_refused },
+    { "myv: an UNTRUSTED image's out-of-range field index is caught (#137)",
+      myv_untrusted_field_index },
     { "myv: Loc escapes - delta table + narrow pool Locs",
       myv_loc_escapes },
     { "vm: the handler table describes each try region (#78)",

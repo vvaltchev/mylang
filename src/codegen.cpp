@@ -9495,20 +9495,48 @@ void ChunkVerifier::verify_one(const Instr &in)
              * a null pointer. */
             pod_def(ck.struct_defs[in.target2], "planned ctor def");
             pool(in.b_dual_hi(), ck.ctor_plans.size(), "ctor plan");
+            const StructTypeDef *d = ck.struct_defs[in.target2];
             for (const Chunk::CtorPlanField &f
-                     : ck.ctor_plans[in.b_dual_hi()].f)
+                     : ck.ctor_plans[in.b_dual_hi()].f) {
                 reg(f.src);
+                /* The plan stores RAW BYTES, and its own `act` gives the
+                 * exact width: 0 = int, 1 = float (both 8), 2 = a bool
+                 * BYTE. The store must END inside the instance, not merely
+                 * start inside it - so the width is part of the check, and
+                 * using a blanket 8 would falsely refuse a trailing bool. */
+                if (f.act > 2)
+                    reject("ctor plan action");
+                const int32_t w = f.act == 2
+                    ? 1 : static_cast<int32_t>(sizeof(int_type));
+                if (f.off < 0
+                    || f.off + w > static_cast<int32_t>(d->size))
+                    reject("ctor plan field offset");
+            }
         } else {
+            /* vm_struct_ctor walks def->fields[i] for i < this count, so
+             * it is not merely a run length - it must fit the def. NOT an
+             * equality: a TRAILING OPT FIELD is skippable at the call site
+             * (`R(1)` for `struct R { int x; dyn? d; }`), which the suite
+             * caught the moment `==` was tried. */
+            if (in.b_dual_lo()
+                > static_cast<int>(
+                      ck.struct_defs[in.target2]->fields.size()))
+                reject("ctor arg count");
             run(in.a_lit(), in.b_dual_lo());
         }
         break;
     case OpCode::StructCtorBoxedV:
         reg(in.target);
         pool(in.target2, ck.boxed_ctors.size(), "boxed ctor");
-        defined_ptr(ck.boxed_ctors[in.target2].def, "boxed ctor def");
-        run(in.a_lit(),
-            static_cast<int_type>(
-                ck.boxed_ctors[in.target2].arg_locs.size()));
+        {
+            const Chunk::BoxedCtor &bc = ck.boxed_ctors[in.target2];
+            defined_ptr(bc.def, "boxed ctor def");
+            /* `<=`, not `==` - see the StructCtorV note above: an omitted
+             * trailing opt field is bound to none by the ctor itself. */
+            if (bc.arg_locs.size() > bc.def->fields.size())
+                reject("boxed ctor arg count");
+            run(in.a_lit(), static_cast<int_type>(bc.arg_locs.size()));
+        }
         break;
     case OpCode::MakeStructArrayV:
         /* N structs' fields, interleaved: the run is N * the def's width -
