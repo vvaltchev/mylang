@@ -388,8 +388,25 @@ Each lands as its OWN commit.
    SIGABRT), and capture descriptors were snapshotted BEFORE pass 2
    stamped escaped globals, so a captured global silently fell back to
    the by-name map walk.
-4. **Carets** (#126/#127/#128) - incl. a `Loc` per `CaptureDesc`, so a
-   `.myv` format bump.
+4. **Carets** (#126/#127/#128) - **PARTLY LANDED.**
+   - the READ caret came right for free at step 3 (the throw carries the
+     identifier's own span): all three engines now caret the NAME;
+   - the CAPTURE caret is FIXED - a `Loc` per `CaptureDesc` (myv v12),
+     re-stamped in the FuncObject ctor, which is AST-free and so had no
+     span at all before. It used to give THREE answers (tw: the whole
+     `func[g]() => g`; `-nj`: no caret; jit: elsewhere entirely);
+   - the FRAMES came back at step 2 (the RuntimeException base);
+   - **STILL OPEN: the STORE-base caret** (#127). The tree-walker carets
+     `g`, the VM carets `g[0]`. Fixing it needs a base-specific `Loc`,
+     because the op's `locs` entry is CORRECTLY the whole `a[i]` lvalue -
+     that is what its OOB and non-array-base errors caret, and those two
+     already agree across engines (measured). So the shared entry cannot
+     be narrowed. A new pc-keyed `base_locs` side table would have to be
+     produced at 17 `as_container_base` call sites (funnelled through
+     `emit()`), join the bytecode-splice pc-REMAP pass that rebuilds
+     `locs`, and be serialized - i.e. it is a new audited table in the
+     exact shape CLAUDE.md's AUDIT-TABLE STAGE TRAP warns about. Not
+     started; scaffolding deliberately NOT left behind.
 5. **Nested func/struct hoist with binding** (#134).
 6. **Const-fold poisoning + the `isbound()` builtin** (#133); `defined()`
    becomes REPL-only.

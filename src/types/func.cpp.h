@@ -101,9 +101,21 @@ FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
     capture_slots.reserve(func->captures.size());
 
     for (const auto &cap : func->captures) {
-        capture_slots.emplace_back(
-            RValue(read_sym(ctx, cap.kind, cap.slot, cap.name)),
-            ctx->const_ctx
-        );
+        /* read_sym raises loc-less (it is the descriptor twin of
+         * Identifier::do_eval and has no node); re-stamp with the capture
+         * entry's OWN span so the caret lands on the name inside `[...]`
+         * instead of the whole closure expression (#131 step 4). */
+        try {
+            capture_slots.emplace_back(
+                RValue(read_sym(ctx, cap.kind, cap.slot, cap.name)),
+                ctx->const_ctx
+            );
+        } catch (Exception &e) {
+            if (!e.loc_start.line) {
+                e.loc_start = cap.start;
+                e.loc_end = cap.end;
+            }
+            throw;
+        }
     }
 }

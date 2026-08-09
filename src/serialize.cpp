@@ -1589,6 +1589,8 @@ void myv_write(const VmProgram &prog, const std::string &path,
             w.uidv(cp.name);
             w.u8v(static_cast<uint8_t>(cp.kind));
             w.u32v(static_cast<uint32_t>(cp.slot));
+            w.locv(cp.start);           /* v12: the capture's own caret */
+            w.locv(cp.end);
         }
         w.boolv(d->resolved);
         w.u32v(static_cast<uint32_t>(d->frame_size));
@@ -1825,6 +1827,8 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             cp.name = r.uidv();
             cp.kind = static_cast<SymKind>(r.u8v());
             cp.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
+            cp.start = r.locv();        /* v12 */
+            cp.end = r.locv();
             d.captures.push_back(cp);
         }
         d.resolved = r.boolv();

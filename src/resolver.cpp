@@ -1309,7 +1309,8 @@ private:
         fd->desc->captures.reserve(fd->captures->elems.size());
         for (auto &cap : fd->captures->elems)
             fd->desc->captures.push_back(
-                { cap->uid, cap->sym.kind, cap->sym.slot });
+                { cap->uid, cap->sym.kind, cap->sym.slot,
+                  cap->start, cap->end });
     }
 
     struct EscapedRef {

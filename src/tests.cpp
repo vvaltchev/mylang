@@ -4483,6 +4483,20 @@ static const std::vector<test> tests =
         "try { var dyn h = mk(); } catch (UnboundSymbolEx) { out = 1; }",
         "assert(out == 1);",
         "var g = 5;" } },
+    /*
+     * ...and its CARET is the name INSIDE the brackets (#131 step 4). The
+     * snapshot runs from the FuncObject ctor, which is AST-free - it reads
+     * the descriptor's CaptureDesc, so the span had to be carried there
+     * (serialized, hence myv v12). Before this the three engines gave three
+     * answers: the tree-walker carets the whole `func[g]() => g`, `-nj` had
+     * no caret at all, and the JIT pointed somewhere else entirely.
+     * col 26 is the `g` inside `func[g]`.
+     */
+    { "TDZ: the capture caret marks the name inside the brackets",
+      { "func mk() { var c = func[g]() => g; return c; }",
+        "var dyn h = mk();",
+        "var g = 5;" },
+      &typeid(UnboundSymbolEx), 26, 1, 28, 1 },
     { "TDZ: a store through an unbound global base",
       { "func f() { g[0] = 1; }",
         "var out = 0;",
