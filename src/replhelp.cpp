@@ -76,7 +76,11 @@ const BuiltinDoc builtin_docs[] = {
   "The bare type name of x as a string (\"int\", \"array\", \"dict\", ...).",
   "Compare typestr(x), the full structural type, and kindstr(x), the kind." },
 { "defined", "convert", "defined(x)",
-  "True if x is a defined symbol (not an undefined identifier).", nullptr },
+  "True if the name x is DECLARED anywhere in an enclosing scope.",
+  "True throughout the name's scope, the part ABOVE the declaration "
+  "included - a declaration's name exists from scope entry, only its VALUE "
+  "binds later. Ask isbound(x) for that half. The argument is unevaluated, "
+  "so in a script defined() can only be CALLED, never used as a value." },
 { "clone", "convert", "clone(x)",
   "A shallow (one-level) copy; nested const objects stay shared/read-only.",
   nullptr },
@@ -126,6 +130,13 @@ const BuiltinDoc builtin_docs[] = {
 { "intptr", "reflect", "intptr(x)",
   "The internal shared-object pointer of x as an int (tests of aliasing).",
   nullptr },
+{ "isbound", "reflect", "isbound(x)",
+  "True if x's DECLARATION has run yet (the other half of defined()).",
+  "False inside the temporal dead zone - between scope entry and the "
+  "declaration statement. Lexical kinds (param, capture, builtin, local) "
+  "answer at compile time; a GLOBAL read from a function body is a genuine "
+  "runtime query. The argument must be an identifier (`none` and `len` "
+  "qualify, `3` and \"x\" do not) and is never evaluated." },
 { "isconst", "reflect", "isconst(x)",
   "True if x is effectively const (literal, const, const-expr, or auto-const).",
   nullptr },

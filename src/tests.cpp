@@ -11596,6 +11596,83 @@ static const std::vector<test> tests =
     },
 
     /*
+     * isbound(name) - the TDZ pair's other half (#131 step 6). `defined(name)`
+     * asks whether the name EXISTS (true throughout its scope, including
+     * ABOVE the declaration - the name is declared, merely unbound);
+     * `isbound(name)` asks whether its declaration has RUN. The pair is
+     * asserted together on the same program so the difference is the test.
+     */
+    {
+        "isbound: a LOCAL is unbound above its declaration, bound below",
+        {
+            "func f() {",
+            "    var before = isbound(a);",
+            "    var d = defined(a);",
+            "    var a = 5;",
+            "    var after = isbound(a);",
+            "    return [before, d, after];",
+            "}",
+            "var r = f();",
+            "assert(r[0] == false);",   /* isbound, above the decl */
+            "assert(r[1] == true);",    /* defined, above the decl */
+            "assert(r[2] == true);",
+        }
+    },
+    {
+        "isbound: a GLOBAL is the genuine RUNTIME query",
+        {
+            /* the one case that cannot fold: whether main has reached the
+             * declaration by the time f() runs is not a lexical property */
+            "func f() { var r = isbound(g); return r; }",
+            "var before = f();",
+            "var g = 5;",
+            "var after = f();",
+            "assert(before == false);",
+            "assert(after == true);",
+            "assert(defined(g) == true);",
+        }
+    },
+    {
+        "isbound: params, captures and builtins are always bound",
+        {
+            "func h(p) { var r = isbound(p); return r; }",
+            "assert(h(1) == true);",
+            "assert(isbound(len) == true);",
+            "assert(isbound(none) == true);",   /* name-shaped, always there */
+            "var c = 7;",
+            "var cl = func [c] () { var r = isbound(c); return r; };",
+            "assert(cl() == true);",
+        }
+    },
+    {
+        /* FIX-1 is NOT waived for isbound: `defined` may ask about a name that
+         * exists nowhere (answer false), but asking whether something that can
+         * never exist is BOUND is the ordinary compile error. */
+        "isbound: a name declared NOWHERE is still a compile error",
+        {
+            "print(isbound(zz));",
+        },
+        &typeid(UndefinedVariableEx)
+    },
+    {
+        /* the arg-shape rules are COMPILE errors, so both engines agree - the
+         * runtime body's own throws would leave the no-fail codegen refusing
+         * to lower the shape at all (NotLoweredEx), a divergence */
+        "isbound: a non-identifier argument is a compile error",
+        {
+            "print(isbound(3));",
+        },
+        &typeid(TypeMismatchEx)
+    },
+    {
+        "isbound: wrong arity is a compile error",
+        {
+            "print(isbound());",
+        },
+        &typeid(WrongArgCountEx)
+    },
+
+    /*
      * #133 - A DECLARATION BEATS THE CONST BUILTIN IT SHADOWS. The parse-time
      * const evaluator used to resolve a name straight to the const builtin
      * without looking at what the program declared, so `abs(-1)` folded to the

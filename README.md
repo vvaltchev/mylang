@@ -429,9 +429,11 @@ print(total);                   #        'heigth'
 This costs nothing: a script resolves every name it can reach, so such a name
 was guaranteed to fail at run time anyway. A name declared *later* is a
 different matter and is still accepted (a function may read a global declared
-below it). The query builtins are exempt - `defined(x)`, `isconst(x)` and
+below it). Some query builtins are exempt - `defined(x)`, `isconst(x)` and
 `isconstdecl(x)` never evaluate their argument, so asking about a name that
-exists nowhere is legal and answers `false`.
+exists nowhere is legal and answers `false`. **`isbound(x)` is deliberately
+NOT exempt**: asking whether something that can never exist has been *bound*
+is the same mistake as reading it, so it stays a compile error.
 
 **Top-level variables have an implicit `var`.** At the outermost scope (a
 statement directly in the program/REPL, not inside any block or function), a
@@ -2464,6 +2466,40 @@ folded normally, so `runtime(1/0)` fails at compile time (the error is *inside*
 the expression, before it is "runtime-ized"), whereas `1 / runtime(0)` throws a
 catchable `DivisionByZeroEx` at runtime. Useful for tests and to deliberately
 opt a specific expression out of folding.
+
+#### `isbound(name)`
+Has `name`'s **declaration run yet?** The companion to `defined()`, and the
+pair differ exactly in the *temporal dead zone* (see
+[Declaring variables](#declaring-variables)): a
+declaration's *name* exists from the moment its scope is entered, its *value*
+is bound when the declaration statement executes.
+
+| `name` is... | `defined(name)` | `isbound(name)` |
+|---|---|---|
+| declared nowhere | `false` | **compile error** |
+| declared, declaration not yet run | `true` | `false` |
+| declared, declaration has run | `true` | `true` |
+
+```C#
+func f() {
+    var before = isbound(a);        # false - `a` is declared below
+    var a = 5;
+    var after = isbound(a);         # true
+    return [before, after, defined(a)];     # [false, true, true]
+}
+```
+
+The argument is **unevaluated** (which is the point — reading an unbound
+global is the very `UnboundSymbolEx` this lets a script avoid) and must be an
+**identifier**: `isbound(len)` and `isbound(none)` are fine, `isbound(3)` and
+`isbound("x")` are compile errors, as is any wrong arity. Like `defined`, it
+can only be *called* — the bare name is not usable as a value.
+
+For a parameter, a capture, a builtin or a local the answer is decided at
+compile time (a local is bound exactly after its declaration, on every loop
+iteration alike). Only a **global read from inside a function** is a genuine
+runtime query, since whether the program has reached the declaration yet is
+not a lexical property.
 
 #### `isconst(expr)` / `isconstdecl(expr)`
 Compile-time introspection (mainly handy in tests). `isconst()` is true when

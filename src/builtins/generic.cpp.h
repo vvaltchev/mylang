@@ -22,6 +22,53 @@ EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
     return !arg->eval(ctx).is<UndefinedId>();
 }
 
+/*
+ * isbound(name) - has `name`'s DECLARATION run yet? The other half of the TDZ
+ * pair (#131): `defined(name)` asks whether the name EXISTS (declared anywhere
+ * in an enclosing scope, so true throughout its scope including above the
+ * declaration), `isbound(name)` asks whether it has a VALUE yet.
+ *
+ * A LAZY builtin: the argument is NOT evaluated, and it MUST NOT be - reading
+ * an unbound global is exactly the UnboundSymbolEx this call exists to let a
+ * script avoid. So it reads the resolved symbol off the Identifier node
+ * instead. (`defined` can still afford to evaluate, because it only ever sees
+ * the REPL / non-identifier cases at run time; every script case folds.)
+ *
+ * Reachable at run time for a GLOBAL only - the lexical kinds fold in
+ * try_fold_isbound, and the VM lowers the global to DefinedGlobalV. This is
+ * the tree-walker's body for that same query.
+ */
+EvalValue builtin_isbound(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const Identifier *id = dynamic_cast<const Identifier *>(arg);
+
+    if (!id)
+        throw TypeErrorEx("isbound() requires an identifier",
+                          arg->start, arg->end);
+
+    switch (id->sym.kind) {
+
+    case SymKind::global:
+        /* the genuine runtime question: has the declaration executed? */
+        return ctx->gfuncs && ctx->gfuncs->defined[id->sym.slot];
+
+    case SymKind::local:
+    case SymKind::capture:
+    case SymKind::builtin:
+        return true;
+
+    default:
+        /* unresolved: a SCRIPT cannot get here (a name declared nowhere is a
+         * compile error since #130, and isbound's argument is deliberately NOT
+         * exempt from that), so this is the REPL's open world - ask the map. */
+        return !arg->eval(ctx).is<UndefinedId>();
+    }
+}
+
 EvalValue builtin_len(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
