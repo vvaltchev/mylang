@@ -1397,8 +1397,16 @@ for every arm (same invariant: prep must never clone a base the
 interpreter would fault on without cloning). All four guard families
 sabotage-verified; probing the bool shape exposed a PRE-EXISTING
 tw-vs-VM divergence (a bool literal stored into an int-JOINED array -
-tw throws, VM stores 1), filed separately. No suite bench compounds into
-an element (reach + parity, like prep).
+tw threw, VM stored 1), since FIXED as #96 (maintainer-ruled VM-right):
+**a bool WIDENS into flat numeric storage** - 0/1 into ints, 0.0/1.0
+into floats, the promotion chain the decl/struct-field coerces already
+followed - at all three engine-SHARED value-entry points
+(flat_store_core, arr_append_fast, builtin_insert_arr; the JIT's inline
+arms keep their narrow t_int/t_bool guards and decline a bool to the
+helper, which widens). The reverse (an int into an array<bool>) stays a
+TypeError - a narrowing. README documents the rule; a 5-mode entry pins
+it, the tree-walker pass being the one that used to throw. No suite
+bench compounds into an element (reach + parity, like prep).
 **#95 case 2 - the NESTED store `a[i][j] = v` / `OP= v` inline
 (emit_store_elem2_inline).** The read side (#93) had its tier; the store
 paid the full helper. The fast shape: int k1/k2 SLOTS (boxed - type-tag

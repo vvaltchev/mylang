@@ -3139,11 +3139,23 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
         apply_compound_op(newval, r, op);
     }
 
+    /*
+     * #96: a BOOL value WIDENS into numeric storage (0/1 into ints,
+     * 0.0/1.0 into floats) - the promotion chain bool <= int <= float,
+     * the same widen coerce_to_decl_type and coerce_struct_field
+     * already do (arrays were the outlier; the static checker accepts
+     * the assignment, so refusing at runtime contradicted it - and the
+     * VM's typed StoreElemInt path, which pre-widens a bool literal to
+     * a 0/1 operand, DIVERGED from this refusal). The reverse direction
+     * (an int into a BOOL array) stays an error: that is a narrowing,
+     * which the language never does implicitly.
+     */
     const bool fits = kind_int
-        ? newval.is<int_type>()
+        ? (newval.is<int_type>() || newval.is<bool>())
         : kind_bool
             ? newval.is<bool>()
-            : (newval.is<float_type>() || newval.is<int_type>());
+            : (newval.is<float_type>() || newval.is<int_type>()
+               || newval.is<bool>());
 
     if (!fits) {
         /*
@@ -3173,13 +3185,17 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
 
     const size_type at = arr.offset() + idx;
     if (kind_int) {
-        arr.flat_ints()[at] = newval.get<int_type>();
+        arr.flat_ints()[at] = newval.is<bool>()
+            ? (newval.get<bool>() ? 1 : 0)
+            : newval.get<int_type>();
     } else if (kind_bool) {
         arr.flat_bools()[at] = newval.get<bool>() ? 1 : 0;
     } else {
         arr.flat_floats()[at] = newval.is<int_type>()
             ? static_cast<float_type>(newval.get<int_type>())
-            : newval.get<float_type>();
+            : newval.is<bool>()
+                ? (newval.get<bool>() ? 1.0 : 0.0)
+                : newval.get<float_type>();
     }
 
     arr.invalidate_hash();   /* an element write changes the array's hash */
