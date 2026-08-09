@@ -7062,6 +7062,34 @@ omitting it is a compile error.
   the runtime throw disappears). The bar: surface the language-level option,
   recommend, and let the maintainer decide — same as any design fork.
 
+- **⛔ CLAUDE OWNS THE CASE MATRIX AND THE MAP (maintainer-set,
+  2026-08-02).** The maintainer runs this as a SIDE PROJECT with limited
+  time, and deliberately holds LESS context than Claude does about the
+  work in flight. Waiting for him to discover a hole is a failure of the
+  arrangement — the motivating case: the inline element-store tier landed
+  for INT and the float twin silently kept paying ~85 Ir per element
+  until HE noticed. Therefore:
+  - **When a change implements case X of a design, ENUMERATE the sibling
+    cases before calling it done**: type variants (int/float/bool/str/
+    dyn), op variants (load/store, single-level/nested, plain/compound),
+    engine variants (tree-walker/VM/JIT), creation vs mutation. Finish
+    the cheap ones in the SAME change; for the rest, END THE REPORT with
+    the explicit remaining-cases list and tracked tasks — UNPROMPTED.
+    "If we did it for X, either do it for Y or say Y is missing."
+  - **After each approved task, PROACTIVELY propose the next steps that
+    fit the same design** — including "there are N cases left to reach
+    the coherent state that unblocks the next level", when that is the
+    truth. Draw the whole map, honestly sized.
+  - This does NOT license unilateral scope-widening. The rule below
+    ("the maintainer prioritizes") stands: he sequences the work and
+    signs off on new directions. The division of labor is: **Claude
+    draws the map — completely; the maintainer picks the route.**
+    PARITY within an already-approved design (the float twin of a landed
+    int tier) is in scope by default; a NEW design is not.
+  - A task report that lands case X without the sibling-case list is an
+    INCOMPLETE report, the same way a behavior change without its README
+    update is an incomplete change.
+
 - **DON'T pick work by "highest value" — the MAINTAINER prioritizes; YOU pick
   the SMALLEST step that makes progress in the chosen direction
   (maintainer-set, 2026-07-19).** When deciding what to do next, do NOT rank
