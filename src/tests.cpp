@@ -19727,6 +19727,118 @@ static bool jit_telide_temps_c3()
 #endif
 }
 
+/*
+ * C4b: FLOAT LITERALS pinned in registers, and arithmetic reading its
+ * source register directly. Three properties:
+ *   - it ENGAGES on a literal-heavy float loop (g_jit_flit);
+ *   - the VALUES are right - and the shapes are chosen so a wrong
+ *     source register or a swapped operand cannot pass: `2.5 / x` and
+ *     `- x * 1.5` are order-sensitive, and two DISTINCT literals (1.5,
+ *     2.5) must land in two DISTINCT registers;
+ *   - a run whose LOOP calls libm DECLINES (the pool is caller-saved,
+ *     so each continuing epilogue re-materialises it) while still
+ *     computing correctly.
+ */
+static bool jit_flit_c4b()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto go = [](const std::vector<const char *> &src) -> std::string {
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return cap.str();
+    };
+
+    const unsigned long f0 = g_jit_flit;
+    const std::string got = go({
+        "func g(int n) {",
+        "  var s = 0.0;",
+        "  for (var i = 1; i < n; i++) {",
+        "    var x = i * 1.5;",
+        "    s += x * 2.5 + 2.5 / x - x * 1.5;",
+        "  }",
+        "  return s; }",
+        "print(str(g(int(runtime(50))), 5));" });
+    if (got != "1844.96534 \n") {
+        cout << "  flit: got [" << got << "]\n";
+        return false;
+    }
+    if (g_jit_flit <= f0) {
+        cout << "  flit: no fragment pinned a float literal\n";
+        return false;
+    }
+
+    /*
+     * THE RUNTIME-CONDITIONAL CALL - the case that makes the epilogue
+     * restore load-bearing rather than belt-and-braces, and the reason
+     * pick_float_lits' opcode whitelist CANNOT be the correctness
+     * argument. A main-level float loop pins the pool (its calls are
+     * all before the loop, so the loop-scoped gate allows it), but
+     * main's low TEMPS are shared with the string-subscript prologue,
+     * so they are ref-listed: the loop's first float store to such a
+     * temp finds a live reference, calls jit_put_float, and CONTINUES -
+     * with xmm2/xmm3 clobbered. Without the epilogue restore the next
+     * `x + 1.0` reads garbage and the program dies on a bogus
+     * division-by-zero (watched; it is exactly what bench/my/55 does,
+     * which -rt does not run - hence this shape, reproduced down to the
+     * named bound local `N`: with the bound inlined, an int op writes
+     * the temp first and releases the reference before any float op
+     * sees it, and the case goes vacuous).
+     */
+    const std::string refl = go({
+        "var av = [\"7\"];",
+        "var scale = 1;",
+        "if (len(av) > 0)",
+        "    scale = int(av[0]);",
+        "var N = 300 * scale;",
+        "var total = 0.0;",
+        "for (var i = 1; i < N; i++) {",
+        "  var x = i * 1.0;",
+        "  total += x / (x + 1.0) - 0.5 / x + 1.0 / (x * x);",
+        "}",
+        "print(str(total, 5));" });
+    if (refl != "2089.30398 \n") {
+        cout << "  flit ref-listed dst: got [" << refl << "]\n";
+        return false;
+    }
+
+    /* the libm DECLINE: correct values with the pool refused */
+    const std::string call = go({
+        "func h(int n) {",
+        "  var s = 0.0;",
+        "  for (var i = 1; i < n; i++) {",
+        "    var x = i * 1.0;",
+        "    s += sqrt(x) + x * 3.0;",
+        "  }",
+        "  return s; }",
+        "print(str(h(int(runtime(50))), 5));" });
+    if (call != "3906.96473 \n") {
+        cout << "  flit libm: got [" << call << "]\n";
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_fcache_c2()
 {
 #if ML_JIT_SUPPORTED
@@ -24786,6 +24898,8 @@ static const std::vector<extra_check> extra_checks =
       jit_ffwd_c4aii },
     { "jit: C3 inc 3 float type-store elision admits safe TEMPS",
       jit_telide_temps_c3 },
+    { "jit: C4b float literal registers + register arith sources",
+      jit_flit_c4b },
     { "jit: native CallV (function->function call in the fragment)",
       jit_native_call },
     { "jit: the inline push binds a REFERENCE argument (no slow-tier decline)",

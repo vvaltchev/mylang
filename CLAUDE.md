@@ -1364,6 +1364,54 @@ consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
 or the next such gap will also be found only by someone reading a
 disassembly for an unrelated reason.
 
+**C4b - FLOAT LITERAL REGISTERS + REGISTER ARITH SOURCES (2026-08-04).**
+Two halves of one idea - a value that already lives in a register should
+be READ there. (1) **`farith` takes its SOURCE register as a parameter**
+instead of hardcoding `xmm0, xmm1`: SSE arithmetic reads any xmm
+directly, so an operand b that is a C2a-pinned local or a pinned literal
+needs no `movsd xmm1, xmm<n>` first. `emit_float_operands` RETURNS where
+b landed, and the div0 bit test reads that register too
+(`movq_rax_x`). (2) **A per-run FLOAT LITERAL POOL in xmm2/xmm3**: a
+literal costs TWO instructions to materialise (`movabs` + `movq`) at
+EVERY use, i.e. per ITERATION for the most loop-invariant value there
+is - 8 of 55_float_sum's 55 hot-path instructions. Loaded once at the
+fragment entry (and at every entry stub), an operand-b literal is then
+FREE and an operand-a one is a single move.
+**THE GATE IS LOOP-SCOPED, and that is the whole accounting**: a use or
+a clobbering call INSIDE a loop costs per iteration, outside it costs
+once. Scanning the whole RUN instead measured the difference between a
+win and nothing - since delete-originals a run spans a whole function,
+so `main`'s argv/print calls, long before the loop, declined the pool on
+55's real bench shape while the identical loop inside a function pinned
+fine. **CORRECTNESS is `emit_call_epilogue`'s job, NOT the gate's**: the
+pool is caller-saved and a call can be RUNTIME-CONDITIONAL and invisible
+to any opcode scan (a float store to a ref-listed dst calls
+jit_put_float and CONTINUES), so the choke point every helper-call
+emission already pairs through re-materialises the pool exactly as it
+does the rsi/r8 type singletons - verified by turning the gate off
+entirely and watching the suite stay green. Through **RCX, never rax**:
+the epilogue runs immediately before every call site's `test rax, rax`,
+and materialising through rax silently destroyed the helper's status
+(it surfaced as a spurious DivisionByZeroEx).
+**A LATENT C4a-ii BUG SURFACED HERE AND IS FIXED:** `emit_float_store`'s
+ref-listed COLD arm calls jit_put_float, which TAKES its value in xmm0
+and leaves it clobbered - so a producer whose pair armed the forward
+handed the consumer garbage. The int side had solved this from the
+start (`store_dst`'s `keep_rax` reload); the float twin shipped without
+it. Now `keep_x0`, cold-arm only, so the hot path pays nothing. It bites
+only when a ref-listed float dst actually HOLDS a reference at the
+store, which `main`'s temp reuse produces and `-rt` did not - the shape
+is now a test (reproduced down to the named bound local: with the bound
+inlined an int op writes the temp first, releases the reference, and the
+case goes vacuous).
+Proven by `g_jit_flit`; the `jit_flit_c4b` test pins an
+order-sensitive two-literal chain, the ref-listed-dst shape, and a
+libm loop that must DECLINE. Measured (Ir/scale, OPT=1 ASSERTS=0):
+04_float_arith **-25.0%**, 55_float_sum **-9.2%**, 54_mandelbrot
+**-6.4%**; 40_math_builtins flat (its loop calls libm - the gate
+declining, by design), 46/01 byte-flat. 55's hot path 55 -> 48 in a
+function, 75 -> 68 at main level.
+
 **C3 inc 3 - TEMPS JOIN THE FLOAT TYPE-STORE ELISION (2026-08-04).**
 inc 2's producer was gated `< slot_count`, LOCALS ONLY, so every float
 TEMP still stored its type word on every write. A temp qualifies on the

@@ -414,9 +414,9 @@ literal movabs+movq re-materialization (~8), div zero bit-tests (~9),
 plus per-op movsd traffic. C++ keeps the WHOLE expression in
 registers. The route, in increasing depth:
   1. **C4a-ii: float forwarding** - LANDED 2026-08-04, see below;
-  2. **C4b: expression-DAG registerization** - compile a float
-     expression TREE into an xmm DAG with one store at the root (the
-     actual N7 shape for floats; subsumes 1 when it lands);
+  2. **C4b: expression-DAG registerization** - increment 1 LANDED
+     2026-08-04 (literal registers + register arith sources), see
+     below; the full DAG allocator is still open;
   3. **C4c: the return protocol** (10's ~35% jit_ret round trip) -
      LANDED 2026-08-04, see below;
   4. **C4d: struct dst tags** (64's two-stores - the C3-elision idea
@@ -477,6 +477,41 @@ allocator, not a peephole), 3 float literals cost 2 instructions each,
 and the rest is the arithmetic itself plus the counted-loop tail. The
 int type dispatch on `i` at the loop head is correct (an int promoting
 into a float expression).
+
+**C4b increment 1 LANDED (2026-08-04): literal registers + register
+arith sources.** The hot-path breakdown above is what chose it - the
+literals were the single biggest REMOVABLE item (the div0 guards are a
+language semantic and the arithmetic is the work). Two halves:
+`farith` takes its source register (so a pinned local or literal is
+read in place, no `movsd xmm1, ...` first), and a per-run literal pool
+in xmm2/xmm3 loaded once at the fragment entry.
+MEASURED: 04_float_arith **-25.0%**, 55_float_sum **-9.2%**,
+54_mandelbrot **-6.4%**; 40 flat (its loop calls libm, the gate
+declines), 46/01 byte-flat.
+THREE things this cost, all recorded because each is a general trap:
+  1. the gate must be **LOOP-SCOPED**. A whole-run scan declined 55's
+     real bench shape (main's calls sit before the loop) while the same
+     loop in a function pinned - the fix moved the measurement from
+     -2.6% to -9.2%. Since delete-originals, "the run" is a whole
+     function; per-iteration cost questions must be asked per LOOP;
+  2. **correctness belongs in emit_call_epilogue, not the gate.** A
+     call can be runtime-conditional (a ref-listed float store) and no
+     opcode scan can see it. Verified by disabling the gate entirely
+     and watching the suite stay green;
+  3. materialise through **rcx, never rax** - the epilogue runs
+     immediately before every call site's `test rax, rax`.
+And it surfaced a LATENT C4a-ii bug: jit_put_float takes its value in
+xmm0 and clobbers it, so the ref-listed cold arm destroyed a forwarded
+value. The int side had `keep_rax` for exactly this from the start; the
+float twin shipped without it. Fixed as `keep_x0`.
+
+**Still open for a full C4b**: a real allocator over the whole float
+expression DAG (tracking which register holds which value, so the
+RESULT need not always land in xmm0 and the operand-a moves and the
+non-adjacent temps both disappear). Today's emit is still
+"accumulator in xmm0"; the remaining reg-reg moves on 55 are that
+shape's cost. Widening the pools would want REX-encoded xmm8-15 (the
+current encoders are xmm0-7 only).
 
 **C4c LANDED (2026-08-04): the INLINE frame pop** - the return-side
 twin of M5b's inline push (emit_ret_native, jit.cpp; jit_ret is the
