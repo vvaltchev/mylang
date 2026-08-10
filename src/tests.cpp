@@ -19297,6 +19297,73 @@ static bool jit_hoist_c1()
           "    for (var k = 0; k < n; k++) t += a[k];",
           "    return s * 7 + t; }",
           "print(f(mk(32), 32));" }, 1 },
+
+      /* ---- C1d: the FUSIONS as candidates ---- */
+
+      /* JumpUnlessElemInt over a BOOL base (57_bool_reduce's shape):
+       * the fused `if (a[k])` test reads a byte off the pinned
+       * registers (kind 3 via the read-side hint) */
+      { "the fused bool test hoists (jmp.ifnotel, byte read)",
+        { "func mkb(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i % 3 != 0; i++; }",
+          "    return a; }",
+          "func f(a, n) {",
+          "    var c = 0;",
+          "    for (var k = 0; k < n; k++) { if (a[k]) c++; }",
+          "    return c; }",
+          "print(f(mkb(64), 64));" }, 1 },
+
+      /* the same fusion over an INT base with a NEGATIVE index: the
+       * hoisted bounds check (unsigned vs the pinned count) declines
+       * every element to the slow tier, whose wrap reads MEMORY -
+       * value parity is the oracle */
+      { "a negative index in a hoisted fused test takes the slow tier",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var c = 0;",
+          "    for (var k = 0; k < n; k++) { if (a[k - n]) c++; }",
+          "    return c; }",
+          "print(f(mk(64), 64));" }, 1 },
+
+      /* ForStepElemInt (the #9 back-edge load, via foreach-over-array):
+       * the base is the foreach SNAPSHOT - a TEMP slot, which C1d
+       * admits as a base (the def scan still protects it) */
+      { "the back-edge load fusion hoists off a TEMP base (foreach)",
+        { MK_ARR,
+          "func f(a) {",
+          "    var r = 0;",
+          "    foreach (e in a) r = (r + e) % 1000007;",
+          "    return r; }",
+          "print(f(mk(64)));" }, 1 },
+
+      /* ForStepElemInt over a BOOL base: the fusion copies the STEP's
+       * struct, so the load's ELEM-BOOL hint must TRANSFER by hand -
+       * without it the pick stamps kind INTS, the runtime kind guard
+       * fails, and the loop never hoists (this case's counter catches
+       * exactly that) */
+      { "the back-edge load fusion transfers the bool hint (kind 3)",
+        { "func mkb(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i % 3 != 0; i++; }",
+          "    return a; }",
+          "func f(a, n) {",
+          "    var r = 0;",
+          "    for (var k = 0; k < n; k++) r = (r + a[k]) % 1000007;",
+          "    return r; }",
+          "print(f(mkb(64), 64));" }, 1 },
+
+      /* a typed DICT READ inside the region (68_nested's blocker): a
+       * dict read is strictly weaker than the admitted DictStore - it
+       * cannot move an array's storage - so the region still hoists */
+      { "a typed dict read inside the region does not refuse the hoist",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var d = {\"m\": 3};",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k] * d.m;",
+          "    return s; }",
+          "print(f(mk(64), 64));" }, 1 },
     };
     #undef MK_ARR
 

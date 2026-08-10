@@ -2862,6 +2862,13 @@ static bool jit_hoist_op_ok(const Instr &in)
     case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
     case OpCode::StoreElemValue: case OpCode::StoreElem2V:
     case OpCode::DictStore:
+    /* C1d: the typed dict READS - strictly weaker than DictStore
+     * (admitted above): a default-dict vivify mutates the DICT's own
+     * map nodes, never any array's element vector, and a KeyNotFound
+     * conveys out (a region is never resumed after a throw). Helper
+     * calls, so the epilogue re-derives r10/r11. Unlocks 68_nested's
+     * ForStepElemInt loops, which carry one. */
+    case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
         return true;
     default:
         return false;
@@ -2882,7 +2889,10 @@ static void jit_hoist_op_defs(const Instr &in, D d)
     case OpCode::IntAddStep:
         d(in.a_dual_lo()); d(in.target2); break; /* acc + counter */
     case OpCode::ForStepElemInt:
-        d(in.target); d(in.target2); break;
+        /* the counter + the elem dst; `target` is this op's BRANCH pc,
+         * not a slot (the first version marked it a def - a pc-numbered
+         * slot was spuriously killed as a candidate) */
+        d(in.target2); d(in.b_dual_hi()); break;
     case OpCode::Jump:
     case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
     case OpCode::JumpUnlessElemInt: case OpCode::JumpUnlessTrueV:
@@ -2981,8 +2991,20 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
         struct Cand { int kind; int uses; bool dead; bool store; };
         std::map<int, Cand> cands;
         const auto add = [&](int slot, int kind, bool store) {
-            if (slot < 0 || slot >= chunk.slot_count)
-                return;                          /* locals only */
+            /* C1d: TEMPS are admitted as bases too (a foreach over an
+             * array snapshots the container into a TEMP, so every
+             * foreach loop - and 68's ForStepElemInt shapes - has a
+             * temp base). N5's temp hazard (eager entry-load +
+             * exit-FLUSH overwriting a live temp) does not apply: the
+             * base slot is only READ, at the preheader, and a def
+             * inside the region kills the candidate below. A store
+             * through another alias cannot move the storage either -
+             * element stores never detach a plain alias (#92's
+             * has_slices rule); growth is a builtin call, refused by
+             * the whitelist. */
+            if (slot < 0
+                    || slot >= chunk.slot_count + chunk.n_temps)
+                return;
             auto it = cands.find(slot);
             if (it == cands.end())
                 cands[slot] = { kind, 1, false, store };
@@ -2997,7 +3019,15 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
             const Instr &in = chunk.code[p];
             switch (in.op) {
             case OpCode::LoadElemInt:
+            case OpCode::JumpUnlessElemInt:  /* C1d: the fused sieve test
+                                              * (base/idx ride the load's
+                                              * own fields + hint) */
                 add(in.target2, in.elem_bool_hint() ? 3 : 0, false);
+                break;
+            case OpCode::ForStepElemInt:     /* C1d: the back-edge load;
+                                              * base = b_dual_lo, the hint
+                                              * TRANSFERRED by the fusion */
+                add(in.b_dual_lo(), in.elem_bool_hint() ? 3 : 0, false);
                 break;
             case OpCode::LoadElemFloat: add(in.target2, 1, false); break;
             case OpCode::LoadElem2Int:
@@ -4033,6 +4063,22 @@ static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc,
 {
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(in.target2);
+    /* C1d: the hoisted form - the region preheader proved the base and
+     * pinned (data, count); bounds vs r11, read off r10 (byte for a
+     * hinted bools base). Declines land on the caller's slow tier,
+     * which reads MEMORY - never stale. Only emitted when a slow list
+     * exists (the bail-mode callers keep the full nav). */
+    if (slows && g_hoist.active && in.target2 == g_hoist.base
+            && g_hoist.kind == (in.elem_bool_hint() ? 3 : 0)) {
+        load_index_r9(e, in);
+        e.cmp_r9_hr(g_hoist.rcount);
+        slows->push_back(e.j32(0x73));           /* jae -> slow */
+        if (g_hoist.kind == 3)
+            e.load_elem_byte_hr(g_hoist.rdata);
+        else
+            e.load_elem_int_hr(g_hoist.rdata);
+        return;                                  /* rax = the element */
+    }
     const auto decline = [&](uint8_t pass_short, uint8_t fail_near) {
         /* #56: with a slow tier, a declined guard JUMPS there (the helper
          * runs the interpreter core); without one, the old bail. */
@@ -7689,13 +7735,32 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * on the already-stepped counter. Neither bails -> deletable. */
         std::vector<size_t> gate_slows, read_slows;
         e.bump_op(OpCode::ForStepElemInt);   /* before any loads (rax!) */
-        emit_elem_base_gate(e, in.b_dual_lo(), pc, &gate_slows);
+        /* C1d: in a hoisted region the preheader already proved the base
+         * and its ONE kind - no gate (so no SLOW B and no double-step
+         * hazard: nothing bail-able precedes the step) and no per-element
+         * kind dispatch; the read is bounds-vs-r11 + a read off r10, with
+         * the post-step value tier (SLOW A) serving negative/OOB exactly
+         * as before. */
+        const bool hoisted = g_hoist.active
+            && in.b_dual_lo() == g_hoist.base
+            && g_hoist.kind == (in.elem_bool_hint() ? 3 : 0);
+        if (!hoisted)
+            emit_elem_base_gate(e, in.b_dual_lo(), pc, &gate_slows);
         read_slot(e, RAX, in.target2);
         e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8);   /* inc/dec rax */
         write_slot(e, ck, RAX, in.target2, pc);
         load_operand(e, RCX, in.a_is_lit(), in.a_lit(), in.a_slot());
         e.u8(0x48); e.u8(0x39); e.u8(0xC8);               /* cmp rax, rcx */
         const size_t j_fall = e.j32(cc_for(cc_negate(in.aop)).short_op);
+        if (hoisted) {
+            load_slot_r9(e, in.target2);      /* the stepped counter */
+            e.cmp_r9_hr(g_hoist.rcount);
+            read_slows.push_back(e.j32(0x73));
+            if (g_hoist.kind == 3)
+                e.load_elem_byte_hr(g_hoist.rdata);
+            else
+                e.load_elem_int_hr(g_hoist.rdata);
+        } else {
         /* the trusted read: the gate proved kind is ints or bools */
         e.load(RAX, base.payload);            /* rax = shobj */
         e.cmp_byte_rax(L.kind_off, L.kind_bools);
@@ -7707,6 +7772,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         emit_flat_int_tail(e, pc, /*bools=*/true, nullptr, in.target2,
                            &read_slows);
         e.patch32_here(j_done);
+        }
         write_slot(e, ck, RAX, in.b_dual_hi(), pc);
         std::vector<size_t> j_takens;
         {
