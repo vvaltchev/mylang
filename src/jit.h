@@ -1047,6 +1047,19 @@ void jit_norec_rebind(Chunk &chunk);
  * conveyance globals; single-threaded like the rest of them. */
 extern const void *g_norec_switch_site;
 extern const void *g_norec_switch_rbp;
+/*
+ * 4-v: the EXIT RELAY - every fragment pc-exit stores the exiting
+ * function's FuncDescriptor here (the shared epilogue's last act before
+ * the ret). A conveyed exception out of a RECORD-LESS frame reaches the
+ * caller's site with the frame's native stack dead; the callee's
+ * identity - the one datum the record-less cleanup cannot derive from
+ * live state (the vframe still holds its window and total, the captures
+ * relay its caller's captures) - comes from here. Consumed only when the
+ * window compare says the exited frame was record-less; stale values are
+ * never read. Null for main's fragments (a boundary frame is never the
+ * record-less exited callee). Defined in vm.cpp beside the switch relay.
+ */
+extern const void *g_norec_exit_desc;
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
 #else

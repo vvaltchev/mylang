@@ -810,3 +810,56 @@ the record-ful case; the retarm oracle's record compares become
 structural.
 
 ## 4-v-v. Flip the default + Net 4 + measure (the ~51-instruction win).
+
+## 4-v-ii REFINED (2026-08-11, supersedes the prefix-sweep idea above):
+## the CONVEYANCE-UNIFORM model - one frame per level
+
+The multi-frame "record-less prefix sweep" in the direct-raise path was
+WRONG: after sweeping, the native unwinding still crosses each swept
+frame's call site (the conveyance exits level by level), so the sites
+would re-clean already-cleaned frames. The model that composes:
+
+- EVERY cleanup is one frame, at one level, mirroring how the sync
+  conveyance already crosses record-ful frames one sync_stop at a time
+  (each site's postexit + its emitted depth dec balance per level).
+- Category (a), the DIRECT raise (jit_throw in a record-less frame F):
+  vm_raise cleans F ONLY - capture (loc-less iff the backtrace is
+  empty; F's desc = raise_desc), release F's ref_slots, used/seg->top
+  -= F's totals, ctx.captures = residue [fp+16], REPOINT the vframe at
+  F's parent ([fp-8] + the parent chunk's totals via site.caller_desc)
+  - then set pending and return false. F's fragment then exits -2 (the
+  "walk stopped" contract), and the conveyance proceeds normally.
+- Category (b), a CONVEYED exception (helper exc / eptr / raise-kind,
+  r = the exit pc): F was NOT cleaned. F's caller's site postexit
+  discriminates (vframe.slots != top_rec->window -> the exited callee
+  was record-less), cleans F from LIVE state (desc from the EXIT
+  RELAY, window/total from the vframe, caller captures from
+  g_jit_residue_caps), captures F's frame, repoints the vframe at THE
+  CALLER (window = rbx, passed as a new postexit argument; total baked
+  at the site, -1 for main -> read top_rec->nslots, which is main's),
+  and converts to the conveyance (return 2).
+- THE DOUBLE-CLEAN DISCRIMINATION at the site: r == -2 means the walk
+  already cleaned F (category a); any pc-valued r means it did not
+  (category b). Crisp because -2 only ever arises from a walk that
+  stopped AT F.
+- postexit's signature grows (caller_win = rbx, caller_total baked /
+  -1 for main); core's call site passes (nullptr, -1) - its callee is
+  always record-ful, the discrimination never fires there.
+
+OPEN QUESTION for the next session (read before coding): the -2 tail's
+vm_jit_stamp_call_site guard is `backtrace.back().desc == d` with d
+read from back_rec() AT POSTEXIT ENTRY - by which time the walk has
+POPPED the callee's record, so d looks like the CALLER's desc and the
+guard should never match the callee's captured frame... yet
+norec_stamp_verify fires suite-wide and the 4-ii(b) end-to-end compare
+proves frames[i>0] DO carry their site locs. The stamp mechanics are
+therefore NOT what a casual read suggests - READ jit_sync_postexit's
+-2 flow + vm_capture_rec_frame's interplay carefully and mirror
+whatever is actually true in the record-less capture, or the norec
+backtraces will diverge in exactly the way the recon compare exists to
+catch.
+
+BUILT SO FAR (dormant until the push fork): NorecSite::{inline_chain,
+inline_pool} (the #88 pair, filled at the emit beside resume_pc);
+the EXIT RELAY (g_norec_exit_desc, stored by both fragment epilogues
+before every pc-exit ret - rcx/rdx scratch, rax carries the pc).
