@@ -825,6 +825,9 @@ extern "C" unsigned long g_jit_ret_inline;
 /* C4a-i: TEMP slots admitted to the float read-elision set (compile-time -
  * it proves the AUDIT TABLE is complete, see the definition). */
 extern "C" unsigned long g_jit_fread_temps;
+/* C4a-ii: FLOAT-forwarded consumers RUN (the emitted-code proof, the
+ * float twin of g_jit_fwd). */
+extern "C" unsigned long g_jit_ffwd;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)

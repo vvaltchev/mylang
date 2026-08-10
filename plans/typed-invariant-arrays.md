@@ -413,9 +413,7 @@ single dominator - 9 FloatBins each pay temp two-stores (~14/iter),
 literal movabs+movq re-materialization (~8), div zero bit-tests (~9),
 plus per-op movsd traffic. C++ keeps the WHOLE expression in
 registers. The route, in increasing depth:
-  1. **C4a-ii: float forwarding** - lever A's twin (FloatBin
-     producer -> consumer hands xmm0; 55's chain has 4-5 adjacent
-     pairs, est. -15-20% there);
+  1. **C4a-ii: float forwarding** - LANDED 2026-08-04, see below;
   2. **C4b: expression-DAG registerization** - compile a float
      expression TREE into an xmm DAG with one store at the root (the
      actual N7 shape for floats; subsumes 1 when it lands);
@@ -424,6 +422,45 @@ registers. The route, in increasing depth:
   4. **C4d: struct dst tags** (64's two-stores - the C3-elision idea
      applied to the ctor plans' dsts).
 Each is its own measured increment; 2 and 3 are the big ones.
+
+**C4a-ii LANDED (2026-08-04): float forwarding** - a float producer
+hands its result over in XMM0 (where the emitted shape already leaves
+it) and a dead temp skips the store; the b-operand case, which is
+EVERY corpus pair, moves it aside to xmm1 first. Whitelist = the
+arithmetic family on both sides, chosen because those ops have no slow
+tier that rejoins after writing the dst. MEASURED: 54_mandelbrot
+**-17.4%**, 55_float_sum **-15.4%**, 04_float_arith **-13.9%**,
+40 -0.6%, 46/01 flat; 55's hot path 67 -> 57 instructions/iteration.
+Note 54 and 04 gain MOST although the read-elision fix left them
+byte-flat - their float locals were already pinned by C2a, so
+everything left to win was exactly this temp round trip.
+
+**A NON-TASK, recorded so it is not re-opened:** the div0 raise-convey
+call's float-pin spill/reload was reported (by me) as sitting on the
+hot path. It does not - `raise_convey_unless` emits the whole convey
+block AFTER the pass-jcc, so the bracket is cold by construction, and
+the `jne` over it in the disassembly proves it. The claim came from
+reading a linear disassembly as a linear execution path; the same
+error class as the "23 static dispatches" figure. CHECK THE JUMP
+TARGETS before costing anything read out of `-vdj`.
+
+**What 55's 57-instruction hot path still holds**, measured by walking
+the fall-through path (not by reading the dump top to bottom):
+  - **2 temps x 3 instructions** - r5/r7, the two chain positions whose
+    consumer is NOT the adjacent op (`x / (x+1)` is consumed two ops
+    later). An extension to non-adjacent pairs needs a real register
+    allocator, i.e. C4b;
+  - **7 type stores that C3 should have elided but does not**:
+    `typed_extra_f`'s production is gated `kv.first < slot_count`,
+    LOCALS ONLY, so every float temp still stores its type word per
+    write. Admitting temps needs one extra condition beyond the fread
+    gate - NOT ref-listed - because the flush stamps t_float at every
+    exit including one taken before the first write, and a temp (unlike
+    a local, whose pre-decl window holds `none`) can hold a REFERENCE
+    left by a previous run; stamping over it would hide it from
+    pop_window's release scan. Worth ~7 of 57;
+  - **3 float literals at 2 instructions each** (`movabs rax, bits` +
+    `movq xmm, rax`) - a rip-relative constant pool would halve it.
 
 **C4c LANDED (2026-08-04): the INLINE frame pop** - the return-side
 twin of M5b's inline push (emit_ret_native, jit.cpp; jit_ret is the

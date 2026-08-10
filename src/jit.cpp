@@ -60,6 +60,7 @@ unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
 unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
 unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
+unsigned long g_jit_ffwd = 0;          /* C4a-ii: FLOAT forwarded runs */
 unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
@@ -3182,6 +3183,18 @@ struct JitFwd {
     int prod = -1;      /* producer side: this op's dst temp qualifies */
     bool skip_write = false;
     bool armed = false; /* the producer's emit confirmed RAX at its exit */
+    /*
+     * C4a-ii: the FLOAT twin. Identical protocol, in XMM0 - which is
+     * exactly where a float op leaves its result already (the shape is
+     * load a->xmm0, load b->xmm1, arith xmm0, store xmm0). Parallel
+     * fields rather than a flag on the int ones: a producer is int or
+     * float, never both, and keeping the working int lever's state
+     * untouched is worth four words.
+     */
+    int fin_x0 = -1;
+    int fprod = -1;
+    bool fskip_write = false;
+    bool farmed = false;
 };
 static JitFwd g_fwd;
 
@@ -3202,6 +3215,50 @@ static bool jit_fwd_producer(const Instr &in, int &dst)
     case OpCode::LoadElem2Int:
         dst = in.target;
         return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * C4a-ii: the FLOAT producer/consumer whitelists. Deliberately narrower
+ * than the int ones - just the arithmetic family, which is BOTH sides of
+ * every pair in a float expression chain. Two properties make it the
+ * clean starting set: the result is in XMM0 at the op's exit (farith /
+ * the fmod libm return), and the op has NO slow tier that rejoins after
+ * writing the dst (the div/mod zero arm EXITS, it never falls back
+ * through), so there is no "reload the forwarding register on the slow
+ * path" case to get wrong - the int side's LoadElem* producers do have
+ * one, and their float twins are a deliberate follow-up.
+ *
+ * NOT admitted as a producer: an op whose dst is float-PINNED - the
+ * store is a register move into the pin and skipping it would strand
+ * the pin. Moot in practice (only TEMPS forward, and the C2a pool is
+ * locals-only), so it is an invariant to keep rather than a check.
+ */
+static bool jit_fwd_fproducer(const Instr &in, int &dst)
+{
+    switch (in.op) {
+    case OpCode::FloatBin:
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+        dst = in.target;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool jit_fwd_fconsumer(const Instr &nx, int t)
+{
+    switch (nx.op) {
+    case OpCode::FloatBin:
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+        return (!nx.a_is_lit() && nx.a_slot() == t)
+            || (!nx.b_is_lit() && nx.b_slot() == t);
     default:
         return false;
     }
@@ -3234,6 +3291,18 @@ static void emit_fwd_bump(Emitter &e)
 {
 #ifdef TESTS
     e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_fwd));
+    e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
+#endif
+}
+
+/* C4a-ii: the same, for FLOAT-forwarded consumers - a separate counter so
+ * a test can tell the two levers apart (rax/rdx are dead here: the
+ * operand loads that follow write xmm regs, and rax is only used by the
+ * literal path, which reloads it). */
+static void emit_fwd_fbump(Emitter &e)
+{
+#ifdef TESTS
+    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_ffwd));
     e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
 #endif
 }
@@ -4475,6 +4544,44 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
     if (!e.telided(dst, /*flt=*/true))
         e.store_r8_type(a.type);          /* type = t_float */
     e.fstore(xr, a.payload);              /* payload = the double */
+}
+
+/*
+ * C4a-ii: load a float binary op's two operands into xmm0/xmm1, taking
+ * the forwarded value from XMM0 when the pair armed it. Three shapes:
+ *   a forwarded  - xmm0 already holds it; load b only.
+ *   b forwarded  - move it ASIDE first (xmm1 <- xmm0), because loading a
+ *                  into xmm0 would clobber it. One movsd, still cheaper
+ *                  than the store+load pair it replaces. (The int side
+ *                  swaps operand roles for a commutative op instead; the
+ *                  same trick is sound here per the enum's own note that
+ *                  NaN payloads are not observable in-language, but a
+ *                  4-byte move needs no such argument.)
+ *   both same t  - xmm0 has it: copy to xmm1, load nothing.
+ */
+static void emit_float_operands(Emitter &e, const Instr &in, uint32_t pc)
+{
+    const int f = g_fwd.fin_x0;
+    const bool fa = f >= 0 && !in.a_is_lit() && in.a_slot() == f;
+    const bool fb = f >= 0 && !in.b_is_lit() && in.b_slot() == f;
+    if (fb) {
+        e.fmov_rr(X1, X0);               /* aside, BEFORE a lands in xmm0 */
+        emit_fwd_fbump(e);
+        if (!fa)
+            emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(),
+                            pc, /*no_bail=*/true);
+        return;
+    }
+    if (fa) {
+        emit_fwd_fbump(e);               /* xmm0 already holds a */
+        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+                        /*no_bail=*/true);
+        return;
+    }
+    emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+                    /*no_bail=*/true);
+    emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+                    /*no_bail=*/true);
 }
 
 /* N6a: call a libm function `fn` (arg(s) already in xmm0[/xmm1], result
@@ -6035,10 +6142,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.bump_op(OpCode::FloatBin);   /* execution proof for the div/mod
                                             * arms (BEFORE any load - bump_op
                                             * clobbers rax) */
-        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
-                        /*no_bail=*/true);
-        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
-                        /*no_bail=*/true);
+        /* C4a-ii: the operand loads, forwarding-aware (a pair armed by
+         * the previous op hands its value over in XMM0). */
+        emit_float_operands(e, in, pc);
         if (fop == 0x5E || is_mod) {
             /* float DIV and MOD throw DivisionByZeroEx on a +-0.0 divisor
              * (TypeFloat::div/mod: fpclassify(rhs) == FP_ZERO). Test the
@@ -6060,6 +6166,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 static_cast<double (*)(double, double)>(&::fmod)));
         else
             e.farith(fop);
+        /* C4a-ii: the result is in XMM0 - arm the pair, and when the
+         * temp is provably dead after the consumer, skip the store
+         * entirely (the two-store round trip this lever exists to
+         * delete). Nothing is emitted between two ops, so XMM0 carries
+         * across the boundary. */
+        if (g_fwd.fprod == in.target) {
+            g_fwd.farmed = true;
+            if (g_fwd.fskip_write)
+                return true;
+        }
         emit_float_store(e, ck, X0, in.target, pc);
         return true;
     }
@@ -10239,6 +10355,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             g_fwd.prod = -1;
             g_fwd.skip_write = false;
             g_fwd.armed = false;
+            /* C4a-ii: the float twin, same one-shot discipline in XMM0 */
+            g_fwd.fin_x0 = g_fwd.farmed ? g_fwd.fprod : -1;
+            g_fwd.fprod = -1;
+            g_fwd.fskip_write = false;
+            g_fwd.farmed = false;
             int fdst;
             bool next_is_preheader = false;
             for (const HoistRegion &hr : hregs)
@@ -10263,6 +10384,34 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 g_fwd.prod = fdst;
                 const int tb = fdst - chunk.slot_count;
                 g_fwd.skip_write = fwd_live_ok && tb < 64
+                    && !(fwd_lout[pc + 1] & (uint64_t(1) << tb))
+                    && !jit_slot_ref_listed(chunk, fdst);
+            }
+            /* C4a-ii: the FLOAT pair - every guard above, verbatim, on
+             * the float whitelists. The two are mutually exclusive (an
+             * op is an int producer or a float one), so the shared
+             * preheader/barrier/entry conditions are simply repeated
+             * rather than factored: a factored predicate would have to
+             * carry which pool armed it anyway. */
+            if (pc + 1 < end
+                    && !(!in_cold && next_is_preheader)
+                    && !(in_cold && pc + 1 > cold_end)
+                    && !cache_barrier[pc - begin]
+                    && !cache_barrier[pc + 1 - begin]
+                    && jit_fwd_fproducer(in, fdst)
+                    && fdst >= chunk.slot_count          /* a TEMP only */
+                    && jit_fwd_fconsumer(chunk.code[pc + 1], fdst)
+                    && !fwd_tgt[pc + 1]
+                    && !std::binary_search(
+                           entries.begin(), entries.end(),
+                           std::make_pair(pc + 1, size_t(0)),
+                           [](const std::pair<size_t, size_t> &x,
+                              const std::pair<size_t, size_t> &y) {
+                               return x.first < y.first;
+                           })) {
+                g_fwd.fprod = fdst;
+                const int tb = fdst - chunk.slot_count;
+                g_fwd.fskip_write = fwd_live_ok && tb < 64
                     && !(fwd_lout[pc + 1] & (uint64_t(1) << tb))
                     && !jit_slot_ref_listed(chunk, fdst);
             }
