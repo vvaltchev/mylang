@@ -7275,26 +7275,93 @@ jit_sync_boundary_call(EvalContext &ctx, FuncObject &fo, int_type argbase,
  * own retargets, which need no site).
  */
 static void norec_switch_retarget(VmActivation &act, const char *fp,
-                                  size_t idx)
+                                  size_t idx, const Chunk *my_ck,
+                                  const FuncDescriptor *my_desc,
+                                  LValue *my_win)
 {
-    for (int guard = 0; idx; guard++) {
+    for (int guard = 0;; guard++) {
         ML_CHECK(guard <= 100000);
-        VmCallRec &rec = act.records[idx - 1];
-        if (!rec.sync_stop)
-            break;                     /* a live consumer resumes it */
         const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
         const NorecSite *S = jit_norec_site_for(ra);
-        if (!S)
-            break;                     /* the segment floor: core-pushed,
+        if (idx && act.records[idx - 1].window == my_win) {
+            /* RECORD-FUL: 4-iv's retarget - its sentinel consumer dies
+             * with the -3 unwind, so its resume becomes the real one */
+            VmCallRec &rec = act.records[idx - 1];
+            if (!rec.sync_stop)
+                break;                 /* a live consumer resumes it */
+            if (!S)
+                break;                 /* the segment floor: core-pushed,
                                         * retargeted by its own core */
-        rec.ret_chunk = S->caller;
-        rec.ret_pc = S->resume_pc;
-        rec.sync_stop = 0;
-        rec.call_site_packed = static_cast<int_type>(S->site_loc);
-        rec.pushed_with_residue = 0;   /* the residue dies with the
-                                        * native frames (4-iii) */
+            rec.ret_chunk = S->caller;
+            rec.ret_pc = S->resume_pc;
+            rec.sync_stop = 0;
+            rec.call_site_packed = static_cast<int_type>(S->site_loc);
+            rec.pushed_with_residue = 0;   /* the residue dies with the
+                                            * native frames (4-iii) */
+            idx--;
+        } else {
+            /* RECORD-LESS (4-v): INSERT the full record this frame never
+             * had, from the walk's live data - after this the frame IS
+             * the record world's, and the flat continuation resumes it
+             * through the same machinery as everyone else. The insert
+             * position is records[idx] (above the deepest record the
+             * walk has not yet passed); walking top-down, positions
+             * below are untouched by each insert. */
+            ML_CHECK(S != nullptr);    /* only an emitted site creates a
+                                        * record-less frame */
+            ML_CHECK(my_ck != nullptr && my_win != nullptr);
+            VmCallRec nr;
+            nr.window = my_win;
+            nr.nslots = static_cast<int_type>(my_ck->slot_count)
+                        + my_ck->n_temps;
+            nr.seg = act.cur_seg;      /* the inline-push invariant: a
+                                        * record-less frame shares its
+                                        * caller's segment */
+            {
+                const VmStackSeg &sg =
+                    *act.segs[static_cast<size_t>(act.cur_seg)];
+                nr.seg_top_before = static_cast<int_type>(
+                    my_win - sg.slots.data());
+            }
+            nr.run_chunk = my_ck;
+            nr.desc = my_desc;
+            nr.ret_chunk = S->caller;
+            nr.ret_pc = S->resume_pc;
+            nr.dst = S->dst;
+            nr.call_site_packed = static_cast<int_type>(S->site_loc);
+            nr.caller_captures =
+                *reinterpret_cast<CaptureSlots *const *>(fp + 16);
+            /* a record-less frame is plain: the watermarks never moved,
+             * so the live sizes ARE its bases (pop's hardened branch
+             * re-checks exactly this) */
+            nr.handler_base = static_cast<uint32_t>(act.handlers.size());
+            nr.diter_base = act.diters_n;
+            nr.dyiter_base = act.dyiters_n;
+            nr.native_rbp = *reinterpret_cast<const char *const *>(fp);
+#ifdef TESTS
+            nr.norec_site = S;
+#endif
+            /* the parent view (4-v inc 1) - the next level's descent */
+            nr.parent_window =
+                *reinterpret_cast<LValue *const *>(fp - 8);
+            nr.parent_nslots = static_cast<int32_t>(
+                S->caller->slot_count + S->caller->n_temps);
+            nr.parent_seg = static_cast<int32_t>(act.cur_seg);
+            act.records.insert(
+                act.records.begin() + static_cast<ptrdiff_t>(idx),
+                std::move(nr));
+            act.rec_n++;
+            act.recs_high = static_cast<uint32_t>(act.records.size());
+            act.top_rec = &act.records[act.rec_n - 1];
+        }
+        if (!S)
+            break;
+        /* the descent: the parent's identity from the site, its window
+         * from the chain */
+        my_ck = S->caller;
+        my_desc = static_cast<const FuncDescriptor *>(S->caller_desc);
+        my_win = *reinterpret_cast<LValue *const *>(fp - 8);
         fp = *reinterpret_cast<const char *const *>(fp);
-        idx--;
     }
 }
 
@@ -7340,12 +7407,23 @@ jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
     norec_materialize_shadow(act, ctx, resume_pc, dst, site_packed,
                              entry_rbp);
 #endif
-    /* 4-iv (task #148): retarget the doomed sentinel records of the
-     * topmost native segment before the -3 unwinds their consumers -
-     * see norec_switch_retarget above. records[rec_n-1] is the switching
-     * caller's record, the frame at entry_rbp. */
-    if (entry_rbp)
-        norec_switch_retarget(act, entry_rbp, act.rec_n);
+    /* 4-iv/4-v (task #148): MATERIALIZE the topmost native segment
+     * before the -3 unwinds its consumers - retarget each record-ful
+     * frame's sentinel resume, INSERT a full record for each record-less
+     * one (see norec_switch_retarget). The descent is seeded by the
+     * relay SITE (the switching caller's own identity - back_rec() can
+     * be an ancestor's in the record-less world) and the live vframe
+     * (its window). After this, back_rec() below IS the switching
+     * caller's record in every world. */
+    if (entry_rbp) {
+        const auto *seed =
+            static_cast<const NorecSite *>(g_norec_switch_site);
+        ML_CHECK(seed != nullptr);
+        norec_switch_retarget(
+            act, entry_rbp, act.rec_n, seed->caller,
+            static_cast<const FuncDescriptor *>(seed->caller_desc),
+            ctx.frame ? ctx.frame->slots : nullptr);
+    }
     const Chunk *caller_ck = act.back_rec().run_chunk;  /* BEFORE the push */
     try {
         if (d->fast_bind && !key)
@@ -7387,6 +7465,16 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
     g_jit_call_inline_pool = nullptr;
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
+    /* 4-v: the CALLER's identity + window, captured at entry for the
+     * r == JIT_RET_SWITCH materialization - the site relay names the
+     * caller (back_rec() can be an ancestor's in the record-less world)
+     * and the vframe still points at its window here. Trustworthy only
+     * when entry_rbp is (both are stored by the same slow tail); the
+     * generic dyn-callee caller passes a null entry_rbp and neither is
+     * read. */
+    const auto *entry_site =
+        static_cast<const NorecSite *>(g_norec_switch_site);
+    LValue *const entry_caller_win = ctx.frame ? ctx.frame->slots : nullptr;
     const FuncDescriptor *d = fo.func;
     if (!d->vm_chunk_tried) {              /* the interpreted op's AOT net */
         fo.func->vm_chunk = vm_func_chunk(fo.func);
@@ -7488,14 +7576,20 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
              * records[my_idx - 2] is the caller's frame at entry_rbp. */
             if (resume_pc >= 0) {
                 VmCallRec &mine = act.records[my_idx - 1];
-                mine.ret_chunk = caller_ck;
+                mine.ret_chunk =
+                    (entry_rbp && entry_site) ? entry_site->caller
+                                              : caller_ck;
                 mine.ret_pc = static_cast<size_t>(resume_pc);
                 mine.sync_stop = 0;
                 mine.call_site_packed = site_packed;
                 mine.pushed_with_residue = 0;
             }
-            if (entry_rbp && my_idx >= 2)
-                norec_switch_retarget(act, entry_rbp, my_idx - 1);
+            if (entry_rbp && entry_site && my_idx >= 2)
+                norec_switch_retarget(
+                    act, entry_rbp, my_idx - 1, entry_site->caller,
+                    static_cast<const FuncDescriptor *>(
+                        entry_site->caller_desc),
+                    entry_caller_win);
             g_jit_sync_depth--;
             return 3;
         }
