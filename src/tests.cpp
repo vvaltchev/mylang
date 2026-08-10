@@ -4177,6 +4177,31 @@ static const std::vector<test> tests =
         "assert((-1 >> 64) == -1 && (4 >> 64) == 0);" } },
     { "shift: a negative count throws at runtime",
       { "var n = -1; var x = 1 << n;" }, &typeid(InvalidValueEx) },
+    /* #103: INT_MIN / -1 (and % -1) THROWS - it used to be UB (idiv's
+     * hardware #DE SIGFPE'd every engine incl. the parse-time fold;
+     * -fwrapv does not define division overflow). Explicit pre-checks
+     * everywhere, never a signal handler. */
+    { "div overflow: INT_MIN / -1 throws (runtime divisor)",
+      { "var x = 1 << 63; var d = int(runtime(0 - 1));",
+        "var y = x / d;" }, &typeid(InvalidValueEx) },
+    { "div overflow: INT_MIN % -1 throws too (one uniform rule)",
+      { "var x = 1 << 63; var d = int(runtime(0 - 1));",
+        "var y = x % d;" }, &typeid(InvalidValueEx) },
+    { "div overflow: catchable, and a non-overflowing / -1 still divides",
+      { "var x = 1 << 63; var d = int(runtime(0 - 1));",
+        "var t = 0;",
+        "try { t = x / d; } catch (InvalidValueEx) { t = 77; }",
+        "assert(t == 77);",
+        "assert(10 / d == -10);" } },
+    { "div overflow: the element compound path throws it too",
+      { "var a = [0, 0, 0];",
+        "a[1] = 1 << 63;",
+        "var d = int(runtime(0 - 1));",
+        "var t = 0;",
+        "try { a[1] /= d; } catch (InvalidValueEx) { t = 66; }",
+        "assert(t == 66 && a[1] == 1 << 63);" } },
+    { "div overflow: a fully-const INT_MIN / -1 fails the BUILD",
+      { "const C = (1 << 63) / (0 - 1);" }, &typeid(InvalidValueEx) },
     { "bitwise: bool operands promote to int",
       { "assert((true & true) == 1);",
         "assert((true | false) == 1);",
@@ -19352,21 +19377,22 @@ static bool jit_hoist_c1()
           "    return t * 1000 + a[0] + a[63]; }",
           "print(f(mk(64), 64, int(runtime(0))));" }, 1 },
 
-      /* a -1 runtime divisor declines to the helper (the ordinary
-       * tier's own convention - the idiv INT_MIN/-1 trap). NOT
-       * sabotage-provable today: INT_MIN/-1 SIGFPEs the HELPER too (a
-       * pre-existing, engine-uniform hole - task #103), so with sane
-       * elements both paths compute identically; the case documents
-       * the decline and pins parity, and #103's fix lands in the
-       * helper both tiers decline to. */
-      { "a -1 runtime divisor declines to the helper (parity)",
+      /* a -1 runtime divisor declines to the helper, which (#103) now
+       * THROWS on the INT_MIN element - so the guard is finally
+       * sabotage-provable: dropped, the hoisted idiv takes a hardware
+       * #DE where the helper raises the catchable InvalidValueEx */
+      { "a -1 runtime divisor declines to the helper (INT_MIN throws)",
         { MK_ARR,
           "func f(a, n, d) {",
-          "    var j = 0;",
-          "    while (j < n) { a[j] /= d; j++; }",
+          "    a[3] = 1 << 63;",
+          "    var t = 0;",
+          "    try {",
+          "        var j = 0;",
+          "        while (j < n) { a[j] /= d; j++; }",
+          "    } catch (InvalidValueEx) { t = 55; }",
           "    var s = 0;",
-          "    for (var t = 0; t < n; t++) s += a[t];",
-          "    return s; }",
+          "    for (var k = 0; k < n; k++) s += a[k];",
+          "    return t * 100000 + s; }",
           "print(f(mk(64), 64, int(runtime(0 - 1))));" }, 1 },
 
       /* the FLOAT compound RMW (addsd off the pinned data pointer) */

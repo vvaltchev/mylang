@@ -418,8 +418,10 @@ vm_store_elem_int_body(LValue &alv, int_type idx, int_type rhs, Op aop,
             case Op::plus:    el += rhs; break;
             case Op::minus:   el -= rhs; break;
             case Op::times:   el *= rhs; break;
-            case Op::div:     el /= rhs; break;
-            case Op::mod:     el %= rhs; break;
+            case Op::div:     check_int_div_overflow(el, rhs);
+                              el /= rhs; break;
+            case Op::mod:     check_int_div_overflow(el, rhs);
+                              el %= rhs; break;
             default: throw InternalErrorEx();
             }
             arr.invalidate_hash();
@@ -1052,8 +1054,10 @@ vm_num_binop(EvalValue &a, const EvalValue &b, Op aop)
         case Op::plus:  x += y; return;
         case Op::minus: x -= y; return;
         case Op::times: x *= y; return;
-        case Op::div:   if (y == 0) throw DivisionByZeroEx(); x /= y; return;
-        case Op::mod:   if (y == 0) throw DivisionByZeroEx(); x %= y; return;
+        case Op::div:   if (y == 0) throw DivisionByZeroEx();
+                        check_int_div_overflow(x, y); x /= y; return;
+        case Op::mod:   if (y == 0) throw DivisionByZeroEx();
+                        check_int_div_overflow(x, y); x %= y; return;
         case Op::band:  x &= y; return;
         case Op::bor:   x |= y; return;
         case Op::bxor:  x ^= y; return;
@@ -4759,13 +4763,23 @@ extern "C" int jit_throw_runtime(const void *tv) noexcept
  * exception EnterNative builds with a loc_at(pc) caret - wrong at a
  * deleted run's collapsed pc). The construction mirrors EnterNative's
  * exactly. Cold - called only when the div/shift actually faults. */
+/* The ONE kind->exception mapping (four consumers used to carry copies
+ * of a ternary chain - a new kind would have had to be added to each). */
+static std::unique_ptr<RuntimeException> vm_jit_raise_kind_new(int kind)
+{
+    switch (kind) {
+    case JR_OOB:     return std::make_unique<OutOfBoundsEx>();
+    case JR_DIV0:    return std::make_unique<DivisionByZeroEx>();
+    case JR_DIV_OVF: return std::make_unique<InvalidValueEx>(
+                                "integer overflow in division");
+    default:         return std::make_unique<InvalidValueEx>(
+                                "negative shift count");
+    }
+}
+
 extern "C" void jit_raise_kind_exc(int kind) noexcept
 {
-    g_vm_jit_exc.reset(
-        kind == JR_DIV0
-            ? static_cast<RuntimeException *>(new DivisionByZeroEx())
-            : static_cast<RuntimeException *>(
-                  new InvalidValueEx("negative shift count")));
+    g_vm_jit_exc = vm_jit_raise_kind_new(kind);
 }
 
 /* model-flip (nativize-ops): the native CheckCallableV - an indirect
@@ -5590,13 +5604,7 @@ vm_invoke_postexit(const Chunk &cck, EvalContext &ctx, VmActivation &act,
     if (g_vm_jit_raise) {
         const int kind = g_vm_jit_raise;
         g_vm_jit_raise = 0;
-        cont = vm_raise(c2, p2, act, ctx,
-            kind == JR_OOB
-              ? std::unique_ptr<RuntimeException>(new OutOfBoundsEx())
-              : kind == JR_DIV0
-              ? std::unique_ptr<RuntimeException>(new DivisionByZeroEx())
-              : std::unique_ptr<RuntimeException>(
-                    new InvalidValueEx("negative shift count")));
+        cont = vm_raise(c2, p2, act, ctx, vm_jit_raise_kind_new(kind));
     } else if (g_vm_jit_exc) {
         cont = vm_raise(c2, p2, act, ctx, std::move(g_vm_jit_exc));
     } else if (g_vm_jit_eptr) {
@@ -6241,13 +6249,7 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
             const int kind = g_vm_jit_raise;
             g_vm_jit_raise = 0;
             cont = vm_raise(c2, p2, act, ctx,
-                kind == JR_OOB
-                  ? std::unique_ptr<RuntimeException>(new OutOfBoundsEx())
-                  : kind == JR_DIV0
-                  ? std::unique_ptr<RuntimeException>(
-                        new DivisionByZeroEx())
-                  : std::unique_ptr<RuntimeException>(
-                        new InvalidValueEx("negative shift count")));
+                            vm_jit_raise_kind_new(kind));
         } else if (g_vm_jit_exc) {
             cont = vm_raise(c2, p2, act, ctx, std::move(g_vm_jit_exc));
         } else if (g_vm_jit_eptr) {
@@ -7498,18 +7500,24 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             case Op::minus: r = a - b; break;
             case Op::times: r = a * b; break;
             case Op::div:
-                if (b == 0) {
-                    if (!vm_raise(chunk, pc, act, ctx,
-                                  std::make_unique<DivisionByZeroEx>()))
+                if (b == 0 || (b == -1 && a == INT_TYPE_MIN)) {
+                    if (!vm_raise(chunk, pc, act, ctx, b == 0
+                            ? std::unique_ptr<RuntimeException>(
+                                  std::make_unique<DivisionByZeroEx>())
+                            : std::make_unique<InvalidValueEx>(
+                                  "integer overflow in division")))
                         return;       /* boundary: signal set */
                     code = chunk->code.data();
                     VM_NEXT;          /* dispatched: skip the write */
                 }
                 r = a / b; break;
             case Op::mod:
-                if (b == 0) {
-                    if (!vm_raise(chunk, pc, act, ctx,
-                                  std::make_unique<DivisionByZeroEx>()))
+                if (b == 0 || (b == -1 && a == INT_TYPE_MIN)) {
+                    if (!vm_raise(chunk, pc, act, ctx, b == 0
+                            ? std::unique_ptr<RuntimeException>(
+                                  std::make_unique<DivisionByZeroEx>())
+                            : std::make_unique<InvalidValueEx>(
+                                  "integer overflow in division")))
                         return;
                     code = chunk->code.data();
                     VM_NEXT;
@@ -7829,14 +7837,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 const int kind = g_vm_jit_raise;
                 g_vm_jit_raise = 0;
                 if (!vm_raise(chunk, pc, act, ctx,
-                        kind == JR_OOB
-                          ? std::unique_ptr<RuntimeException>(
-                                new OutOfBoundsEx())
-                          : kind == JR_DIV0
-                          ? std::unique_ptr<RuntimeException>(
-                                new DivisionByZeroEx())
-                          : std::unique_ptr<RuntimeException>(
-                                new InvalidValueEx("negative shift count"))))
+                              vm_jit_raise_kind_new(kind)))
                     return;                    /* boundary: signal set */
                 code = chunk->code.data();     /* dispatched to a handler */
             }

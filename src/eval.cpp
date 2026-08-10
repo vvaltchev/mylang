@@ -2732,11 +2732,17 @@ int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
                         if (r == 0)
                             throw DivisionByZeroEx(elems[i].second->start,
                                                    elems[i].second->end);
+                        check_int_div_overflow(acc, r,
+                                               elems[i].second->start,
+                                               elems[i].second->end);
                         acc /= r; break;
                     case Op::mod:
                         if (r == 0)
                             throw DivisionByZeroEx(elems[i].second->start,
                                                    elems[i].second->end);
+                        check_int_div_overflow(acc, r,
+                                               elems[i].second->start,
+                                               elems[i].second->end);
                         acc %= r; break;
                     case Op::band: acc &= r; break;
                     case Op::bor:  acc |= r; break;

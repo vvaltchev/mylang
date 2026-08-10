@@ -7315,7 +7315,10 @@ static void specialize_arith_ops(Chunk &ck)
                 /* Only the NONZERO-immediate form (no zero check needed -
                  * the checksum shape); mod-by-reg / mod-by-zero keep
                  * IntBin's checked path + its div0 loc. */
-                if (ri && in.b_lit() != 0)
+                /* imm -1 excluded too: INT_MIN % -1 now THROWS (#103)
+                 * and the RI handler is uncheck-fast - IntBin's checked
+                 * path serves `% -1` (nonexistent in real code) */
+                if (ri && in.b_lit() != 0 && in.b_lit() != -1)
                     in.op = OpCode::IntModRI;
                 break;
             default:
@@ -7917,6 +7920,7 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                 if (op1.op == OpCode::IntBin && op1.aop == Op::plus
                     && op2.op == OpCode::IntBin && op2.aop == Op::mod
                     && op2.b_is_lit() && op2.b_lit() != 0
+                    && op2.b_lit() != -1        /* INT_MIN % -1 throws */
                     && op2.b_lit() == static_cast<int32_t>(op2.b_lit())
                     && !op2.a_is_lit() && op2.a_slot() == op1.target
                     && bit(op1.target)) {

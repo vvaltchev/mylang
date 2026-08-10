@@ -84,6 +84,7 @@ void TypeInt::div(EvalValue &a, const EvalValue &b)
     if (b.get<int_type>() == 0)
         throw DivisionByZeroEx();
 
+    check_int_div_overflow(a.get<int_type>(), b.get<int_type>());
     a.get<int_type>() /= b.get<int_type>();
 }
 
@@ -95,6 +96,7 @@ void TypeInt::mod(EvalValue &a, const EvalValue &b)
     if (b.get<int_type>() == 0)
         throw DivisionByZeroEx();
 
+    check_int_div_overflow(a.get<int_type>(), b.get<int_type>());
     a.get<int_type>() %= b.get<int_type>();
 }
 
