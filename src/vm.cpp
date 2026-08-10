@@ -1632,16 +1632,6 @@ struct VmCallRec {
      * instead of walking into the native caller's record. */
     unsigned char sync_stop = 0;
 
-    /* G1 step 4-iii (plans/g1-no-record-tier.md 4c): this frame was
-     * pushed by an emitted site that ALSO pushed the 2-qword RESIDUE
-     * ([dst_addr][captures]) on the native stack, so the callee's
-     * record-less return arm may consume it. Written by the emitted
-     * push only under MYLANG_JIT_FORCE=norec (1 at plain sites, 0 at
-     * cached ones - a reused record must be overwritten); zeroed by
-     * every C++ push. Dies with the record in step 4-v, where the
-     * discrimination becomes the window compare. */
-    unsigned char pushed_with_residue = 0;
-
     /* The CALLER's per-frame pure-call cache, stashed while a callee runs:
      * eval.cpp reaches the cache as `ctx->frame->pure_cache`, and the view
      * Frame is SHARED across the whole activation - without the stash the
@@ -1836,9 +1826,6 @@ struct VmActivation {
         rec.parent_nslots = par_nslots;
         rec.parent_seg = par_seg;
         rec.boundary = boundary;
-        rec.pushed_with_residue = 0;   /* a C++ push has no residue - and
-                                        * a REUSED record must not keep a
-                                        * prior emitted push's flag */
         rec.sync_stop = 0;               /* a REUSED record must not carry a
                                           * stale lean-sync stop mark */
         rec.norec_site = nullptr;        /* every C++ push nulls the G1 site
@@ -6775,7 +6762,6 @@ extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
     const Chunk *ck =
         desc ? static_cast<const Chunk *>(desc->vm_chunk) : nullptr;
     ML_CHECK(ck != nullptr);
-    (void)rbp;
     EvalValue res = res_slot >= 0
         ? ctx.frame->at(res_slot).steal_value()
         : EvalValue();
@@ -6791,6 +6777,8 @@ extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
     }
     act.segs[static_cast<size_t>(act.cur_seg)]->top -= total;
     act.used -= total;
+    ctx.captures = *reinterpret_cast<CaptureSlots *const *>(
+        static_cast<const char *>(rbp) + 16);
     if (dst_addr)
         dst_addr->put(std::move(res));
     return JIT_RET_SENTINEL;
@@ -7335,8 +7323,6 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
             rec.ret_pc = S->resume_pc;
             rec.sync_stop = 0;
             rec.call_site_packed = static_cast<int_type>(S->site_loc);
-            rec.pushed_with_residue = 0;   /* the residue dies with the
-                                            * native frames (4-iii) */
             idx--;
         } else {
             /* RECORD-LESS (4-v): INSERT the full record this frame never
@@ -7624,7 +7610,6 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
                 mine.ret_pc = static_cast<size_t>(resume_pc);
                 mine.sync_stop = 0;
                 mine.call_site_packed = site_packed;
-                mine.pushed_with_residue = 0;
             }
             if (entry_rbp && entry_site && my_idx >= 2)
                 norec_switch_retarget(
@@ -8180,8 +8165,6 @@ void jit_fill_push_layout(JitPushLayout *L)
         reinterpret_cast<const char *>(&r.norec_site) - rb;
     L->rec_native_rbp =
         reinterpret_cast<const char *>(&r.native_rbp) - rb;
-    L->rec_residue =
-        reinterpret_cast<const char *>(&r.pushed_with_residue) - rb;
     L->rec_parent_window =
         reinterpret_cast<const char *>(&r.parent_window) - rb;
     L->rec_parent_nslots =
@@ -8417,7 +8400,7 @@ static size_t norec_walk_chain(VmActivation *act, const char *fp,
  *          depends on.
  *
  * The full reconstruction is checked for the frames that WOULD be
- * record-less (pushed_with_residue - under MYLANG_JIT_FORCE=norec);
+ * record-less (the 4-iii era's residue-flagged frames - historical);
  * the identity descent is checked for every chain frame in both modes.
  * The relayed seed is additionally pinned against the helper's own
  * ARGUMENTS (resume_pc / dst / site loc rode a different vehicle from
@@ -8476,7 +8459,7 @@ static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
     const void *my_desc = seed->caller_desc;
     const LValue *my_win = ctx.frame->slots;
     size_t idx = act.rec_n;
-    size_t levels = 0, residue_frames = 0;
+    size_t levels = 0;
     bool hit_floor = false;
     for (int guard = 0; idx; guard++) {
         if (guard > 100000)
@@ -8513,62 +8496,10 @@ static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
         const char *link = *reinterpret_cast<const char *const *>(fp);
         const void *parent_win =
             *reinterpret_cast<const void *const *>(fp - 8);
-        if (rec.pushed_with_residue) {
-            /* the FULL insert reconstruction - this frame would be
-             * record-less in 4-v */
-            if (!rec.run_chunk || !rec.run_chunk->norec_ok)
-                norec_fail("mat: a residue frame whose chunk is not "
-                           "norec_ok", &rec, rec.run_chunk);
-            if (static_cast<int_type>(S->dst) != rec.dst)
-                norec_fail("mat: site dst != record",
-                           reinterpret_cast<const void *>(
-                               static_cast<intptr_t>(S->dst)),
-                           reinterpret_cast<const void *>(
-                               static_cast<intptr_t>(rec.dst)));
-            if (rec.nslots != static_cast<int_type>(
-                                  my_ck->slot_count + my_ck->n_temps))
-                norec_fail("mat: chunk totals != record nslots",
-                           reinterpret_cast<const void *>(
-                               static_cast<intptr_t>(rec.nslots)),
-                           my_ck);
-            if (rec.seg != act.cur_seg)
-                norec_fail("mat: residue frame not in cur_seg",
-                           reinterpret_cast<const void *>(
-                               static_cast<intptr_t>(rec.seg)),
-                           reinterpret_cast<const void *>(
-                               static_cast<intptr_t>(act.cur_seg)));
-            const VmStackSeg &sg =
-                *act.segs[static_cast<size_t>(act.cur_seg)];
-            if (rec.window != sg.slots.data() + rec.seg_top_before)
-                norec_fail("mat: window != seg base + watermark",
-                           rec.window,
-                           sg.slots.data() + rec.seg_top_before);
-            /* the residue, read at the SWITCH moment: it sits deeper in
-             * the native stack, untouched since its push */
-            const void *caps =
-                *reinterpret_cast<const void *const *>(fp + 16);
-            if (caps != static_cast<const void *>(rec.caller_captures))
-                norec_fail("mat: residue captures != record", caps,
-                           rec.caller_captures);
-            const void *dst_addr =
-                *reinterpret_cast<const void *const *>(fp + 24);
-            const void *want =
-                rec.dst < 0
-                    ? nullptr
-                    : static_cast<const void *>(
-                          static_cast<const LValue *>(parent_win)
-                          + rec.dst);
-            if (dst_addr != want)
-                norec_fail("mat: residue dst_addr != &parent[dst]",
-                           dst_addr, want);
-            /* the inserted resume (S->caller, S->resume_pc): bounds -
-             * registration verified stub-ness where it is guaranteed */
-            if (static_cast<size_t>(S->resume_pc)
-                    >= S->caller->code.size())
-                norec_fail("mat: site resume_pc out of bounds", S,
-                           S->caller);
-            residue_frames++;
-        }
+        /* (the per-frame residue reconstruction that lived here died
+         * with the 4-iii residue flag: this shadow runs UNFORCED only,
+         * where no residue exists - the fork's real insert is verified
+         * by g_jit_norec_mat_insert + the end-to-end nets instead) */
         my_ck = S->caller;
         my_desc = S->caller_desc;
         my_win = static_cast<const LValue *>(parent_win);
@@ -8581,7 +8512,6 @@ static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
                    fp, seed);
     g_jit_norec_mat_walk++;
     g_jit_norec_mat_frames += levels;
-    g_jit_norec_mat_residue += residue_frames;
 }
 
 #endif
@@ -8608,13 +8538,15 @@ extern "C" void jit_norec_retarm_verify(const void *dst_addr,
         norec_fail("retarm: no activation / no record stack", act,
                    nullptr);
     const VmCallRec &rec = act->back_rec();
-    if (!rec.pushed_with_residue) {
-        /* 4-v FORK MODE: the returning frame has NO record - the top
+    {
+        /* the arm only fires on the WINDOW-COMPARE mismatch, so the
+         * returning frame has NO record by construction - the top
          * record is an ancestor's, and only the live facts remain
-         * checkable: the discrimination itself (this frame's window is
-         * not the top record's), the baked total vs the vframe (the
-         * push set it from the same chunk), and the window chain's
-         * [rbp-8] being a real pointer distinct from our own window. */
+         * checkable: the discrimination itself, the baked total vs the
+         * vframe (the push set it from the same chunk), and the window
+         * chain's [rbp-8] being a real pointer distinct from our own
+         * window. (The 4-iii record-compare half died with the residue
+         * flag.) */
         EvalContext *fctx = g_current_ctx;
         if (!fctx || !fctx->frame)
             norec_fail("retarm fork: no ctx", fctx, nullptr);
@@ -8768,17 +8700,6 @@ extern "C" void jit_norec_push_verify(const void *site,
         if (cck && cck->norec_ok != jit_chunk_norec_ok(*cck))
             norec_fail("chunk norec_ok byte != the predicate", cck,
                        nullptr);
-        /* 4-iii: the RESIDUE FLAG the push stored must be what the gate
-         * says - under FORCE every emitted site pushes residue and the
-         * flag is the callee's norec_ok byte; unforced it is never set.
-         * A wrong flag is either a dead tier (0 where 1 belongs - how
-         * 76's value-call path would hide) or garbage residue reads. */
-        if (rec.pushed_with_residue
-                != (jit_norec_forced() && cck && cck->norec_ok ? 1 : 0))
-            norec_fail("residue flag != the gate's answer",
-                       reinterpret_cast<const void *>(
-                           static_cast<intptr_t>(rec.pushed_with_residue)),
-                       cck);
     }
     /*
      * G1 STEP 3 - THE SHADOW WALK. `rbp` is the CALLER fragment's frame
@@ -9610,16 +9531,10 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * because it is THIS line that would form a member address on a
              * null pointer if that ever stopped holding. */
             ML_VM_CHECK(ctx.frame != nullptr);
-            /* G1 4-iii: an EnterNative entry means THIS frame is driven
-             * by the interpreter - the residue-carrying native frame of
-             * any earlier `call rdx` entry is GONE (it frag_ret when the
-             * fragment exited mid-body, or the -3 flat path abandoned
-             * it), so the record-less return arm must not consume a
-             * residue that no longer exists. The oracle caught exactly
-             * this on the first forced run: a re-entered fragment's
-             * ReturnV read garbage at [rbp+24]. One byte store; the top
-             * record is this frame's (frames above have returned). */
-            act.back_rec().pushed_with_residue = 0;
+            /* (the 4-iii residue-flag clear that lived here died with
+             * the flag: the return arm's WINDOW COMPARE is self-truthing
+             * - a re-entered record-ful frame's top_rec IS its own
+             * record, so it takes the record arm with no flag needed) */
             pc = jit_enter(static_cast<char *>(chunk->native.base)
                                + in->a_lit(),
                            ctx.frame->slots);

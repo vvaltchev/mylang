@@ -894,3 +894,52 @@ boundary bit sent every record-less return through the boundary arm
 read 0 against 39 record-less pushes, then Frame::at aborted at main's
 print with the callee's stale vframe.size. The counter named the dead
 tier before the abort named the damage.
+
+## 4-v TAX SHRINK (2026-08-12) - the broad-suite cost halved
+
+Three removals, all of machinery whose role the window compare had
+already absorbed, plus one provably-dead test:
+
+1. **The 4-iii rec_residue byte died entirely** - the emitted store
+   (movzx + byte store per record-ful forced push), the cached-site
+   zero, the field, its layout offset, push_window's zero, the
+   materializer's clears, the push_verify flag pin, AND the
+   EnterNative-entry clear that ran once per EnterNative dispatch IN
+   EVERY MODE. The window compare is self-truthing: a re-entered
+   record-ful frame's top_rec IS its own record.
+2. **The record path's caps-relay park died** - a record-FUL callee's
+   residue captures value is never read (its record carries
+   caller_captures; the exceptional readers only touch record-less
+   frames' residues), so the stale relay value its residue push then
+   pushes is harmless. Only the NOREC branch parks.
+3. **The captures restore moved callee-side** - the record-less return
+   arm (and jit_ret_norec) restore ctx.captures from the residue at
+   [rbp+16]; the caller's sentinel arm dropped its per-call relay
+   round-trip, which record-ful returns paid for nothing (their pop
+   restores captures from the record).
+4. **Plain sites dropped the pending-key gate test** (5 instructions
+   per plain forced push): only a CachedCallV site's OWN probe parks a
+   key, consumed by that same site's push - a plain site can never
+   observe one.
+
+Re-measured (same method): callgrind 10_recursion -14.5% (was -12.2%),
+78 -7.4% (-6.1%), gcd -4.3% (-3.6%), 76 -3.7% (-3.0%) - ~33-36 Ir per
+call net; wall 10_rec 0.77x, 78 0.93x; suite geomean cur/base
+**1.006x** (was 1.011x), inside the documented run-to-run spread.
+
+THE COVERAGE GAP THE SHRINK EXPOSED (the vacuous-test trap, again): a
+sabotage of the arm's captures-restore offset PASSED the entire forced
+suite - no test had a capture-reading caller above a record-less
+callee. The new "closure capture read survives record-less returns"
+test constructs it, defeating two shape-eaters on the way (a tiny
+callee INLINES - the mutual pair survives to codegen; a write-once
+`var c = 10` AUTO-CONSTS and the capture read folds - the write-twice
+init keeps it a runtime slot). Watched failing against the sabotage,
+both return tiers covered (the emitted arm via the scalar result, the
+jit_ret_norec decline via the array result).
+
+Remaining per-call residue (deliberate): the 2-qword residue push/pop
+(dst_addr + the exceptional-captures source), the 2-instruction gate
+byte test, the window compare, and the sentinel arm's slots+size
+restore. The default flip decision stands unchanged - now at a 1.006x
+broad cost.
