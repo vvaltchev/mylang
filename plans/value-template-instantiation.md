@@ -122,3 +122,24 @@ fill-a-fresh-array shape. A candidate v2 item — the principled fix is to
 make an element READ out of a bottom container yield `dyn`, not `none`,
 which is a lattice change (it would turn `var x = empty[0]` into a
 `DynRequiredEx`) and needs maintainer sign-off.
+
+## #149 (2026-08-11): base reachability is a CLOSURE, not the flag
+
+The dead-base exclusion (`is_template_base`) was keyed off the name
+sym's `value_used` alone - and that misses ONE HOP: a value-used base
+runs its ORIGINAL body, whose direct calls were never redirected to
+instances (the check/instantiation passes skip template bodies), so
+every template that body names is itself runtime-reachable, and so on
+transitively. `var dyn g = aa;` kept aa's base compiled, but aa's base
+body calls bb - whose base was excluded as dead - and the indirect
+g() call reached a chunk-less bb one hop in: the post-teardown
+ML_CHECK abort in a script (or, under ASSERTS=0, a tree-walk of a
+freed AST). The -rt harness RETAINS its AST, so no `tests` entry can
+see this - the net is tests/functional/dyn_template_base.my
+(corpus_diff spawns the real binary, teardown included; the sabotage
+run showed 14/15 with the abort named). The fix is a fixpoint in the
+finalize pass: seed the kept set with the value-used bases, then any
+IDENTIFIER naming a template inside a kept base's body (call or value
+use; nested lambdas descended - the whole subtree runs with the base)
+keeps that template too. Over-keeping (a body-local shadowing a
+template's name) costs a compiled chunk, never correctness.

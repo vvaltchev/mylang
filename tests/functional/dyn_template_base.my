@@ -1,0 +1,17 @@
+# #149: a dyn-laundered TEMPLATE BASE must stay runnable in SCRIPT mode
+# (after the AST teardown), including every base its body TRANSITIVELY
+# names - `g = aa` keeps aa's base, and aa's base body calls bb, whose
+# base was wrongly excluded from codegen before the reachability
+# closure (the call then aborted on the post-teardown ML_CHECK, or
+# under ASSERTS=0 walked a freed AST). The -rt harness RETAINS its AST,
+# so only a real script run can see this - hence a functional test.
+func aa(n) { if (n < 1) { return 0; } return bb(n - 1) + 1; }
+func bb(n) { if (n < 1) { return 0; } return aa(n - 1) + 1; }
+var dyn g = aa;
+print(g(runtime(2)));
+print(g(runtime(7)));
+# the lambda twin (#150's shape, semantics half): a template instance
+# whose registered single-return body a tail splice de-expressified
+var dyn h = func(k) { return aa(k); };
+print(h(runtime(3)));
+print(aa(4));
