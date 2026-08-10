@@ -1308,12 +1308,30 @@ epilogue re-derivation (ASan SEGV - clobbered r10 as a data pointer).
 Measured (callgrind Ir, OPT=1 ASSERTS=0, scale-delta):
 46_matrix_mult **-12.0%**/iter (~89.5 -> ~78.7), 14_array_subscript
 **-15.9%**/iter; everything else within +-0.01% incl. 15 (a runtime
-slice base - the cold twin serves it at no cost). 43/56_sieve pick but
-do not move - their hot loops are STORE-dominated and the store tiers
-do not consult the hoisted registers yet: **C1b** (the store-side
-hoist: entry guards grow const/ro/has_slices, a pinned shobj for the
-hash byte) is the scoped next increment; C2 (widen the register cache)
-and C3 (typed slots / ref_slots narrowing) follow per the plan.
+slice base - the cold twin serves it at no cost).
+**C1b - the STORE side (same day).** A region that STORES to its base
+(`HoistRegion::has_store`) gets three more preheader guards - const
+slot, readonly, has_slices, all region-stable - and a ONE-SHOT hash
+invalidation there (hash_valid=0 early only means "recompute later",
+so the per-element store needs neither the shobj nor a third
+register): the element is bounds + raw write. The store guards are
+emitted ONLY for storing regions - unconditionally they would send a
+read-only loop over a CONST base cold, losing the read hoisting. Plus
+MULTI-REGION (greedy innermost-first, non-overlapping, r10/r11 reused
+across disjoint regions - a one-region pick served only 43's tiny fill
+loop). Measured: 14_array_subscript a further **-29.0%**/iter
+(cumulative -40% across C1+C1b); 46/15/18/01 neutral. 43/56_sieve
+STILL do not move and the mechanism is live-counter-proven (the
+ordinary #92 tier serves their 3.1M stores; g_jit_hoist 0): their
+arrays are BOOLS and the pick stamps StoreElemInt candidates kind
+INTS - the Instr does not carry the element kind. **C1c** (the bools
+kind: a second hot copy, or - cleaner - a compile-time kind stamp on
+the store/load ops) and the hoisted-COMPOUND store form are the
+scoped follow-ups; C2/C3 per the plan. The C1b sabotages each
+required defeating a fresh shape-eater first: a bare `runtime()`
+argument is DYN, which lowers `arr[j] = n` to StoreElemValue - no
+candidate, a vacuous case - `int(runtime(5))` keeps the store
+StoreElemInt.
 
 **N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to `MAX_CACHED` hot
 int-scalar slots are pinned in `r12`-`r15` per fragment
