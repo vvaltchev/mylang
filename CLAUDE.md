@@ -1208,6 +1208,34 @@ helper calls AROUND hot int locals - precisely the spill this deletes.
 The `>= 3`-uses heuristic still limits how much of the pool gets used; a
 LIVE-RANGE allocator is the next step and is what the wider pool is for.
 
+**C2a - THE FLOAT REGISTER CACHE (2026-08-04, xmm4-7;
+plans/typed-invariant-arrays.md).** The N5 pool's float half: hot
+float LOCALS pin in xmm4-7 (xmm0/1 stay scratch) - parallel accounting
+in `pick_cached_slots` (usef/badi/badf; the pools are DISJOINT: an int
+use disqualifies the float side and vice versa), entry loads at the
+head + every entry stub, flush (r8 type + movsd payload) / reload /
+barrier-bracket extended, and - xmm being ALL caller-saved - a
+payload-only spill to the slot around EVERY helper call via the shared
+emit_call_prologue/epilogue (sound: a pinned slot is never memory-read
+by any op in the run; a real exit flushes type+payload properly).
+THE QUALIFICATION RULE: only a slot some float op WROTE in the run
+(`fdst`) - a float op can READ a definitely-int slot via the promote
+arm, and pinning one would movsd int bits as a double. ReturnV does
+not disqualify (the emit flushes before jit_ret); MoveV's SOURCE is
+float-aware at ZERO weight (04's accumulator was killed by its final
+str(x,4) arg-staging move - the int pool's four-accumulator lesson
+replayed); MathFnV joined the classifier (previously UNLISTED - one
+math builtin disabled pinning for its whole run). SHIPPED BUG caught
+by -rt: `e.fcache` was not cleared per RUN - jit-ineligible selectors
+(floor/abs) split a body into fragments and fragment 2's epilogue
+flushed fragment 1's never-loaded pin into the slot. Pinned by the
+run-split test; 4 sabotages watched failing (no per-run clear, no
+spill, no flush - a suite abort - wrong-register read).
+Execution-proven by `g_jit_fcache` (emitted inc per float-pinned
+fragment entry). Measured (callgrind Ir/scale, OPT=1 ASSERTS=0):
+04_float_arith **-28.0%**, 54_mandelbrot **-22.5%**, 55_float_sum
+**-19.5%**, 40_math_builtins -2.6%; 44/46/43/01/09/34/35 byte-flat.
+
 **`MoveV` IS CACHE-AWARE ON ITS SOURCE SIDE (2026-08-01,
 plans/jit-registers.md step 2b).** The register pool went four wide and
 still would not FILL, and the reason was not the ranking: an op whose emit

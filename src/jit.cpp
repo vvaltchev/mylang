@@ -51,6 +51,7 @@ unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
 unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
+unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
@@ -496,6 +497,21 @@ struct Emitter {
      * push/pop around every call. */
     struct CacheEnt { int slot; int32_t payload, type; uint8_t reg; };
     std::vector<CacheEnt> cache;
+    /* C2a: the FLOAT half of the pool - hot float slots pinned in
+     * xmm4-xmm7 (xmm0/1 stay the per-op scratch). xmm registers are ALL
+     * caller-saved, so unlike the GP pins these are spilled to their
+     * slot's payload around every helper call (emit_call_prologue) and
+     * reloaded after (emit_call_epilogue) - the pre-step-2a discipline,
+     * acceptable because the float-loop shapes that matter make few or
+     * no helper calls. reg = the xmm index. */
+    std::vector<CacheEnt> fcache;
+    int fcreg(int slot) const
+    {
+        for (const CacheEnt &c : fcache)
+            if (c.slot == slot)
+                return c.reg;
+        return -1;
+    }
 
     /* N6a: a CALL-site relocation. A libm call reserves a fixed 12-byte
      * slot (offset `off` in `b`) + records the target; after the buffer is
@@ -557,6 +573,14 @@ struct Emitter {
             store(6 /*rsi = t_int*/, c.type);
             store(c.reg, c.payload);
         }
+        /* the float pins: t_float rides in r8, which is live in any
+         * fragment that HAS float pins (they only arise from float ops,
+         * so run_has_float set it at entry and every helper-call
+         * epilogue re-materialises it) */
+        for (const CacheEnt &c : fcache) {
+            store(8 /*r8 = t_float*/, c.type);
+            fstore(c.reg, c.payload);
+        }
     }
     /* The inverse: re-load every pinned slot's payload from memory. Used with
      * flush_cache to BRACKET an op that reads or writes frame slots the emitter
@@ -572,6 +596,8 @@ struct Emitter {
     {
         for (const CacheEnt &c : cache)
             load(c.reg, c.payload);
+        for (const CacheEnt &c : fcache)
+            fload(c.reg, c.payload);
     }
     /* movabs <reg64>, imm64 */
     void movabs(uint8_t reg, uint64_t imm)
@@ -636,7 +662,8 @@ struct Emitter {
     {
         u8(0xB8); u32(pc);                                /* mov eax, pc */
         u8(0xE9);
-        (cache.empty() ? epi_bare : epi_flush).push_back(pos());
+        (cache.empty() && fcache.empty() ? epi_bare : epi_flush)
+            .push_back(pos());
         u32(0);                                           /* jmp rel32 */
     }
 
@@ -676,6 +703,10 @@ struct Emitter {
     }
     /* addsd/subsd/mulsd xmm0, xmm1 (op = 0x58/0x5C/0x59) */
     void farith(uint8_t op) { u8(0xF2); u8(0x0F); u8(op); u8(0xC1); }
+    /* movsd xmm<dst>, xmm<src> (reg-reg; both < 8, no REX needed) */
+    void fmov_rr(uint8_t dst, uint8_t src)
+    { u8(0xF2); u8(0x0F); u8(0x10);
+      u8(static_cast<uint8_t>(0xC0 | (dst << 3) | src)); }
     /* sqrtsd xmm<d>, xmm<s>  (SSE2) */
     void sqrtsd(uint8_t d, uint8_t s)
     { u8(0xF2); u8(0x0F); u8(0x51);
@@ -1771,9 +1802,17 @@ static void jit_put_bool(LValue *lv, int_type v) noexcept
  * construction rather than by remembering to bracket each call. */
 static void emit_call_prologue(Emitter &e)
 {
-    /* NOTHING. Both things this used to do are gone: the slots base is in
-     * callee-saved rbx and the N5 cache registers are callee-saved too, so
-     * a helper call preserves all of them, and rsp is already call-ready
+    /* C2a: the FLOAT pins are in xmm registers, which are ALL
+     * caller-saved - spill each to its slot's PAYLOAD before the call
+     * (the type word stays stale in memory, which is fine: a pinned
+     * slot is never memory-read by any op in the run - the same bad()
+     * rules as the GP pool - and an exceptional exit reloads in the
+     * epilogue and then flushes type+payload properly). */
+    for (const Emitter::CacheEnt &c : e.fcache)
+        e.fstore(c.reg, c.payload);
+    /* Otherwise NOTHING. Both things this used to do are gone: the slots base
+     * is in callee-saved rbx and the N5 cache registers are callee-saved too,
+     * so a helper call preserves all of them, and rsp is already call-ready
      * (frag_entry made the body rsp % 16 == 0). Kept as a named no-op
      * because it MARKS the call sites - a future pin in a caller-saved
      * register would spill here, and the epilogue below is still real.
@@ -1809,9 +1848,13 @@ static JitHoist g_hoist;
 
 static void emit_call_epilogue(Emitter &e)
 {
-    /* Only the two type singletons need restoring - they are compile-time
-     * constants held in CALLER-saved rsi/r8, so re-materialising is
-     * cheaper than a register pair the allocator could otherwise use. */
+    /* C2a: reload the caller-saved float pins the callee clobbered
+     * (spilled to their slot payloads by emit_call_prologue). */
+    for (const Emitter::CacheEnt &c : e.fcache)
+        e.fload(c.reg, c.payload);
+    /* The two type singletons - compile-time constants held in
+     * CALLER-saved rsi/r8, so re-materialising is cheaper than a
+     * register pair the allocator could otherwise use. */
     e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
     e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
     if (g_hoist.active) {
@@ -3127,6 +3170,10 @@ void jit_cache_audit_report()
  * is what let it grow from two registers to four at the same time. */
 static const uint8_t CACHE_REGS[] = { 12, 13, 14, 15 };
 static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
+/* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
+static const uint8_t FCACHE_REGS[] = { 4, 5, 6, 7 };
+static const size_t MAX_FCACHED =
+    sizeof(FCACHE_REGS) / sizeof(FCACHE_REGS[0]);
 
 /* N5: pick up to MAX_CACHED hot INT-scalar slots to pin for a run.
  * A slot qualifies iff it is a RESOLVED LOCAL (< slot_count) and EVERY use
@@ -3170,7 +3217,8 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
 static std::vector<int>
 pick_cached_slots(const Chunk &ck, size_t begin,
                   size_t end, int slot_count,
-                  std::vector<char> *barrier = nullptr)
+                  std::vector<char> *barrier = nullptr,
+                  std::vector<int> *fhot = nullptr)
 {
     const std::vector<Instr> &code = ck.code;
     /* `barrier[pc-begin] = 1` marks an op that touches frame slots the emitter
@@ -3184,7 +3232,26 @@ pick_cached_slots(const Chunk &ck, size_t begin,
     };
     std::unordered_map<int, int> use;    /* slot -> int-scalar use count */
     std::unordered_set<int> disq;
-    const auto usei = [&](int s) { if (s >= 0) use[s]++; };
+    /* C2a: the FLOAT pool's parallel accounting. The two pools are
+     * DISJOINT by construction: an int use disqualifies the float side
+     * (an int-cache-aware read goes to memory, stale for a float pin)
+     * and a float use disqualifies the int side (the pre-C2a bad()).
+     * A slot QUALIFIES for the float pool only when some float op WROTE
+     * it in the run (`fdst`): a float op can legitimately READ a
+     * definitely-int slot through the promote arm, and pinning such a
+     * slot would movsd its int payload bits as a double. A float-WRITTEN
+     * slot is t_float from its first write, every other writer in the
+     * run is a float op (any non-float writer disqualified it), and the
+     * pre-first-write window holds either an earlier float value or the
+     * pre-decl none, whose garbage entry-load is dead by def-before-use
+     * - the exact soundness shape the int pool established. */
+    std::unordered_map<int, int> use_f;
+    std::unordered_set<int> disq_f, fdst;
+    const auto badf = [&](int s) { if (s >= 0) disq_f.insert(s); };
+    const auto usei = [&](int s) {
+        if (s >= 0) { use[s]++; disq_f.insert(s); }
+    };
+    const auto usef = [&](int s) { if (s >= 0) { use_f[s]++; } };
     /* CACHE AUDIT (env MYLANG_CACHEAUDIT=1): which opcode DISQUALIFIED a
      * slot that would otherwise have been pinned. This is the "what to make
      * cache-aware next" surface - a bad() site only matters in proportion
@@ -3196,6 +3263,20 @@ pick_cached_slots(const Chunk &ck, size_t begin,
     const bool audit = g_cache_audit;
     OpCode cur_op = OpCode::Halt;
     const auto bad  = [&](int s) {
+        if (s < 0)
+            return;
+        disq_f.insert(s);        /* memory-touched: no float pin either */
+        disq.insert(s);
+        if (audit)
+            killed_by[s].push_back(cur_op);
+    };
+    /* C2a: the INT-side-only disqualifier, for the FLOAT ops' slots -
+     * they leave the int pool (a float value can't live in a GP pin)
+     * but stay float candidates. Everything else keeps the both-pool
+     * bad() above, which is the safe default: a slot only escapes the
+     * float pool's disqualification where a case explicitly says its
+     * reads/writes go through the cache-aware float choke points. */
+    const auto badi = [&](int s) {
         if (s < 0)
             return;
         disq.insert(s);
@@ -3250,37 +3331,77 @@ pick_cached_slots(const Chunk &ck, size_t begin,
         case OpCode::ReturnV:
             /* the result value slot is read by the return. Counting it as an
              * int use is SAFE: a FLOAT result slot is always disqualified by
-             * the float op that produced it (bad()), and a slot reachable
+             * the float op that produced it (badi()), and a slot reachable
              * only via ReturnV is used once (< the 3-use cache threshold) - so
-             * no float slot is ever cached as an int here. */
-            usei(in.a_slot());
+             * no float slot is ever cached as an int here. C2a: it must NOT
+             * disqualify the FLOAT side (usei normally badf's) - the emit
+             * runs flush_cache BEFORE jit_ret, so a float-pinned result
+             * slot is current in memory when the helper reads it. */
+            if (in.a_slot() >= 0)
+                use[in.a_slot()]++;
             break;
-        /* float / array touches disqualify the slots (not int-scalar) */
+        /* float ops: no int-pin (bad), but C2a float-pool USES - the
+         * operand reads go through emit_float_load and the dst writes
+         * through emit_float_store, both cache-aware. Only the DST
+         * qualifies a slot (`fdst`); an operand may be a definitely-int
+         * slot served by the promote arm. FloatBin's div/mod arms are
+         * fine: the div0 raise exits through the flushing epilogue and
+         * the fmod libm call spills the pins via the shared prologue. */
         case OpCode::FloatBin:
         case OpCode::FloatAddRR: case OpCode::FloatSubRR:
         case OpCode::FloatMulRR: case OpCode::FloatAddRI:
         case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+            if (!in.a_is_lit()) { badi(in.a_slot()); usef(in.a_slot()); }
+            if (!in.b_is_lit()) { badi(in.b_slot()); usef(in.b_slot()); }
+            badi(in.target); usef(in.target); fdst.insert(in.target);
+            break;
         case OpCode::JumpUnlessFloatCmp:
-            bad(in.a_slot()); bad(in.b_slot()); bad(in.target);
+            if (!in.a_is_lit()) { badi(in.a_slot()); usef(in.a_slot()); }
+            if (!in.b_is_lit()) { badi(in.b_slot()); usef(in.b_slot()); }
             break;
         case OpCode::LoadImmFloat:
-            bad(in.target);
+            badi(in.target); usef(in.target); fdst.insert(in.target);
+            break;
+        case OpCode::MathFnV:
+            /* C2a: previously UNLISTED - one math builtin disabled
+             * pinning for its whole run. Arg(s) via emit_float_load,
+             * dst via emit_float_store (cache-aware); an MK_CALL
+             * selector's libm call spills the float pins via the shared
+             * prologue/epilogue. The int side stays memory (bad). */
+            if (!in.a_is_lit()) { badi(in.a_slot()); usef(in.a_slot()); }
+            if (!in.b_is_lit()) { badi(in.b_slot()); usef(in.b_slot()); }
+            badi(in.target); usef(in.target); fdst.insert(in.target);
             break;
         case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
         case OpCode::OrdCharV:      /* same shape: idx cache-aware (a VALUE
                                      * arg to jit_ord_char), base/dst leas */
             /* the INDEX is read cache-aware (load_index_r9), so it stays a
              * countable int use - it is the loop counter, the slot most worth
-             * pinning. dst/base are written/read in memory. */
-            bad(in.target2); bad(in.target);
+             * pinning. base is read in memory. LoadElemFloat's dst is
+             * written via emit_float_store -> a C2a float candidate; the
+             * int/ord dsts stay memory (the two-store / store_dst). */
+            bad(in.target2);
+            if (in.op == OpCode::LoadElemFloat) {
+                badi(in.target);
+                usef(in.target); fdst.insert(in.target);
+            } else {
+                bad(in.target);
+            }
             if (!in.a_is_lit()) usei(in.a_slot());
             break;
         case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
             /* BOTH indices are VALUE args to jit_load_elem2_* (read
              * cache-aware), so they stay countable int uses - in a matrix
              * loop they are the two loop counters, the slots most worth
-             * pinning. base/dst are leas -> memory. */
-            bad(in.target2); bad(in.target);
+             * pinning. base is a lea -> memory. The FLOAT dst is written
+             * via emit_float_store -> a C2a float candidate. */
+            bad(in.target2);
+            if (in.op == OpCode::LoadElem2Float) {
+                badi(in.target);
+                usef(in.target); fdst.insert(in.target);
+            } else {
+                bad(in.target);
+            }
             usei(in.a_dual_lo());
             if (!in.b_is_lit()) usei(in.b_slot());
             break;
@@ -3291,7 +3412,11 @@ pick_cached_slots(const Chunk &ck, size_t begin,
             break;
         case OpCode::StoreElemFloat:
             bad(in.target2);             /* base slot holds an array */
-            if (!in.b_is_lit()) bad(in.b_slot());    /* value is a FLOAT */
+            if (!in.b_is_lit()) {        /* value: a FLOAT, read via
+                                          * emit_float_load (cache-aware -
+                                          * a C2a float use, no fdst) */
+                badi(in.b_slot()); usef(in.b_slot());
+            }
             if (!in.a_is_lit()) usei(in.a_slot());   /* index (int) */
             break;
         case OpCode::DictStore:
@@ -3327,6 +3452,12 @@ pick_cached_slots(const Chunk &ck, size_t begin,
             bad(in.b_slot()); bad(in.target);
             break;
         case OpCode::MoveV:
+            /* C2a: the source side is float-cache-aware too (the emit
+             * reads the pin via emit_float_store), and like the int side
+             * it contributes NO WEIGHT - a boxed move must never be the
+             * evidence a slot holds a float. The DEST stays memory-only
+             * (a MoveV can write ANY type). */
+            badf(in.target);
             /* CACHE-AWARE ON THE SOURCE SIDE (see the emit). A pinned source
              * is a proven int, so the move is just the ordinary int store and
              * the register is read directly - which is why target2 is NOT
@@ -3604,11 +3735,11 @@ pick_cached_slots(const Chunk &ck, size_t begin,
              * Per the MakeClosureV can't-enumerate rule, cache nothing. */
             return {};
         case OpCode::CmpFloatV:
-            /* float operands + a bool dst - none is an int-cache candidate;
-             * all read/written from memory. */
-            if (!in.a_is_lit()) bad(in.a_slot());
-            if (!in.b_is_lit()) bad(in.b_slot());
-            bad(in.target);
+            /* float operands (cache-aware via emit_float_load - C2a
+             * float uses) + a BOOL dst written to memory (bad both). */
+            if (!in.a_is_lit()) { badi(in.a_slot()); usef(in.a_slot()); }
+            if (!in.b_is_lit()) { badi(in.b_slot()); usef(in.b_slot()); }
+            bad(in.target); badf(in.target);
             break;
         case OpCode::JumpIfNotNoneV:
             /* reads the lhs slot's type tag from memory (a boxed value). */
@@ -3698,6 +3829,26 @@ pick_cached_slots(const Chunk &ck, size_t begin,
     for (size_t i = 0; i < cand.size() && i < MAX_CACHED; i++)
         out.push_back(cand[i].second);
 
+    /* C2a: the float pool's picks - local, undisqualified, >= 3 uses,
+     * and WRITTEN by a float op in the run (see the soundness note at
+     * the accounting above). Temps are excluded for the pool's usual
+     * reason (scratch reused across run boundaries). */
+    if (fhot) {
+        std::vector<std::pair<int, int>> fc;
+        for (const auto &kv : use_f)
+            if (kv.first < slot_count && !disq_f.count(kv.first)
+                    && kv.second >= 3 && fdst.count(kv.first))
+                fc.push_back({ kv.second, kv.first });
+        std::sort(fc.begin(), fc.end(),
+                  [](const std::pair<int,int> &a,
+                     const std::pair<int,int> &b) {
+                      return a.first != b.first ? a.first > b.first
+                                                : a.second < b.second;
+                  });
+        for (size_t i = 0; i < fc.size() && i < MAX_FCACHED; i++)
+            fhot->push_back(fc[i].second);
+    }
+
     /* AUDIT: a slot LOST to disqualification is one that is a resolved
      * local and used often enough to have cleared the threshold - i.e. it
      * would have been a candidate, and only bad() stopped it. Attribute it
@@ -3766,6 +3917,13 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
         e.movq_xmm(xr);
         return;
     }
+    /* C2a: a float-PINNED slot reads register-to-register - no type
+     * dispatch (the pool qualifies only float-WRITTEN slots, proven
+     * t_float; see pick_cached_slots). */
+    if (const int fr = e.fcreg(slot); fr >= 0) {
+        e.fmov_rr(xr, static_cast<uint8_t>(fr));
+        return;
+    }
     const SlotAddr a = slot_addr(slot);
     e.load_type(a.type);                 /* rax = slot type */
     e.cmp_rax_r8();                       /* == t_float ? */
@@ -3791,6 +3949,14 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
                              int dst, uint32_t bail_pc)
 {
     (void)bail_pc;                        /* no bail: helper on the ref path */
+    /* C2a: a float-PINNED dst is a register write - no type store, no
+     * ref check (every writer of a pinned slot in the run is a float
+     * op, so it can never hold a reference; the epilogue flush restores
+     * type+payload to memory). */
+    if (const int fr = e.fcreg(dst); fr >= 0) {
+        e.fmov_rr(static_cast<uint8_t>(fr), xr);
+        return;
+    }
     const SlotAddr a = slot_addr(dst);
     if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                            static_cast<int32_t>(dst))) {
@@ -5815,6 +5981,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * on either side - the source cannot be a reference. */
         if (const int sreg = e.creg(in.target2); sreg >= 0) {
             store_dst(e, ck, static_cast<uint8_t>(sreg), in.target, pc);
+            return true;
+        }
+        /* C2a: the FLOAT twin - a float-PINNED source is a proven float
+         * (only genuine float ops qualify a pin; the MoveV itself adds
+         * no weight), so the move is the ordinary float store from the
+         * register (emit_float_store handles a ref-listed dst via
+         * jit_put_float, which wants the value in xmm0). Without this,
+         * an arg-staging `move rN = x` cost x its register for the
+         * whole fragment - 04_float_arith's accumulator never pinned
+         * because of its final str(x, 4). */
+        if (const int fr = e.fcreg(in.target2); fr >= 0) {
+            e.fmov_rr(X0, static_cast<uint8_t>(fr));
+            emit_float_store(e, ck, X0, in.target, pc);
             return true;
         }
         std::vector<size_t> jhelp;
@@ -8898,6 +9077,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
      * The whole body is one fragment at offset 0. */
     Emitter e;
     e.cache.clear();                       /* no N5 register cache in a container*/
+    e.fcache.clear();                      /* C2a: nor a float one */
     std::vector<NativeCode::OpMark> marks;  /* -vdj: op-boundary annotations */
     std::vector<size_t> label(n, 0);        /* fragment offset of each body pc */
     std::vector<Fixup> fixups;              /* fragment-local branch fixups */
@@ -9366,6 +9546,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * callee-saved registers this fragment takes over and therefore
          * what frag_entry must push (and what every exit must pop). */
         e.cache.clear();
+        e.fcache.clear();       /* C2a: per-RUN state like the GP pool - a
+                                 * stale entry from the previous fragment
+                                 * would flush a never-loaded xmm into the
+                                 * slot at this fragment's epilogue (caught
+                                 * as a wrong 40_math-shape sum: floor/abs
+                                 * split the run, and fragment 2 flushed
+                                 * fragment 1's pin) */
         e.saved.clear();
         std::vector<char> cache_barrier(end - begin, 0);
 
@@ -9384,9 +9571,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         g_hoist = JitHoist{};
         const std::vector<HoistRegion> hregs =
             jit_hoist_pick(chunk, begin, end, entries);
+        std::vector<int> fhot;                    /* C2a float picks */
         const std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
-                              &cache_barrier);
+                              &cache_barrier, &fhot);
         for (size_t h = 0; h < hot.size(); h++)
             e.saved.push_back(CACHE_REGS[h]);
 
@@ -9403,6 +9591,24 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.cache.push_back({ hot[h], a.payload, a.type, CACHE_REGS[h] });
             e.load(CACHE_REGS[h], a.payload);     /* entry load */
         }
+        /* C2a: the float pins - xmm needs no push (caller-saved; the
+         * C++ caller expects nothing preserved), only the entry loads.
+         * A non-empty fhot implies run_has_float (float pins only arise
+         * from float ops), so r8 = t_float is live for the flushes. */
+        for (size_t h = 0; h < fhot.size(); h++) {
+            const SlotAddr a = slot_addr(fhot[h]);
+            e.fcache.push_back({ fhot[h], a.payload, a.type,
+                                 FCACHE_REGS[h] });
+            e.fload(FCACHE_REGS[h], a.payload);   /* entry load */
+        }
+#ifdef TESTS
+        if (!fhot.empty()) {
+            /* the execution proof: bumped per ENTRY of a float-pinned
+             * fragment (the g_jit_hoist pattern) */
+            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fcache));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+        }
+#endif
 
 
         std::vector<size_t> label(end - begin, 0);
@@ -9475,7 +9681,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
              * spill-around-a-call). Never a branch op, so the reload always
              * executes. */
             const bool brk = cache_barrier[pc - begin] && !e.cache.empty();
-            std::vector<Emitter::CacheEnt> saved_cache;
+            std::vector<Emitter::CacheEnt> saved_cache, saved_fcache;
             if (brk) {
                 e.flush_cache();
                 /* EMPTY the cache across the op's emission: a barrier'd op
@@ -9489,6 +9695,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                  * read falls back to (current) memory. */
                 saved_cache = std::move(e.cache);
                 e.cache.clear();
+                saved_fcache = std::move(e.fcache);
+                e.fcache.clear();
             }
             if (op_is_branch(in.op)) {
                 /* targets get entry_remap (an external exit is a RESUME -
@@ -9502,6 +9710,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             }
             if (brk) {
                 e.cache = std::move(saved_cache);
+                e.fcache = std::move(saved_fcache);
                 e.reload_cache();
             }
         };
@@ -9645,6 +9854,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
             for (size_t h = 0; h < hot.size(); h++)
                 e.load(CACHE_REGS[h], e.cache[h].payload);
+            for (const Emitter::CacheEnt &c : e.fcache)
+                e.fload(c.reg, c.payload);        /* C2a float pins */
 #ifdef TESTS
             e.movabs(RCX,
                      reinterpret_cast<uint64_t>(&g_jit_entry_resume));

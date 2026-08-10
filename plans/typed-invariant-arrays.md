@@ -211,14 +211,50 @@ The C1 family is COMPLETE. Next: C2/C3 below.
 
 ### C2 - widen the register cache beyond int slots
 
-`pick_cached_slots` pins only int SCALAR locals today. Extend the pool
-model to (a) float slots (xmm registers are all caller-saved, so this
-interacts with helper calls - may need the C1 spill discipline), and
-(b) the C1-hoisted pointers as first-class pool citizens with the same
-`bad()` disqualification rules. This is the allocator groundwork the
-register plan (plans/jit-registers.md) names as next; A's forwarding
-machinery feeds it (a forwarded value is a register-resident value with
-a one-op lifetime - the allocator generalizes the lifetime).
+**C2a (the FLOAT half) LANDED 2026-08-04.** Hot float locals pin in
+xmm4-7 (xmm0/1 stay the per-op scratch): a parallel accounting in
+pick_cached_slots (usef/badi/badf), entry loads at the head and every
+entry stub, the flush/reload/barrier machinery extended, and - since
+xmm are ALL caller-saved - a spill to the slot's payload around every
+helper call via the shared emit_call_prologue/epilogue (the C1 spill
+discipline; sound because a pinned slot is never memory-read by any op
+in the run, so the payload-only spill has no reader until the proper
+type+payload flush at a real exit).
+
+THE SOUNDNESS RULE that shaped it: a slot qualifies only when a float
+op WROTE it in the run (`fdst`) - a float op can legitimately READ a
+definitely-int slot through the promote arm, and pinning such a slot
+would movsd its int payload bits as a double. A float-written slot is
+t_float from its first write, every other writer is a float op (any
+non-float writer disqualified it), and the pre-first-write window's
+garbage entry-load is dead by def-before-use - the int pool's exact
+argument. ReturnV does NOT disqualify (the emit flushes before
+jit_ret); MoveV's SOURCE is float-cache-aware with ZERO weight (the
+int pool's four-accumulator lesson replayed: 04_float_arith's
+accumulator never pinned because its final str(x, 4) staged an arg
+move). MathFnV joined the classifier - previously UNLISTED, one math
+builtin disabled pinning for its whole run.
+
+SHIPPED BUG, caught by -rt: e.fcache was not cleared per RUN, so when
+jit-ineligible selectors (floor/abs) split a body into several
+fragments, fragment 2's epilogue flushed fragment 1's never-loaded
+pin into the slot (a wrong 40_math-shape sum from iteration 3). The
+per-run clear mirrors e.cache's; the run-split shape is a pinned test
+and the missing clear a watched-failing sabotage (with three more:
+no prologue spill, no exit flush - aborts the suite - and a
+wrong-register pinned read).
+
+MEASURED (callgrind Ir/scale, OPT=1 ASSERTS=0): 04_float_arith
+**-28.0%**, 54_mandelbrot **-22.5%**, 55_float_sum **-19.5%**,
+40_math_builtins -2.6%; 44/46/43/01/09/34/35 byte-flat per scale.
+
+**C2b (the hoisted pointers as pool citizens) remains**: r10/r11 are
+fixed caller-saved today; making the C1-hoisted (data, count) pairs
+allocable would let a 2-base region (a dot product's two arrays) hoist
+both. Needs per-citizen kinds in the pool (a derived pin must not
+flush). A's forwarding machinery still feeds the eventual allocator
+(a forwarded value is a register-resident value with a one-op
+lifetime - the allocator generalizes the lifetime).
 
 ### C3 - typed frame slots for proven scalars
 
