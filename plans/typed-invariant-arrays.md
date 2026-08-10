@@ -283,6 +283,34 @@ lifetime - the allocator generalizes the lifetime).
 
 ### C3 - typed frame slots for proven scalars
 
+**INCREMENT 1 (the ref_slots narrowing) LANDED 2026-08-04.** The
+return-path lever from plans/cpp-gap-extremes.md: `ParamDesc::
+proven_type` (i/f), stamped by the ONE-SHOT inferencer for an
+un-annotated param that can only receive that scalar - concrete,
+non-opt, non-dyn, on a non-template, never-value-used function in the
+global scope - and consumed by codegen's ref_slots param join. The
+enumeration of bind paths (the #96 discipline): direct calls are
+compile-checked; indirect/dyn/callback/builtin paths all require a
+VALUE use, which the gate excludes; `$` is not an identifier char and
+the reflection builtins return names, so instances leak no other way.
+FOUND + FIXED: the value-template redirect never marked the clone's
+sym value_used - a value-instantiated instance (`ops[k]`) would have
+stamped despite being dyn-launderable; the ops-array gate test pins
+zero exclusions. The audit net is the EXISTING pop_window
+every-slot-trivial re-scan (VM_HARDENING; on in every CI release
+lane) - the force-stamp sabotage aborts -rt. Engagement proven by
+g_ref_slots_proven_excluded (TESTS). myv v11 (the ParamDesc byte).
+MEASURED (Ir/scale, OPT=1 ASSERTS=0): 10_recursion_deep **-7.1%**,
+63_closures -0.7%; 11 flat (LAMBDAS are not covered - their descs are
+not global-scope syms; a scoped follow-up), 76 flat BY DESIGN (its
+funcs are value-dispatched - the gate refusing is the soundness
+working), 08/09/46/01 byte-flat.
+
+REMAINING C3 increments: the JIT type-word store elision for proven
+slots (skip half of every scalar two-store where the slot provably
+holds one kind - needs the same proof extended to LOCALS), and the
+lambda-param coverage above.
+
 Narrow what a slot write must do when inference proved the slot's type:
 the type-word store (half of every scalar two-store) disappears for
 slots that can never hold anything else, and `ref_slots` narrows to

@@ -158,6 +158,7 @@ public:
 
     explicit Inferencer(Construct *root = nullptr) : root(root) { }
     void run();
+    void stamp_proven_params();     /* C3: see the definition */
     void setup();                  /* once: bottom + global scope */
     void infer_input(Block *root); /* REPL: one input, commit+pin its globals */
     void undef_global(const UniqueId *name);  /* REPL undef(x) */
@@ -1108,10 +1109,16 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
         }
 
         /* 5) Redirect EVERY value use IN PLACE (uid + sym rebind - the
-         * Identifier node keeps its loc, so carets are unchanged). */
+         * Identifier node keeps its loc, so carets are unchanged). Each
+         * redirected use IS a value use of the CLONE (that is the
+         * feature's name), so mark its sym: the instance's FuncObject
+         * is reachable as a value (`ops[0]`), dyn-launderable, and
+         * therefore callable with unchecked args - C3's proven-param
+         * stamp must never fire on it. */
         for (const Use &u : kv.second) {
             u.id->uid = clone_name;
             id_sym[u.id] = clone_sym;
+            clone_sym->value_used = true;
             if (u.in_func)
                 clone_sym->func->has_func_consumer = true;
         }
@@ -1362,6 +1369,48 @@ void Inferencer::run()
 
     setup();
     infer_one(rootBlock);
+    stamp_proven_params();
+}
+
+/*
+ * C3: stamp ParamDesc::proven_type for params that can ONLY ever
+ * receive one scalar kind - see the field's comment in funcdesc.h for
+ * the full soundness gate. ONE-SHOT only (run(); ReplInfer never calls
+ * this): the REPL's open-world redefinition + input-local value rules
+ * make the never-value-used proof weaker there, and the win is a
+ * script-runtime one. Global-scope functions only (a nested scoped
+ * func is rare and conservatively skipped). specializations()/globals()
+ * return NAMES, and `$` is not an identifier character, so an instance
+ * FuncObject is unreachable as a value except through the value uses
+ * this gate excludes.
+ */
+void Inferencer::stamp_proven_params()
+{
+    for (const auto &kv : global->syms) {
+        const TypeSym *s = kv.second;
+        if (!s->func || s->value_used)
+            continue;
+        FuncInfo *fi = s->func;
+        if (fi->is_template || fi->value_escaped || !fi->decl
+                || !fi->decl->desc)
+            continue;
+        FuncDescriptor *d =
+            const_cast<FuncDescriptor *>(fi->decl->desc);
+        const size_t n = std::min(fi->params.size(), d->params.size());
+        for (size_t i = 0; i < n; i++) {
+            const TypeSym *p = fi->params[i];
+            if (!p || p->dyn_decl || p->opt_decl
+                    || p->ann != DeclType::none || !p->type)
+                continue;
+            const StaticType *t = static_type_resolve(p->type);
+            if (!t || t->opt)
+                continue;
+            if (t->kind == StaticTypeKind::Int)
+                d->params[i].proven_type = DeclType::i;
+            else if (t->kind == StaticTypeKind::Float)
+                d->params[i].proven_type = DeclType::f;
+        }
+    }
 }
 
 /*
