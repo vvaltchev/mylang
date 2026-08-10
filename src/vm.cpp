@@ -1662,6 +1662,21 @@ struct VmCallRec {
      * record-less frames. Written UNCONDITIONALLY by the emitted push
      * (the step-4 walk needs it in every build); null on C++ pushes. */
     const void *native_rbp = nullptr;
+
+    /* G1 step 4-v (plans/g1-no-record-tier.md 4c): the PARENT frame's
+     * view - window/nslots/seg of the frame this record's pop returns
+     * to, captured AT PUSH TIME (the view frame + cur_seg, which still
+     * describe the caller there). These replace every "the record below
+     * is my parent" read - pop_window's vframe repoint and the C4c
+     * inline arm's parent-window loads: with record-less frames
+     * interleaved, records[rec_n-2] can be an ANCESTOR, but the
+     * push-time capture is always the true parent. Byte-identical in
+     * the all-record world (records[rec_n-2] IS the parent there -
+     * pinned per push by jit_norec_push_verify). Filled by push_window
+     * (every C++ push) and the emitted M5b inline push. */
+    LValue *parent_window = nullptr;
+    int32_t parent_nslots = 0;
+    int32_t parent_seg = -1;
 };
 
 /*
@@ -1772,6 +1787,16 @@ struct VmActivation {
         if (used + n > cap)
             throw StackOverflowEx();
 
+        /* 4-v: capture the PARENT view BEFORE the segment logic below can
+         * advance cur_seg - the view frame + cur_seg still describe the
+         * caller here (a record-less caller included: the vframe is
+         * repointed by every push/pop, so it is correct even when the
+         * caller has no record of its own). Stored into the record after
+         * it is (re)acquired. */
+        LValue *const par_win = view_frame.slots;
+        const int32_t par_nslots = static_cast<int32_t>(view_frame.size);
+        const int32_t par_seg = static_cast<int32_t>(cur_seg);
+
         VmStackSeg *sg = cur_seg >= 0 ? segs[cur_seg].get() : nullptr;
         /* the emitted push's fit test compares against cap_slots instead of
          * re-deriving the vector's extent - keep the two provably equal */
@@ -1807,6 +1832,9 @@ struct VmActivation {
         rec.nslots = n;
         rec.seg = cur_seg;
         rec.seg_top_before = sg->top;
+        rec.parent_window = par_win;          /* 4-v: the parent view */
+        rec.parent_nslots = par_nslots;
+        rec.parent_seg = par_seg;
         rec.boundary = boundary;
         rec.pushed_with_residue = 0;   /* a C++ push has no residue - and
                                         * a REUSED record must not keep a
@@ -1954,14 +1982,18 @@ struct VmActivation {
         rec.cache_key.reset();
         rec_n--;
 
-        /* `cur_seg` is set from the NEW top below; only an empty stack keeps
-         * the dead frame's segment (the old unconditional write was dead
-         * whenever a caller remained - i.e. on every hot return). */
+        /* `cur_seg` is set from the popped record's PARENT VIEW (4-v) -
+         * captured at push time, so it names the true parent even when
+         * record-less frames interleave (records[rec_n-1] can then be an
+         * ANCESTOR). In the all-record world the two are identical
+         * (records[rec_n-1] IS the parent - pinned per push by
+         * jit_norec_push_verify); only an empty stack keeps the dead
+         * frame's segment. */
         if (rec_n) {
-            const VmCallRec &tp = records[rec_n - 1];
             top_rec = &records[rec_n - 1];
-            view_frame.point_at(tp.window, static_cast<int>(tp.nslots));
-            cur_seg = tp.seg;
+            view_frame.point_at(rec.parent_window,
+                                static_cast<int>(rec.parent_nslots));
+            cur_seg = rec.parent_seg;
         } else {
             top_rec = nullptr;
             cur_seg = rec.seg;
@@ -7846,6 +7878,12 @@ void jit_fill_push_layout(JitPushLayout *L)
         reinterpret_cast<const char *>(&r.native_rbp) - rb;
     L->rec_residue =
         reinterpret_cast<const char *>(&r.pushed_with_residue) - rb;
+    L->rec_parent_window =
+        reinterpret_cast<const char *>(&r.parent_window) - rb;
+    L->rec_parent_nslots =
+        reinterpret_cast<const char *>(&r.parent_nslots) - rb;
+    L->rec_parent_seg =
+        reinterpret_cast<const char *>(&r.parent_seg) - rb;
     static FuncDescriptor fd;         /* static: fo.func may outlive scope */
     const char *db = reinterpret_cast<const char *>(&fd);
     L->desc_params = reinterpret_cast<const char *>(&fd.params) - db;
@@ -8341,6 +8379,32 @@ extern "C" void jit_norec_push_verify(const void *site,
      * SAME function step 4's emitted gate will consult, so the reach
      * numbers and the tier cannot drift (4-i's unification).
      */
+    /* 4-v: the PARENT-VIEW capture must equal the record below - the
+     * all-record-world identity that let every consumer (pop_window's
+     * vframe repoint, the C4c arm's parent reads) switch from
+     * "records[rec_n-2]" to the captured fields with zero behavior
+     * change. Once records stop being written the two legitimately
+     * diverge (the record below becomes an ancestor) - this pin then
+     * moves behind the record-ful case. */
+    if (act->rec_n >= 2) {
+        const VmCallRec &rec = act->back_rec();
+        const VmCallRec &par = act->records[act->rec_n - 2];
+        if (rec.parent_window != par.window)
+            norec_fail("parent_window != the record below's",
+                       rec.parent_window, par.window);
+        if (static_cast<int_type>(rec.parent_nslots) != par.nslots)
+            norec_fail("parent_nslots != the record below's",
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(rec.parent_nslots)),
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(par.nslots)));
+        if (rec.parent_seg != par.seg)
+            norec_fail("parent_seg != the record below's",
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(rec.parent_seg)),
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(par.seg)));
+    }
     {
         const VmCallRec &rec = act->back_rec();
         const Chunk *cck = rec.run_chunk;

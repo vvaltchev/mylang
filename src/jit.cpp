@@ -3057,6 +3057,17 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     st(R10, static_cast<int32_t>(P.rec_seg_top_before), R11);
     ld32(RAX, R8R, static_cast<int32_t>(P.act_cur_seg));
     st32(R10, static_cast<int32_t>(P.rec_seg), RAX);
+    /* 4-v: the PARENT view, captured at push time (the pop's vframe
+     * repoint + the C4c arm's parent-window reads use these instead of
+     * "the record below" - see VmCallRec::parent_window). rbx IS the
+     * caller's window; rax still holds cur_seg, which doubles as the
+     * parent's seg (an inline push never advances the segment); the
+     * caller's size from the live vframe, not yet repointed (uniform
+     * for function and MAIN callers). */
+    st32(R10, static_cast<int32_t>(P.rec_parent_seg), RAX);
+    st(R10, static_cast<int32_t>(P.rec_parent_window), RBX);
+    ld32(RAX, R8R, static_cast<int32_t>(P.act_vframe + P.frame_size));
+    st32(R10, static_cast<int32_t>(P.rec_parent_nslots), RAX);
     st(R10, static_cast<int32_t>(P.rec_run_chunk), RCX);
     e.movabs(RAX, reinterpret_cast<uint64_t>(P.stop_chunk));
     st(R10, static_cast<int32_t>(P.rec_ret_chunk), RAX);
@@ -3931,10 +3942,14 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         ld(RDX, R10, static_cast<int32_t>(P.rec_dst));
         e.u8(0x48); e.u8(0x85); e.u8(0xD2);        /* test rdx, rdx */
         const size_t j_nowrite = e.j32(0x78);      /* js no_write */
-        /* rcx = &parent_win[dst]; parent rec = top_rec - rec_size */
+        /* rcx = &parent_win[dst] - from OUR record's parent_window (4-v:
+         * captured at push; "top_rec - rec_size" is an ANCESTOR when
+         * record-less frames interleave, and this arm also serves
+         * EnterNative-re-entered fragments whose [rbp-8] is not the
+         * chain, so the field is the one source right in every case) */
         e.u8(0x48); e.u8(0x69); e.u8(0xC2);        /* imul rax, rdx, 48 */
         e.u32(static_cast<uint32_t>(sizeof(LValue)));
-        ld(RCX, R10, static_cast<int32_t>(P.rec_window) - L.rec_size);
+        ld(RCX, R10, static_cast<int32_t>(P.rec_parent_window));
         e.u8(0x48); e.u8(0x01); e.u8(0xC1);        /* add rcx, rax */
         /* the old dst value must be TRIVIAL (else: C++ release -> slow) */
         ld(RAX, RCX, static_cast<int32_t>(L.off_type));
@@ -4016,14 +4031,18 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                                                    /* sub [act+used], rdx */
         e.u8(0x49); e.u8(0xFF); e.u8(0x88);        /* dec qword [r8+rec_n] */
         e.u32(static_cast<uint32_t>(L.act_rec_n));
-        /* r11 = the parent record; top_rec/view/cur_seg from it */
+        /* top_rec steps to the record below; the view/cur_seg come from
+         * OUR record's PARENT fields (4-v: the record below can be an
+         * ANCESTOR once record-less frames interleave - the push-time
+         * capture is always the true parent, and in the all-record world
+         * the two are byte-identical, pinned per push by push_verify) */
         modrm(0x8D, R11, R10, -L.rec_size, true);  /* lea r11,[r10-RECSZ] */
         st(R8R, static_cast<int32_t>(P.act_top_rec), R11);
-        ld(RAX, R11, static_cast<int32_t>(P.rec_window));
+        ld(RAX, R10, static_cast<int32_t>(P.rec_parent_window));
         st(R8R, static_cast<int32_t>(P.act_vframe + P.frame_slots), RAX);
-        ld32(RAX, R11, static_cast<int32_t>(P.rec_nslots));
+        ld32(RAX, R10, static_cast<int32_t>(P.rec_parent_nslots));
         st32(R8R, static_cast<int32_t>(P.act_vframe + P.frame_size), RAX);
-        ld32(RAX, R11, static_cast<int32_t>(P.rec_seg));
+        ld32(RAX, R10, static_cast<int32_t>(P.rec_parent_seg));
         st32(R8R, static_cast<int32_t>(P.act_cur_seg), RAX);
 #ifdef TESTS
         e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_ret_inline));
