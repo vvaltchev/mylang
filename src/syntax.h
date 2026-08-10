@@ -1548,6 +1548,11 @@ public:
     /* Lever 4b: `what` is statically a non-opt STRING - gates the fused
      * ord(s[i]) lowering (OrdCharV: the byte read, no 1-char SharedStr). */
     bool base_str = false;
+    /* C1c: the base is statically array<bool> (non-opt elem). Feeds the
+     * ELEM-BOOL hint (Instr::opflags bit 6) on StoreElemInt/LoadElemInt,
+     * so the JIT's hoist pick guards the bools kind - ADVISORY (a wrong
+     * hint fails a runtime guard and the loop runs its cold twin). */
+    bool elem_bool = false;
 
     Subscript() : Construct("Subscript", false, ConstructType::subscript) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1563,6 +1568,7 @@ public:
         c->base_array = base_array;
         c->base_str = base_str;
         c->base_dict = base_dict;
+        c->elem_bool = elem_bool;
         return c;
     }
 };
