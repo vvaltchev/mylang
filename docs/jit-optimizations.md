@@ -3220,3 +3220,99 @@ runs forced (the arm works without the oracle); non-JIT probe. The C4c
 coverage test now counts g_jit_ret_inline + g_jit_norec_ret_arm - the
 property is "served inline, not by the jit_ret helper", which either
 arm satisfies.
+
+## G1 no-record tier STEP 4-iv (2026-08-11): the -3/SWITCH materializer
+## - and the LOST-CONTINUATION BUG it unearthed (#148)
+
+The step's plan (design doc 4d) was to build the mechanism that keeps
+record-less frames resumable across a depth-cap SWITCH. Preparing its
+test exposed that the -3 protocol was ALREADY broken for record-FUL
+frames, from the day it shipped: after a switch, the -3 propagation
+unwinds every native/C++ frame of the sync chain, but each frame's
+record still carries the SENTINEL resume (sync_stop, ret = the stop
+chunk) - meaningful only while its C/native consumer waits. When the
+flat continuation's first pop past the switching caller read one, it
+dispatched the stop chunk's ExitBlock, vm_dispatch RETURNED, and the
+whole rest of the program was silently ABANDONED with exit 0:
+`print(111); var r = aa(runtime(50)); print(222);` printed only 111 on
+any build whose cap is below the depth (the ASan lanes run cap 32).
+Verified BORN BROKEN at the protocol's introducing commit (f080b99).
+
+**Why every net missed it**: the coverage test's asserts sat AFTER the
+deep call, and a skipped assert reads as a pass - the test was VACUOUS
+from birth (only its g_jit_sync_switch growth check ever bit). The
+THROW half survived by luck: a raise walks the records downward in one
+C++ sweep to the handler, needing no per-frame native resume. The test
+now CAPTURES STDOUT and compares - a print cannot be skipped invisibly.
+
+**The fix IS the materializer, applied one class earlier than planned**:
+at the switch, every doomed sentinel record is RETARGETED to its real
+resume - (site.caller, site.resume_pc), the caller's post-call entry
+stub, the exact fields a SWITCH-pushed record carries - after which the
+existing machinery (vm_frame_leave / the C4c inline pop reading
+rec.ret_* into the resume globals, the EnterNative SENTINEL consumer
+dispatching them) resumes each caller natively, link by link, back to
+main. Division of labor:
+
+- `norec_switch_retarget` (vm.cpp, RELEASE code): the 3c walk's release
+  twin - records paired positionally with native frames from the
+  relayed rbp, the site via each frame's return address
+  (jit_norec_site_for). Covers the M5b (call rdx) frames of the topmost
+  segment. Stops at a non-sentinel record (a live consumer) or a C++
+  RA (the segment floor). Also clears sync_stop (a later raise walks
+  through normally), stamps call_site_packed = site.site_loc (the
+  deleted-run caret), and clears the 4-iii residue flag (the residue
+  dies with the native frames).
+- `jit_call_sync_core`'s r == JIT_RET_SWITCH branch retargets the
+  record IT pushed from its own (caller_ck, resume_pc) args - its C
+  frame IS the dying consumer, and no site can name a core-pushed
+  frame's resume - then walks the CALLER's segment from the relay
+  anchor it snapshotted at entry. Induction: each C++ level fixes the
+  segment below it.
+- **The anchor relay** (g_norec_switch_site/rbp, consumed-and-nulled by
+  the wrappers): the emitted slow tail stores its NorecSite* + the
+  fragment's rbp just before the helper call (all six argument
+  registers are taken). This is the permanent 4-v mechanism, emitted
+  unconditionally when the site exists.
+- **The generic dyn-callee path** (CallValueGenericV) bakes no resume
+  stub, and its site mistranslated a propagated status 3 into a re-run
+  bail (observed: a double-call abort). It now CONSUMES a switch
+  instead of propagating: jit_call_value_generic drives the flat
+  continuation in its own dispatch invocation, which thereby becomes
+  the sentinel consumer of the record core pushed - core's own
+  protocol one level up, zero emit changes. Frames above it are never
+  doomed.
+
+`norec_materialize_shadow` (TESTS) runs at each switch BEFORE the
+retarget: the full insert reconstruction per frame (identity descent
+seeded by the relayed site, window via [fp-8], dst/nslots/seg
+math/captures-from-residue vs the pristine records; the residue half
+under MYLANG_JIT_FORCE=norec). Counters norec_mat_walk / mat_frames /
+mat_residue; on the 3-descent probe: 3 walks, 67 frames, 64 residue
+reconstructions forced - and sync_inline went 0 -> 85, because the fix
+un-broke the M5b inline pushes of every re-descent (the record
+HIGH-WATER gate declines a first descent; a re-descent over warm
+records inlines, and its chains previously died at the first switch).
+
+**Retargeted-record consumers taught**: the full-stack audit and
+vm_capture_rec_frame skip/re-pin on sync_stop == 0 (a retargeted frame
+captures from its packed site loc, byte-identical to a SWITCH record).
+
+**Sabotage, all three watched failing**: the walk disabled -> only the
+core-chain descent survives ("stdout 60" vs 60+31); core's retarget
+disabled -> stdout EMPTY; the relay storing rsp instead of rbp (a dead
+anchor) -> the re-descent lost. Three nets, each naming its failure.
+
+**Residuals filed separately** (pre-existing, reproduced at HEAD's
+build, NOT switch-related): #149 - `var dyn g = aa` (a chunk-less
+TEMPLATE BASE) aborts at the call after AST teardown; #150 - the AST
+inliner asserts on a lambda calling a MUTUALLY-recursive template.
+Under MYLANG_JIT_OFF=norec no sites exist, so M5b-framed chains retain
+the historical hole there (core chains are fixed regardless) - a debug
+lever, documented status quo.
+
+**Lanes, BOTH modes**: dbg/clang/rel-hard -rt 1867/1867 default AND
+forced; corpus 14/14 both; 150-program nested_fuzz both (5 engines);
+non-JIT probe (g++ + clang); a .myv image of the deep-switch shape
+resumes identically (the load-time JIT rebuilds the sites). Interleaved
+full-suite bench cur/base 0.999x (the retarget is cold-path only).

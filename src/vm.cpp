@@ -2664,6 +2664,15 @@ unsigned long g_jit_norec_raise_walk = 0;
 unsigned long g_jit_norec_raise_frames = 0;
 unsigned long g_jit_norec_ret_arm = 0;
 unsigned long g_jit_norec_retarm_verify = 0;
+unsigned long g_jit_norec_mat_walk = 0;
+unsigned long g_jit_norec_mat_frames = 0;
+unsigned long g_jit_norec_mat_residue = 0;
+/* G1 step 4-iv (design 4d): the MATERIALIZER ANCHOR relay - see jit.h.
+ * Written by the emitted slow tail just before each jit_call_sync*
+ * helper call; read (and consumed) by the depth-cap SWITCH. Defined
+ * unconditionally so the non-JIT platforms link without stubs. */
+const void *g_norec_switch_site = nullptr;
+const void *g_norec_switch_rbp = nullptr;
 #ifdef TESTS
 std::vector<NorecReconFrame> g_norec_recon;
 #endif
@@ -2672,6 +2681,12 @@ std::vector<NorecReconFrame> g_norec_recon;
  * vm_raise runs it from the raise site since step 4-ii */
 static size_t norec_walk_chain(VmActivation *act, const char *fp,
                                size_t idx, const void *ns);
+/* step 4-iv: the -3/SWITCH materializer's shadow (defined there too);
+ * jit_call_sync_switch runs it at every depth-cap switch */
+static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
+                                     int_type resume_pc, int_type dst,
+                                     int_type site_packed,
+                                     const char *entry_rbp);
 #endif
 #ifdef TESTS
 [[noreturn]] static void norec_fail(const char *what, const void *a,
@@ -2726,9 +2741,24 @@ static void vm_capture_rec_frame(RuntimeException &e, const VmCallRec &rec)
      * the moment the record-based renderer runs. */
     if (rec.norec_site) {
         const auto *ns = static_cast<const NorecSite *>(rec.norec_site);
-        if (!rec.sync_stop)
-            norec_fail("a norec-site record without sync_stop", ns,
-                       nullptr);
+        if (!rec.sync_stop) {
+            /* 4-iv (task #148): a RETARGETED record - its sentinel resume
+             * was rewritten to the real one at a switch, and its capture
+             * must have come from the site's baked loc (the packed-loc
+             * branch above), not the collapsed loc table. */
+            if (rec.call_site_packed
+                    != static_cast<int_type>(ns->site_loc))
+                norec_fail("a retargeted frame's packed loc != its site",
+                           ns, nullptr);
+            if (static_cast<uint64_t>(
+                        (static_cast<int_type>(cs.line) << 32)
+                        | static_cast<uint32_t>(cs.col))
+                    != ns->site_loc)
+                norec_fail("a retargeted frame captured off-site", ns,
+                           nullptr);
+            e.backtrace.emplace_back(rec.desc, cs);
+            return;
+        }
         if (cs.line != 0 || cs.col != 0)
             norec_fail("an M5b frame captured WITH a loc", ns, nullptr);
         if (!ns->site_loc)
@@ -7005,6 +7035,71 @@ jit_sync_boundary_call(EvalContext &ctx, FuncObject &fo, int_type argbase,
     return 0;
 }
 
+/*
+ * G1 STEP 4-iv - THE SWITCH RETARGET (task #148; the -3 materializer of
+ * plans/g1-no-record-tier.md 4d, generalized). The -3 propagation is
+ * about to unwind every native frame in the topmost segment - and every
+ * one of those frames' records carries the SENTINEL resume (sync_stop,
+ * ret = the stop chunk), which is only meaningful while its C/native
+ * consumer waits. Without this walk the flat continuation's first pop
+ * past the switching caller dispatched the sentinel's ExitBlock,
+ * vm_dispatch RETURNED, and the whole rest of the program was silently
+ * ABANDONED with exit 0 - main's remaining statements never ran. That
+ * hole shipped WITH the switch protocol (born at its introducing commit)
+ * and was invisible because the coverage test's asserts sat AFTER the
+ * deep call: the lost continuation skipped them, which reads as a pass.
+ *
+ * The retarget rewrites each doomed record's resume to the REAL one -
+ * (site.caller, site.resume_pc), the caller's post-call entry stub, the
+ * exact fields the SWITCH-pushed record itself uses - so the flat pop
+ * chain re-enters each caller fragment natively, link by link, all the
+ * way back to main. Everything downstream already handles a real resume
+ * (it is the interpreted call's own model): vm_frame_leave and the C4c
+ * inline pop read rec.ret_* into the resume globals, and the EnterNative
+ * SENTINEL consumer dispatches them.
+ *
+ * The walk is the norec chain walk's release twin: records paired
+ * POSITIONALLY with native frames (records[idx-1] is the frame at fp),
+ * the site found via the frame's return address. It stops at a
+ * non-sentinel record (an interpreted/flat/boundary frame - a live
+ * consumer) or a C++ return address (the segment floor - that frame was
+ * pushed by a jit_enter_deep core, which retargets it ITSELF at its
+ * r == JIT_RET_SWITCH branch, where its own C frame's death is decided;
+ * a dispatch-driven consumer never propagates the switch, so its records
+ * are never doomed and never reach this walk). sync_stop is CLEARED so a
+ * later raise walks through the frame normally (its C conveyance target
+ * is gone) and the full-stack audit skips it; call_site_packed carries
+ * the site's baked caret (a deleted run's loc table collapsed, the
+ * reason that field exists); the 4-iii residue flag dies with the native
+ * frames. Under MYLANG_JIT_OFF=norec no sites exist, so the walk breaks
+ * immediately - that debug lever retains the historical hole for
+ * M5b-framed chains (core-pushed chains are still fixed by the cores'
+ * own retargets, which need no site).
+ */
+static void norec_switch_retarget(VmActivation &act, const char *fp,
+                                  size_t idx)
+{
+    for (int guard = 0; idx; guard++) {
+        ML_CHECK(guard <= 100000);
+        VmCallRec &rec = act.records[idx - 1];
+        if (!rec.sync_stop)
+            break;                     /* a live consumer resumes it */
+        const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
+        const NorecSite *S = jit_norec_site_for(ra);
+        if (!S)
+            break;                     /* the segment floor: core-pushed,
+                                        * retargeted by its own core */
+        rec.ret_chunk = S->caller;
+        rec.ret_pc = S->resume_pc;
+        rec.sync_stop = 0;
+        rec.call_site_packed = static_cast<int_type>(S->site_loc);
+        rec.pushed_with_residue = 0;   /* the residue dies with the
+                                        * native frames (4-iii) */
+        fp = *reinterpret_cast<const char *const *>(fp);
+        idx--;
+    }
+}
+
 /* #56 step 3: past the DEPTH CAP the call is PUSHED interpreted-flat (the
  * interpreted op's exact in-VM protocol) and status 3 is returned - the
  * emitted site translates it to the JIT_RET_SWITCH fragment return, whose
@@ -7018,7 +7113,7 @@ static int
 jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
                      int_type argbase, int_type nargs, int_type dst,
                      int_type site_packed, int_type resume_pc,
-                     bool cached) noexcept
+                     bool cached, const char *entry_rbp) noexcept
 {
     const FuncDescriptor *d = fo.func;
     if (!d->vm_chunk_tried) {
@@ -7039,6 +7134,20 @@ jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
                                    static_cast<size_t>(nargs), dst, key))
         return 0;                          /* cache hit - dst written */
 
+#ifdef TESTS
+    /* 4-iv: the -3 MATERIALIZER's shadow, at the exact moment the
+     * retarget runs - after the probe (a hit switches nothing), before
+     * the push (the record top is still the switching caller's) and
+     * BEFORE the retarget below mutates the records it verifies. */
+    norec_materialize_shadow(act, ctx, resume_pc, dst, site_packed,
+                             entry_rbp);
+#endif
+    /* 4-iv (task #148): retarget the doomed sentinel records of the
+     * topmost native segment before the -3 unwinds their consumers -
+     * see norec_switch_retarget above. records[rec_n-1] is the switching
+     * caller's record, the frame at entry_rbp. */
+    if (entry_rbp)
+        norec_switch_retarget(act, entry_rbp, act.rec_n);
     const Chunk *caller_ck = act.back_rec().run_chunk;  /* BEFORE the push */
     try {
         if (d->fast_bind && !key)
@@ -7069,7 +7178,8 @@ jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
 
 static int
 jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
-                   int_type dst, int_type site_packed, bool cached) noexcept
+                   int_type dst, int_type site_packed, bool cached,
+                   int_type resume_pc, const char *entry_rbp) noexcept
 {
     /* #88: CLAIM the baked call site (read + reset) before dispatching the
      * callee, which would otherwise overwrite it. */
@@ -7104,6 +7214,12 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
                                    static_cast<size_t>(nargs), dst, key))
         return 0;                          /* cache hit - dst written */
 
+    /* 4-iv (task #148): the caller's chunk, read BEFORE the push - with
+     * resume_pc it is the retarget the r == JIT_RET_SWITCH branch below
+     * applies to the record this call pushes, whose sentinel consumer
+     * (this very C frame) dies when the switch propagates. */
+    const Chunk *caller_ck = act.back_rec().run_chunk;
+
     /* The push. An arity/bind-coerce/StackOverflow throw is PRE-side-effect
      * and idempotent (setup pops its half-built frame) - bail and let the
      * interpreted op re-run and re-throw byte-identically. */
@@ -7131,6 +7247,10 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
     }
 
     act.back_rec().sync_stop = 1;
+    /* 4-iv: the pushed record's INDEX (never a pointer - `records` may
+     * reallocate at a deeper high-water peak). Fixed until this frame
+     * pops, which a switch never does. */
+    const size_t my_idx = act.rec_n;
 
     g_jit_sync_depth++;
     /* DIRECT FRAGMENT ENTRY: when the callee body STARTS with an
@@ -7156,7 +7276,28 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
              * interpreted-flat; propagate as status 3 (the emitted slow
              * tail translates back to the fragment return). Our depth
              * level ended (the callee fragment's C frame died; its
-             * continuation is flat interpretation via the record chain). */
+             * continuation is flat interpretation via the record chain).
+             *
+             * 4-iv (task #148): THIS C frame was the sentinel consumer of
+             * the record this call pushed - and it is returning for good,
+             * so retarget that record to its REAL resume: (caller chunk,
+             * this call's post-call entry stub), the same fields a
+             * SWITCH-pushed record carries. resume_pc < 0 = the caller
+             * emit bakes no resume (the generic dyn-callee path) - leave
+             * the record alone there rather than resume at a wrong pc.
+             * Then retarget the CALLER's segment (the frames the -3 is
+             * about to unwind above our return) from the relay anchor -
+             * records[my_idx - 2] is the caller's frame at entry_rbp. */
+            if (resume_pc >= 0) {
+                VmCallRec &mine = act.records[my_idx - 1];
+                mine.ret_chunk = caller_ck;
+                mine.ret_pc = static_cast<size_t>(resume_pc);
+                mine.sync_stop = 0;
+                mine.call_site_packed = site_packed;
+                mine.pushed_with_residue = 0;
+            }
+            if (entry_rbp && my_idx >= 2)
+                norec_switch_retarget(act, entry_rbp, my_idx - 1);
             g_jit_sync_depth--;
             return 3;
         }
@@ -7275,12 +7416,17 @@ extern "C" int jit_call_sync(int_type callee_slot, int_type ab_n,
         return 2;                          /* loc: the emit's exc-stamp */
     }
     FuncObject &fo = *cv.get_ref<intrusive_ptr<FuncObject>>().get();
+    /* 4-iv: CONSUME the materializer anchor (the emitted slow tail set it
+     * just before this call) - nulled so a path that skipped the relay
+     * can never walk a stale frame pointer. */
+    const char *arbp = static_cast<const char *>(g_norec_switch_rbp);
+    g_norec_switch_rbp = nullptr;
     if (g_jit_sync_depth >= g_jit_sync_cap)
         return jit_call_sync_switch(*ctx, *g_vm_act, fo, argbase, nargs,
                                     dst, site_packed, resume_pc,
-                                    /*cached=*/false);
+                                    /*cached=*/false, arbp);
     return jit_call_sync_core(fo, argbase, nargs, dst, site_packed,
-                              /*cached=*/false);
+                              /*cached=*/false, resume_pc, arbp);
 }
 
 extern "C" int jit_call_sync_cached(int_type callee_slot, int_type ab_n,
@@ -7324,12 +7470,15 @@ extern "C" int jit_call_sync_cached(int_type callee_slot, int_type ab_n,
         return 2;
     }
     FuncObject &fo = *cv.get_ref<intrusive_ptr<FuncObject>>().get();
+    /* 4-iv: consume the materializer anchor (see jit_call_sync) */
+    const char *arbp = static_cast<const char *>(g_norec_switch_rbp);
+    g_norec_switch_rbp = nullptr;
     if (g_jit_sync_depth >= g_jit_sync_cap)
         return jit_call_sync_switch(*ctx, *g_vm_act, fo, argbase, nargs,
                                     dst, site_packed, resume_pc,
-                                    /*cached=*/true);
+                                    /*cached=*/true, arbp);
     return jit_call_sync_core(fo, argbase, nargs, dst, site_packed,
-                              /*cached=*/true);
+                              /*cached=*/true, resume_pc, arbp);
 }
 
 extern "C" int jit_call_sync_value(int_type callee_temp, int_type ab_n,
@@ -7351,12 +7500,15 @@ extern "C" int jit_call_sync_value(int_type callee_temp, int_type ab_n,
         return 2;
     }
     FuncObject &fo = *cv.get_ref<intrusive_ptr<FuncObject>>().get();
+    /* 4-iv: consume the materializer anchor (see jit_call_sync) */
+    const char *arbp = static_cast<const char *>(g_norec_switch_rbp);
+    g_norec_switch_rbp = nullptr;
     if (g_jit_sync_depth >= g_jit_sync_cap)
         return jit_call_sync_switch(*ctx, *g_vm_act, fo, argbase, nargs,
                                     dst, site_packed, resume_pc,
-                                    /*cached=*/false);
+                                    /*cached=*/false, arbp);
     return jit_call_sync_core(fo, argbase, nargs, dst, site_packed,
-                              /*cached=*/false);
+                              /*cached=*/false, resume_pc, arbp);
 }
 
 /*
@@ -7455,9 +7607,55 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
                 return 2;
             }
         }
-        return jit_call_sync_core(
+        /* 4-iv (task #148): the generic emit bakes NO post-call resume
+         * stub, so a deeper switch under this call cannot retarget this
+         * level (resume_pc -1 tells core to leave its record's sentinel
+         * resume alone) - and the generic SITE would mistranslate a
+         * propagated status 3 into a re-run bail (observed as a
+         * double-call abort). So a switch is CONSUMED here instead of
+         * propagated: drive the flat continuation in THIS dispatch
+         * invocation, which thereby becomes the sentinel consumer of the
+         * record core pushed - when the callee finally pops, its
+         * sentinel resume dispatches the stop chunk's ExitBlock and
+         * vm_dispatch returns right here, core's own protocol one level
+         * up. The frames above this call are never doomed (nothing
+         * propagates past it), so they need no retarget. The tail
+         * mirrors core's dispatch path: a pending exception (the walk
+         * stopped at our sync_stop record) conveys with the baked site
+         * stamped; a plain C++ throw conveys likewise. */
+        const int r = jit_call_sync_core(
             *callee.get_ref<intrusive_ptr<FuncObject>>().get(), argbase, nargs,
-            dst, site_packed, /*cached=*/false);
+            dst, site_packed, /*cached=*/false, /*resume_pc=*/-1,
+            /*entry_rbp=*/nullptr);
+        if (r != 3)
+            return r;
+        try {
+            vm_dispatch(*g_vm_resume_chunk, ctx, *g_vm_act,
+                        g_vm_resume_pc);
+        } catch (Exception &e) {
+            if (!e.loc_start) {
+                e.loc_start = al.start;
+                e.loc_end = al.end;
+            }
+            if (auto *re = dynamic_cast<RuntimeException *>(&e))
+                g_vm_jit_exc.reset(re->clone());
+            else
+                g_vm_jit_eptr = std::current_exception();
+            return 2;
+        } catch (...) {
+            g_vm_jit_eptr = std::current_exception();
+            return 2;
+        }
+        if (g_vm_exc_pending) {
+            Exception &e = *g_vm_exc_pending;
+            if (!e.loc_start) {
+                e.loc_start = al.start;
+                e.loc_end = al.end;
+            }
+            g_vm_jit_exc = std::move(g_vm_exc_pending);
+            return 2;
+        }
+        return 0;
     }
 
     bool bail = false;
@@ -7844,6 +8042,203 @@ static size_t norec_walk_chain(VmActivation *act, const char *fp,
     return levels;
 }
 
+/*
+ * G1 step 4-iv - THE -3/SWITCH MATERIALIZER'S SHADOW (design doc 4d).
+ * Runs in jit_call_sync_switch at every depth-cap switch, the moment the
+ * 4-v materializer will run at: the flat push is about to happen and the
+ * -3 propagation is about to unwind every native frame in the topmost
+ * segment, after which each frame's RECORD is its only resume vehicle.
+ * A record-less frame would be unresumable, so 4-v inserts records for
+ * them here - and this shadow reconstructs, per frame, every field that
+ * insert will bake, comparing against the records while they still
+ * exist:
+ *
+ *   desc/run_chunk - the site DESCENT: seeded by the RELAYED site (the
+ *          slow tail stores its own NorecSite*, whose caller/caller_desc
+ *          name the switching frame), propagated upward per level by the
+ *          site at each frame's return address (a site names its
+ *          CALLER's function);
+ *   window - seeded by the live vframe, propagated by [fp-8] (the 3c
+ *          window chain);
+ *   dst / resume - from the frame's own site: dst = S.dst, and the
+ *          inserted record's ret fields are (S.caller, S.resume_pc) -
+ *          exactly the SWITCH-record shape, so the flat pop re-enters
+ *          the caller fragment at its baked entry stub;
+ *   nslots - the chunk totals (slot_count + n_temps), the 4-iii arm's
+ *          my_total;
+ *   seg math - all chain frames live in act.cur_seg (an emitted push
+ *          never crosses a segment - the fit test declines to C++, which
+ *          writes a record), and seg_top_before = window - seg base;
+ *   captures - the residue at [fp+16] (and dst_addr at [fp+24]), read
+ *          at the switch moment - the residues sit untouched deeper in
+ *          the native stack, which is the liveness claim the insert
+ *          depends on.
+ *
+ * The full reconstruction is checked for the frames that WOULD be
+ * record-less (pushed_with_residue - under MYLANG_JIT_FORCE=norec);
+ * the identity descent is checked for every chain frame in both modes.
+ * The relayed seed is additionally pinned against the helper's own
+ * ARGUMENTS (resume_pc / dst / site loc rode a different vehicle from
+ * the same emit). Null seed = JL_NOREC lever off (no sites exist, every
+ * frame is record-ful, nothing to materialize). The seed is deliberately
+ * NOT cleared after reading: every slow tail overwrites it, so a switch
+ * arriving with a stale seed means a path that skipped the relay - and
+ * the seed-association checks abort loudly instead of skipping.
+ */
+static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
+                                     int_type resume_pc, int_type dst,
+                                     int_type site_packed,
+                                     const char *entry_rbp)
+{
+    const auto *seed = static_cast<const NorecSite *>(g_norec_switch_site);
+    if (!seed)
+        return;
+    const char *fp = entry_rbp;
+    if (!fp)
+        norec_fail("mat: a relayed site with no rbp", seed, nullptr);
+
+    /* 1. the SEED ASSOCIATION - this must be THIS call's site */
+    if (!act.rec_n)
+        norec_fail("mat: no records at a switch", seed, nullptr);
+    const VmCallRec &top = act.back_rec();
+    if (seed->caller != top.run_chunk)
+        norec_fail("mat: seed chunk != the switching frame's",
+                   seed->caller, top.run_chunk);
+    if (seed->caller_desc != static_cast<const void *>(top.desc))
+        norec_fail("mat: seed desc != the switching frame's",
+                   seed->caller_desc, top.desc);
+    if (static_cast<int_type>(seed->resume_pc) != resume_pc)
+        norec_fail("mat: seed resume_pc != the helper's",
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(seed->resume_pc)),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(resume_pc)));
+    if (static_cast<int_type>(seed->dst) != dst)
+        norec_fail("mat: seed dst != the helper's",
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(seed->dst)),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(dst)));
+    if (static_cast<int_type>(seed->site_loc) != site_packed)
+        norec_fail("mat: seed site_loc != the helper's",
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(seed->site_loc)),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(site_packed)));
+
+    /* 2. the walk + per-frame insert reconstruction */
+    const Chunk *my_ck = seed->caller;
+    const void *my_desc = seed->caller_desc;
+    const LValue *my_win = ctx.frame->slots;
+    size_t idx = act.rec_n;
+    size_t levels = 0, residue_frames = 0;
+    bool hit_floor = false;
+    for (int guard = 0; idx; guard++) {
+        if (guard > 100000)
+            norec_fail("mat walk did not terminate", fp, seed);
+        const VmCallRec &rec = act.records[idx - 1];
+        /* the identity descent vs the record - the exact desc/chunk/
+         * window the 4-v insert would bake for this frame */
+        if (rec.run_chunk != my_ck)
+            norec_fail("mat: chunk descent != record", my_ck,
+                       rec.run_chunk);
+        if (static_cast<const void *>(rec.desc) != my_desc)
+            norec_fail("mat: desc descent != record", my_desc, rec.desc);
+        if (rec.window != my_win)
+            norec_fail("mat: window descent != record", my_win,
+                       rec.window);
+        const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
+        if (!jit_norec_frag_for(ra)) {
+            /* the segment FLOOR: entered via jit_enter from C++, never
+             * record-less - identity verified above, nothing to insert */
+            levels++;
+            hit_floor = true;
+            break;
+        }
+        const auto *S = jit_norec_site_for(ra);
+        if (!S)
+            norec_fail("mat: emitted RA with no site", ra, nullptr);
+        if (ra != S->ret_plain && ra != S->ret_switched)
+            norec_fail("mat: RA is not the site's", ra, S);
+        if (rec.norec_site != static_cast<const void *>(S))
+            norec_fail("mat: record's site != the RA's", rec.norec_site,
+                       S);
+        /* the parent identity per the site - next level's descent, and
+         * the inserted record's ret_chunk */
+        const char *link = *reinterpret_cast<const char *const *>(fp);
+        const void *parent_win =
+            *reinterpret_cast<const void *const *>(fp - 8);
+        if (rec.pushed_with_residue) {
+            /* the FULL insert reconstruction - this frame would be
+             * record-less in 4-v */
+            if (!rec.run_chunk || !rec.run_chunk->norec_ok)
+                norec_fail("mat: a residue frame whose chunk is not "
+                           "norec_ok", &rec, rec.run_chunk);
+            if (static_cast<int_type>(S->dst) != rec.dst)
+                norec_fail("mat: site dst != record",
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(S->dst)),
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(rec.dst)));
+            if (rec.nslots != static_cast<int_type>(
+                                  my_ck->slot_count + my_ck->n_temps))
+                norec_fail("mat: chunk totals != record nslots",
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(rec.nslots)),
+                           my_ck);
+            if (rec.seg != act.cur_seg)
+                norec_fail("mat: residue frame not in cur_seg",
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(rec.seg)),
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(act.cur_seg)));
+            const VmStackSeg &sg =
+                *act.segs[static_cast<size_t>(act.cur_seg)];
+            if (rec.window != sg.slots.data() + rec.seg_top_before)
+                norec_fail("mat: window != seg base + watermark",
+                           rec.window,
+                           sg.slots.data() + rec.seg_top_before);
+            /* the residue, read at the SWITCH moment: it sits deeper in
+             * the native stack, untouched since its push */
+            const void *caps =
+                *reinterpret_cast<const void *const *>(fp + 16);
+            if (caps != static_cast<const void *>(rec.caller_captures))
+                norec_fail("mat: residue captures != record", caps,
+                           rec.caller_captures);
+            const void *dst_addr =
+                *reinterpret_cast<const void *const *>(fp + 24);
+            const void *want =
+                rec.dst < 0
+                    ? nullptr
+                    : static_cast<const void *>(
+                          static_cast<const LValue *>(parent_win)
+                          + rec.dst);
+            if (dst_addr != want)
+                norec_fail("mat: residue dst_addr != &parent[dst]",
+                           dst_addr, want);
+            /* the inserted resume (S->caller, S->resume_pc): bounds -
+             * registration verified stub-ness where it is guaranteed */
+            if (static_cast<size_t>(S->resume_pc)
+                    >= S->caller->code.size())
+                norec_fail("mat: site resume_pc out of bounds", S,
+                           S->caller);
+            residue_frames++;
+        }
+        my_ck = S->caller;
+        my_desc = S->caller_desc;
+        my_win = static_cast<const LValue *>(parent_win);
+        fp = link;
+        idx--;
+        levels++;
+    }
+    if (!hit_floor)
+        norec_fail("mat: records exhausted before the segment floor",
+                   fp, seed);
+    g_jit_norec_mat_walk++;
+    g_jit_norec_mat_frames += levels;
+    g_jit_norec_mat_residue += residue_frames;
+}
+
 #endif
 
 /*
@@ -8015,6 +8410,11 @@ extern "C" void jit_norec_push_verify(const void *site,
             const VmCallRec &r = act->records[i];
             if (!r.norec_site)
                 continue;             /* a C++-pushed record has no site */
+            if (!r.sync_stop)
+                continue;             /* 4-iv: RETARGETED by a switch (its
+                                       * sentinel resume was rewritten to
+                                       * the real one; norec_check_rec's
+                                       * sentinel pins no longer apply) */
             const auto *rs = static_cast<const NorecSite *>(r.norec_site);
             norec_check_rec(r, rs);
             /* step 2, the CHAIN: the site's caller chunk must be the

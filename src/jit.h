@@ -932,6 +932,21 @@ extern unsigned long g_jit_norec_raise_frames;
  * pre-mutation shadow verifications. */
 extern unsigned long g_jit_norec_ret_arm;
 extern unsigned long g_jit_norec_retarm_verify;
+/* step 4-iv: the -3/SWITCH MATERIALIZER's shadow (design doc 4d) - runs
+ * in jit_call_sync_switch at every depth-cap switch, walking the native
+ * chain from the relayed rbp and reconstructing, per frame, every field
+ * the 4-v record insert will bake (identity via the site descent seeded
+ * by the RELAYED site, window via the [fp-8] chain, dst/resume from the
+ * frame's own site, seg/watermark from the window pointer, captures from
+ * the residue), compared field-for-field against the records while they
+ * still exist. mat_walk = switches walked; mat_frames = levels verified
+ * (the load-bearing half - a dead anchor floors at 0 silently, the 4-ii
+ * lesson); mat_residue = would-be RECORD-LESS frames whose full insert
+ * reconstruction was verified (moves only under MYLANG_JIT_FORCE=norec,
+ * where residue frames exist). */
+extern unsigned long g_jit_norec_mat_walk;
+extern unsigned long g_jit_norec_mat_frames;
+extern unsigned long g_jit_norec_mat_residue;
 /* step 4-ii(b): the backtrace prefix RECONSTRUCTED at the last
  * rbp-anchored raise, from hardware + baked emit-time constants ONLY
  * (the chain's return addresses -> sites -> site_loc/caller_desc, seeded
@@ -1016,6 +1031,21 @@ bool jit_norec_forced();
  * one. No-op when the chunk has no native code.
  */
 void jit_norec_rebind(Chunk &chunk);
+/*
+ * G1 step 4-iv (plans/g1-no-record-tier.md 4d): the MATERIALIZER ANCHOR
+ * relay. The emitted slow tail stores the site's NorecSite* and the
+ * calling FRAGMENT's rbp here just before invoking the jit_call_sync*
+ * helper (every register is an argument there, and the switch is the
+ * helper's own cold decision), so a depth-cap SWITCH can walk the native
+ * chain from the switching caller and - in 4-v - INSERT records for the
+ * record-less frames the -3 propagation is about to unwind. Fresh at
+ * every helper entry (all three helpers are reached only through a slow
+ * tail); null only when the JL_NOREC lever is off (no sites emitted), in
+ * which case every frame is record-ful and there is nothing to
+ * materialize. Defined in vm.cpp (the reader) beside the other
+ * conveyance globals; single-threaded like the rest of them. */
+extern const void *g_norec_switch_site;
+extern const void *g_norec_switch_rbp;
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
 #else

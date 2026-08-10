@@ -24647,7 +24647,13 @@ static bool jit_call_switch_protocol()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
-    auto run = [](const std::vector<const char *> &lines) -> bool {
+    /* #148: `expect` is the program's REQUIRED stdout. It exists because
+     * this test was VACUOUS from the switch protocol's birth: the lost
+     * continuation silently SKIPPED the post-call asserts, and a skipped
+     * assert reads as a pass. A print the harness compares cannot be
+     * skipped invisibly. */
+    auto run = [](const std::vector<const char *> &lines,
+                  const char *expect) -> bool {
         std::string src;
         std::vector<Tok> toks;
         for (size_t i = 0; i < lines.size(); i++) {
@@ -24658,6 +24664,8 @@ static bool jit_call_switch_protocol()
         const ExecEngine saved = g_exec_engine;
         g_exec_engine = ExecEngine::Vm;
         bool ok = true;
+        std::ostringstream out;
+        std::streambuf *old = std::cout.rdbuf(out.rdbuf());
         try {
             ParseContext pc(TokenStream(toks), true);
             unique_ptr<Construct> root = pBlock(pc);
@@ -24668,27 +24676,70 @@ static bool jit_call_switch_protocol()
         } catch (...) {
             ok = false;
         }
+        std::cout.rdbuf(old);
         g_exec_engine = saved;
+        if (ok && expect && out.str() != expect) {
+            fprintf(stderr, "jit_call_switch_protocol: stdout %s != "
+                            "expected %s (continuation lost?)\n",
+                    out.str().c_str(), expect);
+            ok = false;
+        }
         return ok;
     };
     const int saved_cap = jit_sync_depth_cap();
     jit_set_sync_depth_cap(4);
     const unsigned long s0 = g_jit_sync_switch;
+    const unsigned long mw0 = g_jit_norec_mat_walk;
+    const unsigned long mf0 = g_jit_norec_mat_frames;
+    const unsigned long mr0 = g_jit_norec_mat_residue;
     /* MUTUAL recursion (a self-recursive CallV is run-excluded), depth 60
      * >> cap 4: the first levels run native sync, then every deeper call
-     * SWITCHES; the result proves the full chain, the resume stubs prove
-     * the caller fragments re-entered. */
+     * SWITCHES; the PRINTED result proves the deep chain computed AND
+     * that main's continuation survived the switch (task #148 - it used
+     * to be silently abandoned, exit 0), and the second print proves a
+     * RE-descent over the switch-scarred records works too. */
     bool ok = run({
         "func aa(int n) { if (n < 1) { return 0; } return bb(n - 1) + 1; }",
         "func bb(int n) { if (n < 1) { return 0; } return aa(n - 1) + 1; }",
-        "assert(aa(runtime(60)) == 60);" });
+        "print(aa(runtime(60)));",
+        "print(aa(runtime(30)) + 1);" }, "60 \n31 \n");
     if (ok && g_jit_sync_switch <= s0) {
         fprintf(stderr,
                 "jit_call_switch_protocol: the SWITCH push DID NOT RUN\n");
         ok = false;
     }
+    /* 4-iv: every switch above must have run the MATERIALIZER shadow
+     * (the relay was live and the chain walked). The FRAMES bound is the
+     * load-bearing half: a dead rbp relay makes every walk "floor" at
+     * exactly level 1 (a garbage RA resolves to no fragment), so frames
+     * == walks - real chains under cap 4 average 4-5 levels, so require
+     * strictly more than 2 per walk. */
+    if (ok) {
+        const unsigned long walks = g_jit_norec_mat_walk - mw0;
+        const unsigned long frames = g_jit_norec_mat_frames - mf0;
+        if (walks == 0) {
+            fprintf(stderr, "jit_call_switch_protocol: the materializer "
+                            "shadow DID NOT RUN\n");
+            ok = false;
+        } else if (frames < walks * 2) {
+            fprintf(stderr, "jit_call_switch_protocol: %lu mat walks "
+                            "traversed only %lu frames (dead anchor?)\n",
+                    walks, frames);
+            ok = false;
+        }
+        /* under MYLANG_JIT_FORCE=norec the chain's M5b frames carry the
+         * residue flag, so the FULL insert reconstruction must have run
+         * on at least one would-be record-less frame */
+        if (ok && jit_norec_forced()
+                && g_jit_norec_mat_residue <= mr0) {
+            fprintf(stderr, "jit_call_switch_protocol: no residue frame "
+                            "reconstructed under FORCE=norec\n");
+            ok = false;
+        }
+    }
     /* a THROW from far below the cap: the walk crosses switch-pushed
-     * records - the caret and catch must be byte-identical semantics */
+     * records - the caret and catch must be byte-identical semantics
+     * (printed, not just asserted - see the vacuity note above) */
     if (ok)
         ok = run({
             "func ca(int n) { if (n < 1) { return 100 / n; }",
@@ -24696,7 +24747,33 @@ static bool jit_call_switch_protocol()
             "func cb(int n) { return ca(n - 1); }",
             "var got = 0;",
             "try { ca(runtime(50)); } catch (DivisionByZeroEx) { got = 7; }",
-            "assert(got == 7);" });
+            "print(got);" }, "7 \n");
+    /* the GENERIC (dyn-callee) path: its emit bakes no resume stub, so a
+     * switch under it is CONSUMED by jit_call_value_generic (the helper
+     * drives the flat continuation; its own dispatch becomes the
+     * sentinel consumer) rather than propagated - the pre-#148 site
+     * mistranslated the propagated status into a re-run bail (a
+     * double-call abort). Both the return and the throw cross it. */
+    if (ok)
+        ok = run({
+            "func da(int n) { if (n < 1) { return 0; }",
+            "  return db(n - 1) + 1; }",
+            "func db(int n) { if (n < 1) { return 0; }",
+            "  return da(n - 1) + 1; }",
+            "func dlam(int k) { return da(k); }",
+            "var dyn dg = dlam;",
+            "print(dg(runtime(40)));",
+            "print(dg(runtime(20)) + 1);" }, "40 \n21 \n");
+    if (ok)
+        ok = run({
+            "func ea(int n) { if (n < 1) { return 100 / n; }",
+            "  return eb(n - 1); }",
+            "func eb(int n) { return ea(n - 1); }",
+            "func elam(int k) { return ea(k); }",
+            "var dyn eg = elam;",
+            "var egot = 0;",
+            "try { eg(runtime(30)); } catch (DivisionByZeroEx) { egot = 9; }",
+            "print(egot);" }, "9 \n");
     jit_set_sync_depth_cap(saved_cap);
     return ok;
 #else
