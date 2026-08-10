@@ -822,6 +822,9 @@ extern "C" unsigned long g_jit_entry_resume;
  * bumped by the emitted code itself, so it proves the inline tier ran (the
  * jit_ret helper's own counter also counts declines and cannot). */
 extern "C" unsigned long g_jit_ret_inline;
+/* C4a-i: TEMP slots admitted to the float read-elision set (compile-time -
+ * it proves the AUDIT TABLE is complete, see the definition). */
+extern "C" unsigned long g_jit_fread_temps;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)

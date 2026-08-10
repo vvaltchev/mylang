@@ -7466,6 +7466,31 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::IntBin: case OpCode::FloatBin:
     case OpCode::CmpIntV: case OpCode::CmpFloatV:
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
+    /*
+     * The B1/B2 SPECIALIZED family - same 3-address shape as the
+     * IntBin/FloatBin they replace (an RI form's `b` is a literal,
+     * which opnd() skips). These do NOT occur when the PEEPHOLE runs
+     * (specialize_arith_ops is a later pass), nor when compute_ref_slots
+     * does - but jit_fwd_info runs at JIT TIME, on the specialized code,
+     * and an op MISSING here is a use-def BARRIER there: `lin = all`,
+     * every temp live at every pc. That silently defeated BOTH JIT-time
+     * consumers - lever A's write elision and C4a-i's read-elision entry
+     * gate (which is why C4a-i measured flat: every float temp read as
+     * live-in at its own run head). Any future post-peephole opcode
+     * belongs here for the same reason.
+     */
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::IntAndRR: case OpCode::IntAndRI:
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:
+    case OpCode::IntXorRR: case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShlRI:
+    case OpCode::IntShrRR: case OpCode::IntShrRI:
+    case OpCode::IntModRI:
+    case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR: case OpCode::FloatMulRI:
         opnd(in.a()); opnd(in.b()); d(in.target); return true;
     case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
         opnd(in.a()); opnd(in.b()); return true;
@@ -7610,10 +7635,12 @@ static bool retargetable_dst(OpCode op)
  * kept here so jit.cpp never grows a drifting copy of visit_use_def /
  * visit_pc_fields / the handler collection. */
 bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
+                  std::vector<uint64_t> &livein,
                   std::vector<char> &is_tgt)
 {
     const size_t n = chunk.code.size();
     liveout.clear();
+    livein.clear();
     is_tgt.assign(n + 1, 0);
 
     std::vector<int> handler_pcs;
@@ -7693,6 +7720,7 @@ bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
             out |= live_in[p + 1];
         liveout[p] = out;
     }
+    livein = live_in;                /* the fixpoint's own per-pc live-in */
     return true;
 }
 
