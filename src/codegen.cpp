@@ -4088,10 +4088,60 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * H1 (2026-08-12): a CLOSURE-CAPTURE leaf inside a typed expression.
+     *
+     * A capture is not a frame slot - it lives in the called closure's own
+     * `ctx->captures` vector - so it can never BE an Operand (which is a
+     * literal or a frame slot). `as_int_operand`/`as_float_operand`
+     * therefore decline it, and before this the decline propagated: ONE
+     * capture operand made the whole TypedScalarExpr fall to the boxed
+     * tier, so `func [base] (int k) { return base + k; }` - fully proven
+     * int by inference - compiled to `load.capture` + a BOXED `bin.v`
+     * (num_bin_op's PMF dispatch + promotion check, ~137 Ir per call on
+     * 78_typed_param_call, where C++ pays one `add`).
+     *
+     * The fix needs no new opcode: MATERIALIZE the capture with the
+     * existing boxed LoadCaptureV into a temp, and hand back that temp.
+     * A temp holding a boxed int IS an int frame slot - `read_int_slot`
+     * reads it by tag exactly as it reads any other typed slot (and its
+     * bool -> 0/1 arm matches Identifier::eval_int's capture path
+     * byte-for-byte, so a captured bool behaves as it always did). Only
+     * the ARITHMETIC changes tier: the load was there before and is
+     * unchanged, including its JIT inline copy.
+     *
+     * The dedicated typed load (a raw int read instead of the 32-byte
+     * EvalValue copy, ~6 more instructions per read) is a separate,
+     * later question - the arithmetic is where the cost was.
+     */
+    bool try_capture_leaf(const Construct *e, bool flt, Operand &out,
+                          std::vector<CgInstr> &ops)
+    {
+        const Identifier *id = dynamic_cast<const Identifier *>(e);
+        if (!id || id->sym.kind != SymKind::capture)
+            return false;
+        /* int wants `i`; float accepts `f` OR `i` (read_float_slot
+         * promotes an int/bool slot) - the as_*_operand rule for a local,
+         * applied to the other table. */
+        if (!(id->th == TypeHint::i || (flt && id->th == TypeHint::f)))
+            return false;
+        const int t = alloc_temp();
+        CgInstr in;
+        in.op = OpCode::LoadCaptureV;
+        in.target = t;
+        in.target2 = id->sym.slot;
+        ops.push_back(in);
+        out = slot_op(t);
+        return true;
+    }
+
     bool compile_int_expr(const Construct *e, Operand &out,
                           std::vector<CgInstr> &ops)
     {
         if (as_int_operand(e, out))
+            return true;
+
+        if (e->th == TypeHint::i && try_capture_leaf(e, false, out, ops))
             return true;
 
         if (e->th == TypeHint::i && try_typed_ternary(e, out, ops, false))
@@ -5057,6 +5107,10 @@ struct Codegen {
                             std::vector<CgInstr> &ops)
     {
         if (as_float_operand(e, out))
+            return true;
+
+        if ((e->th == TypeHint::f || e->th == TypeHint::i)
+                && try_capture_leaf(e, true, out, ops))
             return true;
 
         if (e->th == TypeHint::f && try_typed_ternary(e, out, ops, true))

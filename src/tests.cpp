@@ -1720,6 +1720,50 @@ static const std::vector<test> tests =
     },
 
     {
+        /* H1: a typed CAPTURE operand keeps its arithmetic UNBOXED. The
+         * tier is invisible to a value check by design (both tiers
+         * compute the same answer - capture_typed_arith_shapes is the
+         * shape oracle); these pin the SEMANTICS the typed path must
+         * reproduce, in all five execution modes. The interesting ones
+         * are the promotions: read_int_slot's bool arm must answer 0/1
+         * exactly as num_bin_op's bool promotion did, and an INT capture
+         * inside a float expression must widen, not truncate. */
+        "typed capture arithmetic: values across every promotion (H1)",
+        {
+            "func mki(int base) { return func [base] (int k) "
+                "{ return base + k; }; }",
+            "func mkf(float b) { return func [b] (float x) "
+                "{ return b * x; }; }",
+            "func mkb(bool b) { return func [b] (int k) "
+                "{ return b + k; }; }",
+            "func mk2(int a, int b) { return func [a, b] (int k) "
+                "{ return a + b + k; }; }",
+            "var fi = mki(7);   assert(fi(runtime(3)) == 10);",
+            "var ff = mkf(0.5); assert(ff(runtime(4)) == 2.0);",
+            /* an INT capture in a FLOAT expression: widening, not trunc */
+            "var fp = mkf(runtime(1));  assert(fp(runtime(2.5)) == 2.5);",
+            "var bt = mkb(true);  assert(bt(runtime(5)) == 6);",
+            "var bf = mkb(false); assert(bf(runtime(5)) == 5);",
+            "var f2 = mk2(2, 3); assert(f2(runtime(4)) == 9);",
+            /* NEGATIVE + zero operands (the raw int path has no sign
+             * assumptions the boxed one lacked) */
+            "var fn = mki(-7); assert(fn(runtime(-3)) == -10);",
+            "assert(fn(runtime(0)) == -7);",
+            /* the captured value is a per-INSTANCE snapshot: two closures
+             * over different values must not share the materialized temp */
+            "var a1 = mki(100); var a2 = mki(200);",
+            "assert(a1(runtime(1)) == 101);",
+            "assert(a2(runtime(1)) == 201);",
+            "assert(a1(runtime(1)) == 101);",
+            /* a capture read MANY times in one body (the temp is
+             * re-materialized per occurrence, and each must agree) */
+            "func mks(int c) { return func [c] (int k) "
+                "{ return c + k + c + c; }; }",
+            "var fs = mks(5); assert(fs(runtime(1)) == 16);",
+        },
+    },
+
+    {
         /* ARG-position value use (a higher-order builtin) escapes too:
          * map(template, arr) keeps today's behavior. */
         "value-template passed to map() stays sound",
@@ -19382,6 +19426,148 @@ static bool hoist_subscript_shapes()
     return true;
 }
 
+/*
+ * H1: a CLOSURE-CAPTURE leaf inside a PROVEN int/float expression lowers
+ * to the TYPED arithmetic (IntBin / FloatBin), not the boxed BinOpV.
+ *
+ * A capture is not a frame slot, so it can never be an Operand; before
+ * H1 that decline propagated and one capture operand pushed the WHOLE
+ * typed expression onto the boxed tier (num_bin_op's PMF dispatch), even
+ * though inference had proven the type. The engines AGREE either way -
+ * only the tier differs - so no differential can see this: the oracle is
+ * the emitted bytecode.
+ *
+ * Every case is checked over the FUNCTION chunks only (the factory bodies
+ * here are deliberately arithmetic-free, so the lambda is the only source
+ * of a binary op) and the DECLINE cases matter most: a capture whose type
+ * inference did NOT prove must stay boxed.
+ */
+static bool capture_typed_arith_shapes()
+{
+    struct Case {
+        const char *name;
+        std::vector<const char *> lines;
+        int want_int;        /* IntBin ops expected in the func chunks */
+        int want_float;      /* FloatBin ops expected */
+        int want_boxed;      /* BinOpV ops expected */
+    };
+    const std::vector<Case> cases = {
+        /* 78_typed_param_call's adder: int capture + int param */
+        { "capture: int + int param -> IntBin", {
+            "func mk(int base) { return func [base] (int k) "
+                "{ return base + k; }; }",
+            "var f = mk(7); print(f(runtime(3)));" }, 1, 0, 0 },
+        /* 78's scaler: float capture * float param */
+        { "capture: float * float param -> FloatBin", {
+            "func mk(float b) { return func [b] (float x) "
+                "{ return b * x; }; }",
+            "var f = mk(0.5); print(f(runtime(4)));" }, 0, 1, 0 },
+        /* an INT capture inside a FLOAT expression promotes (the
+         * as_float_operand rule for a local, applied to the capture) */
+        { "capture: int capture in a float expr -> FloatBin", {
+            "func mk(int b) { return func [b] (float x) "
+                "{ return b * x; }; }",
+            "var f = mk(3); print(f(runtime(1.5)));" }, 0, 1, 0 },
+        /* a captured BOOL is stamped `i` and flows through the int path
+         * as 0/1 - exactly what Identifier::eval_int's capture arm does */
+        { "capture: bool capture -> IntBin (0/1)", {
+            "func mk(bool b) { return func [b] (int k) "
+                "{ return b + k; }; }",
+            "var f = mk(true); print(f(runtime(5)));" }, 1, 0, 0 },
+        /* two captures in one chain: BOTH materialize */
+        { "capture: two captures in one chain", {
+            "func mk(int a, int b) { return func [a, b] (int k) "
+                "{ return a + b + k; }; }",
+            "var f = mk(2, 3); print(f(runtime(4)));" }, 2, 0, 0 },
+        /* DECLINE: a `dyn` capture stays BOXED - the gate must fire only
+         * on a type INFERENCE PROVED. (`dyn` and not an un-annotated
+         * template param on purpose: a template compiles BOTH its base
+         * and its instance body, so the count would be 2 and the case
+         * would be reading template duplication rather than the gate.) */
+        { "no typed capture: dyn capture", {
+            "func mk(dyn base) { return func [base] (int k) "
+                "{ return base + k; }; }",
+            "var f = mk(7); print(f(runtime(3)));" }, 0, 0, 1 },
+        /* DECLINE: a STRING capture is not a scalar at all */
+        { "no typed capture: str capture", {
+            "func mk(str s) { return func [s] (str t) "
+                "{ return s + t; }; }",
+            "var f = mk(\"a\"); print(f(runtime(\"b\")));" }, 0, 0, 1 },
+    };
+
+    for (const Case &c : cases) {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i) src += '\n';
+            src += c.lines[i];
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        /* jit=false: the native tier DELETES the interpreted originals,
+         * which is exactly the code this test reads. */
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+
+        int n_int = 0, n_float = 0, n_boxed = 0, n_cap = 0;
+        for (const auto &fd : prog.funcs) {
+            if (!fd->vm_chunk)
+                continue;
+            const Chunk *ck = static_cast<const Chunk *>(fd->vm_chunk);
+            for (const Instr &in : ck->code) {
+                switch (in.op) {
+                /* THE STAGE TRAP, in test form: by the time vm_compile
+                 * returns, `specialize_arith_ops` has REWRITTEN IntBin /
+                 * FloatBin into the B1/B2 register-immediate family - so
+                 * a test that counts only the generic opcodes sees ZERO
+                 * and "proves" the typed path never fired (watched: the
+                 * first version of this test failed 0/0/0 against
+                 * correct code). Count the family. */
+                case OpCode::IntBin:
+                case OpCode::IntAddRR: case OpCode::IntAddRI:
+                case OpCode::IntSubRR: case OpCode::IntSubRI:
+                case OpCode::IntMulRR: case OpCode::IntMulRI:
+                case OpCode::IntAndRR: case OpCode::IntAndRI:
+                case OpCode::IntOrRR:  case OpCode::IntOrRI:
+                case OpCode::IntXorRR: case OpCode::IntXorRI:
+                case OpCode::IntShlRR: case OpCode::IntShlRI:
+                case OpCode::IntShrRR: case OpCode::IntShrRI:
+                case OpCode::IntModRI:
+                    n_int++;   break;
+                case OpCode::FloatBin:
+                case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+                case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+                case OpCode::FloatMulRR: case OpCode::FloatMulRI:
+                    n_float++; break;
+                case OpCode::BinOpV:       n_boxed++; break;
+                case OpCode::LoadCaptureV: n_cap++;   break;
+                default: break;
+                }
+            }
+        }
+        if (n_int != c.want_int || n_float != c.want_float
+                || n_boxed != c.want_boxed) {
+            fprintf(stderr, "capture_typed_arith_shapes: '%s' emitted "
+                            "int=%d float=%d boxed=%d, wanted %d/%d/%d\n",
+                    c.name, n_int, n_float, n_boxed,
+                    c.want_int, c.want_float, c.want_boxed);
+            return false;
+        }
+        /* the capture LOAD is unchanged by H1 and must still be there -
+         * without it the shape counts above could be satisfied by a
+         * program that stopped reading the capture at all */
+        if (n_cap == 0) {
+            fprintf(stderr, "capture_typed_arith_shapes: '%s' loads no "
+                            "capture at all\n", c.name);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Lever 2 (VmInvoker direct fragment entry): per callback ELEMENT the
  * invoker calls jit_enter directly instead of re-entering vm_dispatch -
  * g_jit_invoke_direct counts those entries, so growth ~ the element
@@ -28744,6 +28930,8 @@ static const std::vector<extra_check> extra_checks =
       hoist_subscript_shapes },
     { "opt: loop-invariant slice hoisting shapes (lever 3)",
       hoist_slice_shapes },
+    { "codegen: a typed CAPTURE leaf keeps its arithmetic unboxed (H1)",
+      capture_typed_arith_shapes },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",
