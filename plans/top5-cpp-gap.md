@@ -1,8 +1,13 @@
 # The top-5 my/cpp gap, decomposed (2026-08-12)
 
 Post-flip suite (OPT=1 ASSERTS=0, norec default, fresh-stamped cpp
-cache): geomean my/cpp **2.514x** over 77 pairs. The top-5, all
-call/closure protocol:
+cache): geomean my/cpp **~2.47x** over 77 pairs (the 2.514x first
+recorded here was measured on `build/mylang` - run.py's DEFAULT
+--mylang, i.e. the MAINTAINER's binary, not the lane under test. Pass
+`--mylang build-claude/<lane>/mylang` explicitly; the per-bench
+RANKING below is unaffected, and the callgrind decomposition was
+always taken on build-claude/perf). The top-5, all call/closure
+protocol:
 
     76_funcval_dispatch   18.66x   836 Ir/iter (1 value call)
     11_closure_counter    18.59x   355 Ir/iter (1 closure call)
@@ -75,24 +80,15 @@ refcount churn per element.
   geomean cur/base 0.999x; 67_make_dict's callback additionally became
   a native_leaf. 11 and 63 are byte-identical - their cost is the
   capture STORE, which is H1b. Full record: docs/jit-optimizations.md.
-- **H1b - TYPED CAPTURE WRITES (11 + 63), NEXT.** `count++` still
-  lowers to a compound StoreCaptureV (copy-modify-store through
-  num_bin_op: ~105 of 11's 355 Ir/iter). With H1a's typed READ in
-  hand the shape is `LoadCaptureV t; IntBin t2 = t + 1; <typed store>`
-  - i.e. only a PLAIN typed capture store is missing. **Gate it to the
-  compound / inc-dec forms**: a plain `cap = <rhs>` whose rhs is
-  `th == i` may be a BOOL value, and storing it as an int would change
-  the observable type (the #96 hazard); a compound's result is int by
-  arithmetic promotion, so that question does not arise.
-- **H1 (original entry) - TYPED CAPTURES (the biggest, hits 78+11+63).** Give the
-  VM/JIT typed capture-slot reads/writes: the inferencer already
-  types the captured var (by-value snapshot), CaptureSlots' data
-  pointer is already a bare `mov` (G2's layout contract), and the
-  tree-walker already reads captures in eval_int - only the codegen
-  declines. A capture operand with proven int/float lowers into the
-  typed ops (a capture-read source / capture-write dst variant, or a
-  typed load-to-temp), `start++` becomes load/inc/store behind the
-  existing type proof. Projected: 78 −30%, 11 −30%, 63 −10-15%.
+- **H1b - TYPED CAPTURE WRITES: DONE (2026-08-12).** `cap++`/`cap OP= v`
+  recomposes into materialize + IntBin/FloatBin + a PLAIN store (which
+  has a JIT inline tier; the compound never did). `+ - *` only - those
+  cannot throw for proven operands, so there is no caret to preserve;
+  `/` and `%` were MEASURED moving the div0 caret two lines and are
+  excluded, pinned by an `err loc:` test. Measured (H1a+H1b, interleaved
+  full suite): **11_closure_counter 0.55x** (18.6x -> 9.08x my/cpp),
+  78 0.80x, 63 0.90x; suite geomean cur/base 0.986x, my/cpp **2.424x**.
+  The ORIGINAL H1b sketch below is superseded.
 - **H2 - FUNC-VALUE ELEMENT CALL (76).** The `ops[i%2]` boxed
   materialization (~200 Ir) borrows instead: an elem-read callee
   feeding CallValueV can be guarded + called off a borrowed
@@ -106,7 +102,15 @@ refcount churn per element.
   (~30-40 Ir/call). Big design step (StackOverflowEx, the walker,
   helper visibility); not sized here.
 
-Honest ceiling: with H1-H3 landed these benches project to ~8-11x -
-the remaining gap is the value model itself (48-byte LValues, type
-tags, refcounts on every func/str value), i.e. #60's territory, not
-the call protocol's.
+## Where the top-5 stands after H1 (measured, same interleaved run)
+
+    76_funcval_dispatch   18.83x   (unchanged - H2 is its item)
+    75_indexed_unpack     13.72x   (unchanged - H3 is its item)
+    78_typed_param_call   11.54x   (was 15.66x)
+    63_closures           11.44x   (was 14.19x)
+    11_closure_counter     9.08x   (was 18.59x - out of the top five)
+
+Suite my/cpp geomean **2.424x**. Honest ceiling: with H2 + H3 landed
+these project to ~8-11x - past that the gap is the value model itself
+(48-byte LValues, type tags, refcounts on every func/str value), i.e.
+#60's territory, not the call protocol's.

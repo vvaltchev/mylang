@@ -737,6 +737,25 @@ static const std::vector<test> tests =
      * is why it exists. In an UNTYPED context the tree-walker never took
      * the fast path, so the two engines agreed there and the bug hid.
      */
+    /*
+     * H1b's `/` and `%` EXCLUSION, defended by the thing it protects.
+     * Recomposing a compound capture update into read + IntBin + store is
+     * sound for `+ - *` because those cannot throw for proven int/float
+     * operands - so there is no error path whose caret could move. `/`
+     * CAN throw, and recomposing it was measured moving this caret from
+     * `a /= k` (line 2, the tree-walker's answer) to `var c = mk(12);`
+     * (line 4) with the backtrace line wrong too - a RULE 2 violation.
+     * The shape test asserts the DECLINE; this asserts what the decline
+     * buys, so re-including `/` fails on the observable, not on a count.
+     */
+    { "err loc: a capture `cap /= 0` carets the compound update itself",
+      { "func mk(int a) {",
+        "  return func [a] (int k) { a /= k; return a; };",
+        "}",
+        "var c = mk(12);",
+        "c(runtime(0));" },
+      &typeid(DivisionByZeroEx), 29, 2, 35, 2 },
+
     { "err loc: a typed a[i].field OOB marks the SUBSCRIPT, not the field",
       { "struct P { int x; int y; }",
         "func f(int i) { var r = [P(1,2)]; var a = 0; a += r[i].y; return a; }",
@@ -1760,6 +1779,58 @@ static const std::vector<test> tests =
             "func mks(int c) { return func [c] (int k) "
                 "{ return c + k + c + c; }; }",
             "var fs = mks(5); assert(fs(runtime(1)) == 16);",
+        },
+    },
+
+    {
+        /* H1b: a COMPOUND capture update recomposed into read + typed op
+         * + a plain store. The semantics that must survive are the ones
+         * the capture vector exists for: a write PERSISTS across calls to
+         * the same closure instance (the state lives in the FuncObject,
+         * not the per-call frame), and two instances of the same lambda
+         * are INDEPENDENT. The excluded ops (/ and %) are here too, so
+         * the boxed compound path they keep is exercised beside the
+         * recomposed one. */
+        "typed capture updates: persistence and independence (H1b)",
+        {
+            "func mkc(int start) { return func [start] { start++; "
+                "return start; }; }",
+            "var c = mkc(0);",
+            "assert(c() == 1);",           /* the write persists ... */
+            "assert(c() == 2);",           /* ... call after call */
+            "assert(c() == 3);",
+            "var c2 = mkc(10);",           /* a SECOND instance is its own */
+            "assert(c2() == 11);",
+            "assert(c() == 4);",
+            /* every recomposed op, and a decrement */
+            "func mka(int a) { return func [a] (int k) { a += k; "
+                "return a; }; }",
+            "var fa = mka(1); assert(fa(runtime(2)) == 3);",
+            "assert(fa(runtime(2)) == 5);",
+            "func mkm(int a) { return func [a] (int k) { a -= k; "
+                "return a; }; }",
+            "var fm = mkm(10); assert(fm(runtime(3)) == 7);",
+            "func mkt(int a) { return func [a] (int k) { a *= k; "
+                "return a; }; }",
+            "var ft = mkt(2); assert(ft(runtime(3)) == 6);",
+            "assert(ft(runtime(3)) == 18);",
+            "func mkf(float a) { return func [a] (float x) { a *= x; "
+                "return a; }; }",
+            "var ff = mkf(2.0); assert(ff(runtime(0.5)) == 1.0);",
+            /* the DECLINED ops keep the boxed compound - same answers */
+            "func mkd(int a) { return func [a] (int k) { a /= k; "
+                "return a; }; }",
+            "var fd = mkd(12); assert(fd(runtime(2)) == 6);",
+            "assert(fd(runtime(3)) == 2);",
+            "func mkr(int a) { return func [a] (int k) { a %= k; "
+                "return a; }; }",
+            "var fr = mkr(7); assert(fr(runtime(4)) == 3);",
+            /* a decremented counter crossing zero into negatives */
+            "func mkn(int a) { return func [a] { a--; return a; }; }",
+            "var fn2 = mkn(1);",
+            "assert(fn2() == 0);",
+            "assert(fn2() == -1);",
+            "assert(fn2() == -2);",
         },
     },
 
@@ -19450,35 +19521,36 @@ static bool capture_typed_arith_shapes()
         int want_int;        /* IntBin ops expected in the func chunks */
         int want_float;      /* FloatBin ops expected */
         int want_boxed;      /* BinOpV ops expected */
+        int want_compound;   /* COMPOUND capture stores (the helper call) */
     };
     const std::vector<Case> cases = {
         /* 78_typed_param_call's adder: int capture + int param */
         { "capture: int + int param -> IntBin", {
             "func mk(int base) { return func [base] (int k) "
                 "{ return base + k; }; }",
-            "var f = mk(7); print(f(runtime(3)));" }, 1, 0, 0 },
+            "var f = mk(7); print(f(runtime(3)));" }, 1, 0, 0, 0 },
         /* 78's scaler: float capture * float param */
         { "capture: float * float param -> FloatBin", {
             "func mk(float b) { return func [b] (float x) "
                 "{ return b * x; }; }",
-            "var f = mk(0.5); print(f(runtime(4)));" }, 0, 1, 0 },
+            "var f = mk(0.5); print(f(runtime(4)));" }, 0, 1, 0, 0 },
         /* an INT capture inside a FLOAT expression promotes (the
          * as_float_operand rule for a local, applied to the capture) */
         { "capture: int capture in a float expr -> FloatBin", {
             "func mk(int b) { return func [b] (float x) "
                 "{ return b * x; }; }",
-            "var f = mk(3); print(f(runtime(1.5)));" }, 0, 1, 0 },
+            "var f = mk(3); print(f(runtime(1.5)));" }, 0, 1, 0, 0 },
         /* a captured BOOL is stamped `i` and flows through the int path
          * as 0/1 - exactly what Identifier::eval_int's capture arm does */
         { "capture: bool capture -> IntBin (0/1)", {
             "func mk(bool b) { return func [b] (int k) "
                 "{ return b + k; }; }",
-            "var f = mk(true); print(f(runtime(5)));" }, 1, 0, 0 },
+            "var f = mk(true); print(f(runtime(5)));" }, 1, 0, 0, 0 },
         /* two captures in one chain: BOTH materialize */
         { "capture: two captures in one chain", {
             "func mk(int a, int b) { return func [a, b] (int k) "
                 "{ return a + b + k; }; }",
-            "var f = mk(2, 3); print(f(runtime(4)));" }, 2, 0, 0 },
+            "var f = mk(2, 3); print(f(runtime(4)));" }, 2, 0, 0, 0 },
         /* DECLINE: a `dyn` capture stays BOXED - the gate must fire only
          * on a type INFERENCE PROVED. (`dyn` and not an un-annotated
          * template param on purpose: a template compiles BOTH its base
@@ -19487,12 +19559,47 @@ static bool capture_typed_arith_shapes()
         { "no typed capture: dyn capture", {
             "func mk(dyn base) { return func [base] (int k) "
                 "{ return base + k; }; }",
-            "var f = mk(7); print(f(runtime(3)));" }, 0, 0, 1 },
+            "var f = mk(7); print(f(runtime(3)));" }, 0, 0, 1, 0 },
         /* DECLINE: a STRING capture is not a scalar at all */
         { "no typed capture: str capture", {
             "func mk(str s) { return func [s] (str t) "
                 "{ return s + t; }; }",
-            "var f = mk(\"a\"); print(f(runtime(\"b\")));" }, 0, 0, 1 },
+            "var f = mk(\"a\"); print(f(runtime(\"b\")));" }, 0, 0, 1, 0 },
+
+        /* --- H1b, the STORE side: a compound capture update recomposes
+         * into read + typed op + a PLAIN store (which has a JIT inline
+         * tier; the compound never did). --- */
+
+        /* 11_closure_counter's counter */
+        { "capture store: cap++ -> IntBin + plain store", {
+            "func mk(int start) { return func [start] { start++; "
+                "return start; }; }",
+            "var c = mk(0); print(c());" }, 1, 0, 0, 0 },
+        { "capture store: cap += k", {
+            "func mk(int a) { return func [a] (int k) { a += k; "
+                "return a; }; }",
+            "var c = mk(1); print(c(runtime(2)));" }, 1, 0, 0, 0 },
+        { "capture store: float cap *= x", {
+            "func mk(float a) { return func [a] (float x) { a *= x; "
+                "return a; }; }",
+            "var c = mk(2.0); print(c(runtime(3.0)));" }, 0, 1, 0, 0 },
+        /* DECLINE: `/` and `%` keep the compound store - IntBin carets the
+         * DIVISOR (#76) where the compound carets the statement, so
+         * recomposing them would MOVE a caret (a RULE 2 violation) */
+        { "no recompose: cap /= k (the div0 caret differs)", {
+            "func mk(int a) { return func [a] (int k) { a /= k; "
+                "return a; }; }",
+            "var c = mk(6); print(c(runtime(2)));" }, 0, 0, 0, 1 },
+        { "no recompose: cap %= k", {
+            "func mk(int a) { return func [a] (int k) { a %= k; "
+                "return a; }; }",
+            "var c = mk(7); print(c(runtime(2)));" }, 0, 0, 0, 1 },
+        /* DECLINE: a float rhs into an INT capture needs num_bin_op's
+         * promotion - the typed path would be the wrong type */
+        { "no recompose: float rhs into an int capture", {
+            "func mk(int a) { return func [a] (dyn k) { a += k; "
+                "return a; }; }",
+            "var c = mk(1); print(c(runtime(2)));" }, 0, 0, 0, 1 },
     };
 
     for (const Case &c : cases) {
@@ -19512,7 +19619,7 @@ static bool capture_typed_arith_shapes()
          * which is exactly the code this test reads. */
         VmProgram prog = vm_compile(root.get(), /*jit=*/false);
 
-        int n_int = 0, n_float = 0, n_boxed = 0, n_cap = 0;
+        int n_int = 0, n_float = 0, n_boxed = 0, n_cap = 0, n_comp = 0;
         for (const auto &fd : prog.funcs) {
             if (!fd->vm_chunk)
                 continue;
@@ -19544,16 +19651,25 @@ static bool capture_typed_arith_shapes()
                     n_float++; break;
                 case OpCode::BinOpV:       n_boxed++; break;
                 case OpCode::LoadCaptureV: n_cap++;   break;
+                case OpCode::StoreCaptureV:
+                    /* aop != invalid == the COMPOUND form (the helper
+                     * call H1b exists to avoid); a plain store is the
+                     * recomposed tier's own write. */
+                    if (in.aop != Op::invalid)
+                        n_comp++;
+                    break;
                 default: break;
                 }
             }
         }
         if (n_int != c.want_int || n_float != c.want_float
-                || n_boxed != c.want_boxed) {
+                || n_boxed != c.want_boxed || n_comp != c.want_compound) {
             fprintf(stderr, "capture_typed_arith_shapes: '%s' emitted "
-                            "int=%d float=%d boxed=%d, wanted %d/%d/%d\n",
-                    c.name, n_int, n_float, n_boxed,
-                    c.want_int, c.want_float, c.want_boxed);
+                            "int=%d float=%d boxed=%d compound=%d, wanted "
+                            "%d/%d/%d/%d\n",
+                    c.name, n_int, n_float, n_boxed, n_comp,
+                    c.want_int, c.want_float, c.want_boxed,
+                    c.want_compound);
             return false;
         }
         /* the capture LOAD is unchanged by H1 and must still be there -

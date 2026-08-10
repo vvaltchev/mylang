@@ -3457,3 +3457,40 @@ generic op - the same "a table is audited only for the stages that
 existed when it was written" lesson, one layer up. Sabotage-watched:
 reverting `try_capture_leaf` to decline fails the shape test
 (int=0 boxed=1 where 1/0 was wanted).
+
+## H1b (2026-08-12): a COMPOUND capture update leaves the helper call
+
+`cap++` / `cap OP= v` on a proven int/float capture lowered to a
+COMPOUND StoreCaptureV - `jit_store_capture_compound` -> num_bin_op,
+the ONE capture form the JIT still served with a helper CALL (the
+PLAIN store has had an inline tier since de-helperize 6b, the compound
+never did). It is now RECOMPOSED into the typed tier: H1a's capture
+materialize + IntBin/FloatBin + a PLAIN StoreCaptureV. Three inline
+sequences instead of one call; no new opcode.
+
+**`+ - *` ONLY, and that IS the soundness argument.** For proven
+int/float operands those three cannot throw (`-fwrapv` makes int
+overflow defined, float arithmetic raises nothing in-language), so the
+recomposition has NO error path and therefore no caret to preserve.
+`/` and `%` are excluded on exactly that ground, and the reason is
+MEASURED, not asserted: with `/` recomposed, `a /= k` with k == 0
+carets **line 4, `var c = mk(12);`** (and reports the wrong backtrace
+line) where the tree-walker and the shipped build both caret **line 2,
+`a /= k`** - the recomposed IntBin carries no loc of its own, so the
+pc lookup degenerates to a neighbour (the #88 shape). A moved caret is
+a RULE 2 violation, so the exclusion is now pinned by an `err loc:`
+test on that exact program, beside the shape test's decline case.
+
+CAPTURES only, not globals: a capture is always bound (snapshot at
+closure creation) so the read cannot raise, while a global read can
+(the TDZ's UnboundSymbolEx) and the compound op's undefined-global
+bail would have to be reproduced.
+
+Measured (OPT=1 ASSERTS=0, interleaved --baseline, full suite, H1a+H1b
+together): **11_closure_counter 0.55x** (my/cpp 18.6x -> 9.08x - out
+of the top five entirely), **78 0.80x** (15.6x -> 11.5x), **63_closures
+0.90x** (14.2x -> 11.4x), 67_make_dict 0.96x; suite geomean cur/base
+**0.986x**, my/cpp geomean **2.424x**. Blast radius 4 of 95 corpus
+programs. Sabotages watched failing: storing the pre-update value
+(caught by the persistence test), and re-including `/` (caught by both
+the shape decline and the caret test).
