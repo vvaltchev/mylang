@@ -306,10 +306,40 @@ not global-scope syms; a scoped follow-up), 76 flat BY DESIGN (its
 funcs are value-dispatched - the gate refusing is the soundness
 working), 08/09/46/01 byte-flat.
 
-REMAINING C3 increments: the JIT type-word store elision for proven
-slots (skip half of every scalar two-store where the slot provably
-holds one kind - needs the same proof extended to LOCALS), and the
-lambda-param coverage above.
+**INCREMENT 2 (the TYPE-ELIDED slots) LANDED 2026-08-04.** A
+qualified-but-unpinned local (the pool overflow + the sub-threshold
+picks - same bad() soundness as a pin, minus the register) skips the
+per-write TYPE store; every exit's flush stamps the singleton once
+(`Emitter::tflush`), the barrier bracket restores it before any
+helper that reads full values, and an elided float slot's READ skips
+emit_float_load's 3-way dispatch (provably t_float - the
+guard-elision win). THREE holes found by the suite while landing, each
+now pinned + sabotage-verified:
+- a slot used ONLY by ReturnV (an ARRAY result!) qualified - the >= 3
+  pin threshold had silently protected the pool from that, as its own
+  comment says; elision has no threshold, so the gate is now
+  "int-WRITTEN in the run" (idst);
+- MoveV's cache-aware source is a FULL-VALUE memory read that
+  propagates the stale type word - sources leave both elision sets
+  (`full_read`);
+- the barrier bracket fired only when the INT cache was non-empty -
+  a closure-capture snapshot of an elided dyn local read a `none`
+  type (spurious TypeError); the bracket now fires for float pins and
+  tflush too (float pins had been accidentally safe via the call
+  prologue's payload spill).
+Execution-proven by g_jit_telide; the test shape needed runtime()
+armor (a const-arg pure call folded WHOLE - the trap list's #2, hit
+again). MEASURED: the corpus is BYTE-FLAT (hot writes are pinned or
+lever-A-forwarded already); a 6-hot-accumulator probe - more int
+locals than the 4-wide pool - reads **-6.8%** whole-program. Reach +
+architecture, like prep.
+
+**Lambda-param coverage was assessed and DROPPED as vacuous**:
+11_closure_counter's closure has NO params (its cost is the call
+record + capture RMW), and every other corpus lambda is passed as an
+argument - value-escaped, which is exactly what the C3 gate must
+refuse. The sound cases (a var-bound, calls-only, never-passed lambda
+with params) do not occur in real code; recorded rather than built.
 
 Narrow what a slot write must do when inference proved the slot's type:
 the type-word store (half of every scalar two-store) disappears for

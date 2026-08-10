@@ -19241,6 +19241,69 @@ static bool ref_slots_proven_params()
     return ok;
 }
 
+/*
+ * C3 inc 2 - TYPE-ELIDED slots. A qualified-but-unpinned local's
+ * per-write TYPE store is skipped; every exit's flush stamps the
+ * singleton once, and the barrier bracket restores it before any
+ * helper that reads full values (the closure-capture snapshot and the
+ * dyn ++ were the two shapes that caught stale types during
+ * development - the ordinary suite pins those; this case pins the
+ * flush contract on a shape built to elide: more hot int locals than
+ * the 4-wide pin pool, the 5th+ elided, values crossing an exit into
+ * interpreted code (print reads memory post-flush).
+ */
+static bool jit_telide_c3()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const unsigned long t0 = g_jit_telide;
+    const ExecEngine se = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    std::ostringstream cap;
+    std::streambuf *old = cout.rdbuf(cap.rdbuf());
+    try {
+        const char *lines[] = {
+            "func f(n) {",
+            "    var a = 0; var b = 0; var c = 0; var d = 0; var q = 0;",
+            "    var w = 0;",
+            "    for (var i = 0; i < n; i++) {",
+            "        a += i; b += a; c += b; d += c; q += d; w += q; }",
+            "    return a + b * 3 + c * 7 + d * 11 + q * 13 + w * 17; }",
+            /* runtime(): a const arg folds the whole PURE call at
+             * compile time (the trap list's shape-eater #2 - the first
+             * version printed a baked literal and ran nothing) */
+            "print(f(int(runtime(50))));",
+        };
+        std::string joined;
+        for (const char *l : lines) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (...) { }
+    cout.rdbuf(old);
+    g_exec_engine = se;
+    const std::string got = cap.str();
+    /* the tree-walker's value, computed independently */
+    if (got != "3819049780 \n") {
+        cout << "  telide: got [" << got << "]\n";
+        return false;
+    }
+    if (g_jit_telide == t0) {
+        cout << "  telide: no type-elided fragment ever entered\n";
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_fcache_c2()
 {
 #if ML_JIT_SUPPORTED
@@ -24350,6 +24413,9 @@ static const std::vector<extra_check> extra_checks =
       jit_fcache_c2 },
     { "vm: C3 - inference-proven params leave the ref_slots release scan",
       ref_slots_proven_params },
+    { "jit: C3 - type-elided slots (write elision + the exit/barrier "
+      "type flush)",
+      jit_telide_c3 },
     { "myv: stored-bytecode round trip (dump + run + determinism)",
       myv_round_trip },
     { "myv: Loc escapes - delta table + narrow pool Locs",

@@ -1253,6 +1253,29 @@ fragment entry). Measured (callgrind Ir/scale, OPT=1 ASSERTS=0):
 04_float_arith **-28.0%**, 54_mandelbrot **-22.5%**, 55_float_sum
 **-19.5%**, 40_math_builtins -2.6%; 44/46/43/01/09/34/35 byte-flat.
 
+**C3 inc 2 - TYPE-ELIDED SLOTS (2026-08-04).** A
+qualified-but-unpinned local (pool overflow + sub-threshold - the
+same bad() soundness as an N5 pin, minus the register) skips the
+per-write TYPE store; every exit's flush stamps the singleton once
+(`Emitter::tflush`), the barrier bracket restores it before helpers
+that read full values, and an elided FLOAT slot's read skips
+emit_float_load's dispatch (provably t_float). THREE suite-caught
+holes, each pinned + sabotage-verified: a ReturnV-only slot (an ARRAY
+result) qualified - the >= 3 pin threshold had silently protected the
+pool from that, so the elision gate is int-WRITTEN-in-run (idst);
+MoveV's cache-aware SOURCE is a full-value memory read (stale type
+propagation) - sources leave both elision sets (full_read); and the
+barrier bracket fired only on a non-empty INT cache - a
+closure-capture snapshot of an elided dyn local read a `none` type
+(the bracket now fires for float pins + tflush; float pins had been
+accidentally safe via the prologue payload spill). Proven by
+g_jit_telide; the test needed runtime() armor (const-arg pure fold -
+trap #2 again). MEASURED: corpus BYTE-FLAT (hot writes are pinned or
+forwarded already); a 6-accumulator probe (more hot ints than the
+pool) reads **-6.8%**. Lambda-param coverage was assessed and DROPPED
+as vacuous (11's closure has NO params; every passed lambda is
+value-escaped by design - recorded in the plan).
+
 **C2b - A SECOND HOISTED BASE PER REGION (2026-08-04).** A region's
 second-best candidate (a dot product's other array - 46's $licm0
 beside b) hoists into a CALLEE-saved pair from r12-r15: leftovers

@@ -53,6 +53,7 @@ unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
+unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
@@ -513,6 +514,24 @@ struct Emitter {
                 return c.reg;
         return -1;
     }
+    /* C3 inc 2: TYPE-ELIDED slots - qualified-but-UNPINNED locals (the
+     * pool overflow + the sub-threshold picks). Their payload lives in
+     * memory as before, but the per-write TYPE store is skipped: no op
+     * in the run reads their type word (the same bad() rules that
+     * qualify a pin), and every exit's flush stamps the singleton once
+     * (t_int via rsi / t_float via r8, by `flt`) - the pin pool's
+     * amortization applied to slots that never earned a register.
+     * Barrier brackets restore the types too (their flush runs this
+     * list), so an interpreted helper mid-run reads valid memory. */
+    struct TypedEnt { int slot; int32_t type; bool flt; };
+    std::vector<TypedEnt> tflush;
+    bool telided(int slot, bool flt) const
+    {
+        for (const TypedEnt &t : tflush)
+            if (t.slot == slot && t.flt == flt)
+                return true;
+        return false;
+    }
 
     /* N6a: a CALL-site relocation. A libm call reserves a fixed 12-byte
      * slot (offset `off` in `b`) + records the target; after the buffer is
@@ -582,6 +601,8 @@ struct Emitter {
             store(8 /*r8 = t_float*/, c.type);
             fstore(c.reg, c.payload);
         }
+        for (const TypedEnt &t : tflush)
+            store(t.flt ? 8 : 6, t.type);   /* C3: restore the singleton */
     }
     /* The inverse: re-load every pinned slot's payload from memory. Used with
      * flush_cache to BRACKET an op that reads or writes frame slots the emitter
@@ -663,7 +684,8 @@ struct Emitter {
     {
         u8(0xB8); u32(pc);                                /* mov eax, pc */
         u8(0xE9);
-        (cache.empty() && fcache.empty() ? epi_bare : epi_flush)
+        (cache.empty() && fcache.empty() && tflush.empty()
+             ? epi_bare : epi_flush)
             .push_back(pos());
         u32(0);                                           /* jmp rel32 */
     }
@@ -2688,7 +2710,8 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
         e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
-    e.store(RSI, a.type);        /* the int Type singleton */
+    if (!e.telided(dst, /*flt=*/false))
+        e.store(RSI, a.type);    /* the int Type singleton */
     e.store(src_reg, a.payload);
 }
 
@@ -3261,7 +3284,9 @@ pick_cached_slots(const Chunk &ck, size_t begin,
                   size_t end, int slot_count,
                   std::vector<char> *barrier = nullptr,
                   std::vector<int> *fhot = nullptr,
-                  std::vector<int> *hot_counts = nullptr)
+                  std::vector<int> *hot_counts = nullptr,
+                  std::vector<int> *typed_extra = nullptr,
+                  std::vector<int> *typed_extra_f = nullptr)
 {
     const std::vector<Instr> &code = ck.code;
     /* `barrier[pc-begin] = 1` marks an op that touches frame slots the emitter
@@ -3294,6 +3319,21 @@ pick_cached_slots(const Chunk &ck, size_t begin,
     const auto usei = [&](int s) {
         if (s >= 0) { use[s]++; disq_f.insert(s); }
     };
+    /* C3 inc 2: the slots an int-scalar op WRITES in the run. Only
+     * these can type-elide - a slot merely READ here (an index, a
+     * bound, a ReturnV result - which can be an ARRAY: the >= 3 pin
+     * threshold was what protected the pool from that one, as its
+     * comment says) has no write to elide and must NOT be stamped
+     * t_int at exits. */
+    std::unordered_set<int> idst;
+    const auto usei_dst = [&](int s) {
+        if (s >= 0) { use[s]++; disq_f.insert(s); idst.insert(s); }
+    };
+    /* C3 inc 2: slots some op reads as a FULL 32-byte VALUE from memory
+     * without disqualifying them (MoveV's cache-aware source is the one
+     * such reader) - the copy would propagate the stale type word, so
+     * they may pin but NOT type-elide. */
+    std::unordered_set<int> full_read;
     const auto usef = [&](int s) { if (s >= 0) { use_f[s]++; } };
     /* CACHE AUDIT (env MYLANG_CACHEAUDIT=1): which opcode DISQUALIFIED a
      * slot that would otherwise have been pinned. This is the "what to make
@@ -3341,17 +3381,17 @@ pick_cached_slots(const Chunk &ck, size_t begin,
         case OpCode::IntAddModRI:
             if (!in.a_is_lit()) usei(in.a_slot());
             if (!in.b_is_lit()) usei(in.b_slot());
-            usei(in.target);
+            usei_dst(in.target);
             break;
         case OpCode::IntModRI:
-            usei(in.a_slot()); usei(in.target);
+            usei(in.a_slot()); usei_dst(in.target);
             break;
         case OpCode::JumpUnlessIntCmp:
             if (!in.a_is_lit()) usei(in.a_slot());
             if (!in.b_is_lit()) usei(in.b_slot());
             break;
         case OpCode::ForLoopStep:
-            usei(in.target2);
+            usei_dst(in.target2);
             if (!in.a_is_lit()) usei(in.a_slot());
             if (!in.b_is_lit()) usei(in.b_slot());
             break;
@@ -3363,13 +3403,13 @@ pick_cached_slots(const Chunk &ck, size_t begin,
              * which for a LITERAL rhs is the literal VALUE - would treat that
              * value as a slot index and cache/corrupt whatever slot it
              * collides with (an array slot -> LoadElem InternalErrorEx). */
-            usei(in.a_dual_lo());      /* accumulator */
-            usei(in.target2);          /* counter */
+            usei_dst(in.a_dual_lo());  /* accumulator */
+            usei_dst(in.target2);      /* counter */
             if (!in.b_is_lit()) usei(in.b_slot());      /* rhs slot */
             if (!in.a_is_lit()) usei(in.a_dual_hi());    /* bound slot */
             break;
         case OpCode::LoadImmInt:
-            usei(in.target);
+            usei_dst(in.target);
             break;
         case OpCode::ReturnV:
             /* the result value slot is read by the return. Counting it as an
@@ -3499,7 +3539,9 @@ pick_cached_slots(const Chunk &ck, size_t begin,
              * reads the pin via emit_float_store), and like the int side
              * it contributes NO WEIGHT - a boxed move must never be the
              * evidence a slot holds a float. The DEST stays memory-only
-             * (a MoveV can write ANY type). */
+             * (a MoveV can write ANY type). C3: an UNPINNED source is
+             * copied from memory as a FULL value - no type elision. */
+            full_read.insert(in.target2);
             badf(in.target);
             /* CACHE-AWARE ON THE SOURCE SIDE (see the emit). A pinned source
              * is a proven int, so the move is just the ordinary int store and
@@ -3875,6 +3917,20 @@ pick_cached_slots(const Chunk &ck, size_t begin,
             hot_counts->push_back(cand[i].first);   /* C2b: the weights */
     }
 
+    /* C3 inc 2: EVERY qualified local that did not get a pin - the
+     * pool overflow AND the sub-threshold ones (elision has no
+     * entry-load cost, so no threshold applies). Same soundness as a
+     * pin minus the register. */
+    if (typed_extra) {
+        for (const auto &kv : use)
+            if (kv.first < slot_count && !disq.count(kv.first)
+                    && idst.count(kv.first)
+                    && !full_read.count(kv.first)
+                    && std::find(out.begin(), out.end(), kv.first)
+                       == out.end())
+                typed_extra->push_back(kv.first);
+    }
+
     /* C2a: the float pool's picks - local, undisqualified, >= 3 uses,
      * and WRITTEN by a float op in the run (see the soundness note at
      * the accounting above). Temps are excluded for the pool's usual
@@ -3893,6 +3949,15 @@ pick_cached_slots(const Chunk &ck, size_t begin,
                   });
         for (size_t i = 0; i < fc.size() && i < MAX_FCACHED; i++)
             fhot->push_back(fc[i].second);
+        if (typed_extra_f) {
+            for (const auto &kv : use_f)
+                if (kv.first < slot_count && !disq_f.count(kv.first)
+                        && fdst.count(kv.first)
+                        && !full_read.count(kv.first)
+                        && std::find(fhot->begin(), fhot->end(), kv.first)
+                           == fhot->end())
+                    typed_extra_f->push_back(kv.first);
+        }
     }
 
     /* AUDIT: a slot LOST to disqualification is one that is a resolved
@@ -3971,6 +4036,15 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
         return;
     }
     const SlotAddr a = slot_addr(slot);
+    /* C3 inc 2: a type-ELIDED float slot's type word is stale between
+     * writes and flushes - and provably t_float anyway, so skip the
+     * dispatch (the guard-elision win; reading the stale word took the
+     * wrong arm - a `none` type cvtsi2sd'd a double's bits, the
+     * mandelbrot `inf`). */
+    if (e.telided(slot, /*flt=*/true)) {
+        e.fload(xr, a.payload);
+        return;
+    }
     e.load_type(a.type);                 /* rax = slot type */
     e.cmp_rax_r8();                       /* == t_float ? */
     const size_t j_notf = e.j8(0x75);     /* jne -> not float */
@@ -4016,7 +4090,8 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
         e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
-    e.store_r8_type(a.type);              /* type = t_float */
+    if (!e.telided(dst, /*flt=*/true))
+        e.store_r8_type(a.type);          /* type = t_float */
     e.fstore(xr, a.payload);              /* payload = the double */
 }
 
@@ -9123,6 +9198,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     Emitter e;
     e.cache.clear();                       /* no N5 register cache in a container*/
     e.fcache.clear();                      /* C2a: nor a float one */
+    e.tflush.clear();                      /* C3: nor type elision */
     std::vector<NativeCode::OpMark> marks;  /* -vdj: op-boundary annotations */
     std::vector<size_t> label(n, 0);        /* fragment offset of each body pc */
     std::vector<Fixup> fixups;              /* fragment-local branch fixups */
@@ -9591,6 +9667,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * callee-saved registers this fragment takes over and therefore
          * what frag_entry must push (and what every exit must pop). */
         e.cache.clear();
+        e.tflush.clear();       /* C3: per-RUN like the pools */
         e.fcache.clear();       /* C2a: per-RUN state like the GP pool - a
                                  * stale entry from the previous fragment
                                  * would flush a never-loaded xmm into the
@@ -9619,9 +9696,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             jit_hoist_pick(chunk, begin, end, entries);
         std::vector<int> fhot;                    /* C2a float picks */
         std::vector<int> hot_counts;
+        std::vector<int> textra, textra_f;        /* C3: type-elided */
         std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
-                              &cache_barrier, &fhot, &hot_counts);
+                              &cache_barrier, &fhot, &hot_counts,
+                              &textra, &textra_f);
         /*
          * C2b: allocate a CALLEE-saved pair for the regions' SECOND
          * bases (every region shares one pair - their lifetimes are
@@ -9698,6 +9777,19 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
         }
 #endif
+        /* C3 inc 2: the type-elided slots (see Emitter::tflush) - no
+         * entry state at all, only the write-side elision + the flush's
+         * one type store per exit. */
+        for (const int s : textra)
+            e.tflush.push_back({ s, slot_addr(s).type, false });
+        for (const int s : textra_f)
+            e.tflush.push_back({ s, slot_addr(s).type, true });
+#ifdef TESTS
+        if (!e.tflush.empty()) {
+            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_telide));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+        }
+#endif
 
 
         std::vector<size_t> label(end - begin, 0);
@@ -9769,7 +9861,17 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
              * reload after so anything it wrote is picked up (the ordinary
              * spill-around-a-call). Never a branch op, so the reload always
              * executes. */
-            const bool brk = cache_barrier[pc - begin] && !e.cache.empty();
+            /* C2a/C3: the bracket must also fire for float pins and
+             * TYPE-ELIDED slots - the barrier'd helper reads full
+             * values from memory, where an elided slot's type word is
+             * stale (the closure-capture snapshot of a dyn local read
+             * a `none` type - a spurious TypeError on the counter
+             * shape). Float pins were accidentally safe (the call
+             * prologue spills their payloads), kept here for
+             * robustness. */
+            const bool brk = cache_barrier[pc - begin]
+                && (!e.cache.empty() || !e.fcache.empty()
+                    || !e.tflush.empty());
             std::vector<Emitter::CacheEnt> saved_cache, saved_fcache;
             if (brk) {
                 e.flush_cache();

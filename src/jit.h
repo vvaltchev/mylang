@@ -809,6 +809,8 @@ extern "C" unsigned long g_jit_fcache;        /* C2a: float-pinned fragment
 extern "C" unsigned long g_jit_hoist2;        /* C2b: second-base preheader
                                                * entries (the callee-saved
                                                * pair) */
+extern "C" unsigned long g_jit_telide;        /* C3: type-elided fragment
+                                               * entries */
 extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
 extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
 extern "C" unsigned long g_jit_sync_inline;
