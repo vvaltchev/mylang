@@ -806,6 +806,9 @@ extern "C" unsigned long g_jit_hoist_rmw;     /* C1e: hoisted-COMPOUND
                                                * off r10/r11) */
 extern "C" unsigned long g_jit_fcache;        /* C2a: float-pinned fragment
                                                * entries (xmm4-7) */
+extern "C" unsigned long g_jit_hoist2;        /* C2b: second-base preheader
+                                               * entries (the callee-saved
+                                               * pair) */
 extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
 extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
 extern "C" unsigned long g_jit_sync_inline;

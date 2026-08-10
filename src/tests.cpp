@@ -19267,9 +19267,11 @@ static bool jit_hoist_c1()
 
     auto go = [&](const std::vector<const char *> &src, bool vm,
                   unsigned long *hoist,
-                  unsigned long *rmw = nullptr) -> std::string {
+                  unsigned long *rmw = nullptr,
+                  unsigned long *h2 = nullptr) -> std::string {
         const unsigned long h0 = g_jit_hoist;
         const unsigned long r0 = g_jit_hoist_rmw;
+        const unsigned long s0 = g_jit_hoist2;
         const ExecEngine se = g_exec_engine;
         g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
         std::ostringstream cap;
@@ -19290,6 +19292,7 @@ static bool jit_hoist_c1()
         g_exec_engine = se;
         if (hoist) *hoist = g_jit_hoist - h0;
         if (rmw) *rmw = g_jit_hoist_rmw - r0;
+        if (h2) *h2 = g_jit_hoist2 - s0;
         return cap.str();
     };
 
@@ -19305,6 +19308,8 @@ static bool jit_hoist_c1()
                              * arm to have RUN (g_jit_hoist_rmw - the
                              * shared g_jit_store_fast cannot prove it:
                              * the ordinary tier bumps that one too) */
+        long h2_min = 0;    /* C2b: >=1 requires a SECOND-base preheader
+                             * to have RUN (g_jit_hoist2) */
     };
 
     #define MK_ARR \
@@ -19498,6 +19503,75 @@ static bool jit_hoist_c1()
           "    return s * 7 + t; }",
           "print(f(mk(32), 32));" }, 1 },
 
+      /* ---- C2b: a SECOND base per region ---- */
+
+      /* the dot-product shape (46's inner loop): TWO bases read in one
+       * region - the second hoists into a callee-saved pair (leftover
+       * pool regs here: few int candidates). Both counters prove their
+       * preheaders ran. */
+      { "a two-base region hoists BOTH (the dot-product shape)",
+        { MK_ARR,
+          "func mkb(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i * 3 + 1; i++; }",
+          "    return a; }",
+          "func dot(a, b, n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k] * b[k];",
+          "    return s; }",
+          "print(dot(mk(64), mkb(64), 64));" }, 1, -1, 0, 1 },
+
+      /* the DISPLACEMENT trade: many hot int locals fill the pool, and
+       * the second base's per-element nav saving (12x weight) displaces
+       * the two weakest pins - the second preheader must still run */
+      { "the second base DISPLACES the weakest int pins when it wins",
+        { MK_ARR,
+          "func mkb(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i * 3 + 1; i++; }",
+          "    return a; }",
+          "func f(a, b, n) {",
+          "    var s = 0; var t = 0; var u = 0; var w = 0;",
+          "    for (var k = 0; k < n; k++) {",
+          "        s += a[k] * b[k];",
+          "        t += k; u += t; w += u; }",
+          "    return s * 1000 + (t + u + w) % 997; }",
+          "print(f(mk(64), mkb(64), 64));" }, 1, -1, 0, 1 },
+
+      /* a second base that is STORED to carries the C1b store guards in
+       * its own preheader too (both bases +store) */
+      { "two STORE bases in one region (both guard sets emitted)",
+        { MK_ARR,
+          "func mkb(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = 0; i++; }",
+          "    return a; }",
+          "func f(a, b, n) {",
+          "    for (var k = 0; k < n; k++) { a[k] = k * 2; b[k] = k + 7; }",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k] + b[k];",
+          "    return s; }",
+          "print(f(mk(64), mkb(64), 64));" }, 1, -1, 0, 1 },
+
+      /* the second base's guards go COLD like the first's: a runtime
+       * slice as base2 fails its preheader -> the whole region's cold
+       * twin serves (base1's hoisting is lost too - the documented
+       * trade: the body was emitted with BOTH hoists live and cannot
+       * partially deactivate), values exact. Exactly 3 = the two fill
+       * loops + dot's base1 bump, which precedes base2's failed guard. */
+      { "a slice second base sends the region cold (value parity)",
+        { MK_ARR,
+          "func mkb(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i * 3 + 1; i++; }",
+          "    return a; }",
+          "func dot(a, b, n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) s += a[k] * b[k];",
+          "    return s; }",
+          "var big = mkb(80);",
+          "print(dot(mk(64), big[runtime(4):68], 64));" }, -1, 3 },
+
       /* ---- C1e: the hoisted-COMPOUND element store ---- */
 
       /* `a[j] += j` / `a[k] *= 3` inside hoisted store regions run the
@@ -19648,8 +19722,8 @@ static bool jit_hoist_c1()
 
     bool ok = true;
     for (const Case &c : cases) {
-        unsigned long hoist = 0, rmw = 0;
-        const std::string got = go(c.src, true, &hoist, &rmw);
+        unsigned long hoist = 0, rmw = 0, h2 = 0;
+        const std::string got = go(c.src, true, &hoist, &rmw, &h2);
         const std::string ref = go(c.src, false, nullptr);
         if (got != ref || ref.empty()) {
             cout << "  hoist [" << c.name << "]: tw=[" << ref
@@ -19670,6 +19744,11 @@ static bool jit_hoist_c1()
         if (c.rmw_min >= 1 && rmw == 0) {
             cout << "  hoist [" << c.name << "]: the hoisted-compound "
                     "arm never ran\n";
+            ok = false;
+        }
+        if (c.h2_min >= 1 && h2 == 0) {
+            cout << "  hoist [" << c.name << "]: the second-base "
+                    "preheader never ran\n";
             ok = false;
         }
     }
