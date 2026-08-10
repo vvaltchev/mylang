@@ -950,6 +950,13 @@ extern unsigned long g_jit_norec_retarm_verify;
 extern unsigned long g_jit_norec_mat_walk;
 extern unsigned long g_jit_norec_mat_frames;
 extern unsigned long g_jit_norec_mat_residue;
+/* step 4-v: RECORD-LESS pushes actually made (the fork's prove-it-ran
+ * counter - bumped by the emitted norec arm, so a dead gate cannot fake
+ * it). */
+extern unsigned long g_jit_norec_pushes;
+/* step 4-v: records INSERTED by the switch materializer for record-less
+ * frames (the -3 path's prove-it-ran counter). */
+extern unsigned long g_jit_norec_mat_insert;
 /* step 4-ii(b): the backtrace prefix RECONSTRUCTED at the last
  * rbp-anchored raise, from hardware + baked emit-time constants ONLY
  * (the chain's return addresses -> sites -> site_loc/caller_desc, seeded
@@ -1085,6 +1092,17 @@ extern const void *g_jit_residue_caps;
  * baked as a call target by the emitter. noexcept: a fully-native leaf body is
  * throw-free, so the pop/leave here cannot throw. */
 extern "C" size_t jit_ret(int_type res_slot) noexcept;
+
+/* 4-v: the RECORD-LESS return's decline tier (a ref result / a
+ * non-trivial old dst need C++'s proper steal/release) - jit_ret's twin
+ * with no record to read: the destination comes from the residue
+ * (dst_addr), the frame's identity from the BAKED desc (the returning
+ * chunk is known at its own ReturnV's emit), the parent window from the
+ * chain; the caller's sentinel arm restores the vframe + captures, so
+ * this only steals/writes/releases and un-accounts the frame. */
+extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
+                                const void *descv,
+                                const void *rbp) noexcept;
 
 /* C4c: the address of the TU-local g_vm_resume_chunk (the pc twin is
  * jit_addr_resume_pc above) - the emitted inline pop stores both resume

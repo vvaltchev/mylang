@@ -2699,6 +2699,8 @@ unsigned long g_jit_norec_retarm_verify = 0;
 unsigned long g_jit_norec_mat_walk = 0;
 unsigned long g_jit_norec_mat_frames = 0;
 unsigned long g_jit_norec_mat_residue = 0;
+unsigned long g_jit_norec_pushes = 0;
+unsigned long g_jit_norec_mat_insert = 0;
 /* G1 step 4-iv (design 4d): the MATERIALIZER ANCHOR relay - see jit.h.
  * Written by the emitted slow tail just before each jit_call_sync*
  * helper call; read (and consumed) by the depth-cap SWITCH. Defined
@@ -5745,7 +5747,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
      * fragment's frame (callee-saved + never emitted) at exactly the
      * point step 4's record-less unwind will anchor on it.
      */
-    if (frag_rbp && act.rec_n) {
+    if (frag_rbp && act.rec_n && !jit_norec_forced()) {
         g_jit_norec_raise_frames +=
             norec_walk_chain(&act, static_cast<const char *>(frag_rbp),
                              act.rec_n, nullptr);
@@ -6757,6 +6759,43 @@ extern "C" size_t jit_halt() noexcept
     return JIT_RET_SENTINEL;
 }
 
+/* 4-v: the record-less return's decline tier (see jit.h). The steal /
+ * the dst put are the C++ moves the emitted arm's guards exist for (a
+ * reference result must unregister its slice from the dying slot; a
+ * non-trivial old dst must release); the rest mirrors the emitted arm.
+ * The vframe/captures restores are the CALLER's sentinel arm's job. */
+extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
+                                const void *descv,
+                                const void *rbp) noexcept
+{
+    g_jit_native_returns++;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    const auto *desc = static_cast<const FuncDescriptor *>(descv);
+    const Chunk *ck =
+        desc ? static_cast<const Chunk *>(desc->vm_chunk) : nullptr;
+    ML_CHECK(ck != nullptr);
+    (void)rbp;
+    EvalValue res = res_slot >= 0
+        ? ctx.frame->at(res_slot).steal_value()
+        : EvalValue();
+    LValue *win = ctx.frame->slots;
+    const int_type total = static_cast<int_type>(ck->slot_count)
+                           + ck->n_temps;
+    for (const int32_t s : ck->ref_slots) {
+        if (s >= total)
+            break;
+        LValue &lv = win[s];
+        if (lv.get().get_type()->t >= Type::t_str)
+            lv = LValue();
+    }
+    act.segs[static_cast<size_t>(act.cur_seg)]->top -= total;
+    act.used -= total;
+    if (dst_addr)
+        dst_addr->put(std::move(res));
+    return JIT_RET_SENTINEL;
+}
+
 /* #55 STEP 2.1: native CallVs set up process-wide (coverage - see jit.h). */
 unsigned long g_jit_native_calls = 0;
 unsigned long g_jit_inline_baked = 0;
@@ -7353,6 +7392,9 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
             act.rec_n++;
             act.recs_high = static_cast<uint32_t>(act.records.size());
             act.top_rec = &act.records[act.rec_n - 1];
+#ifdef TESTS
+            g_jit_norec_mat_insert++;
+#endif
         }
         if (!S)
             break;
@@ -8393,6 +8435,9 @@ static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
     const auto *seed = static_cast<const NorecSite *>(g_norec_switch_site);
     if (!seed)
         return;
+    if (jit_norec_forced())
+        return;    /* 4-v: the real INSERT runs; the shadow's positional
+                    * record pairing does not hold in the mixed world */
     const char *fp = entry_rbp;
     if (!fp)
         norec_fail("mat: a relayed site with no rbp", seed, nullptr);
@@ -8559,12 +8604,37 @@ extern "C" void jit_norec_retarm_verify(const void *dst_addr,
 {
 #ifdef TESTS
     VmActivation *act = g_vm_act;
-    if (!act || act->rec_n < 2)
-        norec_fail("retarm: no activation / no parent record", act,
+    if (!act || act->rec_n < 1)
+        norec_fail("retarm: no activation / no record stack", act,
                    nullptr);
     const VmCallRec &rec = act->back_rec();
-    if (!rec.pushed_with_residue)
-        norec_fail("retarm on a residue-less frame", &rec, nullptr);
+    if (!rec.pushed_with_residue) {
+        /* 4-v FORK MODE: the returning frame has NO record - the top
+         * record is an ancestor's, and only the live facts remain
+         * checkable: the discrimination itself (this frame's window is
+         * not the top record's), the baked total vs the vframe (the
+         * push set it from the same chunk), and the window chain's
+         * [rbp-8] being a real pointer distinct from our own window. */
+        EvalContext *fctx = g_current_ctx;
+        if (!fctx || !fctx->frame)
+            norec_fail("retarm fork: no ctx", fctx, nullptr);
+        if (rec.window == fctx->frame->slots)
+            norec_fail("retarm fork: top record IS this frame's",
+                       rec.window, fctx->frame->slots);
+        if (total != static_cast<int_type>(fctx->frame->size))
+            norec_fail("retarm fork: baked total != vframe.size",
+                       reinterpret_cast<const void *>(total),
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(fctx->frame->size)));
+        const char *ffp = static_cast<const char *>(rbp);
+        const void *pwin =
+            *reinterpret_cast<const void *const *>(ffp - 8);
+        if (!pwin || pwin == static_cast<const void *>(fctx->frame->slots))
+            norec_fail("retarm fork: [rbp-8] not a distinct window",
+                       pwin, fctx->frame->slots);
+        g_jit_norec_retarm_verify++;
+        return;
+    }
     if (!rec.run_chunk || !rec.run_chunk->norec_ok)
         norec_fail("retarm: a residue frame whose chunk is not norec_ok",
                    &rec, rec.run_chunk);
@@ -8621,6 +8691,19 @@ extern "C" void jit_norec_push_verify(const void *site,
     VmActivation *act = g_vm_act;
     if (!act || !act->rec_n || !ns)
         norec_fail("no activation/record at a verify", act, ns);
+    /* 4-v FORK: a gate-passing push made NO record - the vframe (the
+     * callee's window, just repointed by the push) differs from the top
+     * record's. Verify exactly that absence plus the gate's own terms,
+     * then stop: every record check below reads a record this frame
+     * does not have. */
+    if (g_current_ctx && g_current_ctx->frame
+            && act->top_rec->window != g_current_ctx->frame->slots) {
+        if (!jit_norec_forced())
+            norec_fail("a record-less push outside the fork", ns,
+                       nullptr);
+        g_jit_norec_verify++;
+        return;
+    }
     norec_check_rec(act->back_rec(), ns);
     g_jit_norec_verify++;
     /*
@@ -8648,7 +8731,7 @@ extern "C" void jit_norec_push_verify(const void *site,
      * change. Once records stop being written the two legitimately
      * diverge (the record below becomes an ancestor) - this pin then
      * moves behind the record-ful case. */
-    if (act->rec_n >= 2) {
+    if (act->rec_n >= 2 && !jit_norec_forced()) {
         const VmCallRec &rec = act->back_rec();
         const VmCallRec &par = act->records[act->rec_n - 2];
         if (rec.parent_window != par.window)
@@ -8718,7 +8801,11 @@ extern "C" void jit_norec_push_verify(const void *site,
      * is decided by the return address alone, so garbage C++ rbp values
      * (frames built without frame pointers) are unreachable.
      */
-    {
+    if (!jit_norec_forced()) {
+        /* the positional record<->frame pairing the walk checks does not
+         * hold once record-less frames interleave (4-v) - the fork's
+         * verification lives in the release machinery + the end-to-end
+         * nets instead */
         const VmCallRec &callee = act->records[act->rec_n - 1];
         if (callee.native_rbp != rbp)
             norec_fail("callee anchor != the push rbp",
@@ -8746,7 +8833,8 @@ extern "C" void jit_norec_push_verify(const void *site,
             /* step 2, the CHAIN: the site's caller chunk must be the
              * frame BELOW's run_chunk - the frame identity the mixed
              * walk (step 3) will derive from interleave order */
-            if (i && rs->caller != act->records[i - 1].run_chunk)
+            if (i && !jit_norec_forced()
+                    && rs->caller != act->records[i - 1].run_chunk)
                 norec_fail("site caller != parent frame's chunk",
                            rs->caller, act->records[i - 1].run_chunk);
             g_jit_norec_audit_frames++;

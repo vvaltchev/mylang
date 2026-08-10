@@ -3068,6 +3068,55 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     e.u8(0x49); e.u8(0x8D); e.u8(0x04); e.u8(0x33);   /* lea rax,[r11+rsi] */
     st(R10, static_cast<int32_t>(P.seg_top), RAX);
     add_m_r(R8R, static_cast<int32_t>(P.act_used), RSI);
+    /*
+     * 4-v THE FORK (MYLANG_JIT_FORCE=norec): a gate-passing call skips
+     * the ENTIRE record - no acquire, no fill, no rec_n++/top_rec - and
+     * joins the shared tail (vframe repoint + binds + captures) with
+     * only the caps-relay store the residue push needs. The gate, per
+     * call: the callee's norec_ok byte (plain + fully deleted + short
+     * ref_slots + no cached-call body), no parked pure-cache key, and -
+     * at a CachedCallV site - no live caller cache (a plain site already
+     * declined that above). The record-REUSE gate above is deliberately
+     * KEPT: a call at a new record high-water declines to the C++ tier
+     * and stays record-ful - only warmed re-descents go record-less,
+     * which is where the hot loops live anyway. Registers on the norec
+     * arm at the join: rdx=window, rsi=total, rcx=cck, r9=ctx, r8=act
+     * all preserved; rax is spilled (the desc at [rsp]), r10/r11 die
+     * with the skipped fill.
+     */
+    size_t j_norec_join = 0;
+    if (jit_norec_forced()) {
+        cmp_b_imm8(RCX, static_cast<int32_t>(P.ck_norec_ok), 0);
+        const size_t j_rec1 = e.j32(0x74);            /* je record path */
+        e.push_reg(RAX);
+        e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_pending_key()));
+        e.u8(0x48); e.u8(0x83); e.u8(0x38); e.u8(0x00);
+                                                      /* cmp qword[rax],0 */
+        e.pop_reg(RAX);                               /* flags kept */
+        const size_t j_rec2 = e.j32(0x75);            /* jne record path */
+        size_t j_rec3 = 0;
+        if (cached) {
+            cmp_q_imm8(R8R,
+                       static_cast<int32_t>(P.act_vframe
+                                            + P.frame_pure_cache), 0);
+            j_rec3 = e.j32(0x75);                     /* jne record path */
+        }
+        /* NOREC: park the caller's captures for the residue push (rax is
+         * spilled - the record path reloads it from [rsp]; r11 is dead
+         * here, the fill it fed is skipped) */
+        ld(RAX, R9R, static_cast<int32_t>(L.ctx_captures));
+        movabs_r11(reinterpret_cast<uint64_t>(&g_jit_residue_caps));
+        st(R11, 0, RAX);
+#ifdef TESTS
+        movabs_r11(reinterpret_cast<uint64_t>(&g_jit_norec_pushes));
+        e.u8(0x49); e.u8(0xFF); e.u8(0x03);           /* inc qword [r11] */
+#endif
+        j_norec_join = e.j32(0xEB);                   /* jmp the tail */
+        e.patch32_here(j_rec1);
+        e.patch32_here(j_rec2);
+        if (cached)
+            e.patch32_here(j_rec3);
+    }
     /* rec r10 = records_start + rec_n * RECSZ; rec_n++; top_rec = rec */
     ld(R10, R8R, static_cast<int32_t>(L.act_records));
     ld(RAX, R8R, static_cast<int32_t>(L.act_rec_n));
@@ -3191,7 +3240,10 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         st(R10, static_cast<int32_t>(P.rec_cache_key), R11);
         st_q_imm32(RAX, 0, 0);
     }
-    /* the view frame */
+    /* the view frame - THE FORK's join (4-v: the record-less arm lands
+     * here with rdx/rsi/rcx/r9/r8 intact and no record made) */
+    if (j_norec_join)
+        e.patch32_here(j_norec_join);
     st(R8R, static_cast<int32_t>(P.act_vframe + P.frame_slots), RDX);
     st32(R8R, static_cast<int32_t>(P.act_vframe + P.frame_size), RSI);
     /* fast_bind arg copies (unrolled; trivial payloads - guarded above):
@@ -3672,6 +3724,13 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.u32(static_cast<uint32_t>(JL.ctx_captures));
         e.movabs(RCX, reinterpret_cast<uint64_t>(JL.addr_act));
         e.u8(0x48); e.u8(0x8B); e.u8(0x09);        /* mov rcx, [rcx] */
+        /* 4-v: vframe.slots = rbx (OUR window) - a record-ful CALLEE's
+         * pop repointed the view via its record's parent fields, but a
+         * record-less callee's arm could only set slots from [rbp-8];
+         * either way OUR window is rbx, so the store is idempotent for
+         * the record path and load-bearing for the record-less one. */
+        e.u8(0x48); e.u8(0x89); e.u8(0x99);        /* mov [rcx+d], rbx */
+        e.u32(static_cast<uint32_t>(JP.act_vframe + JP.frame_slots));
         if (g_cur_caller_desc) {
             e.u8(0xC7); e.u8(0x81);                /* mov dword [rcx+d], */
             e.u32(static_cast<uint32_t>(JP.act_vframe + JP.frame_size));
@@ -3927,14 +3986,24 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
          * those shapes the ref-slot guard walk (34/35 measured +2.4-3.1%
          * with the ref guards first; the fast path pays the same total
          * either way). */
+        size_t j_norec = 0;
+        /* 4-v: the WINDOW COMPARE MUST PRECEDE EVERY RECORD READ - for a
+         * record-less frame, top_rec is an ANCESTOR's record, so testing
+         * its boundary byte first sent every record-less return through
+         * the BOUNDARY arm the moment the ancestor was main (flow
+         * corrupted to `ret`, the dst never written, the caller's size
+         * restore skipped - found by norec_ret_arm reading 0 against 39
+         * record-less pushes). A record-less frame is never boundary; a
+         * record-ful frame's top_rec is its own, so the byte test below
+         * then reads the right record. */
+        const bool arm_norec_pre = jit_lever_forced(JL_NOREC);
+        if (arm_norec_pre) {
+            modrm(0x3B, RBX, R10, static_cast<int32_t>(P.rec_window),
+                  true);                           /* cmp rbx,[r10+win] */
+            j_norec = e.j32(0x75);                 /* jne record-less arm */
+        }
         cmp_b_imm8(R10, static_cast<int32_t>(P.rec_boundary), 0);
         const size_t j_bnd = e.j32(0x75);          /* jne boundary arm */
-        /* 4-iii (MYLANG_JIT_FORCE=norec): a RESIDUE frame takes the
-         * record-less arm below, which sources everything the record
-         * supplies from the residue + baked constants instead. In 4-v
-         * this byte test becomes the window compare and the record
-         * dies. */
-        size_t j_norec = 0;
         /* chunk-local total, NOT g_cur_caller_desc: the value-template
          * instances compile with a null jc, which silently skipped the
          * arm on every one of 76_funcval_dispatch's returns (found by
@@ -3948,11 +4017,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
          * dead-tier find of this step, each by the prove-it-ran
          * counter). The arm writes the none singleton for it, exactly
          * like the record-ful Halt shape. */
-        const bool arm_norec = jit_lever_forced(JL_NOREC);
-        if (arm_norec) {
-            cmp_b_imm8(R10, static_cast<int32_t>(P.rec_residue), 0);
-            j_norec = e.j32(0x75);                 /* jne record-less arm */
-        }
+        const bool arm_norec = arm_norec_pre;
         cmp_q_imm8(R10, static_cast<int32_t>(P.rec_cache_key), 0);
         j_slow.push_back(e.j32(0x75));             /* jne slow */
         cmp_q_imm8(R10, static_cast<int32_t>(P.rec_caller_cache), 0);
@@ -4169,12 +4234,14 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         if (arm_norec) {
             const int32_t my_total =
                 static_cast<int32_t>(ck.slot_count + ck.n_temps);
+            std::vector<size_t> j_nslow;   /* -> jit_ret_norec (no record
+                                            * exists for jit_ret to pop) */
             e.patch32_here(j_norec);
 #ifdef TESTS
-            /* the pre-mutation oracle (jit_norec_retarm_verify):
-             * residue vs record, field for field, while the record is
-             * still whole. Clobbers caller-saved regs - act/top_rec
-             * reloaded after. */
+            /* the pre-mutation oracle (jit_norec_retarm_verify) - under
+             * the fork there is no record; the C++ discriminates and
+             * checks what remains checkable. Clobbers caller-saved regs
+             * - act/top_rec reloaded after. */
             ld(RDI, 5, 24);                    /* rdi = [rbp+24] */
             e.u8(0x48); e.u8(0x89); e.u8(0xEE);/* mov rsi, rbp */
             e.movabs(RDX, static_cast<uint64_t>(
@@ -4186,21 +4253,12 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             ld(R8R, RAX, 0);
             ld(R10, R8R, static_cast<int32_t>(L.act_top_rec));
 #endif
-            /* the PURE-CACHE guards - the tier's exclusion is "no
-             * pure-cache interaction", decided HERE per call: a parked
-             * key (a CachedCallV miss), a stashed caller cache, or a
-             * live cache on the callee frame all need C++ - decline to
-             * jit_ret, whose record is fully valid in 4-iii. A
-             * CachedCallV whose cache never engaged (gcd) passes all
-             * three and gets the tier. */
-            cmp_q_imm8(R10, static_cast<int32_t>(P.rec_cache_key), 0);
-            j_slow.push_back(e.j32(0x75));
-            cmp_q_imm8(R10, static_cast<int32_t>(P.rec_caller_cache), 0);
-            j_slow.push_back(e.j32(0x75));
-            cmp_q_imm8(R8R,
-                       static_cast<int32_t>(P.act_vframe
-                                            + P.frame_pure_cache), 0);
-            j_slow.push_back(e.j32(0x75));
+            /* 4-v: NO cache guards - the gate excludes cached-call
+             * bodies (norec_had_cached), so a record-less frame can
+             * never hold a parked key, a stashed caller cache, or a
+             * live vframe pure cache. The residual declines (a ref
+             * result, a non-trivial old dst) go to jit_ret_norec -
+             * jit_ret would pop an ANCESTOR's record. */
             if (res_listed) {
                 ld(RAX, RBX, static_cast<int32_t>(
                                  res_slot
@@ -4208,7 +4266,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                              + static_cast<int32_t>(L.off_type));
                 cmp_d_imm8(RAX, L.type_t_off,
                            static_cast<int8_t>(L.t_str_val));
-                j_slow.push_back(e.j32(0x7D));     /* a reference result */
+                j_nslow.push_back(e.j32(0x7D));    /* a reference result */
             }
             /* rdx = dst_addr from the residue; 0 = discarded result */
             ld(RDX, 5, 24);
@@ -4217,7 +4275,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             ld(RAX, RDX, static_cast<int32_t>(L.off_type));
             cmp_d_imm8(RAX, L.type_t_off,
                        static_cast<int8_t>(L.t_str_val));
-            j_slow.push_back(e.j32(0x7D));         /* old dst: reference */
+            j_nslow.push_back(e.j32(0x7D));        /* old dst: reference */
             if (res_slot >= 0) {
                 const int32_t s = static_cast<int32_t>(
                     static_cast<long>(res_slot)
@@ -4259,15 +4317,11 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             }
             /* vframe.slots = the caller's window from [rbp-8] (the
              * window chain - record-less); size is the caller's
-             * sentinel arm's job */
+             * sentinel arm's job. NO record bookkeeping: no record was
+             * pushed (4-v), and the top record belongs to an ancestor. */
             ld(RAX, 5, -8);
             st(R8R, static_cast<int32_t>(P.act_vframe + P.frame_slots),
                RAX);
-            /* record bookkeeping while records exist (dies in 4-v) */
-            e.u8(0x49); e.u8(0xFF); e.u8(0x88);    /* dec qword [r8+d] */
-            e.u32(static_cast<uint32_t>(L.act_rec_n));
-            modrm(0x8D, R11, R10, -L.rec_size, true);
-            st(R8R, static_cast<int32_t>(P.act_top_rec), R11);
             /* seg->top -= total; used -= total (baked) */
             modrm(0x63, RAX, R8R, static_cast<int32_t>(P.act_cur_seg),
                   true);                           /* movsxd rax,[curseg] */
@@ -4291,6 +4345,25 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
             e.u32(0xFFFFFFFFu);                    /* mov rax, -1 */
             e.frag_ret();
+            /* the record-less DECLINE tier: jit_ret_norec(res_slot,
+             * [rbp+24], the baked desc, rbp) - the C++ steal/put for a
+             * reference result / a non-trivial old dst; returns the
+             * sentinel in rax */
+            if (!j_nslow.empty()) {
+                for (const size_t j : j_nslow)
+                    e.patch32_here(j);
+                e.movabs(RDI, static_cast<uint64_t>(
+                                  static_cast<int_type>(res_slot)));
+                ld(RSI, 5, 24);                    /* rsi = [rbp+24] */
+                e.movabs(RDX,
+                         reinterpret_cast<uint64_t>(g_cur_caller_desc));
+                e.u8(0x48); e.u8(0x89); e.u8(0xE9);/* mov rcx, rbp */
+                e.call_relocs.push_back(
+                    { e.pos(),
+                      reinterpret_cast<const void *>(jit_ret_norec) });
+                e.u8(0xE8); e.u32(0);
+                e.frag_ret();                      /* rax = the sentinel */
+            }
         }
     }
 
@@ -4998,6 +5071,8 @@ void jit_stats_report()
         { "norec_raise_frames",&g_jit_norec_raise_frames },
         { "norec_ret_arm",    &g_jit_norec_ret_arm },
         { "norec_retarm_vfy", &g_jit_norec_retarm_verify },
+        { "norec_pushes",     &g_jit_norec_pushes },
+        { "norec_mat_insert", &g_jit_norec_mat_insert },
         { "norec_mat_walk",   &g_jit_norec_mat_walk },
         { "norec_mat_frames", &g_jit_norec_mat_frames },
         { "norec_mat_residue",&g_jit_norec_mat_residue },
@@ -11637,7 +11712,11 @@ struct Run { size_t begin, end; };   /* [begin, end) in OLD pc space */
 bool jit_chunk_norec_ok(const Chunk &chunk)
 {
     if (!chunk.plain_frame || chunk.code.empty()
-            || chunk.ref_slots.size() > RET_REF_GUARD_MAX)
+            || chunk.ref_slots.size() > RET_REF_GUARD_MAX
+            || chunk.norec_had_cached)   /* 4-v: a cached-call body could
+                                          * acquire a live vframe pure
+                                          * cache, which a record-less
+                                          * return cannot stash */
         return false;
     for (const Instr &in : chunk.code)
         if (in.op != OpCode::EnterNative)
@@ -12026,6 +12105,18 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * residue no longer exists. */
     struct NorecOkGuard {
         Chunk &c;
+        NorecOkGuard(Chunk &ck) : c(ck)
+        {
+            /* 4-v: the PRE-deletion cached-op scan (see the Chunk field)
+             * - after deletion every op is EnterNative and the fact is
+             * unrecoverable, the audit-table stage trap's shape. */
+            c.norec_had_cached = false;
+            for (const Instr &in : c.code)
+                if (in.op == OpCode::CachedCallV) {
+                    c.norec_had_cached = true;
+                    break;
+                }
+        }
         ~NorecOkGuard() { c.norec_ok = jit_chunk_norec_ok(c); }
     } norec_ok_guard{chunk};
     if (!g_jit_enabled || chunk.code.empty())

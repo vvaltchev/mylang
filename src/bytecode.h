@@ -1682,6 +1682,13 @@ struct Chunk {
      * like `native` and `call_caches`.
      */
     std::vector<std::unique_ptr<NorecSite>> norec_sites;
+    /* 4-v: the PRE-DELETION body contained a CachedCallV (scanned by
+     * NorecOkGuard's ctor, before deletion turns every op into
+     * EnterNative). A record-less frame must never acquire a live
+     * per-frame pure cache - its return arm has no record to stash it
+     * through - so such a chunk fails the norec gate. Derived, never
+     * serialized (like norec_ok). */
+    bool norec_had_cached = false;
 
     /*
      * #55 native calls: this chunk's WHOLE body is a single fully-native run
