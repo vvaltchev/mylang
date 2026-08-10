@@ -100,14 +100,42 @@ make clean
 > `BUILD_DIR=build-claude/dbg`, `BUILD_DIR=build-claude/meas-<sha>` — NEVER
 > in `build/`, `build-rel/`, or any other top-level directory. The
 > maintainer's own build dirs (whatever he creates: `build`, `build-rel`,
-> ...) are OFF-LIMITS: never build into, measure with, or delete them.
-> **⛔ `bench/run.py` DEFAULTS `--mylang` TO `build/mylang` — the
-> maintainer's binary. ALWAYS pass `--mylang build-claude/<lane>/mylang`
-> EXPLICITLY** (and `--baseline` likewise). Omitting it silently times
-> HIS build instead of the change under test: two full-suite runs and a
-> reported geomean were invalid that way on 2026-08-12, and the tell is
-> only the one-line `mylang :` header run.py prints — CHECK IT before
-> quoting any number.
+> ...) are OFF-LIMITS: never build into or measure with them (for
+> DELETING `build/`, see the mandatory pre-benchmark step below — the
+> maintainer's 2026-08-12 instruction, which overrides the older
+> "never delete" wording for that one case).
+>
+> ## ⛔⛔ RULE B1 — NEVER BENCHMARK THE MAINTAINER'S BINARY ⛔⛔
+> ### (maintainer-set 2026-08-12, after it produced two invalid runs)
+>
+> **`bench/run.py` DEFAULTS `--mylang` TO `build/mylang` — THE
+> MAINTAINER'S BINARY, NOT YOURS.** A bare `python3 bench/run.py` does
+> NOT measure your change. It silently measures HIS build, at whatever
+> commit he last compiled, and prints a plausible geomean you will then
+> report as your result. That happened on 2026-08-12: two full-suite
+> runs and a reported "post-flip 2.514x" were all his binary. The
+> maintainer's words: *"it's truly unacceptable."*
+>
+> **THE TWO MANDATORY STEPS, BOTH REQUIRED, EVERY TIME:**
+>
+> 1. **DELETE `build/` BEFORE ANY PERFORMANCE RUN** — `rm -rf build`.
+>    This is the maintainer's explicit instruction and it OVERRIDES the
+>    "never delete his build dirs" clause above for this one purpose.
+>    The point is FAIL-FAST: with `build/` gone, a forgotten `--mylang`
+>    makes run.py die immediately instead of quietly timing the wrong
+>    program. He rebuilds his own tree when he wants it; a silent wrong
+>    number costs far more than his rebuild.
+> 2. **PASS `--mylang build-claude/<lane>/mylang` EXPLICITLY** (and
+>    `--baseline` likewise, when comparing). Never rely on the default.
+>
+> **AND CHECK THE HEADER.** run.py prints one line - `mylang : <path>` -
+> as its first output. READ IT before quoting any number from that run.
+> If it does not name a `build-claude/` path, the run is INVALID: throw
+> the numbers away, do not "sanity-check" them, do not report them.
+>
+> This is restated at the benchmark sections below on purpose. It is the
+> easiest mistake in the repo to make and the hardest to notice, because
+> the wrong answer looks exactly like the right one.
 > Name the lanes descriptively and DELETE throwaway measurement lanes when
 > the measurement is done — 40+ stale `build-meas*` dirs once littered the
 > repo root, which is what triggered this rule. Standard lanes:
@@ -667,6 +695,25 @@ modes with no extra work.
 
 ## Benchmarks
 
+> ## ⛔⛔ BEFORE YOU RUN ANYTHING HERE — RULE B1 ⛔⛔
+>
+> **1. `rm -rf build`** (the maintainer's binary; deleting it before a
+> perf run is his 2026-08-12 instruction — it makes a forgotten flag
+> FAIL instead of silently timing his program).
+> **2. `--mylang build-claude/<lane>/mylang` EXPLICITLY**, every run,
+> plus `--baseline` when comparing. `bench/run.py`'s default `--mylang`
+> is **`build/mylang`, the MAINTAINER'S binary** — a bare
+> `python3 bench/run.py` measures HIS build, not your change, and
+> prints a believable geomean you will report as yours.
+> **3. READ the `mylang : <path>` header line run.py prints.** If it is
+> not a `build-claude/` path, the run is INVALID — discard it.
+>
+> Full statement of the rule under "CLAUDE BUILDS ONLY UNDER
+> `build-claude/`". Two full-suite runs and a reported geomean were
+> invalid this way on 2026-08-12; the maintainer's words were "it's
+> truly unacceptable". The failure is invisible without step 3 —
+> the wrong answer looks exactly like the right one.
+
 `bench/` is a standalone performance suite comparing MyLang against CPython,
 construct by construct
 (`bench/my/NN_name.my` paired with `bench/py/NN_name.py`; a few MyLang-only
@@ -790,6 +837,15 @@ read through `.data()` when you have already proven the range (a flattened
 pool indexed with `operator[]` cost +28 Ir per throw versus the nested form
 it replaced).
 
+**⛔ RULE B1 AGAIN, BECAUSE THIS IS WHERE THE FLAGS ARE CHOSEN: `rm -rf
+build` FIRST, then pass `--mylang build-claude/<lane>/mylang` (and
+`--baseline`) EXPLICITLY, then READ run.py's `mylang : <path>` header.
+The default is the MAINTAINER's `build/mylang`; a bare
+`python3 bench/run.py` times HIS binary and reports a wrong number that
+looks right. The build-config gate below checks `opt`/`asserts` — it
+does NOT check WHOSE binary you handed it, so passing the gate proves
+nothing about this.**
+
 **THE BUILD-CONFIG GATE — AND `--force` IS THE MAINTAINER'S ALONE
 (maintainer-set, 2026-08-01).** `bench/run.py` runs `mylang -v` on EVERY
 binary it will time (the current one AND `--baseline`) and **REFUSES to run**
@@ -807,7 +863,12 @@ numbers are invalid).
 
 **THE "PROVE THE CODE RAN + DISTRUST A SURPRISING RESULT" HARD RULE
 (maintainer-set, 2026-07-19).** Two joined rules, both learned the hard way in
-ONE investigation:
+ONE investigation. **RULE B1 is the third member of this family and the
+crudest: before asking whether the code PATH ran, make sure the BINARY
+was yours — `rm -rf build`, pass `--mylang build-claude/<lane>/mylang`
+explicitly, and read run.py's `mylang :` header line. A run of the
+maintainer's binary is not a weak measurement, it is a measurement of
+something else entirely.**
 
 (1) NEVER draw a conclusion from a performance measurement until you have HARD
 DATA that the code path under test ACTUALLY EXECUTED in that measurement. If
