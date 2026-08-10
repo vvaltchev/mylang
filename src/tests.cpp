@@ -15952,6 +15952,141 @@ static bool jit_native_return()
 #endif
 }
 
+/* C4c: the INLINE frame pop (emit_ret_native) - g_jit_ret_inline is bumped
+ * by the EMITTED fast path itself, so growth proves the inline tier served
+ * the return (jit_ret's own counter also counts declines and cannot).
+ * Covers: the ReturnV shape (recursion - sync-pushed records), the Halt
+ * shape (a void callee - none written to the parent dst), the DISCARDED
+ * dst (-1: the no-write arm), and the decline shapes for CORRECTNESS -
+ * a reference-valued parent dst (the old value needs a C++ release; the
+ * raw-copy sabotage leaks it, LSan-caught) and the cached call (rec.
+ * cache_key set -> vm_frame_leave_cached; fib must still memoize right). */
+static bool jit_ret_inline_c4c()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    /* ReturnV: a deep plain recursion - every level's return is the
+     * common shape (non-boundary, no cache key, trivial int dst). The
+     * splice may halve the RECORD count (two levels per spliced call),
+     * so assert a conservative floor, not an exact count. */
+    unsigned long b = g_jit_ret_inline;
+    if (!run({ "func s(n) { if (n < 1) { return 0; }",
+               "  var t = s(n - 1); return t + n; }",
+               "assert(s(500) == 125250);",
+               "assert(s(500) == 125250);" }))
+        return false;
+    if (g_jit_ret_inline < b + 100) {
+        fprintf(stderr, "jit_ret_inline_c4c: recursion returns did not "
+                        "take the inline pop (%lu)\n", g_jit_ret_inline - b);
+        return false;
+    }
+
+    /* Halt: a void callee's implicit `return none` - the inline pop's
+     * none arm writes the parent dst. */
+    b = g_jit_ret_inline;
+    if (!run({ "func v(int n) { var s = 0;",
+               "  for (var i = 0; i < n; i++) s = s + i; }",
+               "var r = v(runtime(5));",
+               "assert(r == none);" }))
+        return false;
+    if (g_jit_ret_inline <= b) {
+        fprintf(stderr, "jit_ret_inline_c4c: the void (Halt) return did "
+                        "not take the inline pop\n");
+        return false;
+    }
+
+    /* dst == -1: a DISCARDED call statement (the peephole's dead-dst rule)
+     * takes the no-write arm. */
+    b = g_jit_ret_inline;
+    if (!run({ "func w(int n) { var s = 0;",
+               "  for (var i = 0; i < n; i++) s = s + i;",
+               "  return s; }",
+               "for (var k = 0; k < 3; k++) w(runtime(4));" }))
+        return false;
+    if (g_jit_ret_inline <= b) {
+        fprintf(stderr, "jit_ret_inline_c4c: the discarded-dst return did "
+                        "not take the inline pop\n");
+        return false;
+    }
+
+    /* the RELEASE arm: a callee whose ref-listed param HOLDS an array at
+     * return still takes the inline pop - the emitted per-slot check
+     * routes the live reference through jit_release_slot (pop_window's
+     * scan body) instead of declining the whole pop (76's shape). The
+     * counter growth is the proof: before the release arm this shape
+     * declined every return. */
+    /* (a loop-bodied callee: an expression body this small would be
+     * AST-inlined away and no call would survive - shape-eater #1) */
+    b = g_jit_ret_inline;
+    if (!run({ "func h(a, int n) {",
+               "  var s = 0;",
+               "  for (var i = 0; i < n; i++) s = s + len(a);",
+               "  return s + n;",
+               "}",
+               "var arr = [1, 2, 3];",
+               "var t = 0;",
+               "for (var k = 0; k < 40; k++) t = t + h(arr, runtime(2));",
+               "assert(t == 320);" }))
+        return false;
+    if (g_jit_ret_inline < b + 40) {
+        fprintf(stderr, "jit_ret_inline_c4c: the live-reference frame did "
+                        "not take the inline pop (release arm)\n");
+        return false;
+    }
+
+    /* DECLINE correctness 1: the parent dst holds an ARRAY when the call
+     * result overwrites it - the old value needs a C++ release, so the
+     * guard must send this to jit_ret (a raw copy would leak the array:
+     * the sabotage signature, LSan-caught on the ASan lanes). Loop it so
+     * the reference-valued dst recurs; the result must be right. */
+    if (!run({ "func g(int n) { return n * 2; }",
+               "var dyn a = [1, 2, 3];",
+               "for (var k = 0; k < 5; k++) {",
+               "  a = [k, k + 1];",
+               "  a = g(runtime(k));",
+               "  assert(a == k * 2);",
+               "}" }))
+        return false;
+
+    /* DECLINE correctness 2: a CACHED call's callee record carries
+     * cache_key - the store into the caller's cache is C++
+     * (vm_frame_leave_cached); fib must still memoize correctly. */
+    if (!run({ "func fib(n) { if (n < 2) { return n; }",
+               "  return fib(n - 1) + fib(n - 2); }",
+               "assert(fib(20) == 6765);" }))
+        return false;
+    return true;
+#else
+    return true;
+#endif
+}
+
 /* Lever 1 step 5: the fragment-INLINE sync call - g_jit_sync_inline is
  * bumped by the EMITTED code right before the direct `call rdx` into the
  * callee fragment, so a bump proves the inline path (guards + flat push +
@@ -22173,12 +22308,14 @@ static bool jit_op_nativized()
             "}",
             "var f = mk(runtime(7));",
             "assert(f(runtime(5)) == 35);" } },
-        /* Halt: a VOID function's implicit `return none` runs in the fragment
-         * (jit_halt). f's whole body is a fully-native loop ending in Halt (no
-         * `return`), so JIT-on it collapses to a single enter.nat - the Halt's
-         * interpreted original is deleted, so jit_halt is the only code and must
-         * have run. It returns none to the caller (the IN-VM path); main's own
-         * trailing Halt also runs (the boundary path) - both bump the counter. */
+        /* Halt: a VOID function's implicit `return none` runs in the fragment.
+         * f's whole body is a fully-native loop ending in Halt (no `return`),
+         * so JIT-on it collapses to a single enter.nat - the Halt's
+         * interpreted original is deleted, so the native Halt is the only
+         * code. C4c: BOTH its arms (the callee's in-VM pop AND main's
+         * boundary Halt) are now the emitted inline pop, so jit_halt
+         * legitimately starves - the acceptance below takes g_jit_ret_inline
+         * as "ran natively" for this op (the BinOpV inline-tier precedent). */
         { OpCode::Halt, {
             "func f(int n) { var s = 0; for (var i = 0; i < n; i++) s = s + i; }",
             "var r = f(runtime(5));",
@@ -22958,6 +23095,7 @@ static bool jit_op_nativized()
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
         const unsigned long bf = g_jit_boxed_fast;
         const unsigned long s2 = g_jit_store2_fast;
+        const unsigned long ri = g_jit_ret_inline;
         if (!run(c.src)) {
             fprintf(stderr, "jit_op_nativized: op %d WRONG RESULT\n",
                     (int)c.op);
@@ -22973,7 +23111,11 @@ static bool jit_op_nativized()
             ((c.op == OpCode::BinOpV || c.op == OpCode::CmpV
               || c.op == OpCode::CompoundV)
              && g_jit_boxed_fast > bf)
-            || (c.op == OpCode::StoreElem2V && g_jit_store2_fast > s2);
+            || (c.op == OpCode::StoreElem2V && g_jit_store2_fast > s2)
+            /* C4c: Halt (and ReturnV) are served by the emitted inline
+             * pop - jit_halt legitimately starves (both the in-VM and
+             * the boundary arm are inline now). */
+            || (c.op == OpCode::Halt && g_jit_ret_inline > ri);
         if (g_jit_op_run[static_cast<size_t>(c.op)] <= b && !inline_ok) {
             fprintf(stderr, "jit_op_nativized: op %d DID NOT RUN\n",
                     (int)c.op);
@@ -24406,6 +24548,8 @@ static const std::vector<extra_check> extra_checks =
       jit_delete_originals },
     { "jit: native ReturnV runs in the fragment (in-VM + boundary paths)",
       jit_native_return },
+    { "jit: C4c inline frame pop serves the common return shape",
+      jit_ret_inline_c4c },
     { "jit: native CallV (function->function call in the fragment)",
       jit_native_call },
     { "jit: the inline push binds a REFERENCE argument (no slow-tier decline)",

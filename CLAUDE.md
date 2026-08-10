@@ -324,6 +324,61 @@ optimizer, so the reference bind is reached by indirect/value calls and
 by callees too big to inline - the first version of its test exercised
 nothing for exactly that reason.
 
+**C4c - THE INLINE FRAME POP (2026-08-04,
+plans/typed-invariant-arrays.md route item 3) - the return-side twin of
+M5b's inline push.** jit_ret's C++ round trip (globals, steal,
+pop_window, dst put) was ~35% of 10_recursion_deep; the common shape is
+now EMITTED at the ReturnV/Halt site (emit_ret_native, jit.cpp) and
+jit_ret is its SLOW TIER - every guard declines BEFORE any mutation, so
+a decline re-runs the whole pop from scratch, byte-identically. EMIT
+gate: the returning chunk's own `plain_frame` + `ref_slots.size() <= 6`
+(the list must NOT be required empty - a recursion body's call dsts are
+always ref-listed, so an empty gate excludes exactly the motivating
+shape; the first run's counter read 0). RUNTIME guards: `boundary` is
+NOT a decline but a branch to the BOUNDARY ARM (jit_ret's boundary path
+- flow->value raw copy + flow->type = ret - emitted inline; NO pop, the
+C++ owner pops; Halt's boundary is a bare -2 sentinel with flow
+untouched); no `cache_key` (a CachedCallV miss's cache store is a map
+emplace); no `caller_cache` / live vframe.pure_cache (the stash
+restore); the RESULT, if ref-listed, currently trivial (a reference
+result cannot be raw-moved - the slices set would keep pointing at the
+dying slot, the jit_bind_ref_arg lesson - so it declines to jit_ret's
+proper steal); and the parent dst slot's OLD value trivial (a release
+needs C++). A ref-listed slot HOLDING a reference is NOT a decline
+either: the release scan is emitted per listed slot as a type check +
+a cold `jit_release_slot` call (pop_window's exact per-slot assignment,
+slice-unregistration correct by construction) - which is what serves
+76's array-param frames inline. GUARD ORDER is DECLINE-FREQUENCY, not
+per-guard cost: boundary/cached first - the first version put the
+ref-slot guards first and the callback benches read +2.4-3.1% paying a
+dead guard walk per element. The mutations mirror pop_window's fast
+path: raw 32-byte result copy (guards proved both sides trivial),
+resume globals (a native caller ignores them, an EnterNative consumer
+reads them - the callee cannot know which entered it), captures, seg
+top / used / rec_n / top_rec / view frame / cur_seg; the parent record
+is `top_rec - rec_size` (the records vector is contiguous and cannot
+realloc during a pop). A VM_HARDENING build emits a `jit_ret_audit`
+call first, so the C3 every-reference-is-listed net stays alive on the
+SAME emitted path a release runs (never a hardened-only code shape).
+Execution-proven by `g_jit_ret_inline` (emitted incs; the
+jit_ret_inline_c4c test pins the recursion, Halt, discarded-dst, and
+live-reference/release-arm shapes plus the decline-correctness pair);
+sabotage-verified: dst guard (LSan leak), the ref handling (ASan UAF),
+boundary guard (abort), seg-top restore (abort); recorded UNPROVABLE in
+isolation and kept as defense in depth: the cache_key guard (a record
+with a cache key always also carries a stashed caller cache today), the
+release call (skipping it only DELAYS the release to slot-reuse /
+teardown), and the boundary flow-old-value guard (every consumer moves
+flow->value out, leaving none). jit_halt legitimately STARVES (both its
+arms are inline) - the Halt coverage case accepts g_jit_ret_inline as
+"ran natively", the BinOpV-precedent. Measured (callgrind Ir/scale,
+OPT=1 ASSERTS=0 both sides): 10_recursion_deep **-27.8%**,
+11_closure_counter **-18.6%**, 35_map_filter **-17.1%**,
+34_sort_custom_cmp **-15.6%**, 63_closures **-8.2%**,
+76_funcval_dispatch **-7.9%**; 09_fib +0.18% (a cached return pays the
+record guards then declines - the cache store is inherently C++);
+08/01/46 byte-flat per scale.
+
 **Sync-depth accounting (fixed 2026-07-27):** the depth DEC runs AFTER
 `jit_sync_postexit` - at the emitted inline site AND in
 `jit_call_sync_core`'s direct-entry branch - because the postexit's
