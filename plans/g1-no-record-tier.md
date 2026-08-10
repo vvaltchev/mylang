@@ -863,3 +863,34 @@ BUILT SO FAR (dormant until the push fork): NorecSite::{inline_chain,
 inline_pool} (the #88 pair, filled at the emit beside resume_pc);
 the EXIT RELAY (g_norec_exit_desc, stored by both fragment epilogues
 before every pc-exit ret - rcx/rdx scratch, rax carries the pc).
+
+## 4-v MEASURED (2026-08-11, OPT=1 ASSERTS=0, forced-vs-unforced on one
+## binary, interleaved --baseline via an env wrapper)
+
+Callgrind Ir, whole-program at scale 1: 10_recursion_deep -12.2%,
+78_typed_param_call -6.1%, 45_gcd -3.6%, 76_funcval_dispatch -3.0% -
+about ~27-30 Ir per call net (the ~51-instruction fill minus the
+fork's own runtime gate, the residue push/pop pair, and the caps-relay
+store). Wall clock, suite interleaved: 10_recursion 0.75x, 78 0.88x,
+76 0.97x, 45 0.98x, 09_fib 1.02x (the cache decline, as designed);
+suite geomean cur/base 1.011x - the ~70 non-call benches pay ~1% for
+the per-push gate + residue that exist on every emitted sync call
+whether or not the callee qualifies.
+
+DECISION LEFT FOR THE MAINTAINER (inc 5): flip the lever default. The
+raw numbers say the tier wins exactly where the arc aims (the call
+protocol) and taxes everything else slightly; the tax is shrinkable
+before the flip (the unforced side still carries the 4-iii-era
+residue-byte store; a flipped default could drop the lever tests and
+fold the gate into the callee-cache compare), and 10_recursion's full
+reach still wants sumto$0's interpreted CallV nativized. Net 4 (the
+coverage gate) also remains for the flip.
+
+DEFECT LOG for inc 4 (both found by the nets, in order): (1) the
+return arm's window compare MUST precede the boundary byte test - the
+top record is an ANCESTOR's for a record-less frame, and main's
+boundary bit sent every record-less return through the boundary arm
+(flow corrupted, dst unwritten, size restore skipped); norec_ret_arm
+read 0 against 39 record-less pushes, then Frame::at aborted at main's
+print with the callee's stale vframe.size. The counter named the dead
+tier before the abort named the damage.
