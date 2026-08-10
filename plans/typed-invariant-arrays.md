@@ -414,9 +414,10 @@ literal movabs+movq re-materialization (~8), div zero bit-tests (~9),
 plus per-op movsd traffic. C++ keeps the WHOLE expression in
 registers. The route, in increasing depth:
   1. **C4a-ii: float forwarding** - LANDED 2026-08-04, see below;
-  2. **C4b: expression-DAG registerization** - increment 1 LANDED
-     2026-08-04 (literal registers + register arith sources), see
-     below; the full DAG allocator is still open;
+  2. **C4b: expression-DAG registerization** - increments 1 and 2
+     LANDED 2026-08-04 (literal registers + register arith sources;
+     the result picks its register), see below; a full allocator is
+     still open;
   3. **C4c: the return protocol** (10's ~35% jit_ret round trip) -
      LANDED 2026-08-04, see below;
   4. **C4d: struct dst tags** (64's two-stores - the C3-elision idea
@@ -505,13 +506,39 @@ xmm0 and clobbers it, so the ref-listed cold arm destroyed a forwarded
 value. The int side had `keep_rax` for exactly this from the start; the
 float twin shipped without it. Fixed as `keep_x0`.
 
-**Still open for a full C4b**: a real allocator over the whole float
-expression DAG (tracking which register holds which value, so the
-RESULT need not always land in xmm0 and the operand-a moves and the
-non-adjacent temps both disappear). Today's emit is still
-"accumulator in xmm0"; the remaining reg-reg moves on 55 are that
-shape's cost. Widening the pools would want REX-encoded xmm8-15 (the
-current encoders are xmm0-7 only).
+**C4b increment 2 LANDED (2026-08-04): the result picks its
+register.** SSE2 is two-operand, so one operand must occupy the result
+register; pinning that to xmm0 forced an aside-move for every
+forwarded temp (which is every pair in a chain). `farith` takes its
+destination now and `emit_float_operands` returns the {dst, src} pair,
+so the two scratches ALTERNATE down the chain. MEASURED: 55_float_sum
+**-6.7%**, 54_mandelbrot **-3.1%**, 40 -0.8%; 04/01/46 flat.
+
+IT COST A REAL BUG, and the lesson is about the NET, not the bug:
+jit_put_float takes its value in xmm0, and the ref-listed float store
+passed whatever register it was handed - so a non-xmm0 result stored
+STALE xmm0. `-rt` was green; bench/my/55 was off by 1.5. That is the
+SECOND time in one day (the first: C4a-ii's missing keep_x0 reload)
+that a corpus program caught what the suite could not. **The corpus
+differential - tw vs the default engine over bench/ + samples/, 83
+programs - is now part of the routine.** Reproducing it as a test took
+real work, because the trigger needs a reference living in exactly the
+temp whose op has a forwarded b, and that depends on SLOT ALLOCATION:
+a local-bound array shifts the numbering vacuous, `argv` is empty under
+-rt, `clone([..])` misses and `dynarray([..])` hits. So the test
+asserts an emitted-code counter (`g_jit_fstore_movx0`) as well as the
+value - the coverage is provable rather than lucky, and if a future
+change stops the shape covering the arm, the test says so instead of
+passing quietly.
+
+**Still open - a FULL allocator** over the float expression DAG: today
+the two scratches alternate, which handles chains, but a value that
+must live across an intervening op still round-trips through its slot
+(55's two non-adjacent temps), and operand `a` still costs a copy when
+it lives in a pin (SSE2's two-operand form makes that irreducible
+without AVX's three-operand VEX encodings). Widening the pools past
+xmm2/xmm3 wants REX-encoded xmm8-15 - the current encoders are xmm0-7
+only.
 
 **C4c LANDED (2026-08-04): the INLINE frame pop** - the return-side
 twin of M5b's inline push (emit_ret_native, jit.cpp; jit_ret is the

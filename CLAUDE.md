@@ -1364,6 +1364,38 @@ consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
 or the next such gap will also be found only by someone reading a
 disassembly for an unrelated reason.
 
+**C4b inc 2 - THE FLOAT RESULT PICKS ITS REGISTER (2026-08-04).**
+SSE2 arithmetic is TWO-operand (`dst = dst OP src`), so one operand must
+occupy the result register. Forcing that to be xmm0 meant a value
+ALREADY in xmm0 - a C4a-ii forwarded temp, which is every pair in a
+float chain - had to be moved ASIDE before `a` could land there.
+`farith` takes its DESTINATION as a parameter now and
+`emit_float_operands` returns the `{dst, src}` PAIR: with b forwarded,
+`a` is built in the OTHER scratch and the result lands there, so the two
+scratches ALTERNATE down the chain and the aside-move is gone.
+`JitFwd` carries the register (`fin_reg`/`fres_reg`) rather than
+assuming xmm0. The `a`-forwarded case computes over the forwarded
+scratch in place (its temp is dead), and `t OP t` needs no load at all
+(`dst == src == its register`). fmod is the one forced shape - its libm
+call wants x/y in xmm0/xmm1 by the SysV float order.
+**THE BUG THIS COST, and the net that caught it:** jit_put_float takes
+its value in XMM0, and `emit_float_store`'s ref-listed arm passed
+whatever register it was handed - so once the result could be xmm1, that
+arm stored a STALE xmm0. `-rt` stayed green; **bench/my/55 was off by
+1.5**. That is the second time in one day a corpus program caught what
+the suite could not, so the corpus differential (tw vs the default
+engine over bench/ + samples/, 83 programs) is now part of the routine,
+not an afterthought. Reproducing it in a TEST took real work - the
+trigger needs a reference living in exactly the temp whose op has a
+forwarded b, which depends on slot allocation: a local-bound array
+shifts the numbering and the case goes vacuous, `argv` is empty under
+`-rt`, and `clone([...])` misses while `dynarray([...])` hits. Hence
+`g_jit_fstore_movx0`, an emitted-code counter the test ASSERTS, so the
+coverage is provable rather than lucky.
+Measured (Ir/scale, OPT=1 ASSERTS=0): 55_float_sum **-6.7%**,
+54_mandelbrot **-3.1%**, 40_math_builtins -0.8%, 46_matrix_mult -0.02%;
+04/01 byte-flat.
+
 **C4b - FLOAT LITERAL REGISTERS + REGISTER ARITH SOURCES (2026-08-04).**
 Two halves of one idea - a value that already lives in a register should
 be READ there. (1) **`farith` takes its SOURCE register as a parameter**

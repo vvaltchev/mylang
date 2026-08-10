@@ -62,6 +62,7 @@ unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
 unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
 unsigned long g_jit_ffwd = 0;          /* C4a-ii: FLOAT forwarded runs */
 unsigned long g_jit_flit = 0;          /* C4b: literal-pinned frag entries */
+unsigned long g_jit_fstore_movx0 = 0;  /* C4b inc 2: ref-arm result move */
 unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
@@ -820,13 +821,21 @@ struct Emitter {
         u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
     }
     /* addsd/subsd/mulsd xmm0, xmm1 (op = 0x58/0x5C/0x59) */
-    /* addsd/subsd/mulsd/divsd xmm0, xmm<src> (op = 0x58/0x5C/0x59/0x5E).
-     * C4b: the SOURCE is a parameter now. SSE arithmetic can read any
-     * xmm register directly, so a value that ALREADY lives in one - a
-     * C2a-pinned local, a pinned float literal - needs no move into
-     * xmm1 first. src < 8 (no REX): the pools live in xmm2-xmm7. */
-    void farith(uint8_t op, uint8_t src = 1)
-    { u8(0xF2); u8(0x0F); u8(op); u8(static_cast<uint8_t>(0xC0 | src)); }
+    /* addsd/subsd/mulsd/divsd xmm<dst>, xmm<src> (op = 0x58/0x5C/0x59/
+     * 0x5E), computing dst = dst OP src.
+     * C4b inc 1 made the SOURCE a parameter: SSE arithmetic reads any
+     * xmm directly, so a value already in one - a C2a-pinned local, a
+     * pinned literal - needs no move into xmm1 first.
+     * C4b inc 2 makes the DESTINATION one too. SSE2 is two-operand, so
+     * ONE operand must occupy the result register; forcing that to be
+     * xmm0 meant a value already sitting in xmm0 (a forwarded temp) had
+     * to be moved ASIDE before `a` could land there. Letting the result
+     * pick the other scratch instead deletes that move - the result is
+     * then in xmm1, the next op's forwarded operand lives there, and
+     * the two alternate. Both < 8 (no REX): the pools are xmm0-xmm7. */
+    void farith(uint8_t op, uint8_t dst = 0, uint8_t src = 1)
+    { u8(0xF2); u8(0x0F); u8(op);
+      u8(static_cast<uint8_t>(0xC0 | (dst << 3) | src)); }
     /* movq rax, xmm<src> - the div0 bit test's read (C4b: any source). */
     void movq_rax_x(uint8_t src)
     {
@@ -3258,15 +3267,21 @@ struct JitFwd {
     bool skip_write = false;
     bool armed = false; /* the producer's emit confirmed RAX at its exit */
     /*
-     * C4a-ii: the FLOAT twin. Identical protocol, in XMM0 - which is
-     * exactly where a float op leaves its result already (the shape is
-     * load a->xmm0, load b->xmm1, arith xmm0, store xmm0). Parallel
+     * C4a-ii: the FLOAT twin. Identical protocol, in a SCRATCH xmm -
+     * which is where a float op leaves its result anyway. Parallel
      * fields rather than a flag on the int ones: a producer is int or
      * float, never both, and keeping the working int lever's state
-     * untouched is worth four words.
+     * untouched is worth a few words.
+     *
+     * C4b inc 2: the register is no longer always xmm0, so it is
+     * carried explicitly. `fin_reg` is where the CONSUMER finds the
+     * forwarded temp; `fres_reg` is where the PRODUCER just left its
+     * result (the consumer's fin_reg on the next op).
      */
-    int fin_x0 = -1;
+    int fin_temp = -1;
+    uint8_t fin_reg = 0;
     int fprod = -1;
+    uint8_t fres_reg = 0;
     bool fskip_write = false;
     bool farmed = false;
 };
@@ -4607,6 +4622,24 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
     if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                            static_cast<int32_t>(dst))) {
         const size_t jb_fast = emit_ref_check(e, a.type);
+        /* C4b inc 2: jit_put_float takes its value in XMM0 by the SysV
+         * float-argument order, and the result register is no longer
+         * always xmm0 - move it there first. (Missing this stored the
+         * stale xmm0 instead: caught as a 1.5-off result on
+         * bench/my/55, which -rt does not run.) */
+        if (xr != X0) {
+            e.fmov_rr(X0, xr);
+#ifdef TESTS
+            /* the execution proof for this arm: it is reached only when
+             * a ref-listed float dst HOLDS a reference at the store AND
+             * the result landed outside xmm0 - a combination that
+             * depends on slot allocation, so a test must be able to
+             * assert it happened rather than hope. rcx is scratch here
+             * (the ref check used rax; the helper's args come after). */
+            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fstore_movx0));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+#endif
+        }
         emit_put_scalar_call(e, reinterpret_cast<const void *>(jit_put_float),
                              dst);            /* xmm0 holds the value */
         /* C4a-ii: jit_put_float TAKES its value in xmm0 and, being an
@@ -4619,7 +4652,7 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
          * DivisionByZeroEx). COLD arm only - the fast two-store path
          * leaves xmm0 alone, so the hot path pays nothing. */
         if (keep_x0)
-            e.fload(xr, a.payload);
+            e.fload(xr, a.payload);   /* reload into the RESULT register */
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch8(jb_fast, e.pos());           /* fast: */
         e.store_r8_type(a.type);
@@ -4784,58 +4817,99 @@ pick_float_lits(const Chunk &chunk, size_t begin, size_t end)
  *   both same t  - xmm0 has it: copy to xmm1, load nothing.
  */
 /*
- * C4b: RETURNS the register operand b ended up in. It is xmm1 as
- * before whenever b had to be materialised, but when b ALREADY lives in
- * a register - a C2a-pinned local (xmm4-7) or a pinned float literal
- * (xmm2-3) - nothing is emitted at all and its own register is
- * returned, because SSE arithmetic reads any source directly. That
- * deletes a `movsd xmm1, xmm<n>` per such operand, which on a float
- * chain is most of them.
+ * Set up a float binary op's operands, returning the register PAIR the
+ * arith will use: after `farith(op, r.dst, r.src)` the RESULT is in
+ * r.dst, which holds operand `a` beforehand.
  *
- * `force_x1` is for the fmod arm, whose libm call needs y in xmm1 by
- * the SysV float-argument order.
+ * C4b inc 1: an operand that already lives in a register - a C2a-pinned
+ * local (xmm4-7) or a pinned float literal (xmm2-3) - is read there,
+ * with nothing emitted.
+ * C4b inc 2: the DESTINATION is chosen rather than always xmm0. SSE2 is
+ * two-operand, so one operand must occupy the result register; when the
+ * forwarded temp (C4a-ii) is operand `b` it already sits in a scratch,
+ * and the old fixed-xmm0 shape had to move it ASIDE before `a` could
+ * land there. Loading `a` into the OTHER scratch and computing into
+ * that deletes the move - one instruction per forwarded pair, which on
+ * a float chain is every pair.
+ *
+ * `force_x0_x1` is for the fmod arm, whose libm call needs x in xmm0
+ * and y in xmm1 by the SysV float-argument order.
  */
-static uint8_t emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
-                                   bool force_x1 = false)
+struct FOperands { uint8_t dst, src; };
+
+static FOperands emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
+                                     bool force_x0_x1 = false)
 {
-    const int f = g_fwd.fin_x0;
+    const int f = g_fwd.fin_temp;
+    const uint8_t freg = g_fwd.fin_reg;
     const bool fa = f >= 0 && !in.a_is_lit() && in.a_slot() == f;
     const bool fb = f >= 0 && !in.b_is_lit() && in.b_slot() == f;
-    /* where b already lives, if anywhere (forwarding takes priority -
-     * it is in xmm0 and must move before `a` lands there) */
-    int breg = -1;
-    if (!fb && !force_x1) {
-        if (in.b_is_lit())
-            breg = e.flitreg(in.b_flit());
-        else if (const int fr = e.fcreg(in.b_slot()); fr >= 0)
-            breg = fr;
+
+    /* where each operand already lives, if anywhere */
+    const auto home = [&](bool is_lit, float_type lit, int slot) -> int {
+        if (is_lit)
+            return e.flitreg(lit);
+        return e.fcreg(slot);
+    };
+
+    if (fa && fb) {
+        /* the same forwarded temp on both sides (`t * t`): compute in
+         * place, dst == src == its register - no load at all */
+        emit_fwd_fbump(e);
+        if (!force_x0_x1)
+            return { freg, freg };
+        if (freg != X0) e.fmov_rr(X0, freg);
+        e.fmov_rr(X1, X0);
+        return { X0, X1 };
     }
-    /* likewise for a - it must END in xmm0, so a register source is one
-     * move rather than two instructions */
-    const auto load_a = [&]() {
-        if (fa) { emit_fwd_fbump(e); return; }
-        if (in.a_is_lit()) {
-            if (const int lr = e.flitreg(in.a_flit()); lr >= 0) {
-                e.fmov_rr(X0, static_cast<uint8_t>(lr));
-                return;
-            }
-        }
+
+    if (fb) {
+        /* b is forwarded and already in a scratch - keep it there and
+         * build `a` in the OTHER scratch, which becomes the result */
+        emit_fwd_fbump(e);
+        const uint8_t dst = force_x0_x1 ? uint8_t(X0)
+                          : (freg == X0 ? uint8_t(X1) : uint8_t(X0));
+        uint8_t src = freg;
+        if (force_x0_x1 && freg != X1) { e.fmov_rr(X1, freg); src = X1; }
+        if (const int h = home(in.a_is_lit(), in.a_flit(), in.a_slot());
+                h >= 0)
+            e.fmov_rr(dst, static_cast<uint8_t>(h));
+        else
+            emit_float_load(e, dst, in.a_is_lit(), in.a_flit(),
+                            in.a_slot(), pc, /*no_bail=*/true);
+        return { dst, src };
+    }
+
+    if (fa) {
+        /* a is forwarded: its scratch IS the result register (the temp
+         * is dead after this op, so computing over it is free) */
+        emit_fwd_fbump(e);
+        const uint8_t dst = force_x0_x1 ? uint8_t(X0) : freg;
+        if (dst != freg) e.fmov_rr(dst, freg);
+        const uint8_t other = dst == X0 ? uint8_t(X1) : uint8_t(X0);
+        const int h = force_x0_x1 ? -1
+                    : home(in.b_is_lit(), in.b_flit(), in.b_slot());
+        if (h >= 0)
+            return { dst, static_cast<uint8_t>(h) };
+        emit_float_load(e, other, in.b_is_lit(), in.b_flit(), in.b_slot(),
+                        pc, /*no_bail=*/true);
+        return { dst, other };
+    }
+
+    /* neither forwarded: `a` into xmm0, `b` where it lives or xmm1 */
+    if (const int h = home(in.a_is_lit(), in.a_flit(), in.a_slot()); h >= 0)
+        e.fmov_rr(X0, static_cast<uint8_t>(h));
+    else
         emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
                         /*no_bail=*/true);
-    };
-    if (fb) {
-        e.fmov_rr(X1, X0);               /* aside, BEFORE a lands in xmm0 */
-        emit_fwd_fbump(e);
-        if (!fa)
-            load_a();
-        return X1;
+    if (!force_x0_x1) {
+        if (const int h = home(in.b_is_lit(), in.b_flit(), in.b_slot());
+                h >= 0)
+            return { X0, static_cast<uint8_t>(h) };
     }
-    load_a();
-    if (breg >= 0)
-        return static_cast<uint8_t>(breg);   /* already in a register */
     emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
                     /*no_bail=*/true);
-    return X1;
+    return { X0, X1 };
 }
 
 /* N6a: call a libm function `fn` (arg(s) already in xmm0[/xmm1], result
@@ -6400,7 +6474,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * armed by the previous op hands its value over in XMM0), and
          * returning the register operand b actually landed in (its own,
          * when it already lived in a pin or the literal pool). */
-        const uint8_t breg = emit_float_operands(e, in, pc, is_mod);
+        const FOperands ops = emit_float_operands(e, in, pc, is_mod);
         if (fop == 0x5E || is_mod) {
             /* float DIV and MOD throw DivisionByZeroEx on a +-0.0 divisor
              * (TypeFloat::div/mod: fpclassify(rhs) == FP_ZERO). Test the
@@ -6409,7 +6483,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * bits stay nonzero and divide, exactly fpclassify's answer).
              * A bits test avoids a ucomisd NaN pitfall (unordered sets ZF,
              * so a bare `je` would wrongly raise on a NaN divisor). */
-            e.movq_rax_x(breg);                    /* movq rax, xmm<b> */
+            e.movq_rax_x(ops.src);                 /* movq rax, xmm<b> */
             e.u8(0x48); e.u8(0xD1); e.u8(0xE0);    /* shl rax, 1 */
             raise_convey_unless(e, ck, 0x75 /* jnz */, JR_DIV0, pc, old_pc);
         }
@@ -6420,19 +6494,23 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_libm_call(e, reinterpret_cast<const void *>(
                 static_cast<double (*)(double, double)>(&::fmod)));
         else
-            e.farith(fop, breg);
+            e.farith(fop, ops.dst, ops.src);
         /* C4a-ii: the result is in XMM0 - arm the pair, and when the
          * temp is provably dead after the consumer, skip the store
          * entirely (the two-store round trip this lever exists to
          * delete). Nothing is emitted between two ops, so XMM0 carries
          * across the boundary. */
+        /* the result register: the arith's dst, except fmod's libm
+         * call, which always returns in xmm0 */
+        const uint8_t res = is_mod ? uint8_t(X0) : ops.dst;
         const bool fwd_arm = g_fwd.fprod == in.target;
         if (fwd_arm) {
             g_fwd.farmed = true;
+            g_fwd.fres_reg = res;        /* C4b inc 2: WHERE it landed */
             if (g_fwd.fskip_write)
                 return true;
         }
-        emit_float_store(e, ck, X0, in.target, pc, /*keep_x0=*/fwd_arm);
+        emit_float_store(e, ck, res, in.target, pc, /*keep_x0=*/fwd_arm);
         return true;
     }
 
@@ -10650,8 +10728,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             g_fwd.prod = -1;
             g_fwd.skip_write = false;
             g_fwd.armed = false;
-            /* C4a-ii: the float twin, same one-shot discipline in XMM0 */
-            g_fwd.fin_x0 = g_fwd.farmed ? g_fwd.fprod : -1;
+            /* C4a-ii: the float twin, same one-shot discipline - in
+             * whichever scratch the producer's emit reported (C4b) */
+            g_fwd.fin_temp = g_fwd.farmed ? g_fwd.fprod : -1;
+            g_fwd.fin_reg = g_fwd.fres_reg;
             g_fwd.fprod = -1;
             g_fwd.fskip_write = false;
             g_fwd.farmed = false;

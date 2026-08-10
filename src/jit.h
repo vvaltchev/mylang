@@ -832,6 +832,9 @@ extern "C" unsigned long g_jit_ffwd;
 extern "C" unsigned long g_jit_telide_temps;
 /* C4b: fragment entries that pinned float literals in registers. */
 extern "C" unsigned long g_jit_flit;
+/* C4b inc 2: times the ref-listed float-store arm had to move a
+ * non-xmm0 result into xmm0 for jit_put_float (see the emit). */
+extern "C" unsigned long g_jit_fstore_movx0;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)

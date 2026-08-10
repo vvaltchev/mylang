@@ -19819,6 +19819,45 @@ static bool jit_flit_c4b()
         return false;
     }
 
+    /*
+     * C4b inc 2: the RESULT REGISTER is no longer always xmm0, and
+     * jit_put_float takes its value in xmm0 - so the ref-listed float
+     * store must move it there first. This shape executes exactly that
+     * combination: a REFERENCE lives in the temp that the chain's
+     * `x / (x + 1.0)` writes (dynarray() sources it from a builtin, so
+     * unlike a local-bound array it does not shift the temp numbering),
+     * and that op's operand b is FORWARDED, so its result lands in
+     * xmm1. Without the move the store writes a stale xmm0.
+     *
+     * The shape is fragile BY NATURE - it depends on slot allocation -
+     * which is why the counter below is the real assertion and this is
+     * the value check. It is bench/my/55_float_sum's exact shape, and
+     * that bench (which -rt does not run) is what caught the bug: a
+     * 1.5-off sum. `g_jit_fstore_movx0` makes the coverage provable
+     * instead of lucky.
+     */
+    const unsigned long m0 = g_jit_fstore_movx0;
+    const std::string resreg = go({
+        "var scale = 1;",
+        "if (len(dynarray([\"1\"])) > 0)",
+        "    scale = int(dynarray([\"1\"])[0]);",
+        "var N = 400 * scale;",
+        "var total = 0.0;",
+        "for (var i = 1; i < N; i++) {",
+        "    var x = i * 1.0;",
+        "    total += x / (x + 1.0) - 0.5 / x + 1.0 / (x * x);",
+        "}",
+        "print(str(total, 6));" });
+    if (resreg != "391.788786 \n") {
+        cout << "  flit result-reg: got [" << resreg << "]\n";
+        return false;
+    }
+    if (g_jit_fstore_movx0 <= m0) {
+        cout << "  flit result-reg: the ref-arm result move never RAN - "
+                "the shape stopped covering it\n";
+        return false;
+    }
+
     /* the libm DECLINE: correct values with the pool refused */
     const std::string call = go({
         "func h(int n) {",
