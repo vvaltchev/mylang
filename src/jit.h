@@ -828,6 +828,8 @@ extern "C" unsigned long g_jit_fread_temps;
 /* C4a-ii: FLOAT-forwarded consumers RUN (the emitted-code proof, the
  * float twin of g_jit_fwd). */
 extern "C" unsigned long g_jit_ffwd;
+/* C3 inc 3: TEMP slots admitted to the float TYPE-STORE elision. */
+extern "C" unsigned long g_jit_telide_temps;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)

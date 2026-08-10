@@ -450,17 +450,33 @@ the fall-through path (not by reading the dump top to bottom):
     consumer is NOT the adjacent op (`x / (x+1)` is consumed two ops
     later). An extension to non-adjacent pairs needs a real register
     allocator, i.e. C4b;
-  - **7 type stores that C3 should have elided but does not**:
-    `typed_extra_f`'s production is gated `kv.first < slot_count`,
-    LOCALS ONLY, so every float temp still stores its type word per
-    write. Admitting temps needs one extra condition beyond the fread
-    gate - NOT ref-listed - because the flush stamps t_float at every
-    exit including one taken before the first write, and a temp (unlike
-    a local, whose pre-decl window holds `none`) can hold a REFERENCE
-    left by a previous run; stamping over it would hide it from
-    pop_window's release scan. Worth ~7 of 57;
+  - the type stores C3 elided only for LOCALS - **DONE as inc 3, same
+    day** (see below);
   - **3 float literals at 2 instructions each** (`movabs rax, bits` +
     `movq xmm, rax`) - a rip-relative constant pool would halve it.
+
+**C3 inc 3 LANDED (2026-08-04): TEMPS join the float type-store
+elision.** The gate is C4a-i's read gate plus **!ref_listed**, because
+the flush stamps t_float at every exit including one before the run's
+first write, and a temp - unlike a local, whose pre-decl window holds
+`none` - can hold a reference an earlier run left in the frame;
+stamping over it hides it from pop_window's release scan. The guard
+FIRES on real code: `main` reuses its low temps for the argv subscript
+and for a float chain, so 55's r5/r6 stay while r7/r8 elide. Dropping
+it fails the suite AND trips LeakSanitizer (watched). MEASURED:
+55_float_sum **-1.3%**, 40 -0.6%, rest byte-flat - small ONLY because
+C4a-ii went first and had already removed 5 of the 7 writes; the
+non-adjacent-temp probe reads **-3.1%** (64 -> 62 instructions/iter).
+An ordering note worth keeping: doing forwarding before elision made
+the second increment look weak. The pair together is what matters -
+55's hot path went **67 -> 55** across the two.
+
+**55's remaining 55 instructions/iteration**, for whoever picks up
+C4b: 2 non-adjacent chain temps still round-trip (they need a real
+allocator, not a peephole), 3 float literals cost 2 instructions each,
+and the rest is the arithmetic itself plus the counted-loop tail. The
+int type dispatch on `i` at the loop head is correct (an int promoting
+into a float expression).
 
 **C4c LANDED (2026-08-04): the INLINE frame pop** - the return-side
 twin of M5b's inline push (emit_ret_native, jit.cpp; jit_ret is the

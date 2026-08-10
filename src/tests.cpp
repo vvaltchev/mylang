@@ -19643,6 +19643,90 @@ static bool jit_ffwd_c4aii()
 #endif
 }
 
+/*
+ * C3 inc 3: TEMPS admitted to the float TYPE-STORE elision. Two
+ * properties, both needed and both asserted:
+ *   - the mechanism ENGAGES on a float chain through temps
+ *     (g_jit_telide_temps, a compile-time count);
+ *   - the !ref_listed condition REFUSES a temp that can hold a
+ *     reference. That is not hypothetical: `main` reuses its low temps
+ *     for the argv subscript AND for a float chain, so 55's own r5/r6
+ *     are ref-listed and must keep their type stores while r7/r8 elide.
+ *     Here the same shape is built explicitly - an ARRAY through the
+ *     temp the float chain later reuses - and the run must still
+ *     produce the right values (a wrongly-elided slot would stamp
+ *     t_float over a live array handle and hide it from pop_window's
+ *     release scan).
+ */
+static bool jit_telide_temps_c3()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto go = [](const std::vector<const char *> &src) -> std::string {
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return cap.str();
+    };
+
+    /* NON-adjacent temps (forwarding cannot fire, so the per-write type
+     * store is what is left to remove) inside a FUNCTION, where no
+     * reference ever lands in those temps. */
+    const unsigned long t0 = g_jit_telide_temps;
+    const std::string got = go({
+        "func f(int n) {",
+        "  var total = 0.0;",
+        "  for (var i = 1; i < n; i++) {",
+        "    var x = i * 1.0;",
+        "    total += (x + 1.0) * (x + 2.0) + (x + 3.0) * (x + 4.0);",
+        "  }",
+        "  return total; }",
+        "print(str(f(int(runtime(60))), 4));" });
+    if (got != "158946.0000 \n") {
+        cout << "  telide temps: got [" << got << "]\n";
+        return false;
+    }
+    if (g_jit_telide_temps <= t0) {
+        cout << "  telide temps: no temp admitted\n";
+        return false;
+    }
+
+    /* the REF-LISTED shape: an array flows through the low temps that
+     * the float chain then reuses. Values must stay correct. */
+    const std::string mixed = go({
+        "var a = [10, 20, 30];",
+        "var total = 0.0;",
+        "for (var i = 1; i < int(runtime(40)); i++) {",
+        "  var x = i * 1.0;",
+        "  total += (x + 1.0) * (x + 2.0) + a[i % 3] * 1.0;",
+        "}",
+        "print(str(total, 4));" });
+    if (mixed != "23738.0000 \n") {
+        cout << "  telide ref-listed: got [" << mixed << "]\n";
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_fcache_c2()
 {
 #if ML_JIT_SUPPORTED
@@ -24700,6 +24784,8 @@ static const std::vector<extra_check> extra_checks =
       jit_fread_temps_audited },
     { "jit: C4a-ii float dead-temp forwarding (xmm0 hand-off)",
       jit_ffwd_c4aii },
+    { "jit: C3 inc 3 float type-store elision admits safe TEMPS",
+      jit_telide_temps_c3 },
     { "jit: native CallV (function->function call in the fragment)",
       jit_native_call },
     { "jit: the inline push binds a REFERENCE argument (no slow-tier decline)",
