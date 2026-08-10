@@ -1,0 +1,16 @@
+# The element tiers: flat int/float/bool arrays, plain and compound
+# stores, a nested read, and a slice base (each inline tier plus its
+# decline). Sizes are tiny - we check VALUES, not throughput.
+var ai = [0, 0, 0, 0, 0, 0, 0, 0];
+var af = [0.0, 0.0, 0.0, 0.0];
+var ab = [false, false, false, false, false, false, false, false];
+for (var i = 0; i < 8; i++) { ai[i] = i * 3; ab[i] = true; }
+for (var i = 0; i < 4; i++) { af[i] = i * 1.5; }
+for (var i = 0; i < 8; i++) { ai[i] += 2; }
+var m = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+var s = 0;
+for (var r = 0; r < 3; r++)
+    for (var c = 0; c < 3; c++)
+        s += m[r][c];
+var sl = ai[2:5];
+print("elem:", sum(ai), str(sum(af), 2), sum(ab), s, sum(sl));

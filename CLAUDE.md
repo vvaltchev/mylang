@@ -1364,6 +1364,21 @@ consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
 or the next such gap will also be found only by someone reading a
 disassembly for an unrelated reason.
 
+**⛔ BENCHMARKS ARE NOT FUNCTIONAL TESTS (maintainer-set, 2026-08-05).**
+`bench/` measures THROUGHPUT - millions of iterations - and must NEVER
+be used as a correctness corpus. A JIT bug shows on iteration 1 or not
+at all, so running benches for it buys no coverage and costs minutes:
+the first cold-arm stress lane took `-rt` from 2.6s to over TEN
+MINUTES purely because the shapes it needed were buried in benchmark
+loop counts. Functional tests live in **`tests/functional/`** - tiny,
+self-asserting programs that CONSTRUCT the hazard shape on purpose
+(a reference parked in the very temp a float chain reuses, a
+ref-listed loop counter, each element tier and its decline) rather
+than hoping a benchmark happens to contain it. `tests/corpus_diff.sh`
+runs those plus `samples/` in **0.2 seconds**, and its `--cold` matrix
+in 0.7. Write a new dedicated test for the construct under test; do
+not reach for a bench.
+
 **⛔ EMITTER-ONLY CODE LIVES INSIDE `#if ML_JIT_SUPPORTED` (2026-08-05).**
 The lever switches below first sat ABOVE the guard and broke three CI
 lanes at once, none of them reproducible locally: macOS clang
@@ -1397,9 +1412,20 @@ everywhere and both died instantly on a bench program (a real `main`
 reuses its low temps for argv/print AND for the hot loop - exactly the
 collision). Three nets now:
 - **`tests/corpus_diff.sh`** - tree-walker vs the default engine over
-  bench/my + samples (83 programs). RUN IT with -rt, rel-hard, clang
-  and the fuzzer on any JIT/register batch. It is the net that caught
-  both.
+  `tests/functional/` + samples (14 programs, 0.2s). RUN IT with -rt,
+  rel-hard, clang and the fuzzer on any JIT/register batch.
+- **`MYLANG_JIT_COLD=tier[,...]`** - force a guarded tier's DECLINE arm
+  so a path normally reached only by a runtime coincidence becomes the
+  ONLY path (the RECYCLE=1 philosophy for the JIT). `refstore` forces
+  the ref-listed scalar store's release-helper arm. On its FIRST run it
+  found a real latent bug in 0.7s: `store_dst`'s cold arm gated its RAX
+  reload on `keep_rax`, but `ForLoopStep`/`IntAddStep` store the
+  counter and then `cmp rax, <bound>` - so a ref-listed counter taking
+  that arm compared garbage and the loop ran the wrong number of times.
+  The reload is unconditional now (it costs the hot path nothing).
+  Opt in PER CALL SITE via emit_ref_check's `cold` parameter - a
+  first version overrode the shared helper for every caller at once,
+  which is the wrong granularity for a knob meant to isolate one tier.
 - **THE LEVER SWITCHES** (`MYLANG_JIT_OFF=lever[,...]`, jit.cpp): the
   JIT analogue of `--no-opt`, which CLAUDE.md already mandates for AST
   transforms for the same reason (`-nj` is all-or-nothing and localises

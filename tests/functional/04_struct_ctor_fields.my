@@ -1,0 +1,13 @@
+# Standalone POD struct construction + scalar field reads: the H1
+# reuse guards and the planned-ctor byte stores (int and float defs).
+struct Point { int x; int y; }
+struct Vec3 { float x; float y; float z; }
+var sx = 0;
+var fs = 0.0;
+for (var i = 0; i < 4; i++) {
+    var p = Point(i, i * 2);
+    sx += p.x + p.y;
+    var v = Vec3(i * 1.0, i * 2.0, i * 3.0);
+    fs += v.x + v.y + v.z;
+}
+print("struct:", sx, str(fs, 2));

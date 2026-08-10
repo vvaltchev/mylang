@@ -1,0 +1,13 @@
+# Float temps whose consumer is NOT the adjacent op, so forwarding
+# cannot fire and the per-write type store is what is exercised.
+func g(int n) {
+  var total = 0.0;
+  for (var i = 1; i < n; i++) {
+    var x = i * 1.0;
+    total += (x + 1.0) * (x + 2.0) + (x + 3.0) * (x + 4.0);
+  }
+  return total;
+}
+var v = g(int(runtime(5)));
+print("nonadj:", str(v, 4));
+assert(str(v, 4) == "216.0000");
