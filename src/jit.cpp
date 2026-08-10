@@ -137,6 +137,98 @@ bool g_jit_enabled = false;
  * the old self-gate - behavior identical to pre-M5a.
  */
 #if ML_JIT_SUPPORTED
+
+/*
+ * ---- THE JIT LEVER SWITCHES (test infrastructure, 2026-08-04) ----
+ *
+ * INSIDE `#if ML_JIT_SUPPORTED` deliberately: off-platform there is no
+ * emitter to disable, so every one of these would be an unused static
+ * (a -Werror build error on the macOS lane) and its `getenv` an MSVC
+ * C4996 - both of which the first version hit, because it sat above
+ * the guard. Anything that only the emitter consumes belongs in here.
+ *
+ * The JIT is a stack of independent OPTIMIZATION LEVERS (the N5 int
+ * cache, the C2a float cache, C1's hoisting, lever A / C4a-ii
+ * forwarding, C3's type elision, C4b's literal pool...). Each has a
+ * PICK - a cost heuristic deciding whether it engages - and, behind
+ * that, SOUNDNESS guards. Two bugs in one day (C4a-ii's missing xmm0
+ * reload, C4b's non-xmm0 result reaching a helper that reads xmm0)
+ * showed that neither `-rt` nor the fuzzer can reach these: they need a
+ * program shape, a runtime state AND an emitter decision to coincide,
+ * and every existing net varies only the first.
+ *
+ * These knobs vary the other two, and they are the JIT analogue of the
+ * `--no-opt` per-pass switches CLAUDE.md already mandates for AST
+ * transforms ("the engine differential cannot see a bug in one, so the
+ * only oracle is the same program with the pass off"). `-nj` is
+ * all-or-nothing and localizes nothing.
+ *
+ *   MYLANG_JIT_OFF=lever[,...]    disable a lever entirely.
+ *   MYLANG_JIT_FORCE=lever[,...]  ignore a lever's COST heuristic (never
+ *                                 its soundness guards) - so a lever
+ *                                 runs in shapes it would normally
+ *                                 decline as unprofitable. This is the
+ *                                 half with real catch power: it tests
+ *                                 a gate's CORRECTNESS independently of
+ *                                 its PROFITABILITY, which is exactly
+ *                                 how C4b's epilogue restore was
+ *                                 verified (by hand, then).
+ * `MYLANG_JIT_OFF=all` / `MYLANG_JIT_FORCE=all` select everything.
+ *
+ * A third knob - forcing a guarded inline tier to take its DECLINE arm,
+ * so a rare cold path becomes the only path - is DESIGNED but NOT here:
+ * a first attempt overrode the SHARED `emit_ref_check`, which several
+ * call sites use with different fall-through expectations, and
+ * 43_sieve raised OutOfBounds. It needs per-CALL-SITE opt-in, and a
+ * bounded run lane (forcing every scalar store through a helper made
+ * `-rt` go from 2.6s to over 10 minutes). See the task.
+ */
+enum JitLever {
+    JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
+    JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_COUNT
+};
+static const char *const jit_lever_names[JL_COUNT] = {
+    "cache", "fcache", "telide", "fread", "flit",
+    "fwd", "ffwd", "resreg", "hoist", "hoist2"
+};
+static unsigned jit_parse_mask(const char *env, const char *const *names,
+                               int n)
+{
+    const char *v = getenv(env);
+    if (!v || !*v)
+        return 0;
+    if (!strcmp(v, "all"))
+        return (n >= 32) ? ~0u : ((1u << n) - 1);
+    unsigned m = 0;
+    for (const char *p = v; *p; ) {
+        const char *e = strchr(p, ',');
+        const size_t len = e ? static_cast<size_t>(e - p) : strlen(p);
+        for (int i = 0; i < n; i++)
+            if (strlen(names[i]) == len && !strncmp(names[i], p, len))
+                m |= 1u << i;
+        p = e ? e + 1 : p + len;
+    }
+    return m;
+}
+static unsigned jit_off_mask()
+{
+    static const unsigned m =
+        jit_parse_mask("MYLANG_JIT_OFF", jit_lever_names, JL_COUNT);
+    return m;
+}
+static unsigned jit_force_mask()
+{
+    static const unsigned m =
+        jit_parse_mask("MYLANG_JIT_FORCE", jit_lever_names, JL_COUNT);
+    return m;
+}
+/* OFF wins over FORCE (a disabled lever stays disabled). */
+static bool jit_lever_off(JitLever l) { return jit_off_mask() & (1u << l); }
+static bool jit_lever_forced(JitLever l)
+{
+    return !jit_lever_off(l) && (jit_force_mask() & (1u << l));
+}
+
 #if defined(__SANITIZE_ADDRESS__)
 #  define ML_NSTACK_OFF 1
 #elif defined(__has_feature)
@@ -3295,6 +3387,8 @@ static bool jit_slot_ref_listed(const Chunk &ck, int slot)
 
 static bool jit_fwd_producer(const Instr &in, int &dst)
 {
+    if (jit_lever_off(JL_FWD))
+        return false;
     switch (in.op) {
     case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
     case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
@@ -3327,6 +3421,8 @@ static bool jit_fwd_producer(const Instr &in, int &dst)
  */
 static bool jit_fwd_fproducer(const Instr &in, int &dst)
 {
+    if (jit_lever_off(JL_FFWD))
+        return false;
     switch (in.op) {
     case OpCode::FloatBin:
     case OpCode::FloatAddRR: case OpCode::FloatSubRR:
@@ -4760,9 +4856,15 @@ pick_float_lits(const Chunk &chunk, size_t begin, size_t end)
             for (size_t q = static_cast<size_t>(in.target); q <= pc; q++)
                 in_loop[q - begin] = 1;
     }
-    for (size_t pc = begin; pc < end; pc++)
-        if (in_loop[pc - begin] && op_calls_on_hot_path(chunk.code[pc]))
-            return {};
+    if (jit_lever_off(JL_FLIT))
+        return {};
+    /* FORCE skips the COST gate (calls in the loop re-materialise the
+     * pool) but NOT correctness - emit_call_epilogue restores it either
+     * way, which is precisely the property this lets a test check. */
+    if (!jit_lever_forced(JL_FLIT))
+        for (size_t pc = begin; pc < end; pc++)
+            if (in_loop[pc - begin] && op_calls_on_hot_path(chunk.code[pc]))
+                return {};
 
     /* weight: an operand-b literal saves BOTH instructions, an
      * operand-a literal saves one (it still has to reach xmm0) */
@@ -4838,12 +4940,18 @@ pick_float_lits(const Chunk &chunk, size_t begin, size_t end)
 struct FOperands { uint8_t dst, src; };
 
 static FOperands emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
-                                     bool force_x0_x1 = false)
+                                     bool force_x0_x1 = false)   /* by
+                                      * VALUE: JL_RESREG rewrites it */
 {
     const int f = g_fwd.fin_temp;
     const uint8_t freg = g_fwd.fin_reg;
     const bool fa = f >= 0 && !in.a_is_lit() && in.a_slot() == f;
     const bool fb = f >= 0 && !in.b_is_lit() && in.b_slot() == f;
+    /* JL_RESREG off: the pre-C4b-inc-2 shape, result always in xmm0
+     * (force_x0_x1 is exactly that constraint minus the b-in-xmm1 part,
+     * so reusing it keeps ONE code path rather than two) */
+    if (jit_lever_off(JL_RESREG))
+        force_x0_x1 = true;
 
     /* where each operand already lives, if anywhere */
     const auto home = [&](bool is_lit, float_type lit, int slot) -> int {
@@ -10514,8 +10622,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          */
         g_hoist = JitHoist{};
         g_hoist2 = JitHoist{};
-        const std::vector<HoistRegion> hregs =
+        std::vector<HoistRegion> hregs =
             jit_hoist_pick(chunk, begin, end, entries);
+        if (jit_lever_off(JL_HOIST))
+            hregs.clear();
+        else if (jit_lever_off(JL_HOIST2))
+            for (HoistRegion &hr : hregs) hr.base2 = -1;
         std::vector<int> fhot;                    /* C2a float picks */
         std::vector<int> hot_counts;
         std::vector<int> textra, textra_f;        /* C3: type-elided */
@@ -10524,6 +10636,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
                               &cache_barrier, &fhot, &hot_counts,
                               &textra, &textra_f, &fread_raw);
+        /* the per-lever kill switches (see JitLever): applied HERE, on
+         * the pick's OUTPUT, so one place disables a lever no matter
+         * how many emit sites consume it. */
+        if (jit_lever_off(JL_CACHE))   { hot.clear(); hot_counts.clear(); }
+        if (jit_lever_off(JL_FCACHE))  fhot.clear();
+        if (jit_lever_off(JL_TELIDE))  { textra.clear(); textra_f.clear(); }
+        if (jit_lever_off(JL_FREAD))   fread_raw.clear();
         /*
          * C2b: allocate a CALLEE-saved pair for the regions' SECOND
          * bases (every region shares one pair - their lifetimes are
@@ -10672,7 +10791,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         for (const int s : textra_f)
             e.tflush.push_back({ s, slot_addr(s).type, true });
         for (const int s : e.fread)
-            if (s >= chunk.slot_count && !jit_slot_ref_listed(chunk, s)) {
+            if (!jit_lever_off(JL_TELIDE)
+                    && s >= chunk.slot_count
+                    && !jit_slot_ref_listed(chunk, s)) {
                 e.tflush.push_back({ s, slot_addr(s).type, true });
 #ifdef TESTS
                 g_jit_telide_temps++;

@@ -1364,6 +1364,64 @@ consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
 or the next such gap will also be found only by someone reading a
 disassembly for an unrelated reason.
 
+**⛔ EMITTER-ONLY CODE LIVES INSIDE `#if ML_JIT_SUPPORTED` (2026-08-05).**
+The lever switches below first sat ABOVE the guard and broke three CI
+lanes at once, none of them reproducible locally: macOS clang
+`unused function 'jit_lever_forced' [-Werror]` (off-platform nothing
+calls them) and MSVC `C4996` on their `getenv` (inside the guard it is
+never compiled - which is why jit.cpp's OTHER getenv calls are fine).
+The same push also hit `std::binary_search` in vm.cpp with no
+`#include <algorithm>`: GCC and the local clang pulled it in
+transitively, the runners' newer stdlib does not. **Before pushing a
+JIT batch, compile the NON-JIT path**: temporarily flip jit.h's
+`#if defined(__linux__) && defined(__x86_64__)` to `#if 0`, build with
+BOTH g++ and clang++, run `-rt` (JIT mode self-skips; still
+1715/1715), restore. And build once with **CMake** - that is what CI
+runs, and `make` alone passed all three broken configurations.
+
+**⛔ THE JIT'S TEST NETS - AND THE AXIS THEY ALL MISSED (2026-08-04).**
+A JIT register bug needs THREE things to coincide: a PROGRAM SHAPE
+(which temps are shared between reference-producing code and the hot
+chain - slot allocation), a RUNTIME STATE (that slot actually holding a
+reference when the guarded op runs, so the cold arm is taken), and an
+EMITTER DECISION (which register the value is in - forwarding armed?
+result in xmm0 or xmm1? pinned?). Measured against that: `-rt` varies
+only the first, weakly (hand-written tests have few locals, so their
+temps rarely collide); `tests/nested_fuzz.py` varies control flow but
+is **INT-ONLY** by construction - it maintains a CPython twin, which
+forbids int `/`, negative `%`, >64-bit ints and dict iteration - so it
+can never build a reference/float temp collision; the 5-mode
+differential is an excellent ORACLE over those same programs. Nothing
+varied axes 2 or 3. That is why TWO bugs in one day were green
+everywhere and both died instantly on a bench program (a real `main`
+reuses its low temps for argv/print AND for the hot loop - exactly the
+collision). Three nets now:
+- **`tests/corpus_diff.sh`** - tree-walker vs the default engine over
+  bench/my + samples (83 programs). RUN IT with -rt, rel-hard, clang
+  and the fuzzer on any JIT/register batch. It is the net that caught
+  both.
+- **THE LEVER SWITCHES** (`MYLANG_JIT_OFF=lever[,...]`, jit.cpp): the
+  JIT analogue of `--no-opt`, which CLAUDE.md already mandates for AST
+  transforms for the same reason (`-nj` is all-or-nothing and localises
+  nothing). Levers: cache, fcache, telide, fread, flit, fwd, ffwd,
+  resreg, hoist, hoist2, `all`. `tests/corpus_diff.sh BIN --levers`
+  runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
+  design - the coverage tests assert their own lever ran - so the
+  matrix runs against the CORPUS, not the suite.
+- **`MYLANG_JIT_FORCE=lever[,...]`** - ignore a lever's COST heuristic
+  but NOT its soundness guards, so it engages in shapes it would
+  normally decline as unprofitable. This is the half with real catch
+  power: it tests a gate's CORRECTNESS independently of its
+  PROFITABILITY. `FORCE=flit` is how C4b's "correctness lives in
+  emit_call_epilogue, not the gate" claim is checked.
+A fourth - forcing a guarded tier's DECLINE arm so a rare cold path
+becomes the only path (the RECYCLE=1 philosophy for the JIT) - is
+DESIGNED and NOT BUILT: a first attempt overrode the SHARED
+`emit_ref_check`, whose call sites have different fall-through
+expectations, and 43_sieve raised OutOfBounds; it needs per-CALL-SITE
+opt-in plus a bounded lane (forcing every scalar store through a helper
+took `-rt` from 2.6s to over 10 minutes).
+
 **C4b inc 2 - THE FLOAT RESULT PICKS ITS REGISTER (2026-08-04).**
 SSE2 arithmetic is TWO-operand (`dst = dst OP src`), so one operand must
 occupy the result register. Forcing that to be xmm0 meant a value
