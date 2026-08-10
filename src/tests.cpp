@@ -17880,28 +17880,34 @@ static bool jit_ret_inline_c4c()
     /* ReturnV: a deep plain recursion - every level's return is the
      * common shape (non-boundary, no cache key, trivial int dst). The
      * splice may halve the RECORD count (two levels per spliced call),
-     * so assert a conservative floor, not an exact count. */
-    unsigned long b = g_jit_ret_inline;
+     * so assert a conservative floor, not an exact count.
+     * The property is "served INLINE, not by the jit_ret helper" -
+     * under MYLANG_JIT_FORCE=norec the record-less arm (4-iii) serves
+     * the same returns, so the two counters are summed. */
+    const auto inline_rets = []() {
+        return g_jit_ret_inline + g_jit_norec_ret_arm;
+    };
+    unsigned long b = inline_rets();
     if (!run({ "func s(n) { if (n < 1) { return 0; }",
                "  var t = s(n - 1); return t + n; }",
                "assert(s(500) == 125250);",
                "assert(s(500) == 125250);" }))
         return false;
-    if (g_jit_ret_inline < b + 100) {
+    if (inline_rets() < b + 100) {
         fprintf(stderr, "jit_ret_inline_c4c: recursion returns did not "
-                        "take the inline pop (%lu)\n", g_jit_ret_inline - b);
+                        "take the inline pop (%lu)\n", inline_rets() - b);
         return false;
     }
 
     /* Halt: a void callee's implicit `return none` - the inline pop's
      * none arm writes the parent dst. */
-    b = g_jit_ret_inline;
+    b = inline_rets();
     if (!run({ "func v(int n) { var s = 0;",
                "  for (var i = 0; i < n; i++) s = s + i; }",
                "var r = v(runtime(5));",
                "assert(r == none);" }))
         return false;
-    if (g_jit_ret_inline <= b) {
+    if (inline_rets() <= b) {
         fprintf(stderr, "jit_ret_inline_c4c: the void (Halt) return did "
                         "not take the inline pop\n");
         return false;
@@ -17909,13 +17915,13 @@ static bool jit_ret_inline_c4c()
 
     /* dst == -1: a DISCARDED call statement (the peephole's dead-dst rule)
      * takes the no-write arm. */
-    b = g_jit_ret_inline;
+    b = inline_rets();
     if (!run({ "func w(int n) { var s = 0;",
                "  for (var i = 0; i < n; i++) s = s + i;",
                "  return s; }",
                "for (var k = 0; k < 3; k++) w(runtime(4));" }))
         return false;
-    if (g_jit_ret_inline <= b) {
+    if (inline_rets() <= b) {
         fprintf(stderr, "jit_ret_inline_c4c: the discarded-dst return did "
                         "not take the inline pop\n");
         return false;
@@ -17929,7 +17935,7 @@ static bool jit_ret_inline_c4c()
      * declined every return. */
     /* (a loop-bodied callee: an expression body this small would be
      * AST-inlined away and no call would survive - shape-eater #1) */
-    b = g_jit_ret_inline;
+    b = inline_rets();
     if (!run({ "func h(a, int n) {",
                "  var s = 0;",
                "  for (var i = 0; i < n; i++) s = s + len(a);",
@@ -17940,7 +17946,7 @@ static bool jit_ret_inline_c4c()
                "for (var k = 0; k < 40; k++) t = t + h(arr, runtime(2));",
                "assert(t == 320);" }))
         return false;
-    if (g_jit_ret_inline < b + 40) {
+    if (inline_rets() < b + 40) {
         fprintf(stderr, "jit_ret_inline_c4c: the live-reference frame did "
                         "not take the inline pop (release arm)\n");
         return false;

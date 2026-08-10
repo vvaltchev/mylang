@@ -1632,6 +1632,16 @@ struct VmCallRec {
      * instead of walking into the native caller's record. */
     unsigned char sync_stop = 0;
 
+    /* G1 step 4-iii (plans/g1-no-record-tier.md 4c): this frame was
+     * pushed by an emitted site that ALSO pushed the 2-qword RESIDUE
+     * ([dst_addr][captures]) on the native stack, so the callee's
+     * record-less return arm may consume it. Written by the emitted
+     * push only under MYLANG_JIT_FORCE=norec (1 at plain sites, 0 at
+     * cached ones - a reused record must be overwritten); zeroed by
+     * every C++ push. Dies with the record in step 4-v, where the
+     * discrimination becomes the window compare. */
+    unsigned char pushed_with_residue = 0;
+
     /* The CALLER's per-frame pure-call cache, stashed while a callee runs:
      * eval.cpp reaches the cache as `ctx->frame->pure_cache`, and the view
      * Frame is SHARED across the whole activation - without the stash the
@@ -1798,6 +1808,9 @@ struct VmActivation {
         rec.seg = cur_seg;
         rec.seg_top_before = sg->top;
         rec.boundary = boundary;
+        rec.pushed_with_residue = 0;   /* a C++ push has no residue - and
+                                        * a REUSED record must not keep a
+                                        * prior emitted push's flag */
         rec.sync_stop = 0;               /* a REUSED record must not carry a
                                           * stale lean-sync stop mark */
         rec.norec_site = nullptr;        /* every C++ push nulls the G1 site
@@ -2649,6 +2662,8 @@ unsigned long g_jit_norec_gate_plain = 0;
 unsigned long g_jit_norec_gate_body = 0;
 unsigned long g_jit_norec_raise_walk = 0;
 unsigned long g_jit_norec_raise_frames = 0;
+unsigned long g_jit_norec_ret_arm = 0;
+unsigned long g_jit_norec_retarm_verify = 0;
 #ifdef TESTS
 std::vector<NorecReconFrame> g_norec_recon;
 #endif
@@ -7631,6 +7646,8 @@ void jit_fill_push_layout(JitPushLayout *L)
         reinterpret_cast<const char *>(&r.norec_site) - rb;
     L->rec_native_rbp =
         reinterpret_cast<const char *>(&r.native_rbp) - rb;
+    L->rec_residue =
+        reinterpret_cast<const char *>(&r.pushed_with_residue) - rb;
     static FuncDescriptor fd;         /* static: fo.func may outlive scope */
     const char *db = reinterpret_cast<const char *>(&fd);
     L->desc_params = reinterpret_cast<const char *>(&fd.params) - db;
@@ -7646,6 +7663,8 @@ void jit_fill_push_layout(JitPushLayout *L)
         reinterpret_cast<const char *>(&ck.plain_frame) - cb;
     L->ck_sync_entry =
         reinterpret_cast<const char *>(&ck.sync_entry_off) - cb;
+    L->ck_norec_ok =
+        reinterpret_cast<const char *>(&ck.norec_ok) - cb;
     {
         static EvalContext probe_root(nullptr, false, false);
         FuncObject fo(&fd, &probe_root);
@@ -7827,6 +7846,78 @@ static size_t norec_walk_chain(VmActivation *act, const char *fp,
 
 #endif
 
+/*
+ * G1 step 4-iii: the RECORD-LESS RETURN ARM's shadow oracle - called by
+ * the emitted arm (TESTS builds, MYLANG_JIT_FORCE=norec) BEFORE any of
+ * its mutations, with the record still fully valid. Verifies every
+ * record-less data source against the record it replaces: the residue
+ * ([rbp+24] = dst_addr, [rbp+16] = the caller's captures), the window
+ * chain ([rbp-8] = the parent's window, which the arm stores into
+ * vframe.slots), the baked callee total, and the seg-top induction fact
+ * (seg->top == rec.seg_top_before + total - what makes the arm's baked
+ * subtraction equal the record path's absolute restore). Never throws
+ * (#142); a mismatch is the deliberate located abort.
+ */
+extern "C" void jit_norec_retarm_verify(const void *dst_addr,
+                                        const void *rbp,
+                                        int_type total) noexcept
+{
+#ifdef TESTS
+    VmActivation *act = g_vm_act;
+    if (!act || act->rec_n < 2)
+        norec_fail("retarm: no activation / no parent record", act,
+                   nullptr);
+    const VmCallRec &rec = act->back_rec();
+    if (!rec.pushed_with_residue)
+        norec_fail("retarm on a residue-less frame", &rec, nullptr);
+    if (!rec.run_chunk || !rec.run_chunk->norec_ok)
+        norec_fail("retarm: a residue frame whose chunk is not norec_ok",
+                   &rec, rec.run_chunk);
+    /* a frame with a parked key / stashed cache may legally reach the
+     * oracle - the arm's emitted cache guards run AFTER it and decline
+     * to jit_ret; the residue checks below hold either way */
+    if (rec.boundary)
+        norec_fail("retarm on a boundary frame", &rec, nullptr);
+    const VmCallRec &par = act->records[act->rec_n - 2];
+    const void *want =
+        rec.dst < 0 ? nullptr
+                    : static_cast<const void *>(par.window + rec.dst);
+    if (dst_addr != want)
+        norec_fail("residue dst_addr != &parent[rec.dst]", dst_addr,
+                   want);
+    const char *fp = static_cast<const char *>(rbp);
+    const void *caps = *reinterpret_cast<const void *const *>(fp + 16);
+    if (caps != static_cast<const void *>(rec.caller_captures))
+        norec_fail("residue captures != rec.caller_captures", caps,
+                   rec.caller_captures);
+    const void *below_win =
+        *reinterpret_cast<const void *const *>(fp - 8);
+    if (below_win != static_cast<const void *>(par.window))
+        norec_fail("retarm [rbp-8] != the parent window", below_win,
+                   par.window);
+    if (total != rec.nslots)
+        norec_fail("retarm baked total != rec.nslots",
+                   reinterpret_cast<const void *>(total),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(rec.nslots)));
+    if (act->cur_seg != rec.seg)
+        norec_fail("retarm cur_seg != rec.seg",
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(act->cur_seg)),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(rec.seg)));
+    const VmStackSeg &sg = *act->segs[static_cast<size_t>(act->cur_seg)];
+    if (static_cast<int_type>(sg.top) != rec.seg_top_before + total)
+        norec_fail("retarm seg->top != seg_top_before + total",
+                   reinterpret_cast<const void *>(sg.top),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(rec.seg_top_before + total)));
+    g_jit_norec_retarm_verify++;
+#else
+    (void)dst_addr; (void)rbp; (void)total;
+#endif
+}
+
 extern "C" void jit_norec_push_verify(const void *site,
                                       const void *rbp) noexcept
 {
@@ -7858,7 +7949,7 @@ extern "C" void jit_norec_push_verify(const void *site,
     {
         const VmCallRec &rec = act->back_rec();
         const Chunk *cck = rec.run_chunk;
-        if (rec.cache_key)
+        if (rec.cache_key || rec.caller_cache)
             g_jit_norec_gate_cached++;
         else if (!cck || !cck->plain_frame)
             g_jit_norec_gate_plain++;
@@ -7866,6 +7957,24 @@ extern "C" void jit_norec_push_verify(const void *site,
             g_jit_norec_gate_body++;
         else
             g_jit_norec_gate_ok++;
+        /* the DERIVED byte must agree with the function it derives from
+         * (the emitted push reads the BYTE; a stale byte is a silently
+         * dead tier - which is exactly how 4-iii's arm was first found
+         * not running) */
+        if (cck && cck->norec_ok != jit_chunk_norec_ok(*cck))
+            norec_fail("chunk norec_ok byte != the predicate", cck,
+                       nullptr);
+        /* 4-iii: the RESIDUE FLAG the push stored must be what the gate
+         * says - under FORCE every emitted site pushes residue and the
+         * flag is the callee's norec_ok byte; unforced it is never set.
+         * A wrong flag is either a dead tier (0 where 1 belongs - how
+         * 76's value-call path would hide) or garbage residue reads. */
+        if (rec.pushed_with_residue
+                != (jit_norec_forced() && cck && cck->norec_ok ? 1 : 0))
+            norec_fail("residue flag != the gate's answer",
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(rec.pushed_with_residue)),
+                       cck);
     }
     /*
      * G1 STEP 3 - THE SHADOW WALK. `rbp` is the CALLER fragment's frame
@@ -8687,6 +8796,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * because it is THIS line that would form a member address on a
              * null pointer if that ever stopped holding. */
             ML_VM_CHECK(ctx.frame != nullptr);
+            /* G1 4-iii: an EnterNative entry means THIS frame is driven
+             * by the interpreter - the residue-carrying native frame of
+             * any earlier `call rdx` entry is GONE (it frag_ret when the
+             * fragment exited mid-body, or the -3 flat path abandoned
+             * it), so the record-less return arm must not consume a
+             * residue that no longer exists. The oracle caught exactly
+             * this on the first forced run: a re-entered fragment's
+             * ReturnV read garbage at [rbp+24]. One byte store; the top
+             * record is this frame's (frames above have returned). */
+            act.back_rec().pushed_with_residue = 0;
             pc = jit_enter(static_cast<char *>(chunk->native.base)
                                + in->a_lit(),
                            ctx.frame->slots);
