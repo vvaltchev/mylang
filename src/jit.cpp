@@ -4235,25 +4235,35 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                             in.b_slot(), 0, /*no_bail=*/true);
         else
             load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
-        if (compound && divmod && !in.b_is_lit()) {
-            /* the slot-divisor 0 / -1 declines (the helper throws /
-             * computes the -1 case as the interpreter's C++ does) */
-            if (!is_float) {
-                e.cmp_rdi_imm8(0);
-                slows.push_back(e.j32(0x74));    /* je (== 0) */
-                e.cmp_rdi_imm8(-1);
-                slows.push_back(e.j32(0x74));    /* je (== -1) */
-            } else {
-                e.pxor_x1();
-                e.ucomisd(X0, X1);
-                const size_t j_nan = e.j8(0x7A); /* jp -> not zero */
-                slows.push_back(e.j32(0x74));    /* je (== 0.0) */
-                e.patch8(j_nan, e.pos());
-            }
+        if (compound && divmod && !in.b_is_lit() && is_float) {
+            e.pxor_x1();
+            e.ucomisd(X0, X1);
+            const size_t j_nan = e.j8(0x7A);     /* jp -> not zero */
+            slows.push_back(e.j32(0x74));        /* je (== 0.0) */
+            e.patch8(j_nan, e.pos());
         }
         load_index_r9(e, in);
         e.cmp_r9_hr(g_hoist.rcount);
         slows.push_back(e.j32(0x73));            /* jae -> the helper */
+        if (compound && divmod && !in.b_is_lit() && !is_float) {
+            /* the int divisor gate (#103 refinement), AFTER the bounds
+             * check so the cold side can read the element off the
+             * pinned registers: 0 declines, and of the -1 divisors only
+             * the INT_MIN dividend does - an ordinary x / -1 falls
+             * through to the native RMW (which reloads the element;
+             * rax is free here). */
+            e.u8(0x48); e.u8(0x8D); e.u8(0x57); e.u8(0x01);
+                                                 /* lea rdx,[rdi+1] */
+            e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+            const size_t j_ok = e.j32(0x77);     /* ja .ok (hot) */
+            e.u8(0x48); e.u8(0x85); e.u8(0xFF);  /* test rdi,rdi */
+            slows.push_back(e.j32(0x74));        /* 0 -> the helper */
+            e.load_elem_int_hr(g_hoist.rdata);   /* rax = the element */
+            e.movabs(RDX, 0x8000000000000000ull);
+            e.u8(0x48); e.u8(0x39); e.u8(0xD0);  /* cmp rax,rdx */
+            slows.push_back(e.j32(0x74));        /* INT_MIN -> helper */
+            e.patch32_here(j_ok);
+        }
 #ifdef TESTS
         e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
         e.u8(0x48); e.u8(0xFF); e.u8(0x02);      /* the tier's counter */
@@ -4341,18 +4351,17 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     decline_ne();                                            /* readonly */
 
     /*
-     * The RUNTIME divisor guards (compound div/mod, slot rhs) - BEFORE
+     * The RUNTIME float divisor guard (compound div, slot rhs) - BEFORE
      * the prep jumps for the same reason prep sits after const/readonly:
      * a div-by-zero store throws WITHOUT cloning in the interpreter, so
      * the clone side effect must not run first. A decline itself is
      * always safe (the helper re-derives everything in the right order).
+     * The INT guards moved INTO the compound-ints arm (below): deciding
+     * the -1 case needs the ELEMENT, whose read needs the kind proven.
      */
     if (divmod && !in.b_is_lit()) {
         if (!is_float) {
-            e.cmp_rdi_imm8(0);
-            decline_if(0x74);                         /* je (== 0) */
-            e.cmp_rdi_imm8(-1);
-            decline_if(0x74);                         /* je (== -1) */
+            /* moved into the ints arm */
         } else {
             /* xmm0 == 0.0 declines; NaN (unordered sets ZF too) must NOT
              * - jp hops the decline first. -0.0 compares equal, matching
@@ -4445,6 +4454,38 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
          * not fit the storage; the helper raises the exact error) --- */
         e.cmp_byte_rax(L.kind_off, L.kind_ints);
         decline_ne();
+        /*
+         * The int divisor gate (#103 refinement) - AFTER the kind proof
+         * (the cold side reads the ELEMENT) and BEFORE the prep jumps
+         * (a div-by-zero/overflow store throws WITHOUT cloning). ONE
+         * hot branch: rdi+1 unsigned <= 1 catches 0 and -1; the cold
+         * side declines 0, then derives data/count/index (the same nav
+         * the arm re-derives later - rcx/rdx/r9 are all re-computed),
+         * declines OOB (the helper wraps negatives), reads the element
+         * and declines ONLY the INT_MIN dividend - an ordinary x / -1
+         * jumps back and stores natively.
+         */
+        if (divmod && !in.b_is_lit()) {
+            e.u8(0x48); e.u8(0x8D); e.u8(0x57); e.u8(0x01);
+                                                 /* lea rdx,[rdi+1] */
+            e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+            const size_t j_ok = e.j32(0x77);     /* ja .ok (hot) */
+            e.u8(0x48); e.u8(0x85); e.u8(0xFF);  /* test rdi,rdi */
+            decline_if(0x74);                    /* 0 -> the helper */
+            e.mov_rcx_rax(L.data_off);
+            e.mov_rdx_rax(L.data_off + 8);
+            e.sub_rdx_rcx();
+            e.sar_rdx_3();
+            load_index_r9(e, in);
+            e.cmp_r9_rdx();
+            decline_if(0x73);                    /* OOB/neg -> helper */
+            e.u8(0x4A); e.u8(0x8B); e.u8(0x14); e.u8(0xC9);
+                                                 /* mov rdx,[rcx+r9*8] */
+            e.movabs_r9(0x8000000000000000ull);
+            e.u8(0x4C); e.u8(0x39); e.u8(0xCA);  /* cmp rdx,r9 */
+            decline_if(0x74);                    /* INT_MIN -> helper */
+            e.patch32_here(j_ok);
+        }
         cow_guards();
         e.mov_rcx_rax(L.data_off);
         e.mov_rdx_rax(L.data_off + 8);
@@ -4941,10 +4982,38 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     decline_ne();
     e.load(RDI, val.payload);
     if (divmod) {
-        e.cmp_rdi_imm8(0);
-        decline_if(0x74);
-        e.cmp_rdi_imm8(-1);
-        decline_if(0x74);
+        /* the int divisor gate (#103 refinement): the row's kind is
+         * proven ints here and rax = the row's shobj, so the cold side
+         * derives data/count/index (inner_bounds' own sequence -
+         * rcx/rdx/r9 are re-derived by the arm anyway), declines OOB,
+         * reads the element and declines ONLY the INT_MIN dividend;
+         * an ordinary x / -1 jumps back and stores natively. */
+        /* NOTE rcx holds &row here and must SURVIVE until the cow
+         * guards - the first version clobbered it via the shared nav
+         * shape (a misaligned-Type* crash in -rt). This cold path uses
+         * rdx/r9 only: &elem formed by lea, bounds as a TWO-sided
+         * pointer compare (a negative index wraps below data). */
+        e.u8(0x48); e.u8(0x8D); e.u8(0x57); e.u8(0x01);
+                                                 /* lea rdx,[rdi+1] */
+        e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+        const size_t j_ok = e.j32(0x77);         /* ja .ok (hot) */
+        e.u8(0x48); e.u8(0x85); e.u8(0xFF);      /* test rdi,rdi */
+        decline_if(0x74);                        /* 0 -> the helper */
+        e.mov_rdx_rax(L.data_off);               /* rdx = data */
+        load_slot_r9(e, in.b_slot());
+        e.u8(0x4A); e.u8(0x8D); e.u8(0x14); e.u8(0xCA);
+                                                 /* lea rdx,[rdx+r9*8] */
+        e.u8(0x48); e.u8(0x3B); e.u8(0x50);
+        e.u8(static_cast<uint8_t>(L.data_off));  /* cmp rdx,[rax+data] */
+        decline_if(0x72);                        /* jb: negative idx */
+        e.u8(0x48); e.u8(0x3B); e.u8(0x50);
+        e.u8(static_cast<uint8_t>(L.data_off + 8));
+        decline_if(0x73);                        /* jae: OOB */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x12);      /* mov rdx,[rdx] */
+        e.movabs_r9(0x8000000000000000ull);
+        e.u8(0x4C); e.u8(0x39); e.u8(0xCA);      /* cmp rdx,r9 */
+        decline_if(0x74);                        /* INT_MIN -> helper */
+        e.patch32_here(j_ok);
     }
     cow_guards();
     inner_bounds(/*bytes=*/false);
@@ -7010,11 +7079,22 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             } else {
                 if (dv) {
                     if (!bo.b.is_lit) {
-                        /* runtime 0 / -1 divisor -> the helper tier */
-                        e.u8(0x48); e.u8(0x83); e.u8(0xF9); e.u8(0x00);
-                        j_slows.push_back(e.j32(0x74));   /* je slow */
-                        e.u8(0x48); e.u8(0x83); e.u8(0xF9); e.u8(0xFF);
-                        j_slows.push_back(e.j32(0x74));   /* je slow */
+                        /* the edge divisors (#103): rcx+1 unsigned <= 1
+                         * catches 0 and -1 in ONE hot branch; the cold
+                         * side declines 0 (the helper throws div0) and
+                         * ONLY the INT_MIN dividend (the helper throws
+                         * the overflow) - an ordinary x / -1 falls back
+                         * into the native idiv (rax = the dividend is
+                         * already loaded; rdx is dead, cqo is next). */
+                        e.u8(0x48); e.u8(0x8D); e.u8(0x51); e.u8(0x01);
+                        e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+                        const size_t j_div = e.j32(0x77);  /* ja .div */
+                        e.u8(0x48); e.u8(0x85); e.u8(0xC9);
+                        j_slows.push_back(e.j32(0x74));    /* 0 -> slow */
+                        e.movabs(RDX, 0x8000000000000000ull);
+                        e.u8(0x48); e.u8(0x39); e.u8(0xD0);
+                        j_slows.push_back(e.j32(0x74));    /* ovf -> slow */
+                        e.patch32_here(j_div);
                     }
                     e.u8(0x48); e.u8(0x99);              /* cqo */
                     e.u8(0x48); e.u8(0xF7); e.u8(0xF9);  /* idiv rcx */

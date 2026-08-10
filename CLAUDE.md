@@ -1426,6 +1426,23 @@ fully-const BUILD failure) and the C1e -1-guard case now asserts the
 InvalidValueEx (previously sabotage-unprovable - the helper crashed
 too); the guards sabotage-verified on the final shape (each drop = an
 FPE abort). README documents the rule under Integer.
+**The -1 REFINEMENT (same day, maintainer-directed):** a runtime -1
+divisor no longer declines WHOLESALE anywhere - only the ONE dividend
+that overflows does. All four decline-based tiers (the boxed int-int
+inline tier, the ordinary + nested element-store tiers, the C1e
+hoisted arm) now use IntBin's shape: the hot path is the single
+lea/cmp/ja gate; the cold side declines 0, then reads the ACTUAL
+dividend - rax for the boxed tier, the ELEMENT for the store tiers
+(which is why the store gates moved AFTER their kind proof; the
+nested tier's cold path must not clobber rcx = &row, so it forms
+&elem in rdx with a TWO-sided pointer bounds compare - a negative
+index wraps below data) - and declines ONLY INT_MIN; an ordinary
+x / -1 rejoins the native path. Proven by counters (the #95 tests'
+fast counts ROSE by exactly the formerly-declined stores; the C1e
+INT_MIN case now requires rmw >= 1 - the sane elements before the
+throwing one run the hoisted RMW) and by four cold-check sabotages
+(each skip = an FPE abort in -rt). Measured: element-compound and
+boxed /-1 probes **-52.6% / -54.9%** whole-program; 03/44 byte-flat.
 MEASUREMENT-HARNESS NOTE: shopping/phonebook fed </dev/null spin
 forever on EOF re-printing their menus - a `timeout`-truncated
 JIT-on-vs-off byte compare then "diverges" purely by SPEED; feed `q`

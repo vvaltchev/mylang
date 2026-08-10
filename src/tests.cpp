@@ -4202,6 +4202,18 @@ static const std::vector<test> tests =
         "assert(t == 66 && a[1] == 1 << 63);" } },
     { "div overflow: a fully-const INT_MIN / -1 fails the BUILD",
       { "const C = (1 << 63) / (0 - 1);" }, &typeid(InvalidValueEx) },
+    { "div overflow: the BOXED (dyn) tier - /-1 divides, INT_MIN throws",
+      { "var dyn v = 10; var d = int(runtime(0 - 1));",
+        "var s = 0;",
+        "var i = 0;",
+        "while (i < 8) { s = s + v / d; i++; }",
+        "assert(s == 0 - 80);",
+        "var dyn w = 1 << 63;",
+        "var t = 0;",
+        "try { t = w / d; } catch (InvalidValueEx) { t = 9; }",
+        "assert(t == 9);",
+        "try { t = w % d; } catch (InvalidValueEx) { t = 11; }",
+        "assert(t == 11);" } },
     { "bitwise: bool operands promote to int",
       { "assert((true & true) == 1);",
         "assert((true | false) == 1);",
@@ -18358,16 +18370,30 @@ static bool jit_store_elem_inline_tier()
           "    return t * 10000 + sl[0] * 100 + a[1]; }",
           "print(f(9));" }, true, true, /*prep=*/0, /*fast_exact=*/32 },
 
-      /* a slot divisor of -1: declines (the helper runs the exact
-       * interpreter C++ - the IntModRI idiv-trap convention) */
-      { "DECLINE: div/mod by a runtime -1 divisor",
+      /* a slot divisor of -1 with ORDINARY elements stays NATIVE
+       * (#103 refinement: the cold side reads the dividend and
+       * declines ONLY INT_MIN - the two compound stores now count) */
+      { "NATIVE: div/mod by a runtime -1 divisor (sane dividends)",
         { "func f(n) {",
           "    var a = array(32); var i = 0;",
           "    while (i < 32) { a[i] = i + 5; i++; }",
           "    var m = 0; m = n - 10;",              /* -1, in a SLOT */
           "    a[3] /= m; a[4] %= m;",
           "    return a[3] * 10 + a[4]; }",
-          "print(f(9));" }, true, true, -1, /*fast_exact=*/32 },
+          "print(f(9));" }, true, true, -1, /*fast_exact=*/34 },
+      /* ... and the INT_MIN dividend is the ONE that declines: the
+       * helper throws the catchable overflow, nothing is stored */
+      { "DECLINE: -1 divisor with an INT_MIN dividend (throws)",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i + 5; i++; }",
+          "    a[7] = 1 << 63;",
+          "    var m = 0; m = n - 10;",              /* -1, in a SLOT */
+          "    var t = 0;",
+          "    try { a[7] /= m; } catch (InvalidValueEx) { t = 1; }",
+          "    a[8] /= m;",
+          "    return t * 1000 + a[8] * 10 + (a[7] == 1 << 63 ? 1 : 0); }",
+          "print(f(9));" }, true, true, -1, /*fast_exact=*/34 },
 
       /* LITERAL 0 / -1 divisors are refused at EMIT time (helper) */
       { "DECLINE: literal 0 / -1 divisors (emit-refused)",
@@ -18737,7 +18763,11 @@ static bool jit_store_elem2_inline_tier()
        * in flat_store_core), and OOB outranks div0 via the helper's
        * re-derivation. -1 declines to the helper's exact C++.
        */
-      { "DECLINE: div/mod by runtime 0 and -1 (before prep, slice)",
+      /* #103 refinement: the -1 divisor's SANE-dividend stores now run
+       * NATIVE (fast 2) - only div-by-zero (before prep: the sliced row
+       * must NOT detach for a store that throws) and the INT_MIN
+       * dividend decline */
+      { "div/mod by runtime 0 (declines before prep) and -1 (native)",
         { MK_INT,
           "func f(m, n) {",
           "    var r1 = m[1];",
@@ -18750,7 +18780,22 @@ static bool jit_store_elem2_inline_tier()
           "    try { m[1][2] %= z; } catch (DivisionByZeroEx) { t += 4; }",
           "    m[0][3] /= w; m[0][4] %= w;",
           "    return t * 100000 + sl[0] * 100 + m[0][3] * 10 + m[0][4]; }",
-          "print(f(mk(8), 8));" }, 0, /*prep=*/0 },
+          "print(f(mk(8), 8));" }, 2, /*prep=*/0 },
+
+      /* ... and the INT_MIN dividend is the one nested store that
+       * declines: the helper throws the catchable overflow pre-store */
+      { "DECLINE: -1 divisor with an INT_MIN nested dividend (throws)",
+        { MK_INT,
+          "func f(m, n) {",
+          "    m[0][2] = 1 << 63;",
+          "    var w = 0; w = n - 9;",           /* -1 in a slot */
+          "    var t = 0;",
+          "    try { m[0][2] /= w; } catch (InvalidValueEx) { t = 1; }",
+          "    m[0][3] /= w;",
+          "    return t * 1000 + m[0][3] * 10",
+          "        + (m[0][2] == 1 << 63 ? 1 : 0); }",
+          /* fast 2: the plain INT_MIN seed store + the sane /-1 */
+          "print(f(mk(8), 8));" }, 2, /*prep=*/0 },
 
       /* a non-int inner key: the k2 type guard declines; the helper
        * raises the interpreter's exact "Expected integer" error */
@@ -19377,11 +19422,11 @@ static bool jit_hoist_c1()
           "    return t * 1000 + a[0] + a[63]; }",
           "print(f(mk(64), 64, int(runtime(0))));" }, 1 },
 
-      /* a -1 runtime divisor declines to the helper, which (#103) now
-       * THROWS on the INT_MIN element - so the guard is finally
-       * sabotage-provable: dropped, the hoisted idiv takes a hardware
-       * #DE where the helper raises the catchable InvalidValueEx */
-      { "a -1 runtime divisor declines to the helper (INT_MIN throws)",
+      /* the #103 refinement: a -1 divisor's SANE dividends run the
+       * hoisted RMW natively (the cold side reads the element and
+       * declines ONLY INT_MIN); rmw_min proves the arm ran on the
+       * elements BEFORE the INT_MIN one, which throws via the helper */
+      { "a -1 runtime divisor: sane elements native, INT_MIN throws",
         { MK_ARR,
           "func f(a, n, d) {",
           "    a[3] = 1 << 63;",
@@ -19393,7 +19438,7 @@ static bool jit_hoist_c1()
           "    var s = 0;",
           "    for (var k = 0; k < n; k++) s += a[k];",
           "    return t * 100000 + s; }",
-          "print(f(mk(64), 64, int(runtime(0 - 1))));" }, 1 },
+          "print(f(mk(64), 64, int(runtime(0 - 1))));" }, 1, -1, 1 },
 
       /* the FLOAT compound RMW (addsd off the pinned data pointer) */
       { "compound float stores hoist (the SSE RMW)",
