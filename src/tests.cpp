@@ -19073,8 +19073,10 @@ static bool jit_hoist_c1()
         return true;
 
     auto go = [&](const std::vector<const char *> &src, bool vm,
-                  unsigned long *hoist) -> std::string {
+                  unsigned long *hoist,
+                  unsigned long *rmw = nullptr) -> std::string {
         const unsigned long h0 = g_jit_hoist;
+        const unsigned long r0 = g_jit_hoist_rmw;
         const ExecEngine se = g_exec_engine;
         g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
         std::ostringstream cap;
@@ -19094,6 +19096,7 @@ static bool jit_hoist_c1()
         cout.rdbuf(old);
         g_exec_engine = se;
         if (hoist) *hoist = g_jit_hoist - h0;
+        if (rmw) *rmw = g_jit_hoist_rmw - r0;
         return cap.str();
     };
 
@@ -19105,6 +19108,10 @@ static bool jit_hoist_c1()
                                  * cases' fills hoist too (C1b store
                                  * candidates), so "did not hoist" is
                                  * only assertable as fills == total */
+        long rmw_min = 0;   /* C1e: >=1 requires the hoisted-COMPOUND
+                             * arm to have RUN (g_jit_hoist_rmw - the
+                             * shared g_jit_store_fast cannot prove it:
+                             * the ordinary tier bumps that one too) */
     };
 
     #define MK_ARR \
@@ -19298,6 +19305,84 @@ static bool jit_hoist_c1()
           "    return s * 7 + t; }",
           "print(f(mk(32), 32));" }, 1 },
 
+      /* ---- C1e: the hoisted-COMPOUND element store ---- */
+
+      /* `a[j] += j` / `a[k] *= 3` inside hoisted store regions run the
+       * RMW off the pinned registers - the arm's own counter is the
+       * proof (the ordinary tier serves these correctly too, so value
+       * parity alone cannot see a silent unhoist) */
+      { "compound int stores hoist (the RMW off the pinned registers)",
+        { MK_ARR,
+          "func f(a, n) {",
+          "    var j = 0;",
+          "    while (j < n) { a[j] += j; j++; }",
+          "    var k = 0;",
+          "    while (k < n) { a[k] *= 3; k++; }",
+          "    var s = 0;",
+          "    for (var t = 0; t < n; t++) s += a[t];",
+          "    return s; }",
+          "print(f(mk(64), 64));" }, 1, -1, 1 },
+
+      /* a SLOT divisor: the 0/-1 guards precede the RMW; a nonzero,
+       * non-minus-one divisor stays on the fast path (div and mod -
+       * mod also covers the remainder-out-of-rdx tail) */
+      { "compound div/mod with a runtime divisor hoist (guards pass)",
+        { MK_ARR,
+          "func f(a, n, d) {",
+          "    var j = 0;",
+          "    while (j < n) { a[j] /= d; j++; }",
+          "    var k = 0;",
+          "    while (k < n) { a[k] %= 5; k++; }",
+          "    var s = 0;",
+          "    for (var t = 0; t < n; t++) s += a[t];",
+          "    return s; }",
+          "print(f(mk(64), 64, int(runtime(3))));" }, 1, -1, 1 },
+
+      /* a ZERO runtime divisor: the guard declines the very first
+       * element to the helper, which throws WITHOUT storing - error
+       * parity is the oracle (a dropped guard is a hardware #DE) */
+      { "a zero runtime divisor declines before any store (parity)",
+        { MK_ARR,
+          "func f(a, n, d) {",
+          "    var t = 0;",
+          "    try {",
+          "        var j = 0;",
+          "        while (j < n) { a[j] /= d; j++; }",
+          "    } catch (DivisionByZeroEx) { t = 88; }",
+          "    return t * 1000 + a[0] + a[63]; }",
+          "print(f(mk(64), 64, int(runtime(0))));" }, 1 },
+
+      /* a -1 runtime divisor declines to the helper (the ordinary
+       * tier's own convention - the idiv INT_MIN/-1 trap). NOT
+       * sabotage-provable today: INT_MIN/-1 SIGFPEs the HELPER too (a
+       * pre-existing, engine-uniform hole - task #103), so with sane
+       * elements both paths compute identically; the case documents
+       * the decline and pins parity, and #103's fix lands in the
+       * helper both tiers decline to. */
+      { "a -1 runtime divisor declines to the helper (parity)",
+        { MK_ARR,
+          "func f(a, n, d) {",
+          "    var j = 0;",
+          "    while (j < n) { a[j] /= d; j++; }",
+          "    var s = 0;",
+          "    for (var t = 0; t < n; t++) s += a[t];",
+          "    return s; }",
+          "print(f(mk(64), 64, int(runtime(0 - 1))));" }, 1 },
+
+      /* the FLOAT compound RMW (addsd off the pinned data pointer) */
+      { "compound float stores hoist (the SSE RMW)",
+        { "func mkf(n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i * 0.5; i++; }",
+          "    return a; }",
+          "func f(a, n) {",
+          "    var j = 0;",
+          "    while (j < n) { a[j] += 0.25; j++; }",
+          "    var s = 0.0;",
+          "    for (var t = 0; t < n; t++) s = s + a[t];",
+          "    return s; }",
+          "print(f(mkf(64), 64));" }, 1, -1, 1 },
+
       /* ---- C1d: the FUSIONS as candidates ---- */
 
       /* JumpUnlessElemInt over a BOOL base (57_bool_reduce's shape):
@@ -19369,8 +19454,8 @@ static bool jit_hoist_c1()
 
     bool ok = true;
     for (const Case &c : cases) {
-        unsigned long hoist = 0;
-        const std::string got = go(c.src, true, &hoist);
+        unsigned long hoist = 0, rmw = 0;
+        const std::string got = go(c.src, true, &hoist, &rmw);
         const std::string ref = go(c.src, false, nullptr);
         if (got != ref || ref.empty()) {
             cout << "  hoist [" << c.name << "]: tw=[" << ref
@@ -19386,6 +19471,11 @@ static bool jit_hoist_c1()
             && hoist != static_cast<unsigned long>(c.hoist_exact)) {
             cout << "  hoist [" << c.name << "]: entries " << hoist
                  << " != expected " << c.hoist_exact << "\n";
+            ok = false;
+        }
+        if (c.rmw_min >= 1 && rmw == 0) {
+            cout << "  hoist [" << c.name << "]: the hoisted-compound "
+                    "arm never ran\n";
             ok = false;
         }
     }
