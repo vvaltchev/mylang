@@ -420,8 +420,8 @@ registers. The route, in increasing depth:
      still open;
   3. **C4c: the return protocol** (10's ~35% jit_ret round trip) -
      LANDED 2026-08-04, see below;
-  4. **C4d: struct dst tags** (64's two-stores - the C3-elision idea
-     applied to the ctor plans' dsts).
+  4. **C4d: struct dst tags** - INVESTIGATED 2026-08-05 and found
+     ALREADY DONE; the real residual is different, see below.
 Each is its own measured increment; 2 and 3 are the big ones.
 
 **C4a-ii LANDED (2026-08-04): float forwarding** - a float producer
@@ -597,3 +597,49 @@ same discipline unboxing.md applied to its option B).
 - CLAUDE.md's vacuous-test trap list applies in full; C1's tests need
   shapes where LICM does NOT already hoist the row (outer index varying
   with the inner loop) and bases that defeat const-arg specialization.
+
+
+## C4d: the scoped step was already done - what 64 actually costs
+
+**MEASURED FIRST, and the scope was wrong.** C4d was written as "the
+C3-elision idea applied to the ctor plans' dsts", from an older
+CLAUDE.md line describing 64_struct_create's residual as "type-tag
+two-stores + ref-checks per dst". The emitted code says otherwise:
+**the planned StructCtorV stores NO dst tag and no dst payload at all**
+(`grep` for a dst `.type` store at either ctor site in `-vdj`: zero).
+H1's reuse path had already removed them - its four guards PROVE the
+slot still holds the same same-def instance, so the type word and the
+object pointer are already correct and only the struct's BYTES change.
+There is nothing to elide.
+
+**What 64 really costs: 234 Ir per iteration** (callgrind scale-delta,
+OPT=1 ASSERTS=0) for one int-POD ctor + 2 field reads, one float-POD
+ctor + 3 field reads, and ~6 arithmetic ops. The ctor fast path is 13
+instructions BEFORE any field store:
+
+    mov rax, p.type            ; \
+    movabs rcx, <t_struct>     ;  | guard 1: dst holds a struct
+    cmp rax, rcx / jne slow    ; /
+    mov rax, p                 ; \
+    movabs rcx, <def>          ;  | guard 2: same def
+    cmp [rax+def], rcx / jne   ; /
+    cmp [rax+rc], 1 / jne      ;    guard 3: sole owner (H1)
+    cmp byte [rax+ro], 0 / jne ;    guard 4: not readonly
+    mov r9, [rax+bytes]        ;    the byte buffer
+
+x2 ctors = ~26 of the 234. **Every one of those guards is
+LOOP-INVARIANT**: the dst holds the SAME reused StructObject each
+iteration, the def is a compile-time constant, and neither readonly nor
+the refcount changes inside the loop.
+
+So the real step is not a tag elision but **C1-family loop-invariant
+guard hoisting applied to the ctor**: verify the four guards once in a
+preheader, keep the byte buffer pointer in a register across the loop,
+and send a failed guard to a cold twin of the region - exactly C1's
+structure, with the ctor's dst slot playing the role of C1's base. That
+is a real mechanism (preheader + cold twin + a def-scan proving nothing
+in the region rebinds the dst), NOT a peephole, which is why it is
+recorded here rather than half-built.
+
+The other 200 Ir are the field reads, the arithmetic, and the loop
+tail - N7 territory, not struct-specific.
