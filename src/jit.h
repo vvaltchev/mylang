@@ -929,7 +929,7 @@ extern unsigned long g_jit_norec_raise_walk;
  * push walks so a dead anchor (a walk that silently floors at level 0)
  * is a test failure, not a hidden regression. */
 extern unsigned long g_jit_norec_raise_frames;
-/* step 4-iii (MYLANG_JIT_FORCE=norec): returns served by the emitted
+/* step 4-iii (the norec tier, DEFAULT ON): returns served by the emitted
  * RECORD-LESS arm (the prove-it-ran counter - bumped by the emitted
  * code, so a dead discrimination byte cannot fake it), and the arm's
  * pre-mutation shadow verifications. */
@@ -945,8 +945,8 @@ extern unsigned long g_jit_norec_retarm_verify;
  * still exist. mat_walk = switches walked; mat_frames = levels verified
  * (the load-bearing half - a dead anchor floors at 0 silently, the 4-ii
  * lesson); mat_residue = would-be RECORD-LESS frames whose full insert
- * reconstruction was verified (moves only under MYLANG_JIT_FORCE=norec,
- * where residue frames exist). */
+ * reconstruction was verified (moves only with the norec tier on -
+ * the default - where residue frames exist). */
 extern unsigned long g_jit_norec_mat_walk;
 extern unsigned long g_jit_norec_mat_frames;
 extern unsigned long g_jit_norec_mat_residue;
@@ -1029,8 +1029,9 @@ const Chunk *jit_norec_frag_for(const void *addr);
  * ref_slots list (the C4c return arm's bound). Per-CALL exclusions (a
  * cached call) are the site's business. False off-platform. */
 bool jit_chunk_norec_ok(const Chunk &chunk);
-/* is the norec tier FORCED (MYLANG_JIT_FORCE=norec)? False off-platform. */
-bool jit_norec_forced();
+/* is the norec tier ON? Default true (inc 5 flipped it, 2026-08-12);
+ * MYLANG_JIT_OFF=norec disables it. False off-platform. */
+bool jit_norec_on();
 /*
  * A compiled chunk that MOVES to its final storage (codegen_chunk returns
  * by value; the lazy vm_func_chunk net jits a stack local and emplaces it)

@@ -3394,3 +3394,23 @@ AUTO-CONSTS and the read folds -> the write-twice init; also noted:
 compile TypeMismatchEx - the dyn coercion needs the two-statement
 spelling). Watched failing; both return tiers covered (the emitted arm
 via a scalar result, jit_ret_norec via an array result).
+
+## G1 4-v INC 5 (2026-08-12): the no-record tier is the DEFAULT
+
+jit_norec_forced() -> jit_norec_on() = !jit_lever_off(JL_NOREC).
+MYLANG_JIT_OFF=norec is the same-binary A/B lever; FORCE=norec a no-op.
+The TESTS nets self-adjust per mode, so `-rt` is green with the tier
+ON (the fork's own proofs: norec_pushes, ret_arm, mat_insert) and OFF
+(the full record-pairing shadow battery) - keep running BOTH in the
+lanes, the OFF mode is the record path's only -rt coverage.
+
+THE FLIP'S ONE DEFECT: the NorecSite side table was lever-gated while
+the emitted entry-RA check (jit_norec_ret_verify, every TESTS fragment
+prologue) resolves against it in every mode - OFF=norec aborted -rt at
+the first fragment-to-fragment call. Fixed by making the table
+UNCONDITIONAL (passive address data; the lever disables behaviour -
+the push fork, the return arm, the residue - never data). OFF=norec is
+now byte-equivalent to the pre-flip default. Perf numbers carry over
+from the TAX SHRINK entry (the forced config already built the table).
+Lanes: dbg/clang/rel-hard -rt 1870/1870 both modes, corpus 15/15 plain
++ levers, 40-program fuzz clean.

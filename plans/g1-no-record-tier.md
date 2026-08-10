@@ -943,3 +943,38 @@ Remaining per-call residue (deliberate): the 2-qword residue push/pop
 byte test, the window compare, and the sentinel arm's slots+size
 restore. The default flip decision stands unchanged - now at a 1.006x
 broad cost.
+
+## 4-v INC 5 (2026-08-12) - THE FLIP: the no-record tier is the DEFAULT
+
+Maintainer-ordered after the tax shrink brought the broad-suite cost to
+1.006x. jit_norec_forced() became jit_norec_on() = !jit_lever_off(
+JL_NOREC): ON by default, MYLANG_JIT_OFF=norec is the same-binary A/B
+lever (corpus_diff --levers already carried it), MYLANG_JIT_FORCE=norec
+is a harmless no-op. The TESTS nets self-adjust per mode - the fork's
+assertions run in the default lanes, the record-pairing shadow battery
+under OFF=norec - so `-rt` is green BOTH ways (unusual for a lever;
+worth keeping, since the OFF lane is the record path's only remaining
+-rt coverage).
+
+THE ONE DEFECT THE FLIP EXPOSED: the side TABLE was gated on the lever
+(`!jit_lever_off` at both site-push sites), but the TESTS entry-RA
+check (jit_norec_ret_verify, emitted in EVERY fragment prologue)
+resolves hardware return addresses against it unconditionally - so
+OFF=norec aborted `-rt` at the first fragment-to-fragment call ("RA in
+emitted code but resolves to no site"). Pre-flip this was invisible
+because the pre-flip DEFAULT built the table and nobody ran OFF=norec
+-rt (the lever matrix runs the corpus, whose 15 programs never tripped
+it in the dbg binary). The fix states the real design: the side table
+is PASSIVE ADDRESS DATA, unconditional in every mode; the lever
+disables the runtime BEHAVIOUR (the push fork, the return arm, the
+residue) - never the data. OFF=norec is now byte-equivalent to the
+pre-flip default: sites built, every frame record-ful, shadows on.
+
+Measurement: the flipped default is instruction-identical to the
+measured FORCE=norec configuration (the force path also built the
+table), so the 4-v MEASURED + TAX SHRINK numbers carry over verbatim;
+one fresh default-mode suite run recorded post-flip for the books.
+
+STILL OPEN from the inc-5 list: Net 4 (the GCOV coverage gate over the
+walk/reconstruction code) - tracked separately; sumto$0's interpreted
+CallV (10_recursion's full reach) - tracked separately.

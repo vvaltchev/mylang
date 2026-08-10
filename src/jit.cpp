@@ -250,11 +250,13 @@ static bool jit_lever_forced(JitLever l)
     return !jit_lever_off(l) && (jit_force_mask() & (1u << l));
 }
 
-/* 4-iii: the oracle (vm.cpp) pins the emitted residue flag against what
- * the push SHOULD have stored, which depends on the lever state. */
-bool jit_norec_forced()
+/* 4-v inc 5 (2026-08-12): the no-record tier is the DEFAULT.
+ * MYLANG_JIT_OFF=norec is the same-binary A/B lever (corpus_diff
+ * --levers picks it up); MYLANG_JIT_FORCE=norec is now a no-op kept
+ * only so an old command line stays valid. */
+bool jit_norec_on()
 {
-    return jit_lever_forced(JL_NOREC);
+    return !jit_lever_off(JL_NOREC);
 }
 
 /*
@@ -3069,7 +3071,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     st(R10, static_cast<int32_t>(P.seg_top), RAX);
     add_m_r(R8R, static_cast<int32_t>(P.act_used), RSI);
     /*
-     * 4-v THE FORK (MYLANG_JIT_FORCE=norec): a gate-passing call skips
+     * 4-v THE FORK (the DEFAULT since inc 5): a gate-passing call skips
      * the ENTIRE record - no acquire, no fill, no rec_n++/top_rec - and
      * joins the shared tail (vframe repoint + binds + captures) with
      * only the caps-relay store the residue push needs. The gate, per
@@ -3085,7 +3087,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      * with the skipped fill.
      */
     size_t j_norec_join = 0;
-    if (jit_norec_forced()) {
+    if (jit_norec_on()) {
         cmp_b_imm8(RCX, static_cast<int32_t>(P.ck_norec_ok), 0);
         const size_t j_rec1 = e.j32(0x74);            /* je record path */
         size_t j_rec2 = 0, j_rec3 = 0;
@@ -3557,7 +3559,11 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         g_cur_entry_remap ? (*g_cur_entry_remap)[old_pc + 1]
                           : static_cast<int_type>(pc) + 1;
     NorecSite *ns = nullptr;
-    if (g_cur_norec_sites && !jit_lever_off(JL_NOREC)) {
+    /* the side TABLE is unconditional (inc 5): it is passive address
+     * data the TESTS entry RA check resolves against in every mode -
+     * MYLANG_JIT_OFF=norec disables the runtime BEHAVIOUR (the push
+     * fork, the return arm, the residue), never the table. */
+    if (g_cur_norec_sites) {
         g_cur_norec_sites->push_back(
             std::unique_ptr<NorecSite>(new NorecSite()));
         ns = g_cur_norec_sites->back().get();
@@ -3577,7 +3583,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 ? nullptr
                 : static_cast<const void *>(ck.inline_frames.data());
     }
-    /* 4-iii (MYLANG_JIT_FORCE=norec): this site pushes the 2-qword
+    /* 4-iii (the norec tier, DEFAULT ON): this site pushes the 2-qword
      * RESIDUE around the call. CACHED sites are included - the tier's
      * exclusion is "no pure-cache INTERACTION", a runtime property (a
      * null key and a null stash), which the return arm's guards decide
@@ -3592,7 +3598,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * reach was zero - their outer call loops all live at top level
      * (gcd's recursion is even tail-spliced into a loop, so main makes
      * ALL its calls). */
-    const bool residue = jit_lever_forced(JL_NOREC);
+    const bool residue = jit_norec_on();
     const int32_t caller_total =
         (residue && g_cur_caller_desc)
             ? static_cast<int32_t>(g_cur_caller_desc->frame_size
@@ -3983,7 +3989,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
          * record-less pushes). A record-less frame is never boundary; a
          * record-ful frame's top_rec is its own, so the byte test below
          * then reads the right record. */
-        const bool arm_norec_pre = jit_lever_forced(JL_NOREC);
+        const bool arm_norec_pre = jit_norec_on();
         if (arm_norec_pre) {
             modrm(0x3B, RBX, R10, static_cast<int32_t>(P.rec_window),
                   true);                           /* cmp rbx,[r10+win] */
@@ -4203,7 +4209,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         e.u32(0xFFFFFFFEu);                        /* mov rax, -2 */
         e.frag_ret();
 
-        /* ---- 4-iii: THE RECORD-LESS ARM (MYLANG_JIT_FORCE=norec).
+        /* ---- 4-iii: THE RECORD-LESS ARM (the norec tier, DEFAULT ON).
          * Every datum the record-ful pop reads from the record comes
          * from somewhere else here: the result destination from the
          * residue ([rbp+24], pushed by the caller's site), the parent
@@ -10610,7 +10616,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * RA check false-aborts on every leaf call. No record is pushed
          * here (that is the leaf protocol's point) - the entry is address
          * data only, marked `leaf`. */
-        if (g_cur_norec_sites && !jit_lever_off(JL_NOREC)) {
+        if (g_cur_norec_sites) {
             g_cur_norec_sites->push_back(
                 std::unique_ptr<NorecSite>(new NorecSite()));
             NorecSite *lns = g_cur_norec_sites->back().get();
@@ -13337,7 +13343,7 @@ bool jit_chunk_norec_ok(const Chunk &)
     return false;   /* no fragments off-platform -> no record-less frames */
 }
 
-bool jit_norec_forced()
+bool jit_norec_on()
 {
     return false;
 }

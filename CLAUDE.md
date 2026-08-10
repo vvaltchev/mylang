@@ -331,7 +331,9 @@ collision). Three nets now:
   JIT analogue of `--no-opt`, which CLAUDE.md already mandates for AST
   transforms for the same reason (`-nj` is all-or-nothing and localises
   nothing). Levers: cache, fcache, telide, fread, flit, fwd, ffwd,
-  resreg, hoist, hoist2, mfact, cest, relent, `all`.
+  resreg, hoist, hoist2, mfact, cest, relent, norec (the no-record
+  call tier, DEFAULT ON since 2026-08-12 - its TESTS nets self-adjust
+  per mode, so `-rt` is green with it on OR off), `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the

@@ -17957,8 +17957,9 @@ static bool jit_ret_inline_c4c()
      * splice may halve the RECORD count (two levels per spliced call),
      * so assert a conservative floor, not an exact count.
      * The property is "served INLINE, not by the jit_ret helper" -
-     * under MYLANG_JIT_FORCE=norec the record-less arm (4-iii) serves
-     * the same returns, so the two counters are summed. */
+     * with the norec tier on (the default) the record-less arm
+     * (4-iii) serves the same returns, so the two counters are
+     * summed. */
     const auto inline_rets = []() {
         return g_jit_ret_inline + g_jit_norec_ret_arm;
     };
@@ -18216,13 +18217,14 @@ static bool jit_norec_shadow()
         fprintf(stderr, "jit_norec_shadow: NO side-table sites emitted\n");
         return false;
     }
-    /* THE FORK (4-v, MYLANG_JIT_FORCE=norec): the record-pairing shadow
-     * battery below is gated off (records are genuinely absent for
-     * gate-passing frames) - assert the fork's OWN proof instead:
+    /* THE FORK (4-v, the DEFAULT since inc 5): the record-pairing
+     * shadow battery below is gated off (records are genuinely absent
+     * for gate-passing frames) - assert the fork's OWN proof instead:
      * record-less pushes actually happened for this shape and their
      * returns ran the record-less arm with its oracle. The shadow
-     * battery keeps its full coverage in the default (unforced) lane. */
-    if (jit_norec_forced()) {
+     * battery keeps its full coverage under MYLANG_JIT_OFF=norec (the
+     * levers lane). */
+    if (jit_norec_on()) {
         if (g_jit_norec_pushes <= fp0) {
             fprintf(stderr, "jit_norec_shadow: NO record-less pushes "
                             "under the fork\n");
@@ -24819,7 +24821,7 @@ static bool jit_call_switch_protocol()
      * exactly level 1 (a garbage RA resolves to no fragment), so frames
      * == walks - real chains under cap 4 average 4-5 levels, so require
      * strictly more than 2 per walk. */
-    if (ok && !jit_norec_forced()) {
+    if (ok && !jit_norec_on()) {
         const unsigned long walks = g_jit_norec_mat_walk - mw0;
         const unsigned long frames = g_jit_norec_mat_frames - mf0;
         if (walks == 0) {
@@ -24833,12 +24835,12 @@ static bool jit_call_switch_protocol()
             ok = false;
         }
     }
-    /* under the FORK (MYLANG_JIT_FORCE=norec) the shadow is off and the
-     * REAL materializer runs: record-less frames in the switched chains
+    /* under the FORK (the default) the shadow is off and the REAL
+     * materializer runs: record-less frames in the switched chains
      * must have had records INSERTED (the -3 path's prove-it-ran) */
-    if (ok && jit_norec_forced() && g_jit_norec_mat_insert <= mr0i) {
+    if (ok && jit_norec_on() && g_jit_norec_mat_insert <= mr0i) {
         fprintf(stderr, "jit_call_switch_protocol: the materializer "
-                        "INSERT DID NOT RUN under FORCE=norec\n");
+                        "INSERT DID NOT RUN with the norec tier on\n");
         ok = false;
     }
     /* a THROW from far below the cap: the walk crosses switch-pushed
@@ -26069,14 +26071,14 @@ static bool jit_counter_coverage()
         { "norec_verify",     &g_jit_norec_verify,     nullptr },
         { "norec_ret",        &g_jit_norec_ret_verify,  nullptr },
         { "norec_frame",      &g_jit_norec_frame_verify,
-          jit_norec_forced() ? "the record-pairing shadows are gated off "
+          jit_norec_on() ? "the record-pairing shadows are gated off "
                                "under the 4-v fork" : nullptr },
         { "norec_stamp",      &g_jit_norec_stamp_verify,
-          jit_norec_forced() ? "gated off under the 4-v fork" : nullptr },
+          jit_norec_on() ? "gated off under the 4-v fork" : nullptr },
         { "norec_walk",       &g_jit_norec_walk_frames,
-          jit_norec_forced() ? "gated off under the 4-v fork" : nullptr },
+          jit_norec_on() ? "gated off under the 4-v fork" : nullptr },
         { "norec_desc",       &g_jit_norec_desc_chain,
-          jit_norec_forced() ? "gated off under the 4-v fork" : nullptr },
+          jit_norec_on() ? "gated off under the 4-v fork" : nullptr },
         { "callee_cache",     &g_jit_callee_cache,     nullptr },
         { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
         { "bind_coerce",      &g_jit_bind_coerce,      nullptr },
