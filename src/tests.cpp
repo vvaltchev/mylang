@@ -1835,6 +1835,52 @@ static const std::vector<test> tests =
     },
 
     {
+        /* H2: LoadElemValue serves EVERY storage kind now (it was
+         * general-or-strs, everything else an InternalErrorEx), because a
+         * plain `x = a[i]` on a proven array lowers to it - and a proven
+         * array can be FLAT. `vm_arr_elem` IS `arr_elem_at`, the function
+         * TypeArr::subscript's read path already used, so each kind boxes
+         * as it always did; these pin that, in all five execution modes.
+         * The STRUCT case is the one that could not occur before (the
+         * op's only caller read a nested-array base, always general). */
+        "boxed element read: every array storage kind (H2)",
+        {
+            "struct P { int x; int y; }",
+            "var i = 0; i = i + runtime(1);",
+            /* flat structs */
+            "var ps = [P(1,2), P(3,4)];",
+            "var p = ps[i]; assert(p.x == 3 && p.y == 4);",
+            /* flat strs */
+            "var ss = [\"a\", \"bb\"];",
+            "var s = ss[i]; assert(s == \"bb\");",
+            /* general (an array of arrays) */
+            "var gg = [[1,2],[3,4]];",
+            "var g = gg[i]; assert(g == [3,4]);",
+            /* general holding FUNC values - 76_funcval_dispatch's shape */
+            "func f0() { return 10; }",
+            "func f1() { return 20; }",
+            "var fs = [f0, f1];",
+            "var fn = fs[i]; assert(fn() == 20);",
+            /* a NEGATIVE index wraps, on every kind */
+            "var n = 0; n = n - runtime(1);",
+            "assert(ps[n].x == 3);",
+            "assert(ss[n] == \"bb\");",
+            "assert(gg[n] == [3,4]);",
+            /* a SLICE base (offset() must be honoured) */
+            "var sl = gg[1:];",
+            "var z = 0; z = z + runtime(0);",
+            "assert(sl[z] == [3,4]);",
+            /* the element is a COPY, not an alias into the storage:
+             * mutating the array afterwards must not change what was read
+             * (nor the reverse) */
+            "var mm = [[7,8],[9,9]];",
+            "var row = mm[z];",
+            "mm[0] = [1,1];",
+            "assert(row == [7,8]);",
+        },
+    },
+
+    {
         /* ARG-position value use (a higher-order builtin) escapes too:
          * map(template, arr) keeps today's behavior. */
         "value-template passed to map() stays sound",
@@ -19684,6 +19730,80 @@ static bool capture_typed_arith_shapes()
     return true;
 }
 
+/*
+ * H2: a boxed element READ `x = a[i]` on a PROVEN array with an int index
+ * lowers to LoadElemValue, not the generic SubscriptV.
+ *
+ * SubscriptV goes through the runtime Type virtual, which for a general
+ * array with an LValue base builds the element's LVALUE (a get_vec() plus
+ * two container back-pointer stores) that jit_subscript then RValue()s
+ * away - this op wants a VALUE. Both produce the same value, so only the
+ * bytecode can see the difference. The DECLINES matter as much: a dict
+ * base, or an index that is not an int expression, must keep SubscriptV,
+ * whose Type dispatch is what serves them.
+ */
+static bool array_elem_read_shapes()
+{
+    struct Case {
+        const char *name;
+        std::vector<const char *> lines;
+        int want_loadev;
+        int want_subscriptv;
+    };
+    const std::vector<Case> cases = {
+        /* 76_funcval_dispatch's dispatch shape */
+        { "elem read: proven array + int index -> LoadElemValue", {
+            "var a = [[1],[2]]; var i = 0; i = i + runtime(0);",
+            "var x = a[i]; print(x);" }, 1, 0 },
+        /* a DICT base is not base_array - the Type virtual serves it */
+        { "no elem read: dict base keeps SubscriptV", {
+            "var d = {1: [9]}; var i = 0; i = i + runtime(1);",
+            "var x = d[i]; print(x);" }, 0, 1 },
+        /* a DYN index cannot compile as an int operand; SubscriptV's
+         * TypeErrorEx(\"Expected integer as subscript\") is its job */
+        { "no elem read: dyn index keeps SubscriptV", {
+            "var a = [[1],[2]]; var dyn k = runtime(0);",
+            "var x = a[k]; print(x);" }, 0, 1 },
+    };
+
+    for (const Case &c : cases) {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i) src += '\n';
+            src += c.lines[i];
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+
+        int n_lev = 0, n_sub = 0;
+        auto scan = [&](const Chunk &ck) {
+            for (const Instr &in : ck.code) {
+                if (in.op == OpCode::LoadElemValue) n_lev++;
+                if (in.op == OpCode::SubscriptV)    n_sub++;
+            }
+        };
+        scan(prog.root);
+        for (const auto &fd : prog.funcs)
+            if (fd->vm_chunk)
+                scan(*static_cast<const Chunk *>(fd->vm_chunk));
+
+        if (n_lev != c.want_loadev || n_sub != c.want_subscriptv) {
+            fprintf(stderr, "array_elem_read_shapes: '%s' emitted "
+                            "loadev=%d subscriptv=%d, wanted %d/%d\n",
+                    c.name, n_lev, n_sub,
+                    c.want_loadev, c.want_subscriptv);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Lever 2 (VmInvoker direct fragment entry): per callback ELEMENT the
  * invoker calls jit_enter directly instead of re-entering vm_dispatch -
  * g_jit_invoke_direct counts those entries, so growth ~ the element
@@ -27703,12 +27823,18 @@ static bool vm_codegen_shapes()
 
     /* 13) a 2-D read `m[i][j]` in nested loops lowers fully native, and the
      * INVARIANT row read `m[i]` is HOISTED out of the inner loop (LICM): it
-     * becomes one SubscriptV into a `$licm0` temp above the inner loop, so the
-     * inner body is a single LoadElemInt. The per-iteration LoadElemValue that
-     * used to materialize the row - a boxed EvalValue + an intrusive_ptr
-     * retain/release every iteration - is GONE (loadev == 0), which is the
-     * whole point of the pass. Here `0 < 3` is decidable at compile time, so
-     * no guard is emitted either (juic stays 2: the two loop tests). */
+     * becomes ONE element read into a `$licm0` temp above the inner loop, so
+     * the inner body is a single LoadElemInt. The pass's property is that the
+     * row is materialized ONCE, not per iteration - a boxed EvalValue + an
+     * intrusive_ptr retain/release every iteration is what it deletes.
+     * Here `0 < 3` is decidable at compile time, so no guard is emitted
+     * either (juic stays 2: the two loop tests).
+     *
+     * H2 (2026-08-12) changed WHICH op the hoisted read is: a proven-array
+     * subscript now lowers to LoadElemValue, not the generic SubscriptV -
+     * so this reads loadev == 1 / subscriptv == 0 where it read 1 / 0
+     * before. The COUNT is what pins the pass (one read, not three); the
+     * opcode identity is H2's business. */
     VmOpCounts d2;
     if (!codegen_counts({
             "var m = [[1,2,3],[4,5,6]]; var s = 0;",
@@ -27719,7 +27845,7 @@ static bool vm_codegen_shapes()
     /* the inner `s += t` + step fuse to IntAddStep (#9); the outer
      * step stays a plain ForLoopStep. */
     const bool read_2d_ok =
-        d2.loadev == 0 && d2.subscriptv == 1 && d2.loadei == 1
+        d2.loadev == 1 && d2.subscriptv == 0 && d2.loadei == 1
         && d2.flstep == 1 && d2.iaddstep == 1 && d2.juic == 2;
 
     /* 14) a scalar-returning migrated BUILTIN in a loop body (`s += sqrt(i)`)
@@ -29048,6 +29174,8 @@ static const std::vector<extra_check> extra_checks =
       hoist_slice_shapes },
     { "codegen: a typed CAPTURE leaf keeps its arithmetic unboxed (H1)",
       capture_typed_arith_shapes },
+    { "codegen: a proven-array element read lowers to LoadElemValue (H2)",
+      array_elem_read_shapes },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",

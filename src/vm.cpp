@@ -4241,12 +4241,6 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
         return 1;
     }
     const SharedArrayObj &arr = basev.get_ref<SharedArrayObj>();
-    const SharedArrayObj::Storage k = arr.skind();
-    if (k != SharedArrayObj::Storage::general
-            && k != SharedArrayObj::Storage::strs) {
-        g_vm_jit_eptr = std::make_exception_ptr(InternalErrorEx());
-        return 1;
-    }
     int_type i = idx;
     if (i < 0)
         i += arr.size();
@@ -4254,10 +4248,9 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
         g_vm_jit_exc.reset(new OutOfBoundsEx());   /* loc-less: side table */
         return 1;
     }
-    if (k == SharedArrayObj::Storage::general)
-        f->at(dst).put(arr.get_vec()[arr.offset() + i].get());
-    else
-        f->at(dst).put(EvalValue(SharedStr(arr.flat_strs()[arr.offset() + i])));
+    /* every storage kind, through the interpreter's own boxing function
+     * (H2) - see the interpreted twin's comment. */
+    f->at(dst).put(vm_arr_elem(arr, static_cast<size_type>(i)));
     return 0;
 }
 
@@ -9677,48 +9670,36 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 
         VM_CASE(LoadElemValue): {
 
-            /* a[i] (an array-valued element of a GENERAL array) into a temp
-             * slot, so a 2-D read `a[i][k]` is native (both indices). The base
-             * is a PROVEN general array (base_array + a general element type),
-             * so the old non-general node->eval fallback was unreachable. */
+            /* `a[i]` read as a VALUE, for ANY element storage (H2,
+             * 2026-08-12). It was general-or-strs only, because its one
+             * caller was compile_array_base's nested read (whose outer
+             * element is itself a container, hence general); every other
+             * storage kind was an InternalErrorEx. It is now the general
+             * boxed array-element READ - `vm_arr_elem` IS `arr_elem_at`,
+             * the same function TypeArr::subscript's read path calls, so
+             * ints/floats/bools/structs box exactly as they always did
+             * and there is one implementation, not a second copy. That
+             * is what lets a plain `x = a[i]` on a PROVEN array lower
+             * here instead of to the generic SubscriptV, whose
+             * Type-virtual dispatch + LValue back-pointer dance is
+             * computed and then thrown away by the RValue(). */
             const EvalValue &base = ctx.frame->at(in->target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                if (arr.skind() == SharedArrayObj::Storage::general) {
-                    int_type idx = read_int_operand(in->a(), &ctx);
-                    if (idx < 0)
-                        idx += arr.size();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
-                        Loc ls, le;
-                        chunk->loc_at(pc, ls, le);
-                        throw OutOfBoundsEx(ls, le);
-                    }
-                    ctx.frame->at(in->target).put(
-                        arr.get_vec()[arr.offset() + idx].get());
-                    pc++;
-                    VM_NEXT;
+                int_type idx = read_int_operand(in->a(), &ctx);
+                if (idx < 0)
+                    idx += arr.size();
+                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+                    Loc ls, le;
+                    chunk->loc_at(pc, ls, le);
+                    throw OutOfBoundsEx(ls, le);
                 }
-                if (arr.skind() == SharedArrayObj::Storage::strs) {
-                    /* Flat STRING array (top-10 #7): an array<str> is a
-                     * general-ELEMENT type statically but may hold flat strs
-                     * storage - bind a boxed SharedStr copy (a handle;
-                     * strings are immutable, so a copy == the tree-walker's
-                     * reference bind). */
-                    int_type idx = read_int_operand(in->a(), &ctx);
-                    if (idx < 0)
-                        idx += arr.size();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
-                        Loc ls, le;
-                        chunk->loc_at(pc, ls, le);
-                        throw OutOfBoundsEx(ls, le);
-                    }
-                    ctx.frame->at(in->target).put(EvalValue(
-                        SharedStr(arr.flat_strs()[arr.offset() + idx])));
-                    pc++;
-                    VM_NEXT;
-                }
+                ctx.frame->at(in->target).put(
+                    vm_arr_elem(arr, static_cast<size_type>(idx)));
+                pc++;
+                VM_NEXT;
             }
-            throw InternalErrorEx();   /* unreachable: base_array general proven */
+            throw InternalErrorEx();   /* unreachable: base_array proven */
         }
 
         VM_CASE(DictIterInit): {

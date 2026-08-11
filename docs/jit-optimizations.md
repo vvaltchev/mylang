@@ -3494,3 +3494,54 @@ of the top five entirely), **78 0.80x** (15.6x -> 11.5x), **63_closures
 programs. Sabotages watched failing: storing the pre-update value
 (caught by the persistence test), and re-including `/` (caught by both
 the shape decline and the caret test).
+
+## H2 (2026-08-12): a proven-array element READ leaves SubscriptV
+
+`x = a[i]` on an array the inferencer proved (`base_array`) with an int
+index now lowers to **LoadElemValue** instead of the generic SubscriptV.
+SubscriptV goes through the runtime `Type::subscript(for_write=false)`
+virtual, which for a general array with an LValue base builds the
+element's LVALUE - a `get_vec()` plus two container back-pointer stores
+- and `jit_subscript` then `RValue()`s all of it away, because the op
+wants a VALUE. LoadElemValue reads the element straight out of the
+storage.
+
+`LoadElemValue` became UNIVERSAL to make this safe: it served
+general-or-strs and raised InternalErrorEx on anything else (its only
+caller was compile_array_base's nested-read base, whose element is
+itself a container). A proven array can be FLAT, so both twins now go
+through **`vm_arr_elem`, which IS `arr_elem_at`** - the same function
+TypeArr::subscript's read path calls - and every kind boxes exactly as
+before, from ONE implementation. The op's InternalErrorEx now means
+only "the base is not an array", which `base_array` proves.
+
+**TWO AUDIT-TABLE GAPS FELL OUT, and they are the durable part.**
+LoadElemValue was missing from BOTH `visit_use_def` (so it was a
+LIVENESS BARRIER - every temp read live) and `retargetable_dst` (so the
+E1 peephole could not fuse `<produce t>; MoveV d = t`). Neither cost
+anything VISIBLE while its only caller was a nested-read base consumed
+by the very next op; the moment H2 gave it a plain `x = a[i]` in a
+LOOP, both bit at once - the MoveV survived (an extra 32-byte copy +
+refcount per iteration) and the barrier killed the call-cluster
+dead-dst rule, so 76's discarded `fn(st, i);` went back to
+materializing its result. Watched in the disassembly, fixed, and 76's
+bytecode is now byte-identical to before except the one opcode. **This
+is the third occurrence of the stage trap in this file; the shape is
+always "a table is audited for the callers that existed".**
+
+MEASURED, and the projection was WRONG in an instructive way. Ir
+(OPT=1 ASSERTS=0, scale-1-vs-3 so compile time is excluded):
+**76_funcval_dispatch 836 -> 734 Ir per iteration, -12.2%**;
+46_matrix_mult -0.6%. Wall clock (interleaved --baseline, full suite):
+**76 is FLAT (1.01x)**, 46 0.97x, suite geomean cur/base 1.004x - and
+benches whose bytecode is BYTE-IDENTICAL swing 0.89x-1.13x in the same
+run, which is the noise floor this sits inside. The plan projected
+76 -20-25% WALL from ~200 Ir; the Ir arrived and the time did not,
+because what was removed is a helper-call frame, a virtual dispatch
+and pointer arithmetic - cheap, perfectly-predicted, L1-resident work
+that retires alongside the memory-bound call protocol. The same
+instruction-vs-time divergence recorded for the guard-elision family.
+The change stays (fewer instructions, smaller emitted code, and the
+two table fixes are correctness-adjacent wins), but **76's wall-clock
+gap is NOT in its element read** - the remaining 734 Ir/iteration is
+the call protocol and the two arg copies.

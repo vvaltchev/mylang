@@ -1443,6 +1443,53 @@ struct Codegen {
          * SubscriptV via the runtime Type::subscript. (A slice is a separate
          * node, not handled here.) */
         if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+            /*
+             * H2 (2026-08-12): a PROVEN ARRAY base with an int index reads
+             * through LoadElemValue instead - the same value, a third of
+             * the work. SubscriptV goes through the runtime Type virtual
+             * `subscript(for_write=false)`, which for a general array with
+             * an LValue base builds the element's LVALUE (a get_vec() and
+             * two container back-pointer stores) - and jit_subscript then
+             * RValue()s all of it away, because this op wants a VALUE.
+             * LoadElemValue reads the element straight out of the storage
+             * (any kind, via arr_elem_at). Measured on the `ops[i % 2]`
+             * dispatch of 76_funcval_dispatch: ~173 Ir -> ~60.
+             *
+             * `base_array` is the inferencer's proof that the base is a
+             * non-opt array - the same proof LoadElemValue's existing
+             * caller relies on. The int index is required because the op
+             * reads an int operand; a dyn/str index keeps SubscriptV,
+             * whose TypeErrorEx("Expected integer as subscript") it is.
+             * A dict/string/dyn base is not base_array and is untouched.
+             */
+            if (sub->base_array) {
+                /* BOTH halves emit, so a half-succeeded attempt must be
+                 * rolled back whole - otherwise the base's ops survive
+                 * into the SubscriptV path below, which compiles the
+                 * base AGAIN (a duplicated evaluation, not just waste). */
+                const size_t smark = ops.size();
+                const size_t scmark = chunk.consts.size();
+                const int ssave = next_temp;
+                int aslot;
+                Operand aidx;
+                if (compile_array_base(sub->what.get(), aslot, ops)
+                        && compile_int_expr(sub->index.get(), aidx, ops)) {
+                    const int t = alloc_temp();
+                    CgInstr in;
+                    in.op = OpCode::LoadElemValue;
+                    in.node_idx = add_ast_node(sub);   /* the OOB caret */
+                    in.target = t;
+                    in.target2 = aslot;
+                    in.set_a(aidx);
+                    ops.push_back(in);
+                    out_slot = t;
+                    return true;
+                }
+                ops.resize(smark);
+                chunk.consts.resize(scmark);
+                next_temp = ssave;
+            }
+
             int base_slot, idx_slot;
             if (!compile_boxed_expr(sub->what.get(), base_slot, ops)
                 || !compile_boxed_expr(sub->index.get(), idx_slot, ops))
@@ -7942,6 +7989,17 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElemBool: case OpCode::LoadStrChar:
+    /* LoadElemValue was a BARRIER too (H2, 2026-08-12) - the SAME
+     * omission as the struct reads below, found the same way. Its only
+     * caller was compile_array_base's nested-read base, whose enclosing
+     * shapes never showed the cost; the moment H2 gave it a plain
+     * `x = a[i]` inside a LOOP, the barrier made every temp look live
+     * across the back edge and the call-cluster dead-dst rule stopped
+     * firing - 76_funcval_dispatch's discarded `fn(st, i);` went from
+     * `dst = -1` back to materializing its result. It reads its base
+     * (target2) + index (a) and writes target, exactly like the
+     * siblings on this line. */
+    case OpCode::LoadElemValue:
     /* the struct reads (were BARRIERS, which made every temp look live
      * inside a struct-loop body and silently blocked the E4 IntAddModRI
      * fusion there - found by #9 F-C): */
@@ -8023,6 +8081,16 @@ static bool retargetable_dst(OpCode op)
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+    /* LoadElemValue was MISSING here while every sibling was present -
+     * a pre-existing gap this table's shape invites (see THE AUDIT-TABLE
+     * STAGE TRAP): its only caller was compile_array_base's nested-read
+     * base, which is consumed by the next op and never reaches the
+     * `<produce t>; MoveV d = t` shape E1 fuses, so the absence cost
+     * nothing VISIBLE. The moment H2 made it serve a plain `x = a[i]`,
+     * the move survived and the win was half eaten. It writes only
+     * `target` and never reads it - the same contract as the LoadElem*
+     * siblings above. */
+    case OpCode::LoadElemValue:
     case OpCode::LoadStrChar: case OpCode::ArrLen: case OpCode::StrLen:
     case OpCode::OrdCharV:
     case OpCode::SliceV: case OpCode::CallV: case OpCode::CachedCallV:
