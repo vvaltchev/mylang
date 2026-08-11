@@ -107,9 +107,48 @@ refcount churn per element.
   **76's remaining 734 Ir/iteration is the CALL PROTOCOL and the two
   arg copies - not the element read**, so the next move on 76 is H4
   (the window/accounting residue), not another read tier.
-- **H3 - SINGLE-MOVE UNPACK (75).** arr_elem_at straight into the
-  dst slot with one retain, no boxed temp round-trip. Projected:
-  75 −25-35%.
+- **H3 - SINGLE-MOVE UNPACK (75). TARGET PROVEN WALL-CLOCK-VISIBLE
+  (2026-08-12), implementation open.** After H2 the first question is
+  no longer "how many instructions" but "does the time move". For 75
+  it does. A four-way probe at scale 4, best-of-5, same binary:
+
+        bare counter loop, no bind            0.01s
+        foreach + ONE array-element bind      0.16s
+        foreach + 2-STRING unpack, unused     0.27s
+        the bench (unpack + 2 len + arith)    0.28s
+
+  So **the element BINDS are ~93% of this bench's wall time** (0.26 of
+  0.28) and the loop machinery is ~4%; the `len()` calls and the
+  arithmetic together cost 0.01s. Per element that is ~6.7ns (~20
+  cycles) for what is logically a 24-byte handle copy plus two
+  refcount RMWs. (Note a control: replacing the unpack with
+  `row[0]`/`row[1]` subscripts is SLOWER - 0.44s - so the unpack op is
+  already the better of the two lowerings; the cost is inside the
+  BIND, not in choosing it.)
+
+  WHERE IT GOES, per element (vm_unpack_elem_body's value branch):
+  `vm_arr_elem` builds `EvalValue(SharedStr(flat_strs()[at]))` - one
+  intrusive_ptr RETAIN - and `LValue::put(EvalValue&&)` then runs
+  `EvalValue::operator=(EvalValue&&)`, whose work for a `t_str` value
+  is an INDIRECT call through `type->move_assign` (plus destroy/create
+  through two more function pointers whenever the slot's current type
+  differs). The type erasure is the cost: the types are statically
+  known at that point (a `strs` sub-array yields a SharedStr) but the
+  value model reaches them through pointers.
+
+  THE SHAPE OF THE FIX: in the `strs` branch, when the destination is
+  a plain frame slot ALREADY holding a SharedStr (the steady state
+  after the first iteration), assign the handle directly -
+  `dst.getval<SharedStr>() = SharedStr(src)` - which is an
+  intrusive_ptr release+retain with NO type-erased dispatch; anything
+  else (a const slot, a container-backed slot, a different current
+  type) keeps `put()`. NOTE `SharedStr`'s DELETED ctor is the one from
+  `std::string`, not the copy ctor - copying a handle is allowed and
+  is exactly a retain. Sibling cases to enumerate before calling it
+  done: the general-storage branch (a func/array/dict element - the
+  same indirect-call chain), the flat int/float branches (already
+  direct via write_*_slot), and MultiUnpackV, which shares the value
+  model but not this function.
 - **H4 - the structural residue (the G1 arc's next act): window on
   the native stack** - kill the seg-top/used accounting + restore
   (~30-40 Ir/call). Big design step (StackOverflowEx, the walker,
