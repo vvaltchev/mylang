@@ -91,6 +91,9 @@ extern unsigned long g_jit_invoke_direct;
  * Next bodies (resolved once at ForeachDynInit): 0 int / 1 float / 2 bool /
  * 3 gen / 4 dict */
 extern unsigned long g_dyn_foreach_fast[5];
+/* H3 (#159) execution proof: unpack binds that took the direct SharedStr
+ * copy-assign (no type-erased dispatch) instead of put() */
+extern unsigned long g_unpack_fast_binds;
 #endif
 
 /*

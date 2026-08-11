@@ -4303,6 +4303,77 @@ extern "C" int jit_dict_load_float(int_type dst, int_type base_slot,
     return jit_dict_load_body(dst, base_slot, key, false);
 }
 
+#ifdef TESTS
+unsigned long g_unpack_fast_binds = 0;   /* H3 (#159) execution proof */
+#endif
+
+/* H3 (#159): bind an unpacked STRING into a plain frame slot. put() is
+ * correct here but pays the type-erased dispatch (EvalValue::operator= is
+ * an indirect call through type->copy/move_assign, plus destroy/create
+ * function-pointer hops when the slot's current type differs) - measured
+ * at ~93% of 75_indexed_unpack's wall time. When BOTH sides are strings
+ * and the slot is a plain one (no container back-pointer - the COW path
+ * keeps put()), the bind is a plain SharedStr copy-assign: an
+ * intrusive_ptr release+retain plus three POD fields, fully inline, with
+ * a self-assign guard in the pointer. Observably identical to put(): the
+ * slot shares the same StrObj either way (the window model gives value
+ * semantics with shared buffers), and put() does not test is_const
+ * either (const-ness is enforced by the callers). The steady state
+ * (iteration 2+ of an unpack loop) always hits this: the slot still
+ * holds the previous iteration's string. */
+static inline void
+vm_slot_bind_str(LValue &dst, const SharedStr &src)
+{
+    if (!dst.container && dst.is<SharedStr>()) {
+#ifdef TESTS
+        g_unpack_fast_binds++;
+#endif
+        dst.getval<SharedStr>() = src;   /* release + retain, no dispatch */
+        return;
+    }
+    dst.put(EvalValue(SharedStr(src)));  /* first bind / type change */
+}
+
+/* The GENERAL-storage twin: the element is already a boxed EvalValue, so
+ * a non-string bind is put(const &) - ONE copy_assign - instead of
+ * materializing a temp via vm_arr_elem (copy_ctor + move_assign + dtor).
+ * Safe to pass a reference INTO the array's storage: the base frame slot
+ * owns the outer array for the whole op and this writes only frame
+ * slots, so the source cannot be freed mid-assign (the same argument
+ * today's temp-then-put relies on for its `sub` reference). */
+static inline void
+vm_slot_bind_value(LValue &dst, const EvalValue &src)
+{
+    if (!dst.container && src.is<SharedStr>() && dst.is<SharedStr>()) {
+#ifdef TESTS
+        g_unpack_fast_binds++;
+#endif
+        dst.getval<SharedStr>() = src.get_ref<SharedStr>();
+        return;
+    }
+    dst.put(src);
+}
+
+/* Element k of `sub` into `dst`, storage-aware (the H3 dispatch). The
+ * flat scalar kinds keep the vm_arr_elem temp: it is trivial there (a
+ * POD copy, t < t_str), and a struct element must materialize anyway. */
+static inline void
+vm_unpack_bind_elem(LValue &dst, const SharedArrayObj &sub, size_type k)
+{
+    const size_type at = sub.offset() + k;
+    switch (sub.skind()) {
+        case SharedArrayObj::Storage::general:
+            vm_slot_bind_value(dst, sub.get_vec()[at].get());
+            return;
+        case SharedArrayObj::Storage::strs:
+            vm_slot_bind_str(dst, sub.flat_strs()[at]);
+            return;
+        default:
+            dst.put(vm_arr_elem(sub, k));
+            return;
+    }
+}
+
 /* The SHARED UnpackElem* body (the STRICT foreach-unpack of pairs[i] into N
  * loop vars): ONE implementation for the four interpreter handlers AND
  * jit_unpack_elem. `kind` 0 = int (flat-ints fast path), 1 = float, 2 =
@@ -4327,8 +4398,8 @@ vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
     if (targets) {
         for (int_type k = 0; k < N; k++) {
             if ((*targets)[k] >= 0)
-                ctx.frame->at((*targets)[k]).put(
-                    vm_arr_elem(sub, static_cast<size_type>(k)));
+                vm_unpack_bind_elem(ctx.frame->at((*targets)[k]), sub,
+                                    static_cast<size_type>(k));
         }
         return;
     }
@@ -4346,8 +4417,8 @@ vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
          * scalar kind): bind each element's ACTUAL boxed value - identical
          * to do_iter's bind_loop_var. */
         for (int_type k = 0; k < N; k++)
-            ctx.frame->at(dst_base + k).put(
-                vm_arr_elem(sub, static_cast<size_type>(k)));
+            vm_unpack_bind_elem(ctx.frame->at(dst_base + k), sub,
+                                static_cast<size_type>(k));
     }
 }
 
@@ -4396,15 +4467,27 @@ vm_multi_unpack_body(EvalContext &ctx, const EvalValue &rval,
             vm_throw_multi_unpack_len(chunk, pc, m, targets.size());
         for (size_t i = 0; i < targets.size(); i++) {
             ti = i;
-            if (targets[i] >= 0)
-                store(targets[i], vm_arr_elem(ra,
-                                              static_cast<size_type>(i)));
+            if (targets[i] < 0)
+                continue;
+            if (!compound && !(coerce && (*coerce)[i])) {
+                /* the plain bind (H3): identical to store()'s put arm,
+                 * minus the vm_arr_elem temp + type-erased dispatch */
+                vm_unpack_bind_elem(ctx.frame->at(targets[i]), ra,
+                                    static_cast<size_type>(i));
+                continue;
+            }
+            store(targets[i], vm_arr_elem(ra, static_cast<size_type>(i)));
         }
     } else {
         for (size_t i = 0; i < targets.size(); i++) {
             ti = i;
-            if (targets[i] >= 0)
-                store(targets[i], rval);
+            if (targets[i] < 0)
+                continue;
+            if (!compound && !(coerce && (*coerce)[i])) {
+                vm_slot_bind_value(ctx.frame->at(targets[i]), rval);
+                continue;
+            }
+            store(targets[i], rval);
         }
     }
 }
