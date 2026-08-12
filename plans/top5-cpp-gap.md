@@ -403,3 +403,38 @@ RECOMMENDATION: **C now** (it banks 78's win at low risk and is
 independently justified), and **B as a design discussion** - if B is
 accepted, A becomes unnecessary and H4 lands cheaply and permanently
 sound. A is only worth building if B is rejected.
+
+## OPTION B LANDED (2026-08-12) - H4 IS UNBLOCKED AND NEEDS NO GUARD
+
+`static_type_assignable` AND the fixpoint's `join` now both compare the
+whole func SIGNATURE (arity + every settled param/return), deferring on
+an Unknown / None / dyn component. Commit: "ti: function subtyping
+checks the SIGNATURE, not just the arity (option B)".
+
+**THE COMPLETENESS AUDIT** - every route by which a wrongly-typed
+function could previously reach a typed call site, re-probed after the
+change. Each is now closed, and note they close in THREE different ways,
+which is why the audit was worth running rather than assuming:
+
+    var g = a; g = b;              -> TypeMismatchEx (assignable/join)
+    var ops = [a, b]; ops[1](1)    -> element join conflicts -> array<dyn>
+                                      -> DynRequiredEx (write `dyn` to opt in)
+    var d = {0:a, 1:b}; d[1](1)    -> same, via the dict value type
+    func pick(n){...return b;}     -> the RETURN type joins to dyn
+                                      -> DynRequiredEx
+    func use(f){ return f(1); }    -> `use` is a TEMPLATE: monomorphized
+       use(a); use(b);                per signature, each instance typed
+                                      correctly (prints 1 and 2.500000)
+    func[g]() => g(1)              -> the capture keeps g's exact signature
+
+So a call whose static return type is a concrete int/float now really
+does return that type at run time. **H4 therefore reduces to what it was
+originally scoped as**: a `try_call_leaf` beside `try_capture_leaf` that
+materializes the result with the EXISTING call op into a temp and hands
+the temp to the typed ops - no guard, no new opcode, no dual-path
+lowering, no myv change. The int AND float halves both work, since the
+decline that forced the split no longer exists.
+
+Costs nothing at run time and was measured to refuse 0 of 96 corpus
+programs. The `dyn` keyword is the documented opt-out for code that
+genuinely wants a variable to hold differently-typed functions.
