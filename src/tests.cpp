@@ -13997,6 +13997,65 @@ static const std::vector<test> tests =
       { "var x = 1; x = \"s\";" }, &typeid(TypeMismatchEx) },
     { "ti: mandatory dyn - `dyn` allows the conflicting reassignment",
       { "var dyn x = 1; x = \"s\"; assert(x == \"s\");" } },
+
+    /*
+     * FUNCTION SUBTYPING CHECKS THE SIGNATURE, not just the arity
+     * (option B, 2026-08-12). Before this, a func type was a promise the
+     * runtime did not keep: the three REFUSE cases below all COMPILED,
+     * and `g(1)` then returned a float (the whole expression promoted -
+     * `s` printed 2.500000), an int, or a str (a runtime TypeErrorEx).
+     * That is why a typed call-result tier could not be built soundly.
+     * BOTH doors are closed and both are tested: a REASSIGNMENT goes
+     * through the fixpoint's join (these cases), an ANNOTATED decl / an
+     * argument goes through assignable.
+     */
+    { "ti: func subtyping - a wrong RETURN type is refused (->float)",
+      { "func a(int k) { return k; }",
+        "func b(int k) { return 2.5; }",
+        "var g = a; g = b; var s = 0; s = s + g(1);" },
+      &typeid(TypeMismatchEx) },
+    { "ti: func subtyping - a wrong RETURN type is refused (->str)",
+      { "func a(int k) { return k; }",
+        "func b(int k) { return \"z\"; }",
+        "var g = a; g = b; var s = 0; s = s + g(1);" },
+      &typeid(TypeMismatchEx) },
+    { "ti: func subtyping - an int return into a float one is refused",
+      { "func a(float x) { return x; }",
+        "func b(float x) { return 3; }",
+        "var h = a; h = b; var t = 0.0; t = t + h(1.0);" },
+      &typeid(TypeMismatchEx) },
+    { "ti: func subtyping - a wrong PARAM type is refused",
+      { "func a(int k) { return k; }",
+        "func b(str k) { return 1; }",
+        "var g = a; g = b;" },
+      &typeid(TypeMismatchEx) },
+    { "ti: func subtyping - an IDENTICAL signature is still accepted",
+      { "func a(int k) { return k; }",
+        "func b(int k) { return k * 2; }",
+        "var g = a; g = b; var s = 0; s = s + g(3); assert(s == 6);" } },
+    { "ti: func subtyping - `dyn` opts out (the escape hatch)",
+      { "func a(int k) { return k; }",
+        "func b(int k) { return 2.5; }",
+        "var dyn g = a; g = b; assert(g(1) == 2.5);" } },
+    /* The DECLINE direction is the one that matters: the rule must not
+     * fire on inference ORDER. A callback's own param/return types are
+     * themselves inferred, so these three shapes - the exact objection
+     * the old arity-only comment recorded - are what the Unknown-defers
+     * rule in static_type_sig_compat exists to keep compiling. */
+    { "ti: func subtyping - higher-order apply(f, v) still compiles",
+      { "func sq(int x) { return x * x; }",
+        "func apply(f, int v) { return f(v); }",
+        "assert(apply(sq, 5) == 25);" } },
+    { "ti: func subtyping - a same-signature func ARRAY still compiles",
+      { "func a(int k) { return k; }",
+        "func b(int k) { return k + 1; }",
+        "var ops = [a, b]; var s = 0;",
+        "for (var i = 0; i < 2; i++) { var h = ops[i]; s = s + h(1); }",
+        "assert(s == 3);" } },
+    { "ti: func subtyping - an inline lambda callback still compiles",
+      { "var a = [1, 2, 3];",
+        "var m = map(func(int x) { return x + 1; }, a);",
+        "assert(m[2] == 4);" } },
     { "ti: mandatory dyn - an int accumulator stays concrete (no dyn needed)",
       { "var s = 0; var a = range(5);",
         "foreach (var e in a) s += e; assert(s == 10);" } },

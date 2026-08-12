@@ -1019,6 +1019,30 @@ Key rules:
   * A variable's type is the **join** of everything assigned to it. Assigning an
     incompatible type on any path is an error. `int` automatically widens to
     `float` (so `var x = 1; x = 2.5;` is fine, and `x` becomes a `float`).
+  * **A function value's type is its whole signature, not just its arity.** A
+    variable holding a function may only be assigned functions with the *same*
+    parameter and return types, so the signature a call site sees is one the
+    runtime actually keeps:
+
+    ```C#
+    func a(int k) { return k; }
+    func b(int k) { return 2.5; }   # same arity, different return type
+    func c(int k) { return k * 2; } # same signature
+
+    var g = a;
+    g = c;                 # ok
+    g = b;                 # error: g has type 'func(int)->int'
+                           #        but is assigned 'func(int)->float'
+
+    var dyn h = a;
+    h = b;                 # ok: `dyn` opts out of the check
+    ```
+
+    This only ever compares types the compiler has actually settled on — an
+    un-inferred or `dyn` parameter/return matches anything — so ordinary
+    higher-order code (`apply(sq, 5)`, an array of same-shaped functions, an
+    inline `map` callback) is unaffected. Use `dyn` when you genuinely want a
+    variable to hold differently-typed functions.
   * **A function with un-annotated parameters is a *template*** (like a C++
     template), not a fixed-type function. It is **not type-checked on its own**;
     instead it is **instantiated per call-site signature**, and each instance is

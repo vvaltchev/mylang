@@ -2251,8 +2251,42 @@ decisions behind it: `plans/archived/type-inference.md`,
   pass runs, so it never sees them as symbols. A statically-known type error
   that used to surface as a runtime `TypeErrorEx`/`NotCallableEx` is now a
   compile error — to keep such an error catchable at runtime, make the value
-  `dyn`. **Not yet done** (deferred): function subtyping is arity-only;
-  cross-statement narrowing beyond the patterns above.
+  `dyn`. **Not yet done** (deferred): cross-statement narrowing beyond the
+  patterns above.
+- **FUNCTION SUBTYPING CHECKS THE SIGNATURE (option B, 2026-08-12) — and it
+  is a TYPE-SOUNDNESS rule, not a style rule.** Assigning a function to a
+  func-typed name requires the arity AND every *settled* param/return type to
+  match; `dyn` anywhere opts that position out. It used to check **arity
+  alone**, which made a function type a promise the runtime did not keep:
+
+      func a(int k) { return k; }
+      func b(int k) { return 2.5; }
+      var g = a; g = b;          # was ACCEPTED
+      var s = 0; s = s + g(1);   # -> s = 2.500000, though g : func(int)->int
+
+  Every consumer of `g(1)` — the inferencer, M8, and each of the JIT's
+  unboxed tiers — is entitled to treat the result as the `int` the signature
+  promises, and none of them could. **This is the same principle as the
+  brace-less-body note under *Invariants & hazards*: a hole in the type
+  system is a hole in every unboxed tier built on it**, because they all
+  elide their guards on the strength of inference's proof. Closing it here,
+  once, is what lets a typed call-result tier be built with no per-call
+  runtime guard.
+  **TWO doors had to close, and finding only one is the trap:** an
+  *annotated decl or an argument* goes through `static_type_assignable`, but
+  a **REASSIGNMENT contributes through the fixpoint's `join`**, whose Func
+  arm used to widen a conflicting component to `dyn` (`rj ? rj : g_dyn[0]`)
+  — so tightening `assignable` alone changed nothing observable and the
+  probe still ran. Both arms now consult `static_type_sig_compat`.
+  **It DEFERS on an unsettled component** (Unknown / None / `dyn`), which is
+  the whole reason the old code gave for staying arity-only: a callback's own
+  param and return types are themselves inferred, so a strict rule would fire
+  on inference ORDER rather than on a mismatch (`apply(sq, i)`, a func array,
+  an inline `map` lambda — all three are pinned as ACCEPT cases). Only two
+  settled concretes can refuse. `param_opt` is deliberately not compared —
+  opt-ness governs call arity, which `check_call` enforces per site.
+  Measured blast radius before landing: **0 of 96** corpus programs
+  (bench/my + samples + tests/functional) refused.
 
 ### M8 — typed scalar specialization (`specialize_types`, the speed payoff)
 
