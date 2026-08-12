@@ -107,8 +107,34 @@ refcount churn per element.
   **76's remaining 734 Ir/iteration is the CALL PROTOCOL and the two
   arg copies - not the element read**, so the next move on 76 is H4
   (the window/accounting residue), not another read tier.
-- **H3 - SINGLE-MOVE UNPACK (75). TARGET PROVEN WALL-CLOCK-VISIBLE
-  (2026-08-12), implementation open.** After H2 the first question is
+- **H3 - SINGLE-MOVE UNPACK (75): DONE (2026-08-12).** Measured
+  (interleaved --baseline, full suite): **75_indexed_unpack 0.84x wall,
+  -25.4% Ir** (1991M -> 1486M at scale 1, callgrind - ~50 Ir per
+  element bind over 10M binds); suite geomean cur/base 1.002x, with the
+  same run's untouched benches swinging 0.91-1.13x (73's 1.11x and
+  20's 1.05x sit inside that band beside untouched movers on both
+  sides; neither touches the changed arms - 20 is the flat-int unpack,
+  73 is int elements through the unchanged default arm). What shipped:
+  `vm_slot_bind_str`/`vm_slot_bind_value` (vm.cpp) - when BOTH sides
+  are strings and the slot is plain (no container back-pointer), the
+  bind is a direct SharedStr copy-assign (intrusive_ptr release+retain,
+  self-assign-guarded, fully inline, ZERO indirect calls); a
+  general-storage non-string element improves to put(const &) in place
+  (one copy_assign instead of copy_ctor + move_assign + temp dtor).
+  Wired into vm_unpack_elem_body (both loops; jit_unpack_elem funnels
+  through it) and vm_multi_unpack_body's plain stores; compound +
+  numeric-coerce arms untouched. Proof: g_unpack_fast_binds bumps ONLY
+  in the dispatch-free arm - unpack_fast_bind_shapes asserts growth per
+  shape and EXACTLY 0 on alternating str/int re-binds; both sabotages
+  watched failing (fast arms disabled -> the counter check fails;
+  a one-short window from the fast arm -> the value tests + the
+  pre-existing unpack tests fail). REMAINING SIBLINGS (enumerated, not
+  built): the single-var foreach VALUE bind (`foreach s in rows` -
+  do_iter / the foreach Next op pays the same put() chain; the probe's
+  one-bind loop cost 0.16s of 75's 0.28s shape, so it is the same class
+  of target), and the tree-walker's bind_loop_var (perf parity only -
+  values already identical). The ORIGINAL probe record follows.
+  After H2 the first question is
   no longer "how many instructions" but "does the time move". For 75
   it does. A four-way probe at scale 4, best-of-5, same binary:
 
