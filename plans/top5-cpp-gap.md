@@ -192,3 +192,140 @@ Suite my/cpp geomean **2.424x**. Honest ceiling: with H2 + H3 landed
 these project to ~8-11x - past that the gap is the value model itself
 (48-byte LValues, type tags, refcounts on every func/str value), i.e.
 #60's territory, not the call protocol's.
+
+# RE-MEASURED AFTER H1+H2+H3 (2026-08-12): the twins are FAIR, the gap is ours
+
+Suite my/cpp geomean **2.361x** (was 2.47x pre-H1). The top five:
+
+    76_funcval_dispatch   17.60x   734 Ir/iter
+    78_typed_param_call   10.87x   678 Ir/iter
+    75_indexed_unpack     10.63x   294 Ir/row
+    63_closures           10.46x
+    11_closure_counter     9.11x
+
+## The ratios are UNDERSTATED, not inflated (fixed-cost audit)
+
+These C++ twins run 1-10 ms total, so process startup is a real fraction
+of them - which SHRINKS the printed ratio rather than inflating it.
+Measured floors: an empty C++ binary **0.3 ms**, a trivial MyLang script
+**1.3 ms**. Re-measured as a SCALE DELTA (time at scale 2 and 10,
+subtract - removes process startup, MyLang's compile AND the JIT warmup
+from both sides, best-of-9):
+
+    bench                   my/unit    cpp/unit   ratio   (printed)
+    76_funcval_dispatch     0.03027    0.00122    24.73x   (17.60x)
+    78_typed_param_call     0.02446    0.00214    11.43x   (10.87x)
+    75_indexed_unpack       0.06089    0.00511    11.93x   (10.63x)
+    63_closures             0.01388    0.00069    20.14x   (10.46x)
+    11_closure_counter      0.00897    0.00065    13.77x    (9.11x)
+
+So the honest compute gap is WORSE than the table says (76 is ~25x, 63
+~20x). Nothing here is a measurement artifact.
+
+## FAIRNESS AUDIT (asm-verified, not asserted)
+
+- **76**: the C++ loop keeps a real `call *%rax` (the target reloaded
+  from `ops[i&1]` every iteration - no devirtualization, no unswitch);
+  8 instructions + the call.
+- **78**: `cmpq $0,48(%rsp); je; call *56(%rsp)` - a genuine
+  std::function indirect call WITH its null check, both closures, not
+  inlined. (This is the already-fixed twin; the fix holds.)
+- **75**: models what MyLang actually does - a volatile refcount ++/--
+  per handle bind and the STRICT arity check per row.
+All three are fair. **The gap is MyLang's codegen, not the twins.**
+
+## WHERE THE INSTRUCTIONS GO (callgrind, per unit of work, perf build)
+
+**76 - 734 Ir/iteration** (C++ ~8):
+
+    jit_load_elem_value  (read ops[i%2])       1 call    171 Ir
+    the `st` reference ARG traffic:                      184 Ir
+       jit_bind_ref_arg                        1 call     78
+       SharedArrayObj::copy_assign             2 calls    74
+       SharedArrayObj::dtor                    2 calls    22
+       SharedArrayObj::default_ctor            2 calls    10
+    the two callee fragments (the REAL work)   1 call     80 Ir
+    jit_move                                   1 call     81 Ir
+    jit_release_slot                           1 call     54 Ir
+    jit_put_int  (st[0] = ...)                 1 call     50 Ir
+
+**78 - 678 Ir/iteration**: `jit_boxed_binop` **190 Ir** -> vm_num_binop
+90 -> num_bin_op 61 -> TypeFloat::add 15. ONE float addition, 190
+instructions. The two closure fragments are 149.
+
+**75 - 294 Ir/row**: `jit_unpack_elem` 239 -> vm_unpack_elem_body 217
+-> vm_unpack_bind_elem 122 (2 calls). Still a 4-deep helper chain per
+row even after H3 (which cut ~100 Ir off it).
+
+## THE THREE ROOT CAUSES (each verified, each with a fix shape)
+
+### H4 - A CALL RESULT IS NOT A TYPED OPERAND (the biggest, and the
+### cleanest: it is the H1a shape again, one level up)
+
+The whole typed expression degrades to the boxed tier when ANY operand
+is a call. Controlled A/B, same statically-int accumulate:
+
+    var q = runtime(3); s = s + q;      ->  i.bin  r2 = r1 + r0   UNBOXED
+    var f = mk(7);      s = s + f(i);   ->  bin.v  s = s + r4     BOXED
+
+Nothing is unproven here - `-dti` says `add : func(int)->int`,
+`scale_it : func(float)->float`, `s : int`, `t : float`, and M8 DID
+build `TypedScalarExpr<arith,i>(CallExpr(...))` /
+`TypedScalarExpr<arith,f>(CallExpr(...))`. The **codegen** refuses a
+call as a typed leaf and falls back for the entire node. That is
+exactly what a CAPTURE operand did until H1a, and the fix is the same
+one: materialize the result into a temp with the EXISTING call op, then
+read the temp as a typed leaf (`try_call_leaf`, beside
+`try_capture_leaf`), with a result type-tag guard for soundness so the
+tier never depends on inference being right.
+REACH: 78 (both accumulates), and every call-heavy bench - 12, 35, 63,
+11. On 78 it removes the 190 Ir float chain outright and the int guard
+tier with it.
+
+### H5 - THE VALUE-MODEL ASSIGN COSTS 37-100 Ir WHERE ~10 IS THE WORK
+
+`EvalValue::operator=` reaches a non-trivial type through THREE
+function pointers - `dtor` -> `default_ctor` -> `copy_assign` - on any
+type change. For a SharedArrayObj that is 106 Ir/iteration on 76 to
+copy one handle twice, when the real work (an intrusive_ptr
+release+retain plus three POD fields, both slice tests false) is ~10
+inline instructions. The same triple sits behind `jit_bind_ref_arg`
+(78), `jit_load_elem_value` (171) and every return.
+**H3 is the proof of concept**: it deleted exactly this triple for
+STRINGS in the unpack ops and took 75 to 0.84x wall / -25.4% Ir. The
+general form is a statically-typed assign path - when the emitter knows
+both sides' types (it usually does), call a monomorphic assign or emit
+it inline, instead of the type-erased triple-dispatch. This is #60's
+core thesis and it is where 76's remaining gap lives.
+
+### H6 - THE BOXED INLINE FAST TIER IS INT-ONLY
+
+jit.cpp's own comment: *"ANY other shape (float/bool/string/mixed
+operand, a throwing aop) falls to the EXACT helper path below"* - the
+guard compares against `t_int` and there is no float twin. That is why
+78's float accumulate pays 190 Ir where the int one pays inline guards.
+A classic sibling-case gap (the CLAUDE.md rule). LOWER priority than
+H4, which removes the boxing altogether for the PROVEN cases; H6 only
+catches the genuinely-`dyn` residue (66_dyn_foreach's float sibling).
+
+### H7 - the unpack is still a 4-deep helper chain (75)
+
+Post-H3 it is 239 Ir/row through jit_unpack_elem -> vm_unpack_elem_body
+-> vm_unpack_bind_elem x2. The element STORE (#92) and the nested READ
+(#93) both got emitted INLINE tiers for the same reason; the unpack
+never did. Sized ~150-200 Ir/row.
+
+## RECOMMENDED SEQUENCE (the maintainer picks)
+
+1. **H4** - biggest reach, smallest change, precedent already written
+   (H1a). Unblocks typed arithmetic across every call-heavy program.
+2. **H5** - the deepest win (it is what makes 76 a 25x bench) but the
+   largest design step: it touches the value model's hot path
+   everywhere. H3 proved the shape on one op; generalizing needs care.
+3. **H7** then **H6** - both are bounded, local, sibling-case work.
+
+HONEST CEILING: H4+H5 plausibly take 76 from ~25x to ~10x and 78 from
+~11x to ~5x. Below that the remaining cost is the call protocol's
+irreducible obligations (window accounting, the walkable frame view,
+refcount correctness) - H4 in the ORIGINAL list above, now renumbered
+H8 to avoid the collision.
