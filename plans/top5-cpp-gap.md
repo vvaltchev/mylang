@@ -565,3 +565,59 @@ in the *other* direction - the surprise was a REGRESSION where the
 mechanism predicted a win, and taking it seriously (rather than shipping
 on the plausible story) is what produced the finding. Measure the
 mechanism, not the attribution.
+
+## DIRECTION 1 INVESTIGATED (2026-08-12): the double retain is REAL,
+## and the fix is an OWNERSHIP change, not a copy deletion
+
+Confirmed with caller-attributed callgrind: 76 makes exactly TWO
+array-handle copies per iteration, and they are
+
+    jit_bind_ref_arg  1.00/iter   (the callee's param slot)
+    jit_move          1.00/iter   (the ARGUMENT STAGING slot)
+
+The bytecode names the second one:
+
+    23  i.bin        r6 = i % 2
+    24  load.elem.v  fn = ops[r6]
+    25  move         r6 = st        <-- retain #1, into the arg run
+    26  move         r7 = i
+    27  call.val     _ = fn(r6, r7) <-- retain #2, into the callee frame
+
+`st` is retained twice and released twice for ONE call. The staging move
+exists because the call protocol reads its arguments from a CONTIGUOUS
+register run, so an argument that lives in an arbitrary slot has to be
+copied adjacent to its siblings first. (The callee itself is not the
+problem - `add_op$0` is fully typed and native: load.elem.i / i.bin /
+store.elem.i.)
+
+**WHY THE STAGING RETAIN LOOKS REMOVABLE.** Between the `move` and the
+bind, NO user code runs - no call, no allocation, no unwinding - so the
+source slot cannot change and the value cannot be freed. The staging
+slot only has to carry the bits across that window; the REAL reference
+is taken by jit_bind_ref_arg. So the staging copy can in principle be a
+raw BORROW (copy the 24 bytes, no refcount bump). Note this is NOT the
+borrow H2 rejected: there the callee had to stay alive ACROSS the call,
+here the window contains nothing at all.
+
+**THE HAZARD, which is why this is not a small change.** The staging
+slot is a frame TEMP, and the frame's `ref_slots` machinery releases
+every slot that may hold a reference (jit_release_slot, frame teardown,
+slot reuse). A borrowed staging slot listed in ref_slots would be
+OVER-RELEASED - a use-after-free, not a wrong number. So the change is
+not "delete a copy", it is "teach the call protocol that an argument
+staging slot is NON-OWNING for the window it exists", which means:
+  - the emitter must exclude such slots from ref_slots (or mark them),
+    and `jit_ret_audit`'s ref_slots contract has to agree;
+  - the DECLINE path matters - an argument that is NOT a stable slot (a
+    computed temp, a call result) must keep the owning copy;
+  - the exception path has to be checked: if the bind throws (a coerce
+    error), the staging slot must not be released either.
+
+SIZED: ~1 retain + 1 release + 1 type-erased assign per reference
+argument, i.e. of 76's 734 Ir/iteration the `jit_move` line is ~81 Ir
+plus its share of the 106 Ir triple. Worth doing, but it is call-protocol
+ownership surgery and belongs in its own increment with the ref_slots
+audit in scope - NOT bolted onto a measurement session.
+
+NOT STARTED. The investigation above is the deliverable; the next
+session should start from the ref_slots contract, not from the emitter.
