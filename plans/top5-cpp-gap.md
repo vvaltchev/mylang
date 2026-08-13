@@ -438,3 +438,68 @@ decline that forced the split no longer exists.
 Costs nothing at run time and was measured to refuse 0 of 96 corpus
 programs. The `dyn` keyword is the documented opt-out for code that
 genuinely wants a variable to hold differently-typed functions.
+
+## H4 LANDED (2026-08-12) - 78 is 0.74x wall and OUT of the top five
+
+`try_call_leaf` (codegen.cpp), the indirect sibling of the DirectCallExpr
+case that has been a typed leaf all along. Measured (interleaved
+--baseline, full suite, OPT=1 ASSERTS=0):
+
+    78_typed_param_call   0.74x wall   my/cpp 10.87x -> 8.02x
+    suite geomean cur/base 1.001x (untouched benches span 0.88-1.11x)
+
+**NO RUNTIME GUARD** - option B is what makes that legal. If function
+subtyping is ever loosened back toward arity-only, this tier is the
+first thing that breaks, silently.
+
+THE PLACEMENT TOOK THREE TRIES, each caught by a test and not by
+reading, which is the durable part of this entry:
+
+ 1. **EARLY in compile_int_expr -> INFINITE RECURSION.**
+    `compile_boxed_expr` DELEGATES back to the typed compilers for a
+    th==i/f node, so the leaf called itself (ASan stack overflow through
+    try_call_leaf -> compile_boxed_expr -> compile_int_expr). Hence the
+    `allow_typed` opt-out parameter, which exists for this one caller.
+ 2. **LAST-resort -> DEAD CODE.** compile_int_expr returns false at
+    `if (!t) return false;` for any non-TypedScalarExpr, long before the
+    function tail - so a CallExpr never reached the hook and 78 went
+    back to `bin.v` while the suite stayed green.
+ 3. **After the specialized paths but UNNARROWED -> ate MathFnV.**
+    `s += sqrt(i)` fell from the typed MathFnV to the generic
+    CallBuiltinV marshal (vm_codegen_shapes case 14, watched failing).
+
+Final: after every specialized typed path, before the TypedScalarExpr
+cast. The Direct*-form exclusion in the leaf is DEFENSIVE, not
+load-bearing - removing it keeps the suite green at this position
+(watched), and the comment says so rather than claiming credit the
+placement earns.
+
+**THE TEST'S OWN TRAP, worth more than the optimization.** Counting
+`IntBin`/`FloatBin` made the shape test read 0 and pass vacuously,
+because the plain op disappears TWICE before vm_compile returns: a
+counted loop FUSES the accumulate into `IntAddStep` (#9), and
+`specialize_arith_ops` rewrites the rest into the B1/B2 family (the
+float case emits **FloatAddRR**). That is THE AUDIT-TABLE STAGE TRAP in
+test form - the same shape CLAUDE.md records for visit_use_def and
+op_writes_scalar, and the second time it has bitten a test in this arc
+(H1 hit it too). **A test that names an opcode must name the one that
+SURVIVES to the stage it inspects.**
+
+Four behaviour tests pin that a typed leaf did not change WHEN the call
+runs: short-circuit under `&&`, only the taken ternary arm, two operands
+left-to-right, and the int+float values.
+
+### The top five after H4
+
+    76_funcval_dispatch   17.73x   (H5 - the value-model assign - is its item)
+    75_indexed_unpack     11.09x   (the single-var foreach bind, #160)
+    63_closures           10.89x
+    73_multi_unpack        9.00x
+    11_closure_counter     8.64x
+    ...
+    78_typed_param_call    8.02x   (was 10.87x - out of the top five)
+
+76 is now the clear outlier and its cost is NOT the call protocol alone:
+~184 Ir/iteration is the type-erased assign triple (dtor ->
+default_ctor -> copy_assign) around one array-handle argument. That is
+H5, and H3 is its proof of concept.
