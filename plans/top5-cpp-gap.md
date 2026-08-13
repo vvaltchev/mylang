@@ -503,3 +503,65 @@ left-to-right, and the int+float values.
 ~184 Ir/iteration is the type-erased assign triple (dtor ->
 default_ctor -> copy_assign) around one array-handle argument. That is
 H5, and H3 is its proof of concept.
+
+## ⛔ H5 INCREMENT 1 ATTEMPTED AND REVERTED (2026-08-12) - a NEGATIVE
+## result worth keeping: the assign's cost is WORK, not DISPATCH
+
+The plan said the value-model assign "costs 37-100 Ir where ~10 is the
+work" and named devirtualization as the fix. **That reading of the
+callgrind attribution was WRONG, and the experiment says so three
+times.**
+
+WHAT WAS BUILT (evalvalue.h, reverted): `SharedStr` and `SharedArrayObj`
+are COMPLETE types in evalvalue.h, so a same-type assign of either can
+call its own `operator=` DIRECTLY instead of through `type->copy_assign`
+- an indirect call the compiler can neither inline nor optimize across.
+Plus the type-CHANGE path collapsed from three indirect calls
+(dtor -> default_ctor -> copy_assign) to two (dtor -> copy_ctor).
+
+MEASURED on 76_funcval_dispatch (Ir/iteration, OPT=1 ASSERTS=0, the
+scale-1-vs-3 delta), against a pre-H5 baseline of **734**:
+
+    devirtualize str+arr, tests before the trivial split   741  (+1.0%)
+    ...with the trivial split hoisted first                765  (+4.2%)
+
+WORSE, twice, and MORE devirtualization made it WORSE. The profile of
+the second attempt says exactly why:
+
+    TypeImpl<SharedArrayObj>::copy_ctor            90 Ir   <- REPLACED
+    (the default_ctor + copy_assign it replaced)   84 Ir      a CHEAPER pair
+    EvalValue::operator=(&&) inline body          171 Ir
+    EvalValue::operator=(const &) inline body     108 Ir
+
+Two lessons, both general:
+
+1. **`copy_ctor` is NOT cheaper than `default_ctor + copy_assign` here.**
+   The "one indirect call instead of two" arithmetic ignored that the
+   ctor does MORE work (a slice registration path the assign's
+   `if (slice)` skips outright when both sides are non-slices, which is
+   the common case).
+2. **The 37 Ir inside copy_assign is mostly REAL WORK** - an
+   intrusive_ptr release+retain (two refcount RMWs with their
+   delete-checks), two slice tests, four field copies - NOT dispatch
+   overhead. The indirect call is ~5 Ir of it. Removing 5 Ir of dispatch
+   while inlining ~30 Ir of body into every one of the MANY assignment
+   sites is a net loss, and it grows with how many sites inline it.
+
+So **76's 184 Ir of array-handle traffic is not reducible by attacking
+the assign's dispatch**. What is left to try, in the order I would try
+it, none of them started:
+ - **cut the NUMBER of assignments**, not their cost: 76 copies the `st`
+   handle TWICE per iteration (arg bind + a release/rebind round trip).
+   One of those is plausibly removable at the call protocol level - a
+   reference argument that the callee only READS need not be a fresh
+   retained handle at all if the caller's slot outlives the call, which
+   it does.
+ - an INLINE emitted tier for `jit_bind_ref_arg` (78 Ir) in the JIT,
+   mirroring #92/#93 - emit the retain + 4 stores at the call site.
+ - the refcount itself (N7 territory), which is the value model's floor.
+
+METHOD NOTE: this is the "DISTRUST A SURPRISING RESULT" rule paying off
+in the *other* direction - the surprise was a REGRESSION where the
+mechanism predicted a win, and taking it seriously (rather than shipping
+on the plausible story) is what produced the finding. Measure the
+mechanism, not the attribution.
