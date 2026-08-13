@@ -927,8 +927,19 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * `allow_typed = false` SKIPS the typed-delegation preamble below and
+     * lowers `e` with the boxed cases only. Exactly one caller wants that:
+     * H4's try_call_leaf, which is reached FROM compile_int_expr and would
+     * otherwise re-enter it here - an infinite recursion (watched: an ASan
+     * stack overflow through try_call_leaf -> compile_boxed_expr ->
+     * compile_int_expr -> try_call_leaf). It needs the CALL lowered boxed
+     * into a slot, which is precisely what the preamble is trying to avoid
+     * doing - so skipping it is the intent, not a workaround.
+     */
     bool compile_boxed_expr(const Construct *e, int &out_slot,
-                            std::vector<CgInstr> &ops)
+                            std::vector<CgInstr> &ops,
+                            bool allow_typed = true)
     {
         /*
          * Typed-arg lowering: a th==i/f node computes its int/float value via
@@ -941,7 +952,7 @@ struct Codegen {
          * fall through to the boxed cases below - so this only ever turns a
          * boxed op into the equivalent typed one, never changes behavior.
          */
-        if (e->th == TypeHint::i || e->th == TypeHint::f) {
+        if (allow_typed && (e->th == TypeHint::i || e->th == TypeHint::f)) {
             const size_t omark = ops.size();
             const size_t cmark = chunk.consts.size();
             const int save_top = next_temp;
@@ -4219,6 +4230,72 @@ struct Codegen {
     }
 
     /*
+     * H4 (2026-08-12): a CALL RESULT is a typed leaf.
+     *
+     * `s = s + q` lowered to an unboxed `i.bin`, but `s = s + f(i)` fell
+     * to the boxed `bin.v` for the WHOLE expression - one call operand
+     * defeated the typed lowering of everything around it, though
+     * inference had proved every part of it (`-dti`: `f : func(int)->int`,
+     * `s : int`, and M8 built `TypedScalarExpr<arith,i>(CallExpr)`). On
+     * 78_typed_param_call that cost a 190 Ir/iteration helper chain
+     * (jit_boxed_binop -> vm_num_binop -> num_bin_op -> TypeFloat::add)
+     * for one float addition.
+     *
+     * Same shape as try_capture_leaf above, one level up: materialize the
+     * result with the EXISTING call lowering into a temp, and the temp IS
+     * an int/float frame slot the typed ops read by tag. No new opcode.
+     *
+     * NO RUNTIME GUARD, and that is a LANGUAGE property, not an
+     * assumption: function subtyping compares the whole SIGNATURE
+     * (statictype.cpp, option B), so a call whose static return type is a
+     * concrete int/float really does return that type. Before that
+     * change, `var g = a; g = b;` with a differently-returning `b` was
+     * ACCEPTED and this tier would have read a float (or a str) through
+     * an int tag - RULE 1 and RULE 2 both. If that rule is ever loosened,
+     * THIS TIER IS THE FIRST THING THAT BREAKS, silently.
+     *
+     * Conditional positions stay conditional: compile_int_expr refuses
+     * cmp/logical chains outright (they yield bool), a condition lowers
+     * one compare-branch per conjunct, and the typed ternary emits its
+     * branch BEFORE the arms - so a call materialized here lands inside
+     * the region that owns it. Pinned by the short-circuit tests.
+     */
+    bool try_call_leaf(const Construct *e, bool flt, Operand &out,
+                       std::vector<CgInstr> &ops)
+    {
+        /* A PLAIN (indirect) call only. The Direct* forms have their own
+         * typed paths ABOVE the hook, so this exclusion is DEFENSIVE, not
+         * load-bearing: removing it keeps the suite green today (watched),
+         * because the placement already gives those paths first refusal.
+         * It is kept so the leaf cannot start second-guessing a Direct*
+         * path that deliberately declined if the hook ever moves - which
+         * is exactly the mistake the placement note below records. */
+        if (!dynamic_cast<const CallExpr *>(e)
+                || dynamic_cast<const DirectCallExpr *>(e)
+                || dynamic_cast<const DirectBuiltinCallExpr *>(e))
+            return false;
+        /* int wants `i`; float accepts `f` OR `i` (read_float_slot
+         * promotes an int/bool slot) - try_capture_leaf's rule. */
+        if (!(e->th == TypeHint::i || (flt && e->th == TypeHint::f)))
+            return false;
+        /* A half-emitted attempt must leave NOTHING behind: the caller
+         * falls back to the boxed lowering, which compiles this same call
+         * again - leaked ops would evaluate it TWICE. */
+        const size_t mark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        int t;
+        if (!compile_boxed_expr(e, t, ops, /*allow_typed=*/false)) {
+            ops.resize(mark);
+            chunk.consts.resize(cmark);
+            next_temp = save_top;
+            return false;
+        }
+        out = slot_op(t);
+        return true;
+    }
+
+    /*
      * H1b: may `cap OP= v` / `cap++` be RECOMPOSED into the typed tier -
      * read + IntBin/FloatBin + a PLAIN capture store - instead of the
      * compound StoreCaptureV (a copy-modify-store through num_bin_op,
@@ -4367,6 +4444,17 @@ struct Codegen {
                     return true;
                 }
             }
+
+        /* H4: the INDIRECT sibling of the DirectCallExpr case above -
+         * a call through a func VALUE (`add(i)` where `add` is a
+         * variable). The direct form has been a typed leaf all along;
+         * the indirect one fell to the boxed tier and dragged the WHOLE
+         * surrounding expression with it. Placed HERE, after every
+         * specialized path: an earlier placement swallowed `sqrt(i)`
+         * from the typed MathFnV into the generic CallBuiltinV marshal
+         * (watched: vm_codegen_shapes case 14 failed). */
+        if (e->th == TypeHint::i && try_call_leaf(e, false, out, ops))
+            return true;
 
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
         if (!t || t->kind != TypeHint::i)
@@ -5349,6 +5437,18 @@ struct Codegen {
             }
             return false;
         }
+
+        /* H4: the INDIRECT sibling of the DirectCallExpr case above -
+         * a call through a func VALUE (`add(i)` where `add` is a
+         * variable). The direct form has been a typed leaf all along;
+         * the indirect one fell to the boxed tier and dragged the WHOLE
+         * surrounding expression with it. Placed HERE, after every
+         * specialized path: an earlier placement swallowed `sqrt(i)`
+         * from the typed MathFnV into the generic CallBuiltinV marshal
+         * (watched: vm_codegen_shapes case 14 failed). */
+        if ((e->th == TypeHint::f || e->th == TypeHint::i)
+                && try_call_leaf(e, true, out, ops))
+            return true;
 
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
         if (!t || t->kind != TypeHint::f)
