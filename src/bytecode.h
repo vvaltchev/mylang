@@ -1682,6 +1682,21 @@ struct Chunk {
      * like `native` and `call_caches`.
      */
     std::vector<std::unique_ptr<NorecSite>> norec_sites;
+
+    /*
+     * G1 THE IN-PLACE ARGUMENT (#162): the per-site (dst, src) staging
+     * pairs a fused call site did NOT emit, so its COLD arms can
+     * materialise the argument run before handing it to a C++ tier that
+     * reads it (jit_stage_args). One separately-allocated vector per
+     * site, for the same reason CalleeCache cells are: the address is
+     * baked as an immediate and must not move as later sites are added.
+     * DERIVED, never serialized - the fusion is decided at emit time from
+     * the code itself, so a loaded image's JIT pass rebuilds it (and a
+     * HOSTILE image cannot inject one, which is why this is not a
+     * bytecode fact - see #137's layering).
+     */
+    std::vector<std::unique_ptr<std::vector<int32_t>>> arg_stage_pools;
+
     /* 4-v: the PRE-DELETION body contained a CachedCallV (scanned by
      * NorecOkGuard's ctor, before deletion turns every op into
      * EnterNative). A record-less frame must never acquire a live

@@ -205,12 +205,12 @@ bool g_jit_enabled = false;
 enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
-    JL_CEST, JL_RELENT, JL_NOREC, JL_COUNT
+    JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
-    "relent", "norec"
+    "relent", "norec", "argfuse"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -2578,12 +2578,53 @@ static const JitPushLayout &jit_push_layout()
 /* moved to vm.cpp (4-v: the record-less postexit cleanup reads it as the
  * caller-captures source); the emit sites keep using it via jit.h. */
 
+/*
+ * THE IN-PLACE ARGUMENT (#162) - one fused call site's decision.
+ *
+ * A call's arguments live in a CONTIGUOUS register run, so an argument
+ * that is already a named local costs a staging `MoveV run[i] = x` whose
+ * only consumer is the bind two instructions later - a full type-erased
+ * handle copy (release + retain) for a value the caller is holding
+ * anyway. `src[i] >= 0` says argument i is bound STRAIGHT from that
+ * caller slot and its MoveV was not emitted at all.
+ *
+ * This is a JIT-DERIVED fact, never a bytecode one: the fusion is decided
+ * from the instruction sequence at emit time, so the interpreter is
+ * untouched, no format version moves, and a hostile image cannot assert
+ * it (#137's layering - a bogus "this slot is an argument" claim would be
+ * exactly the kind of unverifiable operand that layering exists to
+ * refuse).
+ *
+ * `pairs` is the skipped MoveVs as (dst, src) slot pairs, for the cold
+ * arms that hand the run to C++ (jit_stage_args).
+ */
+struct ArgFuse {
+    std::vector<int> src;                    /* per arg: caller slot / -1 */
+    const std::vector<int32_t> *pairs = nullptr;
+};
+
+/* The CURRENT fragment's fusion, set around the emission loop beside
+ * g_cur_entry_remap and safe as a file-static for the same reason (the
+ * compiler is single-threaded and non-reentrant). `skip` is indexed by
+ * OLD pc over the whole chunk; `fuse` is keyed by the call's old pc. */
+static const std::vector<char> *g_cur_argfuse_skip = nullptr;
+static const std::unordered_map<size_t, ArgFuse> *g_cur_argfuse = nullptr;
+
+static const ArgFuse *argfuse_at(size_t old_pc)
+{
+    if (!g_cur_argfuse)
+        return nullptr;
+    const auto it = g_cur_argfuse->find(old_pc);
+    return it == g_cur_argfuse->end() ? nullptr : &it->second;
+}
+
 static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
                                   bool cached, int callee_arg,
                                   std::vector<size_t> &j_slow,
                                   std::vector<size_t> &j_done,
                                   Chunk::CalleeCache *cache_cell,
-                                  const NorecSite *ns, bool residue)
+                                  const NorecSite *ns, bool residue,
+                                  const ArgFuse *af)
 {
     const JitPushLayout &P = jit_push_layout();
     const JitLayout &L = jit_layout();
@@ -2892,13 +2933,40 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      */
     ld(R11, RAX, static_cast<int32_t>(P.desc_bind_req));
     for (int i = 0; i < NARGS; i++) {
-        const int32_t s = (ARGBASE + i) * 48;
+        const int fsrc = (af && af->src[i] >= 0) ? af->src[i] : -1;
+        const int32_t s = ((fsrc >= 0 ? fsrc : ARGBASE + i)) * 48;
         std::vector<size_t> j_next;
         ld(R10, R11, i * 8);                          /* the required Type* */
         e.u8(0x4D); e.u8(0x85); e.u8(0xD2);           /* test r10, r10 */
         j_next.push_back(e.j32(0x74));                /* je next (no coerce) */
+        /*
+         * #162: a FUSED argument is read from the CALLER'S OWN SLOT, so
+         * the widening below - which writes the argument temp IN PLACE -
+         * would corrupt the caller's variable. Its soundness argument is
+         * literally "emit_args_range gives every argument a FRESH temp",
+         * which a fused argument is not. So a coercing parameter DECLINES
+         * the whole call here (pre-mutation, where declining is still
+         * possible) and the C++ tier - whose arm materialised the run -
+         * does the coercion into the PARAMETER slot, where it belongs.
+         */
         modrm(0x39, R10, RBX, s + 24, true);          /* cmp [arg.type], r10 */
         j_next.push_back(e.j32(0x74));                /* je next (EXACT) */
+        if (fsrc >= 0) {
+            /* A conversion IS wanted, and the widening below writes the
+             * argument temp IN PLACE - which for a fused argument is the
+             * CALLER'S OWN VARIABLE. So decline (pre-mutation, still
+             * legal) and let the C++ tier coerce into the PARAMETER slot.
+             * Only a REFERENCE-carrying slot is ever fused (see the
+             * ref_slots gate at the recognizer), and a reference at a
+             * numeric parameter declines here anyway - so in practice
+             * this arm costs nothing that the un-fused emit was getting;
+             * it is the exact-type test above that a fused argument
+             * normally passes. */
+            j_slow.push_back(e.j32(0xEB));            /* jmp slow */
+            for (const size_t j : j_next)
+                e.patch32_here(j);
+            continue;
+        }
         /*
          * NOT exact - so this is a WIDENING, a `none`, or an error. The
          * widenings are TOTAL (bool -> int, int/bool -> float), so they are
@@ -3242,7 +3310,20 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     /* fast_bind arg copies (unrolled; trivial payloads - guarded above):
      * 24B payload + 8B type copied, container/idx/flags zeroed */
     for (int i = 0; i < NARGS; i++) {
-        const int32_t s = (ARGBASE + i) * 48, d = i * 48;
+        /* #162: a fused argument's bytes come from the CALLER'S slot -
+         * the staging MoveV that would have copied them here was never
+         * emitted. Every arm that instead hands the run to C++ has
+         * materialised it first (jit_stage_args), so the two tiers see
+         * the same argument either way. */
+        const int fsrc = (af && af->src[i] >= 0) ? af->src[i] : -1;
+        const int32_t s = ((fsrc >= 0 ? fsrc : ARGBASE + i)) * 48,
+                      d = i * 48;
+#ifdef TESTS
+        if (fsrc >= 0) {
+            movabs_r10(reinterpret_cast<uint64_t>(&g_jit_arg_inplace));
+            e.u8(0x49); e.u8(0xFF); e.u8(0x02);       /* inc qword [r10] */
+        }
+#endif
         ld(RAX, RBX, s + 24);                         /* rax = type* */
         cmp_d_imm8(RAX, static_cast<int32_t>(L.type_t_off),
                    static_cast<int8_t>(L.t_str_val));
@@ -3604,10 +3685,11 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             ? static_cast<int32_t>(g_cur_caller_desc->frame_size
                                    + ck.n_temps)
             : 0;
+    const ArgFuse *af = argfuse_at(old_pc);
     emit_sync_push_native(e, in, is_value,
                           in.op == OpCode::CachedCallV,
                           static_cast<int>(callee_arg), j_slows, j_dones,
-                          cell, ns, residue);
+                          cell, ns, residue, af);
     /* depth++ (the callee is committed) */
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x01);                        /* inc dword [rcx] */
@@ -3799,6 +3881,24 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * the exc-stamp below). */
     for (const size_t j : j_slows)
         e.patch32_here(j);
+    /*
+     * #162: MATERIALISE the fused arguments. Everything below reads the
+     * argument RUN - the C++ slow tier binds from it, the depth-cap
+     * SWITCH pushes from it, and a BAIL (status 1) resumes the INTERPRETED
+     * call op, which reads it too - and the staging MoveVs that fill it
+     * were not emitted. This is the ONE join every decline passes through,
+     * which is why the fusion needs exactly one materialisation point.
+     * Cold: reached only by a guard decline. rdi/rsi are dead here (the
+     * slow-helper setup below redefines both).
+     */
+    if (af && af->pairs) {
+        e.movabs(RDI, reinterpret_cast<uint64_t>(af->pairs->data()));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(af->pairs->size() / 2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_stage_args) });
+        e.u8(0xE8); e.u32(0);
+    }
     /* 4-iv (design 4d): the MATERIALIZER ANCHOR relay - the site pointer
      * and THIS fragment's rbp, stored just before the helper call so a
      * depth-cap SWITCH inside it can walk the native chain from the
@@ -5050,6 +5150,8 @@ void jit_stats_report()
         { "native_returns",   &g_jit_native_returns },
         /* THE CALL PROTOCOL - which tier each call took */
         { "sync_inline",      &g_jit_sync_inline },
+        { "arg_inplace",      &g_jit_arg_inplace },
+        { "arg_stage",        &g_jit_arg_stage },
         { "sync_switch",      &g_jit_sync_switch },
         { "sync_boundary",    &g_jit_sync_boundary_call },
         { "callee_cache",     &g_jit_callee_cache },
@@ -8547,6 +8649,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::MoveV: {
+        /*
+         * #162 THE IN-PLACE ARGUMENT: this move only exists to put a
+         * value the caller is already holding into the call's contiguous
+         * argument run, and the call two instructions on now reads it
+         * from the caller's slot directly - so emit NOTHING. The cold
+         * arms that hand the run to C++ replay it (jit_stage_args).
+         */
+        if (g_cur_argfuse_skip && old_pc < g_cur_argfuse_skip->size()
+                && (*g_cur_argfuse_skip)[old_pc])
+            return true;
         /* De-helperize (roadmap step 6): dst = src.get() INLINE for the
          * trivial-x-trivial case - a TRIVIAL source (type->t < t_str) copied
          * over a TRIVIAL current dst is a bitwise 24-byte-payload + Type*
@@ -12479,6 +12591,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     chunk.call_caches.clear();
     g_cur_call_caches = &chunk.call_caches;
     chunk.norec_sites.clear();          /* G1: recompile hygiene */
+    chunk.arg_stage_pools.clear();      /* #162: ditto - the old native
+                                         * code that baked these
+                                         * addresses is being replaced */
     g_cur_norec_sites = &chunk.norec_sites;
     g_cur_caller_desc = jc ? jc->caller_desc : nullptr;   /* step 3b */
     /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
@@ -12489,9 +12604,18 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * fall-through off the end. */
     Emitter e;
     std::vector<size_t> frag_off(runs.size());
+    /* #162: the in-place-argument decision, refilled per fragment but
+     * OWNED here so the file-statics the emit reads can never outlive
+     * their storage (they are cleared with the others at the end). */
+    std::unordered_map<size_t, ArgFuse> argfuse;
+    std::vector<char> argfuse_skip;
     for (size_t r = 0; r < runs.size(); r++) {
         const size_t begin = runs[r].begin, end = runs[r].end;
         frag_off[r] = e.pos();
+        argfuse.clear();
+        argfuse_skip.clear();
+        g_cur_argfuse = nullptr;
+        g_cur_argfuse_skip = nullptr;
 
         /* N5: pin up to MAX_CACHED hot int slots for this run. The PICK
          * runs BEFORE the entry is emitted, because it decides which
@@ -12733,6 +12857,147 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         }
 #endif
 
+
+        /*
+         * #162 THE IN-PLACE ARGUMENT - decide it HERE, once, for this
+         * fragment, because both consumers (the MoveV that must not be
+         * emitted and the call that must read elsewhere) have to agree
+         * and they are emitted at different times.
+         *
+         * THE PATTERN: the staging MoveVs of a call form a contiguous
+         * run immediately before it (emit_args_range compiles the
+         * arguments left to right into [argbase, argbase+n) and the call
+         * follows), so scanning BACKWARDS from the call over
+         * `MoveV run[i] = x` is a complete and cheap recognizer. Anything
+         * else - a fused producing op writing the run slot directly, an
+         * argument that is a nested call - simply stops the scan, and
+         * those arguments keep the ordinary staging.
+         *
+         * WHY IT IS SOUND, which is one sentence: the caller slot and the
+         * run slot hold the SAME value, so reading either is correct as
+         * long as nothing writes the caller slot in between - and nothing
+         * between them writes anything but run slots. That is also why
+         * the fusion survives a branch or an entry landing anywhere in
+         * the sequence: the call reads the caller slot either way.
+         *
+         * THE GATES, each closing a way the caller slot's MEMORY could
+         * fail to hold the live value at the call:
+         *  - a NAMED local/param (< slot_count), never a temp - a temp is
+         *    where lever A's forwarding and the C5 release picker do
+         *    their work, and a fused read would be asking a slot whose
+         *    write may have been skipped;
+         *  - not register-PINNED (N5/C2a): a pin makes memory stale;
+         *  - not TYPE-ELIDED (C3) and not float-read-elided (C4a-i): the
+         *    type word in memory is stale for exactly those slots, and
+         *    the bind reads the whole value;
+         *  - source outside the run itself (no intra-run dependency);
+         *  - CachedCallV excluded - its probe builds the pure-cache KEY
+         *    from the run before the push, so the run must be real;
+         *  - the native-direct CallV excluded - that tier reads the run
+         *    from C++ (jit_call_setup), with no decline join to
+         *    materialise at.
+         */
+        if (!jit_lever_off(JL_ARGFUSE)) {
+            const auto pinned = [&](int slot) {
+                for (const int s : hot) if (s == slot) return true;
+                for (const int s : fhot) if (s == slot) return true;
+                for (const int s : textra) if (s == slot) return true;
+                for (const int s : textra_f) if (s == slot) return true;
+                for (const int s : fread_raw) if (s == slot) return true;
+                return false;
+            };
+            for (size_t pc = begin; pc < end; pc++) {
+                const Instr &in = chunk.code[pc];
+                if (in.op != OpCode::CallV && in.op != OpCode::CallValueV)
+                    continue;
+                if (in.op == OpCode::CallV && callv_native_ok(in, jc))
+                    continue;
+                const int nargs = static_cast<int>(in.b_lit());
+                const int abase = static_cast<int>(in.a_lit());
+                if (nargs <= 0 || abase < 0)
+                    continue;
+                ArgFuse af;
+                af.src.assign(static_cast<size_t>(nargs), -1);
+                std::vector<int32_t> pairs;
+                for (size_t p = pc; p > begin; p--) {
+                    const Instr &m = chunk.code[p - 1];
+                    /* Only the staging run itself ends the scan: an op
+                     * that is not a MoveV into this call's run is the
+                     * argument PRODUCTION (or the callee's), and nothing
+                     * before it is a staging move. */
+                    if (m.op != OpCode::MoveV)
+                        break;
+                    const int d = static_cast<int>(m.target);
+                    const int s = static_cast<int>(m.target2);
+                    if (d < abase || d >= abase + nargs)
+                        break;
+                    if (af.src[static_cast<size_t>(d - abase)] >= 0)
+                        break;                     /* written twice: stop */
+                    af.src[static_cast<size_t>(d - abase)] = -1;
+                    /* A move this fragment cannot fuse is simply LEFT
+                     * ALONE and the scan CONTINUES: every gate here is
+                     * about THIS move's source, and the moves between it
+                     * and the call write only run slots, so an earlier
+                     * argument's caller slot is still untouched at the
+                     * call. (Stopping instead cost the motivating bench
+                     * its whole fusion - 76's second argument is the
+                     * PINNED loop counter, and the array argument it
+                     * would have fused sits one instruction further
+                     * back.) */
+                    if (s < 0 || s >= chunk.slot_count)
+                        continue;                  /* a temp, not a name */
+                    /* ONLY a slot the ref_slots audit says can hold a
+                     * REFERENCE. Two reasons, and the second is the
+                     * load-bearing one:
+                     *  - VALUE: a trivial argument's staging move is
+                     *    already the inline two-store path (~8 instrs);
+                     *    the copy worth deleting is the reference one,
+                     *    which costs a helper call plus the type-erased
+                     *    release/retain triple.
+                     *  - SOUNDNESS OF THE COERCING ARM: that arm widens
+                     *    bool->int / int->float IN THE ARGUMENT TEMP, and
+                     *    a fused argument has none - it would write the
+                     *    caller's variable. A reference at a numeric
+                     *    parameter already declines there, so restricting
+                     *    the fusion to reference-carrying slots keeps
+                     *    that arm's behaviour exactly as it was (the
+                     *    jit_bind_widen coverage test is what found this:
+                     *    its widening argument is a plain int loop
+                     *    counter, which this gate leaves alone). */
+                    if (!std::binary_search(chunk.ref_slots.begin(),
+                                            chunk.ref_slots.end(),
+                                            static_cast<int32_t>(s)))
+                        continue;
+                    if (s >= abase && s < abase + nargs)
+                        continue;                  /* reads the run itself */
+                    if (pinned(s) || pinned(d))
+                        continue;
+                    af.src[static_cast<size_t>(d - abase)] = s;
+                    pairs.push_back(static_cast<int32_t>(d));
+                    pairs.push_back(static_cast<int32_t>(s));
+                    if (argfuse_skip.empty())
+                        argfuse_skip.assign(chunk.code.size(), 0);
+                    argfuse_skip[p - 1] = 1;
+                }
+                if (pairs.empty())
+                    continue;
+                /* The cold arm replays them in CODEGEN order (the scan
+                 * collected them backwards), so a materialised run is
+                 * byte-identical to the unfused one. Separately heap-
+                 * allocated: its address is baked as an immediate and
+                 * must not move as later sites are added. */
+                std::reverse(pairs.begin(), pairs.end());
+                for (size_t i = 0; i + 1 < pairs.size(); i += 2)
+                    std::swap(pairs[i], pairs[i + 1]);
+                chunk.arg_stage_pools.push_back(
+                    std::unique_ptr<std::vector<int32_t>>(
+                        new std::vector<int32_t>(std::move(pairs))));
+                af.pairs = chunk.arg_stage_pools.back().get();
+                argfuse.emplace(pc, std::move(af));
+            }
+        }
+        g_cur_argfuse = argfuse.empty() ? nullptr : &argfuse;
+        g_cur_argfuse_skip = argfuse_skip.empty() ? nullptr : &argfuse_skip;
 
         std::vector<size_t> label(end - begin, 0);
         std::vector<NativeCode::OpMark> marks;
@@ -13273,6 +13538,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     verify_handler_sites(chunk);
 
     g_cur_entry_remap = nullptr;        /* #56: emission done */
+    g_cur_argfuse = nullptr;            /* #162: fragment-scoped storage */
+    g_cur_argfuse_skip = nullptr;
     g_cur_call_caches = nullptr;
     g_cur_norec_sites = nullptr;
     g_cur_caller_desc = nullptr;

@@ -14101,6 +14101,100 @@ static const std::vector<test> tests =
         "var s = 0;",
         "s = s + p(1) + p(2) + p(3);",
         "assert(seen == \"123\"); assert(s == 6);" } },
+    /*
+     * #162 THE IN-PLACE ARGUMENT. A reference argument that is already a
+     * named local is bound STRAIGHT from that slot; the staging MoveV
+     * into the call's argument run is not emitted at all. These are the
+     * BEHAVIOUR half (the emitted fusion and its declines are asserted by
+     * arg_inplace_shapes) and they exist because the hazard is not a
+     * wrong value but a wrong REFERENCE COUNT - so each one keeps the
+     * argument alive and observable AFTER the call, where a lost or
+     * doubled release would show up as a freed or leaked container.
+     *
+     * The bodies are deliberately several statements: a small one is
+     * INLINED by the optimizer and then there is no call left to fuse -
+     * the vacuous-test trap the ref-arg bind test already documents.
+     */
+    { "#162: an array argument bound in place survives the call",
+      { "func addto(a, x) {",
+        "  var t = a[0] + x;",
+        "  var u = t * 2;",
+        "  var v = u - t;",
+        "  a[0] = v;",
+        "  return v;",
+        "}",
+        "var st = [0];",
+        "for (var i = 0; i < 40; i++) addto(st, i);",
+        "assert(st[0] == 780);",
+        "assert(len(st) == 1);" } },
+    /* The COLD arm: a callee holding a TRY is not plain_frame, so the
+     * inline push DECLINES on every call and the C++ tier reads the
+     * argument RUN - which the fusion left unwritten until
+     * jit_stage_args materialises it. A wrong materialisation is a wrong
+     * argument, so the value assertion IS the check here. */
+    { "#162: the cold arm materialises the argument run (callee with a try)",
+      { "func addto(a, x) {",
+        "  var v = 0;",
+        "  try { v = a[0] + x; } catch (DivisionByZeroEx) { v = -1; }",
+        "  var u = v * 2;",
+        "  a[0] = u - v;",
+        "  return u;",
+        "}",
+        "var st = [0];",
+        "for (var i = 0; i < 40; i++) addto(st, i);",
+        "assert(st[0] == 780);" } },
+    /* The RAISING arm: the callee throws, the caller catches. The frame
+     * must unwind with the argument's refcount intact - the array is
+     * read and mutated afterwards. */
+    { "#162: an in-place argument survives a throw out of the callee",
+      { "func addto(a, x) {",
+        "  var t = a[0] + x;",
+        "  var u = t * 2;",
+        "  if (x == 20) throw MyEx(u);",
+        "  a[0] = u - t;",
+        "  return u;",
+        "}",
+        "struct MyEx { int v; }",
+        "var st = [0]; var caught = 0;",
+        "for (var i = 0; i < 40; i++) {",
+        "  try { addto(st, i); } catch (MyEx as e) { caught = caught + 1; }",
+        "}",
+        "assert(caught == 1);",
+        "append(st, 9);",
+        "assert(len(st) == 2 && st[1] == 9);" } },
+    /* A SLICE argument: a slice registers itself in its parent's live
+     * views set on copy, and mutating the base while a view is live is
+     * what makes a corrupted set observable. */
+    { "#162: a slice argument bound in place keeps value semantics",
+      { "func first(a, k) {",
+        "  var t = a[0] + k;",
+        "  var u = t * 3 - k;",
+        "  var v = u - t - t;",
+        "  return t + v - v;",
+        "}",
+        "var base = [10, 20, 30, 40, 50];",
+        "var s = 0;",
+        "for (var i = 0; i < 20; i++) {",
+        "  var sl = base[1:4];",
+        "  s += first(sl, i);",
+        "  base[1] = base[1] + 1;",
+        "}",
+        "assert(s == 190 + 590);",
+        "assert(base[1] == 40);" } },
+    /* An INDIRECT call (76's own shape): the callee is a func VALUE, so
+     * nothing about it is known at emit time. */
+    { "#162: an in-place argument through an indirect call",
+      { "func f1(s, k) { var t = len(s) + k; var u = t * 2; return u - t; }",
+        "func f2(s, k) { var t = len(s) - k; var u = t * 2; return u - t; }",
+        "var ops = [f1, f2];",
+        "var msg = \"abcde\";",
+        "var acc = 0;",
+        "for (var i = 0; i < 40; i++) {",
+        "  var fn = ops[i % 2];",
+        "  acc = acc + fn(msg, i);",
+        "}",
+        "assert(acc == 180);",
+        "assert(msg == \"abcde\");" } },
     { "ti: mandatory dyn - an int accumulator stays concrete (no dyn needed)",
       { "var s = 0; var a = range(5);",
         "foreach (var e in a) s += e; assert(s == 10);" } },
@@ -26671,6 +26765,134 @@ static bool jit_ref_arg_bind()
 #endif
 }
 
+/*
+ * #162 THE IN-PLACE ARGUMENT - the emitted shape, and its DECLINES.
+ *
+ * The behaviour cases in the `tests` table run in every engine and would
+ * pass whether or not a single argument was ever fused; this is what says
+ * the fusion HAPPENED. `g_jit_arg_inplace` is bumped by the EMITTED copy
+ * loop only, so the helper tier cannot satisfy it, and `g_jit_arg_stage`
+ * by the cold arm only - the path where a mistake is a use-after-free
+ * rather than a wrong answer, which is why it gets its own proof.
+ *
+ * The deltas are taken PER SHAPE: a program-wide count would let the
+ * fusing loop pay for the declining one.
+ */
+static bool arg_inplace_shapes()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const auto fail = [](const char *what, unsigned long got) {
+        fprintf(stderr, "arg_inplace_shapes: %s (%lu)\n", what, got);
+        return false;
+    };
+
+    /* FUSES: an array in a named local, passed to a several-statement
+     * callee (a small body would be inlined and leave no call at all). */
+    unsigned long b0 = g_jit_arg_inplace;
+    if (!run({ "func addto(a, x) {",
+               "  var t = a[0] + x;",
+               "  var u = t * 2;",
+               "  var v = u - t;",
+               "  a[0] = v;",
+               "  return v;",
+               "}",
+               "var st = [0];",
+               "for (var i = 0; i < 40; i++) addto(st, i);",
+               "assert(st[0] == 780);" }))
+        return false;
+    if (g_jit_arg_inplace <= b0)
+        return fail("the array argument was NOT bound in place",
+                    g_jit_arg_inplace - b0);
+
+    /* DECLINES - the argument is a fresh CALL RESULT, so the producing op
+     * writes the run slot directly and there is no staging MoveV to fuse
+     * (nor a caller slot that would still be holding the value). */
+    b0 = g_jit_arg_inplace;
+    if (!run({ "func addto(a, x) {",
+               "  var t = a[0] + x;",
+               "  var u = t * 2;",
+               "  var v = u - t;",
+               "  a[0] = v;",
+               "  return v;",
+               "}",
+               "var st = [0];",
+               "for (var i = 0; i < 40; i++) addto(clone(st), i);",
+               "assert(st[0] == 0);" }))
+        return false;
+    if (g_jit_arg_inplace != b0)
+        return fail("a call-result argument was fused - it has no caller "
+                    "slot to be read from", g_jit_arg_inplace - b0);
+
+    /* DECLINES - an INT local. Its staging move is already the inline
+     * two-store path, and fusing it is what broke the jit_bind_widen
+     * coverage (the coercing arm widens IN the argument temp, which a
+     * fused argument does not have). The ref_slots gate is what keeps it
+     * out; without that gate this delta is nonzero (watched). */
+    b0 = g_jit_arg_inplace;
+    if (!run({ "func addk(n, x) {",
+               "  var t = n + x;",
+               "  var u = t * 2;",
+               "  var v = u - t;",
+               "  return v;",
+               "}",
+               "var base = 7; var s = 0;",
+               "for (var i = 0; i < 40; i++) s = s + addk(base, i);",
+               "assert(s == 1060);" }))
+        return false;
+    if (g_jit_arg_inplace != b0)
+        return fail("a trivial int local was fused - only reference-"
+                    "carrying slots may be", g_jit_arg_inplace - b0);
+
+    /* THE COLD ARM: a callee holding a TRY is not plain_frame, so the
+     * inline push declines every call and the C++ tier reads the argument
+     * RUN - which only jit_stage_args has written. */
+    b0 = g_jit_arg_stage;
+    if (!run({ "func addto(a, x) {",
+               "  var v = 0;",
+               "  try { v = a[0] + x; } catch (DivisionByZeroEx) { v = -1; }",
+               "  var u = v * 2;",
+               "  a[0] = u - v;",
+               "  return u;",
+               "}",
+               "var st = [0];",
+               "for (var i = 0; i < 40; i++) addto(st, i);",
+               "assert(st[0] == 780);" }))
+        return false;
+    if (g_jit_arg_stage <= b0)
+        return fail("the cold arm never materialised the argument run",
+                    g_jit_arg_stage - b0);
+    return true;
+#else
+    return true;
+#endif
+}
+
 /* model-flip M3 (plans/model-flip.md): a straight-line boxed LEAF compiles to a
  * native CONTAINER - one EnterNative drives the body, the boxed ISLAND is a
  * `call jit_exec_block`, the ReturnV is native. PROVE it ran (g_jit_container_
@@ -26911,6 +27133,8 @@ static bool jit_counter_coverage()
         { "release_entry",    &g_jit_release_entry,    nullptr },
         { "relent_stores",    &g_jit_relent_stores,    nullptr },
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
+        { "arg_inplace",      &g_jit_arg_inplace,      nullptr },
+        { "arg_stage",        &g_jit_arg_stage,        nullptr },
         { "inline_baked",     &g_jit_inline_baked,     nullptr },
         { "sync_boundary",    &g_jit_sync_boundary_call,
           "a live SAFETY NET with no constructible trigger (#114, "
@@ -29538,6 +29762,8 @@ static const std::vector<extra_check> extra_checks =
       "still correct)", jit_callee_cache_hit },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
       jit_bind_widen_inline },
+    { "jit: a reference argument binds IN PLACE, and the declines (#162)",
+      arg_inplace_shapes },
     { "jit: post-call entry stub re-enters native on interpreted return",
       jit_post_call_entry },
     { "jit: deep recursion runs native on the dedicated stack (M5a)",
