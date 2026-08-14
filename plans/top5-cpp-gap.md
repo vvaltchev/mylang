@@ -676,8 +676,19 @@ at a numeric parameter already declined there, so the arm's behaviour is
 now identical to before - and it is the right VALUE gate anyway, since a
 trivial argument's staging move is already the inline two-store path.
 
-MEASURED (76_funcval_dispatch, OPT=1 ASSERTS=0, scale-1-vs-3 delta):
-see the numbers appended below.
+MEASURED, OPT=1 ASSERTS=0 on both sides, baseline = dab3f9b:
+ - **76 per-iteration Ir 734 -> 588 (-19.9%)** (the scale-1-vs-3 delta,
+   so process startup, compile time and JIT warmup are excluded from
+   both sides); whole-program -19.4% / -19.7% at scale 1 / 3.
+ - **wall-clock 0.73x** (0.036 -> 0.026s), from the interleaved
+   `--baseline` full-suite run - the trustworthy form, both binaries
+   timed in one session.
+ - **my/cpp 17.7x -> 12.42x**; 76 is no longer the worst bench.
+ - suite geomean cur/base **0.992x**, every other bench inside
+   0.94-1.05x. my/python geomean 11.08x over 77 pairs.
+   (14_array_subscript tripped the variance gate at 6.6% and its number
+   is unreliable either way - unrelated to this change, which cannot
+   reach a subscript loop.)
 
 SABOTAGE (all watched):
  - ref_slots gate removed -> `jit_bind_widen` fails AND

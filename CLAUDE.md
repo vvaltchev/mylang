@@ -368,7 +368,10 @@ collision). Three nets now:
   nothing). Levers: cache, fcache, telide, fread, flit, fwd, ffwd,
   resreg, hoist, hoist2, mfact, cest, relent, norec (the no-record
   call tier, DEFAULT ON since 2026-08-12 - its TESTS nets self-adjust
-  per mode, so `-rt` is green with it on OR off), `all`.
+  per mode, so `-rt` is green with it on OR off), argfuse (#162: a
+  reference argument already in a named local is bound STRAIGHT from
+  that slot and its staging MoveV is not emitted; the cold arms
+  materialise the run), `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
