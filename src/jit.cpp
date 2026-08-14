@@ -12944,8 +12944,18 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                      * PINNED loop counter, and the array argument it
                      * would have fused sits one instruction further
                      * back.) */
+                    /* A NAMED local/param only. HONEST STATUS: this
+                     * gate is DEFENSIVE and is not sabotage-falsified -
+                     * removing it keeps -rt and the corpus green
+                     * (watched). It is kept because a temp is where
+                     * lever A's dead-temp forwarding and C5's release
+                     * picker do their work, i.e. the one place a slot's
+                     * write may legitimately have been SKIPPED, and a
+                     * fused read would then ask memory that was never
+                     * written. Costing a few fusions to stay clear of
+                     * that is the right trade. */
                     if (s < 0 || s >= chunk.slot_count)
-                        continue;                  /* a temp, not a name */
+                        continue;
                     /* ONLY a slot the ref_slots audit says can hold a
                      * REFERENCE. Two reasons, and the second is the
                      * load-bearing one:
