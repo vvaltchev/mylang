@@ -1,6 +1,6 @@
 # Bytecode VM
 
-## END GOAL — SERIALIZABLE `.myv (full design: plans/myv-serializer.md)` bytecode (user, 2026-07-09)
+## END GOAL — SERIALIZABLE `.myv (full design: plans/archived/myv-serializer.md)` bytecode (user, 2026-07-09)
 
 The concrete target that drives everything: **`mylang -c source.my` emits a
 binary `source.myv`** — a self-contained bytecode image — and **`mylang

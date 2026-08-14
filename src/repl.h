@@ -14,7 +14,7 @@ class Construct;
  * const-eval context, the runtime global scope, the retained input ASTs and the
  * accumulated source - and evaluates one input at a time, faithfully running
  * real pipeline so each input behaves like a script augmented with the existing
- * globals (see plans/repl.md). The TTY / line-editor layer is separate; this
+ * globals (see plans/archived/repl.md). The TTY / line-editor layer is separate; this
  * core is headless and is exactly what the `repl:` tests drive (a sequence of
  * input -> output pairs, to exercise the persisted global context).
  */

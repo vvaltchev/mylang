@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 /*
- * The `.myv` stored-bytecode reader/writer (plans/myv-serializer.md).
+ * The `.myv` stored-bytecode reader/writer (plans/archived/myv-serializer.md).
  *
  * ONLY the VM image is stored - never native code. The AOT tier re-runs at
  * LOAD time, so a `.myv` is portable across machines and across the JIT's
@@ -152,7 +152,7 @@ std::string join_path(const std::string &dir, const std::string &rel)
 
 /*
  * Resolve + VERIFY the source of an image being loaded, per the reference and
- * the load options. The rules (README / plans/myv-serializer.md):
+ * the load options. The rules (README / plans/archived/myv-serializer.md):
  *  - `--source ROOT` given: look ONLY under it (`ROOT/rel`) - an explicit
  *    root that does not have the file is a mistake worth reporting, not a
  *    reason to silently fall back to a stale absolute path.

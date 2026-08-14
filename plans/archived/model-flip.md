@@ -1,10 +1,10 @@
 # Model flip: NATIVE containers with bytecode ISLANDS (design + staging)
 
-The endgame inversion named in `plans/native-aot.md` ("The endgame INVERSION")
+The endgame inversion named in `plans/archived/native-aot.md` ("The endgame INVERSION")
 and `[[vm-endgame]]`. This file is the self-contained design + the staged,
 each-step-lands-green execution guide, written to survive a context compact.
 
-> Read first: `plans/native-aot.md` (the JIT design, approach A, the native-call
+> Read first: `plans/archived/native-aot.md` (the JIT design, approach A, the native-call
 > arc) and `plans/archived/native-call-impl.md` (the v1 native-call machine code — the
 > pieces this builds on). This file assumes both.
 
@@ -350,7 +350,7 @@ InvalidArgumentEx/InvalidNumberOfArgsEx `DECL_RUNTIME_EX` so `catch
 (RuntimeException)` conveys them, no `std::terminate`), and is op_fully_native
 (re-raises + carries its own pool caret, so a deleted CallBuiltinV is caret-
 correct → no delete-originals regression). See
-`plans/callbuiltinv-nativization.md`. Per-op perf ~neutral (helper ≈ dispatch)
+`plans/archived/callbuiltinv-nativization.md`. Per-op perf ~neutral (helper ≈ dispatch)
 but CUMULATIVELY a real win where they're hot: 62_dict_word_count −5.2% (the
 first 6 on vs off). And **LoadCaptureV** (`jit_load_capture` - a capture read
 `(*ctx->captures)[idx]`, always defined so non-throwing + op_fully_native;
@@ -1025,7 +1025,7 @@ The running TODO of things that would shrink islands / extend native coverage,
 to do LATER, separately (don't forget these):
 
 - **CallBuiltinV** (~294, the big island source) — DONE (2026-07-22, c606b61 +
-  the exception change fa90955); see `plans/callbuiltinv-nativization.md` (#1
+  the exception change fa90955); see `plans/archived/callbuiltinv-nativization.md` (#1
   exception model change, #2 op_fully_native, #3 root-caused-orthogonal).
 - **`IntSubIR` (imm − reg) shape in `specialize_arith_ops`** — WON'T DO
   (2026-07-22, maintainer decision). The JIT motivation is SUBSUMED by the
@@ -1386,7 +1386,7 @@ to do LATER, separately (don't forget these):
   Evaluate when hand-assembly hurts, not before.
 
 ## Relationship to the other plans
-- Builds ON `plans/archived/native-call-impl.md` (v1 native calls) and `plans/native-aot.md`
+- Builds ON `plans/archived/native-call-impl.md` (v1 native calls) and `plans/archived/native-aot.md`
   (approach A, the fragment ABI, the exception signalling).
 - SUPERSEDES the #55 v2/v3 open items (throwing/recursive/dyn callees) — they
   become container-to-container calls (M5).

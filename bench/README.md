@@ -392,7 +392,7 @@ blow-out is per-iteration *genuine* exceptions (`42` ~22×).
     nothing until something is thrown.
   Root cause of the throw-heavy cases: every `throw` heap-allocates + unwinds
   the C++ stack via DWARF tables (~1.6µs, irreducible by build flags). The VM
-  exception work (`plans/vm-exceptions.md`) targets these — same-frame first,
+  exception work (`plans/archived/vm-exceptions.md`) targets these — same-frame first,
   then cross-frame (return-value propagation), then VM-detected runtime errors —
   and this suite is the scoreboard for all three.
 - **`09_fib_recursive` (3.5×), `44_primes_sqrt` (2.5×):** these were ~31× and

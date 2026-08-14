@@ -4354,7 +4354,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
              * inferencer proved is a non-null int (th == i) - e.g. a POD struct
              * field `p.x`. The latter reads UNBOXED via eval_int() (no
              * pod_get/EvalValue), which is what makes `sx += p.x` over a flat
-             * struct array a true unboxed reduction (plans/structs.md phase 8).
+             * struct array a true unboxed reduction (plans/archived/structs.md phase 8).
              */
             const bool rhs_int =
                 rvalue->is_lit_int() || rvalue->th == TypeHint::i;

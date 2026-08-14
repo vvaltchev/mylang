@@ -394,7 +394,7 @@ node's loc (a subscript-only chain keeps the tuned `StoreElem2V`/
 So a member-in-the-middle nested store — which WORKS for boxed structs / dict
 values, throws for POD — is native, byte-identical incl. carets. **P8 exceptions
 are now fully native** (see
-`plans/vm-exceptions.md`): try/catch/finally + throw + rethrow + all
+`plans/archived/vm-exceptions.md`): try/catch/finally + throw + rethrow + all
 flow-crossing-try (incl. nested-finally chaining) are native ops. **G1
 (2026-07-17): a VM-RAISED exception NEVER C++-throws, cross-frame included.**
 `vm_raise` (the shared raise for `Throw`/`Reraise`/`Rethrow`/`EndFinally`'s
@@ -621,7 +621,15 @@ the JIT kill switch, the residual is: a DESIGN cost (+1.4% / +4.2% with
 `-nj`) - `vm_dispatch_exc_frame` is 89-116 Ir/throw where the chain was
 ~50, ~32 of it NESTED-VECTOR addressing (a `vector<HandlerClause>` per
 site, a `vector<const UniqueId *>` per clause: three indirection levels
-per match), which flattening into chunk-level arrays is the next step -
+per match) - **and flattening that into chunk-level arrays was TRIED
+and is REFUSED: it measured +1.14% on 42_exceptions and +2.88% on
+70_exc_runtime_error at `OPT=1 ASSERTS=0`. The three-hops premise is
+false of the generated CODE — the inner vector's pointers live INSIDE
+the site struct the dispatch already loaded, so the nested range-for
+has no extra dependent load while the flat form must fetch
+`handler_clauses.data()`, `clause_base` and `n_clauses`. Do not
+re-attempt without reading
+`plans/archived/vm-optimizations-rejected.md`** -
 and a JIT-SHAPE cost (the rest), inherent to delete-originals on a
 throw-EVERY-iteration loop, which now leaves and re-enters ONE big
 fragment per iteration instead of stepping through several small ones.
@@ -1407,4 +1415,4 @@ be run-eligible yet sit in a run whose compilation declined) or `NOT ready`
 with each blocking
 island's pc span + its distinct un-nativizable opcodes (the "what to nativize
 next" surface). DUMP-ONLY today; see **THE MODEL FLIP** below and
-`plans/model-flip.md`.
+`plans/archived/model-flip.md`.

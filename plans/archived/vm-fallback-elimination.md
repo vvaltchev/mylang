@@ -1270,7 +1270,7 @@ first:
    PREREQUISITE.** `try`/`catch`/`throw` are `EvalStmt`; every `throw` is a C++
    throw (bench 42, 24.5x). Needs VM-level exception dispatch (a handler stack +
    a pending-exception jump). **Full design + increment breakdown:
-   `plans/vm-exceptions.md`.** One bench (~5% geomean) but the single
+   `plans/archived/vm-exceptions.md`.** One bench (~5% geomean) but the single
    most-dramatic per-bench win + it unblocks the serializable-bytecode endgame.
 
 4. **Small residual fallbacks** (low value): ~~a dict MEMBER store `d.k=v`
@@ -1610,7 +1610,7 @@ real call, but stops being tree-walked wholesale).
 
 ## Part C — VM optimizations (native but sub-optimal)
 
-> **SUPERSEDED (2026-07-15) by `plans/vm-performance-roadmap.md`** — the
+> **SUPERSEDED (2026-07-15) by `plans/archived/vm-performance-roadmap.md`** — the
 > full post-zero-AST performance deep-dive (regression decomposition,
 > profiles, and the ranked opportunity catalog). The items below are
 > absorbed there (C1 -> F1, C2 -> A1, C3 -> D2, C4 -> B2, C5 -> B4).

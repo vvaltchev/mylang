@@ -64,7 +64,7 @@ public:
     typedef std::vector<SharedStr>    tvec_type;
 
     /*
-     * Flat storage for an array of POD structs (plans/structs.md phase 7): the
+     * Flat storage for an array of POD structs (plans/archived/structs.md phase 7): the
      * elements laid out contiguously as raw C-struct bytes, `stride`
      * bytes each.
      * `def` (a StructTypeDef*) is the element type - used only by the impl
@@ -247,7 +247,7 @@ public:
         , slice(false)
     { }
 
-    /* Flat POD-struct storage (plans/structs.md phase 7). `len` is the element
+    /* Flat POD-struct storage (plans/archived/structs.md phase 7). `len` is the element
      * count (buf bytes / stride). */
     SharedArrayObjTempl(svec_type &&arr)
         : shobj(make_intrusive<SharedObject>(std::move(arr)))

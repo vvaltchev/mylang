@@ -37,7 +37,7 @@
 using std::string;
 
 /* Is stdout a terminal (for color)? The REPL is non-interactive on Windows
- * (see plans/repl.md), so there it is always "not a tty" - no color. */
+ * (see plans/archived/repl.md), so there it is always "not a tty" - no color. */
 static bool
 repl_out_is_tty()
 {

@@ -214,7 +214,7 @@ Two things the fusion does NOT change, both known going in:
   - **It does not touch the other extremes.** 76_funcval_dispatch (23.8x),
     63_closures (23.7x), 11_closure_counter (21.8x) and
     10_recursion_deep (19.1x) are CALL PROTOCOL, not element access. They
-    need the separate arc in plans/call-protocol-arc.md.
+    need the separate arc in plans/archived/call-protocol-arc.md.
 
 ## One trap, recorded because it cost time
 
@@ -287,7 +287,7 @@ The honest framing: both inline tiers took the EASY 60% (447 -> 91.5 on
 the sieve-class costs). What remains is the architecture, not a helper.
 
 **The route was picked (2026-08-02): C, incrementally.** The staircase
-lives in plans/typed-invariant-arrays.md - B is folded in as its first
+lives in plans/archived/typed-invariant-arrays.md - B is folded in as its first
 step (C1); A is orthogonal (register territory, not type territory) and
 lands first as its own change.
 

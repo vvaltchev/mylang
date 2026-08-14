@@ -1134,7 +1134,7 @@ static const std::vector<test> tests =
     },
 
     {
-        /* NATIVE AOT N4 (plans/native-aot.md): a flat int/float array
+        /* NATIVE AOT N4 (plans/archived/native-aot.md): a flat int/float array
          * element READ a[i] runs in a fragment; a slice base, an OOB
          * index, or a wrong-kind array BAILS to the interpreter (exact
          * result/throw). Pinned against the tree-walker via the
@@ -1322,7 +1322,7 @@ static const std::vector<test> tests =
     },
 
     {
-        /* NATIVE AOT N3 (plans/native-aot.md): float ordering compares
+        /* NATIVE AOT N3 (plans/archived/native-aot.md): float ordering compares
          * over a NaN must all be FALSE (IEEE) on the VM+JIT exactly as
          * on the tree-walker - the ucomisd swap trick avoids the NaN
          * trap. The counter loop keeps the compares inside a fragment. */
@@ -1341,7 +1341,7 @@ static const std::vector<test> tests =
     },
 
     {
-        /* NATIVE AOT N1 (plans/native-aot.md): a negative shift count
+        /* NATIVE AOT N1 (plans/archived/native-aot.md): a negative shift count
          * inside a JIT-eligible run BAILS to the interpreter, which
          * re-executes the op and throws InvalidValueEx with the normal
          * caret - byte-identical to -tw (the differential reruns this
@@ -1358,7 +1358,7 @@ static const std::vector<test> tests =
     },
 
     {
-        /* APPROACH A - container-store helper ops (plans/native-aot.md): a
+        /* APPROACH A - container-store helper ops (plans/archived/native-aot.md): a
          * flat-array element STORE `a[i] = v` / `a[i] OP= v` inside a JIT run
          * no longer splits the run - the fragment CALLS jit_store_elem_int /
          * jit_store_elem_float (the interpreter's exact store, COW included),
@@ -1439,7 +1439,7 @@ static const std::vector<test> tests =
     },
 
     {
-        /* NATIVE AOT N5 (plans/native-aot.md) - register-caching soundness.
+        /* NATIVE AOT N5 (plans/archived/native-aot.md) - register-caching soundness.
          * The fragment-local cache pins a hot int slot in r10/r11, loading
          * it ONCE at entry and flushing type+payload at EVERY exit. That is
          * sound ONLY for a RESOLVED LOCAL: a TEMP (>= slot_count) is scratch
@@ -2233,7 +2233,7 @@ static const std::vector<test> tests =
     },
     {
         /*
-         * THE NESTED-READ FUSION (LoadElem2Int/Float, plans/unboxing.md
+         * THE NESTED-READ FUSION (LoadElem2Int/Float, plans/archived/unboxing.md
          * option A). The fused op fires when the OUTER index is not loop-
          * invariant - `m[j][i]` with `j` the inner counter - because LICM
          * hoists `m[i][j]`'s row out of the loop before codegen sees it.
@@ -7595,7 +7595,7 @@ static const std::vector<test> tests =
     {
         /* `array += array` concatenation for each flat storage kind, plus
          * clone/intptr - the flat float/bool paths the struct flat-array work
-         * (plans/structs.md phase 7) mirrors. */
+         * (plans/archived/structs.md phase 7) mirrors. */
         "Typed arrays: flat += concatenation, clone, intptr (float/bool)",
         {
             "var fa = [1.0, 2.0]; fa += [3.0, 4.0];",
@@ -18549,7 +18549,7 @@ static bool jit_sync_inline_call()
 
 /*
  * G1 NO-RECORD TIER STEP 1 - the SHADOW-VERIFIED side table
- * (plans/g1-no-record-tier.md). Every M5b inline push runs
+ * (plans/archived/g1-no-record-tier.md). Every M5b inline push runs
  * jit_norec_push_verify, which compares the just-filled record against
  * the emit-time side-table entry and ABORTS on any mismatch - so the
  * whole suite is the test; what THIS test adds is the prove-it-ran
@@ -20523,7 +20523,7 @@ static bool dyn_foreach_fast_shapes()
  * boundary: an inlined chain spliced as a UNIT (one chain in the run)
  * deletes and still renders its virtual frames, so a backtrace through
  * it must be byte-identical to the tree-walker's. */
-/* .myv (plans/myv-serializer.md): the stored-bytecode ROUND TRIP -
+/* .myv (plans/archived/myv-serializer.md): the stored-bytecode ROUND TRIP -
  * compile a program to an image, load it back, and require BOTH the
  * disassembly (the design's oracle) and the executed result to match the
  * in-memory compile. Also pins determinism (two compiles are byte-
@@ -23076,7 +23076,7 @@ static bool jit_elem_slice_and_promote()
 }
 
 /*
- * Lever A - ADJACENT DEAD-TEMP FORWARDING (plans/unboxing.md). The
+ * Lever A - ADJACENT DEAD-TEMP FORWARDING (plans/archived/unboxing.md). The
  * producer hands its int result to the next op IN RAX; the consumer
  * skips the slot load and a provably-dead temp's write is elided.
  * g_jit_fwd is bumped by the EMITTED consumer at runtime - the only
@@ -23194,7 +23194,7 @@ static bool jit_fwd_deadtemp()
 
 /*
  * C1 - PER-LOOP GUARD + NAVIGATION HOISTING (the typed-invariant-arrays
- * staircase, plans/typed-invariant-arrays.md). An invariant base's
+ * staircase, plans/archived/typed-invariant-arrays.md). An invariant base's
  * type/slice/kind guards + data/count derivation run ONCE at the
  * fragment entry; the per-element form is bounds + read. g_jit_hoist is
  * bumped by the EMITTED entry navigation on SUCCESS - once per fragment
@@ -26300,7 +26300,7 @@ static bool jit_ctor_establish_c4e()
 }
 
 /*
- * C5: THE LOOP-PREHEADER RELEASE (plans/typed-invariant-arrays.md).
+ * C5: THE LOOP-PREHEADER RELEASE (plans/archived/typed-invariant-arrays.md).
  *
  * A ref-listed temp's scalar store tests whether the slot currently holds
  * a reference before it may overwrite the two words. Inside a loop that
@@ -26902,7 +26902,7 @@ static bool arg_inplace_shapes()
 #endif
 }
 
-/* model-flip M3 (plans/model-flip.md): a straight-line boxed LEAF compiles to a
+/* model-flip M3 (plans/archived/model-flip.md): a straight-line boxed LEAF compiles to a
  * native CONTAINER - one EnterNative drives the body, the boxed ISLAND is a
  * `call jit_exec_block`, the ReturnV is native. PROVE it ran (g_jit_container_
  * calls bumps, the "prove the code ran" rule) with a correct result, AND that a
@@ -27022,7 +27022,7 @@ static bool jit_container()
  * op] bumped (so the op landed in a fragment and its jit_* helper was called).
  * If a counter fails to bump, the op is nativized but NOT actually emitted/run
  * in that shape - a real gap this test surfaces. */
-/* Re-raise deletability (plans/model-flip.md): a native_leaf must be
+/* Re-raise deletability (plans/archived/model-flip.md): a native_leaf must be
  * EXIT-FREE (op_never_exits), because the #55 direct call IGNORES the callee
  * fragment's return value. Pre-fix, a non-inlined `len(dyn)` leaf's
  * CallBuiltinV conveyed its throw, the direct caller dropped it (stale dst,
@@ -29150,7 +29150,7 @@ static bool vm_disasm_native_call()
 #endif
 }
 
-/* plans/model-flip.md M1: -vd surfaces the CONTAINER PLAN - how a body
+/* plans/archived/model-flip.md M1: -vd surfaces the CONTAINER PLAN - how a body
  * partitions into native/island segments and whether it could be ONE native
  * container. A chunk with a still-boxed op is MIXED -> "NOT ready" + the
  * blocking island(s) (here `main`, whose island is a CallV - calls are M5

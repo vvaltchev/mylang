@@ -2193,7 +2193,7 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
      * A block normally gets its own nested const scope (popped on exit). The
      * REPL's top-level input passes push_const_scope=false so its consts land
      * in the persistent const context on c.const_ctx and survive to the next
-     * input (see plans/repl.md). The CSE cache scope is still per-block.
+     * input (see plans/archived/repl.md). The CSE cache scope is still per-block.
      */
     EvalContext block_const_ctx(c.const_ctx, true);
     if (push_const_scope)
@@ -2590,7 +2590,7 @@ static FieldKind decltype_to_fieldkind(DeclType dt)
 
 /* v1: `opt` is allowed only on the reference kinds that already carry `none`
  * (a null handle): dyn/array/dict. A scalar/str/struct field with `opt` would
- * need extra presence bits or break the C layout - deferred (plans/structs.md).
+ * need extra presence bits or break the C layout - deferred (plans/archived/structs.md).
  */
 static bool fieldkind_allows_opt(FieldKind k)
 {
@@ -2690,7 +2690,7 @@ check_struct_no_recursion(const StructTypeDef *def,
 }
 
 /*
- * Parse `struct Name { field/const ... }` (plans/structs.md). A field is
+ * Parse `struct Name { field/const ... }` (plans/archived/structs.md). A field is
  * `[opt] TYPE name;` where TYPE is a primitive keyword, `dyn`, or a struct-type
  * name (an identifier - validated later by the inferencer). v1 rejects `var`
  * fields and `opt` on a non-reference field. A `const NAME = expr;` member is

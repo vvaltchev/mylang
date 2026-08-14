@@ -1506,7 +1506,7 @@ static inline Construct *func_expr_body(const FuncDeclStmt *fd)
 }
 
 /*
- * A `struct Name { ... }` declaration (plans/structs.md). Owns the
+ * A `struct Name { ... }` declaration (plans/archived/structs.md). Owns the
  * StructTypeDef; do_eval binds the type name to a const descriptor value
  * (t_structtype) in scope, like a func name. Const-evaluable, so a `const`
  * built from the type (construction, `Type.CONST`) folds at parse time.

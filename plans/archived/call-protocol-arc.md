@@ -2,7 +2,7 @@
 
 Status: **SCOPED, not started.** Written 2026-08-01. This is the arc that
 covers the WORST benches - it is a bigger target than the unboxing work
-(plans/unboxing.md), which squarely fixes one bench.
+(plans/archived/unboxing.md), which squarely fixes one bench.
 
 ## The benches this is about
 
@@ -54,7 +54,7 @@ in it although it can never hold a reference. That is **task #85, still
 open and deliberately so**: it trades a memory-lifetime guarantee for the
 inference stack being airtight, and the failure mode is silent (a retained
 reference, visible only as a `use_count` difference). See
-plans/cpp-gap-extremes.md for the full argument.
+plans/archived/cpp-gap-extremes.md for the full argument.
 
 ### 2. Allocation per closure (~6.5% here)
 

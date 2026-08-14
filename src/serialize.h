@@ -9,7 +9,7 @@
 struct VmProgram;
 
 /*
- * The `.myv` STORED-BYTECODE format (plans/myv-serializer.md) - the endgame
+ * The `.myv` STORED-BYTECODE format (plans/archived/myv-serializer.md) - the endgame
  * artifact of the zero-AST campaign: `mylang -c file.my` writes a binary the
  * interpreter runs with NO source, NO parse, NO optimizer passes.
  *

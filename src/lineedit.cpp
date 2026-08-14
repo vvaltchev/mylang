@@ -15,7 +15,7 @@
 
 /* The raw-mode interactive editor is Unix-only (termios). On Windows the REPL
  * is not interactive (read_line falls back to a cooked getline) - see
- * plans/repl.md; the pure LineEditor core compiles everywhere for the tests. */
+ * plans/archived/repl.md; the pure LineEditor core compiles everywhere for the tests. */
 #ifndef _WIN32
 #include <unistd.h>
 #include <termios.h>

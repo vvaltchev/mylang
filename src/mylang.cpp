@@ -247,7 +247,7 @@ void help()
     cout << "  -vm      Execute via the bytecode VM (the DEFAULT)." << endl;
     cout << "  -nj      Disable the native x86-64 AOT tier (also"
          << endl;
-    cout << "           MYLANG_JIT=0). See plans/native-aot.md" << endl;
+    cout << "           MYLANG_JIT=0). See plans/archived/native-aot.md" << endl;
     cout << "  -tw      Execute via the tree-walking interpreter instead"
          << endl;
     cout << "           of the VM. See plans/archived/bytecode-vm.md" << endl;
@@ -476,7 +476,7 @@ parse_args(int argc, char **argv)
 
         } else if (!strcmp(arg, "-nj")) {
 
-            g_jit_enabled = false;   /* native-AOT off (plans/native-aot.md);
+            g_jit_enabled = false;   /* native-AOT off (plans/archived/native-aot.md);
                                       * also MYLANG_JIT=0 */
 
         } else if (!strcmp(arg, "-bi")) {
@@ -841,7 +841,7 @@ int main(int argc, char **argv)
              * run function bodies via the VM too, not just the top-level
              * chunk. */
             if (opt_compile) {
-                /* .myv (plans/myv-serializer.md): the full pipeline, then
+                /* .myv (plans/archived/myv-serializer.md): the full pipeline, then
                  * SERIALIZE and exit - no execution. Only the VM image is
                  * stored; the native tier re-runs at load. */
                 g_exec_engine = ExecEngine::Vm;

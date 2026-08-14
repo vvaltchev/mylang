@@ -42,7 +42,7 @@ statement.")
   phase, sketched in §9. This plan delivers inference + checking + annotation.
 - Flow-sensitive nullability narrowing (smart-casts after `if (x != none)`).
   Deferred to a v2 (see §4, D3).
-- Struct types (`plans/structs.md`). Inference is designed to *accommodate* them
+- Struct types (`plans/archived/structs.md`). Inference is designed to *accommodate* them
   later (a `Struct<Name>` static type), but they're not built here.
 
 ## 2. The static type lattice

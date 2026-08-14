@@ -51,7 +51,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
  */
 std::string disassemble_program(const Block *root);
 
-/* The LOADED-IMAGE twin (plans/myv-serializer.md): dump a VmProgram exactly
+/* The LOADED-IMAGE twin (plans/archived/myv-serializer.md): dump a VmProgram exactly
  * as disassemble_program dumps a fresh compile - the ROUND-TRIP ORACLE
  * (`-vd file.my` vs `-vd file.myv` must be byte-identical) and the everyday
  * "what is in this file" answer. */

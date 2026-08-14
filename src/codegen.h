@@ -73,7 +73,7 @@ bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit = true);
 void build_boxed_ops(Chunk &chunk);
 
 /*
- * Lever A (dead-temp forwarding, plans/unboxing.md): per-pc TEMP
+ * Lever A (dead-temp forwarding, plans/archived/unboxing.md): per-pc TEMP
  * live-out AND live-in masks + branch-target flags over the chunk's
  * FINAL code, for the JIT's adjacent-pair forwarding. Computed HERE,
  * with the audited enumerations (visit_use_def / visit_pc_fields / the
@@ -100,7 +100,7 @@ bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
                   std::vector<char> &is_tgt);
 
 /*
- * C4d (plans/typed-invariant-arrays.md): the per-pc STRUCT-IDENTITY facts
+ * C4d (plans/archived/typed-invariant-arrays.md): the per-pc STRUCT-IDENTITY facts
  * a PLANNED StructCtorV establishes, so a baked member read on the same
  * slot can skip the type-tag + def-identity guards it would otherwise
  * re-check on every single field read.

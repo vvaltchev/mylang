@@ -980,7 +980,7 @@ enum class OpCode : unsigned char {
     Halt,
 
     /*
-     * B1/B2 SPECIALIZED ARITHMETIC (plans/vm-performance-roadmap.md): the
+     * B1/B2 SPECIALIZED ARITHMETIC (plans/archived/vm-performance-roadmap.md): the
      * per-operator, per-operand-shape variants of IntBin/FloatBin, selected
      * by specialize_arith_ops (codegen.cpp) as an in-place post-codegen
      * rewrite. Each removes IntBin's inner 11-way `aop` switch (a second
@@ -1003,7 +1003,7 @@ enum class OpCode : unsigned char {
     FloatAddRR, FloatAddRI, FloatSubRR, FloatSubRI, FloatMulRR, FloatMulRI,
 
     /*
-     * D1 (plans/vm-performance-roadmap.md): the dedicated `append(a, x)` /
+     * D1 (plans/archived/vm-performance-roadmap.md): the dedicated `append(a, x)` /
      * `push(a, x)` op - the CallBuiltinLV shape (a.slot = builtin_calls pool
      * idx, a.lit = arg0's slot KIND, target2 = arg0's slot, b.lit = the
      * value's slot, target = the result dst) with the marshaling deleted:
@@ -1015,7 +1015,7 @@ enum class OpCode : unsigned char {
     AppendV,
 
     /*
-     * F1 (plans/vm-performance-roadmap.md): a TYPED math-builtin call -
+     * F1 (plans/archived/vm-performance-roadmap.md): a TYPED math-builtin call -
      * `sqrt(x)`/`sin(x)`/`log(x)`/`float(x)`/`abs(float)`/`pow(x,y)` with a
      * float-proven result and float-compilable arg(s). Reads the operand(s)
      * RAW (read_float_operand - an int operand promotes), calls the C
@@ -1034,7 +1034,7 @@ enum class OpCode : unsigned char {
     MathFnV,
 
     /*
-     * H1 (plans/vm-performance-roadmap.md): the TYPED standalone struct-member
+     * H1 (plans/archived/vm-performance-roadmap.md): the TYPED standalone struct-member
      * READ `p.x` (th==i / th==f, a proven non-opt struct base in a LOCAL slot)
      * - the standalone twin of the flat-array LoadStructField* pair, and the
      * VM analog of the tree-walker's M8 MemberExpr::eval_int/eval_float. The
@@ -1104,7 +1104,7 @@ enum class OpCode : unsigned char {
     IntAddStep, ForStepElemInt, StructFieldAddInt,
 
     /*
-     * Native-AOT (plans/native-aot.md): enter a compiled x86-64 fragment.
+     * Native-AOT (plans/archived/native-aot.md): enter a compiled x86-64 fragment.
      * `a` (int lit) = the byte offset of the fragment entry inside
      * Chunk::native. The fragment (a frameless leaf: slots base in, resume
      * pc out, caller-saved regs only) runs a whole straight-line RUN of
@@ -1117,7 +1117,7 @@ enum class OpCode : unsigned char {
     EnterNative,
 
     /*
-     * model-flip M2 (plans/model-flip.md): the ISLAND fall-through terminator.
+     * model-flip M2 (plans/archived/model-flip.md): the ISLAND fall-through terminator.
      * In the "native containers with bytecode islands" model, a native
      * container `call`s vm_exec_block(from_pc) to run an interpreted island;
      * the island ends with an ExitBlock, whose handler hands control back to
@@ -1129,7 +1129,7 @@ enum class OpCode : unsigned char {
     ExitBlock,
 
     /*
-     * The NESTED-READ FUSION (plans/unboxing.md option A): `dst =
+     * The NESTED-READ FUSION (plans/archived/unboxing.md option A): `dst =
      * base[i][j]` in ONE op, the read-side twin of StoreElem2V. Without it
      * the pair is `LoadElemValue t = base[i]` then `LoadElemInt dst = t[j]`
      * - and materialising `t` costs a helper call, an intrusive_ptr retain,
@@ -1266,7 +1266,7 @@ struct Operand {
 };
 
 /*
- * B3 (plans/vm-performance-roadmap.md): the PACKED 32-byte instruction -
+ * B3 (plans/archived/vm-performance-roadmap.md): the PACKED 32-byte instruction -
  * exactly two per cache line (the old shape was 56 bytes: two 16-byte
  * Operands whose 8-byte lit/flit unions forced alignment padding around
  * their 2 tag bytes + 4-byte slot). The packing: `slot` and `lit` are
@@ -1451,7 +1451,7 @@ struct CgInstr : Instr {
 };
 
 /*
- * Native-AOT fragment buffer (plans/native-aot.md; jit.cpp): an mmap'd,
+ * Native-AOT fragment buffer (plans/archived/native-aot.md; jit.cpp): an mmap'd,
  * W^X (RW -> RX flipped) region holding this chunk's compiled fragments.
  * Move-only (munmap on release); NEVER serialized (`.myv` stays portable
  * - the AOT pass re-runs after load); null on unsupported platforms or
@@ -1489,7 +1489,7 @@ struct NativeCode {
 };
 
 /*
- * G1 NO-RECORD TIER, STEP 1 (plans/g1-no-record-tier.md): one entry per
+ * G1 NO-RECORD TIER, STEP 1 (plans/archived/g1-no-record-tier.md): one entry per
  * EMITTED sync-call site - the pc-keyed side table the tier will later
  * rebuild frames from. At namespace scope (not nested in Chunk) so jit.h
  * can name it through a forward declaration.
@@ -1576,7 +1576,7 @@ struct Chunk {
      * straight to a catch BODY (ordinary, entry-mapped code), so the matcher
      * ops left the bytecode entirely - a deleted native run then has no
      * un-deletable "matcher pc" to dispatch into, which is what kept every
-     * try/catch run interpreted (plans/model-flip.md).
+     * try/catch run interpreted (plans/archived/model-flip.md).
      *
      * PRIMARY data (built by compile_native_try, not derived - the chain it
      * could have been derived from is gone), hence serialized. Every pc in

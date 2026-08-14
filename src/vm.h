@@ -41,7 +41,7 @@ extern std::unique_ptr<RuntimeException> g_vm_exc_pending;
  * native-call gate sees every callee's native_leaf flag - #55 STEP 2). */
 const Chunk *vm_func_chunk(const FuncDescriptor *fdesc, bool jit = true);
 
-/* .myv LOAD (plans/myv-serializer.md): install a deserialized chunk as a
+/* .myv LOAD (plans/archived/myv-serializer.md): install a deserialized chunk as a
  * descriptor's body - the loader's equivalent of what vm_precompile_all
  * does for a fresh compile (own the chunk, stamp vm_chunk/vm_chunk_tried).
  * The AOT native tier is (re-)run here too: only the VM image is stored. */
@@ -65,7 +65,7 @@ bool vm_lookup_builtin(const UniqueId *name, Builtin &out);
 void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
 
 /*
- * model-flip M2 (plans/model-flip.md): headless self-test for vm_exec_block -
+ * model-flip M2 (plans/archived/model-flip.md): headless self-test for vm_exec_block -
  * the interpreted-ISLAND executor the native container will call. Hand-builds
  * tiny islands (fall-through, an internal boxed branch, a return, an uncaught
  * throw) and asserts the returned status + resulting state. Defined only under

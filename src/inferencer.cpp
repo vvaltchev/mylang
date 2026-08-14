@@ -23,7 +23,7 @@
 
 /*
  * Whole-program static type inference + checking. See plans/archived/type-inference.md
- * and plans/type-inference-questions.md for the design and decisions.
+ * and plans/archived/type-inference-questions.md for the design and decisions.
  *
  * Pipeline (Inferencer::run):
  *   1. structural  - build scopes; one TypeSym per declaration; resolve every
@@ -137,7 +137,7 @@ struct FuncInfo {
     bool is_template = false;
 
     /*
-     * Value-template tracking (plans/value-template-instantiation.md): the
+     * Value-template tracking (plans/archived/value-template-instantiation.md): the
      * template's VALUE escaped precise tracking (a join dropped its finfo
      * set, or it was passed as a call/builtin ARGUMENT or captured) - an
      * untracked call site could then reach a typed instance with a
@@ -899,7 +899,7 @@ void Inferencer::drain_escapes()
 }
 
 /*
- * Value-used template instantiation (plans/value-template-instantiation.md).
+ * Value-used template instantiation (plans/archived/value-template-instantiation.md).
  * A template whose VALUE flows (through vars/containers - the finfo set on
  * its Func static type rides the ordinary lattice) to indirect call sites
  * that all agree on ONE settled signature is instantiated for that
@@ -3217,7 +3217,7 @@ StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
 /*
  * Result type of a builtin call. Precise where it matters downstream;
  * `dyn` otherwise (sound - the runtime still type-checks the call). See
- * plans/type-inference-questions.md Q8.
+ * plans/archived/type-inference-questions.md Q8.
  */
 StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 {
@@ -5291,7 +5291,7 @@ static bool hoist_refs_uid(Construct *c, const UniqueId *uid)
 }
 
 /*
- * LEVER 3 increment 2 (plans/native-gap-roadmap.md) - LOOP-INVARIANT
+ * LEVER 3 increment 2 (plans/archived/native-gap-roadmap.md) - LOOP-INVARIANT
  * SLICE HOISTING. `for (...) { var sl = base[a:b]; ...reads... }`
  * evaluates an identical slice VIEW every iteration - the registration/
  * refcount churn is the loop's cost (the pooled set halved it; this
