@@ -790,9 +790,41 @@ guards, the three `i * K.0` promotions feeding the Vec3 ctor (each an
 int-slot type dispatch plus an inline literal materialisation - the C4b
 pool declined here), and the arithmetic itself.
 
-The general mechanism for the whole family is still the **first-
-iteration PEEL**: a hot copy of a region that assumes everything one
-full iteration established, at the price of doubling the region's
-fragment text. C4e and C5 each got one member of the family by making
-the invariant true instead of proving it, which is cheaper wherever it
-applies; the peel is what reaches the rest.
+### The first-iteration PEEL: MEASURED AND DECLINED (2026-08-05)
+
+The peel - emit a region twice, the first copy guarded and run once, the
+second assuming what it established - was the noted general mechanism
+for this family. It was measured before being built, and it is refuted
+on two independent grounds.
+
+**(1) ITS REACH IS ZERO.** A ceiling probe (an unsound build that lets
+C4e establish through the internal-branch / can-exit / top-tested
+conditions it normally refuses - i.e. exactly what a peel would license)
+removes **not one guard instruction on any of the 77 benches**. C4e's
+and C5's preheader conditions already cover every loop shape that
+occurs; the top-tested loop the peel would unlock does not appear.
+
+**A TRAP ON THE WAY, worth its own entry.** The probe LOOKED promising
+at first, on a copy of 64_struct_create with `500000 * scale` replaced
+by a literal `300` - that program's loop is TOP-TESTED and C4e refuses
+it, with the H1 guards plainly visible in `-vdj`. The real bench is not:
+with a runtime bound the loop lowers to the counted `for.step` form,
+C4e fires, and the guards are gone. **Shrinking a bench to make it a
+probe changed which optimization applies to it** - the vacuous-test trap
+in the measurement direction.
+
+**(2) EVEN WITH REACH, THE CURRENCY IS WRONG.** The specialized-family
+table fix above is a controlled experiment in exactly this: it deleted
+the same kind of guard, worth **-15% to -32% Ir on six benches**, and
+its wall-clock is **FLAT** (best-of-9 at table scale: 06_if_branch
+1.005x, 03_int_arith 0.995x, 54_mandelbrot 0.983x, 64_struct_create
+0.963x; suite cur/base 1.006x, inside the run-to-run spread). These
+guards are a perfectly-predicted branch over two L1-hitting loads with
+no dependency on the store's data - they retire nearly free on a wide
+out-of-order core. The peel would pay real I-cache (doubled fragment
+text) for instruction-count that does not convert.
+
+So the guard-elision family is now understood as an INSTRUCTION-COUNT
+optimization with a wall-clock ceiling near zero. C4e and C5 are still
+worth having (they cost nothing and make the emitted code smaller), but
+this line should not be pushed further on Ir evidence alone.

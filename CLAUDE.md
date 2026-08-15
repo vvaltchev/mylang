@@ -1649,6 +1649,23 @@ its guards. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0, cross-binary):
 LoadMemberInt - a different op), 46/01/09/55 byte-flat, so the new emit
 arm costs no layout tax.
 
+**⛔ THE GUARD-ELISION FAMILY IS AN INSTRUCTION-COUNT WIN WITH A
+WALL-CLOCK CEILING NEAR ZERO (measured 2026-08-05).** The
+specialized-family table fix above is the controlled experiment: it
+deleted guards worth **-15% to -32% Ir on six benches** and its
+wall-clock is **FLAT** (best-of-9 at table scale: 06_if_branch 1.005x,
+03_int_arith 0.995x, 54_mandelbrot 0.983x, 64_struct_create 0.963x;
+suite `cur/base` 1.006x, inside the run-to-run spread). The reason is
+what the guards ARE: a perfectly-predicted branch over two L1-hitting
+loads, with no dependency on the store's data - they retire nearly free
+alongside the real work on a wide out-of-order core. This is the
+documented instruction-vs-time divergence at its extreme, and it is the
+measured argument that killed the first-iteration PEEL (see
+plans/typed-invariant-arrays.md: its reach across bench/ is ZERO guards,
+and even with reach it would trade real I-cache for free instructions).
+C4d/C4e/C5 stay - they cost nothing and shrink the emitted code - but
+**do not push this line further on Ir evidence alone.**
+
 **C5 - THE LOOP-PREHEADER RELEASE (2026-08-05,
 `jit_pick_release_slots`, jit.cpp) - C4e's trick on the STORE side.**
 A scalar store to a REF-LISTED slot cannot just overwrite the two
@@ -5880,7 +5897,16 @@ AST transform joins **all three** on the day it is written:
 >    three divisor-guard cases were vacuous exactly this way. Defeat by
 >    making the local write-TWICE (`var z = 1; z = n - n;` - blocked
 >    from promotion), or by calling with a non-const argument.
-> 7. **A CALL is not a call by the time codegen sees it.** Testing what
+> 7. **SHRINKING A BENCH TO PROBE IT CHANGES WHICH OPTIMIZATION
+>    APPLIES.** 64_struct_create with `500000 * scale` replaced by a
+>    literal `300` lowers its loop to the TOP-TESTED form, which C4e
+>    refuses - so the probe showed H1 guards in `-vdj` that the real
+>    bench does not have (a runtime bound gives the counted `for.step`
+>    form, where C4e fires). A whole mechanism was nearly built for
+>    that phantom. Keep the bound RUNTIME when probing a loop, and
+>    diff `-vd` between the probe and the original before believing
+>    the probe.
+> 8. **A CALL is not a call by the time codegen sees it.** Testing what
 >    an op does to a slot's DATAFLOW (a kill, a barrier, a liveness
 >    edge) with `p = mk(i)` exercises nothing: a small callee is
 >    inlined by the AST inliner or spliced by the bytecode inliner, and
