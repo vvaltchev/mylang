@@ -402,8 +402,9 @@ loads, with no dependency on the store's data - they retire nearly free
 alongside the real work on a wide out-of-order core. This is the
 documented instruction-vs-time divergence at its extreme, and it is the
 measured argument that killed the first-iteration PEEL (see
-plans/archived/typed-invariant-arrays.md: its reach across bench/ is ZERO guards,
-and even with reach it would trade real I-cache for free instructions).
+plans/archived/typed-invariant-arrays.md: its reach across bench/ is
+ZERO guards, and even with reach it would trade real I-cache for free
+instructions).
 C4d/C4e/C5 stay - they cost nothing and shrink the emitted code - but
 **do not push this line further on Ir evidence alone.**
 
@@ -2430,8 +2431,9 @@ construction, and every other program's output is byte-identical to the
 pre-LICM binary.
 
 **THE NESTED-READ FUSION - `LoadElem2Int`/`LoadElem2Float` (2026-08-01,
-plans/archived/unboxing.md option A).** LICM above removes the row read whose index
-is loop-INVARIANT (`a[i][k]` in the k-loop). What it cannot touch is the
+plans/archived/unboxing.md option A).** LICM above removes the row read
+whose index is loop-INVARIANT (`a[i][k]` in the k-loop). What it cannot
+touch is the
 one whose outer index VARIES with the inner loop - `b[k][j]` - and that is
 where 46_matrix_mult's remaining cost sat: a profile put **61% of the
 inner iteration inside C++ helpers**, ~134 Ir of it in the two-op pair
@@ -3578,7 +3580,8 @@ are unchanged.
 ## Custom struct types
 
 User-defined value types (`struct Point { int x; int y; }`). Full design +
-phasing: `plans/archived/structs.md`. **Status: complete (all 8 phases)** — decl,
+phasing: `plans/archived/structs.md`. **Status: complete (all 8
+phases)** — decl,
 construction, field/const access, inference, const-folding, COW; the POD
 C-layout; nested (recursive) POD; flat `array<PodStruct>` storage; M8-style
 *direct* (unboxed) field access; and construct-in-place append. A flat struct
@@ -3983,8 +3986,8 @@ and two macros:
 
 `mylang` with no FILE/`-e` on a TTY (or `--repl` to force it off a TTY, for
 testing) runs the REPL (`run_repl`, launched from `mylang.cpp`). Full design +
-status: `plans/archived/repl.md`. Four TUs, split so the logic is headless-testable
-behind a thin terminal shell:
+status: `plans/archived/repl.md`. Four TUs, split so the logic is
+headless-testable behind a thin terminal shell:
 
 - **`repl.{h,cpp}` — `ReplEngine`**, the headless evaluation core. Holds the
   persistent interpreter state: a persistent **const-eval `EvalContext`** + a
@@ -4962,8 +4965,8 @@ Design record: `plans/archived/bytecode-vm.md`.
 > RULE (see *Benchmarks*); apply it to EVERY native-codegen change.
 
 **THE MODEL FLIP — native CONTAINERS with bytecode ISLANDS
-(`plans/archived/model-flip.md`, M1-M4a landed; M4b measured MOOT — see the end of
-this paragraph).** The endgame inversion of the JIT: flip
+(`plans/archived/model-flip.md`, M1-M4a landed; M4b measured MOOT — see
+the end of this paragraph).** The endgame inversion of the JIT: flip
 "BYTECODE with native ISLANDS" (a bytecode chunk, some runs replaced by
 `EnterNative`, the interpreter driving between them) into "NATIVE with bytecode
 ISLANDS" — EVERY function becomes ONE `call`-able native BLOB; its
@@ -5014,7 +5017,8 @@ MODEST win, LIMITED by the per-island `vm_dispatch` RE-ENTRY overhead. Still one
 island of simple boxed ops + no calls, so M1-M4a match NO bench/sample (real
 loops have a multi-island init+body / richer ops) — ZERO suite impact; M4a is a
 mechanism step + the M5 prerequisite. **M4b IS MOOT AS A PERF ITEM, MEASURED
-(2026-07-28, plans/archived/model-flip.md "the prize is collected"):** the nativize-ops
+(2026-07-28, plans/archived/model-flip.md "the prize is collected"):**
+the nativize-ops
 arc got there from the other side. 100% of bench + sample chunks are
 container-READY, and `vm_dispatch`'s callgrind SELF cost is a CONSTANT 47
 instructions (invocation entry + Halt) across every hot bench — the
@@ -5029,8 +5033,8 @@ ARCHITECTURE milestone: M5-flip is largely subsumed by the M5b/c native sync
 calls, and M6 (delete-originals + `.myv`) has since landed. Proven
 by the `jit_container` `-rt` test (`g_jit_container_calls` coverage + a
 throw-from-island + a loop container) + differential + fuzzer + `-vdj`. Builds on
-`plans/archived/native-call-impl.md` (v1 native calls) and `plans/archived/native-aot.md`
-(approach A, the fragment ABI).
+`plans/archived/native-call-impl.md` (v1 native calls) and
+`plans/archived/native-aot.md` (approach A, the fragment ABI).
 
 ## Invariants & hazards (defense in depth)
 
