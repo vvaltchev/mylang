@@ -121,6 +121,16 @@ public:
         return std::string_view(obj->s.data() + offset(), size());
     }
 
+    /*
+     * The JIT's layout probe (the co-located-probe rule, as
+     * SharedArrayObj::jit_probe): hand out the ADDRESS of the window
+     * length so jit.cpp can bake its byte offset from a REAL object
+     * instead of growing a second copy of this class's layout that could
+     * drift. `len` is private, hence the accessor.
+     */
+    struct JitProbe { const void *len; };
+    JitProbe jit_probe() const { return { &len }; }
+
     bool is_slice() const { return slice; }
     size_type offset() const { return slice ? off : 0; }
     /* `len` is authoritative for BOTH forms - see THE WINDOW MODEL above.

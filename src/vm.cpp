@@ -3799,16 +3799,6 @@ extern "C" void jit_load_elem_bool(int_type dst, int_type base,
     f->at(dst).put(EvalValue(b));
 }
 
-/* StrLen: the foreach bound n = the string's char count (get_view accounts for
- * a slice's offset). */
-extern "C" void jit_str_len(int_type dst, int_type base) noexcept
-{
-    ML_JIT_OP_RAN(StrLen);
-    Frame *f = g_current_ctx->frame;
-    f->at(dst).put(EvalValue(static_cast<int_type>(
-        f->at(base).get().get_ref<SharedStr>().get_view().size())));
-}
-
 /* LoadStrChar: bind a FRESH 1-char string for the container's i-th char -
  * matches the tree-walker's SharedStr(string(&view[i], 1)). */
 extern "C" void jit_load_str_char(int_type dst, int_type base,

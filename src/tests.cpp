@@ -22146,7 +22146,12 @@ static bool jit_len_ord()
         return ok;
     };
     const unsigned long a0 = g_jit_op_run[static_cast<size_t>(OpCode::ArrLen)];
-    const unsigned long s0 = g_jit_op_run[static_cast<size_t>(OpCode::StrLen)];
+    /* G5: len(str) is EMITTED INLINE now, so jit_str_len is never called
+     * and its own g_jit_op_run slot cannot say the code ran. The proof is
+     * the emit-side counter (the g_jit_elem2_fast pattern) - a helper's
+     * counter would also count DECLINES, which is exactly why the inline
+     * tiers each carry their own. */
+    const unsigned long s0 = g_jit_strlen_fast;
     const unsigned long o0 =
         g_jit_op_run[static_cast<size_t>(OpCode::OrdCharV)];
     if (!run({
@@ -22157,14 +22162,19 @@ static bool jit_len_ord()
             "var n = 0;",
             "for (var i = 0; i < len(a); i++) { n += a[i]; }",
             "for (var i = 0; i < len(s); i++) { n += ord(s[i]); }",
+            /* G5: a SLICE is a window with a NON-ZERO offset - the case
+             * that separates reading `len` from reading `off`. */
+            "var sl = s[2:5];",
+            "for (var i = 0; i < len(sl); i++) { n += 0; }",
+            "assert(len(sl) == 3);",
             "assert(n == 23 + 565);" }))
         return false;
     if (g_jit_op_run[static_cast<size_t>(OpCode::ArrLen)] <= a0) {
         fprintf(stderr, "jit_len_ord: native ArrLen DID NOT RUN\n");
         return false;
     }
-    if (g_jit_op_run[static_cast<size_t>(OpCode::StrLen)] <= s0) {
-        fprintf(stderr, "jit_len_ord: native StrLen DID NOT RUN\n");
+    if (g_jit_strlen_fast <= s0) {
+        fprintf(stderr, "jit_len_ord: the INLINE StrLen DID NOT RUN\n");
         return false;
     }
     if (g_jit_op_run[static_cast<size_t>(OpCode::OrdCharV)] <= o0) {
@@ -23640,15 +23650,9 @@ static bool jit_op_nativized()
             "  return n;",
             "}",
             "assert(f(runtime([true, false, true, true])) == 3);" } },
-        /* StrLen + LoadStrChar: a foreach over a proven string (StrLen is the
-         * once-evaluated bound, LoadStrChar binds each 1-char string). */
-        { OpCode::StrLen, {
-            "func f(str s) {",
-            "  var n = 0;",
-            "  foreach (var c in s) n += len(c);",
-            "  return n;",
-            "}",
-            "assert(f(runtime(\"banana\")) == 6);" } },
+        /* StrLen is NOT here: it is emitted INLINE (G5), so no helper runs
+         * and g_jit_op_run cannot see it. Its execution proof is the
+         * emit-side g_jit_strlen_fast, asserted by jit_len_ord. */
         { OpCode::LoadStrChar, {
             "func f(str s) {",
             "  var n = 0;",

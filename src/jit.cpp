@@ -57,6 +57,7 @@ unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
 unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
+unsigned long g_jit_strlen_fast = 0;   /* G5: inline len(str) runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
 unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
 unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
@@ -417,6 +418,9 @@ struct JitLayout {
     int slice_off;        /* SharedArrayObj: offset of `slice` (from payload) */
     int arr_off_off;      /* SharedArrayObj: offset of `off` (u32; #95 slice
                            * reads - elements live at data + (off + i)) */
+    int str_len_off;      /* SharedStr: offset of the window `len` (u32) -
+                           * AUTHORITATIVE for every string since the window
+                           * model, so len() is one load (G5) */
     int arr_len_off;      /* SharedArrayObj: offset of `len` (u32; a slice's
                            * element count - its bounds, NOT the vector's) */
     int kind_off;         /* SharedObject: &kind - shobj */
@@ -511,6 +515,14 @@ static const JitLayout &jit_layout()
         l.arr_len_off = static_cast<int>(
             reinterpret_cast<const char *>(&arr.len) -
             reinterpret_cast<const char *>(&arr));
+        /* G5: the SharedStr window length, from a real object. */
+        SharedStr sprobe{ std::string("ab") };
+        LValue slv(EvalValue(std::move(sprobe)), false);
+        const SharedStr &sref = slv.get().get_ref<SharedStr>();
+        l.str_len_off = static_cast<int>(
+            static_cast<const char *>(sref.jit_probe().len)
+            - reinterpret_cast<const char *>(&sref));
+
         const SharedArrayObj::JitProbe jp = arr.jit_probe();
         const char *so = static_cast<const char *>(jp.shobj);
         l.kind_off = static_cast<int>(
@@ -8567,7 +8579,35 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             return true;
         }
         goto foreach_load_helper;
-    case OpCode::StrLen:
+
+    case OpCode::StrLen: {
+        /*
+         * G5: len(str) INLINE - one 4-byte load, no call, no boxing.
+         *
+         * Sound because of THE WINDOW MODEL (sharedstr.h): `len` is the
+         * AUTHORITATIVE length of EVERY SharedStr, slice or not, so there
+         * is nothing to dispatch on. Before it, `size()` was
+         * `slice ? len : obj->s.size()` - a dependent load through `obj`
+         * that no emitter can do without baking libstdc++'s std::string
+         * layout, which is why this op was a helper call at ~48 Ir (21 of
+         * them the boxed LValue::put of the result, 22 the call frame, and
+         * only 5 the actual string access).
+         *
+         * No type guard: the codegen emits StrLen only when `vm_len_kind`
+         * proved the argument is a string (the same stamp that picks
+         * ArrLen), exactly as ArrLen's helper trusts its proven array.
+         */
+        const JitLayout &L = jit_layout();
+        const SlotAddr b = slot_addr(in.target2);
+        e.mov_eax_slot(b.payload + L.str_len_off);   /* zero-extended u32 */
+#ifdef TESTS
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_strlen_fast));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
+#endif
+        store_dst(e, ck, RAX, in.target, pc);
+        return true;
+    }
+
     case OpCode::LoadStrChar:
     case OpCode::LoadStructFieldInt:
     case OpCode::LoadStructFieldFloat:
@@ -8579,9 +8619,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * slot-or-literal `a` operand BEFORE the prologue - rax survives the
          * pushes - so an N5-pinned loop counter is read from its REGISTER),
          * rcx/r8 = the field index + int/float selector for the struct-field
-         * pair. StrLen has no index. Only LoadElemValue returns a status
-         * (OOB re-raise / unproven-base bail). */
-        const bool has_idx = in.op != OpCode::StrLen;
+         * pair. Only LoadElemValue returns a status (OOB re-raise /
+         * unproven-base bail). (StrLen used to share this block; it is
+         * emitted INLINE now - G5 - so every op left here has an index.) */
+        const bool has_idx = true;
         const bool is_field = in.op == OpCode::LoadStructFieldInt
                            || in.op == OpCode::LoadStructFieldFloat;
         if (has_idx)
@@ -8598,8 +8639,6 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const void *fn =
             in.op == OpCode::LoadElemBool
                 ? reinterpret_cast<const void *>(jit_load_elem_bool)
-          : in.op == OpCode::StrLen
-                ? reinterpret_cast<const void *>(jit_str_len)
           : in.op == OpCode::LoadStrChar
                 ? reinterpret_cast<const void *>(jit_load_str_char)
           : is_field
