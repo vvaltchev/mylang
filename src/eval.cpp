@@ -1116,8 +1116,12 @@ construct_struct_from_values(StructTypeDef *def,
 {
     auto obj = make_intrusive<StructObject>(def);
     for (size_t i = 0; i < n; i++) {
-        EvalValue v = coerce_struct_field(def->fields[i], vals[i],
-                                          Loc(), Loc());
+        const FieldDef &fd = def->fields[i];
+        if (field_exact_scalar(fd, vals[i])) {          /* G3 */
+            obj->pod_set(static_cast<int>(i), vals[i]);
+            continue;
+        }
+        EvalValue v = coerce_struct_field(fd, vals[i], Loc(), Loc());
         obj->pod_set(static_cast<int>(i), v);
     }
     return intrusive_ptr<StructObject>(obj);

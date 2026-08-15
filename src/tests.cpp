@@ -693,6 +693,36 @@ static const std::vector<test> tests =
      * member read. Unlike the foreach form it must wrap a negative index,
      * bounds-check, and still serve a PROMOTED general array.
      */
+    /*
+     * G3: the identity-coercion skip (field_exact_scalar, structtype.h).
+     *
+     * THE SHAPE MATTERS: the edit is in vm_make_struct_array_op's DST-REUSE
+     * arm, which only runs once the slot ALREADY holds a matching array -
+     * i.e. from the second iteration of a LOOP-CARRIED literal. A one-shot
+     * `var a = [W(..)]` takes vm_make_struct_array instead and never
+     * reaches it, so a non-loop test here is vacuous (it was, first time).
+     *
+     * What must keep working is every REAL widening - bool -> int and
+     * int -> bool -> float are all supported and must not be swallowed by
+     * an over-eager exact-match test, which would store the raw payload
+     * and corrupt the struct's bytes.
+     */
+    { "struct build: widenings survive the array-literal reuse arm",
+      { "struct W { float f; int i; float g; }",
+        "var acc = 0.0;",
+        "for (var n = 0; n < 5; n++) {",
+        "  var a = [W(n, true, 2.5)];",   /* int->float, bool->int, float */
+        "  acc += a[0].f + a[0].i + a[0].g; }",
+        "assert(acc == 27.5);" } },
+    { "struct build: exact-match fields round-trip through the reuse arm",
+      { "struct E { int a; float b; bool c; }",
+        "var t = 0;",
+        "for (var n = 0; n < 4; n++) {",
+        "  var v = [E(n, 1.5, true), E(n + 1, 2.5, false)];",
+        "  t += v[1].a * 10 + int(v[0].b * 10) + int(v[0].c)",
+        "       + int(v[1].c); }",
+        "assert(t == 164);" } },
+
     { "struct elem field: flat / negative index / float + bool fields",
       { "struct P { int x; float w; bool b; }",
         "func g(int i) {",
