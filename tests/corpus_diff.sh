@@ -26,7 +26,7 @@ set -u
 cd "$(dirname "$0")/.."
 BIN=${1:-build-claude/dbg/mylang}
 MODE=${2:-}
-LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2"
+LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2 mfact"
 COLD_TIERS="refstore"
 
 progs() {

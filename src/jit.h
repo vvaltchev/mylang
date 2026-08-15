@@ -835,6 +835,11 @@ extern "C" unsigned long g_jit_flit;
 /* C4b inc 2: times the ref-listed float-store arm had to move a
  * non-xmm0 result into xmm0 for jit_put_float (see the emit). */
 extern "C" unsigned long g_jit_fstore_movx0;
+/* C4d: baked member reads emitted with NO type/def guards, because a
+ * dominating planned StructCtorV proved both (jit_struct_facts).
+ * g_jit_member_fast counts the GUARDED form too, so only this can prove
+ * the elided one ran. */
+extern "C" unsigned long g_jit_member_noguard;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
@@ -872,6 +877,15 @@ extern "C" void jit_release_slot(LValue *lv) noexcept;
  * hardened lanes while they exercise the same emitted path a release
  * runs). A no-op body outside ML_VM_HARDENING builds. */
 extern "C" void jit_ret_audit() noexcept;
+
+/* C4d: the VM_HARDENING net for the GUARD-ELIDED member read - re-checks
+ * at RUNTIME, on the same emitted path a release takes, the very fact the
+ * dataflow proved (slot holds a struct of `def`). A stale audit table, a
+ * missed KILL or a predecessor the CFG walk failed to enumerate all show
+ * up here as a located abort instead of a wild pointer read. A no-op body
+ * outside ML_VM_HARDENING builds. */
+extern "C" void jit_member_fact_audit(int_type slot,
+                                      const void *def) noexcept;
 
 /* model-flip (nativize-ops): the native Halt - a fall-through body's implicit
  * `return none`. Like jit_ret but the result is hard-wired to none (no slot).

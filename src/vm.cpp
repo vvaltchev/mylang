@@ -5310,6 +5310,19 @@ extern "C" void jit_release_slot(LValue *lv) noexcept
     *lv = LValue();
 }
 
+extern "C" void jit_member_fact_audit(int_type slot,
+                                      const void *def) noexcept
+{
+#if ML_VM_HARDENING
+    const EvalValue &v = g_current_ctx->frame->at(slot).get();
+    ML_VM_CHECK(v.is<intrusive_ptr<StructObject>>());
+    ML_VM_CHECK(v.get_ref<intrusive_ptr<StructObject>>()->def
+                == static_cast<const StructTypeDef *>(def));
+#else
+    (void)slot; (void)def;
+#endif
+}
+
 extern "C" void jit_ret_audit() noexcept
 {
 #if ML_VM_HARDENING

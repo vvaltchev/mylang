@@ -22000,7 +22000,7 @@ static bool jit_struct_baked()
         g_exec_engine = saved;
         return ok;
     };
-    const unsigned long m0 = g_jit_member_fast, c0 = g_jit_ctor_fast;
+    const unsigned long c0 = g_jit_ctor_fast;
     if (!run({
             "struct P { int x; float f; bool b; }",
             "func go(int n) {",
@@ -22015,12 +22015,125 @@ static bool jit_struct_baked()
             "}",
             "assert(go(runtime(4)) == 8015);" }))
         return false;
+    if (g_jit_ctor_fast <= c0) {
+        fprintf(stderr, "jit_struct_baked: ctor fast path DID NOT RUN\n");
+        return false;
+    }
+    /* The member reads above are C4d-ELIDED (a planned ctor on the same
+     * slot dominates them), so g_jit_member_fast no longer counts them -
+     * jit_member_fact_c4d owns that shape. The GUARDED form needs a base
+     * no ctor generates: a struct PARAM. */
+    const unsigned long m0 = g_jit_member_fast;
+    if (!run({
+            "struct P { int x; float f; bool b; }",
+            "func rd(P p, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++)",
+            "    s += p.x;",
+            "  return s;",
+            "}",
+            "var q = P(runtime(3), 1.5, true);",
+            "assert(rd(q, runtime(4)) == 12);" }))
+        return false;
     if (g_jit_member_fast <= m0) {
         fprintf(stderr, "jit_struct_baked: member fast path DID NOT RUN\n");
         return false;
     }
-    if (g_jit_ctor_fast <= c0) {
-        fprintf(stderr, "jit_struct_baked: ctor fast path DID NOT RUN\n");
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
+ * C4d: a member read whose slot a PLANNED StructCtorV dominates drops its
+ * type-tag + def-identity guards (jit_struct_facts). ONE program pins both
+ * halves, because the risk is not that the elision fails but that it is
+ * INDISCRIMINATE: `p` is ctor-generated in the loop (elided) while `q` is a
+ * PARAM no ctor can generate (still guarded), so the two counters must BOTH
+ * move. Asserting only the elided one would pass just as happily if every
+ * read in the process lost its guards.
+ */
+static bool jit_member_fact_c4d()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long n0 = g_jit_member_noguard, m0 = g_jit_member_fast;
+    /* i = 0,1,2:  (p.x + p.y) = 2i+1 -> 1+3+5 = 9;  q.a = 5 each -> 15 */
+    if (!run({
+            "struct P { int x; int y; }",
+            "struct Q { int a; int b; }",
+            "func mix(Q q, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var p = P(i, i + 1);",
+            "    s += p.x + p.y;",
+            "    s += q.a;",
+            "  }",
+            "  return s;",
+            "}",
+            "var qq = Q(runtime(5), 7);",
+            "assert(mix(qq, runtime(3)) == 24);" }))
+        return false;
+    if (g_jit_member_noguard <= n0) {
+        fprintf(stderr, "jit_member_fact_c4d: elided read DID NOT RUN\n");
+        return false;
+    }
+    if (g_jit_member_fast <= m0) {
+        fprintf(stderr, "jit_member_fact_c4d: the param read lost its "
+                        "guards - the elision is not selective\n");
+        return false;
+    }
+    /* The KILL side: a plain MoveV (`p = q`) REBINDS the slot, so the fact
+     * the ctor above it established dies there and the reads after it are
+     * guarded again. A MoveV and not a call, because a small callee is
+     * inlined/spliced away long before codegen and the reads then read the
+     * INLINED body's own slot - a vacuous case (this test had it, and the
+     * no-KILL sabotage passed against it: 4 emitted def guards either way).
+     * With the MoveV the same sabotage takes the count 4 -> 2. */
+    const unsigned long m1 = g_jit_member_fast;
+    if (!run({
+            "struct P { int x; int y; }",
+            "func go(int n) {",
+            "  var s = 0;",
+            "  var p = P(0, 0);",
+            "  var q = P(n, n * 2);",
+            "  for (var i = 0; i < n; i++) {",
+            "    p = q;",
+            "    s += p.x + p.y;",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(go(runtime(4)) == 48);" }))
+        return false;
+    if (g_jit_member_fast <= m1) {
+        fprintf(stderr, "jit_member_fact_c4d: a rebind did not KILL the "
+                        "fact (the reads after it stayed elided)\n");
         return false;
     }
     return true;
@@ -22532,6 +22645,7 @@ static bool jit_counter_coverage()
         { "telide",           &g_jit_telide,           nullptr },
         { "telide_temps",     &g_jit_telide_temps,     nullptr },
         { "fstore_movx0",     &g_jit_fstore_movx0,     nullptr },
+        { "member_noguard",   &g_jit_member_noguard,   nullptr },
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
         { "inline_baked",     &g_jit_inline_baked,     nullptr },
         { "sync_boundary",    &g_jit_sync_boundary_call,
@@ -25037,6 +25151,8 @@ static const std::vector<extra_check> extra_checks =
       jit_leaf_never_exits },
     { "jit: struct baked member read + planned ctor run INLINE natively",
       jit_struct_baked },
+    { "jit: a ctor-dominated member read drops its guards (C4d)",
+      jit_member_fact_c4d },
     { "jit: native len() + fused ord(s[i]) run natively (lever 4b)",
       jit_len_ord },
     { "jit: LoadElem slow tier serves declined shapes (#56 inc 1)",
