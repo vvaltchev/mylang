@@ -5836,9 +5836,13 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
      * point step 4's record-less unwind will anchor on it.
      */
     if (frag_rbp && act.rec_n && !jit_norec_on()) {
-        g_jit_norec_raise_frames +=
+        /* the counters are `unsigned long`, which is 32-bit on
+         * WINDOWS (LLP64) - narrowing a size_t into one is MSVC C4267,
+         * and WERROR makes it a build failure there while GCC/clang say
+         * nothing. Cast at every such site. */
+        g_jit_norec_raise_frames += static_cast<unsigned long>(
             norec_walk_chain(&act, static_cast<const char *>(frag_rbp),
-                             act.rec_n, nullptr);
+                             act.rec_n, nullptr));
         g_jit_norec_raise_walk++;
         /*
          * STEP 4-ii(b) - THE RECONSTRUCTION. Build the backtrace prefix
@@ -8712,7 +8716,7 @@ static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
         norec_fail("mat: records exhausted before the segment floor",
                    fp, seed);
     g_jit_norec_mat_walk++;
-    g_jit_norec_mat_frames += levels;
+    g_jit_norec_mat_frames += static_cast<unsigned long>(levels);
 }
 
 /*
