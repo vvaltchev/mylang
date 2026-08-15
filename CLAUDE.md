@@ -5511,6 +5511,28 @@ omitting it is a compile error.
     INCOMPLETE report, the same way a behavior change without its README
     update is an incomplete change.
 
+- **⛔ MyLang DOES NOT CODEGEN WHAT THE C++ STANDARD LIBRARY ALREADY
+  DOES (maintainer-set, 2026-08-14).** A builtin's ALGORITHM stays
+  hard-coded C++ - `std::sort`, the hash map, the string search. Do not
+  propose, and do not build, a JIT that EMITS a specialized copy of one
+  (a sort generated per comparator call site, a map/filter fused into
+  its callback). The maintainer's words: *"overkill for MyLang"*, and
+  *"I don't want MyLang to produce with codegen implementations of
+  everything that already exists in the C++ std library."*
+  **THE CONSEQUENCE IS A PERMANENT, ACCEPTED ASYMMETRY**, and it is why
+  bench/cpp is written the way it is: `std::sort` INLINES its comparator
+  and `builtin_sort_lv` structurally cannot, so the C++ twin is required
+  to hand its comparator to a `noinline` helper as a `std::function`
+  (see plans/archived/bench-fairness.md, the 2026-08-14 reversal). The
+  fairness fix goes on the BENCH side because the implementation is not
+  going to change.
+  **WHAT IS STILL ALLOWED, and the line is worth stating precisely:**
+  making the CALL CHEAPER is not reimplementing the algorithm. A typed
+  callback entry - entering a proven `(int,int)->bool` comparator with
+  two raw `int_type`s instead of two boxed `EvalValue`s bound through
+  the generic parameter path - leaves `std::sort` exactly where it is
+  and still calls the comparator once per comparison. That is in scope.
+  Emitting the sort is not.
 - **THE MICRO-STEP ORDER INSIDE A TASK IS YOURS — DON'T ASK
   (maintainer-set, 2026-08-14).** The maintainer sequences work at the
   HIGH level: optimization vs feature vs test coverage, and which task
