@@ -20524,12 +20524,68 @@ static bool unpack_fast_bind_shapes()
             "for (var i = 0; i < 3; i++) { a, b, c = p; }",
             "assert(a == \"mm\" && b == \"nn\" && c == \"oo\");" },
           4, false },
+        /* MultiUnpackV over a SLICE rvalue - the multi-unpack twin of the
+         * hoisted offset. Without it, zeroing `roff` in vm_multi_unpack_
+         * body left the suite GREEN (watched): every other multi-unpack
+         * case destructures a whole array, whose offset is 0. */
+        { "multi-unpack over a str slice", {
+            "var src = split(\"zz aa bbb\", \" \");",
+            "var a = \"\"; var b = \"\";",
+            "for (var i = 0; i < 3; i++) { a, b = src[1:3]; }",
+            "assert(a == \"aa\" && b == \"bbb\");" }, 3, false },
         /* MultiUnpackV: the scalar string SPREAD */
         { "multi-unpack str spread", {
             "var s = \"sp\" + str(runtime(9));",
             "var a = \"\"; var b = \"\";",
             "for (var i = 0; i < 3; i++) { a, b = s; }",
             "assert(a == \"sp9\" && b == \"sp9\");" }, 4, false },
+        /* H7 inc 1 hoisted `off` and the element base OUT of the loop, so
+         * a SLICE sub-array is the shape that catches a wrong hoist: a
+         * slice shares its PARENT's storage, and reading from the parent's
+         * base returns the parent's elements ("q2 bb2" instead of
+         * "a2 bb2"). Values, not just counts, are asserted. */
+        { "slice str rows (hoisted offset)", {
+            "var rows = [];",
+            "for (var j = 0; j < 3; j++)",
+            "    append(rows, split(\"q\" + str(j) + \" a\" + str(j)",
+            "                       + \" bb\" + str(j), \" \")[1:3]);",
+            "var n = 0; var last = \"\";",
+            "for (var r = 0; r < 3; r++)",
+            "    foreach (var a, b in rows) {",
+            "        n += len(a) + len(b); last = a + b;",
+            "    }",
+            "assert(n == 45); assert(last == \"a2bb2\");" }, 6, false },
+        /* the GENERAL-storage twin of the slice case above, and it is
+         * NOT optional: with only the strs case, dropping the general
+         * arm's `+ off` left the whole suite GREEN (watched). The row is
+         * built with `dynarray()` on purpose - a plain heterogeneous
+         * literal makes the OUTER dyn too, and the foreach then lowers to
+         * fe.dyn.next instead of unpack.elem.v, so that version tested
+         * NOTHING (also watched: the sabotage did not move its value). */
+        { "slice general rows (hoisted offset)", {
+            "var rows = [];",
+            "for (var j = 0; j < 3; j++)",
+            "    append(rows, dynarray([\"q\" + str(j), \"a\" + str(j),",
+            "                           \"bb\" + str(j)])[1:3]);",
+            "var n = 0; var last = \"\";",
+            "for (var r = 0; r < 3; r++)",
+            "    foreach (var a, b in rows) {",
+            "        n += len(str(a)) + len(str(b));",
+            "        last = str(a) + str(b);",
+            "    }",
+            "assert(n == 45); assert(last == \"a2bb2\");" }, 6, false },
+        /* the TARGETS variant (a `_` placeholder makes the run
+         * non-consecutive) over the same hoisted string base */
+        { "targets with _ over strs", {
+            "var rows = [];",
+            "for (var j = 0; j < 2; j++)",
+            "    append(rows, [\"p\" + str(j), \"SKIP\", \"q\" + str(j)]);",
+            "var n = 0; var last = \"\";",
+            "for (var r = 0; r < 3; r++)",
+            "    foreach (var a, _, c in rows) {",
+            "        n += len(a) + len(c); last = a + c;",
+            "    }",
+            "assert(n == 24); assert(last == \"p1q1\");" }, 6, false },
         /* DECLINE: alternating str/int re-binds - every bind is a type
          * change, so the fast arm must never fire (growth EXACTLY 0) */
         { "alternating types decline", {

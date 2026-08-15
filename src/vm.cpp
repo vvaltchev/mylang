@@ -4390,26 +4390,6 @@ vm_slot_bind_value(LValue &dst, const EvalValue &src)
     dst.put(src);
 }
 
-/* Element k of `sub` into `dst`, storage-aware (the H3 dispatch). The
- * flat scalar kinds keep the vm_arr_elem temp: it is trivial there (a
- * POD copy, t < t_str), and a struct element must materialize anyway. */
-static inline void
-vm_unpack_bind_elem(LValue &dst, const SharedArrayObj &sub, size_type k)
-{
-    const size_type at = sub.offset() + k;
-    switch (sub.skind()) {
-        case SharedArrayObj::Storage::general:
-            vm_slot_bind_value(dst, sub.get_vec()[at].get());
-            return;
-        case SharedArrayObj::Storage::strs:
-            vm_slot_bind_str(dst, sub.flat_strs()[at]);
-            return;
-        default:
-            dst.put(vm_arr_elem(sub, k));
-            return;
-    }
-}
-
 /* The SHARED UnpackElem* body (the STRICT foreach-unpack of pairs[i] into N
  * loop vars): ONE implementation for the four interpreter handlers AND
  * jit_unpack_elem. `kind` 0 = int (flat-ints fast path), 1 = float, 2 =
@@ -4431,30 +4411,66 @@ vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
     const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
     if (sub.size() != static_cast<size_type>(N))
         vm_throw_unpack_len(chunk, pc, sub.size(), N);
-    if (targets) {
-        for (int_type k = 0; k < N; k++) {
-            if ((*targets)[k] >= 0)
-                vm_unpack_bind_elem(ctx.frame->at((*targets)[k]), sub,
-                                    static_cast<size_type>(k));
-        }
-        return;
-    }
     const size_type off = sub.offset();
     const auto sk = sub.skind();
-    if (kind == 0 && sk == SharedArrayObj::Storage::ints) {
+    /*
+     * H7 inc 1: THE STORAGE DISPATCH IS HOISTED OUT OF THE ELEMENT LOOP.
+     * It used to sit in a per-element helper, so every element re-read
+     * `sub.skind()` and `sub.offset()`, re-derived the element vector, and
+     * paid a non-inlined call - N times for a sub-array whose storage
+     * cannot change between them (nothing here runs user code; the only
+     * writes are to frame slots). Dispatching ONCE and running a
+     * kind-specialized loop over a hoisted base pointer leaves the binds
+     * themselves untouched - the refcount work in vm_slot_bind_str is the
+     * irreducible half and is not what this removes.
+     */
+    const auto each = [&](auto &&bind) {
+        if (targets) {
+            for (int_type k = 0; k < N; k++)
+                if ((*targets)[k] >= 0)
+                    bind(ctx.frame->at((*targets)[k]), k);
+        } else {
+            for (int_type k = 0; k < N; k++)
+                bind(ctx.frame->at(dst_base + k), k);
+        }
+    };
+    if (!targets && kind == 0 && sk == SharedArrayObj::Storage::ints) {
+        const int_type *iv = sub.flat_ints().data() + off;
         for (int_type k = 0; k < N; k++)
-            write_int_slot(&ctx, dst_base + k, sub.flat_ints()[off + k]);
-    } else if (kind == 1 && sk == SharedArrayObj::Storage::floats) {
+            write_int_slot(&ctx, dst_base + k, iv[k]);
+        return;
+    }
+    if (!targets && kind == 1 && sk == SharedArrayObj::Storage::floats) {
+        const float_type *fv = sub.flat_floats().data() + off;
         for (int_type k = 0; k < N; k++)
-            write_float_slot(&ctx, dst_base + k, sub.flat_floats()[off + k]);
-    } else {
-        /* UnpackElemValue, OR a flat op whose sub-array's storage is NOT the
-         * expected kind (a mixed-numeric literal built GENERAL, or the other
-         * scalar kind): bind each element's ACTUAL boxed value - identical
-         * to do_iter's bind_loop_var. */
-        for (int_type k = 0; k < N; k++)
-            vm_unpack_bind_elem(ctx.frame->at(dst_base + k), sub,
-                                static_cast<size_type>(k));
+            write_float_slot(&ctx, dst_base + k, fv[k]);
+        return;
+    }
+    /* UnpackElemValue, the Targets variant, OR a flat op whose sub-array's
+     * storage is NOT the expected kind (a mixed-numeric literal built
+     * GENERAL, or the other scalar kind): bind each element's ACTUAL boxed
+     * value - identical to do_iter's bind_loop_var. */
+    switch (sk) {
+    case SharedArrayObj::Storage::strs: {
+        const SharedStr *sv = sub.flat_strs().data() + off;
+        each([&](LValue &d, int_type k) { vm_slot_bind_str(d, sv[k]); });
+        return;
+    }
+    case SharedArrayObj::Storage::general: {
+        const LValue *gv = sub.get_vec().data() + off;
+        each([&](LValue &d, int_type k) {
+            vm_slot_bind_value(d, gv[k].get());
+        });
+        return;
+    }
+    default:
+        /* the flat SCALAR kinds keep the vm_arr_elem temp: it is trivial
+         * there (a POD copy, t < t_str), and a struct element must
+         * materialize anyway */
+        each([&](LValue &d, int_type k) {
+            d.put(vm_arr_elem(sub, static_cast<size_type>(k)));
+        });
+        return;
     }
 }
 
@@ -4501,6 +4517,21 @@ vm_multi_unpack_body(EvalContext &ctx, const EvalValue &rval,
         const size_type m = ra.size();
         if (m != static_cast<size_type>(targets.size()))
             vm_throw_multi_unpack_len(chunk, pc, m, targets.size());
+        /* H7 inc 1's SIBLING: the storage dispatch is hoisted here too.
+         * `sk`/`off`/the element base are loop-invariant for the same
+         * reason as in vm_unpack_elem_body - nothing in the loop runs
+         * user code or touches `ra`. A COMPOUND or COERCING position
+         * still goes through store(), which needs the boxed element, so
+         * the fast arm is chosen per element and the hoisting only pays
+         * for the plain ones. */
+        const size_type roff = ra.offset();
+        const auto rsk = ra.skind();
+        const SharedStr *rsv =
+            rsk == SharedArrayObj::Storage::strs
+                ? ra.flat_strs().data() + roff : nullptr;
+        const LValue *rgv =
+            rsk == SharedArrayObj::Storage::general
+                ? ra.get_vec().data() + roff : nullptr;
         for (size_t i = 0; i < targets.size(); i++) {
             ti = i;
             if (targets[i] < 0)
@@ -4508,8 +4539,13 @@ vm_multi_unpack_body(EvalContext &ctx, const EvalValue &rval,
             if (!compound && !(coerce && (*coerce)[i])) {
                 /* the plain bind (H3): identical to store()'s put arm,
                  * minus the vm_arr_elem temp + type-erased dispatch */
-                vm_unpack_bind_elem(ctx.frame->at(targets[i]), ra,
-                                    static_cast<size_type>(i));
+                LValue &d = ctx.frame->at(targets[i]);
+                if (rsv)
+                    vm_slot_bind_str(d, rsv[i]);
+                else if (rgv)
+                    vm_slot_bind_value(d, rgv[i].get());
+                else
+                    d.put(vm_arr_elem(ra, static_cast<size_type>(i)));
                 continue;
             }
             store(targets[i], vm_arr_elem(ra, static_cast<size_type>(i)));
