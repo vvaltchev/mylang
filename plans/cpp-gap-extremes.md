@@ -604,3 +604,65 @@ The other ~650 Ir of a creation is the FuncObject ctor itself, the
 `read_sym` capture snapshot, `jit_make_closure`, and the pooled FuncObject
 allocation. And creation is only ~45% of 63_closures; the rest is G1 (three
 indirect calls per iteration at 219 Ir each).
+
+## G5 is BLOCKED, and finding out why turned up a correctness bug
+
+**The premise in the G5 write-up was wrong.** `arr.len` is NOT an inline
+tier - lever 4b made `len()` a dedicated OPCODE whose emit is still a
+`call jit_arr_len`. So there was no inline precedent to copy.
+
+**Where jit_str_len's ~48 Ir actually go** (callgrind, per call, split by
+the file each inlined frame came from):
+
+    evalvalue.h   21   the boxed LValue::put of the result
+    vm.cpp        14   the helper body + the call frame
+    eval.h         8   Frame::at x2
+    sharedstr.h    5   get_view()/size() - the actual string access
+    basic_string.h 1
+
+So the string access is already cheap; the cost is the call plus the boxed
+store. An inline tier removes both - it would read the length and hand it
+to the existing ref-aware `store_dst` (which C3/C5 can then elide).
+
+**What blocks it.** An inline read needs the length in a FIELD. `size()`
+is `slice ? len : obj->s.size()`, and the non-slice arm exists because
+`len` GOES STALE: `TypeStr::append` grows the shared std::string in place
+without updating it. Reading `obj->s.size()` inline would mean baking
+libstdc++'s std::string layout into the emitter, which the co-located
+probe pattern cannot supply (there is no portable way to take the address
+of a std::string's size field).
+
+**And that stale `len` is the visible half of a real bug.** See task #123:
+`var a = "hi"; var b = a; a += "!";` leaves BOTH at "hi!" (Python leaves b
+at "hi"); a `+=` inside a function mutates the CALLER's string; an array
+element alias and even `clone()` see the append. README line 299 says
+"Strings are immutable like in Python" and line 781 says copies "use
+copy-on-write techniques", so this is a spec violation, not a design
+choice. Both engines share it (it is in `TypeStr::append`).
+
+**The obvious fix is wrong, and I measured it rather than reasoned about
+it.** Adding `&& lval.use_count() == 1` makes EVERY append rebuild,
+because the compound path copies the value out of the slot first
+(`EvalValue nv = frame->at(target).get()`, vm.cpp CompoundV) - so the
+count is structurally >= 2 and never 1. 28_str_concat: **+18268% Ir**,
+and a scaling check reads 0.00 / 0.03 / 0.33s at N = 20k / 40k / 80k -
+textbook O(n^2). Worth recording as a test trap too: the 50-iteration
+"sole owner still appends" test I wrote PASSES under the quadratic
+version. Size an asymptotic test to its asymptote.
+
+**The fix worth having (proposed, NOT taken - it is a design change to a
+core type):** make every SharedStr a WINDOW, which is what a slice
+already is. `len` becomes authoritative for both forms, is resynced after
+an in-place append, and the append happens in place only when this
+handle's window is the whole current string (`!slice && len ==
+obj->s.size()`), else it rebuilds. An alias then keeps its own shorter
+`len` and reads the old value - correct for all four repros, with NO COW
+clone - while the sole-owner accumulator still appends in place, so the
+O(n) idiom survives and no use_count test is needed anywhere. It also
+makes `len` a plain field read, i.e. **it is the same change G5 needs**.
+Audit list: `size()`, `hash()` (a non-slice uses the StrObj's cached
+FULL-string hash, valid only when `len == obj->s.size()`), `append()`,
+and every `is_slice()` consumer assuming non-slice == whole string.
+
+The four failing tests are written and were watched failing (1725/1729)
+against the current code; they go in with the fix.
