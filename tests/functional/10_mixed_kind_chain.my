@@ -1,0 +1,30 @@
+# A MIXED-KIND call chain: plain -> try -> plain -> dict-iter.
+#
+# With the no-record tier on, record-ful and record-less frames
+# INTERLEAVE, so `act.back_rec()` is not the returning frame's record but
+# an ANCESTOR. jit_ret_audit compared this frame's watermarks against
+# that ancestor's bases and ABORTED under VM_HARDENING - which CI turns
+# ON in the release lanes. The value was correct in every engine; only
+# the audit fired, and no corpus program had a mixed chain until this
+# one (found by the Net 3 enumeration, 2026-08-13).
+#
+# The loop is load-bearing: a FIRST descent is all new record-stack peaks
+# and the record-reuse guard declines every level of it, so iteration 1
+# alone emits no inline push at all.
+
+struct Never { int x; }
+var D = {"a": 1, "b": 2};
+
+func L3(int n) { var s = 0; foreach (k, v in D) { s += v; } return s; }
+func L2(int n) { var r = L3(n - 1); return r + 1; }
+func L1(int n) {
+    var out = 0;
+    try { var r = L2(n - 1); out = r + 1; } catch (Never) { out = -1; }
+    return out;
+}
+func L0(int n) { var r = L1(n - 1); return r + 1; }
+
+var t = 0;
+for (var k = 0; k < 4; k++)
+    t += L0(runtime(6));
+print("mixed:", t);
