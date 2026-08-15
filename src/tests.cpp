@@ -22775,19 +22775,28 @@ static bool jit_counter_coverage()
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
         { "inline_baked",     &g_jit_inline_baked,     nullptr },
         { "sync_boundary",    &g_jit_sync_boundary_call,
-          "READS ZERO TODAY - flagged by this check on its first run and "
-          "NOT yet explained (task #114). CLAUDE.md claims the sync-call "
-          "test execution-proves it, so either that shape stopped "
-          "reaching the chunk-less-callee boundary or the claim was "
-          "always wrong. Exempted to keep the suite green, tracked so "
-          "it is not silently dropped" },
+          "a live SAFETY NET with no constructible trigger (#114, "
+          "investigated 2026-08-05). It needs a CHUNK-LESS callee, and "
+          "since the no-fail codegen the only chunk-less function is a "
+          "template BASE - which is marked exactly when every call to it "
+          "was redirected to an instance. Both residual routes were "
+          "built (a D4 >64-instance overflow; an uninstantiable direct "
+          "call) and both TREE-WALK instead of reaching an emitted sync "
+          "site. Keep it: #56 deleted the interpreted originals, so "
+          "there is no re-run to decline to. The old note here claimed "
+          "CLAUDE.md execution-proved it - that claim was wrong and is "
+          "now corrected there" },
         { "rethrow_native",   &g_jit_rethrow_native,   nullptr },
         { "end_finally",      &g_jit_end_finally_reraise, nullptr },
         { "container_calls",  &g_jit_container_calls,
-          "the model-flip M3 CONTAINER, which M4b measured as marginal "
-          "and left gated off for small bodies - so it plausibly cannot "
-          "fire in-suite at all. Same task #114: confirm dead-by-design "
-          "vs regressed, then either delete the tier or cover it" },
+          "DEAD BY DESIGN and already documented - see the retirement "
+          "note in jit_container above (2026-07-25): once the dyn-callee "
+          "pair was nativized, no op remained that op_is_simple_island "
+          "admits but op_run_eligible rejects, so jit_try_container can "
+          "no longer form a container from real code and those shapes "
+          "compile fully native. The tier stays for future "
+          "un-nativizable ops; M2's vm_exec_block keeps its own "
+          "synthetic self-test" },
         { "sync_switch",      &g_jit_sync_switch,
           "needs the depth cap, which the sanitized lanes set to 32 and "
           "the cap-gated test then skips" },

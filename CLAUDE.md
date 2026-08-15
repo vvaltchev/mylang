@@ -981,8 +981,24 @@ op_never_exits); post-call entry STUBS now materialize INSIDE deleted
 spans (the only pcs there - the entries/dual-remap/rebuild
 generalization), so a call loop's chunk is enter.nat + stub enter.nats
 and `call.v` is GONE from -vd (the pin updated). Execution-proven:
-g_jit_sync_switch (the cap-4 mutual-recursion + deep-throw test) +
-g_jit_sync_boundary_call. Corpus: 41 -> **27 kept runs**; call benches
+g_jit_sync_switch (the cap-4 mutual-recursion + deep-throw test).
+**THE BOUNDARY CALL IS NOT EXECUTION-PROVEN, and this line used to claim
+it was (corrected 2026-08-05, task #114).** `g_jit_sync_boundary_call`
+reads ZERO after the whole suite. Its only trigger is a CHUNK-LESS
+callee, and since the no-fail codegen the ONLY chunk-less function is a
+template BASE (`is_template_base`) - which the inferencer sets exactly
+when the base is NEVER value-used, i.e. when every call to it was
+redirected to an instance. The two residual routes the inferencer's own
+comment names were both BUILT and neither reaches the emitted sync site:
+a D4 overflow (70 struct signatures - the ">64 instantiations" warning
+fires, the base runs, the counter stays 0) and an uninstantiable direct
+call (a dyn arg, a bottom-element `[]` - both instantiated after all).
+Those calls tree-walk, as that comment says, rather than arriving at a
+JIT'd call site. So the helper is a live SAFETY NET with no constructible
+in-suite trigger - and it must stay: since #56 deleted the interpreted
+originals there is no re-run to decline to, so a chunk-less callee
+reaching an emitted site with this gone would be a crash, not a
+slowdown. Corpus: 41 -> **27 kept runs**; call benches
 Ir -0.0-0.4%. Remaining: Catch/Reraise/Throw (12), StructFieldAddInt
 (5), MultiUnpackV (3), LoadMemberInt/Float guard-miss carets (3),
 JumpUnlessElemInt (3), MapFilterV (2), the inline-raise guard (5).
