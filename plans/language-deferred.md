@@ -59,24 +59,6 @@ detail, so these sketches are the only written record
   not mention it, so it vanishes entirely if the archived plan is not
   read.
 
-## Empty structs — the code and the docs disagree TODAY
-
-`struct Unit {}` is **accepted**: it compiles, constructs, prints
-`Unit()` and compares equal (verified 2026-08-13). But
-`plans/archived/structs.md` says it is "rejected at decl time with a
-clear message", CLAUDE.md lists "empty structs" as deferred, README.md
-does not mention them, and there are ZERO tests.
-
-Cause: the field loop is `while (!pAcceptOp(c, Op::braceR))`, so an
-empty body yields a zero-field descriptor and `compute_layout` returns
-early with `layout = boxed, size = 0`.
-
-Decide: **allow and document** (README + tests pinning construction,
-equality, hash, printing — and check what a flat `array<Unit>` of
-zero-stride elements does before blessing it), or **reject** at decl
-time as the plan always intended, with the refusal test. Tracked as
-task #86.
-
 ## `ordered_dict` as a new insertion-ordered type
 
 From `plans/archived/hash-and-dict.md`, filed under "Deferred /

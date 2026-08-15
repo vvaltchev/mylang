@@ -13562,6 +13562,46 @@ static const std::vector<test> tests =
         "assert(intptr(p) == intptr(q));",
         "var r = clone(p); assert(intptr(p) != intptr(r));" } },
 
+    /* ------------------------- FIELD-LESS structs ----------------------
+     * These pin behaviour that SHIPPED WITH STRUCTS but was documented as
+     * "rejected at decl time" and never tested, so all three doc sources
+     * disagreed with the code until 2026-08-13. Settled as
+     * allow-and-document; see README *Structs*.                          */
+    { "struct: a field-less struct constructs, prints and self-compares",
+      { "struct Unit {} var a = Unit(); var b = Unit();",
+        "assert(str(a) == \"Unit()\");",
+        /* no state to differ by, so any two instances are equal */
+        "assert((a == b) == true); assert((a != b) == false);",
+        "assert(typestr(a) == \"Unit\"); assert(kindstr(a) == \"struct\");" } },
+    { "struct: a struct with only const members is field-less too",
+      { "struct Marker { const TAG = 7; }",
+        "assert(Marker.TAG == 7); assert(str(Marker()) == \"Marker()\");",
+        "assert(Marker() == Marker());" } },
+    /* THE load-bearing one: compute_layout returns EARLY for zero fields
+     * with layout = boxed, size = 0. If it ever made a field-less struct
+     * POD instead, the flat-struct array path would run at stride 0. */
+    { "struct: a field-less struct is boxed, so its array is general",
+      { "struct Unit {} var a = [Unit(), Unit(), Unit()];",
+        "assert(array_storage(a) == \"general\");",
+        "assert(len(a) == 3); append(a, Unit()); assert(len(a) == 4);",
+        "assert(a[3] == Unit());" } },
+    { "struct: a field-less struct hashes and works as a dict key",
+      { "struct Unit {} var d = {}; d[Unit()] = \"hi\";",
+        "assert(hash(Unit()) == hash(Unit()));",
+        "assert(d[Unit()] == \"hi\");" } },
+    { "struct: a field-less struct is a payload-less exception type",
+      { "struct Timeout {} var hit = 0;",
+        "try { throw Timeout(); } catch (Timeout) { hit = 1; }",
+        "assert(hit == 1);" } },
+    { "struct: a field-less struct zero-inits and clones",
+      { "struct Unit {} Unit u; assert(u == Unit());",
+        "var p = Unit(); assert(clone(p) == p);",
+        "assert(deepclone(p) == p);",
+        "const K = Unit(); assert(K == Unit());" } },
+    { "struct: reading a field on a field-less struct is an error",
+      { "struct Unit {} var u = Unit(); var z = u.x;" },
+      &typeid(TypeMismatchEx) },
+
     /* --------------- explicit type annotations on declarations --------- */
     { "types: scalar annotations declare and check",
       { "int x = 32; float f = 1.5; str s = \"hi\"; bool b = true;",

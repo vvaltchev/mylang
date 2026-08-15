@@ -3711,8 +3711,26 @@ but the per-element `StructObject` allocation is gone (build overhead
   deep). `==`
   is structural between same-`def` instances (`TypeStruct::eq`); `hash`
   combines the field hashes (see *Universal `hash()`* above), so a struct can be
-  a dict key. **Deferred** (plans/archived/structs.md): `var` fields (call-site
-  field inference), `opt` scalar fields, methods, and empty structs.
+  a dict key. **Deferred** (plans/language-deferred.md): `var` fields
+  (call-site field inference), `opt` scalar fields, methods, and struct
+  SUBTYPING (`assignable` accepts equal struct types only).
+- **A FIELD-LESS struct is SUPPORTED, not deferred** (settled 2026-08-13 —
+  the docs had said "rejected at decl time" while the parser accepted it,
+  untested, since the feature shipped). `struct Unit {}` — and a struct
+  declaring only `const` members, since consts are type-level — parses to a
+  zero-field descriptor, and `compute_layout` returns EARLY with
+  `layout = boxed, size = 0`. That early return is the load-bearing part:
+  a field-less struct is never POD, so an `array` of it is a general array
+  and **the flat-struct path's stride is never 0**. WATCHED FAILING —
+  making a zero-field struct `Layout::pod` (which the archived plan
+  proposed as "size 0, trivially POD") does not merely change
+  `array_storage`, it is **undefined behaviour**: UBSan reports "null
+  pointer passed as argument 1, which is declared to never be null" at
+  eval.cpp's flat-struct copy. Construction,
+  equality (always true within a type), `hash`, dict-key use, `clone`/
+  `deepclone`, `Unit u;` zero-init, `throw`/`catch` and `.myv` round-trip
+  all work and are pinned by the `struct:` empty-struct tests. The useful
+  case is a payload-less exception marker type.
 
 ## Error model
 
