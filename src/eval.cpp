@@ -3910,6 +3910,82 @@ float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
     return v;
 }
 
+/*
+ * G4: the CHECKED `a[i].f` scalar read - the SUBSCRIPT form of
+ * LoadStructFieldInt/Float.
+ *
+ * The foreach form above is unchecked because its gate proved both facts it
+ * needs: flat-struct storage, and an in-range loop counter. A SUBSCRIPT base
+ * proves NEITHER - a flat array<PodStruct> AUTO-PROMOTES to general storage
+ * on any cold op (insert/sort/map, via get_vec()), and the index is
+ * arbitrary - so this does the negative-index wrap and the bounds check
+ * itself and serves BOTH storages.
+ *
+ * The element is a POD struct either way (the codegen gate requires it), so
+ * the general arm reads the same FIELD INDEX out of the boxed StructObject.
+ * OutOfBoundsEx is thrown LOC-LESS: the interpreter stamps it from the loc
+ * side table and the JIT re-raises it through EnterNative, so both engines
+ * report the op's own caret (the SUBSCRIPT's span - see task #125).
+ */
+template <class T>
+static T vm_struct_elem_field(const EvalValue &arrv, int_type idx,
+                              int_type fidx)
+{
+    const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+
+    if (idx < 0)
+        idx += static_cast<int_type>(arr.size());
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+        throw OutOfBoundsEx();
+
+    if (arr.skind() == SharedArrayObj::Storage::structs) {
+        const auto &sv = arr.flat_structs();
+        const FieldDef &f = sv.def->fields[fidx];
+        const char *p = sv.buf.data()
+            + (arr.offset() + static_cast<size_type>(idx)) * sv.stride
+            + f.offset;
+        if (f.kind == FieldKind::f_bool)
+            return static_cast<T>(static_cast<unsigned char>(*p) != 0 ? 1 : 0);
+        if (f.kind == FieldKind::f_float) {
+            float_type v;
+            std::memcpy(&v, p, sizeof v);
+            return static_cast<T>(v);
+        }
+        int_type v;
+        std::memcpy(&v, p, sizeof v);
+        return static_cast<T>(v);
+    }
+
+    /* PROMOTED (or built) general: a boxed StructObject per element. The
+     * same FIELD INDEX applies - the element is a POD struct either way -
+     * and pod_get hands back the field's own kind, so one arm per kind
+     * covers int / float / bool for BOTH the int and float readers (an
+     * int field feeding a float read is try_member_scalar's promoting
+     * form). */
+    const EvalValue &ev =
+        arr.get_vec()[arr.offset() + static_cast<size_type>(idx)].get();
+    const EvalValue fv =
+        ev.get_ref<intrusive_ptr<StructObject>>()->pod_get(
+            static_cast<int>(fidx));
+    if (fv.is<float_type>())
+        return static_cast<T>(fv.get<float_type>());
+    if (fv.is<int_type>())
+        return static_cast<T>(fv.get<int_type>());
+    return static_cast<T>(fv.get_type()->is_true(fv) ? 1 : 0);   /* bool */
+}
+
+int_type vm_struct_elem_field_int(const EvalValue &arrv, int_type idx,
+                                  int_type fidx)
+{
+    return vm_struct_elem_field<int_type>(arrv, idx, fidx);
+}
+
+float_type vm_struct_elem_field_float(const EvalValue &arrv, int_type idx,
+                                      int_type fidx)
+{
+    return vm_struct_elem_field<float_type>(arrv, idx, fidx);
+}
+
 /* Materialize element `idx` of a flat array<PodStruct> as a FRESH StructObject
  * (the VM's LoadStructElemV - the whole-`p` foreach bind). Byte-identical to the
  * tree-walker's reused-object bind (its COW guard only avoids overwriting a

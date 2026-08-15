@@ -3811,6 +3811,37 @@ extern "C" void jit_load_str_char(int_type dst, int_type base,
     f->at(dst).put(EvalValue(SharedStr(std::string(&view[idx], 1))));
 }
 
+/*
+ * G4: the CHECKED `a[i].f` helper - the subscript form. Returns non-zero when
+ * it raised, conveying a LOC-LESS OutOfBoundsEx exactly as jit_load_elem_value
+ * does, so EnterNative re-raises it with this op's caret from the loc side
+ * table (the SUBSCRIPT's span).
+ */
+extern "C" int jit_load_struct_elem_field(int_type dst, int_type base,
+                                          int_type idx, int_type fidx,
+                                          int is_float) noexcept
+{
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(is_float ? OpCode::LoadStructFieldFloat
+                                              : OpCode::LoadStructFieldInt)]++;
+    g_jit_sfield_checked++;
+#endif
+    Frame *f = g_current_ctx->frame;
+    try {
+        const EvalValue &av = f->at(base).get();
+        if (is_float)
+            write_float_slot(g_current_ctx, dst,
+                             vm_struct_elem_field_float(av, idx, fidx));
+        else
+            write_int_slot(g_current_ctx, dst,
+                           vm_struct_elem_field_int(av, idx, fidx));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(static_cast<RuntimeException *>(e.clone()));
+        return 1;
+    }
+    return 0;
+}
+
 /* LoadStructFieldInt/Float: `pts[i].f` read STRAIGHT from the flat struct-array
  * bytes into a scalar slot (no StructObject) - `is_float` picks the pair. */
 extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
@@ -8556,10 +8587,25 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             /* pts[i].f (scalar int/bool field) read straight from the flat
              * struct-array bytes into a slot - the struct-foreach direct read,
              * no StructObject. target2 = the array slot, a = the counter, b =
-             * the field index. */
-            write_int_slot(&ctx, in->target,
-                vm_struct_field_int(ctx.frame->at(in->target2).get(),
-                                    read_int_operand(in->a(), &ctx), in->b_lit()));
+             * the field index. `struct_checked` is G4's SUBSCRIPT form: it
+             * wraps a negative index, bounds-checks (OutOfBoundsEx, stamped
+             * with this op's caret) and also serves a PROMOTED general array. */
+            if (in->struct_checked()) {
+                try {
+                    write_int_slot(&ctx, in->target,
+                        vm_struct_elem_field_int(
+                            ctx.frame->at(in->target2).get(),
+                            read_int_operand(in->a(), &ctx), in->b_lit()));
+                } catch (Exception &e) {
+                    vm_stamp_loc(*chunk, pc, e);
+                    throw;
+                }
+            } else {
+                write_int_slot(&ctx, in->target,
+                    vm_struct_field_int(ctx.frame->at(in->target2).get(),
+                                        read_int_operand(in->a(), &ctx),
+                                        in->b_lit()));
+            }
             pc++;
             VM_NEXT;
 
@@ -8574,10 +8620,22 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             VM_NEXT;
 
         VM_CASE(LoadStructFieldFloat):
-            write_float_slot(&ctx, in->target,
-                vm_struct_field_float(ctx.frame->at(in->target2).get(),
-                                      read_int_operand(in->a(), &ctx),
-                                      in->b_lit()));
+            if (in->struct_checked()) {         /* G4: the subscript form */
+                try {
+                    write_float_slot(&ctx, in->target,
+                        vm_struct_elem_field_float(
+                            ctx.frame->at(in->target2).get(),
+                            read_int_operand(in->a(), &ctx), in->b_lit()));
+                } catch (Exception &e) {
+                    vm_stamp_loc(*chunk, pc, e);
+                    throw;
+                }
+            } else {
+                write_float_slot(&ctx, in->target,
+                    vm_struct_field_float(ctx.frame->at(in->target2).get(),
+                                          read_int_operand(in->a(), &ctx),
+                                          in->b_lit()));
+            }
             pc++;
             VM_NEXT;
 

@@ -685,6 +685,63 @@ static const std::vector<test> tests =
      * array element and even clone() saw a later `+=`. Python is the
      * oracle for each.
      */
+    /*
+     * G4: the CHECKED `a[i].f` read - the SUBSCRIPT form of the flat
+     * struct-field load. try_sfe_field covered a struct-FOREACH loop var and
+     * try_member_scalar a plain local struct; a subscript base fell to a
+     * boxed subscript (materialising a StructObject per read) plus a boxed
+     * member read. Unlike the foreach form it must wrap a negative index,
+     * bounds-check, and still serve a PROMOTED general array.
+     */
+    { "struct elem field: flat / negative index / float + bool fields",
+      { "struct P { int x; float w; bool b; }",
+        "func g(int i) {",
+        "  var a = [P(1, 1.5, true), P(2, 2.5, false)];",
+        "  var s = 0; var f = 0.0;",
+        "  s += a[i].x; f += a[i].w; s += int(a[i].b);",
+        "  return s * 100 + int(f * 10); }",
+        "assert(g(0) == 215);",
+        "assert(g(1) == 225);",
+        "assert(g(-1) == 225);" } },
+    /* PROMOTED: sort() takes the array through get_vec(), so the storage is
+     * general afterwards and the elements are boxed StructObjects - the
+     * checked read must serve that too, not just the flat bytes. */
+    { "struct elem field: a PROMOTED (general) array still reads right",
+      { "struct P { int x; }",
+        "func h() {",
+        "  var a = [P(2), P(1)];",
+        "  sort(a, pure func(p, q) => p.x > q.x);",
+        "  var s = 0; s += a[0].x; return s; }",
+        "assert(h() == 2);" } },
+    { "struct elem field: a SLICE base indexes within its own window",
+      { "struct P { int x; }",
+        "func sl() {",
+        "  var a = [P(1), P(2), P(3)]; var v = a[1:3];",
+        "  var s = 0; s += v[1].x; return s; }",
+        "assert(sl() == 3);" } },
+    { "struct elem field: an out-of-range index throws",
+      { "struct P { int x; int y; }",
+        "func f(int i) {",
+        "  var a = [P(1,2), P(3,4)]; var s = 0; s += a[i].y; return s; }",
+        "assert(f(1) == 4);",
+        "f(9);" }, &typeid(OutOfBoundsEx) },
+    /*
+     * THE FUSION MUST NOT EAT IT. #9 F-C fuses `LoadStructFieldInt t;
+     * IntBin(+) dst = other + t` into StructFieldAddInt - sound ONLY because
+     * the foreach form cannot fault (it even drops the caret). The CHECKED
+     * form can raise, and StructFieldAddInt's helper is the UNCHECKED
+     * reader, so fusing it read past the buffer: ASan reported a
+     * heap-buffer-overflow on exactly this shape the first time the gate let
+     * it through. Two reads in one add is what builds the fusable pair.
+     */
+    { "struct elem field: the no-fault ADD fusion refuses the checked form",
+      { "struct P { int x; int y; }",
+        "func f(int i, int j) {",
+        "  var a = [P(1,2), P(3,4)]; var s = 0;",
+        "  s += a[i].x + a[j].y; return s; }",
+        "assert(f(0, 1) == 5);",
+        "f(0, 9);" }, &typeid(OutOfBoundsEx) },
+
     { "string window: a plain alias does not see a later +=",
       { "var a = \"hi\"; var b = a;",
         "a += \"!\";",
