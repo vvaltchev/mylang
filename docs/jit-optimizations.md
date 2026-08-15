@@ -3808,3 +3808,59 @@ what defeats the two shape-eaters `jit_norec_shadow` documents).
 
 STILL OPEN from the plan's testing arc: Net 3 (exhaustive small-scope
 enumeration) and Net 4 (the GCOV coverage gate).
+
+---
+
+## NET 3 - EXHAUSTIVE SMALL-SCOPE ENUMERATION (2026-08-13)
+
+The second of the no-record tier's unbuilt nets. NOT a fuzzer:
+`tests/norec_enum.py` emits EVERY program in a bounded shape space and
+runs each through four engine configurations, comparing stdout, stderr
+and exit status BYTE-FOR-BYTE.
+
+    depth        1..4 chained functions
+    frame kind   per level: plain / try / try-finally / dict-iter
+    terminal     return int / return float / throw
+    catch level  for a throw: caught at level j, for every j, or not
+
+2272 programs, 9088 engine runs, ~1.3 min. RULE 2 is the spec, and an
+uncaught throw's rendered BACKTRACE is the hard consumer: it is built
+from the frames the tier reconstructs.
+
+TWO AXES SUBSTITUTED, recorded rather than silently dropped (the plan's
+axis list is closed to removals). "cached-call" as a frame kind is
+unreachable: a frame gets a cache key only when its callee is a pure
+tree-recursive function, which cannot also be a link in an impure
+chain. And no builtin captures a backtrace without throwing, so
+CAPTURE is covered by every throw variant (frames are recorded as the
+exception unwinds, caught or not) and RENDERING by the uncaught ones.
+
+TIER REACH is sampled and printed, so a space that never engages the
+tier reports that instead of a green zero (12 of 25 sampled at depth 4).
+
+IT FOUND TWO REAL BUGS ON ITS FIRST RUN, neither caught by `-rt` or
+`corpus_diff`:
+
+1. **The mixed-kind ret audit abort.** A plain -> try -> plain ->
+   dict-iter chain aborted `jit_ret_audit`, which read
+   `act.back_rec()` as the returning frame's record - an ANCESTOR once
+   record-less frames interleave. Correct in every engine, but
+   VM_HARDENING is ON in CI's RELEASE lanes. Fixed separately.
+2. **The catch-bind `ref_slots` gap** - the more serious one, and a
+   direct consequence of #78 step D. `compute_ref_slots` derives its
+   list from instruction write-dsts; deleting the interpreted
+   `CatchTest` chain moved the catch binding into the RAISE PATH, so
+   the slot `catch (T as e)` binds a STRUCT INSTANCE into is written
+   by no opcode and never entered the list. `pop_window`'s release
+   scan skipped it and the hardened re-scan aborted. Only the
+   caller-catches-a-callee's-throw spelling trips it, which is why no
+   corpus program ever had. Fixed by feeding `handler_sites`' bind
+   slots into `compute_ref_slots`.
+
+SABOTAGE, watched: with the `ref_slots` fix removed, `-rt` exits 0 and
+`corpus_diff` exits 0 while the enumeration fails 16 of 96 at depth 2.
+`tests/functional/11_catch_bind_release.my` was then added so
+corpus_diff catches it too (sabotaged: exit 1, 17/18) - a cheap pin for
+a shape that took an exhaustive search to find.
+
+STILL OPEN from the plan's testing arc: Net 4, the GCOV coverage gate.
