@@ -3742,3 +3742,69 @@ AND arg_inplace_shapes' int-local decline; removing the cold-arm
 materialisation fails the ref-arg bind test and then ABORTS the suite,
 and the cold shape alone gives InternalErrorEx; removing the named-local
 gate fails NOTHING (recorded as defensive).
+
+---
+
+## NET 2 - the DETERMINISTIC EVENT SWEEP for the no-record tier (2026-08-13)
+
+Not an optimization: a TEST NET for one that already shipped. The G1
+no-record tier (default-ON since 291c2fc) does not write a `VmCallRec`
+for a call it can REBUILD later, and the rebuild runs only on the rare
+paths that ask - an unwind step, a backtrace frame. So its correctness
+was exercised wherever a corpus happens to throw, and nowhere else.
+
+`MYLANG_RECON_AT=N` (or `g_norec_recon_at` from a test) forces
+`norec_recon_probe` at the Nth CALL EVENT - every emitted M5b push is
+one - and the driver `tests/norec_sweep.py` walks N over a program's
+whole event count, one process per N. SQLite's fail-the-Nth-malloc,
+applied to frame reconstruction.
+
+WHAT THE PROBE CHECKS, and why it is not a duplicate of Nets 1/1b.
+Those verify chain INTEGRITY (site association, anchor links, the
+descriptor and window chains) at every push. The probe rebuilds, from
+hardware + baked constants only, the values the record-less unwind
+INSTALLS, and adds three things they do not have:
+ - the CUMULATIVE slot-stack arithmetic: each frame's
+   `seg_top_before + nslots` must land exactly on the next frame down's
+   `seg_top_before`, the topmost on the live `seg->top`;
+ - `nslots` against the CHUNK totals - the derivation the record-less
+   un-accounting uses instead of reading the record;
+ - a chain walk in the PRODUCTION configuration. Net 1's walk is gated
+   `!jit_norec_on()`, so in the shipping mode nothing traverses the
+   chain at all; the probe does (termination, site resolution, RA
+   agreement, ascending links), which is the half that can be asserted
+   without a record to read.
+
+Two modes: `MYLANG_JIT_OFF=norec` keeps records, so the rebuild is
+compared field-for-field (the oracle); the default is record-less and
+walks the real mixed chain. The probe is READ-ONLY - the sweep compares
+every run's stdout and exit code against a probe-free baseline, so a
+probe that PERTURBS a program fails even when nothing mismatches.
+
+SABOTAGE, watched failing: corrupt the emitted push's `seg_top_before`
+store by one (`add r11,1` around the store in the record fill). `-rt`
+stays GREEN at 1907/1907, `corpus_diff` green at 15/15, and the program
+prints the right answer - the slot stack merely leaks one slot per call.
+The sweep fails at N=1: "live seg->top != top record's seg_top_before +
+nslots". That is the whole argument for the net: the existing tree does
+not look.
+
+TWO VACUITY TRAPS, both hit while writing it and both now guarded. The
+walk was first driven by the RECORD COUNT, which made it walk zero
+frames in production (where most frames have no record) - the mode that
+ships was silently uncovered, visible only as "0 frames, production" in
+the report; it is driven by the native chain now. And the in-suite seed
+first reported "0 probes fired", because the event counter is
+process-global and -rt has already made thousands of calls by the time
+that entry runs - it rebases per run. The seed asserts FRAMES walked,
+not just probes fired, for the same reason.
+
+Measured: 1212 forced reconstructions over the default corpus
+(tests/functional + samples) in ~5.5 min, debug+ASan. Corpus reach is
+5 of 19 programs - most functional tests make no emitted sync calls -
+so `tests/functional/09_norec_deep_calls.my` was added to give the sweep
+a TALL chain (175 call events; mutual recursion inside a loop, which is
+what defeats the two shape-eaters `jit_norec_shadow` documents).
+
+STILL OPEN from the plan's testing arc: Net 3 (exhaustive small-scope
+enumeration) and Net 4 (the GCOV coverage gate).

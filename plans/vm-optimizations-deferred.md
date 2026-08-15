@@ -243,13 +243,28 @@ as a problem".
 
 ## Testing
 
-- **The G1 no-record tier's three unbuilt nets** - tracked as task #85,
-  designs in `archived/g1-no-record-tier.md`: Net 2 (the deterministic
-  `MYLANG_RECON_AT=N` event sweep), Net 3 (the exhaustive small-scope
-  enumeration generator, whose axis list is OPEN to additions and
-  CLOSED to removals), Net 4 (the GCOV coverage gate over the new
-  walk/reconstruction code). **The tier is DEFAULT-ON**, which is what
-  makes these worth carrying.
+- **The G1 no-record tier's unbuilt nets** - task #85, designs in
+  `archived/g1-no-record-tier.md`. **The tier is DEFAULT-ON**, which is
+  what makes these worth carrying.
+  - **Net 2 - DONE (2026-08-13)**: `MYLANG_RECON_AT=N` +
+    `tests/norec_sweep.py`, with an in-suite seed. Sabotage-verified -
+    a one-off `seg_top_before` leaves `-rt` and `corpus_diff` green
+    and only the sweep fails.
+  - **Net 3 - OPEN**: the exhaustive small-scope enumeration generator
+    (per level, depth <= 4, frame kind x terminal x where-caught;
+    uncaught programs compared BYTE-FOR-BYTE on stderr across tw /
+    vm-nojit / jit / jit+shadow). Its axis list is OPEN to additions
+    and CLOSED to removals, and three cases the depth bound does not
+    cover must be enumerated explicitly: a call exactly at a
+    `SEG_SLOTS` boundary, recursion deep enough to grow the native
+    stack, and a reconstruction spanning both. Two entries in the
+    plan's own sabotage matrix name Net 3 as their only catcher
+    ("interleave ignores the SP bound", "caller_captures pop skipped").
+  - **Net 4 - OPEN**: the GCOV coverage gate. The lane exists
+    (`-DGCOV=ON`); the gate script does not. 100% line + branch over
+    the walk/reconstruction code only, an uncovered branch either
+    covered or listed with a written reason, never silently exempt.
+    The plan sequenced this to GATE the step that shipped.
 - **A `.myv` agreement lane** (`archived/myv-serializer.md`, S5's
   fourth lane, never built): `nested_fuzz.py --myv` (compile -> file ->
   load -> run as a fourth agreement engine) plus a CI round-trip step.

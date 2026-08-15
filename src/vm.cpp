@@ -8336,6 +8336,40 @@ unsigned long g_jit_norec_audit_frames = 0;
 unsigned long g_jit_norec_ret_verify = 0;
 bool g_norec_audit = false;
 
+/*
+ * NET 2 - THE DETERMINISTIC EVENT SWEEP (`MYLANG_RECON_AT=N`;
+ * plans/archived/g1-no-record-tier.md "Net 2", SQLite's
+ * fail-the-Nth-malloc applied to reconstruction).
+ *
+ * WHY THIS EXISTS WHEN NETS 1/1b ALREADY WALK THE CHAIN. Those two
+ * verify chain INTEGRITY - that each frame's site resolves and its
+ * anchor matches the link. They say nothing about the ARITHMETIC the
+ * record-less unwind performs: the production path
+ * (vm_raise's `norec_raiser` arm) un-accounts `act.used` and the
+ * segment top by the frame's own totals and repoints the view at the
+ * parent using values it derives from hardware. A frame whose
+ * `seg_top_before` disagrees with that derivation unwinds to a WRONG
+ * slot-stack top, and nothing in Nets 1/1b looks. The sabotage matrix
+ * names exactly that defect ("wrong seg_top_before restore") with this
+ * net as its only catcher.
+ *
+ * WHAT IT FORCES. Reconstruction is normally demanded only where an
+ * exception happens to fall. `MYLANG_RECON_AT=N` demands it at the Nth
+ * CALL EVENT instead - one deterministic point per run - and the sweep
+ * driver (tests/norec_sweep.py) walks N over a program's whole event
+ * count, so every point at which reconstruction COULD be demanded gets
+ * exercised, not just the points a corpus happens to reach.
+ *
+ * The probe is READ-ONLY: it reconstructs and compares, then lets the
+ * program continue untouched. It cannot use the real unwind, which
+ * would need an exception in flight and would end the run at the first
+ * event.
+ */
+unsigned long g_norec_recon_at = 0;      /* 0 = off, else the 1-based event */
+unsigned long g_norec_events = 0;        /* call events seen this run */
+unsigned long g_jit_norec_recon_probes = 0;
+unsigned long g_jit_norec_recon_frames = 0;
+
 #ifdef TESTS
 static void norec_check_rec(const VmCallRec &rec, const NorecSite *ns)
 {
@@ -8614,6 +8648,165 @@ static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
     g_jit_norec_mat_frames += levels;
 }
 
+/*
+ * NET 2's PROBE - "if the record-less unwind started HERE, would it
+ * reconstruct what the records say?"
+ *
+ * Walks the topmost native segment from `fp0` (the caller fragment's
+ * frame pointer at a push event, the same anchor norec_walk_chain
+ * uses) and, per frame, rebuilds from HARDWARE + BAKED CONSTANTS only:
+ *
+ *   the site        S = jit_norec_site_for([fp+8])
+ *   the parent view window [fp-8], nslots S->caller totals
+ *   the frame total slot_count + n_temps of its own chunk
+ *
+ * and compares each against the live record. The SLOT-STACK ARITHMETIC
+ * is the part no other net checks, and it is checked CUMULATIVELY:
+ * `seg_top_before + nslots` of each frame must land exactly on the next
+ * frame down's `seg_top_before`, with the topmost landing on the live
+ * `seg->top`. A single frame with a wrong `seg_top_before` breaks the
+ * chain of equalities wherever it sits - which is the defect the
+ * sabotage matrix assigns to this net.
+ *
+ * Record comparison needs records, so it runs in SHADOW mode (the
+ * `norec` lever off). In the production mixed world the positional
+ * record<->frame pairing does not hold - record-less frames interleave
+ * - so there the probe still walks and validates the record-FREE half
+ * (termination, site resolution, RA agreement, anchor links), which is
+ * what the walk can honestly assert without a record to read.
+ */
+static void norec_recon_probe(VmActivation *act, const char *fp0,
+                              const void *ns, bool report)
+{
+    const bool shadow = !jit_norec_on();
+    const char *fp = fp0;
+    /* the frame at fp0 is the CALLER of the just-pushed callee, so its
+     * record is records[rec_n-2] - norec_walk_chain's correspondence */
+    size_t idx = act->rec_n ? act->rec_n - 1 : 0;
+    size_t levels = 0;
+    bool hit_floor = false;
+
+    /* seeded from the live segment top: the CALLEE just pushed is the
+     * top of the slot stack, so the first equality we can demand is on
+     * that record, then one per frame down. */
+    int_type expect_top = -1;
+    if (shadow && act->rec_n) {
+        const VmCallRec &callee = act->back_rec();
+        if (callee.seg >= 0
+                && static_cast<size_t>(callee.seg) < act->segs.size()) {
+            const VmStackSeg &sg =
+                *act->segs[static_cast<size_t>(callee.seg)];
+            if (static_cast<int_type>(sg.top)
+                    != callee.seg_top_before + callee.nslots)
+                norec_fail("recon: live seg->top != top record's "
+                           "seg_top_before + nslots",
+                           reinterpret_cast<const void *>(sg.top),
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(
+                                   callee.seg_top_before
+                                   + callee.nslots)));
+            expect_top = callee.seg_top_before;
+        }
+    }
+
+    /*
+     * Driven by the NATIVE CHAIN, not by the record count: in the
+     * production world most frames have no record, so a loop keyed on
+     * `idx` would walk zero frames there and the probe would be
+     * silently vacuous in exactly the mode that ships. (It was, on the
+     * first run - the "0 frames, production" line is what showed it.)
+     * `idx` only gates the record-comparing half.
+     */
+    for (int guard = 0; ; guard++) {
+        if (guard > 100000)
+            norec_fail("recon probe walk did not terminate", fp, ns);
+        if (shadow && !idx)
+            break;                  /* records exhausted - see below */
+        const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
+        if (!jit_norec_frag_for(ra)) {
+            hit_floor = true;         /* the segment floor - see the walk */
+            break;
+        }
+        const NorecSite *S = jit_norec_site_for(ra);
+        if (!S)
+            norec_fail("recon: emitted RA with no site", ra, ns);
+        if (ra != S->ret_plain && ra != S->ret_switched)
+            norec_fail("recon: RA is not the site's", ra, S);
+        if (!S->caller)
+            norec_fail("recon: site with no caller chunk", ra, S);
+        const char *link = *reinterpret_cast<const char *const *>(fp);
+        if (link <= fp)
+            norec_fail("recon: chain link does not ascend", link, fp);
+
+        if (shadow) {
+            const VmCallRec &R = act->records[idx - 1];
+            /* R.native_rbp is R's CALLER's rbp - the NEXT link up, i.e.
+             * [fp], not fp itself (fp is R's own frame pointer). Same
+             * rule as norec_walk_chain; getting it wrong is the first
+             * thing this probe caught, on its own author. */
+            if (R.native_rbp != link)
+                norec_fail("recon: record anchor != the chain link",
+                           link, R.native_rbp);
+            /* the parent view, rebuilt from hardware + the site */
+            const void *pw =
+                *reinterpret_cast<const void *const *>(fp - 8);
+            if (static_cast<const void *>(R.parent_window) != pw)
+                norec_fail("recon: rebuilt parent window != record's",
+                           pw, R.parent_window);
+            const int32_t pn =
+                static_cast<int32_t>(S->caller->slot_count)
+                + static_cast<int32_t>(S->caller->n_temps);
+            if (R.parent_nslots != pn)
+                norec_fail("recon: rebuilt parent nslots != record's",
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(pn)),
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(R.parent_nslots)));
+            /* the frame's OWN total, derived from its chunk the way the
+             * record-less un-accounting derives it */
+            if (R.run_chunk) {
+                const int_type total =
+                    static_cast<int_type>(R.run_chunk->slot_count)
+                    + R.run_chunk->n_temps;
+                if (R.nslots != total)
+                    norec_fail("recon: chunk totals != record nslots",
+                               reinterpret_cast<const void *>(
+                                   static_cast<intptr_t>(total)),
+                               reinterpret_cast<const void *>(
+                                   static_cast<intptr_t>(R.nslots)));
+            }
+            /* THE CUMULATIVE SLOT-STACK EQUALITY (the seg_top_before
+             * net): un-accounting the frame above must land here. */
+            if (expect_top >= 0) {
+                if (R.seg_top_before + R.nslots != expect_top)
+                    norec_fail("recon: seg_top_before + nslots != the "
+                               "frame above's seg_top_before",
+                               reinterpret_cast<const void *>(
+                                   static_cast<intptr_t>(
+                                       R.seg_top_before + R.nslots)),
+                               reinterpret_cast<const void *>(
+                                   static_cast<intptr_t>(expect_top)));
+                expect_top = R.seg_top_before;
+            }
+            idx--;
+        }
+        fp = link;
+        levels++;
+    }
+    if (shadow && !hit_floor && idx)
+        norec_fail("recon: records exhausted before the segment floor",
+                   fp, ns);
+    g_jit_norec_recon_probes++;
+    g_jit_norec_recon_frames += static_cast<unsigned long>(levels);
+    /* The sweep driver reads this line to know the event existed; when N
+     * exceeds a run's event count nothing prints and the sweep stops.
+     * Only the ENV-driven form reports - an in-suite test drives the
+     * global and asserts the counters instead, so -rt stays quiet. */
+    if (report)
+        fprintf(stderr, "norec recon probe: event %lu, %zu frames, %s\n",
+                g_norec_events, levels, shadow ? "shadow" : "production");
+}
+
 #endif
 
 /*
@@ -8723,6 +8916,22 @@ extern "C" void jit_norec_push_verify(const void *site,
     VmActivation *act = g_vm_act;
     if (!act || !act->rec_n || !ns)
         norec_fail("no activation/record at a verify", act, ns);
+    /*
+     * NET 2 - every emitted push is a CALL EVENT. Counted HERE, before
+     * the record-less fork returns early below, so event N addresses
+     * the same call in shadow and production mode and the sweep's runs
+     * are comparable across the two.
+     */
+    static const unsigned long env_recon_at = [] {
+        const auto v = env_get("MYLANG_RECON_AT");
+        return v ? std::strtoul(v->c_str(), nullptr, 10) : 0UL;
+    }();
+    const unsigned long recon_at =
+        g_norec_recon_at ? g_norec_recon_at : env_recon_at;
+    g_norec_events++;
+    if (recon_at && g_norec_events == recon_at)
+        norec_recon_probe(act, static_cast<const char *>(rbp), ns,
+                          /*report=*/g_norec_recon_at == 0);
     /* 4-v FORK: a gate-passing push made NO record - the vframe (the
      * callee's window, just repointed by the push) differs from the top
      * record's. Verify exactly that absence plus the gate's own terms,

@@ -1041,6 +1041,21 @@ extern unsigned long g_jit_norec_sites;
 extern unsigned long g_jit_norec_verify;
 extern unsigned long g_jit_norec_audit_frames;
 extern bool g_norec_audit;
+/*
+ * NET 2 - the DETERMINISTIC EVENT SWEEP (`MYLANG_RECON_AT=N`, or
+ * g_norec_recon_at from a test). Forces the reconstruction the
+ * record-less unwind would perform at the Nth CALL EVENT and compares
+ * it against the live records, so reconstruction is exercised at every
+ * point it COULD be demanded rather than only where an exception
+ * happens to fall. The driver is tests/norec_sweep.py.
+ *   norec_events        call events seen so far this run
+ *   norec_recon_probes  probes that actually fired
+ *   norec_recon_frames  frames those probes reconstructed
+ */
+extern unsigned long g_norec_recon_at;
+extern unsigned long g_norec_events;
+extern unsigned long g_jit_norec_recon_probes;
+extern unsigned long g_jit_norec_recon_frames;
 /* ret-address -> site, and address -> owning fragment's chunk. Real
  * implementations live in jit.cpp (the registries are filled when a
  * fragment is placed); the non-JIT build gets null-returning stubs. */

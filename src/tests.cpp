@@ -18937,6 +18937,125 @@ static bool jit_norec_shadow()
 }
 
 /*
+ * NET 2 - THE DETERMINISTIC EVENT SWEEP, in-suite seed.
+ *
+ * The full sweep is tests/norec_sweep.py, which walks N over a
+ * program's whole call-event count, one process per N; that is too many
+ * processes for -rt. This entry is the seed: it forces the probe at a
+ * few events IN PROCESS and asserts it actually reconstructed frames,
+ * so a change that silently stops the probe firing fails the suite
+ * rather than only the (rarely-run) sweep.
+ *
+ * WHY THE PROBE EARNS ITS KEEP - the sabotage, watched failing
+ * (2026-08-13): corrupting the EMITTED push's `seg_top_before` store by
+ * one (add r11,1 around the store in jit.cpp's record fill) leaves
+ * `-rt` GREEN at 1907/1907, corpus_diff green at 15/15, and the program
+ * printing the right answer - while the sweep fails at N=1 with
+ * "live seg->top != top record's seg_top_before + nslots". The slot
+ * stack leaks one slot per call and nothing else in the tree looks.
+ *
+ * The shape is the one jit_norec_shadow documents: MUTUAL recursion (a
+ * direct self-call is sync-emitted only when the native stack is armed,
+ * which this lane is not) inside a LOOP (a first descent is all new
+ * record-stack peaks, and the reuse guard declines every level of it).
+ */
+static bool jit_norec_recon_sweep()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const std::vector<const char *> prog = {
+        "func ev2(int n) {",
+        "  if (n == 0) { return 0; }",
+        "  var r = od2(n - 1);",
+        "  return r + 1;",
+        "}",
+        "func od2(int n) {",
+        "  if (n == 0) { return 0; }",
+        "  var r = ev2(n - 1);",
+        "  return r + 1;",
+        "}",
+        "var t = 0;",
+        "for (var k = 0; k < 4; k++)",
+        "  t += ev2(runtime(24));",
+        "assert(t == 96);" };
+
+    const unsigned long saved_at = g_norec_recon_at;   /* save/restore: a
+                                                        * knob one test
+                                                        * sets must not
+                                                        * leak into the
+                                                        * next */
+    unsigned long probes = 0, frames = 0;
+    bool ok = true;
+    /* Several events, deliberately including a DEEP one (the mutual
+     * recursion is 24 levels, so a late event walks a tall chain - a
+     * probe that only ever saw 1-2 frames would prove nothing). */
+    for (const unsigned long at : { 5UL, 30UL, 60UL, 74UL }) {
+        const unsigned long p0 = g_jit_norec_recon_probes;
+        const unsigned long f0 = g_jit_norec_recon_frames;
+        g_norec_recon_at = at;
+        /* The event counter is process-global - right for the sweep,
+         * where each N is its own process, but by the time -rt reaches
+         * this entry thousands of earlier calls have already gone by,
+         * so an absolute N would never be hit. Rebase per run. (The
+         * first version did not, and reported "0 probes fired".) */
+        g_norec_events = 0;
+        const bool r = run(prog);
+        g_norec_recon_at = saved_at;
+        if (!r) { ok = false; break; }
+        probes += g_jit_norec_recon_probes - p0;
+        frames += g_jit_norec_recon_frames - f0;
+    }
+    g_norec_recon_at = saved_at;
+    if (!ok) {
+        fprintf(stderr, "jit_norec_recon_sweep: the program failed\n");
+        return false;
+    }
+    if (probes < 4) {
+        fprintf(stderr, "jit_norec_recon_sweep: %lu probes fired for 4 "
+                        "forced events - the hook did not run\n", probes);
+        return false;
+    }
+    /* the LOAD-BEARING half: a probe that walks zero frames is the
+     * vacuous case (it was, in production mode, until the walk stopped
+     * being driven by the record count) */
+    if (frames < 8) {
+        fprintf(stderr, "jit_norec_recon_sweep: %lu frames over %lu "
+                        "probes - the walk floored immediately\n",
+                frames, probes);
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * G1 the MONOMORPHIC CALLEE CACHE. `g_jit_callee_cache` is bumped by the
  * emitted HIT arm only, so a bump proves the skip actually ran - a correct
  * result proves nothing here, since the full guard chain produces the same
@@ -29811,6 +29930,8 @@ static const std::vector<extra_check> extra_checks =
       jit_sync_inline_call },
     { "jit: norec: shadow-verified side table + the full-stack audit",
       jit_norec_shadow },
+    { "jit: norec: forced reconstruction at a chosen call event (Net 2)",
+      jit_norec_recon_sweep },
     { "jit: the monomorphic callee cache hits (and a polymorphic site is "
       "still correct)", jit_callee_cache_hit },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
