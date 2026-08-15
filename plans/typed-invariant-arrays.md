@@ -423,7 +423,10 @@ registers. The route, in increasing depth:
   4. **C4d: struct dst tags** - INVESTIGATED 2026-08-05 and found
      ALREADY DONE; RE-SCOPED to the ctor-dominated member read and
      LANDED the same day (-17.1% on 64), see below. The ctor's own
-     guards remain - they need loop versioning.
+     guards followed as **C4e** (a loop preheader ESTABLISHES the H1
+     invariant rather than versioning the loop), and the store side as
+     **C5** (the same preheader releases a ref-listed temp so its
+     stores drop their reference test) - both LANDED 2026-08-05.
 Each is its own measured increment; 2 and 3 are the big ones.
 
 **C4a-ii LANDED (2026-08-04): float forwarding** - a float producer
@@ -682,66 +685,88 @@ so C4e only exists because C4d landed first.
 Measured 194 -> 170 Ir/iteration (**-12.4%**), cumulative with C4d
 **234 -> 170 (-27.4%)**. Lever `cest`.
 
-### C5 (DESIGNED, not built): release-at-entry unlocks the ref-listed temps
+### C5 LANDED (2026-08-05): the loop-preheader release
 
 Scoping #116 - "peel the first iteration so the hot copy can assume what
-one iteration established" - found that the leading case does NOT need a
-peel. It needs C4e's trick a second time: **make the invariant true at
-the fragment entry instead of proving it per store.**
+one iteration established" - found the leading case does NOT need a
+peel. It needs C4e's trick a second time, on the store side.
 
 THE COST. `store_dst` emits a 4-instruction guard (`mov rcx, dst.type;
 mov rcx, [rcx+8]; cmp rcx, 8; jb`) before the two-store whenever the dst
-is REF-LISTED, plus a cold `jit_put_int` block in the fragment text. In
-64 that is 5 sites x 4 = 20 of the remaining 170 Ir/iteration, and it
-fires on `main`-level loops generally, because main reuses its low temps
-for argv/print so they are all ref-listed.
+is REF-LISTED, plus a cold `jit_put_int` block. `main`'s temps are
+ref-listed WHOLESALE - `compute_ref_slots` bails to "every slot" the
+moment a chunk holds one op whose defs it cannot enumerate, which any
+argv/print call is - so a hot loop in main pays it on every store
+although nothing in the LOOP puts a reference anywhere.
 
-THE MECHANISM. At the fragment entry (and every entry stub), for each
-qualifying temp emit the SAME check once - `if (type >= t_str) call
-jit_release_slot` - after which the slot provably holds a trivial value.
-Every store to it in the run then skips the guard: 6 instructions per
-store become 2, at a one-off ~4 per entry.
+THE MECHANISM. The loop PREHEADER releases the slot once (`if (type >=
+t_str) jit_release_slot`, leaving a trivial `none`); every store inside
+then drops its test. ~5 instructions per loop ENTRY buys 4 per store
+execution.
 
-THE GATE, all of it already computed:
- - a REF-LISTED TEMP (`slot >= slot_count`) - locals are not scratch and
-   are covered by C3 already;
- - `idst`/`fdst` and NOT `disq`/`disq_f` from `pick_cached_slots` - "an
-   int/float op writes it in this run and nothing touches it through
-   memory in a way the emitter cannot account for", the identical
-   soundness C3 inc 2's type elision already relies on;
- - dead-in at the run head AND at every entry stub (`jit_fwd_info`'s
-   `livein`, C4a-i's gate) - the release must not destroy a live value;
- - stored inside a LOOP in the run (C4b's loop-scoped profitability
-   rule), or the entry cost is not repaid.
+**THE PLACEMENT WAS MEASURED, AND THE PLAN'S WAS WRONG.** This was
+scoped at the FRAGMENT ENTRY. Built that way it picked NOTHING on the
+shape it exists for: since delete-originals a run spans a whole
+function, so main's argv prologue and its closing print reuse the very
+temps the loop stores to, and "no non-scalar def anywhere in the run" is
+false for all of them. Scoped to the loop, the same slots qualify -
+C4b's loop-scoped lesson, in the same place, for the same reason.
 
-WHY THIS IS THE SAME IDEA AS C3 INC 3. That increment admitted temps to
-the float type-store elision but required `!ref_listed`, because the
-flush stamps t_float at every exit including one taken before the run's
-first write, which would hide a reference an earlier run left there from
-`pop_window`'s release scan and LEAK it. A release at entry removes
-exactly that objection - so the same change plausibly unlocks the type
-elision for these temps too, and both should be measured together.
+THE GATE: a ref-listed TEMP; every def of it inside the region is
+`op_writes_scalar` (the same table that decided ref_slots, so nothing
+can put a reference back and the invariant holds at every pc); DEAD-IN
+at the region head (live-IN, not live-out - C4a-i's trap); and the
+preheader is the only way in - `region_preheader_reached`, factored out
+of C4e so the two cannot drift. Outermost region first. A C1 cold copy
+clears the set (its entry jump precedes the preheader).
 
-Nets it will need: an emitted-code counter (the guarded form must stay
-covered by a shape that does NOT qualify), a LeakSanitizer run (the
-release is the whole soundness argument), and `MYLANG_JIT_COLD=refstore`,
-which forces the arm this deletes.
+SABOTAGE, as measured. The dead-in gate needed a REFUSAL assertion, not
+a value check: a `foreach` counter is a live-in, ForLoopStep-written
+temp that only that gate refuses - but `jit_release_slot` assigns
+`LValue()`, whose payload is ZERO, and a fresh counter is zero too, so
+the wrongly-released loop still prints the right answer (watched, here
+and on 58_structs / 68_nested). The scalar-def gate dies as a
+**LeakSanitizer** report (71KB / 813 allocations).
+`region_preheader_reached` and the cold clear are UNPROVABLE: removing
+them changes which slots are picked (2 sites corpus-wide) but no
+output - the failure needs a resume, or a failed C1 guard, to land where
+the slot holds a reference right then.
+
+Proven by `g_jit_release_entry` (emitted) + `g_jit_relent_stores`
+(compile-time) - the pair, because a broken `relok()` would leave the
+first bumping happily. It starved `g_jit_fstore_movx0`, whose shape got
+its reference from main's prologue and ran the cold arm ONCE; the C4b
+test grew an IN-LOOP reference and now exercises it per iteration.
+
+Measured (Ir/scale, OPT=1 ASSERTS=0): 18_foreach_array **-18.2%**,
+55_float_sum **-12.5%**, 65_struct_field_sum **-11.4%**, 46_matrix_mult
+**-10.3%**, 14_array_subscript **-8.2%**, 64_struct_create -2.4%;
+01/43/54/04/34/35/10/62/15/57/19/42/58/68 byte-flat. Lever `relent`.
 
 NOT the peel. A first-iteration peel is still the general answer for a
-property that is false on iteration 1 and true after, and doubles a
-region's fragment text to get it; it stays on the list, but it is not
-what this case wants.
+property false on iteration 1 and true after, and doubles a region's
+fragment text to get it; it stays on the list, but it is not what this
+case wanted.
 
-**What the C-series leaves on 64.** The remaining ~170 Ir are, per the
-emitted code: the five member reads' ref-listed STORE guards (5 sites x
-4 instructions - `store_dst`'s "does the dst temp currently hold a
-reference" test, which is true only because `main` reuses its low temps
-for argv/print), the three `i * K.0` promotions feeding the Vec3 ctor
-(each an int-slot type dispatch plus an inline literal materialisation -
-the C4b pool declined here), and the arithmetic itself. The store-guard
-half has the SAME shape C4e just solved by a different route: the
-property is false on iteration 1 and true forever after. Solving it
-generally - a JIT-level first-iteration PEEL, where the hot copy of a
-region assumes everything one full iteration established - would reach
-both it and any future member of the family, and is the natural next
-mechanism if this line is continued.
+FOLLOW-UP, not taken here: C3 inc 3 admits temps to the float
+type-store elision only when `!ref_listed`, because a flush stamps
+t_float at an exit taken before the run's first write and would hide a
+reference from `pop_window`'s scan. A released temp no longer can hold
+one, so that objection is gone for exactly this set - worth measuring
+as its own increment.
+
+**What the C-series leaves on 64.** C5 took the store guards, but only
+partly: 64 reads **-2.4%** where 18/55/65/46/14 read -8% to -18%,
+because on that program most of the five member reads' dsts do NOT
+qualify (the Vec3/Point ctor temps are written by the ctor plan, not by
+a scalar op). What is left, per the emitted code: the residual store
+guards, the three `i * K.0` promotions feeding the Vec3 ctor (each an
+int-slot type dispatch plus an inline literal materialisation - the C4b
+pool declined here), and the arithmetic itself.
+
+The general mechanism for the whole family is still the **first-
+iteration PEEL**: a hot copy of a region that assumes everything one
+full iteration established, at the price of doubling the region's
+fragment text. C4e and C5 each got one member of the family by making
+the invariant true instead of proving it, which is cheaper wherever it
+applies; the peel is what reaches the rest.

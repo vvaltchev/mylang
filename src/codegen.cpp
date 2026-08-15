@@ -8455,7 +8455,7 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
  * value - the audited set behind Chunk::ref_slots (profile #2). Anything
  * not listed is treated as possibly-reference (conservative). Computed
  * before specialize_arith_ops, so only the generic forms appear here. */
-static bool op_writes_scalar(OpCode op)
+bool op_writes_scalar(OpCode op)
 {
     switch (op) {
     case OpCode::IntBin: case OpCode::FloatBin:

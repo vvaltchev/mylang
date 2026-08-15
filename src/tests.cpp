@@ -19836,6 +19836,18 @@ static bool jit_flit_c4b()
      * 1.5-off sum. `g_jit_fstore_movx0` makes the coverage provable
      * instead of lucky.
      */
+    /*
+     * The IN-LOOP reference (`tag`) is load-bearing since C5. Before it,
+     * this shape got its reference from main's prologue temps and the
+     * cold arm ran ONCE, on iteration 1; C5's preheader release now
+     * clears exactly that leftover, so the arm would never run and the
+     * counter below would read 0 - which is what happened, and is the
+     * honest signal that the shape had stopped covering the code. A
+     * NON-SCALAR write inside the loop refuses the C5 release for that
+     * temp (its invariant cannot hold) and puts a fresh reference there
+     * every iteration, so the arm is exercised per iteration instead of
+     * once per program.
+     */
     const unsigned long m0 = g_jit_fstore_movx0;
     const std::string resreg = go({
         "var scale = 1;",
@@ -19844,6 +19856,7 @@ static bool jit_flit_c4b()
         "var N = 400 * scale;",
         "var total = 0.0;",
         "for (var i = 1; i < N; i++) {",
+        "    var tag = dynarray([\"t\"]);",
         "    var x = i * 1.0;",
         "    total += x / (x + 1.0) - 0.5 / x + 1.0 / (x * x);",
         "}",
@@ -22268,6 +22281,152 @@ static bool jit_ctor_establish_c4e()
 }
 
 /*
+ * C5: THE LOOP-PREHEADER RELEASE (plans/typed-invariant-arrays.md).
+ *
+ * A ref-listed temp's scalar store tests whether the slot currently holds
+ * a reference before it may overwrite the two words. Inside a loop that
+ * is false on every iteration but, at most, the first - so the preheader
+ * releases the slot once and every store then drops the test.
+ *
+ * BOTH counters are asserted and they prove DIFFERENT halves.
+ * g_jit_release_entry is bumped by the EMITTED preheader, so it proves
+ * the release ran; g_jit_relent_stores is a COMPILE-TIME count of store
+ * sites that dropped their guard, so it proves the point of the exercise
+ * actually happened. A broken relok() would leave the first one bumping
+ * happily while nothing changed - which is the failure this pairing
+ * exists to catch.
+ *
+ * The shapes need main-level loops on purpose: main's temps are
+ * ref-listed WHOLESALE (compute_ref_slots bails to "every slot" the
+ * moment a chunk holds one op whose defs it cannot enumerate, which any
+ * argv/print call is), and that is the whole motivating case.
+ */
+static bool jit_release_c5()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        cout.rdbuf(old);
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    /*
+     * THE MOTIVATING SHAPE. `av[0]` puts a STRING in one of main's low
+     * temps, and the float chain below reuses it - so without C5 every
+     * one of the chain's stores tests for a reference that only the
+     * first iteration could ever find. sum(1/i) for i in 1..9.
+     */
+    const unsigned long r0 = g_jit_release_entry;
+    const unsigned long s0 = g_jit_relent_stores;
+    if (!run({
+            "var av = [\"3\"];",
+            "var n = int(av[0]) * 3;",
+            "var total = 0.0;",
+            "for (var i = 1; i < n + 1; i++) {",
+            "    var x = i * 1.0;",
+            "    total += 1.0 / x + x * 0.5 - x / (x + 1.0);",
+            "}",
+            "assert(int(total * 1000.0) == 18257);",
+            "print(av[0]);" }))
+        return false;
+    if (g_jit_release_entry <= r0) {
+        fprintf(stderr, "jit_release_c5: the preheader release DID NOT RUN\n");
+        return false;
+    }
+    if (g_jit_relent_stores <= s0) {
+        fprintf(stderr, "jit_release_c5: no store dropped its ref guard\n");
+        return false;
+    }
+
+    /*
+     * THE REFUSAL, and it is the interesting direction. `dynarray(..)`
+     * writes a REFERENCE into a temp on every iteration, so for whatever
+     * temp it lands in the released-therefore-trivial invariant is false
+     * and the release must not happen for it. The value check is what
+     * catches getting this wrong: a wrongly-released temp holding a live
+     * array is read back as `none` and the subscript throws.
+     */
+    if (!run({
+            "var av = [\"4\"];",
+            "var n = int(av[0]);",
+            "var s = 0;",
+            "for (var i = 0; i < n; i++) {",
+            "    var t = dynarray([i, i + 1, i + 2]);",
+            "    s += t[0] + t[2];",
+            "}",
+            "assert(s == 20);",
+            "print(av[0]);" }))
+        return false;
+
+    /*
+     * THE LIVE-IN REFUSAL, asserted as a refusal rather than through a
+     * value - and that distinction is the whole point of this case.
+     *
+     * A `foreach` lowers to a counted loop whose COUNTER is a temp,
+     * initialised before the loop and read as the index inside it: it is
+     * live-in at the region head AND scalar-defined in it (the
+     * ForLoopStep), so it clears every other condition and only the
+     * dead-in gate refuses it. Releasing it would destroy the loop's own
+     * index.
+     *
+     * A value check CANNOT see that. `jit_release_slot` assigns
+     * `LValue()`, whose payload is ZERO - and a freshly-initialised
+     * counter is zero too, so the wrongly-released loop still runs
+     * correctly by coincidence. (Watched: with the gate removed, this
+     * program and both corpus programs that expose it print the right
+     * answer.) So the assertion is that NOTHING was released here, which
+     * is exactly what the gate decides.
+     */
+    const unsigned long r1 = g_jit_release_entry;
+    if (!run({
+            "var av = [\"3\"];",
+            "var n = int(av[0]);",
+            "struct P { int x; int y; }",
+            "var pts = [];",
+            "for (var i = 0; i < n; i++)",
+            "    append(pts, P(i, i * 2));",
+            "var sx = 0;",
+            "foreach (var p in pts)",
+            "    sx += p.x;",
+            "assert(sx == 3);",
+            "print(av[0]);" }))
+        return false;
+    if (g_jit_release_entry != r1) {
+        fprintf(stderr, "jit_release_c5: released a LIVE-IN temp "
+                        "(the foreach counter)\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * Cross-compile determinism of M8 specialization. A concrete, typed function's
  * body must specialize to the SAME native/typed bytecode no matter what was
  * compiled BEFORE it in the same process - in particular, compiling an
@@ -22772,6 +22931,8 @@ static bool jit_counter_coverage()
         { "fstore_movx0",     &g_jit_fstore_movx0,     nullptr },
         { "member_noguard",   &g_jit_member_noguard,   nullptr },
         { "ctor_est",         &g_jit_ctor_est,         nullptr },
+        { "release_entry",    &g_jit_release_entry,    nullptr },
+        { "relent_stores",    &g_jit_relent_stores,    nullptr },
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
         { "inline_baked",     &g_jit_inline_baked,     nullptr },
         { "sync_boundary",    &g_jit_sync_boundary_call,
@@ -25296,6 +25457,8 @@ static const std::vector<extra_check> extra_checks =
       jit_member_fact_c4d },
     { "jit: a loop preheader establishes the ctor's H1 invariant (C4e)",
       jit_ctor_establish_c4e },
+    { "jit: C5 loop-preheader release of a ref-listed temp",
+      jit_release_c5 },
     { "jit: native len() + fused ord(s[i]) run natively (lever 4b)",
       jit_len_ord },
     { "jit: LoadElem slow tier serves declined shapes (#56 inc 1)",

@@ -1464,7 +1464,7 @@ collision). Three nets now:
   JIT analogue of `--no-opt`, which CLAUDE.md already mandates for AST
   transforms for the same reason (`-nj` is all-or-nothing and localises
   nothing). Levers: cache, fcache, telide, fread, flit, fwd, ffwd,
-  resreg, hoist, hoist2, mfact, cest, `all`.
+  resreg, hoist, hoist2, mfact, cest, relent, `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
@@ -1631,6 +1631,73 @@ its guards. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0, cross-binary):
 (they read through LoadStructField*/the foreach direct read, not
 LoadMemberInt - a different op), 46/01/09/55 byte-flat, so the new emit
 arm costs no layout tax.
+
+**C5 - THE LOOP-PREHEADER RELEASE (2026-08-05,
+`jit_pick_release_slots`, jit.cpp) - C4e's trick on the STORE side.**
+A scalar store to a REF-LISTED slot cannot just overwrite the two
+words: the slot may currently hold a reference, and releasing one needs
+C++. So every such store emits a 4-instruction test first (`mov rcx,
+type; mov ecx,[rcx+t]; cmp ecx, t_str; jb fast`) plus a cold
+`jit_put_*` block - on a property that, inside a loop, is false on
+every iteration but at most the first.
+**`main`'s temps are the case, and they are ref-listed WHOLESALE:**
+`compute_ref_slots` bails to "every slot" the moment a chunk holds one
+op whose defs it cannot enumerate, which any argv/print call is - so a
+hot loop in main pays the test on every store although nothing in the
+LOOP puts a reference anywhere. The loop PREHEADER now releases the
+slot once (`if (type >= t_str) jit_release_slot`, leaving a trivial
+`none`) and every store inside drops its test: ~5 instructions per loop
+ENTRY for 4 per store execution.
+**THE PLACEMENT WAS MEASURED, NOT ASSUMED.** The plan scoped this at
+the FRAGMENT ENTRY; built that way it picked **nothing** on the shape
+it exists for - since delete-originals a run spans a whole function, so
+main's argv prologue and closing print reuse the very temps the loop
+stores to, and "no non-scalar def anywhere in the run" is false for all
+of them. Scoped to the loop, the same slots qualify. This is C4b's
+loop-scoped lesson, in the same place, for the same reason.
+THE GATE: a ref-listed TEMP (locals are not scratch, and
+`jit_fwd_info`'s liveness tracks temps only); EVERY def of it inside
+the region is `op_writes_scalar` - the same table that decided
+ref_slots - so nothing can put a reference back and the invariant holds
+at every pc, not merely at the top (an op the use-def table does not
+know refuses the whole region); DEAD-IN at the region head, so the
+released value is one nobody reads (live-IN, not live-out - C4a-i's
+trap); and the preheader must be the only way in, which is
+`region_preheader_reached`, FACTORED OUT of C4e so the two cannot
+drift. Regions are taken outermost-first (a slot an enclosing region
+released is already trivial inside). At an exit the slot holds `none`
+or a scalar, so `pop_window`'s release scan correctly skips it -
+nothing leaks, because whatever was there was released HERE.
+The COLD copy of a C1 hoist region is entered by a failed guard whose
+jump precedes this preheader, so it clears the released set and keeps
+every guard. `MYLANG_RELDBG=1` prints each region's picks (the
+MYLANG_ESTDBG / MYLANG_HOISTDBG pattern).
+SABOTAGE, recorded as measured. The DEAD-IN gate needed a REFUSAL
+assertion, not a value check: a `foreach`'s counter is a temp that is
+live-in AND ForLoopStep-written, so only that gate refuses it - but
+`jit_release_slot` assigns `LValue()`, whose payload is ZERO, and a
+freshly-initialised counter is zero too, so the wrongly-released loop
+still prints the right answer (watched, on the test and on both corpus
+programs that expose it). The test therefore asserts nothing was
+released. The SCALAR-DEF gate dies as a **LeakSanitizer** report (71KB
+in 813 allocations - a reference written into the temp inside the loop,
+then overwritten unreleased). `region_preheader_reached` and the cold
+clear are recorded UNPROVABLE: removing them changes which slots are
+picked (2 sites corpus-wide for the first) but no corpus program's
+output, since the failure needs a resume - or a failed C1 guard - to
+land where the slot happens to hold a reference right then.
+Execution-proven by TWO counters that prove different halves:
+`g_jit_release_entry` (emitted preheader) says the release ran,
+`g_jit_relent_stores` (compile-time) says a store actually dropped its
+guard - a broken `relok()` would leave the first bumping happily.
+It also starved `g_jit_fstore_movx0`: that shape got its reference from
+main's prologue and the cold arm ran ONCE, which C5 now clears, so the
+C4b test grew an IN-LOOP reference and exercises the arm per iteration
+instead. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0):
+**18_foreach_array -18.2%**, **55_float_sum -12.5%**,
+**65_struct_field_sum -11.4%**, **46_matrix_mult -10.3%**,
+**14_array_subscript -8.2%**, 64_struct_create -2.4%; 01/43/54/04/34/
+35/10/62/15/57/19/42/58/68 byte-flat. Lever `relent`.
 
 **C4e - THE LOOP-ESTABLISHED CTOR (2026-08-05,
 `jit_pick_ctor_establish`, jit.cpp).** A planned StructCtorV spends 13

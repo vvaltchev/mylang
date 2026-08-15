@@ -65,6 +65,7 @@ unsigned long g_jit_flit = 0;          /* C4b: literal-pinned frag entries */
 unsigned long g_jit_fstore_movx0 = 0;  /* C4b inc 2: ref-arm result move */
 unsigned long g_jit_member_noguard = 0; /* C4d: guard-elided member reads */
 unsigned long g_jit_ctor_est = 0;      /* C4e: established ctor preheaders */
+unsigned long g_jit_release_entry = 0; /* C5: entries that released a temp */
 unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
@@ -81,6 +82,12 @@ unsigned long g_jit_fread_temps = 0;
  * compile-time count - the same audit-table dependence as its read-side
  * sibling, plus the !ref_listed condition a temp needs). */
 unsigned long g_jit_telide_temps = 0;
+/* C5: scalar STORE sites emitted with NO ref guard, because the temp was
+ * released at every entry. A COMPILE-TIME count, and the necessary
+ * partner to g_jit_release_entry: that one proves the entry release RAN,
+ * this one proves a store actually dropped its test - a broken relok()
+ * would leave the first counter bumping happily while nothing changed. */
+unsigned long g_jit_relent_stores = 0;
 }
 #endif
 
@@ -189,11 +196,12 @@ bool g_jit_enabled = false;
 enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
-    JL_CEST, JL_COUNT
+    JL_CEST, JL_RELENT, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
-    "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest"
+    "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
+    "relent"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -742,6 +750,26 @@ struct Emitter {
     bool fread_ok(int s) const
     {
         for (const int x : fread)
+            if (x == s)
+                return true;
+        return false;
+    }
+    /*
+     * C5: the TEMPS this fragment RELEASED at its entry (and at every
+     * entry stub). A ref-listed slot's scalar store must first test
+     * whether it currently holds a reference, because releasing one
+     * needs C++ - 4 instructions before every store, on a property
+     * that is false only until the run's first write to the slot.
+     *
+     * Releasing the slot once at the entry makes the property TRUE from
+     * then on, so every store in the run drops the test: the C4e trick
+     * (establish the invariant instead of proving it) applied to the
+     * store side. See pick_release_slots for the gate.
+     */
+    std::vector<int> released;
+    bool relok(int s) const
+    {
+        for (const int x : released)
             if (x == s)
                 return true;
         return false;
@@ -3323,8 +3351,14 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
 {
     (void)bail_pc;                       /* no bail: helper on the ref path */
     const SlotAddr a = slot_addr(dst);
-    if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
-                           static_cast<int32_t>(dst))) {
+    const bool reflisted =
+        std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                           static_cast<int32_t>(dst));
+#ifdef TESTS
+    if (reflisted && e.relok(dst))
+        g_jit_relent_stores++;           /* C5: this store dropped its test */
+#endif
+    if (reflisted && !e.relok(dst)) {
         const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_int),
                           dst, src_reg);
@@ -3368,8 +3402,14 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
 {
     const SlotAddr a = slot_addr(dst);
     const uint64_t tb = reinterpret_cast<uint64_t>(jit_layout().t_bool);
-    if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
-                           static_cast<int32_t>(dst))) {
+    const bool reflisted =
+        std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                           static_cast<int32_t>(dst));
+#ifdef TESTS
+    if (reflisted && e.relok(dst))
+        g_jit_relent_stores++;           /* C5: this store dropped its test */
+#endif
+    if (reflisted && !e.relok(dst)) {
         const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_bool),
                           dst, src_reg);
@@ -4840,8 +4880,14 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
         return;
     }
     const SlotAddr a = slot_addr(dst);
-    if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
-                           static_cast<int32_t>(dst))) {
+    const bool reflisted =
+        std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                           static_cast<int32_t>(dst));
+#ifdef TESTS
+    if (reflisted && e.relok(dst))
+        g_jit_relent_stores++;           /* C5: this store dropped its test */
+#endif
+    if (reflisted && !e.relok(dst)) {
         const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
 #ifdef TESTS
         /* the execution proof for the non-xmm0 case: it is reached only
@@ -5025,6 +5071,227 @@ pick_float_lits(const Chunk &chunk, size_t begin, size_t end)
         out.push_back({ w[i].first, FLIT_REGS[i] });
     }
     return out;
+}
+
+/*
+ * C4e / C5: can control reach [T, L] ONLY by falling through the
+ * preheader emitted just before label[T] (or by the region's own back
+ * edge)? Everything a preheader establishes rests on this: a RESUME
+ * inside the region - an entry stub, a catch body, a finally - or a
+ * jump in from outside would land past the preheader with the invariant
+ * unestablished.
+ *
+ * Shared so the two users cannot drift. They differ in what ELSE they
+ * demand: C4e additionally needs every op in the region to run (no
+ * internal branch, nothing that can exit part-way), because its ctor
+ * must actually execute; C5 does not, since a released slot stays
+ * trivial along every path.
+ */
+static bool region_preheader_reached(
+    const Chunk &chunk, size_t begin, size_t end,
+    const std::vector<std::pair<size_t, size_t>> &entries,
+    size_t T, size_t L)
+{
+    for (const auto &pe : entries)
+        if (pe.first >= T && pe.first <= L)
+            return false;
+    for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : hs.clauses)
+            if (cl.body_pc >= static_cast<int>(T)
+                    && cl.body_pc <= static_cast<int>(L))
+                return false;
+        if (hs.fin_pc >= static_cast<int>(T)
+                && hs.fin_pc <= static_cast<int>(L))
+            return false;
+    }
+    for (size_t p = begin; p < end; p++) {
+        const Instr &in = chunk.code[p];
+        if (op_is_branch(in.op) && in.target >= static_cast<int>(T)
+                && in.target <= static_cast<int>(L)
+                && (p < T || p > L))
+            return false;
+    }
+    return true;
+}
+
+/*
+ * ---- C5: THE LOOP-PREHEADER RELEASE (plans/typed-invariant-arrays.md) ----
+ *
+ * A scalar store to a REF-LISTED slot cannot just overwrite the two
+ * words: the slot may currently hold a reference, and releasing one
+ * needs C++. So every such store emits a 4-instruction test first
+ * (`mov rcx, type; mov ecx, [rcx+t]; cmp ecx, t_str; jb fast`) plus a
+ * cold jit_put_* call in the fragment text - and inside a loop that test
+ * is false on every iteration but, at most, the first.
+ *
+ * `main`'s temps are the motivating case and they are ref-listed
+ * WHOLESALE: compute_ref_slots bails to "every slot" as soon as the
+ * chunk contains one op whose defs it cannot enumerate, which any
+ * argv/print call is. So a hot arithmetic loop in main pays the test on
+ * every store although nothing in the LOOP ever puts a reference
+ * anywhere.
+ *
+ * C4e's answer applies again: ESTABLISH the invariant instead of proving
+ * it. The loop PREHEADER releases the slot once - `if (type >= t_str)
+ * jit_release_slot(&slot)`, which leaves a trivial `none` - and every
+ * store in the loop then drops its test. ~5 instructions per loop ENTRY
+ * buys 4 per store execution.
+ *
+ * THE PLACEMENT IS THE PREHEADER, NOT THE FRAGMENT ENTRY, and that was
+ * measured rather than assumed. A fragment-entry release was built
+ * first and picked NOTHING on the shape it exists for: since
+ * delete-originals a run spans a whole function, so main's argv prologue
+ * and its closing print reuse the very temps the loop stores to, and
+ * "no non-scalar def anywhere in the run" is false for all of them.
+ * Scoped to the loop, the same slots qualify. This is C4b's lesson in
+ * the same place for the same reason.
+ *
+ * THE GATE:
+ *  - a TEMP (>= slot_count). A local is not scratch, and more to the
+ *    point `jit_fwd_info`'s liveness - the dead-in evidence - tracks
+ *    TEMPS only.
+ *  - REF-LISTED, or there is no test to remove.
+ *  - EVERY def of it inside the region is `op_writes_scalar` - the same
+ *    table that decided ref_slots. This is what makes the invariant hold
+ *    at every pc in the region and not merely at the top: nothing here
+ *    can put a reference back. An op the use-def table does not know
+ *    refuses the whole region (it may define anything).
+ *  - DEAD-IN at the region head, so the value the release destroys is
+ *    one nobody reads. Live-IN, not live-out, for C4a-i's reason: at a
+ *    head whose first op writes the temp, live-out trivially contains
+ *    it.
+ *  - the preheader is the only way in (region_preheader_reached), or a
+ *    resume would land inside with the slot unreleased.
+ *
+ * WHAT HAPPENS AT AN EXIT is the other half of the argument: the slot
+ * then holds either the release's `none` or a scalar, so pop_window's
+ * release scan correctly skips it. Nothing leaks, because whatever was
+ * there was released HERE.
+ *
+ * Regions are taken OUTERMOST FIRST (they sort by head pc, and an outer
+ * loop's head precedes its inner ones): a slot released by an enclosing
+ * region is already trivial throughout the inner one, so paying for it
+ * again would be waste.
+ */
+static const size_t MAX_RELEASED = 8;
+
+static void jit_pick_release_slots(
+    const Chunk &chunk, size_t begin, size_t end,
+    const std::vector<std::pair<size_t, size_t>> &entries,
+    const std::vector<uint64_t> &fwd_lin, bool fwd_live_ok,
+    std::vector<std::vector<int>> &active,
+    std::map<size_t, std::vector<int>> &rel_at)
+{
+    static const bool dbg = getenv("MYLANG_RELDBG") != nullptr;
+    active.assign(end - begin, {});
+    if (jit_lever_off(JL_RELENT) || !fwd_live_ok || fwd_lin.empty())
+        return;
+
+    for (size_t T = begin; T < end; T++) {
+        /* the region: T .. the LAST back edge that targets it (so a
+         * multi-exit loop body is covered whole) */
+        size_t L = 0;
+        bool found = false;
+        for (size_t p = T; p < end; p++) {
+            const Instr &in = chunk.code[p];
+            if (op_is_branch(in.op) && in.target == static_cast<int>(T)
+                    && p > T)
+                { L = p; found = true; }
+        }
+        if (!found
+                || !region_preheader_reached(chunk, begin, end, entries, T, L))
+            continue;
+
+        /* every def in the region, split by whether it keeps the slot
+         * trivial; an unaudited op refuses the region outright */
+        std::vector<int> cand, refused;
+        std::vector<int> uses, defs;
+        bool ok = true;
+        for (size_t p = T; p <= L && ok; p++) {
+            const Instr &in = chunk.code[p];
+            if (!jit_op_slot_refs(in, uses, defs)) {
+                ok = false;
+                break;
+            }
+            const bool scalar = op_writes_scalar(in.op);
+            for (const int d : defs) {
+                if (d < chunk.slot_count || !jit_slot_ref_listed(chunk, d))
+                    continue;
+                if (!scalar)
+                    refused.push_back(d);
+                else if (std::find(cand.begin(), cand.end(), d) == cand.end())
+                    cand.push_back(d);
+            }
+        }
+        if (!ok)
+            continue;
+
+        std::vector<int> picked;
+        for (const int s : cand) {
+            if (std::find(refused.begin(), refused.end(), s) != refused.end())
+                continue;                    /* a reference lands here */
+            const int tb = s - chunk.slot_count;
+            if (tb >= 64)
+                continue;                    /* outside the liveness bitset */
+            if (T < fwd_lin.size()
+                    && (fwd_lin[T] & (uint64_t(1) << tb)))
+                continue;                    /* live-in: the release shows */
+            const std::vector<int> &enc = active[T - begin];
+            if (std::find(enc.begin(), enc.end(), s) != enc.end())
+                continue;                    /* an enclosing region has it */
+            picked.push_back(s);
+            if (picked.size() == MAX_RELEASED)
+                break;                       /* bound the per-entry cost */
+        }
+        if (picked.empty())
+            continue;
+        rel_at[T] = picked;
+        for (size_t p = T; p <= L; p++)
+            for (const int s : picked)
+                active[p - begin].push_back(s);
+        if (dbg) {
+            fprintf(stderr, "relent[%zu,%zu):", T, L);
+            for (const int s : picked)
+                fprintf(stderr, " r%d", s);
+            fprintf(stderr, "\n");
+        }
+    }
+}
+
+/*
+ * C5: emit the preheader release for each picked slot. Sits with C4e's
+ * establish, immediately before label[T] - a back edge targets the
+ * label, so only the FALL-THROUGH entry pays.
+ *
+ */
+static void emit_release_preheader(Emitter &e, const std::vector<int> &slots)
+{
+    for (const int s : slots) {
+        const SlotAddr a = slot_addr(s);
+        /* REL32 both ways: the call is bracketed by the standard
+         * prologue/epilogue pair, which can emit the float spills, the
+         * type singletons, the literal pool AND the C1 hoist
+         * re-derivation - far past a short jump's reach. (It must be
+         * that pair: this preheader is emitted AFTER C1's nav, so the
+         * call would otherwise leave r10/r11 clobbered inside the very
+         * region that reads them.) */
+        const size_t j_ref = emit_ref_check_jae(e, a.type);  /* a ref? */
+        const size_t j_skip = e.j32(0xEB);     /* trivial: nothing to do */
+        e.patch32_here(j_ref);
+        emit_call_prologue(e);
+        e.lea_rdi(a.payload);                  /* rdi = &frame->slots[s] */
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_release_slot) });
+        e.u8(0xE8); e.u32(0);                  /* call jit_release_slot */
+        emit_call_epilogue(e);
+        e.patch32_here(j_skip);
+    }
+#ifdef TESTS
+    if (!slots.empty()) {
+        e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_release_entry));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x01);    /* inc qword [rcx] */
+    }
+#endif
 }
 
 /*
@@ -9863,28 +10130,7 @@ static void jit_pick_ctor_establish(
             }
         if (!ok || !op_never_exits(bi))
             continue;
-        /* a RESUME inside the region would skip the preheader */
-        for (const auto &pe : entries)
-            if (pe.first >= T && pe.first <= L)
-                ok = false;
-        for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
-            for (const Chunk::HandlerClause &cl : hs.clauses)
-                if (cl.body_pc >= static_cast<int>(T)
-                        && cl.body_pc <= static_cast<int>(L))
-                    ok = false;
-            if (hs.fin_pc >= static_cast<int>(T)
-                    && hs.fin_pc <= static_cast<int>(L))
-                ok = false;
-        }
-        /* and no jump into it from outside */
-        for (size_t p = begin; p < end && ok; p++) {
-            const Instr &in = chunk.code[p];
-            if (op_is_branch(in.op) && in.target >= static_cast<int>(T)
-                    && in.target <= static_cast<int>(L)
-                    && (p < T || p > L))
-                ok = false;
-        }
-        if (!ok)
+        if (!region_preheader_reached(chunk, begin, end, entries, T, L))
             continue;
 
         /* the candidate ctors, then the per-slot appearance scan */
@@ -10966,6 +11212,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         e.flits.clear();        /* C4b: per-RUN (a stale entry would let
                                  * the next fragment read a register it
                                  * never loaded - the C2a fcache bug) */
+        e.released.clear();     /* C5: per-RUN AND per-pc below (a stale
+                                 * entry would let a store skip a guard
+                                 * nothing released - the C2a fcache bug) */
         e.fcache.clear();       /* C2a: per-RUN state like the GP pool - a
                                  * stale entry from the previous fragment
                                  * would flush a never-loaded xmm into the
@@ -11060,6 +11309,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.saved.push_back(static_cast<uint8_t>(pair_lo));
             e.saved.push_back(static_cast<uint8_t>(pair_hi));
         }
+
+        /* C5: which ref-listed temps each loop preheader releases, and
+         * where each release is still in force. Picked BEFORE any op is
+         * emitted, since store_dst reads e.released. */
+        std::vector<std::vector<int>> rel_active;
+        std::map<size_t, std::vector<int>> rel_at;
+        jit_pick_release_slots(chunk, begin, end, entries, fwd_lin,
+                               fwd_live_ok, rel_active, rel_at);
 
         e.frag_entry();               /* push rbx + the cache regs; rbx=rdi */
         e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
@@ -11449,8 +11706,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                     }
                     g_fwd = JitFwd{};             /* the calls clobbered rax */
                 }
+                const auto ra = rel_at.find(pc);
+                if (ra != rel_at.end()) {         /* C5: the same preheader */
+                    emit_release_preheader(e, ra->second);
+                    g_fwd = JitFwd{};             /* the calls clobbered rax */
+                }
             }
             label[pc - begin] = e.pos();
+            e.released = rel_active[pc - begin];
             emit_one(pc, /*in_cold=*/false, end);
         }
         g_hoist.active = false;
@@ -11482,6 +11745,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             std::vector<size_t> cold_label(cL - cT + 1, 0);
             std::vector<Fixup> cold_fix;
             cur_fix = &cold_fix;
+            /* C5: the cold copy is entered by a FAILED C1 guard, whose
+             * jump sits BEFORE this region's release preheader - so no
+             * release ran on this path and every store here keeps its
+             * guard. (Setting the release set per-pc as the main stream
+             * does would be exactly wrong.) */
+            e.released.clear();
             for (size_t pc = cT; pc <= cL && emit_ok; pc++) {
                 cold_label[pc - cT] = e.pos();
                 emit_one(pc, /*in_cold=*/true, cL + 1);
