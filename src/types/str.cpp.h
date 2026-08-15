@@ -121,9 +121,22 @@ EvalValue TypeStr::intptr(const EvalValue &a)
 
 void TypeStr::append(SharedStr &lval, const string_view &s)
 {
-    if (!lval.is_slice()) {
+    /*
+     * Grow the buffer IN PLACE only when this window ends where the buffer
+     * ends; otherwise build a fresh string. See THE WINDOW MODEL in
+     * sharedstr.h: appending to a window that is only a PREFIX of the
+     * buffer would silently swallow the bytes past it.
+     *
+     * This is also what makes `+=` respect the documented value semantics
+     * with NO copy-on-write: an alias that has not appended keeps its
+     * shorter window and reads the old value, so `var b = a; a += "!";`
+     * leaves b at "hi" - while the sole-owner accumulator (`s += x` in a
+     * loop) still appends in place and stays O(n).
+     */
+    if (lval.owns_whole_buffer()) {
 
         lval.get_ref() += s;
+        lval.after_inplace_append();
 
     } else {
 

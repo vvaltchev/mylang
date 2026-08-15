@@ -674,6 +674,96 @@ static const std::vector<test> tests =
         },
     },
 
+    /*
+     * THE WINDOW MODEL (2026-08-06). Every SharedStr is a window over a
+     * shared APPEND-ONLY buffer, so an alias that has not appended keeps
+     * its shorter window and reads the OLD value - strings get their
+     * documented value semantics with no copy-on-write clone at all.
+     *
+     * All of these were WRONG before: TypeStr::append grew the shared
+     * std::string with no test at all, so an alias, a bound parameter, an
+     * array element and even clone() saw a later `+=`. Python is the
+     * oracle for each.
+     */
+    { "string window: a plain alias does not see a later +=",
+      { "var a = \"hi\"; var b = a;",
+        "a += \"!\";",
+        "assert(a == \"hi!\" && b == \"hi\");",
+        "assert(len(a) == 3 && len(b) == 2);" } },
+    { "string window: += in a function leaves the caller's string alone",
+      { "func f(s) { s += \"!\"; return s; }",
+        "var e = \"hi\";",
+        "assert(f(e) == \"hi!\");",
+        "assert(e == \"hi\" && len(e) == 2);" } },
+    { "string window: an array element alias does not see a later +=",
+      { "var g = [\"hi\"]; var h = g[0];",
+        "g[0] += \"!\";",
+        "assert(g[0] == \"hi!\" && h == \"hi\");" } },
+    { "string window: clone() detaches from a later +=",
+      { "var i = \"hi\"; var j = clone(i);",
+        "i += \"!\";",
+        "assert(i == \"hi!\" && j == \"hi\");" } },
+    { "string window: a slice keeps its window across a base +=",
+      { "var k = \"xy\"; var m = k[0:2];",
+        "k += \"z\";",
+        "assert(k == \"xyz\" && m == \"xy\" && len(m) == 2);" } },
+    /*
+     * THE MECHANISM, not a stopwatch. The accumulator idiom stays O(n)
+     * only if a sole-owned append does NOT rebuild, so assert exactly
+     * that: intptr() is the shared StrObj's address, so it must not move
+     * across 100 appends. (A timing test would be the wrong tool here -
+     * the first attempt at this fix was O(n^2) and a 50-iteration
+     * accumulator test passed it happily.)
+     */
+    { "string window: a sole-owned append does not rebuild (O(n) idiom)",
+      { "var s = \"ab\";",     /* NOT \"\": the empty literal is a SHARED
+                                 * singleton with no buffer at all, so its
+                                 * first append necessarily allocates one */
+        "var p0 = intptr(s);",
+        "for (var n = 0; n < 100; n++) s += \"ab\";",
+        "assert(len(s) == 202);",
+        "assert(intptr(s) == p0);" } },
+    /* The alias direction the other tests do not cover: mutate the ALIAS
+     * and check the CONTAINER. The window model handles it for free - the
+     * buffer grows, the element's window does not. */
+    { "string window: appending to an element alias leaves the element",
+      { "var g = [\"hi\"]; var h = g[0];",
+        "h += \"!\";",
+        "assert(g[0] == \"hi\" && h == \"hi!\");" } },
+    /* The empty literal is a shared singleton; appending through one
+     * handle must not disturb another. */
+    { "string window: the shared empty literal is not disturbed",
+      { "var e = \"\"; e += \"z\";",
+        "var e2 = \"\";",
+        "assert(e == \"z\" && e2 == \"\" && len(e2) == 0);" } },
+    /* ...and a PREFIX window must rebuild, since growing the buffer would
+     * otherwise swallow the bytes past its end. */
+    { "string window: appending through a prefix window rebuilds",
+      { "var a = \"x\"; var b = a;",
+        "a += \"y\";",
+        "var pb = intptr(b);",
+        "b += \"z\";",
+        "assert(a == \"xy\" && b == \"xz\");",
+        "assert(intptr(b) != pb);" } },
+    /*
+     * THE DICT is what made this a data-integrity bug and not just an
+     * aliasing surprise. A key mutated in place moved the stored key AND
+     * left the StrObj's cached hash (the hash of the WHOLE buffer) stale,
+     * so a second dict could hold an entry findable by NO key at all -
+     * it still printed and compared equal to its own value.
+     */
+    { "string window: a key is not disturbed by a later += on the source",
+      { "var k = \"aa\"; var d = {};",
+        "d[k] = 1;",
+        "k += \"b\";",
+        "assert(len(d) == 1 && get(d, \"aa\") == 1);",
+        "assert(get(d, \"aab\") == none);" } },
+    { "string window: an appended string is still findable as a key",
+      { "var k = \"aa\"; var d1 = {}; d1[k] = 1;",   /* caches hash(\"aa\") */
+        "k += \"b\";",                                /* buffer changed */
+        "var d2 = {}; d2[k] = 2;",
+        "assert(get(d2, \"aab\") == 2);",
+        "assert(k == \"aab\");" } },
     {
         "invalid string operators",
         {
