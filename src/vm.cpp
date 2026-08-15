@@ -1793,6 +1793,17 @@ struct VmActivation {
         ML_VM_CHECK(!sg || sg->cap_slots
                                == static_cast<int_type>(sg->slots.size()));
         if (!sg || sg->top + n > sg->cap_slots) {
+#ifdef TESTS
+            /* Net 3's SEGMENT-BOUNDARY case: an emitted push DECLINES
+             * across a boundary (the fit test sends it to C++), so this
+             * is exactly where record-ful and record-less frames must
+             * interleave. Counted so a test can PROVE it got here -
+             * crossing needs ~16384/frame-size levels of recursion, far
+             * more than any corpus program had. `sg` non-null means a
+             * REAL advance; the null case is just the first segment. */
+            if (sg)
+                g_vm_seg_advance++;
+#endif
             /* Advance to (or create) a segment with room. Reuse an already-
              * allocated successor when its capacity fits (the common pop/
              * push cycle at a segment edge); else append a fresh one. */
@@ -7732,6 +7743,10 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
     const size_t my_idx = act.rec_n;
 
     g_jit_sync_depth++;
+#ifdef TESTS
+    if (static_cast<unsigned long>(g_jit_sync_depth) > g_jit_sync_depth_max)
+        g_jit_sync_depth_max = static_cast<unsigned long>(g_jit_sync_depth);
+#endif
     /* DIRECT FRAGMENT ENTRY: when the callee body STARTS with an
      * EnterNative (the common shape - a whole-native body is a bare
      * `enter.nat`), hoist that first op out of vm_dispatch: enter the
@@ -8435,6 +8450,12 @@ bool g_norec_audit = false;
 unsigned long g_jit_ret_audit_done = 0;
 unsigned long g_jit_ret_audit_skipped = 0;
 unsigned long g_jit_ret_audit_refscan = 0;
+/* Net 3's two enumerated cases, made MEASURABLE (they are reached by
+ * depth, not by shape, so nothing else can tell you they happened):
+ *   seg_advance    slot-stack SEGMENT boundaries crossed
+ *   sync_depth_max high-water mark of the NATIVE sync depth */
+unsigned long g_vm_seg_advance = 0;
+unsigned long g_jit_sync_depth_max = 0;
 
 unsigned long g_norec_recon_at = 0;      /* 0 = off, else the 1-based event */
 unsigned long g_norec_events = 0;        /* call events seen this run */

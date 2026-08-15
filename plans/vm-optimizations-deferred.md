@@ -271,13 +271,13 @@ as a problem".
     `norec_walk_chain` at ZERO; the shadow workload plus two new
     corpus programs took the surface from 54.8%/47.0% to 77.4%/62.6%.
     **STILL OPEN**: the ~335 residual lines/branches, dominated by
-    abort arms and loop backstops, plus two runtime coincidences the
-    plan enumerated and the corpus still does not build - a call
-    exactly at a `SEG_SLOTS` boundary, and a reconstruction spanning
-    a boundary AND a native-stack growth. Marking them wholesale would
-    be the "silently exempt" failure the design forbids, so the floor
-    holds the line until they are genuinely covered. Detail:
-    `docs/jit-optimizations.md`'s Net 4 entry.
+    abort arms and loop backstops. (The three DEPTH cases the plan
+    enumerated - a call at a `SEG_SLOTS` boundary, recursion deep
+    enough to grow the native stack, and a reconstruction spanning
+    both - are now COVERED by `norec_segment_boundary`, 2026-08-13.)
+    Marking the residue wholesale would be the "silently exempt"
+    failure the design forbids, so the floor holds the line until it
+    is genuinely covered. Detail: `docs/jit-optimizations.md`.
 - **A `.myv` agreement lane** (`archived/myv-serializer.md`, S5's
   fourth lane, never built): `nested_fuzz.py --myv` (compile -> file ->
   load -> run as a fourth agreement engine) plus a CI round-trip step.

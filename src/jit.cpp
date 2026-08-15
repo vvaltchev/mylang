@@ -5190,6 +5190,8 @@ void jit_stats_report()
         { "ret_audit_done",   &g_jit_ret_audit_done },
         { "ret_audit_skip",   &g_jit_ret_audit_skipped },
         { "ret_audit_refscan",&g_jit_ret_audit_refscan },
+        { "seg_advance",      &g_vm_seg_advance },
+        { "sync_depth_max",   &g_jit_sync_depth_max },
         /* step 4 gate reach, classified per M5b inline push: would the
          * CALLEE qualify for the no-record tier? (see push_verify) */
         { "norec_gate_ok",    &g_jit_norec_gate_ok },

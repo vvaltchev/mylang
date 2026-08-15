@@ -1055,6 +1055,8 @@ extern bool g_norec_audit;
 extern unsigned long g_jit_ret_audit_done;
 extern unsigned long g_jit_ret_audit_skipped;
 extern unsigned long g_jit_ret_audit_refscan;
+extern unsigned long g_vm_seg_advance;
+extern unsigned long g_jit_sync_depth_max;
 extern unsigned long g_norec_recon_at;
 extern unsigned long g_norec_events;
 extern unsigned long g_jit_norec_recon_probes;
