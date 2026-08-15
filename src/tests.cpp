@@ -3752,6 +3752,54 @@ static const std::vector<test> tests =
       { "func e() { }",
         "assert(str(e()) == \"<none>\");" } },
 
+    /*
+     * G2 (2026-08-06): CaptureSlots - the closure's captures are a
+     * hand-rolled tiny vector with `inline_cap` (2) slots inside the
+     * FuncObject and a heap buffer beyond that. BOTH ARMS NEED A TEST, and
+     * neither existed: every capture list in bench/, samples/ and
+     * tests/functional/ is exactly ONE name, and the widest in this file
+     * was TWO - i.e. exactly at the inline bound, so the heap arm was
+     * never reached by anything.
+     *
+     * The copy case is the subtle one. `ptr` may point INTO the object, so
+     * a copy ctor that copied `ptr` instead of re-pointing at its own
+     * buffer would leave two closures sharing one capture array (and a
+     * dangling pointer once the source dies). clone() of a CAPTURING
+     * closure is specified to be independent (TypeFunc::clone), so a
+     * shared array shows up as the clone's counter advancing the
+     * original's - which is what these assert.
+     */
+    { "closure captures: 5 captures (the heap arm) read + mutate",
+      { "func mk(a, b, c, d, e) {",
+        "  return func [a, b, c, d, e] {",
+        "    a = a + 1;",
+        "    return a * 10000 + b * 1000 + c * 100 + d * 10 + e; }; }",
+        "var f = mk(1, 2, 3, 4, 5);",
+        "assert(f() == 22345);",
+        "assert(f() == 32345);" } },
+    { "closure captures: clone() is independent (heap arm)",
+      { "func mk(a, b, c) {",
+        "  return func [a, b, c] {",
+        "    a = a + 1; return a * 100 + b * 10 + c; }; }",
+        "var f = mk(1, 2, 3);",
+        "assert(f() == 223);",
+        "var g = clone(f);",
+        "assert(g() == 323);",     /* g continues from f's state... */
+        "assert(f() == 323);" } }, /* ...but does NOT advance f's */
+    { "closure captures: clone() is independent (inline arm)",
+      { "func mk(a, b) {",
+        "  return func [a, b] { a = a + 1; return a * 10 + b; }; }",
+        "var f = mk(1, 2);",
+        "assert(f() == 22);",
+        "var g = clone(f);",
+        "assert(g() == 32);",
+        "assert(f() == 32);" } },
+    { "closure captures: exactly at the inline bound, and one over",
+      { "func mk2(a, b) { return func [a, b] => a * 10 + b; }",
+        "func mk3(a, b, c) { return func [a, b, c] => a * 100 + b * 10 + c; }",
+        "assert(mk2(1, 2)() == 12);",
+        "assert(mk3(1, 2, 3)() == 123);" } },
+
     /* dyn-into-concrete COERCION: `int + dyn` is `dyn` (the natural result), but
      * a `dyn` value is ASSIGNABLE to a concrete NUMERIC local - a runtime-checked
      * coercion. So a `var s = 0; s = s + x` accumulator KEEPS `s` int (its type

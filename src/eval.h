@@ -17,6 +17,7 @@
 #include <unordered_map>
 
 class Identifier;
+class CaptureSlots;   /* a closure's captured values - defined below */
 
 /*
  * Non-local control flow (return/break/continue) is signaled through this
@@ -285,7 +286,7 @@ public:
      * at the called closure's vector. A `SymKind::capture` reference
      * reads/writes `(*captures)[slot]` - an O(1) slot, no map walk.
      */
-    std::vector<LValue> *captures;
+    CaptureSlots *captures;
 
     /*
      * Points at the FlowState shared by every context within the current
@@ -635,6 +636,114 @@ get_root_ctx(EvalContext *ctx)
 EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
                    const UniqueId *uid);
 
+/*
+ * A closure's captured values. A hand-rolled tiny vector, NOT a std::vector,
+ * for two reasons (G2, 2026-08-06):
+ *
+ *  - THE HEAP ALLOCATION. A capture list is almost always ONE name (every
+ *    site in bench/, samples/ and tests/functional/ is exactly one), and a
+ *    std::vector paid a malloc AND a free per closure - with its reserve,
+ *    141 Ir of the ~890 a closure creation cost. `inline_cap` slots live
+ *    inside the FuncObject, so the common closure allocates nothing.
+ *
+ *  - LAYOUT. The JIT walks `ctx->captures->data()` as a plain
+ *    `mov r9, [rax+0]` (emit_ctx_chain_r9, jit.cpp) - it hard-codes "the
+ *    first 8 bytes are the data pointer", which is where libstdc++ puts
+ *    vector's _M_start. `ptr` MUST therefore stay the FIRST member; the
+ *    static_assert below is what stops a future edit from moving it. (The
+ *    other two JIT sites only save/restore the container pointer itself,
+ *    into rec.caller_captures, and never index it.)
+ *
+ * Only what the call sites need: index, size/empty, and a one-shot build of
+ * reserve + emplace_back. No iterators, no erase, and no growth after the
+ * reserve - a capture list is fixed at closure creation.
+ *
+ * `ptr` may point INTO this object (the inline buffer), so a CaptureSlots is
+ * neither movable nor assignable; copying re-points the copy at its own
+ * buffer. FuncObject is only ever created in place and copied by
+ * TypeFunc::clone, never relocated.
+ */
+class CaptureSlots final {
+
+public:
+
+    static const uint32_t inline_cap = 2;
+
+private:
+
+    LValue *ptr;                 /* the data pointer - MUST be first */
+    uint32_t n;
+    uint32_t cap;
+    alignas(LValue) char inl[inline_cap * sizeof(LValue)];
+
+    LValue *inline_slots() { return reinterpret_cast<LValue *>(inl); }
+
+public:
+
+    CaptureSlots() : ptr(nullptr), n(0), cap(0) { }
+
+    CaptureSlots(const CaptureSlots &rhs) : ptr(nullptr), n(0), cap(0) {
+        reserve(rhs.n);
+        for (uint32_t i = 0; i < rhs.n; i++)
+            emplace_back(rhs.ptr[i]);
+    }
+
+    CaptureSlots &operator=(const CaptureSlots &rhs) = delete;
+    CaptureSlots(CaptureSlots &&rhs) = delete;
+    CaptureSlots &operator=(CaptureSlots &&rhs) = delete;
+
+    ~CaptureSlots() {
+        for (uint32_t i = n; i > 0; i--)
+            ptr[i - 1].~LValue();
+        if (cap > inline_cap)
+            ::operator delete(static_cast<void *>(ptr));
+    }
+
+    /* Fix the capacity ONCE, before any emplace_back. */
+    void reserve(size_t want) {
+        ML_CHECK(n == 0 && cap == 0);
+        if (!want)
+            return;
+        if (want <= inline_cap) {
+            ptr = inline_slots();
+            cap = inline_cap;
+            return;
+        }
+        ptr = static_cast<LValue *>(::operator new(want * sizeof(LValue)));
+        cap = static_cast<uint32_t>(want);
+    }
+
+    void emplace_back(EvalValue &&v, bool is_const) {
+        ML_CHECK(n < cap);
+        new (ptr + n) LValue(std::move(v), is_const);
+        n++;
+    }
+
+    void emplace_back(const LValue &lv) {
+        ML_CHECK(n < cap);
+        new (ptr + n) LValue(lv);
+        n++;
+    }
+
+    size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+    LValue &operator[](size_t i) { return ptr[i]; }
+    const LValue &operator[](size_t i) const { return ptr[i]; }
+
+    /*
+     * Never called - it exists for its body. A static_assert at namespace
+     * scope cannot name a private member, and one inside the class body
+     * would need the class to be complete; a member function's body is
+     * compiled after both are true, so this is where the JIT's offset-0
+     * contract can actually be enforced at COMPILE time.
+     */
+    static void layout_contract() {
+        static_assert(offsetof(CaptureSlots, ptr) == 0,
+                      "the JIT reads the capture data pointer at offset 0 "
+                      "(emit_ctx_chain_r9, jit.cpp)");
+    }
+};
+
 class FuncObject : public RefCounted {
 
 public:
@@ -657,13 +766,27 @@ public:
      * must persist across calls to the same closure (e.g. a counter); each
      * closure instance / clone owns its own vector.
      */
-    std::vector<LValue> capture_slots;
+    CaptureSlots capture_slots;
     /*
-     * An empty context parented to the program root - the body's args context
-     * parents to this, so the body reaches the global table (gfuncs) and the
-     * builtins map. Holds no captured values (those are in capture_slots).
+     * The program ROOT context (get_root_ctx at creation). The tree-walker's
+     * do_func_call parents the body's args context DIRECTLY to it, so the body
+     * reaches the global table (gfuncs) and the builtins map.
+     *
+     * G2 (2026-08-06): this used to be an `EvalContext capture_ctx` BY VALUE -
+     * an empty context whose entire content was `(root, false, true)` and whose
+     * only use was to be that parent. Constructing one cost ~39 Ir per closure
+     * and embedded a std::map nobody ever wrote. Parenting args_ctx to the root
+     * instead is byte-identical: the ctor inherits repl_mode/frame/gfuncs/
+     * captures from the parent, and the empty node passed all four through
+     * unchanged (its own `captures` was the root's null, and args_ctx
+     * overwrites that field anyway); `in_const_eval()` walks to the same root
+     * because the node's const_ctx was false; and a name lookup simply skips
+     * one guaranteed-empty map. The raw root pointer is NOT a new lifetime
+     * hazard - `capture_ctx.parent` already held exactly this pointer.
+     *
+     * The VM never used it at all (it reads only capture_slots).
      */
-    EvalContext capture_ctx;
+    EvalContext *capture_root;
 
     FuncObject(const FuncDescriptor *func, EvalContext *ctx);
     FuncObject(const FuncObject &rhs);

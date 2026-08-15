@@ -516,3 +516,91 @@ G1 is the big one and should be planned as its own arc, not an
 increment - the prior session's conclusion that reaching <=5x on the
 call benches needs the frame protocol reduced to what a C++ call does
 still stands, and nothing measured today contradicts it.
+
+## G2 LANDED 2026-08-06: closure creation ~900 -> ~650 Ir
+
+Two data-structure changes in `FuncObject`, no codegen, no JIT emitter, no
+new opcode.
+
+**(a) `capture_ctx` -> `capture_root`.** The FuncObject embedded an
+`EvalContext` BY VALUE whose entire content was `(get_root_ctx(ctx),
+false, true)` and whose ONLY use was to be the parent of the tree-walker's
+`args_ctx`. Constructing one cost ~39 Ir per closure and carried a
+`std::map` nothing ever wrote. Parenting `args_ctx` straight to the root
+is byte-identical: the EvalContext ctor inherits repl_mode / frame /
+gfuncs / captures from its parent and the empty node passed all four
+through unchanged (its own `captures` was the root's null, and `args_ctx`
+overwrites that field one line later); `in_const_eval()` walks to the same
+root because the node's `const_ctx` was false; and a name lookup simply
+skips one guaranteed-empty map. It is not a new lifetime hazard either -
+`capture_ctx.parent` already held exactly this raw pointer. The VM never
+used the node at all (it reads only `capture_slots`).
+
+**(b) `std::vector<LValue>` -> `CaptureSlots`.** A hand-rolled tiny vector
+with `inline_cap` (2) slots inside the FuncObject, heap beyond that. A
+capture list is almost always ONE name - every site in bench/, samples/
+and tests/functional/ is exactly one - so the common closure now
+allocates NOTHING where it used to pay a malloc, a free and a reserve.
+
+THE LAYOUT CONSTRAINT that shapes it: the JIT walks
+`ctx->captures->data()` as a bare `mov r9,[rax+0]` (`emit_ctx_chain_r9`),
+i.e. it hard-codes "the first 8 bytes are the data pointer" - which is
+where libstdc++ puts vector's `_M_start`. Keeping `ptr` as the FIRST
+member is what makes the emitted code byte-identical, and
+`layout_contract()` static_asserts it. (A static_assert at namespace scope
+cannot name a private member and one inside the class body needs the class
+complete; a never-called member function's body is where both hold.) The
+other two JIT sites only save/restore the container POINTER into
+`rec.caller_captures` and never index it. `CaptureSlots` is neither
+movable nor assignable, since `ptr` may point into the object itself.
+
+### The test gap this had to close first
+
+NOTHING exercised either arm. Every capture list in bench/, samples/ and
+tests/functional/ is exactly ONE name, and the widest in `tests.cpp` was
+TWO - i.e. exactly AT the inline bound, so the heap arm was unreachable
+by any existing test, and no test anywhere checked that `clone()` of a
+capturing closure is independent. Four `-rt` cases now cover 2 / 3 / 5
+captures and clone-independence on both arms.
+
+Both sabotages watched failing:
+  - copy ctor copies `ptr` instead of re-pointing at its own buffer (two
+    closures share one capture array): ASan `heap-use-after-free`, and
+    WITHOUT sanitizers the clone-independence assertions fail outright -
+    so the release lanes catch it too, not just the ASan one.
+  - `reserve` ignores the inline bound (writes past the 2-slot buffer):
+    ASan `heap-buffer-overflow`; without sanitizers, a SIGSEGV on the
+    5-capture test.
+
+### Measured (OPT=1 ASSERTS=0 both sides)
+
+callgrind Ir, per iteration:
+
+    r_create (one closure created + destroyed)   953 -> 653   -31.6%
+    63_closures                                  618M -> 498M -19.5%
+    11_closure_counter                                        +0.00%
+    76_funcval_dispatch                                       +0.00%
+
+The two zeros are the point: 11 and 76 create their closures ONCE, at
+startup, so a creation-path change cannot help them - and does not hurt
+them either. Split by sub-item, (a) was -6.6% of r_create and -4.1% of
+63, (b) the rest.
+
+Wall clock, interleaved `--baseline`: **63_closures 0.88x**, suite geomean
+cur/base **1.002x** - neutral, as it must be for a pass that fires on one
+program. (The my/cpp geomean printed 3.161x in that run against 2.694x
+earlier the same day, with no code between them that touches the other 76
+benches: the box was slower under a build+valgrind load. That is exactly
+the drift the machine-marker note warns about, and why `cur/base` from an
+interleaved run is the number to trust.)
+
+Green: `-rt` 1723/1723 in all five modes, rel-hard, clang, CMake, the
+corpus differential + the full lever matrix, the non-JIT platform probe on
+g++ AND clang++, and 60 fuzzer programs.
+
+### What G2 does NOT touch
+
+The other ~650 Ir of a creation is the FuncObject ctor itself, the
+`read_sym` capture snapshot, `jit_make_closure`, and the pooled FuncObject
+allocation. And creation is only ~45% of 63_closures; the rest is G1 (three
+indirect calls per iteration at 219 Ir each).

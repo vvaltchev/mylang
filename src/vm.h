@@ -102,6 +102,7 @@ extern unsigned long g_dyn_foreach_fast[5];
  * this frame's backtrace entry appended).
  */
 class FuncObject;
+class CaptureSlots;   /* a closure's captured values (eval.h) */
 bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
                    const EvalValue *argv, size_t n, EvalValue &out);
 
@@ -135,7 +136,7 @@ private:
     const Chunk *cck_ = nullptr;
     const FuncDescriptor *desc_ = nullptr;
     Frame *w_ = nullptr;
-    std::vector<LValue> *saved_caps_ = nullptr;
+    CaptureSlots *saved_caps_ = nullptr;
     /* #60: g_current_ctx is owned for the whole loop (set once in the ctor,
      * restored in the dtor) so invoke() re-enters vm_dispatch with no per-
      * element CtxGuard store. */

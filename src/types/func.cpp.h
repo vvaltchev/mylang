@@ -82,15 +82,13 @@ FuncObject::FuncObject(const FuncObject &rhs)
     : RefCounted()   /* a clone owns a FRESH count - do NOT copy rhs's */
     , func(rhs.func)
     , capture_slots(rhs.capture_slots)
-    , capture_ctx(rhs.capture_ctx.parent,
-                  rhs.capture_ctx.const_ctx,
-                  rhs.capture_ctx.func_ctx)
+    , capture_root(rhs.capture_root)
 {
 }
 
 FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
     : func(func)
-    , capture_ctx(get_root_ctx(ctx), false, true)
+    , capture_root(get_root_ctx(ctx))
 {
     if (func->captures.empty())
         return;
