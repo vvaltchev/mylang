@@ -723,6 +723,26 @@ static const std::vector<test> tests =
         "       + int(v[1].c); }",
         "assert(t == 164);" } },
 
+    /*
+     * #125 (maintainer's call, 2026-08-06): an index OOB in a TYPED
+     * `a[i].f` read carets the SUBSCRIPT, not the whole member expression -
+     * the fault is the index, not the field, and it is what every other
+     * element read reports.
+     *
+     * This was an ENGINE DIVERGENCE: the tree-walker's fast path
+     * (member_pod_array_scalar) was handed the enclosing MemberExpr's span
+     * and reported `r[i].y`, while the VM reported `r[i]`. Nothing caught
+     * it because the 5-mode differential compares exception TYPES, not
+     * caret columns - only an explicit-column test like this one can, which
+     * is why it exists. In an UNTYPED context the tree-walker never took
+     * the fast path, so the two engines agreed there and the bug hid.
+     */
+    { "err loc: a typed a[i].field OOB marks the SUBSCRIPT, not the field",
+      { "struct P { int x; int y; }",
+        "func f(int i) { var r = [P(1,2)]; var a = 0; a += r[i].y; return a; }",
+        "f(9);" },
+      &typeid(OutOfBoundsEx), 51, 2, 56, 2 },
+
     { "struct elem field: flat / negative index / float + bool fields",
       { "struct P { int x; float w; bool b; }",
         "func g(int i) {",
