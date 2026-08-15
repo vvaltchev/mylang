@@ -2600,10 +2600,10 @@ the AST nodes **by hand in C++** (never parsed, so no fold/inline/specialize can
 perturb the measured nodes or the loop count) and timing each in a tight C++
 loop; per-node marginal cost is isolated by subtracting child-subtree costs and
 printed relative to a slot read. The **CALL** weight is the reference for the
-planned inliner benefit function (inline a body when the sum of its node weights
-is below the call weight — see `plans/archived/function-inlining.md`). Re-run when the
-interpreter changes; reusable for the eventual bytecode VM (the weights change,
-the benefit function does not). Current (`OPT=1 ASSERTS=0`): id/lit/add/cmp ≈ 1,
+inliner's benefit function (inline a body when the sum of its node weights is
+below the call weight — see `plans/archived/function-inlining.md`). Re-run when
+the interpreter changes; the weights are tree-walker-specific but the benefit
+function is not. Current (`OPT=1 ASSERTS=0`): id/lit/add/cmp ≈ 1,
 return ≈ 3, if ≈ 7, assign ≈ 11, **CALL ≈ 21** (×id-read).
 
 Tests are **not** a separate framework — they are entries in the `tests` table
@@ -2951,8 +2951,9 @@ reflection objects. The two native `StructTypeDef`s are built in C++
 (`native_struct_field_def`/`native_struct_layout_def`, `eval.cpp`), the
 inferencer registers them in `struct_by_name` (`setup()`) and types `layout()`
 via `builtin_result`, and `reflect_make_layout` (reflect.cpp.h) constructs the
-boxed instance. This is the mechanism `Type` objects (the planned
-`type()`/`decltype()` return value) will reuse — see `plans/archived/reflection.md`.
+boxed instance. `Type` objects (the `type()`/`decltype()` return value, see
+*Compile-time TYPE QUERIES*) reuse this same mechanism — design record:
+`plans/archived/reflection.md`.
 
 **Why so many headers are templates.** `type.h` (`TypeTemplate`),
 `sharedarray.h`
@@ -3401,30 +3402,12 @@ parse-time consts and `const` params; `isconst` also accepts auto-const vars and
 auto-const params. All four are registered as runtime builtins (with fallback
 bodies) so the names resolve even when the pass doesn't fold them.
 
-**In progress: function inlining & specialization.** Designed and being built;
-see `plans/archived/function-inlining.md` for the full plan and task order. Three aims:
-(1) *specialization* — propagate a const/auto-const argument into a (possibly
-non-pure) function and fold (the missing half of const-parameter propagation,
-since today only pure/auto-pure whole-call folding crosses a call); (2) *inline
-trivial bodies even with no const args* (`func f(x) => x+1` called `f(y)` folds
-to `y+1` in place — removes call overhead and exposes the body to the caller's
-const-folder); (3) keep backtraces identical with inlining on/off. The two
-formerly-open questions are settled: the **criterion** is "specialize→fold→
-measure→decide" (inline if tiny-after-fold; else emit a shared specialized clone
-if it folded a lot; else leave the call), and the **backtrace** uses
-"inlined-at" chains (`InlineCtx`, `errors.h`) flushed by `flush_inline_frames`
-(`backtrace.cpp`) at two error-path points (`Construct::eval` and
-`do_func_call`'s catch), keyed off `Exception::inline_origin_emitted` (see the
-re-fold paragraph), leaving `format_backtrace` unchanged. Algebraic
-simplification of non-constant operands (`x+1-1 -> x`, `a+a -> 2*a`,
-`x*2*3 -> x*6`) is done for **int-typed** operands only (`fold_int_arith`, see
-its own section) — sound because inference proves the type (`-fwrapv` makes int
-`+`/`-`/`*` associative); it stays out of scope for `float` (non-associative
-rounding) and `str`/`array` (`+`-overloading), and `/`/`%` (truncating division
-isn't associative). **Status:** the `InlineCtx` backtrace foundation exists (a
-`Construct::inline_ctx` field, the flush helper + the `Construct::eval` hook),
-**AST deep-clone** (`Construct::clone()`, all node types), and the **size-only
-inliner** (`Inliner` in `resolver.cpp`, run after `AutoConst`; gated by `-ni`).
+**Function inlining & specialization** (design record:
+`plans/archived/function-inlining.md`). The pieces: "inlined-at" chains
+(`InlineCtx`, `errors.h`) keep backtraces identical with inlining on or off
+(see *Inlined (virtual) frames* under the error model), **AST deep-clone**
+(`Construct::clone()`, all node types), and the **size-only inliner**
+(`Inliner` in `resolver.cpp`, run after `AutoConst`; gated by `-ni`).
 It splices eligible direct calls — top-level, expression-bodied, non-capturing,
 non-recursive, no nested function, arity match, body ≤ a node threshold (`-it
 N`, default 24), sound arg use
@@ -5821,8 +5804,9 @@ sequence of `(input, expected-substring)` steps, so the persisted global scope
 AND the cross-input type commitment / `:undef` reset / per-input optimizers are
 exercised; the **`lineedit:`** / **`highlight:`** `extra_checks` feed byte
 scripts / strings to the pure cores. Only `read_line`'s few syscalls are not
-unit-tested. **Not yet (Phase 5):** an IRB-style dropdown completion menu,
-reverse-search / bracketed paste, and the Windows raw-input backend.
+unit-tested. **Not built:** an IRB-style dropdown completion menu, and the
+Windows raw-input backend (the editor is termios-only; on Windows the REPL
+falls back to line-at-a-time input).
 
 ## Testing an AST TRANSFORM (the differential does NOT cover it)
 
@@ -6014,12 +5998,13 @@ the proof. Before calling it done:
 >    chunk carries none of it.
 > 7. **The ONLY exceptions are the REPL and the `-rt` test harness** (they
 >    retain the AST for their own reasons — decompilation, differential
->    testing). A plain script run (`mylang file.my`, `-vm`, and the eventual
->    `.myv`) has ZERO AST at runtime.
-> 8. **The endgame is a serializable `.myv` file** (`mylang -c file.my` →
->    binary, run with no AST). That is IMPOSSIBLE while any `Construct*`
->    survives codegen. So this rule is not aspirational polish — it is the
->    load-bearing invariant the whole VM exists to satisfy.
+>    testing). A plain script run (`mylang file.my`, `-vm`, `.myv`) has ZERO
+>    AST at runtime.
+> 8. **This is what makes the `.myv` file possible** (`mylang -c file.my` →
+>    binary, run with no AST — SHIPPED, see the format section). It would be
+>    IMPOSSIBLE while any `Construct*` survived codegen. So this rule is not
+>    aspirational polish — it is the load-bearing invariant the whole VM
+>    exists to satisfy.
 > 9. **When you find a construct that isn't natively lowered, NATIVIZE IT.** Do
 >    not add a node-holding op. Do not relocate the node. Extract its loc/data
 >    to a pool and emit real bytecode. (Since the no-fail contract landed, an
@@ -6257,7 +6242,8 @@ order — the same order a real C/C++ compiler works in:
    operand reads saved ~1 instruction/iteration, 0.03%, because it only trades
    a well-predicted monomorphic vcall for an equal-length inline branch; the
    per-node dispatch can only be removed *wholesale*, which is what a VM does).
-   Target: **5-10x CPython**.
+   The target was **5-10x CPython**; with the native tier it was crossed
+   (10.25x on 2026-07-28, see the JIT sections).
 
 The VM does **not** replace the runtime value/scope model — it reuses
 `EvalValue`, `EvalContext`, `Frame`/slots, the global/builtin tables,
@@ -6265,9 +6251,10 @@ The VM does **not** replace the runtime value/scope model — it reuses
 strategy* (a flat instruction stream + a switch loop) layered over the same
 runtime, not a second interpreter — which is what keeps it small and correct.
 
-**Status: Phase 5 in progress** (register machine over frame slots —
-resolved-local int/float/mixed scalar loops run native at top level, inside
-function bodies via a `do_func_call` hook, and NESTED — nested loops + `if` in a
+**THE OP INVENTORY.** What follows is what the VM lowers natively today - the
+whole language, since the codegen is no-fail (see the ZERO-AST rule above).
+Resolved-local int/float/mixed scalar loops run native at top level, inside
+function bodies, and NESTED — nested loops + `if` in a
 loop body compile directly into the chunk; array element read/write `a[i]` /
 `a[i]=v` / `a[i][j]` (and a subscript **inc-dec** `a[i]++`/`d[k]++`/`a[i]--` →
 `StoreElemInt`/`Float` with a constant 1 for a flat array, or a `DictStore` with
@@ -6278,11 +6265,8 @@ STORE ops **`DictStore`/`StoreElemValue`** are **AST-free**:
 (the shared `Type::subscript(for_write)` + `slot_rmw`) handles ANY base type, so
 the `is<Dict>`/`is<Array>` guard + `node->eval` fallback were dropped and its
 not-an-lvalue caret is now a `Loc` pair (from the loc side table, recorded by
-`extract_locs` from `node` = the `Subscript`), not an `Expr14`-cast node. A
-flow-free statement runs as a fallback within an otherwise-native loop so
-array-building loops (matrix/sieve) go native; recursion stays neutral; **suite
-geomean 0.75x, VM ~1.3x faster than the tree-walker**). A **boxed (dyn/string)
-value tier** then removed the `node->eval` fallback for scalar `dyn`/string
+`extract_locs` from `node` = the `Subscript`), not an `Expr14`-cast node.
+A **boxed (dyn/string) value tier** covers scalar `dyn`/string
 expressions — assign / compound-assign / comparison / logical `&&`/`||` over
 locals, globals, captures, builtins, literals, subscripts (`a[i]` via the
 runtime `Type::subscript`), members (`obj.f` / `d.k` via a shared
@@ -6945,7 +6929,7 @@ target falls back to build+append, matching the tree-walker). So a
 AST-FREE** (the `Chunk::emplace_sites` pool: the ctor's POD def + the
 container-arg caret + the per-field coerce carets + the callee name, indexed
 by the kind-packed `Instr::a`; the whole-args caret rides the loc side
-table), so a struct-append chunk serializes with an empty `node_table`.
+table), so a struct-append chunk holds no AST pointer at all.
 An **AST builtin**
 (defined/type/…, needs the arg node) keeps the union null (its call site
 falls back whole) — EXCEPT `defined`, now fully lowered: only a bare
@@ -7002,37 +6986,22 @@ tree-walker — the baseline now gets `-tw`). Implemented in its **own files** �
 enum — named `OpCode`, since `Op` is already the operator enum in
 `operators.h` — plus `Instr`/`Chunk`), `codegen.{h,cpp}` (`codegen_program`,
 AST→`Chunk` lowering), `vm.{h,cpp}` (`vm_execute` + the `g_exec_engine`
-harness switch) — never woven into `eval.cpp`. The build-out is strictly
-incremental behind three safety pillars: an **AST-fallback opcode**
-(`OpCode::EvalStmt`, and later `EvalExpr`, whose handler is just
-`node->eval(ctx)`) so the VM executes the *whole* language from day one; a
-**differential test harness** (the `tests` table reruns under the VM and must
-match the tree-walker — see "Tests"); and a **performance gate** (`bench/run.py
---vm --baseline`, `cur/base` = VM/tree-walker — see "Benchmarks"). We replace
-fallbacks with native opcodes one small, fully-tested step at a time — never a
-big-bang 10k-LoC drop; a temporary, *tracked* scaffolding regression from the
-smallest sensible step is acceptable, an accidental one is not.
-**Phase 0** lowered the optimized root to one `EvalStmt` per top-level statement
-+ `Halt`, building the root `EvalContext`/`Frame`/`GlobalFuncTable` exactly as
-`Block::do_eval`'s root path — byte-identical to `root->eval(nullptr)`.
-**Phase 1** added native control flow (`Jump`/`JumpIfFalse`/`LoopBackEdge`) and
-flattened **top-level `if`/`while`** to jumps; conditions/bodies still fell back
-(one `do_eval` each). (`JumpIfFalse` and its Phase-1 gen_if/gen_while flatten
-forms are since DELETED; `LoopBackEdge` is DELETED too — once the no-fail
-codegen removed every fallback body, nothing could set a brk/cont/ret
-FlowState inside a chunk and codegen had already stopped emitting it, so
-the VM's only remaining FlowState use is ReturnV's value hand-off to
-do_func_call — see plans/archived/vm-native-call-stack.md Phase A.)
-**Phase 2** is a **REGISTER machine over the frame slots** (the VM's registers
+harness switch) — never woven into `eval.cpp`. The conversion itself is
+history (`plans/archived/bytecode-vm.md`); its scaffolding opcodes -
+`EvalStmt`/`EvalExpr`, `JumpIfFalse`, `LoopBackEdge` - are all DELETED, and
+that last deletion is why **the VM's only remaining FlowState use is
+ReturnV's value hand-off to `do_func_call`**: with no fallback body left,
+nothing inside a chunk can set a brk/cont/ret FlowState
+(plans/archived/vm-native-call-stack.md Phase A).
+The VM is a **REGISTER machine over the frame slots** (the VM's registers
 ARE the resolved-local slots — NO value stack), with fused superinstructions:
 `IntBin` (3-address `dst = a <arith> b`, operands = slot or int immediate) and
 `JumpUnlessIntCmp` (fused compare+branch). A `while` whose condition is an int
 compare and whose body is int assignments (compound `s += i*i`, plain
 `x = a*b+1`, `++`/`--`) compiles with **no tree-walker fallback**; **nested
 expressions** use scratch temp slots (`compile_int_expr` + a temp register
-allocator above the resolved locals; `Chunk::n_temps` grows the frame). Anything
-else (a bare/bool leaf plain-assign, a global/capture operand, a call) falls
-back to Phase 1. **Bool-safety:** a plain assign's rhs must be `definitely_int`
+allocator above the resolved locals; `Chunk::n_temps` grows the frame).
+**Bool-safety:** a plain assign's rhs must be `definitely_int`
 (arith/neg/int-literal, never a leaf id or comparison — both can be bool), since
 writing an int into a bool slot would corrupt it. **Float** loops compile too
 (`FloatBin`/`JumpUnlessFloatCmp`, operands promote), as do **mixed** int/float
@@ -7106,7 +7075,7 @@ void function, a trailing loop/if) keeps the `Halt` as its implicit-return-
 `none` terminator + jump target. Recursion with arith stays ~neutral (`fib`
 −0.08%).
 
-**Phase 5** widens native coverage: array element read/write
+**Array elements and nested control flow:** array element read/write
 (`a[i]` / `a[i]=v` → `LoadElem`/`StoreElem`, mirroring the flat-array
 subscript/store incl. COW; a dict subscript stays a fallback via the inferencer-
 set `Subscript::base_array`), and **nested control flow** — the loop codegen
@@ -7130,12 +7099,7 @@ move preserves the real type. A **15-level randomly-nested if/while/for
 `vm/codegen: deep 15-level nest` test + `bench/*/68_nested`, ~4x CPython; and
 the `tests/nested_fuzz.py` differential fuzzer, which generates thousands of
 random deep-nested programs + their Python twins and checks tree-walker == VM ==
-CPython).
-**Suite geomean 0.61x, VM ~1.6x faster than the
-tree-walker** (improved from 0.82x as the container-STORE residuals — struct
-field, nested `a[i][j]`, global/capture base, and the universal dyn-base
-`StoreElemValue` — went native, so matrix/dict/struct benches no longer fall
-back: `68_nested` 0.22x, `65_struct_field_sum` 0.22x vs the tree-walker). The
+CPython). The
 register choice (over a stack machine, which the
 already-M8-optimized tree-walker would beat) is also the right IR for the
 eventual native x86-64 codegen. Full roadmap + phase order:
@@ -7179,11 +7143,10 @@ the loc, records it and **NULLs `node`** — making them AST-free. It migrated t
 div/mod carets of `IntBin`/`FloatBin` (throw via `vm_throw_div0(chunk, pc)`,
 which uses `loc_at`, not `node`) and dropped the dead `node` from the
 non-throwing `JumpUnlessIntCmp`/`JumpUnlessFloatCmp`/`ForLoopStep`. So the whole
-register/loop CORE is now `node`-free. **The runtime `Instr` holds no live AST
-reference** (see *AST-node side table* below): a residual node is looked up by pc
-in the pc-keyed `node_table`, and the codegen-transient `node_idx` handle is
-nulled after codegen — so the bytecode has no AST pointer in its instruction
-stream.
+register/loop CORE is now `node`-free. **The runtime `Instr` holds no AST
+reference at all**: the codegen-transient handle lives on `CgInstr` and is
+nulled when codegen finishes (`verify_ast_free`), so the bytecode has no AST
+pointer in its instruction stream.
 
 **Foundation step 2 — op-data into the CONST POOL (member key, started).**
 `DictLoadInt`/`DictLoadFloat` (the typed `d.k` / `d[k]` read) are now fully
@@ -7222,8 +7185,7 @@ frame backtraces are byte-identical). **The foreach / array-read ops
 dead non-array `node->eval` else-branch - unreachable, `base_array` is proven -
 became an `InternalErrorEx` net). The builtin-call ops
 (`CallBuiltinV`/`LV`/`LVElem`) read the serializable `builtin_calls` pool and
-`EmplaceStruct` the `emplace_sites` pool, so the ONLY remaining `node` user
-is the single fallback op (`EvalStmt`) — `CallValueGenericV` reads the
+`EmplaceStruct` the `emplace_sites` pool; `CallValueGenericV` reads the
 `call_sites` pool. P8
 exceptions are fully native (they no longer reach a fallback op). The FALLBACK-OP
 AUDIT (`plans/archived/vm-fallback-elimination.md`) that followed found LIVE `EvalStmt`
@@ -7294,9 +7256,9 @@ surfaced a **pre-existing tree-walker bug**: auto-const promoting a write-once
 INDEX var (`var i=1; a[i]++`) dropped its decl but `fold_reads` had no
 `IncDecExpr` case, dangling the promoted `i` — fixed by folding the READS in an
 inc-dec lvalue like an assignment lvalue. **Net: ALL of `bench/` and `samples/`
-lower with an EMPTY `node_table` (100% native, serializable) — the struct
-benches' last `EmplaceStruct` ctor node is gone too (its def + carets moved
-into the serializable `emplace_sites` pool).**
+lower 100% native and fully serializable — the struct benches' last
+`EmplaceStruct` ctor node went too (its def + carets moved into the
+serializable `emplace_sites` pool).**
 
 **Error-path constructs → native throwing ops (`ThrowRuntimeV`).** The
 always-throwing constructs the tree-walker ran and threw on are now native: an
@@ -7393,8 +7355,7 @@ corner (documented, not observable in well-formed code): an UNRESOLVED id
 in a non-arg0 position throws at its own position under the VM
 (`ThrowRuntimeV` in the run) but at the consumer in the tree-walker, so a
 LATER arg's side effects may run in one engine and not the other — both
-throw the same `UndefinedVariableEx`. **With this, `node_table`'s only
-user is the ONE fallback op** (`EvalStmt`).
+throw the same `UndefinedVariableEx`.
 
 **Niche STATEMENTS → native (a further sweep).** Several residual real shapes
 went native: an **inc-dec STATEMENT on an int/float member/nested subscript**
@@ -7483,8 +7444,8 @@ storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
 / `str s;` / `Point p;` is already desugared (at parse) to a zero-value literal
 / zero-struct ctor rvalue, so it lowers the same way.
 
-**The Tier-1 endgame (2026-07-14): `EvalToSlot` + `JumpIfFalse` are
-DELETED; `EvalStmt` is THE single fallback op.** The last live expression/
+**`EvalToSlot` + `JumpIfFalse` DELETED (2026-07-14)** — the step before the
+no-fail codegen below, which took `EvalStmt` too. The last live expression/
 statement roots went native first: **coalesce** `a ?? b` (a
 `compile_boxed_expr` case: MoveV lhs into the dst — reserved BELOW the
 scratch temps — + the new **`JumpIfNotNoneV`** op to skip the rhs, so the
@@ -7588,38 +7549,17 @@ the dyn scalar/element/member inc-dec, `append` to a struct member, the common
 `DefinedGlobalV` / the non-identifier arg / wrong arity), and a
 runtime-`const` rebind are all now native (above).
 
-**The AST-NODE SIDE TABLE — `Chunk::node_table` (the indexed `ast_nodes` POOL is
-DROPPED).** A runtime-node op looks its `Construct*` up by **pc** in the
-pc-keyed **`node_table`** (`{pc, Construct*}`, sorted, binary-searched by
-`node_at_pc` on the COLD path only — SAME shape/cost as `locs` / `inline_ctxs`),
-NOT via a per-`Instr` index into a pool. The residual nodes are now ONLY the
-ONE fallback op (`EvalStmt`, `node->eval`).
-The builtin-call ops read the `builtin_calls` pool,
-`EmplaceStruct` the `emplace_sites` pool (ctor def + container/field carets),
-`CallValueGenericV` the `call_sites` pool (carets + arg0's lvalue
-descriptor — F1 step 2),
-`CheckFuncV`/`MapFilterV` and the flat int/float element stores the loc side
-table, and the checked inc-decs the `incdec_sites` / `incdec_chains`
-pools — all AST-free.
-**How it's built:** `Instr::node_idx`
-(a 4-byte index into a CODEGEN-TRANSIENT `Chunk::ast_nodes`, appended by
-`Codegen::add_ast_node`) is the SPLICE-STABLE handle codegen needs before an
-op's final pc is known (ops grow + roll back, and an index survives that where a
-pc would not); `extract_locs` nulls the loc-only ops' `node_idx` (their caret is
-in the loc side table) and a KEEP-list marks the genuine runtime-node ops; then
-**`build_node_table`** (post-`extract_locs`, pcs final) flattens each surviving
-`{pc → ast_nodes[node_idx]}` into `node_table`, NULLS every live `node_idx`, and
-CLEARS `ast_nodes`. So the finished chunk carries NO indexed pool and NO live
-per-`Instr` `node_idx` — the runtime uses `node_at_pc(pc)` (`node_idx` stays a
-codegen-only handle, always `-1` at runtime; one `Instr` layout, no codegen-vs-
-runtime split). A **fully-native chunk ends with an EMPTY `node_table`** — a
-non-empty one is EXACTLY the "this chunk still needs the AST, a `.myv` writer
-must keep it or reject" signal (`-vd` dumps it labelled *NOT serializable*).
-This is the ONE remaining non-serializable side table (the loc / member-key /
-catch-type / literal-obj / closure-def / struct-def / unpack-target / chain-locs
-/ inline-frames pools are all plain data or by-name-re-internable). The
-node-drop was ~orthogonal to the VM-exception work (see
-`plans/archived/vm-fallback-elimination.md`).
+**WHERE AN OP'S DATA COMES FROM (all of it serializable).** The builtin-call
+ops read the `builtin_calls` pool, `EmplaceStruct` the `emplace_sites` pool
+(ctor def + container/field carets), `CallValueGenericV` the `call_sites` pool
+(carets + arg0's lvalue descriptor), `CheckFuncV`/`MapFilterV` and the flat
+int/float element stores the loc side table, and the checked inc-decs the
+`incdec_sites` / `incdec_chains` pools.
+The AST-node side table this section used to describe -
+`Chunk::node_table`/`node_at_pc` and the `ast_nodes` pool - is GONE with the
+fallback op it existed for; the codegen-transient handle now lives on
+`CgInstr`, not `Instr` (see B3 stage 2), and `verify_ast_free` asserts every
+one is nulled when codegen finishes.
 
 **A THIRD side table — `Chunk::inline_ctxs` (`pc → inline_frames index`, P8 Inc
 4).** Same shape/cost as `locs` (sorted, binary-searched, throw path only),
@@ -7650,13 +7590,12 @@ JIT-bakeable operand data for BinOpV/CmpV/CompoundV; rebuilt on a `.myv` load,
 not primary), `incdec_sites`, `incdec_chains`, `emplace_sites`,
 `call_sites`, `catch_types`,
 `literal_objs`, `closure_defs`, `struct_defs`,
-`unpack_targets`, `chain_locs`, the pc-keyed `node_table` - labelled *NOT
-serializable* -, `locs`, `inline_ctxs` + its `inline_frames` pool - non-empty
-ones only). This is the audit surface for the `.myv` stored-bytecode endgame:
-everything a serialized file must hold is visible in the dump, and — now that
-`inline_ctxs` is flattened into the serializable `inline_frames` pool — a
-non-empty `node_table` is the ONE remaining section that says the AST can't yet
-be dropped for that chunk. Each chunk's header also shows its **CONTAINER PLAN**
+`unpack_targets`, `chain_locs`, `locs`, `inline_ctxs` + its `inline_frames`
+pool - non-empty ones only). This is the audit surface for the `.myv` stored
+bytecode: everything a serialized file must hold is visible in the dump, and
+every section in it IS serializable - the no-fail codegen and the flattened
+`inline_frames` pool between them removed the last one that was not. Each
+chunk's header also shows its **CONTAINER PLAN**
 (model-flip M1, `jit_container_plan`, `jit.cpp`): how the body partitions into
 NATIVE vs ISLAND segments and whether it could be ONE native container —
 `READY` (every op native-ELIGIBLE, a looser bar than `native_leaf`: an op can
@@ -7694,7 +7633,8 @@ next" surface). DUMP-ONLY today; see **THE MODEL FLIP** below and
 > RULE (see *Benchmarks*); apply it to EVERY native-codegen change.
 
 **THE MODEL FLIP — native CONTAINERS with bytecode ISLANDS
-(`plans/model-flip.md`, M1-M4a landed).** The endgame inversion of the JIT: flip
+(`plans/model-flip.md`, M1-M4a landed; M4b measured MOOT — see the end of
+this paragraph).** The endgame inversion of the JIT: flip
 "BYTECODE with native ISLANDS" (a bytecode chunk, some runs replaced by
 `EnterNative`, the interpreter driving between them) into "NATIVE with bytecode
 ISLANDS" — EVERY function becomes ONE `call`-able native BLOB; its
@@ -7744,9 +7684,19 @@ MEASURED −3.4% instructions on a synthetic loop (container vs `-nj`) — a rea
 MODEST win, LIMITED by the per-island `vm_dispatch` RE-ENTRY overhead. Still one
 island of simple boxed ops + no calls, so M1-M4a match NO bench/sample (real
 loops have a multi-island init+body / richer ops) — ZERO suite impact; M4a is a
-mechanism step + the M5 prerequisite. **M4b (next):** multiple islands + richer
-island ops + the BRANCHED island-exit (boxed conditions) + a leaner island
-executor — only then do real mixed functions become winning containers. Proven
+mechanism step + the M5 prerequisite. **M4b IS MOOT AS A PERF ITEM, MEASURED
+(2026-07-28, plans/model-flip.md "the prize is collected"):** the nativize-ops
+arc got there from the other side. 100% of bench + sample chunks are
+container-READY, and `vm_dispatch`'s callgrind SELF cost is a CONSTANT 47
+instructions (invocation entry + Halt) across every hot bench — the
+interpreter loop does not execute in the steady state anywhere on the suite,
+so there is no dispatch left for a flip to capture. The runtime already IS
+"native driving, C++ helpers for the hard ops", reached by growing the islands
+to cover everything rather than by flipping the driver. The one nonzero
+residue is 70_exc_runtime_error's post-throw resume, an exception-PATH cost
+(#74's territory, not a flip target). What remains of the flip is the
+ARCHITECTURE milestone: M5-flip is largely subsumed by the M5b/c native sync
+calls, and M6 (delete-originals + `.myv`) has since landed. Proven
 by the `jit_container` `-rt` test (`g_jit_container_calls` coverage + a
 throw-from-island + a loop container) + differential + fuzzer + `-vdj`. Builds on
 `plans/archived/native-call-impl.md` (v1 native calls) and `plans/native-aot.md`

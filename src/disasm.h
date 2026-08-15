@@ -15,18 +15,13 @@ class Block;
  * and immediates (`#N`), and the instructions are the fused superinstructions
  * (a for-loop counter is ONE `for.step`, not three ops).
  *
- * A residual runtime-node op - a fallback (`eval.stmt` / `eval.slot` /
- * `jmp.if.not`), a MUTATING/map-filter builtin call, or a flat-store caret -
- * holds its AST node as an INDEX into `Chunk::ast_nodes` (the `Instr` itself has
- * NO `Construct*` - that is what lets the bytecode serialize). The disassembler
- * renders that node via the SHARED AST decompiler (`render_construct_code`,
- * coderender.h) so it reads as the AST dump, not a duplicate, and dumps the
- * `ast_nodes` pool itself (labelled NOT serializable). A READ-ONLY value-ABI
- * builtin call (`call.blt.v`) is AST-FREE - it reads the serializable
- * `builtin_calls` pool (name + arg carets), also dumped. As the residual ops
- * become native (the no-fallback end-goal) the `ast_nodes` pool shrinks toward
- * EMPTY - a fully-native chunk has an empty `ast_nodes`, the accurate "the AST
- * can be dropped" signal for a stored-bytecode `.myv`.
+ * EVERY op's data comes from a SERIALIZABLE pool: a builtin call
+ * (`call.blt.v` and the LV family) reads `builtin_calls` (name + arg carets),
+ * a struct-append `emplace_sites`, an indirect call `call_sites`, and a caret
+ * with nowhere else to live rides the `locs` side table. There is no AST
+ * pointer to render: the no-fail codegen removed the fallback ops that needed
+ * one, and with them `Chunk::ast_nodes` / `node_table` (see CLAUDE.md's
+ * ZERO-AST rule). So the whole dump is what a `.myv` file stores.
  *
  * `cap_names` is a CLOSURE's capture list - its anonymous capture-struct field
  * names, in `cN` slot order: the header prints them (`; captures (anon struct):
