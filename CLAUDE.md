@@ -5727,6 +5727,16 @@ AST transform joins **all three** on the day it is written:
 >    three divisor-guard cases were vacuous exactly this way. Defeat by
 >    making the local write-TWICE (`var z = 1; z = n - n;` - blocked
 >    from promotion), or by calling with a non-const argument.
+> 7. **A CALL is not a call by the time codegen sees it.** Testing what
+>    an op does to a slot's DATAFLOW (a kill, a barrier, a liveness
+>    edge) with `p = mk(i)` exercises nothing: a small callee is
+>    inlined by the AST inliner or spliced by the bytecode inliner, and
+>    the reads afterwards then read the INLINED BODY's own slot, not
+>    the one the call would have written. C4d's KILL sabotage passed
+>    against exactly this - 4 emitted guards either way. Use a shape
+>    that survives to codegen (a plain `p = q` MoveV took the same
+>    sabotage from 4 guards to 2), or check `-vd` for the op the test
+>    actually produces.
 >
 > The mechanical safeguards, both mandatory: an **EMITTED-code counter**
 > (the `g_jit_store_fast` pattern - the helper's counter also counts
