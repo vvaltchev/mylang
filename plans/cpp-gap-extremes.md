@@ -343,3 +343,176 @@ whole point of the native-call arc, not one increment of it.
 46_matrix_mult and the callback benches additionally need the value model
 (N7): a boxed EvalValue + an intrusive_ptr retain/release per container
 touch is the floor there, and no amount of call work moves it.
+
+
+# Re-measured 2026-08-06: the tail is now ONE cause, and it is the
+# indirect call
+
+Maintainer's request: run the suite vs C++, take the five worst, find
+out why, and re-plan. Suite geomean **2.694x** over 76 paired benches
+(`OPT=1 ASSERTS=0`, build-claude/perf). Every figure below is callgrind
+Ir per iteration unless stated.
+
+## What the last five days did to the old tail
+
+    46_matrix_mult      23.2x -> 6.25x    LICM + LoadElem2 + inline tier
+    10_recursion_deep   17.9x -> 7.56x    C4c inline frame pop
+    34_sort_custom_cmp  13.7x -> 10.25x
+    35_map_filter       10.0x -> 8.71x
+    73_multi_unpack     10.7x -> 9.29x
+
+Both named causes of the 2026-08-01 analysis are now spent: cause 2
+(container-read LICM) is fixed outright, and cause 1 (the return path)
+gave up what a C++-side edit can give. The new tail:
+
+    1  75_indexed_unpack    20.03x    0.128s / 0.006s   (was 19.8x)
+    2  76_funcval_dispatch  19.43x    0.041s / 0.002s   (was 23.4x)
+    3  63_closures          19.30x    0.030s / 0.002s   (was 21.1x)
+    4  77_struct_array_lit  16.38x    0.063s / 0.004s   (was 16.8x)
+    5  11_closure_counter   15.73x    0.024s / 0.002s   (was 21.8x)
+
+Startup is ~1.3ms for MyLang against ~0.3ms for a C++ binary, so
+removing it makes every ratio slightly WORSE, not better - the gaps are
+real. The C++ twins were audited for fairness in
+plans/archived/bench-fairness.md (75 models the refcounted handle bind,
+63 and 11 use std::function rather than a dissolvable `auto` lambda).
+
+## The controlled experiment that reframed everything
+
+`s += c()` lowers to a BOXED `compound.v`, while the same code written
+`var t = c(); s += t;` lowers to a typed `i.bin`. `compile_int_expr`
+(codegen.cpp ~3971) refuses ANY non-builtin call, and says why:
+
+    Builtins ONLY: [...] A user call whose body is tree-walked (a
+    closure) would only add the boxing on top of the call (see
+    11_closure_counter)
+
+That premise died with #55/M5 - a call is now a native `call`. So the
+comment is stale. **But fixing it is worth almost nothing**: the two
+spellings measure 414.7M vs 408.4M Ir (**-1.5%**, wall 0.972x), because
+the boxed int-int compound already has the #60 fast tier. The 30 Ir of
+`vm_num_binop` in 11's profile is NOT this compound - it is IDENTICAL in
+both spellings, because it comes from the capture increment inside the
+closure. Recorded because the profile genuinely looked like a 15% item
+and a controlled A/B said 1.5%.
+
+## Where the time actually goes (measured, not apportioned)
+
+Four probe programs, each differing from the next by one construct:
+
+    q_direct    a small DIRECT call, result accumulated      20 Ir/iter
+    q_proto     the same through a CLOSURE value           219 Ir/iter
+    q_capture   ... whose body does `start++`              408 Ir/iter
+    q_global    ... incrementing a GLOBAL instead          460 Ir/iter
+    r_create    creating (not calling) one closure         953 Ir/iter
+    r_nocreate  the same loop, no closure                   27 Ir/iter
+
+Three numbers fall out, and they explain all five benches:
+
+**(1) A direct call to a small function COSTS NOTHING - it is inlined
+away.** q_direct compiles to `s = s + 1`: no call survives. This is why
+08_func_call sits at 1.93x and tells us nothing about calls. Every gap
+below is paid ONLY by a call that CANNOT be inlined: a closure, a
+func-value, a callback.
+
+**(2) The indirect-call protocol is 219 Ir** against C++'s 2-3 for
+`call rdx`. It is already 100% emitted native code - no helper call
+appears in q_proto's profile at all - so nothing is left to "nativize".
+Reading the emitted code (`-vdj`), one call is ~10 field writes into the
+frame record (+0x28..+0x71), a save/switch/restore of rsp onto the
+dedicated native stack (M5a), the indirect `call rdx`, and a
+three-way `cmp rax` status dispatch. That IS the frame-record model.
+
+**(3) Creating a closure costs ~900 Ir** (953 - 27, of which ~219 is
+mk's own call). Per creation: `malloc`+`_int_free` 107, the FuncObject
+ctor 54, **the embedded `EvalContext` ctor 39**, `vector<LValue>::
+reserve` 34, the handle move-assign 26. C++'s `std::function` with one
+captured long allocates NOTHING (small-buffer) and is ~5 instructions.
+
+## Per-bench decomposition
+
+    11_closure_counter    415/iter   protocol 219 + capture store ~190
+    63_closures          3092/iter   2 creations ~1800, 3 protocols
+                                     ~660, boxed capture compound ~150
+    76_funcval_dispatch   898/iter   protocol ~219, `ops[i%2]` boxed
+                                     subscript ~180, array-arg ref bind
+                                     ~130, FuncObject handle churn ~67
+    77_struct_array_lit  3142/iter   make.structarr ~1300 (of which
+                                     coerce_struct_field 196 and
+                                     malloc/free 214), the two
+                                     `row[N].f` reads ~490 FULLY BOXED
+    75_indexed_unpack     493/row    unpack helper 96, arr_elem_at 80,
+                                     str.len 86 (2 calls), LValue::put
+                                     50, SharedStr refcount 48
+
+## The gaps, with reach (static census over bench/ + samples/)
+
+**G1 - the indirect-call protocol (219 Ir).** Reach: `call.val` in 5
+programs, `call.v` in 14, plus every callback bench. THE cluster: it is
+53% of bench 11, ~21% of 63, ~24% of 76. Not fixable by nativizing
+anything - it is the cost of maintaining a VM frame record. Options are
+(a) shrink the record for a callee that provably needs less of it, (b)
+skip the native-stack switch when already on it (the branch exists; the
+save/restore is what costs), (c) inline the RETURN the way M5b inlined
+the push - the prior session already flagged this as untried and
+symmetric.
+
+**G2 - closure creation (~900 Ir).** Reach: NARROW - `make.closure`
+appears in 24 programs but almost always once, at startup; only 63
+creates closures in a hot loop. Three separable sub-items, all small
+and low-risk:
+  - `FuncObject::capture_ctx` is a full `EvalContext` BY VALUE whose
+    entire content is `(get_root_ctx(ctx), false, true)` - identical for
+    every closure made from the same root, and it holds an empty
+    `std::map`. One shared instance per root would do. 39 Ir each.
+  - `capture_slots` is a heap `std::vector<LValue>` for typically 1-2
+    captures: one malloc + one free per closure. An inline small buffer
+    removes both for the common case.
+  - Together these are most of the 107 Ir of allocator traffic.
+
+**G3 - `make.structarr` re-boxes and re-validates (~1300 Ir).** Bench 77
+builds `[P(i,i+1), P(i+2,i+3)]` by boxing each field into an EvalValue
+and running `coerce_struct_field` (196 Ir/iter) per field - although the
+struct is POD and every field type is statically proven. #61 already
+solved exactly this for `append(arr, S(...))` (construct-in-place) and
+for a bare `StructCtorV`; the ARRAY-LITERAL form never got it. Reach: 1
+program.
+
+**G4 - `a[i].field` on a flat struct array has NO typed VM path.** The
+tree-walker has `member_pod_array_scalar`; the VM has `LoadMemberInt`
+(base = a local struct) and `LoadStructFieldInt` (base = a struct-
+foreach loop var) - and nothing for a SUBSCRIPT base, so `row[0].x`
+lowers to `subscript.v` + `member.v`, both boxed, ~490 Ir of bench 77.
+`row` IS inferred `array<P>`, so this is purely a codegen hole, not an
+inference one. A clean sibling-case gap of the #92-#96 element matrix.
+Reach: 1 program statically (`member.v` occurs only in 77).
+
+**G5 - `str.len` is a helper call at 43 Ir.** Lever 4b gave `len()` on
+an ARRAY an inline tier (`arr.len`); the STRING twin still calls
+`jit_str_len`, which loads `g_current_ctx`, bounds-checks the slot,
+takes a `get_view()` and boxes the result through `LValue::put`. Two
+calls are 17% of bench 75. Reach: 6 programs. The precedent and the
+shape are identical to the element-load inline tiers.
+
+**G6 - the unpack helper.** 75's `unpack.elem.v` is 96 Ir plus
+`arr_elem_at` 80 and `LValue::put` 50 per row. Not yet analysed to the
+same depth as the others.
+
+## Recommendation
+
+The honest summary is that **the tail is now one cause with a long
+shadow**: an un-inlinable call costs 219 Ir and creating a closure costs
+900, and those two numbers ARE benches 11, 63 and most of 76. G3-G6 are
+real but each reaches one or two programs.
+
+Smallest useful step, in the maintainer's chosen direction: **G2**. It
+is self-contained (two data-structure changes in `FuncObject`, no
+codegen, no JIT, no new opcode), it is the largest single measured mass
+in the worst-5 that is NOT the call protocol, and it cannot regress a
+program that creates no closures. G5 is an equally small second, with an
+exact existing precedent to copy.
+
+G1 is the big one and should be planned as its own arc, not an
+increment - the prior session's conclusion that reaching <=5x on the
+call benches needs the frame protocol reduced to what a C++ call does
+still stands, and nothing measured today contradicts it.
