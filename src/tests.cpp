@@ -22000,7 +22000,7 @@ static bool jit_struct_baked()
         g_exec_engine = saved;
         return ok;
     };
-    const unsigned long c0 = g_jit_ctor_fast;
+    const unsigned long e0 = g_jit_ctor_est;
     if (!run({
             "struct P { int x; float f; bool b; }",
             "func go(int n) {",
@@ -22014,6 +22014,28 @@ static bool jit_struct_baked()
             "  return si * 1000 + int(sf);",
             "}",
             "assert(go(runtime(4)) == 8015);" }))
+        return false;
+    if (g_jit_ctor_est <= e0) {
+        fprintf(stderr, "jit_struct_baked: ctor establish DID NOT RUN\n");
+        return false;
+    }
+    /* The GUARDED inline ctor still has to be covered: C4e establishes a
+     * ctor only inside a qualifying LOOP region, so a branch in the body
+     * (here an `if`) refuses it and the four H1 guards are emitted. */
+    const unsigned long c0 = g_jit_ctor_fast;
+    if (!run({
+            "struct P { int x; int y; }",
+            "func go(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    if (i > 0)",
+            "      s += 1;",
+            "    var p = P(i, i * 2);",
+            "    s += p.y;",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(go(runtime(4)) == 15);" }))
         return false;
     if (g_jit_ctor_fast <= c0) {
         fprintf(stderr, "jit_struct_baked: ctor fast path DID NOT RUN\n");
@@ -22136,6 +22158,109 @@ static bool jit_member_fact_c4d()
                         "fact (the reads after it stayed elided)\n");
         return false;
     }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
+ * C4e: a loop preheader establishes the ctor's H1 reuse invariant, so the
+ * ctors inside emit two instructions and no guards. The two cases after
+ * the first are the ones that can CORRUPT rather than merely deoptimize,
+ * and each is a value-divergence check, not a counter check:
+ *
+ *  - ESCAPE: `append(arr, p)` retains the instance, so H1 must stop
+ *    reusing it and allocate fresh. Established wrongly, every element
+ *    would alias ONE object and the array would read as N copies of the
+ *    last struct (6 -> 12 here).
+ *  - ZERO TRIP: the establish WRITES the slot, so a loop that never runs
+ *    must not disturb a struct the code around it can still read. This is
+ *    the direct test of the placement argument - the preheader sits after
+ *    the loop's entry test, so reaching it proves the body runs.
+ */
+static bool jit_ctor_establish_c4e()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long e0 = g_jit_ctor_est;
+    /* i = 0..3: p.x + p.y = 3i -> 0+3+6+9 = 18 */
+    if (!run({
+            "struct P { int x; int y; }",
+            "func go(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var p = P(i, i * 2);",
+            "    s += p.x + p.y;",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(go(runtime(4)) == 18);" }))
+        return false;
+    if (g_jit_ctor_est <= e0) {
+        fprintf(stderr, "jit_ctor_establish_c4e: preheader DID NOT RUN\n");
+        return false;
+    }
+    /* ESCAPE: the instance is retained, so reuse must stop */
+    if (!run({
+            "struct P { int x; int y; }",
+            "func go(int n) {",
+            "  var arr = [];",
+            "  for (var i = 0; i < n; i++) {",
+            "    var p = P(i, i * 2);",
+            "    append(arr, p);",
+            "  }",
+            "  var s = 0;",
+            "  foreach (var e in arr)",
+            "    s += e.x;",
+            "  return s;",
+            "}",
+            "assert(go(runtime(4)) == 6);" }))
+        return false;
+    /* ZERO TRIP. The struct arrives as a PARAM on purpose: a local
+     * declared before the loop is re-initialised by its own decl, which
+     * would mask a mis-PLACED establish (emitting it at the fragment head
+     * instead of the loop preheader passes such a test). A param is live
+     * from entry AND shared with the caller, so a stray establish both
+     * zeroes it and detaches it - and the n > 0 line checks the caller's
+     * copy is left alone when the establish DOES run. */
+    if (!run({
+            "struct P { int x; int y; }",
+            "func go(P p, int n) {",
+            "  for (var i = 0; i < n; i++)",
+            "    p = P(i, i * 2);",
+            "  return p.x * 100 + p.y;",
+            "}",
+            "var q = P(runtime(7), 9);",
+            "assert(go(q, runtime(0)) == 709);",
+            "assert(go(q, runtime(3)) == 204);",
+            "assert(q.x * 100 + q.y == 709);" }))
+        return false;
     return true;
 #else
     return true;
@@ -22646,6 +22771,7 @@ static bool jit_counter_coverage()
         { "telide_temps",     &g_jit_telide_temps,     nullptr },
         { "fstore_movx0",     &g_jit_fstore_movx0,     nullptr },
         { "member_noguard",   &g_jit_member_noguard,   nullptr },
+        { "ctor_est",         &g_jit_ctor_est,         nullptr },
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
         { "inline_baked",     &g_jit_inline_baked,     nullptr },
         { "sync_boundary",    &g_jit_sync_boundary_call,
@@ -23677,6 +23803,7 @@ static bool jit_op_nativized()
         const unsigned long bf = g_jit_boxed_fast;
         const unsigned long s2 = g_jit_store2_fast;
         const unsigned long ri = g_jit_ret_inline;
+        const unsigned long ce = g_jit_ctor_est;
         if (!run(c.src)) {
             fprintf(stderr, "jit_op_nativized: op %d WRONG RESULT\n",
                     (int)c.op);
@@ -23696,7 +23823,12 @@ static bool jit_op_nativized()
             /* C4c: Halt (and ReturnV) are served by the emitted inline
              * pop - jit_halt legitimately starves (both the in-VM and
              * the boundary arm are inline now). */
-            || (c.op == OpCode::Halt && g_jit_ret_inline > ri);
+            || (c.op == OpCode::Halt && g_jit_ret_inline > ri)
+            /* C4e: a ctor in a qualifying loop is served by the
+             * ESTABLISHED form (2 instructions, no guards and no slow
+             * tier), so jit_struct_ctor_planned legitimately starves -
+             * the deeper form of native, the BinOpV precedent. */
+            || (c.op == OpCode::StructCtorV && g_jit_ctor_est > ce);
         if (g_jit_op_run[static_cast<size_t>(c.op)] <= b && !inline_ok) {
             fprintf(stderr, "jit_op_nativized: op %d DID NOT RUN\n",
                     (int)c.op);
@@ -25153,6 +25285,8 @@ static const std::vector<extra_check> extra_checks =
       jit_struct_baked },
     { "jit: a ctor-dominated member read drops its guards (C4d)",
       jit_member_fact_c4d },
+    { "jit: a loop preheader establishes the ctor's H1 invariant (C4e)",
+      jit_ctor_establish_c4e },
     { "jit: native len() + fused ord(s[i]) run natively (lever 4b)",
       jit_len_ord },
     { "jit: LoadElem slow tier serves declined shapes (#56 inc 1)",

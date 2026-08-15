@@ -658,17 +658,40 @@ A proven read emits three instructions and NO slow arm at all - the
 guards were its only decline path. Measured 234 -> 194 Ir/iteration
 (**-17.1%**), everything else byte-flat cross-binary. Lever `mfact`.
 
-**Still open - the CTOR's own guards (~26 Ir).** At the loop head the
-fact dies in the meet between the preheader (the slot is not
-constructed yet) and the back edge, and that is CORRECT: iteration 1
-really must check. Reaching them needs loop VERSIONING - a preheader
-that verifies once, the byte-buffer pointer live in a register across
-the loop, and a cold twin of the region for a failed guard: exactly
-C1's structure with the ctor's dst slot playing C1's base, plus a scan
-proving nothing in the region rebinds the dst or takes a reference to
-it (a MoveV copy raises the refcount and H1's sole-owner guard must
-then fail). A real mechanism, not a peephole - hence recorded rather
-than half-built, as before.
+### C4e LANDED (2026-08-05): the loop-established ctor
 
-The other ~170 Ir are the field reads' remaining loads, the arithmetic,
-and the loop tail - N7 territory, not struct-specific.
+The remaining ~26 Ir. Loop VERSIONING turned out not to be needed: the
+preheader does not have to VERIFY the invariant, it can ESTABLISH it.
+`jit_struct_ctor_establish` is idempotent and non-destructive when the
+slot already holds a reusable instance, so it cannot fail, there is no
+cold twin, and a re-entered inner loop still allocates once for the
+whole program. Every iteration then emits
+`mov rax, dst.payload; mov r9, [rax+bytes]` - 2 instructions for 13.
+
+Conditions (`jit_pick_ctor_establish`): a back-edge region with no
+internal branch, nothing that can exit part-way, no entry stub or
+handler pc inside and no jump in from outside - which together mean
+reaching the preheader proves every op in the region runs, so the
+establish only does what iteration 1's own slow tier would; and the dst
+slot appears in the region ONLY as this ctor's dst and as a baked member
+read's base, so nothing can retain the instance and break the refcount.
+A C4d-elided member read counts as never-exiting (with its guards proved
+away it cannot throw) - without that every real struct loop is refused,
+so C4e only exists because C4d landed first.
+
+Measured 194 -> 170 Ir/iteration (**-12.4%**), cumulative with C4d
+**234 -> 170 (-27.4%)**. Lever `cest`.
+
+**What the C-series leaves on 64.** The remaining ~170 Ir are, per the
+emitted code: the five member reads' ref-listed STORE guards (5 sites x
+4 instructions - `store_dst`'s "does the dst temp currently hold a
+reference" test, which is true only because `main` reuses its low temps
+for argv/print), the three `i * K.0` promotions feeding the Vec3 ctor
+(each an int-slot type dispatch plus an inline literal materialisation -
+the C4b pool declined here), and the arithmetic itself. The store-guard
+half has the SAME shape C4e just solved by a different route: the
+property is false on iteration 1 and true forever after. Solving it
+generally - a JIT-level first-iteration PEEL, where the hot copy of a
+region assumes everything one full iteration established - would reach
+both it and any future member of the family, and is the natural next
+mechanism if this line is continued.

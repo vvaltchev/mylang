@@ -840,6 +840,9 @@ extern "C" unsigned long g_jit_fstore_movx0;
  * g_jit_member_fast counts the GUARDED form too, so only this can prove
  * the elided one ran. */
 extern "C" unsigned long g_jit_member_noguard;
+/* C4e: loop preheaders that established a ctor's H1 invariant (so the
+ * ctors inside emitted no guards at all). */
+extern "C" unsigned long g_jit_ctor_est;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
@@ -886,6 +889,12 @@ extern "C" void jit_ret_audit() noexcept;
  * outside ML_VM_HARDENING builds. */
 extern "C" void jit_member_fact_audit(int_type slot,
                                       const void *def) noexcept;
+
+/* C4e: establish the H1 reuse invariant on `dst` once, in a loop
+ * preheader, so the ctors inside need no guards. Idempotent and
+ * non-destructive when the slot already holds a reusable instance. */
+extern "C" void jit_struct_ctor_establish(const void *def,
+                                          int_type dst) noexcept;
 
 /* model-flip (nativize-ops): the native Halt - a fall-through body's implicit
  * `return none`. Like jit_ret but the result is hard-wired to none (no slot).

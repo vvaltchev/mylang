@@ -1448,7 +1448,8 @@ collision). Three nets now:
   JIT analogue of `--no-opt`, which CLAUDE.md already mandates for AST
   transforms for the same reason (`-nj` is all-or-nothing and localises
   nothing). Levers: cache, fcache, telide, fread, flit, fwd, ffwd,
-  resreg, hoist, hoist2, mfact, `all`. `tests/corpus_diff.sh BIN --levers`
+  resreg, hoist, hoist2, mfact, cest, `all`.
+  `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
   matrix runs against the CORPUS, not the suite.
@@ -1614,6 +1615,58 @@ its guards. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0, cross-binary):
 (they read through LoadStructField*/the foreach direct read, not
 LoadMemberInt - a different op), 46/01/09/55 byte-flat, so the new emit
 arm costs no layout tax.
+
+**C4e - THE LOOP-ESTABLISHED CTOR (2026-08-05,
+`jit_pick_ctor_establish`, jit.cpp).** A planned StructCtorV spends 13
+instructions before it can touch a byte - dst holds a struct / same def /
+sole owner / not readonly / load the buffer - and inside a loop all four
+are true from iteration 2 on. C4d's dataflow cannot reach them: at the
+loop head the fact dies in the meet with the preheader, CORRECTLY, since
+iteration 1 must really check. **So make the invariant true instead of
+proving it.** The loop's preheader calls `jit_struct_ctor_establish`
+once (idempotent, and NON-destructive when the slot already holds a
+reusable instance - which is what keeps a re-entered inner loop at ONE
+allocation for the whole program), and every iteration then emits
+`mov rax, dst.payload; mov r9, [rax+bytes]`. There is NO cold twin and
+no versioning, because the establish cannot fail.
+**THE SAFETY ARGUMENT is placement.** The establish WRITES the slot, so
+it must be unobservable. It is emitted before `label[T]` - a back edge
+targets the label, so only the FALL-THROUGH entry pays - and a region
+with no internal branch and no exiting op runs every op in it, so the
+ctor runs and the establish does exactly what that first ctor's own slow
+tier would have done. A top-tested `while` is refused by construction:
+its T is the condition and the region would contain that branch.
+**THE SECOND CONDITION is the appearance scan.** The refcount is what can
+break reuse - a MoveV copy, a container store, an arg bind all retain the
+instance and H1 would then have to allocate - so the dst slot may appear
+in the region ONLY as this ctor's dst and as a baked member read's BASE
+(which reads bytes and retains nothing). Both come from
+`jit_op_slot_refs`, a thin export of `visit_use_def` added for exactly
+this, so the emitter grows no second per-op slot table; an op the table
+does not know refuses the region.
+**A C4d-ELIDED MEMBER READ COUNTS AS NEVER-EXITING** even though the
+opcode does not: with its guards proved away it emits a raw byte read
+with no slow tier and literally cannot throw. Using the static
+`op_never_exits` there instead refused every real struct loop - 64's five
+reads are all elided - so C4e only exists because C4d landed first.
+**SABOTAGE STATUS, recorded as measured.** Emitting the establish at the
+FRAGMENT HEAD instead of the preheader fails the test - but only after
+the zero-trip case was rewritten to take the struct as a PARAM: a local
+declared before the loop is re-initialised by its own decl, which masks
+the mis-placement entirely (the first version passed). The APPEARANCE
+scan is defense in depth today and could not be made to diverge: the ops
+that would retain the instance (`append` -> CallBuiltinLV is unaudited,
+`arr[i] = p` -> StoreElemValue can throw) are already refused by the
+unaudited-op and never-exits gates, and the ones that survive both
+(MoveV, MakeArrayV) overwrite their alias every iteration, so no wrong
+value results. Execution-proven by `g_jit_ctor_est`; `jit_struct_baked`
+keeps the GUARDED form alive with an `if` in the body (a branch refuses
+the region), and the jit_op_nativized coverage loop accepts the
+established tier for StructCtorV - its helper legitimately starves, the
+BinOpV precedent. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0):
+**64_struct_create 194 -> 170 Ir/iteration (-12.4%)**, cumulative with
+C4d **234 -> 170 (-27.4%)**; 58/01 byte-flat, 46 +3 instructions
+whole-program (the picker running at compile time).
 
 **C3 inc 3 - TEMPS JOIN THE FLOAT TYPE-STORE ELISION (2026-08-04).**
 inc 2's producer was gated `< slot_count`, LOCALS ONLY, so every float
