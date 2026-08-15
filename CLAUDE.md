@@ -301,6 +301,24 @@ consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
 (the way `visit_pc_fields`' remap net and the `ref_slots` audit do),
 or the next such gap will also be found only by someone reading a
 disassembly for an unrelated reason.
+**⛔ AND A THIRD SHAPE: THE TABLE STAYED PUT WHILE AN OP CHANGED
+UNDER IT (2026-08-13).** `op_writes_pure_target` (codegen.cpp) lists
+the ops whose `.target` may be RETARGETED, so `<produce t>; MoveV
+rArg = t` fuses into `<produce rArg>` for a call argument. Its
+soundness needs the op to be the SOLE producer of that temp, and its
+own comment has excluded `MoveV` since 2026-07-26 for exactly the
+JOIN shape that breaks it. **`LogV` was in the list and belonged
+there** - a `&&`/`||` chain was a straight run of LogV ops, one
+producer each - until **#138 gave the chain real short-circuit
+branches**. `emit_logical_chain` then wrote ONE dst from N arms: a
+join whose tail is a LogV, not a MoveV. Retargeting only the last arm
+left the short-circuiting path writing the old temp, so
+`var dyn s = runtime(3); print(s > 5 && s < 6);` printed **`3`**
+under the VM and `false` in the tree-walker - a wrong answer and a
+RULE 2 divergence, latent in 8 corpus programs (bytecode changed,
+output did not). **When you change HOW a construct lowers, re-audit
+every table that classifies its OPCODE** - the entry does not have to
+be edited to become false.
 
 **⛔ A HELPER'S REGISTER ABI IS THE EMITTER'S JOB, NOT THE CALLER'S
 (2026-08-05).** THREE bugs in two days were one shape - an implicit

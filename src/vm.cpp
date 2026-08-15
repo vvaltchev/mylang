@@ -4960,12 +4960,37 @@ extern "C" int jit_member(const EvalValue *base, LValue *dst,
  * type) is caught LOC-LESS into g_vm_jit_exc + returns 1, so EnterNative
  * re-raises stamping the op's caret from the loc side table (extract_locs
  * records these ops) - byte-identical to the interpreted stamp_operand_loc. */
+#ifdef TESTS
+/* WHICH SHAPE declines the inline fast tier? The tier is int-int (#60)
+ * and float-float (H6); everything else pays the exact-helper path here.
+ * Bumped from the SLOW helpers only, so this is a complete classification
+ * of the residue: `_f` should now be ~0 (a float-float decline is a
+ * div-by-zero or a shape the emit gate refused), `_m` sizes the one
+ * enumerated-but-unbuilt arm (the MIXED int/float promotion), and
+ * everything left is strings/arrays/dicts, which have no inline shape. */
+static void boxed_slow_classify(const EvalValue &a, const EvalValue &b)
+{
+    const bool af = a.is<float_type>(), bf = b.is<float_type>();
+    const bool ai = a.is<int_type>(),   bi = b.is<int_type>();
+    g_jit_boxed_slow++;
+    if (af && bf)
+        g_jit_boxed_slow_f++;
+    else if ((af && bi) || (ai && bf))
+        g_jit_boxed_slow_m++;
+}
+#define ML_BOXED_SLOW(a, b) boxed_slow_classify((a), (b))
+#else
+#define ML_BOXED_SLOW(a, b) ((void)0)
+#endif
+
 extern "C" int jit_boxed_binop(const void *bop) noexcept
 {
     ML_JIT_OP_RAN(BinOpV);
     const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
     EvalContext *ctx = g_current_ctx;
     EvalValue sa, sb;
+    ML_BOXED_SLOW(boxed_operand(bo->a, ctx, sa),
+                  boxed_operand(bo->b, ctx, sb));
     EvalValue val = boxed_operand(bo->a, ctx, sa).clone();
     try {
         vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
@@ -4985,6 +5010,8 @@ extern "C" int jit_boxed_cmp(const void *bop) noexcept
     const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
     EvalContext *ctx = g_current_ctx;
     EvalValue sa, sb;
+    ML_BOXED_SLOW(boxed_operand(bo->a, ctx, sa),
+                  boxed_operand(bo->b, ctx, sb));
     EvalValue val = boxed_operand(bo->a, ctx, sa);
     try {
         vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
@@ -5005,6 +5032,7 @@ extern "C" int jit_boxed_compound(const void *bop) noexcept
     EvalContext *ctx = g_current_ctx;
     EvalValue sb;
     EvalValue nv = ctx->frame->at(bo->target).get();
+    ML_BOXED_SLOW(nv, boxed_operand(bo->b, ctx, sb));
     try {
         vm_num_binop(nv, boxed_operand(bo->b, ctx, sb), bo->aop);
     } catch (RuntimeException &e) {

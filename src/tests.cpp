@@ -20720,6 +20720,154 @@ static bool jit_boxed_int_fast()
 #endif
 }
 
+/* H6: the boxed-op FLOAT-FLOAT inline tier, the twin of the int one above.
+ * g_jit_boxed_fastf is bumped by the EMITTED guard-passed path only, so a
+ * per-shape growth is what proves the inline arithmetic RAN - the helper
+ * produces the identical value, so a value assertion alone cannot tell the
+ * two tiers apart. Each shape is attributed separately (the per-shape rule:
+ * one program's ordinary float ops would otherwise mask a decline case). */
+static bool jit_boxed_float_fast()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const char *what,
+                  const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (Exception &ex) {
+            fprintf(stderr, "jit_boxed_float_fast: %s raised %s: %s\n",
+                    what, ex.name, ex.msg);
+            ok = false;
+        } catch (...) {
+            fprintf(stderr,
+                    "jit_boxed_float_fast: %s raised a non-Exception\n",
+                    what);
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    unsigned long c0 = g_jit_boxed_fastf;
+    /* BinOpV: a slot-slot `+` and a FLOAT-LITERAL `*` operand */
+    if (!run("binop", { "var dyn a = dynarray([1.5, 2.5, 3.5, 4.5]);",
+               "var dyn s = 0.0;",
+               "for (var r = 0; r < 5; r++)",
+               "    foreach (var e in a) s = (s + e) * 0.5;",
+               "assert(s > 3.7 && s < 3.8);" }))
+        return false;
+    if (g_jit_boxed_fastf <= c0) {
+        fprintf(stderr, "jit_boxed_float_fast: BinOpV inline DID NOT RUN\n");
+        return false;
+    }
+    c0 = g_jit_boxed_fastf;
+    /* CompoundV (`s += e` on a float dst) + the four ORDERING CmpV forms */
+    if (!run("compound/cmp", { "var dyn a = dynarray([1.5, 2.5, 3.5, 4.5]);",
+               "var dyn s = 0.0; var n = 0;",
+               "for (var r = 0; r < 5; r++)",
+               "    foreach (var e in a) {",
+               "        s += e;",
+               "        var dyn lt = e < 3.0; var dyn gt = e > 3.0;",
+               "        var dyn le = e <= 2.5; var dyn ge = e >= 2.5;",
+               "        n += (lt ? 1 : 0) + (gt ? 1 : 0)",
+               "           + (le ? 1 : 0) + (ge ? 1 : 0);",
+               "    }",
+               "assert(s > 59.9 && s < 60.1); assert(n == 45);" }))
+        return false;
+    if (g_jit_boxed_fastf <= c0) {
+        fprintf(stderr,
+                "jit_boxed_float_fast: CompoundV/CmpV inline DID NOT RUN\n");
+        return false;
+    }
+    c0 = g_jit_boxed_fastf;
+    /* div: a nonzero RUNTIME divisor inlines. `z` is written TWICE so
+     * auto-const cannot promote it to a literal operand - which would
+     * exercise the emit-time gate instead of the runtime bits guard. */
+    if (!run("div", { "var dyn a = dynarray([1.5, 2.5, 3.5, 4.5]);",
+               "var dyn s = 0.0;",
+               "for (var r = 0; r < 5; r++)",
+               "    foreach (var e in a) {",
+               "        var dyn z = 1.0;",
+               "        z = e + 0.5;",
+               "        s = s + e / z;",
+               "    }",
+               "assert(s > 16.7 && s < 16.9);" }))
+        return false;
+    if (g_jit_boxed_fastf <= c0) {
+        fprintf(stderr, "jit_boxed_float_fast: div inline DID NOT RUN\n");
+        return false;
+    }
+    /* a RUNTIME +-0.0 divisor DECLINES to the helper, which throws the
+     * exact DivisionByZeroEx (the bits test, not a ucomisd je) */
+    if (!run("div0 decline", { "var dyn a = dynarray([1.5, 2.5, 3.5, 4.5]);",
+               "var dyn s = 1.0; var caught = 0;",
+               "for (var r = 0; r < 5; r++)",
+               "    foreach (var e in a) {",
+               "        var dyn z = 1.0;",
+               "        z = e - e;",
+               "        try { s = s / z; }",
+               "        catch (DivisionByZeroEx) { caught = caught + 1; }",
+               "    }",
+               "assert(caught == 20); assert(s == 1.0);" }))
+        return false;
+    /* NaN: every ORDERING compare is FALSE, including `>=`/`<=`. This is
+     * the ucomisd operand-SWAP trick - an unordered compare sets CF and
+     * ZF, so the un-swapped `seta`/`setae` forms would answer TRUE for
+     * two of the four. A NaN divisor is NOT +-0.0, so it divides. */
+    if (!run("nan compares", { "var dyn a = dynarray([nan, nan, nan, nan]);",
+               "var dyn t = 0; var dyn q = 0.0;",
+               "for (var r = 0; r < 5; r++)",
+               "    foreach (var e in a) {",
+               "        if (e < 1.0) t = t + 1;",
+               "        if (e > 1.0) t = t + 1;",
+               "        if (e <= 1.0) t = t + 1;",
+               "        if (e >= 1.0) t = t + 1;",
+               "        q = 1.0 / e;",
+               "    }",
+               "assert(t == 0); assert(isnan(q));" }))
+        return false;
+    /* the MIXED int/float shapes keep the helper and stay exact: an int
+     * element into a float accumulator, and an int-int pair that must
+     * still yield an INT. `str(k)` is the discriminator a type query
+     * cannot be: `typestr` folds to the STATIC type, which is `dyn`
+     * either way - only the RENDERING tells an int 60 from a float 60.0.
+     *
+     * WHAT ACTUALLY GUARDS THE INT-INT PAIR IS THE RUNTIME TYPE TEST, not
+     * boxed_float_arm's operand rule: with that rule sabotaged away the
+     * two t_float compares still decline, so this shape stays green. The
+     * rule is load-bearing for a LITERAL operand, which has no runtime
+     * guard at all - an int literal read as double bits is garbage - and
+     * THAT is caught by the pre-existing `var dyn d = runtime(2.5); var
+     * dyn r = 3 + d;` test (watched failing). Kept here for the exactness
+     * claim, not as the sabotage net. */
+    if (!run("mixed decline", { "var dyn a = dynarray([1, 2.5, 3, 4.5]);",
+               "var dyn s = 0.0; var dyn k = 0;",
+               "for (var r = 0; r < 5; r++)",
+               "    foreach (var e in a) { s = s + e; k = k + 3; }",
+               "assert(s == 55.0); assert(k == 60);",
+               "assert(str(k) == \"60\");" }))
+        return false;
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool dyn_foreach_fast_shapes()
 {
 #if ML_JIT_SUPPORTED
@@ -30048,6 +30196,8 @@ static const std::vector<extra_check> extra_checks =
       dyn_foreach_fast_shapes },
     { "jit: boxed int-int fast tier runs inline (#60)",
       jit_boxed_int_fast },
+    { "jit: boxed float-float fast tier runs inline (H6)",
+      jit_boxed_float_fast },
     { "jit: fragment-inline sync call runs (direct push + call rdx)",
       jit_sync_inline_call },
     { "jit: norec: shadow-verified side table + the full-stack audit",

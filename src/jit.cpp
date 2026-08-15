@@ -49,6 +49,10 @@
 extern "C" {
 unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
 unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
+unsigned long g_jit_boxed_fastf = 0;   /* H6: inline float-float ones */
+unsigned long g_jit_boxed_slow = 0;    /* H6 reach: helper-path declines */
+unsigned long g_jit_boxed_slow_f = 0;  /* H6 reach: ... of them float-float */
+unsigned long g_jit_boxed_slow_m = 0;  /* H6: ... of them MIXED */
 unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
@@ -1520,6 +1524,58 @@ static FCmp float_cmp(Op o)
     case Op::gt: return { false, 0x86, 0x77 };
     default:     return { false, 0x82, 0x73 };   /* ge */
     }
+}
+
+/* H6: does this BOXED op get the inline FLOAT-FLOAT arm?
+ *
+ * The int-int tier (#60) leaves every float shape on the exact-helper
+ * path; this is its twin. BOTH operands must be PROVABLY float - a float
+ * LITERAL, or a slot the emitted guard compares against t_float - and
+ * that is a correctness requirement, not conservatism: an int-int pair
+ * must produce an INT, so an arm that promoted whatever it was handed
+ * would silently turn `1 + 2` into 3.0 whenever the int arm declined for
+ * its own reasons. The MIXED int/float shapes therefore keep the helper.
+ *
+ * ARITH is `+ - * /` only: `%` is the libm fmod call the helper already
+ * makes, and the bitwise ops do not exist for floats (base Type throws).
+ * COMPARES are the four ORDERING ones, matching CmpFloatV's own
+ * long-standing decision to leave eq/noteq out - NaN needs PF, i.e. a
+ * second setcc and a cmov.
+ *
+ * ONE PLACE, TWO CALLERS: the emit AND run_has_float, which decides
+ * whether the fragment entry materialises t_float in r8 - the register
+ * this arm's guard and its store both read. A predicate that drifted
+ * from that would leave r8 holding garbage. */
+static bool boxed_float_arm(const Chunk &ck, const Instr &in)
+{
+    if (in.target2 < 0
+        || static_cast<size_t>(in.target2) >= ck.boxed_ops.size())
+        return false;
+    const Chunk::BoxedOp &bo = ck.boxed_ops[in.target2];
+    const auto fopnd = [](const Operand &o) {
+        return !o.is_lit || o.lit_kind == Operand::LitKind::f;
+    };
+    switch (in.op) {
+    case OpCode::BinOpV:
+    case OpCode::CompoundV:
+        if (bo.aop != Op::plus && bo.aop != Op::minus
+            && bo.aop != Op::times && bo.aop != Op::div)
+            return false;
+        /* a literal +-0.0 divisor ALWAYS throws (TypeFloat::div's
+         * fpclassify test) - leave it to the helper, which throws it
+         * exactly, carets included */
+        if (bo.aop == Op::div && bo.b.is_lit && bo.b.flit == 0.0)
+            return false;
+        break;
+    case OpCode::CmpV:
+        if (!float_cmp_eligible(bo.aop))
+            return false;
+        break;
+    default:
+        return false;                 /* UnaryV / LogV: not this tier */
+    }
+    return fopnd(bo.b)
+        && (in.op == OpCode::CompoundV || fopnd(bo.a));
 }
 
 /* -------------------------- run selection --------------------------- */
@@ -5154,6 +5210,12 @@ void jit_stats_report()
         { "frags",            &g_jit_frags },
         { "native_calls",     &g_jit_native_calls },
         { "native_returns",   &g_jit_native_returns },
+        /* which TIER the boxed (dyn) arithmetic took */
+        { "boxed_fast",       &g_jit_boxed_fast },
+        { "boxed_fastf",      &g_jit_boxed_fastf },
+        { "boxed_slow",       &g_jit_boxed_slow },
+        { "boxed_slow_f",     &g_jit_boxed_slow_f },
+        { "boxed_slow_m",     &g_jit_boxed_slow_m },
         /* THE CALL PROTOCOL - which tier each call took */
         { "sync_inline",      &g_jit_sync_inline },
         { "arg_inplace",      &g_jit_arg_inplace },
@@ -10090,6 +10152,106 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             j_done = e.j32(0xEB);
             for (const size_t j : j_slows)
                 e.patch32_here(j);
+            j_slows.clear();
+        }
+        /* H6: the FLOAT-FLOAT twin of the tier above. Reached either
+         * because the int arm's guard found a float, or because the int
+         * arm was never emitted (a float literal operand, a float-only
+         * aop). boxed_float_arm decides eligibility; see its comment for
+         * why BOTH operands must be provably float and why the mixed
+         * shapes stay on the helper.
+         *
+         * The operand/dst slots are read by their TYPE WORD, which is
+         * sound only while a boxed op's slots can never be register-
+         * pinned or type-elided. They cannot: the cache scan's `bad()`
+         * inserts into disq AND disq_f for every one of these ops, and
+         * both elision sets are filtered by those. The int arm has always
+         * relied on the same fact; the ML_CHECK below states it, so a
+         * future op reclassification fails loudly instead of reading a
+         * stale type word. */
+        size_t j_donef = 0;
+        if (boxed_float_arm(ck, in)) {
+#ifndef NDEBUG
+            {   /* the block is NDEBUG-gated so an ASSERTS=0 release does
+                 * not carry an unused lambda (-Werror) */
+                const auto not_pinned = [&e](const Operand &o) {
+                    return o.is_lit || (e.fcreg(o.slot) < 0
+                                        && !e.telided(o.slot, true)
+                                        && !e.fread_ok(o.slot));
+                };
+                ML_CHECK(not_pinned(bo.b)
+                         && (comp || not_pinned(bo.a))
+                         && e.fcreg(in.target) < 0);
+            }
+#endif
+            if (comp) {
+                e.load_type(slot_addr(in.target).type);
+                e.cmp_rax_r8();
+                j_slows.push_back(e.j32(0x75));
+            } else if (!bo.a.is_lit) {
+                e.load_type(slot_addr(bo.a.slot).type);
+                e.cmp_rax_r8();
+                j_slows.push_back(e.j32(0x75));
+            }
+            if (!bo.b.is_lit) {
+                e.load_type(slot_addr(bo.b.slot).type);
+                e.cmp_rax_r8();
+                j_slows.push_back(e.j32(0x75));
+            }
+#ifdef TESTS
+            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_boxed_fastf));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x02);    /* inc qword [rdx] */
+#endif
+            /* payloads: xmm0 = lhs, xmm1 = rhs */
+            const auto fload_opnd = [&e](uint8_t xr, const Operand &o) {
+                if (!o.is_lit) {
+                    e.fload(xr, slot_addr(o.slot).payload);
+                    return;
+                }
+                uint64_t bits;
+                std::memcpy(&bits, &o.flit, sizeof bits);
+                e.movabs(RAX, bits);
+                e.movq_xmm(xr);
+            };
+            if (comp)
+                e.fload(X0, slot_addr(in.target).payload);
+            else
+                fload_opnd(X0, bo.a);
+            fload_opnd(X1, bo.b);
+            if (cmp) {
+                const FCmp fc = float_cmp(bo.aop);
+                if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
+                e.u8(0x0F);
+                e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
+                e.u8(0xC0);                           /* setcc al */
+                e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);   /* movzx eax, al */
+                store_dst_bool(e, ck, RAX, in.target);
+            } else {
+                if (bo.aop == Op::div && !bo.b.is_lit) {
+                    /* a +-0.0 divisor DECLINES (TypeFloat::div throws
+                     * DivisionByZeroEx). The BITS test with the sign
+                     * stripped is exactly fpclassify's answer, where a
+                     * bare `ucomisd; je` would also decline a NaN
+                     * divisor - the same reasoning as FloatBin's. */
+                    e.movq_rax_x(X1);
+                    e.u8(0x48); e.u8(0xD1); e.u8(0xE0);   /* shl rax, 1 */
+                    j_slows.push_back(e.j32(0x74));       /* jz -> slow */
+                }
+                e.farith(bo.aop == Op::plus    ? 0x58
+                       : bo.aop == Op::minus   ? 0x5C
+                       : bo.aop == Op::times   ? 0x59
+                                               : 0x5E, X0, X1);
+                if (comp)
+                    /* the guard proved the dst already holds a float, so
+                     * its type word is t_float and there is nothing to
+                     * release - payload only, the int arm's shape */
+                    e.fstore(X0, slot_addr(in.target).payload);
+                else
+                    emit_float_store(e, ck, X0, in.target, pc);
+            }
+            j_donef = e.j32(0xEB);
+            for (const size_t j : j_slows)
+                e.patch32_here(j);
         }
         /* the slow tier: the interpreter-exact helpers (any operand shape,
          * the throwing aops) */
@@ -10111,6 +10273,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.exit_pc(pc);                        /* raised: EnterNative re-raises */
         e.patch8(j_ok, e.pos());
         if (j_done) e.patch32_here(j_done);
+        if (j_donef) e.patch32_here(j_donef);
         return true;
     }
 
@@ -11231,6 +11394,14 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
                                           * arm's val-type guard reads r8 */
         case OpCode::LoadMemberFloat:    /* baked fast path: float store */
             return true;
+        case OpCode::BinOpV:             /* H6: the boxed FLOAT-FLOAT arm's
+                                          * guard cmps against r8 and its
+                                          * store writes it */
+        case OpCode::CmpV:
+        case OpCode::CompoundV:
+            if (boxed_float_arm(ck, ck.code[pc]))
+                return true;
+            break;
         case OpCode::StructCtorV:        /* a planned float field reads via
                                           * emit_float_load -> needs r8 */
             if (ck.code[pc].b_dual_hi() >= 0)
