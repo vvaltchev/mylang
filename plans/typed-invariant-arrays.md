@@ -755,6 +755,32 @@ reference from `pop_window`'s scan. A released temp no longer can hold
 one, so that objection is gone for exactly this set - worth measuring
 as its own increment.
 
+### The audit-table trap, second occurrence (2026-08-05)
+
+C5 landed reading only -2.4% on 64_struct_create where its siblings read
+-8% to -18%, and the reason was NOT the mechanism. `op_writes_scalar` -
+the table C5's gate consults, and the one `compute_ref_slots` uses to
+decide `ref_slots` in the first place - did not know the **B1/B2
+specialized arithmetic family**. `visit_use_def` was fixed for exactly
+that family on 2026-08-04; its sibling in the same file was not, because
+both run BEFORE `specialize_arith_ops` and so neither can see those
+opcodes at that stage.
+
+C5 is the first consumer to ask at **JIT time**, on the specialized
+code. The conservative answer - "not a scalar write" - made it refuse
+almost every real arithmetic temp: on 64 it picked 1 slot of 4.
+
+Adding the 23 opcodes is a no-op for `compute_ref_slots` (they do not
+exist at its stage; `-nj -vd` dumps are byte-identical) and measured
+(Ir/scale, OPT=1 ASSERTS=0, on top of C5): **54_mandelbrot -32.0%,
+03_int_arith -28.1%, 64_struct_create -24.1%, 06_if_branch -16.7%,
+07_nested_loops -15.4%, 04_float_arith -14.8%**, 55_float_sum -7.1%,
+46_matrix_mult -5.8%, 40_math_builtins -1.2%; 20 others byte-flat.
+
+The net is a `jit_release_c5` case whose qualifying temps are written
+ONLY by the specialized family, so losing them again fails a test
+instead of costing 20% silently (sabotage-verified).
+
 **What the C-series leaves on 64.** C5 took the store guards, but only
 partly: 64 reads **-2.4%** where 18/55/65/46/14 read -8% to -18%,
 because on that program most of the five member reads' dsts do NOT
