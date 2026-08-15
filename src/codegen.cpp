@@ -223,6 +223,25 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
  * below cannot be a join tail (codegen funnels every join through MoveV),
  * and the E1 peephole's join-move rule - which checks EVERY predecessor -
  * cleans the extra move correctly afterwards.
+ *
+ * LogV IS EXCLUDED FOR THE SAME REASON (2026-08-13, a WRONG-CODE fix) -
+ * and it is the same bug the MoveV paragraph above describes, arriving
+ * through a door that paragraph could not see. LogV used to be a safe
+ * single producer because a `&&`/`||` chain compiled to a STRAIGHT RUN of
+ * LogV ops. #138 gave the chain real SHORT-CIRCUIT branches, so
+ * emit_logical_chain now writes ONE dst from N arms - a join whose tail is
+ * a LogV, not a MoveV. Retargeting only the last arm left the
+ * short-circuit path writing the OLD temp while the consumer read the new
+ * one:
+ *
+ *     var dyn s = runtime(3);
+ *     print(s > 5 && s < 6);      # printed `3`, not `false`
+ *
+ * (the arg slot kept whatever it held - here the `3` staged for
+ * `runtime`). The tree-walker said `false`, so this was a RULE 2
+ * divergence as well as a wrong answer. EVERY LogV comes from
+ * emit_to_bool, i.e. from a logical chain, so there is no safe subset to
+ * keep. Pinned by `boxed && / || in an argument short-circuits`.
  */
 bool op_writes_pure_target(OpCode op)
 {
@@ -232,7 +251,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::LoadImmFloat: case OpCode::LoadGlobalV:
     case OpCode::LoadCaptureV: case OpCode::LoadBuiltinV:
     case OpCode::BinOpV:
-    case OpCode::CmpV:        case OpCode::LogV:
+    case OpCode::CmpV:
     case OpCode::IntBin:      case OpCode::FloatBin:
     case OpCode::CmpIntV:     case OpCode::CmpFloatV:
     case OpCode::SubscriptV:  case OpCode::MemberV:
