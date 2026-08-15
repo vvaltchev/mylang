@@ -1784,6 +1784,52 @@ pExpr14(ParseContext &c, unsigned fl)
     ret->start = start;
     ret->end = c.get_loc();
 
+    /*
+     * A target whose SHAPE can never denote a location is refused HERE, at
+     * compile time (maintainer's call, 2026-08-06): "when NotLValueEx is
+     * determined at compile time, make it a compile failure - but the
+     * exception must keep existing at runtime, because a dynamic value
+     * cannot always be proven".
+     *
+     * Only four forms can ever be assignable: a variable, a destructuring
+     * list, an element `a[i]` and a field `a.f`. Everything else - a
+     * literal, a call result, an arithmetic/comparison/logical chain, a
+     * ternary, a SLICE - is an rvalue by construction whatever its operands
+     * turn out to be, so no type information is needed and this needs no
+     * pass that a flag can disable. The VALUE-dependent failures (writing
+     * through a `const` container, a read-only element, a `dyn` that holds
+     * one) are NOT decidable here and stay the runtime NotLValueEx they
+     * have always been.
+     *
+     * This also closes two divergences: the tree-walker used to report a
+     * SLICE target as TypeErrorEx "does NOT support slice operator []"
+     * (misleading - the type slices fine; the result just is not a
+     * location), and the NO-FAIL codegen could not lower either a slice or
+     * an arithmetic target at all, so the VM raised a NON-catchable
+     * InternalErrorEx where the tree-walker raised a catchable NotLValueEx.
+     */
+    if (ret->lvalue && !(fl & pFlags::pInDecl)) {
+
+        const Construct *lv = ret->lvalue.get();
+
+        if (!lv->is_id() && !lv->is_idlist()
+            && !dynamic_cast<const Subscript *>(lv)
+            && !dynamic_cast<const MemberExpr *>(lv)) {
+
+            /* A CONST element/field target lands here too, because the
+             * parser already folded `K[0]` to its literal value - which is
+             * exactly right: `const K = [..]; K[0] = v;` IS decidable at
+             * compile time. The same const reached through a PARAMETER is
+             * not folded, keeps its Subscript shape, and still raises the
+             * runtime NotLValueEx. Hence the shape-neutral wording. */
+            SyntaxErrorEx e(lv->start,
+                            "Cannot assign to this expression: "
+                            "it is not an assignable location");
+            e.loc_end = lv->end;
+            throw e;
+        }
+    }
+
     /* Propagate a `var opt`/`var dyn` modifier onto the declared identifier(s),
      * so the type inferencer (which reads Identifier::opt_mod/dyn_mod) sees it. */
     if ((fl & pFlags::pInDecl) &&
