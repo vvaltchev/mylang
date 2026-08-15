@@ -1559,7 +1559,21 @@ struct VmPendState {
  */
 struct VmStackSeg {
     std::vector<LValue> slots;
-    int_type top = 0;                 /* allocation watermark */
+    /*
+     * THE ALLOCATION WATERMARK IS A POINTER, not a slot index. It used
+     * to be an index, and every emitted call then paid to convert: the
+     * window is `slots.data() + top * sizeof(LValue)`, i.e. a load, a
+     * move and an imul by 48 on the push, plus a saved index per record
+     * to restore on the pop. As a pointer the window IS the watermark -
+     * the push reads it, the pop writes the record's own `window` back,
+     * and no multiply happens at all.
+     *
+     * `end` is the one-past-last slot; the fit test is a pointer
+     * compare. Both are stable for the segment's whole life (segments
+     * never move and `slots` is never resized - see below).
+     */
+    LValue *cur = nullptr;            /* allocation watermark */
+    LValue *end = nullptr;            /* one past the last slot */
     /*
      * `slots` is sized ONCE at construction and never resized - live windows
      * hold raw pointers into it ("segments never move"), so its capacity is a
@@ -1571,7 +1585,15 @@ struct VmStackSeg {
      */
     int_type cap_slots;
     explicit VmStackSeg(size_t cap)
-        : slots(cap), cap_slots(static_cast<int_type>(cap)) { }
+        : slots(cap), cap_slots(static_cast<int_type>(cap))
+    {
+        cur = slots.data();
+        end = slots.data() + cap;
+    }
+    /* the slot INDEX of the watermark - the form the reconstruction
+     * oracle and the -vd-facing diagnostics still speak in */
+    int_type top_index() const
+    { return static_cast<int_type>(cur - slots.data()); }
 };
 
 /*
@@ -1585,7 +1607,10 @@ struct VmCallRec {
     LValue *window;                   /* stable - segments never move */
     int_type nslots;
     int seg;                          /* owning segment index */
-    int_type seg_top_before;          /* watermark to restore on pop */
+    /* No saved watermark: the pop restores `cur = window`, which is the
+     * same value and is already in the record. The reconstruction
+     * oracle's cumulative chain now reads `window + nslots == the frame
+     * above's window` - the identical invariant in addresses. */
 
     const Chunk *run_chunk = nullptr; /* the chunk THIS frame executes */
 
@@ -1814,11 +1839,12 @@ struct VmActivation {
 
         VmStackSeg *sg = cur_sg;
         ML_VM_CHECK(!sg || sg == segs[cur_seg].get());
-        /* the emitted push's fit test compares against cap_slots instead of
-         * re-deriving the vector's extent - keep the two provably equal */
-        ML_VM_CHECK(!sg || sg->cap_slots
-                               == static_cast<int_type>(sg->slots.size()));
-        if (!sg || sg->top + n > sg->cap_slots) {
+        /* the emitted push's fit test compares `cur + n` against `end` -
+         * keep both provably the extent of `slots` */
+        ML_VM_CHECK(!sg || (sg->cap_slots
+                                == static_cast<int_type>(sg->slots.size())
+                            && sg->end == sg->slots.data() + sg->cap_slots));
+        if (!sg || sg->cur + n > sg->end) {
 #ifdef TESTS
             /* Net 3's SEGMENT-BOUNDARY case: an emitted push DECLINES
              * across a boundary (the fit test sends it to C++), so this
@@ -1857,7 +1883,7 @@ struct VmActivation {
             }
             sg = segs[cur_seg].get();
             cur_sg = sg;
-            ML_CHECK(sg->top == 0);
+            ML_CHECK(sg->cur == sg->slots.data());
         }
 
         /* REUSE the constructed record at rec_n; grow only at a new peak. */
@@ -1868,10 +1894,9 @@ struct VmActivation {
         }
         VmCallRec &rec = records[rec_n++];   /* fill IN PLACE - no move */
         top_rec = &rec;                  /* stays valid: grow is above */
-        rec.window = sg->slots.data() + sg->top;
+        rec.window = sg->cur;
         rec.nslots = n;
         rec.seg = cur_seg;
-        rec.seg_top_before = sg->top;
         rec.parent_window = par_win;          /* 4-v: the parent view */
         rec.parent_nslots = par_nslots;
         rec.parent_seg = par_seg;
@@ -1916,7 +1941,7 @@ struct VmActivation {
             pends_n += static_cast<uint32_t>(ck->n_trys);
             pends.resize(pends_n);
         }
-        sg->top += n;
+        sg->cur += n;
 
         /* Stash the CALLER's pure cache; the callee's frame starts with
          * none (per-frame scoping - see VmCallRec::caller_cache). */
@@ -2005,7 +2030,7 @@ struct VmActivation {
         }
 
         ML_VM_CHECK(cur_sg == segs[rec.seg].get());
-        cur_sg->top = rec.seg_top_before;
+        cur_sg->cur = rec.window;      /* the window IS the watermark */
 
         /* The popped frame's cache dies HERE (per-frame scoping); the
          * caller's stashed cache comes back into the view. */
@@ -5936,7 +5961,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
             if (lv.get().get_type()->t >= Type::t_str)
                 lv = LValue();
         }
-        act.cur_sg->top -= total;
+        act.cur_sg->cur -= total;
         const char *fp = static_cast<const char *>(frag_rbp);
         ctx.captures =
             *reinterpret_cast<CaptureSlots *const *>(fp + 16);
@@ -7066,7 +7091,7 @@ extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
         if (lv.get().get_type()->t >= Type::t_str)
             lv = LValue();
     }
-    act.cur_sg->top -= total;
+    act.cur_sg->cur -= total;
     ctx.captures = *reinterpret_cast<CaptureSlots *const *>(
         static_cast<const char *>(rbp) + 16);
     if (dst_addr)
@@ -7329,7 +7354,7 @@ jit_norec_postexit(size_t r, int_type site_packed, LValue *caller_win,
         if (lv.get().get_type()->t >= Type::t_str)
             lv = LValue();
     }
-    act.cur_sg->top -= total;
+    act.cur_sg->cur -= total;
     ctx.captures = static_cast<CaptureSlots *>(
         const_cast<void *>(g_jit_residue_caps));
     act.view_frame.point_at(
@@ -7630,12 +7655,6 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
             nr.seg = act.cur_seg;      /* the inline-push invariant: a
                                         * record-less frame shares its
                                         * caller's segment */
-            {
-                const VmStackSeg &sg =
-                    *act.segs[static_cast<size_t>(act.cur_seg)];
-                nr.seg_top_before = static_cast<int_type>(
-                    my_win - sg.slots.data());
-            }
             nr.run_chunk = my_ck;
             nr.desc = my_desc;
             nr.ret_chunk = S->caller;
@@ -8427,15 +8446,13 @@ void jit_fill_push_layout(JitPushLayout *L)
     VmStackSeg sg(1);
     const char *sb = reinterpret_cast<const char *>(&sg);
     L->seg_slots = reinterpret_cast<const char *>(&sg.slots) - sb;
-    L->seg_top = reinterpret_cast<const char *>(&sg.top) - sb;
-    L->seg_cap = reinterpret_cast<const char *>(&sg.cap_slots) - sb;
+    L->seg_cur = reinterpret_cast<const char *>(&sg.cur) - sb;
+    L->seg_end = reinterpret_cast<const char *>(&sg.end) - sb;
     VmCallRec r;
     const char *rb = reinterpret_cast<const char *>(&r);
     L->rec_window = reinterpret_cast<const char *>(&r.window) - rb;
     L->rec_nslots = reinterpret_cast<const char *>(&r.nslots) - rb;
     L->rec_seg = reinterpret_cast<const char *>(&r.seg) - rb;
-    L->rec_seg_top_before =
-        reinterpret_cast<const char *>(&r.seg_top_before) - rb;
     L->rec_run_chunk = reinterpret_cast<const char *>(&r.run_chunk) - rb;
     L->rec_ret_chunk = reinterpret_cast<const char *>(&r.ret_chunk) - rb;
     L->rec_ret_pc = reinterpret_cast<const char *>(&r.ret_pc) - rb;
@@ -8542,9 +8559,9 @@ bool g_norec_audit = false;
  * (vm_raise's `norec_raiser` arm) un-accounts the segment top and the
  * segment top by the frame's own totals and repoints the view at the
  * parent using values it derives from hardware. A frame whose
- * `seg_top_before` disagrees with that derivation unwinds to a WRONG
+ * window disagrees with that derivation unwinds to a WRONG
  * slot-stack top, and nothing in Nets 1/1b looks. The sabotage matrix
- * names exactly that defect ("wrong seg_top_before restore") with this
+ * names exactly that defect ("wrong watermark restore") with this
  * net as its only catcher.
  *
  * WHAT IT FORCES. Reconstruction is normally demanded only where an
@@ -8733,7 +8750,7 @@ static size_t norec_walk_chain(VmActivation *act, const char *fp,
  *          my_total;
  *   seg math - all chain frames live in act.cur_seg (an emitted push
  *          never crosses a segment - the fit test declines to C++, which
- *          writes a record), and seg_top_before = window - seg base;
+ *          writes a record), and the watermark IS the window;
  *   captures - the residue at [fp+16] (and dst_addr at [fp+24]), read
  *          at the switch moment - the residues sit untouched deeper in
  *          the native stack, which is the liveness claim the insert
@@ -8868,9 +8885,9 @@ static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
  *
  * and compares each against the live record. The SLOT-STACK ARITHMETIC
  * is the part no other net checks, and it is checked CUMULATIVELY:
- * `seg_top_before + nslots` of each frame must land exactly on the next
- * frame down's `seg_top_before`, with the topmost landing on the live
- * `seg->top`. A single frame with a wrong `seg_top_before` breaks the
+ * `window + nslots` of each frame must land exactly on the next frame
+ * down's `window`, with the topmost landing on the live `seg->cur`.
+ * A single frame with a wrong `window` breaks the
  * chain of equalities wherever it sits - which is the defect the
  * sabotage matrix assigns to this net.
  *
@@ -8895,23 +8912,20 @@ static void norec_recon_probe(VmActivation *act, const char *fp0,
     /* seeded from the live segment top: the CALLEE just pushed is the
      * top of the slot stack, so the first equality we can demand is on
      * that record, then one per frame down. */
-    int_type expect_top = -1;
+    const LValue *expect_cur = nullptr;
     if (shadow && act->rec_n) {
         const VmCallRec &callee = act->back_rec();
         if (callee.seg >= 0
                 && static_cast<size_t>(callee.seg) < act->segs.size()) {
             const VmStackSeg &sg =
                 *act->segs[static_cast<size_t>(callee.seg)];
-            if (static_cast<int_type>(sg.top)
-                    != callee.seg_top_before + callee.nslots)
-                norec_fail("recon: live seg->top != top record's "
-                           "seg_top_before + nslots",
-                           reinterpret_cast<const void *>(sg.top),
-                           reinterpret_cast<const void *>(
-                               static_cast<intptr_t>(
-                                   callee.seg_top_before
-                                   + callee.nslots)));
-            expect_top = callee.seg_top_before;
+            if (sg.cur != callee.window + callee.nslots)
+                norec_fail("recon: live seg->cur != top record's "
+                           "window + nslots",
+                           static_cast<const void *>(sg.cur),
+                           static_cast<const void *>(
+                               callee.window + callee.nslots));
+            expect_cur = callee.window;
         }
     }
 
@@ -8981,18 +8995,26 @@ static void norec_recon_probe(VmActivation *act, const char *fp0,
                                reinterpret_cast<const void *>(
                                    static_cast<intptr_t>(R.nslots)));
             }
-            /* THE CUMULATIVE SLOT-STACK EQUALITY (the seg_top_before
-             * net): un-accounting the frame above must land here. */
-            if (expect_top >= 0) {
-                if (R.seg_top_before + R.nslots != expect_top)
-                    norec_fail("recon: seg_top_before + nslots != the "
-                               "frame above's seg_top_before",
-                               reinterpret_cast<const void *>(
-                                   static_cast<intptr_t>(
-                                       R.seg_top_before + R.nslots)),
-                               reinterpret_cast<const void *>(
-                                   static_cast<intptr_t>(expect_top)));
-                expect_top = R.seg_top_before;
+            /*
+             * THE CUMULATIVE SLOT-STACK EQUALITY, in ADDRESSES. The
+             * watermark used to be a slot INDEX saved per record
+             * (`seg_top_before`), and this net demanded `seg_top_before
+             * + nslots == the frame above's seg_top_before`. The
+             * watermark is a POINTER now and the record no longer saves
+             * a copy, so the same invariant is stated on the window
+             * itself - which is the SAME quantity (the old field was
+             * `window - slots.data()`) and a strictly stronger check:
+             * an index equality can hold with the frames in the wrong
+             * SEGMENT, an address equality cannot.
+             */
+            if (expect_cur) {
+                if (R.window + R.nslots != expect_cur)
+                    norec_fail("recon: window + nslots != the frame "
+                               "above's window",
+                               static_cast<const void *>(
+                                   R.window + R.nslots),
+                               static_cast<const void *>(expect_cur));
+                expect_cur = R.window;
             }
             idx--;
         }
@@ -9023,7 +9045,7 @@ static void norec_recon_probe(VmActivation *act, const char *fp0,
  * ([rbp+24] = dst_addr, [rbp+16] = the caller's captures), the window
  * chain ([rbp-8] = the parent's window, which the arm stores into
  * vframe.slots), the baked callee total, and the seg-top induction fact
- * (seg->top == rec.seg_top_before + total - what makes the arm's baked
+ * (seg->cur == rec.window + total - what makes the arm's baked
  * subtraction equal the record path's absolute restore). Never throws
  * (#142); a mismatch is the deliberate located abort.
  */
@@ -9103,11 +9125,10 @@ extern "C" void jit_norec_retarm_verify(const void *dst_addr,
                    reinterpret_cast<const void *>(
                        static_cast<intptr_t>(rec.seg)));
     const VmStackSeg &sg = *act->segs[static_cast<size_t>(act->cur_seg)];
-    if (static_cast<int_type>(sg.top) != rec.seg_top_before + total)
-        norec_fail("retarm seg->top != seg_top_before + total",
-                   reinterpret_cast<const void *>(sg.top),
-                   reinterpret_cast<const void *>(
-                       static_cast<intptr_t>(rec.seg_top_before + total)));
+    if (sg.cur != rec.window + total)
+        norec_fail("retarm seg->cur != window + total",
+                   static_cast<const void *>(sg.cur),
+                   static_cast<const void *>(rec.window + total));
     g_jit_norec_retarm_verify++;
 #else
     (void)dst_addr; (void)rbp; (void)total;

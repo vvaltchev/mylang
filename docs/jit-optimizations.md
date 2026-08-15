@@ -4241,3 +4241,90 @@ Four things depend on the current shape, and all four are load-bearing:
     somewhere; today the POP does it, so this is a move rather than a
     new cost - but it is the reason the segmented design exists and it
     has to be re-measured, not waved through.
+
+## H8 inc 2 (2026-08-14): the slot stack's watermark is a POINTER, so
+## the window IS the watermark - and the oracle was rewritten FIRST
+
+Inc 1 removed the redundant live-slot counter. What was left in the
+emitted call protocol was the conversion between a slot INDEX and an
+address: the window is `slots.data() + top * sizeof(LValue)`, so the
+push loaded the base, moved the index, multiplied by 48 and added -
+then saved the index in the record so the pop could put it back.
+
+`VmStackSeg` now holds `cur` and `end` as `LValue *`. The push reads
+`cur` AS the window (no multiply, no base load), the new watermark is
+computed once into r11 by the fit test and stored, and the pop writes
+back the record's own `window` - which is the same value the deleted
+`seg_top_before` held, so the field is gone rather than moved.
+
+    ; before                            ; after
+    mov  r11, [seg+top]                 imul r11, rsi, 48
+    push rax                            add  r11, [seg+cur]
+    lea  rax, [r11+rsi]                 cmp  r11, [seg+end]
+    cmp  rax, [seg+cap]                 ja   slow
+    pop  rax                            ...
+    jg   slow                           mov  rdx, [seg+cur]   ; the window
+    ...                                 mov  [seg+cur], r11
+    mov  rdx, [seg+slots]
+    mov  rax, r11
+    imul rax, 48
+    add  rdx, rax
+    lea  rax, [r11+rsi]
+    mov  [seg+top], rax
+    mov  [rec+seg_top_before], r11
+
+Nothing is spilled now: the 3-operand `imul r11, rsi, 48` needs none of
+r11's old value, where the index form had to push/pop rax to build its
+sum. The compare is `ja`, not `jg` - these are addresses.
+
+**THE ORACLE WAS REWRITTEN BEFORE THE THING IT VERIFIES CHANGED**, which
+is the only order that works here. The no-record tier's reconstruction
+is checked by a CUMULATIVE equality over the walked frames, and it was
+stated on the deleted field:
+
+    if (R.seg_top_before + R.nslots != expect_top)     // before
+    if (R.window + R.nslots != expect_cur)             // after
+
+The two are the same predicate - the old field was set to `window -
+slots.data()` in the same breath as `window` itself - and the address
+form is STRICTLY STRONGER: an index equality can hold with two frames in
+DIFFERENT segments, an address equality cannot.
+
+PROVEN, not asserted, with the canary this net was built for - an
+emitted push that leaks ONE SLOT per call:
+
+    -rt                1911/1911 PASS
+    corpus_diff        green
+    Net 2 sweep        FAIL: "recon: live seg->cur != top record's
+                              window + nslots"
+
+Same defect, same net, through the translated assertion. (The FIRST
+sabotage attempted - the walker's rebuilt window off by one slot -
+aborts `-rt` outright, so it proves nothing about this check
+specifically; the leaked-slot form is the one that isolates it.)
+
+MEASURED (callgrind Ir, `OPT=1 ASSERTS=0` both sides, steady-state per
+scale unit; wall from one interleaved full-suite `--baseline` run):
+ - **10_recursion_deep -2.99% Ir**, and the per-call figure is exact:
+   **6.0 instructions per emitted push**, matching the hand count (5
+   from the sequence above, 1 from the deleted field's store). With inc
+   1 the call-window work is -7.6% on that bench.
+ - **WALL CLOCK FLAT** - 1.01x on the bench (0.018s, inside the spread
+   its byte-identical neighbours show in the same run) and 1.004x
+   geomean. This is the documented instruction-vs-time divergence, in
+   the shape the guard-elision family already established: what was
+   removed is a load, an imul and a store on L1-resident data, which
+   retire alongside a call protocol whose real cost is memory traffic.
+   Kept on the CLAUDE.md rule - a neutral wall clock is not a reason to
+   revert a correct change that removes work - and reported as two
+   numbers rather than one.
+
+A COVERAGE GAP FOUND WHILE PROVING THE ABOVE, and NOT introduced by it:
+corrupting the MATERIALIZER's `nr.nslots` by one (the record it
+synthesizes at RAISE time for a record-less frame) is caught by nothing
+- not `-rt`, not corpus_diff, not the sweep. The probe's chain check
+walks CALL-time frames, and the one check that would see it compares
+`nslots` against the chunk totals it was derived from, so it is
+self-consistent by construction. The index form had the identical
+structure. Recorded here rather than fixed, since it is a pre-existing
+hole in a different path.
