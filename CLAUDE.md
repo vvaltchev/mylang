@@ -1695,9 +1695,27 @@ call. Four rules a future editor must not soften:
   `sum` was listed on the reasoning that a sum is a number, but `sum(arr, f)`
   is a reduce; the awk that finds every builtin reaching `VmInvoker`/
   `eval_func` is quoted at the table. A new builtin needs no entry.
+  A SECOND, weaker list (`esc_builtin_no_invoke`) claims only "runs no
+  MyLang code" and gates the callback rule alone. It is an allowlist of
+  NON-invokers on purpose: **that grep misses `map`, `filter` and `sort`**,
+  which reach their callback through a shared helper not named `builtin_*`,
+  so a list built FROM the grep would have declared `sort` safe. Inverted,
+  the same imprecision costs only an optimization.
 - **A callee it cannot NAME poisons the whole function**, not just the
   arguments handed to it: it might reassign the global that some caller
-  passed us and drop the last reference mid-call.
+  passed us and drop the last reference mid-call. A HIGHER-ORDER BUILTIN's
+  callback is a callee like any other, and IS named when it is an inline
+  lambda or a global function slot nothing reassigns (`esc_callback_fn`) —
+  the fixpoint then propagates its `unsafe` along an ordinary call edge.
+  One reached through a parameter or a container element still poisons.
+- **`esc_collect` walks function BODIES explicitly**, because
+  `for_each_child` has no `FuncDeclStmt` arm and would otherwise stop at
+  the top level. That is not only an enabler for naming callbacks:
+  `written_slots` — the reassigned-global-slot set that decides whether a
+  call may be resolved through `slot2fn` at all — was collected from
+  top-level statements ONLY, so a function body doing `helper = other;`
+  was invisible and a call to `helper` elsewhere was answered for a callee
+  that may no longer be there.
 
 Every rule is pinned by a `param_escape_analysis` row that fails when the
 rule is deleted (watched, one sabotage build per rule), except the

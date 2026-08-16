@@ -1342,3 +1342,67 @@ call. The optimization is consumed, not dead.
 - **The tree-walker's `do_func_bind_params`.** Not a performance tier,
   but it is a case, and leaving it out means the two engines bind
   differently.
+
+## B - NAMING THE CALLBACK: BUILT, CORRECT, AND WORTH ZERO TODAY
+
+B was scoped from a counter reading "9 of 12 poisoned functions are
+higher-order builtin". That reading was wrong in a way worth recording:
+`g_esc_p_hobuiltin` counts sites where a NON-TRANSPARENT builtin had a
+possibly-callable argument, and `callable_arg_mask` sets a bit for any
+`Dyn` argument - "a dyn might hold a function". In a TEMPLATE BASE every
+un-annotated parameter is `dyn`, so **`array(n)` was counted as a
+higher-order call**. None of the corpus's poison sites was a callback.
+
+### What was built
+
+1. **The callback is NAMED when it can be** (`esc_callback_fn`): an inline
+   lambda is a `FuncDeclStmt` in the argument list, a named function is a
+   global slot nothing reassigns. Either way it is an ordinary callee, and
+   the `unsafe` edge the fixpoint already propagates is the whole answer -
+   what the poison guarded against (a callback writing a global, or
+   reaching something unanalysable) IS that flag. A callback reached
+   through a parameter or a container element still poisons.
+2. **A builtin that runs no MyLang code skips the rule**
+   (`esc_builtin_no_invoke`). Deliberately an allowlist of NON-invokers:
+   the mechanical grep for `VmInvoker`/`eval_func(` finds `make_array`,
+   `make_dict`, `sum`, `find_arr`, `hash` and **misses `map`, `filter` and
+   `sort`**, which reach their callback through a shared helper. A list
+   built from that grep would have declared `sort` safe.
+3. **`esc_collect` now walks function BODIES** - `for_each_child` has no
+   `FuncDeclStmt` arm, so collection stopped at the top level.
+
+### (3) is a pre-existing SOUNDNESS fix, and it is the real value here
+
+`written_slots` is the set of reassigned global slots, and it decides
+whether a call may be resolved through `slot2fn` at all. Collected from
+top-level statements only, a function body doing `helper = other;` was
+INVISIBLE - so a call to `helper` from anywhere resolved to the original
+function and the fixpoint answered for a callee that may no longer be
+there. That is the unsound direction. It was latent before the borrow
+existed and would have become a use-after-free the moment a program hit
+it.
+
+### The measurement, and it is a null result
+
+Compile-time reach over bench/my + samples/ + tests/functional:
+
+| | before | after |
+|---|---|---|
+| functions poisoned | 8 | **5** |
+| higher-order poison sites | 7 | **4** |
+| parameters marked | 13 | **15** |
+
+**Run-time borrows over the corpus: UNCHANGED at 1,000,002.** The two
+extra marked parameters are on template BASES, which never execute -
+calls redirect to the typed clones. So B is correct, its mechanism is
+proven on a constructed shape (a `map` with an inline lambda takes that
+function from 0 to 30 borrows per 30 calls), and it buys NOTHING measured
+on today's corpus. It is kept for the soundness fix and because the
+callback shape is ordinary code that this corpus simply lacks; the call
+is the maintainer's.
+
+Four rules, four sabotages, each watched failing: the callback naming,
+the fail-closed decline for an unnameable one, the no-invoke list, and
+the body walk. The no-invoke case had to spell its parameter `dyn`
+explicitly - written un-annotated it is instantiated to a concrete int
+and the rule never runs (watched: that version survives the sabotage).
