@@ -1600,6 +1600,13 @@ struct Chunk {
      * four are actually unmoved, so a future op that pushes per-frame state
      * without a chunk count fails loudly instead of leaking it into the
      * caller's frame.
+     *
+     * G1 (2026-08-07): the EMITTED inline push (emit_sync_push_native) tests
+     * the same flag on the CALLEE chunk, where it used to compare n_trys,
+     * n_dict_iters and n_dyn_iters separately - a callee that owns any of
+     * them needs push_window to grow its slice (and #78's pend_base), so it
+     * declines to the C++ tier. Identical proof, one byte test instead of
+     * three dword compares, and now BOTH ends of the protocol read one flag.
      */
     bool plain_frame = true;
     void set_plain_frame() {

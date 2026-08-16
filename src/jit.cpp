@@ -2630,14 +2630,20 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     j_slow.push_back(e.j32(0x74));                    /* jz slow */
     cmp_q_imm8(RCX, static_cast<int32_t>(P.ck_sync_entry), 0);
     j_slow.push_back(e.j32(0x7C));                    /* jl slow */
-    cmp_d_imm8(RCX, static_cast<int32_t>(P.ck_n_dict_iters), 0);
-    j_slow.push_back(e.j32(0x75));                    /* jne slow */
-    cmp_d_imm8(RCX, static_cast<int32_t>(P.ck_n_dyn_iters), 0);
-    j_slow.push_back(e.j32(0x75));                    /* jne slow */
-    /* #78: a callee with TRY regions needs rec.pend_base + a pends slice -
-     * push_window's job; the inline push declines (like the iter pools). */
-    cmp_d_imm8(RCX, static_cast<int32_t>(P.ck_n_trys), 0);
-    j_slow.push_back(e.j32(0x75));                    /* jne slow */
+    /*
+     * The callee must own NO per-frame side state - and that is EXACTLY what
+     * Chunk::plain_frame already says (`!n_trys && !n_dict_iters &&
+     * !n_dyn_iters`), so one byte test replaces the three dword compares this
+     * used to emit. Each clause still matters for its own reason: an iterator
+     * pool needs push_window to grow the slice, and #78's TRY regions need a
+     * rec.pend_base + a pends slice - both push_window's job, so such a callee
+     * declines to the C++ tier. The POP side has trusted this same flag since
+     * 2026-08-01; using it here is the identical proof one step earlier, and
+     * pop_window's hardened else-branch asserts the watermarks really did not
+     * move.
+     */
+    cmp_b_imm8(RCX, static_cast<int32_t>(P.ck_plain_frame), 0);
+    j_slow.push_back(e.j32(0x74));                    /* je slow */
     /* rsi = total = frame_size + n_temps */
     if (!cached) {
         /* a PLAIN call from a cache-carrying caller declines (the stash
@@ -2672,16 +2678,16 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     /* mov r10, [r11 + r10*8] */
     e.u8(0x4F); e.u8(0x8B); e.u8(0x14); e.u8(0xD3);   /* r10 = seg* */
     ld(R11, R10, static_cast<int32_t>(P.seg_top));    /* r11 = top */
+    /* segment fit, in SLOT units: top + total <= seg->cap_slots. This used to
+     * compare BYTE extents - imul the sum by 48, then rebuild the vector's
+     * length from its two pointers - which needed rcx spilled as a second
+     * scratch. cap_slots is a constant of the segment (see VmStackSeg), so
+     * the whole thing is one compare; rax is still spilled because every
+     * register is live here, and `pop` leaves the flags alone. */
     e.push_reg(RAX);
-    /* lea rax, [r11 + rsi]; imul rax, rax, 48 */
     e.u8(0x49); e.u8(0x8D); e.u8(0x04); e.u8(0x33);   /* lea rax,[r11+rsi] */
-    imul_imm(RAX, 48);
-    e.push_reg(RCX);
-    ld(RCX, R10, static_cast<int32_t>(P.seg_slots) + 8);
-    modrm(0x2B, RCX, R10, static_cast<int32_t>(P.seg_slots), true);
-                                                      /* sub rcx, [start] */
-    e.u8(0x48); e.u8(0x39); e.u8(0xC8);               /* cmp rax, rcx */
-    e.pop_reg(RCX);
+    modrm(0x3B, RAX, R10, static_cast<int32_t>(P.seg_cap), true);
+                                                      /* cmp rax,[seg+cap] */
     e.pop_reg(RAX);
     j_slow.push_back(e.j32(0x7F));                    /* jg slow */
 
@@ -2727,10 +2733,21 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(0x02);   /* shr rax, 2
                                                        * (4-byte VmHandler) */
     st32(R10, static_cast<int32_t>(P.rec_handler_base), RAX);
-    ld32(RAX, R8R, static_cast<int32_t>(P.act_diters_n));
-    st32(R10, static_cast<int32_t>(P.rec_diter_base), RAX);
-    ld32(RAX, R8R, static_cast<int32_t>(P.act_dyiters_n));
-    st32(R10, static_cast<int32_t>(P.rec_dyiter_base), RAX);
+    /* diter_base AND dyiter_base in ONE qword move: both are adjacent u32
+     * pairs (the activation's two mirror counters, the record's two bases),
+     * so on this little-endian target the copy is exact. The probe checks
+     * the adjacency rather than assuming it - a layout that ever separated
+     * them falls back to the two-move form instead of writing garbage. */
+    if (P.act_dyiters_n == P.act_diters_n + 4
+            && P.rec_dyiter_base == P.rec_diter_base + 4) {
+        ld(RAX, R8R, static_cast<int32_t>(P.act_diters_n));
+        st(R10, static_cast<int32_t>(P.rec_diter_base), RAX);
+    } else {
+        ld32(RAX, R8R, static_cast<int32_t>(P.act_diters_n));
+        st32(R10, static_cast<int32_t>(P.rec_diter_base), RAX);
+        ld32(RAX, R8R, static_cast<int32_t>(P.act_dyiters_n));
+        st32(R10, static_cast<int32_t>(P.rec_dyiter_base), RAX);
+    }
     st_b_imm8(R10, static_cast<int32_t>(P.rec_boundary), 0);
     st_b_imm8(R10, static_cast<int32_t>(P.rec_sync_stop), 1);
     if (cached) {
@@ -2796,10 +2813,13 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.pop_reg(R9R); e.pop_reg(RCX);
         e.patch32_here(j_done);
     }
-    e.u8(0x45); e.u8(0x31); e.u8(0xDB);               /* xor r11d, r11d */
-    for (int i = 0; i < NARGS; i++) {
-        st(RDX, i * 48 + 32, R11);
-        st(RDX, i * 48 + 40, R11);
+    if (NARGS) {                       /* the zeroing constant, if anyone
+                                        * zeroes: a 0-arg callee had it dead */
+        e.u8(0x45); e.u8(0x31); e.u8(0xDB);           /* xor r11d, r11d */
+        for (int i = 0; i < NARGS; i++) {
+            st(RDX, i * 48 + 32, R11);
+            st(RDX, i * 48 + 40, R11);
+        }
     }
     /* ctx.captures = &fo.capture_slots; restore the spills */
     e.pop_reg(RAX);                                   /* desc (done) */

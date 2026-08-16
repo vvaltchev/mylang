@@ -2345,3 +2345,76 @@ non-loop-carried literal uses) and `construct_struct_from_values`
 (StructCtorV) have the same per-field identity coercion. The latter got the
 same treatment here; the fresh array path did not, and is why
 64_struct_create is flat.
+
+## G1 increment 1 (2026-08-07): the inline push's GUARD phase
+
+Four precomputes in `emit_sync_push_native`, each replacing a per-call
+recomputation with a quantity that was already derivable. No new proof
+obligation, no new flag whose staleness could bite.
+
+1. **`Chunk::plain_frame` for the three callee-count tests.** The push used
+   to compare `n_dict_iters`, `n_dyn_iters` and `n_trys` separately (six
+   instructions); that flag already means exactly "owns no per-frame side
+   state", and the POP side has trusted it since 2026-08-01. Same proof, one
+   byte test, and now both ends of the protocol read one flag. **-4**
+2. **`VmStackSeg::cap_slots`.** The segment fit test compared BYTE extents:
+   `imul` the slot sum by 48, then rebuild the vector's length from its two
+   pointers - which needed rcx spilled as a second scratch. `slots` is sized
+   once at construction and never resized (live windows hold raw pointers
+   into it), so its capacity is a constant; the test is now one compare in
+   slot units. rax is still spilled - every register is live here - and
+   `pop` leaves the flags alone. **-5**
+3. **The two iterator watermark bases in ONE qword move.** Both are adjacent
+   u32 pairs. The emitter CHECKS the adjacency from the probed layout rather
+   than assuming it, and falls back to the two-move form. **-2**
+4. **The arg-zeroing `xor r11d, r11d` is emitted only when there are args.**
+   **-1**
+
+Measured (callgrind Ir, `OPT=1 ASSERTS=0`): the probe's caller fragment
+159 -> 147 Ir per call (**-7.55%**, exactly the 12 instructions), its callee
+fragment byte-flat (the pop is untouched); 10_recursion_deep **-3.99%**,
+11_closure_counter **-2.89%**, 63_closures **-2.29%**,
+76_funcval_dispatch **-1.22%**, 09_fib_recursive -0.14%. Ten unrelated
+benches flat to the last digit - no dispatch layout tax.
+
+### RULE THIS EARNS: the emitted push serves REPEAT calls, not DEEP ones
+
+Instrumenting `g_jit_sync_inline` while looking for a test shape produced a
+reach measurement worth more than the increment:
+
+    a closure called 2,000,000 times in a loop   2,000,000 inline pushes
+    down(n) with an int param, 6000 deep                 0
+    down(dyn n), 8000 deep                              0
+    zero-arg self-recursion, 3000 deep                  0
+
+Two independent gates: **`fast_bind` is FALSE for any callee with an
+`int`/`float`-declared param** (such a param needs a coercion, not a copy),
+and the **record-reuse guard `rec_n != recs_high`** declines a
+monotonically-deepening chain - a first descent always grows `records`, so
+it always takes the C++ tier. Before attributing a call-protocol measurement
+to this emitted path, CHECK THE COUNTER; the shapes it does not serve are
+not exotic.
+
+### The sabotage that needed a purpose-built shape
+
+A half-copy of the watermark pair is invisible to every ordinary program.
+The slice is sized at FRAME push from the chunk's own count, so **within one
+frame the watermark never moves** - the stale value and the live value are
+equal, and no differential can tell them apart. The catching shape needs the
+SAME record slot reused under two DIFFERENT correct bases: `A` owns a dyn
+foreach (dyiters_n is higher for as long as it runs), `B` owns none, both
+calling one zero-arg closure at the same depth. Then the half-copy aborts on
+`jit_ret_audit`'s `dyiters_n == rec.dyiter_base`.
+
+Three shape-eaters had to be defeated for the callee to reach the push at
+all, and they are why the test looks contrived: it must be a **closure** (a
+named function is folded or inlined away), take **no argument** (an int
+param kills `fast_bind`), and be called from a **loop** (the first call
+declines on record reuse).
+
+Sabotages watched failing: removing the `plain_frame` gate -> `-rt` exit 134
+on `jit_dyiter`'s slice bound; `cap_slots` inflated in C++ -> the ML_VM_CHECK
+at `push_window`; the fit test pointed at `seg_top` instead of `seg_cap` (it
+then always declines - silently correct, only slower) -> the EXISTING
+coverage test, `jit_sync_inline_call: inline path DID NOT RUN`; the half-copy
+-> the new test above.

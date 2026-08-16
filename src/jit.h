@@ -225,8 +225,9 @@ struct JitPushLayout {
               act_handlers2;
     /* Frame (the view) */
     ptrdiff_t frame_slots, frame_size, frame_pure_cache;
-    /* VmStackSeg */
-    ptrdiff_t seg_slots, seg_top;
+    /* VmStackSeg (seg_cap: the PRECOMPUTED slot capacity - the emitted fit
+     * test used to rebuild it from the vector's two pointers and an imul) */
+    ptrdiff_t seg_slots, seg_top, seg_cap;
     /* VmCallRec */
     ptrdiff_t rec_window, rec_nslots, rec_seg, rec_seg_top_before,
               rec_run_chunk, rec_ret_chunk, rec_ret_pc, rec_dst, rec_desc,
@@ -236,9 +237,9 @@ struct JitPushLayout {
     /* FuncDescriptor */
     ptrdiff_t desc_params, desc_frame_size, desc_fast_bind;
     size_t param_desc_size;
-    /* Chunk */
-    ptrdiff_t ck_n_temps, ck_n_dict_iters, ck_n_dyn_iters, ck_n_trys,
-              ck_sync_entry;
+    /* Chunk (ck_plain_frame: the DERIVED byte flag that already means
+     * "no trys, no dict iters, no dyn iters" - one test for three) */
+    ptrdiff_t ck_n_temps, ck_plain_frame, ck_sync_entry;
     /* FuncObject */
     ptrdiff_t fo_func, fo_capture_slots;
     /* singletons/constants */
