@@ -4659,3 +4659,90 @@ from the emitted code IS the event, the same idiom as
 literal was what listed the slot - MEASURED FALSE** (swapping it for an
 int leaves the counter unchanged); the sabotage, not the shape, is what
 rules out vacuity.
+
+## #95 THE INLINE ord(s[i]) READ: 5.82 -> 0.62 ns/char, my/cpp 27x -> 2.7x
+
+The census (plans/cpp-gap-ladder.md) ranked the corpus by
+STARTUP-CORRECTED my/cpp and found 30_str_index_iterate worst at
+**27.36x**, with the simplest loop of the eight: two `lea`s, ONE helper
+call for the fused `ord(s[i])`, two `movabs` to reload the type-tag
+singletons that call clobbered, a status test, and reloading the result
+the helper had stored. **A function call per character where C++ does a
+load.**
+
+The emitted arm, gated on the layout self-check below:
+
+    cmp  byte [rbx + payload + slice_off], 0
+    jne  -> cold                    ; a SLICE
+    mov  eax, [rbx + payload + len_off]
+    <index -> rdx, cache-aware load_operand>
+    cmp  rdx, rax
+    jae  -> cold                    ; ONE unsigned compare: a negative
+                                    ; index read unsigned is huge, so
+                                    ; this catches BOTH neg and >= len
+    mov  rax, [rbx + payload]       ; the StrObj *
+    mov  rcx, [rax + strobj_data]   ; std::string's char pointer
+    movzx eax, byte [rcx + rdx]
+    <store_dst>
+
+**MEASURED, and it BEAT the prediction** (which said ~1 ns and 27x ->
+~4x): the loop-only figure, scale-3 minus scale-1 so startup cancels,
+went **5.82 -> 0.62 ns/char against C++'s 0.23**, i.e. **my/cpp 27.36x
+-> 2.7x** and a **9.4x** speedup on the loop. End-to-end the bench is
+**0.30x**; the suite geomean is **0.990x** (1% faster overall) with no
+regression - the two benches reading 1.16x/1.22x are +0.000%/-0.001% on
+callgrind, i.e. noise.
+
+This is the first prediction of the session that came out right, and it
+is the category the cost model says wins: it removes a real CALL and its
+BODY (a `get_ref<SharedStr>` type check, a `string_view` construction,
+two stores through memory), not free instructions. Contrast #94 step 3,
+which removed a predicted call to a hot helper that did almost nothing
+and bought exactly zero.
+
+### ⛔ THE LAYOUT SELF-CHECK, and why a static_assert cannot do it
+
+The arm loads characters through `[StrObj + strobj_data_off]`, i.e.
+`std::string::_M_p`. libstdc++ keeps that at offset 0 of the string and
+VALID for both the SSO and the heap form, so one load serves every
+string; libc++ does not lay its short form out that way, and this
+project builds with clang and has a libc++ CI lane. A wrong offset is a
+silent wrong character or a wild read, never a build error.
+
+So the offset is derived from a real object (`SharedStr::JitProbe`, the
+co-located-probe rule) and then VERIFIED at layout-init against a live
+SHORT and LONG string; `str_inline_ok` gates the arm and a mismatch
+leaves every `ord(s[i])` calling the helper. Reported as JITSTATS
+`str_probe_ok`.
+
+**AND THE PROBE CANNOT BECOME THE WILD READ IT PREVENTS** (maintainer's
+requirement): a BOUND first - the offset plus a pointer must fit inside
+the StrObj, whose size the probe hands out for exactly this - then a
+FAULT GUARD (sigaction on SIGSEGV/SIGBUS + sigsetjmp/siglongjmp,
+restored immediately) as the backstop. Watched: bypassing the bound and
+forcing a 1 GB offset prints the warning, keeps the tier off, returns
+the right answer and does not crash. **A failure WARNS on stderr** -
+losing an optimization silently is how a platform ends up permanently
+slower with nobody noticing.
+
+⛔ **BUILD THE TEST STRINGS OUTSIDE THE GUARDED WINDOW.** `siglongjmp`
+skips C++ destructors, so a string constructed inside it LEAKS when the
+guard fires - ASan reported exactly that (56 bytes) on the first
+version.
+
+### The nets
+
+`jit_ord_char_inline` covers one FIRING shape and three DECLINES (a
+slice base, a negative index, an out-of-range index), each asserting the
+value AND its own `g_jit_ord_inline` delta. Sabotage watched: deleting
+the slice decline or the bounds decline fails it; forcing the tier OFF
+fails it AND `jit_counter_coverage` ("g_jit_ord_inline is ZERO after the
+whole suite"), which is a second independent net.
+
+Two honest notes. **Forcing the tier ON is a VACUOUS sabotage here** -
+the probe passes on this toolchain, so it changes nothing; only the
+off direction is meaningful on a machine where the layout matches.
+And `lever 4b`'s existing test had to start counting BOTH native tiers
+(`g_jit_op_run[OrdCharV] + g_jit_ord_inline`), because the helper is
+what bumps the former and the inline arm calls nothing - the same
+tier-moved-under-a-counter fix the borrow needed.

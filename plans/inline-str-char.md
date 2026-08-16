@@ -1,7 +1,9 @@
 # Inline the fused `ord(s[i])` read (30_str_index_iterate, 27x my/cpp)
 
-**Status: STEP 1 LANDED (the self-verifying probe, inert); steps 2-6
-next.** Everything needed to execute the rest is here, including the one
+**Status: DONE (2026-08-16). MEASURED 5.82 -> 0.62 ns/char, my/cpp
+27.36x -> 2.7x, suite geomean 0.990x.** The per-change record with the
+sabotage matrix is in docs/jit-optimizations.md; this file keeps the
+design and the hazard. Everything needed to execute the rest is here, including the one
 hazard that decides the shape.
 
 **What step 1 measured on this toolchain** (gcc 11.4 / libstdc++):
@@ -159,7 +161,12 @@ plus `jit_layout()` fields `str_slice_off`, `str_obj_off`,
    base then reads the parent's bytes), the bounds test (a wild read -
    ASan), and the self-check (force it false; the tier must vanish and
    everything stay green).
-6. **Measure wall clock**, interleaved, against the prediction above.
+6. ~~**Measure wall clock**~~ **DONE - and it BEAT the prediction.**
+   Loop-only (scale-3 minus scale-1, so startup cancels): **5.82 -> 0.62
+   ns/char** against C++'s 0.23, i.e. **9.4x on the loop** and my/cpp
+   **27.36x -> 2.7x**. End-to-end 0.30x; suite geomean 0.990x with no
+   regression (the two benches reading 1.16x/1.22x are +0.000%/-0.001%
+   on callgrind). Steps 2-5 all done; see docs/jit-optimizations.md.
 
 ## ⛔ Two emitter traps already paid for once (2026-08-15)
 

@@ -887,6 +887,8 @@ extern "C" unsigned long g_jit_elem2_fast;
 /* G5: emitted-code proof that the INLINE len(str) ran (the helper is gone
  * for a proven-string base, so jit_str_len's own counter cannot say). */
 extern "C" unsigned long g_jit_strlen_fast;
+/* #95: the EMITTED inline ord(s[i]) arm (execution proof) */
+extern "C" unsigned long g_jit_ord_inline;
 /* G4: execution proof for the CHECKED a[i].f helper (the subscript form). */
 extern "C" unsigned long g_jit_sfield_checked;
 extern "C" unsigned long g_jit_store2_fast;   /* #95: nested-store tier */

@@ -24134,6 +24134,109 @@ static bool jit_elem_slice_and_promote()
 }
 
 /*
+ * #95 THE INLINE ord(s[i]) ARM, and the three shapes that must DECLINE.
+ *
+ * The helper is one call PER CHARACTER where C++ does a load; inlining it
+ * took 30_str_index_iterate from 5.82 to 0.62 ns/char. `g_jit_ord_inline`
+ * is bumped by the EMITTED arm only - the helper's own ML_JIT_OP_RAN
+ * cannot satisfy it, which is the whole point, since both tiers compute
+ * the same character.
+ *
+ * The declines all hand the awkward semantics back to the helper:
+ *  - a SLICE base. SharedStr::offset() is `slice ? off : 0`, so a
+ *    non-slice must IGNORE `off`; a borrowed-in fast arm that skipped
+ *    that test would read the PARENT's bytes at the wrong position.
+ *  - a NEGATIVE index, which the helper wraps (s[-1] is the last char).
+ *  - an OUT-OF-RANGE index, which must still throw OutOfBoundsEx with
+ *    the subscript's caret.
+ * The last two share ONE unsigned compare in the emitted arm (a negative
+ * index read as unsigned is huge), so both are pinned.
+ */
+static bool jit_ord_char_inline()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    /* FIRES: a plain, non-slice string with in-range indices. */
+    unsigned long b0 = g_jit_ord_inline;
+    if (!run({ "var s = \"abcdefghij\";",
+               "var t = 0;",
+               "for (var k = 0; k < 40; k++)",
+               "  for (var i = 0; i < len(s); i++) t = t + ord(s[i]);",
+               "assert(t == 40 * 1015);" }))
+        return false;
+    if (g_jit_ord_inline <= b0)
+        return false;         /* the emitted arm never served a character */
+
+    /* DECLINES - a SLICE base. The values must still be the slice's own
+     * characters, not the parent's at the same offsets. */
+    b0 = g_jit_ord_inline;
+    if (!run({ "var s = \"abcdefghij\";",
+               "var sl = s[3:6];",
+               "var t = 0;",
+               "for (var k = 0; k < 40; k++)",
+               "  for (var i = 0; i < 3; i++) t = t + ord(sl[i]);",
+               /* 'd','e','f' - NOT 'a','b','c' */
+               "assert(t == 40 * (100 + 101 + 102));" }))
+        return false;
+    if (g_jit_ord_inline != b0)
+        return false;         /* a slice must never take the inline arm */
+
+    /* DECLINES - a NEGATIVE index, which the helper wraps. */
+    b0 = g_jit_ord_inline;
+    if (!run({ "var s = \"abcdefghij\";",
+               "var t = 0;",
+               "for (var k = 0; k < 40; k++) t = t + ord(s[-1]);",
+               "assert(t == 40 * 106);" }))
+        return false;
+    if (g_jit_ord_inline != b0)
+        return false;
+
+    /* DECLINES - OUT OF RANGE: still OutOfBoundsEx, still catchable. */
+    b0 = g_jit_ord_inline;
+    if (!run({ "var s = \"abcdefghij\";",
+               "var t = 0;",
+               "for (var k = 0; k < 40; k++) t = t + ord(s[k % 10]);",
+               "var caught = 0;",
+               "try { t = t + ord(s[99]); } catch (OutOfBoundsEx) "
+               "{ caught = 1; }",
+               "assert(caught == 1);",
+               "assert(t == 4 * 1015);" }))
+        return false;
+    if (g_jit_ord_inline <= b0)
+        return false;         /* the in-range reads still inline */
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * Lever A's write-elision, on a REF-LISTED temp that C5 has discharged.
  *
  * A temp SLOT is reused across a whole chunk, so one string temp anywhere
@@ -27090,8 +27193,8 @@ static bool jit_len_ord()
      * counter would also count DECLINES, which is exactly why the inline
      * tiers each carry their own. */
     const unsigned long s0 = g_jit_strlen_fast;
-    const unsigned long o0 =
-        g_jit_op_run[static_cast<size_t>(OpCode::OrdCharV)];
+    const unsigned long o0 = g_jit_op_run[static_cast<size_t>(OpCode::OrdCharV)]
+                 + g_jit_ord_inline;
     if (!run({
             "var a = [3, 1, 4, 1, 5];",
             "var s = \"hello\";",
@@ -27115,7 +27218,16 @@ static bool jit_len_ord()
         fprintf(stderr, "jit_len_ord: the INLINE StrLen DID NOT RUN\n");
         return false;
     }
-    if (g_jit_op_run[static_cast<size_t>(OpCode::OrdCharV)] <= o0) {
+    /*
+     * "OrdCharV ran natively" has TWO tiers since #95: the helper
+     * (jit_ord_char, which is what bumps g_jit_op_run) and the INLINE arm,
+     * which calls nothing and so cannot bump it. Both are native - the
+     * claim this test makes - so it counts their sum. The inline arm gets
+     * its own assertion in jit_ord_char_inline, where the claim is
+     * specifically that IT ran.
+     */
+    if (g_jit_op_run[static_cast<size_t>(OpCode::OrdCharV)]
+            + g_jit_ord_inline <= o0) {
         fprintf(stderr, "jit_len_ord: native OrdCharV DID NOT RUN\n");
         return false;
     }
@@ -28616,6 +28728,7 @@ static bool jit_counter_coverage()
         { "relent_stores",    &g_jit_relent_stores,    nullptr },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel,     nullptr },
         { "str_probe_ok",     &g_jit_str_probe_ok,     nullptr },
+        { "ord_inline",       &g_jit_ord_inline,       nullptr },
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
         { "arg_borrow",       &g_arg_borrow,           nullptr },
         { "arg_borrow_slice", &g_arg_borrow_slice,     nullptr },
@@ -31163,6 +31276,9 @@ static const std::vector<extra_check> extra_checks =
       jit_ctor_establish_c4e },
     { "jit: C5 loop-preheader release of a ref-listed temp",
       jit_release_c5 },
+    { "jit: #95 the INLINE ord(s[i]) arm - fires on a plain string, "
+      "DECLINES a slice / negative / out-of-range index",
+      jit_ord_char_inline },
     { "jit: native len() + fused ord(s[i]) run natively (lever 4b)",
       jit_len_ord },
     { "jit: LoadElem slow tier serves declined shapes (#56 inc 1)",
