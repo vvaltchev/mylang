@@ -471,7 +471,6 @@ struct JitLayout {
     int hashv_off;     /* SharedObject: &hash_valid - shobj */
     int slices_off;    /* SharedObject: &has_slices - shobj */
     int lv_const_off;  /* LValue: &is_const - &slot */
-    int lv_borrow_off; /* LValue: &borrowed - &slot (#94) */
     int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
     int t_str_val;        /* Type::t_str: types >= this hold a REFERENCE */
     /* G1's widening bind compares KIND bytes, not singleton pointers */
@@ -586,9 +585,6 @@ static const JitLayout &jit_layout()
             static_cast<const char *>(jp.has_slices) - so);
         l.lv_const_off = static_cast<int>(
             reinterpret_cast<const char *>(&alv.jit_const_probe()) -
-            reinterpret_cast<const char *>(&alv));
-        l.lv_borrow_off = static_cast<int>(
-            reinterpret_cast<const char *>(&alv.jit_borrowed_probe()) -
             reinterpret_cast<const char *>(&alv));
         /* Type::t offset + the t_str boundary: a slot whose current type has
          * t >= t_str holds a REFERENCE (needs a C++ release before overwrite);
@@ -935,13 +931,18 @@ struct Emitter {
     }
     /* movabs <reg64>, imm64 */
     /* ⛔ LOW EIGHT REGISTERS ONLY. The REX byte is a bare 0x48 - no REX.B -
-     * so `reg >= 8` does not encode r8-r15, it silently produces a
-     * DIFFERENT INSTRUCTION: movabs(R10, x) assembles as 0xC2, `ret imm16`,
-     * and the fragment returns into nothing. That cost a debugging cycle on
-     * #94's inline borrow arm. The dedicated movabs_r8 / movabs_r10 helpers
-     * exist for the high registers; the assert is here so the next caller
-     * finds out at compile-run time instead of from a SEGV in generated
-     * code. */
+     * so `reg >= 8` does not encode r8-r15, it silently assembles a
+     * DIFFERENT INSTRUCTION: movabs(R10, x) is 0xC2, `ret imm16`, and the
+     * fragment returns into nothing. That cost a debugging cycle on #94's
+     * (since reverted) inline borrow arm. The dedicated movabs_r8 /
+     * movabs_r10 helpers exist for the high registers; this assert is so
+     * the next caller learns it from a named abort rather than from a SEGV
+     * inside generated code.
+     *
+     * Its sibling trap, for the same reason: `j32` takes the SHORT jcc
+     * opcode and adds 0x10 for the near form, so it wants 0x74 for `je` -
+     * hand it the near second byte 0x84 and you get 0F 94, a SETE with a
+     * bogus modrm. */
     void movabs(uint8_t reg, uint64_t imm)
     {
         ML_CHECK(reg < 8);
@@ -3526,25 +3527,14 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
             e.u8(0x49); e.u8(0xFF); e.u8(0x02);       /* inc qword [r10] */
         }
 #endif
-        /* the raw 32-byte copy plus the container/flag tail - the scalar
-         * arm's body, and #94's borrow arm reuses it verbatim (a borrow IS
-         * the scalar copy, applied to a reference). */
-        const auto raw_copy = [&](bool borrowed) {
-            for (int32_t o = 0; o <= 24; o += 8) {
-                ld(R11, RBX, s + o);
-                st(RDX, d + o, R11);
-            }
-            e.u8(0x45); e.u8(0x31); e.u8(0xDB);       /* xor r11d, r11d */
-            st(RDX, d + 32, R11);
-            st(RDX, d + 40, R11);
-            if (borrowed)                             /* mov byte [..], 1 */
-                st_b_imm8(RDX, d + L.lv_borrow_off, 1);
-        };
         ld(RAX, RBX, s + 24);                         /* rax = type* */
         cmp_d_imm8(RAX, static_cast<int32_t>(L.type_t_off),
                    static_cast<int8_t>(L.t_str_val));
         const size_t j_ref = e.j32(0x7D);             /* jge -> reference */
-        raw_copy(false);                              /* scalar */
+        for (int32_t o = 0; o <= 24; o += 8) {        /* scalar: raw copy */
+            ld(R11, RBX, s + o);
+            st(RDX, d + o, R11);
+        }
         /*
          * container / container_idx / is_const / borrowed = 0 - and this
          * belongs INSIDE the scalar arm, which is the only arm that needs
@@ -3565,23 +3555,10 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_ref);
         /*
-         * #94 THE INLINE BORROW ARM. A reference the escape analysis proved
-         * cannot outlive the call needs no retain, and a bind with no retain
-         * is BYTE-FOR-BYTE the scalar copy above - so when the two runtime
-         * questions answer yes, take that copy and skip the call entirely.
-         *
-         * Both questions are cheap here and neither needs the C++ ABI:
-         *   - is bit i of the callee's `noescape_params` set? The callee is
-         *     an inline CACHE, so the bit is loaded from the descriptor
-         *     spill at [rsp] (nothing is pushed yet at this point);
-         *   - is the value a SLICE? Only an ARRAY can be one, so a non-array
-         *     reference borrows on the type compare alone, and an array
-         *     costs one more byte compare.
-         * Either "no" falls through to the helper, which re-asks both (it is
-         * the C++ bind path's own tier) and keeps the decline counters -
-         * that is why the bit is loaded again there rather than handed over.
-         *
-         * FOUR pushes below: rcx/rdx/r9 are read after the
+         * A REFERENCE: defer to the real C++ copy (jit_bind_ref_arg). It
+         * cannot be inlined as a refcount bump - a SLICE registers itself in
+         * its parent's `slices` set on copy - so the helper runs fast_bind's
+         * exact per-argument step. FOUR pushes: rcx/rdx/r9 are read after the
          * bind and the 4th is a PAD, because an even count preserves the
          * 16-byte alignment this site already has (emit_call_prologue made it
          * call-ready and the two live pushes here - fo, desc - keep it so).
@@ -3590,30 +3567,6 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * preserves - it used to be rdi, which is why this pushed four LIVE
          * registers rather than three and a pad.
          */
-        /* mov r11, [rsp] - the desc spill; the modrm helper deliberately
-         * cannot encode an rsp base (it needs a SIB byte). */
-        e.u8(0x4C); e.u8(0x8B); e.u8(0x1C); e.u8(0x24);
-        ld(R11, R11, static_cast<int32_t>(P.desc_noescape));
-        if (i) {                                      /* shr r11, i */
-            e.u8(0x49); e.u8(0xC1); e.u8(0xEB);
-            e.u8(static_cast<uint8_t>(i));
-        }
-        e.u8(0x41); e.u8(0xF6); e.u8(0xC3); e.u8(0x01);   /* test r11b, 1 */
-        const size_t j_call_nb = e.j32(0x74);         /* je -> the helper */
-        movabs_r10(reinterpret_cast<uint64_t>(L.t_arr));
-        e.u8(0x4C); e.u8(0x39); e.u8(0xD0);           /* cmp rax, r10 */
-        const size_t j_borrow = e.j32(0x75);          /* jne -> not an array */
-        cmp_b_imm8(RBX, s + static_cast<int32_t>(L.slice_off), 0);
-        const size_t j_call_sl = e.j32(0x75);         /* jne -> a slice */
-        e.patch32_here(j_borrow);
-#ifdef TESTS
-        movabs_r10(reinterpret_cast<uint64_t>(&g_jit_arg_borrow));
-        e.u8(0x49); e.u8(0xFF); e.u8(0x02);           /* inc qword [r10] */
-#endif
-        raw_copy(true);
-        const size_t j_done_b = e.j32(0xEB);
-        e.patch32_here(j_call_nb);
-        e.patch32_here(j_call_sl);
         e.push_reg(RCX); e.push_reg(R9R);
         e.push_reg(RDX);
         e.u8(0x48); e.u8(0x83); e.u8(0xEC); e.u8(0x08);   /* sub rsp,8 (pad) */
@@ -3641,7 +3594,6 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.pop_reg(RDX);
         e.pop_reg(R9R); e.pop_reg(RCX);
         e.patch32_here(j_done);
-        e.patch32_here(j_done_b);
     }
     /* ctx.captures = &fo.capture_slots; restore the spills */
     e.pop_reg(RAX);                                   /* desc (done) */
@@ -5465,7 +5417,6 @@ void jit_stats_report()
         { "arg_borrow",       &g_arg_borrow },
         { "arg_borrow_slice", &g_arg_borrow_slice },
         { "arg_borrow_scal",  &g_arg_borrow_scalar },
-        { "arg_borrow_nat",   &g_jit_arg_borrow },
         { "ret_inline",       &g_jit_ret_inline },
         { "entry_resume",     &g_jit_entry_resume },
         /* G1 no-record tier step 1 (the shadow-verified side table) */
