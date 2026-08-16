@@ -4456,3 +4456,84 @@ its OWN counters (both reset first) across BOTH engines - the VM cases
 must take the prepared entry, the tree-walker cases the fallback - and
 asserts every case's result as well as its counter. Sabotage watched:
 forcing the fallback arm always fails it at the first VM case.
+
+## #94 THE BORROW BIND: a non-escaping reference argument takes no retain
+
+The consumer the #93 parameter escape analysis was built for. When the
+analysis proves the reference bound to a parameter cannot still be
+reachable after the call returns, the callee slot takes a RAW BIT-COPY
+of the caller's slot and skips both halves of the refcount pair - the
+retain at the bind, and the release at the frame pop. The caller's slot
+owns the reference for the whole of the synchronous call, which is the
+entire soundness argument.
+
+MEASURED (`OPT=1 ASSERTS=0` both sides, interleaved `--baseline`):
+**76_funcval_dispatch -13.48% instructions** (601.0M -> 520.0M, i.e.
+**-81 Ir per call** over its 1,000,000 calls) and **0.88x wall clock**.
+Suite geomean cur/base **1.008x** - flat. Two benches read +10% and
++16% on the wall clock and BOTH are **+0.01% on callgrind**, so they
+are timing noise, not a regression; that check is why the run was not
+repeated.
+
+REACH IS PROVEN, not assumed: `MYLANG_JITSTATS` reports **`arg_borrow`**
+(the retain actually skipped) and **`arg_borrow_slice`** (a parameter
+the analysis cleared whose VALUE declined). Bench 76 reports
+`arg_borrow 1000000` - one per call, so none of the above measures dead
+code. Two counters rather than one because a single total cannot
+distinguish "the tier ran" from "the tier was reachable and every value
+declined", which is this project's standing vacuous-test trap.
+
+THE DECISION IS ONE FUNCTION, `vm_bind_arg` (vm.cpp), shared by the C++
+`fast_bind` and the emitted push's reference arm. The slot records the
+answer in `LValue::borrowed`, which lives in `is_const`'s tail padding -
+the slot did not grow, and the emitter's 48-byte stride static_assert is
+what enforces that.
+
+FOUR THINGS A FUTURE EDITOR MUST NOT SOFTEN, each watched failing:
+
+- **Only a REFERENCE is borrowed** (`t >= t_str`). The release scan
+  skips a trivial slot - correctly, there is nothing to release - so a
+  borrowed int keeps its flag set FOREVER, and the next call to reuse
+  that window slot rebinds over a slot still marked borrowed. This is
+  not hypothetical: it fired on the first run, in **ackermann**, whose
+  un-annotated TEMPLATE parameter is not `binds_scalar` (so the analysis
+  claims it) but holds an int at run time. Caught by `rebind`'s
+  ML_CHECK, which the step-1 commit had added as "proven redundant".
+  It was not redundant.
+- **Never a SLICE.** A slice registers itself in its parent's
+  live-slices set when COPIED, and an element write to the parent
+  detaches every registered view in place (`clone_aliased_slices`). A
+  borrowed view is in no such set, so the write leaves it reading
+  storage the detach just handed to somebody else - and freed outright,
+  if the caller's slot held the last reference. Every OTHER reference
+  type's copy is a plain retain with no registration, which is exactly
+  what makes the bit-copy symmetric with the abandon at the pop.
+- **`LValue::frame_release()` is THE ONE release point.** Seven scans
+  open-coded `lv = LValue()` (pop_window's two arms, three no-record
+  raise/return paths, the callback window pop, the JIT's cold
+  `jit_release_slot`). A borrow makes the decision PER SLOT, so they
+  were routed through one method FIRST, in a separate commit, while
+  nothing set the flag and the change was provably inert.
+- **In the emitted push, the slot zeroing MOVED ABOVE the copy loop.**
+  The qword at +40 covers `container_idx` AND both flag bytes, so
+  zeroing it after the binds wiped the `borrowed` flag the reference arm
+  had just set. A use-after-free from a store that reads as tidy-up -
+  found by reading the emitted sequence, not by a test.
+
+THE EMITTED PUSH READS THE BIT FROM THE DESCRIPTOR rather than baking
+it, because its callee is an inline CACHE, not a compile-time constant
+(`JitPushLayout::desc_noescape`; four instructions on a path that is
+already a call). The C++ path reads it the same way, so the two cannot
+drift.
+
+The `-rt` net is `jit_borrow_arg_shapes`: one FIRING shape and three
+DECLINING ones (the callee stores the argument in a global; the value is
+a slice; the parameter is scalar), each asserting its OWN counter delta
+as well as its result. The slice case is written to fail on a VALUE, not
+merely a count, because its failure direction is a use-after-free.
+
+STILL UNBUILT, in reach order: the emitted INLINE borrow arm (the call
+itself is still paid - the bit test and the slice test would move into
+emitted code, jumping to the raw-copy path already there); the builtin
+CALLBACK bind paths (`argv[i]` - sort's comparator, map/filter/
+make_dict); and the tree-walker's `do_func_bind_params`.

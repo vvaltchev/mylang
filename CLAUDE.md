@@ -1675,11 +1675,9 @@ resolver.cpp) — A FALSE "SAFE" IS A USE-AFTER-FREE, SO EVERY RULE FAILS
 CLOSED.** `func_mutates_input`'s transitive, escape-aware sibling: per
 parameter, *can the reference this is bound to still be reachable after the
 call returns?* The answer is a bit in `FuncDescriptor::noescape_params`, and
-its intended consumer is a reference argument bound with NO retain (the
-caller's slot holds one for the whole of a synchronous call). **There is no
-consumer yet** — the one hazard it owes (a SLICE argument, whose in-place
-detach would release a reference the borrowed slot never took) is recorded
-on the pass. Four rules a future editor must not soften:
+its consumer is **#94 THE BORROW BIND** — a reference argument bound with NO
+retain, since the caller's slot holds one for the whole of a synchronous
+call. Four rules a future editor must not soften:
 
 - **It runs LAST in `resolve_names`, after `devirtualize_direct_calls`** — it
   reads `SymKind::global` (pass 2) and `direct_func_slot` (that call). A
@@ -1705,6 +1703,46 @@ Every rule is pinned by a `param_escape_analysis` row that fails when the
 rule is deleted (watched, one sabotage build per rule), except the
 reassignment guard, which is proven REDUNDANT by an `ML_CHECK` — no test can
 reach it, and the check fires if a future change ever makes it load-bearing.
+
+**⛔ #94 THE BORROW BIND — THE CONSUMER, AND ITS THREE RUNTIME DECLINES
+(2026-08-15).** With the bit set, the callee slot takes a RAW BIT-COPY of the
+caller's and skips the retain at the bind AND the release at the frame pop.
+The decision is ONE function, **`vm_bind_arg`** (vm.cpp), shared by the C++
+`fast_bind` and the emitted push's reference arm, and the slot records the
+answer in **`LValue::borrowed`** (in `is_const`'s tail padding, so the slot
+did not grow — the emitter bakes a 48-byte stride). Measured on
+76_funcval_dispatch: **−13.5% instructions, 0.88x wall clock**, from
+1,000,000 borrows — the whole call count.
+
+Four things a future editor must not soften, each watched failing:
+- **Only a REFERENCE is ever borrowed** (`t >= t_str`). The release scan
+  skips a trivial slot, so a borrowed int would keep its flag set forever and
+  the next call to reuse that window slot would rebind over it. Not
+  hypothetical: it fired on the first run, in ackermann, whose un-annotated
+  TEMPLATE parameter is not `binds_scalar` (so the analysis claims it) but
+  holds an int.
+- **Never a SLICE.** A slice registers itself in its parent's live-slices set
+  when COPIED, and an element write to the parent detaches every registered
+  view in place (`clone_aliased_slices`); a borrowed view is in no such set,
+  so the write leaves it reading storage the detach just gave away — and
+  freed, if the caller's slot held the last reference. Every other reference
+  type's copy is a plain retain, which is what makes the bit-copy symmetric
+  with the abandon.
+- **`LValue::frame_release()` IS THE ONE RELEASE POINT.** Seven scans used to
+  open-code `lv = LValue()`; a borrow makes the decision PER SLOT, and a scan
+  that forgets it decrements a count the slot never took.
+- **In the emitted push, the slot zeroing runs BEFORE the copy loop.** The
+  qword at +40 covers `container_idx` and BOTH flag bytes, so zeroing it
+  afterwards wiped the flag the reference arm had just set — a use-after-free
+  from a store that reads as tidy-up.
+
+REACH is `MYLANG_JITSTATS`' `arg_borrow` (the retain actually skipped) and
+`arg_borrow_slice` (cleared by the analysis, declined by the value) — two
+counters so "the tier ran" and "the tier was reachable and every value
+declined" cannot be confused. **Remaining cases, none built:** the emitted
+INLINE borrow arm (the call itself is still paid), the builtin-CALLBACK bind
+paths (`argv[i]` — sort/map/filter/make_dict), and the tree-walker's
+`do_func_bind_params`.
 
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to
