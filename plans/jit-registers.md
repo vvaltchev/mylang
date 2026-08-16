@@ -421,6 +421,33 @@ it (76_funcval_dispatch at ~11x) is where the traffic is not hidden.
 with the most slot references.** Those are different sets, and conflating
 them is why this plan pointed at 03_int_arith.
 
+### AND THE CENSUS OF THE WORST BENCHES SAYS: NOT THIS (2026-08-15)
+
+Ranking the corpus by STARTUP-CORRECTED my/cpp (scale-3 minus scale-1 on
+both sides) and classifying each worst loop's emitted body:
+
+| bench | loop my/cpp | instrs | calls | slot ld/st | dominant |
+|---|---|---|---|---|---|
+| 30_str_index_iterate | 27.36x | 30 | 1 | 2 / 0 | CALL |
+| 63_closures | 17.57x | 151 | 6 | 15 / 7 | CALL |
+| 76_funcval_dispatch | 11.40x | 248 | 6 | 11 / 4 | CALL |
+| 11_closure_counter | 11.11x | 259 | 15 | 18 / 6 | CALL |
+| 64_struct_create | 10.26x | 137 | **0** | 22 / 14 | **slots** |
+| 75_indexed_unpack | 9.18x | 92 | 5 | 4 / 4 | CALL |
+| 73_multi_unpack | 8.47x | 55 | 1 | 2 / 0 | CALL |
+
+**Seven of the eight are CALL-dominated.** Slot traffic dominates exactly
+one, and 03_int_arith - the shape this plan was written around - measures
+**1.18x of C++** once startup is removed, i.e. it is already at parity
+and has nothing to give.
+
+**So build this for 64_struct_create or not at all.** It is the one
+candidate: 36 slot accesses in 137 instructions, no calls,
+9.85 ns/iteration at IPC ~2.8-3.5 (partly latency-bound, so the
+`bench/micro/slotcost.cpp` regime test says its ceiling is somewhere
+between 0 and 26%). Measure that one shape before writing an allocator;
+a general one cannot be justified from this corpus.
+
 ### What to build first, and the gate before building it
 
 1. **MEASURE THE CEILING.** For 03_int_arith and 08_func_call, count from
