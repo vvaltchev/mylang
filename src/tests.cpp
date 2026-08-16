@@ -28615,6 +28615,7 @@ static bool jit_counter_coverage()
         { "release_entry",    &g_jit_release_entry,    nullptr },
         { "relent_stores",    &g_jit_relent_stores,    nullptr },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel,     nullptr },
+        { "str_probe_ok",     &g_jit_str_probe_ok,     nullptr },
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
         { "arg_borrow",       &g_arg_borrow,           nullptr },
         { "arg_borrow_slice", &g_arg_borrow_slice,     nullptr },

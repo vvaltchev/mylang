@@ -1,7 +1,17 @@
 # Inline the fused `ord(s[i])` read (30_str_index_iterate, 27x my/cpp)
 
-**Status: DESIGNED, NOT BUILT (2026-08-16).** Everything needed to
-execute is here, including the one hazard that decides the shape.
+**Status: STEP 1 LANDED (the self-verifying probe, inert); steps 2-6
+next.** Everything needed to execute the rest is here, including the one
+hazard that decides the shape.
+
+**What step 1 measured on this toolchain** (gcc 11.4 / libstdc++):
+`slice` at +16, `obj` at +0, the char pointer at StrObj+8, and the
+self-check **PASSES** - `MYLANG_JITSTATS` reports `str_probe_ok 1`.
+Watched failing: adding 8 to the computed offset takes it to
+`str_probe_ok 0`, and the program still prints the right answer because
+the tier simply does not engage. The emitted code is byte-identical
+(modulo ASLR-baked addresses) to before the step, as an inert step must
+be.
 
 ## Why this one
 
@@ -103,8 +113,14 @@ plus `jit_layout()` fields `str_slice_off`, `str_obj_off`,
 
 ## Steps
 
-1. **The probes + the self-check**, with the tier still disabled. Inert;
-   every net must stay green and `-vdj` byte-identical.
+1. ~~**The probes + the self-check**, with the tier still disabled.~~
+   **DONE.** `SharedStr::JitProbe` gained `slice`/`obj`/`strobj_data`;
+   `jit_layout()` gained `str_slice_off`/`str_obj_off`/
+   `strobj_data_off`/`str_inline_ok`; the verdict is reported as
+   `str_probe_ok`. NOTE the counter's assignment is `#ifdef TESTS` like
+   every other JITSTATS bump, but **the TIER's gate must read
+   `l.str_inline_ok`**, which is unconditional - a release build has to
+   gate correctly too.
 2. **The inline arm** in `emit_op`'s `OpCode::OrdCharV` case
    (jit.cpp ~10855), cold-declining to the existing `jit_ord_char`.
 3. **`g_jit_ord_inline`**, bumped by the EMITTED code only - the helper's
