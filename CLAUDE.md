@@ -1161,7 +1161,11 @@ slot identity). For each function (and the top-level "main"), it:
   || 5` is `true`, not `5`), which shapes the rules. A const that **determines**
   the result — `false && rest` → `false`, `true || rest` → `true` — folds the
   whole expression to that bool (sound regardless of `rest`: it is
-  short-circuited, so never evaluated, even side effects / an undefined name).
+  short-circuited, so never evaluated - including its side effects. An
+  UNDEFINED NAME there is nonetheless a compile error since FIX-1 (#130):
+  the resolver rejects it before this fold runs. Early dead-code
+  elimination, which would let a name survive under a false guard, is a
+  separate parked idea (#135).)
   This is what makes a feature-flag guard fold: `const DEBUG = false; if (DEBUG
   && heavy())` → `if (false)`, which the DCE then drops — matching C++ `-O3`. A
   **non-determining** leading const (`true && rest`, `false || rest`)
@@ -2490,9 +2494,14 @@ sanitizers never reproduced it.)
   resolver's pass 1 collects the names functions read (`escaped`) and pass 2
   routes an escaped top-level var into the global table rather than a main-frame
   slot. **Not slotted (stay in the map):** REPL top-level names (open-world
-  redefinition) and anything genuinely unresolved (a truly-undefined name → the
-  runtime map → `UndefinedVariableEx`; the map fallback keeps the pass purely an
-  optimization). The resolver does a forward
+  redefinition). **A name declared in NO scope is a COMPILE error since
+  FIX-1 (#130)** - `resolve_ref` refuses it rather than leaving it for the
+  runtime map, which was guaranteed to fail anyway (the script map is empty
+  and asserted). Two exemptions: a LAZY builtin's argument
+  (`defined`/`isconst`/`isconstdecl` never evaluate it - they ask a question
+  ABOUT the name, answered `false`) and the `_` placeholder. A name declared
+  BELOW its use is NOT this error - see `Scope::all_names`, the whole-scope
+  pre-scan that distinguishes them. The resolver does a forward
   lexical walk (no hoisting **for locals**, so `var x = x + 1` reads the outer
   `x`; top-level *functions* ARE hoisted — see next bullet). **No per-slot
   liveness**: a slot is default-constructed when the `Frame` is built, and a
@@ -2660,8 +2669,9 @@ sanitizers never reproduced it.)
   `in_const_eval()` walks the parent chain for a `const_ctx` ancestor, because
   AutoConst folds pure functions in throwaway non-const args contexts whose ROOT
   is the const `cctx` (so a struct/func decl inside a folded body legitimately
-  emplaces into a discarded map). A genuinely-undefined name at runtime reaches
-  `lookup` on an empty map → `UndefinedId` → `UndefinedVariableEx`, as before.
+  emplaces into a discarded map). Since FIX-1 (#130) a genuinely-undefined
+  name is refused at COMPILE time, so that runtime path is now reachable only
+  in the REPL (open world) - which is exactly why the invariant holds.
 - **Captured variables are slotted (`SymKind::capture`).** A closure's explicit
   `[x,y]` capture list is snapshot into a per-instance **`CaptureSlots`**
   **`FuncObject::capture_slots`** at closure creation (`func.cpp.h`), in
@@ -2703,8 +2713,9 @@ sanitizers never reproduced it.)
   symbols` map is **empty and never a resolution path** (asserted — see *The
   script runtime symbols map is EMPTY* above): the map is populated only by the
   REPL (open-world redefinition) and the parse-time const-evaluator (which runs
-  before slots exist). A genuinely-undefined name reaches `lookup` on an empty
-  map and surfaces `UndefinedVariableEx`. **A user symbol always wins** — the resolver checks scopes (local/param/capture)
+  before slots exist). Since FIX-1 (#130) such a name is a COMPILE error in a
+  SCRIPT, so that path is now REPL-only. **A user symbol always wins** — the
+  resolver checks scopes (local/param/capture)
   then the global table (user functions + escaped vars) BEFORE the builtin
   table, so a `func len(x)` shadow resolves to `SymKind::global` and the builtin
   is unreachable by name (`var <builtin>` for a *const* builtin is still a
@@ -3879,6 +3890,59 @@ AST transform joins **all three** on the day it is written:
 **A caret/backtrace check needs the same treatment**: an AST transform can
 move a `Loc` without changing any value, so compare the rendered error
 POSITION across layers too, not just the exception type.
+
+## ⛔ THE TWO HARD LANGUAGE RULES (maintainer-set, 2026-08-08)
+
+These are not guidelines. A change that violates either is wrong, however
+much it wins on a benchmark.
+
+### RULE 1 — THERE IS NO UNDEFINED BEHAVIOR IN MyLang. EVER.
+
+Every program has a DEFINED outcome, decided either at **compile time**
+(a refusal) or at **run time** (a specified value, or a thrown
+exception). There is no third category. C and C++ answer "read an
+uninitialized variable" with UB — an unpredictable value, no diagnostic;
+that is explicitly one of the things this language exists to not do.
+
+Concretely, when you find a construct with no defined answer, the fix is
+ALWAYS one of:
+ - reject it at compile time, or
+ - give it a specified value, or
+ - throw a specified exception at run time.
+
+Never: "it happens to read 0", "it depends on the allocator", "the slot
+holds whatever was there". A `none` sitting in a slot that inference
+proved is an `int` is UB by this rule even though no memory is unsafe —
+it was found printing `1` under the JIT, aborting `ML_VM_CHECK` under
+`-nj`, and throwing `TypeErrorEx` in the tree-walker (see the brace-less
+body note under *Invariants & hazards*).
+
+### RULE 2 — AN OPTIMIZATION MAY NEVER CHANGE OBSERVABLE BEHAVIOR
+
+`--no-opt all` + `-nc` + `-tw` at one end, and the full VM + JIT + every
+transform at the other, must be **observably identical in every
+respect** — printed output, the exception raised, the message, the
+**caret span**, the **backtrace**, and the exit code. The ONLY thing an
+optimization may change is **how long the script takes**.
+
+This is stronger than "the tests agree", and it is the reason the
+engine differential exists. It applies to:
+ - the AST transforms (const-fold, auto-const/pure, inline, specialize,
+   DCE, LICM, for-range, M8) — see *Testing an AST TRANSFORM*, whose
+   `--no-opt` kill switches are the oracle for exactly this rule;
+ - the engines (tree-walker vs VM vs VM+JIT);
+ - the stored image (`.myv` must render errors identically to source).
+
+Two violations of this rule have already been fixed and are the canonical
+examples: **const-eval changed SCOPING** (`if (1) func g() {...} g();`
+worked by default and threw under `-nc`), and **const-fold ignored a
+name binding** (`func abs(x) { return 42; } print(abs(-1), abs(runtime(-1)));`
+printed `1 42` — the same call resolving to two different functions).
+Both were "the parse-time const evaluator has its own, wrong, notion of
+what a name means". **Expect more of that shape and look for it.**
+
+A caret or a backtrace that differs between engines is a RULE 2
+violation, not a cosmetic issue.
 
 ## Optimizations must generalize (the bar is a compiler, not an example)
 

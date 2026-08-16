@@ -3699,9 +3699,20 @@ static const std::vector<test> tests =
       { "const FLAG = false;",
         "func guarded(x) { if (FLAG && x > 1000) { return 1; } return 2; }",
         "assert(guarded(9) == 2);" } },
-    { "fold: short-circuit `true ||` drops an undefined dead operand",
+    /* The dropped operand used to be an UNDEFINED name, so that failing to
+     * drop it would throw. FIX-1 (#130) makes that a COMPILE error even in a
+     * dead operand (approach (a), maintainer 2026-08-08 - early dead-code
+     * elimination is the separate, parked #135), so the drop is now proven by
+     * OBSERVATION instead: a side effect that must never run. */
+    { "fold: short-circuit `true ||` drops the dead operand",
+      { "var n = 0;",
+        "func bump() { n = n + 1; return true; }",
+        "func sc() => 7 || bump();",
+        "assert(sc() == true);",
+        "assert(n == 0);" } },
+    { "FIX-1: an undefined name in a DROPPED operand is STILL a compile error",
       { "func sc_undef() => 7 || undefined_name_xyz;",
-        "assert(sc_undef() == true);" } },
+        "assert(sc_undef() == true);" }, &typeid(UndefinedVariableEx) },
     /* a NON-determining leading const (`false ||`, `true &&`) drops - but only
      * collapses to a lone operand when that operand is ALREADY bool, since
      * mylang's ||/&& yield bool (so `false || 5` is `true`, not `5`). */
@@ -4335,6 +4346,57 @@ static const std::vector<test> tests =
     { "const-folded if branch is scoped like the runtime one",
       { "if (1) var x = 5;",
         "print(x);" }, &typeid(UndefinedVariableEx) },
+    /*
+     * FIX-1 (#130): a name declared in NO scope is a COMPILE error.
+     *
+     * Free, because a SCRIPT's runtime symbols map is empty and asserted, so
+     * such a name is GUARANTEED to fail at run time - this only moves a
+     * certain runtime failure to compile time.
+     *
+     * The leading `assert(false)` is the COMPILE-TIME PROOF: if the program
+     * were still compiled and run, that assert would throw
+     * AssertionFailureEx FIRST and the expected type would not match.
+     */
+    { "FIX-1: an undefined name is refused at COMPILE time",
+      { "assert(false);",
+        "print(zz);" }, &typeid(UndefinedVariableEx) },
+    { "FIX-1: undefined name inside a function body",
+      { "assert(false);",
+        "func f() { var dyn r = zz; return r; }",
+        "var dyn t = f();" }, &typeid(UndefinedVariableEx) },
+    /* Was `InternalErrorEx: construct not lowered natively` in the VM - the
+     * no-fail codegen REFUSING a legal program, because a name declared
+     * nowhere has no slot for the store to lower against. */
+    { "FIX-1: undefined STORE base (was an InternalErrorEx in the VM)",
+      { "assert(false);",
+        "zz[0] = 1;" }, &typeid(UndefinedVariableEx) },
+    /* Was a std::terminate / SIGABRT under the JIT: UndefinedVariableEx is a
+     * plain Exception, which the fragment's conveyance cannot carry. */
+    { "FIX-1: undefined name in a CAPTURE list (was a SIGABRT)",
+      { "assert(false);",
+        "var c = func[zz]() => zz;",
+        "var dyn r = c();" }, &typeid(UndefinedVariableEx) },
+    /*
+     * ...and what FIX-1 must NOT reject. A name declared BELOW its use is
+     * not "declared nowhere" - that is step 3's TDZ, a different error. A
+     * LAZY builtin (defined/isconst/isconstdecl) never evaluates its
+     * argument: it asks a question ABOUT the name, so a name that exists
+     * nowhere is a legitimate question answered `false`. And `_` is the
+     * destructuring placeholder - deliberately never declared.
+     */
+    { "FIX-1 accepts: forward refs, lazy-builtin queries, and `_`",
+      { "func fetch() { return g; }",
+        "var g = 5;",
+        "var dyn t = fetch();",
+        "assert(t == 5);",
+        "assert(defined(nonexistent_xyz) == false);",
+        "assert(isconst(nonexistent_xyz) == false);",
+        "assert(isconstdecl(nonexistent_xyz) == false);",
+        "var p = 1; var q = 3; p, _, q += [10, 20, 30];",
+        "assert(p == 11 && q == 33);",
+        "var a1, _, d1 = [1, 2, 3];",
+        "assert(a1 == 1 && d1 == 3);" } },
+
     /* ...and the body still RUNS, with the declaration visible inside it. */
     { "a scoped brace-less body still runs and sees its own decl",
       { "var dyn c = runtime(1);",
@@ -11160,11 +11222,12 @@ static const std::vector<test> tests =
 
     {
         /* The function arg must be validated before the container is
-           evaluated: with a bad func and an undefined container, the
-           "Expected function" TypeErrorEx must win over UndefinedVariable. */
+           evaluated: with BOTH bad, the "Expected function" TypeErrorEx must
+           win. (The container used to be an undefined NAME - a FIX-1 compile
+           error now, #130 - so it is a bad VALUE instead.) */
         "map() validates its function argument first",
         {
-            "map(5, undefined_var);",
+            "map(5, 42);",
         },
         &typeid(TypeErrorEx),
     },
@@ -11172,7 +11235,7 @@ static const std::vector<test> tests =
     {
         "filter() validates its function argument first",
         {
-            "filter(5, undefined_var);",
+            "filter(5, 42);",
         },
         &typeid(TypeErrorEx),
     },
@@ -13486,9 +13549,16 @@ backtrace_truncation()
 static bool
 backtrace_end_to_end()
 {
+    /* The error used to be a read of an undefined `oops`; FIX-1 (#130) makes
+     * that a COMPILE error, so this drives the formatter with a genuine
+     * RUNTIME error instead. The divisor comes from runtime() - a LITERAL
+     * 0 would be a const arg, which the specializer propagates into `a` and
+     * AutoConst then folds, throwing out of resolve_names (which is OUTSIDE
+     * this test's try block). The chain still produces three PHYSICAL
+     * frames. */
     static const char *src[] = {
-        "func a(x) { return x + oops; }",
-        "func b(x) { return a(x); }",
+        "func a(x, d) { return x / d; }",
+        "func b(x) { return a(x, runtime(0)); }",
         "print(b(10));",
     };
 
@@ -13512,7 +13582,7 @@ backtrace_end_to_end()
     const auto npos = std::string::npos;
     bool ok = true;
 
-    ok = ok && bt.find("[0] a(x)") != npos;     /* error in a, line 1 */
+    ok = ok && bt.find("[0] a(x, d)") != npos;  /* error in a, line 1 */
     ok = ok && bt.find("[1] b(x)") != npos;     /* b called a, line 2 */
     ok = ok && bt.find("[2] main()") != npos;   /* main called b, line 3 */
     ok = ok && bt.find("at line 1") != npos;
@@ -24727,7 +24797,7 @@ static bool jit_op_nativized()
         if (run({ "func f(int n) {",
                   "  var s = 0;",
                   "  for (var i = 0; i < n; i++) s += i;",
-                  "  s += undefined_name;",
+                  "  append(5, s);",     /* provably-non-lvalue arg0 */
                   "  return s;",
                   "}",
                   "f(runtime(3));" })) {
