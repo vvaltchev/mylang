@@ -3578,6 +3578,22 @@ and two macros:
 - **Multi-line spans**: `dumpLocInError` (`mylang.cpp`) renders every source
   line in `[loc_start.line, loc_end.line]` with a caret row per line (start from
   `loc_start.col` to EOL, full middle lines, end line up to `loc_end`).
+- **`defined()`-GUARDED NARROWING (#135, 2026-08-09).** FIX-1 refuses a name
+  declared nowhere, which left no way to feature-test one. Dart's
+  promote-after-a-test is the model: the name that was CHECKED is tolerated
+  and nothing else — deliberately NOT "code the DCE will delete may say
+  anything", which would lose the typo protection wholesale. The guarded code
+  still VANISHES (`defined(x)` folds false, the DCE drops the branch); the
+  narrowing only lets it COMPILE. `collect_defined_guards` + a scoped
+  `guarded` stack in the resolver's `walk`, consulted at BOTH FIX-1 sites —
+  the in-walk one and the `escaped_refs` one, which needs the answer recorded
+  on the EscapedRef at PUSH time because it runs after the walk.
+  **⛔ TESTING IT NEEDS A COMPILE-ONLY ORACLE.** A tolerated name in a script
+  stays unresolved and throws `UndefinedVariableEx` at RUN time — the SAME
+  type the compile refusal throws — so a `tests` entry cannot tell "refused"
+  from "failed later", and a polarity case written there passes either way
+  (watched: with the else-arm polarity broken, that version stayed green).
+  The polarity cases run parse+infer+resolve only.
 - **⛔ NO INPUT MAY CRASH THE INTERPRETER (#137, 2026-08-09).** Every `.my`
   file ends in a DEFINED outcome — a compile refusal, a thrown exception, or a
   clean run. Two real crashes were found by simply trying degenerate inputs:

@@ -1294,6 +1294,7 @@ public:
              * bind. `root_decl_names` is the top-level scope's own pre-scan,
              * kept because that scope is popped by the time we get here. */
             if (!repl_mode && !er.lazy_arg && !id->is_underscore()
+                    && !er.guarded                      /* #135 */
                     && id->sym.kind == SymKind::unresolved
                     && !er.declared_later
                     && !root_decl_names.count(id->uid))
@@ -1338,6 +1339,77 @@ public:
     }
 
 private:
+
+    /*
+     * #135: `defined()`-GUARDED NARROWING. A name that exists NOWHERE is a
+     * compile error (FIX-1, #130), which leaves no way to feature-test one.
+     * Dart's promotion-after-a-test is the model: the SPECIFIC name that was
+     * CHECKED is tolerated, and nothing else.
+     *
+     *     if (defined(x)) { print(x); }           # x tolerated
+     *     if (defined(x)) { print(x, y); }        # y is STILL an error
+     *     if (defined(x) && defined(y)) { ... }   # both tolerated
+     *
+     * This is deliberately NOT "code the DCE will delete may say anything" -
+     * that would lose FIX-1's typo protection wholesale (maintainer, #135).
+     * The code still VANISHES: when `x` exists nowhere, `defined(x)` folds to
+     * false, the branch is dead, and the existing DCE drops it. Narrowing's
+     * only job is to let the guarded code COMPILE.
+     *
+     * POLARITY, and it is the whole correctness question: the guard holds for
+     * the THEN branch and for the REST of its own `&&` chain (so
+     * `if (defined(x) && isbound(x))` works - `isbound` is deliberately not
+     * FIX-1-exempt). It does NOT hold for the ELSE branch, and `!defined(x)`
+     * establishes nothing.
+     */
+    void collect_defined_guards(const Construct *cond,
+                                std::vector<const UniqueId *> &out)
+    {
+        if (!cond)
+            return;
+
+        /* an `&&` chain: every conjunct contributes. `||` does NOT - the
+         * branch can be taken with the other side true, so nothing is proven.
+         * A TypedScalarExpr is the M8 form of the same chain. */
+        if (auto *e11 = dynamic_cast<const Expr11 *>(cond)) {
+            for (const auto &p : e11->elems)
+                collect_defined_guards(p.second.get(), out);
+            return;
+        }
+        if (auto *ts = dynamic_cast<const TypedScalarExpr *>(cond)) {
+            if (ts->cat != TypedScalarExpr::Cat::logical)
+                return;
+            for (const auto &p : ts->elems)
+                if (p.first == Op::invalid || p.first == Op::land)
+                    collect_defined_guards(p.second.get(), out);
+            return;
+        }
+
+        const auto *call = dynamic_cast<const CallExpr *>(cond);
+        if (!call || !call->args || call->args->elems.size() != 1)
+            return;
+        /* Only `defined`. Broadening this to any 1-arg call is in fact
+         * unobservable - every other call EVALUATES its argument, so an
+         * undefined name there is refused by FIX-1 before any guard could
+         * help - which is why no test can catch that mistake. Named rather
+         * than left to chance. */
+        const auto *cid = dynamic_cast<const Identifier *>(call->what.get());
+        if (!cid || cid->get_str() != "defined")
+            return;
+        if (const auto *arg =
+                dynamic_cast<const Identifier *>(call->args->elems[0].get()))
+            out.push_back(arg->uid);
+    }
+
+    bool is_guarded(const UniqueId *uid) const
+    {
+        if (guarded.empty())
+            return false;
+        for (const UniqueId *g : guarded)
+            if (g == uid)
+                return true;
+        return false;
+    }
 
     /*
      * `--strict` (step 7): EVERY NON-LOCAL MUST BE DECLARED ABOVE ITS FIRST
@@ -1639,6 +1711,11 @@ private:
         bool lazy_arg;          /* the use is a LAZY builtin's argument
                                  * (defined/isconst/isconstdecl): a question
                                  * about the name, never a read */
+        bool guarded;           /* #135: a `defined()` guard vouched for the
+                                 * name at this use - recorded HERE because
+                                 * the FIX-1 check for a function-body
+                                 * reference runs after the walk, when the
+                                 * guard stack is long gone */
         bool lazy_any;          /* the use is ANY lazy builtin's argument,
                                  * `isbound` INCLUDED. Wider than lazy_arg on
                                  * purpose: isbound(zz) on a name declared
@@ -1661,6 +1738,11 @@ private:
      * use, because there is nothing for it to be bound to, ever.
      */
     bool no_tdz_check = false;
+    /* #135: names a `defined()` guard has vouched for at this point - see
+     * collect_defined_guards. A scoped stack, like `shadowed` in the parser;
+     * empty in every program that does not feature-test, so the lookup is one
+     * compare. */
+    std::vector<const UniqueId *> guarded;
     std::vector<EscapedRef> escaped_refs;
     /*
      * The GLOBAL table: every top-level function (hoisted up front so a forward
@@ -2039,7 +2121,8 @@ private:
             escaped.insert(id->uid);
             escaped_refs.push_back(
                 EscapedRef{ id, declared_in_live_scopes(cur, id->uid),
-                            no_undef_check, no_tdz_check });
+                            no_undef_check, is_guarded(id->uid),
+                            no_tdz_check });
             return;
         }
 
@@ -2056,6 +2139,7 @@ private:
          * ANYWHERE (below included) - so it can never bind. Refuse now
          * instead of failing at run time. */
         if (!repl_mode && !no_undef_check && !id->is_underscore()
+                && !is_guarded(id->uid)          /* #135 */
                 && id->sym.kind == SymKind::unresolved
                 && !declared_in_live_scopes(cur, id->uid))
             fix1_undefined(id);
@@ -2733,6 +2817,26 @@ Resolver::walk(Construct *c, FuncState *cur)
         }
 
         walk(tc->finallyBody.get(), cur);
+        return;
+    }
+
+    /* --- if: a `defined()` guard vouches for its name (#135) --- */
+    if (auto *iff = dynamic_cast<IfStmt *>(c)) {
+
+        std::vector<const UniqueId *> names;
+        collect_defined_guards(iff->condExpr.get(), names);
+
+        const size_t mark = guarded.size();
+        for (const UniqueId *u : names)
+            guarded.push_back(u);
+
+        /* the CONDITION is walked with them active, so a later conjunct may
+         * use the name (`if (defined(x) && isbound(x))`) */
+        walk(iff->condExpr.get(), cur);
+        walk(iff->thenBlock.get(), cur);
+
+        guarded.resize(mark);       /* the ELSE arm proves nothing */
+        walk(iff->elseBlock.get(), cur);
         return;
     }
 
