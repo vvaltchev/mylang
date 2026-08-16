@@ -92,6 +92,10 @@ extern unsigned long g_jit_invoke_direct;
  * sees anything in a real program at all */
 extern unsigned long g_noescape_funcs;
 extern unsigned long g_noescape_marks;
+extern unsigned long g_noescape_cands;
+extern unsigned long g_noescape_unsafe;
+extern unsigned long g_esc_p_callee, g_esc_p_gwrite;
+extern unsigned long g_esc_p_hobuiltin, g_esc_p_shape;
 /* Which VmInvoker::call entry each callback element took (vm.cpp) */
 extern unsigned long g_invoke_prepared;
 extern unsigned long g_invoke_fallback;

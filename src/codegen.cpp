@@ -10238,10 +10238,7 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
     std::vector<int32_t> merged;
     const auto &params = fn->desc->params;
     for (size_t i = 0; i < params.size(); i++) {
-        if (params[i].decl_type != DeclType::i
-            && params[i].decl_type != DeclType::f
-            && params[i].proven_type != DeclType::i
-            && params[i].proven_type != DeclType::f) {
+        if (!params[i].binds_scalar()) {
             merged.push_back(static_cast<int32_t>(i));
         }
 #ifdef TESTS

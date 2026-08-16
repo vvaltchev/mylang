@@ -66,6 +66,14 @@
 bool MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out,
                                bool process_arrays, bool immutable = false);
 
+#ifdef TESTS
+/* #93 reach diagnostics - defined further down, beside the other counters;
+ * declared here because the analysis lives in the anonymous namespace below
+ * and an `extern` there would get internal linkage instead. */
+extern unsigned long g_esc_p_callee, g_esc_p_gwrite,
+                     g_esc_p_hobuiltin, g_esc_p_shape;
+#endif
+
 namespace {
 
 /* Max slots per frame. The Frame no longer has a fixed-width liveness word
@@ -2954,7 +2962,14 @@ static bool fmi_has_tainted_write(
  *   - the body writes NO global, for the same reason: the argument
  *     expression at the call site may BE that global, and dropping its
  *     last reference mid-call would leave the borrow dangling;
- *   - the body declares no nested function (a capture list could take it).
+ *   - the body declares no nested function (a capture list could take it);
+ *   - every node in the body is a shape the walker can ENUMERATE
+ *     (esc_known_shape) - an unknown kind hides occurrences, so it declines
+ *     rather than guessing that it has none.
+ *
+ * Each rule is pinned by a row of the `param_escape_analysis` test that
+ * FAILS when the rule is deleted, except the reassignment one, which is
+ * proven redundant by an ML_CHECK instead - see the note at the check.
  */
 static bool esc_is_base_position(const Construct *c, const Construct *child)
 {
@@ -2965,98 +2980,415 @@ static bool esc_is_base_position(const Construct *c, const Construct *child)
     return false;
 }
 
-/* Does the body contain a call, a nested function, or a global write? Any
- * of the three ends the analysis for EVERY param (see the rules above). */
-static bool esc_body_is_opaque(const Construct *c)
+/*
+ * ⛔ FAIL CLOSED ON A NODE KIND THE WALKER DOES NOT KNOW.
+ *
+ * `fmi_children` delegates to `for_each_child`, a dynamic_cast chain whose
+ * fallthrough means "this node has no children". For its original caller
+ * (func_mutates_input) an unknown kind costs a pure classification. HERE it
+ * would hide an occurrence of the parameter, mark it non-escaping, and the
+ * consumer would drop a reference that is still reachable - a use-after-free
+ * from a node kind nobody remembered to add.
+ *
+ * So the escape analysis does not trust the fallthrough: it names the kinds
+ * whose children it knows are visited, plus the kinds that genuinely have
+ * none, and treats ANYTHING ELSE as opaque. A node kind added later, or one
+ * that exists at a stage this pass does not run at today, then costs the
+ * optimization instead of soundness. `ForRangeStmt` is the live example -
+ * absent from `for_each_child`, and only out of reach because this pass runs
+ * before `specialize_types` builds one. Moving the pass later (which the
+ * consumer may want) must not silently turn that into a dangling borrow.
+ */
+static bool esc_known_shape(const Construct *c)
 {
-    if (!c)
-        return false;
-    if (dynamic_cast<const FuncDeclStmt *>(c))
-        return true;                       /* a nested function may capture */
-    if (dynamic_cast<const CallExpr *>(c))
-        return true;                       /* incl. builtins - not analysed */
-    /* a write whose target is a GLOBAL (the argument may be that global) */
+    /* enumerable: fmi_children's own cases ... */
+    if (dynamic_cast<const Block *>(c) ||
+        dynamic_cast<const ForStmt *>(c) ||
+        dynamic_cast<const ForeachStmt *>(c) ||
+        dynamic_cast<const TryCatchStmt *>(c) ||
+        dynamic_cast<const Expr14 *>(c))
+        return true;
+    /* ... and for_each_child's, in its own order */
+    if (dynamic_cast<const SingleChildConstruct *>(c) ||
+        dynamic_cast<const MultiOpConstruct *>(c) ||
+        dynamic_cast<const TypedScalarExpr *>(c) ||
+        dynamic_cast<const IncDecExpr *>(c) ||
+        dynamic_cast<const TernaryExpr *>(c) ||
+        dynamic_cast<const CoalesceExpr *>(c) ||
+        dynamic_cast<const CallExpr *>(c) ||
+        dynamic_cast<const IfStmt *>(c) ||
+        dynamic_cast<const WhileStmt *>(c) ||
+        dynamic_cast<const Subscript *>(c) ||
+        dynamic_cast<const Slice *>(c) ||
+        dynamic_cast<const MemberExpr *>(c) ||
+        dynamic_cast<const ReturnStmt *>(c) ||
+        dynamic_cast<const LiteralDictKVPair *>(c) ||
+        dynamic_cast<const MultiElemConstruct<Construct> *>(c) ||
+        dynamic_cast<const MultiElemConstruct<Identifier> *>(c) ||
+        dynamic_cast<const MultiElemConstruct<LiteralDictKVPair> *>(c))
+        return true;
+    /* childless: a leaf cannot hide an occurrence */
+    return dynamic_cast<const Literal *>(c) ||
+           dynamic_cast<const LiteralObj *>(c) ||
+           dynamic_cast<const Identifier *>(c) ||
+           dynamic_cast<const ChildlessConstruct *>(c) ||
+           dynamic_cast<const NopConstruct *>(c) ||
+           dynamic_cast<const StructDeclStmt *>(c) ||
+           dynamic_cast<const FuncDeclStmt *>(c);
+}
+
+/* Does this statement write a GLOBAL (`g = ..`, `g[i] = ..`, `g.f++`)? The
+ * argument at some call site may BE that global, so dropping its last
+ * reference mid-call would leave a borrow dangling. */
+static bool esc_writes_global(const Construct *c)
+{
     const Construct *lv = nullptr;
     if (auto *e = dynamic_cast<const Expr14 *>(c))
         lv = e->lvalue.get();
     else if (auto *idc = dynamic_cast<const IncDecExpr *>(c))
         lv = idc->lvalue.get();
-    if (lv) {
-        const Construct *b = lv;
-        while (b) {
-            if (auto *id = dynamic_cast<const Identifier *>(b)) {
-                if (id->sym.kind == SymKind::global)
-                    return true;
-                break;
-            }
-            if (auto *s = dynamic_cast<const Subscript *>(b)) {
-                b = s->what.get(); continue;
-            }
-            if (auto *m = dynamic_cast<const MemberExpr *>(b)) {
-                b = m->what.get(); continue;
-            }
-            break;
+    while (lv) {
+        if (auto *id = dynamic_cast<const Identifier *>(lv))
+            return id->sym.kind == SymKind::global;
+        if (auto *s = dynamic_cast<const Subscript *>(lv)) {
+            lv = s->what.get(); continue;
         }
+        if (auto *m = dynamic_cast<const MemberExpr *>(lv)) {
+            lv = m->what.get(); continue;
+        }
+        break;
     }
-    bool opaque = false;
-    fmi_children(const_cast<Construct *>(c), [&](Construct *ch) {
-        if (esc_body_is_opaque(ch)) opaque = true;
-    });
-    return opaque;
+    return false;
 }
 
-/* Clear a param's bit the moment it is used anywhere but a base position. */
-static void esc_scan(const Construct *c,
-                     const std::unordered_map<const UniqueId *, int> &pidx,
-                     uint64_t &mask)
+/*
+ * THE BUILTIN ARGUMENT-CAPTURE TABLE.
+ *
+ * A builtin is C++, so nothing about it can be derived from the AST: the
+ * question "can a reference I hand this builtin still be reachable after it
+ * returns?" is answered by READING ITS IMPLEMENTATION, once, here.
+ *
+ * A listed builtin is TRANSPARENT, which is three claims at once:
+ *   1. it stores no reference to an argument anywhere that outlives the
+ *      call;
+ *   2. it does not return an argument ITSELF. Returning something reached
+ *      THROUGH one is fine - `min(a)` hands back an ELEMENT of `a`, which
+ *      carries its own count and stays alive on its own; the borrow is on
+ *      the container;
+ *   3. it invokes no MyLang CALLBACK. This is why a listed builtin skips
+ *      the `callable_arg_mask` test at the call site: `len` cannot run user
+ *      code whatever its argument's static type is, and refusing it for a
+ *      `dyn` argument would cost the single most common shape in the
+ *      language for no reason.
+ *
+ * ⛔ IT IS AN ALLOWLIST, SO IT FAILS CLOSED. An unlisted builtin - and any
+ * builtin added later - captures every argument and is assumed to invoke,
+ * costing the optimization and never soundness. That is what CLAUDE.md's
+ * audit-table trap asks for: this table is read at a stage where a missing
+ * entry cannot be noticed, so forgetting one has to be harmless.
+ *
+ * ⛔ AND CLAIM 3 IS WHY THE LIST IS AUDITED BY GREP, NOT BY EYE. `sum` was
+ * on it in a first version, on the obvious reasoning that a sum is a number
+ * - but `sum(arr, func)` is a REDUCE, and its second form calls
+ * `eval_func` per element. The mechanical check is an awk over
+ * src/builtins/ that prints the enclosing `EvalValue builtin_...` header of
+ * every line mentioning `VmInvoker` or `eval_func(` - i.e. every builtin
+ * that can run user code: make_array, make_dict, map/filter, find, sort,
+ * and sum. RE-RUN IT when adding an entry.
+ *
+ * The instructive EXCLUSIONS, since "why is X not here" is the question a
+ * future reader will have:
+ *   runtime(a)          returns the argument ITSELF - the identity function
+ *                       is the exact shape claim 2 exists for, and it is a
+ *                       builtin real programs use
+ *   append/push/insert  store the argument INTO a container that outlives
+ *   dict(pairs)         builds a dict holding them
+ *   sum/sort/map/       may run a callback (claim 3)
+ *   filter/find/
+ *   make_array/make_dict
+ *   reverse/pop/erase/  mutate or hand back pieces in ways worth reading
+ *   top/get             one at a time before trusting; not needed yet
+ */
+static bool esc_builtin_transparent(const UniqueId *name)
+{
+    static const char *const transparent[] = {
+        "abs", "array_storage", "chr", "endswith", "float", "hash",
+        "int", "intptr", "join", "kindstr", "len", "max", "min", "ord",
+        "print", "split", "splitlines", "startswith", "str", "typestr",
+    };
+    for (const char *n : transparent)
+        if (name->val == n)
+            return true;
+    return false;
+}
+
+/*
+ * THE CALL-GRAPH ESCAPE FIXPOINT.
+ *
+ * One `EscFn` per analysable function body. `mask` starts OPTIMISTIC (every
+ * candidate param assumed non-escaping) and only ever loses bits, so the
+ * iteration is a greatest fixpoint - which is what makes RECURSION come out
+ * right rather than needing a special case: `func f(a) { f(a); }` passes `a`
+ * to a position that does not escape, so nothing clears it, and the answer
+ * "the reference never leaves" is correct. Mutual recursion makes the graph
+ * cyclic, so there is no traversal order and it has to be a fixpoint at all
+ * - the same argument `build_reachable_reads` makes for the unbound-call
+ * prover, which this deliberately mirrors.
+ */
+struct EscEdge {
+    int callee;                 /* index into the EscFn vector */
+    int argpos;                 /* my param sits at this argument position */
+    int mine;                   /* ... and is my parameter number `mine` */
+};
+
+struct EscFn {
+    FuncDeclStmt *fd = nullptr;
+    uint64_t mask = 0;          /* candidates; shrinks to the fixpoint */
+    uint64_t cands = 0;         /* the initial mask, kept for the reach stat */
+    uint64_t written = 0;       /* params the body reassigns */
+    bool unsafe = false;        /* writes a global, or calls something we
+                                 * cannot name (which might write one) */
+    std::vector<EscEdge> edges;
+    std::vector<int> calls;     /* known callees, for the `unsafe` fixpoint */
+};
+
+#ifdef TESTS
+/* WHY a function was poisoned - the reach diagnostic. Counted once per
+ * function, at the FIRST rule that fires, so the columns sum to the number
+ * of locally-poisoned functions and the rest were poisoned transitively. */
+#define ESC_POISON(f, ctr) do { if (!(f)->unsafe) (ctr)++; \
+                                (f)->unsafe = true; } while (0)
+#else
+#define ESC_POISON(f, ctr) ((f)->unsafe = true)
+#endif
+
+struct EscWorld {
+    std::unordered_map<int, int> slot2fn;    /* global slot -> EscFn index */
+    std::unordered_set<int> struct_slots;    /* global slot -> a struct name */
+    std::unordered_set<int> written_slots;   /* reassigned global slots */
+};
+
+struct EscCtx {
+    std::unordered_map<const UniqueId *, int> pidx;   /* param name -> index */
+    const EscWorld *w;
+    EscFn *self;
+};
+
+static void esc_scan(const Construct *c, EscCtx &ctx);
+
+/* Classify one call: which bits it clears, which edges it owes, and whether
+ * it can reach code that writes a global. */
+static void esc_scan_call(const CallExpr *call, EscCtx &ctx)
+{
+    auto *cid = dynamic_cast<const Identifier *>(call->what.get());
+    const bool is_builtin = cid && cid->sym.kind == SymKind::builtin;
+    /*
+     * A STRUCT CONSTRUCTION is a CallExpr whose callee names a struct. The
+     * inferencer's `vm_struct_ctor_def`/`vm_struct_boxed_def` stamps say so
+     * for the calls IT typed, but a TEMPLATE body is skipped by the check
+     * pass and carries neither - so the slot the resolver hoisted the
+     * struct name into is the reliable question. Without that, `B(a)` in a
+     * template read as a callee we cannot name and poisoned the function
+     * (watched: the struct-ctor row answered 0x0 instead of 0x2).
+     */
+    const bool is_ctor = call->vm_struct_ctor_def || call->vm_struct_boxed_def
+        || (cid && call->direct_func_slot >= 0
+            && ctx.w->struct_slots.count(call->direct_func_slot));
+
+    int callee = -1;
+    if (!is_builtin && !is_ctor && cid && call->direct_func_slot >= 0
+        && !ctx.w->written_slots.count(call->direct_func_slot)) {
+        auto it = ctx.w->slot2fn.find(call->direct_func_slot);
+        if (it != ctx.w->slot2fn.end())
+            callee = it->second;
+    }
+
+    /*
+     * A callee we cannot NAME could do anything, including reassigning the
+     * global some caller passed us - so it poisons this function the same
+     * way a direct global write does. A STRUCT CONSTRUCTION is named and
+     * harmless in that respect (it binds fields, calls nothing), it merely
+     * captures whatever it is given. And a HIGHER-ORDER builtin runs a
+     * MyLang callback that this pass cannot see: `callable_arg_mask` is the
+     * inferencer's existing answer to "which arguments might be callable"
+     * (LICM asks it for the same reason), and it defaults to ~0u, so an
+     * unstamped call declines.
+     */
+    const bool transparent = is_builtin && esc_builtin_transparent(cid->uid);
+    if (!is_builtin && !is_ctor && callee < 0)
+        ESC_POISON(ctx.self, g_esc_p_callee);
+    if (is_builtin && !transparent && call->args
+        && (call->args->elems.size() >= 32
+            || (call->callable_arg_mask
+                & ((1u << call->args->elems.size()) - 1))))
+        ESC_POISON(ctx.self, g_esc_p_hobuiltin);
+    if (callee >= 0)
+        ctx.self->calls.push_back(callee);
+
+    /* the callee EXPRESSION: `p()` is a bare read of p, `p[0]()` is not */
+    if (cid) {
+        auto it = ctx.pidx.find(cid->uid);
+        if (it != ctx.pidx.end())
+            ctx.self->mask &= ~(uint64_t(1) << it->second);
+    } else {
+        esc_scan(call->what.get(), ctx);
+    }
+
+    if (!call->args)
+        return;
+    for (size_t j = 0; j < call->args->elems.size(); j++) {
+        const Construct *arg = call->args->elems[j].get();
+        auto *aid = dynamic_cast<const Identifier *>(arg);
+        auto it = aid ? ctx.pidx.find(aid->uid) : ctx.pidx.end();
+        if (it == ctx.pidx.end()) {
+            esc_scan(arg, ctx);
+            continue;
+        }
+        if (transparent)
+            continue;                       /* audited: stores nothing */
+        if (callee >= 0 && j < 64) {
+            ctx.self->edges.push_back(
+                EscEdge{ callee, static_cast<int>(j), it->second });
+            continue;                       /* resolved by the fixpoint */
+        }
+        ctx.self->mask &= ~(uint64_t(1) << it->second);
+    }
+}
+
+/* Clear a param's bit the moment it is used anywhere but a base position (or
+ * an argument position the fixpoint can discharge). */
+static void esc_scan(const Construct *c, EscCtx &ctx)
 {
     if (!c)
         return;
+    if (!esc_known_shape(c)) {
+        ESC_POISON(ctx.self, g_esc_p_shape); /* see esc_known_shape */
+        return;
+    }
+    /*
+     * A NESTED FUNCTION READS NOTHING BUT ITS CAPTURE LIST, and in MyLang
+     * that list is EXPLICIT - a lambda is `func [x, y] (...)` and a NAMED
+     * nested function may not have one at all (the grammar rejects it). Its
+     * body is parented to `capture_root`, the program root, so it cannot
+     * reach this frame by any other route. So the list IS the answer: clear
+     * the bits of the parameters it names and do not descend.
+     *
+     * A first version poisoned the whole function for any nested decl, and
+     * the reach measurement is what argued it down: 8 of the 15
+     * candidate-bearing functions in samples/ + bench/my lost everything
+     * that way. Clearing the captured bits is still conservative - a
+     * capture SNAPSHOTS the value, taking a reference of its own, so it may
+     * well be borrowable - but conservative here costs only the
+     * optimization.
+     */
+    if (auto *nested = dynamic_cast<const FuncDeclStmt *>(c)) {
+        if (nested->captures) {
+            for (auto &cap : nested->captures->elems) {
+                auto it = ctx.pidx.find(cap->uid);
+                if (it != ctx.pidx.end())
+                    ctx.self->mask &= ~(uint64_t(1) << it->second);
+            }
+        }
+        return;
+    }
+    if (auto *call = dynamic_cast<const CallExpr *>(c)) {
+        esc_scan_call(call, ctx);
+        return;
+    }
+    if (esc_writes_global(c))
+        ESC_POISON(ctx.self, g_esc_p_gwrite);
     fmi_children(const_cast<Construct *>(c), [&](Construct *ch) {
         if (!ch)
             return;
         if (auto *id = dynamic_cast<const Identifier *>(ch)) {
-            auto it = pidx.find(id->uid);
-            if (it != pidx.end() && !esc_is_base_position(c, ch))
-                mask &= ~(uint64_t(1) << it->second);
+            auto it = ctx.pidx.find(id->uid);
+            if (it != ctx.pidx.end() && !esc_is_base_position(c, ch))
+                ctx.self->mask &= ~(uint64_t(1) << it->second);
             return;                        /* an Identifier has no children */
         }
-        esc_scan(ch, pidx, mask);
+        esc_scan(ch, ctx);
     });
 }
 
 /*
- * Per-parameter "cannot outlive this call" bits, one per param, bit i for
- * param i. Bit set == does NOT escape. Params past 64 are never marked.
+ * The LOCAL half: this body's own contribution, before the fixpoint. Bit i
+ * set == param i does not escape as far as this body alone can tell.
+ *
+ * ⛔ THE BODY IS SCANNED EVEN WHEN THERE IS NOTHING TO CLAIM. `unsafe` is
+ * not a fact about this function's own parameters, it is a fact its CALLERS
+ * need - "code reachable from here may reassign a global" - so a body with
+ * no candidate params (all scalar, or none at all) must still be walked for
+ * its writes and its call edges. Returning early there is the bug that made
+ * the global-write row pass its poison nowhere: `func h(k) { g = [k]; }`
+ * has one int param, so it had no candidates, so it was never scanned, so
+ * `f` calling it stayed clean and marked its own parameter safe.
  */
-static uint64_t compute_noescape_params(FuncDeclStmt *fd)
+static void esc_scan_body(EscFn &f, const EscWorld &w)
 {
-    if (!fd->body || !fd->params || fd->params->elems.empty())
-        return 0;
-    const size_t n = fd->params->elems.size();
-    if (n > 64 || esc_body_is_opaque(fd->body.get()))
-        return 0;
+    FuncDeclStmt *fd = f.fd;
+    if (!fd->body)
+        return;
+    const size_t n = fd->params ? fd->params->elems.size() : 0;
 
-    std::unordered_map<const UniqueId *, int> pidx;
-    uint64_t mask = 0;
-    for (size_t i = 0; i < n; i++) {
+    EscCtx ctx;
+    ctx.w = &w;
+    ctx.self = &f;
+    uint64_t mask = 0, written = 0;
+    for (size_t i = 0; i < n && i < 64; i++) {
         Identifier *p = dynamic_cast<Identifier *>(fd->params->elems[i].get());
         if (!p)
-            return 0;
-        /* a SCALAR param is a by-value copy - there is no reference to
-         * borrow, so it is neither interesting nor claimed here */
-        if (p->th == TypeHint::i || p->th == TypeHint::f)
             continue;
-        /* reassigned? the resolver already counted the writes */
+        /* A SCALAR param is a by-value copy - there is no reference to
+         * borrow, so it is neither interesting nor claimed here. Asked of
+         * the DESCRIPTOR (ParamDesc::binds_scalar), which is the same
+         * predicate codegen's ref_slots join uses to decide the slot can
+         * never hold a reference; the param DECL's own `th` is not stamped
+         * by annotate_hints, so testing that answered "not scalar" for
+         * every param and the skip never fired. */
+        if (fd->desc && i < fd->desc->params.size()
+            && fd->desc->params[i].binds_scalar())
+            continue;
         if (i < fd->slot_writes.size() && fd->slot_writes[i])
-            continue;
-        pidx.emplace(p->uid, static_cast<int>(i));
+            written |= uint64_t(1) << i;
+        ctx.pidx.emplace(p->uid, static_cast<int>(i));
         mask |= uint64_t(1) << i;
     }
-    if (!mask)
+    f.mask = mask;
+    f.cands = mask;
+    f.written = written;
+    /* past 64 params nothing is claimable, but the body still has to be
+     * walked for `unsafe` and for the call edges (see the note above) */
+    if (n > 64)
+        f.mask = 0;
+    esc_scan(fd->body.get(), ctx);
+}
+
+/*
+ * REASSIGNMENT: an assignment to the parameter itself would release whatever
+ * the slot holds, which a borrowed slot must never do.
+ *
+ * ⛔ THE GUARD IS PROVEN REDUNDANT RATHER THAN TESTED, on purpose - and the
+ * proof is the CHECK, not a comment. No program can reach it: every spelling
+ * of a write to a parameter - `a = e`, `a += e`, `a++`, `a, b = pair` - puts
+ * the parameter's Identifier somewhere that is not a subscript/member BASE,
+ * so the scan has already cleared the bit. A test row for it is therefore
+ * impossible to write, and one that merely LOOKS like a test of it (an
+ * ordinary `a = [9]` row) passes with the guard deleted - which is what
+ * "defensive, not proven" meant, and the sabotage run confirms: deleting the
+ * guard leaves the whole suite green.
+ *
+ * The check earns its place by firing on the change that would make the
+ * guard load-bearing again. WATCHED: make `esc_is_base_position` answer true
+ * for everything and this assert - not any test row - is what stops the
+ * build, because a reassigned param then survives the scan. Keep both; the
+ * failure direction here is a use-after-free.
+ */
+static uint64_t esc_final_mask(const EscFn &f)
+{
+    if (f.unsafe)
         return 0;
-    esc_scan(fd->body.get(), pidx, mask);
-    return mask;
+    ML_CHECK((f.mask & f.written) == 0);
+    return f.mask & ~f.written;
 }
 
 /* True if `fd` may mutate a reference-typed parameter (so it is not pure). */
@@ -5795,26 +6127,119 @@ collect_cacheable_slots(Construct *c, std::unordered_set<int> &out)
 #ifdef TESTS
 unsigned long g_noescape_funcs = 0;    /* functions with >=1 marked param */
 unsigned long g_noescape_marks = 0;    /* parameters marked, in total */
+/* the DENOMINATOR, so the reach number can be read as a hit rate rather
+ * than an absolute nobody can size: how many parameters were even
+ * candidates (a reference param of an analysable function), and how many
+ * candidate-bearing functions lost everything to the all-or-nothing
+ * `unsafe` poison rather than to a per-parameter rule */
+unsigned long g_noescape_cands = 0;
+unsigned long g_noescape_unsafe = 0;
+unsigned long g_esc_p_callee = 0, g_esc_p_gwrite = 0,
+              g_esc_p_hobuiltin = 0, g_esc_p_shape = 0;
 #endif
 
+/* every named function body, plus which global slot names it and which
+ * global slots some assignment writes (a slot a program reassigns cannot be
+ * trusted to still hold the function whose name it is) */
+static void esc_collect(Construct *c, std::vector<EscFn> &fns, EscWorld &w)
+{
+    if (!c)
+        return;
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (fd->desc) {
+            if (fd->id && fd->id->sym.kind == SymKind::global)
+                w.slot2fn[fd->id->sym.slot] = static_cast<int>(fns.size());
+            EscFn f;
+            f.fd = fd;
+            fns.push_back(f);
+        }
+    } else if (auto *sd = dynamic_cast<StructDeclStmt *>(c)) {
+        if (sd->id && sd->id->sym.kind == SymKind::global)
+            w.struct_slots.insert(sd->id->sym.slot);
+    } else if (esc_writes_global(c)) {
+        const Construct *lv = nullptr;
+        if (auto *e = dynamic_cast<const Expr14 *>(c))
+            lv = e->lvalue.get();
+        else if (auto *idc = dynamic_cast<const IncDecExpr *>(c))
+            lv = idc->lvalue.get();
+        /* only a WHOLE-slot write can replace the function; `g[i] = v`
+         * mutates the object the slot points at */
+        if (auto *id = dynamic_cast<const Identifier *>(lv))
+            w.written_slots.insert(id->sym.slot);
+    }
+    fmi_children(c, [&](Construct *ch) { esc_collect(ch, fns, w); });
+}
+
+/*
+ * #93: stamp every function's per-parameter escape bits - see THE
+ * PARAMETER ESCAPE ANALYSIS and THE CALL-GRAPH ESCAPE FIXPOINT above.
+ *
+ * ⛔ IT RUNS HERE, AT THE END OF resolve_names, AND NOT IN
+ * process_function WHERE ITS SIBLING func_mutates_input LIVES - because
+ * the answer depends on `SymKind::global`, which pass 2 has not stamped
+ * yet when a body is walked, and (since the fixpoint) on
+ * `direct_func_slot`, which `devirtualize_direct_calls` stamps one line
+ * above this call. A first version did stamp it in process_function and
+ * was caught by the analysis' own test: `func f(a) { g = [9]; a[0] = 1; }`
+ * came back with `a` marked non-escaping, because the write to the global
+ * `g` still looked like a write to an unresolved name. That is the
+ * audit-table stage trap in its usual shape - a pass reading a table one
+ * stage before it is filled - and here the failure direction is a
+ * use-after-free, so the stage matters more than the tidiness of sitting
+ * next to the related analysis.
+ */
 static void stamp_noescape_params(Construct *root)
 {
-    if (!root)
-        return;
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(root)) {
-        if (fd->desc) {
-            fd->desc->noescape_params = compute_noescape_params(fd);
-#ifdef TESTS
-            if (fd->desc->noescape_params) {
-                g_noescape_funcs++;
-                for (uint64_t m = fd->desc->noescape_params; m; m &= m - 1)
-                    g_noescape_marks++;
+    std::vector<EscFn> fns;
+    EscWorld w;
+    esc_collect(root, fns, w);
+
+    for (EscFn &f : fns)
+        esc_scan_body(f, w);
+
+    /*
+     * THE FIXPOINT. Two facts travel the call graph, and both only ever get
+     * WORSE, so the iteration terminates: `unsafe` spreads from a callee to
+     * its callers (whatever it may do to a global, calling it may do too),
+     * and an edge "my param i is argument j of g" clears i as soon as g's
+     * param j turns out to escape - or g turns out to be unsafe.
+     */
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (EscFn &f : fns) {
+            for (int c : f.calls)
+                if (fns[c].unsafe && !f.unsafe) {
+                    f.unsafe = true;
+                    changed = true;
+                }
+            for (const EscEdge &e : f.edges) {
+                const EscFn &g = fns[e.callee];
+                const bool ok = !g.unsafe
+                    && e.argpos < 64
+                    && (g.mask >> e.argpos & 1)
+                    && !(g.written >> e.argpos & 1);
+                if (!ok && (f.mask >> e.mine & 1)) {
+                    f.mask &= ~(uint64_t(1) << e.mine);
+                    changed = true;
+                }
             }
-#endif
         }
-        /* a nested function is walked below like any other child */
     }
-    fmi_children(root, [&](Construct *ch) { stamp_noescape_params(ch); });
+
+    for (EscFn &f : fns) {
+        f.fd->desc->noescape_params = esc_final_mask(f);
+#ifdef TESTS
+        for (uint64_t m = f.cands; m; m &= m - 1)
+            g_noescape_cands++;
+        if (f.cands && f.unsafe)
+            g_noescape_unsafe++;
+        if (f.fd->desc->noescape_params) {
+            g_noescape_funcs++;
+            for (uint64_t m = f.fd->desc->noescape_params; m; m &= m - 1)
+                g_noescape_marks++;
+        }
+#endif
+    }
 }
 
 static void
