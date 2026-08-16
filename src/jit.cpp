@@ -74,6 +74,8 @@ unsigned long g_jit_sfield_checked = 0;/* G4: checked a[i].f runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
 unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
 unsigned long g_jit_fwd = 0;           /* lever A: forwarded consumers RUN */
+unsigned long g_jit_fwd_local = 0;     /* ... of which the source was a
+                                        * LOCAL, not a temp (#96) */
 unsigned long g_jit_ffwd = 0;          /* C4a-ii: FLOAT forwarded runs */
 unsigned long g_jit_flit = 0;          /* C4b: literal-pinned frag entries */
 unsigned long g_jit_fstore_movx0 = 0;  /* C4b inc 2: ref-arm result move */
@@ -5451,12 +5453,24 @@ static bool jit_fwd_consumer(const Instr &nx, int t)
 }
 
 /* TESTS: the execution proof - forwarded consumers bump at RUNTIME (the
- * emitted-code counter rule; rdx is dead at every bump site). */
-static void emit_fwd_bump(Emitter &e)
+ * emitted-code counter rule; rdx is dead at every bump site).
+ *
+ * `local` splits out the #96 half - the source was a LOCAL whose value is
+ * in RAX because the PREVIOUS op just wrote it, rather than a dead temp.
+ * Two counters, not one: the shapes have different soundness arguments
+ * (a local's write is never skipped) and a test that could not tell them
+ * apart would let one silently stop firing behind the other's count. */
+static void emit_fwd_bump(Emitter &e, bool local)
 {
 #ifdef TESTS
     e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_fwd));
     e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
+    if (local) {
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_fwd_local));
+        e.u8(0x48); e.u8(0xFF); e.u8(0x02);
+    }
+#else
+    (void)e; (void)local;
 #endif
 }
 
@@ -5872,6 +5886,7 @@ void jit_stats_report()
          * `fwd_skip_rel` is the narrower C5-discharged write-skip. */
         { "xcache",           &g_jit_xcache },
         { "fwd",              &g_jit_fwd },
+        { "fwd_local",        &g_jit_fwd_local },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
         { "str_probe_ok",     &g_jit_str_probe_ok },
         { "ord_inline",       &g_jit_ord_inline },
@@ -8815,7 +8830,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const bool fa = fin >= 0 && in.a_slot() == fin;
         const bool fb = fin >= 0 && !in.b_is_lit() && in.b_slot() == fin;
         if (fa || fb)
-            emit_fwd_bump(e);
+            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
         if (fa && fb) {
             e.mov_rr(RCX, RAX);            /* t OP t */
         } else if (fb && aop == Op::minus) {
@@ -8957,7 +8972,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const bool fa = fin >= 0 && in.a_slot() == fin;
         const bool fb = fin >= 0 && !in.b_is_lit() && in.b_slot() == fin;
         if (fa || fb)
-            emit_fwd_bump(e);
+            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
         if (fb)
             e.mov_rr(RCX, RAX);              /* the count, before the value */
         if (!fa)
@@ -9006,7 +9021,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * NOT a producer: the remainder lands in RDX on the idiv path
          * and in RAX on the div-magic one. */
         if (g_fwd.in_rax >= 0 && in.a_slot() == g_fwd.in_rax)
-            emit_fwd_bump(e);
+            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
         else
             read_slot(e, RAX, in.a_slot());
         DivMagic mg;
@@ -9026,7 +9041,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::IntAddModRI: {
         /* lever A, consumer side (operand `a` only - see the predicate) */
         if (g_fwd.in_rax >= 0 && in.a_slot() == g_fwd.in_rax)
-            emit_fwd_bump(e);
+            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
         else
             read_slot(e, RAX, in.a_slot());
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
@@ -11835,7 +11850,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         const bool fb = g_fwd.in_rax >= 0 && !in.b_is_lit()
             && in.b_slot() == g_fwd.in_rax;
         if (fb) {
-            emit_fwd_bump(e);
+            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
             read_slot(e, RCX, adst);
         } else {
             read_slot(e, RAX, adst);
@@ -14151,7 +14166,25 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                     && !cache_barrier[pc - begin]
                     && !cache_barrier[pc + 1 - begin]
                     && jit_fwd_producer(in, fdst)
-                    && fdst >= chunk.slot_count          /* a TEMP only */
+                    /*
+                     * #96: LOCALS FORWARD TOO. The temp restriction that
+                     * used to sit here belonged to the WRITE ELISION, not
+                     * to the read: `skip_write` needs the destination
+                     * provably dead, which only a temp's liveness gives.
+                     * Eliding just the READ asks far less - the write
+                     * still happens, so the slot is current for anyone
+                     * else - and it is worth as much, because the reload
+                     * it removes is on the DEPENDENCY CHAIN:
+                     *
+                     *     mov  a4, rax      ; a4 = a4 + i
+                     *     mov  rax, a4      ; <- store-to-load forwarding
+                     *     sar  rax, 7       ;    ~4-5 cycles, for nothing
+                     *
+                     * The restriction moves down to skip_write, which is
+                     * also where `tb` (the temp bit index) stops being
+                     * negative - `1 << tb` for a local is UB, and that is
+                     * the trap in doing this the lazy way.
+                     */
                     && jit_fwd_consumer(chunk.code[pc + 1], fdst)
                     && !fwd_tgt[pc + 1]
                     && !std::binary_search(
@@ -14162,7 +14195,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                return x.first < y.first;
                            })) {
                 g_fwd.prod = fdst;
-                const int tb = fdst - chunk.slot_count;
+                const bool is_temp = fdst >= chunk.slot_count;
+                const int tb = is_temp ? fdst - chunk.slot_count : 0;
                 /*
                  * The REF-LISTED refusal is about RELEASE SEMANTICS, not
                  * about the list: a ref-listed dst keeps its write
@@ -14184,7 +14218,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                  * pair executed once per iteration.
                  */
                 const bool listed = jit_slot_ref_listed(chunk, fdst);
-                g_fwd.skip_write = fwd_live_ok && tb < 64
+                g_fwd.skip_write = is_temp && fwd_live_ok && tb < 64
                     && !(fwd_lout[pc + 1] & (uint64_t(1) << tb))
                     && (!listed || e.relok(fdst));
 #ifdef TESTS

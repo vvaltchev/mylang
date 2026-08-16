@@ -653,12 +653,22 @@ register at all. **That is the next increment**, and it is lever A
 generalised from TEMPS to LOCALS (the plan's own T1 line, arrived at
 from the other direction).
 
-Its hazard is stated up front: the "rax still holds slot S" fact must be
-invalidated by EVERY emit that writes rax and at every label, branch
-target and entry stub. Getting that wrong is a silent miscompile, so it
-wants the narrowest possible carrier - set it in ONE place (the store to
-a pinned register) and clear it in `emit_one`'s per-op reset, the way
-`g_fwd.in_rax` already does.
+**DONE.** It needed no new carrier at all: lever A's `g_fwd` one-shot
+already has exactly the right lifetime, and the temp restriction that
+blocked locals belonged to the WRITE ELISION rather than to the read. So
+the change is one condition MOVED - out of the arming test, down into
+`skip_write`, which is also where `tb` stops being negative (`1 << tb`
+for a local is UB).
+
+MEASURED: 80_regs_int_08's loop body **92 -> 84 instructions**, the 8
+predicted; **83_regs_int_40 -8.86% Ir and 0.89x WALL CLOCK**; 28 corpus
+programs changed and every one Ir-negative or flat. Record in
+docs/jit-optimizations.md.
+
+**It confirms the corrected cost model.** Same benchmark family, same
+box: removing 23.3% of the DATA REFERENCES bought 1.004x, removing 7.3%
+of the INSTRUCTIONS bought a real win. The discriminator is the
+instruction count.
 
 #### The order for the rest
 

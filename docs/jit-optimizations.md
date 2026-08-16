@@ -5017,3 +5017,108 @@ Two things a future reader must not mistake for proven:
     debug-only stub that deliberately writes garbage into r10/r11 after
     every emitted helper call - the MYLANG_JIT_COLD philosophy applied
     to the ABI. Not built.
+
+## Lever A forwards LOCALS, not just dead temps (2026-08-16, #96)
+
+The increment the caller-saved extension's flat wall clock pointed at: a
+register is a prerequisite, the WIN is the instruction it makes
+removable. Every whitelisted producer already leaves its result in RAX
+and then writes the slot - so the next op's read of that same slot is a
+reload of something already in the register:
+
+    mov  r14, rax      ; a0 = a0 + i        (a PINNED local)
+    mov  rax, r14      ; <- the reload, for nothing
+    sar  rax, 3
+
+    mov  a4, rax       ; a4 = a4 + i        (a MEMORY local)
+    mov  rax, a4       ; <- store-to-load forwarding, ~4-5 cycles
+    sar  rax, 7        ;    ON THE DEPENDENCY CHAIN
+
+### The change is one condition moved, not added
+
+Lever A required `fdst >= chunk.slot_count` to ARM. That restriction
+belongs to the **write elision**, not to the read: `skip_write` needs
+the destination provably dead, which only a temp's liveness gives.
+Eliding just the READ asks far less - the write still happens, so the
+slot stays current for every other reader - and it is worth as much,
+because on a memory-backed local the removed reload is a
+store-to-load-forwarding stall on the chain.
+
+So the test moved down into `skip_write`, which is also where `tb` (the
+temp bit index) stops being negative. **`1 << tb` for a local is UB**,
+and that is the trap in doing this the lazy way; the sabotage that lets
+a local reach `skip_write` fails 5 `-rt` tests.
+
+**RAX genuinely survives `write_slot` on all four paths, and this was
+verified rather than assumed**: the cached-register store is `mov cr,
+rax`; the plain path is a type store through RSI plus a payload store;
+the ref-listed FAST arm is two stores; and the ref-listed COLD arm calls
+`jit_put_int`, which clobbers RAX - and then does `e.load(RAX,
+a.payload)` UNCONDITIONALLY. That reload exists because of an earlier
+bug (a `keep_rax` parameter that only lever A set, which let a
+ref-listed loop counter compare garbage), and it is what makes this
+increment sound for ref-listed locals too.
+
+### Measured
+
+Loop body of 80_regs_int_08: **92 -> 84 instructions**, exactly the 8
+predicted (one per accumulator).
+
+| bench | Ir | wall |
+|---|---|---|
+| 83_regs_int_40 | **-8.86%** | **0.89x** |
+| 80_regs_int_08 | -7.30% | 0.99x |
+| 59_bit_hash | -3.64% | - |
+| 18_foreach_array | -2.78% | - |
+| 07_nested_loops | -2.75% | - |
+| 08_func_call | -2.23% | - |
+| 03_int_arith | -1.36% | - |
+
+28 corpus programs change and **every one is Ir-negative or flat** - no
+regression anywhere. Suite geomean cur/base 0.999x, which is what a
+change touching one instruction per producer-consumer pair should read.
+
+⛔ **AND IT CONFIRMS THE CORRECTED COST MODEL RATHER THAN CONTRADICTING
+IT.** The caller-saved extension removed **-23.3% of the data
+references** on 80_regs_int_08 for **1.004x**; this removes **-7.30% of
+the INSTRUCTIONS** on the same program and the biggest instruction cut
+(83_regs_int_40, -8.86%) is the biggest wall-clock win (0.89x). Same
+benchmark family, same machine, opposite outcomes - so the
+discriminator really is the instruction count, not the traffic.
+
+**A NOTE ON READING THAT BENCH TABLE.** Eight benches read 1.04-1.09x
+"regressed" in the same run, and SEVEN of them are BYTE-IDENTICAL under
+`-vdj` - so that run's noise floor is +-7% (39_find_builtin read 0.70x
+on unchanged code). Diff the emitted code before believing a per-bench
+number; the deterministic Ir above is the signal.
+
+### The nets
+
+`jit_fwd_deadtemp`'s two shift cases now carry a THIRD number,
+`loc_exact` - how many of the forwards were LOCAL-sourced - fed by a
+second emitted counter `g_jit_fwd_local` (JITSTATS `fwd_local`). Two
+counters because the halves have different soundness arguments, and one
+total could hide either going dark. The counts were derived from `-nj
+-vd` before the change and matched exactly on the first run: case 1 goes
+3 -> 5 forwards per iteration (pc4->pc5 and pc6->pc7 both produce the
+local `s` and immediately read it; pc8->pc9 does NOT, since the addmod
+reads `a` and `k`), case 2 goes 3 -> 4.
+
+Watched failing: the temp restriction put back where it was
+(`LOCAL-sourced 0, expected 16`), and a local allowed to take
+`skip_write` (5 tests).
+
+### The sibling case, so the map is complete
+
+A COMPARE consumer still reloads. In 80_regs_int_08's `if ((i & 1) == 0)`:
+
+    and  rax, rcx      ; IntAndRI -> temp
+    mov  r11.type, rsi
+    mov  r11, rax
+    mov  rax, r11      ; <- still there
+
+because `JumpUnlessIntCmp`/`CmpIntV` are not consumer-whitelisted. The
+existing note explains why that was deliberate ("a counted loop's BOUND
+temp is read every iteration - exactly the shape the liveness refuses"),
+but the liveness net now exists, so it is worth re-examining - as a
+separate increment, with the ratchet's row updated to match.
