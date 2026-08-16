@@ -20672,6 +20672,132 @@ static bool jit_invoke_direct_entry()
 #endif
 }
 
+/*
+ * VmInvoker::call's TIER LADDER (vm.h): which entry each callback element
+ * takes. g_invoke_prepared counts the prepared-window entry (one boundary
+ * frame for the whole loop, a rebind per element); g_invoke_fallback counts
+ * the per-call eval_func path taken when there is no activation to run a
+ * boundary frame on. Each shape is measured on its OWN counters (both reset
+ * before it) - a program-wide total would let one shape's elements satisfy
+ * another's, which is how a decline case fakes a pass.
+ *
+ * Every case ALSO asserts its result: an entry that binds the right number
+ * of slots with the WRONG values is the failure mode a counter cannot see.
+ */
+static bool invoker_call_tiers()
+{
+    struct Case {
+        const char *what;
+        std::vector<const char *> lines;
+        ExecEngine engine;
+        bool want_prepared;    /* the prepared entry must run ... */
+        unsigned long min_n;   /* ... at least this many times */
+    };
+
+    /* \u26d4 THE SETUP MAY NOT USE A CALLBACK. Building the input array with
+     * make_array would add ITS elements to the counters, which is exactly
+     * what made the first version of these cases fail: 30 setup binds
+     * satisfied the "the other entry did not serve this shape" check. Fill
+     * with a plain loop, so every counted element is the one under test. */
+    static const char *const fill =
+        "var a = []; for (var i = 0; i < 30; i++) { append(a, 30 - i); }";
+
+    static const std::vector<Case> cases = {
+        /* The shape the whole path exists for: 34_sort_custom_cmp's
+         * comparator, one prepared entry per comparison. */
+        { "sort comparator, VM engine",
+          { fill,
+            "sort(a, func(x, y) { return x < y; });",
+            "assert(a[0] == 1 && a[29] == 30);" },
+          ExecEngine::Vm, true, 30 },
+        /* One argument rather than two, and a different builtin - the
+         * point of ONE call() entry is that neither needs its own ladder. */
+        { "make_array generator, VM engine",
+          { "var g = make_array(40, func(i) { return i * 3; });",
+            "assert(g[39] == 117);" },
+          ExecEngine::Vm, true, 40 },
+        /* map over already-boxed elements, still the prepared entry. */
+        { "map callback, VM engine",
+          { fill,
+            "var m = map(func(x) { return x + 1; }, a);",
+            "assert(m[29] == 2);" },
+          ExecEngine::Vm, true, 30 },
+        /* THE FALLBACK: the tree-walker has no activation, so there is no
+         * window to prepare and every element goes through eval_func. Same
+         * source, same answers - which is the property that matters, since
+         * a builtin no longer spells this arm out for itself. */
+        { "sort comparator, tree-walker (no activation to prepare)",
+          { fill,
+            "sort(a, func(x, y) { return x < y; });",
+            "assert(a[0] == 1 && a[29] == 30);" },
+          ExecEngine::TreeWalk, false, 30 },
+        { "map callback, tree-walker (no activation to prepare)",
+          { fill,
+            "var m = map(func(x) { return x + 1; }, a);",
+            "assert(m[29] == 2);" },
+          ExecEngine::TreeWalk, false, 30 },
+    };
+
+    auto run = [](const std::vector<const char *> &lines,
+                  ExecEngine eng) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = eng;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (eng == ExecEngine::Vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);   /* the root block builds its own ctx */
+        } catch (Exception &e) {
+            fprintf(stderr, "invoker_call_tiers: threw %s: %s\n",
+                    e.name, e.msg ? e.msg : "");
+            ok = false;
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    for (const Case &c : cases) {
+        g_invoke_prepared = 0;
+        g_invoke_fallback = 0;
+        if (!run(c.lines, c.engine)) {
+            fprintf(stderr, "invoker_call_tiers: '%s' did not run\n", c.what);
+            return false;
+        }
+        const unsigned long got = c.want_prepared ? g_invoke_prepared
+                                                  : g_invoke_fallback;
+        const unsigned long other = c.want_prepared ? g_invoke_fallback
+                                                    : g_invoke_prepared;
+        if (got < c.min_n) {
+            fprintf(stderr, "invoker_call_tiers: '%s' took the %s entry only "
+                            "%lu times (want >= %lu)\n", c.what,
+                    c.want_prepared ? "prepared" : "fallback", got, c.min_n);
+            return false;
+        }
+        if (other >= c.min_n) {
+            fprintf(stderr, "invoker_call_tiers: '%s' also took the %s entry "
+                            "%lu times\n", c.what,
+                    c.want_prepared ? "fallback" : "prepared", other);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Struct BAKED-LAYOUT fast paths (the 64_struct_create fix): the member
  * read and the planned ctor emit INLINE machine code whose execution is
  * proven by g_jit_member_fast / g_jit_ctor_fast - counters bumped by the
@@ -30361,6 +30487,8 @@ static const std::vector<extra_check> extra_checks =
       jit_native_stack_deep },
     { "jit: VmInvoker enters callback fragments directly (lever 2)",
       jit_invoke_direct_entry },
+    { "vm: VmInvoker::call picks the typed / boxed callback entry",
+      invoker_call_tiers },
     { "opt: every AST transform is behaviour-preserving (layer equivalence)",
       opt_layer_equivalence },
     { "opt: loop-invariant container-subscript hoisting shapes (LICM)",

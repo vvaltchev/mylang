@@ -4397,3 +4397,62 @@ the point:
    both signs, both INT64 extremes, powers of two, a 31-bit prime,
    negative divisors) precisely so the tree-walker's C++ `/` and `%`
    are the oracle. A reach test alone would have shipped this.
+
+## THE BUILTIN-CALLBACK ENTRY: `VmInvoker::call` (2026-08-14)
+
+Not an emitter change - the VM's callback path - but it lives here
+because it added two `MYLANG_JITSTATS` counters and because its
+REJECTED half is a trap worth reading before touching this area.
+
+`VmInvoker::call(args...)` (vm.h) is now the ONE entry every
+higher-order builtin uses. It takes the callback's arguments in
+whatever C++ types the builtin holds them in, boxes each EXACTLY ONCE
+into the argv, and picks the tier itself (the prepared window, or
+`eval_func` when there is no activation to run a boundary frame on).
+The five sites - sort's comparator, find's key, `make_array`,
+`make_dict`, `map`/`filter` - each spelled that ladder out by hand,
+and each spelled it differently.
+
+The win is the double boxing it removes, not the tidy-up: `sort`
+reached its invoker through a `cmp2(EvalValue, EvalValue)` lambda
+shared by the five storage arms, so ONE flat-int comparison built two
+EvalValues for `cmp2`'s parameters and then COPIED them into a
+two-element argv - four constructions. Taking the raw `int_type`s
+builds the argv directly: two.
+
+MEASURED (`OPT=1 ASSERTS=0` both sides, interleaved `--baseline`):
+**34_sort_custom_cmp -16.2% instructions (893.6M -> 748.9M) and 0.89x
+wall clock; 12_higher_order 0.87x; full suite geomean 1.002x**, with
+33_sort_ints - the same sort with NO comparator - flat, as it must be.
+
+**⛔ THE REJECTED HALF, so it is not built a third time: binding the
+raw scalar STRAIGHT into the callee's window slot**, skipping the argv
+entirely. It was built in FOUR shapes - bind inlined at the site; the
+same with the body shared through a file-local ALWAYS-INLINE helper;
+the same plus a non-inlinable body; and the whole typed entry
+out-of-line - and every one measured **1.20x-1.22x SLOWER** on
+34_sort_custom_cmp while winning **every metric a simulator models**:
+-28.2% instructions, -28% branches (122.1M -> 88.3M), D1 misses
+464,030 -> 463,098 and LL 49,031 -> 49,043 (identical), mispredicts
++2.5%. That combination is this codebase's known front-end/code-layout
+signature (the same one behind the vm_dispatch layout tax), and this
+box is WSL2 with no PMU, so it cannot be measured directly here.
+
+THE CONTROL THAT SETTLED IT, and it inverted the diagnosis: the SAME
+refactored source with the typed path disabled at compile time
+measured **0.90x**. So the refactor was always the win and the typed
+bind always the loss - the first attempt summed them and read the sum
+as one result.
+
+REACH WAS PROVEN, not assumed: `MYLANG_JITSTATS` now reports
+**`cb_prepared` / `cb_fallback`**, so "which entry did this program's
+callback elements actually take" is answerable of a real program
+instead of only from inside `-rt`. With the typed bind in, 34 took it
+2,820,290 of 2,820,290 comparisons - so none of the above is a
+measurement of dead code.
+
+The `-rt` net is `invoker_call_tiers`, which measures each shape on
+its OWN counters (both reset first) across BOTH engines - the VM cases
+must take the prepared entry, the tree-walker cases the fallback - and
+asserts every case's result as well as its counter. Sabotage watched:
+forcing the fallback arm always fails it at the first VM case.

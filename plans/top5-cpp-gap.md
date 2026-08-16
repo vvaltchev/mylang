@@ -751,61 +751,96 @@ when you change HOW a construct lowers, re-audit every table that
 classifies its OPCODE - the entry does not have to be edited to become
 false.
 
-## ⛔ THE TYPED CALLBACK ENTRY: BUILT, MEASURED, REVERTED (2026-08-14)
-## -27% INSTRUCTIONS AND +19% WALL CLOCK. A negative result worth keeping.
+## THE CALLBACK ENTRY: `VmInvoker::call` LANDED; THE TYPED BIND INSIDE IT
+## WAS BUILT TWICE, MEASURED AND REJECTED (2026-08-14)
 
-The design proposed for the higher-order builtins - hand `VmInvoker` the
-RAW scalar a flat container already holds, instead of boxing it into an
-`EvalValue` argv array for the bind to copy out of - was built end to
-end and is being kept OUT of the tree. The instruction reduction is
-real; the wall clock says no.
+Two separable ideas were tried together, and only after splitting them
+did the data make sense. Keep them separate when reading this.
 
-WHAT WAS BUILT (all of it worked and was green):
- - `VmInvoker::call(args...)`, ONE entry every higher-order builtin
-   uses, picking the tier internally: argv-free bind / boxed invoke /
-   `eval_func` when there is no VM activation. Written this way on the
-   maintainer's brief - more builtins are coming and the alternative is
-   each repeating the ready/typed/boxed ladder. All FIVE existing call
-   sites (sort, find-with-key, make_array, make_dict, map/filter)
-   collapsed to a single `inv.call(...)` line with no branching.
- - The gate is `fast_bind`, and this is the first thing worth keeping:
-   the callee's INFERRED TYPES do not enter it. `fast_bind` already
-   means "no parameter needs work beyond the value copy", so writing a
-   raw scalar into the slot is exactly what the boxed path does with a
-   boxed one - the caller already holds the right scalar.
- - **The FIRST gate, on `ParamDesc::proven_type`, engaged ZERO times**,
-   for a structural reason: `proven_type` is stamped only for a function
-   NEVER USED AS A VALUE, and a callback is by definition a function
-   used as a value. Anyone reaching for that field here should stop.
+### WHAT LANDED: one `call(args...)` entry, boxing each argument ONCE
 
-MEASURED, and the two numbers disagree violently:
- - **-27.2% instructions** on 34_sort_custom_cmp (-84.6 Ir per
-   comparison), against a correctly-built baseline;
- - **+19% WALL CLOCK** on the same bench (0.046 -> 0.055s), +16% on
-   67_make_dict, +9% on 35_map_filter. Reproduced on a second run.
-   Suite geomean 1.009x SLOWER.
+`VmInvoker::call(args...)` is now the single entry every higher-order
+builtin uses. It takes the callback's arguments in whatever C++ types the
+builtin holds them in, boxes each exactly once into an argv run, and
+picks the tier itself: the prepared window (`invoke`) or `eval_func`
+when there is no activation to run a boundary frame on. All FIVE call
+sites (sort's comparator, find's key, `make_array`, `make_dict`,
+`map`/`filter`) collapsed to one `inv.call(...)` line with no ladder of
+their own - which was the maintainer's brief, since more higher-order
+builtins are coming and each was repeating that ladder slightly
+differently.
 
-THE CONTROL THAT LOCATES IT: **33_sort_ints, which runs the same sort
-code with NO comparator, measures exactly 1.00x.** So this is not a
-general code-layout shift in the sort - it is the callback path itself.
-The mechanism is almost certainly the one this codebase already
-documents as "the LOOP-BODY TEXT RULE": sharing the post-bind half
-between the two tiers meant splitting `invoke()` into `invoke()` +
-`run_body()`, so EVERY element - boxed path included - now pays an
-out-of-line call that used to be straight-line code.
+**The win is not the tidy-up, it is the DOUBLE BOXING it removes.**
+`sort` reached its invoker through a `cmp2(EvalValue, EvalValue)` lambda
+shared by the five storage arms, so one flat-int comparison built TWO
+EvalValues for `cmp2`'s parameters and then COPIED them into a
+two-element argv - four constructions per comparison. `call(a, b)` takes
+the raw `int_type`s and builds the argv directly: two.
 
-WHAT THE NEXT ATTEMPT SHOULD DO DIFFERENTLY. Do not share the body
-through an out-of-line function. Either keep `invoke()` monolithic and
-DUPLICATE the post-bind half into the typed entry (the duplication is
-the cheaper mistake here), or move both into the header so the split
-costs nothing. The one-line `ML_ALWAYS_INLINE` fix does NOT work as
-written - a member declared in vm.h and defined in vm.cpp is not
-visible at the call sites and the build refuses it.
+MEASURED (`OPT=1 ASSERTS=0` both sides, interleaved `--baseline`):
+ - 34_sort_custom_cmp **-16.2% instructions** (893.6M -> 748.9M) and
+   **0.89x** wall clock;
+ - 12_higher_order **0.87x**;
+ - full suite geomean **1.002x** (flat), 33_sort_ints - the same sort
+   with no comparator - flat, as it must be.
 
-AND A MEASUREMENT ERROR OF MINE, recorded because it nearly shipped this:
-the first reading was "-29.5% Ir", taken against callgrind files
-captured BEFORE the constant-divisor strength reduction landed. Bench 34
-fills its array with an LCG containing `x % 2147483647`, so most of that
-"win" was the previous commit. **A baseline binary and a baseline
-PROFILE are not the same thing** - rebuild the baseline, do not reuse
-yesterday's .out files.
+### WHAT DID NOT LAND: binding the raw scalar into the window slot
+
+The obvious next step is to skip the argv entirely: write the
+`int_type`/`float_type`/`bool` straight into the callee's window slot
+from its static C++ type. It was built in FOUR shapes and every one lost
+on the wall clock. Do not rebuild it without reading this.
+
+REACH WAS PROVEN, so none of this is a measurement of dead code:
+`MYLANG_JITSTATS` now reports `cb_prepared`/`cb_fallback`, and with the
+typed bind in, 34_sort_custom_cmp took it **2,820,290 of 2,820,290**
+comparisons.
+
+THE FOUR SHAPES, all measured against the same baseline:
+ 1. bind inlined at the call site, body shared through a file-local
+    ALWAYS-INLINE helper: **1.20x slower**;
+ 2. the same, plus a compile-time gate restricting the typed bind to raw
+    scalars: **1.22x**;
+ 3. the same, plus `ML_NOINLINE` on the body: **1.21x**;
+ 4. the whole typed entry out-of-line (`ML_NOINLINE call_typed<...>`),
+    so the hot loop sees exactly one call: **1.21x**.
+
+THE CONTROL THAT SETTLED IT, and it inverted the diagnosis: the SAME
+refactored source with the typed path disabled at compile time measured
+**0.90x** - faster than baseline - on 34_sort_custom_cmp. So the refactor
+was always the win and the typed bind was always the loss; the first
+attempt's numbers had them summed and read as one result.
+
+EVERY SIMULABLE METRIC SAID IT SHOULD BE FASTER. Cachegrind on shape 1:
+-28.2% instructions, -28% branches (122.1M -> 88.3M), D1 misses
+464,030 -> 463,098 and LL 49,031 -> 49,043 (identical), mispredicts
++2.5%. That combination - better on everything a simulator models, worse
+on the clock - is this codebase's known front-end/code-layout signature
+(see the memory note on the VM dispatch front-end regression, where a
++0.5% instruction delta was amplified 24x in wall clock). This box is
+WSL2 and has no PMU, so the front-end cannot be measured directly here;
+if someone wants to close this out properly, that is the tool needed.
+
+TWO MORE TRAPS WORTH KEEPING, both cost real time:
+ - **The gate is `fast_bind`, and the callee's INFERRED TYPES never
+   enter it.** The first version gated on `ParamDesc::proven_type` and
+   engaged ZERO times, for a structural reason: `proven_type` is stamped
+   only for a function NEVER USED AS A VALUE, and a callback is by
+   definition a function used as a value.
+ - **A baseline BINARY and a baseline PROFILE are not the same thing.**
+   The first reading, "-29.5% Ir", was taken against callgrind `.out`
+   files captured before the constant-divisor strength reduction landed;
+   bench 34 fills its array with an LCG containing `x % 2147483647`, so
+   most of that "win" belonged to the previous commit.
+
+### An unrelated observation, NOT chased
+
+A `float`-annotated callback param does not appear to receive a coerced
+float: with the `fast_bind` gate REMOVED (so the coercion is skipped
+entirely), `map(func(float x) => x / 2, <array of ints>)` still prints
+0.5, and a `dyn` global assigned from such a param reads back as an INT
+on the CORRECT path too. It behaves identically on the pre-existing
+boxed path, so it is not the callback work's doing - but it means a
+value assertion on that decline is vacuous, and the `-rt` case pins it
+on the counter only and says so.
+

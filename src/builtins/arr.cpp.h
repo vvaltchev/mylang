@@ -182,9 +182,7 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
 
     for (int_type i = 0; i < n; i++) {
 
-        const EvalValue iv(i);
-        const EvalValue r = inv.ready() ? inv.invoke(&iv, 1)
-                                        : eval_func(ctx, funcObj, iv);
+        const EvalValue r = inv.call(i);
 
         if (mode == 0) {
             if (r.is<int_type>()) {
@@ -777,9 +775,7 @@ builtin_find_arr(const SharedArrayObj &arr,
 
         for (size_type i = 0; i < n; i++) {
 
-            const EvalValue e = arr_elem_at(arr, i);
-            const EvalValue r = inv.ready() ? inv.invoke(&e, 1)
-                                            : eval_func(ctx, *key, e);
+            const EvalValue r = inv.call(arr_elem_at(arr, i));
             if (r == v)
                 return static_cast<int_type>(i);
         }
@@ -1012,22 +1008,19 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
          * the unboxed int/float vector when flat - no promotion.
          */
         /* Prepared per-loop invoker (VmInvoker, vm.h): the comparator frame
-         * is pushed once; each comparison rebinds two slots. Falls back to
-         * eval_func when unavailable (tree-walk / const-eval). */
+         * is pushed once; each comparison rebinds two slots. `call` picks
+         * the tier itself (prepared window / eval_func) and boxes each
+         * argument ONCE, so each arm below hands it the elements in their
+         * NATIVE storage type - the shared `cmp2(EvalValue, EvalValue)`
+         * helper this replaced boxed a flat int comparison's operands
+         * twice, once for its own parameters and again into the argv. */
         VmInvoker inv(ctx, funcObj);
-        auto cmp2 = [&](const EvalValue &a, const EvalValue &b) {
-            if (inv.ready()) {
-                const EvalValue argv[2] = { a, b };
-                return inv.invoke(argv, 2).is_true();
-            }
-            return eval_func(ctx, funcObj, make_pair(a, b)).is_true();
-        };
 
         switch (arr.skind()) {
             case SharedArrayObj::Storage::ints: {
                 auto &v = arr.flat_ints();
                 comparator_heapsort(v, [&](int_type a, int_type b) {
-                    const bool lt = cmp2(EvalValue(a), EvalValue(b));
+                    const bool lt = inv.call(a, b).is_true();
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1035,7 +1028,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
             case SharedArrayObj::Storage::floats: {
                 auto &v = arr.flat_floats();
                 comparator_heapsort(v, [&](float_type a, float_type b) {
-                    const bool lt = cmp2(EvalValue(a), EvalValue(b));
+                    const bool lt = inv.call(a, b).is_true();
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1043,22 +1036,23 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
             case SharedArrayObj::Storage::bools: {
                 auto &v = arr.flat_bools();
                 comparator_heapsort(v, [&](unsigned char a, unsigned char b) {
-                    const bool lt = cmp2(EvalValue(static_cast<bool>(a)),
-                                         EvalValue(static_cast<bool>(b)));
+                    const bool lt = inv.call(static_cast<bool>(a),
+                                             static_cast<bool>(b)).is_true();
                     return reverse ? !lt : lt;
                 });
                 break;
             }
             case SharedArrayObj::Storage::strs: {
                 /* Directly over the SharedStr vector - stays flat, no
-                 * promote (see the no-cmp strs note). Each compare boxes
-                 * two handle copies for the callback. */
+                 * promote (see the no-cmp strs note). Each compare copies
+                 * two handles for the callback (a SharedStr is move-only,
+                 * so the copy is explicit). */
                 auto &v = arr.flat_strs();
                 comparator_heapsort(v,
                                     [&](const SharedStr &a,
                                         const SharedStr &b) {
-                    const bool lt = cmp2(EvalValue(SharedStr(a)),
-                                         EvalValue(SharedStr(b)));
+                    const bool lt = inv.call(SharedStr(a),
+                                             SharedStr(b)).is_true();
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1078,7 +1072,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
 
                 comparator_heapsort(vec,
                                     [&](const LValue &a, const LValue &b) {
-                    const bool lt = cmp2(a.get(), b.get());
+                    const bool lt = inv.call(a.get(), b.get()).is_true();
                     return reverse ? !lt : lt;
                 });
                 break;
