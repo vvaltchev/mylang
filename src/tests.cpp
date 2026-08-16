@@ -16744,6 +16744,118 @@ struct VmOpCounts {
 
 static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c);
 
+/*
+ * `--strict` (step 7): every non-local must be DECLARED ABOVE its first use.
+ * Each case is compiled TWICE - with the flag off and on - because the point
+ * of the option is the DIFFERENCE. A case that is refused either way, or
+ * accepted either way, tests nothing about it.
+ */
+static bool strict_forward_decl_shapes()
+{
+    struct Case {
+        const char *what;
+        std::vector<const char *> lines;
+        bool strict_refuses;
+    };
+
+    const Case cases[] = {
+        /* the plan's two examples: correct today, refused under --strict */
+        { "a function body reads a global declared below",
+          { "func fetch() { return g; }",
+            "var g = 5;",
+            "var dyn t = fetch();" }, true },
+        { "two hops - helpers at the top, configuration at the bottom",
+          { "func total(a) { return a + base; }",
+            "func run() { return total(1); }",
+            "var base = 100;",
+            "var t = run();" }, true },
+        /* the same programs, reordered - accepted by both */
+        { "the same global, declared first",
+          { "var g = 5;",
+            "func fetch() { return g; }",
+            "var t = fetch();" }, false },
+        /*
+         * FUNC and STRUCT names are exempt: they bind at SCOPE ENTRY (#134),
+         * so a forward call is not a forward reference. Requiring definition
+         * order there would forbid mutual recursion and buy nothing.
+         */
+        { "a forward FUNCTION name is exempt",
+          { "func a() { var r = b(); return r; }",
+            "func b() { return 7; }",
+            "var t = a();" }, false },
+        { "mutual recursion is exempt (it cannot be ordered at all)",
+          { "func ev(n) { if (n == 0) { return 1; } var r = od(n-1);"
+            " return r; }",
+            "func od(n) { if (n == 0) { return 0; } var r = ev(n-1);"
+            " return r; }",
+            "var t = ev(4);" }, false },
+        { "a forward STRUCT name is exempt",
+          { "func mk() { var p = P(1); return p.v; }",
+            "struct P { int v; }",
+            "var t = mk();" }, false },
+        /*
+         * A LAZY builtin's argument is a question ABOUT the name, not a use of
+         * its value - and asking is exactly how a program copes with an order
+         * it cannot fix, so --strict must not refuse it. (NOTE `isbound` is
+         * deliberately NOT exempt from FIX-1, so this needs a signal wider
+         * than the one that check uses - see EscapedRef::lazy_any.)
+         */
+        { "isbound() of a later global is exempt",
+          { "func p() { var r = isbound(g); return r; }",
+            "var x = p();",
+            "var g = 5;" }, false },
+        { "defined() of a later global is exempt",
+          { "func p() { var r = defined(g); return r; }",
+            "var x = p();",
+            "var g = 5;" }, false },
+    };
+
+    const bool saved = g_strict_mode;
+    bool ok = true;
+
+    for (const Case &c : cases) {
+        for (int strict = 0; strict < 2 && ok; strict++) {
+
+            g_strict_mode = strict != 0;
+
+            std::string src;
+            for (size_t i = 0; i < c.lines.size(); i++) {
+                if (i) src += '\n';
+                src += c.lines[i];
+            }
+
+            bool refused = false;
+            try {
+                std::vector<Tok> toks;
+                lexer(src, 1, toks);
+                ParseContext pc(TokenStream(toks), true);
+                unique_ptr<Construct> root = pBlock(pc);
+                mark_implicit_globals(root.get(), {});
+                infer_types(root.get());
+                resolve_names(root.get());
+            } catch (const UseBeforeBindingEx &) {
+                refused = true;
+            } catch (const Exception &e) {
+                fprintf(stderr, "strict: '%s' threw %s unexpectedly\n",
+                        c.what, e.name);
+                ok = false;
+                continue;
+            }
+
+            const bool expect = strict && c.strict_refuses;
+            if (refused != expect) {
+                fprintf(stderr, "strict: '%s' (strict=%d): %s, expected %s\n",
+                        c.what, strict, refused ? "refused" : "accepted",
+                        expect ? "refused" : "accepted");
+                ok = false;
+            }
+        }
+    }
+
+    g_strict_mode = saved;
+    return ok;
+}
+
 static bool codegen_counts(const std::vector<const char *> &lines,
                            VmOpCounts &c)
 {
@@ -27051,6 +27163,8 @@ static const std::vector<extra_check> extra_checks =
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
+    { "opt: --strict requires a non-local to be declared first",
+      strict_forward_decl_shapes },
     { "builtins: dev-only show() reserved in a script",
       dev_builtin_reserved_in_script },
     { "builtins: lazy-arg builtins are not values in a script (F1)",

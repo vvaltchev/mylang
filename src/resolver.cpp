@@ -1324,8 +1324,11 @@ public:
          * invariant (RULE 2).
          */
         if (!repl_mode)
-            if (auto *rb = dynamic_cast<Block *>(root))
+            if (auto *rb = dynamic_cast<Block *>(root)) {
+                if (g_strict_mode)      /* --strict: FIX-2's original shape */
+                    strict_forward_globals(rb);
                 prove_unbound_calls(rb);
+            }
 
         /* Promote write-once scalar vars to constants and fold (uses the write
          * counts just collected; the top-level frame's in main_st.writes).
@@ -1335,6 +1338,72 @@ public:
     }
 
 private:
+
+    /*
+     * `--strict` (step 7): EVERY NON-LOCAL MUST BE DECLARED ABOVE ITS FIRST
+     * USE. This is FIX-2 in its original shape, kept behind a flag because it
+     * is too aggressive to impose on everyone - it refuses programs that are
+     * CORRECT today, not merely risky ones:
+     *
+     *     func total(a) { return a + base; }
+     *     func run() { return total(1); }
+     *     var base = 100;
+     *     print(run());                    # 101 by default, REFUSED here
+     *
+     * That is the ordinary "helpers at the top, configuration at the bottom"
+     * layout, so the cost is real and recurring - which is exactly why it is
+     * opt-in. What it buys is that `UnboundSymbolEx` becomes UNREACHABLE: with
+     * every global declared before any function that mentions it, no call can
+     * find one unbound.
+     *
+     * FUNCTION and STRUCT names are NOT subject to it. They bind at SCOPE
+     * ENTRY (#134), so a forward call is not a forward reference at all -
+     * requiring definition order there would forbid mutual recursion and buy
+     * nothing.
+     *
+     * It reuses `escaped_refs`, which already holds every function-body
+     * reference to an outer name, so this is a comparison of two source
+     * positions and not a second analysis.
+     */
+    void strict_forward_globals(Block *rb)
+    {
+        std::unordered_map<const UniqueId *, Loc> decl_at;
+
+        for (auto &e : rb->elems) {
+            auto *ex = dynamic_cast<Expr14 *>(e.get());
+            if (!ex || !(ex->fl & pFlags::pInDecl))
+                continue;
+            auto *lv = dynamic_cast<Identifier *>(ex->lvalue.get());
+            if (lv && lv->sym.kind == SymKind::global)
+                decl_at.emplace(lv->uid, lv->start);
+        }
+
+        if (decl_at.empty())
+            return;
+
+        for (const EscapedRef &er : escaped_refs) {
+
+            Identifier *id = er.id;
+
+            /* a lazy builtin's argument is a question ABOUT the name, not a
+             * use of its value - `isbound(g)` is how a program copes with a
+             * name it cannot order above itself */
+            if (id->sym.kind != SymKind::global || er.lazy_any)
+                continue;
+
+            auto it = decl_at.find(id->uid);
+            if (it == decl_at.end())
+                continue;               /* a func/struct name: exempt */
+
+            const Loc &d = it->second;
+            if (d.line > id->start.line
+                    || (d.line == id->start.line && d.col > id->start.col))
+                throw UseBeforeBindingEx(
+                    intern_msg("--strict: '" + std::string(id->get_str())
+                               + "' is used before its declaration"),
+                    id->start, id->end);
+        }
+    }
 
     /* ------------------------------------------------------------------
      * STEP 7 tier 2 - THE PROVER: a call that is GUARANTEED to raise
@@ -1570,6 +1639,15 @@ private:
         bool lazy_arg;          /* the use is a LAZY builtin's argument
                                  * (defined/isconst/isconstdecl): a question
                                  * about the name, never a read */
+        bool lazy_any;          /* the use is ANY lazy builtin's argument,
+                                 * `isbound` INCLUDED. Wider than lazy_arg on
+                                 * purpose: isbound(zz) on a name declared
+                                 * NOWHERE is still a FIX-1 error (there is
+                                 * nothing for it to be bound to), but
+                                 * isbound(g) is not a USE of g's value, so
+                                 * --strict must not demand g be declared
+                                 * above it - that call is precisely how a
+                                 * program copes with the order it cannot fix */
     };
 
     /* Set while walking a lazy builtin's arguments - see the CallExpr walk. */
@@ -1961,7 +2039,7 @@ private:
             escaped.insert(id->uid);
             escaped_refs.push_back(
                 EscapedRef{ id, declared_in_live_scopes(cur, id->uid),
-                            no_undef_check });
+                            no_undef_check, no_tdz_check });
             return;
         }
 

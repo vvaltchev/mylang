@@ -93,6 +93,10 @@ enum OptPass : unsigned {
 /* Bitmask of DISABLED passes; 0 (the default) = everything on. */
 extern unsigned g_opt_disabled;
 
+/* `--strict`: every non-local must be declared above its first use (step 7's
+ * opt-in half - see strict_forward_globals in resolver.cpp). */
+extern bool g_strict_mode;
+
 /* Map a CLI name ("licm", "slice-hoist", "for-range", "typed", "all") to its
  * bit. Returns false for an unknown name. `names` for --help/diagnostics. */
 bool opt_pass_bit(const std::string &name, unsigned &bit);

@@ -223,6 +223,8 @@ void help()
     cout << "  -ni      No function inlining (debug)" << endl;
     cout << "  --no-opt L  Disable AST transforms (comma-separated): "
          << opt_pass_names() << endl;
+    cout << "  --strict Require every non-local to be DECLARED before use"
+         << endl;
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
          << endl;
     cout << "  -nr      Don't run, just validate" << endl;
@@ -404,6 +406,10 @@ parse_args(int argc, char **argv)
                     one += spec[i];
                 }
             }
+
+        } else if (!strcmp(arg, "--strict")) {
+
+            g_strict_mode = true;
 
         } else if (!strcmp(arg, "-it")) {
 
