@@ -844,3 +844,100 @@ boxed path, so it is not the callback work's doing - but it means a
 value assertion on that decline is vacuous, and the `-rt` case pins it
 on the counter only and says so.
 
+
+## WHERE 76_funcval_dispatch (11.1x) AND 63_closures (10.6x) ACTUALLY SPEND
+## THEIR TIME (measured 2026-08-14)
+
+Both were profiled with callgrind at `OPT=1 ASSERTS=0`, per-iteration
+figures taken as the scale-1 vs scale-3 DELTA so compile time is
+excluded. `MYLANG_JITSTATS` was read on both first, because the
+interesting result is what it RULES OUT.
+
+### THE DISPATCH TIERS ARE ALREADY OPTIMAL - THIS IS NOT A JIT GAP
+
+76_funcval_dispatch, 1,000,000 iterations:
+
+    sync_inline      999999      arg_inplace      999999
+    callee_cache     499999      callee_cache2    499999
+    ref_arg_binds    999999      bind_coerce      0
+    divmagic        1000000      arg_stage        1
+
+Every call takes the inline sync tier; #162's in-place reference
+argument binding fires on every call; the 2-entry polymorphic callee
+cache hits every time (the target alternates, so both entries are
+live). There is no tier left to reach. 63_closures is the same picture
+(`callee_cache` 999995 of 1M).
+
+**So the remaining cost is the VALUE MODEL, not dispatch** - which is
+task #60's territory, and it is why neither bench moved when the call
+protocol did.
+
+### 76: 600 Ir PER ITERATION, against ~10 for the C++ twin
+
+    jit_load_elem_value                 39   \  reading ops[i % 2]
+    arr_elem_at                         25   |  and boxing the
+    TypeImpl<FuncObject>::move_assign   14   |  FuncObject handle
+    LValue::put(EvalValue&&)            25   /  into `fn`      = 103
+    jit_bind_ref_arg                    26   \  binding `st`
+    TypeImpl<SharedArrayObj>::copy_asgn 18   /  (a retain)     =  44
+    jit_release_slot                    30      the matching releases
+    ------------------------------------------------------------
+    helpers                            177  (29.5%)
+    emitted native code               ~277  (46%) - the inline call
+                                                    guard sequence
+
+C++ loads a function pointer and calls it. MyLang boxes a refcounted
+handle out of an array, stores it in a slot (retain + release), retains
+the array argument, calls, and releases both.
+
+### 63: 1816 Ir PER ITERATION (2 closure creations + 3 calls)
+
+    FuncObject::FuncObject (3 inlined copies)  198   \ closure
+    jit_make_closure (2 copies)                 82   / creation = 280
+    jit_ret_norec                              146     ~49 per return
+    EvalValue::operator=(&&)                   120
+
+FuncObject already has `ML_POOL_NEW_DELETE`, so this is NOT malloc -
+it is the per-closure field/capture-slot setup, paid twice an
+iteration. (The `__dynamic_cast` + `__strcmp_avx2` in the scale-1
+profile are COMPILE time - they stay constant at scale 3.)
+
+### THE TWO LEVERS, AND THEY NEED THE SAME NEW ANALYSIS
+
+Both of 76's big items are blocked on the same missing fact: **what a
+CALLEE can do to what it is handed.**
+
+ 1. **A non-escaping reference argument should bind with NO retain.**
+    For a SYNC call the caller's slot holds the reference for the whole
+    call, so the callee's slot needs its own reference only if the
+    reference can OUTLIVE the call - stored into a global, a container,
+    a struct field, a closure capture, or returned. `add_op(st, x)`
+    only subscripts `st`; it cannot escape. Worth ~74 Ir on 76 (12%),
+    and it generalises to every `compute(arr)` / `process(data)` call
+    in the language.
+ 2. **A func value read out of a never-written array should be
+    BORROWED, not boxed.** `ops[i % 2]` immediately feeds a call; the
+    LoadElem2 precedent (borrow the row, consume it inside one op)
+    applies - EXCEPT that here real user code runs in between, so the
+    borrow is only sound if the callee cannot mutate `ops` and drop the
+    last reference to the function being executed. Worth ~103 Ir (17%).
+
+Together they take 76 from **11.1x to roughly 7.6x**. 63 needs the
+closure-creation path as well (280 Ir, 15%) to reach 8x, and its
+remaining half is the call/return protocol itself.
+
+**The shared prerequisite is a per-function ESCAPE/MUTATION SUMMARY** -
+for each parameter and each reachable global, can this function (or
+anything it calls) let it escape, or mutate it? `func_mutates_input`
+(resolver.cpp) already computes the mutation half for purity over a
+taint analysis; this is its transitive, escape-aware sibling, and it
+would want to live beside it and be stamped on the FuncDescriptor.
+
+⛔ THAT IS A NEW WHOLE-PROGRAM ANALYSIS WITH A USE-AFTER-FREE FAILURE
+MODE, so it is NOT started unilaterally - it needs the maintainer's
+sign-off on the design before any code. One contained piece needs no
+new analysis and could go first as a warm-up, though it is small: the
+per-argument bind type-check emitted at every call site is provably
+dead here (`bind_coerce` and `bind_widen` are BOTH 0 across 1,000,000
+calls, because the value-template instance's params are typed and the
+arguments' static types already match), worth ~3%.
