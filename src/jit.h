@@ -334,6 +334,18 @@ void jit_cache_audit_report();
  * spend. Exported for jit_telide_c3, which must build a program with
  * MORE hot int locals than this or it exercises nothing. */
 size_t jit_pin_budget();
+
+/*
+ * #96: ROTATE the caller-saved pin pool so member N is handed out
+ * FIRST (env MYLANG_JIT_XROT=N; settable in-process so a test can
+ * sweep it). take_reg scans the pool in preference order, so its LAST
+ * member is reached only by a run with the maximum pin count - which
+ * is how an UNSAFE register sat in the pool for a day, exercised by
+ * nothing (the r9 bug; see XCACHE_ORDER in jit.cpp). Rotating makes
+ * every member take the first-choice traffic.
+ */
+extern unsigned g_jit_xrot;
+size_t jit_xcache_width();
 /*
  * REACH (env MYLANG_JITSTATS=1): print the emitted-code counters after a
  * script run - which TIER each shape actually took, on a real program.

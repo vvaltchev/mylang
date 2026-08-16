@@ -496,6 +496,52 @@ exactly the moment a cross-check between them stops being evidence -
 re-derive at least one check from the SPEC.** Same family as "a test
 derived from a table can never find a hole in that table".
 
+**⛔ A POOL ORDERED BY PREFERENCE HIDES ITS OWN TAIL - AND THE SIXTH
+SHAPE ATE THE TOOL BUILT TO PREVENT IT (#96, 2026-08-17).** r9 was added
+to the JIT's caller-saved pin pool on 2026-08-16 and was a **shipping
+wrong answer for a day**. The comment that added it claimed "r9 is used
+in exactly TWO local scopes and both are already safe". False: r9 is raw
+scratch in the CAPTURE ops and in every element tier
+(`emit_elem_int_read`, `emit_store_elem_inline`,
+`emit_load_elem2_inline`, `emit_store_elem2_inline`, `ForStepElemInt`) -
+about 80 sites outside any `emit_call_prologue` bracket. Twelve lines
+reproduce it: eight hot int accumulators in a closure loop plus
+`s7 += cap` prints **56640** under `-tw`/`-nj` and **88854283473440**
+under the JIT, because the entry emits `mov r9, s5` and
+`emit_ctx_chain_r9` then walks the ctx through r9.
+
+Three separate failures let that ship, and each earns a rule:
+
+- **THE CENSUS WAS BLIND TO ITS OWN SUBJECT.** `scripts/regcensus.py`
+  reported **14** sites for r9; the true figure is ~87. The misses are
+  `movabs_r9`, `cmp_r9_rdx`, `lea_rdi`, `slots_to_arg0`,
+  `store_elem_byte_dil` - the register is in the **METHOD NAME**, so a
+  scan for the operand cannot see it. This is *exactly* the sixth
+  audit-table shape recorded above, hit by the tool written to keep the
+  arc honest. It now **DERIVES** the accessor set from the source (every
+  `void name(` whose name, split on `_`, contains a register token) - so
+  a new fixed-pair wrapper is counted the day it is written. **When an
+  audit tool and your intuition disagree about a register, suspect the
+  tool's blind spot before the intuition.**
+- **THE POOL'S PREFERENCE ORDER IS A COVERAGE HOLE.** `take_reg` scans
+  the pool in order, so the LAST member is handed out only to a run with
+  the maximum pin count. r9 was 4th of 4, so `-rt`, all four
+  differentials, `corpus_diff`, and every fuzzer exercised the first
+  three heavily and r9 essentially never. A bigger corpus does not fix
+  this - the allocator's own preference is what hides the tail.
+  **`MYLANG_JIT_XROT=N` rotates the pool** so member N is handed out
+  first; `corpus_diff.sh --xrot` runs the matrix, and the
+  `jit_xcache_pins` `-rt` case sweeps every rotation in-process. Making
+  r9 FIRST fails `-rt` in seconds - which is how it was found.
+  **Generalise: when a resource is allocated in a fixed preference
+  order, the test net must permute that order.**
+- **"SAFE BY THE SAME GATES AS X" IS NOT AN ARGUMENT.** r9 was admitted
+  by analogy to r10/r11. A register joins only with its OWN sites
+  enumerated against the gates. r8, audited that way, is genuinely safe
+  (its raw-scratch use is confined to `emit_sync_push_native`,
+  `emit_sync_call_inline` - both blocked by `jit_run_blocks_xcache` -
+  and `emit_ret_native`, whose first act is `flush_cache()`); r9 is not.
+
 **⛔ A FRAGMENT RETURN MUST NAME ITS WRITE-BACK CONTRACT (#96,
 2026-08-16).** The N5/C2a register cache holds frame slots in registers
 between an entry load and an exit flush, so a `ret` that leaves one
@@ -609,6 +655,15 @@ collision). Three nets now:
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
   matrix runs against the CORPUS, not the suite.
+- **`MYLANG_JIT_XROT=N` - ROTATE the caller-saved pin pool** so member
+  N is handed out FIRST (`tests/corpus_diff.sh BIN --xrot` runs the
+  matrix; `g_jit_xrot` is settable in-process, and `jit_xcache_pins`
+  sweeps every rotation). `take_reg` scans the pool in PREFERENCE
+  order, so its last member is reached only by a run with the maximum
+  pin count - which is how an UNSAFE register (r9) sat in the pool for
+  a day, exercised by no net in the project, as a wrong answer. Unlike
+  a lever switch this is not an A/B: every rotation must produce the
+  SAME output, so it is a pure differential axis.
 - **`MYLANG_JIT_FORCE=lever[,...]`** - ignore a lever's COST heuristic
   but NOT its soundness guards, so it engages in shapes it would
   normally decline as unprofitable. This is the half with real catch
