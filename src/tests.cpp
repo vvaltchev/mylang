@@ -1187,6 +1187,28 @@ static const std::vector<test> tests =
 
     {
         /*
+         * G1: the emitted call site no longer probes `defined` before reading
+         * a global callee slot - an UNBOUND slot holds the default `none`,
+         * which the type test declines, and the C++ tier then raises this
+         * exactly as it always did (GlobalFuncTable::define, eval.h, is what
+         * keeps the store and the mark inseparable).
+         *
+         * `fn` is a top-level VAR declared after the function that calls it,
+         * so its slot is still unbound when `run` executes. A top-level
+         * FUNCTION would not do: those are bound before main's body runs, so
+         * `print(later())` ahead of `func later()` simply works.
+         */
+        "jit: an unbound global callee still raises UndefinedVariableEx",
+        {
+            "func run() { var r = fn(); return r; }",
+            "var t = run();",
+            "var fn = func() { return 1; };",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
+        /*
          * G1: a parameter declared `int`/`float` needs coerce_to_decl_type at
          * bind, which used to decline the whole call to the C++ tier. The
          * emitted push now checks, before any mutation, that the argument

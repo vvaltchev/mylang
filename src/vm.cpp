@@ -3391,9 +3391,7 @@ extern "C" void jit_store_global(int_type gslot,
                                  const EvalValue *src) noexcept
 {
     ML_JIT_OP_RAN(StoreGlobalV);
-    GlobalFuncTable *g = g_current_ctx->gfuncs;
-    g->slots[gslot].put(RValue(*src));
-    g->defined[gslot] = 1;
+    g_current_ctx->gfuncs->put_defined(gslot, RValue(*src));
 }
 
 /* model-flip (nativize-ops): the native StoreCaptureV PLAIN `cap = <expr>` - the
@@ -4422,8 +4420,7 @@ extern "C" void jit_decl_const(int_type dst, int_type is_global,
     if (!is_global) {
         ctx->frame->at(dst) = LValue(std::move(v), true);
     } else {
-        ctx->gfuncs->slots[dst] = LValue(std::move(v), true);
-        ctx->gfuncs->defined[dst] = 1;
+        ctx->gfuncs->define(dst, LValue(std::move(v), true));
     }
 }
 
@@ -6789,6 +6786,17 @@ extern "C" int jit_call_sync(int_type callee_slot, int_type ab_n,
     const int_type argbase = ab_n & 0xffffffff;
     const int_type nargs = ab_n >> 32;
     EvalContext *ctx = g_current_ctx;
+    /*
+     * THE INVARIANT THE EMITTED PUSH RELIES ON: an undefined slot holds the
+     * default-constructed `none`, never a callable - which is why the inline
+     * call site no longer probes `defined` and simply lets the type test
+     * decline here (GlobalFuncTable::define / put_defined, eval.h). This is
+     * the natural place to check it: every decline, including every FIRST
+     * call at a site, arrives here.
+     */
+    ML_VM_CHECK(ctx->gfuncs->defined[callee_slot]
+                || !ctx->gfuncs->slots[callee_slot].get()
+                        .is<intrusive_ptr<FuncObject>>());
     if (!ctx->gfuncs->defined[callee_slot]) {
         const Chunk::LocEntry *le =
             static_cast<const Chunk::LocEntry *>(lep);
@@ -6824,6 +6832,17 @@ extern "C" int jit_call_sync_cached(int_type callee_slot, int_type ab_n,
     const int_type argbase = ab_n & 0xffffffff;
     const int_type nargs = ab_n >> 32;
     EvalContext *ctx = g_current_ctx;
+    /*
+     * THE INVARIANT THE EMITTED PUSH RELIES ON: an undefined slot holds the
+     * default-constructed `none`, never a callable - which is why the inline
+     * call site no longer probes `defined` and simply lets the type test
+     * decline here (GlobalFuncTable::define / put_defined, eval.h). This is
+     * the natural place to check it: every decline, including every FIRST
+     * call at a site, arrives here.
+     */
+    ML_VM_CHECK(ctx->gfuncs->defined[callee_slot]
+                || !ctx->gfuncs->slots[callee_slot].get()
+                        .is<intrusive_ptr<FuncObject>>());
     if (!ctx->gfuncs->defined[callee_slot]) {
         const Chunk::LocEntry *le =
             static_cast<const Chunk::LocEntry *>(lep);
@@ -9471,8 +9490,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 /* g = <expr>: write the shared global slot + mark defined -
                  * exactly slot_rmw(op==assign) (put(RValue)) + the decl's
                  * defined=1. Serves both a decl and a reassign (idempotent). */
-                lv.put(RValue(ctx.frame->at(in->a_slot()).get()));
-                ctx.gfuncs->defined[in->target] = 1;
+                ctx.gfuncs->put_defined(
+                    in->target, RValue(ctx.frame->at(in->a_slot()).get()));
             } else {
                 /* g OP= rhs / g++ (aop = the base op, rhs in `a`): a compound
                  * requires the slot already DEFINED (else UndefinedVariableEx,
@@ -9506,8 +9525,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             if (in->target2 == 0) {
                 ctx.frame->at(in->target) = LValue(std::move(v), true);
             } else {
-                ctx.gfuncs->slots[in->target] = LValue(std::move(v), true);
-                ctx.gfuncs->defined[in->target] = 1;
+                ctx.gfuncs->define(in->target, LValue(std::move(v), true));
             }
             pc++;
         }
