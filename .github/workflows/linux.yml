@@ -219,3 +219,81 @@ jobs:
       working-directory: ${{github.workspace}}/build
       shell: bash
       run: python3 $GITHUB_WORKSPACE/tests/system_smoke.py ./mylang
+
+  # ⛔ THE NON-LTO LANE. LTO defaults to OPT, so every optimized build in
+  # every other lane - and every local `make -j` - is an LTO build, and
+  # `LTO=0` (documented in CLAUDE.md as the way to get a faster/debuggable
+  # link) was compiled by NOBODY. It had been BROKEN for a day before anyone
+  # tried it.
+  #
+  # This is not a packaging nicety. GCC's `-Wclobbered` needs the ordinary
+  # per-TU pipeline to see a whole function at compile time, so an LTO build
+  # is SILENT about it - and the thing it was silent about was real
+  # undefined behaviour: `jit_str_probe_verify` read a non-volatile local
+  # after `siglongjmp`, which C17 7.13.2.1p3 leaves INDETERMINATE. Had that
+  # register come back non-zero, the probe would have reported success after
+  # faulting and the JIT would have baked a std::string layout the toolchain
+  # does not have.
+  #
+  # So the lane's real job is to run the DIAGNOSTICS that only exist without
+  # LTO. Both compilers, because their warning sets differ.
+  lto0:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build (Makefile, OPT=1 TESTS=1 LTO=0)
+      shell: bash
+      run: make -j OPT=1 TESTS=1 LTO=0 CXX=${{ matrix.cxx }}
+           BUILD_DIR=build-lto0
+
+    # Prove the lane tested what it claims. `-v` reads COMPILER-SET macros,
+    # so it cannot drift from what was compiled - without this check a
+    # future change to the LTO default would leave this job building WITH
+    # LTO and passing while proving nothing.
+    - name: Confirm LTO is actually off
+      shell: bash
+      run: |
+        ./build-lto0/mylang -v
+        ./build-lto0/mylang -v | grep -qE "^  lto +0" \
+          || { echo "FAIL: this lane did not build with LTO off"; exit 1; }
+        ./build-lto0/mylang -v | grep -qE "^  opt +1" \
+          || { echo "FAIL: -Wclobbered needs an optimized build"; exit 1; }
+
+    - name: Test
+      shell: bash
+      run: ./build-lto0/mylang -rt
+
+    - name: Driver - the CLI flags do what they say
+      shell: bash
+      run: tests/driver_checks.sh ./build-lto0/mylang
+
+    # A no-TESTS, assert-free build is the shape a user ships, and is also
+    # where a declaration that escaped a TESTS guard shows up.
+    - name: Build the shipping shape too (OPT=1 ASSERTS=0 LTO=0)
+      shell: bash
+      run: |
+        make -j OPT=1 ASSERTS=0 TESTS=0 LTO=0 CXX=${{ matrix.cxx }} \
+             BUILD_DIR=build-lto0-ship
+        ./build-lto0-ship/mylang -v
+        python3 tests/system_smoke.py ./build-lto0-ship/mylang
+
+    # The other build system has its own LTO knob; a fix to one must not
+    # leave the other broken. CMake is also what CI runs everywhere else,
+    # and `make` alone has passed configurations it breaks before.
+    - name: CMake with -DLTO=OFF
+      shell: bash
+      run: |
+        cmake -E make_directory cmb-lto0
+        cd cmb-lto0
+        cmake -DTESTS=1 -DLTO=OFF -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} $GITHUB_WORKSPACE
+        cmake --build . --config Release
+        ./mylang -v
+        ./mylang -v | grep -qE "^  lto +0" \
+          || { echo "FAIL: CMake -DLTO=OFF did not disable LTO"; exit 1; }
+        ./mylang -rt

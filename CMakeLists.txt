@@ -183,7 +183,25 @@ if (LTO AND NOT GCOV AND NOT CMAKE_VERSION VERSION_LESS "3.9")
                    PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
       set_property(TARGET mylang
                    PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+      set(ml_lto_on TRUE)
    else()
       message(STATUS "LTO requested but not supported: ${ipo_msg}")
    endif()
+endif()
+
+# Tell the binary what actually happened, so `-v` can report it. The Makefile
+# has always defined ML_LTO; CMake did not, so a CMake build answered
+# `lto unknown` - and a CI lane cannot ASSERT a config it cannot read, which
+# is exactly what the non-LTO lane needs to do to avoid going vacuous.
+#
+# A generator expression, not a plain define, because IPO here is PER-CONFIG:
+# only Release and RelWithDebInfo get it, so a multi-config generator must
+# answer differently per config. `ml_lto_on` is false whenever LTO was off,
+# GCOV was on, CMake was too old, or check_ipo_supported said no - so the
+# macro tracks the OUTCOME, never the request.
+if (ml_lto_on)
+   target_compile_definitions(mylang PRIVATE
+      $<IF:$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>,ML_LTO=1,ML_LTO=0>)
+else()
+   target_compile_definitions(mylang PRIVATE ML_LTO=0)
 endif()
