@@ -761,3 +761,50 @@ sabotage (restoring the MemberExpr span) fails it: expected 56, got 57.
 Note the convention when writing such a test: the harness checks the RAW
 `loc_end.col`, which is "last char + 2", while the renderer prints
 `loc_end.col - 1`. A caret shown as `51:55` is stored as 51..56.
+
+## G6 (#122) analysed 2026-08-06: the premise was wrong; one small win taken
+
+**75_indexed_unpack is now 400 Ir/row** (2004M at scale 1, 5M rows), down
+from 493 after G5 removed its two `str.len` calls (-16.98%). Where the 400
+go: `vm_unpack_elem_body` 69, `arr_elem_at` 68, `LValue::put` 50, the native
+fragment 53, `SharedStr::move_assign` 38, `jit_unpack_elem` 18.
+
+**THE TASK'S PREMISE WAS WRONG.** It said this was "per-op helper cost, the
+same shape as the element loads before #92/#93 got their inline tiers" - i.e.
+that #93's borrow trick applied. It does not: `vm_unpack_elem_body` ALREADY
+borrows the row,
+
+    const EvalValue &elem = outer.get_vec()[outer.offset() + idx].get();
+
+a reference, not a boxed copy. There is no row materialisation to remove,
+which was the entire basis for the comparison.
+
+**What actually remains is the VALUE MODEL**: two refcounted `SharedStr`
+binds per row. `arr_elem_at` returns `EvalValue(SharedStr(flat_strs()[at]))`
+- a handle copy, refcount++ - and `LValue::put` then releases the slot's
+previous string (refcount--) and moves the new one in. Not a missing fusion
+and not a boxed op that should be typed. The C++ twin models the same
+refcounted binds deliberately (bench-fairness class E), so the residual gap
+is real but belongs with N7, not with a standalone unpack item.
+
+**The one thing taken:** `vm_arr_elem(elem, k)` re-derived
+`elem.get_ref<SharedArrayObj>()` per element although every unpack site
+already holds the extracted array - it had to, to check the element count
+first. An overload taking `const SharedArrayObj &` removes that per-element
+tag-check + cast at four sites (the dyn-foreach N-var unpack,
+`vm_unpack_elem_body`'s two loops, and the multi-unpack, whose `get_ref` for
+`size()` is now hoisted into a local).
+
+Measured (`OPT=1 ASSERTS=0`, callgrind Ir):
+
+    73_multi_unpack     328.7M -> 321.5M   -2.19%
+    75_indexed_unpack  2004.4M -> 1989.4M  -0.75%
+    20_foreach_unpack / 74_dyn_foreach_kv / 66_dyn_foreach   -0.00%
+
+The three zeros are correct: 20 takes the flat-int branch and the two dyn
+benches iterate a DICT, so neither reaches the boxed element loop.
+
+It is a pure refactor - the same object, the same read - so there is no new
+guard to break. The sabotage that DOES mean something is a mix-up between
+the outer array and the sub-array, and the suite catches that hard: aborting
+with exit 134 under the hardened debug build.
