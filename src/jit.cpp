@@ -5985,6 +5985,26 @@ bool g_cache_audit = getenv("MYLANG_CACHEAUDIT") != nullptr;
 static std::unordered_map<int, long> g_cache_killed;   /* opcode -> kills */
 static long g_cache_pinned = 0, g_cache_lost = 0;
 
+/* #96 THE SHARING CEILING (env MYLANG_REGAUDIT=1) - see the block in
+ * pick_cached_slots. Answers "would letting two slots with disjoint live
+ * ranges share one register give any slot a register it does not have
+ * today", which decides whether interval sharing is worth building. */
+static bool g_reg_audit = getenv("MYLANG_REGAUDIT") != nullptr;
+static long g_reg_frags = 0, g_reg_cand = 0, g_reg_pinned = 0;
+static long g_reg_overflow = 0, g_reg_shareable = 0;
+static long g_reg_shareable_closed = 0;
+
+void reg_audit_report()
+{
+    if (!g_reg_audit)
+        return;
+    fprintf(stderr,
+            "REGAUDIT TOTAL frags=%ld cand=%ld pinned=%ld overflow=%ld "
+            "shareable=%ld shareable_edge_closed=%ld\n",
+            g_reg_frags, g_reg_cand, g_reg_pinned, g_reg_overflow,
+            g_reg_shareable, g_reg_shareable_closed);
+}
+
 static const char *jit_op_name(OpCode op)
 {
 #define ML_OPCODE_NAMEV(N) #N,
@@ -6122,6 +6142,7 @@ void jit_stats_report()
 
 void jit_cache_audit_report()
 {
+    reg_audit_report();
     if (!g_cache_audit)
         return;
     std::vector<std::pair<long, int>> v;
@@ -6177,9 +6198,42 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * They are NOT pushed at frag_entry: caller-saved means the C++ caller
  * expects nothing preserved, so the fragment may clobber them freely.
  */
-static const uint8_t XCACHE_REGS[] = { 10, 11 };
+/*
+ * #96: r9 joined on 2026-08-16, and the reason it is CHEAP where
+ * rax/rcx/rdx/rdi are not is worth stating - MYLANG_REGAUDIT measured
+ * the pool, not the sharing, to be the binding constraint (42 qualified
+ * candidates against 6 registers on 83_regs_int_40), so the question
+ * became "which register can join", and the answer is decided by how
+ * often the emitter hardcodes it as SCRATCH:
+ *
+ *      RAX 297   RCX 165   RDX 133   RSI 84   RDI 76   r8 42   r9 14
+ *
+ * The first four cannot join without teaching ~300 emit sites to
+ * allocate their scratch; rsi/r8 are the type singletons (plan step 5,
+ * a regression on its own). r9 is used in exactly TWO local scopes and
+ * both are already safe by the SAME gates r10/r11 rely on:
+ *   - emit_sync_push_native (the inline call record) - a run containing
+ *     a MyLang call gets no caller-saved pin at all (jit_run_blocks_
+ *     xcache), which is why r10/r11 are safe there and r9 is too;
+ *   - emit_ret_native - its FIRST act is flush_cache(), so no pin is
+ *     live past it.
+ * As a SysV argument register r9 additionally holds a 6th helper
+ * argument, which is harmless for the same reason a callee's clobber
+ * is: emit_call_prologue spills every caller-saved pin BEFORE the arg
+ * setup. jit_assert_no_volatile_pin is the standing check that no
+ * raw-scratch call site sees one.
+ */
+static const uint8_t XCACHE_REGS[] = { 10, 11, 9 };
 static const size_t MAX_XCACHED = sizeof(XCACHE_REGS) / sizeof(XCACHE_REGS[0]);
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
+/* #96: the TOTAL int pin budget, exported so a coverage test can size
+ * its program from it instead of hardcoding a margin. jit_telide_c3
+ * needs MORE hot locals than this to reach the elision tier at all, and
+ * it silently stopped doing so the moment r9 widened the pool - the
+ * improvement ate the test's shape. Deriving the count removes that
+ * whole failure mode. */
+size_t jit_pin_budget() { return MAX_CACHED + MAX_XCACHED; }
+
 static const uint8_t FCACHE_REGS[] = { 4, 5, 6, 7 };
 static const size_t MAX_FCACHED =
     sizeof(FCACHE_REGS) / sizeof(FCACHE_REGS[0]);
@@ -6886,6 +6940,106 @@ pick_cached_slots(const Chunk &ck, size_t begin,
         if (kv.first < slot_count && !disq.count(kv.first)
                 && kv.second >= 3)
             cand.push_back({ kv.second, kv.first });
+
+    /*
+     * #96 THE SHARING CEILING (env MYLANG_REGAUDIT=1). Measured BEFORE
+     * writing an allocator, because plans/jit-registers.md requires the
+     * ceiling be stated first and because the answer decides whether
+     * interval sharing is the right next increment at all.
+     *
+     * The question: of the qualified candidates that do NOT get a
+     * register today (the pool overflow), how many have a live interval
+     * DISJOINT from some pinned candidate's - i.e. could share that
+     * register instead of living in memory? Reported alongside how many
+     * of those intervals are EDGE-CLOSED (no branch in the run crosses
+     * the boundary), since only those are safely shareable without
+     * per-edge state reconciliation.
+     */
+    if (g_reg_audit) {
+        struct Iv { int slot, lo, hi; };
+        std::vector<Iv> iv;
+        for (const auto &c : cand) {
+            int lo = -1, hi = -1;
+            for (size_t p = begin; p < end; p++) {
+                std::vector<int> u2, d2;
+                Instr &i2 = const_cast<Instr &>(code[p]);
+                if (!jit_op_slot_refs(i2, u2, d2))
+                    continue;
+                bool touch = std::find(u2.begin(), u2.end(), c.second)
+                                 != u2.end()
+                          || std::find(d2.begin(), d2.end(), c.second)
+                                 != d2.end();
+                if (!touch)
+                    continue;
+                if (lo < 0)
+                    lo = static_cast<int>(p);
+                hi = static_cast<int>(p);
+            }
+            if (lo >= 0)
+                iv.push_back({ c.second, lo, hi });
+        }
+        /* EDGE-CLOSED: for every NON-SEQUENTIAL edge a -> b, the
+         * interval contains both endpoints or neither - then the
+         * register state is the same on both sides of every jump and no
+         * per-edge reconciliation is needed. Fall-through (a -> a+1) is
+         * excluded on purpose: the state is ALLOWED to change in linear
+         * order, which is exactly where an interval begins and ends.
+         *
+         * A loop-spanning interval is therefore CLOSED (the back edge
+         * has both ends inside), which a "no branch inside" proxy would
+         * wrongly reject - and did, reporting a flat zero. */
+        std::vector<std::pair<int,int>> edges;
+        for (size_t p = begin; p < end; p++) {
+            const Instr &i2 = code[p];
+            if (op_is_branch(i2.op) && i2.target >= 0
+                    && i2.target != static_cast<int>(p) + 1)
+                edges.push_back({ static_cast<int>(p), i2.target });
+        }
+        const auto closed = [&](const Iv &a) {
+            for (const auto &e : edges) {
+                const bool si = e.first  >= a.lo && e.first  <= a.hi;
+                const bool di = e.second >= a.lo && e.second <= a.hi;
+                if (si != di)
+                    return false;
+            }
+            return true;
+        };
+        const size_t pinned = cand.size() < max_pins ? cand.size() : max_pins;
+        long shareable = 0, shareable_closed = 0;
+        for (size_t i = pinned; i < iv.size() && i < cand.size(); i++) {
+            /* iv is in `cand` order only if every candidate had a touch;
+             * find this overflow candidate's interval by slot */
+            const Iv *me = nullptr;
+            for (const Iv &x : iv)
+                if (x.slot == cand[i].second) { me = &x; break; }
+            if (!me)
+                continue;
+            for (size_t j = 0; j < pinned; j++) {
+                const Iv *pin = nullptr;
+                for (const Iv &x : iv)
+                    if (x.slot == cand[j].second) { pin = &x; break; }
+                if (!pin)
+                    continue;
+                if (me->hi < pin->lo || pin->hi < me->lo) {
+                    shareable++;
+                    if (closed(*me) && closed(*pin))
+                        shareable_closed++;
+                    break;
+                }
+            }
+        }
+        g_reg_frags++;
+        g_reg_cand += static_cast<long>(cand.size());
+        g_reg_pinned += static_cast<long>(pinned);
+        g_reg_overflow += static_cast<long>(cand.size() - pinned);
+        g_reg_shareable += shareable;
+        g_reg_shareable_closed += shareable_closed;
+        if (cand.size() > pinned)
+            fprintf(stderr, "REGAUDIT frag[%zu,%zu) cand=%zu pinned=%zu "
+                    "overflow=%zu shareable=%ld closed=%ld\n",
+                    begin, end, cand.size(), pinned, cand.size() - pinned,
+                    shareable, shareable_closed);
+    }
     std::sort(cand.begin(), cand.end(),
               [](const std::pair<int,int> &a, const std::pair<int,int> &b) {
                   return a.first != b.first ? a.first > b.first

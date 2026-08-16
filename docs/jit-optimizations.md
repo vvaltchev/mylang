@@ -5340,3 +5340,75 @@ the corpus - the oracle for "this refactor changed nothing", with the
 four normalisation traps recorded in its header) and
 `scripts/sabotage.sh` (apply a defect, rebuild, run a check, always
 restore; exit 1 means the check PASSED, i.e. the test is blind).
+
+## #96 - r9 joins the pool (6 -> 7), and the measurement that redirected it
+
+**The ceiling was measured BEFORE any allocator code was written**, as
+plans/jit-registers.md requires, via a new env-gated audit
+`MYLANG_REGAUDIT=1` in `pick_cached_slots`. Over bench/my + samples +
+tests/functional: 127 fragments, 332 qualified int candidates, 220
+pinned, **112 with no register**, of which 35 have a live interval
+disjoint from some pinned candidate's - and **0** are edge-closed.
+
+So the obvious next increment, letting two slots with disjoint live
+ranges SHARE a register, would give a register to **no slot anywhere in
+the corpus**. Two reasons, the second general:
+
+  - the `8N_regs_int_*` family reports `shareable=0` outright: every
+    accumulator is updated every iteration, so the live ranges all span
+    the loop and overlap completely. Sharing cannot help the very
+    benches written to exercise register pressure;
+  - where intervals ARE disjoint (68_nested: 41 candidates, 4 pinned,
+    34 disjoint) none is edge-closed, because a fragment containing
+    `if`s has forward branches over nearly every interior point.
+
+Sharing therefore needs real edge reconciliation - moves inserted on
+control-flow edges - not the cheap "edge-closed intervals" rule. Large
+machine, measured-zero benefit on today's corpus; not built.
+
+**What the audit says instead: the POOL is the binding constraint** (42
+candidates against 6 registers on 83_regs_int_40). Which register can
+join is decided by how often the emitter hardcodes it as scratch:
+
+    RAX 297   RCX 165   RDX 133   RSI 84   RDI 76   r8 42   r9 14
+
+r9 is used in exactly two local scopes and both are already safe under
+the gates r10/r11 rely on - `emit_sync_push_native` (a run containing a
+MyLang call gets no caller-saved pin at all) and `emit_ret_native`
+(whose first act is `flush_cache()`). As a SysV argument register it can
+also hold a 6th helper argument, which is harmless because
+`emit_call_prologue` spills every caller-saved pin BEFORE the arg setup.
+
+**MEASURED, and it is the corrected cost model verbatim:**
+
+  - execution-proven: `mov r9, a4` in the emitted entry - a local that
+    used to live in memory now has a register;
+  - loop instruction count **byte-identical** - the scale3-minus-scale1
+    delta is 328,000,022 on both sides of 80_regs_int_08, and the whole
+    +0.24% whole-program Ir is a FIXED 496,237-instruction compile-time
+    delta, identical at both scales;
+  - loop data references **-20.0%** on 80_regs_int_08, -2.7% on
+    83_regs_int_40;
+  - wall clock **1.009x** over the seven affected benches, i.e. flat
+    inside this box's ~5.8% same-binary spread.
+
+A register removes traffic, not work. This is a PREREQUISITE for the
+instruction lever A can then delete, exactly as the r10/r11 extension
+was - and it is banked as such, not as a win.
+
+### The test the improvement ate
+
+`jit_telide_c3` declared six hot locals to overflow a 4-wide pool and
+reach the type-elision tier. With the pool at 7 they all got REGISTERS,
+nothing was elided, and it failed with *"no type-elided fragment ever
+entered"*. Not a miscompile - a coverage test whose shape the
+improvement consumed, the vacuous-test trap running in reverse.
+
+Fixed by DERIVING the program from the pool: `jit_pin_budget()` is
+exported and the test generates `budget + 3` accumulators, so widening
+the pool can never make it vacuous again. Its expected value could then
+no longer be a hardcoded constant, and the oracle is now the program's
+SPEC recomputed in C++ (same sequential order, same int_type
+wraparound) - not a second engine, since a script's runtime symbol map
+is asserted empty and the tree-walker cannot be driven in-process from
+a test.
