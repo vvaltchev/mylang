@@ -371,6 +371,43 @@ This holds for every declaration (`var`, `const`, `func`, `struct`), and whether
 or not the condition is a compile-time constant. Declare the name *above* the
 statement if you need it afterwards.
 
+**A declaration's name exists for the whole scope; its value binds when the
+declaration runs.** Reading it in between is refused - what JavaScript calls
+the *temporal dead zone*:
+
+```C#
+func f() {
+    var r = t;          # ERROR: 't' is used before its declaration
+    var t = 5;
+    return r;
+}
+```
+
+This holds even when an outer name of the same spelling exists - the inner
+declaration wins for the whole scope, so the earlier read is a mistake rather
+than a silent read of the outer one. Put the shadowing declaration in a nested
+scope if that is what you meant:
+
+```C#
+var loc = 99;
+func f() { var r = loc; { var loc = 5; ... } return r; }   # r == 99
+```
+
+**Functions and structs are different: they bind immediately**, so calling one
+declared further down - and mutual recursion - keep working.
+
+Where the compiler *cannot* decide, the check happens at run time and is
+catchable. A function body reading a global may run at any moment:
+
+```C#
+func fetch() { return g; }
+var dyn t = fetch();     # UnboundSymbolEx: 'g' is not bound yet
+var g = 5;
+```
+
+Catching `UnboundSymbolEx` should be very rare: where the failure is provable,
+the compiler refuses the program instead.
+
 **A name declared nowhere is a compile error.** A misspelled or missing
 variable is refused before the program runs, not when execution reaches it:
 

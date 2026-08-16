@@ -324,6 +324,24 @@ DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
  * NOW; the deeper fix is FIXED builtin arities (e.g. write(str) +
  * fwrite(file_or_handle, str)) so arity becomes a COMPILE-time check and the
  * runtime throw disappears - see plans/callbuiltinv-nativization.md #1. */
+/*
+ * THE TEMPORAL DEAD ZONE, runtime half (#131) - see UseBeforeBindingEx. A
+ * function body reading a GLOBAL whose declaration has not run yet:
+ *
+ *     func fetch() { return g; }
+ *     var dyn t = fetch();          # called BEFORE the binding
+ *     var g = 5;
+ *
+ * The function may be called from anywhere, so this is NOT decidable in
+ * general (an indirect or conditional call defeats any analysis) - hence a
+ * runtime error rather than a compile one. It IS catchable: the condition is
+ * a defined, ordinary runtime fact, and by HARD RULE 1 every program must
+ * have a defined outcome. Catching it should nonetheless be extremely rare
+ * in real code - where the failure is PROVABLE the compiler refuses the
+ * program with UseBeforeBindingEx instead, even inside a `try`.
+ */
+DECL_RUNTIME_EX(UnboundSymbolEx, "Unbound symbol")
+
 DECL_RUNTIME_EX(InvalidArgumentEx, "Invalid argument error")
 DECL_RUNTIME_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
 DECL_RUNTIME_EX(CannotChangeConstEx, "Cannot change constant")
@@ -363,6 +381,29 @@ struct DynRequiredEx : public Exception {
     DynRequiredEx(const char *m = "Declaration requires an explicit 'dyn'",
                   Loc start = Loc(), Loc end = Loc())
         : Exception("DynRequiredEx", m, start, end) { }
+};
+
+/*
+ * THE TEMPORAL DEAD ZONE, compile half (#131). Every declaration's NAME
+ * exists from the top of its scope; its VALUE is bound when the declaration
+ * statement runs. Reading it in between is the "temporal dead zone" - the
+ * term is JavaScript's, for `let`, and MyLang adopts the same model.
+ *
+ * This is the DECIDABLE half: the reader is not inside a function body, so
+ * its position relative to the declaration is fixed and the error is a
+ * COMPILE error (uncatchable, like the other compile diagnostics).
+ *
+ *     func f() { var r = t; var t = 5; return r; }   # same scope
+ *     var q = g; var g = 5;                          # top-level statement
+ *
+ * Distinct from UndefinedVariableEx, which means the name is declared in NO
+ * scope at all (FIX-1, #130), and from UnboundSymbolEx below, which is the
+ * same condition where it CANNOT be decided at compile time.
+ */
+struct UseBeforeBindingEx : public Exception {
+    UseBeforeBindingEx(const char *m = "Use before binding",
+                       Loc start = Loc(), Loc end = Loc())
+        : Exception("UseBeforeBindingEx", m, start, end) { }
 };
 
 /*

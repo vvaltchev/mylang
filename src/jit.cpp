@@ -8040,11 +8040,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
-    case OpCode::MakeClosureV:
+    case OpCode::MakeClosureV: {
         /* dst = FuncObject(def, ctx) via jit_make_closure (rdi=dst, rsi=def).
          * def = the closure_defs[idx] FuncDescriptor* baked as a VALUE (a
          * stable program-lifetime address, like CallV's callee). The helper
-         * uses g_current_ctx->frame, not the slots arg. Never throws. */
+         * uses g_current_ctx->frame, not the slots arg.
+         *
+         * IT CAN THROW (#131): the capture SNAPSHOT reads each captured name,
+         * and a captured GLOBAL whose declaration has not run raises
+         * UnboundSymbolEx. It used to be a `void noexcept` helper documented
+         * as "never throws", which turned that into a std::terminate; it
+         * conveys through g_vm_jit_exc now and returns a status like every
+         * other throwing tier. */
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.movabs(RSI,
@@ -8053,7 +8060,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_make_closure) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
+
+        e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
+        const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = no raise) */
+        emit_exc_stamp(e, ck, pc);        /* cold: the op's own caret */
+        e.exit_pc(pc);                    /* raised: EnterNative raises exc */
+        e.patch8(j_ok, e.pos());
         return true;
+    }
 
     case OpCode::MakeArrayV:
         /* dst = build_array_from_values(run[a_lit .. +b_lit), hint=target2) via

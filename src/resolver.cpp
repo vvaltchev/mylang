@@ -111,6 +111,17 @@ struct Scope {
      * `unresolved AT THIS POINT` cannot tell them apart.
      */
     std::vector<const UniqueId *> all_names;
+
+    /*
+     * The subset of `all_names` that has a TEMPORAL DEAD ZONE: `var`/`const`
+     * declarations only. A func or struct declaration HOISTS WITH ITS
+     * BINDING (it is a compile-time entity with no runtime initialisation
+     * order), which is what keeps mutual recursion and the "helpers below
+     * main" layout legal - so it is never "declared but unbound" and must
+     * NOT raise UseBeforeBindingEx. This is JavaScript's `function`-vs-`let`
+     * split, which MyLang already had for funcs; TDZ adds the `let` half.
+     */
+    std::vector<const UniqueId *> var_names;
 };
 
 /*
@@ -489,7 +500,13 @@ private:
          * -> fold to `true`. A GLOBAL is a genuine runtime property (its decl
          * may not have run) -> left for DefinedGlobalV. */
         if (k == SymKind::local || k == SymKind::capture
-                || k == SymKind::builtin) {
+                || k == SymKind::builtin || k == SymKind::global
+                || id->in_tdz) {
+            /* TDZ (#131): `in_tdz` means the name is DECLARED in this scope
+             * but its declaration has not been walked yet - `defined()` asks
+             * whether the name EXISTS, so the answer is true. Whether its
+             * value is bound yet is `isbound()`'s question (step 6), which
+             * takes over the runtime DefinedGlobalV check. */
             MakeConstructFromConstVal(EvalValue(true), slot, false);
             return true;
         }
@@ -1235,6 +1252,11 @@ public:
                 fix1_undefined(id);
         }
 
+        /* Now that escaped globals have their slots, RE-SNAPSHOT every
+         * capture list: the in-walk snapshot above ran before this stamp. */
+        for (FuncDeclStmt *fd : capture_funcs)
+            sync_capture_desc(fd);
+
         /* Publish the global table's slot->name list to the root block, which
          * sizes the runtime GlobalFuncTable and lets globals() enumerate it;
          * plus the write-once map (reassigned slots) for the native-call gate
@@ -1274,6 +1296,21 @@ private:
      * popped by the time the escaped_refs post-pass runs, and a function
      * body's free name may legitimately refer to a global declared BELOW it. */
     std::unordered_set<const UniqueId *> root_decl_names;
+
+    /* Every capturing FuncDeclStmt, so its descriptor's capture snapshot can
+     * be re-taken after pass 2 has stamped the escaped globals. */
+    std::vector<FuncDeclStmt *> capture_funcs;
+
+    /* Copy the RESOLVED capture sources into the descriptor (kind/slot), so
+     * the FuncObject ctor never reads a capture Identifier. */
+    static void sync_capture_desc(FuncDeclStmt *fd)
+    {
+        fd->desc->captures.clear();
+        fd->desc->captures.reserve(fd->captures->elems.size());
+        for (auto &cap : fd->captures->elems)
+            fd->desc->captures.push_back(
+                { cap->uid, cap->sym.kind, cap->sym.slot });
+    }
 
     struct EscapedRef {
         Identifier *id;
@@ -1492,11 +1529,20 @@ private:
      * "undefined", not "declared nowhere", and the two messages differ. */
     static void collect_lvalue_names(Construct *lvalue, Scope &s)
     {
+        /* `_` is recorded in all_names (so a reference to it reports
+         * "undefined", not "declared nowhere") but NEVER in var_names: it is
+         * never bound, so it has no temporal dead zone - reading it must stay
+         * UndefinedVariableEx, not UseBeforeBindingEx. */
         if (auto *id = dynamic_cast<Identifier *>(lvalue)) {
             s.all_names.push_back(id->uid);
+            if (!id->is_underscore())
+                s.var_names.push_back(id->uid);
         } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
-            for (auto &id : il->elems)
+            for (auto &id : il->elems) {
                 s.all_names.push_back(id->uid);
+                if (!id->is_underscore())
+                    s.var_names.push_back(id->uid);
+            }
         }
     }
 
@@ -1532,6 +1578,23 @@ private:
 
     /* Is `uid` declared ANYWHERE in a live scope of `cur` - including below
      * the current walk position? The FIX-1 "declared nowhere" test. */
+    /* Is `uid` a VAR/CONST declared below the walk position in a live scope
+     * - i.e. currently in its temporal dead zone? (A func/struct is never:
+     * see Scope::var_names.) */
+    static bool in_tdz_of_live_scope(const FuncState *cur,
+                                     const UniqueId *uid)
+    {
+        if (!cur)
+            return false;
+
+        for (const auto &s : cur->scopes)
+            for (const UniqueId *n : s.var_names)
+                if (n == uid)
+                    return true;
+
+        return false;
+    }
+
     static bool declared_in_live_scopes(const FuncState *cur,
                                         const UniqueId *uid)
     {
@@ -1599,6 +1662,29 @@ private:
          * map walk. Escaped vars aren't in the table yet during pass 1 - they
          * are stamped post-pass-2 via escaped_refs.
          */
+        /*
+         * TDZ (#131): the scope loop above searches DECLARED-SO-FAR names;
+         * `all_names` additionally holds the ones declared BELOW. A hit here
+         * means the name IS in scope but its declaration has not run - and
+         * because the reader is inside the scope itself, that is decidable,
+         * so it is a COMPILE error. The lazy builtins are the exception:
+         * they ask ABOUT the name rather than reading it, and `defined()`
+         * must answer TRUE (the name is declared - it is merely unbound).
+         */
+        if (cur->slottable && in_tdz_of_live_scope(cur, id->uid)
+                && global_func_slots.find(id->uid) == global_func_slots.end()) {
+            if (!no_undef_check) {
+                if (!repl_mode)
+                    throw UseBeforeBindingEx(
+                        intern_msg("'" + std::string(id->get_str())
+                                   + "' is used before its declaration"),
+                        id->start, id->end);
+            } else {
+                id->in_tdz = true;      /* declared, not yet bound */
+            }
+            return;
+        }
+
         auto git = global_func_slots.find(id->uid);
         if (git != global_func_slots.end()) {
             id->sym = ResolvedSym{ SymKind::global, git->second };
@@ -2139,11 +2225,13 @@ Resolver::walk(Construct *c, FuncState *cur)
              * FuncObject ctor reads kind/slot (read_sym), never the capture
              * Identifiers, so closure creation is AST-free. Unresolved (REPL
              * top-level) captures keep the by-name map fallback via `name`. */
-            fd->desc->captures.clear();
-            fd->desc->captures.reserve(fd->captures->elems.size());
-            for (auto &cap : fd->captures->elems)
-                fd->desc->captures.push_back(
-                    { cap->uid, cap->sym.kind, cap->sym.slot });
+            sync_capture_desc(fd);
+            /* ...but an ESCAPED GLOBAL capture is stamped only AFTER pass 2
+             * (escaped_refs), so this snapshot would record `unresolved` and
+             * silently fall back to the by-name map walk - which in a SCRIPT
+             * is the asserted-empty map, so the read reported "undefined"
+             * instead of UnboundSymbolEx (#131). Re-sync at the end. */
+            capture_funcs.push_back(fd);
         }
 
         /* A hoisted top-level function already has a GLOBAL slot (resolved via

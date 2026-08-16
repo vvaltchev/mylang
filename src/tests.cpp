@@ -1198,13 +1198,13 @@ static const std::vector<test> tests =
          * FUNCTION would not do: those are bound before main's body runs, so
          * `print(later())` ahead of `func later()` simply works.
          */
-        "jit: an unbound global callee still raises UndefinedVariableEx",
+        "jit: an unbound global callee still raises UnboundSymbolEx",
         {
             "func run() { var r = fn(); return r; }",
             "var t = run();",
             "var fn = func() { return 1; };",
         },
-        &typeid(UndefinedVariableEx),
+        &typeid(UnboundSymbolEx),
     },
 
     {
@@ -1815,7 +1815,9 @@ static const std::vector<test> tests =
          * interpreter re-runs the op + throws) AND the interpreted path - both
          * must throw UndefinedVariableEx (non-catchable, byte-identical caret in
          * vm/nj). f is called before `var g` runs, so g's global slot is
-         * undefined at the read. */
+         * NOT BOUND YET at the read - the name IS declared (it has a slot),
+         * which is why this is UnboundSymbolEx and not UndefinedVariableEx
+         * (TDZ runtime half, #131). It is CATCHABLE. */
         "use-before-def global read (LoadGlobalV bail)",
         {
             "func f() { var s = 0;",
@@ -1824,14 +1826,14 @@ static const std::vector<test> tests =
             "var r = f();",
             "var g = 7;",
         },
-        &typeid(UndefinedVariableEx),
+        &typeid(UnboundSymbolEx),
     },
 
     {
         /* use-before-def of a global CONTAINER base in a store loop: exercises
          * StoreElemValue's undefined-global BAIL (kind==1, the base slot
          * undefined -> return 1 with NO g_vm_jit_exc -> the interpreter re-runs
-         * the store + throws UndefinedVariableEx, a plain Exception). f writes
+         * the store + throws UnboundSymbolEx (#131). f writes
          * g[i] before `var g` runs. */
         "use-before-def global store (StoreElemValue bail)",
         {
@@ -1839,27 +1841,32 @@ static const std::vector<test> tests =
             "f();",
             "var g = [0, 0, 0];",
         },
-        &typeid(UndefinedVariableEx),
+        &typeid(UnboundSymbolEx),
     },
 
     {
         /* use-before-def of a global in a COMPOUND store loop: the native
          * jit_store_global_compound finds the slot undefined -> BAILS (return 1,
          * no g_vm_jit_exc) -> the interpreter re-runs the store + throws
-         * UndefinedVariableEx (byte-identical vm/nj). */
+         * UnboundSymbolEx (byte-identical vm/nj). */
         "use-before-def global compound store (StoreGlobalV bail)",
         {
             "func f() { for (var i = 0; i < 20; i++) g += i; }",
             "f();",
             "var g = 0;",
         },
-        &typeid(UndefinedVariableEx),
+        &typeid(UnboundSymbolEx),
     },
 
     {
+        /* TDZ (#131): `defined(a)` before `var a;` is now TRUE - the name is
+         * DECLARED for the whole scope, it is merely UNBOUND, and `defined()`
+         * asks whether it exists. (`isbound()`, step 6, is the one that
+         * answers false there.) It used to be 0, because the resolver walked
+         * forward and left the name unresolved. */
         "defined() builtin",
         {
-            "assert(defined(a) == 0);",
+            "assert(defined(a) == 1);",
             "assert(defined(len) == 1);",
             "assert(defined(\"blah\") == 1);",
             "assert(defined(defined) == 1);",
@@ -1896,15 +1903,20 @@ static const std::vector<test> tests =
     },
 
     {
-        /* defined() of a GLOBAL is NOT folded (its slot's defined-flag is set
-         * only when its decl executes): false before the decl runs, true after -
-         * a genuine runtime property that must stay a runtime defined() call. */
-        "defined() of a global is execution-order-dependent (not folded)",
+        /*
+         * TDZ (#131): `defined()` asks whether the name EXISTS, and a global
+         * always does - so it is TRUE even before the declaration has run,
+         * and it FOLDS at compile time. Whether the value is bound yet is a
+         * different question, and it belongs to `isbound()` (step 6), which
+         * will take over the runtime DefinedGlobalV check this test used to
+         * exercise.
+         */
+        "defined() of a global is TRUE before its decl runs (it exists)",
         {
             "func gt() { return defined(gg); }",
-            "assert(gt() == 0);",     /* gg not declared yet */
+            "assert(gt() == 1);",     /* declared below - but declared */
             "var gg = 42;",
-            "assert(gt() == 1);",     /* now declared */
+            "assert(gt() == 1);",
         },
     },
 
@@ -4054,14 +4066,15 @@ static const std::vector<test> tests =
       { "func mkd() { var d = {\"cnt\": 1}; return d; }",
         "var dyn dd = mkd(); dd.missing++;" },
       &typeid(KeyNotFoundEx), 21, 2, 31, 2 },
-    /* An UNDEFINED global base (`g` read by f before its decl runs): the
-     * VM's vm_store_base uses the loc side table — must match the tree-
-     * walker's identifier caret. */
-    { "err loc: dyn elem ++ on an undefined global base marks the base",
+    /* An UNBOUND global base (`g` read by f before its decl runs - the name
+     * IS declared, so this is UnboundSymbolEx, #131): the VM's
+     * vm_store_base uses the loc side table — must match the tree-walker's
+     * identifier caret. */
+    { "err loc: dyn elem ++ on an unbound global base marks the base",
       { "func f() { g[0]++; }",
         "f();",
         "var dyn g = [1];" },
-      &typeid(UndefinedVariableEx), 12, 1, 14, 1 },
+      &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
 
     /* ZERO-SLOT bodies (no params, no locals -> the resolver leaves them
      * `resolved == false`) now run their CHUNK under -vm (the chunk hook is
@@ -4396,6 +4409,86 @@ static const std::vector<test> tests =
         "assert(p == 11 && q == 33);",
         "var a1, _, d1 = [1, 2, 3];",
         "assert(a1 == 1 && d1 == 3);" } },
+
+    /*
+     * THE TEMPORAL DEAD ZONE (#131). Every declaration's NAME exists from the
+     * top of its scope; its VALUE binds when the declaration runs. Reading it
+     * in between is the dead zone, and it splits by DECIDABILITY.
+     *
+     * (1) LEXICALLY DECIDABLE -> UseBeforeBindingEx, a COMPILE error. The
+     * reader is not inside a function body, so its position relative to the
+     * declaration is fixed. The leading `assert(false)` is the compile-time
+     * proof: were the program still run, it would throw first.
+     */
+    { "TDZ: local read before its decl (no outer binding)",
+      { "assert(false);",
+        "func f() { var r = t; var t = 5; return r; }",
+        "var dyn q = f();" }, &typeid(UseBeforeBindingEx) },
+    /* The shadowing case: it used to read the OUTER `loc` and return 99. */
+    { "TDZ: local read before its decl SHADOWING an outer name",
+      { "assert(false);",
+        "var loc = 99;",
+        "func f() { var r = loc; var loc = 5; return r; }",
+        "var dyn q = f();" }, &typeid(UseBeforeBindingEx) },
+    { "TDZ: a top-level statement reading a later top-level var",
+      { "assert(false);",
+        "var q = g;",
+        "var g = 5;" }, &typeid(UseBeforeBindingEx) },
+    /* CLAUDE.md used to document this as reading the outer `x` (-> 11). */
+    { "TDZ: `var x = x + 1` reads the INNER x, which is in its dead zone",
+      { "assert(false);",
+        "var x = 10;",
+        "func f() { var x = x + 1; return x; }",
+        "var dyn q = f();" }, &typeid(UseBeforeBindingEx) },
+    /*
+     * ...and what the TDZ must NOT touch. A func/struct hoists WITH its
+     * binding (no runtime initialisation order), so calling one declared
+     * below is legal and keeps mutual recursion working. A NESTED scope is a
+     * different scope, so the outer name is still readable there. And a lazy
+     * builtin asks ABOUT the name: `defined()` answers TRUE, because the name
+     * IS declared - it is merely unbound. (`isbound()`, step 6, is the one
+     * that answers false there.)
+     */
+    /* NOTE the STRUCT case is deliberately absent: `var p1 = P(3); ...
+     * struct P { int x; }` works in a SCRIPT but not in this harness's
+     * pipeline, where the descriptor's global slot is still undefined at the
+     * construction. That is a real gap in "a struct hoists WITH its binding"
+     * and belongs to #134; adding it here would pin a behaviour that only
+     * one pipeline has. */
+    { "TDZ accepts: a hoisted func, nested scopes, defined()",
+      { "var dyn t1 = f();",
+        "assert(t1 == 5);",
+        "func f() { return 5; }",
+        "var loc = 99;",
+        "func g2() { var r = loc; { var loc = 5; } return r; }",
+        "assert(g2() == 99);",
+        "func g3() { var b = defined(a); var a = 5; return b; }",
+        "assert(g3() == true);" } },
+    /*
+     * (2) NOT DECIDABLE -> UnboundSymbolEx, a CATCHABLE runtime error. A
+     * function body reading a GLOBAL: the call may happen anywhere. All three
+     * positions - read, store base, capture list - and it is catchable, which
+     * is the whole point of it being an ordinary RuntimeException.
+     */
+    { "TDZ: reading an unbound global is a CATCHABLE runtime error",
+      { "func fetch() { return g; }",
+        "var out = 0;",
+        "try { var dyn t = fetch(); } catch (UnboundSymbolEx) { out = 1; }",
+        "assert(out == 1);",
+        "var g = 5;",
+        "assert(fetch() == 5);" } },
+    { "TDZ: a capture of an unbound global (was a SIGABRT under the JIT)",
+      { "func mk() { var c = func[g]() => g; return c; }",
+        "var out = 0;",
+        "try { var dyn h = mk(); } catch (UnboundSymbolEx) { out = 1; }",
+        "assert(out == 1);",
+        "var g = 5;" } },
+    { "TDZ: a store through an unbound global base",
+      { "func f() { g[0] = 1; }",
+        "var out = 0;",
+        "try { f(); } catch (UnboundSymbolEx) { out = 1; }",
+        "assert(out == 1);",
+        "var g = [0, 0];" } },
 
     /*
      * UncatchableRuntimeException: an error a script may NEVER handle, but
@@ -24507,18 +24600,12 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(5)) == 5);" } },
-        /* DefinedGlobalV: defined(g) of a GLOBAL reads the slot's
-         * defined-flag. */
-        { OpCode::DefinedGlobalV, {
-            "var g = 1;",
-            "func rd() { return g; }",
-            "func f(int n) {",
-            "  var c = 0;",
-            "  for (var i = 0; i < n; i++) { if (defined(g)) c += 1; }",
-            "  return c;",
-            "}",
-            "assert(f(runtime(4)) == 4);",
-            "assert(rd() == 1);" } },
+        /* DefinedGlobalV HAS NO PRODUCER RIGHT NOW and so is not listed.
+         * It read a global slot's defined-flag for `defined(g)`; under the
+         * TDZ model (#131) `defined()` asks whether the name EXISTS, and a
+         * global always does, so it folds to `true` at compile time. The
+         * defined-FLAG question is `isbound()`'s, and step 6 gives this op
+         * back to it - restore a case here then. */
         /* The STRICT-unpack family: the foreach 2-var unpack over proven
          * array<array<T>> (int/float/value), the `_` targets variant, and
          * the multi-assign MultiUnpackV. */
@@ -25551,8 +25638,11 @@ static bool vm_codegen_shapes()
         return false;
     const bool defined_fold_ok = df.callbuiltinv == 0;
 
-    /* defined(GLOBAL) does NOT fold (execution-order dependent) but is
-     * native: a DefinedGlobalV op reading gfuncs->defined[slot]. */
+    /* defined(GLOBAL) FOLDS too now (TDZ, #131): `defined()` asks whether
+     * the name EXISTS, and a global always does. So no DefinedGlobalV and no
+     * builtin call - the whole body is a constant. The op itself is not dead
+     * for long: `isbound()` (step 6) is the one that must read
+     * gfuncs->defined[slot], and it takes DefinedGlobalV over. */
     VmOpCounts dg;
     if (!codegen_func_counts({
             "var gg = 0;",
@@ -25560,7 +25650,7 @@ static bool vm_codegen_shapes()
         }, dg))
         return false;
     const bool defined_global_ok =
-        dg.definedg == 1 && dg.callbuiltinv == 0;
+        dg.definedg == 0 && dg.callbuiltinv == 0;
 
     /* `a ?? b` in a native body lowers to MoveV + JumpIfNotNoneV (the ??
      * short-circuit) + the rhs into the same dst - no fallback (the old

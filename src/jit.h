@@ -545,7 +545,9 @@ extern "C" int jit_dict_load_float(int_type dst, int_type base_slot,
 /* model-flip (nativize-ops): MakeClosureV natively - create a closure +
  * snapshot captures from the running ctx. `def` is the closure's
  * program-lifetime FuncDescriptor* (baked as a value). Never throws. */
-extern "C" void jit_make_closure(int_type dst, const void *def) noexcept;
+/* returns 1 and sets g_vm_jit_exc when a captured GLOBAL is not bound yet
+ * (UnboundSymbolEx, #131); 0 on success */
+extern "C" int jit_make_closure(int_type dst, const void *def) noexcept;
 
 /* model-flip (nativize-ops): MakeArrayV natively - build an array LITERAL from
  * the element run [base, base+n) via the shared build_array_from_values, honoring

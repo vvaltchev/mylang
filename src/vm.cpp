@@ -275,7 +275,9 @@ vm_store_base(EvalContext &ctx, int_type kind, int slot,
             Loc s, en;
             if (node) { s = node->start; en = node->end; }
             else chunk.loc_at(pc, s, en);       /* AST-free op: side table */
-            throw UndefinedVariableEx(ctx.gfuncs->names[slot]->val, s, en);
+            throw UnboundSymbolEx(
+                intern_msg("'" + std::string(ctx.gfuncs->names[slot]->val)
+                           + "' is not bound yet"), s, en);
         }
         return &ctx.gfuncs->slots[slot];
     }
@@ -3447,8 +3449,9 @@ extern "C" int jit_load_global(int_type dst_gslot,
             s = le->start;
             en = le->end;
         }
-        g_vm_jit_eptr = std::make_exception_ptr(
-            UndefinedVariableEx(g->names[gslot]->val, s, en));
+        g_vm_jit_exc = std::make_unique<UnboundSymbolEx>(
+            intern_msg("'" + std::string(g->names[gslot]->val)
+                       + "' is not bound yet"), s, en);
         return 1;
     }
     g_current_ctx->frame->at(dst).put(g->slots[gslot].get());
@@ -3481,12 +3484,25 @@ extern "C" void jit_arr_len(LValue *slots, int_type dst, int_type base) noexcept
  * lambda. `defv` is the closure's program-lifetime FuncDescriptor* (baked by the
  * emitter as a value - the descriptor address is stable, like CallV's callee).
  * A resolved closure's captures are defined, so the ctor never throws. */
-extern "C" void jit_make_closure(int_type dst, const void *defv) noexcept
+extern "C" int jit_make_closure(int_type dst, const void *defv) noexcept
 {
     ML_JIT_OP_RAN(MakeClosureV);
     const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
-    g_current_ctx->frame->at(dst).put(EvalValue(intrusive_ptr<FuncObject>(
-        make_intrusive<FuncObject>(def, g_current_ctx))));
+
+    /* The capture SNAPSHOT reads each captured name, and a captured GLOBAL
+     * whose declaration has not run yet raises UnboundSymbolEx (#131) - so
+     * this CAN throw, contrary to what it assumed while it was `void` and
+     * unguarded. That assumption is what made
+     * `var c = func[zz]() => zz;` a std::terminate: a throw escaping a
+     * `noexcept` helper aborts outright. Convey it like every other tier. */
+    try {
+        g_current_ctx->frame->at(dst).put(EvalValue(intrusive_ptr<FuncObject>(
+            make_intrusive<FuncObject>(def, g_current_ctx))));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
 }
 
 /* model-flip (nativize-ops): the native MakeArrayV body - the interpreter's
@@ -4599,8 +4615,9 @@ extern "C" int jit_store_global_compound(const void *bop) noexcept
          * name + the op's own pool caret, instead of the old bail-to-
          * re-run; the pool entry is already loaded, so this costs nothing
          * on the defined path. */
-        g_vm_jit_eptr = std::make_exception_ptr(UndefinedVariableEx(
-            g->names[bo->target]->val, bo->start, bo->end));
+        g_vm_jit_exc = std::make_unique<UnboundSymbolEx>(
+            intern_msg("'" + std::string(g->names[bo->target]->val)
+                       + "' is not bound yet"), bo->start, bo->end);
         return 1;
     }
     LValue &lv = g->slots[bo->target];
@@ -4809,8 +4826,11 @@ extern "C" int jit_throw_runtime(const void *tv) noexcept
             std::make_unique<InvalidNumberOfArgsEx>(t.start, t.end);
         break;
     case Chunk::ThrowKind::undefined_var:
-        g_vm_jit_eptr = std::make_exception_ptr(
-            UndefinedVariableEx(t.name->val, t.start, t.end));
+        /* UNDEFINED (no slot anywhere), not unbound - see the interpreted
+         * twin. Still the eptr channel: UndefinedVariableEx is an
+         * UncatchableRuntimeException, conveyed but never handled. */
+        g_vm_jit_exc = std::make_unique<UndefinedVariableEx>(
+            t.name->val, t.start, t.end);
         break;
     case Chunk::ThrowKind::rebind_builtin:
         g_vm_jit_eptr = std::make_exception_ptr(
@@ -6808,7 +6828,10 @@ extern "C" int jit_call_sync(int_type callee_slot, int_type ab_n,
         const Chunk::LocEntry *le =
             static_cast<const Chunk::LocEntry *>(lep);
         try {
-            throw UndefinedVariableEx(ctx->gfuncs->names[callee_slot]->val,
+            throw UnboundSymbolEx(
+                intern_msg("'"
+                           + std::string(ctx->gfuncs->names[callee_slot]->val)
+                           + "' is not bound yet"),
                                       le ? le->start : Loc(),
                                       le ? le->end : Loc());
         } catch (...) {
@@ -6854,7 +6877,10 @@ extern "C" int jit_call_sync_cached(int_type callee_slot, int_type ab_n,
         const Chunk::LocEntry *le =
             static_cast<const Chunk::LocEntry *>(lep);
         try {
-            throw UndefinedVariableEx(ctx->gfuncs->names[callee_slot]->val,
+            throw UnboundSymbolEx(
+                intern_msg("'"
+                           + std::string(ctx->gfuncs->names[callee_slot]->val)
+                           + "' is not bound yet"),
                                       le ? le->start : Loc(),
                                       le ? le->end : Loc());
         } catch (...) {
@@ -7517,8 +7543,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 if (!ctx.gfuncs->defined[in->target]) {
                     Loc s, en;
                     chunk->loc_at(pc, s, en);
-                    throw UndefinedVariableEx(
-                        ctx.gfuncs->names[in->target]->val, s, en);
+                    throw UnboundSymbolEx(
+                        intern_msg("'"
+                                   + std::string(ctx.gfuncs->names[in->target]
+                                                 ->val)
+                                   + "' is not bound yet"), s, en);
                 }
                 lvp = &ctx.gfuncs->slots[in->target];
             } else if (in->target2 == 2) {
@@ -8576,6 +8605,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             const Chunk::ThrowSite &t = chunk->throws[in->target];
             switch (t.kind) {
                 case Chunk::ThrowKind::undefined_var:
+                    /* UNDEFINED, not unbound: codegen emits this kind ONLY
+                     * for a SymKind::unresolved name - a name with no slot
+                     * anywhere. After FIX-1 (#130) that is `_` (never bound
+                     * by design) and the REPL's open world. An unbound
+                     * GLOBAL has a slot and goes through
+                     * LoadGlobalV/StoreGlobalV, which raise UnboundSymbolEx. */
                     throw UndefinedVariableEx(t.name->val, t.start, t.end);
                 case Chunk::ThrowKind::not_lvalue:
                     throw NotLValueEx(t.start, t.end);
@@ -8909,8 +8944,10 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             if (!ctx.gfuncs->defined[in->target2]) {
                 Loc s, en;
                 chunk->loc_at(pc, s, en);
-                throw UndefinedVariableEx(
-                    ctx.gfuncs->names[in->target2]->val, s, en);
+                throw UnboundSymbolEx(
+                    intern_msg("'" +
+                               std::string(ctx.gfuncs->names[in->target2]->val)
+                               + "' is not bound yet"), s, en);
             }
             const EvalValue &callee = ctx.gfuncs->slots[in->target2].get();
             if (!callee.is<intrusive_ptr<FuncObject>>()) {
@@ -9462,8 +9499,10 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             if (!ctx.gfuncs->defined[in->target2]) {
                 Loc s, en;
                 chunk->loc_at(pc, s, en);
-                throw UndefinedVariableEx(
-                    ctx.gfuncs->names[in->target2]->val, s, en);
+                throw UnboundSymbolEx(
+                    intern_msg("'" +
+                               std::string(ctx.gfuncs->names[in->target2]->val)
+                               + "' is not bound yet"), s, en);
             }
             ctx.frame->at(in->target).put(
                 ctx.gfuncs->slots[in->target2].get());
@@ -9507,8 +9546,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 if (!ctx.gfuncs->defined[in->target]) {
                     Loc s, en;
                     chunk->loc_at(pc, s, en);
-                    throw UndefinedVariableEx(
-                        ctx.gfuncs->names[in->target]->val, s, en);
+                    throw UnboundSymbolEx(
+                        intern_msg("'"
+                                   + std::string(ctx.gfuncs->names[in->target]
+                                                 ->val)
+                                   + "' is not bound yet"), s, en);
                 }
                 EvalValue sb;
                 EvalValue nv = lv.get();
