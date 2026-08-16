@@ -5,6 +5,7 @@
 #include "syntax.h"
 #include <cstring>   /* memcpy - the packed flit accessors (B3) */
 
+#include <memory>    /* unique_ptr - the per-site callee cache cells */
 #include <vector>
 
 /*
@@ -1560,6 +1561,35 @@ struct Chunk {
 
     /* Native-AOT fragments (see NativeCode above). */
     NativeCode native;
+
+    /*
+     * G1: the CALLEE CACHE - one cell per EMITTED inline call site, holding
+     * the `FuncDescriptor *`s that last passed that site's callee-PROPERTY
+     * guards (fast_bind, the arity match, a compiled chunk, a native sync
+     * entry, plain_frame). Every one of those is fixed once the descriptor
+     * and its chunk exist, so a pointer match re-establishes all five and
+     * the emitted push jumps straight to the mutation phase.
+     *
+     * TWO entries, not one, and 76_funcval_dispatch is why: it dispatches
+     * through `ops[i % 2]`, so a one-entry cache missed on EVERY call and
+     * measured +0.56% - the textbook monomorphic-inline-cache failure, on
+     * the very bench this arc is named after. A miss shifts (entry 0 takes
+     * entry 1, entry 1 takes the new callee), so an alternating pair
+     * reaches steady-state hits after two calls. Entry 0 costs a hit
+     * exactly what one entry did, so two is never worse.
+     *
+     * A `FuncDescriptor *` is one of the codebase's STABLE identities
+     * (program-lifetime, owned by the VmProgram) - unlike a `FuncObject *`,
+     * which is refcounted and whose freed address a later closure can
+     * reuse, so caching on THAT would be the classic stale-identity bug.
+     *
+     * Each cell is separately heap-allocated so its ADDRESS - baked as an
+     * immediate into the fragment - cannot move as later sites are added.
+     * DERIVED, never serialized, exactly like `native`: a loaded image's
+     * JIT pass re-emits the sites and builds its own cells.
+     */
+    struct CalleeCache { const void *desc[2] = { nullptr, nullptr }; };
+    std::vector<std::unique_ptr<CalleeCache>> call_caches;
 
     /*
      * #55 native calls: this chunk's WHOLE body is a single fully-native run

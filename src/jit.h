@@ -826,6 +826,11 @@ extern "C" unsigned long g_jit_fread;         /* C4a-i: float read-dispatch
                                                * elision entries */
 extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
 extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
+/* G1: HITS of the emitted monomorphic callee cache - the same callee as last
+ * time at this site, so the five callee-property guards are skipped. Bumped
+ * by EMITTED code on the hit arm only (a miss falls into the full chain). */
+extern "C" unsigned long g_jit_callee_cache;
+extern "C" unsigned long g_jit_callee_cache2;
 extern "C" unsigned long g_jit_sync_inline;
 extern "C" unsigned long g_jit_entry_resume;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -

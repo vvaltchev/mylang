@@ -16499,6 +16499,129 @@ static bool jit_sync_inline_call()
 #endif
 }
 
+/*
+ * G1 the MONOMORPHIC CALLEE CACHE. `g_jit_callee_cache` is bumped by the
+ * emitted HIT arm only, so a bump proves the skip actually ran - a correct
+ * result proves nothing here, since the full guard chain produces the same
+ * one (that is exactly how a dead lever hides).
+ *
+ * Both halves matter. A MONOMORPHIC site (one callee, called repeatedly)
+ * must HIT: it is the shape the cache exists for, and its counter must grow
+ * by roughly the call count, not by one. A POLYMORPHIC site (two closures
+ * alternating through the same variable) must stay CORRECT: every hit is a
+ * miss there, so the full chain runs each time and the answers must still
+ * be the two callees' own - a cache that ignored the pointer compare would
+ * call the wrong body and the sum would be wrong.
+ *
+ * The callees are CLOSURES with no parameter on purpose: a named function is
+ * inlined or folded away before codegen, and an int/float-declared param
+ * makes the descriptor non-fast_bind, which declines the whole inline push.
+ */
+static bool jit_callee_cache_hit()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    /* MONOMORPHIC: 200 calls through one closure - the cache must hit. */
+    const unsigned long b0 = g_jit_callee_cache;
+    const unsigned long b2 = g_jit_callee_cache2;
+    if (!run({
+            "func mk(dyn k) { return func [k] () { return k; }; }",
+            "func drive(int n) {",
+            "  var f = mk(3);",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s += f();",
+            "  return s;",
+            "}",
+            "assert(drive(runtime(200)) == 600);" }))
+        return false;
+    if (g_jit_callee_cache <= b0 + 100) {
+        fprintf(stderr, "jit_callee_cache: hit arm DID NOT RUN (%lu)\n",
+                g_jit_callee_cache - b0);
+        return false;
+    }
+    /* ...and from ENTRY 0. This is what pins the MRU shift order: fill
+     * entry 1 first and one callee sits behind a compare it can never
+     * pass, paying two extra instructions on every call forever. The
+     * answers stay correct either way, so nothing but this counter split
+     * can see it (the probe measured it as +2 Ir/call). */
+    if (g_jit_callee_cache2 > b2 + 4) {
+        fprintf(stderr, "jit_callee_cache: monomorphic site sits in entry 1"
+                " (%lu) - the MRU shift is backwards\n",
+                g_jit_callee_cache2 - b2);
+        return false;
+    }
+    /*
+     * POLYMORPHIC: the SAME site alternates between two callees. The
+     * closures must come from DIFFERENT lambda DECLS - two closures of one
+     * decl share a FuncDescriptor, so keying on the descriptor makes them
+     * the same callee and the site is monomorphic after all. The first
+     * version of this test made exactly that mistake and tested nothing.
+     *
+     * With two entries this settles into hits after two misses (that is
+     * why the second entry exists: one entry missed on EVERY call of
+     * 76_funcval_dispatch's `ops[i % 2]`), so the counter must grow by
+     * nearly the call count here too. The sum discriminates the bodies:
+     * 100 * 3 + 100 * (8 + 100).
+     */
+    const unsigned long b1 = g_jit_callee_cache;
+    const unsigned long b3 = g_jit_callee_cache2;
+    if (!run({
+            "func mk1(dyn k) { return func [k] () { return k; }; }",
+            "func mk2(dyn k) { return func [k] () { return k + 100; }; }",
+            "func drive(int n) {",
+            "  var a = mk1(3);",
+            "  var b = mk2(8);",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var f = a;",
+            "    if (i % 2 == 1) f = b;",
+            "    s += f();",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(drive(runtime(200)) == 11100);" }))
+        return false;
+    if (g_jit_callee_cache2 <= b3 + 50) {
+        fprintf(stderr, "jit_callee_cache: the SECOND entry is dead (%lu)\n",
+                g_jit_callee_cache2 - b3);
+        return false;
+    }
+    if (g_jit_callee_cache <= b1 + 50) {
+        fprintf(stderr, "jit_callee_cache: the FIRST entry went dead (%lu)\n",
+                g_jit_callee_cache - b1);
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 /* Per-pc entry points, increment 1 (post-call resume): g_jit_entry_resume
  * is bumped by the ENTRY STUB itself, so a bump proves an interpreted
  * return actually re-entered native code mid-run. Recursion PAST the sync
@@ -23299,6 +23422,8 @@ static bool jit_counter_coverage()
         { "native_returns",   &g_jit_native_returns,   nullptr },
         { "native_calls",     &g_jit_native_calls,     nullptr },
         { "sync_inline",      &g_jit_sync_inline,      nullptr },
+        { "callee_cache",     &g_jit_callee_cache,     nullptr },
+        { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
         { "entry_resume",     &g_jit_entry_resume,     nullptr },
         { "ret_inline",       &g_jit_ret_inline,       nullptr },
         { "member_fast",      &g_jit_member_fast,      nullptr },
@@ -25920,6 +26045,8 @@ static const std::vector<extra_check> extra_checks =
       jit_boxed_int_fast },
     { "jit: fragment-inline sync call runs (direct push + call rdx)",
       jit_sync_inline_call },
+    { "jit: the monomorphic callee cache hits (and a polymorphic site is "
+      "still correct)", jit_callee_cache_hit },
     { "jit: post-call entry stub re-enters native on interpreted return",
       jit_post_call_entry },
     { "jit: deep recursion runs native on the dedicated stack (M5a)",
