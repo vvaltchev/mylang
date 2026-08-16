@@ -407,6 +407,33 @@ Running scripts:
                                  # (`isbound(g)` is how a program COPES with
                                  # an order it cannot fix). Measured: 0 of the
                                  # 95 corpus programs trip it
+                                 #
+                                 # FUTURE (maintainer, 2026-08-09 - agreed as
+                                 # an idea, NOT scheduled): make `--strict`
+                                 # stronger by requiring define-before-use for
+                                 # FUNCTIONS and STRUCTS too, which needs
+                                 # FORWARD DECLARATIONS (`func f(x);` with no
+                                 # body) to be added to the language first.
+                                 # Without them the rule is not compliable:
+                                 # mutual recursion is a CYCLE and a linear
+                                 # file cannot linearise one, so whichever of
+                                 # `ev`/`od` is written second leaves the other
+                                 # pointing forward. The motivation would be
+                                 # top-down readability discipline (C's rule),
+                                 # NOT safety - a func/struct name binds at
+                                 # SCOPE ENTRY (#134), so a forward reference
+                                 # to one can never raise UnboundSymbolEx and
+                                 # ordering it prevents nothing. Note MyLang
+                                 # already has ONE such requirement, arrived at
+                                 # for a parsing reason: a struct used as a
+                                 # TYPE annotation (`P p;`) must be declared
+                                 # first, because the parser resolves the type
+                                 # name to tell a declaration from an
+                                 # expression - while `P(1)` and `P.CONST`
+                                 # work forward. Before building it, MEASURE
+                                 # how many corpus programs call a function
+                                 # declared below them; that number says
+                                 # whether the discipline is paid for
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
 ./build/mylang -v                # how THIS binary was built (opt, asserts,
                                  # lto, sanitizers, vm_hardening, cgoto,
