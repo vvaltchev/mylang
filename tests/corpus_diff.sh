@@ -20,6 +20,19 @@
 #   tests/corpus_diff.sh [binary] --levers   - once per JIT lever off
 #   tests/corpus_diff.sh [binary] --cold     - once per forced cold tier
 #   tests/corpus_diff.sh [binary] --xrot     - once per pin-pool rotation
+#   tests/corpus_diff.sh [binary] --nolowmem - with the low-address arena
+#                                              REFUSED (the imm32 tags fall
+#                                              back to registers)
+#
+# --nolowmem exists because the JIT emits MATERIALLY different code when
+# ml_lowmem_fits_imm32 is false: every type tag becomes a register read
+# instead of an imm32, which also decides whether rsi/r8 may hold a pin
+# at all. That configuration ships - lowmem.h says in bold that a failed
+# MAP_32BIT is reachable on Linux - and until MYLANG_NO_LOWMEM existed
+# NO build and NO lane could enter it. Its first run found 7 corpus
+# programs crashing or answering wrongly: store_dst_bool named a
+# fallback register for the t_bool tag and the movabs that filled it had
+# been deleted as "an instruction saved" when the imm32 form landed.
 #
 # --xrot exists because take_reg hands out the caller-saved pin pool in
 # PREFERENCE order, so its last member is reached only by a run with the
@@ -71,5 +84,7 @@ case "$MODE" in
     for T in $COLD_TIERS all; do run_one "MYLANG_JIT_COLD=$T" || rc=1; done ;;
   --xrot)
     for K in $XROTS; do run_one "MYLANG_JIT_XROT=$K" || rc=1; done ;;
+  --nolowmem)
+    run_one "MYLANG_NO_LOWMEM=1" || rc=1 ;;
 esac
 exit $rc

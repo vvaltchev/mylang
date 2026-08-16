@@ -46,6 +46,20 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --levers
 
+    # THE NO-ARENA CONFIGURATION. With MAP_32BIT unavailable the JIT
+    # writes every type tag through a REGISTER instead of an imm32 - a
+    # different emission, shipping on any Linux box where that mmap
+    # fails, and until MYLANG_NO_LOWMEM existed no build and no lane
+    # could enter it. Its first run found 7 corpus programs crashing
+    # (store_dst_bool storing an unloaded register as a type pointer).
+    # Both halves: the whole suite, then the engine differential.
+    - name: "-rt with the low-address arena refused"
+      working-directory: ${{github.workspace}}/build
+      run: MYLANG_NO_LOWMEM=1 ./mylang -rt
+    - name: corpus_diff --nolowmem
+      working-directory: ${{github.workspace}}/build
+      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --nolowmem
+
     # Net 3: every program in a bounded shape space, four engines,
     # compared byte-for-byte. Depth 3 here (480 programs); the full
     # depth-4 space (2272) is a manual run.

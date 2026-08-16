@@ -1165,14 +1165,60 @@ struct Emitter {
      * immediate silently, and this file has lost that bet three times
      * already this task.
      */
-    void store_type_tag(int32_t disp, const void *tag, uint8_t fallback_reg)
+    /*
+     * ⛔ `held_reg` MUST ALREADY HOLD `tag`. Only two singletons are
+     * ever materialised into a register - t_int in rsi and t_float in
+     * r8, by emit_type_tags at every fragment entry and by
+     * emit_call_epilogue after every helper call - so only those two
+     * may be written this way. The ML_CHECK is not ceremony: this
+     * parameter is a PROMISE the caller can break SILENTLY, and one
+     * did (see store_type_tag_via below).
+     */
+    void store_type_tag(int32_t disp, const void *tag, uint8_t held_reg)
     {
-        if (ml_lowmem_fits_imm32(tag))
+        if (ml_lowmem_fits_imm32(tag)) {
             store_imm64_as_imm32(
                 disp, static_cast<uint64_t>(
                           reinterpret_cast<uintptr_t>(tag)));
-        else
-            store(fallback_reg, disp);
+            return;
+        }
+        ML_CHECK_MSG(tag == jit_layout().t_int
+                     || tag == jit_layout().t_float,
+                     "store_type_tag: no register holds this tag - use "
+                     "store_type_tag_via");
+        store(held_reg, disp);
+    }
+    /*
+     * The form for a tag NOTHING holds: imm32 when it fits, else BUILD
+     * it in `scratch` first. `scratch` is clobbered either way.
+     *
+     * ⛔ THIS EXISTS BECAUSE ITS ABSENCE WAS A WRONG ANSWER (found
+     * 2026-08-18, shipped since #96 step 3). `store_dst_bool` wrote the
+     * t_bool tag as `store_type_tag(a.type, t_bool, RCX)` - and when
+     * the imm32 form landed, the `movabs RCX, t_bool` that had made
+     * that true was DELETED as "an instruction removed". Correct while
+     * the tag IS an imm32; on the fallback path (no low arena - a
+     * hardened kernel, an exhausted low 2GB, a failed MAP_32BIT: see
+     * lowmem.h, which says in bold that this is reachable on Linux)
+     * every bool store then wrote whatever RCX happened to hold as the
+     * slot's TYPE POINTER. 8 corpus programs crashed or gave wrong
+     * answers, and NOTHING could see it, because nothing could enter
+     * that path - which is what MYLANG_NO_LOWMEM=1 now fixes.
+     *
+     * The general shape: an optimization that makes a register
+     * UNNECESSARY must not leave behind an argument that says the
+     * register is still LOADED. Delete the parameter or honour it.
+     */
+    void store_type_tag_via(int32_t disp, const void *tag, uint8_t scratch)
+    {
+        if (ml_lowmem_fits_imm32(tag)) {
+            store_imm64_as_imm32(
+                disp, static_cast<uint64_t>(
+                          reinterpret_cast<uintptr_t>(tag)));
+            return;
+        }
+        movabs(scratch, reinterpret_cast<uint64_t>(tag));
+        store(scratch, disp);
     }
     /* mov <dst>, <src>  (GP reg-reg, both 0-15) */
     void mov_rr(uint8_t dst, uint8_t src)
@@ -1823,10 +1869,14 @@ struct Emitter {
      * an ARGUMENT. A new tag reader that does not come through here is
      * a bug; do not add `cmp_<reg>_<reg>` back.
      */
-    void cmp_reg_tag(uint8_t reg, const void *tag, uint8_t fallback_reg)
+    void cmp_reg_tag(uint8_t reg, const void *tag, uint8_t held_reg)
     {
         if (!ml_lowmem_fits_imm32(tag)) {
-            cmp_rr(reg, fallback_reg);
+            /* same promise as store_type_tag's, same tripwire */
+            ML_CHECK_MSG(tag == jit_layout().t_int
+                         || tag == jit_layout().t_float,
+                         "cmp_reg_tag: no register holds this tag");
+            cmp_rr(reg, held_reg);
             return;
         }
         if (reg == 0) {                  /* rax: the short accumulator form */
@@ -5636,13 +5686,17 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
         /* #96: the bool tag as an IMMEDIATE - this used to burn a
          * `movabs RCX` per store purely to have a register to store
          * FROM, so the immediate form removes an instruction here
-         * rather than merely relocating one. */
-        e.store_type_tag(a.type, reinterpret_cast<const void *>(tb), RCX);
+         * rather than merely relocating one. `_via`, not the plain
+         * form: no register holds t_bool, so on the no-arena fallback
+         * this must BUILD it (see store_type_tag_via - the absence of
+         * that was a shipped wrong answer). */
+        e.store_type_tag_via(a.type, reinterpret_cast<const void *>(tb),
+                             RCX);
         e.store(src_reg, a.payload);
         e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
-    e.store_type_tag(a.type, reinterpret_cast<const void *>(tb), RCX);
+    e.store_type_tag_via(a.type, reinterpret_cast<const void *>(tb), RCX);
     e.store(src_reg, a.payload);
 }
 

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <new>
 #include <utility>
 
@@ -80,6 +81,26 @@ struct MlLowmemArena {
     MlLowmemArena()
     {
 #if ML_LOWMEM_SUPPORTED
+        /*
+         * ⛔ MYLANG_NO_LOWMEM=1 - REFUSE THE ARENA, so the fallback the
+         * comment above calls "reachable on Linux too" is REACHABLE BY
+         * A TEST. Without it that path is a shipping configuration
+         * (Darwin, Windows, a hardened kernel, an exhausted low 2GB)
+         * that no local build and no Linux CI lane can enter - and the
+         * JIT behaves MATERIALLY differently in it: every type tag is a
+         * register read rather than an imm32, which decides whether rsi
+         * and r8 are pinnable at all (jit_xcache_busy). A branch only
+         * one platform can take is a branch nobody tests; this is the
+         * same reason the `lto0` CI lane exists.
+         *
+         * Read here and not at each use: the arena is built once at
+         * static init, so one getenv cannot cost anything measurable,
+         * and a per-use switch could flip mid-run and break the
+         * invariant that ONE tested pointer speaks for the rest.
+         */
+        if (const char *s = getenv("MYLANG_NO_LOWMEM"))
+            if (s[0] && s[0] != '0')
+                return;
         /* One page is already ~4x what the type singletons need; the
          * arena deliberately does NOT grow, because a second mapping
          * could land high and silently break the invariant that a

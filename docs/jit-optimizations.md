@@ -5769,3 +5769,56 @@ three programs.
 not the script that reads it.** A workaround in one consumer leaves the
 tool broken for every other consumer, and then rots the next time the
 tool's output changes shape.
+
+## 2026-08-18 - the NO-ARENA configuration, and the wrong answer it hid
+
+`MYLANG_NO_LOWMEM=1` refuses the low-address arena, so the JIT's
+register-form type tags become reachable by a test.
+
+**WHY IT HAD TO EXIST.** `lowmem.h` places `t_int`/`t_float`/`t_bool`
+below 2^31 so a tag store is `mov qword [rbx+d], imm32`. Where that
+mapping is unavailable - Darwin, Windows, a hardened kernel, an
+exhausted low 2GB, **a failed `MAP_32BIT` on an ordinary Linux box** -
+`store_type_tag` and `cmp_reg_tag` fall back to a REGISTER form. The
+header says in bold that this is reachable on Linux. It is also
+materially different emitted code, and it decides whether rsi/r8 can
+hold a pin at all (`jit_xcache_busy`). Nothing could enter it: the
+arena is an `mmap` at static init with no switch. Same shape as the
+`lto0` lane - a configuration only one platform can take is one nobody
+tests.
+
+**WHAT ITS FIRST RUN FOUND - a shipped wrong answer.** `store_dst_bool`
+wrote the bool tag as
+
+    e.store_type_tag(a.type, t_bool, RCX);        /* RCX holds it */
+
+and #96 step 3, making tags immediates, DELETED the `movabs RCX,
+t_bool` that made the third argument true - correctly noting it as "an
+instruction removed rather than relocated", which it is on the arena
+path. Nothing else ever loads a tag into RCX. So on the fallback path
+every bool store wrote **whatever RCX happened to hold as the slot's
+type pointer**. Measured: 7 of 107 corpus programs crashed or answered
+wrongly (`57_bool_reduce` -> a null `Type *` in the ret audit;
+`34_sort_custom_cmp`, `35_map_filter`, `79_dyn_float`,
+`06_calls_closures`, `dyn_template_base`).
+
+WATCHED, with the defect reintroduced and the new ML_CHECK removed:
+
+    ./mylang -rt                     1922/1922  PASS   (blind)
+    corpus_diff.sh                   20/20 agree       (blind)
+    corpus_diff.sh --nolowmem        18/20             CATCHES IT
+
+**THE FIX IS A SEAM SPLIT, not a re-added instruction.**
+`store_type_tag(disp, tag, held_reg)` now ML_CHECKs that `tag` is one
+of the two singletons something actually materialises (t_int in rsi at
+every fragment entry, t_float in r8), because that third parameter is a
+promise a caller can break SILENTLY - and one did. Any other tag must
+use `store_type_tag_via(disp, tag, scratch)`, which BUILDS the value
+when it is not an immediate. `cmp_reg_tag` carries the same tripwire.
+
+**THE RULE: an optimization that makes a register UNNECESSARY must not
+leave behind an argument that says the register is still LOADED.**
+Delete the parameter or honour it.
+
+Nets: `tests/corpus_diff.sh --nolowmem`, plus `-rt` under the same env,
+both in the `Nets` CI lane's `differential` job.
