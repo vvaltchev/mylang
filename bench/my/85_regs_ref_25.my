@@ -1,0 +1,73 @@
+# REGISTER PRESSURE, REFERENCE locals: 25 array PARAMETERS, each
+# read once per iteration. They are non-escaping, so #93/#94 marks
+# them BORROWED - a reference whose refcount is somebody else's
+# problem, i.e. exactly the case whose data pointer could live in a
+# machine register. Today each read re-derives it from the 48-byte
+# frame slot. Four-element arrays and an & mask: no division, no
+# cache pressure, no mispredicts.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func work(array<int> b0, array<int> b1, array<int> b2, array<int> b3, array<int> b4, array<int> b5, array<int> b6, array<int> b7, array<int> b8, array<int> b9, array<int> b10, array<int> b11, array<int> b12, array<int> b13, array<int> b14, array<int> b15, array<int> b16, array<int> b17, array<int> b18, array<int> b19, array<int> b20, array<int> b21, array<int> b22, array<int> b23, array<int> b24, int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var j = i & 3;
+        s = s + b0[j];
+        s = s + b1[j];
+        s = s + b2[j];
+        s = s + b3[j];
+        s = s + b4[j];
+        s = s + b5[j];
+        s = s + b6[j];
+        s = s + b7[j];
+        s = s + b8[j];
+        s = s + b9[j];
+        s = s + b10[j];
+        s = s + b11[j];
+        s = s + b12[j];
+        s = s + b13[j];
+        s = s + b14[j];
+        s = s + b15[j];
+        s = s + b16[j];
+        s = s + b17[j];
+        s = s + b18[j];
+        s = s + b19[j];
+        s = s + b20[j];
+        s = s + b21[j];
+        s = s + b22[j];
+        s = s + b23[j];
+        s = s + b24[j];
+        if ((i & 1) == 0)
+            s = s + 1;
+    }
+    return s;
+}
+
+var v0 = [1, 2, 3, 4];
+var v1 = [2, 3, 4, 5];
+var v2 = [3, 4, 5, 6];
+var v3 = [4, 5, 6, 7];
+var v4 = [5, 6, 7, 8];
+var v5 = [6, 7, 8, 9];
+var v6 = [7, 8, 9, 10];
+var v7 = [8, 9, 10, 11];
+var v8 = [9, 10, 11, 12];
+var v9 = [10, 11, 12, 13];
+var v10 = [11, 12, 13, 14];
+var v11 = [12, 13, 14, 15];
+var v12 = [13, 14, 15, 16];
+var v13 = [14, 15, 16, 17];
+var v14 = [15, 16, 17, 18];
+var v15 = [16, 17, 18, 19];
+var v16 = [17, 18, 19, 20];
+var v17 = [18, 19, 20, 21];
+var v18 = [19, 20, 21, 22];
+var v19 = [20, 21, 22, 23];
+var v20 = [21, 22, 23, 24];
+var v21 = [22, 23, 24, 25];
+var v22 = [23, 24, 25, 26];
+var v23 = [24, 25, 26, 27];
+var v24 = [25, 26, 27, 28];
+var N = 2000000 * scale;
+print("result:", work(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, N));

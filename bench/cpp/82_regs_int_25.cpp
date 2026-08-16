@@ -1,0 +1,124 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Faithful C++ of bench/my/82_regs_int_25.my - the REGISTER-PRESSURE
+ * family. 25 independent loop-carried accumulators: at this count the
+ * compiler must SPILL some of them. -fwrapv matches MyLang's
+ * wrapping int64. */
+#include "bench.h"
+
+__attribute__((noinline)) static long work(long n)
+{
+    long a0 = 1;
+    long a1 = 2;
+    long a2 = 3;
+    long a3 = 4;
+    long a4 = 5;
+    long a5 = 6;
+    long a6 = 7;
+    long a7 = 8;
+    long a8 = 9;
+    long a9 = 10;
+    long a10 = 11;
+    long a11 = 12;
+    long a12 = 13;
+    long a13 = 14;
+    long a14 = 15;
+    long a15 = 16;
+    long a16 = 17;
+    long a17 = 18;
+    long a18 = 19;
+    long a19 = 20;
+    long a20 = 21;
+    long a21 = 22;
+    long a22 = 23;
+    long a23 = 24;
+    long a24 = 25;
+    for (long i = 0; i < n; i++) {
+        a0 = a0 + i;
+        a0 = a0 ^ (a0 >> 3);
+        a1 = a1 + i;
+        a1 = a1 ^ (a1 >> 4);
+        a2 = a2 + i;
+        a2 = a2 ^ (a2 >> 5);
+        a3 = a3 + i;
+        a3 = a3 ^ (a3 >> 6);
+        a4 = a4 + i;
+        a4 = a4 ^ (a4 >> 7);
+        a5 = a5 + i;
+        a5 = a5 ^ (a5 >> 3);
+        a6 = a6 + i;
+        a6 = a6 ^ (a6 >> 4);
+        a7 = a7 + i;
+        a7 = a7 ^ (a7 >> 5);
+        a8 = a8 + i;
+        a8 = a8 ^ (a8 >> 6);
+        a9 = a9 + i;
+        a9 = a9 ^ (a9 >> 7);
+        a10 = a10 + i;
+        a10 = a10 ^ (a10 >> 3);
+        a11 = a11 + i;
+        a11 = a11 ^ (a11 >> 4);
+        a12 = a12 + i;
+        a12 = a12 ^ (a12 >> 5);
+        a13 = a13 + i;
+        a13 = a13 ^ (a13 >> 6);
+        a14 = a14 + i;
+        a14 = a14 ^ (a14 >> 7);
+        a15 = a15 + i;
+        a15 = a15 ^ (a15 >> 3);
+        a16 = a16 + i;
+        a16 = a16 ^ (a16 >> 4);
+        a17 = a17 + i;
+        a17 = a17 ^ (a17 >> 5);
+        a18 = a18 + i;
+        a18 = a18 ^ (a18 >> 6);
+        a19 = a19 + i;
+        a19 = a19 ^ (a19 >> 7);
+        a20 = a20 + i;
+        a20 = a20 ^ (a20 >> 3);
+        a21 = a21 + i;
+        a21 = a21 ^ (a21 >> 4);
+        a22 = a22 + i;
+        a22 = a22 ^ (a22 >> 5);
+        a23 = a23 + i;
+        a23 = a23 ^ (a23 >> 6);
+        a24 = a24 + i;
+        a24 = a24 ^ (a24 >> 7);
+        if ((i & 1) == 0)
+            a0 = a0 + 1;
+    }
+    long s = 0;
+    s = s + a0;
+    s = s + a1;
+    s = s + a2;
+    s = s + a3;
+    s = s + a4;
+    s = s + a5;
+    s = s + a6;
+    s = s + a7;
+    s = s + a8;
+    s = s + a9;
+    s = s + a10;
+    s = s + a11;
+    s = s + a12;
+    s = s + a13;
+    s = s + a14;
+    s = s + a15;
+    s = s + a16;
+    s = s + a17;
+    s = s + a18;
+    s = s + a19;
+    s = s + a20;
+    s = s + a21;
+    s = s + a22;
+    s = s + a23;
+    s = s + a24;
+    return s;
+}
+
+int main(int argc, char **argv)
+{
+    long scale = bench_scale(argc, argv);
+    long N = 2000000L * scale;
+    printf("result: %ld\n", work(N));
+    return 0;
+}

@@ -1,0 +1,54 @@
+# REGISTER PRESSURE: 8 int locals, each with its OWN loop-carried
+# recurrence so they are INDEPENDENT (N-way ILP -> the throughput
+# regime, where a frame-slot round-trip actually costs) and no
+# compiler can vectorize them. The condition alternates with
+# period 2, so no mispredicts. Nothing allocates; everything is in L1.
+# The my/cpp ratio ACROSS the family (8/14/25/40) is the measurement:
+# C++ spills too once the locals outnumber the registers.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func work(int n) {
+    int a0 = 1;
+    int a1 = 2;
+    int a2 = 3;
+    int a3 = 4;
+    int a4 = 5;
+    int a5 = 6;
+    int a6 = 7;
+    int a7 = 8;
+    for (var i = 0; i < n; i++) {
+        a0 = a0 + i;
+        a0 = a0 ^ (a0 >> 3);
+        a1 = a1 + i;
+        a1 = a1 ^ (a1 >> 4);
+        a2 = a2 + i;
+        a2 = a2 ^ (a2 >> 5);
+        a3 = a3 + i;
+        a3 = a3 ^ (a3 >> 6);
+        a4 = a4 + i;
+        a4 = a4 ^ (a4 >> 7);
+        a5 = a5 + i;
+        a5 = a5 ^ (a5 >> 3);
+        a6 = a6 + i;
+        a6 = a6 ^ (a6 >> 4);
+        a7 = a7 + i;
+        a7 = a7 ^ (a7 >> 5);
+        if ((i & 1) == 0)
+            a0 = a0 + 1;
+    }
+    var s = 0;
+    s = s + a0;
+    s = s + a1;
+    s = s + a2;
+    s = s + a3;
+    s = s + a4;
+    s = s + a5;
+    s = s + a6;
+    s = s + a7;
+    return s;
+}
+
+var N = 2000000 * scale;
+print("result:", work(N));
