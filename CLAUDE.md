@@ -1209,9 +1209,15 @@ and it lives *inside the parser*. Mechanics:
   REPL skip wholesale via `g_dev_builtins_allowed`, so a check placed there is
   invisible to every test) nor behind `checks_enabled` (`-nti` must not turn a
   syntactic rule off); (3) the FIX-1 exemption is NARROWER than the TDZ one —
-  the resolver's `no_tdz_check` covers every lazy builtin (asking about a name
-  in its TDZ is the whole point), but `no_undef_check` skips `isbound`, since
-  asking whether a name declared NOWHERE is bound is the ordinary #130 error.
+  every lazy builtin is exempt from BOTH (`no_tdz_check` and `no_undef_check`),
+  so a name declared NOWHERE answers `false` rather than erroring. That was
+  the reverse until 2026-08-09, when the maintainer made the short form the
+  point: `isbound(x)` ALONE is the feature test, where the conjunction
+  `defined(x) && isbound(x)` used to be required. The typo hazard it accepts
+  is one `defined()` already had, so the two lazy queries are now consistent.
+  `isbound` is a #135 NARROWING GUARD for the same reason — without that, the
+  `print(x)` inside `if (isbound(x)) { ... }` would still be refused and the
+  short form would not work at all.
   `builtin_isbound` reads `sym` off the Identifier and never evaluates it —
   evaluating an unbound global throws the very `UnboundSymbolEx` the call
   exists to avoid. The lexical kinds fold in `try_fold_isbound`; a GLOBAL is

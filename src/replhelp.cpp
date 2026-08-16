@@ -133,10 +133,13 @@ const BuiltinDoc builtin_docs[] = {
 { "isbound", "reflect", "isbound(x)",
   "True if x's DECLARATION has run yet (the other half of defined()).",
   "False inside the temporal dead zone - between scope entry and the "
-  "declaration statement. Lexical kinds (param, capture, builtin, local) "
-  "answer at compile time; a GLOBAL read from a function body is a genuine "
-  "runtime query. The argument must be an identifier (`none` and `len` "
-  "qualify, `3` and \"x\" do not) and is never evaluated." },
+  "declaration statement - and false for a name that exists nowhere, so "
+  "isbound(x) alone is the feature test. Lexical kinds (param, capture, "
+  "builtin, local) answer at compile time; a GLOBAL read from a function "
+  "body is a genuine runtime query. The argument must be an identifier "
+  "(`none` and `len` qualify, `3` and \"x\" do not) and is never evaluated. "
+  "It also GUARDS: inside if (isbound(x)) { ... }, x may be used even if it "
+  "is declared nowhere." },
 { "isconst", "reflect", "isconst(x)",
   "True if x is effectively const (literal, const, const-expr, or auto-const).",
   nullptr },

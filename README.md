@@ -461,14 +461,15 @@ refused, `defined(x)` is the way to ask about one — and inside the branch it
 guards, *that* name is tolerated:
 
 ```C#
-if (defined(x)) { print(x); }        # fine - `x` was checked
-if (defined(x)) { print(x, y); }     # ERROR: `y` was not
-if (defined(x) && defined(y)) { print(x, y); }   # fine - both were
+if (isbound(x)) { print(x); }        # fine - `x` was checked
+if (isbound(x)) { print(x, y); }     # ERROR: `y` was not
+if (isbound(x) && isbound(y)) { print(x, y); }   # fine - both were
 ```
 
-Only the checked name, only in the branch the check proves: the `else` arm,
-`!defined(x)`, an `||` chain, and anything after the `if` are unaffected. When
-`x` really does not exist the guarded code is also *deleted* — `defined(x)`
+Either query guards — `isbound(x)` is the usual one, `defined(x)` works too.
+Only the checked name, and only in the branch the check proves: the `else` arm,
+a negated guard, an `||` chain, and anything after the `if` are unaffected.
+When `x` really does not exist the guarded code is also *deleted* — the guard
 folds to `false` and the dead branch is dropped.
 
 **Nesting is bounded.** Expressions and blocks may nest up to 256 levels; past
@@ -2547,9 +2548,13 @@ is bound when the declaration statement executes.
 
 | `name` is... | `defined(name)` | `isbound(name)` |
 |---|---|---|
-| declared nowhere | `false` | **compile error** |
+| declared nowhere | `false` | `false` |
 | declared, declaration not yet run | `true` | `false` |
 | declared, declaration has run | `true` | `true` |
+
+So **`isbound(x)` alone is the feature test** — it answers "can I use this right
+now", which is what a guard wants. `defined(x)` is the narrower, rarer question
+"does this name exist at all", true even where the value is not there yet.
 
 ```C#
 func f() {
@@ -2563,7 +2568,9 @@ func f() {
 The argument is **unevaluated** (which is the point — reading an unbound
 global is the very `UnboundSymbolEx` this lets a script avoid) and must be an
 **identifier**: `isbound(len)` and `isbound(none)` are fine, `isbound(3)` and
-`isbound("x")` are compile errors, as is any wrong arity. Like `defined`, it
+`isbound("x")` are compile errors, as is any wrong arity. It also acts as a
+guard, so `if (isbound(x)) { print(x); }` compiles even when `x` exists
+nowhere. Like `defined`, it
 can only be *called* — the bare name is not usable as a value.
 
 For a parameter, a capture, a builtin or a local the answer is decided at

@@ -563,6 +563,21 @@ private:
             MakeConstructFromConstVal(EvalValue(true), slot, false);
             return true;
         }
+        /*
+         * A name that exists NOWHERE is not bound -> `false`, the same shape
+         * try_fold_defined uses. This is an OPTIMIZATION, not a correctness
+         * fix, and the distinction is worth stating because the obvious
+         * assumption is the other way: the runtime path answers correctly
+         * without it (builtin_isbound's unresolved arm evaluates the
+         * Identifier, which yields the UndefinedId sentinel), so removing the
+         * fold leaves the whole suite green in all five modes - measured.
+         * What it buys is eliminating the call. NOT in the REPL, where an
+         * unresolved name may be an open-world map global.
+         */
+        if (k == SymKind::unresolved && !repl_mode) {
+            MakeConstructFromConstVal(EvalValue(false), slot, false);
+            return true;
+        }
         return false;   /* global -> runtime; unresolved -> the REPL's map */
     }
 
@@ -1394,7 +1409,14 @@ private:
          * help - which is why no test can catch that mistake. Named rather
          * than left to chance. */
         const auto *cid = dynamic_cast<const Identifier *>(call->what.get());
-        if (!cid || cid->get_str() != "defined")
+        if (!cid)
+            return;
+        /* `isbound` guards too: since it answers `false` for a name that
+         * exists nowhere, `if (isbound(x)) { print(x); }` is THE short
+         * feature test - and without narrowing here the `print(x)` inside it
+         * would still be refused, so the short form would not work at all. */
+        const std::string_view gname = cid->get_str();
+        if (gname != "defined" && gname != "isbound")
             return;
         if (const auto *arg =
                 dynamic_cast<const Identifier *>(call->args->elems[0].get()))
@@ -1460,7 +1482,7 @@ private:
             /* a lazy builtin's argument is a question ABOUT the name, not a
              * use of its value - `isbound(g)` is how a program copes with a
              * name it cannot order above itself */
-            if (id->sym.kind != SymKind::global || er.lazy_any)
+            if (id->sym.kind != SymKind::global || er.lazy_arg)
                 continue;
 
             auto it = decl_at.find(id->uid);
@@ -1716,15 +1738,6 @@ private:
                                  * the FIX-1 check for a function-body
                                  * reference runs after the walk, when the
                                  * guard stack is long gone */
-        bool lazy_any;          /* the use is ANY lazy builtin's argument,
-                                 * `isbound` INCLUDED. Wider than lazy_arg on
-                                 * purpose: isbound(zz) on a name declared
-                                 * NOWHERE is still a FIX-1 error (there is
-                                 * nothing for it to be bound to), but
-                                 * isbound(g) is not a USE of g's value, so
-                                 * --strict must not demand g be declared
-                                 * above it - that call is precisely how a
-                                 * program copes with the order it cannot fix */
     };
 
     /* Set while walking a lazy builtin's arguments - see the CallExpr walk. */
@@ -2121,8 +2134,7 @@ private:
             escaped.insert(id->uid);
             escaped_refs.push_back(
                 EscapedRef{ id, declared_in_live_scopes(cur, id->uid),
-                            no_undef_check, is_guarded(id->uid),
-                            no_tdz_check });
+                            no_undef_check, is_guarded(id->uid) });
             return;
         }
 
@@ -2850,10 +2862,14 @@ Resolver::walk(Construct *c, FuncState *cur)
          * must answer rather than throw (that is what lets try_fold_defined /
          * try_fold_isbound fold it).
          *
-         * The FIX-1 exemption is NARROWER: only `defined` may ask about a
-         * name declared NOWHERE ("does this exist?" - answer false).
-         * `isbound(zz)` on such a name asks whether something that can never
-         * exist has been bound, so it stays the ordinary compile error. */
+         * `isbound` is exempt TOO (maintainer, 2026-08-09 - it was not, until
+         * the short form proved to be what programs want): asking whether a
+         * name that exists nowhere is bound has the obvious answer `false`,
+         * and refusing it forced every feature test to spell out
+         * `defined(x) && isbound(x)`. The typo hazard that buys is one
+         * `defined()` already accepts - `defined(confg)` folds to false in
+         * silence - so this makes the two lazy queries consistent rather than
+         * adding a new class of risk. */
         const Identifier *cid = dynamic_cast<Identifier *>(call->what.get());
         const bool lazy = cid && is_lazy_builtin(cid->uid);
         const bool saved_nc = no_undef_check;
@@ -2861,8 +2877,7 @@ Resolver::walk(Construct *c, FuncState *cur)
 
         if (lazy) {
             no_tdz_check = true;
-            if (cid->get_str() != "isbound")
-                no_undef_check = true;
+            no_undef_check = true;
         }
 
         if (call->args)
