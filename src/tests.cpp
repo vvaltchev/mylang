@@ -27899,27 +27899,72 @@ static bool jit_borrow_arg_shapes()
         return false;
 
     /*
-     * DECLINES - the callee STORES the argument into a global, so the
-     * reference outlives the call and the analysis must never claim it.
-     * Nothing else in this program passes a reference, so the counter is
-     * attributable: any bump here is the escape rule failing.
+     * DECLINES - the callee writes a GLOBAL, so it might drop the very
+     * reference some caller passed it.
+     *
+     * ⛔ WRITTEN AS A REAL USE-AFTER-FREE, not a counter check. `g` is the
+     * only holder of the array, `drop` is handed it, and `g = [9, 9, 9]`
+     * releases it MID-CALL - so if the parameter had been borrowed (no
+     * retain), the read after that line touches freed memory. ASan is the
+     * detector; the value assertion is the second net. A test that only
+     * watched `g_arg_borrow` stay flat would pass just as well against a
+     * borrow that happened to be harmless in this shape, which is the whole
+     * difference between checking a counter and checking the hazard.
      */
     b0 = g_arg_borrow;
-    if (!run({ "var keep = [0];",
-               "func stash(array a, int k) {",
-               "  var t = a[0] + k;",
-               "  var u = t * 2;",
-               "  keep = a;",
-               "  return u - t;",
+    if (!run({ "var g = [1, 2, 3];",
+               "func drop(array a, int k) {",
+               "  var x = a[0];",
+               "  g = [9, 9, 9];",
+               "  var y = a[1];",
+               "  return x * 100 + y * 10 + k;",
                "}",
-               "var arr = [7, 8];",
                "var s = 0;",
-               "for (var i = 0; i < 60; i++) s += stash(arr, i);",
-               "assert(s == 2190);",
-               "assert(keep[0] == 7);" }))
+               "for (var i = 0; i < 60; i++) {",
+               "  g = [1, 2, 3];",
+               "  s = s + drop(g, 0);",
+               "}",
+               /* a[1] must still read the OLD array's 2 */
+               "assert(s == 60 * 120);" }))
         return false;
     if (g_arg_borrow != b0)
         return false;
+
+    /*
+     * DECLINES PER CALLEE at a POLYMORPHIC site - the emitted push reaches
+     * its callee through an inline CACHE, so the noescape bit cannot be
+     * baked at emit time and must be read from whichever descriptor the
+     * call actually lands on. This site alternates between a callee that
+     * drops the caller's last reference mid-call and one that does not: the
+     * borrow must follow the callee, so `plain` borrows and `dropper` never
+     * does. Reading a stale or baked bit is a use-after-free in `dropper`,
+     * caught by ASan and by the value.
+     */
+    b0 = g_arg_borrow;
+    if (!run({ "var g = [1, 2, 3];",
+               "func dropper(array<int> a, int k) {",
+               "  var x = a[0];",
+               "  g = [9, 9, 9];",
+               "  var y = a[1];",
+               "  return x + y;",
+               "}",
+               "func plain(array<int> a, int k) {",
+               "  var t = a[0] + a[1];",
+               "  var u = t * 2;",
+               "  var v = u - t;",
+               "  return v;",
+               "}",
+               "var ops = [dropper, plain];",
+               "var s = 0;",
+               "for (var i = 0; i < 80; i++) {",
+               "  g = [1, 2, 3];",
+               "  var fn = ops[i % 2];",
+               "  s = s + fn(g, i);",
+               "}",
+               "assert(s == 80 * 3);" }))
+        return false;
+    if (g_arg_borrow <= b0)
+        return false;         /* `plain` must still borrow at this site */
 
     /*
      * DECLINES - a SLICE value. The parameter IS cleared by the analysis
@@ -27950,24 +27995,93 @@ static bool jit_borrow_arg_shapes()
         return false;         /* the slice never reached the decline */
 
     /*
-     * DECLINES - a SCALAR parameter. The analysis skips it (there is no
-     * reference to borrow), and the bind must too: the release scan leaves a
-     * trivial slot alone, so a borrowed int would keep its flag set forever
-     * and the next call to reuse that window slot would rebind over it.
+     * PER POSITION - parameter 0 is claimed and parameter 1 is not, in the
+     * SAME call. `safe` is only ever a subscript base, so it keeps its bit;
+     * `victim` is handed to `keeper`, which RETURNS it, so the fixpoint
+     * clears that bit and only that bit. The mask is 0b01.
+     *
+     * ⛔ THIS IS THE ONLY CASE THAT READS THE SHIFT. The emitted push loads
+     * the whole `noescape_params` word and shifts it by the argument index;
+     * every other case here has both parameters agreeing, so a push that
+     * tested bit 0 for EVERY argument would satisfy all of them. Watched:
+     * replacing `shr rdx, i` with a no-op leaves the rest of this test
+     * green and fails here.
+     *
+     * The count is exact rather than a lower bound, because that is the
+     * whole assertion: ONE of the two reference arguments borrows per call,
+     * and `keeper`'s own parameter borrows never. Both bind paths read the
+     * bit per position, so the tier a given call takes cannot change it.
      */
     b0 = g_arg_borrow;
-    if (!run({ "func addk(int a, int k) {",
-               "  var t = a + k;",
+    if (!run({ "func keeper(array<int> v) {",
+               "  var t = v[0];",
                "  var u = t * 2;",
-               "  var v = u - t;",
+               "  var w = u - t;",
+               "  if (w > 100000) { return [0]; }",
                "  return v;",
                "}",
+               "func mix(array<int> safe, array<int> victim) {",
+               "  var t = safe[0] + safe[1];",
+               "  var r = keeper(victim);",
+               "  var q = r[0];",
+               "  return t + q;",
+               "}",
+               "var a1 = [1, 2];",
+               "var a2 = [5, 6];",
                "var s = 0;",
-               "for (var i = 0; i < 60; i++) s += addk(i, 3);",
-               "assert(s == 1950);" }))
+               "for (var i = 0; i < 60; i++) s = s + mix(a1, a2);",
+               "assert(s == 480);" }))
+        return false;
+    if (g_arg_borrow - b0 != 60)
+        return false;         /* 2 per call == the index shift was dropped */
+
+    /*
+     * DECLINES - a parameter the analysis CLAIMS whose VALUE is a scalar.
+     *
+     * The rule matters because the release scan leaves a trivial slot
+     * alone: a borrowed int keeps its flag set FOREVER, and the next call
+     * to reuse that window slot rebinds over a slot still marked borrowed.
+     * That is what ackermann hit.
+     *
+     * ⛔ THREE THINGS THIS CASE NEEDS, AND IT WAS VACUOUS FOR WANT OF THE
+     * FIRST TWO - twice, in two different ways:
+     *  1. THE PARAMETER MUST NOT BE ANNOTATED. `func addk(int a, ...)`
+     *     makes `binds_scalar()` true, so the ANALYSIS skips it and
+     *     `can_borrow` is false before the runtime rule is ever consulted.
+     *  2. IT MUST NOT BE READ IN A NON-BASE POSITION EITHER. `dyn a` with
+     *     a body that so much as copies `a` has its bit cleared by the
+     *     scan, and a `dyn` parameter that only ever receives ints gets
+     *     `proven_type = i` (C3) and becomes `binds_scalar` after all. A
+     *     parameter the body never reads is claimed unconditionally, which
+     *     is what a fixed-signature callback looks like in real code.
+     *  3. THE JIT MUST BE OFF. The emitted push's SCALAR arm raw-copies
+     *     without calling the helper at all, so it cannot reach this rule;
+     *     only the C++ bind path can, and that is precisely where
+     *     ackermann's deep recursion lives. With the JIT on this shape
+     *     bumps twice (the pre-warmup calls) instead of 120 times - a
+     *     count too close to zero to assert on.
+     *
+     * `g_arg_borrow_scalar` is what makes the decline POSITIVE EVIDENCE
+     * rather than the absence of a bump: without it the case cannot tell
+     * "declined here" from "never reached the bind", which is exactly how
+     * both earlier versions passed while testing nothing.
+     */
+    b0 = g_arg_borrow;
+    unsigned long c0 = g_arg_borrow_scalar;
+    const bool saved_jit = g_jit_enabled;
+    g_jit_enabled = false;
+    const bool scalar_ok =
+        run({ "func ig(dyn a, dyn b) { return 2; }",
+              "var s = 0;",
+              "for (var i = 0; i < 60; i++) s = s + ig(i, i);",
+              "assert(s == 120);" });
+    g_jit_enabled = saved_jit;
+    if (!scalar_ok)
         return false;
     if (g_arg_borrow != b0)
         return false;
+    if (g_arg_borrow_scalar <= c0)
+        return false;         /* the analysis never claimed it - vacuous */
     return true;
 #else
     return true;
@@ -28354,6 +28468,7 @@ static bool jit_counter_coverage()
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
         { "arg_borrow",       &g_arg_borrow,           nullptr },
         { "arg_borrow_slice", &g_arg_borrow_slice,     nullptr },
+        { "arg_borrow_scal",  &g_arg_borrow_scalar,    nullptr },
         { "arg_inplace",      &g_jit_arg_inplace,      nullptr },
         { "arg_stage",        &g_jit_arg_stage,        nullptr },
         { "inline_baked",     &g_jit_inline_baked,     nullptr },

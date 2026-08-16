@@ -3495,30 +3495,9 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.patch32_here(j_norec_join);
     st(R8R, static_cast<int32_t>(P.act_vframe + P.frame_slots), RDX);
     st32(R8R, static_cast<int32_t>(P.act_vframe + P.frame_size), RSI);
-    /*
-     * container / container_idx / is_const / borrowed = 0, for every
-     * argument slot.
-     *
-     * ⛔ THIS MUST RUN BEFORE THE COPY LOOP, not after it (#94). The
-     * qword at +40 covers container_idx AND both flag bytes, so zeroing
-     * it after the binds would wipe the `borrowed` flag the reference arm
-     * has just set - and a borrowed slot that reads as un-borrowed is
-     * released at the frame pop, decrementing a count it never took. A
-     * use-after-free, from a store that looks like tidy-up. The slot is
-     * dead memory here either way (the window was pushed above), and both
-     * bind arms write these fields themselves, so moving it up is
-     * otherwise a no-op.
-     */
-    if (NARGS) {                       /* the zeroing constant, if anyone
-                                        * zeroes: a 0-arg callee had it dead */
-        e.u8(0x45); e.u8(0x31); e.u8(0xDB);           /* xor r11d, r11d */
-        for (int i = 0; i < NARGS; i++) {
-            st(RDX, i * 48 + 32, R11);
-            st(RDX, i * 48 + 40, R11);
-        }
-    }
-    /* fast_bind arg copies (unrolled; trivial payloads - guarded above):
-     * 24B payload + 8B type copied */
+    /* fast_bind arg copies (unrolled): 24B payload + 8B type copied, and
+     * the container / flag tail zeroed BY THE SCALAR ARM ONLY - see the
+     * note there. */
     for (int i = 0; i < NARGS; i++) {
         /* #162: a fused argument's bytes come from the CALLER'S slot -
          * the staging MoveV that would have copied them here was never
@@ -3542,6 +3521,23 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
             ld(R11, RBX, s + o);
             st(RDX, d + o, R11);
         }
+        /*
+         * container / container_idx / is_const / borrowed = 0 - and this
+         * belongs INSIDE the scalar arm, which is the only arm that needs
+         * it. The reference arm's helper writes all four fields itself.
+         *
+         * ⛔ IT USED TO BE ONE LOOP AFTER ALL THE BINDS, and #94 made that
+         * a use-after-free: the qword at +40 covers container_idx AND both
+         * flag bytes, so the tidy-up store wiped the `borrowed` flag the
+         * reference arm had just set, and a borrowed slot that reads as
+         * un-borrowed is RELEASED at the frame pop - decrementing a count
+         * it never took. Scoping the stores to the arm that wants them
+         * removes the ordering question instead of documenting it, and it
+         * makes the reference arm two stores cheaper.
+         */
+        e.u8(0x45); e.u8(0x31); e.u8(0xDB);           /* xor r11d, r11d */
+        st(RDX, d + 32, R11);
+        st(RDX, d + 40, R11);
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_ref);
         /*
@@ -5406,6 +5402,7 @@ void jit_stats_report()
          * reachable but every value declined" cannot be confused. */
         { "arg_borrow",       &g_arg_borrow },
         { "arg_borrow_slice", &g_arg_borrow_slice },
+        { "arg_borrow_scal",  &g_arg_borrow_scalar },
         { "ret_inline",       &g_jit_ret_inline },
         { "entry_resume",     &g_jit_entry_resume },
         /* G1 no-record tier step 1 (the shadow-verified side table) */
