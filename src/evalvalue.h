@@ -297,6 +297,22 @@ public:
         return type;
     }
 
+    /*
+     * DROP the value WITHOUT releasing it: reset the tag to `none` and leave
+     * the payload bytes as they are, so no destructor and no refcount
+     * decrement runs.
+     *
+     * ⛔ CORRECT IN EXACTLY ONE PLACE, and everywhere else it LEAKS: a
+     * BORROWED argument slot (#94), whose payload is a raw bit-copy of a
+     * caller slot that owns the reference for the whole of the synchronous
+     * call. Reached only through LValue::frame_release(), which asks the
+     * slot's own `borrowed` flag - do not call it directly.
+     */
+    void abandon_borrowed() {
+        type = AllTypes[Type::t_none];
+        val.ival = 0;
+    }
+
     template <class T>
     T &get() {
 
@@ -613,6 +629,16 @@ private:
      */
     bool is_const;
 
+    /*
+     * #94: this slot's value is BORROWED - a raw bit-copy of a reference the
+     * CALLER's slot owns for the whole of the synchronous call, bound with no
+     * retain. So the frame pop must NOT release it (that would decrement a
+     * count this slot never incremented - a use-after-free, not a leak):
+     * frame_release() drops the tag instead. Shares is_const's tail padding,
+     * so the slot does not grow; the setter is mark_borrowed().
+     */
+    bool borrowed;
+
     LValue clone();
     EvalValue &get_value_for_put();
     void put_slow(const EvalValue &v);   /* container-backed (COW) put */
@@ -630,12 +656,13 @@ public:
      * inline array of slots; the value is always `none` here, so type_checks()
      * would trivially pass and is skipped to keep this cheap (runs per slot).
      */
-    LValue() : val(), container(nullptr), is_const(false) { }
+    LValue() : val(), container(nullptr), is_const(false), borrowed(false) { }
 
     LValue(const EvalValue &val, bool is_const)
         : val(val)
         , container(nullptr)
         , is_const(is_const)
+        , borrowed(false)
     {
         type_checks();
     }
@@ -644,6 +671,7 @@ public:
         : val(std::move(val))
         , container(nullptr)
         , is_const(is_const)
+        , borrowed(false)
     {
         type_checks();
     }
@@ -654,6 +682,7 @@ public:
      * VM slot write); an ARRAY-ELEMENT put (container set - the COW path)
      * takes the out-of-line slow put. */
     void put(const EvalValue &v) {
+        ML_CHECK(!borrowed);
         if (!container) {
             val = v;
             type_checks();
@@ -662,6 +691,7 @@ public:
         put_slow(v);
     }
     void put(EvalValue &&v) {
+        ML_CHECK(!borrowed);
         if (!container) {
             val = static_cast<EvalValue &&>(v);
             type_checks();
@@ -694,17 +724,65 @@ public:
         return static_cast<EvalValue &&>(val);
     }
 
+    /*
+     * ⛔ The two ML_CHECKs state what makes the borrow (#94) sound and are
+     * PROVEN REDUNDANT rather than tested, the esc_final_mask pattern: a
+     * parameter the escape analysis marks non-escaping is never one the body
+     * WRITES (`f.mask & f.written` is asserted empty there), and the frame pop
+     * clears every ref_slot, so no reused window slot can still be borrowed
+     * when the next call binds it. Overwriting a borrowed slot would release
+     * a count it never took, so the failure direction is a use-after-free -
+     * which is why the invariant is asserted at the write rather than left to
+     * a comment. No test can reach either; both fire if a future change makes
+     * them reachable.
+     */
     void rebind(const EvalValue &v) {
+        ML_CHECK(!borrowed);
         val = v;
         container = nullptr;
         is_const = false;
         type_checks();
     }
     void rebind(EvalValue &&v) {
+        ML_CHECK(!borrowed);
         val = static_cast<EvalValue &&>(v);
         container = nullptr;
         is_const = false;
         type_checks();
+    }
+
+    /*
+     * #94: bind this slot to a BORROWED reference - the payload is already a
+     * raw bit-copy of the caller's slot, taken with no retain. See the
+     * `borrowed` member. The caller owns the reference for the whole of the
+     * synchronous call, which is what makes the elided retain sound.
+     */
+    void mark_borrowed() { borrowed = true; }
+    bool is_borrowed() const { return borrowed; }
+
+    /*
+     * THE ONE PLACE A DYING FRAME'S SLOT IS RELEASED. Every release scan
+     * goes through it - pop_window's two arms, the three no-record raise /
+     * return paths, the callback window pop, and the JIT's cold
+     * jit_release_slot - because the borrow (#94) makes the decision
+     * PER SLOT, and a scan that open-codes `lv = LValue()` would release a
+     * count the slot never took. That is a use-after-free, so this is a
+     * method rather than a rule: six of the seven sites predate the flag and
+     * none of them can forget it now.
+     *
+     * The plain assignment is what unregisters a SLICE from its parent's
+     * live-slices set, so it cannot be reduced to a refcount decrement (the
+     * jit_bind_ref_arg lesson, from the push side).
+     */
+    void frame_release() {
+        if (borrowed) {
+            val.abandon_borrowed();
+            borrowed = false;
+            container = nullptr;
+            is_const = false;
+            return;
+        }
+        *this = LValue();
     }
 
     bool is_const_var() const { return is_const; }
@@ -736,6 +814,15 @@ public:
         return val != rhs.val;
     }
 };
+
+/*
+ * #94: `borrowed` shares `is_const`'s tail padding, so a slot did NOT grow -
+ * the emitter bakes a 48-byte stride (jit.cpp static_asserts the concrete
+ * number, but only where ML_JIT_SUPPORTED, so state it here too). Vacuous on
+ * MSVC, whose 8-byte size_type already pushes the flags out of the padding.
+ */
+static_assert(sizeof(size_type) != 4 || sizeof(LValue) == 48,
+              "`borrowed` must fit the tail padding, not grow the slot");
 
 inline EvalValue
 RValue(const EvalValue &v)

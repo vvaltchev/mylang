@@ -1979,7 +1979,7 @@ struct VmActivation {
                     break;               /* sorted */
                 LValue &lv = rec.window[s];
                 if (lv.get().get_type()->t >= Type::t_str)
-                    lv = LValue();
+                    lv.frame_release();
             }
 #if ML_VM_HARDENING
             for (int_type i = 0; i < rec.nslots; i++)
@@ -1990,7 +1990,7 @@ struct VmActivation {
             for (int_type i = 0; i < rec.nslots; i++) {
                 LValue &lv = rec.window[i];
                 if (lv.get().get_type()->t >= Type::t_str)
-                    lv = LValue();
+                    lv.frame_release();
             }
         }
 
@@ -5959,7 +5959,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
                 break;
             LValue &lv = win[s];
             if (lv.get().get_type()->t >= Type::t_str)
-                lv = LValue();
+                lv.frame_release();
         }
         act.cur_sg->cur -= total;
         const char *fp = static_cast<const char *>(frag_rbp);
@@ -6076,7 +6076,7 @@ void *jit_addr_resume_chunk()
  * reference; the emitted check mirrors the scan's own type test. */
 extern "C" void jit_release_slot(LValue *lv) noexcept
 {
-    *lv = LValue();
+    lv->frame_release();
 }
 
 extern "C" void jit_member_fact_audit(int_type slot,
@@ -6660,7 +6660,7 @@ vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
         if (sidx >= total)
             break;                       /* sorted */
         if (win[sidx].get().get_type()->t >= Type::t_str)
-            win[sidx] = LValue();
+            win[sidx].frame_release();
     }
 #if ML_VM_HARDENING
     for (int_type i = 0; i < total; i++)
@@ -7144,7 +7144,7 @@ extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
             break;
         LValue &lv = win[s];
         if (lv.get().get_type()->t >= Type::t_str)
-            lv = LValue();
+            lv.frame_release();
     }
     act.cur_sg->cur -= total;
     ctx.captures = *reinterpret_cast<CaptureSlots *const *>(
@@ -7407,7 +7407,7 @@ jit_norec_postexit(size_t r, int_type site_packed, LValue *caller_win,
             break;
         LValue &lv = win[s];
         if (lv.get().get_type()->t >= Type::t_str)
-            lv = LValue();
+            lv.frame_release();
     }
     act.cur_sg->cur -= total;
     ctx.captures = static_cast<CaptureSlots *>(
