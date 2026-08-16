@@ -6911,10 +6911,43 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * A NAMED func/struct declaration binds at SCOPE ENTRY, not where the
+     * statement sits (#134) - so a call to a function declared BELOW the call
+     * works, at every scope. Sound because such a declaration cannot depend on
+     * the enclosing frame: the grammar REJECTS a capture list on a named func
+     * (`func f[a](x)` is a SyntaxError - captures are for closure EXPRESSIONS
+     * only) and a named func's body is parented to the program root, so it
+     * cannot read an enclosing local either.
+     *
+     * A LAMBDA is NOT one of these: `var f = func(x) {...}` is an Expr14 var
+     * declaration, so it keeps its declaration-point binding and its temporal
+     * dead zone - its capture snapshot must happen where it is written.
+     *
+     * The tree-walker twin is bind_hoistable_decls (eval.cpp); the two must
+     * stay in lockstep or the engines diverge on WHEN a name becomes callable.
+     */
+    static bool is_hoistable_decl(const Construct *c)
+    {
+        if (const auto *fd = dynamic_cast<const FuncDeclStmt *>(c))
+            return fd->id != nullptr;
+        if (const auto *sd = dynamic_cast<const StructDeclStmt *>(c))
+            return sd->id != nullptr;
+        return false;
+    }
+
     void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
     {
+        /* Emit the block's named func/struct decls FIRST (see above), then
+         * everything else in source order. Re-entering the block (a loop body)
+         * re-runs them, exactly as the statement position used to. */
         for (const auto &e : elems)
-            gen_stmt(e.get());
+            if (is_hoistable_decl(e.get()))
+                gen_stmt(e.get());
+
+        for (const auto &e : elems)
+            if (!is_hoistable_decl(e.get()))
+                gen_stmt(e.get());
     }
 
     void gen_stmt(const Construct *s)

@@ -393,8 +393,17 @@ var loc = 99;
 func f() { var r = loc; { var loc = 5; ... } return r; }   # r == 99
 ```
 
-**Functions and structs are different: they bind immediately**, so calling one
-declared further down - and mutual recursion - keep working.
+**Functions and structs are different: they bind at the top of their scope**,
+so calling one declared further down - and mutual recursion - keep working:
+
+```C#
+var dyn r = later();      # fine: `later` is bound before the block runs
+print(r);
+func later() { return 7; }
+```
+
+That applies at every scope, not just the top level. A *lambda* is an ordinary
+variable, though, so `var f = func(x) => x;` binds where it is written.
 
 Where the compiler *cannot* decide, the check happens at run time and is
 catchable. A function body reading a global may run at any moment:

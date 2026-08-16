@@ -4505,6 +4505,46 @@ static const std::vector<test> tests =
         "var g = [0, 0];" } },
 
     /*
+     * A NAMED func/struct declaration binds at SCOPE ENTRY, not where the
+     * statement sits (#134) - so a call to a function declared BELOW works.
+     *
+     * Sound because such a declaration cannot depend on the enclosing frame:
+     * the grammar REJECTS a capture list on a named func (`func f[a](x)` is a
+     * SyntaxError) and a named func's body is parented to the program root,
+     * so it cannot read an enclosing local either. A struct's descriptor is
+     * computed at parse time.
+     *
+     * THE CALLEE MUST BE IMPURE and the struct arg must come from runtime():
+     * a tiny func is INLINED at the call site and a const-arg construction is
+     * CONST-FOLDED, either of which makes the test pass without the binding
+     * ever being needed. Both masked this bug for a long time.
+     */
+    { "hoisted decls: a call to a func declared BELOW it",
+      { "var dyn r = inner();",
+        "assert(r == 7);",
+        "func inner() { print(\"\"); return 7; }" } },
+    { "hoisted decls: a struct constructed above its `struct` line",
+      { "var p = P(runtime(3));",
+        "assert(p.x == 3);",
+        "struct P { int x; }" } },
+    /* Mutual recursion is the reason this rule exists at all. */
+    { "hoisted decls: mutual recursion across the declaration order",
+      { "var dyn r = ev(runtime(6));",
+        "assert(r == true);",
+        "func ev(int n) { if (n == 0) { return true; } var t = od(n - 1);",
+        "                 return t; }",
+        "func od(int n) { if (n == 0) { return false; } var t = ev(n - 1);",
+        "                 return t; }" } },
+    /* ...and a decl in a LOOP BODY is still re-bound per ITERATION, exactly
+     * as it was when the statement position did the binding - scope entry
+     * happens once per iteration, so nothing changed there. */
+    { "hoisted decls: a decl in a loop body still re-binds per iteration",
+      { "var n = 0;",
+        "for (var i = 0; i < 3; i++) { func g() { print(\"\"); return 1; }",
+        "                              var t = g(); n = n + t; }",
+        "assert(n == 3);" } },
+
+    /*
      * UncatchableRuntimeException: an error a script may NEVER handle, but
      * which still travels the VM/JIT conveyance so it gets a message, a
      * caret and backtrace frames instead of a std::terminate.

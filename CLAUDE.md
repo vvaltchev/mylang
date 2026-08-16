@@ -2650,6 +2650,30 @@ sanitizers never reproduced it.)
   the masked route gone, a SCRIPT's named func/struct decl ALWAYS has a
   global slot — the VM codegen's `gen_stmt` `ML_CHECK`s that invariant
   instead of falling back.
+  **A NAMED func/struct decl BINDS AT SCOPE ENTRY, not where the statement
+  sits (#134, 2026-08-08).** So a call to a function declared BELOW it works,
+  mutual recursion works regardless of order, and a struct can be constructed
+  above its `struct` line — at EVERY scope, not just the top level. Sound
+  because such a declaration cannot depend on the enclosing frame: the grammar
+  REJECTS a capture list on a named func (`func f[a](x)` is a SyntaxError —
+  captures are for closure EXPRESSIONS only) and a named func's body is
+  parented to `capture_root`, the program root, so it cannot read an enclosing
+  local either. A LAMBDA is deliberately excluded: `var f = func(x) {...}` is
+  an `Expr14` var declaration, so it keeps its declaration-point binding and
+  its TDZ — its capture snapshot must happen where it is written.
+  TWO twins that must stay in lockstep, or the engines diverge on WHEN a name
+  becomes callable: `bind_hoistable_decls` (eval.cpp, both the scope_free and
+  general Block paths) and `gen_stmts`' decls-first emission (codegen.cpp).
+  **Re-entering a block re-runs them**, so a decl in a LOOP BODY is still
+  re-bound per iteration exactly as before.
+  ⛔ **MEASURING THIS NEEDS AN IMPURE CALLEE AND A `runtime()` STRUCT ARG.**
+  A tiny func is INLINED at the call site and a const-arg construction is
+  CONST-FOLDED — either makes a test pass without the binding ever being
+  needed, and both masked this bug for a long time (they are why the earlier
+  claim "top level already works" was believed).
+  **RESIDUAL (#134):** a nested func used BEFORE its decl inside a FUNCTION
+  BODY still fails to lower in the VM (`NotLoweredEx`) — a pre-existing
+  codegen refusal, unchanged by the above; the tree-walker handles it.
   **Scope, still map-bound:** lambdas (anonymous — no name binding; their
   params/locals ARE slotted) and, in the **REPL** (top-level names stay
   redefinable), all top-level names; template-instance clones, inserted before
