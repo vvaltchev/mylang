@@ -1198,3 +1198,55 @@ not a conversion, it is an optimization wearing one - and those get
 measured separately ([[bundled-change-needs-a-kill-switch]]).
 Re-run `scripts/regcensus.py` after each one; the UNbracketed column is
 the burn-down.
+
+### inc 1 analysis: the sites fall into THREE kinds, and only one is work
+
+Reading all 14 RDI sites (`scripts/regcensus.py RDI`) changes the shape
+of the remaining arc. They are not 14 instances of one problem:
+
+**(a) SysV setup inside an `emit_call_prologue`/`epilogue` bracket.**
+Already safe for ANY caller-saved register: the prologue spills every
+caller-saved pin and the epilogue reloads it. Nothing to do, ever.
+
+**(b) SysV setup in a HAND-ROLLED call sequence** - `push_reg(RDX)`,
+`sub rsp,8`, load the args, `call` (the M5c cache probe at 3708, the
+borrow-bind at 4315, `jit_stage_args` at 4866, the sync-call fragment
+entry at 4347/12332 where `rdi` is the JIT's OWN fragment ABI). These
+do NOT spill pins - and they do not have to, because the whole RUN is
+denied caller-saved pins by **`jit_run_blocks_xcache`**, and
+**`jit_assert_no_volatile_pin`** ASSERTS that at both emitters. The
+mechanism, the opcode list AND its staleness net already exist.
+
+**(c) genuine scratch inside a run** - the only real blocker. For RDI
+that is FOUR sites: `load_operand(e, RDI, ...)` (8468, 8571) and
+`e.load(RDI, val.payload)` feeding `store_elem_byte_dil` (9172, 9214),
+which is `mov [rcx+r9], dil` and therefore wants RDI's low byte
+specifically.
+
+**SO THE REMAINING WORK IS NOT "CONVERT 670 SITES TO AN ALLOCATOR".**
+It is, per register: find its kind-(c) sites, and for each either move
+it to another register or make its OPCODE block that register's pin.
+
+**THE DESIGN THAT FALLS OUT: per-register block lists.** Today
+`jit_run_blocks_xcache` is one global "this run gets NO caller-saved
+pin" gate - correct but maximally coarse, because it is driven by the
+worst op in the run. Replace it with a per-opcode CLOBBER MASK (which
+registers this op writes behind the allocator's back); a register may
+be pinned in any run whose ops do not name it. Then:
+  - kind (a) contributes nothing (bracketed);
+  - kind (b) contributes "all caller-saved", exactly today's behaviour;
+  - kind (c) contributes just the register it really uses.
+`jit_assert_no_volatile_pin` generalises to "no pin is live in a
+register this op's mask claims", which keeps the existing staleness net
+and makes a forgotten mask entry a named abort rather than a silent
+corruption.
+
+That is a much smaller and much more honest piece of work than a
+general scratch allocator, and it is the thing that actually unblocks
+registers. A real allocator only becomes necessary for RAX/RCX, whose
+kind-(c) counts (254/135) are large enough that per-op masks would
+block nearly every run.
+
+**NEXT ACTION:** classify RDX/RSI/r8's unbracketed sites the same way
+(the census prints them) to confirm the (a)/(b)/(c) split holds, then
+build the clobber mask for the four RDI ops and add RDI to the pool.
