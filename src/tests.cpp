@@ -4799,6 +4799,57 @@ static const std::vector<test> tests =
         "var g = [1];" },
       &typeid(UseBeforeBindingEx) },
     /*
+     * REACHED THROUGH CALLS. `outer` does not read `g`; what it calls does.
+     * The set of globals a call can reach is a FIXPOINT over the call graph,
+     * and it is a fixpoint rather than a walk because mutual recursion makes
+     * that graph cyclic.
+     */
+    { "prover: a global read TWO hops down is still provable",
+      { "func fetch() { return g; }",
+        "func outer() { var r = fetch(); return r; }",
+        "var dyn t = outer();",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    { "prover: three hops",
+      { "func a3() { return g; }",
+        "func a2() { var r = a3(); return r; }",
+        "func a1() { var r = a2(); return r; }",
+        "var dyn t = a1();",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    { "prover: a CYCLE in the call graph converges (and still proves)",
+      { "func ev(n) { var r = od(n); return r; }",
+        "func od(n) { return g; }",
+        "var dyn t = ev(1);",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    /*
+     * ... and EVERY link must be unconditional, or the failure is not
+     * guaranteed. One `if` anywhere along the chain - at the call, at the
+     * inner call, or at the read - must drop the case to the WARNING tier.
+     * These three are what keep the transitive form sound.
+     */
+    { "prover: declines when the OUTER call is conditional",
+      { "func fetch() { return g; }",
+        "func outer() { var r = fetch(); return r; }",
+        "var out = 0;",
+        "if (runtime(0) > 1) { var dyn t = outer(); out = 1; }",
+        "assert(out == 0);",
+        "var g = 5;" } },
+    { "prover: declines when the INNER call is conditional",
+      { "func fetch() { return g; }",
+        "func outer() { if (runtime(0) > 1) { var r = fetch(); return r; }"
+        " return 7; }",
+        "var t = outer();",
+        "assert(t == 7);",
+        "var g = 5;" } },
+    { "prover: declines when the READ is conditional",
+      { "func fetch() { if (runtime(0) > 1) { return g; } return 7; }",
+        "func outer() { var r = fetch(); return r; }",
+        "var t = outer();",
+        "assert(t == 7);",
+        "var g = 5;" } },
+    /*
      * The DECLINES - the direction that matters most, because a false
      * "provable" refuses a program that would have run. Each of these must
      * still COMPILE; whether it then raises at run time is not the point.
@@ -16953,17 +17004,30 @@ static bool unbound_call_warnings()
             "var g = 5;" }, 1 },
         {
           /*
-           * THE TRANSITIVITY GAP, pinned rather than left to be discovered:
-           * `outer` does not read `g` itself, it CALLS something that does,
-           * and neither tier follows that edge - so this is silent today. If
-           * transitivity is added, this expectation becomes 1 and the change
-           * has a test that notices.
+           * REACHED THROUGH A CALL: `outer` does not read `g` itself, it
+           * CALLS something that does. This case expected ZERO until the
+           * call-graph fixpoint landed - the pin worked exactly as intended,
+           * failing the moment the behaviour changed rather than letting the
+           * improvement go unnoticed.
            */
-          "a global read one hop away is reported by NEITHER tier",
+          "a global read ONE HOP away, through a conditional call",
           { "func fetch() { return g; }",
             "func outer() { var r = fetch(); return r; }",
             "if (runtime(0) > 1) { var dyn t = outer(); }",
-            "var g = 5;" }, 0 },
+            "var g = 5;" }, 1 },
+        { "a global read THREE hops away",
+          { "func a3() { return g; }",
+            "func a2() { var r = a3(); return r; }",
+            "func a1() { var r = a2(); return r; }",
+            "if (runtime(0) > 1) { var dyn t = a1(); }",
+            "var g = 5;" }, 1 },
+        { /* the fixpoint must CONVERGE on a cyclic call graph, not spin */
+          "mutual recursion reaching a later global",
+          { "func ev(n) { if (n == 0) { return g; } var r = od(n-1);"
+            " return r; }",
+            "func od(n) { var r = ev(n-1); return r; }",
+            "if (runtime(0) > 1) { var dyn t = ev(4); }",
+            "var g = 5;" }, 1 },
         /* ... and the cases that must stay QUIET */
         { "the global is declared FIRST",
           { "func fetch() { return g; }",
