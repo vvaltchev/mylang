@@ -1136,3 +1136,65 @@ whole remaining piece of #96.** Sketch, to be argued before building:
 
 Step 1-2 are pure restructuring and can be verified absolutely; step 3
 is where the 13 registers actually arrive.
+
+### The scratch census, CORRECTED (2026-08-17) - and it names a different
+### first target than every previous note in this file
+
+`scripts/regcensus.py`. Two mistakes in the earlier counts, each of
+which pointed at the wrong register:
+
+ 1. **comments and strings are not code.** `grep -c RSI src/jit.cpp`
+    said 92 - and a large part of that was prose ABOUT rsi, including a
+    stale scratch-count comment I had written myself. Scrubbed: 85, and
+    the *unbracketed* part is 23.
+ 2. **a use inside a call bracket is already safe.** `emit_call_prologue`
+    SPILLS every caller-saved pin and the epilogue reloads it, so SysV
+    argument setup between them cannot disturb a pin whatever register
+    it writes. Counting all uses is counting the calling convention.
+    (The bracket scan must itself run on scrubbed text: comments
+    mentioning `emit_call_prologue` opened brackets that never closed,
+    which alone moved RAX from 8 "bracketed" to 190.)
+
+    reg    bracketed   UNbracketed   total   cost to free
+    RAX            8           254     262   expensive
+    RCX           36           135     171   expensive
+    RDX           57            76     133   mid
+    RSI           62            23      85   mid
+    RDI           59            14      73   CHEAP
+    r8            0            42      42   mid
+    r9            0            14      14   CHEAP  (already pooled)
+
+**So "~670 sites" was never the real number, and rsi/rdi are the
+CHEAPEST registers to free, not the hardest.** The claim in the step-3
+commit that "rsi is SysV arg 2 plus ~84 raw scratch sites" is WRONG:
+it is arg 2 plus **23** unbracketed sites, several of which are the
+no-arena fallback (`store_type_tag(..., RSI)`, `cmp_rax_tag(..., RSI)`,
+the tag materialisation) that emit nothing on Linux at all.
+
+**THE STAGED PLAN, cheapest first, each increment independently
+verifiable:**
+
+ - **inc 1 - RDI (14 sites).** Read them first: several are ABI arg-1
+   setup whose bracket the scan cannot see (`lea_rdi` inside a helper
+   call sequence), so the true count is lower still. Convert the
+   genuine scratch uses to a tracked request, leave the ABI ones.
+ - **inc 2 - RSI (23, minus the no-arena fallbacks).**
+ - **inc 3 - RDX (76).**
+ - **inc 4/5 - RCX (135) and RAX (254)**, the two that need the real
+   mechanism rather than a hand conversion.
+
+**THE MECHANISM, and why it is not just renaming.** What blocks the pin
+allocator is not that a site names RAX - it is that the emitter keeps
+no record of which scratch registers are LIVE at a point, so the
+allocator cannot know what is free. So each increment adds a tracked
+request (`scratch_busy` mask + an RAII holder + an `ML_CHECK` that a
+requested register is not currently holding a pin - the invariant
+`jit_assert_no_volatile_pin` checks by hand today), while still handing
+back the SAME register, so emission stays byte-identical.
+
+**THE ORACLE FOR EVERY INCREMENT IS `scripts/vdjcmp.sh`**: emitted code
+byte-identical across the corpus. A conversion that changes one byte is
+not a conversion, it is an optimization wearing one - and those get
+measured separately ([[bundled-change-needs-a-kill-switch]]).
+Re-run `scripts/regcensus.py` after each one; the UNbracketed column is
+the burn-down.
