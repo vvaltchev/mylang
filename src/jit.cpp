@@ -1160,6 +1160,59 @@ struct Emitter {
      * the count is now 2 + saved.size() and the pad parity FLIPPED. */
     bool entry_pad() const { return (2 + saved.size()) % 2 == 0; }
 
+    /*
+     * THE SPILL AREA (the real register allocator, maintainer-set
+     * 2026-08-16: "reserve space in the native stack like C compilers
+     * do"). `spill_slots` 8-byte slots are carved out of the native
+     * stack by frag_entry and released by frag_ret, so the allocator can
+     * evict a value to the stack and reload it - which is what lets a
+     * register be REUSED by several variables in one frame instead of
+     * being pinned to one for the whole fragment.
+     *
+     * ⛔ RBP-RELATIVE, NOT RSP-RELATIVE, and that is load-bearing: a
+     * helper call site PUSHES registers around the call, so rsp moves
+     * inside the fragment body and an [rsp+k] spill address would shift
+     * under it. rbp is fixed for the fragment's whole life (frag_entry
+     * sets it and only frag_ret pops it).
+     *
+     * The BYTE COUNT IS ROUNDED TO 16 so the entry parity `entry_pad`
+     * computes is unchanged - the 16-alignment trap this file already
+     * documents (a miss is not a crash on x86-64 until some callee uses
+     * an aligned SSE store, i.e. exactly the kind of bug that hides).
+     *
+     * Set to 0 today: the area is reserved and addressable, and nothing
+     * spills yet, so a fragment is byte-identical to before.
+     */
+    int spill_slots = 0;
+
+    int spill_bytes() const
+    { return (spill_slots * 8 + 15) & ~15; }
+
+    /* slot k's displacement from rbp: below the pushes and the pad. */
+    int32_t spill_off(int k) const
+    {
+        const int below = 8 + 8 * static_cast<int>(saved.size())
+                          + (entry_pad() ? 8 : 0);
+        return static_cast<int32_t>(-below - spill_bytes() + k * 8);
+    }
+
+    /* mov [rbp + disp32], reg64  /  mov reg64, [rbp + disp32]
+     * (mod=10, rm=101 is rbp+disp32 - no SIB needed) */
+    void spill(uint8_t reg, int k)
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
+        u8(0x89);
+        u8(static_cast<uint8_t>(0x85 | ((reg & 7) << 3)));
+        u32(static_cast<uint32_t>(spill_off(k)));
+    }
+    void reload(uint8_t reg, int k)
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
+        u8(0x8B);
+        u8(static_cast<uint8_t>(0x85 | ((reg & 7) << 3)));
+        u32(static_cast<uint32_t>(spill_off(k)));
+    }
+
     /* THE FRAGMENT ENTRY: the window arrives in rdi (from jit_enter, an
      * emitted sync `call rdx`, or a native_leaf direct call). rbx and the
      * cache registers are callee-saved, so save the caller's and take them
@@ -1202,6 +1255,8 @@ struct Emitter {
             push_reg(r);
         if (entry_pad())
             { u8(0x48); u8(0x83); u8(0xEC); u8(0x08); }       /* sub rsp,8 */
+        if (const int sb = spill_bytes())            /* sub rsp, imm32 */
+            { u8(0x48); u8(0x81); u8(0xEC); u32(static_cast<uint32_t>(sb)); }
         mov_rr(REG_SLOTS_BASE, REG_ARG0);
     }
     /* THE FRAGMENT RETURN: give the caller its registers back, then ret.
@@ -1209,6 +1264,8 @@ struct Emitter {
      * and neither pop nor the pad adjustment touches it. */
     void frag_ret()
     {
+        if (const int sb = spill_bytes())            /* add rsp, imm32 */
+            { u8(0x48); u8(0x81); u8(0xC4); u32(static_cast<uint32_t>(sb)); }
         if (entry_pad())
             { u8(0x48); u8(0x83); u8(0xC4); u8(0x08); }       /* add rsp,8 */
         for (size_t i = saved.size(); i-- > 0; )

@@ -556,6 +556,66 @@ and #96's redundant float dispatch). Either removes the same traffic.
 N=8 row as the cleanest number - C++ uses no stack at all there, and
 MyLang still puts half its accumulators in memory.
 
+### THE MANDATE (maintainer, 2026-08-16) - and it is NOT REVERTIBLE
+
+*"I want the real register allocator done at 100%. I'm not going to
+compromise on that. The benefits are unclear, but I wanna bet on that
+and don't revert it please! If a change introduces a regression, that
+change is incorrect, there's something you're missing. Debug, re-work
+it, don't revert this effort."*
+
+Target: the pinned set becomes **RBP, RSP and ONE more** (RBX, the slots
+base) - **13 of 16 usable**. A register must be REUSABLE by several
+variables in the same frame and the same block, evicted to reserved
+native-stack space the way a C compiler does.
+
+**A REGRESSION IS A BUG IN THE CHANGE, NOT A REASON TO BACK OUT.** That
+inverts this file's earlier habit (step 2b was reverted as inert); under
+this mandate the same finding means "debug it".
+
+#### LANDED: the spill area
+
+`Emitter::spill_slots` / `spill_bytes()` / `spill_off(k)` / `spill()` /
+`reload()`. frag_entry carves the slots out of the native stack after
+the pushes and the pad; frag_ret releases them first.
+
+  - **RBP-relative, not RSP-relative** - a helper call site PUSHES
+    registers around the call, so rsp moves inside the body and an
+    `[rsp+k]` spill address would shift under it. rbp is fixed for the
+    fragment's life.
+  - **the byte count is rounded to 16**, so `entry_pad()`'s parity is
+    unchanged - the alignment trap this file documents (a miss is not a
+    crash until some callee uses an aligned SSE store).
+  - inert at `spill_slots = 0`: emitted code is byte-identical, -rt
+    1917/1917.
+
+#### The order for the rest
+
+1. **Per-instruction register STATE** replacing `pick_cached_slots`'
+   whole-fragment pin - this is the allocator, and everything else is
+   detail.
+2. **Live ranges from `visit_use_def`** - reuse it; a second enumeration
+   would rot (the audit-table trap).
+3. **Spill the furthest next use** on pressure; reload on demand.
+4. **Flush live registers at every exit.** `exit_pc`/`flush_cache`
+   already does this for the pinned pair and generalises - but the
+   **12 raw `u8(0xC3)` returns are NOT covered by it** and must be
+   enumerated, not pattern-matched.
+5. **Unpin RSI/R8** (the type singletons) LAST of the foundations: it is
+   a REGRESSION on its own (+1 instruction per type store) until the
+   allocator can choose to keep a hot singleton in a register. Land it
+   WITH that ability, not before - this is exactly the "bundled change
+   needs a kill switch" shape, so gate it.
+
+**KEEP the N5 soundness rule's REASON** - a temp's slot is reused across
+runs holding different types - but note it is a property of PINNING: a
+live range confined to `[def, last use]` inside one run never touches
+the slot at a moment when its type is unknown.
+
+**MEASURE ON `bench/my/8{0..5}_regs_*`**, the N=8 row first: C++ uses no
+stack at all there, and MyLang still puts half its accumulators in
+memory.
+
 ### What to build first, and the gate before building it
 
 1. **MEASURE THE CEILING.** For 03_int_arith and 08_func_call, count from
