@@ -6223,8 +6223,31 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * setup. jit_assert_no_volatile_pin is the standing check that no
  * raw-scratch call site sees one.
  */
-static const uint8_t XCACHE_REGS[] = { 10, 11, 9 };
+static const uint8_t XCACHE_REGS[] = { 10, 11, 9, 8 };
 static const size_t MAX_XCACHED = sizeof(XCACHE_REGS) / sizeof(XCACHE_REGS[0]);
+/*
+ * ⛔ r8 IS LAST ON PURPOSE - it is conditional. It holds the t_float
+ * SINGLETON, but only in a run that HAS a float op: `run_has_float`
+ * decides whether frag_entry materialises it at all, so in an int-only
+ * run r8 is dead weight and can hold a pin instead. A run WITH floats
+ * must keep it. Since take_reg scans the pool in order, passing a
+ * COUNT of 3 rather than 4 excludes r8 without a second array.
+ *
+ * This is the cheapest register left, and the reason is worth
+ * recording: freeing rax/rcx/rdx/rdi needs the emitter to allocate its
+ * SCRATCH (~670 hardcoded uses), whereas rsi/r8 are pinned CONSTANTS -
+ * nothing computes into them. Every single R8R use in this file is in
+ * emit_sync_push_native or emit_ret_native, the SAME two functions,
+ * safe for the SAME two reasons, that admitted r9: a run containing a
+ * MyLang call takes no caller-saved pin at all, and emit_ret_native
+ * flushes the cache on its first line.
+ */
+static bool run_has_float(const Chunk &ck, size_t begin, size_t end);
+
+static size_t jit_xcache_count(const Chunk &ck, size_t begin, size_t end)
+{
+    return run_has_float(ck, begin, end) ? MAX_XCACHED - 1 : MAX_XCACHED;
+}
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
 /* #96: the TOTAL int pin budget, exported so a coverage test can size
  * its program from it instead of hardcoding a margin. jit_telide_c3
@@ -14055,7 +14078,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         const bool xcache_ok = hregs.empty()
             && !jit_run_blocks_xcache(chunk, begin, end)
             && !jit_lever_off(JL_XCACHE);
-        const size_t max_pins = MAX_CACHED + (xcache_ok ? MAX_XCACHED : 0);
+        const size_t n_xcache =
+            xcache_ok ? jit_xcache_count(chunk, begin, end) : 0;
+        const size_t max_pins = MAX_CACHED + n_xcache;
         std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
                               max_pins,
@@ -14131,7 +14156,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         for (size_t h = 0; h < hot.size(); h++) {
             int r = e.take_reg(CACHE_REGS, MAX_CACHED);
             if (r < 0 && xcache_ok)
-                r = e.take_reg(XCACHE_REGS, MAX_XCACHED);
+                r = e.take_reg(XCACHE_REGS, n_xcache);
             ML_CHECK(r >= 0);            /* hot.size() <= max_pins */
             hot_reg[h] = static_cast<uint8_t>(r);
             if (jit_reg_is_callee_saved(hot_reg[h]))

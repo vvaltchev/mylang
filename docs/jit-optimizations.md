@@ -5412,3 +5412,57 @@ SPEC recomputed in C++ (same sequential order, same int_type
 wraparound) - not a second engine, since a script's runtime symbol map
 is asserted empty and the tree-walker cannot be driven in-process from
 a test.
+
+## #96 - r8 joins CONDITIONALLY (pool 8), and the ceiling this arc has hit
+
+**r8 is the cheapest register left, and for a reason that generalises:**
+freeing rax/rcx/rdx/rdi needs the emitter to allocate its SCRATCH (~670
+hardcoded uses: RAX 297, RCX 165, RDX 133, RDI 76), whereas rsi and r8
+hold pinned CONSTANTS - nothing computes into them. And r8's constant,
+`t_float`, is only materialised when `run_has_float`, so in an INT-ONLY
+run r8 holds nothing at all and can take a pin.
+
+Every `R8R` use in jit.cpp is in `emit_sync_push_native` or
+`emit_ret_native` - **the same two functions, safe for the same two
+reasons, that admitted r9**: a run containing a MyLang call takes no
+caller-saved pin (`jit_run_blocks_xcache`), and `emit_ret_native`
+flushes on its first line. r8 sits LAST in `XCACHE_REGS` so passing a
+count of 3 instead of 4 excludes it, with no second array.
+
+Pinned by two cases in `jit_xcache_pins`, in both directions - eight hot
+int locals reach r8; the same loop WITH a float keeps it as the type
+singleton. **Watched failing:** delete the `run_has_float` gate and
+`-rt` fails. The VALUE is the oracle there, not the counter: a pinned r8
+in a float run is overwritten by the t_float constant.
+
+### ⛔ THE ARC'S RESULT, STATED PLAINLY: MORE REGISTERS DO NOT PAY HERE
+
+Three widenings now, pool 4 -> 8, each measured the same way:
+
+| step | loop D refs | loop instructions | wall clock |
+|---|---|---|---|
+| r10/r11 (#96) | -23.3% (80_regs_int_08) | unchanged | 1.004x |
+| r9 | -20.0% | **byte-identical** | 1.009x |
+| r8 | **-40.0%** | **byte-identical** | 0.994x |
+
+**Not one of them changed the instruction count, and none moved the wall
+clock.** The reason is structural, and it is now measured three times
+rather than argued: in these loops every accumulator is read AND written
+every iteration, so a register turns `mov rax, [rbx+0x38]` into
+`mov rax, r8` - one instruction either way. Memory traffic falls; work
+does not. An instruction is only REMOVED when the value is DEAD
+(`skip_write`, which needs liveness and never fires on an accumulator)
+or when a reload is redundant (lever A's local forwarding, already
+landed - and that one bought **0.89x** on 83_regs_int_40 for -8.86% Ir).
+
+So the corrected cost model's "a register is a PREREQUISITE, not a win"
+is not a caveat on this arc - it is the whole result of it. Registers 5
+through 8 bought 40% of the memory traffic on the bench built to want
+them and zero time.
+
+**What this predicts for registers 9-13** (rax/rcx/rdx/rdi via a scratch
+allocator): the same shape, at a far higher cost to build, unless the
+extra registers are spent on something that REMOVES instructions.
+Before building the scratch allocator, find the instruction that the
+extra register makes removable - the way local forwarding did - and
+measure THAT.
