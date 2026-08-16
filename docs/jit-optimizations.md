@@ -5122,3 +5122,68 @@ existing note explains why that was deliberate ("a counted loop's BOUND
 temp is read every iteration - exactly the shape the liveness refuses"),
 but the liveness net now exists, so it is worth re-examining - as a
 separate increment, with the ratchet's row updated to match.
+
+## #96 - the fragment RETURN states, and CHECKS, its write-back contract
+
+The register cache lives in registers between an entry load and an exit
+flush, so **any return that leaves a cached slot in a register resumes
+the interpreter on a stale slot** - a silent wrong answer, not a crash.
+`exit_pc` handles that automatically (it picks the flushing or the bare
+epilogue per exit site). The direct returns do not.
+
+`plans/jit-registers.md` carried a note that "12 raw `u8(0xC3)` returns
+are NOT covered by exit_pc and must be enumerated". **The count was
+stale in a way worth recording**: the epilogue consolidation had already
+left exactly ONE `ret` in the emitter, inside `frag_ret()`. The hazard
+survived in a different shape - **13 sites call `frag_ret()` directly**,
+and only six flushed.
+
+**What the other seven were resting on, unstated at every one of them:**
+`pick_cached_slots`' opcode switch lists neither `CallV` nor
+`CachedCallV` nor `CallValueV`, so a call falls into its
+`default: return {}` and a run containing one is not cached at all.
+Sound today - and **exactly the invariant this task exists to destroy**,
+since the mandate is to spill live registers around a call and keep them
+across it.
+
+So the claim moved out of the reader's head and into the signature:
+
+    enum class RetFlush {
+        flushed,   /* flush_cache() was emitted on THIS path, above */
+        empty,     /* nothing is cached here - ASSERTED */
+        epilogue,  /* emit_epilogues only: exit_pc already chose per
+                    * exit, so end-of-fragment cache state describes
+                    * no particular exit and neither claim is checkable */
+    };
+
+**It ASSERTS rather than emitting the flush**, which is a deliberate
+trade: emitting would reorder the flush against the
+`mov rax, <sentinel>` every site places first, and byte-identical output
+is the cheapest possible proof that adding a contract changed nothing.
+Verified **108/108** over bench/my + samples + tests/functional.
+
+⛔ **Two traps in that verification, both mine, both worth reusing.**
+A `-vdj` dump is NOT directly comparable between two separately-linked
+binaries: baked helper addresses and rel32 displacements differ under
+ASLR (a naive compare reported 108/108 DIFFERING). And after masking
+them, `40_math_builtins` still differed *intermittently against the same
+binary* - its libm call displacement is 5 or 6 hex digits depending on
+where the code page lands, so a `0x[0-9a-f]{6,}` rule and a
+`call -0x...` rule race each other unless the call rule runs FIRST.
+
+**WATCHED FAILING, with the sabotage being the literal future state:**
+teach `pick_cached_slots` that `CallV`/`CachedCallV`/`CallValueV` are
+cacheable, and `-rt` aborts at the propagate/switch arms of the call
+path within seconds.
+
+**Honest scope, because the distinction matters:** with `ASSERTS=0` that
+same sabotage leaves `corpus_diff` GREEN (20/20). This is a guard for
+where #96 is going, not a fix for a live bug. It is nonetheless stronger
+than the two xcache gates recorded above, which fire on nothing - this
+one fires on a reachable shape.
+
+**And it earned its keep immediately.** The five `frag_ret` sites inside
+`emit_ret_native` are `flushed`, not `empty`: that function flushes on
+its FIRST line and all of its returns inherit it. A "is there a
+flush_cache() within four lines above" classification got all five
+wrong, and the assertion caught it on the first run.

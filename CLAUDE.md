@@ -393,6 +393,29 @@ already paid the move, and the hot two-store path preserves RAX free.
 **When you add a helper the emitter calls, make its argument registers
 PARAMETERS and say what it clobbers.**
 
+**⛔ A FRAGMENT RETURN MUST NAME ITS WRITE-BACK CONTRACT (#96,
+2026-08-16).** The N5/C2a register cache holds frame slots in registers
+between an entry load and an exit flush, so a `ret` that leaves one
+there resumes the interpreter on a STALE slot - a silent wrong answer.
+`exit_pc` flushes automatically; **`frag_ret()` does not**, and 13 sites
+call it directly. Seven of them were relying on an invariant written
+nowhere near them: `pick_cached_slots` lists no call opcode, so it hits
+`default: return {}` and a run containing a call is not cached. So
+`frag_ret` now takes a `RetFlush` - `flushed` (a `flush_cache()` was
+emitted on this path), `empty` (**ML_CHECKed**), or `epilogue`
+(`emit_epilogues` only, where `exit_pc` already chose per exit). **A new
+return site must pick one**, and `empty` is the one that will fail
+loudly the day the allocator keeps a value in a register across a call.
+Do not "fix" that abort by switching to `flushed` - emit the flush.
+
+**⛔ COMPARING `-vdj` BETWEEN TWO BINARIES NEEDS NORMALISATION.** Baked
+helper addresses and rel32 call displacements differ between separate
+links under ASLR, so a raw compare says "everything changed". Mask them
+- and mask the CALL displacement FIRST: `40_math_builtins`' libm target
+is 5 or 6 hex digits depending on where the code page lands, so a
+width-based rule and a call-based rule race and the file appears to
+differ from ITSELF at random.
+
 **⛔ BENCHMARKS ARE NOT FUNCTIONAL TESTS (maintainer-set, 2026-08-05).**
 `bench/` measures THROUGHPUT - millions of iterations - and must NEVER
 be used as a correctness corpus. A JIT bug shows on iteration 1 or not

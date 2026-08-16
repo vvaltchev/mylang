@@ -678,10 +678,51 @@ instruction count.
 2. **Live ranges from `visit_use_def`** - reuse it; a second enumeration
    would rot (the audit-table trap).
 3. **Spill the furthest next use** on pressure; reload on demand.
-4. **Flush live registers at every exit.** `exit_pc`/`flush_cache`
-   already does this for the pinned pair and generalises - but the
-   **12 raw `u8(0xC3)` returns are NOT covered by it** and must be
-   enumerated, not pattern-matched.
+4. **Flush live registers at every exit. DONE - as a CHECKED CONTRACT,
+   not an enumeration.** The note this replaces said "12 raw `u8(0xC3)`
+   returns are NOT covered by `exit_pc` and must be enumerated". That
+   count was STALE: the epilogue consolidation left exactly ONE `ret` in
+   the emitter, inside `frag_ret()`. The hazard was real but differently
+   shaped - **13 sites call `frag_ret()` directly**, bypassing
+   `exit_pc`'s automatic flush, and only six of them flushed.
+
+   The other seven rested on an invariant stated NOWHERE at those sites:
+   `pick_cached_slots` lists neither `CallV` nor `CachedCallV` nor
+   `CallValueV`, so they hit its `default: return {}` and a run holding
+   a call caches nothing. **That is precisely the invariant this task
+   exists to destroy** - the mandate is to spill live registers around a
+   call and keep them across it.
+
+   So the claim moved into the signature: `frag_ret(RetFlush)` with
+   `flushed` (flush_cache() was emitted on this path), `empty`
+   (ASSERTED - `cache/fcache/tflush` all empty here) and `epilogue`
+   (emit_epilogues only, where exit_pc already chose per exit and the
+   emitter's end-of-fragment state describes no particular exit).
+
+   It ASSERTS rather than emitting the flush itself, deliberately:
+   emitting would reorder the flush against the `mov rax, <sentinel>`
+   the sites place first, and **byte-identical output is the cheapest
+   proof the contract changed nothing** - verified 108/108 across
+   bench/my + samples + tests/functional (normalising baked addresses
+   and rel32 call displacements, which differ between two links; note
+   40_math_builtins' libm displacement is 5 or 6 hex digits depending
+   on ASLR, so the call rule must run BEFORE the width rule or the
+   normaliser fights itself).
+
+   WATCHED FAILING, and the sabotage is the exact future state: teach
+   `pick_cached_slots` that a call run is cacheable and `-rt` aborts at
+   the propagate/switch arms within seconds. **Honest scope: with
+   `ASSERTS=0` that same sabotage keeps `corpus_diff` green (20/20).**
+   So this is a guard for where #96 is going, not the fix for a live
+   bug - and unlike the two xcache gates it does fire on a reachable
+   shape, so it is not vacuous.
+
+   The five `frag_ret` sites inside `emit_ret_native` are `flushed`,
+   not `empty`: that function flushes on its FIRST line and every one
+   of its returns inherits it. A "is there a flush_cache() within four
+   lines above" heuristic mis-classified all five, and the assert
+   caught it on the first run - which is the small version of the
+   argument for having it.
 5. **Unpin RSI/R8** (the type singletons) LAST of the foundations: it is
    a REGRESSION on its own (+1 instruction per type store) until the
    allocator can choose to keep a hot singleton in a register. Land it
