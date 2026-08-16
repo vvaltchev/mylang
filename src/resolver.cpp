@@ -524,6 +524,49 @@ private:
     }
 
     /*
+     * `isbound(name)` - has the DECLARATION run yet? The TDZ twin of
+     * try_fold_defined, and the answers are deliberately different:
+     *
+     *   func f() { var b = isbound(a); var a = 5; return b; }   -> FALSE
+     *   func f() { var b = defined(a); var a = 5; return b; }   -> true
+     *
+     * For a LEXICAL kind the answer is a compile-time constant: a param /
+     * capture / builtin is always bound, and a local is bound exactly after
+     * its declaration - `in_tdz` is the resolver's own record of "declared in
+     * this scope, declaration not yet walked", so the fold is exact. Each loop
+     * iteration re-runs the declaration, so "before the decl" is false on
+     * every iteration too and no runtime bound-flag is needed.
+     *
+     * A GLOBAL read from a function body is the one genuine RUNTIME query (the
+     * decl may not have executed): left un-folded for DefinedGlobalV in the VM
+     * and builtin_isbound in the tree-walker.
+     */
+    bool try_fold_isbound(unique_ptr<Construct> &slot, CallExpr *ce)
+    {
+        Construct *arg = ce->args->elems[0].get();
+        /* `none` is always available - the inferencer lets it through the
+         * identifier check for that reason (see reject_dev_builtins). */
+        if (dynamic_cast<LiteralNone *>(arg)) {
+            MakeConstructFromConstVal(EvalValue(true), slot, false);
+            return true;
+        }
+        auto *id = dynamic_cast<Identifier *>(arg);
+        if (!id)
+            return false;                  /* the arg-shape error, not ours */
+        if (id->in_tdz) {
+            MakeConstructFromConstVal(EvalValue(false), slot, false);
+            return true;
+        }
+        const SymKind k = id->sym.kind;
+        if (k == SymKind::local || k == SymKind::capture
+                || k == SymKind::builtin) {
+            MakeConstructFromConstVal(EvalValue(true), slot, false);
+            return true;
+        }
+        return false;   /* global -> runtime; unresolved -> the REPL's map */
+    }
+
+    /*
      * Register every effectively-pure NAMED function into `cctx`, so that
      * fold_reads can evaluate their constant-argument calls at compile time.
      * Does not descend into function bodies (a pure func contains no funcs, and
@@ -1081,6 +1124,11 @@ private:
                     && try_fold_defined(slot, ce)) {
                 return;   /* folded; else fall through to normal arg handling */
             }
+            if (callee && ce->args && ce->args->elems.size() == 1
+                    && callee->get_str() == "isbound"
+                    && try_fold_isbound(slot, ce)) {
+                return;
+            }
 
             bool all_const = ce->args != nullptr;
             if (ce->args)
@@ -1325,6 +1373,15 @@ private:
 
     /* Set while walking a lazy builtin's arguments - see the CallExpr walk. */
     bool no_undef_check = false;
+    /*
+     * Step 6: the TDZ suppression is a SEPARATE question from the FIX-1 one.
+     * BOTH lazy builtins must be allowed to ask about a name inside its TDZ
+     * (`isbound(x)` before `var x` is the whole point, and must answer
+     * false) - but only `defined` may ask about a name declared NOWHERE.
+     * `isbound(zz)` on such a name is a FIX-1 compile error like any other
+     * use, because there is nothing for it to be bound to, ever.
+     */
+    bool no_tdz_check = false;
     std::vector<EscapedRef> escaped_refs;
     /*
      * The GLOBAL table: every top-level function (hoisted up front so a forward
@@ -1674,7 +1731,7 @@ private:
          */
         if (cur->slottable && in_tdz_of_live_scope(cur, id->uid)
                 && global_func_slots.find(id->uid) == global_func_slots.end()) {
-            if (!no_undef_check) {
+            if (!no_tdz_check) {
                 if (!repl_mode)
                     throw UseBeforeBindingEx(
                         intern_msg("'" + std::string(id->get_str())
@@ -2404,24 +2461,33 @@ Resolver::walk(Construct *c, FuncState *cur)
     if (auto *call = dynamic_cast<CallExpr *>(c)) {
         walk(call->what.get(), cur);
 
-        /* A LAZY builtin (`defined`/`isconst`/`isconstdecl`) never EVALUATES
-         * its argument - it asks a question ABOUT the name. So a name that
-         * exists nowhere is a legitimate question with the answer `false`,
-         * NOT a FIX-1 error; suppress the check for the duration of the
-         * argument walk (the name still resolves normally when it exists,
-         * which is what lets try_fold_defined fold it). */
+        /* A LAZY builtin (`defined`/`isbound`/`isconst`/`isconstdecl`) never
+         * EVALUATES its argument - it asks a question ABOUT the name - so
+         * asking about a name inside its TDZ is legal for all of them and
+         * must answer rather than throw (that is what lets try_fold_defined /
+         * try_fold_isbound fold it).
+         *
+         * The FIX-1 exemption is NARROWER: only `defined` may ask about a
+         * name declared NOWHERE ("does this exist?" - answer false).
+         * `isbound(zz)` on such a name asks whether something that can never
+         * exist has been bound, so it stays the ordinary compile error. */
         const Identifier *cid = dynamic_cast<Identifier *>(call->what.get());
         const bool lazy = cid && is_lazy_builtin(cid->uid);
         const bool saved_nc = no_undef_check;
+        const bool saved_tz = no_tdz_check;
 
-        if (lazy)
-            no_undef_check = true;
+        if (lazy) {
+            no_tdz_check = true;
+            if (cid->get_str() != "isbound")
+                no_undef_check = true;
+        }
 
         if (call->args)
             for (auto &a : call->args->elems)
                 walk(a.get(), cur);
 
         no_undef_check = saved_nc;
+        no_tdz_check = saved_tz;
 
         /* If the callee resolved to a global-table slot (a top-level / scoped
          * function, or a struct descriptor), record it so do_eval can read the

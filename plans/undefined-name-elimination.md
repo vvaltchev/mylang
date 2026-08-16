@@ -442,7 +442,19 @@ Each lands as its OWN commit.
    ever costs a FOLD, never an answer.
    `defined()` needed NO work: it already matches the agreed table - it
    fell out of step 3, which folds `SymKind::global` and `in_tdz` to true.
-   `isbound()` is what remains of this step.
+   **`isbound()` LANDED** too: lazy, identifier-only (`none` accepted -
+   name-shaped, as the maintainer specified alongside `len`), lexical
+   kinds folded by `try_fold_isbound` and a GLOBAL left to the existing
+   `DefinedGlobalV` (which `defined` no longer reaches). Two placement
+   traps found by sabotage: the arg-shape check must be UNGATED (inside
+   `reject_dev_builtins` it is invisible to `-rt` and the REPL, which set
+   `g_dev_builtins_allowed`) and must be a COMPILE error (the runtime
+   body's throw is the tree-walker's answer while the codegen refuses the
+   shape - a divergence); and the FIX-1 exemption had to be SPLIT from the
+   TDZ one, since `isbound(zz)` on a nowhere-declared name stays an error.
+   NOT testable in `-rt`: the F1 value-use rule (`var dyn q = isbound;`),
+   because `reject_dev_builtins` - which owns it - is skipped by the
+   harness. Verified by hand.
 7. **Prover conservatism**, then **`--strict`**.
 
 ## Known residuals (accepted)

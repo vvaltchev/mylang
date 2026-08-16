@@ -2825,7 +2825,12 @@ struct Codegen {
                                    int &out_slot, std::vector<CgInstr> &ops)
     {
         const Identifier *callee = dynamic_cast<Identifier *>(dc->what.get());
-        if (!callee || callee->get_str() != "defined")
+        /* `isbound` (step 6) is the OTHER owner of this op - and now the only
+         * one a script reaches, since `defined` of a declared global folds to
+         * `true` at resolve time. Both are lowered identically: the op reads
+         * gfuncs->defined[slot], which IS the has-it-been-bound question. */
+        if (!callee || (callee->get_str() != "defined"
+                        && callee->get_str() != "isbound"))
             return false;
         if (!dc->args || dc->args->elems.size() != 1)
             return false;

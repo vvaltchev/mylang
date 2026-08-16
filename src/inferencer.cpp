@@ -273,6 +273,7 @@ private:
     void lower_named_args(Construct *n);        /* desugar named-arg calls */
     void lower_call_named_args(CallExpr *call); /* ...for one call */
     void reject_dev_builtins(Construct *n);     /* DEV-only builtins in a script */
+    void check_isbound_args(Construct *n);     /* isbound()'s arg SHAPE */
     void enforce_nonnull_params();   /* the mandatory-`opt` rule for params */
     static bool type_has_dyn(StaticTypeRef t, bool deep);
     static bool type_has_bottom_elem(StaticTypeRef t);
@@ -1171,6 +1172,10 @@ void Inferencer::infer_one(Block *rootBlock)
      */
     for (auto &e : rootBlock->elems)
         lower_named_args(e.get());
+
+    /* isbound()'s argument SHAPE - syntactic, so ungated (see the fn). */
+    for (auto &e : rootBlock->elems)
+        check_isbound_args(e.get());
 
     /* Reserve DEV-only builtins (show()) in a script - a compile-time error,
      * even under -nti (this runs before the checks_enabled early return). A
@@ -2556,6 +2561,50 @@ void Inferencer::lower_named_args(Construct *n)
  * REPL / test runner. A user symbol of the same name (a `func show(){}` shadow)
  * has a non-null id_sym entry and is left alone - it is the user's function.
  */
+/*
+ * `isbound` takes ONLY an identifier (maintainer's call): `none` and `len`
+ * are identifiers, `3` and `"blah"` are not. A SYNTACTIC rule, so it runs
+ * ungated - not inside reject_dev_builtins (which the test runner and the
+ * REPL skip wholesale) and not behind `checks_enabled` (`-nti` must not turn
+ * it off), exactly like the named-argument lowering beside it.
+ *
+ * It has to be a COMPILE error rather than the runtime body's own throw: the
+ * tree-walker would answer TypeErrorEx while the no-fail codegen refuses to
+ * lower the shape at all (NotLoweredEx) - an engine divergence on top of a
+ * worse diagnostic.
+ */
+void Inferencer::check_isbound_args(Construct *n)
+{
+    if (!n)
+        return;
+
+    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+        if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+            auto it = id_sym.find(cid);
+            const bool user_shadow = (it != id_sym.end() && it->second);
+            if (!user_shadow && cid->uid->val == "isbound") {
+                const size_t n_args =
+                    call->args ? call->args->elems.size() : 0;
+                if (n_args != 1)
+                    throw WrongArgCountEx(
+                        intern_msg("isbound() takes exactly 1 argument"),
+                        cid->start, cid->end);
+                /* `none` is name-SHAPED but parses to a LiteralNone, not an
+                 * Identifier - let it through and let try_fold_isbound
+                 * answer `true`. */
+                Construct *ba = call->args->elems[0].get();
+                if (!dynamic_cast<Identifier *>(ba)
+                        && !dynamic_cast<LiteralNone *>(ba))
+                    throw TypeMismatchEx(
+                        intern_msg("isbound() takes an identifier"),
+                        ba->start, ba->end);
+            }
+        }
+    }
+
+    for_each_child(n, [this](Construct *c) { check_isbound_args(c); });
+}
+
 void Inferencer::reject_dev_builtins(Construct *n)
 {
     if (!n)
@@ -2571,8 +2620,9 @@ void Inferencer::reject_dev_builtins(Construct *n)
                         "' is a dev-only builtin (REPL / tests only); it is not "
                         "available in a script"));
             /* The CALLEE position is the one LEGAL use of a LAZY-ARG builtin
-             * (defined/isconst/isconstdecl): walk the args only, skipping the
-             * callee id, so the value-use check below doesn't fire on it. */
+             * (defined/isbound/isconst/isconstdecl): walk the args only,
+             * skipping the callee id, so the value-use check below doesn't
+             * fire on it. */
             reject_dev_builtins(call->args.get());
             return;
         }
@@ -3138,7 +3188,8 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return A.int_ty();
 
     /* bool-returning predicates */
-    if (n == "defined" || n == "isconst" || n == "isconstdecl" ||
+    if (n == "defined" || n == "isbound" || n == "isconst" ||
+        n == "isconstdecl" ||
         n == "ispure" || n == "ispuredecl" || n == "startswith" ||
         n == "endswith" || n == "isinf" || n == "isfinite" ||
         n == "isnormal" || n == "isnan")

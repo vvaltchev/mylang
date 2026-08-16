@@ -1130,6 +1130,28 @@ and it lives *inside the parser*. Mechanics:
   `CallExpr` folds when
   the callee and all args are const — that's how
   `sort(arr, pure func(a,b) => a<b)` runs at parse time.
+- **`isbound(name)` — the TDZ pair's runtime half (#131 step 6).**
+  `defined(name)` asks whether the name EXISTS (true throughout its scope,
+  ABOVE the declaration included — the name is declared, merely unbound);
+  `isbound(name)` asks whether its declaration has RUN. LAZY (unevaluated
+  argument — `mark_lazy_builtin` + the F1 rule: callable directly, never a
+  value), and its argument must be an **identifier** (or `none`), checked by
+  `Inferencer::check_isbound_args`. **Three things a future reader will get
+  wrong:** (1) the arg-shape rule must be a COMPILE error, because the runtime
+  body's own throw is the tree-walker's answer while the no-fail codegen
+  refuses the shape (`NotLoweredEx`) — an engine divergence; (2) it must run
+  UNGATED, not inside `reject_dev_builtins` (which the `-rt` harness and the
+  REPL skip wholesale via `g_dev_builtins_allowed`, so a check placed there is
+  invisible to every test) nor behind `checks_enabled` (`-nti` must not turn a
+  syntactic rule off); (3) the FIX-1 exemption is NARROWER than the TDZ one —
+  the resolver's `no_tdz_check` covers every lazy builtin (asking about a name
+  in its TDZ is the whole point), but `no_undef_check` skips `isbound`, since
+  asking whether a name declared NOWHERE is bound is the ordinary #130 error.
+  `builtin_isbound` reads `sym` off the Identifier and never evaluates it —
+  evaluating an unbound global throws the very `UnboundSymbolEx` the call
+  exists to avoid. The lexical kinds fold in `try_fold_isbound`; a GLOBAL is
+  the one runtime query and reuses `DefinedGlobalV` (which `defined` no longer
+  reaches, since a declared global folds to `true`).
 - **⛔ A DECLARATION BEATS THE CONST BUILTIN IT SHADOWS (#133, 2026-08-09).**
   `pAcceptId` used to resolve a name straight to a const builtin without ever
   asking what the program declared, so `func abs(x){return 42;}` gave

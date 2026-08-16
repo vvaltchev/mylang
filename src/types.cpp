@@ -666,6 +666,11 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_v<builtin_assert>("assert"),
     make_builtin_v<builtin_exit>("exit"),
     make_builtin_v<builtin_runtime>("runtime"), /* optimization barrier */
+    /* #131/#133 step 6: the TDZ pair's runtime half - `defined` asks whether
+     * the name EXISTS, `isbound` whether its declaration has RUN. Lazy (the
+     * argument is never evaluated - reading an unbound global is the very
+     * error this lets a script avoid). */
+    mark_lazy_builtin(make_builtin("isbound", builtin_isbound)),
     mark_lazy_builtin(make_builtin("isconst", builtin_isconst)),
     mark_lazy_builtin(make_builtin("isconstdecl", builtin_isconstdecl)),
     make_builtin_v<builtin_ispure>("ispure"),
