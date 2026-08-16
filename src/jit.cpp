@@ -1346,10 +1346,65 @@ struct Emitter {
         u8(0x5D);                                     /* pop rbp */
         u8(0xC3);
     }
-    /* Pending `jmp <epilogue>` sites, split by whether the exit must
-     * FLUSH the register cache. Patched (and cleared) per fragment by
-     * emit_epilogues. */
-    std::vector<size_t> epi_flush, epi_bare;
+    /*
+     * Pending `jmp <epilogue>` sites. Each records the CACHE STATE that
+     * was live where it was emitted, and `emit_epilogues` emits one
+     * epilogue per DISTINCT state.
+     *
+     * #96: this used to be two lists - "flush the cache" and "do not" -
+     * which is exactly right while the cache is FRAGMENT-CONSTANT, and
+     * becomes wrong the moment a register's occupant changes within a
+     * fragment: one shared flushing epilogue can only write back one
+     * state. Interning the state per exit generalises that without
+     * bringing back the inlined per-exit tail the shared epilogue
+     * replaced (at four pins the flush alone is 56 bytes, and it blew
+     * the 8-bit displacement of the short jcc that hops over an exit).
+     *
+     * With a fragment-constant cache there are exactly TWO states - the
+     * pins, and the empty one a barrier'd op installs across its own
+     * emission - so this reproduces the old output byte for byte.
+     */
+    struct CacheState {
+        std::vector<CacheEnt> cache, fcache;
+        std::vector<TypedEnt> tflush;
+        bool is_empty() const
+        { return cache.empty() && fcache.empty() && tflush.empty(); }
+    };
+    struct ExitSite { size_t at; size_t state; };
+    std::vector<ExitSite> exits;
+    std::vector<CacheState> exit_states;
+
+    /* find-or-add the CURRENT state; returns its index in exit_states */
+    size_t intern_exit_state()
+    {
+        const auto same_c = [](const std::vector<CacheEnt> &a,
+                               const std::vector<CacheEnt> &b) {
+            if (a.size() != b.size())
+                return false;
+            for (size_t i = 0; i < a.size(); i++)
+                if (a[i].slot != b[i].slot || a[i].payload != b[i].payload
+                        || a[i].type != b[i].type || a[i].reg != b[i].reg)
+                    return false;
+            return true;
+        };
+        const auto same_t = [](const std::vector<TypedEnt> &a,
+                               const std::vector<TypedEnt> &b) {
+            if (a.size() != b.size())
+                return false;
+            for (size_t i = 0; i < a.size(); i++)
+                if (a[i].slot != b[i].slot || a[i].type != b[i].type
+                        || a[i].flt != b[i].flt)
+                    return false;
+            return true;
+        };
+        for (size_t i = 0; i < exit_states.size(); i++)
+            if (same_c(exit_states[i].cache, cache)
+                    && same_c(exit_states[i].fcache, fcache)
+                    && same_t(exit_states[i].tflush, tflush))
+                return i;
+        exit_states.push_back({ cache, fcache, tflush });
+        return exit_states.size() - 1;
+    }
 
     /* THE EXIT/BAIL: `mov eax, pc; jmp <epilogue>` - a CONSTANT 10 bytes.
      * It used to inline the whole tail (flush the N5 cache, restore, ret),
@@ -1359,18 +1414,17 @@ struct Emitter {
      * fragment makes every exit the same small size again, and stops the
      * flush being duplicated at ~100 sites.
      *
-     * TWO epilogues, because a barrier'd op EMPTIES the cache across its
-     * emission on purpose: such an op's exit must NOT flush (the helper
-     * already wrote those slots, and flushing would clobber its writes
-     * with the stale pre-call register values). The choice is exactly
-     * "is the cache live right now", which is what `cache` already says. */
+     * ONE EPILOGUE PER DISTINCT CACHE STATE. A barrier'd op EMPTIES the
+     * cache across its emission on purpose: such an op's exit must NOT
+     * flush (the helper already wrote those slots, and flushing would
+     * clobber its writes with the stale pre-call register values). That
+     * gives two states while the cache is fragment-constant; #96's
+     * allocator adds more by changing a register's occupant mid-run. */
     void exit_pc(uint32_t pc)
     {
         u8(0xB8); u32(pc);                                /* mov eax, pc */
         u8(0xE9);
-        (cache.empty() && fcache.empty() && tflush.empty()
-             ? epi_bare : epi_flush)
-            .push_back(pos());
+        exits.push_back({ pos(), intern_exit_state() });
         u32(0);                                           /* jmp rel32 */
     }
 
@@ -1399,23 +1453,44 @@ struct Emitter {
             u8(0x48); u8(0xBA); u64(d);              /* movabs rdx, desc */
             u8(0x48); u8(0x89); u8(0x11);            /* mov [rcx], rdx */
         };
-        if (!epi_flush.empty()) {
+        /* NON-EMPTY states first, then first-seen order. With the two
+         * states a fragment-constant cache produces that is exactly the
+         * old flush-then-bare emission order, so the bytes are
+         * unchanged - which is how this refactor is verified. */
+        std::vector<size_t> order;
+        for (size_t pass = 0; pass < 2; pass++)
+            for (size_t i = 0; i < exit_states.size(); i++)
+                if (exit_states[i].is_empty() == (pass == 1))
+                    order.push_back(i);
+
+        for (const size_t st : order) {
+            bool used = false;
+            for (const ExitSite &x : exits)
+                if (x.state == st) { used = true; break; }
+            if (!used)
+                continue;
             const size_t at = pos();
-            flush_cache();
+            if (!exit_states[st].is_empty()) {
+                /* flush_cache() reads the LIVE members, so install this
+                 * exit's state around it and put the emitter's own back
+                 * (an entry stub emitted later still needs it). */
+                std::vector<CacheEnt> sc, sf;
+                std::vector<TypedEnt> st_;
+                sc.swap(cache); sf.swap(fcache); st_.swap(tflush);
+                cache = exit_states[st].cache;
+                fcache = exit_states[st].fcache;
+                tflush = exit_states[st].tflush;
+                flush_cache();
+                cache.swap(sc); fcache.swap(sf); tflush.swap(st_);
+            }
             relay_store();
             frag_ret(RetFlush::epilogue);
-            for (const size_t s : epi_flush)
-                patch32(s, static_cast<uint32_t>(at - (s + 4)));
-            epi_flush.clear();
+            for (const ExitSite &x : exits)
+                if (x.state == st)
+                    patch32(x.at, static_cast<uint32_t>(at - (x.at + 4)));
         }
-        if (!epi_bare.empty()) {
-            const size_t at = pos();
-            relay_store();
-            frag_ret(RetFlush::epilogue);
-            for (const size_t s : epi_bare)
-                patch32(s, static_cast<uint32_t>(at - (s + 4)));
-            epi_bare.clear();
-        }
+        exits.clear();
+        exit_states.clear();
     }
 
     /* ---- N3 SSE float ---- (xmm0=a/acc, xmm1=b; r8 = t_float) */
@@ -13713,6 +13788,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         e.cache.clear();
         e.reg_busy = 0;
         e.tflush.clear();       /* C3: per-RUN like the pools */
+        /* #96: the pending exits + their interned cache states are also
+         * per-RUN. emit_epilogues clears them, but a run whose emission
+         * BAILS never reaches it, and one Emitter serves every run in
+         * the chunk - a leaked exit would be patched against the next
+         * fragment's epilogue. */
+        e.exits.clear();
+        e.exit_states.clear();
         e.fread.clear();        /* C4a-i: per-RUN */
         e.flits.clear();        /* C4b: per-RUN (a stale entry would let
                                  * the next fragment read a register it
@@ -14316,6 +14398,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 && (!e.cache.empty() || !e.fcache.empty()
                     || !e.tflush.empty());
             std::vector<Emitter::CacheEnt> saved_cache, saved_fcache;
+            std::vector<Emitter::TypedEnt> saved_tflush;
             if (brk) {
                 e.flush_cache();
                 /* EMPTY the cache across the op's emission: a barrier'd op
@@ -14330,9 +14413,22 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 saved_cache = std::move(e.cache);
                 e.cache.clear();
                 e.reg_busy = 0;
-        e.reg_busy = 0;
                 saved_fcache = std::move(e.fcache);
                 e.fcache.clear();
+                /* ⛔ AND tflush, which this used to MISS - the bug the
+                 * state-keyed epilogues exposed (#96). exit_pc's old test
+                 * was `cache.empty() && fcache.empty() && tflush.empty()`,
+                 * so a fragment with C3 type-elided slots left tflush
+                 * non-empty here, the barrier'd exit read as "something is
+                 * cached", and it took the FLUSHING epilogue - which
+                 * writes the WHOLE restored cache, i.e. precisely the
+                 * pre-call register values over the helper's writes that
+                 * the comment above says must never happen. The intent was
+                 * always "a barrier'd exit flushes NOTHING"; the pre-op
+                 * flush_cache() above has already stamped these types, so
+                 * nothing is owed. */
+                saved_tflush = std::move(e.tflush);
+                e.tflush.clear();
             }
             if (op_is_branch(in.op)) {
                 /* targets get entry_remap (an external exit is a RESUME -
@@ -14347,6 +14443,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             if (brk) {
                 e.cache = std::move(saved_cache);
                 e.fcache = std::move(saved_fcache);
+                e.tflush = std::move(saved_tflush);
                 e.reload_cache();
             }
         };
