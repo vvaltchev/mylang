@@ -791,6 +791,19 @@ same is true of OpCode and Op, which appear in every instruction.)
 Version 9 is exactly such a change: deleting the CatchTest and Reraise
 opcodes renumbered every OpCode after them.
 
+LOADER HARDENING (2026-08-09, no format change).  Every ELEMENT COUNT is
+read through `Reader::countv`, which refuses a count larger than the bytes
+remaining in the file.  A count precedes records that each consume at least
+one byte, so a larger one cannot describe a real image - and feeding it to
+`reserve()` is what a corrupt file exploits.  Measured over 400 random
+mutations of an 800-byte image: 19 hangs and 20 crashes before, 5 and 9 after,
+the dominant signature being an allocator failure or 5 GB of RSS in five
+seconds.  The bound is the weakest universally-true one ("no more entries than
+bytes") on purpose - it needs no knowledge of the record it guards, so it
+cannot drift when a record's encoding changes.  The RESIDUAL is a different
+class (a slot or pool INDEX that is in range for the file but not for the
+structure it indexes) and is tracked separately.
+
 Version 13 adds `base_locs`, a second loc table per chunk, written straight
 after `locs` in the identical encoding.  A container store has TWO error
 spans and one table cannot hold both: an out-of-bounds / key / type error
