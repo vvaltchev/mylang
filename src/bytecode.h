@@ -1578,6 +1578,15 @@ struct Chunk {
      * reaches steady-state hits after two calls. Entry 0 costs a hit
      * exactly what one entry did, so two is never worse.
      *
+     * `coerce` is a THIRD entry, for a callee whose parameters need the
+     * bind-time coercion. It is kept apart rather than sharing the pair
+     * because the two hits are not the same thing: a plain hit goes
+     * straight to the push, while a coercing one must still run the
+     * per-argument type checks (those depend on the ARGUMENT VALUES, which
+     * no descriptor match can re-establish - only the five descriptor
+     * PROPERTIES are cached). Being third, it is tested only after both
+     * plain entries have missed, so a fast_bind site pays nothing for it.
+     *
      * A `FuncDescriptor *` is one of the codebase's STABLE identities
      * (program-lifetime, owned by the VmProgram) - unlike a `FuncObject *`,
      * which is refcounted and whose freed address a later closure can
@@ -1588,7 +1597,10 @@ struct Chunk {
      * DERIVED, never serialized, exactly like `native`: a loaded image's
      * JIT pass re-emits the sites and builds its own cells.
      */
-    struct CalleeCache { const void *desc[2] = { nullptr, nullptr }; };
+    struct CalleeCache {
+        const void *desc[2] = { nullptr, nullptr };  /* fast_bind callees */
+        const void *coerce = nullptr;                /* the coercing one */
+    };
     std::vector<std::unique_ptr<CalleeCache>> call_caches;
 
     /*

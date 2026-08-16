@@ -2576,3 +2576,27 @@ per call); the exact, dyn and zero-arg probes byte-flat, fourteen benches
 flat. Sabotages watched failing: skip the int -> float conversion -> the
 extra_check AND the differential (1534/1535); accept a narrowing -> the two
 JIT-ON differential modes (1534/1535) while the headline stays green.
+
+## G1 increment 5 (2026-08-07): the coercing callee joins the callee cache
+
+Increment 3 left a coercing callee re-running the five descriptor-property
+guards on EVERY call, because increment 2's cache could not hold it: a plain
+hit goes straight to the push, a coercing one must still run the
+per-argument checks (they are about ARGUMENT VALUES, which no descriptor
+match re-establishes).
+
+`Chunk::CalleeCache` gains a THIRD entry tested only after both plain entries
+miss - so a fast_bind site pays for it never on a hit, once on a miss. A
+coercing hit skips the arity compare, the chunk load+test, the sync-entry
+test, plain_frame and the fast_bind test, re-derives only the callee chunk,
+and falls into the per-argument checks.
+
+Predicted 10 instructions, measured exactly 10: q_int 301 -> 291 Ir/call
+(**-3.32%**), widen2 495 -> 485 (**-2.02%**); the dyn and zero-arg probes
+byte-flat, twelve benches flat.
+
+Sabotage watched failing: point the third compare at a register that cannot
+match -> the widening extra_check's own assertion (`the coercing callee is
+NOT CACHED (0)`) AND the coverage sweep (`g_jit_coerce_cached is ZERO`),
+1752/1754. Both are counter-based of necessity: a cache that never hits is
+CORRECT, so no differential, corpus, fuzzer or lever configuration sees it.

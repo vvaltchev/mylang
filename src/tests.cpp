@@ -16720,6 +16720,7 @@ static bool jit_bind_widen_inline()
         return ok;
     };
     const unsigned long b0 = g_jit_bind_widen;
+    const unsigned long c0 = g_jit_coerce_cached;
     if (!run({
             "func mkf() { var b = 0.5;",
             "  return func[b](float x) { return b + x; }; }",
@@ -16741,6 +16742,15 @@ static bool jit_bind_widen_inline()
     if (g_jit_bind_widen <= b0 + 50) {
         fprintf(stderr, "jit_bind_widen: the inline widening DID NOT RUN"
                 " (%lu)\n", g_jit_bind_widen - b0);
+        return false;
+    }
+    /* ...and the callee cache's THIRD entry served most of those calls: each
+     * loop misses once and hits from then on, so ~2 misses over 100 calls.
+     * Without the entry a coercing callee re-ran the five descriptor-property
+     * guards on EVERY call - correct, so nothing but this counter sees it. */
+    if (g_jit_coerce_cached <= c0 + 50) {
+        fprintf(stderr, "jit_bind_widen: the coercing callee is NOT CACHED"
+                " (%lu)\n", g_jit_coerce_cached - c0);
         return false;
     }
     return true;
@@ -23553,6 +23563,7 @@ static bool jit_counter_coverage()
         { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
         { "bind_coerce",      &g_jit_bind_coerce,      nullptr },
         { "bind_widen",       &g_jit_bind_widen,       nullptr },
+        { "coerce_cached",    &g_jit_coerce_cached,    nullptr },
         { "entry_resume",     &g_jit_entry_resume,     nullptr },
         { "ret_inline",       &g_jit_ret_inline,       nullptr },
         { "member_fast",      &g_jit_member_fast,      nullptr },

@@ -75,6 +75,8 @@ unsigned long g_jit_callee_cache2 = 0; /* G1: hits on the SECOND entry */
 unsigned long g_jit_bind_coerce = 0;   /* G1: inline pushes to a callee
                                         * with a coercing param */
 unsigned long g_jit_bind_widen = 0;    /* G1: arguments WIDENED inline */
+unsigned long g_jit_coerce_cached = 0; /* G1: coercing-callee cache
+                                        * HITS (emitted) */
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 unsigned long g_jit_ret_inline = 0;    /* C4c: inline-pop returns run */
 /* C4a-i: TEMP slots admitted to the float read-elision set, process-wide.
@@ -2666,13 +2668,27 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      */
     const uint64_t cache_addr = cache_cell
         ? reinterpret_cast<uint64_t>(&cache_cell->desc[0]) : 0;
-    size_t j_hit0 = 0, j_hit1 = 0;
+    /* The two further entries are addressed from the SAME baked base, so
+     * their displacements are measured from the real members rather than
+     * written as constants (the co-located-probe rule). */
+    const auto cell_off = [&](const void *m) {
+        return static_cast<int32_t>(
+            reinterpret_cast<const char *>(m)
+            - reinterpret_cast<const char *>(&cache_cell->desc[0]));
+    };
+    const int32_t off_e1 = cache_cell ? cell_off(&cache_cell->desc[1]) : 0;
+    const int32_t off_ec = cache_cell ? cell_off(&cache_cell->coerce) : 0;
+    size_t j_hit0 = 0, j_hit1 = 0, j_hit_coerce = 0;
     if (cache_addr) {
         movabs_r11(cache_addr);
         modrm(0x3B, RAX, R11, 0, true);               /* cmp rax, [r11] */
         j_hit0 = e.j32(0x74);                         /* je hit */
-        modrm(0x3B, RAX, R11, 8, true);               /* cmp rax, [r11+8] */
+        modrm(0x3B, RAX, R11, off_e1, true);          /* cmp rax, entry 1 */
         j_hit1 = e.j32(0x74);                         /* je hit */
+        /* The COERCING entry is tested LAST, so a fast_bind site - which can
+         * never match it - pays for it only on a miss, never on a hit. */
+        modrm(0x3B, RAX, R11, off_ec, true);          /* cmp rax, coerce */
+        j_hit_coerce = e.j32(0x74);                   /* je coercing hit */
     }
     /* nparams == NARGS via the vector's byte length */
     ld(RCX, RAX, static_cast<int32_t>(P.desc_params) + 8);
@@ -2739,17 +2755,37 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * the coercing arm's checks depend on the ARGUMENT VALUES, which a
          * descriptor match cannot re-establish. */
         ld(R10, R11, 0);                              /* r10 = entry 0 */
-        st(R11, 8, R10);                              /* entry 1 = entry 0 */
+        st(R11, off_e1, R10);                         /* entry 1 = entry 0 */
         st(R11, 0, RAX);                              /* entry 0 = desc */
     }
     const size_t j_plain = e.j32(0xEB);               /* jmp -> done */
     /*
-     * The coercing arm: every parameter whose bind_req is set must find its
-     * argument ALREADY holding that type, or the plain copy below would skip
-     * a real conversion. rcx still carries the callee chunk, so the scratch
-     * here is r11 (the cache cell address is dead on this path) and r10.
+     * The coercing arm. A MISS arrives here having just proved the five
+     * descriptor properties, so it records the callee in the third cache
+     * entry; a HIT skips straight past that, having only to re-derive the
+     * callee chunk. Either way the per-argument checks below run EVERY
+     * call - they are about the ARGUMENT VALUES, which no descriptor match
+     * can re-establish.
      */
-    e.patch32_here(j_coerce);                         /* coercing: */
+    size_t j_to_args = 0;
+    e.patch32_here(j_coerce);                         /* coercing MISS: */
+    if (cache_addr) {
+        st(R11, off_ec, RAX);                         /* remember the callee */
+        j_to_args = e.j32(0xEB);                      /* jmp -> the checks */
+        e.patch32_here(j_hit_coerce);                 /* coercing HIT: */
+        ld(RCX, RAX, static_cast<int32_t>(L.desc_vm_chunk)); /* rcx = cck */
+#ifdef TESTS
+        movabs_r10(reinterpret_cast<uint64_t>(&g_jit_coerce_cached));
+        e.u8(0x49); e.u8(0xFF); e.u8(0x02);           /* inc qword [r10] */
+#endif
+        e.patch32_here(j_to_args);
+    }
+    /*
+     * Every parameter whose bind_req is set must find its argument ALREADY
+     * holding that type, or the plain copy below would skip a real
+     * conversion. rcx carries the callee chunk, so the scratch here is r11
+     * (the cache cell address is dead from now on) and r10.
+     */
     ld(R11, RAX, static_cast<int32_t>(P.desc_bind_req));
     for (int i = 0; i < NARGS; i++) {
         const int32_t s = (ARGBASE + i) * 48;

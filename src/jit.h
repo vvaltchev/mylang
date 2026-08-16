@@ -839,6 +839,10 @@ extern "C" unsigned long g_jit_bind_coerce;
 /* G1: arguments actually WIDENED by the emitted push (bool -> int,
  * int/bool -> float) rather than found already exact. */
 extern "C" unsigned long g_jit_bind_widen;
+/* G1: hits on the cache's THIRD entry - the coercing callee, whose five
+ * descriptor properties a pointer match re-establishes (its per-argument
+ * checks still run every call). */
+extern "C" unsigned long g_jit_coerce_cached;
 extern "C" unsigned long g_jit_sync_inline;
 extern "C" unsigned long g_jit_entry_resume;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
