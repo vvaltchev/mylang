@@ -60,6 +60,7 @@ unsigned long g_jit_boxed_slow_m = 0;  /* H6: ... of them MIXED */
 unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
+unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
 unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
@@ -232,12 +233,12 @@ bool g_jit_enabled = false;
 enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
-    JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_COUNT
+    JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
-    "relent", "norec", "argfuse"
+    "relent", "norec", "argfuse", "xcache"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -2718,6 +2719,16 @@ static void jit_put_bool(LValue *lv, int_type v) noexcept
  * int run (a float/libm run caches nothing, so it was masked), a
  * nested_fuzz find. Moving them callee-side keeps that guarantee by
  * construction rather than by remembering to bracket each call. */
+/*
+ * #96: SysV's callee-saved set. A pin in one of these survives a helper
+ * call for free; a pin in anything else must be spilled around one - see
+ * XCACHE_REGS and emit_call_prologue/epilogue below.
+ */
+static ML_ALWAYS_INLINE bool jit_reg_is_callee_saved(uint8_t r)
+{
+    return r == 3 || r == 5 || r >= 12;      /* rbx, rbp, r12-r15 */
+}
+
 static void emit_call_prologue(Emitter &e)
 {
     /* C2a: the FLOAT pins are in xmm registers, which are ALL
@@ -2728,12 +2739,31 @@ static void emit_call_prologue(Emitter &e)
      * epilogue and then flushes type+payload properly). */
     for (const Emitter::CacheEnt &c : e.fcache)
         e.fstore(c.reg, c.payload);
-    /* Otherwise NOTHING. Both things this used to do are gone: the slots base
-     * is in callee-saved rbx and the N5 cache registers are callee-saved too,
-     * so a helper call preserves all of them, and rsp is already call-ready
-     * (frag_entry made the body rsp % 16 == 0). Kept as a named no-op
-     * because it MARKS the call sites - a future pin in a caller-saved
-     * register would spill here, and the epilogue below is still real.
+    /*
+     * #96: and the GP pins that are CALLER-saved (r10/r11 - XCACHE_REGS),
+     * for the same reason and to the same place: the slot's PAYLOAD. The
+     * type word is left alone exactly as the float pins leave theirs - a
+     * pinned slot is never memory-read by any op in the run (the bad()
+     * rules), and an exceptional exit reloads here and then flushes type
+     * and payload together.
+     *
+     * "a future pin in a caller-saved register would spill here" is what
+     * this comment used to promise; this is that future.
+     *
+     * ORDER MATTERS AND IS ALREADY RIGHT: every call site emits this
+     * prologue BEFORE its argument setup, so the spill stores the pin's
+     * live value, and a `read_slot` in the arg setup that resolves to
+     * r10/r11 still finds it there (a spill does not invalidate). Only
+     * the `call` itself clobbers them.
+     */
+    for (const Emitter::CacheEnt &c : e.cache)
+        if (!jit_reg_is_callee_saved(c.reg))
+            e.store(c.reg, c.payload);
+    /* Otherwise NOTHING. What this used to do for the CALLEE-saved half is
+     * gone: the slots base is in rbx and r12-r15 are preserved by the
+     * callee, and rsp is already call-ready (frag_entry made the body
+     * rsp % 16 == 0). Kept as a named no-op for those, because it MARKS
+     * the call sites, and the epilogue below is still real.
      *
      * NOTE it does NOT materialise rdi either. A helper that takes the
      * slot window as its first argument used to get it for free, because
@@ -2821,6 +2851,12 @@ static void emit_call_epilogue(Emitter &e)
      * (spilled to their slot payloads by emit_call_prologue). */
     for (const Emitter::CacheEnt &c : e.fcache)
         e.fload(c.reg, c.payload);
+    /* #96: and the caller-saved GP pins (r10/r11). RAX carries the
+     * helper's status, which every call site tests right after this
+     * epilogue - a load into r10/r11 cannot disturb it. */
+    for (const Emitter::CacheEnt &c : e.cache)
+        if (!jit_reg_is_callee_saved(c.reg))
+            e.load(c.reg, c.payload);
     /* The two type singletons - compile-time constants held in
      * CALLER-saved rsi/r8, so re-materialising is cheaper than a
      * register pair the allocator could otherwise use. */
@@ -2847,6 +2883,31 @@ static void emit_call_epilogue(Emitter &e)
         if (g_hoist.kind == 0 || g_hoist.kind == 1)
             e.sar_hr_3(g_hoist.rcount);       /* 2/3 count BYTES */
     }
+}
+
+/*
+ * ⛔ #96 THE TRIPWIRE. `emit_sync_push_native` and `emit_sync_call_inline`
+ * use r10/r11 as RAW SCRATCH, outside any emit_call_prologue bracket -
+ * they are building a call RECORD, not calling a helper - so a
+ * caller-saved pin in either register would be destroyed with nothing to
+ * restore it. `jit_run_blocks_xcache` keeps a run containing such an op
+ * out of the extension.
+ *
+ * That is an opcode list, and this codebase's opcode lists have gone
+ * stale at least four times (CLAUDE.md, THE AUDIT-TABLE STAGE TRAP), so
+ * the list is not trusted on its own: both emitters ASSERT their input
+ * here. A future call-emitting op that forgets to join the list aborts a
+ * debug build loudly instead of silently corrupting a pinned local.
+ */
+static void jit_assert_no_volatile_pin(const Emitter &e)
+{
+    /* indexed, not range-for: ML_CHECK_MSG compiles to nothing under
+     * ASSERTS=0 and a range-for's binding would then be an unused
+     * variable (-Werror). The size() call keeps `e` used either way. */
+    for (size_t i = 0; i < e.cache.size(); i++)
+        ML_CHECK_MSG(jit_reg_is_callee_saved(e.cache[i].reg),
+                     "a caller-saved pin reached a raw-scratch call "
+                     "emitter - see jit_run_blocks_xcache");
 }
 
 /* Re-raise DELETABILITY: the op's own LocEntry (`&ck.locs[i]`, a stable
@@ -3124,6 +3185,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
                                   const NorecSite *ns, bool residue,
                                   const ArgFuse *af)
 {
+    jit_assert_no_volatile_pin(e);
     const JitPushLayout &P = jit_push_layout();
     const JitLayout &L = jit_layout();
     const int NARGS = static_cast<int>(in.b_lit());
@@ -4121,6 +4183,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                   const void *slow_helper,
                                   int_type callee_arg)
 {
+    jit_assert_no_volatile_pin(e);
     Loc ls, le;
     ck.loc_at(old_pc, ls, le);
     const uint64_t site =
@@ -5755,6 +5818,7 @@ void jit_stats_report()
          * question the counter exists to answer, "does this lever reach
          * a real program?", could be asked only from inside -rt);
          * `fwd_skip_rel` is the narrower C5-discharged write-skip. */
+        { "xcache",           &g_jit_xcache },
         { "fwd",              &g_jit_fwd },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
         { "str_probe_ok",     &g_jit_str_probe_ok },
@@ -5849,10 +5913,75 @@ void jit_cache_audit_report()
  * is what let it grow from two registers to four at the same time. */
 static const uint8_t CACHE_REGS[] = { 12, 13, 14, 15 };
 static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
+
+/*
+ * #96: THE CALLER-SAVED EXTENSION - the first registers the JIT uses
+ * that the SysV convention does NOT preserve for it.
+ *
+ * The maintainer's objection to a four-wide pool is exactly right: four
+ * is the ceiling for PINNING, because a pin lives for the whole fragment
+ * and must therefore survive a helper call, and SysV's callee-saved set
+ * is only {RBX, RBP, R12-R15} - of which RBX is the slots base and RBP
+ * the frame pointer the no-record tier walks. Native code has no such
+ * limit: it uses the scratch registers and spills around the calls that
+ * actually occur. The loops that matter here make NO call in the body.
+ *
+ * r10/r11 are the two GP registers that are neither a SysV ARGUMENT
+ * register nor per-op scratch, which is what makes them the cheapest
+ * first step:
+ *   - an argument register (rdi/rsi/rdx/rcx/r8/r9) is written by the
+ *     call site's own arg setup, BETWEEN the prologue and the call, so
+ *     a pin there would have to be read back out of the spill by every
+ *     later arg - a separate increment;
+ *   - rax/rcx/rdx are written by nearly every emitted op.
+ *
+ * TWO conditions make them sound, and both are checked, not assumed:
+ *   1. a helper call clobbers them, so `emit_call_prologue` SPILLS each
+ *      to its slot payload and `emit_call_epilogue` RELOADS it. That
+ *      choke point already exists and already does exactly this for the
+ *      caller-saved xmm float pins;
+ *   2. the C1 navigation hoist OWNS r10/r11 while a loop region emits
+ *      (JitHoist::rdata/rcount), so the pool takes them only when the
+ *      fragment has NO hoist region.
+ * They are NOT pushed at frag_entry: caller-saved means the C++ caller
+ * expects nothing preserved, so the fragment may clobber them freely.
+ */
+static const uint8_t XCACHE_REGS[] = { 10, 11 };
+static const size_t MAX_XCACHED = sizeof(XCACHE_REGS) / sizeof(XCACHE_REGS[0]);
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
 static const uint8_t FCACHE_REGS[] = { 4, 5, 6, 7 };
 static const size_t MAX_FCACHED =
     sizeof(FCACHE_REGS) / sizeof(FCACHE_REGS[0]);
+
+/*
+ * #96: may this RUN spend the caller-saved extension (XCACHE_REGS)?
+ *
+ * Not if it emits a MyLang CALL. `emit_sync_push_native` builds the call
+ * RECORD with r10/r11 as raw scratch - it is not calling a helper, so it
+ * is outside the emit_call_prologue bracket that spills them, and a pin
+ * there would be destroyed with nothing to restore it.
+ *
+ * ⛔ ReturnV and Halt are deliberately NOT in this list even though
+ * `emit_ret_native` uses r10/r11 just as freely: its FIRST act is
+ * `e.flush_cache()`, so every pin is already back in memory and
+ * everything after reads memory. Leaving them out is what makes the
+ * extension reach a function BODY at all - every one of them ends in a
+ * ReturnV. The claim is checked, not assumed: jit_assert_no_volatile_pin
+ * fires in a debug build if a pin ever reaches the raw-scratch emitters.
+ */
+static bool jit_run_blocks_xcache(const Chunk &ck, size_t begin, size_t end)
+{
+    for (size_t p = begin; p < end; p++)
+        switch (ck.code[p].op) {
+        case OpCode::CallV:
+        case OpCode::CachedCallV:
+        case OpCode::CallValueV:
+            return true;
+        default:
+            break;
+        }
+    return false;
+}
 
 /* N5: pick up to MAX_CACHED hot INT-scalar slots to pin for a run.
  * A slot qualifies iff it is a RESOLVED LOCAL (< slot_count) and EVERY use
@@ -5896,6 +6025,12 @@ static const size_t MAX_FCACHED =
 static std::vector<int>
 pick_cached_slots(const Chunk &ck, size_t begin,
                   size_t end, int slot_count,
+                  /* #96: how many int pins this FRAGMENT can afford -
+                   * MAX_CACHED, plus the caller-saved extension when
+                   * the C1 hoist does not own r10/r11. Was hardcoded to
+                   * MAX_CACHED, which is a property of the POOL, not of
+                   * the pick. */
+                  size_t max_pins,
                   std::vector<char> *barrier = nullptr,
                   std::vector<int> *fhot = nullptr,
                   std::vector<int> *hot_counts = nullptr,
@@ -6526,7 +6661,7 @@ pick_cached_slots(const Chunk &ck, size_t begin,
                                             : a.second < b.second;
               });
     std::vector<int> out;
-    for (size_t i = 0; i < cand.size() && i < MAX_CACHED; i++) {
+    for (size_t i = 0; i < cand.size() && i < max_pins; i++) {
         out.push_back(cand[i].second);
         if (hot_counts)
             hot_counts->push_back(cand[i].first);   /* C2b: the weights */
@@ -13513,8 +13648,20 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         std::vector<int> hot_counts;
         std::vector<int> textra, textra_f;        /* C3: type-elided */
         std::vector<int> fread_raw;               /* C4a-i */
+        /*
+         * #96: this fragment's PIN BUDGET. The callee-saved four always;
+         * r10/r11 as well when no C1 region wants them (see XCACHE_REGS).
+         * Decided HERE because it is a property of the fragment, not of
+         * the pool - which is why the pick can no longer read MAX_CACHED
+         * for itself.
+         */
+        const bool xcache_ok = hregs.empty()
+            && !jit_run_blocks_xcache(chunk, begin, end)
+            && !jit_lever_off(JL_XCACHE);
+        const size_t max_pins = MAX_CACHED + (xcache_ok ? MAX_XCACHED : 0);
         std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
+                              max_pins,
                               &cache_barrier, &fhot, &hot_counts,
                               &textra, &textra_f, &fread_raw);
         /* the per-lever kill switches (see JitLever): applied HERE, on
@@ -13562,8 +13709,37 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 }
             }
         }
-        for (size_t h = 0; h < hot.size(); h++)
-            e.saved.push_back(CACHE_REGS[h]);
+        /*
+         * #96: ASSIGN a register to each pin, through the register STATE
+         * rather than the positional zip `hot[h] -> CACHE_REGS[h]`. The
+         * callee-saved pool first, then the caller-saved extension - so
+         * a fragment that pins five or six slots spends r10/r11 on the
+         * overflow and everything else is exactly as before.
+         *
+         * The C2b hoist pair is reserved FIRST because its own pick above
+         * already chose `CACHE_REGS[hot.size()..+1]` positionally; marking
+         * those busy makes take_reg's first-free scan reproduce the old
+         * assignment byte for byte instead of colliding with it. (The pair
+         * exists only when hregs is non-empty, which is exactly when the
+         * extension is off, so the two can never compete.)
+         *
+         * Only a CALLEE-saved register joins `e.saved`: frag_entry pushes
+         * that list and frag_ret pops it, and r10/r11 need neither.
+         */
+        if (pair_lo >= 0) {
+            e.reg_busy |= 1u << pair_lo;
+            e.reg_busy |= 1u << pair_hi;
+        }
+        std::vector<uint8_t> hot_reg(hot.size());
+        for (size_t h = 0; h < hot.size(); h++) {
+            int r = e.take_reg(CACHE_REGS, MAX_CACHED);
+            if (r < 0 && xcache_ok)
+                r = e.take_reg(XCACHE_REGS, MAX_XCACHED);
+            ML_CHECK(r >= 0);            /* hot.size() <= max_pins */
+            hot_reg[h] = static_cast<uint8_t>(r);
+            if (jit_reg_is_callee_saved(hot_reg[h]))
+                e.saved.push_back(hot_reg[h]);
+        }
         if (pair_lo >= 0) {
             e.saved.push_back(static_cast<uint8_t>(pair_lo));
             e.saved.push_back(static_cast<uint8_t>(pair_hi));
@@ -13587,15 +13763,25 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * flushes them back). */
         for (size_t h = 0; h < hot.size(); h++) {
             const SlotAddr a = slot_addr(hot[h]);
-            /* through the register STATE rather than the positional zip
-             * `CACHE_REGS[h]` - identical while nothing gives a register
-             * back, and the seam the allocator drives. */
-            const int r = e.take_reg(CACHE_REGS, MAX_CACHED);
-            ML_CHECK(r >= 0);            /* hot.size() <= MAX_CACHED */
-            e.cache.push_back({ hot[h], a.payload, a.type,
-                                static_cast<uint8_t>(r) });
-            e.load(static_cast<uint8_t>(r), a.payload);   /* entry load */
+            e.cache.push_back({ hot[h], a.payload, a.type, hot_reg[h] });
+            e.load(hot_reg[h], a.payload);                /* entry load */
         }
+#ifdef TESTS
+        {
+            /* #96: the execution proof, bumped per ENTRY of a fragment
+             * that spent a CALLER-saved pin (the g_jit_fcache pattern).
+             * A compile-time count would not do: the question is whether
+             * the extension REACHES a running program. */
+            bool vol = false;
+            for (const uint8_t r : hot_reg)
+                if (!jit_reg_is_callee_saved(r))
+                    vol = true;
+            if (vol) {
+                e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_xcache));
+                e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+            }
+        }
+#endif
         /* C2a: the float pins - xmm needs no push (caller-saved; the
          * C++ caller expects nothing preserved), only the entry loads.
          * A non-empty fhot implies run_has_float (float pins only arise
@@ -14241,8 +14427,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
             if (run_has_float(chunk, begin, end))
                 e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
-            for (size_t h = 0; h < hot.size(); h++)
-                e.load(CACHE_REGS[h], e.cache[h].payload);
+            for (const Emitter::CacheEnt &c : e.cache)
+                e.load(c.reg, c.payload);   /* #96: the ENTRY's own
+                                             * assignment, not the
+                                             * positional CACHE_REGS[h] */
             for (const Emitter::CacheEnt &c : e.fcache)
                 e.fload(c.reg, c.payload);        /* C2a float pins */
             for (const Emitter::FLit &fl : e.flits)

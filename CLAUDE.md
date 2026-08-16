@@ -430,7 +430,10 @@ collision). Three nets now:
   per mode, so `-rt` is green with it on OR off), argfuse (#162: a
   reference argument already in a named local is bound STRAIGHT from
   that slot and its staging MoveV is not emitted; the cold arms
-  materialise the run), `all`.
+  materialise the run), xcache (#96: the CALLER-saved pin extension -
+  r10/r11 hold two more hot locals in a fragment with no C1 hoist
+  region and no MyLang call, spilled/reloaded around every helper call
+  by emit_call_prologue/epilogue), `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the

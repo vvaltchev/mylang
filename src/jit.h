@@ -902,6 +902,11 @@ extern "C" unsigned long g_jit_hoist;         /* C1: hoisted-nav entries */
 extern "C" unsigned long g_jit_hoist_rmw;     /* C1e: hoisted-COMPOUND
                                                * element stores (the RMW
                                                * off r10/r11) */
+/* #96: fragment entries that spent a CALLER-saved pin (XCACHE_REGS -
+ * r10/r11). The emitted-code proof that the extension reaches a real
+ * program, and the discriminator between "the pool is wide" and "the
+ * pool is wide AND something used the width". */
+extern "C" unsigned long g_jit_xcache;
 extern "C" unsigned long g_jit_fcache;        /* C2a: float-pinned fragment
                                                * entries (xmm4-7) */
 extern "C" unsigned long g_jit_hoist2;        /* C2b: second-base preheader

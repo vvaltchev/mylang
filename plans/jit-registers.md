@@ -612,6 +612,54 @@ The lesson to carry into the allocator: **the cheapest register is the
 one a value never leaves.** Before widening the pool, check whether the
 traffic is a value that could simply have stayed where it was produced.
 
+#### LANDED: the caller-saved extension r10/r11 - the pool is 6 wide
+
+`XCACHE_REGS`, `MYLANG_JIT_OFF=xcache`, JITSTATS `xcache`. The first
+registers this JIT uses that SysV does not preserve for it: spilled by
+`emit_call_prologue` and reloaded by `emit_call_epilogue` (the spill
+lands BEFORE the arg setup at every call site, which is the correctness
+argument), and taken only when no C1 hoist region wants the pair.
+
+**MEASURED: -23.3% data references on 80_regs_int_08, and the wall clock
+does not move** (1.004 / 0.985 / 0.984 / 1.052 across N = 8/14/25/40).
+Full record + the two defensive-not-proven gates in
+docs/jit-optimizations.md.
+
+⛔ **THE FINDING THAT REDIRECTS THE REST OF THIS PLAN.** Ir is flat BY
+CONSTRUCTION: `mov rax, [rbx+0x38]` and `mov rax, r10` are both one
+instruction and one uop. An allocator removes DATA references, and on
+this core an L1-hitting slot round-trip retires alongside the real work
+- so **a data-reference win with an unchanged instruction count has a
+wall-clock ceiling near zero**, the exact mirror of the guard-elision
+family's instruction-count win with the same ceiling.
+
+The two-regime model above predicted a payoff here and was WRONG about
+this shape: `slotcost.cpp` varied the memory ops while the instruction
+count ALSO changed, which is not what an allocator does.
+
+**So a register is a PREREQUISITE, not the win.** The win is the
+instruction the register makes removable:
+
+    mov rax, r14      ; a0
+    mov rcx, r13      ; i
+    add rax, rcx
+    mov r14, rax      ; a0 = ...
+    mov rax, r14      ; <-- REDUNDANT: rax already holds it
+    sar rax, 3
+
+One instruction per accumulator per iteration - ~8 of 80_regs_int_08's
+~50 loop instructions - and only removable once the value is in a
+register at all. **That is the next increment**, and it is lever A
+generalised from TEMPS to LOCALS (the plan's own T1 line, arrived at
+from the other direction).
+
+Its hazard is stated up front: the "rax still holds slot S" fact must be
+invalidated by EVERY emit that writes rax and at every label, branch
+target and entry stub. Getting that wrong is a silent miscompile, so it
+wants the narrowest possible carrier - set it in ONE place (the store to
+a pinned register) and clear it in `emit_one`'s per-op reset, the way
+`g_fwd.in_rax` already does.
+
 #### The order for the rest
 
 1. **Per-instruction register STATE** replacing `pick_cached_slots`'

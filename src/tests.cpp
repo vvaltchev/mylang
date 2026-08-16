@@ -24308,6 +24308,159 @@ static bool jit_fwd_skip_reflisted()
  * proof the forwarding executed (values are right either way). Exact
  * counts attribute per shape.
  */
+/*
+ * #96 - THE CALLER-SAVED PIN EXTENSION (XCACHE_REGS = r10/r11).
+ *
+ * Four callee-saved registers is the ceiling for PINNING, not for using
+ * the machine: r10/r11 are neither SysV argument registers nor per-op
+ * scratch, so a fragment can hold two more locals there provided every
+ * helper call spills and reloads them (emit_call_prologue/epilogue) and
+ * no C1 hoist region wants the pair.
+ *
+ * g_jit_xcache is bumped by the EMITTED entry of a fragment that spent
+ * one - the g_jit_fcache pattern, and the only proof that the extension
+ * reached a running program rather than merely widening a table. Value
+ * parity with the tree-walker is the corruption oracle: a pin that is
+ * clobbered and not restored computes a wrong answer, it does not crash.
+ */
+static bool jit_xcache_pins()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src, bool vm,
+                  unsigned long *xc) -> std::string {
+        const unsigned long x0 = g_jit_xcache;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (xc) *xc = g_jit_xcache - x0;
+        return cap.str();
+    };
+
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        bool want;          /* must the extension have ENGAGED? */
+    };
+    const std::vector<Case> cases = {
+      /* SIX hot int locals in a call-free loop: four take r12-r15, the
+       * last two take r10/r11. Every accumulator is read and written
+       * each iteration, so all six clear the pick's use threshold. */
+      { "six hot locals in a call-free loop take r10/r11 too",
+        { "func f(int n) {",
+          "    var a = 1; var b = 2; var c = 3;",
+          "    var d = 4; var e = 5; var g = 6;",
+          "    for (var i = 0; i < n; i++) {",
+          "        a = a + i; b = b + a; c = c + b;",
+          "        d = d + c; e = e + d; g = g + e; }",
+          "    return a + b + c + d + e + g; }",
+          "print(f(runtime(40)));" }, true },
+
+      /*
+       * THE DECLINE THAT MATTERS. `emit_sync_push_native` builds a call
+       * RECORD with r10/r11 as raw scratch, outside any prologue
+       * bracket, so a run containing a MyLang CALL must not spend them.
+       * Same six accumulators, one call in the loop.
+       *
+       * The VALUE is the real oracle here: with the decline removed the
+       * push overwrites two live accumulators and the sum is wrong (the
+       * counter would still say "engaged").
+       */
+      { "a MyLang call in the loop DECLINES the extension",
+        { "var sink = 0;",
+          /* IMPURE and OVER THE INLINE WEIGHT on purpose - the first
+           * version of this case wrote `func h(int x) => x + 1`, which
+           * the AST inliner splices away, so the loop held no CallV at
+           * all and the case engaged exactly like the one above. The
+           * vacuous-test trap in its documented form ("a CALL is not a
+           * call by the time codegen sees it"); `-vd` shows a real
+           * `call.v` for this body. */
+          "func h(int x) {",
+          "    sink = sink + 1;",
+          "    var t = x * 3; var u = t - 1;",
+          "    var v = u + t; var w = v * 2;",
+          "    if (w > 1000000) { w = w - 1000000; }",
+          "    return w + u + t + 7; }",
+          "func f(int n) {",
+          "    var a = 1; var b = 2; var c = 3;",
+          "    var d = 4; var e = 5; var g = 6;",
+          "    for (var i = 0; i < n; i++) {",
+          "        a = a + i; b = b + a; c = c + b;",
+          "        d = d + c; e = e + d; g = g + h(e); }",
+          "    return a + b + c + d + e + g; }",
+          "print(f(runtime(40)));" }, false },
+
+      /*
+       * THE LOAD-BEARING SHAPE: a caller-saved pin SPILLED around a
+       * helper call and RELOADED after it. Six hot locals plus an
+       * `int(q)` on a dyn, whose boxed arm calls a helper - so r10/r11
+       * are clobbered mid-loop and only emit_call_prologue/epilogue
+       * bring them back. Read the emitted code once and it is literally
+       *   mov e, r10 / mov g, r11 / <arg setup> / call / mov r10, e
+       * with the spill BEFORE the argument setup, which is the whole
+       * ordering argument. A missing reload is a wrong ANSWER, so tree-
+       * walker parity is the oracle and the counter only says it ran.
+       */
+      { "a caller-saved pin survives a helper call (spill + reload)",
+        { "func f(int n, dyn q) {",
+          "    var a = 1; var b = 2; var c = 3;",
+          "    var d = 4; var e = 5; var g = 6;",
+          "    for (var i = 0; i < n; i++) {",
+          "        a = a + i; b = b + a; c = c + b;",
+          "        d = d + c; e = e + d; g = g + int(q) + e; }",
+          "    return a + b + c + d + e + g; }",
+          "print(f(runtime(40), runtime(2)));" }, true },
+
+      /* THREE hot locals: the callee-saved four suffice, so the
+       * extension must stay out of it (a pool that always reaches for
+       * r10/r11 would pass the case above and this one would catch it). */
+      { "a fragment that fits in r12-r15 does not touch r10/r11",
+        { "func f(int n) {",
+          "    var a = 1; var b = 2;",
+          "    for (var i = 0; i < n; i++) { a = a + i; b = b + a; }",
+          "    return a + b; }",
+          "print(f(runtime(40)));" }, false },
+    };
+
+    bool ok = true;
+    for (const Case &c : cases) {
+        unsigned long xc = 0;
+        const std::string got = go(c.src, true, &xc);
+        const std::string ref = go(c.src, false, nullptr);
+        if (got != ref || ref.empty()) {
+            cout << "  xcache [" << c.name << "]: tw=[" << ref
+                 << "] vm=[" << got << "]\n";
+            ok = false;
+        }
+        if (c.want != (xc > 0)) {
+            cout << "  xcache [" << c.name << "]: engaged " << xc
+                 << ", expected " << (c.want ? "> 0" : "0") << "\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_fwd_deadtemp()
 {
 #if ML_JIT_SUPPORTED
@@ -31375,6 +31528,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the SLICE read arms (single + nested outer/row) and the "
       "nested int-row PROMOTE arm (#95)",
       jit_elem_slice_and_promote },
+    { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "
+      "call-free fragment, declines around a MyLang call (#96)",
+      jit_xcache_pins },
     { "jit: adjacent dead-temp FORWARDING hands values in RAX "
       "(lever A; counter + slow-path rejoin)",
       jit_fwd_deadtemp },

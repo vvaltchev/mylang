@@ -4846,3 +4846,120 @@ to gain - MyLang's shifts are int-only - but it is the same kind of
 list and should be re-read whenever the float family grows.
 IntModRI/IntAddModRI as PRODUCERS is the one remaining int gap, and it
 is a result-register normalisation, not a soundness question.
+
+## #96: the caller-saved pin extension (r10/r11) - and what it measured
+
+**The maintainer's objection was right and the plan's answer was wrong.**
+This file (and plans/jit-registers.md) said MAX_CACHED = 4 is the limit.
+Four is the ceiling for **PINNING**: a pin lives for the whole fragment,
+so it must survive a helper call, so it must be callee-saved - and SysV's
+callee-saved set is {RBX, RBP, R12-R15}, of which RBX is the slots base
+and RBP the frame pointer the no-record tier walks. It is NOT the limit
+on using the machine. Native code holds values in scratch registers and
+spills only around the calls that actually occur, and the loops that
+matter here make no call in the body.
+
+`XCACHE_REGS = {r10, r11}` is the first step of that: the two GP
+registers that are neither a SysV ARGUMENT register nor per-op scratch.
+An argument register is written by the call site's own arg setup between
+the prologue and the call, so a pin there needs every later argument to
+read back out of the spill - a separate increment. rax/rcx/rdx are
+written by nearly every op.
+
+Two conditions, both checked rather than assumed:
+  - `emit_call_prologue` SPILLS each caller-saved pin to its slot
+    payload and `emit_call_epilogue` RELOADS it. The choke point already
+    did exactly this for the caller-saved xmm float pins, and its own
+    comment promised "a future pin in a caller-saved register would
+    spill here". **The spill lands BEFORE the argument setup at every
+    call site** - verified by reading the emitted code, and that
+    ordering is what makes it correct;
+  - the C1 navigation hoist OWNS r10/r11 while a loop region emits, so
+    the pool takes them only when the fragment has no hoist region.
+
+Lever: `MYLANG_JIT_OFF=xcache`. Counter: JITSTATS `xcache`, bumped by the
+EMITTED fragment entry.
+
+### Measured - and the result is the point
+
+| bench | Ir | D refs | wall |
+|---|---|---|---|
+| 80_regs_int_08 | +0.00% | **-23.33%** | 1.004x |
+| 81_regs_int_14 | -0.00% | - | 0.985x |
+| 82_regs_int_25 | -0.00% | **-7.09%** | 0.984x |
+| 83_regs_int_40 | +0.00% | **-4.39%** | 1.052x |
+
+**Ir is flat BY CONSTRUCTION** and that is the finding. `mov rax,
+[rbx+0x38]` and `mov rax, r10` are both one instruction and one uop; a
+register allocator removes DATA references, not instructions. Exactly
+20,000,000 D refs vanish in each row (2 accumulators x 2M iterations x
+5 accesses), so the tier does precisely what it claims.
+
+**And the wall clock does not move.** 1.004 / 0.985 / 0.984 / 1.052
+across N = 8/14/25/40 - non-monotone in N, with a strictly-improving
+mechanism and identical instruction counts. That is a code-LAYOUT
+lottery, the effect this box has already produced at 12.5% (see the
+vm_dispatch front-end note), not a cost. The 5% on the N=40 row
+reproduces across three interleaved runs and has no other mechanism
+available to it: fewer memory operations, byte-identical instruction
+count.
+
+⛔ **THE RULE THIS EARNS, and it is the mirror of the guard-elision
+one.** That entry says an INSTRUCTION-count win can have a wall-clock
+ceiling near zero. This is the other half: **a DATA-reference win with
+an unchanged instruction count has a wall-clock ceiling near zero too.**
+On a wide out-of-order core an L1-hitting slot round-trip retires
+alongside the real work; what binds is the front end, and the front end
+did not change. The two-regime model in plans/cpp-gap-ladder.md
+predicted a payoff here (these loops are throughput-bound by
+construction, where the isolated microbenchmark measured 3.21x) and it
+was WRONG about this shape - the microbenchmark varied the memory ops
+with the instruction count held DIFFERENT, which is not what an
+allocator does.
+
+**So the register is a PREREQUISITE, not the win.** The win is the
+instruction the register makes removable:
+
+    mov rax, r14      ; a0
+    mov rcx, r13      ; i
+    add rax, rcx
+    mov r14, rax      ; a0 = ...
+    mov rax, r14      ; <-- REDUNDANT: rax already holds it
+    sar rax, 3
+
+That reload is one instruction per accumulator per iteration, and it is
+only removable once the value is in a register at all. It is lever A
+generalised from TEMPS to LOCALS, and it is the next increment.
+
+### The nets, and two gates that are DEFENSIVE rather than proven
+
+`jit_xcache_pins` has four cases: six hot locals in a call-free loop
+(engages), the same with a MyLang call (declines), a caller-saved pin
+spilled around a HELPER call (engages, and is the shape the new
+prologue/epilogue code exists for), and three hot locals (the
+callee-saved four suffice, so the extension must stay out).
+
+Two things a future reader must not mistake for proven:
+
+  - **`jit_run_blocks_xcache` is redundant today.** `emit_sync_push_native`
+    builds a call RECORD with r10/r11 as raw scratch, outside any
+    prologue bracket, so a run containing a MyLang call must not spend
+    them - but `pick_cached_slots` has no case for CallV/CachedCallV/
+    CallValueV and its `default: return {}` already caches NOTHING in
+    such a run. Watched: removing the gate changes no behaviour. It is
+    kept because that default is a catch-all for UNCLASSIFIED ops, and
+    the day someone classifies CallV there (reasonable - a call
+    preserves callee-saved pins) the requirement becomes real and
+    invisible. `jit_assert_no_volatile_pin` is the tripwire in both
+    raw-scratch emitters; it is likewise unreachable today.
+  - **The epilogue RELOAD is ABI-mandated but not sabotage-observable
+    on this toolchain.** Deleting it keeps the whole suite green,
+    because no helper on the reachable paths happens to write r10/r11
+    with this gcc and this libm - tried with libm sin/cos in the loop
+    and with an `asm volatile("" ::: "r10","r11")` clobber added to
+    `jit_move`, neither diverges. SysV says a callee MAY clobber them,
+    so the reload stays; a different toolchain turns its absence into a
+    silent wrong answer. **The net that would make it observable** is a
+    debug-only stub that deliberately writes garbage into r10/r11 after
+    every emitted helper call - the MYLANG_JIT_COLD philosophy applied
+    to the ABI. Not built.
