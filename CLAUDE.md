@@ -1677,8 +1677,9 @@ parameter, *can the reference this is bound to still be reachable after the
 call returns?* The answer is a bit in `FuncDescriptor::noescape_params`, and
 its intended consumer is a reference argument bound with NO retain (the
 caller's slot holds one for the whole of a synchronous call). **There is no
-consumer yet** — the two hazards one owes are recorded on the pass and in
-`plans/top5-cpp-gap.md`. Four rules a future editor must not soften:
+consumer yet** — the one hazard it owes (a SLICE argument, whose in-place
+detach would release a reference the borrowed slot never took) is recorded
+on the pass. Four rules a future editor must not soften:
 
 - **It runs LAST in `resolve_names`, after `devirtualize_direct_calls`** — it
   reads `SymKind::global` (pass 2) and `direct_func_slot` (that call). A
