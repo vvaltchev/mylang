@@ -148,12 +148,16 @@ public:
         const void *slice;
         const void *obj;
         long strobj_data;
+        /* the object the offset is INTO, so the emitter can bound it
+         * without needing StrObj (which is private) visible there */
+        size_t strobj_size;
     };
     JitProbe jit_probe() const {
         return { &len, &slice, &obj,
                  obj ? reinterpret_cast<const char *>(&obj->s)
                        - reinterpret_cast<const char *>(obj.get())
-                     : 0 };
+                     : 0,
+                 sizeof(StrObj) };
     }
 
     bool is_slice() const { return slice; }

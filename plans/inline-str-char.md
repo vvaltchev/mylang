@@ -87,8 +87,32 @@ for a toolchain change.
 construct a SHORT string and a LONG one, compute the candidate offset
 from a real object, load a pointer through it, and check both equal
 `s.data()`. If either fails, leave the inline tier DISABLED and every
-`ord(s[i])` keeps calling the helper. Ten lines, and it converts a
-portability landmine into a tier that quietly does not engage.
+`ord(s[i])` keeps calling the helper. It converts a portability landmine
+into a tier that quietly does not engage.
+
+**AND THE PROBE MUST NOT BE ABLE TO DO THE WILD READ IT PREVENTS**
+(maintainer, 2026-08-16). Two layers, in this order:
+  1. a BOUND - the offset plus a pointer must fit inside the StrObj,
+     whose size the probe hands out (`JitProbe::strobj_size`) precisely
+     so jit.cpp can check without needing the private type. This is the
+     real defence and it costs nothing.
+  2. a FAULT GUARD - `sigaction` on SIGSEGV/SIGBUS plus
+     `sigsetjmp`/`siglongjmp` around the two loads, restored
+     immediately, as the backstop for whatever the bound does not
+     foresee. WATCHED: bypassing the bound and forcing a 1 GB offset
+     prints the warning, keeps the tier off, returns the right answer
+     and does not crash.
+
+  ⛔ **BUILD THE TEST STRINGS OUTSIDE THE GUARDED WINDOW.**
+  `siglongjmp` skips C++ destructors, so a string constructed inside it
+  LEAKS when the guard fires - ASan reported exactly that (56 bytes,
+  once) on the first version. The window now holds two loads and a
+  compare; everything that allocates happens before it.
+
+**A FAILURE WARNS, ONCE, ON STDERR** (maintainer, 2026-08-16): losing an
+optimization silently is how a platform ends up permanently slower with
+nobody noticing. The text says correctness is unaffected, so it cannot
+be mistaken for an error, and asks for the toolchain to be reported.
 
 This follows the project's existing precedent - `SharedObject`'s
 `data_off` already bakes libstdc++'s `vector::_M_start` at +0, and

@@ -43,6 +43,8 @@
 #include <unordered_set>
 #include <cstring>
 #include <cmath>
+#include <csetjmp>
+#include <csignal>
 #include <vector>
 
 #ifdef TESTS
@@ -537,6 +539,130 @@ struct JitLayout {
     bool sobj_ok;         /* the vector-data-at-+0 probe held */
 };
 
+/*
+ * #95: VERIFY the SharedStr char-data offset against LIVE strings, under
+ * a fault guard.
+ *
+ * The emitted inline `ord(s[i])` loads characters through
+ * `[StrObj + strobj_data_off]`, i.e. std::string::_M_p. libstdc++ keeps
+ * that at offset 0 of the string and valid for BOTH the SSO and the heap
+ * form, so one load serves every string; libc++ does not lay its short
+ * form out that way. A wrong offset is a silent wrong character or a
+ * wild read, never a build error, so it is CHECKED rather than assumed.
+ *
+ * ⛔ AND THE CHECK ITSELF IS FAULT-GUARDED, because a probe that exists
+ * to prevent a wild read must not be able to perform one. The caller
+ * bounds the offset by sizeof(StrObj) first - that is the real defence -
+ * and this is the backstop for whatever the bound does not foresee: a
+ * SIGSEGV or SIGBUS inside the window longjmps out and the tier stays
+ * DISABLED. The handlers are installed for the duration of the two reads
+ * and restored immediately, so a genuine crash anywhere else still
+ * reports normally.
+ *
+ * A FAILURE IS WARNED ABOUT, ONCE. Losing an optimization silently is
+ * how a platform ends up permanently slower with nobody noticing; the
+ * warning says correctness is unaffected so it cannot be mistaken for an
+ * error.
+ */
+static sigjmp_buf g_str_probe_jmp;
+
+extern "C" void jit_str_probe_fault(int)
+{
+    siglongjmp(g_str_probe_jmp, 1);
+}
+
+/* ONE subject, prepared OUTSIDE the fault window - see the note there. */
+struct JitStrSubject { const SharedStr *r; const char *expect; };
+
+/* The only thing inside the window: pointer arithmetic, two loads and a
+ * comparison. No allocation, no destructor, nothing a siglongjmp could
+ * skip. */
+static bool jit_str_probe_read(const JitLayout &l, const JitStrSubject &s)
+{
+    const char *base = reinterpret_cast<const char *>(s.r);
+    const void *sobj =
+        *reinterpret_cast<void *const *>(base + l.str_obj_off);
+    if (!sobj)
+        return false;
+    const char *got = *reinterpret_cast<const char *const *>(
+        static_cast<const char *>(sobj) + l.strobj_data_off);
+    return got == s.expect;
+}
+
+static bool jit_verify_str_probe(const JitLayout &l)
+{
+    /*
+     * ⛔ BUILD THE SUBJECTS OUTSIDE THE FAULT WINDOW. `siglongjmp` skips
+     * C++ destructors, so a string constructed inside it leaks when the
+     * guard fires - ASan reported exactly that (56 bytes, once) the
+     * first time this was written the other way round. Everything that
+     * allocates, and every call that could, happens here; the guarded
+     * region below is two loads and a compare.
+     *
+     * SHORT (SSO-eligible) and LONG (certainly heap) are the two forms
+     * whose layouts diverge, so both must verify.
+     */
+    SharedStr shortv{ std::string("abc") };
+    SharedStr longv{ std::string(
+        "0123456789012345678901234567890123456789"
+        "0123456789012345678901234567890123456789") };
+    LValue lv_s(EvalValue(std::move(shortv)), false);
+    LValue lv_l(EvalValue(std::move(longv)), false);
+    const SharedStr &rs = lv_s.get().get_ref<SharedStr>();
+    const SharedStr &rl = lv_l.get().get_ref<SharedStr>();
+    const JitStrSubject sub_short{ &rs, rs.get_view().data() };
+    const JitStrSubject sub_long{ &rl, rl.get_view().data() };
+
+    struct sigaction sa, old_segv, old_bus;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = &jit_str_probe_fault;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGSEGV, &sa, &old_segv) != 0)
+        return false;
+    if (sigaction(SIGBUS, &sa, &old_bus) != 0) {
+        sigaction(SIGSEGV, &old_segv, nullptr);
+        return false;
+    }
+    /*
+     * ⛔ `volatile` IS LOAD-BEARING, NOT DECORATION. A local that is
+     * (a) automatic, (b) not volatile-qualified, and (c) MODIFIED
+     * between `sigsetjmp` and the `siglongjmp` has an INDETERMINATE
+     * value after the jump - C17 7.13.2.1p3, and C++ inherits it. The
+     * compiler is entitled to keep `ok` in a callee-saved register that
+     * the jump restores to its pre-`sigsetjmp` contents, so "ok stays
+     * false" is a wish, not a guarantee: the probe could report SUCCESS
+     * after faulting and the emitter would then bake a string layout
+     * this toolchain does not have.
+     *
+     * GCC says so (`-Wclobbered`), and it is not a false positive.
+     * `-Wclobbered` needs the non-LTO pipeline to see the whole
+     * function at compile time, so a `LTO=1` build - the default for
+     * OPT=1 - is SILENT about it. That is why this shipped: nothing in
+     * CI built LTO=0. The `lto0` matrix leg in linux.yml exists to keep
+     * that gap closed.
+     */
+    volatile bool ok = false;
+    if (sigsetjmp(g_str_probe_jmp, 1) == 0)
+        ok = jit_str_probe_read(l, sub_short)
+             && jit_str_probe_read(l, sub_long);
+    /* else: a fault landed here - ok stays false (and now really does) */
+    sigaction(SIGSEGV, &old_segv, nullptr);
+    sigaction(SIGBUS, &old_bus, nullptr);
+    if (!ok)
+        fprintf(stderr,
+                "mylang: WARNING: the SharedStr character-data layout "
+                "probe FAILED (obj@%d, data@%d).\n"
+                "  The inline ord(s[i]) tier is DISABLED; every string "
+                "index will call the helper.\n"
+                "  This build's std::string layout is not the one the "
+                "JIT emitter knows. Correctness\n"
+                "  is unaffected - only speed. Please report the "
+                "toolchain and standard library.\n",
+                l.str_obj_off, l.strobj_data_off);
+    return ok;
+}
+
 /* Runtime-computed via public accessors (LValue mixes access specifiers,
  * so offsetof on it is not portable): getval<T>() returns a reference to
  * the union payload; EvalValue's own offsets are class-internal facts
@@ -615,24 +741,18 @@ static const JitLayout &jit_layout()
                 static_cast<int>(static_cast<const char *>(sp.obj) - sb);
             l.strobj_data_off = static_cast<int>(sp.strobj_data);
             l.str_inline_ok = false;
-            if (l.str_obj_off == 0 && l.strobj_data_off >= 0) {
-                auto probe_ok = [&](const char *text) {
-                    SharedStr t{ std::string(text) };
-                    LValue lv(EvalValue(std::move(t)), false);
-                    const SharedStr &r = lv.get().get_ref<SharedStr>();
-                    const char *base = reinterpret_cast<const char *>(&r);
-                    const void *sobj =
-                        *reinterpret_cast<void *const *>(base + l.str_obj_off);
-                    const char *got = *reinterpret_cast<const char *const *>(
-                        static_cast<const char *>(sobj) + l.strobj_data_off);
-                    return got == r.get_view().data();
-                };
-                /* SHORT (SSO-eligible) and LONG (certainly heap) */
-                l.str_inline_ok =
-                    probe_ok("abc")
-                    && probe_ok("0123456789012345678901234567890123456789"
-                                "0123456789012345678901234567890123456789");
-            }
+            /*
+             * ⛔ A BOUND FIRST, BECAUSE THE PROBE MUST NOT BECOME THE
+             * WILD READ IT EXISTS TO PREVENT. The offset is derived from
+             * a real object today, so it is in-bounds - but that is
+             * exactly the assumption being verified, and a future
+             * StrObj layout or a mis-derivation must not be dereferenced
+             * on faith. `sizeof(StrObj)` is the honest ceiling.
+             */
+            if (l.str_obj_off == 0 && l.strobj_data_off >= 0
+                    && static_cast<size_t>(l.strobj_data_off)
+                       + sizeof(void *) <= sp.strobj_size)
+                l.str_inline_ok = jit_verify_str_probe(l);
 #ifdef TESTS
             /* observability only; the TIER's gate is the layout
              * field itself, which is unconditional. */
