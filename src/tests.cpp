@@ -1215,14 +1215,24 @@ static const std::vector<test> tests =
             "var ff = mkf();",
             "var s = 0;",
             "var t = 0.0;",
+            /* EXACT: the argument already holds the declared type */
             "for (var i = 0; i < 50; i++) { s = s + fi(i); t = t + ff(1.5); }",
             "assert(s == 6225);",
             "assert(t == 100.0);",
-            "assert(fi(runtime(true)) == 101);",     /* bool widens */
-            "assert(ff(runtime(2)) == 2.5);",        /* int widens */
+            /* WIDENING, in a loop so it reaches the emitted push: an int
+             * into a float param, and a bool into an int one. */
+            "var w = 0.0;",
+            "for (var i = 0; i < 50; i++) w = w + ff(i);",
+            "assert(w == 1250.0);",
+            "var bs = 0;",
+            "for (var i = 0; i < 50; i++) bs = bs + fi(i % 2 == 0);",
+            "assert(bs == 5025);",
+            /* the NARROWING is the one shape that must still decline: it
+             * raises, and raising cannot happen once the frame exists */
             "var caught = 0;",
             "try { fi(runtime(2.5)); } catch (TypeErrorEx) { caught = 1; }",
-            "assert(caught == 1);",                  /* float never narrows */
+            "assert(caught == 1);",
+            "assert(ff(runtime(2)) == 2.5);",
         },
     },
 
@@ -16663,6 +16673,82 @@ static bool jit_callee_cache_hit()
 #endif
 }
 
+/*
+ * G1 the WIDENING bind. `g_jit_bind_widen` is bumped ONLY by the two
+ * conversion arms the emitted push contains (bool -> int is a retag, since a
+ * bool's payload is already the int 0/1; int/bool -> float is a cvtsi2sd),
+ * so it separates "a widening ran inline" from "the coercing push ran" -
+ * which `g_jit_bind_coerce` alone cannot, and which matters because a guard
+ * that quietly stopped widening would still be CORRECT (it would decline to
+ * the C++ tier) and still be counted.
+ *
+ * This has to be an extra_check rather than a `tests` entry: the counter
+ * coverage assertion runs during the TREE-WALKER pass, before the
+ * differential modes have executed any native code, so a source-table test
+ * cannot feed it.
+ *
+ * The values discriminate the conversions: 0.5*50 + sum(0..49) as floats,
+ * and 100*50 + 25 trues as ints.
+ */
+static bool jit_bind_widen_inline()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long b0 = g_jit_bind_widen;
+    if (!run({
+            "func mkf() { var b = 0.5;",
+            "  return func[b](float x) { return b + x; }; }",
+            "func mki() { var b = 100;",
+            "  return func[b](int k) { return b + k; }; }",
+            "func drive(int n) {",
+            "  var ff = mkf();",
+            "  var fi = mki();",
+            "  var w = 0.0;",
+            "  var bs = 0;",
+            "  for (var i = 0; i < n; i++) w = w + ff(i);",
+            "  for (var i = 0; i < n; i++) bs = bs + fi(i % 2 == 0);",
+            "  assert(w == 1250.0);",       /* int -> float, 50 times */
+            "  assert(bs == 5025);",        /* bool -> int, 50 times */
+            "  return 1;",
+            "}",
+            "assert(drive(runtime(50)) == 1);" }))
+        return false;
+    if (g_jit_bind_widen <= b0 + 50) {
+        fprintf(stderr, "jit_bind_widen: the inline widening DID NOT RUN"
+                " (%lu)\n", g_jit_bind_widen - b0);
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 /* Per-pc entry points, increment 1 (post-call resume): g_jit_entry_resume
  * is bumped by the ENTRY STUB itself, so a bump proves an interpreted
  * return actually re-entered native code mid-run. Recursion PAST the sync
@@ -23466,6 +23552,7 @@ static bool jit_counter_coverage()
         { "callee_cache",     &g_jit_callee_cache,     nullptr },
         { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
         { "bind_coerce",      &g_jit_bind_coerce,      nullptr },
+        { "bind_widen",       &g_jit_bind_widen,       nullptr },
         { "entry_resume",     &g_jit_entry_resume,     nullptr },
         { "ret_inline",       &g_jit_ret_inline,       nullptr },
         { "member_fast",      &g_jit_member_fast,      nullptr },
@@ -26089,6 +26176,8 @@ static const std::vector<extra_check> extra_checks =
       jit_sync_inline_call },
     { "jit: the monomorphic callee cache hits (and a polymorphic site is "
       "still correct)", jit_callee_cache_hit },
+    { "jit: an int/float param's WIDENING argument binds inline (G1)",
+      jit_bind_widen_inline },
     { "jit: post-call entry stub re-enters native on interpreted return",
       jit_post_call_entry },
     { "jit: deep recursion runs native on the dedicated stack (M5a)",

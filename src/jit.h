@@ -836,6 +836,9 @@ extern "C" unsigned long g_jit_callee_cache2;
 /* G1: inline pushes made to a callee with an int/float-declared param - the
  * shape that used to decline to the C++ tier outright. */
 extern "C" unsigned long g_jit_bind_coerce;
+/* G1: arguments actually WIDENED by the emitted push (bool -> int,
+ * int/bool -> float) rather than found already exact. */
+extern "C" unsigned long g_jit_bind_widen;
 extern "C" unsigned long g_jit_sync_inline;
 extern "C" unsigned long g_jit_entry_resume;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
