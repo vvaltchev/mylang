@@ -204,7 +204,15 @@ struct StructTypeDef {
         if (fields.empty())
             return;
 
-        int sz, al;
+        /* Initialized because the SECOND loop ignores the return value:
+         * the first loop already proved every field POD-inline-able, so
+         * the call cannot fail there - but that is a cross-loop fact no
+         * compiler can see, and GCC reports `sz`/`al` "may be used
+         * uninitialized" on the strength of the false path it cannot
+         * rule out. The values are dead (every use is preceded by a
+         * successful call); they exist so the claim is written down
+         * rather than assumed. Only a non-LTO build diagnoses this. */
+        int sz = 0, al = 1;
         for (const auto &f : fields)
             if (!pod_field_metrics(f, sz, al))
                 return;                       /* not all POD-inline-able */
