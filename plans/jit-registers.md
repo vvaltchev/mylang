@@ -1247,6 +1247,75 @@ registers. A real allocator only becomes necessary for RAX/RCX, whose
 kind-(c) counts (254/135) are large enough that per-op masks would
 block nearly every run.
 
-**NEXT ACTION:** classify RDX/RSI/r8's unbracketed sites the same way
-(the census prints them) to confirm the (a)/(b)/(c) split holds, then
-build the clobber mask for the four RDI ops and add RDI to the pool.
+**NEXT ACTION (SUPERSEDED - read the section below first).**
+
+---
+
+## 2026-08-17: the census was WRONG and r9 was a shipping bug
+
+The (a)/(b)/(c) taxonomy above is CONFIRMED - it was re-derived against
+a corrected census and holds for every register examined. Two things
+around it were wrong.
+
+**1. THE SITE COUNTS WERE LOW BY UP TO 6x.** `regcensus.py` could not
+see an accessor whose NAME encodes the register (`lea_rdi`,
+`slots_to_arg0`, `store_elem_byte_dil`, `movabs_r9`, `cmp_r9_rdx`) -
+CLAUDE.md's sixth audit-table shape, hit by the tool written to avoid
+it. It now derives the accessor set from the source. Corrected
+unbracketed counts: **RAX 392, RCX 193, RDX 142, R9 87, R8 45, RDI 33,
+RSI 23** (was 254/135/76/14/42/14/23).
+
+**2. r9 WAS NEVER SAFE, AND SHIPPED A WRONG ANSWER FOR A DAY.** It is
+raw scratch in the capture ops and every element tier. Removed from
+`XCACHE_ORDER`; full record in docs/jit-optimizations.md
+("#96 - r9 was NEVER safe as a pin"). Three nets came out of it:
+`MYLANG_JIT_XROT=N` (rotate the pool so its TAIL gets first-choice
+traffic), `Emitter::scratch(reg)` (declare raw-scratch use at the site;
+ML_CHECK that no pin lives there), and a REPAIRED `vdjcmp.sh` (it had
+been reporting 0-identical for every comparison since #96 step 3, and
+77/31 against itself).
+
+### The RDI increment, re-derived and still valid
+
+RDI's 33 unbracketed sites split exactly as the taxonomy predicts:
+ - **(a)/(b)** 12 sites - `emit_sync_push_native` (3),
+   `emit_sync_call_inline` (3), the `CallV` case (1), all blocked
+   because the run contains a call; `emit_ret_native` (5), whose first
+   act is `flush_cache()`;
+ - **(c)** 21 sites in just TWO emitters - `emit_store_elem_inline`
+   (13) and `emit_store_elem2_inline` (8) - reached by exactly THREE
+   opcodes: `StoreElemInt`, `StoreElemFloat`, `StoreElem2V`.
+
+So the clobber mask for RDI is three opcodes, and both emitters already
+declare `e.scratch2(9, RDI)`, so a mistake aborts by name.
+
+### ⛔ BUT: DO NOT DO IT NEXT. The measurement says it will not pay.
+
+The r8 entry in docs/jit-optimizations.md already measured this arc's
+central result - **MORE REGISTERS DO NOT PAY HERE** - and RDI would be
+the pool's 4th caller-saved member, available only in a run with no
+call, no C1 hoist region AND no element store. That is a narrow set,
+and it buys at most one more pinned local in it.
+
+Adding it would be another opportunistic pool widening justified by
+"the site count is small", which is the exact reasoning that produced
+the r9 bug. The site count is a COST estimate; it was never evidence of
+a BENEFIT.
+
+**THE HONEST NEXT STEP IS THE SCRATCH ALLOCATOR ITSELF**, because that
+is what the maintainer actually asked for ("all the sites need to use
+the allocator instead of hard-coding the registers") and it is the only
+route to RAX/RCX/RDX - 727 of the 915 unbracketed sites, and the only
+registers numerous enough for the outcome to matter. Suggested shape,
+smallest-first:
+
+ 1. `Emitter::alloc_scratch(n)` / `free_scratch()` - hand out registers
+    that hold no pin and no live emitter state, ML_CHECKing exhaustion.
+    `scratch(reg)` (already landed) is the read-only half of this
+    contract and its call sites become the first conversions.
+ 2. Convert ONE emitter family end-to-end (`emit_store_elem_inline` +
+    `emit_store_elem2_inline` - 21 RDI sites and 20 r9 sites, and they
+    already declare their scratch). Oracle: `vdjcmp.sh` must stay
+    108/108 identical when the allocator happens to choose the same
+    registers, and `-rt` + `--xrot` must be green when it does not.
+ 3. Only then reconsider the pool, WITH a measurement.
