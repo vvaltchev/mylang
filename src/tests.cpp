@@ -16927,6 +16927,100 @@ static bool deep_nesting_refused()
  * later. Watched: with the else-arm polarity deliberately broken, the
  * `tests`-entry version of these stayed green.
  */
+/*
+ * STEP 7 tier 3 - THE WARNING. Where the prover found the same situation but
+ * could not PROVE the failure, the compile says so rather than staying
+ * silent. Checked by reading `g_warnings` directly, since the point is
+ * whether a diagnostic was PRODUCED - a program that merely runs proves
+ * nothing either way.
+ */
+static bool unbound_call_warnings()
+{
+    struct Case { const char *what; std::vector<const char *> lines; int n; };
+
+    const Case cases[] = {
+        { "a CONDITIONAL call to a function reading a later global",
+          { "func fetch() { return g; }",
+            "if (runtime(0) > 1) { var dyn t = fetch(); }",
+            "var g = 5;" }, 1 },
+        { "a call whose callee reads the global CONDITIONALLY",
+          { "func fetch() { if (runtime(0) > 1) { return g; } return 1; }",
+            "var t = fetch();",
+            "var g = 5;" }, 1 },
+        { "a call inside a LOOP body (conditional, so not provable)",
+          { "func fetch() { return g; }",
+            "for (var i = 0; i < runtime(0); i++) { var dyn t = fetch(); }",
+            "var g = 5;" }, 1 },
+        {
+          /*
+           * THE TRANSITIVITY GAP, pinned rather than left to be discovered:
+           * `outer` does not read `g` itself, it CALLS something that does,
+           * and neither tier follows that edge - so this is silent today. If
+           * transitivity is added, this expectation becomes 1 and the change
+           * has a test that notices.
+           */
+          "a global read one hop away is reported by NEITHER tier",
+          { "func fetch() { return g; }",
+            "func outer() { var r = fetch(); return r; }",
+            "if (runtime(0) > 1) { var dyn t = outer(); }",
+            "var g = 5;" }, 0 },
+        /* ... and the cases that must stay QUIET */
+        { "the global is declared FIRST",
+          { "func fetch() { return g; }",
+            "var g = 5;",
+            "var t = fetch();" }, 0 },
+        { "no global is read at all",
+          { "func f(a) { return a + 1; }",
+            "var t = f(2);",
+            "var g = 5;" }, 0 },
+        { "one warning per CALL SITE, not per read",
+          { "func fetch() { var a = g; var b = g; return a + b; }",
+            "if (runtime(0) > 1) { var dyn t = fetch(); }",
+            "var g = 5;" }, 1 },
+    };
+
+    bool ok = true;
+
+    for (const Case &c : cases) {
+        std::string src;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i) src += '\n';
+            src += c.lines[i];
+        }
+        g_warnings.clear();
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get());
+            resolve_names(root.get());
+        } catch (const Exception &e) {
+            fprintf(stderr, "warn: '%s' threw %s\n", c.what, e.name);
+            ok = false;
+            g_warnings.clear();
+            continue;
+        }
+        const int got = static_cast<int>(g_warnings.size());
+        if (got != c.n) {
+            fprintf(stderr, "warn: '%s': %d warnings, expected %d\n",
+                    c.what, got, c.n);
+            ok = false;
+        }
+        /* a warning with no location is barely a warning */
+        for (const CompileWarning &w : g_warnings)
+            if (!w.start || !w.msg) {
+                fprintf(stderr, "warn: '%s': a warning with no loc/msg\n",
+                        c.what);
+                ok = false;
+            }
+        g_warnings.clear();
+    }
+
+    return ok;
+}
+
 static bool defined_guard_polarity()
 {
     struct Case { const char *what; const char *src; bool refused; };
@@ -27409,6 +27503,8 @@ static const std::vector<extra_check> extra_checks =
     { "parser: deep nesting is REFUSED, never a crash (#137)",
       deep_nesting_refused },
     { "opt: defined()-guard polarity (#135)", defined_guard_polarity },
+    { "opt: unprovable unbound calls WARN (step 7 tier 3)",
+      unbound_call_warnings },
     { "builtins: dev-only show() reserved in a script",
       dev_builtin_reserved_in_script },
     { "builtins: lazy-arg builtins are not values in a script (F1)",

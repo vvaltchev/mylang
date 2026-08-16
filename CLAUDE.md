@@ -3627,6 +3627,22 @@ and two macros:
   from "failed later", and a polarity case written there passes either way
   (watched: with the else-arm polarity broken, that version stayed green).
   The polarity cases run parse+infer+resolve only.
+- **COMPILE WARNINGS — the THIRD tier (step 7, 2026-08-09).** The rule is
+  PROVE -> fail, SUSPECT -> warn, `--strict` -> enforce. `prove_unbound_calls`
+  refuses what it can prove; `warn_unbound_calls` reports the residue it
+  DECLINED — a conditional call, a conditional read, a call in a loop body —
+  in GCC's spirit ("this variable might be uninitialized"). The two cannot
+  double-report **by construction**: the prover THROWS on everything it
+  proves, so anything reaching the warning pass is exactly what it could not.
+  Warnings are **COLLECTED** into `g_warnings` (inferencer.h), not printed at
+  the raise site: the compiler has no diagnostic stream, and a pass writing to
+  stderr directly would be untestable and would interleave with the script's
+  own output. The driver drains the list and renders each with the same caret
+  machinery an error uses; `-rt` reads the vector instead. **A warning that
+  cannot be located is barely a warning** — the test asserts every one carries
+  a loc and a message. NOT transitive: a global read one hop away (the callee
+  calls something that reads it) is reported by neither tier — pinned by a
+  test that expects ZERO, so adding transitivity has something that notices.
 - **⛔ NO INPUT MAY CRASH THE INTERPRETER (#137, 2026-08-09).** Every `.my`
   file ends in a DEFINED outcome — a compile refusal, a thrown exception, or a
   clean run. Two real crashes were found by simply trying degenerate inputs:

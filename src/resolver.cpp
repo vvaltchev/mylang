@@ -1344,6 +1344,7 @@ public:
                 if (g_strict_mode)      /* --strict: FIX-2's original shape */
                     strict_forward_globals(rb);
                 prove_unbound_calls(rb);
+                warn_unbound_calls(rb);   /* tier 3: the residue it declined */
             }
 
         /* Promote write-once scalar vars to constants and fold (uses the write
@@ -1618,6 +1619,134 @@ private:
                     && global_decl_stmt.count(id->uid))
                 out.push_back(id);
         });
+    }
+
+    /*
+     * STEP 7 tier 3 - THE WARNING. Where the prover above found the same
+     * situation but could NOT prove the failure, say so instead of staying
+     * silent. GCC's spirit ("this variable might be uninitialized"): the
+     * program is not refused, but the reader is told.
+     *
+     *     func fetch() { return g; }
+     *     if (ready()) { var dyn t = fetch(); }   <- warned: may not be bound
+     *     var g = 5;
+     *
+     * The complement of the error tier by construction: prove_unbound_calls
+     * THROWS on everything it can prove, so anything reaching here is exactly
+     * the residue - a conditional call, a conditional read, or a call site
+     * below the top level. That is why this walks EVERYTHING (plain
+     * for_each_child plus the containers it skips) while the prover walks
+     * only unconditional code, and why the two cannot double-report.
+     *
+     * Still NOT transitive: a global read by a function the callee calls is
+     * reported by neither tier. That gap is silent, not wrong.
+     */
+    template <typename F>
+    static void walk_every(Construct *c, const F &f)
+    {
+        if (!c)
+            return;
+        f(c);
+        if (auto *bl = dynamic_cast<Block *>(c)) {
+            for (auto &e : bl->elems)
+                walk_every(e.get(), f);
+            return;
+        }
+        if (auto *ex = dynamic_cast<Expr14 *>(c)) {
+            walk_every(ex->lvalue.get(), f);
+            walk_every(ex->rvalue.get(), f);
+            return;
+        }
+        if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+            walk_every(tc->tryBody.get(), f);
+            for (auto &p : tc->catchStmts)
+                walk_every(p.second.get(), f);
+            walk_every(tc->finallyBody.get(), f);
+            return;
+        }
+        if (auto *fo = dynamic_cast<ForStmt *>(c)) {
+            walk_every(fo->init.get(), f);
+            walk_every(fo->cond.get(), f);
+            walk_every(fo->inc.get(), f);
+            walk_every(fo->body.get(), f);
+            return;
+        }
+        if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+            walk_every(fe->container.get(), f);
+            walk_every(fe->body.get(), f);
+            return;
+        }
+        for_each_child(c, [&](Construct *ch) { walk_every(ch, f); });
+    }
+
+    void warn_unbound_calls(Block *rb)
+    {
+        std::unordered_map<const UniqueId *, size_t> global_decl_stmt;
+        std::unordered_map<const UniqueId *, FuncDeclStmt *> top_funcs;
+
+        for (size_t i = 0; i < rb->elems.size(); i++) {
+            Construct *e = rb->elems[i].get();
+            if (auto *fd = dynamic_cast<FuncDeclStmt *>(e)) {
+                if (fd->id)
+                    top_funcs[fd->id->uid] = fd;
+                continue;
+            }
+            auto *ex = dynamic_cast<Expr14 *>(e);
+            if (!ex || !(ex->fl & pFlags::pInDecl))
+                continue;
+            auto *lv = dynamic_cast<Identifier *>(ex->lvalue.get());
+            if (lv && lv->sym.kind == SymKind::global)
+                global_decl_stmt.emplace(lv->uid, i);
+        }
+
+        if (global_decl_stmt.empty() || top_funcs.empty())
+            return;
+
+        /* every global a callee may read, on ANY path - the conditional read
+         * is half of what this tier exists to catch */
+        std::unordered_map<FuncDeclStmt *, std::vector<Identifier *>> reads;
+
+        for (size_t i = 0; i < rb->elems.size(); i++) {
+
+            if (dynamic_cast<FuncDeclStmt *>(rb->elems[i].get()))
+                continue;
+
+            walk_every(rb->elems[i].get(), [&](Construct *n) {
+                auto *call = dynamic_cast<CallExpr *>(n);
+                if (!call)
+                    return;
+                auto *cid = dynamic_cast<Identifier *>(call->what.get());
+                if (!cid)
+                    return;
+                auto ft = top_funcs.find(cid->uid);
+                if (ft == top_funcs.end())
+                    return;
+
+                auto rit = reads.find(ft->second);
+                if (rit == reads.end()) {
+                    std::vector<Identifier *> v;
+                    walk_every(ft->second->body.get(), [&](Construct *m) {
+                        auto *id = dynamic_cast<Identifier *>(m);
+                        if (id && id->sym.kind == SymKind::global
+                                && global_decl_stmt.count(id->uid))
+                            v.push_back(id);
+                    });
+                    rit = reads.emplace(ft->second, std::move(v)).first;
+                }
+
+                for (Identifier *g : rit->second) {
+                    auto dit = global_decl_stmt.find(g->uid);
+                    if (dit != global_decl_stmt.end() && dit->second > i) {
+                        compile_warn(
+                            intern_msg("this call may fail: "
+                                       + std::string(g->get_str())
+                                       + " is not bound until later"),
+                            call->start, call->end);
+                        return;     /* one per call site, not per read */
+                    }
+                }
+            });
+        }
     }
 
     void prove_unbound_calls(Block *rb)

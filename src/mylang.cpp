@@ -767,6 +767,29 @@ int main(int argc, char **argv)
             run_optimizers(root.get(), !opt_no_inline, opt_inline_threshold,
                            !opt_no_type_infer);
 
+            /*
+             * Step 7 tier 3: render whatever the compile SUSPECTED but could
+             * not prove. To stderr, so a script's own stdout is untouched,
+             * and with the same caret machinery an error uses - a warning the
+             * reader cannot locate is barely a warning.
+             */
+            for (const CompileWarning &w : g_warnings) {
+                cerr << "warning: " << w.msg;
+                if (w.start)
+                    cerr << " at line " << w.start.line
+                         << ", col " << w.start.col;
+                cerr << endl;
+                if (w.start && w.start.line >= 1
+                        && w.start.line <= static_cast<int>(lines.size())) {
+                    cerr << endl;
+                    dump_line_with_caret(
+                        cerr, lines[static_cast<size_t>(w.start.line - 1)],
+                        w.start.col,
+                        w.end.line == w.start.line ? w.end.col - 1 : 0);
+                    cerr << endl;
+                }
+            }
+
             /* -s also dumps the tree AFTER the optimizer (inlining, unroll,
              * specialization) so the actual optimized AST is inspectable. */
             if (opt_show_syntax_tree) {
