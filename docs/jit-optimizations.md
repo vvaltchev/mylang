@@ -4574,3 +4574,67 @@ itself is still paid - the bit test and the slice test would move into
 emitted code, jumping to the raw-copy path already there); the builtin
 CALLBACK bind paths (`argv[i]` - sort's comparator, map/filter/
 make_dict); and the tree-walker's `do_func_bind_params`.
+
+### Step 3 - THE EMITTED INLINE BORROW ARM: -3.3% Ir, ZERO wall clock
+
+The helper call removed. When the two runtime questions answer yes the
+emitted push takes the scalar copy directly and calls nothing:
+
+    mov  r11, [rsp]                  ; the desc spill (nothing pushed yet)
+    mov  r11, [r11 + noescape_params]
+    shr  r11, i                      ; omitted for argument 0
+    test r11b, 1
+    je   -> the helper               ; not claimed
+    movabs r10, <t_arr>
+    cmp  rax, r10
+    jne  -> borrow                   ; a non-array reference cannot be a slice
+    cmp  byte [rbx + s + slice_off], 0
+    jne  -> the helper               ; a slice
+  borrow:
+    <the scalar arm's 32-byte copy>  ; plus `mov byte [dst+borrowed], 1`
+
+Both declines fall through to the helper, which re-asks both questions -
+it is the C++ bind path's own tier and it keeps the decline counters, so
+the bit is loaded again there rather than handed over.
+
+EXECUTION PROVEN: `g_jit_arg_borrow` (JITSTATS `arg_borrow_nat`) is
+bumped by GENERATED CODE ONLY, and bench 76 reports **999,999 of its
+1,000,000 calls** served by it, with the helper at zero. A separate
+counter from `g_arg_borrow` for exactly this reason - both tiers produce
+the same answer, so only the counter distinguishes them.
+
+**MEASURED, AND IT IS THE GUARD-ELISION SIGNATURE AGAIN.**
+76_funcval_dispatch **-3.27% instructions** (518.2M -> 501.2M, -17 Ir per
+call) and **1.00x WALL CLOCK**. Suite geomean 1.003x. Meanwhile two
+benches that NEVER BORROW pay for the emitted bytes:
+**10_recursion_deep +1.44% Ir / 1.05x** and 63_closures +0.48% / 1.07x -
+the arm is emitted at every reference-argument slot whether or not the
+runtime value ever takes it. (26_dict_iterate's 1.14x is noise: +0.01%
+on callgrind.)
+
+So the removed call was a perfectly-predicted jump to an I-cache-resident
+helper, which retires nearly free beside the real work - exactly what
+this file's guard-elision entry says, and the reason that entry warns
+against pushing the line on Ir evidence alone. The mechanism is correct
+and proven; **its cost in emitted bytes is larger than its benefit in
+time, and the recommendation is to revert it and keep the helper tier**
+(steps 1-2, which measured -13.5% Ir AND 0.88x). Kept for now because
+reverting a working, maintainer-requested change on a neutral measurement
+is the maintainer's call, not this file's.
+
+Three sabotages, watched failing: the noescape bit test (forced set ->
+`borrow_from`'s ML_CHECK), the slice test (forced "not a slice" -> the
+#94 test on a value), and the `borrowed` byte store (dropped -> ASan
+use-after-free).
+
+⛔ TWO EMITTER TRAPS THIS COST TIME ON, both silent:
+- **`Emitter::j32` takes the SHORT opcode** and adds 0x10 for the near
+  form, so `j32(0x74)` is `je`. Passing the near second byte (0x84)
+  assembles `0F 94` - SETE with a bogus modrm. It now segfaults nothing
+  because nothing passes it, but read the helper before using it.
+- **`Emitter::movabs` is LOW-EIGHT-REGISTERS ONLY.** Its REX is a bare
+  0x48 with no REX.B, so `movabs(R10, x)` emits 0xC2 - `ret imm16` - and
+  the fragment returns into nothing. The dedicated `movabs_r8` /
+  `movabs_r10` helpers exist for this; `movabs` now ML_CHECKs `reg < 8`
+  so the next caller finds out from an assert rather than a SEGV in
+  generated code.
