@@ -2591,30 +2591,53 @@ sanitizers never reproduced it.)
   nested* functions doesn't resolve (each function's body resolves in its own
   scope stack, which doesn't see the enclosing scope's scoped globals) — it was
   already broken (a runtime `UndefinedVariableEx`), and stays so.
-  **FIXED CRASH (2026-07-14, `pWrapDeclBody` in parser.cpp):** a func (or
-  struct) decl as a **BRACE-LESS** `if`/loop body — `if (c) func g() => 1;`,
-  `while (i < 1) func g() => 1;` — ABORTED the tree-walker:
-  `hoist_scoped_decls` only pre-scans **Block** statement lists, so a
-  bare-statement body's decl was never hoisted to a scoped global; it fell to
-  `declare_masking` (a local map entry) and `FuncDeclStmt::do_eval`'s
-  `ctx->emplace` tripped the asserted-EMPTY script map
-  (`in_const_eval() || repl_mode`). The fix is a **TARGETED parser
-  normalization**: `pWrapDeclBody` wraps a brace-less body in a synthetic
-  single-statement `Block` **only when it is a func/struct decl** (the
-  crashing shapes, which nothing could have depended on). It is deliberately
-  NOT the blanket wrap first proposed, because a brace-less body **decl LEAKS
-  into the enclosing scope by long-standing behavior** — `if (c) var x = 5;
-  print(x)` prints 5, `if (c) const K = 7;` keeps `K` visible, a `while`-body
-  `var` too (all verified + pinned by tests) — and a blanket wrap would have
-  silently broken that. Two more preserved subtleties: the `if` applies the
-  wrap only to the RUNTIME statement, so a const-folded
-  `if (true) func g() => 1;` still folds to the bare decl (the feature-flag
-  pattern keeps `g` in the enclosing scope); and a PURE expr-bodied `g` is
-  const-folded/inlined at its call sites regardless of scope (a pre-existing
-  fold-vs-scope quirk, identical in both engines — the block-scoping tests
-  must use an IMPURE func). With the masked route gone, a SCRIPT's named
-  func/struct decl ALWAYS has a global slot — the VM codegen's `gen_stmt`
-  now `ML_CHECK`s that invariant instead of falling back.
+  **⛔ A BRACE-LESS BODY IS ITS OWN SCOPE — and getting there took three
+  fixes to the same two functions (`pStmtDeclaresName` / `pWrapDeclBody` /
+  `pBraceLessBody`, parser.cpp).** A declaration written as a brace-less
+  `if`/`else`/loop body used to land in the ENCLOSING scope, unlike its
+  braced form. The three ways that was wrong, in the order they were found:
+  - **(2026-07-14, a CRASH)** a func/struct decl there — `if (c) func g() =>
+    1;` — ABORTED the tree-walker: `hoist_scoped_decls` only pre-scans
+    **Block** statement lists, so a bare-statement body's decl was never
+    hoisted to a scoped global; it fell to `declare_masking` (a local map
+    entry) and `FuncDeclStmt::do_eval`'s `ctx->emplace` tripped the
+    asserted-EMPTY script map (`in_const_eval() || repl_mode`).
+  - **(2026-08-08, a SILENT WRONG ANSWER)** a `var`/`const` decl there stayed
+    visible after the statement even when the branch NEVER RAN, so its slot
+    held `none` while inference still proved the declared type — and the
+    engines then disagreed about a typed read of it:
+    `if (runtime(false)) var x = 5; return x + 1;` **printed 1 under the
+    JIT** (reading `none` as int 0), aborted `ML_VM_CHECK` under `-nj`, and
+    threw `TypeErrorEx` in the tree-walker. The JIT is NOT at fault — it
+    elides the tag check BECAUSE inference proved the type (see *static types
+    imply runtime guards*), and that proof is sound only once a declaration
+    cannot be skipped. **This is the general principle: a scoping hole is a
+    TYPE-SOUNDNESS hole here, because every unboxed tier is built on the
+    inferencer's proof.**
+  - **(2026-08-08, an OPTIMIZATION CHANGING SEMANTICS)** the const-folded
+    taken branch was hoisted UNWRAPPED, so const-eval changed scoping:
+    `if (1) func g() {...} g();` worked by default and threw
+    "Undefined variable 'g'" under `-nc`.
+
+  The fix: `pBraceLessBody` parses a brace-less body inside its own const +
+  CSE scope (pushed AROUND the parse — a `const` registers its VALUE as it is
+  parsed, so wrapping the finished statement is too late for
+  `if (c) const K = 7;`) and then `pWrapDeclBody` wraps it in a synthetic
+  single-statement `Block` **iff it DECLARES** (`pStmtDeclaresName`: a
+  `FuncDeclStmt`, a `StructDeclStmt`, or an `Expr14` carrying `pInDecl`).
+  A non-declaring body is left ALONE on purpose — a blanket wrap would put an
+  extra `Block` around `for (...) sum += a[i];` and perturb the shapes
+  for-range and LICM match on, for no scoping benefit. **ADD TO
+  `pStmtDeclaresName` if a new declaring statement form appears**; a missing
+  kind silently restores the leak. Both halves have watched-failing coverage
+  (`brace-less * is block-scoped` in tests.cpp: removing the `Expr14` case
+  fails 5, removing the const-scope push fails the const one).
+  Two subtleties that survive: a PURE expr-bodied `g` is const-folded/inlined
+  at its call sites regardless of scope (a fold-vs-scope quirk, identical in
+  both engines — the block-scoping tests must use an IMPURE func); and with
+  the masked route gone, a SCRIPT's named func/struct decl ALWAYS has a
+  global slot — the VM codegen's `gen_stmt` `ML_CHECK`s that invariant
+  instead of falling back.
   **Scope, still map-bound:** lambdas (anonymous — no name binding; their
   params/locals ARE slotted) and, in the **REPL** (top-level names stay
   redefinable), all top-level names; template-instance clones, inserted before

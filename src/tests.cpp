@@ -4294,21 +4294,59 @@ static const std::vector<test> tests =
       { "var dyn c = runtime(1);",
         "if (c) func g() { print(\"side\"); }",
         "g();" }, &typeid(UndefinedVariableEx) },
-    /* ONLY func/struct decl bodies are wrapped: a brace-less VAR/CONST body
-     * keeps its historical enclosing-scope binding, and a CONST-TRUE if
-     * still folds to the bare decl (the feature-flag pattern `if (DEBUG)
-     * func g()...` keeps leaking g to the enclosing scope). */
-    { "brace-less var/const bodies keep the enclosing-scope binding",
+    /*
+     * A brace-less body is its OWN SCOPE, for every declaring statement kind
+     * and on the const-folded path too (pWrapDeclBody / pBraceLessBody). Each
+     * of these leaked into the enclosing scope until 2026-08-08.
+     *
+     * The var case is the one that mattered: the decl could be SKIPPED while
+     * the name stayed in scope, so the slot held `none` while inference still
+     * proved its declared type - and the engines then disagreed about a typed
+     * read of it (JIT printed 1, `-nj` aborted ML_VM_CHECK, the tree-walker
+     * threw TypeErrorEx). The `runtime(false)` case below is the regression
+     * test for exactly that: with the wrap removed it does NOT throw.
+     */
+    { "brace-less var body is block-scoped",
       { "var dyn c = runtime(1);",
         "if (c) var x = 5;",
-        "assert(x == 5);",
+        "print(x);" }, &typeid(UndefinedVariableEx) },
+    { "brace-less var body is block-scoped when the branch is SKIPPED",
+      { "func f() {",
+        "  if (runtime(false)) var x = 5;",
+        "  return x + 1;",
+        "}",
+        "print(f());" }, &typeid(UndefinedVariableEx) },
+    { "brace-less const body is block-scoped",
+      { "var dyn c = runtime(1);",
         "if (c) const K = 7;",
-        "assert(K == 7);",
-        "var i = 0;",
+        "print(K);" }, &typeid(UndefinedVariableEx) },
+    { "brace-less else body is block-scoped",
+      { "var dyn c = runtime(1);",
+        "if (c) var a = 1; else var b = 2;",
+        "print(b);" }, &typeid(UndefinedVariableEx) },
+    { "brace-less while body is block-scoped",
+      { "var i = 0;",
         "while (i < 1) var y = i++;",
-        "assert(y == 0);",
-        "if (1) func g() => 41;",     /* const-true: folds to the bare decl */
-        "assert(g() == 41);" } },
+        "assert(i == 1);",
+        "print(y);" }, &typeid(UndefinedVariableEx) },
+    /* The CONST-FOLDED taken branch is scoped like the runtime one - it used
+     * to be hoisted bare, so const-eval CHANGED SCOPING (`if (1) func g()
+     * {...} g();` worked by default and failed under -nc). */
+    { "const-folded if branch is scoped like the runtime one",
+      { "if (1) var x = 5;",
+        "print(x);" }, &typeid(UndefinedVariableEx) },
+    /* ...and the body still RUNS, with the declaration visible inside it. */
+    { "a scoped brace-less body still runs and sees its own decl",
+      { "var dyn c = runtime(1);",
+        "var out = 0;",
+        "if (c) out = 5;",
+        "assert(out == 5);",
+        "var i = 0;",
+        "while (i < 3) i++;",
+        "assert(i == 3);",
+        "var s = 0; var arr = [1, 2, 3];",
+        "for (var k = 0; k < 3; k++) s += arr[k];",
+        "assert(s == 6);" } },
 
     /* Devirtualized direct calls (DirectCallExpr): a global-slot callee is
      * called straight from the slot. Exercises the FuncObject fast path (global

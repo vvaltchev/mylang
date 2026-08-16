@@ -2162,32 +2162,93 @@ pAcceptBracedBlock(ParseContext &c,
 }
 
 /*
- * A func/struct decl as a BRACE-LESS `if`/loop body must behave exactly like
- * its braced form (block-scoped, hoisted by the resolver's Block pre-scan):
- * without a Block wrapper the decl bypasses `hoist_scoped_decls` (which only
- * scans Block statement lists), falls to `declare_masking`, and the decl's
- * do_eval map-emplace ABORTS a script (the asserted-empty runtime map) -
- * `if (c) func g() => 1;` crashed. Wrap it in a synthetic single-statement
- * Block. ONLY these two decl kinds are wrapped: a brace-less VAR/CONST body
- * (`if (c) var x = 5;`) deliberately keeps its historical enclosing-scope
- * binding (`x` stays visible after the `if` - verified, pre-existing), and
- * every other statement is scope-neutral anyway. The `if` applies this only
- * to the RUNTIME statement (after const-folding): a const-true
- * `if (true) func g() => 1;` keeps folding to the bare decl in the enclosing
- * scope, preserving the working feature-flag pattern.
+ * Does this single statement introduce a NAME into the scope that contains it?
+ *
+ * A brace-less body is exactly one statement, and only three statement kinds
+ * can declare into the enclosing scope: a func decl, a struct decl, and a
+ * var/const decl (an `Expr14` carrying pInDecl - `pInConstDecl` implies it).
+ * Every other statement is scope-neutral: a nested `if`/loop/`try` declares
+ * only inside its OWN body, which is wrapped by its own call to
+ * pWrapDeclBody. ADD TO THIS TEST if a new declaring statement form appears -
+ * a missing kind here silently restores the leak documented below.
+ */
+static bool pStmtDeclaresName(const Construct *stmt)
+{
+    if (dynamic_cast<const FuncDeclStmt *>(stmt))
+        return true;
+
+    if (dynamic_cast<const StructDeclStmt *>(stmt))
+        return true;
+
+    if (const auto *e = dynamic_cast<const Expr14 *>(stmt))
+        return (e->fl & pFlags::pInDecl) != 0;
+
+    return false;
+}
+
+/*
+ * A DECLARATION as a BRACE-LESS `if`/`else`/loop body must behave exactly like
+ * its braced form - block-scoped, so the name is NOT visible after the
+ * statement. Without a Block wrapper it lands in the ENCLOSING scope, which is
+ * wrong three ways (each found separately, each fixed here):
+ *
+ *  - a func/struct decl bypasses `hoist_scoped_decls` (which only scans Block
+ *    statement lists), falls to `declare_masking`, and its do_eval map-emplace
+ *    ABORTS a script (the asserted-empty runtime map): `if (c) func g() => 1;`
+ *    CRASHED (2026-07-14);
+ *  - a var/const decl stays visible after the statement even when the branch
+ *    NEVER RAN, so its slot holds `none` while inference still proves the
+ *    declared type - and the engines then disagree about a typed read of it:
+ *    `if (runtime(false)) var x = 5; return x + 1;` PRINTED 1 under the JIT
+ *    (reading `none` as int 0), aborted `ML_VM_CHECK` under `-nj`, and threw
+ *    TypeErrorEx in the tree-walker (2026-08-08). The JIT is not at fault -
+ *    it elides the tag check BECAUSE inference proved the type, and that proof
+ *    is sound only once a declaration cannot be skipped;
+ *  - the CONST-FOLDED taken branch was hoisted UNWRAPPED, so const-eval
+ *    CHANGED SCOPING: `if (1) func g() {...} g();` worked by default and threw
+ *    "Undefined variable 'g'" under `-nc`.
+ *
+ * So: wrap whenever the body DECLARES, on the const-folded path too. A
+ * non-declaring body is left ALONE rather than blanket-wrapped - an extra
+ * Block around `for (...) sum += a[i];` would perturb the shapes the for-range
+ * and LICM passes match on, for no scoping benefit.
  */
 static unique_ptr<Construct> pWrapDeclBody(unique_ptr<Construct> stmt)
 {
-    if (!stmt)
+    if (!stmt || stmt->is_block() || !pStmtDeclaresName(stmt.get()))
         return stmt;
-    if (!dynamic_cast<FuncDeclStmt *>(stmt.get())
-        && !dynamic_cast<StructDeclStmt *>(stmt.get()))
-        return stmt;
+
     auto blk = make_unique<Block>();
     blk->start = stmt->start;
     blk->end = stmt->end;
     blk->elems.push_back(std::move(stmt));
     return blk;
+}
+
+/*
+ * Parse a BRACE-LESS body and give it its own scope. The Block wrapper above
+ * is not enough on its own for `const`: a const decl registers its VALUE in
+ * the parser's const context AS IT IS PARSED, so by the time the finished
+ * statement is wrapped, `if (c) const K = 7;` has already put K where a later
+ * `print(K)` folds it. So the const + CSE scopes are pushed AROUND the parse,
+ * exactly as pBlock does for a braced body (and, like pBlock, not restored on
+ * a parse throw - that aborts the whole parse, and the REPL builds a fresh
+ * ParseContext per input).
+ */
+static unique_ptr<Construct> pBraceLessBody(ParseContext &c, unsigned fl)
+{
+    EvalContext body_const_ctx(c.const_ctx, true);
+    EvalContext *const saved = c.const_ctx;
+
+    c.const_ctx = &body_const_ctx;
+    c.cse->push();
+
+    unique_ptr<Construct> stmt = pStmt(c, fl);
+
+    c.cse->pop();
+    c.const_ctx = saved;
+
+    return pWrapDeclBody(std::move(stmt));
 }
 
 bool
@@ -2210,7 +2271,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
     if (!pAcceptBracedBlock(c, ifstmt->thenBlock, fl)) {
 
-        unique_ptr<Construct> stmt = pStmt(c, fl);
+        unique_ptr<Construct> stmt = pBraceLessBody(c, fl);
 
         if (stmt && !stmt->is_nop())
             ifstmt->thenBlock = std::move(stmt);
@@ -2220,7 +2281,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
         if (!pAcceptBracedBlock(c, ifstmt->elseBlock, fl)) {
 
-            unique_ptr<Construct> stmt = pStmt(c, fl);
+            unique_ptr<Construct> stmt = pBraceLessBody(c, fl);
 
             if (stmt && !stmt->is_nop())
                 ifstmt->elseBlock = std::move(stmt);
@@ -2243,12 +2304,10 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                 c.analysis->mark_dead(dead->start, dead->end);
         }
 
+        /* The taken branch was already scoped at parse time (see
+         * pBraceLessBody): hoisting it BARE made const-eval change scoping. */
         if (t)
-            ret = std::move(ifstmt->thenBlock);   /* NOT wrapped: keeps the
-                                              * `if (true) func g()...`
-                                              * feature-flag decl leaking to
-                                              * the enclosing scope, as it
-                                              * always did */
+            ret = std::move(ifstmt->thenBlock);
         else
             ret = std::move(ifstmt->elseBlock);
 
@@ -2261,10 +2320,6 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             ret = make_unique<NopConstruct>();
 
     } else {
-        /* A RUNTIME if: a brace-less func/struct decl branch gets its Block
-         * wrapper (the crash fix - see pWrapDeclBody). */
-        ifstmt->thenBlock = pWrapDeclBody(std::move(ifstmt->thenBlock));
-        ifstmt->elseBlock = pWrapDeclBody(std::move(ifstmt->elseBlock));
         ret = std::move(ifstmt);
     }
 
@@ -2290,7 +2345,7 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     pExpectOp(c, Op::parenR);
 
     if (!pAcceptBracedBlock(c, whileStmt->body, fl | pFlags::pInLoop))
-        whileStmt->body = pWrapDeclBody(pStmt(c, fl | pFlags::pInLoop));
+        whileStmt->body = pBraceLessBody(c, fl | pFlags::pInLoop);
 
     whileStmt->start = start;
     whileStmt->end = c.get_loc();
@@ -3100,7 +3155,7 @@ pAcceptForeachStmt(ParseContext &c,
     stmt->end = c.get_loc();
 
     if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
-        stmt->body = pWrapDeclBody(pStmt(c, fl | pFlags::pInLoop));
+        stmt->body = pBraceLessBody(c, fl | pFlags::pInLoop);
 
     if (c.const_eval && stmt->container->is_const) {
 
@@ -3158,7 +3213,7 @@ pAcceptForStmt(ParseContext &c,
     pExpectOp(c, Op::parenR);
 
     if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
-        stmt->body = pWrapDeclBody(pStmt(c, fl));
+        stmt->body = pBraceLessBody(c, fl);
 
     stmt->end = c.get_loc();
     ret = std::move(stmt);
