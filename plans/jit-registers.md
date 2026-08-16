@@ -675,8 +675,43 @@ instruction count.
 1. **Per-instruction register STATE** replacing `pick_cached_slots`'
    whole-fragment pin - this is the allocator, and everything else is
    detail.
-2. **Live ranges from `visit_use_def`** - reuse it; a second enumeration
-   would rot (the audit-table trap).
+2. **Live ranges from `visit_use_def` - DONE.** `jit_slot_liveness`
+   (codegen.h) answers the three questions an allocator asks: may a
+   register be dropped without a write-back (is the slot dead), what
+   must be written back at an exit (the live-out set), and may one
+   register serve two slots (disjoint ranges). `jit_next_use` gives the
+   spill heuristic its victim ranking - **deliberately a separate
+   function, because it is a HEURISTIC**: pc order is not execution
+   order across a back edge, and evicting the wrong register costs a
+   reload rather than an answer. Nothing that must be correct may read
+   it.
+
+   The widening reuses `jit_fwd_info`'s fixpoint rather than adding a
+   second one - both are now wrappers over `jit_liveness_core`, so
+   `visit_use_def` / `visit_pc_fields` / the handler absorption are read
+   from exactly one place. It also removes a real cliff: the old
+   one-word mask gave up at `n_temps > 64` (`return false`), which
+   silently downgraded C4a-i, C3 inc 3 and C5 to locals-only on any
+   chunk that big. Emitted code byte-identical on all 108 corpus
+   programs.
+
+   ⛔ **AND THE TEST TAUGHT SOMETHING GENERAL, watched failing.** The
+   obvious oracle - "compare the new all-slot analysis against the old
+   temps-only one" - looked independent and WAS NOT, precisely because
+   the widening made them share a core. Sabotaging the may-analysis
+   direction (an unaudited op contributing NOTHING live, which is the
+   direction whose loss is a silent miscompile) left that comparison
+   perfectly green: the bug was on both sides and cancelled. **A test
+   whose ORACLE SHARES THE IMPLEMENTATION UNDER TEST proves only that
+   the shared part is self-consistent** - the same shape as "a test
+   derived from a table can never find a hole in that table".
+
+   What catches it is a check derived from the written CONTRACT instead:
+   an op `visit_use_def` does not know must leave every covered slot
+   live-in. That needed a program containing one of the 35 unaudited
+   opcodes (an array element store - `StoreElemInt` is a barrier), and
+   the test asserts it SAW one rather than passing vacuously - which it
+   did on the first attempt, loudly.
 3. **Spill the furthest next use** on pressure; reload on demand.
 4. **Flush live registers at every exit. DONE - as a CHECKED CONTRACT,
    not an enumeration.** The note this replaces said "12 raw `u8(0xC3)`

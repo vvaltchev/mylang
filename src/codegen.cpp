@@ -8230,16 +8230,14 @@ static bool retargetable_dst(OpCode op)
  * fixpoint as the peephole's E1 block, on the same audited enumerations -
  * kept here so jit.cpp never grows a drifting copy of visit_use_def /
  * visit_pc_fields / the handler collection. */
-bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
-                  std::vector<uint64_t> &livein,
-                  std::vector<char> &is_tgt)
+/* The handler bodies + finally pcs, which the liveness ABSORBS into every
+ * op's live-out (a throw can resume there from anywhere in the region) and
+ * which are entry targets like any branch. Shared by both wrappers. */
+static void jit_live_targets(const Chunk &chunk, std::vector<int> &handler_pcs,
+                             std::vector<char> &is_tgt)
 {
     const size_t n = chunk.code.size();
-    liveout.clear();
-    livein.clear();
     is_tgt.assign(n + 1, 0);
-
-    std::vector<int> handler_pcs;
     for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
         for (const Chunk::HandlerClause &cl : hs.clauses)
             handler_pcs.push_back(cl.body_pc);
@@ -8258,66 +8256,164 @@ bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
                 is_tgt[t] = 1;
         });
     }
+}
 
-    if (chunk.n_temps <= 0 || chunk.n_temps > 64)
-        return false;                    /* reads may forward; no elision */
-
-    const int tbase = chunk.slot_count;
-    const uint64_t all = chunk.n_temps == 64
-        ? ~uint64_t(0) : ((uint64_t(1) << chunk.n_temps) - 1);
-    const auto bit = [&](int slot) -> uint64_t {
-        return (slot >= tbase && slot < tbase + chunk.n_temps)
-            ? (uint64_t(1) << (slot - tbase)) : 0;
+/*
+ * THE ONE BACKWARD LIVENESS. Both jit_fwd_info (temps, one word) and
+ * jit_slot_liveness (#96: every slot, `words` words) are wrappers over
+ * this, so the audited enumerations - visit_use_def for use/def,
+ * visit_pc_fields for the CFG edges, the handler absorption - are read
+ * from exactly one place.
+ *
+ * A MAY analysis: an op visit_use_def does not know sets every covered
+ * slot live, which over-approximates and is therefore safe in the only
+ * direction that matters.
+ */
+static void jit_liveness_core(const Chunk &chunk,
+                              const std::vector<int> &handler_pcs,
+                              int base, int count,
+                              std::vector<uint64_t> &livein,
+                              std::vector<uint64_t> &liveout,
+                              size_t words)
+{
+    const size_t n = chunk.code.size();
+    const auto set_bit = [&](std::vector<uint64_t> &m, size_t off, int slot) {
+        if (slot < base || slot >= base + count)
+            return;
+        const int b = slot - base;
+        m[off + b / 64] |= uint64_t(1) << (b % 64);
     };
+    livein.assign(n * words, 0);
 
-    std::vector<uint64_t> live_in(n, 0);
+    std::vector<uint64_t> out(words), use(words), def(words), lin(words);
     for (bool changed = true; changed; ) {
         changed = false;
-        uint64_t hlive = 0;
+        std::vector<uint64_t> hlive(words, 0);
         for (int h : handler_pcs)
             if (h >= 0 && static_cast<size_t>(h) < n)
-                hlive |= live_in[h];
+                for (size_t w = 0; w < words; w++)
+                    hlive[w] |= livein[h * words + w];
         for (size_t r = 0; r < n; r++) {
             const size_t p = n - 1 - r;
             Instr &in = const_cast<Instr &>(chunk.code[p]);
-            uint64_t out = hlive;
+            out = hlive;
             visit_pc_fields(in, [&](int &t) {
                 if (t >= 0 && static_cast<size_t>(t) < n)
-                    out |= live_in[t];
+                    for (size_t w = 0; w < words; w++)
+                        out[w] |= livein[t * words + w];
             });
             if (op_falls_through(in.op) && p + 1 < n)
-                out |= live_in[p + 1];
-            uint64_t use = 0, def = 0;
+                for (size_t w = 0; w < words; w++)
+                    out[w] |= livein[(p + 1) * words + w];
+            std::fill(use.begin(), use.end(), 0);
+            std::fill(def.begin(), def.end(), 0);
             const bool known = visit_use_def(in,
-                [&](int s) { use |= bit(s); },
-                [&](int s) { def |= bit(s); });
-            const uint64_t lin = known ? ((out & ~def) | use) : all;
-            if (lin != live_in[p]) {
-                live_in[p] = lin;
-                changed = true;
+                [&](int s) { set_bit(use, 0, s); },
+                [&](int s) { set_bit(def, 0, s); });
+            for (size_t w = 0; w < words; w++) {
+                uint64_t all = ~uint64_t(0);
+                const int hi = count - static_cast<int>(w) * 64;
+                if (hi < 64)
+                    all = hi <= 0 ? 0 : ((uint64_t(1) << hi) - 1);
+                lin[w] = known ? ((out[w] & ~def[w]) | use[w]) : all;
             }
+            for (size_t w = 0; w < words; w++)
+                if (lin[w] != livein[p * words + w]) {
+                    livein[p * words + w] = lin[w];
+                    changed = true;
+                }
         }
     }
 
     /* live-OUT per pc: successors' live-in + the handler absorption */
-    uint64_t hlive = 0;
+    std::vector<uint64_t> hlive(words, 0);
     for (int h : handler_pcs)
         if (h >= 0 && static_cast<size_t>(h) < n)
-            hlive |= live_in[h];
-    liveout.assign(n, 0);
+            for (size_t w = 0; w < words; w++)
+                hlive[w] |= livein[h * words + w];
+    liveout.assign(n * words, 0);
     for (size_t p = 0; p < n; p++) {
         Instr &in = const_cast<Instr &>(chunk.code[p]);
-        uint64_t out = hlive;
+        for (size_t w = 0; w < words; w++)
+            liveout[p * words + w] = hlive[w];
         visit_pc_fields(in, [&](int &t) {
             if (t >= 0 && static_cast<size_t>(t) < n)
-                out |= live_in[t];
+                for (size_t w = 0; w < words; w++)
+                    liveout[p * words + w] |= livein[t * words + w];
         });
         if (op_falls_through(in.op) && p + 1 < n)
-            out |= live_in[p + 1];
-        liveout[p] = out;
+            for (size_t w = 0; w < words; w++)
+                liveout[p * words + w] |= livein[(p + 1) * words + w];
     }
-    livein = live_in;                /* the fixpoint's own per-pc live-in */
+}
+
+bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
+                  std::vector<uint64_t> &livein,
+                  std::vector<char> &is_tgt)
+{
+    liveout.clear();
+    livein.clear();
+    std::vector<int> handler_pcs;
+    jit_live_targets(chunk, handler_pcs, is_tgt);
+
+    if (chunk.n_temps <= 0 || chunk.n_temps > 64)
+        return false;                    /* reads may forward; no elision */
+
+    /* one word, based at the first temp - byte-identical to the
+     * hand-rolled fixpoint this replaced (verified over the corpus) */
+    jit_liveness_core(chunk, handler_pcs, chunk.slot_count, chunk.n_temps,
+                      livein, liveout, 1);
     return true;
+}
+
+bool jit_slot_liveness(const Chunk &chunk, SlotLiveness &out)
+{
+    out = SlotLiveness();
+    const int count = chunk.slot_count + chunk.n_temps;
+    if (count <= 0 || chunk.code.empty())
+        return false;                    /* caller assumes everything live */
+    std::vector<int> handler_pcs;
+    std::vector<char> is_tgt;
+    jit_live_targets(chunk, handler_pcs, is_tgt);
+    out.base = 0;
+    out.count = count;
+    out.words = (static_cast<size_t>(count) + 63) / 64;
+    jit_liveness_core(chunk, handler_pcs, out.base, out.count,
+                      out.livein, out.liveout, out.words);
+    out.ok = true;
+    return true;
+}
+
+void jit_next_use(const Chunk &chunk, size_t begin, size_t end,
+                  int base, int count, std::vector<int> &dist)
+{
+    /* A HEURISTIC - see the header. Backward scan in PC ORDER, which is
+     * not execution order across a back edge. */
+    const size_t n = end > begin ? end - begin : 0;
+    dist.assign(n * static_cast<size_t>(count > 0 ? count : 0),
+                JIT_NO_NEXT_USE);
+    if (!n || count <= 0)
+        return;
+    std::vector<int> cur(count, JIT_NO_NEXT_USE);
+    for (size_t r = 0; r < n; r++) {
+        const size_t p = end - 1 - r;
+        Instr &in = const_cast<Instr &>(chunk.code[p]);
+        for (int &d : cur)
+            if (d != JIT_NO_NEXT_USE)
+                d++;
+        /* An op the table does not know may read ANY slot, so every
+         * covered slot's next use is right here. */
+        const bool known = visit_use_def(in,
+            [&](int s) {
+                if (s >= base && s < base + count)
+                    cur[s - base] = 0;
+            },
+            [](int) {});
+        if (!known)
+            std::fill(cur.begin(), cur.end(), 0);
+        std::copy(cur.begin(), cur.end(),
+                  dist.begin() + (p - begin) * static_cast<size_t>(count));
+    }
 }
 
 /*

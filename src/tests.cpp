@@ -24366,6 +24366,206 @@ static const char *fwd_opcode_name(OpCode op)
 #undef ML_TEST_OPNAME
 }
 
+/*
+ * #96: the all-slot LIVE RANGES (jit_slot_liveness) against the temps-only
+ * analysis they generalise (jit_fwd_info), over the chunks of real
+ * programs.
+ *
+ * WHY IT NEEDS ITS OWN ORACLE. A liveness bug is invisible to every
+ * other net here. Being WRONGLY CONSERVATIVE (too much live) is SAFE, so
+ * it changes no answer and merely loses an optimization - the "an
+ * optimization that only affects SPEED has no correctness oracle" gap.
+ * Being wrongly OPTIMISTIC is a silent miscompile, but only once an
+ * allocator acts on it - i.e. after this lands.
+ *
+ * ⛔ AND THE OBVIOUS ORACLE IS WEAKER THAN IT LOOKS - watched failing.
+ * Comparing against jit_fwd_info reads like an independent computation
+ * of the same fact, and it is NOT: the widening made jit_fwd_info a
+ * WRAPPER over the same core, so a bug in the core is present on both
+ * sides and cancels. Proven by sabotage - making an unaudited op
+ * contribute NOTHING live (`known ? ... : 0`, the dangerous direction)
+ * leaves the agreement check perfectly green. This is "a test derived
+ * from a table can never find a hole in that table" wearing a new coat:
+ * a test whose ORACLE SHARES THE IMPLEMENTATION UNDER TEST proves only
+ * that the shared part is self-consistent.
+ *
+ * So the load-bearing checks are the two derived from the DEFINITION of
+ * liveness rather than from this code - the dataflow equation (1) and
+ * the unaudited-op contract (2) - and each is watched failing. What the
+ * agreement check (3) still buys, honestly stated, is the WRAPPERS: a
+ * wrong base, count or word stride shows up there and nowhere else.
+ *
+ * The >64-temp program matters: jit_fwd_info returns false there (its
+ * one-word mask cannot express it) and the general form must still work.
+ * That is the cliff this widening removes, so the case asserts it is
+ * actually reached rather than hoping some corpus chunk is big enough.
+ */
+static bool jit_slot_liveness_check()
+{
+#if ML_JIT_SUPPORTED
+    /* a chain of distinct live temps wider than one word - `t0..t79` are
+     * all live simultaneously at the print, so n_temps clears 64 */
+    /* `s` is int by its 0 initializer and takes the dyn value through the
+     * documented coercion, so every tN below is a plain int temp. */
+    std::string wide = "var s = 0; s = s + runtime(1);\n";
+    for (int i = 0; i < 80; i++)
+        wide += "var t" + std::to_string(i) + " = s * "
+             + std::to_string(i + 1) + " + 1;\n";
+    wide += "print(";
+    for (int i = 0; i < 80; i++)
+        wide += (i ? "+ t" : "t") + std::to_string(i) + " ";
+    wide += ");\n";
+
+    struct Case { const char *name; std::string src; };
+    const Case cases[] = {
+        { "loop + branch",
+          "var a = 0; var b = 0; b = b + runtime(7);\n"
+          "for (var i = 0; i < b; i++) { if (i % 2 == 0) a = a + i;"
+          " else a = a - i; }\nprint(a);\n" },
+        { "try/catch (handler absorption)",
+          "var x = 0; x = x + runtime(3);\nvar y = 0;\n"
+          "try { y = x / (x - 3); } catch (DivisionByZeroEx) { y = x; }\n"
+          "print(y);\n" },
+        { "calls + closures",
+          "func h(int n) { var r = n * 3; return r + 1; }\n"
+          "var acc = 0;\nfor (var i = 0; i < runtime(5); i++)"
+          " { var v = h(i); acc = acc + v; }\nprint(acc);\n" },
+        /* an ARRAY ELEMENT STORE: StoreElemInt is one of the 35
+         * opcodes visit_use_def does not name, so it is a BARRIER and
+         * this case is what makes check (2) non-vacuous. */
+        { "array element store (an UNAUDITED op)",
+          "var lim = 0; lim = lim + runtime(4);\n"
+          "var a = array(lim);\n"
+          "for (var i = 0; i < lim; i++) { a[i] = i * 2; }\n"
+          "print(sum(a));\n" },
+        { ">64 live temps (past jit_fwd_info's one-word cliff)", wide },
+    };
+
+    bool saw_wide = false;              /* the cliff case was REACHED */
+    int n_unknown = 0;                  /* unaudited ops SEEN */
+    for (const Case &c : cases) {
+        std::vector<Tok> toks;
+        lexer(c.src, 1, toks);
+        ParseContext pctx(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pctx);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        /* jit=false: the native tier deletes the interpreted originals,
+         * and it is that code both analyses read. */
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+
+        std::vector<const Chunk *> chunks;
+        chunks.push_back(&prog.root);
+        for (const auto &fd : prog.funcs)
+            if (fd->vm_chunk)
+                chunks.push_back(static_cast<const Chunk *>(fd->vm_chunk));
+
+        for (const Chunk *ck : chunks) {
+            SlotLiveness sl;
+            if (!jit_slot_liveness(*ck, sl)) {
+                if (!ck->code.empty() && ck->slot_count + ck->n_temps > 0) {
+                    printf("  liveness declined a non-empty chunk\n");
+                    return false;
+                }
+                continue;
+            }
+            const size_t n = ck->code.size();
+
+            /* (1) EQUATION: for an op the table KNOWS,
+             *     live_in = use U (live_out - def).
+             * (2) CONTRACT: for an op it does NOT know, every covered
+             *     slot is live-in. This is the MAY direction, and it is
+             *     the one whose loss is a silent miscompile - checked
+             *     against the written contract, never against another
+             *     run of the same core (see the header note). */
+            for (size_t p = 0; p < n; p++) {
+                std::vector<int> uses, defs;
+                Instr &in = const_cast<Instr &>(ck->code[p]);
+                if (!jit_op_slot_refs(in, uses, defs)) {
+                    n_unknown++;
+                    for (int s = 0; s < sl.count; s++)
+                        if (!sl.live_in(p, s)) {
+                            printf("  %s: pc %zu is an UNAUDITED op but "
+                                   "slot %d reads dead - the may-analysis "
+                                   "contract is broken\n", c.name, p, s);
+                            return false;
+                        }
+                    continue;
+                }
+                for (int s = 0; s < sl.count; s++) {
+                    const bool use = std::find(uses.begin(), uses.end(), s)
+                                     != uses.end();
+                    const bool def = std::find(defs.begin(), defs.end(), s)
+                                     != defs.end();
+                    const bool want = use || (sl.live_out(p, s) && !def);
+                    if (sl.live_in(p, s) != want) {
+                        printf("  %s: pc %zu slot %d: live_in=%d want=%d\n",
+                               c.name, p, s, (int)sl.live_in(p, s),
+                               (int)want);
+                        return false;
+                    }
+                }
+            }
+
+            /* (3) AGREEMENT with the temps-only wrapper. NOT an
+             * independent oracle (same core) - what it checks is the
+             * WRAPPERS' base/count/stride. */
+            std::vector<uint64_t> lout, lin;
+            std::vector<char> is_tgt;
+            if (jit_fwd_info(*ck, lout, lin, is_tgt)) {
+                for (size_t p = 0; p < n; p++)
+                    for (int t = 0; t < ck->n_temps; t++) {
+                        const int slot = ck->slot_count + t;
+                        const bool oi = (lin[p] >> t) & 1;
+                        const bool oo = (lout[p] >> t) & 1;
+                        if (oi != sl.live_in(p, slot)
+                                || oo != sl.live_out(p, slot)) {
+                            printf("  %s: pc %zu temp %d: old(%d,%d) "
+                                   "new(%d,%d)\n", c.name, p, t, (int)oi,
+                                   (int)oo, (int)sl.live_in(p, slot),
+                                   (int)sl.live_out(p, slot));
+                            return false;
+                        }
+                    }
+            } else if (ck->n_temps > 64) {
+                saw_wide = true;        /* (4) past the one-word cliff */
+            }
+
+            /* (5) the next-use HEURISTIC's one hard contract: a slot the
+             * op at pc reads has distance 0 there. */
+            std::vector<int> dist;
+            jit_next_use(*ck, 0, n, 0, sl.count, dist);
+            for (size_t p = 0; p < n; p++) {
+                std::vector<int> uses, defs;
+                Instr &in = const_cast<Instr &>(ck->code[p]);
+                if (!jit_op_slot_refs(in, uses, defs))
+                    continue;
+                for (const int s : uses)
+                    if (s >= 0 && s < sl.count
+                            && dist[p * sl.count + s] != 0) {
+                        printf("  %s: pc %zu slot %d used but next_use=%d\n",
+                               c.name, p, s, dist[p * sl.count + s]);
+                        return false;
+                    }
+            }
+        }
+    }
+    if (!saw_wide) {
+        printf("  VACUOUS: no chunk exceeded jit_fwd_info's 64-temp "
+               "cliff, so the widening was never exercised\n");
+        return false;
+    }
+    if (!n_unknown) {
+        printf("  VACUOUS: no UNAUDITED op appeared, so the may-analysis "
+               "contract - the direction whose loss is a miscompile - "
+               "was never checked\n");
+        return false;
+    }
+#endif
+    return true;
+}
+
 static bool jit_fwd_family_coverage()
 {
 #if ML_JIT_SUPPORTED
@@ -31688,6 +31888,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: lever A's whitelists COVER the specialized-arith family - "
       "the ratchet derived from the opcode ENUM, not from the table",
       jit_fwd_family_coverage },
+    { "jit: the all-slot LIVE RANGES agree with the temps-only analysis "
+      "they generalise, and clear its 64-temp cliff (#96)",
+      jit_slot_liveness_check },
     { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "
       "call-free fragment, declines around a MyLang call (#96)",
       jit_xcache_pins },
