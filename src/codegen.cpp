@@ -1771,6 +1771,101 @@ struct Codegen {
      * has no error path. Returns false if an op isn't of the kind or an operand
      * can't compile. Used for both the raw ExprNN and TypedScalarExpr forms.
      */
+    /*
+     * #138: `dst = bool(v)`, as a LogV against ITSELF - `v && v` IS `bool(v)`.
+     * Reusing the op keeps the truthiness rules, the throw for a value with no
+     * bool conversion, and that throw's caret in ONE place instead of a second
+     * spelling that could drift. `is_true` is side-effect-free, so reading the
+     * operand twice costs a slot read.
+     */
+    void emit_to_bool(int dst, const Operand &v, const Construct *node,
+                      std::vector<CgInstr> &ops)
+    {
+        CgInstr in;
+        in.op = OpCode::LogV;
+        in.node_idx = add_ast_node(node);
+        in.target = dst;
+        in.set_a(v);
+        in.set_b(v);
+        in.aop = Op::land;
+        ops.push_back(in);
+    }
+
+    /*
+     * #138: a LOGICAL chain SHORT-CIRCUITS, so unlike an arith or compare
+     * chain it is NOT a straight run of ops - the operand that determines the
+     * result must jump over everything after it.
+     *
+     *     a && b     ->   dst = bool(a)
+     *                     JumpUnlessTrueV dst -> END     ; dst is already false
+     *                     dst = bool(b)
+     *                 END:
+     *
+     *     a || b     ->   dst = bool(a)
+     *                     JumpUnlessTrueV dst -> L       ; false: evaluate b
+     *                     Jump END                       ; true: dst is it
+     *                 L:  dst = bool(b)
+     *                 END:
+     *
+     * The `||` form needs the extra Jump because JumpUnlessTrueV is the only
+     * truthiness branch there is; `&&` gets the direct form because a false
+     * accumulator IS the answer, so the branch target needs no fixup work.
+     *
+     * EVERY path writes the SAME dst - the whole point of allocating it up
+     * front rather than a temp per step, since the ops after a branch may not
+     * run. Forward jumps are patched into `ops` before returning: `ops` is
+     * always the codegen's own `code` vector (every parameter is a reference
+     * to it), so an index recorded here stays valid.
+     *
+     * A mid-chain operand failure leaves the partial emission for the caller
+     * to roll back with `ops.resize(mark)` - the same contract the eager form
+     * had.
+     */
+    bool emit_logical_chain(
+        const std::vector<std::pair<Op, unique_ptr<Construct>>> &elems,
+        const Construct *node, int &out_slot, std::vector<CgInstr> &ops)
+    {
+        const int dst = alloc_temp();
+        std::vector<size_t> done_jumps;      /* all -> the shared exit */
+
+        Operand acc_op;
+        if (!boxed_operand(elems[0].second.get(), acc_op, ops))
+            return false;
+        emit_to_bool(dst, acc_op, node, ops);
+
+        for (size_t i = 1; i < elems.size(); i++) {
+
+            CgInstr j;
+            j.op = OpCode::JumpUnlessTrueV;
+            j.node_idx = add_ast_node(node);
+            j.target2 = dst;
+
+            if (elems[i].first == Op::land) {
+                done_jumps.push_back(ops.size());
+                ops.push_back(j);
+            } else {
+                const size_t to_rhs = ops.size();
+                ops.push_back(j);
+                CgInstr g;
+                g.op = OpCode::Jump;
+                done_jumps.push_back(ops.size());
+                ops.push_back(g);
+                ops[to_rhs].target = static_cast<int>(ops.size());
+            }
+
+            Operand rhs_op;
+            if (!boxed_operand(elems[i].second.get(), rhs_op, ops))
+                return false;
+            emit_to_bool(dst, rhs_op, node, ops);
+        }
+
+        for (size_t j : done_jumps)
+            ops[j].target = static_cast<int>(ops.size());
+
+        out_slot = dst;
+        return true;
+    }
+
     bool emit_boxed_chain(
         const std::vector<std::pair<Op, unique_ptr<Construct>>> &elems,
         char k, const Construct *node, int &out_slot, std::vector<CgInstr> &ops)
@@ -1785,6 +1880,8 @@ struct Codegen {
             if (!ok)
                 return false;
         }
+        if (k == 'l')                       /* #138: it branches - see above */
+            return emit_logical_chain(elems, node, out_slot, ops);
         Operand acc_op;
         if (!boxed_operand(elems[0].second.get(), acc_op, ops))
             return false;

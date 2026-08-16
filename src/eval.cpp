@@ -2659,6 +2659,12 @@ EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::land:
+                /* SHORT-CIRCUIT (#138): a false accumulator DETERMINES the
+                 * result, so the right operand is not evaluated at all - its
+                 * side effects do not happen and its errors are not raised.
+                 * That is what makes `p != none && p.x > 0` a guard. */
+                if (!val.is_true())
+                    return EvalValue(false);
                 logop_loc(val, e.get(), ctx, op);
                 break;
             default:
@@ -2679,6 +2685,10 @@ EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::lor:
+                /* SHORT-CIRCUIT (#138) - the `||` twin: a TRUE accumulator
+                 * determines the result. */
+                if (val.is_true())
+                    return EvalValue(true);
                 logop_loc(val, e.get(), ctx, op);
                 break;
             default:
@@ -2782,7 +2792,17 @@ int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
         case Cat::logical: {
             int_type acc = elems[0].second->eval_int(ctx);
             for (size_t i = 1; i < elems.size(); i++) {
-                /* both sides always evaluated (no short-circuit) */
+                /* SHORT-CIRCUIT (#138): stop at the operand that DETERMINES
+                 * the result - false for `&&`, true for `||` - so the rest is
+                 * never evaluated. The M8 form must agree with the boxed one
+                 * operand for operand, since which one a node gets is an
+                 * inference detail the program cannot see. */
+                if (elems[i].first == Op::land) {
+                    if (!acc)
+                        return 0;
+                } else if (acc) {
+                    return 1;
+                }
                 const int_type r = elems[i].second->eval_int(ctx);
                 acc = (elems[i].first == Op::land) ? (acc && r) : (acc || r);
             }

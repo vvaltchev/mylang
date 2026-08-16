@@ -1229,7 +1229,12 @@ slot identity). For each function (and the top-level "main"), it:
   || 5` is `true`, not `5`), which shapes the rules. A const that **determines**
   the result — `false && rest` → `false`, `true || rest` → `true` — folds the
   whole expression to that bool (sound regardless of `rest`: it is
-  short-circuited, so never evaluated - including its side effects. An
+  short-circuited, so never evaluated - including its side effects. **That
+  claim was FALSE until #138**: only the FOLD skipped `rest`; the runtime
+  evaluated every operand, so the same operator behaved differently depending
+  on whether const-eval could see the left side - a RULE 2 violation this
+  paragraph was quietly asserting away. `&&`/`||` short-circuit at run time
+  now, in all three engines - see *Short-circuit* under the eval section. An
   UNDEFINED NAME there is nonetheless a compile error since FIX-1 (#130):
   the resolver rejects it before this fold runs. Early dead-code
   elimination, which would let a name survive under a false guard, is a
@@ -2879,6 +2884,23 @@ sanitizers never reproduced it.)
   (`ExceptionObject`), and `rethrow`
   (`RethrowEx`, defined locally in `eval.cpp`) — caught by
   `do_catch`/`TryCatchStmt`.
+- **⛔ `&&` / `||` SHORT-CIRCUIT — in THREE places that must agree (#138,
+  2026-08-09).** The determining operand (false for `&&`, true for `||`) stops
+  the chain: the rest is not evaluated, so its side effects do not happen and
+  its errors are not raised. Before this only the CONST-FOLD skipped the tail,
+  so `const F = false; F && side()` skipped it while
+  `runtime(0) > 1 && side()` did not — the same operator, two behaviours,
+  decided by whether const-eval could see the operand.
+  The three implementations are **`Expr11`/`Expr12::do_eval`** (the boxed
+  tree-walker), **`TypedScalarExpr::eval_int_body`'s `Cat::logical`** (the M8
+  typed form), and **`emit_logical_chain`** (codegen — a logical chain is the
+  one boxed chain that is NOT a straight op run: it needs real branches, one
+  `JumpUnlessTrueV` per operand plus an extra `Jump` for `||`, every path
+  writing the SAME dst). Which form a node gets is an inference detail the
+  program cannot see, so a divergence between them is invisible until it
+  bites. **A VALUE assertion cannot test any of this** — `a && b` was always
+  `bool(a) && bool(b)`, so only side effects and errors changed; test with a
+  call counter or a would-throw tail.
 - **`Construct::eval()` wraps `do_eval()`** to attach the node's source `Loc` to
   any in-flight
   `Exception` that doesn't already carry one — this is how runtime errors get

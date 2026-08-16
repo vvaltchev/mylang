@@ -468,7 +468,8 @@ Each lands as its OWN commit.
    expect. It also found TWO bugs: a lazy builtin's argument counted as a
    read (`isbound(g)` is how a program AVOIDS the error - refusing it
    would refuse the correct code), and **#138**, that `&&`/`||` do not
-   short-circuit at run time although the const-fold assumes they do.
+   short-circuit at run time although the const-fold assumes they do
+   (FIXED the same day - they short-circuit now, in all three engines).
    STILL OPEN in step 7: transitivity (a global read by a function the
    callee calls), call sites below the top level, the WARNING tier for
    the merely suspicious, and **`--strict`**.
