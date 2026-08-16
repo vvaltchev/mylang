@@ -114,6 +114,12 @@ struct FuncDescriptor {
         const UniqueId *name;
         SymKind kind;
         int slot;
+        /* The capture-list entry's own span, so an UnboundSymbolEx raised by
+         * the snapshot carets THE NAME INSIDE THE BRACKETS rather than the
+         * whole closure expression (#131 step 4). Serializable (plain Locs);
+         * the ctor is AST-free, so the Identifier is long gone by then. */
+        Loc start;
+        Loc end;
     };
 
     const UniqueId *name = nullptr;  /* null for a lambda */

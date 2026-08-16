@@ -308,6 +308,8 @@ whole call model reads it, never an AST node.
         uid   name
         u8    kind                  SymKind, section 13
         u32   slot                  (signed)
+        loc   start                 v12 - the capture-list entry's own span
+        loc   end                   (see below)
 
 `has_chunk` is what pairs a descriptor with its chunk in section 9: the chunks
 follow in exactly this order, skipping descriptors whose flag is false.  A
@@ -785,6 +787,16 @@ same is true of OpCode and Op, which appear in every instruction.)
 
 Version 9 is exactly such a change: deleting the CatchTest and Reraise
 opcodes renumbered every OpCode after them.
+
+Version 12 adds the two Locs to the Capture record.  The capture SNAPSHOT
+runs in the FuncObject constructor, which is AST-free by design - it reads
+the descriptor, never the capture Identifiers - so when a captured GLOBAL is
+not bound yet (UnboundSymbolEx, #131) there was no span to caret with, and
+the three engines produced three different answers.  Carrying the span in
+the descriptor is what lets the caret land on the name INSIDE the brackets,
+identically everywhere.  They go through the narrow pool-Loc encoding
+(u16 line + u8 col, whole-byte escapes), so a capture costs 6 more bytes and
+almost always exactly 6.
 
 Version 10 is the milder kind: LoadElem2Int and LoadElem2Float (the fused
 nested read `a[i][j]`) were APPENDED, so no existing ordinal moved and a v9
