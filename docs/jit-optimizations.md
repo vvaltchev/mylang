@@ -5822,3 +5822,72 @@ Delete the parameter or honour it.
 
 Nets: `tests/corpus_diff.sh --nolowmem`, plus `-rt` under the same env,
 both in the `Nets` CI lane's `differential` job.
+
+## 2026-08-18 - #96: the xcache gate becomes a per-register CLOBBER MASK
+
+`jit_xcache_clobber(chunk, begin, end, has_hoist)` replaces
+
+    xcache_ok = hregs.empty() && !jit_run_blocks_xcache(..) && !lever
+
+with one mask, one bit per pool register, and each contributor stating
+its OWN claim: the C1 hoist owns r10/r11 (`g_hoist.rdata`/`rcount` and
+nothing else - the region preheader's other scratch is rax/r9/rdx,
+which are in no pool); a MyLang call emitter uses r8/r10/r11 as raw
+scratch outside any prologue bracket, so it claims the whole pool; a
+type singleton still in a register claims that register; the kill
+switch claims everything. `e.reg_busy` is seeded from it, so the budget
+and the assignment cannot disagree.
+
+**WHY THE BOOLEAN WAS EXPENSIVE.** It denied the whole pool for one
+hoist region, though a region claims two of three members - and the two
+conditions are not independent: an element read on a loop-invariant
+base is PRECISELY what makes `jit_hoist_pick` return a region. So
+"walks an array in a loop" and "may pin a caller-saved register" were
+mutually exclusive by construction. Measured over bench/my + samples +
+tests/functional: **199 runs compiled, 20 with a hoist region, 0 of
+those with a pool register left.** That is what made the previous day's
+ScratchPlan unreachable.
+
+**A SECOND GATE OF THE SAME SHAPE, one register over.** With the mask
+in, the reachability was STILL 0/20 - and the breakdown said none of
+the 20 was blocked by a call; all 20 were blocked by
+`jit_xcache_busy`'s float-tag claim. That predicate is
+`run_needs_float_tag`, a deliberately fail-safe whitelist of the pure
+int-loop family, so EVERY element op falls to `default: return true`.
+It was claiming r8 for a singleton that, with the low-address arena, is
+not in a register at all. Narrowed to
+`run_needs_float_tag(..) && !jit_tag_is_imm(t_float)` - which is
+exactly the form `elem_reg_usable` already used, so the two agree now.
+After both: **20 of 20.**
+
+**AND IT MEASURES FLAT.** 9 of 108 corpus programs change
+(43_sieve, 56_sieve_bool, 60_bit_sieve, 68_nested, 80..83_regs_int,
+samples/primes2). Callgrind Ir, `OPT=1 ASSERTS=0` both sides:
+43_sieve **-0.40%**, 56_sieve_bool **-0.71%**, 60_bit_sieve -0.15%,
+68_nested +0.22%, the four regs_int benches 0.00%. Wall clock,
+interleaved `--baseline`, full suite: **geomean cur/base 0.997x**, per
+bench 0.92x .. 1.04x, i.e. inside the spread.
+
+**THE THIRD "MORE REGISTERS DO NOT PAY HERE" IN THIS ARC** (after r8
+and after the ScratchPlan). The arc's central result stands: pin
+PRESSURE is not what these programs are short of. What the mask buys is
+structural - the gate now states a fact instead of an approximation,
+which is what makes any future pool member reachable at all - and the
+narrowing removes a claim that was simply FALSE on the shipping path.
+
+Also fixed here, because the wider budget exposes it: the C2b hoist
+pair picked its registers as `CACHE_REGS[hot.size()]` under
+`MAX_CACHED - hot.size() >= 2`. That subtraction is a `size_t` and was
+safe only while a hoist run got no caller-saved pin - the exact
+coupling this change removes. With 5 pins it underflows, grants the
+pair unconditionally and indexes `CACHE_REGS[5]`. The displacement arm
+needed the same care in the other direction: dropping the pin that
+lives in r8 frees no CALLEE-saved register, so "the two coldest" became
+"the ones that do not fit in what is left", weighed against exactly
+those.
+
+PINNED by a new `jit_xcache_pins` case, "a C1 hoist region leaves r8
+pinnable (r10/r11 are its own)" - five accumulators plus an `a[i]` read
+to force a region. Watched: restoring the boolean fails it by name at
+every `--xrot` rotation. `-rt` 1922/1922 arena on and off, all four
+corpus_diff matrices 20/20.

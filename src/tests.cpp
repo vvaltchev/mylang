@@ -24827,6 +24827,58 @@ static bool jit_xcache_pins()
           "print(f(runtime(40)));" }, false },
 
       /*
+       * ⛔ THE C1-HOIST SHAPE, AND IT ANSWERED `false` BY CONSTRUCTION
+       * UNTIL 2026-08-18. The gate used to read
+       *
+       *     xcache_ok = hregs.empty() && !blocks_xcache(..) && !lever
+       *
+       * so ONE hoist region cost the WHOLE caller-saved pool - far more
+       * than the hoist claims, which is r10 and r11 and nothing else.
+       * And the two are not independent: an element read on a
+       * loop-invariant base is PRECISELY what makes jit_hoist_pick
+       * return a region, so "this fragment walks an array in a loop"
+       * and "this fragment may pin a caller-saved register" were
+       * MUTUALLY EXCLUSIVE. Measured over bench + samples + functional:
+       * 20 runs with a hoist region, 0 of them with a pool register
+       * left - which is also why the ScratchPlan built the day before
+       * measured itself unreachable.
+       *
+       * Five accumulators plus the loop var, so the pick wants more
+       * than the callee-saved four, and an `a[i]` read to force the
+       * region. `want = true` FAILS on the boolean gate - watched.
+       *
+       * The VALUE is the oracle as everywhere else here: r10/r11 carry
+       * the hoisted (data, count), so a pin wrongly placed in either
+       * returns a wrong sum rather than merely a slower one.
+       */
+      { "a C1 hoist region leaves r8 pinnable (r10/r11 are its own)",
+        { "func mk(int n) {",
+          "    var a = array(n); var i = 0;",
+          "    while (i < n) { a[i] = i * 2 + 1; i++; }",
+          "    return a; }",
+          "func f(a, int n) {",
+          "    var s0 = 1; var s1 = 2; var s2 = 3;",
+          "    var s3 = 4; var s4 = 5;",
+          "    for (var i = 0; i < n; i++) {",
+          "        s0 = s0 + a[i]; s1 = s1 + s0; s2 = s2 + s1;",
+          "        s3 = s3 + s2; s4 = s4 + s3; }",
+          "    return s0 + s1 + s2 + s3 + s4; }",
+          "print(f(mk(runtime(48)), runtime(48)));" },
+        /*
+         * ⛔ THE EXPECTATION DEPENDS ON THE ARENA, because the CLAIM
+         * does. This run's element ops are outside run_needs_float_tag's
+         * int-only whitelist, so it "needs the float tag" - and whether
+         * that costs r8 depends on whether t_float encodes as an imm32.
+         * With the arena it does not live in a register at all and r8 is
+         * free; under MYLANG_NO_LOWMEM=1 (or on any host where
+         * MAP_32BIT is unavailable) it genuinely DOES, and declining is
+         * the correct answer. Hardcoding `true` failed the no-arena lane
+         * the day that lane started running - which is the lane doing
+         * its job, not a bug to paper over.
+         */
+        ml_lowmem_fits_imm32(AllTypes[Type::t_float]) },
+
+      /*
        * THE LOAD-BEARING SHAPE: a caller-saved pin SPILLED around a
        * helper call and RELOADED after it. Six hot locals plus an
        * `int(q)` on a dyn, whose boxed arm calls a helper - so r10/r11

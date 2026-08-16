@@ -6678,6 +6678,15 @@ static const uint8_t *xcache_regs()
     return order;
 }
 
+/* every member of the caller-saved pin pool, as a bit mask */
+static uint32_t xcache_mask()
+{
+    uint32_t m = 0;
+    for (size_t i = 0; i < MAX_XCACHED; i++)
+        m |= 1u << XCACHE_ORDER[i];
+    return m;
+}
+
 /* Which XCACHE registers this run must NOT spend, because they still
  * hold a type singleton. Empty when both tags encode as imm32. */
 static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
@@ -6696,7 +6705,8 @@ static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
      * sufficient: rsi/rax/rcx/rdx/rdi/r8 all need the emitter to
      * ALLOCATE its scratch before they can be pinned generally.
      */
-    if (run_needs_float_tag(ck, begin, end))
+    if (run_needs_float_tag(ck, begin, end)
+            && !jit_tag_is_imm(jit_layout().t_float))
         busy |= 1u << 8;
     return busy;
 }
@@ -6741,6 +6751,58 @@ static bool jit_run_blocks_xcache(const Chunk &ck, size_t begin, size_t end)
             break;
         }
     return false;
+}
+
+/*
+ * #96: WHICH caller-saved pool registers this RUN may not spend - a
+ * MASK, one bit per register, and the ONE place that answers it.
+ *
+ * ⛔ IT USED TO BE A BOOLEAN, AND THE BOOLEAN WAS COSTING A REGISTER
+ * FOR NOTHING (2026-08-18). The gate read
+ *
+ *     xcache_ok = hregs.empty() && !jit_run_blocks_xcache(..) && !lever
+ *
+ * so a fragment with ONE C1 hoist region lost the WHOLE extension.
+ * That is far more than the hoist actually claims: `g_hoist.rdata` and
+ * `g_hoist.rcount` are r10 and r11 and nothing else (see the region
+ * preheader's `nav`, whose other scratch - rax, r9, rdx - is not in any
+ * pool). r8 was denied by association.
+ *
+ * It mattered because the two are not independent: an element read or
+ * store on a loop-invariant base is PRECISELY what makes
+ * `jit_hoist_pick` return a region, so `hregs` is non-empty exactly
+ * when the element tier fires. The boolean therefore made "this
+ * fragment touches an array in a loop" and "this fragment may pin a
+ * caller-saved register" MUTUALLY EXCLUSIVE - which is what the
+ * ScratchPlan measured when it found itself unreachable (58 plan calls
+ * corpus-wide, never one with a caller-saved pin live).
+ *
+ * Each contributor now states its OWN registers:
+ *
+ *   - the C1 hoist owns r10/r11 for the duration of a region;
+ *   - a MyLang CALL emitter (emit_sync_push_native /
+ *     emit_sync_call_inline) uses r8, r10 and r11 as RAW scratch
+ *     OUTSIDE any emit_call_prologue bracket - i.e. the whole pool.
+ *     `jit_assert_no_volatile_pin` is the standing check that this
+ *     stays true, and it asserts the strong form (no caller-saved pin
+ *     at all), so widening the pool cannot silently outrun this line;
+ *   - a type singleton still in a register claims it (jit_xcache_busy);
+ *   - the kill switch claims everything.
+ *
+ * A NEW pool member is denied by NOTHING here unless a contributor
+ * names it, which is the property the boolean could not have.
+ */
+static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
+                                   size_t end, bool has_hoist)
+{
+    if (jit_lever_off(JL_XCACHE))
+        return xcache_mask();
+    uint32_t clob = jit_xcache_busy(ck, begin, end);
+    if (has_hoist)
+        clob |= (1u << 10) | (1u << 11);     /* g_hoist.rdata/rcount */
+    if (jit_run_blocks_xcache(ck, begin, end))
+        clob |= xcache_mask();
+    return clob;
 }
 
 /* N5: pick up to MAX_CACHED hot INT-scalar slots to pin for a run.
@@ -14613,11 +14675,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * callee-saved registers this fragment takes over and therefore
          * what frag_entry must push (and what every exit must pop). */
         e.cache.clear();
-        /* #96 step 3: a register still carrying a type singleton starts
-         * BUSY, so take_reg cannot hand it to a pin. With the
-         * low-address arena the mask is empty and rsi/r8 are ordinary
-         * pool registers. */
-        e.reg_busy = jit_xcache_busy(chunk, begin, end);
+        /* #96: every register some part of this run has CLAIMED starts
+         * BUSY, so take_reg cannot hand it to a pin - a type singleton
+         * still in a register (step 3), r10/r11 under a C1 hoist
+         * region, the whole pool in a run that emits a MyLang call.
+         * ONE mask, so the budget above and the assignment below cannot
+         * disagree about which registers exist. Set below, once hregs
+         * is known. */
+        e.reg_busy = 0;
         e.tflush.clear();       /* C3: per-RUN like the pools */
         /* #96: the pending exits + their interned cache states are also
          * per-RUN. emit_epilogues clears them, but a run whose emission
@@ -14673,22 +14738,22 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         std::vector<int> textra, textra_f;        /* C3: type-elided */
         std::vector<int> fread_raw;               /* C4a-i */
         /*
-         * #96: this fragment's PIN BUDGET. The callee-saved four always;
-         * r10/r11 as well when no C1 region wants them (see XCACHE_ORDER).
+         * #96: this fragment's PIN BUDGET. The callee-saved four always,
+         * plus whichever caller-saved pool members nothing in this run
+         * has CLAIMED - see jit_xcache_clobber, which is the single
+         * place that answers that and states each claim's reason.
          * Decided HERE because it is a property of the fragment, not of
          * the pool - which is why the pick can no longer read MAX_CACHED
          * for itself.
          */
-        const bool xcache_ok = hregs.empty()
-            && !jit_run_blocks_xcache(chunk, begin, end)
-            && !jit_lever_off(JL_XCACHE);
-        const uint32_t xbusy = jit_xcache_busy(chunk, begin, end);
+        const uint32_t xclob =
+            jit_xcache_clobber(chunk, begin, end, !hregs.empty());
         size_t n_xcache = 0;
-        if (xcache_ok)
-            for (size_t i = 0; i < MAX_XCACHED; i++)
-                if (!(xbusy & (1u << xcache_regs()[i])))
-                    n_xcache++;
+        for (size_t i = 0; i < MAX_XCACHED; i++)
+            if (!(xclob & (1u << XCACHE_ORDER[i])))
+                n_xcache++;
         const size_t max_pins = MAX_CACHED + n_xcache;
+        e.reg_busy = xclob;
         std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
                               max_pins,
@@ -14726,28 +14791,82 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             for (const HoistRegion &h : hregs)
                 if (h.base2 >= 0)
                     u2 += h.uses2;
+            /*
+             * How many CALLEE-saved registers the pins will consume.
+             * take_reg fills CACHE_REGS before the caller-saved
+             * extension, so a pin that OVERFLOWS into the extension
+             * costs the pair nothing.
+             *
+             * ⛔ A `min`, NOT the plain `MAX_CACHED - hot.size()` this
+             * used to be. That subtraction was safe only while a run
+             * with a hoist region got NO caller-saved pin - the exact
+             * coupling the clobber mask above removes. With the mask a
+             * hoist region can also hold a pin in r8, so hot.size() may
+             * EXCEED MAX_CACHED, and the size_t underflows to a huge
+             * value: the pair is granted unconditionally and
+             * CACHE_REGS[5] is read out of bounds. Same trap as the
+             * pop_back note below, in a second place - and it is the
+             * only thing in this function that the wider budget could
+             * have broken silently.
+             */
+            const size_t cs_used = std::min(hot.size(), MAX_CACHED);
             if (u2 > 0) {
-                if (MAX_CACHED - hot.size() >= 2) {
-                    pair_lo = CACHE_REGS[hot.size()];
-                    pair_hi = CACHE_REGS[hot.size() + 1];
-                } else if (hot.size() >= 2
-                           && 12 * u2 > hot_counts[hot.size() - 1]
-                                        + hot_counts[hot.size() - 2]) {
-                    /* drop the two COLDEST pins to free the pair.
-                     * `pop_back` twice, not `resize(size() - 2)`: the
-                     * `size() >= 2` guard above makes both correct, but
-                     * the subtraction is a size_t that UNDERFLOWS if a
-                     * future edit weakens the guard, and GCC's LTO
-                     * inliner cannot always carry the range fact across
-                     * the reallocated call tree - it reported a
-                     * -Wstringop-overflow on the `memset` behind
-                     * `resize`, with a size of (size_t)-12, and WERROR
-                     * turned that into a failed release build. This
-                     * spelling cannot express the bad value at all. */
-                    hot.pop_back();
-                    hot.pop_back();
-                    pair_lo = CACHE_REGS[hot.size()];
-                    pair_hi = CACHE_REGS[hot.size() + 1];
+                if (MAX_CACHED - cs_used >= 2) {
+                    pair_lo = CACHE_REGS[cs_used];
+                    pair_hi = CACHE_REGS[cs_used + 1];
+                } else if (hot.size() >= 2) {
+                    /*
+                     * DISPLACE the coldest pins to free the pair.
+                     *
+                     * ⛔ "THE TWO COLDEST" WAS AN APPROXIMATION VALID
+                     * ONLY UNDER AN INVARIANT THE CLOBBER MASK ABOVE
+                     * REMOVED, and the C1 hoist test is what says so.
+                     * The pair needs two CALLEE-saved registers; while
+                     * hot.size() <= MAX_CACHED, dropping two pins frees
+                     * exactly two. A hoist run may now ALSO pin r8, so
+                     * hot.size() can be 5 - and then the number to drop
+                     * is neither 2 nor 3:
+                     *   - 3 (drop until only 2 pins remain) is too
+                     *     many. The pin in r8 does not occupy a
+                     *     callee-saved register, so dropping it buys
+                     *     the pair NOTHING and costs a pin for free;
+                     *   - the honest count is "how many pins do not fit
+                     *     in what is left", i.e. MAX_CACHED - 2 for the
+                     *     pair plus the caller-saved members, so a
+                     *     5-pin run drops 2 and the third survivor
+                     *     moves into r8.
+                     * The trade is then weighed against exactly the
+                     * pins that actually lose their register.
+                     */
+                    const size_t n_avail = MAX_CACHED - 2 + n_xcache;
+                    const size_t n_drop =
+                        hot.size() <= MAX_CACHED ? 2
+                      : hot.size() > n_avail ? hot.size() - n_avail : 2;
+                    long lost = 0;
+                    for (size_t k = 0; k < n_drop; k++)
+                        lost += hot_counts[hot.size() - 1 - k];
+                    if (12 * u2 > lost) {
+                        /* `pop_back` in a loop, not `resize(size() - n)`:
+                         * the subtraction is a size_t that UNDERFLOWS if
+                         * a future edit weakens the guard, and GCC's LTO
+                         * inliner cannot always carry the range fact
+                         * across the reallocated call tree - it reported
+                         * a -Wstringop-overflow on the `memset` behind
+                         * `resize`, with a size of (size_t)-12, and
+                         * WERROR turned that into a failed release
+                         * build. This spelling cannot express the bad
+                         * value at all. */
+                        for (size_t k = 0; k < n_drop; k++)
+                            hot.pop_back();
+                        /* the two callee-saved the survivors do not
+                         * need; a survivor past MAX_CACHED - 2 takes a
+                         * caller-saved member instead (take_reg skips
+                         * the pair, which is marked busy below). */
+                        const size_t k0 =
+                            std::min(hot.size(), MAX_CACHED - 2);
+                        pair_lo = CACHE_REGS[k0];
+                        pair_hi = CACHE_REGS[k0 + 1];
+                    }
                 }
             }
         }
@@ -14775,7 +14894,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         std::vector<uint8_t> hot_reg(hot.size());
         for (size_t h = 0; h < hot.size(); h++) {
             int r = e.take_reg(CACHE_REGS, MAX_CACHED);
-            if (r < 0 && xcache_ok)
+            if (r < 0)
                 r = e.take_reg(xcache_regs(), MAX_XCACHED);
             ML_CHECK(r >= 0);            /* hot.size() <= max_pins */
             hot_reg[h] = static_cast<uint8_t>(r);
