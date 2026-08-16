@@ -29,6 +29,7 @@
  */
 
 #include "jit.h"
+#include "lowmem.h"
 #include "codegen.h"
 #include "bytecode.h"
 #include "evalvalue.h"
@@ -1121,6 +1122,57 @@ struct Emitter {
         u8(static_cast<uint8_t>(MODRM_SLOT | ((reg & 7) << 3)));
         u32(static_cast<uint32_t>(disp));
     }
+    /*
+     * #96: `mov qword [rbx+disp], imm32` - REX.W C7 /0. The immediate is
+     * SIGN-EXTENDED to 64 bits, which is the entire reason the
+     * low-address arena exists: only a pointer below 2^31 survives the
+     * round trip. Callers MUST have checked with ml_lowmem_fits_imm32;
+     * the assert is here because getting it wrong writes a
+     * sign-extended garbage pointer into a slot's type field, and the
+     * next read of that slot dispatches through it.
+     *
+     * 11 bytes against 4 for `mov [rbx+disp], reg` - bigger, SAME
+     * instruction count, and it needs no register at all, which is what
+     * frees rsi/r8 for the allocator and deletes every entry
+     * materialisation and every post-call re-materialisation.
+     */
+    void store_imm64_as_imm32(int32_t disp, uint64_t val)
+    {
+        ML_CHECK_MSG(val < 0x80000000u,
+                     "store_imm64_as_imm32 with a value that does not "
+                     "survive sign extension - check ml_lowmem_fits_imm32");
+        u8(0x48);
+        u8(0xC7);
+        u8(static_cast<uint8_t>(MODRM_SLOT | (0 << 3)));   /* /0 */
+        u32(static_cast<uint32_t>(disp));
+        u32(static_cast<uint32_t>(val));
+    }
+    /*
+     * ⛔ THE ONE SEAM for writing a TYPE TAG into a slot's type field.
+     *
+     * A tag is a compile-time CONSTANT (a Type singleton), so the right
+     * encoding is an IMMEDIATE - and since #96 placed the singletons in
+     * the low-address arena, `mov qword [rbx+d], imm32` reaches them in
+     * ONE instruction and NO register. Where the arena is unavailable
+     * (Darwin, Windows, non-x86-64, or a failed MAP_32BIT) the pointer
+     * does not survive sign extension and this falls back to the old
+     * register form - which is why `fallback_reg` is a required
+     * parameter and not an assumption.
+     *
+     * EVERY tag store goes through here. There were four sites writing
+     * rsi/r8 by hand; a fifth added later would have missed the
+     * immediate silently, and this file has lost that bet three times
+     * already this task.
+     */
+    void store_type_tag(int32_t disp, const void *tag, uint8_t fallback_reg)
+    {
+        if (ml_lowmem_fits_imm32(tag))
+            store_imm64_as_imm32(
+                disp, static_cast<uint64_t>(
+                          reinterpret_cast<uintptr_t>(tag)));
+        else
+            store(fallback_reg, disp);
+    }
     /* mov <dst>, <src>  (GP reg-reg, both 0-15) */
     void mov_rr(uint8_t dst, uint8_t src)
     {
@@ -1135,7 +1187,7 @@ struct Emitter {
     void flush_cache()
     {
         for (const CacheEnt &c : cache) {
-            store(6 /*rsi = t_int*/, c.type);
+            store_type_tag(c.type, jit_layout().t_int, 6);
             store(c.reg, c.payload);
         }
         /* the float pins: t_float rides in r8, which is live in any
@@ -1143,11 +1195,14 @@ struct Emitter {
          * so run_has_float set it at entry and every helper-call
          * epilogue re-materialises it) */
         for (const CacheEnt &c : fcache) {
-            store(8 /*r8 = t_float*/, c.type);
+            store_type_tag(c.type, jit_layout().t_float, 8);
             fstore(c.reg, c.payload);
         }
         for (const TypedEnt &t : tflush)
-            store(t.flt ? 8 : 6, t.type);   /* C3: restore the singleton */
+            store_type_tag(t.type,
+                           t.flt ? jit_layout().t_float
+                                 : jit_layout().t_int,
+                           t.flt ? 8 : 6);   /* C3: restore the singleton */
     }
     /* The inverse: re-load every pinned slot's payload from memory. Used with
      * flush_cache to BRACKET an op that reads or writes frame slots the emitter
@@ -1671,10 +1726,6 @@ struct Emitter {
     void cmp_rax_r8()  { u8(0x4C); u8(0x39); u8(0xC0); }
     void cmp_rax_rsi() { u8(0x48); u8(0x39); u8(0xF0); }
     /* mov [rbx+disp], r8  (store t_float as a slot's type) */
-    void store_r8_type(int32_t d)
-    {
-        u8(0x4C); u8(0x89); u8(MODRM_SLOT); u32(uint32_t(d));
-    }
     /* movabs r8, imm64 (REX.WB) */
     void movabs_r8(uint64_t imm)
     {
@@ -5402,13 +5453,13 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
         e.load(RAX, a.payload);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch8(jb_fast, e.pos());           /* fast: */
-        e.store(RSI, a.type);                 /* the int Type singleton */
+        e.store_type_tag(a.type, jit_layout().t_int, RSI);
         e.store(src_reg, a.payload);
         e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
     if (!e.telided(dst, /*flt=*/false))
-        e.store(RSI, a.type);    /* the int Type singleton */
+        e.store_type_tag(a.type, jit_layout().t_int, RSI);
     e.store(src_reg, a.payload);
 }
 
@@ -5434,14 +5485,16 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
                           dst, src_reg);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch8(jb_fast, e.pos());           /* fast: */
-        e.movabs(RCX, tb);
-        e.store(RCX, a.type);
+        /* #96: the bool tag as an IMMEDIATE - this used to burn a
+         * `movabs RCX` per store purely to have a register to store
+         * FROM, so the immediate form removes an instruction here
+         * rather than merely relocating one. */
+        e.store_type_tag(a.type, reinterpret_cast<const void *>(tb), RCX);
         e.store(src_reg, a.payload);
         e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
-    e.movabs(RCX, tb);
-    e.store(RCX, a.type);
+    e.store_type_tag(a.type, reinterpret_cast<const void *>(tb), RCX);
     e.store(src_reg, a.payload);
 }
 
@@ -7436,13 +7489,13 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
             e.fload(xr, a.payload);   /* reload into the RESULT register */
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch8(jb_fast, e.pos());           /* fast: */
-        e.store_r8_type(a.type);
+        e.store_type_tag(a.type, jit_layout().t_float, 8);
         e.fstore(xr, a.payload);
         e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
     if (!e.telided(dst, /*flt=*/true))
-        e.store_r8_type(a.type);          /* type = t_float */
+        e.store_type_tag(a.type, jit_layout().t_float, 8);
     e.fstore(xr, a.payload);              /* payload = the double */
 }
 
