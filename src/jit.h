@@ -892,6 +892,8 @@ extern "C" unsigned long g_jit_sfield_checked;
 extern "C" unsigned long g_jit_store2_fast;   /* #95: nested-store tier */
 extern "C" unsigned long g_jit_elem_slice_fast; /* #95: slice-read arms */
 extern "C" unsigned long g_jit_fwd;           /* lever A: fwd consumers */
+/* lever A: ref-listed dead-temp writes skipped on C5's proof (#95) */
+extern "C" unsigned long g_jit_fwd_skip_rel;
 extern "C" unsigned long g_jit_hoist;         /* C1: hoisted-nav entries */
 extern "C" unsigned long g_jit_hoist_rmw;     /* C1e: hoisted-COMPOUND
                                                * element stores (the RMW
