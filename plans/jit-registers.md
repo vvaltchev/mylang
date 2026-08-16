@@ -1,6 +1,14 @@
 # JIT registers: kill the pins, then allocate
 
-Status: **STEP 1 LANDED (the slots base); step 2 (the allocator) next.**
+Status (2026-08-15): **steps 1 and 2a LANDED; 2b's ranking half was
+built and REVERTED as inert; 2b's cache-awareness arc is DONE for
+locals; step 2c - the real allocator - is REFRAMED BY MEASUREMENT and
+UNBUILT.** The short version of the reframe: the existing cache already
+holds the hot LOCALS (177 pinned / 25 lost over the corpus), and the
+remaining traffic - **~16 data references per iteration of a pure int
+loop, against C++'s ~0.05** - is in the TEMPS, which the N5 rule
+excludes. That exclusion is a property of the fragment-wide PIN model,
+not of temps; live ranges dissolve it. See "Step 2c" below.
 Direction set by the maintainer
 2026-08-01: *"minimize the number of pinned registers, ideally to 0 but 1
 is also acceptable. All the other ones should be allocated depending on
@@ -284,25 +292,135 @@ the site is.
 Recorded rather than kept, because shipping a measurable-but-negative
 change that provably does not do its job is worse than a written finding.
 
-## Step 2c - a real fragment register allocator (unchanged plan)
+## Step 2c - THE ALLOCATOR: REFRAMED BY MEASUREMENT (2026-08-15)
 
-Replace `pick_cached_slots` (which picks at most two int locals by a
-heuristic) with linear-scan allocation over the run's live ranges:
+The old sketch here said "linear-scan over live ranges, and keep the N5
+rule: only LOCALS, never TEMPS". **Both halves are now known to be wrong
+about where the work is.** What follows replaces it.
 
-  - compute live ranges per slot over the fragment's instruction span
-    (the codegen already has `visit_use_def`, the audited use/def
-    enumeration - reuse it, do not write a second one);
-  - allocate from the free pool; on pressure, spill the range with the
-    furthest next use back to its frame slot and reload on demand;
-  - at every exit, flush live registers to their slots - `exit_pc`
-    already does exactly this for the two cached ones (`flush_cache`), so
-    the mechanism exists and generalizes;
-  - keep the N5 SOUNDNESS rule: only resolved LOCALS may live in
-    registers, never TEMPS. A temp is scratch the VM reuses across run
-    boundaries (an int inside one run, a foreach snapshot or slice temp
-    between runs), so an eager entry-load/exit-flush would overwrite a
-    live container with an int and its type tag. That corruption was a
-    FUZZER find, not an -rt one - see plans/archived/native-aot.md N5.
+### The measurement that reframes it
+
+Data references (cachegrind `--cache-sim=yes`), release lane, scale 1:
+
+| bench | MyLang D refs | C++ D refs | ratio |
+|---|---|---|---|
+| 03_int_arith | **16,340,036** (6.5M rd + **9.8M wr**) | 48,553 | **336x** |
+| 08_func_call | 12,288,236 (4.2M rd + 8.1M wr) | 48,553 | 253x |
+
+03_int_arith runs ~1M iterations, so that is **~16 data references per
+iteration of a pure int loop** against C++'s ~0.05. This is the single
+largest measured gap in the project, it is squarely in the category that
+reliably WINS here (memory traffic - see plans/cpp-gap-ladder.md), and
+**more of it is WRITES than reads**, which is the tell: every op stores
+its result back to a frame slot, and an int store is TWO writes (payload
++ type tag).
+
+### It is NOT the locals. It is the TEMPS.
+
+Reading 03_int_arith's emitted loop (`-vdj`, the disassembler renders
+slots by name) shows the three locals `acc`, `i`, `N` already living in
+r12/r13/r14 - the N5 cache is doing its job. What round-trips through
+memory is `r4`, `r5`, ... - the TEMPS:
+
+        mov  rcx, r4.type          ; a type-tag load on a temp
+        mov  rcx, [rcx+0x8]
+        cmp  rcx, 8
+        lea  rdi, r4               ; &slot handed to a helper
+
+The corpus audit agrees from the other side: **177 pinned / 25 lost**,
+and ~6 of the 25 are float slots an int cache could never take. The
+LOCAL side is at its ceiling. Nothing in the audit can see temps,
+because a temp is never a candidate.
+
+### Why temps were excluded, and why that reason does not survive
+
+The N5 rule says a temp may never be cached, because "a temp is scratch
+the VM reuses across run boundaries (an int inside one run, a foreach
+snapshot or a slice temp between runs), so an eager entry-load /
+exit-flush would overwrite a live container with an int and its type
+tag" - a FUZZER find, recorded in plans/archived/native-aot.md N5.
+
+**That is a property of the PIN model, not of temps.** An N5 pin is
+fragment-wide: load at entry, flush at every exit. It therefore touches
+the slot at moments when the temp legitimately holds something else.
+
+A LIVE-RANGE allocation does not. A temp's range is almost always
+`[def, last use]` INSIDE one run - one op produces it, the next consumes
+it. Allocate only over that range, with **no entry load and no exit
+flush outside it**, and the slot is never read or written at a moment
+when its type is unknown. The soundness objection disappears, and it
+disappears exactly where the traffic is.
+
+This is the same shape as #94's borrow: the old rule was sound but
+stated over the wrong unit (there, "the whole chunk's ref_slots"; here,
+"the whole fragment").
+
+### The three tiers, in increasing order of proof obligation
+
+**T1 - INT/FLOAT TEMPS with a within-run live range.** The bulk of the
+16 refs/iteration. A temp defined and consumed inside one run needs no
+slot at all: it is a virtual register. Predicted saving: the payload
+store, the type-tag store (C3 already elides that for qualified LOCALS -
+`Emitter::tflush`; temps got only the FLOAT half, C3 inc 3), and the
+reload. **Estimate the ceiling from the `-vdj` count before building.**
+
+**T2 - SPILL/RELOAD instead of disqualification.** Today `bad()` removes
+a slot from the pool for the WHOLE fragment if any op needs it in memory.
+With live ranges the answer is to split the range and spill around that
+one op. NOTE step 2b already measured the naive form of this - flush the
+one operand at the emit - and it landed on ZERO (23_dict_insert -0.42%,
+46_matrix_mult +0.27%, others ~0). So T2 is only worth building if T1's
+range splitting makes it free, and it must be measured separately.
+
+**T3 - REFERENCES IN REGISTERS (the maintainer's second ask).** A
+reference-typed value is a `shobj` pointer plus `off`/`len`/`slice`; the
+reason it cannot simply live in a register is the REFCOUNT - a register
+copy does not retain, and the frame slot is what the release scan walks.
+
+**#94 is exactly the missing proof.** A BORROWED reference is one the
+escape analysis proved cannot outlive the call, bound with no retain
+and abandoned rather than released at the pop - i.e. a reference whose
+refcount is somebody else's problem for the whole of its lifetime. That
+is precisely the condition under which its pointer is just a value and
+may live in a register. Two sub-cases, in order:
+  - a borrowed ARGUMENT slot the callee only READS (the #94 bit already
+    proves non-escape; `frame_release` already knows not to release it);
+  - a loop-invariant container LOCAL (`a` in `a[i]`), where the owner is
+    the caller's slot for the whole loop. Check first whether the C1
+    navigation hoist (`jit_hoist_c1`) already covers the shape - it
+    hoists per-loop navigation and may leave nothing to win.
+
+T3 must NOT precede T1: it has the hardest soundness argument and the
+smallest measured traffic.
+
+### What to build first, and the gate before building it
+
+1. **MEASURE THE CEILING.** For 03_int_arith and 08_func_call, count from
+   `-vdj` how many per-iteration frame accesses are to temps with a
+   within-run live range. Multiply by the iteration count and compare
+   against the 16 refs/iteration total. That number is T1's ceiling, and
+   per plans/cpp-gap-ladder.md it must be stated BEFORE any code is
+   written. If it is not most of the 16, stop and re-plan.
+2. **T1 for a single shape**: a temp defined and consumed by adjacent
+   int ops inside one run. Reuse `visit_use_def` for the ranges - it is
+   the audited use/def enumeration and a second one would rot (the
+   audit-table trap).
+3. Only then widen, and only on wall-clock evidence.
+
+### Interaction with what already exists - do not rebuild these
+
+  - **`visit_use_def`** (codegen.cpp) is the audited use/def
+    enumeration. USE IT. A new opcode must already join it.
+  - **lever A (`fwd`)** already forwards a value between ADJACENT ops in
+    a register, skipping the slot entirely. T1 is the general form of
+    lever A; measure how much lever A already captures before assuming
+    T1's ceiling is the full 16.
+  - **C3 (`telide`)** already elides the per-write type store for
+    qualified locals and for float temps. T1 subsumes it for the temps
+    it takes; keep them consistent or the tflush bookkeeping diverges.
+  - **`exit_pc` / `flush_cache`** is the single exit point for all ~101
+    exits, and the mechanism generalizes; **12 raw `u8(0xC3)` returns**
+    are NOT covered by it and must be enumerated, not pattern-matched.
 
 ## Testing protocol (both steps)
 
