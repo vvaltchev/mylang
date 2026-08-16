@@ -1836,6 +1836,15 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         d.fast_bind = r.boolv();
         has_chunk[i] = r.boolv();
         d.decl = nullptr;                      /* compile-only back-pointer */
+        /* Rebuild the bind plan from the params just read: bind_req is
+         * DERIVED and not stored, and recomputing fast_bind beside it makes
+         * the stored flag a free cross-check of the params round trip. */
+        {
+            const bool stored = d.fast_bind;
+            compute_bind_flags(&d);
+            ML_CHECK(d.fast_bind == stored);
+            (void)stored;              /* ML_CHECK compiles out at ASSERTS=0 */
+        }
     }
 
     /* chunks: root, then the descriptors' (same order as written) */

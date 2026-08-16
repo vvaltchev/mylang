@@ -1689,13 +1689,8 @@ std::string disassemble_program(const Block *root)
      * gates on it (a typed param needs the coercing bind, which a MoveV is
      * not) - so it must be set here too, or a -vd dump would decline an
      * inline that execution performs. */
-    for (const FuncDeclStmt *fn : funcs) {
-        bool fast = true;
-        for (const auto &p : fn->desc->params)
-            if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
-                fast = false;
-        fn->desc->fast_bind = fast;
-    }
+    for (const FuncDeclStmt *fn : funcs)
+        compute_bind_flags(fn->desc);
 
     /* THE SPLICE, before the jit pass, exactly as vm_precompile_all does -
      * otherwise -vd would dump the un-inlined bytecode and lie about what

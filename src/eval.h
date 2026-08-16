@@ -489,6 +489,10 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
  * See eval.cpp. */
 EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float);
 
+/* The ONE derivation of a function's bind plan: `fast_bind` + `bind_req`
+ * (funcdesc.h). Every site that needs either calls this. */
+void compute_bind_flags(const FuncDescriptor *d);
+
 /* The never-throwing append core (arr.cpp.h) shared by builtin_append and
  * the VM's AppendV: true = appended (flat or general, hash maintained);
  * false = take the full builtin path (errors/odd shapes, proper carets). */

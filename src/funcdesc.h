@@ -152,6 +152,28 @@ struct FuncDescriptor {
     mutable bool fast_bind = false;
 
     /*
+     * G1: for a NON-fast_bind function, the Type singleton each parameter's
+     * bind-time coercion requires - `t_int` for a param declared `int`,
+     * `t_float` for `float`, null for one that needs no coercion. Empty when
+     * `fast_bind` holds (nothing reads it then).
+     *
+     * `coerce_to_decl_type` is the IDENTITY when the value already has that
+     * type, which is what the inferencer normally produces, so an emitted
+     * caller can check the argument against this and use the plain copy -
+     * instead of declining the whole call to the C++ tier, which is what a
+     * single `int`-annotated parameter used to cost (measured 1.61x on an
+     * otherwise identical closure call). A widening argument (bool into int,
+     * int into float) and a `none` still go the slow way; they are correct,
+     * just not fast.
+     *
+     * DERIVED with `fast_bind` by compute_bind_flags (eval.cpp) - the ONE
+     * place that reads `decl_type`, so the flag and this array cannot drift
+     * apart. Not serialized: a loaded image recomputes both, and ML_CHECKs
+     * the recomputed flag against the stored one.
+     */
+    mutable std::vector<const void *> bind_req;
+
+    /*
      * COMPILE-TIME / tree-walker back-pointer to the owning decl (body eval,
      * func_expr_body fast path, REPL :show). NULLED by the debug AST teardown
      * (mylang.cpp) - after it, only chunk execution remains. Never serialized.

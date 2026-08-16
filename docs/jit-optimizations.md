@@ -2472,3 +2472,61 @@ Measured (callgrind Ir, `OPT=1 ASSERTS=0`), on top of increment 1: probe
 caller fragment 147 -> 138 Ir/call (**-6.12%**); 10_recursion_deep -3.40%,
 11_closure_counter -2.23%, 63_closures -1.85%, 76_funcval_dispatch -0.90%,
 09_fib -0.09%; nine unrelated benches flat.
+
+## G1 increment 3 (2026-08-07): the coercing bind goes inline
+
+**An `int`/`float`-declared parameter used to decline the ENTIRE inline push
+to the C++ tier, and that measured 1.61x** on the same closure called two
+million times with only the annotation changed (742.6M Ir for `dyn k`,
+1194.6M for `int k`; `jit_call_sync_core` was 180M of the difference). So the
+language's own encouragement - annotate your parameters - made every call to
+such a function 61% more expensive.
+
+`coerce_to_decl_type` is the IDENTITY when the value already has the declared
+type, which is what the inferencer produces. `FuncDescriptor::bind_req` names
+that requirement per parameter (`t_int`/`t_float`, null for none), populated
+only when `fast_bind` is false; the emitted push tests `fast_bind` as before,
+and on the false arm requires each argument to already hold its parameter's
+type before falling into the SAME copy loop. A widening (bool into int, int
+into float), a `none`, or a wrong type still declines - correct, just slower,
+because the conversion would have to happen in the copy loop, which runs
+AFTER the record is pushed and so can no longer decline.
+
+The coercing callee is deliberately NOT cached: increment 2's cache
+re-establishes DESCRIPTOR properties, and this one depends on ARGUMENT VALUES.
+
+**One derivation, four callers.** `fast_bind` was recomputed inline at three
+sites and now something else must agree with it - the audit-table trap in
+miniature - so `compute_bind_flags` (eval.cpp) is the ONE reader of
+`decl_type`. The fourth caller is the .myv reader: `bind_req` is derived and
+unstored, and recomputing `fast_bind` beside it makes the stored byte a free
+ML_CHECKed cross-check of the param round trip.
+
+### RULE: a guard that is TOO STRICT is invisible to every correctness net
+
+Swapping the required types (an `int` param demanding `t_float`) makes every
+call decline - which is CORRECT, so the 5-mode differential, the corpus, the
+fuzzer and the lever matrix are all green on it. Only `g_jit_bind_coerce`
+sees it: `is ZERO after the whole suite - the lever is dead or untested`.
+Whenever a new tier's failure mode is "declines more than it should", the
+emitted-code counter is not a nicety, it is the ONLY net.
+
+The other sabotage - dropping the per-argument check - fails the JIT-ON
+differential modes (1534/1535) while the headline stays 1753/1753, the
+documented VM-only shape.
+
+Measured: q_int 1194.6M -> 602.6M (**-49.56%**, 597 -> 301 Ir per call), now
+FASTER than the `dyn` twin; q_dyn and the zero-arg probe byte-flat.
+**bench/ is flat on all 14 call-heavy and control benches** - and that is a
+finding about bench/: no benchmark annotates a parameter on a call-heavy
+path, so the suite cannot see a 1.61x that any annotated program pays.
+
+**SIBLING NOT TAKEN**: a WIDENING argument (`func f(float x)` called as
+`f(i)` with an int `i`) still declines every call - `g_jit_bind_coerce` reads
+0 for a loop of exactly that, against 100 for the exact-type twin. A widening
+is TOTAL (it cannot throw) so it could be inlined, but the conversion has to
+live in the COPY LOOP, which runs after the record is pushed; the guard would
+then have to accept a SET of types per parameter and the copy loop would need
+a conversion arm - two emitted pieces instead of one. The only genuinely
+un-inlinable residue is the NARROWING throw (a float into an `int` param),
+which raises before the frame exists.

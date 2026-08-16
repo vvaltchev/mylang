@@ -235,7 +235,9 @@ struct JitPushLayout {
               rec_dyiter_base, rec_boundary, rec_sync_stop,
               rec_cache_key, rec_caller_cache;
     /* FuncDescriptor */
-    ptrdiff_t desc_params, desc_frame_size, desc_fast_bind;
+    /* desc_bind_req: FuncDescriptor::bind_req (vector; data at +0) - the
+     * per-parameter required Type singleton, read only when !fast_bind */
+    ptrdiff_t desc_params, desc_frame_size, desc_fast_bind, desc_bind_req;
     size_t param_desc_size;
     /* Chunk (ck_plain_frame: the DERIVED byte flag that already means
      * "no trys, no dict iters, no dyn iters" - one test for three) */
@@ -831,6 +833,9 @@ extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
  * by EMITTED code on the hit arm only (a miss falls into the full chain). */
 extern "C" unsigned long g_jit_callee_cache;
 extern "C" unsigned long g_jit_callee_cache2;
+/* G1: inline pushes made to a callee with an int/float-declared param - the
+ * shape that used to decline to the C++ tier outright. */
+extern "C" unsigned long g_jit_bind_coerce;
 extern "C" unsigned long g_jit_sync_inline;
 extern "C" unsigned long g_jit_entry_resume;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -

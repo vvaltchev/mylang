@@ -287,8 +287,15 @@ whole call model reads it, never an AST node.
         bool  cache_results
         bool  pure_ctx
         bool  is_template_base
-        bool  fast_bind
+        bool  fast_bind             see the note below
         bool  has_chunk             false for a dead template base
+
+    NOTE on fast_bind: the reader RECOMPUTES it from the params it just
+    read (compute_bind_flags, eval.cpp) and ML_CHECKs the result against
+    the stored byte - so the field doubles as a cross-check of the param
+    round trip. Its companion `bind_req` (the per-param bind-time coercion
+    target) is DERIVED from the same read and is deliberately NOT stored,
+    like every other derived pool in this format.
 
     Param:
         uid   name

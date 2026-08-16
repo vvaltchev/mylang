@@ -3374,6 +3374,44 @@ EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float)
 }
 
 /*
+ * THE ONE place that turns a function's parameter list into its bind plan.
+ * Sets `fast_bind` (no parameter needs coercion, so a bind is a plain copy)
+ * and, when it does not hold, `bind_req` - the Type singleton each parameter
+ * requires for the copy to still be exact (see FuncDescriptor::bind_req).
+ *
+ * It exists as ONE function because the two are derived from the SAME read of
+ * `decl_type` and there are four callers (vm_bind_chunk, vm_precompile_all's
+ * pass A, the -vd dump's splice pass, and the .myv reader). The flag used to
+ * be recomputed inline at three of them; a fourth consumer that had to agree
+ * with it is exactly the shape CLAUDE.md's audit-table trap warns about.
+ */
+void compute_bind_flags(const FuncDescriptor *d)
+{
+    bool fast = true;
+
+    for (const auto &p : d->params)
+        if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+            fast = false;
+
+    d->fast_bind = fast;
+    d->bind_req.clear();
+
+    if (fast)
+        return;                     /* nothing reads bind_req then */
+
+    d->bind_req.reserve(d->params.size());
+
+    for (const auto &p : d->params) {
+        const void *req = nullptr;
+        if (p.decl_type == DeclType::i)
+            req = EvalValue(static_cast<int_type>(0)).get_type();
+        else if (p.decl_type == DeclType::f)
+            req = EvalValue(static_cast<float_type>(0)).get_type();
+        d->bind_req.push_back(req);
+    }
+}
+
+/*
  * VM P2/P4: native SUBSCRIPT element store `c[k] = v` / `c[k] OP= v` for a dict
  * (P2) OR a general array (P4). `base_lv` = the container's LValue (a slot),
  * `key`/`value` the pre-evaluated operands (an int index for an array, any key
