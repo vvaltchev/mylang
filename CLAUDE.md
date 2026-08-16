@@ -319,6 +319,27 @@ RULE 2 divergence, latent in 8 corpus programs (bytecode changed,
 output did not). **When you change HOW a construct lowers, re-audit
 every table that classifies its OPCODE** - the entry does not have to
 be edited to become false.
+**⛔ AND A FOURTH SHAPE, THE CHEAPEST TO PREVENT: THE OPTIMIZATION
+WHITELIST NOBODY RE-READ (2026-08-16).** `jit_fwd_producer` /
+`jit_fwd_consumer` (jit.cpp) list the ops lever A may forward a value
+between. They were written over the B1/B2 specialized family as it
+stood - Add/Sub/Mul/And/Or/Xor, RR and RI - and `specialize_arith_ops`
+LATER grew **IntShlRR/RI, IntShrRR/RI** and IntModRI. Nothing
+re-audited the lists, and nothing could notice: an unlisted op simply
+does not forward, so `t = a >> 3; a = a ^ t` - a temp alive for ONE
+instruction - kept paying a type store, a payload store and a reload,
+per shift, per iteration. Admitting the shifts read **-21.0% Ir on
+83_regs_int_40 and -17.97% on 80_regs_int_08**, 11 corpus programs
+changed and every other one byte-identical.
+**The generalisation: a table whose stale entry costs an OPTIMIZATION
+is not self-announcing the way one whose stale entry costs
+CORRECTNESS is** - `verify_chunk` fails the build, this fails
+nothing. So when you ADD AN OPCODE, grep for the opcode lists that
+name its siblings and decide EXPLICITLY for each; and when you add a
+lever, give it a JITSTATS counter so "does it reach a real program?"
+is answerable without reading a disassembly. `g_jit_fwd` was bumped
+from emitted code and registered in NO table - the third counter
+found that way.
 
 **⛔ A HELPER'S REGISTER ABI IS THE EMITTER'S JOB, NOT THE CALLER'S
 (2026-08-05).** THREE bugs in two days were one shape - an implicit

@@ -24343,6 +24343,11 @@ static bool jit_fwd_deadtemp()
         const char *name;
         std::vector<const char *> src;
         long fwd_min;       /* the counter must reach at least this */
+        /* AND at most this, when the shape's forwards are exactly
+         * enumerable (0 = no upper bound). A MINIMUM alone cannot pin a
+         * DECLINE: the shift cases below claim "this op does NOT
+         * forward", and only a ceiling makes that claim testable. */
+        long fwd_max;
     };
     const std::vector<Case> cases = {
       /* the canonical chain: load -> mulRI -> addstep, two forwards per
@@ -24357,7 +24362,7 @@ static bool jit_fwd_deadtemp()
           "    var a = array(n); var i = 0;",
           "    while (i < n) { a[i] = i + 1; i++; }",
           "    return a; }",
-          "print(f(mk(32), 32));" }, 64 },
+          "print(f(mk(32), 32));" }, 64, 0 },
 
       /* the 46_matrix_mult inner shape: elem2 -> mul -> addstep */
       { "nested-read -> mul -> accumulate (the matmul shape)",
@@ -24373,7 +24378,7 @@ static bool jit_fwd_deadtemp()
           "    for (var j = 0; j < 32; j++)",
           "        s += m[j % 4][j % 8] * w[j % 8];",
           "    return s; }",
-          "print(f(mk(4), mk(1)[0]));" }, 32 },
+          "print(f(mk(4), mk(1)[0]));" }, 32, 0 },
 
       /*
        * The SLOW-PATH REJOIN: a negative index declines the load to the
@@ -24392,7 +24397,51 @@ static bool jit_fwd_deadtemp()
           "    var a = array(n); var i = 0;",
           "    while (i < n) { a[i] = i + 1; i++; }",
           "    return a; }",
-          "print(f(mk(32), 32));" }, 32 },
+          "print(f(mk(32), 32));" }, 32, 0 },
+
+      /*
+       * THE SHIFT FAMILY, which the whitelist did not know until
+       * 2026-08-16 (the audit-table stage trap: the list predates
+       * specialize_arith_ops growing IntShl/IntShr). Three distinct
+       * arms per iteration, so the count attributes them:
+       *   `a >> 3` feeding `+`  - the shift as PRODUCER, temp at the
+       *                           consumer's `a` position;
+       *   `s << 2` feeding `^`  - producer again, temp at `b`, which
+       *                           takes the commutative SWAP;
+       *   `s >> k` feeding `+`  - the REGISTER-count form, whose
+       *                           negative-count arm raises.
+       * The trailing `(a + k) % 7` is an IntAddModRI, deliberately NOT
+       * a producer (its result is in RDX on the idiv path), so it must
+       * contribute nothing - 3 x 8, not 4 x 8.
+       */
+      { "shift producers: >>/<< feed the next int op (3 forwards x 8)",
+        { "func f(int a, int n) {",
+          "    var s = 0;",
+          "    for (var k = 0; k < n; k++) {",
+          "        s = s + (a >> 3);",
+          "        s = s ^ (s << 2);",
+          "        s = s + (s >> k);",
+          "        s = s + ((a + k) % 7); }",
+          "    return s; }",
+          "print(f(runtime(12345), 8));" }, 24, 24 },
+
+      /*
+       * The two CONSUMER arms the shape above cannot reach:
+       *   `a << (k + 1)` - the temp is the shift COUNT, so it is moved
+       *                    aside into RCX before the value loads (a
+       *                    shift is not commutative - no swap);
+       *   `(s * 3) % 7`  - IntModRI consuming a forwarded operand `a`.
+       * IntModRI is not a producer, so the following addstep gets
+       * nothing: 3 per iteration x 6, not 4.
+       */
+      { "shift COUNT + mod consumer (3 forwards x 6)",
+        { "func f(int a, int n) {",
+          "    var s = 1;",
+          "    for (var k = 0; k < n; k++) {",
+          "        s = s + (a << (k + 1));",
+          "        s = s + ((s * 3) % 7); }",
+          "    return s; }",
+          "print(f(runtime(3), 6));" }, 18, 18 },
     };
 
     bool ok = true;
@@ -24408,6 +24457,11 @@ static bool jit_fwd_deadtemp()
         if (fwd < static_cast<unsigned long>(c.fwd_min)) {
             cout << "  fwd [" << c.name << "]: forwarded " << fwd
                  << " < expected " << c.fwd_min << "\n";
+            ok = false;
+        }
+        if (c.fwd_max && fwd > static_cast<unsigned long>(c.fwd_max)) {
+            cout << "  fwd [" << c.name << "]: forwarded " << fwd
+                 << " > expected " << c.fwd_max << "\n";
             ok = false;
         }
     }

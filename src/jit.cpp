@@ -5209,6 +5209,29 @@ static bool jit_fwd_producer(const Instr &in, int &dst)
     case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
     case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
     case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+    /*
+     * ⛔ THE SHIFTS BELONG HERE AND WERE MISSING - the AUDIT-TABLE STAGE
+     * TRAP again (CLAUDE.md). This whitelist was written over the B1/B2
+     * family as it stood; `specialize_arith_ops` later grew IntShl/IntShr
+     * (and IntModRI), and nothing re-audited it. The cost was silent and
+     * exactly the shape lever A exists to remove: `t = a >> 3; a = a ^ t`
+     * - a temp alive for ONE instruction - paid a type store, a payload
+     * store and a reload, per shift, per iteration. bench/my/80_regs_int_08
+     * has eight of those pairs in its loop.
+     *
+     * They satisfy the producer contract verbatim: the result is in RAX at
+     * the op's exit, and the ONLY slow tier (a negative register count)
+     * RAISES and leaves the fragment - it never rejoins with a stale RAX,
+     * which is the condition the LoadElem* producers needed a reload for.
+     *
+     * SIBLING CASES STILL OUT (deliberate, not overlooked): IntModRI and
+     * IntAddModRI leave the remainder in RDX on the idiv path and in RAX
+     * on the div-magic one, so admitting them means normalising the result
+     * register first. They are consumers below, where the operand side has
+     * no such split.
+     */
+    case OpCode::IntShlRR: case OpCode::IntShrRR:
+    case OpCode::IntShlRI: case OpCode::IntShrRI:
     case OpCode::LoadElemInt:
     case OpCode::LoadElem2Int:
         dst = in.target;
@@ -5274,6 +5297,33 @@ static bool jit_fwd_consumer(const Instr &nx, int t)
     case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
     case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
         return nx.a_slot() == t;
+    /* the shift family (see the producer note): BOTH operand positions
+     * are forwardable. The RI/RR split is not load-bearing here - the
+     * emit itself branches on `b_is_lit()`, not on the opcode - so one
+     * arm covers all four and cannot disagree with it. */
+    case OpCode::IntShlRR: case OpCode::IntShrRR:
+    case OpCode::IntShlRI: case OpCode::IntShrRI:
+        return nx.a_slot() == t
+            || (!nx.b_is_lit() && nx.b_slot() == t);
+    /* IntModRI / IntAddModRI: operand `a` only. `a` is the FIRST thing
+     * either emit loads. IntAddModRI's `b` goes through load_operand
+     * and would need the move-aside the shifts do; not worth it for the
+     * one shape (`(x + k) % m`) it appears in.
+     *
+     * The `b` clause is the contract's "any other field naming the temp
+     * reads the SLOT, which skip_write may have left stale": `(t + t) % m`
+     * would name t at both positions and forwarding only `a` would leave
+     * load_operand reading a slot the producer never wrote.
+     *
+     * ⛔ IT IS DEFENSIVE, NOT PROVEN, and saying so is the point. No test
+     * reaches it and none can today: `fold_int_arith` rewrites `t + t`
+     * into `t * 2` before codegen, so IntAddModRI never gets the same
+     * temp twice, and IntModRI's `b` is a literal by construction. The
+     * clause costs one compare at JIT time and is what keeps the
+     * predicate honest if either of those two facts changes. */
+    case OpCode::IntModRI: case OpCode::IntAddModRI:
+        return nx.a_slot() == t
+            && (nx.b_is_lit() || nx.b_slot() != t);
     case OpCode::IntAddStep:
         /* the accumulate VALUE only; the accumulator, the counter and a
          * slot bound all read their SLOTS */
@@ -5700,6 +5750,12 @@ void jit_stats_report()
         { "bind_coerce",      &g_jit_bind_coerce },
         { "bind_widen",       &g_jit_bind_widen },
         { "ref_arg_binds",    &g_jit_ref_arg_binds },
+        /* lever A: `fwd` is the EMITTED-code proof that a forwarded
+         * consumer RAN (it was bumped but never reported - so the one
+         * question the counter exists to answer, "does this lever reach
+         * a real program?", could be asked only from inside -rt);
+         * `fwd_skip_rel` is the narrower C5-discharged write-skip. */
+        { "fwd",              &g_jit_fwd },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
         { "str_probe_ok",     &g_jit_str_probe_ok },
         { "ord_inline",       &g_jit_ord_inline },
@@ -8702,7 +8758,23 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::IntShlRI: case OpCode::IntShrRI: {
         const bool shl =
             in.op == OpCode::IntShlRR || in.op == OpCode::IntShlRI;
-        read_slot(e, RAX, in.a_slot());
+        /*
+         * Lever A, the CONSUMER side. A shift is NOT commutative, so a
+         * forwarded COUNT cannot use the arith family's swap: it has to
+         * be moved aside into RCX before the value is loaded. That still
+         * trades a `mov` for a slot load, and the value-side case - by
+         * far the common one, `t = a >> k; a = a ^ t` - costs nothing.
+         * Both positions forwarded means the temp shifts itself.
+         */
+        const int fin = g_fwd.in_rax;
+        const bool fa = fin >= 0 && in.a_slot() == fin;
+        const bool fb = fin >= 0 && !in.b_is_lit() && in.b_slot() == fin;
+        if (fa || fb)
+            emit_fwd_bump(e);
+        if (fb)
+            e.mov_rr(RCX, RAX);              /* the count, before the value */
+        if (!fa)
+            read_slot(e, RAX, in.a_slot());
         if (in.b_is_lit()) {
             /* imm count: >= 0 by selection; saturate at compile time */
             const int_type c = in.b_lit();
@@ -8719,12 +8791,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(static_cast<uint8_t>(c));
             }
         } else {
-            read_slot(e, RCX, in.b_slot());   /* cache-aware (the classifier
-                                               * counts this shift count as a
-                                               * cacheable int use) */
+            if (!fb)
+                read_slot(e, RCX, in.b_slot());  /* cache-aware (the
+                                                  * classifier counts this
+                                                  * shift count as a
+                                                  * cacheable int use) */
             emit_reg_shift(e, ck, shl ? Op::shl : Op::shr, pc, old_pc);
         }
-        write_slot(e, ck, RAX, in.target, pc);
+        /* lever A, the PRODUCER side - identical to the arith family's.
+         * The negative-count arm above RAISES and leaves the fragment, so
+         * there is no slow-path rejoin that would need RAX reloaded. */
+        const bool fw = g_fwd.prod == in.target;
+        if (!(fw && g_fwd.skip_write))
+            write_slot(e, ck, RAX, in.target, pc);
+        if (fw)
+            g_fwd.armed = true;
         return true;
     }
 
@@ -8734,7 +8815,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * THIS opcode, so a reduction wired only into IntBin reaches
          * every corpus program EXCEPT the ones that motivated it
          * (06_if_branch kept both its idivs - watched). */
-        read_slot(e, RAX, in.a_slot());
+        /* lever A, consumer side (operand `a` only - see the predicate).
+         * NOT a producer: the remainder lands in RDX on the idiv path
+         * and in RAX on the div-magic one. */
+        if (g_fwd.in_rax >= 0 && in.a_slot() == g_fwd.in_rax)
+            emit_fwd_bump(e);
+        else
+            read_slot(e, RAX, in.a_slot());
         DivMagic mg;
         if (div_magic(in.b_lit(), mg)) {
             emit_div_magic(e, mg, in.b_lit(), /*want_mod=*/true);
@@ -8750,7 +8837,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::IntAddModRI: {
-        read_slot(e, RAX, in.a_slot());
+        /* lever A, consumer side (operand `a` only - see the predicate) */
+        if (g_fwd.in_rax >= 0 && in.a_slot() == g_fwd.in_rax)
+            emit_fwd_bump(e);
+        else
+            read_slot(e, RAX, in.a_slot());
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
         op_rr(e, Op::plus);
         {

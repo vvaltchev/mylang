@@ -4746,3 +4746,103 @@ And `lever 4b`'s existing test had to start counting BOTH native tiers
 (`g_jit_op_run[OrdCharV] + g_jit_ord_inline`), because the helper is
 what bumps the former and the inline arm calls nothing - the same
 tier-moved-under-a-counter fix the borrow needed.
+
+## Lever A grows the SHIFT family (2026-08-16, #96)
+
+**A whitelist that went stale, and the cost was silent** - the
+AUDIT-TABLE STAGE TRAP (CLAUDE.md) in the shape that entry exists to
+warn about. `jit_fwd_producer` / `jit_fwd_consumer` (jit.cpp) were
+written over the B1/B2 specialized family as it stood: Add/Sub/Mul/And/
+Or/Xor in their RR and RI forms, plus the two LoadElem producers.
+`specialize_arith_ops` later grew **IntShlRR/RI, IntShrRR/RI** (and
+IntModRI), and nothing re-audited the two lists. Neither is consulted
+by anything that would notice - an unlisted op simply does not forward.
+
+So every `t = a >> k; a = a ^ t` - a temp alive for exactly ONE
+instruction - kept paying the full slot round-trip:
+
+    mov  rax, a0
+    sar  rax, 3
+    mov  r11.type, rsi        ; the temp's TYPE store
+    mov  r11, rax             ; the temp's PAYLOAD store
+    mov  rax, a0
+    mov  rcx, r11             ; ... and the reload, 2 instructions later
+    xor  rax, rcx
+    mov  a0, rax
+
+Eight instructions, three of them memory, for a value that never
+leaves the pair. With the shifts admitted it is five and none:
+
+    mov  rax, a0
+    sar  rax, 3
+    mov  rcx, a0              ; the commutative SWAP - rax already holds t
+    xor  rax, rcx
+    mov  a0, rax
+
+### Why the contract already fits them
+
+The producer contract is "the int result is in RAX at the op's exit, and
+no slow tier rejoins after writing the dst". The shifts satisfy both
+verbatim: `write_slot(RAX, ...)` is the last thing either form emits,
+and the ONLY slow tier - a negative register count - RAISES through
+`emit_raise_convey` and leaves the fragment, so there is no
+stale-RAX rejoin of the kind the LoadElem producers need their reload
+for.
+
+The consumer side needed one new arm. A shift is **not commutative**, so
+a forwarded COUNT cannot use the arith family's swap: it is moved aside
+into RCX before the value loads (`mov rcx, rax`), which still trades a
+`mov` for a slot load. A forwarded VALUE - the common case - costs
+nothing.
+
+**IntModRI / IntAddModRI are CONSUMERS ONLY, deliberately.** Their
+result is in RDX on the idiv path and in RAX on the div-magic one, so
+admitting them as producers means normalising the result register
+first. Their operand `a` is the first thing either emit loads, so the
+consumer half is free.
+
+### Measured (callgrind Ir, `OPT=1 ASSERTS=0` both sides)
+
+| bench | Ir |
+|---|---|
+| 83_regs_int_40 | **-21.01%** |
+| 80_regs_int_08 | **-17.97%** |
+| 33_sort_ints | -0.46% |
+| 68_nested | -0.37% |
+| 45_gcd | -0.24% |
+| 46_matrix_mult | +0.02% (COMPILE time: it emits two `mov` FEWER) |
+
+Reach over bench/ + samples/: **11 programs** change - the four
+`8*_regs_int_*`, plus 33_sort_ints, 34_sort_custom_cmp, 38_min_max,
+45_gcd, 46_matrix_mult, 47_wordcount, 68_nested. Everything else is
+byte-identical, which is the blast radius a whitelist addition should
+have.
+
+### The nets, and the three sabotages watched failing
+
+Two `jit_fwd_deadtemp` cases, both with an EXACT count (the struct
+gained `fwd_max`: a minimum alone cannot pin a DECLINE, and both cases
+assert that the mod op contributes nothing).
+
+  - producer whitelist reverted to its stale state -> `forwarded 0 <
+    expected 24`;
+  - consumer whitelist reverted -> `forwarded 12 < expected 18`;
+  - the count-position move-aside deleted -> a **WRONG VALUE**, caught
+    as a tw-vs-vm divergence rather than a counter miss.
+
+**`g_jit_fwd` is now REPORTED by `MYLANG_JITSTATS`** (`fwd`). It was
+bumped from emitted code and registered nowhere, so the one question
+the counter exists to answer - does this lever reach a real program? -
+could be asked only from inside `-rt`. It reads 16,000,000 on
+80_regs_int_08 (2M iterations x 8 accumulators), 999,999 on
+03_int_arith, 705,602 on 46_matrix_mult. This is the third counter
+found unregistered (`g_jit_ord_inline` was the second); when you add
+one, add its table row in the same edit.
+
+### The sibling cases, so the map is complete
+
+The FLOAT twin (`jit_fwd_fproducer` / `jit_fwd_fconsumer`) has no shift
+to gain - MyLang's shifts are int-only - but it is the same kind of
+list and should be re-read whenever the float family grows.
+IntModRI/IntAddModRI as PRODUCERS is the one remaining int gap, and it
+is a result-register normalisation, not a soundness question.
