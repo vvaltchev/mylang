@@ -340,6 +340,7 @@ Each chunk is:
     N x u32  ref_slots              (signed) slots that may hold a reference
     N x value consts
     N x LocEntry locs               9.2
+    N x LocEntry base_locs          9.2 - the store-BASE carets (v13)
     N x InlineFrame inline_frames   9.3
     N x InlineCtx inline_ctxs       9.3
     N x MemberKey member_keys       9.4
@@ -423,10 +424,12 @@ This is NOT in-format compression: no dictionary, no entropy coding, no
 bit-level packing of values, no decoder state.  Each field is a plain integer
 at a byte boundary, decoded in O(1), and two compiles remain byte-identical.
 
-9.2  LocEntry - the delta-coded loc table
+9.2  LocEntry - the delta-coded loc tables
 
 `locs` maps the pc of an op that can throw to the source span its caret
-covers.  Entries are pc-ascending.  Each is FOUR bytes in the common case:
+covers.  `base_locs` (v13) has the IDENTICAL encoding and holds a container
+store's SECOND caret - see the version note in section 12.  Both are
+pc-ascending, and each entry is FOUR bytes in the common case:
 
     u8    pcd       pc - previous pc            255  = escape
     i8    lined     start.line - previous line  -128 = escape
@@ -787,6 +790,18 @@ same is true of OpCode and Op, which appear in every instruction.)
 
 Version 9 is exactly such a change: deleting the CatchTest and Reraise
 opcodes renumbered every OpCode after them.
+
+Version 13 adds `base_locs`, a second loc table per chunk, written straight
+after `locs` in the identical encoding.  A container store has TWO error
+spans and one table cannot hold both: an out-of-bounds / key / type error
+carets the WHOLE lvalue (`g[0]`, which is what `locs` records and what the
+tree-walker marks), while an UNBOUND-GLOBAL base carets only the base
+identifier (`g`).  Before it, every store form reported the whole subscript
+where the tree-walker reported the name, and the CHAIN stores - whose per-step
+carets live in `chain_locs`, so they record no `locs` entry at all - reported
+NO location, rendering a backtrace that read "line 0".  The table is SPARSE
+(only a store whose base can be a global records one), so a chunk with no such
+store pays the 4-byte count and nothing else.
 
 Version 12 adds the two Locs to the Capture record.  The capture SNAPSHOT
 runs in the FuncObject constructor, which is AST-free by design - it reads

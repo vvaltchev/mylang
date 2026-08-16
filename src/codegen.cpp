@@ -601,6 +601,17 @@ struct Codegen {
         return static_cast<int>(ast_nodes.size()) - 1;
     }
 
+    /*
+     * #127: the handle for a container store's BASE caret (-> Chunk::base_locs,
+     * used by vm_store_base's unbound-global arm). `kind` and `base` come
+     * straight from as_container_base; only kind 1 (GLOBAL) can ever be
+     * unbound, so any other kind records nothing and the table stays sparse.
+     */
+    int add_base_node(int kind, const Construct *base)
+    {
+        return kind == 1 ? add_ast_node(base) : -1;
+    }
+
     /* Pool a value-ABI builtin call's AST-free data (the Builtin + the ArgLocs
      * carets/hint pulled off the DirectBuiltinCallExpr) and return its
      * Chunk::builtin_calls index - so CallBuiltinV carries a serializable index,
@@ -4238,6 +4249,7 @@ struct Codegen {
         CgInstr in;
         in.op = OpCode::StoreLValueChainV;
         in.node_idx = add_ast_node(e->lvalue.get());   /* outer lvalue loc */
+        in.base_node_idx = add_base_node(bkind, cur);  /* #127: base caret */
         in.target = vslot;                             /* value temp */
         in.target2 = bslot;                            /* base slot */
         /* DUAL operand: lo = the chain_steps pool idx, hi = the base kind */
@@ -4350,6 +4362,7 @@ struct Codegen {
         /* extract_locs: the inc-dec span -> the loc side table (the
          * undefined-global-root caret) + inline_ctx; then node-free. */
         in.node_idx = add_ast_node(inc);
+        in.base_node_idx = add_base_node(bkind, root); /* #127: base caret */
         in.target = dst;
         in.target2 = bslot;
         in.set_a(int_lit(bkind));          /* root kind: 0/1/2, 3 = rvalue temp */
@@ -4434,6 +4447,8 @@ struct Codegen {
                     CgInstr in;
                     in.op = OpCode::StoreElemInt;
                     in.node_idx = add_ast_node(sub);   /* subscript loc for OOB (matches TW) */
+                    in.base_node_idx =             /* #127: the base caret */
+                        add_base_node(akind, sub->what.get());
                     in.target = akind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = aslot;
                     in.set_a(idx);
@@ -4465,6 +4480,8 @@ struct Codegen {
                     CgInstr in;
                     in.op = OpCode::DictStore;
                     in.node_idx = add_ast_node(sub);
+                    in.base_node_idx =             /* #127: the base caret */
+                        add_base_node(dkind, sub->what.get());
                     in.target = dkind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = dslot;
                     in.set_a(slot_op(kslot));
@@ -4499,6 +4516,8 @@ struct Codegen {
                 ops.push_back(ld);
                 const Op cop = inc->is_inc ? Op::addeq : Op::subeq;
                 CgInstr in;
+                in.base_node_idx =                 /* #127: the base caret */
+                    add_base_node(bkind, m->what.get());
                 if (m->base_dict) {
                     CgInstr kin;               /* the member name as a string key */
                     kin.op = OpCode::LoadConstV;
@@ -4624,6 +4643,10 @@ struct Codegen {
                     locnodes.push_back(chain[nkeys - 1 - k]);
                 CgInstr in;
                 in.op = OpCode::StoreElemChainV;
+                /* #127: this op records NO `locs` entry (its per-step carets
+                 * live in chain_locs), so without this an unbound-global base
+                 * threw with NO location at all - "line 0" in the backtrace. */
+                in.base_node_idx = add_base_node(bkind, cur);
                 in.target = vslot;
                 in.target2 = bslot;
                 /* DUAL: lo = the chain_locs idx (nkeys = entry size), hi =
@@ -4656,6 +4679,8 @@ struct Codegen {
                 CgInstr in;
                 in.op = OpCode::DictStore;
                 in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
+                in.base_node_idx =                 /* #127: the base caret */
+                    add_base_node(dkind, sub->what.get());
                 in.target = dkind;   /* base kind: 0 local / 1 global / 2 cap */
                 in.target2 = dslot;
                 in.set_a(slot_op(kslot));
@@ -4715,6 +4740,8 @@ struct Codegen {
                                                      sub)
                                                : static_cast<const Construct *>(
                                                      s));
+                        in.base_node_idx =         /* #127: the base caret */
+                            add_base_node(akind, sub->what.get());
                         in.target = akind;   /* 0 local / 1 global / 2 cap */
                         in.target2 = aslot;
                         in.set_a(idx);
@@ -4760,6 +4787,8 @@ struct Codegen {
                 CgInstr in;
                 in.op = OpCode::StoreElemValue;
                 in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
+                in.base_node_idx =                 /* #127: the base caret */
+                    add_base_node(akind, sub->what.get());
                 in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
                 in.target2 = aslot;
                 in.set_a(slot_op(kslot));
@@ -4799,6 +4828,8 @@ struct Codegen {
                 CgInstr in;
                 in.op = OpCode::DictStore;
                 in.node_idx = add_ast_node(m);             /* for its loc (extract_locs) */
+                in.base_node_idx =                 /* #127: the base caret */
+                    add_base_node(dkind, m->what.get());
                 in.target = dkind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = dslot;
                 in.set_a(slot_op(kin.target));
@@ -4825,6 +4856,8 @@ struct Codegen {
                     return false;
                 CgInstr in;
                 in.op = OpCode::StoreMemberV;
+                in.base_node_idx =                 /* #127: the base caret */
+                    add_base_node(skind, m->what.get());
                 in.target = skind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = sslot;
                 in.set_a(int_lit(add_member_key(m)));   /* AST-free: pool index */
@@ -5151,6 +5184,8 @@ struct Codegen {
             in.node_idx = add_ast_node(
                 aop == Op::invalid ? static_cast<const Construct *>(sub)
                                    : static_cast<const Construct *>(s));
+            in.base_node_idx =                 /* #127: the base caret */
+                add_base_node(akind, sub->what.get());
             in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
             in.target2 = aslot;
             in.set_a(idx);
@@ -7177,6 +7212,17 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
          * below never touches it (a fuzzer-caught verify_ast_free abort). */
         const Construct *locnode = node_at(in.loc_node_idx);
         in.loc_node_idx = -1;
+        /*
+         * #127: the store BASE's caret -> base_locs. Read + cleared
+         * UNCONDITIONALLY and BEFORE the `!node` bail, for the same reason the
+         * loc twin above is: a peephole fusion copies the source struct, and a
+         * chain store records a base node with NO node_idx at all. The loop is
+         * pc-ascending, so base_locs comes out sorted.
+         */
+        if (const Construct *bn = node_at(in.base_node_idx))
+            chunk.base_locs.push_back(
+                {static_cast<uint32_t>(pc), bn->start, bn->end});
+        in.base_node_idx = -1;
         if (!node)
             continue;
         /*
@@ -7375,6 +7421,7 @@ static void verify_ast_free(const std::vector<CgInstr> &code)
     for (const CgInstr &in : code) {
         ML_CHECK(in.node_idx == -1);
         ML_CHECK(in.loc_node_idx == -1);   /* #76: the loc twin too */
+        ML_CHECK(in.base_node_idx == -1);  /* #127: the base-caret twin */
         (void)in;
     }
 }
@@ -9285,6 +9332,7 @@ void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
     BcInlineSnapshot s;
     s.code = ck.code;
     s.locs = ck.locs;
+    s.base_locs = ck.base_locs;                        /* #127 */
     s.ref_slots = ck.ref_slots;
     s.slot_count = ck.slot_count;
     s.n_temps = ck.n_temps;
@@ -9314,6 +9362,7 @@ bool bc_inline_chunk(Chunk &ck,
         int dst;                        /* the call's result slot */
         std::vector<Instr> body;        /* SNAPSHOT (self-recursion) */
         std::vector<Chunk::LocEntry> locs;
+        std::vector<Chunk::LocEntry> base_locs;   /* #127 */
         std::vector<int32_t> ref_slots;
         Chunk::InlineFrame frame;
     };
@@ -9363,6 +9412,15 @@ bool bc_inline_chunk(Chunk &ck,
         s.dst = in.target;
         s.body = snap.code;             /* the PRISTINE body (see above) */
         s.locs = snap.locs;
+        /*
+         * #127: UNREACHABLE today and deliberately kept. `bc_inline_op_ok`
+         * whitelists no store op, so a spliced body can hold no base caret -
+         * but the day one is admitted, silently dropping them would be a
+         * caret regression nothing tests (the CALLER half below IS covered,
+         * by "unbound global base survives the bytecode splice"). Same
+         * belt-and-braces reasoning as the branch-past-end check.
+         */
+        s.base_locs = snap.base_locs;
         s.ref_slots = snap.ref_slots;
         /* the virtual frame, built to render EXACTLY as the physical one
          * would (backtrace.cpp's frame_display over the descriptor) */
@@ -9389,12 +9447,19 @@ bool bc_inline_chunk(Chunk &ck,
     /* the caller's own pc -> loc, so a copied op keeps its caret */
     std::vector<Instr> nc;
     std::vector<Chunk::LocEntry> nlocs;
+    std::vector<Chunk::LocEntry> nbase;                /* #127 */
     std::vector<Chunk::InlineEntry> nctx;
     std::vector<char> from_caller;
     std::vector<uint32_t> old2new(ck.code.size() + 1);
 
     const auto caller_loc = [&](size_t pc, Loc &s, Loc &e) -> bool {
         for (const auto &le : ck.locs)
+            if (le.pc == pc) { s = le.start; e = le.end; return true; }
+        return false;
+    };
+    /* #127: the store-base caret rides the splice exactly like the loc. */
+    const auto caller_base_loc = [&](size_t pc, Loc &s, Loc &e) -> bool {
+        for (const auto &le : ck.base_locs)
             if (le.pc == pc) { s = le.start; e = le.end; return true; }
         return false;
     };
@@ -9438,6 +9503,12 @@ bool bc_inline_chunk(Chunk &ck,
                     if (le.pc == j) {
                         bs = le.start; be = le.end; has_loc = true; break;
                     }
+                Loc bbs, bbe;                          /* #127 */
+                bool has_base = false;
+                for (const auto &le : S.base_locs)
+                    if (le.pc == j) {
+                        bbs = le.start; bbe = le.end; has_base = true; break;
+                    }
                 if (S.body[j].op == OpCode::ReturnV) {
                     Instr mv;
                     mv.op = OpCode::MoveV;
@@ -9475,6 +9546,9 @@ bool bc_inline_chunk(Chunk &ck,
                 if (has_loc)
                     nlocs.push_back({ static_cast<uint32_t>(nc.size()),
                                       bs, be });
+                if (has_base)
+                    nbase.push_back({ static_cast<uint32_t>(nc.size()),
+                                      bbs, bbe });
                 nctx.push_back({ static_cast<uint32_t>(nc.size()), fidx });
                 nc.push_back(bi);
                 from_caller.push_back(0);
@@ -9485,6 +9559,8 @@ bool bc_inline_chunk(Chunk &ck,
         Loc s, e;
         if (caller_loc(pc, s, e))
             nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        if (caller_base_loc(pc, s, e))
+            nbase.push_back({ static_cast<uint32_t>(nc.size()), s, e });
         const int32_t f = ck.inline_frame_at(pc);
         if (f >= 0) {
 #ifdef TESTS
@@ -9512,6 +9588,7 @@ bool bc_inline_chunk(Chunk &ck,
 
     ck.code = std::move(nc);
     ck.locs = std::move(nlocs);
+    ck.base_locs = std::move(nbase);                   /* #127 */
     ck.inline_ctxs = std::move(nctx);
     ck.n_temps = next_base - ck.slot_count;
     for (const Site &S : sites)

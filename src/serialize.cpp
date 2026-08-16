@@ -785,6 +785,97 @@ int64_t get_i8_esc(Reader &r)
     return static_cast<int64_t>(static_cast<int32_t>(r.u32v()));
 }
 
+/*
+ * A pc-keyed loc side table in its DELTA-CODED on-disk form - FOUR bytes for
+ * the overwhelmingly common entry, where the fixed
+ * `{u32 pc, u32 line, u32 col, u32 line, u32 col}` record spent 20 (and ~19 of
+ * them zero: over bench/ + samples/, 969 entries, the pc delta never exceeded
+ * 19 and the widest column was 99).
+ *
+ *     pcd   u8  pc - prev_pc                      255  = escape
+ *     lined i8  start.line - prev_line            -128 = escape
+ *     col   u8  start.col                         255  = escape
+ *     ecol  u8  end.col, IMPLYING end.line == start.line
+ *                                                 255  = escape, and then
+ *               the FULL end Loc (i32 line, i32 col) follows
+ *
+ * A byte's reserved value means "did not fit": the value follows as a plain
+ * 4-byte int32 (put_u8_esc / put_i8_esc). So a 100k-line file or a 5000-column
+ * line round-trips EXACTLY - the byte form is an optimization for the common
+ * case, never a cap - at 8-12 bytes for those entries. (Measured: 97.7% of
+ * entries end on the line they start, so folding the end LINE into ecol's
+ * escape pays for itself; only 4 of 969 entries needed any escape at all.)
+ * Worst case, an entry escaping all four fields is 24 bytes vs the old 20 -
+ * unreachable in practice.
+ *
+ * ON-DISK ONLY: the loader rebuilds the same `vector<LocEntry>`, so `loc_at`'s
+ * binary search on the throw path is untouched. Shared by `locs` and
+ * `base_locs` (#127), which differ only in which caret they carry.
+ */
+void write_loc_table(Writer &w, const std::vector<Chunk::LocEntry> &tbl)
+{
+    w.u32v(static_cast<uint32_t>(tbl.size()));
+
+    int64_t prev_pc = 0, prev_line = 0;
+
+    for (const auto &l : tbl) {
+        put_u8_esc(w, static_cast<int64_t>(l.pc) - prev_pc);
+        put_i8_esc(w, static_cast<int64_t>(l.start.line) - prev_line);
+        put_u8_esc(w, l.start.col);
+
+        if (l.end.line == l.start.line
+                && l.end.col >= 0 && l.end.col <= 254) {
+            w.u8v(static_cast<uint8_t>(l.end.col));
+        } else {
+            w.u8v(0xff);
+            w.u32v(static_cast<uint32_t>(l.end.line));
+            w.u32v(static_cast<uint32_t>(l.end.col));
+        }
+
+        prev_pc = static_cast<int64_t>(l.pc);
+        prev_line = l.start.line;
+    }
+}
+
+void read_loc_table(Reader &r, std::vector<Chunk::LocEntry> &tbl,
+                    size_t code_size)
+{
+    const uint32_t n = r.u32v();
+    tbl.reserve(n);
+
+    int64_t prev_pc = 0, prev_line = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::LocEntry l;
+
+        const int64_t pc = prev_pc + get_u8_esc(r);
+        const int64_t line = prev_line + get_i8_esc(r);
+
+        if (pc < 0 || line < 0)
+            bad_image("corrupt .myv (loc delta)");
+
+        l.pc = static_cast<uint32_t>(pc);
+        l.start = Loc(line, get_u8_esc(r));
+
+        const uint8_t ecol = r.u8v();
+
+        if (ecol != 0xff) {
+            l.end = Loc(line, ecol);
+        } else {
+            const int32_t el = static_cast<int32_t>(r.u32v());
+            const int32_t ec = static_cast<int32_t>(r.u32v());
+            l.end = Loc(el, ec);
+        }
+
+        if (l.pc > code_size)
+            bad_image("corrupt .myv (loc pc)");
+
+        prev_pc = pc;
+        prev_line = line;
+        tbl.push_back(l);
+    }
+}
+
 void write_arglocs(Writer &w, const std::vector<ArgLoc> &v)
 {
     w.u32v(static_cast<uint32_t>(v.size()));
@@ -927,55 +1018,12 @@ void write_chunk(Writer &w, const Chunk &c)
         write_value(w, v);
 
     ct("  consts+refslots");
-    /*
-     * locs: DELTA-CODED - FOUR bytes for the overwhelmingly common entry,
-     * where the fixed `{u32 pc, u32 line, u32 col, u32 line, u32 col}` record
-     * spent 20 (and ~19 of them zero: over bench/ + samples/, 969 entries, the
-     * pc delta never exceeded 19 and the widest column was 99).
-     *
-     *     pcd   u8  pc - prev_pc                      255  = escape
-     *     lined i8  start.line - prev_line            -128 = escape
-     *     col   u8  start.col                         255  = escape
-     *     ecol  u8  end.col, IMPLYING end.line == start.line
-     *                                                 255  = escape, and then
-     *               the FULL end Loc (i32 line, i32 col) follows
-     *
-     * A byte's reserved value means "did not fit": the value follows as a
-     * plain 4-byte int32 (put_u8_esc / put_i8_esc). So a 100k-line file or a
-     * 5000-column line round-trips EXACTLY - the byte form is an optimization
-     * for the common case, never a cap - at 8-12 bytes for those entries.
-     * (Measured: 97.7% of entries end on the line they start, so folding the
-     * end LINE into ecol's escape pays for itself; only 4 of 969 entries
-     * needed any escape at all.) Worst case, an entry escaping all four
-     * fields is 24 bytes vs the old 20 - unreachable in practice.
-     *
-     * ON-DISK ONLY: the loader rebuilds the same `vector<LocEntry>`, so
-     * `loc_at`'s binary search on the throw path is untouched.
-     */
-    w.u32v(static_cast<uint32_t>(c.locs.size()));
-    {
-        int64_t prev_pc = 0, prev_line = 0;
-
-        for (const auto &l : c.locs) {
-            put_u8_esc(w, static_cast<int64_t>(l.pc) - prev_pc);
-            put_i8_esc(w, static_cast<int64_t>(l.start.line) - prev_line);
-            put_u8_esc(w, l.start.col);
-
-            if (l.end.line == l.start.line
-                    && l.end.col >= 0 && l.end.col <= 254) {
-                w.u8v(static_cast<uint8_t>(l.end.col));
-            } else {
-                w.u8v(0xff);
-                w.u32v(static_cast<uint32_t>(l.end.line));
-                w.u32v(static_cast<uint32_t>(l.end.col));
-            }
-
-            prev_pc = static_cast<int64_t>(l.pc);
-            prev_line = l.start.line;
-        }
-    }
-
+    write_loc_table(w, c.locs);   /* the DELTA-CODED form; see the fn */
     ct("  locs");
+    /* #127: the store-BASE carets, same delta form (sparse - only a store
+     * whose base can be an unbound global records one). */
+    write_loc_table(w, c.base_locs);
+    ct("  base_locs");
     w.u32v(static_cast<uint32_t>(c.inline_frames.size()));
     for (const auto &f : c.inline_frames) {
         w.strv(f.callee_name);
@@ -1237,43 +1285,8 @@ void read_chunk(Reader &r, Chunk &c)
     for (uint32_t i = 0; i < n; i++)
         c.consts.push_back(read_value(r));
 
-    n = r.u32v();
-    /* locs: the DELTA-CODED form - the field layout and the escape rule are
-     * documented at the write site in write_chunk (the pairing rule). */
-    c.locs.reserve(n);
-    {
-        int64_t prev_pc = 0, prev_line = 0;
-
-        for (uint32_t i = 0; i < n; i++) {
-            Chunk::LocEntry l;
-
-            const int64_t pc = prev_pc + get_u8_esc(r);
-            const int64_t line = prev_line + get_i8_esc(r);
-
-            if (pc < 0 || line < 0)
-                bad_image("corrupt .myv (loc delta)");
-
-            l.pc = static_cast<uint32_t>(pc);
-            l.start = Loc(line, get_u8_esc(r));
-
-            const uint8_t ecol = r.u8v();
-
-            if (ecol != 0xff) {
-                l.end = Loc(line, ecol);
-            } else {
-                const int32_t el = static_cast<int32_t>(r.u32v());
-                const int32_t ec = static_cast<int32_t>(r.u32v());
-                l.end = Loc(el, ec);
-            }
-
-            if (l.pc > c.code.size())
-                bad_image("corrupt .myv (loc pc)");
-
-            prev_pc = pc;
-            prev_line = line;
-            c.locs.push_back(l);
-        }
-    }
+    read_loc_table(r, c.locs, c.code.size());
+    read_loc_table(r, c.base_locs, c.code.size());     /* #127 */
 
     n = r.u32v();
     c.inline_frames.reserve(n);

@@ -1161,8 +1161,9 @@ TWO distinct error carets — the SUBSCRIPT loc for a subscript-internal throw
 (`KeyNotFound`/OOB) vs the INC-DEC loc for its own `NotLValue`/`const`/
 `TypeError` — which a one-loc-per-pc side table can't hold, live in the
 serializable **`Chunk::incdec_sites`** pool (`Instr::b` = the index, O(1));
-the undefined-global-BASE caret comes from the loc side table
-(`vm_store_base`, node = null). A **dyn MEMBER** inc-dec `d.f++`/`d.f--` (a
+the undefined-global-BASE caret comes from the **`base_locs`** side table
+(`vm_store_base`, node = null; #127 — see below).
+A **dyn MEMBER** inc-dec `d.f++`/`d.f--` (a
 dyn/general base holding a struct or dict) is the exact twin,
 **`IncDecMemberCheckedV`**:
 it forms the member LValue like `MemberExpr::do_eval`'s rooted-base path (a
@@ -1332,6 +1333,23 @@ ops read the `builtin_calls` pool, `EmplaceStruct` the `emplace_sites` pool
 (carets + arg0's lvalue descriptor), `CheckFuncV`/`MapFilterV` and the flat
 int/float element stores the loc side table, and the checked inc-decs the
 `incdec_sites` / `incdec_chains` pools.
+
+**`Chunk::base_locs` — the container store's SECOND caret (#127).** Identical
+shape to `locs` (pc-keyed, ascending, binary-searched, read only on the throw
+path) and SPARSE: only a store whose base can be a **global** records one. It
+exists because a store has two error spans and one `locs` entry cannot hold
+both — an OOB / key / type error carets the WHOLE lvalue (`g[0]`, which is
+what `locs` holds and what the tree-walker marks), while an **unbound global
+base** carets only the base identifier (`g`), which is what
+`Identifier::do_eval` throws with in the tree-walker. Every store form was
+reporting the whole subscript, and the CHAIN stores — whose per-step carets
+live in `chain_locs`, so they record no `locs` entry at all — reported **no
+location whatsoever** (a backtrace rendering "line 0"). Produced by
+`extract_locs` from `CgInstr::base_node_idx`, which the emit sites set from
+`as_container_base` via `add_base_node` (a non-global base records nothing).
+`vm_store_base` prefers it and falls back to `locs`. It rides the two JIT pc
+remaps and the bytecode splice's rebuild like `locs`, and is serialized right
+after it (myv **v13**).
 The AST-node side table this section used to describe -
 `Chunk::node_table`/`node_at_pc` and the `ast_nodes` pool - is GONE with the
 fallback op it existed for; the codegen-transient handle now lives on

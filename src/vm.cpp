@@ -273,8 +273,14 @@ vm_store_base(EvalContext &ctx, int_type kind, int slot,
     if (kind == 1) {                            /* global */
         if (!ctx.gfuncs->defined[slot]) {
             Loc s, en;
+            /* #127: the BASE's own caret, not the whole lvalue's - the
+             * tree-walker marks the identifier (`g`), and `locs` deliberately
+             * holds the whole `g[0]` span for the OOB/type errors. `base_locs`
+             * is the store ops' second caret; `locs` remains the fallback for
+             * an op that records no base entry. */
             if (node) { s = node->start; en = node->end; }
-            else chunk.loc_at(pc, s, en);       /* AST-free op: side table */
+            else if (!chunk.base_loc_at(pc, s, en))
+                chunk.loc_at(pc, s, en);       /* AST-free op: side table */
             throw UnboundSymbolEx(
                 intern_msg("'" + std::string(ctx.gfuncs->names[slot]->val)
                            + "' is not bound yet"), s, en);

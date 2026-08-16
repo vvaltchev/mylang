@@ -11189,6 +11189,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     chunk.code = std::move(nc);
     for (auto &l : chunk.locs)
         l.pc = static_cast<uint32_t>(remap[l.pc]);
+    for (auto &l : chunk.base_locs)          /* #127 */
+        l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &ic : chunk.inline_ctxs)
         ic.pc = static_cast<uint32_t>(remap[ic.pc]);
     /* #78: the handler table's pcs are resumes into ordinary code, remapped
@@ -12332,6 +12334,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 #endif
 
     for (auto &l : chunk.locs)
+        l.pc = static_cast<uint32_t>(remap[l.pc]);
+    for (auto &l : chunk.base_locs)          /* #127 */
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &ic : chunk.inline_ctxs)
         ic.pc = static_cast<uint32_t>(remap[ic.pc]);

@@ -1440,6 +1440,12 @@ struct CgInstr : Instr {
      * SHALLOWER chain, which would drop virtual frames). -1 = the loc comes
      * from node_idx as before. Codegen-transient like node_idx. */
     int32_t loc_node_idx = -1;
+    /* #127: an optional SEPARATE node for the store BASE's span -> the
+     * base_locs table. A container store needs BOTH carets (the whole lvalue
+     * for an OOB, the base identifier alone for an unbound global) and
+     * node_idx can only carry one. -1 = this op records no base caret.
+     * Codegen-transient like node_idx. */
+    int32_t base_node_idx = -1;
     CgInstr() = default;
     CgInstr(const Instr &i) : Instr(i) {}
 };
@@ -1685,27 +1691,57 @@ struct Chunk {
     struct LocEntry { uint32_t pc; Loc start; Loc end; };
     std::vector<LocEntry> locs;
 
-    /* The recorded Loc of the op at `pc` (exact match; sets start/end to {} and
-     * returns false if this op recorded none). Binary search - O(log n) on the
-     * error path only. */
-    bool loc_at(size_t pc, Loc &start, Loc &end) const
+    /*
+     * BASE-caret side table (#127). A container-STORE op has TWO error spans
+     * and one `locs` entry cannot hold both: an OOB / key / type error carets
+     * the WHOLE lvalue (`g[0]`, which is what `locs` records and what the
+     * tree-walker marks), while an UNBOUND-GLOBAL base carets only the BASE
+     * identifier (`g`) - the tree-walker's `Identifier::do_eval` throws with
+     * the identifier's own span. Without this, every store form reported the
+     * whole subscript, and the CHAIN stores (whose `locs` entry does not exist,
+     * their per-step carets living in `chain_locs`) reported NO location at all
+     * - a backtrace reading "line 0".
+     *
+     * Same shape and cost as `locs` - pc-keyed, ascending, binary-searched,
+     * read ONLY from vm_store_base's cold unbound-global arm - and SPARSE: only
+     * a store whose base can be a global records one.
+     */
+    std::vector<LocEntry> base_locs;
+
+    /* Shared exact-match binary search over a pc-keyed, ascending loc table. */
+    static bool loc_lookup(const std::vector<LocEntry> &tbl, size_t pc,
+                           Loc &start, Loc &end)
     {
-        size_t lo = 0, hi = locs.size();
+        size_t lo = 0, hi = tbl.size();
         while (lo < hi) {
             const size_t mid = (lo + hi) / 2;
-            if (locs[mid].pc < pc)
+            if (tbl[mid].pc < pc)
                 lo = mid + 1;
             else
                 hi = mid;
         }
-        if (lo < locs.size() && locs[lo].pc == pc) {
-            start = locs[lo].start;
-            end = locs[lo].end;
+        if (lo < tbl.size() && tbl[lo].pc == pc) {
+            start = tbl[lo].start;
+            end = tbl[lo].end;
             return true;
         }
         start = Loc();
         end = Loc();
         return false;
+    }
+
+    /* The recorded Loc of the op at `pc` (exact match; sets start/end to {} and
+     * returns false if this op recorded none). Binary search - O(log n) on the
+     * error path only. */
+    bool loc_at(size_t pc, Loc &start, Loc &end) const
+    {
+        return loc_lookup(locs, pc, start, end);
+    }
+
+    /* The STORE-BASE Loc of the op at `pc` (#127); false if none. */
+    bool base_loc_at(size_t pc, Loc &start, Loc &end) const
+    {
+        return loc_lookup(base_locs, pc, start, end);
     }
 
     /*
