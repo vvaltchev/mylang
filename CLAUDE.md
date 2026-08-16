@@ -3578,6 +3578,22 @@ and two macros:
 - **Multi-line spans**: `dumpLocInError` (`mylang.cpp`) renders every source
   line in `[loc_start.line, loc_end.line]` with a caret row per line (start from
   `loc_start.col` to EOL, full middle lines, end line up to `loc_end`).
+- **⛔ NO INPUT MAY CRASH THE INTERPRETER (#137, 2026-08-09).** Every `.my`
+  file ends in a DEFINED outcome — a compile refusal, a thrown exception, or a
+  clean run. Two real crashes were found by simply trying degenerate inputs:
+  an **EMPTY program** (also a comment-only file, or one the DCE empties like
+  `if (false) { print(1); }`) had no `Frame`, and `EnterNative` formed
+  `ctx.frame->slots` on the null pointer — UB, and SILENT in a release build
+  because nothing reads it; and **~800 levels of nesting** blew the C stack of
+  the recursive-descent parser (a SIGSEGV in release, an ASan DEADLYSIGNAL in
+  debug). Fixed by refusing to JIT a frameless chunk (plus an `ML_VM_CHECK`
+  stating the invariant at the one line that would form the bad address) and
+  by `ParseContext::MAX_NEST`, a scoped depth cap in `pExpr01`, `pStmt` **and
+  `pBlock`** — a bare `{ ... }` reaches `pBlock` from its own loop and never
+  through `pStmt`, so the statement guard alone left `{{{...}}}` unbounded.
+  **The oracle is the debug+ASan+UBSan lane; a release build hides all of
+  this.** When you add a runtime path, ask what it does with a program that has
+  no statements, no slots, or absurd depth.
 - **⛔ ONE OP CAN NEED TWO CARETS, AND `locs` HOLDS ONE (#127, 2026-08-08).**
   A container store `g[0] = v` has two error spans: an OOB / key / type error
   carets the WHOLE lvalue (`g[0]`), an UNBOUND-GLOBAL base carets only `g` —

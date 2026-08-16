@@ -99,6 +99,27 @@ ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
 ParseContext::~ParseContext() = default;
 
 /*
+ * #137: one level of source nesting = one level of C recursion, so the depth
+ * is counted and capped (see ParseContext::MAX_NEST). Scoped, so SIBLINGS do
+ * not accumulate - only nesting does. Guards the two recursion points that
+ * can nest without bound: the expression primary (parens, array/dict
+ * literals, call arguments) and the statement (a block, or a brace-less
+ * if/loop body, which is why the guard is in pStmt and not pBlock).
+ */
+namespace {
+struct NestGuard {
+    ParseContext &c;
+    explicit NestGuard(ParseContext &pc) : c(pc)
+    {
+        if (++c.nest_depth > ParseContext::MAX_NEST)
+            throw SyntaxErrorEx(c.get_loc(),
+                                "nesting too deep (max 256 levels)");
+    }
+    ~NestGuard() { c.nest_depth--; }
+};
+}
+
+/*
  * #133: record a declared name IFF it also names a CONST BUILTIN, so
  * pAcceptId stops resolving it to that builtin for the extent of the scope.
  * Anything else is dropped on the floor - which is what keeps the set empty
@@ -1301,6 +1322,7 @@ pAcceptMember(ParseContext &c,
 unique_ptr<Construct>
 pExpr01(ParseContext &c, unsigned fl)
 {
+    NestGuard ng(c);                   /* #137: bound the C recursion */
     unique_ptr<Construct> main;
     unique_ptr<Construct> otherExpr;
     const Loc start = c.get_loc();
@@ -2062,6 +2084,7 @@ pAcceptThrowStmt(ParseContext &c,
 unique_ptr<Construct>
 pStmt(ParseContext &c, unsigned fl)
 {
+    NestGuard ng(c);                   /* #137: bound the C recursion */
     unique_ptr<Construct> subStmt;
     const Loc start = c.get_loc();
     fl |= pFlags::pInStmt;
@@ -2154,6 +2177,12 @@ pStmt(ParseContext &c, unsigned fl)
 unique_ptr<Construct>
 pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
 {
+    /* #137: a bare `{ ... }` is parsed by pAcceptBracedBlock straight from
+     * pBlock's own loop, never through pStmt - so the statement guard does
+     * NOT see it and `{{{...}}}` recursed unbounded (an ASan DEADLYSIGNAL at
+     * 5000). Guard here too; the two nest through each other, and each is
+     * scoped, so a block's SIBLINGS still cost nothing. */
+    NestGuard ng(c);
     unique_ptr<Block> ret(new Block);
     unique_ptr<Construct> stmt, tmp;
     bool added_elem;
