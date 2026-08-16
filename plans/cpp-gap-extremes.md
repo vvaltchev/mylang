@@ -1271,3 +1271,37 @@ never hit: **two** nets fire - the widening extra_check's own assertion
 It needs both to be counter-based for the reason increment 3 established: a
 cache that never hits is CORRECT - the full chain simply runs - so no
 differential, corpus, fuzzer or lever configuration can see it.
+
+## The bench gap CLOSED 2026-08-07: 78_typed_param_call
+
+Increments 3, 4 and 5 were each byte-flat across bench/ - not because they do
+nothing, but because **no benchmark annotated a parameter on a call-heavy
+path**, so the suite structurally could not see a 1.61x that any annotated
+program paid. `bench/my/78_typed_param_call` (with its `.py` and `.cpp`
+twins) is that shape: two CLOSURES built over a captured value, one taking
+its argument EXACTLY (`int` -> `int` parameter) and one taking a WIDENING one
+(`int` -> `float`), each called once per iteration.
+
+Closures on purpose - a direct call to a named function is inlined away at
+compile time and would measure nothing about the call protocol.
+
+**Verified to exercise the tiers it exists for**, not merely to run: an
+instrumented build reports, at scale 1, 2,000,001 inline pushes, 2,000,002
+coercing binds, 1,000,000 inline widenings and 1,999,998 coercing-cache hits
+- i.e. every call takes the emitted path, half of them through the widening
+arm, and effectively all of them through the third cache entry.
+
+Interleaved A/B against the pre-G1 binary (5ab3428), scale 4:
+
+    base 0.252s -> 0.151s     cur/base **0.60x**  (1.67x faster)
+    my/python  0.30x          (3.34x faster than CPython)
+    my/cpp    61.4x           (C++ inlines the closure outright - the same
+                               class as 76_funcval_dispatch's 0.002s)
+
+The full suite runs clean with it: 77 paired benchmarks, geomean 0.094x
+(10.67x faster than CPython).
+
+NOTE for the next person to run the suite: `bench/.bench_cache/` is
+git-ignored, so a machine that has not seen this bench will fail fast on the
+missing comparison entry and name the `--recompute` command, exactly as it
+should for any newly added bench.

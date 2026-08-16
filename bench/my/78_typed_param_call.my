@@ -1,0 +1,37 @@
+# INDIRECT calls whose callee has ANNOTATED int/float parameters - the shape a
+# typed language should make FASTER, not slower. Nothing else in bench/ has it:
+# every other call-heavy bench leaves its parameters un-annotated, which is why
+# the suite was byte-flat while this shape measured 1.61x slower than the
+# identical `dyn`-parameter code (plans/cpp-gap-extremes.md, G1 increment 3).
+#
+# CLOSURES on purpose: a direct call to a named function is inlined away at
+# compile time, so it would measure nothing about the call protocol. `add`
+# receives its argument EXACTLY (int -> int param); `scale_it` receives a
+# WIDENING one (int -> float param) - the two bind tiers the emitted call
+# protocol has to get right.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 1000000 * scale;
+
+func make_adder(int base) {
+    return func [base] (int k) { return base + k; };
+}
+
+func make_scaler(float f) {
+    return func [f] (float x) { return f * x; };
+}
+
+var add = make_adder(7);
+var scale_it = make_scaler(0.5);
+
+var s = 0;
+var t = 0.0;
+
+for (var i = 0; i < N; i++) {
+    s = s + add(i);             # exact:    int argument -> int parameter
+    t = t + scale_it(i);        # widening: int argument -> float parameter
+}
+
+print("result:", s, t);
