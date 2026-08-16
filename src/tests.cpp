@@ -24323,6 +24323,143 @@ static bool jit_fwd_skip_reflisted()
  * parity with the tree-walker is the corruption oracle: a pin that is
  * clobbered and not restored computes a wrong answer, it does not crash.
  */
+/*
+ * ⛔ THE FAMILY-COVERAGE RATCHET for lever A's whitelists - the net that
+ * would have caught the missing SHIFTS (2026-08-16), and the answer to
+ * "how did four test nets all miss this?".
+ *
+ * They missed it because a forwarding gap changes NO OBSERVABLE
+ * BEHAVIOUR, so:
+ *   - the 5-mode differential, corpus_diff and every fuzzer are blind by
+ *     construction (the answer is right whether the value travelled in
+ *     RAX or through a slot);
+ *   - `jit_counter_coverage` asks "did this lever run AT ALL?" and
+ *     g_jit_fwd was non-zero the whole time - the add/mul shapes fire;
+ *   - `jit_fwd_deadtemp`'s cases were written FROM the whitelist, so
+ *     they exercised exactly the opcodes already in it. A test derived
+ *     from a table can never find a hole in that table.
+ *
+ * So this one is derived from the OPCODE ENUM instead. The B1/B2
+ * specialized family is a CONTIGUOUS range - IntAddRR .. FloatMulRI,
+ * bytecode.h - and every member must be CLASSIFIED here: forwardable, or
+ * exempt with a written reason. Adding an opcode to that range without
+ * deciding fails with the opcode named, which is the failure the shift
+ * family should have produced when it was added.
+ *
+ * It asks jit.cpp's OWN predicates (jit_fwd_op_is_producer /
+ * jit_fwd_op_consumer_slots / the float twins), which the Instr-taking
+ * whitelists are built on - so this cannot drift from what the emitter
+ * consults, and a row that disagrees with the table fails too (in either
+ * direction: a claimed exemption that is actually whitelisted is as much
+ * a lie as the reverse).
+ */
+static const char *fwd_opcode_name(OpCode op)
+{
+    /* from ML_FOR_EACH_OPCODE, the enumeration bytecode.h static-asserts
+     * against the enum - so a renamed or reordered opcode cannot make
+     * this print the wrong name */
+#define ML_TEST_OPNAME(N) case OpCode::N: return #N;
+    switch (op) {
+    ML_FOR_EACH_OPCODE(ML_TEST_OPNAME)
+    default: return "?";
+    }
+#undef ML_TEST_OPNAME
+}
+
+static bool jit_fwd_family_coverage()
+{
+#if ML_JIT_SUPPORTED
+    struct Row {
+        OpCode op;
+        /* nullptr == must be classified; else the reason it is not */
+        const char *prod_why;
+        const char *cons_why;
+    };
+    static const char *const FLOAT_OP =
+        "a FLOAT op - the int whitelists are int-only by construction; "
+        "its float twin is checked in the same row";
+    static const char *const MOD_RDX =
+        "NOT a producer: the remainder is in RDX on the idiv path and in "
+        "RAX on the div-magic one, so admitting it needs a "
+        "result-register normalisation first (#96)";
+    const Row rows[] = {
+        { OpCode::IntAddRR, nullptr,  nullptr },
+        { OpCode::IntAddRI, nullptr,  nullptr },
+        { OpCode::IntSubRR, nullptr,  nullptr },
+        { OpCode::IntSubRI, nullptr,  nullptr },
+        { OpCode::IntMulRR, nullptr,  nullptr },
+        { OpCode::IntMulRI, nullptr,  nullptr },
+        { OpCode::IntAndRR, nullptr,  nullptr },
+        { OpCode::IntAndRI, nullptr,  nullptr },
+        { OpCode::IntOrRR,  nullptr,  nullptr },
+        { OpCode::IntOrRI,  nullptr,  nullptr },
+        { OpCode::IntXorRR, nullptr,  nullptr },
+        { OpCode::IntXorRI, nullptr,  nullptr },
+        { OpCode::IntShlRR, nullptr,  nullptr },
+        { OpCode::IntShlRI, nullptr,  nullptr },
+        { OpCode::IntShrRR, nullptr,  nullptr },
+        { OpCode::IntShrRI, nullptr,  nullptr },
+        { OpCode::IntModRI, MOD_RDX,  nullptr },
+        { OpCode::FloatAddRR, FLOAT_OP, FLOAT_OP },
+        { OpCode::FloatAddRI, FLOAT_OP, FLOAT_OP },
+        { OpCode::FloatSubRR, FLOAT_OP, FLOAT_OP },
+        { OpCode::FloatSubRI, FLOAT_OP, FLOAT_OP },
+        { OpCode::FloatMulRR, FLOAT_OP, FLOAT_OP },
+        { OpCode::FloatMulRI, FLOAT_OP, FLOAT_OP },
+    };
+    bool ok = true;
+
+    /* 1. THE RATCHET: every opcode in the range has a row. */
+    for (int o = static_cast<int>(OpCode::IntAddRR);
+         o <= static_cast<int>(OpCode::FloatMulRI); o++) {
+        bool found = false;
+        for (const Row &r : rows)
+            if (static_cast<int>(r.op) == o)
+                found = true;
+        if (!found) {
+            cout << "  fwd-family: opcode #" << o << " ("
+                 << fwd_opcode_name(static_cast<OpCode>(o))
+                 << ") joined the specialized family with no row here - "
+                    "decide whether lever A forwards it, then say so\n";
+            ok = false;
+        }
+    }
+
+    /* 2. each row's CLAIM must match the whitelist it describes. A float
+     *    row is checked against the float twins, an int row against the
+     *    int ones - so "exempt because it is a float op" is not a way to
+     *    smuggle an unclassified opcode past the ratchet. */
+    for (const Row &r : rows) {
+        const bool isf = r.prod_why == FLOAT_OP;
+        const bool prod = isf ? jit_fwd_op_is_fproducer(r.op)
+                              : jit_fwd_op_is_producer(r.op);
+        const bool cons = isf ? jit_fwd_op_is_fconsumer(r.op)
+                              : (jit_fwd_op_consumer_slots(r.op) != 0);
+        const bool want_p = isf || r.prod_why == nullptr;
+        const bool want_c = isf || r.cons_why == nullptr;
+        if (prod != want_p) {
+            cout << "  fwd-family: " << fwd_opcode_name(r.op)
+                 << " producer is " << (prod ? "whitelisted" : "absent")
+                 << " but the row says "
+                 << (want_p ? "it must be whitelisted"
+                            : r.prod_why) << "\n";
+            ok = false;
+        }
+        if (cons != want_c) {
+            cout << "  fwd-family: " << fwd_opcode_name(r.op)
+                 << " consumer is " << (cons ? "whitelisted" : "absent")
+                 << " but the row says "
+                 << (want_c ? "it must be whitelisted"
+                            : r.cons_why) << "\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_xcache_pins()
 {
 #if ML_JIT_SUPPORTED
@@ -31528,6 +31665,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the SLICE read arms (single + nested outer/row) and the "
       "nested int-row PROMOTE arm (#95)",
       jit_elem_slice_and_promote },
+    { "jit: lever A's whitelists COVER the specialized-arith family - "
+      "the ratchet derived from the opcode ENUM, not from the table",
+      jit_fwd_family_coverage },
     { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "
       "call-free fragment, declines around a MyLang call (#96)",
       jit_xcache_pins },
