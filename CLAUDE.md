@@ -2671,9 +2671,20 @@ sanitizers never reproduced it.)
   CONST-FOLDED — either makes a test pass without the binding ever being
   needed, and both masked this bug for a long time (they are why the earlier
   claim "top level already works" was believed).
-  **RESIDUAL (#134):** a nested func used BEFORE its decl inside a FUNCTION
-  BODY still fails to lower in the VM (`NotLoweredEx`) — a pre-existing
-  codegen refusal, unchanged by the above; the tree-walker handles it.
+  **THREE PASSES MUST AGREE ON THIS, and the third was the last to learn
+  it (#136).** The resolver hoists the names (`hoist_scoped_decls`), the
+  engines bind them at scope entry (above) — and the INFERENCER's
+  structural pass has to pre-declare them per BLOCK too. It did that only
+  for the root (`hoist_globals`); inside a block it walked declarations in
+  statement order, so a call above the declaration got a callee whose
+  static type had not settled to `Func`, `annotate_hints` left
+  `CallExpr::vm_direct_func` false, and the codegen REFUSED to lower the
+  call (`NotLoweredEx`) while the tree-walker ran it. A struct used above
+  its `struct` line typed as `none`, so `p.x` became a bogus
+  `NullabilityEx`. The tell is `typestr`: `func inner()` before the decl
+  vs `func()->int` after, where the top level said `func()->int` in both.
+  **If you add a fourth pass that cares about declaration order, it needs
+  the same pre-scan.**
   **Scope, still map-bound:** lambdas (anonymous — no name binding; their
   params/locals ARE slotted) and, in the **REPL** (top-level names stay
   redefinable), all top-level names; template-instance clones, inserted before

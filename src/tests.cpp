@@ -4449,16 +4449,13 @@ static const std::vector<test> tests =
      * IS declared - it is merely unbound. (`isbound()`, step 6, is the one
      * that answers false there.)
      */
-    /* NOTE the STRUCT case is deliberately absent: `var p1 = P(3); ...
-     * struct P { int x; }` works in a SCRIPT but not in this harness's
-     * pipeline, where the descriptor's global slot is still undefined at the
-     * construction. That is a real gap in "a struct hoists WITH its binding"
-     * and belongs to #134; adding it here would pin a behaviour that only
-     * one pipeline has. */
     { "TDZ accepts: a hoisted func, nested scopes, defined()",
       { "var dyn t1 = f();",
         "assert(t1 == 5);",
         "func f() { return 5; }",
+        "var p1 = P(3);",
+        "assert(p1.x == 3);",
+        "struct P { int x; }",
         "var loc = 99;",
         "func g2() { var r = loc; { var loc = 5; } return r; }",
         "assert(g2() == 99);",
@@ -4527,6 +4524,23 @@ static const std::vector<test> tests =
       { "var p = P(runtime(3));",
         "assert(p.x == 3);",
         "struct P { int x; }" } },
+    /*
+     * NESTED in a function body - the case that needed the INFERENCER fixed
+     * too (#136). The resolver hoisted the name and step 5 bound it at scope
+     * entry, but the inferencer still saw the declaration in STATEMENT order
+     * inside a block, so the callee's static type had not settled to `Func`:
+     * annotate_hints left `vm_direct_func` false and the codegen REFUSED to
+     * lower the call (NotLoweredEx) while the tree-walker ran it. The struct
+     * twin typed as `none`, so `p.x` was a bogus NullabilityEx.
+     */
+    { "hoisted decls: a nested func called before its decl (VM lowers it)",
+      { "func outer() { var dyn r = inner(); return r;",
+        "               func inner() { print(\"\"); return 7; } }",
+        "assert(outer() == 7);" } },
+    { "hoisted decls: a nested struct used before its decl",
+      { "func outer() { var p = Q(runtime(2)); return p.x;",
+        "               struct Q { int x; } }",
+        "assert(outer() == 2);" } },
     /* Mutual recursion is the reason this rule exists at all. */
     { "hoisted decls: mutual recursion across the declaration order",
       { "var dyn r = ev(runtime(6));",
