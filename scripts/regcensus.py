@@ -65,7 +65,18 @@ import re
 import sys
 import os
 
-REGS = ['RAX', 'RCX', 'RDX', 'RSI', 'RDI', 'R8R', 'R9R']
+# R8/R9 have TWO spellings in jit.cpp: the `Reg` enum members (R8, R9)
+# and the function-local `const uint8_t R8R/R9R` the older emitters
+# declare. Both must be counted, or a conversion that switches from
+# one to the other looks like the uses vanished - which happened:
+# rewriting cmp_r9_rdx() as cmp_rr(9, RDX) briefly dropped R9 from
+# 87 to 23 while changing nothing, because a bare `9` is as invisible
+# as the wrapper name was. jit.cpp now names them; this counts both.
+REGS = ['RAX', 'RCX', 'RDX', 'RSI', 'RDI', 'R8', 'R9', 'R10', 'R11',
+        'R8R', 'R9R']
+REPORT = ['RAX', 'RCX', 'RDX', 'RSI', 'RDI', 'R8', 'R9', 'R10', 'R11']
+# report R8/R8R (and R9/R9R, R10/R11) as one register each
+MERGE = {'R8R': 'R8', 'R9R': 'R9'}
 
 # The register a NAME TOKEN refers to. Sub-registers and the SysV
 # argument-position spellings map to their 64-bit parent, because a
@@ -155,7 +166,7 @@ def census(path):
         if m and m.group(1) in acc:
             decl_line[i] = m.group(1)
 
-    res = {r: {'br': 0, 'un': 0, 'lines': []} for r in REGS}
+    res = {MERGE.get(r, r): {'br': 0, 'un': 0, 'lines': []} for r in REGS}
     for i, l in enumerate(lines):
         if 'enum Reg' in l:
             continue
@@ -172,7 +183,8 @@ def census(path):
                 continue
             for r in regs:
                 hits[r] = hits.get(r, 0) + n
-        for r, n in hits.items():
+        for r0, n in hits.items():
+            r = MERGE.get(r0, r0)
             if bracketed[i]:
                 res[r]['br'] += n
             else:
@@ -201,7 +213,7 @@ def main():
     print("%-6s %10s %13s %7s   %s"
           % ("reg", "bracketed", "UNbracketed", "total", "cost to free"))
     tb = tu = 0
-    for r in REGS:
+    for r in REPORT:
         b, u = res[r]['br'], res[r]['un']
         tb += b
         tu += u
@@ -212,7 +224,7 @@ def main():
           "emit_call_prologue\nand emit_call_epilogue cannot disturb a pin "
           "(the prologue spilled it).")
 
-    for r in REGS:
+    for r in REPORT:
         if not (show_all or r in want):
             continue
         print("\n=== %s unbracketed sites (%d) ===" % (r, res[r]['un']))
