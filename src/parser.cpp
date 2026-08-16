@@ -3064,6 +3064,22 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                 );
             }
 
+            /* The COMPILE-TIME half of UncatchableRuntimeException: an
+             * interpreter-bug tripwire (InternalErrorEx) or a name error
+             * (UndefinedVariable) is reported properly but may never be
+             * HANDLED, so naming one here is refused rather than silently
+             * never matching. The run-time half is the is_catchable() test
+             * in both catch matchers, which also defeats the catch-all. */
+            for (const auto &ex_id : exList->elems) {
+                if (is_uncatchable_ex_name(ex_id->get_str())) {
+                    throw SyntaxErrorEx(
+                        ex_id->start,
+                        "This exception cannot be caught: "
+                        "it reports an error the script must not handle"
+                    );
+                }
+            }
+
             if (pAcceptKeyword(c, Keyword::kw_as)) {
 
                 unique_ptr<Construct> id;

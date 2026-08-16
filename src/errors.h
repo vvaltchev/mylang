@@ -201,6 +201,40 @@ struct RuntimeException : public Exception {
      * already-interned type name. nullptr = "match by string" - the
      * safe fallback for any subclass without the override. */
     virtual const UniqueId *match_uid() const { return nullptr; }
+
+    /*
+     * May a SCRIPT handle this? See UncatchableRuntimeException below.
+     * Checked by BOTH catch matchers (vm_catch_match, do_catch) before any
+     * name comparison, so it also defeats the parenless catch-all.
+     */
+    virtual bool is_catchable() const { return true; }
+};
+
+/*
+ * A RUNTIME exception a script may NEVER handle.
+ *
+ * `RuntimeException` used to mean two unrelated things at once: "travels the
+ * VM/JIT conveyance, so it gets backtrace frames and a caret" (an
+ * IMPLEMENTATION property) and "a `catch` clause may name it" (a LANGUAGE
+ * property). Splitting them is what lets an error be reported PROPERLY
+ * without becoming script-catchable.
+ *
+ * It matters because the two channels out of a JIT fragment are not equal:
+ * `g_vm_jit_exc` is typed on RuntimeException and re-raises through vm_raise
+ * (frames + the baked caret), while a plain `Exception` is not carried at all
+ * and propagates as a raw C++ throw through JIT-generated code - which has no
+ * unwind information, so the unwinder finds no handler and calls
+ * std::terminate. That was a real SIGABRT (`var c = func[zz]() => zz;`).
+ *
+ * Enforcement is BOTH ways: naming one in a catch clause is a COMPILE error
+ * (is_uncatchable_ex_name, checked in the parser), and the matchers refuse it
+ * at run time so no catch-all can swallow it.
+ */
+struct UncatchableRuntimeException : public RuntimeException {
+
+    using RuntimeException::RuntimeException;
+
+    bool is_catchable() const override { return false; }
 };
 
 #define DECL_SIMPLE_EX(name, msg)                  \
@@ -212,17 +246,25 @@ struct RuntimeException : public Exception {
         { }                                        \
     };
 
-#define DECL_RUNTIME_EX(name, msg)                        \
+/* Same shape as DECL_RUNTIME_EX but NOT script-catchable - see
+ * UncatchableRuntimeException. */
+#define DECL_UNCATCHABLE_EX(name, msg)                              \
+    DECL_RUNTIME_EX_BASE(name, msg, UncatchableRuntimeException)
+
+#define DECL_RUNTIME_EX(name, msg)                                  \
+    DECL_RUNTIME_EX_BASE(name, msg, RuntimeException)
+
+#define DECL_RUNTIME_EX_BASE(name, msg, base)             \
                                                           \
-    struct name : public RuntimeException {               \
+    struct name : public base {                           \
                                                           \
         name(Loc start = Loc(), Loc end = Loc())          \
-            : RuntimeException(#name, msg, start, end)    \
+            : base(#name, msg, start, end)                \
         { }                                               \
                                                           \
         name(const char *custom_msg,                      \
              Loc s = Loc(), Loc e = Loc())                \
-            : RuntimeException(#name, custom_msg, s, e)   \
+            : base(#name, custom_msg, s, e)               \
         { }                                               \
                                                           \
         name *clone() const override {                    \
@@ -262,7 +304,10 @@ struct InvalidTokenEx : public Exception {
     { }
 };
 
-DECL_SIMPLE_EX(InternalErrorEx, "Internal error")
+/* An interpreter BUG tripwire, never a user error - but it must RENDER
+ * (message, caret, frames) instead of aborting when one fires inside a JIT
+ * fragment, which is why it is a RuntimeException. Still unhandleable. */
+DECL_UNCATCHABLE_EX(InternalErrorEx, "Internal error")
 DECL_SIMPLE_EX(CannotRebindConstEx, "Cannot rebind const")
 DECL_SIMPLE_EX(CannotRebindBuiltinEx, "Cannot rebind builtin")
 DECL_SIMPLE_EX(ExpressionIsNotConstEx, "The expression is not const")
@@ -351,17 +396,45 @@ DECL_RUNTIME_EX(OutOfBoundsEx, "Out of bounds error")
 DECL_RUNTIME_EX(KeyNotFoundEx, "Key not found in dict")
 DECL_RUNTIME_EX(CannotOpenFileEx, "Cannot open file error")
 
-struct UndefinedVariableEx : public Exception {
+/*
+ * Since FIX-1 (#130) a SCRIPT cannot reach this - a name declared nowhere is
+ * a compile error - so it fires only in the REPL, which is open-world. It is
+ * an UncatchableRuntimeException rather than a plain Exception so that the
+ * REPL path still gets frames and a caret through the ordinary conveyance,
+ * without ever becoming something a script can handle.
+ */
+struct UndefinedVariableEx : public UncatchableRuntimeException {
 
     const std::string_view name;
     bool in_pure_func;
 
-    UndefinedVariableEx(const std::string_view &name, Loc start = Loc(), Loc end = Loc())
-        : Exception("UndefinedVariable", nullptr, start, end)
+    UndefinedVariableEx(const std::string_view &name,
+                        Loc start = Loc(), Loc end = Loc())
+        : UncatchableRuntimeException("UndefinedVariable", nullptr, start, end)
         , name(name)
         , in_pure_func(false)
     { }
+
+    UndefinedVariableEx *clone() const override {
+        return new UndefinedVariableEx(*this);
+    }
+
+    [[ noreturn ]] void rethrow() const override {
+        throw *this;
+    }
 };
+
+/*
+ * Is `n` the name of an exception a script may NOT name in a catch clause?
+ * The compile-time half of UncatchableRuntimeException (the run-time half is
+ * the `is_catchable()` test in both catch matchers). Keep in sync with the
+ * UncatchableRuntimeException subclasses above.
+ */
+inline bool is_uncatchable_ex_name(const std::string_view &n)
+{
+    return n == "InternalErrorEx" || n == "UndefinedVariable"
+        || n == "UndefinedVariableEx";
+}
 
 struct SyntaxErrorEx : public Exception {
 
