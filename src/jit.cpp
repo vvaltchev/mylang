@@ -1332,7 +1332,7 @@ struct Emitter {
     void frag_ret(RetFlush why)
     {
         if (why == RetFlush::empty)
-            ML_CHECK_MSG(cache.empty() && fcache.empty() && tflush.empty(),
+            ML_CHECK_MSG(!cache_live(),
                          "frag_ret(empty) with a live register cache: this "
                          "return would resume the interpreter on stale "
                          "slots - flush_cache() first and say flushed");
@@ -1370,6 +1370,56 @@ struct Emitter {
         bool is_empty() const
         { return cache.empty() && fcache.empty() && tflush.empty(); }
     };
+
+    /*
+     * ⛔⛔ THE ENUMERATION OF "WHAT CURRENTLY LIVES IN A REGISTER" LIVES
+     * IN THESE FOUR FUNCTIONS AND NOWHERE ELSE. ADD A MEMBER -> UPDATE
+     * ALL FOUR (they are deliberately adjacent so you see them at once):
+     * CacheState's fields, is_empty(), snapshot_cache(), restore_cache()
+     * and clear_cache_state().
+     *
+     * WHY THIS EXISTS. `cache` (N5 int pins), `fcache` (C2a float pins)
+     * and `tflush` (C3 type-elided slots) are one FAMILY, and four
+     * scattered sites used to enumerate it by hand: flush_cache()'s
+     * three loops, exit_pc's `cache.empty() && fcache.empty() &&
+     * tflush.empty()`, the barrier's `brk` guard, and the barrier's
+     * CLEAR. C3 added `tflush` and updated the first three. The fourth -
+     * two `.clear()` statements that were supposed to mean "empty
+     * EVERYTHING" - was missed, so a barrier'd exit answered "something
+     * is still cached", took the FLUSHING epilogue, and wrote pre-call
+     * registers over the helper's writes: the exact clobber the clear
+     * exists to prevent.
+     *
+     * The general shape, and the reason it went unnoticed for so long:
+     * **an `&&` over every member of a family is an AUDIT TABLE that
+     * does not look like one.** The project's documented audit-table
+     * traps are all `switch` statements, so "go re-read the tables"
+     * never pointed here. A boolean chain and a run of `.clear()` calls
+     * are the same enumeration in different clothes.
+     *
+     * clear_cache_state() ML_CHECKs itself against cache_live(), so a
+     * member added to one and forgotten in the other aborts by name
+     * rather than corrupting a slot.
+     */
+    CacheState snapshot_cache() const { return { cache, fcache, tflush }; }
+    void restore_cache(CacheState &&s)
+    {
+        cache = std::move(s.cache);
+        fcache = std::move(s.fcache);
+        tflush = std::move(s.tflush);
+    }
+    void clear_cache_state()
+    {
+        cache.clear();
+        fcache.clear();
+        tflush.clear();
+        ML_CHECK_MSG(!cache_live(),
+                     "clear_cache_state() left something live: a cache "
+                     "vector was added to cache_live() but not here");
+    }
+    /* "is anything held in a register right now" - asked by the barrier
+     * guard and by frag_ret's write-back contract. */
+    bool cache_live() const { return !snapshot_cache().is_empty(); }
     struct ExitSite { size_t at; size_t state; };
     std::vector<ExitSite> exits;
     std::vector<CacheState> exit_states;
@@ -14394,11 +14444,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
              * shape). Float pins were accidentally safe (the call
              * prologue spills their payloads), kept here for
              * robustness. */
-            const bool brk = cache_barrier[pc - begin]
-                && (!e.cache.empty() || !e.fcache.empty()
-                    || !e.tflush.empty());
-            std::vector<Emitter::CacheEnt> saved_cache, saved_fcache;
-            std::vector<Emitter::TypedEnt> saved_tflush;
+            const bool brk = cache_barrier[pc - begin] && e.cache_live();
+            Emitter::CacheState saved_state;
             if (brk) {
                 e.flush_cache();
                 /* EMPTY the cache across the op's emission: a barrier'd op
@@ -14410,25 +14457,21 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                  * write). With no cache entries, the op's exits flush nothing
                  * and memory keeps the helper's writes; any in-op operand
                  * read falls back to (current) memory. */
-                saved_cache = std::move(e.cache);
-                e.cache.clear();
+                /* ⛔ THIS USED TO MISS `tflush` - it cleared `cache` and
+                 * `fcache` by hand and C3's third vector was never added.
+                 * exit_pc then read "something is cached", the barrier'd
+                 * exit took the FLUSHING epilogue, and that epilogue
+                 * writes the whole RESTORED cache - precisely the
+                 * pre-call registers over the helper's writes that the
+                 * comment above says must never happen. Going through
+                 * snapshot/clear is what makes the miss impossible: the
+                 * family is enumerated in ONE place now, and
+                 * clear_cache_state ML_CHECKs itself against
+                 * cache_live(). Sound to clear the type list too, since
+                 * the pre-op flush_cache() has already stamped it. */
+                saved_state = e.snapshot_cache();
+                e.clear_cache_state();
                 e.reg_busy = 0;
-                saved_fcache = std::move(e.fcache);
-                e.fcache.clear();
-                /* ⛔ AND tflush, which this used to MISS - the bug the
-                 * state-keyed epilogues exposed (#96). exit_pc's old test
-                 * was `cache.empty() && fcache.empty() && tflush.empty()`,
-                 * so a fragment with C3 type-elided slots left tflush
-                 * non-empty here, the barrier'd exit read as "something is
-                 * cached", and it took the FLUSHING epilogue - which
-                 * writes the WHOLE restored cache, i.e. precisely the
-                 * pre-call register values over the helper's writes that
-                 * the comment above says must never happen. The intent was
-                 * always "a barrier'd exit flushes NOTHING"; the pre-op
-                 * flush_cache() above has already stamped these types, so
-                 * nothing is owed. */
-                saved_tflush = std::move(e.tflush);
-                e.tflush.clear();
             }
             if (op_is_branch(in.op)) {
                 /* targets get entry_remap (an external exit is a RESUME -
@@ -14441,9 +14484,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 emit_ok = false;           /* selection bug: give up */
             }
             if (brk) {
-                e.cache = std::move(saved_cache);
-                e.fcache = std::move(saved_fcache);
-                e.tflush = std::move(saved_tflush);
+                e.restore_cache(std::move(saved_state));
                 e.reload_cache();
             }
         };

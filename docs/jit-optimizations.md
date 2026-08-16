@@ -5311,3 +5311,32 @@ predicate that enumerates "everything that can be cached" is an audited
 table wearing an `&&`. `tflush` joined the flush and the barrier had no
 reason to know. When you add a fourth cache vector, grep for every site
 that tests all three.
+
+### The follow-up: the enumeration now lives in ONE place
+
+Explaining the bug above made the fix obvious. The family
+`{cache, fcache, tflush}` is now listed only in four adjacent `Emitter`
+members - `snapshot_cache()`, `restore_cache()`, `clear_cache_state()`
+and `cache_live()` - and every site that asks about the family as a
+whole goes through them: `frag_ret`'s `empty` contract, the barrier's
+`brk` guard, the barrier's clear and its restore.
+
+`clear_cache_state()` ML_CHECKs itself against `cache_live()`, which is
+the mechanical net: a vector added to one and forgotten in the other
+aborts by name instead of silently corrupting a slot. **Watched failing
+by reintroducing the ORIGINAL defect** (delete `tflush.clear()`):
+`-rt` aborts immediately with
+
+    Assertion `(!cache_live()) && ("clear_cache_state() left something
+    live: a cache vector was added to cache_live() but not here")'
+
+Verified as a pure restructuring: emitted code byte-identical on all 108
+corpus programs (`scripts/vdjcmp.sh`).
+
+**Two tools came out of this session and now live in `scripts/`**, since
+both were re-derived from scratch more than once:
+`scripts/vdjcmp.sh` (compare two binaries' emitted native code across
+the corpus - the oracle for "this refactor changed nothing", with the
+four normalisation traps recorded in its header) and
+`scripts/sabotage.sh` (apply a defect, rebuild, run a check, always
+restore; exit 1 means the check PASSED, i.e. the test is blind).
