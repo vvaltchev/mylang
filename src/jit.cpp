@@ -1723,8 +1723,62 @@ struct Emitter {
         u8(0x48); u8(0x8B); u8(MODRM_SLOT); u32(uint32_t(d));
     }
     /* cmp rax, r8 (t_float) / cmp rax, rsi (t_int) */
-    void cmp_rax_r8()  { u8(0x4C); u8(0x39); u8(0xC0); }
-    void cmp_rax_rsi() { u8(0x48); u8(0x39); u8(0xF0); }
+    /* cmp <dst>, <src>  (GP reg-reg, both 0-15) - the general form the
+     * old hand-rolled cmp_rax_r8 / cmp_rax_rsi / cmp_rdx_rsi /
+     * cmp_rdx_r8 each spelled out for one fixed pair. */
+    void cmp_rr(uint8_t dst, uint8_t src)
+    {
+        u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 0x04 : 0)
+                                | (dst >= 8 ? 0x01 : 0)));
+        u8(0x39);
+        u8(static_cast<uint8_t>(0xC0 | ((src & 7) << 3) | (dst & 7)));
+    }
+    /*
+     * THE READ SEAM, twin of store_type_tag: compare a register against
+     * a type singleton, as an IMMEDIATE when the arena placed it low.
+     * `cmp r64, imm32` sign-extends exactly like the store's imm32
+     * does, so the same < 2^31 test decides both. rax keeps the
+     * one-byte-shorter accumulator form (REX.W 3D id); everything else
+     * uses REX.W 81 /7 id.
+     *
+     * ⛔ THIS IS WHY step 3 FAILED TWICE, and the shape is worth a
+     * name of its own - the SIXTH audit-table disguise:
+     *
+     *     A WRAPPER WHOSE NAME ENCODES ITS OPERAND IS INVISIBLE TO AN
+     *     AUDIT THAT GREPS FOR THE OPERAND.
+     *
+     * The tag readers were `cmp_rax_r8()`, `cmp_rax_rsi()`,
+     * `cmp_rdx_r8()` and `cmp_rdx_rsi()` - four methods, nine call
+     * sites, and NOT ONE of them mentions `RSI` or `R8R` as an
+     * argument. So `grep -n "R8R\|RSI"` over the store2 tier returned
+     * nothing and I twice concluded the singletons were write-only and
+     * safe to stop materialising. The first attempt lost four float
+     * tests; the second lost the whole #95 nested-store tier, which
+     * declined at RUNTIME (its value-type guard compared against
+     * garbage) while still emitting perfectly - so `-vdj` showed the
+     * fast path present and the counter read zero.
+     *
+     * The fix is structural, not vigilance: there is ONE tag-comparison
+     * entry point and ONE tag-store entry point, both taking the tag as
+     * an ARGUMENT. A new tag reader that does not come through here is
+     * a bug; do not add `cmp_<reg>_<reg>` back.
+     */
+    void cmp_reg_tag(uint8_t reg, const void *tag, uint8_t fallback_reg)
+    {
+        if (!ml_lowmem_fits_imm32(tag)) {
+            cmp_rr(reg, fallback_reg);
+            return;
+        }
+        if (reg == 0) {                  /* rax: the short accumulator form */
+            u8(0x48); u8(0x3D);
+        } else {
+            u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
+            u8(0x81); u8(static_cast<uint8_t>(0xF8 | (reg & 7)));
+        }
+        u32(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(tag)));
+    }
+    void cmp_rax_tag(const void *tag, uint8_t fallback_reg)
+    { cmp_reg_tag(0, tag, fallback_reg); }
     /* mov [rbx+disp], r8  (store t_float as a slot's type) */
     /* movabs r8, imm64 (REX.WB) */
     void movabs_r8(uint64_t imm)
@@ -1838,8 +1892,6 @@ struct Emitter {
     void farith_x1_x0(uint8_t op) { u8(0xF2); u8(0x0F); u8(op); u8(0xC8); }
     void pxor_x1() { u8(0x66); u8(0x0F); u8(0xEF); u8(0xC9); }
     /* ---- #95, the nested-STORE tier (boxed slot type guards in rdx) ---- */
-    void cmp_rdx_rsi() { u8(0x48); u8(0x39); u8(0xF2); }
-    void cmp_rdx_r8()  { u8(0x4C); u8(0x39); u8(0xC2); }
     void cmp_rdx_r9()  { u8(0x4C); u8(0x39); u8(0xCA); }
     void mov_rdi_rcx() { u8(0x48); u8(0x89); u8(0xCF); }  /* prep: &row */
     /* ---- C1, the hoisted-base navigation (r12-r15 operands) ---- */
@@ -3144,10 +3196,20 @@ static bool run_needs_float_tag(const Chunk &ck, size_t begin, size_t end)
     return false;
 }
 
+/* Is the tag reachable as an imm32, i.e. does it need NO register? */
+static bool jit_tag_is_imm(const void *tag) { return ml_lowmem_fits_imm32(tag); }
+
 static void emit_type_tags(Emitter &e)
 {
-    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
-    if (e.float_tag_live)
+    /* #96 step 3: with the low-address arena in place every tag store
+     * encodes the pointer DIRECTLY, so nothing reads rsi/r8 as a
+     * singleton and materialising them is dead code. Emitted only on
+     * the fallback path (no arena: Darwin, Windows, a failed
+     * MAP_32BIT), where the register form is still what store_type_tag
+     * falls back to. */
+    if (!jit_tag_is_imm(jit_layout().t_int))
+        e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
+    if (e.float_tag_live && !jit_tag_is_imm(jit_layout().t_float))
         e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
 }
 
@@ -3183,9 +3245,10 @@ static void emit_call_epilogue(Emitter &e)
      *     102 on 46_matrix_mult. The entry and the re-materialisation
      *     now read the SAME flag and cannot drift.
      */
-    if (!e.reg_holds_pin(RSI))
+    if (!jit_tag_is_imm(jit_layout().t_int) && !e.reg_holds_pin(RSI))
         e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
-    if (e.float_tag_live && !e.reg_holds_pin(8))
+    if (e.float_tag_live && !jit_tag_is_imm(jit_layout().t_float)
+            && !e.reg_holds_pin(8))
         e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
     /* C4b: the pinned float LITERALS, same argument - caller-saved and
      * compile-time constant. THIS is where their correctness lives, not
@@ -6388,40 +6451,38 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * setup. jit_assert_no_volatile_pin is the standing check that no
  * raw-scratch call site sees one.
  */
+/* ⛔ rsi is NOT here, and the attempt is worth recording: with the tag
+ * now an immediate, rsi LOOKS free - and it is not. It is SysV argument
+ * 2 AND raw scratch at ~84 sites (`mov rsi, rax`, `lea rsi, <slot>`),
+ * most of them OUTSIDE any emit_call_prologue bracket, so a pin there
+ * is destroyed with nothing to restore it. Adding it failed -rt
+ * immediately. rsi/rax/rcx/rdx/rdi need the emitter to ALLOCATE its
+ * scratch; freeing the type tag was necessary for that but not
+ * sufficient. */
 static const uint8_t XCACHE_REGS[] = { 10, 11, 9, 8 };
 static const size_t MAX_XCACHED = sizeof(XCACHE_REGS) / sizeof(XCACHE_REGS[0]);
-/*
- * ⛔ r8 IS LAST ON PURPOSE - it is conditional. It holds the t_float
- * SINGLETON, but only in a run that HAS a float op: `run_has_float`
- * decides whether frag_entry materialises it at all, so in an int-only
- * run r8 is dead weight and can hold a pin instead. A run WITH floats
- * must keep it. Since take_reg scans the pool in order, passing a
- * COUNT of 3 rather than 4 excludes r8 without a second array.
- *
- * This is the cheapest register left, and the reason is worth
- * recording: freeing rax/rcx/rdx/rdi needs the emitter to allocate its
- * SCRATCH (~670 hardcoded uses), whereas rsi/r8 are pinned CONSTANTS -
- * nothing computes into them. Every single R8R use in this file is in
- * emit_sync_push_native or emit_ret_native, the SAME two functions,
- * safe for the SAME two reasons, that admitted r9: a run containing a
- * MyLang call takes no caller-saved pin at all, and emit_ret_native
- * flushes the cache on its first line.
- */
-static bool run_needs_float_tag(const Chunk &ck, size_t begin, size_t end);
 
-static size_t jit_xcache_count(const Chunk &ck, size_t begin, size_t end)
+/* Which XCACHE registers this run must NOT spend, because they still
+ * hold a type singleton. Empty when both tags encode as imm32. */
+static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
 {
-    /* ⛔ ONE PREDICATE for one question. r8 is EITHER the t_float
-     * singleton OR a pin, never both, so the pin decision and the tag
-     * decision must not be able to disagree - and they did: this asked
-     * the OPTIMISTIC `run_has_float` while emit_type_tags asked the
-     * CONSERVATIVE `run_needs_float_tag`, so a run the first called
-     * float-free and the second did not would have pinned r8 AND
-     * materialised the tag over it. Both ask the conservative one now,
-     * which makes `float_tag_live` and `reg_holds_pin(8)` mutually
-     * exclusive BY CONSTRUCTION. */
-    return run_needs_float_tag(ck, begin, end) ? MAX_XCACHED - 1
-                                               : MAX_XCACHED;
+    uint32_t busy = 0;
+    /*
+     * ⛔ THE TAG IS NOT r8's ONLY JOB, and this is the finding that
+     * stops step 3 here. With the arena the t_float TAG is an
+     * immediate, so r8 looks free in every run - and making it so fails
+     * four float tests. r8 is ALSO SysV argument 5 and raw scratch
+     * (~20 `movabs_r8` sites), and the run_needs_float_tag gate was
+     * quietly doubling as an exclusion for those paths.
+     *
+     * So r8 stays available only where that gate already proved the run
+     * safe. Freeing a register from a CONSTANT was necessary and is not
+     * sufficient: rsi/rax/rcx/rdx/rdi/r8 all need the emitter to
+     * ALLOCATE its scratch before they can be pinned generally.
+     */
+    if (run_needs_float_tag(ck, begin, end))
+        busy |= 1u << 8;
+    return busy;
 }
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
 /* #96: the TOTAL int pin budget, exported so a coverage test can size
@@ -7417,13 +7478,13 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
         return;
     }
     e.load_type(a.type);                 /* rax = slot type */
-    e.cmp_rax_r8();                       /* == t_float ? */
+    e.cmp_rax_tag(jit_layout().t_float, 8);                       /* == t_float ? */
     const size_t j_notf = e.j8(0x75);     /* jne -> not float */
     e.fload(xr, a.payload);               /* FAST: movsd xmm, [payload] */
     const size_t j_done1 = e.j8(0xEB);    /* jmp done */
     e.patch8(j_notf, e.pos());
     if (!no_bail) {
-        e.cmp_rax_rsi();                  /* == t_int ? */
+        e.cmp_rax_tag(jit_layout().t_int, RSI);                  /* == t_int ? */
         const size_t j_int = e.j8(0x74);  /* je -> promote */
         e.exit_pc(bail_pc);               /* neither -> bail */
         e.patch8(j_int, e.pos());
@@ -9009,10 +9070,10 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     /* both keys must be plain ints (boxed slots - the interpreter's
      * "Expected integer as subscript" declines to the helper) */
     e.load(RAX, k1.type);
-    e.cmp_rax_rsi();
+    e.cmp_rax_tag(jit_layout().t_int, RSI);
     decline_ne();
     e.load(RAX, k2.type);
-    e.cmp_rax_rsi();
+    e.cmp_rax_tag(jit_layout().t_int, RSI);
     decline_ne();
 
     /* OUTER: an array, not a slice, not readonly, GENERAL storage */
@@ -9085,9 +9146,9 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
 
         /* --- FLOAT row, plain: value promotes like the interpreter --- */
         e.load(RDX, val.type);
-        e.cmp_rdx_r8();                        /* t_float? */
+        e.cmp_reg_tag(RDX, jit_layout().t_float, 8);                        /* t_float? */
         const size_t j_vf = e.j8(0x74);
-        e.cmp_rdx_rsi();                       /* t_int? (promote) */
+        e.cmp_reg_tag(RDX, jit_layout().t_int, RSI);                       /* t_int? (promote) */
         decline_ne();
         e.cvt(X0, val.payload);                /* cvtsi2sd xmm0, [val] */
         const size_t j_vgot = e.j8(0xEB);
@@ -9123,9 +9184,9 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         decline_if(0xEB);                      /* other kinds: helper */
         e.patch32_here(j_floats);
         e.load(RDX, val.type);
-        e.cmp_rdx_r8();
+        e.cmp_reg_tag(RDX, jit_layout().t_float, 8);
         const size_t j_vf = e.j8(0x74);
-        e.cmp_rdx_rsi();
+        e.cmp_reg_tag(RDX, jit_layout().t_int, RSI);
         decline_ne();
         e.cvt(X0, val.payload);
         const size_t j_vgot = e.j8(0xEB);
@@ -9148,7 +9209,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     /* --- INT row (plain or compound) --- */
     e.patch32_here(j_ints);
     e.load(RDX, val.type);
-    e.cmp_rdx_rsi();
+    e.cmp_reg_tag(RDX, jit_layout().t_int, RSI);
     decline_ne();
     e.load(RDI, val.payload);
     if (divmod) {
@@ -11515,16 +11576,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 #endif
             if (comp) {
                 e.load_type(slot_addr(in.target).type);
-                e.cmp_rax_r8();
+                e.cmp_rax_tag(jit_layout().t_float, 8);
                 j_slows.push_back(e.j32(0x75));
             } else if (!bo.a.is_lit) {
                 e.load_type(slot_addr(bo.a.slot).type);
-                e.cmp_rax_r8();
+                e.cmp_rax_tag(jit_layout().t_float, 8);
                 j_slows.push_back(e.j32(0x75));
             }
             if (!bo.b.is_lit) {
                 e.load_type(slot_addr(bo.b.slot).type);
-                e.cmp_rax_r8();
+                e.cmp_rax_tag(jit_layout().t_float, 8);
                 j_slows.push_back(e.j32(0x75));
             }
 #ifdef TESTS
@@ -14163,7 +14224,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * callee-saved registers this fragment takes over and therefore
          * what frag_entry must push (and what every exit must pop). */
         e.cache.clear();
-        e.reg_busy = 0;
+        /* #96 step 3: a register still carrying a type singleton starts
+         * BUSY, so take_reg cannot hand it to a pin. With the
+         * low-address arena the mask is empty and rsi/r8 are ordinary
+         * pool registers. */
+        e.reg_busy = jit_xcache_busy(chunk, begin, end);
         e.tflush.clear();       /* C3: per-RUN like the pools */
         /* #96: the pending exits + their interned cache states are also
          * per-RUN. emit_epilogues clears them, but a run whose emission
@@ -14228,8 +14293,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         const bool xcache_ok = hregs.empty()
             && !jit_run_blocks_xcache(chunk, begin, end)
             && !jit_lever_off(JL_XCACHE);
-        const size_t n_xcache =
-            xcache_ok ? jit_xcache_count(chunk, begin, end) : 0;
+        const uint32_t xbusy = jit_xcache_busy(chunk, begin, end);
+        size_t n_xcache = 0;
+        if (xcache_ok)
+            for (size_t i = 0; i < MAX_XCACHED; i++)
+                if (!(xbusy & (1u << XCACHE_REGS[i])))
+                    n_xcache++;
         const size_t max_pins = MAX_CACHED + n_xcache;
         std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
@@ -14275,7 +14344,19 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 } else if (hot.size() >= 2
                            && 12 * u2 > hot_counts[hot.size() - 1]
                                         + hot_counts[hot.size() - 2]) {
-                    hot.resize(hot.size() - 2);
+                    /* drop the two COLDEST pins to free the pair.
+                     * `pop_back` twice, not `resize(size() - 2)`: the
+                     * `size() >= 2` guard above makes both correct, but
+                     * the subtraction is a size_t that UNDERFLOWS if a
+                     * future edit weakens the guard, and GCC's LTO
+                     * inliner cannot always carry the range fact across
+                     * the reallocated call tree - it reported a
+                     * -Wstringop-overflow on the `memset` behind
+                     * `resize`, with a size of (size_t)-12, and WERROR
+                     * turned that into a failed release build. This
+                     * spelling cannot express the bad value at all. */
+                    hot.pop_back();
+                    hot.pop_back();
                     pair_lo = CACHE_REGS[hot.size()];
                     pair_hi = CACHE_REGS[hot.size() + 1];
                 }
@@ -14306,7 +14387,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         for (size_t h = 0; h < hot.size(); h++) {
             int r = e.take_reg(CACHE_REGS, MAX_CACHED);
             if (r < 0 && xcache_ok)
-                r = e.take_reg(XCACHE_REGS, n_xcache);
+                r = e.take_reg(XCACHE_REGS, MAX_XCACHED);
             ML_CHECK(r >= 0);            /* hot.size() <= max_pins */
             hot_reg[h] = static_cast<uint8_t>(r);
             if (jit_reg_is_callee_saved(hot_reg[h]))

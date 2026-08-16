@@ -1095,3 +1095,44 @@ So the remaining registers (rsi, r8, rax, rcx, rdx, rdi) are ALL
 blocked on the same thing: **the emitter must allocate its scratch.**
 That is the one large piece left in #96, and steps 1-2 were the
 prerequisite for it, not a substitute.
+
+### Step 3 LANDED (2026-08-17) - and what it did NOT buy
+
+Recovered from the session transcript after I destroyed the working
+tree with `git checkout --`; see the standing rule now in the per-user
+CLAUDE.md. The lost hour was replayable only by luck.
+
+DONE: the tag materialisations are gone on Linux x86-64 (`movabs`
+-31.8%, all emitted instructions -6.72% corpus-wide, code ~6% smaller);
+`cmp_reg_tag` is the read seam; `jit_xcache_busy` replaced the prefix
+count with a per-register mask. -rt 1921/1921, four differentials,
+corpus_diff plain/--levers/--cold, norec_enum depth 3 all green.
+Wall clock flat (suite 1.006x) - banked as a prerequisite, per the
+cost model.
+
+**THE BLOCKING FACT, now measured rather than suspected:** freeing a
+register from a CONSTANT does not free the REGISTER.
+
+    rsi  = t_int   AND SysV arg 2 AND ~84 raw scratch sites
+    r8   = t_float AND SysV arg 5 AND ~20 raw scratch sites
+    rax 297   rcx 165   rdx 133   rdi 76   (scratch mentions)
+
+`run_needs_float_tag` had been quietly doubling as r8's exclusion for
+the argument/scratch role, which is why r8-as-a-pin ever appeared to
+work. Adding rsi to XCACHE_REGS fails -rt at once.
+
+**SO THE NEXT STEP IS THE EMITTER'S SCRATCH ALLOCATION, and it is the
+whole remaining piece of #96.** Sketch, to be argued before building:
+
+ 1. give the Emitter a scratch REQUEST api (`take_scratch()` /
+    `scoped_scratch`), initially satisfied by exactly the registers
+    hardcoded today, so the change is provably byte-identical
+    (`scripts/vdjcmp.sh` over the corpus is the oracle);
+ 2. convert the ~670 sites family by family, each conversion
+    byte-identical, never a behaviour change bundled with a refactor
+    (see [[bundled-change-needs-a-kill-switch]]);
+ 3. only then let the pool draw from the freed set, one register at a
+    time, each with its own measurement.
+
+Step 1-2 are pure restructuring and can be verified absolutely; step 3
+is where the 13 registers actually arrive.
