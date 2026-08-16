@@ -19,6 +19,7 @@
 #include <type_traits>
 #include <cassert>
 #include <cstddef>
+#include <cstring>
 
 class LValue;
 class ExprList;
@@ -311,6 +312,20 @@ public:
     void abandon_borrowed() {
         type = AllTypes[Type::t_none];
         val.ival = 0;
+    }
+
+    /*
+     * The mirror of abandon_borrowed(): take the bits of another value
+     * WITHOUT taking a reference to what they point at. Same single caller
+     * (LValue::borrow_from), same #94 justification.
+     *
+     * This is byte-for-byte what the emitter's SCALAR argument arm already
+     * does - a 24-byte payload copy plus the type word - so writing it in
+     * C++ keeps the two bind paths one implementation rather than two that
+     * must be kept in step.
+     */
+    void copy_bits_borrowed(const EvalValue &src) {
+        std::memcpy(static_cast<void *>(this), &src, sizeof(EvalValue));
     }
 
     template <class T>
@@ -757,7 +772,22 @@ public:
      * `borrowed` member. The caller owns the reference for the whole of the
      * synchronous call, which is what makes the elided retain sound.
      */
-    void mark_borrowed() { borrowed = true; }
+    void borrow_from(const EvalValue &v) {
+        ML_CHECK(!borrowed);
+        /*
+         * NO release of what the slot held: a callee window slot is free at
+         * bind time, because the frame pop clears every ref_slot and a
+         * parameter slot is always listed there. The emitter's scalar arm
+         * has always assumed exactly this (it overwrites the slot raw), and
+         * pop_window's ML_VM_HARDENING re-scan - every slot trivial after
+         * the pop - is the standing net for a ref_slots that missed one.
+         */
+        val.copy_bits_borrowed(v);
+        container = nullptr;
+        is_const = false;
+        borrowed = true;
+        type_checks();
+    }
     bool is_borrowed() const { return borrowed; }
 
     /*

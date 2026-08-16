@@ -248,6 +248,12 @@ struct JitPushLayout {
     /* desc_bind_req: FuncDescriptor::bind_req (vector; data at +0) - the
      * per-parameter required Type singleton, read only when !fast_bind */
     ptrdiff_t desc_params, desc_frame_size, desc_fast_bind, desc_bind_req;
+    /* #94: FuncDescriptor::noescape_params - the escape analysis's
+     * per-parameter bit, read in the emitted push's REFERENCE arm to pick
+     * between the retaining and the borrowing helper. The callee is an
+     * inline CACHE here, not a compile-time constant, so this cannot be
+     * resolved at emit time the way the C++ bind resolves it. */
+    ptrdiff_t desc_noescape;
     size_t param_desc_size;
     /* Chunk (ck_plain_frame: the DERIVED byte flag that already means
      * "no trys, no dict iters, no dyn iters" - one test for three) */
@@ -427,8 +433,18 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept;
  * parent's `slices` set on copy - so this runs fast_bind's exact per-argument
  * step. `g_jit_ref_arg_binds` is the execution proof (TESTS builds).
  */
-extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src) noexcept;
+/*
+ * `can_borrow` is #94 THE BORROW BIND: the escape analysis proved the
+ * reference bound to this parameter cannot outlive the call, so the slot
+ * takes a raw bit-copy with NO retain and the frame pop must not release it
+ * either (LValue::frame_release). The emitted push reads the bit out of the
+ * callee descriptor - which is an inline CACHE there, not a compile-time
+ * constant - and the helper applies the one dynamic exclusion (a slice).
+ */
+extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src,
+                                 int_type can_borrow) noexcept;
 extern unsigned long g_jit_ref_arg_binds;
+extern unsigned long g_arg_borrow, g_arg_borrow_slice;
 
 /*
  * THE IN-PLACE ARGUMENT's cold arm (#162). A fused call site binds some

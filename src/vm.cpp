@@ -3272,6 +3272,17 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
  * argument is an array/string/dict/struct, which used to decline entirely). */
 unsigned long g_jit_ref_arg_binds = 0;
 
+/*
+ * #94 execution proof, and the reason there are TWO counters: a single
+ * "borrow" total cannot tell "the tier ran" from "the tier was reachable but
+ * every value declined", which is the exact shape the project's vacuous-test
+ * trap takes. `g_arg_borrow` is bumped ONLY where the retain was skipped;
+ * `g_arg_borrow_slice` counts a parameter the analysis cleared whose value
+ * turned out to be a slice, so a decline is attributable rather than silent.
+ */
+unsigned long g_arg_borrow = 0;
+unsigned long g_arg_borrow_slice = 0;
+
 /* THE IN-PLACE ARGUMENT (#162): bumped by the EMITTED copy loop, once per
  * fused argument bound from its caller slot. */
 unsigned long g_jit_arg_inplace = 0;
@@ -3318,12 +3329,95 @@ extern "C" void jit_stage_args(const int32_t *pairs, int_type n) noexcept
  * `w->at(i).rebind(argrun[i].get())`), so the two paths cannot drift.
  * noexcept: a copy-assign of an EvalValue does not throw.
  */
-extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src) noexcept
+/*
+ * #94 THE BORROW BIND - the consumer of the parameter escape analysis
+ * (resolver.cpp, FuncDescriptor::noescape_params).
+ *
+ * When the analysis proves the reference bound to a parameter cannot still be
+ * reachable after the call returns, the callee slot does not need a reference
+ * of its own: the CALLER's slot holds one for the whole of the synchronous
+ * call. So bind it as a raw bit-copy and skip the retain here and the release
+ * at the frame pop - the pair this whole path exists to pay.
+ *
+ * ⛔ ONE runtime exclusion, and dropping it is a use-after-free, not a leak:
+ * a SLICE registers itself in its parent's live-slices set when it is COPIED,
+ * and an element write to the parent then DETACHES every registered slice in
+ * place (clone_aliased_slices). A borrowed slice is not in that set, so such a
+ * write would leave it pointing at storage that has just been handed to
+ * somebody else - and freed outright, if the caller's slot held the last
+ * reference. Every OTHER reference type's copy is a plain retain with no
+ * registration, which is exactly what makes the bit-copy symmetric with
+ * LValue::frame_release()'s abandon.
+ *
+ * `can_borrow` is the callee descriptor's bit for THIS parameter. It is read
+ * at run time on both paths, not baked at emit time, because the emitted push
+ * reaches its callee through an inline CACHE - the descriptor is a register
+ * there, not a compile-time constant.
+ */
+static ML_ALWAYS_INLINE bool vm_value_is_slice(const EvalValue &v)
+{
+    return v.get_type()->t == Type::t_arr
+           && v.get_ref<SharedArrayObj>().is_slice();
+}
+
+static ML_ALWAYS_INLINE void
+vm_bind_arg(LValue &dst, const EvalValue &v, bool can_borrow)
+{
+    /*
+     * ⛔ ONLY A REFERENCE IS EVER BORROWED, and the `t >= t_str` test is
+     * load-bearing rather than an optimization. The release scan skips a
+     * slot holding a TRIVIAL value - correctly, there is nothing to release
+     * - so a borrowed int would keep its flag set forever, and the next call
+     * to reuse that window slot would rebind over a slot still marked
+     * borrowed. Caught by rebind's ML_CHECK on the first run, in a template
+     * whose un-annotated parameter is not `binds_scalar` (so the analysis
+     * claims it) but holds an int at run time - ackermann.
+     *
+     * It costs nothing: a trivial value's rebind is already a bit-copy with
+     * no refcount, which is exactly what the borrow would have done.
+     */
+    if (can_borrow && v.get_type()->t >= Type::t_str
+            && !vm_value_is_slice(v)) {
+#ifdef TESTS
+        g_arg_borrow++;
+#endif
+        dst.borrow_from(v);
+        return;
+    }
+#ifdef TESTS
+    if (can_borrow)
+        g_arg_borrow_slice++;
+#endif
+    dst.rebind(v);
+}
+
+/*
+ * Bind ONE reference argument for the fragment-inline sync push (M5b).
+ *
+ * The inline push copies a scalar argument as raw bytes - 24 bytes of payload
+ * plus the type word - and used to DECLINE the whole push when any argument
+ * held a reference, sending the call to the C++ slow tier. That decline was
+ * not a micro-cost: it is 100% of the calls in any code that passes an array,
+ * string, dict or struct, i.e. most real code (measured: 76_funcval_dispatch
+ * took the slow tier on all 1,000,000 of its calls, 55% of the benchmark's
+ * instructions, while the same shape with an int argument took it ONCE).
+ *
+ * The retaining copy cannot be inlined as a refcount bump, which is why it is
+ * a call: a SLICE registers itself in its parent's `slices` set on copy, so a
+ * raw payload copy plus a retain would corrupt that set. Deferring to the real
+ * C++ copy is correct by construction for every reference type.
+ *
+ * This is `fast_bind`'s per-argument step verbatim (vm_frame_setup_lean's own
+ * vm_bind_arg call), so the two paths cannot drift.
+ * noexcept: neither a copy-assign nor a bit-copy of an EvalValue throws.
+ */
+extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src,
+                                 int_type can_borrow) noexcept
 {
 #ifdef TESTS
     g_jit_ref_arg_binds++;
 #endif
-    dst->rebind(src->get());
+    vm_bind_arg(*dst, src->get(), can_borrow != 0);
 }
 
 /*
@@ -6814,8 +6908,10 @@ vm_frame_setup(VmActivation &act, EvalContext &ctx, const Chunk *ret_chunk,
     rec.cache_key = std::move(ckey);
 
     if (d->fast_bind) {
+        const uint64_t noesc = d->noescape_params;
         for (size_t i = 0; i < nargs; i++)
-            w->at(static_cast<int_type>(i)).rebind(argrun[i].get());
+            vm_bind_arg(w->at(static_cast<int_type>(i)), argrun[i].get(),
+                        i < 64 && (noesc >> i & 1));
         for (size_t i = nargs; i < nparams; i++)
             w->at(static_cast<int_type>(i)).rebind(EvalValue());
     } else {
@@ -6884,8 +6980,10 @@ vm_frame_setup_lean(VmActivation &act, EvalContext &ctx,
     rec.call_site_packed = 0;            /* #56: no stale switch site */
     ML_CHECK(!rec.cache_key);            /* pop reset it / fresh is null */
 
+    const uint64_t noesc = d->noescape_params;
     for (size_t i = 0; i < nargs; i++)
-        w->at(static_cast<int_type>(i)).rebind(argrun[i].get());
+        vm_bind_arg(w->at(static_cast<int_type>(i)), argrun[i].get(),
+                    i < 64 && (noesc >> i & 1));
     for (size_t i = nargs; i < nparams; i++)
         w->at(static_cast<int_type>(i)).rebind(EvalValue());
 
@@ -8544,6 +8642,8 @@ void jit_fill_push_layout(JitPushLayout *L)
         reinterpret_cast<const char *>(&fd.frame_size) - db;
     L->desc_fast_bind = reinterpret_cast<const char *>(&fd.fast_bind) - db;
     L->desc_bind_req = reinterpret_cast<const char *>(&fd.bind_req) - db;
+    L->desc_noescape =
+        reinterpret_cast<const char *>(&fd.noescape_params) - db;
     L->param_desc_size = sizeof(FuncDescriptor::ParamDesc);
     Chunk ck;
     const char *cb = reinterpret_cast<const char *>(&ck);

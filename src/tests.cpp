@@ -27824,6 +27824,157 @@ static bool jit_ref_arg_bind()
 }
 
 /*
+ * #94 THE BORROW BIND, PER SHAPE - the consumer of the parameter escape
+ * analysis, and the three shapes that must DECLINE it.
+ *
+ * When the analysis proves the reference bound to a parameter cannot still be
+ * reachable after the call returns, the callee slot takes a raw bit-copy of
+ * the caller's and skips both the retain here and the release at the frame
+ * pop. A value check alone proves nothing - the retaining bind computes the
+ * same answer - so every case asserts its OWN counter delta. Program-wide
+ * totals would let the borrowing shape pay for the declining one, which is
+ * the project's standing vacuous-test trap.
+ *
+ * `g_arg_borrow` is bumped only where the retain was actually skipped;
+ * `g_arg_borrow_slice` only where the analysis cleared the parameter and the
+ * VALUE turned out to be a slice. Having both is what distinguishes "the tier
+ * ran" from "the tier was reachable and every value declined".
+ *
+ * ⛔ THE SLICE CASE IS THE ONE WHOSE FAILURE IS A USE-AFTER-FREE, so it is
+ * written to fail LOUDLY on a value, not merely to count: a slice registers
+ * itself in its parent's live-slices set when copied, and an element write to
+ * the parent DETACHES every registered view in place. A borrowed slice is in
+ * no such set, so the write leaves it reading the parent's mutated storage
+ * instead of its own detached snapshot. WATCHED: deleting the vm_value_is_slice
+ * test from vm_bind_arg makes this case print the post-write value.
+ */
+static bool jit_borrow_arg_shapes()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    /*
+     * FIRES: a plain (non-slice) array read through a parameter that never
+     * escapes. The body is several statements on purpose - a small one is
+     * inlined away and leaves no call to bind at all.
+     */
+    unsigned long b0 = g_arg_borrow, s0 = g_arg_borrow_slice;
+    if (!run({ "func total(array a, int k) {",
+               "  var t = a[0] + a[1];",
+               "  var u = t * 2 - k;",
+               "  var v = u - t;",
+               "  return v + t - v;",
+               "}",
+               "var arr = [3, 4, 5];",
+               "var s = 0;",
+               "for (var i = 0; i < 60; i++) s += total(arr, i);",
+               "assert(s == 420);" }))
+        return false;
+    if (g_arg_borrow <= b0 || g_arg_borrow_slice != s0)
+        return false;
+
+    /*
+     * DECLINES - the callee STORES the argument into a global, so the
+     * reference outlives the call and the analysis must never claim it.
+     * Nothing else in this program passes a reference, so the counter is
+     * attributable: any bump here is the escape rule failing.
+     */
+    b0 = g_arg_borrow;
+    if (!run({ "var keep = [0];",
+               "func stash(array a, int k) {",
+               "  var t = a[0] + k;",
+               "  var u = t * 2;",
+               "  keep = a;",
+               "  return u - t;",
+               "}",
+               "var arr = [7, 8];",
+               "var s = 0;",
+               "for (var i = 0; i < 60; i++) s += stash(arr, i);",
+               "assert(s == 2190);",
+               "assert(keep[0] == 7);" }))
+        return false;
+    if (g_arg_borrow != b0)
+        return false;
+
+    /*
+     * DECLINES - a SLICE value. The parameter IS cleared by the analysis
+     * (`view` never escapes `sum2`), so the static half of the gate is
+     * satisfied and only the runtime slice test can refuse it. The parent is
+     * written THROUGH THE OTHER PARAMETER during the call, so a borrowed view
+     * would observe the write.
+     */
+    b0 = g_arg_borrow;
+    s0 = g_arg_borrow_slice;
+    if (!run({ "func sum2(array p, array view) {",
+               "  var a = view[0];",
+               "  p[1] = 99;",
+               "  var b = view[0];",
+               "  return a * 1000 + b;",
+               "}",
+               "var base = [10, 20, 30, 40];",
+               "var acc = 0;",
+               "for (var i = 0; i < 60; i++) {",
+               "  base[1] = 20;",
+               "  var sl = base[1:3];",
+               "  acc = acc + sum2(base, sl);",
+               "}",
+               /* both reads see 20: the write detached the view */
+               "assert(acc == 60 * 20020);" }))
+        return false;
+    if (g_arg_borrow_slice <= s0)
+        return false;         /* the slice never reached the decline */
+
+    /*
+     * DECLINES - a SCALAR parameter. The analysis skips it (there is no
+     * reference to borrow), and the bind must too: the release scan leaves a
+     * trivial slot alone, so a borrowed int would keep its flag set forever
+     * and the next call to reuse that window slot would rebind over it.
+     */
+    b0 = g_arg_borrow;
+    if (!run({ "func addk(int a, int k) {",
+               "  var t = a + k;",
+               "  var u = t * 2;",
+               "  var v = u - t;",
+               "  return v;",
+               "}",
+               "var s = 0;",
+               "for (var i = 0; i < 60; i++) s += addk(i, 3);",
+               "assert(s == 1950);" }))
+        return false;
+    if (g_arg_borrow != b0)
+        return false;
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * #162 THE IN-PLACE ARGUMENT - the emitted shape, and its DECLINES.
  *
  * The behaviour cases in the `tests` table run in every engine and would
@@ -28201,6 +28352,8 @@ static bool jit_counter_coverage()
         { "release_entry",    &g_jit_release_entry,    nullptr },
         { "relent_stores",    &g_jit_relent_stores,    nullptr },
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
+        { "arg_borrow",       &g_arg_borrow,           nullptr },
+        { "arg_borrow_slice", &g_arg_borrow_slice,     nullptr },
         { "arg_inplace",      &g_jit_arg_inplace,      nullptr },
         { "arg_stage",        &g_jit_arg_stage,        nullptr },
         { "inline_baked",     &g_jit_inline_baked,     nullptr },
@@ -30727,6 +30880,9 @@ static const std::vector<extra_check> extra_checks =
       jit_native_call },
     { "jit: the inline push binds a REFERENCE argument (no slow-tier decline)",
       jit_ref_arg_bind },
+    { "jit: #94 the BORROW bind - a non-escaping reference argument takes no "
+      "retain; escaping / slice / scalar shapes each decline",
+      jit_borrow_arg_shapes },
     { "jit: native container + bytecode island (model-flip M3)",
       jit_container },
     { "jit: nativized ops actually run natively (g_jit_op_calls bumps)",
