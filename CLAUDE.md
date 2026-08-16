@@ -1130,6 +1130,30 @@ and it lives *inside the parser*. Mechanics:
   `CallExpr` folds when
   the callee and all args are const — that's how
   `sort(arr, pure func(a,b) => a<b)` runs at parse time.
+- **⛔ A DECLARATION BEATS THE CONST BUILTIN IT SHADOWS (#133, 2026-08-09).**
+  `pAcceptId` used to resolve a name straight to a const builtin without ever
+  asking what the program declared, so `func abs(x){return 42;}` gave
+  `abs(-1)` == **1** (the builtin, folded) and `abs(runtime(-1))` == **42**
+  (the function) — the same call, two answers, and a RULE 2 violation (`-nc`
+  printed 42 twice). It hit five shapes: the func name used after OR before
+  its decl, a param in a `=> expr` body (which folded `<builtin> + 1` into a
+  COMPILE error), a lambda param, and a foreach loop var.
+  The fix is **`ParseContext::shadowed`** (parser.h): names that also name a
+  const builtin, which `pAcceptId` refuses to const-resolve. Two feeders,
+  deliberately different in reach — a **token PRE-SCAN in the ParseContext
+  ctor** for every `func NAME`/`struct NAME` in the stream (whole-parse, since
+  #134 binds those at SCOPE ENTRY so a use ABOVE the decl already means the
+  user's function, which a single-pass parser cannot know at the use), and a
+  **scoped push/pop** for params (`pAcceptFuncDecl`, around BOTH body forms —
+  the `=> expr` sugar never reaches `pBlock`) and foreach vars. `pBlock`
+  pushes a scope in lockstep with the CSE cache. A `pure func` is NOT
+  shadowed: it IS the const evaluator's own binding and must keep folding.
+  The pre-scan is intentionally over-broad (a nested `func abs` shadows the
+  name everywhere): shadowing only ever COSTS A FOLD, never an answer, since
+  the resolver then binds the name correctly at run time — so when in doubt,
+  shadow. **A `var`/`const` of that name is still refused outright**
+  (`CannotRebindBuiltinEx`, `declExprCheckId`); this rule is for the forms
+  that were always allowed.
 - **Early failure:** exceptions raised *during* const-eval propagate immediately
   and are *not*
   catchable by script `try/catch` (the parser never enters a const assignment

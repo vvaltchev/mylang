@@ -10,6 +10,7 @@
 #include <string_view>
 
 class EvalContext;
+class UniqueId;
 class Block;
 struct AnalysisInfo;
 struct StructTypeDef;
@@ -82,6 +83,46 @@ public:
 
     ParseContext(const TokenStream &ts, bool const_eval);
     ~ParseContext(); // out-of-line: CseCache is incomplete here (PIMPL)
+
+    /*
+     * #133 - THE SHADOWED-CONST-BUILTIN SET. A declaration may name a const
+     * builtin (`func abs(x) { return 42; }`, a param, a foreach var), and the
+     * parse-time const evaluator used to ignore it completely: `abs(-1)`
+     * folded through to the BUILTIN while `abs(runtime(-1))` called the user's
+     * function - the same call spelled two ways giving two answers, and a
+     * RULE 2 violation (`-nc` disagreed with the default).
+     *
+     * So each such name is recorded here for the extent of its scope, and
+     * pAcceptId refuses to resolve it to the const builtin. A flat vector with
+     * per-scope MARKS, not a map: an entry is only ever added for a name that
+     * IS a const builtin, so in every real program the set is EMPTY and
+     * `shadowed.empty()` short-circuits the lookup to one compare.
+     *
+     * NOT for a `pure func`: that IS the const evaluator's own binding (it
+     * registers itself in const_ctx and must keep folding).
+     */
+    std::vector<const UniqueId *> shadowed;
+    std::vector<size_t> shadow_marks;
+
+    void shadow_push() { shadow_marks.push_back(shadowed.size()); }
+    void shadow_pop()
+    {
+        ML_CHECK(!shadow_marks.empty());   /* an unbalanced push/pop */
+        shadowed.resize(shadow_marks.back());
+        shadow_marks.pop_back();
+    }
+    /* Record `uid` iff it names a const builtin (else a no-op, so the set
+     * stays empty for normal code). Defined out-of-line: const_builtins. */
+    void shadow_add(const UniqueId *uid);
+    bool is_shadowed(const UniqueId *uid) const
+    {
+        if (shadowed.empty())
+            return false;
+        for (const UniqueId *s : shadowed)
+            if (s == uid)
+                return true;
+        return false;
+    }
 
     /*
      * A declaration's pending explicit-type annotation (e.g. the `int` in
