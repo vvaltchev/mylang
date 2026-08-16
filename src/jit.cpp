@@ -5347,6 +5347,8 @@ void jit_stats_report()
          * answerable only from inside -rt before (see the MYLANG_JITSTATS
          * note in CLAUDE.md: that gap is how a per-call cost came to be
          * quoted for a path most calls skip) */
+        { "noesc_funcs",      &g_noescape_funcs },
+        { "noesc_params",     &g_noescape_marks },
         { "cb_prepared",      &g_invoke_prepared },
         { "cb_fallback",      &g_invoke_fallback },
         /* THE CALL PROTOCOL - which tier each call took */
