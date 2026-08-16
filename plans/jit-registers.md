@@ -913,3 +913,81 @@ increment below adds or edits an opcode-keyed decision, and every one of
 them fails SILENTLY when it goes stale. Before landing one, ask whether
 its table has an enumeration a ratchet can walk - and if it does not,
 build the enumeration first.
+
+## The type SINGLETONS: why they must stop living in registers (2026-08-17)
+
+**Maintainer's instruction:** *"constants should not be pinned to
+registers, you should use immediate operands instead... Use immediate
+operands as much as possible, they're fast and cheap."* Correct, and
+the day's work proved it from the other side.
+
+### What the register scheme costs, measured
+
+`rsi` holds `t_int` and `r8` holds `t_float`. They are compile-time
+CONSTANTS, yet they are re-materialised constantly, because both are
+caller-saved: `emit_call_epilogue` re-does `movabs` after EVERY helper
+call. Counted over the emitted code:
+
+| bench | type stores via rsi | `movabs rsi` | `movabs r8` |
+|---|---|---|---|
+| 09_fib_recursive | 42 | **108** | **106** |
+| 46_matrix_mult | 57 | **101** | **102** |
+| 43_sieve | 31 | 48 | 46 |
+
+**More materialisations than uses**, and on 09_fib_recursive - which
+contains no float arithmetic at all - 106 `movabs r8` for a constant
+nothing reads.
+
+### And it made r8 UNSAFE to pin
+
+Pinning r8 (d4b40c5) asked `run_has_float`, an OPTIMISTIC whitelist:
+true for listed float ops, false for everything else. Used as a NEED
+test it is unsound in the direction that matters, and it already was -
+`UnpackElemValue` passes r8 as a helper ARGUMENT and needs the
+singleton back, and is not in the list. So the pin gate got
+"float-free", took r8, and the epilogue wrote `t_float` over the pinned
+local. Nothing broke earlier only because the epilogue restored r8
+UNCONDITIONALLY, masking it.
+
+Fixed: ONE predicate, `run_needs_float_tag`, conservative (a run needs
+the tag UNLESS every op is positively known not to touch r8), asked by
+BOTH the pin gate and the tag materialisation - so `float_tag_live` and
+`reg_holds_pin(8)` are mutually exclusive by construction. Plus
+`emit_call_epilogue` never writes over a pin. `run_has_float` is
+DELETED; a comment stands where it was.
+
+**And the safe version costs the pin its whole benefit:**
+80_regs_int_08 now pins r8 **zero** times, because its fragment is not
+provably float-tag-free. The -40% data references r8 bought are gone.
+
+### THE CONCLUSION, and it decides the next step
+
+While the type tags live in registers, r8 cannot be freed usefully and
+rsi cannot be freed at all - so **two of the thirteen registers are
+unreachable by construction**, and ~100 instructions per program are
+spent re-creating constants.
+
+**The requirement, stated precisely, because it is easy to get wrong:**
+`mov qword [rbx+disp], imm32` SIGN-EXTENDS its immediate, so what is
+needed is a Type object at a LOW ABSOLUTE ADDRESS (< 2^31). "Near the
+generated code" is a different property - it buys RIP-relative
+addressing (`mov rax, [rip+d]; mov [slot], rax`), which is TWO
+instructions and therefore worse than the pinned register. Only the low
+absolute address gives the ONE-instruction store.
+
+Today the binary is PIE and loads around `0x6348_0000_0000`, so no Type
+pointer fits.
+
+**The fix is to place the singletons ourselves.** They are ~12 objects,
+constructed ONCE at startup, NEVER freed, a few hundred bytes total -
+so the allocator this needs is a BUMP POINTER over one `mmap`ed region
+(`MAP_32BIT` on Linux/x86-64, which is exactly where the JIT runs),
+with placement-new for the Type objects and a fallback to normal static
+storage anywhere else. No free list, no coalescing, no size classes, no
+thread safety: none of what a general allocator provides is used.
+
+The JIT then asks, per store, whether the pointer fits in an imm32 and
+emits `mov qword [slot], imm32` when it does - one instruction, no
+register, no entry materialisation, and no epilogue re-materialisation.
+rsi and r8 both become ordinary pool registers, taking the pool from 8
+to 10 with the two most-wasted instructions in the emitter deleted.
