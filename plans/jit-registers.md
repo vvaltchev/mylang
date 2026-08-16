@@ -1044,3 +1044,54 @@ JIT pages. The code buffer needs `MAP_JIT` plus
 hardened process needs the `com.apple.security.cs.allow-jit`
 entitlement. That is a constraint on the whole ARM64-on-Darwin backend,
 not on this task.
+
+### Step 3 ATTEMPTED and NOT LANDED - what it costs and where it stops
+
+With the arena in (e652a13) every type tag is an immediate, so the
+`movabs rsi`/`movabs r8` at each fragment entry and after each helper
+call are, apparently, dead - and rsi/r8 look like free pool registers.
+Both halves were tried. **Neither works yet, for the same reason.**
+
+**(a) rsi CANNOT be pinned.** Adding it to `XCACHE_REGS` fails `-rt`
+immediately. rsi is SysV ARGUMENT 2 and raw scratch at ~84 sites
+(`mov rsi, rax`, `lea rsi, <slot>`), most of them OUTSIDE any
+`emit_call_prologue` bracket, so a pin there is destroyed with nothing
+to restore it.
+
+**(b) DELETING the r8 materialisation breaks four float tests**, and
+this is the more interesting one because it means my reader audit was
+WRONG. I grepped for `cmp` against the tag registers, found only the
+three `cmp_q_imm8(R8R, ...)` sites in emit_sync_push_native /
+emit_ret_native (where r8 is scratch, not a tag), and concluded nothing
+reads r8 as t_float. Something does. Failing:
+
+    jit: C3 inc 3 float type-store elision admits safe TEMPS
+    jit: C4b float literal registers + register arith sources
+    jit: native container + bytecode island (model-flip M3)
+    jit: nativized ops actually run natively (g_jit_op_calls bumps)
+
+with the signature `flit ref-listed dst: got
+[9670410800713881878528.00000]` - a garbage float, i.e. a value read
+through a slot whose type word is wrong (or an r8 payload written where
+a type was expected). Note it fails the same way WITH the conservative
+pin gate restored, so it is the DELETION, not the pin.
+
+**WHERE TO LOOK NEXT** (the audit to redo properly rather than by
+grepping for `cmp`): the C4b float-literal path (`flit_load`,
+`pick_float_lits`), `emit_put_scalar_call`, and any site that writes a
+type field through a register the six converted ones did not cover.
+The right method is not another grep - it is to instrument
+`store_type_tag` and the r8 writers, or to diff `-vdj` for a failing
+program with and without the deletion and read what changed.
+
+⛔ **THE FINDING THAT MATTERS, AND IT IS THE PLAN-LEVEL ONE: freeing a
+register from a CONSTANT is NECESSARY BUT NOT SUFFICIENT.** rsi and r8
+each had TWO jobs - the type singleton AND an argument/scratch role -
+and the arena only removed the first. `run_needs_float_tag` was
+additionally, and silently, excluding the runs where r8 is used as an
+argument, which is why r8-as-a-pin appeared to work at all.
+
+So the remaining registers (rsi, r8, rax, rcx, rdx, rdi) are ALL
+blocked on the same thing: **the emitter must allocate its scratch.**
+That is the one large piece left in #96, and steps 1-2 were the
+prerequisite for it, not a substitute.
