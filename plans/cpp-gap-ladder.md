@@ -155,12 +155,32 @@ deltas is the loop-only ratio). It reorders the list substantially:
 | 35_map_filter | 7.11x | 8.74x |
 | 73_multi_unpack | 8.91x | 8.47x |
 | 03_int_arith | 1.36x | **1.18x** |
-| 09_fib_recursive | 6.41x | **0.09x** (FASTER than C++) |
+| 09_fib_recursive | 6.41x | ~~0.09x~~ **INVALID - see below** |
 
 03_int_arith is at PARITY once startup is removed - which independently
 confirms the rung-4 finding that its eleven slot references per iteration
-cost nothing. 09_fib_recursive BEATS C++ (the recursion unroll plus the
-per-frame pure-call cache against a naive recursive twin).
+cost nothing.
+
+⛔ **THE 09_fib_recursive ROW IS WRONG AND THE REASON MATTERS
+(corrected 2026-08-16).** It read "0.09x, FASTER than C++" and that was
+an artefact of the startup correction itself. The bench is
+`for (var k = 0; k < scale; k++) r = fib(29);` - and the PER-FRAME
+PURE-CALL CACHE dedups the repeated call, so **iterations 2..scale are
+cache HITS and MyLang's work does not scale at all**:
+
+    cache on (default)   scale 1: 93,116,925 Ir   scale 3: 93,121,763
+    -npc (cache off)     scale 1: 235,623,416     scale 3: 561,517,546
+
+The scale-3-minus-scale-1 delta is **4,838 instructions of cache hits**,
+so dividing it by C++'s real delta produced a meaningless ~0. C++ and
+CPython have no such cache and do the full work every iteration.
+
+TWO consequences. **The startup-correction method is only valid for a
+bench whose work actually scales** - check that before applying it, the
+way this row failed to. And at any scale > 1 this bench compares
+different amounts of work between the two languages, so its `scale`
+knob should not be raised without addressing that (at scale 1, the
+default, both sides do one fib(29) and the entry is honest).
 
 ### Step 2: classify each worst loop's emitted body
 

@@ -946,6 +946,26 @@ enumerated there. (Floats match: both are 64-bit IEEE `double`.)
 `bench/verify_semantics.{my,py}` assert that equivalence and must both print the
 same line.
 
+**⛔ THE PURE-CALL CACHE IS OFF FOR EVERY BENCHMARK RUN (maintainer-set,
+2026-08-16).** `bench/run.py` passes **`-npc`** by default, to the current
+binary AND to `--baseline`; `--pure-call-cache` opts back in, and the header
+line says which way the run went. **Claude never runs the suite with the
+cache on.** Two reasons, both measured:
+- **It is not a language comparison.** The per-frame cache memoizes a pure
+  call's result within one frame. C++, CPython, Ruby and Lua all re-execute
+  the call, so with the cache on a bench that repeats a pure call times
+  MyLang's memo table against the other language's real work.
+- **It makes `scale` NON-LINEAR, which invalidates the startup
+  correction.** `09_fib_recursive` is `for (k...) r = fib(29);` — iterations
+  2..N are cache HITS, so it costs **93,116,925 Ir at scale 1 and
+  93,121,763 at scale 3**. With `-npc`: 235.6M -> 561.5M, exactly linear.
+  The scale3-minus-scale1 correction therefore divided a 4,838-instruction
+  delta of cache hits by C++'s real one and produced a recorded
+  "09_fib_recursive 6.41x -> 0.09x, FASTER than C++" that was an artifact
+  (now marked INVALID in `plans/cpp-gap-ladder.md`). **Only
+  startup-correct a bench whose work actually SCALES** — and check that it
+  does, rather than assuming.
+
 **BENCHMARK-RUN DISCIPLINE — 1-vs-1 BY DEFAULT, the maintainer controls the
 deep runs (maintainer-set, 2026-07-19).** Do NOT run the bench suite over and
 over on your own initiative — `--repeat 3`, hand-rolled 25x loops, run-after-run

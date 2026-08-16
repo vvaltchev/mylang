@@ -49,6 +49,22 @@
 #   python3 bench/run.py --csv out.csv   # also write the table as CSV
 #   python3 bench/run.py -s              # also re-dump sorted by ratio (wins
 #                                        # first, regressions last)
+#   python3 bench/run.py --pure-call-cache   # re-ENABLE the per-frame pure
+#                                        # call cache (OFF by default - below)
+#
+# THE PER-FRAME PURE-CALL CACHE IS DISABLED BY DEFAULT (`-npc`), on BOTH the
+# current binary and --baseline (maintainer-set, 2026-08-16). It memoizes a
+# pure call's result within one frame, which NO comparison language does - C++,
+# CPython, Ruby and Lua all re-execute the call. Leaving it on makes a bench
+# that repeats a pure call measure MyLang's cache against the other language's
+# real work, which is not a language comparison at all, AND makes the `scale`
+# knob non-linear: 09_fib_recursive's `for (k...) r = fib(29);` costs 93.1M
+# instructions at scale 1 AND at scale 3, because iterations 2..N are cache
+# HITS (with -npc: 235M -> 561M, linear as intended). That silently invalidated
+# a startup correction (a scale3-minus-scale1 delta of nothing but cache hits)
+# and produced a recorded "09_fib_recursive is FASTER than C++" that was an
+# artifact. `--pure-call-cache` restores the old behaviour when you specifically
+# want to MEASURE the cache's contribution.
 
 import argparse
 import hashlib
@@ -756,6 +772,14 @@ def main():
     ap.add_argument("--tw", action="store_true",
                     help="run the current mylang with -tw (the tree-walking "
                          "interpreter).")
+    ap.add_argument("--pure-call-cache", action="store_true",
+                    help="re-enable the per-frame pure-call cache. It is "
+                         "DISABLED by default (-npc, on the current binary AND "
+                         "--baseline): no comparison language memoizes a pure "
+                         "call, so leaving it on measures MyLang's cache "
+                         "against the other language's real work and makes the "
+                         "`scale` knob non-linear on any bench that repeats a "
+                         "pure call. Pass this only to MEASURE the cache.")
     ap.add_argument("--python", default=sys.executable,
                     help="python interpreter (for --complang python)")
     ap.add_argument("-cl", "--complang", default="python",
@@ -956,6 +980,11 @@ def main():
     if calib_msg:
         print(calib_msg + "\n")
 
+    # The per-frame pure-call cache is OFF unless asked for - see the header
+    # comment. Applied to the current binary AND --baseline: an A/B with the
+    # cache on one side only would be nonsense.
+    pcc = [] if args.pure_call_cache else ["-npc"]
+
     print("mylang : %s%s" % (mylang,
                              "  (engine: -vm bytecode VM)" if args.vm
                              else "  (engine: -tw tree-walker)" if args.tw
@@ -964,6 +993,10 @@ def main():
         print("baseline: %s%s" % (args.baseline,
                                   "  (engine: -tw tree-walker)"
                                   if args.vm else ""))
+    print("purecache: %s" % (
+        "ON (--pure-call-cache) - NOT comparable to another language, "
+        "and `scale` may be non-linear" if args.pure_call_cache
+        else "off (-npc, the default)"))
     comp_desc = args.python if lobj.name == "python" else (
         "%s (%s)" % (lobj.name, args.cxx) if lobj.name == "cpp" else lobj.name)
     print("compare: %-8s %s  (cached)" % (lobj.name, comp_desc))
@@ -1014,7 +1047,7 @@ def main():
         eng = ["-vm"] if args.vm else (["-tw"] if args.tw else [])
         scale = scales[name]
         scale_arg = str(scale)
-        my_cmd = [mylang] + eng + [my_path, scale_arg]
+        my_cmd = [mylang] + eng + pcc + [my_path, scale_arg]
 
         # Measure the PRIMARY binary: adaptive reps until the variance gate is
         # met (or --repeat N for a fixed count). Needing more reps to settle is
@@ -1050,7 +1083,7 @@ def main():
         if has_base:
             beng = ["-tw"] if args.vm else []
             bt, _bout, _berr = run_reps(
-                [args.baseline] + beng + [my_path, scale_arg],
+                [args.baseline] + beng + pcc + [my_path, scale_arg],
                 n_reps, args.timeout)
             base_t = min(bt) if bt else None
 
