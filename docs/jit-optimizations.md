@@ -4328,3 +4328,72 @@ walks CALL-time frames, and the one check that would see it compares
 self-consistent by construction. The index form had the identical
 structure. Recorded here rather than fixed, since it is a pre-existing
 hole in a different path.
+
+## CONSTANT-DIVISOR STRENGTH REDUCTION (2026-08-14): the one place where
+## the instruction count was FINE and the clock was 8x off
+
+06_if_branch runs `i % 3` twice per iteration, costs **33 instructions
+per iteration** - only modestly worse than the C++ - and was **8.8x**
+its twin. The reason is not in the instruction count at all: the JIT
+emitted `cqo; idiv rcx` with a LITERAL divisor, and a 64-bit `idiv` is
+~26-40 CYCLES and not pipelined, so two of them serialize ~60 cycles
+into a body g++ finishes in ~10. g++ never emits idiv for a constant
+divisor. This is the INVERSE of the divergence the guard-elision family
+documents, and nothing in the usual discipline - which counts
+instructions - could have found it.
+
+THE IDENTITY, for |d| >= 2: pick the smallest shift s with
+`M = floor(2^(64+s)/d) + 1` and `e = M*d - 2^(64+s)` satisfying
+`e < 2^(s+1)`; then `floor(M*n / 2^(64+s))` is the floor quotient for
+every |n| <= 2^63, and the `shr 63; add` tail converts floor to
+MyLang's truncate-toward-zero. The bound is deliberately the
+CONSERVATIVE one (|n| <= 2^63 on BOTH sides rather than the tighter
+per-sign bounds a compiler uses): it costs one extra shift step for some
+divisors and makes ONE condition cover the whole int64 range, INT64_MIN
+included. A negative divisor negates the quotient; `n % d` is
+`n - (n/d)*d`.
+
+**THE ONE SUBTLETY, AND IT IS SILENT: `imul` IS SIGNED.** A reciprocal
+with its top bit set is read as `M - 2^64`, so the high half comes out
+`n` too low and the dividend must be added back. The first version
+gated that on "M did not fit in 64 bits" instead of "M >= 2^63", which
+is wrong for every divisor whose reciprocal lands in [2^63, 2^64) -
+including **3**. The effect: `3/3 == 0`, `7/3 == -1`, while every
+REMAINDER stayed correct (the mod path recomputes from its own
+quotient). The engine differential caught it on the first run.
+
+**THE SIBLING-CASE GAP, caught the same way.** Wired into the generic
+`IntBin` alone, the reduction reached 06_if_branch ZERO times:
+`specialize_arith_ops` rewrites `i % <lit>` into **IntModRI**, which has
+its own emit site, as does the #9 fusion **IntAddModRI**. All three
+share `div_magic` + `emit_div_magic` + `Emitter::bump_divmagic` so they
+cannot drift.
+
+MEASURED (interleaved full-suite `--baseline`, `OPT=1 ASSERTS=0` both
+sides). **26 benches improved, suite geomean cur/base 0.918x** - the
+whole suite 1.09x faster - and my/python **11.70x -> 13.23x**:
+
+    06_if_branch      0.34x     53_collatz        0.58x
+    03_int_arith      0.57x     71_exc_no_throw   0.63x
+    07_nested_loops   0.65x     22_multi_assign   0.65x
+    08_func_call      0.66x     72_exc_finally    0.66x
+    48_const_fold     0.67x     49_autoconst_fold 0.69x
+    51_purefunc_fold  0.70x     68_nested         0.72x
+    12_higher_order   0.74x     ... 13 more at 0.88-0.96x
+
+The 1.04-1.11x readings on 18/21/35/43 are benches whose hot loops have
+no constant divisor; they sit in the run-to-run band their byte-identical
+neighbours show.
+
+TWO SABOTAGES, WATCHED - AND THEY ARE CAUGHT BY DIFFERENT NETS, which is
+the point:
+ - the `needs_add` bound put back to the wrong test -> `-rt` fails 4 and
+   corpus_diff fails;
+ - the truncate-toward-zero tail deleted -> **`-rt` PASSES 1912/1912**
+   and only corpus_diff fails. Floor and truncation agree for every
+   NON-NEGATIVE dividend, and the `-rt` reach cases are all
+   non-negative. The exhaustive value sweep lives in
+   `tests/functional/14_div_magic.my` (17 divisors x 40 dividends,
+   both signs, both INT64 extremes, powers of two, a 31-bit prime,
+   negative divisors) precisely so the tree-walker's C++ `/` and `%`
+   are the oracle. A reach test alone would have shipped this.

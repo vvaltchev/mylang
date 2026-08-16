@@ -20924,6 +20924,91 @@ static bool jit_boxed_float_fast()
 #endif
 }
 
+/* The constant-divisor STRENGTH REDUCTION: g_jit_divmagic is bumped by the
+ * EMITTED reciprocal sequence, never by a helper, so growth is the only
+ * thing that can prove idiv was actually replaced - the values are
+ * identical either way. The exhaustive VALUE sweep lives in
+ * tests/functional/14_div_magic.my, where corpus_diff compares it against
+ * the tree-walker's C++ `/` and `%`; this pins REACH per op shape. */
+static bool jit_div_magic_reach()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const char *what,
+                  const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (Exception &ex) {
+            fprintf(stderr, "jit_div_magic_reach: %s raised %s\n",
+                    what, ex.name);
+            ok = false;
+        } catch (...) { ok = false; }
+        g_exec_engine = saved;
+        return ok;
+    };
+    struct Case { const char *name; std::vector<const char *> lines; };
+    const std::vector<Case> cases = {
+        /* IntModRI - the SPECIALIZED opcode specialize_arith_ops makes for
+         * `i % <lit>`. It is the one that matters: a reduction wired only
+         * into the generic IntBin left 06_if_branch with both its idivs
+         * (watched), because this shape never reaches IntBin. */
+        { "IntModRI (i % lit)", {
+            "var t = 0;",
+            "for (var i = 0; i < 400; i++) t += i % 3;",
+            "assert(t == 399);" } },
+        /* IntAddModRI - the #9 fusion of an add feeding a mod */
+        { "IntAddModRI (fused add+mod)", {
+            "var s = 0;",
+            "for (var i = 0; i < 400; i++) s = (s + i) % 1000000007;",
+            "assert(s == 79800);" } },
+        /* generic IntBin, where the dividend is not a plain slot read */
+        { "IntBin (div by lit)", {
+            "var a = []; for (var i = 0; i < 400; i++) append(a, i * 7);",
+            "var t = 0;",
+            "foreach (var v in a) t += v / 5 + v % 5;",
+            "assert(t == 112360);" } },
+    };
+    for (const Case &c : cases) {
+        const unsigned long b0 = g_jit_divmagic;
+        if (!run(c.name, c.lines))
+            return false;
+        if (g_jit_divmagic <= b0) {
+            fprintf(stderr, "jit_div_magic_reach: '%s' DID NOT REDUCE "
+                            "(still idiv)\n", c.name);
+            return false;
+        }
+    }
+    /* the DECLINE: |d| < 2 has no reciprocal, and a 0 or -1 divisor must
+     * keep the raise path the language specifies */
+    if (!run("declines", {
+            "var t = 0; var caught = 0;",
+            "for (var i = 1; i < 40; i++) t += i / 1;",
+            "var dyn z = 1; z = z - 1;",
+            "try { t += 7 / z; } catch (DivisionByZeroEx) { caught = 1; }",
+            "assert(t == 780); assert(caught == 1);" }))
+        return false;
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool dyn_foreach_fast_shapes()
 {
 #if ML_JIT_SUPPORTED
@@ -30254,6 +30339,8 @@ static const std::vector<extra_check> extra_checks =
       jit_boxed_int_fast },
     { "jit: boxed float-float fast tier runs inline (H6)",
       jit_boxed_float_fast },
+    { "jit: div/mod by a constant is strength-reduced (no idiv)",
+      jit_div_magic_reach },
     { "jit: fragment-inline sync call runs (direct push + call rdx)",
       jit_sync_inline_call },
     { "jit: norec: shadow-verified side table + the full-stack audit",
