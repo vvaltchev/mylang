@@ -3956,6 +3956,15 @@ int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
 {
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
     const auto &sv = arr.flat_structs();
+    /* #137 tier 2: `fidx` is an INSTRUCTION operand, and the def is
+     * whatever the slot holds at run time - so verify_chunk can only
+     * bound it by the WIDEST struct in the program. A narrow struct
+     * read with a wide one's field index gets here in range for tier 1
+     * and out of range for this vector. */
+    ML_UNTRUSTED_CHECK(fidx >= 0
+                       && static_cast<size_t>(fidx)
+                              < sv.def->fields.size(),
+                       "struct field index");
     const FieldDef &f = sv.def->fields[fidx];
     const char *p =
         sv.buf.data() + (arr.offset() + idx) * sv.stride + f.offset;
@@ -3971,6 +3980,15 @@ float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
 {
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
     const auto &sv = arr.flat_structs();
+    /* #137 tier 2: `fidx` is an INSTRUCTION operand, and the def is
+     * whatever the slot holds at run time - so verify_chunk can only
+     * bound it by the WIDEST struct in the program. A narrow struct
+     * read with a wide one's field index gets here in range for tier 1
+     * and out of range for this vector. */
+    ML_UNTRUSTED_CHECK(fidx >= 0
+                       && static_cast<size_t>(fidx)
+                              < sv.def->fields.size(),
+                       "struct field index");
     const FieldDef &f = sv.def->fields[fidx];
     const char *p =
         sv.buf.data() + (arr.offset() + idx) * sv.stride + f.offset;
@@ -4009,6 +4027,11 @@ static T vm_struct_elem_field(const EvalValue &arrv, int_type idx,
 
     if (arr.skind() == SharedArrayObj::Storage::structs) {
         const auto &sv = arr.flat_structs();
+        /* #137 tier 2 - see the twin in vm_struct_field_int above. */
+        ML_UNTRUSTED_CHECK(fidx >= 0
+                           && static_cast<size_t>(fidx)
+                                  < sv.def->fields.size(),
+                           "struct field index");
         const FieldDef &f = sv.def->fields[fidx];
         const char *p = sv.buf.data()
             + (arr.offset() + static_cast<size_type>(idx)) * sv.stride

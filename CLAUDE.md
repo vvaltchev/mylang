@@ -4540,9 +4540,13 @@ first two cannot see what the third checks:
     `read_sym` turns into frame/global/capture/builtin slot reads. Plus the
     STATIC CROSS-FIELD facts: a boxed op's `aop` must be one `vm_num_binop`
     can dispatch (asked of the dispatch's OWN tables via
-    `vm_aop_dispatchable`, so the two cannot drift), and a def a byte-level
-    path writes through must be POD with the field count its site was
-    compiled for.
+    `vm_aop_dispatchable`, so the two cannot drift); a def a byte-level path
+    writes through must be POD; a ctor's arg count must FIT its def (`<=`,
+    not `==` - a trailing `opt` field is skippable at the call site, which
+    the suite caught the moment `==` was tried); and a baked ctor plan's
+    per-field byte offset plus ITS OWN store width must land inside the
+    instance (the width matters: a blanket 8 falsely refuses a trailing
+    bool).
 **TIER 2 - THE PROVENANCE GATE (`ML_UNTRUSTED_CHECK`, defs.h).** A few facts
 no load-time pass can decide, because they belong to the VALUE in a slot and
 not to the image: a flat array's storage-kind union tag, a struct field index
