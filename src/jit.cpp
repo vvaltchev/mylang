@@ -63,6 +63,7 @@ unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
+unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
 unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
@@ -1116,6 +1117,34 @@ struct Emitter {
     { u8(reg >= 8 ? 0x4D : 0x49); u8(0x89);
       u8(static_cast<uint8_t>(0x81 | ((reg & 7) << 3))); u32(
           static_cast<uint32_t>(d)); }
+    /*
+     * #96 TWO-ADDRESS ARITHMETIC: `<op> qword [rbx+disp], reg` - the MR
+     * form, so the SLOT is both source and destination and the whole
+     * `dst = dst OP b` shape is ONE instruction.
+     *
+     * ⛔ NO `times`. `imul` has no MR encoding at all - `imul r64,
+     * r/m64` (0F AF /r) is RM only, the destination must be a register.
+     * The caller's selection excludes it; this aborts rather than
+     * emitting a wrong opcode if that ever slips.
+     */
+    void op_mem_reg(Op aop, int32_t disp, uint8_t reg)
+    {
+        uint8_t opc;
+        switch (aop) {
+        case Op::plus:  opc = 0x01; break;
+        case Op::minus: opc = 0x29; break;
+        case Op::band:  opc = 0x21; break;
+        case Op::bor:   opc = 0x09; break;
+        case Op::bxor:  opc = 0x31; break;
+        default:
+            ML_CHECK_MSG(false, "op_mem_reg: no MR encoding for this op");
+            return;
+        }
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
+        u8(opc);
+        u8(static_cast<uint8_t>(MODRM_SLOT | ((reg & 7) << 3)));
+        u32(static_cast<uint32_t>(disp));
+    }
     void store(uint8_t reg, int32_t disp)
     {
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
@@ -1913,6 +1942,24 @@ struct Emitter {
      * byte-identical to one with no instrumentation. Call it FIRST in an op's
      * emit, while rax is still dead.
      */
+    /*
+     * Bump a counter through an EXPLICIT scratch register, for sites
+     * where rax is live. `bump_op` below hardcodes rax and clobbers it -
+     * fine at its call sites, fatal at one holding a forwarded value.
+     * BOTH clobber FLAGS, so emit before the arithmetic, never between
+     * an op and a consumer of its flags.
+     */
+    void bump_counter(const void *ctr, uint8_t scratch)
+    {
+#ifdef TESTS
+        movabs(scratch, reinterpret_cast<uint64_t>(ctr));
+        u8(static_cast<uint8_t>(0x48 | (scratch >= 8 ? 0x01 : 0)));
+        u8(0xFF);
+        u8(static_cast<uint8_t>(0x00 | (scratch & 7)));   /* inc [scr] */
+#else
+        (void)ctr; (void)scratch;
+#endif
+    }
     void bump_op(OpCode op)
     {
 #ifdef TESTS
@@ -6436,6 +6483,7 @@ void jit_stats_report()
          * a real program?", could be asked only from inside -rt);
          * `fwd_skip_rel` is the narrower C5-discharged write-skip. */
         { "xcache",           &g_jit_xcache },
+        { "two_addr",         &g_jit_two_addr },
         { "fwd",              &g_jit_fwd },
         { "fwd_local",        &g_jit_fwd_local },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
@@ -9830,6 +9878,107 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const int fin = g_fwd.in_rax;
         const bool fa = fin >= 0 && in.a_slot() == fin;
         const bool fb = fin >= 0 && !in.b_is_lit() && in.b_slot() == fin;
+        /*
+         * ⛔ #96 TWO-ADDRESS FORM - the memory destination.
+         *
+         * The emitter's shape is three-address-through-the-accumulator:
+         * operand 1 into RAX, operand 2 into RCX, apply, store RAX. That
+         * is FOUR instructions for `a = a + i`, and it is why a PIN
+         * measured worth zero on 83_regs_int_40 - a pin makes each of
+         * those a register move instead of a load and the COUNT does not
+         * change (340 instructions/iteration at every pin budget from 0
+         * to 7; see docs/jit-optimizations.md 2026-08-18).
+         *
+         * When the destination IS one of the sources - every `+=` in the
+         * language, and every accumulator recurrence - x86 does it in
+         * one instruction against memory:
+         *
+         *     mov rax, i ; add [rbx+d], rax          4 -> 2
+         *     add [rbx+d], rax     (b already in RAX) 3 -> 1
+         *
+         * FIVE conditions. THREE are soundness and TWO are cost, and
+         * they are labelled because each was sabotage-tested and the
+         * suite's answer decides which is which - do not "tidy" a cost
+         * guard away on the strength of a green run:
+         *
+         *  1. SOUNDNESS. dst == operand a and a is a SLOT - otherwise
+         *     this is not the two-address shape at all.
+         *  2. SOUNDNESS. dst is NOT pinned. `write_slot` would have
+         *     moved the result into the pin's register; writing MEMORY
+         *     instead leaves the live register stale. WATCHED: removing
+         *     this HANGS `-rt` (a wrong loop counter). A pinned dst is
+         *     increment 2's job.
+         *  3. SOUNDNESS. `imul` is excluded - it has NO MR encoding
+         *     (`imul r64, r/m64` is RM only). WATCHED: removing it
+         *     aborts in op_mem_reg by name.
+         *  4. COST, not soundness. dst's value is not forwarded OUT.
+         *     Using the form there is CORRECT - `g_fwd` is cleared
+         *     below, so the consumer reloads from the memory this form
+         *     just wrote - it merely gives up lever A's write elision
+         *     and adds the reload. WATCHED: removing it leaves `-rt`
+         *     fully green, which is exactly why it says COST here.
+         *  5. COST. `fa` (a IS the forwarded value) and a REF-LISTED
+         *     dst are both declined. Reading dst as an int proves its
+         *     tag is t_int so the ref check would take its fast arm,
+         *     and lever A may have elided the write that puts `a` in
+         *     memory - both are arguments store_dst already owns, and
+         *     this form skips store_dst entirely. Revisit WITH a
+         *     measurement, not by inspection.
+         *
+         * ⛔ AND IT IS AN INSTRUCTION WIN, NOT A MICRO-OP WIN - MEASURED
+         * (2026-08-18). -17.05% Ir on 83_regs_int_40 (-15.06% on 82,
+         * -11.30% on 81, -5.92% on 80) for a WALL CLOCK of 1.005x
+         * geomean, i.e. flat. The reason is specific and worth knowing
+         * before optimising anything else this way: an x86 read-modify-
+         * write decodes to the SAME micro-ops as the sequence it
+         * replaces -
+         *     mov rcx,[a] ; xor rax,rcx ; mov [a],rax    3 uops
+         *     xor [a], rax                               3 uops
+         * - a load, an ALU op and a store either way. Callgrind counts
+         * INSTRUCTIONS, so it reports a large win where the execution
+         * resources are unchanged. What is genuinely saved is decode
+         * slots and code size (this fragment 817 -> 747 instructions).
+         *
+         * The REGISTER form (increment 2, a pinned dst) is the one that
+         * removes real work: `add r14, r13` is ONE uop against four
+         * instructions of which the two moves merely rename. Do not
+         * read this entry as "two-address arithmetic does not pay" -
+         * read it as "the MEMORY half pays in size, the REGISTER half
+         * pays in time".
+         *
+         * NO TAG STORE IS NEEDED, and that is not an omission: dst is
+         * READ as an int by this very op, so its tag is ALREADY t_int -
+         * the same argument C3's elision makes, available here without
+         * C3 having to prove anything. `imul` is excluded because it has
+         * no MR encoding (see op_mem_reg).
+         */
+        const bool two_addr =
+            !in.a_is_lit() && in.target == in.a_slot()
+            && aop != Op::times
+            && e.creg(in.target) < 0
+            && !(g_fwd.prod == in.target)
+            && !fa
+            && !std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                                   static_cast<int32_t>(in.target));
+        if (two_addr) {
+            /* EXECUTION proof, and it is emitted FIRST on purpose: it
+             * clobbers its scratch and the FLAGS, and after the
+             * arithmetic below the flags belong to that arithmetic.
+             * Through RCX, not rax - rax may hold the forwarded `b`. */
+#ifdef TESTS
+            e.scratch(RCX);
+            e.bump_counter(&g_jit_two_addr, RCX);
+#endif
+            if (fb) {
+                emit_fwd_bump(e, fin < ck.slot_count);
+            } else {
+                load_operand(e, RAX, in.b_is_lit(), in.b_lit(),
+                             in.b_slot());
+            }
+            e.op_mem_reg(aop, slot_addr(in.target).payload, RAX);
+            g_fwd = JitFwd{};        /* the result is in MEMORY, not RAX */
+            return true;
+        }
         if (fa || fb)
             emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
         if (fa && fb) {

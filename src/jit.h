@@ -925,6 +925,9 @@ extern "C" unsigned long g_jit_hoist_rmw;     /* C1e: hoisted-COMPOUND
  * program, and the discriminator between "the pool is wide" and "the
  * pool is wide AND something used the width". */
 extern "C" unsigned long g_jit_xcache;
+/* #96: `<op> [slot], reg` emitted instead of the four-instruction
+ * load/load/apply/store shape - the two-address form. */
+extern "C" unsigned long g_jit_two_addr;
 extern "C" unsigned long g_jit_fcache;        /* C2a: float-pinned fragment
                                                * entries (xmm4-7) */
 extern "C" unsigned long g_jit_hoist2;        /* C2b: second-base preheader

@@ -5944,3 +5944,71 @@ waste the type-tag arena removed one level up.
 three measured flat, because the pool was never the constraint. When an
 optimization measures zero, read the EMITTED CODE for the shape it was
 supposed to improve before concluding anything about its size.**
+
+## 2026-08-18 - #96 increment 1: TWO-ADDRESS arithmetic, memory destination
+
+`<op> qword [rbx+d], reg` for `dst = dst OP b` - every `+=` in the
+language and every accumulator recurrence. Replaces the emitter's
+load/load/apply/store shape:
+
+    mov rax, a0 ; mov rcx, i ; add rax, rcx ; mov a0, rax     4
+    mov rax, i  ; add [rbx+d], rax                            2
+    add [rbx+d], rax          (b already forwarded in RAX)    1
+
+`op_mem_reg` is the encoder (MR form). No pin is involved, so it pays
+on accumulators that will never get a register.
+
+**NO TAG STORE**, and it is not an omission: dst is READ as an int by
+this very op, so its tag is already `t_int`. Same argument C3's elision
+makes, available here without C3 having to prove anything.
+
+FIVE conditions, three SOUNDNESS and two COST, each sabotage-tested and
+labelled in the source by what the suite actually answered:
+ - dst == operand a, a is a slot (the shape itself);
+ - dst NOT pinned - writing memory while the live value sits in a
+   pin register is a wrong answer. WATCHED: removing it HANGS `-rt`;
+ - `imul` excluded - no MR encoding exists. WATCHED: removing it aborts
+   in op_mem_reg BY NAME;
+ - dst not forwarded OUT - **COST, not soundness**. Using the form
+   there is correct (g_fwd is cleared, so the consumer reloads from the
+   memory just written); it only forfeits lever A's elision. WATCHED:
+   removing it leaves `-rt` fully green, which is why it is labelled
+   COST and must not be "tidied" away on a green run;
+ - `fa` and a ref-listed dst - COST, declined pending a measurement.
+
+MEASURED (callgrind Ir, OPT=1 ASSERTS=0): **83_regs_int_40 -17.05%,
+82_regs_int_25 -15.06%, 81_regs_int_14 -11.30%, 80_regs_int_08
+-5.92%**, 54_mandelbrot -0.13%, every other bench byte-flat. 10 of 108
+corpus programs change. `func work` in 83: 817 -> 747 instructions.
+
+**⛔ AND THE WALL CLOCK IS FLAT - geomean cur/base 1.005x.** The reason
+is specific and generalises: an x86 read-modify-write decodes to the
+SAME micro-ops as the sequence it replaces -
+
+    mov rcx,[a] ; xor rax,rcx ; mov [a],rax     3 uops
+    xor [a], rax                                3 uops
+
+a load, an ALU op and a store either way. **Callgrind counts
+INSTRUCTIONS; fusing load/op/store into an RMW changes that count
+without changing the work.** This is a DIFFERENT mechanism from the
+guard-elision divergence already recorded here (a predicted branch over
+L1 loads retiring free) and deserves its own line: when an optimization
+merges memory access INTO an arithmetic instruction, expect Ir to
+overstate it.
+
+What is genuinely bought is decode slots and code size - and the
+precondition for increment 2. The REGISTER form (`add r14, r13`, a
+pinned dst) removes real work: ONE uop against four instructions of
+which two merely rename. Read this entry as "the MEMORY half pays in
+size, the REGISTER half should pay in time", not as "two-address
+arithmetic does not pay".
+
+Reach counter `two_addr` in MYLANG_JITSTATS, bumped from EMITTED code
+through RCX (not `bump_op`, which hardcodes rax - rax may hold the
+forwarded operand) and emitted BEFORE the arithmetic, since the bump
+clobbers FLAGS. Pinned by the `jit: two-address arithmetic` `-rt` case:
+four programs, each asserting the VALUE and whether the tier engaged.
+Two of its cases needed TEN accumulators rather than one - with one,
+every accumulator is PINNED and the tier declines for that reason
+first, so the imul sabotage left the suite green. A decline case that
+cannot fail is not a decline case.

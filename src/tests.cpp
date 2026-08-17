@@ -24710,6 +24710,172 @@ static bool jit_lowmem_singletons()
     return ok;
 }
 
+/*
+ * ⛔ #96 TWO-ADDRESS ARITHMETIC: `<op> [slot], reg` for `dst = dst OP b`.
+ *
+ * The emitter's shape was load/load/apply/store - FOUR instructions for
+ * `a += i` - which is why a PIN measured worth zero on 83_regs_int_40:
+ * pinning turns each load into a register move and the COUNT does not
+ * change. This tier collapses the whole thing to one instruction
+ * against memory, needing no register at all.
+ *
+ * THE VALUE IS THE ORACLE, not the counter: the form writes the slot's
+ * PAYLOAD and no type tag, on the argument that dst is READ as an int
+ * by this very op so its tag is already t_int. If that argument were
+ * wrong the tag would be stale and the value would read back as
+ * something else - which every case here would catch, since each one
+ * prints an accumulator it built with the form.
+ *
+ * The shape traps this had to defeat, all from CLAUDE.md's list:
+ *  - `runtime()` on the bound, or the loop folds and no fragment forms;
+ *  - the accumulators must be read AFTER the loop, or the whole thing
+ *    is dead code;
+ *  - enough iterations that the run is JIT-compiled at all.
+ */
+static bool jit_two_address()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src,
+                  unsigned long *hits) -> std::string {
+        const unsigned long h0 = g_jit_two_addr;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        if (hits) *hits = g_jit_two_addr - h0;
+        return cap.str();
+    };
+
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        const char *want;      /* expected stdout */
+        bool fires;            /* must the two-address form ENGAGE? */
+    };
+    const std::vector<Case> cases = {
+      /* the accumulator family, one per MR-encodable op. Each `a = a OP
+       * b` is the two-address shape; the sums pin the arithmetic. */
+      /* TEN accumulators, so they OUTNUMBER the pin pool and some are
+       * memory-resident - a five-accumulator version engaged ZERO
+       * times because every one of them got pinned, and a pinned dst
+       * declines (that is increment 2). The vacuous-test trap in a new
+       * shape: the tier under test was optimised away by the tier
+       * beside it. */
+      { "the five MR-encodable ops over memory accumulators",
+        { "func f(int n) {",
+          "    var a0 = 0; var a1 = 1000; var a2 = 255; var a3 = 0;",
+          "    var a4 = 0; var a5 = 0; var a6 = 2000; var a7 = 511;",
+          "    var a8 = 0; var a9 = 0;",
+          "    for (var i = 1; i <= n; i++) {",
+          "        a0 = a0 + i;  a1 = a1 - i;  a2 = a2 & (i + 240);",
+          "        a3 = a3 | i;  a4 = a4 ^ i;",
+          "        a5 = a5 + i;  a6 = a6 - i;  a7 = a7 & (i + 496);",
+          "        a8 = a8 | i;  a9 = a9 ^ i; }",
+          "    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9; }",
+          "print(f(runtime(20)));" }, "3102", true },
+
+      /*
+       * imul has NO MR encoding - `imul r64, r/m64` is RM only, the
+       * destination must be a register - so the tier must DECLINE.
+       *
+       * ⛔ TEN accumulators again, and the first version had ONE: with
+       * one, it is PINNED, the pin guard declines first, and the imul
+       * guard is never consulted. Sabotaging `aop != Op::times` then
+       * left the suite fully green - a decline case that cannot fail is
+       * not a decline case. With ten, some are memory-resident and
+       * removing the guard aborts in op_mem_reg BY NAME.
+       */
+      { "multiply accumulators decline (imul has no MR form)",
+        { "func f(int n) {",
+          "    var m0 = 1; var m1 = 1; var m2 = 1; var m3 = 1;",
+          "    var m4 = 1; var m5 = 1; var m6 = 1; var m7 = 1;",
+          "    var m8 = 1; var m9 = 1;",
+          "    for (var i = 0; i < n; i++) {",
+          "        m0 = m0 * 3; m1 = m1 * 3; m2 = m2 * 3; m3 = m3 * 3;",
+          "        m4 = m4 * 3; m5 = m5 * 3; m6 = m6 * 3; m7 = m7 * 3;",
+          "        m8 = m8 * 3; m9 = m9 * 3; }",
+          "    return m0 + m1 + m2 + m3 + m4 + m5 + m6 + m7 + m8 + m9; }",
+          "print(f(runtime(9)));" }, "196830", false },
+
+      /* dst is NOT one of the sources - not the two-address shape. */
+      { "a three-address write declines (dst is not a source)",
+        { "func f(int n) {",
+          "    var a = 0; var b = 0; var c = 0;",
+          "    for (var i = 0; i < n; i++) { a = b + i; b = c + i;",
+          "                                  c = i + 1; }",
+          "    return a * 100 + b * 10 + c; }",
+          "print(f(runtime(7)));" }, "1727", false },
+
+      /*
+       * THE TAG, and getting this case right took two tries. The form
+       * writes the slot's PAYLOAD and no type word, on the argument
+       * that dst is READ as an int by this very op so its tag is
+       * already t_int. To TEST that, the tag has to be consulted at
+       * RUNTIME - and `typestr(d)` does not do it: it is folded by
+       * fold_type_query from the STATIC type, so a `var dyn d` answers
+       * "dyn" whatever the slot holds, and the case passed on a
+       * constant. `d + 1` on a dyn dispatches through num_bin_op on the
+       * LIVE tag, which is the thing at issue.
+       */
+      { "the slot's TYPE survives (a dyn add reads it at runtime)",
+        { "func f(int n) {",
+          "    var a0 = 1; var a1 = 2; var a2 = 3; var a3 = 4;",
+          "    var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 8;",
+          "    var a8 = 9; var a9 = 10;",
+          "    for (var i = 0; i < n; i++) {",
+          "        a0 = a0 ^ (i + 1); a1 = a1 + i; a2 = a2 ^ i;",
+          "        a3 = a3 + i; a4 = a4 ^ i; a5 = a5 + i;",
+          "        a6 = a6 ^ i; a7 = a7 + i; a8 = a8 ^ i;",
+          "        a9 = a9 + i; }",
+          "    var dyn d = a9;",
+          "    var dyn r = d + 1;",
+          "    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + r; }",
+          "print(f(runtime(10)));" }, "286", true },
+    };
+
+    bool ok = true;
+    for (const Case &c : cases) {
+        unsigned long hits = 0;
+        const std::string out = go(c.src, &hits);
+        std::string got = out;
+        while (!got.empty() && (got.back() == '\n' || got.back() == ' '))
+            got.pop_back();
+        if (got != c.want) {
+            cout << "  two_addr [" << c.name << "]: got \"" << got
+                 << "\", want \"" << c.want << "\"\n";
+            ok = false;
+        }
+        if (c.fires && hits == 0) {
+            cout << "  two_addr [" << c.name
+                 << "]: the tier never engaged\n";
+            ok = false;
+        }
+        if (!c.fires && hits != 0) {
+            cout << "  two_addr [" << c.name << "]: engaged " << hits
+                 << " times, expected a DECLINE\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_xcache_pins()
 {
 #if ML_JIT_SUPPORTED
@@ -32400,6 +32566,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the low-address arena placed every Type singleton below "
       "2^31, so a type tag can encode as imm32 (#96)",
       jit_lowmem_singletons },
+    { "jit: two-address arithmetic `<op> [slot], reg` for dst = dst OP b "
+      "- engages per MR-encodable op, declines for imul (#96)",
+      jit_two_address },
     { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "
       "call-free fragment, declines around a MyLang call (#96)",
       jit_xcache_pins },
