@@ -201,6 +201,21 @@ static void show_build_config()
      * WHY the emitted code looks different. */
     cout << "  lowmem            " << (ml_lowmem_available() ? "1" : "0")
          << "        (type tags as imm32; 0 = register form)" << endl;
+    /* #96: the JIT's pin budget, and the CALLER-saved half of it. The
+     * second number is what MYLANG_JIT_XROT rotates, so a test lane
+     * that sweeps the pool must READ it rather than hardcode a count -
+     * `tests/corpus_diff.sh --xrot` does, and would otherwise
+     * under-sweep the day a register is admitted, leaving the newest
+     * (and least-exercised) member in the tail position that hid an
+     * unsafe r9 for a day. Printed even on a non-JIT build, where both
+     * are 0 and say so. */
+#if ML_JIT_SUPPORTED
+    cout << "  jit_pins          " << jit_pin_budget()
+         << "        (int pin budget; xcache " << jit_xcache_width()
+         << " caller-saved)" << endl;
+#else
+    cout << "  jit_pins          0        (no native codegen)" << endl;
+#endif
     cout << "  compiler          "
 #if defined(__clang__)
          << "clang " << __clang_major__ << "." << __clang_minor__
