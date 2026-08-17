@@ -3,6 +3,7 @@
 #include "codegen.h"
 #include "env.h"
 #include "jit.h"
+#include "vm.h"      /* vm_aop_dispatchable - #137 tier 1 */
 #include "inferencer.h"
 #include "syntax.h"
 
@@ -8979,6 +8980,37 @@ struct ChunkVerifier {
         if (f < 0 || static_cast<size_t>(f) >= lim.max_fields)
             reject("struct field index");
     }
+    /*
+     * The ARITH/COMPARE `aop` of a boxed op. It is one raw byte in an image,
+     * and vm_num_binop turns it into a pointer-to-member with no fallback:
+     * a value in neither table gives a NULL, and the call through it was a
+     * SIGSEGV in the default release build (the ML_VM_CHECK that catches it
+     * is VM_HARDENING-tier, off there). Asked of the dispatch's OWN tables
+     * (vm.h) so a new operator cannot be valid in one and not the other.
+     */
+    void aop_dispatchable(Op aop) const
+    {
+        if (!vm_aop_dispatchable(aop))
+            reject("arith/compare op");
+    }
+    /* The same, for a COMPOUND global/capture store, where Op::invalid is
+     * the legal "plain assignment, no operator" encoding. */
+    void aop_opt_dispatchable(Op aop) const
+    {
+        if (aop != Op::invalid)
+            aop_dispatchable(aop);
+    }
+    /* A struct def a BYTE-LEVEL path will write into: `pod_get`/`pod_set` and
+     * the baked ctor plans index `bytes`, which a non-POD instance leaves
+     * EMPTY - the store then lands on a null buffer (UBSan: "store to null
+     * pointer", and a silent hang in a release). */
+    void pod_def(const StructTypeDef *def, const char *what) const
+    {
+        defined_ptr(def, what);
+        if (!def->is_pod())
+            reject(what);
+    }
+
     /* An operand that is a slot unless it is an immediate. */
     void a_reg(const Instr &in) const
     {
@@ -9367,11 +9399,17 @@ void ChunkVerifier::verify_one(const Instr &in)
          * run [b_lit, +nfields) named by the pool entry. */
         reg(in.target);
         pool(in.a_lit() >> 2, ck.emplace_sites.size(), "emplace site");
-        defined_ptr(ck.emplace_sites[in.a_lit() >> 2].def, "emplace def");
-        base(in.a_lit() & 3, in.target2);
-        run(in.b_lit(),
-            static_cast<int_type>(
-                ck.emplace_sites[in.a_lit() >> 2].field_locs.size()));
+        {
+            const Chunk::EmplaceSite &es = ck.emplace_sites[in.a_lit() >> 2];
+            /* vm_emplace_struct asserts exactly this, and BOTH sides are
+             * static - the def's field count and the site's caret list. */
+            pod_def(es.def, "emplace def");
+            if (es.field_locs.size() != es.def->fields.size())
+                reject("emplace field count");
+            base(in.a_lit() & 3, in.target2);
+            run(in.b_lit(),
+                static_cast<int_type>(es.field_locs.size()));
+        }
         break;
     case OpCode::CallV:
     case OpCode::CachedCallV:
@@ -9452,6 +9490,10 @@ void ChunkVerifier::verify_one(const Instr &in)
         pool(in.target2, ck.struct_defs.size(), "struct def");
         defined_ptr(ck.struct_defs[in.target2], "struct def");
         if (in.b_dual_hi() >= 0) {
+            /* the PLANNED form stores raw bytes, so the def must be POD -
+             * a boxed one has an EMPTY byte buffer and the store lands on
+             * a null pointer. */
+            pod_def(ck.struct_defs[in.target2], "planned ctor def");
             pool(in.b_dual_hi(), ck.ctor_plans.size(), "ctor plan");
             for (const Chunk::CtorPlanField &f
                      : ck.ctor_plans[in.b_dual_hi()].f)
@@ -9473,7 +9515,7 @@ void ChunkVerifier::verify_one(const Instr &in)
          * which is also what bounds the element buffer the op allocates. */
         reg(in.target);
         pool(in.target2, ck.struct_defs.size(), "struct def");
-        defined_ptr(ck.struct_defs[in.target2], "struct def");
+        pod_def(ck.struct_defs[in.target2], "struct array def");
         if (in.b_lit() < 0)
             reject("struct array count");
         run(in.a_lit(),
@@ -9484,7 +9526,13 @@ void ChunkVerifier::verify_one(const Instr &in)
     /* --- boxed general ops -------------------------------------------- */
     case OpCode::BinOpV:
     case OpCode::CmpV:
+        reg(in.target);
+        ab_regs(in);
+        aop_dispatchable(in.aop);
+        break;
     case OpCode::LogV:
+        /* `&&` / `||` - branch-free boxed form; its aop never reaches
+         * vm_num_binop, so only the operands matter here. */
         reg(in.target);
         ab_regs(in);
         break;
@@ -9495,6 +9543,7 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::CompoundV:
         reg(in.target);                 /* read-modify-written in place */
         b_reg(in);
+        aop_dispatchable(in.aop);
         break;
 
     /* --- global / capture / builtin access ---------------------------- */
@@ -9506,6 +9555,7 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::StoreGlobalV:
         gslot(in.target);
         a_reg(in);
+        aop_opt_dispatchable(in.aop);
         break;
     case OpCode::LoadCaptureV:
         reg(in.target);
@@ -9514,6 +9564,7 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::StoreCaptureV:
         cslot(in.target);
         a_reg(in);
+        aop_opt_dispatchable(in.aop);
         break;
     case OpCode::LoadBuiltinV:
         reg(in.target);

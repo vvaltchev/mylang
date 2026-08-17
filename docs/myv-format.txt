@@ -58,7 +58,9 @@ sees a kind of field the others structurally cannot (#137):
      read length-checked (Reader::need); every ELEMENT COUNT bounded by the
      bytes remaining (Reader::countv); every table REFERENCE required to name
      a real entry (Reader::idx - the permissive idx_opt is opt-in, for a field
-     with a genuine null form).
+     with a genuine null form); every ENUM stored as a byte bounded by its
+     last valid enumerator (Reader::enumv), since each is cast straight into
+     a type the VM switches on or indexes a table with.
 
   2. THE STANDALONE COUNTS.  A count that no record array follows, so layer 1
      has nothing to bound it against: a chunk's slot_count / n_temps, its
@@ -76,6 +78,14 @@ sees a kind of field the others structurally cannot (#137):
      base_locs, inline_ctxs - which are REMAPPED by indexing, not merely
      searched) and each closure descriptor's capture slots.  It runs BEFORE
      the load-time JIT, which bakes pool ENTRY ADDRESSES into machine code.
+
+     It also checks the STATIC CROSS-FIELD facts a runtime path would
+     otherwise discover the hard way: a boxed arith/compare op's `aop` must
+     be one vm_num_binop can dispatch (a value in neither table gives a NULL
+     pointer-to-member, and calling through it was a SIGSEGV in a release
+     build), and a def reached by a BYTE-LEVEL path - a baked ctor plan, an
+     emplace site, a flat struct array - must be POD and must have exactly
+     the field count the site was compiled for.
 
 WHAT VALIDATION DOES NOT PROMISE.  A structurally valid image whose VALUES are
 nonsense is ACCEPTED, and may then fail at run time (a named ML_CHECK abort,

@@ -421,6 +421,25 @@ struct Reader {
             bad_image(what);
         return n;
     }
+    /*
+     * #137 tier 1: an ENUM read from a byte. Every one of these used to be a
+     * bare `static_cast<E>(u8v())` - a garbage value straight into a type the
+     * code then switches on, or indexes a table with.
+     *
+     * `last` is the LAST VALID ENUMERATOR, named rather than counted, so the
+     * check reads as what it means. Appending an enumerator makes this stale
+     * in the SAFE direction: it starts REFUSING images that use the new value,
+     * which the round-trip test fails on loudly - the opposite of silently
+     * admitting an out-of-range one.
+     */
+    template <class E>
+    E enumv(E last, const char *what)
+    {
+        const uint8_t v = u8v();
+        if (v > static_cast<uint8_t>(last))
+            bad_image(what);
+        return static_cast<E>(v);
+    }
     uint8_t u8v() { need(1); return static_cast<uint8_t>(buf[p++]); }
     uint32_t u32v()
     {
@@ -605,7 +624,8 @@ void write_array(Writer &w, const SharedArrayObj &a)
 
 EvalValue read_array(Reader &r)
 {
-    const auto kind = static_cast<SharedArrayObj::Storage>(r.u8v());
+    const auto kind = r.enumv(SharedArrayObj::Storage::strs,
+                              "corrupt .myv (array storage kind)");
     const bool ro = r.boolv();
     const uint32_t n = r.countv();
     SharedArrayObj out;
@@ -1287,7 +1307,8 @@ void read_chunk(Reader &r, Chunk &c)
     for (uint32_t i = 0; i < ncode; i++) {
         Instr &in = c.code[i];
 
-        in.op = static_cast<OpCode>(r.u8v());
+        in.op = static_cast<OpCode>(
+            r.u8v());   /* range-checked below, against OpCount_ */
         const uint32_t lo = r.u8v();
         const uint32_t flags = lo | (static_cast<uint32_t>(r.u8v()) << 8);
 
@@ -1303,7 +1324,9 @@ void read_chunk(Reader &r, Chunk &c)
             bad_image("corrupt .myv (instruction width)");
 
         if (flags & (1u << 10))
-            in.aop = static_cast<Op>(r.u8v());
+            /* the SET valid for this opcode is per-op, so verify_chunk
+             * owns it; here only the enum's own range */
+            in.aop = r.enumv(Op::qmdot, "corrupt .myv (op)");
         if (flags & (1u << 11))
             in.opflags = r.u8v();
         if (wt)
@@ -1495,7 +1518,8 @@ void read_chunk(Reader &r, Chunk &c)
         Chunk::LiteralObjEntry lo;
         lo.value = read_value(r);
         lo.immutable = r.boolv();
-        lo.arr_hint = static_cast<ArrHint>(r.u8v());
+        lo.arr_hint = r.enumv(ArrHint::flat_s,
+                              "corrupt .myv (array hint)");
         const uint32_t si = r.idx_opt(r.structs.size(), "corrupt .myv (hint)");
         lo.arr_hint_struct = si == 0xffffffffu ? nullptr : r.structs[si];
         c.literal_objs.push_back(std::move(lo));
@@ -1538,7 +1562,8 @@ void read_chunk(Reader &r, Chunk &c)
     c.throws.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         Chunk::ThrowSite t;
-        t.kind = static_cast<Chunk::ThrowKind>(r.u8v());
+        t.kind = r.enumv(Chunk::ThrowKind::bad_args,
+                         "corrupt .myv (throw kind)");
         t.start = r.locv(); t.end = r.locv();
         t.name = r.uidv();
         c.throws.push_back(t);
@@ -1573,7 +1598,8 @@ void read_chunk(Reader &r, Chunk &c)
         if (!bc.name || !vm_lookup_builtin(bc.name, bc.builtin))
             bad_image("corrupt or incompatible .myv (unknown builtin)");
         bc.start = r.locv(); bc.end = r.locv();
-        bc.arr_hint = static_cast<ArrHint>(r.u8v());
+        bc.arr_hint = r.enumv(ArrHint::flat_s,
+                              "corrupt .myv (array hint)");
         bc.args = read_arglocs(r);
         bc.member = r.uidv();
         c.builtin_calls.push_back(std::move(bc));
@@ -1585,7 +1611,8 @@ void read_chunk(Reader &r, Chunk &c)
         Chunk::CallSite cs;
         cs.start = r.locv(); cs.end = r.locv();
         cs.args = read_arglocs(r);
-        cs.arr_hint = static_cast<ArrHint>(r.u8v());
+        cs.arr_hint = r.enumv(ArrHint::flat_s,
+                              "corrupt .myv (array hint)");
         cs.a0_form = static_cast<Chunk::CallSite::A0>(r.u8v());
         cs.a0_kind = static_cast<unsigned char>(r.u32v());
         cs.a0_slot = static_cast<int32_t>(r.u32v());
@@ -1896,7 +1923,8 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         for (uint32_t j = 0; j < nf; j++) {
             FieldDef fd;
             fd.name = r.uidv();
-            fd.kind = static_cast<FieldKind>(r.u8v());
+            fd.kind = r.enumv(FieldKind::f_struct,
+                              "corrupt .myv (field kind)");
             fd.struct_ty = r.uidv();
             const uint32_t si = r.idx_opt(n, "corrupt .myv (field struct)");
             fd.struct_def = si == 0xffffffffu ? nullptr : r.structs[si];
@@ -1932,8 +1960,10 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             FuncDescriptor::ParamDesc p;
             p.name = r.uidv();
             p.opt = r.boolv(); p.cnst = r.boolv(); p.dyn_mod = r.boolv();
-            p.decl_type = static_cast<DeclType>(r.u8v());
-            p.proven_type = static_cast<DeclType>(r.u8v());  /* C3, v11 */
+            p.decl_type = r.enumv(DeclType::dyn,
+                                  "corrupt .myv (param type)");
+            p.proven_type = r.enumv(DeclType::dyn,   /* C3, v11 */
+                                    "corrupt .myv (param type)");
             d.params.push_back(p);
         }
         const uint32_t ncp = r.countv();
@@ -1941,7 +1971,8 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         for (uint32_t j = 0; j < ncp; j++) {
             FuncDescriptor::CaptureDesc cp;
             cp.name = r.uidv();
-            cp.kind = static_cast<SymKind>(r.u8v());
+            cp.kind = r.enumv(SymKind::builtin,
+                              "corrupt .myv (capture kind)");
             cp.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
             cp.start = r.locv();        /* v12 */
             cp.end = r.locv();

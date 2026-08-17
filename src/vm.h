@@ -218,6 +218,22 @@ void vm_jit_loaded_image(VmProgram &prog);
  */
 void vm_verify_program(const VmProgram &prog);
 
+/*
+ * #137 tier 1: can `aop` be dispatched by vm_num_binop?
+ *
+ * A boxed arith/compare op's `aop` is ONE RAW BYTE in a `.myv`, cast straight
+ * into `enum class Op`. A corrupt one finds no method - `binop_pmf` and
+ * `cmp_pmf` both return null - and the call then goes through a NULL
+ * pointer-to-member. That was a real SIGSEGV in the DEFAULT release build
+ * (the ML_VM_CHECK that catches it belongs to the VM_HARDENING tier, which a
+ * release turns off).
+ *
+ * Exported so verify_chunk can refuse it AT LOAD, for free, in every build -
+ * and exported rather than duplicated so the verifier asks the SAME two
+ * tables the dispatch uses. A new operator joins them in one place.
+ */
+bool vm_aop_dispatchable(Op aop);
+
 VmProgram vm_compile(const Construct *root, bool jit = true);
 void vm_run(VmProgram &prog);
 void vm_execute(const Construct *root);
