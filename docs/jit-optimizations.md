@@ -5891,3 +5891,56 @@ pinnable (r10/r11 are its own)" - five accumulators plus an `a[i]` read
 to force a region. Watched: restoring the boolean fails it by name at
 every `--xrot` rotation. `-rt` 1922/1922 arena on and off, all four
 corpus_diff matrices 20/20.
+
+## 2026-08-18 - WHY A PIN IS WORTH ZERO: the operand routing, not the pool
+
+`MYLANG_JIT_MAXPINS=N` caps the pin budget so the marginal value of one
+register is measurable. On 83_regs_int_40 (40 independent int
+recurrences) EVERY pin from 0 to 7 measures +0.00% Ir. The emitted code
+says why, and it is one line of diff:
+
+    cap=0  (a0, i in memory)      cap=7  (a0->r14, i->r13)
+    mov rax, a0                   mov rax, r14
+    mov rcx, i                    mov rcx, r13
+    add rax, rcx                  add rax, rcx
+    mov a0, rax                   mov r14, rax
+    sar rax, 3                    sar rax, 3
+    mov rcx, a0                   mov rcx, r14
+    xor rax, rcx                  xor rax, rcx
+    mov a0, rax                   mov r14, rax
+
+**A pin changes each operand's ADDRESSING MODE, never the instruction
+COUNT.** The loop body is 340 instructions per iteration at both caps;
+209 of them are `mov` and only 122 are work (42 add, 40 xor, 40 sar).
+
+THE CAUSE is that the B1/B2 specialized arithmetic emitter is a fixed
+three-address-through-the-accumulator shape: operand 1 into RAX,
+operand 2 into RCX, apply, store RAX to the destination. A pinned
+register can be the SOURCE of a `mov`; it can never BE the operand of
+the `add`. So the pin removes a load's latency (real, but invisible to
+Ir and small against 40-way ILP) and removes no instruction.
+
+**THE FIX IS TWO-ADDRESS ARITHMETIC, and it mostly does not need a pin
+at all.** Every accumulator has dst == src1 (`a = a + i`, and every
+`+=` in the language):
+
+    pinned dst    add r14, r13                       4 -> 1
+    memory dst    mov rax, i ; add [rbx+d], rax      4 -> 2
+
+`add r/m64, r64` is a legal encoding, so the memory form pays on the 33
+accumulators that will never get a register. It composes with C3's tag
+elision (the form writes the payload only). And it is what finally
+gives an extra register something to do: with two-address arithmetic a
+pinned accumulator is 1 instruction where memory is 2 - the first
+REASON to widen the pool this arc has produced, as opposed to a site
+count.
+
+Secondary, same family: the loop counter emits
+`mov rax,r13; movabs rcx,1; add rax,rcx; mov r13,rax` where `add r13,1`
+is one instruction - `movabs` for a value that fits imm8, the same
+waste the type-tag arena removed one level up.
+
+**THE LESSON FOR THE ARC: three increments widened the pin pool and all
+three measured flat, because the pool was never the constraint. When an
+optimization measures zero, read the EMITTED CODE for the shape it was
+supposed to improve before concluding anything about its size.**
