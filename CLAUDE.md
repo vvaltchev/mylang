@@ -4619,7 +4619,16 @@ format or loader change**, against BOTH a debug (ASan+UBSan) and an
 `OPT=1 ASSERTS=0` build - they catch different things, and it found the
 tier-2 throw-through-noexcept and the codegen-audit false alarm below
 within minutes of being checked in. A finding is SAVED, because it cannot
-be regenerated from the seed: an image embeds its SOURCE PATH. Verified:
+be regenerated from the seed: an image embeds its SOURCE PATH. Its sibling
+**`tests/repl_fuzz.py BINARY`** does the same for the REPL - a THIRD front
+end that shares almost none of the script path (its own incremental
+inferencer with cross-input type commitment, retained per-input ASTs, an
+open world of map-resident redefinable globals, and a dozen `:` commands
+that parse arbitrary text). Its generator is TEMPLATE-based, not
+byte-random: random bytes bounce off the lexer, while these reach the
+passes that hold state ACROSS inputs. Run it under **RECYCLE=1 + ASan** -
+the REPL retains ASTs, so it is where a stale-node identity bug would
+live, and that is the detector CLAUDE.md already names for the class. Verified:
 83/84 of bench/ + samples/ run identically from an image (the one
 exception, rand_sort, calls `rand()`), 84/86 also dump byte-identically
 (the 2
