@@ -182,6 +182,18 @@ documents a trap that cost real time to find. The `-vd`/`-vdj` dumps and the
 lever kill switches (`MYLANG_JIT_OFF`, `MYLANG_JIT_FORCE`, `MYLANG_JIT_COLD`)
 are described there too.
 
+**`MYLANG_JITSTATS=1` answers "which TIER did this program's calls actually
+take?"** — the emitted-code counters, printed after a script run (a
+**`TESTS=1` build only**; the bumps are `#ifdef TESTS`, and it says so
+rather than print zeros in a release). It exists because the counters were
+readable only from inside `-rt`, so that question could be asked of a
+hand-written probe and of nothing else — which is exactly how a per-call
+cost came to be quoted for a path most real calls turned out to skip, and
+then how the OPPOSITE error was caught: the recorded finding "recursion
+never reaches the inline push" stayed in the plan for two days after the
+increments that made it false. **Re-measure reach after any change to a
+tier's GATES, not just its body.**
+
 The RULES that came out of that work stay HERE, because a rule must be
 obeyed before you know you are in the area it governs:
 

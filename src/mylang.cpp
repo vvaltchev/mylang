@@ -900,5 +900,6 @@ int main(int argc, char **argv)
     }
 
     jit_cache_audit_report();   /* no-op unless MYLANG_CACHEAUDIT=1 */
+    jit_stats_report();         /* no-op unless MYLANG_JITSTATS=1 */
     return 0;
 }

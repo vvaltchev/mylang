@@ -939,6 +939,18 @@ emitted push - the thing this increment made cheaper - serves the
 finding than the increment: it says the 219 Ir figure the arc quotes is the
 INLINE path, and a large fraction of real calls never reach it at all.
 
+> **⛔ SUPERSEDED 2026-08-09 - DO NOT QUOTE THE PARAGRAPH ABOVE.**
+> Increments 3-5 closed both gates. Measured with `MYLANG_JITSTATS=1`
+> (added the same day, because this question had no answer on a REAL
+> program - only on hand-written probes):
+> 10_recursion_deep **1,352,549** inline pushes / 1,352,997 cache hits /
+> 1,353,001 inline returns, and 45_gcd 149,998 / 149,998 / 150,000. The
+> descend-deeper shape now takes the inline push on essentially every
+> call. See docs/jit-optimizations.md "G1 reach" for the full table and
+> for the one shape that still has no inline RETURN (`09_fib_recursive`,
+> a `cache_results` callee - a documented decline, and only 10,687 calls
+> survive its unroll anyway).
+
 ### What is left, honestly sized
 
 The guard phase is still 51 instructions and most of it is re-proving
