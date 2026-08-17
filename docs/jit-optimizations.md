@@ -6576,3 +6576,107 @@ no-arena}, not the first two alone. The no-TESTS build is also the only
 one that can tell a TESTS-guarded change from a real one - which
 matters directly here, since the push/pop makes every TESTS-build
 disassembly differ while the shipping build is untouched.
+
+## 2026-08-19 - #96: RDX joins as pin 11, by a POSITIVE run predicate
+
+**WHAT.** `mylang -v`: **`jit_pins 11 ... xcache 7 caller-saved`**.
+
+**WHY THE MECHANISM IS DIFFERENT.** rdi, rsi and r9 were admitted by
+enumerating their own sites against the gates. rdx cannot be: it is raw
+scratch at ~100 unbracketed sites - the element tiers' COUNT role,
+`idiv`'s RDX:RAX dividend and remainder, `emit_div_magic`, UnaryV,
+OrdCharV, the global chain's GlobalFuncTable output - and several are
+ISA-forced, not habits an allocator can talk out of.
+
+Enumerating what DOES touch it is the r9 mistake, where a missing entry
+is a silent wrong answer. So `run_may_pin_rdx` inverts the question the
+way `run_needs_float_tag` does: rdx is spendable only in a run made
+ENTIRELY of ops positively established never to write it. An unlisted
+or brand-new opcode keeps rdx out - the failure direction is a lost
+pin, never a wrong answer. The list is the B1/B2 specialized int family
+plus int loop control, compares, ReturnV and Halt, minus
+IntModRI/IntAddModRI. Verified rdx-free by reading every shared path
+those ops reach: store_dst, write_slot, load_operand, op_rr, exit_pc,
+raise_unless, emit_raise, flush_cache, frag_ret, emit_epilogues.
+
+**⛔ REACH WAS ZERO ON THE FIRST ATTEMPT, AND ONLY THE "PROVE THE CODE
+RAN" RULE CAUGHT IT.** `-rt` was green, corpus_diff was green, the
+admission looked done - and **not one program in the corpus spent rdx**.
+The whitelist omitted `ReturnV`, and a leaf body is ONE run ending in
+ReturnV, so the predicate refused every fragment there is. Without the
+counter check this would have been reported as a register gained.
+
+ReturnV and Halt belong for the same reason `jit_run_blocks_xcache`
+omits them: `emit_ret_native` uses rdx freely (16 sites) but its SECOND
+LINE is `flush_cache()`, so every pin is already in memory. With them
+listed, rdx is spent at **107 pin entry loads across 36 programs**.
+
+(Count the ENTRY loads - `mov rdx, <slot>` - not the flushes. A first
+pass counted `mov <slot>, rdx` and reported 264/65, which also matches
+every element-tier store that happens to write through rdx. An entry
+load into rdx happens for a pin and nothing else.)
+
+`MYLANG_RDXDBG=1` now names the op that refused, so widening the list
+is evidence-driven rather than guesswork - the instrument that would
+have made the zero-reach obvious in one run.
+
+**⛔ AND THE IMPROVEMENT ATE THREE TEST SHAPES - TWO OF THEM
+SILENTLY.** `jit_two_address` had three cases built on "TEN
+accumulators, so they OUTNUMBER the pin pool", true when the pool held
+eight. At eleven every accumulator gets pinned:
+
+ - the memory-form case failed loudly ("the tier never engaged");
+ - **the imul DECLINE case passed** - it asserts `hits == 0` about a
+   tier that could no longer fire at all, which its own comment had
+   warned about in a different form ("a decline case that cannot fail
+   is not a decline case");
+ - the tag-survival case likewise.
+
+Same failure `jit_telide_c3` had when r9 widened the pool. The fix is
+the recorded one: `two_addr_prog()` DERIVES the accumulator count from
+`jit_pin_budget()`, and takes the expected output from the TREE-WALKER
+rather than a literal - a derived N changes the sum, so a hardcoded
+answer would only move the staleness one field to the right.
+
+**THE LIMITATION, WRITTEN DOWN RATHER THAN PAPERED OVER.** rdx is a
+NARROW pin: available in dense scalar int loops and nowhere else, since
+any element or div/mod op in the run refuses it. Widening it means
+threading the element tiers' `count` role the way `idx` was threaded
+for r9 - the eleven fixed-pair accessors deleted the day before are the
+prerequisite, and every one of those sites now takes its register as an
+argument.
+
+## 2026-08-19 - the macOS lane, failing for the SAME reason as 2026-08-05
+
+`two_addr_prog` - the budget-derived accumulator generator added with
+rdx - was defined at file scope in tests.cpp, OUTSIDE
+`#if ML_JIT_SUPPORTED`. Its only caller, `jit_two_address`, is inside
+one. So on any platform without the native tier nothing calls it, and
+macOS clang refused the build:
+
+    src/tests.cpp:24884:1: error: unused function 'two_addr_prog'
+                                  [-Werror,-Wunused-function]
+
+CLAUDE.md records this verbatim under *EMITTER-ONLY CODE LIVES INSIDE
+`#if ML_JIT_SUPPORTED`* - same warning, same lane, same cause, from
+2026-08-05 - **and prescribes the local check that finds it**: flip
+jit.h's `#if defined(__linux__) && defined(__x86_64__)` to `#if 0`,
+build with BOTH g++ and clang++, run `-rt` (the JIT tests self-skip),
+restore; and build once with CMake, which is what CI runs.
+
+I skipped that check. Six local lanes were green - debug, rel-hard,
+plain release, corpus_diff, vdjcmp, the arena matrix - and not one of
+them compiles the off-platform path, exactly as the rule says.
+
+Now verified, and this is the shape the battery should keep:
+
+    non-JIT g++      build + -rt 1924/1924
+    non-JIT clang++  build + -rt 1924/1924
+    CMake Debug      build + -rt 1924/1924   (what CI runs)
+    clang JIT        build + -rt 1924/1924
+
+**The generalisation worth keeping: a `-Werror` diagnostic that only
+one PLATFORM can see is one no local lane will find**, the sibling of
+`LTO=0`'s "a warning only one build configuration can see is a warning
+nobody sees" and of the plain-`OPT=1` break found the same day. Both
+were caught by CI; both should have been caught before the push.

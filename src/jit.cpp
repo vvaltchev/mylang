@@ -7213,7 +7213,37 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * rotations - the net that would have caught the original r9 bug in
  * seconds.
  */
-static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9 };
+/*
+ * ⛔ RDX (2) JOINED 2026-08-19 - pin 11, and it is the first member
+ * admitted by a POSITIVE run predicate rather than by a site audit.
+ *
+ * rdi, rsi and r9 were admitted by enumerating their own sites against
+ * the gates. rdx cannot be: it is raw scratch at ~100 unbracketed
+ * sites - the element tiers' COUNT role, `idiv`'s RDX:RAX dividend and
+ * remainder, emit_div_magic, UnaryV, OrdCharV, the global chain's
+ * GlobalFuncTable output - and several of those are ISA-forced, not
+ * habits an allocator can talk out of.
+ *
+ * So `run_may_pin_rdx` (see jit_xcache_busy) inverts the question:
+ * rdx is spendable only in a run made ENTIRELY of ops positively
+ * established never to write it - the B1/B2 specialized int family
+ * plus int loop control and compares, minus IntModRI/IntAddModRI. An
+ * unlisted or brand-new opcode keeps rdx out, so the failure direction
+ * is a lost pin and never a wrong answer.
+ *
+ * That makes rdx a NARROW pin - available in dense scalar int loops
+ * and nowhere else. That is a real limitation and it is written down
+ * rather than papered over: widening it means threading the element
+ * tiers' `count` role the way `idx` was threaded for r9, which is the
+ * recorded next step. It is also, deliberately, exactly the shape
+ * where an eleventh pin pays: 83_regs_int_40 and its siblings have
+ * more hot int locals than registers.
+ *
+ * PLACED LAST, as every admission has been: take_reg scans in order,
+ * so the tail is the least-exercised slot, and MYLANG_JIT_XROT now
+ * sweeps SEVEN rotations.
+ */
+static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2 };
 static const size_t MAX_XCACHED =
     sizeof(XCACHE_ORDER) / sizeof(XCACHE_ORDER[0]);
 
@@ -7265,6 +7295,56 @@ static uint32_t xcache_mask()
     return m;
 }
 
+/*
+ * #96: may this RUN spend rdx as a pin? See the comment at its use in
+ * jit_xcache_busy for why the list is positive and what it costs to be
+ * wrong in each direction.
+ */
+static bool run_may_pin_rdx(const Chunk &ck, size_t begin, size_t end)
+{
+    /* MYLANG_RDXDBG=1 names the op that refused - the list is meant to
+     * be widened with evidence, and guessing which op blocks a shape
+     * is exactly how the first version shipped with zero reach. */
+    static const bool dbg = getenv("MYLANG_RDXDBG") != nullptr;
+    for (size_t pc = begin; pc < end; pc++) {
+        switch (ck.code[pc].op) {
+        /* B1/B2 specialized int arithmetic: rax + rcx in the case body,
+         * rsi via store_dst's tag write off-arena. Never rdx.
+         * ⛔ IntModRI / IntAddModRI are DELIBERATELY ABSENT - they go
+         * through emit_div_magic, whose `mul`/`idiv` write rdx. */
+        case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+        case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+        case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+        case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+        case OpCode::IntShlRR: case OpCode::IntShrRR:
+        case OpCode::IntShlRI: case OpCode::IntShrRI:
+        /* int loop control + compare */
+        case OpCode::IntAddStep: case OpCode::ForLoopStep:
+        case OpCode::JumpUnlessIntCmp: case OpCode::CmpIntV:
+        case OpCode::LoadImmInt: case OpCode::Jump:
+        /* ⛔ ReturnV and Halt are here for the SAME reason
+         * jit_run_blocks_xcache leaves them out of ITS list:
+         * `emit_ret_native` uses rdx freely (16 sites) but its SECOND
+         * LINE is `flush_cache()`, so every pin is already back in
+         * memory and nothing after reads a register. Leaving them out
+         * is what kept rdx at ZERO REACH when it was first admitted -
+         * a leaf body is ONE run ending in ReturnV, so the predicate
+         * refused every fragment in the corpus and the pin was
+         * hollow. (Found by the "prove the code ran" rule: 0 rdx pin
+         * loads corpus-wide, and the admission would otherwise have
+         * been reported as a win.) emit_epilogues is rdx-free. */
+        case OpCode::ReturnV: case OpCode::Halt:
+            break;                       /* provably rdx-free */
+        default:
+            if (dbg)
+                fprintf(stderr, "rdx blocked by op %d at pc %zu\n",
+                        static_cast<int>(ck.code[pc].op), pc);
+            return false;                /* unknown -> keep rdx out */
+        }
+    }
+    return true;
+}
+
 /* Which XCACHE registers this run must NOT spend, because they still
  * hold a type singleton. Empty when both tags encode as imm32. */
 static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
@@ -7310,6 +7390,36 @@ static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
      */
     if (!jit_tag_is_imm(jit_layout().t_int))
         busy |= 1u << 6;                     /* rsi holds t_int */
+    /*
+     * ⛔ rdx, AND THE WHITELIST IS WRITTEN IN THE FAIL-SAFE DIRECTION.
+     *
+     * rdx is not a singleton holder - it is raw scratch at ~100
+     * unbracketed sites: the element tiers' COUNT role, `idiv`'s
+     * RDX:RAX dividend (and its remainder), emit_div_magic, UnaryV,
+     * OrdCharV, and the global chain's GlobalFuncTable output. Naming
+     * those ops would be the r9 mistake exactly - an enumeration of
+     * what DOES touch it, where a missing entry is a silent wrong
+     * answer.
+     *
+     * So this asks the question the other way, like
+     * `run_needs_float_tag`: rdx is spendable ONLY if every op in the
+     * run is one positively established never to write it. An
+     * unlisted or brand-new opcode keeps rdx OUT of the pool - it
+     * costs a pin, never an answer.
+     *
+     * The list is the B1/B2 specialized int family plus int loop
+     * control and compares, MINUS IntModRI and IntAddModRI, whose
+     * emit_div_magic needs RDX:RAX. Verified rdx-free for these ops by
+     * reading every shared path they reach: store_dst, write_slot,
+     * load_operand, op_rr, exit_pc, raise_unless, emit_raise,
+     * flush_cache, frag_ret and emit_epilogues.
+     *
+     * Widening it is a measurable optimization and needs the same
+     * argument each of these has: the op's emission, and every emitter
+     * it calls, touches no rdx outside an emit_call_prologue bracket.
+     */
+    if (!run_may_pin_rdx(ck, begin, end))
+        busy |= 1u << 2;
     return busy;
 }
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
