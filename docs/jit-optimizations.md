@@ -6125,3 +6125,47 @@ pin covers 1/40 of the body (-0.62%), 80 has 8 and each covers 1/8
 (-2.6%) - so the return scales with what fraction of the working set a
 register captures, exactly as it should, and going 7 -> 13 on 83
 projects to roughly another -3.7%.
+
+## 2026-08-18 - #96 increment 3: the COUNTED-LOOP step, in registers
+
+`ForLoopStep` is what a `for` loop lowers its step to, so increments 1
+and 2 - which rewrite the specialized IntAddRR/RI family - never
+reached it. It was paying the full accumulator shape plus a
+materialised constant:
+
+    mov rax, r13 ; movabs rcx, 1 ; add rax, rcx
+    mov r13, rax ; mov rcx, n    ; cmp rax, rcx ; jl          7
+    inc r13      ; cmp r13, n    ; jl                         3
+
+With the counter PINNED the step is two-address and the bound test
+reads the pin directly, so RAX is never involved. New encoders
+`cmp_rr2` / `cmp_reg_slot` / `cmp_reg_imm` (the CMP counterparts of the
+RM family) let the bound be an immediate, another pin, or memory.
+A MEMORY counter keeps the old shape but still drops the `movabs`: a
+literal step becomes an imm8/imm32 operand.
+
+**`inc`/`dec` ARE used here** (maintainer-suggested), and the reason it
+is safe is specific rather than general: their PARTIAL flags write (CF
+untouched) is harmless because the FLAGS ARE DEAD - the `cmp` on the
+very next line sets them afresh before the jump reads them. It is also
+not a new idiom: IntAddStep's counter already emitted `inc rax`.
+Elsewhere the imm8 form (`83 /ext`) is preferred instead, which is one
+byte larger but writes flags completely and covers every constant.
+
+**MEASURED, increments 1+2+3 cumulative (callgrind Ir, OPT=1
+ASSERTS=0):** 01_while_loop **-37.35%**, 80_regs_int_08 **-31.07%**,
+83_regs_int_40 -23.26%, 43_sieve -12.08%, 07_nested_loops -11.35%,
+44_primes_sqrt -6.13%, 03_int_arith -5.50%, 46_matrix_mult -0.07%.
+
+**WALL CLOCK: geomean cur/base 0.985x** (0.990x after increments 1+2,
+so increment 3 adds ~0.5% suite-wide). 01_while_loop 0.64x,
+81_regs_int_14 0.80x, 80_regs_int_08 0.91x, 82 0.92x, 43_sieve 0.94x.
+
+Reach: `step_imm` in MYLANG_JITSTATS. Note it fires only where the
+COUNTER wins a pin - a ten-accumulator program spends every register on
+accumulators and leaves the counter in memory, which two `-rt` cases
+assert as a DECLINE.
+
+⛔ IntAddStep is NOT converted yet - same shape, same opportunity (its
+accumulate is still `read/load/op/write` and its bound test still goes
+through RAX), left for a follow-up so this increment measures alone.

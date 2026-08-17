@@ -24740,9 +24740,11 @@ static bool jit_two_address()
 
     auto go = [&](const std::vector<const char *> &src,
                   unsigned long *hits,
-                  unsigned long *rhits) -> std::string {
+                  unsigned long *rhits,
+                  unsigned long *shits) -> std::string {
         const unsigned long h0 = g_jit_two_addr;
         const unsigned long r0 = g_jit_two_addr_reg;
+        const unsigned long s0 = g_jit_step_imm;
         std::ostringstream cap;
         std::streambuf *old = cout.rdbuf(cap.rdbuf());
         try {
@@ -24760,6 +24762,7 @@ static bool jit_two_address()
         cout.rdbuf(old);
         if (hits) *hits = g_jit_two_addr - h0;
         if (rhits) *rhits = g_jit_two_addr_reg - r0;
+        if (shits) *shits = g_jit_step_imm - s0;
         return cap.str();
     };
 
@@ -24769,6 +24772,11 @@ static bool jit_two_address()
         const char *want;      /* expected stdout */
         bool fires;            /* the MEMORY form must engage? */
         bool fires_reg;        /* the PINNED form must engage? */
+        /* increment 3: the counted-loop step. TRUE only where the
+         * loop COUNTER wins a pin - a ten-accumulator program spends
+         * every register on accumulators and leaves the counter in
+         * memory, which is why two cases here expect false. */
+        bool fires_step;
     };
     const std::vector<Case> cases = {
       /* the accumulator family, one per MR-encodable op. Each `a = a OP
@@ -24790,7 +24798,7 @@ static bool jit_two_address()
           "        a5 = a5 + i;  a6 = a6 - i;  a7 = a7 & (i + 496);",
           "        a8 = a8 | i;  a9 = a9 ^ i; }",
           "    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9; }",
-          "print(f(runtime(20)));" }, "3102", true, true },
+          "print(f(runtime(20)));" }, "3102", true, true, true },
 
       /*
        * imul has NO MR encoding - `imul r64, r/m64` is RM only, the
@@ -24813,7 +24821,7 @@ static bool jit_two_address()
           "        m4 = m4 * 3; m5 = m5 * 3; m6 = m6 * 3; m7 = m7 * 3;",
           "        m8 = m8 * 3; m9 = m9 * 3; }",
           "    return m0 + m1 + m2 + m3 + m4 + m5 + m6 + m7 + m8 + m9; }",
-          "print(f(runtime(9)));" }, "196830", false, true },
+          "print(f(runtime(9)));" }, "196830", false, true, false },
 
       /* dst is NOT one of the sources - not the two-address shape. */
       { "a three-address write declines (dst is not a source)",
@@ -24822,7 +24830,7 @@ static bool jit_two_address()
           "    for (var i = 0; i < n; i++) { a = b + i; b = c + i;",
           "                                  c = i + 1; }",
           "    return a * 100 + b * 10 + c; }",
-          "print(f(runtime(7)));" }, "1727", false, false },
+          "print(f(runtime(7)));" }, "1727", false, false, true },
 
       /*
        * THE TAG, and getting this case right took two tries. The form
@@ -24848,7 +24856,7 @@ static bool jit_two_address()
           "    var dyn d = a9;",
           "    var dyn r = d + 1;",
           "    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + r; }",
-          "print(f(runtime(10)));" }, "286", true, false },
+          "print(f(runtime(10)));" }, "286", true, false, false },
 
       /*
        * INCREMENT 2 on its own: THREE accumulators, so every one is
@@ -24866,13 +24874,13 @@ static bool jit_two_address()
           "    for (var i = 1; i <= n; i++) {",
           "        s = s + i; p = p * 2; x = x ^ i; }",
           "    return s * 1000000 + p * 10 + x; }",
-          "print(f(runtime(12)));" }, "78040971", false, true },
+          "print(f(runtime(12)));" }, "78040971", false, true, true },
     };
 
     bool ok = true;
     for (const Case &c : cases) {
-        unsigned long hits = 0, rhits = 0;
-        const std::string out = go(c.src, &hits, &rhits);
+        unsigned long hits = 0, rhits = 0, shits = 0;
+        const std::string out = go(c.src, &hits, &rhits, &shits);
         std::string got = out;
         while (!got.empty() && (got.back() == '\n' || got.back() == ' '))
             got.pop_back();
@@ -24899,6 +24907,11 @@ static bool jit_two_address()
         if (!c.fires_reg && rhits != 0) {
             cout << "  two_addr [" << c.name << "]: the PINNED form "
                  << "engaged " << rhits << " times, expected a DECLINE\n";
+            ok = false;
+        }
+        if (c.fires_step && shits == 0) {
+            cout << "  two_addr [" << c.name
+                 << "]: the counted-loop STEP form never engaged\n";
             ok = false;
         }
     }

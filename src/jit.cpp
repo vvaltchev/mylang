@@ -65,6 +65,7 @@ unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
 unsigned long g_jit_two_addr_reg = 0;  /* #96: two-address PINNED ops */
+unsigned long g_jit_step_imm = 0;      /* #96: pinned counted-loop steps */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
 unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
@@ -1248,6 +1249,48 @@ struct Emitter {
             u8(static_cast<uint8_t>(0xC0 | (ext << 3) | (dst & 7)));
         }
         u32(static_cast<uint32_t>(imm));
+    }
+    /*
+     * #96 increment 3 - the CMP counterparts of the RM family, so a
+     * loop test can read a pinned counter directly instead of routing
+     * it through RAX. `cmp r64, r/m64` is 3B /r; the immediate forms
+     * are group 81 /7 with the imm8 short form 83 /7.
+     */
+    void cmp_rr2(uint8_t a, uint8_t b)
+    {
+        u8(static_cast<uint8_t>(0x48 | (a >= 8 ? 0x04 : 0)
+                                     | (b >= 8 ? 0x01 : 0)));
+        u8(0x3B);
+        u8(static_cast<uint8_t>(0xC0 | ((a & 7) << 3) | (b & 7)));
+    }
+    void cmp_reg_slot(uint8_t reg, int32_t disp)
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
+        u8(0x3B);
+        u8(static_cast<uint8_t>(MODRM_SLOT | ((reg & 7) << 3)));
+        u32(static_cast<uint32_t>(disp));
+    }
+    void cmp_reg_imm(uint8_t reg, int32_t imm)
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
+        if (imm >= -128 && imm <= 127) {
+            u8(0x83);
+            u8(static_cast<uint8_t>(0xF8 | (reg & 7)));
+            u8(static_cast<uint8_t>(imm));
+            return;
+        }
+        u8(0x81);
+        u8(static_cast<uint8_t>(0xF8 | (reg & 7)));
+        u32(static_cast<uint32_t>(imm));
+    }
+    /* `inc`/`dec` on an arbitrary register (FF /0, FF /1). Used ONLY
+     * where the emitter already chose inc/dec - the step ops - so the
+     * partial-flags write is not newly introduced anywhere. */
+    void incdec_reg(uint8_t reg, bool up)
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
+        u8(0xFF);
+        u8(static_cast<uint8_t>((up ? 0xC0 : 0xC8) | (reg & 7)));
     }
     void store(uint8_t reg, int32_t disp)
     {
@@ -6589,6 +6632,7 @@ void jit_stats_report()
         { "xcache",           &g_jit_xcache },
         { "two_addr",         &g_jit_two_addr },
         { "two_addr_reg",     &g_jit_two_addr_reg },
+        { "step_imm",         &g_jit_step_imm },
         { "fwd",              &g_jit_fwd },
         { "fwd_local",        &g_jit_fwd_local },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
@@ -13177,9 +13221,79 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         /* i (target2) += step (b)  [lt/le]  or -= step  [ge/gt]; then
          * jump to target (the back edge) when (i aop bound(a)). */
         const bool up = in.aop == Op::lt || in.aop == Op::le;
+        /*
+         * ⛔ #96 INCREMENT 3 - the counted loop's own step, which
+         * increments 1 and 2 do not reach: they rewrite the specialized
+         * IntAddRR/RI family, and a `for` loop lowers its step to THIS
+         * op instead. It was still paying the full accumulator shape
+         * plus a materialised constant:
+         *
+         *     mov rax, r13 ; movabs rcx, 1 ; add rax, rcx
+         *     mov r13, rax ; mov rcx, n    ; cmp rax, rcx ; jl     7
+         *     add r13, 1   ; cmp r13, n    ; jl                    3
+         *
+         * With the counter PINNED the step is two-address and the test
+         * reads the pin directly, so RAX is never involved. The bound
+         * takes whichever of the three cmp forms fits - immediate,
+         * another pin, or memory.
+         *
+         * A MEMORY counter keeps the old shape but still drops the
+         * `movabs`: a literal step becomes an imm8/imm32 operand, which
+         * is one instruction less on every counted loop in the corpus.
+         */
+        const int creg_i = e.creg(in.target2);
+        const bool lit_step = in.b_is_lit()
+            && in.b_lit() >= INT32_MIN && in.b_lit() <= INT32_MAX;
+        if (creg_i >= 0) {
+            const uint8_t r = static_cast<uint8_t>(creg_i);
+#ifdef TESTS
+            e.scratch(RCX);
+            e.bump_counter(&g_jit_step_imm, RCX);
+#endif
+            if (lit_step && (in.b_lit() == 1 || in.b_lit() == -1)) {
+                /* the emitter already used inc/dec for IntAddStep's
+                 * counter, so this introduces no new partial-flags
+                 * write - and the FLAGS here are dead: the cmp below
+                 * sets them afresh before the jump reads them. */
+                e.incdec_reg(r, up == (in.b_lit() == 1));
+            } else if (lit_step) {
+                e.op_reg_imm(up ? Op::plus : Op::minus, r,
+                             static_cast<int32_t>(in.b_lit()));
+            } else {
+                const int bcr = e.creg(in.b_slot());
+                if (bcr >= 0)
+                    e.op_rr2(up ? Op::plus : Op::minus, r,
+                             static_cast<uint8_t>(bcr));
+                else
+                    e.op_reg_slot(up ? Op::plus : Op::minus, r,
+                                  slot_addr(in.b_slot()).payload);
+            }
+            if (in.a_is_lit() && in.a_lit() >= INT32_MIN
+                    && in.a_lit() <= INT32_MAX) {
+                e.cmp_reg_imm(r, static_cast<int32_t>(in.a_lit()));
+            } else if (in.a_is_lit()) {
+                e.movabs(RCX, static_cast<uint64_t>(in.a_lit()));
+                e.cmp_rr2(r, RCX);
+            } else {
+                const int acr = e.creg(in.a_slot());
+                if (acr >= 0)
+                    e.cmp_rr2(r, static_cast<uint8_t>(acr));
+                else
+                    e.cmp_reg_slot(r, slot_addr(in.a_slot()).payload);
+            }
+            g_fwd = JitFwd{};      /* the counter is in the PIN, not RAX */
+            emit_cond_jump(e, in.aop, static_cast<size_t>(in.target),
+                           begin, end, remap, fixups);
+            return;
+        }
         read_slot(e, RAX, in.target2);
-        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
-        op_rr(e, up ? Op::plus : Op::minus);     /* rax += / -= rcx */
+        if (lit_step) {
+            e.op_reg_imm(up ? Op::plus : Op::minus, RAX,
+                         static_cast<int32_t>(in.b_lit()));
+        } else {
+            load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+            op_rr(e, up ? Op::plus : Op::minus); /* rax += / -= rcx */
+        }
         write_slot(e, ck, RAX, in.target2, pc);
         load_operand(e, RCX, in.a_is_lit(), in.a_lit(), in.a_slot());
         e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */

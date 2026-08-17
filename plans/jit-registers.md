@@ -1660,3 +1660,33 @@ Still open, cheaper, and worth doing before the big conversion:
    measurement;
  - #100 (constant multiply strength reduction) and #101 (the native
    peephole pass), both maintainer-raised, both after the allocator.
+
+
+## 2026-08-18 (g): increment 3 LANDED - the counted-loop step
+
+    inc r13 ; cmp r13, n ; jl        (was 7 instructions, now 3)
+
+Ir cumulative over 1+2+3: 01_while_loop -37.35%, 80_regs_int_08
+-31.07%, 83_regs_int_40 -23.26%, 43_sieve -12.08%, 07_nested_loops
+-11.35%, 44_primes_sqrt -6.13%, 03_int_arith -5.50%.
+Wall: geomean **0.985x** (0.990x after 1+2), 01_while_loop 0.64x,
+81_regs_int_14 0.80x.
+
+`inc`/`dec` used here on the maintainer's suggestion; safe SPECIFICALLY
+because the flags are dead (the cmp on the next line resets them) and
+because IntAddStep already used the idiom. Not adopted generally - the
+imm8 form is one byte larger and writes flags completely.
+
+### Remaining, in order
+
+ 1. **IntAddStep**, the same conversion - its accumulate is still
+    read/load/op/write and its bound test still routes through RAX.
+    Deliberately left out so increment 3 measured alone.
+ 2. The increment-1 cost declines (fa, ref-listed dst), WITH a
+    measurement.
+ 3. **Widen the pool toward 13** - now justified by the re-run sweep
+    (each register -0.62% on 83, -2.6% on 80, not plateauing at 7).
+    The cost is the scratch allocator for RAX/RCX/RDX, 717 of 1016
+    unbracketed sites.
+ 4. #100 (constant multiply strength reduction), #101 (native peephole
+    pass) - both maintainer-raised, both after the allocator.
