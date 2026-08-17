@@ -2463,10 +2463,41 @@ empty and a run predicate would buy nothing. rax needs the roles
 threaded - note `store_dst` ALREADY takes its source register as an
 argument, so the question is only its three internal uses.
 
-**rcx is the interesting one**: none of the four shared paths touch it.
-What does is the B1/B2 case BODIES - and #96's two-address increments
-mean a PINNED destination now goes straight through `op_rr`, which is
-rcx-free. So the rcx whitelist may be non-trivial after all, but it is
-emit-time-dependent ("only if the operands won pins"), which a
-run-level predicate cannot express. Check whether the boxed staging
-path is still reachable for those ops before writing one.
+**rcx: the predicate route is DEAD TOO, and here is the exact reason.**
+None of the four shared paths touch it, but the specialized-arith arm
+has THREE emission paths and only two are rcx-free:
+
+    two_addr (memory dst)   mov rax, b ; <op> [dst], rax    rax only
+    two_addr_reg (pinned)   op_rr(dst_reg, src_reg)         neither
+    the general staging     mov rax,a ; mov rcx,b ; op ; st rax AND rcx
+
+Which path an op takes is decided at EMIT time, from five conditions
+(dst == operand a, dst not pinned / pinned, imul, forwarding, ref-list).
+A run-level predicate must assume the worst, so ANY specialized op in
+the run denies rcx - and those are exactly the ops that make rdx
+spendable. The whitelist is therefore empty in practice: no run
+qualifies. Confirmed by construction, not by trying it.
+
+So rcx needs its ROLES threaded, like r9. Its 218 sites, grouped:
+
+    26  emit_sync_push_native  ) ALREADY SAFE - the gates rdi/rsi/r9
+    13  emit_ret_native        ) were cleared against
+     4  emit_sync_call_inline  )
+    22  emit_load_elem2_inline ) ElemScratch::data, the SIB BASE of
+    12  LoadElemInt/Float arm  ) every element operand. The encoders
+    10  emit_store_elem_inline ) (load_elem_q/zx8/sd, store_elem_*)
+     8  emit_store_elem2_inline) ALREADY take the base as an argument,
+     5  LoadElemBool arm       ) so this is threading, not re-encoding
+     4  emit_flat_int_tail     )
+    15  IntAddStep/ForLoopStep ) the loop-step staging
+     7  IntOrRR.. (the family) ) the general three-address staging -
+                               ) allocate it the way elem_read_idx does
+    12  LoadCaptureV/StoreCaptureV ) the chain's copy register
+     ~40 the long tail (UnaryV 7, LoadMemberFloat 5, StructCtorV 4,
+         MoveV/LoadBuiltinV/LoadConstV 3 each, jit_try_container 8, ...)
+
+ORDER: the element `data` role first (55 sites, one mechanical pass,
+and it doubles as the rdx `count` work since the two are computed
+together), then the arith staging, then the tail. Expect it to be
+larger than r9's conversion and to land inert at every step -
+`scripts/vdjcmp.sh` byte-identical is the check that it did.
