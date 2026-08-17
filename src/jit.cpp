@@ -2212,29 +2212,46 @@ struct Emitter {
      */
     /*
      * Bump a counter through an EXPLICIT scratch register, for sites
-     * where rax is live. `bump_op` below hardcodes rax and clobbers it -
-     * fine at its call sites, fatal at one holding a forwarded value.
-     * BOTH clobber FLAGS, so emit before the arithmetic, never between
-     * an op and a consumer of its flags.
+     * where rax is live. BOTH this and `bump_op` clobber FLAGS, so emit
+     * before the arithmetic, never between an op and a consumer of its
+     * flags.
+     *
+     * ⛔ #96: THIS SEAM EXISTED AND NINETEEN SITES OPEN-CODED IT
+     * ANYWAY - `movabs RDX, &ctr; inc qword [rdx]`, written out, plus
+     * `bump_op`, which hardcoded rax with the register named only in a
+     * COMMENT. Exactly the shape the tag-compare seam was found in the
+     * same day: an entry point with a hole around it.
+     *
+     * It matters more here than it looks, because these are all
+     * `#ifdef TESTS`: a clobber makes the TESTS build's register
+     * traffic DIFFER FROM THE SHIPPING BUILD's, so the net meant to
+     * catch a pin bug would report one the release does not have - or
+     * hide one it does. And rdx and rax are the next two registers #96
+     * must admit.
+     *
+     * `scratch()` states the contract, so the day either joins the pool
+     * without these sites being revisited, -rt aborts BY NAME instead
+     * of silently corrupting a pinned accumulator.
      */
-    void bump_counter(const void *ctr, uint8_t scratch)
+    void bump_counter(const void *ctr, uint8_t scratch_reg)
     {
 #ifdef TESTS
-        movabs(scratch, reinterpret_cast<uint64_t>(ctr));
-        u8(static_cast<uint8_t>(0x48 | (scratch >= 8 ? 0x01 : 0)));
+        ML_CHECK_MSG(scratch_reg != 4 && scratch_reg != 5,
+                     "bump_counter: rsp/rbp need a different mod form");
+        scratch(scratch_reg);
+        movabs(scratch_reg, reinterpret_cast<uint64_t>(ctr));
+        u8(static_cast<uint8_t>(0x48 | (scratch_reg >= 8 ? 0x01 : 0)));
         u8(0xFF);
-        u8(static_cast<uint8_t>(0x00 | (scratch & 7)));   /* inc [scr] */
+        u8(static_cast<uint8_t>(0x00 | (scratch_reg & 7)));  /* inc [r] */
 #else
-        (void)ctr; (void)scratch;
+        (void)ctr; (void)scratch_reg;
 #endif
     }
     void bump_op(OpCode op)
     {
 #ifdef TESTS
-        movabs(0 /* rax; the Reg enum is declared below */,
-               reinterpret_cast<uint64_t>(
-                   &g_jit_op_run[static_cast<size_t>(op)]));
-        u8(0x48); u8(0xFF); u8(0x00);          /* inc qword [rax] */
+        bump_counter(&g_jit_op_run[static_cast<size_t>(op)],
+                     0 /* rax; the Reg enum is declared below */);
 #else
         (void)op;
 #endif
@@ -5685,10 +5702,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         ld(RAX, R10, static_cast<int32_t>(P.rec_parent_sg));
         st(R8R, static_cast<int32_t>(P.act_cur_sg), RAX);
 #ifdef TESTS
-        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_ret_inline));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x00);        /* inc qword [rax] */
-        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_native_returns));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x00);        /* inc qword [rax] */
+        e.bump_counter(&g_jit_ret_inline, RAX);
+        e.bump_counter(&g_jit_native_returns, RAX);
 #endif
         /* rax = JIT_RET_SENTINEL ((size_t)-1); return to the caller */
         e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
@@ -5739,10 +5754,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             e.u8(static_cast<uint8_t>(L.fs_ret));
         }
 #ifdef TESTS
-        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_ret_inline));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x00);        /* inc qword [rax] */
-        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_native_returns));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x00);        /* inc qword [rax] */
+        e.bump_counter(&g_jit_ret_inline, RAX);
+        e.bump_counter(&g_jit_native_returns, RAX);
 #endif
         e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
         e.u32(0xFFFFFFFEu);                        /* mov rax, -2 */
@@ -6364,11 +6377,9 @@ static void emit_fwd_bump(Emitter &e, bool local)
     if (g_fwd.in_reg != RAX)
         e.mov_rr(RAX, g_fwd.in_reg);
 #ifdef TESTS
-    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_fwd));
-    e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
+    e.bump_counter(&g_jit_fwd, RDX);
     if (local) {
-        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_fwd_local));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x02);
+        e.bump_counter(&g_jit_fwd_local, RDX);
     }
 #else
     (void)local;
@@ -6382,8 +6393,7 @@ static void emit_fwd_bump(Emitter &e, bool local)
 static void emit_fwd_fbump(Emitter &e)
 {
 #ifdef TESTS
-    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_ffwd));
-    e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
+    e.bump_counter(&g_jit_ffwd, RDX);
 #endif
 }
 
@@ -9748,8 +9758,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             e.patch32_here(j_ok);
         }
 #ifdef TESTS
-        e.movabs(sc.count, reinterpret_cast<uint64_t>(&g_jit_store_fast));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x02);      /* the tier's counter */
+        e.bump_counter(&g_jit_store_fast, sc.count);
 #endif
         if (!compound) {
             if (is_float)
@@ -9761,12 +9770,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                 e.store_elem_q(H->rdata, sc.idx, sc.val);
         } else {
 #ifdef TESTS
-            e.movabs(sc.count, reinterpret_cast<uint64_t>(&g_jit_hoist_rmw));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x02);  /* the ARM's own counter
-                                                  * (g_jit_store_fast also
-                                                  * counts the ordinary
-                                                  * tier - it cannot prove
-                                                  * THIS arm ran) */
+            /* the hoisted-compound arm's own proof (g_jit_store_fast
+             * also counts the ordinary tier - it cannot prove THIS
+             * arm ran) */
+            e.bump_counter(&g_jit_hoist_rmw, sc.count);
 #endif
             e.mov_rr(sc.data, H->rdata);             /* the [rcx+r9*8] tails */
             if (is_float) {
@@ -9877,8 +9884,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     };
     const auto bump = [&]() {
 #ifdef TESTS
-        e.movabs(sc.count, reinterpret_cast<uint64_t>(&g_jit_store_fast));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x02);              /* inc qword */
+        e.bump_counter(&g_jit_store_fast, sc.count);
 #endif
     };
     /* The int RMW tail: the hash byte is invalidated FIRST (rax = shobj is
@@ -10151,8 +10157,7 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
     };
     const auto bump = [&]() {
 #ifdef TESTS
-        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem2_fast));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x02);    /* inc qword [rdx] */
+        e.bump_counter(&g_jit_elem2_fast, RDX);
 #endif
     };
 
@@ -10243,8 +10248,7 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
     e.add_rr(ir, RDX);                            /* iidx += off */
     e.mov_rcx_rax(L.data_off);                 /* rcx = row data */
 #ifdef TESTS
-    e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem_slice_fast));
-    e.u8(0x48); e.u8(0xFF); e.u8(0x02);        /* inc qword [rdx] */
+    e.bump_counter(&g_jit_elem_slice_fast, RDX);
 #endif
     if (is_float) {
         e.load_elem_sd(0, RCX, ir);
@@ -10381,8 +10385,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     };
     const auto bump = [&]() {
 #ifdef TESTS
-        e.movabs(sc.count, reinterpret_cast<uint64_t>(&g_jit_store2_fast));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x02);
+        e.bump_counter(&g_jit_store2_fast, sc.count);
 #endif
     };
     /* inner data/count/index/bounds (clobbers rcx - after cow_guards) */
@@ -11342,8 +11345,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.mov_eax_slot(base.payload + L.arr_off_off);   /* rax = off */
         e.add_rr(ir, RAX);                          /* idx += off */
 #ifdef TESTS
-        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem_slice_fast));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x02);      /* inc qword [rdx] */
+        e.bump_counter(&g_jit_elem_slice_fast, RDX);
 #endif
         if (is_float) {
             e.load_elem_sd(0, RCX, ir);
@@ -12832,8 +12834,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const SlotAddr b = slot_addr(in.target2);
         e.mov_eax_slot(b.payload + L.str_len_off);   /* zero-extended u32 */
 #ifdef TESTS
-        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_strlen_fast));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
+        e.bump_counter(&g_jit_strlen_fast, RDX);
 #endif
         store_dst(e, ck, RAX, in.target, pc);
         return true;
@@ -12985,8 +12986,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 j_slows.push_back(e.j32(0x75));
             }
 #ifdef TESTS
-            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_boxed_fast));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x02);    /* inc qword [rdx] */
+            e.bump_counter(&g_jit_boxed_fast, RDX);
 #endif
             /* payloads: rax = lhs, rcx = rhs (guard value dead now) */
             if (comp)
@@ -13101,8 +13101,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 j_slows.push_back(e.j32(0x75));
             }
 #ifdef TESTS
-            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_boxed_fastf));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x02);    /* inc qword [rdx] */
+            e.bump_counter(&g_jit_boxed_fastf, RDX);
 #endif
             /* payloads: xmm0 = lhs, xmm1 = rhs */
             const auto fload_opnd = [&e](uint8_t xr, const Operand &o) {
@@ -13586,8 +13585,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.u8(0x0F); e.u8(0xB6); e.u8(0x04);  /* movzx eax,           */
             e.u8(0x11);                          /*   byte [rcx + rdx]   */
 #ifdef TESTS
-            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_ord_inline));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x02);  /* inc qword [rdx] */
+            e.bump_counter(&g_jit_ord_inline, RDX);
 #endif
             store_dst(e, ck, RAX, in.target, pc);
             j_fast_done = e.j32(0xEB);
@@ -16765,8 +16763,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 nav(hr.base, hr.kind, hr.has_store,
                     HOIST_RDATA, HOIST_RCOUNT);
 #ifdef TESTS
-                e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_hoist));
-                e.u8(0x48); e.u8(0xFF); e.u8(0x02);
+                e.bump_counter(&g_jit_hoist, RDX);
 #endif
                 g_hoist.active = true;
                 if (hr.base2 >= 0 && pair_lo >= 0) {
