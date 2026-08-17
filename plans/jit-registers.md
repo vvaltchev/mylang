@@ -1577,3 +1577,46 @@ accumulator would become 1 uop where memory is 3, which is the first
 mechanism in this whole task that makes an ADDITIONAL register worth
 something measurable. The 13-register goal gets its justification from
 increment 2, not from any pool widening.
+
+
+## 2026-08-18 (e): increment 2 LANDED - and the arc finally pays
+
+`<op> pin, <src>`. `add r14, r13` for four instructions. Full record in
+docs/jit-optimizations.md; the headline:
+
+    Ir   01_while_loop -37.35%, 80 -27.13%, 81 -24.79%, 82 -23.16%,
+         83 -22.29%, 07_nested_loops -11.34%, 43_sieve -6.88%
+    WALL geomean cur/base 0.990x, 01_while_loop 0.62x, 81 0.86x
+
+**THE FIRST WALL-CLOCK WIN OF #96**, and it lands exactly where the
+micro-op argument said it would: the memory half re-encodes work (RMW =
+same uops), the register half removes it (two renamed moves and a store
+collapse into one uop).
+
+### The arc, honestly summarised
+
+Three increments widened the PIN POOL and measured flat, because the
+pool was never the constraint - the emitter could not name a pinned
+register as an arithmetic OPERAND, so a pin only changed an addressing
+mode. Two increments fixed the OPERAND ROUTING and the same programs
+moved 22-37%. The register file mattered all along; what was missing
+was an instruction shape that could use it.
+
+### What is left
+
+ 3. imm operands beyond the two-address path - the loop counter still
+    emits `mov rax,r13; movabs rcx,1; add rax,rcx; mov r13,rax` when it
+    lowers to ForLoopStep/IntAddStep rather than IntAddRI, which this
+    increment does not touch. (`op_reg_imm` already prefers imm8 for
+    the paths it does reach.)
+ 4. RE-MEASURE the marginal value of a register with
+    MYLANG_JIT_MAXPINS. It should be non-zero for the first time - a
+    pinned accumulator is now 1 uop where a memory one is 3 - and THAT
+    number is what should decide whether to widen the pool toward 13.
+    Do not widen it before running the sweep.
+ 5. The cost guards declined in increment 1 (fa, ref-listed dst) are
+    still declined. Revisit WITH a measurement.
+
+Also queued from this session (maintainer-raised, both AFTER the
+allocator): #100 strength-reduce constant MULTIPLICATION, #101 a native
+peephole + scheduling pass run last and agnostic of everything else.

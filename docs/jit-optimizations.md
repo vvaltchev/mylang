@@ -6012,3 +6012,73 @@ Two of its cases needed TEN accumulators rather than one - with one,
 every accumulator is PINNED and the tier declines for that reason
 first, so the imul sabotage left the suite green. A decline case that
 cannot fail is not a decline case.
+
+## 2026-08-18 - #96 increment 2: TWO-ADDRESS with a PINNED destination
+
+`<op> pin, <src>` - the half that removes real WORK rather than
+re-encoding it:
+
+    mov rax, r14 ; mov rcx, r13 ; add rax, rcx ; mov r14, rax    4
+    add r14, r13                                                 1
+
+Four instructions - of which the two moves are eliminated at rename but
+still occupy decode slots - become ONE uop. Contrast increment 1, whose
+memory RMW decodes to the same uops as the sequence it replaced.
+
+Three source shapes, no scratch needed by any of them: another pin
+(`add r14, r13`), a memory slot (`add r14, [rbx+d]` - the RM form reads
+memory directly), or a literal (`add r14, 1`). Encoders `op_rr2` /
+`op_reg_slot` / `op_reg_imm` share one opcode table, because RM is
+`reg = reg OP r/m` and reg-reg and reg-memory differ only in the ModRM.
+
+**`imul` IS ALLOWED HERE**, unlike the memory half: `imul r64, r/m64`
+(0F AF /r) is exactly the RM form and only the MR direction is missing
+from the ISA. That asymmetry is why the two halves have different op
+sets, and it is worth stating because it looks like an inconsistency.
+
+**A forwarded-OUT destination is ALSO allowed here**, again unlike the
+memory half: the result is in a PIN, so handing it to the consumer
+costs one `mov rax, pin`, and 1 + 1 still beats 4. Declining it left
+`a0 = a0 + i` at four instructions on 83_regs_int_40 - the single
+biggest remaining cost when the pinned form first landed.
+
+The whole recurrence, before and after this arc:
+
+    mov rax, a0 ; mov rcx, i  ; add rax, rcx ; mov a0, rax
+    sar rax, 3  ; mov rcx, a0 ; xor rax, rcx ; mov a0, rax     8
+    ---------------------------------------------------------------
+    add r14, r13 ; mov rax, r14 ; sar rax, 3 ; xor r14, rax    4
+
+**MEASURED, increments 1+2 together (callgrind Ir, OPT=1 ASSERTS=0):**
+01_while_loop **-37.35%**, 80_regs_int_08 -27.13%, 81_regs_int_14
+-24.79%, 82_regs_int_25 -23.16%, 83_regs_int_40 -22.29%,
+07_nested_loops -11.34%, 43_sieve -6.88%, 54_mandelbrot -3.43%.
+`func work` in 83: 817 -> 722 instructions. 49 of 108 corpus programs
+change.
+
+**WALL CLOCK: geomean cur/base 0.990x** - a suite-wide 1% gain, with
+01_while_loop at **0.62x** and 81_regs_int_14 at 0.86x. This is the
+first wall-clock win of the #96 arc, and it lands exactly where the
+uop argument said it would.
+
+Also here: `op_reg_imm` prefers the **imm8** form (`83 /ext`, 4 bytes)
+over imm32 (`81 /ext`, 7). Deliberately NOT `inc`/`dec`, which are one
+byte smaller again but write flags PARTIALLY (they leave CF), costing a
+flag-merge on older cores - a real trade for one byte where imm8 is
+free and covers every small constant, not just +-1.
+
+⛔ TWO ENCODING TRAPS, both watched failing:
+ - **`imul r64, r/m64, imm32` (69 /r) names the destination TWICE** -
+   reg field AND r/m - so a high register needs REX.R *and* REX.B.
+   Setting only REX.B (natural, since every other form here is
+   r/m-only) leaves the reg field at its low 3 bits: for r12 that is 4,
+   i.e. **RSP**, and `imul rsp, r12, 3` destroys the stack pointer.
+   ASan reported a stack-overflow with sp = 0x3. The case that caught
+   it was the imul DECLINE program written for increment 1, which
+   reaches this path the moment a pinned dst is allowed.
+ - **the opcode lookup must not live INSIDE its ML_CHECK.** Written as
+   `ML_CHECK_MSG(op_rm_opcode(aop, opc, two, ext), ...)` it compiles
+   away entirely under ASSERTS=0, leaving `opc`/`two` UNINITIALISED and
+   a release build emitting a garbage opcode. `-Werror=uninitialized`
+   caught it; the debug build was clean. Same family as any check whose
+   side effect is load-bearing.

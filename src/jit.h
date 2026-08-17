@@ -928,6 +928,9 @@ extern "C" unsigned long g_jit_xcache;
 /* #96: `<op> [slot], reg` emitted instead of the four-instruction
  * load/load/apply/store shape - the two-address form. */
 extern "C" unsigned long g_jit_two_addr;
+/* #96 increment 2: `<op> pin, <src>` - the two-address form with a
+ * PINNED destination, which collapses four instructions to one uop. */
+extern "C" unsigned long g_jit_two_addr_reg;
 extern "C" unsigned long g_jit_fcache;        /* C2a: float-pinned fragment
                                                * entries (xmm4-7) */
 extern "C" unsigned long g_jit_hoist2;        /* C2b: second-base preheader

@@ -24739,8 +24739,10 @@ static bool jit_two_address()
         return true;
 
     auto go = [&](const std::vector<const char *> &src,
-                  unsigned long *hits) -> std::string {
+                  unsigned long *hits,
+                  unsigned long *rhits) -> std::string {
         const unsigned long h0 = g_jit_two_addr;
+        const unsigned long r0 = g_jit_two_addr_reg;
         std::ostringstream cap;
         std::streambuf *old = cout.rdbuf(cap.rdbuf());
         try {
@@ -24757,6 +24759,7 @@ static bool jit_two_address()
         } catch (...) { }
         cout.rdbuf(old);
         if (hits) *hits = g_jit_two_addr - h0;
+        if (rhits) *rhits = g_jit_two_addr_reg - r0;
         return cap.str();
     };
 
@@ -24764,7 +24767,8 @@ static bool jit_two_address()
         const char *name;
         std::vector<const char *> src;
         const char *want;      /* expected stdout */
-        bool fires;            /* must the two-address form ENGAGE? */
+        bool fires;            /* the MEMORY form must engage? */
+        bool fires_reg;        /* the PINNED form must engage? */
     };
     const std::vector<Case> cases = {
       /* the accumulator family, one per MR-encodable op. Each `a = a OP
@@ -24786,7 +24790,7 @@ static bool jit_two_address()
           "        a5 = a5 + i;  a6 = a6 - i;  a7 = a7 & (i + 496);",
           "        a8 = a8 | i;  a9 = a9 ^ i; }",
           "    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9; }",
-          "print(f(runtime(20)));" }, "3102", true },
+          "print(f(runtime(20)));" }, "3102", true, true },
 
       /*
        * imul has NO MR encoding - `imul r64, r/m64` is RM only, the
@@ -24809,7 +24813,7 @@ static bool jit_two_address()
           "        m4 = m4 * 3; m5 = m5 * 3; m6 = m6 * 3; m7 = m7 * 3;",
           "        m8 = m8 * 3; m9 = m9 * 3; }",
           "    return m0 + m1 + m2 + m3 + m4 + m5 + m6 + m7 + m8 + m9; }",
-          "print(f(runtime(9)));" }, "196830", false },
+          "print(f(runtime(9)));" }, "196830", false, true },
 
       /* dst is NOT one of the sources - not the two-address shape. */
       { "a three-address write declines (dst is not a source)",
@@ -24818,7 +24822,7 @@ static bool jit_two_address()
           "    for (var i = 0; i < n; i++) { a = b + i; b = c + i;",
           "                                  c = i + 1; }",
           "    return a * 100 + b * 10 + c; }",
-          "print(f(runtime(7)));" }, "1727", false },
+          "print(f(runtime(7)));" }, "1727", false, false },
 
       /*
        * THE TAG, and getting this case right took two tries. The form
@@ -24844,13 +24848,31 @@ static bool jit_two_address()
           "    var dyn d = a9;",
           "    var dyn r = d + 1;",
           "    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + r; }",
-          "print(f(runtime(10)));" }, "286", true },
+          "print(f(runtime(10)));" }, "286", true, false },
+
+      /*
+       * INCREMENT 2 on its own: THREE accumulators, so every one is
+       * PINNED and the MEMORY form must never fire. `add r14, r13`
+       * against `mov rax,r14; mov rcx,r13; add rax,rcx; mov r14,rax`.
+       * A multiply is included deliberately - `imul r64, r/m64` IS the
+       * RM form, so unlike the memory half this one must ENGAGE for
+       * times, and the encoder names the destination twice (69 /r), an
+       * asymmetry that cost an `imul rsp, r12, 3` and a stack overflow
+       * before REX.R was set.
+       */
+      { "a PINNED destination takes the register form (imul included)",
+        { "func f(int n) {",
+          "    var s = 0; var p = 1; var x = 7;",
+          "    for (var i = 1; i <= n; i++) {",
+          "        s = s + i; p = p * 2; x = x ^ i; }",
+          "    return s * 1000000 + p * 10 + x; }",
+          "print(f(runtime(12)));" }, "78040971", false, true },
     };
 
     bool ok = true;
     for (const Case &c : cases) {
-        unsigned long hits = 0;
-        const std::string out = go(c.src, &hits);
+        unsigned long hits = 0, rhits = 0;
+        const std::string out = go(c.src, &hits, &rhits);
         std::string got = out;
         while (!got.empty() && (got.back() == '\n' || got.back() == ' '))
             got.pop_back();
@@ -24867,6 +24889,16 @@ static bool jit_two_address()
         if (!c.fires && hits != 0) {
             cout << "  two_addr [" << c.name << "]: engaged " << hits
                  << " times, expected a DECLINE\n";
+            ok = false;
+        }
+        if (c.fires_reg && rhits == 0) {
+            cout << "  two_addr [" << c.name
+                 << "]: the PINNED form never engaged\n";
+            ok = false;
+        }
+        if (!c.fires_reg && rhits != 0) {
+            cout << "  two_addr [" << c.name << "]: the PINNED form "
+                 << "engaged " << rhits << " times, expected a DECLINE\n";
             ok = false;
         }
     }
