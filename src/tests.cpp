@@ -4898,6 +4898,71 @@ static const std::vector<test> tests =
         "func fetch() { return g; }",
         "assert(t == 5);" } },
 
+    /*
+     * THROUGH A WRITE-ONCE NAME (#140). The callee is not spelled at the call
+     * site, but a name whose ONLY write is its declaration can hold nothing
+     * else - so the failure is exactly as certain as the direct spelling, and
+     * refusing one while running the other was the inconsistency.
+     */
+    { "alias: a call through a write-once name is refused",
+      { "func fetch() { return g; }",
+        "var f = fetch;",
+        "var dyn t = f();",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    { "alias: refused through a write-once name and a call hop",
+      { /* the alias is read INSIDE a body, so it is a global here - the edge
+         * has to be found by build_reachable_reads, not just at the top
+         * level */
+        "func fetch() { return g; }",
+        "var f = fetch;",
+        "func outer() { var r = f(); return r; }",
+        "var dyn t = outer();",
+        "var g = 5;" },
+      &typeid(UseBeforeBindingEx) },
+    /*
+     * ... and the declines. A false "provable" here refuses a program that
+     * RUNS, so each of these asserts its own result rather than merely
+     * compiling.
+     */
+    { "alias: declines when the name is REASSIGNED (not write-once)",
+      { /* f holds `other` by the time it is called, and `other` never reads
+         * g - so proving anything from `fetch` would be simply wrong */
+        "func fetch() { return g; }",
+        "func other() { return 7; }",
+        "var f = fetch;",
+        "f = other;",
+        "var t = f();",
+        "assert(t == 7);",
+        "var g = 5;" } },
+    { "alias: declines when the global is bound before the call",
+      { "func fetch() { return g; }",
+        "var g = 5;",
+        "var f = fetch;",
+        "var dyn t = f();",
+        "assert(t == 5);" } },
+    { "alias: declines a name bound to something that is not a function",
+      { "func fetch() { return g; }",
+        "var f = 3;",
+        "assert(f == 3);",
+        "var g = 5;" } },
+    { "alias: declines a CONDITIONAL call through the name",
+      { "func fetch() { return g; }",
+        "var f = fetch;",
+        "var out = 0;",
+        "if (runtime(0) > 0) { var dyn t = f(); out = 1; }",
+        "assert(out == 0);",
+        "var g = 5;" } },
+    { "alias: declines a container element (the value is not one name)",
+      { /* `ops[0]()` needs a callee-SET analysis; the resolver sees a
+         * subscript, declines, and the runtime error stands */
+        "func fetch() { return g; }",
+        "var ops = [fetch];",
+        "var out = 0;",
+        "try { var dyn t = ops[0](); } catch (UnboundSymbolEx) { out = 1; }",
+        "assert(out == 1);",
+        "var g = 5;" } },
+
     { "TDZ: a store through an unbound global base",
       { "func f() { g[0] = 1; }",
         "var out = 0;",
@@ -17041,6 +17106,22 @@ static bool unbound_call_warnings()
           { "func fetch() { var a = g; var b = g; return a + b; }",
             "if (runtime(0) > 1) { var dyn t = fetch(); }",
             "var g = 5;" }, 1 },
+        { /* #140: the callee is a write-once NAME, not spelled at the call */
+          "a conditional call through a write-once alias",
+          { "func fetch() { return g; }",
+            "var f = fetch;",
+            "if (runtime(0) > 1) { var dyn t = f(); }",
+            "var g = 5;" }, 1 },
+        { /* ... and a REASSIGNED name is no alias, so it must stay quiet:
+           * warning about `fetch` here would be warning about a function
+           * this call cannot reach */
+          "a reassigned name is not an alias",
+          { "func fetch() { return g; }",
+            "func other() { return 7; }",
+            "var f = fetch;",
+            "f = other;",
+            "if (runtime(0) > 1) { var dyn t = f(); }",
+            "var g = 5;" }, 0 },
     };
 
     bool ok = true;
