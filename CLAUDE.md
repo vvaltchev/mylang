@@ -95,6 +95,13 @@ them means anything:**
   register. Oracle: it DERIVES its accessor list from the source.
 - **`bench/run.py`** - is it faster. Oracle: RULE B1, the build-config
   gate, and the machine-speed marker.
+- **`MYLANG_JIT_MAXPINS=N`** - cap the JIT's pin budget, so the
+  MARGINAL value of one register is a measured number. Oracle: a
+  NON-BINDING cap must be a no-op - `N >= jit_pin_budget()` has to
+  emit byte-identical code to unset, over the whole corpus. (It is
+  NOT the same as `MYLANG_JIT_OFF=cache`, which clears the picks
+  AFTER the pick and so leaves the C3/C4a side-outputs derived from
+  a full budget.)
 - **`MYLANG_JITSTATS`** - which TIER a program's calls actually took.
   Oracle: the counters are bumped from EMITTED code only.
 - **`tests/corpus_diff.sh`** - do the engines agree. Oracle: the
