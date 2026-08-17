@@ -3954,17 +3954,27 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
 int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
                     int_type fidx)
 {
+    /*
+     * #137 tier 2 + #142: `fidx` is an INSTRUCTION operand and the def is
+     * whatever the slot holds at RUN time, so verify_chunk can bound it by
+     * nothing tighter than the widest struct in the program - a narrow
+     * struct read with a wide one's field index arrives here in range for
+     * tier 1 and out of range for this vector.
+     *
+     * It must not THROW to say so: jit_load_struct_field and
+     * jit_struct_field_add_int are `noexcept` with no catch, so an
+     * exception here is std::terminate. A defined value it is - the same
+     * bargain the rest of the untrusted tier makes.
+     */
+    if (!arrv.is<SharedArrayObj>())
+        return 0;
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    if (arr.skind() != SharedArrayObj::Storage::structs
+        || idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        return 0;
     const auto &sv = arr.flat_structs();
-    /* #137 tier 2: `fidx` is an INSTRUCTION operand, and the def is
-     * whatever the slot holds at run time - so verify_chunk can only
-     * bound it by the WIDEST struct in the program. A narrow struct
-     * read with a wide one's field index gets here in range for tier 1
-     * and out of range for this vector. */
-    ML_UNTRUSTED_CHECK(fidx >= 0
-                       && static_cast<size_t>(fidx)
-                              < sv.def->fields.size(),
-                       "struct field index");
+    if (fidx < 0 || static_cast<size_t>(fidx) >= sv.def->fields.size())
+        return 0;
     const FieldDef &f = sv.def->fields[fidx];
     const char *p =
         sv.buf.data() + (arr.offset() + idx) * sv.stride + f.offset;
@@ -3978,17 +3988,27 @@ int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
 float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
                       int_type fidx)
 {
+    /*
+     * #137 tier 2 + #142: `fidx` is an INSTRUCTION operand and the def is
+     * whatever the slot holds at RUN time, so verify_chunk can bound it by
+     * nothing tighter than the widest struct in the program - a narrow
+     * struct read with a wide one's field index arrives here in range for
+     * tier 1 and out of range for this vector.
+     *
+     * It must not THROW to say so: jit_load_struct_field and
+     * jit_struct_field_add_int are `noexcept` with no catch, so an
+     * exception here is std::terminate. A defined value it is - the same
+     * bargain the rest of the untrusted tier makes.
+     */
+    if (!arrv.is<SharedArrayObj>())
+        return 0.0;
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    if (arr.skind() != SharedArrayObj::Storage::structs
+        || idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        return 0.0;
     const auto &sv = arr.flat_structs();
-    /* #137 tier 2: `fidx` is an INSTRUCTION operand, and the def is
-     * whatever the slot holds at run time - so verify_chunk can only
-     * bound it by the WIDEST struct in the program. A narrow struct
-     * read with a wide one's field index gets here in range for tier 1
-     * and out of range for this vector. */
-    ML_UNTRUSTED_CHECK(fidx >= 0
-                       && static_cast<size_t>(fidx)
-                              < sv.def->fields.size(),
-                       "struct field index");
+    if (fidx < 0 || static_cast<size_t>(fidx) >= sv.def->fields.size())
+        return 0.0;
     const FieldDef &f = sv.def->fields[fidx];
     const char *p =
         sv.buf.data() + (arr.offset() + idx) * sv.stride + f.offset;
@@ -4027,11 +4047,12 @@ static T vm_struct_elem_field(const EvalValue &arrv, int_type idx,
 
     if (arr.skind() == SharedArrayObj::Storage::structs) {
         const auto &sv = arr.flat_structs();
-        /* #137 tier 2 - see the twin in vm_struct_field_int above. */
-        ML_UNTRUSTED_CHECK(fidx >= 0
-                           && static_cast<size_t>(fidx)
-                                  < sv.def->fields.size(),
-                           "struct field index");
+        /* #137 tier 2 - see the twin in vm_struct_field_int above. The
+         * OutOfBoundsEx raised earlier is a LANGUAGE error and stays a
+         * throw (its caller conveys it); a bad field index is CORRUPTION
+         * and takes the defined value instead. */
+        if (fidx < 0 || static_cast<size_t>(fidx) >= sv.def->fields.size())
+            return static_cast<T>(0);
         const FieldDef &f = sv.def->fields[fidx];
         const char *p = sv.buf.data()
             + (arr.offset() + static_cast<size_type>(idx)) * sv.stride

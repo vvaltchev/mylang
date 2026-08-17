@@ -5544,7 +5544,12 @@ extern "C" void jit_member_fact_audit(int_type slot,
     /* #142: VM_HARDENING=1 with ASSERTS=0 is a real configuration (the CI
      * release lanes are close to it), and there ML_VM_CHECK compiles away
      * while the get_ref below does not - so the audit itself would throw
-     * out of a noexcept helper. Test structurally, assert on the result. */
+     * out of a noexcept helper. Test structurally, assert on the result.
+     * And like jit_ret_audit, it audits OUR codegen - not a disk image. */
+#if ML_UNTRUSTED_CHECKS
+    if (g_untrusted_bytecode)
+        return;
+#endif
     const EvalValue &v = g_current_ctx->frame->at(slot).get();
     const bool is_struct = v.is<intrusive_ptr<StructObject>>();
     ML_VM_CHECK(is_struct);
@@ -5559,6 +5564,19 @@ extern "C" void jit_member_fact_audit(int_type slot,
 extern "C" void jit_ret_audit() noexcept
 {
 #if ML_VM_HARDENING
+    /*
+     * #137/#142: every assertion below audits OUR OWN CODEGEN's output -
+     * that `ref_slots` lists what the emitted code can actually put in a
+     * slot, that a plain frame moved no watermark. On bytecode read off a
+     * DISK none of that is our output and the premise simply does not
+     * hold, so the audit is not a bug report, it is a false alarm that
+     * aborts the process. `ref_slots` is bounded by verify_chunk, so a
+     * wrong one can only leak a reference, never index out of range.
+     */
+#if ML_UNTRUSTED_CHECKS
+    if (g_untrusted_bytecode)
+        return;
+#endif
     VmActivation &act = *g_vm_act;
     VmCallRec &rec = act.back_rec();     /* also re-checks the top_rec mirror */
     /* the C3 net, pre-release form: every slot holding a REFERENCE must be

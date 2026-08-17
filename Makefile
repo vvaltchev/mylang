@@ -100,13 +100,14 @@ endif
 # than at COMPILE time on the build type - so a release running a shipped image
 # keeps them, which is the one case that matters. NOT tied to ASSERTS.
 #
-# DEFAULT OFF FOR NOW. The tier is landing so its cost can be measured
-# (UNTRUSTED_CHECKS=1 is how the numbers in this commit were taken), but it is
-# not yet safe to enable: ml_untrusted_fail THROWS, and some of the sites it
-# guards are reached from `noexcept` JIT helpers the emitter gives no status
-# test - where an escaping exception is std::terminate, not an error. Enabled
-# once that is fixed. See ML_UNTRUSTED_CHECK in defs.h.
-UNTRUSTED_CHECKS ?= 0
+# ON by default. It landed OFF, because ml_untrusted_fail throws and several
+# guarded sites are reached from `noexcept` JIT helpers where that is
+# std::terminate; those sites take a defined fallback now (this commit and
+# the noexcept sweep before it), so the tier is armed.
+# UNTRUSTED_CHECKS=0 compiles it away: the A/B lever for measuring what the
+# never-taken branch costs a trusted run, NOT a shipping configuration.
+# See ML_UNTRUSTED_CHECK in defs.h.
+UNTRUSTED_CHECKS ?= 1
 ifeq ($(UNTRUSTED_CHECKS),0)
 	BASE_FLAGS += -DML_UNTRUSTED_CHECKS=0
 else
