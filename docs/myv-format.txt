@@ -2,7 +2,7 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 10.  This document describes the on-disk image exhaustively:
+Format version 13.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
 
 It is the specification of what `mylang -c FILE` writes and what `mylang
@@ -341,9 +341,11 @@ whole call model reads it, never an AST node.
         bool  has_chunk             false for a dead template base
 
     NOTE on fast_bind: the reader RECOMPUTES it from the params it just
-    read (compute_bind_flags, eval.cpp) and ML_CHECKs the result against
-    the stored byte - so the field doubles as a cross-check of the param
-    round trip. Its companion `bind_req` (the per-param bind-time coercion
+    read (compute_bind_flags, eval.cpp) and compares the result with the
+    stored byte - so the field doubles as a cross-check of the param round
+    trip.  A mismatch REFUSES the image ("corrupt .myv (descriptor bind
+    flags)"); it is an input error, not an assertion, so a release build
+    reports it too. Its companion `bind_req` (the per-param bind-time coercion
     target) is DERIVED from the same read and is deliberately NOT stored,
     like every other derived pool in this format.
 
@@ -353,6 +355,11 @@ whole call model reads it, never an AST node.
         bool  cnst
         bool  dyn_mod
         u8    decl_type             DeclType, section 13
+        u8    proven_type           v11 - DeclType, section 13.  The type
+                                    INFERENCE proved for this parameter, as
+                                    opposed to the one the source DECLARED
+                                    (decl_type): the JIT elides a bind-time
+                                    type store when the two agree (C3).
 
     Capture:
         uid   name
