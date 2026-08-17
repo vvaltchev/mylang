@@ -4567,6 +4567,25 @@ again: a perfectly-predicted branch on a hot-cached global retires free beside
 the real work (the same finding as the guard-elision family). Judge it on the
 wall clock, and remember which number is which.
 
+**⛔ A `noexcept` JIT HELPER MUST NOT THROW - AND SEVERAL DID (#142).** The
+emitter gives a `void`-returning helper NO status test (that is what makes it
+cheap), so an exception leaving one is `std::terminate`: the process dies with
+no message, no caret, no backtrace. Four did - `jit_arr_len`,
+`jit_load_elem_bool`, `jit_load_str_char`, `jit_member_fact_audit` - because
+they read their base through `get_ref<T>()`, which THROWS on a type miss, and
+because `read_int_slot` / `read_float_slot` / the planned ctor's arms ended in
+a throwing `getval<T>()` behind an `ML_VM_CHECK` that a release compiles out.
+Two of them also indexed a string or a flat array with a compile-PROVEN index
+and no bound - a WILD READ, which is worse than a throw and is fatal in the
+interpreter too.
+**The rule:** in a helper the emitter cannot get a status from, a type miss or
+a bad index takes a DEFINED fallback (`none`, `0`), never a throw. The type
+test costs nothing - `get_ref` performs it anyway; only the miss branch
+changes. And **fix the INTERPRETED TWIN in the same change**: `ArrLen`,
+`LoadStrChar` and `LoadElemBool` each have a hand-inlined copy in `vm.cpp`'s
+dispatch with the identical hazard, and the unbounded index there is a wild
+read even though the interpreter may legally throw.
+
 Two producer-side rules fell out: **only PRE-JIT bytecode is storable**
 (`myv_write` ML_CHECKs it - the JIT rewrites code in place and fragments
 are not serialized, so a post-jit image names fragments that do not
