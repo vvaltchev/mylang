@@ -1620,3 +1620,43 @@ was an instruction shape that could use it.
 Also queued from this session (maintainer-raised, both AFTER the
 allocator): #100 strength-reduce constant MULTIPLICATION, #101 a native
 peephole + scheduling pass run last and agnostic of everything else.
+
+
+## 2026-08-18 (f): the sweep re-run - THE POOL IS NOW MEASURABLY TOO SMALL
+
+    WHOLE POOL (cap 0 -> 7)     before      now
+    83_regs_int_40              +0.00%     -3.19%
+    80_regs_int_08              +0.00%    -12.44%
+    01_while_loop               -5.85%    -16.57%
+    07_nested_loops             -5.36%    -11.33%
+
+    MARGINAL, per additional pin
+    83_regs_int_40   pins 3..7  -0.76 -0.61 -0.62 -0.62 -0.62 %
+    80_regs_int_08   pins 3..7  -2.96 -2.44 -2.50 -2.57 -2.64 %
+    01_while_loop    pins 1,2   -8.28 -9.04 %, then flat (2 hot locals)
+    07_nested_loops  pins 1,2   -8.50 -3.09 %, then flat
+
+**The curve does NOT plateau at 7 on the pressure benches, and 7 is the
+entire pool.** Each further register is worth a steady -0.62% (83) /
+-2.6% (80). 7 -> 13 on 83 projects to about another -3.7%.
+
+So the original mandate is now backed by a measurement rather than a
+site count, and the order it should be done in is settled:
+
+ - FIRST the operand routing (done: increments 1 and 2). Without it a
+   register cannot pay, which is what the three flat increments were
+   really telling us.
+ - THEN widen the pool. The remaining cost is the SCRATCH ALLOCATOR for
+   RAX/RCX/RDX (717 of 1016 unbracketed sites) - the same work the plan
+   named months ago, but now with a per-register return attached to it
+   instead of a hope.
+
+Still open, cheaper, and worth doing before the big conversion:
+ - increment 3: the loop counter still emits
+   `mov rax,r13; movabs rcx,1; add rax,rcx; mov r13,rax` where it
+   lowers to ForLoopStep/IntAddStep rather than IntAddRI, which
+   increment 2 does not reach;
+ - the increment-1 cost declines (fa, ref-listed dst), revisit WITH a
+   measurement;
+ - #100 (constant multiply strength reduction) and #101 (the native
+   peephole pass), both maintainer-raised, both after the allocator.
