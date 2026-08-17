@@ -2040,6 +2040,18 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
      */
     vm_verify_program(prog);
 
+    /*
+     * #137 tier 2: from here on this process is running UNTRUSTED bytecode.
+     * Everything verify_chunk could decide from the image alone is already
+     * decided; what is left is value-dependent (a slot's storage kind, a
+     * field index against the def a slot actually holds), and those sites
+     * now check. Never cleared: once an untrusted image is loaded, the rest
+     * of the run is untrusted too.
+     */
+#if ML_UNTRUSTED_CHECKS
+    g_untrusted_bytecode = true;
+#endif
+
     /* the AOT native tier, re-run at LOAD over the WHOLE image (only the
      * VM image is stored) - the same two passes a fresh compile runs. */
     vm_jit_loaded_image(prog);
