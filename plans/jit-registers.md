@@ -2362,3 +2362,37 @@ element navigation to either spill around themselves or DECLINE when
 the register is pinned - a different mechanism from the one that got
 rdi, rsi and r9 in. Do rdx first (it is the smallest and its only hard
 constraint is idiv), then rcx, then rax.
+
+### (q1) the rdx survey, for whoever picks it up
+
+118 unbracketed sites, by enclosing function:
+
+    ALREADY SAFE (38)   emit_sync_push_native 21, emit_ret_native 16,
+                        emit_sync_call_inline 1 - the same gates
+                        rdi/rsi/r9 were cleared against
+    THE COUNT ROLE (39) emit_load_elem2_inline 15,
+                        emit_store_elem_inline 14,
+                        emit_store_elem2_inline 6,
+                        emit_elem_bounds_or_wrap 4,
+                        emit_flat_int_tail 3, emit_elem_base_gate 1
+                        - already a NAMED role (ElemScratch::count),
+                          just fixed to rdx. Threading is mechanical.
+    emit_op (29)        helper args, the div/mod arms, boxed ops
+    emit_div_magic (3)  RDX:RAX is the ISA, not a habit
+    the TESTS bumps     now all through bump_counter, so they take the
+                        register as an argument
+
+**The hard core is small**: `idiv` puts the dividend in RDX:RAX and
+writes the remainder to RDX, and `emit_div_magic` needs the same pair.
+Everything else is the `count` role, which the ScratchPlan already
+names. So the rdx step is: make `ElemScratch::count` allocatable,
+and have the compound `/=` / `%=` arm either spill rdx around itself
+or DECLINE when rdx is pinned (it already declines for a literal 0/-1
+divisor, so the decline path exists and is tested).
+
+⛔ **Check the ScratchPlan is HONOURED, not just consulted.** The r9
+conversion found eleven store-tier sites that loaded into r9 while
+comparing `sc.idx` - the plan named a register and the code ignored it,
+invisible because the register was in the loader's NAME. `count` is the
+same kind of role; audit every `RDX` inside the element tiers against
+`sc.count` before assuming they agree.
