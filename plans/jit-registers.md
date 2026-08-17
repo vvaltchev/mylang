@@ -2019,3 +2019,80 @@ the same self-naming treatment, and the finer-grained
 than an optional follow-up. Re-run the MAXPINS sweep first to price
 pin 8 against the -0.63%/-2.8% projection - that measurement is the
 gate on whether pins 9+ are worth their conversion cost at all.
+
+
+## 2026-08-18 (n): MAINTAINER DIRECTIVE - 13 REGISTERS IS NOT OPTIONAL
+
+**Stop pricing each register's marginal benefit.** The maintainer's
+position, 2026-08-18: getting to 13 usable registers is a REQUIREMENT,
+not a trade. The bench corpus is small; larger scripts accumulate the
+benefit, and *a register allocator that cannot use all the registers is
+not worth its complexity*. So the sweep numbers are a CHECK that each
+admission works, never a gate on whether to do it.
+
+Consequence for this file: entries (l)-(m) argue cost-vs-benefit
+ordering. That reasoning is superseded - cheapest-first remains the
+sensible ORDER, but every register gets done regardless of what its
+pin measures.
+
+## RSI - pin 9: THE AUDIT (complete; execution is the next step)
+
+25 census sites, by enclosing function:
+
+  emit_sync_push_native      6  ) the SAME four gates already verified
+  emit_sync_call_inline      3  ) for rdi in (l): jit_run_blocks_xcache
+  emit_ret_native            1  ) denies the pool to runs with a call,
+  emit_op                    1  ) flush_cache() is emit_ret_native's
+                                ) second line, prologue for emit_op
+  emit_store_elem2_inline    5  ) the t_int SINGLETON fallback, reached
+  emit_store_elem            1  ) through store_type_tag / cmp_reg_tag /
+  store_dst                  2  ) cmp_rax_tag - all of which take the
+  emit_float_load            1  ) register as an ARGUMENT (#96 step 3)
+  emit_call_epilogue         2  ) the singleton MATERIALISATION, already
+  emit_type_tags             1  ) guarded by !reg_holds_pin(RSI)
+  elem_reg_usable            1  ) the guard itself and CAND - not
+  elem_scratch_plan          1  ) blockers (both test reg_holds_pin)
+
+**So rsi needs NO site conversion either.** Its 11 raw-scratch sites are
+in the four functions already proven safe for rdi; the other 12 are the
+t_int singleton, which is live ONLY off-arena.
+
+### THE CHANGE
+
+1. `jit_xcache_busy` gains the INT-tag contributor mirroring r8's float
+   one:
+
+       if (run_needs_int_tag(...) && !jit_tag_is_imm(t_int))
+           busy |= 1u << 6;            /* rsi carries t_int */
+
+   NOTE r8's `run_needs_float_tag` gate does DOUBLE DUTY (see the
+   comment there): it also excludes r8's non-tag scratch paths. Check
+   whether an int-tag equivalent needs the same breadth, or whether the
+   four-function audit above already covers it - do NOT assume.
+2. `XCACHE_ORDER` gains 6.
+
+### ⛔ AND THE ELEMENT-TIER RESERVATION IS NOW A PREREQUISITE, NOT A
+### FOLLOW-UP
+
+`elem_scratch_plan` needs TWO free members of
+CAND = { rdi, r9, r10, r11, rsi, r8 } for `idx` and `val`, and declines
+the whole tier to the helper otherwise. Every register admitted to the
+pin pool shrinks that set - this already bit once (entry (m): rdi
+starved it off-arena, -rt 1921/1923).
+
+With rsi pinned ON-arena and a C1 hoist holding r10/r11, CAND survivors
+are { r9, r8 } - exactly two, the minimum. **The next register admitted
+(r9 is in CAND) breaks it**, and (m)'s per-register workaround does not
+generalise.
+
+So before or with rsi, replace the ad-hoc "rdi names itself off-arena"
+rule with a GENERAL reservation: at pool-pick time, deny pool members
+until at least two CAND members remain usable by `elem_reg_usable`, for
+any run containing an element-tier op (scan it the way
+`jit_xcache_busy` already scans for tag use). That is the rule that
+survives r9, rdx, rcx and rax joining.
+
+Watch it fail: the `hoist` -rt cases ("the hoisted-compound arm never
+ran") are the detector, and they only fire off-arena today - construct
+an ON-arena case too, or the reservation goes untested in the shipping
+configuration.
