@@ -45,7 +45,28 @@ code in this repository.
 >   failing). Add your entry there, not here; only a RULE that a future
 >   reader must obey *before* knowing they are in that area belongs in
 >   CLAUDE.md.
-> - **`docs/myv-format.txt`** whenever the stored-bytecode format changes.
+> - **⛔ `docs/myv-format.txt` IS ALWAYS UP TO DATE — HARD RULE
+>   (maintainer-set, 2026-08-09).** It is not "documentation of" the format,
+>   it IS the format's specification: it describes every record, in order,
+>   with its exact byte encoding, and a third party must be able to write a
+>   reader from it ALONE. So any change to what `myv_write` emits or
+>   `myv_read` accepts — a new field, a changed width, a new pool, a bumped
+>   `MYV_FORMAT_VERSION`, a new validation rule — updates this file in the
+>   SAME commit. There is no "I'll sync the doc later": later means a reader
+>   who trusts it produces a corrupt image.
+>
+>   **IT HAS A MACHINE CHECK, SO "I THINK IT'S FINE" IS NEVER THE ANSWER:**
+>
+>       make -j BUILD_DIR=build-claude/dbg TESTS=1 OPT=0
+>       ./build-claude/dbg/mylang -c samples/gcd -o /tmp/gcd.myv
+>       tests/myv_doc_check.py /tmp/gcd.myv
+>
+>   That script is written from the DOCUMENT and deliberately not from
+>   `serialize.cpp`; consuming an image to exactly EOF is what proves the doc
+>   complete. **RUN IT after any serializer change** — and note it was found
+>   FAILING on 2026-08-09, the doc stale at v10 while the format was at v13
+>   (v11 `proven_type`, v12 capture Locs, v13 `base_locs` had all landed
+>   without it). That is the failure this rule exists to prevent.
 >
 > A change that alters behavior or architecture but leaves the docs stale is
 > incomplete.

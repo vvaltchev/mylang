@@ -1635,17 +1635,24 @@ void myv_write(const VmProgram &prog, const std::string &path,
      * which is a load-time diagnosis of a WRITE-time mistake. Say it here,
      * where the mistake is made. `-c` always compiles with jit=false, so this
      * only guards an internal caller.
+     *
+     * A THROW, not an ML_CHECK, and always on: myv_write's contract already
+     * says it throws on "an unserializable value (loud, never silent)", and
+     * a jitted program is exactly that. An assert would also vanish under
+     * ASSERTS=0 - the one build where writing a silently unloadable file
+     * would go unnoticed.
      */
-    const auto pre_jit = [](const Chunk &ck) {
+    const auto refuse_if_jitted = [](const Chunk &ck) {
         for (const Instr &in : ck.code)
-            ML_CHECK_MSG(in.op != OpCode::EnterNative,
-                         "myv_write: the program has been JIT-compiled; "
-                         "only PRE-jit bytecode is storable");
+            if (in.op == OpCode::EnterNative)
+                throw Exception("MyvError",
+                                "the program has been JIT-compiled; only "
+                                "PRE-jit bytecode is storable");
     };
-    pre_jit(prog.root);
+    refuse_if_jitted(prog.root);
     for (const auto &d : prog.funcs)
         if (d->vm_chunk)
-            pre_jit(*static_cast<const Chunk *>(d->vm_chunk));
+            refuse_if_jitted(*static_cast<const Chunk *>(d->vm_chunk));
 
     /* Index tables FIRST: values and pools reference defs/descs by index,
      * and the writer must be able to resolve any of them (dependency order
