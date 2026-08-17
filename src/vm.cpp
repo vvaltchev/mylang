@@ -6230,6 +6230,73 @@ vm_frame_setup_lean(VmActivation &act, EvalContext &ctx,
     return w;
 }
 
+#ifdef TESTS
+/*
+ * G1 REACH PROBE (#118, 2026-08-09) - measurement only, no behaviour.
+ *
+ * The design fork asks: what would a callee that needs NO VM frame record
+ * look like, and how many real calls would qualify? Rather than guess,
+ * classify every in-VM call against four progressively tighter gates and
+ * count. Reported by MYLANG_JITSTATS=1.
+ *
+ * It runs on the C++ push path, which means it must be measured with the
+ * JIT OFF - and that is sound for THIS question, because the JIT does not
+ * change WHICH callee a call reaches, only how the push is emitted. The
+ * shape distribution is identical.
+ *
+ * `leaf` is computed from the BYTECODE (any call-like opcode in the body),
+ * not from Chunk::native_leaf, which is a JIT product and is therefore
+ * false on the very run this probe needs.
+ */
+unsigned long g_norec_total, g_norec_plain, g_norec_leaf,
+              g_norec_arity, g_norec_scalar;
+
+static bool norec_body_is_leaf(const Chunk *c)
+{
+    static std::unordered_map<const Chunk *, bool> memo;
+    auto it = memo.find(c);
+    if (it != memo.end())
+        return it->second;
+    bool leaf = true;
+    for (const Instr &i : c->code) {
+        switch (i.op) {
+        case OpCode::CallV: case OpCode::CachedCallV:
+        case OpCode::CallValueV: case OpCode::CallValueGenericV:
+        case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
+        case OpCode::CallBuiltinLVElem: case OpCode::CallBuiltinLVMember:
+            leaf = false; break;
+        default: break;
+        }
+        if (!leaf)
+            break;
+    }
+    memo.emplace(c, leaf);
+    return leaf;
+}
+
+static void norec_classify(const FuncObject &fo, const Chunk *cck)
+{
+    g_norec_total++;
+    if (!cck->plain_frame)
+        return;                       /* handlers / iterators to unwind */
+    g_norec_plain++;
+    if (!norec_body_is_leaf(cck))
+        return;                       /* a deeper frame needs our record */
+    g_norec_leaf++;
+    const auto &ps = fo.func->params;
+    if (fo.func->min_args != static_cast<int>(ps.size()))
+        return;                       /* a skipped opt param binds none */
+    g_norec_arity++;
+    for (const auto &p : ps) {
+        const DeclType t = p.decl_type != DeclType::none ? p.decl_type
+                                                         : p.proven_type;
+        if (t != DeclType::i && t != DeclType::f && t != DeclType::b)
+            return;                   /* a reference param needs refcounting */
+    }
+    g_norec_scalar++;
+}
+#endif
+
 /* The lean twin of vm_enter_call (the common shape: fast_bind + no cache
  * key). ONE out-of-line call from the dispatch loop (the loop-body text
  * rule), with the setup inlined - the old shape paid a second nested
@@ -6239,6 +6306,9 @@ vm_enter_call_lean(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
                    size_t &pc, FuncObject &fo, const Chunk *cck,
                    int_type argbase, size_t nargs, int_type dst)
 {
+#ifdef TESTS
+    norec_classify(fo, cck);
+#endif
     vm_frame_setup_lean(act, ctx, chunk, pc, fo, cck, argbase, nargs, dst);
     chunk = cck;
     pc = 0;
@@ -6256,6 +6326,9 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
               int_type argbase, size_t nargs, int_type dst,
               std::unique_ptr<PureCacheKey> ckey)
 {
+#ifdef TESTS
+    norec_classify(fo, cck);
+#endif
     vm_frame_setup(act, ctx, chunk, pc, fo, cck, argbase, nargs, dst,
                    std::move(ckey));
     chunk = cck;

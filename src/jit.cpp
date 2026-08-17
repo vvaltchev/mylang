@@ -4319,10 +4319,28 @@ void jit_stats_report()
         { "ret_inline",       &g_jit_ret_inline },
         { "entry_resume",     &g_jit_entry_resume },
     };
+    /* G1 reach probe (vm.cpp): the no-record tier's candidate gates.
+     * Only meaningful with the JIT OFF - it sits on the C++ push path. */
+    extern unsigned long g_norec_total, g_norec_plain, g_norec_leaf,
+                         g_norec_arity, g_norec_scalar;
+    const Ent norec[] = {
+        { "calls_total",      &g_norec_total },
+        { "  plain_frame",    &g_norec_plain },
+        { "  + leaf",         &g_norec_leaf },
+        { "  + fixed_arity",  &g_norec_arity },
+        { "  + scalar_params",&g_norec_scalar },
+    };
     fprintf(stderr, "jit stats\n");
     for (const Ent &e : ents)
         if (*e.v)
             fprintf(stderr, "  %-16s %lu\n", e.name, *e.v);
+    if (g_norec_total) {
+        fprintf(stderr, "no-record tier reach (JIT-off path)\n");
+        for (const Ent &e : norec)
+            fprintf(stderr, "  %-16s %lu (%.1f%%)\n", e.name, *e.v,
+                    100.0 * static_cast<double>(*e.v)
+                          / static_cast<double>(g_norec_total));
+    }
 #endif
 }
 

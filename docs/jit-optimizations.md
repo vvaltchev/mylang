@@ -2693,3 +2693,68 @@ a live `pure_cache` - both documented gates - and `fib` is a
 construction. Not worth attacking: the AST recursion-unroll plus the
 per-frame pure-call cache already removed **99.4%** of fib's calls
 (~1.7M -> 10,687), so the return path there is no longer hot.
+
+## G1 fork REACH (2026-08-09): what a no-record tier would actually cover
+
+The fork asks what a callee that needs NO VM frame record looks like -
+"a leaf, plain-frame, fixed-arity callee whose params are scalars". Before
+designing one, measure how many real calls that describes. A probe
+(`norec_classify`, vm.cpp, `#ifdef TESTS`) classifies every in-VM call
+against the four gates in order; `MYLANG_JITSTATS=1` reports it.
+
+It sits on the **C++ push path**, so it is read with the **JIT OFF** - and
+that is sound for this question: the JIT changes how a push is emitted,
+never WHICH callee a call reaches, so the shape distribution is identical.
+`leaf` is computed from the BYTECODE (any call-like opcode in the body),
+not from `Chunk::native_leaf`, which is a JIT product and is false on the
+very run the probe needs.
+
+### The corpus, 6,953,702 in-VM calls (bench/ + samples/, scale 1)
+
+    program                  calls    plain     leaf    arity   scalar
+    78_typed_param_call    2000002  2000002  2000002  2000002  2000002
+    10_recursion_deep      1353000  1353000        0        0        0
+    11_closure_counter     1000001  1000001  1000001  1000001  1000001
+    63_closures            1000000  1000000  1000000  1000000   800000
+    76_funcval_dispatch    1000000  1000000  1000000  1000000        0
+    69_exc_crossframe       340000   340000        0        0        0
+    45_gcd                  149999   149999   149999   149999   149999
+    44_primes_sqrt           99998    99998    99998    99998    99998
+    09_fib_recursive         10696    10696        0        0        0
+    ------------------------------------------------------------------
+    share of all calls                100.0%    75.5%    75.5%    58.2%
+
+**plain_frame is free** - every call in the corpus already qualifies.
+**Fixed arity is free** - it excludes nothing the leaf gate had not.
+The two that cost are `leaf` (-24.5%) and `scalar params` (-17.3%).
+
+### The finding that decides the fork's shape
+
+**The leaf gate excludes RECURSION entirely, and recursion is where the
+protocol hurts most.** A self-recursive callee is never a leaf, by
+definition - so 10_recursion_deep (1.35M calls, 19% of the corpus) and
+09_fib_recursive contribute ZERO, as does 69_exc_crossframe. Those are
+precisely the shapes that pay the protocol per level and have nothing else
+to amortise it against.
+
+What the strict tier WOULD cover is the closure/dispatch family (11, 63,
+76) plus the typed-param and iterative-helper shapes (78, 45, 44). Note
+45_gcd counts as a leaf legitimately - it is written ITERATIVELY - and 76
+fails only the scalar gate, because `add_op(st, x)` takes an array.
+
+**Honest sizing: 58.2% of executed calls, or 41.4% excluding
+78_typed_param_call** - a bench this arc added for itself, and 2M of the
+4.05M qualifying calls. Per PROGRAM rather than per call: 5 of the 13
+programs that make any call are at ~100%, one at 80%, and seven at 0%.
+
+### So the design question is not the one the fork asked
+
+"Leaf" is not a requirement of the idea, it is the easy version of it: it
+guarantees no deeper frame can need our record. Relaxing it - a non-leaf
+callee that still skips the record, reconstructing it only when a deeper
+frame, an exception or a backtrace asks - is what takes reach from 58% to
+the 75-100% band AND is the only version that touches recursion at all.
+That is a materially harder design (the reconstruction needs the caller's
+resume pc and dst, which is most of what the record holds), and it is the
+question worth putting to the maintainer, rather than "should we build the
+leaf tier".
