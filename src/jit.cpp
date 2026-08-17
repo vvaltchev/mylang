@@ -2282,14 +2282,25 @@ struct Emitter {
     { u8(0x80); u8(0xB9); u32(uint32_t(d)); u8(imm); }
     /* movsd [rcx + r9*8], xmm0  (#94: the float element STORE) */
     /* ---- #95, the COMPOUND element store (read-modify-write) ----
-     * The element rides RAX (the shobj is done with it once the hash byte
-     * is invalidated - which happens FIRST, since past the guards nothing
-     * can fault); the rhs stays in RDI. */
-    void add_rax_rdi()  { u8(0x48); u8(0x01); u8(0xF8); }
-    void sub_rax_rdi()  { u8(0x48); u8(0x29); u8(0xF8); }
-    void imul_rax_rdi() { u8(0x48); u8(0x0F); u8(0xAF); u8(0xC7); }
+     * The element rides the plan's `obj` register (the shobj is done with
+     * it once the hash byte is invalidated - which happens FIRST, since
+     * past the guards nothing can fault); the rhs rides `val`.
+     *
+     * ⛔ #96 step 2: `add_rax_rdi` / `sub_rax_rdi` / `imul_rax_rdi` are
+     * DELETED rather than defaulted, and `idiv_rdi` became `idiv_reg`.
+     * They named their operand in the METHOD, which is the one shape a
+     * `grep RDI` cannot see - CLAUDE.md's sixth audit-table shape, the
+     * one that let an unsafe r9 sit in the pin pool for a day as a
+     * shipping wrong answer. Deleting them means no caller can reach
+     * the fixed pair again; the arithmetic is `op_rr2(aop, dst, src)`,
+     * which the census CAN see because both operands are arguments. */
     void cqo()          { u8(0x48); u8(0x99); }
-    void idiv_rdi()     { u8(0x48); u8(0xF7); u8(0xFF); }
+    /* idiv r64 - rdx:rax / r. Quotient to RAX and remainder to RDX are
+     * ISA-fixed, so the DIVISOR is the only allocatable operand here and
+     * therefore the only one this takes. */
+    void idiv_reg(uint8_t r)
+    { u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 1 : 0))); u8(0xF7);
+      u8(static_cast<uint8_t>(0xF8 | (r & 7))); }
     void cmp_rdi_imm8(int8_t v)        /* cmp rdi, imm8 (sign-extended) */
     { u8(0x48); u8(0x83); u8(0xFF); u8(static_cast<uint8_t>(v)); }
     /* movsd xmm1, [rcx + r9*8] / movsd [rcx + r9*8], xmm1 */
@@ -6724,6 +6735,32 @@ void jit_stats_report()
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
         { "str_probe_ok",     &g_jit_str_probe_ok },
         { "ord_inline",       &g_jit_ord_inline },
+        /*
+         * ⛔ THE ELEMENT READ/STORE TIERS - the FOURTH family found
+         * bumped from emitted code and present in no REPORT table
+         * (after g_jit_fwd, and the reason CLAUDE.md says "when you add
+         * a lever, give it a JITSTATS row too"). All eight were
+         * readable only from inside -rt, so "which tier did THIS
+         * program's element accesses take?" could be asked of a
+         * hand-written probe and of nothing else - and these are
+         * exactly the tiers whose GUARDS have twice failed silently
+         * (#96 step 3 left the #95 nested-store emitting perfectly and
+         * reaching 0 of 64 at runtime, because the guard compared
+         * against a register the same change had stopped loading).
+         *
+         * Found while verifying #96 step 2: the whole corpus emits the
+         * compound-RMW arm ZERO times, so vdjcmp had no coverage of it
+         * at all and could not have seen a change to it. Reach and
+         * emission are different questions; these answer the first.
+         */
+        { "store_fast",       &g_jit_store_fast },
+        { "store_prep",       &g_jit_store_prep },
+        { "store2_fast",      &g_jit_store2_fast },
+        { "elem2_fast",       &g_jit_elem2_fast },
+        { "elem_slice_fast",  &g_jit_elem_slice_fast },
+        { "hoist",            &g_jit_hoist },
+        { "hoist2",           &g_jit_hoist2 },
+        { "hoist_rmw",        &g_jit_hoist_rmw },
         /* #94: the BORROW - a reference argument bound with no retain
          * (arg_borrow) vs one the analysis cleared whose value turned
          * out to be a slice (arg_borrow_slice, the one dynamic
@@ -9215,7 +9252,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                 /* rax = elem */
                 e.load_elem_q(sc.obj, sc.data, sc.idx);
                 e.cqo();
-                e.idiv_rdi();
+                e.idiv_reg(sc.val);
                 if (aop == Op::div)
                     e.store_elem_q(sc.data, sc.idx, sc.obj);
                 else
@@ -9223,9 +9260,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                     e.store_elem_q(sc.data, sc.idx, sc.count);
             } else {
                 e.load_elem_q(sc.obj, sc.data, sc.idx);
-                if (aop == Op::plus)       e.add_rax_rdi();
-                else if (aop == Op::minus) e.sub_rax_rdi();
-                else                       e.imul_rax_rdi();
+                e.op_rr2(aop, sc.obj, sc.val);
                 e.store_elem_q(sc.data, sc.idx, sc.obj);
             }
         }
@@ -9332,7 +9367,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             /* rax = elem */
             e.load_elem_q(sc.obj, sc.data, sc.idx);
             e.cqo();
-            e.idiv_rdi();
+            e.idiv_reg(sc.val);
             if (aop == Op::div)
                 e.store_elem_q(sc.data, sc.idx, sc.obj);
             else
@@ -9341,9 +9376,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             return;
         default:
             e.load_elem_q(sc.obj, sc.data, sc.idx);
-            if (aop == Op::plus)       e.add_rax_rdi();
-            else if (aop == Op::minus) e.sub_rax_rdi();
-            else                       e.imul_rax_rdi();
+            e.op_rr2(aop, sc.obj, sc.val);
             e.store_elem_q(sc.data, sc.idx, sc.obj);
             return;
         }
@@ -9962,7 +9995,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     case Op::div: case Op::mod:
         e.load_elem_q(sc.obj, sc.data, sc.idx);
         e.cqo();
-        e.idiv_rdi();
+        e.idiv_reg(sc.val);
         if (bop == Op::div)
             e.store_elem_q(sc.data, sc.idx, sc.obj);
         else
@@ -9970,9 +10003,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         break;
     default:
         e.load_elem_q(sc.obj, sc.data, sc.idx);
-        if (bop == Op::plus)       e.add_rax_rdi();
-        else if (bop == Op::minus) e.sub_rax_rdi();
-        else                       e.imul_rax_rdi();
+        e.op_rr2(bop, sc.obj, sc.val);
         e.store_elem_q(sc.data, sc.idx, sc.obj);
         break;
     }
