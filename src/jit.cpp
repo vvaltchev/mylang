@@ -13313,24 +13313,105 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * RCX and rax = value + accumulator (no move-aside). */
         const bool fb = g_fwd.in_rax >= 0 && !in.b_is_lit()
             && in.b_slot() == g_fwd.in_rax;
-        if (fb) {
-            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
-            read_slot(e, RCX, adst);
+        /*
+         * ⛔ #96 INCREMENT 3b - the fused accumulate-and-step, the
+         * sibling of ForLoopStep above. Ten instructions in the boxed
+         * shape, and its TWO HALVES ARE INDEPENDENT: the accumulator
+         * and the loop counter are different slots, so either may be
+         * pinned without the other. Each half is converted on its own
+         * merits and the old code is what runs for whichever half is
+         * memory-resident.
+         *
+         *     mov rax,r12 ; mov rcx,rhs ; add rax,rcx ; mov r12,rax
+         *     mov rax,r13 ; inc rax     ; mov r13,rax
+         *     mov rcx,n   ; cmp rax,rcx ; jl                      10
+         *     add r12, rhs ; inc r13 ; cmp r13, n ; jl             4
+         *
+         * `inc`/`dec` on the counter is what this op ALREADY emitted
+         * (into RAX); doing it in the pin is the same instruction with
+         * a different operand, and the flags stay dead until the cmp.
+         */
+        const int areg = e.creg(adst);
+        const int ireg = e.creg(in.target2);
+        bool clear_fwd = false;
+
+        /* ---- half A: the ACCUMULATE ---- */
+        if (areg >= 0) {
+            const uint8_t d = static_cast<uint8_t>(areg);
+#ifdef TESTS
+            e.scratch(RCX);
+            e.bump_counter(&g_jit_step_imm, RCX);
+#endif
+            if (fb) {
+                emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
+                e.op_rr2(Op::plus, d, RAX);
+            } else if (in.b_is_lit() && in.b_lit() >= INT32_MIN
+                       && in.b_lit() <= INT32_MAX) {
+                e.op_reg_imm(Op::plus, d, static_cast<int32_t>(in.b_lit()));
+            } else if (in.b_is_lit()) {
+                e.movabs(RCX, static_cast<uint64_t>(in.b_lit()));
+                e.op_rr2(Op::plus, d, RCX);
+            } else {
+                const int bcr = e.creg(in.b_slot());
+                if (bcr >= 0)
+                    e.op_rr2(Op::plus, d, static_cast<uint8_t>(bcr));
+                else
+                    e.op_reg_slot(Op::plus, d,
+                                  slot_addr(in.b_slot()).payload);
+            }
+            clear_fwd = true;
         } else {
-            read_slot(e, RAX, adst);
-            load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+            if (fb) {
+                emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
+                read_slot(e, RCX, adst);
+            } else {
+                read_slot(e, RAX, adst);
+                load_operand(e, RCX, in.b_is_lit(), in.b_lit(),
+                             in.b_slot());
+            }
+            op_rr(e, Op::plus);
+            write_slot(e, ck, RAX, adst, pc);
         }
-        op_rr(e, Op::plus);
-        write_slot(e, ck, RAX, adst, pc);
-        read_slot(e, RAX, in.target2);
-        e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8);   /* inc/dec rax */
-        write_slot(e, ck, RAX, in.target2, pc);
-        if (in.a_is_lit())
-            e.movabs(RCX, static_cast<uint64_t>(
-                              static_cast<int_type>(in.a_dual_hi())));
-        else
-            read_slot(e, RCX, in.a_dual_hi());
-        e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
+
+        /* ---- half B: the COUNTER and its bound test ---- */
+        if (ireg >= 0) {
+            const uint8_t r = static_cast<uint8_t>(ireg);
+#ifdef TESTS
+            e.scratch(RCX);
+            e.bump_counter(&g_jit_step_imm, RCX);
+#endif
+            e.incdec_reg(r, up);
+            const int_type bnd = static_cast<int_type>(in.a_dual_hi());
+            if (in.a_is_lit() && bnd >= INT32_MIN && bnd <= INT32_MAX) {
+                e.cmp_reg_imm(r, static_cast<int32_t>(bnd));
+            } else if (in.a_is_lit()) {
+                e.movabs(RCX, static_cast<uint64_t>(bnd));
+                e.cmp_rr2(r, RCX);
+            } else {
+                const int bcr = e.creg(in.a_dual_hi());
+                if (bcr >= 0)
+                    e.cmp_rr2(r, static_cast<uint8_t>(bcr));
+                else
+                    e.cmp_reg_slot(r,
+                                   slot_addr(in.a_dual_hi()).payload);
+            }
+            clear_fwd = true;
+        } else {
+            read_slot(e, RAX, in.target2);
+            e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8); /* inc/dec */
+            write_slot(e, ck, RAX, in.target2, pc);
+            if (in.a_is_lit())
+                e.movabs(RCX, static_cast<uint64_t>(
+                                  static_cast<int_type>(in.a_dual_hi())));
+            else
+                read_slot(e, RCX, in.a_dual_hi());
+            e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
+        }
+        /* Either converted half leaves RAX holding something OTHER than
+         * what the boxed shape left there, so no consumer may believe a
+         * forward survived this op. */
+        if (clear_fwd)
+            g_fwd = JitFwd{};
         emit_cond_jump(e, in.aop, static_cast<size_t>(in.target),
                        begin, end, remap, fixups);
         return;
