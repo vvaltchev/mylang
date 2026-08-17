@@ -65,6 +65,16 @@ jobs:
         done
         python3 $GITHUB_WORKSPACE/tests/myv_doc_check.py myvdoc/*.myv
 
+    # `-rt` runs IN-PROCESS: it calls lexer/parser/infer/resolve directly and
+    # never goes through the CLI's argument handling, so a flag wired to the
+    # wrong side of an `if` is invisible to every one of its tests. That is
+    # how `-nr` came to skip run_optimizers - exiting 0 in silence on a
+    # program a plain run refuses - with the whole suite green (#147).
+    - name: Driver - the CLI flags do what they say
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run: $GITHUB_WORKSPACE/tests/driver_checks.sh ./mylang
+
     # On a crash: print a full backtrace from the core (immediately visible in
     # the log) and upload the core + the exact binary as an artifact, so the
     # failure can be debugged offline without re-reproducing it.

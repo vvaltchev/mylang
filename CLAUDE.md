@@ -464,7 +464,19 @@ Running scripts:
                                  # `NDEBUG`, ...) so it cannot drift from
                                  # what was compiled. bench/run.py parses
                                  # it; see the ASSERTS=0 rule below
-./build/mylang -nr FILE          # parse/validate only, don't run
+./build/mylang -nr FILE          # COMPILE and validate, don't run: lex,
+                                 # parse, infer, AND run_optimizers (#147,
+                                 # 2026-08-09 - it used to stop before the
+                                 # optimizers, so every diagnostic that lives
+                                 # in resolve_names was invisible to it: the
+                                 # step 7 prover, the whole WARNING tier,
+                                 # FIX-1, the TDZ, the duplicate-decl check.
+                                 # `-nr` exited 0 in silence on a program a
+                                 # plain run REFUSES, which is backwards for
+                                 # the flag a CI job reaches for. It is no
+                                 # longer a cheap parse - it is the whole
+                                 # compile minus execution.) Exit 1 on a
+                                 # refusal, 0 with warnings on stderr
 ./build/mylang -vm FILE          # execute via the bytecode VM — the
                                  # DEFAULT engine (flipped 2026-07-18);
                                  # kept for pre-flip scripts/CI
@@ -564,6 +576,20 @@ below the call weight — see `plans/archived/function-inlining.md`). Re-run whe
 the interpreter changes; the weights are tree-walker-specific but the benefit
 function is not. Current (`OPT=1 ASSERTS=0`): id/lit/add/cmp ≈ 1,
 return ≈ 3, if ≈ 7, assign ≈ 11, **CALL ≈ 21** (×id-read).
+
+**⛔ `-rt` RUNS IN-PROCESS, SO IT CANNOT SEE THE CLI DRIVER (#147,
+2026-08-09).** It calls lexer/parser/infer/resolve directly and never goes
+through `mylang.cpp`'s argument handling — so a FLAG wired to the wrong side
+of an `if` is invisible to every one of its tests. `-nr` ("compile and
+validate, don't run") called `run_optimizers` only when it was going to
+*run*, which silently skipped the step 7 prover, the whole warning tier,
+FIX-1, the TDZ and the duplicate-decl check: `mylang -nr prog.my` exited 0
+in silence on a program `mylang prog.my` refuses. The whole suite was green
+throughout, and stays green when the bug is reintroduced. **`tests/
+driver_checks.sh` (POSIX sh, in CI) is the net** — spawn the binary and
+assert the flag's behaviour; reverting the wiring fails 7 of its 9 checks.
+**Add a case there when you add or change a CLI flag**, because no `-rt`
+entry can cover one.
 
 Tests are **not** a separate framework — they are entries in the `tests` table
 (a `static const std::vector<test>`) in `src/tests.cpp`. Each entry is a tuple:
