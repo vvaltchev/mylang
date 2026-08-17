@@ -23,6 +23,14 @@ and they are the reason this file has to stay accurate:
     classified in `op_writes_scalar`; one with a pc field must join
     `visit_pc_fields`. Those tables are audited and several consumers
     read them at different pipeline stages.
+  * a NEW op must ALSO be classified in `verify_chunk` (codegen.cpp) —
+    the post-load verifier that bounds every operand against the table it
+    indexes. Its switch has NO `default`, so the build FAILS until the op
+    is classified; that is deliberate, because a stale entry there means
+    silently accepting an unchecked operand from a `.myv` file. Say what
+    each field IS: a frame slot, a run window, a pc, a pool index, an
+    iterator or region id, a struct field. Anything the op dereferences
+    (a `struct_defs` / `closure_defs` entry) also needs a non-null check.
 
 KEEP IT IN SYNC — a change to the VM's op set updates this file in the
 same commit, per CLAUDE.md's doc-sync rule.

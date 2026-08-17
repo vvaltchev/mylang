@@ -8851,6 +8851,750 @@ void verify_handler_sites(const Chunk &chunk)
 #endif
 }
 
+/* ------------------------------------------------------------------ */
+/* #137: STRUCTURAL VERIFICATION of a chunk's instruction operands      */
+/* ------------------------------------------------------------------ */
+
+namespace {
+
+/*
+ * The per-operand checks verify_chunk's switch is written in terms of. Each
+ * one names the LIMIT its operand belongs to, so a case reads as a
+ * declaration of what the op's fields mean:
+ *
+ *      case OpCode::LoadConstV:
+ *          dst(in.target); pool(in.target2, ck.consts.size(), "consts");
+ *          break;
+ *
+ * Every rejection is fatal for the image, so the checks throw rather than
+ * returning a status - a case never has to propagate anything.
+ */
+struct ChunkVerifier {
+
+    const Chunk &ck;
+    const ChunkLimits &lim;
+    size_t pc = 0;
+
+    ChunkVerifier(const Chunk &c, const ChunkLimits &l) : ck(c), lim(l) { }
+
+    [[noreturn]] void reject(const char *what) const
+    {
+        throw Exception("MyvError",
+                        intern_msg("corrupt .myv (" + std::string(what)
+                                   + " at pc " + std::to_string(pc) + ")"));
+    }
+
+    /* A FRAME SLOT that must exist - a register read or written. */
+    void reg(int_type s) const
+    {
+        if (s < 0 || s >= lim.nslots)
+            reject("frame slot");
+    }
+    /* The same, but -1 ("unset") is legal: a DISCARDED call result, an
+     * absent slice bound. */
+    void reg_opt(int_type s) const
+    {
+        if (s != -1)
+            reg(s);
+    }
+    /* A contiguous RUN of `n` slots starting at `base` - a call's argument
+     * window, a literal's element window. `n == 0` needs no slot at all,
+     * which is why an empty run does not require a valid base. */
+    void run(int_type base, int_type n) const
+    {
+        if (n < 0)
+            reject("run length");
+        if (n == 0)
+            return;
+        if (base < 0 || base > lim.nslots - n)
+            reject("run window");
+    }
+    /* A GLOBAL-table slot / a CAPTURE index / a builtin-table index. */
+    void gslot(int_type s) const
+    {
+        if (s < 0 || static_cast<size_t>(s) >= lim.nglobals)
+            reject("global slot");
+    }
+    void cslot(int_type s) const
+    {
+        if (s < 0 || static_cast<size_t>(s) >= lim.ncaptures)
+            reject("capture slot");
+    }
+    void builtin(int_type s) const
+    {
+        if (s < 0 || static_cast<size_t>(s) >= lim.nbuiltins)
+            reject("builtin slot");
+    }
+    /* A container-store BASE, by the slot KIND vm_store_base switches on:
+     * 1 global, 2 capture, anything else (0, and the -1 default) local. */
+    void base(int_type kind, int_type slot) const
+    {
+        if (kind == 1)
+            gslot(slot);
+        else if (kind == 2)
+            cslot(slot);
+        else
+            reg(slot);
+    }
+    /* A branch destination. */
+    void target_pc(int_type p) const
+    {
+        if (p < 0 || static_cast<size_t>(p) >= ck.code.size())
+            reject("jump target");
+    }
+    /* An index into one of the chunk's pools. */
+    void pool(int_type i, size_t n, const char *what) const
+    {
+        if (i < 0 || static_cast<size_t>(i) >= n)
+            reject(what);
+    }
+    /* A pool entry the OP WILL DEREFERENCE. Several def pointers have a
+     * legitimate null form for OTHER consumers (a boxed ctor's, an emplace
+     * site's), so bounding the index is not enough - the op that reads one
+     * walks `def->fields` with no null test, and a null reached
+     * vm_struct_ctor_planned through a `noexcept` JIT helper, whose throw
+     * then hit std::terminate instead of unwinding (the #132 shape). */
+    void defined_ptr(const void *p, const char *what) const
+    {
+        if (!p)
+            reject(what);
+    }
+    /* A per-frame side-state id (a dict / dyn iterator), sized by the
+     * chunk's own count exactly as vm_run_chunk allocates the slice. */
+    void iter(int_type i, int n) const
+    {
+        if (i < 0 || i >= n)
+            reject("iterator id");
+    }
+    /*
+     * A STRUCT FIELD index. The def is only known at RUN time (it comes from
+     * whatever value the base slot holds), so the tightest COMPILE-time bound
+     * is the widest struct in the whole program - enough to refuse the
+     * mangled-byte case, which is the point here. A field index valid for
+     * some other struct still reaches the runtime path, exactly as a slot
+     * holding the wrong type does.
+     */
+    void field(int_type f) const
+    {
+        if (f < 0 || static_cast<size_t>(f) >= lim.max_fields)
+            reject("struct field index");
+    }
+    /* An operand that is a slot unless it is an immediate. */
+    void a_reg(const Instr &in) const
+    {
+        if (!in.a_is_lit())
+            reg(in.a_slot());
+    }
+    void b_reg(const Instr &in) const
+    {
+        if (!in.b_is_lit())
+            reg(in.b_slot());
+    }
+    void ab_regs(const Instr &in) const { a_reg(in); b_reg(in); }
+
+    void verify_one(const Instr &in);
+};
+
+/*
+ * ONE CASE PER OPCODE, and the switch has NO `default` - see the header
+ * comment. The operand meanings are the ones disasm.cpp's render_row prints
+ * and vm.cpp's handlers read; when the two ever disagree, the HANDLER wins,
+ * because that is what indexes the memory.
+ */
+void ChunkVerifier::verify_one(const Instr &in)
+{
+    switch (in.op) {
+
+    /* --- control flow ------------------------------------------------ */
+    case OpCode::Jump:
+        target_pc(in.target);
+        break;
+    case OpCode::Halt:
+    case OpCode::PopHandler:
+        break;
+    case OpCode::ExitBlock:
+        target_pc(in.a_lit());          /* the container's resume pc */
+        break;
+    case OpCode::EnterNative:
+        /*
+         * `a` is a BYTE OFFSET into the JIT's fragment buffer, not a pc. A
+         * STORED image never contains one (`-c` compiles with jit=false and
+         * fragments are not serializable), so a null `native.base` here means
+         * the op was invented by corruption - refuse it rather than compute
+         * an address from a mangled offset.
+         */
+        if (!ck.native.base
+            || in.a_lit() < 0
+            || static_cast<size_t>(in.a_lit()) >= ck.native.len)
+            reject("native fragment offset");
+        break;
+
+    /* --- exceptions --------------------------------------------------- */
+    case OpCode::Throw:
+        reg(in.a_slot());
+        break;
+    case OpCode::PushHandler:
+    case OpCode::Rethrow:
+    case OpCode::EndFinally:
+    case OpCode::SetPend:               /* target is a 0/1 action, not a pc */
+        /* A region id indexes TWO things: the handler table, and the
+         * activation's per-region {exc, pend} slice, which n_trys sizes. */
+        pool(in.a_lit(), ck.handler_sites.size(), "handler region");
+        pool(in.a_lit(), static_cast<size_t>(ck.n_trys), "try region");
+        break;
+    case OpCode::ThrowRuntimeV:
+        pool(in.target, ck.throws.size(), "throw site");
+        break;
+
+    /* --- scalar arithmetic (3-address: dst, a, b) --------------------- */
+    case OpCode::IntBin:
+    case OpCode::FloatBin:
+    case OpCode::CmpIntV:
+    case OpCode::CmpFloatV:
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::IntAndRR: case OpCode::IntAndRI:
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:
+    case OpCode::IntXorRR: case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShlRI:
+    case OpCode::IntShrRR: case OpCode::IntShrRI:
+    case OpCode::IntModRI:
+    case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR: case OpCode::FloatMulRI:
+        reg(in.target);
+        ab_regs(in);
+        break;
+    case OpCode::IntAddModRI:
+        /* E4: `dst = (a + b) % target2` - a ZERO modulus would divide by
+         * zero in an op whose whole selection premise is that it cannot. */
+        reg(in.target);
+        ab_regs(in);
+        if (in.target2 == 0)
+            reject("addmod modulus");
+        break;
+    case OpCode::MathFnV:
+        /* `pow_` is the only two-argument entry; every other selector
+         * leaves `b` unset. */
+        reg(in.target);
+        a_reg(in);
+        if (in.target2 < 0
+            || in.target2 > static_cast<int>(MathFn::pow_))
+            reject("math selector");
+        if (static_cast<MathFn>(in.target2) == MathFn::pow_)
+            b_reg(in);
+        break;
+    case OpCode::CoerceNumV:
+        reg(in.target);
+        a_reg(in);
+        break;
+
+    /* --- conditional branches ----------------------------------------- */
+    case OpCode::JumpUnlessIntCmp:
+    case OpCode::JumpUnlessFloatCmp:
+        target_pc(in.target);
+        ab_regs(in);
+        break;
+    case OpCode::JumpIfNotNoneV:
+        target_pc(in.target);
+        a_reg(in);
+        break;
+    case OpCode::JumpUnlessTrueV:
+        target_pc(in.target);
+        reg(in.target2);
+        break;
+    case OpCode::JumpUnlessElemInt:     /* E4: `if (!a[i]) jump` */
+        target_pc(in.target);
+        reg(in.target2);
+        a_reg(in);
+        break;
+
+    /* --- counted-loop steps (target is the back edge) ----------------- */
+    case OpCode::ForLoopStep:
+        target_pc(in.target);
+        reg(in.target2);                /* the counter */
+        ab_regs(in);                    /* bound, step */
+        break;
+    case OpCode::IntAddStep:
+        /* #9: a_dual = (the added-to dst, the bound slot-or-immediate). */
+        target_pc(in.target);
+        reg(in.target2);
+        reg(in.a_dual_lo());
+        if (!in.a_is_lit())
+            reg(in.a_dual_hi());
+        b_reg(in);
+        break;
+    case OpCode::ForStepElemInt:
+        /* #9: b_dual = (the array, the element dst). */
+        target_pc(in.target);
+        reg(in.target2);
+        a_reg(in);
+        reg(in.b_dual_lo());
+        reg(in.b_dual_hi());
+        break;
+
+    /* --- element / member READS --------------------------------------- */
+    case OpCode::LoadElemInt:
+    case OpCode::LoadElemFloat:
+    case OpCode::LoadElemBool:
+    case OpCode::LoadElemValue:
+    case OpCode::LoadStructElemV:
+    case OpCode::LoadStrChar:
+    case OpCode::OrdCharV:
+    case OpCode::SubscriptV:
+        reg(in.target);
+        reg(in.target2);
+        a_reg(in);
+        break;
+    case OpCode::LoadElem2Int:
+    case OpCode::LoadElem2Float:
+        /* the fused nested read: a_dual = (outer index slot, chain_locs). */
+        reg(in.target);
+        reg(in.target2);
+        reg(in.a_dual_lo());
+        pool(in.a_dual_hi(), ck.chain_locs.size(), "chain locs");
+        b_reg(in);
+        break;
+    case OpCode::LoadStructFieldInt:
+    case OpCode::LoadStructFieldFloat:
+        reg(in.target);
+        reg(in.target2);
+        a_reg(in);
+        field(in.b_lit());
+        break;
+    case OpCode::StructFieldAddInt:
+        /* #9: `dst = other + a[i].f`; b_dual = (field index, other slot). */
+        reg(in.target);
+        reg(in.target2);
+        a_reg(in);
+        field(in.b_dual_lo());
+        reg(in.b_dual_hi());
+        break;
+    case OpCode::ArrLen:
+    case OpCode::StrLen:
+    case OpCode::MoveV:
+        reg(in.target);
+        reg(in.target2);
+        break;
+    case OpCode::MemberV:
+        reg(in.target);
+        reg(in.target2);
+        pool(in.a_lit(), ck.member_keys.size(), "member key");
+        break;
+    case OpCode::LoadMemberInt:
+    case OpCode::LoadMemberFloat:
+        /* H1: b_dual = (baked byte offset or -1, struct_defs idx << 2 |
+         * form). The def index is only read when an offset was baked. */
+        reg(in.target);
+        reg(in.target2);
+        pool(in.a_lit(), ck.member_keys.size(), "member key");
+        if (in.b_dual_lo() >= 0) {
+            pool(in.b_dual_hi() >> 2, ck.struct_defs.size(), "struct def");
+            defined_ptr(ck.struct_defs[in.b_dual_hi() >> 2], "struct def");
+        }
+        break;
+    case OpCode::DictLoadInt:
+    case OpCode::DictLoadFloat:
+        /* a member's key is a const-pool entry, a subscript's is a temp. */
+        reg(in.target);
+        reg(in.target2);
+        if (in.a_is_lit())
+            pool(in.a_lit(), ck.consts.size(), "consts");
+        else
+            reg(in.a_slot());
+        break;
+    case OpCode::SliceV:
+        reg(in.target);
+        reg(in.target2);
+        reg_opt(in.a_slot());           /* an absent bound is -1 */
+        reg_opt(in.b_slot());
+        break;
+
+    /* --- element / member STORES (target = the base's slot KIND) ------ */
+    case OpCode::StoreElemInt:
+    case OpCode::StoreElemFloat:
+    case OpCode::StoreElemValue:
+    case OpCode::DictStore:
+        base(in.target, in.target2);
+        ab_regs(in);                    /* index, value */
+        break;
+    case OpCode::StoreMemberV:
+        base(in.target, in.target2);
+        pool(in.a_lit(), ck.member_keys.size(), "member key");
+        b_reg(in);
+        break;
+    case OpCode::StoreElem2V:
+        reg(in.target);                 /* the VALUE (a plain slot here) */
+        reg(in.target2);
+        ab_regs(in);                    /* the two indexes */
+        break;
+    case OpCode::StoreElemChainV:
+        /* a_dual = (chain_locs idx, base kind); the keys are the run
+         * [b_lit, +nkeys), nkeys being that pool entry's length. */
+        reg(in.target);
+        base(in.a_dual_hi(), in.target2);
+        pool(in.a_dual_lo(), ck.chain_locs.size(), "chain locs");
+        run(in.b_lit(),
+            static_cast<int_type>(ck.chain_locs[in.a_dual_lo()].size()));
+        break;
+    case OpCode::StoreLValueChainV:
+        /* a_dual = (chain_steps idx, base kind). A subscript step's key is
+         * a frame temp named by the step itself. */
+        reg(in.target);
+        base(in.a_dual_hi() & 3, in.target2);
+        pool(in.a_dual_lo(), ck.chain_steps.size(), "chain steps");
+        for (const Chunk::ChainStep &st : ck.chain_steps[in.a_dual_lo()]) {
+            if (st.is_member)
+                pool(st.operand, ck.member_keys.size(), "member key");
+            else
+                reg(st.operand);
+        }
+        break;
+
+    /* --- ++ / -- ------------------------------------------------------ */
+    case OpCode::IncDecCheckedV:
+        base(in.target2, in.target);    /* here the KIND rides target2 */
+        break;
+    case OpCode::IncDecElemCheckedV:
+        base(in.target, in.target2);
+        reg(in.a_slot());               /* the key temp - never a literal */
+        pool(in.b_lit(), ck.incdec_sites.size(), "incdec site");
+        break;
+    case OpCode::IncDecMemberCheckedV:
+        base(in.target, in.target2);
+        pool(in.b_lit(), ck.incdec_sites.size(), "incdec site");
+        break;
+    case OpCode::IncDecChainV:
+        /* kind 3 is the fourth form: an rvalue ROOT held in a frame slot. */
+        reg(in.target);
+        if (in.a_lit() == 3)
+            reg(in.target2);
+        else
+            base(in.a_lit(), in.target2);
+        pool(in.b_lit(), ck.incdec_chains.size(), "incdec chain");
+        for (const Chunk::ChainStep &st
+                 : ck.incdec_chains[in.b_lit()].steps) {
+            if (st.is_member)
+                pool(st.operand, ck.member_keys.size(), "member key");
+            else
+                reg(st.operand);
+        }
+        break;
+
+    /* --- destructuring / iteration ------------------------------------ */
+    case OpCode::UnpackElemInt:
+    case OpCode::UnpackElemFloat:
+    case OpCode::UnpackElemValue:
+        run(in.target, in.b_lit());     /* the consecutive target run */
+        reg(in.target2);
+        a_reg(in);
+        break;
+    case OpCode::UnpackElemTargets:
+        pool(in.target, ck.unpack_targets.size(), "unpack targets");
+        reg(in.target2);
+        a_reg(in);
+        for (int32_t t : ck.unpack_targets[in.target])
+            reg_opt(t);                 /* -1 == the `_` placeholder */
+        break;
+    case OpCode::MultiUnpackV:
+        reg(in.a_slot());               /* the rvalue - always a slot */
+        pool(in.target, ck.unpack_targets.size(), "unpack targets");
+        for (int32_t t : ck.unpack_targets[in.target])
+            reg_opt(t);
+        if (in.b_is_lit())
+            pool(in.b_lit(), ck.unpack_coerce.size(), "unpack coerce");
+        break;
+    case OpCode::DictIterInit:
+        iter(in.target, ck.n_dict_iters);
+        reg(in.target2);
+        break;
+    case OpCode::DictIterNext:
+        /* the key and value binds are each -1 when the loop does not want
+         * that half (`foreach (var k in d)` leaves the value unset, `_`
+         * leaves either). */
+        target_pc(in.target);
+        iter(in.target2, ck.n_dict_iters);
+        reg_opt(in.a_slot());
+        reg_opt(in.b_slot());
+        break;
+    case OpCode::ForeachDynInit:
+        iter(in.target, ck.n_dyn_iters);
+        reg(in.target2);
+        pool(in.b_lit(), ck.unpack_targets.size(), "unpack targets");
+        for (int32_t t : ck.unpack_targets[in.b_lit()])
+            reg_opt(t);
+        break;
+    case OpCode::ForeachDynNext:
+        target_pc(in.target);
+        iter(in.target2, ck.n_dyn_iters);
+        break;
+
+    /* --- calls -------------------------------------------------------- */
+    case OpCode::CallBuiltinV:
+        reg(in.target);
+        pool(in.target2, ck.builtin_calls.size(), "builtin call");
+        run(in.a_lit(), in.b_lit());
+        break;
+    case OpCode::CallBuiltinLV:
+    case OpCode::CallBuiltinLVElem:
+    case OpCode::CallBuiltinLVMember:
+        /* a_dual = (builtin_calls idx, arg0's slot kind); `b`, when it is an
+         * immediate, is the base of the remaining VALUE args, whose count
+         * the pool entry's ArgLoc list gives (arg0 is not in the run). */
+        reg(in.target);
+        pool(in.a_dual_lo(), ck.builtin_calls.size(), "builtin call");
+        base(in.a_dual_hi(), in.target2);
+        if (in.b_is_lit()) {
+            const size_t nargs =
+                ck.builtin_calls[in.a_dual_lo()].args.size();
+            /* LVElem's run additionally holds the INDEX at run[0]. */
+            const int_type nrun = static_cast<int_type>(nargs)
+                - (in.op == OpCode::CallBuiltinLVElem ? 0 : 1);
+            run(in.b_lit(), nrun > 0 ? nrun : 0);
+        }
+        break;
+    case OpCode::AppendV:
+        /* D1: the same shape with the marshaling deleted; `b` is the single
+         * value slot and a -1 dst means the result is discarded. */
+        reg_opt(in.target);
+        pool(in.a_dual_lo(), ck.builtin_calls.size(), "builtin call");
+        base(in.a_dual_hi(), in.target2);
+        reg(in.b_lit());
+        break;
+    case OpCode::EmplaceStruct:
+        /* `a` packs (kind | emplace_sites idx << 2); the field args are the
+         * run [b_lit, +nfields) named by the pool entry. */
+        reg(in.target);
+        pool(in.a_lit() >> 2, ck.emplace_sites.size(), "emplace site");
+        defined_ptr(ck.emplace_sites[in.a_lit() >> 2].def, "emplace def");
+        base(in.a_lit() & 3, in.target2);
+        run(in.b_lit(),
+            static_cast<int_type>(
+                ck.emplace_sites[in.a_lit() >> 2].field_locs.size()));
+        break;
+    case OpCode::CallV:
+    case OpCode::CachedCallV:
+        reg_opt(in.target);             /* -1 == a discarded result */
+        gslot(in.target2);
+        run(in.a_lit(), in.b_lit());
+        break;
+    case OpCode::CallValueV:
+        reg_opt(in.target);
+        reg(in.target2);                /* the callee VALUE's slot */
+        run(in.a_lit(), in.b_lit());
+        break;
+    case OpCode::CallValueGenericV:
+        /* `b` packs (argc | call_sites idx << 12). */
+        reg(in.target);
+        reg(in.target2);
+        run(in.a_lit(), in.b_lit() & 0xfff);
+        pool(in.b_lit() >> 12, ck.call_sites.size(), "call site");
+        break;
+    case OpCode::CheckFuncV:
+    case OpCode::CheckCallableV:
+    case OpCode::ReturnV:
+        a_reg(in);
+        break;
+    case OpCode::MapFilterV:
+        reg(in.target);
+        ab_regs(in);
+        break;
+
+    /* --- value construction ------------------------------------------- */
+    case OpCode::LoadImmInt:
+    case OpCode::LoadImmFloat:
+        reg(in.target);
+        break;
+    case OpCode::LoadConstV:
+        reg(in.target);
+        pool(in.target2, ck.consts.size(), "consts");
+        break;
+    case OpCode::LoadLiteralObjV:
+        reg(in.target);
+        pool(in.target2, ck.literal_objs.size(), "literal obj");
+        break;
+    case OpCode::MakeArrayV:
+        reg(in.target);
+        run(in.a_lit(), in.b_lit());
+        break;
+    case OpCode::MakeDictV:
+        reg(in.target);
+        run(in.a_lit(), 2 * in.b_lit());   /* key/value pairs */
+        break;
+    case OpCode::MakeClosureV:
+        reg(in.target);
+        pool(in.target2, ck.closure_defs.size(), "closure def");
+        defined_ptr(ck.closure_defs[in.target2], "closure def");
+        /*
+         * The new closure SNAPSHOTS its captures here, through `read_sym`,
+         * from THIS chunk's frame / captures and the program tables - so the
+         * descriptor's capture list is really a set of operands of this op,
+         * and its slots are bounded by exactly the limits above. Without
+         * this a mutated capture slot reached `Frame::at(16580619)`.
+         */
+        for (const FuncDescriptor::CaptureDesc &cd
+                 : ck.closure_defs[in.target2]->captures) {
+            switch (cd.kind) {
+            case SymKind::local:   reg(cd.slot);     break;
+            case SymKind::global:  gslot(cd.slot);   break;
+            case SymKind::capture: cslot(cd.slot);   break;
+            case SymKind::builtin: builtin(cd.slot); break;
+            case SymKind::unresolved: break;  /* read_sym falls back to the
+                                               * by-NAME map walk */
+            }
+        }
+        break;
+    case OpCode::StructCtorV:
+        /* b_dual_hi >= 0 selects the BAKED plan (each field naming its own
+         * source slot); otherwise the args are the run [a_lit, +b_dual_lo). */
+        reg(in.target);
+        pool(in.target2, ck.struct_defs.size(), "struct def");
+        defined_ptr(ck.struct_defs[in.target2], "struct def");
+        if (in.b_dual_hi() >= 0) {
+            pool(in.b_dual_hi(), ck.ctor_plans.size(), "ctor plan");
+            for (const Chunk::CtorPlanField &f
+                     : ck.ctor_plans[in.b_dual_hi()].f)
+                reg(f.src);
+        } else {
+            run(in.a_lit(), in.b_dual_lo());
+        }
+        break;
+    case OpCode::StructCtorBoxedV:
+        reg(in.target);
+        pool(in.target2, ck.boxed_ctors.size(), "boxed ctor");
+        defined_ptr(ck.boxed_ctors[in.target2].def, "boxed ctor def");
+        run(in.a_lit(),
+            static_cast<int_type>(
+                ck.boxed_ctors[in.target2].arg_locs.size()));
+        break;
+    case OpCode::MakeStructArrayV:
+        /* N structs' fields, interleaved: the run is N * the def's width -
+         * which is also what bounds the element buffer the op allocates. */
+        reg(in.target);
+        pool(in.target2, ck.struct_defs.size(), "struct def");
+        defined_ptr(ck.struct_defs[in.target2], "struct def");
+        if (in.b_lit() < 0)
+            reject("struct array count");
+        run(in.a_lit(),
+            in.b_lit() * static_cast<int_type>(
+                ck.struct_defs[in.target2]->fields.size()));
+        break;
+
+    /* --- boxed general ops -------------------------------------------- */
+    case OpCode::BinOpV:
+    case OpCode::CmpV:
+    case OpCode::LogV:
+        reg(in.target);
+        ab_regs(in);
+        break;
+    case OpCode::UnaryV:
+        reg(in.target);
+        a_reg(in);
+        break;
+    case OpCode::CompoundV:
+        reg(in.target);                 /* read-modify-written in place */
+        b_reg(in);
+        break;
+
+    /* --- global / capture / builtin access ---------------------------- */
+    case OpCode::LoadGlobalV:
+    case OpCode::DefinedGlobalV:
+        reg(in.target);
+        gslot(in.target2);
+        break;
+    case OpCode::StoreGlobalV:
+        gslot(in.target);
+        a_reg(in);
+        break;
+    case OpCode::LoadCaptureV:
+        reg(in.target);
+        cslot(in.target2);
+        break;
+    case OpCode::StoreCaptureV:
+        cslot(in.target);
+        a_reg(in);
+        break;
+    case OpCode::LoadBuiltinV:
+        reg(in.target);
+        builtin(in.target2);
+        break;
+    case OpCode::DeclConstV:
+        /* target2 selects the destination table: a global slot or a local. */
+        if (in.target2)
+            gslot(in.target);
+        else
+            reg(in.target);
+        a_reg(in);
+        break;
+
+    case OpCode::OpCount_:
+        reject("opcode");               /* the sentinel is never emitted */
+    }
+}
+
+}   /* anon namespace */
+
+/* Declared in codegen.h - see the contract (and the no-`default` rule). */
+void verify_chunk(const Chunk &chunk, const ChunkLimits &lim)
+{
+    ChunkVerifier v(chunk, lim);
+
+    /*
+     * A chunk that RUNS must be able to reach an end: vm_run_chunk indexes
+     * `code[pc]` and only a terminator stops it, so an empty code vector
+     * would read past the buffer on the very first fetch.
+     */
+    if (chunk.code.empty())
+        v.reject("empty chunk");
+
+    for (v.pc = 0; v.pc < chunk.code.size(); v.pc++) {
+        const Instr &in = chunk.code[v.pc];
+        if (static_cast<unsigned>(in.op)
+                >= static_cast<unsigned>(OpCode::OpCount_))
+            v.reject("opcode");
+        v.verify_one(in);
+    }
+
+    /* The handler table is reachable from every raise, not just from the
+     * PushHandler that names it, so its pcs are checked whole. */
+    v.pc = 0;
+    for (const Chunk::HandlerSite &site : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : site.clauses) {
+            if (cl.types_idx >= 0)
+                v.pool(cl.types_idx, chunk.catch_types.size(), "catch types");
+            v.target_pc(cl.body_pc);
+            v.reg_opt(cl.bind_slot);
+        }
+        if (site.fin_pc >= 0)
+            v.target_pc(site.fin_pc);
+    }
+
+    /*
+     * The pc-KEYED side tables. It is tempting to leave their pcs unchecked -
+     * the VM only ever binary-searches them for an exact match, so a pc past
+     * the code simply never matches. That reasoning is WRONG, and a fuzz run
+     * proved it: every pc-MOVING transformation REMAPS these tables by
+     * INDEXING a per-pc vector (`l.pc = remap[l.pc]`, jit.cpp), so the JIT
+     * that runs right after a load reads `remap[67108891]`. Bound them.
+     */
+    for (const Chunk::LocEntry &e : chunk.locs)
+        v.target_pc(static_cast<int_type>(e.pc));
+    for (const Chunk::LocEntry &e : chunk.base_locs)
+        v.target_pc(static_cast<int_type>(e.pc));
+    for (const Chunk::InlineEntry &e : chunk.inline_ctxs) {
+        v.target_pc(static_cast<int_type>(e.pc));
+        v.pool(e.frame, chunk.inline_frames.size(), "inline frame");
+    }
+    for (const Chunk::InlineFrame &f : chunk.inline_frames)
+        if (f.parent >= 0)
+            v.pool(f.parent, chunk.inline_frames.size(), "inline frame");
+
+    /* ref_slots drives the frame's reference-release scan - it INDEXES. */
+    for (int32_t s : chunk.ref_slots)
+        v.reg(s);
+}
+
 /* Declared in codegen.h - the `.myv` loader calls it to REBUILD this derived
  * pool instead of storing it (see the header comment). */
 void build_boxed_ops(Chunk &chunk)
@@ -9585,15 +10329,31 @@ bool bc_inline_chunk(Chunk &ck,
                 nc.push_back(mv);
                 from_caller.push_back(0);
             }
-            /* pass 1: the body's local pc map (a non-tail ReturnV becomes
-             * TWO ops - the result move and a jump to the join) */
+            /*
+             * pass 1: the body's local pc map. A ReturnV becomes up to TWO
+             * ops - the result move, and a jump to the join when it is not
+             * already the last one.
+             *
+             * `S.dst < 0` is the call whose RESULT IS DISCARDED (`c(a);` as
+             * a statement - the peephole's dead-dst rule). There is then no
+             * destination to move into, and emitting the move anyway wrote
+             * frame slot -1: `Frame::at(-1)` is out of bounds, and the JIT's
+             * store would have computed an address one LValue BELOW the
+             * window. It survived only because the one corpus shape that
+             * reached it sat in a chunk the const-folder had made dead;
+             * #137's verifier is what found it.
+             */
             const size_t nb = S.body.size();
+            const bool keep_result = S.dst >= 0;
             std::vector<uint32_t> lmap(nb);
             size_t emitted = 0;
             for (size_t j = 0; j < nb; j++) {
                 lmap[j] = static_cast<uint32_t>(emitted);
-                emitted += (S.body[j].op == OpCode::ReturnV
-                            && j + 1 != nb) ? 2 : 1;
+                if (S.body[j].op == OpCode::ReturnV)
+                    emitted += (keep_result ? 1u : 0u)
+                               + (j + 1 != nb ? 1u : 0u);
+                else
+                    emitted++;
             }
             const size_t body_base = nc.size();
             const size_t join = body_base + emitted;
@@ -9612,13 +10372,16 @@ bool bc_inline_chunk(Chunk &ck,
                         bbs = le.start; bbe = le.end; has_base = true; break;
                     }
                 if (S.body[j].op == OpCode::ReturnV) {
-                    Instr mv;
-                    mv.op = OpCode::MoveV;
-                    mv.target = S.dst;
-                    mv.target2 = S.body[j].a_slot() + S.base;
-                    nctx.push_back({ static_cast<uint32_t>(nc.size()), fidx });
-                    nc.push_back(mv);
-                    from_caller.push_back(0);
+                    if (keep_result) {
+                        Instr mv;
+                        mv.op = OpCode::MoveV;
+                        mv.target = S.dst;
+                        mv.target2 = S.body[j].a_slot() + S.base;
+                        nctx.push_back(
+                            { static_cast<uint32_t>(nc.size()), fidx });
+                        nc.push_back(mv);
+                        from_caller.push_back(0);
+                    }
                     if (j + 1 != nb) {
                         Instr jm;
                         jm.op = OpCode::Jump;

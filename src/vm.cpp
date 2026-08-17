@@ -1961,7 +1961,21 @@ bool vm_lookup_builtin(const UniqueId *name, Builtin &out)
  * image is stored, so machine code is (re-)generated per load. */
 void vm_install_func_chunk(const FuncDescriptor *fdesc, Chunk &&ck)
 {
-    Chunk &owned = g_func_chunks.emplace(fdesc, std::move(ck)).first->second;
+    /*
+     * insert_or_ASSIGN, not emplace: `g_func_chunks` is keyed by a RAW
+     * DESCRIPTOR POINTER, which is a stable identity only while the program
+     * that owns it is alive. A second `.myv` loaded into the same process
+     * gets fresh descriptors from the allocator, and it happily hands back
+     * an address the previous program's descriptor had - at which point
+     * `emplace` finds the key PRESENT, keeps the OLD chunk, and returns it,
+     * so the new function would run the previous image's bytecode.
+     *
+     * Exactly the stale-identity hazard CLAUDE.md warns about, and silent:
+     * one image per process (the CLI) never sees it. It surfaced loading
+     * several images in one process, which the #137 corruption test does.
+     */
+    Chunk &owned =
+        g_func_chunks.insert_or_assign(fdesc, std::move(ck)).first->second;
     /* NOT jit'd here: the tier runs once over the WHOLE image
      * (vm_jit_loaded_image), because a caller's native-call gate needs
      * every callee's flag set first - vm_precompile_all's two passes. */
@@ -1979,8 +1993,29 @@ void vm_install_func_chunk(const FuncDescriptor *fdesc, Chunk &&ck)
  * plus the stored reassigned flags), then main. */
 void vm_jit_loaded_image(VmProgram &prog)
 {
-    for (auto &kv : g_func_chunks)
-        kv.second.native_leaf = jit_chunk_is_native_leaf(kv.second);
+    /*
+     * Over THIS PROGRAM's chunks, not over `g_func_chunks`.
+     *
+     * That map is process-global and keyed by descriptor pointer, and
+     * nothing removes a program's entries when it is destroyed - only
+     * `vm_compile` clears it, and a `.myv` load does not go through
+     * vm_compile. Iterating it therefore re-JITs chunks belonging to
+     * previously loaded, already-freed programs, handing them a dangling
+     * `caller_desc` and THIS program's global-slot tables. One image per
+     * process (the CLI) never notices; loading several in one process
+     * crashed inside emit_op on a foreign chunk's pools.
+     */
+    const auto for_each_chunk = [&](const std::function<void (Chunk &,
+                                    const FuncDescriptor *)> &fn) {
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk)
+                fn(*static_cast<Chunk *>(
+                       const_cast<void *>(d->vm_chunk)), d.get());
+    };
+
+    for_each_chunk([](Chunk &ck, const FuncDescriptor *) {
+        ck.native_leaf = jit_chunk_is_native_leaf(ck);
+    });
 
     std::vector<const FuncDescriptor *> slot_desc(
         prog.global_func_names.size(), nullptr);
@@ -1994,14 +2029,39 @@ void vm_jit_loaded_image(VmProgram &prog)
                 break;
             }
     }
-    for (auto &kv : g_func_chunks) {
+    for_each_chunk([&](Chunk &ck, const FuncDescriptor *desc) {
         JitCtx jc;
         jc.slot_desc = &slot_desc;
         jc.slot_reassigned = &prog.global_slot_reassigned;
-        jc.caller_desc = kv.first;
-        jit_compile_chunk(kv.second, &jc);
-    }
+        jc.caller_desc = desc;
+        jit_compile_chunk(ck, &jc);
+    });
     jit_compile_chunk(prog.root);
+}
+
+/* Declared in vm.h - see the contract there. */
+void
+vm_verify_program(const VmProgram &prog)
+{
+    ChunkLimits lim;
+    lim.nglobals = prog.global_func_names.size();
+    lim.nbuiltins = builtin_slot_count();
+    for (const auto &sd : prog.structs)
+        lim.max_fields = std::max(lim.max_fields, sd->fields.size());
+
+    /* main: no captures, and its frame is the ROOT slot count + temps. */
+    lim.nslots = prog.root_slot_count + prog.root.n_temps;
+    lim.ncaptures = 0;
+    verify_chunk(prog.root, lim);
+
+    for (const auto &d : prog.funcs) {
+        if (!d->vm_chunk)
+            continue;
+        const Chunk &ck = *static_cast<const Chunk *>(d->vm_chunk);
+        lim.nslots = d->frame_size + ck.n_temps;
+        lim.ncaptures = d->captures.size();
+        verify_chunk(ck, lim);
+    }
 }
 
 VmProgram
@@ -2061,6 +2121,20 @@ vm_compile(const Construct *root_c, bool jit)
     };
     for (const auto &e : root->elems)
         take_structs(e.get());
+
+    /*
+     * #137: the CODEGEN self-check. The verifier's per-opcode table is the
+     * audit-table stage trap in its most dangerous form (a stale entry means
+     * silent acceptance), so it is run here too - against everything codegen
+     * and the JIT actually emit. A mis-classified operand then fails the
+     * whole test suite and the sample corpus, not a hostile image in the
+     * field. ASSERTS-only: on a loaded image the check is what stands
+     * between corruption and a wild index, but here the input is our own
+     * output. Runs LAST, once the structs are in `prog` (max_fields).
+     */
+#ifndef NDEBUG
+    vm_verify_program(prog);
+#endif
 
     return prog;
 }
