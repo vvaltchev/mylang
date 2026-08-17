@@ -6319,3 +6319,93 @@ conversion was costed, because 80 - the bench with the big numbers - is
 one pin from exhausting its live values. **The cheap registers were the
 valuable ones**, which is the argument for the cheapest-register-first
 ordering rather than alloc_scratch's preference order.
+
+## 2026-08-18 - #96: the ELEMENT-TIER RESERVATION, and RSI as pin 9
+
+**WHAT.** Two changes that had to land together. `elem_scratch_reserve`
+(jit.cpp) makes the pin pool withhold members until the element-store
+tier is guaranteed two of its six scratch candidates; rsi then joins
+`XCACHE_ORDER`, taking the int pin budget to **9** (`mylang -v`:
+`jit_pins 9 ... xcache 5 caller-saved`).
+
+**WHY TOGETHER.** `elem_scratch_plan` allocates `idx` and `val` - the
+two roles the ISA does not fix - from
+`ELEM_CAND = { rdi, r9, r10, r11, rsi, r8 }`, and declines the WHOLE
+inline store tier to the helper if it cannot fill both. Every register
+#96 admits to the caller-saved pool is one candidate fewer. rdi's
+admission the day before had already starved it off-arena, patched with
+a one-line per-register rule; rsi is itself a candidate, so that rule
+would have had to grow a clause - and r9, rdx, rcx and rax are all in
+CAND or ISA-fixed behind it.
+
+**THE RULE.** At pool-pick time, count the candidates this run can use
+for reasons other than a pin (`elem_reg_usable_nopin` - the same
+predicate the emitter asks, split out so there is one rule set), split
+them into "no pin can reach this" and "this pool could spend this", and
+withhold spendable members least-preferred-first until two survive.
+Conditioned on `run_has_elem_scratch`, so a run with no element store
+pays nothing.
+
+**MEASURED (MYLANG_JITSTATS, bench + samples + functional).**
+
+    config                        elem_noreg   elem_reserve
+    on-arena, before rsi                   0              0
+    off-arena, before rsi                  0             17
+    on-arena, after rsi                    0             14
+
+The reservation absorbs exactly the pressure each admission creates and
+nothing has starved with it in place. Emitted code on-arena was
+**byte-identical over all 109 corpus programs** for the reservation
+alone (`scripts/vdjcmp.sh`), i.e. it landed inert and rsi is what moved
+it.
+
+**TWO ROTTED SITES had to be fixed before rsi could join**, and neither
+was in the audit's tidy list:
+
+ - **`emit_store_elem` staged its arguments BEFORE the prologue** - the
+   only call site in the file to invert the order. With an argument
+   register pinnable that is a wrong answer: the stage overwrites the
+   pin, and `emit_call_prologue` then spills the OVERWRITTEN register
+   to the pin's slot. Its comment ("read before the cache regs spill")
+   rested on a premise the prologue's own comment contradicts - a spill
+   does not invalidate;
+ - **`emit_op` did `movabs rsi, t_int` unconditionally** for
+   `store_dst`, whose tag write became an imm32 in #96 step 3: dead
+   code on-arena, and a pin clobber. The exact mirror of the
+   `store_dst_bool` bug (there an argument outlived its loader). 3 -> 0
+   such instructions over the sampled benches.
+
+**⛔ THE SABOTAGE, AND WHY THIS NEEDED A NEW TEST.** With
+`elem_scratch_reserve` returning 0 and rsi in the pool, the detector
+program's inline element stores go from **80 to ZERO** - and `-rt` was
+**1923/1923 GREEN**, along with all four differentials and corpus_diff.
+The helper computes the same answer, so only the speed changes. Same
+shape as #96 step 3's nested-store tier (emitted perfectly, reached 0
+of 64).
+
+`jit_elem_scratch_reserved` (tests.cpp) is the net: eight hot int
+accumulators, a runtime bound, an element store on a loop-invariant
+base so a C1 hoist claims r10/r11. It asserts the counter (`store_fast`
+bumped, `elem_noreg == 0`) and carries an ANTI-VACUITY assertion
+(`elem_reserve > 0`) so it reports "this program no longer exercises
+the reservation" the day the pool shrinks or ELEM_CAND grows.
+
+**TWO SELF-CHECKS ADDED with it**, both cheap and both of the
+audit-table family:
+
+ - `elem_scratch_plan` takes the opcode and ML_CHECKs it against
+   `op_uses_elem_scratch`, so a third emitter that takes a plan without
+   registering its op aborts BY NAME rather than silently losing its
+   inline tier;
+ - `HOIST_REGS_MASK` is one definition of C1's (data, count) pair, read
+   by the region setup, `jit_xcache_clobber` and the reservation. Two of
+   those three spelled `10` and `11` as literals.
+
+**THE STALE EXPECTATION THIS EXPOSED** is worth recording as a
+positive: `jit_xcache_pins`' hoist case expected a DECLINE off-arena
+and now ENGAGES, because the reservation asks whether the run has an
+element STORE and that case has only element READS (whose emitter takes
+no ElemScratch). The old rule denied rdi in every off-arena run
+regardless. The expectation is `true` in both configurations now, which
+is also the stronger assertion - it fails if EITHER configuration loses
+its last pool member.

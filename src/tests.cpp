@@ -23716,6 +23716,136 @@ static bool jit_store_elem_inline_tier()
  * divisors are write-TWICE locals (the const-ARG eater); LICM cannot
  * hoist `m[i]` out of a store loop (the store taints mut_content).
  */
+/*
+ * ⛔ #96: THE PIN POOL MUST LEAVE THE ELEMENT TIER ITS SCRATCH.
+ *
+ * `elem_scratch_plan` allocates the two roles the ISA does not fix -
+ * `idx` and `val` - from ELEM_CAND = { rdi, r9, r10, r11, rsi, r8 },
+ * and DECLINES the whole inline store tier to the helper if it cannot
+ * fill both. Every register #96 admits to the caller-saved pin pool is
+ * one candidate fewer, and by rsi (pin 9) the margin is gone: a C1
+ * hoist region takes r10/r11, so an element loop with enough hot int
+ * locals leaves r9 alone against two roles.
+ *
+ * ⛔ AND THE FAILURE IS COMPLETELY SILENT. The helper computes exactly
+ * the same answer, so `-rt`, all four differentials, corpus_diff and
+ * every fuzzer stay green while the tier disappears - watched: with
+ * `elem_scratch_reserve` returning 0, this program's inline stores go
+ * from 80 to ZERO and the suite does not notice. That is the same
+ * shape as #96 step 3's nested-store tier (emitted perfectly, reached
+ * 0 of 64) and it is why this check asserts a COUNTER, not a value.
+ *
+ * THREE ASSERTIONS, and the third is the anti-vacuity one:
+ *   1. g_jit_store_fast bumped        - the inline arm actually ran;
+ *   2. g_jit_elem_noreg == 0          - nothing starved;
+ *   3. g_jit_elem_reserve > 0         - the reservation was NEEDED
+ *      here. Without (3) the case passes the day the pool shrinks or
+ *      ELEM_CAND grows, having tested nothing.
+ *
+ * The shape is load-bearing in three ways and each was arrived at by
+ * watching a weaker one pass under sabotage: the array is filled in a
+ * COMPILED loop (a literal array's single store is never JIT'd); the
+ * bound is RUNTIME (a literal one lowers to the top-tested form and
+ * changes which tier applies); and the store's base is loop-invariant
+ * so a hoist region forms and claims r10/r11, which is what makes the
+ * candidate list tight in the first place.
+ */
+static bool jit_elem_scratch_reserved()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    static const char *const src[] = {
+        "func f(int n) {",
+        "    var a = array(16); var j = 0;",
+        "    while (j < 16) { a[j] = j; j++; }",
+        /* eight hot int accumulators: with the four callee-saved pins
+         * spent the pick reaches into the caller-saved pool, which is
+         * where the contention with ELEM_CAND lives. */
+        "    var s0 = 1; var s1 = 2; var s2 = 3; var s3 = 4;",
+        "    var s4 = 5; var s5 = 6; var s6 = 7; var s7 = 8;",
+        "    for (var i = 0; i < n; i++) {",
+        "        s0 = s0 + i; s1 = s1 + s0; s2 = s2 + s1; s3 = s3 + s2;",
+        "        s4 = s4 + s3; s5 = s5 + s4; s6 = s6 + s5; s7 = s7 + s6;",
+        "        a[i % 16] = s0 + s7;",
+        "    }",
+        "    var t = 0; var k = 0;",
+        "    while (k < 16) { t = t + a[k]; k++; }",
+        "    return t + s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7; }",
+        "print(f(runtime(64)));",
+    };
+
+    const unsigned long f0 = g_jit_store_fast;
+    const unsigned long n0 = g_jit_elem_noreg;
+    const unsigned long r0 = g_jit_elem_reserve;
+
+    std::string joined, vm_out, tw_out;
+    for (const char *l : src) { joined += l; joined += "\n"; }
+
+    const auto run = [&](bool vm) -> std::string {
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (const Exception &e) {
+            cout.rdbuf(old);
+            g_exec_engine = se;
+            return std::string("EX:") + e.name;
+        } catch (...) {
+            cout.rdbuf(old);
+            g_exec_engine = se;
+            return "EX:?";
+        }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return cap.str();
+    };
+
+    vm_out = run(true);
+    tw_out = run(false);
+
+    const unsigned long fast = g_jit_store_fast - f0;
+    const unsigned long noreg = g_jit_elem_noreg - n0;
+    const unsigned long resv = g_jit_elem_reserve - r0;
+    bool ok = true;
+
+    if (vm_out != tw_out) {
+        cout << "  value: VM " << vm_out << " vs tree-walker " << tw_out
+             << "\n";
+        ok = false;
+    }
+    if (!fast) {
+        cout << "  the inline element-store tier ran ZERO times - the "
+                "pin pool took a register elem_scratch_plan needed\n";
+        ok = false;
+    }
+    if (noreg) {
+        cout << "  elem_scratch_plan DECLINED " << noreg << " time(s) "
+                "for want of a register (elem_noreg)\n";
+        ok = false;
+    }
+    if (!resv) {
+        cout << "  VACUOUS: elem_scratch_reserve withheld nothing here, "
+                "so this program no longer exercises the reservation - "
+                "widen the pool or the accumulator count\n";
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_store_elem2_inline_tier()
 {
 #if ML_JIT_SUPPORTED
@@ -25076,18 +25206,32 @@ static bool jit_xcache_pins()
           "    return s0 + s1 + s2 + s3 + s4; }",
           "print(f(mk(runtime(48)), runtime(48)));" },
         /*
-         * ⛔ THE EXPECTATION DEPENDS ON THE ARENA, because the CLAIM
-         * does. This run's element ops are outside run_needs_float_tag's
-         * int-only whitelist, so it "needs the float tag" - and whether
-         * that costs r8 depends on whether t_float encodes as an imm32.
-         * With the arena it does not live in a register at all and r8 is
-         * free; under MYLANG_NO_LOWMEM=1 (or on any host where
-         * MAP_32BIT is unavailable) it genuinely DOES, and declining is
-         * the correct answer. Hardcoding `true` failed the no-arena lane
-         * the day that lane started running - which is the lane doing
-         * its job, not a bug to paper over.
+         * ⛔ THE EXPECTATION USED TO DEPEND ON THE ARENA, AND THE REASON
+         * IT NO LONGER DOES IS THE POINT OF THIS CASE.
+         *
+         * The claim is "a hoist region costs r10/r11 and nothing else",
+         * so SOME pool member must survive. Which one differs by
+         * configuration: with the arena r8 is free (t_float encodes as
+         * an imm32, so nothing holds it); without it r8 genuinely
+         * carries the singleton - this run's element ops are outside
+         * run_needs_float_tag's int-only whitelist - and rdi is the
+         * survivor instead.
+         *
+         * It read `ml_lowmem_fits_imm32(t_float)` for one day, i.e.
+         * "off-arena, decline everything". That was not the hoist's
+         * doing: it was the ad-hoc `if (!tag_is_imm(t_int)) clob |= rdi`
+         * rule, which withheld rdi from EVERY run off-arena to keep the
+         * element STORE tier two candidates. The general reservation
+         * (elem_scratch_reserve) asks whether the run contains a store
+         * at all - this one has only element READS, whose emitter takes
+         * no ElemScratch - so rdi is spendable here and the pool is
+         * non-empty in both configurations.
+         *
+         * `true` unconditionally is therefore the honest form, and it
+         * is also the stronger test: it fails if EITHER configuration
+         * loses its last pool member.
          */
-        ml_lowmem_fits_imm32(AllTypes[Type::t_float]) },
+        true },
 
       /*
        * THE LOAD-BEARING SHAPE: a caller-saved pin SPILLED around a
@@ -32596,6 +32740,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the INLINE element-store tier serves plain + COMPOUND stores "
       "and REFUSES bad divisors / const stores (#92, #95)",
       jit_store_elem_inline_tier },
+    { "jit: the pin pool leaves the element tier two scratch candidates "
+      "- the reservation, whose absence is SILENT (#96)",
+      jit_elem_scratch_reserved },
     { "jit: the INLINE nested-STORE tier (a[i][j] = / OP=) with prep, "
       "promote and fit/divisor decline order (#95)",
       jit_store_elem2_inline_tier },
