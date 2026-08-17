@@ -184,5 +184,24 @@ else
     fail "depth cap: uncaught overflow rc=$got_rc [$out]"
 fi
 
+# -v REPORTS THE ARENA, and MYLANG_NO_LOWMEM=1 refuses it. This is the
+# VACUITY GUARD for the no-arena CI lane: a lane that tests a
+# configuration must be able to prove it is IN that configuration, or it
+# goes green doing nothing the day a default moves (the lto0 lane's
+# reason for asserting `lto 0` before it tests anything). Checked in
+# BOTH directions, so neither a stuck-on nor a stuck-off answer passes.
+out=$("$BIN" -v 2>&1)
+if printf '%s' "$out" | grep -q '^  lowmem  *1'; then
+    pass "-v: the low-address arena is reported, and is ON by default"
+else
+    fail "-v: expected 'lowmem 1' by default [$out]"
+fi
+out=$(MYLANG_NO_LOWMEM=1 "$BIN" -v 2>&1)
+if printf '%s' "$out" | grep -q '^  lowmem  *0'; then
+    pass "-v: MYLANG_NO_LOWMEM=1 refuses the arena"
+else
+    fail "-v: MYLANG_NO_LOWMEM=1 did not refuse the arena [$out]"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc
