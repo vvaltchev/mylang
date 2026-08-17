@@ -1759,3 +1759,65 @@ Order for that work, smallest-first, each with vdjcmp as the oracle:
  2. convert ONE family end-to-end and prove it byte-identical;
  3. admit ONE register to the pool and re-run this sweep. Repeat.
 Never admit a register by analogy - r9 shipped a wrong answer that way.
+
+
+## 2026-08-18 (j): the scratch allocator - the SEAM, and why the rest is
+## one indivisible conversion
+
+`Emitter::alloc_scratch()` / `free_scratch()` land: hand out a register
+holding no pin and no live state, ML_CHECK on exhaustion, preference
+order rax,rcx,rdx so a converted site gets what it used to hardcode and
+the emitted code stays byte-identical (verified 108/108 against the
+previous commit).
+
+**AND THE MEASUREMENT SAYS THE REST CANNOT BE INCREMENTAL.** Probe over
+bench/my + samples + tests/functional: of **199 compiled runs, ZERO**
+avoid the ops that use rax/rcx/rdx as raw scratch. Top blockers by op
+count: CallBuiltinV 384, LoadConstV 251, LoadBuiltinV 178, ArrLen 138,
+Halt 126, StoreGlobalV 123, MakeClosureV 119, ReturnV 101, LoadElemInt
+101, SubscriptV 96 - a long tail, not a handful.
+
+Two structural reasons, and neither yields to picking a subset:
+ - a FRAGMENT IS A WHOLE FUNCTION BODY (`native_leaf`), so it always
+   contains a return, a store, a load and usually a call;
+ - `read_slot` / `write_slot` / `store_dst` - which EVERY op goes
+   through - take RAX by caller convention.
+So admitting rax to the pool while ONE site still writes it unasked is
+a silent wrong answer of exactly the r9 shape. The conversion must be
+COMPLETE before the pool changes. Census is the progress bar:
+**RAX 399, RCX 222, RDX 118** unbracketed sites.
+
+⛔ NOTE a helper CALL is NOT a blocker. `emit_call_prologue` already
+spills every caller-saved pin - that is what made r8/r10/r11
+admissible. Only RAW scratch outside that bracket is.
+
+### THE PREREQUISITE NOBODY HAD NOTED: lever A's protocol names RAX
+
+`JitFwd::in_rax` - the field name, and 14 sites - IS the forwarding
+ABI: a producer leaves its value in RAX and the consumer reads it
+there. **RAX cannot become an allocatable scratch register until that
+carries WHICH register holds the value.**
+
+The fix is already precedented IN THE SAME STRUCT: the float twin was
+converted for exactly this reason ("C4b inc 2: the register is no
+longer always xmm0, so it is carried"). So the int side follows a shape
+that already exists and is already tested.
+
+### ORDER, revised by the above
+
+ 1. **Generalise `JitFwd::in_rax` to `in_reg`**, mirroring the float
+    twin. Self-contained, ~14 sites, byte-identical while the register
+    chosen stays RAX. THIS IS THE GATE - nothing else can proceed.
+ 2. Convert the emitters family by family to `alloc_scratch()`, with
+    `vdjcmp` proving byte-identical at every step and the census as the
+    progress bar.
+ 3. Only when a register's count reaches ZERO, admit it and re-run the
+    MAXPINS sweep. One register at a time, never by analogy.
+
+**Honest scale: ~740 mechanical edits across essentially every emitter
+in a 16k-line file, for a projected -3.8% (83_regs_int_40) to -5.6%
+(80_regs_int_08) once the first of the three lands.** That is a
+multi-session conversion, and it buys NOTHING until a register's count
+hits zero - so it should be started only with that commitment, and step
+1 should be done first regardless since it is small and unblocks
+everything.
