@@ -6409,3 +6409,61 @@ no ElemScratch). The old rule denied rdi in every off-arena run
 regardless. The expectation is `true` in both configurations now, which
 is also the stronger assertion - it fails if EITHER configuration loses
 its last pool member.
+
+## 2026-08-18 - #96: the tag-compare seam had a HOLE, and it cost bytes
+
+**WHAT.** `cmp_reg_tag_via(reg, tag, scratch)` - the compare twin of
+`store_type_tag_via` - and the seven `movabs r9, t_arr; cmp rax, r9`
+pairs that open-coded it now route through it.
+
+**WHY IT EXISTED.** #96 step 3's note says there is ONE tag-comparison
+entry point and every tag reader must come through it. There wasn't:
+`cmp_reg_tag` ML_CHECKs that a non-imm32 tag is `t_int` or `t_float`
+(the only two a register holds), so `t_arr` could not use it at all,
+and seven element-tier sites materialised the tag by hand instead. A
+seam with a hole is filled by hand-written code, and hand-written code
+is where the register names come back.
+
+**MEASURED.** On the arena the pair is 13 bytes (`movabs` + `cmp rr`)
+where `cmp rax, imm32` is 6, on every element base gate:
+**98588 -> 98442 emitted instructions** over bench + samples, i.e. ~146
+`movabs` deleted / ~1.4 KB of machine code. Off-arena the emission is
+byte-identical (109/109) - the fallback is exactly what was there.
+r9's census: 117 -> 109.
+
+**AND THE CLOBBER MOVED TO WHERE IT HAPPENS.** `cmp_reg_tag_via` calls
+`scratch(sc)` itself, on the fallback path only, so
+`emit_elem_base_gate` drops its blanket `e.scratch(R9)` - which on the
+arena was asserting a register that path no longer writes. That matters
+beyond tidiness: once r9 is pinnable, an over-broad `scratch()` ABORTS
+a legal fragment. Same rule as "a helper's register ABI is the
+emitter's job".
+
+## 2026-08-18 - vdjcmp: a difference is CONFIRMED before it is reported
+
+**THE PROBLEM.** Twice in one session a full-corpus run reported
+exactly ONE differing program - `29_str_slice_readonly`, then
+`67_make_dict` - and neither reproduced. 250 same-binary runs and 200
+cross-binary runs of each, six clean self-tests, and six more clean
+full-corpus runs: all identical. Rate is on the order of 1 in 1000
+program comparisons, and the cause is NOT yet known.
+
+**WHY IT MATTERS MORE THAN ITS RATE.** This script is the oracle for
+"my JIT change is a pure restructuring". A spurious single-program DIFF
+reads exactly like a real regression - and, worse, teaches the reader
+to wave the next real one away as "that flake again". That is the
+failure mode the 2026-08-17 rewrite of this script already fixed once,
+in its loud form (0 identical / 108 differing, for weeks).
+
+**THE FIX, WHICH IS NOT A MASK.** On a `cmp` mismatch the script
+RE-RUNS both binaries and asks again. A real difference reproduces; one
+that does not is reported as `FLAKE:`, its three dumps are saved to
+`./vdjcmp-flake/` (override with `VDJCMP_EVIDENCE`), it is counted in
+its own column, and the script **exits 3** with a message saying the
+ORACLE is at fault and this run is not a clean one either. The run is
+not discarded, it is re-asked - instrument property 2 - and the
+evidence needed to root-cause it is now captured instead of lost.
+
+**IT FIRED ON ITS FIRST REAL USE** (and the evidence was then deleted
+by an `rm -rf` in the same command - don't do that). Twelve subsequent
+full-corpus runs have been clean.

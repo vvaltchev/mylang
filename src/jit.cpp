@@ -2125,6 +2125,39 @@ struct Emitter {
     }
     void cmp_rax_tag(const void *tag, uint8_t fallback_reg)
     { cmp_reg_tag(0, tag, fallback_reg); }
+    /*
+     * The compare form for a tag NOTHING holds - `t_arr` is the live
+     * case - exactly mirroring store_type_tag_via. `scratch` is
+     * clobbered ONLY on the fallback path.
+     *
+     * ⛔ ITS ABSENCE WAS COSTING BOTH SIZE AND A REGISTER. Seven sites
+     * open-coded `movabs r9, t_arr; cmp rax, r9` because cmp_reg_tag
+     * ML_CHECKs a tag it has no register for - so the ONE seam the
+     * step-3 note above says every tag reader must come through had a
+     * hole, and the hole was filled by hand-written code naming r9. On
+     * the arena that is 13 bytes where 6 do (`cmp rax, imm32`), on
+     * every element base gate; off it, it is identical to what was
+     * there. And it is 14 of r9's census sites, in the register whose
+     * invisible element-tier uses shipped a wrong answer.
+     */
+    void cmp_reg_tag_via(uint8_t reg, const void *tag, uint8_t sc)
+    {
+        if (ml_lowmem_fits_imm32(tag)) {
+            cmp_reg_tag(reg, tag, sc);
+            return;         /* an imm32 - `sc` is NOT touched */
+        }
+        /* ⛔ THE CLOBBER IS DECLARED WHERE IT HAPPENS, not by the
+         * caller. Callers used to open a blanket `e.scratch(R9)` at the
+         * top of the whole emitter, which on the arena asserts a
+         * register this path no longer writes - and once that register
+         * is pinnable, an over-broad assert ABORTS a legal fragment.
+         * Same rule as "a helper's register ABI is the emitter's job":
+         * state the clobber at the instruction that makes it. */
+        scratch(sc);
+        movabs(sc, static_cast<uint64_t>(
+                       reinterpret_cast<uintptr_t>(tag)));
+        cmp_rr(reg, sc);
+    }
     /* ---- N4 array element access ---- */
     /* cmp byte [rbx+disp], imm8  (the slice flag) */
     void cmp_byte_slot(int32_t d, uint8_t imm)
@@ -9123,8 +9156,7 @@ static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc,
             e.bail_unless(pass_short, pc);
     };
     e.load(RAX, base.type);                  /* base an array? */
-    e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-    e.cmp_rr(RAX, R9);
+    e.cmp_reg_tag_via(RAX, L.t_arr, R9);
     decline(0x74, 0x75);                     /* je (== t_arr) */
     e.cmp_byte_slot(base.payload + L.slice_off, 0);   /* not a slice? */
     decline(0x74, 0x75);                     /* je (slice==0) */
@@ -9150,7 +9182,9 @@ static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc,
 static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc,
                                 std::vector<size_t> *slows = nullptr)
 {
-    e.scratch(R9);
+    /* No blanket `scratch(R9)`: since the t_arr compare went through
+     * cmp_reg_tag_via this gate touches r9 only on the no-arena
+     * fallback, and that path declares the clobber itself. */
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(base_slot);
     const auto decline = [&](uint8_t pass_short, uint8_t fail_near) {
@@ -9160,8 +9194,7 @@ static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc,
             e.bail_unless(pass_short, pc);
     };
     e.load(RAX, base.type);
-    e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-    e.cmp_rr(RAX, R9);
+    e.cmp_reg_tag_via(RAX, L.t_arr, R9);
     decline(0x74, 0x75);
     e.cmp_byte_slot(base.payload + L.slice_off, 0);
     decline(0x74, 0x75);
@@ -9893,8 +9926,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
         e.add_rr(RCX, R9);                        /* rcx = &row (LValue) */
     } else {
     e.load(RAX, base.type);
-    e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-    e.cmp_rr(RAX, R9);
+    e.cmp_reg_tag_via(RAX, L.t_arr, R9);
     decline_ne();
     e.cmp_byte_slot(base.payload + L.slice_off, 0);
     j_oslice = e.j32(0x75);                    /* -> the outer-slice arm */
@@ -9917,8 +9949,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
      * rejoin here, so `row_sec` is the common &row entry. */
     const size_t row_sec = e.pos();
     e.mov_rax_rcx_d(static_cast<int32_t>(L.off_type));
-    e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-    e.cmp_rr(RAX, R9);
+    e.cmp_reg_tag_via(RAX, L.t_arr, R9);
     decline_ne();
     e.cmp_byte_rcx(static_cast<int32_t>(L.off_payload) + L.slice_off, 0);
     const size_t j_rslice = e.j32(0x75);       /* -> the row-slice arm */
@@ -11063,8 +11094,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             j_dones.push_back(e.j32(0xEB));
         } else {
         e.load(RAX, base.type);                  /* base an array? */
-        e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-        e.cmp_rr(RAX, R9);
+        e.cmp_reg_tag_via(RAX, L.t_arr, R9);
         j_slows.push_back(e.j32(0x75));          /* jne -> slow */
         e.cmp_byte_slot(base.payload + L.slice_off, 0);
         const size_t j_slice = e.j32(0x75);      /* #95: -> the slice arm */
@@ -12564,8 +12594,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             const SlotAddr dst = slot_addr(in.target);
             e.bump_op(OpCode::LoadElemBool);         /* execution proof */
             e.load(RAX, base.type);                  /* base an array? */
-            e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-            e.cmp_rr(RAX, R9);
+            e.cmp_reg_tag_via(RAX, L.t_arr, R9);
             e.bail_unless(0x74, pc);
             e.cmp_byte_slot(base.payload + L.slice_off, 0);   /* not a slice? */
             e.bail_unless(0x74, pc);
@@ -16477,8 +16506,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                      uint8_t rdata, uint8_t rcount) {
                     const SlotAddr hb = slot_addr(base);
                     e.load(RAX, hb.type);
-                    e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-                    e.cmp_rr(RAX, R9);
+                    e.cmp_reg_tag_via(RAX, L.t_arr, R9);
                     cold.push_back(e.j32(0x75));
                     e.cmp_byte_slot(hb.payload + L.slice_off, 0);
                     cold.push_back(e.j32(0x75));
