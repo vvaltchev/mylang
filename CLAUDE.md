@@ -1225,10 +1225,18 @@ and it lives *inside the parser*. Mechanics:
   enters a set only if every step from the call to the read is guaranteed — a
   conditional link ANYWHERE drops the case to the warning tier, and all three
   positions (outer call, inner call, read) are pinned.
-  **IT SEES THROUGH A WRITE-ONCE NAME** (#140, 2026-08-09): `var f = fetch;
-  var t = f();` is refused exactly like the direct `fetch()` spelling, at the
-  top level and through a call hop alike (`index_func_aliases` +
-  `callee_of`, consulted by BOTH tiers and by the fixpoint's call edges).
+  **IT SEES THROUGH A WRITE-ONCE NAME** (#140/#146, 2026-08-09):
+  `var f = fetch; var t = f();` is refused exactly like the direct `fetch()`
+  spelling, at the top level and through a call hop alike
+  (`index_func_aliases` + `callee_of`, consulted by BOTH tiers and by the
+  fixpoint's call edges). Three rvalue shapes name one function: a top-level
+  NAMED func, a LAMBDA literal (`var f = func() { return g; };` — then the
+  lambda is the whole call graph, so `build_reachable_reads` must iterate
+  the alias TARGETS and not just the name index, and the cheap early bail
+  must ask about both or a program with no named function is skipped
+  entirely), and a CHAIN (`var f2 = f;` — free, because the index is built
+  in statement ORDER, so each link sees the one above it, which is also
+  exactly when it holds that value).
   Sound for the same reason AutoConst's promotion is: the declaration is the
   ONLY write, so wherever the name is bound at all it holds that one
   function — proven from the write counters the resolver has already
@@ -1238,13 +1246,13 @@ and it lives *inside the parser*. Mechanics:
   **The decline direction is the one that matters** — a false alias refuses a
   program that RUNS (`var f = fetch; f = other; f();` where `other` never
   reads the global), which is why the write-once sabotage is watched failing
-  on a case that asserts its own result, not merely that it compiled. Two
-  deliberate limits, both silent: a top-level call ABOVE the binding is left
+  on a case that asserts its own result, not merely that it compiled. One
+  deliberate limit stays silent: a top-level call ABOVE the binding is left
   alone (the failure there is the unbound NAME, and reporting what it will
-  later hold would name the wrong cause — the TDZ already refuses it), and
-  a callee that needs a real callee-SET analysis to bound — a container
-  element (`ops[0]()`), a parameter, an alias CHAIN (`var f2 = f;`) — keeps
-  today's runtime `UnboundSymbolEx`.
+  later hold would name the wrong cause — the TDZ already refuses it). A
+  callee that needs a real callee-SET analysis to bound — a container
+  element (`ops[0]()`), a parameter, an alias declared inside a body — is
+  not proven, but it IS reported by the warning tier's weak arm below.
 - **`isbound(name)` — the TDZ pair's runtime half (#131 step 6).**
   `defined(name)` asks whether the name EXISTS (true throughout its scope,
   ABOVE the declaration included — the name is declared, merely unbound);
@@ -3696,6 +3704,26 @@ and two macros:
   table expected ZERO until the call-graph fixpoint landed, and the pin
   worked as intended: it FAILED the moment the behaviour improved, instead of
   letting the improvement go unnoticed. Keep writing them that way.
+  **IT HAS TWO STRENGTHS, and the WORDING is the contract (#146,
+  maintainer-set 2026-08-09).** `"this call MAY fail: g is not bound until
+  later"` means the callee is KNOWN and provably reaches `g` on some path —
+  only whether that path runs is open. `"this call MIGHT fail: the callee is
+  not known here, and g is not bound until later"` covers the shapes no
+  cheap analysis can bound — a container element, a parameter, a REASSIGNED
+  name — and **is allowed to be a false positive**, which is exactly what
+  "might" announces. Two things keep the weak arm from being noise, and both
+  are sabotage-pinned: it fires only for a global that SOME function
+  actually reads (an opaque callee cannot fail on a global nobody touches),
+  and `call_is_opaque` excludes BUILTINS and STRUCT CONSTRUCTIONS — `print`
+  is C++ and `P(1)` binds fields, so counting either as "a callee we cannot
+  analyse" warns on nearly every program (removing that exclusion makes
+  `runtime(0)` itself warn, watched). Measured over samples/ + bench/ +
+  tests/functional/: **ZERO** warnings, while 76_funcval_dispatch — which
+  has exactly this call shape — warns the moment one of its globals moves
+  below the call. **A test of this tier must assert the STRENGTH, not just
+  the count**: the two arms are both one warning, so a bare count lets a
+  "might" satisfy a case that means the definite statement (the `needle`
+  field in the `unbound_call_warnings` table).
 - **⛔ NO INPUT MAY CRASH THE INTERPRETER (#137, 2026-08-09).** Every `.my`
   file ends in a DEFINED outcome — a compile refusal, a thrown exception, or a
   clean run. Two real crashes were found by simply trying degenerate inputs:

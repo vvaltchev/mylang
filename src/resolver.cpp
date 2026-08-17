@@ -1532,14 +1532,13 @@ private:
      * branch is CONDITIONAL, so it is skipped either way - and running before
      * every transform means the tree is the one the user wrote.
      *
-     * WHAT IT SEES, and what it still does not. Transitivity through the
-     * call graph is here (build_reachable_reads), the WARNING tier for the
-     * merely suspicious is here (warn_unbound_calls), and a callee named
-     * indirectly through a write-once binding is here (index_func_aliases).
-     * What remains silent is a callee that needs a real callee-SET analysis
-     * to bound - a container element (`ops[0]()`), a parameter, an alias
-     * CHAIN (`var f2 = f;`). Those keep today's runtime UnboundSymbolEx,
-     * which is correct, merely late.
+     * WHAT IT SEES. Transitivity through the call graph
+     * (build_reachable_reads), and a callee named indirectly through a
+     * WRITE-ONCE binding - a named function, a LAMBDA literal, or a CHAIN
+     * of either (index_func_aliases). A callee it cannot name at all -
+     * `ops[0]()`, a parameter, an alias declared inside a body - is NOT
+     * proven here; it is reported by the weak arm of the warning tier
+     * instead, which is allowed to be wrong and says "might".
      * ------------------------------------------------------------------ */
 
     /*
@@ -1647,6 +1646,26 @@ private:
      * asked for every path rather than the guaranteed ones) and it resolves
      * the same write-once aliases, so the two tiers see one call graph and
      * differ only in which paths count.
+     *
+     * IT HAS TWO STRENGTHS, and the wording is the contract:
+     *
+     *   "this call MAY fail: g is not bound until later"
+     *        the callee is KNOWN and provably reaches g on some path; only
+     *        WHETHER that path runs is open
+     *
+     *   "this call MIGHT fail: the callee is not known here, and g is not
+     *    bound until later"
+     *        the callee is NOT known - a container element, a parameter, a
+     *        reassigned name. This one is ALLOWED to be a false positive
+     *        (maintainer, 2026-08-09), which is what "might" announces.
+     *
+     * The weak arm is filtered so it is not merely noise: it fires only for
+     * a global that SOME function actually reads, since an opaque callee
+     * cannot fail on a global nobody touches. Measured over samples/ +
+     * bench/ + tests/functional/: ZERO warnings. The filter is what earns
+     * that - 76_funcval_dispatch has exactly this call shape and is quiet
+     * because its globals are declared above it, and moving one below makes
+     * it warn.
      */
     template <typename F>
     static void walk_every(Construct *c, const F &f)
@@ -1690,20 +1709,61 @@ private:
     {
         DeclIndex global_decl_stmt;
         FuncIndex top_funcs;
-        index_top_level(rb, global_decl_stmt, top_funcs);
+        NameSet structs;
+        index_top_level(rb, global_decl_stmt, top_funcs, structs);
 
-        if (global_decl_stmt.empty() || top_funcs.empty())
+        if (global_decl_stmt.empty())
             return;
 
         AliasIndex aliases;
         index_func_aliases(rb, top_funcs, main_writes, aliases);
 
+        /* a LAMBDA bound to a name is a function this program can call even
+         * with no NAMED function anywhere, so the cheap bail must ask about
+         * both indexes - asking only about top_funcs skipped s1 entirely */
+        if (top_funcs.empty() && aliases.empty())
+            return;
+
         /* every global a call may reach, on ANY path and through ANY number
          * of hops - the conditional read and the deeper one are what this
-         * tier exists to catch */
+         * tier exists to catch - plus which functions reach a callee this
+         * pass cannot name, for the weaker "might" arm below */
         ReadSets reads;
-        build_reachable_reads(top_funcs, global_decl_stmt, aliases,
-                              /*unconditional_only=*/false, reads);
+        FuncSet opaque;
+        build_reachable_reads(top_funcs, global_decl_stmt, aliases, structs,
+                              /*unconditional_only=*/false, reads, &opaque);
+
+        /*
+         * THE "MIGHT" ARM's candidate set. An un-nameable callee could run
+         * anything, so the honest statement is about any global that SOME
+         * function reads - if no function reads `g` at all, no call can fail
+         * on it, however opaque the callee. Ordered by declaration so the
+         * message names the FIRST offender and is not at the mercy of an
+         * unordered_map's iteration order.
+         */
+        std::vector<std::pair<size_t, const UniqueId *>> read_anywhere;
+        for (const auto &rp : reads)
+            for (const UniqueId *g : rp.second) {
+                auto dit = global_decl_stmt.find(g);
+                bool seen = false;
+                for (const auto &e : read_anywhere)
+                    if (e.second == g) { seen = true; break; }
+                if (!seen && dit != global_decl_stmt.end())
+                    read_anywhere.emplace_back(dit->second, g);
+            }
+        std::sort(read_anywhere.begin(), read_anywhere.end());
+
+        const auto warn_might = [&](CallExpr *call, size_t i) {
+            for (const auto &e : read_anywhere)
+                if (e.first > i) {
+                    compile_warn(
+                        intern_msg("this call might fail: the callee is not "
+                                   "known here, and " + e.second->val
+                                   + " is not bound until later"),
+                        call->start, call->end);
+                    return;
+                }
+        };
 
         for (size_t i = 0; i < rb->elems.size(); i++) {
 
@@ -1716,8 +1776,13 @@ private:
                     return;
                 FuncDeclStmt *fd = callee_of(call, top_funcs, aliases,
                                              static_cast<ptrdiff_t>(i));
-                if (!fd)
+                if (!fd) {
+                    /* `ops[0]()`, a parameter, a body-local alias: we cannot
+                     * name what runs, so this is the weaker statement */
+                    if (call_is_opaque(call, top_funcs, aliases, structs))
+                        warn_might(call, i);
                     return;
+                }
 
                 for (const UniqueId *g : reads[fd]) {
                     auto dit = global_decl_stmt.find(g);
@@ -1729,6 +1794,10 @@ private:
                         return;     /* one per call site, not per read */
                     }
                 }
+                /* the callee IS known, but something it reaches is not - so
+                 * the definite statement above could not be made */
+                if (opaque.count(fd))
+                    warn_might(call, i);
             });
         }
     }
@@ -1741,15 +1810,26 @@ private:
     struct Alias { FuncDeclStmt *fd; size_t decl_stmt; };
     typedef std::unordered_map<const UniqueId *, Alias> AliasIndex;
 
+    typedef std::unordered_set<const UniqueId *> NameSet;
+
     /* The top-level statement index of each global VAR/CONST decl, plus every
-     * top-level named function - the two things both tiers index by. */
-    static void index_top_level(Block *rb, DeclIndex &decls, FuncIndex &funcs)
+     * top-level named function - the two things both tiers index by - plus
+     * the STRUCT names, which the "might" warning needs only to stay quiet:
+     * `P(1)` is a call whose callee is not a function, and calling it
+     * "a callee we cannot analyse" would warn about every construction. */
+    static void index_top_level(Block *rb, DeclIndex &decls, FuncIndex &funcs,
+                                NameSet &structs)
     {
         for (size_t i = 0; i < rb->elems.size(); i++) {
             Construct *e = rb->elems[i].get();
             if (auto *fd = dynamic_cast<FuncDeclStmt *>(e)) {
                 if (fd->id)
                     funcs[fd->id->uid] = fd;
+                continue;
+            }
+            if (auto *sd = dynamic_cast<StructDeclStmt *>(e)) {
+                if (sd->id)
+                    structs.insert(sd->id->uid);
                 continue;
             }
             auto *ex = dynamic_cast<Expr14 *>(e);
@@ -1787,10 +1867,10 @@ private:
      * reassigns its copy leaves this binding alone - and that write is a
      * capture-slot write, counted against neither table.
      *
-     * NOT chased through a chain (`var f = fetch; var f2 = f;` leaves f2
-     * unresolved) and not through a container (`ops[0]()`): both need a
-     * callee-set analysis, and the value the resolver can see here is one
-     * name. The limit costs a diagnostic, never an answer.
+     * NOT chased through a container (`ops[0]()`) or a parameter: those
+     * need a real callee-SET analysis, and what the resolver can see here
+     * is one value. The limit costs a diagnostic, never an answer - and
+     * those shapes reach the warning tier's weak arm anyway.
      */
     void index_func_aliases(Block *rb, const FuncIndex &funcs,
                             const std::vector<int> &main_writes,
@@ -1804,13 +1884,36 @@ private:
 
             /* `var a, b = ...` binds a list: no single function value */
             auto *lv = dynamic_cast<Identifier *>(ex->lvalue.get());
-            auto *rv = dynamic_cast<Identifier *>(ex->rvalue.get());
-            if (!lv || !rv || rv->sym.kind != SymKind::global)
+            if (!lv)
                 continue;
 
-            auto ft = funcs.find(rv->uid);
-            if (ft == funcs.end())
-                continue;               /* not a top-level named function */
+            /*
+             * THREE rvalue shapes name one function. A LAMBDA LITERAL is the
+             * function - there is no name to look up, and no way for the
+             * binding to hold anything else. A named top-level function is
+             * the base case. An earlier ALIAS chains: because this loop runs
+             * in statement ORDER, `var f2 = f;` finds f's entry already
+             * built, and finds it only when f was bound ABOVE - which is
+             * exactly the condition for f2 to hold f's function at all.
+             */
+            FuncDeclStmt *target = nullptr;
+            if (auto *lam = dynamic_cast<FuncDeclStmt *>(ex->rvalue.get())) {
+                target = lam;
+            } else if (auto *rv =
+                           dynamic_cast<Identifier *>(ex->rvalue.get())) {
+                if (rv->sym.kind == SymKind::global) {
+                    auto ft = funcs.find(rv->uid);
+                    if (ft != funcs.end())
+                        target = ft->second;
+                }
+                if (!target) {
+                    auto at = out.find(rv->uid);
+                    if (at != out.end())
+                        target = at->second.fd;
+                }
+            }
+            if (!target)
+                continue;
 
             if (lv->sym.kind == SymKind::local) {
                 const int s = lv->sym.slot;
@@ -1824,7 +1927,7 @@ private:
                 continue;               /* not a plain top-level binding */
             }
 
-            out.emplace(lv->uid, Alias{ ft->second, i });
+            out.emplace(lv->uid, Alias{ target, i });
         }
     }
 
@@ -1862,6 +1965,37 @@ private:
         return at->second.fd;
     }
 
+    /*
+     * OPAQUE: this call reaches MyLang code we cannot name. Not the same as
+     * "callee_of said no" - most of those are perfectly analysable things
+     * that simply are not user functions, and warning about them would bury
+     * the real diagnostic:
+     *
+     *     print(x);        a BUILTIN - C++, reads no MyLang global
+     *     P(1);            a STRUCT construction - binds fields, calls nothing
+     *     ops[0]();        opaque: an element, and we do not track the set
+     *     fn();            opaque: a parameter, bound by whoever called us
+     *
+     * A block-scoped nested function counts as opaque too: it has a global
+     * SLOT but no entry in `global_func_slots`, so this cannot name its body.
+     * That is a false positive in the honest sense - the callee really is
+     * one this pass cannot analyse - and it is why the diagnostic it feeds
+     * says "might".
+     */
+    static bool call_is_opaque(CallExpr *call, const FuncIndex &funcs,
+                               const AliasIndex &aliases,
+                               const NameSet &structs)
+    {
+        auto *cid = dynamic_cast<Identifier *>(call->what.get());
+        if (!cid)
+            return true;                /* a subscript / member / call result */
+        if (cid->sym.kind == SymKind::builtin)
+            return false;
+        if (structs.count(cid->uid))
+            return false;
+        return !funcs.count(cid->uid) && !aliases.count(cid->uid);
+    }
+
     static void add_uniq(std::vector<const UniqueId *> &v, const UniqueId *u)
     {
         for (const UniqueId *x : v)
@@ -1893,15 +2027,33 @@ private:
      * conditionally puts `g` in no set of fetch's. The warning tier passes
      * false and takes every path.
      */
+    typedef std::unordered_set<FuncDeclStmt *> FuncSet;
+
     void build_reachable_reads(const FuncIndex &funcs, const DeclIndex &decls,
                                const AliasIndex &aliases,
-                               bool unconditional_only, ReadSets &out)
+                               const NameSet &structs,
+                               bool unconditional_only, ReadSets &out,
+                               FuncSet *opaque = nullptr)
     {
         std::unordered_map<FuncDeclStmt *, std::vector<FuncDeclStmt *>> callees;
 
-        for (const auto &fp : funcs) {
+        /* every body a call can land in: the named functions, plus the
+         * LAMBDA an alias binds - which has no name, so the FuncIndex does
+         * not know it and iterating that map alone would leave its reads
+         * empty (and the alias pointing at an empty set, silently) */
+        std::vector<FuncDeclStmt *> bodies;
+        for (const auto &fp : funcs)
+            bodies.push_back(fp.second);
+        for (const auto &ap : aliases) {
+            bool seen = false;
+            for (FuncDeclStmt *b : bodies)
+                if (b == ap.second.fd) { seen = true; break; }
+            if (!seen)
+                bodies.push_back(ap.second.fd);
+        }
 
-            FuncDeclStmt *fd = fp.second;
+        for (FuncDeclStmt *fd : bodies) {
+
             std::vector<const UniqueId *> reads;
             std::vector<FuncDeclStmt *> calls;
 
@@ -1913,7 +2065,13 @@ private:
                 if (!call)
                     return;
                 FuncDeclStmt *h = callee_of(call, funcs, aliases, -1);
-                if (h && h != fd) {
+                if (!h) {
+                    if (opaque && call_is_opaque(call, funcs, aliases,
+                                                 structs))
+                        opaque->insert(fd);
+                    return;
+                }
+                if (h != fd) {
                     bool seen = false;
                     for (FuncDeclStmt *k : calls)
                         if (k == h) { seen = true; break; }
@@ -1931,17 +2089,25 @@ private:
             callees[fd] = std::move(calls);
         }
 
-        /* propagate along the call edges until nothing new arrives */
+        /* propagate along the call edges until nothing new arrives - the
+         * reads, and (for the warning tier) the OPAQUE bit: a function that
+         * calls one which reaches an un-nameable callee reaches it too */
         for (bool changed = true; changed; ) {
             changed = false;
             for (const auto &cp : callees)
-                for (FuncDeclStmt *h : cp.second)
+                for (FuncDeclStmt *h : cp.second) {
                     for (const UniqueId *u : out[h]) {
                         const size_t before = out[cp.first].size();
                         add_uniq(out[cp.first], u);
                         if (out[cp.first].size() != before)
                             changed = true;
                     }
+                    if (opaque && opaque->count(h)
+                            && !opaque->count(cp.first)) {
+                        opaque->insert(cp.first);
+                        changed = true;
+                    }
+                }
         }
     }
 
@@ -1949,17 +2115,24 @@ private:
     {
         DeclIndex global_decl_stmt;
         FuncIndex top_funcs;
-        index_top_level(rb, global_decl_stmt, top_funcs);
+        NameSet structs;
+        index_top_level(rb, global_decl_stmt, top_funcs, structs);
 
-        if (global_decl_stmt.empty() || top_funcs.empty())
+        if (global_decl_stmt.empty())
             return;
 
         AliasIndex aliases;
         index_func_aliases(rb, top_funcs, main_writes, aliases);
 
+        /* a LAMBDA bound to a name is a function this program can call even
+         * with no NAMED function anywhere, so the cheap bail must ask about
+         * both indexes - asking only about top_funcs skipped s1 entirely */
+        if (top_funcs.empty() && aliases.empty())
+            return;
+
         /* what a call can REACH, not just what its callee's own body reads */
         ReadSets reads;
-        build_reachable_reads(top_funcs, global_decl_stmt, aliases,
+        build_reachable_reads(top_funcs, global_decl_stmt, aliases, structs,
                               /*unconditional_only=*/true, reads);
 
         for (size_t i = 0; i < rb->elems.size(); i++) {
