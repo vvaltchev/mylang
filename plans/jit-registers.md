@@ -1821,3 +1821,44 @@ multi-session conversion, and it buys NOTHING until a register's count
 hits zero - so it should be started only with that commitment, and step
 1 should be done first regardless since it is small and unblocks
 everything.
+
+
+## 2026-08-18 (k): step 1 DONE - lever A's protocol no longer names RAX
+
+`JitFwd::in_rax` -> `in_temp` + `in_reg`, plus `res_reg` on the
+producer side, mirroring the float twin that was generalised for the
+same reason (C4b inc 2, "no longer always xmm0"). `emit_fwd_bump` - the
+one function every consumer already calls exactly once, immediately
+before using the value - became the ADAPTER: it emits `mov rax, in_reg`
+when they differ, so all the consumer code below keeps its "it is in
+RAX" assumption while the PROTOCOL stops requiring it.
+
+Byte-identical (vdjcmp 108/108), because every producer still picks RAX.
+
+**PROVEN BY CONSTRUCTION, not by inspection.** A probe producer that
+hands its result over in RCX *and destroys RAX*:
+
+    adapter PRESENT   1923/1923
+    adapter REMOVED   1898/1923
+
+⛔ The FIRST version of that probe was VACUOUS and passed both ways: it
+COPIED to RCX and left RAX intact, so the adapter was never needed.
+A hand-over probe must kill the old register.
+
+### ⛔ AND IT FOUND A REAL LATENT DEFECT IN INCREMENTS 2 AND 3
+
+The TESTS-only counter bumps added in those increments use **RCX** as
+scratch and were emitted **before** `emit_fwd_bump` - so they would
+have destroyed exactly the register a future producer hands its value
+over in. Invisible today (in_reg is always RAX), fatal the moment it is
+not, and precisely the r9 shape: a latent clobber nothing exercises.
+The adapter now runs FIRST in all four converted paths, and the
+ordering is commented as reasoned rather than tried, since no test can
+currently observe it.
+
+### Next
+
+Step 2: convert emitters family by family to `alloc_scratch()`, vdjcmp
+byte-identical at each step, `scripts/regcensus.py` as the progress bar
+(RAX 399, RCX 222, RDX 118). Step 3: at a count of ZERO, admit that
+register and re-run the MAXPINS sweep. One at a time, never by analogy.

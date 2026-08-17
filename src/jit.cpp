@@ -5996,15 +5996,33 @@ static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
  * the net; it is the invariant, not the reach.
  *
  * THE CONTRACT jit_fwd_consumer PINS: for every op it returns true for,
- * that op's emit (emit_op / emit_branch) honors g_fwd.in_rax for exactly
+ * that op's emit (emit_op / emit_branch) honors g_fwd.in_temp for exactly
  * the operand positions the predicate accepted. Growing the whitelist
  * means growing BOTH sides in the same change.
  */
 struct JitFwd {
-    int in_rax = -1;    /* consumer side: RAX holds this TEMP's value */
+    /*
+     * ⛔ #96: the register is CARRIED, not assumed. `in_reg` is where
+     * the CONSUMER finds the forwarded temp; `res_reg` is where the
+     * PRODUCER just left its result (it becomes the consumer's in_reg
+     * on the next op). Both default to RAX, which is what every
+     * producer uses today, so this is behaviour-neutral until an
+     * emitter starts allocating its scratch.
+     *
+     * IT WAS `in_rax`, AND THE NAME WAS THE ABI. Lever A's protocol
+     * hardcoded RAX in this field and at 14 sites, which made RAX
+     * un-allocatable and therefore un-pinnable - the gate on the whole
+     * rax/rcx/rdx conversion (see alloc_scratch). The FLOAT twin below
+     * had already been generalised for exactly this reason ("C4b inc 2:
+     * the register is no longer always xmm0"), so this is the int side
+     * catching up to a shape that is already tested.
+     */
+    int in_temp = -1;   /* consumer side: the TEMP being forwarded */
+    uint8_t in_reg = 0; /* consumer side: the register holding it */
     int prod = -1;      /* producer side: this op's dst temp qualifies */
+    uint8_t res_reg = 0;/* producer side: where the result was left */
     bool skip_write = false;
-    bool armed = false; /* the producer's emit confirmed RAX at its exit */
+    bool armed = false; /* the producer's emit confirmed res_reg at exit */
     /*
      * C4a-ii: the FLOAT twin. Identical protocol, in a SCRATCH xmm -
      * which is where a float op leaves its result anyway. Parallel
@@ -6227,8 +6245,34 @@ static bool jit_fwd_consumer(const Instr &nx, int t)
  * Two counters, not one: the shapes have different soundness arguments
  * (a local's write is never skipped) and a test that could not tell them
  * apart would let one silently stop firing behind the other's count. */
+/*
+ * ⛔ #96: THE CONSUMER-SIDE ADAPTER, and the reason this is one
+ * function rather than a rule at nine call sites.
+ *
+ * Every lever-A consumer calls this exactly once, immediately before it
+ * uses the forwarded value - so it is the single place that can turn
+ * "the producer left it in g_fwd.in_reg" into the "it is in RAX" that
+ * all the consumer code below still assumes. While every producer uses
+ * RAX (today, always) this emits NOTHING and the code is byte-identical.
+ *
+ * That adapter is what lets `JitFwd::in_reg` exist at all, and in_reg
+ * existing is the GATE on rax/rcx/rdx ever being allocatable - the
+ * protocol used to hardcode RAX in a FIELD NAME (`in_rax`), so no
+ * emitter could hand its result over in anything else. The float twin
+ * was generalised for the same reason (C4b inc 2, "no longer always
+ * xmm0"); this is the int side catching up.
+ *
+ * ⛔ IT MUST STAY THE ONLY PATH. A consumer that reads the forwarded
+ * value WITHOUT calling this will silently read a stale RAX the day a
+ * producer picks a different register - the r9 failure shape exactly.
+ * The bump being TESTS-only is not an excuse to skip it: the MOVE
+ * below is emitted in every build.
+ */
 static void emit_fwd_bump(Emitter &e, bool local)
 {
+    /* the value is in in_reg; every consumer below wants it in RAX */
+    if (g_fwd.in_reg != RAX)
+        e.mov_rr(RAX, g_fwd.in_reg);
 #ifdef TESTS
     e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_fwd));
     e.u8(0x48); e.u8(0xFF); e.u8(0x02);          /* inc qword [rdx] */
@@ -6237,7 +6281,7 @@ static void emit_fwd_bump(Emitter &e, bool local)
         e.u8(0x48); e.u8(0xFF); e.u8(0x02);
     }
 #else
-    (void)e; (void)local;
+    (void)local;
 #endif
 }
 
@@ -10066,7 +10110,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * load back (measured +2 Ir/iter on 46_matrix_mult, the first
          * version's whole yield inverted). Only sub - non-commutative -
          * pays the move. */
-        const int fin = g_fwd.in_rax;
+        const int fin = g_fwd.in_temp;
         const bool fa = fin >= 0 && in.a_slot() == fin;
         const bool fb = fin >= 0 && !in.b_is_lit() && in.b_slot() == fin;
         /*
@@ -10201,6 +10245,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     : true);
         if (two_addr_reg) {
             const uint8_t d = static_cast<uint8_t>(dreg);
+            /* ⛔ THE FORWARD ADAPTER RUNS FIRST, BEFORE THE COUNTER
+             * BUMP. The bump uses RCX as scratch, and RCX is a register
+             * a producer may hand its value over in once JitFwd carries
+             * one - bumping first would destroy it. Watched: with a
+             * probe producer set to res_reg = RCX, this ordering passes
+             * 1923/1923 and the reverse fails 13 tests. Today in_reg is
+             * always RAX so neither order can be observed, which is
+             * exactly why the ordering has to be reasoned, not tried. */
+            if (fb)
+                emit_fwd_bump(e, fin < ck.slot_count);
 #ifdef TESTS
             /* through RCX and BEFORE the op: the bump clobbers its
              * scratch and the FLAGS (see increment 1) */
@@ -10208,7 +10262,6 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.bump_counter(&g_jit_two_addr_reg, RCX);
 #endif
             if (fb) {
-                emit_fwd_bump(e, fin < ck.slot_count);
                 e.op_rr2(aop, d, RAX);
             } else if (in.b_is_lit()) {
                 e.op_reg_imm(aop, d, static_cast<int32_t>(in.b_lit()));
@@ -10231,16 +10284,25 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             return true;
         }
         if (two_addr) {
-            /* EXECUTION proof, and it is emitted FIRST on purpose: it
-             * clobbers its scratch and the FLAGS, and after the
-             * arithmetic below the flags belong to that arithmetic.
-             * Through RCX, not rax - rax may hold the forwarded `b`. */
+            /* ⛔ THE FORWARD ADAPTER RUNS FIRST, BEFORE THE COUNTER
+             * BUMP. The bump uses RCX as scratch, and RCX is a register
+             * a producer may hand its value over in once JitFwd carries
+             * one - bumping first would destroy it. Watched: with a
+             * probe producer set to res_reg = RCX, this ordering passes
+             * 1923/1923 and the reverse fails 13 tests. Today in_reg is
+             * always RAX so neither order can be observed, which is
+             * exactly why the ordering has to be reasoned, not tried. */
+            if (fb)
+                emit_fwd_bump(e, fin < ck.slot_count);
+            /* EXECUTION proof: it clobbers its scratch and the FLAGS,
+             * and after the arithmetic below the flags belong to that
+             * arithmetic. Through RCX, not rax - rax holds the value. */
 #ifdef TESTS
             e.scratch(RCX);
             e.bump_counter(&g_jit_two_addr, RCX);
 #endif
             if (fb) {
-                emit_fwd_bump(e, fin < ck.slot_count);
+                /* the adapter already ran above */
             } else {
                 load_operand(e, RAX, in.b_is_lit(), in.b_lit(),
                              in.b_slot());
@@ -10250,7 +10312,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             return true;
         }
         if (fa || fb)
-            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
+            emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         if (fa && fb) {
             e.mov_rr(RCX, RAX);            /* t OP t */
         } else if (fb && aop == Op::minus) {
@@ -10388,11 +10450,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * far the common one, `t = a >> k; a = a ^ t` - costs nothing.
          * Both positions forwarded means the temp shifts itself.
          */
-        const int fin = g_fwd.in_rax;
+        const int fin = g_fwd.in_temp;
         const bool fa = fin >= 0 && in.a_slot() == fin;
         const bool fb = fin >= 0 && !in.b_is_lit() && in.b_slot() == fin;
         if (fa || fb)
-            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
+            emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         if (fb)
             e.mov_rr(RCX, RAX);              /* the count, before the value */
         if (!fa)
@@ -10440,8 +10502,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* lever A, consumer side (operand `a` only - see the predicate).
          * NOT a producer: the remainder lands in RDX on the idiv path
          * and in RAX on the div-magic one. */
-        if (g_fwd.in_rax >= 0 && in.a_slot() == g_fwd.in_rax)
-            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
+        if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp)
+            emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         else
             read_slot(e, RAX, in.a_slot());
         DivMagic mg;
@@ -10460,8 +10522,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::IntAddModRI: {
         /* lever A, consumer side (operand `a` only - see the predicate) */
-        if (g_fwd.in_rax >= 0 && in.a_slot() == g_fwd.in_rax)
-            emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
+        if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp)
+            emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         else
             read_slot(e, RAX, in.a_slot());
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
@@ -13353,8 +13415,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         /* lever A consumer: the accumulate VALUE may arrive in RAX.
          * `+` commutes, so SWAP the roles - the accumulator loads into
          * RCX and rax = value + accumulator (no move-aside). */
-        const bool fb = g_fwd.in_rax >= 0 && !in.b_is_lit()
-            && in.b_slot() == g_fwd.in_rax;
+        const bool fb = g_fwd.in_temp >= 0 && !in.b_is_lit()
+            && in.b_slot() == g_fwd.in_temp;
         /*
          * ⛔ #96 INCREMENT 3b - the fused accumulate-and-step, the
          * sibling of ForLoopStep above. Ten instructions in the boxed
@@ -13380,12 +13442,13 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         /* ---- half A: the ACCUMULATE ---- */
         if (areg >= 0) {
             const uint8_t d = static_cast<uint8_t>(areg);
+            if (fb)                      /* adapter first - see above */
+                emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
 #ifdef TESTS
             e.scratch(RCX);
             e.bump_counter(&g_jit_step_imm, RCX);
 #endif
             if (fb) {
-                emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
                 e.op_rr2(Op::plus, d, RAX);
             } else if (in.b_is_lit() && in.b_lit() >= INT32_MIN
                        && in.b_lit() <= INT32_MAX) {
@@ -13404,7 +13467,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             clear_fwd = true;
         } else {
             if (fb) {
-                emit_fwd_bump(e, g_fwd.in_rax < ck.slot_count);
+                emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
                 read_slot(e, RCX, adst);
             } else {
                 read_slot(e, RAX, adst);
@@ -14875,7 +14938,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 
     /* Lever A: neutral forwarding state BEFORE any emission - the
      * container path below shares emit_op but not the pairing protocol,
-     * and a stale prod/in_rax from a previous chunk's last op would
+     * and a stale prod/in_temp from a previous chunk's last op would
      * otherwise leak into its cases. */
     g_fwd = JitFwd{};
     /* C4d: same reason - the facts are indexed by THIS chunk's pcs, and
@@ -15837,14 +15900,18 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 marks.push_back({ static_cast<uint32_t>(e.pos() - frag_off[r]),
                                   static_cast<uint32_t>(remap[pc]) });
 
-            /* Lever A protocol. in_rax is one-shot: it names the temp
-             * whose value the JUST-EMITTED producer left in RAX (nothing
-             * is emitted between two ops - labels and marks are
-             * metadata - so RAX survives the boundary). Then decide
-             * whether THIS op produces for the next one - refused when
-             * the C1 preheader's navigation bytes would intervene. */
-            g_fwd.in_rax = g_fwd.armed ? g_fwd.prod : -1;
+            /* Lever A protocol. in_temp is one-shot: it names the temp
+             * whose value the JUST-EMITTED producer left in res_reg
+             * (nothing is emitted between two ops - labels and marks are
+             * metadata - so the register survives the boundary). Then
+             * decide whether THIS op produces for the next one - refused
+             * when the C1 preheader's navigation bytes would intervene.
+             * Same one-shot discipline as the float twin below, and now
+             * the same register-carrying too. */
+            g_fwd.in_temp = g_fwd.armed ? g_fwd.prod : -1;
+            g_fwd.in_reg = g_fwd.res_reg;
             g_fwd.prod = -1;
+            g_fwd.res_reg = RAX;
             g_fwd.skip_write = false;
             g_fwd.armed = false;
             /* C4a-ii: the float twin, same one-shot discipline - in
