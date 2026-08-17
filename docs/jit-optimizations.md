@@ -6207,3 +6207,48 @@ so IntAddStep alone is worth ~0.7% suite-wide. 01_while_loop 0.62x,
 NOTE 14_array_subscript reads 1.04x wall for -12.69% Ir: it is
 memory-bound, so removing instructions does not move it. The
 instruction-vs-time divergence again, in its ordinary form.
+
+## 2026-08-18 - the MAXPINS sweep, third run: the pool is the constraint
+
+After the whole operand-routing arc (increments 1, 2, 3, 3b). Self-test
+re-verified first: a non-binding cap is byte-identical on 108/108.
+
+**WHAT THE WHOLE POOL IS WORTH (cap 0 -> 7), across the arc:**
+
+    bench                 pre-arc   after 1+2      now
+    83_regs_int_40         +0.00%      -3.19%   -4.11%
+    80_regs_int_08         +0.00%     -12.44%  -16.19%
+    01_while_loop          -5.85%     -16.57%  -16.57%
+    07_nested_loops        -5.36%     -11.33%  -11.34%
+    14_array_subscript          -           -  -24.93%
+
+**MARGINAL, per additional pin, and this is the number that sizes the
+remaining work:**
+
+    83_regs_int_40   2..7  -0.91 -0.77 -0.62 -0.62 -0.63 -0.63 %
+    80_regs_int_08   2..7  -3.60 -3.11 -2.57 -2.64 -2.71 -2.78 %
+    01_while_loop    1,2   -8.28 -9.04 %, then flat (2 hot locals)
+    07_nested_loops  1,2   -8.50 -3.09 %, then flat
+    14_array_subscript 2,3 -12.47 -14.25 %, then flat (3 hot locals)
+
+⛔ **THE PRESSURE BENCHES STILL DO NOT PLATEAU AT 7, AND 80's MARGINAL
+IS RISING** - -2.57, -2.64, -2.71, -2.78 for pins 4,5,6,7. Every
+register handed out is worth MORE than the one before it, because each
+additional pinned slot removes a whole 4-instruction memory shape now
+instead of merely changing an addressing mode. 7 is the entire pool
+(MAX_CACHED 4 + MAX_XCACHED 3).
+
+**PROJECTION for the pool work.** 80_regs_int_08 has 8 accumulators
+plus a counter, so 7 pins leave 2 slots in memory: 7 -> 13 captures
+both, ~-5.6%. 83_regs_int_40 has 41 hot slots and each pin is worth
+-0.63%: 7 -> 13 projects ~-3.8%. Those are the numbers that justify
+the RAX/RCX/RDX scratch allocator (717 of 1016 unbracketed sites),
+which is the whole remaining cost of getting to 13.
+
+**AND THE SHAPE OF THE PLATEAUS IS THE CROSS-CHECK.** 01_while_loop
+flattens after 2 pins, 07_nested_loops after 2, 14_array_subscript
+after 3 - each exactly at its number of hot locals. A sweep that
+plateaued everywhere would be measuring something else; a sweep that
+plateaued nowhere would be suspicious. This one plateaus precisely
+where the program runs out of values to hold, which is what a correct
+marginal-value curve looks like.
