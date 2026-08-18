@@ -2245,7 +2245,26 @@ struct Emitter {
     { u8(0x80); u8(MODRM_SLOT | (7 << 3)); u32(uint32_t(d)); u8(imm); }
     /* cmp byte [rax+disp], imm8  (the SharedObject kind) */
     void cmp_byte_rax(int32_t d, uint8_t imm)
-    { u8(0x80); u8(0xB8); u32(uint32_t(d)); u8(imm); }
+    { cmp_byte_base(0 /* rax */, d, imm); }
+    /*
+     * cmp byte [base+disp], imm8 - the GENERIC form, the one to reach
+     * for. The two fixed-pair spellings it replaced (`cmp_byte_rcx`,
+     * and `cmp_byte_rax` above, which is now a thin alias kept only
+     * while the rax role is un-threaded) name their base register in
+     * the METHOD, so no audit that greps for the operand can see them
+     * - CLAUDE.md's sixth audit-table shape, which cost a day on r9.
+     */
+    void cmp_byte_base(uint8_t base, int32_t d, uint8_t imm)
+    {
+        ML_CHECK_MSG(base != 4 && base != 5,
+                     "cmp_byte_base: rsp/rbp need SIB / a different mod");
+        if (base >= 8)
+            u8(0x41);
+        u8(0x80);
+        u8(static_cast<uint8_t>(0x80 | (7 << 3) | (base & 7)));
+        u32(uint32_t(d));
+        u8(imm);
+    }
     /* mov <rcx|rdx>, [rax+disp]  (the flat vector's start/finish ptr) */
     /*
      * The per-op EXECUTION counter for an INLINED op (model-flip verify rule).
@@ -2417,11 +2436,6 @@ struct Emitter {
     /* jmp rel32 to a KNOWN (earlier) position - the prep retry loop */
     void jmp32_to(size_t target)
     { u8(0xE9); u32(static_cast<uint32_t>(target - (pos() + 4))); }
-    /* ---- #93, the inline nested-READ tier (rcx = a row LValue*) ---- */
-    void mov_rax_rcx_d(int32_t d)      /* mov rax, [rcx+disp] */
-    { u8(0x48); u8(0x8B); u8(0x81); u32(uint32_t(d)); }
-    void cmp_byte_rcx(int32_t d, uint8_t imm)  /* cmp byte [rcx+d], imm */
-    { u8(0x80); u8(0xB9); u32(uint32_t(d)); u8(imm); }
     /* movsd [rcx + r9*8], xmm0  (#94: the float element STORE) */
     /* ---- #95, the COMPOUND element store (read-modify-write) ----
      * The element rides the plan's `obj` register (the shobj is done with
@@ -10234,10 +10248,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
  *          then the ref-aware store_dst (the same dst path every int
  *          producer uses).
  *
- * Registers: rax scratch/element, rcx walks outer-data -> row -> inner
- * data, rdx byte-length/count, r9 the two indexes then the t_arr
- * immediate. rsi (t_int) and r8 (t_float) are RESERVED; no call on the
- * fast path, so nothing needs saving.
+ * Registers: the ElemRead ROLE SET, not fixed names - `obj` is the
+ * scratch/element, `data` walks outer-data -> &row -> inner data,
+ * `count` is the byte length / element count, `idx` is the caller's
+ * allocated index register carrying both levels' indexes in turn. No
+ * call on the fast path, so nothing needs saving.
  */
 static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
                                    const Chunk &ck,
@@ -10248,6 +10263,15 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
 {
     e.scratch(ir);            /* both level indices use it */
     const JitLayout &L = jit_layout();
+    /*
+     * The role set. `data` is a CURSOR here rather than a plain data
+     * pointer - outer data, then &row, then the row's own data - but it
+     * is one live value throughout, which is what a role is; `count` is
+     * the byte length at the outer level and the element count at the
+     * inner one, the same way the single-level tiers use it.
+     */
+    ElemRead r;
+    r.idx = ir;
     const SlotAddr base = slot_addr(in.target2);
     const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
     /* lever A producer (the int tails; the CALLER reloads RAX on the
@@ -10256,7 +10280,7 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
     const auto dst_write = [&]() {
         if (fw && g_fwd.skip_write)
             return;
-        store_dst(e, ck, RAX, in.target, pc);
+        store_dst(e, ck, r.obj, in.target, pc);
     };
 
     /* OUTER: array, general storage; a SLICE outer takes its arm (#95).
@@ -10266,57 +10290,59 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
     const JitHoist *H2 = hoist_match(in.target2, 2);
     const bool hoisted = H2 != nullptr;
     if (hoisted) {
-        load_slot_idx(e, ir, in.a_dual_lo());
-        e.imul_rr_imm8(ir, ir, static_cast<uint8_t>(sizeof(LValue)));
-        e.cmp_rr(ir, H2->rcount);               /* vs the BYTE length */
+        load_slot_idx(e, r.idx, in.a_dual_lo());
+        e.imul_rr_imm8(r.idx, r.idx, static_cast<uint8_t>(sizeof(LValue)));
+        e.cmp_rr(r.idx, H2->rcount);            /* vs the BYTE length */
         slows.push_back(e.j32(0x73));          /* jae: negative OR OOB */
-        e.mov_rr(RCX, H2->rdata);
-        e.add_rr(RCX, ir);                        /* rcx = &row (LValue) */
+        e.mov_rr(r.data, H2->rdata);
+        e.add_rr(r.data, r.idx);                  /* data = &row (LValue) */
     } else {
-    e.load(RAX, base.type);
-    e.cmp_reg_tag_via(RAX, L.t_arr, ir);
+    e.load(r.obj, base.type);
+    e.cmp_reg_tag_via(r.obj, L.t_arr, r.idx);
     decline_ne();
     e.cmp_byte_slot(base.payload + L.slice_off, 0);
     j_oslice = e.j32(0x75);                    /* -> the outer-slice arm */
-    e.load(RAX, base.payload);                 /* outer SharedObject */
-    e.cmp_byte_rax(L.kind_off, L.kind_general);
+    e.load(r.obj, base.payload);               /* outer SharedObject */
+    e.cmp_byte_base(r.obj, L.kind_off, L.kind_general);
     decline_ne();
 
     /* the row: data + oidx * sizeof(LValue), bounds by byte length */
-    e.load_base(RCX, RAX, L.data_off);
-    e.load_base(RDX, RAX, L.data_off + 8);
-    e.sub_rr(RDX, RCX);                           /* rdx = byte length */
-    load_slot_idx(e, ir, in.a_dual_lo());           /* the outer index (slot) */
-    e.imul_rr_imm8(ir, ir, static_cast<uint8_t>(sizeof(LValue)));
-    e.cmp_rr(ir, RDX);
+    e.load_base(r.data, r.obj, L.data_off);
+    e.load_base(r.count, r.obj, L.data_off + 8);
+    e.sub_rr(r.count, r.data);                    /* count = byte length */
+    load_slot_idx(e, r.idx, in.a_dual_lo());   /* the outer index (slot) */
+    e.imul_rr_imm8(r.idx, r.idx, static_cast<uint8_t>(sizeof(LValue)));
+    e.cmp_rr(r.idx, r.count);
     slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
-    e.add_rr(RCX, ir);                            /* rcx = &row (LValue) */
+    e.add_rr(r.data, r.idx);                      /* data = &row (LValue) */
     }
 
     /* ROW: an array; a SLICE row takes its arm (#95); the arms below
      * rejoin here, so `row_sec` is the common &row entry. */
     const size_t row_sec = e.pos();
-    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_type));
-    e.cmp_reg_tag_via(RAX, L.t_arr, ir);
+    e.load_base(r.obj, r.data, static_cast<int32_t>(L.off_type));
+    e.cmp_reg_tag_via(r.obj, L.t_arr, r.idx);
     decline_ne();
-    e.cmp_byte_rcx(static_cast<int32_t>(L.off_payload) + L.slice_off, 0);
+    e.cmp_byte_base(r.data,
+                    static_cast<int32_t>(L.off_payload) + L.slice_off, 0);
     const size_t j_rslice = e.j32(0x75);       /* -> the row-slice arm */
-    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_payload));  /* row shobj */
+    e.load_base(r.obj, r.data,
+                static_cast<int32_t>(L.off_payload));      /* row shobj */
 
-    const auto inner_idx_r9 = [&]() {
+    const auto inner_idx = [&]() {
         if (in.b_is_lit())
-            e.movabs(ir, static_cast<uint64_t>(in.b_lit()));
+            e.movabs(r.idx, static_cast<uint64_t>(in.b_lit()));
         else
-            load_slot_idx(e, ir, in.b_slot());
+            load_slot_idx(e, r.idx, in.b_slot());
     };
     const auto count_and_idx = [&](bool bytes) {
-        e.load_base(RCX, RAX, L.data_off);
-        e.load_base(RDX, RAX, L.data_off + 8);
-        e.sub_rr(RDX, RCX);
+        e.load_base(r.data, r.obj, L.data_off);
+        e.load_base(r.count, r.obj, L.data_off + 8);
+        e.sub_rr(r.count, r.data);
         if (!bytes)
-            e.sar_rr_imm8(RDX, 3);
-        inner_idx_r9();
-        e.cmp_rr(ir, RDX);
+            e.sar_rr_imm8(r.count, 3);
+        inner_idx();
+        e.cmp_rr(r.idx, r.count);
         slows.push_back(e.j32(0x73));
     };
     const auto bump = [&]() {
@@ -10330,18 +10356,18 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
          * - the helper's own behaviour (the mixed-rows shape:
          * `[[1.0,2.0],[3,4]]` joins to float while one row's storage
          * stays flat INT). */
-        e.cmp_byte_rax(L.kind_off, L.kind_floats);
+        e.cmp_byte_base(r.obj, L.kind_off, L.kind_floats);
         const size_t j_frow = e.j32(0x74);
-        e.cmp_byte_rax(L.kind_off, L.kind_ints);
+        e.cmp_byte_base(r.obj, L.kind_off, L.kind_ints);
         decline_ne();
         count_and_idx(/*bytes=*/false);
-        e.cvtsi2sd_elem(0, RCX, ir);                  /* xmm0 = (double)elem */
+        e.cvtsi2sd_elem(0, r.data, r.idx);       /* xmm0 = (double)elem */
         bump();
         emit_float_store(e, ck, X0, in.target, pc);
         dones.push_back(e.jmp32());
         e.patch32_here(j_frow);
         count_and_idx(/*bytes=*/false);
-        e.load_elem_sd(0, RCX, ir);                   /* xmm0 = [rcx + r9*8] */
+        e.load_elem_sd(0, r.data, r.idx);        /* xmm0 = [data + idx*8] */
         bump();
         emit_float_store(e, ck, X0, in.target, pc);
         dones.push_back(e.jmp32());
@@ -10351,21 +10377,21 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
     /* INT semantics accept flat ints AND flat bools, exactly as the
      * single-level emit_elem_int_read does (a bool node is stamped `i`).
      * A bool row stores ONE byte per element - byte count, byte read. */
-    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    e.cmp_byte_base(r.obj, L.kind_off, L.kind_ints);
     const size_t j_ints = e.j32(0x74);
-    e.cmp_byte_rax(L.kind_off, L.kind_bools);
+    e.cmp_byte_base(r.obj, L.kind_off, L.kind_bools);
     decline_ne();
     count_and_idx(/*bytes=*/true);
-    /* movzx eax, [rcx + r9] */
-    e.load_elem_zx8(RAX, RCX, ir);
+    /* movzx obj32, [data + idx] */
+    e.load_elem_zx8(r.obj, r.data, r.idx);
     bump();
     dst_write();
     dones.push_back(e.jmp32());
 
     e.patch32_here(j_ints);
     count_and_idx(/*bytes=*/false);
-    /* rax = [rcx + r9*8] */
-    e.load_elem_q(RAX, RCX, ir);
+    /* obj = [data + idx*8] */
+    e.load_elem_q(r.obj, r.data, r.idx);
     bump();
     dst_write();
     dones.push_back(e.jmp32());
@@ -10378,18 +10404,18 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
      */
     if (j_oslice != SIZE_MAX) {
     e.patch32_here(j_oslice);
-    e.load(RAX, base.payload);
-    e.cmp_byte_rax(L.kind_off, L.kind_general);
+    e.load(r.obj, base.payload);
+    e.cmp_byte_base(r.obj, L.kind_off, L.kind_general);
     decline_ne();
-    e.load_base(RCX, RAX, L.data_off);                 /* data, before rax dies */
-    e.load32_slot(RDX, base.payload + L.arr_len_off);
-    load_slot_idx(e, ir, in.a_dual_lo());
-    e.cmp_rr(ir, RDX);
+    e.load_base(r.data, r.obj, L.data_off);      /* data, before obj dies */
+    e.load32_slot(r.count, base.payload + L.arr_len_off);
+    load_slot_idx(e, r.idx, in.a_dual_lo());
+    e.cmp_rr(r.idx, r.count);
     slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
-    e.load32_slot(RAX, base.payload + L.arr_off_off);
-    e.add_rr(ir, RAX);                            /* oidx += off */
-    e.imul_rr_imm8(ir, ir, static_cast<uint8_t>(sizeof(LValue)));
-    e.add_rr(RCX, ir);                            /* rcx = &row */
+    e.load32_slot(r.obj, base.payload + L.arr_off_off);
+    e.add_rr(r.idx, r.obj);                       /* oidx += off */
+    e.imul_rr_imm8(r.idx, r.idx, static_cast<uint8_t>(sizeof(LValue)));
+    e.add_rr(r.data, r.idx);                      /* data = &row */
     e.jmp32_to(row_sec);
     }
 
@@ -10400,25 +10426,28 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
      * arm; those decline to the helper).
      */
     e.patch32_here(j_rslice);
-    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_payload));  /* row shobj */
-    e.cmp_byte_rax(L.kind_off,
-                   is_float ? L.kind_floats : L.kind_ints);
+    e.load_base(r.obj, r.data,
+                static_cast<int32_t>(L.off_payload));      /* row shobj */
+    e.cmp_byte_base(r.obj, L.kind_off,
+                    is_float ? L.kind_floats : L.kind_ints);
     decline_ne();
-    e.load32_base(RDX, RCX, static_cast<int32_t>(L.off_payload) + L.arr_len_off);
-    inner_idx_r9();
-    e.cmp_rr(ir, RDX);
+    e.load32_base(r.count, r.data,
+                  static_cast<int32_t>(L.off_payload) + L.arr_len_off);
+    inner_idx();
+    e.cmp_rr(r.idx, r.count);
     slows.push_back(e.j32(0x73));
-    e.load32_base(RDX, RCX, static_cast<int32_t>(L.off_payload) + L.arr_off_off);
-    e.add_rr(ir, RDX);                            /* iidx += off */
-    e.load_base(RCX, RAX, L.data_off);                 /* rcx = row data */
+    e.load32_base(r.count, r.data,
+                  static_cast<int32_t>(L.off_payload) + L.arr_off_off);
+    e.add_rr(r.idx, r.count);                     /* iidx += off */
+    e.load_base(r.data, r.obj, L.data_off);       /* data = row data */
 #ifdef TESTS
     e.bump_counter(&g_jit_elem_slice_fast);
 #endif
     if (is_float) {
-        e.load_elem_sd(0, RCX, ir);
+        e.load_elem_sd(0, r.data, r.idx);
         emit_float_store(e, ck, X0, in.target, pc);
     } else {
-        e.load_elem_q(RAX, RCX, ir);
+        e.load_elem_q(r.obj, r.data, r.idx);
         dst_write();
     }
     dones.push_back(e.jmp32());
@@ -10530,19 +10559,22 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     e.add_rr(sc.data, sc.idx);
 
     /* ROW: an array, not const, not readonly */
-    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_type));
+    e.load_base(sc.obj, RCX, static_cast<int32_t>(L.off_type));
     e.movabs(sc.idx, reinterpret_cast<uint64_t>(L.t_arr));
     e.cmp_rr(sc.obj, sc.idx);
     decline_ne();
-    e.cmp_byte_rcx(L.lv_const_off, 0);
+    e.cmp_byte_base(RCX, L.lv_const_off, 0);
     decline_ne();
-    e.mov_rax_rcx_d(static_cast<int32_t>(L.off_payload));  /* row shobj */
+    e.load_base(sc.obj, RCX,
+                static_cast<int32_t>(L.off_payload));   /* row shobj */
     e.cmp_byte_rax(L.ro_off, 0);
     decline_ne();
 
     /* the row's COW pair -> prep; every arm shares one stub */
     const auto cow_guards = [&]() {
-        e.cmp_byte_rcx(static_cast<int32_t>(L.off_payload) + L.slice_off, 0);
+        e.cmp_byte_base(RCX,
+                        static_cast<int32_t>(L.off_payload) + L.slice_off,
+                        0);
         preps.push_back(e.j32(0x75));
         e.cmp_byte_rax(L.slices_off, 0);
         preps.push_back(e.j32(0x75));
