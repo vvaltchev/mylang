@@ -12960,19 +12960,25 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.load(RAX, base.payload);               /* rax = shobj */
             e.cmp_byte_rax(L.kind_off, L.kind_bools);/* flat bools? */
             e.bail_unless(0x74, pc);
-            e.load_base(RCX, RAX, L.data_off);               /* rcx = _M_start */
-            e.load_base(RDX, RAX, L.data_off + 8);           /* rdx = _M_finish */
-            e.sub_rr(RDX, RCX);                         /* rdx = count (1B elems,
-                                                      * so NO sar - unlike the
-                                                      * 8-byte int/float path) */
-            load_index_idx(e, ir, in);                    /* cache-aware index */
-            e.cmp_rr(ir, RDX);
+            ElemRead r; r.idx = ir;
+            e.load_base(r.data, r.obj, L.data_off);      /* _M_start   */
+            e.load_base(r.count, r.obj, L.data_off + 8); /* _M_finish  */
+            e.sub_rr(r.count, r.data);            /* count (1B elems, so NO
+                                                   * sar - unlike the 8-byte
+                                                   * int/float path) */
+            load_index_idx(e, r.idx, in);            /* cache-aware index */
+            e.cmp_rr(r.idx, r.count);
             e.bail_unless(0x72, pc);                 /* jb: unsigned in-range */
-            /* movzx eax,[rcx+r9] */
-            e.load_elem_zx8(RAX, RCX, ir);
-            e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_bool));
-            e.store_rcx_slot(dst.type);              /* a REAL bool, not 0/1 */
-            e.store_rax_slot(dst.payload);
+            e.load_elem_zx8(r.obj, r.data, r.idx);
+            /* ⛔ #96: the tag through the SEAM, not by hand. This was
+             * `movabs RCX, t_bool; store_rcx_slot(...)` - the exact
+             * store_dst_bool shape that shipped a wrong answer once a
+             * register stopped being loaded. store_type_tag_via emits an
+             * imm32 when the arena placed t_bool low (so it names NO
+             * register at all, 17 bytes -> 11) and builds it in the
+             * scratch only on the fallback path. */
+            e.store_type_tag_via(dst.type, L.t_bool, RCX);
+            e.store_rax_slot(dst.payload);           /* a REAL bool, not 0/1 */
             return true;
         }
         goto foreach_load_helper;
