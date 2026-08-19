@@ -1,0 +1,53 @@
+# The FUSED nested read `base[i][j]` (LoadElem2Int / LoadElem2Float) and
+# every arm of its inline tier: int rows, bool rows, float rows, an INT
+# row promoting under the float op, a SLICE outer, and SLICE rows.
+#
+# ⛔ WHY THIS FILE EXISTS. Until 2026-08-19 the vdjcmp corpus (bench/my
+# + samples + tests/functional) emitted LoadElem2Float in exactly ZERO
+# programs, so the byte-identity oracle - the thing an emitter refactor
+# is verified with - covered NEITHER float arm NOR the row-slice arm of
+# a tier that ships. The `elem2:` cases in tests.cpp run in-process and
+# are invisible to vdjcmp, which is the gap: an in-process test proves
+# the VALUES, only a corpus program proves the BYTES.
+#
+# ⛔ AND THE OUTER INDEX MUST VARY WITH THE INNER LOOP. Written the
+# natural way - `m[r][c]` in a c-loop - LICM hoists the row above the
+# loop and no fused op is emitted at all; 05_elem_tiers.my has exactly
+# that shape and reaches this tier never. Hence `m[c][r]` throughout.
+
+var n = 12;
+var mi = []; var mf = []; var mb = []; var ms = []; var mfs = [];
+for (var i = 0; i < n; i++) {
+    var ri = []; var rf = []; var rb = []; var rw = []; var rfw = [];
+    for (var j = 0; j < n + 4; j++) {
+        push(ri, i * 100 + j);
+        push(rf, (i * 100 + j) * 0.5);
+        push(rb, (i + j) % 3 == 0);
+        push(rw, i * 10 + j);
+        push(rfw, (i * 10 + j) * 0.25);
+    }
+    push(mi, ri);
+    push(mf, rf);
+    push(mb, rb);
+    push(ms, rw[2:n + 2]);            # a SLICE row (int)
+    push(mfs, rfw[2:n + 2]);          # a SLICE row (float)
+}
+var subi = mi[1:n];                   # a SLICE outer over general rows
+var subf = mf[1:n];                   # the same, read under the FLOAT op
+
+var si = 0; var sb = 0; var ssl = 0;
+var sf = 0.0; var sp = 0.0; var srs = 0.0; var sis = 0; var sos = 0.0;
+for (var i = 0; i < n - 2; i++) {
+    for (var j = 0; j < n - 2; j++) {
+        si  += mi[j][i];              # int row
+        sb  += mb[j][i];              # bool row (byte count, byte read)
+        ssl += subi[j][i];            # slice outer -> general row
+        sis += ms[j][i];              # slice row, int
+        sf  += mf[j][i];              # float row
+        sp  += mi[j][i] * 1.0;        # int row PROMOTES under the float op
+        srs += mfs[j][i];             # slice row, float
+        sos += subf[j][i];            # slice OUTER under the float op
+    }
+}
+print("elem2:", si, sb, ssl, sis, sis + si,
+      str(sf, 2), str(sp, 2), str(srs, 2), str(sos, 2));

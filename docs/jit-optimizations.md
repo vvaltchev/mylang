@@ -6680,3 +6680,137 @@ one PLATFORM can see is one no local lane will find**, the sibling of
 `LTO=0`'s "a warning only one build configuration can see is a warning
 nobody sees" and of the plain-`OPT=1` break found the same day. Both
 were caught by CI; both should have been caught before the push.
+
+## 2026-08-19 - TWO SHIPPED JIT BUGS, both found by ONE new corpus file
+
+Neither is a #96 regression. Both were sitting in the tree, both were
+invisible to `-rt`, `corpus_diff`, all four fuzzers and `vdjcmp`, and
+both were found within a minute of adding
+`tests/functional/16_elem2_fused.my` - a file written for an
+INFRASTRUCTURE reason, to close a hole in the byte-identity oracle's
+CORPUS. That is the whole entry: the coverage hole in the instrument
+was also a coverage hole in the correctness net, and closing the first
+closed the second.
+
+### The hole
+
+`scripts/vdjcmp.sh` compares emitted code over bench/my + samples +
+tests/functional. Of those 109 programs, **zero emitted
+`LoadElem2Float`** - so neither float arm of the fused nested read, nor
+its row-slice arm, was covered by the oracle every emitter refactor is
+verified with. The `elem2:` cases in tests.cpp do exercise them, but
+they run IN-PROCESS: an in-process test proves the VALUES, only a corpus
+program proves the BYTES.
+
+`05_elem_tiers.my` looks like it covers this and does not. It reads
+`m[r][c]` in a `c` loop, so the row is loop-invariant, LICM hoists it,
+and no fused op is emitted at all. **The outer index has to vary with
+the INNER loop** or this tier is unreachable - the vacuous-test trap,
+in the exact clothes CLAUDE.md lists.
+
+### Bug 1 - a slice read the WRONG ELEMENT under the float op
+
+`emit_load_elem2_inline` ended its float branch with `return`. The two
+SLICE arms are emitted after it, so on the float path `j_oslice` and
+`j_rslice` - forward `jne rel32`s already written into the fragment
+with a 0 placeholder - were **never patched**. An unpatched
+`jne rel32=0` neither declines nor faults: it falls through into the
+NON-slice path, which reads the slice's shared object (its PARENT's
+storage) and indexes it without the slice's `off`.
+
+    var r = []; ...; push(mfs, r[2:14]);
+    for i, j:  srs += mfs[j][i];
+
+    -tw  1287.50      -nj  1287.50      jit  1237.50
+
+- `off` too small on every element, at BOTH levels (a slice outer read
+the wrong ROW the same way), under the float op only. An `if`/`return`
+where an `if`/`else` was meant. The int twin patches both arms and was
+always correct, which is exactly why the shapes read as covered.
+
+Fixed by making it an `else`. The counters confirm the diagnosis rather
+than merely the values: `elem_slice_fast` goes 100 -> 200 on the new
+test (the float slice row now takes the slice arm) while `elem2_fast`
+drops by the same 100 (it was being counted by the arm it wrongly fell
+into).
+
+### Bug 2 - a rel8 jump span that GROWS WITH THE PIN BUDGET
+
+Adding one more accumulator to the new test turned it into an abort:
+
+    Assertion `d >= -128 && d <= 127' failed   (Emitter::patch8)
+
+`emit_ref_check` returned a SHORT `jb`, and all three of its callers
+put a helper call between that jump and its patch. A call carries the
+whole `emit_call_prologue`/`emit_call_epilogue` bracket, **whose length
+is the number of live caller-saved pins** - the quantity #96 exists to
+increase. So this was dormant at a small budget and became reachable as
+the budget grew: it aborts from `MYLANG_JIT_MAXPINS=8` up, and is
+CLEAN at 4 and 6.
+
+**At `ASSERTS=0` there is no abort at all** - the displacement
+truncates and the jump lands inside an instruction. The shipping
+release configuration is the one with no net.
+
+`patch8`'s own comment had named this hazard, precisely, for a year:
+*"use j32 for any span that can grow (an exit_pc carries an N5 flush, a
+helper call its whole prologue/epilogue)"*. It was a comment, so
+nothing enforced it, and the one site that broke it was written anyway.
+
+### Why no audit could have found bug 2, and what replaces the audit
+
+A script that reads the source between each `j8` and its `patch8`
+looking for a call reports **"0 calls in span" for the site that
+crashes** - because the call is not written there. It is inside
+`emit_put_int_call`, one function call away. Same shape as a register
+hidden in a method name (the sixth audit-table shape): the thing being
+audited for is behind a NAME, so a text scan cannot see it.
+
+The check therefore lives in the EMITTER, not in a script.
+`Emitter::n_prologues` counts the call prologues emitted; `j8` records
+the count at the jump; `patch8` requires it to be unchanged and says
+so by name. Debug-only (`#ifndef NDEBUG`), so a release build has
+neither member.
+
+**It fires on `samples/gcd`.** Reintroduce the short jump and the
+smallest sample in the repo aborts immediately, and `-rt` dies on its
+first JIT test - where the real defect needed a program big enough to
+push one span past 127 bytes AND a pin budget of 8 or more. That is
+the property to want: the guard triggers on the SHAPE, not on the
+shape plus a size coincidence.
+
+### Cost - and a THIRD instrument failure, in the measurement itself
+
+The fix makes three `jb`s near instead of short: +4 bytes at each
+ref-listed scalar store's cold-arm entry, so 108 of 109 corpus
+programs' emitted code changed. Ir at `OPT=1 ASSERTS=0`, callgrind,
+scale 1:
+
+    01_while_loop +0.003%   03_int_arith +0.001%   43_sieve +0.001%
+    14_array_subscript +0.002%   46_matrix_mult +0.002%
+    58_structs +0.001%   64_struct_create +0.001%
+
+i.e. nothing, and necessarily so: `jb rel8` and `jb rel32` are both ONE
+instruction, so only the once-per-compile emission cost moves. A
+restructure that puts the fast arm first would recover ~1 byte; it is
+an OPTIMIZATION and is deliberately not bundled with a correctness fix.
+
+⛔ **THE FIRST VERSION OF THAT TABLE READ +1.67% ON 46_matrix_mult, AND
+IT WAS A STALE BUILD DIRECTORY.** `build-claude/perf` existed from an
+earlier session, built with different flags; `make BUILD_DIR=...` does
+not rebuild on a flag change, so the "current" binary was partly
+someone else's configuration. The tell was that the number made no
+sense - the emitted instruction SEQUENCE was identical, 3322 lines
+each, and identical code cannot execute more instructions - and
+chasing it found the stale binary emitting the REGISTER tag form (9
+`movabs r9, <array-tag>` where the clean build emits `cmp rax,
+<array-tag>` as an imm32). Clean-built, the delta is the table above.
+
+**RULE B1 covers `build/` and a forgotten `--mylang`; it does not
+cover a REUSED `build-claude/<lane>` whose flags have changed, which
+is the same failure with the same signature - a plausible number
+measured from the wrong subject.** Build measurement lanes FRESH
+(`rm -rf` first), on both sides, and delete them when the measurement
+is done. Note also that the debug pair was byte-identical throughout,
+so `vdjcmp` on debug binaries would never have shown this: the stale
+artifact was release-only.
