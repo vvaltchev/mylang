@@ -1,0 +1,51 @@
+# The nested COMPOUND divide/modulo `m[j][i] /= d` and its cold divisor
+# gate - the arm that must decline `d == 0` and `INT_MIN / -1` to the
+# helper so they raise a CATCHABLE DivisionByZeroEx.
+#
+# ⛔ WHY THIS FILE EXISTS. That gate was five hand-encoded byte
+# sequences naming `rdi` (the divisor) and `r9` (the index) LITERALLY,
+# while both are ALLOCATED ElemScratch roles that `pick()` moves off
+# their preferred registers whenever those are pinned - which happens in
+# ordinary programs. With a role moved, the gate tested a register that
+# does not hold the divisor and `/= 0` reached the native `idiv`:
+#
+#     -tw  DivisionByZeroEx (caught)     -nj  DivisionByZeroEx (caught)
+#     jit  SIGFPE, exit 136
+#
+# RULE 1 and RULE 2 at once, and a crash on a valid program. The r9
+# class exactly: a register named where no audit for the register can
+# see it.
+#
+# ⛔ THE EIGHT ACCUMULATORS ARE LOAD-BEARING, NOT PADDING. They put the
+# pin pool under enough pressure that the allocator actually moves a
+# role; with two or three of them the roles stay on rdi/r9 and this
+# file passes with the defect in. Keep the count at or above the pin
+# budget, and keep the loop bound RUNTIME (a literal bound lowers to a
+# different loop form).
+
+var n = 16;
+var m = [];
+for (var i = 0; i < n; i++) {
+    var r = [];
+    for (var j = 0; j < n; j++) { push(r, (i + 1) * 1000 + j * 7 + 13); }
+    push(m, r);
+}
+var a0=0; var a1=0; var a2=0; var a3=0; var a4=0; var a5=0; var a6=0; var a7=0;
+var caught = 0;
+var mods = 0;
+for (var i = 0; i < n; i++) {
+    for (var j = 0; j < n; j++) {
+        var d = 3;
+        if (i == 9 && j == 9) { d = 0; }        # the zero divisor
+        if (i == 4 && j == 6) { d = -1; }       # the -1 divisor
+        try { m[j][i] /= d; } catch (DivisionByZeroEx) { caught = caught + 1; }
+        var e = 5;
+        if (i == 2 && j == 7) { e = 0; }
+        try { mods += m[j][i] % e; } catch (DivisionByZeroEx) { mods += 1; }
+        a0 += i; a1 += j; a2 += i*2; a3 += j*3;
+        a4 += i+j; a5 += i-j; a6 += i^j; a7 += i|j;
+    }
+}
+var s = 0;
+for (var i = 0; i < n; i++) { for (var j = 0; j < n; j++) { s += m[i][j]; } }
+print("elem2dm:", s, caught, mods, a0+a1+a2+a3+a4+a5+a6+a7);
