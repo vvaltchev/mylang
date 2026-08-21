@@ -53,6 +53,25 @@ by grepping, and both of which pointed at the WRONG register:
     call sites are counted. A NEW fixed-pair wrapper is therefore
     counted the day it is written, with no edit here.
 
+    4. A REGISTER SPELLED INTO A modrm BYTE IS INVISIBLE TO EVERY ONE
+    OF THE ABOVE. Corrections 1-3 all assume the register appears as a
+    NAME somewhere - an operand, a method, an alias. It does not have
+    to:
+
+        e.u8(0x48); e.u8(0x8B); e.u8(0x00);   /* mov rax, [rax]     */
+        e.u8(0x8B);  e.u8(0x89);              /* mov ecx, [rcx+...] */
+        e.u8(0x4A); e.u8(0x8D); e.u8(0x14); e.u8(0xCA);
+                                              /* lea rdx,[rdx+r9*8] */
+
+    - the register is in the ENCODING. This is not hypothetical: the
+    third of those shipped a SIGFPE (2026-08-19), because `r9` there is
+    an ALLOCATED role the allocator moves, and no scan for r9 could see
+    the site. Decoding modrm here would be a disassembler, and a
+    half-right one is worse than none - so this script does the other
+    thing an instrument may do, and SAYS IT DOES NOT KNOW: it counts the
+    raw emissions and prints them as an explicit blind spot above the
+    table. Convert them to a generic encoder and the number falls.
+
 The output is a lower bound on the work, not an upper one: an
 unbracketed site may still turn out to be an ABI setup whose bracket
 this scan cannot see, and an accessor's IMPLICIT operands are invisible
@@ -178,6 +197,17 @@ def scrub(s):
     return ''.join(out)
 
 
+RAW_INSN = re.compile(r'\b\w+\.?u8\(0x[0-9A-Fa-f]+\)\s*;\s*'
+                      r'\w*\.?u8\(0x[0-9A-Fa-f]+\)')
+
+
+def raw_encodings(lines):
+    """Lines that emit two or more literal bytes in a row - a
+    hand-encoded instruction, whose register operands live in the
+    modrm/SIB bytes and are therefore invisible to every count below."""
+    return [i + 1 for i, l in enumerate(lines) if RAW_INSN.search(l)]
+
+
 def census(path):
     raw = open(path).read()
     lines = scrub(raw).split('\n')
@@ -204,6 +234,7 @@ def census(path):
             decl_line[i] = m.group(1)
 
     res = {MERGE.get(r, r): {'br': 0, 'un': 0, 'lines': []} for r in REGS}
+    res['__raw__'] = raw_encodings(lines)
     for i, l in enumerate(lines):
         if 'enum Reg' in l:
             continue
@@ -252,6 +283,14 @@ def main():
             print("  %-24s %s" % (name, ' '.join(sorted(acc[name]))))
         print()
 
+    raw = res.pop('__raw__')
+    if raw:
+        print("⛔ BLIND SPOT: %d line(s) emit a hand-encoded instruction "
+              "(two or more\n   literal bytes in a row). Their register "
+              "operands are in the modrm/SIB\n   bytes, so EVERY count "
+              "below misses them - the table is a LOWER BOUND.\n"
+              "   `scripts/regcensus.py --raw` lists them.\n" % len(raw))
+
     print("hardcoded scratch registers in src/jit.cpp "
           "(code only; comments/strings removed)\n")
     print("%-6s %10s %13s %7s   %s"
@@ -267,6 +306,11 @@ def main():
     print("\nonly the UNbracketed column is work: a use between "
           "emit_call_prologue\nand emit_call_epilogue cannot disturb a pin "
           "(the prologue spilled it).")
+
+    if '--raw' in sys.argv:
+        print("\n=== hand-encoded instructions (%d) ===" % len(raw))
+        for n_ in raw:
+            print("%6d: %s" % (n_, rawl[n_ - 1].strip()[:92]))
 
     for r in REPORT:
         if not (show_all or r in want):
