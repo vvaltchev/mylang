@@ -110,7 +110,7 @@ def objdump_lens(blob):
     try:
         r = subprocess.run(['objdump', '-D', '-b', 'binary',
                             '-m', 'i386:x86-64', '-M', 'intel',
-                            '--insn-width=16', name],
+                            '-w', '--insn-width=16', name],
                            capture_output=True, text=True)
     finally:
         os.unlink(name)
@@ -123,26 +123,35 @@ def objdump_lens(blob):
     # first version of this script printed them as decoder bugs. An
     # instrument's first run should be assumed to be measuring itself.
     #
-    starts = []
+    #
+    # ⛔ WRAPPING IS PREVENTED, AND THEN CHECKED FOR. `-w` (--wide) plus
+    # --insn-width=16 keep every instruction on one line. Without them
+    # objdump splits a long one and gives the overflow bytes their OWN
+    # `offset:` line with an EMPTY mnemonic - which cost this script two
+    # rounds of false positives, both of which ACCUSED THE DECODER (a
+    # 10-byte movabs read as 7, on 206 fragments).
+    #
+    # So a continuation line is not skipped, it is COUNTED and reported.
+    # Silently tolerating it would leave the script working by accident
+    # on an objdump whose wrapping the flags failed to suppress - the
+    # workaround-in-the-consumer trap, one level up. If this ever fires
+    # the ORACLE is misconfigured, which is a different verdict from
+    # "the decoder is wrong", and the exit code says so.
+    #
+    starts, wrapped = [], 0
     for line in r.stdout.split('\n'):
         m = OBJD.match(line)
-        #
-        # ⛔ AND A CONTINUATION LINE IS NOT AN INSTRUCTION. When objdump
-        # wraps, the overflow bytes get their OWN `offset:` line with an
-        # EMPTY mnemonic - which the offset-difference fix above duly
-        # counted as an instruction start, so a 10-byte movabs still
-        # read as 7. Second false alarm from the same wrap, and both
-        # accused the decoder. `--insn-width=16` above stops the
-        # wrapping; this stays as the belt to that braces.
-        #
-        if not m or not m.group(3).strip():
+        if not m:
+            continue
+        if not m.group(3).strip():
+            wrapped += 1
             continue
         starts.append((int(m.group(1), 16), m.group(3)))
     res = {}
     for i, (off, mn) in enumerate(starts):
         end = starts[i + 1][0] if i + 1 < len(starts) else len(blob)
         res[off] = (end - off, mn)
-    return res
+    return res, wrapped
 
 
 # Operand spellings the two tools deliberately disagree on. We compare
@@ -159,7 +168,7 @@ def norm(s):
 
 
 def check(binary, env, files, verbose):
-    bad_len = bad_mn = insns = frag_n = 0
+    bad_len = bad_mn = insns = frag_n = wraps = 0
     for path in files:
         fs = frags(binary, path, env)
         if fs is None:
@@ -168,7 +177,8 @@ def check(binary, env, files, verbose):
             frag_n += 1
             base = ins[0][0]
             blob = b''.join(bytes.fromhex(b) for _, b, _ in ins)
-            od = objdump_lens(blob)
+            od, wr = objdump_lens(blob)
+            wraps += wr
             for i, (off, hx, mn) in enumerate(ins):
                 insns += 1
                 rel = off - base
@@ -190,7 +200,7 @@ def check(binary, env, files, verbose):
                     if verbose or bad_mn <= 20:
                         print("MNEMONIC %s +%d: {%s} we %-28r objdump %r"
                               % (path, off, hx, mn, omn))
-    return bad_len, bad_mn, insns, frag_n
+    return bad_len, bad_mn, insns, frag_n, wraps
 
 
 def main():
@@ -202,6 +212,14 @@ def main():
         return 2
     binary = args[0]
     verbose = '-v' in sys.argv
+    try:
+        subprocess.run(['objdump', '--version'], capture_output=True)
+    except FileNotFoundError:
+        print("error: objdump not found. This script's whole point is to "
+              "compare\n       our decoder against an INDEPENDENT one; "
+              "without it there is no\n       check to run. Install "
+              "binutils.", file=sys.stderr)
+        return 2
     files = corpus()
 
     envs = [({}, 'default')]
@@ -212,18 +230,28 @@ def main():
         for p in (4, 6, 8, 10, 11):
             envs.append(({'MYLANG_JIT_MAXPINS': str(p)}, 'maxpins=%d' % p))
 
-    tl = tm = ti = tf = 0
+    tl = tm = ti = tf = tw = 0
     for env, name in envs:
-        bl, bm, n, fn = check(binary, env, files, verbose)
+        bl, bm, n, fn, wr = check(binary, env, files, verbose)
         print("%-12s %6d insns in %4d frags   boundary-errors %d   "
-              "mnemonic-errors %d" % (name, n, fn, bl, bm))
+              "mnemonic-errors %d%s"
+              % (name, n, fn, bl, bm,
+                 "   ⛔ %d WRAPPED objdump lines" % wr if wr else ""))
         tl += bl
         tm += bm
         ti += n
         tf += fn
+        tw += wr
 
     print("\nTOTAL %d instructions, %d fragments" % (ti, tf))
     print("  boundary errors: %d   mnemonic errors: %d" % (tl, tm))
+    if tw:
+        print("\n⛔ objdump WRAPPED %d instruction(s) across lines despite "
+              "-w and\n   --insn-width=16. The comparison below cannot be "
+              "trusted: a wrapped\n   line parses as a second, empty "
+              "instruction. THE ORACLE is misconfigured,\n   not the "
+              "decoder - fix the objdump invocation." % tw, file=sys.stderr)
+        return 2
     if tl or tm:
         print("\n⛔ the disassembler DISAGREES with objdump. A boundary "
               "error means\n   every mnemonic after it in that fragment "
