@@ -6944,3 +6944,80 @@ work. 33 of 111 corpus programs' emitted code changed on-arena, 26 off.
 they never reach this op at all. The benches that move are the `dyn`
 ones - which is the reach statement this fix needs, and the reason a
 "boxed" tier's regressions hide from a corpus of typed programs.
+
+## 2026-08-19 (4) - THE DISASSEMBLER: two missing opcodes, three SILENT
+## "I don't know" markers, and an objdump oracle
+
+Maintainer requirement, and it is absolute: **no instruction the JIT
+emits may be undecodable, or wrongly decoded, by `-vdj`.** Everything
+downstream - vdjcmp, every claim about emitted code, reading a dump by
+eye - rests on it.
+
+It was not met. Three separate problems.
+
+### 1. The self-check could not see the failure it exists for
+
+`DUMP IS UNRELIABLE` counts `.byte` lines: bytes we KNOW we failed on.
+It says nothing about a byte sequence we decode CONFIDENTLY AND
+WRONGLY, which is the failure that cost weeks in August (the SIB arm
+that never consumed its displacement). **A decoder cannot check
+itself** - the decoder is the subject.
+
+### 2. Three markers that looked like output and were not
+
+    case 0xF7: o << ((regf & 7) == 7 ? "idiv " : "f7/? ") << rm;
+    ...                              : sub == 6 ? "push " : "ff/? "
+    else { o << ".0f 0x" << hex2(o2); }
+
+`f7/? rdx` is not a mnemonic and not a `.byte`. It is not counted, so
+the banner stays silent - AND it claims a LENGTH the decoder has not
+earned, so everything after it is read at the wrong offset. Every path
+now lands on one `undecoded:` label that rewinds `p` and emits `.byte`.
+
+**That single change retroactively armed the existing `-rt` check.**
+With the F7 gap reintroduced, `jit: -vdj decodes every emitted form`
+now FAILS (1923/1924); it passed for the gap's entire lifetime, because
+`f7/?` was not a `.byte`.
+
+### 3. Two genuinely missing opcodes, on 284 corpus sites
+
+`F7 /3` (`neg`) and `F7 /5` (`imul`) - the div-magic sequence. Only
+`/7` (idiv) was decoded. The whole group is now handled (/0 test, /2
+not, /3 neg, /4 mul, /5 imul, /6 div, /7 idiv).
+
+### The oracle: `scripts/disasmcheck.py`
+
+`MYLANG_VDJ_HEX=1` makes `-vdj` print each instruction's raw bytes;
+the script hands each fragment to **objdump** and compares
+
+  * **BOUNDARIES** - objdump's instruction lengths must equal ours.
+    This is the desync check, and the one that matters most: a wrong
+    length makes every later mnemonic wrong.
+  * **MNEMONICS** - normalised, because the two spell operands
+    differently on purpose (`-vdj` prints slots by name and baked
+    pointers as `<addr>`). Only the opcode and register/memory shape
+    are compared.
+
+objdump is a development-time tool a script invokes, like python3 in
+the other scripts - not a build or test dependency.
+
+**RESULT, and this is the answer to the requirement:**
+
+    2,209,682 instructions   2,884 fragments
+    boundary errors 0        mnemonic errors 0
+
+over the whole corpus x {both arenas} x {7 pin-pool rotations} x
+{5 pin budgets} - the axes that change WHICH encodings get emitted.
+Watched failing: reintroducing the `/5` gap gives 46 boundary errors,
+fires the banner, and fails `-rt`.
+
+### And one EMITTER defect it found
+
+`load_elem_sd` / `store_elem_sd` passed `w=true` to `rex_sib`, but
+`movsd` (F2 0F 10/11) has a FIXED 64-bit operand size and REX.W is
+architecturally IGNORED - so every float element access carried a
+prefix bit that does nothing (objdump renders it `rex.WX`). Now the
+REX byte is emitted only when R/X/B needs it, which also makes the
+instruction a byte shorter when none does.
+**`cvtsi2sd_elem` deliberately KEEPS `w=true`**: there REX.W selects
+the 64-bit integer SOURCE, and clearing it would silently truncate.

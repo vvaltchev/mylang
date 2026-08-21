@@ -2500,14 +2500,37 @@ struct Emitter {
     void load_elem_zx8(uint8_t dst, uint8_t base, uint8_t index)
     { u8(rex_sib(dst, base, index, false)); u8(0x0F); u8(0xB6);
       modrm_sib(dst, base, index, 1); }
-    /* movsd <xmm>, [base + index*8] / movsd [base + index*8], <xmm> */
+    /*
+     * movsd <xmm>, [base + index*8] / movsd [base + index*8], <xmm>
+     *
+     * ⛔ NO REX.W, AND NO REX AT ALL WHEN NOTHING NEEDS ONE. `movsd` is
+     * F2 0F 10/11 and its operand size is FIXED at 64 bits - REX.W is
+     * architecturally IGNORED. These two passed `w=true`, so every
+     * float element access carried a prefix bit that does nothing;
+     * objdump renders it as a `rex.WX` pseudo-prefix, which is how it
+     * was found (scripts/disasmcheck.py). Where no R/X/B bit is needed
+     * either, the whole REX byte goes and the instruction is a byte
+     * shorter.
+     *
+     * `cvtsi2sd_elem` below KEEPS w=true and that is not an oversight:
+     * there REX.W selects the 64-bit integer SOURCE, so clearing it
+     * would read 32 bits and silently truncate a large int.
+     */
+    void elem_sd(uint8_t xmm, uint8_t base, uint8_t index, uint8_t op)
+    {
+        u8(0xF2);
+        const uint8_t rex = rex_sib(xmm, base, index, false);
+        if (rex != 0x40)
+            u8(rex);
+        u8(0x0F); u8(op);
+        modrm_sib(xmm, base, index, 8);
+    }
     void load_elem_sd(uint8_t xmm, uint8_t base, uint8_t index)
-    { u8(0xF2); u8(rex_sib(xmm, base, index, true)); u8(0x0F); u8(0x10);
-      modrm_sib(xmm, base, index, 8); }
+    { elem_sd(xmm, base, index, 0x10); }
     void store_elem_sd(uint8_t base, uint8_t index, uint8_t xmm)
-    { u8(0xF2); u8(rex_sib(xmm, base, index, true)); u8(0x0F); u8(0x11);
-      modrm_sib(xmm, base, index, 8); }
-    /* cvtsi2sd <xmm>, qword [base + index*8]  (an int element promotes) */
+    { elem_sd(xmm, base, index, 0x11); }
+    /* cvtsi2sd <xmm>, qword [base + index*8]  (an int element promotes;
+     * REX.W is LOAD-BEARING here - it picks the 64-bit source) */
     void cvtsi2sd_elem(uint8_t xmm, uint8_t base, uint8_t index)
     { u8(0xF2); u8(rex_sib(xmm, base, index, true)); u8(0x0F); u8(0x2A);
       modrm_sib(xmm, base, index, 8); }

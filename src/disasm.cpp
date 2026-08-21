@@ -787,8 +787,29 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         o << "cmp rax, " << imm_str(imm, ti, tf, ta);
         break; }
     case 0x99: o << (W ? "cqo" : "cdq"); break;
-    case 0xF7: { modrm(regf, rm);
-        o << ((regf & 7) == 7 ? "idiv " : "f7/? ") << rm; break; }
+    /*
+     * ⛔ THE F7 GROUP - /3 neg AND /5 imul WERE MISSING, AND THEIR
+     * ABSENCE WAS SILENT (2026-08-19). Only /7 (idiv) was decoded;
+     * everything else printed `f7/? rdx`, which is neither a mnemonic
+     * nor a `.byte` - so the UNRELIABLE banner, which counts `.byte`
+     * lines, stayed quiet while the dump showed a placeholder. 284
+     * corpus sites: the div-magic sequence's `neg rdx` and `imul rdx`.
+     * Found by cross-checking against objdump (scripts/disasmcheck.py),
+     * because no self-check can see this - the decoder is the subject.
+     */
+    case 0xF7: { modrm(regf, rm); const uint8_t sub = regf & 7;
+        if (sub == 0) {                        /* test r/m64, imm32 */
+            const int32_t imm = rd32();
+            o << "test " << rm << ", " << imm_str(imm, ti, tf, ta);
+        } else {
+            static const char *const f7[8] = {
+                "", "", "not ", "neg ", "mul ", "imul ", "div ", "idiv "
+            };
+            if (!*f7[sub])
+                goto undecoded;
+            o << f7[sub] << rm;
+        }
+        break; }
     case 0xC1: { modrm(regf, rm); const uint8_t imm = c[p++];
         o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
           << rm << ", " << int(imm);
@@ -837,7 +858,9 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
                                      * opcode extension, NOT a register) */
         const int sub = regf & 7;
         o << (sub == 0 ? "inc " : sub == 1 ? "dec " : sub == 2 ? "call "
-            : sub == 4 ? "jmp " : sub == 6 ? "push " : "ff/? ") << rm;
+            : sub == 4 ? "jmp " : sub == 6 ? "push " : "") << rm;
+        if (sub != 0 && sub != 1 && sub != 2 && sub != 4 && sub != 6)
+            goto undecoded;
         break; }
     case 0x80: { modrm(regf, rm); const uint8_t imm = c[p++];
         o << "cmp byte " << rm << ", " << int(imm); break; }
@@ -922,15 +945,57 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             o << sc[o2 - 0x90] << " " << rm; }
         else if (o2 == 0xB6) { modrm(regf, rm);   /* movzx r32, r/m8 */
             o << "movzx " << gp64(regf) << ", " << rm; }
-        else { o << ".0f 0x" << hex2(o2); }
+        else { goto undecoded; }
         break; }
     default:
-        p = start + 1;
-        out = ".byte 0x" + hex2(c[start]);
-        return;
+        goto undecoded;
     }
     (void)pf_f2; (void)pf_66;
     out = o.str();
+    return;
+    /*
+     * ⛔ ONE EXIT FOR "I DO NOT KNOW", AND IT MUST BE `.byte`.
+     *
+     * There used to be three ways to not know an instruction, and only
+     * one of them said so. `default:` emitted `.byte`, which
+     * disasm_native_frag COUNTS and reports in the `DUMP IS UNRELIABLE`
+     * banner - but an unhandled sub-opcode printed `f7/? rdx` or
+     * `ff/? rax`, and an unhandled two-byte opcode printed `.0f 0x38`.
+     * Those look like output. They are not counted, they do not trip
+     * the banner, and they claim a LENGTH the decoder has not earned -
+     * so the next instruction is read at the wrong offset.
+     *
+     * Every path now lands here: p rewinds to start + 1 and the byte is
+     * reported, so an unknown form is loud, has no length claim, and
+     * shows up in the banner exactly like every other one.
+     */
+undecoded:
+    p = start + 1;
+    out = ".byte 0x" + hex2(c[start]);
+}
+
+/*
+ * MYLANG_VDJ_HEX=1 - print each instruction's RAW BYTES beside it.
+ *
+ * ⛔ THIS EXISTS SO AN INDEPENDENT DISASSEMBLER CAN CHECK OURS. The
+ * `DUMP IS UNRELIABLE` banner only catches bytes we FAILED to decode;
+ * it says nothing about a byte sequence we decode CONFIDENTLY AND
+ * WRONGLY, which is the failure that actually cost weeks (the SIB arm
+ * that never consumed its displacement printed `mov rdi,[rsp+rsp*8]`
+ * and desynchronised the whole fragment - well-formed, plausible, and
+ * wrong). No self-check can find that: the decoder is the thing under
+ * test. Only a SECOND decoder can.
+ *
+ * With the bytes in the dump, `scripts/disasmcheck.py` feeds them to
+ * objdump and compares both the instruction BOUNDARIES and the
+ * MNEMONICS. objdump is a development-time cross-check invoked by a
+ * script, exactly like python3 in the other scripts - it is not a
+ * build or test dependency of the interpreter.
+ */
+static bool vdj_hex_on()
+{
+    static const bool on = env_get("MYLANG_VDJ_HEX").has_value();
+    return on;
 }
 
 void disasm_native_frag(std::ostream &s, const uint8_t *code,
@@ -983,7 +1048,14 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
             undecoded++;
         std::ostringstream line;
         line << "       .   +" << std::setw(3) << std::setfill(' ')
-             << std::dec << st << ": " << mn;
+             << std::dec << st << ": ";
+        if (vdj_hex_on()) {
+            std::ostringstream hx;
+            for (uint32_t q = st; q < p; q++)
+                hx << hex2(code[q]);
+            line << "{" << hx.str() << "} ";
+        }
+        line << mn;
         if (!cmt.empty())
             line << std::string(mn.size() < 26 ? 26 - mn.size() : 1, ' ')
                  << "; " << cmt;

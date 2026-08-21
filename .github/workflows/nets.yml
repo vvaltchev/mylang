@@ -41,6 +41,19 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang
 
+    # ⛔ IS THE DISASSEMBLER TELLING THE TRUTH? Every instruction the
+    # JIT emits, cross-checked against objdump - boundaries AND
+    # mnemonics. This is the only net that can catch a CONFIDENTLY
+    # WRONG decode; `DUMP IS UNRELIABLE` and the -rt coverage check both
+    # only catch bytes we KNOW we failed on. It found two missing F7
+    # sub-opcodes (neg, imul) that printed a silent `f7/?` placeholder
+    # on 284 corpus sites. --matrix sweeps both arenas, every pin-pool
+    # rotation and a range of pin budgets, because those change WHICH
+    # encodings get emitted.
+    - name: "disasm: every emitted instruction agrees with objdump"
+      working-directory: ${{github.workspace}}/build
+      run: python3 $GITHUB_WORKSPACE/scripts/disasmcheck.py ./mylang --matrix
+
     # the same corpus with each JIT lever forced off, one at a time
     - name: corpus_diff --levers
       working-directory: ${{github.workspace}}/build
