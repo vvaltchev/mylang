@@ -2574,3 +2574,55 @@ exists to say so rather than let it go quiet - watch it, and widen
 
 Then rax (340), which has no predicate shortcut: `store_dst` touches it
 3x on every whitelisted path, so the roles must be threaded first.
+
+## (t) the branch emitter, the tag seam, and what the census cannot see
+
+Four more commits, 2026-08-19. Census: RCX 159 -> 140.
+
+ - **`op_rr(e, aop)` took its operands** - a fixed rax/rcx pair across
+   seven call sites, none naming a register. Kept its own encoding
+   direction rather than folding into `op_rr2`, so it stays inert.
+ - **`emit_branch` gained the STAGING role** (21 sites) plus three
+   write helpers (`tmp_lit`/`tmp_slot`/`tmp_operand`) that declare the
+   clobber at the write. **Three stale `e.scratch(RCX)` deleted** -
+   they sat next to a `bump_counter` that clobbers nothing, so they
+   asserted a register the path does not write, and an over-broad
+   `scratch()` ABORTS a legal fragment once the register is pinnable.
+ - **The tag seam's remaining holes filled**, which turned up bug 4
+   (the boxed truth test comparing against an rsi nobody loads on the
+   arena). `cmp_rax_rcx()` deleted - the FIFTH fixed-pair accessor,
+   missed by the 2026-08-17 sweep. Measured -1.19% Ir on the two `dyn`
+   benches, -20% on a pure boxed-truth-test loop, nothing regressed.
+ - **The ref-check family and `emit_ctx_chain` stopped hand-encoding**;
+   the four gate helpers take (and now DECLARE) their scratch.
+
+### ⛔ THE CENSUS WAS CONFIDENTLY WRONG, AND NOW SAYS SO
+
+`regcensus.py`'s three recorded corrections all assume the register
+appears as a NAME - an operand, a method name, an alias constant. **A
+register spelled into a modrm or SIB byte is matched by none of them**,
+and there are **290 such lines** in jit.cpp. One of them was bug 3's
+SIGFPE.
+
+Decoding modrm there would make the script a disassembler, and a
+half-right one is worse than none, so it does the other thing an
+instrument may do: it counts them and prints an explicit BLIND SPOT
+banner, with the table labelled a LOWER BOUND (`--raw` lists them).
+
+**That count is now the real progress metric for the rest of this
+arc** - more honest than the per-register columns, because converting
+a hand-encoded instruction to a generic encoder moves it from
+"invisible" to "counted", which makes the register columns go UP while
+the code gets safer. Both numbers have to be read together:
+
+    hand-encoded lines   290   <- drive this to 0
+    RCX / RAX columns    140 / 357   <- these RISE as it falls
+
+### Still to do for rcx (140)
+
+     ~55  emit_op's tail (arith staging, UnaryV, StructCtorV,
+          LoadMemberFloat, MoveV/LoadConstV/LoadBuiltinV)
+       8  jit_try_container
+      39  emit_sync_push_native + emit_ret_native - safe by the
+          existing gates; convert last, for the census only
+     ~38  the scattered remainder
