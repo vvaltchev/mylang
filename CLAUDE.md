@@ -82,9 +82,26 @@ it to a follow-up task. Fix it, then continue.
 fact, and which must therefore be correct before anything built on
 them means anything:**
 
-- **`-vdj`** (disasm.cpp) - what machine code was emitted. Oracle: it
-  self-reports `DUMP IS UNRELIABLE`, plus the `-rt` entry
+- **`-vdj`** (disasm.cpp) - what machine code was emitted. Oracle:
+  **`scripts/disasmcheck.py`**, which cross-checks EVERY emitted
+  instruction against **objdump** - both the BOUNDARIES (a wrong length
+  desynchronises the rest of the fragment) and the mnemonics; plus the
+  self-report `DUMP IS UNRELIABLE` and the `-rt` entry
   `jit: -vdj decodes every emitted form, address-free`.
+  **⛔ THE SELF-REPORT IS NOT ENOUGH AND CANNOT BE.** It counts `.byte`
+  lines - bytes we KNOW we failed on - and says nothing about a
+  sequence decoded CONFIDENTLY AND WRONGLY, which is the failure that
+  cost weeks (the SIB displacement bug). A decoder cannot check itself.
+  On 2026-08-19 the objdump oracle found `F7 /3` (neg) and `F7 /5`
+  (imul) missing on 284 corpus sites, printing a placeholder `f7/? rdx`
+  that was neither a mnemonic nor a `.byte` - silent to the banner AND
+  claiming a length it had not earned. **Every "I do not know" path in
+  `decode_one` must end at the single `undecoded:` label**; adding a
+  new one that prints a placeholder re-opens the hole. Current status:
+  2,209,682 instructions over the corpus x both arenas x 7 pin
+  rotations x 5 pin budgets, ZERO disagreements. `MYLANG_VDJ_HEX=1`
+  puts the raw bytes in the dump, which is what makes the check
+  possible.
 - **`-vd`** (disasm.cpp) - what bytecode was emitted. Oracle:
   `myv_round_trip` (a loaded image vs a fresh compile).
 - **`-s` / `-a` / `-dti`** - what the optimizers did to the tree.
