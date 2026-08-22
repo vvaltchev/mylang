@@ -5734,7 +5734,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
      * fragment's frame (callee-saved + never emitted) at exactly the
      * point step 4's record-less unwind will anchor on it.
      */
-    if (frag_rbp && act.rec_n && !jit_norec_forced()) {
+    if (frag_rbp && act.rec_n && !jit_norec_on()) {
         g_jit_norec_raise_frames +=
             norec_walk_chain(&act, static_cast<const char *>(frag_rbp),
                              act.rec_n, nullptr);
@@ -7296,10 +7296,9 @@ jit_sync_boundary_call(EvalContext &ctx, FuncObject &fo, int_type argbase,
  * is gone) and the full-stack audit skips it; call_site_packed carries
  * the site's baked caret (a deleted run's loc table collapsed, the
  * reason that field exists); the 4-iii residue flag dies with the native
- * frames. Under MYLANG_JIT_OFF=norec no sites exist, so the walk breaks
- * immediately - that debug lever retains the historical hole for
- * M5b-framed chains (core-pushed chains are still fixed by the cores'
- * own retargets, which need no site).
+ * frames. Under MYLANG_JIT_OFF=norec the sites still EXIST (inc 5: the
+ * table is unconditional) but no frame is ever record-less, so the walk
+ * degenerates to pure retargets - the pre-flip default's behaviour.
  */
 static void norec_switch_retarget(VmActivation &act, const char *fp,
                                   size_t idx, const Chunk *my_ck,
@@ -8404,8 +8403,8 @@ static size_t norec_walk_chain(VmActivation *act, const char *fp,
  * the identity descent is checked for every chain frame in both modes.
  * The relayed seed is additionally pinned against the helper's own
  * ARGUMENTS (resume_pc / dst / site loc rode a different vehicle from
- * the same emit). Null seed = JL_NOREC lever off (no sites exist, every
- * frame is record-ful, nothing to materialize). The seed is deliberately
+ * the same emit). Null seed = a switch that made no emitted
+ * sync calls (only the slow tails store the relay). The seed is deliberately
  * NOT cleared after reading: every slow tail overwrites it, so a switch
  * arriving with a stale seed means a path that skipped the relay - and
  * the seed-association checks abort loudly instead of skipping.
@@ -8418,7 +8417,7 @@ static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
     const auto *seed = static_cast<const NorecSite *>(g_norec_switch_site);
     if (!seed)
         return;
-    if (jit_norec_forced())
+    if (jit_norec_on())
         return;    /* 4-v: the real INSERT runs; the shadow's positional
                     * record pairing does not hold in the mixed world */
     const char *fp = entry_rbp;
@@ -8518,7 +8517,7 @@ static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
 
 /*
  * G1 step 4-iii: the RECORD-LESS RETURN ARM's shadow oracle - called by
- * the emitted arm (TESTS builds, MYLANG_JIT_FORCE=norec) BEFORE any of
+ * the emitted arm (TESTS builds, norec tier on - the default) BEFORE any of
  * its mutations, with the record still fully valid. Verifies every
  * record-less data source against the record it replaces: the residue
  * ([rbp+24] = dst_addr, [rbp+16] = the caller's captures), the window
@@ -8630,7 +8629,7 @@ extern "C" void jit_norec_push_verify(const void *site,
      * does not have. */
     if (g_current_ctx && g_current_ctx->frame
             && act->top_rec->window != g_current_ctx->frame->slots) {
-        if (!jit_norec_forced())
+        if (!jit_norec_on())
             norec_fail("a record-less push outside the fork", ns,
                        nullptr);
         g_jit_norec_verify++;
@@ -8663,7 +8662,7 @@ extern "C" void jit_norec_push_verify(const void *site,
      * change. Once records stop being written the two legitimately
      * diverge (the record below becomes an ancestor) - this pin then
      * moves behind the record-ful case. */
-    if (act->rec_n >= 2 && !jit_norec_forced()) {
+    if (act->rec_n >= 2 && !jit_norec_on()) {
         const VmCallRec &rec = act->back_rec();
         const VmCallRec &par = act->records[act->rec_n - 2];
         if (rec.parent_window != par.window)
@@ -8722,7 +8721,7 @@ extern "C" void jit_norec_push_verify(const void *site,
      * is decided by the return address alone, so garbage C++ rbp values
      * (frames built without frame pointers) are unreachable.
      */
-    if (!jit_norec_forced()) {
+    if (!jit_norec_on()) {
         /* the positional record<->frame pairing the walk checks does not
          * hold once record-less frames interleave (4-v) - the fork's
          * verification lives in the release machinery + the end-to-end
@@ -8754,7 +8753,7 @@ extern "C" void jit_norec_push_verify(const void *site,
             /* step 2, the CHAIN: the site's caller chunk must be the
              * frame BELOW's run_chunk - the frame identity the mixed
              * walk (step 3) will derive from interleave order */
-            if (i && !jit_norec_forced()
+            if (i && !jit_norec_on()
                     && rs->caller != act->records[i - 1].run_chunk)
                 norec_fail("site caller != parent frame's chunk",
                            rs->caller, act->records[i - 1].run_chunk);
