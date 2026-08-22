@@ -18134,6 +18134,10 @@ static bool jit_norec_shadow()
     const unsigned long d0 = g_jit_norec_desc_chain;
     const unsigned long wc0 = g_jit_norec_win_chain;
     const unsigned long gk0 = g_jit_norec_gate_ok;
+    const unsigned long fp0 = g_jit_norec_pushes;
+    const unsigned long fa0 = g_jit_norec_ret_arm;
+    const unsigned long fv0 = g_jit_norec_retarm_verify;
+    (void)wc0; (void)gk0;
     const bool saved_audit = g_norec_audit;      /* save/restore: an
                                                   * env-gated tool toggled
                                                   * by one test must not
@@ -18173,6 +18177,30 @@ static bool jit_norec_shadow()
     if (g_jit_norec_sites <= s0) {
         fprintf(stderr, "jit_norec_shadow: NO side-table sites emitted\n");
         return false;
+    }
+    /* THE FORK (4-v, MYLANG_JIT_FORCE=norec): the record-pairing shadow
+     * battery below is gated off (records are genuinely absent for
+     * gate-passing frames) - assert the fork's OWN proof instead:
+     * record-less pushes actually happened for this shape and their
+     * returns ran the record-less arm with its oracle. The shadow
+     * battery keeps its full coverage in the default (unforced) lane. */
+    if (jit_norec_forced()) {
+        if (g_jit_norec_pushes <= fp0) {
+            fprintf(stderr, "jit_norec_shadow: NO record-less pushes "
+                            "under the fork\n");
+            return false;
+        }
+        if (g_jit_norec_ret_arm <= fa0) {
+            fprintf(stderr, "jit_norec_shadow: the record-less arm did "
+                            "not RUN under the fork\n");
+            return false;
+        }
+        if (g_jit_norec_retarm_verify <= fv0) {
+            fprintf(stderr, "jit_norec_shadow: the arm's oracle did not "
+                            "run under the fork\n");
+            return false;
+        }
+        return true;
     }
     const unsigned long calls = g_jit_norec_verify - v0;
     /* step 2 seed: the hardware-RA check must have run for these same
@@ -24729,6 +24757,8 @@ static bool jit_call_switch_protocol()
     const unsigned long mw0 = g_jit_norec_mat_walk;
     const unsigned long mf0 = g_jit_norec_mat_frames;
     const unsigned long mr0 = g_jit_norec_mat_residue;
+    const unsigned long mr0i = g_jit_norec_mat_insert;
+    (void)mr0;
     /* MUTUAL recursion (a self-recursive CallV is run-excluded), depth 60
      * >> cap 4: the first levels run native sync, then every deeper call
      * SWITCHES; the PRINTED result proves the deep chain computed AND
@@ -24751,7 +24781,7 @@ static bool jit_call_switch_protocol()
      * exactly level 1 (a garbage RA resolves to no fragment), so frames
      * == walks - real chains under cap 4 average 4-5 levels, so require
      * strictly more than 2 per walk. */
-    if (ok) {
+    if (ok && !jit_norec_forced()) {
         const unsigned long walks = g_jit_norec_mat_walk - mw0;
         const unsigned long frames = g_jit_norec_mat_frames - mf0;
         if (walks == 0) {
@@ -24764,15 +24794,14 @@ static bool jit_call_switch_protocol()
                     walks, frames);
             ok = false;
         }
-        /* under MYLANG_JIT_FORCE=norec the chain's M5b frames carry the
-         * residue flag, so the FULL insert reconstruction must have run
-         * on at least one would-be record-less frame */
-        if (ok && jit_norec_forced()
-                && g_jit_norec_mat_residue <= mr0) {
-            fprintf(stderr, "jit_call_switch_protocol: no residue frame "
-                            "reconstructed under FORCE=norec\n");
-            ok = false;
-        }
+    }
+    /* under the FORK (MYLANG_JIT_FORCE=norec) the shadow is off and the
+     * REAL materializer runs: record-less frames in the switched chains
+     * must have had records INSERTED (the -3 path's prove-it-ran) */
+    if (ok && jit_norec_forced() && g_jit_norec_mat_insert <= mr0i) {
+        fprintf(stderr, "jit_call_switch_protocol: the materializer "
+                        "INSERT DID NOT RUN under FORCE=norec\n");
+        ok = false;
     }
     /* a THROW from far below the cap: the walk crosses switch-pushed
      * records - the caret and catch must be byte-identical semantics
@@ -26001,10 +26030,15 @@ static bool jit_counter_coverage()
         { "norec_sites",      &g_jit_norec_sites,      nullptr },
         { "norec_verify",     &g_jit_norec_verify,     nullptr },
         { "norec_ret",        &g_jit_norec_ret_verify,  nullptr },
-        { "norec_frame",      &g_jit_norec_frame_verify, nullptr },
-        { "norec_stamp",      &g_jit_norec_stamp_verify, nullptr },
-        { "norec_walk",       &g_jit_norec_walk_frames,  nullptr },
-        { "norec_desc",       &g_jit_norec_desc_chain,   nullptr },
+        { "norec_frame",      &g_jit_norec_frame_verify,
+          jit_norec_forced() ? "the record-pairing shadows are gated off "
+                               "under the 4-v fork" : nullptr },
+        { "norec_stamp",      &g_jit_norec_stamp_verify,
+          jit_norec_forced() ? "gated off under the 4-v fork" : nullptr },
+        { "norec_walk",       &g_jit_norec_walk_frames,
+          jit_norec_forced() ? "gated off under the 4-v fork" : nullptr },
+        { "norec_desc",       &g_jit_norec_desc_chain,
+          jit_norec_forced() ? "gated off under the 4-v fork" : nullptr },
         { "callee_cache",     &g_jit_callee_cache,     nullptr },
         { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
         { "bind_coerce",      &g_jit_bind_coerce,      nullptr },
