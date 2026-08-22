@@ -4270,7 +4270,11 @@ static void jit_put_bool(LValue *lv, int_type v) noexcept
  */
 static ML_ALWAYS_INLINE bool jit_reg_is_callee_saved(uint8_t r)
 {
-    return r == 3 || r == 5 || r >= 12;      /* rbx, rbp, r12-r15 */
+    /* #96 (c): READ THE MODEL. This used to restate `r == 3 || r == 5
+     * || r >= 12` - a third copy of a fact gp_caps() and
+     * elem_reg_usable_nopin also held. gp_caps is constexpr, so this
+     * still folds to the same test. */
+    return (gp_caps(r) & CAP_CALLEE_SAVED) != 0;
 }
 
 static void emit_call_prologue(Emitter &e)
@@ -10535,7 +10539,11 @@ static const uint8_t ELEM_CAND[] = { RDI, R9, R10, R11, RSI, R8 };
 static bool elem_reg_usable_nopin(uint8_t r, bool float_tag_live,
                                   uint32_t hoist_claimed)
 {
-    if (r == RBX || r == 4 /*rsp*/ || r == 5 /*rbp*/)
+    /* #96 (c): the slots base, the stack pointer and the frame anchor,
+     * asked of the MODEL rather than restated here - two of the three
+     * were bare numbers, which is exactly what the census cannot see
+     * and what lets the set drift between its copies. */
+    if (!(gp_caps(r) & CAP_ALLOCATABLE))
         return false;
     if (r == RSI && !jit_tag_is_imm(jit_layout().t_int))
         return false;
