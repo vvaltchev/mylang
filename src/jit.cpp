@@ -3059,17 +3059,51 @@ struct Emitter {
      * already paying for counters, and no register question at all.
      * rax is arbitrary - nothing can observe it.
      */
+    /*
+     * ⛔ A COUNTER BUMP MUST PRESERVE ITS ADDRESS REGISTER, AND FOR A
+     * LONG TIME ONLY THIS ONE DID (#96 (c), 2026-08-20).
+     *
+     * Two idioms existed. This one takes rax and brackets it with a
+     * push/pop, so it is safe wherever it is emitted. The other was
+     * hand-rolled at FIFTEEN sites - `movabs(RCX, &ctr);
+     * inc_qword_base(RCX)` - and preserved NOTHING, because rcx was
+     * "obviously free". It stopped being free the moment rcx entered
+     * the pin pool, and it was the last thing blocking that: the
+     * admission survey could not see it (a bump declares no
+     * `scratch()`), and the emitted result was a hot int local
+     * overwritten with a COUNTER'S ADDRESS - the wrong answers in
+     * 16_elem2_fused and 17_elem2_divmod_roles were a heap pointer
+     * printed as an integer.
+     *
+     * Every bump goes through here now. The hand-rolled form is gone,
+     * so a new counter cannot reintroduce it by copying a neighbour.
+     *
+     * NOTE it clobbers FLAGS (`inc` writes them), exactly as the
+     * hand-rolled form did - so a bump still may not sit between a
+     * compare and its jump.
+     */
+    void bump_at(const void *ctr, bool dword)
+    {
+        push_reg(RAX);
+        movabs(RAX, reinterpret_cast<uint64_t>(ctr));
+        if (dword)
+            inc_dword_base(RAX);
+        else
+            inc_qword_base(RAX);
+        pop_reg(RAX);
+    }
+    /* the TESTS statistics: compiled out of a release entirely */
     void bump_counter(const void *ctr)
     {
 #ifdef TESTS
-        u8(0x50);                                    /* push rax      */
-        movabs(0 /* rax */, reinterpret_cast<uint64_t>(ctr));
-        u8(0x48); u8(0xFF); u8(0x00);                /* inc qword [rax] */
-        u8(0x58);                                    /* pop rax       */
+        bump_at(ctr, /*dword=*/false);
 #else
         (void)ctr;
 #endif
     }
+    /* a counter the RUNTIME reads (the sync depth), so it is always
+     * emitted - not a statistic. */
+    void bump_counter32_live(const void *ctr) { bump_at(ctr, true); }
     void bump_op(OpCode op)
     {
 #ifdef TESTS
@@ -6155,14 +6189,11 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                           static_cast<int>(callee_arg), j_slows, j_dones,
                           cell, ns, residue, af);
     /* depth++ (the callee is committed) */
-    e.movabs(RCX, depth_addr);
-    e.inc_dword_base(RCX);                        /* inc dword [rcx] */
+    e.bump_counter32_live(
+        reinterpret_cast<const void *>(depth_addr));
 #ifdef TESTS
-    e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_sync_inline));
-    e.inc_qword_base(RCX);            /* inc qword [rcx] */
-    e.movabs(RCX, reinterpret_cast<uint64_t>(
-                      &g_jit_op_run[static_cast<size_t>(in.op)]));
-    e.inc_qword_base(RCX);            /* inc qword [rcx] */
+    e.bump_counter(&g_jit_sync_inline);
+    e.bump_counter( &g_jit_op_run[static_cast<size_t>(in.op)]);
     /* G1 step 1: the SHADOW VERIFICATION - compare the record the push
      * just filled against the side-table entry, every call, before the
      * callee runs. Only rdi (the callee window) and rdx (the fragment
@@ -9793,8 +9824,7 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
          * rather than hope. rcx is scratch here (the ref check used rax;
          * the helper's args come after). */
         if (xr != X0) {
-            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fstore_movx0));
-            e.inc_qword_base(RCX);   /* inc qword [rcx] */
+            e.bump_counter(&g_jit_fstore_movx0);
         }
 #endif
         /* the value register is an ARGUMENT now - the emitter puts it
@@ -10184,8 +10214,7 @@ static void emit_release_preheader(Emitter &e, const std::vector<int> &slots)
     }
 #ifdef TESTS
     if (!slots.empty()) {
-        e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_release_entry));
-        e.inc_qword_base(RCX);    /* inc qword [rcx] */
+        e.bump_counter(&g_jit_release_entry);
     }
 #endif
 }
@@ -13708,8 +13737,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.cmp_byte_base(RAX, static_cast<int32_t>(L.sobj_ro), 0);
                 const size_t js4 = e.j32(0x75);
 #ifdef TESTS
-                e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_ctor_fast));
-                e.inc_qword_base(RCX);   /* inc qword [rcx] */
+                e.bump_counter(&g_jit_ctor_fast);
 #endif
                 /* r9 = bytes data (vector _M_start at +0, probed) */
                 e.load_base(R9, RAX, static_cast<int32_t>(L.sobj_bytes));
@@ -15211,8 +15239,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_call_epilogue(e);
 #endif
 #ifdef TESTS
-            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_member_noguard));
-            e.inc_qword_base(RCX);    /* inc qword [rcx] */
+            e.bump_counter(&g_jit_member_noguard);
 #endif
             e.load(RAX, b.payload);            /* rax = StructObject* */
             emit_field_read();
@@ -15231,8 +15258,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.cmp_base_reg(RAX, static_cast<int32_t>(L.sobj_def), RCX);
             const size_t js2 = e.j32(0x75);
 #ifdef TESTS
-            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_member_fast));
-            e.inc_qword_base(RCX);    /* inc qword [rcx] */
+            e.bump_counter(&g_jit_member_fast);
 #endif
             emit_field_read();
             j_done = e.j32(0xEB);
@@ -17829,8 +17855,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 if (!jit_reg_is_callee_saved(r))
                     vol = true;
             if (vol) {
-                e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_xcache));
-                e.inc_qword_base(RCX);   /* inc qword [rcx] */
+                e.bump_counter(&g_jit_xcache);
             }
         }
 #endif
@@ -17848,8 +17873,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         if (!fhot.empty()) {
             /* the execution proof: bumped per ENTRY of a float-pinned
              * fragment (the g_jit_hoist pattern) */
-            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fcache));
-            e.inc_qword_base(RCX);   /* inc qword [rcx] */
+            e.bump_counter(&g_jit_fcache);
         }
 #endif
         /* C4b: the float LITERAL pool - materialised once here (and at
@@ -17859,8 +17883,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.flit_load(fl);
 #ifdef TESTS
         if (!e.flits.empty()) {
-            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_flit));
-            e.inc_qword_base(RCX);   /* inc qword [rcx] */
+            e.bump_counter(&g_jit_flit);
         }
 #endif
         /*
@@ -17934,14 +17957,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             }
 #ifdef TESTS
         if (!e.tflush.empty()) {
-            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_telide));
-            e.inc_qword_base(RCX);   /* inc qword [rcx] */
+            e.bump_counter(&g_jit_telide);
         }
 #endif
 #ifdef TESTS
         if (!e.fread.empty()) {
-            e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fread));
-            e.inc_qword_base(RCX);   /* inc qword [rcx] */
+            e.bump_counter(&g_jit_fread);
         }
 #endif
 
@@ -18406,9 +18427,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                         e.u8(0xE8); e.u32(0);
                         emit_call_epilogue(e);
 #ifdef TESTS
-                        e.movabs(RCX, reinterpret_cast<uint64_t>(
-                                          &g_jit_ctor_est));
-                        e.inc_qword_base(RCX);
+                        e.bump_counter( &g_jit_ctor_est);
 #endif
                     }
                     g_fwd = JitFwd{};             /* the calls clobbered rax */
@@ -18514,9 +18533,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             for (const Emitter::FLit &fl : e.flits)
                 e.flit_load(fl);                  /* C4b literal pool */
 #ifdef TESTS
-            e.movabs(RCX,
-                     reinterpret_cast<uint64_t>(&g_jit_entry_resume));
-            e.inc_qword_base(RCX);   /* inc qword [rcx] */
+            e.bump_counter(&g_jit_entry_resume);
 #endif
             const size_t tgt = label[pe.first - begin];
             e.u8(0xE9);

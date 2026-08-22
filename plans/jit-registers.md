@@ -3277,3 +3277,59 @@ whole point is that these writes never call it. The durable fix is the
 one this entry continues: every register a tier writes becomes a NAMED
 ROLE taken from a plan, so "who writes this register" is answerable by
 reading the plan rather than by auditing the emitter.
+
+## (ad) 2026-08-20 - the counter bumps were the hidden rcx writer;
+## ONE failure left
+
+Fifteen sites bumped a counter with a hand-rolled
+`movabs(RCX, &ctr); inc_qword_base(RCX)` and **preserved nothing** -
+while the `bump_counter` helper right beside them took rax and
+bracketed it with a push/pop. Two idioms for one job, one of them safe.
+
+They were invisible to the admission survey by construction (a bump
+declares no `scratch()`), and the emitted result once rcx was pinned
+was a hot int local overwritten with **a counter's ADDRESS** - which is
+why the failing programs printed a heap pointer where an integer
+belonged.
+
+All fifteen route through `Emitter::bump_at` now; the hand-rolled form
+is gone, so a new counter cannot reintroduce it by copying a neighbour.
+The always-on depth counter gets `bump_counter32_live` (it is a value
+the RUNTIME reads, not a statistic, so it must still emit in a release).
+
+**Result: corpus_diff with rcx admitted goes 22/24 -> 23/24.**
+
+⛔ Cost: +460 bytes over the corpus in a TESTS build (2 instructions per
+bump). In a RELEASE build `bump_counter` is `#ifdef TESTS` and compiles
+to nothing, so the only always-on site is the depth counter, at +2
+bytes per emitted sync call. Worth stating because a bump is emitted on
+hot paths and the TESTS number looks alarming next to the release one.
+
+### THE ONE THAT REMAINS
+
+`17_elem2_divmod_roles` still diverges (`728167` vs `45737`) and `-rt`
+still aborts. The `-vdj` with rcx admitted shows two rcx writes with no
+push/pop bracket around them:
+
+    +202: mov rcx, r24.type ; mov rcx, [rcx+0x8] ; cmp rcx, 8
+    +306: movabs rcx, 16    ; cmp rax, rcx
+
+Those are `emit_ref_check` and `tmp_lit` - **both of which were
+converted** and both of which DO bracket correctly elsewhere in the
+same dump. So the question is not "who writes rcx" but **"why did
+`reg_holds_pin(RCX)` answer FALSE here"**.
+
+The likely shape, and where to start: `RefScratch` and `tmp_hold` both
+ask `e.reg_holds_pin(r)`, which scans `e.cache`. If the pin for this
+fragment is recorded somewhere `cache` does not cover at the moment
+these emitters run - a barrier having cleared it, or an xcache pin held
+outside `cache` - then the borrow is skipped exactly where it is
+needed. Note `mov rcx, j` / `mov j, rcx` in that dump is emit_op's
+STAGING register, not a pin, so do not read it as one.
+
+⛔ If that is the cause, the fix belongs with `check_pins_are_busy()`:
+the invariant "every register `cache` calls pinned is busy in the
+allocator" already exists, and its MIRROR - "every register the
+allocator has busy is discoverable by reg_holds_pin" - is the one that
+would have caught this. Consider asking the ALLOCATOR rather than
+`cache` in both borrow sites.
