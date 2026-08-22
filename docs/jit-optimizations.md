@@ -2796,5 +2796,20 @@ level - a single deep call yields ZERO inline pushes), and direct SELF-
 recursion is sync-emitted only with the native stack armed (the ASan lane
 runs cap 32, unarmed) - the test drives MUTUAL recursion in a loop.
 
-PENDING (tomorrow): clang / rel-hard / stats lanes, corpus_diff,
-non-JIT platform probe, CMake build, nested_fuzz - run before push.
+LANES RUN 2026-08-10, and the push found TWO MORE step-1 bugs first
+(the maintainer pushed for backup; CI failed):
+- macOS: jit_norec_release_range declared outside ML_JIT_SUPPORTED,
+  defined inside - declared-never-defined static, -Werror. The non-JIT
+  platform probe caught the same thing locally before CI was read.
+- Linux Release: SIGSEGV AT EXIT - the registries and g_func_chunks live
+  in different TUs, and the exit-time Chunk destructors erased from maps
+  the exit handlers had already destroyed (unspecified static destruction
+  order; the CI core-dump net produced the exact backtrace). Fixed by
+  making the registries IMMORTAL (construct-on-first-use, deliberately
+  leaked). REPRODUCED LOCALLY in rel-hard once the RAW EXIT CODE was
+  checked: `./mylang -rt | grep "Tests passed"` reports the GREP's exit,
+  and the suite had been printing PASS and then segfaulting in the exit
+  handlers. CHECK `-rt`'s RAW EXIT CODE, not a grep through it.
+After the fixes: dbg/clang/rel-hard/stats all 1867/1867 with raw exit 0,
+corpus_diff plain + audit-on + norec-lever configs agree, non-JIT probe
+builds green on g++ AND clang, CMake Debug builds + passes.

@@ -403,8 +403,13 @@ size_t jit_enter_deep(const void *frag, void *slots)
  * by the chunk and may already be freed when release runs; the first
  * version's owner-pointer purge was an ASan-caught UAF on its very first
  * -rt run - the shadow net catching its own scaffolding). Defined below
- * the registries; forward-declared here for release(). */
+ * the registries; forward-declared here for release(). Guarded: the
+ * definition is emitter-side, and an off-platform build would otherwise
+ * hold a declared-never-defined static (-Werror, caught by the non-JIT
+ * platform probe). */
+#if ML_JIT_SUPPORTED
 static void jit_norec_release_range(const void *base, size_t len) noexcept;
+#endif
 
 void NativeCode::release() noexcept
 {
@@ -3174,22 +3179,39 @@ static void emit_nstack_switch_post(Emitter &e)
  * non-overlapped entries do linger; nothing queries dead addresses
  * today, and the walk that might (step 2+) must revisit this.
  */
-static std::map<uintptr_t, const NorecSite *> g_norec_ret;
-static std::map<uintptr_t,
-                std::pair<uintptr_t, const Chunk *>> g_norec_frag;
+/* IMMORTAL (constructed on first use, deliberately never destroyed):
+ * NativeCode::release runs from Chunk destructors, and the process-exit
+ * teardown of a GLOBAL chunk map (g_func_chunks, vm.cpp - a different
+ * TU) would otherwise erase from registries the exit handlers had
+ * already destroyed. Unspecified static destruction order across TUs:
+ * the local gcc link survived it, the CI runner's SIGSEGV'd in
+ * _Rb_tree_rebalance_for_erase - found by the Linux Release lane's
+ * core-dump net on step 1's very first push. */
+static std::map<uintptr_t, const NorecSite *> &norec_ret_map()
+{
+    static auto *m = new std::map<uintptr_t, const NorecSite *>();
+    return *m;
+}
+static std::map<uintptr_t, std::pair<uintptr_t, const Chunk *>> &
+norec_frag_map()
+{
+    static auto *m =
+        new std::map<uintptr_t, std::pair<uintptr_t, const Chunk *>>();
+    return *m;
+}
 
 const NorecSite *jit_norec_site_for(const void *ret_addr)
 {
-    const auto it = g_norec_ret.find(
+    const auto it = norec_ret_map().find(
         reinterpret_cast<uintptr_t>(ret_addr));
-    return it == g_norec_ret.end() ? nullptr : it->second;
+    return it == norec_ret_map().end() ? nullptr : it->second;
 }
 
 const Chunk *jit_norec_frag_for(const void *addr)
 {
     const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
-    auto it = g_norec_frag.upper_bound(a);
-    if (it == g_norec_frag.begin())
+    auto it = norec_frag_map().upper_bound(a);
+    if (it == norec_frag_map().begin())
         return nullptr;
     --it;
     return a < it->second.first ? it->second.second : nullptr;
@@ -3203,11 +3225,11 @@ static void jit_norec_release_range(const void *b, size_t n) noexcept
 {
     const uintptr_t lo = reinterpret_cast<uintptr_t>(b);
     const uintptr_t hi = lo + n;
-    g_norec_ret.erase(g_norec_ret.lower_bound(lo),
-                      g_norec_ret.lower_bound(hi));
-    for (auto it = g_norec_frag.begin(); it != g_norec_frag.end(); )
+    norec_ret_map().erase(norec_ret_map().lower_bound(lo),
+                      norec_ret_map().lower_bound(hi));
+    for (auto it = norec_frag_map().begin(); it != norec_frag_map().end(); )
         it = (it->first < hi && it->second.first > lo)
-                 ? g_norec_frag.erase(it) : ++it;
+                 ? norec_frag_map().erase(it) : ++it;
 }
 
 static void jit_norec_register(Chunk &chunk)
@@ -3218,15 +3240,15 @@ static void jit_norec_register(Chunk &chunk)
         return;
     const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
     jit_norec_release_range(base, chunk.native.len);
-    g_norec_frag.emplace(
+    norec_frag_map().emplace(
         lo, std::make_pair(lo + chunk.native.len,
                            static_cast<const Chunk *>(&chunk)));
     for (auto &up : chunk.norec_sites) {
         NorecSite *ns = up.get();
         ns->ret_switched = base + ns->off_switched;
         ns->ret_plain = base + ns->off_plain;
-        g_norec_ret[reinterpret_cast<uintptr_t>(ns->ret_switched)] = ns;
-        g_norec_ret[reinterpret_cast<uintptr_t>(ns->ret_plain)] = ns;
+        norec_ret_map()[reinterpret_cast<uintptr_t>(ns->ret_switched)] = ns;
+        norec_ret_map()[reinterpret_cast<uintptr_t>(ns->ret_plain)] = ns;
         g_jit_norec_sites++;
     }
 }
