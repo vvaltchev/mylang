@@ -2042,7 +2042,8 @@ struct Emitter {
     /* push/pop a GP reg (0x50+r / 0x58+r; REX.B for r8..r15) */
     void push_reg(uint8_t r) { if (r >= 8) u8(0x41); u8(0x50 | (r & 7)); }
     void pop_reg(uint8_t r)  { if (r >= 8) u8(0x41); u8(0x58 | (r & 7)); }
-    void call_rax() { u8(0xFF); u8(0xD0); }   /* call rax (indirect) */
+    void call_rax() { call_reg(0 /* rax: the Reg enum is
+                                * declared below the class */); }
     /* lea reg, [rbx + disp32]  (an EvalValue-ptr / LValue-ptr helper arg;
      * rm = rbx = slots base). reg is a raw GP number (the Reg enum is
      * declared after this struct, so lea_rdi passes REG_ARG0). */
@@ -2319,6 +2320,110 @@ struct Emitter {
                                 | (a >= 8 ? 0x01 : 0)));
         u8(0x85);
         u8(static_cast<uint8_t>(0xC0 | ((b & 7) << 3) | (a & 7)));
+    }
+    /*
+     * #96 batch 5 - the shift / unary / indirect-transfer family. Every
+     * one of these was spelled as literal bytes, so the register lived
+     * in the modrm byte and the census could not see it. The shift
+     * COUNT is an immediate here; the CL-variable form stays where it
+     * is (it has its own modrm construction).
+     */
+    void shl_rr_imm8(uint8_t reg, uint8_t k)          /* shl r64, imm8 */
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
+        u8(0xC1);
+        u8(static_cast<uint8_t>(0xE0 | (reg & 7)));
+        u8(k);
+    }
+    void shr_rr_imm8(uint8_t reg, uint8_t k)          /* shr r64, imm8 */
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
+        u8(0xC1);
+        u8(static_cast<uint8_t>(0xE8 | (reg & 7)));
+        u8(k);
+    }
+    void shl_reg_1(uint8_t reg)         /* shl r64, 1 (the D1 /4 form) */
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
+        u8(0xD1);
+        u8(static_cast<uint8_t>(0xE0 | (reg & 7)));
+    }
+    void neg_reg(uint8_t r)                                /* neg r64 */
+    {
+        u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 0x01 : 0)));
+        u8(0xF7);
+        u8(static_cast<uint8_t>(0xD8 | (r & 7)));
+    }
+    /* imul r64 - the ONE-operand form: rdx:rax = rax * r. Like idiv_reg
+     * both halves of the destination are ISA-fixed, so the multiplier
+     * is the only allocatable operand. */
+    void imul_reg(uint8_t r)
+    {
+        u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 0x01 : 0)));
+        u8(0xF7);
+        u8(static_cast<uint8_t>(0xE8 | (r & 7)));
+    }
+    void imul_rr_imm32(uint8_t dst, uint8_t src, int32_t k)
+    {
+        u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
+                                | (src >= 8 ? 0x01 : 0)));
+        u8(0x69);
+        u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7)));
+        u32(static_cast<uint32_t>(k));
+    }
+    /* mov r64, imm32 (sign-extended) - the short form of movabs for a
+     * value that fits, which every caller here has. */
+    void mov_reg_imm32(uint8_t reg, uint32_t imm)
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
+        u8(0xC7);
+        u8(static_cast<uint8_t>(0xC0 | (reg & 7)));
+        u32(imm);
+    }
+    void call_reg(uint8_t r)                              /* call r64 */
+    {
+        if (r >= 8)
+            u8(0x41);
+        u8(0xFF);
+        u8(static_cast<uint8_t>(0xD0 | (r & 7)));
+    }
+    void jmp_reg(uint8_t r)                                /* jmp r64 */
+    {
+        if (r >= 8)
+            u8(0x41);
+        u8(0xFF);
+        u8(static_cast<uint8_t>(0xE0 | (r & 7)));
+    }
+    /* setcc r8 - `cc` is the condition's low nibble (0x5 = ne). Only
+     * the low-8 registers are reachable without a REX, and a REX is
+     * what a caller wanting sil/dil/spl/bpl would need, so this
+     * refuses those rather than emit the WRONG byte register. */
+    void setcc_r8(uint8_t cc, uint8_t r)
+    {
+        ML_CHECK_MSG(r < 4, "setcc_r8: only al/cl/dl/bl are REX-free");
+        u8(0x0F);
+        u8(static_cast<uint8_t>(0x90 | cc));
+        u8(static_cast<uint8_t>(0xC0 | (r & 7)));
+    }
+    /* cmp qword [base], imm8 (sign-extended) */
+    void cmp_qword_base_imm8(uint8_t base, int8_t imm)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base) && !base_no_base_form(base),
+                     "cmp_qword_base_imm8: rsp/r12 SIB, rbp/r13 a disp");
+        u8(static_cast<uint8_t>(0x48 | (base >= 8 ? 0x01 : 0)));
+        u8(0x83);
+        u8(static_cast<uint8_t>(0x38 | (base & 7)));
+        u8(static_cast<uint8_t>(imm));
+    }
+    /* inc dword [base] - the twin of dec_dword_base */
+    void inc_dword_base(uint8_t base)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base) && !base_no_base_form(base),
+                     "inc_dword_base: rsp/r12 need SIB, rbp/r13 a disp");
+        if (base >= 8)
+            u8(0x41);
+        u8(0xFF);
+        u8(static_cast<uint8_t>(base & 7));
     }
     void cmp_rr(uint8_t dst, uint8_t src)
     {
@@ -2991,7 +3096,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     const uint8_t keep = RCX;
     e.mov_rr(keep, RAX);                             /* keep = n */
     e.movabs(RDX, m.M);
-    e.u8(0x48); e.u8(0xF7); e.u8(0xEA);              /* imul rdx (signed,
+    e.imul_reg(RDX);              /* imul rdx (signed,
                                                       * rdx:rax = n*M) */
     if (m.needs_add) {
         e.add_rr(RDX, RCX);
@@ -3002,10 +3107,10 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     }
     /* truncate toward zero: += 1 when the quotient came out negative */
     e.mov_rr(RAX, RDX);
-    e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(63);    /* shr rax, 63 */
+    e.shr_rr_imm8(RAX, 63);    /* shr rax, 63 */
     e.add_rr(RDX, RAX);
     if (m.negate) {
-        e.u8(0x48); e.u8(0xF7); e.u8(0xDA);          /* neg rdx */
+        e.neg_reg(RDX);          /* neg rdx */
     }
     if (!want_mod) {
         e.mov_rr(RAX, RDX);                          /* rax = quotient */
@@ -3017,7 +3122,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
         e.u32(static_cast<uint32_t>(static_cast<int32_t>(d)));
     } else {
         e.movabs(RAX, static_cast<uint64_t>(d));
-        e.u8(0x48); e.u8(0x0F); e.u8(0xAF); e.u8(0xC2);  /* imul rax, rdx */
+        e.op_rr2(Op::times, RAX, RDX);  /* imul rax, rdx */
     }
     e.sub_rr(RCX, RAX);
     e.mov_rr(RAX, keep);                             /* rax = remainder */
@@ -4881,7 +4986,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      * register but r11 is live, and the 3-operand imul needs none of
      * r11's old value, so nothing is spilled at all.
      */
-    e.u8(0x4C); e.u8(0x6B); e.u8(0xDE); e.u8(48);     /* imul r11,rsi,48 */
+    e.imul_rr_imm8(R11, RSI, 48);     /* imul r11,rsi,48 */
     modrm(0x03, R11, R10, static_cast<int32_t>(P.seg_cur), true);
                                                       /* add r11,[seg+cur] */
     modrm(0x3B, R11, R10, static_cast<int32_t>(P.seg_end), true);
@@ -4925,7 +5030,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
             e.push_reg(RAX);
             e.movabs(RAX,
                      reinterpret_cast<uint64_t>(jit_addr_pending_key()));
-            e.u8(0x48); e.u8(0x83); e.u8(0x38); e.u8(0x00);
+            e.cmp_qword_base_imm8(RAX, 0);
                                                       /* cmp qword[rax],0 */
             e.pop_reg(RAX);                           /* flags kept */
             j_rec2 = e.j32(0x75);                     /* jne record path */
@@ -5016,7 +5121,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      * own, which its callee's exceptional paths do read.) */
     ld(RAX, R8R, static_cast<int32_t>(P.act_handlers2) + 8);
     modrm(0x2B, RAX, R8R, static_cast<int32_t>(P.act_handlers2), true);
-    e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(0x02);   /* shr rax, 2
+    e.shr_rr_imm8(RAX, 2);   /* shr rax, 2
                                                        * (4-byte VmHandler) */
     st32(R10, static_cast<int32_t>(P.rec_handler_base), RAX);
     /* diter_base AND dyiter_base in ONE qword move: both are adjacent u32
@@ -5175,7 +5280,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
 static size_t emit_nstack_switch_pre(Emitter &e)
 {
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_cur));
-    e.u8(0x48); e.u8(0x83); e.u8(0x39); e.u8(0x00);   /* cmp qword [rcx],0 */
+    e.cmp_qword_base_imm8(RCX, 0);   /* cmp qword [rcx],0 */
     const size_t j_plain = e.j32(0x74);               /* je plain */
     /* mov qword [rcx], 0  (cur = null: active) */
     e.u8(0x48); e.u8(0xC7); e.u8(0x01); e.u32(0);
@@ -5479,7 +5584,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                           cell, ns, residue, af);
     /* depth++ (the callee is committed) */
     e.movabs(RCX, depth_addr);
-    e.u8(0xFF); e.u8(0x01);                        /* inc dword [rcx] */
+    e.inc_dword_base(RCX);                        /* inc dword [rcx] */
 #ifdef TESTS
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_sync_inline));
     e.inc_qword_base(RCX);            /* inc qword [rcx] */
@@ -5547,7 +5652,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         };
         const size_t j_plain = emit_nstack_switch_pre(e);
         residue_push();
-        e.u8(0xFF); e.u8(0xD2);                    /* call rdx (switched) */
+        e.call_reg(RDX);                    /* call rdx (switched) */
         if (ns)
             ns->off_switched = e.pos();  /* G1: the hardware ret address */
         residue_pop();
@@ -5555,7 +5660,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         const size_t j_over = e.j32(0xEB);
         e.patch32_here(j_plain);
         residue_push();
-        e.u8(0xFF); e.u8(0xD2);                    /* call rdx (plain) */
+        e.call_reg(RDX);                    /* call rdx (plain) */
         if (ns)
             ns->off_plain = e.pos();
         residue_pop();
@@ -9520,7 +9625,7 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
     e.u8(0x0F); e.u8(0x88);
     const size_t js = e.pos(); e.u32(0);
     /* cmp rcx,64; jl Lnorm */
-    e.u8(0x48); e.u8(0x83); e.u8(0xF9); e.u8(64);
+    e.cmp_reg_imm(RCX, 64);
     e.u8(0x0F); e.u8(0x8C);
     const size_t jl = e.pos(); e.u32(0);
     if (aop == Op::shr) {
@@ -11726,7 +11831,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * A bits test avoids a ucomisd NaN pitfall (unordered sets ZF,
              * so a bare `je` would wrongly raise on a NaN divisor). */
             e.movq_rax_x(ops.src);                 /* movq rax, xmm<b> */
-            e.u8(0x48); e.u8(0xD1); e.u8(0xE0);    /* shl rax, 1 */
+            e.shl_reg_1(RAX);    /* shl rax, 1 */
             raise_convey_unless(e, ck, 0x75 /* jnz */, JR_DIV0, pc, old_pc);
         }
         if (is_mod)
@@ -13101,7 +13206,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.u32(static_cast<uint32_t>(in.a_lit()));
         }
         ML_CHECK(L.pend_state_size == 16);
-        e.u8(0x48); e.u8(0xC1); e.u8(0xE2); e.u8(4);   /* shl rdx, 4 */
+        e.shl_rr_imm8(RDX, 4);   /* shl rdx, 4 */
         /* _M_start */
         e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
         e.add_rr(RAX, RDX);
@@ -13133,7 +13238,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.u32(static_cast<uint32_t>(in.a_lit()));
         }
         ML_CHECK(L.pend_state_size == 16);
-        e.u8(0x48); e.u8(0xC1); e.u8(0xE2); e.u8(4);   /* shl rdx, 4 */
+        e.shl_rr_imm8(RDX, 4);   /* shl rdx, 4 */
         /* mov rax, [rax+pends] */
         e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
         e.add_rr(RAX, RDX);
@@ -13705,7 +13810,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                      * bare `ucomisd; je` would also decline a NaN
                      * divisor - the same reasoning as FloatBin's. */
                     e.movq_rax_x(X1);
-                    e.u8(0x48); e.u8(0xD1); e.u8(0xE0);   /* shl rax, 1 */
+                    e.shl_reg_1(RAX);   /* shl rax, 1 */
                     j_slows.push_back(e.j32(0x74));       /* jz -> slow */
                 }
                 e.farith(bo.aop == Op::plus    ? 0x58
@@ -14219,7 +14324,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(0x0F); e.u8(0xB6); e.u8(0x80);
                 e.u32(static_cast<uint32_t>(moff));
                 e.test32_rr(RAX, RAX);               /* test eax, eax */
-                e.u8(0x0F); e.u8(0x95); e.u8(0xC0);   /* setne al */
+                e.setcc_r8(0x5, RAX);   /* setne al */
                 e.movzx_r32_r8(RAX, RAX);   /* movzx eax, al */
                 store_dst(e, ck, RAX, in.target, pc);
                 break;
@@ -14425,7 +14530,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* mov rdx, [rax + native_entry_off]*/
         e.load_base(RDX, RAX, static_cast<int32_t>(L.chunk_native_entry));
         e.add_rr(RCX, RDX);
-        e.u8(0xFF); e.u8(0xD1);             /* call rcx (the callee fragment) */
+        e.call_reg(RCX);             /* call rcx (the callee fragment) */
         /* G1 step 2: a leaf call is the OTHER fragment-to-fragment call
          * form, so its return address must be in the table or the entry
          * RA check false-aborts on every leaf call. No record is pushed
@@ -16030,7 +16135,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         if (tramp.count(r.fn)) continue;
         tramp[r.fn] = e.pos();
         e.movabs(RAX, reinterpret_cast<uint64_t>(r.fn));
-        e.u8(0xFF); e.u8(0xE0);                             /* jmp rax */
+        e.jmp_reg(RAX);                             /* jmp rax */
     }
     const size_t len = e.b.size();
     void *mem = mmap(nullptr, len, PROT_READ | PROT_WRITE,
@@ -17712,7 +17817,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             continue;
         tramp[r.fn] = e.pos();
         e.movabs(RAX, reinterpret_cast<uint64_t>(r.fn));   /* movabs rax, fn */
-        e.u8(0xFF); e.u8(0xE0);                            /* jmp rax */
+        e.jmp_reg(RAX);                            /* jmp rax */
     }
 
     /* Map RW, copy, flip RX (strict W^X). */
