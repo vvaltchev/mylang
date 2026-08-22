@@ -20,6 +20,10 @@ hand. The full set:
 - **`myv_doc_check.py`** — *CI*. A reader written from `docs/myv-format.txt`
   alone must consume every image to exactly EOF.
 - **`driver_checks.sh`** — *CI*. The CLI flags do what they say.
+- **`system_smoke.py`** — *CI*. A RELEASE binary with no `-rt` suite
+  (TESTS=0) still runs actual scripts correctly: the bench pairs vs
+  CPython through both engines, plus the self-asserting functional tests,
+  all at scale 1.
 
 ### Why `driver_checks.sh` exists
 

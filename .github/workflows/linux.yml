@@ -167,3 +167,55 @@ jobs:
           ${{github.workspace}}/build/core.*
           ${{github.workspace}}/build/mylang
         if-no-files-found: ignore
+
+  # The RELEASE binaries a USER actually ships have NO -rt suite (it is
+  # compiled in only under TESTS=1), so until this NOTHING in CI proved they
+  # run correctly - the whole matrix above is TESTS=1. Two configs: the
+  # default release (ASSERTS=1) and the bare one (ASSERTS=0). Deliberately
+  # shallow - build them and run actual scripts at the minimum size
+  # (system_smoke.py: the bench pairs vs CPython through both engines, plus
+  # the self-asserting functional tests). Coverage stays the TESTS lanes'
+  # job; this only answers "does the shipped binary work at all". A plain
+  # no-TESTS build ALSO catches a declaration that escaped a TESTS guard -
+  # exactly the bug that broke `make` with no flags once (the norec decls).
+  release-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        asserts: [ON, OFF]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Create Build Environment
+      run: cmake -E make_directory ${{github.workspace}}/build
+
+    - name: Configure CMake (Release, TESTS=0, ASSERTS=${{ matrix.asserts }})
+      shell: bash
+      working-directory: ${{github.workspace}}/build
+      run: cmake -DTESTS=0 -DASSERTS=${{ matrix.asserts }}
+           -DCMAKE_BUILD_TYPE=Release $GITHUB_WORKSPACE
+
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run: cmake --build . --config Release
+
+    # Confirm the binary IS the config we meant to test (`-v` reads
+    # compiler-set macros, so it cannot drift): tests=0, and asserts matching
+    # the matrix. A silent misconfigure would make the smoke test vacuous.
+    - name: Confirm the build config
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run: |
+        ./mylang -v
+        want=$([ "${{ matrix.asserts }}" = "ON" ] && echo 1 || echo 0)
+        ./mylang -v | grep -q "tests             0" \
+          || { echo "expected tests=0"; exit 1; }
+        ./mylang -v | grep -q "asserts           $want" \
+          || { echo "expected asserts=$want"; exit 1; }
+
+    - name: System smoke - actual scripts at scale 1
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run: python3 $GITHUB_WORKSPACE/tests/system_smoke.py ./mylang
