@@ -716,3 +716,97 @@ entirely in C++.
          fills the same resume fields the retarget writes today.
   4-v.   Stop writing the record for gate-passing calls; flip the lever
          default; Net 4 coverage gate; measure per shape + suite.
+
+# STEP 4-v DESIGN FACTS (established 2026-08-11, after the consumer read)
+
+## 4-v-i. The PARENT-VIEW record fields (DONE, cb8b838)
+
+The pop path's load-bearing coupling was "the record below is my
+parent": pop_window's vframe repoint + cur_seg, and the C4c arm's
+parent-window load (`top_rec - rec_size`) and post-pop view repoint.
+Every record now carries parent_window/parent_nslots/parent_seg,
+captured AT PUSH TIME (push_window for C++ pushes - which every C++
+push funnels through; three stores in the M5b fill, where rbx IS the
+parent window and cur_seg doubles as parent_seg because an inline push
+never advances the segment). All four consumer reads converted.
+Byte-identical today (pinned per emitted push by the push_verify
+oracle; sabotage watched failing on the warmed mutual-recursion shape -
+the self-call shape is VACUOUS, a self-recursive CallV is run-excluded
+from the sync emit). The C4c arm ALSO serves EnterNative-re-entered
+fragments whose [rbp-8] is NOT the chain, which is why the field - not
+the chain - is the right source there.
+
+## 4-v-ii. Raise anchoring - the two categories, and the exit relay
+
+A raise OUT of a record-less frame reaches vm_raise two ways:
+
+(a) DIRECT (jit_throw / jit_rethrow / jit_end_finally): called from the
+    fragment with the frame LIVE - frag_rbp + raise_desc already passed
+    (4-ii). The walk gains a RECORD-LESS PREFIX pass (before the
+    existing record loop and before its FIRST handler search - a
+    core-pushed try-bearing floor searched with a record-less frame's
+    pc could FALSE-MATCH a region): while the current frame's window
+    != top_rec->window, the frame is record-less - capture its
+    backtrace frame ({desc via the raise_desc-seeded site descent;
+    innermost LOC-LESS, outer = site.site_loc} - the exact recon 4-ii(b)
+    proved byte-identical), release its ref_slots (chunk = desc->
+    vm_chunk, window = vframe/the [fp-8] descent), seg->top/used -=
+    its chunk totals, ctx.captures = the residue at [fp+16], flush the
+    site's baked inlined-at chain (NorecSite gains {inline_chain,
+    inline_pool}, the #88 pair the site already bakes into the side
+    channel), and step fp = [fp]. Then repoint the vframe at top_rec
+    and set pc = S_last->resume_pc - 1 (the record path's ret_pc - 1
+    analogue) for the record-ful frame's own handler search.
+
+(b) CONVEYED (a helper's OOB/div0/...; the fragment exits with the op
+    pc): the frame's native stack DIES at the exit, so the anchor must
+    be captured while it is live - but a fully-deleted chunk's every
+    exit_pc IS an exception exit (op_fully_native means no bails, and
+    deletion forbids mid-body interpreted resumes), and the exit is
+    COLD. So the FRAGMENT EPILOGUE stores the fragment's baked DESC
+    into an exit relay global on every pc-exit; the caller site's
+    postexit (which gains the CALLER's rbp as an argument - it is
+    emitted code, rbp is right there) discriminates the exited callee
+    by `vframe.slots != top_rec->window` (the vframe still points at
+    the dead callee's window): record-less -> clean the callee's frame
+    from LIVE data only (window+total = the vframe, chunk/desc = the
+    relay, caller captures = g_jit_residue_caps - residue_pop already
+    parked it, dst_addr unused on this path), capture its backtrace
+    frame, then continue the raise anchored on the CALLER's rbp (the
+    caller itself may be record-less - the prefix pass recurses
+    naturally). The conveyed exception is PRE-STAMPED by #56's
+    op_fully_native contract, so no loc table is consulted.
+
+## 4-v-iii. The materializer INSERT (extends 4-iv's retarget)
+
+At a switch, record-less frames get REAL records INSERTED (top of the
+record stack, outermost-first): window/[fp-8] descent, nslots/seg from
+the chunk + cur_seg, resume = (site.caller, site.resume_pc), captures
+from the residue, call_site_packed = site.site_loc, parent fields from
+the descent, sync_stop = 0, residue flag 0. After insertion the -3
+unwind + flat resume are the plain record world; jit_call_sync_switch's
+back_rec() reads then see the materialized caller. 4-iv's retarget
+remains the record-ful half of the same walk.
+
+## 4-v-iv. The push fork + the return arm, behind MYLANG_JIT_FORCE=norec
+
+The emitted push, after the callee gates + cache probe: test the
+callee's norec_ok byte + no parked key + no live caller pure_cache ->
+the RECORD-LESS fill (window alloc + vframe repoint + binds + captures
+switch ONLY - no record, no rec_n++, no top_rec, no high-water gate)
+vs today's full fill. The gate ALSO excludes a chunk whose PRE-DELETION
+body contained a CachedCallV (scanned by NorecOkGuard's ctor before
+deletion): a record-less frame must never acquire a live vframe
+pure_cache, or its return arm would have to decline to jit_ret - whose
+record belongs to an ANCESTOR. The return arm's discrimination becomes
+the window compare (top_rec.window == rbx); its residual declines
+(ref-result, non-trivial old dst) go to a NEW helper taking rbp (the
+record-less jit_ret twin); the rec_n--/top_rec bookkeeping dies. The
+caller's sentinel arm additionally restores vframe.slots = rbx
+(idempotent for a record-ful caller - the pop already repointed it via
+the parent fields). The 4-iii/4-iv TESTS nets fork: push_verify checks
+gate-passing pushes made NO record; the parent-view pin moves behind
+the record-ful case; the retarm oracle's record compares become
+structural.
+
+## 4-v-v. Flip the default + Net 4 + measure (the ~51-instruction win).
