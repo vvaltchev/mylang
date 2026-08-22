@@ -1024,12 +1024,34 @@ struct Emitter {
     }
 
     /* Emit this fragment's epilogue(s) and patch the exits that need them.
-     * Called once per fragment, after its body and entry stubs. */
-    void emit_epilogues()
+     * Called once per fragment, after its body and entry stubs.
+     *
+     * 4-v (exit_desc): every pc-exit stores the exiting FUNCTION's
+     * descriptor into the EXIT RELAY (g_norec_exit_desc) before the ret.
+     * A conveyed exception out of a RECORD-LESS frame arrives at the
+     * caller's site with the frame's native stack already dead, so the
+     * one datum the record-less cleanup cannot derive from live state -
+     * the exited callee's identity - is captured here, on the exit path,
+     * while the fragment still knows who it is. Cold for a fully-deleted
+     * chunk (its only pc-exits are exceptions - op_fully_native means no
+     * bails and deletion forbids mid-body interpreted resumes); for a
+     * kept chunk the exit already pays a C++ round trip, so two movabs +
+     * a store are noise. rax carries the exit pc - rcx/rdx are the
+     * scratch (dead at every exit consumer). Null for main (a boundary
+     * frame is never the record-less exited callee). */
+    void emit_epilogues(const void *exit_desc, void *exit_relay)
     {
+        const auto relay_store = [&]() {
+            const uint64_t a = reinterpret_cast<uint64_t>(exit_relay);
+            const uint64_t d = reinterpret_cast<uint64_t>(exit_desc);
+            u8(0x48); u8(0xB9); u64(a);              /* movabs rcx, relay */
+            u8(0x48); u8(0xBA); u64(d);              /* movabs rdx, desc */
+            u8(0x48); u8(0x89); u8(0x11);            /* mov [rcx], rdx */
+        };
         if (!epi_flush.empty()) {
             const size_t at = pos();
             flush_cache();
+            relay_store();
             frag_ret();
             for (const size_t s : epi_flush)
                 patch32(s, static_cast<uint32_t>(at - (s + 4)));
@@ -1037,6 +1059,7 @@ struct Emitter {
         }
         if (!epi_bare.empty()) {
             const size_t at = pos();
+            relay_store();
             frag_ret();
             for (const size_t s : epi_bare)
                 patch32(s, static_cast<uint32_t>(at - (s + 4)));
@@ -3501,6 +3524,14 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         ns->op = static_cast<uint8_t>(in.op);
         ns->caller_desc = g_cur_caller_desc;   /* step 3b */
         ns->resume_pc = static_cast<uint32_t>(resume_stub);   /* step 4-i */
+        /* step 4-v: the site's inlined-at pair, from the SAME source
+         * emit_bake_call_site bakes (the record-less unwind's twin of
+         * the #88 side-channel stamp) */
+        ns->inline_chain = ck.inline_frame_at(old_pc);
+        ns->inline_pool =
+            ck.inline_frames.empty()
+                ? nullptr
+                : static_cast<const void *>(ck.inline_frames.data());
     }
     /* 4-iii (MYLANG_JIT_FORCE=norec): this site pushes the 2-qword
      * RESIDUE around the call. CACHED sites are included - the tier's
@@ -11873,7 +11904,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     /* The body ends in a native ReturnV (emit_op emitted its `ret`); every
      * other exit is a branch to an in-body label, so no trailing exit_pc.
      * An island call CAN exit though (RAISED), so the shared tail follows. */
-    e.emit_epilogues();
+    e.emit_epilogues(g_cur_caller_desc, &g_norec_exit_desc);
 
     /* Finalize: trampolines for out-of-range calls, mmap W^X, patch call
      * rel32s, flip RX. (Self-contained - does NOT touch the per-run path.) */
@@ -12969,7 +13000,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.u32(static_cast<uint32_t>(
                 tgt - (e.pos() + 4)));            /* jmp (backward) */
         }
-        e.emit_epilogues();      /* the shared exit tail(s) for THIS run */
+        e.emit_epilogues(g_cur_caller_desc, &g_norec_exit_desc);
+                                 /* the shared exit tail(s) for THIS run */
         if (g_jit_annotate)
             chunk.native.frags.push_back(
                 { static_cast<uint32_t>(frag_off[r]), 0, std::move(marks) });

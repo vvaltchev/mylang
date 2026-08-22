@@ -2705,6 +2705,8 @@ unsigned long g_jit_norec_mat_residue = 0;
  * unconditionally so the non-JIT platforms link without stubs. */
 const void *g_norec_switch_site = nullptr;
 const void *g_norec_switch_rbp = nullptr;
+/* 4-v: the EXIT RELAY (see jit.h) - the fragment epilogue's last store. */
+const void *g_norec_exit_desc = nullptr;
 #ifdef TESTS
 std::vector<NorecReconFrame> g_norec_recon;
 #endif

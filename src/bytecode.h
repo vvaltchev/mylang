@@ -1533,6 +1533,16 @@ struct NorecSite {
                                       * record with it. 0 for a leaf site
                                       * (a leaf callee makes no calls, so
                                       * no -3 originates below one). */
+    int32_t inline_chain = -1;       /* STEP 4-v: the site's inlined-at
+                                      * chain + pool (#88's pair, the same
+                                      * values emit_bake_call_site bakes
+                                      * into the side channel) - the
+                                      * record-less unwind flushes a
+                                      * frame's virtual call-site frames
+                                      * from here, where the record path
+                                      * reads the side-channel stamp. -1 =
+                                      * no chain (the common case). */
+    const void *inline_pool = nullptr;
     size_t off_switched = 0;         /* emit-time offsets of the two */
     size_t off_plain = 0;            /* return addresses            */
     const void *ret_switched = nullptr;  /* absolute - filled when the
