@@ -3,22 +3,26 @@
  * over an int, one over a double - called once each per iteration, with the
  * second receiving an int argument that widens to its double parameter.
  *
- * A capturing lambda held in an `auto` variable is the faithful translation
- * of `var add = make_adder(7)`: a value that carries its captured state and
- * is invoked through the variable. C++ knows the target statically and will
- * inline both bodies - and that is exactly the CEILING this column exists to
- * report (see bench.h): the same work with the call protocol gone. bench_sink
- * on each accumulator is what stops -O3 from close-forming the two sums to
- * O(1) once the calls are inlined (rule a).
+ * std::function is the flexibility-matched translation of
+ * `var add = make_adder(7)`: in MyLang the variable is RUNTIME state that
+ * may hold ANY callable, so every call is an indirect dispatch. A capturing
+ * lambda in an `auto` variable is NOT that - its type pins the one target,
+ * -O3 inlines both bodies, and the loop compiles to 8 instructions with
+ * ZERO calls (measured: ~8.5ms at scale 16 vs ~35.4ms for this version) -
+ * a ceiling on "the same arithmetic with the call protocol gone", not a
+ * fair race for a call-protocol bench. bench_sink_ptr on the two callables
+ * keeps their targets opaque (runtime state, rule a); bench_sink on each
+ * accumulator stops -O3 from close-forming the sums to O(1).
  */
 #include "bench.h"
+#include <functional>
 
-static auto make_adder(long base)
+static std::function<long(long)> make_adder(long base)
 {
     return [base](long k) { return base + k; };
 }
 
-static auto make_scaler(double f)
+static std::function<double(double)> make_scaler(double f)
 {
     return [f](double x) { return f * x; };
 }
@@ -30,6 +34,8 @@ int main(int argc, char **argv)
 
     auto add = make_adder(7);
     auto scale_it = make_scaler(0.5);
+    bench_sink_ptr(&add);          /* the targets are runtime state */
+    bench_sink_ptr(&scale_it);
 
     long s = 0;
     double t = 0.0;
