@@ -3076,3 +3076,95 @@ retry a decision with one register excluded.
     which sites still claim them.
  4. **Backtracking / DP**, once (2) has made the candidate sets bigger
     than one.
+
+## (aa) 2026-08-20 - alloc_scratch(caps): the seam gets its interface
+## and its first caller, and asking finds two things
+
+`alloc_scratch()` had been a DEAD SEAM since it was written - declared
+as the route every hardcoded rax/rcx/rdx must come through, called by
+NOTHING. Giving it a capability interface alone would have changed
+nothing, so this increment also converts the first site.
+
+    int alloc_scratch(need, prefer = 0, exclude = 0)
+
+**`prefer` is the whole mechanism**, and it is worth being explicit
+about why: a converted site passes the register it used to hardcode, so
+while nothing else wants that register the cost model's discount hands
+it straight back and the emitted bytes are UNCHANGED - and the day the
+register is pinned, the site takes another one instead of aborting.
+That is how rcx and rax reach the pin pool without a flag day.
+
+`exclude` is a LOCAL constraint (it holds our own input; it carries a
+status the following code reads), deliberately distinct from `denied`,
+which is a property of the whole RUN.
+
+### The first caller was the documented blocker
+
+`emit_call_epilogue`'s hoist re-derive. Its recorded fix was "add RCX
+to `HOIST_REGS_MASK`" - deny the WHOLE caller-saved pool to any run
+with a hoist region. That is exactly what the clobber mask already had
+to stop doing once, for r10/r11: **0 of 20 hoist runs corpus-wide had a
+register left**, because "walks an array in a loop" and "may pin a
+caller-saved register" had been made mutually exclusive. Asking costs
+nothing and does not have that failure mode.
+
+### ⛔ ASKING IMMEDIATELY FOUND TWO THINGS HARDCODING HAD HIDDEN
+
+**(1) THE CACHE-STATE FAMILY'S SECOND MISS.** `ra` is part of "what
+currently lives in a register", and it was not in `snapshot_cache` /
+`restore_cache` / `clear_cache_state`. A barrier therefore restored the
+pin vectors and left the allocator's occupancy at ZERO: `cache` said a
+register was pinned while `RegAlloc` said it was free. The first code
+to ASK aborted on 14 corpus programs.
+
+This is the *same* miss that family's comment was written about - a run
+of `.clear()` calls being an audit table that does not look like one -
+hit again by the very next member added to the family. It joins all
+four functions now, and **`check_pins_are_busy()`** ML_CHECKs the
+invariant wherever either record is rewritten wholesale. `is_empty()`
+deliberately does NOT consult it: its two callers (`exit_pc`'s
+write-back test, the barrier's brk guard) mean "is a SLOT held in a
+register", and a transient scratch is not a slot.
+
+**(2) REGISTER PRESSURE IS REACHABLE.** With rcx in the pool, a
+fragment at full pressure holds ELEVEN pins; add rax (the helper
+status), the two hoist registers, r12 (no `CAP_MEM_BASE`) and the three
+role registers, and nothing is free - three corpus programs reach it.
+Today the site is safe only because it hardcodes a register the pool
+never spends, which is exactly the assumption being removed.
+
+So `RegAlloc::any_capable()` plus a push/pop **SPILL** - the first in
+the allocator, and the "spill to the native stack" half of #96's
+mandate. The pair is balanced, so the stack alignment every emitted
+call site depends on is unchanged, and it runs only when a hoist region
+survives a helper call. It is a SEPARATE call from `take()` on purpose:
+spilling costs two instructions and a caller must choose it, never get
+it silently because `take()` ran out.
+
+### MEASURED - and the first number was wrong, which is worth recording
+
+Same corpus, same method both sides (rcx placed FIRST in
+`XCACHE_ORDER`, `scratch()` reporting instead of aborting):
+
+    before   806 SCRATCH-PIN conflicts, 0 failed compiles
+    after    699 SCRATCH-PIN conflicts, 0 failed compiles
+
+**107 removed by converting ONE site** - and the site that most needed
+it, since the epilogue runs after every helper call.
+
+The first reading of the "after" number was **288**, which looked like
+a 6x win and was an ARTIFACT: three programs aborted early on the
+pressure check, so their remaining conflicts were never counted. The
+spill made them compile, and the honest number went UP. **A count taken
+over runs that DIED is not a count** - the same lesson `vdjcmp.sh`
+learned when it reported a crashed run as a difference.
+
+### Where this leaves step 2
+
+The remaining **699** are the other rcx-claiming sites, and they are
+now a mechanical worklist rather than a design problem: each is a site
+that CLAIMS a register where it could REQUEST one, and each conversion
+is byte-identical by construction (pass the old register as `prefer`).
+The two hazards this one exposed are the ones to expect again - a
+family that must learn about `ra`, and a pressure point that needs a
+spill.
