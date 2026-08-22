@@ -3291,6 +3291,36 @@ static void jit_norec_register(Chunk &chunk)
         norec_ret_map()[reinterpret_cast<uintptr_t>(ns->ret_switched)] = ns;
         norec_ret_map()[reinterpret_cast<uintptr_t>(ns->ret_plain)] = ns;
         g_jit_norec_sites++;
+#ifdef TESTS
+        /* 4-i: verify the baked SWITCH resume while nothing depends on
+         * it (a wrong pc here becomes a wrong record the -3 materializer
+         * (4d) builds). Bounds always. The STRONGER claim - the resume
+         * names an EnterNative entry stub - holds only for a FULLY
+         * DELETED caller: in a kept run the interpreted original at that
+         * pc IS the resume target (vm_dispatch interprets from there),
+         * and the first unconditional version of this check aborted on
+         * exactly such a site (resume_pc 1 of 3 ops, watched). The
+         * materializer only ever uses sites of GATE-PASSING callers -
+         * which are fully deleted - so the conditional form verifies
+         * precisely the sites it will consume. Leaf sites bake no
+         * resume (a leaf callee makes no calls - no -3 below one). */
+        if (!ns->leaf) {
+            const bool bad_pc = ns->resume_pc >= chunk.code.size();
+            if (bad_pc
+                    || (jit_chunk_norec_ok(chunk)
+                        && chunk.code[ns->resume_pc].op
+                               != OpCode::EnterNative)) {
+                fprintf(stderr,
+                        "NOREC SHADOW MISMATCH: site resume_pc %u %s "
+                        "(of %zu ops)\n", ns->resume_pc,
+                        bad_pc ? "out of bounds"
+                               : "is not an EnterNative entry stub in a "
+                                 "fully-deleted caller",
+                        chunk.code.size());
+                abort();
+            }
+        }
+#endif
     }
 }
 
@@ -3393,6 +3423,13 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * tier.md). The ret-address offsets are captured after the two
      * `call rdx` emissions below; the absolute addresses are filled when
      * the buffer is placed (jit_norec_register). */
+    /* The POST-CALL entry-stub pc - the SWITCH resume. Computed ONCE so
+     * the site's resume_pc and the slow helper's rdx (below) read the
+     * same value and cannot drift (step 4-i's unification); registration
+     * verifies it names a real EnterNative stub. */
+    const int_type resume_stub =
+        g_cur_entry_remap ? (*g_cur_entry_remap)[old_pc + 1]
+                          : static_cast<int_type>(pc) + 1;
     NorecSite *ns = nullptr;
     if (g_cur_norec_sites && !jit_lever_off(JL_NOREC)) {
         g_cur_norec_sites->push_back(
@@ -3404,6 +3441,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         ns->site_loc = site;
         ns->op = static_cast<uint8_t>(in.op);
         ns->caller_desc = g_cur_caller_desc;   /* step 3b */
+        ns->resume_pc = static_cast<uint32_t>(resume_stub);   /* step 4-i */
     }
     emit_sync_push_native(e, in, is_value,
                           in.op == OpCode::CachedCallV,
@@ -3522,10 +3560,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.movabs(RSI, static_cast<uint64_t>(
                       static_cast<uint64_t>(in.a_lit())
                       | (static_cast<uint64_t>(in.b_lit()) << 32)));
-    e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(
-                      g_cur_entry_remap
-                          ? (*g_cur_entry_remap)[old_pc + 1]
-                          : static_cast<int>(pc) + 1)));
+    e.movabs(RDX, static_cast<uint64_t>(resume_stub));   /* the SWITCH
+                                        * resume - the SAME local the
+                                        * site's resume_pc holds (4-i) */
     e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
     e.movabs_r8(site);
     {
@@ -11181,6 +11218,26 @@ struct Run { size_t begin, end; };   /* [begin, end) in OLD pc space */
  * single maximal run (every op jit_op_eligible, so nothing splits it) that is
  * deletable (every op op_fully_native; single-entry is trivial for [0,n)) and
  * ends in ReturnV. */
+/* G1 step 4 (plans/g1-no-record-tier.md "STEP 4 DESIGN FACTS" 4b): may a
+ * frame RUNNING this chunk skip its call record? The record is the
+ * interpreter's ONLY resume vehicle (jit_sync_postexit drives vm_dispatch
+ * through it), so the body must be FULLY DELETED - every op EnterNative,
+ * nothing can ever run interpreted in the frame. plain_frame keeps the
+ * unwind from ever searching the frame; the ref_slots bound is the C4c
+ * release arm's own (a longer list declines the inline return, whose slow
+ * tier jit_ret reads the record). Per-CALL exclusions (a cached call) are
+ * the SITE's business, not this chunk predicate's. */
+bool jit_chunk_norec_ok(const Chunk &chunk)
+{
+    if (!chunk.plain_frame || chunk.code.empty()
+            || chunk.ref_slots.size() > RET_REF_GUARD_MAX)
+        return false;
+    for (const Instr &in : chunk.code)
+        if (in.op != OpCode::EnterNative)
+            return false;
+    return true;
+}
+
 bool jit_chunk_is_native_leaf(const Chunk &chunk)
 {
     if (!g_jit_enabled)
@@ -12767,6 +12824,11 @@ void jit_compile_chunk(Chunk &, const JitCtx *)
 bool jit_chunk_is_native_leaf(const Chunk &)
 {
     return false;
+}
+
+bool jit_chunk_norec_ok(const Chunk &)
+{
+    return false;   /* no fragments off-platform -> no record-less frames */
 }
 
 ContainerPlan jit_container_plan(const Chunk &, const JitCtx *)

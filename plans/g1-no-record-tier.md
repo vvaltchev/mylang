@@ -574,6 +574,19 @@ entirely in C++.
 
   4-i.   NorecSite::resume_pc + jit_chunk_norec_ok() (the real gate
          function, unifying the push_verify mirror) - mechanical.
+         DONE (2026-08-10). ONE local at the emit site feeds both the
+         site's resume_pc and the slow helper's rdx, so they cannot
+         drift. Registration verifies the resume: bounds always, and
+         for a FULLY-DELETED caller it must name an EnterNative entry
+         stub - the first, unconditional version of that check aborted
+         on a KEPT-run site within one -rt run (resume_pc 1 of 3 ops)
+         and taught the real semantics: in a kept run the interpreted
+         original at that pc IS the resume target; the stub is
+         guaranteed only where originals are deleted, which is exactly
+         the callers whose sites the materializer consumes. Sabotage
+         (bake resume+1) watched failing ("out of bounds"). The gate
+         classifier now calls the real jit_chunk_norec_ok (reach
+         numbers byte-identical to the removed mirror's).
   4-ii.  The raise-helper rbp argument + the mixed unwind walk, WITH
          records still written (the walk prefers reconstruction for a
          qualifying frame and cross-checks the record it still has -

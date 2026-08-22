@@ -7673,24 +7673,19 @@ extern "C" void jit_norec_push_verify(const void *site,
      *   - callee FULLY DELETED - every op is EnterNative, so the frame
      *     can never resume through the interpreter mid-body (the
      *     record is the interpreter's only resume vehicle);
-     *   - callee ref_slots small (the C4c release-arm bound - a mirror
-     *     of jit.cpp's RET_REF_GUARD_MAX; step 4 unifies the two).
+     *   - callee ref_slots small (the C4c release-arm bound).
+     * The chunk-side predicate is jit_chunk_norec_ok (jit.cpp) - the
+     * SAME function step 4's emitted gate will consult, so the reach
+     * numbers and the tier cannot drift (4-i's unification).
      */
     {
         const VmCallRec &rec = act->back_rec();
         const Chunk *cck = rec.run_chunk;
-        bool deleted = cck && !cck->code.empty();
-        if (deleted)
-            for (const Instr &i2 : cck->code)
-                if (i2.op != OpCode::EnterNative) {
-                    deleted = false;
-                    break;
-                }
         if (rec.cache_key)
             g_jit_norec_gate_cached++;
         else if (!cck || !cck->plain_frame)
             g_jit_norec_gate_plain++;
-        else if (!deleted || cck->ref_slots.size() > 6)
+        else if (!jit_chunk_norec_ok(*cck))
             g_jit_norec_gate_body++;
         else
             g_jit_norec_gate_ok++;

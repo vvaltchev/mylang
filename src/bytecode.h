@@ -1521,6 +1521,18 @@ struct NorecSite {
                                       * record is pushed at all; registered
                                       * so the entry RA check can resolve
                                       * its return address (step 2) */
+    uint32_t resume_pc = 0;          /* STEP 4-i: the POST-CALL entry-stub
+                                      * pc in `caller` - where the flat
+                                      * (JIT_RET_SWITCH) driver re-enters
+                                      * the caller once the callee
+                                      * completes. The SAME local feeds
+                                      * this and the slow helper's rdx at
+                                      * the emit site, so the two cannot
+                                      * drift. The -3 materializer (design
+                                      * 4d) rebuilds a record-less frame's
+                                      * record with it. 0 for a leaf site
+                                      * (a leaf callee makes no calls, so
+                                      * no -3 originates below one). */
     size_t off_switched = 0;         /* emit-time offsets of the two */
     size_t off_plain = 0;            /* return addresses            */
     const void *ret_switched = nullptr;  /* absolute - filled when the
