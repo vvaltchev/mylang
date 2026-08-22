@@ -2937,3 +2937,46 @@ COST (callgrind Ir, OPT=1 ASSERTS=0, one 1-vs-1): 10_recursion_deep
 fragment-recursion - the exact path step 4 relieves of the ~51-
 instruction record fill, which dwarfs this. Steps 1-3 buy nothing by
 design; this is the mechanism, not a win.
+
+## G1 no-record tier STEP 3b (2026-08-10): the descriptor chain
+
+A backtrace frame NAMES its function, and 3a left that the one thing the
+table could not supply: the site carries the CALLER of a call, never the
+CALLEE. So how does step 4 name a reconstructed frame whose record is
+gone? Through the frame BELOW it. A call recorded at site S was made from
+the function whose chunk contains S - S.caller_desc, KNOWN AT EMIT TIME
+(jit_compile_chunk's JitCtx names the function being compiled; null for
+main). And the frame a call creates sits directly ABOVE its caller. So:
+
+    desc(frame N)  ==  site(frame N+1).caller_desc
+
+- each frame's descriptor is reconstructible from the site of the frame
+one closer to the top. main has a null descriptor and a null-desc
+boundary record, so null == null closes the bottom of the chain.
+
+STEP 3b adds caller_desc to NorecSite and, in the shadow walk, checks
+that continuity against the still-present records:
+records[k].site.caller_desc == records[k-1].desc, at every native frame
+and ACROSS the segment floor (the bottom native frame's caller is the C++
+frame below, and its desc must match too - the gluing point is a desc
+match, not just a pc). This is exactly the reconstruction step 4 performs;
+proving it here, record-checked, is the dress rehearsal.
+
+Reach: norec_desc == norec_walk on both 10_recursion_deep (304,323,525)
+and 69_exc_crossframe (2,719,864 - the throwing path, where the frames
+are actually rendered into a backtrace). Sabotage watched failing:
+baking a wrong caller_desc dies "site caller_desc != the frame below's
+desc (0x1 vs (nil))" on the first -rt run. The -rt test asserts the
+desc-chain counter advanced >= the call count on the mutual recursion.
+caller_desc is a compile-time constant of the site, so it is stored in
+EVERY build (unlike the shadow-only native_rbp) - step 4's reconstruction
+reads it in release.
+
+WHAT 3b DELIBERATELY LEAVES TO STEP 4: the native-SP interleave ordering
+(design doc point 2). It only matters once record-less frames coexist
+with record-ful ones in one backtrace, which does not happen until step 4
+removes the records - today every frame still has a record, so the record
+stack IS the order. 3a proved each segment matches its rbp chain, 3b
+proves each frame's descriptor reconstructs; step 4 removes the records
+and merges the reconstructed frames with the surviving record-ful ones by
+SP.

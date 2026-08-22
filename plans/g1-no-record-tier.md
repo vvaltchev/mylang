@@ -106,8 +106,18 @@ design pays.
 
 **Exception unwind** (`vm_unwind_walk`, vm.cpp) - the hard part, see §5.
 
-**Backtrace** - the same walk, but it only needs `desc` + the call-site
-loc, both of which the side table has directly.
+**Backtrace** - the same walk. A frame shows (its function, the loc where
+it was called). STEP 3b established exactly how each is recovered, and it
+is NOT "the site has them directly" as first written - the site has the
+CALLER, not the callee:
+  - call-site loc = `site.site_loc` (directly, proven in step 2);
+  - the frame's FUNCTION = `site(the frame ABOVE it).caller_desc` - the
+    site records which function's chunk it was emitted in, so the frame a
+    call creates is named by the site one closer to the top. `desc(N) ==
+    site(N+1).caller_desc`; main's null descriptor closes the bottom.
+Both `site_loc` and `caller_desc` are compile-time constants stored in
+every build. The shadow walk (steps 3a/3b) verifies both against the
+still-present records before step 4 removes them.
 
 ## 4. Which calls qualify - the gate
 
