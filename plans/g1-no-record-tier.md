@@ -608,10 +608,29 @@ entirely in C++.
          entered (jit_enter) so their walks correctly floor at level 0 -
          69 is native-top/interpreted-middle/native-bottom, its throw
          frame a 1-frame segment.
-         (b) REMAINS: the unwind CAPTURE path consumes the chain -
-         reconstruct each popped frame's backtrace entry from the site
-         (site_loc + caller_desc) and cross-check byte-for-byte against
-         vm_capture_rec_frame's record-based output.
+         (b) DONE (2026-08-11): THE END-TO-END RECONSTRUCTION COMPARE.
+         The raise helpers additionally bake the RAISING function's desc
+         (g_cur_caller_desc at the throw emit - the one backtrace datum
+         no site can supply, since a site names its CALLER; null for
+         main). vm_raise builds g_norec_recon: the backtrace prefix of
+         the topmost segment from hardware + baked constants ONLY (the
+         baked desc seeds the descent; each level = {desc,
+         site([fp+8]).site_loc}, next desc = site.caller_desc), cross-
+         checked per level against the records at build time. The -rt
+         harness then throws uncaught through a warm 21-frame native
+         segment, catches at C++ level, and compares the recon
+         FRAME-FOR-FRAME against the exception's real captured
+         backtrace. The first run of the compare TAUGHT a composition
+         fact no per-level check could see: frames[0].call_site is
+         loc-less (0) - the innermost frame's M5b capture is never
+         stamped (the caller's postexit compares back().desc against a
+         desc it read AFTER the pop), and it is UNOBSERVABLE by design
+         (format_backtrace renders frame [0] from ex.loc_start). The
+         compare pins the stored 0, so step 4's capture rule is: leave
+         [0] loc-less, byte-identical. Sabotage watched failing: a
+         post-build std::reverse of the recon passes every per-level
+         check and fails ONLY the end-to-end compare ("recon frame 20
+         diverges") - the composition net doing exactly its job.
   4-iii. The callee return's record-less arm + the call-site residue,
          behind MYLANG_JIT_FORCE=norec (records still written but
          IGNORED by the return - the A/B lever).

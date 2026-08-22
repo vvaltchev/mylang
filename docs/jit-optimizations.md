@@ -3107,3 +3107,49 @@ cross-check byte-for-byte against the record-based capture.
 
 Lanes: dbg/clang/rel-hard -rt 1867/1867, corpus 14/14, non-JIT probe
 (g++ + clang), plain release runs.
+
+## G1 no-record tier STEP 4-ii(b) (2026-08-11): the end-to-end
+## reconstruction compare - and the loc-less frame [0] it discovered
+
+The last verification piece before behaviour changes: a complete
+backtrace prefix RECONSTRUCTED from hardware + baked emit-time constants
+only - zero record fields - compared frame-for-frame against the
+exception's real captured backtrace.
+
+The missing datum was the RAISING function's identity: a site names its
+CALLER, so no site can name the frame that contains the throw. The raise
+helpers (jit_throw / jit_rethrow / jit_end_finally) now bake it -
+g_cur_caller_desc at the throw emit, one movabs (null for main, matching
+main's null-desc boundary record). vm_raise builds `g_norec_recon`: the
+baked desc seeds the descent, each level contributes {desc,
+site([fp+8]).site_loc}, and the next desc is that site's caller_desc -
+the 3b recipe finally producing capture-shaped data. Each level is
+cross-checked against the record that still exists (which also proves
+the desc bake, suite-wide); the -rt harness then throws uncaught through
+a WARM 21-frame native segment (a try-loop warm-up defeats the cold-peak
+shape-eater: iteration 1's pushes all decline on the record-reuse guard)
+and compares the recon against the caught exception's backtrace.
+
+**WHAT THE FIRST RUN OF THE COMPARE TAUGHT** - the reason composition
+checks exist: every index matched EXCEPT frames[0].call_site == 0. The
+innermost frame's M5b capture is loc-less and its stamp never lands -
+jit_sync_postexit reads `d = back_rec().desc` AFTER the raising frame's
+walk already popped it, so the stamp's `back().desc == d` guard compares
+the callee's frame against the CALLER's desc and skips. UNOBSERVABLE by
+design: format_backtrace renders frame [0]'s line from ex.loc_start and
+never reads its call_site - so this is not a bug to fix but a fact to
+pin. The compare pins the stored 0; step 4's capture rule is therefore
+"leave [0] loc-less" for byte-identical backtraces. The recon knows MORE
+than the record path materializes.
+
+Sabotage watched failing: a post-build std::reverse of the recon
+satisfies every per-level check (desc chain, window chain, record
+cross-checks - on an alternating recursion it even keeps the desc
+column aligned) and fails ONLY the end-to-end compare ("recon frame 20
+diverges", the loc sequence betraying the order). That is precisely the
+class of bug - assembly, not fields - this net was built for.
+
+Lanes: dbg/clang/rel-hard -rt 1867/1867, corpus 14/14, non-JIT probe
+(g++ + clang), plain release runs. 4-ii complete; next is 4-iii - the
+record-less return arm + call-site residue behind MYLANG_JIT_FORCE=norec,
+where behaviour first changes.

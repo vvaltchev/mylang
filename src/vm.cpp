@@ -2650,6 +2650,9 @@ unsigned long g_jit_norec_gate_body = 0;
 unsigned long g_jit_norec_raise_walk = 0;
 unsigned long g_jit_norec_raise_frames = 0;
 #ifdef TESTS
+std::vector<NorecReconFrame> g_norec_recon;
+#endif
+#ifdef TESTS
 /* the shared chain walk (defined beside jit_norec_push_verify below);
  * vm_raise runs it from the raise site since step 4-ii */
 static size_t norec_walk_chain(VmActivation *act, const char *fp,
@@ -5583,7 +5586,7 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 static bool
 vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
          std::unique_ptr<RuntimeException> ex,
-         const void *frag_rbp = nullptr)
+         const void *frag_rbp = nullptr, const void *raise_desc = nullptr)
 {
     if (!ex->loc_start) {
         Loc s, en;
@@ -5607,6 +5610,43 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
             norec_walk_chain(&act, static_cast<const char *>(frag_rbp),
                              act.rec_n, nullptr);
         g_jit_norec_raise_walk++;
+        /*
+         * STEP 4-ii(b) - THE RECONSTRUCTION. Build the backtrace prefix
+         * this segment will contribute, from hardware + baked constants
+         * ONLY: `raise_desc` (the raising function, baked at the throw
+         * emit - the one datum no site can supply, since a site names
+         * its CALLER) seeds the descent; each level's entry is
+         * {the frame's desc, site([fp+8]).site_loc} and the next desc is
+         * that site's caller_desc (the 3b recipe, now producing the
+         * actual capture-shaped data). Cross-checked per level against
+         * the record that still exists; the -rt harness then compares
+         * the whole prefix against the exception's REAL captured
+         * backtrace - the end-to-end composition check.
+         */
+        g_norec_recon.clear();
+        const void *dcur = raise_desc;
+        const char *fp = static_cast<const char *>(frag_rbp);
+        size_t idx = act.rec_n;        /* record of the frame at fp */
+        while (idx) {
+            const void *ra =
+                *reinterpret_cast<const void *const *>(fp + 8);
+            const NorecSite *s = jit_norec_site_for(ra);
+            if (!s)
+                break;                 /* the segment floor */
+            const VmCallRec &r = act.records[idx - 1];
+            if (dcur != static_cast<const void *>(r.desc))
+                norec_fail("recon desc != record desc", dcur, r.desc);
+            if (!r.norec_site
+                    || s->site_loc
+                           != static_cast<const NorecSite *>(
+                                  r.norec_site)->site_loc)
+                norec_fail("recon site_loc != record site", s,
+                           r.norec_site);
+            g_norec_recon.push_back({ dcur, s->site_loc });
+            dcur = s->caller_desc;
+            fp = *reinterpret_cast<const char *const *>(fp);
+            idx--;
+        }
     }
 #endif
 
@@ -5717,7 +5757,8 @@ extern "C" void jit_ret_audit() noexcept
 }
 
 extern "C" int jit_throw(int_type val_slot, int_type pc,
-                         const void *lep, const void *frag_rbp) noexcept
+                         const void *lep, const void *frag_rbp,
+                         const void *raise_desc) noexcept
 {
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
@@ -5745,7 +5786,7 @@ extern "C" int jit_throw(int_type val_slot, int_type pc,
     }
     const Chunk *c2 = act.back_rec().run_chunk;
     size_t p2 = static_cast<size_t>(pc);
-    if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp))
+    if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp, raise_desc))
         return 1;                          /* boundary: signal set */
     g_vm_resume_chunk = c2;                /* same-frame: the handler pc */
     g_vm_resume_pc = p2;
@@ -5777,7 +5818,8 @@ extern "C" int jit_throw(int_type val_slot, int_type pc,
  */
 extern "C" int jit_end_finally(int_type region, int_type pc,
                                int_type inline_chain,
-                               const void *frag_rbp) noexcept
+                               const void *frag_rbp,
+                               const void *raise_desc) noexcept
 {
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
@@ -5798,7 +5840,7 @@ extern "C" int jit_end_finally(int_type region, int_type pc,
     const Chunk *c2 = rec.run_chunk;
     size_t p2 = static_cast<size_t>(pc);
     try {
-        if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp))
+        if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp, raise_desc))
             return 1;                  /* boundary: signal set */
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
@@ -5833,7 +5875,8 @@ extern "C" int jit_end_finally(int_type region, int_type pc,
  */
 extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
                            int_type inline_chain,
-                           const void *frag_rbp) noexcept
+                           const void *frag_rbp,
+                           const void *raise_desc) noexcept
 {
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
@@ -5867,7 +5910,7 @@ extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
     const Chunk *c2 = rec.run_chunk;
     size_t p2 = static_cast<size_t>(pc);
     try {
-        if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp))
+        if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp, raise_desc))
             return 1;                  /* boundary: signal set */
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
