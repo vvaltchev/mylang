@@ -3229,3 +3229,51 @@ the store gate. Either they get a genuinely free register from
 `ELEM_CAND` (which is what `elem_scratch_plan` already does for the
 other two, and what makes this tractable) or the tier DECLINES to the
 helper - which it already knows how to do.
+
+## (ac) 2026-08-20 - the ELEMENT ROLES are allocated; rcx still blocked
+## by at least one more undeclared writer
+
+`ElemRead` and `ElemScratch` held their roles as FIXED DEFAULTS. `idx`
+and `val` were already allocated; **`data` (rcx) and `count` (rdx) were
+not, and nothing DECLARED them** - no `scratch()` call, which is exactly
+why the admission survey reported a zero worklist while these tiers
+wrote rcx.
+
+### What landed
+
+**`elem_read_plan(e, idx)`** - the read tier's allocator, mirroring
+`elem_scratch_plan`. It allocates **both** `data` and `count`, and the
+asymmetry is the interesting part:
+
+  - the STORE tier's `count` is **ISA-FIXED**: its compound `/=`, `%=`
+    arms emit `cqo; idiv`, which reads RDX:RAX and writes the remainder
+    to RDX. So `elem_scratch_plan` allocates `data` ALONE.
+  - the READ tier emits no idiv - `count` is only
+    `_M_finish - _M_start`, shifted and compared - so both are free.
+
+`data` becomes a SIB base, which every `ELEM_CAND` member can be (none
+is rsp/r12). Preferred-first, so with an empty pin set the assignment is
+today's and the mechanism landed **INERT**: byte-identical on all 112
+corpus programs in BOTH arenas, -rt 1925/1925, corpus_diff 24/24.
+
+### What is still wrong, stated precisely
+
+`scripts/rcx_admission.sh 1` still ends **NOT admissible**: the worklist
+is 0, but with rcx admitted `-rt` aborts and corpus_diff is 22/24
+(16_elem2_fused, 17_elem2_divmod_roles - the same two as before).
+
+So **at least one more site writes rcx without declaring it**, and it is
+NOT the element roles - `emit_load_elem2_inline` now takes its whole
+role set from `elem_read_plan`. The search should start from those two
+programs, and the fastest route is a bisect on the EMITTERS they reach
+rather than another grep: the survey cannot help here BY CONSTRUCTION
+(that is its documented limit), so the tool to use is the failing
+program plus `-vdj`, looking for a write to rcx that no role and no
+`scratch()` accounts for.
+
+⛔ **DO NOT "FIX" THIS BY WIDENING THE SURVEY'S ASSERT.** The temptation
+is to make `scratch()` fire on every rcx write; it cannot, because the
+whole point is that these writes never call it. The durable fix is the
+one this entry continues: every register a tier writes becomes a NAMED
+ROLE taken from a plan, so "who writes this register" is answerable by
+reading the plan rather than by auditing the emitter.
