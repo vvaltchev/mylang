@@ -1,0 +1,119 @@
+# The SRC gate of the de-helperized global/capture store
+# (emit_store_src_gate, jit.cpp).
+#
+# The gate admits the CONTIGUOUS type band 3 .. t_str-1 - int, builtin,
+# float, bool, structtype - inline, and sends everything else to the
+# helper: t_none (0) and the pseudo types below it, and every reference
+# (>= t_str) whose store needs a release.
+#
+# It is emitted as ONE unsigned range test (`sub 3; cmp t_str-3; jae`),
+# so a mistake in the bias or the span silently moves the BAND EDGE -
+# admitting a reference to the inline path (a leaked/clobbered refcount)
+# or sending an int to the helper (correct, just slower). Only the first
+# is a wrong answer, and it shows as a wrong value or a crash, not as a
+# refusal - so this walks BOTH edges and every class in between.
+#
+# The stores must be to a GLOBAL and to a CAPTURE (the two ops the gate
+# guards) and must run in a LOOP, so the run is long enough to compile.
+#
+# WATCHED FAILING 2026-08-20: widening the band by one (t_str admitted to
+# the inline path) gives a heap-use-after-free on the churn() loop, which
+# ASan reports and the process aborts on.
+#
+# THE ORACLE IS ASan, NOT THE PRINTED OUTPUT. With that sabotage in, this
+# program's stdout is still CORRECT, the 5-mode differential still agrees,
+# and `-rt` is still 1925/1925 - because storing a reference without
+# releasing the old one is a refcount error, not a value error, until the
+# freed object is reused. So this file earns its keep only when run under
+# the sanitizers: tests/corpus_diff.sh on a debug build, which is what the
+# Nets differential lane does. Running it on a release build proves little.
+
+struct P { int x; }
+
+var g_int = 0;
+var g_flt = 0.0;
+var g_bool = false;
+var g_str = "";
+var g_arr = [1];
+var g_none = 0;
+dyn g_dyn = 0;
+dyn g_ty = 0;
+dyn g_bi = 0;
+
+func fill(int n) {
+    var i = 0;
+    while (i < n) {
+        g_int = i;                  # t_int  (3)   - inline
+        g_flt = i * 1.5;            # t_float(5)   - inline
+        g_bool = i % 2 == 0;        # t_bool (6)   - inline
+        g_str = "s";                # t_str  (8)   - HELPER (a reference)
+        g_arr = [i];                # t_arr        - HELPER (a reference)
+        i = i + 1;
+    }
+}
+
+# the CAPTURE half: the same band, stored through a closure's captured
+# slots rather than the global table.
+func mk() {
+    var c_int = 0;
+    var c_flt = 0.0;
+    var c_str = "";
+    var f = func [c_int, c_flt, c_str] (int n) {
+        var i = 0;
+        while (i < n) {
+            c_int = i;
+            c_flt = i * 0.5;
+            c_str = "c";
+            i = i + 1;
+        }
+        return c_int + int(c_flt) + len(c_str);
+    };
+    return f;
+}
+
+fill(400);
+print(g_int, g_flt, g_bool, g_str, g_arr);
+
+var cf = mk();
+print(cf(400));
+
+# THE LOW EDGE. `none` is type 0 - below the band, so the unsigned bias
+# must wrap it ABOVE the span and send it to the helper. A bias error
+# here admits it to the inline path, which stores a none over a slot
+# whose old value is never released.
+func fill_none(int n) {
+    var i = 0;
+    while (i < n) {
+        g_none = none;
+        g_dyn = i;
+        i = i + 1;
+    }
+}
+fill_none(400);
+print(g_none, g_dyn);
+
+# THE HIGH EDGE, repeatedly OVERWRITING a reference with a reference:
+# every iteration's store must release the previous string, so a gate
+# that wrongly inlined it would leak or double-free.
+func churn(int n) {
+    var i = 0;
+    while (i < n) {
+        g_str = "x" + str(i % 7);
+        i = i + 1;
+    }
+    return g_str;
+}
+print(churn(400));
+
+# a STRUCTTYPE value (the top of the admitted band) and a BUILTIN value
+# (inside it) stored to a global in a loop.
+func fill_edge(int n) {
+    var i = 0;
+    while (i < n) {
+        g_ty = P;
+        g_bi = len;
+        i = i + 1;
+    }
+}
+fill_edge(400);
+print(typestr(g_ty), typestr(g_bi));
