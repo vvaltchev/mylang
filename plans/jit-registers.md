@@ -2952,3 +2952,127 @@ why the rcx admission blocker is a design step and not a bug list:
 **1749 SCRATCH-PIN reports, all reg=1, none for any other register** -
 those are declared, correct, necessary clobbers, and the defect is that
 the scratch register is FIXED at rcx.
+
+## (z) 2026-08-19 - APPROACH (c): the register MODEL is built
+
+The maintainer's design, accepted 2026-08-19: *"no fixed scratch
+registers anywhere in the codegen. Only classes of equivalent
+registers... within a class, a register capability bitmask... the
+allocator should first determine the candidates that FUNCTIONALLY could
+do the job, then based on a weight system, previous use cases /
+availability in the current context, determine which is the most
+efficient choice."* Plus `take_fixed({RAX, RDX})` for the cases the ISA
+or the ABI names, and backtracking / DP where a single pass cannot
+choose well.
+
+### What is built: the MODEL and its self-test
+
+Three questions, kept apart, in `jit.cpp` above the Emitter class:
+
+    RegClass       RC_GP / RC_XMM - never interchangeable at any price
+    RegCap         a bitmask of what a register can FUNCTIONALLY do
+    gp_weight()    the opportunity cost of spending it
+
+The capability bits are the ISA's inequalities, not ours:
+
+    CAP_BYTE_NOREX    al/cl/dl/bl only - without a REX prefix, modrm
+                      4..7 mean ah/ch/dh/bh, NOT sil/dil/spl/bpl. A
+                      CORRECTNESS bit, not a size one.
+    CAP_MEM_BASE      not rsp/r12 - low 3 bits 100 MEANS "SIB follows"
+    CAP_BASE_NODISP   not rbp/r13 - low 3 bits 101 means "disp32, no
+                      base"
+    CAP_SHIFT_CNT     cl and nothing else
+    CAP_CALLEE_SAVED  survives a helper call
+    CAP_SYSV_ARG      rdi rsi rdx rcx r8 r9
+    CAP_ALLOCATABLE   the allocator may hand it out at all
+
+This IS the maintainer's "RCX can do everything R12 can, PLUS more"
+relation, expressed as a superset of bits rather than as extra classes.
+
+The weights: **+4** a SysV argument register (every emitted helper call
+rebuilds those, so a value held there is the likeliest to force a
+move), **+2** caller-saved (spilled around each call rather than
+surviving free), **+1** needs a REX byte. They **reproduce today's
+hand-written preference as an OUTPUT** - the cheapest allocatable
+register is a callee-saved low one, which is exactly why CACHE_REGS is
+spent before XCACHE_ORDER - instead of that order being an assumption
+baked into an array.
+
+### Two structural decisions worth keeping
+
+**THE CAPABILITY TABLE IS DERIVED, NOT TYPED.** `base_needs_sib` and
+`base_no_base_form` are the predicates the ENCODERS already assert on,
+so `gp_caps()` is built from the same expressions. A hand-typed table
+would be one more audited table free to drift from the code it
+describes - the failure this file has hit five times.
+
+**THE RESERVED SET IS BUILT FROM ROLE CONSTANTS.** `REG_FRAME_ANCHOR`
+and `REG_STACK_PTR` join `REG_SLOTS_BASE` as named roles, and
+`GP_RESERVED_MASK` is composed from them. A register cannot be freed
+for allocation without deleting the role that says what it is FOR.
+
+### THE SELF-TEST, and the arm that was VACUOUS
+
+`jit: the register MODEL` (-rt) re-derives every bit from the encoders,
+checks the pool invariants and the allocator's contract. **Watched
+failing seven ways**, each message recorded at the test.
+
+**One arm passed the entire suite at first**, and it is the reason to
+write them down: dropping rbx from the reserved mask - i.e. making the
+FRAME SLOTS BASE allocatable - was green, because the check asked "is
+take()'s result in `GP_RESERVED_MASK`", consulting the very constant
+the sabotage edits. It asks the ROLE CONSTANTS now. Textbook
+oracle-shares-its-subject, found only by doing the sabotage.
+
+### STATE unified, POLICY deliberately NOT
+
+`Emitter::reg_busy` became `RegAlloc::busy`, so the capability-driven
+`take()` and the positional `take_reg(pool)` cannot disagree about what
+is free; `xclob` became `denied` rather than `busy`, which is what it
+always meant (the model can now distinguish "all taken" from "all
+forbidden" in a pressure report).
+
+**The pool scan is UNCHANGED.** Switching a site from the pool to the
+cost model changes WHICH REGISTER it gets, so that happens per call
+site, each one measurable - not all at once behind a refactor. Every
+commit in this increment is byte-identical on all 111 corpus programs
+in both arenas.
+
+Three copies of the role facts collapsed into the model
+(`jit_reg_is_callee_saved` and `elem_reg_usable_nopin` now ask it, two
+of them having written the registers as bare numbers). That cost a
+cross-check, and the test names what replaced it: the POOL INVARIANTS
+cover eleven of the sixteen registers independently, the other five
+rest on the SysV ABI.
+
+### WHY BACKTRACKING AND DP ARE NOT BUILT YET
+
+Not a deferral by preference - there is nothing for them to search.
+Every allocation decision today has exactly one legal answer, because
+the ~1100 remaining hardcoded sites each demand a specific register.
+A search over a one-element candidate set is untestable machinery, and
+untestable machinery in this emitter is how a wrong register ships.
+
+They become real the moment step 2 below gives `take()` genuine
+choices, and the model is already shaped for them: `candidates(need)`
+returns the whole legal set as a mask, and `take(need, prefer)` takes a
+preference hint - which is the interface a backtracking pass needs to
+retry a decision with one register excluded.
+
+### THE ORDER FROM HERE
+
+ 1. **`alloc_scratch(caps)`** - the per-op scratch takes a capability
+    request instead of scanning {rax, rcx, rdx}. Its callers are few;
+    this is the seam the emitter's remaining hardcoding must come
+    through.
+ 2. **Thread the ~1100 unbracketed sites** so they ASK rather than
+    assume. The census is the progress bar: RAX 588, RCX 161, RDX 103.
+    This is the bulk of the remaining work and it is what unlocks
+    everything else - see (w): the rcx admission test reports 1749
+    SCRATCH-PIN conflicts, all reg=1, and they are not bugs but
+    declared, correct, necessary clobbers of a register that is FIXED
+    where it should be requested.
+ 3. **Widen the pool** - rcx, then rax - now that the model can say
+    which sites still claim them.
+ 4. **Backtracking / DP**, once (2) has made the candidate sets bigger
+    than one.
