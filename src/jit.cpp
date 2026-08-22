@@ -924,11 +924,12 @@ struct Emitter {
      * at every exit. Empty for a fragment that caches nothing. */
     std::vector<uint8_t> saved;
 
-    /* Total pushes at entry, including the base and any 8-byte pad. A
-     * fragment is entered at rsp % 16 == 8, so an ODD count lands the body
-     * at 0 - which IS the call-ready state every emitted call site assumes.
-     * Hence the pad when 1 + saved.size() is even. */
-    bool entry_pad() const { return (1 + saved.size()) % 2 == 0; }
+    /* Total pushes at entry, including rbp, the base and any 8-byte pad.
+     * A fragment is entered at rsp % 16 == 8, so an ODD count lands the
+     * body at 0 - which IS the call-ready state every emitted call site
+     * assumes. G1 step 3 added the rbp push (frame-pointer chains), so
+     * the count is now 2 + saved.size() and the pad parity FLIPPED. */
+    bool entry_pad() const { return (2 + saved.size()) % 2 == 0; }
 
     /* THE FRAGMENT ENTRY: the window arrives in rdi (from jit_enter, an
      * emitted sync `call rdx`, or a native_leaf direct call). rbx and the
@@ -949,6 +950,17 @@ struct Emitter {
         call_rax();
         pop_reg(REG_ARG0);
 #endif
+        /* G1 STEP 3 - THE FRAME-POINTER CHAIN (plans/g1-no-record-tier.md,
+         * frame pointers decided by the maintainer). Every fragment now
+         * maintains rbp: [rbp] = the caller's rbp, [rbp+8] = the return
+         * address, so a chain of fragment-to-fragment calls is walkable
+         * with two loads per level and NOTHING outside emitted code needs
+         * frame pointers - a C++ return address stops the walk before the
+         * (possibly garbage) C++ rbp link is ever dereferenced. rbp was
+         * audited FREE (the Reg enum omits 4/rsp and 5/rbp; no emitted
+         * code encodes it), and every exit funnels through frag_ret. */
+        u8(0x55);                                     /* push rbp */
+        u8(0x48); u8(0x89); u8(0xE5);                 /* mov rbp, rsp */
         push_reg(REG_SLOTS_BASE);
         for (const uint8_t r : saved)
             push_reg(r);
@@ -966,6 +978,7 @@ struct Emitter {
         for (size_t i = saved.size(); i-- > 0; )
             pop_reg(saved[i]);
         pop_reg(REG_SLOTS_BASE);
+        u8(0x5D);                                     /* pop rbp */
         u8(0xC3);
     }
     /* Pending `jmp <epilogue>` sites, split by whether the exit must
@@ -3023,6 +3036,14 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     st_q_imm32(R10, static_cast<int32_t>(P.rec_dst),
                static_cast<int32_t>(in.target));
 #ifdef TESTS
+    /* G1 step 3: the CALLER fragment's rbp - the SHADOW anchor the walk
+     * compares the rbp chain against. TESTS-only: step 4 removes the
+     * record for these frames entirely and reconstructs from the LIVE
+     * rbp chain + the table, so a stored anchor has no release consumer.
+     * reg 5 (rbp) in the modrm REG field is plain; only BASE 5 escapes. */
+    st(R10, static_cast<int32_t>(P.rec_native_rbp), 5);
+#endif
+#ifdef TESTS
     /* G1 step 1: associate the record with its side-table site so the
      * shadow verification and the full-stack audit can find the entry
      * from a live record. rax is free here - the very next instruction
@@ -3395,6 +3416,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     if (ns) {
         e.push_reg(RDI); e.push_reg(RDX);
         e.movabs(RDI, reinterpret_cast<uint64_t>(ns));
+        e.u8(0x48); e.u8(0x89); e.u8(0xEE);   /* mov rsi, rbp (the anchor:
+                                               * the caller's own frame) */
         e.movabs(RAX, reinterpret_cast<uint64_t>(&jit_norec_push_verify));
         e.call_rax();
         e.pop_reg(RDX); e.pop_reg(RDI);
@@ -4533,6 +4556,7 @@ void jit_stats_report()
         { "norec_ret",        &g_jit_norec_ret_verify },
         { "norec_frame",      &g_jit_norec_frame_verify },
         { "norec_stamp",      &g_jit_norec_stamp_verify },
+        { "norec_walk",       &g_jit_norec_walk_frames },
         { "norec_audit",      &g_jit_norec_audit_frames },
     };
     /* G1 reach probe (vm.cpp): the no-record tier's candidate gates.

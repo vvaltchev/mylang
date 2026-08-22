@@ -179,6 +179,21 @@ the correct interleaved order. Two things make this tractable:
    between two records belong between them. That is ONE extra field on
    the record - paid by the record-ful minority, not the hot path.
 
+**WHAT STEP 3a MEASURED (2026-08-10), and it refines point 2.** The rbp
+chain does NOT span the whole record stack - it covers only the TOPMOST
+CONTIGUOUS NATIVE SEGMENT. Its floor is the first C++ return address: a
+fragment entered from the interpreter (jit_enter), or a deeper call that
+declined to the C++ tier (the sync depth cap runs interpreted-flat -
+ackermann). Below that floor the record stack continues with EARLIER
+native segments the current rbp chain cannot reach. So the mixed walk is
+not "one rbp chain vs one record stack" - it is a SEQUENCE of native
+segments (each an rbp chain) glued by C++/interpreter frames, and the
+record stack is their concatenation. Point 2's native-SP field is how the
+step-4 walk finds where one segment's rbp chain ends and the next begins;
+the shadow walk already proves each segment matches its record slice
+frame-for-frame (jit_norec_push_verify), so step 4 adds the gluing, not
+the per-segment check.
+
 Still genuinely hard, and the honest risks:
 
 - **Native stack walking is the least portable thing in the codebase.**
