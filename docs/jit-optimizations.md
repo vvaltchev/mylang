@@ -3316,3 +3316,56 @@ forced; corpus 14/14 both; 150-program nested_fuzz both (5 engines);
 non-JIT probe (g++ + clang); a .myv image of the deep-switch shape
 resumes identically (the load-time JIT rebuilds the sites). Interleaved
 full-suite bench cur/base 0.999x (the retarget is cold-path only).
+
+## G1 no-record tier STEP 4-v incs 1-4 (2026-08-11): records actually
+## stop being written - behind MYLANG_JIT_FORCE=norec
+
+Seven commits (cb8b838..eb8c36d; design facts in the plan's "STEP 4-v
+DESIGN FACTS" + "4-v-ii REFINED" sections - read those first):
+
+- **inc 1**: every record carries its PARENT's view (window/nslots/seg,
+  captured at push), replacing every "records[rec_n-2] is my parent"
+  read - pop_window's repoint/cur_seg and the C4c arm's parent loads.
+  Byte-identical in the all-record world, oracle-pinned per push,
+  sabotage watched failing (on the WARMED mutual-recursion shape - the
+  self-call probe was vacuous, a self-recursive CallV is run-excluded
+  from the sync emit).
+- **inc 2**: the record-less RAISE arms, conveyance-uniform (ONE frame
+  per level - a prefix sweep double-cleans, since the native unwinding
+  still crosses each swept frame's site): vm_raise cleans a record-less
+  RAISING frame from live+baked state; jit_norec_postexit cleans a
+  record-less EXITED callee (identity from the EXIT RELAY - the
+  fragment epilogue's last store; window/total from the vframe; caller
+  captures from the residue relay, now vm.cpp-owned). The -2 arm's
+  stamp passes a null desc so frame [0] stays loc-less exactly as the
+  record path's after-the-pop desc read makes it.
+- **inc 3**: the switch materializer INSERTS full records for
+  record-less frames (window chain + sites + residue + live watermarks
+  + the parent view), seeded by the relay site; core seeds from its
+  entry-time captures. After materialization the -3 flat continuation
+  is the plain record world.
+- **inc 4, THE FORK**: a gate-passing call (norec_ok = plain + fully
+  deleted + short ref_slots + NO CachedCallV in the pre-deletion body,
+  scanned by NorecOkGuard's ctor; no parked key; no live caller cache)
+  skips the record fill entirely. The return arm discriminates by the
+  WINDOW COMPARE - which MUST PRECEDE the boundary byte test (the top
+  record is an ancestor's; main's boundary bit hijacked every
+  record-less return - norec_ret_arm 0 vs 39 pushes, then a Frame::at
+  abort at main's print with the callee's stale vframe.size). Declines
+  go to jit_ret_norec; the caller's sentinel arm restores
+  vframe.slots=rbx + size. TESTS nets forked per mode (the
+  record-pairing shadows gate off under FORCE; their replacements:
+  norec_pushes / the arm counter+oracle / norec_mat_insert).
+
+**Measured** (OPT=1 ASSERTS=0, forced-vs-unforced interleaved):
+callgrind whole-program 10_recursion -12.2%, 78 -6.1%, gcd -3.6%,
+76 -3.0% (~27-30 Ir/call net of the gate+residue); wall 10_rec 0.75x,
+78 0.88x; suite geomean 1.011x (the non-call benches pay ~1% for the
+per-push gate+residue). The DEFAULT FLIP (inc 5) is the maintainer's
+call with these numbers - the tax is shrinkable first, Net 4 remains,
+and 10_recursion's full reach wants sumto$0's CallV nativized.
+
+Lanes, both modes: dbg/clang/rel-hard -rt 1869/1869, corpus 15/15,
+150-program forced fuzz. Reach probes: 39/39 record-less on the
+alternating value-call shape, 85/85 on the 3-descent switch shape with
+the materializer inserting what the -3 path resumes through.
