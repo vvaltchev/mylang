@@ -84,7 +84,11 @@ done
 #
 # This mode normalises exactly two things and nothing else:
 #   - the `+ NN:` instruction-offset column, and
-#   - a relative branch target that is the WHOLE operand (`je +107`).
+#   - a relative branch target that is the WHOLE operand (`je +107`),
+#   - a `frag@+NNNN` fragment BASE offset, which shifts for every
+#     fragment placed after one that changed size. Found the hard way:
+#     the first run of this mode reported 39 programs as "instruction
+#     stream, not just lengths" on nothing but these.
 # Registers, memory displacements, immediates, tags and helper names
 # are all still compared, so a wrong register or a wrong offset still
 # fails. It also reports the total byte delta, which is the point of
@@ -100,6 +104,7 @@ done
 #
 shape_norm() {
     sed -e 's/^\( *\. *\)+ *[0-9][0-9]*:/\1+ N:/' \
+        -e 's/frag@+[0-9][0-9]*/frag@+N/g' \
         -e 's/^\(.*[[:space:]]\(jmp\|je\|jne\|jl\|jle\|jg\|jge\|jb\|jbe\|ja\|jae\|js\|jns\|jo\|jno\|jp\|jnp\|loop\) \)[+-][0-9][0-9]*$/\1<rel>/'
 }
 last_off() {
@@ -164,9 +169,11 @@ if [ -n "$SHAPE" ]; then
     # erased, or the mode reports a difference for every program and
     # is useless in the other direction.
     printf '%s\n' '       .   +  4: mov rcx, [rax+0x8]' \
-                   '       .   + 11: je +107' > "$TMP/nv3"
+                   '       .   + 11: je +107' \
+                   '   1  enter.nat    frag@+7219' > "$TMP/nv3"
     printf '%s\n' '       .   + 91: mov rcx, [rax+0x8]' \
-                   '       .   + 98: je +203' > "$TMP/nv4"
+                   '       .   + 98: je +203' \
+                   '   1  enter.nat    frag@+7213' > "$TMP/nv4"
     shape_norm < "$TMP/nv3" > "$TMP/nv3n"
     shape_norm < "$TMP/nv4" > "$TMP/nv4n"
     if ! cmp -s "$TMP/nv3n" "$TMP/nv4n"; then
