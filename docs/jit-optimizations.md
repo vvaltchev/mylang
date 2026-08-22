@@ -3414,3 +3414,46 @@ now byte-equivalent to the pre-flip default. Perf numbers carry over
 from the TAX SHRINK entry (the forced config already built the table).
 Lanes: dbg/clang/rel-hard -rt 1870/1870 both modes, corpus 15/15 plain
 + levers, 40-program fuzz clean.
+
+## H1 (2026-08-12): a typed CAPTURE leaf keeps its arithmetic UNBOXED
+
+A closure capture lives in `ctx->captures`, not the frame, so it can
+never BE an `Operand` (a literal or a frame slot) - `as_int_operand` /
+`as_float_operand` decline it. That decline PROPAGATED: one capture
+operand pushed the whole TypedScalarExpr onto the boxed tier, so
+`func [base] (int k) { return base + k; }` - proven int end to end by
+inference - compiled to `load.capture` + a BOXED `bin.v`, i.e.
+num_bin_op's PMF dispatch + promotion check per call. The tree-walker
+had no such hole (`Identifier::eval_int` reads a capture directly);
+only the codegen did.
+
+The fix needs NO new opcode: `try_capture_leaf` (codegen.cpp)
+MATERIALIZES the capture with the existing boxed LoadCaptureV into a
+temp and hands that temp back as the operand. A temp holding a boxed
+int IS an int frame slot - `read_int_slot` reads it by tag like any
+other, and its bool -> 0/1 arm matches `Identifier::eval_int`'s capture
+arm byte-for-byte. Only the ARITHMETIC changes tier; the capture load
+(and its JIT inline copy) is untouched. The float twin accepts an `i`
+capture too, exactly as `as_float_operand` does for a local
+(read_float_slot promotes).
+
+Measured (OPT=1 ASSERTS=0, interleaved --baseline, the full suite):
+**78_typed_param_call 0.75x wall / -23.7% Ir per iteration** (889 ->
+678, my/cpp 15.6x -> ~11x); suite geomean cur/base **0.999x**. Blast
+radius is 2 of 95 corpus programs (a `-vd` md5 sweep): 78, and
+67_make_dict - whose `make_dict(ks, func[r](k) => k*k+r)` callback
+loses its last boxed op and becomes a #55 **native_leaf** (flat: the
+dict is its cost, not the arithmetic). 11_closure_counter and
+63_closures are byte-identical - their cost is the capture STORE
+(`count++`), which is H1's next increment.
+
+**THE STAGE TRAP, in TEST form (worth reading before writing the next
+shape test).** The first version of the coverage test counted
+`OpCode::IntBin` / `FloatBin` and read **0/0/0 against correct code**:
+by the time `vm_compile` returns, `specialize_arith_ops` has rewritten
+those into the B1/B2 register-immediate family (IntAddRR ...). A test
+that reads a chunk AFTER codegen must count the FAMILY, not the
+generic op - the same "a table is audited only for the stages that
+existed when it was written" lesson, one layer up. Sabotage-watched:
+reverting `try_capture_leaf` to decline fails the shape test
+(int=0 boxed=1 where 1/0 was wanted).

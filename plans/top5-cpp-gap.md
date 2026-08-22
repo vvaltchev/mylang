@@ -67,7 +67,24 @@ refcount churn per element.
 
 ## The reduction map (sized, unordered - the maintainer sequences)
 
-- **H1 - TYPED CAPTURES (the biggest, hits 78+11+63).** Give the
+- **H1a - TYPED CAPTURE READS: DONE (2026-08-12).** No new opcode was
+  needed: `try_capture_leaf` materializes the capture with the existing
+  boxed LoadCaptureV into a temp, and the temp IS an int/float frame
+  slot the typed ops read by tag. Measured (interleaved --baseline,
+  full suite): **78 = 0.75x wall, -23.7% Ir/iter, my/cpp 15.6x -> 11x**;
+  geomean cur/base 0.999x; 67_make_dict's callback additionally became
+  a native_leaf. 11 and 63 are byte-identical - their cost is the
+  capture STORE, which is H1b. Full record: docs/jit-optimizations.md.
+- **H1b - TYPED CAPTURE WRITES (11 + 63), NEXT.** `count++` still
+  lowers to a compound StoreCaptureV (copy-modify-store through
+  num_bin_op: ~105 of 11's 355 Ir/iter). With H1a's typed READ in
+  hand the shape is `LoadCaptureV t; IntBin t2 = t + 1; <typed store>`
+  - i.e. only a PLAIN typed capture store is missing. **Gate it to the
+  compound / inc-dec forms**: a plain `cap = <rhs>` whose rhs is
+  `th == i` may be a BOOL value, and storing it as an int would change
+  the observable type (the #96 hazard); a compound's result is int by
+  arithmetic promotion, so that question does not arise.
+- **H1 (original entry) - TYPED CAPTURES (the biggest, hits 78+11+63).** Give the
   VM/JIT typed capture-slot reads/writes: the inferencer already
   types the captured var (by-value snapshot), CaptureSlots' data
   pointer is already a bare `mov` (G2's layout contract), and the
