@@ -2827,7 +2827,7 @@ above need no new encoder, only a call.
 Batches 3-6, four commits, 149 sites converted plus one new instrument
 mode. The count of lines emitting an instruction as literal bytes:
 
-    290  (start)  ->  205  ->  171  ->  104  ->  79  ->  59  ->  21
+    290 -> 205 -> 171 -> 104 -> 79 -> 59 -> 21 -> 20
 
 The census columns went the OTHER way over the same commits - RAX
 360 -> 602, RCX 99 -> 211 - and that is the conversion working, not a
@@ -2911,7 +2911,7 @@ class**, so the class body cannot name a register (`call_rax` passes a
 bare 0 with the reason in a comment). Move the enum above the class
 before the allocator needs to name defaults.
 
-### THE 21 THAT REMAIN, and why each is left
+### THE 20 THAT REMAIN, and why each is left
 
 These are not more of the same; each needs a decision, not a pattern:
 
@@ -2933,12 +2933,12 @@ These are not more of the same; each needs a decision, not a pattern:
   2  `48 D3 <modrm>` / `48 C1`    the VARIABLE-count shift: the modrm
                                   is computed from the op, so the
                                   register is already a variable.
-  5  scattered                    `push [rcx]`, `mov qword [rcx], 0`,
-                                  `lea rcx,[rbx+d]`, `mov [r9+off], al`,
+  4  scattered                    `push [rcx]`, `lea rcx,[rbx+d]`,
+                                  `mov [r9+off], al`, and
                                   `movzx eax, byte [rbx+d]`.
 
 **None of them blocks (c).** The census's blind-spot banner now covers
-21 lines instead of 290, and every register in the pin pool's candidate
+20 lines instead of 290, and every register in the pin pool's candidate
 set is visible. Finish them opportunistically; do not let them gate the
 allocator.
 

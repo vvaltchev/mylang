@@ -2483,6 +2483,15 @@ struct Emitter {
         emit_modrm_disp(0, base, d);
         u32(imm);
     }
+    void store_qword_base_imm32(uint8_t base, int32_t d, uint32_t imm)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "store_qword_base_imm32: rsp/r12 need a SIB byte");
+        u8(static_cast<uint8_t>(0x48 | (base >= 8 ? 0x01 : 0)));
+        u8(0xC7);
+        emit_modrm_disp(0, base, d);
+        u32(imm);
+    }
     void store_byte_base_imm(uint8_t base, int32_t d, uint8_t imm)
     {
         ML_CHECK_MSG(!base_needs_sib(base),
@@ -5373,8 +5382,7 @@ static size_t emit_nstack_switch_pre(Emitter &e)
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_cur));
     e.cmp_qword_base_imm8(RCX, 0);   /* cmp qword [rcx],0 */
     const size_t j_plain = e.j32(0x74);               /* je plain */
-    /* mov qword [rcx], 0  (cur = null: active) */
-    e.u8(0x48); e.u8(0xC7); e.u8(0x01); e.u32(0);
+    e.store_qword_base_imm32(RCX, 0, 0);   /* cur = null: active */
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_saved_rsp));
     e.store_base0(RSP, RCX);
     e.movabs(RCX, reinterpret_cast<uint64_t>(g_nstack_top));
