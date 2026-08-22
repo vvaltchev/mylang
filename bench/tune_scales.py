@@ -13,11 +13,47 @@
 # UNCOMMITTED for review); benches that cannot be stabilized within the cap are
 # reported, not silently dropped.
 #
+# ⛔⛔ IT GATES THE COMPARISON SIDE TOO, AND THAT IS NOT OPTIONAL (2026-08-20).
+#
+# The headline figure is a RATIO - my/cpp, my/python - so its error is the
+# error of BOTH sides. This tuner used to raise a scale until MYLANG settled
+# and never look at the denominator at all. The consequence was a false
+# regression report: 76_funcval_dispatch printed 15.26x against a recorded
+# 10.68x, and re-timing the SAME binaries at four scales in one sitting gave
+# 9.84x .. 13.02x. MyLang settled fine; the C++ side was 1.25 ms, and a 1 ms
+# process time is not a measurement.
+#
+# It was systemic, not one bench: 53 of 83 cached C++ results were under 20 ms
+# and 27 were under 5 ms - and the smallest were exactly the benches at the top
+# of the my/cpp ladder (30_str_index_iterate, 63_closures, 76_funcval_dispatch,
+# 11_closure_counter, 64_struct_create). The whole ladder rested on ~1 ms
+# denominators.
+#
+# So a scale must ALSO make the comparison run long enough that process
+# startup is negligible. MIN_CMP_SECONDS is derived, not guessed - see its
+# comment. The gate is applied to the FASTEST comparison language available
+# (C++), because one scale serves them all and the fastest one is the binding
+# constraint; python is slower by a wide margin and comes along for free.
+#
+# ⛔ A VARIANCE GATE ALONE CANNOT SUBSTITUTE. A 1.25 ms run can be perfectly
+# repeatable - 1.25, 1.25, 1.26 - and still be 30% process startup. Low
+# variance says the number is STABLE, not that it measures the LOOP. Both
+# checks are needed and they answer different questions.
+#
 # Usage:
 #   python3 bench/tune_scales.py                    # tune all, write scales.txt
 #   python3 bench/tune_scales.py --filter dict      # only some benches
 #   python3 bench/tune_scales.py --dry-run          # report, don't write
 #   python3 bench/tune_scales.py --mylang build-rel/mylang
+#   python3 bench/tune_scales.py --complang python  # gate that side instead
+#   python3 bench/tune_scales.py --min-cmp-ms 0     # MyLang-only (the old
+#                                                   # behaviour; not advised)
+#
+# AFTER TUNING, THE COMPARISON CACHES ARE STALE BY CONSTRUCTION (they are keyed
+# by scale), so rebuild them:
+#   python3 bench/run.py -cl cpp --recompute
+# A recompute that covers EVERY bench re-stamps the machine-speed marker; a
+# partial one deliberately does not.
 
 import argparse
 import math
@@ -27,8 +63,28 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run  # noqa: E402  (bench/run.py - shared timing + variance)
 
-MAX_SCALE = 64          # never bump a single bench past this multiplier
+# The safety cap on a single bench's scale. Raised from 64 to 256 when the
+# comparison-side floor arrived: 64 was sized for a VARIANCE-only tuner, where
+# a bench needing more than ~2 doublings was a noise problem to investigate
+# rather than a scale to raise. The floor is a different kind of demand - it is
+# arithmetic, and a bench whose C++ side is 1 ms genuinely needs ~20x - so the
+# old cap refused two benches (30_str_index_iterate, 46_matrix_mult) that are
+# simply short, not noisy.
+MAX_SCALE = 256
 MAX_ITERS = 6           # bump attempts per bench before giving up
+
+# ⛔ THE COMPARISON-SIDE FLOOR, DERIVED FROM THE MEASURED PROCESS COST.
+# An empty `int main(){}` compiled -O3 costs 0.31 ms best / 0.38 ms median to
+# fork+exec+exit on this class of box (measured 2026-08-20, 40 reps). For that
+# fixed cost to be under 2% of a timing - i.e. for the number to be about the
+# LOOP rather than about process startup - the run must last ~19 ms. 20 ms is
+# that, rounded.
+#
+# Raise it for a tighter ratio (37 ms puts startup under 1%); set it to 0 with
+# --min-cmp-ms 0 to get the old MyLang-only behaviour, which is what produced a
+# ladder built on 1 ms denominators.
+MIN_CMP_SECONDS = 0.020
+DEFAULT_MIN_CMP_MS = MIN_CMP_SECONDS * 1000
 
 
 def settle_target(base_reps):
@@ -54,13 +110,50 @@ def measure(mylang, my_path, scale, threshold, timeout, min_reps):
     return (err is None, v, n_reps, None)
 
 
-def bump(scale, variance, threshold):
-    """The delicately-sized next scale. The run's fixed-overhead noise falls
-    ~linearly with workload, so factor ~= variance/threshold is about what is
-    needed - but we clamp it to [1.5x, 2x] (the benches are almost stable, a
-    wild jump would waste time), and always advance by at least +1 (integer
-    scale)."""
+def measure_cmp(lang, bench, scale, threshold, timeout):
+    """Time the COMPARISON side at `scale` through run.py's own adaptive gate.
+
+    Returns (best_seconds, settled_bool, error_or_None); (None, False, err)
+    when the language has no source for this bench or the build/run failed."""
+    if lang is None or not lang.has(bench):
+        return (None, False, None)        # MyLang-only bench: nothing to gate
+    prefix, err = lang.prepare(bench)
+    if err:
+        return (None, False, err)
+    best, _out, err, _n, _v = run.measure_adaptive(
+        prefix + [str(scale)], threshold, timeout)
+    if err and not err.startswith("variance"):
+        return (None, False, err)
+    return (best, err is None, None)
+
+
+def bump(scale, variance, threshold, cmp_time=None):
+    """The delicately-sized next scale.
+
+    TWO REASONS TO BUMP, and they are sized DIFFERENTLY on purpose:
+
+    (1) VARIANCE (noisy run). The fixed-overhead noise falls ~linearly with
+        workload, so factor ~= variance/threshold is about what is needed -
+        but variance is itself a noisy estimate, so we clamp to [1.5x, 2x]
+        (the benches are almost stable; a wild jump would waste time).
+
+    (2) THE COMPARISON FLOOR (run too short to mean anything). This is NOT a
+        noise estimate - it is arithmetic. Time scales linearly with `scale`,
+        so reaching MIN_CMP_SECONDS from `cmp_time` needs exactly
+        MIN_CMP_SECONDS/cmp_time, and clamping that to 2x would take six
+        doublings to cross a 25x gap - more than MAX_ITERS, so the bench would
+        be reported as "did not converge" when the answer was known in one
+        step. So this factor is applied DIRECTLY, with 15% headroom.
+
+        (Linearity is what the `-npc` default buys: with the pure-call cache
+        ON, 09_fib_recursive costs the same at scale 1 and scale 3 because
+        iterations 2..N are cache hits. run.py passes -npc, so scale is linear
+        again - see CLAUDE.md's note on the invalid 0.09x reading.)
+
+    Whichever demands more wins; always advance at least +1 (integer scale)."""
     factor = min(2.0, max(1.5, variance / threshold))
+    if cmp_time is not None and cmp_time > 0 and cmp_time < MIN_CMP_SECONDS:
+        factor = max(factor, 1.15 * MIN_CMP_SECONDS / cmp_time)
     nxt = math.ceil(scale * factor)
     return max(nxt, scale + 1)
 
@@ -89,9 +182,21 @@ def main():
                          "uses (default 0.05 = 5%%; a pre-pooled-allocator "
                          "floor, tighten after the pooled-alloc TODO)")
     ap.add_argument("--timeout", type=float, default=120.0)
+    ap.add_argument("--complang", "-cl", default="cpp",
+                    help="which comparison language's runtime to ALSO gate "
+                         "(default cpp - the fastest, so the binding one; "
+                         "one scale serves them all)")
+    ap.add_argument("--min-cmp-ms", type=float, default=DEFAULT_MIN_CMP_MS,
+                    help="the comparison run must last at least this long, so "
+                         "process startup is a negligible share of it "
+                         "(default %(default).0f ms; 0 disables the gate and "
+                         "restores the MyLang-only behaviour)")
+    ap.add_argument("--cxx", default="g++")
     ap.add_argument("--dry-run", action="store_true",
                     help="report proposed bumps but do not write scales.txt")
     args = ap.parse_args()
+    global MIN_CMP_SECONDS
+    MIN_CMP_SECONDS = args.min_cmp_ms / 1000.0
 
     mylang = run.find_mylang(args.mylang)
     if not mylang:
@@ -112,8 +217,23 @@ def main():
     table = run.load_scales()
     reps_table = run.load_reps()     # per-bench reps baselines (scale-immune)
     thr = args.var_threshold
-    print("tuning %d benches with %s (run.py's adaptive gate, target var<=%.1f%%)"
-          "\n" % (len(names), mylang, thr * 100))
+    lang = None
+    if MIN_CMP_SECONDS > 0:
+        langs = run.build_complangs(sys.executable, args.cxx)
+        lang = langs.get(args.complang)
+        if lang is None:
+            sys.exit("error: unknown comparison language %r (have: %s)"
+                     % (args.complang, ", ".join(sorted(langs))))
+    print("tuning %d benches with %s (run.py's adaptive gate, "
+          "target var<=%.1f%%)" % (len(names), mylang, thr * 100))
+    if lang is not None:
+        print("comparison side GATED: %s must run >= %.0f ms "
+              "(so process startup is a negligible share of the RATIO)"
+              % (lang.name, MIN_CMP_SECONDS * 1000))
+    else:
+        print("comparison side NOT gated (--min-cmp-ms 0) - the ratios this "
+              "produces can be dominated by process startup")
+    print()
 
     changed = []     # (name, old, new, final_var)
     failed = []      # (name, reason)
@@ -128,6 +248,7 @@ def main():
         scale = start_scale
         last_v = None
         last_reps = 0
+        last_cmp = None
         for _ in range(MAX_ITERS):
             settled, v, n_reps, err = measure(mylang, my_path, scale, thr,
                                               args.timeout, base_reps)
@@ -136,15 +257,37 @@ def main():
                 break
             last_v = v
             last_reps = n_reps
-            if settled and n_reps <= target:
+            # THE DENOMINATOR. A bench with no source in this language is
+            # MyLang-only and has no ratio to protect, so it is not gated.
+            cmp_t, cmp_settled, cmp_err = measure_cmp(
+                lang, name, scale, thr, args.timeout)
+            if cmp_err:
+                failed.append((name, "%s: %s" % (lang.name, cmp_err)))
+                break
+            last_cmp = cmp_t
+            cmp_ok = (cmp_t is None
+                      or (cmp_t >= MIN_CMP_SECONDS and cmp_settled))
+            if settled and n_reps <= target and cmp_ok:
                 if scale != start_scale:
                     changed.append((name, start_scale, scale, v))
                 table[name] = scale
                 break
-            nxt = bump(scale, v, thr)
+            nxt = bump(scale, v, thr, cmp_t)
+            # ⛔ TRY THE CAP, DO NOT REFUSE A PREDICTION. `bump` EXTRAPOLATES
+            # (linear in scale); the cap is a fact. Giving up because the
+            # prediction overshoots reports "could not stabilize" for a bench
+            # the cap might well handle - and it did, for the two benches
+            # whose work is superlinear-ish in wall time. Measure the cap
+            # instead, and only then report failure.
+            if nxt > MAX_SCALE and scale < MAX_SCALE:
+                nxt = MAX_SCALE
             if nxt > MAX_SCALE:
-                failed.append((name, "var %.1f%% at scale %d, next %d > cap %d"
-                               % (v * 100, scale, nxt, MAX_SCALE)))
+                why = "var %.1f%%" % (v * 100)
+                if last_cmp is not None and last_cmp < MIN_CMP_SECONDS:
+                    why = "%s only %.1f ms (need %.0f)" % (
+                        lang.name, last_cmp * 1000, MIN_CMP_SECONDS * 1000)
+                failed.append((name, "%s at scale %d, next %d > cap %d"
+                               % (why, scale, nxt, MAX_SCALE)))
                 table[name] = scale
                 break
             scale = nxt
@@ -153,9 +296,11 @@ def main():
                            % ((last_v or 0) * 100)))
         marker = ("bumped %d->%d" % (start_scale, table.get(name, start_scale))
                   if table.get(name, start_scale) != start_scale else "ok")
-        print("  %-24s scale=%-3d var=%5.1f%% (%dr)  %s"
+        cmp_s = ("%s %6.1fms" % (lang.name, last_cmp * 1000)
+                 if last_cmp is not None else "no cmp    ")
+        print("  %-24s scale=%-3d var=%5.1f%% (%dr)  %s  %s"
               % (name, table.get(name, start_scale),
-                 (last_v or 0) * 100, last_reps, marker))
+                 (last_v or 0) * 100, last_reps, cmp_s, marker))
 
     print()
     if changed:
