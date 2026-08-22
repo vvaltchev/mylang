@@ -18086,6 +18086,7 @@ static bool jit_norec_shadow()
     const unsigned long v0 = g_jit_norec_verify;
     const unsigned long s0 = g_jit_norec_sites;
     const unsigned long a0 = g_jit_norec_audit_frames;
+    const unsigned long r0 = g_jit_norec_ret_verify;
     const bool saved_audit = g_norec_audit;      /* save/restore: an
                                                   * env-gated tool toggled
                                                   * by one test must not
@@ -18127,6 +18128,14 @@ static bool jit_norec_shadow()
         return false;
     }
     const unsigned long calls = g_jit_norec_verify - v0;
+    /* step 2 seed: the hardware-RA check must have run for these same
+     * calls - a sync callee's entry sees the caller's return address */
+    if (g_jit_norec_ret_verify - r0 < calls) {
+        fprintf(stderr, "jit_norec_shadow: the entry RA check ran %lu "
+                        "times for %lu sync calls\n",
+                g_jit_norec_ret_verify - r0, calls);
+        return false;
+    }
     if (calls < 20) {
         fprintf(stderr, "jit_norec_shadow: verify ran %lu times "
                         "(< the recursion depth)\n", calls);
@@ -25669,6 +25678,7 @@ static bool jit_counter_coverage()
         { "sync_inline",      &g_jit_sync_inline,      nullptr },
         { "norec_sites",      &g_jit_norec_sites,      nullptr },
         { "norec_verify",     &g_jit_norec_verify,     nullptr },
+        { "norec_ret",        &g_jit_norec_ret_verify,  nullptr },
         { "callee_cache",     &g_jit_callee_cache,     nullptr },
         { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
         { "bind_coerce",      &g_jit_bind_coerce,      nullptr },

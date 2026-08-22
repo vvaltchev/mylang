@@ -2813,3 +2813,39 @@ LANES RUN 2026-08-10, and the push found TWO MORE step-1 bugs first
 After the fixes: dbg/clang/rel-hard/stats all 1867/1867 with raw exit 0,
 corpus_diff plain + audit-on + norec-lever configs agree, non-JIT probe
 builds green on g++ AND clang, CMake Debug builds + passes.
+
+## G1 no-record tier STEP 2 seed (2026-08-10): the hardware return address
+## falsifies the table
+
+The step-1 record said it plainly: a corrupted ret-address OFFSET was
+self-consistent, because every lookup key came from the entry's own
+field. This closes that hole with the only key the entry cannot supply -
+the HARDWARE one. At the top of EVERY fragment entry (frag_entry, TESTS
+builds), [rsp] - the return address the caller's `call` just pushed - is
+handed to jit_norec_ret_verify: a C++ address (jit_enter and friends)
+resolves to no fragment and passes; an address in EMITTED code means a
+fragment-to-fragment call, and the table must resolve it to a site
+recording EXACTLY that address, or abort.
+
+Two fragment-to-fragment call forms exist and BOTH are now in the table:
+the M5b sync `call rdx` (two addresses per site) and the #55 native-leaf
+`call rcx` - the leaf sites are registered address-only, marked `leaf`
+(no record is pushed there; that is the leaf protocol's point). Without
+them the entry check would false-abort on every leaf call.
+
+SABOTAGE 2 RE-RUN, now WATCHED FAILING: the off-by-one ret-address
+offset that step 1 could not catch dies with "NOREC RET MISMATCH: RA
+0x... is in emitted code but resolves to no site" on the first -rt run.
+The table's addresses are no longer self-certifying.
+
+Reach: norec_ret == norec_verify EXACTLY (1,352,549 on
+10_recursion_deep; 149,998 on 45_gcd) - every sync call's return address
+resolved through the table on its callee's entry.
+
+COST, stated for the record: the dbg -rt lane 17s -> ~23s (one helper
+call per fragment ENTRY, TESTS builds only; a release build emits none
+of it). Per the agreed testing plan, a slow test's frequency is the
+maintainer's call - flagged, not trimmed.
+
+Lanes: dbg/clang/rel-hard/stats 1867/1867 with RAW exit 0, corpus 14/14
+plain + audit-on, non-JIT probe green, nested_fuzz 1000 programs.

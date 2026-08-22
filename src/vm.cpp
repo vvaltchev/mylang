@@ -7523,6 +7523,7 @@ void jit_fill_push_layout(JitPushLayout *L)
 unsigned long g_jit_norec_sites = 0;
 unsigned long g_jit_norec_verify = 0;
 unsigned long g_jit_norec_audit_frames = 0;
+unsigned long g_jit_norec_ret_verify = 0;
 bool g_norec_audit = false;
 
 #ifdef TESTS

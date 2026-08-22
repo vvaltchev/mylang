@@ -888,6 +888,19 @@ const Chunk *jit_norec_frag_for(const void *addr);
  * the activation's top record, which only vm.cpp can see). NEVER throws
  * (the #142 rule); a mismatch is a deliberate located abort. */
 extern "C" void jit_norec_push_verify(const void *site) noexcept;
+/*
+ * G1 STEP 2 seed: the HARDWARE return address vs the table. Emitted at
+ * the top of EVERY fragment entry (TESTS): if [rsp] at entry lies in
+ * EMITTED code, the caller was a fragment-to-fragment call - a sync
+ * `call rdx` or a #55 leaf `call rcx` - and the table MUST resolve it to
+ * a site recording exactly that address. This is the check the step-1
+ * sabotage run proved was missing: a corrupted ret-address OFFSET was
+ * self-consistent, because every lookup key came from the same field. A
+ * C++ return address (jit_enter and friends) resolves to no fragment and
+ * passes silently. Defined in jit.cpp (it needs only the registries).
+ */
+extern "C" void jit_norec_ret_verify(const void *ra) noexcept;
+extern unsigned long g_jit_norec_ret_verify;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
  * bumped by the emitted code itself, so it proves the inline tier ran (the
  * jit_ret helper's own counter also counts declines and cannot). */
