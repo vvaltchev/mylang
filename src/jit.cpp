@@ -2268,6 +2268,43 @@ struct Emitter {
     /* test r32, r32 - the 0/nonzero check every helper-status site
      * emits. 59 of them spelled `u8(0x85); u8(0xC0)`, so `grep RAX`
      * saw none of them. */
+    /* inc qword [base] - the TESTS counter bump, and the record/segment
+     * pushes. Fourteen sites spelled `48 FF 01`, hiding rcx. */
+    void inc_qword_base(uint8_t base)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base) && !base_no_base_form(base),
+                     "inc_qword_base: rsp/r12 need SIB, rbp/r13 a disp");
+        u8(static_cast<uint8_t>(0x48 | (base >= 8 ? 0x01 : 0)));
+        u8(0xFF);
+        u8(static_cast<uint8_t>(base & 7));
+    }
+    /* dec dword [base] */
+    void dec_dword_base(uint8_t base)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base) && !base_no_base_form(base),
+                     "dec_dword_base: rsp/r12 need SIB, rbp/r13 a disp");
+        if (base >= 8)
+            u8(0x41);
+        u8(0xFF);
+        u8(static_cast<uint8_t>(0x08 | (base & 7)));
+    }
+    /* xor r32, r32 - the canonical zeroing idiom */
+    void zero_reg32(uint8_t r)
+    {
+        if (r >= 8)
+            u8(0x45);
+        u8(0x31);
+        u8(static_cast<uint8_t>(0xC0 | ((r & 7) << 3) | (r & 7)));
+    }
+    /* movzx r32, r8 - widen a byte result (setcc, a bool element) */
+    void movzx_r32_r8(uint8_t dst, uint8_t src)
+    {
+        if (dst >= 8 || src >= 8)
+            u8(static_cast<uint8_t>(0x40 | (dst >= 8 ? 0x04 : 0)
+                                    | (src >= 8 ? 0x01 : 0)));
+        u8(0x0F); u8(0xB6);
+        u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7)));
+    }
     void test32_rr(uint8_t a, uint8_t b)
     {
         if (a >= 8 || b >= 8)
@@ -4641,7 +4678,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         ld(RCX, RAX, static_cast<int32_t>(L.desc_vm_chunk)); /* rcx = cck */
 #ifdef TESTS
         movabs_r10(reinterpret_cast<uint64_t>(&g_jit_coerce_cached));
-        e.u8(0x49); e.u8(0xFF); e.u8(0x02);           /* inc qword [r10] */
+        e.inc_qword_base(R10);           /* inc qword [r10] */
 #endif
         e.patch32_here(j_to_args);
     }
@@ -4764,14 +4801,14 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * ran". Without the split a guard that quietly stopped widening
          * would keep both correct AND counted. */
         movabs_r10(reinterpret_cast<uint64_t>(&g_jit_bind_widen));
-        e.u8(0x49); e.u8(0xFF); e.u8(0x02);           /* inc qword [r10] */
+        e.inc_qword_base(R10);           /* inc qword [r10] */
 #endif
         for (const size_t j : j_next)
             e.patch32_here(j);
     }
 #ifdef TESTS
     movabs_r11(reinterpret_cast<uint64_t>(&g_jit_bind_coerce));
-    e.u8(0x49); e.u8(0xFF); e.u8(0x03);               /* inc qword [r11] */
+    e.inc_qword_base(R11);               /* inc qword [r11] */
 #endif
     if (cache_addr) {
         const size_t j_coerce_done = e.j32(0xEB);     /* jmp -> done */
@@ -4783,11 +4820,11 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * both jumps to the same address and emits none of this. */
         e.patch32_here(j_hit0);                       /* hit, entry 0: */
         movabs_r11(reinterpret_cast<uint64_t>(&g_jit_callee_cache));
-        e.u8(0x49); e.u8(0xFF); e.u8(0x03);           /* inc qword [r11] */
+        e.inc_qword_base(R11);           /* inc qword [r11] */
         const size_t j_shared = e.j32(0xEB);
         e.patch32_here(j_hit1);                       /* hit, entry 1: */
         movabs_r11(reinterpret_cast<uint64_t>(&g_jit_callee_cache2));
-        e.u8(0x49); e.u8(0xFF); e.u8(0x03);           /* inc qword [r11] */
+        e.inc_qword_base(R11);           /* inc qword [r11] */
         e.patch32_here(j_shared);
 #else
         e.patch32_here(j_hit0);                       /* hit: */
@@ -4899,7 +4936,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         st(R11, 0, RAX);
 #ifdef TESTS
         movabs_r11(reinterpret_cast<uint64_t>(&g_jit_norec_pushes));
-        e.u8(0x49); e.u8(0xFF); e.u8(0x03);           /* inc qword [r11] */
+        e.inc_qword_base(R11);           /* inc qword [r11] */
 #endif
         j_norec_join = e.j32(0xEB);                   /* jmp the tail */
         e.patch32_here(j_rec1);
@@ -5040,7 +5077,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
 #ifdef TESTS
         if (fsrc >= 0) {
             movabs_r10(reinterpret_cast<uint64_t>(&g_jit_arg_inplace));
-            e.u8(0x49); e.u8(0xFF); e.u8(0x02);       /* inc qword [r10] */
+            e.inc_qword_base(R10);       /* inc qword [r10] */
         }
 #endif
         ld(RAX, RBX, s + 24);                         /* rax = type* */
@@ -5440,10 +5477,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.u8(0xFF); e.u8(0x01);                        /* inc dword [rcx] */
 #ifdef TESTS
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_sync_inline));
-    e.u8(0x48); e.u8(0xFF); e.u8(0x01);            /* inc qword [rcx] */
+    e.inc_qword_base(RCX);            /* inc qword [rcx] */
     e.movabs(RCX, reinterpret_cast<uint64_t>(
                       &g_jit_op_run[static_cast<size_t>(in.op)]));
-    e.u8(0x48); e.u8(0xFF); e.u8(0x01);            /* inc qword [rcx] */
+    e.inc_qword_base(RCX);            /* inc qword [rcx] */
     /* G1 step 1: the SHADOW VERIFICATION - compare the record the push
      * just filled against the side-table entry, every call, before the
      * callee runs. Only rdi (the callee window) and rdx (the fragment
@@ -5924,7 +5961,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
              * zeroed payload */
             e.movabs(RAX, reinterpret_cast<uint64_t>(L.t_none));
             st(RCX, static_cast<int32_t>(L.off_type), RAX);
-            e.u8(0x31); e.u8(0xC0);                /* xor eax, eax */
+            e.zero_reg32(RAX);                /* xor eax, eax */
             for (int32_t o = 0; o < 24; o += 8)
                 st(RCX, o, RAX);
         }
@@ -6131,7 +6168,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                  * zeroed payload (the record-ful Halt arm's shape) */
                 e.movabs(RAX, reinterpret_cast<uint64_t>(L.t_none));
                 st(RDX, static_cast<int32_t>(L.off_type), RAX);
-                e.u8(0x31); e.u8(0xC0);            /* xor eax, eax */
+                e.zero_reg32(RAX);            /* xor eax, eax */
                 for (int32_t o = 0; o < 24; o += 8)
                     st(RDX, o, RAX);
             }
@@ -8848,7 +8885,7 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
          * the helper's args come after). */
         if (xr != X0) {
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fstore_movx0));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+            e.inc_qword_base(RCX);   /* inc qword [rcx] */
         }
 #endif
         /* the value register is an ARGUMENT now - the emitter puts it
@@ -9239,7 +9276,7 @@ static void emit_release_preheader(Emitter &e, const std::vector<int> &slots)
 #ifdef TESTS
     if (!slots.empty()) {
         e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_release_entry));
-        e.u8(0x48); e.u8(0xFF); e.u8(0x01);    /* inc qword [rcx] */
+        e.inc_qword_base(RCX);    /* inc qword [rcx] */
     }
 #endif
 }
@@ -9485,7 +9522,7 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
     if (aop == Op::shr) {
         e.u8(0x48); e.u8(0xC1); e.u8(0xF8); e.u8(63);    /* sar rax,63 */
     } else {
-        e.u8(0x31); e.u8(0xC0);                          /* xor eax,eax */
+        e.zero_reg32(RAX);                          /* xor eax,eax */
     }
     e.u8(0xE9);
     const size_t jdone = e.pos(); e.u32(0);
@@ -11525,7 +11562,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.patch32_here(j_div);
             }
             e.cqo();              /* cqo */
-            e.u8(0x48); e.u8(0xF7); e.u8(0xF9);  /* idiv rcx */
+            e.idiv_reg(RCX);  /* idiv rcx */
             write_slot(e, ck, in.aop == Op::div ? RAX : RDX, in.target, pc);
             return true;
         case Op::shl: case Op::shr: case Op::ushr:
@@ -11564,7 +11601,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             const int_type c = in.b_lit();
             if (c >= 64) {
                 if (shl) {
-                    e.u8(0x31); e.u8(0xC0);              /* xor eax,eax */
+                    e.zero_reg32(RAX);              /* xor eax,eax */
                 } else {
                     e.u8(0x48); e.u8(0xC1); e.u8(0xF8);
                     e.u8(63);                            /* sar rax,63 */
@@ -11615,7 +11652,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         e.movabs(tmp, static_cast<uint64_t>(in.b_lit()));
         e.cqo();                          /* cqo */
-        e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
+        e.idiv_reg(RCX);              /* idiv rcx */
         write_slot(e, ck, RDX, in.target, pc);            /* remainder */
         return true;
     }
@@ -11640,7 +11677,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.movabs(tmp, static_cast<uint64_t>(dv));
         }
         e.cqo();                          /* cqo */
-        e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
+        e.idiv_reg(RCX);              /* idiv rcx */
         write_slot(e, ck, RDX, in.target, pc);
         return true;
     }
@@ -12710,7 +12747,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 const size_t js4 = e.j32(0x75);
 #ifdef TESTS
                 e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_ctor_fast));
-                e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+                e.inc_qword_base(RCX);   /* inc qword [rcx] */
 #endif
                 /* r9 = bytes data (vector _M_start at +0, probed) */
                 e.u8(0x4C); e.u8(0x8B); e.u8(0x88);
@@ -12787,7 +12824,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>(cc_for(in.aop).near_op + 0x10));
         e.u8(0xC0);                               /* setcc al */
-        e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);       /* movzx eax, al */
+        e.movzx_r32_r8(RAX, RAX);       /* movzx eax, al */
         store_dst_bool(e, ck, RAX, in.target);
         return true;
     }
@@ -12810,7 +12847,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
         e.u8(0xC0);                               /* setcc al */
-        e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);       /* movzx eax, al */
+        e.movzx_r32_r8(RAX, RAX);       /* movzx eax, al */
         store_dst_bool(e, ck, RAX, in.target);
         return true;
     }
@@ -13539,7 +13576,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(0x0F);
                 e.u8(static_cast<uint8_t>(cc_for(bo.aop).near_op + 0x10));
                 e.u8(0xC0);                           /* setcc al */
-                e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);   /* movzx eax, al */
+                e.movzx_r32_r8(RAX, RAX);   /* movzx eax, al */
                 store_dst_bool(e, ck, RAX, in.target);
             } else {
                 if (dv) {
@@ -13562,7 +13599,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         e.patch32_here(j_div);
                     }
                     e.cqo();              /* cqo */
-                    e.u8(0x48); e.u8(0xF7); e.u8(0xF9);  /* idiv rcx */
+                    e.idiv_reg(RCX);  /* idiv rcx */
                     if (bo.aop == Op::mod)
                         e.mov_rr(RAX, RDX);              /* the remainder */
                 } else {
@@ -13660,7 +13697,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(0x0F);
                 e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
                 e.u8(0xC0);                           /* setcc al */
-                e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);   /* movzx eax, al */
+                e.movzx_r32_r8(RAX, RAX);   /* movzx eax, al */
                 store_dst_bool(e, ck, RAX, in.target);
             } else {
                 if (bo.aop == Op::div && !bo.b.is_lit) {
@@ -14187,7 +14224,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u32(static_cast<uint32_t>(moff));
                 e.test32_rr(RAX, RAX);               /* test eax, eax */
                 e.u8(0x0F); e.u8(0x95); e.u8(0xC0);   /* setne al */
-                e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);   /* movzx eax, al */
+                e.movzx_r32_r8(RAX, RAX);   /* movzx eax, al */
                 store_dst(e, ck, RAX, in.target, pc);
                 break;
             default:                       /* int field read as float */
@@ -14229,7 +14266,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 #endif
 #ifdef TESTS
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_member_noguard));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);    /* inc qword [rcx] */
+            e.inc_qword_base(RCX);    /* inc qword [rcx] */
 #endif
             e.load(RAX, b.payload);            /* rax = StructObject* */
             emit_field_read();
@@ -14250,7 +14287,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             const size_t js2 = e.j32(0x75);
 #ifdef TESTS
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_member_fast));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);    /* inc qword [rcx] */
+            e.inc_qword_base(RCX);    /* inc qword [rcx] */
 #endif
             emit_field_read();
             j_done = e.j32(0xEB);
@@ -16802,7 +16839,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                     vol = true;
             if (vol) {
                 e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_xcache));
-                e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+                e.inc_qword_base(RCX);   /* inc qword [rcx] */
             }
         }
 #endif
@@ -16821,7 +16858,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             /* the execution proof: bumped per ENTRY of a float-pinned
              * fragment (the g_jit_hoist pattern) */
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fcache));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+            e.inc_qword_base(RCX);   /* inc qword [rcx] */
         }
 #endif
         /* C4b: the float LITERAL pool - materialised once here (and at
@@ -16832,7 +16869,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 #ifdef TESTS
         if (!e.flits.empty()) {
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_flit));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+            e.inc_qword_base(RCX);   /* inc qword [rcx] */
         }
 #endif
         /*
@@ -16907,13 +16944,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 #ifdef TESTS
         if (!e.tflush.empty()) {
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_telide));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+            e.inc_qword_base(RCX);   /* inc qword [rcx] */
         }
 #endif
 #ifdef TESTS
         if (!e.fread.empty()) {
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_fread));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+            e.inc_qword_base(RCX);   /* inc qword [rcx] */
         }
 #endif
 
@@ -17380,7 +17417,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 #ifdef TESTS
                         e.movabs(RCX, reinterpret_cast<uint64_t>(
                                           &g_jit_ctor_est));
-                        e.u8(0x48); e.u8(0xFF); e.u8(0x01);
+                        e.inc_qword_base(RCX);
 #endif
                     }
                     g_fwd = JitFwd{};             /* the calls clobbered rax */
@@ -17488,7 +17525,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 #ifdef TESTS
             e.movabs(RCX,
                      reinterpret_cast<uint64_t>(&g_jit_entry_resume));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x01);   /* inc qword [rcx] */
+            e.inc_qword_base(RCX);   /* inc qword [rcx] */
 #endif
             const size_t tgt = label[pe.first - begin];
             e.u8(0xE9);
