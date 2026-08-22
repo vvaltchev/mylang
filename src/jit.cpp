@@ -2218,6 +2218,18 @@ struct Emitter {
         u8(static_cast<uint8_t>(((dst & 7) << 3) | 4));      /* SIB */
         u8(static_cast<uint8_t>(0xC0 | ((index & 7) << 3) | (base & 7)));
     }
+    /* cmp [base + disp], reg - the r/m destination direction. NOT the
+     * same instruction as cmp_reg_base: the operand ORDER decides which
+     * way the flags read for the signed conditions. */
+    void cmp_base_reg(uint8_t base, int32_t d, uint8_t reg)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "cmp_base_reg: rsp/r12 need a SIB byte");
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x39);
+        emit_modrm_disp(reg, base, d);
+    }
     /* cmp reg, [base + disp] */
     void cmp_reg_base(uint8_t reg, uint8_t base, int32_t d)
     {
@@ -2424,6 +2436,104 @@ struct Emitter {
             u8(0x41);
         u8(0xFF);
         u8(static_cast<uint8_t>(base & 7));
+    }
+    /*
+     * #96 batch 6 - the MEMORY-WITH-IMMEDIATE family. These all put the
+     * base register in the modrm byte, so every one of them was a
+     * register the census could not see. They route through
+     * emit_modrm_disp like every other base form, so the emitter has
+     * ONE displacement policy (disp8 when it fits) rather than a second
+     * one that exists only because these sites were written by hand.
+     */
+    void cmp_dword_base_imm8(uint8_t base, int32_t d, int8_t imm)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "cmp_dword_base_imm8: rsp/r12 need a SIB byte");
+        if (base >= 8)
+            u8(0x41);
+        u8(0x83);
+        emit_modrm_disp(7 /* /7 = cmp */, base, d);
+        u8(static_cast<uint8_t>(imm));
+    }
+    void cmp_dword_base_imm32(uint8_t base, int32_t d, uint32_t imm)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "cmp_dword_base_imm32: rsp/r12 need a SIB byte");
+        if (base >= 8)
+            u8(0x41);
+        u8(0x81);
+        emit_modrm_disp(7, base, d);
+        u32(imm);
+    }
+    void add_reg32_imm32(uint8_t reg, uint32_t imm)
+    {
+        if (reg >= 8)
+            u8(0x41);
+        u8(0x81);
+        u8(static_cast<uint8_t>(0xC0 | (reg & 7)));
+        u32(imm);
+    }
+    void store_dword_base_imm32(uint8_t base, int32_t d, uint32_t imm)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "store_dword_base_imm32: rsp/r12 need a SIB byte");
+        if (base >= 8)
+            u8(0x41);
+        u8(0xC7);
+        emit_modrm_disp(0, base, d);
+        u32(imm);
+    }
+    void store_byte_base_imm(uint8_t base, int32_t d, uint8_t imm)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "store_byte_base_imm: rsp/r12 need a SIB byte");
+        if (base >= 8)
+            u8(0x41);
+        u8(0xC6);
+        emit_modrm_disp(0, base, d);
+        u8(imm);
+    }
+    /* sub qword [base + disp], imm32  (group 81 /5) */
+    void sub_qword_base_imm32(uint8_t base, int32_t d, uint32_t imm)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "sub_qword_base_imm32: rsp/r12 need a SIB byte");
+        u8(static_cast<uint8_t>(0x48 | (base >= 8 ? 0x01 : 0)));
+        u8(0x81);
+        emit_modrm_disp(5, base, d);
+        u32(imm);
+    }
+    /* dec qword [base + disp]  (FF /1) */
+    void dec_qword_base_disp(uint8_t base, int32_t d)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "dec_qword_base_disp: rsp/r12 need a SIB byte");
+        u8(static_cast<uint8_t>(0x48 | (base >= 8 ? 0x01 : 0)));
+        u8(0xFF);
+        emit_modrm_disp(1, base, d);
+    }
+    /* mov dword [base + disp], r32 - the 32-bit store, twin of
+     * load32_base */
+    void store32_base(uint8_t reg, uint8_t base, int32_t d)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "store32_base: rsp/r12 need a SIB byte");
+        if (reg >= 8 || base >= 8)
+            u8(static_cast<uint8_t>(0x40 | (reg >= 8 ? 0x04 : 0)
+                                    | (base >= 8 ? 0x01 : 0)));
+        u8(0x89);
+        emit_modrm_disp(reg, base, d);
+    }
+    /* movzx r32, byte [base + disp] */
+    void movzx_r32_byte_base(uint8_t dst, uint8_t base, int32_t d)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "movzx_r32_byte_base: rsp/r12 need a SIB byte");
+        if (dst >= 8 || base >= 8)
+            u8(static_cast<uint8_t>(0x40 | (dst >= 8 ? 0x04 : 0)
+                                    | (base >= 8 ? 0x01 : 0)));
+        u8(0x0F); u8(0xB6);
+        emit_modrm_disp(dst, base, d);
     }
     void cmp_rr(uint8_t dst, uint8_t src)
     {
@@ -3102,8 +3212,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
         e.add_rr(RDX, RCX);
     }
     if (m.sh) {
-        e.u8(0x48); e.u8(0xC1); e.u8(0xFA);          /* sar rdx, imm8 */
-        e.u8(static_cast<uint8_t>(m.sh));
+        e.sar_rr_imm8(RDX, static_cast<uint8_t>(m.sh));   /* sar rdx, imm8 */
     }
     /* truncate toward zero: += 1 when the quotient came out negative */
     e.mov_rr(RAX, RDX);
@@ -3118,8 +3227,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     }
     /* n % d == n - (n/d)*d */
     if (d >= INT32_MIN && d <= INT32_MAX) {
-        e.u8(0x48); e.u8(0x69); e.u8(0xC2);          /* imul rax,rdx,imm32 */
-        e.u32(static_cast<uint32_t>(static_cast<int32_t>(d)));
+        e.imul_rr_imm32(RAX, RDX, static_cast<int32_t>(d));
     } else {
         e.movabs(RAX, static_cast<uint64_t>(d));
         e.op_rr2(Op::times, RAX, RDX);  /* imul rax, rdx */
@@ -4295,9 +4403,7 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
 
     size_t j_has = 0;
     if (le) {
-        e.u8(0x83); e.u8(0xB8);              /* cmp dword [rax+off], 0 */
-        e.u32(off_s + 4);                    /*   ... loc_start.col */
-        e.u8(0x00);
+        e.cmp_dword_base_imm8(RAX, off_s + 4, 0x00);   /*   ... loc_start.col */
         j_has = e.j8(0x75);                  /* jnz: caret already set */
         e.movabs(RCX, pack(le->start));
         e.store_base(RCX, RAX, static_cast<int32_t>(off_s));
@@ -4327,9 +4433,7 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
             /* A REAL chain outranks the -2 marker: stamp whenever the field
              * is still negative (unset -1 or "no chain" -2). Unchanged for
              * -1, which is what keeps first-real-conveyor-wins intact. */
-            e.u8(0x83); e.u8(0xB8);          /* cmp dword [rax+off_if], 0 */
-            e.u32(off_if);
-            e.u8(0x00);
+            e.cmp_dword_base_imm8(RAX, off_if, 0x00);
             j_set = e.j8(0x7D);              /* jge end: a chain is set */
         } else {
             /* The marker only fills a VACANCY - it must never overwrite a
@@ -4337,14 +4441,12 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
              * conveyed by an op that is not the one that raised (a C++
              * throw crossing a fragment exit), and that conveyor's "I am
              * not inlined" says nothing about the raise site. */
-            e.u8(0x83); e.u8(0xB8);          /* cmp dword [rax+off_if], -1 */
-            e.u32(off_if);
-            e.u8(0xFF);
+            e.cmp_dword_base_imm8(RAX, off_if, 0xFF);
             j_set = e.j8(0x75);              /* jne end: anything is set */
         }
-        e.u8(0xC7); e.u8(0x80);              /* mov dword [rax+off_if], imm */
-        e.u32(off_if);
-        e.u32(static_cast<uint32_t>(chain >= 0 ? chain : -2));
+        e.store_dword_base_imm32(
+            RAX, static_cast<int32_t>(off_if),
+            static_cast<uint32_t>(chain >= 0 ? chain : -2));
         e.patch8(j_set, e.pos());
     }
 
@@ -4380,8 +4482,7 @@ static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
             ? 0
             : reinterpret_cast<uint64_t>(ck.inline_frames.data());
     e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_call_inline_chain()));
-    e.u8(0xC7); e.u8(0x00);                  /* mov dword [rax], imm32 */
-    e.u32(static_cast<uint32_t>(chain));
+    e.store_dword_base_imm32(RAX, 0, static_cast<uint32_t>(chain));
     e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_call_inline_pool()));
     e.movabs(RCX, pool);
     e.store_base0(RCX, RAX);
@@ -4707,9 +4808,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     ld(RCX, RAX, static_cast<int32_t>(P.desc_params) + 8);
     modrm(0x2B, RCX, RAX, static_cast<int32_t>(P.desc_params), true);
                                                       /* sub rcx,[params] */
-    e.u8(0x48); e.u8(0x81); e.u8(0xF9);               /* cmp rcx, imm32 */
-    e.u32(static_cast<uint32_t>(NARGS
-              * static_cast<int>(P.param_desc_size)));
+    e.cmp_reg_imm(RCX, NARGS * static_cast<int>(P.param_desc_size));
     j_slow.push_back(e.j32(0x75));                    /* jne slow */
     ld(RCX, RAX, static_cast<int32_t>(L.desc_vm_chunk)); /* rcx = cck */
     e.test_rr(RCX, RCX);               /* test rcx, rcx */
@@ -4865,34 +4964,27 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * record fill.
          */
         ld(RSI, RBX, s + 24);                         /* rsi = arg type */
-        e.u8(0x0F); e.u8(0xB6); e.u8(0xB6);           /* movzx esi, byte
-                                                       * [rsi+t_off] */
-        e.u32(static_cast<uint32_t>(L.type_t_off));
-        e.u8(0x83); e.u8(0xFE);                       /* cmp esi, imm8 */
-        e.u8(static_cast<uint8_t>(L.t_none_val));
+        e.movzx_r32_byte_base(RSI, RSI,
+                              static_cast<int32_t>(L.type_t_off));
+        e.cmp_reg32_imm8(RSI, static_cast<uint8_t>(L.t_none_val));
         j_next.push_back(e.j32(0x74));                /* none passes through */
-        e.u8(0x45); e.u8(0x0F); e.u8(0xB6); e.u8(0x92);  /* movzx r10d,
-                                                          * byte [r10+off] */
-        e.u32(static_cast<uint32_t>(L.type_t_off));
-        e.u8(0x41); e.u8(0x83); e.u8(0xFA);           /* cmp r10d, imm8 */
-        e.u8(static_cast<uint8_t>(L.t_float_val));
+        e.movzx_r32_byte_base(R10, R10,
+                              static_cast<int32_t>(L.type_t_off));
+        e.cmp_reg32_imm8(R10, static_cast<uint8_t>(L.t_float_val));
         const size_t j_to_float = e.j32(0x74);        /* je -> to float */
         /* required INT: only a bool widens, and its payload is ALREADY the
          * int 0/1 (the EvalValue(bool) ctor zeroes the whole word), so the
          * widening is a pure RETAG. */
-        e.u8(0x83); e.u8(0xFE);                       /* cmp esi, imm8 */
-        e.u8(static_cast<uint8_t>(L.t_bool_val));
+        e.cmp_reg32_imm8(RSI, static_cast<uint8_t>(L.t_bool_val));
         j_slow.push_back(e.j32(0x75));                /* jne slow */
         movabs_r10(reinterpret_cast<uint64_t>(L.t_int));
         st(RBX, s + 24, R10);
         const size_t j_retagged = e.j32(0xEB);
         /* required FLOAT: an int or a bool - both read as an int payload. */
         e.patch32_here(j_to_float);
-        e.u8(0x83); e.u8(0xFE);                       /* cmp esi, imm8 */
-        e.u8(static_cast<uint8_t>(L.t_int_val));
+        e.cmp_reg32_imm8(RSI, static_cast<uint8_t>(L.t_int_val));
         const size_t j_cvt = e.j32(0x74);
-        e.u8(0x83); e.u8(0xFE);                       /* cmp esi, imm8 */
-        e.u8(static_cast<uint8_t>(L.t_bool_val));
+        e.cmp_reg32_imm8(RSI, static_cast<uint8_t>(L.t_bool_val));
         j_slow.push_back(e.j32(0x75));                /* jne slow */
         e.patch32_here(j_cvt);
         /* cvtsi2sd xmm0, [rbx+s] ; movsd [rbx+s], xmm0. xmm0 is free: the
@@ -5248,8 +5340,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.u8(0x48); e.u8(0x8B); e.u8(0x44); e.u8(0x24); e.u8(0x20);
         ld(RDX, RAX, static_cast<int32_t>(P.desc_noescape));
         if (i) {                                      /* shr rdx, i */
-            e.u8(0x48); e.u8(0xC1); e.u8(0xEA);
-            e.u8(static_cast<uint8_t>(i));
+            e.shr_rr_imm8(RDX, static_cast<uint8_t>(i));
         }
         e.op_reg_imm(Op::band, RDX, 1);
         e.movabs(RAX, reinterpret_cast<uint64_t>(&jit_bind_ref_arg));
@@ -5505,8 +5596,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     emit_call_prologue(e);
     /* depth guard: cmp dword [&g_jit_sync_depth], CAP; jge slow */
     e.movabs(RAX, depth_addr);
-    e.u8(0x81); e.u8(0x38);
-    e.u32(static_cast<uint32_t>(jit_sync_depth_cap()));
+    e.cmp_dword_base_imm32(RAX, 0, static_cast<uint32_t>(jit_sync_depth_cap()));
     std::vector<size_t> j_slows, j_dones;
     j_slows.push_back(e.j32(0x7D));                /* jge slow */
     /* M5b/M5c: THE FULLY-INLINE PUSH - resolve/gates/(cached: probe)/
@@ -5698,9 +5788,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.store_base(RBX, RCX,
                      static_cast<int32_t>(JP.act_vframe + JP.frame_slots));
         if (g_cur_caller_desc) {
-            e.u8(0xC7); e.u8(0x81);                /* mov dword [rcx+d], */
-            e.u32(static_cast<uint32_t>(JP.act_vframe + JP.frame_size));
-            e.u32(static_cast<uint32_t>(caller_total)); /* imm32 */
+            e.store_dword_base_imm32(
+                RCX, static_cast<int32_t>(JP.act_vframe + JP.frame_size),
+                static_cast<uint32_t>(caller_total));
         } else {
             /* MAIN: read nslots from its own boundary record - after
              * the callee popped, top_rec IS main's record, and it
@@ -5709,8 +5799,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.load_base(RDX, RCX, static_cast<int32_t>(JP.act_top_rec));
             /* mov edx, [rdx+d] */
             e.load32_base(RDX, RDX, static_cast<int32_t>(JP.rec_nslots));
-            e.u8(0x89); e.u8(0x91);                /* mov [rcx+d], edx */
-            e.u32(static_cast<uint32_t>(JP.act_vframe + JP.frame_size));
+            e.store32_base(
+                RDX, RCX,
+                static_cast<int32_t>(JP.act_vframe + JP.frame_size));
         }
     }
     e.movabs(RCX, depth_addr);
@@ -6047,8 +6138,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
          * record-less frames interleave, and this arm also serves
          * EnterNative-re-entered fragments whose [rbp-8] is not the
          * chain, so the field is the one source right in every case) */
-        e.u8(0x48); e.u8(0x69); e.u8(0xC2);        /* imul rax, rdx, 48 */
-        e.u32(static_cast<uint32_t>(sizeof(LValue)));
+        e.imul_rr_imm32(RAX, RDX, static_cast<int32_t>(sizeof(LValue)));
         ld(RCX, R10, static_cast<int32_t>(P.rec_parent_window));
         e.add_rr(RCX, RAX);
         /* the old dst value must be TRIVIAL (else: C++ release -> slow) */
@@ -6125,8 +6215,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         ld(RDX, R10, static_cast<int32_t>(P.rec_window));
         st(RCX, static_cast<int32_t>(P.seg_cur), RDX);
         /* rec_n-- */
-        e.u8(0x49); e.u8(0xFF); e.u8(0x88);        /* dec qword [r8+rec_n] */
-        e.u32(static_cast<uint32_t>(L.act_rec_n));
+        e.dec_qword_base_disp(R8, static_cast<int32_t>(L.act_rec_n));
         /* top_rec steps to the record below; the view/cur_seg come from
          * OUR record's PARENT fields (4-v: the record below can be an
          * ANCESTOR once record-less frames interleave - the push-time
@@ -6149,8 +6238,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         e.bump_counter(&g_jit_native_returns);
 #endif
         /* rax = JIT_RET_SENTINEL ((size_t)-1); return to the caller */
-        e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
-        e.u32(0xFFFFFFFFu);                        /* mov rax, -1 */
+        e.mov_reg_imm32(RAX, 0xFFFFFFFFu);   /* mov rax, -1 */
         e.frag_ret(Emitter::RetFlush::flushed);
 
         /* ---- the BOUNDARY arm (C4c): a VmInvoker/do_func_call callee.
@@ -6200,8 +6288,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         e.bump_counter(&g_jit_ret_inline);
         e.bump_counter(&g_jit_native_returns);
 #endif
-        e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
-        e.u32(0xFFFFFFFEu);                        /* mov rax, -2 */
+        e.mov_reg_imm32(RAX, 0xFFFFFFFEu);   /* mov rax, -2 */
         e.frag_ret(Emitter::RetFlush::flushed);
 
         /* ---- 4-iii: THE RECORD-LESS ARM (the norec tier, DEFAULT ON).
@@ -6321,9 +6408,9 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             st(RCX, static_cast<int32_t>(L.ctx_captures), RAX);
             /* seg->top -= total; used -= total (baked) */
             ld(RCX, R8R, static_cast<int32_t>(P.act_cur_sg));
-            e.u8(0x48); e.u8(0x81); e.u8(0xA9);    /* sub qword [rcx+d],i */
-            e.u32(static_cast<uint32_t>(P.seg_cur));
-            e.u32(static_cast<uint32_t>(my_total * 48));   /* BYTES now */
+            e.sub_qword_base_imm32(       /* the watermark is in BYTES */
+                RCX, static_cast<int32_t>(P.seg_cur),
+                static_cast<uint32_t>(my_total * 48));
 #ifdef TESTS
             e.movabs(RAX,
                      reinterpret_cast<uint64_t>(&g_jit_norec_ret_arm));
@@ -6332,8 +6419,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                      reinterpret_cast<uint64_t>(&g_jit_native_returns));
             e.inc_qword_base(RAX);
 #endif
-            e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
-            e.u32(0xFFFFFFFFu);                    /* mov rax, -1 */
+            e.mov_reg_imm32(RAX, 0xFFFFFFFFu);   /* mov rax, -1 */
             e.frag_ret(Emitter::RetFlush::flushed);
             /* the record-less DECLINE tier: jit_ret_norec(res_slot,
              * [rbp+24], the baked desc, rbp) - the C++ steal/put for a
@@ -9561,8 +9647,7 @@ static void emit_libm_call(Emitter &e, const void *fn)
 static void emit_raise(Emitter &e, int kind, uint32_t pc)
 {
     e.movabs(RAX, reinterpret_cast<uint64_t>(&g_vm_jit_raise));
-    e.u8(0xC7); e.u8(0x00);              /* mov dword [rax], kind */
-    e.u32(static_cast<uint32_t>(kind));
+    e.store_dword_base_imm32(RAX, 0, static_cast<uint32_t>(kind));
     e.exit_pc(pc);
 }
 
@@ -11712,8 +11797,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 if (shl) {
                     e.zero_reg32(RAX);              /* xor eax,eax */
                 } else {
-                    e.u8(0x48); e.u8(0xC1); e.u8(0xF8);
-                    e.u8(63);                            /* sar rax,63 */
+                    e.sar_rr_imm8(RAX, 63);   /* sar rax,63 */
                 }
             } else if (c > 0) {
                 e.u8(0x48); e.u8(0xC1);
@@ -12841,16 +12925,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.movabs(RCX, reinterpret_cast<uint64_t>(
                                   ck.struct_defs[in.target2]));
                 /* cmp [rax + sobj_def], rcx */
-                e.u8(0x48); e.u8(0x39); e.u8(0x88);
-                e.u32(static_cast<uint32_t>(L.sobj_def));
+                e.cmp_base_reg(RAX, static_cast<int32_t>(L.sobj_def),
+                               RCX);
                 const size_t js2 = e.j32(0x75);
                 /* cmp dword [rax + sobj_rc], 1  (use_count == 1) */
-                e.u8(0x83); e.u8(0xB8);
-                e.u32(static_cast<uint32_t>(L.sobj_rc)); e.u8(0x01);
+                e.cmp_dword_base_imm8(
+                    RAX, static_cast<int32_t>(L.sobj_rc), 1);
                 const size_t js3 = e.j32(0x75);
                 /* cmp byte [rax + sobj_ro], 0  (not readonly) */
-                e.u8(0x80); e.u8(0xB8);
-                e.u32(static_cast<uint32_t>(L.sobj_ro)); e.u8(0x00);
+                e.cmp_byte_base(RAX, static_cast<int32_t>(L.sobj_ro), 0);
                 const size_t js4 = e.j32(0x75);
 #ifdef TESTS
                 e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_ctor_fast));
@@ -13152,8 +13235,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* end cap */
         e.cmp_reg_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 16));
         const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
-        e.u8(0xC7); e.u8(0x01);                    /* mov dword [rcx], rg */
-        e.u32(region);
+        e.store_dword_base_imm32(RCX, 0, region);   /* mov dword [rcx], rg */
         e.op_reg_imm(Op::plus, RCX, 4);
         /* mov [rax+h+8], rcx */
         e.store_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
@@ -13202,17 +13284,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* mov edx, [rcx+pbase] */
         e.load32_base(RDX, RCX, static_cast<int32_t>(L.rec_pend_base));
         if (in.a_lit()) {
-            e.u8(0x81); e.u8(0xC2);                /* add edx, region */
-            e.u32(static_cast<uint32_t>(in.a_lit()));
+            e.add_reg32_imm32(RDX, static_cast<uint32_t>(in.a_lit()));
         }
         ML_CHECK(L.pend_state_size == 16);
         e.shl_rr_imm8(RDX, 4);   /* shl rdx, 4 */
         /* _M_start */
         e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
         e.add_rr(RAX, RDX);
-        e.u8(0xC6); e.u8(0x80);                    /* mov byte [rax+off], v */
-        e.u32(static_cast<uint32_t>(L.pend_state_pend));
-        e.u8(static_cast<uint8_t>(in.target));
+        e.store_byte_base_imm(
+            RAX, static_cast<int32_t>(L.pend_state_pend),
+            static_cast<uint8_t>(in.target));
         return true;
     }
 
@@ -13234,17 +13315,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* mov edx, [rcx+pbase] */
         e.load32_base(RDX, RCX, static_cast<int32_t>(L.rec_pend_base));
         if (in.a_lit()) {
-            e.u8(0x81); e.u8(0xC2);                /* add edx, region */
-            e.u32(static_cast<uint32_t>(in.a_lit()));
+            e.add_reg32_imm32(RDX, static_cast<uint32_t>(in.a_lit()));
         }
         ML_CHECK(L.pend_state_size == 16);
         e.shl_rr_imm8(RDX, 4);   /* shl rdx, 4 */
         /* mov rax, [rax+pends] */
         e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
         e.add_rr(RAX, RDX);
-        e.u8(0x80); e.u8(0xB8);                    /* cmp byte [rax+off], 0 */
-        e.u32(static_cast<uint32_t>(L.pend_state_pend));
-        e.u8(0);
+        e.cmp_byte_base(RAX, static_cast<int32_t>(L.pend_state_pend), 0);
         /* rel32: the cold arm below is far bigger than a short jump's
          * reach (emit_exc_stamp alone exceeds it). */
         const size_t j_norm = e.j32(0x74);  /* je -> the NORMAL fall-through */
@@ -14157,9 +14235,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * in rdx), then the byte store. */
             e.load_base(RCX, RDX,
                         static_cast<int32_t>(jit_layout().gft_defined));
-            e.u8(0xC6); e.u8(0x81);                /* mov byte [rcx+d], 1 */
-            e.u32(static_cast<uint32_t>(in.target));
-            e.u8(0x01);
+            e.store_byte_base_imm(RCX, static_cast<int32_t>(in.target), 0x01);
         }
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(g.first);
@@ -14321,8 +14397,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 break;
             case 2:                                   /* bool -> 0/1 int */
                 /* movzx eax, byte [rax + moff] */
-                e.u8(0x0F); e.u8(0xB6); e.u8(0x80);
-                e.u32(static_cast<uint32_t>(moff));
+                e.movzx_r32_byte_base(RAX, RAX, static_cast<int32_t>(moff));
                 e.test32_rr(RAX, RAX);               /* test eax, eax */
                 e.setcc_r8(0x5, RAX);   /* setne al */
                 e.movzx_r32_r8(RAX, RAX);   /* movzx eax, al */
@@ -14382,8 +14457,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.load(RAX, b.payload);            /* rax = StructObject* */
             e.movabs(RCX, reinterpret_cast<uint64_t>(ck.struct_defs[defi]));
             /* cmp [rax + sobj_def], rcx */
-            e.u8(0x48); e.u8(0x39); e.u8(0x88);
-            e.u32(static_cast<uint32_t>(L.sobj_def));
+            e.cmp_base_reg(RAX, static_cast<int32_t>(L.sobj_def), RCX);
             const size_t js2 = e.j32(0x75);
 #ifdef TESTS
             e.movabs(RCX, reinterpret_cast<uint64_t>(&g_jit_member_fast));
