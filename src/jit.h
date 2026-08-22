@@ -204,7 +204,9 @@ extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
  * push inline via emit_sync_push_native/JitPushLayout); jit_sync_postexit
  * handles a direct-entered callee's non-sentinel exit (shared with the
  * helper path's direct branch). */
-extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept;
+extern "C" int jit_sync_postexit(size_t r, int_type site_packed,
+                                 LValue *caller_win,
+                                 int_type caller_total) noexcept;
 extern "C" int jit_cached_probe(const void *desc, int_type argbase,
                                 int_type nargs, int_type dst) noexcept;
 void *jit_addr_pending_key();
@@ -1060,6 +1062,11 @@ extern const void *g_norec_switch_rbp;
  * record-less exited callee). Defined in vm.cpp beside the switch relay.
  */
 extern const void *g_norec_exit_desc;
+/* 4-iii/4-v: the residue-captures relay (see the emit-side comment in
+ * jit.cpp) - ALSO the record-less postexit's caller-captures source (the
+ * site's residue_pop parks the popped captures value here before the
+ * status dispatch, exception paths included). Defined in vm.cpp. */
+extern const void *g_jit_residue_caps;
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
 #else

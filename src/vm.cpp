@@ -2707,6 +2707,8 @@ const void *g_norec_switch_site = nullptr;
 const void *g_norec_switch_rbp = nullptr;
 /* 4-v: the EXIT RELAY (see jit.h) - the fragment epilogue's last store. */
 const void *g_norec_exit_desc = nullptr;
+/* 4-iii: the residue-captures relay (see jit.h; was jit.cpp-static). */
+const void *g_jit_residue_caps = nullptr;
 #ifdef TESTS
 std::vector<NorecReconFrame> g_norec_recon;
 #endif
@@ -5667,6 +5669,37 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
          std::unique_ptr<RuntimeException> ex,
          const void *frag_rbp = nullptr, const void *raise_desc = nullptr)
 {
+    /*
+     * 4-v, THE DIRECT RAISE OUT OF A RECORD-LESS FRAME (category (a) of
+     * the conveyance-uniform model - design 4-v-ii REFINED). The window
+     * compare is the discrimination: the running frame's window not being
+     * the top record's means this frame has no record - so back_rec() is
+     * an ANCESTOR whose chunk must caption nothing here (a handler search
+     * against it with OUR pc could FALSE-MATCH a region), and the record
+     * walk may not run. Clean THIS frame only, exactly what the walk's
+     * sync_stop stop does for a record-ful frame: capture it LOC-LESS
+     * (the level-up postexit's stamp fills outer frames; the innermost
+     * one deliberately stays loc-less - frame [0] renders from
+     * ex.loc_start, the 4-ii(b) pinned rule), release its ref slots,
+     * un-account used/seg-top by its own totals, restore the caller's
+     * captures from the residue, repoint the view at the parent (window
+     * from the chain, totals from the parent chunk via the site), set
+     * pending, and return false - the fragment then exits -2 and the
+     * conveyance crosses the levels above one site at a time. Only
+     * jit_throw can arrive here in this state (rethrow/EndFinally need
+     * trys, which a record-less frame cannot have), and it pre-stamps
+     * the caret from its baked entry, so the loc branch below never
+     * consults the wrong chunk; the inline flush must though, hence the
+     * chunk swap to the RAISING function's own.
+     */
+    const bool norec_raiser =
+        frag_rbp && act.top_rec && ctx.frame
+        && ctx.frame->slots != act.top_rec->window;
+    if (norec_raiser) {
+        const auto *d = static_cast<const FuncDescriptor *>(raise_desc);
+        ML_CHECK(d && d->vm_chunk);
+        chunk = static_cast<const Chunk *>(d->vm_chunk);
+    }
     if (!ex->loc_start) {
         Loc s, en;
         chunk->loc_at(pc, s, en);
@@ -5674,6 +5707,34 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
         ex->loc_end = en;
     }
     vm_flush_inline(*chunk, pc, *ex);      /* frames if raised in inlined */
+    if (norec_raiser) {
+        const auto *d = static_cast<const FuncDescriptor *>(raise_desc);
+        ex->backtrace.emplace_back(d, Loc());
+        LValue *win = ctx.frame->slots;
+        const int_type total = static_cast<int_type>(chunk->slot_count)
+                               + chunk->n_temps;
+        for (const int32_t s : chunk->ref_slots) {
+            if (s >= total)
+                break;
+            LValue &lv = win[s];
+            if (lv.get().get_type()->t >= Type::t_str)
+                lv = LValue();
+        }
+        act.used -= total;
+        act.segs[static_cast<size_t>(act.cur_seg)]->top -= total;
+        const char *fp = static_cast<const char *>(frag_rbp);
+        ctx.captures =
+            *reinterpret_cast<CaptureSlots *const *>(fp + 16);
+        const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
+        const NorecSite *S = jit_norec_site_for(ra);
+        ML_CHECK(S && S->caller);
+        act.view_frame.point_at(
+            *reinterpret_cast<LValue *const *>(
+                const_cast<char *>(fp) - 8),
+            static_cast<int>(S->caller->slot_count + S->caller->n_temps));
+        g_vm_exc_pending = std::move(ex);
+        return false;
+    }
 #ifdef TESTS
     /*
      * G1 step 4-ii: THE RAISE-TIME CHAIN WALK. `frag_rbp` is the RAISING
@@ -6869,7 +6930,104 @@ static const Chunk &vm_sync_stop_chunk()
  * in-VM capture's loc_at would have produced it - the sentinel stop chunk
  * is loc-less). Depth is the CALLER's business (already decremented).
  */
-extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
+/*
+ * 4-v, category (b) of the conveyance-uniform model: the exited callee
+ * was RECORD-LESS (the vframe - still pointing at its window, a pc exit
+ * does not repoint it - differs from the top record's). Its native frame
+ * is dead, so the cleanup runs from LIVE state only: identity from the
+ * EXIT RELAY (the fragment epilogue's last store), window/total from the
+ * vframe, the caller's captures from the residue relay (the site's
+ * residue_pop parked them before the status dispatch). Mirrors the
+ * record path level-for-level:
+ *   r == -2   the callee's own raise (category (a)) already cleaned it
+ *             and captured its frame - only the pending conveyance
+ *             conversion remains; the stamp is passed a NULL desc so it
+ *             deliberately MISSES, exactly as the record path's
+ *             after-the-pop desc read makes it miss (frame [0] stays
+ *             loc-less; a self-recursive shape must not diverge on
+ *             whether [0] carries an unobservable loc).
+ *   r == pc   a conveyed exception (helper exc / raise kind; a plain
+ *             eptr stays untouched like the record path's) - replicate
+ *             the vm_raise-at-the-callee the record path performs: loc
+ *             stamp from the callee's own table (usually pre-stamped -
+ *             #56's op_fully_native contract), the raise site's inline
+ *             flush, the frame capture (LOC-LESS, then stamped in THIS
+ *             invocation with the callee's own desc - which is exactly
+ *             when the record path's stamp LANDS, its record still top
+ *             at its own r=pc postexit), the frame cleanup, and the
+ *             vframe repoint at the CALLER (window = the site's rbx
+ *             argument; total baked, or -1 for main = read
+ *             top_rec->nslots, main being record-ful always).
+ *   No handler search: a record-less callee is plain_frame.
+ *   An interpreted-continuation exit is impossible (fully deleted).
+ */
+static ML_COLD int
+jit_norec_postexit(size_t r, int_type site_packed, LValue *caller_win,
+                   int_type caller_total, VmActivation &act,
+                   EvalContext &ctx, int32_t inl_chain,
+                   const void *inl_pool) noexcept
+{
+    if (r == static_cast<size_t>(-2)) {
+        if (g_vm_exc_pending) {
+            Exception &e = *g_vm_exc_pending;
+            vm_jit_stamp_call_site(e, nullptr, site_packed, inl_chain,
+                                   inl_pool);
+            g_vm_jit_exc = std::move(g_vm_exc_pending);
+            return 2;
+        }
+        return 0;
+    }
+    if (g_vm_jit_eptr)
+        return 2;              /* fatal (uncatchable) - conveyed as-is,
+                                * the record path's exact behavior */
+    const auto *d = static_cast<const FuncDescriptor *>(g_norec_exit_desc);
+    const Chunk *ck =
+        d ? static_cast<const Chunk *>(d->vm_chunk) : nullptr;
+    ML_CHECK(d && ck);
+    std::unique_ptr<RuntimeException> ex;
+    if (g_vm_jit_raise) {
+        const int kind = g_vm_jit_raise;
+        g_vm_jit_raise = 0;
+        ex = vm_jit_raise_kind_new(kind);
+    } else if (g_vm_jit_exc) {
+        ex = std::move(g_vm_jit_exc);
+    } else {
+        ML_CHECK_MSG(false, "a record-less frame exited with no signal");
+        return 2;
+    }
+    if (!ex->loc_start) {
+        Loc s, en;
+        ck->loc_at(r, s, en);
+        ex->loc_start = s;
+        ex->loc_end = en;
+    }
+    vm_flush_inline(*ck, r, *ex);
+    ex->backtrace.emplace_back(d, Loc());
+    LValue *win = ctx.frame->slots;
+    const int_type total = static_cast<int_type>(ctx.frame->size);
+    for (const int32_t s : ck->ref_slots) {
+        if (s >= total)
+            break;
+        LValue &lv = win[s];
+        if (lv.get().get_type()->t >= Type::t_str)
+            lv = LValue();
+    }
+    act.used -= total;
+    act.segs[static_cast<size_t>(act.cur_seg)]->top -= total;
+    ctx.captures = static_cast<CaptureSlots *>(
+        const_cast<void *>(g_jit_residue_caps));
+    act.view_frame.point_at(
+        caller_win,
+        caller_total >= 0 ? static_cast<int>(caller_total)
+                          : static_cast<int>(act.top_rec->nslots));
+    vm_jit_stamp_call_site(*ex, d, site_packed, inl_chain, inl_pool);
+    g_vm_jit_exc = std::move(ex);
+    return 2;
+}
+
+extern "C" int jit_sync_postexit(size_t r, int_type site_packed,
+                                 LValue *caller_win,
+                                 int_type caller_total) noexcept
 {
     /* #88: CLAIM the baked call site - read it and reset, before anything
      * is dispatched (see g_jit_call_inline_chain). Resetting is what lets a
@@ -6881,6 +7039,12 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed) noexcept
     g_jit_call_inline_pool = nullptr;
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
+    /* 4-v: the record-less exited callee takes its own path (above) */
+    if (act.top_rec && ctx.frame
+            && ctx.frame->slots != act.top_rec->window)
+        return jit_norec_postexit(r, site_packed, caller_win,
+                                  caller_total, act, ctx, inl_chain,
+                                  inl_pool);
     const FuncDescriptor *d = act.back_rec().desc;
     const Chunk *cck = act.back_rec().run_chunk;
     try {
@@ -7359,7 +7523,9 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
          * callee we just ran may have overwritten the globals. */
         g_jit_call_inline_chain = inl_chain;
         g_jit_call_inline_pool = inl_pool;
-        const int pr = jit_sync_postexit(r, site_packed);
+        const int pr = jit_sync_postexit(r, site_packed,
+                                         /*caller_win=*/nullptr,
+                                         /*caller_total=*/-1);
         g_jit_sync_depth--;
         return pr;
     }

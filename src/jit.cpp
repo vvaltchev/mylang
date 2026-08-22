@@ -2573,7 +2573,8 @@ static const JitPushLayout &jit_push_layout()
  * register across the switch-post scratch. Single-threaded, and each
  * store is consumed by the same call's adjacent code before any nested
  * call can overwrite it. */
-static const void *g_jit_residue_caps = nullptr;
+/* moved to vm.cpp (4-v: the record-less postexit cleanup reads it as the
+ * caller-captures source); the emit sites keep using it via jit.h. */
 
 static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
                                   bool cached, int callee_arg,
@@ -3719,6 +3720,17 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * once the exit pc has moved to rdi. */
     emit_bake_call_site(e, ck, old_pc);
     e.movabs(RSI, site);
+    /* 4-v: the CALLER's window (rbx) + baked total (-1 = main: the
+     * postexit reads top_rec->nslots, main being record-ful always) -
+     * the record-less exited-callee cleanup repoints the vframe at the
+     * caller from these. Dead args on the record path. */
+    e.u8(0x48); e.u8(0x89); e.u8(0xDA);            /* mov rdx, rbx */
+    e.movabs(RCX, static_cast<uint64_t>(
+                      g_cur_caller_desc
+                          ? static_cast<int_type>(
+                                g_cur_caller_desc->frame_size
+                                + ck.n_temps)
+                          : static_cast<int_type>(-1)));
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_sync_postexit) });
     e.u8(0xE8); e.u32(0);
