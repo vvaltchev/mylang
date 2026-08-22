@@ -1254,14 +1254,67 @@ void Inferencer::infer_one(Block *rootBlock)
      * (>64 instances) or an uninstantiable direct call - just tree-walks instead
      * of VM-running (correct, only slower); the planned first-class dyn instance
      * (foo$dyn) erases even that. Keyed off the name SYM's value_used.
+     *
+     * #149: reachability is TRANSITIVE, so "kept" is a CLOSURE, not the
+     * flag. A value-used base runs its ORIGINAL body, whose calls were
+     * never redirected to instances (the check/instantiation passes skip
+     * template bodies) - so any template that body names is itself
+     * runtime-reachable one hop in, and so on: `var dyn g = aa;` keeps aa
+     * (value-used), and aa's base body calls bb, whose base used to be
+     * excluded as dead - the indirect g() call then reached a chunk-less
+     * bb and, post-teardown, aborted (or under ASSERTS=0 walked a freed
+     * AST). Fixpoint over the kept bases' bodies: any IDENTIFIER naming a
+     * template (call or value use; nested lambdas descended - the whole
+     * subtree runs when the base runs) keeps that template too.
+     * Over-keeping (a body-local shadowing a template's name) costs a
+     * compiled chunk, never correctness.
      */
+    std::map<const FuncInfo *, TypeSym *> tmpls;
+    std::map<const UniqueId *, TypeSym *> tmpl_by_uid;
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+        if (s->func && s->func->is_template && s->func->decl) {
+            tmpls.emplace(s->func, s);
+            tmpl_by_uid.emplace(s->name, s);
+        }
+    }
+    std::set<const FuncInfo *> kept_bases;
+    {
+        std::vector<TypeSym *> work;
+        for (auto &kv : tmpls)
+            if (kv.second->value_used && kept_bases.insert(kv.first).second)
+                work.push_back(kv.second);
+        std::function<void(Construct *)> scan = [&](Construct *n) {
+            if (!n)
+                return;
+            if (auto *id = dynamic_cast<Identifier *>(n)) {
+                auto it = tmpl_by_uid.find(id->uid);
+                if (it != tmpl_by_uid.end()
+                        && kept_bases.insert(it->second->func).second)
+                    work.push_back(it->second);
+                return;
+            }
+            if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+                scan(fd->body.get());   /* a nested lambda runs with the
+                                         * base - its references count */
+                return;
+            }
+            for_each_child(n, [&](Construct *c) { scan(c); });
+        };
+        while (!work.empty()) {
+            TypeSym *t = work.back();
+            work.pop_back();
+            scan(t->func->decl->body.get());
+        }
+    }
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
         if (s->func && s->func->is_template && s->func->decl) {
             /* ANY template base -> skip specialization (a monomorphization
-             * shell). A DEAD one (never value-used) -> also skip codegen. */
+             * shell). A dead one (unreachable per the closure) -> also
+             * skip codegen. */
             s->func->decl->is_template = true;
-            if (!s->value_used)
+            if (!kept_bases.count(s->func))
                 s->func->decl->desc->is_template_base = true;
         }
         /*

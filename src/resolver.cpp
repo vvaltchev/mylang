@@ -4424,9 +4424,20 @@ private:
         /* The body EXPRESSION (the splice source): the `=> expr` sugar's
          * inner expr - the Block/Return wrapper is not spliced (it would put
          * a statement in expression position) and is not counted (the size
-         * gate measures the expression, exactly as before the desugar). */
+         * gate measures the expression, exactly as before the desugar).
+         *
+         * NULL is possible (#150): registration checked the body at run()
+         * time, but a LATER pass of this same walk can TAIL-SPLICE a
+         * callee into the registered function's own body - `{ return
+         * aa(k); }` becomes `{ <aa's block> }`, no longer a single-return
+         * shape - so the funcs entry goes stale. Seen with a lambda
+         * template instance whose body tail-called one of a mutually-
+         * recursive pair (mutual recursion is what makes the callee
+         * tail-inlinable but not expr-inlinable). DECLINE, never assert:
+         * the call stays a runtime call, which is always correct. */
         Construct *fexpr = func_expr_body(f);
-        ML_CHECK(fexpr != nullptr);   /* inlinable_decl guaranteed it */
+        if (!fexpr)
+            return;
 
         const int bsz = node_count(fexpr);
         if (bsz > max_nodes)

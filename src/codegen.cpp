@@ -9838,9 +9838,15 @@ collect_funcs(const Construct *c, std::vector<const FuncDeclStmt *> &out)
 bool
 codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
 {
-    /* A base template is a monomorphization source, never called → no chunk
-     * (the ONLY compiled-set exclusion; do_func_call ML_CHECKs if one is ever
-     * called after the AST teardown). */
+    /* A DEAD base template - never used as a VALUE, so every call to it was
+     * redirected to an instance - is a monomorphization source with no
+     * runtime reachability: no chunk (the ONLY compiled-set exclusion;
+     * do_func_call ML_CHECKs if one is ever called after the AST teardown).
+     * A VALUE-used base is NOT excluded - an indirect call can reach it
+     * (see the is_template_base stamping in the inferencer), and its body
+     * may contain shapes only a checked body lowers, which is fine: a
+     * value-used base's body IS checked (it is not skipped as a template
+     * once its value escapes - #149). */
     if (fn->desc->is_template_base)
         return false;
 

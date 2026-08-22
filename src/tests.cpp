@@ -1645,6 +1645,43 @@ static const std::vector<test> tests =
     },
 
     {
+        /* #149: base reachability is TRANSITIVE. `var dyn g = aa` keeps
+         * aa's base compiled (value-used) - but aa's BASE body's calls
+         * are never redirected to instances, so the bb it names must
+         * keep ITS base too, and so on. Before the closure, the
+         * indirect call reached a chunk-less bb one hop in and hit the
+         * post-teardown ML_CHECK abort (or, under ASSERTS=0, walked a
+         * freed AST). The direct aa(2) call beside it pins that the
+         * instances still work and the redirect is untouched. */
+        "value-template escape keeps TRANSITIVELY-called bases (#149)",
+        {
+            "func aa(n) { if (n < 1) { return 0; } return bb(n - 1) + 1; }",
+            "func bb(n) { if (n < 1) { return 0; } return aa(n - 1) + 1; }",
+            "var dyn g = aa;",
+            "assert(g(runtime(2)) == 2);",
+            "assert(g(runtime(5)) == 5);",
+            "assert(aa(2) == 2);",
+        },
+    },
+
+    {
+        /* #150: the AST inliner's `funcs` registry can go STALE - a
+         * lambda template instance registered with a `{ return aa(k); }`
+         * single-return body gets that body TAIL-SPLICED (aa is
+         * tail-inlinable because mutual recursion keeps it out of the
+         * expr engine), so by the time the call site is scanned the
+         * entry's expression body is gone. Used to abort on
+         * `fexpr != nullptr`; it must DECLINE (a runtime call). */
+        "inliner: a funcs entry de-expressified by a tail splice (#150)",
+        {
+            "func aa(n) { if (n < 1) { return 0; } return bb(n - 1) + 1; }",
+            "func bb(n) { if (n < 1) { return 0; } return aa(n - 1) + 1; }",
+            "var dyn g = func(k) { return aa(k); };",
+            "assert(g(runtime(2)) == 2);",
+        },
+    },
+
+    {
         /* ARG-position value use (a higher-order builtin) escapes too:
          * map(template, arr) keeps today's behavior. */
         "value-template passed to map() stays sound",
