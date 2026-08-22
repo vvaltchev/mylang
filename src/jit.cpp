@@ -4320,13 +4320,15 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off,
  * global slot): jump NEAR to the helper when it is a REFERENCE. Clobbers
  * rcx; `cb` is only READ. */
 static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
-                                       int32_t type_off, uint8_t sc = RCX)
+                                       int32_t type_off, uint8_t scr = RCX)
 {
     const JitLayout &L = jit_layout();
-    e.scratch(sc);
+    RefScratch rs(e, scr);
+    const uint8_t sc = rs.sc;
     e.load_base(sc, cb, type_off);
     e.load32_base(sc, sc, L.type_t_off);
     e.cmp_reg32_imm32(sc, static_cast<uint32_t>(L.t_str_val));
+    rs.release();
     return e.j32(0x73);                        /* jae -> the helper (a ref) */
 }
 
@@ -4338,6 +4340,25 @@ static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
 static std::pair<size_t, size_t>
 emit_store_src_gate(Emitter &e, int32_t type_off, uint8_t sc = RCX)
 {
+    /*
+     * ⛔ #96 (c): THE ONE REF-GATE THAT `RefScratch` CANNOT TAKE, and
+     * the reason is worth stating so nobody "completes the set" without
+     * reading it. Its scratch is live across TWO compares with a
+     * CONDITIONAL JUMP BETWEEN THEM (j_lo, to the helper). A borrow
+     * would push before the loads and pop after the second compare -
+     * and the path that takes j_lo jumps over the pop, leaking 8 bytes
+     * of stack on every none/pseudo-typed store. That is not a wrong
+     * answer, it is a corrupted stack, so the spill is refused rather
+     * than fitted.
+     *
+     * THE FIX IS TO NEED ONLY ONE JUMP: the admitted band is
+     * 3 .. t_str-1, which one UNSIGNED compare tests -
+     * `sub sc, 3; cmp sc, t_str-3; jae helper` - after which the pop
+     * sits before the single jump exactly as it does in RefScratch.
+     * That is fewer instructions as well, so it is an improvement and
+     * not a workaround - but it CHANGES EMITTED CODE, so it wants its
+     * own measurement rather than riding along here.
+     */
     const JitLayout &L = jit_layout();
     e.scratch(sc);
     e.load(sc, type_off);
@@ -15336,17 +15357,53 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
      * covering the writes that are real.
      */
     const uint8_t tmp = RCX;
-    const auto tmp_lit = [&](uint64_t v) {
-        e.scratch(tmp);
+    /*
+     * ⛔ #96 (c): THE STAGING REGISTER IS BORROWED, NOT OWNED - and each
+     * helper takes its CONSUMER as a callback, so "load tmp" without
+     * saying what reads it is not expressible.
+     *
+     * That shape is what makes the spill leak-proof. When `tmp` holds a
+     * PIN the borrow is a push/pop pair, and an unbalanced push is not
+     * a wrong answer, it is a corrupted stack - so the release must not
+     * be something a caller can forget. Making it the HELPER's turns a
+     * discipline into a structure. (RAII would do the same; a callback
+     * keeps the pairs on one line, which is how they already read.)
+     *
+     * Sound for the same reason RefScratch is: every use here is a load
+     * followed by exactly ONE consuming instruction, with no call and
+     * no rsp-relative access between them, and `pop` does not touch
+     * flags - so a `cmp` consumer's flags still reach the jcc after it.
+     */
+    bool tmp_spilled = false;
+    const auto tmp_hold = [&]() {
+        tmp_spilled = e.reg_holds_pin(tmp);
+        if (tmp_spilled)
+            e.push_reg(tmp);
+        else
+            e.scratch(tmp);
+    };
+    const auto tmp_drop = [&]() {
+        if (tmp_spilled)
+            e.pop_reg(tmp);
+    };
+    const auto tmp_lit = [&](uint64_t v, auto &&use) {
+        tmp_hold();
         e.movabs(tmp, v);
+        use();
+        tmp_drop();
     };
-    const auto tmp_slot = [&](int slot) {
-        e.scratch(tmp);
+    const auto tmp_slot = [&](int slot, auto &&use) {
+        tmp_hold();
         read_slot(e, tmp, slot);
+        use();
+        tmp_drop();
     };
-    const auto tmp_operand = [&](bool is_lit, int_type lit, int slot) {
-        e.scratch(tmp);
+    const auto tmp_operand = [&](bool is_lit, int_type lit, int slot,
+                                 auto &&use) {
+        tmp_hold();
         load_operand(e, tmp, is_lit, lit, slot);
+        use();
+        tmp_drop();
     };
     switch (in.op) {
 
@@ -15365,8 +15422,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::JumpUnlessIntCmp: {
         /* jump to target when (a cmp b) is FALSE == when negate(cmp). */
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
-        tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot());
-        e.cmp_rr(RAX, tmp);
+        tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot(),
+                    [&]() { e.cmp_rr(RAX, tmp); });
         emit_cond_jump(e, cc_negate(in.aop),
                        static_cast<size_t>(in.target), begin, end,
                        remap, fixups);
@@ -15427,8 +15484,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                     && in.a_lit() <= INT32_MAX) {
                 e.cmp_reg_imm(r, static_cast<int32_t>(in.a_lit()));
             } else if (in.a_is_lit()) {
-                tmp_lit(static_cast<uint64_t>(in.a_lit()));
-                e.cmp_rr2(r, tmp);
+                tmp_lit(static_cast<uint64_t>(in.a_lit()),
+                        [&]() { e.cmp_rr2(r, tmp); });
             } else {
                 const int acr = e.creg(in.a_slot());
                 if (acr >= 0)
@@ -15446,12 +15503,13 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             e.op_reg_imm(up ? Op::plus : Op::minus, RAX,
                          static_cast<int32_t>(in.b_lit()));
         } else {
-            tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot());
-            op_rr(e, up ? Op::plus : Op::minus, RAX, tmp);
+            tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot(),
+                        [&]() { op_rr(e, up ? Op::plus : Op::minus,
+                                      RAX, tmp); });
         }
         write_slot(e, ck, RAX, in.target2, pc);
-        tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot());
-        e.cmp_rr(RAX, tmp);
+        tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot(),
+                    [&]() { e.cmp_rr(RAX, tmp); });
         emit_cond_jump(e, in.aop, static_cast<size_t>(in.target),
                        begin, end, remap, fixups);
         return;
@@ -15504,8 +15562,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                        && in.b_lit() <= INT32_MAX) {
                 e.op_reg_imm(Op::plus, d, static_cast<int32_t>(in.b_lit()));
             } else if (in.b_is_lit()) {
-                tmp_lit(static_cast<uint64_t>(in.b_lit()));
-                e.op_rr2(Op::plus, d, tmp);
+                tmp_lit(static_cast<uint64_t>(in.b_lit()),
+                        [&]() { e.op_rr2(Op::plus, d, tmp); });
             } else {
                 const int bcr = e.creg(in.b_slot());
                 if (bcr >= 0)
@@ -15516,14 +15574,16 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             }
             clear_fwd = true;
         } else {
+            const auto use_add =
+                [&]() { op_rr(e, Op::plus, RAX, tmp); };
             if (fb) {
                 emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
-                tmp_slot(adst);
+                tmp_slot(adst, use_add);
             } else {
                 read_slot(e, RAX, adst);
-                tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot());
+                tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot(),
+                            use_add);
             }
-            op_rr(e, Op::plus, RAX, tmp);
             write_slot(e, ck, RAX, adst, pc);
         }
 
@@ -15538,8 +15598,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             if (in.a_is_lit() && bnd >= INT32_MIN && bnd <= INT32_MAX) {
                 e.cmp_reg_imm(r, static_cast<int32_t>(bnd));
             } else if (in.a_is_lit()) {
-                tmp_lit(static_cast<uint64_t>(bnd));
-                e.cmp_rr2(r, tmp);
+                tmp_lit(static_cast<uint64_t>(bnd),
+                        [&]() { e.cmp_rr2(r, tmp); });
             } else {
                 const int bcr = e.creg(in.a_dual_hi());
                 if (bcr >= 0)
@@ -15553,12 +15613,13 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             read_slot(e, RAX, in.target2);
             e.incdec_reg(RAX, up);
             write_slot(e, ck, RAX, in.target2, pc);
+            const auto use_cmp = [&]() { e.cmp_rr(RAX, tmp); };
             if (in.a_is_lit())
                 tmp_lit(static_cast<uint64_t>(
-                            static_cast<int_type>(in.a_dual_hi())));
+                            static_cast<int_type>(in.a_dual_hi())),
+                        use_cmp);
             else
-                tmp_slot(in.a_dual_hi());
-            e.cmp_rr(RAX, tmp);
+                tmp_slot(in.a_dual_hi(), use_cmp);
         }
         /* Either converted half leaves RAX holding something OTHER than
          * what the boxed shape left there, so no consumer may believe a
@@ -15702,8 +15763,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         read_slot(e, RAX, in.target2);
         e.incdec_reg(RAX, up);
         write_slot(e, ck, RAX, in.target2, pc);
-        tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot());
-        e.cmp_rr(RAX, tmp);
+        tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot(),
+                    [&]() { e.cmp_rr(RAX, tmp); });
         const size_t j_fall = e.j32(cc_for(cc_negate(in.aop)).short_op);
         if (hoisted) {
             load_slot_idx(e, ir, in.target2);      /* the stepped counter */
