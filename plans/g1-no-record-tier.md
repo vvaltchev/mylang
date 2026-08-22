@@ -672,5 +672,47 @@ entirely in C++.
          1867/1867 forced AND default, corpus 14/14 forced, 300-program
          nested_fuzz forced, plain release runs forced, non-JIT probe.
   4-iv.  The -3 materializer.
+         DONE (2026-08-11) - and it landed one class EARLIER than
+         designed, because preparing its test unearthed #148: the -3
+         protocol was BORN BROKEN for record-FUL frames (at f080b99,
+         its introducing commit). The doomed chain's records carry the
+         SENTINEL resume, whose consumer the -3 unwind destroys - so
+         the flat continuation's first pop past the switching caller
+         dispatched the stop chunk's ExitBlock and the REST OF THE
+         PROGRAM was silently abandoned, exit 0. Invisible because the
+         coverage test's asserts sat AFTER the deep call (skipped ==
+         passed - vacuous from birth; it now captures and compares
+         stdout). The fix IS 4d's materializer: at the switch,
+         `norec_switch_retarget` rewrites each doomed record's resume
+         to (site.caller, site.resume_pc) via the relay-anchored walk
+         (the M5b frames), each jit_enter_deep core retargets its own
+         pushed record from its (caller_ck, resume_pc) args and walks
+         the segment below from its relay snapshot, and the generic
+         dyn-callee helper CONSUMES a switch (drives the flat
+         continuation in its own dispatch - its site cannot retarget
+         and used to mistranslate status 3 into a re-run double-call).
+         Everything downstream already handles a real resume - it is
+         the interpreted call's own model. sync_stop clears on
+         retarget (raise walks through; the audit + capture know the
+         shape); the 4-iii residue flag dies with the native frames.
+         The TESTS shadow (norec_materialize_shadow) verifies the full
+         insert reconstruction per frame against the pristine records
+         at every switch; counters mat_walk/mat_frames/mat_residue.
+         THE FIX'S OWN SIGNATURE: sync_inline 0 -> 85 on a 3-descent
+         probe (re-descents' M5b chains used to die at the first
+         switch). Sabotage x3 watched failing (walk off, core-retarget
+         off, dead anchor). Lanes both modes + non-JIT probe + .myv +
+         interleaved bench 0.999x. Residual bugs found while probing,
+         filed separately (pre-existing, not switch-related): #149
+         (dyn-laundered chunk-less template base aborts), #150 (the
+         AST inliner asserts on a lambda calling a mutually-recursive
+         template). MYLANG_JIT_OFF=norec (no sites) retains the
+         historical hole for M5b-framed chains - a debug lever,
+         documented.
+         WHAT 4-v INHERITS: the retarget is exactly the record-less
+         insert minus the record CREATION - 4-v's materializer builds
+         the record (window from the chain, nslots from the chunk,
+         captures from the residue - all shadow-verified here) and
+         fills the same resume fields the retarget writes today.
   4-v.   Stop writing the record for gate-passing calls; flip the lever
          default; Net 4 coverage gate; measure per shape + suite.

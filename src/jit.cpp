@@ -3693,6 +3693,21 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * the exc-stamp below). */
     for (const size_t j : j_slows)
         e.patch32_here(j);
+    /* 4-iv (design 4d): the MATERIALIZER ANCHOR relay - the site pointer
+     * and THIS fragment's rbp, stored just before the helper call so a
+     * depth-cap SWITCH inside it can walk the native chain from the
+     * switching caller (and, in 4-v, insert records for the record-less
+     * frames the -3 propagation is about to unwind). Every integer arg
+     * register is taken by the helper's six arguments, hence the relay;
+     * rax/rcx are dead at slow entry (the helper's return redefines
+     * both). Cold path - guard declines and cap switches only. */
+    if (ns) {
+        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_norec_switch_site));
+        e.movabs(RCX, reinterpret_cast<uint64_t>(ns));
+        e.u8(0x48); e.u8(0x89); e.u8(0x08);        /* mov [rax], rcx */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_norec_switch_rbp));
+        e.u8(0x48); e.u8(0x89); e.u8(0x28);        /* mov [rax], rbp */
+    }
     /* #88: the slow tier reads the same side channel. Reached only from a
      * GUARD decline, i.e. before the callee runs, so nothing can have
      * clobbered the globals between here and the helper. */
@@ -4921,6 +4936,9 @@ void jit_stats_report()
         { "norec_raise_frames",&g_jit_norec_raise_frames },
         { "norec_ret_arm",    &g_jit_norec_ret_arm },
         { "norec_retarm_vfy", &g_jit_norec_retarm_verify },
+        { "norec_mat_walk",   &g_jit_norec_mat_walk },
+        { "norec_mat_frames", &g_jit_norec_mat_frames },
+        { "norec_mat_residue",&g_jit_norec_mat_residue },
         { "norec_audit",      &g_jit_norec_audit_frames },
         /* step 4 gate reach, classified per M5b inline push: would the
          * CALLEE qualify for the no-record tier? (see push_verify) */
