@@ -232,12 +232,182 @@ Each step is independently measurable and independently revertable:
 Steps 1-3 are the whole risk and buy nothing; step 4 is small and buys
 everything. That ordering is deliberate - it front-loads the falsification.
 
-## 8. What I would want decided before starting
+## 8. DECIDED (maintainer, 2026-08-09)
 
-- **Frame pointers or an unwind table?** (§5) This is the portability
-  decision and it shapes step 1.
-- **Is the two-representation maintenance cost acceptable** for a change
-  that does not by itself reach the goal? (§6)
-- **Does the pure-cached shape need to be rescued?** Today it is 0.15% of
-  calls, so the answer is probably no - but it is also the ONLY shape
-  excluded, so saying so explicitly closes the matrix.
+- **FRAME POINTERS**, as a hard opinion: the implementation is much
+  simpler and the walk can be made 100% reliable. **MyLang itself does
+  NOT need `-fno-omit-frame-pointer`**: a record-less frame can only
+  exist between two JIT-EMITTED call sites (every path through C++ - the
+  interpreter tier, vm_exec_block, a builtin re-entry - pushes a record),
+  so the chain the walk traverses consists entirely of prologues our own
+  emitter wrote. The C++ compiler's frames are never walked. The walk's
+  ANCHOR is captured on the COLD path by emitted code (the raise /
+  reconstruct entry passes the fragment's own rbp as an argument) - zero
+  hot cost, no dependence on how the C++ was compiled.
+  AUDIT ITEM before step 1: confirm the emitter does not currently use
+  rbp as a pin/scratch register (the register file uses rbx, r12-r15,
+  xmm4-7; rbp's status is unverified).
+- **The two-representation cost is acceptable** if the improvement is
+  meaningful. No single arc is expected to reach the final goal; the
+  composition of many is. Measure at the end; a significant improvement
+  must be observable.
+- **The pure-cached shape is NOT rescued - and NOT removed.** The
+  per-frame pure-call cache keeps working exactly as today: the gate
+  routes a cache-interacting call down the EXISTING record-ful path
+  (same records, same results, carets, backtraces, same speed as now).
+  "Not rescued" means only that those calls do not get the new saving -
+  a routing decision, never a feature removal. fib already has its 14x
+  from the cache itself, and its residue is 0.15% of corpus calls.
+
+---
+
+# THE TESTING PLAN (agreed with the maintainer, 2026-08-09)
+
+Modeled on SQLite's discipline ("How SQLite Is Tested"): independent
+oracles checking each other, EXHAUSTIVE and DETERMINISTIC anomaly
+injection (their OOM net fails the 1st malloc, then the 2nd, then the
+3rd... until a run needs no injection), 100% branch coverage of the core,
+and tests that are themselves verified by planted defects. Nothing
+probabilistic gates anything. The maintainer's standing rule for this
+work: **when in doubt, MORE testing, never less** - a slow test's
+frequency is his judgment call later; removal is not on the table.
+These nets run locally first and are wired into CI once they exist (the
+driver_checks.sh / myv_doc_check.py pattern).
+
+Terms, by example:
+
+    func c() { throw E(7); }                    # RECORD-LESS candidate:
+    func a() { var r = c(); return r; }         #   plain_frame, emitted call
+    func b() { try { var r = a(); return r; }   # RECORD-FUL: n_trys > 0 -
+               catch (E as e) { return e.x; } } #   keeps its VmCallRec
+    print(b());
+
+## Net 1 - the SHADOW ORACLE (always-on during development, kept forever)
+
+`MYLANG_NOREC_SHADOW=1` (TESTS builds): the tier's machinery runs AND the
+record is still written; at every point a reconstruction would be USED -
+a pop, one unwind step, one backtrace frame - the rebuilt values are
+compared field-for-field against the live record:
+
+    SHADOW MISMATCH call #12841: rebuilt {ret_pc=17, dst=3, desc=sumto}
+                                 record  {ret_pc=18, dst=3, desc=sumto}
+
+Two properties make it the primary net rather than scaffolding:
+- **One-way mirror**: the reconstruction code cannot see the records, so
+  shadow mode exercises the identical code a real record-less run would.
+- **Every suite becomes a reconstruction test**: -rt, corpus_diff,
+  nested_fuzz, repl_fuzz, 69_exc_crossframe's 340k unwinds - re-run under
+  shadow, every call in each verifies the side table. Millions of
+  deterministic checks before any behaviour changes.
+
+## Net 1b - the FULL-STACK AUDIT (hardening lane; agreed 2026-08-09)
+
+Compare-at-use proves "every frame we USED was right". It cannot see a
+TRANSIENT corruption: clobber the saved-rbp link of the frame at depth
+400 in a 501-deep all-record-less recursion that never throws, and every
+pop still verifies only the TOP frame (one step from the anchor) - all
+pops pass, the broken link is never read, the bug ships. The audit
+proves the stronger statement: at EVERY call event, walk the ENTIRE
+chain and compare every frame to its shadow record - i.e. "an exception
+thrown at any moment would have unwound correctly", even in runs where
+nothing throws:
+
+    SHADOW WALK FAIL at call #101: frame 400/501 unreachable
+      (link 0x7ffd... not in [anchor, top-record SP])
+
+Cost is O(current depth) per call - negligible on flat call patterns,
+quadratic on deep recursion (10_recursion_deep: ~600M comparison steps,
+order seconds-to-a-minute in a debug build). Scoped to the
+VM_HARDENING/TESTS lane, which is never benchmarked. Both modes ship:
+at-use always in shadow, the audit in the hardening lane.
+
+## Net 2 - the DETERMINISTIC EVENT SWEEP (SQLite's fail-the-Nth-malloc)
+
+Reconstruction must be correct at EVERY point it could ever be demanded,
+not just where exceptions happen to fall. `MYLANG_RECON_AT=N` forces the
+PRODUCTION reconstruct-and-continue path (not the audit - the real
+single-shot flow) at the Nth call event, verified against shadow:
+
+    N=1
+    while :; do
+      MYLANG_NOREC_SHADOW=1 MYLANG_RECON_AT=$N ./mylang prog.my || exit 1
+      N=$((N+1))            # stop when N exceeds the run's event count
+    done
+
+Every N is a separate deterministic run. Applied to the Net 3 corpus and
+tests/functional/. Complementary to Net 1b: the sweep exercises the real
+code path one point at a time; the audit checks chain integrity
+continuously.
+
+## Net 3 - EXHAUSTIVE SMALL-SCOPE ENUMERATION (not a fuzzer)
+
+A stdlib-only generator that emits ALL programs in a bounded shape space:
+- per level (depth <= 4): frame kind in {record-less scalar, record-ful
+  `try`, record-ful `try/finally`, record-ful dict-iter, cached-call}
+- terminal in {return int, return float, throw, a builtin that captures
+  a backtrace WITHOUT throwing}
+- if throw: caught at level j for every j <= d, or uncaught
+(The `finally` and backtrace-capture axes were added per the expand-by-
+default rule; the axis list is OPEN for additions and closed to
+removals.) Order ~10^3-10^4 tiny self-asserting programs. The uncaught
+ones compare FULL STDERR BYTE-FOR-BYTE across tw / vm-nojit / jit /
+jit+shadow - RULE 2 is the spec, and the backtrace is exactly the hard
+consumer.
+
+Why bounded depth suffices (stated so it can be attacked): the walk is
+inductive - each step processes one frame given only its parent's
+anchor, so any ordering/off-by-one bug is expressible in an interleaving
+of length <= 3-4; more depth adds repetition, not states. The cases that
+do NOT fit that argument are enumerated EXPLICITLY instead: a call
+exactly at a SEG_SLOTS segment boundary, recursion deep enough to grow
+the native stack, a reconstruction spanning both.
+
+## Net 4 - the COVERAGE GATE (SQLite's 100% MC/DC, scoped)
+
+The GCOV lane exists (-DGCOV=ON). A gate script requires 100% line +
+branch coverage of the NEW walk/reconstruction code only; an uncovered
+branch is either covered or listed in the script with a written reason
+("unreachable: plain_frame excludes X") - never silently exempt.
+
+## Net 5 - the SABOTAGE MATRIX, written before the code
+
+Each entry one planted defect + the net that must fail; run mechanically,
+each watched failing before its mechanism lands:
+
+    defect                                   caught by
+    ret_pc off by one in the side table      Net 1, first -rt run
+    interleave ignores the SP bound          Net 3, (less,FUL,less) throw
+    side table stale after a re-JIT          Net 1 under REPL/-rt recompile
+    caller_captures pop skipped              Net 3, closure levels
+    wrong seg_top_before restore             Net 2 + explicit segment cases
+    transient deep-link clobber              Net 1b (and ONLY Net 1b)
+    walk does not terminate at the anchor    the ML_VM_CHECK below
+
+Plus one INVARIANT, not a test: each walk step's SP strictly increases
+and stays within [anchor, top record's SP] - an ML_VM_CHECK, so a
+corrupted chain is a loud located abort in every CI lane, never a wild
+read.
+
+## Net 6 - the levers, from day one
+
+`MYLANG_JIT_OFF=norec` and `MYLANG_JIT_FORCE=norec` land WITH step 1, so
+corpus_diff --levers picks the tier up automatically and every A/B is
+same-binary.
+
+## The honest limit
+
+ASan cannot see emitted frames, so the walk's memory safety is NOT
+covered by the sanitizer lanes. The proof there is deterministic but
+different: the SP-bounds ML_VM_CHECK (termination + range) plus shadow
+equality (content). Stated here so the ASan-green lanes are never read
+as covering it.
+
+## Sequencing against the build order (§7)
+
+Nets 1, 1b, 5, 6 land WITH step 1 (the unused side table) - by the time
+anything depends on the table it has survived millions of shadow
+comparisons. Nets 2 + 3 land before step 3 (the mixed walk). Net 4 gates
+step 4 (stop writing records). Steps 1-3 stay zero-behaviour; nothing
+gets faster until the nets exist. Days spent purely on these test arcs
+are budgeted and expected - the point is writing the hard code afterward
+without fear.
