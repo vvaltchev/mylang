@@ -3088,14 +3088,19 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     if (jit_norec_forced()) {
         cmp_b_imm8(RCX, static_cast<int32_t>(P.ck_norec_ok), 0);
         const size_t j_rec1 = e.j32(0x74);            /* je record path */
-        e.push_reg(RAX);
-        e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_pending_key()));
-        e.u8(0x48); e.u8(0x83); e.u8(0x38); e.u8(0x00);
-                                                      /* cmp qword[rax],0 */
-        e.pop_reg(RAX);                               /* flags kept */
-        const size_t j_rec2 = e.j32(0x75);            /* jne record path */
-        size_t j_rec3 = 0;
+        size_t j_rec2 = 0, j_rec3 = 0;
         if (cached) {
+            /* only a CachedCallV site's OWN probe parks a key, consumed
+             * by this same site's push - a PLAIN site can never see one
+             * (tax shrink: the test was 5 instructions on every plain
+             * forced push) */
+            e.push_reg(RAX);
+            e.movabs(RAX,
+                     reinterpret_cast<uint64_t>(jit_addr_pending_key()));
+            e.u8(0x48); e.u8(0x83); e.u8(0x38); e.u8(0x00);
+                                                      /* cmp qword[rax],0 */
+            e.pop_reg(RAX);                           /* flags kept */
+            j_rec2 = e.j32(0x75);                     /* jne record path */
             cmp_q_imm8(R8R,
                        static_cast<int32_t>(P.act_vframe
                                             + P.frame_pure_cache), 0);
@@ -3113,9 +3118,10 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
 #endif
         j_norec_join = e.j32(0xEB);                   /* jmp the tail */
         e.patch32_here(j_rec1);
-        e.patch32_here(j_rec2);
-        if (cached)
+        if (cached) {
+            e.patch32_here(j_rec2);
             e.patch32_here(j_rec3);
+        }
     }
     /* rec r10 = records_start + rec_n * RECSZ; rec_n++; top_rec = rec */
     ld(R10, R8R, static_cast<int32_t>(L.act_records));
@@ -3171,13 +3177,12 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     st(R10, static_cast<int32_t>(P.rec_desc), RAX);
     ld(RAX, R9R, static_cast<int32_t>(L.ctx_captures));
     st(R10, static_cast<int32_t>(P.rec_caller_caps), RAX);
-    if (residue) {
-        /* 4-iii: relay the caller's OLD captures to the residue push
-         * (see g_jit_residue_caps). r11 is free until the cache_key
-         * load below. */
-        movabs_r11(reinterpret_cast<uint64_t>(&g_jit_residue_caps));
-        st(R11, 0, RAX);
-    }
+    /* (tax shrink: the record path no longer parks the caps relay - a
+     * record-FUL callee's residue captures value is never read (its
+     * record carries caller_captures; the exceptional readers only
+     * touch record-less frames' residues), so the stale relay value the
+     * residue push then pushes is harmless. The NOREC branch parks its
+     * own, which its callee's exceptional paths do read.) */
     ld(RAX, R8R, static_cast<int32_t>(P.act_handlers2) + 8);
     modrm(0x2B, RAX, R8R, static_cast<int32_t>(P.act_handlers2), true);
     e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(0x02);   /* shr rax, 2
@@ -3200,25 +3205,11 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     }
     st_b_imm8(R10, static_cast<int32_t>(P.rec_boundary), 0);
     st_b_imm8(R10, static_cast<int32_t>(P.rec_sync_stop), 1);
-    if (jit_lever_forced(JL_NOREC)) {
-        if (residue) {
-            /* 4-iii: rec_residue = the CALLEE's norec_ok - the runtime
-             * half of the gate (the callee is dynamic at emit time). A
-             * body that is not fully deleted can exit mid-body and be
-             * re-entered through the interpreter, where the residue no
-             * longer exists - the oracle caught exactly that on the
-             * first forced -rt. rax is free (reloaded from the desc
-             * spill below); rcx = the callee chunk. */
-            e.u8(0x0F); e.u8(0xB6); e.u8(0x81);   /* movzx eax,byte[rcx+d] */
-            e.u32(static_cast<uint32_t>(P.ck_norec_ok));
-            e.u8(0x41); e.u8(0x88); e.u8(0x82);   /* mov [r10+d], al */
-            e.u32(static_cast<uint32_t>(P.rec_residue));
-        } else {
-            /* an explicit 0 at a cached site - a REUSED record keeps
-             * old bytes */
-            st_b_imm8(R10, static_cast<int32_t>(P.rec_residue), 0);
-        }
-    }
+    /* (tax shrink, 2026-08-12: the 4-iii rec_residue byte died with its
+     * discrimination role - the return arm's WINDOW COMPARE is
+     * self-truthing, a re-entered record-ful frame's top_rec IS its own
+     * record, so neither the byte nor the EnterNative-entry clear that
+     * protected it is needed.) */
     if (cached) {
         /* the caller's pure-cache STASH (per-frame scoping):
          * rec.caller_cache = move(view_frame.pure_cache) - a raw pointer
@@ -3713,16 +3704,12 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
          * from [rbp-8]). Idempotent when the callee took the record
          * path instead - the values are identical by the shadow
          * checks. */
-        const JitLayout &JL = jit_layout();
         const JitPushLayout &JP = jit_push_layout();
-        e.movabs(RCX, reinterpret_cast<uint64_t>(JL.addr_ctx));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x09);        /* mov rcx, [rcx] */
-        e.movabs(RDX,
-                 reinterpret_cast<uint64_t>(&g_jit_residue_caps));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x12);        /* mov rdx, [rdx] */
-        e.u8(0x48); e.u8(0x89); e.u8(0x91);        /* mov [rcx+d], rdx */
-        e.u32(static_cast<uint32_t>(JL.ctx_captures));
-        e.movabs(RCX, reinterpret_cast<uint64_t>(JL.addr_act));
+        /* (tax shrink: NO captures restore here - a record-ful callee's
+         * pop restores them from its record, and a record-less callee's
+         * return arm now restores them from the residue itself, so this
+         * arm's per-call relay round-trip was pure overhead) */
+        e.movabs(RCX, reinterpret_cast<uint64_t>(jit_layout().addr_act));
         e.u8(0x48); e.u8(0x8B); e.u8(0x09);        /* mov rcx, [rcx] */
         /* 4-v: vframe.slots = rbx (OUR window) - a record-ful CALLEE's
          * pop repointed the view via its record's parent fields, but a
@@ -4322,6 +4309,15 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             ld(RAX, 5, -8);
             st(R8R, static_cast<int32_t>(P.act_vframe + P.frame_slots),
                RAX);
+            /* ctx.captures = the caller's, from the residue at [rbp+16]
+             * (tax shrink: restoring HERE - on record-less returns only
+             * - lets the caller's sentinel arm drop its per-call relay
+             * restore, which record-ful returns paid for nothing: their
+             * pop restores captures from the record anyway) */
+            e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
+            ld(RCX, RAX, 0);
+            ld(RAX, 5, 16);
+            st(RCX, static_cast<int32_t>(L.ctx_captures), RAX);
             /* seg->top -= total; used -= total (baked) */
             modrm(0x63, RAX, R8R, static_cast<int32_t>(P.act_cur_seg),
                   true);                           /* movsxd rax,[curseg] */

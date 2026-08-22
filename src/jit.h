@@ -241,7 +241,7 @@ struct JitPushLayout {
               rec_caller_caps, rec_handler_base, rec_diter_base,
               rec_dyiter_base, rec_boundary, rec_sync_stop,
               rec_cache_key, rec_caller_cache, rec_norec_site,
-              rec_native_rbp, rec_residue,
+              rec_native_rbp,
               rec_parent_window, rec_parent_nslots, rec_parent_seg;
     /* FuncDescriptor */
     /* desc_bind_req: FuncDescriptor::bind_req (vector; data at +0) - the

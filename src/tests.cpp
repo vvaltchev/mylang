@@ -1682,6 +1682,44 @@ static const std::vector<test> tests =
     },
 
     {
+        /* 4-v (the no-record tier): a CLOSURE's capture read AFTER a
+         * warmed call - the callee's record-less return must restore
+         * ctx.captures (from the residue) or the capture read that
+         * follows reads another frame's slots. Both return tiers are
+         * exercised: the scalar result takes the emitted arm, the ARRAY
+         * result declines to jit_ret_norec - each has its own captures
+         * restore. The read sits INSIDE the loop so every post-call
+         * state is observed, warmed included. Found as a COVERAGE GAP:
+         * a sabotage of the arm's restore offset passed the whole
+         * forced suite before this test existed. */
+        "closure capture read survives record-less returns (4-v)",
+        {
+            /* the callees must SURVIVE to codegen as real calls (a tiny
+             * expr body inlines - shape-eater #1) and the capture must
+             * stay a runtime slot (a write-once `var c = 10` auto-consts
+             * and the read folds - eater #2's cousin), hence the mutual
+             * pair and the runtime() init */
+            "func pp(n) { if (n < 1) { return 0; } return qq(n - 1) + 1; }",
+            "func qq(n) { if (n < 1) { return 0; } return pp(n - 1) + 1; }",
+            "func mkarr(n) { var a = [n, n]; append(a, n); return a; }",
+            "var c = 10;",
+            "c = c + runtime(0);",
+            "var f = func[c](n) {",
+            "  var t = 0;",
+            "  for (var i = 0; i < 40; i++) t += pp(n) + c;",
+            "  return t;",
+            "};",
+            "assert(f(runtime(2)) == 480);",
+            "var g = func[c](n) {",
+            "  var t = 0;",
+            "  for (var i = 0; i < 40; i++) t += mkarr(n)[0] + c;",
+            "  return t;",
+            "};",
+            "assert(g(runtime(3)) == 520);",
+        },
+    },
+
+    {
         /* ARG-position value use (a higher-order builtin) escapes too:
          * map(template, arr) keeps today's behavior. */
         "value-template passed to map() stays sound",
