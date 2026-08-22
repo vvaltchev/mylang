@@ -21,8 +21,23 @@
 #
 # Same family as CLAUDE.md's "an oracle's corpus hole is a test hole".
 #
-# Exit 0 when the worklist is EMPTY (and then, and only then, run the
-# real nets: -rt, corpus_diff, corpus_diff --xrot with REG admitted).
+# ⛔⛔ AN EMPTY WORKLIST IS NECESSARY, NOT SUFFICIENT - AND THAT IS NOT A
+# CAVEAT, IT IS THE SECOND THING THIS SCRIPT GOT WRONG (2026-08-20).
+#
+# It can only see a clobber that was DECLARED, i.e. one whose emitter calls
+# Emitter::scratch(). A site that simply WRITES the register - a ROLE with a
+# fixed default, like ElemRead's `data = RCX` in the nested-read tiers -
+# declares nothing and is invisible here. rcx reached a ZERO worklist and was
+# still not admissible: 4 `-rt` JIT cases failed and two corpus programs
+# printed WRONG ANSWERS (16_elem2_fused, 17_elem2_divmod_roles).
+#
+# Same family as the corpus hole above, one level in: the first version
+# measured the wrong PROGRAMS, this one measures the wrong THING - declared
+# intent instead of actual writes.
+#
+# So the script does not stop at the worklist. When it is empty it BUILDS THE
+# REGISTER IN and runs the real nets, and only THAT exiting clean means the
+# register can be admitted.
 set -e
 REG=${1:-1}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -66,11 +81,51 @@ for f in bench/my/*.my samples/* tests/functional/*.my; do
     [ -f "$f" ] || continue
     "$BIN" -vdj "$f" >/dev/null 2>>"$LOG" || fails=$((fails + 1))
 done
-n=$(grep -c SCRATCH-PIN "$LOG" 2>/dev/null || echo 0)
+# grep -c PRINTS 0 and EXITS 1 when there are no matches, so a
+# `|| echo 0` appends a SECOND zero and every later [ ] test dies on
+# "Illegal number". Take the count and default it instead.
+n=$(grep -c SCRATCH-PIN "$LOG" 2>/dev/null) || true
+n=${n:-0}
 echo "pin-pool admission survey for register $REG"
 echo "  conflicts: $n     corpus programs that failed to compile: $fails"
 if [ "$n" -gt 0 ]; then
     echo "  worklist (count, source line - the emitter that clobbers a pin):"
     grep SCRATCH-PIN "$LOG" | sort | uniq -c | sort -rn | sed 's/^/    /'
 fi
-[ "$n" -eq 0 ] && [ "$fails" -eq 0 ]
+if [ "$n" -ne 0 ] || [ "$fails" -ne 0 ]; then
+    echo "  => NOT admissible: work the list above first."
+    exit 1
+fi
+
+# THE WORKLIST IS EMPTY. That says every DECLARED clobber is handled; it says
+# nothing about an undeclared one, so now actually admit the register and run
+# the nets that would notice.
+echo "  worklist empty - now testing the register ADMITTED for real"
+python3 - "$REG" <<'PY'
+import sys
+reg = sys.argv[1]
+p = "src/jit.cpp"; s = open(p).read()
+s = s.replace("static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2 };",
+              "static const uint8_t XCACHE_ORDER[] = { %s, 10, 11, 8, 7, 6, 9, 2 };" % reg)
+open(p, "w").write(s)
+PY
+make -j BUILD_DIR=build-claude/adm-real TESTS=1 OPT=0 > "$TMP/b2.log" 2>&1 || {
+    echo "error: admitted build failed - see $TMP/b2.log" >&2
+    cp "$TMP/jit.cpp.orig" src/jit.cpp; exit 2; }
+cp "$TMP/jit.cpp.orig" src/jit.cpp
+rc=0
+build-claude/adm-real/mylang -rt > "$TMP/rt.log" 2>&1 || rc=1
+echo "  -rt         : $(grep -oE 'Tests passed: [0-9/]+ \[ [A-Z]+ \]' "$TMP/rt.log" \
+                       || echo 'ABORTED')"
+cd_out=$(tests/corpus_diff.sh build-claude/adm-real/mylang 2>&1 | tail -1)
+echo "  corpus_diff :$cd_out"
+echo "$cd_out" | grep -q "agree" || rc=1
+echo "$cd_out" | grep -qE "^ *plain +([0-9]+)/\1 agree" || rc=1
+if [ "$rc" -ne 0 ]; then
+    echo "  => NOT admissible: the worklist is empty but the nets FAIL, so a"
+    echo "     site writes the register WITHOUT declaring it (see the note at"
+    echo "     the top of this file). Find it in the failing programs."
+    exit 1
+fi
+echo "  => register $REG is ADMISSIBLE (also run --xrot before landing it)"
+exit 0
