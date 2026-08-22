@@ -2980,3 +2980,55 @@ stack IS the order. 3a proved each segment matches its rbp chain, 3b
 proves each frame's descriptor reconstructs; step 4 removes the records
 and merges the reconstructed frames with the surviving record-ful ones by
 SP.
+
+## G1 no-record tier STEP 3c (2026-08-10): the window chain + the
+## step-4 gate, measured - and the interleave field 3b deferred is MOOT
+
+The last shadow piece before behaviour changes, plus the protocol read
+that settled step 4's design (recorded in full in
+plans/g1-no-record-tier.md "STEP 4 DESIGN FACTS").
+
+**THE WINDOW CHAIN.** frag_entry pushes rbx (the frame-base register)
+FIRST after `push rbp` - so `[fp-8]` of every native frame is the
+WINDOW of the frame BELOW (the caller's rbx, saved by this frame's
+prologue). That answers the mixed walk's central question - "does this
+frame have a record?" - as `top_rec.window == the frame's own window`,
+with the walk learning each next window as it descends: ZERO new record
+fields, in any build. The native-SP interleave field 3b deferred to
+step 4 is therefore NOT NEEDED. The shadow walk now verifies
+`records[idx-2].window == *(fp-8)` at every native-to-native level
+(g_jit_norec_win_chain, lockstep with norec_desc; 53,328 on fib's audit
+run). Sabotage watched failing: a checker reading [fp-16] aborts with
+"frame-below window != [fp-8]". The rbx-first order is LOAD-BEARING and
+commented in frag_entry; an emitter-side reorder sabotage is unfireable
+TODAY (no sync-call-containing fragment pins cache regs, so `saved` is
+empty in every walkable frame - verified by -vdj on a loop+recursion
+shape after the optimizer ate the first probe's foldable loop), but the
+standing walk catches a reorder the day a pinning fragment appears.
+
+**THE STEP-4 GATE, MEASURED.** The protocol read found a gate the plan's
+reach table could not see: THE RECORD IS THE INTERPRETER'S ONLY RESUME
+VEHICLE (jit_sync_postexit drives vm_dispatch through it), so a
+record-less frame may never exit its fragment mid-body - its chunk must
+be FULLY DELETED (every op EnterNative). Classified per M5b inline push
+in push_verify (zero extra emit; MYLANG_JITSTATS `norec_gate_*`):
+45_gcd / 76_funcval_dispatch / 78_typed_param_call **100% gate_ok**,
+09_fib 100% cached (the designed decline), 10_recursion_deep and
+69_exc_crossframe **50%** - the recursion partner (`sumto$0`) keeps ONE
+interpreted CallV island, so its frames keep records. That corrects the
+plan's "up to 99.8%" on those two benches; the fix (nativize the
+partner's residual op) is a separate later task. The -rt test asserts
+the gate ADMITS the mutual-recursion shape (a gate that silently admits
+nothing would otherwise surface only when step 4's tier never fires -
+the prove-the-code-ran rule, applied one step early).
+
+**ALSO ESTABLISHED** (design doc 4c-4e): the record-less call/return
+protocol (a 2-push residue [dst_addr][captures] AFTER the M5a switch;
+the callee restores seg-top/used from its own baked totals, the caller
+restores vframe from its; return discrimination by top_rec.window vs
+rbx), the raise helpers' new rbp argument, the segment-local mixed walk,
+and the -3/SWITCH hazard: the interpreted-flat protocol resumes callers
+through their records, so the slow helper's flat arm must MATERIALIZE
+records for record-less frames on the rbp chain before going flat (cold,
+cap-exceeded only). Step 4 builds in five sub-steps, 4-i..4-v, each
+lever-gated.

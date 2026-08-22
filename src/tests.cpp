@@ -18089,6 +18089,8 @@ static bool jit_norec_shadow()
     const unsigned long r0 = g_jit_norec_ret_verify;
     const unsigned long w0 = g_jit_norec_walk_frames;
     const unsigned long d0 = g_jit_norec_desc_chain;
+    const unsigned long wc0 = g_jit_norec_win_chain;
+    const unsigned long gk0 = g_jit_norec_gate_ok;
     const bool saved_audit = g_norec_audit;      /* save/restore: an
                                                   * env-gated tool toggled
                                                   * by one test must not
@@ -18162,6 +18164,26 @@ static bool jit_norec_shadow()
         fprintf(stderr, "jit_norec_shadow: the rbp shadow walk covered "
                         "%lu frames for %lu calls - not the segment\n",
                 w_after - w0, calls);
+        return false;
+    }
+    /* step 3c: the WINDOW chain runs beside the desc chain (same
+     * levels), so it must advance in lockstep - each frame's window
+     * recovered from [fp-8] and matched against the record. */
+    if (g_jit_norec_win_chain - wc0 < calls) {
+        fprintf(stderr, "jit_norec_shadow: the window chain matched "
+                        "%lu frames for %lu calls\n",
+                g_jit_norec_win_chain - wc0, calls);
+        return false;
+    }
+    /* step 4 gate reach: ev/od are plain, fully-deleted bodies with a
+     * short ref list, and the calls are uncached - the gate classifier
+     * must admit them. A gate that silently admits NOTHING would
+     * otherwise be discovered only when step 4's emitted tier never
+     * fires (the prove-the-code-ran rule, applied one step early). */
+    if (g_jit_norec_gate_ok - gk0 < calls / 2) {
+        fprintf(stderr, "jit_norec_shadow: the step-4 gate admitted "
+                        "%lu of %lu sync calls\n",
+                g_jit_norec_gate_ok - gk0, calls);
         return false;
     }
     if (!run({
