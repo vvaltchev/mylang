@@ -11098,6 +11098,24 @@ static bool callv_native_ok(const Instr &in, const JitCtx *jc);
 static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     uint32_t pc, const JitCtx *jc, size_t old_pc)
 {
+    /*
+     * emit_op's two named scratch ROLES, so the registers are arguments
+     * rather than literals (the census can then see them, and the
+     * allocator can later move them):
+     *
+     *   `tmp`  the SECOND operand of a boxed/int arithmetic or compare,
+     *          staged beside the accumulator in rax - and the
+     *          move-aside register when a two-address form needs the
+     *          old value kept;
+     *   `cpy`  the scratch a 24-byte EvalValue copy walks through, one
+     *          qword at a time (MoveV, LoadConstV, LoadCaptureV...).
+     *
+     * They are the SAME register today. They are separate names because
+     * they are separate lifetimes: `tmp` is live across an arithmetic
+     * op, `cpy` only between one load and its store.
+     */
+    const uint8_t tmp = RCX;
+    const uint8_t cpy = RCX;
     switch (in.op) {
 
     case OpCode::LoadImmInt:
@@ -11261,19 +11279,27 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (two_addr_reg) {
             const uint8_t d = static_cast<uint8_t>(dreg);
             /* ⛔ THE FORWARD ADAPTER RUNS FIRST, BEFORE THE COUNTER
-             * BUMP. The bump uses RCX as scratch, and RCX is a register
-             * a producer may hand its value over in once JitFwd carries
-             * one - bumping first would destroy it. Watched: with a
-             * probe producer set to res_reg = RCX, this ordering passes
-             * 1923/1923 and the reverse fails 13 tests. Today in_reg is
-             * always RAX so neither order can be observed, which is
-             * exactly why the ordering has to be reasoned, not tried. */
+             * BUMP, and THE REASON HAS CHANGED WHILE THE ORDERING HAS
+             * NOT. It used to be that the bump took RCX as scratch,
+             * and RCX is a register a producer may hand its value over
+             * in once JitFwd carries one, so bumping first would
+             * destroy it (watched: with a probe producer set to
+             * res_reg = RCX this order passed 1923/1923 and the
+             * reverse failed 13). bump_counter no longer touches any
+             * register - it pushes and pops rax - so that argument is
+             * void. The order stays because the bump still clobbers
+             * the FLAGS. Today in_reg is always RAX so neither order
+             * can be observed, which is exactly why this has to be
+             * reasoned, not tried. */
             if (fb)
                 emit_fwd_bump(e, fin < ck.slot_count);
 #ifdef TESTS
-            /* through RCX and BEFORE the op: the bump clobbers its
-             * scratch and the FLAGS (see increment 1) */
-            e.scratch(RCX);
+            /* BEFORE the op: the bump clobbers the FLAGS (increment
+             * 1). It no longer clobbers a REGISTER - bump_counter
+             * pushes and pops rax - so the `e.scratch(RCX)` that used
+             * to sit here is gone: it asserted a clobber that does not
+             * happen, and an over-broad scratch() ABORTS a legal
+             * fragment once the register is pinnable. */
             e.bump_counter(&g_jit_two_addr_reg);
 #endif
             if (fb) {
@@ -11309,11 +11335,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * exactly why the ordering has to be reasoned, not tried. */
             if (fb)
                 emit_fwd_bump(e, fin < ck.slot_count);
-            /* EXECUTION proof: it clobbers its scratch and the FLAGS,
-             * and after the arithmetic below the flags belong to that
-             * arithmetic. Through RCX, not rax - rax holds the value. */
+            /* EXECUTION proof: it clobbers the FLAGS, and after the
+             * arithmetic below the flags belong to that arithmetic. It
+             * needs no scratch REGISTER - bump_counter saves and
+             * restores rax itself - so, like its sibling above, the
+             * `e.scratch(RCX)` that used to be here is deleted rather
+             * than left asserting a clobber that does not happen. */
 #ifdef TESTS
-            e.scratch(RCX);
             e.bump_counter(&g_jit_two_addr);
 #endif
             if (fb) {
@@ -11329,19 +11357,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (fa || fb)
             emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         if (fa && fb) {
-            e.mov_rr(RCX, RAX);            /* t OP t */
+            e.mov_rr(tmp, RAX);            /* t OP t */
         } else if (fb && aop == Op::minus) {
-            e.mov_rr(RCX, RAX);
+            e.mov_rr(tmp, RAX);
             read_slot(e, RAX, in.a_slot());
         } else if (fb) {
-            read_slot(e, RCX, in.a_slot());   /* commutative swap */
+            read_slot(e, tmp, in.a_slot());   /* commutative swap */
         } else if (fa) {
-            load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+            load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         } else {
             read_slot(e, RAX, in.a_slot());
-            load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+            load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         }
-        op_rr(e, aop, RAX, RCX);
+        op_rr(e, aop, RAX, tmp);
         /* lever A, the PRODUCER side: elide a dead temp's write; a kept
          * (ref-listed) write reloads RAX in store_dst's COLD arm only. */
         const bool fw = g_fwd.prod == in.target;
@@ -11379,7 +11407,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             break;
         }
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
-        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         switch (in.aop) {
         case Op::div: case Op::mod:
             /*
@@ -11447,7 +11475,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_reg_shift(e, ck, in.aop, pc, old_pc);
             break;
         default:
-            op_rr(e, in.aop, RAX, RCX);
+            op_rr(e, in.aop, RAX, tmp);
             break;
         }
         write_slot(e, ck, RAX, in.target, pc);
@@ -11471,7 +11499,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (fa || fb)
             emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         if (fb)
-            e.mov_rr(RCX, RAX);              /* the count, before the value */
+            e.mov_rr(tmp, RAX);              /* the count, before the value */
         if (!fa)
             read_slot(e, RAX, in.a_slot());
         if (in.b_is_lit()) {
@@ -11528,7 +11556,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             write_slot(e, ck, RAX, in.target, pc);
             return true;
         }
-        e.movabs(RCX, static_cast<uint64_t>(in.b_lit()));
+        e.movabs(tmp, static_cast<uint64_t>(in.b_lit()));
         e.u8(0x48); e.u8(0x99);                          /* cqo */
         e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
         write_slot(e, ck, RDX, in.target, pc);            /* remainder */
@@ -11541,8 +11569,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         else
             read_slot(e, RAX, in.a_slot());
-        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
-        op_rr(e, Op::plus, RAX, RCX);
+        load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
+        op_rr(e, Op::plus, RAX, tmp);
         {
             const int_type dv = static_cast<int_type>(in.target2);
             DivMagic mg;
@@ -11552,7 +11580,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 write_slot(e, ck, RAX, in.target, pc);
                 return true;
             }
-            e.movabs(RCX, static_cast<uint64_t>(dv));
+            e.movabs(tmp, static_cast<uint64_t>(dv));
         }
         e.u8(0x48); e.u8(0x99);                          /* cqo */
         e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
@@ -12088,9 +12116,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                static_cast<int32_t>(in.target)))
             jhelp.push_back(emit_ref_check_jae(e, dst.type));
         e.load(RAX, src.type);
-        e.load(RCX, src.payload);      e.store(RCX, dst.payload);
-        e.load(RCX, src.payload + 8);  e.store(RCX, dst.payload + 8);
-        e.load(RCX, src.payload + 16); e.store(RCX, dst.payload + 16);
+        e.load(cpy, src.payload);      e.store(cpy, dst.payload);
+        e.load(cpy, src.payload + 8);  e.store(cpy, dst.payload + 8);
+        e.load(cpy, src.payload + 16); e.store(cpy, dst.payload + 16);
         e.store(RAX, dst.type);
         const size_t j_done = e.j32(0xEB);
         for (const size_t s : jhelp)
@@ -12130,9 +12158,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             uint64_t q[3];
             std::memcpy(q, reinterpret_cast<const char *>(&bv)
                                + EvalValue::jit_payload_off(), sizeof q);
-            e.movabs(RCX, q[0]); e.store(RCX, dst.payload);
-            e.movabs(RCX, q[1]); e.store(RCX, dst.payload + 8);
-            e.movabs(RCX, q[2]); e.store(RCX, dst.payload + 16);
+            e.movabs(cpy, q[0]); e.store(cpy, dst.payload);
+            e.movabs(cpy, q[1]); e.store(cpy, dst.payload + 8);
+            e.movabs(cpy, q[2]); e.store(cpy, dst.payload + 16);
             e.movabs(RAX, reinterpret_cast<uint64_t>(bv.get_type()));
             e.store(RAX, dst.type);
             if (!reflisted)
@@ -12185,12 +12213,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                static_cast<int32_t>(in.target)))
             jhelp.push_back(emit_ref_check_jae(e, dst.type));
         e.load_base(RAX, cb, coff + ty0);
-        e.load_base(RCX, cb, coff + pv0);
-        e.store(RCX, dst.payload);
-        e.load_base(RCX, cb, coff + pv0 + 8);
-        e.store(RCX, dst.payload + 8);
-        e.load_base(RCX, cb, coff + pv0 + 16);
-        e.store(RCX, dst.payload + 16);
+        e.load_base(cpy, cb, coff + pv0);
+        e.store(cpy, dst.payload);
+        e.load_base(cpy, cb, coff + pv0 + 8);
+        e.store(cpy, dst.payload + 8);
+        e.load_base(cpy, cb, coff + pv0 + 16);
+        e.store(cpy, dst.payload + 16);
         e.store(RAX, dst.type);
         const size_t j_done = e.j32(0xEB);
         for (const size_t sj : jhelp)
@@ -12275,9 +12303,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             uint64_t q[3];
             std::memcpy(q, reinterpret_cast<const char *>(&v)
                                + EvalValue::jit_payload_off(), sizeof q);
-            e.movabs(RCX, q[0]); e.store(RCX, dst.payload);
-            e.movabs(RCX, q[1]); e.store(RCX, dst.payload + 8);
-            e.movabs(RCX, q[2]); e.store(RCX, dst.payload + 16);
+            e.movabs(cpy, q[0]); e.store(cpy, dst.payload);
+            e.movabs(cpy, q[1]); e.store(cpy, dst.payload + 8);
+            e.movabs(cpy, q[2]); e.store(cpy, dst.payload + 16);
             e.movabs(RAX, reinterpret_cast<uint64_t>(v.get_type()));
             e.store(RAX, dst.type);
             if (!reflisted)
@@ -12496,8 +12524,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
               reinterpret_cast<const void *>(jit_struct_field_add_int) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        read_slot(e, RCX, in.b_dual_hi());        /* other */
-        op_rr(e, Op::plus, RAX, RCX);                        /* rax += rcx */
+        read_slot(e, tmp, in.b_dual_hi());        /* other */
+        op_rr(e, Op::plus, RAX, tmp);                        /* rax += tmp */
         write_slot(e, ck, RAX, in.target, pc);
         return true;
     }
@@ -12697,8 +12725,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * table drives it), `movzx` to a clean 0/1, then the bool two-store.
          * Never faults -> op_fully_native. */
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
-        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
-        e.cmp_rr(RAX, RCX);
+        load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
+        e.cmp_rr(RAX, tmp);
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>(cc_for(in.aop).near_op + 0x10));
         e.u8(0xC0);                               /* setcc al */
@@ -13307,7 +13335,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (has_idx)
             e.mov_rr(RDX, RAX);               /* the index value */
         if (is_field) {
-            e.movabs(RCX, static_cast<uint64_t>(in.b_lit()));
+            e.movabs(tmp, static_cast<uint64_t>(in.b_lit()));
             e.movabs(R8, in.op == OpCode::LoadStructFieldFloat ? 1u : 0u);
         }
         /* G4: the CHECKED subscript form takes its own helper, which can
@@ -13446,11 +13474,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             else
                 e.load(RAX, slot_addr(bo.a.slot).payload);
             if (bo.b.is_lit)
-                e.movabs(RCX, static_cast<uint64_t>(bo.b.lit));
+                e.movabs(tmp, static_cast<uint64_t>(bo.b.lit));
             else
                 e.load(RCX, slot_addr(bo.b.slot).payload);
             if (cmp) {
-                e.cmp_rr(RAX, RCX);
+                e.cmp_rr(RAX, tmp);
                 e.u8(0x0F);
                 e.u8(static_cast<uint8_t>(cc_for(bo.aop).near_op + 0x10));
                 e.u8(0xC0);                           /* setcc al */
