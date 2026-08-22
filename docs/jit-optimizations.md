@@ -2849,3 +2849,46 @@ maintainer's call - flagged, not trimmed.
 
 Lanes: dbg/clang/rel-hard/stats 1867/1867 with RAW exit 0, corpus 14/14
 plain + audit-on, non-JIT probe green, nested_fuzz 1000 programs.
+
+## G1 no-record tier STEP 2 (2026-08-10): backtraces from the table,
+## verified against the record path - and TWO identity bugs found
+
+The record path captures an M5b frame LOC-LESS (the sentinel has no
+locs) and the postexit stamp supplies the site later; the table has both
+halves of the frame up front. Step 2 verifies each half at the moment the
+record-based renderer uses it, with records still authoritative:
+
+- CAPTURE (vm_capture_rec_frame, TESTS): a norec-site record must be
+  sync_stop, captured loc-less, its site must carry a baked loc, its
+  desc->vm_chunk must equal run_chunk (the descriptor-from-range
+  derivation the record-less renderer will use), and the range lookup
+  must resolve its chunk. The popped site is STASHED for the stamp check.
+- STAMP (jit_sync_postexit's pending tail, TESTS): the baked
+  site_packed the render path stamps into the loc-less frame must EQUAL
+  the table's site_loc for the frame the walk just popped - the two
+  travelled from one emission through entirely different machinery (an
+  emitted immediate argument vs C++ bookkeeping). One stash per walk;
+  upper -2 conveyance levels see null and skip.
+- CHAIN (the full-stack audit): each emitted-pushed record's site
+  caller chunk must equal the frame BELOW's run_chunk - the interleave
+  identity the step-3 mixed walk will stand on.
+
+THE CHAIN CHECK PAID FOR ITSELF ON ITS FIRST RUN, twice. Chunk objects
+MOVE after compilation, and every site's `caller` (plus the range
+registry's chunk pointer) went stale at the move:
+- vm_execute's retained VmProgram vector (the return-value move AND the
+  vector's own reallocation moving EARLIER programs' roots);
+- the lazy vm_func_chunk net, which jits a STACK-LOCAL chunk and
+  emplaces it into g_func_chunks.
+Both aborted -rt with a visibly-stack `0x7ffc...` caller address. Fixed
+by `jit_norec_rebind(Chunk&)` called at every move DESTINATION (the
+retained list - ALL entries, the map emplace, vm_install_func_chunk, the
+script driver's prog assignment); the chain check remains the net for
+any missed move site. This is precisely the class of stale-identity bug
+the step-3 walk would otherwise have met as a wild pointer mid-unwind.
+
+Sabotage watched failing: site_loc+1 at emit dies with "stamp != table
+site_loc" on the first -rt run. The -rt test gained a throwing phase
+(mutual recursion, struct exception, caught at top, driven 4x past the
+cold-grow) asserting frame_verify and stamp_verify both advanced.
+Counters: norec_frame / norec_stamp, in coverage + MYLANG_JITSTATS.
