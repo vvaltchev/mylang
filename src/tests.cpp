@@ -25122,6 +25122,16 @@ static bool jit_reg_model()
      *   take_fixed made non-atomic
      *     "a FAILED take_fixed set still took RAX - not atomic"
      *
+     * ⛔ WHAT COVERS CAP_CALLEE_SAVED, now that jit_reg_is_callee_saved
+     * READS the model instead of restating it: the POOL INVARIANTS. The
+     * two pools are maintained by hand and independently - CACHE_REGS
+     * members must be callee-saved and XCACHE_ORDER members must not -
+     * so a wrong bit on any of those eleven registers fails by name.
+     * The remaining five rest on the SysV ABI, an external fixed fact
+     * rather than something that can drift. Unifying two
+     * implementations is exactly when a cross-check between them stops
+     * being evidence; naming what replaced it is the point.
+     *
      * ⛔ AND ONE OF THEM WAS VACUOUS AT FIRST, which is the reason to
      * write these down. Freeing rbx passed the whole suite: the check
      * asked "is take()'s result in GP_RESERVED_MASK", i.e. it consulted
