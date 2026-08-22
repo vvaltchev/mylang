@@ -3369,3 +3369,28 @@ Lanes, both modes: dbg/clang/rel-hard -rt 1869/1869, corpus 15/15,
 150-program forced fuzz. Reach probes: 39/39 record-less on the
 alternating value-call shape, 85/85 on the 3-descent switch shape with
 the materializer inserting what the -3 path resumes through.
+
+## G1 4-v TAX SHRINK (2026-08-12): the broad-suite cost halves
+
+Four removals (full detail in the plan's "4-v TAX SHRINK" section):
+the 4-iii rec_residue byte end to end (including the per-EnterNative-
+dispatch clear that ran in EVERY mode - the window compare is
+self-truthing); the record path's caps-relay park (a record-ful
+callee's residue captures value is provably unread); the caller
+sentinel arm's captures round-trip (the record-less return arm and
+jit_ret_norec restore ctx.captures from the residue themselves); the
+plain-site pending-key gate test (only a CachedCallV site's own probe
+can park a key). Re-measured: callgrind 10_recursion -14.5%, 78 -7.4%,
+gcd -4.3%, 76 -3.7% (~33-36 Ir/call net); suite geomean forced/
+unforced 1.006x, inside the run-to-run spread.
+
+**The shrink exposed a coverage gap** (the vacuous-test trap): a
+sabotaged captures-restore offset PASSED the entire forced suite - no
+test read a CLOSURE CAPTURE after a record-less return. The new
+closure-capture test constructs the shape, defeating two shape-eaters
+(a tiny callee INLINES -> the mutual pair; a write-once capture
+AUTO-CONSTS and the read folds -> the write-twice init; also noted:
+`var c = runtime(10)` is DynRequiredEx and `int c = runtime(10)` a
+compile TypeMismatchEx - the dyn coercion needs the two-statement
+spelling). Watched failing; both return tiers covered (the emitted arm
+via a scalar result, jit_ret_norec via an array result).
