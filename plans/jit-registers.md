@@ -2821,3 +2821,134 @@ multi-line form, or convert by hand and let vdjcmp prove it inert.
 
 **`dec_dword_base` and `load_base` already exist** - several of the
 above need no new encoder, only a call.
+
+## (y) 2026-08-19 - the hand-encoded conversion FINISHED the bulk: 290 -> 21
+
+Batches 3-6, four commits, 149 sites converted plus one new instrument
+mode. The count of lines emitting an instruction as literal bytes:
+
+    290  (start)  ->  205  ->  171  ->  104  ->  79  ->  59  ->  21
+
+The census columns went the OTHER way over the same commits - RAX
+360 -> 602, RCX 99 -> 211 - and that is the conversion working, not a
+regression. A register spelled into a modrm byte was in no column
+before and is counted now. **Only the hand-encoded number is a target;
+the columns are a fidelity measure.**
+
+### Batches 3 and 5 were byte-identical. Batches 4 and 6 could not be.
+
+Batch 3 (67 sites) and batch 5 (20 sites) reached encoders that already
+existed or that encode one exact form, so `vdjcmp.sh` reported 111/111
+byte-identical in BOTH arenas - the strong claim.
+
+Batches 4 and 6 (25 + 38 sites) are the BASE-FORM shapes -
+`mov rcx, [rax+disp32]`, `cmp dword [rax+d], imm8` - and they could not
+be byte-identical for a reason worth writing down: **the hand-written
+form always spelled mod=10 (disp32), while `emit_modrm_disp` picks
+disp8 when the offset fits, which every one of these struct offsets
+does.** So the choice was "convert and shrink" or "leave 63 registers
+invisible". Leaving them invisible defeats #96, so: convert, and say
+so. Total -2142 bytes over the corpus, which is a rounding error and is
+claimed as nothing more.
+
+### THE INSTRUMENT THAT MADE THAT SAFE: `vdjcmp.sh --same-shape`
+
+Byte identity is the wrong oracle for a change that alters LENGTH. The
+new mode normalises exactly three things - the `+ NN:` offset column, a
+relative branch target that is the WHOLE operand, and a `frag@+NNNN`
+fragment base - and compares everything else: registers, memory
+displacements, immediates, tags, helper names. It reports the byte
+delta, which is the only reason to make such a change.
+
+It is STRICTLY WEAKER and the script says so in its own report line, so
+a result cannot be quoted without its mode. What it cannot see is a
+branch that now goes somewhere else - the displacement is exactly what
+it erases - so it is paired with the objdump oracle and corpus_diff,
+never used alone.
+
+**TWO SELF-TESTS, BOTH WATCHED FAILING**, because a normaliser is
+precisely the shape that silently erases what it was meant to keep -
+this repo already shipped a sed pipeline that masked so much it called
+every program different:
+ - NON-VACUITY: `mov rcx` vs `mov rdx` must still differ. Sabotaged by
+   adding `s/r[a-d]x/<reg>/g` -> exit 2, named.
+ - EFFECTIVENESS: two dumps differing only in offsets and branch
+   targets must compare equal. Sabotaged by dropping the branch rule
+   -> exit 2, named.
+
+**AND ITS FIRST REAL RUN CAUGHT ITSELF.** The mode reported 39 programs
+as "instruction stream, not just lengths"; the instrument was wrong,
+not the change - a `frag@+NNNN` base shifts for every fragment placed
+after one that changed size. That rule joined shape_norm and the
+self-test grew a frag@ line, so dropping it now fails by name. This
+mode will be needed again for #101 (the native peephole), which changes
+instruction length constantly.
+
+### Two design points the new encoders record
+
+`imul_reg` and `idiv_reg` take ONE operand each, and their comments say
+why: rdx:rax is ISA-fixed for both, so the multiplier/divisor is the
+only allocatable operand there is. **When the (c) allocator lands those
+are `take_fixed` sites by construction**, not oversights to rediscover.
+
+`setcc_r8` REFUSES a register above bl rather than emit the wrong byte
+register: with no REX, modrm 4..7 means ah/ch/dh/bh, not sil/dil/spl/
+bpl. A caller needing those needs the REX form and should have to say
+so. Same principle as `cmp_base_reg` being a separate function from
+`cmp_reg_base` - 39 /r and 3B /r are not the same instruction, and
+folding them into one "cmp two things" helper is how the operand order
+gets silently swapped.
+
+### RSP and RBP joined the Reg enum
+
+Neither is allocatable - rsp is the machine stack pointer, rbp the
+fragment's slots base - but `0x48 0x89 0xE9` means `mov rcx, rbp` and
+hid rbp from the census exactly as thoroughly as it hid rcx. Naming
+them is the same rule that put R8..R11 there.
+
+**Note for the (c) work: the `Reg` enum is declared BELOW the Emitter
+class**, so the class body cannot name a register (`call_rax` passes a
+bare 0 with the reason in a comment). Move the enum above the class
+before the allocator needs to name defaults.
+
+### THE 21 THAT REMAIN, and why each is left
+
+These are not more of the same; each needs a decision, not a pattern:
+
+  2  `49 BB` / `49 BA` + u64      the movabs_r11 / movabs_r10 LAMBDAS
+                                  in emit_sync_push_native. Already
+                                  named accessors as far as the census
+                                  is concerned - converting them is
+                                  cosmetic.
+  6  F2-prefixed xmm forms        movsd / cvtsi2sd with a disp32 base.
+                                  Needs an xmm base-form family; the
+                                  existing elem_sd is SIB-only.
+  4  SIB forms                    `[rsp]`, `[rsp+0x20]`, `[rcx+r9*8]`,
+                                  `movzx eax, [rbx+rax]`. The SIB
+                                  encoders exist but take a fixed
+                                  scale; these want a general one.
+  2  `0F 88` / `0F 8C` + rel32    jcc rel32 inside the shift-count
+                                  guard - part of the JUMP machinery,
+                                  which owns its own patching.
+  2  `48 D3 <modrm>` / `48 C1`    the VARIABLE-count shift: the modrm
+                                  is computed from the op, so the
+                                  register is already a variable.
+  5  scattered                    `push [rcx]`, `mov qword [rcx], 0`,
+                                  `lea rcx,[rbx+d]`, `mov [r9+off], al`,
+                                  `movzx eax, byte [rbx+d]`.
+
+**None of them blocks (c).** The census's blind-spot banner now covers
+21 lines instead of 290, and every register in the pin pool's candidate
+set is visible. Finish them opportunistically; do not let them gate the
+allocator.
+
+### NEXT: approach (c)
+
+The conversion was the prerequisite. The allocator itself is next -
+register classes, a per-register capability bitmask, a weight/cost
+model, `take_fixed({RAX, RDX})` for the ABI and ISA-mandated cases, and
+backtracking / DP where a single pass cannot choose well. See (w) for
+why the rcx admission blocker is a design step and not a bug list:
+**1749 SCRATCH-PIN reports, all reg=1, none for any other register** -
+those are declared, correct, necessary clobbers, and the defect is that
+the scratch register is FIXED at rcx.
