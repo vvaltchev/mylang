@@ -18149,6 +18149,8 @@ static bool jit_norec_shadow()
      * SITE-carrying records. */
     const unsigned long f0 = g_jit_norec_frame_verify;
     const unsigned long st0 = g_jit_norec_stamp_verify;
+    const unsigned long rw0 = g_jit_norec_raise_walk;
+    const unsigned long rf0 = g_jit_norec_raise_frames;
     /* step 3: the rbp-chain shadow walk must have covered the deep
      * native segment of the mutual recursion above - many frames per
      * push, so it dwarfs the call count. If it were 0 the walk is
@@ -18209,6 +18211,20 @@ static bool jit_norec_shadow()
                         "%lu stamps - the backtrace path did not run\n",
                 g_jit_norec_frame_verify - f0,
                 g_jit_norec_stamp_verify - st0);
+        return false;
+    }
+    /* STEP 4-ii - the RAISE-TIME anchor: jit_throw passed the fragment's
+     * rbp and the walk traversed the segment FROM THE RAISE POINT. The
+     * FRAMES counter is the load-bearing half: a dead anchor (rsp, a
+     * clobbered rbp, a wrong argument register) floors the walk at level
+     * 0 SILENTLY - the invocation count alone cannot see it. The deep
+     * throws above give >= one multi-frame segment per iteration. */
+    if (g_jit_norec_raise_walk - rw0 < 4
+            || g_jit_norec_raise_frames - rf0 < 8) {
+        fprintf(stderr, "jit_norec_shadow: %lu raise walks traversed %lu "
+                        "frames - the raise anchor is dead\n",
+                g_jit_norec_raise_walk - rw0,
+                g_jit_norec_raise_frames - rf0);
         return false;
     }
     if (calls < 20) {

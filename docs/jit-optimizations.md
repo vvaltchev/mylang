@@ -3068,3 +3068,42 @@ working as designed. Sabotage (bake resume+1): "out of bounds" abort on
 
 Lanes: dbg/clang/rel-hard -rt 1867/1867, corpus 14/14, non-JIT probe
 (g++ + clang) builds and passes, plain release builds and runs.
+
+## G1 no-record tier STEP 4-ii(a) (2026-08-10): the raise-time anchor -
+## the raise helpers carry the fragment's rbp, walked at every native throw
+
+The record-less unwind will anchor on the raising fragment's rbp; this
+step proves that anchor LIVE, with records still present. jit_throw /
+jit_rethrow / jit_end_finally gained a trailing frag_rbp argument
+(`mov rcx/r8, rbp` at the emit - raw bytes, the Reg enum deliberately
+omits rbp), threaded to vm_raise (a defaulted parameter, so the ~15
+interpreted raisers are untouched and pass null). vm_raise runs the
+SHARED chain walk - factored out of the push verification into
+norec_walk_chain - from the raise point: the same traversal at a
+DIFFERENT moment, after arbitrary body execution, which is what proves
+rbp still holds the fragment's frame (callee-saved + never emitted)
+exactly where step 4's walk will read it.
+
+TWO counters, and the split is the point: norec_raise_walk counts
+invocations, norec_raise_frames the LEVELS traversed. A dead anchor
+(rsp, a clobbered rbp, the wrong argument register) floors the walk at
+level 0 SILENTLY - the invocation count alone stays green. The -rt
+assertion requires both; the sabotage (mov rcx,rsp in jit_throw's emit)
+was watched failing as "4 raise walks traversed 0 frames - the raise
+anchor is dead", 1866/1867.
+
+Reach, per probe: a deep mutual-recursion throw walks ~14 frames per
+raise (norec_walk 680 -> 765 over the pre-4-ii binary on the same
+program). 42_exceptions' 200k and 69_exc_crossframe's 20k raise walks
+all floor at level 0 - CORRECTLY: 42 throws in main's fragment
+(jit_enter, C++ RA), and 69 is native-top / interpreted-middle /
+native-bottom (deep's self-call declines the sync tier), so its
+throwing frame is a 1-frame segment entered from C++. The walk's floor
+rule is doing exactly its job on both.
+
+Remaining in 4-ii: (b) the unwind CAPTURE path consumes the chain -
+reconstruct each popped frame's backtrace entry from the site and
+cross-check byte-for-byte against the record-based capture.
+
+Lanes: dbg/clang/rel-hard -rt 1867/1867, corpus 14/14, non-JIT probe
+(g++ + clang), plain release runs.
