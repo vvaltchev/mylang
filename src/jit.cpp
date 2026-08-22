@@ -1107,11 +1107,18 @@ struct RegAlloc {
      * through take_fixed. Returns -1 under pressure - the caller
      * spills, it does not get a wrong register.
      */
-    int take(uint32_t need, uint32_t prefer = 0)
+    int take(uint32_t need, uint32_t prefer = 0, uint32_t exclude = 0)
     {
         int best = -1, best_w = 0;
         for (uint8_t r = 0; r < 16; r++) {
             if ((gp_caps(r) & need) != need || !free_reg(r))
+                continue;
+            /* `exclude` is a LOCAL reason this particular site cannot
+             * use a register that is otherwise free and capable - it
+             * already holds this emitter's own input, or it carries a
+             * status the code after us reads. Distinct from `denied`,
+             * which is a property of the whole RUN. */
+            if (exclude & (1u << r))
                 continue;
             /* `prefer` breaks ties toward a register the caller has a
              * reason to want (it already holds the value, it is the
@@ -1151,6 +1158,31 @@ struct RegAlloc {
         return true;
     }
     void give(uint8_t r) { busy &= ~(1u << r); }
+
+    /*
+     * THE PRESSURE ANSWER: a capable register IGNORING occupancy, for a
+     * caller that will SPILL it to the machine stack and restore it.
+     * `denied` and `exclude` are still honoured - a denied register is
+     * not merely occupied, this run may not touch it at all, and an
+     * excluded one holds the caller's own input.
+     *
+     * Deliberately separate from take(): spilling costs two
+     * instructions and a caller must choose it explicitly, never get
+     * it silently because take() ran out.
+     */
+    int any_capable(uint32_t need, uint32_t exclude = 0) const
+    {
+        int best = -1, best_w = 0;
+        for (uint8_t r = 0; r < 16; r++) {
+            if ((gp_caps(r) & need) != need)
+                continue;
+            if ((denied | exclude) & (1u << r))
+                continue;
+            const int w = gp_weight(r);
+            if (best < 0 || w < best_w) { best = r; best_w = w; }
+        }
+        return best;
+    }
 };
 
 struct Emitter {
@@ -1252,15 +1284,43 @@ struct Emitter {
      * already spills every caller-saved pin, which is what made
      * r8/r10/r11 admissible. Only RAW scratch outside that bracket is.
      */
-    int alloc_scratch()
+    /*
+     * ⛔ #96 (c) - ASK FOR A SCRATCH REGISTER, DO NOT NAME ONE.
+     *
+     *   need     what the site FUNCTIONALLY requires. CAP_ALLOCATABLE
+     *            is implied; add CAP_MEM_BASE if the register will be
+     *            a memory base, CAP_BYTE_NOREX if a byte of it is
+     *            written, and so on. Getting this too WEAK is the
+     *            dangerous direction: the allocator would hand back a
+     *            register the encoder then refuses (an ML_CHECK) or,
+     *            worse, encodes wrongly.
+     *   prefer   the register the site used to hardcode. A DISCOUNT in
+     *            the cost model, so a converted site keeps emitting
+     *            byte-identical code while nothing else wants that
+     *            register - and silently moves aside the day something
+     *            does. That is the whole mechanism by which rcx and
+     *            rax can eventually join the pin pool: 1749 of the
+     *            admission test's conflicts are sites that CLAIM rcx
+     *            where they could REQUEST a register.
+     *   exclude  a local reason this site cannot take an otherwise-fine
+     *            register (it holds our own input; it carries a status
+     *            the code after us reads).
+     *
+     * Returns -1 under pressure. A caller that cannot proceed without
+     * one must say so itself - handing back a wrong register would be
+     * the r9 bug again.
+     */
+    int alloc_scratch(uint32_t need, uint32_t prefer = 0,
+                      uint32_t exclude = 0)
     {
-        /* Preference order is today's convention, so a converted site
-         * gets the register it used to hardcode and the emitted code
-         * stays byte-identical until the pool actually widens. */
-        static const uint8_t ORDER[] = { RAX, RCX, RDX };
-        const int r = take_reg(ORDER, sizeof(ORDER) / sizeof(ORDER[0]));
-        ML_CHECK_MSG(r >= 0, "alloc_scratch: no scratch register free");
-        return r;
+        /* THE TWO OCCUPANCY RECORDS MUST AGREE. `cache` is what the
+         * pin machinery reads (reg_holds_pin, flush_cache); `ra.busy`
+         * is what the allocator reads. They are written at the same
+         * moment by the pool pick, and a divergence would let this
+         * hand out a pinned register - so it is checked here, at the
+         * one place that consults both. */
+        check_pins_are_busy();
+        return ra.take(need | CAP_ALLOCATABLE, prefer, exclude);
     }
     void free_scratch(uint8_t r) { give_reg(r); }
     /* C2a: the FLOAT half of the pool - hot float slots pinned in
@@ -2053,6 +2113,23 @@ struct Emitter {
     struct CacheState {
         std::vector<CacheEnt> cache, fcache;
         std::vector<TypedEnt> tflush;
+        /*
+         * #96 (c): the ALLOCATOR'S OCCUPANCY is part of this family
+         * too, and forgetting it was the family's SECOND miss - found
+         * the same way the first was, by a check that named it.
+         * `restore_cache` put the pin vectors back and left `ra.busy`
+         * at zero, so `cache` said a register was pinned while the
+         * allocator said it was free, and the first thing to ASK the
+         * allocator (alloc_scratch) aborted on 14 corpus programs.
+         *
+         * NOTE `is_empty()` deliberately does NOT consult it. Its two
+         * callers - exit_pc's write-back test and the barrier's brk
+         * guard - mean "is a SLOT held in a register", which is the
+         * pin vectors; a transient scratch is not a slot. The
+         * invariant that does matter (every pinned register is busy)
+         * is ML_CHECKed in clear_cache_state and alloc_scratch.
+         */
+        RegAlloc ra;
         bool is_empty() const
         { return cache.empty() && fcache.empty() && tflush.empty(); }
     };
@@ -2062,7 +2139,8 @@ struct Emitter {
      * IN THESE FOUR FUNCTIONS AND NOWHERE ELSE. ADD A MEMBER -> UPDATE
      * ALL FOUR (they are deliberately adjacent so you see them at once):
      * CacheState's fields, is_empty(), snapshot_cache(), restore_cache()
-     * and clear_cache_state().
+     * and clear_cache_state(). `ra` (the allocator's occupancy) is a
+     * member: see its note in CacheState for the miss it caused.
      *
      * WHY THIS EXISTS. `cache` (N5 int pins), `fcache` (C2a float pins)
      * and `tflush` (C3 type-elided slots) are one FAMILY, and four
@@ -2087,21 +2165,43 @@ struct Emitter {
      * member added to one and forgotten in the other aborts by name
      * rather than corrupting a slot.
      */
-    CacheState snapshot_cache() const { return { cache, fcache, tflush }; }
+    CacheState snapshot_cache() const
+    { return { cache, fcache, tflush, ra }; }
     void restore_cache(CacheState &&s)
     {
         cache = std::move(s.cache);
         fcache = std::move(s.fcache);
         tflush = std::move(s.tflush);
+        ra = s.ra;
+        check_pins_are_busy();
     }
     void clear_cache_state()
     {
         cache.clear();
         fcache.clear();
         tflush.clear();
+        /* the OCCUPANCY goes with them; `denied` does NOT - it is a
+         * property of the whole run, not of what is held right now. */
+        ra.busy = 0;
         ML_CHECK_MSG(!cache_live(),
                      "clear_cache_state() left something live: a cache "
                      "vector was added to cache_live() but not here");
+        check_pins_are_busy();
+    }
+    /*
+     * THE INVARIANT JOINING THE TWO RECORDS: every register `cache`
+     * says is pinned must be marked busy in the allocator, or
+     * alloc_scratch can hand out a pinned register - the r9 shape.
+     * Asserted wherever either record is rewritten wholesale.
+     */
+    void check_pins_are_busy() const
+    {
+#ifndef NDEBUG
+        for (const CacheEnt &c : cache)
+            ML_CHECK_MSG(ra.busy & (1u << c.reg),
+                         "a pinned register is not busy in the "
+                         "allocator - cache and RegAlloc have diverged");
+#endif
     }
     /* "is anything held in a register right now" - asked by the barrier
      * guard and by frag_ret's write-back contract. */
@@ -2138,7 +2238,12 @@ struct Emitter {
                     && same_c(exit_states[i].fcache, fcache)
                     && same_t(exit_states[i].tflush, tflush))
                 return i;
-        exit_states.push_back({ cache, fcache, tflush });
+        /* `ra` rides along for the aggregate but is deliberately NOT
+         * part of the comparison above: an exit state describes what
+         * must be WRITTEN BACK, which is the pin vectors. Two exits
+         * with the same pins and different transient scratch are the
+         * same exit and must dedup to one epilogue. */
+        exit_states.push_back({ cache, fcache, tflush, ra });
         return exit_states.size() - 1;
     }
 
@@ -4531,22 +4636,63 @@ static void emit_call_epilogue(Emitter &e)
          * region would reload a pin into it and then this line would
          * destroy it - the r9 shape exactly, and a silent wrong answer.
          *
-         * `scratch()` is a no-op today (nothing pins RCX) and costs
-         * nothing; the day that changes it ABORTS here, by name,
-         * instead of miscompiling. The fix at that point is one line:
-         * `HOIST_REGS_MASK` must gain RCX, so `jit_xcache_clobber`
-         * stops a run with a hoist region from spending it - the mask
-         * already exists precisely so each contributor names its own
-         * registers.
+         * ⛔ #96 (c) - IT NO LONGER CLAIMS RCX, IT REQUESTS A SCRATCH.
+         * This was the documented rcx blocker, and its documented fix
+         * was "add RCX to HOIST_REGS_MASK" - i.e. deny the WHOLE pool
+         * to any run with a hoist region, which is what the clobber
+         * mask already had to stop doing once for r10/r11 (0 of 20
+         * hoist runs had a register left). Asking instead costs
+         * nothing and scales: while nothing else wants rcx the
+         * preference hands it back and the bytes are unchanged; the
+         * day rcx is pinned this takes another register instead of
+         * aborting.
+         *
+         * The requirements are real, not decorative: it is a memory
+         * BASE for the two load_base calls (CAP_MEM_BASE), it must not
+         * be RAX (which carries the helper's status, tested by every
+         * call site right after this epilogue), and it must not be
+         * either hoist register, which the loads below write.
          */
-        e.scratch(RCX);
+        const uint32_t hex = (1u << RAX) | (1u << g_hoist.rdata)
+                           | (1u << g_hoist.rcount);
+        int hsc = e.alloc_scratch(CAP_MEM_BASE, 1u << RCX, hex);
+        /*
+         * ⛔ PRESSURE IS REACHABLE HERE, and finding that out is what
+         * the conversion bought. With rcx in the pin pool, a fragment
+         * at full pressure has ELEVEN pins; add rax (the helper
+         * status), the two hoist registers, r12 (no CAP_MEM_BASE) and
+         * the three role registers and there is genuinely nothing
+         * free - three corpus programs reach it. Today the site is
+         * safe only because it hardcodes a register the pool never
+         * spends, which is precisely the assumption being removed.
+         *
+         * So SPILL: push a capable register, use it for three
+         * instructions, pop it. The pair is balanced, so the stack
+         * alignment every emitted call site depends on is unchanged,
+         * and it costs two instructions on a path that only runs when
+         * a hoist region survives a helper call.
+         */
+        const bool hspill = hsc < 0;
+        if (hspill) {
+            hsc = e.ra.any_capable(CAP_MEM_BASE | CAP_ALLOCATABLE, hex);
+            ML_CHECK_MSG(hsc >= 0,
+                         "no register is even CAPABLE of re-deriving "
+                         "the hoist region - the exclusion set is wrong");
+        }
+        const uint8_t hb = static_cast<uint8_t>(hsc);
+        if (hspill)
+            e.push_reg(hb);
         const JitLayout &L = jit_layout();
-        e.load(RCX, slot_addr(g_hoist.base).payload);   /* the shobj */
-        e.load_base(g_hoist.rdata, RCX, L.data_off);
-        e.load_base(g_hoist.rcount, RCX, L.data_off + 8);
+        e.load(hb, slot_addr(g_hoist.base).payload);    /* the shobj */
+        e.load_base(g_hoist.rdata, hb, L.data_off);
+        e.load_base(g_hoist.rcount, hb, L.data_off + 8);
         e.sub_rr(g_hoist.rcount, g_hoist.rdata);
         if (g_hoist.kind == 0 || g_hoist.kind == 1)
             e.sar_rr_imm8(g_hoist.rcount, 3);       /* 2/3 count BYTES */
+        if (hspill)
+            e.pop_reg(hb);
+        else
+            e.free_scratch(hb);
     }
 }
 
