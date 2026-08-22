@@ -18039,6 +18039,112 @@ static bool jit_sync_inline_call()
 }
 
 /*
+ * G1 NO-RECORD TIER STEP 1 - the SHADOW-VERIFIED side table
+ * (plans/g1-no-record-tier.md). Every M5b inline push runs
+ * jit_norec_push_verify, which compares the just-filled record against
+ * the emit-time side-table entry and ABORTS on any mismatch - so the
+ * whole suite is the test; what THIS test adds is the prove-it-ran
+ * counter (an emitted verify that silently stopped being emitted would
+ * keep every other test green) and the FULL-STACK AUDIT run: with
+ * g_norec_audit set, every push re-verifies every LIVE record, the net
+ * that can see a transient deep-frame corruption a normal pop never
+ * reads. The recursion goes through int-param sync pushes (inc 3's
+ * shape), so at depth d the audit re-walks O(d) records per call -
+ * audit_frames must therefore grow SUPERLINEARLY in the depth, and the
+ * floor below (10x the call count) asserts exactly that, not mere
+ * "it incremented".
+ */
+static bool jit_norec_shadow()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long v0 = g_jit_norec_verify;
+    const unsigned long s0 = g_jit_norec_sites;
+    const unsigned long a0 = g_jit_norec_audit_frames;
+    const bool saved_audit = g_norec_audit;      /* save/restore: an
+                                                  * env-gated tool toggled
+                                                  * by one test must not
+                                                  * leak into the next */
+    g_norec_audit = true;
+    /* TWO shape-eaters were found writing this test, both documented
+     * declines of the push, and both must be defeated for the audit to
+     * ever see a DEEP stack of emitted-pushed records:
+     *  - a FIRST descent is all new record-stack peaks, and the reuse
+     *    guard (rec_n == recs_high -> slow) declines every level of it;
+     *    a single call yields ZERO inline pushes however deep it goes -
+     *    hence the loop, whose iterations 2+ reuse the grown stack;
+     *  - direct SELF-recursion is sync-emitted only when the native
+     *    stack is armed (cap > 1000); this suite's ASan lane runs it
+     *    unarmed (cap 32), where the M5a exclusion keeps the self-call
+     *    off the sync tier entirely - hence MUTUAL recursion, which is
+     *    eligible unconditionally (the entry-stub test's same trick).
+     * Depth 24 stays under the unarmed cap of 32. */
+    const bool ok = run({
+        "func ev(int n) {",
+        "  if (n == 0) { return 0; }",
+        "  var r = od(n - 1);",
+        "  return r + 1;",
+        "}",
+        "func od(int n) {",
+        "  if (n == 0) { return 0; }",
+        "  var r = ev(n - 1);",
+        "  return r + 1;",
+        "}",
+        "var t = 0;",
+        "for (var k = 0; k < 4; k++)",
+        "  t += ev(runtime(24));",
+        "assert(t == 96);" });
+    g_norec_audit = saved_audit;
+    if (!ok)
+        return false;
+    if (g_jit_norec_sites <= s0) {
+        fprintf(stderr, "jit_norec_shadow: NO side-table sites emitted\n");
+        return false;
+    }
+    const unsigned long calls = g_jit_norec_verify - v0;
+    if (calls < 20) {
+        fprintf(stderr, "jit_norec_shadow: verify ran %lu times "
+                        "(< the recursion depth)\n", calls);
+        return false;
+    }
+    if (g_jit_norec_audit_frames - a0 < calls * 4) {
+        fprintf(stderr, "jit_norec_shadow: audit walked %lu frames for "
+                        "%lu calls - NOT the full stack\n",
+                g_jit_norec_audit_frames - a0, calls);
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * G1 the MONOMORPHIC CALLEE CACHE. `g_jit_callee_cache` is bumped by the
  * emitted HIT arm only, so a bump proves the skip actually ran - a correct
  * result proves nothing here, since the full guard chain produces the same
@@ -25561,6 +25667,8 @@ static bool jit_counter_coverage()
         { "native_returns",   &g_jit_native_returns,   nullptr },
         { "native_calls",     &g_jit_native_calls,     nullptr },
         { "sync_inline",      &g_jit_sync_inline,      nullptr },
+        { "norec_sites",      &g_jit_norec_sites,      nullptr },
+        { "norec_verify",     &g_jit_norec_verify,     nullptr },
         { "callee_cache",     &g_jit_callee_cache,     nullptr },
         { "callee_cache2",    &g_jit_callee_cache2,    nullptr },
         { "bind_coerce",      &g_jit_bind_coerce,      nullptr },
@@ -28208,6 +28316,8 @@ static const std::vector<extra_check> extra_checks =
       jit_boxed_int_fast },
     { "jit: fragment-inline sync call runs (direct push + call rdx)",
       jit_sync_inline_call },
+    { "jit: norec: shadow-verified side table + the full-stack audit",
+      jit_norec_shadow },
     { "jit: the monomorphic callee cache hits (and a polymorphic site is "
       "still correct)", jit_callee_cache_hit },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",

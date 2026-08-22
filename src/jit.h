@@ -26,6 +26,7 @@
 #include "defs.h"    /* int_type */
 
 struct Chunk;
+struct NorecSite;
 class LValue;
 
 /*
@@ -233,7 +234,7 @@ struct JitPushLayout {
               rec_run_chunk, rec_ret_chunk, rec_ret_pc, rec_dst, rec_desc,
               rec_caller_caps, rec_handler_base, rec_diter_base,
               rec_dyiter_base, rec_boundary, rec_sync_stop,
-              rec_cache_key, rec_caller_cache;
+              rec_cache_key, rec_caller_cache, rec_norec_site;
     /* FuncDescriptor */
     /* desc_bind_req: FuncDescriptor::bind_req (vector; data at +0) - the
      * per-parameter required Type singleton, read only when !fast_bind */
@@ -863,6 +864,30 @@ extern "C" unsigned long g_jit_bind_widen;
 extern "C" unsigned long g_jit_coerce_cached;
 extern "C" unsigned long g_jit_sync_inline;
 extern "C" unsigned long g_jit_entry_resume;
+/*
+ * G1 NO-RECORD TIER, STEP 1 (plans/g1-no-record-tier.md). The side table
+ * is emitted in every build; the VERIFICATION - the shadow-oracle seed -
+ * runs only where the counters exist:
+ *   norec_sites         table entries REGISTERED (compile-time)
+ *   norec_verify        emitted verify calls RUN (one per inline push)
+ *   norec_audit_frames  live records re-verified by the FULL-STACK audit
+ *                       (g_norec_audit; the transient-corruption net)
+ * All three defined in vm.cpp beside the helper that bumps them, so the
+ * non-JIT platforms link without stubs.
+ */
+extern unsigned long g_jit_norec_sites;
+extern unsigned long g_jit_norec_verify;
+extern unsigned long g_jit_norec_audit_frames;
+extern bool g_norec_audit;
+/* ret-address -> site, and address -> owning fragment's chunk. Real
+ * implementations live in jit.cpp (the registries are filled when a
+ * fragment is placed); the non-JIT build gets null-returning stubs. */
+const NorecSite *jit_norec_site_for(const void *ret_addr);
+const Chunk *jit_norec_frag_for(const void *addr);
+/* The TESTS-emitted per-push verification (defined in vm.cpp - it reads
+ * the activation's top record, which only vm.cpp can see). NEVER throws
+ * (the #142 rule); a mismatch is a deliberate located abort. */
+extern "C" void jit_norec_push_verify(const void *site) noexcept;
 /* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
  * bumped by the emitted code itself, so it proves the inline tier ran (the
  * jit_ret helper's own counter also counts declines and cannot). */
