@@ -1682,6 +1682,13 @@ struct Chunk {
      * (re-)compile, so NOT serialized (like NativeCode itself).
      */
     bool native_leaf = false;
+    /* G1 step 4 (DERIVED, never serialized - recomputed after every
+     * (re)compile like native_leaf): jit_chunk_norec_ok(this) - may a
+     * frame RUNNING this chunk skip its call record? Read at RUNTIME by
+     * the emitted push (the callee is dynamic), which marks the frame
+     * residue-consumable only when its body can never resume through
+     * the interpreter mid-body. */
+    bool norec_ok = false;
     size_t native_entry_off = 0;
     /* Lever 1 step 5 (fragment-inline sync call): when the compiled body
      * STARTS with an EnterNative (code[0]), the fragment offset a sync

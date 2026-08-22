@@ -3153,3 +3153,70 @@ Lanes: dbg/clang/rel-hard -rt 1867/1867, corpus 14/14, non-JIT probe
 (g++ + clang), plain release runs. 4-ii complete; next is 4-iii - the
 record-less return arm + call-site residue behind MYLANG_JIT_FORCE=norec,
 where behaviour first changes.
+
+## G1 no-record tier STEP 4-iii (2026-08-11): the record-less return arm
+## + the call-site residue, behind MYLANG_JIT_FORCE=norec
+
+The first behaviour-changing step, and the shadow apparatus earned its
+keep FIVE times before the lanes went green.
+
+**The mechanism.** Under FORCE, every emitted sync site pushes the
+2-qword residue ([dst_addr][captures]) around `call rdx` - after the
+M5a stack switch (it must live on the stack the callee's rbp sees),
+parity kept. The caller's OLD ctx.captures is relayed through a global
+(g_jit_residue_caps): it is only readable inside the push's fill, and
+no register survives the intervening ref-bind helper calls. The push
+marks the record with the CALLEE's `Chunk::norec_ok` byte (a DERIVED
+flag recomputed by a scope guard on every jit_compile_chunk exit) - the
+runtime half of the gate, since the callee is dynamic at emit time. The
+callee's return discriminates on that byte (after the boundary check)
+and its record-less arm sources everything the record supplies from
+elsewhere: the result through the residue's dst_addr (none for Halt),
+vframe.slots from [rbp-8] (the window chain), seg-top/used as BAKED
+chunk-total subtractions (equal to the record path's absolute restores
+by the seg-top induction), the release scan from its own ref_slots, and
+the resume-global stores SKIPPED (a residue frame's caller is native by
+construction). Two bookkeeping stores (rec_n--, top_rec) keep the still-
+written records consistent and die in 4-v. The caller's sentinel arm
+restores ctx.captures + vframe.size - baked for a function caller, via
+its own PERSISTENT boundary record for main. jit_norec_retarm_verify
+cross-checks residue-vs-record field-for-field on every arm entry.
+
+**WHAT THE NETS CAUGHT, in order:**
+1. **The mid-body re-entry hole** (the oracle's first forced -rt): a
+   residue frame whose fragment exits mid-body is re-entered via
+   jit_enter - the record survives, the residue died with the original
+   native frame, and [rbp+24] is garbage. Fix: the runtime norec_ok
+   gate (a not-fully-deleted callee can always exit mid-body) plus a
+   one-byte flag clear at the EnterNative C++ entry (covers the
+   -3/flat abandonment too).
+2-4. **THREE dead-tier finds**, each by the prove-it-ran counter
+   reading 0 while every result stayed correct - the exact failure
+   mode the counter rule exists for:
+   - the op-level CachedCallV exclusion zeroed gcd (its whole recursion
+     is a CachedCallV whose cache never engages; the tier's exclusion
+     is a RUNTIME property, now the arm's cache_key/caller_cache
+     guards);
+   - the main-caller exclusion zeroed EVERY headline bench: their outer
+     call loops all live at top level, and gcd's recursion is
+     tail-spliced into a loop so main makes ALL its calls;
+   - the res_slot >= 0 gate zeroed 76_funcval_dispatch: fall-through
+     bodies end in HALT, not ReturnV (visible in one -nj -vd), so the
+     arm now writes the none singleton for them.
+5. **An off-platform break** (jit_norec_forced without a stub), caught
+   by the non-JIT probe - the 21abce2 class again.
+
+**Reach under FORCE** (scale 1): gcd 149,998/150,000 returns through
+the arm, 76 999,999/1M, 78 100%, 10_recursion its whole sync portion;
+fib declines via the cache guards as designed. Sabotage watched
+failing: swapped residue push order -> "residue dst_addr !=
+&parent[rec.dst]" abort.
+
+**Lanes, BOTH modes** (the default binary is byte-identical when
+unforced - every 4-iii emit is behind jit_lever_forced):
+dbg/clang/rel-hard -rt 1867/1867 forced AND default; forced corpus
+14/14; 300-program nested_fuzz forced (5 engines agree); plain release
+runs forced (the arm works without the oracle); non-JIT probe. The C4c
+coverage test now counts g_jit_ret_inline + g_jit_norec_ret_arm - the
+property is "served inline, not by the jit_ret helper", which either
+arm satisfies.

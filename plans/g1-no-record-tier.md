@@ -634,6 +634,43 @@ entirely in C++.
   4-iii. The callee return's record-less arm + the call-site residue,
          behind MYLANG_JIT_FORCE=norec (records still written but
          IGNORED by the return - the A/B lever).
+         DONE (2026-08-11). Under FORCE every emitted site pushes the
+         2-qword residue ([dst_addr][captures], after the M5a switch,
+         parity kept; the caller's old captures relayed through
+         g_jit_residue_caps since no register survives the ref-bind
+         helper calls); the push marks the record with the CALLEE's
+         norec_ok byte (runtime - the callee is dynamic); the return's
+         record-less arm sources EVERYTHING record-lessly (result via
+         the residue dst_addr, vframe.slots via [rbp-8], seg-top/used
+         as baked-total subtractions, resume-global stores SKIPPED) and
+         keeps only two bookkeeping stores (rec_n--, top_rec) that die
+         in 4-v; the caller's sentinel arm restores ctx.captures +
+         vframe.size (baked for functions, via its own persistent
+         boundary record for MAIN). jit_norec_retarm_verify is the
+         pre-mutation oracle on every arm entry.
+         FOUR REAL DEFECTS the nets caught, in order:
+         (1) the oracle's first forced -rt: a residue frame whose
+         fragment exits MID-BODY is re-entered via jit_enter with the
+         residue gone -> the runtime norec_ok gate (fully-deleted
+         callees only) + the EnterNative-entry flag clear;
+         (2)-(4) THREE dead-tier finds, each by the prove-it-ran
+         counter reading 0 while results stayed correct: the op-level
+         CachedCallV exclusion zeroed gcd (its cache never engages -
+         the exclusion is a RUNTIME property, now the arm's guards);
+         the main-caller exclusion zeroed EVERY headline bench (their
+         outer call loops all live at top level; gcd's recursion is
+         even tail-spliced so main makes ALL its calls); and the
+         res_slot>=0 gate zeroed 76 (fall-through bodies end in HALT,
+         not ReturnV - the arm now writes the none singleton for
+         them). Plus one off-platform break (jit_norec_forced stub)
+         caught by the non-JIT probe.
+         Reach under FORCE (scale 1): gcd 149,998/150,000 arm returns,
+         76 999,999/1M, 78 100%, 10_rec its whole sync portion; fib
+         declines via the cache guards, as designed. Sabotage watched
+         failing: swapped residue push order -> "residue dst_addr !=
+         &parent[rec.dst]". Lanes BOTH MODES: dbg/clang/rel-hard -rt
+         1867/1867 forced AND default, corpus 14/14 forced, 300-program
+         nested_fuzz forced, plain release runs forced, non-JIT probe.
   4-iv.  The -3 materializer.
   4-v.   Stop writing the record for gate-passing calls; flip the lever
          default; Net 4 coverage gate; measure per shape + suite.

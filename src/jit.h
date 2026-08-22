@@ -239,7 +239,7 @@ struct JitPushLayout {
               rec_caller_caps, rec_handler_base, rec_diter_base,
               rec_dyiter_base, rec_boundary, rec_sync_stop,
               rec_cache_key, rec_caller_cache, rec_norec_site,
-              rec_native_rbp;
+              rec_native_rbp, rec_residue;
     /* FuncDescriptor */
     /* desc_bind_req: FuncDescriptor::bind_req (vector; data at +0) - the
      * per-parameter required Type singleton, read only when !fast_bind */
@@ -247,7 +247,7 @@ struct JitPushLayout {
     size_t param_desc_size;
     /* Chunk (ck_plain_frame: the DERIVED byte flag that already means
      * "no trys, no dict iters, no dyn iters" - one test for three) */
-    ptrdiff_t ck_n_temps, ck_plain_frame, ck_sync_entry;
+    ptrdiff_t ck_n_temps, ck_plain_frame, ck_sync_entry, ck_norec_ok;
     /* FuncObject */
     ptrdiff_t fo_func, fo_capture_slots;
     /* singletons/constants */
@@ -876,6 +876,11 @@ extern "C" unsigned long g_jit_entry_resume;
  * (the #142 rule); a mismatch is a deliberate located abort. */
 extern "C" void jit_norec_push_verify(const void *site,
                                       const void *rbp) noexcept;
+/* step 4-iii: the record-less return arm's pre-mutation oracle (vm.cpp -
+ * it reads the record the arm is about to NOT use). */
+extern "C" void jit_norec_retarm_verify(const void *dst_addr,
+                                        const void *rbp,
+                                        int_type total) noexcept;
 /*
  * G1 STEP 2 seed: the HARDWARE return address vs the table. Emitted at
  * the top of EVERY fragment entry (TESTS): if [rsp] at entry lies in
@@ -921,6 +926,12 @@ extern unsigned long g_jit_norec_raise_walk;
  * push walks so a dead anchor (a walk that silently floors at level 0)
  * is a test failure, not a hidden regression. */
 extern unsigned long g_jit_norec_raise_frames;
+/* step 4-iii (MYLANG_JIT_FORCE=norec): returns served by the emitted
+ * RECORD-LESS arm (the prove-it-ran counter - bumped by the emitted
+ * code, so a dead discrimination byte cannot fake it), and the arm's
+ * pre-mutation shadow verifications. */
+extern unsigned long g_jit_norec_ret_arm;
+extern unsigned long g_jit_norec_retarm_verify;
 /* step 4-ii(b): the backtrace prefix RECONSTRUCTED at the last
  * rbp-anchored raise, from hardware + baked emit-time constants ONLY
  * (the chain's return addresses -> sites -> site_loc/caller_desc, seeded
@@ -993,6 +1004,8 @@ const Chunk *jit_norec_frag_for(const void *addr);
  * ref_slots list (the C4c return arm's bound). Per-CALL exclusions (a
  * cached call) are the site's business. False off-platform. */
 bool jit_chunk_norec_ok(const Chunk &chunk);
+/* is the norec tier FORCED (MYLANG_JIT_FORCE=norec)? False off-platform. */
+bool jit_norec_forced();
 /*
  * A compiled chunk that MOVES to its final storage (codegen_chunk returns
  * by value; the lazy vm_func_chunk net jits a stack local and emplaces it)

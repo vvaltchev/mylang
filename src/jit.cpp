@@ -250,6 +250,13 @@ static bool jit_lever_forced(JitLever l)
     return !jit_lever_off(l) && (jit_force_mask() & (1u << l));
 }
 
+/* 4-iii: the oracle (vm.cpp) pins the emitted residue flag against what
+ * the push SHOULD have stored, which depends on the lever state. */
+bool jit_norec_forced()
+{
+    return jit_lever_forced(JL_NOREC);
+}
+
 /*
  * The forceable COLD TIERS. Each names a guarded fast path whose
  * DECLINE arm REJOINS (so forcing it is semantically transparent -
@@ -2531,12 +2538,26 @@ static const JitPushLayout &jit_push_layout()
     return L;
 }
 
+/* G1 step 4-iii: the RESIDUE-CAPTURES RELAY. The caller's OLD
+ * ctx.captures value is only available inside the inline push (the fill
+ * reads it for rec.caller_captures just before the tail switches
+ * ctx.captures to the callee's), while the residue push happens later,
+ * at the call - after the M5a stack switch, where no register survives
+ * the intervening ref-arg helper calls. The fill therefore ALSO stores
+ * it here (forced sites only) and the residue push reads it back; after
+ * the call, the site pops the residue value back into this slot so the
+ * SENTINEL arm can restore ctx.captures from it without carrying a
+ * register across the switch-post scratch. Single-threaded, and each
+ * store is consumed by the same call's adjacent code before any nested
+ * call can overwrite it. */
+static const void *g_jit_residue_caps = nullptr;
+
 static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
                                   bool cached, int callee_arg,
                                   std::vector<size_t> &j_slow,
                                   std::vector<size_t> &j_done,
                                   Chunk::CalleeCache *cache_cell,
-                                  const NorecSite *ns)
+                                  const NorecSite *ns, bool residue)
 {
     const JitPushLayout &P = jit_push_layout();
     const JitLayout &L = jit_layout();
@@ -3066,6 +3087,13 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     st(R10, static_cast<int32_t>(P.rec_desc), RAX);
     ld(RAX, R9R, static_cast<int32_t>(L.ctx_captures));
     st(R10, static_cast<int32_t>(P.rec_caller_caps), RAX);
+    if (residue) {
+        /* 4-iii: relay the caller's OLD captures to the residue push
+         * (see g_jit_residue_caps). r11 is free until the cache_key
+         * load below. */
+        movabs_r11(reinterpret_cast<uint64_t>(&g_jit_residue_caps));
+        st(R11, 0, RAX);
+    }
     ld(RAX, R8R, static_cast<int32_t>(P.act_handlers2) + 8);
     modrm(0x2B, RAX, R8R, static_cast<int32_t>(P.act_handlers2), true);
     e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(0x02);   /* shr rax, 2
@@ -3088,6 +3116,25 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     }
     st_b_imm8(R10, static_cast<int32_t>(P.rec_boundary), 0);
     st_b_imm8(R10, static_cast<int32_t>(P.rec_sync_stop), 1);
+    if (jit_lever_forced(JL_NOREC)) {
+        if (residue) {
+            /* 4-iii: rec_residue = the CALLEE's norec_ok - the runtime
+             * half of the gate (the callee is dynamic at emit time). A
+             * body that is not fully deleted can exit mid-body and be
+             * re-entered through the interpreter, where the residue no
+             * longer exists - the oracle caught exactly that on the
+             * first forced -rt. rax is free (reloaded from the desc
+             * spill below); rcx = the callee chunk. */
+            e.u8(0x0F); e.u8(0xB6); e.u8(0x81);   /* movzx eax,byte[rcx+d] */
+            e.u32(static_cast<uint32_t>(P.ck_norec_ok));
+            e.u8(0x41); e.u8(0x88); e.u8(0x82);   /* mov [r10+d], al */
+            e.u32(static_cast<uint32_t>(P.rec_residue));
+        } else {
+            /* an explicit 0 at a cached site - a REUSED record keeps
+             * old bytes */
+            st_b_imm8(R10, static_cast<int32_t>(P.rec_residue), 0);
+        }
+    }
     if (cached) {
         /* the caller's pure-cache STASH (per-frame scoping):
          * rec.caller_cache = move(view_frame.pure_cache) - a raw pointer
@@ -3387,6 +3434,7 @@ static std::vector<std::unique_ptr<NorecSite>> *g_cur_norec_sites = nullptr;
  * like g_cur_norec_sites, safe for the same single-threaded reason. */
 static const FuncDescriptor *g_cur_caller_desc = nullptr;
 
+
 static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                   const Instr &in, uint32_t pc,
                                   size_t old_pc, bool is_value,
@@ -3443,10 +3491,31 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         ns->caller_desc = g_cur_caller_desc;   /* step 3b */
         ns->resume_pc = static_cast<uint32_t>(resume_stub);   /* step 4-i */
     }
+    /* 4-iii (MYLANG_JIT_FORCE=norec): this site pushes the 2-qword
+     * RESIDUE around the call. CACHED sites are included - the tier's
+     * exclusion is "no pure-cache INTERACTION", a runtime property (a
+     * null key and a null stash), which the return arm's guards decide
+     * per call; gcd's whole recursion is a CachedCallV whose cache
+     * never engages, and an op-level exclusion silently zeroed its
+     * reach (found by the prove-it-ran counter). MAIN's sites are
+     * included too: a function caller bakes its total for the
+     * vframe.size restore, and main - which has no descriptor - reads
+     * it from its own BOUNDARY record via act.top_rec instead (the one
+     * record that persists even in 4-v; after the callee pops, top_rec
+     * IS the caller's record). Without main, EVERY headline bench's
+     * reach was zero - their outer call loops all live at top level
+     * (gcd's recursion is even tail-spliced into a loop, so main makes
+     * ALL its calls). */
+    const bool residue = jit_lever_forced(JL_NOREC);
+    const int32_t caller_total =
+        (residue && g_cur_caller_desc)
+            ? static_cast<int32_t>(g_cur_caller_desc->frame_size
+                                   + ck.n_temps)
+            : 0;
     emit_sync_push_native(e, in, is_value,
                           in.op == OpCode::CachedCallV,
                           static_cast<int>(callee_arg), j_slows, j_dones,
-                          cell, ns);
+                          cell, ns, residue);
     /* depth++ (the callee is committed) */
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x01);                        /* inc dword [rcx] */
@@ -3481,16 +3550,55 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * (nested sites see null and stay plain; the restore runs BEFORE the
      * sentinel branch, so the exception path unwinds it too). */
     {
+        /* 4-iii residue, per call path: [dst_addr][captures] pushed just
+         * before the call (AFTER the switch - it must live on the stack
+         * the callee's rbp sees) and consumed just after (BEFORE
+         * switch_post). Two pushes keep the 16-byte call parity. The
+         * post-call pop stores the captures value back into the relay
+         * so the sentinel arm can restore it; the semantic restores are
+         * sentinel-only (on the -3/flat path the flat callee's
+         * captures/vframe are live and must not be clobbered). Only rcx
+         * is touched before the call (free per the switch contract);
+         * rcx/rdx after it (dead once the status is in rax). */
+        const auto residue_push = [&]() {
+            if (!residue)
+                return;
+            if (in.target >= 0) {
+                e.u8(0x48); e.u8(0x8D); e.u8(0x8B);   /* lea rcx,[rbx+d] */
+                e.u32(static_cast<uint32_t>(
+                    in.target * static_cast<int32_t>(sizeof(LValue))));
+            } else {
+                e.u8(0x31); e.u8(0xC9);               /* xor ecx, ecx */
+            }
+            e.u8(0x51);                               /* push rcx */
+            e.movabs(RCX,
+                     reinterpret_cast<uint64_t>(&g_jit_residue_caps));
+            e.u8(0xFF); e.u8(0x31);                   /* push [rcx] */
+        };
+        const auto residue_pop = [&]() {
+            if (!residue)
+                return;
+            e.u8(0x59);                               /* pop rcx (caps) */
+            e.movabs(RDX,
+                     reinterpret_cast<uint64_t>(&g_jit_residue_caps));
+            e.u8(0x48); e.u8(0x89); e.u8(0x0A);       /* mov [rdx], rcx */
+            e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08);
+                                                      /* add rsp,8 (dst) */
+        };
         const size_t j_plain = emit_nstack_switch_pre(e);
+        residue_push();
         e.u8(0xFF); e.u8(0xD2);                    /* call rdx (switched) */
         if (ns)
             ns->off_switched = e.pos();  /* G1: the hardware ret address */
+        residue_pop();
         emit_nstack_switch_post(e);
         const size_t j_over = e.j32(0xEB);
         e.patch32_here(j_plain);
+        residue_push();
         e.u8(0xFF); e.u8(0xD2);                    /* call rdx (plain) */
         if (ns)
             ns->off_plain = e.pos();
+        residue_pop();
         e.patch32_here(j_over);
     }
     /* sentinel? (JIT_RET_SENTINEL == (size_t)-1). The depth DEC runs on
@@ -3502,6 +3610,41 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * clang-ASan lane caught (sanitized vm_dispatch frames are ~77KB). */
     e.u8(0x48); e.u8(0x83); e.u8(0xF8); e.u8(0xFF); /* cmp rax, -1 */
     const size_t j_notsent = e.j32(0x75);          /* jne notsent */
+    if (residue) {
+        /* 4-iii, SENTINEL ONLY: the caller-side semantic restores. The
+         * callee's record-less arm restored neither ctx.captures (the
+         * residue is the caller's to consume) nor vframe.size (only the
+         * caller knows its own baked total; the arm set vframe.slots
+         * from [rbp-8]). Idempotent when the callee took the record
+         * path instead - the values are identical by the shadow
+         * checks. */
+        const JitLayout &JL = jit_layout();
+        const JitPushLayout &JP = jit_push_layout();
+        e.movabs(RCX, reinterpret_cast<uint64_t>(JL.addr_ctx));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x09);        /* mov rcx, [rcx] */
+        e.movabs(RDX,
+                 reinterpret_cast<uint64_t>(&g_jit_residue_caps));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x12);        /* mov rdx, [rdx] */
+        e.u8(0x48); e.u8(0x89); e.u8(0x91);        /* mov [rcx+d], rdx */
+        e.u32(static_cast<uint32_t>(JL.ctx_captures));
+        e.movabs(RCX, reinterpret_cast<uint64_t>(JL.addr_act));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x09);        /* mov rcx, [rcx] */
+        if (g_cur_caller_desc) {
+            e.u8(0xC7); e.u8(0x81);                /* mov dword [rcx+d], */
+            e.u32(static_cast<uint32_t>(JP.act_vframe + JP.frame_size));
+            e.u32(static_cast<uint32_t>(caller_total)); /* imm32 */
+        } else {
+            /* MAIN: read nslots from its own boundary record - after
+             * the callee popped, top_rec IS main's record, and it
+             * persists in every step of the tier's future */
+            e.u8(0x48); e.u8(0x8B); e.u8(0x91);    /* mov rdx, [rcx+d] */
+            e.u32(static_cast<uint32_t>(JP.act_top_rec));
+            e.u8(0x8B); e.u8(0x92);                /* mov edx, [rdx+d] */
+            e.u32(static_cast<uint32_t>(JP.rec_nslots));
+            e.u8(0x89); e.u8(0x91);                /* mov [rcx+d], edx */
+            e.u32(static_cast<uint32_t>(JP.act_vframe + JP.frame_size));
+        }
+    }
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x09);                        /* dec dword [rcx] */
     const size_t j_done1 = e.j32(0xEB);            /* jmp done */
@@ -3717,6 +3860,30 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
          * either way). */
         cmp_b_imm8(R10, static_cast<int32_t>(P.rec_boundary), 0);
         const size_t j_bnd = e.j32(0x75);          /* jne boundary arm */
+        /* 4-iii (MYLANG_JIT_FORCE=norec): a RESIDUE frame takes the
+         * record-less arm below, which sources everything the record
+         * supplies from the residue + baked constants instead. In 4-v
+         * this byte test becomes the window compare and the record
+         * dies. */
+        size_t j_norec = 0;
+        /* chunk-local total, NOT g_cur_caller_desc: the value-template
+         * instances compile with a null jc, which silently skipped the
+         * arm on every one of 76_funcval_dispatch's returns (found by
+         * the prove-it-ran counter + a -vdj with no discrimination in
+         * any fragment). The oracle checks this total against
+         * rec.nslots on every arm entry, so a slot_count/frame_size
+         * divergence anywhere aborts by name. */
+        /* Halt (res_slot -1) is INCLUDED: a fall-through body ends in
+         * Halt, not ReturnV - 76_funcval_dispatch's op functions all do,
+         * and a res_slot gate silently zeroed their reach (the third
+         * dead-tier find of this step, each by the prove-it-ran
+         * counter). The arm writes the none singleton for it, exactly
+         * like the record-ful Halt shape. */
+        const bool arm_norec = jit_lever_forced(JL_NOREC);
+        if (arm_norec) {
+            cmp_b_imm8(R10, static_cast<int32_t>(P.rec_residue), 0);
+            j_norec = e.j32(0x75);                 /* jne record-less arm */
+        }
         cmp_q_imm8(R10, static_cast<int32_t>(P.rec_cache_key), 0);
         j_slow.push_back(e.j32(0x75));             /* jne slow */
         cmp_q_imm8(R10, static_cast<int32_t>(P.rec_caller_cache), 0);
@@ -3906,6 +4073,148 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
         e.u32(0xFFFFFFFEu);                        /* mov rax, -2 */
         e.frag_ret();
+
+        /* ---- 4-iii: THE RECORD-LESS ARM (MYLANG_JIT_FORCE=norec).
+         * Every datum the record-ful pop reads from the record comes
+         * from somewhere else here: the result destination from the
+         * residue ([rbp+24], pushed by the caller's site), the parent
+         * window from [rbp-8] (the window chain), the frame size from
+         * this chunk's own BAKED total (seg->top/used become relative
+         * subtractions - equal to the record path's absolute restores
+         * by the seg-top induction the oracle checks), and ctx.captures
+         * / vframe.size are the CALLER's to restore (its sentinel arm).
+         * The resume-global stores are SKIPPED - a residue frame's
+         * caller is native by construction, and those stores exist only
+         * for an EnterNative consumer. The record still exists in
+         * 4-iii, so the two bookkeeping stores (rec_n--, top_rec) keep
+         * the stack consistent and every decline can still fall to
+         * jit_ret; both die in 4-v. */
+        if (arm_norec) {
+            const int32_t my_total =
+                static_cast<int32_t>(ck.slot_count + ck.n_temps);
+            e.patch32_here(j_norec);
+#ifdef TESTS
+            /* the pre-mutation oracle (jit_norec_retarm_verify):
+             * residue vs record, field for field, while the record is
+             * still whole. Clobbers caller-saved regs - act/top_rec
+             * reloaded after. */
+            ld(RDI, 5, 24);                    /* rdi = [rbp+24] */
+            e.u8(0x48); e.u8(0x89); e.u8(0xEE);/* mov rsi, rbp */
+            e.movabs(RDX, static_cast<uint64_t>(
+                              static_cast<int_type>(my_total)));
+            e.movabs(RAX, reinterpret_cast<uint64_t>(
+                              &jit_norec_retarm_verify));
+            e.call_rax();
+            e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
+            ld(R8R, RAX, 0);
+            ld(R10, R8R, static_cast<int32_t>(L.act_top_rec));
+#endif
+            /* the PURE-CACHE guards - the tier's exclusion is "no
+             * pure-cache interaction", decided HERE per call: a parked
+             * key (a CachedCallV miss), a stashed caller cache, or a
+             * live cache on the callee frame all need C++ - decline to
+             * jit_ret, whose record is fully valid in 4-iii. A
+             * CachedCallV whose cache never engaged (gcd) passes all
+             * three and gets the tier. */
+            cmp_q_imm8(R10, static_cast<int32_t>(P.rec_cache_key), 0);
+            j_slow.push_back(e.j32(0x75));
+            cmp_q_imm8(R10, static_cast<int32_t>(P.rec_caller_cache), 0);
+            j_slow.push_back(e.j32(0x75));
+            cmp_q_imm8(R8R,
+                       static_cast<int32_t>(P.act_vframe
+                                            + P.frame_pure_cache), 0);
+            j_slow.push_back(e.j32(0x75));
+            if (res_listed) {
+                ld(RAX, RBX, static_cast<int32_t>(
+                                 res_slot
+                                 * static_cast<int32_t>(sizeof(LValue)))
+                             + static_cast<int32_t>(L.off_type));
+                cmp_d_imm8(RAX, L.type_t_off,
+                           static_cast<int8_t>(L.t_str_val));
+                j_slow.push_back(e.j32(0x7D));     /* a reference result */
+            }
+            /* rdx = dst_addr from the residue; 0 = discarded result */
+            ld(RDX, 5, 24);
+            e.u8(0x48); e.u8(0x85); e.u8(0xD2);    /* test rdx, rdx */
+            const size_t j_nw = e.j32(0x74);       /* jz no_write */
+            ld(RAX, RDX, static_cast<int32_t>(L.off_type));
+            cmp_d_imm8(RAX, L.type_t_off,
+                       static_cast<int8_t>(L.t_str_val));
+            j_slow.push_back(e.j32(0x7D));         /* old dst: reference */
+            if (res_slot >= 0) {
+                const int32_t s = static_cast<int32_t>(
+                    static_cast<long>(res_slot)
+                    * static_cast<long>(sizeof(LValue)));
+                for (int32_t o = 0; o <= 24; o += 8) {
+                    ld(R11, RBX, s + o);
+                    st(RDX, o, R11);
+                }
+            } else {
+                /* Halt: the result is none - the singleton's type, a
+                 * zeroed payload (the record-ful Halt arm's shape) */
+                e.movabs(RAX, reinterpret_cast<uint64_t>(L.t_none));
+                st(RDX, static_cast<int32_t>(L.off_type), RAX);
+                e.u8(0x31); e.u8(0xC0);            /* xor eax, eax */
+                for (int32_t o = 0; o < 24; o += 8)
+                    st(RDX, o, RAX);
+            }
+            e.patch32_here(j_nw);                  /* no_write: */
+            /* the release scan - the record-ful path's exact shape */
+            for (const int32_t sl : ck.ref_slots) {
+                if (res_listed && sl == res_slot)
+                    continue;
+                const int32_t d = static_cast<int32_t>(
+                    sl * static_cast<int32_t>(sizeof(LValue)));
+                ld(RAX, RBX, d + static_cast<int32_t>(L.off_type));
+                cmp_d_imm8(RAX, L.type_t_off,
+                           static_cast<int8_t>(L.t_str_val));
+                const size_t j_tr = e.j32(0x7C);   /* jl skip (trivial) */
+                e.push_reg(R8R);
+                e.push_reg(R10);
+                e.lea_rdi(d);
+                e.call_relocs.push_back(
+                    { e.pos(),
+                      reinterpret_cast<const void *>(jit_release_slot) });
+                e.u8(0xE8); e.u32(0);
+                e.pop_reg(R10);
+                e.pop_reg(R8R);
+                e.patch32_here(j_tr);
+            }
+            /* vframe.slots = the caller's window from [rbp-8] (the
+             * window chain - record-less); size is the caller's
+             * sentinel arm's job */
+            ld(RAX, 5, -8);
+            st(R8R, static_cast<int32_t>(P.act_vframe + P.frame_slots),
+               RAX);
+            /* record bookkeeping while records exist (dies in 4-v) */
+            e.u8(0x49); e.u8(0xFF); e.u8(0x88);    /* dec qword [r8+d] */
+            e.u32(static_cast<uint32_t>(L.act_rec_n));
+            modrm(0x8D, R11, R10, -L.rec_size, true);
+            st(R8R, static_cast<int32_t>(P.act_top_rec), R11);
+            /* seg->top -= total; used -= total (baked) */
+            modrm(0x63, RAX, R8R, static_cast<int32_t>(P.act_cur_seg),
+                  true);                           /* movsxd rax,[curseg] */
+            ld(RCX, R8R, static_cast<int32_t>(P.act_segs));
+            e.u8(0x48); e.u8(0x8B); e.u8(0x0C); e.u8(0xC1);
+                                                   /* mov rcx,[rcx+rax*8] */
+            e.u8(0x48); e.u8(0x81); e.u8(0xA9);    /* sub qword [rcx+d],i */
+            e.u32(static_cast<uint32_t>(P.seg_top));
+            e.u32(static_cast<uint32_t>(my_total));
+            e.u8(0x49); e.u8(0x81); e.u8(0xA8);    /* sub qword [r8+d],i */
+            e.u32(static_cast<uint32_t>(P.act_used));
+            e.u32(static_cast<uint32_t>(my_total));
+#ifdef TESTS
+            e.movabs(RAX,
+                     reinterpret_cast<uint64_t>(&g_jit_norec_ret_arm));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x00);    /* inc qword [rax] */
+            e.movabs(RAX,
+                     reinterpret_cast<uint64_t>(&g_jit_native_returns));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x00);
+#endif
+            e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
+            e.u32(0xFFFFFFFFu);                    /* mov rax, -1 */
+            e.frag_ret();
+        }
     }
 
     /* slow (and the whole op outside the emit-time gate): the C++ tier */
@@ -4610,6 +4919,8 @@ void jit_stats_report()
         { "norec_win",        &g_jit_norec_win_chain },
         { "norec_raise_walk", &g_jit_norec_raise_walk },
         { "norec_raise_frames",&g_jit_norec_raise_frames },
+        { "norec_ret_arm",    &g_jit_norec_ret_arm },
+        { "norec_retarm_vfy", &g_jit_norec_retarm_verify },
         { "norec_audit",      &g_jit_norec_audit_frames },
         /* step 4 gate reach, classified per M5b inline push: would the
          * CALLEE qualify for the no-record tier? (see push_verify) */
@@ -11626,6 +11937,17 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 {
     jit_native_stack_init();   /* M5a: arm the stack + raise the cap BEFORE
                                 * any guard bakes jit_sync_depth_cap() */
+    /* G1 4-iii: recompute the DERIVED norec_ok on EVERY exit path (this
+     * function has many returns and rewrites `code` in place - deletion
+     * included - so only a scope guard is drift-proof). The emitted push
+     * reads the byte at runtime to decide whether the callee's frame may
+     * consume the residue: a body that is not fully deleted can exit
+     * mid-body and be re-entered through the interpreter, where the
+     * residue no longer exists. */
+    struct NorecOkGuard {
+        Chunk &c;
+        ~NorecOkGuard() { c.norec_ok = jit_chunk_norec_ok(c); }
+    } norec_ok_guard{chunk};
     if (!g_jit_enabled || chunk.code.empty())
         return;
 
@@ -12845,6 +13167,11 @@ bool jit_chunk_is_native_leaf(const Chunk &)
 bool jit_chunk_norec_ok(const Chunk &)
 {
     return false;   /* no fragments off-platform -> no record-less frames */
+}
+
+bool jit_norec_forced()
+{
+    return false;
 }
 
 ContainerPlan jit_container_plan(const Chunk &, const JitCtx *)
