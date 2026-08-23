@@ -3545,3 +3545,68 @@ The change stays (fewer instructions, smaller emitted code, and the
 two table fixes are correctness-adjacent wins), but **76's wall-clock
 gap is NOT in its element read** - the remaining 734 Ir/iteration is
 the call protocol and the two arg copies.
+
+## H3 (2026-08-12): the unpack bind drops the type-erased dispatch
+
+75_indexed_unpack's four-way probe (the H2 lesson applied BEFORE
+building: prove the time moves) put ~93% of the bench's wall time in
+the element BINDS - ~6.7ns/element for what is logically a 24-byte
+handle copy plus two refcount RMWs. The cost is the value model's
+indirection: `vm_arr_elem` materializes a boxed temp (an intrusive_ptr
+retain + a move ctor) and `LValue::put()` runs `EvalValue::operator=`,
+an INDIRECT call through `type->move_assign`, plus destroy/create hops
+on a type change. The types are statically knowable at the bind site
+(a string row yields a SharedStr), but the value model reaches them
+through function pointers.
+
+**`vm_slot_bind_str` / `vm_slot_bind_value` (vm.cpp):** when BOTH
+sides are strings and the slot is PLAIN (no container back-pointer -
+the COW path keeps put()), assign the SharedStr handle directly - an
+intrusive_ptr release+retain (self-assign guarded by the pointer
+compare) plus three POD fields, fully inline, ZERO indirect calls. The
+steady state (iteration 2+) always hits it: the slot still holds the
+previous iteration's string. A general-storage NON-string element
+improves too: `put(const &)` on the element in place - one copy_assign
+- instead of the vm_arr_elem temp (copy_ctor + move_assign + dtor).
+Flat scalars keep write_*_slot; structs must materialize. SOUNDNESS:
+observably identical to put() - the slot shares the same StrObj either
+way (the window model's value semantics are a property of the handle),
+put() never tested is_const either, and passing a reference INTO the
+array's storage is safe because the base frame slot owns the outer
+array for the whole op and the op writes only frame slots. NOTE
+bench 75's rows are GENERAL storage (plain string literals stay
+general; only split()/splitlines() build flat strs) - the general arm
+is the hot one, the flat-strs arm its sibling.
+
+Wired into `vm_unpack_elem_body` (both the consecutive and the
+targets loops; `jit_unpack_elem` funnels through the same body, so the
+JIT inherits it) and `vm_multi_unpack_body`'s plain stores (array
+destructure + scalar spread); the compound and numeric-coerce arms
+stay on store() untouched.
+
+MEASURED (OPT=1 ASSERTS=0, interleaved --baseline, full suite):
+**75_indexed_unpack 0.84x wall, -25.4% Ir** (1991M -> 1486M at scale
+1 = ~50 Ir per bind over 10M binds); suite geomean cur/base 1.002x,
+untouched benches swinging 0.91-1.13x in the same run (73's 1.11x and
+20's 1.05x sit inside that band and neither touches the changed arms -
+20 is the flat-int unpack, 73 int elements through the unchanged
+default arm). Unlike H2, the Ir arrived AND the time moved - the
+removed work here includes an allocation-class temp plus two refcount
+RMWs per element, not just predicted branches.
+
+PROOF + NETS: `g_unpack_fast_binds` bumps ONLY in the dispatch-free
+arm; `unpack_fast_bind_shapes` (-rt) asserts growth per shape (general
+rows, flat-strs rows, multi-unpack destructure, scalar spread) and
+EXACTLY 0 on alternating str/int re-binds. Both sabotages watched
+failing: disabling the fast arms fails the counter check; a one-short
+window from the fast arm fails the H3 value tests AND the pre-existing
+unpack tests + the op-nativized JIT check. Three dual-engine tests pin
+the observables (append-to-loop-var never leaks into the row across
+the steady-state re-bind, type-changing re-binds stay exact, the
+multi-unpack siblings keep their values).
+
+REMAINING SIBLINGS (enumerated, not built): the single-var foreach
+VALUE bind (`foreach s in rows` - do_iter / the foreach Next op pays
+the same put() chain; the probe's one-bind loop cost 0.16s of the
+0.28s shape, the same class of target), and the tree-walker's
+bind_loop_var (perf parity only - values already identical).
