@@ -430,6 +430,29 @@ extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src) noexcept;
 extern unsigned long g_jit_ref_arg_binds;
 
 /*
+ * THE IN-PLACE ARGUMENT's cold arm (#162). A fused call site binds some
+ * arguments straight from the caller slot the staging MoveV would have
+ * copied them from, and therefore never emits that MoveV - so every arm
+ * that hands the argument RUN to a C++ tier (the guard declines, and with
+ * them the depth-cap SWITCH and the bail whose re-run re-executes the
+ * INTERPRETED call op) must first materialise it. `pairs` is the site's
+ * baked (dst, src) slot array, `n` its pair count; each pair is exactly
+ * the MoveV that was skipped, in the order codegen emitted them.
+ *
+ * noexcept and it means it: `put` on a plain frame slot runs the value
+ * model's assign, which cannot throw for any value a slot can hold (see
+ * the noexcept-helper rule - a helper the emitter takes no status from
+ * must have a defined outcome, never a throw).
+ */
+extern "C" void jit_stage_args(const int32_t *pairs, int_type n) noexcept;
+/* Execution proof for the FUSED bind - bumped by the EMITTED copy loop,
+ * so it cannot be satisfied by the helper tier (TESTS builds). */
+extern unsigned long g_jit_arg_inplace;
+/* ...and for the COLD arm that replays them - the path where a mistake is
+ * a use-after-free rather than a wrong number, so it gets its own proof. */
+extern unsigned long g_jit_arg_stage;
+
+/*
  * model-flip (nativize-ops): SubscriptV natively - `dst = base[idx]` via the
  * runtime Type::subscript (any base: array/dict/string), the interpreter's
  * EXACT read. base_lv/dst are frame-slot LValue*s, idx the index slot's

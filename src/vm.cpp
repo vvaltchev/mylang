@@ -3185,6 +3185,31 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
  * argument is an array/string/dict/struct, which used to decline entirely). */
 unsigned long g_jit_ref_arg_binds = 0;
 
+/* THE IN-PLACE ARGUMENT (#162): bumped by the EMITTED copy loop, once per
+ * fused argument bound from its caller slot. */
+unsigned long g_jit_arg_inplace = 0;
+
+/*
+ * The fused site's COLD arm: replay the staging MoveVs the emit skipped.
+ * See jit.h. This is the interpreter's own MoveV (jit_move's body) run
+ * over the site's baked pair list, so a materialised run is byte-identical
+ * to the one the unfused emit would have built.
+ */
+unsigned long g_jit_arg_stage = 0;
+
+extern "C" void jit_stage_args(const int32_t *pairs, int_type n) noexcept
+{
+#ifdef TESTS
+    g_jit_arg_stage++;
+#endif
+    EvalContext *ctx = g_current_ctx;
+    if (!ctx || !ctx->frame)
+        return;
+    for (int_type i = 0; i < n; i++)
+        ctx->frame->at(pairs[2 * i]).put(ctx->frame->at(pairs[2 * i + 1])
+                                             .get());
+}
+
 /*
  * Bind ONE reference argument for the fragment-inline sync push (M5b).
  *
