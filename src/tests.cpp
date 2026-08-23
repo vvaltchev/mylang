@@ -5388,6 +5388,31 @@ static const std::vector<test> tests =
         "  return s;",
         "}",
         "assert(drive(runtime(4)) == 6);" } },
+    /* THE SAME BUG, THROUGH A DOOR THE FIX ABOVE COULD NOT SEE. A boxed
+     * `&&`/`||` chain is a JOIN too since #138 gave it real short-circuit
+     * branches - but its arms end in LogV, not MoveV, and LogV was still
+     * in op_writes_pure_target. As a CALL ARGUMENT, compile_to_run_slot
+     * retargeted only the LAST arm, so the short-circuiting path left the
+     * arg slot holding whatever it happened to contain: `print(s > 5 && s
+     * < 6)` printed the staged `3`. The tree-walker said `false`, so it
+     * was a RULE 2 divergence as well as a wrong answer.
+     *
+     * THREE SHAPE-EATERS had to be defeated for this to test anything,
+     * and the first version fell into one: the callee must be a BUILTIN
+     * (a small user `func id(x)` is spliced by the AST inliner, so no
+     * call - and no arg run - reaches codegen at all; that version passed
+     * with the bug REINTRODUCED). `runtime()` keeps `s` dyn, since a const
+     * folds the chain away and a typed `s` never reaches the boxed chain.
+     * And the argument must be the chain ITSELF - assigning to a var first
+     * inserts the MoveV that hides the whole thing. Both polarities of
+     * both operators, so a one-sided fix cannot pass. */
+    { "boxed && / || in an argument short-circuits",
+      { "var dyn s = runtime(3);",
+        "assert(str(s > 5 && s < 6) == \"false\");",
+        "assert(str(s > 1 && s < 6) == \"true\");",
+        "assert(str(s > 1 || s < 0) == \"true\");",
+        "assert(str(s > 5 || s < 0) == \"false\");",
+        "assert(str(s > 5 && s < 6 && s > 0) == \"false\");" } },
     /* Incompatible-arm ternary -> dyn (a runtime variant), not a null
      * static type. The null used to escape type_of into contribute's
      * is_dyn - a SEGFAULT (pre-existing; found by the lever-1 step-5
