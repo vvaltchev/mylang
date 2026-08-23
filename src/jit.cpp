@@ -1694,6 +1694,40 @@ struct Emitter {
         return r;
     }
     void free_scratch(uint8_t r) { trk_takes--; give_reg(r); }
+    /*
+     * #96 batch 9b - THE ACCUMULATOR ASK (cluster D of the rax map,
+     * plans/jit-registers.md entry az). The op emitters stage through
+     * ONE register - the value bus read_slot/op_rr/store_dst move
+     * through - and this is its allocation seam. rax is the bus
+     * because it is the SysV return register (a helper result is
+     * consumed with no move) and the cheapest caller-saved weight.
+     *
+     * `ra.denied` bit 0 is IGNORED here, and ONLY here: that bit is
+     * set exactly when this run's ops raw-clobber rax, i.e. it models
+     * precisely the takers this seam registers - denying the asker on
+     * its own account would be circular. Any OTHER register's deny
+     * bit means a singleton/hoist value lives there and skipping it
+     * would be the r9 bug; rax's means "ops like the asker run here".
+     *
+     * A BUSY rax (a pinned run) refuses. Under the run_may_pin_rax +
+     * coverage gates no staging op coexists with a rax pin, so
+     * refusal is structurally unreachable today - AccScratch below
+     * turns it into an alternative grant, the endgame arm.
+     */
+    int acc_take()
+    {
+        check_pins_are_busy();
+        if (ra.busy & (1u << RAX))                     /* reg:conv */
+            return -1;
+        ra.busy |= 1u << RAX;                          /* reg:conv */
+        trk_takes++;
+        return RAX;                                    /* reg:conv */
+    }
+    void acc_free(uint8_t r)
+    {
+        trk_takes--;
+        give_reg(r);
+    }
     /* C2a: the FLOAT half of the pool - hot float slots pinned in
      * xmm4-xmm7 (xmm0/1 stay the per-op scratch). xmm registers are ALL
      * caller-saved, so unlike the GP pins these are spilled to their
@@ -2978,12 +3012,17 @@ struct Emitter {
 #else
     void bump_divmagic() { }
 #endif
-    /* movq rax, xmm<src> - the div0 bit test's read (C4b: any source). */
-    void movq_rax_x(uint8_t src)
+    /* movq r64, xmm<src> - the div0 bit test's read (C4b: any source;
+     * #96 batch 9b: the dst is an argument, the rax-fixed wrapper is
+     * DELETED - the sixth audit shape's rule). */
+    void movq_r_x(uint8_t dst, uint8_t src)
     {
-        wrote(RAX);
-        u8(0x66); u8(0x48); u8(0x0F); u8(0x7E);
-        u8(static_cast<uint8_t>(0xC0 | (src << 3)));
+        wrote(dst);
+        u8(0x66);
+        u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 4 : 0)
+                                     | (dst >= 8 ? 1 : 0)));
+        u8(0x0F); u8(0x7E);
+        u8(static_cast<uint8_t>(0xC0 | ((src & 7) << 3) | (dst & 7)));
     }
     /* movsd xmm<dst>, xmm<src> (reg-reg; both < 8, no REX needed) */
     void fmov_rr(uint8_t dst, uint8_t src)
@@ -4277,7 +4316,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
         else
             e.scratch(keep);
     }
-    e.mov_rr(keep, RAX);                             /* keep = n */
+    e.mov_rr(keep, RAX);           /* keep = n; reg:isa (imul) */
     e.movabs(RDX, m.M);  /* reg:isa */
     e.imul_reg(RDX);              /* reg:isa: imul rdx (signed,
                                                       * rdx:rax = n*M) */
@@ -4290,7 +4329,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     }
     /* truncate toward zero: += 1 when the quotient came out negative */
     e.mov_rr(RAX, RDX);  /* reg:isa */
-    e.shr_rr_imm8(RAX, 63);    /* shr rax, 63 */
+    e.shr_rr_imm8(RAX, 63);    /* shr rax, 63; reg:isa */
     e.add_rr(RDX, RAX);  /* reg:isa */
     if (m.negate) {
         e.neg_reg(RDX);          /* reg:isa: neg rdx */
@@ -4310,11 +4349,11 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     if (d >= INT32_MIN && d <= INT32_MAX) {
         e.imul_rr_imm32(RAX, RDX, static_cast<int32_t>(d));  /* reg:isa */
     } else {
-        e.movabs(RAX, static_cast<uint64_t>(d));
+        e.movabs(RAX, static_cast<uint64_t>(d));     /* reg:isa */
         e.op_rr2(Op::times, RAX, RDX);  /* reg:isa: imul rax, rdx */
     }
-    e.sub_rr(keep, RAX);
-    e.mov_rr(RAX, keep);                             /* rax = remainder */
+    e.sub_rr(keep, RAX);                             /* reg:isa */
+    e.mov_rr(RAX, keep);          /* rax = remainder; reg:isa */
     if (keep_g >= 0)
         e.free_scratch(static_cast<uint8_t>(keep_g));
     else if (keep_spill)
@@ -5081,6 +5120,81 @@ struct RefScratch {
             spilled = false;
         }
     }
+};
+
+/*
+ * #96 batch 9b - THE ACCUMULATOR WINDOW. RAII over Emitter::acc_take:
+ * an emit_op/emit_branch case that stages values constructs ONE of
+ * these and spells every staging register `acc.r` - sub-emitters
+ * (read_slot/write_slot/store_dst/op_rr/...) receive it as a
+ * parameter and never take their own.
+ *
+ * The grant is deterministically rax while the run_may_pin_rax +
+ * coverage gates stand (rax is unpinned in every run that emits a
+ * staging op), so conversion is byte-identical. Refusal means rax IS
+ * pinned - the INVERSE of the ctx_chain rule, so the fallback must
+ * never be literal rax; it is an ordinary alternative grant (sound:
+ * the respelled bodies are fully threaded). Both arms ML_CHECK -
+ * structurally unreachable today - and the double-failure residue
+ * degrades to exactly the pre-conversion code's unchecked reliance
+ * on the gates, loud in every ASSERTS build where it used to be
+ * silent in all of them.
+ *
+ * In a whitelisted-op case (the IntAddRR family), place the window
+ * on the GENERIC arm, after the pinned fast path declines - taking
+ * it at case top would refuse in a rax-pinned run and cost the pin
+ * its nativization.
+ */
+struct AccScratch {
+    Emitter &e;
+    uint8_t r = RAX;                                   /* reg:conv */
+    int alt = -1;
+    bool on = false;
+
+    /* DEFERRED construction, for a case with a rax-free fast path (the
+     * whitelisted ops): build at case top, take() only on the arm that
+     * stages. The dtor covers every return either way. */
+    struct deferred_t {};
+    AccScratch(Emitter &em, deferred_t) : e(em) {}
+
+    explicit AccScratch(Emitter &em, uint32_t need = CAP_MEM_BASE)
+        : e(em)
+    {
+        take(need);
+    }
+    void take(uint32_t need = CAP_MEM_BASE)
+    {
+        if (on)
+            return;
+        on = true;
+        const int g = e.acc_take();
+        if (g >= 0) {
+            r = static_cast<uint8_t>(g);
+            return;
+        }
+        ML_CHECK_MSG(false, "accumulator ask refused: a staging op "
+                            "in a rax-pinned run (the run_may_pin_rax "
+                            "+ coverage gates should forbid this)");
+        alt = e.alloc_scratch(need);
+        ML_CHECK_MSG(alt >= 0, "accumulator alternative grant failed");
+        if (alt >= 0)
+            r = static_cast<uint8_t>(alt);
+        else
+            alt = -2;    /* nothing to free; r stays rax - exactly the
+                          * pre-conversion reliance on the gates */
+    }
+    ~AccScratch()
+    {
+        if (!on)
+            return;
+        if (alt >= 0)
+            e.free_scratch(static_cast<uint8_t>(alt));
+        else if (alt == -1)                  /* the ordinary take */
+            e.acc_free(r);
+        /* alt == -2: the double-failure arm took nothing */
+    }
+    AccScratch(const AccScratch &) = delete;
+    AccScratch &operator=(const AccScratch &) = delete;
 };
 
 /*
@@ -8268,17 +8382,18 @@ static bool jit_fwd_consumer(const Instr &nx, int t)
  * was generalised for the same reason (C4b inc 2, "no longer always
  * xmm0"); this is the int side catching up.
  *
- * ⛔ IT MUST STAY THE ONLY PATH. A consumer that reads the forwarded
- * value WITHOUT calling this will silently read a stale RAX the day a
- * producer picks a different register - the r9 failure shape exactly.
- * The bump being TESTS-only is not an excuse to skip it: the MOVE
- * below is emitted in every build.
+ * ⛔ IT MUST STAY THE ONLY PATH - and since #96 batch 9b that is
+ * STRUCTURAL, not disciplinary: it RETURNS the register the forwarded
+ * value is in (g_fwd.in_reg, the model state), and a consumer has no
+ * other way to know it. The old form emitted a canonicalization move
+ * into rax here so consumers could assume rax - a move that was dead
+ * (no int producer ever declared another register) and whose guard
+ * job the return value now does one better: reading a stale rax
+ * without calling this is impossible when the register itself is the
+ * call's result.
  */
-static void emit_fwd_bump(Emitter &e, bool local)
+static uint8_t emit_fwd_bump(Emitter &e, bool local)
 {
-    /* the value is in in_reg; every consumer below wants it in RAX */
-    if (g_fwd.in_reg != RAX)
-        e.mov_rr(RAX, g_fwd.in_reg);
 #ifdef TESTS
     e.bump_counter(&g_jit_fwd);
     if (local) {
@@ -8287,6 +8402,7 @@ static void emit_fwd_bump(Emitter &e, bool local)
 #else
     (void)local;
 #endif
+    return g_fwd.in_reg;
 }
 
 /* C4a-ii: the same, for FLOAT-forwarded consumers - a separate counter so
@@ -11654,9 +11770,10 @@ static void raise_convey_unless(Emitter &e, const Chunk &ck,
  * shl/ushr, a full sign-fill for the arithmetic shr), else the machine shift
  * by cl - exactly bit_shl/bit_shr/bit_ushr (bitops.h). Used by the IntShlRR/
  * IntShrRR reg branch AND the generic-IntBin shift arms, so the two cannot
- * drift. Result in rax. */
-static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
-                           size_t old_pc)
+ * drift. `val` is the value register (#96 batch 9b: the callers' granted
+ * accumulator); the count register is CL BY ISA. Result stays in `val`. */
+static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint8_t val,
+                           uint32_t pc, size_t old_pc)
 {
     /* D3 /4 shl, /7 sar (signed shr), /5 shr (ushr); C1 imm forms same /r */
     const uint8_t modrm = aop == Op::shl ? 0xE0
@@ -11670,9 +11787,9 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
     e.u8(0x0F); e.u8(0x8C);
     const size_t jl = e.pos(); e.u32(0);
     if (aop == Op::shr) {
-        e.sar_rr_imm8(RAX, 63);
+        e.sar_rr_imm8(val, 63);
     } else {
-        e.zero_reg32(RAX);                          /* xor eax,eax */
+        e.zero_reg32(val);
     }
     e.u8(0xE9);
     const size_t jdone = e.pos(); e.u32(0);
@@ -11682,9 +11799,11 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
                                                           * with the op's own
                                                           * caret (deletable) */
     e.patch32(jl, static_cast<uint32_t>(e.pos() - (jl + 4)));
-    /* shl/sar/shr rax,cl */
-    e.wrote(0);
-    e.u8(0x48); e.u8(0xD3); e.u8(modrm);
+    /* shl/sar/shr val,cl */
+    e.wrote(val);
+    e.u8(val >= 8 ? 0x49 : 0x48);
+    e.u8(0xD3);
+    e.u8(static_cast<uint8_t>(modrm | (val & 7)));
     e.patch32(jdone, static_cast<uint32_t>(e.pos() - (jdone + 4)));
 }
 
@@ -13693,8 +13812,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             g_fwd = JitFwd{};      /* the result is in the PIN, not RAX */
             return true;
         }
-        e.movabs(RAX, static_cast<uint64_t>(in.a_lit()));
-        write_slot(e, ck, RAX, in.target, pc);
+        AccScratch acc(e);
+        e.movabs(acc.r, static_cast<uint64_t>(in.a_lit()));
+        write_slot(e, ck, acc.r, in.target, pc);
         return true;
     }
 
@@ -13850,18 +13970,22 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          */
         if (dspill_ta >= 0 && aop != Op::times
                 && !(g_fwd.prod == in.target) && !fa) {
+            int fv = -1;
             if (fb)
-                emit_fwd_bump(e, fin < ck.slot_count);
+                fv = emit_fwd_bump(e, fin < ck.slot_count);
 #ifdef TESTS
             e.bump_counter(&g_jit_two_addr);
 #endif
             if (fb) {
-                e.op_spill_reg(aop, dspill_ta, RAX);
+                e.op_spill_reg(aop, dspill_ta,
+                               static_cast<uint8_t>(fv));
             } else if (in.b_is_lit()) {
-                /* no group-81 spill form yet: stage via rax (still one
-                 * instruction fewer than the generic arm) */
-                e.movabs(RAX, static_cast<uint64_t>(in.b_lit()));
-                e.op_spill_reg(aop, dspill_ta, RAX);
+                /* no group-81 spill form yet: stage via the
+                 * accumulator (one instruction fewer than the
+                 * generic arm) */
+                AccScratch acc(e);
+                e.movabs(acc.r, static_cast<uint64_t>(in.b_lit()));
+                e.op_spill_reg(aop, dspill_ta, acc.r);
             } else {
                 const int bcr_s = e.creg(in.b_slot());
                 if (bcr_s >= 0) {
@@ -13869,11 +13993,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     e.op_spill_reg(aop, dspill_ta,
                                    static_cast<uint8_t>(bcr_s));
                 } else {
-                    read_slot(e, RAX, in.b_slot());
-                    e.op_spill_reg(aop, dspill_ta, RAX);
+                    AccScratch acc(e);
+                    read_slot(e, acc.r, in.b_slot());
+                    e.op_spill_reg(aop, dspill_ta, acc.r);
                 }
             }
-            g_fwd = JitFwd{};    /* the result is in the HOME, not RAX */
+            g_fwd = JitFwd{};    /* the result is in the HOME, not
+                                  * the bus */
             return true;
         }
         const int dreg = e.creg(in.target);
@@ -13909,8 +14035,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * the FLAGS. Today in_reg is always RAX so neither order
              * can be observed, which is exactly why this has to be
              * reasoned, not tried. */
+            int fv = -1;
             if (fb)
-                emit_fwd_bump(e, fin < ck.slot_count);
+                fv = emit_fwd_bump(e, fin < ck.slot_count);
 #ifdef TESTS
             /* BEFORE the op: the bump clobbers the FLAGS (increment
              * 1). It no longer clobbers a REGISTER - bump_counter
@@ -13925,7 +14052,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * the slot's new value directly IN its pin */
             Emitter::PinMach pm(e);
             if (fb) {
-                e.op_rr2(aop, d, RAX);
+                e.op_rr2(aop, d, static_cast<uint8_t>(fv));
             } else if (in.b_is_lit()) {
                 e.op_reg_imm(aop, d, static_cast<int32_t>(in.b_lit()));
             } else {
@@ -13939,13 +14066,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     e.op_reg_slot(aop, d,
                                   slot_addr(in.b_slot()).payload);
             }
-            /* the consumer expects RAX; one move, and only when a
-             * consumer actually exists */
+            /* the consumer reads the DECLARED bus register
+             * (g_fwd.res_reg - the loop's reset names the default);
+             * one move, and only when a consumer actually exists */
             if (g_fwd.prod == in.target) {
-                e.mov_rr(RAX, d);
+                e.mov_rr(g_fwd.res_reg, d);
                 g_fwd.armed = true;
             } else {
-                g_fwd = JitFwd{};  /* the result is in the PIN, not RAX */
+                g_fwd = JitFwd{};  /* the result is in the PIN, not
+                                    * the bus */
             }
             return true;
         }
@@ -13958,8 +14087,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * 1923/1923 and the reverse fails 13 tests. Today in_reg is
              * always RAX so neither order can be observed, which is
              * exactly why the ordering has to be reasoned, not tried. */
+            AccScratch acc(e, AccScratch::deferred_t{});
+            uint8_t src_r = 0;
             if (fb)
-                emit_fwd_bump(e, fin < ck.slot_count);
+                src_r = emit_fwd_bump(e, fin < ck.slot_count);
             /* EXECUTION proof: it clobbers the FLAGS, and after the
              * arithmetic below the flags belong to that arithmetic. It
              * needs no scratch REGISTER - bump_counter saves and
@@ -13969,18 +14100,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 #ifdef TESTS
             e.bump_counter(&g_jit_two_addr);
 #endif
-            if (fb) {
-                /* the adapter already ran above */
-            } else {
-                load_operand(e, RAX, in.b_is_lit(), in.b_lit(),
+            if (!fb) {
+                acc.take();
+                load_operand(e, acc.r, in.b_is_lit(), in.b_lit(),
                              in.b_slot());
+                src_r = acc.r;
             }
-            e.op_mem_reg(aop, slot_addr(in.target).payload, RAX);
-            g_fwd = JitFwd{};        /* the result is in MEMORY, not RAX */
+            e.op_mem_reg(aop, slot_addr(in.target).payload, src_r);
+            g_fwd = JitFwd{};        /* the result is in MEMORY, not
+                                      * the bus */
             return true;
         }
+        AccScratch acc(e, AccScratch::deferred_t{});
+        uint8_t A = 0;                   /* the arm's accumulator */
         if (fa || fb)
-            emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+            A = emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         /*
          * ⛔ #96: the SECOND operand is used DIRECTLY when it needs no
          * staging - a pinned slot is already a register operand and an
@@ -13999,37 +14133,45 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             ? e.cspill(in.b_slot()) : -1;
         const bool bimm = !fb && in.b_is_lit()
             && in.b_lit() >= INT32_MIN && in.b_lit() <= INT32_MAX;
-        if (!fa && !fb)
-            read_slot(e, RAX, in.a_slot());
+        if (!fa && !fb) {
+            acc.take();
+            read_slot(e, acc.r, in.a_slot());
+            A = acc.r;
+        }
         if (!fb && bpin >= 0) {
-            op_rr(e, aop, RAX, static_cast<uint8_t>(bpin));
+            op_rr(e, aop, A, static_cast<uint8_t>(bpin));
         } else if (!fb && bskg >= 0) {
-            e.op_reg_spill(aop, RAX, bskg);        /* #96 inc-1 */
+            e.op_reg_spill(aop, A, bskg);          /* #96 inc-1 */
         } else if (!fb && bimm) {
-            e.op_reg_imm(aop, RAX, static_cast<int32_t>(in.b_lit()));
+            e.op_reg_imm(aop, A, static_cast<int32_t>(in.b_lit()));
         } else {
             hold();
             if (fa && fb) {
-                e.mov_rr(tmp, RAX);            /* t OP t */
+                e.mov_rr(tmp, A);              /* t OP t */
             } else if (fb && aop == Op::minus) {
-                e.mov_rr(tmp, RAX);
-                read_slot(e, RAX, in.a_slot());
+                e.mov_rr(tmp, A);
+                acc.take();
+                read_slot(e, acc.r, in.a_slot());
+                A = acc.r;
             } else if (fb) {
                 read_slot(e, tmp, in.a_slot());   /* commutative swap */
             } else {
                 load_operand(e, tmp, in.b_is_lit(), in.b_lit(),
                              in.b_slot());
             }
-            op_rr(e, aop, RAX, tmp);
+            op_rr(e, aop, A, tmp);
             drop();
         }
-        /* lever A, the PRODUCER side: elide a dead temp's write; a kept
-         * (ref-listed) write reloads RAX in store_dst's COLD arm only. */
+        /* lever A, the PRODUCER side: elide a dead temp's write; a
+         * kept (ref-listed) write reloads the accumulator in
+         * store_dst's COLD arm only. */
         const bool fw = g_fwd.prod == in.target;
         if (!(fw && g_fwd.skip_write))
-            write_slot(e, ck, RAX, in.target, pc);
-        if (fw)
+            write_slot(e, ck, A, in.target, pc);
+        if (fw) {
+            g_fwd.res_reg = A;   /* declare where the value landed */
             g_fwd.armed = true;
+        }
         return true;
     }
 
@@ -14059,7 +14201,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         default:
             break;
         }
-        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        {
+        AccScratch acc(e);
+        load_operand(e, acc.r, in.a_is_lit(), in.a_lit(), in.a_slot());
         /* the shift aops feed emit_reg_shift, whose count register is
          * CL by ISA - CAP_SHIFT_CNT (only rcx) makes the model enforce
          * what the borrow used to get by luck */
@@ -14068,6 +14212,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         switch (in.aop) {
         case Op::div: case Op::mod:
+            /* idiv's dividend register is rax BY ISA; the load above
+             * went through the accumulator grant, which is rax while
+             * nothing pins it - and a div-bearing run never pins it */
+            ML_CHECK_MSG(acc.r == RAX, "idiv needs rax");  /* reg:isa */
             /*
              * The edge-divisor checks (#103): 0 raises DivisionByZeroEx,
              * -1 with an INT_MIN dividend raises InvalidValueEx (idiv
@@ -14110,7 +14258,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     emit_div_magic(e, mg, in.b_lit(),
                                    in.aop == Op::mod);
                     e.bump_divmagic();
-                    write_slot(e, ck, RAX, in.target, pc);
+                    write_slot(e, ck, RAX,          /* reg:isa (imul) */
+                               in.target, pc);
                     return true;
                 }
             } else {
@@ -14137,15 +14286,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                        in.target, pc);
             return true;
         case Op::shl: case Op::shr: case Op::ushr:
-            emit_reg_shift(e, ck, in.aop, pc, old_pc);
+            emit_reg_shift(e, ck, in.aop, acc.r, pc, old_pc);
             break;
         default:
-            op_rr(e, in.aop, RAX, tmp);
+            op_rr(e, in.aop, acc.r, tmp);
             break;
         }
         drop();
-        write_slot(e, ck, RAX, in.target, pc);
+        write_slot(e, ck, acc.r, in.target, pc);
         return true;
+        }
 
     case OpCode::IntShlRR: case OpCode::IntShrRR:
     case OpCode::IntShlRI: case OpCode::IntShrRI: {
@@ -14196,25 +14346,31 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 return true;
             }
         }
+        AccScratch acc(e, AccScratch::deferred_t{});
+        uint8_t A = 0;                   /* the arm's accumulator */
         if (fa || fb)
-            emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+            A = emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         if (fb)
-            e.mov_rr(tmp, RAX);              /* the count, before the value */
-        if (!fa)
-            read_slot(e, RAX, in.a_slot());
+            e.mov_rr(tmp, A);            /* the count, before the value */
+        if (!fa) {
+            acc.take();
+            read_slot(e, acc.r, in.a_slot());
+            A = acc.r;
+        }
         if (in.b_is_lit()) {
             /* imm count: >= 0 by selection; saturate at compile time */
             const int_type c = in.b_lit();
             if (c >= 64) {
                 if (shl) {
-                    e.zero_reg32(RAX);              /* xor eax,eax */
+                    e.zero_reg32(A);
                 } else {
-                    e.sar_rr_imm8(RAX, 63);   /* sar rax,63 */
+                    e.sar_rr_imm8(A, 63);
                 }
             } else if (c > 0) {
-                e.wrote(RAX);
-                e.u8(0x48); e.u8(0xC1);
-                e.u8(shl ? 0xE0 : 0xF8);                 /* shl/sar rax,c */
+                e.wrote(A);
+                e.u8(A >= 8 ? 0x49 : 0x48);
+                e.u8(0xC1);                              /* shl/sar A,c */
+                e.u8(static_cast<uint8_t>((shl ? 0xE0 : 0xF8) | (A & 7)));
                 e.u8(static_cast<uint8_t>(c));
             }
         } else {
@@ -14223,16 +14379,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                  * as a cacheable int use); CL is the ISA's one variable
                  * shift-count register */
                 read_slot(e, RCX, in.b_slot());  /* reg:isa: CL */
-            emit_reg_shift(e, ck, shl ? Op::shl : Op::shr, pc, old_pc);
+            emit_reg_shift(e, ck, shl ? Op::shl : Op::shr, A, pc, old_pc);
         }
         /* lever A, the PRODUCER side - identical to the arith family's.
-         * The negative-count arm above RAISES and leaves the fragment, so
-         * there is no slow-path rejoin that would need RAX reloaded. */
+         * The negative-count arm above RAISES and leaves the fragment,
+         * so there is no slow-path rejoin needing the value reloaded. */
         const bool fw = g_fwd.prod == in.target;
         if (!(fw && g_fwd.skip_write))
-            write_slot(e, ck, RAX, in.target, pc);
-        if (fw)
+            write_slot(e, ck, A, in.target, pc);
+        if (fw) {
+            g_fwd.res_reg = A;   /* declare where the value landed */
             g_fwd.armed = true;
+        }
         return true;
     }
 
@@ -14245,15 +14403,25 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* lever A, consumer side (operand `a` only - see the predicate).
          * NOT a producer: the remainder lands in RDX on the idiv path
          * and in RAX on the div-magic one. */
-        if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp)
-            emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
-        else
-            read_slot(e, RAX, in.a_slot());
+        /* the dividend chain is rax BY ISA on both exits - cqo+idiv
+         * claims rax:rdx, and the div-magic imul sequence is anchored
+         * there too - so this case stages in rax by hard reason, not
+         * convention. Forwarding cannot arrive elsewhere: the bus
+         * default is rax and no producer declares another register
+         * while the gates stand (ML_CHECKed). */
+        if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp) {
+            const uint8_t fv =
+                emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+            ML_CHECK_MSG(fv == RAX, "idiv needs rax");   /* reg:isa */
+            (void)fv;              /* the check is ASSERTS-only */
+        } else {
+            read_slot(e, RAX, in.a_slot());              /* reg:isa */
+        }
         DivMagic mg;
         if (div_magic(in.b_lit(), mg)) {
             emit_div_magic(e, mg, in.b_lit(), /*want_mod=*/true);
             e.bump_divmagic();
-            write_slot(e, ck, RAX, in.target, pc);
+            write_slot(e, ck, RAX, in.target, pc);       /* reg:isa */
             return true;
         }
         hold();
@@ -14267,14 +14435,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::IntAddModRI: {
-        /* lever A, consumer side (operand `a` only - see the predicate) */
-        if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp)
-            emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
-        else
-            read_slot(e, RAX, in.a_slot());
+        /* lever A, consumer side (operand `a` only - see the
+         * predicate). The whole (a+b) sum IS the dividend, and the
+         * dividend register is rax by ISA on both exits (cqo+idiv /
+         * the div-magic imul) - hard reason, not convention. */
+        if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp) {
+            const uint8_t fv =
+                emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+            ML_CHECK_MSG(fv == RAX, "idiv needs rax");   /* reg:isa */
+            (void)fv;              /* the check is ASSERTS-only */
+        } else {
+            read_slot(e, RAX, in.a_slot());              /* reg:isa */
+        }
         hold();
         load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
-        op_rr(e, Op::plus, RAX, tmp);
+        op_rr(e, Op::plus, RAX, tmp);                    /* reg:isa */
         drop();          /* window 1 ends: div_magic borrows rcx itself */
         {
             const int_type dv = static_cast<int_type>(in.target2);
@@ -14282,7 +14457,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (div_magic(dv, mg)) {
                 emit_div_magic(e, mg, dv, /*want_mod=*/true);
                 e.bump_divmagic();
-                write_slot(e, ck, RAX, in.target, pc);
+                write_slot(e, ck, RAX, in.target, pc);   /* reg:isa */
                 return true;
             }
             hold();                   /* window 2: the idiv divisor */
@@ -14334,8 +14509,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * bits stay nonzero and divide, exactly fpclassify's answer).
              * A bits test avoids a ucomisd NaN pitfall (unordered sets ZF,
              * so a bare `je` would wrongly raise on a NaN divisor). */
-            e.movq_rax_x(ops.src);                 /* movq rax, xmm<b> */
-            e.shl_reg_1(RAX);    /* shl rax, 1 */
+            AccScratch acc(e);
+            e.movq_r_x(acc.r, ops.src);          /* movq acc, xmm<b> */
+            e.shl_reg_1(acc.r);
             raise_convey_unless(e, ck, 0x75 /* jnz */, JR_DIV0, pc, old_pc);
         }
         if (is_mod)
@@ -14553,10 +14729,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
-        /* lever A: the helper's status clobbered RAX - slow-path-only
-         * reload (the fast dones jump PAST it, keeping their RAX) */
+        /* lever A: the helper's status clobbered the bus register -
+         * slow-path-only reload into the DECLARED bus (g_fwd.res_reg;
+         * the fast dones jump past it, their copy already there) */
         if (fw)
-            e.load(RAX, slot_addr(in.target).payload);
+            e.load(g_fwd.res_reg, slot_addr(in.target).payload);
         for (const size_t j : j_dones)
             e.patch32_here(j);
         if (fw)
@@ -14609,11 +14786,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
-        /* lever A: slow-path-only RAX reload (fast dones jump past it) */
+        /* lever A: slow-path-only bus reload (fast dones jump past) */
         const bool fw2 = in.op == OpCode::LoadElem2Int
             && g_fwd.prod == in.target;
         if (fw2)
-            e.load(RAX, slot_addr(in.target).payload);
+            e.load(g_fwd.res_reg, slot_addr(in.target).payload);
         for (const size_t j : e2_dones)      /* #93: fast tail rejoins */
             e.patch32_here(j);
         if (fw2)
@@ -14814,8 +14991,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * (WATCHED: the isolated final-sum repro). Reload the home and
          * store as the ordinary int. */
         if (const int ssk = e.cspill(in.target2); ssk >= 0) {
-            e.reload(RAX, ssk);
-            store_dst(e, ck, RAX, in.target, pc);
+            AccScratch acc(e);
+            e.reload(acc.r, ssk);
+            store_dst(e, ck, acc.r, in.target, pc);
             return true;
         }
         /* C2a: the FLOAT twin - a float-PINNED source is a proven float
@@ -14836,13 +15014,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                                static_cast<int32_t>(in.target)))
             jhelp.push_back(emit_ref_check_jae(e, dst.type));
-        e.load(RAX, src.type);
+        AccScratch acc(e);
+        e.load(acc.r, src.type);
         hold();
         e.load(cpy, src.payload);      e.store(cpy, dst.payload);
         e.load(cpy, src.payload + 8);  e.store(cpy, dst.payload + 8);
         e.load(cpy, src.payload + 16); e.store(cpy, dst.payload + 16);
         drop();
-        e.store(RAX, dst.type);
+        e.store(acc.r, dst.type);
         const size_t j_done = e.j32(0xEB);
         for (const size_t s : jhelp)
             e.patch32_here(s);
@@ -14886,8 +15065,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.movabs(cpy, q[1]); e.store(cpy, dst.payload + 8);
             e.movabs(cpy, q[2]); e.store(cpy, dst.payload + 16);
             drop();
-            e.movabs(RAX, reinterpret_cast<uint64_t>(bv.get_type()));
-            e.store(RAX, dst.type);
+            AccScratch acc(e);
+            e.movabs(acc.r, reinterpret_cast<uint64_t>(bv.get_type()));
+            e.store(acc.r, dst.type);
             if (!reflisted)
                 return true;
             const size_t j_done = e.j32(0xEB);
@@ -14937,7 +15117,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                                static_cast<int32_t>(in.target)))
             jhelp.push_back(emit_ref_check_jae(e, dst.type));
-        e.load_base(RAX, cb, coff + ty0);
+        AccScratch acc(e);
+        e.load_base(acc.r, cb, coff + ty0);
         hold();
         e.load_base(cpy, cb, coff + pv0);
         e.store(cpy, dst.payload);
@@ -14946,7 +15127,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.load_base(cpy, cb, coff + pv0 + 16);
         e.store(cpy, dst.payload + 16);
         drop();
-        e.store(RAX, dst.type);
+        e.store(acc.r, dst.type);
         const size_t j_done = e.j32(0xEB);
         for (const size_t sj : jhelp)
             e.patch32_here(sj);
@@ -15035,8 +15216,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.movabs(cpy, q[1]); e.store(cpy, dst.payload + 8);
             e.movabs(cpy, q[2]); e.store(cpy, dst.payload + 16);
             drop();
-            e.movabs(RAX, reinterpret_cast<uint64_t>(v.get_type()));
-            e.store(RAX, dst.type);
+            AccScratch acc(e);
+            e.movabs(acc.r, reinterpret_cast<uint64_t>(v.get_type()));
+            e.store(acc.r, dst.type);
             if (!reflisted)
                 return true;
             const size_t j_done = e.j32(0xEB);
@@ -16425,8 +16607,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                      * stripped is exactly fpclassify's answer, where a
                      * bare `ucomisd; je` would also decline a NaN
                      * divisor - the same reasoning as FloatBin's. */
-                    e.movq_rax_x(X1);
-                    e.shl_reg_1(RAX);   /* shl rax, 1 */
+                    {
+                        /* a grant window emits nothing at its edges,
+                         * so the flags survive to the jz below */
+                        AccScratch acc(e);
+                        e.movq_r_x(acc.r, X1);
+                        e.shl_reg_1(acc.r);
+                    }
                     j_slows.push_back(e.j32(0x74));       /* jz -> slow */
                 }
                 e.farith(bo.aop == Op::plus    ? 0x58
