@@ -1173,3 +1173,103 @@ borrowed slot never took, hence an underflow. Sliceness is a runtime
 property, so the bind decides per call and records a borrow mask on the
 window record for `pop_window`; a slice argument simply falls back to a
 real retain.
+
+
+## A - THE BORROW BIND: THE DESIGN, RESOLVED (2026-08-15)
+
+The consumer of `noescape_params`. Written down before any code because
+the failure mode is a use-after-free and two designs were tried on paper
+and rejected; the third is the one to build.
+
+### THE MECHANISM ALREADY EXISTS - IT IS THE SCALAR ARM
+
+`emit_sync_push_native`'s per-argument loop (jit.cpp, the `fast_bind` arg
+copies) ALREADY branches on the type tag:
+
+    ld(RAX, RBX, s + 24)          ; rax = the source slot's type*
+    cmp  [rax + type_t_off], t_str
+    jge  -> reference             ; call jit_bind_ref_arg  (retain)
+    <raw copy of 24B payload + 8B type>          ; scalar: no retain
+
+**A borrow is exactly "take the scalar arm for a reference value".** The
+copy is already written and already emitted; the whole change is deciding
+when a reference may use it, and making the release side agree.
+
+### WHY A BORROWED SLOT CANNOT SIMPLY BE RELEASED
+
+`pop_window` releases by `lv = LValue()` over the chunk's `ref_slots`. A
+borrowed slot holds handle bits it never retained, so that assignment
+decrements a count it does not own. The release side has to know.
+
+**REJECTED - a borrow mask on the call record.** The record is pushed
+BEFORE the argument binds (the record fill precedes the bind loop in
+`emit_sync_push_native`), so `back_rec()` inside the bind is the callee's
+record and the mask would be reachable. But the NO-RECORD tier
+(`norec`, default ON since 2026-08-12) means a frame need not have a
+record at all, so a record-based mask is wrong for exactly the calls the
+project has been optimising hardest.
+
+**REJECTED - excluding the param from `ref_slots` statically.**
+`ref_slots` is per-CHUNK, so it would commit EVERY call site to
+borrowing; a slice argument at any one of them then leaks, because that
+site must fall back to a real retain.
+
+**BUILD THIS - a `borrowed` flag in the LValue itself.** `LValue` is 48
+bytes: EvalValue (32) + container (8) + container_idx (4) + is_const (1)
++ 3 bytes of PADDING. The flag goes in that padding, so `sizeof(LValue)`
+is unchanged and `jit.cpp`'s `static_assert(sizeof(LValue) == 48)` still
+holds. It is per-slot, which is where the fact belongs; it needs no
+record, so it works for the record-less tier; and the emitted scalar arm
+ALREADY zeroes bytes 32 and 40 after the copy, so setting it costs
+nothing extra there. `pop_window`'s scan becomes
+
+    if (lv.borrowed) <raw-clear the type word>   /* no release */
+    else             lv = LValue();
+
+and the `ML_VM_HARDENING` full-window re-scan (every slot trivial after
+pop) still passes, because a raw-clear leaves the tag trivial.
+
+### THE ONE RUNTIME GATE: A SLICE ARGUMENT
+
+A raw byte copy is correct for a non-slice array, a string, a dict and a
+struct - none of them registers anything on copy. A SLICE registers
+itself in its parent's `slices` set, and an element write through it
+detaches IN PLACE (`clone_internal_vec`), releasing the old
+SharedObject - through a slot that never retained. So the bind tests
+`is_slice()` and falls back to `jit_bind_ref_arg`'s retain.
+
+(The OTHER hazard once recorded here - that a borrow would stop
+`clone_aliased_slices` firing - is not real; see the correction above.)
+
+### THE STEPS, IN THE ORDER THEY CAN BE VERIFIED
+
+ 1. `LValue::borrowed` in the padding + a layout static_assert;
+    `pop_window` honours it. No producer yet, so this is a no-op change
+    that must leave every net green.
+ 2. The C++ bind (`vm_frame_setup_lean`'s `rebind` step and
+    `jit_bind_ref_arg`) learns the borrow, gated on the callee
+    descriptor's bit and the runtime `is_slice()` test. `jit_bind_ref_arg`
+    needs the descriptor and the param index - the emit site has `desc`
+    in hand at that point, so it is two more register arguments, not
+    surgery. This alone removes the `copy_assign` (18 of the 44 Ir) while
+    keeping the call.
+ 3. The EMITTED inline arm: test the callee's bit and `is_slice()` inline
+    and jump to the existing raw-copy path, removing the call as well.
+ 4. Only then measure. Interleaved `--baseline`, `OPT=1 ASSERTS=0`, and
+    remember 34_sort_custom_cmp's lesson: an instruction win here is not
+    a wall-clock win until the clock says so.
+
+### PROVING IT IS NOT DEAD CODE (the maintainer's explicit requirement)
+
+An EMITTED-code counter (`g_jit_arg_borrow`), bumped only by the borrow
+path, plus:
+ - a test asserting it fires for `func f(a) { a[0] = 1; }` called with a
+   plain array, and does NOT fire for a poisoned callee, for a slice
+   argument, or for a scalar param - each measured on its OWN counter
+   (a program-wide total lets one shape satisfy another's check);
+ - the same counter read off bench/my/76_funcval_dispatch, where it must
+   read ~1,000,000. `MYLANG_JITSTATS` already prints `ref_arg_binds`
+   999999 there, so the borrow count replacing it is the reach proof;
+ - the `ML_VM_HARDENING` pop_window audit is the net for the failure
+   direction: a slot wrongly left holding a reference fails the
+   every-slot-trivial assert at frame pop.
