@@ -3779,13 +3779,21 @@ struct Emitter {
      */
     void bump_at(const void *ctr, bool dword)
     {
-        push_reg(RAX);
-        movabs(RAX, reinterpret_cast<uint64_t>(ctr));
+        /* The bump runs at ARBITRARY emission points, including
+         * inside open accumulator windows, so it must have zero
+         * register-state footprint: it saves and restores the
+         * accumulator around itself rather than asking (an ask
+         * inside a window would grant a DIFFERENT register and
+         * change the emission mid-window) - the conv-tagged lines
+         * below are that bracket. */
+        push_reg(RAX);                                 /* reg:conv */
+        movabs(RAX,                                    /* reg:conv */
+               reinterpret_cast<uint64_t>(ctr));
         if (dword)
-            inc_dword_base(RAX);
+            inc_dword_base(RAX);                     /* reg:conv */
         else
-            inc_qword_base(RAX);
-        pop_reg(RAX);
+            inc_qword_base(RAX);                     /* reg:conv */
+        pop_reg(RAX);                     /* reg:conv */
     }
     /* the TESTS statistics: compiled out of a release entirely */
     void bump_counter(const void *ctr)
@@ -3940,8 +3948,18 @@ struct Emitter {
     /* mov [base + index], src8   (a flat bool element - 1 byte) */
     void store_elem_b(uint8_t base, uint8_t index, uint8_t src)
     { store_elem_sib(base, index, src, 1, false); }
-    void mov_byte_rax_imm(int32_t d, uint8_t imm)   /* mov byte [rax+d],i */
-    { u8(0xC6); u8(0x80); u32(uint32_t(d)); u8(imm); }
+    /* mov byte [base+d], imm  (#96: the base is an argument; the
+     * rax-fixed spelling is deleted - the sixth audit shape's rule) */
+    void mov_byte_base_imm(uint8_t base, int32_t d, uint8_t imm)
+    {
+        ML_CHECK((base & 7) != 4);
+        if (base >= 8)
+            u8(0x41);
+        u8(0xC6);
+        u8(static_cast<uint8_t>(0x80 | (base & 7)));
+        u32(uint32_t(d));
+        u8(imm);
+    }
     size_t jmp32()                     /* jmp rel32 -> patch32_here */
     { u8(0xE9); const size_t at = pos(); u32(0); return at; }
     /* jmp rel32 to a KNOWN (earlier) position - the prep retry loop */
@@ -5161,6 +5179,31 @@ struct AccScratch {
     struct deferred_t {};
     AccScratch(Emitter &em, deferred_t) : e(em) {}
 
+    /* THE RAISE-PATH (REUSE) FORM, for the emitters a dying op calls
+     * with its own window still open (exc_stamp, emit_raise, the
+     * float-literal materialisation): inside an open window the
+     * caller's staged value is DEAD on this path, so the stamp
+     * recycles the window's register - busy-but-not-pin proves the
+     * busy bit is a take, and no whitelisted (rax-pinnable) op has a
+     * raise path, so busy-by-PIN is unreachable (ML_CHECKed). Outside
+     * a window it takes normally. */
+    struct reuse_t {};
+    AccScratch(Emitter &em, reuse_t) : e(em)
+    {
+        on = true;
+        if (e.reg_is_occupied(RAX)) {                  /* reg:conv */
+            ML_CHECK_MSG(!e.reg_holds_pin(RAX),        /* reg:conv */
+                         "raise-path reuse met a rax PIN");
+            alt = -3;             /* recycled: the dtor frees nothing */
+            return;               /* r is already rax */
+        }
+        const int g = e.acc_take();
+        if (g >= 0)
+            return;
+        ML_CHECK_MSG(false, "accumulator refused with rax unoccupied");
+        alt = -2;
+    }
+
     explicit AccScratch(Emitter &em, uint32_t need = CAP_MEM_BASE)
         : e(em)
     {
@@ -5195,7 +5238,8 @@ struct AccScratch {
             e.free_scratch(static_cast<uint8_t>(alt));
         else if (alt == -1)                  /* the ordinary take */
             e.acc_free(r);
-        /* alt == -2: the double-failure arm took nothing */
+        /* alt == -2: the double-failure arm took nothing;
+         * alt == -3: the reuse form recycled an open window */
     }
     AccScratch(const AccScratch &) = delete;
     AccScratch &operator=(const AccScratch &) = delete;
@@ -5325,13 +5369,14 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap, uint8_t tbl)
 {
     e.scratch(cb);            /* the ctx chain walks through it */
     const JitLayout &L = jit_layout();
-    e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
-    e.load_base0(RAX, RAX);                    /* rax = the ctx */
+    AccScratch acc(e);
+    e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_ctx));
+    e.load_base0(acc.r, acc.r);                /* the ctx */
     if (cap) {
-        e.load_base(RAX, RAX, static_cast<int32_t>(L.ctx_captures));
-        e.load_base(cb, RAX, 0);               /* cb = the captures data */
+        e.load_base(acc.r, acc.r, static_cast<int32_t>(L.ctx_captures));
+        e.load_base(cb, acc.r, 0);             /* cb = the captures data */
     } else {
-        e.load_base(tbl, RAX, static_cast<int32_t>(L.ctx_gfuncs));
+        e.load_base(tbl, acc.r, static_cast<int32_t>(L.ctx_gfuncs));
         e.load_base(cb, tbl,                   /* cb = the gfuncs slots */
                     static_cast<int32_t>(L.gft_slots));
     }
@@ -5843,20 +5888,21 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
      * All interior branches join at `join` below, where the pop sits,
      * so every path through the stamp restores the pin.
      */
+    AccScratch acc(e, AccScratch::reuse_t{});
     RefScratch rs(e, RCX);
-    e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_exc()));
-    e.load_base0(RAX, RAX);      /* mov rax, [rax] (the object) */
-    e.u8(0x48); e.test32_rr(RAX, RAX);      /* test rax, rax */
+    e.movabs(acc.r, reinterpret_cast<uint64_t>(jit_addr_exc()));
+    e.load_base0(acc.r, acc.r);      /* mov rax, [rax] (the object) */
+    e.u8(0x48); e.test32_rr(acc.r, acc.r);      /* test rax, rax */
     const size_t j_null = e.j8(0x74);        /* jz join: bail/eptr - no exc */
 
     size_t j_has = 0;
     if (le) {
-        e.cmp_dword_base_imm8(RAX, off_s + 4, 0x00);   /*   ... loc_start.col */
+        e.cmp_dword_base_imm8(acc.r, off_s + 4, 0x00); /* loc_start.col */
         j_has = e.j8(0x75);                  /* jnz: caret already set */
         e.movabs(rs.sc, pack(le->start));
-        e.store_base(rs.sc, RAX, static_cast<int32_t>(off_s));
+        e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_s));
         e.movabs(rs.sc, pack(le->end));
-        e.store_base(rs.sc, RAX, static_cast<int32_t>(off_e));
+        e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_e));
         e.patch8(j_has, e.pos());            /* the CARET block only: the
                                               * chain stamp below still runs
                                               * for an exception that already
@@ -5881,7 +5927,7 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
             /* A REAL chain outranks the -2 marker: stamp whenever the field
              * is still negative (unset -1 or "no chain" -2). Unchanged for
              * -1, which is what keeps first-real-conveyor-wins intact. */
-            e.cmp_dword_base_imm8(RAX, off_if, 0x00);
+            e.cmp_dword_base_imm8(acc.r, off_if, 0x00);
             j_set = e.j8(0x7D);              /* jge end: a chain is set */
         } else {
             /* The marker only fills a VACANCY - it must never overwrite a
@@ -5889,11 +5935,11 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
              * conveyed by an op that is not the one that raised (a C++
              * throw crossing a fragment exit), and that conveyor's "I am
              * not inlined" says nothing about the raise site. */
-            e.cmp_dword_base_imm8(RAX, off_if, 0xFF);
+            e.cmp_dword_base_imm8(acc.r, off_if, 0xFF);
             j_set = e.j8(0x75);              /* jne end: anything is set */
         }
         e.store_dword_base_imm32(
-            RAX, static_cast<int32_t>(off_if),
+            acc.r, static_cast<int32_t>(off_if),
             static_cast<uint32_t>(chain >= 0 ? chain : -2));
         e.patch8(j_set, e.pos());
     }
@@ -5932,12 +5978,13 @@ static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
         ck.inline_frames.empty()
             ? 0
             : reinterpret_cast<uint64_t>(ck.inline_frames.data());
-    e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_call_inline_chain()));
-    e.store_dword_base_imm32(RAX, 0, static_cast<uint32_t>(chain));
-    e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_call_inline_pool()));
+    AccScratch acc(e, AccScratch::reuse_t{});
+    e.movabs(acc.r, reinterpret_cast<uint64_t>(jit_addr_call_inline_chain()));
+    e.store_dword_base_imm32(acc.r, 0, static_cast<uint32_t>(chain));
+    e.movabs(acc.r, reinterpret_cast<uint64_t>(jit_addr_call_inline_pool()));
     RefScratch rs(e, RCX);
     e.movabs(rs.sc, pool);
-    e.store_base0(rs.sc, RAX);
+    e.store_base0(rs.sc, acc.r);
     rs.release();
 }
 
@@ -7991,7 +8038,14 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
          * path nothing: the two-store arm below preserves RAX for free,
          * and this is the cold arm.
          */
-        e.load(RAX, a.payload);
+        /* a staging (window) src is reloaded so the caller's
+         * continuation keeps reading it; a PINNED src was already
+         * restored by the call bracket, and the legacy unconditional
+         * accumulator load is kept for it - dead, but byte-identical */
+        if (!e.reg_holds_pin(src_reg))
+            e.load(src_reg, a.payload);
+        else
+            e.load(RAX, a.payload);              /* reg:conv */
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch32_here(jb_fast);              /* fast: */
         e.store_type_tag(a.type, jit_layout().t_int, RSI);  /* reg:conv */
@@ -9824,7 +9878,9 @@ static bool reg_model_check(std::string &err)
         if (!(gp_caps(r) & CAP_MEM_BASE))
             continue;
         Emitter e;
-        e.load_base(RAX, r, 0x40);          /* mov rax, [r + 0x40] */
+        e.load_base(RAX, r, 0x40);            /* reg:conv - an
+                                      * example operand of the encoder
+                                      * under test */
         /* REX, 0x8B, modrm, disp8 */
         if (e.b.size() < 3) {
             snprintf(buf, sizeof(buf),
@@ -11078,8 +11134,9 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
     if (is_lit) {
         uint64_t bits;
         std::memcpy(&bits, &flit, sizeof bits);
-        e.movabs(RAX, bits);
-        e.movq_xmm(xr);
+        AccScratch acc(e, AccScratch::reuse_t{});
+        e.movabs(acc.r, bits);
+        e.movq_xmm_from(xr, acc.r);
         return;
     }
     /* C2a: a float-PINNED slot reads register-to-register - no type
@@ -11099,16 +11156,17 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
         e.fload(xr, a.payload);
         return;
     }
-    e.load_type(a.type);                 /* rax = slot type */
+    AccScratch acc(e, AccScratch::reuse_t{});
+    e.load(acc.r, a.type);                /* the slot's type word */
     /* == t_float ? */
-    e.cmp_rax_tag(jit_layout().t_float, 8);
+    e.cmp_reg_tag(acc.r, jit_layout().t_float, 8);
     const size_t j_notf = e.j8(0x75);     /* jne -> not float */
     e.fload(xr, a.payload);               /* FAST: movsd xmm, [payload] */
     const size_t j_done1 = e.j8(0xEB);    /* jmp done */
     e.patch8(j_notf, e.pos());
     if (!no_bail) {
         /* == t_int ? */
-        e.cmp_rax_tag(jit_layout().t_int, RSI);  /* reg:conv */
+        e.cmp_reg_tag(acc.r, jit_layout().t_int, RSI);  /* reg:conv */
         const size_t j_int = e.j8(0x74);  /* je -> promote */
         e.exit_pc(bail_pc);               /* neither -> bail */
         e.patch8(j_int, e.pos());
@@ -11717,8 +11775,9 @@ static void emit_libm_call(Emitter &e, const void *fn)
  * (exit_pc flushes the cache, not rax). */
 static void emit_raise(Emitter &e, int kind, uint32_t pc)
 {
-    e.movabs(RAX, reinterpret_cast<uint64_t>(&g_vm_jit_raise));
-    e.store_dword_base_imm32(RAX, 0, static_cast<uint32_t>(kind));
+    AccScratch acc(e, AccScratch::reuse_t{});
+    e.movabs(acc.r, reinterpret_cast<uint64_t>(&g_vm_jit_raise));
+    e.store_dword_base_imm32(acc.r, 0, static_cast<uint32_t>(kind));
     e.exit_pc(pc);
 }
 
@@ -12103,7 +12162,7 @@ static void emit_elem_base_gate(Emitter &e, uint8_t ir, uint8_t obj,
  * single encoder.
  */
 struct ElemScratch {
-    uint8_t obj   = RAX;   /* the SharedObject *      (ISA-fixed: idiv) */
+    uint8_t obj   = RAX;  /* the SharedObject * (reg:isa: idiv) */
     uint8_t data  = RCX;   /* reg:conv: elem data ptr */
     uint8_t count = RDX;   /* reg:conv: count (idiv-fixed)  */
     uint8_t idx   = R9;    /* the element index (reg:conv)   */
@@ -12548,6 +12607,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     if (!sc.ok)
         return false;          /* no free scratch - the helper tier */
     e.scratch2(sc.idx, sc.val);      /* index in r9; the value in rdi/dil */
+    AccScratch acc(e);   /* the shobj/value staging register */
     /*
      * #95 case 1 - COMPOUND stores `a[i] OP= v` inline too, as a
      * read-modify-write on the element. The op set is the interpreter
@@ -12644,9 +12704,9 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.cmp_reg_imm(RCX, 64);  /* reg:isa */
         const size_t jl = e.j8(0x7C);            /* jl .norm */
         if (aop == Op::shr)
-            e.sar_rr_imm8(RAX, 63);              /* full sign-fill */
+            e.sar_rr_imm8(acc.r, 63);              /* full sign-fill */
         else
-            e.zero_reg32(RAX);                   /* shl / ushr -> 0 */
+            e.zero_reg32(acc.r);                   /* shl / ushr -> 0 */
         const size_t jd = e.j8(0xEB);            /* jmp .done */
         e.patch8(jl, e.pos());
         e.wrote(0);
@@ -12717,7 +12777,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             /* rax = the element */
             e.load_elem_q(sc.obj, H->rdata, sc.idx);
             e.movabs(sc.count, 0x8000000000000000ull);
-            e.cmp_rr(RAX, sc.count);   /* cmp rax, count(INT_MIN) */
+            e.cmp_rr(acc.r, sc.count);   /* cmp rax, count(INT_MIN) */
             slows.push_back(e.j32(0x74));        /* INT_MIN -> helper */
             e.patch32_here(j_ok);
         }
@@ -12810,7 +12870,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
 
     /* rax = the SharedObject */
     e.load(sc.obj, base.payload);
-    e.cmp_byte_rax(L.ro_off, 0);
+    e.cmp_byte_base(acc.r, L.ro_off, 0);
     decline_ne();                                            /* readonly */
 
     /*
@@ -12857,7 +12917,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     const auto cow_guards = [&]() {
         e.cmp_byte_slot(base.payload + L.slice_off, 0);  /* base a slice */
         preps.push_back(e.j32(0x75));
-        e.cmp_byte_rax(L.slices_off, 0);                 /* live views */
+        e.cmp_byte_base(acc.r, L.slices_off, 0);       /* live views */
         preps.push_back(e.j32(0x75));
     };
     const auto bump = [&]() {
@@ -12869,7 +12929,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
      * then free for the element) - safe, because past the guards nothing
      * can fault (div 0/-1 declined, bounds checked). */
     const auto int_rmw = [&]() {
-        e.mov_byte_rax_imm(L.hashv_off, 0);              /* invalidate */
+        e.mov_byte_base_imm(acc.r, L.hashv_off, 0);    /* invalidate */
         switch (aop) {
         case Op::invalid:
             e.store_elem_q(sc.data, sc.idx, sc.val);
@@ -12903,7 +12963,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
 
     if (is_float) {
         /* --- FLOATS: one kind, one 8-byte tail --- */
-        e.cmp_byte_rax(L.kind_off, L.kind_floats);
+        e.cmp_byte_base(acc.r, L.kind_off, L.kind_floats);
         decline_ne();
         cow_guards();
         e.load_base(sc.data, sc.obj, L.data_off);
@@ -12914,7 +12974,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
         bump();
-        e.mov_byte_rax_imm(L.hashv_off, 0);
+        e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
         if (!compound) {
             /* movsd [rcx+r9*8], xmm0 */
             e.store_elem_sd(sc.data, sc.idx, 0);
@@ -12930,7 +12990,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     } else if (compound) {
         /* --- compound INTS only (bools decline: bool+int -> int does
          * not fit the storage; the helper raises the exact error) --- */
-        e.cmp_byte_rax(L.kind_off, L.kind_ints);
+        e.cmp_byte_base(acc.r, L.kind_off, L.kind_ints);
         decline_ne();
         /*
          * The int divisor gate (#103 refinement) - AFTER the kind proof
@@ -12989,9 +13049,9 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         int_rmw();
         dones.push_back(e.jmp32());
     } else {
-    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    e.cmp_byte_base(acc.r, L.kind_off, L.kind_ints);
     const size_t j_ints = e.j32(0x74);
-    e.cmp_byte_rax(L.kind_off, L.kind_bools);
+    e.cmp_byte_base(acc.r, L.kind_off, L.kind_bools);
     decline_ne();
 
     /* --- BOOLS: 1-byte elements, count = finish - start --- */
@@ -13004,7 +13064,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     slows.push_back(e.j32(0x73));        /* jae: negative OR >= count */
     bump();
     e.store_elem_b(sc.data, sc.idx, sc.val);
-    e.mov_byte_rax_imm(L.hashv_off, 0);             /* invalidate_hash() */
+    e.mov_byte_base_imm(acc.r, L.hashv_off, 0);  /* invalidate_hash() */
     dones.push_back(e.jmp32());
 
     /* --- INTS: 8-byte elements, count = (finish - start) / 8 --- */
@@ -13019,7 +13079,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     slows.push_back(e.j32(0x73));
     bump();
     e.store_elem_q(sc.data, sc.idx, sc.val);
-    e.mov_byte_rax_imm(L.hashv_off, 0);
+    e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
     dones.push_back(e.jmp32());
     }                                          /* end of the int/bool arm */
 
@@ -13345,6 +13405,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     if (!sc.ok)
         return false;          /* no free scratch - the helper tier */
     e.scratch2(sc.idx, sc.val);      /* index in r9; the value in rdi/dil */
+    AccScratch acc(e);   /* the shobj/value staging register */
     /* the Expr14 op -> the base op (Op::invalid == plain assign). The
      * arith five only: a shift/bitwise compound (`a[i][j] <<= n`) declines
      * to the helper tier, whose boxed store dispatches the full set. */
@@ -13388,9 +13449,9 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     e.cmp_byte_slot(base.payload + L.slice_off, 0);
     decline_ne();
     e.load(sc.obj, base.payload);                 /* outer SharedObject */
-    e.cmp_byte_rax(L.ro_off, 0);
+    e.cmp_byte_base(acc.r, L.ro_off, 0);
     decline_ne();                              /* readonly outer: rvalue */
-    e.cmp_byte_rax(L.kind_off, L.kind_general);
+    e.cmp_byte_base(acc.r, L.kind_off, L.kind_general);
     decline_ne();
 
     /* the row: data + k1 * sizeof(LValue), bounds by byte length */
@@ -13413,7 +13474,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     decline_ne();
     e.load_base(sc.obj, sc.data,
                 static_cast<int32_t>(L.off_payload));   /* row shobj */
-    e.cmp_byte_rax(L.ro_off, 0);
+    e.cmp_byte_base(acc.r, L.ro_off, 0);
     decline_ne();
 
     /* the row's COW pair -> prep; every arm shares one stub */
@@ -13422,7 +13483,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
                         static_cast<int32_t>(L.off_payload) + L.slice_off,
                         0);
         preps.push_back(e.j32(0x75));
-        e.cmp_byte_rax(L.slices_off, 0);
+        e.cmp_byte_base(acc.r, L.slices_off, 0);
         preps.push_back(e.j32(0x75));
     };
     const auto bump = [&]() {
@@ -13443,12 +13504,12 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     };
 
     /* per-kind arms; kind dispatch BEFORE the COW guards (see above) */
-    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    e.cmp_byte_base(acc.r, L.kind_off, L.kind_ints);
     const size_t j_ints = e.j32(0x74);
     if (!compound) {
-        e.cmp_byte_rax(L.kind_off, L.kind_bools);
+        e.cmp_byte_base(acc.r, L.kind_off, L.kind_bools);
         const size_t j_bools = e.j32(0x74);
-        e.cmp_byte_rax(L.kind_off, L.kind_floats);
+        e.cmp_byte_base(acc.r, L.kind_off, L.kind_floats);
         decline_ne();
 
         /* --- FLOAT row, plain: value promotes like the interpreter --- */
@@ -13468,7 +13529,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         inner_bounds(/*bytes=*/false);
         bump();
         e.store_elem_sd(sc.data, sc.idx, 0);
-        e.mov_byte_rax_imm(L.hashv_off, 0);
+        e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
         dones.push_back(e.jmp32());
 
         /* --- BOOL row, plain: value must BE a bool (an int does not
@@ -13483,12 +13544,12 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         inner_bounds(/*bytes=*/true);
         bump();
         e.store_elem_b(sc.data, sc.idx, sc.val);
-        e.mov_byte_rax_imm(L.hashv_off, 0);
+        e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
         dones.push_back(e.jmp32());
     } else if (!divmod) {
         /* compound float rows: add/sub/mul only (div/mod: the zero test
          * on a maybe-promoted boxed value stays on the helper) */
-        e.cmp_byte_rax(L.kind_off, L.kind_floats);
+        e.cmp_byte_base(acc.r, L.kind_off, L.kind_floats);
         const size_t j_floats = e.j32(0x74);
         decline_if(0xEB);                      /* other kinds: helper */
         e.patch32_here(j_floats);
@@ -13505,7 +13566,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         cow_guards();
         inner_bounds(/*bytes=*/false);
         bump();
-        e.mov_byte_rax_imm(L.hashv_off, 0);
+        e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
         e.load_elem_sd(1, sc.data, sc.idx);                /* xmm1 = elem */
         e.farith_x1_x0(bop == Op::plus  ? 0x58
                      : bop == Op::minus ? 0x5C : 0x59);
@@ -13577,7 +13638,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     cow_guards();
     inner_bounds(/*bytes=*/false);
     bump();
-    e.mov_byte_rax_imm(L.hashv_off, 0);
+    e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
     switch (bop) {
     case Op::invalid:
         e.store_elem_q(sc.data, sc.idx, sc.val);
@@ -15066,9 +15127,28 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 static_cast<int32_t>(in.target));
             if (reflisted)
                 j_help = emit_ref_check_jae(e, dst.type);
-            uint64_t q[3];
+            uint64_t q[3] = { 0, 0, 0 };
+            /* #96 9d: a SCALAR's payload is ONE meaningful qword
+             * (ival/fval/bval; none has none at all) and the union
+             * tail is INDETERMINATE padding. The full 24-byte copy
+             * baked that padding into the fragment, so the emitted
+             * immediates depended on what the emit-time stack
+             * happened to hold: two binaries from the SAME source
+             * produced different -vdj dumps on 4 corpus programs the
+             * day an unrelated edit shifted the stack (vdjcmp caught
+             * it). Copy only the meaningful bytes; the tail bakes as
+             * zero. Builtin - trivial but with a MULTI-qword payload
+             * (the first fix assumed "trivial == one qword" and a
+             * baked `len` value lost its function pointer, caught by
+             * -rt in seconds) - and every reference copy whole. */
+            const Type::TypeE bt_bv = bv.get_type()->t;
+            const size_t nb_bv =
+                bt_bv == Type::t_none ? 0
+                : (bt_bv == Type::t_int || bt_bv == Type::t_float
+                   || bt_bv == Type::t_bool) ? 8
+                : sizeof q;
             std::memcpy(q, reinterpret_cast<const char *>(&bv)
-                               + EvalValue::jit_payload_off(), sizeof q);
+                               + EvalValue::jit_payload_off(), nb_bv);
             hold();
             e.movabs(cpy, q[0]); e.store(cpy, dst.payload);
             e.movabs(cpy, q[1]); e.store(cpy, dst.payload + 8);
@@ -15217,9 +15297,28 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 static_cast<int32_t>(in.target));
             if (reflisted)
                 j_help = emit_ref_check_jae(e, dst.type);
-            uint64_t q[3];
+            uint64_t q[3] = { 0, 0, 0 };
+            /* #96 9d: a SCALAR's payload is ONE meaningful qword
+             * (ival/fval/bval; none has none at all) and the union
+             * tail is INDETERMINATE padding. The full 24-byte copy
+             * baked that padding into the fragment, so the emitted
+             * immediates depended on what the emit-time stack
+             * happened to hold: two binaries from the SAME source
+             * produced different -vdj dumps on 4 corpus programs the
+             * day an unrelated edit shifted the stack (vdjcmp caught
+             * it). Copy only the meaningful bytes; the tail bakes as
+             * zero. Builtin - trivial but with a MULTI-qword payload
+             * (the first fix assumed "trivial == one qword" and a
+             * baked `len` value lost its function pointer, caught by
+             * -rt in seconds) - and every reference copy whole. */
+            const Type::TypeE bt_v = v.get_type()->t;
+            const size_t nb_v =
+                bt_v == Type::t_none ? 0
+                : (bt_v == Type::t_int || bt_v == Type::t_float
+                   || bt_v == Type::t_bool) ? 8
+                : sizeof q;
             std::memcpy(q, reinterpret_cast<const char *>(&v)
-                               + EvalValue::jit_payload_off(), sizeof q);
+                               + EvalValue::jit_payload_off(), nb_v);
             hold();
             e.movabs(cpy, q[0]); e.store(cpy, dst.payload);
             e.movabs(cpy, q[1]); e.store(cpy, dst.payload + 8);
@@ -20473,7 +20572,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             g_fwd.in_temp = g_fwd.armed ? g_fwd.prod : -1;
             g_fwd.in_reg = g_fwd.res_reg;
             g_fwd.prod = -1;
-            g_fwd.res_reg = RAX;
+            /* THE BUS DEFAULT - the one conv-tagged line that
+             * names the whole accumulator convention: a producer
+             * that says nothing else leaves its value here, and
+             * every consumer learns the register from
+             * emit_fwd_bump's return, never by assuming. The last
+             * literal rax the mandate leaves standing, on purpose. */
+            g_fwd.res_reg = RAX;                       /* reg:conv */
             g_fwd.skip_write = false;
             g_fwd.armed = false;
             /* C4a-ii: the float twin, same one-shot discipline - in
@@ -20671,17 +20776,20 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 const auto nav = [&](int base, int kind, bool has_store,
                                      uint8_t rdata, uint8_t rcount) {
                     const SlotAddr hb = slot_addr(base);
-                    e.load(RAX, hb.type);
+                    /* a hoist region's run holds element ops, which
+                     * the rax whitelist refuses - the take is free */
+                    AccScratch acc(e);
+                    e.load(acc.r, hb.type);
                     {
                         RefScratch ra(e, RCX);
-                        e.cmp_reg_tag_via(RAX, L.t_arr, ra.sc);
+                        e.cmp_reg_tag_via(acc.r, L.t_arr, ra.sc);
                         ra.release();      /* before the edge */
                     }
                     cold.push_back(e.j32(0x75));
                     e.cmp_byte_slot(hb.payload + L.slice_off, 0);
                     cold.push_back(e.j32(0x75));
-                    e.load(RAX, hb.payload);
-                    e.cmp_byte_rax(L.kind_off,
+                    e.load(acc.r, hb.payload);
+                    e.cmp_byte_base(acc.r, L.kind_off,
                                    kind == 0 ? L.kind_ints
                                  : kind == 1 ? L.kind_floats
                                  : kind == 3 ? L.kind_bools
@@ -20697,14 +20805,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                         e.cmp_byte_slot(hb.type + (L.lv_const_off
                                                    - L.off_type), 0);
                         cold.push_back(e.j32(0x75));  /* const slot */
-                        e.cmp_byte_rax(L.ro_off, 0);
+                        e.cmp_byte_base(acc.r, L.ro_off, 0);
                         cold.push_back(e.j32(0x75));  /* readonly */
-                        e.cmp_byte_rax(L.slices_off, 0);
+                        e.cmp_byte_base(acc.r, L.slices_off, 0);
                         cold.push_back(e.j32(0x75));  /* live views */
-                        e.mov_byte_rax_imm(L.hashv_off, 0);
+                        e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
                     }
-                    e.load_base(rdata, RAX, L.data_off);
-                    e.load_base(rcount, RAX, L.data_off + 8);
+                    e.load_base(rdata, acc.r, L.data_off);
+                    e.load_base(rcount, acc.r, L.data_off + 8);
                     e.sub_rr(rcount, rdata);
                     if (kind == 0 || kind == 1)
                         e.sar_rr_imm8(rcount, 3);   /* 8-byte elements; general
@@ -21131,7 +21239,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         if (tramp.count(r.fn))
             continue;
         tramp[r.fn] = e.pos();
-        e.movabs(RAX, reinterpret_cast<uint64_t>(r.fn));   /* movabs rax, fn */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(r.fn));  /* reg:abi */
         e.jmp_reg(RAX);                            /* jmp rax; reg:abi */
     }
 
