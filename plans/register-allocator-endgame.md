@@ -455,20 +455,23 @@ cluster at a time with vdjcmp 116/116 after each, and teach the
 tracker the map. Only after every consumer reads the seam does D3
 put the linear scan behind it.
 
-### D2. The per-pc assignment seam - RESTRUCTURING BEFORE THE BRAIN
- - Introduce reg_at(slot, pc) / assignment map; implement it FIRST
-   as a wrapper over today's whole-run answer so every consumer
-   migrates while emission stays byte-identical (vdjcmp 116/116 is
-   the oracle for this step, exactly like the #96 batches).
- - Consumers to migrate: read_slot/write_slot/load_operand/
-   store_dst, the two-address arms, creg()/cspill()/fcreg() callers,
-   the fwd machinery, emit_call_prologue/epilogue,
-   flush_cache/snapshot/restore/clear (RetFlush's contract becomes
-   "flush the assignment AS OF THIS PC"), exit_pc, and the
-   PER-PC ENTRY STUBS (an entry at pc P must load the assignment AT
-   P - today they rebuild the whole-run cache).
- - The tracker learns the map (a read must match the assignment at
-   the current pc; REGTRACK aborts on drift).
+### D2. The per-pc assignment seam  [LANDED 2026-08-23]
+RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
+answer "where does slot s live AT cur_pc?" - dbg_pc was PROMOTED to
+cur_pc, model state both emission loops maintain per op. All 37
+query sites (20 creg + 11 cspill + 6 fcreg) migrated; vdjcmp
+116/116 both arenas, -rt 1948/1948. creg/cspill/fcreg are now
+INTERNALS of the assignment: the wholesale machinery (flush_cache/
+snapshot/restore/clear, emit_call_prologue/epilogue, entry stubs,
+exit_pc) still iterates the vectors directly, which is correct
+while the assignment is whole-run - D3 makes those "the assignment
+AS OF THIS PC" (RetFlush's restated contract) and rebuilds entry
+stubs from the per-pc map.
+ - DEFERRED TO D3, with the reason recorded: "the tracker learns the
+   map" is only definable once the map exists as an artifact
+   SEPARATE from the wrapper (D3's assignment output) - checking the
+   wrapper against itself today is the oracle-shares-its-subject
+   trap verbatim.
 
 ### D3. Linear scan with splitting (the brain)
  - Walk intervals by start; free-until/next-use-distance; at

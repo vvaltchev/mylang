@@ -1407,7 +1407,14 @@ struct Emitter {
     int trk_mach = 0;            /* inside declared pin machinery      */
     int trk_bracket = 0;         /* between call prologue and reload   */
     int trk_takes = 0;           /* alloc_scratch takes not yet freed  */
-    int dbg_pc = -1;             /* the op being emitted, for messages */
+    /* D2: the vm pc of the op being emitted - MODEL STATE now, not
+     * just diagnostics: the per-pc assignment seam (reg_at/spill_at/
+     * freg_at below) answers relative to it, and D3's interval
+     * assignments will vary with it. Set by both emission loops
+     * before each op; -1 outside op emission (entries, epilogues,
+     * where the flush machinery iterates the assignment wholesale
+     * instead of querying). */
+    int cur_pc = -1;
     int dbg_op = -1;
 
 #ifndef NDEBUG
@@ -1427,7 +1434,7 @@ struct Emitter {
         fprintf(stderr,
                 "JIT-REGTRACK: %s: r%u  (vm pc %d, opcode %d; "
                 "borrowed=%#x dirty=%#x mach=%d bracket=%d)\n",
-                what, r, dbg_pc, dbg_op,
+                what, r, cur_pc, dbg_op,
                 trk_borrowed, trk_dirty, trk_mach, trk_bracket);
         static const bool report =
             getenv("MYLANG_REGTRACK_REPORT") != nullptr;
@@ -2016,6 +2023,21 @@ struct Emitter {
                 return c.k;
         return -1;
     }
+    /*
+     * D2 (plans/register-allocator-endgame.md): THE PER-PC ASSIGNMENT
+     * SEAM. "Where does slot s live AT cur_pc?" - the ONE question
+     * every emitting consumer asks, so that D3 can answer it from the
+     * interval assignment (one variable, several registers, per live
+     * range) without touching a consumer. Today the body is the
+     * whole-run answer (the pick's), so the migration is
+     * byte-identical; the value is that creg/cspill/fcreg become
+     * internals of the ASSIGNMENT (the flush/snapshot machinery,
+     * which handles the whole assignment at once) while everything
+     * that emits code for one op goes through here.
+     */
+    int reg_at(int slot) const   { return creg(slot); }
+    int spill_at(int slot) const { return cspill(slot); }
+    int freg_at(int slot) const  { return fcreg(slot); }
 
     /* mov <reg64>, [rbx + disp32]  (reg 0-15; REX.R for r8-r15) */
     void load(uint8_t reg, int32_t disp)
@@ -5273,7 +5295,7 @@ static SlotAddr slot_addr(int slot)
  * if pinned, else from memory. */
 static void read_slot(Emitter &e, uint8_t dst, int slot)
 {
-    const int cr = e.creg(slot);
+    const int cr = e.reg_at(slot);
     if (cr >= 0) {
         /* the tracker: reading the slot OUT of a borrowed-and-
          * overwritten register would read the borrower's temp */
@@ -5284,7 +5306,7 @@ static void read_slot(Emitter &e, uint8_t dst, int slot)
     /* #96 inc-1: a spill-homed slot reads from its stack qword - the
      * frame slot is STALE while the home is live (exactly a pin's
      * contract, with memory for the register) */
-    const int sk = e.cspill(slot);
+    const int sk = e.spill_at(slot);
     if (sk >= 0) {
         e.reload(dst, sk);
         return;
@@ -5323,7 +5345,7 @@ static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
 static void read_slot_avoid(Emitter &e, uint8_t dst, int slot,
                             uint32_t avoid)
 {
-    const int cr = e.creg(slot);
+    const int cr = e.reg_at(slot);
     if (cr >= 0 && (avoid & (1u << cr))) {
         /* pinned, and the pin register was clobbered by an earlier
          * staged argument: the prologue's spill made the slot current */
@@ -8375,7 +8397,7 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
 static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
                        uint32_t bail_pc)
 {
-    const int cr = e.creg(slot);
+    const int cr = e.reg_at(slot);
     if (cr >= 0) {
         /* the ONE legitimate mid-op pin write: updating the pinned
          * slot's value. Declared as machinery so the tracker can tell
@@ -8387,7 +8409,7 @@ static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
     }
     /* #96 inc-1: a spill-homed slot's update goes to its stack qword;
      * type + payload reach the frame at the exits, like a pin's */
-    const int sk = e.cspill(slot);
+    const int sk = e.spill_at(slot);
     if (sk >= 0) {
         e.spill(src, sk);
         return;
@@ -11222,7 +11244,7 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
     /* C2a: a float-PINNED slot reads register-to-register - no type
      * dispatch (the pool qualifies only float-WRITTEN slots, proven
      * t_float; see pick_cached_slots). */
-    if (const int fr = e.fcreg(slot); fr >= 0) {
+    if (const int fr = e.freg_at(slot); fr >= 0) {
         e.fmov_rr(xr, static_cast<uint8_t>(fr));
         return;
     }
@@ -11268,7 +11290,7 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
      * ref check (every writer of a pinned slot in the run is a float
      * op, so it can never hold a reference; the epilogue flush restores
      * type+payload to memory). */
-    if (const int fr = e.fcreg(dst); fr >= 0) {
+    if (const int fr = e.freg_at(dst); fr >= 0) {
         /* the one legitimate mid-op float-pin write - updating the
          * pinned slot's value. Declared as machinery, exactly like
          * write_slot's GP twin. */
@@ -11741,7 +11763,7 @@ static FOperands emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
     const auto home = [&](bool is_lit, float_type lit, int slot) -> int {
         if (is_lit)
             return e.flitreg(lit);
-        return e.fcreg(slot);
+        return e.freg_at(slot);
     };
 
     if (fa && fb) {
@@ -13994,7 +14016,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * the reason LoadImmInt may appear in a rax-pinned run (see
          * run_may_pin_rax). Skipped when lever A paired this op as a
          * producer: the consumer expects the value in RAX. */
-        const int dreg = e.creg(in.target);
+        const int dreg = e.reg_at(in.target);
         if (dreg >= 0 && g_fwd.prod != in.target) {
             Emitter::PinMach pm(e);
             e.movabs(static_cast<uint8_t>(dreg),
@@ -14109,11 +14131,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * below - the frame RMW here would hit the stale frame slot */
         const int dspill_ta = (!in.a_is_lit()
                                && in.target == in.a_slot())
-            ? e.cspill(in.target) : -1;
+            ? e.spill_at(in.target) : -1;
         const bool two_addr =
             !in.a_is_lit() && in.target == in.a_slot()
             && aop != Op::times
-            && e.creg(in.target) < 0
+            && e.reg_at(in.target) < 0
             && dspill_ta < 0
             && !(g_fwd.prod == in.target)
             && !fa
@@ -14177,7 +14199,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.movabs(acc.r, static_cast<uint64_t>(in.b_lit()));
                 e.op_spill_reg(aop, dspill_ta, acc.r);
             } else {
-                const int bcr_s = e.creg(in.b_slot());
+                const int bcr_s = e.reg_at(in.b_slot());
                 if (bcr_s >= 0) {
                     e.trk_read_pin(static_cast<uint8_t>(bcr_s));
                     e.op_spill_reg(aop, dspill_ta,
@@ -14192,7 +14214,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                   * the bus */
             return true;
         }
-        const int dreg = e.creg(in.target);
+        const int dreg = e.reg_at(in.target);
         /*
          * NOTE the forwarded-OUT case is ALLOWED here, unlike the
          * memory half. There, leaving the result only in memory means
@@ -14246,8 +14268,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             } else if (in.b_is_lit()) {
                 e.op_reg_imm(aop, d, static_cast<int32_t>(in.b_lit()));
             } else {
-                const int bcr = e.creg(in.b_slot());
-                const int bsk = e.cspill(in.b_slot());
+                const int bcr = e.reg_at(in.b_slot());
+                const int bsk = e.spill_at(in.b_slot());
                 if (bcr >= 0)
                     e.op_rr2(aop, d, static_cast<uint8_t>(bcr));
                 else if (bsk >= 0)
@@ -14330,9 +14352,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * and gone with this branch (the pin is read in place).
          */
         const int bpin = (!fb && !in.b_is_lit())
-            ? e.creg(in.b_slot()) : -1;
+            ? e.reg_at(in.b_slot()) : -1;
         const int bskg = (!fb && !in.b_is_lit())
-            ? e.cspill(in.b_slot()) : -1;
+            ? e.spill_at(in.b_slot()) : -1;
         const bool bimm = !fb && in.b_is_lit()
             && in.b_lit() >= INT32_MIN && in.b_lit() <= INT32_MAX;
         if (!fa && !fb) {
@@ -14534,7 +14556,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          */
         if (!in.a_is_lit() && in.target == in.a_slot() && in.b_is_lit()
                 && !fa && !fb && g_fwd.prod != in.target) {
-            const int dsh = e.creg(in.target);
+            const int dsh = e.reg_at(in.target);
             if (dsh >= 0) {
                 const uint8_t d = static_cast<uint8_t>(dsh);
                 const int_type c = in.b_lit();   /* >= 0 by selection */
@@ -15229,7 +15251,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * ordinary int store: the two-store fast path, or the release
          * helper when the dst is ref-listed. No reference check is needed
          * on either side - the source cannot be a reference. */
-        if (const int sreg = e.creg(in.target2); sreg >= 0) {
+        if (const int sreg = e.reg_at(in.target2); sreg >= 0) {
             store_dst(e, ck, static_cast<uint8_t>(sreg), in.target, pc);
             return true;
         }
@@ -15239,7 +15261,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * boxed copy below read it raw and a homed `s` printed <none>
          * (WATCHED: the isolated final-sum repro). Reload the home and
          * store as the ordinary int. */
-        if (const int ssk = e.cspill(in.target2); ssk >= 0) {
+        if (const int ssk = e.spill_at(in.target2); ssk >= 0) {
             AccScratch acc(e);
             e.reload(acc.r, ssk);
             store_dst(e, ck, acc.r, in.target, pc);
@@ -15253,7 +15275,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * an arg-staging `move rN = x` cost x its register for the
          * whole fragment - 04_float_arith's accumulator never pinned
          * because of its final str(x, 4). */
-        if (const int fr = e.fcreg(in.target2); fr >= 0) {
+        if (const int fr = e.freg_at(in.target2); fr >= 0) {
             e.fmov_rr(X0, static_cast<uint8_t>(fr));     /* reg:abi */
             emit_float_store(e, ck, X0, in.target, pc);  /* reg:abi:
                                           * jit_put_float reads xmm0 */
@@ -16872,13 +16894,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             {   /* the block is NDEBUG-gated so an ASSERTS=0 release does
                  * not carry an unused lambda (-Werror) */
                 const auto not_pinned = [&e](const Operand &o) {
-                    return o.is_lit || (e.fcreg(o.slot) < 0
+                    return o.is_lit || (e.freg_at(o.slot) < 0
                                         && !e.telided(o.slot, true)
                                         && !e.fread_ok(o.slot));
                 };
                 ML_CHECK(not_pinned(bo.b)
                          && (comp || not_pinned(bo.a))
-                         && e.fcreg(in.target) < 0);
+                         && e.freg_at(in.target) < 0);
             }
 #endif
             if (comp) {
@@ -17869,7 +17891,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * without it run_may_pin_rax refused every loop in the
          * corpus - the reach probe read rax_pin = 0).
          */
-        const int acr = (!in.a_is_lit()) ? e.creg(in.a_slot()) : -1;
+        const int acr = (!in.a_is_lit()) ? e.reg_at(in.a_slot()) : -1;
         if (acr >= 0) {
             const uint8_t r = static_cast<uint8_t>(acr);
             if (in.b_is_lit() && in.b_lit() >= INT32_MIN
@@ -17879,8 +17901,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                 tmp_lit(static_cast<uint64_t>(in.b_lit()),
                         [&]() { e.cmp_rr2(r, tmp); });
             } else {
-                const int bcr = e.creg(in.b_slot());
-                const int bsk = e.cspill(in.b_slot());
+                const int bcr = e.reg_at(in.b_slot());
+                const int bsk = e.spill_at(in.b_slot());
                 if (bcr >= 0)
                     e.cmp_rr2(r, static_cast<uint8_t>(bcr));
                 else if (bsk >= 0)                  /* #96 inc-1 */
@@ -17927,7 +17949,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * `movabs`: a literal step becomes an imm8/imm32 operand, which
          * is one instruction less on every counted loop in the corpus.
          */
-        const int creg_i = e.creg(in.target2);
+        const int creg_i = e.reg_at(in.target2);
         const bool lit_step = in.b_is_lit()
             && in.b_lit() >= INT32_MIN && in.b_lit() <= INT32_MAX;
         if (creg_i >= 0) {
@@ -17949,8 +17971,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                     e.op_reg_imm(up ? Op::plus : Op::minus, r,
                                  static_cast<int32_t>(in.b_lit()));
                 } else {
-                    const int bcr = e.creg(in.b_slot());
-                    const int bsk = e.cspill(in.b_slot());
+                    const int bcr = e.reg_at(in.b_slot());
+                    const int bsk = e.spill_at(in.b_slot());
                     if (bcr >= 0)
                         e.op_rr2(up ? Op::plus : Op::minus, r,
                                  static_cast<uint8_t>(bcr));
@@ -17969,8 +17991,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                 tmp_lit(static_cast<uint64_t>(in.a_lit()),
                         [&]() { e.cmp_rr2(r, tmp); });
             } else {
-                const int acr = e.creg(in.a_slot());
-                const int ask = e.cspill(in.a_slot());
+                const int acr = e.reg_at(in.a_slot());
+                const int ask = e.spill_at(in.a_slot());
                 if (acr >= 0)
                     e.cmp_rr2(r, static_cast<uint8_t>(acr));
                 else if (ask >= 0)                  /* #96 inc-1 */
@@ -18030,8 +18052,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * (into RAX); doing it in the pin is the same instruction with
          * a different operand, and the flags stay dead until the cmp.
          */
-        const int areg = e.creg(adst);
-        const int ireg = e.creg(in.target2);
+        const int areg = e.reg_at(adst);
+        const int ireg = e.reg_at(in.target2);
         bool clear_fwd = false;
         AccScratch acc(e, AccScratch::deferred_t{});
 
@@ -18061,8 +18083,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                         [&]() { Emitter::PinMach pm(e);
                                 e.op_rr2(Op::plus, d, tmp); });
             } else {
-                const int bcr = e.creg(in.b_slot());
-                const int bsk = e.cspill(in.b_slot());
+                const int bcr = e.reg_at(in.b_slot());
+                const int bsk = e.spill_at(in.b_slot());
                 Emitter::PinMach pm(e);
                 if (bcr >= 0)
                     e.op_rr2(Op::plus, d, static_cast<uint8_t>(bcr));
@@ -18116,8 +18138,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                 tmp_lit(static_cast<uint64_t>(bnd),
                         [&]() { e.cmp_rr2(r, tmp); });
             } else {
-                const int bcr = e.creg(in.a_dual_hi());
-                const int bsk = e.cspill(in.a_dual_hi());
+                const int bcr = e.reg_at(in.a_dual_hi());
+                const int bsk = e.spill_at(in.a_dual_hi());
                 if (bcr >= 0)
                     e.cmp_rr2(r, static_cast<uint8_t>(bcr));
                 else if (bsk >= 0)                  /* #96 inc-1 */
@@ -19469,7 +19491,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         }
         label[pc] = e.pos();
         e.op_boundary();
-        e.dbg_pc = static_cast<int>(pc);
+        e.cur_pc = static_cast<int>(pc);
         e.dbg_op = static_cast<int>(chunk.code[pc].op);
         if (op_is_branch(chunk.code[pc].op))
             emit_branch(e, chunk, chunk.code[pc],
@@ -20722,7 +20744,7 @@ retry_emission:
              * unfreed alloc_scratch take silently reassigns every
              * later allocation in the fragment */
             e.op_boundary();
-            e.dbg_pc = static_cast<int>(pc);
+            e.cur_pc = static_cast<int>(pc);
             e.dbg_op = static_cast<int>(in.op);
             if (g_jit_annotate)
                 marks.push_back({ static_cast<uint32_t>(e.pos() - frag_off[r]),
