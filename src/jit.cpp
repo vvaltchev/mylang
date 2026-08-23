@@ -4264,12 +4264,19 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
      * call and no jump, so a push/pop bracket is safe exactly as it is
      * in RefScratch (declared below, hence the open-coded form).
      */
-    const uint8_t keep = RCX;
-    const bool keep_spill = e.reg_is_occupied(keep);
-    if (keep_spill)
-        e.push_reg(keep);
-    else
-        e.scratch(keep);
+    /* #96 (8c): ask-first, like RefScratch's ctor */
+    uint8_t keep = RCX;                              /* reg:conv */
+    const int keep_g = e.alloc_scratch(CAP_MEM_BASE, 1u << RCX);
+    bool keep_spill = false;
+    if (keep_g >= 0) {
+        keep = static_cast<uint8_t>(keep_g);
+    } else {
+        keep_spill = e.reg_is_occupied(keep);
+        if (keep_spill)
+            e.push_reg(keep);
+        else
+            e.scratch(keep);
+    }
     e.mov_rr(keep, RAX);                             /* keep = n */
     e.movabs(RDX, m.M);  /* reg:isa */
     e.imul_reg(RDX);              /* reg:isa: imul rdx (signed,
@@ -4290,6 +4297,13 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     }
     if (!want_mod) {
         e.mov_rr(RAX, RDX);    /* reg:isa: rax = quotient */
+        /* the OLD code leaked a pushed keep on this early return - a
+         * latent stack skew for a pinned-rcx div-magic shape, exposed
+         * the moment the grant made the take unconditional */
+        if (keep_g >= 0)
+            e.free_scratch(static_cast<uint8_t>(keep_g));
+        else if (keep_spill)
+            e.pop_reg(keep);
         return;
     }
     /* n % d == n - (n/d)*d */
@@ -4301,7 +4315,9 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     }
     e.sub_rr(keep, RAX);
     e.mov_rr(RAX, keep);                             /* rax = remainder */
-    if (keep_spill)
+    if (keep_g >= 0)
+        e.free_scratch(static_cast<uint8_t>(keep_g));
+    else if (keep_spill)
         e.pop_reg(keep);
 }
 
@@ -5033,10 +5049,22 @@ static void load_operand_avoid(Emitter &e, uint8_t reg, bool is_lit,
 struct RefScratch {
     Emitter &e;
     uint8_t sc;
-    bool spilled;
+    bool spilled = false;
+    int g = -1;
+    /* #96 (8c): ASK the allocator first (prefer `r`, byte-identical
+     * while it is free); only a refusal takes the push-when-occupied
+     * borrow. A granted window emits no push/pop and may span interior
+     * rejoining branches trivially (the push form requires every path
+     * to reach release() - the exc-stamp's documented contract). */
     RefScratch(Emitter &em, uint8_t r)
-        : e(em), sc(r), spilled(em.reg_is_occupied(r))
+        : e(em), sc(r)
     {
+        g = e.alloc_scratch(CAP_MEM_BASE, 1u << r);
+        if (g >= 0) {
+            sc = static_cast<uint8_t>(g);
+            return;
+        }
+        spilled = e.reg_is_occupied(sc);
         if (spilled)
             e.push_reg(sc);       /* it holds a pin - borrow and restore */
         else
@@ -5045,8 +5073,13 @@ struct RefScratch {
     /* Call AFTER the compare and BEFORE the jump: pop preserves flags. */
     void release()
     {
-        if (spilled)
+        if (g >= 0) {
+            e.free_scratch(static_cast<uint8_t>(g));
+            g = -1;
+        } else if (spilled) {
             e.pop_reg(sc);
+            spilled = false;
+        }
     }
 };
 
@@ -5066,7 +5099,7 @@ struct RefScratch {
  */
 static size_t emit_ref_check(Emitter &e, int32_t type_off,
                              JitColdTier cold = JC_COUNT,
-                             uint8_t scr = RCX)
+                             uint8_t scr = RCX)  /* reg:conv */
 {
     const JitLayout &L = jit_layout();
     const bool force = cold != JC_COUNT && jit_cold_forced(cold);
@@ -5097,7 +5130,8 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off,
  * global slot): jump NEAR to the helper when it is a REFERENCE. Clobbers
  * rcx; `cb` is only READ. */
 static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
-                                       int32_t type_off, uint8_t scr = RCX)
+                                       int32_t type_off,
+                                       uint8_t scr = RCX)  /* reg:conv */
 {
     const JitLayout &L = jit_layout();
     RefScratch rs(e, scr);
@@ -5115,7 +5149,8 @@ static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
  * helper; the inline handles the 3..t_str-1 range (int/builtin/float/bool/
  * structtype). Returns the ONE jump site to patch to the helper. */
 static size_t
-emit_store_src_gate(Emitter &e, int32_t type_off, uint8_t scr = RCX)
+emit_store_src_gate(Emitter &e, int32_t type_off,
+                    uint8_t scr = RCX)      /* reg:conv */
 {
     /*
      * ⛔ ONE UNSIGNED COMPARE FOR A CLOSED BAND (2026-08-20).
@@ -5189,7 +5224,7 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap, uint8_t tbl)
  * t_str); fall through for a trivial value. Returns the jae rel32 site to
  * patch to the helper label. Clobbers rcx. */
 static size_t emit_ref_check_jae(Emitter &e, int32_t type_off,
-                                 uint8_t scr = RCX)
+                                 uint8_t scr = RCX)  /* reg:conv */
 {
     const JitLayout &L = jit_layout();
     RefScratch rs(e, scr);
@@ -5700,10 +5735,10 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
     if (le) {
         e.cmp_dword_base_imm8(RAX, off_s + 4, 0x00);   /*   ... loc_start.col */
         j_has = e.j8(0x75);                  /* jnz: caret already set */
-        e.movabs(RCX, pack(le->start));
-        e.store_base(RCX, RAX, static_cast<int32_t>(off_s));
-        e.movabs(RCX, pack(le->end));
-        e.store_base(RCX, RAX, static_cast<int32_t>(off_e));
+        e.movabs(rs.sc, pack(le->start));
+        e.store_base(rs.sc, RAX, static_cast<int32_t>(off_s));
+        e.movabs(rs.sc, pack(le->end));
+        e.store_base(rs.sc, RAX, static_cast<int32_t>(off_e));
         e.patch8(j_has, e.pos());            /* the CARET block only: the
                                               * chain stamp below still runs
                                               * for an exception that already
@@ -5767,7 +5802,8 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
  * value. That keeps two stores off every call in a chunk with no inlining,
  * which is nearly all of them.
  *
- * Clobbers rax/rcx - emit only where both are dead.
+ * Clobbers rax (rcx now goes through RefScratch - granted or borrowed,
+ * never silently clobbered) - emit only where rax is dead.
  */
 static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
 {
@@ -5781,8 +5817,10 @@ static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
     e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_call_inline_chain()));
     e.store_dword_base_imm32(RAX, 0, static_cast<uint32_t>(chain));
     e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_call_inline_pool()));
-    e.movabs(RCX, pool);
-    e.store_base0(RCX, RAX);
+    RefScratch rs(e, RCX);
+    e.movabs(rs.sc, pool);
+    e.store_base0(rs.sc, RAX);
+    rs.release();
 }
 
 /*
@@ -7877,13 +7915,18 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
          * form: no register holds t_bool, so on the no-arena fallback
          * this must BUILD it (see store_type_tag_via - the absence of
          * that was a shipped wrong answer). */
+        RefScratch rs1(e, RCX);
         e.store_type_tag_via(a.type, reinterpret_cast<const void *>(tb),
-                             RCX);
+                             rs1.sc);
+        rs1.release();
         e.store(src_reg, a.payload);
         e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
-    e.store_type_tag_via(a.type, reinterpret_cast<const void *>(tb), RCX);
+    RefScratch rs2(e, RCX);
+    e.store_type_tag_via(a.type, reinterpret_cast<const void *>(tb),
+                         rs2.sc);
+    rs2.release();
     e.store(src_reg, a.payload);
 }
 
@@ -11747,7 +11790,7 @@ static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint8_t cr,
  */
 struct ElemRead {
     uint8_t obj   = RAX;
-    uint8_t data  = RCX;
+    uint8_t data  = RCX;  /* reg:conv */
     uint8_t count = RDX;  /* reg:conv */
     uint8_t idx   = R9;  /* reg:conv */
 };
@@ -11936,7 +11979,7 @@ static void emit_elem_base_gate(Emitter &e, uint8_t ir, int base_slot,
  */
 struct ElemScratch {
     uint8_t obj   = RAX;   /* the SharedObject *      (ISA-fixed: idiv) */
-    uint8_t data  = RCX;   /* the flat element data pointer            */
+    uint8_t data  = RCX;   /* reg:conv: elem data ptr */
     uint8_t count = RDX;   /* reg:conv: count (idiv-fixed)  */
     uint8_t idx   = R9;    /* the element index (reg:conv)   */
     uint8_t val   = RDI;   /* the stored value / rhs (reg:conv) */
@@ -13604,7 +13647,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     bool tmp_active = false;
     int tmp_grant = -1;
     const auto hold = [&](uint32_t need = CAP_MEM_BASE) {
-        if (tmp_active || (e.trk_borrowed & (1u << RCX))) {
+        if (tmp_active || (e.trk_borrowed & (1u << RCX))) {  /* reg:conv */
             /* already held this window (the second spelling covers a
              * window opened by the raw borrow before this landed) */
             ML_CHECK((gp_caps(tmp) & need) == need);
@@ -15339,14 +15382,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 have_fast = true;
                 const SlotAddr d = slot_addr(in.target);
                 e.load(RAX, d.type);
-                e.cmp_reg_tag_via(RAX, L.t_struct, RCX);
+                {
+                    RefScratch rt(e, RCX);
+                    e.cmp_reg_tag_via(RAX, L.t_struct, rt.sc);
+                    rt.release();          /* before the edge */
+                }
                 const size_t js1 = e.j32(0x75);
                 e.load(RAX, d.payload);           /* rax = StructObject* */
-                e.movabs(RCX, reinterpret_cast<uint64_t>(
-                                  ck.struct_defs[in.target2]));
-                /* cmp [rax + sobj_def], rcx */
+                RefScratch rd(e, RCX);
+                e.movabs(rd.sc, reinterpret_cast<uint64_t>(
+                                    ck.struct_defs[in.target2]));
                 e.cmp_base_reg(RAX, static_cast<int32_t>(L.sobj_def),
-                               RCX);
+                               rd.sc);
+                rd.release();
                 const size_t js2 = e.j32(0x75);
                 /* cmp dword [rax + sobj_rc], 1  (use_count == 1) */
                 e.cmp_dword_base_imm8(
@@ -15657,20 +15705,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.load_base0(RAX, RAX);        /* mov rax, [rax] (act) */
         hold();
         /* finish */
-        e.load_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        e.load_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 8));
         /* end cap */
-        e.cmp_reg_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 16));
+        e.cmp_reg_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 16));
         const bool wp = tmp_pushed;
         const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
-        e.store_dword_base_imm32(RCX, 0, region);   /* mov dword [rcx], rg */
-        e.op_reg_imm(Op::plus, RCX, 4);
-        /* mov [rax+h+8], rcx */
-        e.store_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        e.store_dword_base_imm32(tmp, 0, region);
+        e.op_reg_imm(Op::plus, tmp, 4);
+        e.store_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 8));
         drop();
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_grow);
-        if (wp)              /* the grow path left mid-window: unwind */
-            e.pop_bytes(RCX);
+        if (wp)              /* the grow path left mid-window: unwind
+                              * (a refused grant only ever pushes rcx;
+                              * a granted window needs no compensation) */
+            e.pop_bytes(RCX);                        /* reg:conv */
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(
                           static_cast<int_type>(region)));
@@ -15693,11 +15742,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         hold();
-        /* mov rcx, [rax+h+8] */
-        e.load_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
-        e.op_reg_imm(Op::minus, RCX, 4);
-        /* mov [rax+h+8], rcx */
-        e.store_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        e.load_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        e.op_reg_imm(Op::minus, tmp, 4);
+        e.store_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 8));
         drop();
         return true;
     }
@@ -15723,8 +15770,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         /* = &back_rec */
         hold();
-        e.load_base(RCX, RAX, static_cast<int32_t>(L.act_top_rec));
-        e.load32_base(pr, RCX, static_cast<int32_t>(L.rec_pend_base));
+        e.load_base(tmp, RAX, static_cast<int32_t>(L.act_top_rec));
+        e.load32_base(pr, tmp, static_cast<int32_t>(L.rec_pend_base));
         drop();                            /* the cursor is consumed */
         if (in.a_lit()) {
             e.add_reg32_imm32(pr, static_cast<uint32_t>(in.a_lit()));
@@ -15767,8 +15814,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         /* = &back_rec */
         hold();
-        e.load_base(RCX, RAX, static_cast<int32_t>(L.act_top_rec));
-        e.load32_base(pr, RCX, static_cast<int32_t>(L.rec_pend_base));
+        e.load_base(tmp, RAX, static_cast<int32_t>(L.act_top_rec));
+        e.load32_base(pr, tmp, static_cast<int32_t>(L.rec_pend_base));
         drop();                            /* the cursor is consumed */
         if (in.a_lit()) {
             e.add_reg32_imm32(pr, static_cast<uint32_t>(in.a_lit()));
@@ -16012,7 +16059,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * imm32 when the arena placed t_bool low (so it names NO
              * register at all, 17 bytes -> 11) and builds it in the
              * scratch only on the fallback path. */
-            e.store_type_tag_via(dst.type, L.t_bool, RCX);
+            {
+                RefScratch rb(e, RCX);
+                e.store_type_tag_via(dst.type, L.t_bool, rb.sc);
+                rb.release();
+            }
             e.store_rax_slot(dst.payload);           /* a REAL bool, not 0/1 */
             return true;
         }
@@ -16284,7 +16335,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             for (const size_t j : j_slows_win)
                 e.patch32_here(j);
             if (wp && !j_slows_win.empty())
-                e.pop_bytes(RCX);
+                e.pop_bytes(RCX);            /* reg:conv */
             for (const size_t j : j_slows)
                 e.patch32_here(j);
             j_slows.clear();
@@ -16988,12 +17039,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             have_fast = true;
             const SlotAddr b = slot_addr(in.target2);
             e.load(RAX, b.type);
-            e.cmp_reg_tag_via(RAX, L.t_struct, RCX);
+            {
+                RefScratch rt(e, RCX);
+                e.cmp_reg_tag_via(RAX, L.t_struct, rt.sc);
+                rt.release();              /* before the edge */
+            }
             const size_t js1 = e.j32(0x75);
             e.load(RAX, b.payload);            /* rax = StructObject* */
-            e.movabs(RCX, reinterpret_cast<uint64_t>(ck.struct_defs[defi]));
-            /* cmp [rax + sobj_def], rcx */
-            e.cmp_base_reg(RAX, static_cast<int32_t>(L.sobj_def), RCX);
+            RefScratch rd(e, RCX);
+            e.movabs(rd.sc,
+                     reinterpret_cast<uint64_t>(ck.struct_defs[defi]));
+            e.cmp_base_reg(RAX, static_cast<int32_t>(L.sobj_def), rd.sc);
+            rd.release();
             const size_t js2 = e.j32(0x75);
 #ifdef TESTS
             e.bump_counter(&g_jit_member_fast);
@@ -17584,7 +17641,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          */
         e.cmp_rax_tag(L.t_int, RSI);  /* reg:conv */
         const size_t j_fast_int = e.j32(0x74);   /* je -> fast */
-        e.cmp_reg_tag_via(RAX, L.t_bool, RCX);
+        {
+            RefScratch rb(e, RCX);
+            e.cmp_reg_tag_via(RAX, L.t_bool, rb.sc);
+            rb.release();                  /* before the edge */
+        }
         const size_t j_fast_bool = e.j32(0x74);  /* je -> fast */
         /* --- slow path: any other type (may throw) --- */
         emit_call_prologue(e);
@@ -17626,7 +17687,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         const SlotAddr a = slot_addr(in.a_slot());
         e.bump_op(OpCode::JumpIfNotNoneV);
         e.load(RAX, a.type);
-        e.cmp_reg_tag_via(RAX, jit_layout().t_none, RCX);
+        {
+            RefScratch rn(e, RCX);
+            e.cmp_reg_tag_via(RAX, jit_layout().t_none, rn.sc);
+            rn.release();                  /* before the edge */
+        }
         emit_cond_jump_raw(e, 0x85 /* jne near */, 0x74 /* je short */,
                            static_cast<size_t>(in.target), begin, end,
                            remap, fixups);
@@ -20348,7 +20413,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                      uint8_t rdata, uint8_t rcount) {
                     const SlotAddr hb = slot_addr(base);
                     e.load(RAX, hb.type);
-                    e.cmp_reg_tag_via(RAX, L.t_arr, RCX);
+                    {
+                        RefScratch ra(e, RCX);
+                        e.cmp_reg_tag_via(RAX, L.t_arr, ra.sc);
+                        ra.release();      /* before the edge */
+                    }
                     cold.push_back(e.j32(0x75));
                     e.cmp_byte_slot(hb.payload + L.slice_off, 0);
                     cold.push_back(e.j32(0x75));

@@ -3991,3 +3991,28 @@ Remaining RCX 41 (batch 8c): RefScratch(e, RCX) + the `scr = RCX`
 ref-check defaults, div_magic's `keep`, the *_tag_via scratch args,
 and the PushHandler/PopHandler cursor math (the SetPend pattern).
 Then RAX 455 - the staging convention, the finale.
+
+## (ay) 2026-08-22 - batch 8c: RCX at ZERO; eight of nine clean
+
+RefScratch's ctor asks the allocator first (all four scr-default
+ref-check helpers became mandate-clean at once - they already thread
+rs.sc); the exc-stamp's literal-RCX caret stores respelled through
+rs.sc; emit_bake_call_site's "clobbers rcx" contract became a
+RefScratch window; div_magic's open-coded keep asks first - AND THE
+CONVERSION EXPOSED A PRE-EXISTING LATENT LEAK: the div-only early
+return never popped a pushed keep (a stack skew waiting for a
+pinned-rcx div-magic shape), caught by the take-balance boundary
+check the moment the take became unconditional. The whole *_tag_via
+scratch family (struct ctor/member guards, the bool/none/arr tag
+compares, the foreach bool tag store) converted to RefScratch
+windows released before every edge; PushHandler/PopHandler and the
+SetPend/EndFinally cursors respelled through tmp (the same
+literal-in-a-granting-window class 8b flushed twice). The
+compensation pops (a refused grant only ever pushes rcx) and the
+preference defaults are tagged; RefScratch joined the census's
+allocator-API exemption.
+
+Census: RCX 0, TOTAL 460. 35 corpus programs drift (substitution /
+dropped push-pops); Ir 83_regs +0.001%, 14_array +0.05%,
+09_fib +0.11% (scale-1, compile-share heavy). ONLY RAX (455)
+REMAINS - the staging convention.
