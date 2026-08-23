@@ -40,3 +40,12 @@ var a = 1; a <<= 100; print(a);
 var b = -1; b >>= 999; print(b);
 try { var c = 4; c <<= int(runtime(0 - 1)); }
 catch (InvalidValueEx) { print("neg"); }
+
+# flat ELEMENT negative count: throws BEFORE the COW clone, so a live
+# slice stays attached (intptr-observable, all engines must agree)
+var base = [1, 2, 3];
+var view = base[0:3];
+try { base[0] <<= int(runtime(0 - 2)); }
+catch (InvalidValueEx) { print("eneg", intptr(view) == intptr(base)); }
+base[0] <<= 3;
+print(intptr(view) == intptr(base), base[0], view[0]);

@@ -12274,12 +12274,19 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     const Op aop = in.aop;
     const bool compound = aop != Op::invalid;
     const bool divmod = aop == Op::div || aop == Op::mod;
+    const bool bitw = aop == Op::band || aop == Op::bor || aop == Op::bxor;
 
     /* The compound emit-time refusals FIRST (they hold for the hoisted
-     * arm too - a refused shape takes the full helper either way). */
+     * arm too - a refused shape takes the full helper either way).
+     * The BITWISE compounds (&= |= ^=) inline like plus - non-throwing,
+     * op_rr2 encodes them, int storage only (a float target is
+     * compile-unreachable: bitwise is int-only). The SHIFT compounds
+     * stay on the helper: a reg-count shift needs the rcx shift core +
+     * a runtime negative-count decline, machinery the helper (the
+     * interpreter's exact body, negshift thrower included) gets free. */
     if (compound) {
         if (aop != Op::plus && aop != Op::minus && aop != Op::times
-            && !divmod)
+            && !divmod && !(bitw && !is_float))
             return false;
         if (is_float && aop == Op::mod)
             return false;                       /* fmod: helper */

@@ -7412,3 +7412,37 @@ regs family reads 0.98-1.04x. The win is shape, not a headline: probe
 kernels drop the `mov rax, slot; sar rax, imm; mov slot, rax` triple
 to one instruction (611 two-address emits in the probe, `sar r14, 1`
 in the dump), and rax stays pinnable in shift-bearing kernels.
+
+## THE TYPED FLAT SHIFT/BITWISE COMPOUND STORE (2026-08-21)
+
+**What.** `a[i] <<= n` (and `>>=` `>>>=` `&=` `|=` `^=`) on a proven flat
+int array now lowers to **StoreElemInt** with the base op in `aop` -
+before this it fell to the boxed StoreElemValue (correct, boxed). The
+codegen's StoreElemInt map asks `compound_assign_base` (the single
+table); `vm_store_elem_int_body` dispatches the six new bases, the shift
+arms checking the negative count BEFORE the COW clone via the
+loc-stamped `vm_store_throw_negshift` (the div0 pattern - a throwing
+store must not detach slices, intptr-observable, and the tree-walker's
+flat_store_core already throws before its clone). Caret parity for the
+uncaught negative-count element shift is byte-identical across all
+three engines (verified) and the COW non-detach agrees engine-wise.
+
+**The JIT split, deliberate:** the BITWISE three inline like plus -
+op_rr2 already encodes and/or/xor, no new guards (non-throwing, bool
+storage compile-unreachable) - in BOTH the hoisted (C1e) and ordinary
+inline arms. The SHIFT three DECLINE the inline arm at emit time and
+run the helper (`jit_store_elem_int`, the interpreter's exact body): a
+reg-count shift wants the rcx shift core plus a runtime negative-count
+decline, machinery the helper gets free. An emitted inline shift arm is
+a possible later increment; measure reach first.
+
+**Proof (three counters, because a value oracle cannot tell the flat
+helper from the boxed fallback):** the tier test's new bitwise case
+pins `fast_exact = 56` (32 fills + 24 bitwise, ALL inline);
+`jit_store_elem_shift_helper` pins g_jit_store_fast == 32 (fills only)
+AND `g_jit_op_run[StoreElemInt] == 24` - the helpers now bump their
+per-op counter (they did not before), which is what makes "the shifts
+were LOWERED flat and executed the flat helper" assertable at all.
+WATCHED: reverting the codegen admission leaves every value right and
+fails the helper-count fact; dropping bitwise from the inline admission
+fails fast_exact 56 (each sabotage run separately, committed tree).
