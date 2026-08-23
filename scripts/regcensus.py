@@ -145,6 +145,14 @@ REG_NUM = {0: 'RAX', 1: 'RCX', 2: 'RDX', 6: 'RSI', 7: 'RDI',
 ALIAS_DECL = re.compile(
     r'^\s*static\s+constexpr\s+uint8_t\s+(\w+)\s*=\s*(\d+)\s*;')
 
+# A function-local multi-declarator alias line (`const uint8_t R10 = 10,
+# R11 = 11;`) DECLARES names, it does not use registers - skip it like
+# the enum's member list (each declared NAME's uses are still counted,
+# R8R/R9R being in REGS).
+MULTI_ALIAS_DECL = re.compile(
+    r'^\s*(?:static\s+)?const(?:expr)?\s+uint8_t\s+\w+\s*=\s*\d+'
+    r'(?:\s*,\s*\w+\s*=\s*\d+)*\s*;')
+
 
 def derive_aliases(lines):
     """alias constant -> register, DERIVED from its declaration.
@@ -279,6 +287,8 @@ def census(path):
         # free) - not a bypass. Counting it would punish exactly the
         # conversion the mandate demands.
         if ALLOC_API.search(l):
+            continue
+        if MULTI_ALIAS_DECL.match(l):
             continue
         hits = {}
         for r in REGS:

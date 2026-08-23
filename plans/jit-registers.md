@@ -3800,3 +3800,31 @@ also justified one metadata mention each of RSI/R8/R9/R10/R11);
 floors lowered. Next: RSI (36) and R9 (27) are the cheapest;
 RCX/RDX's remaining mass is the IntBin tmp-borrow family and the
 elem-role spellings, which convert with their emitters.
+
+## (ar) 2026-08-22 - batch 3: RSI reaches ZERO; R9 down to the ctor plan
+
+RSI's 36 + R9's 27 unbracketed sites classified. RSI: ~17 are the
+t_int-SINGLETON convention (the store_type_tag/cmp_reg_tag held-reg
+seam - reg:conv), 8 are SysV argument staging outside prologue
+brackets (reg:abi), 11 are the M5b sync-push machinery's raw scratch,
+justified reg:conv by the MyLang-call clobber mask: a run containing
+a MyLang call denies the WHOLE caller-saved pool, so no pin can exist
+where that machinery emits. R9: the ctx-chain / sync family (same
+denial), the 6th-SysV-argument site (reg:abi), and the allocator's
+own metadata (role defaults, the reservation, ctx_chain_reg's picker
+- reg:conv). Two census fixes: the function-local multi-declarator
+alias lines (`const uint8_t R8R = 8, R9R = 9;`) are declarations, not
+uses; and one stale tag from a line split was caught by the detector
+again (twice now - the net pays for itself).
+
+R9's remaining 3 UNJUSTIFIED are the struct CTOR-PLAN's byte-buffer
+register (emit_ctor_fields + the two loads feeding it) - the ord
+shape again: raw r9 in an inline path with no prologue, protected
+today only by no run having pinned r9 there. Converting needs the
+raw movsd [r9+off] encoding generalized (a RAWENC site) and the reg
+threaded through emit_ctor_fields - batch 4's job, with a
+pinned-r9 ctor sweep test.
+
+Census: 1087 -> 997 UNJUSTIFIED (the sync-machinery lines also
+justified shared-line RAX/RCX/R10/R11 mentions). vdjcmp 116/116
+byte-identical (tags are comments; the two code reflows are pure).
