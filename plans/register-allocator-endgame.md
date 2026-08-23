@@ -55,7 +55,9 @@ STATUS LEDGER (update as steps land):
  5. THE HOIST/C2b REGISTER CLAIMS: the region's rdata/rcount pair and
     its r10/r11 clobber-mask claim. Regions ask like everything else.
     Phase B (the claim -> a recorded grant); fully dissolved in D
-    (hoisted values become ordinary intervals).
+    (hoisted values become ordinary intervals). [DONE 2026-08-22:
+    B3 below - the mask entry deleted, the claim is ra.busy +
+    claim_mask, eviction-retry covers a pinned pair]
  6. THE WHOLE-RUN PICK ITSELF (pick_cached_slots): one slot = one
     register for the WHOLE run, ranked by whole-run use counts,
     qualified by the audited bad()-rules, no splitting, no per-pc
@@ -295,12 +297,24 @@ Do the div arms first (mechanical), then the tier roles via ONE seam
 in elem_read_plan/elem_scratch_plan (evict any pinned role), then
 delete run_may_pin_rdx. NEXT SESSION'S FIRST ITEM.
 
-### B3. The hoist/C2b claims become recorded grants
- - The region's rdata/rcount pair: allocate through take() at region
-   setup (prefer the current pair for byte identity), record in
-   JitHoist, and delete the hand-built r10/r11 clobber-mask entry -
-   the busy bits ARE the claim. The "pool-denied run" scratch
-   fallback keeps its conv tag until D.
+### B3. The hoist/C2b claims become recorded grants  [LANDED 2026-08-22]
+RESULT: the hand-built `clob |= HOIST_REGS_MASK` entry is DELETED.
+The region claims r10/r11 at its own entry - a conflicting pin is
+evicted via the seam (retry denies it), then the pair joins ra.busy
+and Emitter::claim_mask (the generalized run-scoped claim record the
+B1 tag holders share; clear_cache_state restores it, so a barrier no
+longer wipes a live claim; check_pins_are_busy enforces it). Claim
+held to run end = the old deny scope for scratch; region-scoped
+release is a D refinement. elem_scratch_reserve still models the
+claim at pick time (has_hoist). REACH: no corpus program drives the
+eviction - the `jit: B3` -rt case constructs it (7 accumulators +
+array walk), asserts retry>=1, watched failing (tracker names r10).
+MEASURED: 104/116 byte-identical both arenas; all 12 drifts are
+hoist-run scratch substitutions (rsi/rdx -> the freed r10), counts
+equal per program. The C2b pair (pair_lo/hi) was ALREADY a recorded
+take_fixed grant - no change needed there. The "pool-denied run"
+scratch fallback keeps its conv tag until D.
+
 
 ---------------------------------------------------------------------
 ## PHASE C - THE FLOAT (XMM) MANDATE
