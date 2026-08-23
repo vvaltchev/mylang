@@ -477,11 +477,10 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
         for (size_type i = 0; i < n; i++) {
             /* e / r non-const so the kept one is MOVED into the result vector
              * (avoiding a per-element retain for a general/str/dyn element),
-             * not copied (#60 Tier 1). e is passed to the callback by pointer
-             * FIRST, so it is dead by the time filter moves it. */
+             * not copied (#60 Tier 1). e is passed to the callback FIRST,
+             * so it is dead by the time filter moves it. */
             EvalValue e = arr_elem_at(arr, i);
-            EvalValue r = inv.ready() ? inv.invoke(&e, 1)
-                                      : eval_func(ctx, funcObj, e);
+            EvalValue r = inv.call(e);
             if (!is_filter)
                 result.emplace_back(std::move(r), ctx->const_ctx);
             else if (r.is_true())
@@ -496,11 +495,7 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
             container.get<intrusive_ptr<DictObject>>()->get_ref();
 
         auto call_kv = [&](const EvalValue &k, const EvalValue &v) {
-            if (inv.ready()) {
-                const EvalValue argv[2] = { k, v };
-                return inv.invoke(argv, 2);
-            }
-            return eval_func(ctx, funcObj, make_pair(k, v));
+            return inv.call(k, v);
         };
 
         if (!is_filter) {

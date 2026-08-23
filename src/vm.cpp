@@ -6499,6 +6499,12 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
  */
 #ifdef TESTS
 unsigned long g_jit_invoke_direct = 0;   /* lever 2 execution proof */
+/* Which entry each callback ELEMENT took: the prepared window (invoke) vs
+ * the per-call fallback (eval_func, when there is no activation to run a
+ * boundary frame on). A tier is only proven by the counter for ITS OWN
+ * shape, so a test must reset both first - they are process-global. */
+unsigned long g_invoke_prepared = 0;
+unsigned long g_invoke_fallback = 0;
 #endif
 
 /* Lever 2's COLD exit path: the invoker's direct-entered fragment exited
@@ -6545,6 +6551,8 @@ vm_invoke_postexit(const Chunk &cck, EvalContext &ctx, VmActivation &act,
 
 VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj)
 {
+    caller_ctx_ = ctx;
+    obj_ = &obj;
     if (g_exec_engine != ExecEngine::Vm || !g_vm_act
             || !g_vm_act->invoke_ctx || ctx->in_const_eval())
         return;
@@ -6586,29 +6594,25 @@ VmInvoker::~VmInvoker()
     act_->pop_window();
 }
 
-EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
+/*
+ * The POST-BIND half of a prepared callback call - everything that does not
+ * depend on how the arguments got into the window: run the body, convert a
+ * pending raise, reset the reference slots, read the flow.
+ *
+ * ⛔ ALWAYS-INLINE ON PURPOSE, AND MEASURED. It is a separate function only
+ * so the bind above it reads as one step; it must fold BACK into invoke(),
+ * which is the single out-of-line call a callback element pays. An earlier
+ * version of this file let a second entry share it as an ordinary
+ * out-of-line function, so an element paid TWO calls: 34_sort_custom_cmp
+ * +19% wall clock at -27.2% instructions. If a second caller ever appears,
+ * it must inline this too - never call it.
+ */
+static ML_ALWAYS_INLINE EvalValue
+vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
+                const FuncDescriptor *d, LValue *win, int_type total,
+                const char *entry)
 {
-    const FuncDescriptor *d = desc_;
-    const size_t nparams = nparams_;
-    if (n > nparams || n < min_args_)
-        throw InvalidNumberOfArgsEx();
-
-    if (fast_bind_) {
-        for (size_t i = 0; i < n; i++)
-            w_->at(static_cast<int_type>(i)).rebind(argv[i]);
-        for (size_t i = n; i < nparams; i++)
-            w_->at(static_cast<int_type>(i)).rebind(EvalValue());
-    } else {
-        for (size_t i = 0; i < nparams; i++) {
-            const FuncDescriptor::ParamDesc &p = d->params[i];
-            EvalValue val = i < n ? argv[i] : EvalValue();
-            if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
-                val = vm_coerce_decl_num(val, p.decl_type == DeclType::f);
-            w_->at(static_cast<int_type>(i)).rebind(std::move(val));
-        }
-    }
-
-    c_->flow->type = FlowState::none;
+    c->flow->type = FlowState::none;
 
     /* Lever 2: DIRECT fragment entry per element - the whole vm_dispatch
      * entry/exit + the EnterNative op dispatch removed from the hot loop.
@@ -6619,19 +6623,19 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
      * dispatch re-entry remains the fallback for a body that does not
      * start native. */
     try {
-        if (entry_) {
+        if (entry) {
 #ifdef TESTS
             g_jit_invoke_direct++;
 #endif
-            const size_t r = jit_enter(entry_, w_->slots);
+            const size_t r = jit_enter(entry, win);
             /* an IN-VM sentinel is impossible here (this frame is a
              * BOUNDARY record; jit_ret/jit_halt return the boundary form)
              * - a surfaced one would mean ignored resume globals */
             ML_CHECK(r != JIT_RET_SENTINEL);
             if (r != JIT_RET_BOUNDARY)
-                vm_invoke_postexit(*cck_, *c_, *act_, r);
+                vm_invoke_postexit(*cck, *c, *act, r);
         } else {
-            vm_dispatch(*cck_, *c_, *act_);
+            vm_dispatch(*cck, *c, *act);
         }
     } catch (Exception &e) {
         vm_capture_desc_frame(e, d);
@@ -6652,9 +6656,7 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
      * (a separate FlowState member), so the order is immaterial and this lets
      * the result be MOVE-CONSTRUCTED into the return (#60 Tier 1) instead of
      * move-ASSIGNED into a default-constructed local. */
-    LValue *win = w_->slots;
-    const int_type total = static_cast<int_type>(w_->size);
-    for (const int32_t sidx : cck_->ref_slots) {
+    for (const int32_t sidx : cck->ref_slots) {
         if (sidx >= total)
             break;                       /* sorted */
         if (win[sidx].get().get_type()->t >= Type::t_str)
@@ -6665,11 +6667,64 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
         ML_VM_CHECK(win[i].get().get_type()->t < Type::t_str);
 #endif
 
-    if (c_->flow->type == FlowState::ret) {
-        c_->flow->type = FlowState::none;
-        return std::move(c_->flow->value);
+    if (c->flow->type == FlowState::ret) {
+        c->flow->type = FlowState::none;
+        return std::move(c->flow->value);
     }
     return EvalValue();
+}
+
+/*
+ * The PREPARED entry: bind the argv run into the window the ctor pushed,
+ * then run the body. One out-of-line call per callback element.
+ */
+EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
+{
+#ifdef TESTS
+    g_invoke_prepared++;
+#endif
+    const FuncDescriptor *d = desc_;
+    const size_t nparams = nparams_;
+    if (n > nparams || n < min_args_)
+        throw InvalidNumberOfArgsEx();
+
+    if (fast_bind_) {
+        for (size_t i = 0; i < n; i++)
+            w_->at(static_cast<int_type>(i)).rebind(argv[i]);
+        for (size_t i = n; i < nparams; i++)
+            w_->at(static_cast<int_type>(i)).rebind(EvalValue());
+    } else {
+        for (size_t i = 0; i < nparams; i++) {
+            const FuncDescriptor::ParamDesc &p = d->params[i];
+            EvalValue val = i < n ? argv[i] : EvalValue();
+            if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+                val = vm_coerce_decl_num(val, p.decl_type == DeclType::f);
+            w_->at(static_cast<int_type>(i)).rebind(std::move(val));
+        }
+    }
+
+    return vm_invoker_body(cck_, c_, act_, d, w_->slots,
+                           static_cast<int_type>(w_->size), entry_);
+}
+
+/*
+ * The NOT-READY arm of call() (vm.h): no activation to run a boundary frame
+ * on - the tree-walk engine, const-eval, or a chunk-less callee - so the
+ * callback runs through the ordinary per-call path. Absorbing it here is
+ * what lets a builtin spell its whole callback ladder as `inv.call(x)`.
+ */
+EvalValue VmInvoker::call_eval_func(const EvalValue *argv, size_t n)
+{
+#ifdef TESTS
+    g_invoke_fallback++;
+#endif
+    if (n == 1)
+        return eval_func(caller_ctx_, *obj_, argv[0]);
+    if (n == 2)
+        return eval_func(caller_ctx_, *obj_,
+                         std::make_pair(argv[0], argv[1]));
+    return eval_func(caller_ctx_, *obj_,
+                     std::vector<EvalValue>(argv, argv + n));
 }
 
 /*

@@ -35,6 +35,7 @@
 #include "funcdesc.h"   /* FuncDescriptor::vm_chunk (native-call gate, STEP 2.1) */
 #include "structtype.h" /* StructObject layout probe (baked member/ctor) */
 #include "eval.h"       /* builtin_slot (the LoadBuiltinV emit-time bytes) */
+#include "vm.h"         /* the callback-entry counters, for MYLANG_JITSTATS */
 
 #include <algorithm>
 #include <unordered_map>
@@ -5341,6 +5342,13 @@ void jit_stats_report()
         { "boxed_slow",       &g_jit_boxed_slow },
         { "boxed_slow_f",     &g_jit_boxed_slow_f },
         { "boxed_slow_m",     &g_jit_boxed_slow_m },
+        /* which VmInvoker entry a BUILTIN CALLBACK element took - the
+         * question "does this tier reach a real program?", which was
+         * answerable only from inside -rt before (see the MYLANG_JITSTATS
+         * note in CLAUDE.md: that gap is how a per-call cost came to be
+         * quoted for a path most calls skip) */
+        { "cb_prepared",      &g_invoke_prepared },
+        { "cb_fallback",      &g_invoke_fallback },
         /* THE CALL PROTOCOL - which tier each call took */
         { "sync_inline",      &g_jit_sync_inline },
         { "arg_inplace",      &g_jit_arg_inplace },

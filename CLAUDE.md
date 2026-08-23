@@ -5417,6 +5417,27 @@ instrumentation (see `plans/archived/function-templates.md`).
 3. Document it in `README.md` (const vs. non-const section) and add a test in
    `src/tests.cpp`.
 
+**⛔ A HIGHER-ORDER BUILTIN CALLS ITS CALLBACK THROUGH `VmInvoker::call`,
+AND THROUGH NOTHING ELSE (2026-08-14).** Construct one `VmInvoker inv(ctx,
+funcObj)` outside the loop and write `inv.call(args...)` per element —
+passing the arguments in whatever C++ types you already hold (a flat
+array's raw `int_type`, an `EvalValue`, a `SharedStr`). `call` boxes each
+argument exactly ONCE and picks the tier itself: the prepared window
+(one boundary frame for the whole loop) or `eval_func` when there is no
+activation to run one on. Do NOT hand-roll the
+`inv.ready() ? inv.invoke(argv, n) : eval_func(...)` ladder — all five
+existing sites did, each slightly differently, and the shared entry is
+what stops the sixth from inventing a sixth spelling. It is also a
+measured win, not just tidier: reaching the invoker through a
+`cmp2(EvalValue, EvalValue)` helper made `sort` box each operand TWICE
+(once for the helper's parameters, once into the argv), and removing that
+double boxing read −16.2% instructions and 0.89x wall clock on
+34_sort_custom_cmp. **Do not "improve" it by writing the raw scalar
+straight into the callee's window slot** — that was built in four shapes
+and lost the wall clock every time while winning every simulated metric;
+the record, including how to prove reach with `MYLANG_JITSTATS`'
+`cb_prepared`/`cb_fallback`, is in `plans/top5-cpp-gap.md`.
+
 **Memory safety with user callbacks.** A builtin that drives a sort/search with
 a *user-supplied* callback must not assume the callback is well-behaved — it is
 arbitrary script code. In particular `sort(arr, cmp)` (`builtins/arr.cpp.h`)

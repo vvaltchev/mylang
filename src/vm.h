@@ -87,6 +87,9 @@ void vm_window_pop();
 #ifdef TESTS
 /* lever 2 execution proof: VmInvoker's DIRECT fragment entries */
 extern unsigned long g_jit_invoke_direct;
+/* Which VmInvoker::call entry each callback element took (vm.cpp) */
+extern unsigned long g_invoke_prepared;
+extern unsigned long g_invoke_fallback;
 /* lever 4 execution proof: per-element runs of the SPECIALIZED dyn-foreach
  * Next bodies (resolved once at ForeachDynInit): 0 int / 1 float / 2 bool /
  * 3 gen / 4 dict */
@@ -118,9 +121,44 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
  * window push/pop, or record churn. Reference slots are reset between
  * elements (per-call frame-death semantics preserved - COW/use_count
  * behavior stays byte-identical to fresh frames). RAII: the dtor pops the
- * window and restores captures even when a callback throws. When !ready()
- * (tree-walk engine, const-eval, no activation, chunk-less callee) the
- * builtin falls back to eval_func per element.
+ * window and restores captures even when a callback throws.
+ *
+ * ⛔ `call(args...)` IS THE ONE ENTRY EVERY BUILTIN USES - do NOT add a
+ * per-builtin variant. It takes the callback's arguments in whatever C++
+ * types the builtin holds them in and picks the tier ITSELF: the prepared
+ * `invoke` above, or `eval_func` when the invoker is not ready() (the
+ * tree-walk engine, const-eval, no activation, a chunk-less callee). So a
+ * NEW higher-order builtin writes `inv.call(x)` and gets the best
+ * available tier with no ladder of its own - which is the point: the five
+ * existing call sites (sort's comparator, find's key, make_array,
+ * make_dict, map/filter) each spelled that ladder out, and each spelled it
+ * slightly differently.
+ *
+ * ⛔ IT ALSO EXISTS TO BOX EACH ARGUMENT EXACTLY ONCE, WHICH IS WHERE ITS
+ * MEASURED WIN COMES FROM. `sort` used to reach its invoker through a
+ * `cmp2(EvalValue, EvalValue)` lambda shared by the five storage arms, so
+ * a flat int comparison built TWO EvalValues for cmp2's parameters and
+ * then copied them into a two-element argv - four constructions per
+ * comparison. Taking the raw `int_type`s here builds the argv directly:
+ * two. Measured on 34_sort_custom_cmp, -16.2% instructions (893.6M ->
+ * 748.9M) and 0.89x wall clock; 12_higher_order 0.87x; full suite flat at
+ * 1.002x, with 33_sort_ints - the same sort with no comparator - flat, as
+ * it must be.
+ *
+ * ⛔ AND DO NOT "IMPROVE" IT BY BINDING THE RAW SCALAR STRAIGHT INTO THE
+ * WINDOW SLOT - THAT WAS BUILT, MEASURED AND REMOVED, TWICE. Skipping the
+ * argv entirely and writing the scalar into the callee's slot from its
+ * static type is the obvious next step and it LOSES: with it reaching
+ * 2,820,290 of 2,820,290 comparisons on 34_sort_custom_cmp (proven with
+ * MYLANG_JITSTATS' cb_ counters), the bench measured 1.20x-1.22x SLOWER
+ * than this in FOUR different shapes - bind inlined at the site, bind
+ * inlined with the body shared through an always-inline helper, the same
+ * plus a non-inlinable body, and the whole typed entry out-of-line. Every
+ * metric that can be SIMULATED said it should be faster (-28.2%
+ * instructions, -28% branches, identical D1/LL misses, +2.5%
+ * mispredicts), which is this codebase's known front-end/code-layout
+ * signature and is exactly why the wall clock is the number that decides.
+ * The full record is in plans/top5-cpp-gap.md.
  */
 struct VmActivation;
 class VmInvoker {
@@ -129,9 +167,32 @@ public:
     ~VmInvoker();
     VmInvoker(const VmInvoker &) = delete;
     bool ready() const { return ready_; }
+
+    /*
+     * THE callback entry (see the class comment). `args` are the callback's
+     * arguments in whatever C++ types the builtin holds them in - a raw
+     * int_type/float_type/bool element of a flat array, a SharedStr, or an
+     * already-boxed EvalValue. An argument must not alias the callee
+     * window (every caller passes array elements or freshly built values).
+     */
+    template <class... A>
+    EvalValue call(A &&... args)
+    {
+        /* Each argument is boxed EXACTLY ONCE, here, straight from its
+         * static C++ type - that single-boxing is the win (see the class
+         * comment). Then the prepared window entry, or the per-call path
+         * when there is no window to run on. */
+        const EvalValue argv[] = { EvalValue(static_cast<A &&>(args))... };
+        if (ready_)
+            return invoke(argv, sizeof...(A));
+        return call_eval_func(argv, sizeof...(A));
+    }
+
     EvalValue invoke(const EvalValue *argv, size_t n);
 
 private:
+    EvalValue call_eval_func(const EvalValue *argv, size_t n);
+
     bool ready_ = false;
     bool fast_bind_ = false;
     VmActivation *act_ = nullptr;
@@ -150,6 +211,10 @@ private:
     /* Lever 2: the callee fragment's DIRECT entry (body starts native),
      * cached once per loop; null = the vm_dispatch fallback. */
     const char *entry_ = nullptr;
+    /* The not-ready fallback's two operands, kept so `call` can absorb the
+     * eval_func arm and a builtin needs no ladder of its own. */
+    EvalContext *caller_ctx_ = nullptr;
+    FuncObject *obj_ = nullptr;
 };
 void vm_window_pop();
 

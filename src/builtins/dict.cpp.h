@@ -348,8 +348,7 @@ EvalValue builtin_make_dict(EvalContext *ctx, const ArgLocs *exprList,
     for (size_type i = 0; i < n; i++) {
 
         const EvalValue k = arr_elem_at(keys, i);
-        const EvalValue v = inv.ready() ? inv.invoke(&k, 1)
-                                        : eval_func(ctx, funcObj, k);
+        const EvalValue v = inv.call(k);
 
         data.insert_or_assign(make_const_clone(k), LValue(v, false));
     }
