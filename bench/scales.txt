@@ -88,3 +88,5 @@
 83_regs_int_40           2
 84_regs_ref_08           6
 85_regs_ref_25           2
+86_elem_arith_compound   61
+87_elem_shift_compound   103
