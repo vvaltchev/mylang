@@ -3988,3 +3988,90 @@ SABOTAGE, watched: dropping the depth from 12000 to 100 fails it with
 test. That assertion is the load-bearing half - without it a future
 frame-layout change could quietly stop reaching SEG_SLOTS and leave
 something that proves nothing.
+
+## H6 (2026-08-13): the boxed inline tier gets its FLOAT arm - and the
+## reach measurement that had to come first
+
+#60 gave the boxed (dyn) arithmetic ops an INLINE fast tier: guard both
+operand type words against `t_int`, do the payload arithmetic at the
+site, store. Its own comment named what it left behind - *"ANY other
+shape (float/bool/string/mixed operand, a throwing aop) falls to the
+EXACT helper path below"* - and the float half was never built. This is
+that half.
+
+**THE REACH MEASUREMENT CAME FIRST, AND IT SAID ZERO.** The plan sized
+H6 off 78_typed_param_call's float accumulate; H4 has since typed that
+call result, so the motivation was stale. A new classifier on the slow
+helpers (`g_jit_boxed_slow` + `_f` + `_m`, TESTS-only, in
+`MYLANG_JITSTATS`) counted the whole corpus: **`boxed_slow_f` is 0 in
+every one of bench/my + samples**. The declines that exist are string
+`+` (17, 28, strloop) and a handful in 39/75/primes. A two-line probe,
+on the other hand, produced **8,000,000** float-float declines - so the
+shape is real, common in user code, and simply absent from the corpus.
+That is a corpus gap, not a reason to skip the work (the sibling-case
+rule), so **79_dyn_float** was added: the float twin of 66_dyn_foreach.
+
+WHAT SHIPPED - `boxed_float_arm` (jit.cpp) decides eligibility, and it
+has TWO callers on purpose: the emit AND `run_has_float`, which is what
+puts `t_float` in r8 at fragment entry. The arm's guard and its store
+both read r8, so a predicate that drifted from `run_has_float` would
+leave it holding garbage; one function cannot drift from itself.
+
+  * BOTH operands must be PROVABLY float - a float LITERAL, or a slot
+    the emitted guard compares against t_float. This is CORRECTNESS, not
+    conservatism: an int-int pair must produce an INT, and the int arm
+    declines for its own reasons (a div edge case, a non-int literal),
+    so an arm that promoted whatever it was handed would turn `1 + 2`
+    into 3.0. The MIXED int/float promotion is therefore still the
+    helper's - enumerated, not forgotten, and `boxed_slow_m` sizes it.
+  * ARITH is `+ - * /`. `%` is the libm fmod call the helper already
+    makes; the bitwise ops do not exist for floats. A RUNTIME `+-0.0`
+    divisor DECLINES via the sign-stripped BITS test (`movq rax, xmm1;
+    shl rax, 1; jz`), which is exactly `fpclassify(rhs) == FP_ZERO` -
+    the same reasoning FloatBin uses, and the reason a bare `ucomisd;
+    je` is wrong (unordered sets ZF, so a NaN divisor would wrongly
+    decline). A literal `+-0.0` divisor is refused at emit time.
+  * COMPARES are the four ORDERING ones, via CmpFloatV's ucomisd
+    operand-SWAP trick, so an unordered (NaN) compare is FALSE in all
+    four. eq/noteq stay out, matching CmpFloatV's own long-standing
+    decision - NaN needs PF, i.e. a second setcc and a cmov.
+  * CompoundV stores PAYLOAD ONLY (the guard proved the dst already
+    holds a float, so its type word is t_float and there is nothing to
+    release) - the int arm's shape. BinOpV goes through
+    `emit_float_store`, which handles a ref-listed dst.
+
+READING THE TYPE WORD IS SOUND ONLY BECAUSE A BOXED OP'S SLOTS ARE NEVER
+PINNED OR ELIDED, and that is enforced, not hoped: the cache scan's
+`bad()` inserts into `disq` AND `disq_f` for BinOpV/CmpV/CompoundV, and
+both elision sets filter on those. The int arm has always relied on it
+silently; an NDEBUG-gated `ML_CHECK` now states it, so a future
+reclassification fails loudly instead of reading a stale word.
+
+MEASURED (`OPT=1 ASSERTS=0` both sides, interleaved `--baseline`, one
+full suite):
+ - **79_dyn_float 0.183s -> 0.036s = 0.20x wall**, my/python 0.13x;
+   8M helper calls become 8M inline runs (`boxed_fastf`), `boxed_slow`
+   goes to 0.
+ - suite geomean cur/base 0.984x - which is 79 itself; **93 of 101
+   corpus programs have byte-identical `-vd`** and the 8 that differ do
+   so because of the LogV codegen fix in the previous commit, not this.
+
+SABOTAGE, all watched failing:
+ - the arm disabled -> `BinOpV inline DID NOT RUN` (the counter is
+   bumped by the EMITTED code, so a value assertion could not tell the
+   tiers apart);
+ - the `+-0.0` bits guard removed -> the div0-decline shape's
+   `caught == 20` fails;
+ - the ucomisd swap removed -> the NaN shape fails;
+ - the both-float operand rule dropped -> the pre-existing `var dyn d =
+   runtime(2.5); var dyn r = 3 + d;` test fails on all four VM
+   differential modes. Note it is NOT my own mixed shape that catches
+   this: the runtime type test still declines an int-int pair, so the
+   rule is load-bearing only for a LITERAL operand, which has no runtime
+   guard at all. The test says so rather than claiming credit.
+
+REMAINING SIBLING CASES, enumerated: the MIXED int/float arm (needs a
+per-operand int-or-float guard plus cvtsi2sd, and must still refuse
+int-int - `boxed_slow_m` says how much it would buy); float `%` (a libm
+call either way); eq/noteq compares; and UnaryV, which no arm covers in
+either tier.

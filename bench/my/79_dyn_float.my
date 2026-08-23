@@ -1,0 +1,26 @@
+# dyn FLOAT arithmetic: the float sibling of 66_dyn_foreach.
+#
+# 66 accumulates INTS through a `dyn` alias, which the JIT's boxed inline
+# tier has served since #60. Every float shape fell to the exact-helper
+# path instead - and NOTHING in bench/ or samples/ measured that, so the
+# gap was invisible until it was counted (0 float-float boxed ops in the
+# whole corpus, 8M in a two-line probe). This bench exists so the H6 arm
+# has reach: it is the shape a user writing dyn float code actually gets.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var dyn a = dynarray([1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]);
+var dyn s = 0.0;                # `e` is dyn, so `s` stays dyn too
+var dyn hits = 0;
+var reps = 500000 * scale;
+
+for (var r = 0; r < reps; r++) {
+    foreach (var e in a) {
+        s = (s + e) * 0.5;      # BinOpV x2: slot-slot and float-literal
+        if (s > 4.0)            # CmpV: an ordering compare
+            hits = hits + 1;
+    }
+}
+
+print("result:", s, hits);

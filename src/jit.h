@@ -851,6 +851,12 @@ extern unsigned long g_jit_op_run[];
  * prove the inline path ran, not just the slow helper. */
 extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
 extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
+extern "C" unsigned long g_jit_boxed_fastf; /* H6: inline float-float ones */
+/* H6 REACH: the boxed ops that DECLINED to the exact-helper path, and how
+ * many of those were float-float. The difference is the residue no inline
+ * arm covers - which is what says whether another arm would pay. */
+extern "C" unsigned long g_jit_boxed_slow, g_jit_boxed_slow_f,
+                          g_jit_boxed_slow_m;
 /* #92: element stores served by the EMITTED inline tier, never the helper -
  * the only thing that can prove the fast path executed. */
 extern "C" unsigned long g_jit_store_fast;
