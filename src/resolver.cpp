@@ -2911,6 +2911,154 @@ static bool fmi_has_tainted_write(
     return found;
 }
 
+/*
+ * THE PARAMETER ESCAPE ANALYSIS (#93, 2026-08-14).
+ *
+ * Answers, per parameter: can the REFERENCE this parameter is bound to
+ * still be reachable after the call returns? If it cannot, the callee's
+ * slot does not need its own count on it - the CALLER's slot holds one for
+ * the whole of a synchronous call - and the retain/release pair a
+ * reference argument pays today (measured 44 Ir to bind + its share of 30
+ * to release, ~12% of 76_funcval_dispatch) is removable.
+ *
+ * ⛔ THIS PASS ONLY ANSWERS THE QUESTION. Wiring the answer to an actual
+ * borrow needs two more things that are NOT here, both found by reading
+ * the write path and both recorded in plans/top5-cpp-gap.md:
+ *   1. `try_flat_subscript_store` and `get_value_for_put` gate
+ *      `clone_aliased_slices` on `use_count() > 1`. A borrow does not bump
+ *      the count, so that guard would stop firing where it fires today -
+ *      an observable difference (a live slice of the argument would see
+ *      the write), i.e. a RULE 2 violation. The predicate has to move off
+ *      use_count and onto "this array actually has live slices" first.
+ *   2. An element write through a SLICE detaches it by assigning into the
+ *      handle, which would RELEASE a reference the borrowed slot never
+ *      took - a refcount underflow. Sliceness is a runtime property, so
+ *      the bind has to decide per call and record it (a borrow mask on the
+ *      window record, which `pop_window` then consults).
+ * So this lands on its own, with its own tests, and the consumer follows.
+ *
+ * THE RULES, deliberately conservative - a false "does not escape" is a
+ * use-after-free, a false "escapes" only costs the optimization. A param
+ * does not escape iff ALL of:
+ *   - it is never REASSIGNED (an assignment to the param would release
+ *     whatever the slot holds, which a borrowed slot must never do);
+ *   - EVERY occurrence of it is the base of a subscript or member access
+ *     (`p[i]`, `p.f`, and those as assignment targets). Anything else -
+ *     a bare read, an argument, a return operand, a capture, a throw -
+ *     is treated as an escape, because each of those can outlive the call;
+ *   - the body contains NO call of any kind. This is what makes the pass
+ *     non-transitive and therefore cheap AND sound: a callee could pass
+ *     the param on, or reassign the global the argument came from, and
+ *     either would need a whole-program fixpoint to bound. The transitive
+ *     version is the natural increment 2;
+ *   - the body writes NO global, for the same reason: the argument
+ *     expression at the call site may BE that global, and dropping its
+ *     last reference mid-call would leave the borrow dangling;
+ *   - the body declares no nested function (a capture list could take it).
+ */
+static bool esc_is_base_position(const Construct *c, const Construct *child)
+{
+    if (auto *s = dynamic_cast<const Subscript *>(c))
+        return s->what.get() == child;
+    if (auto *m = dynamic_cast<const MemberExpr *>(c))
+        return m->what.get() == child;
+    return false;
+}
+
+/* Does the body contain a call, a nested function, or a global write? Any
+ * of the three ends the analysis for EVERY param (see the rules above). */
+static bool esc_body_is_opaque(const Construct *c)
+{
+    if (!c)
+        return false;
+    if (dynamic_cast<const FuncDeclStmt *>(c))
+        return true;                       /* a nested function may capture */
+    if (dynamic_cast<const CallExpr *>(c))
+        return true;                       /* incl. builtins - not analysed */
+    /* a write whose target is a GLOBAL (the argument may be that global) */
+    const Construct *lv = nullptr;
+    if (auto *e = dynamic_cast<const Expr14 *>(c))
+        lv = e->lvalue.get();
+    else if (auto *idc = dynamic_cast<const IncDecExpr *>(c))
+        lv = idc->lvalue.get();
+    if (lv) {
+        const Construct *b = lv;
+        while (b) {
+            if (auto *id = dynamic_cast<const Identifier *>(b)) {
+                if (id->sym.kind == SymKind::global)
+                    return true;
+                break;
+            }
+            if (auto *s = dynamic_cast<const Subscript *>(b)) {
+                b = s->what.get(); continue;
+            }
+            if (auto *m = dynamic_cast<const MemberExpr *>(b)) {
+                b = m->what.get(); continue;
+            }
+            break;
+        }
+    }
+    bool opaque = false;
+    fmi_children(const_cast<Construct *>(c), [&](Construct *ch) {
+        if (esc_body_is_opaque(ch)) opaque = true;
+    });
+    return opaque;
+}
+
+/* Clear a param's bit the moment it is used anywhere but a base position. */
+static void esc_scan(const Construct *c,
+                     const std::unordered_map<const UniqueId *, int> &pidx,
+                     uint64_t &mask)
+{
+    if (!c)
+        return;
+    fmi_children(const_cast<Construct *>(c), [&](Construct *ch) {
+        if (!ch)
+            return;
+        if (auto *id = dynamic_cast<const Identifier *>(ch)) {
+            auto it = pidx.find(id->uid);
+            if (it != pidx.end() && !esc_is_base_position(c, ch))
+                mask &= ~(uint64_t(1) << it->second);
+            return;                        /* an Identifier has no children */
+        }
+        esc_scan(ch, pidx, mask);
+    });
+}
+
+/*
+ * Per-parameter "cannot outlive this call" bits, one per param, bit i for
+ * param i. Bit set == does NOT escape. Params past 64 are never marked.
+ */
+static uint64_t compute_noescape_params(FuncDeclStmt *fd)
+{
+    if (!fd->body || !fd->params || fd->params->elems.empty())
+        return 0;
+    const size_t n = fd->params->elems.size();
+    if (n > 64 || esc_body_is_opaque(fd->body.get()))
+        return 0;
+
+    std::unordered_map<const UniqueId *, int> pidx;
+    uint64_t mask = 0;
+    for (size_t i = 0; i < n; i++) {
+        Identifier *p = dynamic_cast<Identifier *>(fd->params->elems[i].get());
+        if (!p)
+            return 0;
+        /* a SCALAR param is a by-value copy - there is no reference to
+         * borrow, so it is neither interesting nor claimed here */
+        if (p->th == TypeHint::i || p->th == TypeHint::f)
+            continue;
+        /* reassigned? the resolver already counted the writes */
+        if (i < fd->slot_writes.size() && fd->slot_writes[i])
+            continue;
+        pidx.emplace(p->uid, static_cast<int>(i));
+        mask |= uint64_t(1) << i;
+    }
+    if (!mask)
+        return 0;
+    esc_scan(fd->body.get(), pidx, mask);
+    return mask;
+}
+
 /* True if `fd` may mutate a reference-typed parameter (so it is not pure). */
 static bool func_mutates_input(FuncDeclStmt *fd)
 {
@@ -5629,6 +5777,46 @@ collect_cacheable_slots(Construct *c, std::unordered_set<int> &out)
     for_each_child(c, [&](Construct *ch) { collect_cacheable_slots(ch, out); });
 }
 
+/*
+ * #93: stamp every function's per-parameter escape bits.
+ *
+ * ⛔ IT RUNS HERE, AT THE END OF resolve_names, AND NOT IN
+ * process_function WHERE ITS SIBLING func_mutates_input LIVES - because
+ * the answer depends on `SymKind::global`, which pass 2 has not stamped
+ * yet when a body is walked. A first version did stamp it there and was
+ * caught by the analysis' own test: `func f(a) { g = [9]; a[0] = 1; }`
+ * came back with `a` marked non-escaping, because the write to the global
+ * `g` still looked like a write to an unresolved name. That is the
+ * audit-table stage trap in its usual shape - a pass reading a table one
+ * stage before it is filled - and here the failure direction is a
+ * use-after-free, so the stage matters more than the tidiness of sitting
+ * next to the related analysis.
+ */
+#ifdef TESTS
+unsigned long g_noescape_funcs = 0;    /* functions with >=1 marked param */
+unsigned long g_noescape_marks = 0;    /* parameters marked, in total */
+#endif
+
+static void stamp_noescape_params(Construct *root)
+{
+    if (!root)
+        return;
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(root)) {
+        if (fd->desc) {
+            fd->desc->noescape_params = compute_noescape_params(fd);
+#ifdef TESTS
+            if (fd->desc->noescape_params) {
+                g_noescape_funcs++;
+                for (uint64_t m = fd->desc->noescape_params; m; m &= m - 1)
+                    g_noescape_marks++;
+            }
+#endif
+        }
+        /* a nested function is walked below like any other child */
+    }
+    fmi_children(root, [&](Construct *ch) { stamp_noescape_params(ch); });
+}
+
 static void
 devirtualize_direct_calls(Construct *root)
 {
@@ -5654,6 +5842,7 @@ resolve_names(Construct *root, bool enable_inline, int inline_threshold,
      * the inliner so spec clones + redirected calls are covered; before
      * specialize_types, which treats a DirectCallExpr as the CallExpr it is. */
     devirtualize_direct_calls(root);
+    stamp_noescape_params(root);
 }
 
 void

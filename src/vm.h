@@ -87,6 +87,11 @@ void vm_window_pop();
 #ifdef TESTS
 /* lever 2 execution proof: VmInvoker's DIRECT fragment entries */
 extern unsigned long g_jit_invoke_direct;
+/* #93 reach: functions with >=1 non-escaping param, and params marked
+ * (resolver.cpp) - a COMPILE-time count, so it says whether the analysis
+ * sees anything in a real program at all */
+extern unsigned long g_noescape_funcs;
+extern unsigned long g_noescape_marks;
 /* Which VmInvoker::call entry each callback element took (vm.cpp) */
 extern unsigned long g_invoke_prepared;
 extern unsigned long g_invoke_fallback;

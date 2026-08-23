@@ -158,6 +158,18 @@ struct FuncDescriptor {
     mutable bool fast_bind = false;
 
     /*
+     * #93: per-parameter "this reference cannot outlive the call" bits, bit
+     * i for param i (computed by compute_noescape_params, resolver.cpp -
+     * read its header for the rules and for what a consumer still owes).
+     * A set bit means the callee's slot needs no COUNT of its own, because
+     * the CALLER's slot holds one for the whole of a synchronous call.
+     * Zero for every function until the pass runs, and zero for a param
+     * past 64 - so a missing answer costs the optimization, never
+     * soundness. NOT yet consumed by the bind; see plans/top5-cpp-gap.md.
+     */
+    mutable uint64_t noescape_params = 0;
+
+    /*
      * G1: for a NON-fast_bind function, the Type singleton each parameter's
      * bind-time coercion requires - `t_int` for a param declared `int`,
      * `t_float` for `float`, null for one that needs no coercion. Empty when

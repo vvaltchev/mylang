@@ -20673,6 +20673,155 @@ static bool jit_invoke_direct_entry()
 }
 
 /*
+ * THE PARAMETER ESCAPE ANALYSIS (#93, compute_noescape_params in
+ * resolver.cpp): per parameter, "can the reference this is bound to still
+ * be reachable after the call returns?" Bit i of
+ * FuncDescriptor::noescape_params is SET when it cannot.
+ *
+ * ⛔ THIS IS THE ONLY THING THAT LOOKS AT THE ANSWER TODAY. The pass has
+ * no consumer yet (the borrow it exists for owes two fixes first - see the
+ * pass's header), so nothing else in the tree would notice if it silently
+ * answered 0 for everything, or - far worse - 1 for something that DOES
+ * escape. A false bit is a use-after-free once the consumer lands, so the
+ * table below is weighted towards the ESCAPE cases: every way out of a
+ * function that this project has (a bare read, a return, an argument, a
+ * capture, a reassignment, a global write, a container store) gets a row,
+ * and each asserts the bit is CLEAR.
+ */
+static bool param_escape_analysis()
+{
+    struct Case {
+        const char *what;
+        const char *src;
+        const char *fn;        /* the function to inspect */
+        uint64_t want;         /* expected noescape_params */
+    };
+
+    static const std::vector<Case> cases = {
+        /* THE SHAPE THE PASS EXISTS FOR: 76_funcval_dispatch's callee -
+         * the array parameter is only ever a subscript base, the int one
+         * is a by-value copy and is never claimed. */
+        { "an array param used only as a subscript base",
+          "func f(a, x) { a[0] = a[0] + x; }\nvar q = [0]; f(q, 1);",
+          "f", 0x1 },
+        { "two ref params, both only subscript bases",
+          "func f(a, b) { a[0] = b[0]; }\n"
+          "var q = [0]; var r = [7]; f(q, r);", "f", 0x3 },
+        { "a member base counts too",
+          "struct P { int x; }\nfunc f(p) { p.x = p.x + 1; }\n"
+          "var s = P(1); f(s);", "f", 0x1 },
+        /* ESCAPES - one row per way out. */
+        { "escapes: returned",
+          "func f(a) { return a; }\nvar q = [0]; var z = f(q);",
+          "f", 0x0 },
+        { "escapes: bound to a local (a bare read)",
+          "func f(a) { var b = a; b[0] = 1; }\nvar q = [0]; f(q);",
+          "f", 0x0 },
+        /* The STORED value escapes; the DESTINATION does not - it is only
+         * a subscript base. Getting this backwards is the easy mistake,
+         * and the first version of the expected mask here did (it asked
+         * for 0, and the pass correctly answered "param 1 stays"). */
+        { "escapes: the value stored into a container, not the container",
+          "func f(a, dst) { dst[0] = a; }\n"
+          "var q = [0]; var d = [q]; f(q, d);", "f", 0x2 },
+        /* ⛔ THE CALLEE MUST SURVIVE THE INLINER, or this case tests
+         * NOTHING - the first version used `func g(z) { z[0] = 1; }`,
+         * which block-inlines into f, leaving a body with no call in it
+         * and `a` genuinely non-escaping. The pass answered correctly and
+         * the case was vacuous. `g` reassigns a scalar param here, which
+         * block_inlinable_decl refuses, so a real call reaches the pass. */
+        { "escapes: passed to another (non-inlinable) function",
+          "func g(z, k) { k = k + 1; z[0] = k; }\n"
+          "func f(a) { g(a, 1); }\nvar q = [0]; f(q);", "f", 0x0 },
+        { "escapes: passed to a BUILTIN",
+          "func f(a) { append(a, 1); }\nvar q = [0]; f(q);", "f", 0x0 },
+        { "escapes: captured by a nested function",
+          "func f(a) { var c = func [a] () { return a[0]; }; }\n"
+          "var q = [0]; f(q);", "f", 0x0 },
+        /* ⛔ THE CASE THE "no calls" RULE EXISTS FOR, and the only one:
+         * the param is never mentioned in the call, so the base-position
+         * rule alone would keep its bit - but the callee reassigns the
+         * GLOBAL that the argument may BE, dropping the last count on it
+         * mid-call. `h` reassigns a scalar param so the inliner leaves it
+         * a real call (see the note on the previous case). Sabotage
+         * watched: delete the CallExpr test and this row fails; it is the
+         * ONLY row that does, which is why it is here. */
+        { "escapes: the body CALLS something, even without passing it",
+          "var g = [0];\nfunc h(k) { k = k + 1; g = [k]; }\n"
+          "func rd() { return g[0]; }\n"
+          "func f(a) { h(1); a[0] = 1; }\nf(g);", "f", 0x0 },
+        /* DEFENSIVE, not proven: the slot_writes test this row aims at is
+         * redundant today, because an assignment TO the param puts it in a
+         * non-base position (`a = ...`) and the base-position rule clears
+         * the bit first - deleting the slot_writes test leaves the whole
+         * table green. It stays because the failure direction is a
+         * use-after-free and the two rules answer different questions;
+         * this row pins the BEHAVIOUR, not that guard. */
+        { "escapes: the param is REASSIGNED",
+          "func f(a) { a = [9]; return a[0]; }\nvar q = [0]; f(q);",
+          "f", 0x0 },
+        { "escapes: the body writes a GLOBAL (the arg may BE it)",
+          "var g = [0];\nfunc f(a) { g = [9]; a[0] = 1; }\n"
+          "func use() { return g[0]; }\nf(g);", "f", 0x0 },
+        { "escapes: thrown",
+          "struct E { dyn? v; }\nfunc f(a) { throw E(a); }\n"
+          "var q = [0]; try { f(q); } catch (E) { }", "f", 0x0 },
+    };
+
+    /* find a named FuncDeclStmt anywhere under the root */
+    std::function<FuncDeclStmt *(Construct *, const char *)> find =
+        [&](Construct *c, const char *name) -> FuncDeclStmt * {
+        if (!c)
+            return nullptr;
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c))
+            if (fd->id && fd->id->get_str() == name)
+                return fd;
+        FuncDeclStmt *found = nullptr;
+        if (auto *b = dynamic_cast<Block *>(c))
+            for (auto &e : b->elems)
+                if (!found)
+                    found = find(e.get(), name);
+        return found;
+    };
+
+    for (const Case &c : cases) {
+        std::string src = c.src;
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        uint64_t got = 0;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            FuncDeclStmt *fd = find(root.get(), c.fn);
+            if (!fd || !fd->desc) {
+                fprintf(stderr, "param_escape_analysis: '%s': no func '%s'"
+                                " (inlined away? use an impure body)\n",
+                        c.what, c.fn);
+                return false;
+            }
+            got = fd->desc->noescape_params;
+        } catch (Exception &e) {
+            fprintf(stderr, "param_escape_analysis: '%s' threw %s: %s\n",
+                    c.what, e.name, e.msg ? e.msg : "");
+            ok = false;
+        }
+        if (!ok)
+            return false;
+        if (got != c.want) {
+            fprintf(stderr, "param_escape_analysis: '%s': noescape_params "
+                            "0x%llx, want 0x%llx\n", c.what,
+                    (unsigned long long)got, (unsigned long long)c.want);
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
  * VmInvoker::call's TIER LADDER (vm.h): which entry each callback element
  * takes. g_invoke_prepared counts the prepared-window entry (one boundary
  * frame for the whole loop, a rebind per element); g_invoke_fallback counts
@@ -30489,6 +30638,8 @@ static const std::vector<extra_check> extra_checks =
       jit_invoke_direct_entry },
     { "vm: VmInvoker::call picks the typed / boxed callback entry",
       invoker_call_tiers },
+    { "resolve: which parameters cannot outlive the call (#93)",
+      param_escape_analysis },
     { "opt: every AST transform is behaviour-preserving (layer equivalence)",
       opt_layer_equivalence },
     { "opt: loop-invariant container-subscript hoisting shapes (LICM)",

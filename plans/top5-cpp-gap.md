@@ -941,3 +941,76 @@ per-argument bind type-check emitted at every call site is provably
 dead here (`bind_coerce` and `bind_widen` are BOTH 0 across 1,000,000
 calls, because the value-template instance's params are typed and the
 arguments' static types already match), worth ~3%.
+
+
+## #93 INCREMENT 1: THE PARAMETER ESCAPE ANALYSIS IS BUILT - AND ITS REACH
+## SAYS THE CONSUMER IS NOT WORTH BUILDING UNTIL INCREMENT 2 (2026-08-14)
+
+`compute_noescape_params` (resolver.cpp) answers, per parameter, "can the
+reference this is bound to still be reachable after the call returns?",
+and stamps `FuncDescriptor::noescape_params`. It is correct, tested and
+sabotage-verified. It has NO consumer, deliberately - and the reach
+number below is why that turned out to be the right call rather than a
+staging decision.
+
+**MEASURED REACH: 4 parameters in 76_funcval_dispatch, and FIVE across
+all of samples/ + bench/my. Zero in 63_closures, zero in 46_matrix_mult.**
+
+The rule that costs it is "the body contains NO call of any kind", which
+makes the pass non-transitive and therefore cheap and obviously sound -
+but `len(a)` is a call, so the single most common shape in the language
+(`func f(a) { for (var i = 0; i < len(a); i++) ... }`) is excluded, and
+with it essentially every real function. Wiring the borrow to THIS answer
+would buy ~12% on one benchmark and nothing anywhere else.
+
+**So increment 2 is not optional polish, it is the whole feature:** make
+the analysis TRANSITIVE over the call graph (a fixpoint, as
+`build_reachable_reads` already does for the unbound-call prover - and
+for the same reason: mutual recursion makes the graph cyclic, so there is
+no traversal order). A call then propagates its callee's per-parameter
+escape bits instead of ending the analysis, and a builtin needs a small
+audited table of "does this store its argument" (`append`/`push`/`insert`
+do; `len`/`abs`/`str` do not) - which is exactly the kind of table
+CLAUDE.md's audit-table trap warns about, so it wants the assert-the-
+table-covers-its-input treatment.
+
+TWO HAZARDS THE CONSUMER STILL OWES, both found by reading the write path
+and both recorded on the pass itself:
+ 1. `try_flat_subscript_store` and `get_value_for_put` gate
+    `clone_aliased_slices` on `use_count() > 1`. A borrow does not bump
+    the count, so that guard would stop firing where it fires today - a
+    live slice of the argument would observe the write. RULE 2 violation.
+    The predicate has to move off `use_count` and onto "this array
+    actually has live slices" first, which is both more precise and makes
+    the write path independent of how many handles exist.
+ 2. An element write through a SLICE detaches it by ASSIGNING into the
+    handle, which would release a reference a borrowed slot never took -
+    a refcount underflow. Sliceness is a runtime property, so the bind
+    has to decide per call and record it (a borrow mask on the window
+    record, which `pop_window` then consults).
+
+THREE THINGS THE TEST CAUGHT, all on their first run, and the last two
+are the general lesson:
+ - the expected mask for `dst[0] = a` was written backwards by me: the
+   STORED value escapes, the destination does not;
+ - **the pass was stamped in the wrong PIPELINE STAGE.** It first ran in
+   `process_function`, beside its sibling `func_mutates_input` - but the
+   global-write rule reads `SymKind::global`, which pass 2 has not
+   stamped yet at that point, so `func f(a) { g = [9]; a[0] = 1; }` came
+   back marking `a` safe. It runs at the END of `resolve_names` now. That
+   is the audit-table stage trap in its usual shape, and here the failure
+   direction is a use-after-free;
+ - **a test case for "the param is passed to another function" was
+   VACUOUS**: the AST inliner spliced the callee into the caller, leaving
+   a body with no call and a genuinely non-escaping param. The case needs
+   a callee the inliner refuses (one that reassigns a scalar param).
+
+AND TWO OF THE THREE GUARDS ARE DEFENSIVE, NOT PROVEN - said plainly
+because the sabotage runs say so: deleting the CallExpr test or the
+`slot_writes` test leaves the whole table green, because the
+base-position rule clears those bits first. Only one row in the table
+fails when the CallExpr test is removed (the call that never mentions the
+param, added for exactly that reason); no row fails without the
+`slot_writes` test at all. Both stay - the failure direction is a
+use-after-free and the rules answer different questions - but nobody
+should believe they are pinned.
