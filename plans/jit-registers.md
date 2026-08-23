@@ -393,6 +393,34 @@ may live in a register. Two sub-cases, in order:
 T3 must NOT precede T1: it has the hardest soundness argument and the
 smallest measured traffic.
 
+### ⛔ THE CEILING IS MEASURED, AND IT IS REGIME-DEPENDENT (2026-08-15)
+
+The census asked for below was done, and it does NOT support building
+this on the shape it was planned around. `bench/micro/slotcost.cpp` runs
+03_int_arith's arithmetic in registers versus round-tripped through a
+frame slot at the real 48-byte stride plus the tag store:
+
+  - latency-bound loop (a serial chain through `acc`): **1.00x - FREE**
+  - throughput-bound loop (4 independent accumulators): **3.21x**
+
+and 03_int_arith - the shape with ELEVEN slot references per iteration -
+is the FIRST kind. Corroborated three ways: its D1 misses (~50,000) are
+identical to two other benches with wildly different reference counts,
+so the loops miss essentially never; it runs 63 instructions per
+iteration in 3.89 ns against a register-only C++ chain's 3.30 ns, so all
+the extra work costs 0.59 ns; and removing two of its eight stores
+measured -35.84% data references for 0.998x wall clock.
+
+**So the payoff is not "MyLang does 336x the data references". It is
+(fraction of hot loops that are THROUGHPUT-BOUND) x (up to 3.2x).** The
+discriminator is already in the bench table: a benchmark near the ~2.3x
+my/cpp floor is latency-bound and this buys nothing there; one far above
+it (76_funcval_dispatch at ~11x) is where the traffic is not hidden.
+
+**Rank the corpus by my/cpp and census the WORST benches, not the ones
+with the most slot references.** Those are different sets, and conflating
+them is why this plan pointed at 03_int_arith.
+
 ### What to build first, and the gate before building it
 
 1. **MEASURE THE CEILING.** For 03_int_arith and 08_func_call, count from

@@ -37,7 +37,9 @@ references. The wins in the table above all removed accesses that MISSED
 (48-byte elements, freshly allocated objects, refcount RMWs on cold
 lines) or sat on a chain something waited for. Before predicting a win,
 ask which of those two the removed access was - and if the honest answer
-is "neither, it was an L1 hit nobody reads", expect zero. The reason it was never applied: callgrind counts retired
+is "neither, it was an L1 hit nobody reads", expect zero.
+
+The reason it was never applied: callgrind counts retired
 instructions, a modern core is bound on memory traffic / dependency
 chains / mispredicts / front-end, and this box (WSL2) has **no PMU** - so
 the deterministic instrument measures the one quantity that does not
@@ -84,3 +86,51 @@ If the first is zero and the second is not, do not build it. #94 step 3
 removed 0 bytes and added ~40 per call site: knowable in advance, and it
 measured exactly the predicted nothing (`plans/archived/
 inline-borrow-arm.md`).
+
+## RUNG 4 IS MEASURED (2026-08-15) - and it splits into two regimes
+
+`bench/micro/slotcost.cpp` runs 03_int_arith's arithmetic three ways -
+values in registers, values round-tripped through a frame slot at
+MyLang's real 48-byte stride, and the same plus the `Type *` tag store
+MyLang also emits. Intel Core Ultra 9 285T, g++ -O2, 20M iterations:
+
+| loop shape | registers | + slot round-trip + tag | cost |
+|---|---|---|---|
+| latency-bound (serial `acc` chain) | 3.30 ns | 3.25 ns | **1.00x** |
+| throughput-bound (4 indep. accums) | 0.32 ns | 1.03 ns | **3.21x** |
+
+**A frame-slot round-trip is FREE in a loop whose own dependency chain is
+long enough to hide it, and costs 3.2x in one with real ILP.**
+
+Corroborated from the MyLang side, three ways:
+ - D1 MISSES are ~50,000 on 03_int_arith, 08_func_call AND
+   07_nested_loops - **identical**, though their data references are
+   14.5M / 6.5M / 5.4M. The count is fixed startup cost; the loops miss
+   essentially never. Miss rate 0.35% / 0.79% / 0.93%.
+ - 03_int_arith runs **63 instructions per iteration in ~3.89 ns**;
+   against the hand-written register-only C++ chain at 3.30 ns, MyLang's
+   extra ~45 instructions and 11 slot references cost **0.59 ns total**.
+ - which is why removing two of its eight stores per iteration (the
+   lever A per-site fix) measured **-35.84% data references and 0.998x
+   wall clock**.
+
+### What this means for the register allocator
+
+Its payoff is **not** "MyLang does 336x the data references of C++". It
+is `(fraction of hot loops that are THROUGHPUT-BOUND) x (up to 3.2x on
+those)`. On a latency-bound loop it is worth exactly nothing, and
+03_int_arith - the shape with the most slot traffic per iteration - is
+latency-bound.
+
+**The cheap discriminator is already in the bench table**: a benchmark
+whose my/cpp ratio is near the ~2.3x floor is latency-bound (MyLang's
+traffic hides in the same chain C++ pays), and one far above it -
+76_funcval_dispatch at ~11x - is where the traffic is NOT hidden. That
+is the same "the gap is not uniform" observation this file opens with,
+now with a mechanism behind it.
+
+**So: before building the allocator, rank the corpus by my/cpp and run
+this census on the WORST ones, not on the ones with the most slot
+references.** Those are different sets, and the whole reason the old
+plan pointed at 03_int_arith is that nobody had separated them.
+
