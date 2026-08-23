@@ -3584,31 +3584,28 @@ scope exit has this hole, so:
 
 Three shapes, three different reasons, all now recorded.
 
-### What is actually left
+### What is actually left  (REWRITTEN 2026-08-22 - the text that stood
+### here was the rcx-admission-era options list, superseded by (aj))
 
-The borrow must be tied to the emitted CONTROL FLOW, not to a C++
-scope - i.e. the pop belongs immediately after the last USE, on every
-path that reaches it, which is what `RefScratch::release()` does
-explicitly and what emit_op's callback form does structurally. Both
-work because their windows contain no branch.
+THE MANDATE IS DELIVERED. 13 of 16 registers (rbx/rsp/rbp reserved),
+native-stack spill homes (al), live-range reuse across seams (am) -
+"a register is REUSABLE by several variables in the same frame,
+evicted to reserved native-stack space" is mechanism, each piece
+watched failing. The tracker blind spot is closed (an), the
+two-address family covers arith + shifts (ao), and the placement
+cost model gates the seam tier.
 
-So the remaining options for this emitter, in order of appeal:
-
- 1. **Per-use windows, like emit_op's.** Convert the ~20 tmp/cpy uses
-    to the callback form (`tmp_lit(v, use)`), which places the pop
-    right after the consumer. Mechanical, and the pattern is already
-    proven in the sibling emitter.
- 2. **Give the emitter a single emitted exit** - a label every case
-    jumps to, with the pop there. Bigger surgery, but it makes the
-    whole family of "borrow across an op" problems go away.
- 3. **Leave rcx out of the pool.** 11 pins is the shipping budget and
-    it is fine; the measured marginal value of pins beyond the first
-    two was ZERO on every bench (see the MAXPINS sweep at (r)). The
-    honest question is whether a 12th pin is worth this at all - and
-    on the evidence so far it is not. **The value of the work was
-    never the pin; it was the four real bugs the conversions found.**
-
-⛔ Do NOT try a fourth guard shape without first deciding (3).
+What remains is the NEXT ARC, not this task's mandate - THE ORDER
+FROM HERE above stands: thread the ~1100 hardcoded emitter sites
+(census: RAX 588, RCX 161, RDX 103) through a capability-asking
+alloc_scratch(caps) so they ASK the model rather than assume, at
+which point backtracking/DP allocation has genuine choices to
+search. Two honest facts for whoever schedules it: the MAXPINS sweep
+measured near-ZERO marginal value for pins beyond the first two on
+every bench, so the justification is ARCHITECTURE (#101's peephole/
+scheduling pass, the full-native endgame), not a benchmark; and the
+value of every conversion so far was the bugs it surfaced, not the
+register it freed.
 
 ## (aj) 2026-08-20 - the admission FINISHED: both arenas green; what the
 ## off-arena tail taught
