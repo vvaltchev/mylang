@@ -698,3 +698,55 @@ SABOTAGE (all watched):
    gives InternalErrorEx (the C++ tier read an unwritten run);
  - named-local gate removed -> NOTHING fails (-rt and the corpus stay
    green). Recorded as defensive, not proven, in the code.
+
+
+## H6 / H7 / H8 LANDED (2026-08-13) - what each actually bought, and the
+## two things the plan above got wrong
+
+**H6 - the boxed inline tier's FLOAT arm (6c55f84).** The plan sized it
+off 78_typed_param_call; H4 has since typed that call result, so the
+motivation was stale. Measuring reach FIRST said `boxed_slow_f` is
+**ZERO across bench/my + samples** - and a two-line probe produced
+8,000,000. Real shape, absent corpus, so 79_dyn_float was added and the
+arm built: **0.20x wall** on it. Remaining siblings, sized by the new
+`boxed_slow_m` counter: the MIXED int/float arm, float `%`, eq/noteq,
+UnaryV.
+
+**H7 - the unpack (57cbdd7).** The plan asked for an emitted inline
+tier. Measuring first said the cost was not where a tier would attack
+it: of ~222 Ir/row, only ~44 was the refcount traffic the bind exists to
+do; the rest was a per-element call re-reading `skind()`/`offset()` and
+re-deriving the element vector. Hoisting the dispatch out of the loop -
+**no emitted code at all** - took 75_indexed_unpack to **0.83x wall,
+-19.4% Ir** (~165 Ir/row, the plan's 150-200 target). 73_multi_unpack
+-7.1% from the sibling fix. The emitted navigation tier is sized (~105
+Ir/row) and NOT built.
+
+**H8 inc 1 - the depth cap is the segment budget (ae6a5be).** The full
+H8 is ~28 emitted instructions per call; inc 1 removed the ~9 that need
+no fork (the `used` counter, the cap test, and the segs[] re-derivation
+on both sides). **10_recursion_deep -4.74% Ir / 0.93x wall**;
+09_fib_recursive and 08_func_call exactly 0.00%, because their calls do
+not reach the emitted push at all. It also closed a real hole: the
+depth cap - the catchable StackOverflowEx that the whole segmented slot
+stack exists to provide - **had no test anywhere**, and could not have
+one in `-rt` (the cap is a per-process static). Three driver checks
+cover it now.
+
+**INC 2 IS A FORK FOR THE MAINTAINER, NOT A QUEUED TASK.** Putting the
+window on the native stack removes the remaining ~13 instructions, and
+four things depend on the current shape: the G1 walker's
+`seg_top_before` chain (Nets 2 and 3 verify it field for field, so the
+ORACLE has to be re-derived BEFORE the change), StackOverflowEx's
+mechanism, helper visibility across callbacks, and slot construction.
+Full statement in docs/jit-optimizations.md's H8 entry.
+
+**AND A WRONG-CODE BUG FELL OUT OF H6 (d9f4d1c)**, unrelated to
+performance: `op_writes_pure_target` still listed `LogV`, which stopped
+being a single-producer op when #138 gave `&&`/`||` real short-circuit
+branches. `print(s > 5 && s < 6)` with a dyn `s` printed **`3`** under
+the VM and `false` in the tree-walker. Latent in 8 corpus programs
+(bytecode changed, output did not). The general lesson is in CLAUDE.md:
+when you change HOW a construct lowers, re-audit every table that
+classifies its OPCODE - the entry does not have to be edited to become
+false.
