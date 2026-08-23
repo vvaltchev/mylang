@@ -7035,3 +7035,78 @@ REX byte is emitted only when R/X/B needs it, which also makes the
 instruction a byte shorter when none does.
 **`cvtsi2sd_elem` deliberately KEEPS `w=true`**: there REX.W selects
 the 64-bit integer SOURCE, and clearing it would silently truncate.
+
+## #96 (c) THE REGISTER-STATE TRACKER, and the rcx admission it earned
+## (2026-08-20)
+
+**What it is.** An emit-time guardrail inside `Emitter` (`wrote()`,
+`trk_push`/`trk_pop`, `trk_read_pin`, `assert_no_borrow`,
+`op_boundary`, `PinMach`, `BorrowSuspend` - declared beside `RegAlloc`).
+Every encoder that writes a GP register reports it first - possible
+only because batches 3-6 made every encoder take its registers as
+ARGUMENTS - and the report is checked against the live register state:
+which registers hold pins, which are borrowed, whether emission is
+inside declared pin machinery, a call bracket, or the post-flush
+dead-pin window. A violation aborts DURING JIT COMPILATION with the
+register, vm pc and opcode named. It emits nothing, so the emitted
+bytes are identical with it on or off; it runs in every ASSERTS build.
+
+**Why it exists.** Every prior instrument was REMOTE from this failure
+class: the census reads the SOURCE, the admission survey reads
+DECLARATIONS (`scratch()` calls - a site that simply writes a register
+declares nothing), and the nets read the final ANSWER. The rcx
+admission produced four hand-root-caused bugs that way; the tracker
+then found the REAL list in one -rt run each:
+
+  - `emit_exc_stamp` staged packed Locs through rcx on the conveyance
+    arm - a thrown-and-caught exception flushed a SOURCE LOCATION as a
+    pinned slot's value (16_elem2_fused's wrong sums were line:col
+    pairs);
+  - `bump_divmagic` wrote movabs(1, ...) with RCX in a comment -
+    invisible to the census, the `= RCX` grep and the `movabs(RCX`
+    grep alike;
+  - `ForStepElemInt` built its ElemRead by hand - the FIFTH site,
+    missed when the other four moved to `elem_read_plan`;
+  - `PushHandler`/`PopHandler`/`SetPend`/`EndFinally` and emit_op's
+    tmp/cpy staging used rcx undeclared;
+  - the element divmod gate read the dividend via a hand-encoded
+    `mov rdx,[rcx+r9*8]` - both roles HARDCODED, so a real INT_MIN/-1
+    dividend was not declined and reached the raw idiv: a SIGFPE
+    where the language must throw;
+  - `StructFieldAddInt` staged through rcx after the epilogue reload;
+  - `op_elem_scratch_roles` still said "rcx/rdx are forced" - the
+    audit-table trap, caught by its consumer: the reservation
+    undercounted and the elem tier declined silently at full pressure.
+
+**The states, each learned from a false or missed abort:**
+  - a CALL BRACKET (prologue..reload): caller-saved pins are safe in
+    memory - their registers are free scratch. The bracket CLOSES at
+    the epilogue's reload, not at its end: the tag/flit
+    re-materialisations after it run with pins LIVE.
+  - a BORROW (push of a pinned register): the borrower owns it; pin
+    machinery touching it aborts; `read_slot` resolving to a borrowed
+    register the borrower overwrote aborts. Borrows are ORDERED (pops
+    must reverse pushes) and may not nest per register.
+  - POST-FLUSH: pin registers are dead until a reload; writes are
+    repurposing, and a later `read_slot` through a repurposed register
+    aborts. The state is PER-OP - a run may contain a terminal op
+    mid-sequence, and the next op is entered by jump with pins live.
+  - a RAISE ARM (`BorrowSuspend`): a divergent arm that leaves the op
+    restores open borrows ON THAT PATH (pops emitted, state preserved
+    for the fall-through); `exit_pc` refuses an unsuspended borrow.
+  - an IN-OP SLOW ARM entered from inside a window needs a
+    COMPENSATION stub (`pop_bytes` at its head) - two entry stack
+    shapes cannot share one patch point (see the fused int arm and
+    PushHandler's grow).
+
+**The admission.** rcx is pin 12 (XCACHE_ORDER gains 1, placed last;
+MYLANG_JIT_XROT sweeps EIGHT rotations). With it admitted: -rt
+1925/1925 in all five modes, corpus_diff 24/24 plain and at all eight
+rotations, objdump 164,996 instructions clean. WATCHED: reintroducing
+the un-borrowed exc stamp aborts by name in seconds, where it
+previously shipped as an unattributable wrong answer.
+
+**The tracker's stated blind spots:** raw `e.u8()` byte sequences
+(~20 remain, see plans/jit-registers.md (y)) bypass `wrote()`; jumps
+patched into arms emitted after a window closes are checked by the
+compensation-stub CONVENTION, not by the model.
