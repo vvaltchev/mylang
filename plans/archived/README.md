@@ -146,9 +146,19 @@ NO other file. They were lifted first, because a plan moving to
   `wip/81-flatten-handler-table`, measured +1.14% / +2.88% Ir at
   `OPT=1 ASSERTS=0`, and discarded. Fixed in this change, with the
   measurement preserved in the rejected record so the branch can go.
-- **Empty structs are accepted but documented as rejected.**
-  `struct Unit {}` compiles, constructs, prints and compares equal
-  today, while `structs.md` said it is "rejected at decl time",
-  CLAUDE.md lists it as deferred, README.md is silent, and there are no
-  tests. That is a language decision, so it is task #86 rather than a
-  fix made here.
+- **Empty structs were accepted but documented as rejected** —
+  `struct Unit {}` compiles, constructs, prints and compares equal,
+  while `structs.md` said "rejected at decl time", CLAUDE.md listed it
+  as deferred, README.md was silent and there were no tests.
+  **RESOLVED by the maintainer the same day: allow and document.**
+  README gained a *Structs* paragraph (the useful case is a
+  payload-less exception marker type), CLAUDE.md's deferral line was
+  corrected, `structs.md` carries an inline CORRECTION note, and seven
+  `struct:` tests now pin it across all five engine modes.
+  The audit's stride-0 worry turned out to be already handled — and
+  the reason is worth knowing: `compute_layout` returns EARLY for a
+  zero-field struct with `layout = boxed`, so such a struct is never
+  POD and its array is general. Sabotaging that (making it
+  `Layout::pod`, exactly as this plan's "size 0, trivially POD" line
+  suggested) is not a cosmetic difference but **undefined behaviour** —
+  UBSan reports a null pointer passed to the flat-struct copy.

@@ -1970,6 +1970,24 @@ allowed only on a `dyn`/`array`/`dict` field (a non-opt field is guaranteed
 never `none`). An uninitialised field-less use isn't possible — every field is
 supplied at construction (or defaulted to `none` when an omitted optional).
 
+**A struct may have no fields.** `struct Unit {}` is legal, and so is one
+that declares only `const` members (`struct Marker { const TAG = 7; }` —
+consts are type-level, so such a struct is still field-less). A field-less
+struct constructs with `Unit()`, prints as `Unit()`, compares equal to every
+other instance of its own type (there is no state to differ by), hashes
+equal, and works as a dict key. Its most useful form is a **payload-less
+exception type**, since `throw` takes a struct instance:
+
+```C#
+struct Timeout {}
+
+try {
+    throw Timeout();
+} catch (Timeout) {
+    print("timed out");
+}
+```
+
 **Access.** `obj.field` reads/writes a field; `obj.CONST` / `Type.CONST` reads a
 const member. `.` means *field access* on a struct and *key access* on a dict —
 resolved by the base's type. Reading a field that doesn't exist is a compile
@@ -1994,8 +2012,10 @@ POD structs, embedded inline) gets a compact native-C byte layout, and an
 `array` of it is stored **flat/unboxed** — contiguous bytes, no per-element
 object — just like `array<int>` (`array_storage(a)` reports `"struct"`). A
 struct with any `array`/`dict`/`str`/`dyn`/`opt` field is stored as a boxed
-slot array instead. This is transparent: it changes only memory layout and
-speed, never behavior.
+slot array instead, as is a **field-less** struct (it has `size 0`, so there
+are no bytes to lay out and an `array` of it is a general array, never
+zero-stride). This is transparent: it changes only memory layout and speed,
+never behavior.
 
 **Recursive structs must use a nullable field.** A *non-opt* struct field whose
 type contains its own struct (directly, `struct N { N next; }`, or through a

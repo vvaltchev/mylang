@@ -412,6 +412,17 @@ just one copy. The fast path removes the copy.
   a clear message), but cheap to allow later (size 0, trivially POD). **Keep
   this open** as a possibility; when structs land, this note graduates into
   `CLAUDE.md` next to the struct decl rules so it is not forgotten.
+  > **CORRECTION (2026-08-13).** This paragraph was never true of the
+  > shipped code, and the graduation into CLAUDE.md happened with the
+  > WRONG polarity. No rejection was ever written: the field loop is
+  > `while (!pAcceptOp(c, Op::braceR))`, so an empty body has always
+  > produced a zero-field descriptor, and empty structs have worked —
+  > untested and undocumented — since structs landed. Settled by the
+  > maintainer as **allow and document**; see README *Structs* and the
+  > `struct:` empty-struct tests. Note also "trivially POD" above is
+  > wrong in the other direction: `compute_layout` returns EARLY for a
+  > zero-field struct with `layout = boxed, size = 0`, which is what
+  > keeps the flat-struct path's stride from ever being 0.
 - **Methods**, struct **subtyping**, struct **dict keys / hashing** (v1: not
   hashable, `hash` throws). `==` is field-wise (boxed) / `memcmp` (POD) between
   same-type instances; different types → not equal. `print` shows
