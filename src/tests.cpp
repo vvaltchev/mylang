@@ -25540,6 +25540,33 @@ static bool jit_rax_pin_test()
           "print(f(runtime(40)));" }, false },
 
       /*
+       * #96 two-address shifts: the IN-PLACE literal form
+       * (`s = s >> 1` - the language has no >>=) emits `sar pin, 1`
+       * with no rax staging, so it JOINS the whitelist and a kernel
+       * containing it still pins rax. The same arena asymmetry as the
+       * base case (off-arena the budget is 12 and a 13-slot kernel
+       * cannot reach rax).
+       */
+      { "in-place literal shifts stay rax-free (two-address form)",
+        { "func f(int n) {",
+          "    var s0 = 1; var s1 = 2; var s2 = 3; var s3 = 4;",
+          "    var s4 = 5; var s5 = 6; var s6 = 7; var s7 = 8;",
+          "    var s8 = 9; var s9 = 10; var sa = 11; var sb = 12;",
+          "    for (var i = 0; i < n; i++) {",
+          "        s0 += i; s1 += s0; s2 += s1; s3 += s2;",
+          "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
+          "        s8 += s7; s9 += s8; sa += s9; sb += sa;",
+          "        s3 = s3 >> 1; s7 = s7 << 1; s7 = s7 >> 1;",
+          "    }",
+          "    s0 += s1; s0 += s2; s0 += s3; s0 += s4; s0 += s5;",
+          "    s0 += s6; s0 += s7; s0 += s8; s0 += s9; s0 += sa;",
+          "    s0 += sb;",
+          "    return s0;",
+          "}",
+          "print(f(runtime(40)));" },
+        ml_lowmem_fits_imm32(AllTypes[Type::t_int]) },
+
+      /*
        * SHAPE decline, the DISTINGUISHING form: an IMMEDIATE-count
        * shift adds NO slot, so all 13 pins fit and the coverage gate
        * is satisfied - only the shape gate knows IntShrRI stages its

@@ -7379,3 +7379,36 @@ attribution is not mechanism (the memory rule by that name), and a
 cost model must be anchored on a mechanism A/B (the MAXSPILL /
 MAXSHARE / FORCE levers exist precisely for that), never on a
 single bench's cur/base residue.
+
+## #96 TWO-ADDRESS SHIFTS + THE LAST rax WIDENING (2026-08-21)
+
+**What.** The in-place literal-count shift - `s >>= 1` / `s <<= 1`
+(and their spelled-out `s = s >> 1` twins, which lower identically) -
+on a PINNED destination emits the two-address form `sar/shl pin, imm8`
+with NO rax staging, exactly like the arithmetic two-address family.
+Selection: IntShlRI/IntShrRI with `target == a_slot`, a literal count,
+no forwarding pairing, dst pinned (`creg >= 0`). Semantics preserved
+in the emit itself: a count >= 64 saturates (`shl` -> `zero_reg32`,
+`sar` -> imm 63), a count of 0 emits nothing, and a negative literal
+count never reaches here (`imm_shift_ok` keeps the op interpreted).
+Counter: `g_jit_two_addr_reg` (shared with the arith family).
+
+**And the rax whitelist widened to match** (`run_may_pin_rax`): the
+in-place literal IntShlRI/IntShrRI form no longer stages through rax,
+so it JOINS the accumulator-shape whitelist and a 13-slot kernel
+containing such shifts still pins rax. The coverage gate lists the two
+opcodes in its pinned-target case. WATCHED both ways in
+`jit_rax_pin_test`: the admission case (arena-conditional want, since
+the off-arena budget is 12) and the DISTINGUISHING decline - an
+immediate-count shift that is NOT in-place still stages `sar rax, imm`
+in every form, and with the shape gate disabled that case aborts
+("write to a PINNED register") while the budget arithmetic saves the
+variable-count case.
+
+**Measured (RULE B1, OPT=1 ASSERTS=0, interleaved --baseline):**
+cur/base geomean 1.007x over 85 benches on a box the calibration
+marker flagged ~45% slow - i.e. flat within the machine's noise; the
+regs family reads 0.98-1.04x. The win is shape, not a headline: probe
+kernels drop the `mov rax, slot; sar rax, imm; mov slot, rax` triple
+to one instruction (611 two-address emits in the probe, `sar r14, 1`
+in the dump), and rax stays pinnable in shift-bearing kernels.
