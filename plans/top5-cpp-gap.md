@@ -89,11 +89,24 @@ refcount churn per element.
   full suite): **11_closure_counter 0.55x** (18.6x -> 9.08x my/cpp),
   78 0.80x, 63 0.90x; suite geomean cur/base 0.986x, my/cpp **2.424x**.
   The ORIGINAL H1b sketch below is superseded.
-- **H2 - FUNC-VALUE ELEMENT CALL (76).** The `ops[i%2]` boxed
-  materialization (~200 Ir) borrows instead: an elem-read callee
-  feeding CallValueV can be guarded + called off a borrowed
-  `const EvalValue &` (the local `ops` holds the array across the
-  call), LoadElem2-style. Projected: 76 −20-25%.
+- **H2 - FUNC-VALUE ELEMENT READ: DONE (2026-08-12), and the
+  PROJECTION WAS WRONG.** The borrow idea in the original sketch is
+  UNSOUND and was dropped on inspection: unlike LoadElem2's row (used
+  and discarded inside one instruction), the callee must stay alive
+  ACROSS the call, and the callee can mutate `ops` - so the retain is
+  load-bearing, not waste. What shipped instead: the read lowers to
+  LoadElemValue (universal over storage kinds now) rather than the
+  generic SubscriptV, deleting a helper frame, a Type virtual and the
+  LValue back-pointer work that jit_subscript RValue()s away. Measured
+  **-12.2% Ir on 76 (836 -> 734 per iteration) with the WALL CLOCK
+  FLAT** (1.01x; the suite's byte-identical benches swing 0.89-1.13x in
+  the same run). The removed work is cheap predicted L1 work that
+  retires alongside the memory-bound call protocol - the documented
+  instruction-vs-time divergence. Two audit-table gaps were fixed on
+  the way (LoadElemValue was a liveness BARRIER and un-retargetable).
+  **76's remaining 734 Ir/iteration is the CALL PROTOCOL and the two
+  arg copies - not the element read**, so the next move on 76 is H4
+  (the window/accounting residue), not another read tier.
 - **H3 - SINGLE-MOVE UNPACK (75).** arr_elem_at straight into the
   dst slot with one retain, no boxed temp round-trip. Projected:
   75 −25-35%.
