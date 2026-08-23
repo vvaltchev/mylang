@@ -852,6 +852,10 @@ extern unsigned long g_jit_op_run[];
  * prove the inline path ran, not just the slow helper. */
 extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
 extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
+/* the constant-divisor STRENGTH REDUCTION: bumped by the EMITTED
+ * multiply-shift sequence, so a test can prove idiv was replaced (the
+ * VALUES are identical either way, so nothing else can tell). */
+extern "C" unsigned long g_jit_divmagic;
 extern "C" unsigned long g_jit_boxed_fastf; /* H6: inline float-float ones */
 /* H6 REACH: the boxed ops that DECLINED to the exact-helper path, and how
  * many of those were float-float. The difference is the residue no inline

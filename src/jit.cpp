@@ -49,6 +49,7 @@
 extern "C" {
 unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
 unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
+unsigned long g_jit_divmagic = 0;      /* const-divisor div/mod reduced */
 unsigned long g_jit_boxed_fastf = 0;   /* H6: inline float-float ones */
 unsigned long g_jit_boxed_slow = 0;    /* H6 reach: helper-path declines */
 unsigned long g_jit_boxed_slow_f = 0;  /* H6 reach: ... of them float-float */
@@ -1102,6 +1103,18 @@ struct Emitter {
     void farith(uint8_t op, uint8_t dst = 0, uint8_t src = 1)
     { u8(0xF2); u8(0x0F); u8(op);
       u8(static_cast<uint8_t>(0xC0 | (dst << 3) | src)); }
+#ifdef TESTS
+    /* the strength reduction's execution proof - bumped by the EMITTED
+     * sequence, since the VALUES are identical to idiv's and nothing
+     * else can tell the two apart */
+    void bump_divmagic()
+    {
+        movabs(1 /*RCX*/, reinterpret_cast<uint64_t>(&g_jit_divmagic));
+        u8(0x48); u8(0xFF); u8(0x01);
+    }
+#else
+    void bump_divmagic() { }
+#endif
     /* movq rax, xmm<src> - the div0 bit test's read (C4b: any source). */
     void movq_rax_x(uint8_t src)
     {
@@ -1501,6 +1514,129 @@ static void emit_cond_jump(Emitter &e, Op cc, size_t target_pc,
     emit_cond_jump_raw(e, cc_for(cc).near_op,
                        cc_for(cc_negate(cc)).short_op,
                        target_pc, begin, end, remap, fixups);
+}
+
+/*
+ * STRENGTH REDUCTION for `n / d` and `n % d` with a CONSTANT divisor.
+ *
+ * WHY: a 64-bit `idiv` is ONE instruction but ~26-40 CYCLES, and it is
+ * not pipelined. 06_if_branch runs `i % 3` twice per iteration and costs
+ * only 33 instructions - yet it is 8.8x the C++, because those two idivs
+ * serialize ~60 cycles into a body g++ finishes in ~10. g++ never emits
+ * idiv for a constant divisor: it multiplies by a precomputed reciprocal
+ * and shifts. This is the one place in the JIT where the INSTRUCTION
+ * COUNT is healthy and the CLOCK is not - the reverse of the divergence
+ * the guard-elision family documents.
+ *
+ * THE IDENTITY, for a positive divisor d >= 2. Pick a shift s and set
+ *
+ *     M = floor(2^(64+s) / d) + 1        so   e := M*d - 2^(64+s)
+ *
+ * lies in [1, d]. Then M*n / 2^(64+s) overshoots n/d by e*n/(d*2^(64+s)),
+ * which is under one ulp of the quotient for every |n| <= 2^63 as soon as
+ *
+ *     e * 2^63 < 2^(64+s)     i.e.     e < 2^(s+1)
+ *
+ * so the smallest s satisfying that gives an M for which
+ * floor(M*n / 2^(64+s)) is the FLOOR quotient. MyLang (like C) truncates
+ * TOWARD ZERO, so a negative dividend needs +1 - that is the `shr 63;
+ * add` tail. The bound above is deliberately the CONSERVATIVE one
+ * (|n| <= 2^63 on BOTH sides, rather than the tighter per-sign bounds a
+ * compiler uses): it costs one extra shift step for some divisors and
+ * makes ONE condition cover the whole int64 range, including INT64_MIN.
+ *
+ * M may reach or exceed 2^63, and the correction for that is the one
+ * subtlety in the whole sequence: `imul` is a SIGNED multiply, so a
+ * reciprocal with its top bit set is read as M - 2^64 and the high half
+ * comes out n too low. Adding the dividend back (`add rdx, rcx`) repairs
+ * it, and the SAME repair covers a 65-bit M (where the missing 2^64
+ * contributes exactly n as well) - so the low 64 bits are stored in both
+ * cases and `needs_add` is simply `M >= 2^63`.
+ * TESTING THE WRONG BOUND HERE IS SILENT: with `needs_add` gated on
+ * "M did not fit in 64 bits" instead, every divisor whose reciprocal
+ * lands in [2^63, 2^64) - which includes 3 - produced garbage quotients
+ * (3/3 == 0, 7/3 == -1) while the remainders stayed right, because the
+ * mod path recomputes. The engine differential caught it on the first
+ * run; nothing else would have.
+ *
+ * A NEGATIVE divisor is handled by negating the quotient: |d| drives the
+ * derivation. d == 0 and d == -1 never reach here (the caller raises for
+ * the first and pre-checks INT64_MIN for the second), and |d| < 2 has
+ * nothing to reduce.
+ */
+struct DivMagic {
+    uint64_t M;          /* the reciprocal, as a 64-bit pattern */
+    unsigned sh;         /* the post-multiply arithmetic shift */
+    bool needs_add;      /* M did not fit in 64 bits: add n back */
+    bool negate;         /* the divisor was negative */
+};
+
+static bool div_magic(int_type d, DivMagic &out)
+{
+    if (d == 0 || d == 1 || d == -1)
+        return false;
+    const bool neg = d < 0;
+    /* |d| via unsigned, so INT64_MIN does not overflow */
+    const uint64_t ad = neg ? (~static_cast<uint64_t>(d) + 1u)
+                            : static_cast<uint64_t>(d);
+    if (ad < 2)
+        return false;
+    typedef unsigned __int128 u128;
+    for (unsigned s = 0; s < 64; s++) {
+        const u128 p = static_cast<u128>(1) << (64 + s);
+        const u128 M = p / ad + 1;
+        const u128 e = M * ad - p;                 /* in [1, ad] */
+        if (e < (static_cast<u128>(1) << (s + 1))) {
+            out.M = static_cast<uint64_t>(M);      /* low 64 bits */
+            out.sh = s;
+            out.needs_add = (M >> 63) != 0;        /* imul is SIGNED */
+            out.negate = neg;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Emit the reduced division. On entry rax = the dividend and rcx is
+ * FREE (the caller loaded the literal divisor there and no longer needs
+ * it). On exit the result is in rax, for `div` and for `mod` alike.
+ */
+static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
+                           bool want_mod)
+{
+    e.mov_rr(RCX, RAX);                              /* rcx = n (kept) */
+    e.movabs(RDX, m.M);
+    e.u8(0x48); e.u8(0xF7); e.u8(0xEA);              /* imul rdx (signed,
+                                                      * rdx:rax = n*M) */
+    if (m.needs_add) {
+        e.u8(0x48); e.u8(0x01); e.u8(0xCA);          /* add rdx, rcx */
+    }
+    if (m.sh) {
+        e.u8(0x48); e.u8(0xC1); e.u8(0xFA);          /* sar rdx, imm8 */
+        e.u8(static_cast<uint8_t>(m.sh));
+    }
+    /* truncate toward zero: += 1 when the quotient came out negative */
+    e.mov_rr(RAX, RDX);
+    e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(63);    /* shr rax, 63 */
+    e.u8(0x48); e.u8(0x01); e.u8(0xC2);              /* add rdx, rax */
+    if (m.negate) {
+        e.u8(0x48); e.u8(0xF7); e.u8(0xDA);          /* neg rdx */
+    }
+    if (!want_mod) {
+        e.mov_rr(RAX, RDX);                          /* rax = quotient */
+        return;
+    }
+    /* n % d == n - (n/d)*d */
+    if (d >= INT32_MIN && d <= INT32_MAX) {
+        e.u8(0x48); e.u8(0x69); e.u8(0xC2);          /* imul rax,rdx,imm32 */
+        e.u32(static_cast<uint32_t>(static_cast<int32_t>(d)));
+    } else {
+        e.movabs(RAX, static_cast<uint64_t>(d));
+        e.u8(0x48); e.u8(0x0F); e.u8(0xAF); e.u8(0xC2);  /* imul rax, rdx */
+    }
+    e.u8(0x48); e.u8(0x29); e.u8(0xC1);              /* sub rcx, rax */
+    e.mov_rr(RAX, RCX);                              /* rax = remainder */
 }
 
 /* Float ORDERING compare via ucomisd (N3). Jump-to-target when
@@ -5200,6 +5336,7 @@ void jit_stats_report()
         { "native_returns",   &g_jit_native_returns },
         /* which TIER the boxed (dyn) arithmetic took */
         { "boxed_fast",       &g_jit_boxed_fast },
+        { "divmagic",         &g_jit_divmagic },
         { "boxed_fastf",      &g_jit_boxed_fastf },
         { "boxed_slow",       &g_jit_boxed_slow },
         { "boxed_slow_f",     &g_jit_boxed_slow_f },
@@ -8160,7 +8297,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     raise_convey_unless(e, ck, 0x75 /* jne */, JR_DIV_OVF,
                                         pc, old_pc);
                 }
-                /* any other literal: nothing can fault */
+                /* any other literal: nothing can fault - and it is
+                 * exactly here that the STRENGTH REDUCTION applies, the
+                 * divisor being a compile-time constant. rcx holds the
+                 * literal and is dead from this point, so the sequence
+                 * uses it as its scratch. */
+                DivMagic mg;
+                if (div_magic(in.b_lit(), mg)) {
+                    emit_div_magic(e, mg, in.b_lit(),
+                                   in.aop == Op::mod);
+                    e.bump_divmagic();
+                    write_slot(e, ck, RAX, in.target, pc);
+                    return true;
+                }
             } else {
                 e.u8(0x48); e.u8(0x8D); e.u8(0x51); e.u8(0x01);
                                                      /* lea rdx,[rcx+1] */
@@ -8222,7 +8371,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::IntModRI: {
+        /* THE SPECIALIZED SIBLING of IntBin's div/mod, and the one that
+         * actually matters: specialize_arith_ops rewrites `i % 3` into
+         * THIS opcode, so a reduction wired only into IntBin reaches
+         * every corpus program EXCEPT the ones that motivated it
+         * (06_if_branch kept both its idivs - watched). */
         read_slot(e, RAX, in.a_slot());
+        DivMagic mg;
+        if (div_magic(in.b_lit(), mg)) {
+            emit_div_magic(e, mg, in.b_lit(), /*want_mod=*/true);
+            e.bump_divmagic();
+            write_slot(e, ck, RAX, in.target, pc);
+            return true;
+        }
         e.movabs(RCX, static_cast<uint64_t>(in.b_lit()));
         e.u8(0x48); e.u8(0x99);                          /* cqo */
         e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
@@ -8234,8 +8395,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         read_slot(e, RAX, in.a_slot());
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
         op_rr(e, Op::plus);
-        e.movabs(RCX, static_cast<uint64_t>(
-                          static_cast<int_type>(in.target2)));
+        {
+            const int_type dv = static_cast<int_type>(in.target2);
+            DivMagic mg;
+            if (div_magic(dv, mg)) {
+                emit_div_magic(e, mg, dv, /*want_mod=*/true);
+                e.bump_divmagic();
+                write_slot(e, ck, RAX, in.target, pc);
+                return true;
+            }
+            e.movabs(RCX, static_cast<uint64_t>(dv));
+        }
         e.u8(0x48); e.u8(0x99);                          /* cqo */
         e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
         write_slot(e, ck, RDX, in.target, pc);

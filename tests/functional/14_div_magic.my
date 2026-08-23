@@ -1,0 +1,32 @@
+# The constant-divisor STRENGTH REDUCTION (div/mod by a literal): the JIT
+# replaces cqo+idiv with a reciprocal multiply and shifts. The VALUES are
+# supposed to be identical, so this program is only meaningful run through
+# corpus_diff, which compares it against the tree-walker - which computes
+# with C++ `/` and `%`.
+#
+# Every divisor shape the derivation distinguishes: powers of two, small
+# odd, large (a 31-bit prime), and NEGATIVE ones; every dividend sign,
+# both INT64 extremes, and the values around each divisor's boundary.
+# The reciprocal's top bit decides whether the sequence needs the
+# add-back correction, and getting that bound wrong is SILENT - it broke
+# 3/3 and 7/3 while leaving every remainder right.
+var acc = 0;
+var ns = [0,1,2,3,4,7,8,9,15,16,17,99,100,101,255,256,1023,1024,123456789,1000000006,2147483647,(0 - 1),(0 - 2),(0 - 3),(0 - 4),(0 - 7),(0 - 8),(0 - 9),(0 - 15),(0 - 16),(0 - 17),(0 - 99),(0 - 100),(0 - 101),(0 - 255),(0 - 256),(0 - 123456789),(0 - 2147483647),9223372036854775807,(0 - 9223372036854775807)];
+foreach (var n in ns) acc = acc + (n / 2) * 31 + (n % 2) * 17;
+foreach (var n in ns) acc = acc + (n / 3) * 31 + (n % 3) * 17;
+foreach (var n in ns) acc = acc + (n / 4) * 31 + (n % 4) * 17;
+foreach (var n in ns) acc = acc + (n / 5) * 31 + (n % 5) * 17;
+foreach (var n in ns) acc = acc + (n / 7) * 31 + (n % 7) * 17;
+foreach (var n in ns) acc = acc + (n / 8) * 31 + (n % 8) * 17;
+foreach (var n in ns) acc = acc + (n / 10) * 31 + (n % 10) * 17;
+foreach (var n in ns) acc = acc + (n / 16) * 31 + (n % 16) * 17;
+foreach (var n in ns) acc = acc + (n / 100) * 31 + (n % 100) * 17;
+foreach (var n in ns) acc = acc + (n / 1000) * 31 + (n % 1000) * 17;
+foreach (var n in ns) acc = acc + (n / 65536) * 31 + (n % 65536) * 17;
+foreach (var n in ns) acc = acc + (n / 1000000007) * 31 + (n % 1000000007) * 17;
+foreach (var n in ns) acc = acc + (n / (0 - 2)) * 31 + (n % (0 - 2)) * 17;
+foreach (var n in ns) acc = acc + (n / (0 - 3)) * 31 + (n % (0 - 3)) * 17;
+foreach (var n in ns) acc = acc + (n / (0 - 7)) * 31 + (n % (0 - 7)) * 17;
+foreach (var n in ns) acc = acc + (n / (0 - 16)) * 31 + (n % (0 - 16)) * 17;
+foreach (var n in ns) acc = acc + (n / (0 - 1000)) * 31 + (n % (0 - 1000)) * 17;
+print("div-magic acc:", acc);
