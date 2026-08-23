@@ -112,5 +112,77 @@ else
     fail "-nr -s: the optimized tree is missing"
 fi
 
+# ---------------------------------------------------------------------
+# THE DEPTH CAP (MYLANG_VM_STACK) - untested until 2026-08-13, though the
+# whole point of the segmented slot stack is that a runaway recursion
+# throws a CATCHABLE StackOverflowEx where the old per-call C-stack model
+# SEGFAULTED. It can only be tested from here: the cap is read ONCE per
+# process into a static, so an in-process `-rt` entry cannot set it.
+: > "$TMP/so.my"
+cat > "$TMP/so.my" <<'EOF'
+func down(int n) {
+    if (n <= 0)
+        return 0;
+    var r = down(n - 1);
+    return r + 1;
+}
+var caught = 0;
+try {
+    var d = down(runtime(100000));
+    print("NO THROW", d);
+} catch (StackOverflowEx) {
+    caught = 1;
+}
+print("caught:", caught);
+EOF
+out=$(MYLANG_VM_STACK=4000 "$BIN" "$TMP/so.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 0 ] && printf '%s' "$out" | grep -q '^caught: 1'; then
+    pass "depth cap: deep recursion throws a CATCHABLE StackOverflowEx"
+else
+    fail "depth cap: wanted a caught StackOverflowEx, got rc=$got_rc [$out]"
+fi
+
+# ... and the cap must be the only thing stopping it: the SAME program at
+# a depth that fits must run to completion. A cap change that throws too
+# EARLY is the dangerous direction (it refuses a working program), and
+# nothing else in the tree would notice.
+: > "$TMP/ok.my"
+cat > "$TMP/ok.my" <<'EOF'
+func down(int n) {
+    if (n <= 0)
+        return 0;
+    var r = down(n - 1);
+    return r + 1;
+}
+print("depth:", down(runtime(300)));
+EOF
+out=$(MYLANG_VM_STACK=4000 "$BIN" "$TMP/ok.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 0 ] && printf '%s' "$out" | grep -q '^depth: 300'; then
+    pass "depth cap: a recursion that FITS still completes"
+else
+    fail "depth cap: the fitting program failed rc=$got_rc [$out]"
+fi
+
+# An UNCAUGHT overflow must still be a clean, located error - not a crash.
+: > "$TMP/sou.my"
+cat > "$TMP/sou.my" <<'EOF'
+func down(int n) {
+    if (n <= 0)
+        return 0;
+    var r = down(n - 1);
+    return r + 1;
+}
+print("d:", down(runtime(100000)));
+EOF
+out=$(MYLANG_VM_STACK=4000 "$BIN" "$TMP/sou.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 1 ] && printf '%s' "$out" | grep -q 'StackOverflowEx'; then
+    pass "depth cap: an UNCAUGHT overflow is a located error, not a crash"
+else
+    fail "depth cap: uncaught overflow rc=$got_rc [$out]"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc

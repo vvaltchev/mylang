@@ -4143,3 +4143,101 @@ it to ~105 Ir/row. Inlining the STRING bind as well means emitting
 refcount code (retain, release, the cold free branch), which is the
 highest-risk category in this codebase for the ~42 it would not even
 remove; the navigation half is the part worth doing.
+
+## H8 inc 1 (2026-08-13): the depth cap IS the segment budget, so the
+## live-slot counter is gone - and the depth cap gets its FIRST test
+
+H8 in plans/top5-cpp-gap.md is "kill the seg-top/used accounting +
+restore (~30-40 Ir/call)" by putting the frame window on the native
+stack, and it is marked a big design step. Counting the emitted call
+protocol confirms the size: **~28 instructions per call** across push and
+pop - the cap test (4), the cur_seg -> segs[] -> seg* derivation (4 in
+push, 3 in pop), the fit test (5), the window computation (4), the
+seg->top update (2), and `used +=` / `used -=` (3). Inc 1 removes the
+two that need NO fork.
+
+**THE CAP TEST AND `used` ARE REDUNDANT.** `used` was a second running
+total maintained beside every segment's own `top`, purely so
+`push_window` could test `used + n > cap`. But a frame can only exceed
+the cap by needing a SEGMENT the budget cannot pay for - within a
+segment, the fit test `top + n <= cap_slots` already bounds it. So the
+cap becomes a BUDGET (`VmActivation::room`) spent when a segment is
+CREATED, and the fit test IS the cap test.
+
+EXACT, not approximate, which is a RULE 1 requirement and not a detail:
+a new segment is sized `min(max(n, SEG_SLOTS), room)`, so the LAST
+segment is exactly the remaining budget and the total ever allocated is
+exactly the cap - a program overflows at the same depth it did before.
+The successor-reuse test was relaxed from "at least SEG_SLOTS" to "fits
+this frame", because otherwise a deep/shallow/deep program would insert
+and CHARGE for a fresh segment on every pass and exhaust the budget for
+a depth it had already reached.
+
+**THE ACTIVATION HOLDS ITS SEGMENT** (`cur_sg`) instead of re-deriving
+`segs[cur_seg]` from a sign-extended index and an indexed load, in
+EMITTED code, twice per call. `cur_seg` stays - it is what the records
+store and what the parent-view restore reads - and an `ML_VM_CHECK`
+pins the two together at every push and pop.
+
+MEASURED (callgrind Ir, `OPT=1 ASSERTS=0` both sides, steady-state per
+scale unit), and the ZEROES are the interesting part:
+ - **10_recursion_deep -4.74% Ir, 0.93x wall**;
+ - 09_fib_recursive and 08_func_call **exactly +0.00%** - not noise,
+   byte-identical. MYLANG_JITSTATS says why, and it is the "prove the
+   code ran" rule paying off: 10 makes **1,352,549** emitted pushes, 09
+   makes **10,687** (the per-frame pure cache dedups the recursion), and
+   08 makes **ZERO** (its callee is inlined away). The change is
+   unreachable in two of the three benches that look like call
+   benchmarks.
+ - suite geomean cur/base **0.999x**, my/python 11.75x.
+
+THE HARDENED-RELEASE LANE CAUGHT THE ONE BUG, AND ONLY IT. `cur_sg` has
+to be restored on pop exactly as `cur_seg` is, and the EMITTED pop
+restored only the index - so a pop that walked BACK a segment left the
+pointer on the dead frame's. `-rt` under ASan, corpus_diff, the levers
+matrix, clang and all four nets were GREEN; `TESTS=1 OPT=1
+VM_HARDENING=1` aborted on the M5a deep-recursion test, because that is
+the only configuration whose depth reaches a real segment ADVANCE (the
+sanitizer lanes cap the native stack far below it). The fix is a
+`parent_sg` field beside `parent_seg`, captured at the same instant, so
+the two cannot disagree - plus an `ML_VM_CHECK` at every pop that says
+so. Note the cost lands ONLY on record-ful calls: the steady-state Ir
+for 10_recursion_deep is byte-identical before and after the fix,
+because every one of its 1.35M calls takes the no-record tier and skips
+the record fill entirely.
+
+**THE DEPTH CAP HAD NO TEST AT ALL** before this - the catchable
+StackOverflowEx is the whole point of the segmented slot stack ("a
+clean, located error where the old per-call C-stack model segfaulted")
+and nothing exercised it. It cannot be tested from `-rt`: the cap is
+read ONCE per process into a static, so only a spawned binary can set
+`MYLANG_VM_STACK`. Three checks in `tests/driver_checks.sh` now cover
+it - a deep recursion caught by `catch (StackOverflowEx)`, an UNCAUGHT
+one rendering as a located error rather than a crash, and (the
+dangerous direction) a recursion that FITS still completing, since a
+cap that fires too EARLY refuses a working program and nothing else in
+the tree would notice.
+
+WHAT INC 2 WOULD BE - the fork the maintainer has to settle, NOT
+something to start unilaterally. The residue is the fit test (5), the
+window computation (4), the seg->top pair (2) and the pop restore (2):
+~13 instructions that only disappear if the window IS a stack pointer.
+Four things depend on the current shape, and all four are load-bearing:
+ 1. **the G1 walker's reconstruction premise.** Net 2 and Net 3 verify
+    the CUMULATIVE chain `seg_top_before + nslots == the frame above's
+    seg_top_before`, field for field. A bump-pointer window has no
+    per-frame watermark to chain, so the oracle would have to be
+    re-derived before the change, not after.
+ 2. **StackOverflowEx** would move from a budget test to a guard
+    page/limit compare - and RULE 1 says the outcome stays a thrown,
+    located, CATCHABLE exception, never a signal.
+ 3. **helper visibility**: C++ builtins hold frame `LValue *` ACROSS
+    user-code callbacks (sort's arg0 over its comparator, map/filter's
+    container). A window's address must stay valid for its whole
+    lifetime - which a bump pointer on a NON-relocating stack does
+    satisfy, but it has to be argued, not assumed.
+ 4. **slot construction**: segment slots are constructed ONCE and reused
+    window-over-window. A stack window must reset its slots to `none`
+    somewhere; today the POP does it, so this is a move rather than a
+    new cost - but it is the reason the segmented design exists and it
+    has to be re-measured, not waved through.

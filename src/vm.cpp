@@ -1667,6 +1667,12 @@ struct VmCallRec {
     LValue *parent_window = nullptr;
     int32_t parent_nslots = 0;
     int32_t parent_seg = -1;
+    /* H8 inc 1: the parent's SEGMENT, beside its index. cur_sg has to be
+     * restored on pop exactly as cur_seg is, and the emitted pop cannot
+     * afford to re-derive segs[parent_seg] - that indexed load is what
+     * this increment removed. Captured at the same moment parent_seg is,
+     * so the two can never disagree (ML_VM_CHECKed at every pop). */
+    VmStackSeg *parent_sg = nullptr;
 };
 
 /*
@@ -1747,10 +1753,31 @@ struct VmActivation {
         return pends[rec.pend_base + static_cast<uint32_t>(region)];
     }
     Frame view_frame;                 /* the loop's window into the stack */
-    int_type used = 0;                /* live slots, for the depth cap */
-    int_type cap;                     /* MYLANG_VM_STACK (slots) */
+    /*
+     * H8 inc 1: THE DEPTH CAP IS THE SEGMENT BUDGET, so there is no live-
+     * slot counter. `used` was a second running total maintained beside
+     * every segment's own `top` - one add per push, one sub per pop, plus
+     * a compare against `cap` - and the emitted call protocol carried all
+     * three. It is redundant: a frame can only exceed the cap by needing
+     * a segment that `room` cannot pay for, and WITHIN a segment the fit
+     * test (top + n <= cap_slots) already bounds it.
+     *
+     * EXACT, not approximate: a new segment is sized min(max(n,
+     * SEG_SLOTS), room), so the last one is exactly the remaining budget
+     * and the total ever allocated is exactly the cap. `room` is spent
+     * only when a segment is CREATED - walking back into an already
+     * allocated successor after a pop does not re-charge it, which is
+     * what keeps a deep-recurse/return/deep-recurse program from
+     * exhausting the budget on the second pass.
+     */
+    int_type room;                    /* MYLANG_VM_STACK, minus allocated */
+    /* The current segment, held DIRECTLY. push and pop both used to
+     * re-derive it from (cur_seg, segs._M_start) - a load, a sign-extend
+     * and an indexed load each, in EMITTED code. cur_seg stays: it is the
+     * index the records store and the parent-view restore needs. */
+    VmStackSeg *cur_sg = nullptr;
 
-    VmActivation() : cap(stack_cap()) { records.reserve(32); }
+    VmActivation() : room(stack_cap()) { records.reserve(32); }
 
     /* The configurable depth cap (slots). One env read per process. */
     static int_type stack_cap()
@@ -1774,9 +1801,6 @@ struct VmActivation {
     ML_ALWAYS_INLINE Frame *push_window(int_type n, const Chunk *ck,
                                         bool boundary)
     {
-        if (used + n > cap)
-            throw StackOverflowEx();
-
         /* 4-v: capture the PARENT view BEFORE the segment logic below can
          * advance cur_seg - the view frame + cur_seg still describe the
          * caller here (a record-less caller included: the vframe is
@@ -1786,8 +1810,10 @@ struct VmActivation {
         LValue *const par_win = view_frame.slots;
         const int32_t par_nslots = static_cast<int32_t>(view_frame.size);
         const int32_t par_seg = static_cast<int32_t>(cur_seg);
+        VmStackSeg *const par_sg = cur_sg;
 
-        VmStackSeg *sg = cur_seg >= 0 ? segs[cur_seg].get() : nullptr;
+        VmStackSeg *sg = cur_sg;
+        ML_VM_CHECK(!sg || sg == segs[cur_seg].get());
         /* the emitted push's fit test compares against cap_slots instead of
          * re-deriving the vector's extent - keep the two provably equal */
         ML_VM_CHECK(!sg || sg->cap_slots
@@ -1807,17 +1833,30 @@ struct VmActivation {
             /* Advance to (or create) a segment with room. Reuse an already-
              * allocated successor when its capacity fits (the common pop/
              * push cycle at a segment edge); else append a fresh one. */
-            const size_t need = static_cast<size_t>(
-                n > SEG_SLOTS ? n : SEG_SLOTS);
+            const int_type want = n > SEG_SLOTS ? n : SEG_SLOTS;
+            /* An already-allocated successor is REUSED whenever the frame
+             * fits it - the test used to demand a full SEG_SLOTS, which
+             * would now insert (and CHARGE `room` for) a fresh segment on
+             * a deep/shallow/deep program until the budget ran out. */
             if (cur_seg + 1 < static_cast<int>(segs.size())
-                    && segs[cur_seg + 1]->slots.size() >= need) {
-                cur_seg++;
+                    && segs[cur_seg + 1]->slots.size()
+                           >= static_cast<size_t>(n)) {
+                cur_seg++;                /* already paid for */
             } else {
+                /* THE CAP: a fresh segment is capped by the remaining
+                 * budget, so the last one is exactly `room` and a frame
+                 * the budget cannot pay for is the overflow. */
+                const int_type give = want < room ? want : room;
+                if (give < n)
+                    throw StackOverflowEx();
                 segs.insert(segs.begin() + (cur_seg + 1),
-                            std::make_unique<VmStackSeg>(need));
+                            std::make_unique<VmStackSeg>(
+                                static_cast<size_t>(give)));
+                room -= give;
                 cur_seg++;
             }
             sg = segs[cur_seg].get();
+            cur_sg = sg;
             ML_CHECK(sg->top == 0);
         }
 
@@ -1836,6 +1875,7 @@ struct VmActivation {
         rec.parent_window = par_win;          /* 4-v: the parent view */
         rec.parent_nslots = par_nslots;
         rec.parent_seg = par_seg;
+        rec.parent_sg = par_sg;
         rec.boundary = boundary;
         rec.sync_stop = 0;               /* a REUSED record must not carry a
                                           * stale lean-sync stop mark */
@@ -1877,7 +1917,7 @@ struct VmActivation {
             pends.resize(pends_n);
         }
         sg->top += n;
-        used += n;
+
         /* Stash the CALLER's pure cache; the callee's frame starts with
          * none (per-frame scoping - see VmCallRec::caller_cache). */
         if (view_frame.pure_cache)
@@ -1964,8 +2004,8 @@ struct VmActivation {
             ML_VM_CHECK(dyiters_n == rec.dyiter_base);
         }
 
-        segs[rec.seg]->top = rec.seg_top_before;
-        used -= rec.nslots;
+        ML_VM_CHECK(cur_sg == segs[rec.seg].get());
+        cur_sg->top = rec.seg_top_before;
 
         /* The popped frame's cache dies HERE (per-frame scoping); the
          * caller's stashed cache comes back into the view. */
@@ -1992,10 +2032,21 @@ struct VmActivation {
             view_frame.point_at(rec.parent_window,
                                 static_cast<int>(rec.parent_nslots));
             cur_seg = rec.parent_seg;
+            cur_sg = rec.parent_sg;
         } else {
             top_rec = nullptr;
             cur_seg = rec.seg;
+            cur_sg = cur_seg >= 0 ? segs[cur_seg].get() : nullptr;
         }
+        /* cur_sg tracks cur_seg (it IS segs[cur_seg]); a pop that walks
+         * back a segment must move BOTH, or the next push allocates from
+         * the dead frame's segment. The EMITTED pop restores them from
+         * the record's parent pair for the same reason - forgetting the
+         * pointer half is what the rel-hard lane's M5a deep-recursion
+         * test caught, and only that lane: it needs a real segment
+         * ADVANCE, which no sanitizer-lane depth reaches. */
+        ML_VM_CHECK(cur_sg == (cur_seg >= 0 ? segs[cur_seg].get()
+                                            : nullptr));
     }
 };
 
@@ -5885,8 +5936,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
             if (lv.get().get_type()->t >= Type::t_str)
                 lv = LValue();
         }
-        act.used -= total;
-        act.segs[static_cast<size_t>(act.cur_seg)]->top -= total;
+        act.cur_sg->top -= total;
         const char *fp = static_cast<const char *>(frag_rbp);
         ctx.captures =
             *reinterpret_cast<CaptureSlots *const *>(fp + 16);
@@ -7016,8 +7066,7 @@ extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
         if (lv.get().get_type()->t >= Type::t_str)
             lv = LValue();
     }
-    act.segs[static_cast<size_t>(act.cur_seg)]->top -= total;
-    act.used -= total;
+    act.cur_sg->top -= total;
     ctx.captures = *reinterpret_cast<CaptureSlots *const *>(
         static_cast<const char *>(rbp) + 16);
     if (dst_addr)
@@ -7280,8 +7329,7 @@ jit_norec_postexit(size_t r, int_type site_packed, LValue *caller_win,
         if (lv.get().get_type()->t >= Type::t_str)
             lv = LValue();
     }
-    act.used -= total;
-    act.segs[static_cast<size_t>(act.cur_seg)]->top -= total;
+    act.cur_sg->top -= total;
     ctx.captures = static_cast<CaptureSlots *>(
         const_cast<void *>(g_jit_residue_caps));
     act.view_frame.point_at(
@@ -7612,6 +7660,7 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
             nr.parent_nslots = static_cast<int32_t>(
                 S->caller->slot_count + S->caller->n_temps);
             nr.parent_seg = static_cast<int32_t>(act.cur_seg);
+            nr.parent_sg = act.cur_sg;
             act.records.insert(
                 act.records.begin() + static_cast<ptrdiff_t>(idx),
                 std::move(nr));
@@ -8365,8 +8414,7 @@ void jit_fill_push_layout(JitPushLayout *L)
     L->act_recs_high = reinterpret_cast<const char *>(&a.recs_high) - ab;
     L->act_diters_n = reinterpret_cast<const char *>(&a.diters_n) - ab;
     L->act_dyiters_n = reinterpret_cast<const char *>(&a.dyiters_n) - ab;
-    L->act_used = reinterpret_cast<const char *>(&a.used) - ab;
-    L->act_cap = reinterpret_cast<const char *>(&a.cap) - ab;
+    L->act_cur_sg = reinterpret_cast<const char *>(&a.cur_sg) - ab;
     L->act_top_rec = reinterpret_cast<const char *>(&a.top_rec) - ab;
     L->act_vframe = reinterpret_cast<const char *>(&a.view_frame) - ab;
     L->act_handlers2 = reinterpret_cast<const char *>(&a.handlers) - ab;
@@ -8415,6 +8463,8 @@ void jit_fill_push_layout(JitPushLayout *L)
         reinterpret_cast<const char *>(&r.parent_nslots) - rb;
     L->rec_parent_seg =
         reinterpret_cast<const char *>(&r.parent_seg) - rb;
+    L->rec_parent_sg =
+        reinterpret_cast<const char *>(&r.parent_sg) - rb;
     static FuncDescriptor fd;         /* static: fo.func may outlive scope */
     const char *db = reinterpret_cast<const char *>(&fd);
     L->desc_params = reinterpret_cast<const char *>(&fd.params) - db;
@@ -8489,7 +8539,7 @@ bool g_norec_audit = false;
  * verify chain INTEGRITY - that each frame's site resolves and its
  * anchor matches the link. They say nothing about the ARITHMETIC the
  * record-less unwind performs: the production path
- * (vm_raise's `norec_raiser` arm) un-accounts `act.used` and the
+ * (vm_raise's `norec_raiser` arm) un-accounts the segment top and the
  * segment top by the frame's own totals and repoints the view at the
  * parent using values it derives from hardware. A frame whose
  * `seg_top_before` disagrees with that derivation unwinds to a WRONG

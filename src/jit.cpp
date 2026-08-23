@@ -2748,9 +2748,6 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.u32(static_cast<uint32_t>(d));
         e.u8(imm);
     };
-    const auto add_m_r = [&](uint8_t b, int32_t d, uint8_t r) {
-        modrm(0x01, r, b, d, true);           /* add [b+d], r */
-    };
     const auto inc_q = [&](uint8_t b, int32_t d) {
         e.u8(static_cast<uint8_t>(0x48 | (b >= 8 ? 1 : 0)));
         e.u8(0xFF);                           /* inc qword [b+d] */
@@ -3149,24 +3146,22 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     ld32sx(RSI, RAX, static_cast<int32_t>(P.desc_frame_size));
     ld32sx(R10, RCX, static_cast<int32_t>(P.ck_n_temps));
     e.u8(0x4C); e.u8(0x01); e.u8(0xD6);               /* add rsi, r10 */
-    /* stack-cap overflow: used + total > cap -> slow */
-    ld(R10, R8R, static_cast<int32_t>(P.act_used));
-    e.u8(0x49); e.u8(0x01); e.u8(0xF2);               /* add r10, rsi */
-    modrm(0x3B, R10, R8R, static_cast<int32_t>(P.act_cap), true);
-                                                      /* cmp r10,[act+cap] */
-    j_slow.push_back(e.j32(0x7F));                    /* jg slow */
+    /* H8 inc 1: NO stack-cap test here. The cap is the SEGMENT BUDGET
+     * (see VmActivation::room), so the fit test below is the cap test -
+     * a frame can only exceed it by needing a segment the budget cannot
+     * pay for, which is the slow path. This deleted a load, an add, a
+     * compare and a branch from every emitted call. */
     /* record REUSE available: rec_n != recs_high (else the cold grow) */
     ld(R10, R8R, static_cast<int32_t>(L.act_rec_n));
     ld32(R11, R8R, static_cast<int32_t>(P.act_recs_high));
     e.u8(0x4D); e.u8(0x39); e.u8(0xDA);               /* cmp r10, r11 */
     j_slow.push_back(e.j32(0x74));                    /* je slow */
-    /* segment + fit: (top + total) * 48 <= slots byte length */
-    ld32sx(R10, R8R, static_cast<int32_t>(P.act_cur_seg));
+    /* segment + fit. H8 inc 1: the activation HOLDS the current segment,
+     * so this is one load where it used to be a sign-extended index, a
+     * load of segs._M_start and an indexed load. */
+    ld(R10, R8R, static_cast<int32_t>(P.act_cur_sg));  /* r10 = seg* */
     e.u8(0x4D); e.u8(0x85); e.u8(0xD2);               /* test r10, r10 */
-    j_slow.push_back(e.j32(0x78));                    /* js slow */
-    ld(R11, R8R, static_cast<int32_t>(P.act_segs));   /* segs._M_start */
-    /* mov r10, [r11 + r10*8] */
-    e.u8(0x4F); e.u8(0x8B); e.u8(0x14); e.u8(0xD3);   /* r10 = seg* */
+    j_slow.push_back(e.j32(0x74));                    /* jz slow (no seg) */
     ld(R11, R10, static_cast<int32_t>(P.seg_top));    /* r11 = top */
     /* segment fit, in SLOT units: top + total <= seg->cap_slots. This used to
      * compare BYTE extents - imul the sum by 48, then rebuild the vector's
@@ -3193,7 +3188,6 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     /* seg->top = top + total; used += total (top itself stays in r11) */
     e.u8(0x49); e.u8(0x8D); e.u8(0x04); e.u8(0x33);   /* lea rax,[r11+rsi] */
     st(R10, static_cast<int32_t>(P.seg_top), RAX);
-    add_m_r(R8R, static_cast<int32_t>(P.act_used), RSI);
     /*
      * 4-v THE FORK (the DEFAULT since inc 5): a gate-passing call skips
      * the ENTIRE record - no acquire, no fill, no rec_n++/top_rec - and
@@ -3271,6 +3265,10 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      * for function and MAIN callers). */
     st32(R10, static_cast<int32_t>(P.rec_parent_seg), RAX);
     st(R10, static_cast<int32_t>(P.rec_parent_window), RBX);
+    /* H8 inc 1: the parent SEGMENT beside its index - an inline push
+     * never advances, so cur_sg still names the caller's segment here */
+    ld(RAX, R8R, static_cast<int32_t>(P.act_cur_sg));
+    st(R10, static_cast<int32_t>(P.rec_parent_sg), RAX);
     ld32(RAX, R8R, static_cast<int32_t>(P.act_vframe + P.frame_size));
     st32(R10, static_cast<int32_t>(P.rec_parent_nslots), RAX);
     st(R10, static_cast<int32_t>(P.rec_run_chunk), RCX);
@@ -4280,18 +4278,14 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         ld(R9R, RAX, 0);
         ld(RDX, R10, static_cast<int32_t>(P.rec_caller_caps));
         st(R9R, static_cast<int32_t>(L.ctx_captures), RDX);
-        /* segs[rec.seg]->top = rec.seg_top_before */
-        modrm(0x63, RAX, R10, static_cast<int32_t>(P.rec_seg), true);
-                                                   /* movsxd rax, [seg] */
-        ld(RCX, R8R, static_cast<int32_t>(P.act_segs));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x0C); e.u8(0xC1);
-                                                   /* mov rcx, [rcx+rax*8] */
+        /* cur_sg->top = rec.seg_top_before. H8 inc 1: the popping frame
+         * IS the current one, so its segment is cur_sg - no rec.seg
+         * sign-extend, no segs[] index - and there is no `used` to
+         * un-account. */
+        ld(RCX, R8R, static_cast<int32_t>(P.act_cur_sg));
         ld(RDX, R10, static_cast<int32_t>(P.rec_seg_top_before));
         st(RCX, static_cast<int32_t>(P.seg_top), RDX);
-        /* used -= nslots; rec_n-- */
-        ld(RDX, R10, static_cast<int32_t>(P.rec_nslots));
-        modrm(0x29, RDX, R8R, static_cast<int32_t>(P.act_used), true);
-                                                   /* sub [act+used], rdx */
+        /* rec_n-- */
         e.u8(0x49); e.u8(0xFF); e.u8(0x88);        /* dec qword [r8+rec_n] */
         e.u32(static_cast<uint32_t>(L.act_rec_n));
         /* top_rec steps to the record below; the view/cur_seg come from
@@ -4307,6 +4301,10 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         st32(R8R, static_cast<int32_t>(P.act_vframe + P.frame_size), RAX);
         ld32(RAX, R10, static_cast<int32_t>(P.rec_parent_seg));
         st32(R8R, static_cast<int32_t>(P.act_cur_seg), RAX);
+        /* ... and the pointer half, or a pop that walks back a segment
+         * leaves cur_sg on the dead frame's (H8 inc 1) */
+        ld(RAX, R10, static_cast<int32_t>(P.rec_parent_sg));
+        st(R8R, static_cast<int32_t>(P.act_cur_sg), RAX);
 #ifdef TESTS
         e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_ret_inline));
         e.u8(0x48); e.u8(0xFF); e.u8(0x00);        /* inc qword [rax] */
@@ -4487,16 +4485,9 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             ld(RAX, 5, 16);
             st(RCX, static_cast<int32_t>(L.ctx_captures), RAX);
             /* seg->top -= total; used -= total (baked) */
-            modrm(0x63, RAX, R8R, static_cast<int32_t>(P.act_cur_seg),
-                  true);                           /* movsxd rax,[curseg] */
-            ld(RCX, R8R, static_cast<int32_t>(P.act_segs));
-            e.u8(0x48); e.u8(0x8B); e.u8(0x0C); e.u8(0xC1);
-                                                   /* mov rcx,[rcx+rax*8] */
+            ld(RCX, R8R, static_cast<int32_t>(P.act_cur_sg));
             e.u8(0x48); e.u8(0x81); e.u8(0xA9);    /* sub qword [rcx+d],i */
             e.u32(static_cast<uint32_t>(P.seg_top));
-            e.u32(static_cast<uint32_t>(my_total));
-            e.u8(0x49); e.u8(0x81); e.u8(0xA8);    /* sub qword [r8+d],i */
-            e.u32(static_cast<uint32_t>(P.act_used));
             e.u32(static_cast<uint32_t>(my_total));
 #ifdef TESTS
             e.movabs(RAX,

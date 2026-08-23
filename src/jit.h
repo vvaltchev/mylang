@@ -228,7 +228,7 @@ void jit_native_stack_init();
 struct JitPushLayout {
     /* VmActivation */
     ptrdiff_t act_segs, act_cur_seg, act_recs_high, act_diters_n,
-              act_dyiters_n, act_used, act_cap, act_top_rec, act_vframe,
+              act_dyiters_n, act_cur_sg, act_top_rec, act_vframe,
               act_handlers2;
     /* Frame (the view) */
     ptrdiff_t frame_slots, frame_size, frame_pure_cache;
@@ -242,7 +242,8 @@ struct JitPushLayout {
               rec_dyiter_base, rec_boundary, rec_sync_stop,
               rec_cache_key, rec_caller_cache, rec_norec_site,
               rec_native_rbp,
-              rec_parent_window, rec_parent_nslots, rec_parent_seg;
+              rec_parent_window, rec_parent_nslots, rec_parent_seg,
+              rec_parent_sg;
     /* FuncDescriptor */
     /* desc_bind_req: FuncDescriptor::bind_req (vector; data at +0) - the
      * per-parameter required Type singleton, read only when !fast_bind */
