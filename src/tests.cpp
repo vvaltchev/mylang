@@ -1358,7 +1358,8 @@ static const std::vector<test> tests =
     },
 
     {
-        /* APPROACH A - container-store helper ops (plans/archived/native-aot.md): a
+        /* APPROACH A - container-store helper ops
+         * (plans/archived/native-aot.md): a
          * flat-array element STORE `a[i] = v` / `a[i] OP= v` inside a JIT run
          * no longer splits the run - the fragment CALLS jit_store_elem_int /
          * jit_store_elem_float (the interpreter's exact store, COW included),
@@ -1439,7 +1440,8 @@ static const std::vector<test> tests =
     },
 
     {
-        /* NATIVE AOT N5 (plans/archived/native-aot.md) - register-caching soundness.
+        /* NATIVE AOT N5 (plans/archived/native-aot.md) - register-caching
+         * soundness.
          * The fragment-local cache pins a hot int slot in r10/r11, loading
          * it ONCE at entry and flushing type+payload at EVERY exit. That is
          * sound ONLY for a RESOLVED LOCAL: a TEMP (>= slot_count) is scratch
@@ -2233,7 +2235,8 @@ static const std::vector<test> tests =
     },
     {
         /*
-         * THE NESTED-READ FUSION (LoadElem2Int/Float, plans/archived/unboxing.md
+         * THE NESTED-READ FUSION (LoadElem2Int/Float,
+         * plans/archived/unboxing.md
          * option A). The fused op fires when the OUTER index is not loop-
          * invariant - `m[j][i]` with `j` the inner counter - because LICM
          * hoists `m[i][j]`'s row out of the loop before codegen sees it.
@@ -26942,7 +26945,8 @@ static bool arg_inplace_shapes()
 #endif
 }
 
-/* model-flip M3 (plans/archived/model-flip.md): a straight-line boxed LEAF compiles to a
+/* model-flip M3 (plans/archived/model-flip.md): a straight-line boxed LEAF
+ * compiles to a
  * native CONTAINER - one EnterNative drives the body, the boxed ISLAND is a
  * `call jit_exec_block`, the ReturnV is native. PROVE it ran (g_jit_container_
  * calls bumps, the "prove the code ran" rule) with a correct result, AND that a

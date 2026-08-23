@@ -1000,7 +1000,8 @@ pc_lookup=0` - the pc lookup WOULD have named the wrong body. Pinned in
 jit_final_batch_deletable (engines' backtraces equal, the frame is `snd`
 and never `fst`, and the `g_jit_inline_baked` counter must bump, so the
 test cannot pass by luck or on an unexercised path). `fib$0` is now 9
-instructions. NOTE the earlier scoping (in plans/archived/model-flip.md) predicted
+instructions. NOTE the earlier scoping (in
+plans/archived/model-flip.md) predicted
 a SECOND mechanism for the call case - a stub-pc `inline_ctxs` entry or a
 field on the call record - and this paragraph used to record it as
 UNNECESSARY, reasoning that the emitted call site's own exc-stamp runs
@@ -1895,7 +1896,8 @@ the JIT was silently bailing across the suite - `08_func_call` **0.49x**,
 `07_nested_loops` **0.58x**, `40_math_builtins` **0.72x** (my/py 5.6x ->
 **7.7x**), `49_autoconst_fold`/`51_purefunc_fold` ~0.7x, broad -3-7%; no
 regressions. This is the model for the whole JIT (approach A, see
-plans/archived/native-aot.md): call the SAME C++ the interpreter calls (arrays/dicts/
+plans/archived/native-aot.md): call the SAME C++ the interpreter calls
+(arrays/dicts/
 exceptions) from native, prove handling at COMPILE time, and DELETE the
 interpreted original - no double copy, no runtime re-interpret. **Landed on
 that model:** **`jit_raise`** - an OOB / negative-shift fragment stores a
