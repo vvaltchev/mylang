@@ -234,9 +234,9 @@ struct JitPushLayout {
     ptrdiff_t frame_slots, frame_size, frame_pure_cache;
     /* VmStackSeg (seg_cap: the PRECOMPUTED slot capacity - the emitted fit
      * test used to rebuild it from the vector's two pointers and an imul) */
-    ptrdiff_t seg_slots, seg_top, seg_cap;
+    ptrdiff_t seg_slots, seg_cur, seg_end;
     /* VmCallRec */
-    ptrdiff_t rec_window, rec_nslots, rec_seg, rec_seg_top_before,
+    ptrdiff_t rec_window, rec_nslots, rec_seg, 
               rec_run_chunk, rec_ret_chunk, rec_ret_pc, rec_dst, rec_desc,
               rec_caller_caps, rec_handler_base, rec_diter_base,
               rec_dyiter_base, rec_boundary, rec_sync_stop,

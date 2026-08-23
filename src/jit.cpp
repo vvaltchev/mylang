@@ -3162,32 +3162,30 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     ld(R10, R8R, static_cast<int32_t>(P.act_cur_sg));  /* r10 = seg* */
     e.u8(0x4D); e.u8(0x85); e.u8(0xD2);               /* test r10, r10 */
     j_slow.push_back(e.j32(0x74));                    /* jz slow (no seg) */
-    ld(R11, R10, static_cast<int32_t>(P.seg_top));    /* r11 = top */
-    /* segment fit, in SLOT units: top + total <= seg->cap_slots. This used to
-     * compare BYTE extents - imul the sum by 48, then rebuild the vector's
-     * length from its two pointers - which needed rcx spilled as a second
-     * scratch. cap_slots is a constant of the segment (see VmStackSeg), so
-     * the whole thing is one compare; rax is still spilled because every
-     * register is live here, and `pop` leaves the flags alone. */
-    e.push_reg(RAX);
-    e.u8(0x49); e.u8(0x8D); e.u8(0x04); e.u8(0x33);   /* lea rax,[r11+rsi] */
-    modrm(0x3B, RAX, R10, static_cast<int32_t>(P.seg_cap), true);
-                                                      /* cmp rax,[seg+cap] */
-    e.pop_reg(RAX);
-    j_slow.push_back(e.j32(0x7F));                    /* jg slow */
+    /*
+     * THE FIT TEST, ON POINTERS. The watermark is `seg->cur` (an LValue*)
+     * and the limit `seg->end`, so this computes the NEW watermark once,
+     * in r11, and keeps it for the mutation below - where the old index
+     * form had to spill rax to build a slot-unit sum, then rebuild the
+     * window from `slots.data() + top * 48` with a separate imul. Every
+     * register but r11 is live, and the 3-operand imul needs none of
+     * r11's old value, so nothing is spilled at all.
+     */
+    e.u8(0x4C); e.u8(0x6B); e.u8(0xDE); e.u8(48);     /* imul r11,rsi,48 */
+    modrm(0x03, R11, R10, static_cast<int32_t>(P.seg_cur), true);
+                                                      /* add r11,[seg+cur] */
+    modrm(0x3B, R11, R10, static_cast<int32_t>(P.seg_end), true);
+                                                      /* cmp r11,[seg+end] */
+    j_slow.push_back(e.j32(0x77));                    /* ja slow (unsigned:
+                                                       * these are addresses) */
 
     /* -------------- MUTATIONS (control reaches the call) --------------- */
     e.push_reg(RDX);                                  /* fo   [rsp+8] */
     e.push_reg(RAX);                                  /* desc [rsp]   */
-    /* window rdx = seg->slots.data() + top*48 (r11 = top KEPT - it is
-     * seg_top_before, stored into the record below) */
-    ld(RDX, R10, static_cast<int32_t>(P.seg_slots));
-    e.u8(0x4C); e.u8(0x89); e.u8(0xD8);               /* mov rax, r11 */
-    imul_imm(RAX, 48);
-    e.u8(0x48); e.u8(0x01); e.u8(0xC2);               /* add rdx, rax */
-    /* seg->top = top + total; used += total (top itself stays in r11) */
-    e.u8(0x49); e.u8(0x8D); e.u8(0x04); e.u8(0x33);   /* lea rax,[r11+rsi] */
-    st(R10, static_cast<int32_t>(P.seg_top), RAX);
+    /* the window IS the old watermark - one load, no multiply - and the
+     * new one is already computed in r11 */
+    ld(RDX, R10, static_cast<int32_t>(P.seg_cur));    /* rdx = the window */
+    st(R10, static_cast<int32_t>(P.seg_cur), R11);    /* seg->cur += bytes */
     /*
      * 4-v THE FORK (the DEFAULT since inc 5): a gate-passing call skips
      * the ENTIRE record - no acquire, no fill, no rec_n++/top_rec - and
@@ -3253,7 +3251,6 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     /* the record fill */
     st(R10, static_cast<int32_t>(P.rec_window), RDX);
     st(R10, static_cast<int32_t>(P.rec_nslots), RSI);
-    st(R10, static_cast<int32_t>(P.rec_seg_top_before), R11);
     ld32(RAX, R8R, static_cast<int32_t>(P.act_cur_seg));
     st32(R10, static_cast<int32_t>(P.rec_seg), RAX);
     /* 4-v: the PARENT view, captured at push time (the pop's vframe
@@ -4278,13 +4275,13 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         ld(R9R, RAX, 0);
         ld(RDX, R10, static_cast<int32_t>(P.rec_caller_caps));
         st(R9R, static_cast<int32_t>(L.ctx_captures), RDX);
-        /* cur_sg->top = rec.seg_top_before. H8 inc 1: the popping frame
-         * IS the current one, so its segment is cur_sg - no rec.seg
-         * sign-extend, no segs[] index - and there is no `used` to
-         * un-account. */
+        /* cur_sg->cur = rec.window - the popping frame IS the current
+         * one, so its segment is cur_sg (no rec.seg sign-extend, no
+         * segs[] index), and the watermark to restore is the window the
+         * record already holds (no saved index). */
         ld(RCX, R8R, static_cast<int32_t>(P.act_cur_sg));
-        ld(RDX, R10, static_cast<int32_t>(P.rec_seg_top_before));
-        st(RCX, static_cast<int32_t>(P.seg_top), RDX);
+        ld(RDX, R10, static_cast<int32_t>(P.rec_window));
+        st(RCX, static_cast<int32_t>(P.seg_cur), RDX);
         /* rec_n-- */
         e.u8(0x49); e.u8(0xFF); e.u8(0x88);        /* dec qword [r8+rec_n] */
         e.u32(static_cast<uint32_t>(L.act_rec_n));
@@ -4487,8 +4484,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             /* seg->top -= total; used -= total (baked) */
             ld(RCX, R8R, static_cast<int32_t>(P.act_cur_sg));
             e.u8(0x48); e.u8(0x81); e.u8(0xA9);    /* sub qword [rcx+d],i */
-            e.u32(static_cast<uint32_t>(P.seg_top));
-            e.u32(static_cast<uint32_t>(my_total));
+            e.u32(static_cast<uint32_t>(P.seg_cur));
+            e.u32(static_cast<uint32_t>(my_total * 48));   /* BYTES now */
 #ifdef TESTS
             e.movabs(RAX,
                      reinterpret_cast<uint64_t>(&g_jit_norec_ret_arm));
