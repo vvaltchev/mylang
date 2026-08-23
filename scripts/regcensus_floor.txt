@@ -14,5 +14,11 @@ R8      0
 R9      0
 R10     0
 R11     0
-TOTAL   0
+# Phase C baseline (2026-08-22): the xmm mandate's starting work list.
+# X0/X1 - the per-op float scratch pair - is the float side's rax:
+# every site converts to alloc_fscratch(caps) or earns a tag, and
+# these numbers only go DOWN.
+XMM0   61
+XMM1   28
+TOTAL  89
 RAWENC  15

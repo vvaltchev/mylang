@@ -128,10 +128,17 @@ import os
 # 87 to 23 while changing nothing, because a bare `9` is as invisible
 # as the wrapper name was. jit.cpp now names them; this counts both.
 REGS = ['RAX', 'RCX', 'RDX', 'RSI', 'RDI', 'R8', 'R9', 'R10', 'R11',
-        'R8R', 'R9R']
-REPORT = ['RAX', 'RCX', 'RDX', 'RSI', 'RDI', 'R8', 'R9', 'R10', 'R11']
+        'R8R', 'R9R',
+        # Phase C (the xmm mandate): the per-op float scratch pair.
+        # X0/X1 are the named operand tokens (enum XReg); xmm4-7 (the
+        # C2a pins) are handed out by the model and never hardcoded by
+        # name, and a bare numeric xmm argument is the same blind spot
+        # a bare GP number is - the table stays a lower bound.
+        'X0', 'X1']
+REPORT = ['RAX', 'RCX', 'RDX', 'RSI', 'RDI', 'R8', 'R9', 'R10', 'R11',
+          'XMM0', 'XMM1']
 # report R8/R8R (and R9/R9R, R10/R11) as one register each
-MERGE = {'R8R': 'R8', 'R9R': 'R9'}
+MERGE = {'R8R': 'R8', 'R9R': 'R9', 'X0': 'XMM0', 'X1': 'XMM1'}
 
 # The register a NAME TOKEN refers to. Sub-registers and the SysV
 # argument-position spellings map to their 64-bit parent, because a
@@ -144,6 +151,11 @@ TOKEN_REG = {
     'rdi': 'RDI', 'edi': 'RDI', 'dil': 'RDI', 'arg0': 'RDI',
     'r8': 'R8R', 'r8d': 'R8R', 'r8b': 'R8R',
     'r9': 'R9R', 'r9d': 'R9R', 'r9b': 'R9R',
+    # Phase C: an accessor whose NAME encodes an xmm register
+    # (farith_x1_x0, pxor_x1) is the sixth audit-table shape on the
+    # float side - derived exactly like the GP wrappers.
+    'x0': 'X0', 'xmm0': 'X0',
+    'x1': 'X1', 'xmm1': 'X1',
 }
 
 METHOD_DECL = re.compile(
@@ -301,7 +313,7 @@ def census(path):
                            r'\bhold\s*\(')
     in_reg_enum = False
     for i, l in enumerate(lines):
-        if 'enum Reg' in l:
+        if 'enum Reg' in l or 'enum XReg' in l:
             in_reg_enum = True
         if in_reg_enum:
             # the enum's own member list, INCLUDING continuation lines
