@@ -18937,6 +18937,103 @@ static bool jit_norec_shadow()
 }
 
 /*
+ * THE THREE CASES NET 3's DEPTH BOUND DOES NOT COVER.
+ *
+ * plans/archived/g1-no-record-tier.md enumerates them explicitly,
+ * precisely because the enumeration cannot produce them - they are
+ * reached by DEPTH, not by shape:
+ *   - a call exactly at a SEG_SLOTS segment boundary,
+ *   - recursion deep enough to GROW the native stack,
+ *   - a reconstruction spanning both.
+ *
+ * The slot stack is segmented at SEG_SLOTS = 16 * 1024. An emitted push
+ * DECLINES across a boundary (its fit test sends the call to C++), so a
+ * boundary is exactly where record-ful and record-less frames
+ * interleave, and where seg_top_before / parent_seg arithmetic has to
+ * be right. 12000 levels crosses TWO boundaries; the throw at the
+ * bottom, caught at the top, makes the unwind span them.
+ *
+ * WHY THIS IS AN extra_check AND NOT A `tests` ENTRY: the differential
+ * reruns every `tests` entry in the TREE-WALKER, which recurses on the
+ * C stack and overflows at this depth (documented; ASan frames are
+ * huge). Capping the depth to suit it would drop below the boundary
+ * this exists to cross. A segment boundary is a slot-stack concept the
+ * tree-walker does not have, so the meaningful comparison is across the
+ * VM configurations - which this runs itself.
+ *
+ * The g_vm_seg_advance assertion is the load-bearing half: without it a
+ * future frame-layout change could quietly stop crossing the boundary
+ * and leave a merely-deep test that proves nothing.
+ */
+static bool norec_segment_boundary()
+{
+#if ML_JIT_SUPPORTED
+    auto run = [](bool jit) -> long {
+        const std::vector<const char *> lines = {
+            "struct Deep { int at; }",
+            "func ev(int n) {",
+            "  if (n == 0) { throw Deep(5); }",
+            "  if (n < 0) { return 0; }",
+            "  var r = od(n - 1); return r + 1; }",
+            "func od(int n) {",
+            "  if (n == 0) { throw Deep(5); }",
+            "  if (n < 0) { return 0; }",
+            "  var r = ev(n - 1); return r + 1; }",
+            "var got = 0;",
+            "try { var z = ev(runtime(12000)); got = z; }",
+            "catch (Deep as e) { got = e.at; }",
+            "assert(got == 5);" };
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved_e = g_exec_engine;
+        const bool saved_j = g_jit_enabled;
+        g_exec_engine = ExecEngine::Vm;
+        g_jit_enabled = jit;
+        const unsigned long a0 = g_vm_seg_advance;
+        long ok = 1;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = -1;
+        }
+        g_exec_engine = saved_e;
+        g_jit_enabled = saved_j;
+        return ok < 0 ? -1
+                      : static_cast<long>(g_vm_seg_advance - a0);
+    };
+    for (const bool jit : { false, true }) {
+        const long crossed = run(jit);
+        if (crossed < 0) {
+            fprintf(stderr, "norec_segment_boundary: the program FAILED "
+                            "(jit=%d)\n", (int)jit);
+            return false;
+        }
+        /* PROVE the boundary was crossed - a deep run that stayed inside
+         * one segment would exercise none of what this is for */
+        if (crossed < 1) {
+            fprintf(stderr, "norec_segment_boundary: crossed %ld segment "
+                            "boundaries (jit=%d) - the depth no longer "
+                            "reaches SEG_SLOTS\n", crossed, (int)jit);
+            return false;
+        }
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * NET 2 - THE DETERMINISTIC EVENT SWEEP, in-suite seed.
  *
  * The full sweep is tests/norec_sweep.py, which walks N over a
@@ -29932,6 +30029,8 @@ static const std::vector<extra_check> extra_checks =
       jit_norec_shadow },
     { "jit: norec: forced reconstruction at a chosen call event (Net 2)",
       jit_norec_recon_sweep },
+    { "jit: norec: a segment boundary crossed, and unwound across",
+      norec_segment_boundary },
     { "jit: the monomorphic callee cache hits (and a polymorphic site is "
       "still correct)", jit_callee_cache_hit },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",

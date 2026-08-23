@@ -3931,3 +3931,60 @@ REMAINING, in the order that would pay: cover the two enumerated
 boundary cases (a call at a segment boundary, and a reconstruction
 spanning a boundary plus stack growth); then annotate the abort arms,
 which is mechanical once the reachable set is genuinely exhausted.
+
+---
+
+## THE THREE CASES NET 3's DEPTH BOUND DOES NOT COVER (2026-08-13)
+
+`plans/archived/g1-no-record-tier.md` enumerates them explicitly, and
+says why the enumeration cannot produce them: they are reached by
+DEPTH, not by shape.
+
+    a call exactly at a SEG_SLOTS segment boundary
+    recursion deep enough to GROW the native stack
+    a reconstruction spanning both
+
+All three are now covered by ONE check, `norec_segment_boundary`
+(tests.cpp): 12000 levels of mutual recursion that throws at the bottom
+and catches at the top.
+
+WHY A BOUNDARY MATTERS. The slot stack is segmented at
+`SEG_SLOTS = 16 * 1024`. An emitted push DECLINES across a boundary -
+its fit test sends the call to C++ - so a boundary is precisely where
+record-ful and record-less frames interleave, and where
+`seg_top_before` / `parent_seg` arithmetic has to be right. The throw
+makes the unwind SPAN the boundaries rather than merely reach them.
+
+MEASURED, and the two lanes differ on purpose:
+
+    lane                        seg_advance   sync_depth_max
+    rel-hard (stack armed)          2             12001
+    debug + ASan (stack off)        2                32
+
+`ML_NSTACK_OFF` is set under sanitizers, where the sync cap is 32 and
+everything past it runs interpreted-flat. So the BOUNDARY case is
+covered in every lane and the NATIVE-STACK case in the non-sanitized
+ones - which is the right split, since a 12001-deep native stack is
+exactly what the sanitizer lanes are configured not to build.
+
+TWO NEW COUNTERS make this measurable at all, because depth leaves no
+other trace: `g_vm_seg_advance` (real advances only - the first segment
+allocation is excluded, and counting it was the first version's bug,
+reading 1 at every depth) and `g_jit_sync_depth_max`. Both TESTS-only,
+both in `MYLANG_JITSTATS`.
+
+IT IS AN extra_check, NOT A `tests` ENTRY, and that is forced: the
+differential reruns every `tests` entry in the TREE-WALKER, which
+recurses on the C stack and overflows at this depth (documented; ASan
+frames are huge). Capping the depth to suit it would drop below the
+boundary the check exists to cross - the first attempt put the program
+in `tests/functional/` and `corpus_diff` went 19/20 with a tw
+stack-overflow. A segment boundary is a slot-stack concept the
+tree-walker does not have, so the meaningful comparison is across the
+VM configurations, which the check runs itself (jit off and on).
+
+SABOTAGE, watched: dropping the depth from 12000 to 100 fails it with
+"crossed 0 segment boundaries" rather than passing as a merely-deep
+test. That assertion is the load-bearing half - without it a future
+frame-layout change could quietly stop reaching SEG_SLOTS and leave
+something that proves nothing.

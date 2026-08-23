@@ -443,6 +443,20 @@ collision). Three nets now:
   impure chain by construction, and there is no builtin that captures
   a backtrace without throwing, so capture is covered by every throw
   variant and rendering by the uncaught ones.
+  **The three cases the depth bound does NOT cover are enumerated
+  explicitly instead** (they are reached by DEPTH, not shape, so the
+  generator cannot make them) and are all covered by the
+  `norec_segment_boundary` `-rt` check: 12000 levels of mutual
+  recursion that throws at the bottom and catches at the top. That
+  crosses TWO `SEG_SLOTS` boundaries in every lane and drives the
+  native stack to 12001 on the non-sanitized ones (vs the cap of 32
+  under ASan, where `ML_NSTACK_OFF` is set). `g_vm_seg_advance` and
+  `g_jit_sync_depth_max` (TESTS-only, in `MYLANG_JITSTATS`) make it
+  measurable - depth leaves no other trace, and the check ASSERTS the
+  boundary was crossed so it cannot decay into a merely-deep test.
+  It is an `extra_check`, not a `tests` entry, and that is FORCED: the
+  differential reruns `tests` entries in the TREE-WALKER, which
+  recurses on the C stack and overflows at this depth.
 - **`MYLANG_RECON_AT=N` + `tests/norec_sweep.py` - the NO-RECORD
   tier's DETERMINISTIC EVENT SWEEP (Net 2, built 2026-08-13).** The
   G1 tier does not write a call record it can REBUILD later, and the
