@@ -329,3 +329,77 @@ HONEST CEILING: H4+H5 plausibly take 76 from ~25x to ~10x and 78 from
 irreducible obligations (window accounting, the walkable frame view,
 refcount correctness) - H4 in the ORIGINAL list above, now renumbered
 H8 to avoid the collision.
+
+## ⛔ H4 IS BLOCKED BY A SOUNDNESS DISCOVERY (2026-08-12) - maintainer fork
+
+H4 was scoped as "the H1a shape one level up: materialize the call into
+a temp, read the temp as a typed leaf". That scoping ASSUMED the static
+return type is a runtime guarantee. **IT IS NOT**, and the reason is a
+documented language decision, not a bug: FUNCTION SUBTYPING IS
+ARITY-ONLY, so a differently-returning function is assignable to a
+typed func var. All four programs below COMPILE today:
+
+    func a(int k) { return k; }
+    func b(int k) { return 2.5; }
+    var g = a; g = b;              # ACCEPTED (arity-only subtyping)
+    var s = 0; s = s + g(1);       # -> s = 2.500000   (whole expr PROMOTES)
+
+    func b2(int k) { return "z"; }
+    var g2 = a; g2 = b2;
+    var s2 = 0; s2 = s2 + g2(1);   # -> TypeErrorEx, caret on g2(1)
+
+    func c(float x) { return x; }
+    func d(float x) { return 3; }
+    var h = c; h = d;
+    var t = 0.0; t = t + h(1.0);   # -> t = 3.000000   (int promotes to float)
+
+So `-dti` proving `g : func(int)->int` does NOT mean g(1) returns an int
+at run time, and an unguarded typed tier would compute garbage where the
+program today promotes or throws - RULE 1 (no UB) and RULE 2 (an
+optimization may not change behaviour) both. Note the two readers CANNOT
+paper over it: `read_float_slot` returns a DEFINED 0.0 on a wrong type
+(it must not throw - #142's noexcept rule), so the wrong answer would be
+silent.
+
+Consequence: H4 needs a runtime tag guard with a DECLINE, and at the
+bytecode level that means a NEW type-testing jump opcode plus a
+dual-path lowering (typed arm + the existing boxed arm, both writing the
+same dst, the call emitted once and shared). That is far more than the
+"one function beside try_capture_leaf" the estimate assumed - and it
+touches the audited tables, verify_chunk, the disassembler and the myv
+format.
+
+### THE THREE OPTIONS (the maintainer picks - a language change is his
+### call by the CLAUDE.md rule, and option B is one)
+
+**A. H4 with a bytecode guard + decline.** New opcode (jump-if-tag-not),
+dual-path emission. Sound with no language change. Biggest blast radius
+of the three; the guard costs one compare per call result.
+
+**B. TIGHTEN FUNCTION SUBTYPING to check the RETURN type (and params),
+not just arity.** Then `g = b` above is a COMPILE error, the static
+return type becomes a real guarantee, and H4 collapses back to the
+one-function form beside try_capture_leaf with NO guard, NO new opcode,
+NO dual path. It also permanently unblocks every future optimization
+that wants to trust a func value's signature. COST: it REFUSES programs
+that run today (the three above), so it is a breaking language change -
+which is exactly why it is proposed, not done. Worth measuring how many
+corpus programs it would refuse before deciding (expected: zero - the
+shapes above are pathological).
+
+**C. Deliver 78's measured win at the GUARD LAYER instead (this is H6,
+the float twin of the boxed inline fast tier).** jit.cpp's BinOpV case
+already has the exact structure a guard needs - `guard -> fast path ->
+j_done -> the interpreter-exact helper` - and the int arm is written; a
+float arm is ~100 lines inside that ONE switch case. NO new opcode, NO
+bytecode change, NO myv change, sound by the established pattern
+(anything not float-float declines to the helper, byte-identical incl.
+carets). It removes 78's 190 Ir float chain, which is the SAME cost H4
+was going to remove there, and it also helps every genuinely-`dyn` float
+loop. It does NOT help the int case (already cheap inline) and does not
+generalize to non-arithmetic call results.
+
+RECOMMENDATION: **C now** (it banks 78's win at low risk and is
+independently justified), and **B as a design discussion** - if B is
+accepted, A becomes unnecessary and H4 lands cheaply and permanently
+sound. A is only worth building if B is rejected.
