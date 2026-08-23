@@ -3991,8 +3991,6 @@ struct Emitter {
     /* mov e<dx|ax>, dword [rbx+disp]  (a slice handle's u32 off/len,
      * zero-extended - the handle lives in the slot's payload) */
     /* mov e<dx|ax>, dword [rcx+disp]  (the elem2 ROW handle's off/len) */
-    /* cmp rax, rcx / test rax, rax */
-    void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
     /* mov [rbx+disp], rax  (a raw payload store - the type word is written
      * separately, as the two-store write_slot does). */
     void store_rax_slot(int32_t d)
@@ -11954,8 +11952,9 @@ static void emit_flat_int_tail(Emitter &e, const ElemRead &r, uint32_t pc,
 }
 
 /*
- * Emit the INT-semantics element read `arr[idx]` -> RAX, shared by LoadElemInt
- * and the JumpUnlessElemInt fusion (`if (arr[i])`). Navigates slot -> shobj ->
+ * Emit the INT-semantics element read `arr[idx]` -> `obj` (the caller's
+ * granted accumulator; #96 batch 9c), shared by the JumpUnlessElemInt
+ * fusion (`if (arr[i])`). Navigates slot -> shobj ->
  * kind + data, unsigned bounds-checks, and reads the element - accepting BOTH
  * flat `ints` (8-byte) and flat `bools` (1-byte, 0/1), exactly what the
  * interpreter accepts for these ops. A non-array / SLICE / other-kind base or
@@ -11963,7 +11962,7 @@ static void emit_flat_int_tail(Emitter &e, const ElemRead &r, uint32_t pc,
  * negative); an out-of-range index RAISES OutOfBounds with the op's caret
  * (approach A - no re-interpret). Clobbers rax/rcx/rdx/r9.
  */
-static void emit_elem_int_read(Emitter &e, uint8_t ir,
+static void emit_elem_int_read(Emitter &e, uint8_t ir, uint8_t obj,
                                const Instr &in, uint32_t pc,
                                std::vector<size_t> *slows = nullptr)
 {
@@ -11981,9 +11980,9 @@ static void emit_elem_int_read(Emitter &e, uint8_t ir,
         e.cmp_rr(ir, H->rcount);
         slows->push_back(e.j32(0x73));           /* jae -> slow */
         if (H->kind == 3)
-            e.load_elem_zx8(RAX, H->rdata, ir);
+            e.load_elem_zx8(obj, H->rdata, ir);
         else
-            e.load_elem_q(RAX, H->rdata, ir);
+            e.load_elem_q(obj, H->rdata, ir);
         return;                                  /* rax = the element */
     }
     const auto decline = [&](uint8_t pass_short, uint8_t fail_near) {
@@ -11994,19 +11993,20 @@ static void emit_elem_int_read(Emitter &e, uint8_t ir,
         else
             e.bail_unless(pass_short, pc);
     };
-    e.load(RAX, base.type);                  /* base an array? */
-    e.cmp_reg_tag_via(RAX, L.t_arr, ir);
+    e.load(obj, base.type);                  /* base an array? */
+    e.cmp_reg_tag_via(obj, L.t_arr, ir);
     decline(0x74, 0x75);                     /* je (== t_arr) */
     e.cmp_byte_slot(base.payload + L.slice_off, 0);   /* not a slice? */
     decline(0x74, 0x75);                     /* je (slice==0) */
-    e.load(RAX, base.payload);               /* rax = shobj ptr */
-    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    e.load(obj, base.payload);               /* rax = shobj ptr */
+    e.cmp_byte_base(obj, L.kind_off, L.kind_ints);
     const size_t j_ints = e.j32(0x74);       /* je -> the 8-byte path */
-    e.cmp_byte_rax(L.kind_off, L.kind_bools);
+    e.cmp_byte_base(obj, L.kind_off, L.kind_bools);
     decline(0x74, 0x75);                     /* je (bools) else decline */
     /* flat bools: 1-byte elements, so the count is the raw pointer difference
      * (no sar) and the load is a movzx. */
-    const ElemRead rr = elem_read_plan(e, ir);
+    ElemRead rr = elem_read_plan(e, ir);
+    rr.obj = obj;
     emit_flat_int_tail(e, rr, pc, /*bools=*/true, &in, -1, slows);
     const size_t j_done = e.j32(0xEB);
     /* flat ints */
@@ -12019,8 +12019,8 @@ static void emit_elem_int_read(Emitter &e, uint8_t ir,
  * int/bool array. ForStepElemInt must run every bail-able check BEFORE it
  * steps the counter - a bail re-runs the WHOLE op, and a post-step bail would
  * DOUBLE-STEP. Clobbers rax/r9. */
-static void emit_elem_base_gate(Emitter &e, uint8_t ir, int base_slot,
-                                uint32_t pc,
+static void emit_elem_base_gate(Emitter &e, uint8_t ir, uint8_t obj,
+                                int base_slot, uint32_t pc,
                                 std::vector<size_t> *slows = nullptr)
 {
     /* No blanket `scratch(R9)`: since the t_arr compare went through
@@ -12034,15 +12034,15 @@ static void emit_elem_base_gate(Emitter &e, uint8_t ir, int base_slot,
         else
             e.bail_unless(pass_short, pc);
     };
-    e.load(RAX, base.type);
-    e.cmp_reg_tag_via(RAX, L.t_arr, ir);
+    e.load(obj, base.type);
+    e.cmp_reg_tag_via(obj, L.t_arr, ir);
     decline(0x74, 0x75);
     e.cmp_byte_slot(base.payload + L.slice_off, 0);
     decline(0x74, 0x75);
-    e.load(RAX, base.payload);
-    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    e.load(obj, base.payload);
+    e.cmp_byte_base(obj, L.kind_off, L.kind_ints);
     const size_t j_ok = e.j8(0x74);
-    e.cmp_byte_rax(L.kind_off, L.kind_bools);
+    e.cmp_byte_base(obj, L.kind_off, L.kind_bools);
     decline(0x74, 0x75);
     e.patch8(j_ok, e.pos());
 }
@@ -17605,9 +17605,10 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                            remap, fixups);
             return;
         }
-        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        AccScratch acc(e);
+        load_operand(e, acc.r, in.a_is_lit(), in.a_lit(), in.a_slot());
         tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot(),
-                    [&]() { e.cmp_rr(RAX, tmp); });
+                    [&]() { e.cmp_rr(acc.r, tmp); });
         emit_cond_jump(e, cc_negate(in.aop),
                        static_cast<size_t>(in.target), begin, end,
                        remap, fixups);
@@ -17694,18 +17695,19 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                            begin, end, remap, fixups);
             return;
         }
-        read_slot(e, RAX, in.target2);
+        AccScratch acc(e);
+        read_slot(e, acc.r, in.target2);
         if (lit_step) {
-            e.op_reg_imm(up ? Op::plus : Op::minus, RAX,
+            e.op_reg_imm(up ? Op::plus : Op::minus, acc.r,
                          static_cast<int32_t>(in.b_lit()));
         } else {
             tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot(),
                         [&]() { op_rr(e, up ? Op::plus : Op::minus,
-                                      RAX, tmp); });
+                                      acc.r, tmp); });
         }
-        write_slot(e, ck, RAX, in.target2, pc);
+        write_slot(e, ck, acc.r, in.target2, pc);
         tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot(),
-                    [&]() { e.cmp_rr(RAX, tmp); });
+                    [&]() { e.cmp_rr(acc.r, tmp); });
         emit_cond_jump(e, in.aop, static_cast<size_t>(in.target),
                        begin, end, remap, fixups);
         return;
@@ -17743,12 +17745,14 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         const int areg = e.creg(adst);
         const int ireg = e.creg(in.target2);
         bool clear_fwd = false;
+        AccScratch acc(e, AccScratch::deferred_t{});
 
         /* ---- half A: the ACCUMULATE ---- */
+        int fv = -1;
         if (areg >= 0) {
             const uint8_t d = static_cast<uint8_t>(areg);
             if (fb)                      /* adapter first - see above */
-                emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+                fv = emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
 #ifdef TESTS
             e.bump_counter(&g_jit_step_imm);
 #endif
@@ -17759,7 +17763,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
              * be allowed to clobber anything). */
             if (fb) {
                 Emitter::PinMach pm(e);
-                e.op_rr2(Op::plus, d, RAX);
+                e.op_rr2(Op::plus, d, static_cast<uint8_t>(fv));
             } else if (in.b_is_lit() && in.b_lit() >= INT32_MIN
                        && in.b_lit() <= INT32_MAX) {
                 Emitter::PinMach pm(e);
@@ -17782,17 +17786,22 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             }
             clear_fwd = true;
         } else {
+            uint8_t A = 0;               /* the half's accumulator */
             const auto use_add =
-                [&]() { op_rr(e, Op::plus, RAX, tmp); };
+                [&]() { op_rr(e, Op::plus, A, tmp); };
             if (fb) {
-                emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+                /* `+` commutes: the forwarded value IS the
+                 * accumulator and the slot loads into tmp */
+                A = emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
                 tmp_slot(adst, use_add);
             } else {
-                read_slot(e, RAX, adst);
+                acc.take();
+                A = acc.r;
+                read_slot(e, A, adst);
                 tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot(),
                             use_add);
             }
-            write_slot(e, ck, RAX, adst, pc);
+            write_slot(e, ck, A, adst, pc);
         }
 
         /* ---- half B: the COUNTER and its bound test ---- */
@@ -17825,10 +17834,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             }
             clear_fwd = true;
         } else {
-            read_slot(e, RAX, in.target2);
-            e.incdec_reg(RAX, up);
-            write_slot(e, ck, RAX, in.target2, pc);
-            const auto use_cmp = [&]() { e.cmp_rr(RAX, tmp); };
+            acc.take();
+            read_slot(e, acc.r, in.target2);
+            e.incdec_reg(acc.r, up);
+            write_slot(e, ck, acc.r, in.target2, pc);
+            const auto use_cmp = [&]() { e.cmp_rr(acc.r, tmp); };
             if (in.a_is_lit())
                 tmp_lit(static_cast<uint64_t>(
                             static_cast<int_type>(in.a_dual_hi())),
@@ -17861,7 +17871,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         const SlotAddr cond = slot_addr(in.target2);
         e.bump_op(OpCode::JumpUnlessTrueV);      /* execution proof (the inline
                                                   * fast path calls no helper) */
-        e.load(RAX, cond.type);                  /* rax = the value's Type* */
+        AccScratch acc(e);
+        e.load(acc.r, cond.type);                /* the value's Type* */
         /*
          * ⛔ THE t_int COMPARE READ A REGISTER NOBODY LOADS (fixed
          * 2026-08-19). It was hand-encoded as `cmp rax, rsi`, and rsi
@@ -17876,11 +17887,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * seam (`cmp_rax_tag`) already existed; this site never went
          * through it.
          */
-        e.cmp_rax_tag(L.t_int, RSI);  /* reg:conv */
+        e.cmp_reg_tag(acc.r, L.t_int, RSI);  /* reg:conv */
         const size_t j_fast_int = e.j32(0x74);   /* je -> fast */
         {
             RefScratch rb(e, RCX);
-            e.cmp_reg_tag_via(RAX, L.t_bool, rb.sc);
+            e.cmp_reg_tag_via(acc.r, L.t_bool, rb.sc);
             rb.release();                  /* before the edge */
         }
         const size_t j_fast_bool = e.j32(0x74);  /* je -> fast */
@@ -17903,15 +17914,21 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
-        const size_t j_join = e.j32(0xEB);       /* jmp -> join (rax = 0/1) */
-        /* --- fast path: rax = the raw payload --- */
+        /* the helper returned in the ABI register; the join reads the
+         * GRANT - a mov only if they ever differ (today they never do,
+         * so this emits nothing) */
+        if (acc.r != RAX)                        /* reg:abi */
+            e.mov_rr(acc.r, RAX);                /* reg:abi */
+        const size_t j_join = e.j32(0xEB);       /* jmp -> join */
+        /* --- fast path: acc = the raw payload --- */
         e.patch32_here(j_fast_int);
         e.patch32_here(j_fast_bool);
-        e.load(RAX, cond.payload);
+        e.load(acc.r, cond.payload);
         /* --- join: jump to target when the value is FALSE --- */
         e.patch32_here(j_join);
-        e.test_rax_rax();                        /* 64-bit: a big int whose low
-                                                  * 32 bits are 0 is still true */
+        e.test_rr(acc.r, acc.r);                 /* 64-bit: a big int whose
+                                                  * low 32 bits are 0 is
+                                                  * still true */
         emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
                            static_cast<size_t>(in.target), begin, end,
                            remap, fixups);
@@ -17923,10 +17940,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * type-tag compare against the none singleton. Never throws. */
         const SlotAddr a = slot_addr(in.a_slot());
         e.bump_op(OpCode::JumpIfNotNoneV);
-        e.load(RAX, a.type);
+        AccScratch acc(e);
+        e.load(acc.r, a.type);
         {
             RefScratch rn(e, RCX);
-            e.cmp_reg_tag_via(RAX, jit_layout().t_none, rn.sc);
+            e.cmp_reg_tag_via(acc.r, jit_layout().t_none, rn.sc);
             rn.release();                  /* before the edge */
         }
         emit_cond_jump_raw(e, 0x85 /* jne near */, 0x74 /* je short */,
@@ -17941,7 +17959,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * and missed when the other four moved to the plan, so its
          * `data` stayed rcx unconditionally. The register-state tracker
          * found it the moment rcx was pinnable. */
-        const ElemRead fr = ir == ELEM_NO_REG
+        ElemRead fr = ir == ELEM_NO_REG
             ? ElemRead{} : elem_read_plan(e, ir);
         if (ir == ELEM_NO_REG) {
             /* No free index register (unreachable while
@@ -17954,6 +17972,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             return;
         }
+        AccScratch acc(e);
+        fr.obj = acc.r;
         /* #9 back-edge fusion: step + test + the a[i] element load in one op.
          * ORDER MATTERS: the base GATE (array / non-slice / ints-or-bools,
          * every check that can BAIL) runs FIRST - a bail re-runs the WHOLE
@@ -17987,25 +18007,25 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             hoist_match(in.b_dual_lo(), in.elem_bool_hint() ? 3 : 0);
         const bool hoisted = H != nullptr;
         if (!hoisted)
-            emit_elem_base_gate(e, ir, in.b_dual_lo(), pc, &gate_slows);
-        read_slot(e, RAX, in.target2);
-        e.incdec_reg(RAX, up);
-        write_slot(e, ck, RAX, in.target2, pc);
+            emit_elem_base_gate(e, ir, acc.r, in.b_dual_lo(), pc, &gate_slows);
+        read_slot(e, acc.r, in.target2);
+        e.incdec_reg(acc.r, up);
+        write_slot(e, ck, acc.r, in.target2, pc);
         tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot(),
-                    [&]() { e.cmp_rr(RAX, tmp); });
+                    [&]() { e.cmp_rr(acc.r, tmp); });
         const size_t j_fall = e.j32(cc_for(cc_negate(in.aop)).short_op);
         if (hoisted) {
             load_slot_idx(e, ir, in.target2);      /* the stepped counter */
             e.cmp_rr(ir, H->rcount);
             read_slows.push_back(e.j32(0x73));
             if (H->kind == 3)
-                e.load_elem_zx8(RAX, H->rdata, ir);
+                e.load_elem_zx8(acc.r, H->rdata, ir);
             else
-                e.load_elem_q(RAX, H->rdata, ir);
+                e.load_elem_q(acc.r, H->rdata, ir);
         } else {
         /* the trusted read: the gate proved kind is ints or bools */
-        e.load(RAX, base.payload);            /* rax = shobj */
-        e.cmp_byte_rax(L.kind_off, L.kind_bools);
+        e.load(acc.r, base.payload);            /* rax = shobj */
+        e.cmp_byte_base(acc.r, L.kind_off, L.kind_bools);
         const size_t j_bools = e.j32(0x74);
         emit_flat_int_tail(e, fr, pc, /*bools=*/false, nullptr, in.target2,
                            &read_slows);
@@ -18015,7 +18035,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                            &read_slows);
         e.patch32_here(j_done);
         }
-        write_slot(e, ck, RAX, in.b_dual_hi(), pc);
+        write_slot(e, ck, acc.r, in.b_dual_hi(), pc);
         std::vector<size_t> j_takens;
         {
             const size_t tgt = static_cast<size_t>(in.target);
@@ -18033,9 +18053,9 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         if (!read_slows.empty()) {
             for (const size_t j : read_slows)
                 e.patch32_here(j);
-            read_slot(e, RAX, in.target2);           /* the stepped counter */
+            read_slot(e, acc.r, in.target2);           /* the stepped counter */
             emit_call_prologue(e);
-            e.mov_rr(RSI, RAX);
+            e.mov_rr(RSI, acc.r);
             e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
             e.lea_rdi(off(in.b_dual_lo()));
             e.call_relocs.push_back(
@@ -18050,9 +18070,9 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                 e.exit_pc(pc);
                 e.patch8(j_ok, e.pos());
             }
-            e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
-            e.load_base0(RAX, RAX);      /* mov rax,[rax] */
-            write_slot(e, ck, RAX, in.b_dual_hi(), pc);
+            e.movabs(acc.r, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
+            e.load_base0(acc.r, acc.r);      /* mov rax,[rax] */
+            write_slot(e, ck, acc.r, in.b_dual_hi(), pc);
             const size_t tgt = static_cast<size_t>(in.target);
             if (tgt >= begin && tgt < end) {
                 e.u8(0xE9);
@@ -18068,9 +18088,9 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         if (!gate_slows.empty()) {
             for (const size_t j : gate_slows)
                 e.patch32_here(j);
-            load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+            load_operand(e, acc.r, in.a_is_lit(), in.a_lit(), in.a_slot());
             emit_call_prologue(e);
-            e.mov_rr(RSI, RAX);                      /* the bound VALUE */
+            e.mov_rr(RSI, acc.r);                      /* the bound VALUE */
             e.movabs(RDI, static_cast<uint64_t>(
                               static_cast<int_type>(in.target2)));
             e.movabs(RDX, static_cast<uint64_t>(static_cast<int>(in.aop)));
@@ -18173,7 +18193,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * never re-interprets and its run's originals delete. Both paths
          * CONVERGE with the value in rax before the branch. */
         std::vector<size_t> slows;
-        emit_elem_int_read(e, ir, in, pc, &slows);
+        AccScratch acc(e);
+        emit_elem_int_read(e, ir, acc.r, in, pc, &slows);
         const size_t j_conv = e.j32(0xEB);          /* jmp converge */
         for (const size_t j : slows)
             e.patch32_here(j);
@@ -18186,9 +18207,10 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                 return static_cast<int32_t>(static_cast<long>(slot)
                                             * static_cast<long>(sizeof(LValue)));
             };
-            load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+            load_operand(e, acc.r, in.a_is_lit(), in.a_lit(),
+                         in.a_slot());
             emit_call_prologue(e);
-            e.mov_rr(RSI, RAX);                     /* the index value */
+            e.mov_rr(RSI, acc.r);                   /* the index value */
             e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
             e.lea_rdi(off(in.target2));             /* rdi = &slot[base] */
             e.call_relocs.push_back(
@@ -18201,11 +18223,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             emit_exc_stamp(e, ck, old_pc);          /* the op's own caret */
             e.exit_pc(pc);                          /* threw -> re-raise */
             e.patch8(j_ok, e.pos());
-            e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
-            e.load_base0(RAX, RAX);     /* mov rax, [rax] */
+            e.movabs(acc.r, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
+            e.load_base0(acc.r, acc.r);
         }
         e.patch32_here(j_conv);                     /* converge: */
-        e.test_rax_rax();
+        e.test_rr(acc.r, acc.r);
         emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
                            static_cast<size_t>(in.target), begin, end,
                            remap, fixups);
