@@ -294,7 +294,11 @@ def census(path):
                            # allocator API too - calling it IS model
                            # participation, not a hardcode
                            r'\bRefScratch\s+\w+\s*\(|'
-                           r'\brax_pin_conflict\s*\(')
+                           # the conflict-evict seam (any register) and
+                           # hold() - the ask-first borrow - are model
+                           # API: their register operands are requests
+                           r'\b(?:rax|reg)_pin_conflict\s*\(|'
+                           r'\bhold\s*\(')
     in_reg_enum = False
     for i, l in enumerate(lines):
         if 'enum Reg' in l:

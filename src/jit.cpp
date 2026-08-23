@@ -3455,6 +3455,8 @@ struct Emitter {
      * is the only allocatable operand. */
     void imul_reg(uint8_t r)
     {
+        reg_pin_conflict(RAX);       /* reg:isa */
+        reg_pin_conflict(RDX);       /* reg:isa */
         wrote(RAX); wrote(RDX);      /* reg:isa: rdx:rax = rax * r, ISA-fixed */
         u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 0x01 : 0)));
         u8(0xF7);
@@ -4020,12 +4022,22 @@ struct Emitter {
      * shipping wrong answer. Deleting them means no caller can reach
      * the fixed pair again; the arithmetic is `op_rr2(aop, dst, src)`,
      * which the census CAN see because both operands are arguments. */
-    void cqo()          { wrote(RDX); u8(0x48); u8(0x99); }  /* reg:isa */
+    /* cqo claims rdx BY ISA - the encoder declares its own conflict
+     * (B2c), so every present and future emitter is covered at the
+     * one place the claim is made. */
+    void cqo()
+    {
+        reg_pin_conflict(RDX);                         /* reg:isa */
+        wrote(RDX);                                    /* reg:isa */
+        u8(0x48); u8(0x99);
+    }
     /* idiv r64 - rdx:rax / r. Quotient to RAX and remainder to RDX are
      * ISA-fixed, so the DIVISOR is the only allocatable operand here and
      * therefore the only one this takes. */
     void idiv_reg(uint8_t r)
     {
+        reg_pin_conflict(RAX);                   /* reg:isa */
+        reg_pin_conflict(RDX);                   /* reg:isa */
         wrote(RAX); wrote(RDX);                  /* reg:isa */
         u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 1 : 0))); u8(0xF7);
       u8(static_cast<uint8_t>(0xF8 | (r & 7))); }
@@ -4368,7 +4380,13 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
      */
     /* #96 (8c): ask-first, like RefScratch's ctor */
     uint8_t keep = RCX;                              /* reg:conv */
-    const int keep_g = e.alloc_scratch(CAP_MEM_BASE, 1u << RCX);
+    /* B2c: with rdx un-denied a grant could return it - and the magic
+     * sequence CLOBBERS rdx by ISA (imul) two instructions later,
+     * which killed the keep the moment the whitelist's deny stopped
+     * doubling as a grant filter (a wrong `k % 2`, watched live).
+     * The keep must survive the imul: exclude rdx. */
+    const int keep_g = e.alloc_scratch(CAP_MEM_BASE, 1u << RCX,
+                                       1u << RDX);     /* reg:isa */
     bool keep_spill = false;
     if (keep_g >= 0) {
         keep = static_cast<uint8_t>(keep_g);
@@ -9326,11 +9344,13 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * GlobalFuncTable output - and several of those are ISA-forced, not
  * habits an allocator can talk out of.
  *
- * So `run_may_pin_rdx` (see jit_xcache_busy) inverts the question:
- * rdx is spendable only in a run made ENTIRELY of ops positively
- * established never to write it - the B1/B2 specialized int family
- * plus int loop control and compares, minus IntModRI/IntAddModRI. An
- * unlisted or brand-new opcode keeps rdx out, so the failure direction
+ * B2c REPLACED the old run_may_pin_rdx whitelist with the conflict
+ * seam: rdx is optimistic, and any raw writer evicts a pinned rdx
+ * (reg_pin_conflict) so the chunk re-emits with it denied. The
+ * failure direction the whitelist bought - an unlisted opcode keeps
+ * rdx out - is now the tracker's job: a missed raw writer aborts by
+ * name in every TESTS build instead of shipping. The old text ended:
+ * "the failure direction
  * is a lost pin and never a wrong answer.
  *
  * That makes rdx a NARROW pin - available in dense scalar int loops
@@ -9625,55 +9645,11 @@ static uint32_t xcache_mask()
     return m;
 }
 
-/*
- * #96: may this RUN spend rdx as a pin? See the comment at its use in
- * jit_xcache_busy for why the list is positive and what it costs to be
- * wrong in each direction.
- */
-static bool run_may_pin_rdx(const Chunk &ck, size_t begin, size_t end)
-{
-    /* MYLANG_RDXDBG=1 names the op that refused - the list is meant to
-     * be widened with evidence, and guessing which op blocks a shape
-     * is exactly how the first version shipped with zero reach. */
-    static const bool dbg = getenv("MYLANG_RDXDBG") != nullptr;
-    for (size_t pc = begin; pc < end; pc++) {
-        switch (ck.code[pc].op) {
-        /* B1/B2 specialized int arithmetic: rax + rcx in the case body,
-         * rsi via store_dst's tag write off-arena. Never rdx.
-         * ⛔ IntModRI / IntAddModRI are DELIBERATELY ABSENT - they go
-         * through emit_div_magic, whose `mul`/`idiv` write rdx. */
-        case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
-        case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
-        case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
-        case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
-        case OpCode::IntShlRR: case OpCode::IntShrRR:
-        case OpCode::IntShlRI: case OpCode::IntShrRI:
-        /* int loop control + compare */
-        case OpCode::IntAddStep: case OpCode::ForLoopStep:
-        case OpCode::JumpUnlessIntCmp: case OpCode::CmpIntV:
-        case OpCode::LoadImmInt: case OpCode::Jump:
-        /* ⛔ ReturnV and Halt are here for the SAME reason
-         * jit_run_blocks_xcache leaves them out of ITS list:
-         * `emit_ret_native` uses rdx freely (16 sites) but its SECOND
-         * LINE is `flush_cache()`, so every pin is already back in
-         * memory and nothing after reads a register. Leaving them out
-         * is what kept rdx at ZERO REACH when it was first admitted -
-         * a leaf body is ONE run ending in ReturnV, so the predicate
-         * refused every fragment in the corpus and the pin was
-         * hollow. (Found by the "prove the code ran" rule: 0 rdx pin
-         * loads corpus-wide, and the admission would otherwise have
-         * been reported as a win.) emit_epilogues is rdx-free. */
-        case OpCode::ReturnV: case OpCode::Halt:
-            break;                       /* provably rdx-free */
-        default:
-            if (dbg)
-                fprintf(stderr, "rdx blocked by op %d at pc %zu\n",
-                        static_cast<int>(ck.code[pc].op), pc);
-            return false;                /* unknown -> keep rdx out */
-        }
-    }
-    return true;
-}
+/* B2c: run_may_pin_rdx - the last per-register whitelist - is
+ * DELETED. rdx is optimistic; the raw writers (the div arms,
+ * StoreElem2V's cold path, elem_read_plan's exhaustion arm)
+ * evict a pinned rdx through reg_pin_conflict and the chunk
+ * re-emits with it denied. */
 
 /*
  * Phase A (plans/register-allocator-endgame.md): the run_may_pin_rax
@@ -9758,8 +9734,9 @@ static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
      * argument each of these has: the op's emission, and every emitter
      * it calls, touches no rdx outside an emit_call_prologue bracket.
      */
-    if (!run_may_pin_rdx(ck, begin, end))
-        busy |= 1u << 2;
+    /* B2c: the rdx whitelist is deleted - the raw-rdx writers evict
+     * a pinned rdx themselves (the conflict seam) and the retry's
+     * g_jit_pins_denied mask below carries the deny. */
     /*
      * ⛔ rcx: ISA-FIXED by the variable-count shifts. `shl/sar rax, cl`
      * takes its count in cl and nowhere else, and the RR shift
@@ -11955,7 +11932,7 @@ struct ElemRead {
 /* The allocator for the two roles above that the ISA does NOT fix.
  * Declared here because the first flat-read emitter is above its
  * definition, which needs ELEM_CAND and elem_reg_usable. */
-static ElemRead elem_read_plan(const Emitter &e, uint8_t idx_reg);
+static ElemRead elem_read_plan(Emitter &e, uint8_t idx_reg);
 
 /* The per-kind FLAT element read tail (rax = the shobj): data -> rcx,
  * count -> rdx, the index -> r9 (from the op's a-operand when `idx_in`, else
@@ -12248,8 +12225,10 @@ static bool elem_reg_usable(const Emitter &e, uint8_t r)
  *    (which satisfies the element tiers' `data` role) satisfied the
  *    COUNT while leaving the chain nothing it could use, and every
  *    max-pin closure loop silently lost its whole fragment;
- *  - a role whose preferred register is ALREADY un-pinnable (rdx under
- *    the run_may_pin_rdx whitelist, r9 under a clobber) needs no
+ *  - a role whose preferred register is ALREADY un-pinnable (r9
+ *    under a clobber; rdx was this class under the deleted
+ *    run_may_pin_rdx - now a pinned rdx re-routes the role through
+ *    the candidates, or evicts via the conflict seam) needs no
  *    withhold at all, and counting it starved the pool: the hoisted
  *    read shape withheld three registers where its plan needed one.
  */
@@ -12517,7 +12496,7 @@ static uint8_t elem_read_idx(const Emitter &e, OpCode op)
  * PREFERRED-FIRST, so with an empty pin set this is byte-identical to
  * the hardcoded assignment and the mechanism lands INERT.
  */
-static ElemRead elem_read_plan(const Emitter &e, uint8_t idx_reg)
+static ElemRead elem_read_plan(Emitter &e, uint8_t idx_reg)
 {
     ElemRead r;
     r.idx = idx_reg;
@@ -12532,6 +12511,14 @@ static ElemRead elem_read_plan(const Emitter &e, uint8_t idx_reg)
                 taken |= 1u << c;
                 return c;
             }
+        /* B2c: the EXHAUSTION fallback used to hand back a register
+         * that may hold a PIN - the one unsound arm of this plan
+         * (elem_scratch_plan declines instead; this reader cannot).
+         * A pinned preferred is a conflicting event now: evict and
+         * let the chunk re-emit with it denied. A non-pin unusable
+         * (a singleton holder) still falls through raw - unreachable
+         * short of six unusable candidates, recorded in the plan. */
+        e.reg_pin_conflict(preferred);
         return preferred;
     };
     r.data = pick(r.data);
@@ -12567,6 +12554,14 @@ static ElemScratch elem_scratch_plan(const Emitter &e, OpCode op)
     sc.data = pick(sc.data);
     sc.idx = pick(sc.idx);
     sc.val = pick(sc.val);
+    /* B2c: COUNT deliberately STAYS RDX - the divmod arm's remainder
+     * handling depends on count == rdx post-idiv (picking it produced
+     * a wrong `x %= -1` result, watched), and a pick also ate a
+     * reservation candidate and starved idx/val. A pinned rdx is
+     * handled by EVICTION instead: the tier's divisor gate and the
+     * self-declaring cqo/idiv/imul encoders call the conflict seam,
+     * so the chunk re-emits with rdx denied and count's literal is
+     * sound again. */
 #ifdef TESTS
     if (!sc.ok)
         g_jit_elem_noreg++;      /* the decline, made VISIBLE */
@@ -12581,6 +12576,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     const ElemScratch sc = elem_scratch_plan(e, in.op);
     if (!sc.ok)
         return false;          /* no free scratch - the helper tier */
+    /* B2c: sc.count deliberately stays literal RDX (see the plan), so
+     * the WHOLE tier claims rdx - a pinned rdx is a conflicting event
+     * at entry, not per-arm (the shift-compound arm writes count too,
+     * which the per-arm form missed off-arena at the first rotation). */
+    e.reg_pin_conflict(RDX);
     e.scratch2(sc.idx, sc.val);      /* index in r9; the value in rdi/dil */
     AccScratch acc(e);   /* the shobj/value staging register */
     /*
@@ -12742,7 +12742,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             /* the divisor gate on the PLAN's registers - these were
              * literal RDI/RDX, correct only because the elem-role
              * reservation happens to keep val==RDI and count==RDX (an
-             * invisible coupling; byte-identical spelled either way) */
+             * invisible coupling; byte-identical spelled either way).
+             * B2c: count IS rdx here (see elem_scratch_plan) and the
+             * gate + the RMW's remainder both claim it - a pinned rdx
+             * is a conflicting event. */
+            e.reg_pin_conflict(RDX);
             e.lea_base(sc.count, sc.val, 1);
                                                  /* lea count,[val+1] */
             e.cmp_reg_imm(sc.count, 1);
@@ -13379,6 +13383,11 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     const ElemScratch sc = elem_scratch_plan(e, in.op);
     if (!sc.ok)
         return false;          /* no free scratch - the helper tier */
+    /* B2c: sc.count deliberately stays literal RDX (see the plan), so
+     * the WHOLE tier claims rdx - a pinned rdx is a conflicting event
+     * at entry, not per-arm (the shift-compound arm writes count too,
+     * which the per-arm form missed off-arena at the first rotation). */
+    e.reg_pin_conflict(RDX);
     e.scratch2(sc.idx, sc.val);      /* index in r9; the value in rdi/dil */
     AccScratch acc(e);   /* the shobj/value staging register */
     /* the Expr14 op -> the base op (Op::invalid == plain assign). The
@@ -13570,9 +13579,10 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
          * shape (a misaligned-Type* crash in -rt). This cold path uses
          * RDX plus the two ROLES: &elem formed by lea, bounds as a
          * TWO-sided pointer compare (a negative index wraps below
-         * data). RDX is safe raw scratch because `run_may_pin_rdx` is
-         * a positive whitelist that does not list StoreElem2V, so no
-         * run containing this op may pin it.
+         * data). B2c: a pinned RDX is a conflicting event now (the
+         * whitelist that used to keep it out of these runs is
+         * deleted) - evicted below, and the chunk re-emits with rdx
+         * denied.
          *
          * ⛔ THIS BLOCK WAS FIVE HAND-ENCODED BYTE SEQUENCES NAMING
          * `rdi` AND `r9` LITERALLY, AND THAT WAS A SIGFPE (2026-08-19).
@@ -13620,6 +13630,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         break;
     case Op::div: case Op::mod:
         e.load_elem_q(sc.obj, sc.data, sc.idx);
+        e.reg_pin_conflict(RDX);   /* B2c: cqo/idiv claim rdx raw */
         e.cqo();
         e.idiv_reg(sc.val);
         if (bop == Op::div)
@@ -13807,7 +13818,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     bool tmp_pushed = false;
     bool tmp_active = false;
     int tmp_grant = -1;
-    const auto hold = [&](uint32_t need = CAP_MEM_BASE) {
+    const auto hold = [&](uint32_t need = CAP_MEM_BASE,
+                          uint32_t exclude = 0) {
         if (tmp_active || (e.trk_borrowed & (1u << RCX))) {  /* reg:conv */
             /* already held this window (the second spelling covers a
              * window opened by the raw borrow before this landed) */
@@ -13815,7 +13827,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             return;
         }
         tmp_active = true;
-        tmp_grant = e.alloc_scratch(need, 1u << RCX);
+        tmp_grant = e.alloc_scratch(need, 1u << RCX, exclude);
         if (tmp_grant >= 0) {
             tmp = cpy = static_cast<uint8_t>(tmp_grant);
             return;
@@ -14262,13 +14274,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * CL by ISA - CAP_SHIFT_CNT (only rcx) makes the model enforce
          * what the borrow used to get by luck */
         hold(in.aop == Op::shl || in.aop == Op::shr
-                 || in.aop == Op::ushr ? CAP_SHIFT_CNT : CAP_MEM_BASE);
+                 || in.aop == Op::ushr ? CAP_SHIFT_CNT : CAP_MEM_BASE,
+             /* the divisor must survive cqo (rdx BY ISA) */
+             in.aop == Op::div || in.aop == Op::mod
+                 ? 1u << RDX : 0u);                    /* reg:isa */
         load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         switch (in.aop) {
         case Op::div: case Op::mod:
-            /* idiv's dividend register is rax BY ISA; the load above
-             * went through the accumulator grant, which is rax while
-             * nothing pins it - and a div-bearing run never pins it */
+            /* idiv's dividend is rax BY ISA (the load above went
+             * through the grant, rax while nothing pins it). B2c:
+             * the high half (cqo/idiv, the INT_MIN compare) claims
+             * rdx raw - a pinned rdx is a conflicting event. */
+            e.reg_pin_conflict(RDX);
             ML_CHECK_MSG(acc.r == RAX, "idiv needs rax");  /* reg:isa */
             /*
              * The edge-divisor checks (#103): 0 raises DivisionByZeroEx,
@@ -14475,8 +14492,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * convention. Phase A: the raw rax writes below are exactly a
          * conflicting event - evict a rax pin and retry, like the
          * accumulator ask does (this case never asks, so it must call
-         * the seam itself). */
+         * the seam itself; rdx too - cqo/idiv's high half and the
+         * div-magic imul both claim it). */
         e.rax_pin_conflict();
+        e.reg_pin_conflict(RDX);
         if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp) {
             const uint8_t fv =
                 emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
@@ -14494,7 +14513,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             write_slot(e, ck, RAX, in.target, pc);       /* reg:isa */
             return true;
         }
-        hold();
+        hold(CAP_MEM_BASE, 1u << RDX);   /* the divisor survives cqo */
         e.movabs(tmp, static_cast<uint64_t>(in.b_lit()));
         e.cqo();                          /* cqo */
         e.idiv_reg(tmp);
@@ -14509,8 +14528,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * predicate). The whole (a+b) sum IS the dividend, and the
          * dividend register is rax by ISA on both exits (cqo+idiv /
          * the div-magic imul) - hard reason, not convention.
-         * Phase A: raw rax writes = a conflicting event; evict. */
+         * Phase A: raw rax writes = a conflicting event; evict
+         * (rdx too - cqo/idiv, the div-magic imul). */
         e.rax_pin_conflict();
+        e.reg_pin_conflict(RDX);
         if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp) {
             const uint8_t fv =
                 emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
@@ -14534,7 +14555,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 write_slot(e, ck, RAX, in.target, pc);   /* reg:isa */
                 return true;
             }
-            hold();                   /* window 2: the idiv divisor */
+            hold(CAP_MEM_BASE,        /* window 2: the idiv divisor
+                                       * - survives cqo: no rdx */
+                 1u << RDX);          /* reg:isa */
             e.movabs(tmp, static_cast<uint64_t>(dv));
         }
         e.cqo();                          /* cqo */
@@ -16592,7 +16615,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.movabs(acc.r, static_cast<uint64_t>(bo.a.lit));
             else
                 e.load(acc.r, slot_addr(bo.a.slot).payload);
-            hold();
+            /* B2c: when the aop is div/mod the rhs (the divisor in
+             * tmp) must survive cqo - rdx is claimed BY ISA */
+            hold(CAP_MEM_BASE, dv ? 1u << RDX : 0u);
             const bool wp = tmp_pushed;
             std::vector<size_t> j_slows_win;
             if (bo.b.is_lit)
@@ -16609,6 +16634,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 store_dst_bool(e, ck, acc.r, in.target);
             } else {
                 if (dv) {
+                    /* B2c: cqo/idiv + the INT_MIN compare claim rdx
+                     * raw - a pinned rdx is a conflicting event */
+                    e.reg_pin_conflict(RDX);
                     if (!bo.b.is_lit) {
                         /* the edge divisors (#103): rcx+1 unsigned <= 1
                          * catches 0 and -1 in ONE hot branch; the cold
@@ -17087,11 +17115,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * allocation is REFUSED exactly in the runs where the pool is
          * DENIED (a MyLang call's clobber mask) - and denied means NO
          * PIN can exist, so the legacy literal rdx is provably free
-         * there: the fallback is sound by the same argument that
-         * justifies the sync machinery's conv tags. A pinned rdx with
-         * the whole pool exhausted (the one unsound fallback case)
-         * cannot coincide with a refusal, because a pin implies the
-         * pool was NOT denied and 9 candidates were grantable. */
+         * there. B2c: refusal used to IMPLY pool-denied (no pins);
+         * with rdx optimistic it can also mean everything is BUSY BY
+         * PINS at extreme pressure - so the fallback EVICTS a pinned
+         * rdx (a conflicting event; the chunk re-emits with it
+         * denied) and the literal is sound on both arms: pool-denied
+         * has no pins, and the evicted attempt is discarded. */
         int tbl = -1;
         bool tbl_owned = false;
         if (!is_cap) {
@@ -17099,6 +17128,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (tbl >= 0) {
                 tbl_owned = true;
             } else {
+                e.reg_pin_conflict(RDX);
                 ML_CHECK(!e.reg_holds_pin(RDX));  /* reg:conv */
                 tbl = RDX;                     /* reg:conv */
             }
