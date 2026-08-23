@@ -22716,6 +22716,7 @@ static bool myv_loc_escapes()
 extern unsigned long g_vm_table_dispatch;   /* #78 step C coverage */
 extern unsigned long g_jit_end_finally_reraise;  /* #78 step E coverage */
 extern unsigned long g_jit_rethrow_native;       /* #80 coverage */
+extern "C" unsigned long g_jit_scache;           /* #96 inc-1 coverage */
 #endif
 
 static bool vm_handler_table()
@@ -25165,6 +25166,89 @@ static bool jit_reg_model()
 }
 
 /*
+ * #96 INCREMENT 1 - the SPILL-EXTENDED hot set. Twenty accumulators:
+ * 13 take the pins, the overflow takes native-stack homes (bare
+ * qwords), the tail stays frame. The VALUE is the oracle - a stale
+ * home read or a lost flush is a wrong sum - and g_jit_scache (bumped
+ * by the emitted entry of a fragment with >= 1 home) is the reach
+ * proof. The `int(q)` helper call in the loop is LOAD-BEARING: a
+ * caller-saved pin spills/reloads around it, a home must NOT need to
+ * (the stack survives the call), and the barrier'd builtin exercises
+ * the snapshot/clear/restore/re-seed path on the scache family.
+ * Sized from the budgets so neither a wider pool nor a bigger spill
+ * cap can silently eat the shape (the jit_telide_c3 lesson).
+ *
+ * ⛔ WHAT THIS CASE CANNOT SEE, and what covers it: the INTERNED-
+ * EPILOGUE flush of the homes. Every observation here goes through
+ * print's cache barrier, which flushes the homes itself - so deleting
+ * scache from the epilogue swap leaves this green (watched). The
+ * shape that needs the epilogue is an exit consumed with NO barrier
+ * in between - a raise caught mid-loop - and the corpus pins it:
+ * tests/functional/17_elem2_divmod_roles.my answers 12342 for 22080
+ * under exactly that sabotage. Run corpus_diff with -rt, always.
+ */
+static bool jit_spill_homes()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const unsigned long s0 = g_jit_scache;
+    const size_t nacc = jit_pin_budget() + 4;   /* pins + 4 homes */
+    ML_CHECK(jit_spill_budget() >= 4);
+    std::string src = "func f(int n, dyn q) {\n";
+    for (size_t i = 0; i < nacc; i++)
+        src += "    var s" + std::to_string(i) + " = "
+             + std::to_string(i + 1) + ";\n";
+    src += "    for (var i = 0; i < n; i++) {\n";
+    src += "        s0 += i; s0 += int(q);\n";
+    for (size_t i = 1; i < nacc; i++)
+        src += "        s" + std::to_string(i) + " += s"
+             + std::to_string(i - 1) + ";\n";
+    src += "    }\n";
+    for (size_t i = 1; i < nacc; i++)
+        src += "    s0 += s" + std::to_string(i) + ";\n";
+    src += "    return s0;\n}\nprint(f(runtime(24), runtime(2)));\n";
+
+    const auto run = [&](bool vm) -> std::string {
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return cap.str();
+    };
+    const std::string vm_out = run(true);
+    const std::string tw_out = run(false);
+    bool ok = true;
+    if (vm_out != tw_out || tw_out.empty()) {
+        cout << "  spill: VM [" << vm_out << "] vs tw [" << tw_out
+             << "]\n";
+        ok = false;
+    }
+    if (g_jit_scache == s0) {
+        cout << "  spill: no fragment with a spill home ever ENTERED - "
+                "the overflow past " << jit_pin_budget()
+             << " pins was not homed\n";
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * ⛔ #96 rax - THE 13TH AND LAST REGISTER. rax is the emitter's
  * accumulator convention, every helper's return value and the fragment
  * ABI's own return, so it is pinnable only in a run PROVEN rax-free:
@@ -26001,7 +26085,10 @@ static bool jit_telide_c3()
         return true;
     const unsigned long t0 = g_jit_telide;
     const ExecEngine se = g_exec_engine;
-    const size_t naccum = jit_pin_budget() + 3;
+    /* #96 inc-1: the SPILL homes absorb the pin overflow now, so the
+     * elision tier starts past pins + spills (the improvement ate this
+     * shape a second time, exactly as the note below predicts). */
+    const size_t naccum = jit_pin_budget() + jit_spill_budget() + 3;
     g_exec_engine = ExecEngine::Vm;
     std::ostringstream cap;
     std::streambuf *old = cout.rdbuf(cap.rdbuf());
@@ -33110,6 +33197,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: RAX as the 13th pin - engages on a fully-pinned accumulator "
       "kernel, declines on shape and on coverage (#96 rax)",
       jit_rax_pin_test },
+    { "jit: SPILL-homed hot slots past the pin budget - value + reach, "
+      "and the homes survive a helper call un-spilled (#96 inc-1)",
+      jit_spill_homes },
     { "jit: adjacent dead-temp FORWARDING hands values in RAX "
       "(lever A; counter + slow-path rejoin)",
       jit_fwd_deadtemp },

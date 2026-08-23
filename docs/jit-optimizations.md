@@ -7232,3 +7232,61 @@ distinguishing shape); the tracker's report mode is what turned the
 survey from one-abort-at-a-time into a worklist (and its probe runs
 now carry timeouts - report-mode code is genuinely wrong and a
 clobbered loop counter span forever on the first rax survey).
+
+## #96 INCREMENT 1 - THE SPILL-EXTENDED HOT SET (2026-08-21)
+
+**What.** The pick ranks more candidates than the register budget; the
+overflow past the 13 pins is homed in bare 8-byte NATIVE-STACK slots
+([rbp+spill_off(k)], the machinery landed inert earlier in the arc),
+up to MAX_SPILL_HOMES = 16 (MYLANG_JIT_MAXSPILL caps for measurement;
+MYLANG_JIT_OFF=scache is the kill switch; MYLANG_SPILLDBG=1 names the
+homes). A home follows the PIN contract exactly: seeded at every entry
+(head + stubs), flushed type+payload to the frame slot at every exit
+(the interned-epilogue states carry it), snapshot/cleared/restored at
+the cache barriers, and its qualification is inherited from the same
+ranked pick, so the bad()-rule exclusions hold. Unlike a caller-saved
+pin it needs NO call-site spill/reload - the stack survives helper
+calls - so homes live in call-bearing runs the caller-saved pool must
+decline. `scache` joined the four-function cache-state family as its
+FIFTH member (CacheState/is_empty/snapshot/restore/clear + the
+interning comparison + the epilogue swap - the "&&-over-a-family"
+sites, all of them). g_jit_scache (JITSTATS `scache`) is the
+execution proof.
+
+**The three bugs the build found, each a general lesson:**
+
+ 1. **The flush shuttle clobbered the RESUME PC.** flush_cache never
+    wrote a register before; the scache flush shuttles through rax,
+    and the exit protocol is `mov eax, pc; jmp <epilogue>` - the
+    epilogue's flush destroyed the pc and the interpreter dispatched
+    at a wild opcode (190, off a 128-entry table). The shuttle is now
+    push/pop-wrapped, which also covers rax-as-a-pin and the mid-op
+    barrier flushes. THE RULE: a flush path that gains its first
+    register write must audit every caller for values riding THROUGH
+    the flush.
+ 2. **`load_slot_idx` consulted creg by hand** and fell to the frame
+    for everything else - a stale read for a spill-homed element
+    index (the reservation test summed a[k-at-entry] sixteen times).
+    It routes through read_slot now, THE one resolver that knows all
+    three homes. The ctor-plan field read had the identical shape.
+ 3. **MoveV's cache-aware source read the frame raw** for a homed
+    source - the 24-byte boxed copy - so a homed `s` printed <none>
+    (the tag half) and a homed catch counter lost its increment. The
+    spill-homed source is a proven int by the pinned-source argument
+    and now reloads + stores as the ordinary int.
+    THE PATTERN across 2 and 3: "cache-aware" used to mean
+    "creg-aware", and every such site is a stale read the day a slot
+    can be homed in something that is not a register. read_slot /
+    write_slot are the resolvers; a site consulting creg directly
+    must pair it with cspill or route through them.
+
+**Measured honestly (callgrind, OPT=1 ASSERTS=0, vs pre-inc-1):** Ir
+FLAT (1.0001x) on 80-85_regs_*, 46, 03; D1 misses flat too. The
+reason is worth recording: the two-address family had ALREADY made
+the accumulator's frame RMW tag-free and single-instruction, so a
+home trades equal instruction counts - and 40 slots x 48 bytes is 30
+cache lines, comfortably inside L1, so the 8-byte-stride density
+argument has nothing to bite on at this working-set size. Increment 1
+is the SUBSTRATE: the location map {register | spill home | frame}
+that live-range reuse (increment 2) needs for its evictions, plus
+call-transparent homes, landed at zero measured cost.

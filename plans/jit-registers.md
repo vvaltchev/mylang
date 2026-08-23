@@ -3676,3 +3676,22 @@ What remains on the arc: (y)'s ~20 raw u8() sequences bypassing
 wrote(); spill-to-native-stack (the task title's second half, never
 started); widening run_may_pin_rax with evidence (immediate-count
 shifts want a two-address `sar pin, imm` form first).
+
+## (al) 2026-08-21 - INCREMENT 1 LANDED: the spill-extended hot set
+
+The location map is real: a hot slot's home is now one of
+{pin register | native spill slot | frame}, `read_slot`/`write_slot`
+are the resolvers that know all three, and up to 16 overflow picks
+past the 13 pins live in bare stack qwords (docs entry "#96 INCREMENT
+1" for the mechanism, the three watched bugs, and the honest flat
+measurement - the two-address family had already collected the
+accumulator RMW's win, and 40 slots' worth of frame is 30 cache lines
+against a 32KB L1, so the density argument needs a bigger working set
+or increment 2's reuse pressure to bite).
+
+What increment 2 (live-range reuse) inherits: the homes as eviction
+targets, the seed/flush discipline at entries/exits/barriers, and the
+"cache-aware means creg-aware" audit finding - any site it adds must
+route slot access through read_slot/write_slot or pair creg with
+cspill, because the third home made every hand-rolled creg consult a
+stale read.
