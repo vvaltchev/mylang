@@ -3610,3 +3610,50 @@ VALUE bind (`foreach s in rows` - do_iter / the foreach Next op pays
 the same put() chain; the probe's one-bind loop cost 0.16s of the
 0.28s shape, the same class of target), and the tree-walker's
 bind_loop_var (perf parity only - values already identical).
+
+## H4 (2026-08-12): an INDIRECT call's result is a typed operand
+
+A call through a func VALUE degraded the whole surrounding expression to
+the boxed tier. The A/B is one operand wide:
+
+    var q = runtime(3); s = s + q;    ->  i.bin   (unboxed)
+    var f = mk(7);      s = s + f(i); ->  bin.v   (boxed)
+
+Nothing was unproven - `-dti` gives `f : func(int)->int`, `s : int`, and
+M8 built `TypedScalarExpr<arith,i>(CallExpr)`. Only the codegen dropped
+it. The DIRECT call has been a typed leaf all along (`try_native_call`,
+whose comment already said "so `s += f(i)` stays the int fast path");
+its INDIRECT sibling never was. On 78 that cost a 190 Ir/iteration
+helper chain for one float addition.
+
+`try_call_leaf` materializes the result with the EXISTING call op into a
+temp; the temp IS an int/float frame slot the typed ops read by tag.
+**No new opcode and NO RUNTIME GUARD** - the latter is legal only
+because option B (statictype.cpp) made function subtyping compare the
+whole SIGNATURE, so a concrete static return type is a real runtime
+guarantee. Loosening that rule breaks this tier first, silently.
+
+MEASURED (interleaved --baseline, OPT=1 ASSERTS=0): **78 0.74x wall,
+my/cpp 10.87x -> 8.02x, out of the top five**; suite geomean cur/base
+1.001x with untouched benches spanning 0.88-1.11x.
+
+**PLACEMENT - three wrong answers, each caught by a test:**
+ 1. EARLY -> infinite recursion: `compile_boxed_expr` DELEGATES back to
+    the typed compilers for a th==i/f node. Hence its `allow_typed`
+    opt-out, which exists for this one caller.
+ 2. LAST-resort -> dead: compile_int_expr returns false at
+    `if (!t) return false;` for a non-TypedScalarExpr, before the tail.
+ 3. Unnarrowed at the right spot -> swallowed `sqrt(i)` from the typed
+    MathFnV into the generic CallBuiltinV marshal.
+Final: after every specialized typed path, before the TypedScalarExpr
+cast. The Direct*-form exclusion is DEFENSIVE (removing it stays green
+at this position - watched); the PLACEMENT is what earns the credit.
+
+**THE TEST TRAP, which generalizes past this change:** counting
+`IntBin`/`FloatBin` made the shape test read 0 and pass vacuously - the
+plain op disappears TWICE before vm_compile returns, fused into
+`IntAddStep` (#9) and rewritten by `specialize_arith_ops` into the B1/B2
+family (the float case emits **FloatAddRR**). THE AUDIT-TABLE STAGE TRAP
+in test form, and the second time it has bitten a test in this arc.
+**A test that names an opcode must name the one that SURVIVES to the
+stage it inspects.**
