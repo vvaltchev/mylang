@@ -7603,3 +7603,22 @@ DOES. The cost: one discarded emission per conflicting chunk
 (`rax_retries` in MYLANG_JITSTATS; 83_regs_int_40 retries once -
 its 40 accumulators exceeded the old coverage too - while
 80_regs_int_08 keeps its rax pin with zero retries).
+
+## Endgame B2 (2026-08-22) - the fwd bus DECLARES; the ModRI evict gap
+
+A pin-producing forwarded op no longer pays `mov rax, <pin>` to put
+its value on the bus: it sets g_fwd.res_reg = <pin> and the consumer
+reads emit_fwd_bump's return. Measured honestly: pure mov MIGRATION
+today - every corpus consumer of a forwarded pin value is DESTRUCTIVE
+(it computes into the value), so the copy moved from producer to
+consumer and no count changed (21 programs drift by position only).
+The structural point stands: the bus is DECLARED state, no consumer
+may assume rax, and a read-only consumer takes the pin directly the
+day one appears. The div consumers (IntModRI/IntAddModRI/IntBin's
+arm) copy a non-rax bus value into rax - the ISA's register, paid
+only when it differs. Plus the Phase A completeness fix: IntModRI /
+IntAddModRI stage in rax raw BY ISA with no ask and no bracket, so
+they invoke the conflict eviction themselves - without it a
+rax-pinned attempt would have clobbered the pin unretried (a shape no
+corpus program has: 12+ hot slots AND a specialized mod - closed on
+inspection, not by a failure).

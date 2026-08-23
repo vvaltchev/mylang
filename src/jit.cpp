@@ -14110,11 +14110,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     e.op_reg_slot(aop, d,
                                   slot_addr(in.b_slot()).payload);
             }
-            /* the consumer reads the DECLARED bus register
-             * (g_fwd.res_reg - the loop's reset names the default);
-             * one move, and only when a consumer actually exists */
+            /* B2: the producer DECLARES its pin as the bus register
+             * - no move at all. The consumer reads emit_fwd_bump's
+             * return; a consumer that would COMPUTE INTO the bus
+             * register copies it aside first (the pin is read-only
+             * to it). The mov this deletes ran once per forwarded
+             * pin-produced value. */
             if (g_fwd.prod == in.target) {
-                e.mov_rr(g_fwd.res_reg, d);
+                g_fwd.res_reg = d;
                 g_fwd.armed = true;
             } else {
                 g_fwd = JitFwd{};  /* the result is in the PIN, not
@@ -14157,8 +14160,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         AccScratch acc(e, AccScratch::deferred_t{});
         uint8_t A = 0;                   /* the arm's accumulator */
-        if (fa || fb)
+        if (fa || fb) {
             A = emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+            /* B2: a DECLARED pin is read-only to this arm - it
+             * computes INTO A, so copy the value aside (the mov the
+             * producer no longer pays, owed only here) */
+            if (e.reg_holds_pin(A)) {
+                acc.take();
+                e.mov_rr(acc.r, A);
+                A = acc.r;
+            }
+        }
         /*
          * ⛔ #96: the SECOND operand is used DIRECTLY when it needs no
          * staging - a pinned slot is already a register operand and an
@@ -14392,8 +14404,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         AccScratch acc(e, AccScratch::deferred_t{});
         uint8_t A = 0;                   /* the arm's accumulator */
-        if (fa || fb)
+        if (fa || fb) {
             A = emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+            /* B2: a declared pin is read-only; this arm shifts A */
+            if (fa && e.reg_holds_pin(A)) {
+                acc.take();
+                e.mov_rr(acc.r, A);
+                A = acc.r;
+            }
+        }
         if (fb)
             e.mov_rr(tmp, A);            /* the count, before the value */
         if (!fa) {
@@ -14450,14 +14469,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* the dividend chain is rax BY ISA on both exits - cqo+idiv
          * claims rax:rdx, and the div-magic imul sequence is anchored
          * there too - so this case stages in rax by hard reason, not
-         * convention. Forwarding cannot arrive elsewhere: the bus
-         * default is rax and no producer declares another register
-         * while the gates stand (ML_CHECKed). */
+         * convention. Phase A: the raw rax writes below are exactly a
+         * conflicting event - evict a rax pin and retry, like the
+         * accumulator ask does (this case never asks, so it must call
+         * the seam itself). */
+        e.rax_pin_conflict();
         if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp) {
             const uint8_t fv =
                 emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
-            ML_CHECK_MSG(fv == RAX, "idiv needs rax");   /* reg:isa */
-            (void)fv;              /* the check is ASSERTS-only */
+            /* B2: a declared pin arrives in its own register; the
+             * dividend must be rax BY ISA - one read-only copy */
+            if (fv != RAX)                               /* reg:isa */
+                e.mov_rr(RAX, fv);                       /* reg:isa */
         } else {
             read_slot(e, RAX, in.a_slot());              /* reg:isa */
         }
@@ -14482,12 +14505,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* lever A, consumer side (operand `a` only - see the
          * predicate). The whole (a+b) sum IS the dividend, and the
          * dividend register is rax by ISA on both exits (cqo+idiv /
-         * the div-magic imul) - hard reason, not convention. */
+         * the div-magic imul) - hard reason, not convention.
+         * Phase A: raw rax writes = a conflicting event; evict. */
+        e.rax_pin_conflict();
         if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp) {
             const uint8_t fv =
                 emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
-            ML_CHECK_MSG(fv == RAX, "idiv needs rax");   /* reg:isa */
-            (void)fv;              /* the check is ASSERTS-only */
+            /* B2: a declared pin arrives in its own register; the
+             * dividend must be rax BY ISA - one read-only copy */
+            if (fv != RAX)                               /* reg:isa */
+                e.mov_rr(RAX, fv);                       /* reg:isa */
         } else {
             read_slot(e, RAX, in.a_slot());              /* reg:isa */
         }
@@ -17869,6 +17896,12 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                 /* `+` commutes: the forwarded value IS the
                  * accumulator and the slot loads into tmp */
                 A = emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+                /* B2: a declared pin is read-only; the add writes A */
+                if (e.reg_holds_pin(A)) {
+                    acc.take();
+                    e.mov_rr(acc.r, A);
+                    A = acc.r;
+                }
                 tmp_slot(adst, use_add);
             } else {
                 acc.take();
