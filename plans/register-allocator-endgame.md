@@ -88,20 +88,40 @@ The collision: ~60 emit sites do
 and the comment discipline is "the epilogue runs FIRST - rax
 survives it". If rax became a spillable pin like r10/r11, the
 epilogue would RELOAD the pin into rax between the call and the
-status test, destroying the status. The interim resolution (v1,
-until D dissolves it): rax may be PINNED only in runs that emit NO
-helper calls at all. Derive "call-free" STRUCTURALLY, not from a new
-hand list - candidates, in preference order:
-  (a) reuse the delete-originals classification: a run whose every
-      op is op_fully_native/never-exits emits no helper call on any
-      path (these tables are correctness-audited elsewhere and
-      heavily tested);
-  (b) a post-emit check is NOT possible (the pick runs first), so if
-      (a) is too coarse in practice, measure how many runs it
-      excludes before inventing anything finer.
-NOTE: Phase D dissolves this entirely - with interval splitting, a
-rax interval simply ENDS before each call, which is exactly what a C
-compiler does with caller-saved registers. Do not gold-plate the v1.
+status test, destroying the status. After a helper call TWO values
+compete for rax - the ABI status and the pinned variable - and no
+reload ORDER fixes that; only ending the pin's interval around the
+call does (which is phase D's splitting, and why D dissolves this).
+
+A0 ANALYSIS RESULT (2026-08-22, investigated): there is NO existing
+"emits no helper call" classification to reuse -
+ - op_fully_native is DELETABILITY (never-exits OR convey-with-own-
+   loc): CallBuiltinV is fully_native and obviously calls a helper;
+ - op_never_exits admits helper-calling ops too (MoveV calls
+   jit_move);
+ - a NEW hand list would be an audited table whose stale entry
+   corrupts a pin (the DANGEROUS failure direction) - inventing one
+   is the exact thing this arc deletes.
+
+THE CHOSEN RESOLUTION - (O) RE-EMIT ON CONFLICT, zero new tables:
+the pick may hand rax to a pin optimistically (it is LAST in
+preference, so this is rare - it needs 12+ hot slots); emission
+proceeds; the FIRST emit_call_prologue that finds a rax pin ABORTS
+the run's emission (the mid-run bail path already exists - "a
+mid-emission return false kills the run's nativization" is a known,
+handled event) and the run RE-EMITS ONCE with rax added to the
+denied mask. Sound BY CONSTRUCTION: the decision is made from what
+emission actually did, not from a prediction table; the cost is one
+wasted partial emission on a rare shape. PREREQUISITE to verify
+before building: read the run-emission loop's existing
+bail/rollback path (what state is rewound - e.b, call_relocs,
+labels/fixups, the tracker, the cache vectors) and reuse it for the
+restart rather than inventing rollback.
+FALLBACK if rollback is messier than it looks: v0 ships with rax
+denied UNCONDITIONALLY except in runs the pick proves trivially
+bracket-free by construction... does NOT exist without a table - so
+the real fallback is keeping today's WHITELISTED-RUNS-ONLY behavior
+alive behind the deleted gates' semantics until D. Prefer (O).
 
 ### A1. Make rax grantable to the PICK behind the existing machinery
  - Remove the unconditional bit-0 deny; instead deny rax only when
