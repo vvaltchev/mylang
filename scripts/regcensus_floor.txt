@@ -1,0 +1,18 @@
+# UNJUSTIFIED hardcoded-register floors for scripts/regcensus.py --gate.
+# The maintainer mandate (2026-08-22): every count here must reach ZERO -
+# a site either converts to alloc_scratch(caps) or carries a reg:isa /
+# reg:abi / reg:conv tag with a hard reason. A conversion batch LOWERS
+# its floors in the same commit; the gate fails on ANY drift in either
+# direction, so progress is monotonic and slippage is loud.
+# RAWENC = hand-encoded instruction lines (the census blind spot).
+RAX    621
+RCX    143
+RDX    107
+RSI     38
+RDI     26
+R8      56
+R9      29
+R10     76
+R11     41
+TOTAL 1137
+RAWENC  20

@@ -3595,17 +3595,29 @@ watched failing. The tracker blind spot is closed (an), the
 two-address family covers arith + shifts (ao), and the placement
 cost model gates the seam tier.
 
-What remains is the NEXT ARC, not this task's mandate - THE ORDER
-FROM HERE above stands: thread the ~1100 hardcoded emitter sites
-(census: RAX 588, RCX 161, RDX 103) through a capability-asking
-alloc_scratch(caps) so they ASK the model rather than assume, at
-which point backtracking/DP allocation has genuine choices to
-search. Two honest facts for whoever schedules it: the MAXPINS sweep
-measured near-ZERO marginal value for pins beyond the first two on
-every bench, so the justification is ARCHITECTURE (#101's peephole/
-scheduling pass, the full-native endgame), not a benchmark; and the
-value of every conversion so far was the bugs it surfaced, not the
-register it freed.
+**RE-OPENED 2026-08-22 (maintainer): the threading IS the mandate.**
+His words: an emitter may request a specific register only with a
+HARD reason - calling convention, an instruction that requires it -
+and for all other cases it is *mandatory* to go through the
+allocator. The task stays open until ALL hardcoded callsites are
+fixed. Ground truth at re-open (regcensus): 1137 UNJUSTIFIED
+unbracketed sites - RAX 621, RCX 143, RDX 107, RSI 38, RDI 26,
+R8 56, R9 29, R10 76, R11 41 - plus the 20 raw-encoded blind-spot
+lines. THE ORDER FROM HERE above is the route; backtracking/DP
+become meaningful once take() has genuine choices.
+
+**The bookkeeping (built at re-open):** a site is legal iff
+BRACKETED (call prologue spill covers it), or tagged on its line -
+`reg:isa` (the instruction demands it), `reg:abi` (a calling
+convention outside a bracket: the fragment entry/exit protocol),
+`reg:conv` (a documented fragment-wide internal ABI: the type
+singletons). regcensus.py validates tags (unknown reason = error,
+tag on a register-free line = STALE, both watched), splits the
+table into justified/UNJUSTIFIED, and `--gate` ratchets every
+register against scripts/regcensus_floor.txt IN BOTH DIRECTIONS -
+a new site fails, and an improvement whose floor was not lowered in
+the same commit fails too. driver_checks.sh runs the gate, so every
+CI lane and the local battery enforce it.
 
 ## (aj) 2026-08-20 - the admission FINISHED: both arenas green; what the
 ## off-arena tail taught
