@@ -750,3 +750,62 @@ the VM and `false` in the tree-walker. Latent in 8 corpus programs
 when you change HOW a construct lowers, re-audit every table that
 classifies its OPCODE - the entry does not have to be edited to become
 false.
+
+## ⛔ THE TYPED CALLBACK ENTRY: BUILT, MEASURED, REVERTED (2026-08-14)
+## -27% INSTRUCTIONS AND +19% WALL CLOCK. A negative result worth keeping.
+
+The design proposed for the higher-order builtins - hand `VmInvoker` the
+RAW scalar a flat container already holds, instead of boxing it into an
+`EvalValue` argv array for the bind to copy out of - was built end to
+end and is being kept OUT of the tree. The instruction reduction is
+real; the wall clock says no.
+
+WHAT WAS BUILT (all of it worked and was green):
+ - `VmInvoker::call(args...)`, ONE entry every higher-order builtin
+   uses, picking the tier internally: argv-free bind / boxed invoke /
+   `eval_func` when there is no VM activation. Written this way on the
+   maintainer's brief - more builtins are coming and the alternative is
+   each repeating the ready/typed/boxed ladder. All FIVE existing call
+   sites (sort, find-with-key, make_array, make_dict, map/filter)
+   collapsed to a single `inv.call(...)` line with no branching.
+ - The gate is `fast_bind`, and this is the first thing worth keeping:
+   the callee's INFERRED TYPES do not enter it. `fast_bind` already
+   means "no parameter needs work beyond the value copy", so writing a
+   raw scalar into the slot is exactly what the boxed path does with a
+   boxed one - the caller already holds the right scalar.
+ - **The FIRST gate, on `ParamDesc::proven_type`, engaged ZERO times**,
+   for a structural reason: `proven_type` is stamped only for a function
+   NEVER USED AS A VALUE, and a callback is by definition a function
+   used as a value. Anyone reaching for that field here should stop.
+
+MEASURED, and the two numbers disagree violently:
+ - **-27.2% instructions** on 34_sort_custom_cmp (-84.6 Ir per
+   comparison), against a correctly-built baseline;
+ - **+19% WALL CLOCK** on the same bench (0.046 -> 0.055s), +16% on
+   67_make_dict, +9% on 35_map_filter. Reproduced on a second run.
+   Suite geomean 1.009x SLOWER.
+
+THE CONTROL THAT LOCATES IT: **33_sort_ints, which runs the same sort
+code with NO comparator, measures exactly 1.00x.** So this is not a
+general code-layout shift in the sort - it is the callback path itself.
+The mechanism is almost certainly the one this codebase already
+documents as "the LOOP-BODY TEXT RULE": sharing the post-bind half
+between the two tiers meant splitting `invoke()` into `invoke()` +
+`run_body()`, so EVERY element - boxed path included - now pays an
+out-of-line call that used to be straight-line code.
+
+WHAT THE NEXT ATTEMPT SHOULD DO DIFFERENTLY. Do not share the body
+through an out-of-line function. Either keep `invoke()` monolithic and
+DUPLICATE the post-bind half into the typed entry (the duplication is
+the cheaper mistake here), or move both into the header so the split
+costs nothing. The one-line `ML_ALWAYS_INLINE` fix does NOT work as
+written - a member declared in vm.h and defined in vm.cpp is not
+visible at the call sites and the build refuses it.
+
+AND A MEASUREMENT ERROR OF MINE, recorded because it nearly shipped this:
+the first reading was "-29.5% Ir", taken against callgrind files
+captured BEFORE the constant-divisor strength reduction landed. Bench 34
+fills its array with an LCG containing `x % 2147483647`, so most of that
+"win" was the previous commit. **A baseline binary and a baseline
+PROFILE are not the same thing** - rebuild the baseline, do not reuse
+yesterday's .out files.
