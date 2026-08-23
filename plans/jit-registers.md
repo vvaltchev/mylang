@@ -3973,3 +3973,21 @@ pattern) per family, plus the existing tracker as referee.
 
 RAX 455 after that is the staging convention - read_slot/write_slot/
 store_dst's caller contract - the arc's finale (#101 adjacency).
+
+## (ax) 2026-08-22 - batch 8b LANDED: the borrow family asks first
+
+hold()/tmp_hold() consult alloc_scratch(need, prefer rcx); refusal
+falls back to the old push borrow. CAP_SHIFT_CNT on the IntBin shift
+aops makes the model enforce CL. The conversion immediately flushed
+two literal-RCX residues (the StoreCaptureV copy loop - tracker abort
+by name; the IntBin slot-divisor gate - an ASan FPE on the div
+differential), both respelled through tmp/cpy - and the sabotage
+watch confirms the nets see the class: reverting idiv_reg(tmp) to
+literal RCX fails the -rt differential at once. 35/116 corpus
+programs drift by pure register substitution, Ir flat
+(+0.002..+0.014%, compile-side). Census: RCX 41, TOTAL 496.
+
+Remaining RCX 41 (batch 8c): RefScratch(e, RCX) + the `scr = RCX`
+ref-check defaults, div_magic's `keep`, the *_tag_via scratch args,
+and the PushHandler/PopHandler cursor math (the SetPend pattern).
+Then RAX 455 - the staging convention, the finale.

@@ -13590,12 +13590,33 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
      * tracker verifies every placement - this conversion was DRIVEN by
      * its aborts, not by reading.
      */
-    const uint8_t tmp = RCX;
-    const uint8_t cpy = RCX;
+    /* #96 (8b): the staging/copy register ASKS THE ALLOCATOR first -
+     * hold(need) takes a capability, so the IntBin shift arm's CL
+     * requirement (CAP_SHIFT_CNT, which only rcx satisfies) is enforced
+     * by the model instead of by the borrow's luck. Granted: no push,
+     * no pop (a pinned-rcx window LOSES the push/pop pair), nothing for
+     * BorrowSuspend to restore on a raise arm. Refused: the old
+     * push-when-occupied borrow of rcx, byte-identical. tmp/cpy stay
+     * two NAMES for one register (separate lifetimes, same value). */
+    uint8_t tmp = RCX;                               /* reg:conv */
+    uint8_t cpy = RCX;                               /* reg:conv */
     bool tmp_pushed = false;
-    const auto hold = [&]() {
-        if (e.trk_borrowed & (1u << tmp))
-            return;                       /* already held this window */
+    bool tmp_active = false;
+    int tmp_grant = -1;
+    const auto hold = [&](uint32_t need = CAP_MEM_BASE) {
+        if (tmp_active || (e.trk_borrowed & (1u << RCX))) {
+            /* already held this window (the second spelling covers a
+             * window opened by the raw borrow before this landed) */
+            ML_CHECK((gp_caps(tmp) & need) == need);
+            return;
+        }
+        tmp_active = true;
+        tmp_grant = e.alloc_scratch(need, 1u << RCX);
+        if (tmp_grant >= 0) {
+            tmp = cpy = static_cast<uint8_t>(tmp_grant);
+            return;
+        }
+        tmp = cpy = static_cast<uint8_t>(RCX);       /* reg:conv */
         tmp_pushed = e.reg_is_occupied(tmp);
         if (tmp_pushed)
             e.push_reg(tmp);
@@ -13603,10 +13624,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.scratch(tmp);
     };
     const auto drop = [&]() {
-        if (tmp_pushed) {
+        if (tmp_grant >= 0) {
+            e.free_scratch(static_cast<uint8_t>(tmp_grant));
+            tmp_grant = -1;
+        } else if (tmp_pushed) {
             e.pop_reg(tmp);
             tmp_pushed = false;
         }
+        tmp_active = false;
+        tmp = cpy = static_cast<uint8_t>(RCX);       /* reg:conv */
     };
     switch (in.op) {
 
@@ -13991,7 +14017,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             break;
         }
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
-        hold();
+        /* the shift aops feed emit_reg_shift, whose count register is
+         * CL by ISA - CAP_SHIFT_CNT (only rcx) makes the model enforce
+         * what the borrow used to get by luck */
+        hold(in.aop == Op::shl || in.aop == Op::shr
+                 || in.aop == Op::ushr ? CAP_SHIFT_CNT : CAP_MEM_BASE);
         load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         switch (in.aop) {
         case Op::div: case Op::mod:
@@ -14015,7 +14045,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (in.b_is_lit()) {
                 if (in.b_lit() == 0) {
                     /* always-throws: test on the loaded literal */
-                    e.test_rr(RCX, RCX);  /* test rcx,rcx */
+                    e.test_rr(tmp, tmp);
                     raise_convey_unless(e, ck, 0x75, JR_DIV0, pc, old_pc);
                 } else if (in.b_lit() == -1) {
                     e.movabs(RDX, 0x8000000000000000ull);  /* reg:isa */
@@ -14041,13 +14071,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     return true;
                 }
             } else {
-                e.lea_base(RDX, RCX, 1);  /* reg:isa */
+                e.lea_base(RDX, tmp, 1);  /* reg:isa: rdx (idiv's half) */
                                                      /* lea rdx,[rcx+1] */
                 e.cmp_reg_imm(RDX, 1);  /* reg:isa */
                                                      /* cmp rdx,1 */
                 const size_t j_div = e.j32(0x77);    /* ja .div (hot) */
                 /* cold: rcx is 0 or -1 */
-                e.test_rr(RCX, RCX);  /* test rcx,rcx */
+                e.test_rr(tmp, tmp);
                 raise_convey_unless(e, ck, 0x75, JR_DIV0, pc, old_pc);
                 e.movabs(RDX, 0x8000000000000000ull);  /* reg:isa */
                 e.cmp_rr(RAX, RDX);  /* reg:isa: cmp rax,rdx */
@@ -14057,7 +14087,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.patch32_here(j_div);
             }
             e.cqo();              /* cqo */
-            e.idiv_reg(RCX);  /* idiv rcx */
+            e.idiv_reg(tmp);
             drop();           /* the divisor is consumed */
             write_slot(e, ck,
                        in.aop == Op::div ? RAX : RDX,  /* reg:isa */
@@ -14186,7 +14216,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         hold();
         e.movabs(tmp, static_cast<uint64_t>(in.b_lit()));
         e.cqo();                          /* cqo */
-        e.idiv_reg(RCX);              /* idiv rcx */
+        e.idiv_reg(tmp);
         drop();                       /* the divisor is consumed */
                 write_slot(e, ck, RDX,           /* reg:isa */
                            in.target, pc);       /* remainder */
@@ -14216,7 +14246,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.movabs(tmp, static_cast<uint64_t>(dv));
         }
         e.cqo();                          /* cqo */
-        e.idiv_reg(RCX);              /* idiv rcx */
+        e.idiv_reg(tmp);
         drop();
         write_slot(e, ck, RDX, in.target, pc);  /* reg:isa */
         return true;
@@ -16189,7 +16219,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (bo.b.is_lit)
                 e.movabs(tmp, static_cast<uint64_t>(bo.b.lit));
             else
-                e.load(RCX, slot_addr(bo.b.slot).payload);
+                e.load(tmp, slot_addr(bo.b.slot).payload);
             if (cmp) {
                 e.cmp_rr(RAX, tmp);
                 drop();                /* flags survive the pop */
@@ -16209,10 +16239,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                          * the overflow) - an ordinary x / -1 falls back
                          * into the native idiv (rax = the dividend is
                          * already loaded; rdx is dead, cqo is next). */
-                        e.lea_base(RDX, RCX, 1);  /* reg:isa */
+                        e.lea_base(RDX, tmp, 1);  /* reg:isa: rdx (idiv's half) */
                         e.cmp_reg_imm(RDX, 1);  /* reg:isa */
                         const size_t j_div = e.j32(0x77);  /* ja .div */
-                        e.test_rr(RCX, RCX);
+                        e.test_rr(tmp, tmp);
                         j_slows_win.push_back(e.j32(0x74)); /* 0 -> slow */
                         e.movabs(RDX, 0x8000000000000000ull);  /* reg:isa */
                         e.cmp_rr(RAX, RDX);  /* reg:isa */
@@ -16220,11 +16250,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         e.patch32_here(j_div);
                     }
                     e.cqo();              /* cqo */
-                    e.idiv_reg(RCX);  /* idiv rcx */
+                    e.idiv_reg(tmp);
                     if (bo.aop == Op::mod)
                 e.mov_rr(RAX, RDX);  /* reg:isa: the remainder */
                 } else {
-                    op_rr(e, bo.aop, RAX, RCX);
+                    op_rr(e, bo.aop, RAX, tmp);
                 }
                 drop();               /* the rhs is consumed */
                 if (comp) {
@@ -16707,19 +16737,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * self-closes), so no path enters that arm with this push
          * pending - the window needs no compensation stub */
         hold();
-        e.load(RCX, src.payload);
-        e.store_base(RCX, cb, soff + pv0);
-        e.load(RCX, src.payload + 8);
-        e.store_base(RCX, cb, soff + pv0 + 8);
-        e.load(RCX, src.payload + 16);
-        e.store_base(RCX, cb, soff + pv0 + 16);
+        e.load(cpy, src.payload);
+        e.store_base(cpy, cb, soff + pv0);
+        e.load(cpy, src.payload + 8);
+        e.store_base(cpy, cb, soff + pv0 + 8);
+        e.load(cpy, src.payload + 16);
+        e.store_base(cpy, cb, soff + pv0 + 16);
         e.store_base(RAX, cb, soff + ty0);
         if (!is_cap) {
-            /* defined[gslot] = 1: rcx = defined.data() (the table is
+            /* defined[gslot] = 1: cpy = defined.data() (the table is
              * still in `tbl` - the parameterized contract). */
-            e.load_base(RCX, static_cast<uint8_t>(tbl),
+            e.load_base(cpy, static_cast<uint8_t>(tbl),
                         static_cast<int32_t>(jit_layout().gft_defined));
-            e.store_byte_base_imm(RCX, static_cast<int32_t>(in.target), 0x01);
+            e.store_byte_base_imm(cpy, static_cast<int32_t>(in.target),
+                                  0x01);
             if (tbl_owned)
                 e.free_scratch(static_cast<uint8_t>(tbl));
         }
@@ -17169,26 +17200,32 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
      * becomes pinnable. They are deleted; these three replace them,
      * covering the writes that are real.
      */
-    const uint8_t tmp = RCX;
+    uint8_t tmp = RCX;                               /* reg:conv */
     /*
-     * ⛔ #96 (c): THE STAGING REGISTER IS BORROWED, NOT OWNED - and each
-     * helper takes its CONSUMER as a callback, so "load tmp" without
-     * saying what reads it is not expressible.
+     * ⛔ #96 (c, then 8b): THE STAGING REGISTER ASKS THE ALLOCATOR and
+     * only then falls back to the borrow - and each helper takes its
+     * CONSUMER as a callback, so "load tmp" without saying what reads
+     * it is not expressible.
      *
-     * That shape is what makes the spill leak-proof. When `tmp` holds a
-     * PIN the borrow is a push/pop pair, and an unbalanced push is not
-     * a wrong answer, it is a corrupted stack - so the release must not
-     * be something a caller can forget. Making it the HELPER's turns a
-     * discipline into a structure. (RAII would do the same; a callback
-     * keeps the pairs on one line, which is how they already read.)
-     *
-     * Sound for the same reason RefScratch is: every use here is a load
-     * followed by exactly ONE consuming instruction, with no call and
-     * no rsp-relative access between them, and `pop` does not touch
-     * flags - so a `cmp` consumer's flags still reach the jcc after it.
+     * That shape is what makes the spill leak-proof. When the grant is
+     * REFUSED and `tmp` holds a pin, the borrow is a push/pop pair, and
+     * an unbalanced push is not a wrong answer, it is a corrupted
+     * stack - so the release must not be something a caller can
+     * forget. Making it the HELPER's turns a discipline into a
+     * structure. A granted window emits NO push/pop at all - strictly
+     * fewer instructions than the borrow it replaces, and a `cmp`
+     * consumer's flags reach its jcc either way (pop does not touch
+     * flags; a grant emits nothing).
      */
     bool tmp_spilled = false;
+    int tmp_g = -1;
     const auto tmp_hold = [&]() {
+        tmp_g = e.alloc_scratch(CAP_MEM_BASE, 1u << RCX);
+        if (tmp_g >= 0) {
+            tmp = static_cast<uint8_t>(tmp_g);
+            return;
+        }
+        tmp = static_cast<uint8_t>(RCX);             /* reg:conv */
         tmp_spilled = e.reg_is_occupied(tmp);
         if (tmp_spilled)
             e.push_reg(tmp);
@@ -17196,8 +17233,14 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             e.scratch(tmp);
     };
     const auto tmp_drop = [&]() {
-        if (tmp_spilled)
+        if (tmp_g >= 0) {
+            e.free_scratch(static_cast<uint8_t>(tmp_g));
+            tmp_g = -1;
+        } else if (tmp_spilled) {
             e.pop_reg(tmp);
+            tmp_spilled = false;
+        }
+        tmp = static_cast<uint8_t>(RCX);             /* reg:conv */
     };
     const auto tmp_lit = [&](uint64_t v, auto &&use) {
         tmp_hold();
