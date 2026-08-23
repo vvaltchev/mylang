@@ -7796,3 +7796,37 @@ opcode 54) - the net C3's 89-site conversion needs, proven before the
 conversion starts. MEASURED: 116/116 byte-identical, both arenas
 (vdjcmp vs HEAD); -rt 1947/1947 both arenas; relna + clang lto0
 green; census gate at its floors.
+
+## Endgame C3 batch 2 (2026-08-22) - the float staging pair is a
+## RUN-SCOPED GRANT; the xmm census reaches ZERO
+
+The 81 remaining hardcoded X0/X1 sites were one seam, not 81 edits:
+the per-op float staging pair became a run-scoped grant
+(`Emitter::grant_fstage`, the B1 tag-holder pattern - prefer
+xmm0/xmm1 on the fresh allocator, so it always lands there and the
+conversion is byte-identical by construction), and every staging
+site reads `fsa()/fsb()` instead of naming a register. Holding the
+grant run-long is ALSO what makes the float fwd bus sound with no
+per-op exclude dance: a forwarded value sleeps in a granted
+register between ops, and nothing else can be granted it.
+
+With it: fp_allocatable includes xmm0/1 now; the fixed-pair encoders
+`farith_x1_x0`/`pxor_x1` are DELETED (the sixth audit-table shape's
+rule - generic farith/pxor_rr replace them, byte-for-byte identical
+encodings); the element tiers' BARE-NUMBER xmm operands (0/1 as a
+literal argument - the census's blind spot) converted to queries
+too; and the fmod arm ML_CHECKs that the stage IS the SysV pair,
+because force_x0_x1 conflates "force the stage" with "libm wants
+xmm0/xmm1" - sound while they coincide, and a Phase D stage move
+must add marshalling moves there instead (the check names it).
+
+What stays literal is the SysV float ABI alone: 8 XMM0 + 1 XMM1
+sites, all abi-tagged (libm args/returns, jit_put_float's xmm0,
+the movx0 counter's comparison).
+
+THE FLOAT CENSUS IS AT ZERO - same day it was first measured (61+28
+this morning). Floors: XMM0 0, XMM1 0, TOTAL 0. MEASURED: 116/116
+byte-identical both arenas; -rt 1947/1947 both arenas; corpus both
+arenas + driver green; relna + clang lto0 green. Phase C of
+plans/register-allocator-endgame.md is COMPLETE (xmm8-15 join when
+the float encoders learn REX - a capability gap, recorded there).
