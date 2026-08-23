@@ -4104,3 +4104,46 @@ BATCHES:
  - 9c: emit_branch + the element tiers.
  - 9d: the residue (hoist preamble, exc_stamp, div_magic quotient,
    fwd_bump, the model-internal mentions) + the ledger close-out.
+
+## (ba) 2026-08-22 - batches 9a + 9b: the hard-reason clusters tagged;
+## THE ACCUMULATOR ASK lands; emit_op's staging converted
+
+9a (d52e4d6): 75 reg:abi (post-call status/result, the frag-ret
+protocol, the call veneers), 5 reg:conv (model/policy), 1 reg:isa.
+RAX 455 -> 320, byte-identical (tags + two formatting splits).
+
+9b-i (68c499d): Emitter::acc_take/acc_free + AccScratch (deferred
+mode for whitelisted-op cases; refusal -> ALTERNATIVE grant, never
+literal rax - the inverse of the ctx_chain rule, since refusal means
+rax IS pinned). emit_fwd_bump RETURNS the value's register; producers
+declare g_fwd.res_reg. Converted: LoadImmInt, the IntAddRR family's
+four arms, IntBin (emit_reg_shift gains the value register), the
+shift case, MoveV, LoadBuiltinV/LoadCaptureV/LoadConstV; the
+IntModRI/IntAddModRI dividend chains + div_magic tagged reg:isa
+(cqo+idiv claims rax:rdx; the magic imul anchors there too).
+movq_rax_x DELETED for movq_r_x(dst, src). PLUS a -vdj tool fix found
+by vdjcmp's flake detector: the imm_str pow2 exemption below 2^32 was
+a reproducibility hole (MAP_32BIT sometimes lands at 0x40000000 -
+the dump differed from ITSELF on 69_exc_crossframe). RAX -> 259,
+RAWENC 17 -> 15. Sabotage watched: acc_take forced to refuse aborts
+-rt by name at the first native int run.
+
+9b-ii (d531f91 + 28cfee3): CmpIntV/CmpFloatV (CAP_BYTE_NOREX grants;
+the raw `setcc al` triples become setcc_lo8), UnpackElem*/
+StructFieldAddInt (the across-the-prologue index staging is a held
+window now), StrLen, CallV's chunk-pointer staging, UnaryV's whole
+boxed fast-tier case (cmp_rax_tag spelling gone; movq_xmm_from;
+the idiv ML_CHECK carries its reg:isa ON the register's line - the
+census's FIFTH self-catch), StoreCaptureV. RAX -> 218 OCCURRENCES
+(floors count occurrences, not lines - the gate said so).
+
+REMAINING (the 9c/9d worklist, ~218 occurrences): StructCtorV's field
+loop (store_al_base needs lo8 threading), the PushHandler/PopHandler/
+SetPend/EndFinally quartet (addr_act staging), the element tiers -
+LoadElem*/LoadElemBool/LoadElemValue/OrdCharV/LoadMember* + the
+ElemRead obj=RAX role + emit_store_elem_inline/elem2/emit_elem_* -
+then emit_branch (38: the truthiness/condition staging), the C1 hoist
+preamble, emit_exc_stamp, emit_raise, bump_at's push-bracketed rax,
+jit_compile_chunk's residue, and the g_fwd.res_reg reset line (the
+bus default - the LAST line, deliberately, since it names the whole
+convention).
