@@ -474,6 +474,36 @@ stubs from the per-pc map.
    trap verbatim.
 
 ### D3. Linear scan with splitting (the brain)
+
+DESIGN DECISIONS SETTLED 2026-08-23 (build from these):
+ - BYTE-IDENTITY ENDS HERE, BY PLAN: the allocator goes behind a NEW
+   LEVER (`lsra`, default OFF) - all nets stay green trivially while
+   it is built; dedicated runs enable it; the default flips only when
+   the full D4 net is green AND the D0 ledger says it pays. A
+   lever-off config keeps today's pick path byte-for-byte.
+ - QUALIFICATION GOES PER-INTERVAL: the pick's "EVERY use in the run
+   is cache-aware" becomes "every use INSIDE THIS INTERVAL is" - the
+   payoff shape: one late boxed op no longer costs a slot its whole
+   run. Step 1 of the integration is a BYTE-IDENTICAL refactor:
+   export the pick's bad()-switch as a per-(op, slot) classifier
+   {none, cacheaware, memory-demanding}, consumed by the pick exactly
+   as today, so the interval side and the pick cannot drift.
+ - A MEMORY-DEMANDING op (&slot takers, the g_current_ctx readers) is
+   a FORCED INTERVAL END at that pc - the structural constraint that
+   retires the bad() list (its own measured note says the flush-
+   around trade does not pay, so ending the interval is right).
+ - COLD-ARM HELPER CALLS NEED NOTHING NEW: emit_call_prologue/
+   epilogue's spill-around-call discipline is ASSIGNMENT-AGNOSTIC
+   (it iterates whatever is currently assigned) - it already covers
+   any caller-saved assignment, which is what makes per-interval
+   caller-saved assignments safe from day one.
+ - LABEL RESOLUTION v1: a canonical per-label assignment with fixup
+   moves on in-edges; the LOOP HEAD (reached from above AND the back
+   edge) is the case that matters. Block-local-only allocation was
+   considered and REJECTED: it loses the loop-carried pin, which is
+   the N5 win the whole model exists for.
+ - VALIDATOR ARMS 2/3 (label agreement, exit-flush completeness)
+   land WITH the lever, before the default flips.
  - Walk intervals by start; free-until/next-use-distance; at
    pressure evict/split the interval with the furthest next use;
    SPLIT before helper calls for caller-saved assignments (callee-
