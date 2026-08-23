@@ -134,3 +134,71 @@ this census on the WORST ones, not on the ones with the most slot
 references.** Those are different sets, and the whole reason the old
 plan pointed at 03_int_arith is that nobody had separated them.
 
+## THE CENSUS OF THE WORST BENCHES (2026-08-15) - it is CALLS, not slots
+
+### Step 1: rank by my/cpp, STARTUP-CORRECTED
+
+The raw bench table's my/cpp is misleading at the top: its worst entries
+have cpp times of 1-2 ms, against which MyLang's ~1 ms of parse + compile
++ JIT is a large fraction. Taking the scale-3 minus scale-1 wall time on
+BOTH sides cancels that (and needs no iteration count, since the ratio of
+deltas is the loop-only ratio). It reorders the list substantially:
+
+| bench | raw my/cpp | **loop-only** |
+|---|---|---|
+| 30_str_index_iterate | 9.44x | **27.36x** |
+| 63_closures | 11.86x | **17.57x** |
+| 76_funcval_dispatch | 10.68x | 11.40x |
+| 11_closure_counter | 7.99x | 11.11x |
+| 64_struct_create | 8.08x | 10.26x |
+| 75_indexed_unpack | 8.68x | 9.18x |
+| 35_map_filter | 7.11x | 8.74x |
+| 73_multi_unpack | 8.91x | 8.47x |
+| 03_int_arith | 1.36x | **1.18x** |
+| 09_fib_recursive | 6.41x | **0.09x** (FASTER than C++) |
+
+03_int_arith is at PARITY once startup is removed - which independently
+confirms the rung-4 finding that its eleven slot references per iteration
+cost nothing. 09_fib_recursive BEATS C++ (the recursion unroll plus the
+per-frame pure-call cache against a naive recursive twin).
+
+### Step 2: classify each worst loop's emitted body
+
+| bench | instrs | calls | slot ld | slot st | dominant |
+|---|---|---|---|---|---|
+| 30_str_index_iterate | 30 | 1 | 2 | 0 | **CALL** |
+| 63_closures | 151 | 6 | 15 | 7 | **CALL** |
+| 76_funcval_dispatch | 248 | 6 | 11 | 4 | **CALL** |
+| 11_closure_counter | 259 | 15 | 18 | 6 | **CALL** |
+| 64_struct_create | 137 | **0** | 22 | 14 | **slot traffic** |
+| 75_indexed_unpack | 92 | 5 | 4 | 4 | **CALL** |
+| 73_multi_unpack | 55 | 1 | 2 | 0 | **CALL** |
+
+**SEVEN OF THE EIGHT WORST BENCHES ARE CALL-DOMINATED.** Exactly one -
+64_struct_create - is slot-traffic-dominated, and it makes no calls at
+all.
+
+30_str_index_iterate, the worst at 27x, is the clearest: its whole inner
+loop is `lea` two slot addresses, ONE helper call for the fused
+`ord(s[i])`, two `movabs` to reload the type-tag singletons the call
+clobbered, and the accumulate. **6.3 ns per character against C++'s
+0.23** - a function call where C++ does a load.
+
+### The conclusion for the register allocator
+
+It addresses slot traffic. Slot traffic dominates ONE of the eight worst
+benches. On the shape the old plan was written around (03_int_arith) the
+same measurement says the loop is already at C++ parity.
+
+**64_struct_create is the single honest candidate** - 36 slot accesses in
+137 instructions, 9.85 ns/iteration, IPC ~2.8-3.5, so partly but not
+wholly latency-bound. Worth a targeted experiment; not worth a general
+allocator on its own.
+
+**What the census actually points at is the CALL - its argument setup,
+its clobbering of the pinned type-tag registers, and the work in the
+helper body.** That is the same family as the wins already in the
+record (the nested-read fusion, the element-store inline tiers, the
+struct baked layout): replace a helper call with emitted code that does
+the work. 30_str_index_iterate is the cleanest instance left.
+
