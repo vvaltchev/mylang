@@ -16387,6 +16387,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * to release). CmpV yields a REAL bool (is_true of the 0/1 int),
          * the CmpIntV setcc shape. */
         const Chunk::BoxedOp &bo = ck.boxed_ops[in.target2];
+        /* the whole case stages through the accumulator ask; a boxed op
+         * is never in a rax-pinned run, so the take cannot refuse */
+        AccScratch acc(e, CAP_BYTE_NOREX | CAP_MEM_BASE);
         const bool comp = in.op == OpCode::CompoundV;
         const bool cmp = in.op == OpCode::CmpV;
         const auto arith_ok = [](Op o) {
@@ -16427,17 +16430,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * clobbered for the whole gate.
              */
             if (comp) {
-                e.load(RAX, slot_addr(in.target).type);
-                e.cmp_rax_tag(jit_layout().t_int, RSI);  /* reg:conv */
+                e.load(acc.r, slot_addr(in.target).type);
+                e.cmp_reg_tag(acc.r, jit_layout().t_int, RSI);  /* reg:conv */
                 j_slows.push_back(e.j32(0x75));
             } else if (!bo.a.is_lit) {
-                e.load(RAX, slot_addr(bo.a.slot).type);
-                e.cmp_rax_tag(jit_layout().t_int, RSI);  /* reg:conv */
+                e.load(acc.r, slot_addr(bo.a.slot).type);
+                e.cmp_reg_tag(acc.r, jit_layout().t_int, RSI);  /* reg:conv */
                 j_slows.push_back(e.j32(0x75));
             }
             if (!bo.b.is_lit) {
-                e.load(RAX, slot_addr(bo.b.slot).type);
-                e.cmp_rax_tag(jit_layout().t_int, RSI);  /* reg:conv */
+                e.load(acc.r, slot_addr(bo.b.slot).type);
+                e.cmp_reg_tag(acc.r, jit_layout().t_int, RSI);  /* reg:conv */
                 j_slows.push_back(e.j32(0x75));
             }
 #ifdef TESTS
@@ -16450,11 +16453,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * so the divisor jumps get their own list and a
              * compensation stub at the arm (see the patch site). */
             if (comp)
-                e.load(RAX, slot_addr(in.target).payload);
+                e.load(acc.r, slot_addr(in.target).payload);
             else if (bo.a.is_lit)
-                e.movabs(RAX, static_cast<uint64_t>(bo.a.lit));
+                e.movabs(acc.r, static_cast<uint64_t>(bo.a.lit));
             else
-                e.load(RAX, slot_addr(bo.a.slot).payload);
+                e.load(acc.r, slot_addr(bo.a.slot).payload);
             hold();
             const bool wp = tmp_pushed;
             std::vector<size_t> j_slows_win;
@@ -16463,14 +16466,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             else
                 e.load(tmp, slot_addr(bo.b.slot).payload);
             if (cmp) {
-                e.cmp_rr(RAX, tmp);
+                e.cmp_rr(acc.r, tmp);
                 drop();                /* flags survive the pop */
-                e.wrote(RAX);
-                e.u8(0x0F);
-                e.u8(static_cast<uint8_t>(cc_for(bo.aop).near_op + 0x10));
-                e.u8(0xC0);                           /* setcc al */
-                e.movzx_r32_lo8(RAX, RAX);   /* movzx eax, al */
-                store_dst_bool(e, ck, RAX, in.target);
+                e.setcc_lo8(static_cast<uint8_t>(
+                                (cc_for(bo.aop).near_op + 0x10) & 0x0F),
+                            acc.r);
+                e.movzx_r32_lo8(acc.r, acc.r);
+                store_dst_bool(e, ck, acc.r, in.target);
             } else {
                 if (dv) {
                     if (!bo.b.is_lit) {
@@ -16491,16 +16493,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         j_slows_win.push_back(e.j32(0x74)); /* ovf */
                         e.patch32_here(j_div);
                     }
+                    /* idiv's dividend is rax BY ISA; the grant is
+                     * rax while nothing pins it, and a boxed-op run
+                     * never pins it */
+                    ML_CHECK_MSG(acc.r == RAX,    /* reg:isa */
+                                 "idiv needs rax");
                     e.cqo();              /* cqo */
                     e.idiv_reg(tmp);
                     if (bo.aop == Op::mod)
                 e.mov_rr(RAX, RDX);  /* reg:isa: the remainder */
                 } else {
-                    op_rr(e, bo.aop, RAX, tmp);
+                    op_rr(e, bo.aop, acc.r, tmp);
                 }
                 drop();               /* the rhs is consumed */
                 if (comp) {
-                    e.store(RAX, slot_addr(in.target).payload);
+                    e.store(acc.r, slot_addr(in.target).payload);
                 } else {
                     /* ⛔ #96: store_dst's tag write is an imm32 when the
                      * arena placed t_int low, and reads rsi only on the
@@ -16514,7 +16521,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     if (!jit_tag_is_imm(jit_layout().t_int))
                         e.movabs(RSI, reinterpret_cast<uint64_t>(  /* reg:abi */
                                           jit_layout().t_int));
-                    store_dst(e, ck, RAX, in.target, pc);
+                    store_dst(e, ck, acc.r, in.target, pc);
                 }
             }
             j_done = e.j32(0xEB);
@@ -16562,32 +16569,33 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             }
 #endif
             if (comp) {
-                e.load_type(slot_addr(in.target).type);
-                e.cmp_rax_tag(jit_layout().t_float, 8);
+                e.load(acc.r, slot_addr(in.target).type);
+                e.cmp_reg_tag(acc.r, jit_layout().t_float, 8);
                 j_slows.push_back(e.j32(0x75));
             } else if (!bo.a.is_lit) {
-                e.load_type(slot_addr(bo.a.slot).type);
-                e.cmp_rax_tag(jit_layout().t_float, 8);
+                e.load(acc.r, slot_addr(bo.a.slot).type);
+                e.cmp_reg_tag(acc.r, jit_layout().t_float, 8);
                 j_slows.push_back(e.j32(0x75));
             }
             if (!bo.b.is_lit) {
-                e.load_type(slot_addr(bo.b.slot).type);
-                e.cmp_rax_tag(jit_layout().t_float, 8);
+                e.load(acc.r, slot_addr(bo.b.slot).type);
+                e.cmp_reg_tag(acc.r, jit_layout().t_float, 8);
                 j_slows.push_back(e.j32(0x75));
             }
 #ifdef TESTS
             e.bump_counter(&g_jit_boxed_fastf);
 #endif
             /* payloads: xmm0 = lhs, xmm1 = rhs */
-            const auto fload_opnd = [&e](uint8_t xr, const Operand &o) {
+            const auto fload_opnd = [&e, &acc](uint8_t xr,
+                                               const Operand &o) {
                 if (!o.is_lit) {
                     e.fload(xr, slot_addr(o.slot).payload);
                     return;
                 }
                 uint64_t bits;
                 std::memcpy(&bits, &o.flit, sizeof bits);
-                e.movabs(RAX, bits);
-                e.movq_xmm(xr);
+                e.movabs(acc.r, bits);
+                e.movq_xmm_from(xr, acc.r);
             };
             if (comp)
                 e.fload(X0, slot_addr(in.target).payload);
@@ -16597,12 +16605,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (cmp) {
                 const FCmp fc = float_cmp(bo.aop);
                 if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
-                e.wrote(RAX);
-                e.u8(0x0F);
-                e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
-                e.u8(0xC0);                           /* setcc al */
-                e.movzx_r32_lo8(RAX, RAX);   /* movzx eax, al */
-                store_dst_bool(e, ck, RAX, in.target);
+                e.setcc_lo8(static_cast<uint8_t>(
+                                ((fc.near_op ^ 1) + 0x10) & 0x0F),
+                            acc.r);
+                e.movzx_r32_lo8(acc.r, acc.r);
+                store_dst_bool(e, ck, acc.r, in.target);
             } else {
                 if (bo.aop == Op::div && !bo.b.is_lit) {
                     /* a +-0.0 divisor DECLINES (TypeFloat::div throws
@@ -16610,13 +16617,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                      * stripped is exactly fpclassify's answer, where a
                      * bare `ucomisd; je` would also decline a NaN
                      * divisor - the same reasoning as FloatBin's. */
-                    {
-                        /* a grant window emits nothing at its edges,
-                         * so the flags survive to the jz below */
-                        AccScratch acc(e);
-                        e.movq_r_x(acc.r, X1);
-                        e.shl_reg_1(acc.r);
-                    }
+                    e.movq_r_x(acc.r, X1);
+                    e.shl_reg_1(acc.r);
                     j_slows.push_back(e.j32(0x74));       /* jz -> slow */
                 }
                 e.farith(bo.aop == Op::plus    ? 0x58
@@ -16978,7 +16980,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_ctx_chain(e, cb, is_cap,
                        is_cap ? 0xFF : static_cast<uint8_t>(tbl));
         const size_t j_dref = emit_ref_check_jae_chain(e, cb, soff + ty0);
-        e.load(RAX, src.type);
+        AccScratch acc(e);
+        e.load(acc.r, src.type);
         /* every jump to the slow arm below was emitted BEFORE this
          * window opens (the gate; the chain check, whose own borrow
          * self-closes), so no path enters that arm with this push
@@ -16990,7 +16993,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.store_base(cpy, cb, soff + pv0 + 8);
         e.load(cpy, src.payload + 16);
         e.store_base(cpy, cb, soff + pv0 + 16);
-        e.store_base(RAX, cb, soff + ty0);
+        e.store_base(acc.r, cb, soff + ty0);
         if (!is_cap) {
             /* defined[gslot] = 1: cpy = defined.data() (the table is
              * still in `tbl` - the parameterized contract). */
