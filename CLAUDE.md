@@ -101,6 +101,13 @@ make clean
 > in `build/`, `build-rel/`, or any other top-level directory. The
 > maintainer's own build dirs (whatever he creates: `build`, `build-rel`,
 > ...) are OFF-LIMITS: never build into, measure with, or delete them.
+> **⛔ `bench/run.py` DEFAULTS `--mylang` TO `build/mylang` — the
+> maintainer's binary. ALWAYS pass `--mylang build-claude/<lane>/mylang`
+> EXPLICITLY** (and `--baseline` likewise). Omitting it silently times
+> HIS build instead of the change under test: two full-suite runs and a
+> reported geomean were invalid that way on 2026-08-12, and the tell is
+> only the one-line `mylang :` header run.py prints — CHECK IT before
+> quoting any number.
 > Name the lanes descriptively and DELETE throwaway measurement lanes when
 > the measurement is done — 40+ stale `build-meas*` dirs once littered the
 > repo root, which is what triggered this rule. Standard lanes:

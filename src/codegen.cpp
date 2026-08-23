@@ -2155,6 +2155,20 @@ struct Codegen {
                  * (IntBin/FloatBin) before this. */
                 if (numeric && (id->sym.kind == SymKind::global
                                 || id->sym.kind == SymKind::capture)) {
+                    /* H1b: a PROVEN capture `cap++`/`cap--` recomposes
+                     * into read + IntBin + a plain (inline-emitted) store,
+                     * off the compound helper call. */
+                    const Op ibase = inc->is_inc ? Op::plus : Op::minus;
+                    if (typed_capture_update_ok(id, ibase)) {
+                        const bool flt = inc->th == TypeHint::f;
+                        Operand cur;
+                        if (try_capture_leaf(id, flt, cur, ops)) {
+                            emit_typed_capture_update(
+                                id, ibase, flt, cur,
+                                flt ? float_lit(1.0) : int_lit(1), ops);
+                            return true;
+                        }
+                    }
                     CgInstr in;
                     in.op = id->sym.kind == SymKind::global
                                 ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
@@ -2441,6 +2455,28 @@ struct Codegen {
                 in.set_a(slot_op(rslot));      /* aop invalid == plain assign */
                 ops.push_back(in);
                 return true;
+            }
+            /* H1b: a PROVEN int/float capture `cap OP= rhs` recomposes
+             * into read + IntBin/FloatBin + a plain store. The rhs must
+             * compile in the CAPTURE's OWN type - a float rhs into an
+             * int capture declines here and keeps the boxed compound,
+             * whose num_bin_op promotion is what that case needs. */
+            if (typed_capture_update_ok(lv, cbase)
+                    && (lv->th == TypeHint::i || lv->th == TypeHint::f)) {
+                const bool flt = lv->th == TypeHint::f;
+                const size_t tmark = ops.size();
+                const size_t tcmark = chunk.consts.size();
+                const int tsave = next_temp;
+                Operand cur, r;
+                if (try_capture_leaf(lv, flt, cur, ops)
+                        && (flt ? compile_float_expr(e->rvalue.get(), r, ops)
+                                : compile_int_expr(e->rvalue.get(), r, ops))) {
+                    emit_typed_capture_update(lv, cbase, flt, cur, r, ops);
+                    return true;
+                }
+                ops.resize(tmark);
+                chunk.consts.resize(tcmark);
+                next_temp = tsave;
             }
             /* Compound `x OP= rhs`: the rhs is a boxed operand (immediate or a
              * slot, like the local CompoundV); a complex rhs falls back. */
@@ -4133,6 +4169,59 @@ struct Codegen {
         ops.push_back(in);
         out = slot_op(t);
         return true;
+    }
+
+    /*
+     * H1b: may `cap OP= v` / `cap++` be RECOMPOSED into the typed tier -
+     * read + IntBin/FloatBin + a PLAIN capture store - instead of the
+     * compound StoreCaptureV (a copy-modify-store through num_bin_op,
+     * and the ONE capture form the JIT still serves with a helper call:
+     * the plain store has an inline tier, the compound never did)?
+     *
+     * `+ - *` ONLY, and that restriction is the whole soundness
+     * argument: for PROVEN int/float operands those three cannot throw
+     * (`-fwrapv` makes int overflow defined; float arithmetic raises
+     * nothing in-language), so the recomposed sequence has no error path
+     * and therefore no caret to keep identical. `/` and `%` are excluded
+     * on exactly that ground - IntBin carets the DIVISOR operand (#76)
+     * where the compound store carets the whole statement, and a caret
+     * that moves is a RULE 2 violation, not a cosmetic difference.
+     *
+     * CAPTURES only, not globals: a capture is always bound (snapshot at
+     * closure creation), so the read cannot raise; a global read can
+     * (UnboundSymbolEx, the TDZ), and the compound op's undefined-global
+     * bail would have to be reproduced exactly.
+     */
+    bool typed_capture_update_ok(const Identifier *id, Op base) const
+    {
+        return id && !id->is_const
+            && id->sym.kind == SymKind::capture
+            && (base == Op::plus || base == Op::minus || base == Op::times);
+    }
+
+    /* Emit `cap = cap <base> rhs` given the ALREADY-compiled current
+     * value and rhs operands. The store is a PLAIN StoreCaptureV
+     * (aop invalid), whose value is an int/float the typed op produced -
+     * the same type num_bin_op's promotion yields for these operands
+     * (a bool capture promotes to int either way). */
+    void emit_typed_capture_update(const Identifier *id, Op base, bool flt,
+                                   Operand cur, Operand rhs,
+                                   std::vector<CgInstr> &ops)
+    {
+        const int t = alloc_temp();
+        CgInstr bin;
+        bin.op = flt ? OpCode::FloatBin : OpCode::IntBin;
+        bin.target = t;
+        bin.set_a(cur);
+        bin.set_b(rhs);
+        bin.aop = base;
+        ops.push_back(bin);
+
+        CgInstr st;
+        st.op = OpCode::StoreCaptureV;
+        st.target = id->sym.slot;
+        st.set_a(slot_op(t));        /* aop invalid == a PLAIN assign */
+        ops.push_back(st);
     }
 
     bool compile_int_expr(const Construct *e, Operand &out,
