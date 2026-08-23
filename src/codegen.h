@@ -153,6 +153,34 @@ private:
 bool jit_slot_liveness(const Chunk &chunk, SlotLiveness &out);
 
 /*
+ * D1 (plans/register-allocator-endgame.md): LIVE INTERVALS - the input
+ * representation of the interval allocator. One entry per MAXIMAL
+ * contiguous stretch of pcs over which a slot carries a value; a slot
+ * whose liveness has holes gets one interval PER stretch, which is
+ * what lets the allocator serve the same variable from different
+ * registers (or none) in different parts of one run.
+ *
+ * THE SPEC, and the -rt check is derived from it, not from the
+ * builder: an interval of slot s covers pc iff
+ *     live_in(pc, s)  ||  s ∈ defs(pc)
+ * (a def opens the stretch at the defining pc - live_in only becomes
+ * true at the NEXT pc). Intervals of one slot are disjoint, sorted,
+ * and maximal (the pc before a start and the end pc itself are not
+ * covered). `weight` counts the uses+defs inside the stretch - the
+ * allocator's ranking input. A barrier op (one visit_use_def does not
+ * know) reads as using everything via the liveness fixpoint and
+ * defining nothing - conservative in the safe direction.
+ */
+struct LiveInterval {
+    int slot;
+    uint32_t start, end;             /* [start, end) pcs in the chunk */
+    long weight;
+};
+bool jit_build_intervals(const Chunk &chunk, size_t begin, size_t end,
+                         const SlotLiveness &sl,
+                         std::vector<LiveInterval> &out);
+
+/*
  * #96: the SPILL heuristic's input - for each pc in [begin,end) and each
  * covered slot, how many instructions until its next USE, scanning
  * forward in pc order (JIT_NO_NEXT_USE == none in the run).

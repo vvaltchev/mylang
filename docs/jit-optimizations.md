@@ -7830,3 +7830,26 @@ byte-identical both arenas; -rt 1947/1947 both arenas; corpus both
 arenas + driver green; relna + clang lto0 green. Phase C of
 plans/register-allocator-endgame.md is COMPLETE (xmm8-15 join when
 the float encoders learn REX - a capability gap, recorded there).
+
+## Endgame D0+D1 (2026-08-22) - the Ir baseline ledger; live
+## intervals with holes
+
+D0: callgrind Ir over the pressure corpus (the 80..85 regs family +
+float/hoist/loop anchors) recorded in the plan at sha 039a30c - the
+cross-session-comparable anchor for Phase D's ending A/B (the wall
+half must be interleaved against a binary rebuilt from that sha).
+
+D1: `jit_build_intervals` - the allocator's input representation.
+Per-slot MAXIMAL live stretches with holes ({slot, [start,end),
+weight}), built from the jit_slot_liveness fixpoint + jit_op_slot_refs
+under the spec "an interval covers pc iff live_in(pc,s) or s is
+defined at pc" (a def opens the stretch at the defining pc; barrier
+ops read as use-everything/define-nothing). The `jit: D1` -rt check
+is derived from that SPEC, not from the builder - coverage both ways
+at every (pc, slot), per-slot disjointness, weights recounted - with
+a HOLE vacuity guard: some slot in the corpus must produce two or
+more intervals, or the representation's whole point (one variable,
+several stretches, several registers) went untested. WATCHED
+FAILING: removing the def-opens rule fails with mismatches named by
+pc and slot. Pure analysis - no emission change (vdjcmp 116/116,
+gate, both arenas, clang lto0 all green).
