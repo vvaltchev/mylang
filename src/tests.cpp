@@ -24134,6 +24134,70 @@ static bool jit_elem_slice_and_promote()
 }
 
 /*
+ * Lever A's write-elision, on a REF-LISTED temp that C5 has discharged.
+ *
+ * A temp SLOT is reused across a whole chunk, so one string temp anywhere
+ * in `main` puts that slot on `ref_slots` - and lever A then refused to
+ * elide the dead write of EVERY int producer sharing it, for the whole
+ * fragment. The refusal is about RELEASE SEMANTICS (a ref-listed store's
+ * cold arm is what releases the old value), so it is correctly dropped
+ * exactly where C5's `relok` has already proved no reference can be in
+ * the slot - which is also where store_dst emits no release at all.
+ *
+ * `g_jit_fwd_skip_rel` counts ONLY that newly-admitted case, at emit
+ * time: an elision leaves nothing to execute, so its absence from the
+ * emitted code IS the event (the same idiom as g_jit_relent_stores).
+ *
+ * ⛔ VACUITY IS RULED OUT BY THE SABOTAGE, NOT BY THE SHAPE. A first
+ * version of this comment claimed the string literal was what put the
+ * shared temp slot on ref_slots - MEASURED FALSE: swapping it for an int
+ * leaves the counter unchanged, so some other prologue temp lists the
+ * slot. What actually pins the case is that reverting the
+ * `|| e.relok(fdst)` clause takes this counter to ZERO.
+ */
+static bool jit_fwd_skip_reflisted()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const unsigned long b0 = g_jit_fwd_skip_rel;
+    std::string src =
+        "var tag = \"n=\";\n"
+        "var acc = 1;\n"
+        "var N = int(runtime(400));\n"
+        "for (var i = 1; i < N; i++) {\n"
+        "    acc = (acc + i) * 3;\n"
+        "    acc = acc % 1000000007;\n"
+        "}\n"
+        "assert(len(tag) == 2);\n"
+        "assert(acc == 810462197);\n";
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (...) {
+        ok = false;
+    }
+    g_exec_engine = saved;
+    if (!ok)
+        return false;
+    if (g_jit_fwd_skip_rel <= b0)
+        return false;      /* the ref-listed dead write was kept */
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * Lever A - ADJACENT DEAD-TEMP FORWARDING (plans/archived/unboxing.md). The
  * producer hands its int result to the next op IN RAX; the consumer
  * skips the slot load and a provably-dead temp's write is elided.
@@ -28550,6 +28614,7 @@ static bool jit_counter_coverage()
         { "ctor_est",         &g_jit_ctor_est,         nullptr },
         { "release_entry",    &g_jit_release_entry,    nullptr },
         { "relent_stores",    &g_jit_relent_stores,    nullptr },
+        { "fwd_skip_rel",     &g_jit_fwd_skip_rel,     nullptr },
         { "ref_arg_binds",    &g_jit_ref_arg_binds,    nullptr },
         { "arg_borrow",       &g_arg_borrow,           nullptr },
         { "arg_borrow_slice", &g_arg_borrow_slice,     nullptr },
@@ -31142,6 +31207,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: adjacent dead-temp FORWARDING hands values in RAX "
       "(lever A; counter + slow-path rejoin)",
       jit_fwd_deadtemp },
+    { "jit: lever A elides a REF-LISTED dead temp's write where C5 proved "
+      "the slot holds no reference (per SITE, not per chunk)",
+      jit_fwd_skip_reflisted },
     { "jit: C1 per-loop navigation HOISTING (entry nav + cold twin + "
       "refusals)",
       jit_hoist_c1 },

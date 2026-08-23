@@ -4597,3 +4597,65 @@ REX is a bare 0x48 with no REX.B, so `movabs(R10, x)` silently assembles
 `0xC2` - `ret imm16` - and the fragment returns into nothing. Its sibling
 trap is documented beside it: `j32` takes the SHORT jcc opcode (0x74 for
 `je`), and the near second byte 0x84 assembles `0F 94`, a SETE.
+
+## LEVER A's WRITE-ELISION GOES PER-SITE (2026-08-15)
+
+Lever A forwards an int result to the ADJACENT consumer in RAX and, when
+the temp is provably dead after it, elides the slot write. Its own
+comment lists the guards, one of which is "a REF-LISTED producer dst
+keeps its write (the release semantics)" - because `store_dst`'s cold arm
+is what RELEASES whatever the slot held, and skipping the store would
+skip the release.
+
+**Sound, but stated over the wrong unit.** `ref_slots` is per CHUNK and a
+TEMP SLOT is reused across a whole chunk, so one unrelated temp anywhere
+in `main` lists slot 4 and every int producer sharing it loses its
+write-skip for the entire fragment. Meanwhile C5 (`Emitter::relok`)
+already proves, PER SITE, that no reference can be in a given slot - and
+where it does, `store_dst` emits no release at all. So the refusal now
+reads `!listed || e.relok(fdst)`: keep the write where there are release
+semantics to preserve, skip it where C5 has proved there are none.
+
+FOUND BY CENSUS, not by inspection: counting `03_int_arith`'s emitted
+loop body against a cachegrind scale-delta showed **11 data references
+per iteration (3 rd + 8 wr), all of them TEMPS** - the locals `acc`, `i`,
+`N` already live in r12/r13/r14 and never touch memory. One of the four
+store PAIRS was provably dead (written at +923/+930, overwritten at
++1055/+1062, never read), and instrumenting the gate named the single
+blocker exactly: `live_ok=1 lout=0 reflisted=1 -> skip=0`.
+
+MEASURED. Emitted loop 63 -> 61 instructions, temp stores 8 -> 6.
+**Data references: 07_nested_loops -35.84%, 03_int_arith -12.13%**;
+01_while_loop, 44_primes_sqrt, 46_matrix_mult byte-flat.
+
+**WALL CLOCK: NOTHING. Suite geomean 0.998x, every affected bench within
+noise** - and the reason is the important part, because it refines this
+file's own guard-elision finding. Cachegrind's D1 miss counts on
+07_nested_loops are **50,139 -> 50,164, i.e. UNCHANGED**: all 3,000,000
+removed data references were L1 HITS, to a slot nothing reads. A dead
+store to an L1-resident line retires in the store buffer and stalls
+nothing.
+
+**So the currency is not "data references", it is CACHE MISSES and
+DEPENDENCY STALLS.** "Removes memory traffic" was the rule that predicted
+this change would pay; it predicted wrong, in the same direction as the
+predicted-branch and predicted-call cases above. Refine it before using
+it again: a win needs the removed access to MISS, or to sit on a
+dependency chain something waits for.
+
+KEPT rather than reverted, unlike #94 step 3, because the two differ on
+the COST side: step 3 added ~40 emitted bytes at every call site and
+charged 1.44% to benches that never used it, while this removes two
+instructions per iteration and adds nothing anywhere (the largest
+non-noise Ir delta across the suite is +68 instructions out of 225M on
+11_closure_counter).
+
+`g_jit_fwd_skip_rel` (JITSTATS `fwd_skip_rel`) counts the newly-admitted
+case at EMIT time - an elision leaves nothing to execute, so its absence
+from the emitted code IS the event, the same idiom as
+`g_jit_relent_stores`. Pinned by `jit_fwd_skip_reflisted`; reverting the
+`|| e.relok(fdst)` clause takes the counter to zero and fails it
+(watched). **A first version of that test's comment claimed the string
+literal was what listed the slot - MEASURED FALSE** (swapping it for an
+int leaves the counter unchanged); the sabotage, not the shape, is what
+rules out vacuity.

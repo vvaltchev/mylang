@@ -22,7 +22,22 @@ exactly where this project's flat results cluster:
 | instructions, by ADDING emitted code (#92, 16B Instr) | **loss, 1.20x** |
 
 The rule is predictive over ~15 attempts and was never applied before
-building. The reason it was never applied: callgrind counts retired
+building.
+
+**⛔ AND IT NEEDED REFINING THE FIRST TIME IT WAS USED (2026-08-15).**
+Applied to lever A's dead-store elision it predicted a win: the change
+removes **-35.84% of 07_nested_loops' data references** and -12.13% of
+03_int_arith's. Wall clock: **nothing, suite geomean 0.998x**. The D1
+MISS counts were unchanged (50,139 -> 50,164) - every removed access was
+an L1 hit to a slot nothing reads, and a dead store to an L1-resident
+line retires in the store buffer and stalls nothing.
+
+So the currency is **CACHE MISSES and DEPENDENCY STALLS**, not data
+references. The wins in the table above all removed accesses that MISSED
+(48-byte elements, freshly allocated objects, refcount RMWs on cold
+lines) or sat on a chain something waited for. Before predicting a win,
+ask which of those two the removed access was - and if the honest answer
+is "neither, it was an L1 hit nobody reads", expect zero. The reason it was never applied: callgrind counts retired
 instructions, a modern core is bound on memory traffic / dependency
 chains / mispredicts / front-end, and this box (WSL2) has **no PMU** - so
 the deterministic instrument measures the one quantity that does not

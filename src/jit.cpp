@@ -103,6 +103,13 @@ unsigned long g_jit_telide_temps = 0;
  * this one proves a store actually dropped its test - a broken relok()
  * would leave the first counter bumping happily while nothing changed. */
 unsigned long g_jit_relent_stores = 0;
+
+/* Lever A: a REF-LISTED dead temp whose write was skipped because C5
+ * had already proved no reference can be in the slot. Emit-time, the
+ * same idiom as g_jit_relent_stores - an ELISION leaves nothing to
+ * execute, so its absence from the emitted code IS the event. */
+extern "C" unsigned long g_jit_fwd_skip_rel;
+unsigned long g_jit_fwd_skip_rel = 0;
 }
 #endif
 
@@ -5409,6 +5416,7 @@ void jit_stats_report()
         { "bind_coerce",      &g_jit_bind_coerce },
         { "bind_widen",       &g_jit_bind_widen },
         { "ref_arg_binds",    &g_jit_ref_arg_binds },
+        { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
         /* #94: the BORROW - a reference argument bound with no retain
          * (arg_borrow) vs one the analysis cleared whose value turned
          * out to be a slice (arg_borrow_slice, the one dynamic
@@ -13479,9 +13487,34 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                            })) {
                 g_fwd.prod = fdst;
                 const int tb = fdst - chunk.slot_count;
+                /*
+                 * The REF-LISTED refusal is about RELEASE SEMANTICS, not
+                 * about the list: a ref-listed dst keeps its write
+                 * because store_dst's cold arm is what RELEASES whatever
+                 * the slot held. But C5 (`relok`) may already have
+                 * PROVEN no reference can be in this slot here - and
+                 * where it has, store_dst drops the release test and
+                 * emits the bare two-store. There is then nothing for
+                 * the write to preserve, so skipping it is exactly as
+                 * sound as emitting a store nothing reads.
+                 *
+                 * Asking `relok` rather than the list is what makes the
+                 * test PER SITE instead of per CHUNK. A temp slot is
+                 * reused across a chunk, so one string temp anywhere in
+                 * `main` put slot 4 on the list and cost every int
+                 * producer in the hot loop its write-skip - measured on
+                 * 03_int_arith, where the sole blocked site
+                 * (pc=12, live_ok=1, lout=0) is a provably DEAD store
+                 * pair executed once per iteration.
+                 */
+                const bool listed = jit_slot_ref_listed(chunk, fdst);
                 g_fwd.skip_write = fwd_live_ok && tb < 64
                     && !(fwd_lout[pc + 1] & (uint64_t(1) << tb))
-                    && !jit_slot_ref_listed(chunk, fdst);
+                    && (!listed || e.relok(fdst));
+#ifdef TESTS
+                if (g_fwd.skip_write && listed)
+                    g_jit_fwd_skip_rel++;   /* the C5-discharged case only */
+#endif
             }
             /* C4a-ii: the FLOAT pair - every guard above, verbatim, on
              * the float whitelists. The two are mutually exclusive (an
