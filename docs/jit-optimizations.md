@@ -7489,6 +7489,21 @@ The bench (87) uses literal counts and is untouched by this arm.
 element store - not even `a[i] +=` - so the whole #92/#95 compound arm
 had zero bench reach. `86_elem_arith_compound` (+= -= *= /= %=, values
 kept non-negative so truncating and flooring division agree with the
-Python twin) and `87_elem_shift_compound` (<<= >>= >>>= &= |= ^= with
+Python twin), `87_elem_shift_compound` (<<= >>= >>>= &= |= ^= with
 literal counts, values masked below 2^60 so `>>>` equals Python's `>>`
-and `<<` never wraps) close it, with .py and .cpp twins.
+and `<<` never wraps) and `88_elem_float_compound` (the FLOAT twin:
+f[j] += *= -= /= %=, a contracting recurrence with a time-varying add
+keeping every value in [0,1) so the three languages' float `%` sign
+semantics agree) close it, with .py and .cpp twins.
+
+**THE FLOAT TWIN OF THE SHIFT/BITWISE ARMS IS VACUOUS BY
+CONSTRUCTION** - shifts and bitwise ops are int-only, so a proven
+StoreElemFloat can never carry one (`f[0] <<= 1` / `f[0] &= 3` are
+compile errors) - and that claim is MACHINE-CHECKED: two -rt pins fail
+the day such a compound becomes legal, at which point StoreElemFloat
+needs the arms. The float element tier's ONE remaining compound
+residue is `%=` (the fmod helper, pinned by a value test): inlining it
+means a libm call inside the RMW tail, which needs the full call
+prologue/epilogue - at that point it IS the helper, minus only the
+LValue* formation. Declined as not worth a call-bearing tail; revisit
+only with evidence of a hot fmod-store loop.
