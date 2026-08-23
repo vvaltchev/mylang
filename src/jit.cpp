@@ -11143,8 +11143,9 @@ static void jit_put_float(LValue *lv, double v) noexcept
 static void emit_put_scalar_call(Emitter &e, const void *fn, int slot,
                                  uint8_t value_reg)
 {
-    if (value_reg != X0)
-        e.fmov_rr(X0, value_reg);        /* the helper reads XMM0 */
+    if (value_reg != X0)                 /* reg:abi */
+        e.fmov_rr(X0, value_reg);        /* reg:abi: the helper (SysV
+                                          * float arg0) reads XMM0 */
     emit_call_prologue(e);               /* save the cache regs, align */
     e.lea_rdi(static_cast<int32_t>(static_cast<long>(slot)
                                    * static_cast<long>(sizeof(LValue))));
@@ -14717,7 +14718,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * across the boundary. */
         /* the result register: the arith's dst, except fmod's libm
          * call, which always returns in xmm0 */
-        const uint8_t res = is_mod ? uint8_t(X0) : ops.dst;
+        const uint8_t res =
+            is_mod ? uint8_t(X0)     /* reg:abi: libm returns in xmm0 */
+                   : ops.dst;
         const bool fwd_arm = g_fwd.fprod == in.target;
         if (fwd_arm) {
             g_fwd.farmed = true;
@@ -14740,13 +14743,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             /* Load the arg(s) FIRST (a bail here re-runs the op cleanly),
              * THEN the call sequence. pow is the only 2-arg selector:
              * x in xmm0, y in xmm1 - the SysV order. */
-            emit_float_load(e, X0, in.a_is_lit(), in.a_flit(),
+            emit_float_load(e, X0, in.a_is_lit(), in.a_flit(),  /* reg:abi */
                             in.a_slot(), pc, /*no_bail=*/true);
             if (fn == MathFn::pow_)
-                emit_float_load(e, X1, in.b_is_lit(), in.b_flit(),
+                emit_float_load(e, X1, in.b_is_lit(), in.b_flit(),  /* reg:abi */
                                 in.b_slot(), pc, /*no_bail=*/true);
             emit_libm_call(e, jit_math_fn_ptr(fn));
-            emit_float_store(e, ck, X0, in.target, pc);
+            emit_float_store(e, ck, X0, in.target, pc);  /* reg:abi:
+                                          * the libm result (SysV) */
             return true;
         }
         emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
@@ -15196,8 +15200,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * whole fragment - 04_float_arith's accumulator never pinned
          * because of its final str(x, 4). */
         if (const int fr = e.fcreg(in.target2); fr >= 0) {
-            e.fmov_rr(X0, static_cast<uint8_t>(fr));
-            emit_float_store(e, ck, X0, in.target, pc);
+            e.fmov_rr(X0, static_cast<uint8_t>(fr));     /* reg:abi */
+            emit_float_store(e, ck, X0, in.target, pc);  /* reg:abi:
+                                          * jit_put_float reads xmm0 */
             return true;
         }
         std::vector<size_t> jhelp;

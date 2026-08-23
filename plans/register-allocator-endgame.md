@@ -341,13 +341,36 @@ entry loads declared as machinery - WATCHED failing by name.
 knows X0/X1 + the x0/x1 accessor tokens; floors XMM0=61 XMM1=28.
 
 ### C3. Convert
- - The per-op X0/X1 scratch sites ask with prefer X0/X1 (byte-
-   identical while free) - emit_float_load/store, farith, ucomisd,
-   the cvt family, emit_float_operands, the div0 bits test's xmm
-   side, the libm call marshalling (xmm0/1 at CALL boundaries are
-   reg:abi - SysV float args - and stay).
+ - [DONE 2026-08-22] the reg:abi batch: the SysV/helper boundary
+   sites are TAGGED, not converted - emit_put_scalar_call's xmm0
+   marshalling, fmod/MathFn MK_CALL's libm args+return, the
+   fcreg->jit_put_float move. Floors: XMM0 61->54, XMM1 28->27,
+   TOTAL 89->81. What remains is EXACTLY the staging class.
+ - THE REMAINDER IS ONE SEAM, NOT 81 EDITS - design settled
+   2026-08-22, build it from here:
+   * FStage: a per-op RAII PAIR ask (mirroring AccScratch) - two
+     ra.ftake calls, prefer X0 then X1, freed at op end. With the
+     prefer discounts it is byte-identical while xmm0/1 are free,
+     which today is always.
+   * fp_allocatable currently EXCLUDES xmm0/1 (the C2 note); flip
+     that IN THE SAME COMMIT as the first FStage users - the askers
+     are the only alloc_fscratch callers, so nothing else can grab
+     the pair.
+   * ⛔ THE FLOAT FWD BUS RULE: g_fwd.fin_reg carries a value ACROSS
+     the op boundary (the producer's fres_reg); a consumer op's
+     FRESH asks must EXCLUDE it while the bus is live, or the ask
+     clobbers the forwarded value before emit_float_operands reads
+     it. Today the fixed X0/X1 dance encodes this structurally
+     ("build `a` in the OTHER scratch"); the seam must thread
+     exclude = bus-live ? 1u << fin_reg : 0.
+   * The clusters: emit_float_operands + its ~28 emit_op consumers
+     (farith/ucomisd/sqrtsd/emit_float_store chains), the compare
+     ladders (12805/12928/15927/16854/18474), the element tiers'
+     float staging (13340-13639, 14809-14891), MK_SSE (14752-59),
+     15762, 17444/62. fwrote() is the net - a conversion mistake
+     aborts by name (watched in C2).
  - The fcache pool {xmm4..7} registers its picks in the xmm mask
-   (C2a's spill-around-calls discipline is already per-pin).
+   [DONE in C2 - ftake_reg].
  - ffwd: fres_reg is already a declaration - consumers must READ it
    (audit for assumed-xmm0 consumers, the C4a-ii/C4b family).
  - Ratchet xmm floors batch by batch to zero, same discipline as GP
