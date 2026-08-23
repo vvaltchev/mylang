@@ -3493,3 +3493,62 @@ jumps became one.
 The shape to reach for is an RAII guard scoped over the `switch`, whose
 destructor pops - so no `return` can skip it - or a single exit point.
 **Do NOT re-try reallocation**; the comment at the site now says so.
+
+## (ah) 2026-08-20 - the RAII-over-the-switch analysis: SOUND for the
+## branches, BROKEN by `return false`
+
+Worked through before writing it, because the change manipulates the
+STACK in the hottest emitter and a wrong version is a crash, not a wrong
+answer.
+
+### The emitted branches are fine - this part surprised me
+
+The emitter has 86 local patch sites and several `j_slows` / `j_dones`
+vectors, so the first worry is a runtime path jumping PAST a pop that a
+C++ destructor emits at scope exit. It cannot happen, and the argument
+is short:
+
+  - every `j_slows` / `j_dones` vector is declared INSIDE the emitter
+    and patched inside it, so no emitted jump leaves the op;
+  - every `patch32_here` therefore runs DURING the switch body, while
+    the destructor runs AFTER it - so every patch target is at or
+    before the pop's eventual position.
+
+A jump can land on the pop or before it. None can skip it.
+
+### `return false` is what breaks it
+
+`return false` means "this emitter DECLINES; the caller emits the helper
+instead". A push emitted at the top of the function is already in the
+instruction stream at that point, and the caller's helper code follows
+it with no pop. **That leaks 8 bytes of stack per execution** - and
+unlike a wrong value it compounds until the process dies.
+
+So the guard cannot push at the top. It must push LAZILY - on the first
+actual use of `tmp`/`cpy`, which is necessarily inside a case that has
+already committed to succeeding.
+
+### The shape that works
+
+A guard whose `arm()` emits the push on first call and whose destructor
+pops only if armed:
+
+    TmpBorrow g(e, RCX);        // pushes NOTHING yet
+    ...
+    case OpCode::IntMulRI:
+        g.arm();                // first use: push if occupied
+        e.movabs(tmp, ...); op_rr(e, Op::times, RAX, tmp);
+
+`arm()` at each of the ~13 `tmp` and ~7 `cpy` use sites; the destructor
+handles every `return true` path, and a `return false` before any
+`arm()` pushed nothing. That is the whole change, and it is mechanical
+once the sites are listed (they are, in (ag)).
+
+⛔ VERIFY IT WITH THE DECLINE PATH SPECIFICALLY. The dangerous case is
+an op that arms and THEN declines - if one exists, the destructor still
+pops, which is correct, but confirm no case arms after its last possible
+`return false`. `grep -n "return false" ` within the emitter's range
+against the arm sites answers it.
+
+Then: `scripts/rcx_admission.sh 1`, which builds rcx in and runs the
+nets itself.
