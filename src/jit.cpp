@@ -4063,7 +4063,13 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
 
 #if ML_VM_HARDENING
         /* the audit call: rsp is call-ready at a terminator (frag_entry's
-         * discipline), nothing live yet, callee-saved regs preserved */
+         * discipline), nothing live yet, callee-saved regs preserved.
+         * NO ARGUMENT is passed: handing the chunk in rdi was tried and
+         * REVERTED - a fragment has an implicit rdi argument
+         * (plans/jit-registers.md's recorded trap), and clobbering it
+         * here made the audit read a dangling stack address (ASan:
+         * stack-use-after-scope). The audit gets what it needs from
+         * the activation instead; see jit_ret_audit's fork note. */
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_ret_audit) });
         e.u8(0xE8); e.u32(0);
@@ -5181,6 +5187,9 @@ void jit_stats_report()
         { "norec_mat_frames", &g_jit_norec_mat_frames },
         { "norec_mat_residue",&g_jit_norec_mat_residue },
         { "norec_audit",      &g_jit_norec_audit_frames },
+        { "ret_audit_done",   &g_jit_ret_audit_done },
+        { "ret_audit_skip",   &g_jit_ret_audit_skipped },
+        { "ret_audit_refscan",&g_jit_ret_audit_refscan },
         /* step 4 gate reach, classified per M5b inline push: would the
          * CALLEE qualify for the no-record tier? (see push_verify) */
         { "norec_gate_ok",    &g_jit_norec_gate_ok },

@@ -5967,18 +5967,79 @@ extern "C" void jit_ret_audit() noexcept
 #endif
     VmActivation &act = *g_vm_act;
     VmCallRec &rec = act.back_rec();     /* also re-checks the top_rec mirror */
+    /*
+     * THE 4-v FORK. Every check below reads `rec` as THIS frame's
+     * record. Once record-less frames interleave that is FALSE: a
+     * gate-passing frame wrote no record, so back_rec() is an
+     * ANCESTOR, and these checks then compare this frame's live state
+     * against a DIFFERENT frame's bases.
+     *
+     * Found by the Net 3 enumeration (2026-08-13) on a
+     * plain -> try -> plain -> dict-iter chain: the program is CORRECT
+     * in every engine (-tw, -nj, jit, norec-off all print the same
+     * answer), but this audit ABORTED the process under VM_HARDENING -
+     * which CI turns ON in the RELEASE lanes. A CI abort waiting on a
+     * mixed-kind chain; no corpus program had one.
+     *
+     * The discriminator is the tier's own (jit_norec_push_verify's
+     * fork check, step 3c's rule): a frame is record-ful iff the top
+     * record's window is the frame's own - windows are unique among
+     * live frames.
+     *
+     * THE TWO HALVES SPLIT DIFFERENTLY, so only one of them is lost:
+     *
+     * The REF-SLOT scan needs the frame's WINDOW (ctx->frame->slots -
+     * always available) and its CHUNK. The chunk is recovered WITHOUT
+     * an ABI change: our own return address points INTO the fragment
+     * that called us, and jit_norec_frag_for maps any address in a
+     * fragment's range to that fragment's chunk. So this half audits
+     * BOTH frame kinds - strictly MORE coverage than before the fork
+     * existed, when a record-less frame was scanned against an
+     * ancestor's window and length.
+     * (Handing the chunk in rdi from the emit site was tried first and
+     * REVERTED: a fragment has an implicit rdi argument -
+     * plans/jit-registers.md's recorded trap - and the audit then read
+     * a dangling stack address, ASan stack-use-after-scope.)
+     *
+     * The WATERMARK checks genuinely need this frame's OWN bases, and
+     * a record-less frame stores them nowhere - there is no value to
+     * compare against, so they stay record-ful-only. That residue is
+     * counted (`_done` vs `_skipped`) rather than left silent.
+     */
+#if ML_JIT_SUPPORTED
+    const Chunk *my_ck =
+        jit_norec_frag_for(__builtin_return_address(0));
+#else
+    const Chunk *my_ck = nullptr;    /* never called off-platform */
+#endif
     /* the C3 net, pre-release form: every slot holding a REFERENCE must be
      * ref-listed (an unlisted one would leak - exactly what the ref_slots
      * audit in pop_window catches after ITS release scan; here the scan
      * has not run yet, so a listed slot may legitimately hold one). */
-    const Chunk *ck = rec.run_chunk;
-    ML_VM_CHECK(ck != nullptr);
-    for (int_type i = 0; i < rec.nslots; i++) {
-        if (rec.window[i].get().get_type()->t >= Type::t_str)
-            ML_VM_CHECK(std::binary_search(ck->ref_slots.begin(),
-                                           ck->ref_slots.end(),
-                                           static_cast<int32_t>(i)));
+    if (my_ck && g_current_ctx && g_current_ctx->frame) {
+        const LValue *win = g_current_ctx->frame->slots;
+        const int_type total = static_cast<int_type>(my_ck->slot_count)
+                               + my_ck->n_temps;
+        for (int_type i = 0; i < total; i++) {
+            if (win[i].get().get_type()->t >= Type::t_str)
+                ML_VM_CHECK(std::binary_search(my_ck->ref_slots.begin(),
+                                               my_ck->ref_slots.end(),
+                                               static_cast<int32_t>(i)));
+        }
+        g_jit_ret_audit_refscan++;
     }
+    if (g_current_ctx && g_current_ctx->frame
+            && rec.window != g_current_ctx->frame->slots) {
+        g_jit_ret_audit_skipped++;   /* record-less: no bases to compare */
+        return;
+    }
+    /* THE RECOVERY IS SELF-CHECKED where a record exists: the chunk we
+     * derived from our own return address must BE the record's. The
+     * record-less frames then inherit that confidence - the same
+     * "verify the reconstruction against records wherever there are
+     * records" shape the G1 nets are built on. */
+    ML_VM_CHECK(!my_ck || my_ck == rec.run_chunk);
+    g_jit_ret_audit_done++;
     /* the emit gate was plain_frame: no watermark can have moved */
     ML_VM_CHECK(act.handlers.size() == rec.handler_base);
     ML_VM_CHECK(act.diters_n == rec.diter_base);
@@ -8365,6 +8426,12 @@ bool g_norec_audit = false;
  * would need an exception in flight and would end the run at the first
  * event.
  */
+/* the ret audit's fork accounting: SKIPPED must not become "all", or
+ * the audit is silently dead (see jit_ret_audit) */
+unsigned long g_jit_ret_audit_done = 0;
+unsigned long g_jit_ret_audit_skipped = 0;
+unsigned long g_jit_ret_audit_refscan = 0;
+
 unsigned long g_norec_recon_at = 0;      /* 0 = off, else the 1-based event */
 unsigned long g_norec_events = 0;        /* call events seen this run */
 unsigned long g_jit_norec_recon_probes = 0;

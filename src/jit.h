@@ -1052,6 +1052,9 @@ extern bool g_norec_audit;
  *   norec_recon_probes  probes that actually fired
  *   norec_recon_frames  frames those probes reconstructed
  */
+extern unsigned long g_jit_ret_audit_done;
+extern unsigned long g_jit_ret_audit_skipped;
+extern unsigned long g_jit_ret_audit_refscan;
 extern unsigned long g_norec_recon_at;
 extern unsigned long g_norec_events;
 extern unsigned long g_jit_norec_recon_probes;
