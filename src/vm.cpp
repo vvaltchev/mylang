@@ -316,6 +316,15 @@ static inline Op vm_base_to_expr14_op(Op base)
     case Op::times:   return Op::muleq;
     case Op::div:     return Op::diveq;
     case Op::mod:     return Op::modeq;
+    /* the flat tiers emit only the arith five today, but the inverse map
+     * carries the whole compound set so a future widening cannot silently
+     * turn `<<=` into a PLAIN store (the third audit-table shape) */
+    case Op::shl:     return Op::shleq;
+    case Op::shr:     return Op::shreq;
+    case Op::ushr:    return Op::ushreq;
+    case Op::band:    return Op::bandeq;
+    case Op::bor:     return Op::boreq;
+    case Op::bxor:    return Op::bxoreq;
     default:          return Op::assign;
     }
 }

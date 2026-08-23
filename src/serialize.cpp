@@ -1326,7 +1326,12 @@ void read_chunk(Reader &r, Chunk &c)
         if (flags & (1u << 10))
             /* the SET valid for this opcode is per-op, so verify_chunk
              * owns it; here only the enum's own range */
-            in.aop = r.enumv(Op::qmdot, "corrupt .myv (op)");
+            /* the highest Op value is valid aop content (the element/dict/
+             * member stores carry the COMPOUND Expr14 op) - derive the bound
+             * from the enum so a new operator cannot leave it stale */
+            in.aop = r.enumv(static_cast<Op>(
+                                 static_cast<int>(Op::op_count) - 1),
+                             "corrupt .myv (op)");
         if (flags & (1u << 11))
             in.opflags = r.u8v();
         if (wt)

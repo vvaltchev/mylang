@@ -1755,8 +1755,15 @@ match C precedence; an unused level is skipped):
   AutoConst analogue is in `fold_reads` (`resolver.cpp`), which **must** descend
   into `TernaryExpr`/`CoalesceExpr` (it has no generic fallthrough — a missing
   case silently fails to fold their children).
-- `pExpr14` — assignment `=  +=  -=  *=  /=  %=`, plus `var`/`const` decls and
-  id-list targets
+- `pExpr14` — assignment `=  +=  -=  *=  /=  %=  <<=  >>=  >>>=  &=  |=  ^=`
+  (the compound set is defined ONCE, `compound_assign_base` in operators.h —
+  the parser's accept list, the inferencer's typing, both engines' RMW
+  dispatch, the codegen lowerings, the REPL continuation sets and the disasm
+  spellings all ask that function), plus `var`/`const` decls and id-list
+  targets. A compound lowers byte-identically to its spelled-out
+  `x = x OP rhs` (pinned by test); the shift/bitwise compounds are int-only
+  like their binary forms. The lexer's maximal munch probes 4 chars first
+  (`>>>=`), then 3, then 2.
 
 `pExprGeneric<ExprT>` implements the common left-associative chain: it collects
 `(Op, operand)` pairs

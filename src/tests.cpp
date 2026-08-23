@@ -5668,6 +5668,65 @@ static const std::vector<test> tests =
     { "bitwise: | on a string is a type error (const-folded)",
       { "var x = \"a\" | 2;" }, &typeid(TypeErrorEx) },
 
+    /* ---- compound shift/bitwise assignment (<<= >>= >>>= &= |= ^=) ----
+     * Each is byte-identical sugar for `x = x OP rhs` (pinned: the codegen
+     * lowers both spellings to the same IntBin), so these cover the
+     * SPELLING (lexer maximal munch incl. the 4-char >>>=), each op's
+     * semantics, every lvalue kind the boxed stores serve, and the
+     * int-only type errors. */
+    { "compound shift: >>= <<= >>>= basics",
+      { "var a = -8; a >>= 1; assert(a == -4);",
+        "var b = 5;  b <<= 1; assert(b == 10);",
+        "var c = -8; c >>>= 60; assert(c == 15);" } },
+    { "compound bitwise: &= |= ^= basics",
+      { "var x = 6; x &= 3; assert(x == 2);",
+        "x |= 5; assert(x == 7);",
+        "x ^= 2; assert(x == 5);" } },
+    { "compound shift: saturation matches the binary forms",
+      { "var a = 1;  a <<= 100; assert(a == 0);",
+        "var b = -1; b >>= 64;  assert(b == -1);",
+        "var c = 5;  c >>>= 64; assert(c == 0);" } },
+    { "compound shift: a negative count throws at runtime",
+      { "var n = int(runtime(0 - 1)); var x = 1; x <<= n;" },
+      &typeid(InvalidValueEx) },
+    { "compound shift: lexer maximal munch (>>>= is ONE token)",
+      { "var a = -16; var b = 2; a>>>=b; assert(a == 4611686018427387900);",
+        "var c = 8; c>>=2; assert(c == 2);",
+        "var d = 1; d<<=3; assert(d == 8);" } },
+    { "compound shift/bitwise on every lvalue kind (elem/dict/member/global)",
+      { "var arr = [8, 1]; arr[0] >>= 2; arr[1] <<= 4;",
+        "assert(arr[0] == 2 && arr[1] == 16);",
+        "var d = {\"k\": 12}; d.k &= 10; d[\"k\"] |= 1;",
+        "assert(d.k == 9);",
+        "var G = 32;",
+        "func t() { G >>= 3; }",
+        "t(); assert(G == 4);",
+        "var mk = func[G]() { G <<= 1; return G; };",
+        "assert(mk() == 8 && mk() == 16);" } },
+    { "compound shift: the boxed dyn tier",
+      { "var dyn v = runtime(-8);",
+        "v >>= 1; assert(v == -4);",
+        "v <<= 2; assert(v == -16);",
+        "v >>>= 60; assert(v == 15);",
+        "v ^= 6; assert(v == 9);" } },
+    { "compound shift: nested-element and struct-field targets",
+      { "var m = [[8, 2], [3, 4]];",
+        "m[0][0] >>= 2; m[1][1] <<= 1;",
+        "assert(m[0][0] == 2 && m[1][1] == 8);",
+        "struct S { int v; }",
+        "var s = S(40);",
+        "s.v >>= 2; assert(s.v == 10);",
+        "s.v |= 1; assert(s.v == 11);" } },
+    { "compound shift: <<= on a float is a type error",
+      { "func f(float x) { x <<= 1; return x; }" },
+      &typeid(TypeMismatchEx) },
+    { "compound shift: >>= with a str rhs is a type error",
+      { "var x = 1; x >>= \"s\";" }, &typeid(TypeMismatchEx) },
+    { "compound bitwise: &= on a dyn float throws at runtime",
+      { "var dyn z = runtime(1.5); z &= 1;" }, &typeid(TypeErrorEx) },
+    { "compound shift: `x >> = 1` (split by a space) stays a syntax error",
+      { "var x = 4; x >> = 1;" }, &typeid(SyntaxErrorEx) },
+
     /* ---- for-range loop specialization (ForRangeStmt) ---- */
     { "for-range: ascending (i++) is correct",
       { "var s = 0; for (var i = 0; i < 5; i++) { s += i; }",
@@ -17090,6 +17149,8 @@ static bool repl_incomplete_detection()
     if (!ReplEngine::is_incomplete("var a = [1,")) return false;  /* open [  */
     if (!ReplEngine::is_incomplete("1 +")) return false;          /* trailing op */
     if (!ReplEngine::is_incomplete("foo(1, 2")) return false;     /* open ( */
+    if (!ReplEngine::is_incomplete("x >>=")) return false;  /* trailing op */
+    if (!ReplEngine::is_incomplete("x <<")) return false;         /* binary */
     if (ReplEngine::is_incomplete("var x = 5")) return false;     /* complete */
     if (ReplEngine::is_incomplete("func f() { return 1; }"))      /* complete */
         return false;
@@ -25540,12 +25601,12 @@ static bool jit_rax_pin_test()
           "print(f(runtime(40)));" }, false },
 
       /*
-       * #96 two-address shifts: the IN-PLACE literal form
-       * (`s = s >> 1` - the language has no >>=) emits `sar pin, 1`
-       * with no rax staging, so it JOINS the whitelist and a kernel
-       * containing it still pins rax. The same arena asymmetry as the
-       * base case (off-arena the budget is 12 and a 13-slot kernel
-       * cannot reach rax).
+       * #96 two-address shifts: the IN-PLACE literal form (spelled with
+       * the compound `>>=`/`<<=`, which lowers byte-identically to
+       * `s = s >> 1`) emits `sar pin, 1` with no rax staging, so it
+       * JOINS the whitelist and a kernel containing it still pins rax.
+       * The same arena asymmetry as the base case (off-arena the budget
+       * is 12 and a 13-slot kernel cannot reach rax).
        */
       { "in-place literal shifts stay rax-free (two-address form)",
         { "func f(int n) {",
@@ -25556,7 +25617,7 @@ static bool jit_rax_pin_test()
           "        s0 += i; s1 += s0; s2 += s1; s3 += s2;",
           "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
           "        s8 += s7; s9 += s8; sa += s9; sb += sa;",
-          "        s3 = s3 >> 1; s7 = s7 << 1; s7 = s7 >> 1;",
+          "        s3 >>= 1; s7 <<= 1; s7 >>= 1;",
           "    }",
           "    s0 += s1; s0 += s2; s0 += s3; s0 += s4; s0 += s5;",
           "    s0 += s6; s0 += s7; s0 += s8; s0 += s9; s0 += sa;",

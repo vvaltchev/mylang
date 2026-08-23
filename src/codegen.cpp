@@ -528,14 +528,7 @@ bool is_boxed_cmp(Op op)
  * if `op` isn't a compound-assign the boxed CompoundV handles. */
 Op compound_base_op(Op op)
 {
-    switch (op) {
-        case Op::addeq: return Op::plus;
-        case Op::subeq: return Op::minus;
-        case Op::muleq: return Op::times;
-        case Op::diveq: return Op::div;
-        case Op::modeq: return Op::mod;
-        default:        return Op::invalid;
-    }
+    return compound_assign_base(op);    /* operators.h - the single map */
 }
 
 /* Bake a scalar/string literal into an EvalValue for the boxed const pool.
@@ -4545,11 +4538,9 @@ struct Codegen {
      */
     bool try_native_chain_store(const Expr14 *e, std::vector<CgInstr> &ops)
     {
-        switch (e->op) {
-        case Op::assign: case Op::addeq: case Op::subeq:
-        case Op::muleq:  case Op::diveq: case Op::modeq: break;
-        default: return false;
-        }
+        if (e->op != Op::assign
+                && compound_assign_base(e->op) == Op::invalid)
+            return false;
         /* Decompose the lvalue OUTSIDE-IN into member/subscript steps down to a
          * base. `chain` is outermost-first; reverse for inside-out. */
         std::vector<const Construct *> chain;   /* outermost-first */
@@ -4966,11 +4957,9 @@ struct Codegen {
              * base) -> the GENERIC StoreElemChainV (value, then keys base-to-
              * innermost). Matches the tree-walker's rhs-then-lvalue eval order. */
             if (dynamic_cast<const Subscript *>(sub->what.get())) {
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
+                if (e->op != Op::assign
+                        && compound_assign_base(e->op) == Op::invalid)
+                    return false;
                 std::vector<const Subscript *> chain;   /* outermost-first */
                 const Construct *cur = sub;
                 while (auto *s = dynamic_cast<const Subscript *>(cur)) {
@@ -5061,11 +5050,9 @@ struct Codegen {
              * runtime Type::subscript(for_write) + slot_rmw do the store. */
             if (sub->base_dict) {
                 int dslot, dkind;
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
+                if (e->op != Op::assign
+                        && compound_assign_base(e->op) == Op::invalid)
+                    return false;
                 if (!as_container_base(sub->what.get(), dslot, dkind))
                     return false;
                 int vslot, kslot;
@@ -5104,6 +5091,11 @@ struct Codegen {
                     case Op::muleq:  aop = Op::times;   break;
                     case Op::diveq:  aop = Op::div;     break;
                     case Op::modeq:  aop = Op::mod;     break;
+                    /* the shift/bitwise compounds (`a[i] <<= n`) fall
+                     * through to the boxed StoreElemValue below - the flat
+                     * store body dispatches only the arith five (its shift
+                     * arms would need the loc-stamped InvalidValueEx
+                     * throwers); a typed flat tier is a follow-up */
                     default: ok = false; break;
                 }
                 int aslot, akind;
@@ -5169,11 +5161,9 @@ struct Codegen {
              * left to compile_float_stmt's fast unboxed StoreElemFloat. */
             if (!(sub->th == TypeHint::f && sub->base_array)) {
                 int aslot, akind;
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
+                if (e->op != Op::assign
+                        && compound_assign_base(e->op) == Op::invalid)
+                    return false;
                 if (!as_container_base(sub->what.get(), aslot, akind))
                     return false;
                 int vslot, kslot;
@@ -5205,11 +5195,9 @@ struct Codegen {
                 dynamic_cast<const MemberExpr *>(e->lvalue.get())) {
             if (m->base_dict) {
                 int dslot, dkind;
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
+                if (e->op != Op::assign
+                        && compound_assign_base(e->op) == Op::invalid)
+                    return false;
                 if (!as_container_base(m->what.get(), dslot, dkind))
                     return false;
                 int vslot;
@@ -5240,11 +5228,9 @@ struct Codegen {
              * The member uid + carets ride in the member-key pool (AST-free). */
             if (m->base_struct) {
                 int sslot, skind;
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
+                if (e->op != Op::assign
+                        && compound_assign_base(e->op) == Op::invalid)
+                    return false;
                 if (!as_container_base(m->what.get(), sslot, skind))
                     return false;
                 int vslot;
@@ -5300,15 +5286,12 @@ struct Codegen {
             return true;
         }
 
-        Op arith;
-        switch (e->op) {
-            case Op::addeq: arith = Op::plus;  break;
-            case Op::subeq: arith = Op::minus; break;
-            case Op::muleq: arith = Op::times; break;
-            case Op::diveq: arith = Op::div;   break;
-            case Op::modeq: arith = Op::mod;   break;
-            default: return false;
-        }
+        /* Every compound maps here (shifts/bitwise included): IntBin
+         * dispatches the base op via vm_num_binop and the JIT emits all
+         * eleven (the shift arms via the reg-count shift core). */
+        const Op arith = compound_assign_base(e->op);
+        if (arith == Op::invalid)
+            return false;
 
         Operand rhs;                     /* dst = dst <arith> rhs (rhs nested) */
         if (!compile_int_expr(e->rvalue.get(), rhs, ops))
@@ -5579,6 +5562,8 @@ struct Codegen {
                 case Op::muleq:  aop = Op::times;   break;
                 case Op::diveq:  aop = Op::div;     break;
                 case Op::modeq:  aop = Op::mod;     break;
+                /* shift/bitwise compounds: int-only, so a proven-float
+                 * element never sees one (compile-rejected upstream) */
                 default: return false;
             }
             int aslot, akind;
@@ -5642,15 +5627,9 @@ struct Codegen {
             return true;
         }
 
-        Op arith;
-        switch (e->op) {
-            case Op::addeq: arith = Op::plus;  break;
-            case Op::subeq: arith = Op::minus; break;
-            case Op::muleq: arith = Op::times; break;
-            case Op::diveq: arith = Op::div;   break;
-            case Op::modeq: arith = Op::mod;   break;
-            default: return false;
-        }
+        const Op arith = compound_assign_base(e->op);
+        if (arith == Op::invalid)
+            return false;
 
         Operand rhs;                     /* dst = dst <arith> rhs */
         if (!compile_float_expr(e->rvalue.get(), rhs, ops))

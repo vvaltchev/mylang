@@ -52,6 +52,37 @@ enum class Op : unsigned char {
     ushr        = 41, // >>> (unsigned/logical right shift, zero-fill)
     coalesce    = 42, // ?? (null-coalescing: a ?? b)
     qmdot       = 43, // ?. (optional member access: a?.b)
+    shleq       = 44, // <<=  (compound assign; base op shl)
+    shreq       = 45, // >>=  (compound assign; base op shr)
+    ushreq      = 46, // >>>= (compound assign; base op ushr)
+    bandeq      = 47, // &=   (compound assign; base op band)
+    boreq       = 48, // |=   (compound assign; base op bor)
+    bxoreq      = 49, // ^=   (compound assign; base op bxor)
 
-    op_count    = 44,
+    op_count    = 50,
 };
+
+/* The BASE binary Op of a compound assignment (`+=` -> plus, `<<=` -> shl),
+ * or Op::invalid when `op` is not a compound assign. THE single source of
+ * truth for the compound-assign set: the parser's accept list, the
+ * inferencer's typing, both engines' read-modify-write dispatch and the
+ * codegen's store lowerings all ask THIS function, so a new compound
+ * operator joins every consumer at once (the fifth audit-table shape - an
+ * enumeration copied by hand rots member by member). */
+constexpr Op compound_assign_base(Op op)
+{
+    switch (op) {
+        case Op::addeq:  return Op::plus;
+        case Op::subeq:  return Op::minus;
+        case Op::muleq:  return Op::times;
+        case Op::diveq:  return Op::div;
+        case Op::modeq:  return Op::mod;
+        case Op::shleq:  return Op::shl;
+        case Op::shreq:  return Op::shr;
+        case Op::ushreq: return Op::ushr;
+        case Op::bandeq: return Op::band;
+        case Op::boreq:  return Op::bor;
+        case Op::bxoreq: return Op::bxor;
+        default:         return Op::invalid;
+    }
+}

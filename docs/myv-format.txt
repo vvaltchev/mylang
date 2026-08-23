@@ -2,8 +2,14 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 13.  This document describes the on-disk image exhaustively:
+Format version 14.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v14 changed no encoding: it widened the VALUE DOMAIN of an instruction's
+`aop` byte - the compound shift/bitwise assignment operators `<<=` `>>=`
+`>>>=` `&=` `|=` `^=` are Op values 44-49, which a v13 reader has no
+dispatch for, so the version was bumped rather than let an old binary map
+an unknown compound to a plain store.)
 
 It is the specification of what `mylang -c FILE` writes and what `mylang
 FILE.myv` reads.  The implementation is src/serialize.{h,cpp}; the design
@@ -431,7 +437,13 @@ its default:
 
     u8    op                        the opcode
     u16   flags                     which optional fields follow, and how wide
-    [u8]  aop                       iff flags bit 10
+    [u8]  aop                       iff flags bit 10.  An Op value
+                                    (src/operators.h): the base arith/
+                                    compare op for BinOpV/CmpV/CompoundV/
+                                    the global+capture stores, the
+                                    COMPOUND Expr14 op (assign/addeq/../
+                                    bxoreq, values 15 + 25-29 + 44-49)
+                                    for the element/dict/member stores
     [u8]  opflags                   iff flags bit 11
     [..]  target                    iff its width code is nonzero
     [..]  target2                   iff its width code is nonzero

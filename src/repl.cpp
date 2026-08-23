@@ -193,14 +193,15 @@ repl_continuation_op(Op op)
         case Op::plus:  case Op::minus: case Op::times: case Op::div:
         case Op::mod:   case Op::lt:    case Op::gt:    case Op::le:
         case Op::ge:    case Op::eq:    case Op::noteq: case Op::land:
-        case Op::lor:   case Op::band:  case Op::bor:   case Op::assign:
-        case Op::addeq: case Op::subeq: case Op::muleq: case Op::diveq:
-        case Op::modeq: case Op::comma: case Op::dot:   case Op::arrow:
+        case Op::lor:   case Op::band:  case Op::bor:   case Op::bxor:
+        case Op::shl:   case Op::shr:   case Op::ushr:  case Op::assign:
+        case Op::comma: case Op::dot:   case Op::arrow:
         case Op::colon: case Op::parenL: case Op::braceL: case Op::bracketL:
         case Op::semicolon:
             return true;
         default:
-            return false;
+            /* every compound assignment, via the single map (operators.h) */
+            return compound_assign_base(op) != Op::invalid;
     }
 }
 
@@ -1186,13 +1187,21 @@ ReplEngine::is_incomplete(const string &src)
     if (depth > 0)
         return true;
 
-    /* A line ending on a binary/continuation operator wants more. */
+    /* A line ending on a binary/continuation operator wants more. The
+     * compound assignments answer through compound_assign_base (the single
+     * map, operators.h) so a new one joins here with no edit - this switch
+     * was a second hand-copy of the set and had silently missed even `+=`
+     * (a trailing `x +=` used to submit and error). */
+    if (compound_assign_base(toks.back().op) != Op::invalid)
+        return true;
     switch (toks.back().op) {
         case Op::plus:    case Op::minus:   case Op::times:
         case Op::div:     case Op::mod:     case Op::lt:
         case Op::gt:      case Op::le:      case Op::ge:
         case Op::eq:      case Op::noteq:   case Op::land:
-        case Op::lor:     case Op::assign:  case Op::comma:
+        case Op::lor:     case Op::band:    case Op::bor:
+        case Op::bxor:    case Op::shl:     case Op::shr:
+        case Op::ushr:    case Op::assign:  case Op::comma:
         case Op::dot:     case Op::arrow:
             return true;
         default:

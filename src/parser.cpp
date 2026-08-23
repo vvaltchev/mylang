@@ -1726,7 +1726,8 @@ unique_ptr<Construct>
 pExpr14(ParseContext &c, unsigned fl)
 {
     static const std::initializer_list<Op> valid_ops = {
-        Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq
+        Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq,
+        Op::shleq, Op::shreq, Op::ushreq, Op::bandeq, Op::boreq, Op::bxoreq
     };
 
     const Loc start = c.get_loc();
