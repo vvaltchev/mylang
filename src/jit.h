@@ -950,6 +950,12 @@ extern "C" unsigned long g_jit_rax_pin;
 extern "C" unsigned long g_jit_scache;
 /* #96 inc-2: range seams EXECUTED (eviction + install ran). */
 extern "C" unsigned long g_jit_range_share;
+/* the in-process FORCE override (a bitmask of JitLever bits), for
+ * tests exercising a cost-declined mechanism - the g_jit_xrot
+ * pattern. Zero outside tests. */
+extern unsigned g_jit_force_extra;
+/* a lever's g_jit_force_extra bit, resolved by NAME (0 if unknown) */
+unsigned jit_lever_bit(const char *name);
 /* #96: `<op> [slot], reg` emitted instead of the four-instruction
  * load/load/apply/store shape - the two-address form. */
 extern "C" unsigned long g_jit_two_addr;

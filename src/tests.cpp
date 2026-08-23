@@ -25288,7 +25288,15 @@ static bool jit_range_share_test()
     };
 
     bool ok = true;
+    /*
+     * The sweep runs under the in-process FORCE (the cost model
+     * declines every seam whose alternative is a free home, which is
+     * ALL of them at this shape's pressure - so without the force the
+     * engage case tests nothing). FORCE ignores only the COST half;
+     * the overlap-decline case still pins the soundness half under it.
+     */
     const unsigned rot0 = g_jit_xrot;
+    g_jit_force_extra |= jit_lever_bit("rshare");
     for (unsigned rot = 0; rot < jit_xcache_width(); rot++) {
         g_jit_xrot = rot;
         for (const Case &c : cases) {
@@ -25308,7 +25316,31 @@ static bool jit_range_share_test()
             }
         }
     }
+    g_jit_force_extra &= ~jit_lever_bit("rshare");
     g_jit_xrot = rot0;
+    /*
+     * THE COST GATE, watched from the other side: WITHOUT the force,
+     * the same engage shape's overflow all fits the home tier, the
+     * free alternative wins, and NO seam may execute - a seam here is
+     * the 68_nested +0.36% Ir defect coming back (an evict+install
+     * pair whose alternative was free).
+     */
+    {
+        unsigned long rs = 0;
+        const std::string got = go(cases[0].src, true, &rs);
+        const std::string ref = go(cases[0].src, false, nullptr);
+        if (got != ref || ref.empty()) {
+            cout << "  rshare [cost-gated engage] tw=[" << ref
+                 << "] vm=[" << got << "]\n";
+            ok = false;
+        }
+        if (rs != 0) {
+            cout << "  rshare [cost-gated engage]: " << rs << " seam(s) "
+                    "executed with a FREE home available - the cost "
+                    "model is not declining\n";
+            ok = false;
+        }
+    }
     return ok;
 #else
     return true;

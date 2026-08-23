@@ -7348,3 +7348,34 @@ cheap); a shape that makes its absence bite is still owed. The other
 pieces are watched: the two-phase decline case's first spelling was
 itself caught legitimately chaining backward, and the fully-
 overlapping spelling pins the decline.
+
+## #96 THE PLACEMENT COST MODEL (2026-08-22) - and what it honestly is
+
+**The rule that landed:** a SEAM is taken only when its alternative is
+not free - overflow that fits the home tier keeps the home (0 measured
+cost), and only the residue past MAX_SPILL_HOMES chains. The capacity
+is applied AFTER the share plan, so the plan finally sees the true
+tail (the old order truncated it first, which made the gate vacuously
+"always home"). MYLANG_JIT_FORCE=rshare ignores the cost half and
+chains everything chainable - the FORCE contract - and the -rt engage
+sweep runs under it via `g_jit_force_extra` (the in-process force
+override, g_jit_xrot's pattern, with `jit_lever_bit(name)` so tests
+never touch the enum). WATCHED both ways: the unforced engage shape
+must execute ZERO seams (a seam with a free home available is the
+defect class), and the forced sweep still proves the machinery.
+
+**What the model deliberately does NOT gate, with the numbers:**
+ - PINS: the MAXPINS sweep's flat marginals stand; wall-relevant via
+   dependency chains, never measured negative.
+ - HOMES: measured a WIN where reach exists - 68_nested reads -2.1%
+   Ir homes-on vs MAXSPILL=0 in the same binary. No gate.
+
+**The attribution lesson, earned twice in one arc:** inc-2's
+"68_nested +0.36%" was attributed to the seam; with the seam
+cost-declined the +0.36% REMAINED (it is placement/layout drift from
+the coverage-pop-to-home change - the pop-insert shifts every home
+index), and turning homes OFF to "recover" it read +2.5%. Callgrind
+attribution is not mechanism (the memory rule by that name), and a
+cost model must be anchored on a mechanism A/B (the MAXSPILL /
+MAXSHARE / FORCE levers exist precisely for that), never on a
+single bench's cur/base residue.
