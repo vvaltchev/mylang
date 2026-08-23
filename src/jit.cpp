@@ -5863,15 +5863,18 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.u32(static_cast<uint32_t>(d));
     };
     const auto imul_imm = [&](uint8_t r, int32_t imm) { /* imul r, r, imm */
+        e.wrote(r);                    /* raw bytes: report the write */
         e.u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 5 : 0)));
         e.u8(0x69);
         e.u8(static_cast<uint8_t>(0xC0 | ((r & 7) << 3) | (r & 7)));
         e.u32(static_cast<uint32_t>(imm));
     };
     const auto movabs_r11 = [&](uint64_t imm) {       /* movabs r11, imm64 */
+        e.wrote(11);
         e.u8(0x49); e.u8(0xBB); e.u64(imm);
     };
     const auto movabs_r10 = [&](uint64_t imm) {       /* movabs r10, imm64 */
+        e.wrote(10);
         e.u8(0x49); e.u8(0xBA); e.u64(imm);
     };
     const uint8_t R10 = 10, R11 = 11, R8R = 8, R9R = 9;
@@ -6392,6 +6395,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         st(R10, static_cast<int32_t>(P.rec_norec_site), RAX);
     }
 #endif
+    e.wrote(0);                     /* raw bytes (rsp base needs SIB) */
     e.u8(0x48); e.u8(0x8B); e.u8(0x04); e.u8(0x24);  /* mov rax, [rsp]
                                                       * = the desc spill */
     st(R10, static_cast<int32_t>(P.rec_desc), RAX);
@@ -6529,6 +6533,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          */
         /* mov rax, [rsp+32] - the modrm helper above deliberately cannot
          * encode an rsp base (it needs a SIB byte), so spell it out. */
+        e.wrote(0);                 /* raw bytes (rsp base needs SIB) */
         e.u8(0x48); e.u8(0x8B); e.u8(0x44); e.u8(0x24); e.u8(0x20);
         ld(RDX, RAX, static_cast<int32_t>(P.desc_noescape));
         if (i) {                                      /* shr rdx, i */
@@ -6907,6 +6912,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             if (!residue)
                 return;
             if (in.target >= 0) {
+                e.wrote(1);
                 e.u8(0x48); e.u8(0x8D); e.u8(0x8B);   /* lea rcx,[rbx+d] */
                 e.u32(static_cast<uint32_t>(
                     in.target * static_cast<int32_t>(sizeof(LValue))));
@@ -6921,6 +6927,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         const auto residue_pop = [&]() {
             if (!residue)
                 return;
+            e.wrote(1);              /* a raw pop WRITES its register */
             e.u8(0x59);                               /* pop rcx (caps) */
             e.movabs(RDX,
                      reinterpret_cast<uint64_t>(&g_jit_residue_caps));
@@ -11501,6 +11508,7 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
                                                           * caret (deletable) */
     e.patch32(jl, static_cast<uint32_t>(e.pos() - (jl + 4)));
     /* shl/sar/shr rax,cl */
+    e.wrote(0);
     e.u8(0x48); e.u8(0xD3); e.u8(modrm);
     e.patch32(jdone, static_cast<uint32_t>(e.pos() - (jdone + 4)));
 }
@@ -13851,6 +13859,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     e.sar_rr_imm8(RAX, 63);   /* sar rax,63 */
                 }
             } else if (c > 0) {
+                e.wrote(RAX);
                 e.u8(0x48); e.u8(0xC1);
                 e.u8(shl ? 0xE0 : 0xF8);                 /* shl/sar rax,c */
                 e.u8(static_cast<uint8_t>(c));
@@ -14964,6 +14973,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         break;
                     default:              /* bool byte (payload is 0/1) */
                         /* movzx eax, byte [rdi + payload] */
+                        e.wrote(RAX);
                         e.u8(0x0F); e.u8(0xB6); e.u8(MODRM_SLOT);
                         e.u32(static_cast<uint32_t>(s.payload));
                         /* mov [r9 + off], al */
@@ -15087,6 +15097,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         e.cmp_rr(RAX, tmp);
         drop();                    /* flags survive the pop */
+        e.wrote(RAX);                    /* setcc al writes rax's low byte */
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>(cc_for(in.aop).near_op + 0x10));
         e.u8(0xC0);                               /* setcc al */
@@ -15110,6 +15121,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
                         /*no_bail=*/true);
         if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
+        e.wrote(RAX);
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
         e.u8(0xC0);                               /* setcc al */
@@ -15851,6 +15863,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (cmp) {
                 e.cmp_rr(RAX, tmp);
                 drop();                /* flags survive the pop */
+                e.wrote(RAX);
                 e.u8(0x0F);
                 e.u8(static_cast<uint8_t>(cc_for(bo.aop).near_op + 0x10));
                 e.u8(0xC0);                           /* setcc al */
@@ -15982,6 +15995,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (cmp) {
                 const FCmp fc = float_cmp(bo.aop);
                 if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
+                e.wrote(RAX);
                 e.u8(0x0F);
                 e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
                 e.u8(0xC0);                           /* setcc al */
@@ -16445,6 +16459,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             j_cold.push_back(e.j32(0x73));       /* jae -> neg or >= len */
             e.load(RAX, b.payload + SL.str_obj_off);      /* the StrObj * */
             e.load_base(RCX, RAX, SL.strobj_data_off);   /* rcx = the char data */
+            e.wrote(RAX);
             e.u8(0x0F); e.u8(0xB6); e.u8(0x04);  /* movzx eax,           */
             e.u8(0x11);                          /*   byte [rcx + rdx]   */
 #ifdef TESTS
@@ -18266,6 +18281,7 @@ static void emit_island_call(Emitter &e, const FuncDescriptor *desc,
     e.u8(0x48); e.test32_rr(RAX, RAX);                      /* test rax, rax */
     /* jns +over (rel8)*/
     e.u8(0x79); const size_t jfix = e.pos(); e.u8(0);
+    e.wrote(RAX);
     e.u8(0xB8); e.u32(island_pc);                    /* mov eax, island_pc */
     /* ret -> EnterNative re-raises */
     e.frag_ret(Emitter::RetFlush::empty);

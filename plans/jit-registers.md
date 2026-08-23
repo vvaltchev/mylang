@@ -3712,3 +3712,27 @@ What remains on the arc, unchanged in kind: the ~20 raw u8() tracker
 bypasses (y), widening run_may_pin_rax (two-address shifts), and -
 now that placement has three tiers - a COST model that decides pin vs
 home vs share by weight rather than rank order alone.
+
+## (an) 2026-08-22 - (y) CLOSED for the tracker: every GP-writing raw
+## byte sequence now reports wrote()
+
+Sixteen `e.wrote()` reports at the raw-byte sites outside the Emitter
+class that write a GP register - the div-magic kit's imul/movabs
+lambdas (r10/r11 and the allocated reg), the two rsp-based loads (an
+rsp base needs a SIB the modrm helpers cannot spell), the M5b residue
+kit's lea/pop rcx, both shift-into-rax rejoins, both movzx-eax reads,
+all four setcc-al sites, and the island raise arm's mov eax. All
+sixteen pass every net with zero false aborts - each site's write was
+already legitimately free, which is exactly the consistency the rax
+whitelist encodes (it excludes precisely the ops whose emission
+writes rax raw). The reports are the runtime cross-check on that
+consistency: a future whitelist widening that reaches one aborts BY
+NAME instead of shipping an r9-class silent clobber.
+
+WATCHED for liveness, not reach: a reaching shape cannot be built
+without breaking the whitelist first (the exclusions ARE the
+consistency), so the proof is that the reports are CONSUMED -
+pointing the CmpIntV setcc report at r12 aborts -rt at vm opcode 10
+by name. The remaining raw lines are memory-only stores/compares,
+xmm ops and control flow: no GP writes, census-cosmetic only, left
+for #101's encoder work if it wants them.
