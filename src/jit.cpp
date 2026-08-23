@@ -5877,6 +5877,10 @@ static const ArgFuse *argfuse_at(size_t old_pc)
     return it == g_cur_argfuse->end() ? nullptr : &it->second;
 }
 
+/* reg:conv(fn) - the fragment-inline CALL PROTOCOL: a MyLang call's
+ * clobber mask denies the whole caller-saved pool in any run that
+ * contains one, so no pin can exist where this emits and every
+ * register below is protocol, not scratch-by-assumption. */
 static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
                                   bool cached, int callee_arg,
                                   std::vector<size_t> &j_slow,
@@ -6876,6 +6880,8 @@ static std::vector<std::unique_ptr<NorecSite>> *g_cur_norec_sites = nullptr;
 static const FuncDescriptor *g_cur_caller_desc = nullptr;
 
 
+/* reg:conv(fn) - the sync-call sequence: the same MyLang-call pool
+ * denial as emit_sync_push_native above. */
 static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                   const Instr &in, uint32_t pc,
                                   size_t old_pc, bool is_value,
@@ -7290,6 +7296,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
  */
 static constexpr size_t RET_REF_GUARD_MAX = 6;
 
+/* reg:conv(fn) - the RETURN half of the call protocol (the record /
+ * no-record walk): the same MyLang-call pool denial. */
 static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
 {
     e.flush_cache();

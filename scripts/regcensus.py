@@ -95,7 +95,20 @@ LINE with a tag inside a comment:
 
 A tag with any other reason word is an ERROR; a tag on a line with no
 hardcoded register is reported STALE (the norec-coverage exemption
-pattern - a marker that cannot rot silently). The table splits the
+pattern - a marker that cannot rot silently).
+
+THE FUNCTION-SCOPE FORM `reg:conv(fn)` / `reg:abi(fn)` sits on a
+FUNCTION DEFINITION line and justifies every site until the next
+top-level `}` - for the call-protocol emitters
+(emit_sync_push_native / emit_sync_call_inline / emit_ret_native),
+where EVERY register is protocol: a MyLang call's clobber mask denies
+the whole caller-saved pool in any run containing one, so no pin can
+exist where they emit, and tagging their ~150 lines one by one would
+say less than the one sentence above. The DELIBERATE TRADE: a future
+unjustified site added inside such a function escapes the ratchet -
+which is why the form is reserved for functions that are wholly
+protocol, and why a region with ZERO register sites is reported
+STALE like a line tag. The table splits the
 unbracketed column into justified / UNJUSTIFIED, and UNJUSTIFIED is
 the work. `--gate` compares each register's UNJUSTIFIED count against
 scripts/regcensus_floor.txt and FAILS on any increase - the ratchet:
@@ -267,8 +280,11 @@ def census(path):
     res = {MERGE.get(r, r): {'br': 0, 'un': 0, 'ju': 0, 'lines': []}
            for r in REGS}
     res['__raw__'] = raw_encodings(lines)
-    TAG = re.compile(r'reg:(\w+)')
+    TAG = re.compile(r'reg:(\w+)(\(fn\))?')
     tag_errors, stale_tags = [], []
+    fn_region = False            # inside a reg:xxx(fn) function body
+    fn_region_line = 0
+    fn_region_hits = 0
     ALLOC_API = re.compile(r'\balloc_scratch\s*\(|\.take\s*\(|'
                            r'\btake\s*\(|\bfree_scratch\s*\(')
     in_reg_enum = False
@@ -312,12 +328,23 @@ def census(path):
                     hits[r] = hits.get(r, 0) + n
         # the justification tag lives in a COMMENT, so it is read from
         # the RAW line (the scrub removed it from `l`)
+        if fn_region and l.startswith('}'):
+            if fn_region_hits == 0:
+                stale_tags.append(fn_region_line)
+            fn_region = False
         m = TAG.search(rawl[i])
         tag = m.group(1) if m else None
         if tag is not None and tag not in ('isa', 'abi', 'conv'):
             tag_errors.append((i + 1, tag))
             tag = None
-        if tag is not None and not hits:
+        if tag is not None and m.group(2):     # the (fn) region form
+            fn_region = True
+            fn_region_line = i + 1
+            fn_region_hits = 0
+        if fn_region and hits:
+            fn_region_hits += len(hits)
+            tag = tag or 'conv'                # region-justified
+        if tag is not None and not hits and not fn_region:
             stale_tags.append(i + 1)
         for r0, n in hits.items():
             r = MERGE.get(r0, r0)
