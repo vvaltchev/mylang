@@ -7883,3 +7883,38 @@ D3-era consumer bug) aborts by name with the slot number.
 
 Emission untouched: vdjcmp 116/116 both arenas; -rt 1948/1948 both
 arenas; corpus + xrot-off-arena + gate + driver + clang lto0 green.
+
+## Endgame D3.b step 1 (2026-08-23) - pick_visit_op, the shared
+## op-classification visitor
+
+WHAT: pick_cached_slots' 537-line qualification switch - the rules
+that decide, per op, which frame slots are touched and through which
+choke point - is now `pick_visit_op(ck, in, pc, v)` (jit.cpp, directly
+above the pick): a template over a visitor struct with ten callbacks
+(usei / usei_dst / usef / bad / badi / badf / use_ret / fdst_mark /
+full_read_mark / mark_barrier; the contract is the function's header
+comment). The pick binds its accounting lambdas via a local Fns struct
+of lambda references; `return false` means "unclassifiable, or written
+slots not enumerable per-pc" and the pick answers by caching nothing -
+the exact old `return {}` semantics, including ForeachDynNext's
+in-case early return.
+
+WHY: D3's interval allocator must qualify interval-local uses by the
+SAME rules the pick has always applied. Two copies of 537 lines of
+qualification would drift silently, and a dropped bad() in one of them
+is a wrongly-pinned slot - the r9 shape. One switch, two drivers.
+
+HOW VERIFIED (pure code motion): the extraction was comment-aware
+(a /* */ state machine; only code segments rewritten) and
+count-asserted per callback (160 call sites: usei 28, bad 82, badi 14,
+usef 14, mark_barrier 7, usei_dst 6, fdst 5, badf 2, full_read 1,
+use_ret 1 - the script aborts before writing on any drift). Oracle:
+vdjcmp 116/116 identical in BOTH arenas (lowmem + MYLANG_NO_LOWMEM),
+-rt 1690 x 5 modes x both arenas, corpus_diff 25/25, driver_checks,
+the census gate at floor, TESTS=1 OPT=1 -rt, and the clang OPT=1
+ASSERTS=0 LTO=0 lane with zero warnings (the CI shape that caught the
+retry-bound regression).
+
+NOTE the gcc trap: a local struct member named `usei` cannot be
+declared `const decltype(usei) &usei;` - "changes meaning of usei"
+(-fpermissive). The lambda types are `using`-aliased first.

@@ -451,19 +451,29 @@ named by pc/slot). next-use chains stay with jit_next_use for D3.
 [D2 LANDED 2026-08-23 - see its section. Validator arm 1 landed the
 same day - see D4.]
 
-⛔ RESUME HERE (next session): D3.b step 1 - export the pick's
-qualification switch as a shared per-op VISITOR, byte-identically.
-The switch is pick_cached_slots' op loop (src/jit.cpp ~10490-11027,
-537 lines, callbacks usei/usei_dst/usef/fdst/bad/badi/badf/
-full_read/mark_barrier + the audit hook). Extract it as
-`pick_visit_op(in, fns)` - ONE switch, the pick calls it with its
-existing lambdas (pure code motion, vdjcmp 116/116 the oracle), and
-the interval side then drives the SAME visitor to classify
-interval-local uses, so the two cannot drift. ⛔ DO THIS IN A FRESH
-CONTEXT WINDOW: 537 lines of qualification rules; a silently
-dropped bad() case during a squeezed extraction is a wrongly-pinned
-slot - the r9 shape. After it: the lsra lever + the scan (the
-design-decisions block above).
+[D3.b step 1 LANDED 2026-08-23: `pick_visit_op(ck, in, pc, v)`
+(src/jit.cpp, above pick_cached_slots) is THE shared per-op
+classification switch - a template over a visitor struct with the
+ten callbacks (usei/usei_dst/usef/bad/badi/badf/use_ret/fdst_mark/
+full_read_mark/mark_barrier; contract in its header comment).
+pick_cached_slots binds its accounting lambdas through a local Fns
+struct and its loop is now three lines; `return false` = the op is
+unclassifiable (the pick caches nothing). The extraction was
+comment-aware and count-asserted: 160 call sites converted, every
+count checked (usei 28, bad 82, badi 14, usef 14, mark_barrier 7,
+usei_dst 6, fdst 5, badf 2, full_read 1, use_ret 1). Verified pure
+code motion: vdjcmp 116/116 BOTH arenas, -rt 1690x5 both arenas,
+corpus_diff 25/25, driver_checks, census gate at floor, TESTS=1
+OPT=1 -rt, clang OPT=1 ASSERTS=0 LTO=0 zero warnings.
+
+⛔ NEXT: D3.b step 2 - the `lsra` lever (default OFF) + the linear
+scan with splitting, driving pick_visit_op with the interval side's
+own callbacks to classify interval-local uses (the design-decisions
+block above holds the settled choices: per-interval qualification,
+memory-demanding ops as forced interval ends, label resolution v1
+with the loop head as the critical case). Byte-identity ENDS there
+by design - the oracle becomes the full correctness net + the D0 Ir
+ledger A/B.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
