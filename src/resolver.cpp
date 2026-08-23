@@ -3173,6 +3173,13 @@ struct EscWorld {
     std::unordered_map<int, int> slot2fn;    /* global slot -> EscFn index */
     std::unordered_set<int> struct_slots;    /* global slot -> a struct name */
     std::unordered_set<int> written_slots;   /* reassigned global slots */
+    /* INLINE LAMBDA -> EscFn index. A lambda has no name and no global
+     * slot, so `slot2fn` cannot reach it; this is how a callback written
+     * in the argument list is recognised as an ordinary callee. Keyed by
+     * the node, which is safe here because the map is built and consumed
+     * inside ONE run of the pass - the long-lived-node-pointer hazard
+     * needs the map to outlive the tree. */
+    std::unordered_map<const FuncDeclStmt *, int> fd2fn;
 };
 
 struct EscCtx {
@@ -3182,6 +3189,112 @@ struct EscCtx {
 };
 
 static void esc_scan(const Construct *c, EscCtx &ctx);
+
+/*
+ * The function a possibly-callable ARGUMENT names, or -1 if this pass cannot
+ * say. Two shapes it can name, and they are the two that occur: an INLINE
+ * LAMBDA, which is a FuncDeclStmt sitting in the argument list, and a NAMED
+ * function in a global slot nothing reassigns - the same slot question an
+ * ordinary direct call already asks. A parameter, a container element
+ * (`ops[i]`) or a reassigned name is -1.
+ */
+static int esc_callback_fn(const Construct *arg, const EscCtx &ctx)
+{
+    if (auto *fd = dynamic_cast<const FuncDeclStmt *>(arg)) {
+        auto it = ctx.w->fd2fn.find(fd);
+        return it != ctx.w->fd2fn.end() ? it->second : -1;
+    }
+    auto *id = dynamic_cast<const Identifier *>(arg);
+    if (!id || id->sym.kind != SymKind::global
+            || ctx.w->written_slots.count(id->sym.slot))
+        return -1;
+    auto it = ctx.w->slot2fn.find(id->sym.slot);
+    return it != ctx.w->slot2fn.end() ? it->second : -1;
+}
+
+/*
+ * A HIGHER-ORDER BUILTIN runs a MyLang callback, and the pass cannot see
+ * through the C++ that calls it - `map`/`filter`/`sort`/`find`/`make_array`/
+ * `make_dict` all do. The first version therefore POISONED the whole
+ * enclosing function, which is sound but very blunt: it was 9 of the 12
+ * poisoned functions across samples/ + bench/my.
+ *
+ * It cannot see THROUGH the builtin, but it can nearly always see the
+ * CALLBACK ITSELF - and a callback is just a callee. What the poison was
+ * actually guarding against is a callback that writes a global (dropping a
+ * reference some caller passed us) or reaches a function we cannot analyse;
+ * both of those are exactly the `unsafe` flag the fixpoint already computes
+ * per function and already propagates along `calls`. So NAME the callback
+ * and add the edge. What the callback is HANDED is the container's elements,
+ * never our parameters, so it owes no argument edges - only the unsafe one.
+ *
+ * ⛔ IT STILL FAILS CLOSED, in three places. An argument count past the mask's
+ * width, a mask that was never stamped (`callable_arg_mask` defaults to ~0u,
+ * so a bit outside the argument range is the tell - the same test LICM makes
+ * for the same reason), and any callable argument this pass cannot NAME all
+ * poison exactly as before. A callback reached through a parameter or a
+ * container element is unanalysable, and saying so is the whole point.
+ */
+/*
+ * Builtins that run NO MyLang code. A second allowlist, and a strictly
+ * weaker claim than `esc_builtin_transparent`'s three - these MAY store an
+ * argument or return one, they simply never call back into the language - so
+ * it is a superset and is consulted only by the callback rule below.
+ *
+ * ⛔ IT IS AN ALLOWLIST OF NON-INVOKERS, NOT A LIST OF INVOKERS, AND THAT IS
+ * DELIBERATE. The obvious alternative - list the higher-order builtins and
+ * poison only for those - reads as more precise and is not auditable: the
+ * mechanical grep for `VmInvoker`/`eval_func(` finds `make_array`,
+ * `make_dict`, `sum`, `find_arr` and `hash`, and MISSES `map`, `filter` and
+ * `sort`, which reach their callback through a shared helper whose enclosing
+ * function is not named `builtin_*`. A list built from that grep would have
+ * declared `sort` safe. Inverted, the same imprecision is harmless: an
+ * invoker left off this list is simply not skipped.
+ *
+ * Each entry is a one-line builtin whose body can be read whole. The ones
+ * that must NEVER appear here are the six the grep does find plus the three
+ * it misses: map, filter, sort, find, sum, make_array, make_dict, range,
+ * hash.
+ */
+static bool esc_builtin_no_invoke(const UniqueId *name)
+{
+    static const char *const quiet[] = {
+        "append", "array", "clone", "deepclone", "dict", "dynarray",
+        "erase", "exit", "insert", "keys", "pop", "push", "reverse",
+        "runtime", "top", "values",
+    };
+    if (esc_builtin_transparent(name))
+        return true;                     /* the stronger claim implies this */
+    for (const char *q : quiet)
+        if (name->val == q)
+            return true;
+    return false;
+}
+
+static void esc_scan_ho_builtin(const CallExpr *call, EscCtx &ctx)
+{
+    const size_t na = call->args->elems.size();
+    if (na >= 32) {
+        ESC_POISON(ctx.self, g_esc_p_hobuiltin);
+        return;
+    }
+    const uint32_t valid = na ? ((1u << na) - 1u) : 0u;
+    const uint32_t m = call->callable_arg_mask;
+    if (m & ~valid) {                    /* never stamped - see above */
+        ESC_POISON(ctx.self, g_esc_p_hobuiltin);
+        return;
+    }
+    for (size_t j = 0; j < na; j++) {
+        if (!(m >> j & 1))
+            continue;
+        const int cb = esc_callback_fn(call->args->elems[j].get(), ctx);
+        if (cb < 0) {
+            ESC_POISON(ctx.self, g_esc_p_hobuiltin);
+            return;
+        }
+        ctx.self->calls.push_back(cb);
+    }
+}
 
 /* Classify one call: which bits it clears, which edges it owes, and whether
  * it can reach code that writes a global. */
@@ -3225,10 +3338,8 @@ static void esc_scan_call(const CallExpr *call, EscCtx &ctx)
     if (!is_builtin && !is_ctor && callee < 0)
         ESC_POISON(ctx.self, g_esc_p_callee);
     if (is_builtin && !transparent && call->args
-        && (call->args->elems.size() >= 32
-            || (call->callable_arg_mask
-                & ((1u << call->args->elems.size()) - 1))))
-        ESC_POISON(ctx.self, g_esc_p_hobuiltin);
+            && !esc_builtin_no_invoke(cid->uid))
+        esc_scan_ho_builtin(call, ctx);
     if (callee >= 0)
         ctx.self->calls.push_back(callee);
 
@@ -6156,10 +6267,32 @@ static void esc_collect(Construct *c, std::vector<EscFn> &fns, EscWorld &w)
         if (fd->desc) {
             if (fd->id && fd->id->sym.kind == SymKind::global)
                 w.slot2fn[fd->id->sym.slot] = static_cast<int>(fns.size());
+            w.fd2fn[fd] = static_cast<int>(fns.size());
             EscFn f;
             f.fd = fd;
             fns.push_back(f);
         }
+        /*
+         * ⛔ WALK THE BODY EXPLICITLY: `for_each_child` has NO FuncDeclStmt
+         * arm, so the generic descent below sees a function declaration as
+         * childless and this collection stopped at the TOP LEVEL. Two
+         * things were wrong with that, one of them pre-dating the borrow:
+         *
+         *  - a LAMBDA or a nested named function never entered `fns` at
+         *    all, so it could not be recognised as a callback (which is
+         *    what made the higher-order-builtin rule unable to name any
+         *    real callback), and its own parameters were never analysed;
+         *  - `written_slots` - the reassigned-global-slot set that decides
+         *    whether a call may be resolved through `slot2fn` at all - was
+         *    collected from top-level statements ONLY. A function body
+         *    doing `helper = other;` was invisible, so a call to `helper`
+         *    elsewhere resolved to the ORIGINAL function and the fixpoint
+         *    answered for a callee that may no longer be there. That is
+         *    the unsound direction, and it is why this is a fix and not
+         *    just an enabler.
+         */
+        esc_collect(fd->body.get(), fns, w);
+        return;
     } else if (auto *sd = dynamic_cast<StructDeclStmt *>(c)) {
         if (sd->id && sd->id->sym.kind == SymKind::global)
             w.struct_slots.insert(sd->id->sym.slot);

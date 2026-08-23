@@ -27995,6 +27995,91 @@ static bool jit_borrow_arg_shapes()
         return false;         /* the slice never reached the decline */
 
     /*
+     * B - A HIGHER-ORDER BUILTIN WHOSE CALLBACK CAN BE NAMED no longer
+     * poisons the enclosing function. `map` runs MyLang code the pass
+     * cannot see through, but the callback is an INLINE LAMBDA sitting in
+     * the argument list, so it is an ordinary callee whose own `unsafe` the
+     * fixpoint computes and propagates. `a` is untouched by the map call
+     * and keeps its bit.
+     *
+     * Note the container is a GLOBAL, not `a`: passing a parameter to a
+     * non-transparent builtin clears its bit for a different reason (the
+     * builtin may store it), which would mask what this case is testing.
+     */
+    b0 = g_arg_borrow;
+    if (!run({ "var pool = [1, 2, 3, 4];",
+               "func f(array<int> a) {",
+               "  var t = a[0] + a[1];",
+               "  var m = map(func(e) => e * 2, pool);",
+               "  var q = m[0];",
+               "  return t + q;",
+               "}",
+               "var arr = [7, 8];",
+               "var s = 0;",
+               "for (var i = 0; i < 30; i++) s = s + f(arr);",
+               "assert(s == 30 * 17);" }))
+        return false;
+    if (g_arg_borrow <= b0)
+        return false;         /* the map call still poisoned the function */
+
+    /*
+     * B - AND IT STILL FAILS CLOSED when the callback cannot be NAMED. The
+     * same shape with the callback reached through a container element is
+     * unanalysable, so the function is poisoned exactly as before and `a`
+     * loses its bit. This is the case that says the previous one is a real
+     * gate and not just "the rule was deleted".
+     */
+    b0 = g_arg_borrow;
+    if (!run({ "var pool = [1, 2, 3, 4];",
+               "func dbl(int e) { var z = e * 2; return z; }",
+               "func trp(int e) { var z = e * 3; return z; }",
+               "var cbs = [dbl, trp];",
+               "func f(array<int> a) {",
+               "  var t = a[0] + a[1];",
+               "  var m = map(cbs[0], pool);",
+               "  var q = m[0];",
+               "  return t + q;",
+               "}",
+               "var arr = [7, 8];",
+               "var s = 0;",
+               "for (var i = 0; i < 30; i++) s = s + f(arr);",
+               "assert(s == 30 * 17);" }))
+        return false;
+    if (g_arg_borrow != b0)
+        return false;         /* an unnameable callback must still poison */
+
+    /*
+     * B - A BUILTIN THAT RUNS NO MyLang CODE skips the callback rule
+     * entirely, whatever its arguments look like. `array(n)` inside a
+     * TEMPLATE is the shape that made this worth doing: `n` is statically
+     * `dyn` there, so `callable_arg_mask` sets its bit ("a dyn might hold a
+     * function") and the rule poisoned the function over an argument that
+     * is an int and a builtin that invokes nothing. It was 3 of the 7
+     * poison sites across bench/my + samples.
+     *
+     * ⛔ `n` MUST BE SPELLED `dyn`, not left un-annotated. Written
+     * `func f(a, n)` this case is VACUOUS: the call site instantiates the
+     * template with concrete types, so the CLONE's `n` is an int, the mask
+     * bit is clear and the rule never runs - watched, that version passes
+     * with the no-invoke list deleted. The corpus hits it on the
+     * un-instantiated template BASE, which this cannot reproduce.
+     */
+    b0 = g_arg_borrow;
+    if (!run({ "func f(array<int> a, dyn n) {",
+               "  var t = a[0] + a[1];",
+               "  var buf = array(n);",
+               "  buf[0] = t;",
+               "  return buf[0];",
+               "}",
+               "var arr = [7, 8];",
+               "var s = 0;",
+               "for (var i = 0; i < 30; i++) s = s + f(arr, 4);",
+               "assert(s == 30 * 15);" }))
+        return false;
+    if (g_arg_borrow <= b0)
+        return false;         /* array(n) still poisoned over a dyn arg */
+
+    /*
      * PER POSITION - parameter 0 is claimed and parameter 1 is not, in the
      * SAME call. `safe` is only ever a subscript base, so it keeps its bit;
      * `victim` is handed to `keeper`, which RETURNS it, so the fixpoint
