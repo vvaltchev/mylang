@@ -3657,3 +3657,86 @@ family (the float case emits **FloatAddRR**). THE AUDIT-TABLE STAGE TRAP
 in test form, and the second time it has bitten a test in this arc.
 **A test that names an opcode must name the one that SURVIVES to the
 stage it inspects.**
+
+## #162 - THE IN-PLACE ARGUMENT: a reference argument is bound straight
+## from the caller's slot, and the staging move is not emitted
+
+A call's arguments live in a CONTIGUOUS register run, so an argument
+that is already a named local costs a staging `MoveV run[i] = x` whose
+only consumer is the bind two instructions later. For a REFERENCE that
+move is a `jit_move` call plus the value model's type-erased
+release/retain triple. 76_funcval_dispatch:
+
+    23  i.bin        r6 = i % 2
+    24  load.elem.v  fn = ops[r6]
+    25  move         r6 = st        <-- NO LONGER EMITTED
+    26  move         r7 = i         <-- kept: trivial, already 2 stores
+    27  call.val     _ = fn(r6, r7) <-- arg 0 read from `st` directly
+
+MEASURED (76, OPT=1 ASSERTS=0, the scale-1-vs-3 delta so compile time
+and JIT warmup are excluded from both sides): **734 -> 588 Ir per
+iteration, -19.9%**; whole-program -19.4% / -19.7% at scale 1 / 3.
+Wall-clock and the suite geomean are recorded in plans/top5-cpp-gap.md.
+
+**IT IS NOT A BORROW, AND THAT IS THE DESIGN.** The investigation that
+scoped this (plans/top5-cpp-gap.md, "DIRECTION 1") proposed making the
+staging slot NON-OWNING - copy the bytes without a retain, then
+neutralise the slot - which drags in `ref_slots`, the release scan,
+`jit_ret_audit` and every throwing exit, and buys only the one
+retain/release pair (~15 Ir). Not writing the slot at all buys the whole
+move, and the run slot then holds exactly what it held before, still
+owned by whoever wrote it. **Nothing about ownership changes.**
+
+**SOUND** because the caller slot and the run slot hold the SAME value,
+so reading either is correct as long as nothing writes the caller slot
+in between - and between the staging moves and the call, nothing writes
+anything but run slots. That is also why the fusion survives a branch or
+a fragment ENTRY landing anywhere in the sequence: the call reads the
+caller slot either way, so a partially-executed staging run cannot
+matter.
+
+**THE ONE THING THAT STILL READS THE RUN** is every arm that hands the
+call to C++: a guard decline, the depth-cap SWITCH, and the BAIL whose
+status 1 resumes the INTERPRETED call op (jit_call_sync_core's
+documented idempotent bail). They converge on ONE join in
+emit_sync_call_inline, and `jit_stage_args` materialises the run there
+from the site's baked (dst, src) pair list. `jit_sync_postexit` was
+checked and cannot bail - it returns 0 or 2 - so its `exit_pc` is always
+a re-raise, never a re-run.
+
+**JIT-DERIVED, NEVER A BYTECODE FACT.** The pattern is recognized from
+the instruction sequence at emit time, so the interpreter is untouched,
+no myv version moves, and a hostile image cannot assert it - #137's
+layering has no way to verify a claim like "this slot is an argument",
+and a false one would leave a reference in a slot nobody owns.
+
+**THE GATE I DID NOT ANTICIPATE, and the test that found it.** The
+coercing arm widens bool->int / int->float **in the argument temp**,
+and its soundness note reads "emit_args_range gives every argument a
+FRESH temp" - which a fused argument is not, so widening one would write
+the CALLER'S VARIABLE. Declining that arm for fused arguments took the
+inline widening away from every named-local argument and
+`jit_bind_widen` failed at once (its widening argument is a plain int
+loop counter). The fix: fuse ONLY `ref_slots` members. A reference at a
+numeric parameter already declined there, so the arm behaves exactly as
+before - and it is the right VALUE gate independently, since a trivial
+argument's staging move is already the inline two-store path.
+
+Other gates: a named local (never a temp - lever A's forwarding and C5's
+release picker are where a write may legitimately be SKIPPED; DEFENSIVE,
+not sabotage-falsified, and the code says so); not register-pinned
+(N5/C2a) or type-elided (C3/C4a-i), whose memory is stale; the source
+outside the run; CachedCallV excluded (`jit_cached_probe` builds the
+pure-cache key from the run BEFORE the push); the native-direct CallV
+excluded (it reads the run from C++ with no decline join).
+
+Lever: `MYLANG_JIT_OFF=argfuse`. Counters: `g_jit_arg_inplace` (bumped
+by the EMITTED copy loop, so the helper tier cannot satisfy it) and
+`g_jit_arg_stage` (the cold arm - the path where a mistake is a
+use-after-free rather than a wrong answer, so it gets its own proof).
+
+SABOTAGE, all watched: removing the ref_slots gate fails `jit_bind_widen`
+AND arg_inplace_shapes' int-local decline; removing the cold-arm
+materialisation fails the ref-arg bind test and then ABORTS the suite,
+and the cold shape alone gives InternalErrorEx; removing the named-local
+gate fails NOTHING (recorded as defensive).
