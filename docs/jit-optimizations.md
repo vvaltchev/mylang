@@ -7458,6 +7458,16 @@ fails the helper-count fact; dropping bitwise from the inline
 admission fails fast_exact 56; dropping the literal-shift admission
 fails fast_exact 72 (each sabotage run separately, committed tree).
 
+**Measured (RULE B1: build/ deleted, --mylang build-claude/perf +
+--baseline a worktree build of the language commit, header read, both
+OPT=1 ASSERTS=0, interleaved):** 87_elem_shift_compound **0.06x
+cur/base (0.060s -> 0.004s)** - the baseline runs all six compounds
+boxed (StoreElemValue -> slot_rmw), HEAD runs them all in the inline
+tier; 86_elem_arith_compound 0.97x (flat, as expected - the arith
+compound tier predates the baseline). my/python: 86 at 0.04x, 87 at
+0.03x. Both benches read ~5ms at scale 1 on this box - candidates for
+the scales.txt tuning pass.
+
 **Bench reach (new, 2026-08-21):** NO bench contained ANY compound
 element store - not even `a[i] +=` - so the whole #92/#95 compound arm
 had zero bench reach. `86_elem_arith_compound` (+= -= *= /= %=, values
