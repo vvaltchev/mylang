@@ -8951,6 +8951,31 @@ static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
      */
     if (!run_may_pin_rdx(ck, begin, end))
         busy |= 1u << 2;
+    /*
+     * ⛔ rcx: ISA-FIXED by the variable-count shifts. `shl/sar rax, cl`
+     * takes its count in cl and nowhere else, and the RR shift
+     * emitters load it with a RAW `read_slot(e, RCX, ...)` outside any
+     * borrow - so a run containing one may not pin rcx. (IntBin's
+     * shift and div arms stage through the hold()/drop() borrow kit
+     * and need no claim; the RI forms encode the count as an
+     * immediate and never touch rcx.)
+     *
+     * WATCHED (2026-08-20): 13 hot int slots plus `sb += sa >> k` with
+     * a RUNTIME count pinned rcx and clobbered it at every rotation -
+     * the tracker abort ("write to a PINNED register", IntShrRR) is
+     * the only reason this was not a silent wrong answer in a release
+     * build. It had been latent since the day rcx was admitted: no
+     * net had the shape, because a write-once count auto-consts into
+     * the RI form (shape-eater #6) - the pinned test's count is
+     * assigned twice for exactly that reason.
+     */
+    for (size_t pc = begin; pc < end; pc++) {
+        const OpCode op = ck.code[pc].op;
+        if (op == OpCode::IntShlRR || op == OpCode::IntShrRR) {
+            busy |= 1u << 1;                 /* rcx carries the count */
+            break;
+        }
+    }
     return busy;
 }
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
@@ -13093,22 +13118,44 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         if (fa || fb)
             emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
-        hold();
-        if (fa && fb) {
-            e.mov_rr(tmp, RAX);            /* t OP t */
-        } else if (fb && aop == Op::minus) {
-            e.mov_rr(tmp, RAX);
+        /*
+         * ⛔ #96: the SECOND operand is used DIRECTLY when it needs no
+         * staging - a pinned slot is already a register operand and an
+         * imm32 literal an immediate one. The unconditional copy
+         * through `cpy` was pure convention, and the day rcx became
+         * pinnable it grew teeth: with an accumulator pinned in rcx,
+         * every op on an UNPINNED slot whose rhs was a pin paid a
+         * borrow (push rcx / mov rcx, pin / op / pop rcx) around a
+         * copy that did not need to exist. 82_regs_int_25 paid ~15
+         * such pairs per iteration: +16.7% Ir / 1.50x wall, watched,
+         * and gone with this branch (the pin is read in place).
+         */
+        const int bpin = (!fb && !in.b_is_lit())
+            ? e.creg(in.b_slot()) : -1;
+        const bool bimm = !fb && in.b_is_lit()
+            && in.b_lit() >= INT32_MIN && in.b_lit() <= INT32_MAX;
+        if (!fa && !fb)
             read_slot(e, RAX, in.a_slot());
-        } else if (fb) {
-            read_slot(e, tmp, in.a_slot());   /* commutative swap */
-        } else if (fa) {
-            load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
+        if (!fb && bpin >= 0) {
+            op_rr(e, aop, RAX, static_cast<uint8_t>(bpin));
+        } else if (!fb && bimm) {
+            e.op_reg_imm(aop, RAX, static_cast<int32_t>(in.b_lit()));
         } else {
-            read_slot(e, RAX, in.a_slot());
-            load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
+            hold();
+            if (fa && fb) {
+                e.mov_rr(tmp, RAX);            /* t OP t */
+            } else if (fb && aop == Op::minus) {
+                e.mov_rr(tmp, RAX);
+                read_slot(e, RAX, in.a_slot());
+            } else if (fb) {
+                read_slot(e, tmp, in.a_slot());   /* commutative swap */
+            } else {
+                load_operand(e, tmp, in.b_is_lit(), in.b_lit(),
+                             in.b_slot());
+            }
+            op_rr(e, aop, RAX, tmp);
+            drop();
         }
-        op_rr(e, aop, RAX, tmp);
-        drop();
         /* lever A, the PRODUCER side: elide a dead temp's write; a kept
          * (ref-listed) write reloads RAX in store_dst's COLD arm only. */
         const bool fw = g_fwd.prod == in.target;
