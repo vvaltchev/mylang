@@ -23803,30 +23803,62 @@ static bool jit_store_elem_inline_tier()
 }
 
 /*
- * The REG-COUNT shift compounds on a flat int element (`a[i] <<= n`, n a
- * slot) lower to StoreElemInt (the typed flat tier) but the inline arm
- * DECLINES them at emit time (a reg-count shift needs the rcx core + a
- * negative-count decline ordered before the COW prep; the helper gets
- * both free from the shared body - LITERAL counts inline). Three facts,
- * each with its own counter, because a value oracle cannot tell the flat
- * helper from the boxed StoreElemValue fallback:
- *   1. g_jit_store_fast counts ONLY the 32 fills - the 24 shift
- *      compounds never took the inline arm;
- *   2. g_jit_op_run[StoreElemInt] grows by exactly 24 - the shifts were
- *      LOWERED to StoreElemInt and executed the flat HELPER (a boxed
- *      lowering would leave this counter untouched);
- *   3. the value matches the tree-walker (the differential's job, but
- *      asserted here so this test stands alone).
- * WATCHED: reverting the codegen admission (the compound_assign_base map
- * at the StoreElemInt site) leaves the value right and fails fact 2.
+ * REG-COUNT shift compounds on a flat int element (`a[i] <<= n`, n a
+ * slot) run INLINE too: a bracketed rcx borrow shifts the loaded element
+ * by CL, and the ONLY helper residue is the runtime negative-count
+ * DECLINE (emitted before the COW prep; the helper owns the loc-stamped
+ * throw). Two episodes, each with counter facts a value oracle cannot
+ * supply:
+ *   1. the hot loop: g_jit_store_fast grows by 56 (32 fills + 24 reg-
+ *      count shifts, ALL inline) and the flat HELPER runs ZERO times;
+ *   2. the negative-count run: the emitted js decline routes exactly
+ *      the offending store to the helper (helper delta >= 1) and the
+ *      InvalidValueEx surfaces - an inverted decline polarity would
+ *      compute cl&63 garbage inline and throw nothing.
+ * The argument stays runtime()-wrapped: a literal arg SPECIALIZES f and
+ * folds the counts to literals (the vacuous-test trap's shape-eater #6,
+ * watched inflating the fast count before the wrap).
+ * WATCHED: reverting the reg-count admission fails episode 1 (fast 32,
+ * helper 24); reverting the codegen StoreElemInt admission fails it too
+ * (boxed lowering: helper AND fast both miss the shifts).
  */
-static bool jit_store_elem_shift_helper()
+static bool jit_store_elem_shift_regcount()
 {
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
 
-    const std::vector<const char *> src = {
+    const auto go = [&](const std::vector<const char *> &src,
+                        std::string &out) -> bool {
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        bool ok = true;
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { ok = false; }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        out = cap.str();
+        return ok;
+    };
+
+    /* episode 1: the hot loop - every reg-count shift inline */
+    unsigned long fast0 = g_jit_store_fast;
+    unsigned long help0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::StoreElemInt)];
+    std::string out;
+    const bool ok = go({
         "func f(n) {",
         "    var a = array(32); var i = 0;",
         "    while (i < 32) { a[i] = i * 7 + 1; i++; }",
@@ -23838,52 +23870,55 @@ static bool jit_store_elem_shift_helper()
         "    var s = 0; var k = 0;",
         "    while (k < 32) { s = s + a[k]; k++; }",
         "    return s; }",
-        /* runtime(): a literal arg would SPECIALIZE f, fold m/n to
-         * literal counts, and the shifts would inline - the vacuous-
-         * test trap's shape-eater #6, watched doing exactly that */
-        "print(f(int(runtime(2))));" };
-
-    const unsigned long fast0 = g_jit_store_fast;
-    const unsigned long help0 =
-        g_jit_op_run[static_cast<size_t>(OpCode::StoreElemInt)];
-
-    const ExecEngine se = g_exec_engine;
-    g_exec_engine = ExecEngine::Vm;
-    std::ostringstream cap;
-    std::streambuf *old = cout.rdbuf(cap.rdbuf());
-    bool ok = true;
-    try {
-        std::string joined;
-        for (const char *l : src) { joined += l; joined += "\n"; }
-        std::vector<Tok> toks;
-        lexer(joined, 1, toks);
-        ParseContext pc(TokenStream(toks), true);
-        unique_ptr<Construct> root = pBlock(pc);
-        mark_implicit_globals(root.get(), {});
-        infer_types(root.get(), true);
-        run_optimizers(root.get());
-        vm_execute(root.get());
-    } catch (...) { ok = false; }
-    cout.rdbuf(old);
-    g_exec_engine = se;
-
+        "print(f(int(runtime(2))));" }, out);
     const unsigned long fast = g_jit_store_fast - fast0;
     const unsigned long help =
         g_jit_op_run[static_cast<size_t>(OpCode::StoreElemInt)] - help0;
+    if (!ok) { cout << "  episode 1 threw\n"; return false; }
+    if (out != "3400 \n") {
+        cout << "  value: got \"" << out << "\", want 3400\n";
+        return false;
+    }
+    if (fast != 56) {
+        cout << "  inline fast stores: " << fast
+             << ", want 56 (32 fills + 24 reg-count shifts inline)\n";
+        return false;
+    }
+    if (help != 0) {
+        cout << "  StoreElemInt helper runs: " << help
+             << ", want 0 (a reg-count shift declined to the helper?)\n";
+        return false;
+    }
 
-    if (!ok) { cout << "  threw\n"; return false; }
-    if (cap.str() != "3400 \n") {
-        cout << "  value: got \"" << cap.str() << "\", want 3400\n";
+    /* episode 2: the runtime negative count - the js decline routes the
+     * offending store (and only it) to the helper, which throws */
+    fast0 = g_jit_store_fast;
+    help0 = g_jit_op_run[static_cast<size_t>(OpCode::StoreElemInt)];
+    const bool ok2 = go({
+        "func f(n) {",
+        "    var a = array(32); var i = 0;",
+        "    while (i < 32) { a[i] = i; i++; }",
+        "    var t = 0;",
+        "    var j = 0;",
+        "    while (j < 64) {",
+        "        var c = 1;",
+        "        if (j == 63) { c = 0 - n; }",
+        "        a[j & 7] <<= c;",
+        "        t++;",
+        "        j++; }",
+        "    return t; }",
+        "print(f(int(runtime(3))));" }, out);
+    const unsigned long help2 =
+        g_jit_op_run[static_cast<size_t>(OpCode::StoreElemInt)] - help0;
+    if (ok2) {
+        /* the program must END in the InvalidValueEx - an inverted js
+         * polarity computes cl&63 garbage inline and completes */
+        cout << "  episode 2 did not throw (decline polarity?)\n";
         return false;
     }
-    if (fast != 32) {
-        cout << "  inline fast stores: " << fast << ", want 32 (fills only;"
-             << " a shift served inline would inflate this)\n";
-        return false;
-    }
-    if (help != 24) {
-        cout << "  StoreElemInt helper runs: " << help << ", want 24 - the"
-             << " shifts did not reach the flat helper (boxed lowering?)\n";
+    if (help2 < 1) {
+        cout << "  negative count never reached the flat helper (helper"
+             << " delta " << help2 << ")\n";
         return false;
     }
     return true;
@@ -33563,9 +33598,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the INLINE element-store tier serves plain + COMPOUND stores "
       "and REFUSES bad divisors / const stores (#92, #95)",
       jit_store_elem_inline_tier },
-    { "jit: the SHIFT compounds take the flat StoreElemInt HELPER "
-      "(lowered typed, inline-declined, counted)",
-      jit_store_elem_shift_helper },
+    { "jit: REG-count shift compounds run INLINE; only the negative "
+      "count declines to the flat helper (counted both ways)",
+      jit_store_elem_shift_regcount },
     { "jit: the pin pool leaves the element tier two scratch candidates "
       "- the reservation, whose absence is SILENT (#96)",
       jit_elem_scratch_reserved },
