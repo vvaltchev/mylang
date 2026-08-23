@@ -3828,3 +3828,30 @@ pinned-r9 ctor sweep test.
 Census: 1087 -> 997 UNJUSTIFIED (the sync-machinery lines also
 justified shared-line RAX/RCX/R10/R11 mentions). vdjcmp 116/116
 byte-identical (tags are comments; the two code reflows are pure).
+
+## (as) 2026-08-22 - batch 4: the ctor plan converted; RDI/RSI/R9 all
+## at zero
+
+The struct ctor plan's byte-buffer register (raw r9, the ord shape)
+now asks the allocator: alloc_scratch(CAP_MEM_BASE, prefer r9),
+declining both fast arms to the planned helper when refused; the two
+raw encodings became movsd_store_base / store_al_base (byte-identical
+for r9; RAWENC 19 -> 17). THE WATCH IS LIVENESS, not reach: r9 is
+reliably BUSY in ctor runs - the occupancy the raw form silently
+leaned on, and why the corpus grants r10 at these sites (vdjcmp: 5
+programs differ by exactly that register substitution;
+64_struct_create Ir +0.004%). The sweep's ctor case (an element read
+keeps r9 busy in-process) asserts g_jit_ctor_bb_moved GREW - the
+grant is consumed, not decorative - and the assertion was watched
+firing on its first run (no elem op -> r9 free -> grant never moved).
+
+PROCESS NOTE, the never-discard lesson repeated: the batch's first
+sabotage ran on an UNCOMMITTED tree and its restore discarded the
+conversion (replayed verbatim from the session's scripts). Sabotage
+belongs on a committed tree - no exceptions.
+
+Census: 995 UNJUSTIFIED - RDI, RSI, R9 all at ZERO. Next: R11 (36) +
+R10 (70), mostly the sync-push machinery the MyLang-call clobber-mask
+justification already covers for rsi/r9; then R8 (52); then the two
+structural masses - the IntBin rcx borrow family (RCX 134) and RAX's
+staging convention (605).

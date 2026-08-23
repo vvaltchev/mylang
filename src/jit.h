@@ -895,6 +895,7 @@ extern unsigned long g_jit_op_run[];
  * EMITTED inline code itself (the helpers bump g_jit_op_run), so a test can
  * prove the inline path ran, not just the slow helper. */
 extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
+extern "C" unsigned long g_jit_ctor_bb_moved; /* #96 grant != r9 */
 extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
 /* the constant-divisor STRENGTH REDUCTION: bumped by the EMITTED
  * multiply-shift sequence, so a test can prove idiv was replaced (the
