@@ -823,6 +823,10 @@ public:
      * Reading the real member means a layout change cannot move it out
      * from under the emitter. Probe-only, never hot. */
     const bool &jit_const_probe() const { return is_const; }
+    /* #94: the emitted push's inline BORROW arm sets this byte itself, so
+     * it needs the offset. Same reasoning as jit_const_probe - read the
+     * real member, so a layout change cannot silently move it. */
+    const bool &jit_borrowed_probe() const { return borrowed; }
     const EvalValue &get() const { return val; }
     EvalValue get_rval() const { return val; }
     Type *valtype() const { return val.get_type(); }

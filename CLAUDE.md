@@ -1757,10 +1757,16 @@ Four things a future editor must not soften, each watched failing:
 REACH is `MYLANG_JITSTATS`' `arg_borrow` (the retain actually skipped) and
 `arg_borrow_slice` (cleared by the analysis, declined by the value) — two
 counters so "the tier ran" and "the tier was reachable and every value
-declined" cannot be confused. **Remaining cases, none built:** the emitted
-INLINE borrow arm (the call itself is still paid), the builtin-CALLBACK bind
-paths (`argv[i]` — sort/map/filter/make_dict), and the tree-walker's
-`do_func_bind_params`.
+declined" cannot be confused; `arg_borrow_nat` is the EMITTED arm alone.
+
+**The emitted INLINE borrow arm (step 3) is BUILT and measured a WASH** —
+−3.27% Ir on bench 76 (999,999 of its 1,000,000 calls served by generated
+code) and **1.00x wall clock**, while two benches that never borrow pay
++1.44% / +0.48% Ir for the emitted bytes. The guard-elision family's
+signature again; `docs/jit-optimizations.md` records the recommendation to
+revert it and keep the helper tier. **Remaining cases, none built:** the
+builtin-CALLBACK bind paths (`argv[i]` — sort/map/filter/make_dict) and the
+tree-walker's `do_func_bind_params`.
 
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to

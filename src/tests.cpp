@@ -27761,11 +27761,24 @@ static bool jit_ref_arg_bind()
         return ok;
     };
 
+    /*
+     * "The emitted push served this reference argument" - which since #94
+     * step 3 has TWO tiers: the helper (jit_bind_ref_arg) and the INLINE
+     * BORROW arm, which handles a non-escaping non-slice reference without
+     * calling anything. Both are the emitted push; neither is the C++ slow
+     * tier this test exists to prove was not taken. The SLICE case below
+     * still names the helper specifically, because a slice is exactly what
+     * the borrow arm must decline.
+     */
+    const auto served = []() {
+        return g_jit_ref_arg_binds + g_jit_arg_borrow;
+    };
+
     /* An ARRAY argument through a DIRECT call. The body is deliberately
      * several statements: a small one is INLINED away by the optimizer, so
      * there is no call left to bind - which is how the first version of this
      * test managed to exercise nothing. */
-    unsigned long b0 = g_jit_ref_arg_binds;
+    unsigned long b0 = served();
     if (!run({ "func addto(a, x) {",
                "  var t = a[0] + x;",
                "  var u = t * 2;",
@@ -27777,11 +27790,11 @@ static bool jit_ref_arg_bind()
                "for (var i = 0; i < 40; i++) addto(st, i);",
                "assert(st[0] == 780);" }))
         return false;
-    if (g_jit_ref_arg_binds <= b0)
+    if (served() <= b0)
         return false;         /* the inline push still DECLINED the call */
 
     /* a STRING argument, and an indirect call through a func value */
-    b0 = g_jit_ref_arg_binds;
+    b0 = served();
     if (!run({ "func f1(s, k) { return len(s) + k; }",
                "func f2(s, k) { return len(s) - k; }",
                "var ops = [f1, f2];",
@@ -27792,7 +27805,7 @@ static bool jit_ref_arg_bind()
                "}",
                "assert(acc == 180);" }))
         return false;
-    if (g_jit_ref_arg_binds <= b0)
+    if (served() <= b0)
         return false;
 
     /* a SLICE argument: the copy must register the new view in the parent's
@@ -27853,6 +27866,14 @@ static bool jit_borrow_arg_shapes()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
+    /*
+     * "A borrow happened", counted across BOTH bind paths - `g_arg_borrow`
+     * is the C++ one and `g_jit_arg_borrow` the EMITTED inline arm (#94
+     * step 3), and which one serves a given call depends on JIT warmup. The
+     * emitted arm gets its own assertion below, once, where the claim is
+     * specifically that it ran.
+     */
+    const auto bor = []() { return g_arg_borrow + g_jit_arg_borrow; };
     auto run = [](const std::vector<const char *> &lines) -> bool {
         std::string src;
         std::vector<Tok> toks;
@@ -27883,7 +27904,8 @@ static bool jit_borrow_arg_shapes()
      * escapes. The body is several statements on purpose - a small one is
      * inlined away and leaves no call to bind at all.
      */
-    unsigned long b0 = g_arg_borrow, s0 = g_arg_borrow_slice;
+    unsigned long b0 = bor(), s0 = g_arg_borrow_slice;
+    const unsigned long n0 = g_jit_arg_borrow;
     if (!run({ "func total(array a, int k) {",
                "  var t = a[0] + a[1];",
                "  var u = t * 2 - k;",
@@ -27895,7 +27917,17 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 60; i++) s += total(arr, i);",
                "assert(s == 420);" }))
         return false;
-    if (g_arg_borrow <= b0 || g_arg_borrow_slice != s0)
+    if (bor() <= b0 || g_arg_borrow_slice != s0)
+        return false;
+    /*
+     * #94 step 3: and the EMITTED inline arm is what served it, not the
+     * helper. `g_jit_arg_borrow` is bumped only by generated code, so the
+     * C++ bind path cannot satisfy this - which is the whole point, since
+     * both tiers produce the same answer and only the counter can tell them
+     * apart. A handful of pre-warmup calls still take C++, hence `>` and
+     * not an exact count.
+     */
+    if (g_jit_arg_borrow <= n0)
         return false;
 
     /*
@@ -27911,7 +27943,7 @@ static bool jit_borrow_arg_shapes()
      * borrow that happened to be harmless in this shape, which is the whole
      * difference between checking a counter and checking the hazard.
      */
-    b0 = g_arg_borrow;
+    b0 = bor();
     if (!run({ "var g = [1, 2, 3];",
                "func drop(array a, int k) {",
                "  var x = a[0];",
@@ -27927,7 +27959,7 @@ static bool jit_borrow_arg_shapes()
                /* a[1] must still read the OLD array's 2 */
                "assert(s == 60 * 120);" }))
         return false;
-    if (g_arg_borrow != b0)
+    if (bor() != b0)
         return false;
 
     /*
@@ -27940,7 +27972,7 @@ static bool jit_borrow_arg_shapes()
      * does. Reading a stale or baked bit is a use-after-free in `dropper`,
      * caught by ASan and by the value.
      */
-    b0 = g_arg_borrow;
+    b0 = bor();
     if (!run({ "var g = [1, 2, 3];",
                "func dropper(array<int> a, int k) {",
                "  var x = a[0];",
@@ -27963,7 +27995,7 @@ static bool jit_borrow_arg_shapes()
                "}",
                "assert(s == 80 * 3);" }))
         return false;
-    if (g_arg_borrow <= b0)
+    if (bor() <= b0)
         return false;         /* `plain` must still borrow at this site */
 
     /*
@@ -27973,7 +28005,7 @@ static bool jit_borrow_arg_shapes()
      * written THROUGH THE OTHER PARAMETER during the call, so a borrowed view
      * would observe the write.
      */
-    b0 = g_arg_borrow;
+    b0 = bor();
     s0 = g_arg_borrow_slice;
     if (!run({ "func sum2(array p, array view) {",
                "  var a = view[0];",
@@ -28006,7 +28038,7 @@ static bool jit_borrow_arg_shapes()
      * non-transparent builtin clears its bit for a different reason (the
      * builtin may store it), which would mask what this case is testing.
      */
-    b0 = g_arg_borrow;
+    b0 = bor();
     if (!run({ "var pool = [1, 2, 3, 4];",
                "func f(array<int> a) {",
                "  var t = a[0] + a[1];",
@@ -28019,7 +28051,7 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 30; i++) s = s + f(arr);",
                "assert(s == 30 * 17);" }))
         return false;
-    if (g_arg_borrow <= b0)
+    if (bor() <= b0)
         return false;         /* the map call still poisoned the function */
 
     /*
@@ -28029,7 +28061,7 @@ static bool jit_borrow_arg_shapes()
      * loses its bit. This is the case that says the previous one is a real
      * gate and not just "the rule was deleted".
      */
-    b0 = g_arg_borrow;
+    b0 = bor();
     if (!run({ "var pool = [1, 2, 3, 4];",
                "func dbl(int e) { var z = e * 2; return z; }",
                "func trp(int e) { var z = e * 3; return z; }",
@@ -28045,7 +28077,7 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 30; i++) s = s + f(arr);",
                "assert(s == 30 * 17);" }))
         return false;
-    if (g_arg_borrow != b0)
+    if (bor() != b0)
         return false;         /* an unnameable callback must still poison */
 
     /*
@@ -28064,7 +28096,7 @@ static bool jit_borrow_arg_shapes()
      * with the no-invoke list deleted. The corpus hits it on the
      * un-instantiated template BASE, which this cannot reproduce.
      */
-    b0 = g_arg_borrow;
+    b0 = bor();
     if (!run({ "func f(array<int> a, dyn n) {",
                "  var t = a[0] + a[1];",
                "  var buf = array(n);",
@@ -28076,7 +28108,7 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 30; i++) s = s + f(arr, 4);",
                "assert(s == 30 * 15);" }))
         return false;
-    if (g_arg_borrow <= b0)
+    if (bor() <= b0)
         return false;         /* array(n) still poisoned over a dyn arg */
 
     /*
@@ -28097,7 +28129,7 @@ static bool jit_borrow_arg_shapes()
      * and `keeper`'s own parameter borrows never. Both bind paths read the
      * bit per position, so the tier a given call takes cannot change it.
      */
-    b0 = g_arg_borrow;
+    b0 = bor();
     if (!run({ "func keeper(array<int> v) {",
                "  var t = v[0];",
                "  var u = t * 2;",
@@ -28117,7 +28149,7 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 60; i++) s = s + mix(a1, a2);",
                "assert(s == 480);" }))
         return false;
-    if (g_arg_borrow - b0 != 60)
+    if (bor() - b0 != 60)
         return false;         /* 2 per call == the index shift was dropped */
 
     /*
@@ -28151,7 +28183,7 @@ static bool jit_borrow_arg_shapes()
      * "declined here" from "never reached the bind", which is exactly how
      * both earlier versions passed while testing nothing.
      */
-    b0 = g_arg_borrow;
+    b0 = bor();
     unsigned long c0 = g_arg_borrow_scalar;
     const bool saved_jit = g_jit_enabled;
     g_jit_enabled = false;
@@ -28163,7 +28195,7 @@ static bool jit_borrow_arg_shapes()
     g_jit_enabled = saved_jit;
     if (!scalar_ok)
         return false;
-    if (g_arg_borrow != b0)
+    if (bor() != b0)
         return false;
     if (g_arg_borrow_scalar <= c0)
         return false;         /* the analysis never claimed it - vacuous */
@@ -28554,6 +28586,7 @@ static bool jit_counter_coverage()
         { "arg_borrow",       &g_arg_borrow,           nullptr },
         { "arg_borrow_slice", &g_arg_borrow_slice,     nullptr },
         { "arg_borrow_scal",  &g_arg_borrow_scalar,    nullptr },
+        { "arg_borrow_nat",   &g_jit_arg_borrow,       nullptr },
         { "arg_inplace",      &g_jit_arg_inplace,      nullptr },
         { "arg_stage",        &g_jit_arg_stage,        nullptr },
         { "inline_baked",     &g_jit_inline_baked,     nullptr },
