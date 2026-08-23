@@ -2549,13 +2549,13 @@ struct Emitter {
          * before anything else runs. One push keeps the entry parity
          * (rsp%16: 8 -> 0 == call-ready); rdi (the window argument) is
          * the only live register at entry and is saved around the call. */
-        push_reg(REG_ARG0);                       /* save rdi */
+        push_reg(REG_ARG0);              /* save rdi (reg:abi) */
         u8(0x48); u8(0x8B); u8(0x7C); u8(0x24); u8(0x08);
                                                   /* mov rdi, [rsp+8] */
         movabs(0 /* RAX */, reinterpret_cast<uint64_t>(
                                 &jit_norec_ret_verify));
         call_rax();
-        pop_reg(REG_ARG0);
+        pop_reg(REG_ARG0);                            /* reg:abi */
 #endif
       /* G1 STEP 3 - THE FRAME-POINTER CHAIN (plans/archived/g1-no-record-tier.md,
       
@@ -2583,7 +2583,7 @@ struct Emitter {
             { u8(0x48); u8(0x83); u8(0xEC); u8(0x08); }       /* sub rsp,8 */
         if (const int sb = spill_bytes())            /* sub rsp, imm32 */
             { u8(0x48); u8(0x81); u8(0xEC); u32(static_cast<uint32_t>(sb)); }
-        mov_rr(REG_SLOTS_BASE, REG_ARG0);
+        mov_rr(REG_SLOTS_BASE, REG_ARG0);             /* reg:abi */
     }
     /* #96: WHY THIS RETURN NEEDS NO FURTHER WRITE-BACK. Every frag_ret
      * site must name one, because a ret that leaves a cached slot in a
@@ -2992,13 +2992,14 @@ struct Emitter {
     /* lea rdi, [rbx + disp32]  (rdi = &frame->slots[slot], a helper arg).
      * With the base in rbx this no longer destroys anything - which is
      * exactly why the helper-call prologue no longer saves rdi. */
-    void lea_rdi(int32_t d) { lea(REG_ARG0, d); }
+    void lea_rdi(int32_t d) { lea(REG_ARG0, d); }    /* reg:abi */
     /* mov rdi, rbx - hand the whole slot WINDOW to a helper whose first
      * parameter is `LValue *slots`. Before the base moved to rbx this was
      * implicit (rdi already held it); it is explicit now so that the
      * majority of call sites, which load rdi with something else, pay
      * nothing. */
-    void slots_to_arg0() { mov_rr(REG_ARG0, REG_SLOTS_BASE); }
+    void slots_to_arg0()
+    { mov_rr(REG_ARG0, REG_SLOTS_BASE); }            /* reg:abi */
     /* cvtsi2sd xmm<r>, qword [rbx+disp]  (int -> double) */
     void cvt(uint8_t r, int32_t d)
     {
@@ -5986,7 +5987,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.push_reg(RDX);                  /* fo */
         /* pad: an even push count keeps the stack call-ready */
         e.op_reg_imm(Op::minus, RSP, 8);
-        e.mov_rr(RDI, RAX);               /* rdi = desc */
+        e.mov_rr(RDI, RAX);           /* rdi = desc (reg:abi) */
         e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
         e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
         e.movabs(RCX,
@@ -6585,7 +6586,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.push_reg(RDX);
         e.op_reg_imm(Op::minus, RSP, 8);   /* pad */
         modrm(0x8D, RSI, RBX, s, true);               /* rsi = &src (arg 2) */
-        modrm(0x8D, RDI, RDX, d, true);               /* rdi = &dst (arg 1) */
+        modrm(0x8D, RDI, RDX, d, true);  /* &dst, arg1 (reg:abi) */
         /*
          * arg 3 = #94's `can_borrow`: bit i of the CALLEE's
          * noescape_params. The callee here is an inline CACHE, so the bit
@@ -6616,7 +6617,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     e.lea_base(RAX, R11, static_cast<int32_t>(P.fo_capture_slots));
     st(R9R, static_cast<int32_t>(L.ctx_captures), RAX);
     /* rdi = the callee window; rdx = the fragment entry */
-    e.mov_rr(RDI, RDX);
+    e.mov_rr(RDI, RDX);                               /* reg:abi */
     ld(RDX, RCX, static_cast<int32_t>(L.chunk_native_base));
     modrm(0x03, RDX, RCX, static_cast<int32_t>(P.ck_sync_entry), true);
                                                       /* add rdx,[entry] */
@@ -7088,7 +7089,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * resume-pc argument is irrelevant on that path - the conversion
      * happens before any dispatch - so -2 needs no special case here. */
     /* cold: the shared post-exit (raise/continuation/pending) */
-    e.mov_rr(RDI, RAX);
+    e.mov_rr(RDI, RAX);                               /* reg:abi */
     /* #88: AFTER the callee ran - it may have made calls of its own and
      * overwritten the globals, so this site re-claims them. rax is dead
      * once the exit pc has moved to rdi. */
@@ -7132,7 +7133,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * slow-helper setup below redefines both).
      */
     if (af && af->pairs) {
-        e.movabs(RDI, reinterpret_cast<uint64_t>(af->pairs->data()));
+        e.movabs(RDI,                                 /* reg:abi */
+                 reinterpret_cast<uint64_t>(af->pairs->data()));
         e.movabs(RSI, static_cast<uint64_t>(
                           static_cast<int_type>(af->pairs->size() / 2)));
         e.call_relocs.push_back(
@@ -7158,7 +7160,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * GUARD decline, i.e. before the callee runs, so nothing can have
      * clobbered the globals between here and the helper. */
     emit_bake_call_site(e, ck, old_pc);
-    e.movabs(RDI, static_cast<uint64_t>(callee_arg));
+    e.movabs(RDI, static_cast<uint64_t>(callee_arg)); /* reg:abi */
     /* #56 step 3: argbase|nargs<<32 packed into ONE arg; the freed reg
      * carries the POST-CALL entry-stub pc (the SWITCH record's resume). */
     e.movabs(RSI, static_cast<uint64_t>(
@@ -7442,7 +7444,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             const size_t j_triv = e.j32(0x7C);     /* jl skip (trivial) */
             e.push_reg(R8R);
             e.push_reg(R10);
-            e.lea_rdi(d);                          /* rdi = &slot */
+            e.lea_rdi(d);              /* rdi = &slot (reg:abi) */
             e.call_relocs.push_back(
                 { e.pos(),
                   reinterpret_cast<const void *>(jit_release_slot) });
@@ -7574,7 +7576,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
              * the fork there is no record; the C++ discriminates and
              * checks what remains checkable. Clobbers caller-saved regs
              * - act/top_rec reloaded after. */
-            ld(RDI, 5, 24);                    /* rdi = [rbp+24] */
+            ld(RDI, 5, 24);        /* rdi = [rbp+24] (reg:abi) */
             e.mov_rr(RSI, RBP);
             e.movabs(RDX, static_cast<uint64_t>(
                               static_cast<int_type>(my_total)));
@@ -7638,7 +7640,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                 const size_t j_tr = e.j32(0x7C);   /* jl skip (trivial) */
                 e.push_reg(R8R);
                 e.push_reg(R10);
-                e.lea_rdi(d);
+                e.lea_rdi(d);                     /* reg:abi */
                 e.call_relocs.push_back(
                     { e.pos(),
                       reinterpret_cast<const void *>(jit_release_slot) });
@@ -7685,7 +7687,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             if (!j_nslow.empty()) {
                 for (const size_t j : j_nslow)
                     e.patch32_here(j);
-                e.movabs(RDI, static_cast<uint64_t>(
+                e.movabs(RDI, static_cast<uint64_t>(   /* reg:abi */
                                   static_cast<int_type>(res_slot)));
                 ld(RSI, 5, 24);                    /* rsi = [rbp+24] */
                 e.movabs(RDX,
@@ -7705,7 +7707,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
     for (const size_t j : j_slow)
         e.patch32_here(j);
     if (res_slot >= 0) {
-        e.movabs(RDI, static_cast<uint64_t>(
+        e.movabs(RDI, static_cast<uint64_t>(          /* reg:abi */
                           static_cast<int_type>(res_slot)));
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_ret) });
@@ -11877,7 +11879,7 @@ struct ElemScratch {
     uint8_t data  = RCX;   /* the flat element data pointer            */
     uint8_t count = RDX;   /* the element count / byte length (idiv)   */
     uint8_t idx   = R9;    /* the element index                        */
-    uint8_t val   = RDI;   /* the value being stored / the rhs         */
+    uint8_t val   = RDI;   /* the stored value / rhs (reg:conv) */
     bool    ok    = true;  /* false = no free register; DECLINE        */
 };
 
@@ -11893,7 +11895,8 @@ struct ElemScratch {
  * audit-table trap in miniature - the two would agree until the day a
  * register is added to one of them.
  */
-static const uint8_t ELEM_CAND[] = { RDI, R9, R10, R11, RSI, R8 };
+static const uint8_t ELEM_CAND[] =
+    { RDI, R9, R10, R11, RSI, R8 };                   /* reg:conv */
 
 /*
  * May this register be used as element-tier scratch right now?
@@ -12473,11 +12476,15 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
              * the INT_MIN dividend does - an ordinary x / -1 falls
              * through to the native RMW (which reloads the element;
              * rax is free here). */
-            e.lea_base(RDX, RDI, 1);
-                                                 /* lea rdx,[rdi+1] */
-            e.cmp_reg_imm(RDX, 1);
+            /* the divisor gate on the PLAN's registers - these were
+             * literal RDI/RDX, correct only because the elem-role
+             * reservation happens to keep val==RDI and count==RDX (an
+             * invisible coupling; byte-identical spelled either way) */
+            e.lea_base(sc.count, sc.val, 1);
+                                                 /* lea count,[val+1] */
+            e.cmp_reg_imm(sc.count, 1);
             const size_t j_ok = e.j32(0x77);     /* ja .ok (hot) */
-            e.test_rr(RDI, RDI);
+            e.test_rr(sc.val, sc.val);
             slows.push_back(e.j32(0x74));        /* 0 -> the helper */
             /* rax = the element */
             e.load_elem_q(sc.obj, H->rdata, sc.idx);
@@ -12709,11 +12716,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
          * jumps back and stores natively.
          */
         if (divmod && !in.b_is_lit()) {
-            e.lea_base(RDX, RDI, 1);
+            e.lea_base(sc.count, sc.val, 1);
                                                  /* lea rdx,[rdi+1] */
-            e.cmp_reg_imm(RDX, 1);
+            e.cmp_reg_imm(sc.count, 1);
             const size_t j_ok = e.j32(0x77);     /* ja .ok (hot) */
-            e.test_rr(RDI, RDI);
+            e.test_rr(sc.val, sc.val);
             decline_if(0x74);                    /* 0 -> the helper */
             e.load_base(sc.data, sc.obj, L.data_off);
             e.load_base(sc.count, sc.obj, L.data_off + 8);
@@ -16952,7 +16959,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* -> EnterNative raises g_vm_jit_exc*/
         e.exit_pc(pc);
         e.patch8(j_ok, e.pos());            /* over_SO: */
-        e.mov_rr(RDI, RAX);                 /* rdi = callee window slots */
+        e.mov_rr(RDI, RAX);   /* callee window slots (reg:abi) */
         /* fragment entry = callee->vm_chunk->native.base + native_entry_off: */
         e.movabs(RAX, reinterpret_cast<uint64_t>(callee));
         /* mov rax, [rax + desc.vm_chunk] */

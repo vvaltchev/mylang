@@ -263,8 +263,15 @@ def census(path):
     tag_errors, stale_tags = [], []
     ALLOC_API = re.compile(r'\balloc_scratch\s*\(|\.take\s*\(|'
                            r'\btake\s*\(|\bfree_scratch\s*\(')
+    in_reg_enum = False
     for i, l in enumerate(lines):
         if 'enum Reg' in l:
+            in_reg_enum = True
+        if in_reg_enum:
+            # the enum's own member list, INCLUDING continuation lines
+            # (the single-line test missed `RDI = 7, R8 = 8, ... };`)
+            if '};' in l:
+                in_reg_enum = False
             continue
         # A register mention on an ALLOCATOR-API line is the model's
         # INPUT - a prefer/exclude mask (`alloc_scratch(caps, 1u << RDX)`
