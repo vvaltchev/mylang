@@ -10372,6 +10372,74 @@ static const std::vector<test> tests =
     },
 
     {
+        /* H3 (#159): the direct SharedStr bind shares the element's buffer
+         * (as put() always did), so the WINDOW MODEL must keep value
+         * semantics: appending to the bound loop var grows only ITS window
+         * (or rebuilds), never the array element's - across the steady-state
+         * re-bind (iteration 2+ is the fast path: the slot still holds a
+         * string). Covers both storages: a plain literal row (GENERAL) and
+         * a split() row (flat strs). */
+        "H3 unpack: string binds keep value semantics across re-binds",
+        {
+            "var rows = [[\"ab\", \"cd\"]];",
+            "append(rows, split(\"ef gh\", \" \"));   # a flat-strs row",
+            "var la = \"\"; var lb = \"\";",
+            "for (var r = 0; r < 3; r++) {",
+            "    foreach (var a, b in rows) {",
+            "        a += \"!\";              # must not leak into the row",
+            "        la = a; lb = b;",
+            "    }",
+            "}",
+            "assert(rows[0][0] == \"ab\"); assert(rows[0][1] == \"cd\");",
+            "assert(rows[1][0] == \"ef\"); assert(rows[1][1] == \"gh\");",
+            "assert(la == \"ef!\"); assert(lb == \"gh\");",
+        },
+    },
+
+    {
+        /* H3 (#159): TYPE-CHANGING re-binds (str <-> int in the same slot
+         * across iterations) take the put() miss arm every time - the fast
+         * path must never fire on a mismatched pair, and the general put
+         * keeps each element's actual type. */
+        "H3 unpack: alternating str/int re-binds stay exact",
+        {
+            "var dyn rows = [[\"s\", 1], [2, \"t\"]];",
+            "var dyn r1 = \"\"; var dyn r2 = \"\";",
+            "for (var k = 0; k < 2; k++) {",
+            "    foreach (var a, b in rows) {",
+            "        r1 = str(a) + str(r1); r2 = str(b) + str(r2);",
+            "    }",
+            "}",
+            "assert(r1 == \"2s2s\"); assert(r2 == \"t1t1\");",
+        },
+    },
+
+    {
+        /* H3 (#159): the MultiUnpackV siblings - a string destructure in a
+         * loop (steady-state fast binds), a scalar string SPREAD, and the
+         * numeric COERCE arm (typed float targets from an array<int>),
+         * which must stay on the store() path untouched. */
+        "H3 multi-unpack: string destructure, spread, and the coerce arm",
+        {
+            "var p = [\"mm\", \"nn\"];",
+            "var a = \"\"; var b = \"\";",
+            "for (var i = 0; i < 3; i++) { a, b = p; }",
+            "a += \"!\";",
+            "assert(p[0] == \"mm\"); assert(a == \"mm!\");",
+            "assert(b == \"nn\");",
+            "var s = \"sp\" + str(runtime(9));   # a runtime str value",
+            "var c = \"\"; var d = \"\";",
+            "for (var i = 0; i < 3; i++) { c, d = s; }",
+            "c += \"?\";",
+            "assert(c == \"sp9?\"); assert(d == \"sp9\");",
+            "assert(s == \"sp9\");",
+            "var iv = range(2); append(iv, 7);   # blocks promotion",
+            "float x, y, z = iv;                 # int -> float coerce",
+            "assert(x == 0.0); assert(y == 1.0); assert(z == 7.0);",
+        },
+    },
+
+    {
         /* F-2b: INDEXED + heterogeneous [str, int] unpack (shopping's shape):
          * the unpacked vars are `dyn`, so an arithmetic accumulator must be
          * `dyn` (mandatory-dyn); a str accumulator absorbs a dyn (str + x). */
@@ -19804,6 +19872,108 @@ static bool array_elem_read_shapes()
     return true;
 }
 
+/* H3 (#159): the direct SharedStr unpack bind actually RUNS (prove the
+ * code ran, per shape) - g_unpack_fast_binds is bumped ONLY by the
+ * dispatch-free copy-assign arm, never by the put() fallback, so growth
+ * proves the fast path executed and an exact ZERO on the mismatched-type
+ * shape proves the guard declines. One script per shape so the counter
+ * attributes per shape, not program-wide. */
+static bool unpack_fast_bind_shapes()
+{
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    struct Case {
+        const char *name;
+        std::vector<const char *> lines;
+        unsigned long min_fast;   /* growth floor */
+        bool exact_zero;          /* the decline shape: growth must be 0 */
+    };
+    const std::vector<Case> cases = {
+        /* 75_indexed_unpack's shape: GENERAL string rows, foreach unpack
+         * in a loop. 3 rounds x 3 rows x 2 binds = 18; only the 2 first-
+         * round first-row binds miss (the slots still hold none). */
+        { "general str rows (the 75 shape)", {
+            "var rows = [];",
+            "for (var j = 0; j < 3; j++)",
+            "    append(rows, [\"a\" + str(j), str(j)]);",
+            "var n = 0;",
+            "for (var r = 0; r < 3; r++)",
+            "    foreach (var a, b in rows) n += len(a) + len(b);",
+            "assert(n == 27);" }, 10, false },
+        /* flat-strs rows (split()) - the flat_strs() arm */
+        { "flat strs rows (split)", {
+            "var rows = [];",
+            "for (var j = 0; j < 3; j++)",
+            "    append(rows, split(\"x\" + str(j) + \" y\", \" \"));",
+            "var n = 0;",
+            "for (var r = 0; r < 3; r++)",
+            "    foreach (var a, b in rows) n += len(a) + len(b);",
+            "assert(n == 27);" }, 10, false },
+        /* MultiUnpackV: a string destructure re-run in a loop */
+        { "multi-unpack str destructure", {
+            "var p = [\"mm\", \"nn\"]; append(p, \"oo\");",
+            "var a = \"\"; var b = \"\"; var c = \"\";",
+            "for (var i = 0; i < 3; i++) { a, b, c = p; }",
+            "assert(a == \"mm\" && b == \"nn\" && c == \"oo\");" },
+          4, false },
+        /* MultiUnpackV: the scalar string SPREAD */
+        { "multi-unpack str spread", {
+            "var s = \"sp\" + str(runtime(9));",
+            "var a = \"\"; var b = \"\";",
+            "for (var i = 0; i < 3; i++) { a, b = s; }",
+            "assert(a == \"sp9\" && b == \"sp9\");" }, 4, false },
+        /* DECLINE: alternating str/int re-binds - every bind is a type
+         * change, so the fast arm must never fire (growth EXACTLY 0) */
+        { "alternating types decline", {
+            "var dyn rows = [[\"s\", 1], [2, \"t\"]];",
+            "var dyn r1 = \"\"; var dyn r2 = \"\";",
+            "for (var k = 0; k < 2; k++)",
+            "    foreach (var a, b in rows) {",
+            "        r1 = str(a) + str(r1); r2 = str(b) + str(r2);",
+            "    }",
+            "assert(r1 == \"2s2s\" && r2 == \"t1t1\");" }, 0, true },
+    };
+    for (const Case &c : cases) {
+        const unsigned long b0 = g_unpack_fast_binds;
+        if (!run(c.lines)) {
+            fprintf(stderr, "unpack_fast_bind_shapes: '%s' FAILED to run\n",
+                    c.name);
+            return false;
+        }
+        const unsigned long grew = g_unpack_fast_binds - b0;
+        if (c.exact_zero ? (grew != 0) : (grew < c.min_fast)) {
+            fprintf(stderr, "unpack_fast_bind_shapes: '%s' fast binds "
+                            "= %lu, wanted %s%lu\n",
+                    c.name, grew, c.exact_zero ? "exactly " : ">= ",
+                    c.exact_zero ? 0ul : c.min_fast);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Lever 2 (VmInvoker direct fragment entry): per callback ELEMENT the
  * invoker calls jit_enter directly instead of re-entering vm_dispatch -
  * g_jit_invoke_direct counts those entries, so growth ~ the element
@@ -29176,6 +29346,8 @@ static const std::vector<extra_check> extra_checks =
       capture_typed_arith_shapes },
     { "codegen: a proven-array element read lowers to LoadElemValue (H2)",
       array_elem_read_shapes },
+    { "vm: the dispatch-free string unpack bind runs (H3)",
+      unpack_fast_bind_shapes },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",
