@@ -26830,9 +26830,17 @@ static bool arg_inplace_shapes()
         return fail("the array argument was NOT bound in place",
                     g_jit_arg_inplace - b0);
 
-    /* DECLINES - the argument is a fresh CALL RESULT, so the producing op
-     * writes the run slot directly and there is no staging MoveV to fuse
-     * (nor a caller slot that would still be holding the value). */
+    /* DECLINES - NEITHER argument is a staging move: the fresh CALL
+     * RESULT and the LITERAL are written into the run slots by their own
+     * producing ops (`call.blt.v r2 = clone(r4)`, `load r3, 3`), so the
+     * backward scan stops at once. A call result has no caller slot that
+     * would still be holding the value, which is the point.
+     *
+     * The literal is load-bearing in the TEST, not just the program: with
+     * the loop variable there instead, the case would decline only
+     * because `i` is a trivial int - the next case's subject - and this
+     * one would prove nothing about producing ops (watched: without the
+     * ref_slots gate that version reported 39 fusions, all of them `i`). */
     b0 = g_jit_arg_inplace;
     if (!run({ "func addto(a, x) {",
                "  var t = a[0] + x;",
@@ -26842,12 +26850,13 @@ static bool arg_inplace_shapes()
                "  return v;",
                "}",
                "var st = [0];",
-               "for (var i = 0; i < 40; i++) addto(clone(st), i);",
+               "for (var i = 0; i < 40; i++) addto(clone(st), 3);",
                "assert(st[0] == 0);" }))
         return false;
     if (g_jit_arg_inplace != b0)
-        return fail("a call-result argument was fused - it has no caller "
-                    "slot to be read from", g_jit_arg_inplace - b0);
+        return fail("an argument written by its own producing op was "
+                    "fused - there is no staging move there",
+                    g_jit_arg_inplace - b0);
 
     /* DECLINES - an INT local. Its staging move is already the inline
      * two-store path, and fusing it is what broke the jit_bind_widen
