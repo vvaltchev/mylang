@@ -273,6 +273,26 @@ stage - `-vd` dumps are byte-identical) and read **-32.0% on
 byte-flat. The net is a `jit_release_c5` case whose qualifying temps
 are written ONLY by the specialized family, so the table losing them
 again fails a test instead of costing 20% in silence.
+**⛔ AND THE SAME TRAP HAS A SECOND SHAPE: A WRITE THAT IS NO LONGER
+AN OPCODE (2026-08-13).** `compute_ref_slots` derives a chunk's
+`ref_slots` from instruction write-dsts via `visit_use_def` - complete
+only while every write to a frame slot IS an instruction. **#78 step D
+broke that premise**: deleting the interpreted `CatchTest` chain moved
+the catch binding into the RAISE PATH, where `vm_dispatch_exc_body`
+does `ctx.frame->at(cl.bind_slot).put(...)`. No opcode writes that
+slot, so it never entered `ref_slots` - and `catch (T as e)` binds a
+STRUCT INSTANCE, a reference. `pop_window`'s release scan skipped it
+and the hardened re-scan aborted (`rec.window[i]...->t < Type::t_str`)
+on any frame catching a CALLEE's throw with a bind. The same-frame and
+top-level spellings release elsewhere and were fine, which is why no
+corpus program in the project's history had tripped it. Both `-rt` and
+`corpus_diff` stayed GREEN with the fix removed; the Net 3 enumeration
+failed 16 of 96 at depth 2. Fixed by feeding `handler_sites`' bind
+slots into `compute_ref_slots`; pinned by
+`tests/functional/11_catch_bind_release.my`.
+**When a RUNTIME path starts writing a frame slot, it must join
+`ref_slots` - an opcode-derived table cannot see it.**
+
 **THE RULE this earns:** a table is "audited" only for the PIPELINE
 STAGES that existed when it was written. A pass added later, at a
 DIFFERENT stage, sees a different opcode universe - and a conservative
@@ -382,6 +402,26 @@ collision). Three nets now:
   power: it tests a gate's CORRECTNESS independently of its
   PROFITABILITY. `FORCE=flit` is how C4b's "correctness lives in
   emit_call_epilogue, not the gate" claim is checked.
+- **`tests/norec_enum.py` - the EXHAUSTIVE SMALL-SCOPE ENUMERATION
+  (Net 3, built 2026-08-13). NOT a fuzzer:** it emits EVERY program in
+  a bounded shape space - depth 1-4 x per-level frame kind
+  {plain, try, try/finally, dict-iter} x terminal {int, float, throw}
+  x the level a throw is caught at (or uncaught) - and runs each
+  through **four** engine configurations (`-tw`, `-nj`, jit,
+  `MYLANG_JIT_OFF=norec`), comparing stdout, stderr and exit status
+  BYTE-FOR-BYTE. RULE 2 is the spec, and an uncaught throw's rendered
+  BACKTRACE is the hard consumer - it is built from the reconstructed
+  frames. 2272 programs / 9088 runs at depth 4, ~1.3 min.
+  It reports TIER REACH from a sample, so a space that never engages
+  the tier says so instead of printing a green zero.
+  **It found two real bugs on its first run** - the mixed-kind ret
+  audit abort, and the catch-bind ref_slots gap below - neither of
+  which `-rt` or `corpus_diff` caught.
+  Two axes are deliberately SUBSTITUTED rather than dropped (recorded
+  in the script): "cached-call" as a frame kind is unreachable in an
+  impure chain by construction, and there is no builtin that captures
+  a backtrace without throwing, so capture is covered by every throw
+  variant and rendering by the uncaught ones.
 - **`MYLANG_RECON_AT=N` + `tests/norec_sweep.py` - the NO-RECORD
   tier's DETERMINISTIC EVENT SWEEP (Net 2, built 2026-08-13).** The
   G1 tier does not write a call record it can REBUILD later, and the

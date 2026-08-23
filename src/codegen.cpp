@@ -9115,6 +9115,34 @@ static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
         }
     }
 
+    /*
+     * THE CATCH-BIND SLOTS - written by the RUNTIME, not by any op.
+     *
+     * Everything above is derived from instruction write-dsts, which is
+     * complete only while every write is an opcode. Since #78 step D it
+     * is not: deleting the interpreted CatchTest chain moved the catch
+     * binding into the RAISE PATH, where vm_dispatch_exc_body does
+     *
+     *     ctx.frame->at(cl.bind_slot).put(vm_catch_bind_val(ex.get()));
+     *
+     * No instruction writes that slot, so visit_use_def never sees it,
+     * so `ref_slots` omitted it - and `catch (T as e)` binds a STRUCT
+     * INSTANCE, a reference. pop_window's release scan then skipped it
+     * and the hardened re-scan aborted:
+     *   `rec.window[i].get().get_type()->t < Type::t_str' failed
+     * on any frame that catches a CALLEE's throw with a bind (found by
+     * the Net 3 enumeration, 2026-08-13; 144 of 480 programs).
+     *
+     * This is the audit-table stage trap in a new shape - not "a pass
+     * added later sees a different opcode universe" but "a WRITE that
+     * is no longer an opcode at all". When a runtime path starts
+     * writing a frame slot, it must join this list.
+     */
+    for (const Chunk::HandlerSite &site : chunk.handler_sites)
+        for (const Chunk::HandlerClause &cl : site.clauses)
+            if (cl.bind_slot >= 0 && cl.bind_slot < total)
+                is_ref[cl.bind_slot] = 1;
+
     chunk.ref_slots.clear();
     for (int i = 0; i < total; i++)
         if (bail || is_ref[i])

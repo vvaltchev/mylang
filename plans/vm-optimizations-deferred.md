@@ -250,7 +250,11 @@ as a problem".
     `tests/norec_sweep.py`, with an in-suite seed. Sabotage-verified -
     a one-off `seg_top_before` leaves `-rt` and `corpus_diff` green
     and only the sweep fails.
-  - **Net 3 - OPEN**: the exhaustive small-scope enumeration generator
+  - **Net 3 - DONE (2026-08-13)**: `tests/norec_enum.py`, 2272
+    programs / 9088 engine runs at depth 4. Found two real bugs on its
+    first run (the mixed-kind ret-audit abort and the catch-bind
+    `ref_slots` gap), neither caught by `-rt` or `corpus_diff`.
+    ORIGINAL SCOPE, for reference: the exhaustive enumeration
     (per level, depth <= 4, frame kind x terminal x where-caught;
     uncaught programs compared BYTE-FOR-BYTE on stderr across tw /
     vm-nojit / jit / jit+shadow). Its axis list is OPEN to additions
