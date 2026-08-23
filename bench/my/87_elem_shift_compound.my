@@ -1,0 +1,29 @@
+# Compound SHIFT/BITWISE stores on FLAT array elements: a[j] <<= / >>= /
+# >>>= / &= / |= / ^= with literal counts - the typed flat shift-compound
+# tier (StoreElemInt with a shift/bitwise base op; the literal-count
+# shifts and the bitwise three take the inline arm). Values are masked
+# non-negative below 2^60, so << never wraps and >>> equals Python's >>.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 400000 * scale;
+var MASK = (1 << 60) - 1;
+var a = array(64, 0);                        # flat array<int>
+for (var i = 0; i < 64; i++)
+    a[i] = i * 2654435761 + 1;
+
+for (var t = 0; t < N; t++) {
+    var j = t & 63;
+    a[j] <<= 1;
+    a[j] |= t & 1;
+    a[j] &= MASK;
+    a[j] ^= 40503 * (j + 1);
+    a[j] >>= 2;
+    a[j] >>>= 1;
+}
+
+var s = 0;
+for (var i = 0; i < 64; i++)
+    s += a[i];
+print("result:", s);

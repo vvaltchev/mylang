@@ -5689,6 +5689,9 @@ static const std::vector<test> tests =
     { "compound shift: a negative count throws at runtime",
       { "var n = int(runtime(0 - 1)); var x = 1; x <<= n;" },
       &typeid(InvalidValueEx) },
+    { "compound shift: a negative LITERAL count on a flat element throws",
+      { "var a = [4, 5]; var i = int(runtime(1)); a[i] <<= 0 - 3;" },
+      &typeid(InvalidValueEx) },
     { "compound shift: lexer maximal munch (>>>= is ONE token)",
       { "var a = -16; var b = 2; a>>>=b; assert(a == 4611686018427387900);",
         "var c = 8; c>>=2; assert(c == 2);",
@@ -23534,6 +23537,24 @@ static bool jit_store_elem_inline_tier()
           "    return s; }",
           "print(f(21));" }, true, true, -1, /*fast_exact=*/56 },
 
+      /* LITERAL-count shifts inline (the imm8 arm): normal counts, the
+       * c >= 64 saturation (emit-time zero), and c == 0 (emits nothing)
+       * all on the fast path - 32 fills + 8*5. Values are non-vacuous:
+       * the <<= 100 zeroes, then |= reseeds per j. */
+      { "COMPOUND shifts by LITERAL count: served inline (32 + 8*5)",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i * 7 + 1; i++; }",
+          "    var j = 0;",
+          "    while (j < 8) {",
+          "        a[j] <<= 100; a[j] |= j + n;",
+          "        a[j] <<= 2; a[j] >>= 1; a[j] >>>= 0;",
+          "        j++; }",
+          "    var s = 0; var k = 0;",
+          "    while (k < 32) { s = s + a[k]; k++; }",
+          "    return s; }",
+          "print(f(3));" }, true, true, -1, /*fast_exact=*/72 },
+
       /* the inc-dec lowering `a[i]++` == `a[i] += 1` (a literal rhs) */
       { "COMPOUND: the a[i]++ inc-dec shape (32 + 8)",
         { "func f(n) {",
@@ -23782,10 +23803,11 @@ static bool jit_store_elem_inline_tier()
 }
 
 /*
- * The SHIFT compounds on a flat int element (`a[i] <<= n`) lower to
- * StoreElemInt (the typed flat tier) but the inline arm DECLINES them at
- * emit time (a reg-count shift needs the rcx core + a negative-count
- * decline; the helper gets both free from the shared body). Three facts,
+ * The REG-COUNT shift compounds on a flat int element (`a[i] <<= n`, n a
+ * slot) lower to StoreElemInt (the typed flat tier) but the inline arm
+ * DECLINES them at emit time (a reg-count shift needs the rcx core + a
+ * negative-count decline ordered before the COW prep; the helper gets
+ * both free from the shared body - LITERAL counts inline). Three facts,
  * each with its own counter, because a value oracle cannot tell the flat
  * helper from the boxed StoreElemValue fallback:
  *   1. g_jit_store_fast counts ONLY the 32 fills - the 24 shift
@@ -23808,14 +23830,18 @@ static bool jit_store_elem_shift_helper()
         "func f(n) {",
         "    var a = array(32); var i = 0;",
         "    while (i < 32) { a[i] = i * 7 + 1; i++; }",
+        "    var m = n - 1;",
         "    var j = 0;",
         "    while (j < 8) {",
-        "        a[j] <<= n; a[j] >>= 1; a[j] >>>= n;",
+        "        a[j] <<= n; a[j] >>= m; a[j] >>>= n;",
         "        j++; }",
         "    var s = 0; var k = 0;",
         "    while (k < 32) { s = s + a[k]; k++; }",
         "    return s; }",
-        "print(f(2));" };
+        /* runtime(): a literal arg would SPECIALIZE f, fold m/n to
+         * literal counts, and the shifts would inline - the vacuous-
+         * test trap's shape-eater #6, watched doing exactly that */
+        "print(f(int(runtime(2))));" };
 
     const unsigned long fast0 = g_jit_store_fast;
     const unsigned long help0 =
