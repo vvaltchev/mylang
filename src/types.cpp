@@ -775,7 +775,7 @@ build_builtin_table_once()
      * ordered table would give a builtin a DIFFERENT slot index in the
      * compiling process than in the loading one, and a `.myv`'s baked
      * SymKind::builtin slots would resolve to the WRONG builtin
-     * (plans/myv-serializer.md). Sorting by name makes the table a
+     * (plans/archived/myv-serializer.md). Sorting by name makes the table a
      * deterministic function of the builtin SET; the image additionally
      * carries a fingerprint of that set and refuses a mismatch. */
     std::vector<std::pair<const UniqueId *, bool>> all;

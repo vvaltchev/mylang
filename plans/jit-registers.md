@@ -302,7 +302,7 @@ heuristic) with linear-scan allocation over the run's live ranges:
     boundaries (an int inside one run, a foreach snapshot or slice temp
     between runs), so an eager entry-load/exit-flush would overwrite a
     live container with an int and its type tag. That corruption was a
-    FUZZER find, not an -rt one - see plans/native-aot.md N5.
+    FUZZER find, not an -rt one - see plans/archived/native-aot.md N5.
 
 ## Testing protocol (both steps)
 

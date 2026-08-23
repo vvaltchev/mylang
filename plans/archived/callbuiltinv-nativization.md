@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: BSD-2-Clause -->
 # Nativize CallBuiltinV (model-flip nativize-ops) — design decisions
 
-Part of the model-flip nativize-ops arc (`plans/model-flip.md`). CallBuiltinV is
+Part of the model-flip nativize-ops arc (`plans/archived/model-flip.md`). CallBuiltinV is
 the **biggest island source (~294 occurrences)** — a value-ABI (`func_v`)
 read-only builtin call. Attempting it surfaced several issues that make it bigger
 than the clean incremental ops (MoveV/Subscript/... already done). This file

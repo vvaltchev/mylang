@@ -571,7 +571,7 @@ vm_make_dict(EvalContext &ctx, int_type base, int_type npairs)
  * the caller wraps it in the defensive loc-stamp try/catch (the throw
  * propagates out of here).
  *
- * H1 (plans/vm-performance-roadmap.md) - DST-SLOT REUSE: the hot standalone-
+ * H1 (plans/archived/vm-performance-roadmap.md) - DST-SLOT REUSE: the hot standalone-
  * construction shape is `var p = Point(...)` in a loop, where the dst slot
  * still holds LAST iteration's same-def POD instance and nothing else does
  * (`use_count() == 1` - the slot's handle is the only owner; readonly
@@ -1624,7 +1624,7 @@ struct VmCallRec {
 
     unsigned char boundary = 0;
 
-    /* M5 LEAN SYNC ENTER (plans/model-flip.md): this frame was pushed by a
+    /* M5 LEAN SYNC ENTER (plans/archived/model-flip.md): this frame was pushed by a
      * native caller's jit_call_sync* helper - its ret_chunk is the SENTINEL
      * stop chunk, so a normal return dispatches the sentinel's ExitBlock
      * (vm_dispatch returns to the helper), and the unwind walk STOPS here
@@ -1639,7 +1639,7 @@ struct VmCallRec {
      * the per-frame design explicitly forbids (see PureCache, eval.h). */
     std::unique_ptr<PureCache> caller_cache;
 
-    /* G1 no-record tier, STEP 1 (plans/g1-no-record-tier.md): the emitted
+    /* G1 no-record tier, STEP 1 (plans/archived/g1-no-record-tier.md): the emitted
      * sync-call SITE that pushed this record (a NorecSite*), stored by the
      * M5b inline push UNDER TESTS so the shadow verification and the
      * full-stack audit can associate a live record with its side-table
@@ -1653,7 +1653,7 @@ struct VmCallRec {
      * (the step-4 walk needs it in every build); null on C++ pushes. */
     const void *native_rbp = nullptr;
 
-    /* G1 step 4-v (plans/g1-no-record-tier.md 4c): the PARENT frame's
+    /* G1 step 4-v (plans/archived/g1-no-record-tier.md 4c): the PARENT frame's
      * view - window/nslots/seg of the frame this record's pop returns
      * to, captured AT PUSH TIME (the view frame + cur_seg, which still
      * describe the caller there). These replace every "the record below
@@ -2028,7 +2028,7 @@ bool vm_lookup_builtin(const UniqueId *name, Builtin &out)
     return true;
 }
 
-/* .myv LOAD (plans/myv-serializer.md): own a deserialized chunk and stamp
+/* .myv LOAD (plans/archived/myv-serializer.md): own a deserialized chunk and stamp
  * it on its descriptor - the loader's equivalent of vm_precompile_all's end
  * state for a fresh compile. The AOT NATIVE tier re-runs here: only the VM
  * image is stored, so machine code is (re-)generated per load. */
@@ -2820,7 +2820,7 @@ int g_vm_jit_raise = 0;
 static const Chunk *g_vm_resume_chunk = nullptr;
 static size_t g_vm_resume_pc = 0;
 
-/* model-flip M2 (plans/model-flip.md): the ISLAND fall-through resume pc. An
+/* model-flip M2 (plans/archived/model-flip.md): the ISLAND fall-through resume pc. An
  * ExitBlock sets it (the container's next-block pc) and returns from
  * vm_dispatch; vm_exec_block reads it to distinguish a fall-through exit
  * (g_vm_block_resume != NONE) from a ReturnV/Halt (flow) or a raise. NONE
@@ -3240,7 +3240,7 @@ extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src) noexcept
 }
 
 /*
- * Re-raise DELETABILITY (plans/model-flip.md): a conveying op's caret must
+ * Re-raise DELETABILITY (plans/archived/model-flip.md): a conveying op's caret must
  * be pc-INDEPENDENT (a DELETED run collapses every pc onto its EnterNative,
  * where a loc-table lookup would be wrong). Two zero-hot-cost carriers:
  * the BoxedOp-family helpers stamp from their pool entry's start/end (the
@@ -3376,7 +3376,7 @@ vm_load_elem_float_core(const EvalValue &base, int_type idx,
 }
 
 /*
- * The NESTED-READ FUSION's level 1 (plans/unboxing.md option A): resolve
+ * The NESTED-READ FUSION's level 1 (plans/archived/unboxing.md option A): resolve
  * `base[oidx]` to a BORROWED row - a raw `const EvalValue &` into the outer
  * array's storage - instead of the LoadElemValue pair's boxed temp slot
  * (a helper call + retain + 32-byte copy + live-slices registration + a
@@ -5739,7 +5739,7 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 /*
  * Raise an exception FROM a VM op - a `throw` / `rethrow` / reraise, or a
  * runtime error the op detects itself (div/mod-by-zero). G1
- * (plans/vm-performance-roadmap.md): the ENTIRE propagation is the native
+ * (plans/archived/vm-performance-roadmap.md): the ENTIRE propagation is the native
  * FRAME WALK (vm_unwind_walk) - dispatch to a handler in the current frame,
  * else pop in-VM records (capturing their backtrace frames) until a handler
  * or the activation's BOUNDARY record; only the boundary converts to the
@@ -6340,7 +6340,7 @@ VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj)
     c_ = act_->invoke_ctx.get();
     desc_ = obj.func;
     cck_ = static_cast<const Chunk *>(desc_->vm_chunk);
-    /* Lever 2 (plans/native-gap-roadmap.md): a body that STARTS native
+    /* Lever 2 (plans/archived/native-gap-roadmap.md): a body that STARTS native
      * (the whole-body-native common case) is entered DIRECTLY per element
      * - jit_enter, no vm_dispatch entry/exit, no EnterNative op dispatch.
      * Computed once per LOOP. */
@@ -6571,7 +6571,7 @@ vm_frame_setup(VmActivation &act, EvalContext &ctx, const Chunk *ret_chunk,
 }
 
 /*
- * LEVER 1 STEP 2 (plans/native-gap-roadmap.md) - the COMMON-SHAPE call
+ * LEVER 1 STEP 2 (plans/archived/native-gap-roadmap.md) - the COMMON-SHAPE call
  * push. The callgrind split on 10_recursion_deep put ~500 Ir of protocol
  * on EVERY call: vm_frame_setup 232 (of which ~30 was just the prologue/
  * epilogue - the unique_ptr<PureCacheKey> PARAMETER drags in exception
@@ -6710,7 +6710,7 @@ vm_enter_call_lean(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 /*
  * The interpreter's in-VM CALL: the frame-setup core plus the chunk/pc SWITCH
  * to the callee (the loop then dispatches the callee's ops). The native-call
- * path (plans/native-aot.md #55) will instead `call` the callee's fragment
+ * path (plans/archived/native-aot.md #55) will instead `call` the callee's fragment
  * after vm_frame_setup, so the switch stays here.
  */
 static ML_NOINLINE void
@@ -6981,7 +6981,7 @@ vm_cache_probe_vals(EvalContext &ctx, const FuncDescriptor *d,
 }
 
 /*
- * M5 LEAN SYNC ENTER (inc 3; plans/model-flip.md): a fragment's call op runs
+ * M5 LEAN SYNC ENTER (inc 3; plans/archived/model-flip.md): a fragment's call op runs
  * the callee to completion INSIDE the helper and the CALLER CONTINUES
  * NATIVELY. Inc 1 used vm_try_invoke's BOUNDARY machinery (arg value copy,
  * boundary window, flow round-trip) - measured heavier than the interpreted
@@ -7043,7 +7043,7 @@ static const Chunk &vm_sync_stop_chunk()
 }
 
 /*
- * Lever 1 step 5 (plans/native-gap-roadmap.md) - the post-exit of a
+ * Lever 1 step 5 (plans/archived/native-gap-roadmap.md) - the post-exit of a
  * DIRECT-ENTERED sync callee fragment, shared by jit_call_sync_core's
  * direct branch and the fragment-INLINE call path (which emits the push +
  * the `call` + the sentinel test in machine code and calls this only on a
@@ -7363,7 +7363,7 @@ jit_sync_boundary_call(EvalContext &ctx, FuncObject &fo, int_type argbase,
 
 /*
  * G1 STEP 4-iv - THE SWITCH RETARGET (task #148; the -3 materializer of
- * plans/g1-no-record-tier.md 4d, generalized). The -3 propagation is
+ * plans/archived/g1-no-record-tier.md 4d, generalized). The -3 propagation is
  * about to unwind every native frame in the topmost segment - and every
  * one of those frames' records carries the SENTINEL resume (sync_stop,
  * ret = the stop chunk), which is only meaningful while its C/native
@@ -8310,7 +8310,7 @@ void jit_fill_push_layout(JitPushLayout *L)
 
 /*
  * G1 NO-RECORD TIER, STEP 1 - the SHADOW VERIFICATION (the Net 1 seed,
- * plans/g1-no-record-tier.md "THE TESTING PLAN").
+ * plans/archived/g1-no-record-tier.md "THE TESTING PLAN").
  *
  * jit_norec_push_verify runs after EVERY M5b inline push in a TESTS
  * build (the emitter inserts the call beside its other TESTS-only
@@ -8744,7 +8744,7 @@ extern "C" void jit_norec_push_verify(const void *site,
      * numbers answer "how many of the calls that would skip their
      * record actually may". No extra emit: this helper already runs on
      * every M5b inline push. The gate, per the step-4 design
-     * (plans/g1-no-record-tier.md):
+     * (plans/archived/g1-no-record-tier.md):
      *   - not a CACHED call (the pure-cache exclusion - fib declines);
      *   - callee plain_frame (no handler/iterator watermark, so the
      *     unwind never searches the frame);
@@ -9114,7 +9114,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
     };
 
 
-    /* Inc 0 (P8): the exception BOUNDARY (plans/vm-exceptions.md). It routes a
+    /* Inc 0 (P8): the exception BOUNDARY (plans/archived/vm-exceptions.md). It routes a
      * RuntimeException thrown by any op (a runtime-library error, a fallback
      * `throw`, or a callee) into the VM handler stack: on a caught exception
      * with an active handler, resume at its catch-dispatch pc. PROVEN hot-path-
@@ -9615,7 +9615,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_NEXT;
 
         VM_CASE(EnterNative): {
-            /* Native-AOT (plans/native-aot.md): run the compiled fragment
+            /* Native-AOT (plans/archived/native-aot.md): run the compiled fragment
              * - a frameless leaf (slots base in rdi, resume pc out). It
              * either completes the whole run or BAILS at some interior
              * pc, whose ORIGINAL op the interpreter then re-executes
@@ -9911,7 +9911,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * else the UNIVERSAL vm_subscript_store fallback (const / general
              * / dyn). The store logic lives in vm_store_elem_int_body, SHARED
              * with the approach-A JIT helper jit_store_elem_int - so a native
-             * store fragment runs byte-identical C++ (see plans/native-aot.md).
+             * store fragment runs byte-identical C++ (see plans/archived/native-aot.md).
              * The base may be a global/capture array (in->target = the slot
              * kind); the caret comes from the loc side table, looked up LAZILY
              * on the cold throw/fallback path only. */
@@ -11439,7 +11439,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             VM_NEXT;
 
         VM_CASE(ExitBlock):
-            /* model-flip M2 (plans/model-flip.md): an island's fall-through
+            /* model-flip M2 (plans/archived/model-flip.md): an island's fall-through
              * exit. Hand control back to the native container (vm_exec_block):
              * stash the resume pc (the next block the container continues at)
              * and return from the dispatch loop. ONLY reached via vm_exec_block
@@ -11482,7 +11482,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 }
 
 /* =====================================================================
- * model-flip M2 (plans/model-flip.md): the interpreted-ISLAND executor.
+ * model-flip M2 (plans/archived/model-flip.md): the interpreted-ISLAND executor.
  * The endgame flips "bytecode with native islands" into "native with
  * bytecode islands": every function becomes ONE call-able native container
  * whose un-nativizable regions are ISLANDS reached via a `call vm_exec_block`.
@@ -11536,7 +11536,7 @@ vm_exec_block(EvalContext &ctx, VmActivation &act, const Chunk &chunk,
 }
 
 /*
- * model-flip M3 (plans/model-flip.md): a native CONTAINER fragment, at an
+ * model-flip M3 (plans/archived/model-flip.md): a native CONTAINER fragment, at an
  * island, `call`s this - baking its OWN FuncDescriptor + the island's start pc.
  * It runs the interpreted island via vm_exec_block in the container's frame
  * (reached through g_current_ctx / g_vm_act, exactly like jit_ret) and returns

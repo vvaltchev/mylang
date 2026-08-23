@@ -257,7 +257,7 @@ Applies to this change and every JIT change:
 * **A fragment is entered ONLY at its head.** An op that bails mid-run drops
   everything downstream to the interpreter until the next fragment head. This is
   why an incomplete native path is so costly, and why merging runs can *expose*
-  a latent bail (see the `56_sieve_bool` story in `plans/model-flip.md`).
+  a latent bail (see the `56_sieve_bool` story in `plans/archived/model-flip.md`).
   Removing MIN_RUN creates more, smaller fragments — i.e. more fragment heads —
   which is the opposite pressure and generally helps recovery after a bail.
 * **`patch8` asserts** that a rel8 displacement fits (added 2026-07-25 after it

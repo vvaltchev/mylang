@@ -44,7 +44,7 @@ enum class StaticTypeKind {
     Dict,         /* uses `key`, `val` */
     Func,         /* uses `params`, `param_opt`, `ret` */
     Exception,
-    Struct,       /* uses `struct_def` (future; see plans/structs.md) */
+    Struct,       /* uses `struct_def` (future; see plans/archived/structs.md) */
     Dyn,          /* explicit dynamic top */
 };
 

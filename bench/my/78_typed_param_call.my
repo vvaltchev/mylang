@@ -2,7 +2,7 @@
 # typed language should make FASTER, not slower. Nothing else in bench/ has it:
 # every other call-heavy bench leaves its parameters un-annotated, which is why
 # the suite was byte-flat while this shape measured 1.61x slower than the
-# identical `dyn`-parameter code (plans/cpp-gap-extremes.md, G1 increment 3).
+# identical `dyn`-parameter code (plans/archived/cpp-gap-extremes.md, G1 increment 3).
 #
 # CLOSURES on purpose: a direct call to a named function is inlined away at
 # compile time, so it would measure nothing about the call protocol. `add`

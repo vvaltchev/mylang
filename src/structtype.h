@@ -12,7 +12,7 @@
 #include <memory>
 
 /*
- * Custom struct types (see plans/structs.md). A `struct` decl builds one
+ * Custom struct types (see plans/archived/structs.md). A `struct` decl builds one
  * StructTypeDef (AST-owned, program-lifetime); the type descriptor value
  * (t_structtype) holds a raw pointer to it, exactly like a FuncObject holds a
  * FuncDeclStmt*. A struct *instance* (t_struct) is a StructObject.
@@ -73,7 +73,7 @@ struct FieldDef {
 /*
  * POD field metrics: our OWN fixed alignment rules so a struct's C-style layout
  * depends only on the word size (sizeof(int_type)), never on host `alignof`.
- * This is the one place an arch assumption lives (see plans/structs.md s6); on
+ * This is the one place an arch assumption lives (see plans/archived/structs.md s6); on
  * the LE x86/arm/riscv targets only the int width (4 vs 8) varies. -1 marks a
  * non-POD-scalar kind (a struct is then boxed).
  */

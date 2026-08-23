@@ -7,7 +7,7 @@ INCREMENTAL STEPS - big changes are harder to land correctly.
 
 ## What C is
 
-The measured residual on the array-access class (plans/unboxing.md, the
+The measured residual on the array-access class (plans/archived/unboxing.md, the
 91.5 Ir/inner-iteration decomposition of 46_matrix_mult) has two
 structural components left:
 
@@ -28,7 +28,7 @@ steps that are each independently sound, landable, and measurable.
 - **A (adjacent dead-temp forwarding) is NOT part of C.** It removes
   component (2) - a register-allocation concern that survives even with
   perfect type trust. It is small, independent, and lands FIRST (its
-  own work, not tracked here; see plans/unboxing.md's lever list).
+  own work, not tracked here; see plans/archived/unboxing.md's lever list).
 - **B (loop-preheader guard hoisting) IS C's first step - C1 below.**
   What B hoists (base -> shobj -> data/count, guards checked once per
   loop) is exactly the re-derivation C wants gone. B proves it by
@@ -284,7 +284,7 @@ lifetime - the allocator generalizes the lifetime).
 ### C3 - typed frame slots for proven scalars
 
 **INCREMENT 1 (the ref_slots narrowing) LANDED 2026-08-04.** The
-return-path lever from plans/cpp-gap-extremes.md: `ParamDesc::
+return-path lever from plans/archived/cpp-gap-extremes.md: `ParamDesc::
 proven_type` (i/f), stamped by the ONE-SHOT inferencer for an
 un-annotated param that can only receive that scalar - concrete,
 non-opt, non-dyn, on a non-template, never-value-used function in the
@@ -346,7 +346,7 @@ the type-word store (half of every scalar two-store) disappears for
 slots that can never hold anything else, and `ref_slots` narrows to
 slots that can genuinely hold references (today an inferred-int param
 still sits in the release-scan list). This is the step the return-path
-notes (plans/cpp-gap-extremes.md) flagged as a DELIBERATE soundness
+notes (plans/archived/cpp-gap-extremes.md) flagged as a DELIBERATE soundness
 decision: it trades a memory-lifetime guarantee for inference being
 airtight, and the failure mode is a silently retained reference or a
 garbage type pointer. Prerequisites, in order:

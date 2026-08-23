@@ -402,7 +402,7 @@ loads, with no dependency on the store's data - they retire nearly free
 alongside the real work on a wide out-of-order core. This is the
 documented instruction-vs-time divergence at its extreme, and it is the
 measured argument that killed the first-iteration PEEL (see
-plans/typed-invariant-arrays.md: its reach across bench/ is ZERO guards,
+plans/archived/typed-invariant-arrays.md: its reach across bench/ is ZERO guards,
 and even with reach it would trade real I-cache for free instructions).
 C4d/C4e/C5 stay - they cost nothing and shrink the emitted code - but
 **do not push this line further on Ir evidence alone.**
@@ -1014,7 +1014,7 @@ compile standalone, and there is nothing to add to the Makefile.
 (`globals`/`typestr`/`kindstr`/`signature`/`layout`/`specializations`) and the
 shared `reflect_*` rendering helpers (signature/type/layout strings) the REPL's
 introspection commands reuse; it is `#include`d last (after the other builtins)
-so it can call `arr_elem_at`. See `plans/repl-introspection.md`.
+so it can call `arr_elem_at`. See `plans/archived/repl-introspection.md`.
 **`layout(S)` returns a structured value, not a string** — a **native composite
 type** (`StructLayout`, holding an `array<StructField>`), the first of the
 reflection objects. The two native `StructTypeDef`s are built in C++
@@ -1858,7 +1858,7 @@ so it
 leaves the tree untouched for the later passes (the one exception is the
 named-argument desugaring below, a deliberate lowering). Full design + the
 decisions behind it: `plans/archived/type-inference.md`,
-`plans/type-inference-questions.md`.
+`plans/archived/type-inference-questions.md`.
 
 - **Named-argument desugaring (`lower_named_args`).** A call may pass arguments
   by name (`f(x: 1, z: 3)`, see README *Named arguments*). The parser attaches
@@ -2430,7 +2430,7 @@ construction, and every other program's output is byte-identical to the
 pre-LICM binary.
 
 **THE NESTED-READ FUSION - `LoadElem2Int`/`LoadElem2Float` (2026-08-01,
-plans/unboxing.md option A).** LICM above removes the row read whose index
+plans/archived/unboxing.md option A).** LICM above removes the row read whose index
 is loop-INVARIANT (`a[i][k]` in the k-loop). What it cannot touch is the
 one whose outer index VARIES with the inner loop - `b[k][j]` - and that is
 where 46_matrix_mult's remaining cost sat: a profile put **61% of the
@@ -3524,7 +3524,7 @@ are unchanged.
   mutation (a stale cache fails it loudly). (An order-dependent removable hash —
   polynomial / Rabin-Karp — could also make `a[i]=v` O(1), but it weakens the
   hash, taxes the write path, and still can't do O(1) insert/erase; rejected for
-  B. See `plans/hash-and-dict.md`.)
+  B. See `plans/archived/hash-and-dict.md`.)
 - **Any-type dict keys, frozen on insert.** Because `hash` is total, an array/
   dict/struct/`none` can be a key. A key would corrupt the map if mutated after
   insertion (its hash would change, leaving it in the wrong bucket — COW does
@@ -3533,7 +3533,7 @@ are unchanged.
   **`make_const_clone(key)`** — a deep read-only freeze. Scalars/strings are
   returned as-is (cheap); only a container key pays a one-time clone.
   `MemberExpr` keys are interned strings (already immutable), so they need no
-  freeze. See `plans/hash-and-dict.md`.
+  freeze. See `plans/archived/hash-and-dict.md`.
 - **Deep-const read-only flag.** Both `SharedObject` (arrays) and `DictObject`
   carry a `readonly` bool (`is_readonly()`/`set_readonly()`). It backs `const`
   values: `make_const_clone()` (`eval.cpp`) sets it on every array/dict in the
@@ -3578,7 +3578,7 @@ are unchanged.
 ## Custom struct types
 
 User-defined value types (`struct Point { int x; int y; }`). Full design +
-phasing: `plans/structs.md`. **Status: complete (all 8 phases)** — decl,
+phasing: `plans/archived/structs.md`. **Status: complete (all 8 phases)** — decl,
 construction, field/const access, inference, const-folding, COW; the POD
 C-layout; nested (recursive) POD; flat `array<PodStruct>` storage; M8-style
 *direct* (unboxed) field access; and construct-in-place append. A flat struct
@@ -3711,7 +3711,7 @@ but the per-element `StructObject` allocation is gone (build overhead
   deep). `==`
   is structural between same-`def` instances (`TypeStruct::eq`); `hash`
   combines the field hashes (see *Universal `hash()`* above), so a struct can be
-  a dict key. **Deferred** (plans/structs.md): `var` fields (call-site
+  a dict key. **Deferred** (plans/archived/structs.md): `var` fields (call-site
   field inference), `opt` scalar fields, methods, and empty structs.
 
 ## Error model
@@ -3965,7 +3965,7 @@ and two macros:
 
 `mylang` with no FILE/`-e` on a TTY (or `--repl` to force it off a TTY, for
 testing) runs the REPL (`run_repl`, launched from `mylang.cpp`). Full design +
-status: `plans/repl.md`. Four TUs, split so the logic is headless-testable
+status: `plans/archived/repl.md`. Four TUs, split so the logic is headless-testable
 behind a thin terminal shell:
 
 - **`repl.{h,cpp}` — `ReplEngine`**, the headless evaluation core. Holds the
@@ -4080,7 +4080,7 @@ behind a thin terminal shell:
     pure core is unit-tested with a synthetic suggester (`suggestion()` +
     accept); the gray rendering lives in `read_line` (untested, like the rest of
     the TTY shell). A navigable dropdown completion menu is still deferred (see
-    `plans/repl.md`).
+    `plans/archived/repl.md`).
   - **Reverse history search (`Ctrl-R`).** `class HistorySearch` (lineedit.h) is
     the **pure** analogue of `LineEditor` for searching: a query + a ranked,
     de-duplicated match list + a selected index, driven by `feed()` one byte at
@@ -4155,7 +4155,7 @@ behind a thin terminal shell:
   list (names + descriptions) has one source of truth, `trace_categories_help()`
   (`trace.cpp`), rendered as an aligned bullet list by `:trace help` and the
   `trace`/`:trace` entries alike. Pure/headless, so it is unit-tested (`replhelp:`
-  extra_checks). See `plans/repl-introspection.md`.
+  extra_checks). See `plans/archived/repl-introspection.md`.
 - **`coderender.{h,cpp}`** — `render_func_code(fn)` /
   `render_construct_code(c)`, the optimized-AST **"decompiler"**: it unparses
   the FINAL tree (after parse/fold/inference/`resolve_names`/`specialize_types`)
@@ -4181,7 +4181,7 @@ behind a thin terminal shell:
   (`:show 2 + 3 * 4` → `14`; `:show <expr>` parses + `resolve_names`'s the arg
   non-committing). `:show` output is **syntax-highlighted** via `highlight_line`
   (extended to color C-style block comments and treat `$` as an id char — the
-  `f$0` names). See `plans/repl-introspection.md`.
+  `f$0` names). See `plans/archived/repl-introspection.md`.
 - **`trace.{h,cpp}`** — the **diagnostic tracer** ("MyLang's mind"): a per-
   category bitmask (`TraceCat`: infer/inline/specialize/template/autoconst/
   autopure/arrays/fold) in `g_trace_mask`, the hot guard `trace_enabled(c)`,
@@ -4196,7 +4196,7 @@ behind a thin terminal shell:
   its per-input capture stream (a `TraceSinkGuard` in `do_eval`) so an enabled
   trace narrates into the REPL output just above the result (and is testable);
   a script leaves it at `cerr` so trace never corrupts stdout. OFF by default,
-  so scripts/tests are unaffected. See `plans/repl-introspection.md`.
+  so scripts/tests are unaffected. See `plans/archived/repl-introspection.md`.
 
 `run_repl` (in `repl.cpp`) drives it: history loaded/saved to
 `~/.mylang_history`, colors gated on a TTY + `NO_COLOR` (passed into the
@@ -4537,7 +4537,7 @@ the proof. Before calling it done:
 >
 > **THE `.myv` STORED-BYTECODE FORMAT (`serialize.{h,cpp}`; the byte-level
 SPEC is docs/myv-format.txt — read it before touching the format; design +
-phases in plans/myv-serializer.md) — THE ENDGAME ARTIFACT.**
+phases in plans/archived/myv-serializer.md) — THE ENDGAME ARTIFACT.**
 `mylang -c file.my [-o out.myv] [--strip-source]` runs the full pipeline
 (run-side flags: `--source ROOT`, `-f`/`--force` - see the SOURCE
 REFERENCE below)
@@ -4944,7 +4944,7 @@ Design record: `plans/archived/bytecode-vm.md`.
 > RULE (see *Benchmarks*); apply it to EVERY native-codegen change.
 
 **THE MODEL FLIP — native CONTAINERS with bytecode ISLANDS
-(`plans/model-flip.md`, M1-M4a landed; M4b measured MOOT — see the end of
+(`plans/archived/model-flip.md`, M1-M4a landed; M4b measured MOOT — see the end of
 this paragraph).** The endgame inversion of the JIT: flip
 "BYTECODE with native ISLANDS" (a bytecode chunk, some runs replaced by
 `EnterNative`, the interpreter driving between them) into "NATIVE with bytecode
@@ -4996,7 +4996,7 @@ MODEST win, LIMITED by the per-island `vm_dispatch` RE-ENTRY overhead. Still one
 island of simple boxed ops + no calls, so M1-M4a match NO bench/sample (real
 loops have a multi-island init+body / richer ops) — ZERO suite impact; M4a is a
 mechanism step + the M5 prerequisite. **M4b IS MOOT AS A PERF ITEM, MEASURED
-(2026-07-28, plans/model-flip.md "the prize is collected"):** the nativize-ops
+(2026-07-28, plans/archived/model-flip.md "the prize is collected"):** the nativize-ops
 arc got there from the other side. 100% of bench + sample chunks are
 container-READY, and `vm_dispatch`'s callgrind SELF cost is a CONSTANT 47
 instructions (invocation entry + Halt) across every hot bench — the
@@ -5011,7 +5011,7 @@ ARCHITECTURE milestone: M5-flip is largely subsumed by the M5b/c native sync
 calls, and M6 (delete-originals + `.myv`) has since landed. Proven
 by the `jit_container` `-rt` test (`g_jit_container_calls` coverage + a
 throw-from-island + a loop container) + differential + fuzzer + `-vdj`. Builds on
-`plans/archived/native-call-impl.md` (v1 native calls) and `plans/native-aot.md`
+`plans/archived/native-call-impl.md` (v1 native calls) and `plans/archived/native-aot.md`
 (approach A, the fragment ABI).
 
 ## Invariants & hazards (defense in depth)

@@ -3,7 +3,7 @@
 Status: IMPLEMENTED (2026-07-26) - see the Log at the bottom; the
 classification sections below are the original plan, kept for the
 rationale (amendments recorded in the Log).
-Companion: plans/native-gap-roadmap.md (the MyLang-side levers that stay
+Companion: plans/archived/native-gap-roadmap.md (the MyLang-side levers that stay
 real regardless of bench fairness).
 
 ## The principle (maintainer's rule)

@@ -5,7 +5,7 @@ Status: **SCOPED from measurement, implementation starting.** Written
 
 ## The reach, measured FIRST - and it is not what the lever assumed
 
-plans/call-protocol-arc.md proposed this to fix the four worst benches.
+plans/archived/call-protocol-arc.md proposed this to fix the four worst benches.
 Dumping their bytecode says that is **wrong for three of the four**,
 because the calls they execute do not have a statically-known callee:
 
@@ -184,7 +184,7 @@ The three, as found:
 
 **(1) [NOT THE SPLICE'S BUG - root-caused and mostly FIXED 2026-08-02 in
 `9fe3783` + `c1310ed`; the JIT residual moved to
-plans/jit-backtrace-frames.md.]** The
+plans/archived/jit-backtrace-frames.md.]** The
 first reading was that a spliced frame's virtual backtrace frame was
 dropped by `vm_unwind_walk`'s once-guarded flush. The "splice" half was
 wrong; the "guard" half turned out to be RIGHT, but for the interpreted
@@ -219,7 +219,7 @@ path rather than the one being looked at:
     pc-keyed side-table lookup on the JIT's exception path is degenerate.
     The designed answer is baking, which today covers only the raise site
     and only when the op has a chain. Design + acceptance test:
-    **plans/jit-backtrace-frames.md**.
+    **plans/archived/jit-backtrace-frames.md**.
   - Attempting a pc lookup at `EnterNative` was tried and REJECTED - it
     recovered a frame on one shape by luck and broke another.
 
@@ -429,7 +429,7 @@ a counted loop in the first place. What blocks it now:
      1  too-big
 
 So the dominant blocker by far is the runtime callee, which is exactly
-what plans/call-protocol-arc.md predicted and what 76/11/63 are made of.
+what plans/archived/call-protocol-arc.md predicted and what 76/11/63 are made of.
 Lifting the counted-loop exclusion was worth doing - it removes a whole
 class of decline and the audit trail now says so - but it is NOT what
 widens this feature; an inline cache is.

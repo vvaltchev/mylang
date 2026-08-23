@@ -7,7 +7,7 @@
 
 /*
  * A single-threaded NODE POOL allocator for std::unordered_map (H2 v2,
- * plans/vm-performance-roadmap.md - the maintainer-approved alternative to
+ * plans/archived/vm-performance-roadmap.md - the maintainer-approved alternative to
  * a flat open-addressing map, which was REJECTED: it would break the
  * element-pointer stability the runtime relies on - dict values are LValues
  * written through held LValue* - for a modest lookup win).

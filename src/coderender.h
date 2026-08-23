@@ -9,7 +9,7 @@ class FuncDeclStmt;
 
 /*
  * Render the FINAL optimized AST of a function back into synthetic MyLang-like
- * code (see plans/repl-introspection.md) - the "decompiler" behind the `show()`
+ * code (see plans/archived/repl-introspection.md) - the "decompiler" behind the `show()`
  * builtin and the REPL `:show` command. It walks the tree AFTER parsing,
  * const-folding, inference, resolve_names (inlining/specialization) and
  * specialize_types, so what you see is what actually runs:

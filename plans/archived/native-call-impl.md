@@ -2,7 +2,7 @@
 
 This is the concrete, do-this-next implementation guide for the native-call
 machine-code, written so it can be executed from a FRESH context with no
-conversation memory. Read `plans/native-aot.md` "### #55 — the STAGED
+conversation memory. Read `plans/archived/native-aot.md` "### #55 — the STAGED
 implementation plan" for the design + the F1/F2/F3 findings; this file is the
 step-by-step. HARD constraint (maintainer): at compile time we know EXACTLY
 what to emit — NO runtime-decided silent fallback. Prioritize the SMALLEST

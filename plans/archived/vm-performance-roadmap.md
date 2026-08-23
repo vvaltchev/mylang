@@ -236,7 +236,7 @@ fixed 32B Instr at load.
     instructions of 76's ~2,400/iteration; an IC cannot pay. 76's REAL
     costs: (a) the callee bodies are VALUE-USED template BASES running
     fully boxed — the actual fix is
-    plans/value-template-instantiation.md (maintainer-approved, in
+    plans/archived/value-template-instantiation.md (maintainer-approved, in
     progress) — and (b) enter/leave at ~270 instr/call. SHIPPED from
     the pivot: the dead-dst rule extended to `CallV`/`CallValueV` (a
     discarded call statement `fn(st, i);` skips the result put;

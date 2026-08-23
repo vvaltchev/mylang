@@ -829,7 +829,7 @@ void render_language_index(std::ostream &o, bool color)
     const Pal p = palette(color);
     if (lang_db_empty()) {
         o << "Language reference is being assembled "
-          << p.dim << "(see plans/repl-introspection.md)" << p.rst << "\n";
+          << p.dim << "(see plans/archived/repl-introspection.md)" << p.rst << "\n";
         return;
     }
     o << "Language features by category "

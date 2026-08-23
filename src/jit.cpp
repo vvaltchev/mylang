@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 /*
- * Native x86-64 AOT (N0/N1) - see jit.h and plans/native-aot.md.
+ * Native x86-64 AOT (N0/N1) - see jit.h and plans/archived/native-aot.md.
  *
  * N1 scope: STRAIGHT-LINE runs of the never-throwing int tier (the B1/B2
  * specialized arithmetic + IntModRI/IntAddModRI/LoadImmInt). No branches
@@ -9,7 +9,7 @@
  * splits a run, so a fragment has exactly one entry (its head) and every
  * interior pc's original Instr stays valid for a bail resume.
  *
- * THE THREE CONTRACTS (the correctness core - plans/native-aot.md):
+ * THE THREE CONTRACTS (the correctness core - plans/archived/native-aot.md):
  *  1. Fragments NEVER throw and never call anything that can: they are
  *     frameless leaves with no unwind tables. Every exceptional condition
  *     (a negative shift count, an excluded idiv combination) BAILS -
@@ -131,8 +131,8 @@ bool g_jit_enabled = false;
  * helper (no_sanitize_undefined). Both are no-ops without the
  * sanitizer. */
 /*
- * M5a - THE DEDICATED NATIVE STACK (plans/native-gap-roadmap.md /
- * plans/model-flip.md M5). Each native call level (the sync-inline
+ * M5a - THE DEDICATED NATIVE STACK (plans/archived/native-gap-roadmap.md /
+ * plans/archived/model-flip.md M5). Each native call level (the sync-inline
  * `call rdx`, the #55 direct call) nests a machine frame; on the C stack
  * that forced the tiny sync depth cap (200). Fragments now execute on a
  * RESERVED 1GB MAP_NORESERVE region (virtual only - lazy commit means RSS
@@ -959,7 +959,7 @@ struct Emitter {
         call_rax();
         pop_reg(REG_ARG0);
 #endif
-        /* G1 STEP 3 - THE FRAME-POINTER CHAIN (plans/g1-no-record-tier.md,
+        /* G1 STEP 3 - THE FRAME-POINTER CHAIN (plans/archived/g1-no-record-tier.md,
          * frame pointers decided by the maintainer). Every fragment now
          * maintains rbp: [rbp] = the caller's rbp, [rbp+8] = the return
          * address, so a chain of fragment-to-fragment calls is walkable
@@ -2535,7 +2535,7 @@ static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
  * helper emit established).
  */
 /*
- * M5b - THE FULLY-INLINE RECORD PUSH (plans/native-gap-roadmap.md lever 1
+ * M5b - THE FULLY-INLINE RECORD PUSH (plans/archived/native-gap-roadmap.md lever 1
  * endgame). Emits the sync call's push - callee resolve, the gate checks,
  * push_window's hot shape (segment fit + record REUSE), the record fill,
  * the unrolled fast_bind arg copies, the captures switch - as machine
@@ -3412,7 +3412,7 @@ static void emit_nstack_switch_post(Emitter &e)
 
 /*
  * G1 NO-RECORD TIER, STEP 1 - the ret-address -> site and address ->
- * owning-chunk registries (plans/g1-no-record-tier.md). Filled by
+ * owning-chunk registries (plans/archived/g1-no-record-tier.md). Filled by
  * jit_norec_register when a fragment buffer is placed (the base becomes
  * known exactly where call_relocs are patched); read today ONLY by the
  * TESTS shadow verification. Ordered maps: lookup performance is a
@@ -3963,7 +3963,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
 }
 
 /*
- * C4c (plans/typed-invariant-arrays.md): the INLINE frame pop - the
+ * C4c (plans/archived/typed-invariant-arrays.md): the INLINE frame pop - the
  * return-side twin of the M5b inline push above. jit_ret's common shape
  * costs a C++ round trip per return (prologue, globals, steal, pop_window,
  * dst put - the #1/#2 SELF cost of every call-heavy bench, ~35% of
@@ -4601,7 +4601,7 @@ static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
 }
 
 /*
- * ---- Lever A: ADJACENT DEAD-TEMP FORWARDING (plans/unboxing.md) ----
+ * ---- Lever A: ADJACENT DEAD-TEMP FORWARDING (plans/archived/unboxing.md) ----
  *
  * The measured shape: each op is emitted independently, so a value flows
  * producer -> temp slot (two stores, plus a ref check when the temp is
@@ -4791,7 +4791,7 @@ static void emit_fwd_fbump(Emitter &e)
 
 /*
  * ---- C1: PER-LOOP GUARD + NAVIGATION HOISTING ----
- * (plans/typed-invariant-arrays.md, the staircase's first step)
+ * (plans/archived/typed-invariant-arrays.md, the staircase's first step)
  *
  * A loop's element ops re-derive the base's navigation EVERY element:
  * type tag, slice flag, SharedObject, kind, data/finish, count - for a
@@ -6355,7 +6355,7 @@ static bool region_preheader_reached(
 }
 
 /*
- * ---- C5: THE LOOP-PREHEADER RELEASE (plans/typed-invariant-arrays.md) ----
+ * ---- C5: THE LOOP-PREHEADER RELEASE (plans/archived/typed-invariant-arrays.md) ----
  *
  * A scalar store to a REF-LISTED slot cannot just overwrite the two
  * words: the slot may currently hold a reference, and releasing one
@@ -11514,7 +11514,7 @@ static void jit_pick_ctor_establish(
 
 /* DELETABLE (the interpreted original can be dropped from the rebuilt
  * bytecode): never-exits, OR a CONVEY-WITH-OWN-LOC throwing op. The latter's
- * contract (plans/model-flip.md, the re-raise deletability pass): the helper
+ * contract (plans/archived/model-flip.md, the re-raise deletability pass): the helper
  * (1) stamps its throw from a BAKED loc - the BoxedOp pool's start/end, a
  * baked &locs[i] LocEntry, the builtin_calls / member_keys pool carets - so
  * the caret is pc-INDEPENDENT (a deleted run collapses every pc onto its
@@ -11536,7 +11536,7 @@ static bool op_fully_native(const Instr &in)
     switch (in.op) {
     /* CallBuiltinV conveys its OWN loc from the builtin_calls pool (stamped
      * in jit_call_builtin before stashing) - the family's model; see
-     * plans/callbuiltinv-nativization.md #2. */
+     * plans/archived/callbuiltinv-nativization.md #2. */
     case OpCode::CallBuiltinV:
     case OpCode::BinOpV:
     case OpCode::CmpV:
@@ -11814,7 +11814,7 @@ struct Run { size_t begin, end; };   /* [begin, end) in OLD pc space */
  * single maximal run (every op jit_op_eligible, so nothing splits it) that is
  * deletable (every op op_fully_native; single-entry is trivial for [0,n)) and
  * ends in ReturnV. */
-/* G1 step 4 (plans/g1-no-record-tier.md "STEP 4 DESIGN FACTS" 4b): may a
+/* G1 step 4 (plans/archived/g1-no-record-tier.md "STEP 4 DESIGN FACTS" 4b): may a
  * frame RUNNING this chunk skip its call record? The record is the
  * interpreter's ONLY resume vehicle (jit_sync_postexit drives vm_dispatch
  * through it), so the body must be FULLY DELETED - every op EnterNative,
@@ -11859,7 +11859,7 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk)
     return true;
 }
 
-/* plans/model-flip.md M1: partition the chunk into maximal NATIVE / ISLAND
+/* plans/archived/model-flip.md M1: partition the chunk into maximal NATIVE / ISLAND
  * segments. An op is NATIVE iff it is an inserted EnterNative (a compiled run)
  * or it is op_run_eligible (an op the container WOULD nativize - note this is
  * a looser bar than "has a fragment today": an op can be run-eligible yet sit
@@ -11888,7 +11888,7 @@ ContainerPlan jit_container_plan(const Chunk &chunk, const JitCtx *jc)
 }
 
 /* ---------------------------------------------------------------------------
- * model-flip M3 (plans/model-flip.md): the first NATIVE CONTAINER emission -
+ * model-flip M3 (plans/archived/model-flip.md): the first NATIVE CONTAINER emission -
  * the inversion "bytecode with native islands" -> "native with bytecode
  * islands", on the simplest MIXED shape. A container fragment DRIVES the whole
  * body; its ONE interpreted ISLAND becomes a `call jit_exec_block`, and the

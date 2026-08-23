@@ -18,7 +18,7 @@
  * The struct TYPE descriptor (t_structtype): a trivial value holding a raw
  * StructTypeDef*. It is a `const` value the `struct` decl binds in scope; it is
  * callable (construction, handled in CallExpr::do_eval) and supports `.CONST`
- * reads (handled in MemberExpr::do_eval). See plans/structs.md.
+ * reads (handled in MemberExpr::do_eval). See plans/archived/structs.md.
  */
 class TypeStructType : public Type {
 

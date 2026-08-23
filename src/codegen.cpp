@@ -2647,7 +2647,7 @@ struct Codegen {
      * the temp and never write back, so store codegen keeps as_array_slot.
      */
     /*
-     * The NESTED-READ FUSION (plans/unboxing.md option A): lower a scalar
+     * The NESTED-READ FUSION (plans/archived/unboxing.md option A): lower a scalar
      * `base[i][j]` to ONE LoadElem2Int/Float instead of the
      * `LoadElemValue t = base[i]` + `LoadElem*(t[j])` pair, so the row is
      * BORROWED at run time rather than materialised into a temp slot.
@@ -7823,7 +7823,7 @@ static void verify_ast_free(const std::vector<CgInstr> &code)
 
 
 /*
- * B1/B2 (plans/vm-performance-roadmap.md): rewrite general IntBin/FloatBin
+ * B1/B2 (plans/archived/vm-performance-roadmap.md): rewrite general IntBin/FloatBin
  * ops into their per-operator, per-shape variants (see the enum comment in
  * bytecode.h). IN PLACE - opcode + (for a lit-first commutative op) an
  * operand swap only, so pcs, the loc side table, and every pool stay
@@ -8302,7 +8302,7 @@ bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
 }
 
 /*
- * C4d: THE STRUCT-IDENTITY FACTS (plans/typed-invariant-arrays.md).
+ * C4d: THE STRUCT-IDENTITY FACTS (plans/archived/typed-invariant-arrays.md).
  *
  * A baked member read (LoadMemberInt/Float) guards `slot holds a struct`
  * + `that struct's def is D` before every single byte read - 7
@@ -10111,7 +10111,7 @@ codegen_chunk(const Block *block, int slot_count, bool jit)
      * this flag and records native_entry_off. */
     cg.chunk.native_leaf = jit_chunk_is_native_leaf(cg.chunk);
     if (jit)
-        jit_compile_chunk(cg.chunk);  /* native-AOT (plans/native-aot.md):
+        jit_compile_chunk(cg.chunk);  /* native-AOT (plans/archived/native-aot.md):
                                        * LAST - needs the specialized ops +
                                        * ref_slots; inserts EnterNative
                                        * heads + remaps pcs itself. A

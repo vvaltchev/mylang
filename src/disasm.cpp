@@ -808,7 +808,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
     if (chunk.native_leaf)
         s << "; native_leaf: whole body -> one fragment @+"
           << chunk.native_entry_off << "  (call-able; #55)\n";
-    /* plans/model-flip.md M1: the container plan - how this body partitions
+    /* plans/archived/model-flip.md M1: the container plan - how this body partitions
      * into NATIVE / ISLAND segments, and whether it could be ONE native
      * container. For a mixed body, list each island's pc span + the distinct
      * un-nativizable opcodes blocking it (the "what to nativize next" surface).

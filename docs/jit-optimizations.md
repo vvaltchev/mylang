@@ -80,7 +80,7 @@ of `chunk->code.data()` - a double-load per dispatch, front-end-amplified;
 refreshed only at the four chunk-change sites). Zero-copy arg binding was
 MEASURED AND DECLINED (the bind is ~2 instructions per 1-arg call; the
 protocol around it is what costs - see the plan's Phase E verdict).
-**LEVER 1 (2026-07-26, plans/native-gap-roadmap.md) - the LEAN
+**LEVER 1 (2026-07-26, plans/archived/native-gap-roadmap.md) - the LEAN
 CALL PUSH/LEAVE:** the callgrind split on 10_recursion_deep showed
 ~500 Ir of protocol per call, ~30 of it just vm_frame_setup's
 prologue/epilogue - the unique_ptr<PureCacheKey> PARAMETER drags
@@ -124,8 +124,8 @@ mutations so declines fall to the idempotent jit_call_sync* tier; a
 first-descent grows the record high-water through the slow tier by
 design). M5b measured (Ir): 10_recursion_deep -30.4%, 11 -15.5%,
 63 -15.6%; wall ~0.90x each; 10 CUMULATIVE -46% Ir from pre-lever-1.
-See plans/native-gap-roadmap.md for the full per-step record.
-**THE RETURN SIDE (2026-08-01, plans/cpp-gap-extremes.md cause 1).** A
+See plans/archived/native-gap-roadmap.md for the full per-step record.
+**THE RETURN SIDE (2026-08-01, plans/archived/cpp-gap-extremes.md cause 1).** A
 profile of the my/cpp tail found `vm_frame_leave`/`pop_window` the #1 or
 #2 SELF cost in every call-heavy bench (10/11/63/76) - 129 Ir per return,
 against a C++ return's ~0. Two changes, both of the "the protocol around
@@ -160,7 +160,7 @@ The largest remaining item in the return is the `ref_slots`
 reference-release scan (**50 of the ~112 Ir left**, ~25 per listed slot:
 two DEPENDENT loads - the slot's type pointer, then its tag - which the
 value model makes irreducible). Narrowing the LIST was the lever - DONE
-2026-08-04 as **C3 increment 1** (plans/typed-invariant-arrays.md): the
+2026-08-04 as **C3 increment 1** (plans/archived/typed-invariant-arrays.md): the
 one-shot inferencer stamps `ParamDesc::proven_type` (i/f) for an
 UN-annotated param that can only ever receive that scalar - a concrete
 non-opt non-dyn param of a non-template, never-value-used
@@ -216,7 +216,7 @@ by callees too big to inline - the first version of its test exercised
 nothing for exactly that reason.
 
 **C4c - THE INLINE FRAME POP (2026-08-04,
-plans/typed-invariant-arrays.md route item 3) - the return-side twin of
+plans/archived/typed-invariant-arrays.md route item 3) - the return-side twin of
 M5b's inline push.** jit_ret's C++ round trip (globals, steal,
 pop_window, dst put) was ~35% of 10_recursion_deep; the common shape is
 now EMITTED at the ReturnV/Halt site (emit_ret_native, jit.cpp) and
@@ -432,7 +432,7 @@ verify_ast_free abort (71/400 diverged; -rt alone was green - the
 fuzzer is load-bearing for codegen-field changes). Pinned by the
 "typed div0 carets the DIVISOR operand" test + the comparator smoke.
 
-**LEVER 4b (2026-07-27, plans/native-gap-roadmap.md) - native `len()` +
+**LEVER 4b (2026-07-27, plans/archived/native-gap-roadmap.md) - native `len()` +
 the fused `ord(s[i])`.** `len(x)` whose arg the inferencer proved a
 non-opt ARRAY/STRING lowers to the EXISTING `ArrLen`/`StrLen` op (no
 CallBuiltinV marshal): the stamp is `CallExpr::vm_len_kind` (1 array /
@@ -572,7 +572,7 @@ design-level flat open-addressing dict (23_dict_insert's node allocs)
 stays a maintainer-sign-off item - roadmap H2 v2.
 
 **H1 - STRUCT CREATION (dst-slot reuse + typed member reads).** Two
-pieces (plans/vm-performance-roadmap.md H1): (1) **`vm_struct_ctor`
+pieces (plans/archived/vm-performance-roadmap.md H1): (1) **`vm_struct_ctor`
 constructs INTO the dst slot with REUSE** - when the slot's current value
 is a same-def, non-readonly POD instance with `use_count() == 1` (the
 slot's handle is the only owner), the fields are coerced into a stack
@@ -743,7 +743,7 @@ MoveVs -31%, fib$0's chunk 68->56; the earlier STANDALONE
 threading-without-deletion attempt was a measured DECLINE (+3.2%, 1/77
 benches affected - roadmap E3 records it).
 
-**NATIVE x86-64 AOT — N0/N1 (plans/native-aot.md; `jit.{h,cpp}`).** The
+**NATIVE x86-64 AOT — N0/N1 (plans/archived/native-aot.md; `jit.{h,cpp}`).** The
 incremental baseline tier: `jit_compile_chunk` runs LAST in
 `codegen_chunk` (after specialize_arith_ops; a `.myv` load will call it
 the same way), finds maximal STRAIGHT-LINE runs (EVERY run compiles — the
@@ -848,7 +848,7 @@ DIVISOR `z[0]`, the tree-walker the whole `x / z[0]` chain - FIXED
 45 -> 41 kept runs. Remaining blockers: the calls (38),
 Catch/Reraise/Throw (12), StructFieldAddInt (5), MultiUnpackV (3).
 **Steps 2-4 - the CALLS are deletable (2026-07-28,
-plans/model-flip.md "The CALLS deletability design"):** every sync-call
+plans/archived/model-flip.md "The CALLS deletability design"):** every sync-call
 decline is gone. The chunk-less callee (the old AOT-net bail) first
 LAZY-tries vm_func_chunk (the interpreted op's own net) then runs the
 BOUNDARY call inside the helper (jit_sync_boundary_call - the
@@ -956,7 +956,7 @@ builds it loc-less and vm_raise would stamp it from `loc_at(pc)`, but a
 DELETED run collapses several ops onto one pc, where loc_at returns the
 FIRST entry (the ctor's, in `throw E(9)`). CatchTest/Reraise stay KEPT:
 the handler dispatch JUMPS to their pcs (the catch-dispatch redesign is
-scoped in plans/model-flip.md, deferred). Corpus: 16 -> **15 kept
+scoped in plans/archived/model-flip.md, deferred). Corpus: 16 -> **15 kept
 runs**; 42_exceptions **-9.7%** Ir (the native raise replaces an
 interpreted dispatch per throw), 69 -0.9%, 10_recursion neutral.
 **The FINAL batch (same day) - 15 -> 7 kept runs corpus-wide:** the
@@ -1000,7 +1000,7 @@ pc_lookup=0` - the pc lookup WOULD have named the wrong body. Pinned in
 jit_final_batch_deletable (engines' backtraces equal, the frame is `snd`
 and never `fst`, and the `g_jit_inline_baked` counter must bump, so the
 test cannot pass by luck or on an unexercised path). `fib$0` is now 9
-instructions. NOTE the earlier scoping (in plans/model-flip.md) predicted
+instructions. NOTE the earlier scoping (in plans/archived/model-flip.md) predicted
 a SECOND mechanism for the call case - a stub-pc `inline_ctxs` entry or a
 field on the call record - and this paragraph used to record it as
 UNNECESSARY, reasoning that the emitted call site's own exc-stamp runs
@@ -1188,7 +1188,7 @@ The `>= 3`-uses heuristic still limits how much of the pool gets used; a
 LIVE-RANGE allocator is the next step and is what the wider pool is for.
 
 **C2a - THE FLOAT REGISTER CACHE (2026-08-04, xmm4-7;
-plans/typed-invariant-arrays.md).** The N5 pool's float half: hot
+plans/archived/typed-invariant-arrays.md).** The N5 pool's float half: hot
 float LOCALS pin in xmm4-7 (xmm0/1 stay scratch) - parallel accounting
 in `pick_cached_slots` (usef/badi/badf; the pools are DISJOINT: an int
 use disqualifies the float side and vice versa), entry loads at the
@@ -1623,7 +1623,7 @@ kind of opportunity and the same treatment applies - each needs its own
 argument for why a pinned operand is type-safe there.
 
 **LEVER A - ADJACENT DEAD-TEMP FORWARDING (2026-08-03,
-plans/unboxing.md).** A whitelisted int PRODUCER (LoadElemInt,
+plans/archived/unboxing.md).** A whitelisted int PRODUCER (LoadElemInt,
 LoadElem2Int, the specialized IntBin RR/RI family) immediately followed
 by a whitelisted CONSUMER (the RR/RI family, IntAddStep) reading its
 TEMP dst hands the value over IN RAX: the consumer skips the slot load
@@ -1660,10 +1660,10 @@ Measured (callgrind Ir, OPT=1 ASSERTS=0): 46_matrix_mult -2.19%/iter,
 14_array_subscript -1.2%/iter, 07_nested_loops -2.83%, 03_int_arith
 -1.36% whole-program; the rest <= +0.04% (link noise per the -nj
 control). The write elision is throttled by ref_slots' conservatism -
-narrowing it is C3 (plans/typed-invariant-arrays.md).
+narrowing it is C3 (plans/archived/typed-invariant-arrays.md).
 
 **C1 - PER-LOOP NAVIGATION HOISTING (2026-08-03,
-plans/typed-invariant-arrays.md - the typed-invariant staircase's first
+plans/archived/typed-invariant-arrays.md - the typed-invariant staircase's first
 step).** A loop's element ops re-derive the base's navigation EVERY
 element (type tag, slice flag, shobj, kind, data/finish, count) for a
 base that cannot change inside the loop. C1 is LOOP VERSIONING:
@@ -1868,7 +1868,7 @@ mismatch counted a literal rhs VALUE as a slot index (a phantom that
 could cache/corrupt whatever slot it collided with), and the
 shift-by-register handler read its count raw - both fixed. The only raw
 `slot_addr` reads left are on `bad()`-disqualified `LoadElem` base/index
-slots (never cached). See plans/native-aot.md.
+slots (never cached). See plans/archived/native-aot.md.
 
 **N6a - NATIVE MATH BUILTINS (`MathFnV`) + the REF-STORE FIX.** A typed
 math-builtin (`sqrt`/`sin`/`cos`/`log`/`exp`/`pow`/... - `MathFnV`) is now
@@ -1895,7 +1895,7 @@ the JIT was silently bailing across the suite - `08_func_call` **0.49x**,
 `07_nested_loops` **0.58x**, `40_math_builtins` **0.72x** (my/py 5.6x ->
 **7.7x**), `49_autoconst_fold`/`51_purefunc_fold` ~0.7x, broad -3-7%; no
 regressions. This is the model for the whole JIT (approach A, see
-plans/native-aot.md): call the SAME C++ the interpreter calls (arrays/dicts/
+plans/archived/native-aot.md): call the SAME C++ the interpreter calls (arrays/dicts/
 exceptions) from native, prove handling at COMPILE time, and DELETE the
 interpreted original - no double copy, no runtime re-interpret. **Landed on
 that model:** **`jit_raise`** - an OOB / negative-shift fragment stores a
@@ -2761,7 +2761,7 @@ leaf tier".
 
 ## G1 no-record tier STEP 1 (2026-08-09): the shadow-verified side table
 
-plans/g1-no-record-tier.md steps 1 + nets 1/1b/5/6, zero behaviour: one
+plans/archived/g1-no-record-tier.md steps 1 + nets 1/1b/5/6, zero behaviour: one
 NorecSite per emitted sync-call site ({caller, call_pc, dst, site_loc, op,
 two ret-address offsets - the M5a switch emits `call rdx` TWICE}), filled
 to absolutes where call_relocs are patched, registered in ret-addr -> site
@@ -2986,7 +2986,7 @@ SP.
 
 The last shadow piece before behaviour changes, plus the protocol read
 that settled step 4's design (recorded in full in
-plans/g1-no-record-tier.md "STEP 4 DESIGN FACTS").
+plans/archived/g1-no-record-tier.md "STEP 4 DESIGN FACTS").
 
 **THE WINDOW CHAIN.** frag_entry pushes rbx (the frame-base register)
 FIRST after `push rbp` - so `[fp-8]` of every native frame is the

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 /*
- * Native x86-64 AOT - the incremental baseline tier (plans/native-aot.md).
+ * Native x86-64 AOT - the incremental baseline tier (plans/archived/native-aot.md).
  *
  * jit_compile_chunk runs LAST in codegen_chunk (after the peephole,
  * extract_locs, ref_slots and specialize_arith_ops - and, later, after a
@@ -93,7 +93,7 @@ struct JitCtx {
 void jit_compile_chunk(Chunk &chunk, const JitCtx *jc = nullptr);
 
 /*
- * plans/model-flip.md M1: the CONTAINER PLAN - a compile-time view of how a
+ * plans/archived/model-flip.md M1: the CONTAINER PLAN - a compile-time view of how a
  * chunk partitions into NATIVE segments (maximal runs of native-eligible ops,
  * incl. an already-inserted EnterNative) and ISLAND segments (maximal runs of
  * un-nativizable ops). This is the analysis surface for the "native containers
@@ -351,7 +351,7 @@ enum JitRaiseKind { JR_NONE = 0, JR_OOB = 1, JR_NEG_SHIFT = 2,
                     JR_DIV0 = 3, JR_DIV_OVF = 4 /* INT_MIN / -1 */ };
 extern int g_vm_jit_raise;
 
-/* Approach A (container-store helper ops, plans/native-aot.md): a native
+/* Approach A (container-store helper ops, plans/archived/native-aot.md): a native
  * a[i]=v / a[i] OP= v fragment marshals the base LValue*, the index and the
  * value and CALLS one of these instead of splitting the run at the store, so
  * the enclosing loop stays native. They run the interpreter's EXACT store
@@ -476,7 +476,7 @@ extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
 extern "C" int jit_load_elem_float(LValue *base_lv, int_type idx,
                                    LValue *dst) noexcept;
 
-/* The NESTED-READ FUSION `dst = base[i][j]` (plans/unboxing.md option A):
+/* The NESTED-READ FUSION `dst = base[i][j]` (plans/archived/unboxing.md option A):
  * the row is BORROWED inside the helper, never boxed into a frame slot.
  * `locs` is the baked chain_locs pair - [0] carets an OOB on the outer
  * index, [1] one on the inner - so these throw WITH a caret rather than
@@ -1027,7 +1027,7 @@ extern "C" unsigned long g_jit_relent_stores;
 #endif
 
 /*
- * G1 NO-RECORD TIER, STEP 1 (plans/g1-no-record-tier.md). The side table
+ * G1 NO-RECORD TIER, STEP 1 (plans/archived/g1-no-record-tier.md). The side table
  * is emitted in every build; the VERIFICATION - the shadow-oracle seed -
  * runs only where the counters exist:
  *   norec_sites         table entries REGISTERED (compile-time)
@@ -1066,7 +1066,7 @@ bool jit_norec_on();
  */
 void jit_norec_rebind(Chunk &chunk);
 /*
- * G1 step 4-iv (plans/g1-no-record-tier.md 4d): the MATERIALIZER ANCHOR
+ * G1 step 4-iv (plans/archived/g1-no-record-tier.md 4d): the MATERIALIZER ANCHOR
  * relay. The emitted slow tail stores the site's NorecSite* and the
  * calling FRAGMENT's rbp here just before invoking the jit_call_sync*
  * helper (every register is an argument there, and the switch is the
@@ -1168,7 +1168,7 @@ extern "C" void jit_struct_ctor_establish(const void *def,
 extern "C" size_t jit_halt() noexcept;
 
 /*
- * model-flip M3 (plans/model-flip.md): the native CONTAINER's ISLAND call. A
+ * model-flip M3 (plans/archived/model-flip.md): the native CONTAINER's ISLAND call. A
  * container fragment, at an interpreted island, `call`s this with its OWN
  * FuncDescriptor (so vm_exec_block can reach the container's chunk via
  * desc->vm_chunk) and the island's start pc. Runs the island via vm_exec_block

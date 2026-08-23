@@ -6,7 +6,7 @@
 #include <iosfwd>
 
 /*
- * Diagnostic tracing - "MyLang's mind" (see plans/repl-introspection.md).
+ * Diagnostic tracing - "MyLang's mind" (see plans/archived/repl-introspection.md).
  *
  * A per-category, toggleable narration of the compiler's reasoning: type
  * inference, inlining, specialization, template instantiation, auto-const,

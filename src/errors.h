@@ -323,7 +323,7 @@ DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
  * a param), so both belong here permanently. InvalidNumberOfArgsEx is here FOR
  * NOW; the deeper fix is FIXED builtin arities (e.g. write(str) +
  * fwrite(file_or_handle, str)) so arity becomes a COMPILE-time check and the
- * runtime throw disappears - see plans/callbuiltinv-nativization.md #1. */
+ * runtime throw disappears - see plans/archived/callbuiltinv-nativization.md #1. */
 /*
  * THE TEMPORAL DEAD ZONE, runtime half (#131) - see UseBeforeBindingEx. A
  * function body reading a GLOBAL whose declaration has not run yet:

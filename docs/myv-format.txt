@@ -7,7 +7,7 @@ every record, in order, with its exact byte encoding.
 
 It is the specification of what `mylang -c FILE` writes and what `mylang
 FILE.myv` reads.  The implementation is src/serialize.{h,cpp}; the design
-history and the per-version measurements are in plans/myv-serializer.md, and
+history and the per-version measurements are in plans/archived/myv-serializer.md, and
 the implementation-shape summary is in CLAUDE.md (".myv STORED-BYTECODE
 FORMAT").
 
