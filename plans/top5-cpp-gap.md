@@ -1273,3 +1273,72 @@ path, plus:
  - the `ML_VM_HARDENING` pop_window audit is the net for the failure
    direction: a slot wrongly left holding a reference fails the
    every-slot-trivial assert at frame pop.
+
+## A - THE BORROW BIND: BUILT AND MEASURED (2026-08-15)
+
+Landed as `a847379` (step 1, the single release point - inert) and
+`f6bbdb1` (step 2, the producer). The design above survived contact
+with the code; three things it did NOT predict are recorded below,
+because each was a use-after-free waiting to happen and none of them
+was found by a test.
+
+**THE NUMBER.** 76_funcval_dispatch **-13.48% instructions** (601.0M ->
+520.0M = **-81 Ir per call**, against the ~74 this plan predicted) and
+**0.88x** wall clock, interleaved `--baseline`, `OPT=1 ASSERTS=0` both
+sides. Suite geomean cur/base **1.008x**. Two benches read +10% / +16%
+on the wall clock and are **+0.01% on callgrind** - noise, and the
+deterministic check is why the suite was not re-run to chase them.
+
+**REACH.** `MYLANG_JITSTATS` gained `arg_borrow` and
+`arg_borrow_slice`; bench 76 reports **`arg_borrow 1000000`**, one per
+call. The optimization is consumed, not dead.
+
+### The three things the design missed
+
+1. **A SCALAR value must not be borrowed**, even when the analysis
+   claims the parameter. The release scan skips a trivial slot, so the
+   flag survives into the next call to reuse that window slot. It fired
+   immediately in **ackermann**: an un-annotated TEMPLATE parameter is
+   not `binds_scalar`, so the analysis claims it, but it holds an int.
+   The catch was `rebind`'s `ML_CHECK(!borrowed)` - which step 1 had
+   added under the heading "proven redundant". It was not redundant,
+   and writing it as an assertion rather than a comment is the only
+   reason this was a named abort instead of a corrupted refcount.
+
+2. **The emitted push's slot zeroing had to move ABOVE the copy loop.**
+   The qword at +40 covers `container_idx` and both flag bytes, so the
+   tidy-up store after the binds wiped the flag the reference arm had
+   just set. Found by READING the emitted sequence before writing the
+   producer; no test would have distinguished it from a plain
+   double-release until something crashed.
+
+3. **The callee is an INLINE CACHE at the emitted push**, not a
+   compile-time constant, so the noescape bit cannot be baked. It is
+   loaded from the descriptor (`JitPushLayout::desc_noescape`) - four
+   instructions on a path that is already a call. The two-helper design
+   this plan proposed (one retaining, one borrowing, chosen at emit
+   time) is therefore not buildable here; there is one helper with a
+   third argument, and the C++ path reads the bit the same way so the
+   two cannot drift.
+
+### Sabotage matrix (each rebuilt, each watched failing)
+
+| rule deleted | caught by |
+|---|---|
+| the SLICE exclusion | `jit_borrow_arg_shapes` (a value, not a count) |
+| borrow only a reference (`t >= t_str`) | `rebind`'s ML_CHECK |
+| `frame_release` honours the flag | ASan heap-use-after-free |
+| the analysis's answer (borrow everything) | `put`'s ML_CHECK |
+
+### Remaining cases, in reach order - NONE built
+
+- **The emitted INLINE borrow arm.** The call is still paid; the bit
+  test and the slice test would move into emitted code and jump to the
+  raw-copy path that is already there for scalars. This was step 3 of
+  the original plan.
+- **The builtin CALLBACK bind paths** (`argv[i]`, vm.cpp) - sort's
+  comparator, map/filter/make_dict, i.e. benches 12/34/35/67. Same
+  design, different bind site.
+- **The tree-walker's `do_func_bind_params`.** Not a performance tier,
+  but it is a case, and leaving it out means the two engines bind
+  differently.
