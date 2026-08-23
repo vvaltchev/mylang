@@ -22717,6 +22717,7 @@ extern unsigned long g_vm_table_dispatch;   /* #78 step C coverage */
 extern unsigned long g_jit_end_finally_reraise;  /* #78 step E coverage */
 extern unsigned long g_jit_rethrow_native;       /* #80 coverage */
 extern "C" unsigned long g_jit_scache;           /* #96 inc-1 coverage */
+extern "C" unsigned long g_jit_range_share;      /* #96 inc-2 coverage */
 #endif
 
 static bool vm_handler_table()
@@ -25160,6 +25161,155 @@ static bool jit_reg_model()
         return false;
     }
     return true;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #96 INCREMENT 2 - LIVE-RANGE REUSE. Eleven whole-run accumulators
+ * take eleven pins; the two SEQUENTIAL loops' phase-local slots rank
+ * into the remaining registers, and the later phase's overflow chains
+ * onto an early-ending pin across a SEAM (evict + install at a pc no
+ * branch edge crosses; the loop-exit edge that lands exactly ON the
+ * seam pc is the legal, side-patched case). The VALUE is the oracle;
+ * g_jit_range_share is bumped by the EXECUTED seam, so it proves the
+ * eviction ran, not merely that a plan existed. The `int(q)` call in
+ * the SECOND loop is load-bearing twice over: its barrier exercises
+ * snapshot/restore with the post-seam state, and its post-call entry
+ * stub must install the AS-OF-PC assignment (base + seams before it),
+ * which is the machinery an interpreter excursion relies on.
+ *
+ * The DECLINE case reads the first phase's accumulator t1 AFTER the
+ * second loop, so its range overlaps every later candidate's and no
+ * chain is legal - the counter must stay flat (want=false), and the
+ * value must still be right through the spill-home placement it gets
+ * instead.
+ */
+static bool jit_range_share_test()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src, bool vm,
+                  unsigned long *rs) -> std::string {
+        const unsigned long r0 = g_jit_range_share;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (rs) *rs = g_jit_range_share - r0;
+        return cap.str();
+    };
+
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        bool want;
+    };
+    const std::vector<Case> cases = {
+      { "two sequential loops share a register across the seam",
+        { "func f(int n, dyn q) {",
+          "    var s0 = 1; var s1 = 2; var s2 = 3; var s3 = 4;",
+          "    var s4 = 5; var s5 = 6; var s6 = 7; var s7 = 8;",
+          "    var s8 = 9; var s9 = 10; var sa = 11;",
+          "    var t1 = 0;",
+          "    for (var i = 0; i < n; i++) {",
+          "        t1 += i;",
+          "        s0 += i; s1 += s0; s2 += s1; s3 += s2;",
+          "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
+          "        s8 += s7; s9 += s8; sa += s9;",
+          "    }",
+          "    var t2 = 0;",
+          "    for (var j = 0; j < n; j++) {",
+          "        t2 += j; t2 += int(q);",
+          /* the caught raise makes an INTERPRETED excursion resume
+           * through an entry STUB past the seam - the stub must
+           * install the as-of-pc assignment (the seam's occupant),
+           * not the base one; WATCHED: with the stub's seam
+           * application disabled this sum goes wrong, where the
+           * call-only spelling stays green because a barrier's
+           * inline reload never consults the stub */
+          "        var d = 3;",
+          "        if (j == 9) { d = 0; }",
+          "        try { t2 /= d; } catch (DivisionByZeroEx)"
+          " { t2 += 5; }",
+          "        s0 += j; s1 += s0; s2 += s1; s3 += s2;",
+          "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
+          "        s8 += s7; s9 += s8; sa += s9;",
+          "    }",
+          "    s0 += s1; s0 += s2; s0 += s3; s0 += s4; s0 += s5;",
+          "    s0 += s6; s0 += s7; s0 += s8; s0 += s9; s0 += sa;",
+          "    s0 += t1; s0 += t2;",
+          "    return s0;",
+          "}",
+          "print(f(runtime(24), runtime(2)));" }, true },
+
+      /* ONE loop, every candidate live in it: no two ranges are
+       * disjoint, so no chain is legal in either direction - the
+       * overflow keeps its spill homes and the counter stays flat.
+       * (A two-phase spelling cannot pin this: a phase-local counter
+       * legitimately chains BACKWARD onto a later phase's pin, which
+       * is the feature working - watched, as the first version of
+       * this case.) */
+      { "fully-overlapping ranges decline every chain",
+        { "func f(int n) {",
+          "    var s0 = 1; var s1 = 2; var s2 = 3; var s3 = 4;",
+          "    var s4 = 5; var s5 = 6; var s6 = 7; var s7 = 8;",
+          "    var s8 = 9; var s9 = 10; var sa = 11;",
+          "    var t1 = 0; var t2 = 0;",
+          "    for (var i = 0; i < n; i++) {",
+          "        t1 += i; t2 += t1;",
+          "        s0 += i; s1 += s0; s2 += s1; s3 += s2;",
+          "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
+          "        s8 += s7; s9 += s8; sa += s9;",
+          "    }",
+          "    s0 += s1; s0 += s2; s0 += s3; s0 += s4; s0 += s5;",
+          "    s0 += s6; s0 += s7; s0 += s8; s0 += s9; s0 += sa;",
+          "    s0 += t1; s0 += t2;",
+          "    return s0;",
+          "}",
+          "print(f(runtime(24)));" }, false },
+    };
+
+    bool ok = true;
+    const unsigned rot0 = g_jit_xrot;
+    for (unsigned rot = 0; rot < jit_xcache_width(); rot++) {
+        g_jit_xrot = rot;
+        for (const Case &c : cases) {
+            unsigned long rs = 0;
+            const std::string got = go(c.src, true, &rs);
+            const std::string ref = go(c.src, false, nullptr);
+            if (got != ref || ref.empty()) {
+                cout << "  rshare [" << c.name << "] xrot=" << rot
+                     << ": tw=[" << ref << "] vm=[" << got << "]\n";
+                ok = false;
+            }
+            if (c.want != (rs > 0)) {
+                cout << "  rshare [" << c.name << "] xrot=" << rot
+                     << ": seams executed " << rs << ", expected "
+                     << (c.want ? "> 0" : "0") << "\n";
+                ok = false;
+            }
+        }
+    }
+    g_jit_xrot = rot0;
+    return ok;
 #else
     return true;
 #endif
@@ -33200,6 +33350,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: SPILL-homed hot slots past the pin budget - value + reach, "
       "and the homes survive a helper call un-spilled (#96 inc-1)",
       jit_spill_homes },
+    { "jit: LIVE-RANGE reuse - a phase-local counter's register serves "
+      "a later phase across a seam; overlap declines (#96 inc-2)",
+      jit_range_share_test },
     { "jit: adjacent dead-temp FORWARDING hands values in RAX "
       "(lever A; counter + slow-path rejoin)",
       jit_fwd_deadtemp },
