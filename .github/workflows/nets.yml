@@ -1,0 +1,172 @@
+# The NETS lane - the correctness tools that were never wired into CI.
+#
+# Until now CI ran `-rt`, driver_checks.sh and myv_doc_check.py and
+# nothing else, so the project's differential corpus and all four
+# fuzzers only ever ran when someone remembered to run them by hand.
+# That is not theoretical: corpus_diff caught a JIT abort (a mixed-kind
+# call chain tripping jit_ret_audit) that `-rt` passed straight through,
+# and the Net 3 enumeration caught a ref_slots leak that BOTH missed.
+#
+# These are slower than the -rt lanes by design; they run in parallel
+# with them, not in front of them, so a fast `-rt` failure still
+# reports quickly.
+name: Nets
+
+on: [pull_request, push, workflow_dispatch]
+
+jobs:
+  # ---------------------------------------------------------------- #
+  # The engine differential + the no-record tier's nets 2 and 3.
+  # Debug, so ASan + UBSan + VM_HARDENING are all live: the enumeration
+  # deliberately drives exception unwinds through mixed frame kinds,
+  # which is exactly where a sanitizer finding is worth having.
+  # ---------------------------------------------------------------- #
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure
+      run: cmake -E make_directory ${{github.workspace}}/build
+    - name: CMake
+      working-directory: ${{github.workspace}}/build
+      run: cmake -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+           $GITHUB_WORKSPACE
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: cmake --build . -j
+
+    # tree-walker vs the default engine over tests/functional + samples
+    - name: corpus_diff
+      working-directory: ${{github.workspace}}/build
+      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang
+
+    # the same corpus with each JIT lever forced off, one at a time
+    - name: corpus_diff --levers
+      working-directory: ${{github.workspace}}/build
+      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --levers
+
+    # Net 3: every program in a bounded shape space, four engines,
+    # compared byte-for-byte. Depth 3 here (480 programs); the full
+    # depth-4 space (2272) is a manual run.
+    - name: "Net 3: small-scope enumeration (depth 3)"
+      working-directory: ${{github.workspace}}/build
+      run: python3 $GITHUB_WORKSPACE/tests/norec_enum.py ./mylang
+           --depth 3 --reach 0
+
+    # Net 2: force a frame reconstruction at the Nth call event, one
+    # process per N, in shadow AND production.
+    - name: "Net 2: deterministic event sweep"
+      working-directory: ${{github.workspace}}/build
+      run: python3 $GITHUB_WORKSPACE/tests/norec_sweep.py ./mylang
+           --max-events 25
+
+    # random deep-nested programs against a CPython twin, all engines
+    - name: nested_fuzz
+      working-directory: ${{github.workspace}}/build
+      run: python3 $GITHUB_WORKSPACE/tests/nested_fuzz.py
+           --mylang ./mylang --count 250
+
+  # ---------------------------------------------------------------- #
+  # The .myv corruption fuzzer, on BOTH build types on purpose:
+  # CLAUDE.md records that a sanitizer build and an assert-free release
+  # catch DIFFERENT things here - the debug one finds the memory error,
+  # the release one finds the case where a check the debug build relies
+  # on has been compiled away.
+  # ---------------------------------------------------------------- #
+  myv-fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debug-asan
+            flags: "-DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug"
+          - name: release-noassert
+            flags: "-DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release"
+    name: "myv-fuzz (${{ matrix.name }})"
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure
+      run: cmake -E make_directory ${{github.workspace}}/build
+    - name: CMake
+      working-directory: ${{github.workspace}}/build
+      run: cmake ${{ matrix.flags }} $GITHUB_WORKSPACE
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: cmake --build . -j
+
+    - name: myv_fuzz
+      working-directory: ${{github.workspace}}/build
+      run: python3 $GITHUB_WORKSPACE/tests/myv_fuzz.py ./mylang -n 400
+           --save $GITHUB_WORKSPACE/myv-fuzz-bad
+
+    # a finding cannot be regenerated from a seed - an image embeds its
+    # source path - so keep it
+    - name: Upload findings
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: myv-fuzz-bad-${{ matrix.name }}
+        path: myv-fuzz-bad/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # The REPL fuzzer under RECYCLE=1 + ASan, which is the combination
+  # CLAUDE.md names for this: the REPL RETAINS its input ASTs, so it is
+  # where a stale-node identity bug would live, and the recycling
+  # allocator is what makes that class deterministic.
+  # ---------------------------------------------------------------- #
+  repl-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure
+      run: cmake -E make_directory ${{github.workspace}}/build
+    - name: CMake
+      working-directory: ${{github.workspace}}/build
+      run: cmake -DTESTS=1 -DRECYCLE=ON -DVM_HARDENING=ON
+           -DCMAKE_BUILD_TYPE=Debug $GITHUB_WORKSPACE
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: cmake --build . -j
+    - name: repl_fuzz
+      working-directory: ${{github.workspace}}/build
+      run: python3 $GITHUB_WORKSPACE/tests/repl_fuzz.py ./mylang -n 400
+           --save $GITHUB_WORKSPACE/repl-fuzz-bad
+    - name: Upload findings
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: repl-fuzz-bad
+        path: repl-fuzz-bad/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # Net 4: the coverage RATCHET over the no-record tier's walk and
+  # reconstruction surface.
+  #
+  # The floors below are NOT the goal - the goal is 100% (--gate), and
+  # docs/jit-optimizations.md's Net 4 entry records what is still
+  # uncovered and why. They exist so the surface can only improve: a
+  # plain `-rt` alone measures 54.8%/47.0% here, so a change that
+  # stopped the shadow workload from running would fall straight
+  # through these floors even though the absolute target is ahead.
+  # ---------------------------------------------------------------- #
+  coverage-gate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure
+      run: cmake -E make_directory ${{github.workspace}}/build
+    - name: CMake
+      working-directory: ${{github.workspace}}/build
+      run: cmake -DTESTS=1 -DGCOV=1 -DVM_HARDENING=ON
+           -DCMAKE_BUILD_TYPE=Debug $GITHUB_WORKSPACE
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: cmake --build . -j
+    - name: "Net 4: no-record coverage ratchet"
+      run: python3 $GITHUB_WORKSPACE/tests/norec_coverage.py
+           --build-dir ${{github.workspace}}/build --run
+           --min-lines 70 --min-branches 55

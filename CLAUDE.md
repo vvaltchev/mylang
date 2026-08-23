@@ -402,6 +402,27 @@ collision). Three nets now:
   power: it tests a gate's CORRECTNESS independently of its
   PROFITABILITY. `FORCE=flit` is how C4b's "correctness lives in
   emit_call_epilogue, not the gate" claim is checked.
+- **`tests/norec_coverage.py` - the NO-RECORD COVERAGE RATCHET (Net 4,
+  built 2026-08-13).** Reads gcov's JSON from the existing `-DGCOV=1`
+  lane and reports LINE + BRANCH coverage of the tier's walk /
+  reconstruction / verification surface, function by function (the
+  `SCOPE` list in the script — **a function missing from it is
+  silently ungated**, so add yours when you add one). Exemptions live
+  in the SOURCE, as a trailing `/* NOREC-COV-EXEMPT: reason */`, so
+  they cannot rot when line numbers shift and the next editor sees the
+  claim they must keep true; a marker that is no longer needed is
+  reported STALE. gcc's exception edges are excluded by default
+  (`--with-throw` to look).
+  **The number that justifies the whole thing: a plain `./mylang -rt`
+  leaves `norec_walk_chain` at ZERO** — it is gated `!jit_norec_on()`,
+  so the project's primary shadow oracle only runs in SHADOW mode,
+  which `-rt` does not select. `--run` drives a workload that does
+  (corpus_diff `--levers`, Net 3, Net 2, and the deep-switch program),
+  taking the surface from 54.8%/47.0% to 77.4%/62.6%.
+  **The 100% goal (`--gate`) is NOT met** — see the Net 4 entry in
+  `docs/jit-optimizations.md` for what is left and why. CI pins the
+  current floor instead (`--min-lines`/`--min-branches`), so the
+  surface can only improve.
 - **`tests/norec_enum.py` - the EXHAUSTIVE SMALL-SCOPE ENUMERATION
   (Net 3, built 2026-08-13). NOT a fuzzer:** it emits EVERY program in
   a bounded shape space - depth 1-4 x per-level frame kind
@@ -508,6 +529,27 @@ Makefile's `WERROR`. CI (`.github/workflows/`) builds Debug+Release ×
 g+++clang on Linux (plus a `RECYCLE=ON` lane), macOS (with libc++ hardening),
 and Windows, and runs `./mylang -rt` — correctness only, no timing, so the
 lanes carry as many checks as possible.
+
+**THE `Nets` LANE (`.github/workflows/nets.yml`, added 2026-08-13) runs
+everything `-rt` is BLIND TO.** Until it existed CI ran `-rt`,
+`driver_checks.sh` and `myv_doc_check.py` and nothing else — the
+differential corpus and all four fuzzers only ran when someone
+remembered to, by hand. That gap was not theoretical: `corpus_diff`
+catches a JIT abort (a mixed-kind call chain tripping `jit_ret_audit`)
+that `-rt` passes straight through, and the Net 3 enumeration catches a
+`ref_slots` leak that BOTH miss. Four jobs, in parallel with the fast
+lanes so an `-rt` failure still reports quickly:
+- **differential** (Debug, ASan+UBSan+hardening): `corpus_diff.sh`
+  plain AND `--levers`, `norec_enum.py --depth 3`,
+  `norec_sweep.py`, `nested_fuzz.py`;
+- **myv-fuzz** on BOTH a Debug/ASan and an `ASSERTS=OFF` Release build,
+  because those catch different things (a memory error vs. a check the
+  debug build was relying on being compiled away). Findings are
+  uploaded as artifacts — a `.myv` finding cannot be regenerated from
+  a seed, since an image embeds its source path;
+- **repl-fuzz** under `RECYCLE=ON` + ASan, the combination this file
+  names for the REPL's retained-AST/stale-node class;
+- **coverage-gate** — Net 4's ratchet (below).
 
 Running scripts:
 ```

@@ -1,0 +1,23 @@
+# Recursion deep enough to cross the JIT's SYNC DEPTH CAP, which is what
+# drives the -3/switch materializer (design 4d): at each switch the flat
+# push happens and the -3 propagation unwinds every native frame in the
+# topmost segment, after which each frame's RECORD is its only resume
+# vehicle - so record-less frames must have records INSERTED for them.
+#
+# In shadow mode (MYLANG_JIT_OFF=norec) the same switches drive
+# norec_materialize_shadow, which reconstructs every field that insert
+# will bake and compares it against the records while they still exist.
+# That function sat at 7% coverage until this program existed: nothing
+# else in the corpus recurses past the cap (32 in the sanitizer lanes).
+#
+# Mutual recursion, and a loop, for the reasons 09_norec_deep_calls
+# documents - a direct self-call is sync-emitted only when the native
+# stack is armed, and a first descent is all new record-stack peaks.
+
+func ev(int n) { if (n == 0) { return 0; } var r = od(n - 1); return r + 1; }
+func od(int n) { if (n == 0) { return 0; } var r = ev(n - 1); return r + 1; }
+
+var t = 0;
+for (var k = 0; k < 3; k++)
+    t += ev(runtime(220));
+print("deep switch:", t);

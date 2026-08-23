@@ -264,11 +264,20 @@ as a problem".
     stack, and a reconstruction spanning both. Two entries in the
     plan's own sabotage matrix name Net 3 as their only catcher
     ("interleave ignores the SP bound", "caller_captures pop skipped").
-  - **Net 4 - OPEN**: the GCOV coverage gate. The lane exists
-    (`-DGCOV=ON`); the gate script does not. 100% line + branch over
-    the walk/reconstruction code only, an uncovered branch either
-    covered or listed with a written reason, never silently exempt.
-    The plan sequenced this to GATE the step that shipped.
+  - **Net 4 - BUILT as a RATCHET (2026-08-13), 100% NOT reached**:
+    `tests/norec_coverage.py` measures line+branch coverage of the
+    walk/reconstruction surface per function and is wired into the new
+    `Nets` CI lane with a floor. It found that a plain `-rt` leaves
+    `norec_walk_chain` at ZERO; the shadow workload plus two new
+    corpus programs took the surface from 54.8%/47.0% to 77.4%/62.6%.
+    **STILL OPEN**: the ~335 residual lines/branches, dominated by
+    abort arms and loop backstops, plus two runtime coincidences the
+    plan enumerated and the corpus still does not build - a call
+    exactly at a `SEG_SLOTS` boundary, and a reconstruction spanning
+    a boundary AND a native-stack growth. Marking them wholesale would
+    be the "silently exempt" failure the design forbids, so the floor
+    holds the line until they are genuinely covered. Detail:
+    `docs/jit-optimizations.md`'s Net 4 entry.
 - **A `.myv` agreement lane** (`archived/myv-serializer.md`, S5's
   fourth lane, never built): `nested_fuzz.py --myv` (compile -> file ->
   load -> run as a fourth agreement engine) plus a CI round-trip step.

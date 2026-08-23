@@ -3864,3 +3864,70 @@ corpus_diff catches it too (sabotaged: exit 1, 17/18) - a cheap pin for
 a shape that took an exhaustive search to find.
 
 STILL OPEN from the plan's testing arc: Net 4, the GCOV coverage gate.
+
+---
+
+## NET 4 - the COVERAGE RATCHET for the no-record tier (2026-08-13)
+
+The last of the tier's unbuilt nets. `tests/norec_coverage.py` reads
+gcov's JSON from the existing `-DGCOV=1` lane and reports LINE and
+BRANCH coverage of the walk / reconstruction / verification surface,
+per function, against the `SCOPE` list in the script.
+
+THE FINDING THAT JUSTIFIES IT. A plain `./mylang -rt` leaves
+`norec_walk_chain` at **0% - never executed**. It is gated
+`!jit_norec_on()`, so the project's primary shadow oracle runs only in
+SHADOW mode, which `-rt` does not select. The whole scoped surface
+measured **54.8% lines / 47.0% branches** from `-rt` alone.
+
+WHAT MOVED IT. `--run` drives a workload that reaches those paths -
+`-rt`, `corpus_diff` plain AND `--levers` (which includes
+`MYLANG_JIT_OFF=norec`), the Net 3 enumeration and the Net 2 sweep
+(both run shadow beside production) - plus two new corpus programs
+written for coverage the corpus did not have:
+
+  tests/functional/12_deep_switch.my   recursion past the SYNC DEPTH CAP,
+                                       the only thing that drives the
+                                       -3/switch materializer
+
+That one alone took `norec_materialize_shadow` from **7.2% to 66.7%**
+lines and `norec_switch_retarget` to 98.3%: nothing else in the corpus
+recursed past the cap (32 in the sanitizer lanes). Totals now
+**77.4% lines / 62.6% branches**.
+
+    norec_walk_chain           0.0% ->  71.1% lines,  50.0% branches
+    norec_materialize_shadow   7.2% ->  66.7% lines,  52.5% branches
+    norec_recon_probe         39.0% ->  71.4% lines,  58.3% branches
+    jit_norec_push_verify     46.4% ->  60.9% lines,  57.0% branches
+
+EXEMPTIONS LIVE IN THE SOURCE, as a trailing
+`/* NOREC-COV-EXEMPT: reason */`. Keeping them beside the code means
+they cannot rot when line numbers shift, and the next person to edit
+the line sees the claim they have to keep true. A marker that is no
+longer needed is reported STALE, so the list cannot quietly accumulate.
+gcc's exception edges are excluded by default: it emits one on every
+call that can unwind, and counting them would make the target
+unreachable for reasons that have nothing to do with testing.
+
+**THE 100% GOAL IS NOT MET, and this is the honest accounting.** ~335
+scoped lines/branches remain uncovered. They are dominated by:
+ - `norec_fail`'s ABORT arms and the `ML_VM_CHECK` failure edges - by
+   construction only reachable by crashing the process;
+ - loop backstops like `if (guard > 100000)`, which exist precisely so
+   that a corrupted chain terminates and which no correct run takes;
+ - paths needing a runtime coincidence the corpus does not yet build
+   (a call exactly at a `SEG_SLOTS` boundary; a reconstruction spanning
+   a segment boundary AND a native-stack growth - two of the three
+   cases the plan enumerated explicitly as not covered by the depth
+   bound).
+Marking 335 items would be the "silently exempt" failure the design
+forbids - a marker with a hand-waved reason is worse than no marker -
+so instead CI pins the CURRENT floor (`--min-lines 70
+--min-branches 55`) and the absolute target stays tracked work. The
+floor is well above the `-rt`-only 54.8/47.0, so a change that stops
+the shadow workload running fails the gate immediately.
+
+REMAINING, in the order that would pay: cover the two enumerated
+boundary cases (a call at a segment boundary, and a reconstruction
+spanning a boundary plus stack growth); then annotate the abort arms,
+which is mechanical once the reachable set is genuinely exhausted.
