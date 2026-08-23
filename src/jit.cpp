@@ -3495,8 +3495,30 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.patch32_here(j_norec_join);
     st(R8R, static_cast<int32_t>(P.act_vframe + P.frame_slots), RDX);
     st32(R8R, static_cast<int32_t>(P.act_vframe + P.frame_size), RSI);
+    /*
+     * container / container_idx / is_const / borrowed = 0, for every
+     * argument slot.
+     *
+     * ⛔ THIS MUST RUN BEFORE THE COPY LOOP, not after it (#94). The
+     * qword at +40 covers container_idx AND both flag bytes, so zeroing
+     * it after the binds would wipe the `borrowed` flag the reference arm
+     * has just set - and a borrowed slot that reads as un-borrowed is
+     * released at the frame pop, decrementing a count it never took. A
+     * use-after-free, from a store that looks like tidy-up. The slot is
+     * dead memory here either way (the window was pushed above), and both
+     * bind arms write these fields themselves, so moving it up is
+     * otherwise a no-op.
+     */
+    if (NARGS) {                       /* the zeroing constant, if anyone
+                                        * zeroes: a 0-arg callee had it dead */
+        e.u8(0x45); e.u8(0x31); e.u8(0xDB);           /* xor r11d, r11d */
+        for (int i = 0; i < NARGS; i++) {
+            st(RDX, i * 48 + 32, R11);
+            st(RDX, i * 48 + 40, R11);
+        }
+    }
     /* fast_bind arg copies (unrolled; trivial payloads - guarded above):
-     * 24B payload + 8B type copied, container/idx/flags zeroed */
+     * 24B payload + 8B type copied */
     for (int i = 0; i < NARGS; i++) {
         /* #162: a fused argument's bytes come from the CALLER'S slot -
          * the staging MoveV that would have copied them here was never
@@ -3540,20 +3562,28 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.u8(0x48); e.u8(0x83); e.u8(0xEC); e.u8(0x08);   /* sub rsp,8 (pad) */
         modrm(0x8D, RSI, RBX, s, true);               /* rsi = &src (arg 2) */
         modrm(0x8D, RDI, RDX, d, true);               /* rdi = &dst (arg 1) */
+        /*
+         * arg 3 = #94's `can_borrow`: bit i of the CALLEE's
+         * noescape_params. The callee here is an inline CACHE, so the bit
+         * cannot be baked - it is loaded from the descriptor spill, which
+         * sits at [rsp+32] behind this arm's three pushes and its pad.
+         * Four instructions on a path that is already a call.
+         */
+        /* mov rax, [rsp+32] - the modrm helper above deliberately cannot
+         * encode an rsp base (it needs a SIB byte), so spell it out. */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x44); e.u8(0x24); e.u8(0x20);
+        ld(RDX, RAX, static_cast<int32_t>(P.desc_noescape));
+        if (i) {                                      /* shr rdx, i */
+            e.u8(0x48); e.u8(0xC1); e.u8(0xEA);
+            e.u8(static_cast<uint8_t>(i));
+        }
+        e.u8(0x48); e.u8(0x83); e.u8(0xE2); e.u8(0x01);   /* and rdx, 1 */
         e.movabs(RAX, reinterpret_cast<uint64_t>(&jit_bind_ref_arg));
         e.call_rax();
         e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08);   /* add rsp,8 (pad) */
         e.pop_reg(RDX);
         e.pop_reg(R9R); e.pop_reg(RCX);
         e.patch32_here(j_done);
-    }
-    if (NARGS) {                       /* the zeroing constant, if anyone
-                                        * zeroes: a 0-arg callee had it dead */
-        e.u8(0x45); e.u8(0x31); e.u8(0xDB);           /* xor r11d, r11d */
-        for (int i = 0; i < NARGS; i++) {
-            st(RDX, i * 48 + 32, R11);
-            st(RDX, i * 48 + 40, R11);
-        }
     }
     /* ctx.captures = &fo.capture_slots; restore the spills */
     e.pop_reg(RAX);                                   /* desc (done) */
@@ -5369,6 +5399,13 @@ void jit_stats_report()
         { "bind_coerce",      &g_jit_bind_coerce },
         { "bind_widen",       &g_jit_bind_widen },
         { "ref_arg_binds",    &g_jit_ref_arg_binds },
+        /* #94: the BORROW - a reference argument bound with no retain
+         * (arg_borrow) vs one the analysis cleared whose value turned
+         * out to be a slice (arg_borrow_slice, the one dynamic
+         * decline). Two counters so "the tier ran" and "the tier was
+         * reachable but every value declined" cannot be confused. */
+        { "arg_borrow",       &g_arg_borrow },
+        { "arg_borrow_slice", &g_arg_borrow_slice },
         { "ret_inline",       &g_jit_ret_inline },
         { "entry_resume",     &g_jit_entry_resume },
         /* G1 no-record tier step 1 (the shadow-verified side table) */
