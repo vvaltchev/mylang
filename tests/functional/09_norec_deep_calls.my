@@ -1,0 +1,65 @@
+# The G1 no-record call tier's RECONSTRUCTION shapes: a deep chain of
+# emitted sync calls, and the same chain unwound by a throw.
+#
+# Two shape-eaters have to be defeated for the emitted inline push to
+# happen at all (both documented in jit_norec_shadow, src/tests.cpp):
+#   - a FIRST descent is all new record-stack peaks, and the record-reuse
+#     guard declines every level of it, so a single deep call yields ZERO
+#     inline pushes however deep it goes - hence the outer loop, whose
+#     later iterations reuse the grown stack;
+#   - direct SELF-recursion is sync-emitted only when the native stack is
+#     armed, which the ASan lane is not - hence MUTUAL recursion, which is
+#     eligible unconditionally.
+# Depth stays under the unarmed cap of 32.
+#
+# This file exists mainly so tests/norec_sweep.py (Net 2) has a case that
+# actually reconstructs a TALL chain: without it the default corpus tops
+# out at a handful of frames, and a sweep that only ever walks 1-2 levels
+# proves very little.
+
+func ev(int n) {
+    if (n == 0) { return 0; }
+    var r = od(n - 1);
+    return r + 1;
+}
+
+func od(int n) {
+    if (n == 0) { return 0; }
+    var r = ev(n - 1);
+    return r + 1;
+}
+
+var t = 0;
+for (var k = 0; k < 4; k++)
+    t += ev(runtime(24));
+print("depth:", t);
+
+# the same chain, unwound by an exception: the reconstruction path that
+# actually runs in production (a backtrace frame per level)
+struct Deep { int at; }
+
+# the `n < 0` arm is never taken; it exists so the pair has a
+# value-returning path and infers `int` instead of `none` (without it
+# the only exit is the throw, and `r + 1` below is a NullabilityEx)
+func down(int n) {
+    if (n == 0) { throw Deep(7); }
+    if (n < 0) { return 0; }
+    var r = up(n - 1);
+    return r;
+}
+
+func up(int n) {
+    var r = down(n);
+    return r + 1;
+}
+
+var caught = 0;
+for (var j = 0; j < 4; j++) {
+    try {
+        var z = down(runtime(12));
+        caught += z;
+    } catch (Deep as e) {
+        caught += e.at;
+    }
+}
+print("unwound:", caught);

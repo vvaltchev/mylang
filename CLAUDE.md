@@ -382,6 +382,28 @@ collision). Three nets now:
   power: it tests a gate's CORRECTNESS independently of its
   PROFITABILITY. `FORCE=flit` is how C4b's "correctness lives in
   emit_call_epilogue, not the gate" claim is checked.
+- **`MYLANG_RECON_AT=N` + `tests/norec_sweep.py` - the NO-RECORD
+  tier's DETERMINISTIC EVENT SWEEP (Net 2, built 2026-08-13).** The
+  G1 tier does not write a call record it can REBUILD later, and the
+  rebuild runs only where an exception happens to fall - so its
+  correctness was tested wherever a corpus throws, and nowhere else.
+  `MYLANG_RECON_AT=N` forces a reconstruction at the Nth CALL EVENT
+  instead; the driver walks N over a program's whole event count, one
+  process per N, in BOTH `MYLANG_JIT_OFF=norec` (records still
+  written, so the rebuild is compared field-for-field - the oracle)
+  and the shipping config (record-less, where only the record-free
+  half can be asserted, but which is the mode that ships AND the only
+  mode that walks the real mixed chain - note the Net 1 walk is gated
+  `!jit_norec_on()`, so nothing else traverses it there). Every sweep
+  run's stdout/exit must match a probe-free baseline, so a probe that
+  PERTURBS a program fails too. **Why it earns its keep, watched
+  failing:** corrupting the emitted push's `seg_top_before` store by
+  one leaves `-rt` GREEN at 1907/1907, `corpus_diff` green, and the
+  program printing the right answer, while the sweep fails at N=1 -
+  the slot stack leaks a slot per call and nothing else in the tree
+  looks. The in-suite seed is the `Net 2` `-rt` entry (a few forced
+  events, asserting frames were actually walked); the full sweep is
+  the script, ~5.5 min over the default corpus.
 A fourth - forcing a guarded tier's DECLINE arm so a rare cold path
 becomes the only path (the RECYCLE=1 philosophy for the JIT) - is
 DESIGNED and NOT BUILT: a first attempt overrode the SHARED
