@@ -5,14 +5,14 @@
 # its floors in the same commit; the gate fails on ANY drift in either
 # direction, so progress is monotonic and slippage is loud.
 # RAWENC = hand-encoded instruction lines (the census blind spot).
-RAX    470
-RCX    88
-RDX    55
+RAX    456
+RCX    85
+RDX    11
 RSI     0
 RDI     0
-R8      10
+R8      0
 R9      0
 R10     0
 R11     0
-TOTAL 623
+TOTAL 552
 RAWENC  17

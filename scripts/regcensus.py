@@ -286,7 +286,8 @@ def census(path):
     fn_region_line = 0
     fn_region_hits = 0
     ALLOC_API = re.compile(r'\balloc_scratch\s*\(|\.take\s*\(|'
-                           r'\btake\s*\(|\bfree_scratch\s*\(')
+                           r'\btake\s*\(|\btake_fixed\s*\(|'
+                           r'\bfree_scratch\s*\(')
     in_reg_enum = False
     for i, l in enumerate(lines):
         if 'enum Reg' in l:
