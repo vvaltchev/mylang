@@ -417,9 +417,23 @@ FOUNDATIONS ALREADY IN PLACE (why this is feasible):
  - per-pc entry stubs (M5b/c) already exist - the constraint they
    impose is listed below, not discovered later.
 
-### D0. Baselines and the pressure corpus
- - Ir + wall baselines per RULE B1 over bench/ (the 80..85 regs
-   family IS the pressure corpus); keep the numbers in the ledger.
+### D0. Baselines and the pressure corpus  [CAPTURED 2026-08-22]
+ - THE Ir LEDGER (callgrind, OPT=1 ASSERTS=0 LTO=1, scale 1, sha
+   039a30c - build build-claude/perf per RULE B1). Ir is the
+   cross-session-comparable metric; the wall-clock A/B at D's end
+   must be INTERLEAVED against a baseline binary rebuilt from THIS
+   sha (cur/base is the only trustworthy wall number):
+     80_regs_int_08   126,250,368
+     81_regs_int_14   206,762,340
+     82_regs_int_25   354,124,582
+     83_regs_int_40   555,077,368
+     84_regs_ref_08   320,208,064
+     85_regs_ref_25   961,417,427
+     46_matrix_mult    87,930,309
+     55_float_sum     114,847,876
+     04_float_arith    32,088,245
+     01_while_loop     24,315,122
+     07_nested_loops   42,586,938
 
 ### D1. Live intervals
  - Per run, from livein/liveout: per-slot interval lists WITH HOLES
