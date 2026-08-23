@@ -7661,3 +7661,63 @@ substitution (ties that broke to rsi now break to rdx - counts equal
 program by program); 43_sieve drops SIX instructions (rdx pinning
 gained it a register). -rt 1946/1946 both arenas; corpus + xrot
 green; gate at zero floors.
+
+## Endgame B1 (2026-08-22) - the type-singleton holders become
+## MODEL-OWNED, RUN-SCOPED GRANTS; jit_xcache_busy is deleted
+
+The last static pool exclusions - rsi always, r8 via the
+run_needs_float_tag opcode scan, both only off-arena where a Type
+tag does not encode as an imm32 - stopped being a convention
+re-derived at every consumer and became ONE recorded decision:
+`Emitter::grant_tag_regs(float_live)` runs once per run BEFORE the
+budget and the pick, records the holders (tag_int_reg/tag_float_reg,
+still the conventional rsi/r8 for byte identity - Phase D assigns
+them like any interval) plus a `tag_granted` mask, and the mask is
+claimed as **ra.busy** - the reservation IS the allocator's
+occupancy, so the pick, the element-tier reservation, the pool
+budget and every scratch ask all refuse the holders from the same
+fact. `check_pins_are_busy()` now ML_CHECKs the grant survived every
+allocator reset, at every allocation seam.
+
+THE SEAM HARDENED WITH IT: store_type_tag / cmp_reg_tag /
+cmp_rax_tag LOST their caller-supplied holder parameter - the
+emitter looks the holder up via `tag_holder(tag)`, which ML_CHECKs
+the grant was actually taken. The old parameter was a promise a
+caller could break silently, and one DID: store_dst_bool passed a
+register that held no tag and shipped a wrong answer (the
+store_type_tag_via record). That bug class is an emit-time abort
+now. ~25 call sites dropped their literal RSI/8 argument; the
+write-only float_tag_live field is deleted (the grant carries the
+decision); elem_reg_usable_nopin consults the grant mask instead of
+re-deriving the imm tests; run_needs_float_tag survives solely as
+the grant's input (still fail-safe: an unknown op keeps the tag).
+
+TWO LESSONS PRESERVED from the deleted jit_xcache_busy, both blocks
+against naive pool widening: r8 is ALSO SysV arg 5 + raw scratch
+inside call brackets - freeing it from the TAG was necessary, never
+sufficient (four float tests failed when tried early); and rcx is
+ISA-fixed by the variable-count shifts - the RR shift emitters evict
+a pinned rcx through the conflict seam (WATCHED 2026-08-20: a
+runtime shift count clobbered a pinned rcx at every rotation until
+the tracker named it).
+
+AND A LATENT HAZARD CLOSED: the cache-barrier path did
+`clear_cache_state(); e.ra = RegAlloc()` - the second reset wiped
+`denied` (and would have wiped the grant), so ONLY the barrier'd
+op's emission saw an empty denied set: a scratch ask inside it could
+take a register the whole run was told not to spend (a live hoist's
+r10, a withheld reservation). The redundant reset is deleted;
+clear_cache_state keeps `denied` per its own documented contract and
+now keeps the grant too (`ra.busy = tag_granted`).
+
+MEASURED: 115/116 byte-identical ON AND OFF the arena - the
+conversion itself is exact. The single drift is the barrier fix, not
+the grants: 73_multi_unpack's raise-path loc stamp after a barrier'd
+MultiUnpackV now draws its scratch with the run's denied set visible
+(rcx withheld there), landing on r10 instead of rcx - 4 instructions,
+pure substitution, counts equal. -rt 1946/1946 x both arenas x
+gcc+clang; TESTS=1 OPT=1 ASSERTS=0 -rt green both arenas; corpus
+plain/nolowmem/xrot(both arenas) green; census gate at zero floors -
+where it also caught cmp_rax_tag's callers losing their justifying
+tags (the register lives in the METHOD NAME, the sixth audit-table
+shape, seen by the accessor-derived scan).

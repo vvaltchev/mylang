@@ -799,8 +799,10 @@ collision). Three nets now:
   loop" and "may pin a caller-saved register" were mutually exclusive,
   0 of 20 hoist runs corpus-wide having a register left. Each
   contributor now names its own: hoist -> {r10,r11}, a MyLang call ->
-  the whole pool, a type singleton still in a register -> that
-  register), `all`.
+  the whole pool; a type singleton still in a register is a B1 GRANT
+  claimed as ra.busy, not a clobber entry - Emitter::grant_tag_regs
+  decides it once per run and tag_holder() is the one query),
+  `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the

@@ -39,6 +39,8 @@ STATUS LEDGER (update as steps land):
     (jit_xcache_busy): rsi excluded from the xcache pool
     UNCONDITIONALLY (it may carry the t_int singleton off-arena), r8
     excluded by another run-scanning opcode gate (t_float). Phase B.
+    [DONE 2026-08-22: jit_xcache_busy deleted; grant_tag_regs +
+    tag_holder(); see B1 below]
  3. THE FWD BUS RESIDUE: g_fwd.res_reg defaults to rax (the tagged
     conv line); a pin-producing op pays `mov rax, r14` to put its
     value on the bus instead of DECLARING r14; lever A's pairing
@@ -201,24 +203,35 @@ alive behind the deleted gates' semantics until D. Prefer (O).
 ---------------------------------------------------------------------
 ## PHASE B - THE SAME-KIND SWEEP
 
-### B1. The rsi/r8 type-singleton reservations
- - Today (off-arena only): fragment entry + every call epilogue
-   re-materialize t_int in rsi, t_float in r8; cmp_reg_tag /
-   store_type_tag take the holder as an argument at each site; the
-   POOL statically excludes rsi always and r8 via
-   run_needs_float_tag (another opcode scan).
- - Conversion: the singleton holders become MODEL-OWNED, RUN-SCOPED
-   GRANTS: at fragment entry, if the run is off-arena, take two
-   registers (prefer rsi/r8 for byte identity) and record them in
-   the Emitter (e.tag_reg(t_int) / e.tag_reg(t_float) queries);
-   every site that passes literal RSI/R8/8 consults the query
-   instead. The reservation then IS ra.busy - delete
-   run_needs_float_tag and the unconditional rsi exclusion.
- - On the ARENA (the shipping config) nothing is materialized and
-   the grants are never taken - the pool gains rsi/r8 there, which
-   is the actual payoff.
- - Oracle: the nolowmem lane is THE net for the off-arena half
-   (vacuity-guarded both directions already).
+### B1. The rsi/r8 type-singleton reservations  [LANDED 2026-08-22]
+RESULT: jit_xcache_busy DELETED (the last static pool exclusions);
+Emitter::grant_tag_regs decides the holders once per run, claims
+them as ra.busy before the budget + pick, and store_type_tag /
+cmp_reg_tag / cmp_rax_tag LOST their caller-supplied holder
+parameter - tag_holder(tag) is the one query, ML_CHECKed against
+the recorded grant (the store_dst_bool bug class is an emit-time
+abort now). float_tag_live deleted (write-only after this);
+elem_reg_usable_nopin consults the grant mask;
+check_pins_are_busy() enforces "the reservation IS ra.busy" at
+every allocation seam. run_needs_float_tag SURVIVES as the grant's
+fail-safe input only. A latent hazard closed with it: the barrier's
+redundant `e.ra = RegAlloc()` wiped `denied` for exactly the
+barrier'd op's emission - deleted; clear_cache_state keeps denied
+AND the grant. MEASURED: 115/116 byte-identical on AND off the
+arena (the one drift IS the barrier fix: 73_multi_unpack's
+raise-path scratch, rcx->r10, counts equal). NOTE the "pool gains
+rsi/r8 on-arena" payoff predicted here was ALREADY the shipped
+state - the old exclusions were `!imm`-gated - so B1 is structure,
+not registers. Holders still land on rsi/r8 by construction (the
+grant precedes the pick); arbitrary placement arrives with D.
+
+ - Original design (kept for context): the singleton holders become
+   MODEL-OWNED, RUN-SCOPED GRANTS recorded in the Emitter; every
+   site that passed literal RSI/R8/8 consults the query; the
+   reservation IS ra.busy; delete run_needs_float_tag's pool role
+   and the unconditional rsi exclusion.
+ - Oracle: the nolowmem lane + off-arena vdjcmp/xrot (all run,
+   all green).
 
 ### B2. The fwd bus declares instead of moving  [LANDED 2026-08-22]
 RESULT, measured honestly: pure mov MIGRATION, zero net Ir - the

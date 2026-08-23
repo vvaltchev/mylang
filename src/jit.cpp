@@ -2263,15 +2263,13 @@ struct Emitter {
      * already this task.
      */
     /*
-     * ⛔ `held_reg` MUST ALREADY HOLD `tag`. Only two singletons are
-     * ever materialised into a register - t_int in rsi and t_float in
-     * r8, by emit_type_tags at every fragment entry and by
-     * emit_call_epilogue after every helper call - so only those two
-     * may be written this way. The ML_CHECK is not ceremony: this
-     * parameter is a PROMISE the caller can break SILENTLY, and one
-     * did (see store_type_tag_via below).
+     * B1: the fallback register is the MODEL'S answer (tag_holder),
+     * never a caller-named one. The old `held_reg` parameter was a
+     * PROMISE the caller could break silently, and one did (see
+     * store_type_tag_via below); now the emitter looks up the run's
+     * recorded grant and ML_CHECKs it was actually taken.
      */
-    void store_type_tag(int32_t disp, const void *tag, uint8_t held_reg)
+    void store_type_tag(int32_t disp, const void *tag)
     {
         if (ml_lowmem_fits_imm32(tag)) {
             store_imm64_as_imm32(
@@ -2279,11 +2277,7 @@ struct Emitter {
                           reinterpret_cast<uintptr_t>(tag)));
             return;
         }
-        ML_CHECK_MSG(tag == jit_layout().t_int
-                     || tag == jit_layout().t_float,
-                     "store_type_tag: no register holds this tag - use "
-                     "store_type_tag_via");
-        store(held_reg, disp);
+        store(tag_holder(tag), disp);
     }
     /*
      * The form for a tag NOTHING holds: imm32 when it fits, else BUILD
@@ -2347,7 +2341,7 @@ struct Emitter {
                                           * feeds trk_push (see its ⛔) */
         trk_flushdirty = 0;
         for (const CacheEnt &c : cache) {
-            store_type_tag(c.type, jit_layout().t_int, 6);
+            store_type_tag(c.type, jit_layout().t_int);
             store(c.reg, c.payload);
         }
         /* the float pins: t_float rides in r8, which is live in any
@@ -2355,14 +2349,13 @@ struct Emitter {
          * so run_has_float set it at entry and every helper-call
          * epilogue re-materialises it) */
         for (const CacheEnt &c : fcache) {
-            store_type_tag(c.type, jit_layout().t_float, 8);
+            store_type_tag(c.type, jit_layout().t_float);
             fstore(c.reg, c.payload);
         }
         for (const TypedEnt &t : tflush)
             store_type_tag(t.type,
                            t.flt ? jit_layout().t_float
-                                 : jit_layout().t_int,
-                           t.flt ? 8 : 6);   /* C3: restore the singleton */
+                                 : jit_layout().t_int);  /* C3 */
         /*
          * #96 inc-1: the spill-homed slots, shuttled through RAX -
          * WRAPPED in push/pop, because the flush runs inside the
@@ -2377,7 +2370,7 @@ struct Emitter {
         if (!scache.empty()) {
             push_reg(0 /* rax */);
             for (const SpillEnt &c : scache) {
-                store_type_tag(c.type, jit_layout().t_int, 6);
+                store_type_tag(c.type, jit_layout().t_int);
                 reload(0 /* rax */, c.k);
                 store(0 /* rax */, c.payload);
             }
@@ -2447,15 +2440,54 @@ struct Emitter {
      * the N5 cache registers. Set once at the entry, replayed in reverse
      * at every exit. Empty for a fragment that caches nothing. */
     /*
-     * #96: does THIS fragment still need the t_float singleton in r8?
-     * frag_entry materialises it only when `run_has_float`, and
-     * emit_call_epilogue used to re-materialise it UNCONDITIONALLY at
-     * every helper call - 106 `movabs r8` on 09_fib_recursive, which
-     * has no float arithmetic at all, for a constant nothing reads.
-     * Same flag, both places, so the entry and the re-materialisation
-     * can no longer disagree.
+     * B1 (plans/register-allocator-endgame.md): THE TYPE-SINGLETON
+     * HOLDER GRANTS. Off-arena a run holds t_int (and, when the run
+     * needs it, t_float) in a register between helper calls;
+     * those holders are now RECORDED MODEL STATE, decided once per
+     * run by grant_tag_regs() and claimed as ra.busy - not a
+     * convention re-derived at every consumer, and not a static
+     * jit_xcache_busy exclusion. tag_holder(tag) is the one query;
+     * a consumer naming the register by hand is the store_dst_bool
+     * bug class. The CHOICE is still the conventional rsi/r8 pair
+     * (kept for byte identity - rsi/r8 have essentially no raw-
+     * scratch uses outside call brackets, which is what made them
+     * the convention); Phase D assigns holders like any interval.
+     * On the arena both tags are imm32, nothing is granted, and
+     * rsi/r8 stay ordinary pool members - unchanged.
      */
-    bool float_tag_live = false;
+    uint8_t tag_int_reg = RSI;                   /* reg:conv */
+    uint8_t tag_float_reg = R8;                   /* reg:conv */
+    uint32_t tag_granted = 0;   /* mask of holders actually taken */
+
+    /* Decide this run's grants. Pure decision - the caller applies
+     * it to a (fresh) allocator with `ra.busy |= tag_granted`, so
+     * the pool budget, the pick, the element-tier reservation and
+     * every scratch ask all see the SAME claim. */
+    uint32_t grant_tag_regs(bool float_live)
+    {
+        tag_granted = 0;
+        if (!ml_lowmem_fits_imm32(jit_layout().t_int))
+            tag_granted |= 1u << tag_int_reg;
+        if (float_live && !ml_lowmem_fits_imm32(jit_layout().t_float))
+            tag_granted |= 1u << tag_float_reg;
+        return tag_granted;
+    }
+    /* Which register holds `tag` THIS run? ML_CHECKs the grant was
+     * actually taken - a tag store/compare through a register the
+     * run never materialised is exactly how store_dst_bool shipped
+     * a wrong answer (see store_type_tag_via), caught at emit time
+     * now instead of at a user's crash. */
+    uint8_t tag_holder(const void *tag) const
+    {
+        const uint8_t r = tag == jit_layout().t_int ? tag_int_reg
+                                                    : tag_float_reg;
+        ML_CHECK_MSG((tag == jit_layout().t_int
+                      || tag == jit_layout().t_float)
+                         && (tag_granted & (1u << r)),
+                     "tag_holder: no grant holds this tag - use the "
+                     "_via form for a tag nothing materialises");
+        return r;
+    }
 
     /* Is `r` currently holding a PINNED SLOT rather than being free
      * scratch or a singleton? A re-materialisation must never write
@@ -2844,9 +2876,12 @@ struct Emitter {
         fcache.clear();
         tflush.clear();
         scache.clear();
-        /* the OCCUPANCY goes with them; `denied` does NOT - it is a
-         * property of the whole run, not of what is held right now. */
-        ra.busy = 0;
+        /* the PIN occupancy goes with them; `denied` does NOT - it
+         * is a property of the whole run, not of what is held right
+         * now - and neither do the B1 singleton-holder grants: the
+         * tags stay live in their registers across whatever emptied
+         * the cache, so a scratch ask must still be refused them. */
+        ra.busy = tag_granted;
         ML_CHECK_MSG(!cache_live(),
                      "clear_cache_state() left something live: a cache "
                      "vector was added to cache_live() but not here");
@@ -2865,6 +2900,14 @@ struct Emitter {
             ML_CHECK_MSG(ra.busy & (1u << c.reg),
                          "a pinned register is not busy in the "
                          "allocator - cache and RegAlloc have diverged");
+        /* B1: and the singleton-holder grants - "the reservation IS
+         * ra.busy" is a claim, this is its enforcement. An allocator
+         * reset that forgets to re-apply the grant would let a
+         * scratch ask take a live tag holder; caught here, at every
+         * allocation seam, instead of as a garbage type pointer. */
+        ML_CHECK_MSG((ra.busy & tag_granted) == tag_granted,
+                     "a granted tag holder is not busy in the "
+                     "allocator - a reset dropped the B1 grant");
 #endif
     }
     /* "is anything held in a register right now" - asked by the barrier
@@ -3142,7 +3185,6 @@ struct Emitter {
     {
         u8(0x48); u8(0x8B); u8(MODRM_SLOT); u32(uint32_t(d));
     }
-    /* cmp rax, r8 (t_float) / cmp rax, rsi (t_int) */
     /* cmp <dst>, <src>  (GP reg-reg, both 0-15) - the general form the
      * old hand-rolled cmp_rax_r8 / cmp_rax_rsi / cmp_rdx_rsi /
      * cmp_rdx_r8 each spelled out for one fixed pair. */
@@ -3673,14 +3715,12 @@ struct Emitter {
      * an ARGUMENT. A new tag reader that does not come through here is
      * a bug; do not add `cmp_<reg>_<reg>` back.
      */
-    void cmp_reg_tag(uint8_t reg, const void *tag, uint8_t held_reg)
+    void cmp_reg_tag(uint8_t reg, const void *tag)
     {
         if (!ml_lowmem_fits_imm32(tag)) {
-            /* same promise as store_type_tag's, same tripwire */
-            ML_CHECK_MSG(tag == jit_layout().t_int
-                         || tag == jit_layout().t_float,
-                         "cmp_reg_tag: no register holds this tag");
-            cmp_rr(reg, held_reg);
+            /* B1: same seam rule as store_type_tag - the holder is
+             * the model's recorded grant, never a caller's claim */
+            cmp_rr(reg, tag_holder(tag));
             return;
         }
         if (reg == 0) {                  /* rax: the short accumulator form */
@@ -3691,8 +3731,8 @@ struct Emitter {
         }
         u32(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(tag)));
     }
-    void cmp_rax_tag(const void *tag, uint8_t fallback_reg)
-    { cmp_reg_tag(0, tag, fallback_reg); }
+    void cmp_rax_tag(const void *tag)
+    { cmp_reg_tag(0, tag); }
     /*
      * The compare form for a tag NOTHING holds - `t_arr` is the live
      * case - exactly mirroring store_type_tag_via. `scratch` is
@@ -3711,7 +3751,7 @@ struct Emitter {
     void cmp_reg_tag_via(uint8_t reg, const void *tag, uint8_t sc)
     {
         if (ml_lowmem_fits_imm32(tag)) {
-            cmp_reg_tag(reg, tag, sc);
+            cmp_reg_tag(reg, tag);
             return;         /* an imm32 - `sc` is NOT touched */
         }
         /* ⛔ THE CLOBBER IS DECLARED WHERE IT HAPPENS, not by the
@@ -5639,8 +5679,8 @@ static const JitHoist *hoist_match(int base, int kind)
  * head, an interior resume stub, or a container. THREE call sites used
  * to write the `run_has_float` gate by hand and a FOURTH (the helper-
  * call epilogue) omitted it entirely; that is the "an && over a family
- * is an audit table" shape again, so the gate lives here now and the
- * callers only set `float_tag_live`.
+ * is an audit table" shape again. B1: the gate is the run's recorded
+ * GRANT (Emitter::grant_tag_regs), decided once and read everywhere.
  *
  * Callers must invoke this BEFORE loading the pins: r8 is both the
  * t_float singleton AND a pin register, and the pin must win.
@@ -5703,16 +5743,15 @@ static bool jit_tag_is_imm(const void *tag) { return ml_lowmem_fits_imm32(tag); 
 static void emit_type_tags(Emitter &e)
 {
     /* #96 step 3: with the low-address arena in place every tag store
-     * encodes the pointer DIRECTLY, so nothing reads rsi/r8 as a
-     * singleton and materialising them is dead code. Emitted only on
-     * the fallback path (no arena: Darwin, Windows, a failed
-     * MAP_32BIT), where the register form is still what store_type_tag
-     * falls back to. */
-    if (!jit_tag_is_imm(jit_layout().t_int))
-        e.movabs(RSI,                            /* reg:conv */
+     * encodes the pointer DIRECTLY, so no grant is taken and this
+     * emits nothing. Off-arena (Darwin, Windows, a failed MAP_32BIT)
+     * B1's run-scoped grants say which registers hold the tags - the
+     * one decision store_type_tag/cmp_reg_tag fall back to. */
+    if (e.tag_granted & (1u << e.tag_int_reg))
+        e.movabs(e.tag_int_reg,
                  reinterpret_cast<uint64_t>(jit_layout().t_int));
-    if (e.float_tag_live && !jit_tag_is_imm(jit_layout().t_float))
-        e.movabs(R8,                             /* reg:conv */
+    if (e.tag_granted & (1u << e.tag_float_reg))
+        e.movabs(e.tag_float_reg,
                  reinterpret_cast<uint64_t>(jit_layout().t_float));
 }
 
@@ -5739,32 +5778,24 @@ static void emit_call_epilogue(Emitter &e)
      * flit_load clobbering a pinned rcx (see the FLit note below). */
     e.trk_bracket--;
     /*
-     * The two type singletons - compile-time constants held in
-     * CALLER-saved rsi/r8, so re-materialising is cheaper than a
-     * register pair the allocator could otherwise use.
+     * The two type singletons - compile-time constants held in the
+     * CALLER-saved B1 grant holders, so re-materialising is cheaper
+     * than a register pair the allocator could otherwise use.
      *
-     * ⛔ TWO CONDITIONS, both added by #96, both load-bearing:
-     *
-     * (1) NEVER over a PIN. r8 joined the pin pool, so in a float-free
-     *     fragment it may hold a hot LOCAL - and this line would
-     *     overwrite it with a Type pointer. A silent wrong answer, and
-     *     structurally prevented here rather than argued about at the
-     *     call sites (there are 84 of them).
-     *
-     * (2) ONLY IF THE FRAGMENT USES IT. frag_entry materialises r8 only
-     *     under `run_has_float`; this did it unconditionally, so a
-     *     float-free fragment paid one `movabs r8` per helper call for
-     *     a constant nothing reads - 106 of them on 09_fib_recursive,
-     *     102 on 46_matrix_mult. The entry and the re-materialisation
-     *     now read the SAME flag and cannot drift.
+     * B1: the conditions are now the GRANT itself. A granted holder
+     * is ra.busy from before the pin pick, so it can never be a pin
+     * (the old !reg_holds_pin guards - a pin write here would abort
+     * the tracker anyway), and a grant is taken only when this run
+     * materialises the tag (the old float_tag_live/imm gates: entry
+     * and re-materialisation read the SAME recorded decision, so
+     * they cannot drift - a float-free fragment used to pay one
+     * `movabs r8` per helper call, 106 on 09_fib_recursive).
      */
-    if (!jit_tag_is_imm(jit_layout().t_int)
-            && !e.reg_holds_pin(RSI))            /* reg:conv */
-        e.movabs(RSI,                            /* reg:conv */
+    if (e.tag_granted & (1u << e.tag_int_reg))
+        e.movabs(e.tag_int_reg,
                  reinterpret_cast<uint64_t>(jit_layout().t_int));
-    if (e.float_tag_live && !jit_tag_is_imm(jit_layout().t_float)
-            && !e.reg_holds_pin(8))
-        e.movabs(R8,                             /* reg:conv */
+    if (e.tag_granted & (1u << e.tag_float_reg))
+        e.movabs(e.tag_float_reg,
                  reinterpret_cast<uint64_t>(jit_layout().t_float));
     /* C4b: the pinned float LITERALS, same argument - caller-saved and
      * compile-time constant. THIS is where their correctness lives, not
@@ -8116,13 +8147,13 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
          * (reachable only in a rax-pinned run; Phase A) */
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch32_here(jb_fast);              /* fast: */
-        e.store_type_tag(a.type, jit_layout().t_int, RSI);  /* reg:conv */
+        e.store_type_tag(a.type, jit_layout().t_int);
         e.store(src_reg, a.payload);
         e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
     if (!e.telided(dst, /*flt=*/false))
-        e.store_type_tag(a.type, jit_layout().t_int, RSI);  /* reg:conv */
+        e.store_type_tag(a.type, jit_layout().t_int);
     e.store(src_reg, a.payload);
 }
 
@@ -9252,11 +9283,11 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  *
  *   the t_int SINGLETON (12: emit_type_tags, emit_call_epilogue x2,
  *     store_dst x2, emit_float_load, emit_store_elem2_inline x5,
- *     emit_op) - live ONLY off-arena, where jit_xcache_busy above
- *     claims rsi outright. Every one of them reaches rsi through
- *     store_type_tag / cmp_reg_tag / cmp_rax_tag, the seams that take
- *     the register as an ARGUMENT, so the on-arena form is an imm32
- *     that names no register at all;
+ *     emit_op) - live ONLY off-arena, where the B1 grant claims rsi
+ *     as ra.busy before the pick. Every one of them reaches rsi
+ *     through store_type_tag / cmp_reg_tag / cmp_rax_tag, the seams
+ *     that ask tag_holder(), so the on-arena form is an imm32 that
+ *     names no register at all;
  *   RAW SCRATCH (10: emit_sync_push_native x6, emit_sync_call_inline
  *     x3, emit_ret_native) - the same emitters rdi's audit cleared, by
  *     the same gates: jit_run_blocks_xcache denies the whole pool to a
@@ -9661,111 +9692,24 @@ static uint32_t xcache_mask()
  */
 static uint32_t g_jit_pins_denied = 0;
 
-/* Which XCACHE registers this run must NOT spend, because they still
- * hold a type singleton. Empty when both tags encode as imm32. */
-static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
-{
-    uint32_t busy = 0;
-    /*
-     * ⛔ THE TAG IS NOT r8's ONLY JOB, and this is the finding that
-     * stops step 3 here. With the arena the t_float TAG is an
-     * immediate, so r8 looks free in every run - and making it so fails
-     * four float tests. r8 is ALSO SysV argument 5 and raw scratch
-     * (~20 `movabs_r8` sites), and the run_needs_float_tag gate was
-     * quietly doubling as an exclusion for those paths.
-     *
-     * So r8 stays available only where that gate already proved the run
-     * safe. Freeing a register from a CONSTANT was necessary and is not
-     * sufficient: rsi/rax/rcx/rdx/rdi/r8 all need the emitter to
-     * ALLOCATE its scratch before they can be pinned generally.
-     */
-    if (run_needs_float_tag(ck, begin, end)
-            && !jit_tag_is_imm(jit_layout().t_float))
-        busy |= 1u << 8;
-    /*
-     * ⛔ rsi's twin, and it is deliberately UNCONDITIONAL where r8's is
-     * gated - the asymmetry is real, not an oversight.
-     *
-     * `emit_type_tags` materialises t_float into r8 only when
-     * `e.float_tag_live`, but it materialises t_int into rsi for EVERY
-     * fragment entry off-arena: there is no int analogue of that gate,
-     * because the int tag is what the ubiquitous `store_dst` writes.
-     * So off-arena rsi holds the singleton in every run and no run
-     * predicate could make it spendable; asking one would be a
-     * more-precise-looking answer to a question with a blunt answer.
-     *
-     * On-arena the tag is an imm32 and nothing materialises it, which
-     * is what makes rsi a pin candidate at all. Its remaining raw
-     * scratch is confined to the SAME four emitters rdi's audit
-     * enumerated - emit_sync_push_native and emit_sync_call_inline
-     * (jit_run_blocks_xcache denies the whole pool to a run with a
-     * MyLang call), emit_ret_native (flush_cache is its second line),
-     * and emit_op's boxed int-arith arm, whose `movabs rsi, t_int` is
-     * now correctly gated to the fallback path where this line has
-     * already claimed rsi anyway.
-     */
-    if (!jit_tag_is_imm(jit_layout().t_int))
-        busy |= 1u << 6;                     /* rsi holds t_int */
-    /*
-     * ⛔ rdx, AND THE WHITELIST IS WRITTEN IN THE FAIL-SAFE DIRECTION.
-     *
-     * rdx is not a singleton holder - it is raw scratch at ~100
-     * unbracketed sites: the element tiers' COUNT role, `idiv`'s
-     * RDX:RAX dividend (and its remainder), emit_div_magic, UnaryV,
-     * OrdCharV, and the global chain's GlobalFuncTable output. Naming
-     * those ops would be the r9 mistake exactly - an enumeration of
-     * what DOES touch it, where a missing entry is a silent wrong
-     * answer.
-     *
-     * So this asks the question the other way, like
-     * `run_needs_float_tag`: rdx is spendable ONLY if every op in the
-     * run is one positively established never to write it. An
-     * unlisted or brand-new opcode keeps rdx OUT of the pool - it
-     * costs a pin, never an answer.
-     *
-     * The list is the B1/B2 specialized int family plus int loop
-     * control and compares, MINUS IntModRI and IntAddModRI, whose
-     * emit_div_magic needs RDX:RAX. Verified rdx-free for these ops by
-     * reading every shared path they reach: store_dst, write_slot,
-     * load_operand, op_rr, exit_pc, raise_unless, emit_raise,
-     * flush_cache, frag_ret and emit_epilogues.
-     *
-     * Widening it is a measurable optimization and needs the same
-     * argument each of these has: the op's emission, and every emitter
-     * it calls, touches no rdx outside an emit_call_prologue bracket.
-     */
-    /* B2c: the rdx whitelist is deleted - the raw-rdx writers evict
-     * a pinned rdx themselves (the conflict seam) and the retry's
-     * g_jit_pins_denied mask below carries the deny. */
-    /*
-     * ⛔ rcx: ISA-FIXED by the variable-count shifts. `shl/sar rax, cl`
-     * takes its count in cl and nowhere else, and the RR shift
-     * emitters load it with a RAW `read_slot(e, RCX, ...)` outside any
-     * borrow - so a run containing one may not pin rcx. (IntBin's
-     * shift and div arms stage through the hold()/drop() borrow kit
-     * and need no claim; the RI forms encode the count as an
-     * immediate and never touch rcx.)
-     *
-     * WATCHED (2026-08-20): 13 hot int slots plus `sb += sa >> k` with
-     * a RUNTIME count pinned rcx and clobbered it at every rotation -
-     * the tracker abort ("write to a PINNED register", IntShrRR) is
-     * the only reason this was not a silent wrong answer in a release
-     * build. It had been latent since the day rcx was admitted: no
-     * net had the shape, because a write-once count auto-consts into
-     * the RI form (shape-eater #6) - the pinned test's count is
-     * assigned twice for exactly that reason.
-     */
-    /* Phase A/B2c: rax and rcx are OPTIMISTIC - the conflict
-     * eviction + re-emission replace the deleted run_may_pin_rax
-     * whitelist, its coverage gate, AND the per-op rcx shift scan
-     * that used to live here (the RR-shift's raw CL load evicts a
-     * pinned rcx itself now). rdx still has its whitelist
-     * (run_may_pin_rdx) until the raw-rdx-writer sweep - the
-     * element-tier role registers - converts (the plan's B2c note).
-     * The denies exist only on retry attempts. */
-    busy |= g_jit_pins_denied;
-    return busy;
-}
+/*
+ * B1: jit_xcache_busy IS DELETED - the last static pool exclusions
+ * (rsi/r8 while a type singleton lives in them, formerly gated by the
+ * run_needs_float_tag opcode scan) became run-scoped GRANTS the model
+ * owns: Emitter::grant_tag_regs decides them once per run, they are
+ * claimed as ra.busy before the pick, and every consumer (the tag
+ * store/compare seams, emit_type_tags, the call epilogue, the element
+ * tier's usability rule) queries the recorded grant instead of
+ * re-deriving the convention. The retry denies (g_jit_pins_denied)
+ * fold directly into jit_xcache_clobber. Two lessons that block naive
+ * "widen the pool" moves are preserved in docs/jit-optimizations.md's
+ * B1 entry: r8 is ALSO SysV arg 5 + raw scratch inside call brackets
+ * (freeing it from the TAG was necessary, never sufficient), and rcx
+ * is ISA-fixed by the variable-count shifts (the RR shift emitters now
+ * evict a pinned rcx through the conflict seam - WATCHED 2026-08-20:
+ * `sb += sa >> k` with a runtime count clobbered a pinned rcx at every
+ * rotation until the tracker named it).
+ */
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
 /* #96: the TOTAL int pin budget, exported so a coverage test can size
  * its program from it instead of hardcoding a margin. jit_telide_c3
@@ -10051,7 +9995,7 @@ static bool jit_run_blocks_xcache(const Chunk &ck, size_t begin, size_t end)
  */
 static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
                                      size_t end, bool has_hoist,
-                                     uint32_t clob);
+                                     uint32_t clob, uint32_t tag_claimed);
 
 /*
  * #96: WHICH caller-saved pool registers this RUN may not spend - a
@@ -10086,18 +10030,27 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
  *     `jit_assert_no_volatile_pin` is the standing check that this
  *     stays true, and it asserts the strong form (no caller-saved pin
  *     at all), so widening the pool cannot silently outrun this line;
- *   - a type singleton still in a register claims it (jit_xcache_busy);
+ *   - a type singleton still in a register claims it (the B1 grant,
+ *     ra.busy - see Emitter::grant_tag_regs);
  *   - the kill switch claims everything.
  *
  * A NEW pool member is denied by NOTHING here unless a contributor
  * names it, which is the property the boolean could not have.
  */
 static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
-                                   size_t end, bool has_hoist)
+                                   size_t end, bool has_hoist,
+                                   uint32_t tag_claimed)
 {
     if (jit_lever_off(JL_XCACHE))
         return xcache_mask();
-    uint32_t clob = jit_xcache_busy(ck, begin, end);
+    /* Phase A/B2c: rax, rcx and rdx are OPTIMISTIC - the conflict
+     * eviction + re-emission replaced the per-register whitelists,
+     * and the denies exist only on retry attempts (g_jit_pins_denied).
+     * B1: the type-singleton holders stopped being a static exclusion
+     * too - they are run-scoped GRANTS (Emitter::grant_tag_regs),
+     * claimed as ra.busy and passed here as `tag_claimed` only so the
+     * element-tier reservation consults the same decision. */
+    uint32_t clob = g_jit_pins_denied;
     if (has_hoist)
         clob |= HOIST_REGS_MASK;             /* g_hoist.rdata/rcount */
     if (jit_run_blocks_xcache(ck, begin, end))
@@ -10147,7 +10100,8 @@ static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
      * nothing). Reserving for a tier that never appears is exactly the
      * coarseness the boolean `xcache_ok` was replaced for.
      */
-    clob |= elem_scratch_reserve(ck, begin, end, has_hoist, clob);
+    clob |= elem_scratch_reserve(ck, begin, end, has_hoist,
+                                 clob | tag_claimed, tag_claimed);
     return clob;
 }
 
@@ -11111,14 +11065,14 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
     AccScratch acc(e, AccScratch::reuse_t{});
     e.load(acc.r, a.type);                /* the slot's type word */
     /* == t_float ? */
-    e.cmp_reg_tag(acc.r, jit_layout().t_float, 8);
+    e.cmp_reg_tag(acc.r, jit_layout().t_float);
     const size_t j_notf = e.j8(0x75);     /* jne -> not float */
     e.fload(xr, a.payload);               /* FAST: movsd xmm, [payload] */
     const size_t j_done1 = e.j8(0xEB);    /* jmp done */
     e.patch8(j_notf, e.pos());
     if (!no_bail) {
         /* == t_int ? */
-        e.cmp_reg_tag(acc.r, jit_layout().t_int, RSI);  /* reg:conv */
+        e.cmp_reg_tag(acc.r, jit_layout().t_int);
         const size_t j_int = e.j8(0x74);  /* je -> promote */
         e.exit_pc(bail_pc);               /* neither -> bail */
         e.patch8(j_int, e.pos());
@@ -11183,13 +11137,13 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
             e.fload(xr, a.payload);   /* reload into the RESULT register */
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch32_here(jb_fast);              /* fast: */
-        e.store_type_tag(a.type, jit_layout().t_float, 8);
+        e.store_type_tag(a.type, jit_layout().t_float);
         e.fstore(xr, a.payload);
         e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
     if (!e.telided(dst, /*flt=*/true))
-        e.store_type_tag(a.type, jit_layout().t_float, 8);
+        e.store_type_tag(a.type, jit_layout().t_float);
     e.fstore(xr, a.payload);              /* payload = the double */
 }
 
@@ -11675,8 +11629,8 @@ static FOperands emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
 /* N6a: call a libm function `fn` (arg(s) already in xmm0[/xmm1], result
  * comes back in xmm0). The libm double routines are NOEXCEPT (NaN/inf, no
  * throw), so a call from a fragment keeps the never-unwind contract. What
- * the call clobbers that the fragment relies on: rsi (t_int) and r8
- * (t_float) - constant singletons, RE-materialised after. The slots base
+ * the call clobbers that the fragment relies on: the B1 tag holders
+ * (t_int / t_float) - constant singletons, RE-materialised after. The slots base
  * is in rbx, which libm preserves for us. The xmm regs are all caller-
  * saved but the JIT never keeps a float LIVE in a register across ops
  * (floats are slot-backed - only the INT cache uses GP r10/r11, and a
@@ -12145,10 +12099,10 @@ static const uint8_t ELEM_CAND[] =
  * them is visible from `cache`:
  *   - rbx is the frame-slot base for the whole fragment, and rsp/rbp
  *     are the stack;
- *   - rsi and r8 carry the t_int / t_float singletons whenever the
- *     arena did NOT place them low enough to encode as an imm32 (see
- *     emit_type_tags) - the exact pair whose "it is only a constant"
- *     reading cost #96 step 3 four float tests;
+ *   - the B1 grant holders carry the t_int / t_float singletons
+ *     whenever the arena did NOT place them low enough to encode as
+ *     an imm32 (see grant_tag_regs) - the exact pair whose "it is
+ *     only a constant" reading cost #96 step 3 four float tests;
  *   - r10/r11 hold the C1 hoisted (data, count) while a loop region is
  *     emitting.
  */
@@ -12158,11 +12112,14 @@ static const uint8_t ELEM_CAND[] =
  * exists (see elem_scratch_reserve), and asking it with a second copy
  * of these rules is how the two drift.
  *
- * `hoist_claimed` is a mask rather than the g_hoist globals for the
- * same reason: at pool-pick time the region has not been entered yet,
- * so the caller supplies HOIST_REGS_MASK from its own `has_hoist`.
+ * `tag_claimed` / `hoist_claimed` are masks rather than the Emitter /
+ * g_hoist state for the same reason: at pool-pick time the region has
+ * not been entered yet, so the caller supplies the run's B1 grant
+ * decision and HOIST_REGS_MASK itself. B1: the singleton rule stopped
+ * being a re-derivation (the r==RSI / r==R8 imm tests) and became a
+ * consultation of the SAME recorded grant every other consumer reads.
  */
-static bool elem_reg_usable_nopin(uint8_t r, bool float_tag_live,
+static bool elem_reg_usable_nopin(uint8_t r, uint32_t tag_claimed,
                                   uint32_t hoist_claimed)
 {
     /* #96 (c): the slots base, the stack pointer and the frame anchor,
@@ -12171,10 +12128,7 @@ static bool elem_reg_usable_nopin(uint8_t r, bool float_tag_live,
      * and what lets the set drift between its copies. */
     if (!(gp_caps(r) & CAP_ALLOCATABLE))
         return false;
-    if (r == RSI && !jit_tag_is_imm(jit_layout().t_int))  /* reg:conv */
-        return false;
-    if (r == R8 && float_tag_live               /* reg:conv */
-            && !jit_tag_is_imm(jit_layout().t_float))
+    if (tag_claimed & (1u << r))
         return false;
     if (hoist_claimed & (1u << r))
         return false;
@@ -12196,7 +12150,7 @@ static bool elem_reg_usable(const Emitter &e, uint8_t r)
 {
     if (e.reg_holds_pin(r))
         return false;
-    return elem_reg_usable_nopin(r, e.float_tag_live,
+    return elem_reg_usable_nopin(r, e.tag_granted,
                                  hoist_claimed_mask());
 }
 
@@ -12288,7 +12242,7 @@ static const uint8_t ELEM_NO_REG = 0xFF;
 
 static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
                                      size_t end, bool has_hoist,
-                                     uint32_t clob)
+                                     uint32_t clob, uint32_t tag_claimed)
 {
     bool has_read = false, has_store = false, has_chain = false;
     for (size_t p = begin; p < end; p++)
@@ -12300,7 +12254,6 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
         }
     if (!has_read && !has_store && !has_chain)
         return 0;
-    const bool ftl = run_needs_float_tag(ck, begin, end);
     const uint32_t claimed = has_hoist ? HOIST_REGS_MASK : 0u;
     const uint32_t pool = xcache_mask();
     uint32_t withheld = 0;
@@ -12334,7 +12287,7 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
      * hoist case its last pool member - watched, 2026-08-20).
      */
     const auto usable = [&](uint8_t r) {
-        return elem_reg_usable_nopin(r, ftl, claimed);
+        return elem_reg_usable_nopin(r, tag_claimed, claimed);
     };
     const auto plan_free = [&](uint8_t r) {
         return usable(r)
@@ -13373,8 +13326,9 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
  * outer-data -> &row (alive until the COW guards are done - prep needs
  * it) -> inner data, rdx val-type guard then byte-length/count, r9
  * t_arr/t_bool immediates + both indexes, rdi the int/bool value,
- * xmm0/xmm1 the float value/element. rsi (t_int) and r8 (t_float) are
- * RESERVED reads; the prep stub's epilogue re-materialises them.
+ * xmm0/xmm1 the float value/element. The B1 tag holders (t_int /
+ * t_float) are RESERVED reads; the prep stub's epilogue
+ * re-materialises them.
  */
 static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
                                     std::vector<size_t> &slows,
@@ -13419,10 +13373,10 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     /* both keys must be plain ints (boxed slots - the interpreter's
      * "Expected integer as subscript" declines to the helper) */
     e.load(sc.obj, k1.type);
-    e.cmp_rax_tag(jit_layout().t_int, RSI);  /* reg:conv */
+    e.cmp_rax_tag(jit_layout().t_int);  /* reg:conv */
     decline_ne();
     e.load(sc.obj, k2.type);
-    e.cmp_rax_tag(jit_layout().t_int, RSI);  /* reg:conv */
+    e.cmp_rax_tag(jit_layout().t_int);  /* reg:conv */
     decline_ne();
 
     /* OUTER: an array, not a slice, not readonly, GENERAL storage */
@@ -13499,10 +13453,10 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         /* --- FLOAT row, plain: value promotes like the interpreter --- */
         e.load(sc.count, val.type);
         /* t_float? */
-        e.cmp_reg_tag(sc.count, jit_layout().t_float, 8);
+        e.cmp_reg_tag(sc.count, jit_layout().t_float);
         const size_t j_vf = e.j8(0x74);
         /* t_int? (promote) */
-        e.cmp_reg_tag(sc.count, jit_layout().t_int, RSI);  /* reg:conv */
+        e.cmp_reg_tag(sc.count, jit_layout().t_int);
         decline_ne();
         e.cvt(X0, val.payload);                /* cvtsi2sd xmm0, [val] */
         const size_t j_vgot = e.j8(0xEB);
@@ -13538,9 +13492,9 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         decline_if(0xEB);                      /* other kinds: helper */
         e.patch32_here(j_floats);
         e.load(sc.count, val.type);
-        e.cmp_reg_tag(sc.count, jit_layout().t_float, 8);
+        e.cmp_reg_tag(sc.count, jit_layout().t_float);
         const size_t j_vf = e.j8(0x74);
-        e.cmp_reg_tag(sc.count, jit_layout().t_int, RSI);  /* reg:conv */
+        e.cmp_reg_tag(sc.count, jit_layout().t_int);
         decline_ne();
         e.cvt(X0, val.payload);
         const size_t j_vgot = e.j8(0xEB);
@@ -13563,7 +13517,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     /* --- INT row (plain or compound) --- */
     e.patch32_here(j_ints);
     e.load(sc.count, val.type);
-    e.cmp_reg_tag(sc.count, jit_layout().t_int, RSI);  /* reg:conv */
+    e.cmp_reg_tag(sc.count, jit_layout().t_int);
     decline_ne();
     e.load(sc.val, val.payload);
     if (divmod) {
@@ -14457,8 +14411,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                  * as a cacheable int use); CL is the ISA's one variable
                  * shift-count register. B2c: a pinned rcx is a
                  * conflicting event - evict + retry, exactly the rax
-                 * pattern (this replaced the per-op rcx scan in
-                 * jit_xcache_busy). */
+                 * pattern (this replaced the per-op rcx scan that
+                 * lived in the deleted jit_xcache_busy). */
                 e.reg_pin_conflict(RCX);         /* reg:isa: CL */
                 read_slot(e, RCX, in.b_slot());  /* reg:isa: CL */
             }
@@ -16588,16 +16542,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              */
             if (comp) {
                 e.load(acc.r, slot_addr(in.target).type);
-                e.cmp_reg_tag(acc.r, jit_layout().t_int, RSI);  /* reg:conv */
+                e.cmp_reg_tag(acc.r, jit_layout().t_int);
                 j_slows.push_back(e.j32(0x75));
             } else if (!bo.a.is_lit) {
                 e.load(acc.r, slot_addr(bo.a.slot).type);
-                e.cmp_reg_tag(acc.r, jit_layout().t_int, RSI);  /* reg:conv */
+                e.cmp_reg_tag(acc.r, jit_layout().t_int);
                 j_slows.push_back(e.j32(0x75));
             }
             if (!bo.b.is_lit) {
                 e.load(acc.r, slot_addr(bo.b.slot).type);
-                e.cmp_reg_tag(acc.r, jit_layout().t_int, RSI);  /* reg:conv */
+                e.cmp_reg_tag(acc.r, jit_layout().t_int);
                 j_slows.push_back(e.j32(0x75));
             }
 #ifdef TESTS
@@ -16732,16 +16686,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 #endif
             if (comp) {
                 e.load(acc.r, slot_addr(in.target).type);
-                e.cmp_reg_tag(acc.r, jit_layout().t_float, 8);
+                e.cmp_reg_tag(acc.r, jit_layout().t_float);
                 j_slows.push_back(e.j32(0x75));
             } else if (!bo.a.is_lit) {
                 e.load(acc.r, slot_addr(bo.a.slot).type);
-                e.cmp_reg_tag(acc.r, jit_layout().t_float, 8);
+                e.cmp_reg_tag(acc.r, jit_layout().t_float);
                 j_slows.push_back(e.j32(0x75));
             }
             if (!bo.b.is_lit) {
                 e.load(acc.r, slot_addr(bo.b.slot).type);
-                e.cmp_reg_tag(acc.r, jit_layout().t_float, 8);
+                e.cmp_reg_tag(acc.r, jit_layout().t_float);
                 j_slows.push_back(e.j32(0x75));
             }
 #ifdef TESTS
@@ -18029,7 +17983,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * seam (`cmp_rax_tag`) already existed; this site never went
          * through it.
          */
-        e.cmp_reg_tag(acc.r, L.t_int, RSI);  /* reg:conv */
+        e.cmp_reg_tag(acc.r, L.t_int);
         const size_t j_fast_int = e.j32(0x74);   /* je -> fast */
         {
             RefScratch rb(e, RCX);
@@ -19291,7 +19245,9 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     std::vector<size_t> label(n, 0);
     std::vector<Fixup> fixups;              /* fragment-local branch fixups */
     e.frag_entry();                         /* push rbx; rbx = rdi (the base) */
-    e.float_tag_live = run_needs_float_tag(chunk, 0, n);
+    /* B1: a container takes the holder grants too - it has no pins,
+     * but its scratch asks must not land on a granted holder. */
+    e.ra.busy |= e.grant_tag_regs(run_needs_float_tag(chunk, 0, n));
     emit_type_tags(e);
     size_t isl_idx = 0;                     /* islands are in ascending order */
     for (size_t pc = 0; pc < n; ) {
@@ -19925,11 +19881,18 @@ retry_emission:
          * the pool - which is why the pick can no longer read MAX_CACHED
          * for itself.
          */
+        /* B1: the type-singleton HOLDER GRANTS, decided before the
+         * budget so the pool count, the pick, the element-tier
+         * reservation and every scratch ask all see the SAME claim
+         * (Emitter::grant_tag_regs; applied to ra below). */
+        const uint32_t tagres =
+            e.grant_tag_regs(run_needs_float_tag(chunk, begin, end));
         const uint32_t xclob =
-            jit_xcache_clobber(chunk, begin, end, !hregs.empty());
+            jit_xcache_clobber(chunk, begin, end, !hregs.empty(),
+                               tagres);
         size_t n_xcache = 0;
         for (size_t i = 0; i < MAX_XCACHED; i++)
-            if (!(xclob & (1u << XCACHE_ORDER[i])))
+            if (!((xclob | tagres) & (1u << XCACHE_ORDER[i])))
                 n_xcache++;
         size_t max_pins = MAX_CACHED + n_xcache;
         /*
@@ -19967,9 +19930,13 @@ retry_emission:
          * are not occupied by anything, this fragment simply may not
          * spend them (jit_xcache_clobber says why for each). The model
          * keeps the two apart so a pressure report can tell "all taken"
-         * from "all forbidden". */
+         * from "all forbidden". B1: the singleton holders are the
+         * opposite - OCCUPIED by a live value the model granted - so
+         * they are ra.busy, and check_pins_are_busy enforces that the
+         * claim survives every allocator reset. */
         e.ra = RegAlloc();
         e.ra.denied = xclob;
+        e.ra.busy |= e.tag_granted;
         /*
          * #96 INCREMENT 1: the pick RANKS more candidates than the
          * register budget; the overflow past max_pins is homed in
@@ -20186,12 +20153,11 @@ retry_emission:
         }
         e.spill_slots = static_cast<int>(spill_hot.size());
         e.frag_entry();               /* push rbx + the cache regs; rbx=rdi */
-        /* #96: ONE flag for "this fragment needs the t_float singleton",
-         * read by emit_type_tags at every entry AND by
-         * emit_call_epilogue's re-materialisation, so they cannot
-         * disagree (they did: the epilogue re-made r8 unconditionally,
-         * 106 times on a bench with no float in it). */
-        e.float_tag_live = run_needs_float_tag(chunk, begin, end);
+        /* B1: the grant (taken above, before the pick) is the ONE
+         * decision emit_type_tags and emit_call_epilogue's
+         * re-materialisation both read, so they cannot disagree (they
+         * did once: the epilogue re-made r8 unconditionally, 106
+         * times on a bench with no float in it). */
         emit_type_tags(e);
 
         /* Load each pinned slot ONCE here (the back edge jumps to the
@@ -20724,8 +20690,15 @@ retry_emission:
                  * cache_live(). Sound to clear the type list too, since
                  * the pre-op flush_cache() has already stamped it. */
                 saved_state = e.snapshot_cache();
+                /* B1: clear_cache_state alone - it keeps `denied`
+                 * (a whole-run property) and the singleton-holder
+                 * grants (the tags stay live across the barrier'd
+                 * op; its call epilogue re-materialises them). The
+                 * extra `e.ra = RegAlloc()` that used to follow
+                 * wiped BOTH for the op's emission - a latent
+                 * hazard: a scratch ask inside the op could take a
+                 * denied register or a live tag holder. */
                 e.clear_cache_state();
-                e.ra = RegAlloc();
             }
             if (op_is_branch(in.op)) {
                 /* targets get entry_remap (an external exit is a RESUME -
@@ -20882,7 +20855,7 @@ retry_emission:
                 for (Emitter::CacheEnt &c : e.cache) {
                     if (c.reg != sm.reg)
                         continue;
-                    e.store_type_tag(c.type, jit_layout().t_int, 6);
+                    e.store_type_tag(c.type, jit_layout().t_int);
                     e.store(c.reg, c.payload);       /* evict */
                     const SlotAddr na = slot_addr(sm.to_slot);
                     c.slot = sm.to_slot;
