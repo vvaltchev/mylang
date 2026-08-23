@@ -4075,3 +4075,71 @@ per-operand int-or-float guard plus cvtsi2sd, and must still refuse
 int-int - `boxed_slow_m` says how much it would buy); float `%` (a libm
 call either way); eq/noteq compares; and UnaryV, which no arm covers in
 either tier.
+
+## H7 inc 1 (2026-08-13): the unpack's STORAGE DISPATCH leaves the
+## element loop - 75 is -19.4% Ir with no emitted code at all
+
+Post-H3 the strict element unpack was still a four-deep chain -
+`jit_unpack_elem -> vm_unpack_elem_body -> vm_unpack_bind_elem` (once
+PER ELEMENT). The plan scoped H7 as an emitted INLINE tier, the shape
+#92 (the element store) and #93 (the nested read) both got. Measuring
+first said most of the cost was not where a tier would attack it.
+
+MEASURED BEFORE ANYTHING WAS WRITTEN (callgrind, scale-1-vs-3 delta so
+compile time is excluded; 5M rows per scale unit): 294.2 Ir per row on
+75_indexed_unpack, of which ~222 is the unpack machinery. The split:
+~86 navigation + guards, ~100 the two binds, ~18 the jit_unpack_elem
+wrapper. And inside the 100, only ~44 is the intrusive_ptr traffic the
+bind exists to do - the rest is a non-inlined call, a re-read of
+`sub.skind()` and `sub.offset()`, and a re-derivation of the element
+vector, N TIMES for a sub-array that cannot change between them.
+
+So inc 1 hoists the dispatch instead of emitting anything: dispatch on
+the storage kind ONCE, then run a kind-specialized loop over a base
+pointer computed once. `vm_unpack_bind_elem` is gone - its three arms
+are the three loops. The binds are untouched; this removes only the
+per-element re-derivation.
+
+Nothing in the loop can invalidate the hoist: the only writes are to
+FRAME SLOTS, no user code runs, and the base frame slot owns the outer
+array throughout (the same argument vm_slot_bind_value's
+reference-into-storage note already relies on).
+
+THE SIBLING WENT WITH IT: vm_multi_unpack_body's plain-bind arm had the
+identical per-element dispatch, so it hoists the same way. A compound or
+coercing position still needs the boxed element and keeps store().
+
+MEASURED (callgrind Ir, `OPT=1 ASSERTS=0` both sides, steady-state per
+scale unit; wall clock from one interleaved full-suite --baseline run):
+ - **75_indexed_unpack -19.4% Ir, 0.83x wall** (0.059 -> 0.049s); the
+   unpack machinery goes ~222 -> ~165 Ir/row, which is the plan's
+   150-200 target on its own basis.
+ - **73_multi_unpack -7.1% Ir** (1.04x wall, but at 0.018s it is inside
+   the noise band).
+ - 20_foreach_unpack -0.2% and 22_multi_assign +0.0%, both expected:
+   their flat-scalar arms already ran a hoisted loop.
+ - suite geomean cur/base 1.003x - flat.
+
+THREE HOISTS, THREE SABOTAGES, ALL WATCHED FAILING - and each needed a
+SLICE sub-array to be catchable at all, because a whole array has
+offset 0 and the missing `+ off` is then invisible:
+ - the strs arm's offset -> `slice str rows` fails;
+ - the general arm's offset -> `slice general rows` fails. The FIRST
+   version of that case was VACUOUS: a plain heterogeneous literal makes
+   the OUTER container dyn too, so the foreach lowered to `fe.dyn.next`
+   and never reached the unpack op - the sabotage did not move its value
+   and the suite stayed green. `dynarray()` forces general storage while
+   leaving the outer typed, which is the reachable shape.
+ - vm_multi_unpack_body's `roff` -> `multi-unpack over a str slice`
+   fails. Every pre-existing multi-unpack case destructures a WHOLE
+   array, so none of them could catch it.
+
+WHAT INC 2 WOULD BE, sized rather than promised: the residue is ~165
+Ir/row, of which ~42 is intrusive_ptr traffic (irreducible), ~18 the
+jit_unpack_elem wrapper and ~25 the navigation. An emitted tier doing
+the outer/row navigation and guards inline - the #93 idiom, which
+already has the layout constants and the slice/kind arms - would take
+it to ~105 Ir/row. Inlining the STRING bind as well means emitting
+refcount code (retain, release, the cold free branch), which is the
+highest-risk category in this codebase for the ~42 it would not even
+remove; the navigation half is the part worth doing.
