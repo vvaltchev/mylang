@@ -2930,19 +2930,26 @@ static bool fmi_has_tainted_write(
  * to release, ~12% of 76_funcval_dispatch) is removable.
  *
  * ⛔ THIS PASS ONLY ANSWERS THE QUESTION. Wiring the answer to an actual
- * borrow needs two more things that are NOT here, both found by reading
- * the write path and both recorded in plans/top5-cpp-gap.md:
- *   1. `try_flat_subscript_store` and `get_value_for_put` gate
- *      `clone_aliased_slices` on `use_count() > 1`. A borrow does not bump
- *      the count, so that guard would stop firing where it fires today -
- *      an observable difference (a live slice of the argument would see
- *      the write), i.e. a RULE 2 violation. The predicate has to move off
- *      use_count and onto "this array actually has live slices" first.
- *   2. An element write through a SLICE detaches it by assigning into the
- *      handle, which would RELEASE a reference the borrowed slot never
- *      took - a refcount underflow. Sliceness is a runtime property, so
- *      the bind has to decide per call and record it (a borrow mask on the
- *      window record, which `pop_window` then consults).
+ * borrow needs ONE more thing, which is NOT here: an element write through
+ * a SLICE detaches it in place (`try_flat_subscript_store`'s
+ * `arr.clone_internal_vec()`, `get_value_for_put`'s
+ * `*container = container->clone()`), and that RELEASES the old
+ * SharedObject - a reference a borrowed slot never took, so a refcount
+ * underflow. Sliceness is a RUNTIME property, so the bind has to decide
+ * per call and record it: a borrow mask on the window record, which
+ * `pop_window` then consults, with a slice argument falling back to a real
+ * retain.
+ *
+ * A SECOND hazard was recorded here and is WRONG, corrected 2026-08-15
+ * rather than deleted, because the reasoning is the kind that looks right:
+ * the three element-store paths gate `clone_aliased_slices` on
+ * `use_count() > 1`, and a borrow does not bump the count - so it seemed a
+ * live slice of the argument could observe a write it must not. It cannot.
+ * `use_count()` is the count on the SharedObject, and a slice HOLDS ITS
+ * OWN intrusive_ptr to that same object; so a live slice already makes the
+ * count >= 2 by itself. The borrow can only take the count 2 -> 1 in the
+ * case where the callee's handle was the second one, i.e. where there are
+ * no slices at all and `clone_aliased_slices` would be a no-op.
  * So this lands on its own, with its own tests, and the consumer follows.
  *
  * THE RULES, deliberately conservative - a false "does not escape" is a

@@ -1153,3 +1153,23 @@ new marks - reported as measured, not as a win.
 Still true, and still the gate on any of this being worth shipping: the
 consumer owes the two write-path fixes recorded above (the
 `use_count() > 1` predicate, and the per-call borrow mask for slices).
+
+### CORRECTION (2026-08-15): ONE OF THE TWO CONSUMER HAZARDS IS NOT REAL
+
+The earlier note said a borrow would break the element-store COW guard,
+because `try_flat_subscript_store` and `get_value_for_put` gate
+`clone_aliased_slices` on `use_count() > 1` and a borrow does not bump
+the count. **That is wrong.** `use_count()` is the count on the
+SharedObject, and a SLICE HOLDS ITS OWN intrusive_ptr to that same
+object - so a live slice already makes the count >= 2 on its own. The
+borrow can only take the count 2 -> 1 in the case where the callee's
+handle was the second one, which is exactly the case where there are no
+slices and `clone_aliased_slices` is a no-op.
+
+So the consumer owes ONE fix, not two: a SLICE passed as the argument.
+`f(sl)` where the body writes `sl[0]` detaches the slice IN PLACE
+(`clone_internal_vec`), releasing the old SharedObject - a reference the
+borrowed slot never took, hence an underflow. Sliceness is a runtime
+property, so the bind decides per call and records a borrow mask on the
+window record for `pop_window`; a slice argument simply falls back to a
+real retain.
