@@ -14056,6 +14056,51 @@ static const std::vector<test> tests =
       { "var a = [1, 2, 3];",
         "var m = map(func(int x) { return x + 1; }, a);",
         "assert(m[2] == 4);" } },
+
+    /*
+     * H4: an INDIRECT call's result is a typed operand. The VALUES here
+     * are the same either way (the boxed tier computes them correctly) -
+     * what these pin is that making the call a typed leaf did not change
+     * WHEN it runs. The lowering itself is asserted by
+     * call_result_typed_shapes; these are the behaviour half.
+     */
+    { "H4: an indirect call in a typed accumulate (int + float)",
+      { "func mk_add(int b) { return func [b] (int k) { return b + k; }; }",
+        "func mk_scale(float f) { return func [f](float x) { return f*x; }; }",
+        "var add = mk_add(7); var sc = mk_scale(0.5);",
+        "var s = 0; var t = 0.0;",
+        "for (var i = 0; i < 4; i++) { s = s + add(i); t = t + sc(i); }",
+        "assert(s == 34);",              /* (7+0)+(7+1)+(7+2)+(7+3) */
+        "assert(t > 2.9 && t < 3.1);" } },  /* 0.5*(0+1+2+3) */
+    /* SHORT-CIRCUIT: the rhs call must NOT run when `&&` cuts (#138). A
+     * typed leaf that hoisted the call out of its region would bump the
+     * counter - a VALUE assertion alone cannot see this. */
+    { "H4: a call operand under && is still short-circuited",
+      { "var n = 0;",
+        "func bump(int k) { n = n + 1; return k; }",
+        "var g = 0;",
+        "for (var i = 0; i < 3; i++)",
+        "    if (runtime(0) > 1 && bump(i) > 0) { g = g + 1; }",
+        "assert(n == 0);",               /* the rhs never evaluated */
+        "assert(g == 0);" } },
+    /* CONDITIONALITY: only the TAKEN ternary arm's call may run. */
+    { "H4: only the taken ternary arm's call runs",
+      { "var na = 0; var nb = 0;",
+        "func fa(int k) { na = na + 1; return k; }",
+        "func fb(int k) { nb = nb + 1; return k * 10; }",
+        "var s = 0;",
+        "for (var i = 0; i < 4; i++) { s = s + (i < 2 ? fa(i) : fb(i)); }",
+        "assert(na == 2); assert(nb == 2);",
+        "assert(s == 51);" } },          /* 0+1 + 20+30 */
+    /* EVALUATION ORDER: two calls in one expression run left-to-right. */
+    /* NOTE `log` cannot be the accumulator here - it is a math BUILTIN
+     * and `var log` is a CannotRebindBuiltinEx (watched). */
+    { "H4: two call operands keep their evaluation order",
+      { "var seen = \"\";",
+        "func p(int k) { seen = seen + str(k); return k; }",
+        "var s = 0;",
+        "s = s + p(1) + p(2) + p(3);",
+        "assert(seen == \"123\"); assert(s == 6);" } },
     { "ti: mandatory dyn - an int accumulator stays concrete (no dyn needed)",
       { "var s = 0; var a = range(5);",
         "foreach (var e in a) s += e; assert(s == 10);" } },
@@ -19925,6 +19970,110 @@ static bool array_elem_read_shapes()
                             "loadev=%d subscriptv=%d, wanted %d/%d\n",
                     c.name, n_lev, n_sub,
                     c.want_loadev, c.want_subscriptv);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* H4: an INDIRECT call's result is a typed operand, so the arithmetic
+ * around it stays unboxed. Asserts the LOWERING (i.bin/f.bin present,
+ * bin.v absent), which is the only thing that distinguishes this from
+ * the boxed tier - the VALUES are identical either way, so a value test
+ * cannot see it. The DECLINES matter as much: a math builtin must keep
+ * its typed MathFnV (placing the leaf earlier silently demoted it to the
+ * generic CallBuiltinV marshal), and a dyn-returning call must stay
+ * boxed. */
+static bool call_result_typed_shapes()
+{
+    struct Case {
+        const char *name;
+        std::vector<const char *> lines;
+        int want_typed, want_boxed, want_mathfn;
+    };
+    const std::vector<Case> cases = {
+        /* 78's shape: an int accumulate over an indirect call */
+        { "indirect call -> IntBin, no bin.v", {
+            "func mk(int b) { return func [b] (int k) { return b + k; }; }",
+            "var f = mk(7); var s = 0;",
+            "for (var i = 0; i < 10; i++) { s = s + f(i); }",
+            "print(s);" }, 1, 0, 0 },
+        /* the float twin - this is the one that paid ~190 Ir/iteration */
+        { "indirect float call -> FloatBin, no bin.v", {
+            "func mk(float b) { return func [b] (float x) { return b*x; }; }",
+            "var f = mk(0.5); var t = 0.0;",
+            "for (var i = 0; i < 10; i++) { t = t + f(i); }",
+            "print(t);" }, 1, 0, 0 },
+        /* DECLINE: a math builtin keeps MathFnV (the regression the
+         * early placement caused, watched failing) */
+        { "math builtin keeps MathFnV", {
+            "var s = 0.0;",
+            "for (var i = 1; i < 10; i++) s += sqrt(i);",
+            "print(s);" }, 1, 0, 1 },
+        /* DECLINE: a dyn-returning indirect call stays boxed - there is
+         * no proven type to read the slot by */
+        { "dyn-returning call stays boxed", {
+            "func mk() { return func(dyn k) { return k; }; }",
+            "var f = mk(); var dyn s = 0;",
+            "for (var i = 0; i < 10; i++) { s = s + f(i); }",
+            "print(s);" }, 0, 1, 0 },
+    };
+    for (const Case &c : cases) {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i) src += '\n';
+            src += c.lines[i];
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+
+        int ty = 0, bx = 0, mf = 0;
+        auto scan = [&](const Chunk &ck) {
+            for (const Instr &in : ck.code) {
+                /* THE TYPED ACCUMULATE OPS - and note BOTH ways the
+                 * plain Int/FloatBin disappears before vm_compile
+                 * returns, each of which made this test read 0 and look
+                 * vacuous (both watched):
+                 *   - a counted loop FUSES `s = s + f(i)` into the loop
+                 *     step (#9 IntAddStep);
+                 *   - specialize_arith_ops rewrites Int/FloatBin into the
+                 *     B1/B2 SPECIALIZED family (IntAddRR..FloatMulRI), so
+                 *     the float case emits FloatAddRR, not FloatBin.
+                 * That second one is THE AUDIT-TABLE STAGE TRAP in test
+                 * form - the same trap CLAUDE.md records for
+                 * visit_use_def and op_writes_scalar. A test that names
+                 * an opcode must name the one that SURVIVES to the stage
+                 * it inspects. */
+                if (in.op == OpCode::IntBin
+                    || in.op == OpCode::FloatBin
+                    || in.op == OpCode::IntAddStep
+                    || (in.op >= OpCode::IntAddRR
+                        && in.op <= OpCode::FloatMulRI)) ty++;
+                if (in.op == OpCode::BinOpV)   bx++;
+                if (in.op == OpCode::MathFnV)  mf++;
+            }
+        };
+        scan(prog.root);
+        for (const auto &fd : prog.funcs)
+            if (fd->vm_chunk)
+                scan(*static_cast<const Chunk *>(fd->vm_chunk));
+        /* the counts are floors/exact where it matters: the ACCUMULATE's
+         * op must be present and the boxed one absent (or vice versa for
+         * the decline cases) */
+        const bool ok =
+            ty >= c.want_typed &&
+            (c.want_boxed  ? bx >= c.want_boxed  : bx == 0) &&
+            (c.want_mathfn ? mf >= c.want_mathfn : true);
+        if (!ok) {
+            fprintf(stderr, "call_result_typed_shapes: '%s' got "
+                            "typed=%d boxed=%d mathfn=%d\n",
+                    c.name, ty, bx, mf);
             return false;
         }
     }
@@ -29407,6 +29556,8 @@ static const std::vector<extra_check> extra_checks =
       array_elem_read_shapes },
     { "vm: the dispatch-free string unpack bind runs (H3)",
       unpack_fast_bind_shapes },
+    { "codegen: an indirect call's result is a typed operand (H4)",
+      call_result_typed_shapes },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",
