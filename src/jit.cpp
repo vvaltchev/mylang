@@ -1406,39 +1406,55 @@ struct Emitter {
     }
     void trk_push(uint8_t r)
     {
-#ifndef NDEBUG
+        /*
+         * ⛔ THE BORROW BOOKKEEPING IS UNCONDITIONAL - IT DRIVES
+         * EMISSION. BorrowSuspend EMITS the divergent-path pops from
+         * trk_bstack/trk_bn, so this state must be identical in every
+         * build. It sat inside #ifndef NDEBUG for three days
+         * (26900e1..): the ASSERTS=0 build's borrow stack stayed
+         * empty, every raise arm inside a borrow window lost its
+         * compensating pop, and a pinned-rcx div gate's raise skewed
+         * the stack by 8 - frag_ret then popped garbage into rbp and
+         * the fragment returned INTO THE STACK. Debug and rel-hard
+         * (ASSERTS on) were structurally blind; only the nolowmem
+         * release-no-asserts CI lane could see it, and did.
+         * EMISSION MAY NEVER DEPEND ON NDEBUG. Only the trk_fail
+         * checks are debug.
+         */
         if (trk_mach > 0 || !reg_holds_pin(r) || trk_flushed)
             return;
         if (trk_bracket > 0 && !(gp_caps(r) & CAP_CALLEE_SAVED))
             return;                      /* pushing dead scratch */
+#ifndef NDEBUG
         if (trk_borrowed & (1u << r))
             trk_fail("NESTED borrow of the same register - the inner "
                      "pop would end the outer borrow early", r);
         if (trk_bn >= 8)
             trk_fail("borrow stack overflow", r);
-        trk_bstack[trk_bn++] = r;
-        trk_borrowed |= 1u << r;
-#else
-        (void)r;
 #endif
+        if (trk_bn < 8) {                /* debug aborts at the bound */
+            trk_bstack[trk_bn++] = r;
+            trk_borrowed |= 1u << r;
+        }
     }
     void trk_pop(uint8_t r)
     {
-#ifndef NDEBUG
+        /* unconditional for the same reason trk_push is: the borrow
+         * stack drives BorrowSuspend's emitted pops */
         const uint32_t bit = 1u << r;
         if (trk_borrowed & bit) {        /* the restore: borrow ends */
+#ifndef NDEBUG
             if (trk_bn <= 0 || trk_bstack[trk_bn - 1] != r)
                 trk_fail("borrow pops out of order - the values would "
                          "swap registers", r);
-            trk_bn--;
+#endif
+            if (trk_bn > 0)
+                trk_bn--;
             trk_borrowed &= ~bit;
             trk_dirty &= ~bit;
             return;
         }
         wrote(r);                        /* any other pop WRITES r */
-#else
-        (void)r;
-#endif
     }
     /* read_slot's pin resolution: reading a slot out of a register the
      * borrower has overwritten reads the TEMP, not the slot's value. */
@@ -1487,6 +1503,9 @@ struct Emitter {
                      "DEPTH - some path through this op leaks stack",
                      static_cast<unsigned>(
                          trk_pushes > 0 ? trk_pushes : -trk_pushes));
+#endif
+        /* the RESETS are unconditional - trk_flushed feeds trk_push's
+         * discrimination, which drives EMISSION (see trk_push's ⛔) */
         trk_pushes = 0;
         /* ⛔ THE FLUSH STATE IS PER-OP, NOT PER-EMISSION-ORDER. A run
          * may contain a TERMINAL op mid-sequence (an early return): its
@@ -1499,7 +1518,6 @@ struct Emitter {
          * ReturnV). Every op begins with pins live. */
         trk_flushed = false;
         trk_flushdirty = 0;
-#endif
     }
     /* RAII for the enumerated legitimate pin writers. */
     struct PinMach {
@@ -2178,10 +2196,9 @@ struct Emitter {
     {
         assert_no_borrow("flush_cache with a BORROW open - it would "
                          "store the borrowed-away temp as a slot value");
-#ifndef NDEBUG
-        trk_flushed = true;
+        trk_flushed = true;              /* state, not a check - it
+                                          * feeds trk_push (see its ⛔) */
         trk_flushdirty = 0;
-#endif
         for (const CacheEnt &c : cache) {
             store_type_tag(c.type, jit_layout().t_int, 6);
             store(c.reg, c.payload);
@@ -2233,10 +2250,8 @@ struct Emitter {
     void reload_cache()
     {
         PinMach pm(*this);
-#ifndef NDEBUG
-        trk_flushed = false;
+        trk_flushed = false;             /* state, not a check */
         trk_flushdirty = 0;
-#endif
         /* #96 inc-1: re-seed the spill slots from the (current)
          * frame - push/pop around the rax shuttle, exactly as the
          * flush does: a barrier RESTORE runs right after its op, and
