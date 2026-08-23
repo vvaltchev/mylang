@@ -7853,3 +7853,33 @@ several stretches, several registers) went untested. WATCHED
 FAILING: removing the def-opens rule fails with mismatches named by
 pc and slot. Pure analysis - no emission change (vdjcmp 116/116,
 gate, both arenas, clang lto0 all green).
+
+## Endgame D2 + validator arm 1 (2026-08-23) - the per-pc seam;
+## slot_mem_check
+
+D2: reg_at/spill_at/freg_at - "where does slot s live AT cur_pc?" -
+the one question every emitting consumer asks now (37 sites
+migrated; dbg_pc promoted to cur_pc, model state). Byte-identical
+by construction; D3 swaps the wrapper's body for the interval
+assignment without touching a consumer. "The tracker learns the
+map" deferred to D3 with the reason recorded in the plan (the
+wrapper checked against itself is the oracle-shares-its-subject
+trap).
+
+VALIDATOR ARM 1 (the D4 oracle, built BEFORE the brain it guards):
+`slot_mem_check` - every [rbx+disp] PAYLOAD access through the slot
+accessors (load/store/fload/fstore/cvt) aborts when the assignment
+at cur_pc homes the slot in a register or a spill: the frame word
+is STALE and reading (or writing under) it is the silent-wrong-
+answer class D3's moving homes would otherwise create. Payload-only
+on purpose (the TYPE word legitimately stays memory-resident for a
+pinned slot); gates mirror wrote() (machinery / flushed / call
+bracket). ITS FIRST RUN FOUND A FINDING: emit_call_prologue's pin
+SPILLS were undeclared machinery - the save half of the
+spill-around-a-call discipline never said so, while the epilogue's
+reload half always did (PinMach). Declared now, at the source.
+WATCHED FAILING: a read_slot that bypasses the seam (the exact
+D3-era consumer bug) aborts by name with the slot number.
+
+Emission untouched: vdjcmp 116/116 both arenas; -rt 1948/1948 both
+arenas; corpus + xrot-off-arena + gate + driver + clang lto0 green.

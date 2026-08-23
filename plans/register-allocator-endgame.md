@@ -514,6 +514,16 @@ stubs from the per-pc map.
    replacement for byte-identity - it must FAIL LOUDLY on a wrong
    allocator, and be watched failing (sabotage: skip one fixup
    move).
+   [ARM 1 LANDED 2026-08-23: slot_mem_check - every [rbx+disp]
+   PAYLOAD access through load/store/fload/fstore/cvt aborts if the
+   assignment at cur_pc homes the slot in a register or spill (the
+   value is elsewhere); gates mirror wrote() (machinery/flushed/
+   bracket). Its FIRST RUN found the call prologue's pin spills
+   undeclared as machinery - fixed at the source with PinMach, the
+   same declaration the epilogue's reloads carry. WATCHED failing:
+   a seam-bypassing read_slot aborts by name with the slot number.
+   The label-agreement and exit-completeness arms become definable
+   with D3's varying assignments.]
  - Performance: RULE B1 full-suite A/B + callgrind on the regs
    family and the top-8 my/cpp benches.
 

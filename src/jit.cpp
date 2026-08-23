@@ -2038,11 +2038,50 @@ struct Emitter {
     int reg_at(int slot) const   { return creg(slot); }
     int spill_at(int slot) const { return cspill(slot); }
     int freg_at(int slot) const  { return fcreg(slot); }
+    /*
+     * D3/D4: THE EMIT-TIME ASSIGNMENT VALIDATOR - the read-side twin
+     * of wrote(). Every [rbx+disp] payload access goes through the
+     * few slot accessors below; if the ASSIGNMENT says the slot lives
+     * in a register or a spill home at this pc, its frame payload is
+     * STALE, and an unflushed, unbracketed, non-machinery access to
+     * it is reading (or writing under) a value that is elsewhere - a
+     * silent wrong answer once D3's allocator starts moving homes.
+     * PAYLOAD-ONLY on purpose: the TYPE word legitimately stays
+     * memory-resident for a pinned slot (C3 elides some writes; the
+     * guards read it), and the +40 flag bytes are neither home.
+     * Gates mirror wrote(): machinery (entry loads, flushes), the
+     * flushed state (memory is current), a call bracket (the
+     * prologue spilled).
+     */
+    void slot_mem_check(int32_t disp, bool wr) const
+    {
+#ifndef NDEBUG
+        if (trk_mach > 0 || trk_flushed || trk_bracket > 0)
+            return;
+        if (disp < 0)
+            return;
+        const JitLayout &L = jit_layout();
+        const long stride = static_cast<long>(sizeof(LValue));
+        if (disp % stride != L.off_payload)
+            return;                      /* not a payload word */
+        const int slot = static_cast<int>(disp / stride);
+        if (creg(slot) >= 0 || fcreg(slot) >= 0 || cspill(slot) >= 0)
+            trk_fail(wr ? "frame-payload WRITE under a slot whose home "
+                          "is a register/spill (slot number follows)"
+                        : "frame-payload READ of a slot whose home is "
+                          "a register/spill - the value is elsewhere "
+                          "(slot number follows)",
+                     static_cast<unsigned>(slot));
+#else
+        (void)disp; (void)wr;
+#endif
+    }
 
     /* mov <reg64>, [rbx + disp32]  (reg 0-15; REX.R for r8-r15) */
     void load(uint8_t reg, int32_t disp)
     {
         wrote(reg);
+        slot_mem_check(disp, false);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
         u8(0x8B);
         u8(static_cast<uint8_t>(MODRM_SLOT | ((reg & 7) << 3)));
@@ -2345,6 +2384,7 @@ struct Emitter {
     }
     void store(uint8_t reg, int32_t disp)
     {
+        slot_mem_check(disp, true);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
         u8(0x89);
         u8(static_cast<uint8_t>(MODRM_SLOT | ((reg & 7) << 3)));
@@ -3242,12 +3282,14 @@ struct Emitter {
     void fload(uint8_t r, int32_t d)
     {
         fwrote(r);
+        slot_mem_check(d, false);
         u8(0xF2); u8(0x0F); u8(0x10);
         u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
     }
     /* movsd [rbx+disp], xmm<r> */
     void fstore(uint8_t r, int32_t d)
     {
+        slot_mem_check(d, true);
         u8(0xF2); u8(0x0F); u8(0x11);
         u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
     }
@@ -3342,6 +3384,7 @@ struct Emitter {
     void cvt(uint8_t r, int32_t d)
     {
         fwrote(r);
+        slot_mem_check(d, false);
         u8(0xF2); u8(0x48); u8(0x0F); u8(0x2A);
         u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
     }
@@ -5753,8 +5796,15 @@ static void emit_call_prologue(Emitter &e)
      * slot is never memory-read by any op in the run - the same bad()
      * rules as the GP pool - and an exceptional exit reloads in the
      * epilogue and then flushes type+payload properly). */
-    for (const Emitter::CacheEnt &c : e.fcache)
-        e.fstore(c.reg, c.payload);
+    {
+        /* pin machinery: the SAVE half of the spill-around-a-call
+         * discipline (the epilogue's reloads are declared the same
+         * way) - D3's validator must not read these as stray
+         * payload writes */
+        Emitter::PinMach pm(e);
+        for (const Emitter::CacheEnt &c : e.fcache)
+            e.fstore(c.reg, c.payload);
+    }
     /*
      * #96: and the GP pins that are CALLER-saved (XCACHE_ORDER),
      * for the same reason and to the same place: the slot's PAYLOAD. The
@@ -5772,9 +5822,12 @@ static void emit_call_prologue(Emitter &e)
      * r10/r11 still finds it there (a spill does not invalidate). Only
      * the `call` itself clobbers them.
      */
-    for (const Emitter::CacheEnt &c : e.cache)
-        if (!jit_reg_is_callee_saved(c.reg))
-            e.store(c.reg, c.payload);
+    {
+        Emitter::PinMach pm(e);          /* ditto for the GP save */
+        for (const Emitter::CacheEnt &c : e.cache)
+            if (!jit_reg_is_callee_saved(c.reg))
+                e.store(c.reg, c.payload);
+    }
     /* from here to the epilogue's reload, every caller-saved pin is
      * safe in its slot - its register is legitimately free scratch */
     e.trk_bracket++;
