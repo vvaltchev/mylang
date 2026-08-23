@@ -5349,6 +5349,12 @@ void jit_stats_report()
          * quoted for a path most calls skip) */
         { "noesc_funcs",      &g_noescape_funcs },
         { "noesc_params",     &g_noescape_marks },
+        { "noesc_cands",      &g_noescape_cands },
+        { "noesc_unsafe_fns", &g_noescape_unsafe },
+        { "noesc_p_callee",   &g_esc_p_callee },
+        { "noesc_p_gwrite",   &g_esc_p_gwrite },
+        { "noesc_p_hobuilt",  &g_esc_p_hobuiltin },
+        { "noesc_p_shape",    &g_esc_p_shape },
         { "cb_prepared",      &g_invoke_prepared },
         { "cb_fallback",      &g_invoke_fallback },
         /* THE CALL PROTOCOL - which tier each call took */

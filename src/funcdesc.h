@@ -105,6 +105,21 @@ struct FuncDescriptor {
          * reference fails the every-slot-trivial assert at frame pop.
          */
         DeclType proven_type = DeclType::none;
+
+        /*
+         * "This param slot can never hold a REFERENCE" - an annotated i/f
+         * (bind_param's coercion guarantees it) or an inference-proven one
+         * (C3, above). TWO consumers must agree on this or one of them is
+         * wrong: codegen's ref_slots join (which then leaves the slot out
+         * of the return-path release scan) and the parameter escape
+         * analysis (which does not claim a slot with no reference to
+         * borrow). One predicate, so they cannot drift apart.
+         */
+        bool binds_scalar() const
+        {
+            return decl_type == DeclType::i || decl_type == DeclType::f
+                || proven_type == DeclType::i || proven_type == DeclType::f;
+        }
     };
 
     /* One capture-list entry, RESOLVED: closure creation snapshots the value

@@ -20724,28 +20724,94 @@ static bool param_escape_analysis()
         { "escapes: the value stored into a container, not the container",
           "func f(a, dst) { dst[0] = a; }\n"
           "var q = [0]; var d = [q]; f(q, d);", "f", 0x2 },
-        /* ⛔ THE CALLEE MUST SURVIVE THE INLINER, or this case tests
-         * NOTHING - the first version used `func g(z) { z[0] = 1; }`,
-         * which block-inlines into f, leaving a body with no call in it
-         * and `a` genuinely non-escaping. The pass answered correctly and
-         * the case was vacuous. `g` reassigns a scalar param here, which
-         * block_inlinable_decl refuses, so a real call reaches the pass. */
-        { "escapes: passed to another (non-inlinable) function",
+        /*
+         * ⛔ EVERY CALLEE HERE MUST SURVIVE THE INLINER, or the row tests
+         * NOTHING - a first version used `func g(z) { z[0] = 1; }`, which
+         * block-inlines into f, leaving a body with no call in it and `a`
+         * genuinely non-escaping. The pass answered correctly and the case
+         * was vacuous. Each `g`/`gr`/... below reassigns a scalar param,
+         * which block_inlinable_decl refuses, so a real call survives.
+         *
+         * THE FIXPOINT ROWS. A call is no longer the end of the analysis:
+         * the argument inherits the CALLEE's answer for the position it
+         * lands in, so these four rows differ only in what the callee does
+         * with its own parameter.
+         */
+        { "passed to a callee that does not let it escape: still marked",
           "func g(z, k) { k = k + 1; z[0] = k; }\n"
-          "func f(a) { g(a, 1); }\nvar q = [0]; f(q);", "f", 0x0 },
-        { "escapes: passed to a BUILTIN",
-          "func f(a) { append(a, 1); }\nvar q = [0]; f(q);", "f", 0x0 },
+          "func f(a) { g(a, 1); }\nvar q = [0]; f(q);", "f", 0x1 },
+        { "escapes: passed to a callee that RETURNS it",
+          "func gr(z, k) { k = k + 1; if (k > 0) { return z; } return z; }\n"
+          "func f(a) { var t = gr(a, 1); }\nvar q = [0]; f(q);", "f", 0x0 },
+        /* POSITION-SENSITIVE: the callee's first param is safe and its
+         * second is not, so the caller's `a` survives and its `b` does
+         * not. A fixpoint that propagated one bit per CALL rather than per
+         * ARGUMENT POSITION would answer 0x0 or 0x3 here. */
+        { "the callee's answer is per POSITION, not per call",
+          "func g2(z, w, k) { k = k + 1; z[0] = k; return w; }\n"
+          "func f(a, b) { var t = g2(a, b, 1); }\n"
+          "var q = [0]; var r = [0]; f(q, r);", "f", 0x1 },
+        /* RECURSION is why this is a fixpoint and not a traversal. Both
+         * bodies only ever subscript their parameter, so the optimistic
+         * start survives - the reference is passed around a cycle and
+         * still never leaves it. A pessimistic (or unordered) analysis
+         * would answer 0 for both. */
+        { "mutual recursion keeps the optimistic answer",
+          "func ev(z, k) { k = k + 1; z[0] = k; od(z, k); }\n"
+          "func od(z, k) { k = k + 1; z[1] = k; ev(z, k); }\n"
+          "var q = [0, 0]; ev(q, 1);", "ev", 0x1 },
+        /* ⛔ AN UNNAMEABLE CALLEE POISONS THE WHOLE FUNCTION, not just the
+         * arguments it is handed: it could reassign the global that some
+         * caller passed us, dropping the last reference mid-call. */
+        { "escapes: the callee is a PARAMETER (not nameable)",
+          "func f(a, fn) { a[0] = 1; fn(1); }\n"
+          "func other(k) { return k; }\nvar q = [0]; f(q, other);",
+          "f", 0x0 },
+        /* THE BUILTIN ARGUMENT-CAPTURE TABLE, both directions. `len` is
+         * audited as storing nothing, and it is THE shape that makes the
+         * analysis reach real code - `for (var i = 0; i < len(a); i++)`
+         * was excluded outright before the fixpoint. */
+        { "passed to an audited no-capture BUILTIN (len): still marked",
+          "func f(a, k) { k = k + 1; a[0] = len(a) + k; }\n"
+          "var q = [0]; f(q, 1);", "f", 0x1 },
+        { "escapes: passed to a builtin that STORES it (append)",
+          "func f(a, k) { k = k + 1; append(a, k); }\n"
+          "var q = [0]; f(q, 1);", "f", 0x0 },
+        /*
+         * ⛔ A HIGHER-ORDER builtin runs MyLang code this pass cannot see,
+         * so it poisons the WHOLE function - the callback may reassign the
+         * global that some caller passed us.
+         *
+         * The parameter under test is NOT the one handed to `sort`, and
+         * that is the whole point: a first version sorted `a` itself, so
+         * `a`'s bit was cleared by the capture rule (sort is not in the
+         * transparent table) and the row passed with the higher-order rule
+         * DELETED - it was the only guard in the matrix that survived its
+         * sabotage. Here `a` is only ever a subscript base, so nothing but
+         * the higher-order poison can clear it.
+         */
+        { "escapes: a builtin runs a CALLBACK (poisons the whole function)",
+          "func f(a, b, k) { k = k + 1; a[0] = k;"
+          " sort(b, func(x, y) => x < y); }\n"
+          "var q = [0]; var r = [3, 1]; f(q, r, 1);", "f", 0x0 },
+        /* A struct construction STORES its arguments into the instance,
+         * which outlives the call - but it calls nothing, so it clears the
+         * bits of what it is given without poisoning the function. */
+        { "escapes: handed to a struct constructor",
+          "struct B { dyn? v; }\n"
+          "func f(a, b, k) { k = k + 1; b[0] = k; var t = B(a); }\n"
+          "var q = [0]; var r = [0]; f(q, r, 1);", "f", 0x2 },
         { "escapes: captured by a nested function",
           "func f(a) { var c = func [a] () { return a[0]; }; }\n"
           "var q = [0]; f(q);", "f", 0x0 },
-        /* ⛔ THE CASE THE "no calls" RULE EXISTS FOR, and the only one:
-         * the param is never mentioned in the call, so the base-position
-         * rule alone would keep its bit - but the callee reassigns the
-         * GLOBAL that the argument may BE, dropping the last count on it
-         * mid-call. `h` reassigns a scalar param so the inliner leaves it
-         * a real call (see the note on the previous case). Sabotage
-         * watched: delete the CallExpr test and this row fails; it is the
-         * ONLY row that does, which is why it is here. */
+        /* ⛔ THE ROW THE GLOBAL-WRITE RULE EXISTS FOR, and the only one:
+         * the param is never mentioned in the call, so nothing about the
+         * ARGUMENT positions can clear its bit - but the callee reassigns
+         * the GLOBAL that the argument may BE, dropping the last count on
+         * it mid-call. Since the fixpoint this is also the row that pins
+         * the TRANSITIVE half: `f` does not write a global, `h` does, and
+         * the poison has to travel the call edge. Sabotage watched: delete
+         * the global-write test and this row fails. */
         { "escapes: the body CALLS something, even without passing it",
           "var g = [0];\nfunc h(k) { k = k + 1; g = [k]; }\n"
           "func rd() { return g[0]; }\n"
@@ -20766,6 +20832,16 @@ static bool param_escape_analysis()
         { "escapes: thrown",
           "struct E { dyn? v; }\nfunc f(a) { throw E(a); }\n"
           "var q = [0]; try { f(q); } catch (E) { }", "f", 0x0 },
+        /* ⛔ THE SCALAR SKIP, pinned by a scalar the body never mentions.
+         * Every other row here mentions its int param somewhere, and a
+         * mention is a non-base read that clears the bit anyway - so with
+         * the skip deleted they all still pass and it looks tested. Here
+         * nothing clears bit 1 but the skip itself: deleting it answers
+         * 0x3. (A scalar param is a by-value copy; claiming it would tell
+         * the consumer to skip a retain that was never taken.) */
+        { "a scalar param is never claimed, even when unmentioned",
+          "func f(array a, int x) { a[0] = 1; }\nvar q = [0]; f(q, 7);",
+          "f", 0x1 },
     };
 
     /* find a named FuncDeclStmt anywhere under the root */
@@ -20784,37 +20860,171 @@ static bool param_escape_analysis()
         return found;
     };
 
-    for (const Case &c : cases) {
-        std::string src = c.src;
+    /* compile `src` and read the stamped mask off function `fn` */
+    auto mask_of = [&](const std::string &src, const char *fn,
+                       const char *what, uint64_t *out) -> bool {
         std::vector<Tok> toks;
-        lexer(src, 1, toks);
-        uint64_t got = 0;
-        bool ok = true;
+        lexer(const_cast<std::string &>(src), 1, toks);
         try {
             ParseContext pc(TokenStream(toks), true);
             unique_ptr<Construct> root = pBlock(pc);
             mark_implicit_globals(root.get(), {});
             infer_types(root.get(), true);
             run_optimizers(root.get());
-            FuncDeclStmt *fd = find(root.get(), c.fn);
+            FuncDeclStmt *fd = find(root.get(), fn);
             if (!fd || !fd->desc) {
                 fprintf(stderr, "param_escape_analysis: '%s': no func '%s'"
                                 " (inlined away? use an impure body)\n",
-                        c.what, c.fn);
+                        what, fn);
                 return false;
             }
-            got = fd->desc->noescape_params;
+            *out = fd->desc->noescape_params;
         } catch (Exception &e) {
             fprintf(stderr, "param_escape_analysis: '%s' threw %s: %s\n",
-                    c.what, e.name, e.msg ? e.msg : "");
-            ok = false;
+                    what, e.name, e.msg ? e.msg : "");
+            return false;
         }
-        if (!ok)
+        return true;
+    };
+
+    for (const Case &c : cases) {
+        uint64_t got = 0;
+        if (!mask_of(c.src, c.fn, c.what, &got))
             return false;
         if (got != c.want) {
             fprintf(stderr, "param_escape_analysis: '%s': noescape_params "
                             "0x%llx, want 0x%llx\n", c.what,
                     (unsigned long long)got, (unsigned long long)c.want);
+            return false;
+        }
+    }
+
+    /*
+     * ⛔ POSITIONAL COVERAGE - the rows that make a WALKER GAP a test
+     * failure rather than a use-after-free.
+     *
+     * The analysis rides `fmi_children`, which delegates to
+     * `for_each_child`, a dynamic_cast chain whose fallthrough means "no
+     * children". A node kind missing from it therefore HIDES every
+     * occurrence of the parameter underneath it - and hiding occurrences is
+     * precisely how a parameter gets wrongly marked non-escaping. So each
+     * row below puts a BARE READ of `a` in one syntactic position, over a
+     * fixed body that also gives `a` a legitimate base use:
+     *
+     *     func f(array a, array b) { a[0] = 1; <stmt> }
+     *
+     * If the walker cannot reach <stmt>, bit 0 survives and the row fails,
+     * naming the position. `b` is the second reference param, present so a
+     * row needs a runtime-ish condition without calling anything (a call
+     * would make the body opaque and test nothing); where a row never
+     * mentions `b` its bit stays set - an unmentioned parameter cannot
+     * escape - which is why most rows want 0x2 rather than 0.
+     */
+    struct Pos {
+        const char *what;
+        const char *stmt;
+        uint64_t want;
+    };
+    static const std::vector<Pos> positions = {
+        { "an expression statement",        "var z = a;",            0x2 },
+        { "a nested block",                 "{ var z = a; }",        0x2 },
+        { "an if condition",                "if (a == none) { }",    0x2 },
+        { "an if THEN block",
+          "if (b == none) { var z = a; }",                           0x0 },
+        { "an if ELSE block",
+          "if (b == none) { } else { var z = a; }",                  0x0 },
+        { "a while condition",              "while (a == none) { }", 0x2 },
+        { "a while body",
+          "while (b == none) { var z = a; }",                        0x0 },
+        { "a for INIT",
+          "for (var i = a; b == none; ) { }",                        0x0 },
+        { "a for CONDITION",
+          "for (var i = 0; a == none; i++) { }",                     0x2 },
+        { "a for INCREMENT",
+          "for (var i = a; b == none; i = a) { }",                   0x0 },
+        { "a for BODY",
+          "for (var i = 0; b == none; i++) { var z = a; }",          0x0 },
+        { "a foreach CONTAINER",       "foreach (var e in a) { }",   0x2 },
+        { "a foreach BODY",
+          "foreach (var e in b) { var z = a; }",                     0x0 },
+        { "a try body",       "try { var z = a; } catch (E) { }",    0x2 },
+        { "a catch body",     "try { } catch (E) { var z = a; }",    0x2 },
+        { "a finally body",   "try { } finally { var z = a; }",      0x2 },
+        { "a ternary condition",
+          "var z = (a == none) ? 1 : 2;",                            0x2 },
+        { "a ternary THEN arm",
+          "var z = (b == none) ? a : b;",                            0x0 },
+        { "a ternary ELSE arm",
+          "var z = (b == none) ? b : a;",                            0x0 },
+        { "a logical-op operand",
+          "var z = (b == none) && (a == none);",                     0x0 },
+        { "an arithmetic operand",          "var z = b + a;",        0x0 },
+        /* An ARGUMENT position, reachable only since the fixpoint stopped
+         * treating every call as opaque. `esc` lets its parameter out by
+         * returning it, so reaching this position must clear bit 0; it
+         * reassigns a scalar param so the inliner leaves the call alone. */
+        { "an argument position",           "var z = esc(a, 1);",    0x2 },
+        { "an array literal element",       "var z = [a];",          0x2 },
+        { "a dict literal VALUE",           "var z = {\"k\": a};",   0x2 },
+        { "a return operand",               "return a;",             0x2 },
+        /* THE BASE/INDEX SPLIT: `b[a]` reads `a` as a dict KEY (a bare
+         * read, so it escapes) while `b` is the container base (so it does
+         * not). A row that got the walker's Subscript arm half right -
+         * visiting `what` but not `index` - passes every other row here
+         * and fails this one. */
+        { "a subscript INDEX, the base beside it staying marked",
+          "var z = b[a];",                                           0x2 },
+        /* A SLICE base is deliberately NOT a base position: the view it
+         * makes registers in the parent's live-slices set and can outlive
+         * the call. */
+        { "a slice base (a view outlives the call)",
+          "var z = a[0:1];",                                         0x2 },
+    };
+
+    for (const Pos &p : positions) {
+        const std::string src =
+            std::string("struct E { int v; }\n")
+            + "func esc(z, k) { k = k + 1; if (k > 0) { return z; }"
+              " return z; }\n"
+            + "func f(array a, array b) { a[0] = 1; " + p.stmt + " }\n"
+            + "var q = [0]; var r = [0]; f(q, r);\n";
+        uint64_t got = 0;
+        if (!mask_of(src, "f", p.what, &got))
+            return false;
+        if (got != p.want) {
+            fprintf(stderr, "param_escape_analysis: a bare read in %s: "
+                            "noescape_params 0x%llx, want 0x%llx%s\n",
+                    p.what, (unsigned long long)got,
+                    (unsigned long long)p.want,
+                    (got & 1) && !(p.want & 1)
+                        ? " - the walker cannot reach this position, so an "
+                          "occurrence there is INVISIBLE (a wrongly-marked "
+                          "param is a use-after-free)" : "");
+            return false;
+        }
+    }
+
+    /*
+     * THE 64-PARAM CAP. The mask is a uint64_t, so `1 << i` for i >= 64 is
+     * undefined behaviour - which a sanitized build reports and an
+     * optimized one silently gets wrong. 65 params, none of them claimable
+     * anyway; the row is here for the shift, and UBSan is the real oracle.
+     */
+    {
+        std::string params, args;
+        for (int i = 0; i < 65; i++) {
+            if (i) { params += ", "; args += ", "; }
+            params += "array p" + std::to_string(i);
+            args += "q";
+        }
+        const std::string src = "func wide(" + params + ") { p0[0] = 1; }\n"
+                                "var q = [0]; wide(" + args + ");\n";
+        uint64_t got = 0;
+        if (!mask_of(src, "wide", "65 params", &got))
+            return false;
+        if (got != 0) {
+            fprintf(stderr, "param_escape_analysis: 65 params: want 0x0, "
+                            "got 0x%llx\n", (unsigned long long)got);
             return false;
         }
     }

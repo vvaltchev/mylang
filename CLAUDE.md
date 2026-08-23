@@ -1112,7 +1112,8 @@ nothing to register).
   same file also hosts the **auto-const** folder (the `AutoConst` class), run at
   the end of `resolve_names` (see the const-evaluation section), and the
   **inliner** (the `Inliner` class), run after it (gated by `-ni`; see the value
-  model section / `plans/archived/function-inlining.md`).
+  model section / `plans/archived/function-inlining.md`), and the **parameter
+  escape analysis** (`stamp_noescape_params`, last — see below).
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
@@ -1668,6 +1669,41 @@ this way costs ~no optimization:** a param-mutator can't const-fold (a const arg
 is read-only → the write throws), isn't inlined (mutators are block-bodied), and
 the for-range already excluded it — but it *enables* a sound pure-container-arg
 for-range bound (`compute(arr)`); see the eval below.
+
+**⛔ THE PARAMETER ESCAPE ANALYSIS (#93, `stamp_noescape_params` in
+resolver.cpp) — A FALSE "SAFE" IS A USE-AFTER-FREE, SO EVERY RULE FAILS
+CLOSED.** `func_mutates_input`'s transitive, escape-aware sibling: per
+parameter, *can the reference this is bound to still be reachable after the
+call returns?* The answer is a bit in `FuncDescriptor::noescape_params`, and
+its intended consumer is a reference argument bound with NO retain (the
+caller's slot holds one for the whole of a synchronous call). **There is no
+consumer yet** — the two hazards one owes are recorded on the pass and in
+`plans/top5-cpp-gap.md`. Four rules a future editor must not soften:
+
+- **It runs LAST in `resolve_names`, after `devirtualize_direct_calls`** — it
+  reads `SymKind::global` (pass 2) and `direct_func_slot` (that call). A
+  first version sat in `process_function` beside `func_mutates_input` and
+  marked a global-writing function's parameter safe. The audit-table stage
+  trap, with a dangling-pointer failure direction.
+- **An unknown NODE SHAPE declines** (`esc_known_shape`). `for_each_child` is
+  a dynamic_cast chain whose fallthrough means "no children", so a node kind
+  missing from it HIDES occurrences — and a hidden occurrence is exactly how
+  a parameter gets wrongly marked. `ForRangeStmt` is the live example, out of
+  reach today only because this pass runs before `specialize_types`.
+- **An unlisted BUILTIN captures everything** (`esc_builtin_transparent`). A
+  listed one claims three things at once: stores no argument, does not return
+  one, and invokes no callback. **Audit the third by grep, not by eye** —
+  `sum` was listed on the reasoning that a sum is a number, but `sum(arr, f)`
+  is a reduce; the awk that finds every builtin reaching `VmInvoker`/
+  `eval_func` is quoted at the table. A new builtin needs no entry.
+- **A callee it cannot NAME poisons the whole function**, not just the
+  arguments handed to it: it might reassign the global that some caller
+  passed us and drop the last reference mid-call.
+
+Every rule is pinned by a `param_escape_analysis` row that fails when the
+rule is deleted (watched, one sabotage build per rule), except the
+reassignment guard, which is proven REDUNDANT by an `ML_CHECK` — no test can
+reach it, and the check fires if a future change ever makes it load-bearing.
 
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to

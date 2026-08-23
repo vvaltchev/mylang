@@ -1005,12 +1005,151 @@ are the general lesson:
    a body with no call and a genuinely non-escaping param. The case needs
    a callee the inliner refuses (one that reassigns a scalar param).
 
-AND TWO OF THE THREE GUARDS ARE DEFENSIVE, NOT PROVEN - said plainly
-because the sabotage runs say so: deleting the CallExpr test or the
-`slot_writes` test leaves the whole table green, because the
-base-position rule clears those bits first. Only one row in the table
-fails when the CallExpr test is removed (the call that never mentions the
-param, added for exactly that reason); no row fails without the
-`slot_writes` test at all. Both stay - the failure direction is a
-use-after-free and the rules answer different questions - but nobody
-should believe they are pinned.
+THE HARDENING PASS AND THE CALL-GRAPH FIXPOINT LANDED THE NEXT DAY
+(2026-08-15) - see the section below, which supersedes this paragraph and
+the reach numbers above.
+
+
+## #93: EVERY RULE IS NOW PINNED, AND THE ANALYSIS IS TRANSITIVE
+## (2026-08-15)
+
+### PART 1 - THE TESTS ACTUALLY WORK NOW
+
+The honest statement a day earlier was that two of three guards were
+defensive: deleting the CallExpr test or the `slot_writes` test left the
+suite green. Three things fixed that, and only the first is an ordinary
+test.
+
+**(a) A POSITIONAL COVERAGE TABLE.** 27 rows, each putting a BARE READ of
+the parameter in one syntactic position, over a body that also gives it a
+legitimate base use - so if the walker cannot reach that position the bit
+survives and the row fails, naming the position. This is not pedantry:
+the analysis rides `for_each_child`, a dynamic_cast chain whose
+fallthrough means "no children", so a node kind missing from it HIDES
+occurrences, and a hidden occurrence is exactly how a parameter gets
+wrongly marked. All 27 pass today, so the walker is complete over every
+position MyLang has - and now it stays that way.
+
+**(b) FAIL CLOSED ON AN UNKNOWN SHAPE** (`esc_known_shape`). The rows in
+(a) prove today's coverage; this makes tomorrow's safe. The pass names
+the kinds whose children it knows are visited, plus the kinds that have
+none, and treats anything else as opaque. `ForRangeStmt` is the live
+example - absent from `for_each_child`, out of reach only because this
+pass runs before `specialize_types`, and a dangling borrow the day
+someone moves it.
+
+**(c) AN ML_CHECK WHERE A TEST IS IMPOSSIBLE.** The `slot_writes`
+reassignment guard cannot be reached by any program: every spelling of a
+write to a parameter puts its Identifier somewhere that is not a
+subscript base, so the scan clears the bit first. A row that LOOKS like a
+test of it passes with the guard deleted. So the guard now asserts its
+own subsumption - and that assert is what fires when the base-position
+rule is sabotaged, which is precisely the change that would make the
+guard load-bearing again while nothing tested it.
+
+**THE SABOTAGE MATRIX** (one rebuild per row, each rule deleted in turn):
+
+    capture-list clearing        CAUGHT  row: captured by a nested function
+    opaque-callee poison         CAUGHT  row: the callee is a PARAMETER
+    higher-order builtin poison  CAUGHT  row: a builtin runs a CALLBACK
+    global-write poison          CAUGHT  row: the body CALLS something
+    transitive unsafe            CAUGHT  row: the body CALLS something
+    the fixpoint edge check      CAUGHT  row: a callee that RETURNS it
+    the builtin allowlist        CAUGHT  row: a builtin that STORES it
+    esc_known_shape coverage     CAUGHT  row: a bare read in a try body
+    the base-position rule       CAUGHT  the ML_CHECK
+    the 64-param cap             CAUGHT  UBSan, at the 65-param row
+    the scalar-param skip        CAUGHT  row: a scalar param, unmentioned
+    slot_writes                  SUBSUMED - see (c)
+
+TWO of those rows were VACUOUS when first written, and the matrix is what
+said so. The higher-order row sorted the parameter under test, so its bit
+was cleared by the capture table and the row passed with the rule
+deleted - it now sorts a DIFFERENT array, leaving the poison as the only
+thing that can clear it. And the scalar-skip row mentioned its int
+parameter, so an ordinary non-base read cleared the bit; it now leaves
+the parameter unmentioned, which nothing but the skip can decide.
+
+A fourth finding from the same pass: **the scalar skip had NEVER FIRED.**
+It asked the param declaration's own `th`, which `annotate_hints` does
+not stamp, so every parameter read as non-scalar. It asks
+`ParamDesc::binds_scalar()` now - the same predicate codegen's
+`ref_slots` join uses for "this slot can never hold a reference", so the
+two answers cannot drift.
+
+### PART 2 - THE CALL-GRAPH ESCAPE FIXPOINT
+
+A call is no longer the end of the analysis. One `EscFn` per body, `mask`
+starting OPTIMISTIC and only losing bits, iterated to a greatest fixpoint
+- which is what makes recursion come out right rather than needing a
+special case, and a fixpoint rather than a traversal because mutual
+recursion makes the graph cyclic. Two facts travel the edges: an argument
+inherits the CALLEE's answer for the position it lands in, and `unsafe`
+(may reach a global write) spreads from callee to caller.
+
+Beside it, **the builtin argument-capture table**: an allowlist of
+builtins that store no argument, return no argument, and invoke no
+callback. It fails closed, so a new builtin needs no entry. `sum` was on
+it in the first version - a sum is a number - until the mechanical grep
+for `VmInvoker`/`eval_func` pointed out that `sum(arr, f)` is a reduce.
+That grep is quoted at the table, and is how the third claim is audited.
+
+TWO BUGS THE ROWS CAUGHT while it was being built, both the same family -
+a body not being scanned at all:
+ - **a function with no claimable parameters skipped its body scan**, so
+   `func h(k) { g = [k]; }` (one int param, hence no candidates) never
+   computed the `unsafe` flag its CALLERS need, and `f` calling it marked
+   its own parameter safe. `unsafe` is not a fact about your own
+   parameters; it is a fact you owe your callers;
+ - **a STRUCT CONSTRUCTION in a template body read as an unnameable
+   callee** and poisoned the function. The inferencer's
+   `vm_struct_ctor_def` stamp says "this is a construction" only for the
+   calls the check pass typed, and a template body is skipped. The
+   reliable question is the global slot the resolver hoisted the struct
+   name into.
+
+### THE REACH, WHICH IS THE NUMBER THAT DECIDES THE CONSUMER
+
+Measured over bench/my + samples (`MYLANG_JITSTATS=1 mylang -nr`):
+
+    candidate reference parameters   63
+    MARKED                           11   (was 5 before the fixpoint)
+    functions poisoned wholesale     12
+      because a higher-order builtin  9
+      because an unnameable callee    3
+      because of a global write       2
+      because of an unknown shape     0
+
+**17%.** The fixpoint roughly doubled the marks and, more to the point,
+moved 46_matrix_mult from 0 to 2: `len(a)` in a loop bound was the shape
+that excluded almost every real function. 76_funcval_dispatch marks 4 of
+8, including the `st` that lever 1 wants.
+
+**63_closures gets nothing, and that is not a limitation to fix**: its
+functions take `int` parameters (`make_counter(start)`, `make_adder(n)`),
+so there is no reference to borrow. Its cost is closure CREATION and the
+call/return protocol. The two levers are therefore NOT the shared-
+prerequisite pair the earlier section called them - lever 1 is for 76
+alone, and 63 needs its own work.
+
+A capture-list refinement landed on the way (a nested function reads
+nothing but its EXPLICIT capture list, so clear the bits it names rather
+than poisoning the function). It removed 3 poisonings and produced ZERO
+new marks - reported as measured, not as a win.
+
+**WHAT WOULD RAISE IT FURTHER**, in the order the numbers argue for:
+ 1. **treat a LAMBDA argument as an analysable callee.** 9 of the 12
+    poisonings are `sort(a, func...)` / `map(f, c)`, where the callback
+    is a FuncDeclStmt sitting right there in the argument list.
+    Analysing it like any other callee, instead of assuming a
+    higher-order builtin runs something unknowable, is the single
+    biggest remaining item;
+ 2. **split the global-write veto into a CALL-SITE condition.** It is a
+    callee-side veto standing in for a caller-side fact: the hazard is
+    only real when the ARGUMENT is a global read, since nothing a callee
+    does can reassign a caller's local. Worth doing when the consumer is
+    written, because the consumer is where the call site is.
+
+Still true, and still the gate on any of this being worth shipping: the
+consumer owes the two write-path fixes recorded above (the
+`use_count() > 1` predicate, and the per-call borrow mask for slices).
