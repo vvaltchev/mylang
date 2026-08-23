@@ -3333,3 +3333,62 @@ allocator" already exists, and its MIRROR - "every register the
 allocator has busy is discoverable by reg_holds_pin" - is the one that
 would have caught this. Consider asking the ALLOCATOR rather than
 `cache` in both borrow sites.
+
+## (ae) 2026-08-20 - two more undeclared writers found; the theory that
+## `cache` was the wrong authority was WRONG, and that matters
+
+Entry (ad) predicted the last failure was `reg_holds_pin` consulting
+`cache` where it should consult the allocator. **That prediction was
+wrong**, and the correction is the useful part.
+
+### The change was made anyway, and it IS right
+
+`Emitter::reg_is_occupied(r)` asks `ra.busy`; `RefScratch` and
+`tmp_hold` both use it now. The reasoning stands independently of the
+bug: `check_pins_are_busy()` asserts `cache` is a SUBSET of `ra.busy`,
+never the reverse, so a register taken by anything other than the pin
+machinery - a `take_fixed` pair, a transient scratch - is busy while
+`cache` says nothing. A borrow asking `cache` skips its push/pop
+exactly where something IS live. Asking `busy` can only borrow MORE
+often, which costs two instructions. (`denied` is deliberately not
+consulted: a denied register holds nothing, so there is nothing to
+preserve.)
+
+It did not fix the failure. Both are true at once, and conflating them
+is how a correct change gets reverted later for "not working".
+
+### `emit_div_magic`'s `keep` - the shape worth learning
+
+    /* the dividend is kept aside for the remainder below; naming the
+     * role is what lets the allocator move it later */
+    const uint8_t keep = RCX;
+
+**A role that LOOKS allocated and is not.** It has a name, and a
+comment promising an allocator will move it - and it is a fixed default
+that declares nothing. No `scratch()`, so the survey never saw it. It
+now borrows like the rest.
+
+It only bites a fragment that BOTH strength-reduces a division AND has
+enough hot locals to spend an eleventh pin, which is one program in the
+corpus - the reason it outlived every other rcx blocker.
+
+### STILL 23/24 - what the next person should know
+
+`17_elem2_divmod_roles` still diverges. What is now ESTABLISHED, so it
+need not be re-derived:
+
+  - rcx IS pinned in the failing fragment (it holds `j`) - but NOT in
+    the first fragment, which pins r12-r15. Reading the wrong fragment's
+    entry is what sent (ad) down the wrong path; check the fragment that
+    actually contains the divmod.
+  - the borrows DO fire there - `push rcx` / `pop rcx` are visible in
+    the dump around the ref checks.
+  - admitting rcx grows the pin budget (MAX_XCACHED 7 -> 8), so the
+    fragment pins an EXTRA slot: `mov r8, j; mov rdi, a0` becomes
+    `mov rcx, j; mov r8, a0; mov rdi, a1`. The divergence may therefore
+    be about the extra pin rather than about rcx specifically - worth
+    testing with `MYLANG_JIT_MAXPINS=11` against the rcx build, which
+    separates "rcx is unsafe" from "an 11th pin is unsafe".
+
+That last test is the one to run first: it is one command and it halves
+the search space.
