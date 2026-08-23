@@ -205,3 +205,76 @@ NEW HONEST WORST LIST (the roadmap's targets): 75 36.0x (len()-as-
 builtin-call + unpack helper; see its entry),
 64 41.6x, 46 33.3x, 63 30.3x, 11 30.6x, 30 28.7x, 10 25.5x, 76 24.7x,
 77 17.2x, 73 9.9x, 68 7.8x, 60 7.5x, 74 7.4x.
+
+
+## ⛔ THE 2026-07-26 CALLBACK VERDICT IS REVERSED (maintainer, 2026-08-14)
+
+The class-D list above records:
+
+> **34/35/12 callback loops**: maintainer verdict - MyLang's fault (the
+> VmInvoker dispatch re-entry); C++ stays inlined. No bench change; the
+> fix is roadmap lever 2.
+
+**That verdict no longer stands**, and the maintainer stated the
+principle more precisely than "callbacks":
+
+> C++ inlining is FAIR, but not when it's about STL function calls while
+> we're using MyLang BUILTINS on the other side. MyLang callbacks cannot
+> be inlined into the hard-coded builtins, while the STL doesn't have
+> this problem.
+
+So the test is NOT "does the C++ inline a lambda". It is **"is the
+MyLang side a hard-coded BUILTIN that structurally CANNOT inline its
+callback?"** A `std::sort` that inlines its comparator is competing
+against `builtin_sort_lv`, which reaches its comparator only through
+VmInvoker - the C++ enjoys an inlining the MyLang side cannot have at
+any optimization level.
+
+**Where the line falls, and it matters:** `12_higher_order` is
+`func apply(f, x) => f(x)` - a USER function, which MyLang's own
+inliner, devirtualizer and bytecode splice can all collapse. g++
+inlining `apply` (asm: zero calls, the loop folds to `imul`) is
+therefore FAIR and 12 is UNCHANGED. Only the builtin-plus-callback
+shapes were touched.
+
+THE COMPLETE AUDIT - every callback passed to a builtin in bench/my,
+which is 5 sites across 4 benches:
+
+    34_sort_custom_cmp   sort(a, func(p,q) => p<q)
+    35_map_filter        map(func(x) => x*2, a)
+                         filter(func(x) => x%3==0, b)
+    57_bool_reduce       make_array(N, func(i) => i%2==0)
+    67_make_dict         make_dict(ks, func[r](k) => k*k+r)
+
+All four twins now call a `std::function` through a `noinline` helper
+that stands in for the builtin. ASM-VERIFIED per the prove-it rule -
+indirect calls present in each hot loop where there were none:
+
+    34_sort_custom_cmp   14 indirect calls in the emitted asm
+    35_map_filter         6
+    67_make_dict          3
+    57_bool_reduce        3
+    12_higher_order       0  (unchanged, and correctly so)
+
+The builtin uses with NO callback stay as they are, and for the reason
+the rule gives: `sort(a)` without a comparator, `sum`, `min`, `max` and
+`find` are hard-coded C++ on BOTH sides, so an STL twin is the honest
+counterpart (33_sort_ints, 36_sum_builtin, 38_min_max, 39_find_builtin,
+52_cse_dedup).
+
+**WHY THE FIX GOES ON THE BENCH SIDE AND NOT IN THE IMPLEMENTATION**
+(maintainer, 2026-08-14): to give MyLang the inlining `std::sort` gets,
+we would have to **emit the sorting function itself** - JIT-generate a
+sort specialized to this comparator, per call site - *"which is overkill
+for MyLang"*. The asymmetry is structural and we are choosing to keep
+it, so the honest move is to stop the C++ side from exploiting an
+advantage the design will never have.
+
+NOTE WHAT THIS DOES **NOT** RULE OUT. "Emit the sort" is overkill; a
+**typed callback ENTRY** is not the same thing. The comparator would
+still be called once per comparison - no inlining, no emitted
+algorithm - but it could be entered with two raw `int_type`s instead of
+two boxed `EvalValue`s bound through the generic parameter path. On
+34_sort_custom_cmp that is ~72 Ir of boxing in `sort_core` plus most of
+the ~152 Ir inside `VmInvoker::invoke`, out of ~300 per comparison.
+That optimization stays on the table; the inlining does not.
