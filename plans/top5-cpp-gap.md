@@ -621,3 +621,69 @@ audit in scope - NOT bolted onto a measurement session.
 
 NOT STARTED. The investigation above is the deliverable; the next
 session should start from the ref_slots contract, not from the emitter.
+
+## #162 LANDED (66e8562): THE IN-PLACE ARGUMENT - the staging copy is
+## DELETED, and the ownership surgery the investigation predicted was
+## NOT NEEDED
+
+The investigation above framed direction 1 as "make the argument staging
+slot NON-OWNING": borrow into it, then neutralise it, with `ref_slots`,
+the release scan and every throwing exit in scope. **That framing was
+wrong in a useful way.** The staging slot only has to stop being WRITTEN,
+not stop being OWNING:
+
+    23  i.bin        r6 = i % 2
+    24  load.elem.v  fn = ops[r6]
+    25  move         r6 = st        <-- NO LONGER EMITTED
+    26  move         r7 = i         <-- kept (trivial: 2 stores, cheap)
+    27  call.val     _ = fn(r6, r7) <-- arg 0 read from `st` directly
+
+Skipping the write leaves the run slot holding whatever it held, still
+correctly owned by whoever wrote it. So `ref_slots` is untouched, the
+release scan is untouched, and there is no exception path to reason
+about. The copy is not made cheaper - it does not happen. A borrow would
+have deleted ONE retain/release pair (~15 Ir) and cost the whole
+ownership discipline; deleting the move takes the helper call and the
+type-erased triple with it.
+
+SOUND in one sentence: the caller slot and the run slot hold the SAME
+value, so reading either is correct as long as nothing writes the caller
+slot in between - and between the staging moves and the call, nothing
+writes anything but run slots. That is also why it survives a branch or
+a fragment entry landing anywhere in the sequence.
+
+THE ONE READER LEFT is every arm that hands the call to C++: a guard
+decline, the depth-cap SWITCH, and the BAIL whose status 1 resumes the
+INTERPRETED call op (jit_call_sync_core's documented idempotent bail).
+They converge on ONE join, and `jit_stage_args` materialises the run
+there. jit_sync_postexit was checked and cannot bail - it returns 0 or 2,
+so its exit_pc is always a re-raise.
+
+JIT-DERIVED, never a bytecode fact: recognized from the instruction
+sequence at emit time, so the interpreter is untouched, no myv version
+moves, and a hostile image cannot assert it (#137's layering could not
+verify "this slot is an argument").
+
+THE GATE I DID NOT ANTICIPATE, and the test that taught it: the coercing
+arm widens bool->int / int->float **in the argument temp**, whose
+soundness note reads "emit_args_range gives every argument a FRESH temp"
+- which a fused argument is not, so widening one would write the
+CALLER'S VARIABLE. My first version declined that arm for fused args and
+took the inline widening away from every named-local argument;
+`jit_bind_widen` failed immediately (its widening argument is a plain int
+loop counter). The fix is to fuse ONLY `ref_slots` members: a reference
+at a numeric parameter already declined there, so the arm's behaviour is
+now identical to before - and it is the right VALUE gate anyway, since a
+trivial argument's staging move is already the inline two-store path.
+
+MEASURED (76_funcval_dispatch, OPT=1 ASSERTS=0, scale-1-vs-3 delta):
+see the numbers appended below.
+
+SABOTAGE (all watched):
+ - ref_slots gate removed -> `jit_bind_widen` fails AND
+   arg_inplace_shapes reports the int local fused (1898/1900);
+ - cold-arm materialisation removed -> the ref-arg bind test fails and
+   the suite ABORTS on a downstream assertion; the cold shape run alone
+   gives InternalErrorEx (the C++ tier read an unwritten run);
+ - named-local gate removed -> NOTHING fails (-rt and the corpus stay
+   green). Recorded as defensive, not proven, in the code.
