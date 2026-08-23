@@ -5511,6 +5511,24 @@ omitting it is a compile error.
     INCOMPLETE report, the same way a behavior change without its README
     update is an incomplete change.
 
+- **THE MICRO-STEP ORDER INSIDE A TASK IS YOURS — DON'T ASK
+  (maintainer-set, 2026-08-14).** The maintainer sequences work at the
+  HIGH level: optimization vs feature vs test coverage, and which task
+  comes next. Inside a task he has already chosen, the order of the
+  small steps is Claude's call, and the criterion is **whichever order
+  makes the work EASIER TO EXECUTE** — not which reads better in a
+  report. If the NET RESULT of the task is the same, do not stop to ask
+  permission to reorder.
+  The case that set this: the call-window work needed its
+  correctness ORACLE rewritten before the thing it verifies could
+  change (the test rests on a field the change deletes), i.e.
+  test-then-build instead of build-then-test. That was surfaced as a
+  fork for the maintainer; it is not one. Rewriting the oracle first IS
+  part of the task, so just do it in that order.
+  **What still goes to him:** a change to the LANGUAGE or the
+  ARCHITECTURE, a new direction, dropping a piece of the task, or a
+  result that contradicts the task's premise. Not "may I do step B
+  before step A".
 - **DON'T pick work by "highest value" — the MAINTAINER prioritizes; YOU pick
   the SMALLEST step that makes progress in the chosen direction
   (maintainer-set, 2026-07-19).** When deciding what to do next, do NOT rank
