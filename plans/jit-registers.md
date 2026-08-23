@@ -3758,3 +3758,20 @@ that aborts when the shape gate is removed). g_jit_two_addr_reg
 counts it; probe 611 emits, `sar r14, 1` in -vdj; bench flat
 (1.007x geomean on a noise-flagged box). Full entry:
 docs/jit-optimizations.md "TWO-ADDRESS SHIFTS".
+
+## (ap) 2026-08-22 - the mandate arc opens: the ratchet, the
+## staging-clobber bug, the first conversion
+
+The re-opened mandate's bookkeeping landed (tags + regcensus --gate +
+floors in driver_checks), and the FIRST site audit found a SHIPPED
+WRONG ANSWER in the default configuration - the flat compound store's
+decline path divided by the INDEX because the rhs's "cache-aware"
+read trusted a pin that the index staging had just overwritten (rsi,
+>= 6 pins). Fixed with read_slot_avoid/load_operand_avoid (post-
+prologue slot reads for masked pins) at the store + elem2 staging
+sites; ord()'s inline arm became the first true alloc_scratch(caps)
+conversion (literal RDX/RCX with no prologue - a pin clobber waiting
+for reach); the hand-coded movzx became a generic encoder. Net:
+jit_staging_clobber_sweep, 4 programs x 9 rotations vs the
+tree-walker oracle. docs/jit-optimizations.md "#96 RE-OPENED" has the
+full record. Census: 1137 -> 1132 UNJUSTIFIED, RAWENC 20 -> 19.

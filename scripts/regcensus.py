@@ -261,8 +261,17 @@ def census(path):
     res['__raw__'] = raw_encodings(lines)
     TAG = re.compile(r'reg:(\w+)')
     tag_errors, stale_tags = [], []
+    ALLOC_API = re.compile(r'\balloc_scratch\s*\(|\.take\s*\(|'
+                           r'\btake\s*\(|\bfree_scratch\s*\(')
     for i, l in enumerate(lines):
         if 'enum Reg' in l:
+            continue
+        # A register mention on an ALLOCATOR-API line is the model's
+        # INPUT - a prefer/exclude mask (`alloc_scratch(caps, 1u << RDX)`
+        # keeps the legacy emission byte-identical while the register is
+        # free) - not a bypass. Counting it would punish exactly the
+        # conversion the mandate demands.
+        if ALLOC_API.search(l):
             continue
         hits = {}
         for r in REGS:

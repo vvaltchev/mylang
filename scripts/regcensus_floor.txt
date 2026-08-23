@@ -6,13 +6,13 @@
 # direction, so progress is monotonic and slippage is loud.
 # RAWENC = hand-encoded instruction lines (the census blind spot).
 RAX    621
-RCX    143
-RDX    107
+RCX    140
+RDX    105
 RSI     38
 RDI     26
 R8      56
 R9      29
 R10     76
 R11     41
-TOTAL 1137
-RAWENC  20
+TOTAL 1132
+RAWENC  19

@@ -7507,3 +7507,61 @@ means a libm call inside the RMW tail, which needs the full call
 prologue/epilogue - at that point it IS the helper, minus only the
 LValue* formation. Declined as not worth a call-bearing tail; revisit
 only with evidence of a hot fmod-store loop.
+
+## #96 RE-OPENED: THE STAGING-CLOBBER BUG + THE FIRST MANDATE
+## CONVERSION (2026-08-22)
+
+**The mandate (maintainer):** an emitter site may demand a specific
+register only with a HARD reason - a calling convention, an
+instruction that requires it. Everything else MUST go through
+alloc_scratch(caps). regcensus.py enforces it: sites are
+bracketed / tagged (reg:isa, reg:abi, reg:conv - validated, stale
+tags reported) / UNJUSTIFIED, and `--gate` ratchets every register's
+UNJUSTIFIED count against scripts/regcensus_floor.txt in both
+directions, run by driver_checks.sh in every lane.
+
+**THE SITE AUDIT'S FIRST READ FOUND A SHIPPED WRONG ANSWER (the
+default configuration).** The flat compound store's decline path
+staged the INDEX into rsi, then read the rhs "cache-aware" from the
+rhs slot's pin - which WAS rsi in a >= 6-pin run - so the helper
+divided by the index: `a[j&7] /= d` with d == 0 COMPLETED (dividing
+by 7) while tw / -nj / OFF=all all threw DivisionByZeroEx.
+Byte-proven in -vdj hex: `mov rsi,[rbx+0x180]` (idx) then
+`mov rdx, rsi` (the "cache-aware" rhs read). The prologue-first
+note's premise - "a spill does not INVALIDATE ... only the `call`
+clobbers" - missed that THE ARGUMENT STAGING ITSELF clobbers pin
+registers that later cache-aware argument reads still trust. The
+same class silently corrupted the stored VALUE for negative-index
+compound stores (the helper wraps the index and uses rhs = idx),
+and the LoadElem2 helper tail staged the inner index after the
+outer with the same hole.
+
+**The fix - read_slot_avoid / load_operand_avoid:** between
+emit_call_prologue and the call, every cache-aware argument load
+AFTER the first passes the mask of already-staged targets; a pin in
+the mask reads its FRAME SLOT instead, which the prologue's spill
+made current. ONLY sound in that window (elsewhere a pinned slot's
+frame copy is stale - read_slot's contract, restated at the seam).
+
+**The first mandate conversion, forced by the same audit:** ord()'s
+INLINE arm wrote literal RDX (index) and RCX (data pointer) with NO
+prologue to spill a pin - a pin in either register meant a tracker
+abort in debug and silent corruption in release, reachable the day
+a pinned-enough run contains OrdCharV. Both registers now come from
+`alloc_scratch(CAP_MEM_BASE, prefer)` - prefer keeps the legacy
+bytes while the register is free (the -8 discount always beats an
+unpreferred caller-saved weight), and a pinned register simply
+yields another. Allocation failure skips the inline arm (the helper
+serves). The hand-coded `0F B6 04 11` became the generic
+`movzx_byte_bi` (REX only when an extension bit is needed, so the
+legacy spelling is byte-identical) - RAWENC 20 -> 19.
+
+**The net:** `jit_staging_clobber_sweep` - four programs x all nine
+pool rotations, each checked against the tree-walker oracle (or a
+literal want): the divide-by-the-index throw, the negative-index
+silent value corruption, the elem2 inner-index helper shape, and
+the ord() sum. A rotation sweep, because the pin-assignment
+coincidence is exactly what a fixed preference order never tests
+(the r9 lesson). Census after: UNJUSTIFIED 1137 -> 1132, RAWENC
+20 -> 19; allocator-API lines (prefer/exclude masks) are census
+INPUT, not bypasses, and are exempted.

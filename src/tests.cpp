@@ -25890,6 +25890,202 @@ static bool jit_rax_pin_test()
 #endif
 }
 
+/*
+ * #96 THE STAGING-CLOBBER SWEEP. A helper call's arguments are staged
+ * into fixed SysV registers; a LATER argument's cache-aware read used
+ * to trust the pin map even when an EARLIER argument had just been
+ * staged INTO that pin's register. Shipped as a wrong answer in the
+ * default configuration: the flat compound store's decline path loaded
+ * the index into RSI, then read the rhs "cache-aware" from its pin -
+ * RSI - so the helper divided by the INDEX (a[j&7] /= d with d == 0
+ * COMPLETED, dividing by 7; tw/-nj/OFF=all all threw). Found by the
+ * re-opened #96 site audit, byte-proven in -vdj hex.
+ *
+ * Three programs x every pool rotation, so SOME rotation pins the
+ * hazard slot in RSI regardless of preference order:
+ *   1. the divide-by-the-index shape: d == 0 on the last iteration
+ *      MUST throw (pre-fix: completed with a plausible number);
+ *   2. the negative-index twin: the decline path's rhs corruption is
+ *      a silent WRONG VALUE, not a throw;
+ *   3. the LoadElem2 helper tail: the inner index staged after the
+ *      outer one - slice rows force the helper tier.
+ * The ord() shape rides along: its inline arm now ASKS the allocator
+ * for its index/data registers (the first mandate conversion) - every
+ * rotation must give the same sum where the literal-RDX/RCX form
+ * tracker-aborted the moment either register was pinned.
+ */
+static bool jit_staging_clobber_sweep()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src) -> std::string {
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return cap.str();
+    };
+
+    struct Case { const char *name; std::vector<const char *> src;
+                  const char *want; };
+    const std::vector<Case> cases = {
+      { "div-by-the-index (must throw)",
+        { "func f(int n) {",
+          "    var a = array(8, 0);",
+          "    var i = 0;",
+          "    while (i < 8) { a[i] = 100 + i; i++; }",
+          "    var h0 = 1; var h1 = 2;",
+          "    var t = 0;",
+          "    var j = 0;",
+          "    while (j < 4000) {",
+          "        h0 += j; h1 += h0;",
+          "        var d = 7;",
+          "        if (j == 3999) { d = n - 2; }",
+          "        a[j & 7] /= d;",
+          "        t += a[j & 7];",
+          "        j++;",
+          "    }",
+          "    return t + h0 + h1;",
+          "}",
+          "try { f(int(runtime(2))); print(\"no-throw\"); }",
+          "catch (DivisionByZeroEx) { print(\"div0\"); }" },
+        "div0 \n" },
+      { "negative-index rhs corruption (silent wrong value)",
+        { "func f(int n) {",
+          "    var a = array(8, 0);",
+          "    var i = 0;",
+          "    while (i < 8) { a[i] = 1000 + i * 100; i++; }",
+          "    var h0 = 1; var h1 = 2;",
+          "    var t = 0;",
+          "    var j = 0;",
+          "    while (j < 4000) {",
+          "        h0 += j; h1 += h0;",
+          "        var d = 3;",
+          "        var ix = j & 3;",
+          "        if (j == 3999) { ix = 0 - 1; d = n + 1; }",
+          "        a[ix] /= d;",
+          "        if (a[j & 3] < 2) { a[j & 3] = 1000; }",
+          "        t += a[j & 3];",
+          "        j++;",
+          "    }",
+          "    return a[7];",
+          "}",
+          /* a[-1] wraps to a[7] = 1700, untouched by the loop (ix
+           * covers 0..3): 1700 /= (n+1 == 3) -> 566. The pre-fix
+           * helper divided by the WRAPPED index register instead. */
+          "print(f(int(runtime(2))));" },
+        "566 \n" },
+      /* THE SHAPE THAT BITES, third attempt - each earlier one fell to
+       * a shape-eater, watched: slice rows are served by
+       * elem_slice_fast, and 3-wide BOOL rows by elem2_fast, so the
+       * helper never EXECUTED and the sabotage stayed green. The
+       * decline that must run the helper is an OOB inner index - and
+       * the corruption (the helper receives the OUTER index, a valid
+       * one) then manifests as a MISSING exception. ii is ranked 5th
+       * (j/t/h0/h1 hotter), so the rotation sweep walks its pin
+       * through every caller-saved member including rsi (bit at
+       * rotation 4 when watched). */
+      { "elem2 helper: inner index staged second (OOB decline)",
+        { "func f(int n) {",
+          "    var m = [[10, 20, 30], [40, 50, 60], [70, 80, 90]];",
+          "    var t = 0;",
+          "    var h0 = 1; var h1 = 2;",
+          "    var j = 0;",
+          "    while (j < 4000) {",
+          "        h0 += j; h0 += t; h1 += h0; h1 += j;",
+          "        var oi = j % 3;",
+          "        var ii = (j + n) % 3;",
+          "        if (j == 3999) { ii = n + 2; }",
+          "        t += m[oi][ii];",
+          "        t += ii;",
+          "        j++;",
+          "    }",
+          "    return t + h0 + h1;",
+          "}",
+          "try { f(int(runtime(1))); print(\"no-throw\"); }",
+          "catch (OutOfBoundsEx) { print(\"oob\"); }" },
+        "oob \n" },
+      { "ord inline: allocator-granted index/data registers",
+        { "func f(int n) {",
+          "    var s = \"abcdefgh\";",
+          "    var h0 = 1; var h1 = 2; var h2 = 3; var h3 = 4;",
+          "    var t = 0;",
+          "    var j = 0;",
+          "    while (j < 4000) {",
+          "        h0 += j; h1 += h0; h2 += h1; h3 += h2;",
+          "        t += ord(s[(j + n) & 7]);",
+          "        j++;",
+          "    }",
+          "    return t + h0 + h1 + h2 + h3;",
+          "}",
+          "print(f(int(runtime(1))));" },
+        nullptr },
+    };
+
+    const unsigned rot0 = g_jit_xrot;
+    bool ok = true;
+    for (const Case &c : cases) {
+        /* the ORACLE: the tree-walker (no JIT path by construction) */
+        std::string want = c.want ? std::string(c.want) : std::string();
+        if (!c.want) {
+            const ExecEngine se = g_exec_engine;
+            g_exec_engine = ExecEngine::TreeWalk;
+            std::ostringstream cap;
+            std::streambuf *old = cout.rdbuf(cap.rdbuf());
+            try {
+                std::string joined;
+                for (const char *l : c.src) { joined += l; joined += "\n"; }
+                std::vector<Tok> toks;
+                lexer(joined, 1, toks);
+                ParseContext pc(TokenStream(toks), true);
+                unique_ptr<Construct> root = pBlock(pc);
+                mark_implicit_globals(root.get(), {});
+                infer_types(root.get(), true);
+                run_optimizers(root.get());
+                root->eval(nullptr);
+            } catch (...) { }
+            cout.rdbuf(old);
+            g_exec_engine = se;
+            want = cap.str();
+            if (want.empty()) {
+                cout << "  [" << c.name << "] vacuous oracle\n";
+                ok = false;
+                continue;
+            }
+        }
+        for (unsigned rot = 0; rot < 9; rot++) {
+            g_jit_xrot = rot;
+            const std::string got = go(c.src);
+            if (got != want) {
+                cout << "  [" << c.name << "] rot " << rot << ": got \""
+                     << got << "\", want \"" << want << "\"\n";
+                ok = false;
+            }
+        }
+    }
+    g_jit_xrot = rot0;
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_xcache_pins()
 {
 #if ML_JIT_SUPPORTED
@@ -33616,6 +33812,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: REG-count shift compounds run INLINE; only the negative "
       "count declines to the flat helper (counted both ways)",
       jit_store_elem_shift_regcount },
+    { "jit: helper staging must not read a pin an earlier argument "
+      "clobbered - every rotation (#96, the divide-by-the-index bug)",
+      jit_staging_clobber_sweep },
     { "jit: the pin pool leaves the element tier two scratch candidates "
       "- the reservation, whose absence is SILENT (#96)",
       jit_elem_scratch_reserved },

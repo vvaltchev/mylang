@@ -1894,6 +1894,27 @@ struct Emitter {
         u8(static_cast<uint8_t>(0x80 | ((reg & 7) << 3) | (base & 7)));
         u32(static_cast<uint32_t>(d));
     }
+
+    /* movzx DST32, byte [BASE + IDX] (scale 1). REX is emitted only
+     * when an extension bit is needed, so the legacy eax/[rcx+rdx]
+     * spelling stays byte-identical to the old hand-coded form.
+     * rsp cannot be a SIB index and rbp/r13 need a disp under mod=00;
+     * the allocator never grants rsp (not allocatable) nor r13/rbp
+     * (callee-saved excluded from scratch), and CAP_MEM_BASE filters
+     * the rest - the checks state the contract anyway. */
+    void movzx_byte_bi(uint8_t dst, uint8_t base, uint8_t idx)
+    {
+        ML_CHECK(idx != 4);                      /* rsp: no SIB index */
+        ML_CHECK((base & 7) != 5);               /* rbp/r13: disp-less */
+        wrote(dst);
+        const uint8_t rex = 0x40
+            | (dst >= 8 ? 4 : 0) | (idx >= 8 ? 2 : 0) | (base >= 8 ? 1 : 0);
+        if (rex != 0x40)
+            u8(rex);
+        u8(0x0F); u8(0xB6);
+        u8(0x04 | ((dst & 7) << 3));             /* mod=00 reg=dst rm=SIB */
+        u8(static_cast<uint8_t>(((idx & 7) << 3) | (base & 7)));
+    }
     void store_base(uint8_t reg, uint8_t base, int32_t d)
     {
         ML_CHECK_MSG(!base_needs_sib(base),
@@ -4901,6 +4922,47 @@ static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
         e.movabs(reg, static_cast<uint64_t>(lit));
     else
         read_slot(e, reg, slot);
+}
+
+/*
+ * ⛔ #96: THE STAGING-CLOBBER HAZARD. A helper call's arguments are
+ * staged into fixed SysV registers, and a LATER argument's cache-aware
+ * read trusts the pin map - but an EARLIER argument may have just been
+ * staged into the very register that pin lives in. The prologue-first
+ * note said "a spill does not INVALIDATE ... only the `call` clobbers";
+ * the staging itself was the exception nobody named. Shipped as a
+ * WRONG ANSWER in the default configuration: the flat compound store's
+ * decline path loaded the index into RSI and then read the rhs
+ * "cache-aware" from the rhs slot's pin - RSI - so the helper divided
+ * by the INDEX (a[j&7] /= d with d == 0 completed, dividing by 7).
+ *
+ * The rule: between emit_call_prologue and the call, every cache-aware
+ * argument load AFTER the first must pass the mask of already-staged
+ * targets. A pin in the mask reads its FRAME SLOT instead - current
+ * there, because the prologue spilled every caller-saved pin. ONLY
+ * sound in that window; anywhere else a pinned slot's frame copy is
+ * stale (read_slot's contract).
+ */
+static void read_slot_avoid(Emitter &e, uint8_t dst, int slot,
+                            uint32_t avoid)
+{
+    const int cr = e.creg(slot);
+    if (cr >= 0 && (avoid & (1u << cr))) {
+        /* pinned, and the pin register was clobbered by an earlier
+         * staged argument: the prologue's spill made the slot current */
+        e.load(dst, slot_addr(slot).payload);
+        return;
+    }
+    read_slot(e, dst, slot);
+}
+
+static void load_operand_avoid(Emitter &e, uint8_t reg, bool is_lit,
+                               int_type lit, int slot, uint32_t avoid)
+{
+    if (is_lit)
+        e.movabs(reg, static_cast<uint64_t>(lit));
+    else
+        read_slot_avoid(e, reg, slot, avoid);
 }
 
 /* Ref-listed store guard (approach A): a reused temp on the chunk's ref
@@ -13364,11 +13426,16 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
     if (is_float)
         /* no_bail: the value is compile-proven float (int/bool promote in
          * the 2-way form exactly as read_float_slot does) - the store op's
-         * ONLY exit was this load's bail, which kept it non-deletable. */
+         * ONLY exit was this load's bail, which kept it non-deletable.
+         * (No staging-clobber hazard: it reads slot MEMORY, current
+         * post-prologue, never a GP pin.) */
         emit_float_load(e, X0, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
                         /*no_bail=*/true);
     else
-        load_operand(e, RDX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        /* avoid RSI: the index staging above clobbered it, and the rhs
+         * slot's pin may BE rsi - the shipped divide-by-the-index bug */
+        load_operand_avoid(e, RDX, in.b_is_lit(), in.b_lit(), in.b_slot(),
+                           1u << RSI);
 
     e.lea_rdi(base_off);                  /* rdi = &slots[base] (arg 0) */
     /* aop is the last GP arg: rcx (int helper) / rdx (float helper) */
@@ -14376,7 +14443,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                       static_cast<long>(in.target2)
                       * static_cast<long>(sizeof(LValue))));
         read_slot(e, RSI, in.a_dual_lo());
-        load_operand(e, RDX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        /* avoid RSI: the outer index just staged there may be the inner
+         * index slot's pin (the staging-clobber hazard) */
+        load_operand_avoid(e, RDX, in.b_is_lit(), in.b_lit(), in.b_slot(),
+                           1u << RSI);
         e.lea(RCX, static_cast<int32_t>(
                        static_cast<long>(in.target)
                        * static_cast<long>(sizeof(LValue))));
@@ -16592,20 +16662,35 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const JitLayout &SL = jit_layout();
         std::vector<size_t> j_cold;
         size_t j_fast_done = 0;
-        const bool inl = SL.str_inline_ok;
+        /* #96 (the mandate): the index and data-pointer scratch ASK the
+         * allocator - prefer the legacy rdx/rcx, so the emission stays
+         * byte-identical while they are free, and a run that PINS them
+         * gets other registers instead of a silent pin clobber (this
+         * inline path has NO prologue to spill one). RAX stays literal:
+         * store_dst's staging convention, and OrdCharV is not in
+         * run_may_pin_rax, so no run containing it pins rax. Allocation
+         * failure just skips the inline arm - the helper serves. */
+        const int ri = e.alloc_scratch(CAP_MEM_BASE, 1u << RDX);
+        int rd = -1;
+        if (ri >= 0) {
+            rd = e.alloc_scratch(CAP_MEM_BASE, 1u << RCX);
+            if (rd < 0)
+                e.free_scratch(static_cast<uint8_t>(ri));
+        }
+        const bool inl = SL.str_inline_ok && ri >= 0 && rd >= 0;
         if (inl) {
+            const uint8_t xidx = static_cast<uint8_t>(ri);
+            const uint8_t xdat = static_cast<uint8_t>(rd);
             const SlotAddr b = slot_addr(in.target2);
             e.cmp_byte_slot(b.payload + SL.str_slice_off, 0);
             j_cold.push_back(e.j32(0x75));       /* jne -> a slice */
             e.load32_slot(RAX, b.payload + SL.str_len_off);   /* rax = len */
-            load_operand(e, RDX, in.a_is_lit(), in.a_lit(), in.a_slot());
-            e.cmp_rr(RDX, RAX);
+            load_operand(e, xidx, in.a_is_lit(), in.a_lit(), in.a_slot());
+            e.cmp_rr(xidx, RAX);
             j_cold.push_back(e.j32(0x73));       /* jae -> neg or >= len */
             e.load(RAX, b.payload + SL.str_obj_off);      /* the StrObj * */
-            e.load_base(RCX, RAX, SL.strobj_data_off);   /* rcx = the char data */
-            e.wrote(RAX);
-            e.u8(0x0F); e.u8(0xB6); e.u8(0x04);  /* movzx eax,           */
-            e.u8(0x11);                          /*   byte [rcx + rdx]   */
+            e.load_base(xdat, RAX, SL.strobj_data_off);  /* the char data */
+            e.movzx_byte_bi(RAX, xdat, xidx);
 #ifdef TESTS
             e.bump_counter(&g_jit_ord_inline);
 #endif
@@ -16613,6 +16698,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             j_fast_done = e.j32(0xEB);
             for (const size_t j : j_cold)
                 e.patch32_here(j);
+        }
+        if (ri >= 0 && rd >= 0) {
+            e.free_scratch(static_cast<uint8_t>(rd));
+            e.free_scratch(static_cast<uint8_t>(ri));
         }
         emit_call_prologue(e);
         load_operand(e, RSI, in.a_is_lit(), in.a_lit(), in.a_slot());
