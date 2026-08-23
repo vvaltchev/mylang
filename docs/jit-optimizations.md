@@ -4526,11 +4526,48 @@ it, because its callee is an inline CACHE, not a compile-time constant
 already a call). The C++ path reads it the same way, so the two cannot
 drift.
 
-The `-rt` net is `jit_borrow_arg_shapes`: one FIRING shape and three
-DECLINING ones (the callee stores the argument in a global; the value is
-a slice; the parameter is scalar), each asserting its OWN counter delta
-as well as its result. The slice case is written to fail on a VALUE, not
-merely a count, because its failure direction is a use-after-free.
+### The `-rt` net, after a second pass over the three gaps above
+
+`jit_borrow_arg_shapes` grew from four cases to six, because the first
+version covered the mechanism and not the three hazards that actually
+bit. All six are watched failing:
+
+| rule deleted | caught by |
+|---|---|
+| the SLICE exclusion | the #94 test, on a VALUE |
+| the SCALAR rule (`t >= t_str`) | `borrow_from`'s ML_CHECK |
+| the analysis's answer (borrow everything) | `borrow_from`'s ML_CHECK |
+| `frame_release` honours the flag | ASan use-after-free |
+| the zeroing moved back after the copy loop | ASan use-after-free |
+| the per-argument index shift | the #94 test, on an exact count |
+
+Three of those six were covered by NOTHING when the tier landed, and two
+of the new cases needed a shape the obvious spelling does not produce:
+
+- **The SCALAR case was vacuous twice, in two different ways.** Written
+  `func addk(int a, ...)` the annotation makes `binds_scalar()` true, so
+  the ANALYSIS skips the parameter and the runtime rule is never
+  consulted. Written `dyn a` with a body that so much as copies `a`, the
+  scan clears the bit for the non-base read - and a `dyn` parameter that
+  only ever receives ints picks up `proven_type = i` from C3 and becomes
+  `binds_scalar` anyway. The shape that works is a parameter the body
+  NEVER READS (what a fixed-signature callback looks like), **with the
+  JIT OFF**: the emitted push's scalar arm raw-copies without calling the
+  helper, so only the C++ bind path can reach the rule - which is exactly
+  where ackermann's recursion lives. With the JIT on the same program
+  bumps twice, not 120 times.
+- **The per-POSITION case is the only one that reads the index shift.**
+  Every other case has both parameters agreeing, so a push testing bit 0
+  for EVERY argument satisfies all of them - measured: that sabotage
+  SURVIVED the five-case version and is caught by the sixth. It needs one
+  parameter claimed and one not IN THE SAME CALL, which means the second
+  must escape WITHOUT poisoning the function - a callee that RETURNS it,
+  since a global write would clear the whole mask instead.
+
+The escaping and polymorphic cases are written to fail as real
+use-after-frees rather than counter checks: the callee drops the
+caller's last reference mid-call and reads the parameter afterwards, so
+ASan is the detector and the value is the second net.
 
 STILL UNBUILT, in reach order: the emitted INLINE borrow arm (the call
 itself is still paid - the bit test and the slice test would move into

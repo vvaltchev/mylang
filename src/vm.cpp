@@ -3282,6 +3282,7 @@ unsigned long g_jit_ref_arg_binds = 0;
  */
 unsigned long g_arg_borrow = 0;
 unsigned long g_arg_borrow_slice = 0;
+unsigned long g_arg_borrow_scalar = 0;
 
 /* THE IN-PLACE ARGUMENT (#162): bumped by the EMITTED copy loop, once per
  * fused argument bound from its caller slot. */
@@ -3385,8 +3386,12 @@ vm_bind_arg(LValue &dst, const EvalValue &v, bool can_borrow)
         return;
     }
 #ifdef TESTS
-    if (can_borrow)
-        g_arg_borrow_slice++;
+    if (can_borrow) {
+        if (v.get_type()->t < Type::t_str)
+            g_arg_borrow_scalar++;
+        else
+            g_arg_borrow_slice++;
+    }
 #endif
     dst.rebind(v);
 }
