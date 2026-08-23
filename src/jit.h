@@ -296,6 +296,49 @@ extern unsigned long g_jit_inline_baked;
  * the twin mechanism, counted separately so a test can tell which ran. */
 extern unsigned long g_jit_inline_call_baked;
 
+/*
+ * D3.b step 2a (plans/register-allocator-endgame.md): PER-INTERVAL
+ * QUALIFICATION - the raw classification facts for ONE live interval
+ * (codegen.h's LiveInterval), produced by driving pick_visit_op
+ * (jit.cpp) over the run with the interval side's callbacks. Raw
+ * facts only; the consumer derives the pools:
+ *   GP candidate   : uses_int + uses_ret as weight; !mem_int;
+ *                    uses_float == 0 && !wrote_float (disjoint pools)
+ *   XMM candidate  : wrote_float && uses_float > 0; !mem_float;
+ *                    uses_int == 0 (uses_ret is EXEMPT - the emit
+ *                    flushes before jit_ret; the pick's ReturnV note)
+ *   type-elidable  : wrote_int && !full_read (C3's rule)
+ * `orphans` (out-param of the builder) counts classification events
+ * whose (slot, pc) NO interval covers - a drift detector between
+ * visit_use_def (the liveness the intervals derive from) and
+ * pick_visit_op (the classification); asserted ZERO by the -rt check.
+ * The builder returns false when some op is unclassifiable - the
+ * pick's cache-nothing answer, and the scan must decline the same way.
+ */
+struct LiveInterval;                              /* codegen.h */
+struct IntervalQual {
+    int uses_int = 0;        /* countable int uses (usei / usei_dst) */
+    int uses_ret = 0;        /* ReturnV reads (weight, no float disq) */
+    int uses_float = 0;      /* countable float uses (usef) */
+    bool wrote_int = false;      /* an int op wrote it (usei_dst) */
+    bool wrote_float = false;    /* a float op wrote it (fdst) */
+    bool full_read = false;      /* read as a full 32-byte value */
+    bool mem_int = false;        /* memory-demanded for the GP pool */
+    bool mem_float = false;      /* memory-demanded for the xmm pool */
+};
+bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
+                           const std::vector<LiveInterval> &iv,
+                           std::vector<IntervalQual> &out,
+                           int *orphans = nullptr);
+#ifdef TESTS
+/* Test-only export of the (static) pick - the D3 qualification check
+ * asserts per-interval facts against the pick's public answer. */
+std::vector<int>
+jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
+                           int slot_count, size_t max_pins,
+                           std::vector<int> *fhot);
+#endif
+
 #ifdef TESTS
 /*
  * #96 (c): re-derive the register model's capability table from the
@@ -304,6 +347,7 @@ extern unsigned long g_jit_inline_call_baked;
  * (jit.cpp) for which half of it is strong and which is drift-only.
  */
 bool jit_reg_model_check(std::string &err);
+
 /* #78 step E: times EndFinally's cold RERAISE arm ran natively (see
  * jit_end_finally, vm.cpp) - the coverage counter for the arm that used
  * to bail to the interpreter. */

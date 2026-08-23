@@ -7918,3 +7918,50 @@ retry-bound regression).
 NOTE the gcc trap: a local struct member named `usei` cannot be
 declared `const decltype(usei) &usei;` - "changes meaning of usei"
 (-fpermissive). The lambda types are `using`-aliased first.
+
+## Endgame D3.b step 2a (2026-08-23) - per-interval qualification
+
+WHAT: `jit_qualify_intervals(ck, begin, end, iv, out, &orphans)`
+(jit.cpp, declared in jit.h with the IntervalQual struct) - the first
+CONSUMER pick_visit_op was extracted for. It drives the shared
+classification switch with the interval side's callbacks: each event
+(usei / usef / bad / ...) lands on the LiveInterval covering
+(slot, pc), so an interval is judged by the uses inside IT, not by the
+whole run. Raw facts per interval - uses_int / uses_ret / uses_float
+counts, wrote_int / wrote_float / full_read / mem_int / mem_float
+flags; the pool derivations (GP / XMM candidacy, C3 elidability) are
+stated in jit.h and left to the scan. `orphans` counts events no
+interval covers - a live drift detector between visit_use_def (the
+liveness the intervals derive from) and pick_visit_op (the
+classification), since the two tables here run at the SAME stage.
+
+WHY: the endgame plan's payoff shape - one late boxed op (a DictStore
+key) no longer costs a slot its whole run; the slot's earlier hot
+interval stays register-eligible. This is the fact base the D3 scan
+allocates from.
+
+NET: the `jit: D3.b` -rt check pins the AGGREGATION against the pick's
+public answer (via a TESTS-only export of the static pick):
+ A. every picked slot is per-interval clean (weight >= 3, no mem_int,
+    no float facts); A-float likewise for fhot (wrote_float, >= 3
+    float uses, ZERO countable int uses, no mem_float);
+ D. every local refused despite >= 3 pure-int uses carries mem_int on
+    some interval (max_pins generous, so disqualification is the only
+    refusal left);
+ B. the payoff shape observed + vacuity-guarded: a run-refused slot
+    owns a clean >= 3-use interval;
+ C. orphans == 0.
+WATCHED FAILING both ways: bad() stripped of mem_int -> property D
+names all four slots; attribution disabled -> property C (22/29
+orphans) AND property A (picked slots with zero recorded weight).
+
+Not yet covered, recorded for step 2b: the uses_ret float-exemption
+(ReturnV reading an fhot slot needs a FUNCTION-chunk case - the root
+chunk ends in Halt), and a corpus-wide orphan census (rides along
+when the scan consumes the qualifier over real runs).
+
+Analysis-only: no emission change (vdjcmp trivially identical); -rt
+1690 x 5 x both arenas, corpus_diff, census gate, TESTS=1 OPT=1,
+clang OPT=1 ASSERTS=0 LTO=0 zero warnings, and the non-JIT compile
+check (jit.h's platform test forced to 0, g++ TESTS=1 build + -rt
+green) - the new jit.h decls are unguarded, so the check mattered.
