@@ -7759,3 +7759,40 @@ rsi/rdx (weight 6 - the SysV-arg penalty), which is the cost model
 applied to a candidate set the hand mask had been truncating.
 -rt 1947/1947 both arenas; corpus plain/nolowmem/xrot green; census
 gate at zero floors; TESTS=1 OPT=1 ASSERTS=0 and clang lto0 green.
+
+## Endgame C2 (2026-08-22) - the model learns the xmm FILE; the float
+## tracker exists
+
+The float side had NO model at all: pins assigned by a positional zip
+(`FCACHE_REGS[h]`), no occupancy record, no tracker - an xmm clobber
+was a silent wrong float. Now:
+
+ - `fp_allocatable/fp_weight` (the caps model): xmm2..7 allocatable -
+   xmm0/xmm1 are the per-op float scratch convention (the float
+   side's rax; helper results arrive in xmm0 per SysV) reachable only
+   through their conventional sites until C3 converts them, and
+   xmm8-15 need a REX the float encoders do not emit (an encoding
+   CAPABILITY fact; they join when the encoders do). All xmm are
+   caller-saved, so no unsaved-callee-saved hazard exists;
+ - `RegAlloc.fbusy` + ftake/ftake_fixed/fgive, and the Emitter seams
+   `alloc_fscratch(prefer, exclude)` / `free_fscratch` / `ftake_reg`;
+   the C2a pin assignment goes through the register STATE (first-free
+   over the same pool = byte-identical, the N5 argument);
+   check_pins_are_busy verifies fcache against fbusy at every
+   allocation seam; clear_cache_state drops the float occupancy with
+   the pins (no float claims exist yet);
+ - `fwrote(x)` - the float tracker, in every xmm-WRITING encoder
+   (fload, farith, fmov_rr, sqrtsd, movq_xmm_from, cvt, load_elem_sd,
+   cvtsi2sd_elem, farith_x1_x0, pxor_x1; the store forms READ their
+   xmm and are not hooked). Gates mirror wrote(): machinery, flushed,
+   call bracket; no borrow arm (push/pop do not cover xmm). The ONE
+   legitimate mid-op pin write - write_fslot's cached arm - declares
+   itself with PinMach exactly like write_slot's GP twin, and the
+   entry loads sit in a PinMach block like the GP entry loads.
+
+WATCHED FAILING: removing the write_fslot declaration aborts -rt by
+name ("write to a float-PINNED xmm register with no declaration: r5",
+opcode 54) - the net C3's 89-site conversion needs, proven before the
+conversion starts. MEASURED: 116/116 byte-identical, both arenas
+(vdjcmp vs HEAD); -rt 1947/1947 both arenas; relna + clang lto0
+green; census gate at its floors.

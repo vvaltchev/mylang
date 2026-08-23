@@ -1095,6 +1095,34 @@ static constexpr int gp_weight(uint8_t r)
 }
 
 /*
+ * C2 (plans/register-allocator-endgame.md): THE FLOAT FILE joins the
+ * model. Which xmm registers may the allocator hand out?
+ *
+ *  - xmm0/xmm1 are the per-op float scratch convention - the float
+ *    side's rax: helper float results arrive in xmm0 (SysV), the
+ *    farith/cvt staging runs through the pair - so they are reachable
+ *    only through their conventional sites until Phase C3 converts
+ *    those to asks (exactly how rax is reachable only through
+ *    acc_take and the pick);
+ *  - xmm8-15 need a REX prefix that the float encoders do not emit
+ *    (fload/fstore/movsd_store_base encode 3-bit register fields) -
+ *    an encoding CAPABILITY fact, not policy; they join when the
+ *    encoders do;
+ *  - xmm2..xmm7 are allocatable: xmm4-7 are the C2a pin pool, 2/3
+ *    free scratch. All xmm registers are caller-saved (no
+ *    callee-saved concept in the SysV float file), so there is no
+ *    fp analog of the unsaved-callee-saved hazard.
+ */
+static constexpr bool fp_allocatable(uint8_t x)
+{
+    return x >= 2 && x <= 7;
+}
+static constexpr int fp_weight(uint8_t x)
+{
+    return x >= 8 ? 1 : 0;               /* the REX byte, when legal */
+}
+
+/*
  * THE ALLOCATOR. `take` answers the maintainer's two-step question in
  * that order: filter to the FUNCTIONALLY capable, then pick the
  * cheapest. `take_fixed` is the escape hatch for the cases where the
@@ -1107,6 +1135,9 @@ static constexpr int gp_weight(uint8_t r)
 struct RegAlloc {
     uint32_t busy = 0;          /* bit r: register r is taken */
     uint32_t denied = 0;        /* bit r: this RUN may not spend it */
+    uint32_t fbusy = 0;         /* bit x: xmm<x> is taken (C2 - the
+                                 * float file; no fdenied yet, nothing
+                                 * run-denies a float register) */
 
     bool free_reg(uint8_t r) const
     { return !(busy & (1u << r)) && !(denied & (1u << r)); }
@@ -1179,6 +1210,33 @@ struct RegAlloc {
         return true;
     }
     void give(uint8_t r) { busy &= ~(1u << r); }
+
+    /* C2: the float-file twins. Same contract as take/take_fixed -
+     * -1 under pressure, never a wrong register. */
+    int ftake(uint32_t prefer = 0, uint32_t exclude = 0)
+    {
+        int best = -1, best_w = 0;
+        for (uint8_t x = 0; x < 16; x++) {
+            if (!fp_allocatable(x))
+                continue;
+            if ((fbusy | exclude) & (1u << x))
+                continue;
+            const int w = fp_weight(x)
+                        - ((prefer & (1u << x)) ? 8 : 0);
+            if (best < 0 || w < best_w) { best = x; best_w = w; }
+        }
+        if (best >= 0)
+            fbusy |= 1u << static_cast<uint8_t>(best);
+        return best;
+    }
+    bool ftake_fixed(uint8_t x)
+    {
+        if (fbusy & (1u << x))
+            return false;
+        fbusy |= 1u << x;
+        return true;
+    }
+    void fgive(uint8_t x) { fbusy &= ~(1u << x); }
 
     /*
      * THE PRESSURE ANSWER: a capable register IGNORING occupancy, for a
@@ -1381,6 +1439,39 @@ struct Emitter {
     }
 #endif
     /* EVERY encoder that writes a GP register reports it here first. */
+    /* C2 (ii): the float file's tracker parity. A write to a
+     * float-PINNED xmm outside machinery/a call bracket is the same
+     * silent-wrong-answer class the GP tracker exists for - and with
+     * Phase C3 converting 89 hardcoded X0/X1 sites to asks, this is
+     * the net that catches a conversion mistake as an abort BY NAME
+     * instead of a wrong float. All xmm are caller-saved, so there is
+     * no unsaved-callee-saved arm; there is no borrow machinery on
+     * the float side (push/pop do not cover xmm), so no borrow arm
+     * either. */
+    bool freg_holds_pin(uint8_t x) const
+    {
+        for (const CacheEnt &c : fcache)
+            if (c.reg == x)
+                return true;
+        return false;
+    }
+    void fwrote(uint8_t x)
+    {
+#ifndef NDEBUG
+        if (trk_mach > 0)
+            return;                  /* entry loads / declared updates */
+        if (!freg_holds_pin(x))
+            return;
+        if (trk_flushed)
+            return;                  /* dead until reload */
+        if (trk_bracket > 0)
+            return;                  /* spilled by the call prologue */
+        trk_fail("write to a float-PINNED xmm register with no "
+                 "declaration", x);
+#else
+        (void)x;
+#endif
+    }
     void wrote(uint8_t r)
     {
 #ifndef NDEBUG
@@ -1606,6 +1697,22 @@ struct Emitter {
         return -1;                       /* pressure: the caller spills */
     }
     void give_reg(uint8_t r) { ra.give(r); }
+    /* C2: the float twins - the pin pool scan and the ordinary ask.
+     * The occupancy they write is what check_pins_are_busy verifies
+     * against fcache, so the two records cannot drift. */
+    int ftake_reg(const uint8_t *pool, size_t n)
+    {
+        for (size_t i = 0; i < n; i++)
+            if (ra.ftake_fixed(pool[i]))
+                return pool[i];
+        return -1;
+    }
+    int alloc_fscratch(uint32_t prefer = 0, uint32_t exclude = 0)
+    {
+        check_pins_are_busy();
+        return ra.ftake(prefer, exclude);
+    }
+    void free_fscratch(uint8_t x) { ra.fgive(x); }
 
     /*
      * ⛔ #96 THE SCRATCH ALLOCATOR - `alloc_scratch()` hands out a
@@ -2891,6 +2998,7 @@ struct Emitter {
          * their registers across whatever emptied the cache, so a
          * scratch ask must still be refused them. */
         ra.busy = claim_mask;
+        ra.fbusy = 0;                    /* C2: no float claims exist */
         ML_CHECK_MSG(!cache_live(),
                      "clear_cache_state() left something live: a cache "
                      "vector was added to cache_live() but not here");
@@ -2909,6 +3017,11 @@ struct Emitter {
             ML_CHECK_MSG(ra.busy & (1u << c.reg),
                          "a pinned register is not busy in the "
                          "allocator - cache and RegAlloc have diverged");
+        /* C2: the float record too */
+        for (const CacheEnt &c : fcache)
+            ML_CHECK_MSG(ra.fbusy & (1u << c.reg),
+                         "a float pin is not busy in the allocator - "
+                         "fcache and RegAlloc have diverged");
         /* B1/B3: and the run-scoped claims - "the reservation IS
          * ra.busy" is a claim, this is its enforcement. An allocator
          * reset that forgets to re-apply one would let a scratch ask
@@ -3072,6 +3185,7 @@ struct Emitter {
     /* movsd xmm<r>, [rbx+disp] */
     void fload(uint8_t r, int32_t d)
     {
+        fwrote(r);
         u8(0xF2); u8(0x0F); u8(0x10);
         u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
     }
@@ -3095,7 +3209,7 @@ struct Emitter {
      * then in xmm1, the next op's forwarded operand lives there, and
      * the two alternate. Both < 8 (no REX): the pools are xmm0-xmm7. */
     void farith(uint8_t op, uint8_t dst = 0, uint8_t src = 1)
-    { u8(0xF2); u8(0x0F); u8(op);
+    { fwrote(dst); u8(0xF2); u8(0x0F); u8(op);
       u8(static_cast<uint8_t>(0xC0 | (dst << 3) | src)); }
 #ifdef TESTS
     /* the strength reduction's execution proof - bumped by the EMITTED
@@ -3125,11 +3239,11 @@ struct Emitter {
     }
     /* movsd xmm<dst>, xmm<src> (reg-reg; both < 8, no REX needed) */
     void fmov_rr(uint8_t dst, uint8_t src)
-    { u8(0xF2); u8(0x0F); u8(0x10);
+    { fwrote(dst); u8(0xF2); u8(0x0F); u8(0x10);
       u8(static_cast<uint8_t>(0xC0 | (dst << 3) | src)); }
     /* sqrtsd xmm<d>, xmm<s>  (SSE2) */
     void sqrtsd(uint8_t d, uint8_t s)
-    { u8(0xF2); u8(0x0F); u8(0x51);
+    { fwrote(d); u8(0xF2); u8(0x0F); u8(0x51);
       u8(static_cast<uint8_t>(0xC0 | (d << 3) | s)); }
     /* push/pop a GP reg (0x50+r / 0x58+r; REX.B for r8..r15) */
     void push_reg(uint8_t r)
@@ -3171,6 +3285,7 @@ struct Emitter {
     /* cvtsi2sd xmm<r>, qword [rbx+disp]  (int -> double) */
     void cvt(uint8_t r, int32_t d)
     {
+        fwrote(r);
         u8(0xF2); u8(0x48); u8(0x0F); u8(0x2A);
         u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
     }
@@ -3180,6 +3295,7 @@ struct Emitter {
      * the literal pool materialises through rcx, see flit_load) */
     void movq_xmm_from(uint8_t r, uint8_t gp)
     {
+        fwrote(r);
         u8(0x66); u8(0x48); u8(0x0F); u8(0x6E);
         u8(static_cast<uint8_t>(0xC0 | (r << 3) | gp));
     }
@@ -4025,13 +4141,14 @@ struct Emitter {
         modrm_sib(xmm, base, index, 8);
     }
     void load_elem_sd(uint8_t xmm, uint8_t base, uint8_t index)
-    { elem_sd(xmm, base, index, 0x10); }
+    { fwrote(xmm); elem_sd(xmm, base, index, 0x10); }
     void store_elem_sd(uint8_t base, uint8_t index, uint8_t xmm)
     { elem_sd(xmm, base, index, 0x11); }
     /* cvtsi2sd <xmm>, qword [base + index*8]  (an int element promotes;
      * REX.W is LOAD-BEARING here - it picks the 64-bit source) */
     void cvtsi2sd_elem(uint8_t xmm, uint8_t base, uint8_t index)
-    { u8(0xF2); u8(rex_sib(xmm, base, index, true)); u8(0x0F); u8(0x2A);
+    { fwrote(xmm);
+      u8(0xF2); u8(rex_sib(xmm, base, index, true)); u8(0x0F); u8(0x2A);
       modrm_sib(xmm, base, index, 8); }
 
     /* mov [base + index*8], src  (a flat int/float-payload element) */
@@ -4095,8 +4212,10 @@ struct Emitter {
     /* movsd xmm1, [rcx + r9*8] / movsd [rcx + r9*8], xmm1 */
     /* addsd/subsd/mulsd/divsd xmm1, xmm0 (op = 0x58/0x5C/0x59/0x5E) -
      * the compound direction: el = el OP rhs, el in xmm1, rhs in xmm0 */
-    void farith_x1_x0(uint8_t op) { u8(0xF2); u8(0x0F); u8(op); u8(0xC8); }
-    void pxor_x1() { u8(0x66); u8(0x0F); u8(0xEF); u8(0xC9); }
+    void farith_x1_x0(uint8_t op)
+    { fwrote(1 /* X1 */); u8(0xF2); u8(0x0F); u8(op); u8(0xC8); }
+    void pxor_x1()
+    { fwrote(1 /* X1 */); u8(0x66); u8(0x0F); u8(0xEF); u8(0xC9); }
     /* ---- #95, the nested-STORE tier (boxed slot type guards in rdx) ---- */
     /* ---- C1, the hoisted-base navigation (r12-r15 operands) ---- */
     /* mov rH, [rax+disp]  (the vector's start/finish into a hoist reg) */
@@ -11109,6 +11228,10 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
      * op, so it can never hold a reference; the epilogue flush restores
      * type+payload to memory). */
     if (const int fr = e.fcreg(dst); fr >= 0) {
+        /* the one legitimate mid-op float-pin write - updating the
+         * pinned slot's value. Declared as machinery, exactly like
+         * write_slot's GP twin. */
+        Emitter::PinMach pm(e);
         e.fmov_rr(static_cast<uint8_t>(fr), xr);
         return;
     }
@@ -20234,11 +20357,22 @@ retry_emission:
          * C++ caller expects nothing preserved), only the entry loads.
          * A non-empty fhot implies run_has_float (float pins only arise
          * from float ops), so r8 = t_float is live for the flushes. */
-        for (size_t h = 0; h < fhot.size(); h++) {
-            const SlotAddr a = slot_addr(fhot[h]);
-            e.fcache.push_back({ fhot[h], a.payload, a.type,
-                                 FCACHE_REGS[h] });
-            e.fload(FCACHE_REGS[h], a.payload);   /* entry load */
+        {
+            /* the entry loads are pin ESTABLISHMENT - machinery to the
+             * float tracker, like the GP entry loads above */
+            Emitter::PinMach pm(e);
+            for (size_t h = 0; h < fhot.size(); h++) {
+                const SlotAddr a = slot_addr(fhot[h]);
+                /* C2: through the register STATE, not the positional
+                 * zip - the first-free scan over the same pool
+                 * reproduces the old assignment byte for byte (the N5
+                 * conversion's argument, on the float file). */
+                const int xr = e.ftake_reg(FCACHE_REGS, MAX_FCACHED);
+                ML_CHECK(xr >= 0);       /* fhot.size() <= MAX_FCACHED */
+                e.fcache.push_back({ fhot[h], a.payload, a.type,
+                                     static_cast<uint8_t>(xr) });
+                e.fload(static_cast<uint8_t>(xr), a.payload);
+            }
         }
 #ifdef TESTS
         if (!fhot.empty()) {

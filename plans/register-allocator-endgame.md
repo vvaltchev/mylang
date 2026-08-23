@@ -24,7 +24,8 @@ STATUS LEDGER (update as steps land):
        measurement in the same batch; see the ledger entry)
  - [x] Phase B - the same-kind sweep (B1/B2/B2c/B2c-rdx/B3 all
        landed 2026-08-22)
- - [ ] Phase C - the float (xmm) mandate
+ - [~] Phase C - the float (xmm) mandate (C1+C2 landed; C3 the
+       89-site conversion + C4 ratchet remain)
  - [ ] Phase D - the interval allocator (splitting)
  - [ ] Phase E - retire the transition devices + doc sync
 
@@ -328,12 +329,16 @@ scratch fallback keeps its conv tag until D.
  - Baseline the counts, add xmm floors to regcensus_floor.txt (the
    gate already fails both directions).
 
-### C2. The model learns xmm
- - RegAlloc gains an xmm occupancy mask + take/free; fp_caps is
-   nearly trivial (all caller-saved, no byte/base/SIB concepts;
-   encoding preference for xmm0..7 - no REX - is a WEIGHT fact).
- - Emitter::alloc_fscratch(prefer) / free_fscratch mirroring the GP
-   seams; the tracker learns xmm writes (trk parity).
+### C2. The model learns xmm  [LANDED 2026-08-22]
+RESULT: fp_allocatable (xmm2..7; X0/X1 stay conventional until C3,
+xmm8-15 wait on REX-capable encoders) + fp_weight; RegAlloc.fbusy +
+ftake/ftake_fixed/fgive; alloc_fscratch/free_fscratch/ftake_reg
+seams; the C2a pin assignment through the register state
+(byte-identical); check_pins_are_busy covers fcache-vs-fbusy;
+fwrote() in every xmm-writing encoder, write_fslot's pin arm and the
+entry loads declared as machinery - WATCHED failing by name.
+116/116 byte-identical both arenas. C1 was the same day: the census
+knows X0/X1 + the x0/x1 accessor tokens; floors XMM0=61 XMM1=28.
 
 ### C3. Convert
  - The per-op X0/X1 scratch sites ask with prefer X0/X1 (byte-
