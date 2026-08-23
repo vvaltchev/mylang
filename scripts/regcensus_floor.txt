@@ -7,12 +7,12 @@
 # RAWENC = hand-encoded instruction lines (the census blind spot).
 RAX    456
 RCX    85
-RDX    11
+RDX    0
 RSI     0
 RDI     0
 R8      0
 R9      0
 R10     0
 R11     0
-TOTAL 552
+TOTAL 541
 RAWENC  17

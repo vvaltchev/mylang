@@ -3908,3 +3908,33 @@ deliberately UNJUSTIFIED on the ratchet:
    ops have no decline tier).
 Census: 623 -> 552; R8/RDI/RSI/R9/R10/R11 all ZERO. vdjcmp 116/116
 (the respells byte-identical, as the role identity guarantees).
+
+## (av) 2026-08-22 - batch 7: RDX at zero; SEVEN of nine registers clean
+
+7a: SetPend/EndFinally's pend-slot cursor asks the allocator (prefer
+rdx); refusal takes a bracketed push, the pop placed after the
+cursor's last use and BEFORE EndFinally's branch. Two corpus programs
+drift by the register substitution (rdx busy in exception fragments
+-> r10); 72_exc_finally Ir +0.006%.
+
+7b: emit_ctx_chain's hidden cross-function contract ("the table is
+still in rdx") became a caller-allocated `tbl` PARAMETER - the
+helper-ABI rule applied. TWO lessons paid for in the batch:
+ - the first version allocated MID-EMISSION and returned false on
+   refusal; a refusal happens exactly in call-bearing runs (the pool
+   denial), and the mid-emission false killed the nativization of
+   every such run - watched as `CallV DID NOT RUN` plus the borrow
+   tests failing. THE RULE: allocate BEFORE the first emitted byte,
+   so a decline is clean.
+ - the sound fallback when refused is the LEGACY literal rdx, and the
+   argument is written at the site: a refusal implies the pool is
+   denied, denied implies no pin exists, so rdx is provably free -
+   ML_CHECKed (!reg_holds_pin(RDX)) rather than assumed.
+Twelve corpus programs drift by rdx->r10 where rdx is genuinely busy
+- the OLD literal form was leaning on those slots' luck; 08_func_call
+Ir +0.005%. And the stale-tag detector caught PROSE this time: a
+comment SAYING "reg:conv" mid-sentence parsed as a tag on a
+register-free line - reworded (third catch for that net).
+
+Census: RDX 0; TOTAL 541. Remaining: RCX 85 (the IntBin tmp borrow
+family), RAX 456 (the staging convention).

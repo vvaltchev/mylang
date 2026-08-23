@@ -5160,10 +5160,15 @@ emit_store_src_gate(Emitter &e, int32_t type_off, uint8_t scr = RCX)
     return e.j32(0x73);                    /* jae -> the helper (out of band) */
 }
 
-/* Walk `r9 = ctx->captures->data()` (cap=true) or, with the GlobalFuncTable
- * kept in RDX for the caller's `defined` write, `r9 = gfuncs->slots.data()`
- * (cap=false). Clobbers rax (and rdx for the global chain). */
-static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap)
+/* Walk `cb = ctx->captures->data()` (cap=true) or, with the
+ * GlobalFuncTable handed back in `tbl` for the caller's `defined`-byte
+ * write, `cb = gfuncs->slots.data()` (cap=false). Clobbers rax.
+ * #96: `tbl` is a PARAMETER, caller-allocated - it was a hidden rdx
+ * contract between this helper and its caller's continuation ("the
+ * table is still in rdx"), the helper-ABI class: a register the callee
+ * leaves state in must be an argument, or no audit can see the
+ * coupling. Unused (pass 0xFF) for the capture chain. */
+static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap, uint8_t tbl)
 {
     e.scratch(cb);            /* the ctx chain walks through it */
     const JitLayout &L = jit_layout();
@@ -5173,8 +5178,8 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap)
         e.load_base(RAX, RAX, static_cast<int32_t>(L.ctx_captures));
         e.load_base(cb, RAX, 0);               /* cb = the captures data */
     } else {
-        e.load_base(RDX, RAX, static_cast<int32_t>(L.ctx_gfuncs));
-        e.load_base(cb, RDX,                   /* cb = the gfuncs slots */
+        e.load_base(tbl, RAX, static_cast<int32_t>(L.ctx_gfuncs));
+        e.load_base(cb, tbl,                   /* cb = the gfuncs slots */
                     static_cast<int32_t>(L.gft_slots));
     }
 }
@@ -14849,7 +14854,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (cb == ELEM_NO_REG)
             return false;      /* no free chain register - decline */
         e.bump_op(OpCode::LoadCaptureV);
-        emit_ctx_chain(e, cb, /*cap=*/true);
+        emit_ctx_chain(e, cb, /*cap=*/true, 0xFF);
         std::vector<size_t> jhelp;
         jhelp.push_back(emit_ref_check_jae_chain(e, cb, coff + ty0));
         if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
@@ -15676,10 +15681,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * pop lands right after the cursor's last use. */
         const int rp = e.alloc_scratch(CAP_MEM_BASE, 1u << RDX);
         const bool rpush = rp < 0;
-        const uint8_t pr = rpush ? static_cast<uint8_t>(RDX)
+        const uint8_t pr = rpush ? static_cast<uint8_t>(RDX)  /* reg:conv */
                                  : static_cast<uint8_t>(rp);
         if (rpush)
-            e.push_reg(RDX);
+            e.push_reg(RDX);  /* reg:conv */
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         /* = &back_rec */
@@ -15696,7 +15701,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
         e.add_rr(RAX, pr);
         if (rpush)
-            e.pop_reg(RDX);
+            e.pop_reg(RDX);  /* reg:conv */
         else
             e.free_scratch(static_cast<uint8_t>(rp));
         e.store_byte_base_imm(
@@ -15720,10 +15725,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * use and BEFORE the j_norm branch, so no edge crosses it. */
         const int rp = e.alloc_scratch(CAP_MEM_BASE, 1u << RDX);
         const bool rpush = rp < 0;
-        const uint8_t pr = rpush ? static_cast<uint8_t>(RDX)
+        const uint8_t pr = rpush ? static_cast<uint8_t>(RDX)  /* reg:conv */
                                  : static_cast<uint8_t>(rp);
         if (rpush)
-            e.push_reg(RDX);
+            e.push_reg(RDX);  /* reg:conv */
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         /* = &back_rec */
@@ -15740,7 +15745,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
         e.add_rr(RAX, pr);
         if (rpush)
-            e.pop_reg(RDX);
+            e.pop_reg(RDX);  /* reg:conv */
         else
             e.free_scratch(static_cast<uint8_t>(rp));
         e.cmp_byte_base(RAX, static_cast<int32_t>(L.pend_state_pend), 0);
@@ -16657,12 +16662,40 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const int32_t soff = static_cast<int32_t>(
             in.target * static_cast<int_type>(sizeof(LValue)));
         const int32_t pv0 = slot_addr(0).payload, ty0 = slot_addr(0).type;
+        /* #96: the GLOBAL chain's table register, caller-allocated
+         * BEFORE any byte is emitted (a decline here must be clean -
+         * the first version allocated mid-emission and its refusal
+         * silently killed the nativization of every call-bearing run
+         * with a global store, watched as `CallV DID NOT RUN`). The
+         * allocation is REFUSED exactly in the runs where the pool is
+         * DENIED (a MyLang call's clobber mask) - and denied means NO
+         * PIN can exist, so the legacy literal rdx is provably free
+         * there: the fallback is sound by the same argument that
+         * justifies the sync machinery's conv tags. A pinned rdx with
+         * the whole pool exhausted (the one unsound fallback case)
+         * cannot coincide with a refusal, because a pin implies the
+         * pool was NOT denied and 9 candidates were grantable. */
+        int tbl = -1;
+        bool tbl_owned = false;
+        if (!is_cap) {
+            tbl = e.alloc_scratch(CAP_MEM_BASE, 1u << RDX);
+            if (tbl >= 0) {
+                tbl_owned = true;
+            } else {
+                ML_CHECK(!e.reg_holds_pin(RDX));  /* reg:conv */
+                tbl = RDX;                     /* reg:conv */
+            }
+        }
         e.bump_op(in.op);
         const size_t g = emit_store_src_gate(e, src.type);
         const uint8_t cb = ctx_chain_reg(e);
-        if (cb == ELEM_NO_REG)
+        if (cb == ELEM_NO_REG) {
+            if (tbl_owned)
+                e.free_scratch(static_cast<uint8_t>(tbl));
             return false;      /* no free chain register - decline */
-        emit_ctx_chain(e, cb, is_cap);
+        }
+        emit_ctx_chain(e, cb, is_cap,
+                       is_cap ? 0xFF : static_cast<uint8_t>(tbl));
         const size_t j_dref = emit_ref_check_jae_chain(e, cb, soff + ty0);
         e.load(RAX, src.type);
         /* every jump to the slow arm below was emitted BEFORE this
@@ -16679,10 +16712,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.store_base(RAX, cb, soff + ty0);
         if (!is_cap) {
             /* defined[gslot] = 1: rcx = defined.data() (the table is
-             * still in rdx), then the byte store. */
-            e.load_base(RCX, RDX,
+             * still in `tbl` - the parameterized contract). */
+            e.load_base(RCX, static_cast<uint8_t>(tbl),
                         static_cast<int32_t>(jit_layout().gft_defined));
             e.store_byte_base_imm(RCX, static_cast<int32_t>(in.target), 0x01);
+            if (tbl_owned)
+                e.free_scratch(static_cast<uint8_t>(tbl));
         }
         drop();
         const size_t j_done = e.j32(0xEB);
