@@ -446,7 +446,6 @@ extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src,
 extern unsigned long g_jit_ref_arg_binds;
 extern unsigned long g_arg_borrow, g_arg_borrow_slice,
                      g_arg_borrow_scalar;
-extern unsigned long g_jit_arg_borrow;
 
 /*
  * THE IN-PLACE ARGUMENT's cold arm (#162). A fused call site binds some

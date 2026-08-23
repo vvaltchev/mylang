@@ -3284,11 +3284,6 @@ unsigned long g_arg_borrow = 0;
 unsigned long g_arg_borrow_slice = 0;
 unsigned long g_arg_borrow_scalar = 0;
 
-/* #94 step 3: bumped ONLY by the EMITTED inline borrow arm, never by
- * the helper - so it answers "did the emitted code serve this?", which
- * g_arg_borrow (both bind paths) structurally cannot. */
-unsigned long g_jit_arg_borrow = 0;
-
 /* THE IN-PLACE ARGUMENT (#162): bumped by the EMITTED copy loop, once per
  * fused argument bound from its caller slot. */
 unsigned long g_jit_arg_inplace = 0;
