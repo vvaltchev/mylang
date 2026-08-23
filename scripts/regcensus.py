@@ -290,7 +290,11 @@ def census(path):
                            r'\bfree_scratch\s*\(|'
                            # RefScratch asks the allocator first (8c);
                            # its ctor argument is the PREFERENCE
-                           r'\bRefScratch\s+\w+\s*\(')
+                           # Phase A: the conflict-evict seam is
+                           # allocator API too - calling it IS model
+                           # participation, not a hardcode
+                           r'\bRefScratch\s+\w+\s*\(|'
+                           r'\brax_pin_conflict\s*\(')
     in_reg_enum = False
     for i, l in enumerate(lines):
         if 'enum Reg' in l:

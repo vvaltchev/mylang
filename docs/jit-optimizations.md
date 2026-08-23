@@ -7180,7 +7180,7 @@ non-JIT builds (gate forced 0, g++ + clang) 1925/1925; LTO=0 green.
 NINE rotations, jit_pin_budget() = 13), admissible per RUN through two
 gates that fail closed independently:
 
- - **the SHAPE gate** (`run_may_pin_rax`, consulted by
+ - **the SHAPE gate** (`run_may_pin_rax`, DELETED 2026-08-22 by the endgame Phase A entry below; was consulted by
    jit_xcache_busy): a positive whitelist in run_may_pin_rdx's mould
    but per SHAPE, not per opcode - the specialized int arith family in
    ACCUMULATOR form only (target == a_slot), ForLoopStep / IntAddStep,
@@ -7393,7 +7393,7 @@ in the emit itself: a count >= 64 saturates (`shl` -> `zero_reg32`,
 count never reaches here (`imm_shift_ok` keeps the op interpreted).
 Counter: `g_jit_two_addr_reg` (shared with the arith family).
 
-**And the rax whitelist widened to match** (`run_may_pin_rax`): the
+**And the rax whitelist widened to match** (`run_may_pin_rax`, since DELETED - endgame Phase A): the
 in-place literal IntShlRI/IntShrRI form no longer stages through rax,
 so it JOINS the accumulator-shape whitelist and a 13-slot kernel
 containing such shifts still pins rax. The coverage gate lists the two
@@ -7565,3 +7565,41 @@ coincidence is exactly what a fixed preference order never tests
 (the r9 lesson). Census after: UNJUSTIFIED 1137 -> 1132, RAWENC
 20 -> 19; allocator-API lines (prefer/exclude masks) are census
 INPUT, not bypasses, and are exempted.
+
+## Phase A of the register-allocator endgame (2026-08-22) - the rax
+## whitelist and its coverage gate are DELETED; conflict-evict + a
+## one-shot re-emission replace them
+
+`run_may_pin_rax` (the hand-audited list of "rax-free" op shapes) and
+the pick-time coverage gate (every whitelisted op's target must be
+pinned) were the last two audited opcode tables keeping rax out of
+the general pin pool. Both are gone. The replacement is structural:
+
+ - the pick hands rax out OPTIMISTICALLY (it is last in preference,
+   so only 12+ hot-slot runs reach it);
+ - any emission event that cannot coexist with a rax pin calls
+   `Emitter::rax_pin_conflict()` - a helper-call bracket (after a
+   call the ABI status and the pin COMPETE for rax and no reload
+   order reconciles them), an accumulator ask (`acc_take`), or a
+   raise-path reuse window. The seam EVICTS the pin from the model
+   (cache list + ra bit), flags `e.rax_conflict`, and the DOOMED
+   attempt finishes emitting - tracker-consistent after the
+   eviction, its runtime wrongness irrelevant because
+ - the chunk then RE-EMITS ONCE with `g_jit_rax_denied` set (the
+   `retry_emission` label: a backward goto that destroys and
+   reconstructs the Emitter and every per-chunk local - the same
+   total-discard semantics as the emit_ok=false give-up), and an
+   ML_CHECK proves the denied attempt can never conflict again.
+ - rax stays out of ORDINARY alloc_scratch grants (excluded like
+   callee-saved): the accumulator convention needs rax reachable
+   only through acc_take and the pick. Found the hard way on the
+   first -rt: a table-register grant took rax and the next
+   accumulator ask found its register occupied.
+
+MEASURED EQUIVALENCE: vdjcmp 116/116 BYTE-IDENTICAL against the
+gates. rax pins survive exactly the runs where no conflicting event
+fires - the whitelist's semantic set, now derived from what emission
+DOES. The cost: one discarded emission per conflicting chunk
+(`rax_retries` in MYLANG_JITSTATS; 83_regs_int_40 retries once -
+its 40 accumulators exceeded the old coverage too - while
+80_regs_int_08 keeps its rax pin with zero retries).
