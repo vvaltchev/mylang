@@ -3447,3 +3447,49 @@ allocated and is not).
 Once that one site borrows, re-run `scripts/rcx_admission.sh 1`; it
 builds the register in and runs the nets itself, so it will say whether
 rcx is finally admissible rather than leaving it to judgement.
+
+## (ag) 2026-08-20 - the `= RCX` grep found the site; REALLOCATION was
+## tried there and made it WORSE
+
+The grep works - `grep -n "= RCX" src/jit.cpp` lists the parameter
+defaults, and past the four ref gates (all borrowing now) it names the
+last one:
+
+    const uint8_t tmp = RCX;      /* the staging / move-aside register */
+    const uint8_t cpy = RCX;      /* the 24-byte EvalValue copy walker  */
+
+in the specialized-arith / move emitter. `e.movabs(tmp, in.b_lit())` at
+its IntMulRI case IS the `movabs rcx, 1000` from (af).
+
+### The fix that did not work, and why it is worth recording
+
+Allocating instead - `alloc_scratch(CAP_NONE, prefer RCX, exclude
+RAX|RDX)` - is byte-identical in the shipping configuration and takes
+corpus_diff with rcx admitted from **23/24 to 22/24**. Worse.
+
+The reason was already written down, at RefScratch, and I did not apply
+it: **handing back a DIFFERENT register clobbers whatever the caller
+left in it, and `ra` cannot warn, because the untracked scratch
+registers are not in `busy`.** Excluding rax and rdx is not enough -
+rsi, rdi, r8 and r9 carry element-tier roles and type tags at various
+points in the same emitter.
+
+⛔ A SECOND, SEPARATE BUG IN THE SAME ATTEMPT, worth its own line: the
+first version TOOK the register and never released it. `alloc_scratch`
+marks it busy, the emitter is called PER OP, and `ra.busy` persists
+across ops - so op 1 got rcx, op 2 got r12, op 3 r13... and EVERY
+corpus program's emitted code changed. A take with no matching give is
+not a leak here, it is a silent reassignment of every later allocation
+in the fragment.
+
+### What this site actually needs
+
+A BORROW, like its three siblings. What makes it harder than they were:
+the lifetime spans a whole op emitter with many `return`s and several
+branches, so the pop must happen on every path - structurally the same
+problem that made `emit_store_src_gate` refuse a borrow until its two
+jumps became one.
+
+The shape to reach for is an RAII guard scoped over the `switch`, whose
+destructor pops - so no `return` can skip it - or a single exit point.
+**Do NOT re-try reallocation**; the comment at the site now says so.
