@@ -147,7 +147,12 @@ public:
         const void *len;
         const void *slice;
         const void *obj;
-        long strobj_data;
+        /* ⛔ ptrdiff_t, NOT long: this is initialised from a POINTER
+         * DIFFERENCE, and Windows is LLP64 - `long` is 32 bits there,
+         * so a braced init from __int64 is a NARROWING CONVERSION and
+         * MSVC rejects it outright (error C2397). Green on gcc/clang
+         * for a day before the Windows lane saw it. */
+        ptrdiff_t strobj_data;
         /* the object the offset is INTO, so the emitter can bound it
          * without needing StrObj (which is private) visible there */
         size_t strobj_size;

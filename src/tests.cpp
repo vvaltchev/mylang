@@ -24354,6 +24354,13 @@ static bool jit_fwd_skip_reflisted()
  * direction: a claimed exemption that is actually whitelisted is as much
  * a lie as the reverse).
  */
+/* ⛔ INSIDE the platform guard: off-platform (macOS/Windows/non-x86-64)
+ * ML_JIT_SUPPORTED is 0, jit_fwd_family_coverage's body compiles out,
+ * and this becomes an UNUSED FUNCTION - which is -Werror on the macOS
+ * clang lane. CLAUDE.md names this exact failure ("EMITTER-ONLY CODE
+ * LIVES INSIDE #if ML_JIT_SUPPORTED"); I wrote it outside anyway and
+ * the lane caught it. */
+#if ML_JIT_SUPPORTED
 static const char *fwd_opcode_name(OpCode op)
 {
     /* from ML_FOR_EACH_OPCODE, the enumeration bytecode.h static-asserts
@@ -24366,6 +24373,7 @@ static const char *fwd_opcode_name(OpCode op)
     }
 #undef ML_TEST_OPNAME
 }
+#endif /* ML_JIT_SUPPORTED */
 
 /*
  * #96: the all-slot LIVE RANGES (jit_slot_liveness) against the temps-only
