@@ -925,6 +925,40 @@ struct Emitter {
      * push/pop around every call. */
     struct CacheEnt { int slot; int32_t payload, type; uint8_t reg; };
     std::vector<CacheEnt> cache;
+
+    /*
+     * THE ALLOCATOR'S REGISTER STATE (the real allocator, step 2).
+     *
+     * `cache` says which slot is in which register. What it does NOT say
+     * is which registers are AVAILABLE - because today nothing needs to
+     * ask: the pick is zipped positionally onto CACHE_REGS
+     * (`hot[h] -> CACHE_REGS[h]`) once per run and never changes, so
+     * "free" is just "index past hot.size()".
+     *
+     * That zip is exactly what a real allocator replaces. The moment a
+     * register can be handed out mid-fragment, given up at a live
+     * range's end, and handed out AGAIN to a different variable in the
+     * same frame - the maintainer's requirement - occupancy stops being
+     * derivable from a position and has to be state.
+     *
+     * `reg_busy` is that state, and `take_reg`/`give_reg` are the only
+     * two transitions. They are introduced here maintaining EXACTLY the
+     * present behaviour (the pool is handed out in order, nothing is
+     * ever given back mid-run), so the emitted code is byte-identical -
+     * the seam exists before anything drives it.
+     */
+    uint32_t reg_busy = 0;               /* bit r: register r is taken */
+
+    int take_reg(const uint8_t *pool, size_t n)
+    {
+        for (size_t i = 0; i < n; i++)
+            if (!(reg_busy & (1u << pool[i]))) {
+                reg_busy |= 1u << pool[i];
+                return pool[i];
+            }
+        return -1;                       /* pressure: the caller spills */
+    }
+    void give_reg(uint8_t r) { reg_busy &= ~(1u << r); }
     /* C2a: the FLOAT half of the pool - hot float slots pinned in
      * xmm4-xmm7 (xmm0/1 stay the per-op scratch). xmm registers are ALL
      * caller-saved, so unlike the GP pins these are spilled to their
@@ -12784,6 +12818,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
      * The whole body is one fragment at offset 0. */
     Emitter e;
     e.cache.clear();                       /* no N5 register cache in a container*/
+    e.reg_busy = 0;
     e.fcache.clear();                      /* C2a: nor a float one */
     e.tflush.clear();                      /* C3: nor type elision */
     e.fread.clear();                       /* C4a-i: nor read elision */
@@ -13339,6 +13374,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * callee-saved registers this fragment takes over and therefore
          * what frag_entry must push (and what every exit must pop). */
         e.cache.clear();
+        e.reg_busy = 0;
         e.tflush.clear();       /* C3: per-RUN like the pools */
         e.fread.clear();        /* C4a-i: per-RUN */
         e.flits.clear();        /* C4b: per-RUN (a stale entry would let
@@ -13460,8 +13496,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * flushes them back). */
         for (size_t h = 0; h < hot.size(); h++) {
             const SlotAddr a = slot_addr(hot[h]);
-            e.cache.push_back({ hot[h], a.payload, a.type, CACHE_REGS[h] });
-            e.load(CACHE_REGS[h], a.payload);     /* entry load */
+            /* through the register STATE rather than the positional zip
+             * `CACHE_REGS[h]` - identical while nothing gives a register
+             * back, and the seam the allocator drives. */
+            const int r = e.take_reg(CACHE_REGS, MAX_CACHED);
+            ML_CHECK(r >= 0);            /* hot.size() <= MAX_CACHED */
+            e.cache.push_back({ hot[h], a.payload, a.type,
+                                static_cast<uint8_t>(r) });
+            e.load(static_cast<uint8_t>(r), a.payload);   /* entry load */
         }
         /* C2a: the float pins - xmm needs no push (caller-saved; the
          * C++ caller expects nothing preserved), only the entry loads.
@@ -13880,6 +13922,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                  * read falls back to (current) memory. */
                 saved_cache = std::move(e.cache);
                 e.cache.clear();
+                e.reg_busy = 0;
+        e.reg_busy = 0;
                 saved_fcache = std::move(e.fcache);
                 e.fcache.clear();
             }
