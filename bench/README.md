@@ -71,7 +71,23 @@ python3 bench/run.py --baseline OLD   # before/after: also time a 2nd mylang
                                       # binary, report cur/base (speedup)
 python3 bench/run.py -cl cpp          # compare vs C++ instead of Python
 python3 bench/run.py -cl py --recompute  # (re)populate the Python cache
+python3 bench/run.py --pure-call-cache   # re-enable the per-frame pure-call
+                                      # cache (OFF by default - see below)
 ```
+
+**The per-frame pure-call cache is DISABLED by default (`-npc`)** — on the
+current binary *and* on `--baseline` — because no comparison language has it.
+MyLang memoizes a pure call's result within one frame; C++, CPython, Ruby and
+Lua all re-execute the call, so leaving the cache on measures MyLang's memo
+table against the other language's real work. It also breaks the `scale` knob
+on any bench that repeats a pure call: `09_fib_recursive`'s
+`for (k...) r = fib(29);` costs **93.1M instructions at scale 1 and 93.1M at
+scale 3** with the cache on, because iterations 2..N are hits — with `-npc` it
+is the linear 235M → 561M. That silently invalidated a startup correction (a
+scale3−scale1 delta made of nothing but cache hits) and produced a recorded
+"09_fib_recursive is faster than C++" that was pure artifact. Pass
+`--pure-call-cache` only when the cache's own contribution is what you are
+measuring; the header line always says which way the run went.
 
 **The comparison language is cached; a measure run is cache-only.** MyLang is
 timed on every run, but the comparison language (`-cl python` by default, or
