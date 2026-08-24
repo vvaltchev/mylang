@@ -25226,6 +25226,20 @@ static bool jit_interval_qual_check()
          * fs returns its float accumulator, so f is read by ReturnV
          * AND must STAY an fhot pick - use_ret does not disqualify
          * the float pool (the emit flushes before jit_ret) */
+        /* F1: a MoveV whose dest sits inside a live range that is
+         * float-adjacent - pins that a boxed move's dest yields a
+         * float-side MEM cut event (today supplied by the paired
+         * bad(); badf's own push is DEFENSIVE, see its comment - a
+         * badf-only site does not exist in the visitor, so that
+         * push's removal is structurally unwatchable). */
+        { "MoveV dest mem cut event",
+          "var dyn d = 0.5;\n"
+          "var dyn e = runtime(2);\n"
+          "var f = 0.0;\n"
+          "var n = 0; n = n + runtime(20);\n"
+          "for (var i = 0; i < n; i++) f = f + d;\n"
+          "d = e;\n"
+          "print(f + d);\n" },
         { "float return exemption", 
           "func fs(int n) {\n"
           "    var f = 0.0;\n"
@@ -25236,6 +25250,7 @@ static bool jit_interval_qual_check()
     };
     bool ok = true, saw_payoff = false, saw_pick = false, saw_fhot = false;
     bool saw_gponly = false, saw_both = false, saw_ret_exempt = false;
+    bool saw_fread = false, saw_fwrite = false, saw_fmem = false;
     for (const Case &c : cases) {
         std::vector<Tok> toks;
         lexer(c.src, 1, toks);
@@ -25263,9 +25278,11 @@ static bool jit_interval_qual_check()
         }
         std::vector<IntervalQual> q;
         std::vector<MemEvent> ev;
+        std::vector<FltEvent> fev;
         int orphans = -1;
         if (!jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
-                                   &orphans, &ev)) {
+                                   &orphans, &ev, nullptr, &fev)) {
+
             /* legitimate on a chunk with an unclassifiable op (the
              * float-return case's root holds a CallV); the vacuity
              * guards below catch a case where NOTHING ran */
@@ -25307,6 +25324,34 @@ static bool jit_interval_qual_check()
             }
             if (e.gp_only) saw_gponly = true;
             else saw_both = true;
+        }
+        /* property E-FLOAT (F1): the FltEvent stream reconciles with
+         * the per-interval float facts - reads sum to uses_float, a
+         * write exists iff wrote_float, a mem event exists iff
+         * mem_float. The stream is what the float scan will cut and
+         * admit on, so a drift here is a wrong allocation there. */
+        for (size_t k = 0; k < iv.size(); k++) {
+            int reads = 0;
+            bool wrote = false, mem = false;
+            for (const FltEvent &e : fev)
+                if (e.slot == iv[k].slot && e.pc >= iv[k].start
+                        && e.pc < iv[k].end) {
+                    if (e.kind == FltEvent::read)  reads++;
+                    if (e.kind == FltEvent::write) wrote = true;
+                    if (e.kind == FltEvent::mem)   mem = true;
+                }
+            if (reads != q[k].uses_float || wrote != q[k].wrote_float
+                    || mem != q[k].mem_float) {
+                printf("  qual [%s]: interval slot %d [%u,%u) float "
+                       "stream drift (reads=%d/%d wrote=%d/%d "
+                       "mem=%d/%d)\n", c.name, iv[k].slot,
+                       iv[k].start, iv[k].end, reads, q[k].uses_float,
+                       wrote, q[k].wrote_float, mem, q[k].mem_float);
+                ok = false;
+            }
+            if (reads)               saw_fread  = true;
+            if (wrote)               saw_fwrite = true;
+            if (mem)                 saw_fmem   = true;
         }
         std::vector<int> fhot;
         const std::vector<int> picked =
@@ -25394,6 +25439,12 @@ static bool jit_interval_qual_check()
     if (!saw_payoff) {
         printf("  qual: no run-refused slot owned a clean hot interval "
                "- the payoff shape is untested\n");
+        ok = false;
+    }
+    if (!saw_fread || !saw_fwrite || !saw_fmem) {
+        printf("  qual: a FltEvent kind never occurred (read=%d "
+               "write=%d mem=%d) - property E-float is vacuous\n",
+               saw_fread, saw_fwrite, saw_fmem);
         ok = false;
     }
     return ok;

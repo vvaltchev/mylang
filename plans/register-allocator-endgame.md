@@ -772,7 +772,69 @@ by the -npc sweep unchanged.
 THEN: C2b regions into trans mode (⛔ fresh-window: the cold-copy
 emission reads e.cache at STREAM-END state - needs per-region
 state replay; check whether today's ShareSeams already carry the
-hazard); the float twin; the wall A/B + flip gate.]
+hazard); the wall A/B + flip gate.
+
+⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
+"continue with the float/xmm twin". The mandate's xmm half: the
+scan allocates the FLOAT pool (today the lever leaves fhot to the
+pick in BOTH modes). Current float machinery: C2a pins xmm4-7
+(FCACHE_REGS, MAX_FCACHED=4, all caller-saved - no entry push;
+emit_call_prologue/epilogue spill/reload e.fcache around helper
+calls, reload_cache re-seeds after barriers); the pick's rule is
+local + !disq_f + uses >= 3 + fdst (written by a float op in the
+run).
+
+⛔ THE ONE REAL ASYMMETRY vs the int side, and the rule it forces:
+A USEF READ IS NOT TYPE EVIDENCE. A float op can legitimately READ
+a definitely-int slot through the promote arm, so admission
+evidence is a float WRITE, never a read - a float pin's entry
+movsd would otherwise reinterpret an int payload as a double (the
+pick's own soundness note at the C2a accounting, ~jit.cpp:11019).
+Per-piece translation (the d1 lesson applied to floats): a piece
+is admissible only when it contains an fdst event AND no usef read
+PRECEDES the first fdst in the piece - the pre-write window's
+entry-loaded garbage is then dead (def-before-use inside the
+piece), and everything after the first write is float (a non-float
+writer would have disqualified/cut). Cross-piece "the previous
+flush proved t_float" reasoning is deliberately NOT used -
+conservative costs opportunity, never soundness.
+
+THE F-LADDER (mirror of the int increments, same lever):
+ F1. LANDED 2026-08-24: FltEvent {pc, slot, kind: read|write|mem}
+     stream from jit_qualify_intervals; SELF-CONTAINED for cutting
+     (mem entries from BOTH bad() and badf(), so the float scan
+     never merges with the GP stream, whose badi() must not cut
+     it). Property E-float (stream reconciles with uses_float/
+     wrote_float/mem_float per interval) + 3 vacuity guards +
+     the MoveV-dest cut-event case. WATCHED: mislabeling a usef
+     read as a write fails the suite. ⛔ FINDING: a badf-ONLY site
+     does not exist - every visitor badf() is paired with bad()
+     (MoveV dest, CmpFloatV dst) - so badf's own push is marked
+     DEFENSIVE (9301c45 convention), structurally unwatchable
+     today.
+ F2. the scan in FLOAT mode: a pool-selector parameter on
+     jit_lsra_assign. Candidate: fdst-first rule above; disq:
+     uses_int > 0 (uses_ret EXEMPT - the emit flushes before
+     jit_ret), mem_float pieces; cuts at MemEvents with
+     gp_only == false only (badi does not cut the float side);
+     the run-wide >= 3 float-weight admission floor (pick
+     parity). K_f = MAX_FCACHED = 4. Float-twin properties of
+     I1/I2/I3/G/F2/H, watched failing.
+ F3. snap in FLOAT mode: same lin-point/demotion machinery
+     (register-agnostic already); the whole-run rescue criteria
+     flipped to the pick's float rule (fdst somewhere, no disq_f
+     event anywhere, no int uses, weight >= 3). Tests + watched.
+ F4. the bridge's float half: whole-run fallback replaces the
+     pick's fhot with the scan's whole-run float choice; trans
+     mode installs per-pc xmm pieces through e.fcache (the seam
+     arms emit fload/fstore + t_float tag stores; entry stubs
+     replay; helper-call brackets and reload_cache already handle
+     e.fcache by register STATE, so per-pc pieces ride them for
+     free). g_jit_lsra_fpins execution proof. vdjcmp: default
+     config stays byte-identical (lever OFF touches nothing).
+ F5. measure: the float benches (04, 46, 54, 55, 79_dyn_float,
+     88) per-iteration, then the FULL 88-bench sweep (-npc, the
+     parallel harness) - the flatness mandate applies unchanged.]
 
 ⛔ MAINTAINER DIRECTION (2026-08-23): #96 was PAUSED for the #99
 DETOUR; #99 closed same day. Task #102 created for the

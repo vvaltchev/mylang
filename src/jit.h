@@ -351,12 +351,32 @@ struct MemEvent {
  * the interval still counts pc 0's int use. Admission therefore
  * asks for an int touch INSIDE the piece, never inside the
  * interval (the d1 finding). */
+/* One float-side event, for the FLOAT twin's per-piece evidence
+ * (the F ladder). `kind`: a usef READ, an fdst WRITE, or a MEM
+ * demand. The stream is SELF-CONTAINED for cutting - mem entries
+ * come from BOTH bad() (both-pool demands) and badf() (float-only:
+ * MoveV's boxed dest, CmpFloatV's bool dst), so the float scan
+ * never merges with the GP mem_events stream (whose badi() entries
+ * must NOT cut the float side).
+ * ⛔ THE EVIDENCE ASYMMETRY vs int_uses: a READ is NOT float type
+ * evidence - a float op legitimately reads a definitely-int slot
+ * through the promote arm, and a float entry-load movsd would
+ * reinterpret its int payload as a double. Admission needs a WRITE
+ * (the pick's fdst rule, per piece: the first float event in the
+ * piece must be a write; the pre-write entry-load is then dead by
+ * def-before-use inside the piece). */
+struct FltEvent {
+    uint32_t pc;
+    int slot;
+    enum Kind : uint8_t { read, write, mem } kind;
+};
 bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
                            const std::vector<LiveInterval> &iv,
                            std::vector<IntervalQual> &out,
                            int *orphans = nullptr,
                            std::vector<MemEvent> *mem_events = nullptr,
-                           std::vector<MemEvent> *int_uses = nullptr);
+                           std::vector<MemEvent> *int_uses = nullptr,
+                           std::vector<FltEvent> *flt_events = nullptr);
 
 /*
  * D3.b step 2b-i (plans/register-allocator-endgame.md): THE LINEAR
