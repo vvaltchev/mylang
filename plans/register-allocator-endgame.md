@@ -558,19 +558,34 @@ unreachable for mid-run pieces (pool order). MYLANG_LSRADBG=1
 dumps the plan. Verified: full lever x arena matrix + corpus
 --levers/--xrot COMPOSED with the lever + vdjcmp 116/116 default.
 
-⛔ NEXT: 2b-iii-c - make the transitions PAY and gate the flip:
- - validator arm 2 as a machine check (in-edge agreement is by
-   construction under lin points; assert it anyway - the D4 rule);
- - the D0 Ir LEDGER A/B (RULE B1: rm -rf build, explicit --mylang,
-   OPT=1 ASSERTS=0 both sides, baseline rebuilt at the D0 sha) on
-   the regs family + the top-8 my/cpp - does per-pc residency
-   move Ir where the pick could not (the payoff shapes: phase
-   reuse, event-cut survivors)?
- - the quality items the ledger will likely demand: second-chance
-   re-queue of split remainders, spill homes + C2b regions merged
-   into trans mode, the cost model / physical preference (rax ISA
-   facts), the float pool twin;
- - the default flip only when D4 is green AND the ledger pays.]
+FIRST LEDGER READ (2026-08-23, same-binary env A/B, OPT=1
+ASSERTS=0, callgrind Ir, build-claude/perf): lever-on vs off:
+80_regs +0.16%, 01_while +0.28%, 46_matrix +0.59%, 55_float
++0.10%, ⛔ 83_regs_int_40 +6.08%, ⛔ 07_nested_loops +14.29%.
+DIAGNOSED (07, via LSRADBG + -nj -vd): the INNER loop counter j is
+DEMOTED - its piece starts at pc 12, and the OUTER loop's exit
+edge (11->20) crosses every pc of the outer body, so no install
+can sit there. The pick never had this problem: a whole-run pin
+needs NO transition (entry dead-load, sound by def-before-use).
+83 is the same class at scale (40 slots, 13 pins - demotions +
+scan-order admission vs the pick's weight ranking).
+
+⛔ NEXT: 2b-iii-c - BOUNDARY EXTENSION, the fix the diagnosis
+names: a resident piece whose interior START is not a lin point is
+START-EXTENDED backward (to the nearest lin point, or to run begin
+= the entry-load set) instead of demoted - sound when the
+register is unoccupied over the extension and the slot has no mem
+event inside it (the extension covers only dead/idle pcs; the
+entry dead-load is the pick's own soundness argument). END
+extension likewise (to the next lin point or run end = the exit
+flush). The pick's whole-run pin becomes the DEGENERATE extension,
+so trans mode can never lose to it on a shape the pick handled -
+j extends to [0, end) and is the whole-run pin again. Then:
+weight-aware admission/eviction (the cost model - a piece must
+save more than its install+flush; the pick's >= 3 threshold
+returns as a profitability floor), re-measure the ledger, then
+validator arm 2, second chance, spill homes + C2b merge, float
+twin; the default flip only when D4 is green AND the ledger pays.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
