@@ -455,6 +455,17 @@ collision). Three nets now:
   Opt in PER CALL SITE via emit_ref_check's `cold` parameter - a
   first version overrode the shared helper for every caller at once,
   which is the wrong granularity for a knob meant to isolate one tier.
+- **⛔ LEVER A FORWARDS LOCALS TOO, AND THE TEMP RULE MOVED (#96,
+  2026-08-16).** Lever A's arming test used to require a TEMP
+  destination. That restriction belongs to the WRITE ELISION - only a
+  temp's liveness proves the slot dead - not to the READ, and eliding
+  just the read still removes a real instruction: on a memory-backed
+  local it is a store-to-load-forwarding stall ON the dependency chain
+  (`mov a4, rax; mov rax, a4; sar rax, 7`). The test now sits inside
+  `skip_write`, which is ALSO where `tb = fdst - slot_count` stops
+  being negative - **`1 << tb` for a local is UB**, and that is the
+  trap in doing this the quick way. Measured -8.86% Ir / 0.89x on
+  83_regs_int_40, 28 corpus programs changed, none regressed.
 - **THE LEVER SWITCHES** (`MYLANG_JIT_OFF=lever[,...]`, jit.cpp): the
   JIT analogue of `--no-opt`, which CLAUDE.md already mandates for AST
   transforms for the same reason (`-nj` is all-or-nothing and localises
