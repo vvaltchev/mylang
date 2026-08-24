@@ -991,3 +991,56 @@ emits `mov qword [slot], imm32` when it does - one instruction, no
 register, no entry materialisation, and no epilogue re-materialisation.
 rsi and r8 both become ordinary pool registers, taking the pool from 8
 to 10 with the two most-wasted instructions in the emitter deleted.
+
+### The type tags on the OTHER backends - decided up front (2026-08-17)
+
+Asked before building the x86-64 arena, so the arena is not designed
+into a corner. **The answer is different IN KIND per ISA, and the
+property that matters inverts.**
+
+**AArch64 cannot use the x86-64 trick at all** - three facts, in
+decreasing order of how badly they rule it out:
+
+  1. there is **no store-immediate instruction**. `STR` always stores
+     FROM a register, so `mov qword [slot], imm32` has no analogue and
+     the tag must reach a register no matter what;
+  2. an arbitrary 64-bit constant costs up to **4** instructions
+     (`MOVZ` + 3x`MOVK`, 16 bits at a time);
+  3. but PC-relative is cheap: `ADRP`+`ADD` reaches +/-4GB in **2**
+     instructions, and `ADR` alone reaches +/-1MB in **ONE**.
+
+**So on AArch64 the tags STAY in registers, and that is correct rather
+than a concession.** What we are actually fighting on x86-64 is not
+"constants in registers", it is constants in **CALLER-SAVED** registers:
+rsi/r8 die at every helper call, which is the entire 108-and-106
+`movabs` bill on 09_fib_recursive. AArch64 has **31 GPRs** and
+**ten callee-saved** (x19-x28, AAPCS64), so the tags go in x27/x28,
+are materialised ONCE at fragment entry, and a helper call cannot
+touch them. The cost we are chasing simply does not arise.
+
+| | x86-64 | AArch64 |
+|---|---|---|
+| scarce | callee-saved regs (6, we use 5) | nothing - 10 callee-saved |
+| tag storage | low arena + `imm32` store, NO register | callee-saved x27/x28, set at entry |
+| "near the code" buys | nothing (RIP-relative = a 2-instr load) | everything (`ADR`/`ADRP` are PC-relative) |
+| Darwin | no MAP_32BIT + 4GB `__PAGEZERO` -> no arena | works, no arena needed |
+
+**The shared thing is the POLICY** - the type tags are rematerialisable
+CONSTANTS, never allocatable values - while the ENCODING is per-backend
+behind one `emit_type_tag_store()` seam. If an arena is ever wanted on
+ARM64, the useful property there is PROXIMITY to the code (so `ADR`
+reaches it in one instruction), which is the exact opposite of x86-64's
+"low ABSOLUTE address".
+
+**Darwin x86-64** (Intel Macs) gets no arena either - no `MAP_32BIT`,
+and a 4GB `__PAGEZERO` makes every low address unmappable. It falls
+back to the register form, i.e. today's behaviour: correct, not
+optimal, and there is no JIT there today anyway.
+
+⛔ **BANK THIS NOW FOR DARWIN/ARM64, it is unrelated to constants and is
+the thing most likely to be found late:** Apple Silicon enforces W^X on
+JIT pages. The code buffer needs `MAP_JIT` plus
+`pthread_jit_write_protect_np()` toggled around every write, and a
+hardened process needs the `com.apple.security.cs.allow-jit`
+entitlement. That is a constraint on the whole ARM64-on-Darwin backend,
+not on this task.
