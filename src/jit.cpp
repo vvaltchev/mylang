@@ -11299,8 +11299,11 @@ pick_cached_slots(const Chunk &ck, size_t begin,
  */
 bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
                            const std::vector<LiveInterval> &iv,
-                           std::vector<IntervalQual> &out, int *orphans)
+                           std::vector<IntervalQual> &out, int *orphans,
+                           std::vector<MemEvent> *mem_events)
 {
+    if (mem_events)
+        mem_events->clear();
     out.assign(iv.size(), IntervalQual());
 
     /* per-slot index; iv is start-sorted, so per-slot order is too */
@@ -11314,6 +11317,7 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
         const std::unordered_map<int, std::vector<size_t>> &by_slot;
         size_t cur = 0;                  /* the pc being classified */
         int orphans = 0;
+        std::vector<MemEvent> *mem_events;
 
         IntervalQual *find(int s) {
             if (s < 0)
@@ -11353,10 +11357,18 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
             if (IntervalQual *q = find(s)) {
                 q->mem_int = true;
                 q->mem_float = true;
+                if (mem_events)
+                    mem_events->push_back(
+                        { static_cast<uint32_t>(cur), s, false });
             }
         }
         void badi(int s) {
-            if (IntervalQual *q = find(s)) q->mem_int = true;
+            if (IntervalQual *q = find(s)) {
+                q->mem_int = true;
+                if (mem_events)
+                    mem_events->push_back(
+                        { static_cast<uint32_t>(cur), s, true });
+            }
         }
         void badf(int s) {
             if (IntervalQual *q = find(s)) q->mem_float = true;
@@ -11364,7 +11376,7 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
         /* a bracketed op constrains no interval: the flush/reload
          * spill-around discipline is assignment-agnostic */
         void mark_barrier(size_t) {}
-    } vis { out, iv, by_slot };
+    } vis { out, iv, by_slot, 0, 0, mem_events };
 
     for (size_t pc = begin; pc < end; pc++) {
         vis.cur = pc;

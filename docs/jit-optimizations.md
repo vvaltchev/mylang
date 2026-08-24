@@ -7960,6 +7960,16 @@ Not yet covered, recorded for step 2b: the uses_ret float-exemption
 chunk ends in Halt), and a corpus-wide orphan census (rides along
 when the scan consumes the qualifier over real runs).
 
+ADDENDUM (same day): the qualifier also emits the MemEvent stream
+(optional out) - one {pc, slot, gp_only} per bad()/badi() event, the
+FORCED-INTERVAL-END positions the scan cuts on (the per-interval
+booleans say WHETHER, the events say WHERE). Property E in the -rt
+check requires the stream and the flags to agree in both directions
+(every mem_int interval contains a matching event; every event lands
+inside an interval whose flags it set), with per-kind vacuity guards.
+WATCHED failing: stamping pc+1 fails E in both directions at four
+named sites.
+
 Analysis-only: no emission change (vdjcmp trivially identical); -rt
 1690 x 5 x both arenas, corpus_diff, census gate, TESTS=1 OPT=1,
 clang OPT=1 ASSERTS=0 LTO=0 zero warnings, and the non-JIT compile

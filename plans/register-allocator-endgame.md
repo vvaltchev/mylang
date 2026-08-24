@@ -480,6 +480,9 @@ observed + vacuity-guarded, C orphans == 0. WATCHED failing both
 ways (mem_int stripped -> D names 4 slots; attribution disabled ->
 C + A). Recorded gaps for 2b: uses_ret float-exemption needs a
 function-chunk case; corpus-wide orphan census rides with the scan.
+ADDENDUM: MemEvent stream {pc, slot, gp_only} - the forced-end
+POSITIONS the scan cuts on; property E pins stream/flags agreement
+both ways (watched: pc+1 stamp fails at four named sites).
 
 ⛔ NEXT: D3.b step 2b - the `lsra` lever (default OFF) + the linear
 scan with splitting, allocating from D1 intervals + step 2a's
