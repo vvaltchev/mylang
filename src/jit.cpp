@@ -5455,15 +5455,25 @@ struct RefScratch {
      * borrow. A granted window emits no push/pop and may span interior
      * rejoining branches trivially (the push form requires every path
      * to reach release() - the exc-stamp's documented contract). */
-    RefScratch(Emitter &em, uint8_t r)
+    /* `excl`: registers this site's VALUE lives in - the allocator
+     * sees an ISA result (idiv's rdx, imul's rax) as FREE, because
+     * the encoder's claim is transient, so only the caller can name
+     * it. Found as a wrong `mods` on 17_elem2_divmod_roles: with rcx
+     * unavailable the grant handed the mod store's ref-check scratch
+     * RDX - the remainder being stored - and the helper received the
+     * type pointer's low dword as the value. When even the preferred
+     * register is excluded, the push-borrow arm serves: push/pop
+     * restores the value before release(), so borrowing an excluded
+     * register is safe where granting it is not. */
+    RefScratch(Emitter &em, uint8_t r, uint32_t excl = 0)
         : e(em), sc(r)
     {
-        g = e.alloc_scratch(CAP_MEM_BASE, 1u << r);
+        g = e.alloc_scratch(CAP_MEM_BASE, 1u << r, excl);
         if (g >= 0) {
             sc = static_cast<uint8_t>(g);
             return;
         }
-        spilled = e.reg_is_occupied(sc);
+        spilled = e.reg_is_occupied(sc) || (excl & (1u << sc)) != 0;
         if (spilled)
             e.push_reg(sc);       /* it holds a pin - borrow and restore */
         else
@@ -5601,11 +5611,12 @@ struct AccScratch {
  */
 static size_t emit_ref_check(Emitter &e, int32_t type_off,
                              JitColdTier cold = JC_COUNT,
-                             uint8_t scr = RCX)  /* reg:conv */
+                             uint8_t scr = RCX,  /* reg:conv */
+                             uint32_t excl = 0)  /* the VALUE's regs */
 {
     const JitLayout &L = jit_layout();
     const bool force = cold != JC_COUNT && jit_cold_forced(cold);
-    RefScratch rs(e, scr);
+    RefScratch rs(e, scr, excl);
     const uint8_t sc = rs.sc;
     e.load(sc, type_off);                     /* sc = current Type* */
     e.load32_base(sc, sc, L.type_t_off);      /* sc32 = type->t */
@@ -8363,7 +8374,9 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
         g_jit_relent_stores++;           /* C5: this store dropped its test */
 #endif
     if (reflisted && !e.relok(dst)) {
-        const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
+        const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE,
+                                              RCX,  /* reg:conv */
+                                              1u << src_reg);
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_int),
                           dst, src_reg);
         /*
@@ -8423,7 +8436,9 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
         g_jit_relent_stores++;           /* C5: this store dropped its test */
 #endif
     if (reflisted && !e.relok(dst)) {
-        const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
+        const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE,
+                                              RCX,  /* reg:conv */
+                                              1u << src_reg);
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_bool),
                           dst, src_reg);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
@@ -8435,7 +8450,7 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
          * form: no register holds t_bool, so on the no-arena fallback
          * this must BUILD it (see store_type_tag_via - the absence of
          * that was a shipped wrong answer). */
-        RefScratch rs1(e, RCX);
+        RefScratch rs1(e, RCX, 1u << src_reg);
         e.store_type_tag_via(a.type, reinterpret_cast<const void *>(tb),
                              rs1.sc);
         rs1.release();
@@ -21497,7 +21512,15 @@ retry_emission:
                 if (MAX_CACHED - cs_used >= 2) {
                     pair_lo = CACHE_REGS[cs_used];
                     pair_hi = CACHE_REGS[cs_used + 1];
-                } else if (hot.size() >= 2) {
+                } else if (hot.size() >= 2 && !lsra_tmode) {
+                    /* ⛔ NEVER under tmode: `hot` is then the ENTRY-
+                     * OCCUPANT list whose ORDER is the abstract-reg
+                     * zip, and popping pins from it leaves them
+                     * "resident" per the plan but never loaded
+                     * (hot_reg is built post-displacement, so even
+                     * the aphys ML_CHECK cannot see it). Leftover-
+                     * only; else the second bases drop - the C1
+                     * status quo. */
                     /*
                      * DISPLACE the coldest pins to free the pair.
                      *
