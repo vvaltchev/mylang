@@ -21910,6 +21910,39 @@ retry_emission:
         size_t si = 0;                        /* #96 inc-2: next seam */
         size_t lt = 0;                        /* 2b-iii-b: next trans */
         std::map<size_t, size_t> seam_pre;    /* seam pc -> pre position */
+        /*
+         * D4 VALIDATOR ARM 2 - LABEL IN-EDGE AGREEMENT, the machine
+         * check the linearization-point discipline makes provable: a
+         * branch's source-side register state must equal its target's
+         * (no edge crosses a transition, so agreement holds BY
+         * CONSTRUCTION - which is exactly why it is asserted: a
+         * future scan or seam change that breaks the discipline
+         * becomes a named compile-time abort, never a wrong answer).
+         * The signature folds the GP cache's (reg, slot) pairs - the
+         * per-pc-varying state; fcache/scache/tflush are run-constant
+         * under both modes. A branch patched to seam_pre runs the
+         * pc's transitions, so it compares against the PRE-transition
+         * signature; one patched to the label compares against the
+         * post-transition one.
+         */
+        const auto cache_sig = [&]() -> uint64_t {
+            uint64_t keys[32];
+            size_t nk = 0;
+            for (const Emitter::CacheEnt &c : e.cache)
+                if (nk < 32)
+                    keys[nk++] = (static_cast<uint64_t>(c.reg) << 32)
+                               | static_cast<uint32_t>(c.slot);
+            std::sort(keys, keys + nk);
+            uint64_t h = 0x9e3779b97f4a7c15ull;
+            for (size_t k2 = 0; k2 < nk; k2++) {
+                h ^= keys[k2] + 0x9e3779b97f4a7c15ull + (h << 6)
+                   + (h >> 2);
+            }
+            return h;
+        };
+        std::vector<uint64_t> lbl_sig(end - begin, 0);
+        std::map<size_t, uint64_t> pre_sig;   /* pc -> pre-trans sig */
+        std::vector<uint64_t> fix_sigs;       /* per main-loop fixup */
         for (size_t pc = begin; pc < end && emit_ok; pc++) {
             if (g_hoist.active && hri > 0
                     && pc == hregs[hri - 1].L + 1) {
@@ -22061,6 +22094,8 @@ retry_emission:
              */
             while (si < seams.size() && seams[si].pc == pc) {
                 const ShareSeam &sm = seams[si++];
+                if (!pre_sig.count(pc))
+                    pre_sig[pc] = cache_sig();
                 seam_pre[pc] = e.pos();   /* early branches land HERE */
                 Emitter::PinMach pm(e);
                 for (Emitter::CacheEnt &c : e.cache) {
@@ -22087,6 +22122,8 @@ retry_emission:
              * for the same back-edge reason as the seam above. */
             while (lt < lsra_tr.size() && lsra_tr[lt].pc == pc) {
                 const LsraTrans &tr = lsra_tr[lt++];
+                if (!pre_sig.count(pc))
+                    pre_sig[pc] = cache_sig();
                 if (!seam_pre.count(pc))
                     seam_pre[pc] = e.pos();
                 Emitter::PinMach pm(e);
@@ -22125,8 +22162,12 @@ retry_emission:
 #endif
             }
             label[pc - begin] = e.pos();
+            lbl_sig[pc - begin] = cache_sig();
             e.released = rel_active[pc - begin];
             emit_one(pc, /*in_cold=*/false, end);
+            /* every fixup this op appended sees the op's own state */
+            if (fix_sigs.size() < fixups.size())
+                fix_sigs.resize(fixups.size(), lbl_sig[pc - begin]);
         }
         g_hoist.active = false;
         g_hoist2.active = false;
@@ -22170,14 +22211,38 @@ retry_emission:
         const size_t exit_pos = e.pos();
         e.exit_pc(static_cast<uint32_t>(remap[end]));   /* fall-through */
 
-        for (const Fixup &f : fixups) {    /* patch internal jumps */
+        for (size_t fi = 0; fi < fixups.size(); fi++) {
+            const Fixup &f = fixups[fi];   /* patch internal jumps */
             size_t dst = label[f.target_pc - begin];
+            bool to_pre = false;
             /* #96 inc-2: a branch TARGETING a seam pc runs the seam
              * iff its source precedes it (emission is linear, so the
              * fixup site decides the side) */
             const auto sp = seam_pre.find(f.target_pc);
-            if (sp != seam_pre.end() && f.site < sp->second)
+            if (sp != seam_pre.end() && f.site < sp->second) {
                 dst = sp->second;
+                to_pre = true;
+            }
+#ifndef NDEBUG
+            /* D4 arm 2: the in-edge state must equal the landing
+             * position's state (the discipline's own guarantee,
+             * asserted so a violation aborts by name at compile
+             * time instead of running a stale register). The whole
+             * block is validation - no emission reads it - so the
+             * NDEBUG gate is safe, and without it `want` is the
+             * cc1f50f set-but-unused release warning. */
+            if (fi < fix_sigs.size()) {
+                const uint64_t want = to_pre
+                    ? pre_sig[f.target_pc]
+                    : lbl_sig[f.target_pc - begin];
+                ML_CHECK_MSG(fix_sigs[fi] == want,
+                             "validator arm 2: a branch's register "
+                             "state disagrees with its target's - an "
+                             "edge crossed a transition");
+            }
+#endif
+            (void)to_pre;                /* read only by the gated
+                                          * check - the cc1f50f shape */
             e.patch32(f.site,
                       static_cast<uint32_t>(dst - (f.site + 4)));
         }
