@@ -581,15 +581,29 @@ slot-on-two-registers refused at every lever compile; the escape
 analysis' reassignment-guard precedent), plus property S5 and two
 extension-shape cases in the -rt net.
 
-⛔ NEXT: 2b-iii-c inc 2 - THE COST MODEL (83_regs_int_40 +6.09%
-is its measured target): weight-aware admission and eviction (a
-piece must save more than its install+flush; the pick's >= 3
-threshold returns as a profitability floor; prefer the heavier
-piece at pressure ties instead of scan order). Re-measure the
-six-bench ledger after. Then: validator arm 2, second-chance
-re-queue, spill homes + C2b merge into trans mode, float twin,
-the D0 full-suite ledger (RULE B1), and the default flip only
-when D4 is green AND the ledger pays.]
+2b-iii-c inc 2 LANDED 2026-08-23 - and the diagnosis CORRECTED
+the scope: 83's +6.09% was not the winner selection or the
+eviction but the MISSING SPILL-HOME TIER (lever-off serves 13
+pins + 16 homes; v1 zeroed the homes). The merge: trans mode's
+overflow (uses_int >= 3, no mem_int anywhere, no float facts, no
+resident piece) joins spill_hot weight-ranked via lsra_homes
+(appending to hot corrupts the abstract-reg zip - its ML_CHECK
+caught the draft); jit_share_plan disabled under trans mode (the
+transitions own sharing). MEASURED: 83 +6.09% -> +0.76%; the
+six-bench ledger reads +0.14%..+0.76%.
+
+⛔ NEXT: 2b-iii-d - close the gap to zero and gate the flip:
+ - the residual sub-1%: per-call transition code on hot entries
+   (fuse install runs into the entry-load block when they sit in
+   the straight-line prologue), the textra filter (transitioned
+   slots could re-enter type elision per-piece), selection
+   polish (weight-aware eviction ties);
+ - validator arm 2 as a machine check; second-chance re-queue;
+   C2b hoist regions into trans mode (they currently decline it);
+   the float pool twin;
+ - the D0 full-suite ledger (RULE B1) + wall-clock interleaved
+   A/B, and the default flip only when D4 is green AND the
+   ledger pays.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)

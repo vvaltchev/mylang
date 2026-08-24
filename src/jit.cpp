@@ -20846,6 +20846,7 @@ retry_emission:
         std::vector<LsraTrans> lsra_tr;      /* ABSTRACT until bound */
         std::vector<int> lsra_entry;
         std::vector<int> lsra_aregs;
+        std::vector<int> lsra_homes;         /* the home-tier overflow */
         if (g_jit_lsra) {
             SlotLiveness lsl;
             std::vector<LiveInterval> liv;
@@ -20894,6 +20895,58 @@ retry_emission:
                             std::unique(lsra_aregs.begin(),
                                         lsra_aregs.end()),
                             lsra_aregs.end());
+                        /* the SPILL-HOME overflow: a clean slot that
+                         * never won a register goes to the native-
+                         * stack home tier, exactly as the pick's
+                         * overflow does - v1 zeroed this out and paid
+                         * +6% on 83_regs_int_40, whose lever-off
+                         * emission serves 13 pins PLUS 16 homes. The
+                         * qualification mirrors the pick's whole-run
+                         * contract through the per-interval facts:
+                         * no mem_int anywhere (a d1-style boxed
+                         * redefinition excludes), no float facts,
+                         * int evidence, the >= 3 floor (the home's
+                         * seed + flush cost), and NO resident piece
+                         * (a slot is registers or a home, never
+                         * both). Carried in lsra_homes and handed
+                         * straight to spill_hot after the split -
+                         * appending to hot would corrupt the
+                         * abstract-reg zip, whose order IS the
+                         * entry-occupant list. */
+                        {
+                            std::map<int, char> res2, mem2, fl2;
+                            std::map<int, long> wq;
+                            for (size_t k2 = 0; k2 < liv.size(); k2++) {
+                                const int s2 = liv[k2].slot;
+                                mem2[s2] |= lq[k2].mem_int;
+                                fl2[s2] |= lq[k2].uses_float > 0
+                                         || lq[k2].wrote_float;
+                                wq[s2] += lq[k2].uses_int;
+                            }
+                            for (const LsraPiece &p : tp.pieces)
+                                if (p.reg >= 0)
+                                    res2[p.slot] = 1;
+                            std::vector<std::pair<long, int>> hc;
+                            for (const auto &kv : wq)
+                                if (kv.first >= 0
+                                        && kv.first < chunk.slot_count
+                                        && kv.second >= 3
+                                        && !res2[kv.first]
+                                        && !mem2[kv.first]
+                                        && !fl2[kv.first])
+                                    hc.push_back({ kv.second,
+                                                   kv.first });
+                            std::sort(hc.begin(), hc.end(),
+                                      [](const std::pair<long, int> &a,
+                                         const std::pair<long, int> &b)
+                                      {
+                                          return a.first != b.first
+                                              ? a.first > b.first
+                                              : a.second < b.second;
+                                      });
+                            for (const auto &cd : hc)
+                                lsra_homes.push_back(cd.second);
+                        }
                         lsra_tr.swap(tr);
                         lsra_entry.swap(entry);
                         lsra_tmode = true;
@@ -20986,6 +21039,10 @@ retry_emission:
             hot.resize(max_pins);
             hot_counts.resize(max_pins);
         }
+        if (lsra_tmode)
+            spill_hot = lsra_homes;      /* the trans-mode overflow -
+                                          * hot is the entry-occupant
+                                          * list, never over budget */
         if (jit_lever_off(JL_SCACHE))
             spill_hot.clear();
         /* #96 COST MODEL: the home CAPACITY is applied AFTER the share
@@ -21242,8 +21299,13 @@ retry_emission:
          * home). Decided after the assignment so the plan knows the
          * registers, before the scache build so the homes shrink. */
         std::vector<ShareSeam> seams;
-        jit_share_plan(chunk, begin, end, hot, hot_reg, spill_hot,
-                       home_cap, seams);
+        /* trans mode owns register sharing (the transitions); a
+         * ShareSeam chained onto the same registers would collide
+         * with them, so the share plan runs only for the pick's
+         * placements */
+        if (!lsra_tmode)
+            jit_share_plan(chunk, begin, end, hot, hot_reg, spill_hot,
+                           home_cap, seams);
         /* the homes take what the plan left, up to capacity; a residue
          * past it stays a frame slot (the pre-#96 placement) */
         if (spill_hot.size() > home_cap)
