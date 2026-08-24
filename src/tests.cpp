@@ -26375,6 +26375,13 @@ static bool jit_share_region_clamp()
         "z = z ^ 1;\n"
         "assert(z == 4764);\n";
     const unsigned long c0 = g_jit_share_clamped;
+    /* the ShareSeam machinery is the PICK's (tmode owns register
+     * sharing via transitions and skips the share plan entirely), so
+     * this test forces the default allocator for its duration - the
+     * documented convention for coverage tests of the pick's
+     * mechanisms (jit_xcache_pins et al.) */
+    const bool lsra_saved = g_jit_lsra;
+    g_jit_lsra = false;
     g_jit_force_extra |= jit_lever_bit("rshare");
     setenv("MYLANG_JIT_MAXPINS", "1", 1);
     bool ok = true;
@@ -26396,6 +26403,7 @@ static bool jit_share_region_clamp()
     }
     unsetenv("MYLANG_JIT_MAXPINS");
     g_jit_force_extra &= ~jit_lever_bit("rshare");
+    g_jit_lsra = lsra_saved;
     if (ok && g_jit_share_clamped <= c0) {
         printf("  share-clamp: the clamp never fired (counter flat "
                "at %lu) - the L+1 shape is not reaching it\n", c0);

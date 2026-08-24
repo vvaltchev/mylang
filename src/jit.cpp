@@ -11497,9 +11497,21 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                    std::vector<LsraPiece> &pieces,
                    std::vector<int> &entry_by_reg,
                    std::vector<LsraTrans> &trans,
-                   const std::vector<FltEvent> *fev)
+                   const std::vector<FltEvent> *fev,
+                   const std::vector<std::pair<size_t, size_t>>
+                       *noreach)
 {
     const bool fm = fev != nullptr;      /* F3: the float twin */
+    /* the C2b tmode lift: a pc inside a region's (T, L+1] may not
+     * carry a transition (contract in jit.h) */
+    const auto reach_ok = [&](int x) {
+        if (noreach)
+            for (const auto &r : *noreach)
+                if (static_cast<size_t>(x) > r.first
+                        && static_cast<size_t>(x) <= r.second)
+                    return false;
+        return true;
+    };
     entry_by_reg.assign(static_cast<size_t>(K), -1);
     trans.clear();
     if (begin >= end || K < 0)
@@ -11561,8 +11573,9 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
     const auto latest_legal = [&](uint32_t lo, uint32_t start)
         -> long {
         for (uint32_t s = start; s-- > lo; )
-            if (s == begin || jit_lin_point(edges,
-                                            static_cast<int>(s)))
+            if (s == begin || (jit_lin_point(edges,
+                                             static_cast<int>(s))
+                               && reach_ok(static_cast<int>(s))))
                 return static_cast<long>(s);
         return -1;
     };
@@ -11579,7 +11592,8 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
     for (const size_t pi : order) {
         LsraPiece &p = pieces[pi];
         if (p.reg < 0 || p.start == begin
-                || jit_lin_point(edges, static_cast<int>(p.start)))
+                || (jit_lin_point(edges, static_cast<int>(p.start))
+                    && reach_ok(static_cast<int>(p.start))))
             continue;
         const uint32_t ls = slot_lo(p);
         const uint32_t lo = std::max(ls, reg_lo(p));
@@ -11618,7 +11632,8 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
     for (const size_t pi : order) {
         LsraPiece &p = pieces[pi];
         if (p.reg < 0 || p.end >= end
-                || jit_lin_point(edges, static_cast<int>(p.end)))
+                || (jit_lin_point(edges, static_cast<int>(p.end))
+                    && reach_ok(static_cast<int>(p.end))))
             continue;
         uint32_t hi = static_cast<uint32_t>(end);
         for (const LsraPiece &q2 : pieces) {
@@ -11632,7 +11647,8 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
         bool done = false;
         for (uint32_t s = p.end + 1; s <= hi; s++) {
             if (s == end
-                    || jit_lin_point(edges, static_cast<int>(s))) {
+                    || (jit_lin_point(edges, static_cast<int>(s))
+                        && reach_ok(static_cast<int>(s)))) {
                 p.end = s;
                 done = true;
                 break;
@@ -21054,6 +21070,11 @@ retry_emission:
          * arm below; fhot replaced from them (never from the plan's
          * pieces - the 43_sieve idle-prefix lesson) */
         bool lsra_facts = false, lsra_f_chose = false;
+        /* the C2b tmode lift: transitions may not sit in a region's
+         * (T, L+1] (the cold-path bypass - jit.h's noreach contract) */
+        std::vector<std::pair<size_t, size_t>> lsra_noreach;
+        for (const HoistRegion &hr : hregs)
+            lsra_noreach.push_back({ hr.T, hr.L + 1 });
         /* F4b: FLOAT trans mode - per-pc xmm pieces through e.fcache.
          * Same v1 bounds as GP tmode (no temps; hregs empty - the
          * fresh-window cold-copy hazard). ABSTRACT until bound. */
@@ -21067,13 +21088,15 @@ retry_emission:
          * LsraTrans list, entry stubs replay it, exits and brackets
          * read the evolving e.cache (truthful at every pc by the
          * uniform-flush rule). v1 bounds, each with its reason:
-         * hregs must be empty (a hoist region's COLD COPY re-emits
-         * ops elsewhere - a transition inside one would be re-run);
          * no temps (the pick's scratch-reuse rule, kept until pieces
          * are proven on temp lifetimes); no spill homes (a piece is
          * register or memory; the home tier is a later merge); a
          * transitioned slot leaves textra (two machineries on one
-         * slot's type word is a review, not a v1). */
+         * slot's type word is a review, not a v1). The old hregs-
+         * empty bound is LIFTED (the C2b tmode lift): the snap's
+         * noreach ranges keep transitions out of a region's
+         * (T, L+1], and each cold copy is emitted against the
+         * REPLAYED state at its T (below). */
         bool lsra_tmode = false;
         std::vector<LsraTrans> lsra_tr;      /* ABSTRACT until bound */
         std::vector<int> lsra_entry;
@@ -21104,7 +21127,8 @@ retry_emission:
                             p.reg = -1;          /* v1: no temps */
                     if (jit_lsra_snap(chunk, begin, end, liv, lq,
                                       liu, static_cast<int>(max_pins),
-                                      tp.pieces, entry, tr)) {
+                                      tp.pieces, entry, tr, nullptr,
+                                      &lsra_noreach)) {
                         std::map<int, long> w;
                         for (size_t k2 = 0; k2 < liv.size(); k2++)
                             w[liv[k2].slot] += lq[k2].uses_int
@@ -21336,7 +21360,7 @@ retry_emission:
                                           liu,
                                           static_cast<int>(MAX_FCACHED),
                                           fp.pieces, fentry, ftr,
-                                          &lfev)) {
+                                          &lfev, &lsra_noreach)) {
                             fhot.clear();
                             for (size_t r = 0; r < fentry.size(); r++)
                                 if (fentry[r] >= 0)
@@ -22738,6 +22762,87 @@ retry_emission:
             for (const size_t j : h_cold[ri])
                 e.patch32_here(j);
             g_fwd = JitFwd{};
+            /* the C2b tmode lift: the copy is emitted against the
+             * REPLAYED cache state at T - e.cache/e.fcache here hold
+             * the STREAM-END state (the fresh-window hazard the plan
+             * flagged), while at runtime the cold path enters from
+             * the guard at T. base + transitions <= T is the guard-
+             * point state (a transition AT T is emitted before the
+             * guard), and the snap's noreach refusal makes it
+             * constant across the region. ra's busy set is rebuilt
+             * to match (busy <=> entry, the per-pc invariant);
+             * snapshot/restore bracket the whole copy. No code is
+             * emitted by the rebuild - at runtime those registers
+             * already hold the values. */
+            Emitter::CacheState cold_saved = e.snapshot_cache();
+            {
+                for (const Emitter::CacheEnt &c : e.cache)
+                    e.ra.give(c.reg);
+                for (const Emitter::CacheEnt &c : e.fcache)
+                    e.ra.fgive(c.reg);
+                e.cache = base_cache;
+                /* ShareSeams retarget registers too, and any seam at
+                 * or before T ran on both paths - the guard-point
+                 * state includes it (the stub replay's exact rule; a
+                 * first version applied only transitions, wrong the
+                 * moment the seam clamp lets a pre-T seam coexist
+                 * with a region) */
+                for (const ShareSeam &sm : seams) {
+                    if (sm.pc > cT)
+                        break;
+                    for (Emitter::CacheEnt &c : e.cache)
+                        if (c.reg == sm.reg) {
+                            const SlotAddr na = slot_addr(sm.to_slot);
+                            c.slot = sm.to_slot;
+                            c.payload = na.payload;
+                            c.type = na.type;
+                            break;
+                        }
+                }
+                for (const LsraTrans &tr : lsra_tr) {
+                    if (tr.pc > cT)
+                        break;
+                    if (tr.evict_slot >= 0)
+                        for (size_t ci = 0; ci < e.cache.size(); ci++)
+                            if (e.cache[ci].reg
+                                    == static_cast<uint8_t>(tr.reg)) {
+                                e.cache.erase(e.cache.begin()
+                                    + static_cast<long>(ci));
+                                break;
+                            }
+                    if (tr.install_slot >= 0) {
+                        const SlotAddr na = slot_addr(tr.install_slot);
+                        e.cache.push_back({ tr.install_slot,
+                                            na.payload, na.type,
+                                            static_cast<uint8_t>(
+                                                tr.reg) });
+                    }
+                }
+                e.fcache = base_fcache;
+                for (const LsraTrans &tr : lsra_ftr) {
+                    if (tr.pc > cT)
+                        break;
+                    if (tr.evict_slot >= 0)
+                        for (size_t ci = 0; ci < e.fcache.size(); ci++)
+                            if (e.fcache[ci].reg
+                                    == static_cast<uint8_t>(tr.reg)) {
+                                e.fcache.erase(e.fcache.begin()
+                                    + static_cast<long>(ci));
+                                break;
+                            }
+                    if (tr.install_slot >= 0) {
+                        const SlotAddr na = slot_addr(tr.install_slot);
+                        e.fcache.push_back({ tr.install_slot,
+                                             na.payload, na.type,
+                                             static_cast<uint8_t>(
+                                                 tr.reg) });
+                    }
+                }
+                for (const Emitter::CacheEnt &c : e.cache)
+                    e.ra.take_fixed(c.reg);
+                for (const Emitter::CacheEnt &c : e.fcache)
+                    e.ra.ftake_fixed(c.reg);
+            }
             std::vector<size_t> cold_label(cL - cT + 1, 0);
             std::vector<Fixup> cold_fix;
             cur_fix = &cold_fix;
@@ -22768,6 +22873,7 @@ retry_emission:
                 e.patch32(f.site,
                           static_cast<uint32_t>(dst - (f.site + 4)));
             }
+            e.restore_cache(std::move(cold_saved));
         }
         if (!emit_ok) {
             g_hoist = JitHoist{};
