@@ -25114,24 +25114,36 @@ static bool jit_telide_c3()
         return true;
     const unsigned long t0 = g_jit_telide;
     const ExecEngine se = g_exec_engine;
+    const size_t naccum = jit_pin_budget() + 3;
     g_exec_engine = ExecEngine::Vm;
     std::ostringstream cap;
     std::streambuf *old = cout.rdbuf(cap.rdbuf());
     try {
-        const char *lines[] = {
-            "func f(n) {",
-            "    var a = 0; var b = 0; var c = 0; var d = 0; var q = 0;",
-            "    var w = 0;",
-            "    for (var i = 0; i < n; i++) {",
-            "        a += i; b += a; c += b; d += c; q += d; w += q; }",
-            "    return a + b * 3 + c * 7 + d * 11 + q * 13 + w * 17; }",
-            /* runtime(): a const arg folds the whole PURE call at
-             * compile time (the trap list's shape-eater #2 - the first
-             * version printed a baked literal and ran nothing) */
-            "print(f(int(runtime(50))));",
-        };
-        std::string joined;
-        for (const char *l : lines) { joined += l; joined += "\n"; }
+        /* ⛔ SIZE THE PROGRAM FROM THE POOL, NOT FROM A GUESS. This
+         * used to declare six accumulators against a 4-wide pool. When
+         * #96 widened the pool to 7 (r9 joined), all six got a REGISTER,
+         * nothing was elided, and the test failed with "no type-elided
+         * fragment ever entered" - the improvement ate its shape. Three
+         * past the budget keeps it overflowing at any pool width, and
+         * the check below fails LOUDLY rather than vacuously if the
+         * budget ever outgrows what this generates. */
+        std::string joined = "func f(n) {\n";
+        for (size_t k = 0; k < naccum; k++)
+            joined += "    var a" + std::to_string(k) + " = 0;\n";
+        joined += "    for (var i = 0; i < n; i++) {\n";
+        for (size_t k = 0; k < naccum; k++)
+            joined += k == 0 ? "        a0 += i;\n"
+                             : ("        a" + std::to_string(k) + " += a"
+                                + std::to_string(k - 1) + ";\n");
+        joined += "    }\n    return ";
+        for (size_t k = 0; k < naccum; k++)
+            joined += (k ? " + a" : "a") + std::to_string(k) + " * "
+                   + std::to_string(2 * k + 1);
+        joined += "; }\n";
+        /* runtime(): a const arg folds the whole PURE call at compile
+         * time (the trap list's shape-eater #2 - the first version
+         * printed a baked literal and ran nothing) */
+        joined += "print(f(int(runtime(50))));\n";
         std::vector<Tok> toks;
         lexer(joined, 1, toks);
         ParseContext pc(TokenStream(toks), true);
@@ -25142,11 +25154,32 @@ static bool jit_telide_c3()
         vm_execute(root.get());
     } catch (...) { }
     cout.rdbuf(old);
-    g_exec_engine = se;
     const std::string got = cap.str();
-    /* the tree-walker's value, computed independently */
-    if (got != "3819049780 \n") {
-        cout << "  telide: got [" << got << "]\n";
+
+    g_exec_engine = se;
+    /* THE ORACLE IS THE PROGRAM'S SPEC, recomputed here in C++ - not a
+     * hardcoded constant (the accumulator count now follows the pool
+     * width) and not a second ENGINE (a script's runtime symbol map is
+     * asserted empty, so the tree-walker cannot be driven in-process
+     * from here). Same sequential order the generated body uses, same
+     * int_type wraparound. */
+    int_type acc[64] = { 0 };
+    for (int_type i = 0; i < 50; i++) {
+        acc[0] += i;
+        for (size_t k = 1; k < naccum; k++)
+            acc[k] += acc[k - 1];
+    }
+    int_type total = 0;
+    for (size_t k = 0; k < naccum; k++)
+        total += acc[k] * static_cast<int_type>(2 * k + 1);
+    const std::string want = std::to_string(total) + " \n";
+    /* The VALUE is not hardcoded any more - it depends on the pool
+     * width, which is the point. The oracle is the TREE-WALKER running
+     * the same generated source, which is the project's standard
+     * cross-engine check and is immune to the pool changing. */
+    if (got != want) {
+        cout << "  telide: jit got [" << got << "] tree-walker [" << want
+             << "]\n";
         return false;
     }
     if (g_jit_telide == t0) {

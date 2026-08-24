@@ -691,20 +691,63 @@ instruction count.
    the helper's writes. 57 of 108 corpus programs change; every changed
    line is a retargeted `jmp` or part of the new bare epilogue.
 
-   **What remains for the allocator proper**, now unblocked:
-     - intervals for the qualified candidates `pick_cached_slots`
-       already ranks (its `typed_extra` overflow set is exactly the
-       slots that would share);
-     - a register may take a second occupant once the first interval
-       ends - the mandate's "re-useable by multiple variables even in
-       the same frame, same block";
-     - ⛔ **the branch rule**: with a fragment-constant cache, state
-       agreement across a control-flow edge is free. With intervals it
-       is not. The sufficient condition to start from is that every
-       interval be edge-closed - for each branch a -> b in the run, the
-       interval contains both or neither - which is checkable from
-       `visit_pc_fields` and keeps every edge state-preserving without
-       any merge machinery.
+   ### ⛔ INTERVAL SHARING IS THE WRONG NEXT STEP - MEASURED, 2026-08-16
+
+   The plan said to state the ceiling before writing code. Done, with
+   **`MYLANG_REGAUDIT=1`** (pick_cached_slots), over bench/my + samples
+   + tests/functional:
+
+   | | |
+   |---|---|
+   | fragments | 127 |
+   | qualified int candidates | 332 |
+   | pinned today | 220 |
+   | overflow (no register) | **112** |
+   | overflow with an interval DISJOINT from some pin | 35 |
+   | ...and EDGE-CLOSED (shareable with no per-edge fixup) | **0** |
+
+   **Zero.** Letting two slots with disjoint live ranges share one
+   register would give a register to no slot anywhere in the corpus.
+   Two independent reasons, and the second is the general one:
+
+   - The `8N_regs_int_*` family - the benches written FOR this task -
+     report `shareable=0` outright. Every accumulator is updated every
+     iteration, so their live ranges all span the whole loop and
+     overlap completely. Sharing is meaningless there BY
+     CONSTRUCTION, which is worth knowing before building it.
+   - Where intervals ARE disjoint (68_nested: 41 candidates, 4 pinned,
+     34 shareable) not one is edge-closed. Edge-closure demands that no
+     jump cross the interval boundary, and a fragment with `if`s has
+     forward branches over nearly every interior point. Only a
+     whole-fragment interval survives - which is what we already have.
+
+   Making sharing work therefore needs real **edge reconciliation**
+   (moves inserted on control-flow edges, the thing a linear-scan
+   allocator does), not the cheap edge-closed rule. That is a large
+   machine for a benefit this measurement says is zero on today's code.
+   **Do not build it without a corpus that wants it.**
+
+   ### What the data DOES say: the pool is the binding constraint
+
+   112 candidates have no register because there are only 6 registers
+   and, on 83_regs_int_40, 42 candidates. So the question is not "use
+   the registers better", it is "have more registers" - which is the
+   maintainer's mandate restated. Ranked by how often the emitter
+   hardcodes each as SCRATCH:
+
+       RAX 297   RCX 165   RDX 133   RSI 84   RDI 76   r8 42   r9 14
+
+   - **r9: DONE** (2026-08-16), pool 6 -> 7. Two local uses, both
+     already safe under the gates r10/r11 rely on. Measured: loop
+     instruction count BYTE-IDENTICAL (the scale3-minus-scale1 delta is
+     328,000,022 on both sides), loop data references **-20.0% on
+     80_regs_int_08**, wall clock 1.009x over the affected benches -
+     the corrected cost model exactly. A prerequisite, not a win.
+   - **rax/rcx/rdx/rdi: NOT reachable by adding a pool entry.** ~670
+     hardcoded scratch uses; freeing them needs the emitter to ALLOCATE
+     its scratch, which is the genuinely large piece of work left and
+     the only route to 13.
+   - **rsi/r8** (the type singletons): plan step 5 below, gated.
 2. **Live ranges from `visit_use_def` - DONE.** `jit_slot_liveness`
    (codegen.h) answers the three questions an allocator asks: may a
    register be dropped without a write-back (is the slot dead), what

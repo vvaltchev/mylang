@@ -329,6 +329,11 @@ size_t jit_enter(const void *frag, void *slots);
  * many slot candidacies its disqualification killed. The "what to make
  * cache-aware next" surface - see pick_cached_slots. */
 void jit_cache_audit_report();
+
+/* #96: MAX_CACHED + MAX_XCACHED - the int pin budget a fragment can
+ * spend. Exported for jit_telide_c3, which must build a program with
+ * MORE hot int locals than this or it exercises nothing. */
+size_t jit_pin_budget();
 /*
  * REACH (env MYLANG_JITSTATS=1): print the emitted-code counters after a
  * script run - which TIER each shape actually took, on a real program.
