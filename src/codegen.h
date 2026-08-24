@@ -100,6 +100,76 @@ bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
                   std::vector<char> &is_tgt);
 
 /*
+ * #96 THE REGISTER ALLOCATOR'S LIVE RANGES - the same fixpoint as
+ * jit_fwd_info, widened from "the temps, if there are at most 64" to
+ * EVERY frame slot. Both are wrappers over one core (codegen.cpp), so
+ * there is exactly one backward liveness and one use of visit_use_def:
+ * a second enumeration is the audit-table trap waiting to happen, and
+ * this one would rot silently (liveness that is WRONGLY conservative
+ * costs an optimization and says nothing).
+ *
+ * An allocator needs three things this answers:
+ *   - may a register holding slot s be dropped without a write-back?
+ *     (only if s is dead - `live_out(pc, s)` false);
+ *   - what must be written back at an exit?  (the live-out set there);
+ *   - may one register serve two slots?  (disjoint ranges).
+ *
+ * ⛔ IT IS A **MAY** ANALYSIS AND MUST STAY ONE. "Live" means "read on
+ * SOME path after here", so over-approximating is always safe and
+ * under-approximating is a silent wrong answer. An op `visit_use_def`
+ * does not know makes every covered slot live (`known == false` ->
+ * all), exactly as the temp version does; handler bodies and every
+ * branch target are absorbed the same way.
+ *
+ * `words` uint64 per pc, so there is NO 64-slot cliff. Returns false
+ * only when the chunk has no slots at all, in which case everything is
+ * empty and the caller must assume every slot live.
+ */
+struct SlotLiveness {
+    int base = 0;                    /* first slot covered */
+    int count = 0;                   /* how many slots from base */
+    size_t words = 0;                /* uint64 per pc */
+    std::vector<uint64_t> livein;    /* n_pc * words */
+    std::vector<uint64_t> liveout;
+    bool ok = false;
+
+    bool covers(int slot) const
+    { return ok && slot >= base && slot < base + count; }
+    /* NOT-covered reads as LIVE: the may-analysis direction. */
+    bool live_in(size_t pc, int slot) const
+    { return bit(livein, pc, slot); }
+    bool live_out(size_t pc, int slot) const
+    { return bit(liveout, pc, slot); }
+
+private:
+    bool bit(const std::vector<uint64_t> &v, size_t pc, int slot) const
+    {
+        if (!covers(slot) || (pc + 1) * words > v.size())
+            return true;
+        const int b = slot - base;
+        return (v[pc * words + b / 64] >> (b % 64)) & 1;
+    }
+};
+bool jit_slot_liveness(const Chunk &chunk, SlotLiveness &out);
+
+/*
+ * #96: the SPILL heuristic's input - for each pc in [begin,end) and each
+ * covered slot, how many instructions until its next USE, scanning
+ * forward in pc order (JIT_NO_NEXT_USE == none in the run).
+ *
+ * ⛔ THIS IS A HEURISTIC, NOT A FACT, and the difference is the whole
+ * reason it is a separate function from the liveness above. Straight-line
+ * pc order is not execution order: a BACK EDGE means a slot used at the
+ * top of a loop is next used almost immediately, while this reports "not
+ * again in this run". Evicting the wrong register costs a reload, never
+ * a wrong answer - so a heuristic is the right shape here - but nothing
+ * that must be CORRECT may read it. Use SlotLiveness for that.
+ */
+enum { JIT_NO_NEXT_USE = 1 << 30 };
+void jit_next_use(const Chunk &chunk, size_t begin, size_t end,
+                  int base, int count, std::vector<int> &dist);
+
+/*
  * C4d (plans/archived/typed-invariant-arrays.md): the per-pc STRUCT-IDENTITY facts
  * a PLANNED StructCtorV establishes, so a baked member read on the same
  * slot can skip the type-tag + def-identity guards it would otherwise

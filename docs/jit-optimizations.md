@@ -5187,3 +5187,70 @@ one fires on a reachable shape.
 its FIRST line and all of its returns inherit it. A "is there a
 flush_cache() within four lines above" classification got all five
 wrong, and the assertion caught it on the first run.
+
+## #96 - the all-slot LIVE RANGES (the allocator's input)
+
+`jit_slot_liveness` (codegen.h/.cpp) is the backward liveness an
+allocator needs, and `jit_next_use` is its spill-victim ranking. Three
+questions it answers: may a register holding slot s be dropped without a
+write-back (is s dead), what must be written back at an exit (the
+live-out set there), and may one register serve two slots (disjoint
+ranges).
+
+**ONE FIXPOINT, TWO WRAPPERS.** `jit_fwd_info` (lever A's temps, one
+64-bit word) and `jit_slot_liveness` (every slot, `words` words) both
+call `jit_liveness_core`, so `visit_use_def`, `visit_pc_fields` and the
+handler absorption are read from exactly one place. A second liveness
+would be the audit-table trap with the worst possible failure mode - a
+liveness that is wrongly CONSERVATIVE loses an optimization and says
+nothing at all.
+
+It also removes a cliff nobody was watching: the one-word mask made
+`jit_fwd_info` `return false` whenever `n_temps > 64`, silently
+downgrading C4a-i, C3 inc 3 and C5 to locals-only on any chunk that
+large. The general form has no width limit.
+
+**`jit_next_use` is deliberately a SEPARATE function because it is a
+HEURISTIC.** It scans backward in pc order, and pc order is not
+execution order: across a back edge a slot used at the top of a loop is
+next used almost immediately, while this reports "not again in this
+run". That is fine for choosing an eviction victim - the cost is a
+reload, never a wrong answer - and would be a bug in anything that must
+be correct. Keeping them apart, with the reason written at both, is what
+stops the next reader reaching for the cheap one.
+
+Emitted code byte-identical on all 108 corpus programs, so the widening
+is a pure analysis addition.
+
+### ⛔ THE ORACLE THAT SHARED ITS SUBJECT (watched failing)
+
+The natural test is "the new all-slot analysis must agree with the old
+temps-only one on every temp" - an independent computation of the same
+fact. **It is not independent, and the widening is exactly what made it
+stop being so:** both are now wrappers over one core, so a bug in the
+core appears on both sides and cancels.
+
+Proven, not assumed. Four sabotages were run against the test:
+
+| sabotage | caught by |
+|---|---|
+| single-word packing (`b/64` dropped) | the dataflow equation |
+| drop the handler absorption | the dataflow equation |
+| `next_use` forgets the use | the next-use contract |
+| **unaudited op contributes NOTHING live** | **nothing - green** |
+
+The one that escaped is the dangerous one: too-little-live is what lets
+an allocator drop a value that is still read. What catches it is a check
+derived from the written CONTRACT rather than from another run of the
+code - *an op `visit_use_def` does not know leaves every covered slot
+live-in* - and that needed a program containing one of the **35
+unaudited opcodes** (an array element store; `StoreElemInt` is a
+barrier). The test counts them and FAILS VACUOUS if it saw none, which
+it did on the first attempt.
+
+**The general lesson, worth more than this analysis: a test whose ORACLE
+SHARES THE IMPLEMENTATION UNDER TEST proves only that the shared part is
+self-consistent.** Same family as "a test derived from a table can never
+find a hole in that table" - and the refactor that unifies two
+implementations is precisely the moment a cross-check between them stops
+being evidence. Re-derive at least one check from the SPEC.

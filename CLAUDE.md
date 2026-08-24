@@ -393,6 +393,23 @@ already paid the move, and the hot two-store path preserves RAX free.
 **When you add a helper the emitter calls, make its argument registers
 PARAMETERS and say what it clobbers.**
 
+**⛔ AN ORACLE THAT SHARES ITS SUBJECT IS NOT AN ORACLE (#96,
+2026-08-16).** #96 widened lever A's temps-only liveness into an
+all-slot one (`jit_slot_liveness`) by making BOTH wrappers over one
+`jit_liveness_core` - correct, and it silently destroyed the natural
+test. "The new analysis must agree with the old one on every temp"
+reads like an independent computation of the same fact; after the
+unification a bug in the core is on both sides and CANCELS. Watched:
+making an unaudited op contribute NOTHING live - the direction whose
+loss is a silent miscompile - left that comparison green. What catches
+it is a check derived from the written CONTRACT ("an op
+`visit_use_def` does not know leaves every covered slot live-in"),
+plus a count that FAILS VACUOUS when no unaudited op appeared.
+**The general rule: the refactor that unifies two implementations is
+exactly the moment a cross-check between them stops being evidence -
+re-derive at least one check from the SPEC.** Same family as "a test
+derived from a table can never find a hole in that table".
+
 **⛔ A FRAGMENT RETURN MUST NAME ITS WRITE-BACK CONTRACT (#96,
 2026-08-16).** The N5/C2a register cache holds frame slots in registers
 between an entry load and an exit flush, so a `ret` that leaves one
