@@ -8133,3 +8133,67 @@ check, census gate.
 NEXT: 2b-iii-b - EMISSION: generalize the seam-application loop to
 LsraTrans (evict-only and install-only arms), entry stubs + exit
 flushes from the replayed per-pc state, behind the lever.
+
+## Endgame D3.b step 2b-iii-b (2026-08-23) - transitions EXECUTE:
+## per-pc residency reaches emission
+
+WHAT: under the lever, the snapped plan's transitions are emitted and
+run. The seam-application loop gains the generalized arms (an
+interior-end FLUSH stores tag + payload and removes the cache entry; a
+mid-run INSTALL claims the register and loads - both before label[pc],
+the ShareSeam back-edge rule); entry stubs replay entry state + the
+transitions at or before their pc; exits and brackets need NOTHING new
+- e.cache evolves at the transitions and is truthful at every pc, so
+every consumer that iterates it is per-pc automatically. Physical
+binding: entry occupants ride the existing take_reg zip (hot is in
+abstract-reg order); an areg with only mid-run pieces fixes its
+identity (and its callee-saved push) at setup. Execution proof:
+g_jit_lsra_trans (JITSTATS), bumped by the emitted transition code -
+the phase-handoff shape executes 8 transitions and prints the same
+answer as the default engine.
+
+⛔ TWO INTEGRATION DEFECTS THE NETS CAUGHT IN MINUTES, both now rules:
+
+1. BUSY <=> ENTRY IS AN INVARIANT, NOT A CONVENTION. Binding a mid-run
+   areg's register busy at setup (no cache entry until its install)
+   hit check_pins_are_busy and then AccScratch's "no rax pin present"
+   abort - the conflict-evict and accumulator machinery PIVOT on
+   cache entries, and a busy-but-empty register is invisible to both.
+   Busy is per-pc now: an install take_fixed's its register AT ITS
+   PC, a flush gives it back; scratch is op-scoped, so nothing holds
+   a register across a transition. (A take_fixed refusal means a
+   Phase-A conflict denied the register mid-pass - skip; the pass
+   retries with it denied.)
+
+2. TYPE EVIDENCE IS PER PIECE, NOT PER INTERVAL (the d1 finding, a
+   shipped-quality wrong answer the lever sweep caught):
+   `var dyn d = 5; d = "hi"; d = [1,2]; len(d)` failed - d has ONE
+   interval spanning all three defs (boxed redefinitions are liveness
+   BARRIERS that glue them together), so interval-level uses_int > 0
+   let the post-cut remainder pin an ARRAY as an int and the flush
+   stamped t_int over t_arr. The qualifier now emits `int_uses`
+   events ({pc, slot} per usei/usei_dst) and the scan admits a piece
+   only with an int-op touch INSIDE IT. Property G pins it (a
+   resident piece owns an int touch inside itself), watched failing
+   by reverting to interval-level evidence - it names the exact d1
+   piece [3,4).
+
+MYLANG_LSRADBG=1 dumps per-run intervals + qual facts + pieces +
+transitions (the SHAREDBG pattern) - it is how d1 was diagnosed.
+
+Three more coverage tests pin g_jit_lsra = false (jit_range_share,
+jit_spill_homes, jit_rax_pin - seams, spill homes and the rax pin are
+replaced or absent under transitions by design). The bridge test
+gains the d1 program and a transition-counter execution proof.
+
+Verified: the full lever x arena matrix of -rt (1690 x 5 each) and
+corpus_diff, PLUS corpus --levers and --xrot COMPOSED with the lever,
+vdjcmp 116/116 both arenas for the default config, TESTS=1 OPT=1 both
+lever states, clang OPT=1 ASSERTS=0 LTO=0 zero warnings, non-JIT
+compile check, census gate.
+
+STILL AHEAD (2b-iii-c+): validator arm 2 as a machine check, the cost
+model / physical preference (rax stays excluded from mid-run pieces
+via pool order for now), spill homes + C2b hoist regions merged into
+trans mode (both currently decline it), the D0 Ir ledger A/B, and the
+default flip gated on D4 + the ledger.

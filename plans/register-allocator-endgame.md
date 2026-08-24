@@ -537,19 +537,40 @@ replay==coverage, S2b every continuation end owns its flush
 in-loop events demote; watched failing three ways. Share-plan
 refactor byte-identical (vdjcmp 116/116 both arenas).
 
-⛔ NEXT: 2b-iii-b - EMISSION behind the lever, in the seam
-pattern: generalize the seam-application loop (jit.cpp ~21600) to
-LsraTrans - evict-only and install-only arms beside ShareSeam's
-evict+install; entry stubs install the replayed state AS OF their
-pc (the existing base+seams rebuild, driven from entry_by_reg +
-trans); exits flush the replayed state at their pc (the
-exit_states machinery); brackets spill/reload the residents at
-cur_pc (assignment-agnostic already). Physical binding: abstract
-reg index -> the pool order (CACHE_REGS then xcache), denied
-masks respected. Validator arm 2 (label in-edge agreement) lands
-WITH it. Oracle = the full net + the D0 Ir ledger A/B. Still
-behind MYLANG_JIT_LSRA=1; the default flips only when D4 is green
-AND the ledger pays.]
+2b-iii-b LANDED 2026-08-23: TRANSITIONS EXECUTE. The seam loop
+gained the split arms (flush = store tag+payload + entry removed +
+register given back; install = take_fixed at its pc + entry + load,
+both before label[pc]); entry stubs replay entry + trans <= pc;
+exits/brackets needed NOTHING (e.cache evolves and is truthful at
+every pc). Physical binding: entry occupants ride the zip, mid-run
+aregs fix identity + callee-saved push at setup. Execution proof
+g_jit_lsra_trans; the phase-handoff shape runs 8 transitions with
+the right answer. TWO RULES from the nets: (1) BUSY <=> ENTRY -
+per-pc busy (take_fixed at install, give at flush; a busy-but-empty
+register was invisible to conflict-evict and hit AccScratch's
+abort); (2) TYPE EVIDENCE IS PER PIECE (the d1 finding - a dyn
+slot's ONE interval spans boxed redefinitions, which are liveness
+barriers; interval evidence pinned an ARRAY as int) - the qualifier
+emits int_uses {pc,slot} events, admission needs a touch INSIDE the
+piece, property G watched failing names the exact piece. v1 bounds
+recorded: hregs/spill-homes decline trans mode, no temps, rax
+unreachable for mid-run pieces (pool order). MYLANG_LSRADBG=1
+dumps the plan. Verified: full lever x arena matrix + corpus
+--levers/--xrot COMPOSED with the lever + vdjcmp 116/116 default.
+
+⛔ NEXT: 2b-iii-c - make the transitions PAY and gate the flip:
+ - validator arm 2 as a machine check (in-edge agreement is by
+   construction under lin points; assert it anyway - the D4 rule);
+ - the D0 Ir LEDGER A/B (RULE B1: rm -rf build, explicit --mylang,
+   OPT=1 ASSERTS=0 both sides, baseline rebuilt at the D0 sha) on
+   the regs family + the top-8 my/cpp - does per-pc residency
+   move Ir where the pick could not (the payoff shapes: phase
+   reuse, event-cut survivors)?
+ - the quality items the ledger will likely demand: second-chance
+   re-queue of split remainders, spill homes + C2b regions merged
+   into trans mode, the cost model / physical preference (rax ISA
+   facts), the float pool twin;
+ - the default flip only when D4 is green AND the ledger pays.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
