@@ -828,10 +828,15 @@ THE F-LADDER (mirror of the int increments, same lever):
      def and loop (a DictStore key bad()), and its vacuity
      detector must run PER PIECE - an interval's early def write
      hides read-first at interval granularity.
- F3. snap in FLOAT mode: same lin-point/demotion machinery
-     (register-agnostic already); the whole-run rescue criteria
-     flipped to the pick's float rule (fdst somewhere, no disq_f
-     event anywhere, no int uses, weight >= 3). Tests + watched.
+ F3. LANDED 2026-08-24: jit_lsra_snap's trailing `fev` param
+     flips the RESCUE eligibility to the pick's fhot rule (sum
+     uses_float >= 3, wrote_float somewhere, no mem_float, no int
+     uses); everything else shared verbatim. jit_lsra_snap_float_
+     check: FS2 replay, FS5 single-residency, the float rescue
+     shape (`sc = float(runtime(7))` in a branch - a builtin DST
+     is a BARRIER, not a bad(), so sc stays pick-eligible while
+     the branch edge demotes its piece boundary). WATCHED: forcing
+     fm-ineligibility trips the rescue vacuity guard.
  F4. the bridge's float half: whole-run fallback replaces the
      pick's fhot with the scan's whole-run float choice; trans
      mode installs per-pc xmm pieces through e.fcache (the seam
