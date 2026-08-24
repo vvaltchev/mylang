@@ -500,19 +500,37 @@ guarantees are COMPARATIVE (who loses), the assertion states that
 now. v1 gaps recorded: no split-remainder re-queue (second
 chance), float twin, physical binding/cost model - all 2b-ii.
 
-⛔ NEXT: D3.b step 2b-ii - EMISSION behind the `lsra` lever
-(default OFF): serve reg_at/spill_at (the D2 seam) from the plan's
-pieces at cur_pc; entry loads at piece starts, split stores at
-piece ends, label resolution v1 (canonical per-label assignment +
-in-edge fixup moves; the loop head is the critical case), exit
-flushes from the per-pc map; the physical binding (pool order,
+2b-ii OPENING LANDED 2026-08-23: the `lsra` lever
+(MYLANG_JIT_LSRA=1 / g_jit_lsra, default OFF) - the scan chooses
+the PIN SET (plan reduced to whole-run residency, pick's order),
+everything downstream unchanged; any stage declining falls back.
+Execution proof g_jit_lsra_pins (JITSTATS). ⛔ ITS FIRST SWEEP
+FOUND THE ReturnV TYPE-EVIDENCE RULE: a ret-only closure slot
+pinned on weight>0 was flushed t_int over t_func (NotCallableEx +
+leak) - the pick's >=3 threshold had been silently carrying the
+soundness rule. Now explicit: GP admission needs uses_int > 0;
+uses_ret is weight, never evidence. Gated in the scan (evid), the
+bridge (wint>0), property F in the 2b-i net (function-chunk case,
+watched failing), and the bridge test end-to-end. Coverage tests
+that pin the DEFAULT allocator (jit_xcache_pins,
+jit_hoist_pair_conflict) force g_jit_lsra=false for their span.
+Verified: 2x2 lever-x-arena -rt matrix, corpus both states +
+off-arena, vdjcmp 116/116 both arenas for the DEFAULT config,
+rel-t both states, clang lto0, non-JIT, census.
+
+⛔ NEXT: D3.b step 2b-iii - PER-PC EMISSION behind the lever:
+serve reg_at/spill_at (the D2 seam) from the plan's pieces at
+cur_pc; entry loads at piece starts, split stores at piece ends,
+label resolution v1 (canonical per-label assignment + in-edge
+fixup moves; the loop head is the critical case), exit flushes
+from the per-pc map; the physical binding (pool order,
 callee/caller-saved cost, gp_weight seed, rax ISA facts in the
-model). Validator arms 2/3 land WITH it; byte-identity ENDS here
-by design - oracle = the full net (5-mode, corpus matrices,
-fuzzers, Net 2/3) + the D0 Ir ledger A/B. START by wiring the
-lever + serving the seam for the DEGENERATE plan (K = pool size,
-no cuts fire) and prove THAT against today's pick emission with
-the full net before enabling splits.]
+model). Validator arms 2/3 land WITH it. Oracle = the full net
+(the 2x2 matrix above, corpus matrices, fuzzers, Net 2/3) + the
+D0 Ir ledger A/B. ⛔ FRESH-WINDOW JOB: this is the deepest
+emission surgery of the endgame - flush_cache / snapshot /
+restore / brackets / entry stubs all restate their contracts
+per-pc.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
