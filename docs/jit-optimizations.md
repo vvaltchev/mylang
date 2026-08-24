@@ -8650,3 +8650,35 @@ register-pressure shape (the regs family is int-only) - today's
 float transitions run entry-adjacent, invisible per iteration; a
 phased 5+-hot-float-local bench is the shape that would show the
 payoff.
+
+## C2b-regions arc step 1 (2026-08-24) - the ShareSeam cold-path
+## bypass closed, and the hazard mapped smaller than feared
+
+The C2b-into-tmode plan marker asked whether today's ShareSeams
+already carry the fresh-window hazard. Answer, from probes now kept
+as MYLANG_SHAREDBG: the corpus has ZERO seam/region coexistence
+(latent, not live); IN-region seams were already impossible (a
+region lives inside a loop whose back edge makes every interior pc
+a non-lin-point); and the ONE reachable hazard pc is exactly L+1 -
+outside the loop and lin-LEGAL, yet the cold copy's rejoin jumps to
+label[L+1], PAST a seam there, because the failed-C1-guard edge is
+an emission construct jit_run_edges cannot see. A seam skipped on
+the cold path leaves pre-seam registers where the main stream is
+post-seam.
+
+Fix: jit_share_plan takes `noseam` ranges ([T, L+1] per hoist
+region) and seam_ok refuses them, counted by g_jit_share_clamped.
+The -rt net (jit_share_region_clamp) constructs the L+1 shape - an
+early-phase pin whose span frees before the loop, and a post-loop
+slot whose lo lands exactly at L+1, rank-first among the overflow,
+under MYLANG_JIT_MAXPINS=1 + the in-process rshare force - and
+requires the clamp to FIRE. WATCHED: removing the clamp fails only
+the counter assertion; the value-level wrong answer needs the C1
+guard to FAIL at runtime, which no lever can force today (the
+cold-arm forcing lane, designed-not-built). Default emission
+116/116 byte-identical (no corpus program has the coexistence).
+
+The finding also sizes the remaining tmode lift: transitions inside
+a region are impossible by the snap's own lin rule, so lifting
+hregs.empty() needs only the snap's [T, L+1] refusal (the noseam
+mirror) plus the cold copy emitted against the replayed state at T.

@@ -26334,6 +26334,80 @@ static bool jit_lsra_snap_check()
 }
 
 /*
+ * THE SHARE-SEAM / HOIST-REGION CLAMP: a seam the cold path would
+ * BYPASS. A C2b region's cold copy is entered by the failed C1 guard
+ * - an EMISSION edge jit_run_edges cannot see - and rejoins at
+ * label[L+1], which is PAST a seam at L+1. The probes that built this
+ * test found the structure: IN-region seam pcs were already
+ * impossible (a region lives inside a loop, whose back edge makes
+ * every interior pc a non-lin-point), so the ONE reachable hazard pc
+ * is exactly L+1 - outside the loop, lin-legal, skipped by the
+ * rejoin. The clamp refuses [T, L+1]; this test constructs the L+1
+ * shape (an early-phase pin freed before the loop; a post-loop slot
+ * whose lo lands exactly at L+1, rank-first among the overflow) and
+ * requires the clamp to FIRE (g_jit_share_clamped, compile-time).
+ * WATCHED: removing the clamp leaves the value right - the C1 guard
+ * never fails at runtime, and no lever can force it yet (the
+ * cold-arm forcing lane is designed-not-built) - and fails only the
+ * counter assertion.
+ */
+static bool jit_share_region_clamp()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    std::string src = "var a = 0;\nif (runtime(1) > 0) { a = 1; }\n";
+    for (int k = 1; k <= 20; k++)
+        src += "a = a + " + std::to_string(k) + ";\n";
+    src +=
+        "var arr = [];\n"
+        "for (var i = 0; i < 40; i++) append(arr, i);\n"
+        "var s = 0;\n"
+        "for (var j = 0; j < 40; j++) {\n"
+        "    var t = arr[j] * 2;\n"
+        "    s = s + t;\n"
+        "    var w = arr[j] + 1;\n"
+        "    s = s + w;\n"
+        "}\n"
+        "var z = s + 1;\n"
+        "z = z * 2;\n"
+        "z = z + 3;\n"
+        "z = z ^ 1;\n"
+        "assert(z == 4764);\n";
+    const unsigned long c0 = g_jit_share_clamped;
+    g_jit_force_extra |= jit_lever_bit("rshare");
+    setenv("MYLANG_JIT_MAXPINS", "1", 1);
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+        g_exec_engine = se;
+    } catch (...) {
+        printf("  share-clamp: the shape failed to run\n");
+        ok = false;
+    }
+    unsetenv("MYLANG_JIT_MAXPINS");
+    g_jit_force_extra &= ~jit_lever_bit("rshare");
+    if (ok && g_jit_share_clamped <= c0) {
+        printf("  share-clamp: the clamp never fired (counter flat "
+               "at %lu) - the L+1 shape is not reaching it\n", c0);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * F3 (the float/xmm twin): THE SNAP IN FLOAT MODE. The lin-point /
  * demotion / translation machinery is register-file-agnostic; what
  * flips is the WHOLE-RUN RESCUE's eligibility (the pick's fhot rule:
@@ -35621,6 +35695,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: F3 - the snap in FLOAT mode (replay, single-residency, "
       "the float whole-run rescue)",
       jit_lsra_snap_float_check },
+    { "jit: a ShareSeam at a region's L+1 is refused (the cold-path "
+      "bypass clamp)",
+      jit_share_region_clamp },
     { "jit: the low-address arena placed every Type singleton below "
       "2^31, so a type tag can encode as imm32 (#96)",
       jit_lowmem_singletons },

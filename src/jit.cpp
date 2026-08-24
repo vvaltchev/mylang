@@ -78,6 +78,8 @@ unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
 unsigned long g_jit_lsra_pins = 0;     /* D3.b: lsra-chosen pin sets */
 unsigned long g_jit_lsra_fpins = 0;    /* F4a: lsra-chosen FLOAT pins */
 unsigned long g_jit_lsra_ftrans = 0;   /* F4b: FLOAT transitions run */
+unsigned long g_jit_share_clamped = 0; /* seams refused inside a hoist
+                                        * region (compile-time count) */
 unsigned long g_jit_lsra_trans = 0;    /* D3.b: executed transitions */
 unsigned long g_jit_range_share = 0;   /* #96 inc-2: executed range seams */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
@@ -9787,12 +9789,25 @@ struct ShareSeam {
 };
 static const size_t MAX_SHARE_SEAMS = 8;
 
+/* `noseam`: pc ranges [T, L+1] of the run's C2b hoist REGIONS. A
+ * seam inside one is UNSOUND-BY-BYPASS: the region's cold copy is
+ * entered by the failed C1 guard (an EMISSION-time edge jit_run_edges
+ * cannot see - it is not a bytecode branch), replays [T, L] out of
+ * line and rejoins at label[L+1], which is PAST the seam at L+1 - so
+ * every seam in (T, L+1] simply never runs on the cold path, and the
+ * rejoin arrives with pre-seam registers where the main stream is
+ * post-seam. T itself is excluded too (cheap, and it spares reasoning
+ * about the guard's exact position inside pc T's emission). LATENT
+ * today - a corpus scan found ZERO programs with both seams and
+ * regions - closed before it can ship. */
 static void jit_share_plan(const Chunk &ck, size_t begin, size_t end,
                            std::vector<int> &hot,
                            const std::vector<uint8_t> &hot_reg,
                            std::vector<int> &spill_hot,
                            size_t home_cap,
-                           std::vector<ShareSeam> &seams)
+                           std::vector<ShareSeam> &seams,
+                           const std::vector<std::pair<size_t, size_t>>
+                               &noseam)
 {
     if (jit_lever_off(JL_RSHARE) || hot.empty() || spill_hot.empty())
         return;
@@ -9827,6 +9842,15 @@ static void jit_share_plan(const Chunk &ck, size_t begin, size_t end,
     std::vector<std::pair<int, int>> edges;
     jit_run_edges(ck, begin, end, edges);
     const auto seam_ok = [&](int sp) {
+        for (const auto &r : noseam)
+            if (static_cast<size_t>(sp) >= r.first
+                    && static_cast<size_t>(sp) <= r.second) {
+#ifdef TESTS
+                g_jit_share_clamped++;   /* the counter block is
+                                          * TESTS-gated (line ~52) */
+#endif
+                return false;
+            }
         return jit_lin_point(edges, sp);
     };
     /*
@@ -21638,9 +21662,25 @@ retry_emission:
          * ShareSeam chained onto the same registers would collide
          * with them, so the share plan runs only for the pick's
          * placements */
-        if (!lsra_tmode)
+        if (!lsra_tmode) {
+            std::vector<std::pair<size_t, size_t>> noseam;
+            for (const HoistRegion &hr : hregs)
+                noseam.push_back({ hr.T, hr.L + 1 });
             jit_share_plan(chunk, begin, end, hot, hot_reg, spill_hot,
-                           home_cap, seams);
+                           home_cap, seams, noseam);
+        }
+        if (getenv("MYLANG_SHAREDBG") && !seams.empty()) {
+            fprintf(stderr, "SHAREDBG run[%zu,%zu) seams %zu hregs "
+                    "%zu%s\n", begin, end, seams.size(), hregs.size(),
+                    hregs.empty() ? "" : "  <-- COEXIST");
+            for (const ShareSeam &sm : seams)
+                fprintf(stderr, "SHAREDBG   seam pc %zu reg %u -> "
+                        "slot %d\n", static_cast<size_t>(sm.pc),
+                        static_cast<unsigned>(sm.reg), sm.to_slot);
+            for (const HoistRegion &hr : hregs)
+                fprintf(stderr, "SHAREDBG   region [%zu,%zu]\n",
+                        hr.T, hr.L);
+        }
         /* the homes take what the plan left, up to capacity; a residue
          * past it stays a frame slot (the pre-#96 placement) */
         if (spill_hot.size() > home_cap)

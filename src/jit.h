@@ -1186,6 +1186,9 @@ extern "C" unsigned long g_jit_lsra_fpins;
 /* F4b: float transitions EXECUTED (bumped from the emitted seam code;
  * g_jit_lsra_trans counts the GP pool only) */
 extern "C" unsigned long g_jit_lsra_ftrans;
+/* seams the share plan refused inside a C2b hoist region (the
+ * cold-path-bypass hazard; compile-time, not from emitted code) */
+extern "C" unsigned long g_jit_share_clamped;
 /* D3.b 2b-iii-b: lsra TRANSITIONS executed (bumped by the emitted
  * transition code itself - flush and install arms alike). */
 extern "C" unsigned long g_jit_lsra_trans;
