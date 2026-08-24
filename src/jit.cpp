@@ -66,6 +66,9 @@ unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_strlen_fast = 0;   /* G5: inline len(str) runs */
+/* #95: the INLINE ord(s[i]) - bumped by the EMITTED arm only, so the
+ * helper's own ML_JIT_OP_RAN cannot satisfy it. */
+unsigned long g_jit_ord_inline = 0;
 unsigned long g_jit_sfield_checked = 0;/* G4: checked a[i].f runs */
 unsigned long g_jit_store2_fast = 0;   /* #95: inline nested-STORE runs */
 unsigned long g_jit_elem_slice_fast = 0; /* #95: inline slice-READ runs */
@@ -5608,6 +5611,7 @@ void jit_stats_report()
         { "ref_arg_binds",    &g_jit_ref_arg_binds },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
         { "str_probe_ok",     &g_jit_str_probe_ok },
+        { "ord_inline",       &g_jit_ord_inline },
         /* #94: the BORROW - a reference argument bound with no retain
          * (arg_borrow) vs one the analysis cleared whose value turned
          * out to be a slice (arg_borrow_slice, the one dynamic
@@ -11053,6 +11057,57 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             return static_cast<int32_t>(static_cast<long>(slot)
                                         * static_cast<long>(sizeof(LValue)));
         };
+        /*
+         * #95 THE INLINE ARM. The helper below is ~48 Ir of which the
+         * string access is a handful; on 30_str_index_iterate it is ONE
+         * CALL PER CHARACTER where C++ does a load (6.3 ns vs 0.23). The
+         * base is compile-proven a non-opt string (Subscript::base_str -
+         * the same contract the helper's raw get_ref relies on), so no
+         * type guard is needed; two runtime questions remain.
+         *
+         * DECLINES, both to the helper, which owns the awkward semantics:
+         *  - a SLICE. `SharedStr::offset()` is `slice ? off : 0`, so a
+         *    non-slice must IGNORE `off`; declining keeps that load and
+         *    branch out of the hot arm entirely.
+         *  - a NEGATIVE or OUT-OF-RANGE index, in ONE unsigned compare -
+         *    a negative index read as unsigned is huge, so `jae` catches
+         *    both, and the helper does the negative wrap and the throw.
+         *
+         * LOW REGISTERS ONLY: rsi carries the fragment's t_int singleton
+         * and r8 the t_float, and clobbering either makes every later
+         * slot write stamp a garbage type. The fast arm makes no call, so
+         * nothing restores them - rax/rcx/rdx it is. (`movabs` is also
+         * low-eight-only, which rules out the r9-based element helpers.)
+         *
+         * GATED ON `str_inline_ok`: the layout self-check (see
+         * jit_verify_str_probe). Where the char-data offset could not be
+         * VERIFIED against live strings, this arm is not emitted at all.
+         */
+        const JitLayout &SL = jit_layout();
+        std::vector<size_t> j_cold;
+        size_t j_fast_done = 0;
+        const bool inl = SL.str_inline_ok;
+        if (inl) {
+            const SlotAddr b = slot_addr(in.target2);
+            e.cmp_byte_slot(b.payload + SL.str_slice_off, 0);
+            j_cold.push_back(e.j32(0x75));       /* jne -> a slice */
+            e.mov_eax_slot(b.payload + SL.str_len_off);   /* rax = len */
+            load_operand(e, RDX, in.a_is_lit(), in.a_lit(), in.a_slot());
+            e.u8(0x48); e.u8(0x39); e.u8(0xC2);  /* cmp rdx, rax */
+            j_cold.push_back(e.j32(0x73));       /* jae -> neg or >= len */
+            e.load(RAX, b.payload + SL.str_obj_off);      /* the StrObj * */
+            e.mov_rcx_rax(SL.strobj_data_off);   /* rcx = the char data */
+            e.u8(0x0F); e.u8(0xB6); e.u8(0x04);  /* movzx eax,           */
+            e.u8(0x11);                          /*   byte [rcx + rdx]   */
+#ifdef TESTS
+            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_ord_inline));
+            e.u8(0x48); e.u8(0xFF); e.u8(0x02);  /* inc qword [rdx] */
+#endif
+            store_dst(e, ck, RAX, in.target, pc);
+            j_fast_done = e.j32(0xEB);
+            for (const size_t j : j_cold)
+                e.patch32_here(j);
+        }
         emit_call_prologue(e);
         load_operand(e, RSI, in.a_is_lit(), in.a_lit(), in.a_slot());
         e.lea(RDX, off(in.target));         /* rdx = &slot[dst] */
@@ -11066,6 +11121,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_exc_stamp(e, ck, old_pc);      /* cold: the subscript's caret */
         e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
         e.patch8(j_ok, e.pos());
+        if (inl)
+            e.patch32_here(j_fast_done);
         return true;
     }
 
