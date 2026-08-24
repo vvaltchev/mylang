@@ -8637,3 +8637,16 @@ transitions; 46/79 decline. From here lever-on float emission
 legitimately differs from the pick's, so the oracle is corpus_diff
 plus F5's per-iteration Ir - byte identity retired its role at
 F4a.
+
+F5 CLOSING (same day): the float spot set (04/46/54/55/79/88 +
+05/40) is +0.00%/iter everywhere with the twin fully active, and
+the FULL 88-bench -npc sweep at HEAD reproduces the pre-twin
+ledger exactly - the same five wins (06 -16.80%, 81 -2.72%, 82
+-1.56%, 83 -0.98%, 68 -0.46%), 69's byte-identical heap-priming
+artifact, everything else +-0.00% per iteration. The float twin
+(F1..F4b) is COMPLETE and corpus-flat. The honest gap: no wins
+from float transitions yet, because the corpus has no float
+register-pressure shape (the regs family is int-only) - today's
+float transitions run entry-adjacent, invisible per iteration; a
+phased 5+-hot-float-local bench is the shape that would show the
+payoff.

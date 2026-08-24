@@ -872,9 +872,19 @@ THE F-LADDER (mirror of the int increments, same lever):
      emission now legitimately DIFFERS from the pick on float
      shapes - the oracle from here is corpus_diff (green, both
      arenas) + F5's per-iteration Ir, not byte identity.
- F5. measure: the float benches (04, 46, 54, 55, 79_dyn_float,
-     88) per-iteration, then the FULL 88-bench sweep (-npc, the
-     parallel harness) - the flatness mandate applies unchanged.]
+ F5. CLOSED 2026-08-24: the 8-bench float spot set is +0.00%/
+     iter everywhere with the twin fully active (04 executing 2
+     float transitions per run, 55 four), and the FULL 88-bench
+     sweep at HEAD reproduces the pre-twin ledger EXACTLY - the
+     same 5 wins (06 -16.80, 81 -2.72, 82 -1.56, 83 -0.98, 68
+     -0.46), 69's heap artifact, everything else +-0.00%/iter.
+     THE FLOAT TWIN IS COMPLETE AND FLAT. Honest gap recorded:
+     no WINS from float transitions yet - the corpus has no float
+     register-pressure shape (the regs family is int-only); the
+     transitions run entry-adjacent on today's benches, invisible
+     per iteration. A float regs-family bench (5+ hot float
+     locals, phased) is the shape that would show the payoff, a
+     candidate when the arc returns to measurement.]
 
 ⛔ MAINTAINER DIRECTION (2026-08-23): #96 was PAUSED for the #99
 DETOUR; #99 closed same day. Task #102 created for the
