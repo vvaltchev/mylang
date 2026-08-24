@@ -1296,11 +1296,46 @@ struct Emitter {
             { u8(0x48); u8(0x81); u8(0xEC); u32(static_cast<uint32_t>(sb)); }
         mov_rr(REG_SLOTS_BASE, REG_ARG0);
     }
+    /* #96: WHY THIS RETURN NEEDS NO FURTHER WRITE-BACK. Every frag_ret
+     * site must name one, because a ret that leaves a cached slot in a
+     * register resumes the interpreter on a STALE slot - a silent wrong
+     * answer, not a crash. There is exactly ONE `ret` in this emitter
+     * (below) but THIRTEEN sites reach it, and only six of them flushed;
+     * the other seven were relying, unstated, on `pick_cached_slots`
+     * returning {} for any run containing a call (CallV/CachedCallV/
+     * CallValueV are unlisted, so they hit its `default: return {}`).
+     *
+     * That dependency is exactly what this task is about to invalidate -
+     * the mandate is to spill live registers around a call and keep them
+     * across it - so the claim moves out of the reader's head and into a
+     * checked enumerator. A cross-frame-throw SEGV already found one
+     * missing flush here once (see the exception sites).
+     *
+     * frag_ret ASSERTS rather than emits, deliberately: emitting the
+     * flush here would reorder it against the `mov rax, <sentinel>` the
+     * sites place first, and byte-identical output over the whole corpus
+     * is the cheapest proof that adding this contract changed nothing. */
+    enum class RetFlush {
+        flushed,   /* flush_cache() was emitted on THIS path, just above */
+        empty,     /* nothing is cached at this point - ASSERTED below */
+        epilogue,  /* emit_epilogues ONLY. The flushing epilogue emits its
+                    * own flush_cache() above the relay store; the bare one
+                    * is reached only from exits exit_pc PROVED had an empty
+                    * cache. Either way the emitter's cache state here is
+                    * end-of-fragment state and says nothing about the exits
+                    * that jump to this epilogue, so neither claim above is
+                    * checkable at this point. */
+    };
     /* THE FRAGMENT RETURN: give the caller its registers back, then ret.
      * rax (the resume pc / sentinel) is already set by the caller of this,
      * and neither pop nor the pad adjustment touches it. */
-    void frag_ret()
+    void frag_ret(RetFlush why)
     {
+        if (why == RetFlush::empty)
+            ML_CHECK_MSG(cache.empty() && fcache.empty() && tflush.empty(),
+                         "frag_ret(empty) with a live register cache: this "
+                         "return would resume the interpreter on stale "
+                         "slots - flush_cache() first and say flushed");
         if (const int sb = spill_bytes())            /* add rsp, imm32 */
             { u8(0x48); u8(0x81); u8(0xC4); u32(static_cast<uint32_t>(sb)); }
         if (entry_pad())
@@ -1368,7 +1403,7 @@ struct Emitter {
             const size_t at = pos();
             flush_cache();
             relay_store();
-            frag_ret();
+            frag_ret(RetFlush::epilogue);
             for (const size_t s : epi_flush)
                 patch32(s, static_cast<uint32_t>(at - (s + 4)));
             epi_flush.clear();
@@ -1376,7 +1411,7 @@ struct Emitter {
         if (!epi_bare.empty()) {
             const size_t at = pos();
             relay_store();
-            frag_ret();
+            frag_ret(RetFlush::epilogue);
             for (const size_t s : epi_bare)
                 patch32(s, static_cast<uint32_t>(at - (s + 4)));
             epi_bare.clear();
@@ -4421,7 +4456,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.u8(0xFF); e.u8(0x09);                    /* dec dword [rcx] */
         emit_call_epilogue(e);
         e.movabs(RAX, static_cast<uint64_t>(-3));
-        e.frag_ret();                                /* ret (propagate) */
+        /* ret (propagate) */
+        e.frag_ret(Emitter::RetFlush::empty);
         e.patch32_here(j_nsw);
     }
     /* #56 (native Throw): the callee raised past THIS sync frame - the
@@ -4531,7 +4567,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         const size_t j_sw = e.j32(0x75);           /* jne exc_path */
         emit_call_epilogue(e);
         e.movabs(RAX, static_cast<uint64_t>(-3));  /* JIT_RET_SWITCH */
-        e.frag_ret();                                /* ret */
+        /* ret */
+        e.frag_ret(Emitter::RetFlush::empty);
         e.patch32_here(j_sw);
     }
     emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56 step 1) */
@@ -4844,7 +4881,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         /* rax = JIT_RET_SENTINEL ((size_t)-1); return to the caller */
         e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
         e.u32(0xFFFFFFFFu);                        /* mov rax, -1 */
-        e.frag_ret();
+        e.frag_ret(Emitter::RetFlush::flushed);
 
         /* ---- the BOUNDARY arm (C4c): a VmInvoker/do_func_call callee.
          * jit_ret's boundary path is two stores (flow->value = res,
@@ -4897,7 +4934,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
 #endif
         e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
         e.u32(0xFFFFFFFEu);                        /* mov rax, -2 */
-        e.frag_ret();
+        e.frag_ret(Emitter::RetFlush::flushed);
 
         /* ---- 4-iii: THE RECORD-LESS ARM (the norec tier, DEFAULT ON).
          * Every datum the record-ful pop reads from the record comes
@@ -5029,7 +5066,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
 #endif
             e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
             e.u32(0xFFFFFFFFu);                    /* mov rax, -1 */
-            e.frag_ret();
+            e.frag_ret(Emitter::RetFlush::flushed);
             /* the record-less DECLINE tier: jit_ret_norec(res_slot,
              * [rbp+24], the baked desc, rbp) - the C++ steal/put for a
              * reference result / a non-trivial old dst; returns the
@@ -5047,7 +5084,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                     { e.pos(),
                       reinterpret_cast<const void *>(jit_ret_norec) });
                 e.u8(0xE8); e.u32(0);
-                e.frag_ret();                      /* rax = the sentinel */
+                /* rax = the sentinel */
+                e.frag_ret(Emitter::RetFlush::flushed);
             }
         }
     }
@@ -5065,7 +5103,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             { e.pos(), reinterpret_cast<const void *>(jit_halt) });
     }
     e.u8(0xE8); e.u32(0);                          /* call jit_ret/jit_halt */
-    e.frag_ret();                                  /* ret (rax = sentinel) */
+    /* ret (rax = sentinel) */
+    e.frag_ret(Emitter::RetFlush::flushed);
 }
 
 /* Emit a call to the INT put helper: rdi = &frame->slots[slot], rsi = the
@@ -10537,13 +10576,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
             e.flush_cache();                      /* every raw ret must */
             e.movabs(RAX, static_cast<uint64_t>(-2));   /* JIT_RET_BOUNDARY */
-            e.frag_ret();
+            e.frag_ret(Emitter::RetFlush::flushed);
             e.patch8(j_disp, e.pos());
         }
         e.flush_cache();
         e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
         e.u8(0x48); e.u8(0x8B); e.u8(0x00);       /* mov rax, [rax] */
-        e.frag_ret();                               /* ret (the handler pc) */
+        /* ret (the handler pc) */
+        e.frag_ret(Emitter::RetFlush::flushed);
 
         e.patch32_here(j_none);
         e.patch32_here(j_norm);
@@ -10591,13 +10631,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * (a cross-frame-throw SEGV caught it). */
             e.flush_cache();
             e.movabs(RAX, static_cast<uint64_t>(-2));   /* JIT_RET_BOUNDARY */
-            e.frag_ret();                           /* ret */
+            /* ret */
+            e.frag_ret(Emitter::RetFlush::flushed);
             e.patch8(j_disp, e.pos());
         }
         e.flush_cache();
         e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
         e.u8(0x48); e.u8(0x8B); e.u8(0x00);       /* mov rax, [rax] */
-        e.frag_ret();                               /* ret (the handler pc) */
+        /* ret (the handler pc) */
+        e.frag_ret(Emitter::RetFlush::flushed);
         return true;
 
     case OpCode::Rethrow:
@@ -10637,13 +10679,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
             e.flush_cache();                      /* every raw ret must */
             e.movabs(RAX, static_cast<uint64_t>(-2));   /* JIT_RET_BOUNDARY */
-            e.frag_ret();
+            e.frag_ret(Emitter::RetFlush::flushed);
             e.patch8(j_disp, e.pos());
         }
         e.flush_cache();
         e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
         e.u8(0x48); e.u8(0x8B); e.u8(0x00);       /* mov rax, [rax] */
-        e.frag_ret();                               /* ret (the handler pc) */
+        /* ret (the handler pc) */
+        e.frag_ret(Emitter::RetFlush::flushed);
         return true;
 
     case OpCode::DeclConstV:
@@ -13013,7 +13056,8 @@ static void emit_island_call(Emitter &e, const FuncDescriptor *desc,
     e.u8(0x48); e.u8(0x85); e.u8(0xC0);                      /* test rax, rax */
     e.u8(0x79); const size_t jfix = e.pos(); e.u8(0);        /* jns +over (rel8)*/
     e.u8(0xB8); e.u32(island_pc);                    /* mov eax, island_pc */
-    e.frag_ret();                       /* ret -> EnterNative re-raises */
+    /* ret -> EnterNative re-raises */
+    e.frag_ret(Emitter::RetFlush::empty);
     e.b[jfix] = static_cast<uint8_t>(e.pos() - (jfix + 1)); /* patch the jns */
 }
 
