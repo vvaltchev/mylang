@@ -503,6 +503,59 @@ which the guard-elision entry says retires nearly free - so the honest
 expectation is well under the 2.07x the isolated model shows, and this
 should be measured on the wall clock before anyone commits to it.
 
+### ⛔ THE REGISTER BUDGET, CORRECTLY STATED (maintainer, 2026-08-16)
+
+I first told the maintainer "MAX_CACHED = 4 is the hard limit". **That is
+wrong as stated**, and the correction matters because it changes what is
+buildable.
+
+The 16 GP registers today:
+
+| register | role |
+|---|---|
+| RSP, RBP | stack / frame pointer. RBP is LOAD-BEARING: the
+  no-record tier walks the live rbp chain to rebuild frames |
+| RBX | the frame slots base - `MODRM_SLOT = 0x83` bakes
+  rm=011 into every slot access |
+| RSI, R8 | the t_int / t_float singletons, pinned and
+  re-materialised after every helper call |
+| RAX RCX RDX RDI R9 R10 R11 | **used constantly, as per-op SCRATCH** |
+| R12-R15 | `CACHE_REGS` |
+
+**Four is the ceiling for PINNING, not for ALLOCATION.** A pin holds a
+register for the whole fragment, so it must survive a helper call, so it
+must be callee-saved - and SysV's callee-saved set is exactly
+{RBX, RBP, R12-R15}, of which two are taken. That is where 4 comes from.
+
+A REAL allocator does not pin. It holds a value in a caller-saved
+register and spills **only around calls that actually occur** - which is
+what native code does, and what the maintainer correctly objected was
+missing. **The loops that matter here make NO calls in the body**
+(`bench/my/8*_regs_*`, 03_int_arith), so a caller-saved-capable
+allocator would have **~11 GP registers free there with zero spilling**,
+against the four it uses today.
+
+### And why that could pay even though C++'s own spilling is free
+
+The pressure family measured C++ spilling **35% of its loop instructions
+at N=40 with no change in per-update cost** - so registers per se are
+not worth much at that pressure. The reconciliation is the SHAPE of the
+memory operation, not its presence:
+
+  - a C++ spill is **ONE** 8-byte access of a raw `long`;
+  - a MyLang slot round-trip is **THREE** - a payload store, a TYPE-TAG
+    store, and a payload reload - 48 bytes apart.
+
+So MyLang has strictly more to gain from a register than C++ does, and
+C++'s indifference to spilling does NOT transfer. It also says the two
+levers are alternatives aimed at the same cost: hold the value in a
+register (an allocator), or make the slot cheaper (C3's tag elision,
+and #96's redundant float dispatch). Either removes the same traffic.
+
+**The experiment is already built.** `bench/my/8{0..5}_regs_*` with the
+N=8 row as the cleanest number - C++ uses no stack at all there, and
+MyLang still puts half its accumulators in memory.
+
 ### What to build first, and the gate before building it
 
 1. **MEASURE THE CEILING.** For 03_int_arith and 08_func_call, count from
