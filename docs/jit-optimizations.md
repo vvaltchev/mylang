@@ -8400,3 +8400,46 @@ attributed separately this session.
 = 96.03M at HEAD. Open decisions for the maintainer: the 67
 invoke-internal +12 Ir/call residual (fix vs accepted trade), and
 whether #93's compile price stands as-is until #102.
+
+## Endgame 2b-iii-d inc 3 (2026-08-23) - 81 diagnosed to ONE
+## instruction; the split-worthiness floor VINDICATED and landed
+
+THE DIAGNOSIS (the 43 toolkit, evidence before theory): 81's +1.24%
+is per-iteration (+2M per scale unit), and the loop bodies differ by
+EXACTLY ONE instruction - 74 vs 75 (1/74 = +1.35% = the measured
++1.36%). The instruction: a10 served from a spill home ([rbp-0x38],
+one tagless access) under the pick vs from the FRAME with a type
+stamp under the lever. The chain: a conflict RETRY denies one pool
+register; at K-1 the scan's i evicts a10 at its own install (pc 14),
+keeping a 1-use prefix [10,14); the remainder covers the loop; the
+home filter excludes a10 ("has a resident piece") -> frame + stamp.
+
+THE VINDICATION, owned in full: this is EXACTLY the shape the
+split-worthiness floor addressed - and the floor was REVERTED
+earlier today on a "measured flat" reading that re-measurement now
+proves FALSE (with the floor, 81's per-unit Ir is 147,000,011 -
+IDENTICAL to lever-off; the earlier flat number was a measurement
+error, most likely a stale binary). The floor is re-landed: an
+eviction keeps its prefix only when it carries >= 2 int touches,
+else the loser demotes WHOLE (no install, no flush, home-eligible).
+
+MEASURED (floor in, lever-on vs off): 81 +1.24% -> +0.27%,
+83 +0.72% -> +0.37%; the six-bench spot set reads +0.20%..+0.45% -
+the residual band is the lever's COMPILE-side analysis cost, no
+longer loop-side codegen.
+
+NETS: property H pins the floor (an eviction's kept prefix carries
+>= 2 int touches; a mem-CUT successor is exempt - its flush is
+data-carrying) - WATCHED: removing the floor fails H by name on the
+K=1 case ("eviction kept a 1-use prefix of slot 1 [5,7)"). The K=1
+z-property is restated a THIRD time (max residency over all slots
+must exceed idle-z's) - the picked-based and weight-based forms both
+conflated something. ⛔ HONESTY NOTE: the evict-FURTHEST policy
+itself currently has NO working watched-failing case - all three
+formulations failed to pin it (temps dominate the K=1 dynamics);
+a dedicated temp-aware shape is a recorded follow-up, and the policy
+is otherwise exercised (not verified) by every lever run.
+
+Verified: -rt + corpus, both configs, both arenas; vdjcmp 116/116
+default; TESTS=1 OPT=1 both configs; clang OPT=1 ASSERTS=0 LTO=0
+zero warnings; census gate.

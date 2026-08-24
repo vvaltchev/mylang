@@ -682,8 +682,22 @@ cpp-bench re-timing. Bench-infra notes from this audit:
 78_typed_param_call failed to time in the recompute - both need
 a look (infrastructure first).
 
-⛔ MAINTAINER DIRECTION (2026-08-23): #96 is PAUSED for the #99
-DETOUR; it resumes when #99 closes. Task #102 created for the
+[#99 CLOSED 2026-08-23 (both regressions attributed; the 67 argv
+copy fixed, -3.04%); #96 RESUMED. 2b-iii-d inc 3: 81 diagnosed to
+ONE instruction/iteration (a retry-denied register -> a 1-use-
+prefix eviction -> home eligibility lost -> frame + type stamp);
+the split-worthiness floor VINDICATED (the earlier "measured
+flat" was a false reading - re-measured: 81 per-unit Ir becomes
+IDENTICAL to lever-off) and re-landed with property H watching it
+by name. Ledger: +0.20..0.45% across the spot set - compile-side
+analysis cost only. OPEN: the evict-furthest policy has no
+working watched case (three formulations failed; temps dominate
+K=1 dynamics) - a temp-aware pin is a follow-up. NEXT (2b-iii-d
+remainder): second chance, C2b regions into trans mode, float
+twin, the D0 full-suite RULE-B1 ledger + wall A/B, the flip gate.]
+
+⛔ MAINTAINER DIRECTION (2026-08-23): #96 was PAUSED for the #99
+DETOUR; #99 closed same day. Task #102 created for the
 RTTI compile bill (his call: "optimize the compilation step
 itself"). #99 progress lives in the TASK's own description
 (67_make_dict: attribution confirmed at 202f816, tier intact,
