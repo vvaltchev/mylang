@@ -631,15 +631,32 @@ REASSIGNMENT (reg-neighbour-blocked pieces move to a free
 register over the span) - machine-checked, green, REACH
 UNVERIFIED (noted, not claimed).
 
-⛔ NEXT: 2b-iii-d remainder, in flip-gating order: the residual
-~1% class (81 - install-run fusion / textra per-piece / eviction
-ties; diagnose 81 FIRST, the inc-2 lesson: theory after
-evidence); second-chance re-queue; C2b regions into trans mode;
-the float twin; arm 3 if exits stop flushing wholesale; the D0
-full-suite ledger (RULE B1) + wall-clock A/B; the default flip
-only when D4 is green AND the ledger pays. Also: verify
-g_jit_lsra_pins reach on a whole-run-fallback program (JITSTATS
-showed no row on 43 while the emission had lsra pins).]
+NEGATIVE RESULT, RECORDED (2026-08-23): a SPLIT-WORTHINESS FLOOR
+(evict-whole when the kept prefix has < 2 int touches, restoring
+home eligibility) was built on the theory that 81's +1.24% was a
+shredded evictee - MEASURED FLAT on its target (81 unchanged to
+the second decimal) and UNPINNABLE by the current cases (the
+evict-nearest sabotage went green after the K=1 property was
+restated on qual weight - the idle slot's own 3 events make it
+"hot" to that formulation - and no case distinguishes the floor
+at all). REVERTED to the committed, watched state per the
+unmeasurable-unpinned rule. What a re-attempt needs: the ACTUAL
+81 diagnosis first (per-iteration scale delta + the loop-body
+-vdj diff, the tools that settled 43 - NOT plan-dump theorizing:
+two theories in a row were wrong), and a case that observes the
+evictee's placement directly.
+
+⛔ NEXT: 2b-iii-d remainder, in flip-gating order:
+ - DIAGNOSE 81's +1.24% with the 43 toolkit (scale3-scale1 per-
+   iteration Ir, then the loop-body emission diff); only then a
+   fix;
+ - JITSTATS note: lsra rows print only in TESTS builds - the
+   earlier "no row on 43" was a perf-lane binary, not a reach
+   gap;
+ - second-chance re-queue; C2b regions into trans mode; the
+   float twin; arm 3 if exits stop flushing wholesale;
+ - the D0 full-suite ledger (RULE B1) + wall-clock A/B; the
+   default flip only when D4 is green AND the ledger pays.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
