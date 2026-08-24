@@ -1188,6 +1188,29 @@ struct Emitter {
     /* The CALLEE-SAVED registers this fragment took over, beyond the base:
      * the N5 cache registers. Set once at the entry, replayed in reverse
      * at every exit. Empty for a fragment that caches nothing. */
+    /*
+     * #96: does THIS fragment still need the t_float singleton in r8?
+     * frag_entry materialises it only when `run_has_float`, and
+     * emit_call_epilogue used to re-materialise it UNCONDITIONALLY at
+     * every helper call - 106 `movabs r8` on 09_fib_recursive, which
+     * has no float arithmetic at all, for a constant nothing reads.
+     * Same flag, both places, so the entry and the re-materialisation
+     * can no longer disagree.
+     */
+    bool float_tag_live = false;
+
+    /* Is `r` currently holding a PINNED SLOT rather than being free
+     * scratch or a singleton? A re-materialisation must never write
+     * over a pin - that is a silent wrong answer, and it became
+     * reachable the moment r8 joined the pool. */
+    bool reg_holds_pin(uint8_t r) const
+    {
+        for (const CacheEnt &c : cache)
+            if (c.reg == r)
+                return true;
+        return false;
+    }
+
     std::vector<uint8_t> saved;
 
     /* Total pushes at entry, including rbp, the base and any 8-byte pad.
@@ -3007,6 +3030,76 @@ static const JitHoist *hoist_match(int base, int kind)
     return nullptr;
 }
 
+/*
+ * #96: materialise the type singletons at a fragment ENTRY - the run
+ * head, an interior resume stub, or a container. THREE call sites used
+ * to write the `run_has_float` gate by hand and a FOURTH (the helper-
+ * call epilogue) omitted it entirely; that is the "an && over a family
+ * is an audit table" shape again, so the gate lives here now and the
+ * callers only set `float_tag_live`.
+ *
+ * Callers must invoke this BEFORE loading the pins: r8 is both the
+ * t_float singleton AND a pin register, and the pin must win.
+ */
+/*
+ * ⛔ #96: DOES THIS RUN NEED THE t_float SINGLETON IN r8?
+ *
+ * `run_has_float` looks like the answer and is NOT: it is an OPTIMISTIC
+ * whitelist - it returns true for listed float ops and false for
+ * everything else - so an op it does not know reads as "no float tag
+ * needed". Used as a NEED test that is unsound in the direction that
+ * matters, and it was already wrong: UnpackElemValue passes r8 as a
+ * helper ARGUMENT and then needs the singleton back, but is not in the
+ * list. frag_entry therefore never materialised r8 for such a
+ * fragment, and the only reason anything worked is that
+ * emit_call_epilogue restored it UNCONDITIONALLY after every helper
+ * call. Gate the epilogue on the optimistic predicate and the mask
+ * comes off - which is exactly how the `Foreach unpack of a mixed
+ * int/float sub-array` test failed the moment I tried it.
+ *
+ * So this asks the question the other way round, with the answer that
+ * fails SAFE: a run needs the tag UNLESS every op in it is one we have
+ * positively established never touches r8. An unlisted or brand-new
+ * opcode keeps the tag alive - it costs a `movabs`, never an answer.
+ *
+ * The list is deliberately the pure int-loop family and nothing else.
+ * Widening it is a measurable optimization; getting it wrong is a
+ * silent miscompile, so each addition needs the same argument these
+ * have: the op's emission touches neither r8 nor any helper that
+ * expects the singleton in it.
+ */
+static bool run_needs_float_tag(const Chunk &ck, size_t begin, size_t end)
+{
+    for (size_t pc = begin; pc < end; pc++) {
+        switch (ck.code[pc].op) {
+        /* B1/B2 specialized int arithmetic: RAX + RCX only (the case
+         * body), plus rsi via store_dst. Never r8. */
+        case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+        case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+        case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+        case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+        case OpCode::IntShlRR: case OpCode::IntShrRR:
+        case OpCode::IntShlRI: case OpCode::IntShrRI:
+        case OpCode::IntModRI: case OpCode::IntAddModRI:
+        /* int loop control + compare: no float anywhere */
+        case OpCode::IntAddStep: case OpCode::ForLoopStep:
+        case OpCode::JumpUnlessIntCmp: case OpCode::CmpIntV:
+        case OpCode::LoadImmInt: case OpCode::Jump:
+            break;                       /* provably float-tag-free */
+        default:
+            return true;                 /* unknown -> assume it needs it */
+        }
+    }
+    return false;
+}
+
+static void emit_type_tags(Emitter &e)
+{
+    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
+    if (e.float_tag_live)
+        e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+}
+
 static void emit_call_epilogue(Emitter &e)
 {
     /* C2a: reload the caller-saved float pins the callee clobbered
@@ -3019,11 +3112,30 @@ static void emit_call_epilogue(Emitter &e)
     for (const Emitter::CacheEnt &c : e.cache)
         if (!jit_reg_is_callee_saved(c.reg))
             e.load(c.reg, c.payload);
-    /* The two type singletons - compile-time constants held in
+    /*
+     * The two type singletons - compile-time constants held in
      * CALLER-saved rsi/r8, so re-materialising is cheaper than a
-     * register pair the allocator could otherwise use. */
-    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
-    e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+     * register pair the allocator could otherwise use.
+     *
+     * ⛔ TWO CONDITIONS, both added by #96, both load-bearing:
+     *
+     * (1) NEVER over a PIN. r8 joined the pin pool, so in a float-free
+     *     fragment it may hold a hot LOCAL - and this line would
+     *     overwrite it with a Type pointer. A silent wrong answer, and
+     *     structurally prevented here rather than argued about at the
+     *     call sites (there are 84 of them).
+     *
+     * (2) ONLY IF THE FRAGMENT USES IT. frag_entry materialises r8 only
+     *     under `run_has_float`; this did it unconditionally, so a
+     *     float-free fragment paid one `movabs r8` per helper call for
+     *     a constant nothing reads - 106 of them on 09_fib_recursive,
+     *     102 on 46_matrix_mult. The entry and the re-materialisation
+     *     now read the SAME flag and cannot drift.
+     */
+    if (!e.reg_holds_pin(RSI))
+        e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
+    if (e.float_tag_live && !e.reg_holds_pin(8))
+        e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
     /* C4b: the pinned float LITERALS, same argument - caller-saved and
      * compile-time constant. THIS is where their correctness lives, not
      * in pick_float_lits' opcode whitelist: a call can be
@@ -6242,11 +6354,21 @@ static const size_t MAX_XCACHED = sizeof(XCACHE_REGS) / sizeof(XCACHE_REGS[0]);
  * MyLang call takes no caller-saved pin at all, and emit_ret_native
  * flushes the cache on its first line.
  */
-static bool run_has_float(const Chunk &ck, size_t begin, size_t end);
+static bool run_needs_float_tag(const Chunk &ck, size_t begin, size_t end);
 
 static size_t jit_xcache_count(const Chunk &ck, size_t begin, size_t end)
 {
-    return run_has_float(ck, begin, end) ? MAX_XCACHED - 1 : MAX_XCACHED;
+    /* ⛔ ONE PREDICATE for one question. r8 is EITHER the t_float
+     * singleton OR a pin, never both, so the pin decision and the tag
+     * decision must not be able to disagree - and they did: this asked
+     * the OPTIMISTIC `run_has_float` while emit_type_tags asked the
+     * CONSERVATIVE `run_needs_float_tag`, so a run the first called
+     * float-free and the second did not would have pinned r8 AND
+     * materialised the tag over it. Both ask the conservative one now,
+     * which makes `float_tag_live` and `reg_holds_pin(8)` mutually
+     * exclusive BY CONSTRUCTION. */
+    return run_needs_float_tag(ck, begin, end) ? MAX_XCACHED - 1
+                                               : MAX_XCACHED;
 }
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
 /* #96: the TOTAL int pin budget, exported so a coverage test can size
@@ -12584,45 +12706,21 @@ static bool op_is_branch(OpCode op)
         || op == OpCode::JumpIfNotNoneV;
 }
 
-static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
-{
-    for (size_t pc = begin; pc < end; pc++) {
-        switch (ck.code[pc].op) {
-        case OpCode::FloatBin:
-        case OpCode::FloatAddRR: case OpCode::FloatSubRR:
-        case OpCode::FloatMulRR: case OpCode::FloatAddRI:
-        case OpCode::FloatSubRI: case OpCode::FloatMulRI:
-        case OpCode::LoadImmFloat: case OpCode::JumpUnlessFloatCmp:
-        case OpCode::LoadElemFloat:      /* writes a float -> needs r8 */
-        case OpCode::MathFnV:            /* N6a: writes a float -> needs r8 */
-        case OpCode::StoreElemFloat:     /* reads a float rhs -> needs r8 */
-        case OpCode::LoadElem2Float:     /* #94 inline tier: float dst */
-        case OpCode::StoreElem2V:        /* #95 inline tier: the float-row
-                                          * arm's val-type guard reads r8 */
-        case OpCode::LoadMemberFloat:    /* baked fast path: float store */
-            return true;
-        case OpCode::BinOpV:             /* H6: the boxed FLOAT-FLOAT arm's
-                                          * guard cmps against r8 and its
-                                          * store writes it */
-        case OpCode::CmpV:
-        case OpCode::CompoundV:
-            if (boxed_float_arm(ck, ck.code[pc]))
-                return true;
-            break;
-        case OpCode::StructCtorV:        /* a planned float field reads via
-                                          * emit_float_load -> needs r8 */
-            if (ck.code[pc].b_dual_hi() >= 0)
-                for (const Chunk::CtorPlanField &pf :
-                         ck.ctor_plans[ck.code[pc].b_dual_hi()].f)
-                    if (pf.act == 1)
-                        return true;
-            break;
-        default:
-            break;
-        }
-    }
-    return false;
-}
+/*
+ * `run_has_float` USED TO LIVE HERE and was DELETED (#96, 2026-08-17).
+ *
+ * It was an OPTIMISTIC whitelist - true for listed float ops, false for
+ * everything else - and both of its callers were asking a question that
+ * needs the opposite: "might this run need the t_float singleton in
+ * r8". It answered NO for UnpackElemValue, which passes r8 as a helper
+ * argument and needs the singleton back afterwards. Nothing broke only
+ * because emit_call_epilogue restored r8 unconditionally.
+ *
+ * That made r8 UNSAFE to pin the moment it joined the pool: the pin
+ * gate asked this function, got "float-free", took r8 - and the
+ * epilogue then wrote t_float over the pinned local. Both callers ask
+ * `run_needs_float_tag` now, which fails safe.
+ */
 
 /* Approach A: an op the fragment handles WITHOUT ever returning an interior
  * pc - a non-throwing int op (arith / imm-shift / mod-by-nonzero-imm /
@@ -13465,9 +13563,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     std::vector<size_t> label(n, 0);        /* fragment offset of each body pc */
     std::vector<Fixup> fixups;              /* fragment-local branch fixups */
     e.frag_entry();                         /* push rbx; rbx = rdi (the base) */
-    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
-    if (run_has_float(chunk, 0, n))
-        e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+    e.float_tag_live = run_needs_float_tag(chunk, 0, n);
+    emit_type_tags(e);
     size_t isl_idx = 0;                     /* islands are in ascending order */
     for (size_t pc = 0; pc < n; ) {
         if (g_jit_annotate)
@@ -14176,9 +14273,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                fwd_live_ok, rel_active, rel_at);
 
         e.frag_entry();               /* push rbx + the cache regs; rbx=rdi */
-        e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
-        if (run_has_float(chunk, begin, end))     /* r8 = t_float (N3) */
-            e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+        /* #96: ONE flag for "this fragment needs the t_float singleton",
+         * read by emit_type_tags at every entry AND by
+         * emit_call_epilogue's re-materialisation, so they cannot
+         * disagree (they did: the epilogue re-made r8 unconditionally,
+         * 106 times on a bench with no float in it). */
+        e.float_tag_live = run_needs_float_tag(chunk, begin, end);
+        emit_type_tags(e);
 
         /* Load each pinned slot ONCE here (the back edge jumps to the
          * first op below, so the loop keeps them in registers; every exit
@@ -14871,9 +14972,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                           * uses its run's own entry) */
             pe.second = e.pos();
             e.frag_entry();                      /* a stub IS an entry too */
-            e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
-            if (run_has_float(chunk, begin, end))
-                e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+            /* BEFORE the pin loads: r8 may be both the singleton and
+             * a pin register, and the pin must win. */
+            emit_type_tags(e);
             for (const Emitter::CacheEnt &c : e.cache)
                 e.load(c.reg, c.payload);   /* #96: the ENTRY's own
                                              * assignment, not the
