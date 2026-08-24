@@ -202,3 +202,59 @@ record (the nested-read fusion, the element-store inline tiers, the
 struct baked layout): replace a helper call with emitted code that does
 the work. 30_str_index_iterate is the cleanest instance left.
 
+
+## THE REGISTER-PRESSURE FAMILY (2026-08-16) - built, and it ANSWERS
+
+`bench/my/8{0..5}_regs_*` plus their C++ twins: the same loop with 8,
+14, 25 and 40 int locals, and 8 / 25 REFERENCE (array-parameter) locals.
+Designed to isolate register pressure and nothing else - each local
+carries its OWN loop-carried recurrence (N-way ILP, so the loop sits in
+the THROUGHPUT regime where a slot round-trip actually costs, and no
+compiler can vectorize a carried chain), the condition alternates with
+period 2 so nothing mispredicts, and nothing allocates or leaves L1.
+
+⛔ **THE ITERATION COUNT IS FIXED ACROSS THE FAMILY.** The first version
+held TOTAL UPDATES equal instead, which confounds it: loop overhead is
+per-ITERATION, so the small-N variants ran more iterations and paid more
+overhead per update - and the ratio curve came out non-monotonic for
+that reason alone. Fixed iterations make time(N) linear in N on both
+sides, so the SLOPE is the per-update cost with the overhead separated.
+
+### The result
+
+| N | my ns/update | cpp ns/update | my/cpp | C++ stack accesses in the loop |
+|---|---|---|---|---|
+| 8  | 0.503 | 0.147 | 3.41x | **0** (0%) |
+| 14 | 0.531 | 0.114 | 4.66x | - |
+| 25 | 0.724 | 0.123 | 5.89x | **54 of 199** (27%) |
+| 40 | 0.559 | 0.154 | 3.62x | **114 of 322** (35%) |
+
+Reference locals: 2.62x at N=8, 2.56x at N=25 - flat.
+
+### What it says, and it is not what the hypothesis predicted
+
+**C++ SPILLS 35% of its loop instructions to the stack at N=40 and its
+per-update cost does not move** (0.147 -> 0.123 -> 0.154 ns). Giving up
+the register file costs C++ essentially NOTHING at this pressure,
+because a spill slot is an L1 hit the out-of-order engine absorbs - the
+same finding as `bench/micro/slotcost.cpp`, now with the C++ compiler
+itself as the witness.
+
+So "MyLang is slower because it does not use all the registers" is not
+supported: the control that abandons the registers does not slow down.
+
+**MyLang's 3.4-5.9x is the SHAPE OF ITS SLOT, not the absence of a
+register.** C++'s spill is ONE 8-byte store or load of a raw long;
+MyLang's slot round-trip is a payload store, a TYPE-TAG store and a
+payload load - three memory operations instead of one, 48 bytes apart.
+That is the multiplier, and it is why C4a/C3's type-store elision (the
+tag) and #96's dispatch finding point at the same place a register
+allocator does, more cheaply.
+
+### What would still settle it
+
+MyLang pins only FOUR int slots (r12-r15), so even at N=8 half the
+accumulators are in memory. The family is the instrument for testing any
+fix: widen the pool, elide the tag, or allocate properly - each should
+move the my/cpp column, and the N=8 row (where C++ uses no stack at all)
+is the cleanest single number to watch.
