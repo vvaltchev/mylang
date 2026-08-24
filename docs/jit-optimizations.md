@@ -8591,3 +8591,34 @@ Execution proof: g_jit_lsra_fpins (a JITSTATS row), bumped per
 entry of a float-pinned fragment whose fhot the lever chose;
 WATCHED - skipping the fhot replacement leaves every value right
 and fails only the counter assertion in jit_lsra_bridge_check.
+
+## Endgame F4b core (2026-08-24) - FLOAT trans mode: per-pc xmm
+## pieces execute through e.fcache
+
+The F2/F3 float scan+snap become emission consumers behind the
+lever: the bridge attempts float trans mode (same v1 bounds as GP -
+no temps, hregs empty), fhot becomes the entry-occupant list,
+afphys binds abstract regs to FCACHE_REGS, the seam loop executes
+float transitions (interior-end flush = fstore + t_float tag store,
+install = fload; fgive/ftake_fixed keep busy <=> entry per pc), and
+entry stubs replay base_fcache + the transitions at or before their
+pc - e.fcache at stub-emission time is the post-all-transitions
+FINAL state, the inc-2 lesson on the float file. A transitioned
+slot leaves textra_f and fread_raw (one machinery per slot). The
+barrier brackets and exit flushes read the evolving e.fcache and
+needed no change - register-state-driven, as designed.
+
+⛔ THE BINDING IS TWO LOOPS - take every occupant-less areg's
+register FIRST, then give back: an fgive inside the take loop hands
+the SAME physical xmm to the next areg (both bound to xmm4), and
+the seam's evict then finds the other slot on the register -
+watched aborting `c.slot == tr.evict_slot` on 01_float_chain_ref_
+temp before the fix. The GP aphys block had this structure all
+along; the float copy initially did not.
+
+Verified: -rt + corpus both configs, the off-arena lever config,
+default vdjcmp 116/116 byte-identical. Real float transitions
+execute on the corpus (01_float_chain: installs at pc 9/11, evicts
+at 22/28, across two runs). Remaining in F4b (plan marker): a
+float-specific transition counter + watched sabotage, a bridge
+float-handoff case, and the F5 measurement.
