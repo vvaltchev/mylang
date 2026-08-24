@@ -110,6 +110,15 @@ unsigned long g_jit_relent_stores = 0;
  * execute, so its absence from the emitted code IS the event. */
 extern "C" unsigned long g_jit_fwd_skip_rel;
 unsigned long g_jit_fwd_skip_rel = 0;
+
+/* #95: the SELF-CHECK's verdict on the SharedStr char-data offset -
+ * 1 when a live short AND long string both read back correctly, so the
+ * inline ord(s[i]) tier may engage; 0 on any mismatch (a libc++ short
+ * form, say), where every ord(s[i]) keeps calling jit_ord_char. Not a
+ * counter but a verdict, reported beside them so "is the tier even
+ * available here?" is answerable of a real run. */
+extern "C" unsigned long g_jit_str_probe_ok;
+unsigned long g_jit_str_probe_ok = 0;
 }
 #endif
 
@@ -463,6 +472,14 @@ struct JitLayout {
     int slice_off;        /* SharedArrayObj: offset of `slice` (from payload) */
     int arr_off_off;      /* SharedArrayObj: offset of `off` (u32; #95 slice
                            * reads - elements live at data + (off + i)) */
+    /*
+     * #95 the INLINE ord(s[i]) read. `str_inline_ok` is the SELF-CHECK's
+     * verdict, not a compile-time assumption: see where it is set.
+     */
+    int str_slice_off;    /* SharedStr: offset of the `slice` flag (bool) */
+    int str_obj_off;      /* SharedStr: offset of the StrObj * (expect 0) */
+    int strobj_data_off;  /* StrObj -> std::string::_M_p, the char data */
+    bool str_inline_ok;   /* the probe VERIFIED against a live string */
     int str_len_off;      /* SharedStr: offset of the window `len` (u32) -
                            * AUTHORITATIVE for every string since the window
                            * model, so len() is one load (G5) */
@@ -569,6 +586,59 @@ static const JitLayout &jit_layout()
         l.str_len_off = static_cast<int>(
             static_cast<const char *>(sref.jit_probe().len)
             - reinterpret_cast<const char *>(&sref));
+        /*
+         * #95: the rest of the SharedStr window, plus THE SELF-CHECK.
+         *
+         * ⛔ THE CHAR DATA POINTER IS NOT ASSUMED, IT IS VERIFIED. The
+         * emitted fast arm loads the characters through
+         * `[StrObj + strobj_data_off]`, which is `std::string::_M_p`.
+         * libstdc++ puts that at offset 0 of the string and keeps it
+         * valid for BOTH the SSO and the heap form, so one load serves
+         * every string - but libc++ does not lay its short form out
+         * that way, and this project builds with clang and has a libc++
+         * CI lane. A wrong offset here is a silent wrong character or a
+         * wild read, never a build error, so a static_assert cannot
+         * cover it and neither can a comment.
+         *
+         * So: build a SHORT string and a LONG one, load a pointer
+         * through the candidate offset, and require BOTH to equal
+         * `data()`. `str_inline_ok` stays false on any mismatch and the
+         * tier simply never engages - every ord(s[i]) keeps calling
+         * jit_ord_char, which is what ships today.
+         */
+        {
+            const SharedStr::JitProbe sp = sref.jit_probe();
+            const char *sb = reinterpret_cast<const char *>(&sref);
+            l.str_slice_off =
+                static_cast<int>(static_cast<const char *>(sp.slice) - sb);
+            l.str_obj_off =
+                static_cast<int>(static_cast<const char *>(sp.obj) - sb);
+            l.strobj_data_off = static_cast<int>(sp.strobj_data);
+            l.str_inline_ok = false;
+            if (l.str_obj_off == 0 && l.strobj_data_off >= 0) {
+                auto probe_ok = [&](const char *text) {
+                    SharedStr t{ std::string(text) };
+                    LValue lv(EvalValue(std::move(t)), false);
+                    const SharedStr &r = lv.get().get_ref<SharedStr>();
+                    const char *base = reinterpret_cast<const char *>(&r);
+                    const void *sobj =
+                        *reinterpret_cast<void *const *>(base + l.str_obj_off);
+                    const char *got = *reinterpret_cast<const char *const *>(
+                        static_cast<const char *>(sobj) + l.strobj_data_off);
+                    return got == r.get_view().data();
+                };
+                /* SHORT (SSO-eligible) and LONG (certainly heap) */
+                l.str_inline_ok =
+                    probe_ok("abc")
+                    && probe_ok("0123456789012345678901234567890123456789"
+                                "0123456789012345678901234567890123456789");
+            }
+#ifdef TESTS
+            /* observability only; the TIER's gate is the layout
+             * field itself, which is unconditional. */
+            g_jit_str_probe_ok = l.str_inline_ok ? 1 : 0;
+#endif
+        }
 
         const SharedArrayObj::JitProbe jp = arr.jit_probe();
         const char *so = static_cast<const char *>(jp.shobj);
@@ -5417,6 +5487,7 @@ void jit_stats_report()
         { "bind_widen",       &g_jit_bind_widen },
         { "ref_arg_binds",    &g_jit_ref_arg_binds },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
+        { "str_probe_ok",     &g_jit_str_probe_ok },
         /* #94: the BORROW - a reference argument bound with no retain
          * (arg_borrow) vs one the analysis cleared whose value turned
          * out to be a slice (arg_borrow_slice, the one dynamic

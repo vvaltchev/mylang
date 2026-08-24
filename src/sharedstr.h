@@ -128,8 +128,33 @@ public:
      * instead of growing a second copy of this class's layout that could
      * drift. `len` is private, hence the accessor.
      */
-    struct JitProbe { const void *len; };
-    JitProbe jit_probe() const { return { &len }; }
+    /*
+     * `slice`/`obj` join it for the INLINE `ord(s[i])` read: a non-slice
+     * must IGNORE `off` (see offset() below), so the emitted fast arm
+     * tests `slice` and declines one to the helper rather than carrying
+     * the extra load and branch.
+     *
+     * `strobj_data` is the offset FROM the StrObj to the pointer that
+     * holds its characters - i.e. to `std::string::_M_p`. It is derived
+     * from a REAL object here rather than assumed, and jit.cpp must
+     * additionally VERIFY it against a live short and long string before
+     * enabling the tier: libstdc++ keeps that pointer at offset 0 of the
+     * string and valid for both the SSO and the heap form, but libc++
+     * lays its short form out differently, and a wrong offset here is a
+     * silent wrong character or a wild read, not a build error.
+     */
+    struct JitProbe {
+        const void *len;
+        const void *slice;
+        const void *obj;
+        long strobj_data;
+    };
+    JitProbe jit_probe() const {
+        return { &len, &slice, &obj,
+                 obj ? reinterpret_cast<const char *>(&obj->s)
+                       - reinterpret_cast<const char *>(obj.get())
+                     : 0 };
+    }
 
     bool is_slice() const { return slice; }
     size_type offset() const { return slice ? off : 0; }
