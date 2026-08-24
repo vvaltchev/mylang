@@ -26577,6 +26577,24 @@ static bool jit_lsra_bridge_check()
                "lsra-chosen pin set (counter flat at %lu)\n", p0);
         return false;
     }
+    /* F4a: the FLOAT fallback's execution proof - a float-pinned
+     * fragment whose fhot the lever chose must ENTER (the counter is
+     * bumped only from emitted code beside g_jit_fcache; the float
+     * loop above is the shape). WATCHED: skipping the fhot
+     * replacement (lsra_f_chose never set) leaves the value right
+     * and fails only here. */
+    const unsigned long f0 = g_jit_lsra_fpins;
+    if (!run({
+            "var fx = 0.0; var n = 0; n = n + runtime(400);",
+            "for (var i = 0; i < n; i++) fx = fx + 0.25;",
+            "assert(fx == 100.0);" }))
+        return false;
+    if (g_jit_lsra_fpins <= f0) {
+        printf("  lsra bridge: no fragment ever entered with an "
+               "lsra-chosen FLOAT pin set (counter flat at %lu)\n",
+               f0);
+        return false;
+    }
     return true;
 #else
     return true;

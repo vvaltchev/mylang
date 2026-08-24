@@ -8564,3 +8564,30 @@ boundary a non-lin point, demoting it; the rescue must then merge
 sc whole-run. Net: jit_lsra_snap_float_check (FS2 replay, FS5
 single-residency, the rescue + vacuity). WATCHED: forcing
 float-mode ineligibility fails the vacuity guard by name.
+
+## Endgame F4a (2026-08-24) - the bridge's FLOAT fallback: lever-on
+## fhot from the interval facts, exact pick parity
+
+With the lever ON, the float pin set (fhot) now comes from the lsra
+analysis instead of the pick: the pick's fhot rule restated on the
+interval FACTS - sum uses_float >= 3, wrote_float somewhere, no
+mem_float anywhere, no countable int use; temps excluded;
+weight-ranked, capped MAX_FCACHED. Deliberately NEVER a detour
+through the plan's pieces: a live-in float slot's idle prefix is
+not a candidate piece, and an all-pieces-resident rule would un-pin
+it (the 43_sieve +37% lesson, on the GP side). The emission
+downstream (ftake_reg + fload, barrier brackets, exit flushes)
+consumes fhot unchanged; per-pc xmm pieces are F4b's trans-mode
+work.
+
+MEASURED PARITY, the increment's whole claim: lever-on emission is
+BYTE-IDENTICAL to the pick's over all 116 corpus programs (vdjcmp,
+OPT=1 ASSERTS=0 so the new counter's TESTS-only bump is compiled
+out - on a TESTS build the bump itself perturbs the dump, which is
+worth remembering when using vdjcmp as a parity oracle). Default
+config also 116/116.
+
+Execution proof: g_jit_lsra_fpins (a JITSTATS row), bumped per
+entry of a float-pinned fragment whose fhot the lever chose;
+WATCHED - skipping the fhot replacement leaves every value right
+and fails only the counter assertion in jit_lsra_bridge_check.
