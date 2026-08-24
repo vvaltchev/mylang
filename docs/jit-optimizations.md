@@ -8374,3 +8374,29 @@ pre-202f816 - +12 Ir/call inside the unified invoke's bind path
 itself, not a copy (task #99 carries it).
 
 Nets: -rt 1690 x 5, corpus_diff. No emission change.
+
+### #99 closes: 09_fib's +4.68% fully attributed (2026-08-23)
+
+The #93-window half (+2.52M, 202f816 -> aa3220f) is COMPILE TIME, not
+codegen: the bytecode is byte-identical across the window (-nj -vd
+diff: zero lines), the -vdj diff is only baked addresses (those shas
+predate the reproducible dump), and a fib(1) variant - same compile,
+negligible run - carries +2.59M of the delta. It is the escape
+analysis itself (esc_collect's body walks + the call-graph fixpoint
+over fib's clones): +3.8% of fib's ~69M-Ir compile, the analysis
+price of #94's measured runtime win, and largely made of the same
+for_each_child dynamic_cast chains task #102 targets - #102 will
+shrink it. The devirtualization suspicion (written_slots -> slot2fn)
+is DEAD: the bytecode did not move.
+
+The #94 half (+1.96M to the then-HEAD) stands as diagnosed in
+2026-08-16: vm_bind_arg's per-bind borrow test, ~0.28 instr/call over
+~7M calls - the flip side of 76_funcval_dispatch's -13.5%. The
+growth SINCE then (~+2.9M) is the D-arc's RTTI-strcmp compile drift,
+attributed separately this session.
+
+09's full decomposition: 88.64M + 2.52M (#93 compile, -> #102)
++ 1.96M (#94 bind test, accepted) + ~2.9M (strcmp drift, -> #102)
+= 96.03M at HEAD. Open decisions for the maintainer: the 67
+invoke-internal +12 Ir/call residual (fix vs accepted trade), and
+whether #93's compile price stands as-is until #102.
