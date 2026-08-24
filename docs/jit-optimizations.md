@@ -7955,10 +7955,14 @@ WATCHED FAILING both ways: bad() stripped of mem_int -> property D
 names all four slots; attribution disabled -> property C (22/29
 orphans) AND property A (picked slots with zero recorded weight).
 
-Not yet covered, recorded for step 2b: the uses_ret float-exemption
-(ReturnV reading an fhot slot needs a FUNCTION-chunk case - the root
-chunk ends in Halt), and a corpus-wide orphan census (rides along
-when the scan consumes the qualifier over real runs).
+[CLOSED 2026-08-23: the float-return exemption case landed - the
+qual check iterates FUNCTION chunks and a returned float accumulator
+pins it: an fhot slot the ReturnV reads proves use_ret disqualified
+nothing, vacuity-guarded (saw_ret_exempt), WATCHED failing by
+sabotaging the shared switch's ReturnV case to usei() - which kills
+the pick's own fhot through the same switch, exactly the
+one-switch-two-drivers design detecting its own corruption. Still
+recorded: the corpus-wide orphan census (rides with the scan).]
 
 ADDENDUM (same day): the qualifier also emits the MemEvent stream
 (optional out) - one {pc, slot, gp_only} per bad()/badi() event, the

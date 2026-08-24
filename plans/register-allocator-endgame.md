@@ -478,8 +478,10 @@ pick): A picked => per-interval clean (+ A-float for fhot), D
 refused-yet-hot => mem_int somewhere, B the payoff interval
 observed + vacuity-guarded, C orphans == 0. WATCHED failing both
 ways (mem_int stripped -> D names 4 slots; attribution disabled ->
-C + A). Recorded gaps for 2b: uses_ret float-exemption needs a
-function-chunk case; corpus-wide orphan census rides with the scan.
+C + A). Recorded gaps for 2b: uses_ret float-exemption CLOSED 2026-08-23
+(function-chunk float-return case, vacuity-guarded, watched via a
+shared-switch sabotage); corpus-wide orphan census rides with the
+scan.
 ADDENDUM: MemEvent stream {pc, slot, gp_only} - the forced-end
 POSITIONS the scan cuts on; property E pins stream/flags agreement
 both ways (watched: pc+1 stamp fails at four named sites).
