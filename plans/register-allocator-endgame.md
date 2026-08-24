@@ -602,17 +602,34 @@ aborts the next lever -rt by name. The check is #ifndef NDEBUG
 set-but-unused shape, both caught by the pre-push clang
 OPT=1 ASSERTS=0 LTO=0 step.
 
-⛔ NEXT: 2b-iii-d remainder, in flip-gating order:
- - the residual sub-1%: install-run fusion into the entry-load
-   block, the textra per-piece filter, weight-aware eviction
-   ties;
- - second-chance re-queue; C2b hoist regions into trans mode
-   (they currently decline it); the float pool twin; arm 3
-   (exit-flush completeness) if the exit machinery ever stops
-   flushing e.cache wholesale;
- - the D0 full-suite ledger (RULE B1) + wall-clock interleaved
-   A/B, and the default flip only when D4 is green AND the
-   ledger pays.]
+⛔ BROAD-LEDGER FINDING (2026-08-23, 13-bench same-binary Ir
+sweep - the six-bench set had a corpus hole): ⛔ 43_sieve +37.27%,
+14_array_subscript +2.48%, 81_regs_int_14 +1.26%; everything else
+sub-1%. DIAGNOSED (43, via the -vdj entry loads): the lever pins
+{i1, n, i2, count} - TWO DISTINCT SLOTS both named i (two `var i`
+decls; NOT the S5 hazard) - and LOSES j and k, the inner sieve
+counters. Their piece starts sit inside crossed regions, and the
+backward extension is blocked by the PREVIOUS piece on their
+assigned register (the scan's lowest-free-first packing leaves a
+predecessor ending mid-crossed-region, so no legal lin point
+exists in the gap; 07's fix worked only because that register
+happened to be empty).
+
+⛔ NEXT: 2b-iii-d inc 2 - EXTENSION-AWARE REASSIGNMENT: when the
+start extension fails on the reg-neighbour bound, scan the other
+abstract registers (< K) for one FREE over the whole extended
+span [s', p.end) and REASSIGN the piece (lowest free, then
+demote). The translation is per-reg and handles any assignment;
+the same-slot bound and both machine checks stay. Re-run the
+13-bench sweep after; 43/14/81 are the targets. Also verify
+g_jit_lsra_pins bumps on 43 (JITSTATS printed no lsra row though
+the emission shows lsra pins - a counter-reach question).
+THEN the remainder, in flip-gating order: install-run fusion,
+textra per-piece, eviction ties; second-chance re-queue; C2b
+regions into trans mode; the float twin; arm 3 if exits stop
+flushing wholesale; the D0 full-suite ledger (RULE B1) +
+wall-clock A/B; the default flip only when D4 is green AND the
+ledger pays.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
