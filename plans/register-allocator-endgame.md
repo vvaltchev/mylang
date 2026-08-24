@@ -812,14 +812,22 @@ THE F-LADDER (mirror of the int increments, same lever):
      (MoveV dest, CmpFloatV dst) - so badf's own push is marked
      DEFENSIVE (9301c45 convention), structurally unwatchable
      today.
- F2. the scan in FLOAT mode: a pool-selector parameter on
-     jit_lsra_assign. Candidate: fdst-first rule above; disq:
-     uses_int > 0 (uses_ret EXEMPT - the emit flushes before
-     jit_ret), mem_float pieces; cuts at MemEvents with
-     gp_only == false only (badi does not cut the float side);
-     the run-wide >= 3 float-weight admission floor (pick
-     parity). K_f = MAX_FCACHED = 4. Float-twin properties of
-     I1/I2/I3/G/F2/H, watched failing.
+ F2. LANDED 2026-08-24: jit_lsra_assign gains float mode (a
+     trailing `fev` param; non-null flips the pool). Cuts,
+     evidence, floor and split-worthiness all derive from the
+     FltEvent stream; disq = interval uses_int > 0 (uses_ret
+     exempt); evidence = write-first per piece (fw != MAX and no
+     read strictly earlier); floor = run-wide read-weight >= 3.
+     jit_lsra_float_check: FI1 tiling, FG write-first (WATCHED:
+     accepting read-first names the piece), FD disjoint pools,
+     FF2 floor (WATCHED: inflating the weights names the slots),
+     4 vacuity shapes. ⛔ TWO FINDINGS: LoadImmFloat is a FLOAT
+     WRITE (usef+fdst, badi only) - so an uncut float accumulator
+     is write-first FROM ITS DEF and legitimately resident; the
+     read-first refusal therefore needs a float-side CUT between
+     def and loop (a DictStore key bad()), and its vacuity
+     detector must run PER PIECE - an interval's early def write
+     hides read-first at interval granularity.
  F3. snap in FLOAT mode: same lin-point/demotion machinery
      (register-agnostic already); the whole-run rescue criteria
      flipped to the pick's float rule (fdst somewhere, no disq_f

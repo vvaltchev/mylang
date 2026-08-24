@@ -11760,12 +11760,23 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<IntervalQual> &q,
                      const std::vector<MemEvent> &mem,
                      const std::vector<MemEvent> &int_uses,
-                     int K, LsraOut &out)
+                     int K, LsraOut &out,
+                     const std::vector<FltEvent> *fev)
 {
     out = LsraOut();
     if (begin >= end || iv.size() != q.size() || K < 0)
         return false;
     const int nslots = ck.slot_count + ck.n_temps;
+    /* FLOAT MODE (F2): non-null fev flips the pool - the cut stream,
+     * the evidence rule, the floor and the split-worthiness count all
+     * come from the FltEvent stream (contract in jit.h). */
+    const bool fm = fev != nullptr;
+    std::vector<MemEvent> fmem;
+    if (fm)
+        for (const FltEvent &e : *fev)
+            if (e.kind == FltEvent::mem)
+                fmem.push_back({ e.pc, e.slot, false });
+    const std::vector<MemEvent> &cutev = fm ? fmem : mem;
 
     /* THE ADMISSION FLOOR (pick parity): any residency requires the
      * slot's RUN-WIDE int weight >= 3 - exactly the pick's threshold,
@@ -11777,8 +11788,14 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
      * times (+3.9%/+1.8% per iteration). A per-piece cost model
      * (entry count x piece weight) is the later refinement. */
     std::map<int, int> slot_wint;
-    for (const MemEvent &u : int_uses)
-        slot_wint[u.slot]++;
+    if (fm) {
+        for (const FltEvent &e : *fev)
+            if (e.kind == FltEvent::read)
+                slot_wint[e.slot]++;
+    } else {
+        for (const MemEvent &u : int_uses)
+            slot_wint[u.slot]++;
+    }
 
     /* next-use distances, the admission + eviction input (a HEURISTIC
      * - see its codegen.h note; a wrong eviction costs a reload) */
@@ -11794,19 +11811,20 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
 
     /* (1) CUT. Events are per (pc, slot); every kind forces the GP
      * side (badi is int-side-only, which IS this side). */
-    std::vector<char> used(mem.size(), 0);
+    std::vector<char> used(cutev.size(), 0);
     for (size_t k = 0; k < iv.size(); k++) {
         const LiveInterval &l = iv[k];
         std::vector<uint32_t> pcs;
-        for (size_t e = 0; e < mem.size(); e++)
-            if (mem[e].slot == l.slot && mem[e].pc >= l.start
-                    && mem[e].pc < l.end) {
-                pcs.push_back(mem[e].pc);
+        for (size_t e = 0; e < cutev.size(); e++)
+            if (cutev[e].slot == l.slot && cutev[e].pc >= l.start
+                    && cutev[e].pc < l.end) {
+                pcs.push_back(cutev[e].pc);
                 used[e] = 1;
             }
         std::sort(pcs.begin(), pcs.end());
         pcs.erase(std::unique(pcs.begin(), pcs.end()), pcs.end());
-        const bool fl = q[k].uses_float > 0 || q[k].wrote_float;
+        const bool fl = fm ? q[k].uses_int > 0
+                           : q[k].uses_float > 0 || q[k].wrote_float;
         /* ⛔ TYPE EVIDENCE: a GP pin's flush stamps the slot t_int (the
          * C3 elision re-established), so admission requires an INT-OP
          * touch - which inference proved. uses_ret is WEIGHT, never
@@ -11823,11 +11841,27 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
             if (s >= e2)
                 return;
             bool evid = false;
-            for (const MemEvent &u : int_uses)
-                if (u.slot == l.slot && u.pc >= s && u.pc < e2) {
-                    evid = true;
-                    break;
-                }
+            if (fm) {
+                /* ⛔ write-first: a read at a STRICTLY earlier pc than
+                 * every write kills the piece (the promote-arm rule -
+                 * jit.h's float-mode contract); a same-pc pair is one
+                 * dst touch and admissible. */
+                uint32_t fw = UINT32_MAX, fr = UINT32_MAX;
+                for (const FltEvent &e : *fev)
+                    if (e.slot == l.slot && e.pc >= s && e.pc < e2) {
+                        if (e.kind == FltEvent::write && e.pc < fw)
+                            fw = e.pc;
+                        if (e.kind == FltEvent::read && e.pc < fr)
+                            fr = e.pc;
+                    }
+                evid = fw != UINT32_MAX && fr >= fw;
+            } else {
+                for (const MemEvent &u : int_uses)
+                    if (u.slot == l.slot && u.pc >= s && u.pc < e2) {
+                        evid = true;
+                        break;
+                    }
+            }
             /* admit only an int-evidenced, float-free piece with a USE
              * inside - a stretch nothing reads gains nothing - of a
              * slot over the run-wide floor (pick parity, above) */
@@ -11846,7 +11880,7 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
         piece(cur, l.end, false);
         out.cuts += static_cast<int>(pcs.size());
     }
-    for (size_t e = 0; e < mem.size(); e++)
+    for (size_t e = 0; e < cutev.size(); e++)
         if (!used[e])
             return false;                /* an event outside every
                                           * interval - inconsistent
@@ -11914,10 +11948,18 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
         const int freed = out.pieces[li].reg;
         const uint32_t here = p.start;
         int kept_uses = 0;
-        for (const MemEvent &u : int_uses)
-            if (u.slot == out.pieces[li].slot
-                    && u.pc >= out.pieces[li].start && u.pc < here)
-                kept_uses++;
+        if (fm) {
+            for (const FltEvent &e : *fev)
+                if (e.kind == FltEvent::read
+                        && e.slot == out.pieces[li].slot
+                        && e.pc >= out.pieces[li].start && e.pc < here)
+                    kept_uses++;
+        } else {
+            for (const MemEvent &u : int_uses)
+                if (u.slot == out.pieces[li].slot
+                        && u.pc >= out.pieces[li].start && u.pc < here)
+                    kept_uses++;
+        }
         if (out.pieces[li].start < here && kept_uses >= 2) {
             LsraPiece rest = out.pieces[li];
             rest.start = here;
