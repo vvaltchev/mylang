@@ -8079,3 +8079,57 @@ gate.
 NEXT (the plan's marker): per-pc emission - serve the D2 seam from
 the plan's pieces, entry loads / split stores / label resolution /
 exit flushes, validator arms 2/3, then the D0 ledger A/B.
+
+## Endgame D3.b step 2b-iii-a (2026-08-23) - the snap to
+## linearization points
+
+WHAT: `jit_lsra_snap` (jit.cpp; contract in jit.h) translates the
+scan's plan into the vocabulary the emitter ALREADY EXECUTES - #96
+inc-2's seam pattern, generalized: an entry state per abstract
+register plus LsraTrans transitions {pc, reg, evict|-1, install|-1},
+each sitting on a LINEARIZATION POINT. The rule comes straight from
+the share plan's own soundness note, which had already REFUTED
+per-edge reasoning about intervals ("a seam inside a loop body re-runs
+every iteration"): a register-state transition may only sit at a pc no
+branch edge crosses in either direction; an edge TARGETING it is legal
+(the seam_pre patching sends pre-transition sources before it and
+post-transition sources past it - for an install at a loop head, that
+IS the loop-carried pin). A resident piece whose interior start, or
+whose CONTINUATION end, cannot sit on such a pc is DEMOTED - never
+promoted.
+
+THE CONTINUATION RULE, settled here: a piece end needs a flush exactly
+when the interval continues past it (p.end < interval.end - a mem-cut
+or an eviction-split remainder reads the slot from memory right
+after). A DEATH or HOLE end emits nothing: the register is dropped
+silently in the model (stale memory is unread by liveness), and the
+drop-at-death discipline guarantees no later flush can clobber the
+slot's next definition - which also means installs NEVER evict; every
+flush is a continuation-end's own.
+
+The edge scan is ONE exported function (jit_run_edges), now shared by
+jit_share_plan, the snap, and the -rt net (which re-derives only the
+crossing rule); jit_lin_point is the one crossing test. The
+share-plan refactor is byte-identical: vdjcmp 116/116 both arenas.
+
+NET (`jit: D3.b ... 2b-iii-a`): S1 transitions only at linearization
+points (crossing rule re-derived from spec), S2 replay => coverage at
+every pc (playing entry + transitions must hold exactly the covering
+piece's slot), S2b every continuation end OWNS its flush (stated
+directly - replay cannot see a dropped flush whose model cleanup
+remains: memory state is outside the model), S3 demotion only, S4 the
+in-loop-event case demotes (a DictStore in the loop body puts every
+boundary on a crossed pc). Vacuity: a mid-run install, a continuation
+flush, and a demotion must each occur. WATCHED failing three ways:
+demotion disabled -> S1 names the crossing edges; flush dropped with
+model cleanup kept -> S2b names the pc; install registered one pc
+late -> S2 names three pcs.
+
+Analysis-only (nothing consumes the snap yet). Verified: vdjcmp
+116/116 both arenas, -rt default + off-arena + lever, corpus, TESTS=1
+OPT=1, clang OPT=1 ASSERTS=0 LTO=0 zero warnings, non-JIT compile
+check, census gate.
+
+NEXT: 2b-iii-b - EMISSION: generalize the seam-application loop to
+LsraTrans (evict-only and install-only arms), entry stubs + exit
+flushes from the replayed per-pc state, behind the lever.

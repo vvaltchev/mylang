@@ -9738,6 +9738,42 @@ static const size_t MAX_SPILL_HOMES = 16;
  * otherwise have been a spill home, so a seam strictly upgrades its
  * placement and frees a home for the next overflow.
  */
+/* The run's non-sequential branch edges (fall-through excluded:
+ * linear-order state change is exactly what a seam is). ONE copy,
+ * shared by the share plan and jit_lsra_snap - two edge scans would
+ * drift. */
+void jit_run_edges(const Chunk &ck, size_t begin, size_t end,
+                   std::vector<std::pair<int, int>> &edges)
+{
+    for (size_t p = begin; p < end; p++) {
+        const Instr &i2 = ck.code[p];
+        if (op_is_branch(i2.op) && i2.target >= 0
+                && i2.target != static_cast<int>(p) + 1)
+            edges.push_back({ static_cast<int>(p), i2.target });
+    }
+}
+
+/* Is `sp` a LINEARIZATION POINT - a pc no edge crosses in either
+ * direction? An edge TARGETING sp itself is legal: the patcher sends
+ * a source emitted BEFORE the transition to the pre-transition
+ * position (it must run it) and a source after it past it (it must
+ * not re-run it) - the fixup's own site says which, because emission
+ * is linear. This is the loop-exit-lands-on-the-next-init shape,
+ * which is exactly where sequential-loop sharing lives - and, for an
+ * INSTALL at a loop head targeted by the back edge, exactly the
+ * loop-carried pin. */
+static bool jit_lin_point(const std::vector<std::pair<int, int>> &edges,
+                          int sp)
+{
+    for (const auto &ed : edges) {
+        if (ed.second == sp)
+            continue;
+        if ((ed.first < sp) != (ed.second < sp))
+            return false;                /* an edge crosses sp */
+    }
+    return true;
+}
+
 struct ShareSeam {
     size_t pc;                 /* the linearization point (= to.lo) */
     uint8_t reg;               /* whose occupant is evicted here */
@@ -9780,31 +9816,12 @@ static void jit_share_plan(const Chunk &ck, size_t begin, size_t end,
         for (const int sl : u2) touch(sl);
         for (const int sl : d2) touch(sl);
     }
-    /* the non-sequential edges (fall-through excluded: linear-order
-     * state change is exactly what a seam is) */
-    std::vector<std::pair<int,int>> edges;
-    for (size_t p = begin; p < end; p++) {
-        const Instr &i2 = ck.code[p];
-        if (op_is_branch(i2.op) && i2.target >= 0
-                && i2.target != static_cast<int>(p) + 1)
-            edges.push_back({ static_cast<int>(p), i2.target });
-    }
+    /* the non-sequential edges + the linearization-point test - the
+     * shared statics below (jit_lsra_snap drives the same rule) */
+    std::vector<std::pair<int, int>> edges;
+    jit_run_edges(ck, begin, end, edges);
     const auto seam_ok = [&](int sp) {
-        for (const auto &ed : edges) {
-            /* an edge TARGETING the seam pc itself is legal: the
-             * patcher sends a source emitted BEFORE the seam to the
-             * pre-seam position (it must run the eviction) and a
-             * source after it past the seam (it must not re-run it) -
-             * the fixup's own site says which, because emission is
-             * linear. This is the loop-exit-lands-on-the-next-init
-             * shape, which is exactly where sequential-loop sharing
-             * lives. */
-            if (ed.second == sp)
-                continue;
-            if ((ed.first < sp) != (ed.second < sp))
-                return false;            /* an edge crosses the seam */
-        }
-        return true;
+        return jit_lin_point(edges, sp);
     };
     /*
      * Chain overflow slots onto registers whose occupied SPAN is
@@ -11394,6 +11411,104 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
     }
     if (orphans)
         *orphans = vis.orphans;
+    return true;
+}
+
+/*
+ * D3.b step 2b-iii-a - SNAP TO LINEARIZATION POINTS (contract in
+ * jit.h). Demote first, then translate: every surviving boundary is a
+ * transition the seam-application pattern can execute.
+ */
+bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
+                   const std::vector<LiveInterval> &iv, int K,
+                   std::vector<LsraPiece> &pieces,
+                   std::vector<int> &entry_by_reg,
+                   std::vector<LsraTrans> &trans)
+{
+    entry_by_reg.assign(static_cast<size_t>(K), -1);
+    trans.clear();
+    if (begin >= end || K < 0)
+        return false;
+    std::vector<std::pair<int, int>> edges;
+    jit_run_edges(ck, begin, end, edges);
+
+    /* DEMOTE: a resident piece whose interior start, or whose
+     * continuation end, is not a linearization point cannot have its
+     * transition placed - demotion only, never a new resident pc */
+    for (LsraPiece &p : pieces) {
+        if (p.reg < 0)
+            continue;
+        const bool cont =
+            p.end < iv[static_cast<size_t>(p.iv_idx)].end;
+        if ((p.start > begin
+                && !jit_lin_point(edges, static_cast<int>(p.start)))
+            || (cont
+                && !jit_lin_point(edges, static_cast<int>(p.end))))
+            p.reg = -1;
+    }
+
+    /* TRANSLATE: flushes (continuation ends) before installs at the
+     * same pc; the model validates occupancy as it goes */
+    struct Ev { uint32_t pc; int kind; size_t pi; };  /* 0 flush 1 inst */
+    std::vector<Ev> evs;
+    for (size_t i = 0; i < pieces.size(); i++) {
+        const LsraPiece &p = pieces[i];
+        if (p.reg < 0)
+            continue;
+        if (p.start == begin) {
+            if (entry_by_reg[p.reg] != -1)
+                return false;            /* two entry occupants */
+            entry_by_reg[p.reg] = p.slot;
+        } else {
+            evs.push_back({ p.start, 1, i });
+        }
+        if (p.end < iv[static_cast<size_t>(p.iv_idx)].end)
+            evs.push_back({ p.end, 0, i });
+    }
+    std::sort(evs.begin(), evs.end(), [](const Ev &a, const Ev &b) {
+        return a.pc != b.pc ? a.pc < b.pc
+             : a.kind != b.kind ? a.kind < b.kind
+             : a.pi < b.pi;
+    });
+    /* the model: slot each register holds, and the pc its hold dies.
+     * A DEATH end drops silently; a CONTINUATION hold is removed only
+     * by its own flush event (dropping it early would fail the very
+     * check that validates the flush). */
+    struct Occ { int slot = -1; uint32_t live_end = 0;
+                 bool cont = false; };
+    std::vector<Occ> occ(static_cast<size_t>(K));
+    for (size_t r = 0; r < occ.size(); r++)
+        if (entry_by_reg[r] >= 0) {
+            for (const LsraPiece &p : pieces)
+                if (p.reg == static_cast<int>(r) && p.start == begin) {
+                    occ[r] = { p.slot, p.end,
+                               p.end < iv[static_cast<size_t>(
+                                              p.iv_idx)].end };
+                    break;
+                }
+        }
+    const auto drop_dead = [&](uint32_t now) {
+        for (Occ &o : occ)
+            if (o.slot >= 0 && !o.cont && o.live_end <= now)
+                o = Occ();
+    };
+    for (const Ev &ev : evs) {
+        const LsraPiece &p = pieces[ev.pi];
+        drop_dead(ev.pc);
+        if (ev.kind == 0) {              /* continuation flush */
+            if (occ[p.reg].slot != p.slot)
+                return false;            /* model out of step */
+            trans.push_back({ p.end, p.reg, p.slot, -1 });
+            occ[p.reg] = Occ();
+        } else {                         /* install */
+            if (occ[p.reg].slot >= 0)
+                return false;            /* overlap the scan forbids */
+            trans.push_back({ p.start, p.reg, -1, p.slot });
+            occ[p.reg] = { p.slot, p.end,
+                           p.end < iv[static_cast<size_t>(
+                                          p.iv_idx)].end };
+        }
+    }
     return true;
 }
 
