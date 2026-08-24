@@ -646,17 +646,52 @@ unmeasurable-unpinned rule. What a re-attempt needs: the ACTUAL
 two theories in a row were wrong), and a case that observes the
 evictee's placement directly.
 
-⛔ NEXT: 2b-iii-d remainder, in flip-gating order:
- - DIAGNOSE 81's +1.24% with the 43 toolkit (scale3-scale1 per-
-   iteration Ir, then the loop-body emission diff); only then a
-   fix;
- - JITSTATS note: lsra rows print only in TESTS builds - the
-   earlier "no row on 43" was a perf-lane binary, not a reach
-   gap;
- - second-chance re-queue; C2b regions into trans mode; the
-   float twin; arm 3 if exits stop flushing wholesale;
- - the D0 full-suite ledger (RULE B1) + wall-clock A/B; the
-   default flip only when D4 is green AND the ledger pays.]
+⛔ THE MAINTAINER'S REGRESSION AUDIT (2026-08-23, raised over the
+my/cpp geomean reaching 2.225x): ANSWERED WITH THE TRUSTED
+INSTRUMENT. RULE-B1 interleaved wall A/B, HEAD vs the D0 sha
+(039a30c), both binaries built this session, header verified:
+⛔ cur/base geomean 0.999x over 87 benchmarks - THE D-ARC'S
+DEFAULT CONFIG IS WALL-FLAT, and the emitted code is proven
+identical three independent ways (vdjcmp per commit;
+scale3-scale1 per-iteration Ir bit-equal on every ledger bench;
+the generated-code Ir row byte-equal at function level:
+407,000,371 both on 83). my/python geomean 13.56x; the cpp-cache
+machine marker shows no drift.
+
+BUT THE SUSPICION FOUND SOMETHING REAL AND SMALLER: whole-program
+Ir crept +0.1-0.3% (83: +2.0M, mostly-monotonic across the arc's
+byte-identical commits) - 100% of it __strcmp_avx2 called from
+libstdc++'s RTTI (typeinfo name-compare fallback), i.e. COMPILE-
+phase cost that wobbles with binary layout/linkage per commit
+(getenv counted flat at 21 calls; every MyLang function row
+byte-equal). Below wall resolution today; real; it noises any
+my/cpp reading that includes compile. AND IT EXPOSED THE BIG
+PRE-EXISTING FACT: on 83, compile is ~148M Ir of which ~125M is
+dynamic_cast/RTTI + its strcmp - COMPILE IS ~84% RTTI. The pass
+pipeline's dynamic_cast chains are nearly the whole compile bill:
+a first-class optimization target (the tag-check pattern the
+codebase already uses for is_id/is_lit_int), and the amplifier
+that turns linkage wobble into measurable drift.
+
+THE LONGER-WINDOW my/cpp GROWTH IS NOT THE D-ARC. Remaining
+suspects, in order: task #99's TWO REAL pre-D0 Ir regressions
+(the 2026-08-16 regression check - still open, now the priority
+candidate for the step-by-step hypothesis), and the earlier
+cpp-bench re-timing. Bench-infra notes from this audit:
+28_str_concat's PYTHON side times out at the current scale and
+78_typed_param_call failed to time in the recompute - both need
+a look (infrastructure first).
+
+⛔ NEXT, reordered by the audit:
+ - task #99 (the two pre-D0 regressions) - the maintainer's
+   actual trend suspicion lives there, not in the D-arc;
+ - the RTTI compile bill (~84%): propose the tag-dispatch
+   conversion of the hot pass chains to the maintainer as its
+   own item - it is compile-time, not codegen;
+ - fix the two bench-infra breakages (28 py timeout, 78 timing);
+ - then the 2b-iii-d remainder as before: 81's +1.24% (lever-
+   only, ships nothing), second chance, C2b regions, float twin,
+   the flip gate.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
