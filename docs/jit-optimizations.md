@@ -5254,3 +5254,60 @@ self-consistent.** Same family as "a test derived from a table can never
 find a hole in that table" - and the refactor that unifies two
 implementations is precisely the moment a cross-check between them stops
 being evidence. Re-derive at least one check from the SPEC.
+
+## #96 - ONE EPILOGUE PER CACHE STATE (and the barrier bug it exposed)
+
+**Why.** Every exit is `mov eax, pc; jmp <epilogue>` - a constant 10
+bytes - because inlining the tail made exits grow with the pool (56
+bytes of flush at four pins) until the short jcc that hops over an exit
+ran out of displacement. That sharing works only while the register
+cache is FRAGMENT-CONSTANT: one flushing epilogue can write back exactly
+one state. **The allocator's whole point is to change a register's
+occupant mid-run**, so the exit must carry the state it was emitted
+under.
+
+`exit_pc` now interns the current `(cache, fcache, tflush)` and records
+its index; `emit_epilogues` emits one epilogue per distinct state that
+has an exit, installing that state around `flush_cache()`. States are
+ordered non-empty-first then first-seen, which reproduces the old
+flush-then-bare order exactly.
+
+### ⛔ IT WAS NOT THE PURE REFACTOR IT LOOKED LIKE - a latent bug fell out
+
+The old test was
+`cache.empty() && fcache.empty() && tflush.empty() ? epi_bare : epi_flush`,
+and the barrier path - which EMPTIES the cache across a barrier'd op's
+emission, precisely so that op's exit writes nothing back - cleared
+`cache` and `fcache` and **not `tflush`**.
+
+So in any fragment where C3 type-elision was active, a barrier'd exit
+read as "something is cached", took the FLUSHING epilogue, and that
+epilogue flushes the emitter's FINAL (restored, full) cache. It wrote
+the pre-call register values over slots the helper had just written -
+the exact clobber the barrier comment says must never happen, defeated
+by a third vector nobody re-read when C3 added it.
+
+The fix is one line of intent restored (`saved_tflush = std::move(
+e.tflush); e.tflush.clear();`), and it is sound because the pre-op
+`flush_cache()` has already stamped those types: at a barrier'd exit
+nothing is owed. Barrier'd exits now take a genuinely bare epilogue.
+
+**Blast radius, characterised rather than asserted:** 57 of 108 corpus
+programs change, and a shape check over every changed line confirms each
+is either a retargeted `jmp` or part of the added bare epilogue (relay
+store / stack teardown / pops / ret / a `.type` restore). Nothing else
+in the emitted code moves.
+
+**Honest scope: I could not turn it into a failing program.** It needs a
+barrier'd op that WRITES a pinned int-scalar slot and then exits before
+the reload; the corpus, `-rt`, `corpus_diff` (plain, `--levers`,
+`--cold`), `nested_fuzz` and the Net 3 enumeration are green both ways.
+So this is a latent bug closed by making the code match its written
+intent, not a reproduced defect - recorded that way deliberately, like
+#96's `RetFlush` guard.
+
+**The pattern, since this is now the third one in this task:** a
+predicate that enumerates "everything that can be cached" is an audited
+table wearing an `&&`. `tflush` joined the flush and the barrier had no
+reason to know. When you add a fourth cache vector, grep for every site
+that tests all three.

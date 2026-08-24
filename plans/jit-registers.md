@@ -675,6 +675,36 @@ instruction count.
 1. **Per-instruction register STATE** replacing `pick_cached_slots`'
    whole-fragment pin - this is the allocator, and everything else is
    detail.
+
+   **Its first structural blocker is REMOVED: the epilogue is now keyed
+   by CACHE STATE** (`exit_pc` interns `(cache, fcache, tflush)`,
+   `emit_epilogues` emits one per distinct state). A single shared
+   flushing epilogue can only write back a fragment-CONSTANT cache, so
+   nothing per-instruction was expressible before this. Going back to
+   an inlined per-exit tail is not an option - that is what blew the
+   short jcc's displacement and grew every exit with the pool.
+
+   That change also uncovered a latent bug (full record in
+   docs/jit-optimizations.md): the barrier path emptied `cache` and
+   `fcache` but not `tflush`, so with C3 elision active a barrier'd
+   exit took the FLUSHING epilogue and wrote pre-call registers over
+   the helper's writes. 57 of 108 corpus programs change; every changed
+   line is a retargeted `jmp` or part of the new bare epilogue.
+
+   **What remains for the allocator proper**, now unblocked:
+     - intervals for the qualified candidates `pick_cached_slots`
+       already ranks (its `typed_extra` overflow set is exactly the
+       slots that would share);
+     - a register may take a second occupant once the first interval
+       ends - the mandate's "re-useable by multiple variables even in
+       the same frame, same block";
+     - ⛔ **the branch rule**: with a fragment-constant cache, state
+       agreement across a control-flow edge is free. With intervals it
+       is not. The sufficient condition to start from is that every
+       interval be edge-closed - for each branch a -> b in the run, the
+       interval contains both or neither - which is checkable from
+       `visit_pc_fields` and keeps every edge state-preserving without
+       any merge machinery.
 2. **Live ranges from `visit_use_def` - DONE.** `jit_slot_liveness`
    (codegen.h) answers the three questions an allocator asks: may a
    register be dropped without a write-back (is the slot dead), what
