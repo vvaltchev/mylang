@@ -450,8 +450,18 @@ struct LsraTrans {
  * spec; a second edge scan would drift). */
 void jit_run_edges(const Chunk &ck, size_t begin, size_t end,
                    std::vector<std::pair<int, int>> &edges);
+/* `q` and `int_uses` feed THE WHOLE-RUN RESCUE (pick parity): when
+ * demotion would strike a piece of a slot the PICK would pin whole-
+ * run (no mem_int on any interval, no float facts, run-wide int
+ * weight >= 3), ALL the slot's pieces merge into ONE resident piece
+ * [begin, end) on a register free over the whole run - the pick's
+ * pin as the degenerate snap output, needing NO transitions and
+ * therefore immune to linearization points (44_primes_sqrt's
+ * -3.2%/iter shape: the snap shredded what the pick pins). */
 bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
-                   const std::vector<LiveInterval> &iv, int K,
+                   const std::vector<LiveInterval> &iv,
+                   const std::vector<IntervalQual> &q,
+                   const std::vector<MemEvent> &int_uses, int K,
                    std::vector<LsraPiece> &pieces,
                    std::vector<int> &entry_by_reg,
                    std::vector<LsraTrans> &trans);
