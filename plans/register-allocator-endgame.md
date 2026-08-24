@@ -860,12 +860,18 @@ THE F-LADDER (mirror of the int increments, same lever):
      corpus both configs, off-arena lever config, default vdjcmp
      116/116. Real float transitions execute on the corpus
      (01_float_chain: install@9/11, evict@22/28 across 2 runs).
-     ⛔ STILL TO DO in F4b: a FLOAT-specific transition execution
-     counter + its watched sabotage (g_jit_lsra_trans conflates
-     the pools); a bridge-check float-handoff case; the lever-on
-     parity vdjcmp (expect DIFFERENCES now - the whole point -
-     so the oracle is corpus_diff + per-iteration Ir, not byte
-     identity); then F5 measurement.
+     F4b CLOSED 2026-08-24: g_jit_lsra_ftrans (a JITSTATS row)
+     bumped from the emitted float seam only; the bridge check
+     runs the 01_float_chain shape and requires it to move.
+     WATCHED: declining float-tmode adoption leaves 1953/1954
+     green - every value right via the F4a fallback - and fails
+     ONLY the counter assertion. REACH (JITSTATS, lever on,
+     -npc): 04_float_arith 2 ftrans/run, 55_float_sum 4; 54 and
+     88 enter with lsra fpins and no transitions; 46/79 decline
+     (their float slots are mem-cut or int-mixed). Lever-on
+     emission now legitimately DIFFERS from the pick on float
+     shapes - the oracle from here is corpus_diff (green, both
+     arenas) + F5's per-iteration Ir, not byte identity.
  F5. measure: the float benches (04, 46, 54, 55, 79_dyn_float,
      88) per-iteration, then the FULL 88-bench sweep (-npc, the
      parallel harness) - the flatness mandate applies unchanged.]

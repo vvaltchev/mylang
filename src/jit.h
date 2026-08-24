@@ -1183,6 +1183,9 @@ extern "C" unsigned long g_jit_lsra_pins;
 /* F4a: entries of a fragment whose FLOAT pin set the lsra float
  * fallback chose (the facts-based fhot replacement) */
 extern "C" unsigned long g_jit_lsra_fpins;
+/* F4b: float transitions EXECUTED (bumped from the emitted seam code;
+ * g_jit_lsra_trans counts the GP pool only) */
+extern "C" unsigned long g_jit_lsra_ftrans;
 /* D3.b 2b-iii-b: lsra TRANSITIONS executed (bumped by the emitted
  * transition code itself - flush and install arms alike). */
 extern "C" unsigned long g_jit_lsra_trans;

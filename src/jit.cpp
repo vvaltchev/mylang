@@ -77,6 +77,7 @@ unsigned long g_jit_rax_pin = 0;       /* #96: rax-pinned fragment entries */
 unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
 unsigned long g_jit_lsra_pins = 0;     /* D3.b: lsra-chosen pin sets */
 unsigned long g_jit_lsra_fpins = 0;    /* F4a: lsra-chosen FLOAT pins */
+unsigned long g_jit_lsra_ftrans = 0;   /* F4b: FLOAT transitions run */
 unsigned long g_jit_lsra_trans = 0;    /* D3.b: executed transitions */
 unsigned long g_jit_range_share = 0;   /* #96 inc-2: executed range seams */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
@@ -9259,6 +9260,7 @@ void jit_stats_report()
         { "scache",           &g_jit_scache },
         { "lsra_pins",        &g_jit_lsra_pins },
         { "lsra_fpins",       &g_jit_lsra_fpins },
+        { "lsra_ftrans",      &g_jit_lsra_ftrans },
         { "lsra_trans",       &g_jit_lsra_trans },
         { "range_share",      &g_jit_range_share },
         { "two_addr",         &g_jit_two_addr },
@@ -22595,7 +22597,10 @@ retry_emission:
                     e.fload(static_cast<uint8_t>(tr.reg), na.payload);
                 }
 #ifdef TESTS
-                e.bump_counter(&g_jit_lsra_trans);
+                /* F4b: the FLOAT-specific proof - g_jit_lsra_trans
+                 * conflates the pools, and a test of the float seam
+                 * satisfied by a GP transition proves nothing */
+                e.bump_counter(&g_jit_lsra_ftrans);
 #endif
             }
             label[pc - begin] = e.pos();

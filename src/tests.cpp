@@ -26595,6 +26595,32 @@ static bool jit_lsra_bridge_check()
                f0);
         return false;
     }
+    /* F4b: FLOAT transitions must EXECUTE - the emitted seam code
+     * bumps the float-specific counter (g_jit_lsra_trans conflates
+     * the pools). The shape is 01_float_chain_ref_temp's, values
+     * proven there: per-iteration float locals whose pieces the
+     * boxed prologue cuts. WATCHED: declining float-tmode adoption
+     * leaves every value right (the F4a fallback serves) and fails
+     * only here. */
+    const unsigned long ftr0 = g_jit_lsra_ftrans;
+    if (!run({
+            "var av = dynarray([\"3\"]);",
+            "var scale = 1;",
+            "if (len(av) > 0)",
+            "    scale = int(av[0]);",
+            "var N = 4 * scale;",
+            "var total = 0.0;",
+            "for (var i = 1; i < N; i++) {",
+            "    var x = i * 1.0;",
+            "    total += x / (x + 1.0) - 0.5 / x + 1.0 / (x * x);",
+            "}",
+            "assert(str(total, 6) == \"8.944883\");" }))
+        return false;
+    if (g_jit_lsra_ftrans <= ftr0) {
+        printf("  lsra bridge: no FLOAT transition ever executed "
+               "(counter flat at %lu)\n", ftr0);
+        return false;
+    }
     return true;
 #else
     return true;

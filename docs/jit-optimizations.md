@@ -8622,3 +8622,18 @@ execute on the corpus (01_float_chain: installs at pc 9/11, evicts
 at 22/28, across two runs). Remaining in F4b (plan marker): a
 float-specific transition counter + watched sabotage, a bridge
 float-handoff case, and the F5 measurement.
+
+F4b CLOSING (same day): g_jit_lsra_ftrans - the float-specific
+execution proof (the GP g_jit_lsra_trans conflates the pools, and a
+float-seam test satisfied by a GP transition proves nothing) - is a
+JITSTATS row bumped only from the emitted float seam. The bridge
+check runs the 01_float_chain shape and requires it to move;
+WATCHED: declining float-tmode adoption leaves 1953/1954 green
+(every value right - the F4a fallback serves) and fails only the
+counter assertion. Reach on the float benches (lever on, -npc):
+04_float_arith executes 2 float transitions per run and
+55_float_sum 4; 54_mandelbrot/88 enter with lsra float pins and no
+transitions; 46/79 decline. From here lever-on float emission
+legitimately differs from the pick's, so the oracle is corpus_diff
+plus F5's per-iteration Ir - byte identity retired its role at
+F4a.
