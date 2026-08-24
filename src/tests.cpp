@@ -24700,6 +24700,38 @@ static bool jit_xcache_pins()
       /* SIX hot int locals in a call-free loop: four take r12-r15, the
        * last two take r10/r11. Every accumulator is read and written
        * each iteration, so all six clear the pick's use threshold. */
+      /*
+       * #96 r8: the pool's EIGHTH register, and the only CONDITIONAL
+       * one. r8 holds the t_float singleton - but frag_entry
+       * materialises it only when `run_has_float`, so an INT-ONLY run
+       * can spend it on a pin instead. These two cases pin the gate in
+       * both directions, and the FLOAT one is the one that matters: if
+       * r8 were taken there, the pin would be overwritten by the
+       * t_float constant (or the tag store would write a slot value as
+       * a type), so the VALUE is the oracle, not the counter.
+       */
+      { "EIGHT hot int locals in a float-free loop reach r8",
+        { "func f(int n) {",
+          "    var a = 1; var b = 2; var c = 3; var d = 4;",
+          "    var e = 5; var g = 6; var h = 7; var k = 8;",
+          "    for (var i = 0; i < n; i++) {",
+          "        a = a + i; b = b + a; c = c + b; d = d + c;",
+          "        e = e + d; g = g + e; h = h + g; k = k + h; }",
+          "    return a + b + c + d + e + g + h + k; }",
+          "print(f(runtime(40)));" }, true },
+
+      { "the same loop WITH a float keeps r8 as the type singleton",
+        { "func f(int n, float z) {",
+          "    var a = 1; var b = 2; var c = 3; var d = 4;",
+          "    var e = 5; var g = 6; var h = 7; var k = 8;",
+          "    var fl = 0.0;",
+          "    for (var i = 0; i < n; i++) {",
+          "        a = a + i; b = b + a; c = c + b; d = d + c;",
+          "        e = e + d; g = g + e; h = h + g; k = k + h;",
+          "        fl = fl + z; }",
+          "    return a + b + c + d + e + g + h + k + int(fl); }",
+          "print(f(runtime(40), runtime(1.5)));" }, true },
+
       { "six hot locals in a call-free loop take r10/r11 too",
         { "func f(int n) {",
           "    var a = 1; var b = 2; var c = 3;",
