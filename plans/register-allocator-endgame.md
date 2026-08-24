@@ -615,21 +615,31 @@ predecessor ending mid-crossed-region, so no legal lin point
 exists in the gap; 07's fix worked only because that register
 happened to be empty).
 
-⛔ NEXT: 2b-iii-d inc 2 - EXTENSION-AWARE REASSIGNMENT: when the
-start extension fails on the reg-neighbour bound, scan the other
-abstract registers (< K) for one FREE over the whole extended
-span [s', p.end) and REASSIGN the piece (lowest free, then
-demote). The translation is per-reg and handles any assignment;
-the same-slot bound and both machine checks stay. Re-run the
-13-bench sweep after; 43/14/81 are the targets. Also verify
-g_jit_lsra_pins bumps on 43 (JITSTATS printed no lsra row though
-the emission shows lsra pins - a counter-reach question).
-THEN the remainder, in flip-gating order: install-run fusion,
-textra per-piece, eviction ties; second-chance re-queue; C2b
-regions into trans mode; the float twin; arm 3 if exits stop
-flushing wholesale; the D0 full-suite ledger (RULE B1) +
-wall-clock A/B; the default flip only when D4 is green AND the
-ledger pays.]
+2b-iii-d inc 2 LANDED 2026-08-23 - AND THE FIRST THEORY WAS
+WRONG: trans mode never engages on 43 (hoist regions decline);
+the +37% lived in the WHOLE-RUN FALLBACK, whose all-pieces-
+resident rule excluded live-in slots with IDLE PREFIXES (the
+sieve's inner counters enter their loop-body run untouched for
+the first pcs - no candidate piece there, all_res false, the
+hottest slots ran from memory). The fallback is now the pick's
+contract restated on interval facts (wint>0, no mem_int
+anywhere, no float, >= 3) with NO plan detour (it no longer
+calls jit_lsra_assign). MEASURED: 43 +37.19% -> +0.45%, 14
++2.48% -> +0.31%; 10-bench ledger +0.12..1.24% (81's +1.24% is
+the residual class). Rider: trans-mode extension gained
+REASSIGNMENT (reg-neighbour-blocked pieces move to a free
+register over the span) - machine-checked, green, REACH
+UNVERIFIED (noted, not claimed).
+
+⛔ NEXT: 2b-iii-d remainder, in flip-gating order: the residual
+~1% class (81 - install-run fusion / textra per-piece / eviction
+ties; diagnose 81 FIRST, the inc-2 lesson: theory after
+evidence); second-chance re-queue; C2b regions into trans mode;
+the float twin; arm 3 if exits stop flushing wholesale; the D0
+full-suite ledger (RULE B1) + wall-clock A/B; the default flip
+only when D4 is green AND the ledger pays. Also: verify
+g_jit_lsra_pins reach on a whole-run-fallback program (JITSTATS
+showed no row on 43 while the emission had lsra pins).]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
