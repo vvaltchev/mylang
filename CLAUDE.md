@@ -423,6 +423,42 @@ itself against `cache_live()` — so dropping a vector from one and not the
 other aborts BY NAME (watched: reintroducing exactly the original miss
 fails `-rt` instantly).
 
+**⛔ A SIXTH SHAPE, AND THE CHEAPEST TO WALK INTO: A WRAPPER WHOSE NAME
+ENCODES ITS OPERAND IS INVISIBLE TO AN AUDIT THAT GREPS FOR THE OPERAND
+(#96 step 3, 2026-08-17).** The JIT held the `t_int` / `t_float` Type
+singletons in rsi/r8 and re-materialised them at every fragment entry
+and after every helper call. Once the low-address arena made a tag an
+`imm32`, those `movabs` became dead — *provided nothing reads the
+registers*. The audit for readers was `grep -n "R8R\|RSI"` over the
+relevant emitters, and it came back clean, twice. It was wrong, twice,
+because the four readers are spelled
+
+    e.cmp_rax_r8();   e.cmp_rax_rsi();   e.cmp_rdx_r8();   e.cmp_rdx_rsi();
+
+— nine call sites, and **not one of them mentions the register as an
+argument**. The register is in the METHOD NAME.
+
+The two failures are worth separating, because the second is the nastier
+diagnostic:
+ - deleting the materialisation first cost four FLOAT tests, via
+   `emit_float_load`'s type dispatch — a visible wrong answer;
+ - after fixing those it cost the whole **#95 nested-store tier**, which
+   **still emitted perfectly**. `-vdj` showed the inline fast path
+   present and correct; at RUNTIME its value-type guard compared against
+   a garbage register, so every store declined to the helper and the
+   emitted-code counter read **0 of 64**. An emitted-code counter proves
+   the code was EMITTED; when the thing that broke is a GUARD, reach is
+   zero and the counter looks exactly like "the tier was never
+   nativized".
+
+Fixed structurally: `store_type_tag(disp, tag, fallback)` and
+`cmp_reg_tag(reg, tag, fallback)` are the ONLY tag store / tag compare
+entry points, both take the tag as an ARGUMENT, and the four fixed-pair
+wrappers are DELETED so they cannot be reached again. **When you audit
+for uses of a register, a value, or a slot, grep the ACCESSORS as well
+as the operand — and prefer a seam that makes the operand an argument,
+so the grep can work at all.**
+
 **⛔ AN ORACLE THAT SHARES ITS SUBJECT IS NOT AN ORACLE (#96,
 2026-08-16).** #96 widened lever A's temps-only liveness into an
 all-slot one (`jit_slot_liveness`) by making BOTH wrappers over one

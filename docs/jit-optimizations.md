@@ -5466,3 +5466,87 @@ extra registers are spent on something that REMOVES instructions.
 Before building the scratch allocator, find the instruction that the
 extra register makes removable - the way local forwarding did - and
 measure THAT.
+
+## #96 steps 1-3 - THE TYPE SINGLETONS LEAVE THE REGISTER FILE (2026-08-17)
+
+**The problem.** `t_int` and `t_float` are `Type *` constants written
+into a slot's type field constantly. x86-64's
+`mov qword [rbx+disp], imm32` SIGN-EXTENDS its immediate, so it can
+store a pointer only if that pointer is `< 0x8000'0000`; the binary is
+PIE, so they land around `0x6348'0000'0000` and do not fit. That single
+encoding fact is the whole reason they were kept in REGISTERS (rsi/r8),
+and being caller-saved, the emitter re-materialised them after every
+helper call: **108 `movabs rsi` + 106 `movabs r8` on 09_fib_recursive**,
+a program with no float arithmetic in it.
+
+**Step 1 - the low-address arena (`src/lowmem.h`).** One 4 KB
+`mmap(MAP_32BIT)` bump allocator; `AllTypes`' 14 singletons are
+constructed in it at static init. Not a general allocator and must not
+become one - ~14 objects, made once, never freed. ⛔ **"Low absolute
+address" is the requirement, not "near the code"**: proximity buys
+RIP-relative addressing, which is a two-instruction LOAD and therefore
+worse than the register it would replace. The fallback (`new`) is
+REACHABLE, not decoration - `MAP_32BIT` can fail, and Darwin has a 4 GB
+`__PAGEZERO` - so every site tests its own pointer with
+`ml_lowmem_fits_imm32` and picks the encoding per instruction.
+
+**Step 2 - the STORE seam.** `store_type_tag(disp, tag, fallback_reg)`,
+one place, imm32 when it fits and the register otherwise. Zero
+register-based tag stores corpus-wide afterwards.
+
+**Step 3 - delete what that made dead.** The two materialisation sites
+(`emit_type_tags`, `emit_call_epilogue`) emit only on the fallback path,
+and `cmp_reg_tag(reg, tag, fallback)` is the READ twin of the store
+seam. `jit_xcache_count` (a prefix COUNT) became `jit_xcache_busy` (a
+per-register MASK) OR'd into `e.reg_busy` - behaviour identical, but a
+count can only retire the LAST pool entry and the remaining pool work
+needs to name a register and a reason.
+
+**MEASURED** (bench/my + samples, emitted code):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| `movabs` instructions | 21,758 | 14,846 | **-31.8%** |
+| all emitted instructions | 106,939 | 99,748 | **-6.72%** |
+| 09_fib_recursive code | 22,275 B | 21,055 B | -5.5% |
+| 54_mandelbrot code | 5,164 B | 4,844 B | -6.2% |
+
+**WALL CLOCK: FLAT.** Suite geomean `cur/base` **1.006x** (interleaved,
+`OPT=1 ASSERTS=0`, `-npc`), 18 benches faster / 45 flat / 22 slower.
+A `movabs reg, imm64` is 10 bytes but has no operand and no memory
+access, so it retires nearly free beside the real work; the win is
+CODE SIZE and a freed encoding, not cycles. Same finding as the
+guard-elision family - **do not push this line further on Ir evidence
+alone**. It is banked as a PREREQUISITE: the tags no longer occupy an
+encoding, which is a necessary step toward the register pool.
+
+**⛔ AND IT IS NOT SUFFICIENT. Freeing a register from a CONSTANT does
+not free the REGISTER.** rsi is also SysV argument 2 plus ~84 raw
+scratch sites (`mov rsi, rax`, `lea rsi, <slot>`), most outside any
+`emit_call_prologue` bracket; r8 is argument 5 plus ~20. Adding rsi to
+`XCACHE_REGS` fails `-rt` immediately. Every remaining register is
+blocked on the emitter ALLOCATING its scratch - the large remaining
+piece of #96 and the only route to 13.
+
+**The bug this cost twice** - a wrapper whose NAME encodes its operand
+is invisible to a grep for the operand - is recorded as the SIXTH
+audit-table shape in CLAUDE.md. The second failure is the one to
+remember: the #95 nested-store tier still EMITTED correctly and its
+emitted-code counter read 0/64, because what broke was its GUARD.
+
+**A MEASUREMENT TRAP FOUND HERE (worth reusing).** 39_find_builtin read
+**1.45x SLOWER**, reproduced at 1.54x on a filtered re-run - and it is
+NOT this change. The proof is not statistical: the slowdown is present
+under **`-nj`**, where the JIT never emits and none of this diff can
+execute. Callgrind agrees - Ir identical with the JIT on (Δ 15,879 of
+136.5M) AND off (Δ 654), and cachegrind's D1/LLd/I1 are identical to
+three digits. Two LTO links of a 48 MB binary that differ by 640 bytes
+laid the interpreter out differently; this is the same real-CPU
+front-end effect already recorded for `vm_dispatch`. **When a bench
+moves and Ir does not, check whether it still moves with the subsystem
+DISABLED before attributing it.**
+
+(Aside, pre-existing on both commits: `make OPT=1 LTO=0` does not build
+- `-Werror=clobbered` on `ok` at jit.cpp:634, a setjmp interaction. The
+Makefile documents `LTO=0` as supported, so this is a real break; not
+touched here.)
