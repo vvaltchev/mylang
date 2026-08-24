@@ -441,12 +441,67 @@ one, and 03_int_arith - the shape this plan was written around - measures
 **1.18x of C++** once startup is removed, i.e. it is already at parity
 and has nothing to give.
 
-**So build this for 64_struct_create or not at all.** It is the one
-candidate: 36 slot accesses in 137 instructions, no calls,
-9.85 ns/iteration at IPC ~2.8-3.5 (partly latency-bound, so the
-`bench/micro/slotcost.cpp` regime test says its ceiling is somewhere
-between 0 and 26%). Measure that one shape before writing an allocator;
-a general one cannot be justified from this corpus.
+**So build this for 64_struct_create or not at all** - and the gate said
+MEASURE that shape first. It was measured (2026-08-16), and the answer is
+**NOT AN ALLOCATOR EITHER**.
+
+### What 64_struct_create's loop is actually made of
+
+Reading the emitted 137 instructions: **~60 of them are TEN blocks of
+runtime FLOAT TYPE-DISPATCH**, all of this shape -
+
+        mov   rax, <slot>.type
+        cmp   rax, r8              ; the t_float singleton
+        jne   cold
+        movsd xmm0, <slot>
+        jmp   done
+    cold: cvtsi2sd xmm0, <slot>
+
+- and they dispatch on values whose type is ALREADY KNOWN. Three read
+`i`, a statically-INT local, so the conversion is unconditional by
+construction. Seven read a TEMP the same run tagged a few instructions
+earlier (`mov r7.type, r8; movsd r7, xmm0` ... then a dispatch on
+`r7.type`).
+
+**And the cache has nothing to allocate here anyway**:
+`MYLANG_CACHEAUDIT=1` on this bench reports **pinned 2, lost 1**
+(FloatMulRI). The dispatched values are TEMPS, which the N5 rule keeps
+out of the int cache, and `i`, which is already pinned. None of the
+float levers engage at all - no `fread`, no `telide`, no `fcache`
+counter fires on this program.
+
+### The ceiling, measured
+
+`bench/micro/slotcost.cpp` gained a model of this shape - the same
+arithmetic with the intermediates in registers versus round-tripped
+through 48-byte slots WITH the tag store and the dispatch:
+
+    RS  registers     0.45 ns/iter   1.00x
+    MS  +slots+disp   0.94 ns/iter   **2.07x**
+
+So the pattern is NOT free - unlike the dead stores of 03_int_arith,
+this one is in the paying regime. But 0.94 ns is against the real loop's
+**9.85 ns/iteration**, and the model carries 3 of the loop's ~10
+dispatch blocks, so eliminating the pattern entirely is worth roughly
+**5-16%** of this benchmark - the low end of the 0-26% bound, and only
+on this benchmark.
+
+### The conclusion
+
+**The 60 instructions are not a register-allocation problem.** They are
+the emitter dispatching on types IT JUST SET. The targeted fix is to
+extend the existing float type-proof (C4a `fread` / C3 `telide`) to two
+cases it currently misses:
+  a. an int-typed LOCAL read as a float operand - `cvtsi2sd`
+     unconditionally, no dispatch;
+  b. a TEMP the same run already tagged - `movsd` unconditionally.
+
+That is smaller than an allocator, targets the actual instructions, and
+reuses levers that exist. **Predict before building** (the ladder's
+rule): those blocks are a type LOAD plus a perfectly-predicted branch,
+which the guard-elision entry says retires nearly free - so the honest
+expectation is well under the 2.07x the isolated model shows, and this
+should be measured on the wall clock before anyone commits to it.
 
 ### What to build first, and the gate before building it
 

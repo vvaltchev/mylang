@@ -118,6 +118,61 @@ __attribute__((noinline)) static int64_t run_M_ilp(int64_t n)
     return a + b + c + d;
 }
 
+/*
+ * ---------------------------------------------------------------------
+ * #96: 64_struct_create's shape. Its emitted loop is 137 instructions of
+ * which ~60 are TEN blocks of runtime float type-dispatch
+ *
+ *     mov rax, <slot>.type ; cmp rax, r8 ; jne cold
+ *     movsd xmm0, <slot>   ; jmp done
+ *   cold: cvtsi2sd xmm0, <slot>
+ *
+ * on values the emitter itself has just tagged. RS keeps the
+ * intermediates in registers (what a perfect allocator leaves); MS
+ * round-trips them through 48-byte slots WITH the tag store and the
+ * dispatch (what ships). The gap is the ceiling for #96.
+ * ---------------------------------------------------------------------
+ */
+static void *g_flt_tag;
+static volatile double *fslots;
+
+__attribute__((noinline)) static double run_struct_R(int64_t n)
+{
+    double fs = 0; int64_t sx = 0;
+    for (int64_t i = 1; i < n; i++) {
+        const int64_t px = i, py = i * 2;      /* Point(i, i*2) */
+        sx += px + py;
+        const double a = (double)i * 1.0;      /* Vec3(...) */
+        const double b = (double)i * 2.0;
+        const double c = (double)i * 3.0;
+        fs += a + b + c;
+    }
+    return fs + (double)sx;
+}
+
+#define FS(k) fslots[(k) * 6]
+#define FT(k) (*(void *volatile *)&fslots[(k) * 6 + 3])
+
+/* one dispatched read: the tag load, the compare, the taken arm */
+static inline double disp(int k)
+{
+    return FT(k) == g_flt_tag ? FS(k) : (double)(int64_t)FS(k);
+}
+
+__attribute__((noinline)) static double run_struct_M(int64_t n)
+{
+    double fs = 0; int64_t sx = 0;
+    for (int64_t i = 1; i < n; i++) {
+        FT(4) = g_flt_tag; FS(4) = (double)(i * 2);
+        sx += i + (int64_t)FS(4);
+        FT(5) = g_flt_tag; FS(5) = (double)i * 1.0;
+        FT(6) = g_flt_tag; FS(6) = (double)i * 2.0;
+        FT(7) = g_flt_tag; FS(7) = (double)i * 3.0;
+        fs += disp(5) + disp(6) + disp(7);
+    }
+    return fs + (double)sx;
+}
+
 template <class F> static double best_of(F f, int64_t n, int reps);
 
 template <class F> static double best_of(F f, int64_t n, int reps)
@@ -158,5 +213,16 @@ int main(int argc, char **argv)
            ri, ri / it * 1e9);
     printf("M   +slot rt+tag %8.4f s   %6.2f ns/iter   %.2fx\n",
            mi, mi / it * 1e9, mi / ri);
+    static double fbuf[64];
+    fslots = fbuf;
+    g_flt_tag = (void *)0x5678;
+    const double rs = best_of([](int64_t k) { return run_struct_R(k); }, n, 7);
+    const double ms = best_of([](int64_t k) { return run_struct_M(k); }, n, 7);
+    printf("\n-- #96: 64_struct_create's shape (slots + tags + dispatch) --\n");
+    printf("RS  registers    %8.4f s   %6.2f ns/iter   1.00x\n",
+           rs, rs / it * 1e9);
+    printf("MS  +slots+disp  %8.4f s   %6.2f ns/iter   %.2fx\n",
+           ms, ms / it * 1e9, ms / rs);
     return 0;
 }
+
