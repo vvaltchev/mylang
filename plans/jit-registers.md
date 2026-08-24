@@ -589,6 +589,29 @@ the pushes and the pad; frag_ret releases them first.
   - inert at `spill_slots = 0`: emitted code is byte-identical, -rt
     1917/1917.
 
+#### LANDED: lever A learns the SHIFT family (and what that says)
+
+The FIRST thing the pressure benches showed, before any allocator work:
+`bench/my/80_regs_int_08`'s loop was spending **three memory operations
+per accumulator per iteration** on a temp alive for ONE instruction -
+`t = a >> 3; a = a ^ t` - because `jit_fwd_producer`/`jit_fwd_consumer`
+did not know IntShl/IntShr. The whitelists predate
+`specialize_arith_ops` growing those opcodes and nothing re-audited
+them; an unlisted op silently does not forward. **-21.0% Ir on
+83_regs_int_40, -17.97% on 80_regs_int_08**, 11 corpus programs
+changed, everything else byte-identical. Full record in
+docs/jit-optimizations.md.
+
+**This is NOT the allocator** and must not be mistaken for it - it is a
+stale-table fix the allocator's own measurement uncovered. But it moves
+the baseline the allocator will be measured against, and it makes the
+N=8 row's remaining gap purely about the ACCUMULATORS (six of eight
+still in memory), which is the thing only more registers can fix.
+
+The lesson to carry into the allocator: **the cheapest register is the
+one a value never leaves.** Before widening the pool, check whether the
+traffic is a value that could simply have stayed where it was produced.
+
 #### The order for the rest
 
 1. **Per-instruction register STATE** replacing `pick_cached_slots`'
