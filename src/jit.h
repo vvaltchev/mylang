@@ -1157,6 +1157,24 @@ extern const void *g_norec_exit_desc;
  * site's residue_pop parks the popped captures value here before the
  * status dispatch, exception paths included). Defined in vm.cpp. */
 extern const void *g_jit_residue_caps;
+/*
+ * LEVER A's whitelists, at the OPCODE level - the input to the
+ * FAMILY-COVERAGE RATCHET (`jit_fwd_family_coverage`, tests.cpp). They
+ * are not a second copy of the tables: the Instr-taking predicates in
+ * jit.cpp are built ON these, so a whitelist has exactly one edit site
+ * and the ratchet cannot drift from what the emitter actually consults.
+ *
+ * `jit_fwd_op_consumer_slots` returns a MASK of forwardable operand
+ * positions (0 == not a consumer) rather than a bool, because the
+ * positions differ per op.
+ */
+enum { JIT_FWD_A = 1u, JIT_FWD_B = 2u };
+enum class OpCode : uint8_t;         /* bytecode.h; no include needed */
+bool jit_fwd_op_is_producer(OpCode op);
+unsigned jit_fwd_op_consumer_slots(OpCode op);
+bool jit_fwd_op_is_fproducer(OpCode op);
+bool jit_fwd_op_is_fconsumer(OpCode op);
+
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
 #else

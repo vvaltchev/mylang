@@ -333,13 +333,47 @@ per shift, per iteration. Admitting the shifts read **-21.0% Ir on
 changed and every other one byte-identical.
 **The generalisation: a table whose stale entry costs an OPTIMIZATION
 is not self-announcing the way one whose stale entry costs
-CORRECTNESS is** - `verify_chunk` fails the build, this fails
-nothing. So when you ADD AN OPCODE, grep for the opcode lists that
-name its siblings and decide EXPLICITLY for each; and when you add a
-lever, give it a JITSTATS counter so "does it reach a real program?"
-is answerable without reading a disassembly. `g_jit_fwd` was bumped
-from emitted code and registered in NO table - the third counter
-found that way.
+CORRECTNESS is** - `verify_chunk` fails the BUILD, this failed
+nothing. FOUR nets ran over it and every one was structurally
+incapable of seeing it, which is the part worth internalising:
+ - the 5-mode differential, `corpus_diff` and all four fuzzers are
+   blind BY CONSTRUCTION - forwarding changes no observable behaviour,
+   so the answer is right whether the value travelled in RAX or
+   through a slot. **An optimization that only affects SPEED has no
+   correctness oracle**, the same structural gap as *Testing an AST
+   TRANSFORM*;
+ - `jit_counter_coverage` asks "did this lever run AT ALL?" and
+   `g_jit_fwd` was non-zero throughout - the add/mul shapes fire. A
+   whole-lever counter cannot see "runs for 12 of 17 opcodes";
+ - the lever's OWN test, `jit_fwd_deadtemp`, had its cases written
+   FROM the whitelist, so it exercised exactly the opcodes already in
+   it. **A test derived from a table can never find a hole in that
+   table** - this is the deepest of the four and the one to watch for
+   everywhere;
+ - no corpus program had a dense shift loop until #96 wrote one.
+
+**THE FIX, AND THE PATTERN TO REUSE: derive the test from the OPCODE
+ENUM, not from the table.** The B1/B2 specialized family is a
+CONTIGUOUS range (`IntAddRR .. FloatMulRI`, bytecode.h), so
+`jit_fwd_family_coverage` (tests.cpp) walks the range and requires
+every member to be CLASSIFIED - forwardable, or exempt with a written
+reason - and requires each row's claim to MATCH the live predicate in
+both directions. Adding an opcode to that range without deciding now
+fails with the opcode NAMED. Watched failing three ways: the shifts
+dropped from both whitelists (8 lines, one per opcode per side), a row
+deleted ("opcode #104 (IntShlRR) joined the specialized family with no
+row here"), and a row claiming an exemption for an opcode that is
+whitelisted.
+For that to be possible the whitelists had to be answerable at the
+OPCODE level (`jit_fwd_op_is_producer` / `jit_fwd_op_consumer_slots` /
+the float twins, jit.h) - and the Instr-taking predicates are now
+BUILT on those, so this is one edit site, not a second copy free to
+drift. Verified as a pure restructuring: emitted code byte-identical
+on all 94 corpus programs.
+**Do this for the next opcode family that gates an optimization.**
+And when you add a lever, give it a JITSTATS row too - `g_jit_fwd` was
+bumped from emitted code and appeared in no REPORT table, the third
+counter found that way.
 
 **⛔ A HELPER'S REGISTER ABI IS THE EMITTER'S JOB, NOT THE CALLER'S
 (2026-08-05).** THREE bugs in two days were one shape - an implicit

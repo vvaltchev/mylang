@@ -738,3 +738,19 @@ Step 1 then step 2; step 2 is not sensible without step 1. Do the base
 register (RDI -> RBX) as its OWN increment and land it green before
 touching the singletons or the cache - it is the largest single win and
 the easiest to verify in isolation.
+
+## The test net that came out of the shift finding (2026-08-16)
+
+`jit_fwd_family_coverage` - a ratchet over the specialized-arith opcode
+RANGE rather than over the whitelist. It exists because the shift gap
+survived four nets, each blind for a different structural reason (the
+differential cannot see a speed-only change at all; the counter net asks
+"did the lever run", not "for which opcodes"; the lever's own test was
+written from the table it was meant to check; no corpus program had the
+shape). Full account in docs/jit-optimizations.md.
+
+**The transferable part, for the allocator work still ahead:** every
+increment below adds or edits an opcode-keyed decision, and every one of
+them fails SILENTLY when it goes stale. Before landing one, ask whether
+its table has an enumeration a ratchet can walk - and if it does not,
+build the enumeration first.

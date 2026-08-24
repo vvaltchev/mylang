@@ -5263,11 +5263,16 @@ static bool jit_slot_ref_listed(const Chunk &ck, int slot)
                               static_cast<int32_t>(slot));
 }
 
-static bool jit_fwd_producer(const Instr &in, int &dst)
+/*
+ * ⛔ THE OPCODE-LEVEL HALF, split out so the FAMILY-COVERAGE RATCHET can
+ * ask it (jit_fwd_family_coverage, tests.cpp). It is not a second copy:
+ * the Instr-taking predicates below CALL it, so a whitelist can only be
+ * edited in one place. The operand-POSITION rules stay with the Instr,
+ * because only it knows which field is a literal.
+ */
+bool jit_fwd_op_is_producer(OpCode op)
 {
-    if (jit_lever_off(JL_FWD))
-        return false;
-    switch (in.op) {
+    switch (op) {
     case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
     case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
     case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
@@ -5297,11 +5302,20 @@ static bool jit_fwd_producer(const Instr &in, int &dst)
     case OpCode::IntShlRI: case OpCode::IntShrRI:
     case OpCode::LoadElemInt:
     case OpCode::LoadElem2Int:
-        dst = in.target;
         return true;
     default:
         return false;
     }
+}
+
+/* every producer's result slot is `target` - that is what makes the
+ * opcode-level split above lossless */
+static bool jit_fwd_producer(const Instr &in, int &dst)
+{
+    if (jit_lever_off(JL_FWD) || !jit_fwd_op_is_producer(in.op))
+        return false;
+    dst = in.target;
+    return true;
 }
 
 /*
@@ -5320,16 +5334,34 @@ static bool jit_fwd_producer(const Instr &in, int &dst)
  * the pin. Moot in practice (only TEMPS forward, and the C2a pool is
  * locals-only), so it is an invariant to keep rather than a check.
  */
-static bool jit_fwd_fproducer(const Instr &in, int &dst)
+bool jit_fwd_op_is_fproducer(OpCode op)
 {
-    if (jit_lever_off(JL_FFWD))
-        return false;
-    switch (in.op) {
+    switch (op) {
     case OpCode::FloatBin:
     case OpCode::FloatAddRR: case OpCode::FloatSubRR:
     case OpCode::FloatMulRR: case OpCode::FloatAddRI:
     case OpCode::FloatSubRI: case OpCode::FloatMulRI:
-        dst = in.target;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool jit_fwd_fproducer(const Instr &in, int &dst)
+{
+    if (jit_lever_off(JL_FFWD) || !jit_fwd_op_is_fproducer(in.op))
+        return false;
+    dst = in.target;
+    return true;
+}
+
+bool jit_fwd_op_is_fconsumer(OpCode op)
+{
+    switch (op) {
+    case OpCode::FloatBin:
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
         return true;
     default:
         return false;
@@ -5338,36 +5370,37 @@ static bool jit_fwd_fproducer(const Instr &in, int &dst)
 
 static bool jit_fwd_fconsumer(const Instr &nx, int t)
 {
-    switch (nx.op) {
-    case OpCode::FloatBin:
-    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
-    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
-    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
-        return (!nx.a_is_lit() && nx.a_slot() == t)
-            || (!nx.b_is_lit() && nx.b_slot() == t);
-    default:
+    if (!jit_fwd_op_is_fconsumer(nx.op))
         return false;
-    }
+    return (!nx.a_is_lit() && nx.a_slot() == t)
+        || (!nx.b_is_lit() && nx.b_slot() == t);
 }
 
-static bool jit_fwd_consumer(const Instr &nx, int t)
+/*
+ * The consumer's opcode-level half - a MASK of the operand positions the
+ * op may take a forwarded value at, rather than a bool, because those
+ * differ per op and the FAMILY-COVERAGE RATCHET needs the same "is this
+ * classified at all?" answer the producer side gives. Zero == not a
+ * consumer. As on the producer side this is the ONE switch: the
+ * Instr-taking predicate below applies the literal/aliasing rules ON TOP
+ * of it and never re-lists an opcode.
+ */
+unsigned jit_fwd_op_consumer_slots(OpCode op)
 {
-    switch (nx.op) {
+    switch (op) {
     case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
     case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
-        return nx.a_slot() == t
-            || (!nx.b_is_lit() && nx.b_slot() == t);
+        return JIT_FWD_A | JIT_FWD_B;
     case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
     case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
-        return nx.a_slot() == t;
+        return JIT_FWD_A;
     /* the shift family (see the producer note): BOTH operand positions
      * are forwardable. The RI/RR split is not load-bearing here - the
      * emit itself branches on `b_is_lit()`, not on the opcode - so one
      * arm covers all four and cannot disagree with it. */
     case OpCode::IntShlRR: case OpCode::IntShrRR:
     case OpCode::IntShlRI: case OpCode::IntShrRI:
-        return nx.a_slot() == t
-            || (!nx.b_is_lit() && nx.b_slot() == t);
+        return JIT_FWD_A | JIT_FWD_B;
     /* IntModRI / IntAddModRI: operand `a` only. `a` is the FIRST thing
      * either emit loads. IntAddModRI's `b` goes through load_operand
      * and would need the move-aside the shifts do; not worth it for the
@@ -5385,16 +5418,35 @@ static bool jit_fwd_consumer(const Instr &nx, int t)
      * clause costs one compare at JIT time and is what keeps the
      * predicate honest if either of those two facts changes. */
     case OpCode::IntModRI: case OpCode::IntAddModRI:
-        return nx.a_slot() == t
-            && (nx.b_is_lit() || nx.b_slot() != t);
+        return JIT_FWD_A;
     case OpCode::IntAddStep:
         /* the accumulate VALUE only; the accumulator, the counter and a
          * slot bound all read their SLOTS */
-        return !nx.b_is_lit() && nx.b_slot() == t
-            && nx.a_dual_lo() != t && nx.target2 != t
+        return JIT_FWD_B;
+    default:
+        return 0;
+    }
+}
+
+static bool jit_fwd_consumer(const Instr &nx, int t)
+{
+    const unsigned m = jit_fwd_op_consumer_slots(nx.op);
+    if (!m)
+        return false;
+    const bool at_a = (m & JIT_FWD_A) && nx.a_slot() == t;
+    const bool at_b = (m & JIT_FWD_B) && !nx.b_is_lit() && nx.b_slot() == t;
+    if (!at_a && !at_b)
+        return false;
+    /* the per-op aliasing rules - "any OTHER field naming the temp reads
+     * the SLOT, which skip_write may have left stale" */
+    switch (nx.op) {
+    case OpCode::IntModRI: case OpCode::IntAddModRI:
+        return nx.b_is_lit() || nx.b_slot() != t;
+    case OpCode::IntAddStep:
+        return nx.a_dual_lo() != t && nx.target2 != t
             && (nx.a_is_lit() || nx.a_dual_hi() != t);
     default:
-        return false;
+        return true;
     }
 }
 

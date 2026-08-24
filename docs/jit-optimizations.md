@@ -4843,9 +4843,63 @@ one, add its table row in the same edit.
 
 The FLOAT twin (`jit_fwd_fproducer` / `jit_fwd_fconsumer`) has no shift
 to gain - MyLang's shifts are int-only - but it is the same kind of
-list and should be re-read whenever the float family grows.
+list and is now covered by the same ratchet.
 IntModRI/IntAddModRI as PRODUCERS is the one remaining int gap, and it
 is a result-register normalisation, not a soundness question.
+
+### THE RATCHET, and why four nets missed this (2026-08-16)
+
+Asked how it escaped testing, the answer is that every net was blind
+for a DIFFERENT structural reason, and only one of them is fixable by
+trying harder:
+
+  - **the differential, corpus_diff and the fuzzers cannot see it at
+    all.** Forwarding changes no observable behaviour. An optimization
+    that only affects SPEED has no correctness oracle - the same gap
+    CLAUDE.md documents for AST transforms;
+  - **`jit_counter_coverage` was satisfied.** It asks "did this lever
+    run at all?", and `g_jit_fwd` was non-zero throughout because the
+    add/mul shapes fire. A whole-lever counter cannot distinguish
+    "runs" from "runs for 12 of 17 opcodes";
+  - **`jit_fwd_deadtemp` was written FROM the whitelist.** Its three
+    cases are load->mul->addstep, elem2->mul->addstep and a slow-path
+    rejoin - every one drawn from opcodes already in the list. A test
+    derived from a table can never find a hole in that table;
+  - **no corpus program had a dense shift loop** until #96 wrote
+    80_regs_int_08 for an unrelated reason.
+
+`jit_fwd_family_coverage` is derived from the OPCODE ENUM instead. The
+specialized family is a contiguous range, so it walks
+`IntAddRR..FloatMulRI` and requires (1) every member to have a row and
+(2) every row's claim - "forwardable" or "exempt, because ..." - to
+MATCH the live predicate, in both directions.
+
+Watched failing three ways:
+
+    the shifts dropped from both whitelists
+      -> IntShlRR producer is absent but the row says it must be
+         whitelisted            (x8: four opcodes, both sides)
+    a row deleted (the ACTUAL 2026 sequence - an opcode joins the
+    family and nobody thinks about it)
+      -> opcode #104 (IntShlRR) joined the specialized family with no
+         row here - decide whether lever A forwards it, then say so
+    a row claiming a bogus exemption
+      -> IntXorRR producer is whitelisted but the row says a bogus
+         exemption
+
+For the ratchet to be able to ask, the whitelists had to become
+answerable at the OPCODE level: `jit_fwd_op_is_producer`,
+`jit_fwd_op_consumer_slots` (a MASK of forwardable operand positions,
+since those differ per op), and the two float twins, all declared in
+jit.h. **They are not a second copy** - the Instr-taking predicates are
+built on them and apply the literal/aliasing rules on top, so a
+whitelist has exactly one edit site. Verified as a pure restructuring:
+emitted code byte-identical across all 94 corpus programs.
+
+**Reuse this shape for the next opcode family that gates an
+optimization.** The precondition is a family with a defined
+enumeration; where one does not exist, that is the thing to build
+first.
 
 ## #96: the caller-saved pin extension (r10/r11) - and what it measured
 
