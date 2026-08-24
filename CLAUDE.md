@@ -157,6 +157,26 @@ line passes too) — ~7% smaller binary and ~8-9% faster on `bench/`. It works o
 both GCC and clang and is verified to keep `-rt` green. Build with `LTO=0` to
 disable (e.g. for a faster/debuggable link); an `OPT=0` build is non-LTO anyway.
 
+**⛔ `LTO=0` IS A LANE, NOT A FOOTNOTE — AND IT CARRIES DIAGNOSTICS LTO
+CANNOT (2026-08-17).** Because `LTO` defaults to `OPT`, every optimized
+build anywhere — CI included — was an LTO build, so `make OPT=1 LTO=0` was
+compiled by nobody and had been BROKEN for a day before anyone tried it.
+The break was not cosmetic: **GCC's `-Wclobbered` needs the ordinary
+per-TU pipeline to see a whole function at compile time, so an LTO build
+is SILENT about it**, and what it was silent about was real UB —
+`jit_str_probe_verify` read a non-`volatile` local after `siglongjmp`
+(indeterminate per C17 7.13.2.1p3), so a faulting probe could have
+reported SUCCESS and the JIT would have baked a `std::string` layout the
+toolchain does not have. The `lto0` job in `.github/workflows/linux.yml`
+(both compilers, Makefile + CMake, `-rt` + `driver_checks` +
+`system_smoke`) exists to keep that closed. It ASSERTS `mylang -v`
+reports `lto 0` before testing, so the lane cannot go vacuous if a
+default changes — and for that to be possible on the CMake side,
+**CMake now defines `ML_LTO` too** (a per-config generator expression
+tracking the OUTCOME of `check_ipo_supported`, not the request; a CMake
+build used to answer `lto unknown`). **A warning that only one build
+configuration can see is a warning nobody sees.**
+
 **Sanitizers default on for debug builds.** `ASAN` and `UBSAN` (AddressSanitizer
 / UndefinedBehaviorSanitizer) both default to **on when `OPT=0`** and **off when
 `OPT=1`**, and either can be forced: `make ASAN=0` (debug, no ASan),
@@ -733,7 +753,8 @@ mirroring the Makefile. It ALSO now sets `-Wall -Wextra -Wno-unused-parameter`
 for GCC/clang (it set no warning flags before) and **`-DWERROR=ON/OFF`**
 (default ON) — warnings-as-errors (`-Werror` / MSVC `/WX`), matching the
 Makefile's `WERROR`. CI (`.github/workflows/`) builds Debug+Release ×
-g+++clang on Linux (plus a `RECYCLE=ON` lane), macOS (with libc++ hardening),
+g+++clang on Linux (plus a `RECYCLE=ON` lane and an **`lto0` lane** — see the
+non-LTO note above), macOS (with libc++ hardening),
 and Windows, and runs `./mylang -rt` — correctness only, no timing, so the
 lanes carry as many checks as possible.
 

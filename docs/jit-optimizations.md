@@ -5546,7 +5546,8 @@ front-end effect already recorded for `vm_dispatch`. **When a bench
 moves and Ir does not, check whether it still moves with the subsystem
 DISABLED before attributing it.**
 
-(Aside, pre-existing on both commits: `make OPT=1 LTO=0` does not build
-- `-Werror=clobbered` on `ok` at jit.cpp:634, a setjmp interaction. The
-Makefile documents `LTO=0` as supported, so this is a real break; not
-touched here.)
+(Aside found while measuring this, and fixed: `make OPT=1 LTO=0` did not
+build - `-Werror=clobbered` on `ok` in `jit_str_probe_verify`. Not a
+spurious warning but real UB, and `-Wclobbered` is invisible to an LTO
+build, which is why nothing had ever seen it. There is an `lto0` CI lane
+now; see the non-LTO note in CLAUDE.md.)
