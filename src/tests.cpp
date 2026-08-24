@@ -25750,6 +25750,29 @@ static bool jit_lsra_snap_check()
           "var d = {};\n"
           "for (var i = 0; i < n; i++) { s = s + i; d[s] = 1; }\n"
           "print(len(d));\n" },
+        /* s's SECOND interval starts inside the if (the skip edge
+         * crosses it), so its start EXTENDS backward - and the
+         * same-slot bound must stop the extension at interval 1's
+         * pieces, or s resides on two registers at once (property
+         * S5, which S2 alone cannot see: both registers 'hold' s) */
+        /* the 07 shape at K=1: the eviction-split truncates the
+         * outer counter's piece exactly at the inner counter's
+         * install pc, so the inner's backward extension has ZERO
+         * room - the reg-neighbour bound must stop it (sabotaged,
+         * the extension overlaps the truncated piece and the snap's
+         * own model declines the whole run) */
+        { "extension stops at the reg neighbour", 1,
+          "var t = 0; var n = 0; n = n + runtime(9);\n"
+          "for (var i = 0; i < n; i++) {\n"
+          "    for (var j = 0; j < 7; j++) t = t + i * j;\n"
+          "}\n"
+          "print(t);\n" },
+        { "extension stops at the same slot", 4,
+          "var s = 0; var n = 0; n = n + runtime(30);\n"
+          "for (var i = 0; i < n; i++) s = s + i;\n"
+          "var u = s * 2;\n"
+          "if (runtime(1) > 0) { s = 9; u = u + s; }\n"
+          "print(u + s);\n" },
     };
     bool ok = true, saw_install = false, saw_flush = false;
     bool saw_demote = false;
@@ -25857,6 +25880,25 @@ static bool jit_lsra_snap_check()
                    c.name, trans.size() - ti);
             ok = false;
         }
+        /* S5: a slot resides on AT MOST ONE register at any pc - S2
+         * cannot see double-residency (both registers 'hold' the
+         * slot and each piece checks its own), and in emission the
+         * second register's flush writes a STALE copy over the
+         * live one. The same-slot extension bound is what maintains
+         * this. */
+        for (size_t a = 0; a < plan.pieces.size(); a++)
+            for (size_t b = a + 1; b < plan.pieces.size(); b++) {
+                const LsraPiece &x = plan.pieces[a];
+                const LsraPiece &y = plan.pieces[b];
+                if (x.reg >= 0 && y.reg >= 0 && x.slot == y.slot
+                        && x.start < y.end && y.start < x.end) {
+                    printf("  snap [%s]: slot %d on TWO registers "
+                           "(%d and %d) over [%u,%u)x[%u,%u)\n",
+                           c.name, x.slot, x.reg, y.reg, x.start,
+                           x.end, y.start, y.end);
+                    ok = false;
+                }
+            }
         /* S2b: every INTERIOR end owns its flush (uniform - the
          * truthful-cache rule; a death end's flush writes a dead
          * value, which is the price of the emitter's cache never
