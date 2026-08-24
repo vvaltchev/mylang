@@ -343,6 +343,51 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
                            std::vector<IntervalQual> &out,
                            int *orphans = nullptr,
                            std::vector<MemEvent> *mem_events = nullptr);
+
+/*
+ * D3.b step 2b-i (plans/register-allocator-endgame.md): THE LINEAR
+ * SCAN, as PURE ANALYSIS - no lever, no emission change; the output is
+ * a plan and the -rt net checks its invariants. GP pool only (the
+ * float twin is a recorded sibling case for 2b-ii).
+ *
+ * Each D1 interval is first CUT at its slot's MemEvent pcs (a
+ * memory-demanding op is a forced interval end - the design decision
+ * that retires the pick's run-wide bad()): the event pc itself becomes
+ * a one-pc forced-memory piece, the stretches between events stay
+ * allocatable. An interval with float facts, or with no use inside a
+ * piece (jit_next_use), is not a candidate. Then the classic walk:
+ * pieces by start, expire-and-free, take a free register, and at
+ * pressure EVICT the active piece whose next use (jit_next_use at the
+ * contested pc - a heuristic, so a wrong choice costs a reload, never
+ * an answer) is furthest - splitting it there: the evicted piece keeps
+ * its register UP TO the contested pc, the remainder goes to memory.
+ * That split is what lets one variable use different registers - or
+ * none - in different parts of one run. Registers are abstract indices
+ * 0..K-1 here; the physical binding (pool order, callee/caller-saved
+ * cost, rax's ISA facts) is 2b-ii's cost model.
+ *
+ * Pieces of one interval tile it exactly; every piece carries its
+ * verdict: reg >= 0, or -1 == memory (forced_mem says WHY when it was
+ * an event pc / float facts rather than pressure). Returns false when
+ * the inputs are inconsistent (an event outside every interval).
+ */
+struct LsraPiece {
+    int iv_idx;              /* the D1 interval this piece tiles */
+    int slot;
+    uint32_t start, end;     /* [start, end) pcs */
+    int reg;                 /* abstract register 0..K-1, or -1 */
+    bool forced_mem;         /* event pc / float facts - never a reg */
+};
+struct LsraOut {
+    std::vector<LsraPiece> pieces;   /* sorted by (start, slot) */
+    int cuts = 0;            /* extra pieces made by event cutting */
+    int evictions = 0;       /* pressure splits (the second chance) */
+};
+bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
+                     const std::vector<LiveInterval> &iv,
+                     const std::vector<IntervalQual> &q,
+                     const std::vector<MemEvent> &mem,
+                     int K, LsraOut &out);
 #ifdef TESTS
 /* Test-only export of the (static) pick - the D3 qualification check
  * asserts per-interval facts against the pick's public answer. */

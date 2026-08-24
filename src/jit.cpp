@@ -11401,6 +11401,164 @@ jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
 }
 #endif
 
+/*
+ * D3.b step 2b-i - THE LINEAR SCAN (analysis only; contract in jit.h).
+ * Steps: (1) cut every interval at its slot's event pcs, admitting a
+ * piece only when its interval is float-free and jit_next_use proves a
+ * use inside it; (2) walk pieces by start with expire-and-free; (3) at
+ * pressure evict the active piece with the furthest next use at the
+ * contested pc, truncating it there (its remainder is the memory half
+ * of the split). Deterministic throughout: free registers are taken
+ * lowest-index-first, eviction ties break toward the smaller slot.
+ */
+bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
+                     const std::vector<LiveInterval> &iv,
+                     const std::vector<IntervalQual> &q,
+                     const std::vector<MemEvent> &mem,
+                     int K, LsraOut &out)
+{
+    out = LsraOut();
+    if (begin >= end || iv.size() != q.size() || K < 0)
+        return false;
+    const int nslots = ck.slot_count + ck.n_temps;
+
+    /* next-use distances, the admission + eviction input (a HEURISTIC
+     * - see its codegen.h note; a wrong eviction costs a reload) */
+    std::vector<int> dist;
+    jit_next_use(ck, begin, end, 0, nslots, dist);
+    const size_t span = end - begin;
+    const auto nu = [&](size_t pc, int slot) -> int {
+        if (pc < begin || pc >= end || slot < 0 || slot >= nslots)
+            return JIT_NO_NEXT_USE;
+        return dist[(pc - begin) * static_cast<size_t>(nslots) + slot];
+    };
+    (void)span;
+
+    /* (1) CUT. Events are per (pc, slot); every kind forces the GP
+     * side (badi is int-side-only, which IS this side). */
+    std::vector<char> used(mem.size(), 0);
+    for (size_t k = 0; k < iv.size(); k++) {
+        const LiveInterval &l = iv[k];
+        std::vector<uint32_t> pcs;
+        for (size_t e = 0; e < mem.size(); e++)
+            if (mem[e].slot == l.slot && mem[e].pc >= l.start
+                    && mem[e].pc < l.end) {
+                pcs.push_back(mem[e].pc);
+                used[e] = 1;
+            }
+        std::sort(pcs.begin(), pcs.end());
+        pcs.erase(std::unique(pcs.begin(), pcs.end()), pcs.end());
+        const bool fl = q[k].uses_float > 0 || q[k].wrote_float;
+        const auto piece = [&](uint32_t s, uint32_t e2, bool forced) {
+            if (s >= e2)
+                return;
+            /* admit only a float-free piece with a USE inside - a
+             * stretch nothing reads gains nothing from a register */
+            const bool cand = !forced && !fl
+                    && nu(s, l.slot) < static_cast<int>(e2 - s);
+            out.pieces.push_back({ static_cast<int>(k), l.slot, s, e2,
+                                   -1, forced || fl || !cand });
+        };
+        uint32_t cur = l.start;
+        for (const uint32_t p : pcs) {
+            piece(cur, p, false);
+            piece(p, p + 1, true);       /* the event pc itself */
+            cur = p + 1;
+        }
+        piece(cur, l.end, false);
+        out.cuts += static_cast<int>(pcs.size());
+    }
+    for (size_t e = 0; e < mem.size(); e++)
+        if (!used[e])
+            return false;                /* an event outside every
+                                          * interval - inconsistent
+                                          * inputs, refuse the plan */
+
+    std::sort(out.pieces.begin(), out.pieces.end(),
+              [](const LsraPiece &a, const LsraPiece &b) {
+                  return a.start != b.start ? a.start < b.start
+                                            : a.slot < b.slot;
+              });
+
+    /* (2)+(3) THE WALK. `active` holds indices of register-resident
+     * pieces; `free_regs` is a lowest-first pool of abstract indices. */
+    std::vector<size_t> active;
+    std::vector<char> reg_free(static_cast<size_t>(K), 1);
+    const auto take_lowest = [&]() -> int {
+        for (int r = 0; r < K; r++)
+            if (reg_free[r]) { reg_free[r] = 0; return r; }
+        return -1;
+    };
+    /* split remainders are APPENDED during the walk; they are memory
+     * by decision (v1: no re-queue - the second-chance re-entry is a
+     * recorded quality follow-up), so the walk covers only the
+     * original pieces, in start order. NOTE any reference into
+     * out.pieces dies at a push_back - index after appending. */
+    const size_t n_walk = out.pieces.size();
+    for (size_t i = 0; i < n_walk; i++) {
+        LsraPiece &p = out.pieces[i];
+        /* expire everything that ended at or before this start */
+        for (size_t a = 0; a < active.size(); ) {
+            if (out.pieces[active[a]].end <= p.start) {
+                reg_free[out.pieces[active[a]].reg] = 1;
+                active[a] = active.back();
+                active.pop_back();
+            } else {
+                a++;
+            }
+        }
+        if (p.forced_mem)
+            continue;
+        const int r = take_lowest();
+        if (r >= 0) {
+            p.reg = r;
+            active.push_back(i);
+            continue;
+        }
+        /* pressure: the furthest next use at the contested pc loses.
+         * The newcomer competes too - if ITS next use is furthest, it
+         * is the one that stays in memory. */
+        int far_i = -1, far_nu = nu(p.start, p.slot);
+        for (size_t a = 0; a < active.size(); a++) {
+            const LsraPiece &c = out.pieces[active[a]];
+            const int d = nu(p.start, c.slot);
+            if (d > far_nu || (d == far_nu && far_i >= 0
+                    && c.slot < out.pieces[active[far_i]].slot)) {
+                far_nu = d;
+                far_i = static_cast<int>(a);
+            }
+        }
+        if (far_i < 0)
+            continue;                    /* the newcomer stays memory */
+        /* split the loser at this pc: it KEEPS its register up to
+         * here; the remainder is a fresh memory piece */
+        const size_t li = active[far_i];
+        const int freed = out.pieces[li].reg;
+        const uint32_t here = p.start;
+        if (out.pieces[li].start < here) {
+            LsraPiece rest = out.pieces[li];
+            rest.start = here;
+            rest.reg = -1;
+            out.pieces[li].end = here;
+            out.pieces.push_back(rest);  /* invalidates p and every
+                                          * reference - only indices
+                                          * below this line */
+        } else {
+            out.pieces[li].reg = -1;     /* never really held it here */
+        }
+        active[far_i] = i;
+        out.pieces[i].reg = freed;
+        out.evictions++;
+    }
+    std::sort(out.pieces.begin(), out.pieces.end(),
+              [](const LsraPiece &a, const LsraPiece &b) {
+                  return a.start != b.start ? a.start < b.start
+                                            : a.slot < b.slot;
+              });
+    return true;
+}
+
+
 
 /* Approach-A slow-path helper: release the slot's CURRENT value (whatever
  * reference it holds) and store a scalar float. Called from native ONLY on
