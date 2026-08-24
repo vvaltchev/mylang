@@ -692,9 +692,34 @@ IDENTICAL to lever-off) and re-landed with property H watching it
 by name. Ledger: +0.20..0.45% across the spot set - compile-side
 analysis cost only. OPEN: the evict-furthest policy has no
 working watched case (three formulations failed; temps dominate
-K=1 dynamics) - a temp-aware pin is a follow-up. NEXT (2b-iii-d
-remainder): second chance, C2b regions into trans mode, float
-twin, the D0 full-suite RULE-B1 ledger + wall A/B, the flip gate.]
+K=1 dynamics) - a temp-aware pin is a follow-up.
+
+FULL-SUITE LEVER SWEEP (2026-08-23, same-binary Ir, scale 1, all
+87): the tail names three REAL per-iteration regressions (scale
+split confirms loop-side, not compile): ⛔ 69_exc_crossframe
++4.13%/iter, ⛔ 34_sort_custom_cmp +3.88%/iter, ⛔ 44_primes_sqrt
++3.21%/iter; then 73_multi_unpack +1.81%, 86/87 elem compounds
++1.15% (scale-unsplit), everything else < 1%. Three fresh
+diagnoses, each via the 43/81 toolkit (loop-body -vdj diff +
+LSRADBG plan dump; evidence before theory - twice now the first
+theory was wrong). The shapes hint: 69 = exception-heavy (the
+raise path's cache interplay?), 34 = callback loop (brackets/
+transitions around VmInvoker?), 44 = sqrt loop (float/MathFnV
+interplay with GP pieces?) - but DIAGNOSE FIRST.
+
+SECOND CHANCE: analyzed and NOT BUILT, on reach grounds (the
+whole-span rescue provably never fires - a span denied at arrival
+stays blocked; the partial-rescue split has real complexity and
+~zero reach on every known ledger shape: nothing frees mid-span
+at these pressures). Re-open only when a ledger bench demands it.
+
+NEXT (2b-iii-d, prioritized by the sweep): diagnose 69 -> 34 ->
+44; then C2b regions into trans mode (⛔ fresh-window job: the
+cold-copy emission reads e.cache at STREAM-END state, so a
+region copy after any transition is emitted against the wrong
+map - the merge needs per-region state replay, and whether
+TODAY's ShareSeams already have this hazard must be checked
+first); the float twin; the wall A/B + flip gate.]
 
 ⛔ MAINTAINER DIRECTION (2026-08-23): #96 was PAUSED for the #99
 DETOUR; #99 closed same day. Task #102 created for the
