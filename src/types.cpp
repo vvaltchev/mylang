@@ -36,6 +36,7 @@ static inline ArgLocs build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n
 
 #include <cmath>
 #include <limits>
+#include "lowmem.h"
 
 static const std::array<SharedStr, Type::t_count> TypeNames =
 {
@@ -180,25 +181,36 @@ EvalValue builtin_kindstr_v(EvalContext *, const ArgLocs *el, const EvalValue *a
     return TypeNames[args[0].get_type()->t];
 }
 
+/*
+ * #96: the singletons are placed in the LOW-ADDRESS ARENA when one is
+ * available (see lowmem.h), so the JIT can write a type tag with a
+ * sign-extended `imm32` instead of keeping it in a pinned register.
+ * `ml_lowmem_new` falls back to plain `new` wherever the arena is not -
+ * Darwin, Windows, a non-x86-64 host, or simply a failed MAP_32BIT -
+ * and nothing but the JIT's choice of ENCODING depends on which
+ * happened. Identity is unchanged: these are the same one-per-kind
+ * objects, still never destroyed.
+ */
 const std::array<Type *, Type::t_count> AllTypes =
 {
     /* Trivial types */
-    new TypeNone(),
-    new Type(Type::t_lval),       /* internal type: not visible from outside */
-    new Type(Type::t_undefid),    /* internal type: not visible from outside */
-    new TypeInt(),
-    new TypeBuiltin(),
-    new TypeFloat(),
-    new TypeBool(),
-    new TypeStructType(),
+    ml_lowmem_new<TypeNone>(),
+    /* internal types: not visible from outside */
+    ml_lowmem_new<Type>(Type::t_lval),
+    ml_lowmem_new<Type>(Type::t_undefid),
+    ml_lowmem_new<TypeInt>(),
+    ml_lowmem_new<TypeBuiltin>(),
+    ml_lowmem_new<TypeFloat>(),
+    ml_lowmem_new<TypeBool>(),
+    ml_lowmem_new<TypeStructType>(),
 
     /* Non-trivial types */
-    new TypeStr(),
-    new TypeFunc(),
-    new TypeArr(),
-    new TypeException(),
-    new TypeDict(),
-    new TypeStruct(),
+    ml_lowmem_new<TypeStr>(),
+    ml_lowmem_new<TypeFunc>(),
+    ml_lowmem_new<TypeArr>(),
+    ml_lowmem_new<TypeException>(),
+    ml_lowmem_new<TypeDict>(),
+    ml_lowmem_new<TypeStruct>(),
 };
 
 

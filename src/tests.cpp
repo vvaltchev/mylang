@@ -28,6 +28,7 @@
 #include "backtrace.h"
 #include "errfmt.h"
 #include "statictype.h"
+#include "lowmem.h"
 #include "inferencer.h"
 #include "repl.h"
 #include "lineedit.h"
@@ -24660,6 +24661,47 @@ static bool jit_fwd_family_coverage()
 #endif
 }
 
+/*
+ * #96: the LOW-ADDRESS ARENA actually placed the Type singletons.
+ *
+ * The arena exists so the JIT can write a type tag with a sign-extended
+ * `imm32` instead of keeping the pointer in a pinned register - which
+ * is only possible if every Type singleton really landed below 2^31.
+ * That is invisible in any program's output, so nothing else here would
+ * notice the arena silently failing and every tag quietly reverting to
+ * the register form.
+ *
+ * The assertion is CONDITIONAL on the arena being available, and that
+ * distinction is why `ml_lowmem_available()` exists: where there is no
+ * MAP_32BIT (Darwin, Windows, non-x86-64) the fallback is CORRECT, so
+ * demanding low pointers would fail a working build. Where the arena
+ * DID map, EVERY singleton must be in it - a partial placement would
+ * mean one tag encodes as imm32 and another cannot, which is exactly
+ * the drift worth catching.
+ */
+static bool jit_lowmem_singletons()
+{
+    if (!ml_lowmem_available()) {
+#if ML_LOWMEM_SUPPORTED
+        /* Not a failure - MAP_32BIT can legitimately lose (low 2GB
+         * exhausted, hardened kernel). Say so rather than pass in
+         * silence, so a machine where this NEVER works is visible. */
+        cout << "  lowmem: arena unavailable at runtime - the register "
+                "fallback is in use (not a failure)\n";
+#endif
+        return true;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < AllTypes.size(); i++) {
+        if (ml_lowmem_fits_imm32(AllTypes[i]))
+            continue;
+        cout << "  lowmem: AllTypes[" << i << "] is at a HIGH address - "
+                "it missed the arena, so its tag cannot encode as imm32\n";
+        ok = false;
+    }
+    return ok;
+}
+
 static bool jit_xcache_pins()
 {
 #if ML_JIT_SUPPORTED
@@ -31956,6 +31998,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the all-slot LIVE RANGES agree with the temps-only analysis "
       "they generalise, and clear its 64-temp cliff (#96)",
       jit_slot_liveness_check },
+    { "jit: the low-address arena placed every Type singleton below "
+      "2^31, so a type tag can encode as imm32 (#96)",
+      jit_lowmem_singletons },
     { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "
       "call-free fragment, declines around a MyLang call (#96)",
       jit_xcache_pins },
