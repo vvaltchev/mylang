@@ -393,6 +393,36 @@ already paid the move, and the hot two-store path preserves RAX free.
 **When you add a helper the emitter calls, make its argument registers
 PARAMETERS and say what it clobbers.**
 
+**⛔ A FIFTH AUDIT-TABLE SHAPE: AN `&&` OVER A FAMILY IS A TABLE THAT
+DOES NOT LOOK LIKE ONE (#96, 2026-08-16).** The four traps above are all
+`switch` statements, so "go re-read the audited tables" never pointed at
+this one. The JIT emitter holds THREE vectors describing what currently
+lives in a register — `cache` (N5 int pins), `fcache` (C2a float pins)
+and `tflush` (C3 type-elided slots) — and FOUR sites enumerated that
+family by hand:
+
+    flush_cache()   three loops, one per vector                    OK
+    exit_pc()       cache.empty() && fcache.empty() && tflush.empty()  OK
+    the brk guard   !cache.empty() || !fcache.empty() || !tflush...    OK
+    the barrier's CLEAR   cache.clear(); fcache.clear();           ⛔ 2 of 3
+
+C3 added `tflush` and updated the first three. The fourth — two
+`.clear()` calls that were supposed to mean "empty EVERYTHING" — was
+missed, so a barrier'd exit answered "something is still cached", took
+the FLUSHING epilogue, and that epilogue writes the whole RESTORED cache:
+pre-call register values over the slots the helper had just written,
+which is the exact clobber the clear exists to prevent.
+
+**A boolean chain and a run of `.clear()` calls are the same enumeration
+in different clothes.** When you add a member to a family, grep for every
+site that mentions ALL the existing members together. FIXED
+STRUCTURALLY: `snapshot_cache()` / `restore_cache()` /
+`clear_cache_state()` / `cache_live()` are adjacent in `Emitter`, are the
+only places the family is listed, and `clear_cache_state()` ML_CHECKs
+itself against `cache_live()` — so dropping a vector from one and not the
+other aborts BY NAME (watched: reintroducing exactly the original miss
+fails `-rt` instantly).
+
 **⛔ AN ORACLE THAT SHARES ITS SUBJECT IS NOT AN ORACLE (#96,
 2026-08-16).** #96 widened lever A's temps-only liveness into an
 all-slot one (`jit_slot_liveness`) by making BOTH wrappers over one
