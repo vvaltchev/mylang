@@ -21138,7 +21138,7 @@ retry_emission:
                     && jit_qualify_intervals(chunk, begin, end, liv, lq,
                                              nullptr, &lev, &liu,
                                              &lfev)
-                    && !jit_lever_off(JL_CACHE)) {
+                    && hregs.empty() && !jit_lever_off(JL_CACHE)) {
                 lsra_facts = true;       /* F4a: liv/lq are valid */
                 LsraOut tp;
                 std::vector<int> entry;
@@ -21369,7 +21369,7 @@ retry_emission:
                  * ENTRY-OCCUPANT list in abstract-reg order (the
                  * physical zip below maps areg r to the r'th ftake);
                  * on any decline the F4a facts fhot above stands. */
-                {
+                if (hregs.empty()) {
                     LsraOut fp;
                     std::vector<int> fentry;
                     std::vector<LsraTrans> ftr;
