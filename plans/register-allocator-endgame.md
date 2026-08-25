@@ -870,7 +870,31 @@ change (drop hregs.empty() from both tmode gates, the exact edit
 from step 2/3's diag builds, which passed the full lever-on
 corpus + battery when combined with these fixes) plus the
 standing battery re-run.
-THEN: the re-lift; the wall A/B + flip gate.
+⛔ THE RE-LIFT LANDED AND WAS REVERTED THE SAME DAY (2026-08-25,
+f1fe9b0 -> fa52e97) - THE WALL A/B CAUGHT WHAT THE PRE-LIFT IR
+SWEEP COULD NOT: 43_sieve +44% wall / +47.4% Ir-per-iteration
+lever-on with the gates lifted (the F5 sweep ran pre-lift, when
+region chunks still took the fallback; the battery's rt/corpus
+are value-blind to allocation quality). The mechanism: tmode's
+SUCCESS preempts arm 2, so the facts-based whole-run fallback -
+BUILT for 43's idle-prefix counters (+37% lesson) - never runs;
+tmode's plan on 43's mem-cut shape serves ~6 residents where the
+fallback's pin+home economy serves far more. The defect class:
+NOTHING COMPARES THE TWO PLANS. Next increment: a COST GATE -
+adopt tmode only when its served weight (residents + homes) >=
+the facts fallback's; else decline to arm 2. All three defect
+fixes and all the machinery STAY (only the two gate lines
+reverted); 43 re-verified at lever-on parity post-revert.
+THE WALL A/B RAN (RULE B1 observed: rm -rf build, fresh perf
+lane, an env wrapper for the lever side, header checked; 28
+excluded - its python-cache recompute times out, the standing
+infra item): geomean cur/base 1.001x over 87; wins 85_regs_ref
+0.70x, 82 0.81x, 46 0.83x, 18 0.84x, 06 0.92x; the one over-band
+loss (43 1.44x) was the lifted config's and is reverted. A clean
+wall A/B of the SHIPPING (gates-closed) lever config is still
+owed.
+THEN: the tmode-vs-fallback cost gate -> re-lift; the clean wall
+A/B; the flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
