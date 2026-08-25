@@ -13544,6 +13544,15 @@ static ElemRead elem_read_plan(Emitter &e, uint8_t idx_reg)
 {
     ElemRead r;
     r.idx = idx_reg;
+    /* the obj role is rax-FIXED (the flat tails' contract: the
+     * element lands in RAX), and it never went through pick() - so a
+     * PINNED rax was written raw. The B2c rule the pick()
+     * exhaustion arm already applies belongs here too: a pinned rax
+     * is a conflicting event - evict, re-emit with it denied. Found
+     * by the lever-on xrot matrix at rotation 4 (a rax pin spanning
+     * LoadElem2Int; REGTRACK named it at e.load(r.obj, base.type)). */
+    if (e.reg_holds_pin(r.obj))
+        e.reg_pin_conflict(r.obj);
     uint32_t taken = (1u << r.obj) | (1u << r.idx);
     auto pick = [&](uint8_t preferred) -> uint8_t {
         if (!(taken & (1u << preferred)) && elem_reg_usable(e, preferred)) {

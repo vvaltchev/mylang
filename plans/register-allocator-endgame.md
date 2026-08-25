@@ -858,7 +858,19 @@ XROT MATRIX (pre-existing, so the gates stay closed on it alone):
    The fix arc: the elem2 raw-rax sites join the ask-and-evict
    protocol (the Phase-A generic arm), then re-lift the gates
    (they now fail ONLY on this).
-THEN: the elem2 rax asks + re-lift; the wall A/B + flip gate.
+STEP 4, 2026-08-25 - THE ELEM2 RAX ASK LANDED: elem_read_plan's
+obj role is rax-FIXED (the flat tails' contract) and never went
+through pick(), so a pinned rax was written raw; the B2c rule now
+applies at entry (reg_pin_conflict -> evict + re-emit with rax
+denied; gdb pinned it at e.load(r.obj, base.type), jit.cpp:14200).
+Verified: the xrot=4 repro prints correct values; the lever-on
+xrot matrix is GREEN on all rotations; rt both configs green.
+ALL THREE BLOCKERS ARE NOW FIXED - the RE-LIFT is a two-line
+change (drop hregs.empty() from both tmode gates, the exact edit
+from step 2/3's diag builds, which passed the full lever-on
+corpus + battery when combined with these fixes) plus the
+standing battery re-run.
+THEN: the re-lift; the wall A/B + flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
