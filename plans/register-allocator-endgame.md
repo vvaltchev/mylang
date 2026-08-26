@@ -893,8 +893,19 @@ infra item): geomean cur/base 1.001x over 87; wins 85_regs_ref
 loss (43 1.44x) was the lifted config's and is reverted. A clean
 wall A/B of the SHIPPING (gates-closed) lever config is still
 owed.
-THEN: the tmode-vs-fallback cost gate -> re-lift; the clean wall
-A/B; the flip gate.
+THE COST GATE, FIRST CRITERION REFUTED 2026-08-25: the
+served-weight comparison (residents+homes vs the facts rule's top
+slots) landed - inert while the gates are closed - and a
+lifted-gate measurement shows it does NOT decline on 43 (still
++47.4% Ir/iter): 43's inner counters are MEM-CUT, so BOTH sides
+exclude them and the weights compare equal. The served-weight
+theory of the 43 regression is WRONG. ⛔ NEXT DIAGNOSTIC, before
+any new criterion: -vdj diff 43's hot loop between the lifted
+tmode emission and the fallback emission - the mechanism is
+something tmode emits (per-pc flushes in the loop? the homes-set
+difference? textra filtering?) that no weight ledger sees.
+THEN: the 43 emission diff -> the real gate criterion -> re-lift;
+the clean wall A/B; the flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
