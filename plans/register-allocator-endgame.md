@@ -926,7 +926,29 @@ read the HOT chunk's pieces (the run whose entry loads name
 i/n/j/count/k). Once the rescue reaches them, re-measure 43, then
 re-lift; the inert cost gate can then likely be DELETED (its
 premise was wrong).
-THEN: the rescue reach fix -> re-lift; the clean wall A/B; the
+2026-08-25, THE RESCUE THEORY DIES AND THE REAL MECHANISM IS
+NAILED: the full piece list shows the scan DOES serve j and k
+(pieces [10,21) areg 4 and [22,28) areg 1, installs mid-run; my
+"3 pins" read only the entry loads), the binding drops nothing
+(probed), and function-level callgrind puts the whole +59.5M
+INSIDE the emitted code (123.4M -> 182.9M; every C++ helper
+byte-identical). MYLANG_JITSTATS names it in one line:
+⛔ two_addr_reg 2,201,542 (fallback) -> 79,496 (tmode) - the
+two-address in-place op on a PINNED dst (the 1-instruction form
+vs the staged read/op/write through rax) stops engaging, which
+is the hot loops' per-iteration tax. Its gate is
+`dreg = e.reg_at(in.target) >= 0` at EMIT time (jit.cpp ~15127).
+NEXT: instrument WHICH pcs lose reg_at under tmode on 43's hot
+chunk (print in.target + pc + reg_at when the two_addr gate
+fails but slot_wint says hot) - candidates: the counter ops sit
+at pcs OUTSIDE their slots' resident pieces (piece bounds vs the
+ops' actual pcs - check [10,21) against the ops using j at
+14-18... those ARE inside; so likely ANOTHER chunk or the
+i/count slots), or reg_at consults a state the per-pc installs
+do not maintain at those pcs. Repro identical to before (lift
+gates locally, LSRA_WHY-style print at the two_addr gate).
+Curious side signal: elem_reserve 6 -> 3, xcache 1 -> 0.
+THEN: the two_addr reach fix -> re-lift; the clean wall A/B; the
 flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
