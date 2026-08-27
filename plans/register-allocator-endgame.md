@@ -948,8 +948,27 @@ i/count slots), or reg_at consults a state the per-pc installs
 do not maintain at those pcs. Repro identical to before (lift
 gates locally, LSRA_WHY-style print at the two_addr gate).
 Curious side signal: elem_reserve 6 -> 3, xcache 1 -> 0.
-THEN: the two_addr reach fix -> re-lift; the clean wall A/B; the
-flip gate.
+2026-08-25 REFINEMENT - THE GATE IS NOT THE MECHANISM EITHER:
+instrumenting the two_addr emit gate under tmode shows ONE miss
+in the whole program (pc 0, slot 4), so the two-address form IS
+emitted at the hot pcs both ways - yet its bump EXECUTES 2.2M
+(fallback) vs 79K (tmode). Same emission, different RUNTIME
+PATH. ⛔ THE COLD-COPY HYPOTHESIS, fitting every observation:
+if the C1 guard FAILS per iteration under tmode, the hot loops
+run in the REGION COLD COPIES - still emitted native code
+(helpers stay identical, jit-region Ir rises, the main stream's
+loop bodies measure unchanged) - and the cold copies were
+emitted against the replayed state, plausibly without the pins
+(staged forms, no two_addr bumps). `hoist` is 170 in BOTH
+configs (preheaders run equally), but guard FAILURES are
+uncounted. NEXT, the one-command discriminator: a TESTS bump at
+each region cold-copy head (emitted identically in both
+configs), diff fb/tm on 43 - millions vs ~0 confirms; then ask
+WHY the guard fails under tmode (the preheader's r10/r11
+establishment vs the per-pc pins, or the replayed-state cold
+emission perturbing what the guard compares).
+THEN: the cold-copy discriminator -> the guard fix -> re-lift;
+the clean wall A/B; the flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
