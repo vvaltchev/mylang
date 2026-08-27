@@ -967,8 +967,26 @@ configs), diff fb/tm on 43 - millions vs ~0 confirms; then ask
 WHY the guard fails under tmode (the preheader's r10/r11
 establishment vs the per-pc pins, or the replayed-state cold
 emission perturbing what the guard compares).
-THEN: the cold-copy discriminator -> the guard fix -> re-lift;
-the clean wall A/B; the flip gate.
+2026-08-25, THE DISCRIMINATOR RAN AND REFUTED THE COLD-COPY
+THEORY TOO: g_jit_cold_copy (the new per-verdict counter beside
+g_jit_hoist's per-preheader count - a permanent observability
+gain, landed) reads ZERO in both configs on 43. The guard never
+fails. State of the hunt, all evidence firm: emission
+near-identical (1 two_addr gate miss program-wide), helpers
+byte-identical, hoist entries equal, NO cold copies - yet the
+two_addr bump executes 2.2M vs 79K and the jit-region Ir is
++59.5M. The per-instr callgrind format is now decoded (cost
+lines are `pos line cost`, three fields; positions are relative
+to compressed ob=/fn= sections - the vdj join needs the ob=
+relocation handled). ⛔ NEXT PROBES, cheapest first: (1)
+MYLANG_JIT_MAXPINS sweep under tmode on 43 - if the Ir stays
+high at EVERY pin count, pins are not the mechanism at all; (2)
+finish the ob=-aware join and name the hot instructions
+directly; (3) the lever-off matrix (MYLANG_JIT_OFF per lever)
+under tmode vs fallback on 43 to isolate which lever's
+interaction burns.
+THEN: those probes -> the real fix -> re-lift; the clean wall
+A/B; the flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
