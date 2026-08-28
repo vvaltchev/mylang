@@ -9716,10 +9716,15 @@ static const size_t MAX_XCACHED =
  * 0, which is the only position that matters for this test.
  */
 /* D3.b 2b-ii: the lsra lever (contract in jit.h) - env-seeded,
- * test-settable, DEFAULT OFF. */
+ * test-settable. ⛔ DEFAULT ON since 2026-08-26 (maintainer's flip
+ * decision, made on the completed two-axis ledger: Ir zero
+ * per-iteration regressions corpus-wide, wall geomean 0.997x).
+ * MYLANG_JIT_LSRA=0 is the debugging OPT-OUT - the pick still
+ * exists and serves it, so a suspected allocator bug has a
+ * same-binary A/B one env var away. */
 bool g_jit_lsra = []() -> bool {
     const char *s = getenv("MYLANG_JIT_LSRA");
-    return s && *s == '1';
+    return !(s && *s == '0');
 }();
 
 unsigned g_jit_xrot = []() -> unsigned {

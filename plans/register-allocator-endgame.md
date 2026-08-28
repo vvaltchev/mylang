@@ -1031,7 +1031,16 @@ SUITE-WIDE, the arc's first sub-1.0 full-suite verdict. Wins:
 iteration both configs (59: 24,000,000 = 24,000,000; 52: 27,000
 = 27,000) - single-run wall noise on sub-100ms benches, per the
 documented small-bench divergence.
-WHAT REMAINS IS THE FLIP GATE - THE MAINTAINER'S CALL, with the
+⛔ D4 EXECUTED 2026-08-26 - THE MAINTAINER FLIPPED THE DEFAULT
+("flip the lever on by default, by somehow leave the lever
+togglable (opt-out) in case we need that for debugging"):
+g_jit_lsra defaults true; MYLANG_JIT_LSRA=0 is the opt-out
+restoring the pick end to end. Battery: -rt + corpus in BOTH
+directions, the xrot matrix on the new default, both arenas in
+both directions, rel-t TESTS=1 OPT=1 both directions, census -
+all green. Default emission changes by design; byte-identity
+retires as the default oracle.
+THE FLIP GATE WAS - THE MAINTAINER'S CALL, with the
 ledger now complete on both axes: Ir (zero per-iteration
 regressions corpus-wide; wins 06 -16.8%, 81 -2.7%, 82 -1.6%, 83
 -1.0%, 68 -0.5%, 46 -5.5% post-lift, 43 at exact parity) and
