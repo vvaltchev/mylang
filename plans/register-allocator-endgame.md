@@ -997,8 +997,29 @@ print required dreg < 0, so a ferrying/forwarding arm engaging
 under tmode at the hot ops was INVISIBLE to the instrumentation
 - print the fa-taken case next). A MAXPINS sweep (1..N) under
 tmode would show where the hurt starts.
-THEN: the fa-visibility print + the MAXPINS sweep -> the real
-fix -> re-lift; the clean wall A/B; the flip gate.
+⛔ SOLVED AND RE-LIFTED 2026-08-25/26. The fa print (fa=0
+everywhere) narrowed the field to FIVE two_addr sites, ONE
+missing (pc 17, slot 4 = j, dreg=-1 in the MAIN stream while its
+COLD COPY printed dreg=10 = r10): the aphys binding gave j's areg
+r10 at BIND time (region not yet entered), the region's B3 claim
+took r10 at its entry, and the install's take_fixed failure was
+the seam arm's documented "skipping is safe" - sound for VALUES,
+silent abandonment of the promised piece: the hot op ran STAGED
+2.2M times, tmode's pins worse than none. THE FIX: a failed
+install DECLARES the conflict (pin_conflicts bit -> the pass
+re-emits with the register denied, the binding picks another).
+43 lever-on lifted: 42.5M Ir/iter = EXACT fallback parity
+(two_addr_reg back to 2,201,542; rax_retries 2 = the retry
+working). 46's win retained (-5.5%/iter). The REFUTED cost gate
+is DELETED (its premise was wrong; the real defect was reach,
+not economy). GATES LIFTED FOR REAL: -rt + corpus both configs,
+the lever-on xrot matrix, off-arena, census, default vdjcmp
+116/116 - all green. ⛔ A PROCESS NOTE that cost one wasted
+measurement: an edit verified green can be LOST by a later
+git-restore in the same probe session - the "no effect" run was
+of a binary WITHOUT the fix; grep the anchor before measuring.
+THEN: the clean wall A/B (the lifted config, all benches) ->
+the flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
