@@ -22,3 +22,4 @@ XMM0    0
 XMM1    0
 TOTAL   0
 RAWENC  15
+CONV 499  # 103: the convertible residue - only ever lower this

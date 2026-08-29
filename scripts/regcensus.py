@@ -289,7 +289,9 @@ def census(path):
         if m and m.group(1) in acc:
             decl_line[i] = m.group(1)
 
-    res = {MERGE.get(r, r): {'br': 0, 'un': 0, 'ju': 0, 'lines': []}
+    res = {MERGE.get(r, r): {'br': 0, 'un': 0, 'ju': 0,
+                             'ju_conv': 0, 'ju_isa': 0, 'ju_abi': 0,
+                             'lines': []}
            for r in REGS}
     res['__raw__'] = raw_encodings(lines)
     TAG = re.compile(r'reg:(\w+)(\(fn\))?')
@@ -376,6 +378,10 @@ def census(path):
                 res[r]['br'] += n
             elif tag is not None:
                 res[r]['ju'] += n
+                # #103: the per-tag split - `conv` is the CONVERTIBLE
+                # residue (a documented convention, not the ISA or an
+                # ABI), and the gate ratchets it downward
+                res[r]['ju_' + tag] += n
             else:
                 res[r]['un'] += n
                 res[r]['lines'].append(i + 1)
@@ -442,6 +448,13 @@ def main():
         tu += u
         print("%-6s %10d %10d %12d %7d" % (r, b, j, u, b + j + u))
     print("%-6s %10d %10d %12d %7d" % ("TOTAL", tb, tj, tu, tb + tj + tu))
+    tconv = sum(res[r]['ju_conv'] for r in REPORT)
+    tisa = sum(res[r]['ju_isa'] for r in REPORT)
+    tabi = sum(res[r]['ju_abi'] for r in REPORT)
+    print("\nof the justified: isa %d, abi %d, CONV %d - conv is the"
+          "\nCONVERTIBLE residue (#103): a documented convention, not"
+          "\nthe ISA or an ABI; the gate ratchets it downward."
+          % (tisa, tabi, tconv))
     print("\nbracketed = inside a call prologue/epilogue (the spill "
           "covers it);\njustified = tagged reg:isa / reg:abi / reg:conv "
           "on the line.\nUNJUSTIFIED is the work: it must reach ZERO "
@@ -451,9 +464,10 @@ def main():
     if '--gate' in sys.argv:
         here2 = os.path.dirname(os.path.abspath(__file__))
         floor = read_floor(os.path.join(here2, 'regcensus_floor.txt'))
-        for r in REPORT + ['TOTAL', 'RAWENC']:
+        for r in REPORT + ['TOTAL', 'RAWENC', 'CONV']:
             got = (tu if r == 'TOTAL'
                    else len(raw) if r == 'RAWENC'
+                   else tconv if r == 'CONV'
                    else res[r]['un'])
             want_ = floor.get(r)
             if want_ is None:
