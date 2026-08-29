@@ -1090,6 +1090,17 @@ green. ⛔ THE OTHER TWO v1 BOUNDS STAY, EACH WITH ITS WRITTEN REASON
    redesign for a shape the whole-run rescue and the homes tier
    already mostly serve (a slot heavy enough to want both is
    heavy enough to be rescued whole-run).
+#103 BATCH 3 - EVERY SITE READ, CONV = 3 (2026-08-25): the
+model-check's CL-shift assert and ElemScratch's count are the ISA
+itself (reg:isa; count's comment already said "idiv-fixed"); the
+allocated elem roles' default SEEDS (idx/val/obj - the plan
+overrides them), the ELEM_CAND pool definition, the R9 ctx-chain
+pairing preference and the switch tbl's ask+evict fallback are
+protocol. THE 3 USES THAT REMAIN are the genuine conversions,
+named by their own struct comments as "the next step": ElemRead's
+data/count and ElemScratch's data - making those roles allocatable
+is an emission-changing batch with its own Ir ledger, priced for
+the maintainer to fund.
 #103 THE 38-USE WORKLIST, READ SITE BY SITE (2026-08-25, batch
 2): 15 more uses promoted - every one turned out to be the
 ask-fallback bracket AGAIN (emit_op/emit_branch's hold() asks

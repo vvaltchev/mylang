@@ -22,7 +22,16 @@ XMM0    0
 XMM1    0
 TOTAL   0
 RAWENC  15
-CONV 23   # 103: the convertible residue - only ever lower this.
+CONV 3    # 103: the convertible residue - only ever lower this.
+# 2026-08-25 batch 3, every remaining site READ: the model-check's
+# CL assert + ElemScratch count are the ISA (retagged reg:isa);
+# the allocated elem roles' default seeds, the ELEM_CAND pool
+# definition, the R9 ctx-chain pairing and the switch tbl's
+# ask+evict fallback are protocol (reg:proto). The 3 uses LEFT
+# are the real conversions, named by their own comments as 'the
+# next step': ElemRead's data/count and ElemScratch's data -
+# making those roles allocatable is an emission-changing batch
+# with its own Ir ledger, not a retag.
 # 2026-08-25 batch 2: 15 more uses read site-by-site and promoted -
 # every one was the ask-fallback bracket again (emit_op/emit_branch
 # tmp: hold() ASKS alloc_scratch first, RCX is its refusal path;
