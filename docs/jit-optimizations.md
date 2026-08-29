@@ -8842,3 +8842,41 @@ phase-1 pins' idle gaps so a register is actually free to receive
 it) beats both allocators on this shape - each phase would pay ONE
 memory slot where the pick pays two + four. That is the
 second-chance revival, recorded in the plan as the (b) follow-up.
+
+## Lifetime holes (#103b, 2026-08-25)
+
+The scan splits a candidate piece at a use GAP that contains a
+FULL loop (a back-edge with target and source both inside the
+gap): the register is released across the hole and someone else's
+hot region can live there. Gaps are found at the piece HEAD
+(post-cut pieces often start at a call boundary with the first
+use a loop away), between uses, and at the TAIL (a pure trim).
+Hole boundaries are placed on LIN POINTS by the assign itself
+(jit_run_edges + jit_lin_point) - the snap's extend-or-demote
+slide is bounded by the same slot's neighbouring piece, i.e. the
+hole, so a boundary the snap cannot accept in place would DEMOTE,
+not slide. The full-loop rule doubles as the churn guard: a gap
+inside one iteration contains no complete loop, so a hot body
+never gains a per-iteration seam. A split side keeps candidacy
+only with >= 2 events inside.
+
+ON 89 IT DELIVERS THE PHASED IDEAL - each phase serves four of
+its five floats (f1/f7 the single losers), fj holds a register in
+its loop - and the honest ledger is: Ir FLAT (every memory ref
+became a one-instruction reg move), DATA READS -40% (60.4M ->
+36.4M at scale 3), wall NEUTRAL vs density-only once fmov_rr's
+false dependency was fixed (the movaps commit - found BECAUSE the
+hole plans turned loads into reg-reg moves and the merge
+serialized the body: drefs -40% yet wall 1.43x WORSE was the
+smoking pair). Corpus Ir: 86 of 88 byte-identical,
+17_array_concat -0.42%, 75_indexed_unpack -0.90%, zero
+regressions.
+
+PINNED by the `lifetime hole frees the loop` jit_lsra_check case
+(K=1, two sequential loops, b's piece starting at a call boundary
+with its first use a full loop away - only a HEAD hole can serve
+loop 2); watched failing with the pass disabled ("b resident 0
+pcs"). Building the case found a real oracle subtlety: the first
+shape produced an exact density TIE (cu/cs 3/3 vs 4/4) and the
+tie rule kept the active - the MYLANG_LSRADBG2 contest probe in
+jit_lsra_assign is what surfaced it, and it stays.
