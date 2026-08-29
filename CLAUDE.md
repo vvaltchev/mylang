@@ -3362,6 +3362,29 @@ correct, unoptimized; pinned by a `repl:` test). This closed the last
 CPython-losing bench (76_funcval_dispatch 1.05-1.12x → **0.68x**; its
 callee bodies 6 boxed ops → 4 typed).
 
+**⛔ A DEAD BASE TEMPLATE IS DECIDED FROM THE TREE, AND A BAKED CONST
+VALUE IS NOT IN THE TREE (2026-08-25).** `is_template_base` excludes a
+template NEVER used as a value from codegen - every call to it was
+redirected to an instance, so the base never runs. "Used as a value" was
+read off `TypeSym::value_used`, i.e. off IDENTIFIERS the inferencer can
+see - and the parser's const-fold gets there FIRST: `const OPS = [sq];`
+becomes ONE `LiteralObj` carrying the array, FuncObject and all, so by
+inference time nothing NAMES `sq`. The base was dropped, and
+`var dyn f = OPS[runtime(0)]; f(7);` reached a chunk-less body: an
+ML_CHECK abort under ASSERTS, a walk of the FREED AST without them,
+while `-tw` (which never tears the tree down) printed the right answer -
+a RULE 2 divergence on top of the RULE 1 one. **The #149 closure now
+also walks BAKED VALUES** (`keep_in_value`, inferencer.cpp): const
+arrays, dicts, struct instances, a struct's folded `const` MEMBERS, and
+nesting - a flat array is skipped, since it cannot hold a function and
+`get_view()` would PROMOTE it. The generalisation: **when a pass asks
+"is this thing referenced?", const-eval may have turned the reference
+into a VALUE** - the same shape as the `abs` shadowing bug and the
+brace-less-body scope bug, all three being "the parse-time evaluator
+knows something the later passes cannot see". Pinned by
+`tests/functional/const_pool_func.my` (watched failing: the tree-walker
+printed `49 50 60 42 81`, the VM aborted).
+
 
 
 A **named** function with ≥1 *template param* — un-annotated, non-`dyn`,

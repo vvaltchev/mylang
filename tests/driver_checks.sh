@@ -216,7 +216,8 @@ cat > "$TMP/pool.my" <<'PROG'
 pure func sq(x) => x * x;
 const OPS = [sq];
 var dyn ops = runtime(OPS);
-print(len(ops), array_storage(ops));
+var dyn f = ops[runtime(0)];
+print(len(ops), array_storage(ops), f(7));
 PROG
 src_out=$("$BIN" "$TMP/pool.my" 2>&1)
 src_rc=$?
@@ -232,6 +233,29 @@ if "$BIN" -c "$TMP/pool.my" -o "$TMP/pool.myv" >/dev/null 2>&1; then
     fi
 else
     fail "myv: -c refused a program with a function value in a pool"
+fi
+
+# ... and a function in a STRUCT's const member is REFUSED at -c time,
+# loudly, instead of producing an image nobody can read. The struct table
+# (section 7) is parsed BEFORE the descriptor table, so a descriptor index
+# written there resolves against an empty one: `-c` used to exit 0 and the
+# image then died as "corrupt .myv (descriptor)" - a file that is nothing
+# of the kind. The real fix is to move those consts after section 8; until
+# then the format doc and the writer agree that it is not storable, which
+# is the rule an image is never silently lossy.
+cat > "$TMP/sconst.my" <<'PROG'
+pure func sq(x) => x * x;
+struct Ops { const F = sq; }
+var dyn f = runtime(Ops.F);
+print(f(7));
+PROG
+out=$("$BIN" -c "$TMP/sconst.my" -o "$TMP/sconst.myv" 2>&1)
+got_rc=$?
+if [ "$got_rc" != 0 ] && \
+   printf '%s' "$out" | grep -q "struct's const member"; then
+    pass "myv: a function in a struct const is refused at compile time"
+else
+    fail "myv: struct-const function (rc=$got_rc) [$out]"
 fi
 
 # #96: the hardcoded-register RATCHET (scripts/regcensus.py header has

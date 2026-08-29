@@ -1335,28 +1335,124 @@ void Inferencer::infer_one(Block *rootBlock)
      */
     std::map<const FuncInfo *, TypeSym *> tmpls;
     std::map<const UniqueId *, TypeSym *> tmpl_by_uid;
+    std::map<const FuncDescriptor *, TypeSym *> tmpl_by_desc;
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
         if (s->func && s->func->is_template && s->func->decl) {
             tmpls.emplace(s->func, s);
             tmpl_by_uid.emplace(s->name, s);
+            tmpl_by_desc.emplace(s->func->decl->desc, s);
         }
     }
     std::set<const FuncInfo *> kept_bases;
     {
         std::vector<TypeSym *> work;
-        for (auto &kv : tmpls)
-            if (kv.second->value_used && kept_bases.insert(kv.first).second)
-                work.push_back(kv.second);
+        auto keep = [&](TypeSym *t) {
+            if (kept_bases.insert(t->func).second)
+                work.push_back(t);
+        };
+
+        /*
+         * A BAKED CONST VALUE is the third way a base can be reachable, and
+         * the only one with no Identifier left to see: `const OPS = [sq];`
+         * is const-folded BY THE PARSER into one LiteralObj holding the
+         * array, FuncObject and all, so by the time this pass runs nothing
+         * in the tree NAMES sq and `value_used` is false. The base was then
+         * excluded from codegen, and `var dyn f = OPS[runtime(0)]; f(7)`
+         * reached a chunk-less body: ML_CHECK abort under ASSERTS, a walk
+         * of the freed AST without them - while `-tw`, which never tears
+         * the tree down, printed the right answer (a RULE 2 divergence on
+         * top of the RULE 1 one). Const arrays, dicts, struct instances and
+         * a struct's folded `const` MEMBERS can all carry one, so the value
+         * is walked, not pattern-matched. A flat array (ints/floats/bools/
+         * strs/POD structs) cannot hold a function by construction, and
+         * get_view() on one would PROMOTE it - so those kinds are skipped,
+         * not viewed.
+         */
+        std::function<void(const EvalValue &)> keep_in_value =
+            [&](const EvalValue &v) {
+            switch (v.get_type()->t) {
+
+            case Type::t_func: {
+                auto it = tmpl_by_desc.find(
+                    v.get_ref<intrusive_ptr<FuncObject>>()->func);
+                if (it != tmpl_by_desc.end())
+                    keep(it->second);
+                break;
+            }
+
+            case Type::t_arr: {
+                const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+                if (arr.skind() != SharedArrayObj::Storage::general)
+                    break;
+                ArrayConstView view = arr.get_view();
+                for (size_type i = 0; i < view.size(); i++)
+                    keep_in_value(view[i].get());
+                break;
+            }
+
+            case Type::t_dict:
+                for (const auto &kv :
+                         v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
+                    keep_in_value(kv.first);
+                    keep_in_value(kv.second.get());
+                }
+                break;
+
+            case Type::t_struct: {
+                const StructObject &so =
+                    *v.get_ref<intrusive_ptr<StructObject>>();
+                for (const LValue &f : so.fields)   /* POD holds no func */
+                    keep_in_value(f.get());
+                break;
+            }
+
+            case Type::t_structtype:
+                for (const auto &c : v.get<StructTypeDef *>()->consts)
+                    keep_in_value(c.second);
+                break;
+
+            default:
+                break;
+            }
+        };
+
+        /* The baked values live anywhere a statement does - including
+         * inside a function body, which for_each_child does not enter. */
+        std::function<void(Construct *)> scan_baked = [&](Construct *n) {
+            if (!n)
+                return;
+            if (ctag(n) == ConstructType::lit_obj) {
+                keep_in_value(static_cast<LiteralObj *>(n)->literal_value());
+                return;
+            }
+            if (ctag(n) == ConstructType::struct_decl) {
+                auto *sd = static_cast<StructDeclStmt *>(n);
+                if (sd->def)
+                    for (const auto &c : sd->def->consts)
+                        keep_in_value(c.second);
+                return;
+            }
+            if (ctag(n) == ConstructType::func_decl) {
+                scan_baked(static_cast<FuncDeclStmt *>(n)->body.get());
+                return;
+            }
+            for_each_child(n, [&](Construct *c) { scan_baked(c); });
+        };
+
         std::function<void(Construct *)> scan = [&](Construct *n) {
             if (!n)
                 return;
             if (ctag(n) == ConstructType::id) {
                 auto *id = static_cast<Identifier *>(n);
                 auto it = tmpl_by_uid.find(id->uid);
-                if (it != tmpl_by_uid.end()
-                        && kept_bases.insert(it->second->func).second)
-                    work.push_back(it->second);
+                if (it != tmpl_by_uid.end())
+                    keep(it->second);
+                return;
+            }
+            if (ctag(n) == ConstructType::lit_obj
+                    || ctag(n) == ConstructType::struct_decl) {
+                scan_baked(n);   /* a baked value inside a kept base's body */
                 return;
             }
             if (ctag(n) == ConstructType::func_decl) {
@@ -1367,6 +1463,14 @@ void Inferencer::infer_one(Block *rootBlock)
             }
             for_each_child(n, [&](Construct *c) { scan(c); });
         };
+
+        for (auto &kv : tmpls)
+            if (kv.second->value_used)
+                keep(kv.second);
+
+        for (auto &e : rootBlock->elems)
+            scan_baked(e.get());
+
         while (!work.empty()) {
             TypeSym *t = work.back();
             work.pop_back();
