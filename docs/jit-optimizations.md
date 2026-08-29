@@ -5684,3 +5684,88 @@ measurement, not by the site count being small - and, given that
 finding, the honest next step for this task is the *scratch allocator*
 (which is what unlocks RAX/RCX/RDX, the only registers numerous enough
 to matter), not another opportunistic pool addition.
+
+## The native disassembler was WRONG, and its callers hid it (2026-08-17)
+
+`-vdj` is the evidence for every claim in this file - which tier fired,
+whether a refactor changed anything, why a guard is where it is. It was
+measured against the corpus for the first time on 2026-08-17 and could
+not decode **5543 bytes**. Nothing said so; the dump simply printed
+confident, well-formed, wrong mnemonics.
+
+**Six opcodes were missing from `decode_one`**, all emitted by jit.cpp
+today: `03`/`2B` (add/sub r64, r/m64 - only the r/m <- reg direction was
+decoded, so the M5b record-push address arithmetic decoded as nothing),
+`3D` (cmp rax, imm32, the accumulator short form that #96 step 3 made
+common - 168 sites), `63` (movsxd), `6B` (imul r64, r/m64, imm8 - the
+imm32 twin was there, but 0x30 is the stride the assembler picks), and
+`88`/`8A` (the flat `array<bool>` byte store).
+
+**And the SIB arm was wrong in three ways**, the first of which
+desynchronised the whole fragment: it returned WITHOUT consuming the
+displacement, although a SIB byte does not replace disp8/disp32 - mod
+still selects one. So `mov rdi, [rsp+8]` printed as
+`mov rdi, [rsp+rsp*8]`, left `08` behind as a stray `.byte`, and every
+instruction after it was decoded at the wrong offset. It also hardcoded
+scale `*8` and printed `rsp*8` for index==4, which MEANS NO INDEX.
+
+Fixed: **5543 -> 0** undecoded bytes, corpus-wide.
+
+### The determinism half, and why masking was the wrong answer
+
+Baked addresses move with every process under ASLR, so `-vdj` was not
+reproducible - a binary's dump differed from ITSELF. They now print as
+`<int-tag>` / `<float-tag>` / `<array-tag>` / `<addr>` / `<helper>`:
+the operand SHAPE, which is all a reader or a differ needs, with the
+digits behind `MYLANG_VDJ_ADDRS=1`.
+
+The previous answer was a sed pipeline plus `setarch -R` inside
+`scripts/vdjcmp.sh`, and it failed exactly the way workarounds do:
+
+ - **it rotted silently.** The masks were hex-only; #96 step 3 made
+   Type tags `imm32`, which the disassembler printed in DECIMAL. From
+   that commit the script reported **0 identical / 108 differing** for
+   any pair of binaries. It was not an oracle, it was a constant
+   "everything changed" - and nobody noticed, because that is also what
+   a genuinely broken change looks like;
+ - **no regex could have sufficed.** A mis-decoded instruction emerges
+   as bare `.byte 0xe0` / `nop` lines with no maskable token, which is
+   why 31 of 108 programs differed from themselves;
+ - **it left the tool broken for its most important consumer** - a
+   human reading the dump.
+
+`vdjcmp.sh` is now a plain `cmp` with a self-test that refuses to report
+anything if one binary gives two different dumps.
+
+### The self-check, and three vacuous tests before it worked
+
+The fragment walker counts undecoded bytes AND **skipped op marks** - a
+mark is an offset the JIT recorded at a real instruction boundary, so
+stepping past one proves the decode drifted - and prints
+`⛔ DUMP IS UNRELIABLE: N undecoded byte(s), M skipped op mark(s)`.
+
+The `-rt` check `jit: -vdj decodes every emitted form, reproducibly`
+dumps 14 programs spanning the emitter's shape space and requires no
+`.byte`, no skipped mark, and two identical dumps. **It was vacuous
+three times before it caught anything**, and each failure is a distinct
+instance of the trap:
+
+ 1. its vacuity guard counted `enter.nat` - a BYTECODE op name the
+    listing prints whether or not machine code was emitted;
+ 2. **`-vdj` is `g_jit_annotate`, not a dump flag.** Without setting it
+    the dump has no native section at all, so the test was inspecting
+    text that could not contain the bug. The corrected guard (count
+    `---- native x86-64` blocks) surfaced this as "0 native blocks over
+    14 programs";
+ 3. its first 11 programs were all statically typed, and `cmp rax,
+    imm32` lives in a boxed TYPE CHECK - a float conversion chain and a
+    string concat were required. The test had been written from the
+    shapes the author had in mind, not the shapes the emitter produces.
+
+Watched failing: dropping `0x3D` from `decode_one` fails `-rt` naming
+three programs.
+
+**The rule this earns, and it generalises past the JIT: fix the TOOL,
+not the script that reads it.** A workaround in one consumer leaves the
+tool broken for every other consumer, and then rots the next time the
+tool's output changes shape.

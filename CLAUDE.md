@@ -557,13 +557,40 @@ return site must pick one**, and `empty` is the one that will fail
 loudly the day the allocator keeps a value in a register across a call.
 Do not "fix" that abort by switching to `flushed` - emit the flush.
 
-**⛔ COMPARING `-vdj` BETWEEN TWO BINARIES NEEDS NORMALISATION.** Baked
-helper addresses and rel32 call displacements differ between separate
-links under ASLR, so a raw compare says "everything changed". Mask them
-- and mask the CALL displacement FIRST: `40_math_builtins`' libm target
-is 5 or 6 hex digits depending on where the code page lands, so a
-width-based rule and a call-based rule race and the file appears to
-differ from ITSELF at random.
+**⛔ `-vdj` IS REPRODUCIBLE - AND THE FOUR YEARS OF WORKAROUNDS THAT
+SAY WHY YOU MUST FIX A TOOL, NOT ITS CALLERS (2026-08-17).** Comparing
+two binaries' emitted code is a plain `cmp` now
+(`scripts/vdjcmp.sh OLD NEW`): baked addresses print as
+`<int-tag>`/`<addr>`/`<helper>` - the operand SHAPE, which is all a
+reader or a differ needs - with the digits behind `MYLANG_VDJ_ADDRS=1`.
+
+This paragraph used to say the opposite ("comparing needs
+normalisation") and prescribed a sed pipeline, ordered just so, because
+a libm displacement is 5 or 6 hex digits depending on where the code
+page lands. Every word was true and the whole approach was wrong:
+
+ - **the masks rotted silently.** They were hex-only, and #96 step 3
+   moved the Type singletons into a low-address arena so a tag encodes
+   as an `imm32` - which the disassembler printed in DECIMAL. From that
+   day `vdjcmp.sh` reported **0 identical / 108 differing** for ANY
+   pair of binaries. It was not an oracle; it was a constant
+   "everything changed", and nobody noticed because that is also what a
+   broken change looks like;
+ - **no regex could ever have been enough.** A mis-decoded instruction
+   emerges as bare `.byte 0xe0` / `nop` lines with no maskable token,
+   and 31 of 108 programs differed from THEMSELVES that way;
+ - **the disassembler was ALSO just wrong**, which the masking hid:
+   5543 undecoded bytes corpus-wide, from six missing opcodes and a SIB
+   decoder that never consumed its displacement (so `mov rdi, [rsp+8]`
+   printed as `mov rdi, [rsp+rsp*8]` and desynchronised the fragment).
+
+**THE RULE: fix the TOOL, not the script that reads it.** A workaround
+in one consumer leaves the tool broken for every other consumer - and
+for you, reading the dump by eye, which is the consumer that matters
+most. `-vdj` now self-reports: a fragment it cannot fully decode prints
+`⛔ DUMP IS UNRELIABLE: N undecoded byte(s), M skipped op mark(s)`,
+and the `jit: -vdj decodes every emitted form, reproducibly` `-rt`
+check fails the day a new emitted instruction form appears.
 
 **⛔ BENCHMARKS ARE NOT FUNCTIONAL TESTS (maintainer-set, 2026-08-05).**
 `bench/` measures THROUGHPUT - millions of iterations - and must NEVER
@@ -940,7 +967,20 @@ Running scripts:
                                  # oracle (plans/bytecode-inliner.md)
 ./build/mylang -vdj FILE         # -vd + the native x86-64 disassembly of
                                  # each JIT fragment, interleaved under its
-                                 # `enter.nat` line with `; vm pc N` markers
+                                 # `enter.nat` line with `; vm pc N` markers.
+                                 # REPRODUCIBLE: a baked address prints as
+                                 # <int-tag>/<addr>/<helper>, so two runs
+                                 # and two separately-linked binaries give
+                                 # byte-identical output and `cmp` is the
+                                 # whole comparison (scripts/vdjcmp.sh).
+                                 # MYLANG_VDJ_ADDRS=1 shows the numbers
+                                 # when you need one specific pointer.
+                                 # It SELF-REPORTS: a fragment it cannot
+                                 # fully decode prints "DUMP IS UNRELIABLE"
+                                 # with the undecoded-byte and skipped-mark
+                                 # counts, instead of quietly printing
+                                 # confident wrong mnemonics (it did that
+                                 # for 5543 bytes until 2026-08-17)
 ./build/mylang -nti FILE         # disable static type inference / checking
 ./build/mylang -dti FILE   # dump every identifier's inferred type + uses
 ./build/mylang -a FILE           # analyze: source colored by optimization
