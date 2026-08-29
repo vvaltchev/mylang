@@ -7777,7 +7777,14 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
                                   const FuncDescriptor *my_desc,
                                   LValue *my_win)
 {
-    for (int guard = 0;; guard++) {
+    /* `guard` exists ONLY to feed the ML_CHECK below, which an
+     * ASSERTS=0 build compiles away - so there it is incremented and
+     * never read, and clang says so (-Wunused-but-set-variable). The
+     * attribute is the declaration that this is intended, rather than a
+     * pragma that would hide the next REAL one. Only a non-LTO build
+     * emits this warning at all, which is why the lto0 CI lane found
+     * it and four years of release builds did not. */
+    for ([[maybe_unused]] int guard = 0;; guard++) {
         ML_CHECK(guard <= 100000);
         const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
         const NorecSite *S = jit_norec_site_for(ra);
