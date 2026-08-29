@@ -53,7 +53,8 @@ void collect_slot_names(const Construct *c, std::vector<std::string> &names)
 {
     if (!c)
         return;
-    if (auto *id = dynamic_cast<const Identifier *>(c)) {
+    if (ctag(c) == ConstructType::id) {
+        auto *id = static_cast<const Identifier *>(c);
         if (id->sym.kind == SymKind::local && id->sym.slot >= 0) {
             if (static_cast<size_t>(id->sym.slot) >= names.size())
                 names.resize(id->sym.slot + 1);
@@ -74,37 +75,47 @@ void collect_slot_names(const Construct *c, std::vector<std::string> &names)
         for (auto &e : me->elems) rec(e.get());
         return;
     }
-    if (auto *e = dynamic_cast<const Expr14 *>(c)) {
+    if (ctag(c) == ConstructType::expr14) {
+        auto *e = static_cast<const Expr14 *>(c);
         rec(e->lvalue.get()); rec(e->rvalue.get()); return;
     }
-    if (auto *ce = dynamic_cast<const CallExpr *>(c)) {
+    if (ctag(c) == ConstructType::call) {
+        auto *ce = static_cast<const CallExpr *>(c);
         rec(ce->what.get()); rec(ce->args.get()); return;
     }
-    if (auto *sub = dynamic_cast<const Subscript *>(c)) {
+    if (ctag(c) == ConstructType::subscript) {
+        auto *sub = static_cast<const Subscript *>(c);
         rec(sub->what.get()); rec(sub->index.get()); return;
     }
-    if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+    if (ctag(c) == ConstructType::member) {
+        auto *m = static_cast<const MemberExpr *>(c);
         rec(m->what.get()); return;
     }
-    if (auto *iff = dynamic_cast<const IfStmt *>(c)) {
+    if (ctag(c) == ConstructType::if_stmt) {
+        auto *iff = static_cast<const IfStmt *>(c);
         rec(iff->condExpr.get()); rec(iff->thenBlock.get());
         rec(iff->elseBlock.get()); return;
     }
-    if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
+    if (ctag(c) == ConstructType::while_stmt) {
+        auto *w = static_cast<const WhileStmt *>(c);
         rec(w->condExpr.get()); rec(w->body.get()); return;
     }
-    if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+    if (ctag(c) == ConstructType::for_stmt) {
+        auto *f = static_cast<const ForStmt *>(c);
         rec(f->init.get()); rec(f->cond.get());
         rec(f->inc.get()); rec(f->body.get()); return;
     }
-    if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
+    if (ctag(c) == ConstructType::for_range) {
+        auto *fr = static_cast<const ForRangeStmt *>(c);
         rec(fr->init.get()); rec(fr->bound.get());
         rec(fr->step.get()); rec(fr->body.get()); return;
     }
-    if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+    if (ctag(c) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<const ForeachStmt *>(c);
         rec(fe->container.get()); rec(fe->body.get()); return;
     }
-    if (auto *te = dynamic_cast<const TernaryExpr *>(c)) {
+    if (ctag(c) == ConstructType::ternary) {
+        auto *te = static_cast<const TernaryExpr *>(c);
         rec(te->condExpr.get()); rec(te->thenExpr.get());
         rec(te->elseExpr.get()); return;
     }
@@ -128,7 +139,8 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
         return true;
     if (auto *id = dynamic_cast<const Identifier *>(c))
         return !(id->sym.kind == SymKind::local && id->sym.slot == loop_slot);
-    if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+    if (ctag(c) == ConstructType::member) {
+        auto *m = static_cast<const MemberExpr *>(c);
         auto *bid = dynamic_cast<const Identifier *>(m->what.get());
         if (bid && bid->sym.kind == SymKind::local
             && bid->sym.slot == loop_slot) {
@@ -160,7 +172,8 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
                 return false;
         return true;
     }
-    if (auto *ts = dynamic_cast<const TypedScalarExpr *>(c)) {
+    if (ctag(c) == ConstructType::typed_scalar) {
+        auto *ts = static_cast<const TypedScalarExpr *>(c);
         for (const auto &pr : ts->elems)
             if (!struct_fe_body_ok(pr.second.get(), loop_slot, def, false))
                 return false;
@@ -306,9 +319,9 @@ Operand slot_op(int slot)
 bool is_typed_scalar_arg(const Construct *a)
 {
     return a->th == TypeHint::i || a->th == TypeHint::f
-        || dynamic_cast<const LiteralInt *>(a)
-        || dynamic_cast<const LiteralFloat *>(a)
-        || dynamic_cast<const LiteralBool *>(a);
+        || ctag(a) == ConstructType::lit_int
+        || ctag(a) == ConstructType::lit_float
+        || ctag(a) == ConstructType::lit_bool;
 }
 
 /* A field arg for POD field `fd` that `coerce_struct_field` provably cannot
@@ -488,7 +501,7 @@ bool as_float_operand(const Construct *e, Operand &out)
  */
 bool definitely_int(const Construct *e)
 {
-    if (dynamic_cast<const LiteralInt *>(e))
+    if (ctag(e) == ConstructType::lit_int)
         return true;
     const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
     return t && t->kind == TypeHint::i
@@ -551,7 +564,7 @@ bool boxed_literal(const Construct *e, EvalValue &out)
         out = ls->strval();
         return true;
     }
-    if (dynamic_cast<const LiteralNone *>(e)) {
+    if (ctag(e) == ConstructType::lit_none) {
         out = EvalValue();   /* none */
         return true;
     }
@@ -1814,17 +1827,17 @@ struct Codegen {
             return true;
         }
 
-        if (dynamic_cast<const Expr03 *>(e) || dynamic_cast<const Expr04 *>(e)
-            || dynamic_cast<const Expr05 *>(e)
-            || dynamic_cast<const Expr08 *>(e)
-            || dynamic_cast<const Expr09 *>(e)
-            || dynamic_cast<const Expr10 *>(e))
+        if (ctag(e) == ConstructType::expr03 || ctag(e) == ConstructType::expr04
+            || ctag(e) == ConstructType::expr05
+            || ctag(e) == ConstructType::expr08
+            || ctag(e) == ConstructType::expr09
+            || ctag(e) == ConstructType::expr10)
             k = 'a';
-        else if (dynamic_cast<const Expr06 *>(e)
-                 || dynamic_cast<const Expr07 *>(e))
+        else if (ctag(e) == ConstructType::expr06
+                 || ctag(e) == ConstructType::expr07)
             k = 'c';
-        else if (dynamic_cast<const Expr11 *>(e)
-                 || dynamic_cast<const Expr12 *>(e))
+        else if (ctag(e) == ConstructType::expr11
+                 || ctag(e) == ConstructType::expr12)
             k = 'l';
         else
             return false;
@@ -1986,15 +1999,18 @@ struct Codegen {
     bool boxed_operand(const Construct *e, Operand &out,
                        std::vector<CgInstr> &ops)
     {
-        if (auto *li = dynamic_cast<const LiteralInt *>(e)) {
+        if (ctag(e) == ConstructType::lit_int) {
+            auto *li = static_cast<const LiteralInt *>(e);
             out = int_lit(li->ival());
             return true;
         }
-        if (auto *lf = dynamic_cast<const LiteralFloat *>(e)) {
+        if (ctag(e) == ConstructType::lit_float) {
+            auto *lf = static_cast<const LiteralFloat *>(e);
             out = float_lit(lf->fval());
             return true;
         }
-        if (auto *lb = dynamic_cast<const LiteralBool *>(e)) {
+        if (ctag(e) == ConstructType::lit_bool) {
+            auto *lb = static_cast<const LiteralBool *>(e);
             out = bool_lit(lb->bval());
             return true;
         }
@@ -3361,7 +3377,8 @@ struct Codegen {
          * args to lower; a nested base / non-lowerable arg declines (the
          * statement falls back whole). */
         if (!dc->lvalue_rest_native && !a0->is_id()) {
-            if (auto *sub = dynamic_cast<const Subscript *>(a0)) {
+            if (ctag(a0) == ConstructType::subscript) {
+                auto *sub = static_cast<const Subscript *>(a0);
                 const Construct *base = sub->what.get();
                 int bkind = -1;
                 if (base->is_id())
@@ -3414,7 +3431,8 @@ struct Codegen {
          * member / POD field / non-slotted base falls through (a POD field has no
          * LValue; the runtime check throws the tree-walker's exact error). */
         if (!a0->is_id()) {
-            if (auto *m = dynamic_cast<const MemberExpr *>(a0)) {
+            if (ctag(a0) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(a0);
                 const Construct *base = m->what.get();
                 int bkind = -1;
                 if (m->base_struct && base->is_id())
@@ -3471,8 +3489,8 @@ struct Codegen {
             const Identifier *cid =
                 dynamic_cast<const Identifier *>(dc->what.get());
             if (cid && builtin_requires_lvalue_arg0(cid->get_str())
-                && !dynamic_cast<const Subscript *>(a0)
-                && !dynamic_cast<const MemberExpr *>(a0)) {
+                && ctag(a0) != ConstructType::subscript
+                && ctag(a0) != ConstructType::member) {
                 const size_t om = ops.size();
                 const size_t cm = chunk.consts.size();
                 const int st = next_temp;
@@ -4282,7 +4300,7 @@ struct Codegen {
          * It is kept so the leaf cannot start second-guessing a Direct*
          * path that deliberately declined if the hook ever moves - which
          * is exactly the mistake the placement note below records. */
-        if (!dynamic_cast<const CallExpr *>(e)
+        if (ctag(e) != ConstructType::call
                 || dynamic_cast<const DirectCallExpr *>(e)
                 || dynamic_cast<const DirectBuiltinCallExpr *>(e))
             return false;
@@ -4546,10 +4564,10 @@ struct Codegen {
         std::vector<const Construct *> chain;   /* outermost-first */
         const Construct *cur = e->lvalue.get();
         for (;;) {
-            if (dynamic_cast<const MemberExpr *>(cur)) {
+            if (ctag(cur) == ConstructType::member) {
                 chain.push_back(cur);
                 cur = static_cast<const MemberExpr *>(cur)->what.get();
-            } else if (dynamic_cast<const Subscript *>(cur)) {
+            } else if (ctag(cur) == ConstructType::subscript) {
                 chain.push_back(cur);
                 cur = static_cast<const Subscript *>(cur)->what.get();
             } else {
@@ -4559,7 +4577,7 @@ struct Codegen {
         const int nsteps = static_cast<int>(chain.size());
         int nmember = 0;
         for (const Construct *c : chain)
-            if (dynamic_cast<const MemberExpr *>(c))
+            if (ctag(c) == ConstructType::member)
                 nmember++;
         /* A single-SUBSCRIPT step is StoreElemValue's job (the universal
          * store, incl. a dyn base); a single MEMBER step reaches here only
@@ -4611,7 +4629,8 @@ struct Codegen {
         bool ok = true;
         for (int i = 0; i < nsteps && ok; i++) {
             const Construct *c = chain[nsteps - 1 - i];
-            if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+            if (ctag(c) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(c);
                 steps.push_back({true, add_member_key(m), c->start, c->end});
             } else {
                 const Subscript *sub = static_cast<const Subscript *>(c);
@@ -4668,12 +4687,13 @@ struct Codegen {
         std::vector<const Construct *> chain;   /* outermost-first */
         const Construct *root = inc->lvalue.get();
         for (;;) {
-            if (auto *m = dynamic_cast<const MemberExpr *>(root)) {
+            if (ctag(root) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(root);
                 if (m->optional)
                     return false;   /* d?.f++ is compile-rejected anyway */
                 chain.push_back(root);
                 root = m->what.get();
-            } else if (dynamic_cast<const Subscript *>(root)) {
+            } else if (ctag(root) == ConstructType::subscript) {
                 chain.push_back(root);
                 root = static_cast<const Subscript *>(root)->what.get();
             } else {
@@ -4708,7 +4728,8 @@ struct Codegen {
         const size_t nsteps = chain.size();
         for (size_t i = 0; i < nsteps; i++) {
             const Construct *cn = chain[nsteps - 1 - i];
-            if (auto *m = dynamic_cast<const MemberExpr *>(cn)) {
+            if (ctag(cn) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(cn);
                 steps.push_back({true, add_member_key(m), cn->start, cn->end});
             } else {
                 const Subscript *sub = static_cast<const Subscript *>(cn);
@@ -4728,7 +4749,8 @@ struct Codegen {
         const Construct *fin = chain[0];        /* outermost == final step */
         site.tier2 = inc->th == TypeHint::i || inc->th == TypeHint::f;
         site.is_prefix = inc->is_prefix;
-        if (auto *fsub = dynamic_cast<const Subscript *>(fin)) {
+        if (ctag(fin) == ConstructType::subscript) {
+            auto *fsub = static_cast<const Subscript *>(fin);
             site.allow_flat = construct_no_side_effects(fsub->what.get());
             site.kstart = fsub->index->start;
             site.kend = fsub->index->end;
@@ -5963,7 +5985,7 @@ struct Codegen {
              * its handler + runs its finally first (Inc 2c step 3); crossing
              * nested trys (emit_break_cont returns false) fails the body so the
              * region tree-walks. */
-            if (dynamic_cast<const BreakStmt *>(s)) {
+            if (ctag(s) == ConstructType::brk) {
                 if (loops.empty() || !emit_break_cont(/*is_break=*/true)) {
                     code.resize(start);
                     return false;
@@ -5971,7 +5993,7 @@ struct Codegen {
                 any_native = true;
                 continue;
             }
-            if (dynamic_cast<const ContinueStmt *>(s)) {
+            if (ctag(s) == ConstructType::cont) {
                 if (loops.empty() || !emit_break_cont(/*is_break=*/false)) {
                     code.resize(start);
                     return false;
@@ -6235,9 +6257,9 @@ struct Codegen {
     {
         if (!c)
             return false;
-        if (dynamic_cast<const RethrowStmt *>(c))
+        if (ctag(c) == ConstructType::rethrow)
             return true;
-        if (dynamic_cast<const FuncDeclStmt *>(c))
+        if (ctag(c) == ConstructType::func_decl)
             return false;                     /* another frame's regions */
         bool found = false;
         for_each_child_of(const_cast<Construct *>(c), [&](Construct *ch) {

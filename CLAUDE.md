@@ -6089,8 +6089,15 @@ no `default`, so `-Werror=switch` fails the build until the new kind is
 classified in each — and the `Construct` ctor ML_CHECKs the tag is not
 `other`, so an unstamped class aborts `-rt` on its first construction.
 This replaced the walkers' dynamic_cast chains, which were ~86% of
-compile Ir (139.7M -> 56.4M on 83's compile, -60%; the residual is the
-per-node dynamic_cast ladders inside the passes, tracked in #102).
+compile Ir, and increment 2 then converted the per-node LADDERS inside
+the passes the same way - `ctag(e) == ConstructType::x` is exactly
+`dynamic_cast<X *>(e) != nullptr` for a leaf class (ctag is null-safe:
+null -> `other`, which no real node carries), so ~400 guarded arms in
+inferencer/resolver/codegen became tag tests via a scripted transform
+restricted to leaf classes and double-eval-safe operands. Casts to a
+BASE (SingleChild/MultiOp/MultiElem/Literal) or to a CallExpr SUBCLASS
+(Direct/Cached/DirectBuiltin - they share the `call` tag) stay
+dynamic_cast. Total: 139.7M -> 23.8M on 83's compile, -83%.
 
 ## Conventions
 
