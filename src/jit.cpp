@@ -1266,6 +1266,40 @@ struct Emitter {
         return false;
     }
 
+    /*
+     * ⛔ "I AM ABOUT TO USE <reg> AS RAW SCRATCH." Declare it, at the
+     * top of the emitter that does it, and this ML_CHECKs that no PIN
+     * lives there - because a raw-scratch write destroys the pin with
+     * nothing to restore it.
+     *
+     * This exists because r9 was added to the pin pool on the argument
+     * that it was "safe by the same gates as r10/r11", shipped a wrong
+     * answer for a day, and NOTHING in the tree could say otherwise:
+     * the only check was jit_assert_no_volatile_pin, which asks "is any
+     * caller-saved register pinned" at exactly TWO call sites, and the
+     * ~80 element/capture emitters that use r9 were not among them.
+     *
+     * The contract is per REGISTER and stated where it is used, so a
+     * future pool addition is answered by an abort that NAMES the
+     * emitter instead of by an argument from analogy. It is free in a
+     * release (ML_CHECK compiles away under NDEBUG) and it costs one
+     * line per emitter.
+     *
+     * NOT called between emit_call_prologue and emit_call_epilogue: a
+     * pin is legitimately SPILLED there (and stays in `cache`, since
+     * the epilogue reloads it), so SysV argument setup may write any
+     * caller-saved register freely. That is the (a)/(b)/(c) split the
+     * register census draws - see scripts/regcensus.py.
+     */
+    void scratch(uint8_t r) const
+    {
+        ML_CHECK_MSG(!reg_holds_pin(r),
+                     "a raw-scratch emitter is about to clobber a "
+                     "PINNED register - it must be excluded from the "
+                     "pin pool for this run (see XCACHE_ORDER)");
+    }
+    void scratch2(uint8_t a, uint8_t b) const { scratch(a); scratch(b); }
+
     std::vector<uint8_t> saved;
 
     /* Total pushes at entry, including rbp, the base and any 8-byte pad.
@@ -2912,6 +2946,7 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off,
  * slot): jump NEAR to the helper when it is a REFERENCE. Clobbers rcx. */
 static size_t emit_ref_check_jae_r9(Emitter &e, int32_t type_off)
 {
+    e.scratch(9);            /* the value is read at [r9 + off] */
     const JitLayout &L = jit_layout();
     e.load_r9b(RCX, type_off);
     e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
@@ -2946,6 +2981,7 @@ emit_store_src_gate(Emitter &e, int32_t type_off)
  * (cap=false). Clobbers rax (and rdx for the global chain). */
 static void emit_ctx_chain_r9(Emitter &e, bool cap)
 {
+    e.scratch(9);            /* the ctx chain walks through r9 */
     const JitLayout &L = jit_layout();
     e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
     e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] (the ctx) */
@@ -8278,6 +8314,7 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
 /* Load a SLOT's int payload into r9, cache-aware. */
 static void load_slot_r9(Emitter &e, int slot)
 {
+    e.scratch(9);
     const int cr = e.creg(slot);
     if (cr >= 0)
         e.mov_rr(9 /* r9 */, static_cast<uint8_t>(cr));
@@ -8287,6 +8324,7 @@ static void load_slot_r9(Emitter &e, int slot)
 
 static void load_index_r9(Emitter &e, const Instr &in)
 {
+    e.scratch(9);
     if (in.a_is_lit()) {
         e.movabs_r9(static_cast<uint64_t>(in.a_lit()));
         return;
@@ -8307,6 +8345,7 @@ static void load_index_r9(Emitter &e, const Instr &in)
 static void emit_elem_bounds_or_wrap(Emitter &e, uint32_t pc,
                                     std::vector<size_t> *slows = nullptr)
 {
+    e.scratch(9);            /* the index lives in r9 */
     if (slows) {
         /* #56: DECLINE out-of-range (a negative wrap or a genuine OOB) to
          * the caller's slow tier - the interpreter core does the wrap and
@@ -8371,6 +8410,7 @@ static void emit_flat_int_tail(Emitter &e, uint32_t pc, bool bools,
 static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc,
                                std::vector<size_t> *slows = nullptr)
 {
+    e.scratch(9);
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(in.target2);
     /* C1d: the hoisted form - the region preheader proved the base and
@@ -8426,6 +8466,7 @@ static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc,
 static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc,
                                 std::vector<size_t> *slows = nullptr)
 {
+    e.scratch(9);
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(base_slot);
     const auto decline = [&](uint8_t pass_short, uint8_t fail_near) {
@@ -8482,6 +8523,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                                    std::vector<size_t> &dones,
                                    bool is_float)
 {
+    e.scratch2(9, RDI);      /* index in r9; the value in rdi/dil */
     /*
      * #95 case 1 - COMPOUND stores `a[i] OP= v` inline too, as a
      * read-modify-write on the element. The op set is the interpreter
@@ -8897,6 +8939,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
                                    std::vector<size_t> &dones,
                                    bool is_float)
 {
+    e.scratch(9);            /* both level indices pass through r9 */
     const JitLayout &L = jit_layout();
     const SlotAddr base = slot_addr(in.target2);
     const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
@@ -9120,6 +9163,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
                                     std::vector<size_t> &slows,
                                     std::vector<size_t> &dones)
 {
+    e.scratch2(9, RDI);      /* index in r9; the value in rdi/dil */
     /* the Expr14 op -> the base op (Op::invalid == plain assign) */
     Op bop;
     switch (in.aop) {
