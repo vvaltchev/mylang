@@ -5343,6 +5343,14 @@ restore; exit 1 means the check PASSED, i.e. the test is blind).
 
 ## #96 - r9 joins the pool (6 -> 7), and the measurement that redirected it
 
+> ⛔⛔ **THE r9 HALF OF THIS ENTRY WAS WRONG AND WAS REVERTED ON
+> 2026-08-17. r9 was NEVER safe as a pin, and it shipped a WRONG ANSWER
+> for a day.** The measurement below (sharing has zero reach) stands;
+> the conclusion "so widen the pool, and r9 is the cheap one" did not.
+> Read *#96 - r9 was never safe* at the end of this file before touching
+> `XCACHE_ORDER`.
+
+
 **The ceiling was measured BEFORE any allocator code was written**, as
 plans/jit-registers.md requires, via a new env-gated audit
 `MYLANG_REGAUDIT=1` in `pick_cached_slots`. Over bench/my + samples +
@@ -5551,3 +5559,128 @@ build - `-Werror=clobbered` on `ok` in `jit_str_probe_verify`. Not a
 spurious warning but real UB, and `-Wclobbered` is invisible to an LTO
 build, which is why nothing had ever seen it. There is an `lto0` CI lane
 now; see the non-LTO note in CLAUDE.md.)
+
+## #96 - r9 was NEVER safe as a pin (a shipping wrong answer, 2026-08-17)
+
+`939f5a9` put r9 in the caller-saved pin pool. It was a **wrong answer
+in the default shipping configuration for one day**, and it is the most
+instructive failure of this arc, so the causes are worth more than the
+fix.
+
+**The fix is one line**: `XCACHE_ORDER` is `{ 10, 11, 8 }`. r8 stays -
+re-audited properly this time, its raw-scratch use really is confined to
+`emit_sync_push_native` / `emit_sync_call_inline` (blocked by
+`jit_run_blocks_xcache`) and `emit_ret_native` (whose first act is
+`flush_cache()`).
+
+**The repro**, twelve lines, no lever, no flag:
+
+```
+var cap = 3;
+var f = func[cap](int n) {
+    var s0 = 0; var s1 = 0; var s2 = 0; var s3 = 0;
+    var s4 = 0; var s5 = 0; var s6 = 0; var s7 = 0;
+    for (var i = 0; i < n; i++) {
+        s0 += i; s1 += i * 2; s2 += i * 3; s3 += i * 4;
+        s4 += i * 5; s5 += i * 6; s6 += i * 7;
+        s7 += cap;
+    }
+    return s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7;
+};
+print(f(64));
+```
+
+`-tw` and `-nj` print **56640**. The JIT printed **88854283473440**
+(OPT=0) and **97861752749472** (OPT=1 ASSERTS=0). The entry emits
+`mov r9, s5`; `emit_ctx_chain_r9` then walks the ctx through r9.
+
+The claim that admitted it - "r9 is used in exactly TWO local scopes and
+both are already safe by the SAME gates r10/r11 rely on" - was false. r9
+is raw scratch in the capture ops and in **every element tier**
+(`emit_elem_int_read`, `emit_elem_bounds_or_wrap`, `emit_elem_base_gate`,
+`emit_store_elem_inline`, `emit_load_elem2_inline`,
+`emit_store_elem2_inline`, `ForStepElemInt`), ~80 sites.
+
+### Why nothing caught it, and the three nets that now do
+
+**1. The census was blind to its own subject.** `scripts/regcensus.py`
+was written two commits earlier *specifically* to count this, and
+reported **14** sites for r9. The truth is **87**. The misses are
+`movabs_r9`, `cmp_r9_rdx`, `lea_rdi`, `slots_to_arg0`,
+`store_elem_byte_dil` - the register is in the **method name**, so a
+scan for the operand cannot see it. That is the SIXTH audit-table shape
+already documented in CLAUDE.md, walked into by the tool built to avoid
+it. It now DERIVES the accessor set from the source (every `void name(`
+whose name, split on `_`, holds a register token), so a new fixed-pair
+wrapper is counted the day it is written. Corrected table:
+
+| reg | unbracketed | was |
+|-----|-------------|-----|
+| RAX | 392 | 254 |
+| RCX | 193 | 135 |
+| RDX | 142 |  76 |
+| R9  |  87 |  14 |
+| R8  |  45 |  42 |
+| RDI |  33 |  14 |
+| RSI |  23 |  23 |
+
+**2. A pool ordered by preference hides its own tail.** `take_reg` scans
+in preference order, so r9 - 4th of 4 - was handed out only to a run's
+SEVENTH pin. `-rt`, all four differentials, `corpus_diff` and every
+fuzzer hammered the first three and reached r9 essentially never. A
+bigger corpus does not fix that; the allocator's own preference is the
+hole. **`MYLANG_JIT_XROT=N` rotates the pool** so member N is first;
+`corpus_diff.sh --xrot` runs the matrix, and `jit_xcache_pins` sweeps
+every rotation in-process. Making r9 first fails `-rt` in seconds -
+which is exactly how this was found.
+
+**3. "Safe by the same gates as X" is not an argument.** A register
+joins only with its own sites enumerated against the gates. That is now
+mechanical: **`Emitter::scratch(reg)`**, called at the top of each
+raw-scratch emitter, ML_CHECKs that no pin lives there and aborts naming
+the emitter. Ten sites. It is not called inside an
+`emit_call_prologue`/`epilogue` bracket, where a pin is legitimately
+spilled - which is precisely the (a)/(b)/(c) split the census draws.
+
+### And the oracle for all of this had quietly stopped working
+
+`scripts/vdjcmp.sh` - "the oracle for a pure restructuring" - reported
+**0 identical / 108 differing** for any two separately-linked binaries,
+and **77/31 for a binary against ITSELF**. Two independent holes, both
+opened by earlier work in this same arc:
+
+- **#96 step 3** moved the Type singletons into a low-address arena so a
+  tag encodes as an `imm32` - and the disassembler prints an imm32 in
+  **decimal** (`mov r2.type, 1095139376`). Every masking rule was
+  hex-only.
+- an address the disassembler **mis-decodes** emerges as individual
+  `.byte 0xe0` / `nop` lines, with no maskable token at all. No regex
+  reaches that; the script now runs both binaries under **`setarch -R`**,
+  which removes the nondeterminism instead of hiding it.
+
+It **self-tests** now (the same binary twice must be 100% identical,
+else exit 2 before reporting anything). Without that it cannot tell
+"your change altered the code" from "the normalisation stopped covering
+something" - and it reported the second as the first for weeks.
+**A normaliser fails in the "everything differs" direction, which reads
+exactly like a catastrophic change**; a 0-identical result is a reason
+to read one diff, never a reason to believe the change broke everything.
+
+### What this means for the rest of #96
+
+The remaining pool candidates are **not** a matter of counting sites and
+picking the smallest. RDI's 33 unbracketed sites are (a) SysV setup
+inside a call bracket - already safe; (b) SysV setup in hand-rolled call
+sequences, already blocked because the run contains a call; and (c)
+genuine scratch, which for RDI is exactly **three opcodes**
+(`StoreElemInt`, `StoreElemFloat`, `StoreElem2V`, via
+`emit_store_elem_inline` / `emit_store_elem2_inline`). Only (c) needs
+work, and the shape of that work is a **per-opcode clobber mask**
+replacing the single all-or-nothing `jit_run_blocks_xcache` gate.
+
+But note what the r8 entry above already measured: **more registers do
+not pay here**. Any further pool widening must be justified by a
+measurement, not by the site count being small - and, given that
+finding, the honest next step for this task is the *scratch allocator*
+(which is what unlocks RAX/RCX/RDX, the only registers numerous enough
+to matter), not another opportunistic pool addition.
