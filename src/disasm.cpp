@@ -924,12 +924,23 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             static const char *j[16] = {"jo","jno","jb","jae","je","jne",
                 "jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg"};
             o << j[o2 - 0x80] << " +" << std::dec << (int32_t(p) + d); }
-        else if (o2 == 0x10) { modrm(regf, rm);
-            o << "movsd xmm" << (regf) << ", " << rm; }
-        else if (o2 == 0x11) { modrm(regf, rm);
-            o << "movsd " << rm << ", xmm" << regf; }
-        else if (o2 == 0x51) { modrm(regf, rm);   /* sqrtsd (N6a) */
-            o << "sqrtsd xmm" << regf << ", " << rm; }
+        else if (o2 == 0x10 || o2 == 0x11 || o2 == 0x51) {
+            /* reg-reg form: the rm REGISTER is an XMM, not a GP (the
+             * generic modrm would print `rsi` for xmm6 - found live on
+             * 89_regs_float_08's xmm-pinned fj; the 0x58 family below
+             * had the fix, these three arms did not) */
+            const bool reg_form = (c[p] & 0xC0) == 0xC0;
+            const int rm_xmm = c[p] & 7;
+            modrm(regf, rm);
+            const char *m = o2 == 0x51 ? "sqrtsd" : "movsd";
+            if (o2 == 0x11) {           /* store direction: rm first */
+                o << m << " ";
+                if (reg_form) o << "xmm" << rm_xmm; else o << rm;
+                o << ", xmm" << regf;
+            } else {
+                o << m << " xmm" << regf << ", ";
+                if (reg_form) o << "xmm" << rm_xmm; else o << rm;
+            } }
         else if (o2 == 0x58 || o2 == 0x59 || o2 == 0x5C || o2 == 0x5E) {
             /* reg-reg form: the rm REGISTER is an XMM, not a GP (the generic
              * modrm would print `rcx` for xmm1) */

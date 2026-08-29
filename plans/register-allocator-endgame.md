@@ -1133,6 +1133,42 @@ out of every float expression (one usef touch would disqualify
 them from the int pool - the disjoint rule), and every constant
 is dyadic with identical IEEE op order on both sides (the
 4-digit result compares exactly; verified my == tw == cpp).
+THE 89 DIAGNOSIS IS COMPLETE (2026-08-24), and the mechanism is
+one slot: fj. The emission diff (back-edge-delimited loop bodies;
+vm-pc attribution is unavailable post-delete-originals - every op
+mark reads pc 0) says loop 1 is IDENTICAL (39 = 39 instrs) and
+loop 2 is 48 vs 43 - the whole +5 Ir/iter. In the opt-out body fj
+lives in xmm6 all iteration (the PICK pinned it); in the lever
+body fj is memory: a tagged store (tag + payload) plus four
+reloads per iteration. WHY THE LEVER LEAVES fj UNSERVED: every
+float's interval spans prologue-def -> sum-read, so at fj's walk
+arrival (pc 9) the pool holds f0/f1/f2/fi and fj is the FURTHEST
+next use (loop 2 is ~18 pcs away) - the newcomer stays memory for
+its whole [9,51) interval. The pick's static COUNT ranking is a
+DENSITY ranking, and it is right here: fi and fj have ~5 uses per
+iteration (4 reads + the increment) vs the accumulators' 2, so
+the pick pins both indices and wins. f3's whole-run demotion is
+the same distance-vs-density miss at pc 8 (fi's arrival evicts
+f3, whose 2-op/iter recurrence out-densities fi's 1).
+THE FIX CLASS, for the maintainer to sequence: (a) DENSITY-AWARE
+eviction/admission (uses-remaining / span-remaining instead of
+next-use distance) reaches roughly pick parity on this shape; (b)
+INTERVAL SPLITTING WITH LIFETIME HOLES (split fj to a hot [25,40)
+piece AND split the phase-1 pins' idle gaps so a register is free
+to receive it) beats both - each phase would pay ONE memory slot
+where the pick pays two + four. (b) is the second-chance
+direction, rejected once on 83's +7.9%; 89 is now the
+counter-bench that motivates its careful revival with the idle-
+gap half built too.
+FOUND WHILE DIAGNOSING, FIXED FIRST (infrastructure rule): the
+disassembler printed a REG-FORM movsd/sqrtsd rm operand with the
+GP table ('movsd xmm0, rsi' for movsd xmm0, xmm6) - the 0x58
+arithmetic family had the reg-form fix, the 0x10/0x11/0x51 arms
+did not. disasmcheck.py is structurally blind to it (it compares
+MNEMONICS, not operand text) - recorded as a known oracle limit.
+Also: jit_lsra_assign's float-mode LSRADBG now dumps fpiece rows
+(only ftrans was printed - the phase-2 diagnosis was impossible
+without the pieces).
 ⛔ THE ORACLE'S FIRST VERDICT: THE LEVER LOSES THE SHAPE -
 +6.5%/iter lever-on (164.0M vs 154.0M), even though the float
 machinery visibly engages (lsra_fpins 1, lsra_ftrans 8 = the
