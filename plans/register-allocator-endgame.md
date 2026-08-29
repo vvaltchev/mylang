@@ -1174,7 +1174,11 @@ density contest as the churn guard; see docs/jit-optimizations.md
 at zero per-iteration cost. The 28_str_concat blocker is FIXED
 (the .py's module-level accumulator defeated CPython's in-place
 append - function-wrapped, 2-11 min -> 0.11s; recompute default
-timeout 600s), so the suite-geomean close is unblocked.
+timeout 600s), so the suite-geomean close is unblocked - AND RUN
+(2026-08-25, interleaved --baseline at 03b9d09 = density-only):
+cur/base geomean 0.972x over 89 benches - the movaps + holes +
+re-queue stack is a ~3% suite-wide wall win, led by the float
+benches (04_float_arith 0.52x); my/python geomean 12.12x.
 THE FIX CLASS, for the maintainer to sequence: (a) DENSITY-AWARE
 eviction/admission (uses-remaining / span-remaining instead of
 next-use distance) reaches roughly pick parity on this shape; (b)
