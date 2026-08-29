@@ -22,7 +22,16 @@ XMM0    0
 XMM1    0
 TOTAL   0
 RAWENC  15
-CONV 38   # 103: the convertible residue - only ever lower this.
+CONV 23   # 103: the convertible residue - only ever lower this.
+# 2026-08-25 batch 2: 15 more uses read site-by-site and promoted -
+# every one was the ask-fallback bracket again (emit_op/emit_branch
+# tmp: hold() ASKS alloc_scratch first, RCX is its refusal path;
+# emit_ref_check's scr default feeds RefScratch = the ask bracket;
+# div_magic is 'ask-first, like RefScratch's ctor'; store_dst passes
+# the same scr). The 23 left are the UNREAD sites: the elem
+# base-gate/bounds roles, the R9 ctx-chain preference, the
+# model-check probes, the switch tbl=RDX - read each before moving
+# it.
 # 2026-08-25 phase-E re-litigation: 461 uses promoted to the
 # TERMINAL reg:proto tag (rax value conveyance, the tag grant,
 # the call/ctx-chain protocol, the bump + ask-fallback brackets

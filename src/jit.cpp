@@ -4674,7 +4674,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
      * in RefScratch (declared below, hence the open-coded form).
      */
     /* #96 (8c): ask-first, like RefScratch's ctor */
-    uint8_t keep = RCX;                              /* reg:conv */
+    uint8_t keep = RCX;                              /* reg:proto */
     /* B2c: with rdx un-denied a grant could return it - and the magic
      * sequence CLOBBERS rdx by ISA (imul) two instructions later,
      * which killed the keep the moment the whitelist's deny stopped
@@ -5627,7 +5627,7 @@ struct AccScratch {
  */
 static size_t emit_ref_check(Emitter &e, int32_t type_off,
                              JitColdTier cold = JC_COUNT,
-                             uint8_t scr = RCX,  /* reg:conv */
+                             uint8_t scr = RCX,  /* reg:proto */
                              uint32_t excl = 0)  /* the VALUE's regs */
 {
     const JitLayout &L = jit_layout();
@@ -5660,7 +5660,7 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off,
  * rcx; `cb` is only READ. */
 static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
                                        int32_t type_off,
-                                       uint8_t scr = RCX)  /* reg:conv */
+                                       uint8_t scr = RCX)  /* reg:proto */
 {
     const JitLayout &L = jit_layout();
     RefScratch rs(e, scr);
@@ -5679,7 +5679,7 @@ static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
  * structtype). Returns the ONE jump site to patch to the helper. */
 static size_t
 emit_store_src_gate(Emitter &e, int32_t type_off,
-                    uint8_t scr = RCX)      /* reg:conv */
+                    uint8_t scr = RCX)      /* reg:proto */
 {
     /*
      * ⛔ ONE UNSIGNED COMPARE FOR A CLOSED BAND (2026-08-20).
@@ -5754,7 +5754,7 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap, uint8_t tbl)
  * t_str); fall through for a trivial value. Returns the jae rel32 site to
  * patch to the helper label. Clobbers rcx. */
 static size_t emit_ref_check_jae(Emitter &e, int32_t type_off,
-                                 uint8_t scr = RCX)  /* reg:conv */
+                                 uint8_t scr = RCX)  /* reg:proto */
 {
     const JitLayout &L = jit_layout();
     RefScratch rs(e, scr);
@@ -8391,7 +8391,7 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
 #endif
     if (reflisted && !e.relok(dst)) {
         const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE,
-                                              RCX,  /* reg:conv */
+                                              RCX,  /* reg:proto */
                                               1u << src_reg);
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_int),
                           dst, src_reg);
@@ -8453,7 +8453,7 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
 #endif
     if (reflisted && !e.relok(dst)) {
         const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE,
-                                              RCX,  /* reg:conv */
+                                              RCX,  /* reg:proto */
                                               1u << src_reg);
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_bool),
                           dst, src_reg);
@@ -15145,14 +15145,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
      * BorrowSuspend to restore on a raise arm. Refused: the old
      * push-when-occupied borrow of rcx, byte-identical. tmp/cpy stay
      * two NAMES for one register (separate lifetimes, same value). */
-    uint8_t tmp = RCX;                               /* reg:conv */
-    uint8_t cpy = RCX;                               /* reg:conv */
+    uint8_t tmp = RCX;                               /* reg:proto */
+    uint8_t cpy = RCX;                               /* reg:proto */
     bool tmp_pushed = false;
     bool tmp_active = false;
     int tmp_grant = -1;
     const auto hold = [&](uint32_t need = CAP_MEM_BASE,
                           uint32_t exclude = 0) {
-        if (tmp_active || (e.trk_borrowed & (1u << RCX))) {  /* reg:conv */
+        if (tmp_active || (e.trk_borrowed & (1u << RCX))) {  /* reg:proto */
             /* already held this window (the second spelling covers a
              * window opened by the raw borrow before this landed) */
             ML_CHECK((gp_caps(tmp) & need) == need);
@@ -15164,7 +15164,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             tmp = cpy = static_cast<uint8_t>(tmp_grant);
             return;
         }
-        tmp = cpy = static_cast<uint8_t>(RCX);       /* reg:conv */
+        tmp = cpy = static_cast<uint8_t>(RCX);       /* reg:proto */
         tmp_pushed = e.reg_is_occupied(tmp);
         if (tmp_pushed)
             e.push_reg(tmp);
@@ -15180,7 +15180,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             tmp_pushed = false;
         }
         tmp_active = false;
-        tmp = cpy = static_cast<uint8_t>(RCX);       /* reg:conv */
+        tmp = cpy = static_cast<uint8_t>(RCX);       /* reg:proto */
     };
     switch (in.op) {
 
@@ -18978,7 +18978,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
      * becomes pinnable. They are deleted; these three replace them,
      * covering the writes that are real.
      */
-    uint8_t tmp = RCX;                               /* reg:conv */
+    uint8_t tmp = RCX;                               /* reg:proto */
     /*
      * ⛔ #96 (c, then 8b): THE STAGING REGISTER ASKS THE ALLOCATOR and
      * only then falls back to the borrow - and each helper takes its
@@ -19003,7 +19003,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             tmp = static_cast<uint8_t>(tmp_g);
             return;
         }
-        tmp = static_cast<uint8_t>(RCX);             /* reg:conv */
+        tmp = static_cast<uint8_t>(RCX);             /* reg:proto */
         tmp_spilled = e.reg_is_occupied(tmp);
         if (tmp_spilled)
             e.push_reg(tmp);
@@ -19018,7 +19018,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             e.pop_reg(tmp);
             tmp_spilled = false;
         }
-        tmp = static_cast<uint8_t>(RCX);             /* reg:conv */
+        tmp = static_cast<uint8_t>(RCX);             /* reg:proto */
     };
     const auto tmp_lit = [&](uint64_t v, auto &&use) {
         tmp_hold();
