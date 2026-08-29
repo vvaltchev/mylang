@@ -1040,6 +1040,20 @@ directions, the xrot matrix on the new default, both arenas in
 both directions, rel-t TESTS=1 OPT=1 both directions, census -
 all green. Default emission changes by design; byte-identity
 retires as the default oracle.
+#103 RESIDUALS, FIRST LIFT (2026-08-26): the v1 "one machinery
+per slot" exclusions are GONE - a transitioned slot keeps its C3
+type elision (GP) and its C4a-i read elision + float type elision
+(xmm). The deferred review, now done: the seam's evict arm writes
+the tag itself, the install loads payload only, and both
+elisions' soundness is a property of the SLOT's op set,
+orthogonal to residency; a doubly-covered slot at a barrier flush
+gets its tag written twice, harmless. MEASURED Ir-NEUTRAL on the
+spot set (81/83/06/43/55 all at pre-lift values): the corpus has
+no slot that is both elided and transitioned today, so the
+filters were filtering nothing - the win materializes only when
+that overlap appears, and the bound now cannot cost it. Battery:
+rt + corpus both directions, xrot on the default, nolowmem - all
+green. REMAINING v1 bounds: TEMP pieces; home/piece mixing.
 THE FLIP GATE WAS - THE MAINTAINER'S CALL, with the
 ledger now complete on both axes: Ir (zero per-iteration
 regressions corpus-wide; wins 06 -16.8%, 81 -2.7%, 82 -1.6%, 83
