@@ -3010,7 +3010,7 @@ static void jit_put_bool(LValue *lv, int_type v) noexcept
 /*
  * #96: SysV's callee-saved set. A pin in one of these survives a helper
  * call for free; a pin in anything else must be spilled around one - see
- * XCACHE_REGS and emit_call_prologue/epilogue below.
+ * XCACHE_ORDER and emit_call_prologue/epilogue below.
  */
 static ML_ALWAYS_INLINE bool jit_reg_is_callee_saved(uint8_t r)
 {
@@ -3028,7 +3028,7 @@ static void emit_call_prologue(Emitter &e)
     for (const Emitter::CacheEnt &c : e.fcache)
         e.fstore(c.reg, c.payload);
     /*
-     * #96: and the GP pins that are CALLER-saved (r10/r11 - XCACHE_REGS),
+     * #96: and the GP pins that are CALLER-saved (XCACHE_ORDER),
      * for the same reason and to the same place: the slot's PAYLOAD. The
      * type word is left alone exactly as the float pins leave theirs - a
      * pinned slot is never memory-read by any op in the run (the bad()
@@ -6427,29 +6427,66 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * expects nothing preserved, so the fragment may clobber them freely.
  */
 /*
- * #96: r9 joined on 2026-08-16, and the reason it is CHEAP where
- * rax/rcx/rdx/rdi are not is worth stating - MYLANG_REGAUDIT measured
- * the pool, not the sharing, to be the binding constraint (42 qualified
- * candidates against 6 registers on 83_regs_int_40), so the question
- * became "which register can join", and the answer is decided by how
- * often the emitter hardcodes it as SCRATCH:
+ * #96: which caller-saved register may hold a PIN. The pool - not
+ * sharing - is the binding constraint (MYLANG_REGAUDIT: 42 qualified
+ * candidates against 6 registers on 83_regs_int_40), so the question is
+ * "which register can join", and the answer is decided by how often the
+ * emitter hardcodes it as SCRATCH OUTSIDE an emit_call_prologue bracket
+ * (inside one it cannot matter - the prologue spilled every
+ * caller-saved pin). `scripts/regcensus.py` is that count.
  *
- *      RAX 297   RCX 165   RDX 133   RSI 84   RDI 76   r8 42   r9 14
- *
- * The first four cannot join without teaching ~300 emit sites to
- * allocate their scratch; rsi/r8 are the type singletons (plan step 5,
- * a regression on its own). r9 is used in exactly TWO local scopes and
- * both are already safe by the SAME gates r10/r11 rely on:
- *   - emit_sync_push_native (the inline call record) - a run containing
- *     a MyLang call gets no caller-saved pin at all (jit_run_blocks_
- *     xcache), which is why r10/r11 are safe there and r9 is too;
+ * r8 IS here. Its raw-scratch uses are confined to three emitters that
+ * are already safe:
+ *   - emit_sync_push_native / emit_sync_call_inline - a run containing
+ *     a MyLang call gets no caller-saved pin at all
+ *     (jit_run_blocks_xcache), which is why r10/r11 are safe there too;
  *   - emit_ret_native - its FIRST act is flush_cache(), so no pin is
  *     live past it.
- * As a SysV argument register r9 additionally holds a 6th helper
- * argument, which is harmless for the same reason a callee's clobber
- * is: emit_call_prologue spills every caller-saved pin BEFORE the arg
- * setup. jit_assert_no_volatile_pin is the standing check that no
- * raw-scratch call site sees one.
+ * As SysV argument 5 it also carries a helper argument, harmless for
+ * the same reason a callee's clobber is: emit_call_prologue spills
+ * first. jit_assert_no_volatile_pin is the standing check.
+ *
+ * ⛔⛔ r9 IS NOT HERE, AND IT WAS - FOR ONE DAY, AS A SHIPPING
+ * WRONG-ANSWER BUG (added 939f5a9 2026-08-16, removed 2026-08-17).
+ * The comment that put it here claimed "r9 is used in exactly TWO local
+ * scopes and both are already safe". That was FALSE. r9 is raw scratch
+ * in the capture ops and in EVERY element tier - emit_elem_int_read,
+ * emit_elem_bounds_or_wrap, emit_store_elem_inline,
+ * emit_load_elem2_inline, emit_store_elem2_inline, ForStepElemInt -
+ * about 80 unbracketed sites.
+ *
+ * It shipped because r9 is FOURTH in this list, so it is handed out
+ * only to a run's SEVENTH pin, and no corpus program had seven
+ * pinnable int locals in a run that also read a capture. A twelve-line
+ * program does:
+ *
+ *     var cap = 3;
+ *     var f = func[cap](n) {
+ *         var s0 = 0; ... var s7 = 0;            # 8 hot int locals
+ *         for (var i = 0; i < n; i++) {
+ *             s0 += i; ... s6 += i * 7;
+ *             s7 += cap;                         # LoadCaptureV -> r9
+ *         }
+ *         return s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7;
+ *     };
+ *     print(f(64));                              # 56640, or garbage
+ *
+ * -tw and -nj print 56640; the JIT printed 88854283473440. The entry
+ * emits `mov r9, s5` and emit_ctx_chain_r9 then walks the ctx through
+ * r9, destroying the pin with nothing to restore it.
+ *
+ * THREE LESSONS, all recorded in CLAUDE.md, all earned here:
+ *  1. The census that was supposed to prevent this READ 14 FOR r9 and
+ *     was wrong by a factor of six, because `lea_rdi`, `slots_to_arg0`,
+ *     `store_elem_byte_dil`, `movabs_r9`, `cmp_r9_rdx` name the
+ *     register in the METHOD, not in an argument a grep can see - the
+ *     SIXTH audit-table shape, hit by the tool built to avoid it.
+ *     regcensus.py now DERIVES the accessor list from the source.
+ *  2. A pool ordered by preference hides its own tail. r9 was 4th of 4,
+ *     so every net in the project exercised the first three. Test a
+ *     pool member by making it FIRST (that fails -rt in seconds).
+ *  3. "Safe by the same gates as r10/r11" needs the gates ENUMERATED
+ *     against the register's OWN sites, not asserted by analogy.
  */
 /* ⛔ rsi is NOT here, and the attempt is worth recording: with the tag
  * now an immediate, rsi LOOKS free - and it is not. It is SysV argument
@@ -6459,8 +6496,48 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * immediately. rsi/rax/rcx/rdx/rdi need the emitter to ALLOCATE its
  * scratch; freeing the type tag was necessary for that but not
  * sufficient. */
-static const uint8_t XCACHE_REGS[] = { 10, 11, 9, 8 };
-static const size_t MAX_XCACHED = sizeof(XCACHE_REGS) / sizeof(XCACHE_REGS[0]);
+static const uint8_t XCACHE_ORDER[] = { 10, 11, 8 };
+static const size_t MAX_XCACHED =
+    sizeof(XCACHE_ORDER) / sizeof(XCACHE_ORDER[0]);
+
+/*
+ * ⛔ MYLANG_JIT_XROT=N - ROTATE the pool so member N is handed out
+ * FIRST. This exists because of lesson 2 above, and it is the net that
+ * would have caught the r9 bug in seconds instead of a day.
+ *
+ * take_reg scans this array in order, so the LAST member is reached
+ * only by a run with the maximum number of pins. Every test net in the
+ * project - -rt, the four differentials, corpus_diff, the fuzzers -
+ * therefore exercises the FIRST member heavily and the last one almost
+ * never. That is not a coverage gap a bigger corpus fixes: it is the
+ * allocator's own preference order hiding its tail.
+ *
+ * With the rotation, `corpus_diff.sh BIN --xrot` runs the whole matrix
+ * and every member gets the first-choice traffic. A member that is not
+ * actually safe fails immediately and BY NAME.
+ *
+ * Rotation (not a free permutation) on purpose: it is one integer, it
+ * always yields a valid pool, and it reaches every member in position
+ * 0, which is the only position that matters for this test.
+ */
+unsigned g_jit_xrot = []() -> unsigned {
+    const char *s = getenv("MYLANG_JIT_XROT");
+    return s ? static_cast<unsigned>(atoi(s)) : 0u;
+}();
+
+size_t jit_xcache_width() { return MAX_XCACHED; }
+
+static const uint8_t *xcache_regs()
+{
+    static uint8_t order[MAX_XCACHED];
+    static unsigned cached = ~0u;
+    if (cached != g_jit_xrot) {
+        cached = g_jit_xrot;
+        for (size_t i = 0; i < MAX_XCACHED; i++)
+            order[i] = XCACHE_ORDER[(i + g_jit_xrot) % MAX_XCACHED];
+    }
+    return order;
+}
 
 /* Which XCACHE registers this run must NOT spend, because they still
  * hold a type singleton. Empty when both tags encode as imm32. */
@@ -6498,7 +6575,7 @@ static const size_t MAX_FCACHED =
     sizeof(FCACHE_REGS) / sizeof(FCACHE_REGS[0]);
 
 /*
- * #96: may this RUN spend the caller-saved extension (XCACHE_REGS)?
+ * #96: may this RUN spend the caller-saved extension (XCACHE_ORDER)?
  *
  * Not if it emits a MyLang CALL. `emit_sync_push_native` builds the call
  * RECORD with r10/r11 as raw scratch - it is not calling a helper, so it
@@ -14285,7 +14362,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         std::vector<int> fread_raw;               /* C4a-i */
         /*
          * #96: this fragment's PIN BUDGET. The callee-saved four always;
-         * r10/r11 as well when no C1 region wants them (see XCACHE_REGS).
+         * r10/r11 as well when no C1 region wants them (see XCACHE_ORDER).
          * Decided HERE because it is a property of the fragment, not of
          * the pool - which is why the pick can no longer read MAX_CACHED
          * for itself.
@@ -14297,7 +14374,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         size_t n_xcache = 0;
         if (xcache_ok)
             for (size_t i = 0; i < MAX_XCACHED; i++)
-                if (!(xbusy & (1u << XCACHE_REGS[i])))
+                if (!(xbusy & (1u << xcache_regs()[i])))
                     n_xcache++;
         const size_t max_pins = MAX_CACHED + n_xcache;
         std::vector<int> hot =
@@ -14387,7 +14464,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         for (size_t h = 0; h < hot.size(); h++) {
             int r = e.take_reg(CACHE_REGS, MAX_CACHED);
             if (r < 0 && xcache_ok)
-                r = e.take_reg(XCACHE_REGS, MAX_XCACHED);
+                r = e.take_reg(xcache_regs(), MAX_XCACHED);
             ML_CHECK(r >= 0);            /* hot.size() <= max_pins */
             hot_reg[h] = static_cast<uint8_t>(r);
             if (jit_reg_is_callee_saved(hot_reg[h]))

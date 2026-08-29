@@ -24847,6 +24847,49 @@ static bool jit_xcache_pins()
           "    return a + b + c + d + e + g; }",
           "print(f(runtime(40), runtime(2)));" }, true },
 
+      /*
+       * ⛔ THE r9 CASE - a SHIPPING WRONG ANSWER for one day
+       * (939f5a9 2026-08-16 .. 2026-08-17). r9 was added to the pool on
+       * a comment's claim that it was "used in exactly TWO local
+       * scopes, both already safe". It is in fact raw scratch in the
+       * CAPTURE ops and in every element tier (~80 unbracketed sites),
+       * and `emit_ctx_chain_r9` walks the ctx through it.
+       *
+       * It shipped because r9 was FOURTH in the pool, so only a run's
+       * seventh pin reached it, and no corpus program had seven
+       * pinnable int locals in a run that also read a capture. This
+       * one does: eight accumulators plus `s7 += cap`. The JIT printed
+       * 88854283473440 where -tw and -nj print 56640.
+       *
+       * The VALUE is the oracle - the counter says "engaged" either
+       * way. And the case is swept over every ROTATION below, so it
+       * does not depend on r9 landing in one particular pool slot.
+       */
+      { "a CAPTURE read in a max-pin loop (the r9 clobber)",
+        { "var cap = 3;",
+          "var f = func[cap](int n) {",
+          "    var s0 = 0; var s1 = 0; var s2 = 0; var s3 = 0;",
+          "    var s4 = 0; var s5 = 0; var s6 = 0; var s7 = 0;",
+          "    for (var i = 0; i < n; i++) {",
+          "        s0 += i; s1 += i * 2; s2 += i * 3; s3 += i * 4;",
+          "        s4 += i * 5; s5 += i * 6; s6 += i * 7;",
+          "        s7 += cap; }",
+          "    return s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7; };",
+          "print(f(runtime(64)));" }, true },
+
+      /* The WRITE twin: StoreCaptureV walks the same r9 chain. */
+      { "a CAPTURE write in a max-pin loop (the r9 clobber)",
+        { "var acc = 0;",
+          "var f = func[acc](int n) {",
+          "    var s0 = 0; var s1 = 0; var s2 = 0; var s3 = 0;",
+          "    var s4 = 0; var s5 = 0; var s6 = 0;",
+          "    for (var i = 0; i < n; i++) {",
+          "        s0 += i; s1 += i * 2; s2 += i * 3; s3 += i * 4;",
+          "        s4 += i * 5; s5 += i * 6; s6 += i * 7;",
+          "        acc = acc + i; }",
+          "    return s0 + s1 + s2 + s3 + s4 + s5 + s6 + acc; };",
+          "print(f(runtime(64)));" }, true },
+
       /* THREE hot locals: the callee-saved four suffice, so the
        * extension must stay out of it (a pool that always reaches for
        * r10/r11 would pass the case above and this one would catch it). */
@@ -24859,21 +24902,36 @@ static bool jit_xcache_pins()
     };
 
     bool ok = true;
-    for (const Case &c : cases) {
-        unsigned long xc = 0;
-        const std::string got = go(c.src, true, &xc);
-        const std::string ref = go(c.src, false, nullptr);
-        if (got != ref || ref.empty()) {
-            cout << "  xcache [" << c.name << "]: tw=[" << ref
-                 << "] vm=[" << got << "]\n";
-            ok = false;
-        }
-        if (c.want != (xc > 0)) {
-            cout << "  xcache [" << c.name << "]: engaged " << xc
-                 << ", expected " << (c.want ? "> 0" : "0") << "\n";
-            ok = false;
+    /*
+     * ⛔ EVERY CASE IS SWEPT OVER EVERY POOL ROTATION. take_reg hands
+     * out the pool in preference order, so without this each case only
+     * ever exercises the FIRST member - which is exactly how an unsafe
+     * register (r9) sat in position 4 for a day, hit by no test in the
+     * project. Rotating puts each member in the first-choice seat, so a
+     * member that is not safe fails here rather than in a user's
+     * program.
+     */
+    const unsigned rot0 = g_jit_xrot;
+    for (unsigned rot = 0; rot < jit_xcache_width(); rot++) {
+        g_jit_xrot = rot;
+        for (const Case &c : cases) {
+            unsigned long xc = 0;
+            const std::string got = go(c.src, true, &xc);
+            const std::string ref = go(c.src, false, nullptr);
+            if (got != ref || ref.empty()) {
+                cout << "  xcache [" << c.name << "] xrot=" << rot
+                     << ": tw=[" << ref << "] vm=[" << got << "]\n";
+                ok = false;
+            }
+            if (c.want != (xc > 0)) {
+                cout << "  xcache [" << c.name << "] xrot=" << rot
+                     << ": engaged " << xc << ", expected "
+                     << (c.want ? "> 0" : "0") << "\n";
+                ok = false;
+            }
         }
     }
+    g_jit_xrot = rot0;
     return ok;
 #else
     return true;

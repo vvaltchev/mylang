@@ -19,6 +19,14 @@
 #   tests/corpus_diff.sh [binary]            - the differential
 #   tests/corpus_diff.sh [binary] --levers   - once per JIT lever off
 #   tests/corpus_diff.sh [binary] --cold     - once per forced cold tier
+#   tests/corpus_diff.sh [binary] --xrot     - once per pin-pool rotation
+#
+# --xrot exists because take_reg hands out the caller-saved pin pool in
+# PREFERENCE order, so its last member is reached only by a run with the
+# maximum pin count - and an unsafe register can therefore sit in the
+# pool exercised by nothing. r9 did, for a day, as a wrong answer
+# (939f5a9 .. 2026-08-17). Rotating puts every member in the
+# first-choice seat.
 #
 # Excluded from samples/: rand_sort (rand()), shopping/phonebook (they
 # read stdin and reprint their menu forever on EOF).
@@ -28,6 +36,7 @@ BIN=${1:-build-claude/dbg/mylang}
 MODE=${2:-}
 LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2 mfact cest relent norec"
 COLD_TIERS="refstore"
+XROTS="0 1 2 3"
 
 progs() {
   ls tests/functional/*.my 2>/dev/null
@@ -60,5 +69,7 @@ case "$MODE" in
     for L in $LEVERS all; do run_one "MYLANG_JIT_OFF=$L" || rc=1; done ;;
   --cold)
     for T in $COLD_TIERS all; do run_one "MYLANG_JIT_COLD=$T" || rc=1; done ;;
+  --xrot)
+    for K in $XROTS; do run_one "MYLANG_JIT_XROT=$K" || rc=1; done ;;
 esac
 exit $rc
