@@ -24,15 +24,51 @@ enum pFlags : unsigned {
 
 enum class ConstructType {
 
+    /* TRANSITIONAL sentinel: every concrete node class stamps a real
+     * tag (the Construct ctor ML_CHECKs it), so `other` is
+     * constructible by NO shipped class - a new class that forgets
+     * its tag fails -rt on its first construction, by name. That is
+     * the net that keeps the tag-switch walkers (#102) exhaustive:
+     * a switch over this enum with no default is forced by
+     * -Werror=switch to classify every kind. */
     other,
-    nop,
-    ret,
-    idlist,
-    block,
-    id,
-    lit_int,
-    subscript,
+
+    /* childless */
+    nop, brk, cont, rethrow,
+
+    /* literals */
+    lit_int, lit_bool, lit_float, lit_none, lit_str, lit_arr,
+    lit_obj, lit_dict_kv, lit_dict,
+
+    id, idlist, expr_list, block,
+
+    /* the SingleChildConstruct family - CONTIGUOUS (is_single_ct) */
+    expr01, inlined_call, throw_stmt,
+
+    /* the MultiOpConstruct family - CONTIGUOUS (is_multiop_ct) */
+    expr02, expr03, expr04, expr05, expr06, expr07, expr08, expr09,
+    expr10, expr11, expr12,
+
+    /* the CallExpr family: ONE tag - the subclasses (Direct/Cached/
+     * DirectBuiltin) add no walked children, so the walkers treat
+     * them by the base layout; non-walker code still dynamic_casts
+     * for the subclass identity */
+    call,
+
+    typed_scalar, expr14, if_stmt, ret, while_stmt, func_decl,
+    struct_decl, subscript, slice, try_catch, foreach_stmt, member,
+    incdec, ternary, coalesce, for_stmt, for_range,
 };
+
+/* the contiguous-family queries (the bytecode.h range pattern) */
+static inline bool is_multiop_ct(ConstructType c)
+{
+    return c >= ConstructType::expr02 && c <= ConstructType::expr12;
+}
+static inline bool is_single_ct(ConstructType c)
+{
+    return c >= ConstructType::expr01 && c <= ConstructType::throw_stmt;
+}
 
 /*
  * Static-type hint stamped on an expression node by the type inferencer
@@ -147,7 +183,13 @@ public:
         , is_const(is_const)
         , start(Loc())
         , end(Loc())
-    { }
+    {
+        /* #102: every concrete class must stamp a real tag - the
+         * tag-switch walkers dispatch on it, and an `other` node
+         * would silently walk as CHILDLESS (the hidden-occurrence
+         * trap). A new class fails here on first construction. */
+        ML_CHECK(ct != ConstructType::other);
+    }
 
     bool is_nop() const { return ct == ConstructType::nop; }
     bool is_ret() const { return ct == ConstructType::ret; }
@@ -217,8 +259,9 @@ class ChildlessConstruct : public Construct {
 
 public:
 
-    ChildlessConstruct(const char *name, Loc start = Loc(), Loc end = Loc())
-        : Construct(name)
+    ChildlessConstruct(const char *name, ConstructType ct,
+                       Loc start = Loc(), Loc end = Loc())
+        : Construct(name, false, ct)
     {
         this->start = start;
         this->end = end;
@@ -232,7 +275,8 @@ class SingleChildConstruct : public Construct {
 public:
     unique_ptr<Construct> elem;
 
-    SingleChildConstruct(const char *name) : Construct(name) { }
+    SingleChildConstruct(const char *name, ConstructType ct)
+        : Construct(name, false, ct) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return elem->do_eval(ctx);
@@ -246,7 +290,8 @@ class MultiOpConstruct : public Construct {
 public:
     std::vector<std::pair<Op, unique_ptr<Construct>>> elems;
 
-    MultiOpConstruct(const char *name) : Construct(name) { }
+    MultiOpConstruct(const char *name, ConstructType ct)
+        : Construct(name, false, ct) { }
     void serialize(ostream &s, int level = 0) const override;
 
     /* Special methods */
@@ -266,7 +311,7 @@ public:
     typedef ElemT ElemType;
     std::vector<unique_ptr<ElemType>> elems;
 
-    MultiElemConstruct(const char *name, ConstructType ct = ConstructType::other)
+    MultiElemConstruct(const char *name, ConstructType ct)
         : Construct(name, false, ct)
     { }
 
@@ -305,8 +350,6 @@ inline ostream &operator<<(ostream &s, const Construct &c)
 class Literal : public Construct {
 
 public:
-
-    Literal() : Construct("Literal", true) { }
 
 protected:
     /* Lets a concrete literal carry a ConstructType tag (LiteralInt uses it to
@@ -349,7 +392,8 @@ class LiteralBool final: public Literal {
 
 public:
 
-    LiteralBool(bool v) : value(v) { }
+    LiteralBool(bool v)
+        : Literal(ConstructType::lit_bool), value(v) { }
 
     bool bval() const { return value; }
 
@@ -379,7 +423,8 @@ class LiteralFloat final: public Literal {
 
 public:
 
-    LiteralFloat(float_type v) : value(v) { }
+    LiteralFloat(float_type v)
+        : Literal(ConstructType::lit_float), value(v) { }
 
     float_type fval() const { return value; }
 
@@ -402,7 +447,7 @@ class LiteralNone final: public Literal {
 
 public:
 
-    LiteralNone() : Literal() { }
+    LiteralNone() : Literal(ConstructType::lit_none) { }
     void serialize(ostream &s, int level = 0) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -437,8 +482,10 @@ class LiteralStr final: public Literal {
 public:
 
     LiteralStr(const std::string_view &v);
-    LiteralStr(const EvalValue &v) : value(v) { }
-    LiteralStr(EvalValue &&v) : value(std::move(v)) { }
+    LiteralStr(const EvalValue &v)
+        : Literal(ConstructType::lit_str), value(v) { }
+    LiteralStr(EvalValue &&v)
+        : Literal(ConstructType::lit_str), value(std::move(v)) { }
 
     const EvalValue &strval() const { return value; }
 
@@ -459,7 +506,9 @@ class LiteralArray final: public MultiElemConstruct<> {
 
 public:
 
-    LiteralArray() : MultiElemConstruct<>("LiteralArray") { }
+    LiteralArray()
+        : MultiElemConstruct<>("LiteralArray",
+                               ConstructType::lit_arr) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -506,11 +555,11 @@ class LiteralObj final: public Construct {
 public:
 
     LiteralObj(const EvalValue &v, bool immutable = false)
-        : Construct("LiteralObj", true)
+        : Construct("LiteralObj", true, ConstructType::lit_obj)
         , value(v)
         , immutable(immutable) { }
     LiteralObj(EvalValue &&v, bool immutable = false)
-        : Construct("LiteralObj", true)
+        : Construct("LiteralObj", true, ConstructType::lit_obj)
         , value(std::move(v))
         , immutable(immutable) { }
 
@@ -538,7 +587,9 @@ public:
     unique_ptr<Construct> key;
     unique_ptr<Construct> value;
 
-    LiteralDictKVPair() : Construct("LiteralDictKVPair") { }
+    LiteralDictKVPair()
+        : Construct("LiteralDictKVPair", false,
+                    ConstructType::lit_dict_kv) { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         throw InternalErrorEx(); /* Construct not meant to be evaluated directly */
@@ -557,7 +608,9 @@ class LiteralDict final: public MultiElemConstruct<LiteralDictKVPair> {
 
 public:
 
-    LiteralDict() : MultiElemConstruct<LiteralDictKVPair>("LiteralDict") { }
+    LiteralDict()
+        : MultiElemConstruct<LiteralDictKVPair>(
+              "LiteralDict", ConstructType::lit_dict) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -673,7 +726,9 @@ public:
      */
     std::vector<const UniqueId *> arg_names;
 
-    ExprList() : MultiElemConstruct<>("ExprList") { }
+    ExprList()
+        : MultiElemConstruct<>("ExprList",
+                               ConstructType::expr_list) { }
     void serialize(ostream &s, int level = 0) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -777,8 +832,9 @@ public:
      */
     uint32_t callable_arg_mask = ~0u;
 
-    CallExpr() : Construct("CallExpr") { }
-    explicit CallExpr(const char *name) : Construct(name) { }
+    CallExpr() : Construct("CallExpr", false, ConstructType::call) { }
+    explicit CallExpr(const char *name)
+        : Construct(name, false, ConstructType::call) { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
@@ -954,7 +1010,9 @@ class InlinedCallExpr final: public SingleChildConstruct {
 
 public:
 
-    InlinedCallExpr() : SingleChildConstruct("InlinedCall") { }
+    InlinedCallExpr()
+        : SingleChildConstruct("InlinedCall",
+                               ConstructType::inlined_call) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -992,7 +1050,8 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params);
 class Expr01 final: public SingleChildConstruct {
 
 public:
-    Expr01() : SingleChildConstruct("Expr01") { }
+    Expr01()
+        : SingleChildConstruct("Expr01", ConstructType::expr01) { }
 
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<Expr01>();
@@ -1006,7 +1065,8 @@ class Expr02 final: public MultiOpConstruct {
 
 public:
 
-    Expr02() : MultiOpConstruct("Expr02") { }
+    Expr02()
+        : MultiOpConstruct("Expr02", ConstructType::expr02) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1022,7 +1082,8 @@ class Expr03 final: public MultiOpConstruct {
 
 public:
 
-    Expr03() : MultiOpConstruct("Expr03") { }
+    Expr03()
+        : MultiOpConstruct("Expr03", ConstructType::expr03) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1037,7 +1098,8 @@ class Expr04 final: public MultiOpConstruct {
 
 public:
 
-    Expr04() : MultiOpConstruct("Expr04") { }
+    Expr04()
+        : MultiOpConstruct("Expr04", ConstructType::expr04) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1053,7 +1115,8 @@ class Expr05 final: public MultiOpConstruct {
 
 public:
 
-    Expr05() : MultiOpConstruct("Expr05") { }
+    Expr05()
+        : MultiOpConstruct("Expr05", ConstructType::expr05) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1068,7 +1131,8 @@ class Expr06 final: public MultiOpConstruct {
 
 public:
 
-    Expr06() : MultiOpConstruct("Expr06") { }
+    Expr06()
+        : MultiOpConstruct("Expr06", ConstructType::expr06) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1083,7 +1147,8 @@ class Expr07 final: public MultiOpConstruct {
 
 public:
 
-    Expr07() : MultiOpConstruct("Expr07") { }
+    Expr07()
+        : MultiOpConstruct("Expr07", ConstructType::expr07) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1099,7 +1164,8 @@ class Expr08 final: public MultiOpConstruct {
 
 public:
 
-    Expr08() : MultiOpConstruct("Expr08") { }
+    Expr08()
+        : MultiOpConstruct("Expr08", ConstructType::expr08) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1115,7 +1181,8 @@ class Expr09 final: public MultiOpConstruct {
 
 public:
 
-    Expr09() : MultiOpConstruct("Expr09") { }
+    Expr09()
+        : MultiOpConstruct("Expr09", ConstructType::expr09) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1131,7 +1198,8 @@ class Expr10 final: public MultiOpConstruct {
 
 public:
 
-    Expr10() : MultiOpConstruct("Expr10") { }
+    Expr10()
+        : MultiOpConstruct("Expr10", ConstructType::expr10) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1146,7 +1214,8 @@ class Expr11 final: public MultiOpConstruct {
 
 public:
 
-    Expr11() : MultiOpConstruct("Expr11") { }
+    Expr11()
+        : MultiOpConstruct("Expr11", ConstructType::expr11) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1161,7 +1230,8 @@ class Expr12 final: public MultiOpConstruct {
 
 public:
 
-    Expr12() : MultiOpConstruct("Expr12") { }
+    Expr12()
+        : MultiOpConstruct("Expr12", ConstructType::expr12) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1191,7 +1261,9 @@ public:
     std::vector<std::pair<Op, unique_ptr<Construct>>> elems;
 
     TypedScalarExpr(Cat cat, TypeHint kind)
-        : Construct("TypedScalarExpr"), cat(cat), kind(kind) { }
+        : Construct("TypedScalarExpr", false,
+                    ConstructType::typed_scalar)
+        , cat(cat), kind(kind) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     int_type eval_int(EvalContext *ctx) const override;
@@ -1222,7 +1294,9 @@ public:
     unsigned fl;
     Op op;
 
-    Expr14() : Construct("Expr14"), fl(pNone), op(Op::invalid) { }
+    Expr14()
+        : Construct("Expr14", false, ConstructType::expr14)
+        , fl(pNone), op(Op::invalid) { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
@@ -1244,7 +1318,7 @@ public:
     unique_ptr<Construct> thenBlock;
     unique_ptr<Construct> elseBlock;
 
-    IfStmt() : Construct("IfStmt") { }
+    IfStmt() : Construct("IfStmt", false, ConstructType::if_stmt) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1322,7 +1396,8 @@ public:
 class BreakStmt final: public ChildlessConstruct {
 
 public:
-    BreakStmt(): ChildlessConstruct("BreakStmt") { }
+    BreakStmt()
+        : ChildlessConstruct("BreakStmt", ConstructType::brk) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1335,7 +1410,8 @@ public:
 class ContinueStmt final: public ChildlessConstruct {
 
 public:
-    ContinueStmt(): ChildlessConstruct("ContinueStmt") { }
+    ContinueStmt()
+        : ChildlessConstruct("ContinueStmt", ConstructType::cont) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1368,7 +1444,8 @@ public:
     unique_ptr<Construct> condExpr;
     unique_ptr<Construct> body;
 
-    WhileStmt() : Construct("WhileStmt") { }
+    WhileStmt()
+        : Construct("WhileStmt", false, ConstructType::while_stmt) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1427,7 +1504,7 @@ public:
     bool is_template = false;
 
     FuncDeclStmt()
-        : Construct("FuncDeclStmt")
+        : Construct("FuncDeclStmt", false, ConstructType::func_decl)
         , desc_owner(make_unique<FuncDescriptor>())
         , desc(desc_owner.get())
     {
@@ -1531,7 +1608,8 @@ public:
         def = def_owner.get();
     }
 
-    StructDeclStmt() : Construct("StructDeclStmt", true) { }
+    StructDeclStmt()
+        : Construct("StructDeclStmt", true, ConstructType::struct_decl) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
     unique_ptr<Construct> clone() const override;
@@ -1597,7 +1675,7 @@ public:
      * zero-iteration safety gate (lever 3). */
     bool base_sliceable = false;
 
-    Slice() : Construct("Slice") { }
+    Slice() : Construct("Slice", false, ConstructType::slice) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1626,7 +1704,8 @@ public:
     unique_ptr<Construct> finallyBody;
     std::vector<std::pair<AllowedExList, unique_ptr<Construct>>> catchStmts;
 
-    TryCatchStmt() : Construct("TryCatchStmt") { }
+    TryCatchStmt()
+        : Construct("TryCatchStmt", false, ConstructType::try_catch) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1650,7 +1729,8 @@ class RethrowStmt final: public ChildlessConstruct {
 public:
 
     RethrowStmt(Loc start = Loc(), Loc end = Loc())
-        : ChildlessConstruct("RethrowStmt", start, end) { }
+        : ChildlessConstruct("RethrowStmt", ConstructType::rethrow,
+                             start, end) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
@@ -1664,7 +1744,9 @@ public:
 class ThrowStmt final: public SingleChildConstruct {
 
 public:
-    ThrowStmt(): SingleChildConstruct("ThrowStmt") { }
+    ThrowStmt()
+        : SingleChildConstruct("ThrowStmt",
+                               ConstructType::throw_stmt) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1750,7 +1832,9 @@ public:
      * bind. A whole-`p` use or `p.field` write makes the codegen bail. */
     const StructTypeDef *container_struct_def = nullptr;
 
-    ForeachStmt() : Construct("ForeachStmt"), idsVarDecl(false), indexed(false) { }
+    ForeachStmt()
+        : Construct("ForeachStmt", false, ConstructType::foreach_stmt)
+        , idsVarDecl(false), indexed(false) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1799,7 +1883,8 @@ public:
      * def-identity check, so no name scan runs on a proven member access. */
     int field_slot = -1;
 
-    MemberExpr() : Construct("MemberExpr") { }
+    MemberExpr()
+        : Construct("MemberExpr", false, ConstructType::member) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     int_type eval_int(EvalContext *ctx) const override;
     float_type eval_float(EvalContext *ctx) const override;
@@ -1834,7 +1919,9 @@ public:
     bool is_prefix;                 /* ++x / --x  (else postfix x++ / x--) */
     bool is_inc;                    /* ++ (else --) */
 
-    IncDecExpr() : Construct("IncDecExpr"), is_prefix(false), is_inc(true) { }
+    IncDecExpr()
+        : Construct("IncDecExpr", false, ConstructType::incdec)
+        , is_prefix(false), is_inc(true) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1858,7 +1945,8 @@ public:
     unique_ptr<Construct> thenExpr;
     unique_ptr<Construct> elseExpr;
 
-    TernaryExpr() : Construct("TernaryExpr") { }
+    TernaryExpr()
+        : Construct("TernaryExpr", false, ConstructType::ternary) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1881,7 +1969,8 @@ public:
     unique_ptr<Construct> lhs;
     unique_ptr<Construct> rhs;
 
-    CoalesceExpr() : Construct("CoalesceExpr") { }
+    CoalesceExpr()
+        : Construct("CoalesceExpr", false, ConstructType::coalesce) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1903,7 +1992,7 @@ public:
     unique_ptr<Construct> inc;
     unique_ptr<Construct> body;
 
-    ForStmt() : Construct("ForStmt") { }
+    ForStmt() : Construct("ForStmt", false, ConstructType::for_stmt) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1942,7 +2031,8 @@ public:
     int i_slot = 0;               /* the loop var's frame slot */
     Op cmp_op = Op::lt;           /* lt/le -> ascending; ge/gt -> descending */
 
-    ForRangeStmt() : Construct("ForRangeStmt") { }
+    ForRangeStmt()
+        : Construct("ForRangeStmt", false, ConstructType::for_range) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 

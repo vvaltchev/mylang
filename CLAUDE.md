@@ -6081,7 +6081,16 @@ wire it into the right `pExprNN` level (or `pStmt`) in `parser.cpp`, add the
 `syntax.h`/`syntax.cpp`+`eval.cpp` for a statement),
 and cover it in `tests.cpp`. A **new `Construct` node must also implement
 `clone()`** (pure virtual) — usually a few lines using the shared helpers;
-omitting it is a compile error.
+omitting it is a compile error. **It must also stamp its `ConstructType`
+tag** (#102, 2026-08-25): the compile-pass walkers (`Inferencer::
+for_each_child`, the resolver's `for_each_child` / `for_each_child_slot`
+/ `fmi_children`) dispatch on `Construct::ct` with EXHAUSTIVE switches —
+no `default`, so `-Werror=switch` fails the build until the new kind is
+classified in each — and the `Construct` ctor ML_CHECKs the tag is not
+`other`, so an unstamped class aborts `-rt` on its first construction.
+This replaced the walkers' dynamic_cast chains, which were ~86% of
+compile Ir (139.7M -> 56.4M on 83's compile, -60%; the residual is the
+per-node dynamic_cast ladders inside the passes, tracked in #102).
 
 ## Conventions
 
