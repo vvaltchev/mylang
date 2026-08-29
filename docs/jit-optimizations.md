@@ -8880,3 +8880,41 @@ pcs"). Building the case found a real oracle subtlety: the first
 shape produced an exact density TIE (cu/cs 3/3 vs 4/4) and the
 tie rule kept the active - the MYLANG_LSRADBG2 contest probe in
 jit_lsra_assign is what surfaced it, and it stays.
+
+## The second-chance re-queue (#103b-2, 2026-08-25)
+
+The walk is event-driven now: piece STARTS and RE-BIDS process in
+(pc, kind, slot) order. A contest loser - a denied newcomer, a
+whole-demoted active, an eviction remainder - PARKS and re-bids at
+the earliest lin point after the loss (one pending re-bid per
+piece; candidacy re-checked with the >= 2-events floor, and events
+only shrink with pc, so a first failure is final). A won re-bid
+splits its piece: [s, at) stays memory, [at, e) takes the
+register. Lin-ness bounds everything: a loop body has no lin
+points, so a loser cannot ping-pong inside one, and a re-bid start
+is a legal install pc by construction (the snap's own rule).
+
+WHY IT EXISTS: the walk visits each piece once, at its start, so a
+loser's verdict was sealed the moment it lost - when the winner
+DIED mid-run the freed register went to whoever arrived next,
+never back to the still-live loser. The residual shape (no full
+loop in the loser's use gap, so the hole pass cannot pre-split):
+b touched sparsely in loop 1, hot in loop 2, out-densitied by a
+in loop 1 - b re-bids at the post-loop-1 lin point and takes the
+register for loop 2, out-densitying the loop-2 counter.
+
+THE HISTORY IS THE POINT: this was built once during #96 and
+REJECTED at +7.9%/iter on 83_regs_int_40 - under furthest-next-use
+eviction, re-queued pieces churned (install, re-evict, seam cost
+each round). The density contest closes that direction by
+construction: a sparse re-entrant cannot displace a dense holder.
+MEASURED on the revival: 87 of 88 corpus benches byte-identical
+per-iteration, 68_nested +0.10% (8 re-bids in its plan - named,
+accepted), 83's plan takes 2 re-bids at ZERO per-iteration cost -
+the exact bench that killed v1. Wall flat on 83/89/68.
+
+PINNED by `second chance serves the survivor` (K=1, the residual
+shape; asserts b's residency AND plan.rebids >= 1 - the vacuity
+guard); watched failing with park() neutered ("b resident 0 pcs" +
+"rebids == 0"). Reach: `lsra_rebids` (JITSTATS) - 68_nested and
+83_regs_int_40 on the corpus.

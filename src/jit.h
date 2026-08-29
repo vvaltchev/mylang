@@ -389,8 +389,10 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
  * that retires the pick's run-wide bad()): the event pc itself becomes
  * a one-pc forced-memory piece, the stretches between events stay
  * allocatable. An interval with float facts, or with no use inside a
- * piece (jit_next_use), is not a candidate. Then the classic walk:
- * pieces by start, expire-and-free, take a free register, and at
+ * piece (jit_next_use), is not a candidate. Then the walk -
+ * EVENT-DRIVEN since the second chance (#103b-2): piece starts and
+ * RE-BIDS process in (pc, kind, slot) order with expire-and-free,
+ * take a free register, and at
  * pressure EVICT the piece with the LOWEST use DENSITY over its
  * remaining interval - uses-remaining / span-remaining, the newcomer
  * competing too (a heuristic, so a wrong choice costs a reload, never
@@ -400,7 +402,16 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
  * loser at the contested pc: the evicted piece keeps
  * its register UP TO the contested pc, the remainder goes to memory.
  * That split is what lets one variable use different registers - or
- * none - in different parts of one run. Registers are abstract indices
+ * none - in different parts of one run. A contest LOSER is not memory
+ * forever: it PARKS and re-bids at the next lin point (one pending
+ * re-bid per piece; a body has no lin points, so no ping-pong inside
+ * a loop), and a WON re-bid splits its piece - [s, at) memory,
+ * [at, e) resident (LsraOut::rebids counts the wins; the
+ * `lsra_rebids` JITSTATS row is their compile-time reach). The first
+ * build of the idea was rejected (+7.9%/iter on 83) under
+ * furthest-next-use eviction; the density contest closes that churn
+ * direction - a sparse re-entrant cannot displace a dense holder -
+ * and 83's plan now takes 2 re-bids at zero per-iteration cost. Registers are abstract indices
  * 0..K-1 here; the physical binding (pool order, callee/caller-saved
  * cost, rax's ISA facts) is 2b-ii's cost model.
  *
@@ -419,7 +430,11 @@ struct LsraPiece {
 struct LsraOut {
     std::vector<LsraPiece> pieces;   /* sorted by (start, slot) */
     int cuts = 0;            /* extra pieces made by event cutting */
-    int evictions = 0;       /* pressure splits (the second chance) */
+    int evictions = 0;       /* pressure splits */
+    int rebids = 0;          /* WON second-chance re-entries: a
+                              * contest loser that parked, re-bid at
+                              * a lin point and took a register for
+                              * its remainder (#103b-2) */
 };
 /* FLOAT MODE (F2, the xmm twin): pass `fev` non-null and the scan
  * allocates the FLOAT pool instead - cuts, evidence, the admission
@@ -1204,6 +1219,7 @@ extern "C" unsigned long g_jit_lsra_fpins;
 /* F4b: float transitions EXECUTED (bumped from the emitted seam code;
  * g_jit_lsra_trans counts the GP pool only) */
 extern "C" unsigned long g_jit_lsra_ftrans;
+extern "C" unsigned long g_jit_lsra_rebids;
 /* seams the share plan refused inside a C2b hoist region (the
  * cold-path-bypass hazard; compile-time, not from emitted code) */
 extern "C" unsigned long g_jit_share_clamped;

@@ -28,6 +28,7 @@
  *     gets a type-check + bail instead.
  */
 
+#include <queue>
 #include "jit.h"
 #include "lowmem.h"
 #include "codegen.h"
@@ -78,6 +79,11 @@ unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
 unsigned long g_jit_lsra_pins = 0;     /* D3.b: lsra-chosen pin sets */
 unsigned long g_jit_lsra_fpins = 0;    /* F4a: lsra-chosen FLOAT pins */
 unsigned long g_jit_lsra_ftrans = 0;   /* F4b: FLOAT transitions run */
+unsigned long g_jit_lsra_rebids = 0;   /* #103b-2: won second-chance
+                                        * re-bids in ADOPTED plans - a
+                                        * COMPILE-time reach counter
+                                        * (both pools), unlike its
+                                        * emitted-code siblings */
 unsigned long g_jit_share_clamped = 0; /* seams refused inside a hoist
                                         * region (compile-time count) */
 unsigned long g_jit_lsra_trans = 0;    /* D3.b: executed transitions */
@@ -9288,6 +9294,7 @@ void jit_stats_report()
         { "lsra_pins",        &g_jit_lsra_pins },
         { "lsra_fpins",       &g_jit_lsra_fpins },
         { "lsra_ftrans",      &g_jit_lsra_ftrans },
+        { "lsra_rebids",      &g_jit_lsra_rebids },
         { "lsra_trans",       &g_jit_lsra_trans },
         { "range_share",      &g_jit_range_share },
         { "two_addr",         &g_jit_two_addr },
@@ -11989,10 +11996,33 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
      * iteration contains no complete loop, so a hot body never gains
      * a per-iteration seam. A split side keeps candidacy only with
      * >= 2 events inside (a def-only prologue piece or a lone sum
-     * read is not worth a reload). */
+     * read is not worth a reload). The edge scan, `lin_at` and
+     * `evs_in` live at function scope: the WALK's second chance
+     * (below) re-bids at lin points and re-checks candidacy with the
+     * same primitives. */
+    std::vector<std::pair<int, int>> hedges;
+    jit_run_edges(ck, begin, end, hedges);
+    const auto evs_in = [&](int slot, uint32_t s, uint32_t e2) {
+        std::vector<uint32_t> r;
+        if (fm) {
+            for (const FltEvent &e3 : *fev)
+                if (e3.slot == slot && e3.pc >= s && e3.pc < e2
+                        && e3.kind != FltEvent::mem)
+                    r.push_back(e3.pc);
+        } else {
+            for (const MemEvent &u : int_uses)
+                if (u.slot == slot && u.pc >= s && u.pc < e2)
+                    r.push_back(u.pc);
+        }
+        std::sort(r.begin(), r.end());
+        r.erase(std::unique(r.begin(), r.end()), r.end());
+        return r;
+    };
+    const auto lin_at = [&](uint32_t x) {
+        return x == begin
+               || jit_lin_point(hedges, static_cast<int>(x));
+    };
     {
-        std::vector<std::pair<int, int>> hedges;
-        jit_run_edges(ck, begin, end, hedges);
         std::vector<std::pair<uint32_t, uint32_t>> bedges;
         for (size_t p2 = begin; p2 < end; p2++) {
             const Instr &in = ck.code[p2];
@@ -12001,26 +12031,6 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                 bedges.push_back({ static_cast<uint32_t>(in.target),
                                    static_cast<uint32_t>(p2) });
         }
-        const auto evs_in = [&](int slot, uint32_t s, uint32_t e2) {
-            std::vector<uint32_t> r;
-            if (fm) {
-                for (const FltEvent &e3 : *fev)
-                    if (e3.slot == slot && e3.pc >= s && e3.pc < e2
-                            && e3.kind != FltEvent::mem)
-                        r.push_back(e3.pc);
-            } else {
-                for (const MemEvent &u : int_uses)
-                    if (u.slot == slot && u.pc >= s && u.pc < e2)
-                        r.push_back(u.pc);
-            }
-            std::sort(r.begin(), r.end());
-            r.erase(std::unique(r.begin(), r.end()), r.end());
-            return r;
-        };
-        const auto lin_at = [&](uint32_t x) {
-            return x == begin
-                   || jit_lin_point(hedges, static_cast<int>(x));
-        };
         if (!bedges.empty()) {
         const size_t cap = out.pieces.size() * 4 + 16;
         for (size_t i = 0; i < out.pieces.size()
@@ -12106,8 +12116,22 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                                             : a.slot < b.slot;
               });
 
-    /* (2)+(3) THE WALK. `active` holds indices of register-resident
-     * pieces; `free_regs` is a lowest-first pool of abstract indices. */
+    /* (2)+(3) THE WALK - EVENT-DRIVEN since the SECOND CHANCE
+     * (#103b-2). `active` holds indices of register-resident pieces;
+     * `reg_free` is a lowest-first pool of abstract indices. Two
+     * event kinds, processed in (pc, kind, slot) order: a piece
+     * START (kind 0, as before), and a RE-BID (kind 1) - a contest
+     * LOSER is no longer memory forever: it PARKS and re-enters at
+     * the next lin point (a legal install pc, the snap's own
+     * legality; lin-ness also bounds the re-bid count - a loop body
+     * has no lin points, so a loser cannot ping-pong inside one).
+     * A winning re-bid SPLITS its piece: [s, at) stays memory,
+     * [at, e) takes the register. The first build of this idea was
+     * rejected (+7.9%/iter on 83) under furthest-next-use eviction;
+     * the density contest closes that churn direction by
+     * construction - a sparse re-entrant cannot displace a dense
+     * holder. NOTE any reference into out.pieces dies at a
+     * push_back - index after appending. */
     std::vector<size_t> active;
     std::vector<char> reg_free(static_cast<size_t>(K), 1);
     const auto take_lowest = [&]() -> int {
@@ -12115,17 +12139,62 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
             if (reg_free[r]) { reg_free[r] = 0; return r; }
         return -1;
     };
-    /* split remainders are APPENDED during the walk; they are memory
-     * by decision (v1: no re-queue - the second-chance re-entry is a
-     * recorded quality follow-up), so the walk covers only the
-     * original pieces, in start order. NOTE any reference into
-     * out.pieces dies at a push_back - index after appending. */
-    const size_t n_walk = out.pieces.size();
-    for (size_t i = 0; i < n_walk; i++) {
-        LsraPiece &p = out.pieces[i];
-        /* expire everything that ended at or before this start */
+    const auto uses_rem = [&](int slot, uint32_t from,
+                              uint32_t to) -> uint64_t {
+        uint64_t n = 0;
+        if (fm) {
+            for (const FltEvent &e2 : *fev)
+                if (e2.slot == slot && e2.pc >= from && e2.pc < to
+                        && e2.kind != FltEvent::mem)
+                    n++;
+        } else {
+            for (const MemEvent &u : int_uses)
+                if (u.slot == slot && u.pc >= from && u.pc < to)
+                    n++;
+        }
+        return n;
+    };
+    struct WEv {
+        uint32_t pc;
+        int kind;                        /* 0 = start, 1 = re-bid */
+        size_t idx;
+        int slot;
+    };
+    const auto wafter = [](const WEv &a, const WEv &b) {
+        if (a.pc != b.pc) return a.pc > b.pc;
+        if (a.kind != b.kind) return a.kind > b.kind;
+        return a.slot > b.slot;
+    };
+    std::priority_queue<WEv, std::vector<WEv>, decltype(wafter)>
+        wq(wafter);
+    for (size_t i = 0; i < out.pieces.size(); i++)
+        if (!out.pieces[i].forced_mem)
+            wq.push({ out.pieces[i].start, 0, i, out.pieces[i].slot });
+    /* park a memory piece: schedule ONE re-bid at the earliest lin
+     * point after `from` - if the events remaining there are below
+     * the candidacy floor, later points are only poorer (events
+     * shrink with pc) and the piece stays memory for good */
+    const auto park = [&](size_t idx, uint32_t from) {
+        const LsraPiece &pp = out.pieces[idx];
+        for (uint32_t x = from + 1; x < pp.end; x++)
+            if (lin_at(x)) {
+                if (evs_in(pp.slot, x, pp.end).size() >= 2)
+                    wq.push({ x, 1, idx, pp.slot });
+                return;
+            }
+    };
+    while (!wq.empty()) {
+        const WEv wev = wq.top();
+        wq.pop();
+        const uint32_t at = wev.pc;
+        const size_t i = wev.idx;
+        if (wev.kind == 1
+                && (out.pieces[i].reg >= 0
+                    || at >= out.pieces[i].end))
+            continue;                    /* stale (already split) */
+        /* expire everything that ended at or before this pc */
         for (size_t a = 0; a < active.size(); ) {
-            if (out.pieces[active[a]].end <= p.start) {
+            if (out.pieces[active[a]].end <= at) {
                 reg_free[out.pieces[active[a]].reg] = 1;
                 active[a] = active.back();
                 active.pop_back();
@@ -12133,14 +12202,8 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                 a++;
             }
         }
-        if (p.forced_mem)
-            continue;
-        const int r = take_lowest();
-        if (r >= 0) {
-            p.reg = r;
-            active.push_back(i);
-            continue;
-        }
+        int r = take_lowest();
+        if (r < 0) {
         /* pressure: the LOWEST use DENSITY over the REMAINING
          * interval loses - uses in [here, end) over (end - here),
          * cross-multiplied so there is no float compare. The 89
@@ -12150,23 +12213,11 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
          * loop was far - while the pick's static COUNT ranking, which
          * IS a density ranking, served both and won the wall. The
          * newcomer competes too; ties evict the smaller slot (the
-         * pre-density tie direction, kept). */
-        const auto uses_rem = [&](int slot, uint32_t from,
-                                  uint32_t to) -> uint64_t {
-            uint64_t n = 0;
-            if (fm) {
-                for (const FltEvent &e2 : *fev)
-                    if (e2.slot == slot && e2.pc >= from && e2.pc < to
-                            && e2.kind != FltEvent::mem)
-                        n++;
-            } else {
-                for (const MemEvent &u : int_uses)
-                    if (u.slot == slot && u.pc >= from && u.pc < to)
-                        n++;
-            }
-            return n;
-        };
-        const uint32_t here0 = p.start;
+         * pre-density tie direction, kept). A re-bidding piece
+         * contests exactly like an arrival, over its [at, end)
+         * remainder. */
+        const LsraPiece &p = out.pieces[i];
+        const uint32_t here0 = at;
         int far_i = -1;                  /* -1 = the newcomer loses */
         uint64_t lu = uses_rem(p.slot, here0, p.end);
         uint64_t ls = p.end - here0;
@@ -12208,13 +12259,20 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                     far_i < 0 ? "NEWCOMER" : "active",
                     far_i < 0 ? p.slot
                               : out.pieces[active[far_i]].slot);
-        if (far_i < 0)
-            continue;                    /* the newcomer stays memory */
+        if (far_i < 0) {
+            /* the loser is the (re)bidder itself: park it - the
+             * second chance. A re-bid that loses parks again at the
+             * NEXT lin point (strictly later), so the walk
+             * terminates. */
+            park(i, here0);
+            continue;
+        }
         /* split the loser at this pc: it KEEPS its register up to
-         * here; the remainder is a fresh memory piece */
+         * here; the remainder is a fresh memory piece, PARKED for
+         * its own second chance */
         const size_t li = active[far_i];
         const int freed = out.pieces[li].reg;
-        const uint32_t here = p.start;
+        const uint32_t here = at;
         int kept_uses = 0;
         if (fm) {
             for (const FltEvent &e : *fev)
@@ -12233,15 +12291,34 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
             rest.start = here;
             rest.reg = -1;
             out.pieces[li].end = here;
-            out.pieces.push_back(rest);  /* invalidates p and every
+            out.pieces.push_back(rest);  /* invalidates every
                                           * reference - only indices
                                           * below this line */
+            park(out.pieces.size() - 1, here);
         } else {
             out.pieces[li].reg = -1;     /* never really held it here */
+            park(li, here);
         }
-        active[far_i] = i;
-        out.pieces[i].reg = freed;
+        active[far_i] = active.back();
+        active.pop_back();
         out.evictions++;
+        r = freed;
+        }                                /* r < 0 (pressure) */
+        /* install at register r */
+        if (wev.kind == 0) {
+            out.pieces[i].reg = r;
+            active.push_back(i);
+        } else {
+            /* a WON re-bid splits: [s, at) stays memory, [at, e)
+             * takes the register */
+            LsraPiece seg = out.pieces[i];
+            seg.start = at;
+            seg.reg = r;
+            out.pieces[i].end = at;
+            out.pieces.push_back(seg);
+            active.push_back(out.pieces.size() - 1);
+            out.rebids++;
+        }
     }
     std::sort(out.pieces.begin(), out.pieces.end(),
               [](const LsraPiece &a, const LsraPiece &b) {
@@ -21351,6 +21428,10 @@ retry_emission:
                                       liu, static_cast<int>(max_pins),
                                       tp.pieces, entry, tr, nullptr,
                                       &lsra_noreach)) {
+#ifdef TESTS
+                        g_jit_lsra_rebids +=
+                            static_cast<unsigned long>(tp.rebids);
+#endif
                         std::map<int, long> w;
                         for (size_t k2 = 0; k2 < liv.size(); k2++)
                             w[liv[k2].slot] += lq[k2].uses_int
@@ -21584,6 +21665,10 @@ retry_emission:
                                           static_cast<int>(MAX_FCACHED),
                                           fp.pieces, fentry, ftr,
                                           &lfev, &lsra_noreach)) {
+#ifdef TESTS
+                            g_jit_lsra_rebids +=
+                                static_cast<unsigned long>(fp.rebids);
+#endif
                             fhot.clear();
                             for (size_t r = 0; r < fentry.size(); r++)
                                 if (fentry[r] >= 0)
