@@ -71,6 +71,87 @@ code in this repository.
 > A change that alters behavior or architecture but leaves the docs stale is
 > incomplete.
 
+## ⛔ INFRASTRUCTURE FIRST, TESTS SECOND, FEATURES/OPTIMIZATIONS LAST
+## (maintainer-set, 2026-08-18)
+
+The priority order, always. **Fixing a tool, a script or a test needs
+NO approval** — do not ask, do not offer it as an option, do not defer
+it to a follow-up task. Fix it, then continue.
+
+**THE INSTRUMENTS IN THIS REPO — the things whose output is treated as
+fact, and which must therefore be correct before anything built on
+them means anything:**
+
+- **`-vdj`** (disasm.cpp) - what machine code was emitted. Oracle: it
+  self-reports `DUMP IS UNRELIABLE`, plus the `-rt` entry
+  `jit: -vdj decodes every emitted form, address-free`.
+- **`-vd`** (disasm.cpp) - what bytecode was emitted. Oracle:
+  `myv_round_trip` (a loaded image vs a fresh compile).
+- **`-s` / `-a` / `-dti`** - what the optimizers did to the tree.
+  Oracle: the `analyze:` `-rt` entry.
+- **`scripts/vdjcmp.sh`** - "is my JIT change a pure restructuring?"
+  Oracle: a SELF-TEST - one binary against itself must be 108/108.
+- **`scripts/regcensus.py`** - how much work is left to free a
+  register. Oracle: it DERIVES its accessor list from the source.
+- **`bench/run.py`** - is it faster. Oracle: RULE B1, the build-config
+  gate, and the machine-speed marker.
+- **`MYLANG_JITSTATS`** - which TIER a program's calls actually took.
+  Oracle: the counters are bumped from EMITTED code only.
+- **`tests/corpus_diff.sh`** - do the engines agree. Oracle: the
+  `--levers` / `--cold` / `--xrot` matrices.
+- **`tests/myv_doc_check.py`** - is `docs/myv-format.txt` still the
+  spec. Oracle: it is written from the DOC, not from serialize.cpp.
+
+**FIX THE TOOL, NOT THE SCRIPT THAT READS IT.** Three cases from this
+repo, all found in one week, all the same shape:
+
+ - **the disassembler (2026-08-17/18).** `-vdj` could not decode **5543
+   bytes** corpus-wide — six missing opcodes and a SIB decoder that
+   never consumed its displacement — and printed confident wrong
+   mnemonics rather than admitting it. The first response was to mask
+   the symptoms in `vdjcmp.sh` with a sed pipeline plus `setarch -R`.
+   The mask was hex-only, #96 step 3 made the values decimal, and from
+   that day the script reported **0 identical / 108 differing for every
+   comparison** — it had stopped being an oracle and looked exactly
+   like a catastrophic change. It also reported a binary as differing
+   from ITSELF (31 of 108), which no regex could ever have fixed. The
+   fix belonged in `disasm.cpp`; afterwards the comparison script is a
+   plain `cmp`;
+ - **the register census (2026-08-17).** `regcensus.py`, written
+   expressly to count hardcoded register uses, reported **14** for r9
+   where the truth is **87** — it could not see `movabs_r9`,
+   `cmp_r9_rdx`, `lea_rdi`, `slots_to_arg0`, `store_elem_byte_dil`,
+   because the register is in the METHOD NAME. Acting on that number
+   put an unsafe register in the JIT pin pool and shipped a wrong
+   answer for a day;
+ - **`bench/run.py` defaulting to the maintainer's binary** (RULE B1) —
+   the same class: a plausible number measured from the wrong subject.
+
+**THE THREE PROPERTIES a MyLang instrument must have**, and where each
+already exists so a new one can copy it:
+
+ 1. **REPRODUCIBLE.** `-vdj` prints `<int-tag>`/`<addr>`/`<helper>`
+    instead of baked pointers, so two runs and two separately-linked
+    binaries give identical text (`MYLANG_VDJ_ADDRS=1` for the digits).
+    Before that it was not comparable at all.
+ 2. **IT SAYS WHEN IT DOES NOT KNOW.** `-vdj` counts undecoded bytes
+    AND skipped op marks (a mark is an offset the JIT recorded at a
+    real instruction boundary, so stepping past one proves the decode
+    drifted) and prints a banner. `run.py` prints its
+    `mylang : <path>` header and refuses a wrong build config.
+ 3. **IT SELF-TESTS.** `vdjcmp.sh` compares a binary with ITSELF and
+    exits 2 if that is not identical — otherwise it cannot distinguish
+    "your change altered the code" from "the tool broke", and it
+    reported the second as the first for weeks.
+
+**And the corollary for TESTS of an instrument: watch it fail.** The
+`-vdj` coverage check was VACUOUS THREE TIMES before it caught
+anything — it counted a bytecode op NAME for its vacuity guard;
+`-vdj` is `g_jit_annotate`, not a dump flag, so the dump had no native
+section at all; and its programs were all statically typed while the
+missing opcode lives in a boxed TYPE CHECK. See *THE VACUOUS-TEST
+TRAP*.
+
 ## What this is
 
 MyLang is an educational, dynamically-typed scripting language (C-looking
