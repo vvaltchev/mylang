@@ -1124,6 +1124,25 @@ uses remain):
  4. THE CTX/CAPTURE WALKERS (r9 chains): same protocol family.
  5. bump_counter's rax shuttle: TESTS-only emission - zero
     shipping payoff; convert only for the ratchet's sake.
+#103 THE FLOAT-PRESSURE BENCH LANDED (2026-08-26):
+bench/my/89_regs_float_08.my + the cpp twin - PHASED float
+pressure (two loops, each hot on 4 accumulators + its float
+index: 5 candidates per phase vs the pool's 4, 10 across the
+run). Two design rules baked into it: the INT loop counters stay
+out of every float expression (one usef touch would disqualify
+them from the int pool - the disjoint rule), and every constant
+is dyadic with identical IEEE op order on both sides (the
+4-digit result compares exactly; verified my == tw == cpp).
+⛔ THE ORACLE'S FIRST VERDICT: THE LEVER LOSES THE SHAPE -
++6.5%/iter lever-on (164.0M vs 154.0M), even though the float
+machinery visibly engages (lsra_fpins 1, lsra_ftrans 8 = the
+phased ideal's 4 evicts + 4 installs). The per-pc float pieces
+UNDERPERFORM the pick's whole-run 4-of-10 on the exact shape
+they were built for. NEXT DIAGNOSTIC (the 43 mold): LSRADBG the
+plan on 89's work chunk - are the phase-2 pieces served,
+demoted, or rescued into something degenerate; then the -vdj
+loop-body diff lever on/off. Repro: the bench at scale 1/3,
+callgrind, MYLANG_JIT_LSRA=0 as the baseline.
 THE FLIP GATE WAS - THE MAINTAINER'S CALL, with the
 ledger now complete on both axes: Ir (zero per-iteration
 regressions corpus-wide; wins 06 -16.8%, 81 -2.7%, 82 -1.6%, 83
