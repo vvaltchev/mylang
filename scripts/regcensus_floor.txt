@@ -22,7 +22,16 @@ XMM0    0
 XMM1    0
 TOTAL   0
 RAWENC  15
-CONV 3    # 103: the convertible residue - only ever lower this.
+CONV 0    # 103: CLOSED 2026-08-25 - the mandate's zero. The final
+# 3 uses were ALREADY-BUILT conversions hiding behind stale struct
+# comments ('this lands INERT, and making them allocatable is the
+# next step' - written when the plan landed inert, false since
+# #96 (c) turned the picks live on 2026-08-20): elem_read_plan
+# allocates data AND count, elem_scratch_plan allocates data, and
+# the tagged literals are pick()'s preferred seeds (reg:proto,
+# like their idx/val siblings). Every one of the original 499
+# conv uses is now read and dispositioned: isa 71 / abi 173 /
+# proto 497 / conv 0.
 # 2026-08-25 batch 3, every remaining site READ: the model-check's
 # CL assert + ElemScratch count are the ISA (retagged reg:isa);
 # the allocated elem roles' default seeds, the ELEM_CAND pool
