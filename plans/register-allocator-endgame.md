@@ -1053,7 +1053,25 @@ no slot that is both elided and transitioned today, so the
 filters were filtering nothing - the win materializes only when
 that overlap appears, and the bound now cannot cost it. Battery:
 rt + corpus both directions, xrot on the default, nolowmem - all
-green. REMAINING v1 bounds: TEMP pieces; home/piece mixing.
+green. ⛔ THE OTHER TWO v1 BOUNDS STAY, EACH WITH ITS WRITTEN REASON
+(the guard-elision family's "do not push further" shape):
+ - TEMP PIECES: lever A's contract bakes "TEMPS only... a local
+   is observable state and may be N5-cached; A TEMP IS NEITHER" -
+   skip_write deliberately leaves a dead temp's SLOT stale, and
+   every fwd path assumes no register caches it; a pinned temp
+   would read stale state through reg_at. Lifting means
+   redesigning the forwarding contract (fwd consulting reg_at,
+   pin updates on skip, the staleness invariant rewritten) - and
+   the prize is backwards: forwarding serves the dominant
+   adjacent-temp shape in ZERO instructions, which a pin cannot
+   beat; multi-use long-lived temps are rare by construction
+   ("codegen's expression temps are consumed exactly once").
+ - HOME/PIECE MIXING: the seam flush arms write the FRAME slot;
+   a home's stack qword would go stale unless every seam, exit
+   and bracket becomes per-pc dual-location-aware - a coherence
+   redesign for a shape the whole-run rescue and the homes tier
+   already mostly serve (a slot heavy enough to want both is
+   heavy enough to be rescued whole-run).
 THE FLIP GATE WAS - THE MAINTAINER'S CALL, with the
 ledger now complete on both axes: Ir (zero per-iteration
 regressions corpus-wide; wins 06 -16.8%, 81 -2.7%, 82 -1.6%, 83
