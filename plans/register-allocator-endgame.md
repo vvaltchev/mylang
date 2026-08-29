@@ -1150,6 +1150,13 @@ iteration (4 reads + the increment) vs the accumulators' 2, so
 the pick pins both indices and wins. f3's whole-run demotion is
 the same distance-vs-density miss at pc 8 (fi's arrival evicts
 f3, whose 2-op/iter recurrence out-densities fi's 1).
+(a) IS BUILT AND MEASURED (2026-08-24): the contest is density
+(uses-remaining / span-remaining, cross-multiplied, ties keep the
+old smaller-slot direction). Corpus old-on vs new-on: 86 of 88
+byte-identical, 89 -6.10% (EXACT pick parity, off=new-on to the
+Ir), 68_nested -0.12%, zero regressions; 89 wall 0.90x. Pinned by
+the `density beats distance` K=1 case, watched failing under a
+next-use sabotage. (b) remains the open follow-up below.
 THE FIX CLASS, for the maintainer to sequence: (a) DENSITY-AWARE
 eviction/admission (uses-remaining / span-remaining instead of
 next-use distance) reaches roughly pick parity on this shape; (b)

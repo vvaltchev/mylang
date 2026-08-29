@@ -8804,3 +8804,41 @@ CHANGES with this flip, by design - vdjcmp against a pre-flip
 binary reports the allocator's differences, and byte-identity
 retires as the default-config oracle in favor of corpus_diff +
 the per-iteration Ir ledger.
+
+## Density-aware eviction (#103a, 2026-08-24)
+
+The scan's pressure contest chooses its victim by USE DENSITY over
+the remaining interval (uses-remaining / span-remaining,
+cross-multiplied, newcomer competing; ties evict the smaller slot -
+the pre-density tie direction), replacing furthest-next-use.
+
+WHY: 89_regs_float_08 - the phased float-pressure oracle - measured
+the lever +6.5% Ir/iter WORSE than the pick on the very shape the
+float machinery was built for. The diagnosis (one slot): every
+float's interval spans prologue-def -> sum-read, so at fj's walk
+arrival the pool was full and fj had the FURTHEST next use (its
+loop was ~18 pcs away) - the newcomer stayed memory for its whole
+interval, paying a tagged store + four reloads per phase-2
+iteration, while the pick's static COUNT ranking (which IS a
+density ranking) pinned fj in xmm6 and won. f3's whole-run
+demotion was the same miss: distance evicted the 2-op/iter
+recurrence to keep the 1-op index.
+
+MEASURED (Ir/iter, OPT=1 ASSERTS=0, -npc, old-on vs new-on over
+the 88-bench corpus): 86 byte-identical, 89_regs_float_08 -6.10%
+(exact pick parity - the whole regression erased), 68_nested
+-0.12%. Zero regressions. Wall on 89: 176ms vs 196ms best-of-5,
+interleaved twice (0.90x). Off-config (the pick) untouched by
+construction.
+
+PINNED by the `density beats distance` jit_lsra_check case - the
+89 microshape at K=1 (a near-next-use sparse holder vs a far dense
+newcomer); watched failing under a next-use sabotage ("dense z
+holds 0 pcs, max 8").
+
+WHAT THIS IS NOT: parity, not the win. Interval SPLITTING WITH
+LIFETIME HOLES (split fj to its hot phase piece AND split the
+phase-1 pins' idle gaps so a register is actually free to receive
+it) beats both allocators on this shape - each phase would pay ONE
+memory slot where the pick pays two + four. That is the
+second-chance revival, recorded in the plan as the (b) follow-up.

@@ -391,9 +391,13 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
  * allocatable. An interval with float facts, or with no use inside a
  * piece (jit_next_use), is not a candidate. Then the classic walk:
  * pieces by start, expire-and-free, take a free register, and at
- * pressure EVICT the active piece whose next use (jit_next_use at the
- * contested pc - a heuristic, so a wrong choice costs a reload, never
- * an answer) is furthest - splitting it there: the evicted piece keeps
+ * pressure EVICT the piece with the LOWEST use DENSITY over its
+ * remaining interval - uses-remaining / span-remaining, the newcomer
+ * competing too (a heuristic, so a wrong choice costs a reload, never
+ * an answer; it replaced furthest-next-use after 89_regs_float_08
+ * showed distance evicting a 2-op/iter recurrence to keep a 1-op
+ * index and leaving the far-loop index unserved) - splitting the
+ * loser at the contested pc: the evicted piece keeps
  * its register UP TO the contested pc, the remainder goes to memory.
  * That split is what lets one variable use different registers - or
  * none - in different parts of one run. Registers are abstract indices
