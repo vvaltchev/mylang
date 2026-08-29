@@ -1066,6 +1066,24 @@ green. ⛔ THE OTHER TWO v1 BOUNDS STAY, EACH WITH ITS WRITTEN REASON
    adjacent-temp shape in ZERO instructions, which a pin cannot
    beat; multi-use long-lived temps are rare by construction
    ("codegen's expression temps are consumed exactly once").
+ - THE SECOND CHANCE: BUILT, WATCHED, AND REJECTED ON MEASUREMENT
+   (2026-08-26). The trimmed retry (a pressure loser - newcomer or
+   split remainder, reg -1 non-forced - re-admitted from the
+   earliest pc a register is free through its end, span-accurate
+   against ALL pieces after the walk-end-state version handed out
+   an overlapping register and the snap's model caught it; per-
+   piece evidence re-checked on the trimmed range; the firing
+   shape needs the WINNER TO DIE before the loser's int tail - a
+   winner idling across it blocks the register, and a boxed print
+   tail is a mem event, not evidence). It fired, the suite was
+   green everywhere including the off-arena lane (after
+   jit_hoist_c1 joined the force-the-pick convention, kept) - and
+   ⛔ 83_regs_int_40 measured +7.9%/iter (435M vs 403M): the
+   marginal residency's install/flush seams cost more than the
+   memory it replaced, the admission-floor lesson in a new coat.
+   REVERTED per the flatness mandate; a re-attempt starts from a
+   PROFITABILITY model for the trimmed range (uses saved vs seam
+   cost), not from reach.
  - HOME/PIECE MIXING: the seam flush arms write the FRAME slot;
    a home's stack qword would go stale unless every seam, exit
    and bracket becomes per-pc dual-location-aware - a coherence
