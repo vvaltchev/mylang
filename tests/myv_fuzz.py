@@ -45,7 +45,11 @@ import tempfile
 
 # Two programs, because the SHAPE decides which pools exist at all: a small
 # one keeps the signal-to-offset ratio high, while the fat one is the only
-# way to reach the struct / dict / closure / try-region records.
+# way to reach the struct / dict / closure / try-region records - and the
+# `const OPS = [sq]` at its end is there for the VALUE-CODEC's `func` tag,
+# the one record no corpus program used to produce. That gap was not
+# academic: read_value built its FuncObject with a NULL context and the
+# ctor dereferenced it, so the UNMUTATED image segfaulted on load.
 SMALL = """\
 struct P { int x; }
 func f(a) { var p = P(a); return p.x + 1; }
@@ -79,6 +83,10 @@ var fl = [1.0, 2.0, 3.0];
 var fs = 0.0;
 foreach (var f in fl) { fs += sqrt(f); }
 var bits = (s << 2) | 7;
+pure func sq(x) => x * x;
+const OPS = [sq];
+var dyn ops = runtime(OPS);
+bits += len(ops);
 print(s, joined, t, bits, fs > 0.0);
 """
 

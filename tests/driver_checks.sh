@@ -203,6 +203,37 @@ else
     fail "-v: MYLANG_NO_LOWMEM=1 did not refuse the arena [$out]"
 fi
 
+# A .myv whose chunk pool holds a FUNCTION value must LOAD. #137 bounds
+# every operand an image CONTAINS, but nothing bounded a constructor the
+# LOADER ITSELF calls: read_value built FuncObject(desc, nullptr), and the
+# ctor walked get_root_ctx(nullptr) - `while (ctx->parent)` on a null
+# pointer - so `mylang prog.myv` SEGFAULTED (rc 139) on a valid image of
+# our own making. A `pure func` in a const array is all it takes; nothing
+# in the corpus had one, which is why no net saw it. RULE 2 wants the
+# image to print exactly what the source printed, so compare the two runs
+# instead of just checking that neither crashed.
+cat > "$TMP/pool.my" <<'PROG'
+pure func sq(x) => x * x;
+const OPS = [sq];
+var dyn ops = runtime(OPS);
+print(len(ops), array_storage(ops));
+PROG
+src_out=$("$BIN" "$TMP/pool.my" 2>&1)
+src_rc=$?
+if "$BIN" -c "$TMP/pool.my" -o "$TMP/pool.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/pool.myv" 2>&1)
+    img_rc=$?
+    if [ "$src_rc" = 0 ] && [ "$img_rc" = 0 ] && \
+       [ "$img_out" = "$src_out" ]; then
+        pass "myv: an image whose pool holds a FUNCTION value loads and runs"
+    else
+        det="src $src_rc [$src_out] img $img_rc [$img_out]"
+        fail "myv: a pool FUNCTION value did not load ($det)"
+    fi
+else
+    fail "myv: -c refused a program with a function value in a pool"
+fi
+
 # #96: the hardcoded-register RATCHET (scripts/regcensus.py header has
 # the rule). A source-analysis check, not a binary one - it lives here
 # because every CI lane and the local battery already run this script.

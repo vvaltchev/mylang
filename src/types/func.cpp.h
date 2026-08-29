@@ -102,10 +102,24 @@ FuncObject::FuncObject(const FuncObject &rhs)
 
 FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
     : func(func)
-    , capture_root(get_root_ctx(ctx))
+    /*
+     * A NULL ctx is legal, for exactly one caller: the .myv loader builds a
+     * pool closure before any EvalContext exists (serialize.cpp). This used
+     * to hand the null straight to get_root_ctx, whose `while (ctx->parent)`
+     * DEREFERENCED it - so `mylang prog.myv` SEGFAULTED for any image whose
+     * pool holds a function value (`const OPS = [sq];`), on a valid image of
+     * our own making. Such a closure is capture-free (the reader refuses any
+     * other kind), so it has nothing to snapshot and no root to remember;
+     * do_func_call substitutes the CALLER's root when it runs one.
+     */
+    , capture_root(ctx ? get_root_ctx(ctx) : nullptr)
 {
     if (func->captures.empty())
         return;
+
+    /* Past here the snapshot READS from `ctx`; the ctx-less caller above is
+     * capture-free, and the reader refuses an image that says otherwise. */
+    ML_CHECK_MSG(ctx, "a capturing closure needs a context to capture from");
 
     /* Snapshot each captured outer variable into a capture slot, in declaration
      * order (the resolver assigns SymKind::capture indices in the same order).

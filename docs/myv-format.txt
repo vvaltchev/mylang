@@ -735,7 +735,14 @@ keys and values, and recursively by itself.
     6  dict         see 11.2
     7  strct        see 11.3
     8  structtype   sref
-    9  func         dref     (a capture-free FuncObject)
+    9  func         dref     (a FuncObject; the descriptor MUST have
+                              NO captures - the writer refuses a
+                              capturing closure and the READER
+                              REJECTS one: "corrupt .myv (capturing
+                              closure in a pool)". A loaded closure
+                              gets no capture_root - it has no
+                              context to root at - and runs under
+                              its caller's root.)
 
 The writer ABORTS on any other type - "unserializable value type in a chunk
 pool".  An image is never silently lossy.
