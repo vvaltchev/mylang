@@ -31372,6 +31372,209 @@ static bool vm_codegen_shapes()
         && incdec_chain_ok && expr_body_chunk_ok;
 }
 
+/*
+ * ⛔ THE NATIVE DISASSEMBLER MUST DECODE EVERYTHING THE JIT EMITS.
+ *
+ * `-vdj` is the evidence for every claim about emitted code - which
+ * tier fired, whether a refactor changed anything, why a guard is
+ * there. On 2026-08-17 it was measured against the corpus for the first
+ * time and it could not decode **5543 bytes**: six opcodes were missing
+ * from `decode_one` (0x03/0x2B add/sub r64,r/m64; 0x3D cmp rax,imm32 -
+ * which #96 step 3 had just made common; 0x63 movsxd; 0x6B imul imm8;
+ * 0x88 the byte element store) and the SIB arm never consumed its
+ * displacement, so `mov rdi, [rsp+8]` printed as `mov rdi, [rsp+rsp*8]`
+ * and desynchronised the rest of the fragment.
+ *
+ * NONE of that failed anything. The dump just quietly lied, and two
+ * tools built on top of it (vdjcmp.sh, and my own reading of `-vdj`)
+ * inherited the lie.
+ *
+ * So the check is DERIVED FROM THE EMITTED CODE, not from a list of
+ * opcodes the test author remembered - the same principle as
+ * jit_fwd_family_coverage walking the opcode ENUM rather than the
+ * whitelist. Programs covering the JIT's shape space are compiled with
+ * the JIT ON and disassembled; the dump must contain no `.byte` and no
+ * skipped op mark. A new emitted instruction form fails this the day it
+ * is added.
+ *
+ * It also asserts the dump is REPRODUCIBLE (twice, byte for byte),
+ * because a baked ASLR-varying address printed numerically is the other
+ * way this tool stops being usable as evidence.
+ */
+static bool jit_disasm_decodes_all()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    /* Shape space, not a corpus: each line family drives a different
+     * emitter (element load/store per storage kind, elem2 nesting,
+     * captures, calls, float chains, strings, dicts, structs). */
+    const std::vector<std::vector<const char *>> progs = {
+      { "var a = range(64); var s = 0;",
+        "for (var i = 0; i < 64; i++) s += a[i];",
+        "print(s);" },
+      { "var a = range(64);",
+        "for (var i = 0; i < 64; i++) a[i] = a[i] * 2 + 1;",
+        "print(a[7]);" },
+      { "var b = [];  var i = 0;",
+        "for (i = 0; i < 40; i++) append(b, i % 3 == 0);",
+        "var n = 0;",
+        "for (i = 0; i < 40; i++) { if (b[i]) n = n + 1; }",
+        "print(n);" },
+      { "var m = make_array(8, func(r) => make_array(8, func[r](c) => r*c));",
+        "var t = 0;",
+        "for (var i = 0; i < 8; i++)",
+        "  for (var j = 0; j < 8; j++) t = t + m[i][j];",
+        "print(t);" },
+      { "var f = [];  var k = 0;",
+        "for (k = 0; k < 32; k++) append(f, k * 1.5);",
+        "var fs = 0.0;",
+        "for (k = 0; k < 32; k++) fs = fs + f[k] * 0.5;",
+        "print(fs > 0.0);" },
+      { "var cap = 3;",
+        "var g = func[cap](int n) {",
+        "    var s0 = 0; var s1 = 0; var s2 = 0; var s3 = 0;",
+        "    var s4 = 0; var s5 = 0; var s6 = 0; var s7 = 0;",
+        "    for (var i = 0; i < n; i++) {",
+        "        s0 += i; s1 += i * 2; s2 += i * 3; s3 += i * 4;",
+        "        s4 += i * 5; s5 += i * 6; s6 += i * 7; s7 += cap; }",
+        "    return s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7; };",
+        "print(g(runtime(64)));" },
+      { "func h(int x) { var t = x * 3; return t - 1; }",
+        "var s = 0;",
+        "for (var i = 0; i < 40; i++) { var r = h(i); s = s + r; }",
+        "print(s);" },
+      { "var d = {}; var i = 0;",
+        "for (i = 0; i < 20; i++) d[i] = i * i;",
+        "var s = 0;",
+        "for (i = 0; i < 20; i++) s = s + d[i];",
+        "print(s);" },
+      { "var t = \"abcdefghijklmnopqrstuvwxyz\"; var s = 0;",
+        "for (var i = 0; i < len(t); i++) s = s + ord(t[i]);",
+        "print(s);" },
+      { "struct P { int x; int y; }",
+        "var ps = []; var i = 0;",
+        "for (i = 0; i < 30; i++) append(ps, P(i, i * 2));",
+        "var s = 0;",
+        "for (i = 0; i < 30; i++) s = s + ps[i].x + ps[i].y;",
+        "print(s);" },
+      { "var s = 0;",
+        "for (var i = 1; i < 40; i++) s = s + (i * 7) / 3 + (i % 5)",
+        "           + (i << 2) + (i >> 1) + (i ^ 3);",
+        "print(s);" },
+      /* ⛔ THE TWO SHAPES THAT MAKE THIS TEST NON-VACUOUS, and the
+       * reason they are called out: the first version of this test had
+       * eleven programs, all statically typed, and the sabotage run
+       * (drop `cmp rax, imm32` from decode_one) PASSED - none of them
+       * emits a boxed TYPE CHECK, which is where that opcode lives.
+       * A float CONVERSION chain and a string CONCAT both do. This is
+       * the vacuous-test trap in its documented form: the test was
+       * written from the shapes I had in mind, not from the shapes the
+       * emitter produces. */
+      { "var fs = 0.0;",
+        "for (var i = 0; i < 40; i++) fs = fs + float(i) * 1.5;",
+        "print(fs > 0.0);" },
+      { "var t = \"\";",
+        "for (var i = 0; i < 30; i++) t = t + \"x\";",
+        "print(len(t));" },
+      { "var dyn q = runtime(3); var s = 0;",
+        "for (var i = 0; i < 40; i++) { s = s + int(q) + i; }",
+        "print(s);" },
+    };
+
+    /* ⛔ `-vdj` IS `g_jit_annotate`, NOT A DUMP FLAG. The native
+     * interleave only appears when codegen RECORDED the op marks, and
+     * that recording is off unless the CLI saw -vdj. Without this the
+     * dump is bytecode-only, every check below inspects text that
+     * contains no machine code, and the test passes no matter what the
+     * decoder does - which is exactly what happened until the vacuity
+     * guard was fixed to count native BLOCKS instead of the
+     * `enter.nat` bytecode op name. */
+    const bool ann_was = g_jit_annotate;
+    g_jit_annotate = true;
+    struct AnnRestore {
+        bool v; ~AnnRestore() { g_jit_annotate = v; }
+    } ann_restore{ ann_was };
+
+    auto dump = [&](const std::vector<const char *> &src) -> std::string {
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const Block *b = dynamic_cast<const Block *>(root.get());
+        if (!b)
+            return "";
+        return disassemble_program(b);
+    };
+
+    bool ok = true;
+    unsigned frags = 0;
+    const std::string NATIVE_HDR = "---- native x86-64";
+    for (size_t i = 0; i < progs.size(); i++) {
+        std::string d;
+        try {
+            d = dump(progs[i]);
+        } catch (Exception &e) {
+            /* catch the project's OWN base too - it does not derive
+             * from std::exception, so a bad test program would escape
+             * and abort the whole -rt run instead of failing this
+             * check (it did, on the first version of this test) */
+            cout << "  disasm[" << i << "]: threw " << e.name << ": "
+                 << e.msg << "\n";
+            ok = false;
+            continue;
+        } catch (...) {
+            cout << "  disasm[" << i << "]: threw\n";
+            ok = false;
+            continue;
+        }
+        if (d.find("DUMP IS UNRELIABLE") != std::string::npos) {
+            const size_t at = d.find("DUMP IS UNRELIABLE");
+            cout << "  disasm[" << i << "]: "
+                 << d.substr(at, d.find('\n', at) - at) << "\n";
+            ok = false;
+        }
+        /* the dump must be REPRODUCIBLE - a baked address printed
+         * numerically varies per process under ASLR and makes -vdj
+         * useless as a before/after oracle */
+        std::string d2;
+        try { d2 = dump(progs[i]); } catch (...) { d2 = "<threw>"; }
+        if (d != d2) {
+            cout << "  disasm[" << i << "]: NOT reproducible - two dumps "
+                    "of the same program differ\n";
+            ok = false;
+        }
+        /* ⛔ COUNT THE NATIVE BLOCK, NOT THE `enter.nat` BYTECODE OP.
+         * The first version counted the latter - which the bytecode
+         * listing prints whether or not any machine code was emitted -
+         * so the guard was satisfied by a dump containing NO native
+         * code at all, and the whole test was vacuous. Watched: with
+         * this counting `enter.nat`, deleting an opcode from
+         * decode_one left -rt green. */
+        size_t at = 0;
+        while ((at = d.find(NATIVE_HDR, at)) != std::string::npos)
+            { frags++; at += NATIVE_HDR.size(); }
+    }
+    /* FAIL VACUOUS: with no fragment DISASSEMBLED the check above is a
+     * check of nothing (CLAUDE.md, the vacuous-test trap). */
+    if (frags < progs.size()) {
+        cout << "  disasm: only " << frags << " native blocks over "
+             << progs.size() << " programs - the JIT did not engage, so "
+                "this test proved nothing\n";
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:
  * the fused for.step counter, the register i.bin ops, the fused compare/branch,
  * and a native builtin call (`print(s)` -> call.blt.v via the value ABI).
@@ -32172,6 +32375,8 @@ static const std::vector<extra_check> extra_checks =
     { "vm: node_table (pc-keyed) empty for native code, ast_nodes dropped",
       ast_node_pool_minimal },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
+    { "jit: -vdj decodes every emitted form, reproducibly",
+      jit_disasm_decodes_all },
     { "vm: -vd shows native calls (enter.nat at the call site)",
       vm_disasm_native_call },
     { "vm: -vd full serializable image (types + pools)", vm_disasm_full_image },

@@ -471,6 +471,16 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
  * runtime-probed offsets). */
 namespace {
 
+/* MYLANG_VDJ_ADDRS=1 - print baked ADDRESSES numerically instead of as
+ * `<addr>`. Off by default so the dump is REPRODUCIBLE (see tag_name);
+ * on when you are chasing one specific baked pointer and the digits are
+ * the thing you need. */
+bool vdj_show_addrs()
+{
+    static const bool on = getenv("MYLANG_VDJ_ADDRS") != nullptr;
+    return on;
+}
+
 const char *gp64(int r)
 {
     static const char *n[16] = { "rax","rcx","rdx","rbx","rsp","rbp",
@@ -478,10 +488,53 @@ const char *gp64(int r)
     return (r >= 0 && r < 16) ? n[r] : "r?";
 }
 
+/* The 8-bit register names. WITHOUT a REX prefix, encodings 4-7 are the
+ * legacy HIGH bytes ah/ch/dh/bh; WITH one they are the uniform low bytes
+ * spl/bpl/sil/dil. The JIT's byte store (`mov [rcx+r9], dil`) is the
+ * REX form, and naming it `bh` would be actively misleading. */
+const char *gp8(int r, bool rex)
+{
+    static const char *lo[16] = { "al","cl","dl","bl","spl","bpl","sil","dil",
+        "r8b","r9b","r10b","r11b","r12b","r13b","r14b","r15b" };
+    static const char *legacy[8] = { "al","cl","dl","bl","ah","ch","dh","bh" };
+    if (!rex && r >= 0 && r < 8) return legacy[r];
+    return (r >= 0 && r < 16) ? lo[r] : "r?b";
+}
+
 std::string hex2(uint8_t v)
 {
     static const char *h = "0123456789abcdef";
     return std::string(1, h[v >> 4]) + std::string(1, h[v & 15]);
+}
+
+/*
+ * ⛔ A BAKED ADDRESS MUST BE PRINTED SYMBOLICALLY, NOT NUMERICALLY.
+ *
+ * The JIT bakes absolute addresses (the Type singletons, helper
+ * entry points, pool buffers). Their numeric values move with every
+ * process under ASLR, so printing the number makes `-vdj` output
+ * NON-DETERMINISTIC - the same binary disassembling the same program
+ * twice produced different text. That is not cosmetic: `-vdj` is the
+ * evidence a JIT change is a pure restructuring, and a dump that
+ * differs from itself cannot be that evidence. It cost exactly that:
+ * scripts/vdjcmp.sh reported 77 of 108 programs as differing from
+ * THEMSELVES, and worked around it with regex masking that then went
+ * stale the moment tags became imm32.
+ *
+ * So symbolise here, at the source, and let every consumer benefit.
+ * `tag_name` covers the three Type singletons in both the movabs
+ * (imm64) and imm32 spellings - the low-address arena means the SAME
+ * pointer appears as a full 8-byte immediate in one instruction and a
+ * sign-extended 4-byte one in the next.
+ */
+const char *tag_name(uint64_t imm, const void *ti, const void *tf,
+                     const void *ta)
+{
+    const void *pv = reinterpret_cast<const void *>(imm);
+    if (ti && pv == ti) return "<int-tag>";
+    if (tf && pv == tf) return "<float-tag>";
+    if (ta && pv == ta) return "<array-tag>";
+    return nullptr;
 }
 
 /* [rbx+disp] -> the slot's NAME (via `nm`, the chunk's slot-namer),
@@ -533,20 +586,70 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         for (int i = 0; i < 8 && p < n; i++) v |= uint64_t(c[p++]) << (i*8);
         return v;
     };
-    /* modrm: returns reg field (+R) and formats the r/m as a string,
-     * consuming disp32/sib as needed. Only the mod=10 (disp32) and
-     * mod=11 (register) + one SIB form jit.cpp uses are handled. */
+    /*
+     * modrm: returns the reg field (+REX.R) and formats the r/m operand,
+     * consuming the SIB byte and the displacement.
+     *
+     * ⛔ THE SIB ARM USED TO BE WRONG IN THREE WAYS, AND THE FIRST ONE
+     * DESYNCHRONISED THE WHOLE STREAM (fixed 2026-08-17):
+     *
+     *   1. it returned WITHOUT consuming the displacement, although a
+     *      SIB byte does not replace disp8/disp32 - mod still selects
+     *      one. `mov rdi, [rsp+8]` (48 8B 7C 24 08) therefore decoded
+     *      as `mov rdi, [rsp+rsp*8]` and left `08` behind as a stray
+     *      `.byte`, and every later instruction in that fragment was
+     *      decoded at the wrong offset until the next `; vm pc` mark
+     *      resynced. 330 of the corpus's undecoded bytes were this one
+     *      bug, and the garbage it printed FOR the instruction was
+     *      worse than the missing byte after it;
+     *   2. the SCALE field was ignored and hardcoded `*8`;
+     *   3. index == 4 means NO INDEX (the canonical `[rsp+disp]` form),
+     *      but it printed `rsp*8`. Note REX.X still applies, so r12 as
+     *      an index is index==4 WITH X set - the check must be on the
+     *      3-bit field before the extension, which is why `idx3` exists.
+     *
+     * mod==0 with base==5 (RIP-relative / no-base disp32) is likewise
+     * a real encoding and is handled; jit.cpp does not emit it today,
+     * but a decoder that silently mis-consumes it is exactly how this
+     * class of bug survives.
+     */
     auto modrm = [&](int &regf, std::string &rm) {
         const uint8_t m = c[p++];
         const int mod = m >> 6, reg = ((m >> 3) & 7) + (R ? 8 : 0),
                   rmf = (m & 7) + (B ? 8 : 0);
         regf = reg;
         if (mod == 3) { rm = gp64(rmf); return; }
-        if ((m & 7) == 4) {           /* SIB: [rcx + r9*8] (our only form) */
+        if ((m & 7) == 4) {                       /* SIB byte follows */
             const uint8_t sib = c[p++];
-            const int idx = ((sib >> 3) & 7) + (X ? 8 : 0);
-            const int base = (sib & 7) + (B ? 8 : 0);
-            rm = std::string("[") + gp64(base) + "+" + gp64(idx) + "*8]";
+            const int scale = 1 << (sib >> 6);
+            const int idx3 = (sib >> 3) & 7;      /* pre-REX.X */
+            const int idx = idx3 + (X ? 8 : 0);
+            const int base3 = sib & 7;
+            const int base = base3 + (B ? 8 : 0);
+            const bool no_base = (base3 == 5 && mod == 0);
+            const int32_t d = no_base ? rd32()
+                            : (mod == 2) ? rd32()
+                            : (mod == 1) ? int8_t(c[p++]) : 0;
+            std::ostringstream so;
+            so << "[";
+            if (!no_base) so << gp64(base);
+            if (idx3 != 4) {                      /* 4 == no index */
+                if (!no_base) so << "+";
+                so << gp64(idx) << "*" << scale;
+            }
+            if (d || (no_base && idx3 == 4))
+                so << (d < 0 ? "-0x" : "+0x") << std::hex
+                   << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec;
+            so << "]";
+            rm = so.str();
+            return;
+        }
+        if (mod == 0 && (m & 7) == 5) {           /* RIP-relative disp32 */
+            const int32_t d = rd32();
+            std::ostringstream so;
+            so << "[rip" << (d < 0 ? "-0x" : "+0x") << std::hex
+               << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec << "]";
+            rm = so.str();
             return;
         }
         const int32_t d = (mod == 2) ? rd32()
@@ -561,15 +664,23 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         const int rr = (op - 0xB8) + (B ? 8 : 0);
         if (W) {
             const uint64_t imm = rd64();
-            const void *pv = reinterpret_cast<const void *>(imm);
-            const char *tag = pv == ti ? "<int-tag>" : pv == tf ? "<float-tag>"
-                            : pv == ta ? "<array-tag>" : nullptr;
+            const char *tag = tag_name(imm, ti, tf, ta);
             if (tag) { o << "movabs " << gp64(rr) << ", " << tag;
                        cmt = "the Type-tag constant"; }
-            else if (imm >= 1000)                  /* big values (addresses,
-                                                    * fn pointers) in HEX */
-                o << "movabs " << gp64(rr) << ", 0x" << std::hex << imm
-                  << std::dec;
+            else if (imm >= 0x1000) {
+                /* ⛔ AN ADDRESS, AND ITS VALUE IS ASLR NOISE. Printing
+                 * the number made the dump differ from itself run to
+                 * run. `<addr>` keeps the instruction and its operand
+                 * SHAPE - which is all a reader or a differ needs -
+                 * and drops only the digits nobody can act on. Set
+                 * MYLANG_VDJ_ADDRS=1 to see them when chasing a
+                 * specific baked pointer. */
+                if (vdj_show_addrs())
+                    o << "movabs " << gp64(rr) << ", 0x" << std::hex << imm
+                      << std::dec;
+                else
+                    o << "movabs " << gp64(rr) << ", <addr>";
+            }
             else   o << "movabs " << gp64(rr) << ", " << int64_t(imm);
         } else {
             const uint32_t imm = rd32();            /* mov eNN, imm32 = the
@@ -597,6 +708,33 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         break;
     case 0x29: modrm(regf, rm); o << "sub " << rm << ", " << gp64(regf);
         break;
+    /* The r64 <- r/m64 DIRECTION of the group-1 arithmetic (opcode
+     * bit 1 set). The `rm <- reg` forms above were here from the
+     * start; these were not, so `add rdx, [rcx+0xd8]` and
+     * `sub rcx, [rax+0x28]` - the M5b record-push address arithmetic -
+     * decoded as nothing at all. */
+    case 0x03: modrm(regf, rm); o << "add " << gp64(regf) << ", " << rm;
+        break;
+    case 0x2B: modrm(regf, rm); o << "sub " << gp64(regf) << ", " << rm;
+        break;
+    case 0x0B: modrm(regf, rm); o << "or "  << gp64(regf) << ", " << rm;
+        break;
+    case 0x23: modrm(regf, rm); o << "and " << gp64(regf) << ", " << rm;
+        break;
+    case 0x33: modrm(regf, rm); o << "xor " << gp64(regf) << ", " << rm;
+        break;
+    /* movsxd r64, r/m32 - how a 32-bit frame_size / count field is
+     * widened before it is compared or added. */
+    case 0x63: modrm(regf, rm); o << "movsxd " << gp64(regf) << ", " << rm;
+        break;
+    /* mov r/m8, r8 - the BYTE element store (`mov [rcx+r9], dil`, a
+     * flat array<bool> write). With REX present the source is the
+     * uniform low-byte set (dil/sil/spl/bpl), which is why this prints
+     * the low-byte name rather than gp64. */
+    case 0x88: { modrm(regf, rm);
+        o << "mov byte " << rm << ", " << gp8(regf, rex != 0); break; }
+    case 0x8A: { modrm(regf, rm);
+        o << "mov " << gp8(regf, rex != 0) << ", byte " << rm; break; }
     case 0x21: modrm(regf, rm); o << "and " << rm << ", " << gp64(regf);
         break;
     case 0x09: modrm(regf, rm); o << "or "  << rm << ", " << gp64(regf);
@@ -605,6 +743,17 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         break;
     case 0x39: modrm(regf, rm); o << "cmp " << rm << ", " << gp64(regf);
         break;
+    /* ⛔ cmp rax, imm32 - the ACCUMULATOR short form (REX.W 3D id), with
+     * no modrm byte. This is what `cmp_reg_tag` emits for rax, so #96
+     * step 3 made it common, and it was undecoded: 168 corpus sites,
+     * each one also desynchronising the four immediate bytes after it.
+     * A tag-valued immediate is symbolised like the movabs form. */
+    case 0x3D: { const int32_t imm = rd32();
+        const char *tag = tag_name(uint64_t(uint32_t(imm)), ti, tf, ta);
+        o << "cmp rax, ";
+        if (tag) { o << tag; cmt = "the Type-tag constant"; }
+        else o << imm;
+        break; }
     case 0x99: o << (W ? "cqo" : "cdq"); break;
     case 0xF7: { modrm(regf, rm);
         o << ((regf & 7) == 7 ? "idiv " : "f7/? ") << rm; break; }
@@ -615,6 +764,14 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
     case 0x3B: { modrm(regf, rm);   /* cmp r64, r/m64 (the PushHandler
                                      * capacity check) */
         o << "cmp " << gp64(regf) << ", " << rm; break; }
+    case 0x6B: { modrm(regf, rm);   /* imul r64, r/m64, imm8 - the SAME
+                                     * record-stride multiply when the
+                                     * stride fits a byte (0x30), which
+                                     * is the case the assembler
+                                     * actually picks */
+        const int8_t imm = int8_t(c[p++]);
+        o << "imul " << gp64(regf) << ", " << rm << ", " << int(imm);
+        break; }
     case 0x69: { modrm(regf, rm);   /* imul r64, r/m64, imm32 (the
                                      * SetPend record-stride multiply) */
         const int32_t imm = rd32();
@@ -623,10 +780,19 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
                                      * defined[gslot]=1 store) */
         o << "mov byte " << rm << ", " << int(c[p++]); break; }
     case 0xC7: { modrm(regf, rm);   /* /0: mov r/m, imm32 (emit_raise's
-                                     * kind store `mov dword [rax], kind`) */
+                                     * kind store `mov dword [rax], kind`,
+                                     * and since #96 step 3 the TYPE-TAG
+                                     * store, whose imm32 is a low-arena
+                                     * pointer - symbolise it, or the dump
+                                     * carries an ASLR-varying number) */
         uint32_t imm = 0;
         for (int i = 0; i < 4; i++) imm |= uint32_t(c[p++]) << (8 * i);
-        o << "mov " << rm << ", " << int(imm); break; }
+        const char *tag = tag_name(uint64_t(imm), ti, tf, ta);
+        o << "mov " << rm << ", ";
+        if (tag) { o << tag; cmt = "the Type-tag constant"; }
+        else if (imm >= 0x1000 && !vdj_show_addrs()) o << "<addr>";
+        else o << int(imm);
+        break; }
     case 0xD1: { modrm(regf, rm);   /* group-2 shift by 1 */
         o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
           << rm << ", 1"; break; }
@@ -651,13 +817,19 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         const int32_t imm = op == 0x81 ? rd32() : int8_t(c[p++]);
         o << g1[regf & 7] << " " << rm << ", " << imm; break; }
     case 0x90: o << "nop"; break;
-    case 0xE8: { const int32_t d = rd32();   /* call rel32: a C++ helper
-                                              * (a container store / ref
-                                              * release) or a libm fn; the
-                                              * target is external - show the
-                                              * signed displacement in hex */
-        o << "call " << (d < 0 ? "-0x" : "+0x") << std::hex
-          << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec;
+    case 0xE8: { const int32_t d = rd32();
+        /* call rel32 to a C++ helper / libm. The DISPLACEMENT is the
+         * distance from this code page to the callee, so BOTH ends move
+         * under ASLR and the number is noise - and worse, its WIDTH
+         * varies (5 or 6 hex digits for the same libm target), which is
+         * what made a width-based mask in vdjcmp.sh race with a
+         * call-based one and report a file as differing from itself.
+         * Print the shape, not the digits. */
+        if (vdj_show_addrs())
+            o << "call " << (d < 0 ? "-0x" : "+0x") << std::hex
+              << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec;
+        else
+            o << "call <helper>";
         cmt = "rel32 call (C++ helper / libm)"; break; }
     case 0xE9: { const int32_t d = rd32();
         o << "jmp +" << std::dec << (int32_t(p) + d); break; }
@@ -734,10 +906,31 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
     s << "       . ---- native x86-64 (rbx=frame slots, rsi=int-tag,"
       << " r8=float-tag; xmm=SSE) ----\n";
     uint32_t p = 0, mi = 0;
+    unsigned drifted = 0, undecoded = 0;
     bool first = true;
     while (p < frag.len) {
-        /* each op boundary: a blank line, then the SOURCE VM op these
-         * instructions implement (blank line groups the fragment by op). */
+        /*
+         * ⛔ A SKIPPED MARK IS PROOF THE DECODER DRIFTED, and it is the
+         * only self-check this disassembler can have.
+         *
+         * Every `marks[i].off` is an offset the JIT recorded at a real
+         * instruction boundary. So if the decode ever steps PAST one -
+         * `off < p` - some instruction's length was wrong, and every
+         * mnemonic since then has been read at the wrong offset. That
+         * is far worse than an undecoded byte: it prints confident,
+         * well-formed, WRONG instructions.
+         *
+         * Both counts are reported at the end of the fragment rather
+         * than asserted, because `-vdj` is a debugging aid that must
+         * still produce its best effort on a fragment it cannot fully
+         * decode - but it must never do so SILENTLY. (Before 2026-08-17
+         * it did: 5543 undecoded bytes across the corpus, with nothing
+         * in the output saying the dump was untrustworthy.)
+         */
+        while (mi < frag.marks.size() && frag.marks[mi].off < p) {
+            drifted++;
+            mi++;
+        }
         while (mi < frag.marks.size() && frag.marks[mi].off == p) {
             const uint32_t vpc = frag.marks[mi].vm_pc;
             if (!first)
@@ -750,6 +943,8 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
         const uint32_t st = p;
         std::string mn, cmt;
         decode_one(code, frag.len, p, mn, cmt, nm, ti, tf, ta);
+        if (mn.compare(0, 6, ".byte ") == 0)
+            undecoded++;
         std::ostringstream line;
         line << "       .   +" << std::setw(3) << std::setfill(' ')
              << std::dec << st << ": " << mn;
@@ -759,6 +954,12 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
         s << line.str() << "\n";
     }
     /* close the native block so it doesn't run into the next VM op */
+    if (undecoded || drifted) {
+        s << "       . ---- ⛔ DUMP IS UNRELIABLE: " << undecoded
+          << " undecoded byte(s), " << drifted << " skipped op mark(s)"
+          << " - decode_one is missing an opcode this fragment uses;"
+          << " see disasm.cpp ----\n";
+    }
     s << "       . ---- end native ----\n";
 }
 
