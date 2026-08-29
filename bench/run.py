@@ -806,8 +806,13 @@ def main():
                          "numbers are NOT a valid measurement). "
                          "With --recompute: force-recompute EVERY selected "
                          "bench (not just stale ones). Ignored otherwise.")
-    ap.add_argument("--timeout", type=float, default=120.0,
-                    help="per-run timeout in seconds (default 120)")
+    ap.add_argument("--timeout", type=float, default=None,
+                    help="per-run timeout in seconds (default 120; a "
+                         "--recompute run defaults to 600 - a comparison "
+                         "is timed once and cached, so a slow-but-legit "
+                         "bench must not fail the recompute: 28_str_concat's "
+                         "CPython side needs ~2 min at its tuned scale on "
+                         "this box, mostly kernel mremap churn)")
     ap.add_argument("--csv", default="",
                     help="also write the results table to this CSV file")
     ap.add_argument("-s", "--sorted", action="store_true",
@@ -870,6 +875,8 @@ def main():
 
     filt = " --filter %s" % args.filter if args.filter else ""
 
+    if args.timeout is None:
+        args.timeout = 600.0 if args.recompute else 120.0
     if args.recompute:
         # SEPARATE STEP: (re)time + re-cache the comparison language, then exit.
         # Only STALE entries by default (a no-op when all fresh); --force
