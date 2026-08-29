@@ -1878,10 +1878,54 @@ struct Emitter {
      * the fragment's t_int singleton, so clobbering it makes every later
      * slot write stamp a garbage type (an immediate SEGV, found that way).
      * rdi is free once frag_entry has moved the slots base into rbx. */
-    void store_elem_int_rdi()          /* mov [rcx + r9*8], rdi */
-    { u8(0x4A); u8(0x89); u8(0x3C); u8(0xC9); }
-    void store_elem_byte_dil()         /* mov [rcx + r9], dil */
-    { u8(0x42); u8(0x88); u8(0x3C); u8(0x09); }
+    /*
+     * ⛔ #96: THE ELEMENT STORE, WITH ITS REGISTERS AS ARGUMENTS.
+     *
+     * These replace store_elem_int_rdi / _rax / _rdx and
+     * store_elem_byte_dil / _hr - five wrappers that each baked a
+     * different (base, index, value) triple into a hand-written ModRM
+     * and SIB byte. They are DELETED, not kept alongside, for the
+     * reason CLAUDE.md's sixth audit shape gives: a wrapper whose NAME
+     * encodes its operand is invisible to a grep for that operand, so
+     * as long as one exists the register census cannot see its uses and
+     * the allocator cannot know the register is taken. That is not
+     * hypothetical here - it is precisely how r9 came to be pinned
+     * while ~80 sites used it as scratch.
+     *
+     * Encoding, once, instead of five times by hand:
+     *   REX  = 0x40 | W | (src>=8)<<2 | (index>=8)<<1 | (base>=8)
+     *   op   = 0x89 (qword) / 0x88 (byte)
+     *   mod  = 00, reg = src&7, rm = 100 (SIB follows)
+     *   SIB  = log2(scale)<<6 | (index&7)<<3 | (base&7)
+     * with ONE caveat that the hand-written versions each rediscovered:
+     * a SIB base of 101b (rbp/r13) with mod==00 means "disp32, no
+     * base", so that case takes mod==01 with a zero disp8 instead.
+     * A byte store always emits REX so the value register names the
+     * uniform low byte (dil/sil/spl/bpl) and not ah/ch/dh/bh.
+     */
+    void store_elem_sib(uint8_t base, uint8_t index, uint8_t src,
+                        int scale, bool qword)
+    {
+        const bool rbp_base = (base & 7) == 5;
+        u8(static_cast<uint8_t>(0x40 | (qword ? 8 : 0)
+                                | (src >= 8 ? 4 : 0)
+                                | (index >= 8 ? 2 : 0)
+                                | (base >= 8 ? 1 : 0)));
+        u8(qword ? 0x89 : 0x88);
+        u8(static_cast<uint8_t>((rbp_base ? 0x40 : 0x00)
+                                | ((src & 7) << 3) | 4));
+        const int sc = scale == 8 ? 3 : scale == 4 ? 2 : scale == 2 ? 1 : 0;
+        u8(static_cast<uint8_t>((sc << 6) | ((index & 7) << 3)
+                                | (base & 7)));
+        if (rbp_base)
+            u8(0x00);
+    }
+    /* mov [base + index*8], src  (a flat int/float-payload element) */
+    void store_elem_q(uint8_t base, uint8_t index, uint8_t src)
+    { store_elem_sib(base, index, src, 8, true); }
+    /* mov [base + index], src8   (a flat bool element - 1 byte) */
+    void store_elem_b(uint8_t base, uint8_t index, uint8_t src)
+    { store_elem_sib(base, index, src, 1, false); }
     void mov_byte_rax_imm(int32_t d, uint8_t imm)   /* mov byte [rax+d],i */
     { u8(0xC6); u8(0x80); u32(uint32_t(d)); u8(imm); }
     size_t jmp32()                     /* jmp rel32 -> patch32_here */
@@ -1905,10 +1949,6 @@ struct Emitter {
      * The element rides RAX (the shobj is done with it once the hash byte
      * is invalidated - which happens FIRST, since past the guards nothing
      * can fault); the rhs stays in RDI. */
-    void store_elem_int_rax()          /* mov [rcx + r9*8], rax */
-    { u8(0x4A); u8(0x89); u8(0x04); u8(0xC9); }
-    void store_elem_int_rdx()          /* mov [rcx + r9*8], rdx (mod) */
-    { u8(0x4A); u8(0x89); u8(0x14); u8(0xC9); }
     void add_rax_rdi()  { u8(0x48); u8(0x01); u8(0xF8); }
     void sub_rax_rdi()  { u8(0x48); u8(0x29); u8(0xF8); }
     void imul_rax_rdi() { u8(0x48); u8(0x0F); u8(0xAF); u8(0xC7); }
@@ -1980,13 +2020,6 @@ struct Emitter {
         u8(0x43); u8(0x0F); u8(0xB6);
         if ((hr & 7) == 5) { u8(0x44); u8(0x0D); u8(0x00); }
         else { u8(0x04); u8(static_cast<uint8_t>(0x08 | (hr & 7))); }
-    }
-    /* C1c: mov [rH + r9], dil  (a bool element - 1 byte, scale 1) */
-    void store_elem_byte_hr(uint8_t hr)
-    {
-        u8(0x43); u8(0x88);
-        if ((hr & 7) == 5) { u8(0x7C); u8(0x0D); u8(0x00); }
-        else { u8(0x3C); u8(static_cast<uint8_t>(0x08 | (hr & 7))); }
     }
     /* ---- #95, the SLICE read arms + the elem2 promote arm ---- */
     /* cvtsi2sd xmm0, qword [rcx + r9*8]  (an int element promotes) */
@@ -8622,7 +8655,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             if (is_float)
                 e.store_elem_float_hr(H->rdata);
             else if (hoist_want == 3)
-                e.store_elem_byte_hr(H->rdata);      /* 0/1 lit -> dil */
+                e.store_elem_b(H->rdata, 9, RDI);      /* 0/1 lit -> dil */
             else
                 e.store_elem_int_hr(H->rdata);
         } else {
@@ -8646,15 +8679,15 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                 e.cqo();
                 e.idiv_rdi();
                 if (aop == Op::div)
-                    e.store_elem_int_rax();
+                    e.store_elem_q(RCX, 9, RAX);
                 else
-                    e.store_elem_int_rdx();      /* remainder */
+                    e.store_elem_q(RCX, 9, RDX);      /* remainder */
             } else {
                 e.load_elem_int();
                 if (aop == Op::plus)       e.add_rax_rdi();
                 else if (aop == Op::minus) e.sub_rax_rdi();
                 else                       e.imul_rax_rdi();
-                e.store_elem_int_rax();
+                e.store_elem_q(RCX, 9, RAX);
             }
         }
         dones.push_back(e.jmp32());
@@ -8753,23 +8786,23 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.mov_byte_rax_imm(L.hashv_off, 0);              /* invalidate */
         switch (aop) {
         case Op::invalid:
-            e.store_elem_int_rdi();
+            e.store_elem_q(RCX, 9, RDI);
             return;
         case Op::div: case Op::mod:
             e.load_elem_int();                           /* rax = elem */
             e.cqo();
             e.idiv_rdi();
             if (aop == Op::div)
-                e.store_elem_int_rax();
+                e.store_elem_q(RCX, 9, RAX);
             else
-                e.store_elem_int_rdx();                  /* remainder */
+                e.store_elem_q(RCX, 9, RDX);                  /* remainder */
             return;
         default:
             e.load_elem_int();
             if (aop == Op::plus)       e.add_rax_rdi();
             else if (aop == Op::minus) e.sub_rax_rdi();
             else                       e.imul_rax_rdi();
-            e.store_elem_int_rax();
+            e.store_elem_q(RCX, 9, RAX);
             return;
         }
     };
@@ -8862,7 +8895,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.cmp_r9_rdx();
     slows.push_back(e.j32(0x73));        /* jae: negative OR >= count */
     bump();
-    e.store_elem_byte_dil();
+    e.store_elem_b(RCX, 9, RDI);
     e.mov_byte_rax_imm(L.hashv_off, 0);             /* invalidate_hash() */
     dones.push_back(e.jmp32());
 
@@ -8877,7 +8910,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.cmp_r9_rdx();
     slows.push_back(e.j32(0x73));
     bump();
-    e.store_elem_int_rdi();
+    e.store_elem_q(RCX, 9, RDI);
     e.mov_byte_rax_imm(L.hashv_off, 0);
     dones.push_back(e.jmp32());
     }                                          /* end of the int/bool arm */
@@ -9294,7 +9327,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         cow_guards();
         inner_bounds(/*bytes=*/true);
         bump();
-        e.store_elem_byte_dil();
+        e.store_elem_b(RCX, 9, RDI);
         e.mov_byte_rax_imm(L.hashv_off, 0);
         dones.push_back(e.jmp32());
     } else if (!divmod) {
@@ -9373,23 +9406,23 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     e.mov_byte_rax_imm(L.hashv_off, 0);
     switch (bop) {
     case Op::invalid:
-        e.store_elem_int_rdi();
+        e.store_elem_q(RCX, 9, RDI);
         break;
     case Op::div: case Op::mod:
         e.load_elem_int();
         e.cqo();
         e.idiv_rdi();
         if (bop == Op::div)
-            e.store_elem_int_rax();
+            e.store_elem_q(RCX, 9, RAX);
         else
-            e.store_elem_int_rdx();
+            e.store_elem_q(RCX, 9, RDX);
         break;
     default:
         e.load_elem_int();
         if (bop == Op::plus)       e.add_rax_rdi();
         else if (bop == Op::minus) e.sub_rax_rdi();
         else                       e.imul_rax_rdi();
-        e.store_elem_int_rax();
+        e.store_elem_q(RCX, 9, RAX);
         break;
     }
     dones.push_back(e.jmp32());
