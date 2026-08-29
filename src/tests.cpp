@@ -31540,16 +31540,94 @@ static bool jit_disasm_decodes_all()
                  << d.substr(at, d.find('\n', at) - at) << "\n";
             ok = false;
         }
-        /* the dump must be REPRODUCIBLE - a baked address printed
-         * numerically varies per process under ASLR and makes -vdj
-         * useless as a before/after oracle */
-        std::string d2;
-        try { d2 = dump(progs[i]); } catch (...) { d2 = "<threw>"; }
-        if (d != d2) {
-            cout << "  disasm[" << i << "]: NOT reproducible - two dumps "
-                    "of the same program differ\n";
-            ok = false;
+        /*
+         * ⛔ THE REPRODUCIBILITY CHECK BELOW IS PROBABILISTIC; THIS ONE
+         * IS NOT, AND THAT DIFFERENCE COST A RED CI.
+         *
+         * Two dumps differ only if the baked pointer HAPPENS to land at
+         * a different address between the two parses. Locally it did
+         * not, in eight runs; the Coverage lane hit it on the first
+         * try, on a struct program - the group-1 `cmp r/m, imm32` that
+         * guards a struct instance against its StructTypeDef* was the
+         * one immediate printer still emitting a raw pointer.
+         *
+         * So assert the PROPERTY instead of hoping to observe the
+         * symptom: in the NATIVE block, no immediate may be a large
+         * non-power-of-two literal. Powers of two are the emitter's
+         * real constants (0x8000000000000000 for the INT_MIN division
+         * check, masks) and are deterministic; anything else that big
+         * is an address that must have printed as <addr>.
+         */
+        {
+            const std::string PFX = "       .   +";
+            size_t ls = 0;
+            while (ls < d.size() && ok) {
+                size_t le = d.find('\n', ls);
+                if (le == std::string::npos) le = d.size();
+                const std::string line = d.substr(ls, le - ls);
+                ls = le + 1;
+                if (line.compare(0, PFX.size(), PFX) != 0)
+                    continue;                    /* not a native line */
+                const size_t semi = line.find(" ; ");
+                const std::string body =
+                    semi == std::string::npos ? line : line.substr(0, semi);
+                size_t at = 0;
+                while ((at = body.find(", ", at)) != std::string::npos) {
+                    at += 2;
+                    if (at >= body.size()) break;
+                    const char ch = body[at];
+                    if (!(isdigit(static_cast<unsigned char>(ch))
+                          || ch == '-'))
+                        continue;                /* a register / [mem] */
+                    errno = 0;
+                    char *end = nullptr;
+                    const long long v =
+                        strtoll(body.c_str() + at, &end, 0);
+                    if (end == body.c_str() + at || errno)
+                        continue;
+                    const unsigned long long u =
+                        static_cast<unsigned long long>(v < 0 ? -v : v);
+                    if (u >= 0x1000 && (u & (u - 1)) != 0) {
+                        cout << "  disasm[" << i << "]: a raw ADDRESS-sized"
+                                " immediate survived - `" << body
+                             << "`. Route it through imm_str (disasm.cpp)"
+                                " or the dump is not reproducible\n";
+                        ok = false;
+                        break;
+                    }
+                }
+            }
         }
+        /*
+         * ⛔ WHAT REPRODUCIBILITY MEANS HERE, AND THE CHECK THAT USED
+         * TO BE WRONG.
+         *
+         * The oracle property `-vdj` must have is: THE SAME BINARY ON
+         * THE SAME PROGRAM, IN SEPARATE PROCESSES, GIVES IDENTICAL
+         * TEXT (and so does a second binary built from the same
+         * source). That is what scripts/vdjcmp.sh rests on, and it is
+         * verified there over 108 programs.
+         *
+         * A first version of this test asserted something STRONGER and
+         * not true: that two COMPILES of one program inside ONE process
+         * dump identically. They do not, and the reason is legitimate -
+         * a compile allocates its const objects on the heap, and a
+         * baked const value's bytes therefore include addresses that
+         * differ between the two compiles. It showed up (clang, and CI's
+         * Coverage lane, never on my gcc debug build) as
+         *     A:  movabs rcx, 0
+         *     B:  movabs rcx, <addr>
+         * - the same field of a baked value, null in one compile and a
+         * pointer in the other. No amount of rendering can reconcile
+         * that, because the emitted BYTES genuinely differ.
+         *
+         * The property that actually guarantees the cross-process
+         * oracle is the address-free invariant asserted above: if no
+         * ADDRESS reaches the text, the text cannot vary with where
+         * things were mapped. That is checked, deterministically, on
+         * every platform - and it is strictly better evidence than
+         * hoping two dumps happen to disagree.
+         */
         /* ⛔ COUNT THE NATIVE BLOCK, NOT THE `enter.nat` BYTECODE OP.
          * The first version counted the latter - which the bytecode
          * listing prints whether or not any machine code was emitted -
@@ -32375,7 +32453,7 @@ static const std::vector<extra_check> extra_checks =
     { "vm: node_table (pc-keyed) empty for native code, ast_nodes dropped",
       ast_node_pool_minimal },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
-    { "jit: -vdj decodes every emitted form, reproducibly",
+    { "jit: -vdj decodes every emitted form, address-free",
       jit_disasm_decodes_all },
     { "vm: -vd shows native calls (enter.nat at the call site)",
       vm_disasm_native_call },

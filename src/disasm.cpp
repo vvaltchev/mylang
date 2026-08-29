@@ -4,6 +4,7 @@
 #include "codegen.h"
 #include "vm.h"
 #include "eval.h"      /* builtin_slot / builtin_slot_name */
+#include "env.h"      /* env_get - MSVC deprecates getenv */
 #include "jit.h"       /* jit_type_singletons (-vdj); JitCtx (native calls) */
 #include "funcdesc.h"  /* FuncDescriptor::vm_chunk (faithful native-call dump) */
 #include "coderender.h"   /* render_construct_code - shared AST decompiler */
@@ -477,7 +478,11 @@ namespace {
  * the thing you need. */
 bool vdj_show_addrs()
 {
-    static const bool on = getenv("MYLANG_VDJ_ADDRS") != nullptr;
+    /* env_get, not getenv: MSVC deprecates getenv and WERROR is on.
+     * jit.cpp may call getenv freely because every one of its calls is
+     * inside `#if ML_JIT_SUPPORTED`, which MSVC never compiles - this
+     * file is compiled on every platform. */
+    static const bool on = env_get("MYLANG_VDJ_ADDRS").has_value();
     return on;
 }
 
@@ -535,6 +540,47 @@ const char *tag_name(uint64_t imm, const void *ti, const void *tf,
     if (tf && pv == tf) return "<float-tag>";
     if (ta && pv == ta) return "<array-tag>";
     return nullptr;
+}
+
+/*
+ * ⛔ EVERY IMMEDIATE GOES THROUGH HERE. THERE ARE TEN PRINTERS AND
+ * FIXING THREE OF THEM IS NOT FIXING THE BUG (2026-08-18).
+ *
+ * A baked pointer can appear as ANY immediate the emitter happens to
+ * use: `movabs` (imm64), `mov r/m, imm32`, `cmp rax, imm32`, and - the
+ * one that actually got through - the group-1 `cmp r/m, imm32` that
+ * guards a STRUCT INSTANCE against its `StructTypeDef *`. The first
+ * round of this fix patched the three printers I had seen misbehave;
+ * CI then failed on a struct program, because the fourth printer was
+ * never considered. That is the audit-table trap in its purest form:
+ * the defect is in the CLASS, so the fix belongs at the CLASS's one
+ * choke point.
+ *
+ * The rule, in order:
+ *   - a known Type singleton prints as its name;
+ *   - a POWER OF TWO prints numerically. Real emitted constants are
+ *     bit patterns (0x8000000000000000 for the INT_MIN division check,
+ *     masks, strides), and they are deterministic - masking them would
+ *     cost readability for no reproducibility gain;
+ *   - anything else >= 0x1000 is assumed to be an ADDRESS and prints as
+ *     `<addr>`, because its digits vary per process and would make the
+ *     dump differ from itself;
+ *   - everything else prints numerically.
+ * MYLANG_VDJ_ADDRS=1 disables the masking entirely.
+ */
+std::string imm_str(int64_t v, const void *ti, const void *tf,
+                    const void *ta)
+{
+    if (const char *t = tag_name(static_cast<uint64_t>(v), ti, tf, ta))
+        return t;
+    const uint64_t u = static_cast<uint64_t>(v < 0 ? -v : v);
+    const bool pow2 = u && (u & (u - 1)) == 0;
+    if (!vdj_show_addrs() && u >= 0x1000 && !pow2)
+        return "<addr>";
+    std::ostringstream o;
+    if (u >= 0x1000) o << "0x" << std::hex << u << std::dec;
+    else             o << v;
+    return o.str();
 }
 
 /* [rbx+disp] -> the slot's NAME (via `nm`, the chunk's slot-namer),
@@ -664,28 +710,15 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         const int rr = (op - 0xB8) + (B ? 8 : 0);
         if (W) {
             const uint64_t imm = rd64();
-            const char *tag = tag_name(imm, ti, tf, ta);
-            if (tag) { o << "movabs " << gp64(rr) << ", " << tag;
-                       cmt = "the Type-tag constant"; }
-            else if (imm >= 0x1000) {
-                /* ⛔ AN ADDRESS, AND ITS VALUE IS ASLR NOISE. Printing
-                 * the number made the dump differ from itself run to
-                 * run. `<addr>` keeps the instruction and its operand
-                 * SHAPE - which is all a reader or a differ needs -
-                 * and drops only the digits nobody can act on. Set
-                 * MYLANG_VDJ_ADDRS=1 to see them when chasing a
-                 * specific baked pointer. */
-                if (vdj_show_addrs())
-                    o << "movabs " << gp64(rr) << ", 0x" << std::hex << imm
-                      << std::dec;
-                else
-                    o << "movabs " << gp64(rr) << ", <addr>";
-            }
-            else   o << "movabs " << gp64(rr) << ", " << int64_t(imm);
+            if (tag_name(imm, ti, tf, ta))
+                cmt = "the Type-tag constant";
+            o << "movabs " << gp64(rr) << ", "
+              << imm_str(static_cast<int64_t>(imm), ti, tf, ta);
         } else {
             const uint32_t imm = rd32();            /* mov eNN, imm32 = the
                                                      * resume VM pc (exit) */
-            o << "mov e" << (gp64(rr) + 1) << ", " << imm;
+            o << "mov e" << (gp64(rr) + 1) << ", "
+              << imm_str(static_cast<int64_t>(imm), ti, tf, ta);
             cmt = "return: resume at vm pc " + std::to_string(imm);
         }
         break; }
@@ -749,10 +782,9 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
      * each one also desynchronising the four immediate bytes after it.
      * A tag-valued immediate is symbolised like the movabs form. */
     case 0x3D: { const int32_t imm = rd32();
-        const char *tag = tag_name(uint64_t(uint32_t(imm)), ti, tf, ta);
-        o << "cmp rax, ";
-        if (tag) { o << tag; cmt = "the Type-tag constant"; }
-        else o << imm;
+        if (tag_name(uint64_t(uint32_t(imm)), ti, tf, ta))
+            cmt = "the Type-tag constant";
+        o << "cmp rax, " << imm_str(imm, ti, tf, ta);
         break; }
     case 0x99: o << (W ? "cqo" : "cdq"); break;
     case 0xF7: { modrm(regf, rm);
@@ -775,7 +807,8 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
     case 0x69: { modrm(regf, rm);   /* imul r64, r/m64, imm32 (the
                                      * SetPend record-stride multiply) */
         const int32_t imm = rd32();
-        o << "imul " << gp64(regf) << ", " << rm << ", " << imm; break; }
+        o << "imul " << gp64(regf) << ", " << rm << ", "
+          << imm_str(imm, ti, tf, ta); break; }
     case 0xC6: { modrm(regf, rm);   /* /0: mov BYTE [rm], imm8 (the
                                      * defined[gslot]=1 store) */
         o << "mov byte " << rm << ", " << int(c[p++]); break; }
@@ -787,11 +820,11 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
                                      * carries an ASLR-varying number) */
         uint32_t imm = 0;
         for (int i = 0; i < 4; i++) imm |= uint32_t(c[p++]) << (8 * i);
-        const char *tag = tag_name(uint64_t(imm), ti, tf, ta);
-        o << "mov " << rm << ", ";
-        if (tag) { o << tag; cmt = "the Type-tag constant"; }
-        else if (imm >= 0x1000 && !vdj_show_addrs()) o << "<addr>";
-        else o << int(imm);
+        if (tag_name(uint64_t(imm), ti, tf, ta))
+            cmt = "the Type-tag constant";
+        o << "mov " << rm << ", "
+          << imm_str(static_cast<int64_t>(static_cast<int32_t>(imm)),
+                     ti, tf, ta);
         break; }
     case 0xD1: { modrm(regf, rm);   /* group-2 shift by 1 */
         o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
@@ -815,7 +848,10 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         static const char *g1[8] = {"add","or","adc","sbb",
                                     "and","sub","xor","cmp"};
         const int32_t imm = op == 0x81 ? rd32() : int8_t(c[p++]);
-        o << g1[regf & 7] << " " << rm << ", " << imm; break; }
+        if (tag_name(uint64_t(uint32_t(imm)), ti, tf, ta))
+            cmt = "the Type-tag constant";
+        o << g1[regf & 7] << " " << rm << ", "
+          << imm_str(imm, ti, tf, ta); break; }
     case 0x90: o << "nop"; break;
     case 0xE8: { const int32_t d = rd32();
         /* call rel32 to a C++ helper / libm. The DISPLACEMENT is the
@@ -1906,20 +1942,52 @@ std::string disassemble_program(const Block *root)
     /* THE SPLICE, before the jit pass, exactly as vm_precompile_all does -
      * otherwise -vd would dump the un-inlined bytecode and lie about what
      * runs (the dump is the audit surface for the .myv image). */
+    /*
+     * ⛔ ITERATE `funcs` (SOURCE ORDER), NOT `chunks` - IT IS AN
+     * unordered_map KEYED BY A POINTER (2026-08-18).
+     *
+     * These three passes used to walk `chunks` directly. Its key is a
+     * `const FuncDescriptor *`, so the iteration order is a hash of
+     * HEAP ADDRESSES - which differ between two parses of the same
+     * source in the same process, and between two processes. Splice
+     * and JIT order is observable in the dump (the code arena is filled
+     * in that order), so `-vdj` was NON-DETERMINISTIC on any program
+     * with more than one compiled function.
+     *
+     * It surfaced as a red Coverage lane: the new `-vdj decodes every
+     * emitted form, reproducibly` check compared two dumps of one
+     * struct program and they differed - on CI, on the first try, after
+     * eight clean local runs. The disassembler was innocent; the DUMP
+     * DRIVER was not. Same family as the builtin-slot hazard in
+     * serialize.cpp, where a `std::map` keyed by an interned pointer
+     * gave a different slot order per process (CLAUDE.md).
+     *
+     * `funcs` is built by a source-order walk, so it is stable. Any
+     * future pass added here must use it for the same reason.
+     */
     BcInlineSnapshots bc_snaps;
-    for (const auto &kv : chunks)
-        bc_inline_snapshot(kv.second, bc_snaps);
-    for (auto &kv : chunks)
-        bc_inline_chunk(kv.second, slot_desc, bc_snaps);
+    for (const FuncDeclStmt *fn : funcs) {
+        auto it = chunks.find(fn->desc);
+        if (it != chunks.end())
+            bc_inline_snapshot(it->second, bc_snaps);
+    }
+    for (const FuncDeclStmt *fn : funcs) {
+        auto it = chunks.find(fn->desc);
+        if (it != chunks.end())
+            bc_inline_chunk(it->second, slot_desc, bc_snaps);
+    }
 
     /* Pass B: jit each body with its JitCtx (caller_desc = its own descriptor).
      * Main gets no JitCtx - a call from main is never native (as at runtime). */
-    for (auto &kv : chunks) {
+    for (const FuncDeclStmt *fn : funcs) {
+        auto it = chunks.find(fn->desc);
+        if (it == chunks.end())
+            continue;
         JitCtx jc;
         jc.slot_desc = &slot_desc;
         jc.slot_reassigned = &root->global_slot_reassigned;
-        jc.caller_desc = kv.first;
-        jit_compile_chunk(kv.second, &jc);
+        jc.caller_desc = it->first;
+        jit_compile_chunk(it->second, &jc);
     }
     jit_compile_chunk(main_ck);
 
