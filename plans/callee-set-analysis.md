@@ -1,0 +1,218 @@
+# THE CALLEE-SET ANALYSIS: one answer to "which function is this?"
+
+**Status: AGREED, NOT STARTED (2026-08-28).** A STRUCTURAL change, not a
+performance one - the maintainer's framing when agreeing to it. The
+measured payoff on today's corpus is ~2.8% on one bench (#115); the
+argument is that FOUR partial analyses answering slices of one question
+become ONE, and that the answer becomes able to say "I do not know".
+
+## The category error this fixes
+
+There are two different questions about a callable value:
+
+ - **SHAPE** - how do I emit the call, the window, the return?
+   Asked by the JIT. Answered by the `Func` StaticType.
+ - **IDENTITY** - is it always the SAME function? Asked by
+   devirtualization. Answered by a callee set.
+
+Type equality is CORRECT for the shape question, and `join`'s
+`static_type_equal` shortcut is correct with it: N functions assignable
+to one variable share one shape, and one answer is what the emitter
+needs. Nothing here proposes changing that.
+
+`StaticType::finfos` asks the IDENTITY question off the SHAPE object.
+That is the error. Two distinct functions routinely have equal types -
+
+```C#
+func sq(x)  => x * x;
+func neg(x) => 0 - x;
+print(typestr(sq));    # func(?)->?
+print(typestr(neg));   # func(?)->?     <- identical
+```
+
+- so every shape-level equivalence is a place identity dies. `join`'s
+`if (static_type_equal(a, b)) return a;` was the first one found (fixed
+in 4a1c246 by making the Func arm union the sets), and there is no
+argument that it is the last, because the whole class is "operations
+that treat equal types as interchangeable" - which is what a type system
+is FOR.
+
+**⛔ SO 4a1c246 IS REVERTED BY THIS WORK.** It teaches `join` to preserve
+information that should not be on a type. Leaving it after the
+replacement lands means two mechanisms claiming the same fact.
+
+## The deeper flaw: no ⊤
+
+`finfos` cannot distinguish **"nothing flows here"** from **"I have no
+idea"**. Both are the empty set. That is why:
+
+ - `escaped_finfos` / `FuncInfo::value_escaped` exist at all - a
+   side-channel ledger bolted on to carry the "unknown" that the set
+   itself cannot express;
+ - the ledger is *structurally* insufficient, which #115 hit: it records
+   members a join DROPPED, and says nothing about members that never
+   ENTERED;
+ - `finfos.size() == 1` was never a proof. #115 needed a UNIFORMITY rule
+   on top purely to survive that.
+
+A lattice with a real ⊤ makes "I do not know" a first-class answer, and
+every decline becomes a decline for a stated reason.
+
+## What exists today (all four are partial, none share evidence)
+
+**`TypeSym::func`** (inferencer 2643) - covers `var f = <lambda
+literal>`. Says unknown by being null.
+
+**`StaticType::finfos` + `escaped_finfos` + `value_escaped`**
+(statictype.h 77, inferencer 978) - covers values flowing through
+types. Says unknown through a SIDE LEDGER, incompletely (see above).
+
+**`index_func_aliases` / `callee_of`** (resolver 1943, 2008) - covers
+write-once aliases, for the step-7 unbound-call prover. Returns null.
+
+**`direct_func_slot` / `slot2fn` / `esc_callback_fn`** (resolver 4168,
+3354, 3382) - covers global-slot callees and the escape analysis's
+callbacks. Says unknown via `written_slots`, or null.
+
+`esc_callback_fn`'s own note records that the grep it was built from
+**misses `map`, `filter` and `sort`** - they reach their callback
+through a shared helper not named `builtin_*`. That is one analysis
+already known to be wrong about which functions a call can reach.
+
+## The analysis
+
+A monotone least-fixpoint over FUNCTION VALUES ONLY - a far smaller
+domain than the type lattice, and the same solver shape the inferencer
+already runs.
+
+**Abstract locations** (keyed by PROGRAM LOCATION, never by type):
+ - each `TypeSym` - variable, parameter, capture
+ - `ret(F)` per `FuncInfo`
+ - `elem(S)` / `val(S)` per array/dict-typed symbol
+ - each struct field that can hold a function
+
+**Lattice**: `⊥` (nothing yet) ⊑ finite sets of `FuncInfo *` ⊑ `⊤`
+(unknown). Cap the set at a small N and collapse to ⊤ past it, so a
+pathological program cannot make the sets large.
+
+**Constraints**, one walk:
+
+```C#
+var f = func(x) => x;      # pts(f) ⊇ { that lambda }
+var g = f;                 # pts(g) ⊇ pts(f)
+return h;                  # pts(ret(F)) ⊇ pts(h)
+var k = mk();              # pts(k) ⊇ pts(ret(mk))
+var p = [a, b];            # pts(elem(p)) ⊇ pts(a) ∪ pts(b)
+var q = p[i];              # pts(q) ⊇ pts(elem(p))
+f = <unanalyzable>;        # pts(f) = ⊤
+```
+
+**Query**: `callee_set(expr)` -> a set or ⊤. Exactly one member and not
+⊤ is a MUST answer - the only thing that licenses devirtualization or
+typing that one function's parameters.
+
+## Increments
+
+Each lands green on the full net battery. The order is chosen so the
+first one is measurable and the risky one is last.
+
+**1. THE ANALYSIS + ITS OWN TESTS, CONSUMED BY NOBODY.** Build the
+locations, lattice, constraints, solver and the query. Add a dump
+(`-dcs`, in the `-dti` spirit) printing each call site's callee set, so
+the pass is inspectable before anything depends on it. `-rt` cases
+assert the set for each constraint form ABOVE, and - the part that
+matters - assert ⊤ for each sink. INERT: no consumer, no behaviour
+change, the corpus must be byte-identical.
+
+**2. MIGRATE #115.** `snapshot_indirect_callees` queries the analysis
+instead of `finfos`. Its uniformity rule DISSOLVES: it exists only to
+survive a set that could not say "unknown", so removing it is the test
+that the new answer is real. ⛔ WATCH THE THREE PINNED CASES in
+`tests/functional/25_factory_closure_param.my` - the two declines must
+still decline, for the RIGHT reason now (⊤ or |set| > 1, not
+disagreement between sites).
+
+**3. MIGRATE `value_instantiate_round`.** Then DELETE `finfos`,
+`escaped_finfos`, `value_escaped`, `note_escaped_into`, and REVERT
+4a1c246. `StaticType` goes back to describing shape and nothing else.
+Blast radius check: the value-template corpus (76_funcval_dispatch is
+the bench that feature exists for) must be byte-identical in `-vd`.
+
+**4. MIGRATE THE RESOLVER'S THREE.** `callee_of` (the step-7 prover),
+`slot2fn` / `direct_func_slot` (devirtualization), `esc_callback_fn`
+(the escape analysis). ⛔ THIS INCREMENT IS MEMORY-SAFETY-CRITICAL: #93
+/ #94 make a false "safe" a USE-AFTER-FREE, and the escape analysis
+fails closed by design. Every rule there is pinned by a
+`param_escape_analysis` row that must be re-watched failing against the
+new source. Doing 1-3 and stopping is a legitimate outcome; it gets the
+correctness, and 4 is what collapses the duplication.
+
+## Placement, and why it is the hard part
+
+Not the solver - the sequencing.
+
+ - It needs POST-INSTANTIATION types. A call to a template DEFERS by
+   design, so a factory's return type does not exist until
+   `instantiate_round` has made the clone and redirected the call. #115
+   proved this the expensive way: the snapshot placed after the first
+   `run_fixpoint` found ZERO sites and the rule was silently inert.
+ - The resolver's consumers run LATER (`resolve_names`, then the
+   inliner, then `devirtualize_direct_calls`, then
+   `stamp_noescape_params`), and the inliner REWRITES the tree under
+   them.
+ - So: run it at the end of `infer_one`, after the instantiate loop; and
+   for increment 4, re-run or incrementally update it after the inliner,
+   because a spliced body is new call sites.
+
+**Open**: whether one run serves both sides or increment 4 needs its own
+re-run. Decide with a measurement (does re-running change any answer on
+the corpus?), not by argument.
+
+## The sink audit
+
+The ⊤ assignments are the correctness surface, and the same enumeration
+`esc_builtin_transparent` already got wrong once. Every one of these
+must assign ⊤ unless proven otherwise:
+
+ - a builtin that may STORE its argument or INVOKE it (start from
+   `esc_builtin_transparent` / `esc_builtin_no_invoke`, and re-derive
+   the invoker list by the awk over `VmInvoker`/`eval_func` that
+   CLAUDE.md quotes - remembering it MISSES map/filter/sort);
+ - a capture list (a closure snapshots by value);
+ - a struct field, a dict value, a container reached through `dyn`;
+ - the REPL's open world (a global can be redefined between inputs);
+ - a `.myv` image's pool values (a const array may hold a FuncObject -
+   see const_pool_func.my);
+ - any AST node shape the walker does not know - the `esc_known_shape`
+   rule, verbatim: an unknown kind HIDES occurrences, and a hidden
+   occurrence is how a wrong "safe" happens.
+
+## How it is tested
+
+⛔ THE ENGINE DIFFERENTIAL IS BLIND TO ALL OF THIS. A better-analysed
+program computes the same answers (see *Testing an AST TRANSFORM*). The
+oracles are:
+
+ 1. **the `-dcs` dump** - assert the SET, per constraint form and per
+    sink. This is the primary net and it is what increment 1 exists to
+    make possible;
+ 2. **`typestr`** for the #115 consumer - the parameter's inferred type,
+    scriptable and engine-independent;
+ 3. **`-vd` byte-identity** for the value-template and devirtualization
+    consumers: a migration that changes no decision must change no
+    bytecode;
+ 4. **the 124-program compile+output sweep** against the pre-change
+    binary, which is what caught #115's false refusal;
+ 5. **watched-failing sabotage per rule**, especially every ⊤ sink -
+    a sink that stops assigning ⊤ must fail a test, or the analysis
+    silently starts claiming knowledge it does not have.
+
+## What this does NOT do
+
+ - It does not change the JIT's call emission. That asks the shape
+   question and already reads the type.
+ - It does not make `join` or `static_type_equal` identity-aware. The
+   opposite: it removes the reason anyone wanted them to be.
+ - It is not a general points-to analysis. Function values only; no
+   aliasing of containers, no field sensitivity beyond "this field can
+   hold these functions".
