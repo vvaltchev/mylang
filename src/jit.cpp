@@ -64,6 +64,7 @@ unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
+unsigned long g_jit_two_addr_reg = 0;  /* #96: two-address PINNED ops */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
 unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
@@ -1144,6 +1145,109 @@ struct Emitter {
         u8(opc);
         u8(static_cast<uint8_t>(MODRM_SLOT | ((reg & 7) << 3)));
         u32(static_cast<uint32_t>(disp));
+    }
+    /*
+     * #96 INCREMENT 2 - the RM family: `<op> dst_reg, <src>`, where the
+     * destination is ANY register. Three source forms, one opcode table
+     * (RM is `reg = reg OP r/m`, so reg-reg and reg-memory share it):
+     *
+     *     op_rr2(aop, dst, src)        add r14, r13
+     *     op_reg_slot(aop, dst, disp)  add r14, [rbx+d]
+     *     op_reg_imm(aop, dst, imm32)  add r14, 1
+     *
+     * ⛔ UNLIKE op_mem_reg, `times` IS ALLOWED: `imul r64, r/m64`
+     * (0F AF /r) is exactly the RM form, and only the MR direction is
+     * missing from the ISA. That asymmetry is the whole reason the two
+     * halves of two-address arithmetic have different op sets.
+     */
+    static bool op_rm_opcode(Op aop, uint8_t &opc, bool &two_byte,
+                             uint8_t &ext)
+    {
+        two_byte = false;
+        switch (aop) {
+        case Op::plus:  opc = 0x03; ext = 0; return true;
+        case Op::minus: opc = 0x2B; ext = 5; return true;
+        case Op::band:  opc = 0x23; ext = 4; return true;
+        case Op::bor:   opc = 0x0B; ext = 1; return true;
+        case Op::bxor:  opc = 0x33; ext = 6; return true;
+        case Op::times: opc = 0xAF; ext = 0; two_byte = true; return true;
+        default:        opc = 0;    ext = 0; return false;
+        }
+    }
+    void op_rr2(Op aop, uint8_t dst, uint8_t src)
+    {
+        /* ⛔ the lookup runs OUTSIDE the assert. Inside, ASSERTS=0
+         * compiles the whole call away and opc/two are UNINITIALISED -
+         * a release build emitting a garbage opcode. -Werror caught it;
+         * the debug build was clean. */
+        uint8_t opc = 0, ext = 0; bool two = false;
+        const bool have = op_rm_opcode(aop, opc, two, ext);
+        ML_CHECK_MSG(have, "op_rr2: no RM encoding for this op");
+        (void)have; (void)ext;
+        u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
+                                     | (src >= 8 ? 0x01 : 0)));
+        if (two) u8(0x0F);
+        u8(opc);
+        u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7)));
+    }
+    void op_reg_slot(Op aop, uint8_t dst, int32_t disp)
+    {
+        uint8_t opc = 0, ext = 0; bool two = false;
+        const bool have = op_rm_opcode(aop, opc, two, ext);
+        ML_CHECK_MSG(have, "op_reg_slot: no RM encoding for this op");
+        (void)have; (void)ext;
+        u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)));
+        if (two) u8(0x0F);
+        u8(opc);
+        u8(static_cast<uint8_t>(MODRM_SLOT | ((dst & 7) << 3)));
+        u32(static_cast<uint32_t>(disp));
+    }
+    /* `<op> dst, imm32` - the group-81 forms, plus imul's own 69 /r.
+     * The immediate is SIGN-EXTENDED, so the caller must have checked
+     * the value fits int32. */
+    void op_reg_imm(Op aop, uint8_t dst, int32_t imm)
+    {
+        uint8_t opc = 0, ext = 0; bool two = false;
+        const bool have = op_rm_opcode(aop, opc, two, ext);
+        ML_CHECK_MSG(have, "op_reg_imm: no encoding for this op");
+        (void)have; (void)opc; (void)two;
+        if (aop == Op::times) {
+            /*
+             * ⛔ `imul r64, r/m64, imm32` (69 /r) names the destination
+             * TWICE - once in the reg field and once in r/m - so a
+             * high register needs REX.R *and* REX.B. Setting only
+             * REX.B (the natural thing, since every other form here is
+             * r/m-only) leaves the reg field at its low 3 bits: for
+             * r12 that is 4, i.e. **RSP**, and the emitted
+             * `imul rsp, r12, 3` destroys the stack pointer. Watched:
+             * ASan reported a stack-overflow with sp = 0x3, and the
+             * case that caught it was the imul DECLINE program written
+             * for increment 1 - which reaches this path the moment a
+             * pinned dst is allowed.
+             */
+            u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x05 : 0)));
+            u8(0x69);
+            u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (dst & 7)));
+        } else {
+            /* group 81 /ext: the destination is r/m only - REX.B.
+             * The imm8 form (83 /ext) when the value fits, which is
+             * THREE BYTES smaller and covers every small constant, not
+             * just the +-1 that `inc`/`dec` would. Preferred over
+             * inc/dec deliberately: those are one byte smaller again
+             * but write flags PARTIALLY (they leave CF), which costs a
+             * flag-merge on older cores - a real trade for one byte,
+             * where this is free. */
+            u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x01 : 0)));
+            if (imm >= -128 && imm <= 127) {
+                u8(0x83);
+                u8(static_cast<uint8_t>(0xC0 | (ext << 3) | (dst & 7)));
+                u8(static_cast<uint8_t>(imm));
+                return;
+            }
+            u8(0x81);
+            u8(static_cast<uint8_t>(0xC0 | (ext << 3) | (dst & 7)));
+        }
+        u32(static_cast<uint32_t>(imm));
     }
     void store(uint8_t reg, int32_t disp)
     {
@@ -6484,6 +6588,7 @@ void jit_stats_report()
          * `fwd_skip_rel` is the narrower C5-discharged write-skip. */
         { "xcache",           &g_jit_xcache },
         { "two_addr",         &g_jit_two_addr },
+        { "two_addr_reg",     &g_jit_two_addr_reg },
         { "fwd",              &g_jit_fwd },
         { "fwd_local",        &g_jit_fwd_local },
         { "fwd_skip_rel",     &g_jit_fwd_skip_rel },
@@ -9960,6 +10065,85 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             && !fa
             && !std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                                    static_cast<int32_t>(in.target));
+        /*
+         * ⛔ #96 INCREMENT 2 - the two-address form for a PINNED
+         * destination, and the half that removes real WORK rather than
+         * re-encoding it. Increment 1 (memory dst) turns four
+         * instructions into two, but an x86 RMW decodes to the same
+         * micro-ops, so it buys size and decode slots. THIS one:
+         *
+         *     mov rax, r14 ; mov rcx, r13 ; add rax, rcx ; mov r14, rax
+         *     add r14, r13
+         *
+         * - four instructions, of which the two moves are eliminated at
+         * rename but still occupy decode slots, collapse to ONE uop.
+         *
+         * It is also the first mechanism in this task that makes an
+         * ADDITIONAL pinned register worth something measurable: a
+         * pinned accumulator becomes 1 uop where a memory one is 3. The
+         * 13-register goal gets its justification here, not from any
+         * widening of the pool.
+         *
+         * Same soundness/cost split as increment 1, with ONE difference
+         * that is pure ISA: `imul` IS allowed, because `imul r64,
+         * r/m64` is exactly the RM form - only the MR direction is
+         * missing, which is what excluded it from the memory half.
+         *
+         * The source operand needs no scratch in any of its three
+         * shapes: another pin (`add r14, r13`), a memory slot
+         * (`add r14, [rbx+d]` - the RM form reads memory directly), or
+         * a literal that fits imm32 (`add r14, 1`, which also removes
+         * the `movabs rcx, 1` the loop counter was paying).
+         */
+        const int dreg = e.creg(in.target);
+        /*
+         * NOTE the forwarded-OUT case is ALLOWED here, unlike the
+         * memory half. There, leaving the result only in memory means
+         * the consumer reloads and lever A's elision is lost. Here the
+         * result is in a PIN, so handing it to the consumer costs one
+         * `mov rax, pin` - and 1 + 1 still beats the 4-instruction
+         * shape. On 83_regs_int_40 that is the difference between
+         * `a0 = a0 + i` staying at four instructions and dropping to
+         * two, on every accumulator that is pinned.
+         */
+        const bool two_addr_reg =
+            !in.a_is_lit() && in.target == in.a_slot()
+            && dreg >= 0
+            && !fa
+            && (in.b_is_lit()
+                    ? (in.b_lit() >= INT32_MIN && in.b_lit() <= INT32_MAX)
+                    : true);
+        if (two_addr_reg) {
+            const uint8_t d = static_cast<uint8_t>(dreg);
+#ifdef TESTS
+            /* through RCX and BEFORE the op: the bump clobbers its
+             * scratch and the FLAGS (see increment 1) */
+            e.scratch(RCX);
+            e.bump_counter(&g_jit_two_addr_reg, RCX);
+#endif
+            if (fb) {
+                emit_fwd_bump(e, fin < ck.slot_count);
+                e.op_rr2(aop, d, RAX);
+            } else if (in.b_is_lit()) {
+                e.op_reg_imm(aop, d, static_cast<int32_t>(in.b_lit()));
+            } else {
+                const int bcr = e.creg(in.b_slot());
+                if (bcr >= 0)
+                    e.op_rr2(aop, d, static_cast<uint8_t>(bcr));
+                else
+                    e.op_reg_slot(aop, d,
+                                  slot_addr(in.b_slot()).payload);
+            }
+            /* the consumer expects RAX; one move, and only when a
+             * consumer actually exists */
+            if (g_fwd.prod == in.target) {
+                e.mov_rr(RAX, d);
+                g_fwd.armed = true;
+            } else {
+                g_fwd = JitFwd{};  /* the result is in the PIN, not RAX */
+            }
+            return true;
+        }
         if (two_addr) {
             /* EXECUTION proof, and it is emitted FIRST on purpose: it
              * clobbers its scratch and the FLAGS, and after the
