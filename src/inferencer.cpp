@@ -2016,8 +2016,12 @@ void Inferencer::annotate_hints(Construct *n)
          * like int. The boxing in TypedScalarExpr::do_eval / LiteralBool keeps
          * the value bool where it must (a comparison/logical result, a bool
          * literal); arithmetic over bool correctly yields int. */
-        if (t->kind == StaticTypeKind::Int || t->kind == StaticTypeKind::Bool)
+        if (t->kind == StaticTypeKind::Int || t->kind == StaticTypeKind::Bool) {
             n->th = TypeHint::i;
+            /* ...and REMEMBER which of the two it was: a boxed consumer
+             * needs a bool to stay a bool (see Construct::th_bool). */
+            n->th_bool = t->kind == StaticTypeKind::Bool;
+        }
         else if (t->kind == StaticTypeKind::Float)
             n->th = TypeHint::f;
     }

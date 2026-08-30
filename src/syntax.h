@@ -163,6 +163,23 @@ public:
     TypeHint th = TypeHint::none;
 
     /*
+     * ⛔ `th == i` DOES NOT MEAN "int" - IT ALSO MEANS BOOL. A bool is
+     * evaluated through the int path on purpose (it promotes to 0/1, so
+     * typed arithmetic over bools is unboxed exactly like int), and this
+     * flag is how a consumer that needs the VALUE tells the two apart.
+     *
+     * It exists because the VM lost the distinction: compile_boxed_expr
+     * lowered a th==i node through the typed int path on the stated
+     * argument that the result "is a valid int EvalValue, so a boxed
+     * consumer reads it fine" - true for an int, FALSE for a bool, which
+     * then printed as 1/0 where the tree-walker printed true/false (a
+     * RULE 2 divergence on `a[i]`, `p.b`, `d[k]` and a slice element).
+     * Set by the inferencer wherever it stamps th==i for a Bool type;
+     * copied by copy_base_fields() so clones keep it.
+     */
+    bool th_bool = false;
+
+    /*
      * Representation hint for an array-producing node, set by the inferencer
      * from the destination type so the array is built in its final
      * representation (type-driven creation, no promotion). On a CallExpr's args
@@ -247,6 +264,7 @@ public:
         d.end = end;
         d.inline_ctx = inline_ctx;
         d.th = th;
+        d.th_bool = th_bool;
         d.arr_hint = arr_hint;
         d.arr_hint_struct = arr_hint_struct;
     }

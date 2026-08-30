@@ -964,7 +964,8 @@ struct Codegen {
      */
     bool compile_boxed_expr(const Construct *e, int &out_slot,
                             std::vector<CgInstr> &ops,
-                            bool allow_typed = true)
+                            bool allow_typed = true,
+                            bool truthy_only = false)
     {
         /*
          * Typed-arg lowering: a th==i/f node computes its int/float value via
@@ -977,7 +978,25 @@ struct Codegen {
          * fall through to the boxed cases below - so this only ever turns a
          * boxed op into the equivalent typed one, never changes behavior.
          */
-        if (allow_typed && (e->th == TypeHint::i || e->th == TypeHint::f)) {
+        /* ⛔ NOT for a BOOL (th_bool): the comment above is exactly
+         * right for an int and exactly wrong for a bool. The typed path
+         * writes an INT EvalValue, so a boxed consumer - print, a
+         * container element, str(), a dyn assignment - would see 1/0
+         * where the language (and the tree-walker) says true/false.
+         * A bool falls through to the boxed lowering below, which reads
+         * the real bool out of the array/field/dict.
+         *
+         * `truthy_only` is the EXEMPTION, and it is not a shortcut: a
+         * consumer that only asks is_true() cannot tell an int 0/1 from
+         * a bool, so the typed path stays. The four callers are the
+         * JumpUnlessTrueV feeders (if / while / for / ternary
+         * conditions). WITHOUT it this cost a real optimization rather
+         * than an answer: `if (a[k])` on an array<bool> stopped
+         * emitting LoadElemInt, so the E4 peephole that fuses it into
+         * JumpUnlessElemInt - 57_bool_reduce's whole hot loop - no
+         * longer matched, and the `-rt` hoist test caught it. */
+        if (allow_typed && (truthy_only || !e->th_bool)
+                && (e->th == TypeHint::i || e->th == TypeHint::f)) {
             const size_t omark = ops.size();
             const size_t cmark = chunk.consts.size();
             const int save_top = next_temp;
@@ -1640,7 +1659,9 @@ struct Codegen {
             const int scratch = next_temp;
 
             int cslot;
-            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops)) {
+            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops,
+                                    /*allow_typed=*/true,
+                                    /*truthy_only=*/true)) {
                 ops.resize(mark); next_temp = save_top; return false;
             }
             CgInstr jf;
@@ -4151,7 +4172,9 @@ struct Codegen {
         }
         if (!emitted) {
             int cslot;
-            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops)) {
+            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops,
+                                    /*allow_typed=*/true,
+                                    /*truthy_only=*/true)) {
                 ops.resize(mark);
                 next_temp = save_top;
                 return false;
@@ -5806,7 +5829,8 @@ struct Codegen {
         int cslot;
         reset_temps();
         const size_t mark = code.size();
-        if (compile_boxed_expr(cond, cslot, code)) {
+        if (compile_boxed_expr(cond, cslot, code, /*allow_typed=*/true,
+                               /*truthy_only=*/true)) {
             CgInstr in;
             in.op = OpCode::JumpUnlessTrueV;
             in.node_idx = add_ast_node(loc_node ? loc_node : cond);
@@ -6174,7 +6198,9 @@ struct Codegen {
                 int cslot;
                 /* BOXED condition -> compute a bool slot + branch-unless-
                  * true; the last resort before failing the whole `if`. */
-                if (compile_boxed_expr(f->condExpr.get(), cslot, code)) {
+                if (compile_boxed_expr(f->condExpr.get(), cslot, code,
+                                   /*allow_typed=*/true,
+                                   /*truthy_only=*/true)) {
                     CgInstr in;
                     in.op = OpCode::JumpUnlessTrueV;
                     in.node_idx = add_ast_node(f);   /* the IfStmt: the caret
