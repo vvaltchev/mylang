@@ -2223,3 +2223,71 @@ r9, rdx, rcx, rax are all in the ISA-fixed or candidate sets, so the
 reservation is what makes each of them admissible at all. It is now
 generic: nothing about it names a register, and adding one to
 XCACHE_ORDER is answered by the count.
+
+---
+
+## (p) 2026-08-18 - r9: the READ-tier seam, and what is left
+
+The element READ tiers now take their index register as an ARGUMENT
+(`load_slot_idx`, `load_index_idx`, `emit_elem_bounds_or_wrap`,
+`emit_flat_int_tail`, plus a `test_rr` encoder for the one hand-emitted
+`test r9, r9`). Landed INERT - byte-identical over 109 programs in both
+arena configurations.
+
+⛔ **THE CENSUS WENT UP, 103 -> 117, AND THAT IS CORRECT.** A helper
+whose NAME held the operand was hiding ~30 call sites from the count
+that decides admission. Expect the same for rdx/rcx/rax and do not read
+it as a regression - it is the tool finally seeing its subject, exactly
+as when the accessor list became derived.
+
+### THE REMAINING r9 WORK, grouped
+
+CONVERT - the read tiers, same threading as the seam above:
+
+     28  emit_op            (its element arms + `movabs R9, t_arr`)
+     25  emit_load_elem2_inline
+      6  emit_elem_int_read
+      5  emit_elem_base_gate
+
+ALREADY SAFE - by the gates rdi and rsi were cleared against:
+
+     10  emit_sync_push_native / emit_sync_call_inline
+             (jit_run_blocks_xcache denies the whole pool)
+      5  emit_ret_native   (flush_cache() is its second line)
+
+AUDIT - not yet classified:
+
+      7  emit_branch, jit_compile_chunk, jit_type_singletons,
+         emit_nstack_switch_post
+
+⛔ THE HOLE - no existing gate covers it:
+
+     ~6  emit_ctx_chain_r9, emit_ref_check_jae_r9,
+         load_r9b / store_r9b
+
+The last row is the one that matters. It is the CAPTURE / global-slot
+chain - the very site that printed 88854283473440 - and **no existing
+gate covers it**: `LoadCaptureV` is not a call op, so
+`jit_run_blocks_xcache` says nothing about it. Two options:
+
+ 1. convert it too (`[r9 + disp]` becomes `[reg + disp]`, so `load_r9b`
+    / `store_r9b` take a base register); or
+ 2. add a per-register run predicate - "a run containing a capture op
+    may not spend r9" - fed into `jit_xcache_clobber` exactly as the
+    tag singletons and the hoist pair are. Captures are rare, so this
+    costs almost nothing and is the smaller step.
+
+(2) first, then (1) if a closure-heavy shape ever wants the register.
+Either way r9 also stays in ELEM_CAND, so `elem_scratch_reserve` will
+withhold it whenever the element tier needs it - which is now automatic
+and needs no new clause.
+
+### THEN rdx, rcx, rax
+
+`ElemScratch` already records why `obj` (rax) and `count` (rdx) are
+ISA-FIXED: the compound `/=` and `%=` arms emit `cqo; idiv <val>`,
+which reads the dividend in RDX:RAX. Those two are not freed by
+threading - they need the idiv arm to spill/restore around itself, or
+the arm to decline when either register is pinned. rcx is the SIB base
+of every element operand and the shift-count register. Expect these
+three to be the real work of #96, with rax (393 sites) last.
