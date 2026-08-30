@@ -2396,3 +2396,77 @@ comparing `sc.idx` - the plan named a register and the code ignored it,
 invisible because the register was in the loader's NAME. `count` is the
 same kind of role; audit every `RDX` inside the element tiers against
 `sc.count` before assuming they agree.
+
+---
+
+## (r) 2026-08-19 - RDX (pin 11), by a POSITIVE run predicate
+
+`jit_pins 11 ... xcache 7 caller-saved`. The first register admitted
+WITHOUT a site audit, because rdx cannot have one: ~100 unbracketed
+sites, several ISA-forced (`idiv`'s RDX:RAX, emit_div_magic).
+
+`run_may_pin_rdx` inverts the question the way `run_needs_float_tag`
+does - rdx is spendable only in a run made ENTIRELY of ops positively
+established never to write it, so an unlisted or new opcode costs a
+pin and never an answer.
+
+### ⛔ TWO THINGS TO CARRY INTO rcx AND rax
+
+**1. A POSITIVE PREDICATE CAN BE VACUOUSLY EMPTY, AND -rt WILL NOT SAY
+SO.** The first version omitted `ReturnV`. A leaf body is ONE run
+ending in ReturnV, so the predicate refused EVERY fragment in the
+corpus: `-rt` green, corpus_diff green, zero registers gained. Only
+counting the emitted pin loads found it. When you admit rcx or rax the
+same way, MEASURE REACH BEFORE BELIEVING THE ADMISSION -
+`MYLANG_RDXDBG=1` (add a sibling) names the op that refused.
+
+**2. WIDENING THE POOL EATS TEST SHAPES, AND THE DANGEROUS ONES FAIL
+SILENTLY.** Three `jit_two_address` cases were built on "TEN
+accumulators outnumber the pool". At eleven pins one failed loudly and
+**two passed while testing nothing** - including a DECLINE case
+asserting `hits == 0` about a tier that could no longer fire.
+
+Before admitting the next register, grep the tests for hardcoded
+accumulator counts and any comment of the form "N, so they outnumber
+the pool". The fix is always the same: derive N from
+`jit_pin_budget()`, and take the expected VALUE from the tree-walker,
+because a derived N changes the answer.
+
+### THE REACH, AND WHAT WOULD WIDEN IT
+
+rdx is spent at 107 pin entry loads across 36 programs, but only
+in runs with no element
+and no div/mod op - dense scalar int loops. Widening means threading
+the element tiers' `count` role exactly as `idx` was threaded for r9;
+the eleven fixed-pair accessors deleted in the previous commit are the
+prerequisite, and every one of those sites now takes its register as an
+argument.
+
+### NEXT: rcx (218), rax (390)
+
+    rcx   the SIB base of every element operand, the shift COUNT
+          register (`sar`/`shl` by cl), and ElemScratch::data
+    rax   ElemScratch::obj, idiv's quotient, every helper's return
+          value, and the boxed tiers' accumulator
+
+MEASURED, so this is not a guess: of the four shared paths every
+whitelisted op reaches,
+
+    store_dst      RAX 3   RCX 0
+    write_slot     RAX 0   RCX 0
+    load_operand   RAX 0   RCX 0
+    op_rr          RAX 0   RCX 0
+
+**rax is a dead end for the predicate route.** `store_dst` is on the
+tail of essentially every producing op, so an rax whitelist is close to
+empty and a run predicate would buy nothing. rax needs the roles
+threaded - note `store_dst` ALREADY takes its source register as an
+argument, so the question is only its three internal uses.
+
+**rcx is the interesting one**: none of the four shared paths touch it.
+What does is the B1/B2 case BODIES - and #96's two-address increments
+mean a PINNED destination now goes straight through `op_rr`, which is
+rcx-free. So the rcx whitelist may be non-trivial after all, but it is
+emit-time-dependent ("only if the operands won pins"), which a
+run-level predicate cannot express. Check whether the boxed staging
+path is still reachable for those ops before writing one.

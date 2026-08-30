@@ -24862,16 +24862,80 @@ static bool jit_lowmem_singletons()
  *    is dead code;
  *  - enough iterations that the run is JIT-compiled at all.
  */
+#if ML_JIT_SUPPORTED
+/*
+ * ⛔ INSIDE THE GUARD, and it sat outside it for one push - the macOS
+ * lane failed with `unused function 'two_addr_prog' [-Werror,
+ * -Wunused-function]`, because `jit_two_address` below is itself
+ * ML_JIT_SUPPORTED-only and off-platform nothing calls this. That is
+ * the trap CLAUDE.md records verbatim from 2026-08-05, same warning,
+ * same lane, same cause; and the prescribed local check - flip jit.h's
+ * platform test to `#if 0`, build with BOTH compilers - is what I
+ * skipped.
+ *
+ * #96: an N-accumulator int loop whose accumulators OUTNUMBER the pin
+ * pool, so some are memory-resident and the MEMORY two-address form is
+ * reachable.
+ *
+ * ⛔ N IS DERIVED FROM `jit_pin_budget()`, AND HARDCODING IT WENT
+ * VACUOUS TWICE OVER. Three cases below said "TEN accumulators, so
+ * they outnumber the pin pool" - true when the pool held eight. rdx
+ * made it eleven, every accumulator got pinned, and the memory case
+ * reported "the tier never engaged" while its imul DECLINE sibling
+ * passed SILENTLY, having asserted `hits == 0` about a tier that could
+ * no longer fire at all. The improvement ate the test's shape, exactly
+ * as it did to jit_telide_c3 when r9 widened the pool.
+ *
+ * The expected OUTPUT is taken from the tree-walker rather than
+ * written down, because a derived N changes the sum - a literal would
+ * just move the staleness one field to the right.
+ */
+static std::vector<std::string>
+two_addr_prog(const std::string &ops, bool dyn_tail, int arg)
+{
+    const size_t N = jit_pin_budget() + 3;
+    std::vector<std::string> s{ "func f(int n) {" };
+    for (size_t k = 0; k < N; k++)
+        s.push_back("    var a" + std::to_string(k) + " = "
+                    + std::to_string(k + 1) + ";");
+    s.push_back("    for (var i = 1; i <= n; i++) {");
+    for (size_t k = 0; k < N; k++) {
+        const char op = ops[k % ops.size()];
+        const std::string rhs = op == '&' ? "(i + 240)"
+                              : op == '*' ? "3" : "i";
+        s.push_back(std::string("        a") + std::to_string(k) + " = a"
+                    + std::to_string(k) + " " + op + " " + rhs + ";");
+    }
+    s.push_back("    }");
+    std::string last = "a" + std::to_string(N - 1);
+    if (dyn_tail) {
+        /* the TAG check: a dyn add dispatches on the LIVE type word,
+         * which the payload-only two-address form must have left as
+         * t_int (typestr() cannot see it - it folds statically). */
+        s.push_back("    var dyn d = " + last + ";");
+        s.push_back("    var dyn r = d + 1;");
+        last = "r";
+    }
+    std::string ret = "    return a0";
+    for (size_t k = 1; k + 1 < N; k++)
+        ret += " + a" + std::to_string(k);
+    s.push_back(ret + " + " + last + "; }");
+    s.push_back("print(f(runtime(" + std::to_string(arg) + ")));");
+    return s;
+}
+#endif  /* ML_JIT_SUPPORTED - see the note above two_addr_prog */
+
 static bool jit_two_address()
 {
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
 
-    auto go = [&](const std::vector<const char *> &src,
+    auto go = [&](const std::vector<std::string> &src,
                   unsigned long *hits,
                   unsigned long *rhits,
-                  unsigned long *shits) -> std::string {
+                  unsigned long *shits,
+                  bool tw = false) -> std::string {
         const unsigned long h0 = g_jit_two_addr;
         const unsigned long r0 = g_jit_two_addr_reg;
         const unsigned long s0 = g_jit_step_imm;
@@ -24879,7 +24943,7 @@ static bool jit_two_address()
         std::streambuf *old = cout.rdbuf(cap.rdbuf());
         try {
             std::string joined;
-            for (const char *l : src) { joined += l; joined += "\n"; }
+            for (const std::string &l : src) { joined += l; joined += "\n"; }
             std::vector<Tok> toks;
             lexer(joined, 1, toks);
             ParseContext pc(TokenStream(toks), true);
@@ -24887,7 +24951,7 @@ static bool jit_two_address()
             mark_implicit_globals(root.get(), {});
             infer_types(root.get(), true);
             run_optimizers(root.get());
-            vm_execute(root.get());
+            if (tw) root->eval(nullptr); else vm_execute(root.get());
         } catch (...) { }
         cout.rdbuf(old);
         if (hits) *hits = g_jit_two_addr - h0;
@@ -24898,8 +24962,11 @@ static bool jit_two_address()
 
     struct Case {
         const char *name;
-        std::vector<const char *> src;
-        const char *want;      /* expected stdout */
+        std::vector<std::string> src;
+        /* expected stdout; EMPTY means "ask the tree-walker" - the
+         * generated cases below have a budget-derived accumulator
+         * count, so their sum is not something to write down. */
+        std::string want;
         bool fires;            /* the MEMORY form must engage? */
         bool fires_reg;        /* the PINNED form must engage? */
         /* increment 3: the counted-loop step. TRUE only where the
@@ -24917,18 +24984,8 @@ static bool jit_two_address()
        * declines (that is increment 2). The vacuous-test trap in a new
        * shape: the tier under test was optimised away by the tier
        * beside it. */
-      { "the five MR-encodable ops over memory accumulators",
-        { "func f(int n) {",
-          "    var a0 = 0; var a1 = 1000; var a2 = 255; var a3 = 0;",
-          "    var a4 = 0; var a5 = 0; var a6 = 2000; var a7 = 511;",
-          "    var a8 = 0; var a9 = 0;",
-          "    for (var i = 1; i <= n; i++) {",
-          "        a0 = a0 + i;  a1 = a1 - i;  a2 = a2 & (i + 240);",
-          "        a3 = a3 | i;  a4 = a4 ^ i;",
-          "        a5 = a5 + i;  a6 = a6 - i;  a7 = a7 & (i + 496);",
-          "        a8 = a8 | i;  a9 = a9 ^ i; }",
-          "    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9; }",
-          "print(f(runtime(20)));" }, "3102", true, true, true },
+      { "the MR-encodable ops over memory accumulators",
+        two_addr_prog("+-&|^", false, 20), "", true, true, true },
 
       /*
        * imul has NO MR encoding - `imul r64, r/m64` is RM only, the
@@ -24942,16 +24999,7 @@ static bool jit_two_address()
        * removing the guard aborts in op_mem_reg BY NAME.
        */
       { "multiply accumulators decline (imul has no MR form)",
-        { "func f(int n) {",
-          "    var m0 = 1; var m1 = 1; var m2 = 1; var m3 = 1;",
-          "    var m4 = 1; var m5 = 1; var m6 = 1; var m7 = 1;",
-          "    var m8 = 1; var m9 = 1;",
-          "    for (var i = 0; i < n; i++) {",
-          "        m0 = m0 * 3; m1 = m1 * 3; m2 = m2 * 3; m3 = m3 * 3;",
-          "        m4 = m4 * 3; m5 = m5 * 3; m6 = m6 * 3; m7 = m7 * 3;",
-          "        m8 = m8 * 3; m9 = m9 * 3; }",
-          "    return m0 + m1 + m2 + m3 + m4 + m5 + m6 + m7 + m8 + m9; }",
-          "print(f(runtime(9)));" }, "196830", false, true, false },
+        two_addr_prog("*", false, 9), "", false, true, false },
 
       /* dst is NOT one of the sources - not the two-address shape. */
       { "a three-address write declines (dst is not a source)",
@@ -24974,19 +25022,7 @@ static bool jit_two_address()
        * LIVE tag, which is the thing at issue.
        */
       { "the slot's TYPE survives (a dyn add reads it at runtime)",
-        { "func f(int n) {",
-          "    var a0 = 1; var a1 = 2; var a2 = 3; var a3 = 4;",
-          "    var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 8;",
-          "    var a8 = 9; var a9 = 10;",
-          "    for (var i = 0; i < n; i++) {",
-          "        a0 = a0 ^ (i + 1); a1 = a1 + i; a2 = a2 ^ i;",
-          "        a3 = a3 + i; a4 = a4 ^ i; a5 = a5 + i;",
-          "        a6 = a6 ^ i; a7 = a7 + i; a8 = a8 ^ i;",
-          "        a9 = a9 + i; }",
-          "    var dyn d = a9;",
-          "    var dyn r = d + 1;",
-          "    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + r; }",
-          "print(f(runtime(10)));" }, "286", true, false, false },
+        two_addr_prog("^+", true, 10), "", true, false, false },
 
       /*
        * INCREMENT 2 on its own: THREE accumulators, so every one is
@@ -25014,9 +25050,16 @@ static bool jit_two_address()
         std::string got = out;
         while (!got.empty() && (got.back() == '\n' || got.back() == ' '))
             got.pop_back();
-        if (got != c.want) {
+        std::string want = c.want;
+        if (want.empty()) {                 /* the tree-walker oracle */
+            want = go(c.src, nullptr, nullptr, nullptr, /*tw=*/true);
+            while (!want.empty()
+                   && (want.back() == '\n' || want.back() == ' '))
+                want.pop_back();
+        }
+        if (got != want) {
             cout << "  two_addr [" << c.name << "]: got \"" << got
-                 << "\", want \"" << c.want << "\"\n";
+                 << "\", want \"" << want << "\"\n";
             ok = false;
         }
         if (c.fires && hits == 0) {
