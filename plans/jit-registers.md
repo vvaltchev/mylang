@@ -1690,3 +1690,35 @@ imm8 form is one byte larger and writes flags completely.
     unbracketed sites.
  4. #100 (constant multiply strength reduction), #101 (native peephole
     pass) - both maintainer-raised, both after the allocator.
+
+
+## 2026-08-18 (h): IntAddStep converted - the operand-routing arc closes
+
+Its two halves are INDEPENDENT (accumulator and counter are different
+slots), so each converts on its own and the boxed code still serves
+whichever half is memory-resident.
+
+    Ir cumulative (1+2+3+3b): 01_while_loop -37.35%, 80 -31.07%,
+    83 -23.26%, 14_array_subscript -12.69%, 43_sieve -12.08%,
+    07_nested_loops -11.35%, 44_primes_sqrt -6.13%, 18_foreach -5.72%
+    WALL geomean 0.978x (was 0.985x, 0.990x, 1.005x, 1.000x)
+
+The suite geomean over the whole arc: 1.005x -> 0.990x -> 0.985x ->
+**0.978x**. Two of the benches above are NEW to the arc
+(14_array_subscript, 18_foreach_array): they are the `sum += a[i]`
+shape, which only IntAddStep reaches.
+
+### The operand routing is now done. What remains is the POOL.
+
+ 1. **Widen the pool toward 13** - the re-run MAXPINS sweep justifies
+    it with a number (-0.62%/register on 83, -2.6% on 80, no plateau
+    at 7, which is the whole pool). Cost: the scratch allocator for
+    RAX/RCX/RDX, 717 of 1016 unbracketed sites. THIS is the next big
+    piece and it now has a mechanism behind it.
+ 2. Re-run the MAXPINS sweep AGAIN after 3b - the per-register value
+    should have risen again, since more of the loop body is now
+    register-addressable.
+ 3. The increment-1 cost declines (fa, ref-listed dst), WITH a
+    measurement.
+ 4. #100 (constant multiply strength reduction), #101 (native peephole
+    pass) - both after the allocator.

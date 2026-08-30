@@ -6169,3 +6169,41 @@ assert as a DECLINE.
 ⛔ IntAddStep is NOT converted yet - same shape, same opportunity (its
 accumulate is still `read/load/op/write` and its bound test still goes
 through RAX), left for a follow-up so this increment measures alone.
+
+## 2026-08-18 - #96 increment 3b: IntAddStep, the fused accumulate+step
+
+The sibling of ForLoopStep, and the point worth recording is that its
+TWO HALVES ARE INDEPENDENT: the accumulator and the loop counter are
+different slots, so either may be pinned without the other. Each half
+converts on its own merits and the boxed code still runs for whichever
+half is memory-resident - which is also why the conversion could not be
+one `if`.
+
+    mov rax,r12 ; mov rcx,rhs ; add rax,rcx ; mov r12,rax
+    mov rax,r13 ; inc rax     ; mov r13,rax
+    mov rcx,n   ; cmp rax,rcx ; jl                            10
+    add r12, rhs ; inc r13 ; cmp r13, n ; jl                   4
+
+The accumulate takes any of the three RM source shapes (pin, memory
+slot, imm8/imm32, or a value forwarded in RAX by lever A - `add r12,
+rax`, which is the shape `sum += a[i]` produces). The counter half is
+ForLoopStep's, verbatim.
+
+`g_fwd` is CLEARED when either half converts: both leave RAX holding
+something other than what the boxed shape left there, so no consumer
+may believe a forward survived the op.
+
+**MEASURED, cumulative over increments 1+2+3+3b (callgrind Ir, OPT=1
+ASSERTS=0):** 01_while_loop **-37.35%**, 80_regs_int_08 -31.07%,
+83_regs_int_40 -23.26%, **14_array_subscript -12.69%**, 43_sieve
+-12.08%, 07_nested_loops -11.35%, 44_primes_sqrt -6.13%,
+**18_foreach_array -5.72%**. The last two named are NEW - they are the
+`sum += a[i]` shape, which only IntAddStep reaches.
+
+**WALL CLOCK: geomean cur/base 0.978x**, from 0.985x before this half -
+so IntAddStep alone is worth ~0.7% suite-wide. 01_while_loop 0.62x,
+81_regs_int_14 0.85x, 82 0.89x, 80 0.90x, 18_foreach_array 0.96x.
+
+NOTE 14_array_subscript reads 1.04x wall for -12.69% Ir: it is
+memory-bound, so removing instructions does not move it. The
+instruction-vs-time divergence again, in its ordinary form.
