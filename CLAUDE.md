@@ -3608,19 +3608,25 @@ sites, makes the instance through the ordinary clone machinery
 REDIRECTS every value-use Identifier IN PLACE (uid + id_sym rebind), and
 seeds the clone's params with the signature each fixpoint round (a
 phantom call - no direct call feeds them). **ESCAPES disable it**
-- **TWO of them, and they are different questions.**
-`callee_escaped(f)` (the analysis) asks *can this function be CALLED
-from a site I did not see?* - what the deleted `escaped_finfos` ledger
-was faking. `FuncInfo::value_escaped` asks something the analysis
-deliberately does not model: *is there a value use whose CONSUMERS I
-cannot enumerate* - an ARG-position use (`map(f, ...)`, `runtime(f)`)
-or a capture-list use. That second one matters because this pass
-REDIRECTS every value-use Identifier to the clone, so a use it cannot
-follow would hand the TYPED instance to a consumer free to call it with
-a mismatched signature. **Tracking a value further is not the same as
-being able to redirect it**, which is why keeping both gates is not
-belt-and-braces. Either one makes the template keep its boxed base
-(sound, as before). Non-uniform
+- **ONE ESCAPE QUESTION, ONE ANSWER: `callee_escaped(f)`** - *can this
+function be CALLED from a site the analysis did not see?*
+`FuncInfo::value_escaped` is **DELETED** (2026-08-28). It was fed by
+`escaped_finfos` (deleted in increment 3) and by a blanket rule that an
+ARG-position or CAPTURE-LIST use of a template escapes it outright.
+**Both of those uses are ordinary value uses now**, because the
+callee-set analysis NAMES their consumers: an argument bound to a
+parameter appears in `pts(param)`, so a call through that parameter is
+an attributed site like any other, lands in `sites[tmpl]`, and its
+signature meets the same uniformity rule as every other site.
+⛔ **THAT IS WHERE `12_higher_order` WENT FROM BOXED TO TYPED.**
+`func apply(f, x) => f(x);` called as `apply(sq, i)` used to escape
+`sq`, so `sq` stayed a boxed template base and `f(x)` dispatched
+dynamically. `sq$0` is instantiated now and
+`apply$0 : func(func(int)->int, int)->int` where it was
+`func(dyn,dyn)->dyn` - **-63.5% Ir per scale unit**, and it is the only
+corpus program whose bytecode changes. Still declining: a BUILTIN
+consumer (opaque -> `callee_escaped`), a ⊤ callee anywhere, and
+attributed sites that disagree. Non-uniform
 signatures across sites → no instantiation. **An UNINFORMATIVE signature
 is declined too** — a `dyn` param (the clone would be just as boxed) or a
 container carrying the BOTTOM `none` element type (`type_has_bottom_elem`:

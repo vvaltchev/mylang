@@ -94,9 +94,10 @@ struct FuncDescriptor {
          * C3: the inference-PROVEN scalar kind of an UN-annotated param
          * (i/f, else none). Stamped by the one-shot inferencer ONLY for
          * a concrete, non-opt, non-dyn param of a non-template function
-         * that is NEVER used as a value (sym !value_used, finfo
-         * !value_escaped) - so every call path is compile-checked and
-         * the param can only ever receive that scalar. METADATA, not a
+         * that is NEVER used as a value (sym !value_used) and whose
+         * value the callee-set analysis says has not ESCAPED - so every
+         * call path is compile-checked and the param can only ever
+         * receive that scalar. METADATA, not a
          * coercion trigger (bind paths ignore it): its one consumer is
          * codegen's ref_slots param join, which may then exclude the
          * param from the return-path reference-release scan exactly

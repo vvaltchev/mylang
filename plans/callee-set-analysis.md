@@ -492,9 +492,50 @@ reported escaped, and a name-only callee is still not - the second half
 matters because without it the case would also pass for the blanket
 rule this replaced.
 
-**STILL OPEN** (the next step the maintainer named): an ARG-POSITION
-use of a template is never redirected, even when every consumer is
-nameable. `value_instantiate_round`'s walk `continue`s past it - and
-that `continue`, not `value_escaped`, is what makes the arg case safe.
-Lifting it where the analysis can name every consumer is the remaining
-precision win.
+## Follow-up 2: a value-ARGUMENT use is an ordinary value use
+
+**DONE (2026-08-28), and it is the biggest single win of the arc.**
+
+`value_instantiate_round`'s walk treated an ARG-position or
+CAPTURE-LIST use of a template as an ESCAPE - "an untracked consumer
+could reach the typed instance with a mismatched signature". True when
+nothing could name the consumer of an argument. The callee-set analysis
+names it: the argument is bound to a parameter, so it appears in
+`pts(param)` and a call THROUGH that parameter is an attributed site
+like any other, landing in `sites[tmpl]` where uniformity decides.
+
+⛔ **THE LOSS LEDGER WAS THE ENABLER.** The same experiment run before
+follow-up 1 produced NO instance, because the blanket `cs_escaped_all`
+hammer escaped the template anyway. The two improvements had to land in
+order.
+
+**MEASURED** on `bench/my/12_higher_order` (`func apply(f, x) => f(x);`
+with `apply(sq, i)`): `sq$0` is instantiated for the first time and the
+higher-order chain is typed end to end -
+`apply$0 : func(func(int)->int, int)->int` where it was
+`func(dyn,dyn)->dyn`. Callgrind, `OPT=1 ASSERTS=0`, scale-corrected so
+compile time is excluded: **52.0M -> 19.0M Ir per scale unit, -63.5%**.
+It is the ONLY corpus program whose bytecode changes; 0 of 126 change
+output.
+
+The CAPTURE half is lifted with it. It changes NO corpus program, and
+is lifted anyway because it is the same rule with the same argument -
+one of the two surviving would be an asymmetry with no reason behind
+it, which is the shape this file keeps finding bugs in.
+
+**`FuncInfo::value_escaped` IS NOW DELETED** - both producers are gone,
+so the earlier "residual 1" question is answered by REMOVING it rather
+than by asserting anything about it. `callee_escaped` is the single
+escape question. What still declines: a BUILTIN consumer, a ⊤ callee
+anywhere, and attributed sites that disagree.
+
+⛔ **TWO ORACLES ARE VACUOUS HERE, AND THE TEST SAYS SO.** `typestr(x)`
+inside the callee - the #115 test's oracle - FOLDS at a splice, so it
+reports the argument's concrete type even when the base stayed boxed
+(it answered `int str` for a case that correctly DECLINED).
+`specializations(f)` is a HEISENBERG oracle: it is a BUILTIN, so naming
+the template in its argument list escapes it and collapses the state
+being measured (`[]` either way). Monomorphization is semantically
+transparent by design (RULE 2), so no value-level oracle can exist -
+the test compiles a program in-process and looks for the INSTANCE in
+the tree.

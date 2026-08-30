@@ -21540,6 +21540,111 @@ static bool jit_invoke_direct_entry()
  * capture, a reassignment, a global write, a container store) gets a row,
  * and each asserts the bit is CLEAR.
  */
+/*
+ * ⛔ A TEMPLATE USED AS A VALUE-ARGUMENT IS INSTANTIATED (#116
+ * follow-up, 2026-08-28) - and the oracle is the INSTANCE SET, read
+ * out of the compiled tree.
+ *
+ * `apply(sq, i)` used to ESCAPE `sq` by a blanket rule ("an
+ * arg-position value use has an untracked consumer"), so `sq` stayed a
+ * BOXED template base and `apply`'s `f(x)` called it dynamically. The
+ * callee-set analysis names the consumer - `sq` is bound to `f`, so
+ * `f(x)` is an attributed site whose signature decides - and
+ * bench/my/12_higher_order pays -63.5% Ir per scale unit for it.
+ *
+ * ⛔ TWO ORACLES WERE TRIED AND ARE VACUOUS, WHICH IS WHY THIS ONE
+ * COMPILES A PROGRAM AND WALKS ITS TREE:
+ *  - `typestr(x)` inside the callee - the #115 test's oracle - FOLDS
+ *    at a splice, so it reports the argument's concrete type even when
+ *    the base stayed boxed. It answered `int str` for a case that
+ *    correctly DECLINED.
+ *  - `specializations(f)` is a HEISENBERG oracle: it is a BUILTIN, so
+ *    naming the template in its argument list escapes it and collapses
+ *    the very state being measured. It answers `[]` either way.
+ * Monomorphization is semantically transparent by design (RULE 2), so
+ * no value-level oracle can exist - the instance set is the fact.
+ */
+static bool template_value_arg_instantiation()
+{
+    struct Case {
+        const char *what;
+        const char *src;
+        const char *inst;   /* the instance that must (not) exist */
+        bool want;
+    };
+
+    static const std::vector<Case> cases = {
+        /* THE WIN: 12_higher_order's shape. */
+        { "a template passed as an ARGUMENT is instantiated",
+          "func apply(f, x) { var r = f(x); return r; }\n"
+          "func sq(x) { var t = x * 2; return t; }\n"
+          "print(apply(sq, 3));", "sq$0", true },
+        /* the CAPTURE-LIST half of the same rule - lifted with it
+         * because it is the same question, and an asymmetry between
+         * the two would have no reason behind it */
+        { "...and a template CAPTURED by a closure likewise",
+          "func op(x) { var t = x * 2; return t; }\n"
+          "var g = func [op] (v) { var r = op(v); return r; };\n"
+          "print(g(7));", "op$0", true },
+        /* ---- the DECLINES, one per way the consumer stops being
+         * nameable. Each keeps the boxed base, which is what the old
+         * blanket rule achieved for all of them at once. ---- */
+        { "declines: a BUILTIN consumer is opaque",
+          "func op(x) { var t = x * 2; return t; }\n"
+          "var ops = [op];\n"
+          "var dyn h = runtime(op);\n"
+          "print(ops[0](1) + h(2));", "op$0", false },
+        { "declines: two attributed sites that DISAGREE",
+          "func op(x) { var t = str(x); return t; }\n"
+          "func apply(f, v) { var r = f(v); return r; }\n"
+          "var ops = [op];\n"
+          "print(ops[0](1) + apply(op, \"s\"));", "op$0", false },
+    };
+
+    /* does a FuncDeclStmt named `name` exist anywhere in the tree? */
+    std::function<bool(Construct *, const char *)> has =
+        [&](Construct *c, const char *name) -> bool {
+        if (!c)
+            return false;
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c))
+            if (fd->id && fd->id->get_str() == name)
+                return true;
+        bool found = false;
+        if (auto *b = dynamic_cast<Block *>(c))
+            for (auto &e : b->elems)
+                if (!found)
+                    found = has(e.get(), name);
+        return found;
+    };
+
+    bool ok = true;
+    for (const Case &c : cases) {
+        std::string src(c.src);
+        std::vector<Tok> toks;
+        bool got = false;
+        try {
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            got = has(root.get(), c.inst);
+        } catch (Exception &e) {
+            cout << "  tmpl-arg [" << c.what << "]: threw " << e.name << "\n";
+            ok = false;
+            continue;
+        }
+        if (got != c.want) {
+            cout << "  tmpl-arg [" << c.what << "]: instance '" << c.inst
+                 << "' " << (got ? "EXISTS" : "is absent") << ", wanted "
+                 << (c.want ? "it" : "no instance") << "\n";
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static bool param_escape_analysis()
 {
     struct Case {
@@ -38525,6 +38630,8 @@ static const std::vector<extra_check> extra_checks =
       jit_invoke_direct_entry },
     { "vm: VmInvoker::call picks the typed / boxed callback entry",
       invoker_call_tiers },
+    { "infer: a template used as a value-ARGUMENT is instantiated "
+      "(#116 follow-up)", template_value_arg_instantiation },
     { "resolve: which parameters cannot outlive the call (#93)",
       param_escape_analysis },
     { "opt: every AST transform is behaviour-preserving (layer equivalence)",
