@@ -142,6 +142,28 @@ them means anything:**
 
 - **`tests/myv_doc_check.py`** - is `docs/myv-format.txt` still the
   spec. Oracle: it is written from the DOC, not from serialize.cpp.
+- **`scripts/jitprofile.py` + `MYLANG_JIT_MAP=<path>`** - WHICH
+  EMITTED INSTRUCTION does the JIT spend its instructions on. It joins
+  a per-fragment instruction map, written AT RUNTIME BY THE PROFILED
+  PROCESS (so the addresses are the real ones - ASLR and where mmap
+  lands make a separate `-vdj` run useless for this), against a
+  callgrind `--dump-instr=yes` profile. `--listing` prints a fragment
+  in ADDRESS order with each instruction's Ir and a blank line at every
+  not-executed gap, which is how you read a hot PATH rather than a hot
+  instruction.
+  **⛔ IT EXISTED FOR NOBODY UNTIL 2026-08-27, AND THE WHOLE #97 CALL
+  ARC WAS COSTED WITHOUT IT** - by counting the emitted sequence BY
+  HAND out of `-vdj` and hoping the counted path was the one that ran.
+  JIT code lives in an anonymous mapping with no symbols, so callgrind
+  put every emitted instruction in one nameless blob; `-vdj` says what
+  was EMITTED, never what EXECUTED. Its first run answered in seconds a
+  question three sessions had estimated: of 142 Ir per call, 28 are the
+  ARGUMENT round trip and 71 are ACTIVATION BOOKKEEPING.
+  Oracle: a mandatory join SELF-TEST - mapped + unmapped Ir must equal
+  the run's own `summary:` line, and it EXITS 3 when it does not.
+  Watched failing: dropping the `calls=` skip (which charges a call
+  site its callee's whole subtree) inflates the profile 8x and is
+  otherwise completely plausible and completely silent.
 
 **FIX THE TOOL, NOT THE SCRIPT THAT READS IT.** Three cases from this
 repo, all found in one week, all the same shape:
