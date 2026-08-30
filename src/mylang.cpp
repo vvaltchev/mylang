@@ -16,6 +16,7 @@
 #include "codegen.h"   /* g_bc_inline_enabled (-nbi) */
 #include "serialize.h"
 #include "jit.h"
+#include "lowmem.h"
 #include "disasm.h"
 
 #include <initializer_list>
@@ -191,6 +192,15 @@ static void show_build_config()
          << "0"
 #endif
          << "        (native x86-64 codegen)" << endl;
+    /* RUNTIME, unlike every line above it - the arena is an mmap that
+     * can fail, and MYLANG_NO_LOWMEM=1 refuses it on purpose. It is
+     * here so a lane exercising that configuration can ASSERT it is in
+     * it (the lto0 lane's trick: a test of a configuration must prove
+     * it is in that configuration, or it goes vacuous the day a default
+     * moves), and so a human on a box where MAP_32BIT fails can see
+     * WHY the emitted code looks different. */
+    cout << "  lowmem            " << (ml_lowmem_available() ? "1" : "0")
+         << "        (type tags as imm32; 0 = register form)" << endl;
     cout << "  compiler          "
 #if defined(__clang__)
          << "clang " << __clang_major__ << "." << __clang_minor__

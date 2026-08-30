@@ -46,20 +46,6 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --levers
 
-    # THE NO-ARENA CONFIGURATION. With MAP_32BIT unavailable the JIT
-    # writes every type tag through a REGISTER instead of an imm32 - a
-    # different emission, shipping on any Linux box where that mmap
-    # fails, and until MYLANG_NO_LOWMEM existed no build and no lane
-    # could enter it. Its first run found 7 corpus programs crashing
-    # (store_dst_bool storing an unloaded register as a type pointer).
-    # Both halves: the whole suite, then the engine differential.
-    - name: "-rt with the low-address arena refused"
-      working-directory: ${{github.workspace}}/build
-      run: MYLANG_NO_LOWMEM=1 ./mylang -rt
-    - name: corpus_diff --nolowmem
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --nolowmem
-
     # Net 3: every program in a bounded shape space, four engines,
     # compared byte-for-byte. Depth 3 here (480 programs); the full
     # depth-4 space (2272) is a manual run.
@@ -88,6 +74,88 @@ jobs:
   # the release one finds the case where a check the debug build relies
   # on has been compiled away.
   # ---------------------------------------------------------------- #
+  # ---------------------------------------------------------------- #
+  # THE NO-ARENA CONFIGURATION - the JIT with its type tags in
+  # REGISTERS instead of imm32.
+  #
+  # lowmem.h places the Type singletons below 2^31 so a tag store is
+  # `mov qword [rbx+d], imm32`. Where that mapping is unavailable -
+  # Darwin, Windows, a hardened kernel, an exhausted low 2GB, A FAILED
+  # MAP_32BIT ON AN ORDINARY LINUX BOX - store_type_tag and cmp_reg_tag
+  # emit a register form instead, and jit_xcache_busy then denies r8 to
+  # the pin pool. Materially different emitted code, and it SHIPS.
+  #
+  # Until MYLANG_NO_LOWMEM existed no build and no lane could enter it,
+  # because the arena is an mmap at static init with no switch. That is
+  # the lto0 shape: a configuration only one platform can take is a
+  # configuration nobody tests. Its first run found a shipped wrong
+  # answer - store_dst_bool naming a register for the t_bool tag whose
+  # `movabs` had been deleted when the imm32 form landed - with `-rt`
+  # 1922/1922 and plain corpus_diff 20/20 throughout.
+  #
+  # TWO BUILDS, because they catch different things (the myv-fuzz job's
+  # reasoning, same file) - and that is MEASURED here, not assumed.
+  # Reintroducing the store_dst_bool defect and running `-rt` off-arena
+  # in each:
+  #     debug-sanitized     rc=134, an ABORT with a located UBSan
+  #                         report naming the bad Type access
+  #     release-no-asserts  rc=139, a SEGFAULT - the ML_CHECK tripwires
+  #                         are compiled away, so the defect arrives as
+  #                         the raw crash a user would get, in the build
+  #                         configuration a shipped program runs under
+  # Neither is redundant: the first says WHERE, the second proves the
+  # failure survives without the assertion net holding it up.
+  # ---------------------------------------------------------------- #
+  nolowmem:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debug-sanitized
+            cmake: -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+          - name: release-no-asserts
+            cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
+    name: nolowmem (${{matrix.name}})
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure
+      run: cmake -E make_directory ${{github.workspace}}/build
+    - name: CMake
+      working-directory: ${{github.workspace}}/build
+      run: cmake ${{matrix.cmake}} $GITHUB_WORKSPACE
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: cmake --build . -j
+
+    # ⛔ THE VACUITY GUARD, FIRST. A lane that tests a configuration
+    # must PROVE it is in that configuration, or it passes green doing
+    # nothing the day a default moves - which is exactly why the lto0
+    # lane asserts `lto 0` before it tests anything. Both directions, so
+    # neither a stuck-on nor a stuck-off answer gets through.
+    - name: "assert the arena is refused (and reported)"
+      working-directory: ${{github.workspace}}/build
+      run: |
+        ./mylang -v | grep -E '^  lowmem +1' \
+          || { echo "expected the arena ON by default"; exit 1; }
+        MYLANG_NO_LOWMEM=1 ./mylang -v | grep -E '^  lowmem +0' \
+          || { echo "MYLANG_NO_LOWMEM=1 did not refuse it"; exit 1; }
+
+    - name: "-rt with the arena refused"
+      working-directory: ${{github.workspace}}/build
+      run: MYLANG_NO_LOWMEM=1 ./mylang -rt
+
+    # the engine differential in the same configuration: the tree-walker
+    # has no JIT, so this is tw vs the register-form emission
+    - name: corpus_diff --nolowmem
+      working-directory: ${{github.workspace}}/build
+      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --nolowmem
+
+    - name: driver_checks
+      working-directory: ${{github.workspace}}/build
+      run: $GITHUB_WORKSPACE/tests/driver_checks.sh ./mylang
+
   myv-fuzz:
     runs-on: ubuntu-latest
     strategy:

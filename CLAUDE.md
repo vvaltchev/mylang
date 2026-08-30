@@ -102,6 +102,11 @@ them means anything:**
 - **`MYLANG_NO_LOWMEM=1`** - refuse the low-address arena, so the
   JIT's REGISTER-form type tags (the shipping configuration wherever
   `MAP_32BIT` is unavailable or fails) are reachable by a test.
+  Oracle: `mylang -v` reports `lowmem 0/1`, which the `nolowmem` CI
+  lane ASSERTS in both directions before it tests anything - a lane
+  that cannot prove it is in the configuration it tests goes vacuous
+  the day a default moves.
+
 - **`tests/myv_doc_check.py`** - is `docs/myv-format.txt` still the
   spec. Oracle: it is written from the DOC, not from serialize.cpp.
 
@@ -801,6 +806,18 @@ collision). Three nets now:
   **The general rule: an optimization that makes a register
   UNNECESSARY must not leave an argument behind claiming it is still
   LOADED.** Delete the parameter or honour it.
+  **NET: the `nolowmem` JOB** (`.github/workflows/nets.yml`) - `-rt`
+  off-arena, `corpus_diff.sh --nolowmem` and `driver_checks.sh`, over
+  TWO builds because they catch different things, MEASURED by
+  reintroducing the defect: **debug+ASan/UBSan ABORTS (rc=134)** with a
+  located report, **release `ASSERTS=OFF` SEGFAULTS (rc=139)** - the
+  raw crash a user gets once the ML_CHECK net is compiled away, in the
+  configuration a shipped program actually runs. It opens with a
+  VACUITY GUARD asserting `mylang -v` reports `lowmem 1` by default and
+  `lowmem 0` under the env, in both directions: a lane that cannot
+  prove it is in the configuration it tests goes green doing nothing
+  the day a default moves (the `lto0` lane's reason for asserting
+  `lto 0` first).
 - **`MYLANG_JIT_XROT=N` - ROTATE the caller-saved pin pool** so member
   N is handed out FIRST (`tests/corpus_diff.sh BIN --xrot` runs the
   matrix; `g_jit_xrot` is settable in-process, and `jit_xcache_pins`
