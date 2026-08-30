@@ -2501,3 +2501,76 @@ and it doubles as the rdx `count` work since the two are computed
 together), then the arith staging, then the tail. Expect it to be
 larger than r9's conversion and to land inert at every step -
 `scripts/vdjcmp.sh` byte-identical is the check that it did.
+
+## (s) the rcx element pass - and THREE shipped bugs it turned up
+
+Done, 2026-08-19, over four commits. Census across the day:
+
+               start   after (s)
+    RCX          218      159
+    RDX          118       62
+    RAX          393      340
+
+Threaded: the `LoadElemInt/Float` arm, the `LoadElemBool` arm, the
+nested READ (`emit_load_elem2_inline`, all 22 RCX + 13 RDX), and BOTH
+element STORE tiers. Two fixed-pair accessors deleted
+(`mov_rax_rcx_d`, `cmp_byte_rcx`) for a generic `cmp_byte_base`; four
+generic encoders added (`lea_base`, `lea_elem_q`, `cmp_reg_base`,
+`load_base0`) over a shared `emit_modrm_disp`.
+
+**Every step verified byte-identical over the corpus in BOTH arena
+configurations**, which is the property that makes a conversion this
+size safe to do quickly. Two caveats learned the hard way:
+
+ - **byte-identity is only evidence where the arm is EMITTED.** The
+   corpus emits no `LoadElem2Float` at all, so the float and row-slice
+   arms had to be covered by purpose-written probes (now
+   `tests/functional/16_elem2_fused.my`);
+ - **HALF-threaded is worse than un-threaded.** `emit_store_elem2_inline`
+   already READ `sc.data`/`sc.count` in its bounds compares while
+   WRITING RCX/RDX in the loads above them - correct only by the
+   defaults, and it reads as done.
+
+### The three bugs, all pre-existing, all found by one new corpus file
+
+1. **A slice read the wrong element under the float op.** The float
+   branch of the nested read `return`ed before the two SLICE arms were
+   emitted, leaving their forward `jne rel32`s unpatched - so they fell
+   through into the non-slice path and dropped the slice's `off`. An
+   `if`/`return` where an `if`/`else` was meant.
+2. **A rel8 span that grows with the pin budget.** `emit_ref_check`'s
+   short `jb` jumps over a helper call, whose length is the number of
+   live caller-saved pins. Clean at MAXPINS 4-6, aborts from 8 up, and
+   at `ASSERTS=0` truncates the displacement instead - a jump into the
+   middle of an instruction. **The rule was already written in
+   `patch8`'s comment.** Now machine-checked: `Emitter::n_prologues`.
+3. **The divmod cold gate SIGFPEs.** Five hand-encoded byte sequences
+   naming `rdi` (the divisor) and `r9` (the index) literally, while
+   both are ALLOCATED roles the allocator moves routinely. `/= 0`
+   reached the native `idiv`.
+
+**All three are the same failure**: a fact stated in a form no scan
+can read - a register in a byte literal, a register in a method name,
+a call behind a helper's name, a rule in a comment. And all three
+survived because the nets are blind to them by construction: with each
+defect reintroduced, `-rt` is GREEN at 1924/1924 every time.
+
+### What is left for rcx (159), and the order
+
+     ~55  emit_op's tail - the arith staging, UnaryV, StructCtorV,
+          LoadMemberFloat, MoveV/LoadConstV/LoadBuiltinV
+      21  emit_branch - IntAddStep / ForLoopStep staging
+      12  LoadCaptureV / StoreCaptureV - the chain's copy register
+       8  jit_try_container
+      39  emit_sync_push_native + emit_ret_native - ALREADY SAFE by
+          the existing gates; convert last, for the census only
+
+Then make `data`/`count` ALLOCATABLE in `ElemRead` and `ElemScratch`.
+That is the step with real risk: it raises the reservation's role count
+from 2 to 4 for a store, and with a C1 hoist holding r10/r11 out of six
+CAND members a four-role store may start DECLINING. `g_jit_elem_noreg`
+exists to say so rather than let it go quiet - watch it, and widen
+`ELEM_CAND` before accepting a decline rate.
+
+Then rax (340), which has no predicate shortcut: `store_dst` touches it
+3x on every whitelisted path, so the roles must be threaded first.
