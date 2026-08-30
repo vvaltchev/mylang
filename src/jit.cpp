@@ -2115,6 +2115,26 @@ struct Emitter {
         u32(static_cast<uint32_t>(d));
     }
     /* ... and off the fragment's SLOT base (rbx) */
+    /* cmp r32, imm32 - the ref-check family's `type->t` test. The four
+     * sites that needed it spelled `ecx` into the modrm byte (0xF9),
+     * so no scan for the register could see them. */
+    /* cmp r32, imm8 (sign-extended) - the gate's low-end test */
+    void cmp_reg32_imm8(uint8_t reg, int8_t imm)
+    {
+        if (reg >= 8)
+            u8(0x41);
+        u8(0x83);
+        u8(static_cast<uint8_t>(0xC0 | (7 << 3) | (reg & 7)));
+        u8(static_cast<uint8_t>(imm));
+    }
+    void cmp_reg32_imm32(uint8_t reg, uint32_t imm)
+    {
+        if (reg >= 8)
+            u8(0x41);
+        u8(0x81);
+        u8(static_cast<uint8_t>(0xC0 | (7 << 3) | (reg & 7)));
+        u32(imm);
+    }
     void load32_slot(uint8_t reg, int32_t d)
     {
         if (reg >= 8)
@@ -3558,15 +3578,16 @@ static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
  * caught it.)
  */
 static size_t emit_ref_check(Emitter &e, int32_t type_off,
-                             JitColdTier cold = JC_COUNT)
+                             JitColdTier cold = JC_COUNT,
+                             uint8_t sc = RCX)
 {
     const JitLayout &L = jit_layout();
     const bool force = cold != JC_COUNT && jit_cold_forced(cold);
-    e.load(RCX, type_off);                    /* rcx = current Type* */
-    e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
-    e.u32(static_cast<uint32_t>(L.type_t_off));
-    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str/0 */
-    e.u32(force ? 0u : static_cast<uint32_t>(L.t_str_val));
+    e.scratch(sc);
+    e.load(sc, type_off);                     /* sc = current Type* */
+    e.load32_base(sc, sc, L.type_t_off);      /* sc32 = type->t */
+    e.cmp_reg32_imm32(sc, force ? 0u
+                                : static_cast<uint32_t>(L.t_str_val));
     /*
      * ⛔ NEAR, NOT SHORT (fixed 2026-08-19). Every one of the three
      * callers puts a HELPER CALL between this jump and its patch, and a
@@ -3587,14 +3608,13 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off,
  * global slot): jump NEAR to the helper when it is a REFERENCE. Clobbers
  * rcx; `cb` is only READ. */
 static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
-                                       int32_t type_off)
+                                       int32_t type_off, uint8_t sc = RCX)
 {
     const JitLayout &L = jit_layout();
-    e.load_base(RCX, cb, type_off);
-    e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
-    e.u32(static_cast<uint32_t>(L.type_t_off));
-    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
-    e.u32(static_cast<uint32_t>(L.t_str_val));
+    e.scratch(sc);
+    e.load_base(sc, cb, type_off);
+    e.load32_base(sc, sc, L.type_t_off);
+    e.cmp_reg32_imm32(sc, static_cast<uint32_t>(L.t_str_val));
     return e.j32(0x73);                        /* jae -> the helper (a ref) */
 }
 
@@ -3604,16 +3624,15 @@ static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
  * helper; the inline handles the 3..t_str-1 range (int/builtin/float/bool/
  * structtype). Returns the TWO jump sites to patch to the helper. */
 static std::pair<size_t, size_t>
-emit_store_src_gate(Emitter &e, int32_t type_off)
+emit_store_src_gate(Emitter &e, int32_t type_off, uint8_t sc = RCX)
 {
     const JitLayout &L = jit_layout();
-    e.load(RCX, type_off);
-    e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
-    e.u32(static_cast<uint32_t>(L.type_t_off));
-    e.u8(0x83); e.u8(0xF9); e.u8(3);           /* cmp ecx, 3 (t_int) */
+    e.scratch(sc);
+    e.load(sc, type_off);
+    e.load32_base(sc, sc, L.type_t_off);
+    e.cmp_reg32_imm8(sc, 3);                   /* cmp sc32, 3 (t_int) */
     const size_t j_lo = e.j32(0x72);           /* jb -> helper (none/pseudo) */
-    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
-    e.u32(static_cast<uint32_t>(L.t_str_val));
+    e.cmp_reg32_imm32(sc, static_cast<uint32_t>(L.t_str_val));
     const size_t j_hi = e.j32(0x73);           /* jae -> helper (a ref) */
     return { j_lo, j_hi };
 }
@@ -3626,14 +3645,12 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap)
     e.scratch(cb);            /* the ctx chain walks through it */
     const JitLayout &L = jit_layout();
     e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
-    e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] (the ctx) */
+    e.load_base0(RAX, RAX);                    /* rax = the ctx */
     if (cap) {
-        e.u8(0x48); e.u8(0x8B); e.u8(0x80);    /* mov rax,[rax+captures] */
-        e.u32(static_cast<uint32_t>(L.ctx_captures));
+        e.load_base(RAX, RAX, static_cast<int32_t>(L.ctx_captures));
         e.load_base(cb, RAX, 0);               /* cb = the captures data */
     } else {
-        e.u8(0x48); e.u8(0x8B); e.u8(0x90);    /* mov rdx,[rax+gfuncs] */
-        e.u32(static_cast<uint32_t>(L.ctx_gfuncs));
+        e.load_base(RDX, RAX, static_cast<int32_t>(L.ctx_gfuncs));
         e.load_base(cb, RDX,                   /* cb = the gfuncs slots */
                     static_cast<int32_t>(L.gft_slots));
     }
@@ -3643,14 +3660,14 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap)
  * HELPER fallback when the value at `type_off` is a REFERENCE (type->t >=
  * t_str); fall through for a trivial value. Returns the jae rel32 site to
  * patch to the helper label. Clobbers rcx. */
-static size_t emit_ref_check_jae(Emitter &e, int32_t type_off)
+static size_t emit_ref_check_jae(Emitter &e, int32_t type_off,
+                                 uint8_t sc = RCX)
 {
     const JitLayout &L = jit_layout();
-    e.load(RCX, type_off);
-    e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
-    e.u32(static_cast<uint32_t>(L.type_t_off));
-    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
-    e.u32(static_cast<uint32_t>(L.t_str_val));
+    e.scratch(sc);
+    e.load(sc, type_off);
+    e.load32_base(sc, sc, L.type_t_off);
+    e.cmp_reg32_imm32(sc, static_cast<uint32_t>(L.t_str_val));
     return e.j32(0x73);                        /* jae -> the helper (a ref) */
 }
 
