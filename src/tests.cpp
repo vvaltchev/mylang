@@ -19430,6 +19430,132 @@ static bool jit_frameless_gate()
 #endif
 }
 
+/*
+ * #112: the CAPTURE BASE is walked ONCE per run.
+ *
+ * Every capture access used to emit `ctx -> ctx->captures -> data()`
+ * for itself - three DEPENDENT loads - so a closure body that reads
+ * and writes one captured counter walked it twice per call, the second
+ * walk sitting on the dependency chain of the store after it.
+ *
+ * Three things this asserts, and only the first is about instructions:
+ *  (1) REACH, from an EMITTED-code counter. "A run claimed a capture
+ *      base" is a compile-time claim; "a fragment RAN with one" is not,
+ *      and the two have come apart before.
+ *  (2) RULE 2 - the lever off must give the byte-same ANSWER. The
+ *      optimization may change only how long the script takes.
+ *  (3) THE INVARIANT THE PIN RESTS ON: `ctx->captures` is restored by
+ *      every path that changes it. The case that exercises it is a
+ *      closure calling ANOTHER closure BETWEEN two accesses to its own
+ *      capture - which really does repoint ctx->captures at the
+ *      callee's slots and back. A value test is the whole point here:
+ *      a stale base reads the WRONG closure's captures, which is a
+ *      wrong answer, not a crash.
+ */
+static bool jit_capbase_pinned()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (Exception &e) {
+            fprintf(stderr, "jit_capbase: %s: %s\n", e.name, e.msg);
+            ok = false;
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    /* (1) the plain counter: one READ and one WRITE of `start` per
+     * call, so the run makes two inline capture accesses and qualifies.
+     * 200 calls, sum 1+2+..+200. */
+    const std::vector<const char *> counter = {
+        "func mk(start) => func [start] {",
+        "  start++;",
+        "  return start;",
+        "};",
+        "func drive(int n) {",
+        "  var c = mk(0);",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = s + c();",
+        "  return s;",
+        "}",
+        "assert(drive(runtime(200)) == 20100);" };
+    const unsigned long p0 = g_jit_capbase;
+    if (!run(counter))
+        return false;
+    if (g_jit_capbase <= p0 + 100) {
+        fprintf(stderr, "jit_capbase: the pinned capture base did not "
+                "RUN (%lu entries for 200 calls)\n",
+                g_jit_capbase - p0);
+        return false;
+    }
+
+    /* (2) RULE 2: the same program with the lever off must still be
+     * accepted by the same assert - and must NOT claim a base, or the
+     * A/B proves nothing about the mechanism. */
+    {
+        const unsigned save = g_jit_off_extra;
+        g_jit_off_extra |= jit_lever_bit("capbase");
+        const unsigned long q0 = g_jit_capbase;
+        const bool ok = run(counter);
+        const unsigned long got = g_jit_capbase - q0;
+        g_jit_off_extra = save;
+        if (!ok)
+            return false;
+        if (got != 0) {
+            fprintf(stderr, "jit_capbase: MYLANG_JIT_OFF=capbase still "
+                    "claimed a base %lu times\n", got);
+            return false;
+        }
+    }
+
+    /* (3) THE INVARIANT. `inner` is a capture too (a reference one), and
+     * calling it repoints ctx->captures at ITS slots; the pinned base
+     * must still be this closure's when `start` is written after the
+     * call. A stale base would write `start` through inner's captures.
+     *   call 1: 10 -> 11, +14 -> 25
+     *   call 2: 25 -> 26, +14 -> 40
+     *   call 3: 40 -> 41, +14 -> 55        sum 120 */
+    if (!run({
+            "func mkinner(k) => func [k] { return k * 2; };",
+            "func mkouter(start, inner) => func [start, inner] {",
+            "  start++;",
+            "  var t = inner();",
+            "  start = start + t;",
+            "  return start;",
+            "};",
+            "func drive2(int n) {",
+            "  var c = mkouter(10, mkinner(7));",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + c();",
+            "  return s;",
+            "}",
+            "assert(drive2(runtime(3)) == 120);" }))
+        return false;
+#endif
+    return true;
+}
+
 static bool jit_baked_callee_tier()
 {
 #if ML_JIT_SUPPORTED
@@ -34608,6 +34734,7 @@ static bool jit_counter_coverage()
         { "store_prep",       &g_jit_store_prep,       nullptr },
         { "hoist",            &g_jit_hoist,            nullptr },
         { "hoist2",           &g_jit_hoist2,           nullptr },
+        { "capbase",          &g_jit_capbase,          nullptr },
         { "hoist_rmw",        &g_jit_hoist_rmw,        nullptr },
         { "fwd",              &g_jit_fwd,              nullptr },
         { "ffwd",             &g_jit_ffwd,             nullptr },
@@ -37719,6 +37846,8 @@ static const std::vector<extra_check> extra_checks =
       "still correct)", jit_callee_cache_hit },
     { "jit: a write-once global callee is BAKED, a reassigned one is not",
       jit_baked_callee_tier },
+    { "jit: the capture base is walked ONCE per run, not per access",
+      jit_capbase_pinned },
     { "jit: the FRAMELESS gate admits a scalar leaf and rejects a caller "
       "/ a try region (#97, inert)", jit_frameless_gate },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",

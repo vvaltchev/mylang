@@ -1009,6 +1009,16 @@ collision). Three nets now:
   compare is unreachable under our own compilation and deleting it
   leaves every net green - `MYLANG_JIT_FORCE=bakecallee` lifts the
   cost gate alone and makes it fail in `Frame::at`),
+  capbase (#112: a run making TWO OR MORE inline capture accesses
+  walks `ctx -> ctx->captures -> data()` ONCE, at the run head, into
+  a CALLEE-saved register claimed from whatever `CACHE_REGS` the
+  pins, the C2b pair and trans mode's abstract registers left. **It
+  is a BASE register, not a value register, and that excludes r12**
+  - `(r & 7) == 4` is the ModRM encoding meaning "a SIB byte
+  follows", which `load_base` does not write; `base_needs_sib`'s
+  ML_CHECK caught it on the first run, exactly as its own comment
+  predicted it would the day a base came from an ALLOCATOR rather
+  than a literal),
   `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by

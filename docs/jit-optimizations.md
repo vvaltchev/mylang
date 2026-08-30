@@ -10073,7 +10073,12 @@ fragment. Hoisting it needs a register held across the run (the C1
 shape) or a cached arena cell maintained at every site that writes
 `ctx->captures`; the second is 4 instructions for a miss that would read
 the WRONG closure's captures, so it is not obviously worth it. Recorded,
-not built.
+not built. **BUILT the next day as #112, by the FIRST route** - a
+callee-saved register held for the run. The arena-cell variant was
+rejected for the reason recorded here plus a stronger one: it makes
+every writer of `ctx->captures` responsible for a derived global, which
+is the "an && over a family is a table" shape with a use-after-free as
+its failure mode.
 
 NETS: -rt 1965/1965 on dbg(ASan+UBSan), RECYCLE=1, rel-hard
 (VM_HARDENING) and clang; corpus_diff plain/--levers/--xrot/--cold/
@@ -10083,3 +10088,146 @@ boundary (int / float / bool take it; an array, a string, a `dyn` that
 alternates int and string, and two closures over one factory call must
 not, and are run under RECYCLE=1 + ASan where a torn handle or a missed
 release is a use-after-free).
+
+## #112 - THE CAPTURE BASE IS WALKED ONCE PER RUN, NOT PER ACCESS
+## (2026-08-27)
+
+**THE PROFILER FOUND IT, AND NOTHING ELSE COULD HAVE.**
+`scripts/jitprofile.py` on 11_closure_counter printed the closure body
+in address order, and six of its fifty-three instructions were the same
+three dependent loads, emitted twice:
+
+    +12  mov rax, [<addr>]      +91   mov rax, [<addr>]
+    +20  mov rax, [rax+0x78]    +99   mov rax, [rax+0x78]
+    +27  mov r9,  [rax+0x0]     +106  mov r9,  [rax+0x0]
+    +34  mov rax, [r9+0x18]     +113  mov rax, s1.type
+    +41  mov rcx, [r9+0x0]      +120  mov rcx, s1
+    +48  mov s0, rcx            +127  mov [r9+0x0], rcx
+    +55  mov s0.type, rax       +134  mov [r9+0x18], rax
+
+`ctx -> ctx->captures -> data()`, once for the READ of `start` and again
+for the WRITE. Nothing between them is a call - a slot move and an
+`add`. `-vdj` shows the same bytes but says nothing about which of them
+run; the whole point of the join is that the answer is per-INSTRUCTION.
+
+**THE SHAPE, and why it is not a peephole.** The two accesses are not
+adjacent and there is no window in which "the base is still in r9" is
+locally provable - proving it means knowing which registers every
+intervening emit arm clobbers, which is the audit that failed for r9 in
+the pin pool. So the value is HOISTED instead: a run making TWO OR MORE
+inline capture accesses claims a register for the whole run, walks the
+chain once at the run head, and every access reads it. That is C4b's
+pinned float literals (`Emitter::flits`) applied to a pointer.
+
+**THE REGISTER IS CALLEE-SAVED, AND THAT IS LOAD-BEARING.** It is taken
+from whatever `CACHE_REGS` ({r12..r15}) the pins, the C2b hoist pair and
+trans mode's abstract registers left - claimed LAST, so it can only ever
+spend a register nothing above it wanted. Callee-saved means a helper
+call preserves the REGISTER, so only its VALUE is refreshed, at one
+place (`emit_call_epilogue`). A caller-saved register would need
+refreshing after every call the emitter makes, and which emitted
+sequences call is not scannable - the flits note records a float store
+to a ref-listed dst calling `jit_put_float` from an arm no opcode scan
+sees.
+
+The walk goes THROUGH the destination register (`mov cb, [ctx]; mov cb,
+[cb+0x78]; mov cb, [cb+0]`), needing no scratch - which is what lets it
+run at the epilogue, where rax carries the helper's status that every
+call site tests immediately after.
+
+**⛔ IT IS A BASE REGISTER, NOT A VALUE REGISTER - SO r12 IS EXCLUDED,
+AND `load_base0` HAD TO LEARN r13.** Both halves are the same fact
+about ModRM, and both were caught by an existing instrument on the first
+run rather than shipped:
+
+ - `(r12 & 7) == 4` means "a SIB byte follows", which `load_base` does
+   not write. `base_needs_sib`'s ML_CHECK fired immediately - and its
+   own comment had PREDICTED this moment: *"nothing passes r12/r13 as a
+   base today, which is precisely why it was silent; it stops being
+   silent the moment a base register comes from an ALLOCATOR rather
+   than a literal."* r12 is skipped by the claim.
+ - `(r13 & 7) == 5` at mod=00 means "disp32, no base". Every access
+   addresses off the base with a disp32 (mod=10), which is legal for
+   r13 - but `load_global`'s OFF-ARENA fallback ends in `load_base0`,
+   the mod=00 form, so `load_base0(r13, r13)` aborted. **On the
+   low-address arena that line is never reached** (`load_abs32`
+   returns first), so it is invisible to every default build: the
+   `--nolowmem` lane found it, four programs, one lane.
+   FIXED IN THE EMITTER, not dodged in the caller: `load_base0`
+   delegates to `emit_modrm_disp`, the shared tail that already picks
+   mod=01 disp8=0 for rm==5. Byte-identical for every existing caller
+   (none passes rsp/r12/rbp/r13), and one fewer place the register-class
+   work will trip over.
+
+**MEASURED** (callgrind Ir, `OPT=1 ASSERTS=0` both sides, the
+scale3-minus-scale1 delta so compile time is excluded):
+
+    11_closure_counter   270,000,027 -> 264,000,027   -2.22%
+    63_closures          538,400,000 -> 536,000,000   -0.45%
+    78_typed_param_call        flat (+850 whole-program, both scales)
+    76_funcval_dispatch        flat (+438 whole-program, both scales)
+
+Both deltas are EXACTLY three instructions times the run's own capbase
+counter (3 x 1,000,000 and 3 x 400,000) - the arithmetic the emitted
+counter predicts, which is the check that the reach and the saving are
+the same event. The closure fragment is 53 -> 50 instructions per call,
+and the callee-saved `push` is FREE: it replaced the `sub rsp, 8`
+alignment pad `frag_entry` was emitting anyway.
+
+**WALL CLOCK** (one interleaved `--baseline` A/B, `OPT=1 ASSERTS=0`
+both sides): 11_closure_counter **0.99x**, 63_closures **0.99x**,
+78_typed_param_call 0.98x, suite geomean **cur/base 0.997x over 90**.
+Small, and honestly so: three instructions out of fifty in a fragment
+whose remaining cost is the call protocol's memory traffic. It is on
+the right side of the noise band on both closure benches and nothing
+regressed. Read `cur/base`, not the my/cpp column - the same run put
+63_closures at 16.82x my/cpp where the previous session's run said
+14.65x, which is the comparison denominator drifting, not this change.
+
+**BLAST RADIUS**: `vdjcmp` says 119 of 125 corpus programs are
+BYTE-IDENTICAL. The six that change are exactly the six the pre-build
+census predicted - 11_closure_counter, 63_closures,
+06_calls_closures, 18_store_src_gate, 21_capture_forward,
+24_capture_scalar. `12_compound_bitops` has two capture ops and
+correctly DECLINES: one is a COMPOUND store, which calls
+`jit_store_capture_compound` and never walks the chain, so
+`jit_capbase_uses` does not count it.
+
+**SABOTAGE LEDGER**, each reintroduced, built and watched:
+
+    r12 admitted to the claim        -> ML_CHECK in load_base, rc 134,
+                                        on the first run
+    load_base0 left as it was        -> corpus_diff --nolowmem 28/32,
+                                        four programs truncated mid-run
+    no epilogue re-derive            -> EVERYTHING GREEN (see below)
+    no entry-stub re-derive          -> EVERYTHING GREEN, and vdjcmp
+                                        says it emits ZERO bytes
+
+**⛔ TWO UNFALSIFIABLE SITES, RECORDED RATHER THAN HIDDEN.** The last
+two rows are the honest result, and they differ from each other:
+
+ - the **entry-stub** re-derive emits NO BYTES corpus-wide, because no
+   run that claims a capture base currently has an entry stub. It is
+   not redundant - a stub is a fresh fragment entry, so the register
+   holds the C caller's value there - it is UNREACHED. Kept: it costs
+   literally nothing today and its absence would be a read through a
+   garbage pointer the day a stub appears.
+ - the **epilogue** re-derive DOES emit bytes (four programs). It is
+   kept, and the argument that it is redundant is written at the site
+   so a future measurement can act on it: the UN-pinned path already
+   walks `ctx->captures` after calls and must get OUR captures, so "the
+   call protocol restores it" is a premise this optimization INHERITS
+   rather than adds, and a `CaptureSlots` is neither movable nor
+   assignable and never grows after the snapshot. It costs the shapes
+   that motivated the work nothing - the hot closure bodies make no
+   helper call at all. Delete it only with a test that FAILS without it.
+
+**LEVER**: `MYLANG_JIT_OFF=capbase`. **COUNTER**: `capbase`, bumped from
+EMITTED code at each fragment entry that walked the chain - a
+compile-time count would answer a different question. In the
+`jit_counter_coverage` ratchet, so it cannot go inert unnoticed.
+**TEST**: the `-rt` entry `jit: the capture base is walked ONCE per run,
+not per access`, which asserts reach, RULE 2 (the lever off gives the
+same answer and claims no base), and the invariant - a closure calling
+ANOTHER closure between two accesses to its own capture, which really
+does repoint `ctx->captures` and back.
