@@ -594,6 +594,13 @@ bool jit_chunk_frameless_ok(const Chunk &chunk);
  * 64 x 48 bytes = 3KB, the same bound Frame::init already imposes. */
 enum { FRAMELESS_MAX_SLOTS = 64 };
 /* REACH (TESTS): chunks that qualify, and calls made to one. */
+/*
+ * #111 EXECUTION PROOF: bumped by the EMITTED capture read/write once
+ * per access that took the proven-scalar shape. An emitted-code
+ * counter, not an emit-time one: the tier is a shorter INSTRUCTION
+ * SEQUENCE that still runs, so it can prove it RAN.
+ */
+extern unsigned long g_jit_cap_scalar;
 extern unsigned long g_jit_frameless_chunks;
 extern unsigned long g_jit_frameless_calls;
 
