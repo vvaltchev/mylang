@@ -99,6 +99,8 @@ unsigned long g_jit_peep_selfmov = 0;  /* #101: mov X,X suppressed
                                         * (COMPILE-time count) */
 unsigned long g_jit_elemv_fast = 0;    /* #97: inline boxed-element reads
                                         * (bumped from EMITTED code) */
+unsigned long g_jit_storev_fast = 0;   /* #97: inline boxed-element stores
+                                        * (bumped from EMITTED code) */
 /* #97 inc 2: the DECLINE LEDGER - one counter per guard, bumped from
  * the guard's own landing pad (see jit.h for why a fast-path counter
  * cannot answer this) */
@@ -9733,6 +9735,7 @@ void jit_stats_report()
         { "peep_fold",        &g_jit_peep_fold },
         { "peep_selfmov",     &g_jit_peep_selfmov },
         { "elemv_fast",       &g_jit_elemv_fast },
+        { "storev_fast",      &g_jit_storev_fast },
         { "peep_depbrk",      &g_jit_peep_depbrk },
         { "rax_retries",      &g_jit_rax_retries },
         { "step_imm",         &g_jit_step_imm },
@@ -16771,7 +16774,192 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_dict_store(e, ck, in, pc, old_pc);
         return true;
 
-    case OpCode::StoreElemValue:
+    case OpCode::StoreElemValue: {
+        /*
+         * #97 inc 3 - THE BOXED-ELEMENT INLINE STORE TIER, the read
+         * tier's twin. `a[i] = v` into a GENERAL array paid the whole
+         * helper round trip: jit_store_elem_value -> vm_subscript_store
+         * -> TypeArr::subscript(for_write) -> LValue::put ->
+         * get_value_for_put, i.e. a virtual subscript dispatch, an
+         * element-LValue round trip with its container back-pointer,
+         * and a type-erased 32-byte assignment. Inline it is the
+         * navigation, the COW guards that put would run, the reference
+         * lifecycle, and one hash byte.
+         *
+         * ⛔ ORDER IS SEMANTICS, twice over:
+         *  - RETAIN the new value BEFORE releasing the old one, so
+         *    `a[i] = a[i]` (or any aliasing store) cannot destroy the
+         *    source it is about to copy;
+         *  - every GUARD precedes every MUTATION. The interpreter
+         *    throws on a const/read-only/out-of-range store WITHOUT
+         *    cloning or invalidating anything, and the clone is
+         *    `intptr`-observable - so a declined store must leave the
+         *    array byte-for-byte untouched. A decline is always safe
+         *    (the helper re-derives everything in the right order).
+         *
+         * The COW cases DECLINE rather than replicate: a slice base
+         * (put clones the whole vector) and an array with LIVE SLICES
+         * (put detaches each view in place). With `has_slices == 0` the
+         * interpreter's `use_count > 1 -> clone_aliased_slices` is a
+         * no-op over an empty set, which is why the count needs no
+         * guard of its own.
+         *
+         * EMIT-TIME declines: anything but a plain `Op::assign` (a
+         * COMPOUND `a[i] += v` is a read-modify-write through
+         * apply_compound_op - string concatenation included; note the
+         * plain form's aop is `assign`, NOT `invalid` - this op's
+         * `aop` is the Expr14 operator verbatim), a non-LOCAL base
+         * kind (the
+         * global/capture forms need the gfuncs/captures indirection),
+         * and a LITERAL index (the helper's contract reads the index
+         * from a SLOT, so a literal here would be a different op).
+         */
+        DeclineJumps sv_slows;
+        size_t sv_done = SIZE_MAX;
+        const bool sv_ok = in.target == 0            /* a LOCAL base */
+                           && in.aop == Op::assign   /* not a compound */
+                           && !in.a_is_lit()
+                           && jit_layout().elemv_inline_ok;
+        const int sv_s1 = sv_ok ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                                  /*transient=*/true) : -1;
+        const int sv_s2 = sv_s1 >= 0
+                          ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                            /*transient=*/true) : -1;
+        if (sv_s1 >= 0 && sv_s2 < 0)
+            e.free_scratch(static_cast<uint8_t>(sv_s1));
+        if (sv_s1 >= 0 && sv_s2 >= 0) {
+            const JitLayout &L = jit_layout();
+            const SlotAddr base = slot_addr(in.target2);
+            const SlotAddr src = slot_addr(in.b_slot());
+            const uint8_t s1 = static_cast<uint8_t>(sv_s1);
+            const uint8_t s2 = static_cast<uint8_t>(sv_s2);
+            AccScratch acc(e);
+            const auto decl_ne = [&](JitDecline why) {
+                decline_jump(e, sv_slows, 0x75, why);
+            };
+            /* THE BASE GATES (no mutation yet) */
+            e.load(s1, base.type);
+            e.cmp_reg_tag_via(s1, L.t_arr, s2);
+            decl_ne(JD_storev_base_not_arr);
+            e.cmp_byte_slot(base.type + (L.lv_const_off - L.off_type), 0);
+            decl_ne(JD_storev_base_const);
+            e.cmp_byte_slot(base.payload + L.slice_off, 0);
+            decl_ne(JD_storev_base_slice);
+            e.load(s1, base.payload);                   /* shobj */
+            e.cmp_byte_base(s1, L.ro_off, 0);
+            decl_ne(JD_storev_readonly);
+            e.cmp_byte_base(s1, L.kind_off, L.kind_general);
+            decl_ne(JD_storev_base_kind);
+            e.cmp_byte_base(s1, L.slices_off, 0);
+            decl_ne(JD_storev_has_slices);
+            /* THE VALUE GATES - the two reference kinds the raw copy
+             * cannot carry (a vtable'd pointee has no refcount at +0;
+             * a slice must be (un)registered in its parent's set) */
+            e.load(s2, src.type);
+            e.load32_base(s2, s2, L.type_t_off);
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
+            const size_t v_triv = e.j8(0x72);           /* jb: trivial */
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
+            decline_jump(e, sv_slows, 0x74, JD_storev_val_ex);
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_arr_val));
+            const size_t v_nsl = e.j8(0x75);
+            e.cmp_byte_slot(src.payload + L.slice_off, 0);
+            decl_ne(JD_storev_val_slice);
+            e.patch8(v_nsl, e.pos());
+            e.patch8(v_triv, e.pos());
+            /* THE INDEX (scale, wrap, bounds) - still no mutation */
+            load_operand(e, acc.r, in.a_is_lit(), in.a_lit(), in.a_slot());
+            e.imul_rr_imm8(acc.r, acc.r,
+                           static_cast<uint8_t>(sizeof(LValue)));
+            decline_jump(e, sv_slows, 0x70, JD_storev_scale_wrap);
+            e.load_base(s2, s1, L.data_off + 8);        /* end */
+            e.load_base(s1, s1, L.data_off);            /* data */
+            e.sub_rr(s2, s1);                           /* byte length */
+            e.cmp_rr(acc.r, s2);
+            decline_jump(e, sv_slows, 0x73, JD_storev_bounds);
+            e.add_rr(acc.r, s1);                        /* &elem */
+            e.cmp_byte_base(acc.r, static_cast<int32_t>(L.lv_const_off), 0);
+            decl_ne(JD_storev_elem_const);
+            /* ---- past here NOTHING may fault: mutate ---- */
+            /* RETAIN the new value FIRST (self-store safety) */
+            e.load(s2, src.type);
+            e.load32_base(s2, s2, L.type_t_off);
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
+            const size_t r_triv = e.j8(0x72);           /* jb: trivial */
+            e.load(s2, src.payload);
+            e.inc_dword_base(s2);
+            e.patch8(r_triv, e.pos());
+            /* RELEASE the old element value (cold arm = destruction,
+             * a slice, or an exception object - all three need the
+             * full C++ semantics jit_release_slot runs) */
+            e.load_base(s2, acc.r, static_cast<int32_t>(L.off_type));
+            e.load32_base(s2, s2, L.type_t_off);
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
+            const size_t o_triv = e.j32(0x72);          /* jb: trivial */
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
+            const size_t o_cold = e.j32(0x74);
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_arr_val));
+            const size_t o_nsl = e.j8(0x75);
+            e.cmp_byte_base(acc.r,
+                            static_cast<int32_t>(L.off_payload)
+                                + L.slice_off, 0);
+            const size_t o_cold2 = e.j32(0x75);
+            e.patch8(o_nsl, e.pos());
+            e.load_base(s2, acc.r, static_cast<int32_t>(L.off_payload));
+            e.cmp_dword_base_imm32(s2, 0, 1);
+            const size_t o_cold3 = e.j32(0x74);         /* last ref */
+            e.dec_dword_base(s2);
+            const size_t o_st = e.j32(0xEB);
+            e.patch32_here(o_cold);
+            e.patch32_here(o_cold2);
+            e.patch32_here(o_cold3);
+            /* the element pointer is caller-saved; s1 rides along to
+             * keep the 16-byte call parity (the read tier's shape) */
+            e.push_reg(acc.r);
+            e.push_reg(s1);
+            emit_call_prologue(e);
+            e.mov_rr(REG_ARG0, acc.r);      /* rdi = the element LValue* */
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_release_slot) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            e.pop_reg(s1);
+            e.pop_reg(acc.r);
+            e.patch32_here(o_triv);
+            e.patch32_here(o_st);
+            /* the copy: 24 payload bytes + the Type* */
+            e.load(s2, src.payload);
+            e.store_base(s2, acc.r, static_cast<int32_t>(L.off_payload));
+            e.load(s2, src.payload + 8);
+            e.store_base(s2, acc.r,
+                         static_cast<int32_t>(L.off_payload) + 8);
+            e.load(s2, src.payload + 16);
+            e.store_base(s2, acc.r,
+                         static_cast<int32_t>(L.off_payload) + 16);
+            e.load(s2, src.type);
+            e.store_base(s2, acc.r, static_cast<int32_t>(L.off_type));
+            /*
+             * ⛔ NO HASH INVALIDATION HERE, and that is a PROOF, not an
+             * omission. `get_value_for_put` calls invalidate_hash()
+             * unconditionally, so the obvious twin is a byte store -
+             * but deleting it was watched and caught NOTHING, which
+             * sent me to the rule: `hash_is_cached()` is
+             * `hash_cacheable() && hash_valid`, and hash_cacheable()
+             * requires kind in {ints, floats, bools}. This tier is
+             * gated on kind == GENERAL, and representation is fixed at
+             * creation (promotion only ever goes flat -> general), so
+             * no reader can ever consult that flag for this array. Two
+             * instructions per element store, deleted.
+             */
+#ifdef TESTS
+            e.bump_counter(&g_jit_storev_fast);
+#endif
+            sv_done = e.j32(0xEB);
+            decline_land(e, sv_slows);
+            e.free_scratch(s2);
+            e.free_scratch(s1);
+        }
         /* the UNIVERSAL store a[i] = v via jit_store_elem_value(kind=target,
          * base_slot=target2, idx_slot=a_slot, val_slot=b_slot, aop). The helper
          * forms the base (local/global/capture) from kind+slot + reads idx/val
@@ -16798,7 +16986,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
+        if (sv_done != SIZE_MAX)             /* the inline tail rejoins */
+            e.patch32_here(sv_done);
         return true;
+        }
 
     case OpCode::StoreMemberV:
         /* s.f = v via jit_store_member(kind=target, base_slot=target2,

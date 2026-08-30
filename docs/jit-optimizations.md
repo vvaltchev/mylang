@@ -9300,3 +9300,90 @@ instead of the patch loop, and assert the reasons in the tier's test.
 The next tier to use it is the boxed-element STORE twin, whose guards
 - read-only array, live-slice detach, hash invalidation, plus the
 reference lifecycle - are four separate correctness cliffs.
+
+## #97 increment 3 - THE BOXED-ELEMENT INLINE STORE TIER
+## (StoreElemValue), 2026-08-26
+
+**WHAT.** `a[i] = v` into a GENERAL array - increment 1's twin on the
+write side - paid the whole helper round trip: `jit_store_elem_value`
+-> `vm_subscript_store` -> `TypeArr::subscript(for_write)` ->
+`LValue::put` -> `get_value_for_put`, i.e. a virtual subscript
+dispatch, an element-LValue round trip with its container
+back-pointer, and a type-erased 32-byte assignment. Inline it is the
+navigation, the COW guards `put` would have run, and the reference
+lifecycle (retain-new / release-old with a cold `jit_release_slot`
+arm, the element LValue handed straight to it as `rdi`).
+
+**⛔ ORDER IS SEMANTICS, TWICE OVER:**
+ - RETAIN the new value BEFORE releasing the old one, so an aliasing
+   store cannot destroy the source it is about to copy. (The source
+   slot holds its own retained reference, so an aliasing store's count
+   is >= 2 and the ordering is defensive rather than load-bearing -
+   written that way, and said so, on purpose.)
+ - EVERY GUARD PRECEDES EVERY MUTATION. The interpreter throws on a
+   const / read-only / out-of-range store WITHOUT cloning, and the COW
+   clone is `intptr`-observable, so a declined store must leave the
+   array byte-for-byte untouched.
+
+**THE COW CASES DECLINE RATHER THAN REPLICATE:** a slice base (`put`
+clones the whole vector) and an array with LIVE SLICES (`put` detaches
+each view in place). With `has_slices == 0` the interpreter's
+`use_count > 1 -> clone_aliased_slices` is a no-op over an empty set,
+which is why the reference COUNT needs no guard of its own.
+
+**EMIT-TIME declines:** anything but a plain `Op::assign` (a compound
+is a read-modify-write through `apply_compound_op`, string
+concatenation included - and note the plain form's `aop` is
+**`Op::assign`, NOT `Op::invalid`**: this op's `aop` is the Expr14
+operator verbatim, which cost the first version its entire reach), a
+non-LOCAL base kind, and a literal index (the helper's contract reads
+the index from a SLOT).
+
+**⛔ AND ONE LINE DELETED BY A SABOTAGE THAT CAUGHT NOTHING.** The
+obvious twin of `get_value_for_put`'s unconditional `invalidate_hash()`
+is a byte store, and it was written. Removing it failed NO test - which
+sent me to the rule instead of to a better test: `hash_is_cached()` is
+`hash_cacheable() && hash_valid`, and `hash_cacheable()` requires kind
+in {ints, floats, bools}. This tier is gated on kind == GENERAL, and
+representation is fixed at creation (promotion only ever goes flat ->
+general), so no reader can consult that flag for this array. Two
+instructions per element store, deleted, with the proof at the site.
+**A sabotage that catches nothing is evidence about the CODE, not only
+about the test** - the two readings are "my test is weak" and "this
+line is dead", and the second one has to be ruled out.
+
+**MEASURED** (callgrind Ir per scale unit, scale3-minus-scale1, `-npc`,
+OPT=1 ASSERTS=0 both sides; wall = full-suite interleaved --baseline):
+
+    32_str_build_join    273.0M -> 169.8M  (-37.8%)   wall 0.90x
+    47_wordcount         364.4M -> 261.2M  (-28.3%)   wall 0.86x
+    20_foreach_unpack   1060.2M -> 779.7M  (-26.5%)   wall 0.90x
+    46_matrix_mult        19.10M -> 19.06M (-0.2%)    wall 1.03x
+    31_str_split_join / 76_funcval_dispatch: Ir EXACTLY flat, emission
+    differs (the changed instruction stream reshuffles the peephole)
+
+Suite geomean cur/base 0.995x over 89. vdjcmp blast radius 7 of 119.
+
+**REACH** is `g_jit_storev_fast` (JITSTATS `storev_fast`), and every
+one of the tier's ten reachable guards is proven TAKEN by the decline
+ledger in `jit_storev_native`. Finding the shapes that reach them was
+most of the test work, and three are worth keeping:
+ - **`base_slice` fires ONCE, not once per iteration** - the helper's
+   store on a slice base runs `clone_internal_vec`, which makes the
+   view a standalone non-slice array, so every later store is FAST;
+ - **`base_kind` needs a dyn ALIAS of a flat array** (`var a = [1,2,3];
+   var dyn d = a;`) - a dyn DESTINATION builds a GENERAL array, so the
+   obvious spelling takes the fast path;
+ - **`readonly` needs a SLICE OF A CONST in a plain var** - a const
+   array reached through a parameter still carries the const flag on
+   its slot, so `base_const` shadows `readonly` for that shape.
+`storev_elem_const` is unreachable (an array element's LValue is always
+constructed non-const; a const CONTAINER is readonly, which an earlier
+guard catches) and is carried in the test as a written exemption, for
+the same reason `elemv_base_not_arr` is: a `.myv` image's operands are
+bounded by `verify_chunk` but never type-checked.
+
+**SABOTAGES, watched failing:** retain deleted -> ASan
+heap-use-after-free; release deleted -> LeakSanitizer; the has_slices
+guard deleted -> the detach spec fails in `-rt`; the readonly guard
+deleted -> a const array becomes writable, `-rt` fails.

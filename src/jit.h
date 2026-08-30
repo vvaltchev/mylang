@@ -1191,7 +1191,11 @@ extern unsigned long g_jit_op_run[];
 #define ML_FOR_EACH_JIT_DECLINE(X) \
     X(elemv_base_not_arr) X(elemv_base_slice) X(elemv_base_kind) \
     X(elemv_scale_wrap) X(elemv_bounds) X(elemv_elem_ex) \
-    X(elemv_elem_slice)
+    X(elemv_elem_slice) \
+    X(storev_base_not_arr) X(storev_base_const) X(storev_base_slice) \
+    X(storev_readonly) X(storev_base_kind) X(storev_has_slices) \
+    X(storev_scale_wrap) X(storev_bounds) X(storev_elem_const) \
+    X(storev_val_ex) X(storev_val_slice)
 
 enum JitDecline {
 #define ML_JD_ENUM(n) JD_##n,
@@ -1312,6 +1316,11 @@ extern "C" unsigned long g_jit_peep_selfmov;
  * reference lifecycle inline: retain-new, dec-release-old with a cold
  * C++ arm for destruction). Bumped from the EMITTED code. */
 extern "C" unsigned long g_jit_elemv_fast;
+/* #97 inc 3: the boxed-element inline STORE tier (`a[i] = v` into a
+ * general array: retain-new, release-old with a cold arm, the COW
+ * guards the interpreter's put would run, and the hash byte). Bumped
+ * from the EMITTED code. */
+extern "C" unsigned long g_jit_storev_fast;
 extern "C" unsigned long g_jit_peep_depbrk;
 /* the in-process OFF override for the lever mask (tests; pairs with
  * jit_lever_bit) - the env masks are cached statics. */
