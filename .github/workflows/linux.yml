@@ -297,3 +297,64 @@ jobs:
         ./mylang -v | grep -qE "^  lto +0" \
           || { echo "FAIL: CMake -DLTO=OFF did not disable LTO"; exit 1; }
         ./mylang -rt
+
+  # DEBUG_INFO=1 (2026-08-26): debug info is OFF by default in BOTH build
+  # systems (the binary was huge and the info unused in most builds - disk
+  # wear); this lane keeps the =1 configuration building and green so it
+  # cannot rot. The vacuity guard checks BOTH directions on the actual ELF
+  # (.debug_info present with the flag, absent without it) - `-v` cannot
+  # self-report this one, since no compiler macro tracks -g.
+  dbginfo:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build (Makefile, DEBUG_INFO=1 TESTS=1 OPT=0)
+      shell: bash
+      run: make -j DEBUG_INFO=1 TESTS=1 OPT=0 CXX=${{ matrix.cxx }}
+           BUILD_DIR=build-dbginfo
+
+    - name: Confirm debug info is actually present
+      shell: bash
+      run: |
+        readelf -S build-dbginfo/mylang | grep -q "\.debug_info" \
+          || { echo "FAIL: DEBUG_INFO=1 built without debug info"; exit 1; }
+
+    - name: Test
+      shell: bash
+      run: ./build-dbginfo/mylang -rt
+
+    - name: Confirm the DEFAULT build has NO debug info
+      shell: bash
+      run: |
+        make -j TESTS=0 OPT=1 CXX=${{ matrix.cxx }} BUILD_DIR=build-nodbg
+        if readelf -S build-nodbg/mylang | grep -q "\.debug_info"; then
+          echo "FAIL: the default build still carries debug info"; exit 1
+        fi
+
+    # The other build system's knob; CMake's per-config defaults inject
+    # -g on their own, which is exactly what the OFF default strips.
+    - name: CMake with -DDEBUG_INFO=ON (and the OFF default checked)
+      shell: bash
+      run: |
+        cmake -E make_directory cmb-dbginfo
+        cd cmb-dbginfo
+        cmake -DTESTS=1 -DDEBUG_INFO=ON -DCMAKE_BUILD_TYPE=Debug \
+              -DASAN=OFF -DUBSAN=OFF \
+              -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} $GITHUB_WORKSPACE
+        cmake --build . -j
+        readelf -S mylang | grep -q "\.debug_info" \
+          || { echo "FAIL: -DDEBUG_INFO=ON built without debug info"; exit 1; }
+        cd ..
+        cmake -E make_directory cmb-nodbg
+        cd cmb-nodbg
+        cmake -DTESTS=1 -DCMAKE_BUILD_TYPE=Debug -DASAN=OFF -DUBSAN=OFF \
+              -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} $GITHUB_WORKSPACE
+        cmake --build . -j
+        if readelf -S mylang | grep -q "\.debug_info"; then
+          echo "FAIL: the CMake Debug default still injects -g"; exit 1
+        fi

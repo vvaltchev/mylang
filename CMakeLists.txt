@@ -35,6 +35,31 @@ endif()
 set(ASAN  ${_san_default} CACHE BOOL "AddressSanitizer (GCC/Clang)")
 set(UBSAN ${_san_default} CACHE BOOL "UndefinedBehaviorSanitizer (GCC/Clang)")
 
+# DEBUG_INFO (default OFF, for EVERY build type - the Makefile's twin):
+# debug info multiplies the binary's size many times over and is unused
+# in most builds (maintainer-set, 2026-08-26 - disk wear). OFF strips
+# the -g/-Zi that CMake's own per-config defaults inject (Debug and
+# RelWithDebInfo carry it implicitly - stripping those is what makes
+# the default REALLY debug-info-free for all build types); ON adds
+# -ggdb (MSVC keeps its /Zi defaults). CI carries a DEBUG_INFO=ON lane
+# so the configuration cannot rot.
+set(DEBUG_INFO OFF CACHE BOOL "Emit debug info (-ggdb / MSVC /Zi)")
+if (NOT MSVC)
+   if (DEBUG_INFO)
+      add_compile_options(-ggdb)
+   else()
+      foreach(_cfg DEBUG RELWITHDEBINFO)
+         string(REGEX REPLACE "(^| )-g(gdb[0-9]*|[0-9])?( |$)" " "
+                CMAKE_CXX_FLAGS_${_cfg} "${CMAKE_CXX_FLAGS_${_cfg}}")
+      endforeach()
+   endif()
+elseif (NOT DEBUG_INFO)
+   foreach(_cfg DEBUG RELWITHDEBINFO)
+      string(REGEX REPLACE "(^| )[/-]Z[iI7]( |$)" " "
+             CMAKE_CXX_FLAGS_${_cfg} "${CMAKE_CXX_FLAGS_${_cfg}}")
+   endforeach()
+endif()
+
 file(GLOB SOURCES ${GLOB_CONF_DEP} "src/*.cpp")
 add_executable(mylang ${SOURCES})
 

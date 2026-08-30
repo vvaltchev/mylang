@@ -261,8 +261,22 @@ make clean
 `OPT` defaults to 1 (`-O3`); `OPT=0` drops it. `TESTS=1` adds `-DTESTS`, which
 is what compiles the
 `-rt` suite into the binary. Base flags:
-`-std=c++17 -ggdb -Wall -Wextra -Wno-unused-parameter
+`-std=c++17 -Wall -Wextra -Wno-unused-parameter
 -fwrapv`. The Makefile auto-generates header dependencies under `.d/`.
+
+**⛔ DEBUG INFO IS OFF BY DEFAULT — `DEBUG_INFO` (default 0, EVERY build
+type, both build systems; maintainer-set 2026-08-26).** The `-ggdb` that
+used to sit in the base flags multiplied the binary's size >10x
+(a debug+TESTS build: 155MB -> 12MB) for information unused in most
+builds — pure disk wear. `make DEBUG_INFO=1` (CMake `-DDEBUG_INFO=ON`)
+restores it; pass it whenever you want a debugger, a SYMBOLIZED
+sanitizer report, or line-accurate callgrind attribution (a bare
+address-only ASan trace is the tell that you forgot). On the CMake side
+the OFF default also strips the `-g`/`/Zi` that CMake's own
+Debug/RelWithDebInfo per-config defaults inject. The `dbginfo` CI lane
+(linux.yml) builds `DEBUG_INFO=1` on both build systems and asserts the
+ELF's `.debug_info` in BOTH directions (present with the flag, absent
+without), so neither configuration can rot.
 
 **LTO is on by default for optimized builds.** `LTO` defaults to `OPT`, so a
 release build links with `-flto=auto` (added to `BASE_FLAGS`, which the link
