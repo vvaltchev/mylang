@@ -967,6 +967,48 @@ struct Emitter {
         return -1;                       /* pressure: the caller spills */
     }
     void give_reg(uint8_t r) { reg_busy &= ~(1u << r); }
+
+    /*
+     * ⛔ #96 THE SCRATCH ALLOCATOR - `alloc_scratch()` hands out a
+     * register that holds NO pin and no live emitter state;
+     * `free_scratch()` returns it. This is the seam every hardcoded
+     * `RAX`/`RCX`/`RDX` in the emitter must eventually come through,
+     * and it is the ONLY route to those three joining the pin pool.
+     *
+     * ⛔⛔ AND IT IS ALL-OR-NOTHING, WHICH IS THE FACT THAT SIZES THE
+     * WORK. Measured 2026-08-18 over bench/my + samples + functional:
+     * of 199 compiled runs, **ZERO** avoid the ops that use these
+     * registers as raw scratch - because a fragment is a whole function
+     * body and because `read_slot` / `write_slot` / `store_dst`, which
+     * EVERY op goes through, take RAX by caller convention. The top
+     * blockers by op count are CallBuiltinV 384, LoadConstV 251,
+     * LoadBuiltinV 178, ArrLen 138, Halt 126, StoreGlobalV 123,
+     * MakeClosureV 119, ReturnV 101, LoadElemInt 101, SubscriptV 96 -
+     * a long tail, not a handful.
+     *
+     * So there is NO incremental subset that yields a pinnable
+     * register: admitting RAX to the pool while ONE site still writes
+     * it unasked is a silent wrong answer of exactly the r9 shape. The
+     * conversion is mechanical but must be COMPLETE before the pool
+     * changes, and the census (`scripts/regcensus.py`) is the progress
+     * bar: RAX 399, RCX 222, RDX 118 unbracketed sites remain.
+     *
+     * NOTE a helper CALL is not a blocker - `emit_call_prologue`
+     * already spills every caller-saved pin, which is what made
+     * r8/r10/r11 admissible. Only RAW scratch outside that bracket is.
+     */
+    int alloc_scratch()
+    {
+        /* Preference order is today's convention, so a converted site
+         * gets the register it used to hardcode and the emitted code
+         * stays byte-identical until the pool actually widens. */
+        static const uint8_t ORDER[] = { 0 /*rax*/, 1 /*rcx*/,
+                                         2 /*rdx*/ };
+        const int r = take_reg(ORDER, sizeof(ORDER) / sizeof(ORDER[0]));
+        ML_CHECK_MSG(r >= 0, "alloc_scratch: no scratch register free");
+        return r;
+    }
+    void free_scratch(uint8_t r) { give_reg(r); }
     /* C2a: the FLOAT half of the pool - hot float slots pinned in
      * xmm4-xmm7 (xmm0/1 stay the per-op scratch). xmm registers are ALL
      * caller-saved, so unlike the GP pins these are spilled to their
