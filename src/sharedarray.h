@@ -550,6 +550,10 @@ public:
         const void *readonly;    /* &shobj->readonly   (bool) */
         const void *hash_valid;  /* &shobj->hash_valid (bool) */
         const void *has_slices;  /* &shobj->has_slices (bool, the mirror) */
+        /* #97 (the boxed-element inline tier): &shobj->intr_refcount,
+         * so the emitter can learn the RefCounted base's offset without
+         * SharedObject (private) being visible there. */
+        const void *refcnt;
     };
     JitProbe jit_probe() const {
         return { static_cast<const void *>(shobj.get()),
@@ -557,7 +561,8 @@ public:
                  static_cast<const void *>(&shobj->ivec),
                  static_cast<const void *>(&shobj->readonly),
                  static_cast<const void *>(&shobj->hash_valid),
-                 static_cast<const void *>(&shobj->has_slices) };
+                 static_cast<const void *>(&shobj->has_slices),
+                 static_cast<const void *>(&shobj->intr_refcount) };
     }
     size_type offset() const { return slice ? off : 0; }
 

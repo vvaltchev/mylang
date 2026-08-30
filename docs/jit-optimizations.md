@@ -9155,3 +9155,88 @@ weak sabotage, the counter + disasmcheck being the real net for a
 silently-missing break). peep_selfmov/peep_depbrk join the report
 table; the -rt probe's float loop pins depbrk reach in both lever
 states.
+
+## #97 increment 1 - THE BOXED-ELEMENT INLINE TIER (LoadElemValue),
+## 2026-08-26
+
+**WHAT.** `fn = ops[k]` / `foreach (var e in general_arr)` - a BOXED
+element read out of a GENERAL-storage array - paid a full helper round
+trip (`jit_load_elem_value` -> `arr_elem_at` -> `LValue::put`, ~160 Ir):
+two 32-byte boxed copies, each through a type-erased VIRTUAL, plus the
+old dst value's release. This is 76_funcval_dispatch's per-iteration
+feeder and the first cut at #97's disease list (func-value plumbing).
+The tier emits the whole read inline: navigate (t_arr base / non-slice /
+kind==general / unsigned byte-bounds), then the REFERENCE LIFECYCLE the
+other inline element tiers always declined:
+
+ - RETAIN the element first (`inc dword [pointee+0]` - see the layout
+   check below), so no aliasing order can free it before the copy;
+ - dec-RELEASE dst's old value, with a COLD arm for count==1 that calls
+   `jit_release_slot` (the full C++ dtor semantics: slice
+   unregistration, the pool free) - a plain dec on the last count is
+   never taken;
+ - copy 24 payload bytes + the Type* raw (3 qword loads/stores).
+
+**THE GATES, each one a rule:**
+ - `elemv_inline_ok` (JitLayout): every non-vtable pointee class must
+   keep `intr_refcount` at OFFSET 0 (RefCounted first base). StrObj and
+   SharedObject are PRIVATE nested types, so their offsets come from
+   extended JitProbe members computed inside the class; the accessible
+   three (DictObject/FuncObject/StructObject) use the fake-pointer
+   idiom. A layout change flips the bit and the tier self-disables.
+ - t_ex DECLINES: ExceptionObject's pointee has a vtable, so its
+   refcount is NOT at +0.
+ - a SLICE value declines on EITHER side: the copy must run the C++
+   machinery that (un)registers it in the parent's live-slices set.
+ - dst == base declines at COMPILE time; with them distinct, the base
+   slot's own reference keeps the array alive through the release.
+ - **THE SCALE-WRAP GUARD:** 48 is not a SIB scale, so the index is
+   pre-multiplied - and `2^60 * 48 == 0 mod 2^64`, so a huge index
+   would wrap back INTO bounds and silently read element 0. `imul`
+   sets OF exactly when the product does not fit 64 bits: a `jo`
+   declines. Watched failing: without it, `g[2^60]` returned g[0]
+   instead of raising OutOfBounds.
+
+**TRANSIENT SCRATCH (the enabling allocator change).** The run's
+`ra.denied` set means "not occupied - this fragment may not SPEND it"
+(hold a value across a helper call, i.e. pin). A run containing a
+MyLang call denies the whole caller-saved pool, which blocked every
+`alloc_scratch` ask and silently starved the tier in exactly the shape
+it exists for (a load feeding a call). `alloc_scratch(need, prefer,
+exclude, transient=true)` now ignores `denied` (never `busy`): a grant
+that lives and dies inside ONE op cannot violate any deny reason -
+acc_take, which always ignored denied, is the precedent. Anything a
+run genuinely occupies (a hoist region's claim, a tag-singleton grant)
+is ra.busy and still excludes.
+
+**THE LAUNDERED-TEMP FINDING (test design).** `v = holder[k]` compiles
+to `load.elem.v TEMP` + `move v = TEMP`, and MoveV's helper does a
+PROPER (registering) copy - so a raw slice copy in the temp is
+laundered before any parent write can observe it, and a subscript-shaped
+slice test passes even with the decline deleted. The FOREACH form binds
+the LOOP VAR as the LoadElemValue dst directly; a parent write while it
+is live detaches a registered copy (pre-write view) but leaves a raw
+one reading the mutated storage. That shape is the slice-decline
+observable in `jit_elemv_native` (u == 41 vs 40, watched). LICM is the
+other shape-eater: an invariant `holder[0]` is hoisted to a $licm temp
+and the tier never sees the slice - the test's index varies.
+
+**SABOTAGES, all watched failing:** retain deleted -> ASan
+heap-use-after-free; release skipped -> LeakSanitizer at exit; jo guard
+deleted -> silent wrong answer (the -rt assert); slice decline deleted
+-> the foreach divergence (41 != 40, -rt FAIL).
+
+**MEASURED** (callgrind Ir per scale unit, scale3-minus-scale1, `-npc`,
+OPT=1 ASSERTS=0 both sides; wall = full-suite interleaved --baseline):
+
+    76_funcval_dispatch   492.0M -> 362.0M  (-26.4%)   wall 0.69x
+    62_dict_word_count   1285.8M -> 1019.8M (-20.7%)   wall 0.85x
+    47_wordcount          394.2M -> 364.4M  (-7.6%)    wall 0.96x
+    46_matrix_mult         20.0M -> 19.1M   (-4.5%)    wall 0.95x
+
+Suite geomean cur/base 0.995x over 89; vdjcmp blast radius 9 of 119
+programs changed, 110 byte-identical. REACH: `g_jit_elemv_fast`
+(MYLANG_JITSTATS row `elemv_fast`), bumped by the emitted fast path
+only. The coverage test is `jit_elemv_native` (tests.cpp); the
+`jit_op_nativized` LoadElemValue row accepts the inline counter (the
+BinOpV precedent - the helper legitimately starves).
