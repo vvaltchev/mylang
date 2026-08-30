@@ -3628,6 +3628,66 @@ static const std::vector<test> tests =
         &typeid(TypeMismatchEx),    /* compile-time now: a is array, a + 5 */
     },
 
+    /*
+     * #115: a closure RETURNED FROM A FACTORY is typed from the call
+     * sites of the variable it was bound to. `callee_funcinfo` cannot
+     * name it (the callee is a var), so its parameter used to finalize
+     * to `dyn` and the whole body ran boxed.
+     *
+     * The oracle is `typestr(x)` inside the BODY - the PARAMETER's
+     * type. A better-typed program computes the same answers, so the
+     * engine differential cannot see this; and the call RESULT's type
+     * was already concrete before the change, so asking about that
+     * would prove nothing.
+     */
+    {
+        "infer: a factory-returned closure's param is typed from its "
+        "call sites (#115)",
+        {
+            "func mk(n) {",
+            "  var b = n * 10;",
+            "  return func [b] (x) { return typestr(x); };",
+            "}",
+            "func drive(int k) { var f = mk(k); return f(k); }",
+            "assert(drive(runtime(4)) == \"int\");",
+        },
+    },
+
+    /*
+     * ...and the CONSEQUENCE, pinned so it cannot drift back: two call
+     * sites of irreconcilable types are now a compile error. That is
+     * not a new rule - a DIRECTLY-bound capturing lambda has always
+     * refused this, with the same message - it is the same rule finally
+     * reaching a closure that escaped it by being returned rather than
+     * written inline. The next entry is that directly-bound twin, so
+     * the two are visibly the same behaviour.
+     */
+    {
+        "infer: a factory closure's param CONFLICTS across call sites, "
+        "exactly as a bound lambda's does (#115)",
+        {
+            "func mk(n) {",
+            "  var b = n * 10;",
+            "  return func [b] (x) { return str(b) + str(x); };",
+            "}",
+            "func drive(int k) { var f = mk(k); return f(1) + f(\"s\"); }",
+            "print(drive(runtime(2)));",
+        },
+        &typeid(TypeMismatchEx),
+    },
+    {
+        "infer: the DIRECTLY-bound capturing lambda it now matches",
+        {
+            "func drive(int k) {",
+            "  var b = k * 10;",
+            "  var f = func [b] (x) { return str(b) + str(x); };",
+            "  return f(1) + f(\"s\");",
+            "}",
+            "print(drive(runtime(2)));",
+        },
+        &typeid(TypeMismatchEx),
+    },
+
     {
         "Array equality: equal, length mismatch, type mismatch",
         {

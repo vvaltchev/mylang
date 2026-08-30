@@ -1,0 +1,70 @@
+# #115: a closure RETURNED FROM A FACTORY gets its parameter typed from
+# the call sites of the variable it was bound to.
+#
+# `callee_funcinfo` cannot resolve `add` - it is a var, not a named
+# function or an inline lambda - so `x` used to finalize to `dyn` and
+# the whole closure body ran boxed (an unpinned ctx chain, a 32-byte
+# capture read, two runtime type checks). The finfo set on the Func
+# static type carries the answer: the lambda's type flows into the
+# factory's `ret`, out of the call, and into the variable's symbol.
+#
+# ⛔ THE ORACLE IS `typestr(x)` INSIDE THE BODY. A better-typed program
+# computes the same answers, so an engine differential is blind to this
+# by construction (CLAUDE.md, *Testing an AST TRANSFORM*) - the inferred
+# type itself has to be asserted. And it must be the PARAMETER's type:
+# a first version asked `typestr(add(k))`, the call RESULT, which was
+# already concrete before this change and so proved nothing. Watched:
+# the pre-#115 binary prints `dyn` on every line below.
+#
+# ⛔ ONE FACTORY PER CASE, ON PURPOSE. All the closures a factory
+# returns share ONE FuncInfo, so every call site of every one of them
+# JOINS into the same parameter - a single float call site anywhere
+# re-types the closure everywhere. A first version shared one factory
+# and case (3) silently re-typed cases (1) and (2).
+
+# (1) the parameter is typed, and the value is unchanged
+func make_adder(n) {
+  var base = n * 10;
+  return func [base] (x) { return typestr(x) + ":" + str(base + x); };
+}
+func one_site(int k) {
+  var add = make_adder(3);
+  return add(k);
+}
+print("one    ", one_site(runtime(4)));
+
+# (2) the 63_closures shape: a fresh closure per loop iteration
+func make_sum(n) {
+  var sbase = n * 10;
+  return func [sbase] (x) { return typestr(x) + ":" + str(sbase + x); };
+}
+var last = "";
+for (var i = 0; i < 4; i++) {
+  var a2 = make_sum(i);
+  last = a2(i);
+}
+print("loop   ", last);
+
+# (3) TWO call sites of different numeric types WIDEN the parameter,
+#     exactly as a directly-bound capturing lambda already does - the
+#     int argument is then coerced, so `str` prints a float.
+func make_w(n) {
+  var wbase = n * 10;
+  return func [wbase] (x) { return typestr(x) + ":" + str(wbase + x); };
+}
+func widen(int k) {
+  var f = make_w(k);
+  return f(1) + " " + f(2.5);
+}
+print("widen  ", widen(runtime(2)));
+
+# (4) reached ONLY through a container element
+func make_c(n) {
+  var cbase = n * 100;
+  return func [cbase] (x) { return typestr(x) + ":" + str(cbase + x); };
+}
+func through_array(int k) {
+  var fs = [make_c(k)];
+  return fs[0](7);
+}
+print("array  ", through_array(runtime(1)));

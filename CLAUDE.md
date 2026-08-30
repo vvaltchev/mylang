@@ -3554,7 +3554,8 @@ instantiation.md).** A template stored in a container/var and called
 INDIRECTLY (`ops = [add_op, sub_op]; fn = ops[i%2]; fn(st, i)`) gets a
 typed instance when every such call agrees on ONE settled signature: the
 `Func` StaticType carries a **finfo set** (`StaticType::finfos`, seeded
-by `func_static_type` for a template, UNIONED by `join`, copied by
+by `func_static_type` for **every** function since #115 - it was
+templates only - UNIONED by `join`, copied by
 `with_opt` - metadata, never part of equal/assignable), which rides the
 ordinary lattice through array/dict elements and var joins, so each
 indirect call's callee type names its candidate templates with no new
@@ -3594,6 +3595,48 @@ in the REPL (a prior input's array called later keeps the base -
 correct, unoptimized; pinned by a `repl:` test). This closed the last
 CPython-losing bench (76_funcval_dispatch 1.05-1.12x → **0.68x**; its
 callee bodies 6 boxed ops → 4 typed).
+
+**⛔ THE FINFO SET NOW TYPES A FACTORY-RETURNED CLOSURE'S PARAMETER
+(#115, 2026-08-27) - AND THAT IS A SCRIPT-VISIBLE RULE, NOT ONLY AN
+OPTIMIZATION.** `accumulate_call` fed argument types into a callee's
+params only when `callee_funcinfo` could NAME it - a named function, a
+func-var bound to an inline lambda, or the lambda literal itself. A
+closure RETURNED from a factory is none of those:
+
+    func make_adder(n) {
+        var base = n * 10;
+        return func [base] (x) { return base + x; };
+    }
+    var add = make_adder(i);
+    add(i);                      # always an int
+
+`x` finalized to `dyn`, so `base + x` was `int + dyn` and the whole
+closure body ran boxed - the full ctx chain, a 32-byte capture read and
+TWO runtime type checks per call (64 Ir against the 44 of the same
+bench's counter closure, whose lambda takes no parameter and so was
+never affected). The finfo set already carried the answer the whole way
+- the lambda's type flows into the factory's `ret`, out of the call and
+into the variable's symbol, `join` unioning the sets - so the fix is to
+seed it for every function and to contribute through an INDIRECT call
+whose callee type names **exactly one** candidate. One, not any:
+contributing to a larger set is SOUND (the value may be any member) but
+WIDENS params a different call site must then live with, and a param
+widened to `dyn` costs every unboxed tier built on it.
+
+**⛔ THE CONSEQUENCE IS A REAL SEMANTIC CHANGE, AND IT MAKES TWO
+SPELLINGS AGREE RATHER THAN INVENTING A RULE.** A typed parameter can
+conflict where `dyn` accepted everything, so `f(1)` and `f("s")` on the
+same factory-returned closure is now a `TypeMismatchEx`, and `f(1)` plus
+`f(2.5)` WIDENS it to float (the int argument is then coerced, so the
+result prints `21.000000` where it printed `21`). Neither is new: a
+DIRECTLY-bound capturing lambda has always done exactly this, with the
+same message - a closure was escaping the rule by being returned rather
+than written inline. (A NON-capturing var-bound lambda is a TEMPLATE and
+monomorphizes instead, so it is unaffected.) Measured blast radius:
+**0 of 125 corpus programs change compile outcome, 0 of 124 change
+output.** Pinned by `tests/functional/25_factory_closure_param.my` and
+three `-rt` entries, one of which is the directly-bound twin, so the two
+are visibly the same behaviour.
 
 **⛔ A DEAD BASE TEMPLATE IS DECIDED FROM THE TREE, AND A BAKED CONST
 VALUE IS NOT IN THE TREE (2026-08-25).** `is_template_base` excludes a
