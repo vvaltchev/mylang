@@ -1368,3 +1368,43 @@ and 5 corpus programs change only because the PIN moved into rdi
 elsewhere (helper counts identical, so no tier declined) - which is
 also the evidence that rdi is now safe to pin whenever the gate allows
 it.
+
+## 2026-08-18: the gate becomes a mask - and the arc's answer repeats
+
+Done, in three commits: the no-arena lever + the bool-tag wrong answer
+it found; the clobber mask; the float-tag narrowing. Full record in
+docs/jit-optimizations.md.
+
+**REACHABILITY, which is the number that matters here:** runs with a C1
+hoist region that have a caller-saved register left went **0 -> 20 of
+20** (corpus-wide, 199 runs compiled). The mechanism works and is
+proven to run.
+
+**THE MEASUREMENT: flat.** 9 corpus programs change; Ir -0.71% ..
++0.22%; wall-clock geomean cur/base **0.997x** interleaved. That is the
+THIRD time this arc has answered "more registers do not pay here" (r8,
+then the ScratchPlan, now the mask). Treat it as settled: **pin
+PRESSURE is not what these programs are short of.** Do not open another
+increment whose thesis is "one more pinnable register".
+
+### What this DID buy, and it is not speed
+
+ - the gate states a FACT per register instead of one coarse
+   approximation, so a future pool member is denied only by a
+   contributor that names it;
+ - `jit_xcache_busy` no longer claims r8 for a singleton that is not in
+   a register - a claim that was simply FALSE on the shipping path, and
+   was out of step with `elem_reg_usable`, which already had it right;
+ - a `size_t` underflow in the C2b pair pick (`MAX_CACHED -
+   hot.size()`), latent behind the very coupling the mask removes, is
+   gone;
+ - the no-arena configuration is testable at all, which found a
+   shipped wrong answer in its first run.
+
+### The next increment is NOT here
+
+The register file is not the constraint. Task #97 - the CALL overhead,
+which owns 7 of the 8 worst my/cpp benches - is where the time is. If
+this task is resumed, resume it for the RAX/RCX/RDX scratch allocator
+(727 of 915 unbracketed sites) with a measurement in hand FIRST showing
+what a shortage of those costs, not on a site count.

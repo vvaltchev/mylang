@@ -758,10 +758,20 @@ collision). Three nets now:
   per mode, so `-rt` is green with it on OR off), argfuse (#162: a
   reference argument already in a named local is bound STRAIGHT from
   that slot and its staging MoveV is not emitted; the cold arms
-  materialise the run), xcache (#96: the CALLER-saved pin extension -
-  r10/r11 hold two more hot locals in a fragment with no C1 hoist
-  region and no MyLang call, spilled/reloaded around every helper call
-  by emit_call_prologue/epilogue), `all`.
+  materialise the run), xcache (#96: the CALLER-saved pin
+  extension - r8/r10/r11 hold up to three more hot locals,
+  spilled/reloaded around every helper call by
+  emit_call_prologue/epilogue. **Which members a run may spend is a
+  per-register CLOBBER MASK, `jit_xcache_clobber` - not a boolean.**
+  It was a boolean until 2026-08-18, and the boolean cost a register
+  for nothing: one C1 hoist region denied the WHOLE pool, though the
+  hoist claims only r10/r11, and an element read on a loop-invariant
+  base is exactly what CREATES a region - so "walks an array in a
+  loop" and "may pin a caller-saved register" were mutually exclusive,
+  0 of 20 hoist runs corpus-wide having a register left. Each
+  contributor now names its own: hoist -> {r10,r11}, a MyLang call ->
+  the whole pool, a type singleton still in a register -> that
+  register), `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
