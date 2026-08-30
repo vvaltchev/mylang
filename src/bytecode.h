@@ -1764,6 +1764,46 @@ struct Chunk {
         plain_frame = !n_trys && !n_dict_iters && !n_dyn_iters;
     }
     /*
+     * #97 - THE FRAMELESS CANDIDATE (a REACH PROBE today; nothing reads
+     * it to decide emission). The measured call budget says 71 of a
+     * 142-Ir call is ACTIVATION BOOKKEEPING - the segment fit test, the
+     * window advance, the record or its record-less fork, the residue
+     * push/pop, the vframe and captures repoints, and a 26-instruction
+     * residue RETURN arm. All of it exists so the interpreter can resume
+     * mid-call and an unwind can rebuild frames.
+     *
+     * A callee that needs NONE of it could take its window off the
+     * native stack (`sub rsp, N*48`) and return in five instructions.
+     * This flag is that callee, and it is DERIVED (never serialized;
+     * recomputed by codegen like `native_leaf`) so both ends of the
+     * protocol read one fact:
+     *   - `native_leaf`: one fully-native run over the whole body ending
+     *     in ReturnV, so the body never exits to the interpreter;
+     *   - `plain_frame`: no try region and no iterator slice for
+     *     push_window to grow;
+     *   - `ref_slots` EMPTY: no slot can hold a reference, so there is
+     *     nothing to release at the return and nothing in the window an
+     *     unwinder must see;
+     *   - NO CALL OP: v1 is a true LEAF. A call would need its own
+     *     window and would put a frame below this one on the rbp chain
+     *     whose record the walk expects;
+     *   - a bounded window, so a native-stack allocation is safe.
+     *
+     * ⛔ THE BACKTRACE IS NOT AT RISK, and that is worth stating because
+     * it is the first thing to worry about. A frame is named from TWO
+     * sources that are already disjoint: the PHYSICAL frames come from
+     * the rbp chain (frag_entry pushes rbp then rbx first, so [rbp+8] is
+     * the return address, [rbp] the caller's rbp and [rbp-8] the
+     * caller's window - `norec_walk_chain`), and the VIRTUAL frames from
+     * INLINING come from pc-keyed side tables baked at compile time -
+     * the callee's own `inline_frames` at the raise pc
+     * (`vm_flush_inline`) and the call site's `NorecSite::inline_chain`
+     * (`vm_jit_stamp_call_site`). Neither consults rbp. A frameless
+     * callee keeps the same prologue, so the physical chain is
+     * unchanged, and changes nothing about either side table.
+     */
+    bool frameless_ok = false;
+    /*
      * The BOXED general-value path's constant pool: literal EvalValues baked at
      * codegen (a machine-code backend would put these in the data section),
      * each referenced by index from a LoadConstV. Empty until a boxed op needs

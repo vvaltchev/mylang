@@ -19301,6 +19301,135 @@ static bool jit_norec_recon_sweep()
  *    properties are elided as well (see bake_final), and testing the
  *    weaker shape is what proves the runtime tests still work.
  */
+
+/*
+ * ⛔ #97 - THE FRAMELESS GATE, PINNED WHILE IT IS STILL INERT.
+ *
+ * `Chunk::frameless_ok` decides nothing yet: it is the REACH PROBE for
+ * a tier whose emission is not written. Pinning it now is the point -
+ * the gate went through THREE wrong versions before the reach number
+ * meant anything, and each wrong version looked entirely reasonable:
+ *
+ *   `native_leaf`         - #55's gate, which requires op_never_exits
+ *                           because a direct caller IGNORES the return.
+ *                           A frameless callee does not; its throw
+ *                           conveys through the postexit.
+ *   terminal ReturnV only - excluded every `Halt`-terminated body (a
+ *                           void function, main), 131 of 256 chunks.
+ *   `ref_slots.empty()`   - rejected 209 of 253 (83%) and EVERY chunk
+ *                           in all four target benches, for a reason
+ *                           that was simply false: the release scan
+ *                           works on a native-stack window, and the
+ *                           unwinder reads the window through rbx.
+ *
+ * So this test asserts the SHAPES, not a count: each clause must reject
+ * what it is for and admit what it is not. A gate nobody can see is a
+ * gate that drifts back.
+ */
+static bool jit_frameless_gate()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto probe = [&](const std::vector<const char *> &lines) -> long {
+        std::string src;
+        for (const char *l : lines) { src += l; src += "\n"; }
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        const unsigned long c0 = g_jit_frameless_chunks;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return static_cast<long>(g_jit_frameless_chunks - c0);
+    };
+    bool ok = true;
+    const auto want = [&](const char *what, long got, bool expect_some) {
+        if ((got > 0) != expect_some) {
+            fprintf(stderr, "jit_frameless_gate: %s - %ld qualifying "
+                    "chunk(s), expected %s\n", what, got,
+                    expect_some ? "at least one" : "none");
+            ok = false;
+        }
+    };
+    /* ADMITS: a scalar leaf, and (the Halt clause) a void one. */
+    want("a scalar leaf", probe({
+        "var sink = 0;",
+        "func leaf(dyn k) {",
+        "  var dyn a = k * 3; var dyn b = a + k; var dyn c = b - 1;",
+        "  return c * 2;",
+        "}",
+        "func drive(int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = s + leaf(i);",
+        "  sink = s;",
+        "  return s;",
+        "}",
+        "print(drive(runtime(20)));" }), true);
+    /*
+     * REJECTS: a body that CALLS - and it calls a BUILTIN, deliberately.
+     *
+     * ⛔ A MyLang CALL MAKES THIS CASE UNFALSIFIABLE. `CallV` is not
+     * `jit_op_eligible` (calls join a run through `op_run_eligible`
+     * instead), so the gate's own eligibility test rejects the chunk
+     * first and the leaf clause never decides anything - watched:
+     * deleting the whole leaf clause left -rt GREEN, the verdict merely
+     * changing from "not a leaf" to "an op is not nativizable".
+     * `CallBuiltinV` IS jit_op_eligible, so for a builtin caller the
+     * leaf clause is the ONLY rejector and deleting it fails here.
+     *
+     * ⛔ AND `len()` DOES NOT WORK: lever 4b fuses it to `ArrLen`, a
+     * native op, so the call disappears and the body QUALIFIES (watched
+     * - the first version of this case read "OK"). `max()` survives as
+     * `call.blt.v`.
+     */
+    want("a body that calls a builtin", probe({
+        "var garr = [4, 2, 9, 1];",
+        "func usesblt(dyn k) {",
+        "  var dyn n = max(garr);",
+        "  var dyn a = n * 3; var dyn b = a + k;",
+        "  return b - 1;",
+        "}",
+        "func drive(int reps) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < reps; i++) s = s + usesblt(i);",
+        "  return s;",
+        "}",
+        "print(drive(runtime(20)));" }), false);
+    /* REJECTS: a TRY region - plain_frame is false, so push_window
+     * would have to grow a pends slice the frameless push never makes. */
+    want("a body with a try region", probe({
+        "var sink = 0;",
+        "struct Bad { int at; }",
+        "func guarded(dyn k) {",
+        "  sink = sink + 1;",
+        "  try { if (k == 3) throw Bad(k); }",
+        "  catch (Bad as e) { return e.at; }",
+        "  var dyn a = k * 3; var dyn b = a + k;",
+        "  return b - 1;",
+        "}",
+        "func drive(int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = s + guarded(i);",
+        "  return s;",
+        "}",
+        "print(drive(runtime(20)));" }), false);
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_baked_callee_tier()
 {
 #if ML_JIT_SUPPORTED
@@ -37590,6 +37719,8 @@ static const std::vector<extra_check> extra_checks =
       "still correct)", jit_callee_cache_hit },
     { "jit: a write-once global callee is BAKED, a reassigned one is not",
       jit_baked_callee_tier },
+    { "jit: the FRAMELESS gate admits a scalar leaf and rejects a caller "
+      "/ a try region (#97, inert)", jit_frameless_gate },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
       jit_bind_widen_inline },
     { "jit: a reference argument binds IN PLACE, and the declines (#162)",
