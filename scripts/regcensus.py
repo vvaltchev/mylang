@@ -95,6 +95,42 @@ METHOD_DECL = re.compile(
     r'^\s{4}(?:static\s+)?(?:ML_\w+\s+)?'
     r'(?:void|int|bool|uint8_t|size_t|int32_t)\s+(\w+)\s*\(')
 
+# The register NUMBER each REPORTable name denotes, so an alias constant
+# can be resolved to one.
+REG_NUM = {0: 'RAX', 1: 'RCX', 2: 'RDX', 6: 'RSI', 7: 'RDI',
+           8: 'R8R', 9: 'R9R', 10: 'R10', 11: 'R11'}
+
+ALIAS_DECL = re.compile(
+    r'^\s*static\s+constexpr\s+uint8_t\s+(\w+)\s*=\s*(\d+)\s*;')
+
+
+def derive_aliases(lines):
+    """alias constant -> register, DERIVED from its declaration.
+
+    ⛔ THE SIXTH AUDIT-TABLE SHAPE, ONE LEVEL DEEPER THAN CORRECTION 3.
+    That one caught `lea_rdi` - the register in the METHOD NAME. This
+    catches the register behind a named CONSTANT:
+
+        static constexpr uint8_t REG_ARG0 = 7;   /* rdi */
+        ...
+        push_reg(REG_ARG0);        mov_rr(REG_SLOTS_BASE, REG_ARG0);
+
+    Three real code uses of rdi that `\bRDI\b` cannot match and that no
+    accessor name encodes. The census reported RDI at 15 sites while the
+    truth was 18, and RDI is exactly the register #96 step 2 was about to
+    admit to the pin pool on the strength of that count.
+
+    Same failure as r9 (admitted while ~80 sites were invisible, a
+    shipping wrong answer for a day), same fix as correction 3: DERIVE
+    the mapping from the declaration rather than hand-listing it, so a
+    new alias is counted the day it is written."""
+    out = {}
+    for l in lines:
+        m = ALIAS_DECL.match(l)
+        if m and int(m.group(2)) in REG_NUM:
+            out[m.group(1)] = REG_NUM[int(m.group(2))]
+    return out
+
 
 def derive_accessors(lines):
     """method name -> set of registers its NAME encodes.
@@ -159,6 +195,7 @@ def census(path):
             depth = max(0, depth - 1)
 
     acc = derive_accessors(lines)
+    aliases = derive_aliases(lines)
     # An accessor's own DECLARATION is not a use of the register.
     decl_line = {}
     for i, l in enumerate(lines):
@@ -183,6 +220,13 @@ def census(path):
                 continue
             for r in regs:
                 hits[r] = hits.get(r, 0) + n
+        # alias constants (REG_ARG0 == rdi, ...), skipping the line that
+        # DECLARES the alias - that is not a use.
+        if not ALIAS_DECL.match(l):
+            for name, r in aliases.items():
+                n = len(re.findall(r'\b' + re.escape(name) + r'\b', l))
+                if n:
+                    hits[r] = hits.get(r, 0) + n
         for r0, n in hits.items():
             r = MERGE.get(r0, r0)
             if bracketed[i]:

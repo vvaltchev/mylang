@@ -1862,3 +1862,101 @@ Step 2: convert emitters family by family to `alloc_scratch()`, vdjcmp
 byte-identical at each step, `scripts/regcensus.py` as the progress bar
 (RAX 399, RCX 222, RDX 118). Step 3: at a count of ZERO, admit that
 register and re-run the MAXPINS sweep. One at a time, never by analogy.
+
+
+## 2026-08-18 (l): step 2 increment 1 - the RDI arithmetic family, and
+## THE COMPLETE RDI ADMISSION AUDIT (done; the admission itself is next)
+
+The compound element store's arithmetic tail lost its hardcoded RDI:
+`add_rax_rdi` / `sub_rax_rdi` / `imul_rax_rdi` / `idiv_rdi` are DELETED
+in favour of `op_rr2(aop, dst, src)` (increment 2's seam) and a new
+`idiv_reg(divisor)`. All three call sites already had the ElemScratch
+plan threaded for obj/data/count/idx - only `val` was hardcoded - so
+each three-line if/else collapsed to one plan-driven line.
+
+Census: **RDI 27 -> 20, RAX 402 -> 393.** Two registers from six edits,
+because a fixed-pair wrapper names BOTH.
+
+### THE PLAN'S ORDERING WAS WRONG - convert by REGISTER VALUE, not by
+### alloc_scratch's preference order
+
+Entry (j) said convert RAX first because `alloc_scratch` prefers it.
+That optimises the wrong thing. The payoff is per-REGISTER (a pin is
+worth -0.63%/pin on 83_regs_int_40, -2.8% and rising on 80_regs_int_08),
+so the right order is CHEAPEST-REGISTER-FIRST:
+
+    RDI  20 sites   <- pin 8
+    RSI  25 sites   <- pin 9   (11 of the 25 are the t_int singleton,
+                                live ONLY in the non-default no-arena
+                                build, and already behind the
+                                store_type_tag / cmp_reg_tag seam)
+    R8   48, R10 63, R11 33    <- already in the pool
+    RDX 118, R9 103, RCX 222, RAX 393
+
+RDI+RSI is ~45 sites for pins 8 and 9 - projected to capture most of
+the -3.8%/-5.6% the whole 740-site conversion was costed at.
+
+### ⛔ THE RDI AUDIT - ITS OWN SITES AGAINST THE GATES, NOT BY ANALOGY
+
+r9 shipped a wrong answer for a day because it was admitted "safe by
+the same gates as r10/r11". So RDI's 20 sites are enumerated here and
+each is accounted for individually. THREE are not blockers at all:
+
+  - the `enum Reg` continuation line (a census artifact);
+  - `ElemScratch::val = RDI` (a PREFERENCE, and `pick` tests
+    `elem_reg_usable` - which tests `reg_holds_pin` - before honouring
+    it);
+  - `CAND[] = { RDI, ... }` (same guard).
+
+The remaining 17 sit in exactly FOUR functions:
+
+  fn                      sites  why a pin in RDI survives
+  ----------------------  -----  ---------------------------------------
+  emit_sync_push_native     3    jit_run_blocks_xcache denies the WHOLE
+                                 caller-saved pool to any run holding
+                                 CallV/CachedCallV/CallValueV - which are
+                                 precisely the ops that emit this
+  emit_sync_call_inline     3    same gate, AND a prologue precedes them
+                                 inside the function
+  emit_ret_native           5    its SECOND LINE is `e.flush_cache()`,
+                                 so no pin is live past it
+  emit_op                   1    prologue precedes it in-function
+  frag_entry                3    RDI is the fragment's INCOMING window
+                                 argument, consumed into rbx by the
+                                 entry's last instruction; pins load
+                                 AFTER frag_entry, never before
+  accessor bodies           2    lea_rdi / slots_to_arg0 definitions
+
+Each gate was READ, not assumed: jit_run_blocks_xcache's switch lists
+the three call ops; emit_ret_native line 2 is the flush.
+
+**CONCLUSION: RDI is admissible.** The remaining work to admit it is to
+add 7 to XCACHE_ORDER and run the matrix - the sites need no further
+conversion, because every one is already covered by an existing gate.
+NOTE frag_entry is the one that constrains ORDER rather than being
+spilled: a pin load must never precede `mov rbx, rdi`.
+
+### ⛔ AND THE CENSUS WAS UNDER-REPORTING THE REGISTER IT WAS CLEARING
+
+RDI read **15** while the truth was **20**. The five it could not see:
+
+    static constexpr uint8_t REG_ARG0 = 7;   /* rdi */
+    push_reg(REG_ARG0);   pop_reg(REG_ARG0);
+    mov_rr(REG_SLOTS_BASE, REG_ARG0);
+
+The register behind a named CONSTANT - the sixth audit-table shape one
+level deeper than correction 3, which caught the register in a METHOD
+NAME. This is the r9 failure exactly: acting on a count from a tool
+blind to its own subject, for a register about to enter the pin pool.
+FIXED by DERIVING the alias map from the declarations
+(`static constexpr uint8_t REG_\w+ = N;`), so a new alias counts the day
+it is written - not by a hand-written list, which is the stale-table
+trap one level up.
+
+### Next
+
+Admit RDI (XCACHE_ORDER gains 7; MAX_XCACHED 3 -> 4), run -rt +
+corpus_diff plain/--levers/--xrot/--nolowmem - **--xrot now sweeps FOUR
+rotations, and it is the net that would have caught r9 in seconds** -
+then re-run the MAXPINS sweep to price pin 8 against the projection.
+Then RSI for pin 9.
