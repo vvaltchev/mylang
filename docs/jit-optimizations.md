@@ -8918,3 +8918,64 @@ shape; asserts b's residency AND plan.rebids >= 1 - the vacuity
 guard); watched failing with park() neutered ("b resident 0 pcs" +
 "rebids == 0"). Reach: `lsra_rebids` (JITSTATS) - 68_nested and
 83_regs_int_40 on the corpus.
+
+## #98 - the opcode-table census, and the three holes it closed
+## (2026-08-25)
+
+THE AUDIT the lever-A whitelist episode demanded: walk EVERY table
+that is keyed by opcode and gates an OPTIMIZATION - the class that
+fails silently when an op is added (unlike verify_chunk, whose
+no-default switch fails the build). Six tables audited, each first
+DIFFED against the full opcode enum, then reach-measured over the
+corpus before deciding anything:
+
+ - `pick_visit_op` (register caching / LSRA qualification): the
+   CallBuiltinLV/LVElem/LVMember family was UNLISTED, so one
+   sort/pop/insert/erase turned caching off for its WHOLE run - the
+   exact silent shape MathFnV and CmpIntV were once found in. FIXED:
+   the CallBuiltinV rule applies verbatim (a callback can mutate
+   slots the emitter cannot enumerate; none of the three is a
+   branch), so they BRACKET (flush/reload) now. Reach: 7 corpus
+   programs. The CALL family (CallV/CachedCallV/CallValueV/
+   CallValueGenericV) stays unclassified DELIBERATELY - recorded in
+   the census rows: a run with a MyLang call caches nothing, and
+   whether a call should be a barrier instead is #97's call-protocol
+   decision, not a drive-by.
+ - `op_fully_native` (delete-originals): StructCtorV (unplanned) and
+   StructCtorBoxedV were left undecided by the #56 batch - both are
+   convey-only, so both are DELETABLE now. The unplanned POD ctor
+   shares MakeStructArrayV's emit (cold-side exc-stamp included) and
+   met the bar all along; the boxed ctor needed its emit's exc-stamp
+   and the `catch (...)` eptr net ADDED (a #142-class hazard on its
+   own: its twin had the net, it did not - a plain Exception through
+   the noexcept would have been std::terminate). CallValueGenericV's
+   absence is CORRECT (it bails: depth cap / chunkless callee) and
+   now recorded.
+ - `op_writes_pure_target` (arg-staging retarget): candidates exist
+   (LoadMemberInt, the DictLoads, MathFnV...) but a corpus scan of
+   leftover `<produce t>; move X = t` pairs shows the unlisted
+   producers at <= 7 sites, none in the fusable arg context - no
+   admission owed. The specialized-arith family's absence is the
+   STAGE trap (the ops do not exist at emit_args_range's stage),
+   recorded in the census header instead of repeated.
+ - `bc_inline_op_ok` (the splice whitelist): MYLANG_INLAUDIT=1 over
+   the corpus shows ZERO call sites blocked by an op - the blockers
+   are runtime callees, tail shape and size. No admission owed.
+ - `jit_op_eligible` / `op_never_exits`: clean - the only enum
+   members without cases are the calls (op_run_eligible's layer, by
+   design) and the EnterNative/ExitBlock meta-ops.
+ - `op_is_simple_island`: the documented-dead M3 list (the gate asks
+   op_run_eligible first and the nativize-ops arc exhausted its
+   sources); the census pins the historical list as-is.
+
+THE NET: `opcode_table_census` (tests.cpp) - jit_fwd_family_coverage's
+enum-derived ratchet, widened to the WHOLE opcode enum x six live
+predicates (exported as jit_test_* / bc_test_* / bc_inline_op_ok
+shims - forwarders, no second copy to drift). One row per opcode, six
+claims per row, checked against the live predicate in BOTH directions;
+adding an opcode without deciding fails with the opcode NAMED. Watched
+failing four ways in one sabotage build: a deleted row (the ratchet),
+the MathFnV pick case removed (the historical C2a gap), the LV barrier
+removed, and the struct-ctor deletability reverted - each named its
+op, and the boxed-ctor row's note names the THREE pieces (fully_native
+entry + emit exc-stamp + eptr net) that must revert together or fail.

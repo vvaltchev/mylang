@@ -26,6 +26,8 @@
 #include "defs.h"    /* int_type */
 
 struct Chunk;
+struct Instr;                        /* bytecode.h; the census shims */
+enum class OpCode : uint8_t;         /* bytecode.h; no include needed */
 struct NorecSite;
 class LValue;
 
@@ -545,6 +547,15 @@ std::vector<int>
 jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
                            int slot_count, size_t max_pins,
                            std::vector<int> *fhot);
+
+/* #98: the opcode-keyed tables, exported for the census ratchet
+ * (opcode_table_census, tests.cpp) - every opcode in the enum must be
+ * decided against each, or the test fails naming the op. */
+bool jit_test_op_eligible(const Instr &in);
+bool jit_test_op_never_exits(const Instr &in);
+bool jit_test_op_fully_native(const Instr &in);
+bool jit_test_op_is_simple_island(OpCode op);
+bool jit_test_pick_op_classified(const Chunk &ck, const Instr &in);
 #endif
 
 #ifdef TESTS

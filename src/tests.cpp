@@ -25039,6 +25039,285 @@ static bool jit_fwd_family_coverage()
 }
 
 /*
+ * #98 - THE OPCODE-TABLE CENSUS: jit_fwd_family_coverage's enum-derived
+ * ratchet, widened to the WHOLE opcode enum and to every opcode-keyed
+ * table that gates an OPTIMIZATION. Those tables fail SILENTLY when an
+ * op is added or its lowering changes (unlike verify_chunk, whose
+ * no-default switch fails the build): lever A's whitelists went stale
+ * for the shifts, MathFnV and CmpIntV each disabled register caching
+ * for their whole run while unlisted, and the #56 batch left both
+ * struct ctors undecided. One row per opcode, six claims per row, each
+ * checked against the LIVE predicate through the exported shims - a row
+ * cannot lie in either direction, and ADDING an opcode without deciding
+ * all six columns fails with the opcode NAMED.
+ *
+ * The claims are the predicates' answers for census_instr(op) - the
+ * op's CANONICAL (admitted-shape) instruction; a shape-dependent rule
+ * (a LOCAL-kind store, a plain global store, an aop-gated arm) is
+ * pinned at that canonical shape, and the shape rule itself lives at
+ * the table. Columns:
+ *   e = jit_op_eligible            may the op join a native run?
+ *   d = op_fully_native            may its interpreted original DELETE?
+ *   p = pick_visit_op classified   does register caching survive it?
+ *   i = op_is_simple_island        the M3 island list - DEAD since the
+ *                                  nativize-ops arc exhausted it (the
+ *                                  gate asks op_run_eligible first), so
+ *                                  the column only pins the documented
+ *                                  historical list
+ *   r = op_writes_pure_target      the arg-staging retarget whitelist.
+ *                                  The specialized-arith family is 0
+ *                                  NOT as a decision about safety: it
+ *                                  does not EXIST at emit_args_range's
+ *                                  stage (pre-specialize_arith_ops) -
+ *                                  the audit-table STAGE trap, recorded
+ *                                  instead of repeated
+ *   b = bc_inline_op_ok            the bytecode-splice whitelist (an
+ *                                  unlisted op declines - measured
+ *                                  #98: ZERO corpus sites blocked by
+ *                                  an op, so no admission is owed)
+ */
+#if ML_JIT_SUPPORTED
+static Instr census_instr(OpCode op)
+{
+    Instr in;
+    in.op = op;
+    switch (op) {
+    /* aop-gated arms: pin the canonical ADMITTED arm */
+    case OpCode::IntBin: case OpCode::FloatBin:
+        in.aop = Op::plus; break;
+    case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
+    case OpCode::CmpFloatV:
+        in.aop = Op::lt; break;
+    /* imm-gated arms: a LEGAL immediate (a negative shift count / a
+     * 0 or -1 modulus keeps the op interpreted by selection) */
+    case OpCode::IntShlRI: case OpCode::IntShrRI:
+        in.opflags |= 8; in.pb = 1; break;         /* b = int lit 1 */
+    case OpCode::IntModRI:
+        in.opflags |= 8; in.pb = 2; break;         /* b = int lit 2 */
+    case OpCode::IntAddModRI:
+        in.target2 = 2; break;                     /* modulus rides t2 */
+    case OpCode::MathFnV:
+        in.target2 = 0; break;                     /* MathFn::sqrt_ */
+    /* LOCAL-kind stores: the kind rides `target` (0 == local, the
+     * admitted / deletable shape; global bases are the tables' own
+     * documented exclusions) */
+    case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+    case OpCode::DictStore: case OpCode::StoreElemValue:
+    case OpCode::StoreMemberV:
+        in.target = 0; break;
+    /* boxed ops: deletability requires a valid boxed_ops pool index in
+     * target2 (always true post-build_boxed_ops) */
+    case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
+    case OpCode::UnaryV: case OpCode::CompoundV:
+        in.target2 = 0; break;
+    default:
+        break;
+    }
+    return in;
+}
+#endif
+
+static bool opcode_table_census()
+{
+#if ML_JIT_SUPPORTED
+    struct Row {
+        OpCode op;
+        unsigned char e, d, p, i, r, b;
+        const char *note;      /* the reason behind a load-bearing 0/1 */
+    };
+    static const Row rows[] = {
+        { OpCode::Jump,                  1,1,1,0,0,1, nullptr },
+        { OpCode::IntBin,                1,1,1,0,1,1, nullptr },
+        { OpCode::IncDecCheckedV,        1,1,1,0,0,0, nullptr },
+        { OpCode::IncDecElemCheckedV,    1,1,1,0,0,0, nullptr },
+        { OpCode::IncDecMemberCheckedV,  1,1,1,0,0,0, nullptr },
+        { OpCode::IncDecChainV,          1,1,1,0,0,0, nullptr },
+        { OpCode::StoreLValueChainV,     1,1,0,0,0,0, 
+          "p0: see the StoreElemChainV row" },
+        { OpCode::JumpUnlessIntCmp,      1,1,1,0,0,1, nullptr },
+        { OpCode::FloatBin,              1,1,1,0,1,1, nullptr },
+        { OpCode::JumpUnlessFloatCmp,    1,1,1,0,0,1, nullptr },
+        { OpCode::CmpIntV,               1,1,1,0,1,1, nullptr },
+        { OpCode::CmpFloatV,             1,1,1,0,1,1, nullptr },
+        { OpCode::ForLoopStep,           1,1,1,0,0,1, nullptr },
+        { OpCode::LoadElemInt,           1,1,1,0,1,0, nullptr },
+        { OpCode::LoadElemFloat,         1,1,1,0,1,0, nullptr },
+        { OpCode::LoadElemBool,          1,1,1,0,0,0, nullptr },
+        { OpCode::ArrLen,                1,1,1,0,1,0, nullptr },
+        { OpCode::StrLen,                1,1,1,0,1,0, nullptr },
+        { OpCode::LoadStrChar,           1,1,1,0,0,0, nullptr },
+        { OpCode::OrdCharV,              1,1,1,0,1,0, nullptr },
+        { OpCode::LoadElemValue,         1,1,1,0,1,0, nullptr },
+        { OpCode::LoadStructFieldInt,    1,1,1,0,0,0, nullptr },
+        { OpCode::LoadStructFieldFloat,  1,1,1,0,0,0, nullptr },
+        { OpCode::LoadStructElemV,       1,1,1,0,0,0, nullptr },
+        { OpCode::DictIterInit,          1,1,1,0,0,0, nullptr },
+        { OpCode::DictIterNext,          1,1,1,0,0,0, nullptr },
+        { OpCode::ForeachDynInit,        1,1,1,0,0,0, nullptr },
+        { OpCode::ForeachDynNext,        1,1,0,0,0,0, 
+          "p0: writes POOL-listed slots AND branches - a bracket's reload would be skipped on the taken edge, so cache nothing" },
+        { OpCode::UnpackElemInt,         1,1,1,0,0,0, nullptr },
+        { OpCode::UnpackElemFloat,       1,1,1,0,0,0, nullptr },
+        { OpCode::UnpackElemValue,       1,1,1,0,0,0, nullptr },
+        { OpCode::UnpackElemTargets,     1,1,1,0,0,0, nullptr },
+        { OpCode::StoreElemInt,          1,1,1,0,0,0, nullptr },
+        { OpCode::StoreElemFloat,        1,1,1,0,0,0, nullptr },
+        { OpCode::DictStore,             1,1,1,0,0,0, nullptr },
+        { OpCode::StoreMemberV,          1,1,1,0,0,0, nullptr },
+        { OpCode::StoreElemValue,        1,1,1,0,0,0, nullptr },
+        { OpCode::MultiUnpackV,          1,1,1,0,0,0, nullptr },
+        { OpCode::StoreElem2V,           1,1,1,0,0,0, nullptr },
+        { OpCode::StoreElemChainV,       1,1,0,0,0,0, 
+          "p0: the key RUN's size lives in the pool - not enumerable at the visitor, and a barrier was rejected there (see the StoreElem2V case)" },
+        { OpCode::DictLoadInt,           1,1,1,0,0,0, nullptr },
+        { OpCode::DictLoadFloat,         1,1,1,0,0,0, nullptr },
+        { OpCode::CallBuiltinV,          1,1,1,0,1,0, nullptr },
+        { OpCode::CallBuiltinLV,         1,1,1,0,1,0, nullptr },
+        { OpCode::EmplaceStruct,         1,1,1,0,0,0, nullptr },
+        { OpCode::CallBuiltinLVElem,     1,1,1,0,0,0, nullptr },
+        { OpCode::CallBuiltinLVMember,   1,1,1,0,0,0, nullptr },
+        { OpCode::CallV,                 0,1,0,0,1,1, 
+          "e0/p0: run admission is op_run_eligible's call-shape layer; a run with a call caches NOTHING - decided #98, a call-as-barrier is #97's call-protocol decision" },
+        { OpCode::CachedCallV,           0,1,0,0,1,0, 
+          "see the CallV row - the same two decisions" },
+        { OpCode::CallValueV,            0,1,0,0,0,0, 
+          "see the CallV row - the same two decisions" },
+        { OpCode::CheckFuncV,            1,1,1,1,0,0, nullptr },
+        { OpCode::MapFilterV,            1,1,1,1,0,0, nullptr },
+        { OpCode::ReturnV,               1,1,1,0,0,1, nullptr },
+        { OpCode::LoadImmInt,            1,1,1,0,1,1, nullptr },
+        { OpCode::LoadImmFloat,          1,1,1,0,1,1, nullptr },
+        { OpCode::LoadConstV,            1,1,1,1,1,0, nullptr },
+        { OpCode::MoveV,                 1,1,1,1,0,1, 
+          "r0: a JOIN tail - retargeting only the last of N producers stranded the other arm (the 2026-07-26 wrong-code fix)" },
+        { OpCode::BinOpV,                1,1,1,1,1,0, nullptr },
+        { OpCode::CoerceNumV,            1,1,1,1,0,0, nullptr },
+        { OpCode::LoadLiteralObjV,       1,1,1,0,1,0, nullptr },
+        { OpCode::CompoundV,             1,1,1,1,0,0, nullptr },
+        { OpCode::CmpV,                  1,1,1,1,1,0, nullptr },
+        { OpCode::LogV,                  1,1,1,1,0,0, 
+          "r0: became a join tail when #138 gave &&/|| real branches (the 2026-08-13 wrong-code fix)" },
+        { OpCode::UnaryV,                1,1,1,1,0,0, nullptr },
+        { OpCode::LoadGlobalV,           1,1,1,0,1,0, nullptr },
+        { OpCode::LoadCaptureV,          1,1,1,0,1,0, nullptr },
+        { OpCode::LoadBuiltinV,          1,1,1,0,1,0, nullptr },
+        { OpCode::DefinedGlobalV,        1,1,1,0,0,0, nullptr },
+        { OpCode::StoreGlobalV,          1,1,1,0,0,0, nullptr },
+        { OpCode::DeclConstV,            1,1,1,1,0,0, nullptr },
+        { OpCode::StoreCaptureV,         1,1,1,0,0,0, nullptr },
+        { OpCode::SubscriptV,            1,1,1,0,1,0, nullptr },
+        { OpCode::MemberV,               1,1,1,0,1,0, nullptr },
+        { OpCode::SliceV,                1,1,1,1,1,0, nullptr },
+        { OpCode::MakeArrayV,            1,1,1,1,1,0, nullptr },
+        { OpCode::MakeDictV,             1,1,1,1,1,0, nullptr },
+        { OpCode::MakeClosureV,          1,1,1,0,1,0, nullptr },
+        { OpCode::StructCtorV,           1,1,1,0,1,0, nullptr },
+        { OpCode::StructCtorBoxedV,      1,1,1,1,0,0, 
+          "d1 since #98: convey-only helper + the emit exc-stamp + the eptr net added together - reverting any of the three must fail this row" },
+        { OpCode::ThrowRuntimeV,         1,1,1,0,0,0, nullptr },
+        { OpCode::CallValueGenericV,     1,0,0,1,0,0, 
+          "d0: it can BAIL (depth cap / chunkless callee / undefined-global arg0), so its interpreted original must stay; p0: the CallV rule" },
+        { OpCode::CheckCallableV,        1,1,1,1,0,0, nullptr },
+        { OpCode::MakeStructArrayV,      1,1,1,0,0,0, nullptr },
+        { OpCode::JumpUnlessTrueV,       1,1,1,0,0,0, nullptr },
+        { OpCode::JumpIfNotNoneV,        1,1,1,0,0,0, nullptr },
+        { OpCode::Throw,                 1,1,1,0,0,0, nullptr },
+        { OpCode::PushHandler,           1,1,1,0,0,0, nullptr },
+        { OpCode::PopHandler,            1,1,1,0,0,0, nullptr },
+        { OpCode::Rethrow,               1,1,1,0,0,0, nullptr },
+        { OpCode::SetPend,               1,1,1,0,0,0, nullptr },
+        { OpCode::EndFinally,            1,1,1,0,0,0, nullptr },
+        { OpCode::Halt,                  1,1,1,0,0,0, 
+          "b0: a spliced Halt would stop the CALLER (the whitelist's note)" },
+        { OpCode::IntAddRR,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntAddRI,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntSubRR,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntSubRI,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntMulRR,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntMulRI,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntAndRR,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntAndRI,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntOrRR,               1,1,1,0,0,1, nullptr },
+        { OpCode::IntOrRI,               1,1,1,0,0,1, nullptr },
+        { OpCode::IntXorRR,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntXorRI,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntShlRR,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntShlRI,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntShrRR,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntShrRI,              1,1,1,0,0,1, nullptr },
+        { OpCode::IntModRI,              1,1,1,0,0,1, nullptr },
+        { OpCode::FloatAddRR,            1,1,1,0,0,1, nullptr },
+        { OpCode::FloatAddRI,            1,1,1,0,0,1, nullptr },
+        { OpCode::FloatSubRR,            1,1,1,0,0,1, nullptr },
+        { OpCode::FloatSubRI,            1,1,1,0,0,1, nullptr },
+        { OpCode::FloatMulRR,            1,1,1,0,0,1, nullptr },
+        { OpCode::FloatMulRI,            1,1,1,0,0,1, nullptr },
+        { OpCode::AppendV,               1,1,1,0,0,0, nullptr },
+        { OpCode::MathFnV,               1,1,1,0,0,0, nullptr },
+        { OpCode::LoadMemberInt,         1,1,1,0,0,0, nullptr },
+        { OpCode::LoadMemberFloat,       1,1,1,0,0,0, nullptr },
+        { OpCode::IntAddModRI,           1,1,1,0,0,1, nullptr },
+        { OpCode::JumpUnlessElemInt,     1,1,1,0,0,0, nullptr },
+        { OpCode::IntAddStep,            1,1,1,0,0,1, nullptr },
+        { OpCode::ForStepElemInt,        1,1,1,0,0,0, nullptr },
+        { OpCode::StructFieldAddInt,     1,1,1,0,0,0, nullptr },
+        { OpCode::EnterNative,           0,0,0,0,0,0, 
+          "meta: inserted by the JIT itself, never in a pre-jit chunk" },
+        { OpCode::ExitBlock,             0,0,0,0,0,0, 
+          "meta: reached only via vm_exec_block, never in a pre-jit chunk" },
+        { OpCode::LoadElem2Int,          1,1,1,0,1,0, nullptr },
+        { OpCode::LoadElem2Float,        1,1,1,0,1,0, nullptr },
+    };
+    const size_t nrows = sizeof(rows) / sizeof(rows[0]);
+    const Chunk ck;      /* empty - census_instr never makes a shape
+                          * that indexes a pool */
+    bool ok = true;
+
+    /* 1. THE RATCHET: every opcode in the enum has exactly one row. */
+    for (const OpCode o : ml_opcheck::ml_op_order) {
+        int found = 0;
+        for (size_t k = 0; k < nrows; k++)
+            if (rows[k].op == o)
+                found++;
+        if (found != 1) {
+            cout << "  census: opcode " << fwd_opcode_name(o) << " has "
+                 << found << " rows - every opcode needs exactly one: "
+                    "decide all six columns, then say so\n";
+            ok = false;
+        }
+    }
+
+    /* 2. every claim must MATCH the live predicate, both directions. */
+    for (size_t k = 0; k < nrows; k++) {
+        const Row &r = rows[k];
+        const Instr in = census_instr(r.op);
+        const struct { const char *col; bool live, claim; } cells[] = {
+            { "eligible",  jit_test_op_eligible(in),            !!r.e },
+            { "deletable", jit_test_op_fully_native(in),        !!r.d },
+            { "pick",      jit_test_pick_op_classified(ck, in), !!r.p },
+            { "island",    jit_test_op_is_simple_island(r.op),  !!r.i },
+            { "retarget",  bc_test_op_writes_pure_target(r.op), !!r.r },
+            { "bc-inline", bc_inline_op_ok(r.op),               !!r.b },
+        };
+        for (const auto &c : cells) {
+            if (c.live == c.claim)
+                continue;
+            cout << "  census: " << fwd_opcode_name(r.op) << " '" << c.col
+                 << "' is " << (c.live ? 1 : 0) << " but the row claims "
+                 << (c.claim ? 1 : 0);
+            if (r.note)
+                cout << " - row note: " << r.note;
+            cout << "\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * D1: the interval builder against its SPEC ("an interval of slot s
  * covers pc iff live_in(pc,s) || s in defs(pc)"), where the liveness
  * side comes from the fixpoint the PREVIOUS check already validates
@@ -35826,6 +36105,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: lever A's whitelists COVER the specialized-arith family - "
       "the ratchet derived from the opcode ENUM, not from the table",
       jit_fwd_family_coverage },
+    { "jit: the OPCODE-TABLE CENSUS - every opcode decided against the "
+      "six opcode-keyed optimization tables, vs the live predicates (#98)",
+      opcode_table_census },
     { "jit: the all-slot LIVE RANGES agree with the temps-only analysis "
       "they generalise, and clear its 64-temp cliff (#96)",
       jit_slot_liveness_check },

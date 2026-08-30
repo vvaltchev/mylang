@@ -308,6 +308,19 @@ void verify_chunk(const Chunk &chunk, const ChunkLimits &lim);
  */
 bool bc_inline_callee_ok(const Chunk &callee, std::string *why);
 
+/* The splice's per-OP whitelist behind bc_inline_callee_ok, exported for
+ * the #98 census ratchet (opcode_table_census, tests.cpp), which walks
+ * the whole opcode enum against it. */
+bool bc_inline_op_ok(OpCode op);
+
+/* The arg-staging retarget whitelist (`<produce t>; MoveV rArg = t` ->
+ * `<produce rArg>`, emit_args_range) - exported for the same census
+ * under a shim name (the table itself lives in codegen.cpp's anonymous
+ * namespace; a same-name global declaration made every internal call
+ * ambiguous). Sound only for a SOLE-producer op; see the MoveV/LogV
+ * exclusion notes at the definition (both were wrong-code bugs). */
+bool bc_test_op_writes_pure_target(OpCode op);
+
 /*
  * The corpus audit (env MYLANG_INLAUDIT=1, the MYLANG_DELAUDIT pattern):
  * report each CallV in `caller` with its callee's size and the gate's

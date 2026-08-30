@@ -10441,7 +10441,15 @@ static const char *bc_op_name(OpCode op)
     return "?";
 }
 
-static bool bc_inline_op_ok(OpCode op)
+/* #98 census shim: the retarget whitelist (op_writes_pure_target) lives
+ * in the anonymous namespace above; export it under a test name - a
+ * plain forwarder, so there is no second copy to drift. */
+bool bc_test_op_writes_pure_target(OpCode op)
+{
+    return op_writes_pure_target(op);
+}
+
+bool bc_inline_op_ok(OpCode op)
 {
     switch (op) {
     /* the typed scalar core - B1/B2's specialized forms included, since
