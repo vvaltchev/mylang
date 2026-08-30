@@ -1319,3 +1319,52 @@ smallest-first:
     108/108 identical when the allocator happens to choose the same
     registers, and `-rt` + `--xrot` must be green when it does not.
  3. Only then reconsider the pool, WITH a measurement.
+
+## 2026-08-18: the ScratchPlan lands, and MEASURES ITSELF UNREACHABLE
+
+The store-elem emitters no longer name registers. `ElemScratch` gives
+the tier five ROLES - obj / data / count / idx / val - and
+`elem_scratch_plan()` allocates `idx` and `val`, declining to the helper
+if nothing is free. 149 hardcoded references became role names, and
+`vdjcmp.sh` proves the emitted code byte-identical.
+
+**AND THEN IT MEASURES ITSELF UNREACHABLE, WHICH IS THE FINDING.**
+
+Instrumented over the whole corpus WITH rdi added to the pin pool, the
+plan is consulted **58 times and never once with rdi or r9 pinned**.
+The pin count at every one of those 58 calls is at most 4 - exactly
+`MAX_CACHED`, the callee-saved four. No caller-saved pin is ever live
+when the element tier emits.
+
+**The cause is structural, not luck:**
+
+    xcache_ok = hregs.empty() && !jit_run_blocks_xcache(..) && !lever
+
+An element store on a loop-invariant base is precisely what makes
+`jit_hoist_pick` return a region, so `hregs` is non-empty exactly when
+the element tier fires - and the gate then denies the run EVERY
+caller-saved pin. The element tier and the caller-saved pool are
+mutually exclusive BY CONSTRUCTION.
+
+So: **freeing rdi and r9 inside the element tier buys nothing today**,
+and would have bought nothing however many encoders were converted.
+Converting them was still right - the roles are the only way an
+allocator can ever exist there, and the conversion is what made this
+measurable at all - but the next increment is NOT more of it.
+
+### The next increment, redirected (again)
+
+**Make the C1 hoist mark only the registers it actually uses.** The
+gate is maximally coarse: a hoist region uses r10 and r11, and denies
+r8 (and any future member) for no reason. Replacing the boolean with
+the per-register mask already designed above - hoist contributes
+{r10, r11}, a call contributes all caller-saved, an element store
+contributes {} once its scratch is allocated - is what lets a pin and
+an element store coexist. Only then does the ScratchPlan relocate, and
+only then is "add rdi to the pool" a question worth measuring.
+
+Watched: with rdi forced into the pool the plan still never relocates,
+and 5 corpus programs change only because the PIN moved into rdi
+elsewhere (helper counts identical, so no tier declined) - which is
+also the evidence that rdi is now safe to pin whenever the gate allows
+it.

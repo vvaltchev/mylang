@@ -8573,15 +8573,126 @@ static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc,
  * two variables sharing an array is MyLang's reference semantics and a
  * plain store is correct. Hence the `has_slices` mirror.
  *
- * Registers: rax = shobj, rcx = data, rdx = count, r9 = index, rdi = the
- * value (NOT rsi - see the encoders).
+ * REGISTERS: see ElemScratch below. This tier used to name rax/rcx/rdx/
+ * r9/rdi directly at ~150 sites; they are five ROLES now, and the
+ * emitter is told which register holds each.
  */
+
+/*
+ * ⛔ #96: THE ELEMENT TIER'S SCRATCH PLAN - five ROLES, not five
+ * register names.
+ *
+ * `emit_store_elem_inline` and `emit_store_elem2_inline` between them
+ * referred to rax/rcx/rdx/r9/rdi about 150 times. Every one of those
+ * references meant a role, not a register: the SharedObject, the
+ * element data pointer, the element count, the index, the value. As
+ * long as the role and the register were the same token, no allocator
+ * could exist - the emitter had no way to be told "use something else
+ * here, r9 is holding a hot local".
+ *
+ * ⛔ TWO ROLES ARE FIXED BY THE INSTRUCTION SET, NOT BY HABIT, and a
+ * future allocator must not "free" them: the compound `/=` and `%=`
+ * arms emit `cqo; idiv <val>`, which reads the dividend in RDX:RAX and
+ * writes the quotient to RAX and the remainder to RDX. So `obj` (rax)
+ * and `count` (rdx) are hardware-pinned for any program that can reach
+ * that arm. `idx` and `val` are free - which is the useful half,
+ * because they are exactly the two the census says block r9 and rdi.
+ *
+ * The plan is threaded, not global: each emitter takes one, so a future
+ * caller can hand it a different assignment per op without touching a
+ * single encoder.
+ */
+struct ElemScratch {
+    uint8_t obj   = RAX;   /* the SharedObject *      (ISA-fixed: idiv) */
+    uint8_t data  = RCX;   /* the flat element data pointer            */
+    uint8_t count = RDX;   /* the element count / byte length (idiv)   */
+    uint8_t idx   = R9;    /* the element index                        */
+    uint8_t val   = RDI;   /* the value being stored / the rhs         */
+    bool    ok    = true;  /* false = no free register; DECLINE        */
+};
+
+/*
+ * May this register be used as element-tier scratch right now?
+ *
+ * The list is deliberately explicit rather than "anything not pinned",
+ * because three things other than a pin own a register here and none of
+ * them is visible from `cache`:
+ *   - rbx is the frame-slot base for the whole fragment, and rsp/rbp
+ *     are the stack;
+ *   - rsi and r8 carry the t_int / t_float singletons whenever the
+ *     arena did NOT place them low enough to encode as an imm32 (see
+ *     emit_type_tags) - the exact pair whose "it is only a constant"
+ *     reading cost #96 step 3 four float tests;
+ *   - r10/r11 hold the C1 hoisted (data, count) while a loop region is
+ *     emitting.
+ */
+static bool elem_reg_usable(const Emitter &e, uint8_t r)
+{
+    if (r == RBX || r == 4 /*rsp*/ || r == 5 /*rbp*/)
+        return false;
+    if (e.reg_holds_pin(r))
+        return false;
+    if (r == RSI && !jit_tag_is_imm(jit_layout().t_int))
+        return false;
+    if (r == R8 && e.float_tag_live
+            && !jit_tag_is_imm(jit_layout().t_float))
+        return false;
+    if (g_hoist.active && (r == g_hoist.rdata || r == g_hoist.rcount))
+        return false;
+    if (g_hoist2.active && (r == g_hoist2.rdata || r == g_hoist2.rcount))
+        return false;
+    return true;
+}
+
+/*
+ * THE ALLOCATION. `obj`, `data` and `count` keep their registers: rax
+ * and rdx are ISA-fixed by the idiv arm (above), and rcx is the base of
+ * every SIB operand this tier emits. `idx` and `val` are ALLOCATED -
+ * they are the two roles the instruction set does not constrain, and
+ * (not by coincidence) the two the register census names as what blocks
+ * r9 and rdi from the pin pool.
+ *
+ * The PREFERRED register is tried first and is today's choice, so with
+ * an empty pin set the plan is byte-identical to the hardcoded one -
+ * the mechanism lands INERT and turning it on is a separate, separately
+ * measurable change.
+ *
+ * If nothing is free the plan is `!ok` and the caller DECLINES to the
+ * helper. That is the whole point: the failure mode this replaces is
+ * emitting into a register that holds a hot local, which is a silent
+ * wrong answer (it shipped, as r9, for a day).
+ */
+static ElemScratch elem_scratch_plan(const Emitter &e)
+{
+    static const uint8_t CAND[] = { RDI, R9, R10, R11, RSI, R8 };
+    ElemScratch sc;
+    uint32_t taken = (1u << sc.obj) | (1u << sc.data) | (1u << sc.count);
+    auto pick = [&](uint8_t preferred) -> uint8_t {
+        if (!(taken & (1u << preferred)) && elem_reg_usable(e, preferred)) {
+            taken |= 1u << preferred;
+            return preferred;
+        }
+        for (uint8_t c : CAND)
+            if (!(taken & (1u << c)) && elem_reg_usable(e, c)) {
+                taken |= 1u << c;
+                return c;
+            }
+        sc.ok = false;
+        return preferred;
+    };
+    sc.idx = pick(sc.idx);
+    sc.val = pick(sc.val);
+    return sc;
+}
 static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                                    std::vector<size_t> &slows,
                                    std::vector<size_t> &dones,
                                    bool is_float)
 {
-    e.scratch2(R9, RDI);      /* index in r9; the value in rdi/dil */
+    const ElemScratch sc = elem_scratch_plan(e);
+    if (!sc.ok)
+        return false;          /* no free scratch - the helper tier */
+    e.scratch2(sc.idx, sc.val);      /* index in r9; the value in rdi/dil */
     /*
      * #95 case 1 - COMPOUND stores `a[i] OP= v` inline too, as a
      * read-modify-write on the element. The op set is the interpreter
@@ -8642,7 +8753,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             emit_float_load(e, X0, in.b_is_lit(), in.b_flit(),
                             in.b_slot(), 0, /*no_bail=*/true);
         else
-            load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
+            load_operand(e, sc.val, in.b_is_lit(), in.b_lit(), in.b_slot());
         if (compound && divmod && !in.b_is_lit() && is_float) {
             e.pxor_x1();
             e.ucomisd(X0, X1);
@@ -8651,7 +8762,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             e.patch8(j_nan, e.pos());
         }
         load_index_r9(e, in);
-        e.cmp_rr(R9, H->rcount);
+        e.cmp_rr(sc.idx, H->rcount);
         slows.push_back(e.j32(0x73));            /* jae -> the helper */
         if (compound && divmod && !in.b_is_lit() && !is_float) {
             /* the int divisor gate (#103 refinement), AFTER the bounds
@@ -8666,53 +8777,57 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             const size_t j_ok = e.j32(0x77);     /* ja .ok (hot) */
             e.u8(0x48); e.u8(0x85); e.u8(0xFF);  /* test rdi,rdi */
             slows.push_back(e.j32(0x74));        /* 0 -> the helper */
-            e.load_elem_q(RAX, H->rdata, R9);        /* rax = the element */
-            e.movabs(RDX, 0x8000000000000000ull);
+            /* rax = the element */
+            e.load_elem_q(sc.obj, H->rdata, sc.idx);
+            e.movabs(sc.count, 0x8000000000000000ull);
             e.u8(0x48); e.u8(0x39); e.u8(0xD0);  /* cmp rax,rdx */
             slows.push_back(e.j32(0x74));        /* INT_MIN -> helper */
             e.patch32_here(j_ok);
         }
 #ifdef TESTS
-        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
+        e.movabs(sc.count, reinterpret_cast<uint64_t>(&g_jit_store_fast));
         e.u8(0x48); e.u8(0xFF); e.u8(0x02);      /* the tier's counter */
 #endif
         if (!compound) {
             if (is_float)
-                e.store_elem_sd(H->rdata, R9, 0);
+                e.store_elem_sd(H->rdata, sc.idx, 0);
             else if (hoist_want == 3)
-                e.store_elem_b(H->rdata, R9, RDI);      /* 0/1 lit -> dil */
+                /* 0/1 lit -> dil */
+                e.store_elem_b(H->rdata, sc.idx, sc.val);
             else
-                e.store_elem_q(H->rdata, R9, RDI);
+                e.store_elem_q(H->rdata, sc.idx, sc.val);
         } else {
 #ifdef TESTS
-            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_hoist_rmw));
+            e.movabs(sc.count, reinterpret_cast<uint64_t>(&g_jit_hoist_rmw));
             e.u8(0x48); e.u8(0xFF); e.u8(0x02);  /* the ARM's own counter
                                                   * (g_jit_store_fast also
                                                   * counts the ordinary
                                                   * tier - it cannot prove
                                                   * THIS arm ran) */
 #endif
-            e.mov_rr(RCX, H->rdata);             /* the [rcx+r9*8] tails */
+            e.mov_rr(sc.data, H->rdata);             /* the [rcx+r9*8] tails */
             if (is_float) {
-                e.load_elem_sd(1, RCX, R9);          /* xmm1 = elem */
+                e.load_elem_sd(1, sc.data, sc.idx);          /* xmm1 = elem */
                 e.farith_x1_x0(aop == Op::plus  ? 0x58
                              : aop == Op::minus ? 0x5C
                              : aop == Op::times ? 0x59 : 0x5E);
-                e.store_elem_sd(RCX, R9, 1);
+                e.store_elem_sd(sc.data, sc.idx, 1);
             } else if (divmod) {
-                e.load_elem_q(RAX, RCX, R9);               /* rax = elem */
+                /* rax = elem */
+                e.load_elem_q(sc.obj, sc.data, sc.idx);
                 e.cqo();
                 e.idiv_rdi();
                 if (aop == Op::div)
-                    e.store_elem_q(RCX, R9, RAX);
+                    e.store_elem_q(sc.data, sc.idx, sc.obj);
                 else
-                    e.store_elem_q(RCX, R9, RDX);      /* remainder */
+                    /* remainder */
+                    e.store_elem_q(sc.data, sc.idx, sc.count);
             } else {
-                e.load_elem_q(RAX, RCX, R9);
+                e.load_elem_q(sc.obj, sc.data, sc.idx);
                 if (aop == Op::plus)       e.add_rax_rdi();
                 else if (aop == Op::minus) e.sub_rax_rdi();
                 else                       e.imul_rax_rdi();
-                e.store_elem_q(RCX, R9, RAX);
+                e.store_elem_q(sc.data, sc.idx, sc.obj);
             }
         }
         dones.push_back(e.jmp32());
@@ -8745,16 +8860,17 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         emit_float_load(e, X0, in.b_is_lit(), in.b_flit(), in.b_slot(), 0,
                         /*no_bail=*/true);
     else
-        load_operand(e, RDI, in.b_is_lit(), in.b_lit(), in.b_slot());
+        load_operand(e, sc.val, in.b_is_lit(), in.b_lit(), in.b_slot());
 
-    e.load(RAX, base.type);                        /* an array? */
-    e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-    e.cmp_rr(RAX, R9);
+    e.load(sc.obj, base.type);                        /* an array? */
+    e.movabs(sc.idx, reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rr(sc.obj, sc.idx);
     decline_ne();
     e.cmp_byte_slot(base.type + (L.lv_const_off - L.off_type), 0);
     decline_ne();                                            /* const slot */
 
-    e.load(RAX, base.payload);                     /* rax = the SharedObject */
+    /* rax = the SharedObject */
+    e.load(sc.obj, base.payload);
     e.cmp_byte_rax(L.ro_off, 0);
     decline_ne();                                            /* readonly */
 
@@ -8800,7 +8916,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     };
     const auto bump = [&]() {
 #ifdef TESTS
-        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store_fast));
+        e.movabs(sc.count, reinterpret_cast<uint64_t>(&g_jit_store_fast));
         e.u8(0x48); e.u8(0xFF); e.u8(0x02);              /* inc qword */
 #endif
     };
@@ -8811,24 +8927,25 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.mov_byte_rax_imm(L.hashv_off, 0);              /* invalidate */
         switch (aop) {
         case Op::invalid:
-            e.store_elem_q(RCX, R9, RDI);
+            e.store_elem_q(sc.data, sc.idx, sc.val);
             return;
         case Op::div: case Op::mod:
             /* rax = elem */
-            e.load_elem_q(RAX, RCX, R9);
+            e.load_elem_q(sc.obj, sc.data, sc.idx);
             e.cqo();
             e.idiv_rdi();
             if (aop == Op::div)
-                e.store_elem_q(RCX, R9, RAX);
+                e.store_elem_q(sc.data, sc.idx, sc.obj);
             else
-                e.store_elem_q(RCX, R9, RDX);                  /* remainder */
+                /* remainder */
+                e.store_elem_q(sc.data, sc.idx, sc.count);
             return;
         default:
-            e.load_elem_q(RAX, RCX, R9);
+            e.load_elem_q(sc.obj, sc.data, sc.idx);
             if (aop == Op::plus)       e.add_rax_rdi();
             else if (aop == Op::minus) e.sub_rax_rdi();
             else                       e.imul_rax_rdi();
-            e.store_elem_q(RCX, R9, RAX);
+            e.store_elem_q(sc.data, sc.idx, sc.obj);
             return;
         }
     };
@@ -8843,18 +8960,19 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.sub_rdx_rcx();
         e.sar_rdx_3();
         load_index_r9(e, in);
-        e.cmp_rr(R9, RDX);
+        e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
         bump();
         e.mov_byte_rax_imm(L.hashv_off, 0);
         if (!compound) {
-            e.store_elem_sd(RCX, R9, 0);           /* movsd [rcx+r9*8], xmm0 */
+            /* movsd [rcx+r9*8], xmm0 */
+            e.store_elem_sd(sc.data, sc.idx, 0);
         } else {
-            e.load_elem_sd(1, RCX, R9);            /* xmm1 = elem */
+            e.load_elem_sd(1, sc.data, sc.idx);            /* xmm1 = elem */
             e.farith_x1_x0(aop == Op::plus  ? 0x58
                          : aop == Op::minus ? 0x5C
                          : aop == Op::times ? 0x59 : 0x5E);
-            e.store_elem_sd(RCX, R9, 1);
+            e.store_elem_sd(sc.data, sc.idx, 1);
         }
         dones.push_back(e.jmp32());
         /* fall through to the shared PREP stub below */
@@ -8886,11 +9004,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             e.sub_rdx_rcx();
             e.sar_rdx_3();
             load_index_r9(e, in);
-            e.cmp_rr(R9, RDX);
+            e.cmp_rr(sc.idx, sc.count);
             decline_if(0x73);                    /* OOB/neg -> helper */
             e.u8(0x4A); e.u8(0x8B); e.u8(0x14); e.u8(0xC9);
                                                  /* mov rdx,[rcx+r9*8] */
-            e.movabs(R9, 0x8000000000000000ull);
+            e.movabs(sc.idx, 0x8000000000000000ull);
             e.u8(0x4C); e.u8(0x39); e.u8(0xCA);  /* cmp rdx,r9 */
             decline_if(0x74);                    /* INT_MIN -> helper */
             e.patch32_here(j_ok);
@@ -8901,7 +9019,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.sub_rdx_rcx();
         e.sar_rdx_3();
         load_index_r9(e, in);
-        e.cmp_rr(R9, RDX);
+        e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
         bump();
         int_rmw();
@@ -8918,10 +9036,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
     load_index_r9(e, in);
-    e.cmp_rr(R9, RDX);
+    e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));        /* jae: negative OR >= count */
     bump();
-    e.store_elem_b(RCX, R9, RDI);
+    e.store_elem_b(sc.data, sc.idx, sc.val);
     e.mov_byte_rax_imm(L.hashv_off, 0);             /* invalidate_hash() */
     dones.push_back(e.jmp32());
 
@@ -8933,10 +9051,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.sub_rdx_rcx();
     e.sar_rdx_3();
     load_index_r9(e, in);
-    e.cmp_rr(R9, RDX);
+    e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));
     bump();
-    e.store_elem_q(RCX, R9, RDI);
+    e.store_elem_q(sc.data, sc.idx, sc.val);
     e.mov_byte_rax_imm(L.hashv_off, 0);
     dones.push_back(e.jmp32());
     }                                          /* end of the int/bool arm */
@@ -8952,7 +9070,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     emit_call_prologue(e);
     e.lea_rdi(base_off);
     load_index_r9(e, in);
-    e.mov_rr(RSI, R9);
+    e.mov_rr(RSI, sc.idx);
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
     e.u8(0xE8); e.u32(0);
@@ -9224,7 +9342,10 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
                                     std::vector<size_t> &slows,
                                     std::vector<size_t> &dones)
 {
-    e.scratch2(R9, RDI);      /* index in r9; the value in rdi/dil */
+    const ElemScratch sc = elem_scratch_plan(e);
+    if (!sc.ok)
+        return false;          /* no free scratch - the helper tier */
+    e.scratch2(sc.idx, sc.val);      /* index in r9; the value in rdi/dil */
     /* the Expr14 op -> the base op (Op::invalid == plain assign) */
     Op bop;
     switch (in.aop) {
@@ -9251,21 +9372,21 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     const size_t retry = e.pos();
     /* both keys must be plain ints (boxed slots - the interpreter's
      * "Expected integer as subscript" declines to the helper) */
-    e.load(RAX, k1.type);
+    e.load(sc.obj, k1.type);
     e.cmp_rax_tag(jit_layout().t_int, RSI);
     decline_ne();
-    e.load(RAX, k2.type);
+    e.load(sc.obj, k2.type);
     e.cmp_rax_tag(jit_layout().t_int, RSI);
     decline_ne();
 
     /* OUTER: an array, not a slice, not readonly, GENERAL storage */
-    e.load(RAX, base.type);
-    e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-    e.cmp_rr(RAX, R9);
+    e.load(sc.obj, base.type);
+    e.movabs(sc.idx, reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rr(sc.obj, sc.idx);
     decline_ne();
     e.cmp_byte_slot(base.payload + L.slice_off, 0);
     decline_ne();
-    e.load(RAX, base.payload);                 /* outer SharedObject */
+    e.load(sc.obj, base.payload);                 /* outer SharedObject */
     e.cmp_byte_rax(L.ro_off, 0);
     decline_ne();                              /* readonly outer: rvalue */
     e.cmp_byte_rax(L.kind_off, L.kind_general);
@@ -9276,15 +9397,16 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
     load_slot_r9(e, in.a_dual_lo());
-    e.imul_rr_imm8(R9, R9, static_cast<uint8_t>(sizeof(LValue)));
-    e.cmp_rr(R9, RDX);
+    e.imul_rr_imm8(sc.idx, sc.idx, static_cast<uint8_t>(sizeof(LValue)));
+    e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
-    e.add_rr(RCX, R9);                            /* rcx = &row (LValue) */
+    /* rcx = &row (LValue) */
+    e.add_rr(sc.data, sc.idx);
 
     /* ROW: an array, not const, not readonly */
     e.mov_rax_rcx_d(static_cast<int32_t>(L.off_type));
-    e.movabs(R9, reinterpret_cast<uint64_t>(L.t_arr));
-    e.cmp_rr(RAX, R9);
+    e.movabs(sc.idx, reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rr(sc.obj, sc.idx);
     decline_ne();
     e.cmp_byte_rcx(L.lv_const_off, 0);
     decline_ne();
@@ -9301,7 +9423,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     };
     const auto bump = [&]() {
 #ifdef TESTS
-        e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_store2_fast));
+        e.movabs(sc.count, reinterpret_cast<uint64_t>(&g_jit_store2_fast));
         e.u8(0x48); e.u8(0xFF); e.u8(0x02);
 #endif
     };
@@ -9313,7 +9435,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         if (!bytes)
             e.sar_rdx_3();
         load_slot_r9(e, in.b_slot());
-        e.cmp_rr(R9, RDX);
+        e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
     };
 
@@ -9327,12 +9449,12 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         decline_ne();
 
         /* --- FLOAT row, plain: value promotes like the interpreter --- */
-        e.load(RDX, val.type);
+        e.load(sc.count, val.type);
         /* t_float? */
-        e.cmp_reg_tag(RDX, jit_layout().t_float, 8);
+        e.cmp_reg_tag(sc.count, jit_layout().t_float, 8);
         const size_t j_vf = e.j8(0x74);
         /* t_int? (promote) */
-        e.cmp_reg_tag(RDX, jit_layout().t_int, RSI);
+        e.cmp_reg_tag(sc.count, jit_layout().t_int, RSI);
         decline_ne();
         e.cvt(X0, val.payload);                /* cvtsi2sd xmm0, [val] */
         const size_t j_vgot = e.j8(0xEB);
@@ -9342,22 +9464,22 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         cow_guards();
         inner_bounds(/*bytes=*/false);
         bump();
-        e.store_elem_sd(RCX, R9, 0);
+        e.store_elem_sd(sc.data, sc.idx, 0);
         e.mov_byte_rax_imm(L.hashv_off, 0);
         dones.push_back(e.jmp32());
 
         /* --- BOOL row, plain: value must BE a bool (an int does not
          * fit - the interpreter's own rule); payload is already 0/1 --- */
         e.patch32_here(j_bools);
-        e.load(RDX, val.type);
-        e.movabs(R9, reinterpret_cast<uint64_t>(L.t_bool));
-        e.cmp_rr(RDX, R9);
+        e.load(sc.count, val.type);
+        e.movabs(sc.idx, reinterpret_cast<uint64_t>(L.t_bool));
+        e.cmp_rr(sc.count, sc.idx);
         decline_ne();
-        e.load(RDI, val.payload);
+        e.load(sc.val, val.payload);
         cow_guards();
         inner_bounds(/*bytes=*/true);
         bump();
-        e.store_elem_b(RCX, R9, RDI);
+        e.store_elem_b(sc.data, sc.idx, sc.val);
         e.mov_byte_rax_imm(L.hashv_off, 0);
         dones.push_back(e.jmp32());
     } else if (!divmod) {
@@ -9367,10 +9489,10 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         const size_t j_floats = e.j32(0x74);
         decline_if(0xEB);                      /* other kinds: helper */
         e.patch32_here(j_floats);
-        e.load(RDX, val.type);
-        e.cmp_reg_tag(RDX, jit_layout().t_float, 8);
+        e.load(sc.count, val.type);
+        e.cmp_reg_tag(sc.count, jit_layout().t_float, 8);
         const size_t j_vf = e.j8(0x74);
-        e.cmp_reg_tag(RDX, jit_layout().t_int, RSI);
+        e.cmp_reg_tag(sc.count, jit_layout().t_int, RSI);
         decline_ne();
         e.cvt(X0, val.payload);
         const size_t j_vgot = e.j8(0xEB);
@@ -9381,10 +9503,10 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         inner_bounds(/*bytes=*/false);
         bump();
         e.mov_byte_rax_imm(L.hashv_off, 0);
-        e.load_elem_sd(1, RCX, R9);                /* xmm1 = elem */
+        e.load_elem_sd(1, sc.data, sc.idx);                /* xmm1 = elem */
         e.farith_x1_x0(bop == Op::plus  ? 0x58
                      : bop == Op::minus ? 0x5C : 0x59);
-        e.store_elem_sd(RCX, R9, 1);
+        e.store_elem_sd(sc.data, sc.idx, 1);
         dones.push_back(e.jmp32());
     } else {
         decline_if(0xEB);                      /* div/mod: ints only */
@@ -9392,10 +9514,10 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
 
     /* --- INT row (plain or compound) --- */
     e.patch32_here(j_ints);
-    e.load(RDX, val.type);
-    e.cmp_reg_tag(RDX, jit_layout().t_int, RSI);
+    e.load(sc.count, val.type);
+    e.cmp_reg_tag(sc.count, jit_layout().t_int, RSI);
     decline_ne();
-    e.load(RDI, val.payload);
+    e.load(sc.val, val.payload);
     if (divmod) {
         /* the int divisor gate (#103 refinement): the row's kind is
          * proven ints here and rax = the row's shobj, so the cold side
@@ -9425,7 +9547,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         e.u8(static_cast<uint8_t>(L.data_off + 8));
         decline_if(0x73);                        /* jae: OOB */
         e.u8(0x48); e.u8(0x8B); e.u8(0x12);      /* mov rdx,[rdx] */
-        e.movabs(R9, 0x8000000000000000ull);
+        e.movabs(sc.idx, 0x8000000000000000ull);
         e.u8(0x4C); e.u8(0x39); e.u8(0xCA);      /* cmp rdx,r9 */
         decline_if(0x74);                        /* INT_MIN -> helper */
         e.patch32_here(j_ok);
@@ -9436,23 +9558,23 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     e.mov_byte_rax_imm(L.hashv_off, 0);
     switch (bop) {
     case Op::invalid:
-        e.store_elem_q(RCX, R9, RDI);
+        e.store_elem_q(sc.data, sc.idx, sc.val);
         break;
     case Op::div: case Op::mod:
-        e.load_elem_q(RAX, RCX, R9);
+        e.load_elem_q(sc.obj, sc.data, sc.idx);
         e.cqo();
         e.idiv_rdi();
         if (bop == Op::div)
-            e.store_elem_q(RCX, R9, RAX);
+            e.store_elem_q(sc.data, sc.idx, sc.obj);
         else
-            e.store_elem_q(RCX, R9, RDX);
+            e.store_elem_q(sc.data, sc.idx, sc.count);
         break;
     default:
-        e.load_elem_q(RAX, RCX, R9);
+        e.load_elem_q(sc.obj, sc.data, sc.idx);
         if (bop == Op::plus)       e.add_rax_rdi();
         else if (bop == Op::minus) e.sub_rax_rdi();
         else                       e.imul_rax_rdi();
-        e.store_elem_q(RCX, R9, RAX);
+        e.store_elem_q(sc.data, sc.idx, sc.obj);
         break;
     }
     dones.push_back(e.jmp32());
@@ -9461,9 +9583,10 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     for (const size_t j : preps)
         e.patch32_here(j);
     emit_call_prologue(e);
-    e.mov_rr(RDI, RCX);                           /* &row (still live here) */
+    /* &row (still live here) */
+    e.mov_rr(sc.val, sc.data);
     load_slot_r9(e, in.b_slot());
-    e.mov_rr(RSI, R9);
+    e.mov_rr(RSI, sc.idx);
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
     e.u8(0xE8); e.u32(0);
