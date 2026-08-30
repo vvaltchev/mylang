@@ -567,6 +567,29 @@ ctors were left out of the #56 deletability batch though convey-only
 eptr net - a #142-class terminate hazard). Record:
 docs/jit-optimizations.md, the #98 entry.
 
+**⛔ A SEVENTH AUDIT-TABLE SHAPE: A PROPERTY WRITTEN BY THE PASS YOU
+ARE INSIDE (#97 step 4, 2026-08-27).** The first six are about a table
+that went stale. This one is about a FIELD that is not written YET.
+`Chunk::sync_entry_off` and `Chunk::norec_ok` are both set at the END
+of `jit_compile_chunk` for that chunk, so a caller emitting a call to
+it reads them correctly - unless the callee IS the chunk being
+compiled. A SELF-RECURSIVE call (fib -> fib) therefore sees
+`sync_entry_off` unset, and `norec_ok` unset reads as **false**, which
+is a legal value meaning "no record-less tier". Gating on them took
+09_fib_recursive's baked reach to **4 of 555,823 calls** and would have
+silently disabled the no-record tier at the one site that needs it.
+
+**AND THE FIX IS NOT "READ IT IF IT HAPPENS TO BE SET".** That makes
+the EMITTED CODE DEPEND ON COMPILATION ORDER, and the JIT's Pass B
+walks a POINTER-keyed map - so `-vdj` would stop being reproducible,
+which is precisely what `scripts/vdjcmp.sh` is. The elision is allowed
+for exactly ONE caller, on a structural argument rather than on luck:
+**MAIN is compiled LAST**, after every function body, so every callee
+it can name is already placed (`bake_final`; a null
+`g_cur_caller_desc` IS main). **When you read a field at emit time,
+ask which PASS writes it and whether that pass has run for THIS
+object** - and if the answer varies, do not let it vary per run.
+
 **⛔ A HELPER'S REGISTER ABI IS THE EMITTER'S JOB, NOT THE CALLER'S
 (2026-08-05).** THREE bugs in two days were one shape - an implicit
 register contract violated by a caller: C4a-ii forwarded a value in
@@ -872,6 +895,18 @@ collision). Three nets now:
   containing a MyLang call denies the whole pool, so every inline
   tier asking for scratch in exactly the shape it exists for
   declined to its helper and the counter read zero),
+  bakecallee (#97 step 4: a call to a WRITE-ONCE global slot has a
+  callee the emitter can NAME - `jit_baked_callee` reads it out of
+  `JitCtx::slot_desc`, the same map `callv_native_ok` has always
+  used - so the five descriptor gates, the window SIZE, the
+  record-less fork and each proven-scalar argument's reference test
+  become COMPILE-TIME constants and one identity compare is what
+  survives. **Its FORCE half is not decoration**: the write-once
+  gate is about PROFITABILITY (a reassigned slot fails the compare
+  on every call and loses the cache that would have hit), so the
+  compare is unreachable under our own compilation and deleting it
+  leaves every net green - `MYLANG_JIT_FORCE=bakecallee` lifts the
+  cost gate alone and makes it fail in `Frame::at`),
   `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by

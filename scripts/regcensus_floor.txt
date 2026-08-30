@@ -5,7 +5,7 @@
 # its floors in the same commit; the gate fails on ANY drift in either
 # direction, so progress is monotonic and slippage is loud.
 # RAWENC = hand-encoded instruction lines (the census blind spot).
-RAX   5
+RAX   0
 RCX    0
 RDX    0
 RSI     0
@@ -20,7 +20,7 @@ R11     0
 # is the SysV float ABI (libm args/returns, helper float arg0).
 XMM0    0
 XMM1    0
-TOTAL   5
+TOTAL   0
 RAWENC  15
 CONV 0    # 103: CLOSED 2026-08-25 - the mandate's zero. The final
 # 3 uses were ALREADY-BUILT conversions hiding behind stale struct

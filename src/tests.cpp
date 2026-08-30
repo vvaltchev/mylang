@@ -19275,6 +19275,225 @@ static bool jit_norec_recon_sweep()
  * inlined or folded away before codegen, and an int/float-declared param
  * makes the descriptor non-fast_bind, which declines the whole inline push.
  */
+
+/*
+ * ⛔ #97 STEP 4 - THE BAKED CALLEE, and BOTH DIRECTIONS, because the
+ * dangerous one is the FALSE POSITIVE. Baking means the emitted push
+ * carries the callee's window size, its record-less decision and its
+ * per-argument reference answers as CONSTANTS, so a site that bakes a
+ * callee it does not actually reach would push a wrong-sized window -
+ * memory corruption, not a wrong number.
+ *
+ * `g_jit_bake_push` is bumped by the EMITTED baked arm, so it separates
+ * "the tier was compiled in" from "the tier ran"; `g_jit_callee_cache`
+ * is the arm a NON-baked site takes, which is what makes the decline
+ * observable at all. A correct answer proves nothing on its own here -
+ * the cache tier and the C++ tier produce the same one.
+ *
+ * SHAPE NOTES (the vacuous-test traps this walked into):
+ *  - the callee must SURVIVE to codegen, so it writes a global (impure,
+ *    hence not const-folded) and is big enough to clear the inliner's
+ *    weight gate. A small pure body is spliced away and the site never
+ *    exists;
+ *  - the loop bound is `runtime(N)`, or const-arg specialization folds
+ *    the whole thing;
+ *  - the caller is a FUNCTION, not main: from main the two deferred
+ *    properties are elided as well (see bake_final), and testing the
+ *    weaker shape is what proves the runtime tests still work.
+ */
+static bool jit_baked_callee_tier()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (Exception &e) {
+            fprintf(stderr, "jit_baked_callee: %s: %s\n", e.name, e.msg);
+            ok = false;
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    /* (1) A WRITE-ONCE global function, called 200 times from another
+     * function: every call must take the baked arm. */
+    const unsigned long b0 = g_jit_bake_push;
+    const unsigned long c0 = g_jit_callee_cache;
+    const unsigned long a0 = g_jit_arg_scalar;
+    if (!run({
+            "var sink = 0;",
+            "func hot(k) {",
+            "  sink = sink + 1;",
+            "  var a = k * 3;",
+            "  var b = a + k;",
+            "  var c = b - 1;",
+            "  return c * 2;",
+            "}",
+            "func drive(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + hot(i);",
+            "  return s;",
+            "}",
+            "assert(drive(runtime(200)) == 158800);" }))
+        return false;
+    if (g_jit_bake_push <= b0 + 100) {
+        fprintf(stderr, "jit_baked_callee: the BAKED arm did not run"
+                " (%lu bumps for 200 calls)\n", g_jit_bake_push - b0);
+        return false;
+    }
+    if (g_jit_callee_cache > c0 + 4) {
+        fprintf(stderr, "jit_baked_callee: a baked site still probed the"
+                " callee CACHE %lu times\n", g_jit_callee_cache - c0);
+        return false;
+    }
+    /* ...and the parameter is inference-proven scalar, so the emit
+     * dropped its per-argument reference test. An EMIT-time counter is
+     * the only thing that can see an elision (see jit.h). */
+    if (g_jit_arg_scalar <= a0) {
+        fprintf(stderr, "jit_baked_callee: the scalar ARGUMENT bind was"
+                " not elided for a proven-scalar parameter\n");
+        return false;
+    }
+
+    /*
+     * (2) THE DECLINE - A REASSIGNED FUNCTION SLOT. `alpha = beta`
+     * rebinds the global slot, so the descriptor the emitter would read
+     * out of `slot_desc` is NOT the one standing there at run time.
+     *
+     * ⛔ THE WRITE-ONCE GATE IS A PROFITABILITY GATE, NOT A SOUNDNESS
+     * ONE, and saying so is the point of this case. Soundness comes from
+     * the emitted identity compare, which fails for the wrong callee and
+     * declines - so removing the gate cannot produce a wrong answer. It
+     * produces something else: a site that can NEVER pass its compare,
+     * i.e. every call to the C++ tier and the two-entry cache (which
+     * would have hit) never consulted. That is what these two counters
+     * pin, and removing the gate fails the SECOND one.
+     *
+     * The callees take `dyn` params on purpose: an un-annotated param
+     * makes the function a TEMPLATE, calls are redirected to a `$N`
+     * instance at a DIFFERENT global slot, and `alpha = beta` then
+     * rebinds a base nothing calls - the assignment becomes invisible
+     * and the case tests nothing. (Watched: with plain params both
+     * engines print the pre-assignment answer.)
+     */
+    const unsigned long b1 = g_jit_bake_push;
+    const unsigned long c1 = g_jit_callee_cache;
+    if (!run({
+            "var sink = 0;",
+            "func alpha(dyn k) {",
+            "  sink = sink + 1;",
+            "  var dyn a = k * 3;",
+            "  var dyn b = a + k;",
+            "  return b - 1;",
+            "}",
+            "func beta(dyn k) {",
+            "  sink = sink + 2;",
+            "  var dyn a = k * 5;",
+            "  var dyn b = a + k;",
+            "  return b + 7;",
+            "}",
+            "func drive(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + alpha(i);",
+            "  return s;",
+            "}",
+            "alpha = beta;",
+            "assert(drive(runtime(200)) == 120800);" }))
+        return false;
+    if (g_jit_bake_push > b1 + 4) {
+        fprintf(stderr, "jit_baked_callee: a REASSIGNED slot baked its"
+                " callee (%lu times) - the write-once gate is gone\n",
+                g_jit_bake_push - b1);
+        return false;
+    }
+    if (g_jit_callee_cache <= c1 + 100) {
+        fprintf(stderr, "jit_baked_callee: the declined site did not reach"
+                " the cache tier either (%lu) - a site that bakes a callee"
+                " it cannot match declines EVERY call to C++\n",
+                g_jit_callee_cache - c1);
+        return false;
+    }
+
+    /*
+     * (3) THE IDENTITY COMPARE, under FORCE - the SOUNDNESS half, and it
+     * needs the force lever to be reachable at all.
+     *
+     * Under our own compilation the write-once gate above already means
+     * a baked slot can hold nothing but its own declaration's
+     * FuncObject, so the emitted `cmp rax, <baked desc>` can never fail
+     * and deleting it changes NOTHING that any net can see (watched:
+     * -rt 1963/1963 and corpus_diff 31/31, both green with the compare
+     * gone). It is still the guard a hostile `.myv` image needs, whose
+     * slot -> descriptor map is resolved by NAME from the file.
+     *
+     * `MYLANG_JIT_FORCE=bakecallee` lifts the profitability gate and
+     * leaves the soundness one, which is exactly what the FORCE half of
+     * a lever pair is for. The two callees below have deliberately
+     * DIFFERENT frame sizes, so a site that bakes alpha's window size
+     * and then runs beta pushes a window twelve slots too small.
+     * Watched with the compare removed: `Frame::at` aborts (rc 134).
+     */
+    const unsigned g_saved_force = g_jit_force_extra;
+    g_jit_force_extra |= jit_lever_bit("bakecallee");
+    const unsigned long b2 = g_jit_bake_push;
+    const bool forced_ok = run({
+            "var sink = 0;",
+            "func alpha(dyn k) {",
+            "  sink = sink + 1;",
+            "  var dyn t = k + 1;",
+            "  return t;",
+            "}",
+            "func beta(dyn k) {",
+            "  sink = sink + 2;",
+            "  var dyn a1 = k + 1; var dyn a2 = a1 + 2; var dyn a3 = a2 + 3;",
+            "  var dyn a4 = a3 + 4; var dyn a5 = a4 + 5; var dyn a6 = a5 + 6;",
+            "  var dyn a7 = a6 + 7; var dyn a8 = a7 + 8; var dyn a9 = a8 + 9;",
+            "  var dyn b1 = a9 * 2; var dyn b2 = b1 + a1;",
+            "  var dyn b3 = b2 + a2;",
+            "  return b3;",
+            "}",
+            "func drive(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + alpha(i);",
+            "  return s;",
+            "}",
+            "assert(drive(runtime(20)) == 210);",
+            "alpha = beta;",
+            "assert(drive(runtime(20)) == 2640);" });
+    g_jit_force_extra = g_saved_force;
+    if (!forced_ok)
+        return false;
+    if (g_jit_bake_push <= b2) {
+        fprintf(stderr, "jit_baked_callee: FORCE=bakecallee did not lift"
+                " the write-once gate, so the identity compare stayed"
+                " unreachable and this case tested nothing\n");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_callee_cache_hit()
 {
 #if ML_JIT_SUPPORTED
@@ -37183,6 +37402,8 @@ static const std::vector<extra_check> extra_checks =
       norec_segment_boundary },
     { "jit: the monomorphic callee cache hits (and a polymorphic site is "
       "still correct)", jit_callee_cache_hit },
+    { "jit: a write-once global callee is BAKED, a reassigned one is not",
+      jit_baked_callee_tier },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
       jit_bind_widen_inline },
     { "jit: a reference argument binds IN PLACE, and the declines (#162)",
