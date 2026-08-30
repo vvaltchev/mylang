@@ -9862,12 +9862,22 @@ in.
     the MoveV DEST check dropped           -> -rt AND corpus_diff fail
     the SOURCE check never emitted         -> -rt AND corpus_diff fail
 
-**THE NEXT REFINEMENT, IDENTIFIED AND NOT BUILT:** `LoadConstV` is in
-the same position MoveV was. It is absent from `op_writes_scalar`
-because a constant can be a string or an array - but WHICH constant is
-known at codegen time, and `compute_ref_slots` holds the pool. A loop
-counter initialised by `load i, 0` is marked reference-carrying today,
-which then propagates into every argument staged from it.
+**AND `LoadConstV`, THE SAME SHAPE ONE STEP OUT (built the same day).**
+It is absent from `op_writes_scalar` because a constant CAN be a string
+or an array - but WHICH constant is a compile-time fact and
+`compute_ref_slots` holds the pool. Without it a loop counter
+initialised by `load i, 0` is reference-carrying for the whole chunk,
+and the MoveV rule above then faithfully propagates that into every
+argument staged from it: **a refinement is only as good as the facts
+under it.**
+
+Its measured effect on the four call benches is **0.00%**, and it is
+kept anyway on evidence rather than on taste: the restored
+`vdjcmp.sh` says it changes the EMITTED CODE of **9 of 124** corpus
+programs, so it has real reach - just not in the shapes those four
+benches use, where temp REUSE (an argument temp shared with a string
+argument to `print`) marks the slot for a genuine reason. A rule with
+reach and no measurable cost, under the same two audits, stays.
 
 NETS: -rt 1964/1964 on dbg(ASan+UBSan), RECYCLE=1, rel-hard(VM_HARDENING)
 and clang; corpus_diff plain/--levers/--xrot/--cold/--nolowmem;

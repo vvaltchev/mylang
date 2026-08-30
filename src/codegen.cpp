@@ -9439,6 +9439,24 @@ static void compute_ref_slots(const std::vector<CgInstr> &code,
                         return;
                     }
                 }
+                /*
+                 * ⛔ `LoadConstV` IS THE SAME SHAPE AS MoveV, one step
+                 * further out. `op_writes_scalar` cannot list it -
+                 * a constant can be a string or an array - but WHICH
+                 * constant is a compile-time fact and the pool is right
+                 * here. Without this a loop counter initialised by
+                 * `load i, 0` is reference-carrying for the whole
+                 * chunk, and the MoveV rule above then faithfully
+                 * propagates that into every argument staged from it:
+                 * a refinement is only as good as the facts under it.
+                 */
+                if (in.op == OpCode::LoadConstV) {
+                    const size_t ci = static_cast<size_t>(in.target2);
+                    if (ci < chunk.consts.size()
+                            && chunk.consts[ci].get_type()->t
+                                   < Type::t_str)
+                        return;               /* a TRIVIAL constant */
+                }
                 is_ref[dslot] = 1;
             });
         if (!known) {
