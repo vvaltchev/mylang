@@ -1469,3 +1469,78 @@ from one `-vdj` dump.
 
 ⛔ **Do NOT widen the pool again before that accounting exists.** It has
 been measured flat three times; a fourth is not evidence, it is a habit.
+
+## 2026-08-18 (c): WHY the pins deliver zero on 83_regs_int_40
+
+Answered, from the emitted code. **The pin changes each operand's
+ADDRESSING MODE and not the instruction COUNT.** Same source line
+(`a0 = a0 + i; a0 = a0 ^ (a0 >> 3);`), same fragment, two caps:
+
+    cap=0  (a0, i in memory)      cap=7  (a0->r14, i->r13)
+    mov rax, a0                   mov rax, r14
+    mov rcx, i                    mov rcx, r13
+    add rax, rcx                  add rax, rcx
+    mov a0, rax                   mov r14, rax
+    sar rax, 3                    sar rax, 3
+    mov rcx, a0                   mov rcx, r14
+    xor rax, rcx                  xor rax, rcx
+    mov a0, rax                   mov r14, rax
+    ---- 8 instructions ----      ---- 8 instructions ----
+
+**The whole loop body is 340 instructions per iteration AT BOTH CAPS**,
+and 209 of the 340 are `mov`. The real work is 122 (42 add, 40 xor, 40
+sar). Pinning converts memory movs into register movs one-for-one; the
+count cannot move, which is exactly what callgrind reported.
+
+THE CAUSE: the B1/B2 specialized arithmetic emitter is a fixed
+THREE-ADDRESS-THROUGH-THE-ACCUMULATOR shape - materialise operand 1 in
+RAX, operand 2 in RCX, apply the op, store RAX to the destination. A
+register a pin owns can be the SOURCE of the `mov`, but it can never BE
+the operand of the `add`. So a pin removes a load's LATENCY (real, but
+invisible to Ir and small next to 40-way ILP) and removes no
+instruction at all.
+
+Two things fall out, and the second is the one that pays:
+
+**(A) TWO-ADDRESS ARITHMETIC when dst is one of the sources.** Every
+accumulator in this family has that shape (`a = a + i`, `a = a ^ e`),
+and so does every `+=` in the language. x86 does it in ONE instruction:
+
+    pinned dst    add r14, r13                       4 -> 1
+    memory dst    mov rax, i ; add [rbx+d], rax      4 -> 2
+
+Note the memory form needs NO pin: `add r/m64, r64` is a legal
+encoding, so this pays on the 33 accumulators that will never get a
+register. That is the half worth doing first, and it is also what makes
+a pin worth having at last - with two-address arithmetic in place a
+pinned accumulator is 1 instruction against memory's 2, which is a
+REASON to widen the pool that we have never had before.
+Constraint to check: the destination's TYPE TAG. `add [rbx+d], rax`
+writes the payload only, so it composes with C3's tag elision and needs
+that elision to be in force (or one extra tag store, still 3 < 4).
+
+**(B) IMMEDIATE OPERANDS for small constants.** The loop counter emits
+
+    mov rax, r13 ; movabs rcx, 1 ; add rax, rcx ; mov r13, rax
+
+where `add r13, 1` is one instruction. `movabs` for a value that fits
+imm8 is the same waste the type-tag arena removed, one level down -
+and the maintainer already named it: *"constants should not be pinned
+to registers, use immediate operands"*.
+
+### So the order is now clear, and it INVERTS the task
+
+**The pool was never the constraint; the OPERAND ROUTING is.** Fixing
+it is worth ~47% of this loop body on its own, most of it without any
+pin at all - and it is the precondition that finally gives an extra
+register something to do. Widening the pool first was, in hindsight,
+optimising the wrong end: three increments moved which register held a
+value and none of them could change how many instructions moved it.
+
+Suggested increments, smallest first, each measurable on its own:
+ 1. two-address form for a MEMORY destination (`add [rbx+d], rax`) -
+    no pin interaction, biggest reach;
+ 2. two-address form for a PINNED destination (`add r14, r13`);
+ 3. imm8/imm32 operands for small constants in the RI family;
+ 4. only THEN re-measure the marginal value of a register with
+    MYLANG_JIT_MAXPINS. It should be non-zero for the first time.
