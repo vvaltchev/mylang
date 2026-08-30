@@ -1722,3 +1722,40 @@ shape, which only IntAddStep reaches.
     measurement.
  4. #100 (constant multiply strength reduction), #101 (native peephole
     pass) - both after the allocator.
+
+
+## 2026-08-18 (i): the sweep, third run - GO on widening the pool
+
+    WHOLE POOL (cap 0 -> 7)   pre-arc   after 1+2      now
+    83_regs_int_40             +0.00%      -3.19%   -4.11%
+    80_regs_int_08             +0.00%     -12.44%  -16.19%
+    01_while_loop              -5.85%     -16.57%  -16.57%
+    07_nested_loops            -5.36%     -11.33%  -11.34%
+    14_array_subscript              -           -  -24.93%
+
+    MARGINAL at the pool's edge:  83 -0.63%/pin,  80 -2.78%/pin
+    and 80's is RISING (-2.57 -2.64 -2.71 -2.78 for pins 4..7).
+
+**No plateau at 7 on the pressure benches, and the per-register value
+is now going UP with each pin.** The plateaus that DO appear land
+exactly at each program's hot-local count (01 at 2, 07 at 2, 14 at 3),
+which is the cross-check that the curve is real.
+
+**PROJECTION: 7 -> 13 is worth ~-5.6% on 80_regs_int_08 (it has 9 hot
+slots, so 13 captures all of them) and ~-3.8% on 83_regs_int_40.**
+
+### THE DECISION THIS SETTLES
+
+Widening the pool is now the right next step, for the first time in
+this task, and for a reason rather than a site count. The cost is the
+SCRATCH ALLOCATOR for RAX/RCX/RDX - 717 of 1016 unbracketed sites - and
+the shape is already proven by the ScratchPlan (roles, not register
+names) built for the element tier.
+
+Order for that work, smallest-first, each with vdjcmp as the oracle:
+ 1. `Emitter::alloc_scratch(n)` / `free_scratch()` over the register
+    STATE, satisfied initially by exactly today's hardcoded choices so
+    the emitted code is byte-identical;
+ 2. convert ONE family end-to-end and prove it byte-identical;
+ 3. admit ONE register to the pool and re-run this sweep. Repeat.
+Never admit a register by analogy - r9 shipped a wrong answer that way.
