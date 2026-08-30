@@ -9544,3 +9544,33 @@ absorbs (Ir -8.1%, wall 1.00x). This removes three chained LOADS and a
 It is a BYTECODE peephole, so the interpreter gets it too; and being
 engine-independent it is covered by corpus_diff against the
 tree-walker, which never had the rule.
+
+## #97 step 2b - THE POST-CALL vframe RESTORE, BAKED FOR MAIN,
+## 2026-08-26
+
+Every emitted return repoints the activation's vframe view at the
+caller's window and nslots. A non-main caller stored an IMMEDIATE
+(`caller_total`, from its descriptor); a MAIN caller read its nslots
+back through TWO CHAINED LOADS - `act->top_rec`, then `rec->nslots` -
+purely because `caller_total` is derived from a DESCRIPTOR and main has
+none.
+
+But main's window size is not a runtime fact. The root window is pushed
+in exactly one place with `nslots = root_slot_count + root.n_temps`
+(vm.cpp), and the chunk being emitted IS main's, so the same immediate
+store the other arm already used is correct. A POINTER CHASE off the
+return path is worth more than its instruction count suggests: on a
+RECORD-LESS return the record's cache line is otherwise never touched.
+
+    11_closure_counter  172.0M -> 170.0M  (-1.16%)
+    63_closures         338.2M -> 336.2M  (-0.59%)
+    76_funcval_dispatch 348.0M -> 346.0M  (-0.57%)
+    09_fib_recursive          flat (its caller is a function, so it
+                              already took the baked arm)
+
+**NETS - and this is the change that needed the frame-shaped ones**, a
+wrong nslots corrupts the VM's view of the caller's window rather than
+producing a wrong value: `norec_enum.py --depth 3` (1920 engine runs
+over the enumerated frame-kind space, 9 of 25 sampled programs making
+record-less pushes) and `norec_sweep.py` (the forced reconstruction at
+every call event) both agree, plus -rt 1961/1961 and corpus_diff 29/29.
