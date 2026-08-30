@@ -9030,3 +9030,68 @@ pinned *31), and the bytecode rewrite deleted - the first three as
 value divergences in BOTH the -rt cases and the corpus sweep (which
 also lit 05/14/17, the older *31/*17 carriers), the fourth by the
 structural check.
+
+## #101 increment 1 - the peephole's levels 1-2, done AT THE SEAM
+## (2026-08-26)
+
+The task's four levels, smallest first; this lands 1-2. A pattern
+census over the corpus's -vdj (the method, before any design): 7,337
+imm32-range literals paying movabs's 10 bytes, ~1,000 staged
+literal-compare pairs, ZERO adjacent store-then-reload pairs (lever A
+already owns that class), 7 mov X,X. So the increment is the
+immediate-staging attack, done DURING emission - where lengths may
+change freely (every position is recorded as emission proceeds) - not
+as a byte-moving post-pass, which would have to remap every fixup,
+mark and reloc.
+
+- `Emitter::mov_imm` - the VALUE-immediate load: `mov r32, imm32`
+  (zero-extends, all v < 2^32, 5-6 bytes) / `mov r64, simm32` (C7 /0,
+  the negatives, 7) / movabs (the rest). Converted: load_operand(_avoid),
+  emit_branch's tmp_lit, and 91 Instr-derived direct sites (scripted).
+- cmp_operand (emit_branch): a literal imm32 compare operand folds
+  into the cmp - the form the PINNED arms have had since #96 inc-3,
+  extended to the accumulator arms (4 sites, incl. the memory-counter
+  loop bounds). Identical flags; one instruction per iteration where
+  it lands.
+
+⛔ THE RULE THIS INCREMENT EARNED, watched failing on its first run:
+**movabs NEVER auto-shortens - an instruction's LENGTH must be a pure
+function of the BYTECODE, never of a runtime address.** The first
+version shortened inside movabs itself; most movabs immediates are
+baked ADDRESSES (pool buffers, descriptors), a pool lands below 2^32
+in one process and above it in another, and myv_round_trip failed
+instantly: the loaded image's pools sit at different addresses than
+the fresh compile's, so every following offset disagreed - the exact
+-vdj reproducibility contract (vdjcmp is a plain cmp). Value/address
+is a CALLER fact, hence the separate mov_imm.
+
+FIXED IN PASSING: corpus_diff.sh's LEVERS list was itself a stale
+table - argfuse/xcache/scache/rshare never joined it, so those four
+levers' per-lever-off configs were tested by nothing but `all`. Synced
++ a keep-in-sync warning; `peep` added (MYLANG_JIT_OFF=peep is the
+increment's A/B lever, g_jit_off_extra its in-process override).
+
+MEASURED: emitted code -1.24MB / -3.4% corpus-wide; reach 3,103
+shortened loads + 335 folded compares (g_jit_peep_short/_fold,
+compile-time counts - the encoding IS the artifact, proven by
+disasmcheck: 0 disagreements incl. the new short forms). vdjcmp
+self-test 119/119 identical. Disasm synced in the same change: the
+no-REX.W B8 arm's "resume vm pc" comment asserted an emitter fact
+that stopped being true (the exit was its only producer), so it lies
+no more; the arm symbolises tags like its REX.W sibling.
+
+WATCHED FAILING three ways, individually: the sign rule sabotaged
+(negatives zero-extended) crashes the suite (a truncated sentinel ->
+wild read); the fold's imm32 guard dropped flips the probe's
+big-bound branch (5100000000 truncates - the value case built for
+exactly this); the lever made dead fails the off-config counter
+check. The fold's reach needed the NO-PIN configs (g_jit_lsra=false +
+the cache levers) - in the pinned config every probe compare took the
+pinned arm's pre-existing imm form, and the first vacuity guard
+caught exactly that.
+
+REMAINING (the task's levels 3-4 + residue, all future increments):
+reorder/rename need a decode-transform-reemit platform (the fixup/
+mark/reloc remap this increment deliberately avoided); the
+non-Instr-derived value movabs sites (island_pc, computed constants)
+are enumerable for the same mov_imm treatment; the 7 mov X,X sites.

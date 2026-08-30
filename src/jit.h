@@ -1259,6 +1259,16 @@ extern "C" unsigned long g_jit_two_addr_reg;
  * it is an execution count - the "prove the code ran" counter for the
  * strength-reduced forms (TESTS builds only, like its siblings). */
 extern "C" unsigned long g_jit_mul_strength;
+/* #101 (the peephole, level 1-2): COMPILE-time counts - an immediate
+ * load emitted in a short form instead of the 10-byte movabs, and a
+ * literal compare operand folded into the cmp. The encoding IS the
+ * artifact here (disasmcheck/objdump prove the bytes), so a compile
+ * count is the right reach evidence, unlike the runtime tiers. */
+extern "C" unsigned long g_jit_peep_short;
+extern "C" unsigned long g_jit_peep_fold;
+/* the in-process OFF override for the lever mask (tests; pairs with
+ * jit_lever_bit) - the env masks are cached statics. */
+extern "C" unsigned g_jit_off_extra;
 extern "C" unsigned long g_jit_rax_retries;
 /* #96 increment 3: a counted loop whose counter is PINNED - the step
  * and the bound test run entirely in registers, RAX untouched. */
