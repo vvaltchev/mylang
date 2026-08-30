@@ -258,9 +258,13 @@ struct Writer {
      * the reader's `r.descs` is simply still empty, and the image dies as
      * "corrupt .myv (descriptor)" on a file that is nothing of the kind.
      * Refuse it AT WRITE TIME instead - an image is never silently lossy.
-     * THE REAL FIX is a format change (write struct consts AFTER the
-     * descriptor table, the way a chunk's pools already come later);
-     * until then this is a clean compile-time refusal, not a broken file.
+     * THE REAL FIX is NOT a section swap - it works today only because
+     * a descriptor references nothing, and CLASSES make the table
+     * references cyclic (a class names its methods, a method names its
+     * class), and a cycle has no traversal order. It is the
+     * identity-before-content read designed in
+     * plans/myv-table-ordering.md; until then this is a clean
+     * compile-time refusal, not a broken file.
      */
     bool in_struct_consts = false;
 
