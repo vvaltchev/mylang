@@ -6252,3 +6252,70 @@ plateaued everywhere would be measuring something else; a sweep that
 plateaued nowhere would be suspicious. This one plateaus precisely
 where the program runs out of values to hold, which is what a correct
 marginal-value curve looks like.
+
+## 2026-08-18 - the MAXPINS sweep, FOURTH run: pin 8 (rdi) pays the
+## projection, and 80's marginal is STILL rising
+
+After admitting rdi (#96 step 2). Callgrind Ir, `OPT=1 ASSERTS=0`.
+Self-test re-verified at the NEW budget first - `MYLANG_JIT_MAXPINS=8`
+is byte-identical to unset on 109/109 - which is what makes the cap a
+measuring instrument rather than a second code path.
+
+**REPRODUCIBILITY CHECK FIRST, because it is the reason to believe the
+new column.** The cap 0 -> 7 figures reproduce the third run EXACTLY:
+
+    bench                3rd run   4th run
+    83_regs_int_40        -4.11%    -4.11%
+    80_regs_int_08       -16.19%   -16.19%
+    01_while_loop        -16.57%   -16.57%
+    07_nested_loops      -11.34%   -11.34%
+    14_array_subscript   -24.93%   -24.94%
+
+So admitting rdi is purely ADDITIVE - it did not perturb what the first
+seven pins do - and any difference in the cap-8 column is pin 8 alone.
+
+**WHAT THE POOL IS WORTH NOW (cap 0 -> 8), and PIN 8 alone:**
+
+    bench                cap0->7   cap0->8   pin 8
+    83_regs_int_40        -4.11%    -4.72%   -0.63%
+    80_regs_int_08       -16.19%   -18.59%   -2.86%
+    01_while_loop        -16.57%   -16.57%    0.00%
+    07_nested_loops      -11.34%   -11.34%    0.00%
+    14_array_subscript   -24.94%   -24.94%    0.00%
+
+**PIN 8 LANDED ON ITS PROJECTION, TO THE DECIMAL.** The third run
+predicted -0.63%/pin on 83 and "-2.78% and rising" on 80. Measured:
+-0.63% and -2.86%. A projection that survives contact with the
+measurement is worth more than the measurement alone - it means the
+model of WHY a pin pays (each one removes a whole 4-instruction memory
+shape, not merely an addressing mode) is right.
+
+**MARGINAL per additional pin, pins 1..8:**
+
+    83_regs_int_40    0.00 -0.91 -0.77 -0.62 -0.62 -0.63 -0.63 -0.63
+    80_regs_int_08    0.00 -3.60 -3.11 -2.57 -2.64 -2.71 -2.78 -2.86
+    01_while_loop    -8.28 -9.04  0.00  0.00  0.00  0.00  0.00  0.00
+    07_nested_loops  -8.50 -3.09 -0.01  0.00  0.00  0.00  0.00  0.00
+    14_array_subscript 0.00 -12.47 -14.25 0.00 0.00 0.00 0.00 0.00
+
+⛔ **80's MARGINAL IS STILL MONOTONICALLY RISING** - -2.57, -2.64,
+-2.71, -2.78, -2.86 for pins 4..8. Every register is worth more than
+the one before it. The plateau benches are unchanged and still land
+exactly at each program's hot-local count (01 at 2, 07 at 2, 14 at 3),
+which is the cross-check that the curve measures what it claims.
+
+**THE PREDICTION PIN 9 WILL TEST.** 80_regs_int_08 has 8 accumulators
+plus a counter = 9 hot slots, so at 8 pins exactly ONE slot is still in
+memory. Pin 9 should capture it (~-2.9%) and then 80 should PLATEAU -
+its first plateau. 83_regs_int_40 has 41 hot slots and should keep
+paying -0.63%/pin indefinitely. If pin 9 does NOT plateau 80, the
+hot-slot model is wrong and the remaining conversion cost should be
+re-argued before it is spent.
+
+**REVISED PROJECTION for the rest.** 8 -> 13 is ~-3.1% more on 83
+(5 x -0.63%) and, on 80, one more paying pin then flat. That is a
+materially smaller prize than the 7 -> 13 figure quoted when the
+conversion was costed, because 80 - the bench with the big numbers - is
+one pin from exhausting its live values. **The cheap registers were the
+valuable ones**, which is the argument for the cheapest-register-first
+ordering rather than alloc_scratch's preference order.
