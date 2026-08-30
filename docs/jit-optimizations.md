@@ -8979,3 +8979,54 @@ the MathFnV pick case removed (the historical C2a gap), the LV barrier
 removed, and the struct-ctor deletability reverted - each named its
 op, and the boxed-ctor row's note names the THREE pieces (fully_native
 entry + emit exc-stamp + eptr net) that must revert together or fail.
+
+## #100 - multiply-by-constant strength reduction (2026-08-26)
+
+div_magic's sibling (#91), split across the two levels the task named:
+
+- **BYTECODE**: `x * 2^k` -> `IntShlRI k` in specialize_arith_ops, so
+  both engines take the shift and every downstream table already
+  agrees (IntShlRI predates this - no census row moved, no format
+  bump, no new opcode). EXACT for every int64 x: bit_shl with a
+  count in [1,62] is the plain shift and x*2^k == x<<k mod 2^64
+  under -fwrapv; neither form can throw. m == 0/1 and non-powers
+  stay IntMulRI.
+- **JIT** (mul_plan / emit_mul_plan, one decision + one emitter like
+  div_magic's pair): lea r,[r+r*s] for |m| in {3,5,9} (+neg),
+  shl+neg for -2^k, lea+shl for {3,5,9}*2^k, and mov+shl+add/sub for
+  2^k+-1 - the last is THE hot family: h = h*31 + c, the string-hash
+  recurrence, where imul's 3-cycle latency sits on the dependency
+  chain and the planned form is 2. Wired at both literal-multiply
+  sites: the PINNED two-address arm takes only the scratch-free plans
+  (a scratch window there could abort a rax-pinned run - the
+  one-window rule; imul is one instruction on a pin, so the 2^k+-1
+  decline costs a cycle at most), the GENERIC arm serves everything
+  through the case's hold()/tmp. A new general-scale
+  `Emitter::lea_scaled` (serves rbp/r13 bases via mod=01+disp8(0);
+  RSP-index refused) is the one new encoder; every form goes through
+  tracked encoders and none reads flags.
+
+DELIBERATELY DECLINED, each re-measurable: negate on the 3-op plans
+(latency parity with imul), and the movabs+imul >imm32 path (cold
+scale arithmetic in every corpus hit).
+
+REACH (corpus census before building): *2 at 30 sites, *3 at 16
+across 8 benches, *31/*17 in 68_nested and 86_elem_arith_compound;
+`g_jit_mul_strength` is bumped from the EMITTED code (TESTS builds),
+so reach is execution-proven per program.
+
+NETS: tests/functional/19_mul_strength.my - the exhaustive multiplier
+x value matrix (every plan shape incl. the imul fallbacks and a
+>imm32 constant, both INT64 extremes, wraparound: INT64_MAX * 3 must
+match the tree-walker bit-for-bit, which is what pins the mod-2^64
+identity of every planned sequence); the `jit: #100 mul strength`
+-rt entry (the bytecode rewrite checked STRUCTURALLY on the compiled
+chunk, values tree-walker-oracled, the counter's vacuity guard - the
+guard caught its own first test case dying to DynRequiredEx while
+both engines "agreed" on empty output). WATCHED FAILING four ways in
+one sabotage build: a wrong lea scale, shl_sub emitting add, the
+pinned arm's save gate dropped (mov d,d; shl; add - garbage on a
+pinned *31), and the bytecode rewrite deleted - the first three as
+value divergences in BOTH the -rt cases and the corpus sweep (which
+also lit 05/14/17, the older *31/*17 carriers), the fourth by the
+structural check.

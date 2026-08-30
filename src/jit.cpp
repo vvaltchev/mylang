@@ -90,6 +90,7 @@ unsigned long g_jit_lsra_trans = 0;    /* D3.b: executed transitions */
 unsigned long g_jit_range_share = 0;   /* #96 inc-2: executed range seams */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
 unsigned long g_jit_two_addr_reg = 0;  /* #96: two-address PINNED ops */
+unsigned long g_jit_mul_strength = 0;  /* #100: strength-reduced x*imm */
 unsigned long g_jit_rax_retries = 0;   /* Phase A: conflict re-emissions */
 unsigned long g_jit_step_imm = 0;      /* #96: pinned counted-loop steps */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
@@ -3583,6 +3584,32 @@ struct Emitter {
         u8(static_cast<uint8_t>(((dst & 7) << 3) | 4));      /* SIB */
         u8(static_cast<uint8_t>(0xC0 | ((index & 7) << 3) | (base & 7)));
     }
+    /* lea dst, [base + index*(2^slog)] - the #100 strength-reduction
+     * form (`lea r, [r+r*2]` computes r*3 in one 1-cycle op). Unlike
+     * lea_elem_q it takes the SCALE as an argument and serves an
+     * rbp/r13 base via the mod=01 + disp8(0) form instead of refusing
+     * (base3 == 5 with mod=00 means "no base" - any allocatable
+     * register must work here, the operands are pins/accumulators).
+     * RSP can never be the index (its SIB index encoding means "none";
+     * r12 is fine - REX.X disambiguates). */
+    void lea_scaled(uint8_t dst, uint8_t base, uint8_t index,
+                    uint8_t slog)
+    {
+        wrote(dst);
+        ML_CHECK_MSG(slog >= 1 && slog <= 3, "lea_scaled: scale 2/4/8");
+        ML_CHECK_MSG(index != RSP, "lea_scaled: rsp cannot be an index");
+        const bool d8 = (base & 7) == 5;         /* rbp/r13: mod=01 */
+        u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
+                                | (index >= 8 ? 0x02 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x8D);
+        u8(static_cast<uint8_t>((d8 ? 0x40 : 0x00)
+                                | ((dst & 7) << 3) | 4));    /* SIB */
+        u8(static_cast<uint8_t>((slog << 6)
+                                | ((index & 7) << 3) | (base & 7)));
+        if (d8)
+            u8(0);
+    }
     /* cmp [base + disp], reg - the r/m destination direction. NOT the
      * same instruction as cmp_reg_base: the operand ORDER decides which
      * way the flags read for the signed conditions. */
@@ -4734,6 +4761,162 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
         e.free_scratch(static_cast<uint8_t>(keep_g));
     else if (keep_spill)
         e.pop_reg(keep);
+}
+
+/*
+ * #100 - MULTIPLY-BY-CONSTANT STRENGTH REDUCTION, div_magic's sibling.
+ * `imul r64, r/m64, imm` is 3-cycle latency; the forms below are 1-2,
+ * and the win is on DEPENDENCY CHAINS (h = h*31 + c - the string-hash
+ * recurrence is the corpus's hot carrier), not in instruction count.
+ *
+ * The DECISION and the EMISSION are split (mul_plan / emit_mul_plan)
+ * because the two wired sites differ in what they may spend: the
+ * pinned two-address arm cannot open a scratch window (one-window
+ * rule; a rax-pinned run would abort), so it applies only the
+ * scratch-free plans and keeps imul - one instruction on a pin - for
+ * the rest; the generic arm holds the case's hold()/tmp protocol and
+ * applies everything. Positive 2^k never reaches either site in a
+ * compiled program - specialize_arith_ops rewrites `x * 2^k` to
+ * IntShlRI at the BYTECODE level (both engines benefit; the shl arm
+ * here stays for hand-built chunks and defense in depth).
+ *
+ * EVERY form is exact mod 2^64, hence exact under -fwrapv for every
+ * int64 input: shl/lea/add/sub/neg sequences and imul agree as ring
+ * operations mod 2^64, so wraparound cases (INT64_MAX * 3) are
+ * byte-identical to the interpreter's `a * b`. No form can throw and
+ * none reads flags, so op_fully_native/never-exits are untouched.
+ *
+ * Plans deliberately DECLINED (each re-measurable, none owed by the
+ * corpus): negate on the 2-op plans' outputs beyond shl/lea (3 ops,
+ * latency parity with imul - no win), 2^k +/- 1 with a negative m
+ * (same), and the movabs+imul path's >imm32 constants (cold scale
+ * arithmetic in every corpus hit).
+ */
+struct MulPlan {
+    enum class K : uint8_t {
+        zero,       /* m == 0:  xor r, r */
+        keep,       /* m == 1:  nothing */
+        neg_only,   /* m == -1: neg r */
+        shl,        /* |m| == 2^k: shl r, k        (+ neg) */
+        lea,        /* |m| in {3,5,9}: lea r,[r+r*s]  (+ neg) */
+        lea_shl,    /* m == {3,5,9} * 2^k: lea + shl */
+        shl_add,    /* m == 2^k + 1: mov s,r; shl r,k; add r,s */
+        shl_sub,    /* m == 2^k - 1: mov s,r; shl r,k; sub r,s */
+    } k = K::keep;
+    uint8_t shift = 0;   /* the shl count */
+    uint8_t slog = 0;    /* the lea scale log2 (1,2,3 -> x3,x5,x9) */
+    bool negate = false; /* trailing neg (m < 0) */
+};
+
+static bool mul_plan_needs_save(const MulPlan &p)
+{
+    return p.k == MulPlan::K::shl_add || p.k == MulPlan::K::shl_sub;
+}
+
+static bool mul_plan(int_type m, MulPlan &out)
+{
+    out = MulPlan{};
+    if (m == 0)  { out.k = MulPlan::K::zero;     return true; }
+    if (m == 1)  { out.k = MulPlan::K::keep;     return true; }
+    if (m == -1) { out.k = MulPlan::K::neg_only; return true; }
+    const bool neg = m < 0;
+    /* |m| without UB at INT64_MIN (the div_magic idiom) - unreachable
+     * from the imm32-gated call sites, correct anyway */
+    const uint64_t am = neg ? (~static_cast<uint64_t>(m) + 1u)
+                            : static_cast<uint64_t>(m);
+    const auto pow2_log = [](uint64_t v) -> int {
+        if (v < 2 || (v & (v - 1)) != 0)
+            return -1;
+        int k = 0;
+        while (!((v >> k) & 1))
+            k++;
+        return k;
+    };
+    const auto lea_slog = [](uint64_t v) -> int {
+        return v == 3 ? 1 : v == 5 ? 2 : v == 9 ? 3 : -1;
+    };
+    int k;
+    if ((k = pow2_log(am)) >= 1 && k <= 62) {
+        out.k = MulPlan::K::shl;
+        out.shift = static_cast<uint8_t>(k);
+        out.negate = neg;
+        return true;
+    }
+    if ((k = lea_slog(am)) >= 1) {
+        out.k = MulPlan::K::lea;
+        out.slog = static_cast<uint8_t>(k);
+        out.negate = neg;
+        return true;
+    }
+    if (neg)
+        return false;              /* 3-op plans buy nothing negated */
+    if ((k = pow2_log(am - 1)) >= 4 && k <= 62) {   /* 17, 33, 65... */
+        out.k = MulPlan::K::shl_add;
+        out.shift = static_cast<uint8_t>(k);
+        return true;
+    }
+    if ((k = pow2_log(am + 1)) >= 3 && k <= 62) {   /* 7, 15, 31... */
+        out.k = MulPlan::K::shl_sub;
+        out.shift = static_cast<uint8_t>(k);
+        return true;
+    }
+    /* {3,5,9} * 2^k - the odd part after stripping trailing zeros */
+    if ((am & 1) == 0) {
+        int t = 0;
+        while (!((am >> t) & 1))
+            t++;
+        const int s = lea_slog(am >> t);
+        if (s >= 1 && t <= 62) {
+            out.k = MulPlan::K::lea_shl;
+            out.slog = static_cast<uint8_t>(s);
+            out.shift = static_cast<uint8_t>(t);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Emit the planned `r = r * m` sequence. `save` is the scratch the
+ * shl_add/shl_sub plans stage the original value through (dead for
+ * every other plan - pass r). The caller owns both registers'
+ * allocation; every write goes through tracked encoders. */
+static void emit_mul_plan(Emitter &e, uint8_t r, const MulPlan &p,
+                          uint8_t save)
+{
+    switch (p.k) {
+    case MulPlan::K::zero:
+        e.zero_reg32(r);
+        break;
+    case MulPlan::K::keep:
+        break;
+    case MulPlan::K::neg_only:
+        e.neg_reg(r);
+        break;
+    case MulPlan::K::shl:
+        e.shl_rr_imm8(r, p.shift);
+        if (p.negate)
+            e.neg_reg(r);
+        break;
+    case MulPlan::K::lea:
+        e.lea_scaled(r, r, r, p.slog);
+        if (p.negate)
+            e.neg_reg(r);
+        break;
+    case MulPlan::K::lea_shl:
+        e.lea_scaled(r, r, r, p.slog);
+        e.shl_rr_imm8(r, p.shift);
+        break;
+    case MulPlan::K::shl_add:
+        e.mov_rr(save, r);
+        e.shl_rr_imm8(r, p.shift);
+        e.op_rr2(Op::plus, r, save);
+        break;
+    case MulPlan::K::shl_sub:
+        e.mov_rr(save, r);
+        e.shl_rr_imm8(r, p.shift);
+        e.op_rr2(Op::minus, r, save);
+        break;
+    }
 }
 
 /* Float ORDERING compare via ucomisd (N3). Jump-to-target when
@@ -9299,6 +9482,7 @@ void jit_stats_report()
         { "range_share",      &g_jit_range_share },
         { "two_addr",         &g_jit_two_addr },
         { "two_addr_reg",     &g_jit_two_addr_reg },
+        { "mul_strength",     &g_jit_mul_strength },
         { "rax_retries",      &g_jit_rax_retries },
         { "step_imm",         &g_jit_step_imm },
         { "fwd",              &g_jit_fwd },
@@ -15473,8 +15657,22 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * beside write_slot's - two-address arithmetic computes
              * the slot's new value directly IN its pin */
             Emitter::PinMach pm(e);
+            MulPlan mp;
             if (fb) {
                 e.op_rr2(aop, d, static_cast<uint8_t>(fv));
+            } else if (in.b_is_lit() && aop == Op::times
+                       && mul_plan(in.b_lit(), mp)
+                       && !mul_plan_needs_save(mp)) {
+                /* #100: the SCRATCH-FREE strength-reduction plans on
+                 * the pin (lea / shl+neg / xor / neg). The save-needing
+                 * 2^k+-1 plans keep imul here - one instruction on a
+                 * pin, and a scratch window in this arm could abort a
+                 * rax-pinned run (the one-window rule); the generic
+                 * arm below serves them with the case's hold()/tmp. */
+#ifdef TESTS
+                e.bump_counter(&g_jit_mul_strength);
+#endif
+                emit_mul_plan(e, d, mp, d);
             } else if (in.b_is_lit()) {
                 e.op_reg_imm(aop, d, static_cast<int32_t>(in.b_lit()));
             } else {
@@ -15572,10 +15770,28 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             read_slot(e, acc.r, in.a_slot());
             A = acc.r;
         }
+        MulPlan mp;
         if (!fb && bpin >= 0) {
             op_rr(e, aop, A, static_cast<uint8_t>(bpin));
         } else if (!fb && bskg >= 0) {
             e.op_reg_spill(aop, A, bskg);          /* #96 inc-1 */
+        } else if (!fb && bimm && aop == Op::times
+                   && mul_plan(in.b_lit(), mp)) {
+            /* #100: the strength-reduced literal multiply - THE site
+             * the hot recurrences reach (`t = h * 31` has a temp dst,
+             * so it lands in this generic arm, not the two-address
+             * one). The save-needing 2^k+-1 plans stage the original
+             * value through the case's hold()/tmp register. */
+#ifdef TESTS
+            e.bump_counter(&g_jit_mul_strength);
+#endif
+            if (mul_plan_needs_save(mp)) {
+                hold();
+                emit_mul_plan(e, A, mp, tmp);
+                drop();
+            } else {
+                emit_mul_plan(e, A, mp, A);
+            }
         } else if (!fb && bimm) {
             e.op_reg_imm(aop, A, static_cast<int32_t>(in.b_lit()));
         } else {
