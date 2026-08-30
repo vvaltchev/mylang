@@ -1,0 +1,41 @@
+# STRUCT FIELD STORE `p.f = v` - the WRITE twin of 65_struct_field_sum,
+# and a corpus hole until 2026-08-26: `member.store` occurred ZERO times
+# in bench/ + samples/, so the operation was never measured even though a
+# field write is as fundamental as a field read. Two shapes, because they
+# lower to different tiers:
+#   - a POD struct's scalar fields (int/float/bool), which are a byte
+#     store at a compile-baked offset;
+#   - a BOXED struct's reference field, which carries the full value
+#     lifecycle (retain the new value, release the old one).
+# The int loop counter stays out of the float expression so it is not
+# disqualified from the int register pool (89's rule).
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+struct Pod { int x; int y; float f; bool b; }
+struct Boxed { dyn? tag; int n; }
+
+func pod_writes(int n) {
+    var p = Pod(0, 0, 0.0, false);
+    for (var i = 0; i < n; i++) {
+        p.x = i;
+        p.y = i + 1;
+        p.f = 0.5;
+        p.b = true;
+    }
+    return p.x + p.y;
+}
+
+func boxed_writes(int n, array<array<int>> tags) {
+    var b = Boxed(none, 0);
+    for (var i = 0; i < n; i++) {
+        b.tag = tags[i % 3];
+        b.n = i;
+    }
+    return b.n;
+}
+
+var tags = [[1], [2], [3]];
+var N = 400000 * scale;
+print("result:", pod_writes(N) + boxed_writes(N, tags));

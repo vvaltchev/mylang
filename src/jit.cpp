@@ -101,6 +101,8 @@ unsigned long g_jit_elemv_fast = 0;    /* #97: inline boxed-element reads
                                         * (bumped from EMITTED code) */
 unsigned long g_jit_storev_fast = 0;   /* #97: inline boxed-element stores
                                         * (bumped from EMITTED code) */
+unsigned long g_jit_memberv_fast = 0;  /* #97: inline struct-field stores
+                                        * (bumped from EMITTED code) */
 /* #97 inc 2: the DECLINE LEDGER - one counter per guard, bumped from
  * the guard's own landing pad (see jit.h for why a fast-path counter
  * cannot answer this) */
@@ -640,6 +642,8 @@ struct JitLayout {
     int sobj_def;         /* StructObject::def offset */
     int sobj_ro;          /* StructObject::readonly offset */
     int sobj_bytes;       /* StructObject::bytes (vector; data ptr at +0) */
+    int sobj_fields;      /* StructObject::fields (the BOXED slot vector;
+                           * data ptr at +0, same probe) */
     int sobj_rc;          /* RefCounted::intr_refcount offset (H1 use_count) */
     bool sobj_ok;         /* the vector-data-at-+0 probe held */
 };
@@ -982,6 +986,8 @@ static const JitLayout &jit_layout()
                 reinterpret_cast<const char *>(&sp->readonly) - sb);
             l.sobj_bytes = static_cast<int>(
                 reinterpret_cast<const char *>(&sp->bytes) - sb);
+            l.sobj_fields = static_cast<int>(
+                reinterpret_cast<const char *>(&sp->fields) - sb);
             l.sobj_rc = static_cast<int>(
                 reinterpret_cast<const char *>(&sp->intr_refcount) - sb);
             std::vector<char> vp(3, 'x');
@@ -9736,6 +9742,7 @@ void jit_stats_report()
         { "peep_selfmov",     &g_jit_peep_selfmov },
         { "elemv_fast",       &g_jit_elemv_fast },
         { "storev_fast",      &g_jit_storev_fast },
+        { "memberv_fast",     &g_jit_memberv_fast },
         { "peep_depbrk",      &g_jit_peep_depbrk },
         { "rax_retries",      &g_jit_rax_retries },
         { "step_imm",         &g_jit_step_imm },
@@ -16991,7 +16998,201 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
         }
 
-    case OpCode::StoreMemberV:
+    case OpCode::StoreMemberV: {
+        /*
+         * #97 inc 4 - THE INLINE STRUCT-FIELD STORE TIER. `p.x = i` paid
+         * ~279 Ir: jit_store_member -> vm_member_store -> a field-slot
+         * resolve, a const/readonly check, coerce_struct_field (which
+         * takes its 32-byte EvalValue BY VALUE, twice) and pod_set - or,
+         * for a boxed field, slot_rmw's type-erased assignment. Over half
+         * of a field-store loop's instructions were that chain.
+         *
+         * EVERYTHING THE STORE NEEDS IS A COMPILE-TIME FACT. The member
+         * key already carries `bake_def` + `bake_slot` (the 64_struct_
+         * create fix), so the emit resolves the FieldDef itself: its
+         * KIND and, for a POD layout, its BYTE OFFSET. The def-identity
+         * guard is what makes those facts true at runtime - the same
+         * argument the baked member READ makes.
+         *
+         * TWO FORMS, chosen at emit time:
+         *  - POD: one store to `[bytes + offset]` (8 bytes int/float,
+         *    1 byte bool). The value's tag must match the field's kind
+         *    EXACTLY, which is precisely `field_exact_scalar` - the
+         *    predicate that says coerce_struct_field would hand the
+         *    value straight back. Every real conversion (bool -> int,
+         *    int -> float, `none` into an opt field) DECLINES.
+         *  - BOXED: the field is `obj.fields[slot]`, a plain LValue with
+         *    NO container, so the store is the element tier's reference
+         *    lifecycle without any COW: retain-new, release-old (cold
+         *    arm), copy 24 + the tag.
+         *
+         * NO CLONE ON EITHER PATH, and that is the interpreter's
+         * semantics, not an omission: a struct assignment ALIASES
+         * (`var b = a; b.x = 5` is visible through `a`), so
+         * vm_member_store writes in place too.
+         */
+        const Chunk::MemberKey &mk = ck.member_keys[in.a_lit()];
+        const JitLayout &Lm = jit_layout();
+        const FieldDef *fd =
+            mk.bake_def && mk.bake_slot >= 0
+                && static_cast<size_t>(mk.bake_slot) < mk.bake_def->fields.size()
+                ? &mk.bake_def->fields[mk.bake_slot] : nullptr;
+        const bool pod_form = fd && mk.bake_def->is_pod()
+                              && fd->offset >= 0
+                              && (fd->kind == FieldKind::f_int
+                                  || fd->kind == FieldKind::f_float
+                                  || fd->kind == FieldKind::f_bool);
+        const bool boxed_form = fd && !mk.bake_def->is_pod();
+        DeclineJumps mv_slows;
+        size_t mv_done = SIZE_MAX;
+        const bool mv_ok = in.target == 0            /* a LOCAL base */
+                           && in.aop == Op::assign   /* not a compound */
+                           && Lm.sobj_ok
+                           && (pod_form || boxed_form)
+                           && jit_layout().elemv_inline_ok;
+        const int mv_s1 = mv_ok ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                                  /*transient=*/true) : -1;
+        const int mv_s2 = mv_s1 >= 0
+                          ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                            /*transient=*/true) : -1;
+        if (mv_s1 >= 0 && mv_s2 < 0)
+            e.free_scratch(static_cast<uint8_t>(mv_s1));
+        if (mv_s1 >= 0 && mv_s2 >= 0) {
+            const JitLayout &L = Lm;
+            const SlotAddr base = slot_addr(in.target2);
+            const SlotAddr src = slot_addr(in.b_slot());
+            const uint8_t s1 = static_cast<uint8_t>(mv_s1);
+            const uint8_t s2 = static_cast<uint8_t>(mv_s2);
+            AccScratch acc(e);
+            const auto decl_ne = [&](JitDecline why) {
+                decline_jump(e, mv_slows, 0x75, why);
+            };
+            /* THE BASE GATES */
+            e.load(acc.r, base.type);
+            e.cmp_reg_tag_via(acc.r, L.t_struct, s1);
+            decl_ne(JD_memberv_base_not_struct);
+            e.cmp_byte_slot(base.type + (L.lv_const_off - L.off_type), 0);
+            decl_ne(JD_memberv_base_const);
+            e.load(acc.r, base.payload);                 /* StructObject* */
+            e.movabs(s1, reinterpret_cast<uint64_t>(mk.bake_def));
+            e.cmp_base_reg(acc.r, static_cast<int32_t>(L.sobj_def), s1);
+            decl_ne(JD_memberv_def);
+            e.cmp_byte_base(acc.r, static_cast<int32_t>(L.sobj_ro), 0);
+            decl_ne(JD_memberv_readonly);
+            if (pod_form) {
+                /* the value must ALREADY be the field's exact scalar
+                 * kind (field_exact_scalar): anything else is a real
+                 * coercion and belongs to the helper */
+                const void *want = fd->kind == FieldKind::f_int  ? L.t_int
+                                 : fd->kind == FieldKind::f_float ? L.t_float
+                                                                  : L.t_bool;
+                e.load(s2, src.type);
+                e.cmp_reg_tag_via(s2, want, s1);
+                decl_ne(JD_memberv_val_kind);
+                e.load_base(acc.r, acc.r,
+                            static_cast<int32_t>(L.sobj_bytes));
+                if (fd->kind == FieldKind::f_bool) {
+                    /* the byte form: pod_store_field writes 0/1 */
+                    e.load(s2, src.payload);
+                    e.store_lo8_base(s2, acc.r,
+                                     static_cast<int32_t>(fd->offset));
+                } else {
+                    e.load(s2, src.payload);
+                    e.store_base(s2, acc.r,
+                                 static_cast<int32_t>(fd->offset));
+                }
+            } else {
+                /* BOXED: the field's LValue, at fields.data() + slot */
+                const int32_t fldoff = static_cast<int32_t>(
+                    mk.bake_slot * static_cast<int>(sizeof(LValue)));
+                e.load(s2, src.type);
+                e.load32_base(s2, s2, L.type_t_off);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
+                const size_t v_triv = e.j8(0x72);        /* jb: trivial */
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
+                decline_jump(e, mv_slows, 0x74, JD_memberv_val_ex);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_arr_val));
+                const size_t v_nsl = e.j8(0x75);
+                e.cmp_byte_slot(src.payload + L.slice_off, 0);
+                decl_ne(JD_memberv_val_slice);
+                e.patch8(v_nsl, e.pos());
+                e.patch8(v_triv, e.pos());
+                /* ---- past here nothing may fault ---- */
+                e.load_base(acc.r, acc.r,
+                            static_cast<int32_t>(L.sobj_fields));
+                /* ⛔ the field's byte offset is FOLDED INTO EVERY
+                 * DISPLACEMENT below, never added to the pointer. The
+                 * first version used add_reg32_imm32, which is a
+                 * 32-BIT add: it zeroes the upper half of the register,
+                 * so the field pointer was truncated and the store
+                 * SEGV'd on a small address. Only slot 0 (offset 0,
+                 * add skipped) survived, which is why one field store
+                 * worked and two crashed. */
+                /* RETAIN the new value first (aliasing safety) */
+                e.load(s2, src.type);
+                e.load32_base(s2, s2, L.type_t_off);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
+                const size_t r_triv = e.j8(0x72);
+                e.load(s2, src.payload);
+                e.inc_dword_base(s2);
+                e.patch8(r_triv, e.pos());
+                /* RELEASE the old field value */
+                e.load_base(s2, acc.r, static_cast<int32_t>(L.off_type) + fldoff);
+                e.load32_base(s2, s2, L.type_t_off);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
+                const size_t o_triv = e.j32(0x72);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
+                const size_t o_cold = e.j32(0x74);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_arr_val));
+                const size_t o_nsl = e.j8(0x75);
+                e.cmp_byte_base(acc.r,
+                                static_cast<int32_t>(L.off_payload)
+                                    + fldoff + L.slice_off, 0);
+                const size_t o_cold2 = e.j32(0x75);
+                e.patch8(o_nsl, e.pos());
+                e.load_base(s2, acc.r, static_cast<int32_t>(L.off_payload) + fldoff);
+                e.cmp_dword_base_imm32(s2, 0, 1);
+                const size_t o_cold3 = e.j32(0x74);
+                e.dec_dword_base(s2);
+                const size_t o_st = e.j32(0xEB);
+                e.patch32_here(o_cold);
+                e.patch32_here(o_cold2);
+                e.patch32_here(o_cold3);
+                e.push_reg(acc.r);
+                e.push_reg(s1);
+                emit_call_prologue(e);
+                e.lea_base(REG_ARG0, acc.r, fldoff);   /* &fields[slot] */
+                e.call_relocs.push_back(
+                    { e.pos(),
+                      reinterpret_cast<const void *>(jit_release_slot) });
+                e.u8(0xE8); e.u32(0);
+                emit_call_epilogue(e);
+                e.pop_reg(s1);
+                e.pop_reg(acc.r);
+                e.patch32_here(o_triv);
+                e.patch32_here(o_st);
+                /* the copy: 24 payload bytes + the Type* */
+                e.load(s2, src.payload);
+                e.store_base(s2, acc.r,
+                             static_cast<int32_t>(L.off_payload) + fldoff);
+                e.load(s2, src.payload + 8);
+                e.store_base(s2, acc.r,
+                             static_cast<int32_t>(L.off_payload) + fldoff + 8);
+                e.load(s2, src.payload + 16);
+                e.store_base(s2, acc.r,
+                             static_cast<int32_t>(L.off_payload) + fldoff + 16);
+                e.load(s2, src.type);
+                e.store_base(s2, acc.r,
+                             static_cast<int32_t>(L.off_type) + fldoff);
+            }
+#ifdef TESTS
+            e.bump_counter(&g_jit_memberv_fast);
+#endif
+            mv_done = e.j32(0xEB);
+            decline_land(e, mv_slows);
+            e.free_scratch(s2);
+            e.free_scratch(s1);
+        }
         /* s.f = v via jit_store_member(kind=target, base_slot=target2,
          * val_slot=b_slot, aop, mk=&member_keys[a_lit]). r8 = the pool entry
          * pointer (baked - stable across the chunk move). Non-0 -> exit_pc (bail
@@ -17013,7 +17214,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
+        if (mv_done != SIZE_MAX)             /* the inline tail rejoins */
+            e.patch32_here(mv_done);
         return true;
+        }
 
     case OpCode::StoreElem2V:
         /* a[i][j] = v via jit_store_elem2(base_slot=target2, k1=a_dual_lo,

@@ -1195,7 +1195,10 @@ extern unsigned long g_jit_op_run[];
     X(storev_base_not_arr) X(storev_base_const) X(storev_base_slice) \
     X(storev_readonly) X(storev_base_kind) X(storev_has_slices) \
     X(storev_scale_wrap) X(storev_bounds) X(storev_elem_const) \
-    X(storev_val_ex) X(storev_val_slice)
+    X(storev_val_ex) X(storev_val_slice) \
+    X(memberv_base_not_struct) X(memberv_def) X(memberv_base_const) \
+    X(memberv_readonly) X(memberv_val_kind) X(memberv_val_ex) \
+    X(memberv_val_slice)
 
 enum JitDecline {
 #define ML_JD_ENUM(n) JD_##n,
@@ -1321,6 +1324,10 @@ extern "C" unsigned long g_jit_elemv_fast;
  * guards the interpreter's put would run, and the hash byte). Bumped
  * from the EMITTED code. */
 extern "C" unsigned long g_jit_storev_fast;
+/* #97 inc 4: the inline struct FIELD store tier (StoreMemberV) - a POD
+ * field written straight to its baked byte offset, or a boxed field's
+ * LValue with the reference lifecycle. Bumped from the EMITTED code. */
+extern "C" unsigned long g_jit_memberv_fast;
 extern "C" unsigned long g_jit_peep_depbrk;
 /* the in-process OFF override for the lever mask (tests; pairs with
  * jit_lever_bit) - the env masks are cached statics. */
