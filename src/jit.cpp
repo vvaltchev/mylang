@@ -2551,7 +2551,6 @@ struct Emitter {
      * zero-extended - the handle lives in the slot's payload) */
     /* mov e<dx|ax>, dword [rcx+disp]  (the elem2 ROW handle's off/len) */
     /* cmp rax, rcx / test rax, rax */
-    void cmp_rax_rcx() { u8(0x48); u8(0x39); u8(0xC8); }
     void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
     /* mov [rbx+disp], rax  (a raw payload store - the type word is written
      * separately, as the two-store write_slot does). */
@@ -12567,8 +12566,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 have_fast = true;
                 const SlotAddr d = slot_addr(in.target);
                 e.load(RAX, d.type);
-                e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_struct));
-                e.cmp_rax_rcx();
+                e.cmp_reg_tag_via(RAX, L.t_struct, RCX);
                 const size_t js1 = e.j32(0x75);
                 e.load(RAX, d.payload);           /* rax = StructObject* */
                 e.movabs(RCX, reinterpret_cast<uint64_t>(
@@ -12660,7 +12658,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * Never faults -> op_fully_native. */
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
-        e.cmp_rax_rcx();                          /* cmp rax, rcx */
+        e.cmp_rr(RAX, RCX);
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>(cc_for(in.aop).near_op + 0x10));
         e.u8(0xC0);                               /* setcc al */
@@ -13374,19 +13372,27 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         std::vector<size_t> j_slows;
         size_t j_done = 0;
         if (fast) {
-            e.movabs(RCX, reinterpret_cast<uint64_t>(jit_layout().t_int));
+            /*
+             * Through the seam, not a hoisted `movabs RCX, t_int` plus
+             * three bare compares. On the arena each becomes `cmp rax,
+             * imm32` and the movabs disappears; OFF it, each becomes
+             * `cmp rax, rsi` against the singleton rsi already holds,
+             * which is SHORTER than what was here (3 bytes x N vs
+             * 10 + 3 x N). Either way one register stops being
+             * clobbered for the whole gate.
+             */
             if (comp) {
                 e.load(RAX, slot_addr(in.target).type);
-                e.cmp_rax_rcx();
+                e.cmp_rax_tag(jit_layout().t_int, RSI);
                 j_slows.push_back(e.j32(0x75));
             } else if (!bo.a.is_lit) {
                 e.load(RAX, slot_addr(bo.a.slot).type);
-                e.cmp_rax_rcx();
+                e.cmp_rax_tag(jit_layout().t_int, RSI);
                 j_slows.push_back(e.j32(0x75));
             }
             if (!bo.b.is_lit) {
                 e.load(RAX, slot_addr(bo.b.slot).type);
-                e.cmp_rax_rcx();
+                e.cmp_rax_tag(jit_layout().t_int, RSI);
                 j_slows.push_back(e.j32(0x75));
             }
 #ifdef TESTS
@@ -13404,7 +13410,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             else
                 e.load(RCX, slot_addr(bo.b.slot).payload);
             if (cmp) {
-                e.cmp_rax_rcx();
+                e.cmp_rr(RAX, RCX);
                 e.u8(0x0F);
                 e.u8(static_cast<uint8_t>(cc_for(bo.aop).near_op + 0x10));
                 e.u8(0xC0);                           /* setcc al */
@@ -14109,8 +14115,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             have_fast = true;
             const SlotAddr b = slot_addr(in.target2);
             e.load(RAX, b.type);
-            e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_struct));
-            e.cmp_rax_rcx();
+            e.cmp_reg_tag_via(RAX, L.t_struct, RCX);
             const size_t js1 = e.j32(0x75);
             e.load(RAX, b.payload);            /* rax = StructObject* */
             e.movabs(RCX, reinterpret_cast<uint64_t>(ck.struct_defs[defi]));
@@ -14573,10 +14578,23 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         e.bump_op(OpCode::JumpUnlessTrueV);      /* execution proof (the inline
                                                   * fast path calls no helper) */
         e.load(RAX, cond.type);                  /* rax = the value's Type* */
-        e.u8(0x48); e.u8(0x39); e.u8(0xF0);      /* cmp rax, rsi (t_int) */
+        /*
+         * ⛔ THE t_int COMPARE READ A REGISTER NOBODY LOADS (fixed
+         * 2026-08-19). It was hand-encoded as `cmp rax, rsi`, and rsi
+         * is materialised with t_int ONLY when the tag is not an
+         * imm32 - i.e. only OFF the low-address arena. On the shipping
+         * configuration the dump shows this compare emitted once and
+         * `movabs rsi, <int-tag>` emitted ZERO times, so the int fast
+         * path of a boxed truth test compares against whatever rsi
+         * happens to hold. CLAUDE.md names this exact class: "an
+         * optimization that makes a register UNNECESSARY must not
+         * leave an argument behind claiming it is still LOADED". The
+         * seam (`cmp_rax_tag`) already existed; this site never went
+         * through it.
+         */
+        e.cmp_rax_tag(L.t_int, RSI);
         const size_t j_fast_int = e.j32(0x74);   /* je -> fast */
-        e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_bool));
-        e.cmp_rax_rcx();
+        e.cmp_reg_tag_via(RAX, L.t_bool, RCX);
         const size_t j_fast_bool = e.j32(0x74);  /* je -> fast */
         /* --- slow path: any other type (may throw) --- */
         emit_call_prologue(e);
@@ -14618,8 +14636,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         const SlotAddr a = slot_addr(in.a_slot());
         e.bump_op(OpCode::JumpIfNotNoneV);
         e.load(RAX, a.type);
-        e.movabs(RCX, reinterpret_cast<uint64_t>(jit_layout().t_none));
-        e.cmp_rax_rcx();
+        e.cmp_reg_tag_via(RAX, jit_layout().t_none, RCX);
         emit_cond_jump_raw(e, 0x85 /* jne near */, 0x74 /* je short */,
                            static_cast<size_t>(in.target), begin, end,
                            remap, fixups);

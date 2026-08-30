@@ -6880,3 +6880,67 @@ register in a byte literal, a register in a method name, a call behind
 a helper's name, a rule in a comment. The fix is always the same shape:
 make the thing an ARGUMENT, or make it a MACHINE CHECK. Do not write it
 down and hope.
+
+## 2026-08-19 (3) - a FOURTH: the boxed truth test compared against a
+## register nobody loads
+
+`JumpUnlessTrueV`'s inline fast path decides int-vs-bool-vs-slow from
+the value's Type*, and its first compare was hand-encoded:
+
+    e.u8(0x48); e.u8(0x39); e.u8(0xF0);   /* cmp rax, rsi (t_int) */
+
+rsi is materialised with `t_int` by exactly one line, and that line is
+guarded:
+
+    if (!jit_tag_is_imm(jit_layout().t_int) && !e.reg_holds_pin(RSI))
+        e.movabs(RSI, ... t_int);
+
+- i.e. **only OFF the low-address arena**. On the shipping
+configuration the dump settles it:
+
+    default (arena)   cmp rax, rsi: 1     movabs rsi,<int-tag>: 0
+    MYLANG_NO_LOWMEM  cmp rax, rsi: 1     movabs rsi,<int-tag>: 6
+
+So on-arena the int arm compared against whatever rsi happened to hold.
+The practical cost is a DEAD FAST PATH - every boxed truth test on an
+int fell through to the `jit_is_true` helper call - and the tail risk
+is a wrong answer, since a coincidental match would run the fast path
+(which reads the payload as a truth value) on a non-int.
+
+This is the class CLAUDE.md already names from 2026-08-18: **"an
+optimization that makes a register UNNECESSARY must not leave an
+argument behind claiming it is still LOADED."** That entry describes
+`store_dst_bool` passing RCX as the register holding `t_bool` after the
+`movabs` was deleted. Same shape, opposite direction (a READ, not a
+store), and it survived the seam cleanup because THIS SITE NEVER WENT
+THROUGH THE SEAM - it was raw bytes.
+
+FIXED by routing it through `cmp_rax_tag(t_int, RSI)`, which already
+existed for exactly this: `cmp rax, imm32` on the arena, `cmp rax, rsi`
+off it. The other hand-rolled tag compares went with it -
+`cmp_reg_tag_via` for t_bool, t_none and the two t_struct gates - and
+the boxed-op arm's hoisted `movabs RCX, t_int` + three bare compares
+became three seam compares (shorter off-arena too: 3xN vs 10 + 3xN).
+
+**`cmp_rax_rcx()` IS DELETED - it was the FIFTH fixed-pair accessor,
+and the 2026-08-17 sweep that removed `cmp_rax_r8` / `cmp_rax_rsi` /
+`cmp_rdx_r8` / `cmp_rdx_rsi` missed it.** Nine call sites, invisible to
+`grep RCX`. Its two genuine value-compare users take `cmp_rr(RAX, RCX)`.
+
+MEASURED (callgrind Ir, `OPT=1 ASSERTS=0`, fresh lanes both sides):
+
+    a boxed truth-test loop   -19.95% on-arena, -19.94% off
+    66_dyn_foreach            -1.19%
+    79_dyn_float              -1.19%
+    42_exceptions             -0.08%   56_sieve_bool  -0.06%
+    43_sieve                  -0.05%   46_matrix_mult -0.02%
+    01/03/06/54/57/58/64/76   -0.00x%  (flat)
+
+Nothing regressed. The synthetic probe is 20% because it is nothing
+BUT boxed truth tests and boxed arithmetic; real programs mix them with
+work. 33 of 111 corpus programs' emitted code changed on-arena, 26 off.
+
+**Note 06_if_branch does NOT move**: its conditions are M8-typed, so
+they never reach this op at all. The benches that move are the `dyn`
+ones - which is the reach statement this fix needs, and the reason a
+"boxed" tier's regressions hide from a corpus of typed programs.
