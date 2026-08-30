@@ -30100,6 +30100,27 @@ static bool callee_set_analysis()
         "print(apply(sq, 3));" },
         { "dcs\t1\t28\tapply\tnone\t-" });
 
+    /* ⛔ THE MULTI-SITE HOLE (#116 increment 2's consumer fix, asserted
+     * here at the ANALYSIS level; its behavioural twin is case (7) of
+     * tests/functional/25_factory_closure_param.my). A closure reached
+     * BOTH by a site naming it alone AND by a site that may reach it
+     * or another: #115 counted only the first, typed the parameter
+     * from it, and the check pass then REFUSED a valid program on the
+     * signature it had invented. The analysis is what makes the second
+     * site VISIBLE - it reports `many` naming BOTH closures, so the
+     * consumer can disqualify. */
+    want("the multi-site hole is visible", {
+        "func mk_a(n) => func [n] (x) { return \"A\" + str(n); };",
+        "func mk_b(n) => func [n] (x) { return \"B\" + str(n); };",
+        "func probe(int k) {",
+        "  var only_a = mk_a(1);",
+        "  var p = [mk_a(2), mk_b(3)];",
+        "  var either = p[k];",
+        "  return only_a(7) + either(\"s\"); }",
+        "print(probe(runtime(0)));" },
+        { "\tone\tlambda@1:17~1",
+          "\tmany\tlambda@1:17~1,lambda@2:17~1" });
+
     /* ------------------------- escapes -------------------------- */
 
     /* A function only ever CALLED BY NAME never escapes; one handed to

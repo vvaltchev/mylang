@@ -44,8 +44,37 @@
 # Excluded from samples/: rand_sort (rand()), shopping/phonebook (they
 # read stdin and reprint their menu forever on EOF).
 set -u
+
+# ⛔ RESOLVE $BIN *BEFORE* THE cd, AND PROVE IT RUNS.
+#
+# This script cd's to the repo root, so a RELATIVE binary path given by
+# the caller is silently re-anchored - and CI passes exactly that:
+# `corpus_diff.sh ./mylang` with working-directory `build/`. After the
+# cd, `./mylang` is <repo>/mylang, which does not exist.
+#
+# ⛔ THAT MADE THE WHOLE Nets DIFFERENTIAL VACUOUS, and it could not
+# have announced itself: run_one compares the tree-walker's output with
+# the default engine's, and when NEITHER binary runs both sides are the
+# same "No such file or directory" - so the comparison AGREED, printed
+# `33/33 agree`, and exited 0. An oracle whose two sides fail
+# identically reports success. It was the compile gate - the first
+# check here that reads an EXIT CODE rather than diffing two outputs -
+# that exposed it.
+#
+# Both halves are needed: resolving the path fixes it, and the
+# executable test is what stops it ever being silent again.
+_bin_arg=${1:-build-claude/dbg/mylang}
+case "$_bin_arg" in
+  /*) BIN=$_bin_arg ;;
+  *)  BIN=$PWD/$_bin_arg ;;
+esac
 cd "$(dirname "$0")/.."
-BIN=${1:-build-claude/dbg/mylang}
+if [ ! -x "$BIN" ]; then
+    echo "corpus_diff.sh: '$_bin_arg' is not an executable ($BIN)." >&2
+    echo "  This script cd's to the repo root, so a relative path is" >&2
+    echo "  resolved against your CURRENT directory, not the root." >&2
+    exit 2
+fi
 MODE=${2:-}
 # ⛔ KEEP IN SYNC WITH jit_lever_names (jit.cpp) - this list went stale
 # once (#101 found argfuse/xcache/scache/rshare missing, so those four
@@ -88,6 +117,36 @@ progs() {
   done
 }
 
+# ⛔ A PROGRAM THAT STOPS COMPILING "AGREES" WITH ITSELF.
+#
+# This is the `tail -3` lesson in a new shape (see run_one below): the
+# comparison is between two ENGINES, so a COMPILE-TIME refusal - which
+# happens before either engine runs and prints the identical message on
+# both sides - reads as perfect agreement. Watched: reopening #115's
+# multi-site hole made tests/functional/25_factory_closure_param.my
+# fail to compile at all, and this script still reported 33/33.
+#
+# `-nr` is the discriminator ("compile and validate, don't run": lex,
+# parse, infer AND run_optimizers, exit 1 on a refusal). Exit CODE
+# alone would not do - samples/gcd legitimately exits 1 with a usage
+# message when given no arguments.
+#
+# A comparison oracle must compare everything it claims to; this one
+# claims the corpus RUNS.
+compiles_all() {
+  local bad=0 n=0
+  for f in $(progs); do
+    n=$((n + 1))
+    if ! out=$(timeout 60 "$BIN" -nr "$f" 2>&1); then
+      echo "REFUSED $f"
+      printf '%s\n' "$out" | head -4 | sed 's/^/  /'
+      bad=$((bad + 1))
+    fi
+  done
+  printf "  %-28s %d/%d compile\n" "compile gate" "$((n - bad))" "$n"
+  return $bad
+}
+
 run_one() {                      # $1 = env assignment ("" = plain)
   local bad=0 n=0 a b
   for f in $(progs); do
@@ -114,6 +173,7 @@ run_one() {                      # $1 = env assignment ("" = plain)
 }
 
 rc=0
+compiles_all || rc=1
 run_one "" || rc=1
 case "$MODE" in
   --levers)

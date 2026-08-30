@@ -1,6 +1,6 @@
 # THE CALLEE-SET ANALYSIS: one answer to "which function is this?"
 
-**Status: INCREMENT 1 LANDED (2026-08-28), 2-4 NOT STARTED.** A
+**Status: INCREMENTS 1-2 LANDED (2026-08-28), 3-4 NOT STARTED.** A
 STRUCTURAL change, not a performance one - the maintainer's framing when
 agreeing to it. The measured payoff on today's corpus is ~2.8% on one
 bench (#115); the argument is that FOUR partial analyses answering
@@ -150,13 +150,60 @@ Corpus-wide answers: **48 `one`** (a MUST answer reached through a
 value), 14 `many`, **2 `top`**, 1 `none`, 152 `direct`, 767 `builtin`;
 21 functions escape.
 
-**2. MIGRATE #115.** `snapshot_indirect_callees` queries the analysis
-instead of `finfos`. Its uniformity rule DISSOLVES: it exists only to
-survive a set that could not say "unknown", so removing it is the test
-that the new answer is real. ⛔ WATCH THE THREE PINNED CASES in
-`tests/functional/25_factory_closure_param.my` - the two declines must
-still decline, for the RIGHT reason now (⊤ or |set| > 1, not
-disagreement between sites).
+**2. MIGRATE #115. ✅ DONE (2026-08-28).**
+`snapshot_indirect_callees` asks `callee_set(e)` and
+`callee_escaped(f)`; `value_escaped` is gone from this consumer. All
+six pinned cases in `tests/functional/25_factory_closure_param.my`
+print exactly what they printed before, and the migration changes
+**0 of 126** corpus programs' `-vd` or output.
+
+⛔ **THE PLAN SAID UNIFORMITY WOULD DISSOLVE. IT DOES NOT, AND THAT IS
+A CORRECTION TO THIS PLAN, NOT A SHORTCUT.** Uniformity went in as a
+NECESSITY (the finfo set under-collected); once `join` was fixed it
+became a POLICY, and the two are not interchangeable. Removing it
+changes OBSERVABLE OUTPUT - case (3) joins int and float, so `f(1)`
+starts printing a coerced `21.000000` where it printed `21` - and it
+decides a LANGUAGE question: whether a factory-returned closure with
+disagreeing call sites declines to `dyn` (today) or REFUSES the
+program, the way a directly-bound capturing lambda does. That is the
+maintainer's call. The comment at the rule says so.
+
+⛔ **AND THE REAL ANSWER'S FIRST DIVIDEND WAS A SOUNDNESS FIX #115
+SHIPPED WITHOUT: THE MULTI-SITE HOLE.** Attributing every size-1 site
+is not enough - a closure can be reached BOTH by a site naming it
+alone AND by a site that may reach it or another:
+
+```C#
+func mk_a(n) => func [n] (x) { return "A:" + typestr(x) + str(n); };
+func mk_b(n) => func [n] (x) { return "B:" + typestr(x) + str(n); };
+func probe(int k) {
+    var only_a = mk_a(1);           # names ONE closure
+    var p = [mk_a(2), mk_b(3)];     # ...the SAME FuncInfo as only_a
+    var either = p[k];              # may be either
+    return only_a(7) + " " + either("str");
+}
+```
+
+`only_a(7)` typed the parameter `int`, `either("str")` was never
+attributed, and the check pass REFUSED the program on a signature the
+rule had invented. A callee is usable only when EVERY site whose set
+CONTAINS it names it ALONE (`disqualified`). Pinned as case (7) of the
+functional test and as an `-rt` row asserting the analysis REPORTS the
+second site as `many`.
+
+⛔ **AND CLOSING IT EXPOSED A GAP IN `corpus_diff`**: a program that
+stops COMPILING agrees with itself, because the comparison is between
+two ENGINES and a compile refusal happens before either runs. The
+sabotage made `25_factory_closure_param.my` fail to compile entirely
+and the script still said 33/33. It has a **`compile gate`** now (`-nr`
+per program). Exit code would not have done it - `samples/gcd`
+legitimately exits 1 with a usage message.
+
+Two escape rules were added for this increment's consumer, both
+because a ⊤ that a function could be IN must imply that function
+escaped: a **`throw`** escapes its value (the catch binding reads ⊤),
+and a write to a **REPL-pinned global** escapes (a later input can
+redefine it).
 
 **3. MIGRATE `value_instantiate_round`.** Then DELETE `finfos`,
 `escaped_finfos`, `value_escaped`, `note_escaped_into`, and REVERT
