@@ -2499,8 +2499,43 @@ struct Emitter {
         patch8(sk, pos());
     }
 
-    /* a short rel8 jcc/jmp with the rel patched to here later */
-    size_t j8(uint8_t op) { u8(op); const size_t at = pos(); u8(0); return at; }
+    /*
+     * A short rel8 jcc/jmp with the rel patched to here later.
+     *
+     * ⛔ A rel8 SPAN MAY NOT CONTAIN A HELPER CALL, AND THAT IS CHECKED
+     * NOW RATHER THAN WRITTEN DOWN (2026-08-19). The rule was in
+     * patch8's comment below for a year and `emit_ref_check` broke it
+     * the whole time: its `jb` jumps over an `emit_put_int_call`, whose
+     * length is the call prologue/epilogue, whose length is THE NUMBER
+     * OF LIVE CALLER-SAVED PINS. So the bug was dormant while the pin
+     * budget was small and became reachable as #96 raised it - it
+     * aborts from a budget of 8 up, and at ASSERTS=0 it does not abort
+     * at all: the displacement truncates and the jump lands inside an
+     * instruction.
+     *
+     * A SOURCE-TEXT AUDIT CANNOT FIND THIS, which is the part worth
+     * keeping. The call is not written in the span - it is inside
+     * `emit_put_int_call`, one function call away - so a scan of the
+     * lines between a `j8` and its `patch8` reports "no call here" for
+     * the one site that has one. Same shape as a register hidden in a
+     * method name (CLAUDE.md's sixth audit-table shape): the thing
+     * being audited for is behind a NAME.
+     *
+     * So the emitter counts the prologues it has emitted, `j8` records
+     * that count, and `patch8` requires it to be unchanged. It fires on
+     * ANY program that emits the shape - not only one whose span
+     * happens to exceed 127 bytes - and it names the offending pair.
+     */
+    size_t j8(uint8_t op)
+    {
+        u8(op);
+        const size_t at = pos();
+        u8(0);
+#ifndef NDEBUG
+        j8_calls[at] = n_prologues;
+#endif
+        return at;
+    }
     void patch8(size_t at, size_t target)
     {
         /* A rel8 displacement is a SIGNED BYTE. Truncating an over-127 jump
@@ -2508,10 +2543,22 @@ struct Emitter {
          * a SEGV in generated code, with no hint where it came from. Assert
          * instead, and use j32 for any span that can grow (an exit_pc carries
          * an N5 flush, a helper call its whole prologue/epilogue). */
+#ifndef NDEBUG
+        const auto it = j8_calls.find(at);
+        ML_CHECK_MSG(it == j8_calls.end() || it->second == n_prologues,
+                     "a rel8 span contains a helper call, whose length "
+                     "grows with the pin budget - use j32");
+#endif
         const long d = static_cast<long>(target) - static_cast<long>(at + 1);
         ML_CHECK(d >= -128 && d <= 127);
         b[at] = static_cast<uint8_t>(d);
     }
+    /* Bumped by emit_call_prologue; read by the j8/patch8 pair above.
+     * Debug-only bookkeeping - a release build has neither member. */
+    size_t n_prologues = 0;
+#ifndef NDEBUG
+    std::unordered_map<size_t, size_t> j8_calls;
+#endif
     /* A NEAR (rel32) jmp/jcc, patched to here later. `short_op` is the SHORT
      * opcode (0xEB jmp, 0x7x jcc); the near forms are 0xE9 and 0x0F 0x8x. */
     size_t j32(uint8_t short_op)
@@ -3424,7 +3471,20 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off,
     e.u32(static_cast<uint32_t>(L.type_t_off));
     e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str/0 */
     e.u32(force ? 0u : static_cast<uint32_t>(L.t_str_val));
-    return e.j8(0x72);                         /* jb -> fast (trivial value) */
+    /*
+     * ⛔ NEAR, NOT SHORT (fixed 2026-08-19). Every one of the three
+     * callers puts a HELPER CALL between this jump and its patch, and a
+     * call carries the whole `emit_call_prologue`/`emit_call_epilogue`
+     * bracket - whose length is the number of live caller-saved PINS,
+     * which #96 keeps increasing. At a pin budget of 8 the span passed
+     * 127 bytes and `patch8` aborted; at ASSERTS=0 there is no abort,
+     * just a truncated displacement and a jump into the middle of an
+     * instruction. `patch8`'s own comment already named this exact
+     * hazard ("use j32 for any span that can grow ... a helper call its
+     * whole prologue/epilogue") - it was a comment, so nothing enforced
+     * it. It is enforced now: see Emitter::j8.
+     */
+    return e.j32(0x72);                        /* jb -> fast (trivial value) */
 }
 
 /* The chain-based sibling (the value lives at [base + ...], a capture or
@@ -3540,6 +3600,7 @@ static ML_ALWAYS_INLINE bool jit_reg_is_callee_saved(uint8_t r)
 
 static void emit_call_prologue(Emitter &e)
 {
+    e.n_prologues++;              /* the rel8-span guard - see j8/patch8 */
     /* C2a: the FLOAT pins are in xmm registers, which are ALL
      * caller-saved - spill each to its slot's PAYLOAD before the call
      * (the type word stays stale in memory, which is fine: a pinned
@@ -6032,7 +6093,7 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
          */
         e.load(RAX, a.payload);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
-        e.patch8(jb_fast, e.pos());           /* fast: */
+        e.patch32_here(jb_fast);              /* fast: */
         e.store_type_tag(a.type, jit_layout().t_int, RSI);
         e.store(src_reg, a.payload);
         e.patch8(jmp_done, e.pos());          /* done */
@@ -6064,7 +6125,7 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
         emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_bool),
                           dst, src_reg);
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
-        e.patch8(jb_fast, e.pos());           /* fast: */
+        e.patch32_here(jb_fast);              /* fast: */
         /* #96: the bool tag as an IMMEDIATE - this used to burn a
          * `movabs RCX` per store purely to have a register to store
          * FROM, so the immediate form removes an instruction here
@@ -8614,7 +8675,7 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
         if (keep_x0)
             e.fload(xr, a.payload);   /* reload into the RESULT register */
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
-        e.patch8(jb_fast, e.pos());           /* fast: */
+        e.patch32_here(jb_fast);              /* fast: */
         e.store_type_tag(a.type, jit_layout().t_float, 8);
         e.fstore(xr, a.payload);
         e.patch8(jmp_done, e.pos());          /* done */
@@ -10351,6 +10412,31 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
 #endif
     };
 
+    /*
+     * ⛔ THIS USED TO `return` AT THE END OF THE FLOAT BRANCH, AND THAT
+     * WAS A SHIPPED WRONG ANSWER (found 2026-08-19). The two SLICE arms
+     * are emitted BELOW, so returning here left `j_oslice` and
+     * `j_rslice` - forward `jne rel32`s already written into the
+     * fragment with a 0 placeholder - NEVER PATCHED. An unpatched
+     * `jne rel32=0` does not decline and does not fault: it falls
+     * through into the NON-slice path, which then reads the slice's
+     * shared object (its PARENT's storage) and indexes it WITHOUT the
+     * slice's `off`. So `mfs[j][i]` on a float slice row read
+     * `parent[i]` instead of `parent[i + off]`:
+     *
+     *     var r = []; ... push(mfs, r[2:14]);
+     *     for i,j: srs += mfs[j][i];
+     *     -tw / -nj  1287.50        jit  1237.50
+     *
+     * - exactly `off` too small on every element. Both LEVELS were
+     * affected (a slice outer read the wrong ROW the same way), and
+     * only under the FLOAT op; the int twin patches both arms and was
+     * always right, which is why the shapes looked covered.
+     * Structurally it is an `if/return` where an `if/else` was meant,
+     * so KEEP THE ELSE: a `return` added back here reintroduces it in
+     * silence (watched - `tests/functional/16_elem2_fused.my` prints
+     * 1237.50 and corpus_diff fails 1/21).
+     */
     if (is_float) {
         /* FLOAT rows, and (#95 case 3) an INT row PROMOTES via cvtsi2sd
          * - the helper's own behaviour (the mixed-rows shape:
@@ -10371,9 +10457,7 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
         bump();
         emit_float_store(e, ck, X0, in.target, pc);
         dones.push_back(e.jmp32());
-        return;
-    }
-
+    } else {
     /* INT semantics accept flat ints AND flat bools, exactly as the
      * single-level emit_elem_int_read does (a bool node is stamped `i`).
      * A bool row stores ONE byte per element - byte count, byte read. */
@@ -10395,6 +10479,7 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
     bump();
     dst_write();
     dones.push_back(e.jmp32());
+    }
 
     /*
      * #95 case 4 - the OUTER-SLICE arm: a slice of a general array (its
