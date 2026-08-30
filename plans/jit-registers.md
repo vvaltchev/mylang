@@ -1544,3 +1544,36 @@ Suggested increments, smallest first, each measurable on its own:
  3. imm8/imm32 operands for small constants in the RI family;
  4. only THEN re-measure the marginal value of a register with
     MYLANG_JIT_MAXPINS. It should be non-zero for the first time.
+
+
+## 2026-08-18 (d): increment 1 LANDED - memory two-address arithmetic
+
+`<op> [rbx+d], reg` for `dst = dst OP b`. Ir: **83_regs_int_40 -17.05%,
+82 -15.06%, 81 -11.30%, 80 -5.92%**, everything else flat. Fragment
+817 -> 747 instructions. Full record + the five conditions (three
+soundness, two cost, each sabotage-tested) in docs/jit-optimizations.md.
+
+**WALL CLOCK FLAT (geomean 1.005x), and the reason is mechanical:** an
+x86 RMW decodes to the same micro-ops as the load/op/store it replaces
+(3 either way). Callgrind counts instructions, not uops. So increment 1
+buys code size and decode slots, not time.
+
+### That REORDERS the remaining increments
+
+Increment 2 (`add r14, r13`, a PINNED dst) is now the one expected to
+pay in time, and it is INDEPENDENT of increment 1 rather than built on
+it: four instructions - of which the two register moves are eliminated
+at rename but still occupy decode slots - collapse to ONE uop. That is
+a real reduction in work, not a re-encoding of it.
+
+ 2. two-address form for a PINNED destination      <- do this next
+ 3. imm8/imm32 operands for small constants in the RI family
+    (`add r13, 1` for the loop counter, vs
+     `mov rax,r13; movabs rcx,1; add rax,rcx; mov r13,rax`)
+ 4. re-measure the marginal value of a register with MYLANG_JIT_MAXPINS
+
+And note what increment 2 does to the ARC's central question: a pinned
+accumulator would become 1 uop where memory is 3, which is the first
+mechanism in this whole task that makes an ADDITIONAL register worth
+something measurable. The 13-register goal gets its justification from
+increment 2, not from any pool widening.
