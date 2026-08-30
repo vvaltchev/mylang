@@ -33,6 +33,17 @@ THREE PROPERTIES, the ones CLAUDE.md asks any instrument for:
     runs agree exactly.  Addresses differ per run (ASLR + where mmap
     lands), which is precisely why the map is written BY THE SAME
     PROCESS being profiled rather than by a separate `-vdj` run.
+    A LABEL IS NOT AN IDENTITY, and the tool used to assume it was:
+    `per_frag` was keyed by the label, so two fragments with the same
+    name were SUMMED into one row and their offsets collided in the
+    listing.  Every anonymous closure is `<lambda>`, and 63_closures has
+    two - the tool reported one 30.4M "lambda#0" for what is a 17.6M
+    counter and a 12.8M adder, which are different code with different
+    problems.  Fragments that RAN and share a label now get a `~N`
+    suffix in address order; a dead twin (a chunk re-emitted after a
+    register conflict) is left alone, so the common case still reads
+    plainly.
+
  2. IT SAYS WHEN IT DOES NOT KNOW - a fragment whose decode hit an
     undecodable byte is reported (its later addresses are unreliable
     because the decode desynchronised), and cost at an address the map
@@ -176,6 +187,39 @@ def main():
     frags, addr = parse_map(mapf)
     cost, summary = parse_callgrind(cgf)
 
+    # ⛔ A LABEL IS NOT AN IDENTITY.  Two fragments can carry the same
+    # name - every anonymous closure is `<lambda>`, and 63_closures has
+    # two of them - and keying the per-fragment table by the label SUMS
+    # them into one row while their offsets collide in the listing.  The
+    # tool then answers "lambda#0 is 30.4M" for a fragment that is two
+    # fragments, which is exactly the "an instrument must not conflate
+    # what it cannot distinguish" failure.  Disambiguate by ADDRESS, and
+    # say so in the name: a repeated label gets a #N suffix in address
+    # order, so the display name is still readable and now unique.
+    # Only fragments that ACTUALLY RAN need disambiguating.  A chunk can
+    # be emitted more than once (a register conflict re-emits it), so a
+    # label routinely has a dead twin - suffixing those too would rename
+    # every closure in every program for nothing.
+    live = {}
+    for a, ir in cost.items():
+        hit = addr.get(a)
+        if hit is not None:
+            live[hit[0][0]] = live.get(hit[0][0], 0) + ir
+    name_of = {}
+    seen = {}
+    for fr in sorted(frags, key=lambda f: f[0]):
+        if live.get(fr[0]):
+            seen[fr[2]] = seen.get(fr[2], 0) + 1
+    dup = {lab for lab, n in seen.items() if n > 1}
+    nth = {}
+    for fr in sorted(frags, key=lambda f: f[0]):
+        lab = fr[2]
+        if lab in dup and live.get(fr[0]):
+            nth[lab] = nth.get(lab, 0) + 1
+            name_of[fr[0]] = "%s~%d" % (lab, nth[lab])
+        else:
+            name_of[fr[0]] = lab
+
     mapped = unmapped = 0
     per_frag = {}
     rows = []
@@ -187,7 +231,7 @@ def main():
         mapped += ir
         fr, ln, mn = hit
         off = a - fr[0]
-        label = fr[2]
+        label = name_of[fr[0]]
         per_frag[label] = per_frag.get(label, 0) + ir
         if frag_filter and frag_filter not in label:
             continue
@@ -228,7 +272,8 @@ def main():
         # question a call protocol actually poses.
         print("\nlisting (address order; blank line = a not-executed gap):")
         seen = sorted((a for a in addr
-                       if not frag_filter or frag_filter in addr[a][0][2]))
+                       if not frag_filter
+                       or frag_filter in name_of[addr[a][0][0]]))
         prev_run = None
         for a_ in seen:
             fr, ln, mn = addr[a_]
@@ -242,8 +287,9 @@ def main():
                     prev_run = None
                 continue
             prev_run = ir
-            print("  %14s  %-16s %s"
-                  % ("{:,}".format(ir), "%s+%d" % (fr[2], off), mn))
+            print("  %14s  %-18s %s"
+                  % ("{:,}".format(ir),
+                     "%s+%d" % (name_of[fr[0]], off), mn))
         return
 
     rows.sort(key=lambda r: -r[0])
