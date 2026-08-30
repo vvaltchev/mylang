@@ -3978,6 +3978,36 @@ dump on the corpus, and all three in the UNSOUND direction:**
    initialiser untraceable, so the value is WALKED, FuncObjects resolved
    back through `desc->decl`, with ⊤ only for what cannot be named.
 
+**⛔ ⊤ ABSORBS, SO A SET THAT WIDENS TO ⊤ MUST RECORD WHAT IT
+DISCARDS - THE LOSS LEDGER (2026-08-28).** `CsSet::set_top()` clears
+the members; a consumer reading that ⊤ can still call them, so those
+functions have left the analysable program and must be reported
+ESCAPED. This is the SAME fact `escaped_finfos` carried in the type
+lattice ("the members a join dropped"), at the layer where it is
+complete: `set_top` is the ONLY way a non-empty set loses members
+(`merge` with a ⊤ partner, and the `CS_MAX_SET` cap, both funnel
+through it), so one hook catches every loss instead of an enumeration
+of loss SITES that goes stale.
+
+**It replaced the analysis's bluntest rule, and the numbers say why.**
+The first version answered "an unnameable value escaped somewhere" by
+escaping EVERY function in EVERY points-to set - measured firing on
+**20 of 124** corpus programs, **31 of its 38 firings** from that
+premise alone, with ZERO calls through an unnameable callee in the
+program. Corpus-wide escapes **21 -> 10**; the C3 proven-param gate,
+which had been blocking **1 corpus + 15 suite** stamps purely because
+of this, now blocks **none**. The `a call THROUGH an unnameable callee
+escapes everything` half REMAINS - that premise is real.
+
+⛔ **AND IT MADE THE ANALYSIS BETTER, NOT JUST QUIETER**, which is the
+half a "nothing regressed" check cannot show: `func g(a) {...};
+var dyn h = g; h(1);` used to escape `g`, so value-instantiation
+declined and `h` held the BOXED BASE. It now redirects `h` to the
+monomorphized `g$0` and the indirect call runs typed code. C3 then
+correctly declines to stamp `g$0` - an instance reachable as a VALUE is
+dyn-launderable - which is its own `value_used` rule doing what it
+says, not a lost optimization.
+
 **Testing it: `-dcs` is the ONLY possible oracle.** The analysis changes
 no answer any program computes, so the five-mode differential,
 `corpus_diff` and every fuzzer are blind by construction. The `-rt`
