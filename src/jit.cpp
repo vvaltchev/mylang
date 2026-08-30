@@ -9290,7 +9290,8 @@ static void load_index_idx(Emitter &e, uint8_t ir, const Instr &in)
  * wrapped element, a REAL pre-existing divergence) + a re-check; a
  * non-negative or still-negative-after-wrap index RAISES OutOfBounds (this
  * pc's caret), matching the interpreter's `idx < 0 ||` check. */
-static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint32_t pc,
+static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint8_t cr,
+                                    uint32_t pc,
                                     std::vector<size_t> *slows = nullptr)
 {
     e.scratch(ir);            /* the index register */
@@ -9299,11 +9300,11 @@ static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint32_t pc,
          * the caller's slow tier - the interpreter core does the wrap and
          * throws CONVEYED (the raise path's loc_at would resolve against a
          * DELETED run's collapsed pcs). */
-        e.cmp_rr(ir, RDX);
+        e.cmp_rr(ir, cr);
         slows->push_back(e.j32(0x73));       /* jae -> slow */
         return;
     }
-    e.cmp_rr(ir, RDX);
+    e.cmp_rr(ir, cr);
     const size_t j_load = e.j32(0x72);       /* jb: in range -> the load */
     /* cold: unsigned out-of-range - negative (wrap) or genuine OOB */
     e.test_rr(ir, ir);
@@ -9312,11 +9313,29 @@ static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint32_t pc,
         emit_raise(e, JR_OOB, pc);           /* non-negative OOB */
         e.patch8(j_wrap, e.pos());
     }
-    e.add_rr(ir, RDX);                       /* idx += size */
-    e.cmp_rr(ir, RDX);
+    e.add_rr(ir, cr);                       /* idx += size */
+    e.cmp_rr(ir, cr);
     raise_unless(e, 0x72, JR_OOB, pc);       /* doubly-negative -> OOB */
     e.patch32_here(j_load);
 }
+
+/*
+ * ⛔ #96: THE READ TIERS' ROLES, mirroring ElemScratch on the store
+ * side. `obj` and the element result share RAX; `data` is the SIB base
+ * of every element operand and `count` the bounds bound; `idx` is the
+ * one role already allocated (elem_read_idx).
+ *
+ * `data` and `count` are threaded TOGETHER because they are computed
+ * together - three instructions off the same shobj - so one pass frees
+ * a site for rcx AND for rdx. They are still RCX/RDX at every caller:
+ * this lands INERT, and making them allocatable is the next step.
+ */
+struct ElemRead {
+    uint8_t obj   = RAX;
+    uint8_t data  = RCX;
+    uint8_t count = RDX;
+    uint8_t idx   = R9;
+};
 
 /* The per-kind FLAT element read tail (rax = the shobj): data -> rcx,
  * count -> rdx, the index -> r9 (from the op's a-operand when `idx_in`, else
@@ -9324,26 +9343,26 @@ static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint32_t pc,
  * check; cold negative wrap / OOB raise), else the element lands in RAX.
  * Shared by every flat int/bool element reader so the semantics cannot
  * drift. */
-static void emit_flat_int_tail(Emitter &e, uint8_t ir, uint32_t pc,
+static void emit_flat_int_tail(Emitter &e, const ElemRead &r, uint32_t pc,
                                bool bools,
                                const Instr *idx_in, int idx_slot,
                                std::vector<size_t> *slows = nullptr)
 {
     const JitLayout &L = jit_layout();
-    e.load_base(RCX, RAX, L.data_off);
-    e.load_base(RDX, RAX, L.data_off + 8);
-    e.sub_rr(RDX, RCX);
+    e.load_base(r.data, r.obj, L.data_off);
+    e.load_base(r.count, r.obj, L.data_off + 8);
+    e.sub_rr(r.count, r.data);
     if (!bools)
-        e.sar_rr_imm8(RDX, 3);
+        e.sar_rr_imm8(r.count, 3);
     if (idx_in)
-        load_index_idx(e, ir, *idx_in);
+        load_index_idx(e, r.idx, *idx_in);
     else
-        load_slot_idx(e, ir, idx_slot);
-    emit_elem_bounds_or_wrap(e, ir, pc, slows);
+        load_slot_idx(e, r.idx, idx_slot);
+    emit_elem_bounds_or_wrap(e, r.idx, r.count, pc, slows);
     if (bools)
-        e.load_elem_zx8(RAX, RCX, ir);          /* movzx eax,[rcx+ir] */
+        e.load_elem_zx8(r.obj, r.data, r.idx);
     else
-        e.load_elem_q(RAX, RCX, ir);            /* mov rax,[rcx+ir*8] */
+        e.load_elem_q(r.obj, r.data, r.idx);
 }
 
 /*
@@ -9399,11 +9418,12 @@ static void emit_elem_int_read(Emitter &e, uint8_t ir,
     decline(0x74, 0x75);                     /* je (bools) else decline */
     /* flat bools: 1-byte elements, so the count is the raw pointer difference
      * (no sar) and the load is a movzx. */
-    emit_flat_int_tail(e, ir, pc, /*bools=*/true, &in, -1, slows);
+    ElemRead rr; rr.idx = ir;
+    emit_flat_int_tail(e, rr, pc, /*bools=*/true, &in, -1, slows);
     const size_t j_done = e.j32(0xEB);
     /* flat ints */
     e.patch32_here(j_ints);
-    emit_flat_int_tail(e, ir, pc, /*bools=*/false, &in, -1, slows);
+    emit_flat_int_tail(e, rr, pc, /*bools=*/false, &in, -1, slows);
     e.patch32_here(j_done);
 }
 
@@ -9502,6 +9522,7 @@ struct ElemScratch {
     uint8_t val   = RDI;   /* the value being stored / the rhs         */
     bool    ok    = true;  /* false = no free register; DECLINE        */
 };
+
 
 /*
  * The candidates for the two ALLOCATABLE roles, and how many of them
@@ -14339,6 +14360,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::ForStepElemInt: {
         const uint8_t ir = elem_read_idx(e, in.op);
+        ElemRead fr; fr.idx = ir;
         if (ir == ELEM_NO_REG) {
             /* No free index register (unreachable while
              * elem_scratch_reserve keeps two candidates for this op -
@@ -14403,11 +14425,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         e.load(RAX, base.payload);            /* rax = shobj */
         e.cmp_byte_rax(L.kind_off, L.kind_bools);
         const size_t j_bools = e.j32(0x74);
-        emit_flat_int_tail(e, ir, pc, /*bools=*/false, nullptr, in.target2,
+        emit_flat_int_tail(e, fr, pc, /*bools=*/false, nullptr, in.target2,
                            &read_slows);
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_bools);
-        emit_flat_int_tail(e, ir, pc, /*bools=*/true, nullptr, in.target2,
+        emit_flat_int_tail(e, fr, pc, /*bools=*/true, nullptr, in.target2,
                            &read_slows);
         e.patch32_here(j_done);
         }
