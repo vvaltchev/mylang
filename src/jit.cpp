@@ -14752,7 +14752,38 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         for (size_t i = 0; i < MAX_XCACHED; i++)
             if (!(xclob & (1u << XCACHE_ORDER[i])))
                 n_xcache++;
-        const size_t max_pins = MAX_CACHED + n_xcache;
+        size_t max_pins = MAX_CACHED + n_xcache;
+        /*
+         * ⛔ MYLANG_JIT_MAXPINS=N - CAP THE PIN BUDGET, so "what is a
+         * pin actually WORTH here?" is a measurement instead of an
+         * argument. Sweep N and read callgrind Ir: the difference
+         * between N and N+1 is the MARGINAL value of one register.
+         *
+         * It exists because three increments of #96 widened the pool
+         * and all three measured flat, and nobody could say whether
+         * that meant "the pool is already big enough" or "pinning does
+         * not pay on these shapes at all". The sweep answers it, and
+         * the answer was startling (2026-08-18, OPT=1 ASSERTS=0):
+         *
+         *   07_nested_loops   pin 1 -5.36%, pins 2..7 +0.00%
+         *   01_while_loop     pin 2 -5.85%, pins 3..7 +0.00%
+         *   80_regs_int_08    EVERY pin +0.00%
+         *   83_regs_int_40    EVERY pin +0.00%  (40 hot int locals!)
+         *
+         * and it holds with lever A forwarding OFF, so the two are not
+         * merely overlapping. On 83 the fragment is 1367 emitted
+         * instructions at N=0 and 1416 at N=7 - pinning makes the code
+         * BIGGER and the dynamic count identical.
+         *
+         * MEASUREMENT ONLY - never a shipping config, and unset it
+         * costs nothing: one getenv per RUN at COMPILE time, nothing in
+         * emitted code.
+         */
+        if (const char *mp = getenv("MYLANG_JIT_MAXPINS")) {
+            const size_t cap = static_cast<size_t>(atoi(mp));
+            if (cap < max_pins)
+                max_pins = cap;
+        }
         e.reg_busy = xclob;
         std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,

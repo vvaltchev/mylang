@@ -1408,3 +1408,64 @@ which owns 7 of the 8 worst my/cpp benches - is where the time is. If
 this task is resumed, resume it for the RAX/RCX/RDX scratch allocator
 (727 of 915 unbracketed sites) with a measurement in hand FIRST showing
 what a shortage of those costs, not on a site count.
+
+## 2026-08-18 (b): MYLANG_JIT_MAXPINS, and what a pin is actually WORTH
+
+Three increments widened the pool and all three measured flat, which
+left the important question unanswered: does that mean "the pool is
+already big enough", or "pinning does not pay on these shapes at all"?
+`MYLANG_JIT_MAXPINS=N` caps the budget so the difference between N and
+N+1 IS the marginal value of one register. Self-test: a non-binding cap
+must be a no-op - verified byte-identical on 108/108 corpus programs.
+
+**The sweep (callgrind Ir, OPT=1 ASSERTS=0):**
+
+    bench              where the win is        beyond it
+    07_nested_loops    pin 1   -5.36%          pins 2..7  +0.00%
+    01_while_loop      pin 2   -5.85%          pins 3..7  +0.00%
+    80_regs_int_08     -                       EVERY pin  +0.00%
+    83_regs_int_40     -                       EVERY pin  +0.00%
+
+**The whole value of the register cache is the first one or two pins**,
+and on the two benches written expressly to stress register pressure -
+8 and 40 hot int locals, independent recurrences, the throughput regime
+- pinning is worth NOTHING AT ALL.
+
+Two hypotheses tested and REJECTED:
+ - *lever A already captured it.* No: the numbers are the same with
+   `MYLANG_JIT_OFF=fwd` (83: +0.00% either way; 07: -4.84% vs -5.36%).
+ - *the pick declines them.* No: each accumulator is read/written ~5x
+   per iteration, far over the >= 3 threshold, and 6 do get pinned
+   (`xcache 1` in JITSTATS confirms a caller-saved entry).
+
+And the direct evidence: on 83_regs_int_40 the fragment is **1367
+emitted instructions at N=0 and 1416 at N=7**. Pinning makes the code
+BIGGER and leaves the dynamic count identical.
+
+### What this means for the task
+
+**The register FILE is not the constraint, and neither is the pool
+SIZE. Something downstream is eating the pin's benefit before it
+reaches the loop body, and until that is found, every additional
+register is worth measured zero.** That is a different question from
+the one the last three increments answered, and it is the one worth
+answering next - it is also the only thing that could make "13
+registers" pay.
+
+FIND IT FIRST, cheaply: take 83_regs_int_40's hot fragment, dump it at
+N=0 and N=7, and account for every instruction the pin was supposed to
+remove. The candidates, in the order they are worth checking:
+ 1. the accumulator's uses may not be CACHE-AWARE - a `bad()` site, or
+    an op whose helper must see memory, so the slot is pinned and read
+    from memory anyway (CLAUDE.md's "WHICH bad() SITES ARE WORTH
+    REMOVING" already records this class and says the second kind
+    cannot be fixed);
+ 2. the run may be SPLIT so the loop body is several fragments, each
+    paying entry/exit for pins it uses a handful of times;
+ 3. a barrier inside the loop may be flushing and reloading the whole
+    cache per iteration.
+Only (1) and (3) would be fixable, and both are cheap to rule in or out
+from one `-vdj` dump.
+
+⛔ **Do NOT widen the pool again before that accounting exists.** It has
+been measured flat three times; a fourth is not evidence, it is a habit.
