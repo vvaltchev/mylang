@@ -6814,3 +6814,69 @@ measured from the wrong subject.** Build measurement lanes FRESH
 is done. Note also that the debug pair was byte-identical throughout,
 so `vdjcmp` on debug binaries would never have shown this: the stale
 artifact was release-only.
+
+## 2026-08-19 (2) - A THIRD shipped bug: the divmod cold gate SIGFPEs
+
+Same file, same hour, same cause as the r9 admission that shipped a
+wrong answer for a day: **a register named in a place no audit for the
+register can see.**
+
+`emit_store_elem2_inline`'s #103 divisor gate - the arm that must
+decline `d == 0` and `INT_MIN / -1` to the helper, so they raise a
+CATCHABLE `DivisionByZeroEx` - was five HAND-ENCODED byte sequences:
+
+    e.u8(0x48); e.u8(0x8D); e.u8(0x57); e.u8(0x01);  /* lea rdx,[rdi+1] */
+    e.u8(0x48); e.u8(0x85); e.u8(0xFF);              /* test rdi,rdi    */
+    e.u8(0x4A); e.u8(0x8D); e.u8(0x14); e.u8(0xCA);  /* lea rdx,[rdx+r9*8] */
+    e.u8(0x48); e.u8(0x3B); e.u8(0x50); <data_off>;  /* cmp rdx,[rax+d] */
+    e.u8(0x4C); e.u8(0x39); e.u8(0xCA);              /* cmp rdx,r9      */
+
+`rdi` is the DIVISOR and `r9` is the INDEX - and both are ALLOCATED
+`ElemScratch` roles. `elem_scratch_plan`'s `pick()` prefers rdi/r9 and
+falls back to the next `ELEM_CAND` member whenever the preferred one is
+pinned. **That is not rare**: a probe asserting the roles never leave
+their defaults trips on `bench/my/43_sieve.my` at every pool rotation,
+and inside `-rt`.
+
+With `sc.val` moved, the gate tested a register that does not hold the
+divisor, so `m[j][i] /= 0` walked past it into the native `idiv`:
+
+    -tw  737555 1 22080      (DivisionByZeroEx, caught)
+    -nj  737555 1 22080      (DivisionByZeroEx, caught)
+    jit  Floating point exception (core dumped), exit 136
+
+RULE 1 and RULE 2 at once, plus a crash on a valid program (#137).
+
+FIXED by giving the block the ROLES and adding the four generic
+encoders it should always have had - `lea_base`, `lea_elem_q`,
+`cmp_reg_base`, `load_base0`, over a shared `emit_modrm_disp` that
+picks mod=00/disp8/disp32 so the emitted bytes are IDENTICAL to the
+hand-written ones when the roles sit on their defaults. Verified: the
+whole corpus is byte-identical except the new test, whose one diff IS
+the bug -
+
+    -  lea rdx, [rdi+0x1]        <- tests the wrong register
+    +  lea rdx, [r10+0x1]        <- `sc.val` was allocated to r10
+
+**WHY THE EXISTING NETS COULD NOT SEE IT, and this is the part to
+keep.** The shape needs THREE things at once: a nested COMPOUND
+`/=`/`%=`, a divisor that is actually 0 or -1, and enough pin pressure
+that the allocator moves `sc.val` off rdi. No corpus program had all
+three. Measured with the defect reintroduced:
+
+    -rt                      1924/1924 GREEN
+    corpus_diff (old corpus)          GREEN
+    corpus_diff (+ the new file)      22/23 - and a SIGFPE
+
+`tests/functional/17_elem2_divmod_roles.my` pins it. **Its eight
+accumulators are load-bearing, not padding** - with two or three the
+roles stay on rdi/r9 and the file passes with the defect in; the count
+must stay at or above the pin budget. Keep the loop bound RUNTIME, too
+(a literal bound lowers to a different loop form - shape-eater #7).
+
+**THE GENERALISATION, now three-for-three in one day:** every one of
+these bugs was a fact the code stated in a form no scan could read - a
+register in a byte literal, a register in a method name, a call behind
+a helper's name, a rule in a comment. The fix is always the same shape:
+make the thing an ARGUMENT, or make it a MACHINE CHECK. Do not write it
+down and hope.

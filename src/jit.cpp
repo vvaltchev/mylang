@@ -2142,6 +2142,75 @@ struct Emitter {
     }
     /* test <a64>, <b64> - replaces the hand-emitted `test r9, r9` the
      * element bounds check used, so its register is an ARGUMENT (#96). */
+    /*
+     * ⛔ THE GENERIC FORMS THE #103 DIVMOD COLD BLOCK NEEDED, and did
+     * not have: it was 5 hand-written byte sequences naming `rdi` (the
+     * divisor) and `r9` (the index) LITERALLY, while both of those are
+     * ALLOCATED roles (ElemScratch::val / ::idx). When the allocator
+     * moved either - which it does routinely - the divisor gate tested
+     * a register that does not hold the divisor, and a `/= 0` went
+     * straight to the native `idiv`: SIGFPE, where the tree-walker and
+     * `-nj` both raise a catchable DivisionByZeroEx. Found 2026-08-19.
+     * Keep the operands as ARGUMENTS; do not hand-encode a register.
+     */
+    /* lea dst, [base + disp]  (disp8 when it fits, so the encoding is
+     * the same length the hand-written form used) */
+    void lea_base(uint8_t dst, uint8_t base, int32_t d)
+    {
+        ML_CHECK_MSG(base != 4, "lea_base: rsp needs a SIB byte");
+        u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x8D);
+        emit_modrm_disp(dst, base, d);
+    }
+    /* lea dst, [base + index*8]  (the element address) */
+    void lea_elem_q(uint8_t dst, uint8_t base, uint8_t index)
+    {
+        ML_CHECK_MSG((base & 7) != 5,
+                     "lea_elem_q: rbp/r13 base needs mod=01 + disp8");
+        u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
+                                | (index >= 8 ? 0x02 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x8D);
+        u8(static_cast<uint8_t>(((dst & 7) << 3) | 4));      /* SIB */
+        u8(static_cast<uint8_t>(0xC0 | ((index & 7) << 3) | (base & 7)));
+    }
+    /* cmp reg, [base + disp] */
+    void cmp_reg_base(uint8_t reg, uint8_t base, int32_t d)
+    {
+        ML_CHECK_MSG(base != 4, "cmp_reg_base: rsp needs a SIB byte");
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x3B);
+        emit_modrm_disp(reg, base, d);
+    }
+    /* mov dst, [base]  - no displacement (3 bytes, unlike load_base's
+     * unconditional disp32 form) */
+    void load_base0(uint8_t dst, uint8_t base)
+    {
+        ML_CHECK_MSG((base & 7) != 4 && (base & 7) != 5,
+                     "load_base0: rsp/rbp cannot use mod=00");
+        u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x8B);
+        u8(static_cast<uint8_t>(((dst & 7) << 3) | (base & 7)));
+    }
+    /* the shared mod/rm + displacement tail: mod=00 when the
+     * displacement is zero and the base allows it, else disp8, else
+     * disp32 */
+    void emit_modrm_disp(uint8_t reg, uint8_t base, int32_t d)
+    {
+        const uint8_t rm = static_cast<uint8_t>(base & 7);
+        if (d == 0 && rm != 5) {
+            u8(static_cast<uint8_t>(((reg & 7) << 3) | rm));
+        } else if (d >= -128 && d <= 127) {
+            u8(static_cast<uint8_t>(0x40 | ((reg & 7) << 3) | rm));
+            u8(static_cast<uint8_t>(d));
+        } else {
+            u8(static_cast<uint8_t>(0x80 | ((reg & 7) << 3) | rm));
+            u32(static_cast<uint32_t>(d));
+        }
+    }
     void test_rr(uint8_t a, uint8_t b)
     {
         u8(static_cast<uint8_t>(0x48 | (b >= 8 ? 0x04 : 0)
@@ -10767,30 +10836,49 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
          * rcx/rdx/r9 are re-derived by the arm anyway), declines OOB,
          * reads the element and declines ONLY the INT_MIN dividend;
          * an ordinary x / -1 jumps back and stores natively. */
-        /* NOTE rcx holds &row here and must SURVIVE until the cow
+        /*
+         * NOTE `sc.data` holds &row here and must SURVIVE until the cow
          * guards - the first version clobbered it via the shared nav
          * shape (a misaligned-Type* crash in -rt). This cold path uses
-         * rdx/r9 only: &elem formed by lea, bounds as a TWO-sided
-         * pointer compare (a negative index wraps below data). */
-        e.u8(0x48); e.u8(0x8D); e.u8(0x57); e.u8(0x01);
-                                                 /* lea rdx,[rdi+1] */
-        e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+         * RDX plus the two ROLES: &elem formed by lea, bounds as a
+         * TWO-sided pointer compare (a negative index wraps below
+         * data). RDX is safe raw scratch because `run_may_pin_rdx` is
+         * a positive whitelist that does not list StoreElem2V, so no
+         * run containing this op may pin it.
+         *
+         * ⛔ THIS BLOCK WAS FIVE HAND-ENCODED BYTE SEQUENCES NAMING
+         * `rdi` AND `r9` LITERALLY, AND THAT WAS A SIGFPE (2026-08-19).
+         * The divisor lives in `sc.val` and the index in `sc.idx`, both
+         * ALLOCATED - `pick()` prefers rdi/r9 and falls back whenever
+         * they are pinned, which happens in ordinary programs (43_sieve
+         * and `-rt` both move a role). When either moved, the gate
+         * below tested a register that does not hold the divisor, so a
+         * `m[j][i] /= 0` reached the native `idiv`:
+         *
+         *     -tw  raises DivisionByZeroEx (caught)
+         *     -nj  raises DivisionByZeroEx (caught)
+         *     jit  SIGFPE, exit 136
+         *
+         * - RULE 1 and RULE 2 at once, and a crash on a valid program.
+         * It is the r9 class exactly: a register named in a place no
+         * audit for the register can see. Pinned by
+         * tests/functional/17_elem2_divmod_roles.my.
+         */
+        e.lea_base(RDX, sc.val, 1);              /* rdx = divisor + 1 */
+        e.cmp_reg_imm(RDX, 1);
         const size_t j_ok = e.j32(0x77);         /* ja .ok (hot) */
-        e.u8(0x48); e.u8(0x85); e.u8(0xFF);      /* test rdi,rdi */
+        e.test_rr(sc.val, sc.val);
         decline_if(0x74);                        /* 0 -> the helper */
-        e.load_base(RDX, RAX, L.data_off);               /* rdx = data */
+        e.load_base(RDX, sc.obj, L.data_off);    /* rdx = data */
         load_slot_idx(e, sc.idx, in.b_slot());
-        e.u8(0x4A); e.u8(0x8D); e.u8(0x14); e.u8(0xCA);
-                                                 /* lea rdx,[rdx+r9*8] */
-        e.u8(0x48); e.u8(0x3B); e.u8(0x50);
-        e.u8(static_cast<uint8_t>(L.data_off));  /* cmp rdx,[rax+data] */
+        e.lea_elem_q(RDX, RDX, sc.idx);          /* rdx = &elem */
+        e.cmp_reg_base(RDX, sc.obj, L.data_off);
         decline_if(0x72);                        /* jb: negative idx */
-        e.u8(0x48); e.u8(0x3B); e.u8(0x50);
-        e.u8(static_cast<uint8_t>(L.data_off + 8));
+        e.cmp_reg_base(RDX, sc.obj, L.data_off + 8);
         decline_if(0x73);                        /* jae: OOB */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x12);      /* mov rdx,[rdx] */
+        e.load_base0(RDX, RDX);                  /* rdx = the element */
         e.movabs(sc.idx, 0x8000000000000000ull);
-        e.u8(0x4C); e.u8(0x39); e.u8(0xCA);      /* cmp rdx,r9 */
+        e.cmp_rr(RDX, sc.idx);
         decline_if(0x74);                        /* INT_MIN -> helper */
         e.patch32_here(j_ok);
     }
