@@ -1541,6 +1541,11 @@ A lambda with un-annotated parameters is typed from the places it is
   `float`, and the `int` argument is then coerced); two irreconcilable ones
   are a compile error.
 
+A closure that reaches you **indirectly** - returned from a factory, or read
+out of a container - is typed only when every call through it agrees on the
+argument types; otherwise its parameters stay `dyn`. So an indirectly-reached
+closure is never *refused* for a disagreement, it simply stays dynamic.
+
 ```C#
 func make_adder(n) {
   var base = n * 10;
@@ -1551,10 +1556,6 @@ var add = make_adder(3);
 print(add(4));            # 34 - `x` is typed `int` from this call site
 ```
 
-The second rule applies **however the closure reaches you** - written
-inline, returned from a factory, or read back out of an array - so a
-closure does not change its typing by being returned rather than written
-in place.
 
 #### Const parameters
 

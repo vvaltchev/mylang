@@ -45,9 +45,10 @@ for (var i = 0; i < 4; i++) {
 }
 print("loop   ", last);
 
-# (3) TWO call sites of different numeric types WIDEN the parameter,
-#     exactly as a directly-bound capturing lambda already does - the
-#     int argument is then coerced, so `str` prints a float.
+# (3) DECLINE: two call sites that disagree. The rule fires only when
+#     EVERY site attributed to a closure agrees, so this one stays dyn
+#     and the values are exactly what they were before #115 - an int 21,
+#     not a coerced 21.000000.
 func make_w(n) {
   var wbase = n * 10;
   return func [wbase] (x) { return typestr(x) + ":" + str(wbase + x); };
@@ -58,7 +59,24 @@ func widen(int k) {
 }
 print("widen  ", widen(runtime(2)));
 
-# (4) reached ONLY through a container element
+# (4) DECLINE, and this is the case that made uniformity necessary
+#     rather than nice. The finfo set UNDER-COLLECTS: two same-shaped
+#     closures in an array present a ONE-element set at every call site,
+#     so both sites below attribute to the same survivor. Contributing
+#     per site gave that one FuncInfo both `int` and `str` and REFUSED a
+#     program with no conflict in it. Deciding per callee over all its
+#     sites is what makes it compile.
+func mk_a(n) => func [n] (x) { return str(n) + str(x); };
+func mk_b(n) => func [n] (x) { return str(n) + str(x); };
+func two_closures(int k) {
+  var p = [mk_a(1), mk_b(2)];
+  var f = p[k % 2];
+  var g = p[(k + 1) % 2];
+  return f(7) + g("s");
+}
+print("pair   ", two_closures(runtime(3)));
+
+# (5) reached ONLY through a container element
 func make_c(n) {
   var cbase = n * 100;
   return func [cbase] (x) { return typestr(x) + ":" + str(cbase + x); };

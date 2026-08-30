@@ -3654,29 +3654,34 @@ static const std::vector<test> tests =
     },
 
     /*
-     * ...and the CONSEQUENCE, pinned so it cannot drift back: two call
-     * sites of irreconcilable types are now a compile error. That is
-     * not a new rule - a DIRECTLY-bound capturing lambda has always
-     * refused this, with the same message - it is the same rule finally
-     * reaching a closure that escaped it by being returned rather than
-     * written inline. The next entry is that directly-bound twin, so
-     * the two are visibly the same behaviour.
+     * ...and the DECLINE, which is what keeps the rule from refusing
+     * valid programs. It fires only when every site attributed to a
+     * closure AGREES, so two sites of different types leave the param
+     * `dyn` - the pre-#115 behaviour, values and all.
+     *
+     * ⛔ THAT IS DELIBERATELY *NOT* WHAT A DIRECTLY-BOUND CAPTURING
+     * LAMBDA DOES (the next entry: it refuses). The asymmetry is the
+     * price of a finfo set that UNDER-COLLECTS - two same-shaped
+     * closures in an array present a ONE-element set at every call
+     * site, so without uniformity both sites feed the same survivor and
+     * a program with no conflict is refused. Declining is the safe
+     * direction; the two entries sit together so the difference is on
+     * the record rather than discovered later.
      */
     {
-        "infer: a factory closure's param CONFLICTS across call sites, "
-        "exactly as a bound lambda's does (#115)",
+        "infer: a factory closure's param DECLINES when its call sites "
+        "disagree (#115 uniformity)",
         {
             "func mk(n) {",
             "  var b = n * 10;",
-            "  return func [b] (x) { return str(b) + str(x); };",
+            "  return func [b] (x) { return typestr(x) + str(b) + str(x); };",
             "}",
             "func drive(int k) { var f = mk(k); return f(1) + f(\"s\"); }",
-            "print(drive(runtime(2)));",
+            "assert(drive(runtime(2)) == \"dyn201dyn20s\");",
         },
-        &typeid(TypeMismatchEx),
     },
     {
-        "infer: the DIRECTLY-bound capturing lambda it now matches",
+        "infer: the DIRECTLY-bound capturing lambda still REFUSES it",
         {
             "func drive(int k) {",
             "  var b = k * 10;",
@@ -3686,6 +3691,27 @@ static const std::vector<test> tests =
             "print(drive(runtime(2)));",
         },
         &typeid(TypeMismatchEx),
+    },
+    /*
+     * The case that made uniformity necessary: the survivor of an
+     * under-collected set attributed from two disagreeing sites. Before
+     * uniformity this was a TypeMismatchEx on a program with no
+     * conflict in it.
+     */
+    {
+        "infer: two same-shaped closures in an array do not merge into "
+        "one false conflict (#115)",
+        {
+            "func mk_a(n) => func [n] (x) { return str(n) + str(x); };",
+            "func mk_b(n) => func [n] (x) { return str(n) + str(x); };",
+            "func drive(int k) {",
+            "  var p = [mk_a(1), mk_b(2)];",
+            "  var f = p[k % 2];",
+            "  var g = p[(k + 1) % 2];",
+            "  return f(7) + g(\"s\");",
+            "}",
+            "assert(drive(runtime(3)) == \"271s\");",
+        },
     },
 
     {
