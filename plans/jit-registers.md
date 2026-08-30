@@ -1960,3 +1960,62 @@ corpus_diff plain/--levers/--xrot/--nolowmem - **--xrot now sweeps FOUR
 rotations, and it is the net that would have caught r9 in seconds** -
 then re-run the MAXPINS sweep to price pin 8 against the projection.
 Then RSI for pin 9.
+
+
+## 2026-08-18 (m): RDI ADMITTED - pin 8 - and the starvation the
+## nolowmem lane caught the same day
+
+`XCACHE_ORDER` is `{ 10, 11, 8, 7 }`; `jit_pin_budget()` is **8**
+(MAX_CACHED 4 + MAX_XCACHED 4). The audit in (l) was sufficient: no
+site needed converting, because every one was already covered by an
+existing gate. Blast radius: 7 of 109 corpus programs changed emitted
+code, 0 failed.
+
+### ⛔ AND IT STARVED THE ELEMENT TIER OFF-ARENA
+
+`elem_scratch_plan` allocates two ISA-unconstrained roles - `idx` and
+`val` - from `CAND = { rdi, r9, r10, r11, rsi, r8 }`, and DECLINES the
+whole tier to the helper if it cannot fill both.
+
+  arena ON  : tags are imm32, so rsi and r8 are ordinary candidates.
+  arena OFF : rsi carries t_int and r8 t_float, so elem_reg_usable
+              denies BOTH; a C1 hoist takes r10/r11; pinning rdi then
+              leaves ONE candidate for TWO roles -> !ok -> every
+              hoisted compound element store falls back to the helper.
+
+Measured: `-rt` **1921/1923 off-arena in BOTH build types** ("the
+hoisted-compound arm never ran", plus a stale expectation in
+`jit_xcache_pins` at the two new rotations), **1923/1923 on-arena in
+both**. The debug+arena lane - the one run by reflex - was green
+throughout.
+
+**This is the nolowmem lane paying for itself a second time.** It was
+built (2026-08-18) because a configuration only some platforms can take
+is a configuration nobody tests; its first run found a shipped wrong
+answer in `store_dst_bool`. Its second found this, on the same day the
+register it concerns was admitted. A register-allocation change that
+looks local is not: it competes with every OTHER consumer of the
+register file, and the tightest consumer is the one in the
+configuration with the fewest registers.
+
+FIXED in the established pattern - each contributor names its own
+registers in `jit_xcache_clobber`: rdi is spendable as a pin only when
+`jit_tag_is_imm(t_int)`, i.e. only when the arena freed rsi/r8 for the
+element tier. Costs nothing in the shipping configuration.
+
+KNOWN COARSENESS, deliberate: the pin is picked once per RUN, before
+any element op is emitted, so this denies rdi off-arena for every run
+rather than only for runs containing element ops. `jit_xcache_busy`
+already scans a run for tag use; extending that scan to element ops
+would recover rdi for off-arena runs that never touch an array. Worth
+doing only if the off-arena configuration is ever measured.
+
+### Next
+
+RSI for pin 9 - but NOTE the above changes its calculus: rsi is a
+candidate the element tier RELIES on off-arena, so admitting it needs
+the same self-naming treatment, and the finer-grained
+`jit_xcache_busy`-style element scan may become the prerequisite rather
+than an optional follow-up. Re-run the MAXPINS sweep first to price
+pin 8 against the -0.63%/-2.8% projection - that measurement is the
+gate on whether pins 9+ are worth their conversion cost at all.

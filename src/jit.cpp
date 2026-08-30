@@ -6955,7 +6955,35 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * immediately. rsi/rax/rcx/rdx/rdi need the emitter to ALLOCATE its
  * scratch; freeing the type tag was necessary for that but not
  * sufficient. */
-static const uint8_t XCACHE_ORDER[] = { 10, 11, 8 };
+/*
+ * ⛔ RDI (7) JOINED 2026-08-18, #96 step 2, AND ITS OWN SITES WERE
+ * ENUMERATED AGAINST THE GATES - the r9 lesson is that "safe by the
+ * same gates as r8" is not an argument. All 20 census sites, and why a
+ * pin in rdi survives each:
+ *
+ *   emit_sync_push_native (3), emit_sync_call_inline (3) - raw scratch
+ *     outside any prologue, but jit_run_blocks_xcache denies the WHOLE
+ *     caller-saved pool to a run holding CallV/CachedCallV/CallValueV,
+ *     which are exactly the ops that emit them;
+ *   emit_ret_native (5) - its SECOND LINE is flush_cache(), so no pin
+ *     is live past it;
+ *   emit_op (1) - a prologue precedes it in-function;
+ *   frag_entry (3) - rdi is the fragment's INCOMING window argument,
+ *     consumed into rbx by the entry's last instruction. THIS IS AN
+ *     ORDERING CONSTRAINT, not a spill: every entry site loads the pins
+ *     AFTER frag_entry (verified at all three), and a pin load moved
+ *     before `mov rbx, rdi` would read the window pointer as a value;
+ *   ElemScratch's `val` default and its CAND list (2) - PREFERENCES,
+ *     and `pick` tests elem_reg_usable (hence reg_holds_pin) first;
+ *   the two accessor bodies + the enum line - definitions, not uses.
+ *
+ * Unlike rsi/r8 it carries no type singleton, so it contributes nothing
+ * to jit_xcache_clobber. It is placed LAST because take_reg scans in
+ * order and the tail member is the least exercised - MYLANG_JIT_XROT
+ * now sweeps FOUR rotations, which is the net that would have caught r9
+ * in seconds.
+ */
+static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7 };
 static const size_t MAX_XCACHED =
     sizeof(XCACHE_ORDER) / sizeof(XCACHE_ORDER[0]);
 
@@ -7122,6 +7150,35 @@ static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
         clob |= (1u << 10) | (1u << 11);     /* g_hoist.rdata/rcount */
     if (jit_run_blocks_xcache(ck, begin, end))
         clob |= xcache_mask();
+    /*
+     * ⛔ THE ELEMENT TIER NEEDS TWO FREE CANDIDATES, AND OFF-ARENA IT
+     * CAN RUN OUT (2026-08-18, found by the nolowmem lane the day rdi
+     * joined the pool). `elem_scratch_plan` allocates two roles the ISA
+     * does not fix - `idx` and `val` - from
+     * CAND = { rdi, r9, r10, r11, rsi, r8 }, and DECLINES the whole
+     * tier to the helper if it cannot fill both.
+     *
+     * With the low arena the tags are imm32, so rsi and r8 are ordinary
+     * candidates and the list is comfortable. WITHOUT it they carry
+     * t_int / t_float and elem_reg_usable denies both; a C1 hoist takes
+     * r10/r11; so pinning rdi leaves only r9 - one candidate for two
+     * roles - and every hoisted compound element store silently fell
+     * back to the helper. Watched: -rt 1921/1923 off-arena in BOTH
+     * build types ("the hoisted-compound arm never ran"), 1923/1923 on.
+     *
+     * So rdi names itself here, exactly as the hoist and the singletons
+     * do: it is spendable as a pin only when the arena made rsi/r8
+     * available to the element tier. This costs nothing in the shipping
+     * configuration and keeps the fallback one honest.
+     *
+     * NOTE this is a POOL decision, not a per-op one - the pin is
+     * picked once per run, long before an element op is emitted, so it
+     * cannot be made conditional on the op actually appearing without
+     * scanning the run (which jit_xcache_busy already does for tags;
+     * doing it for elements too is the finer-grained follow-up).
+     */
+    if (!jit_tag_is_imm(jit_layout().t_int))
+        clob |= 1u << 7;                     /* rdi: keep it for CAND */
     return clob;
 }
 

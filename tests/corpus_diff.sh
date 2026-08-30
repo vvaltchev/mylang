@@ -49,7 +49,31 @@ BIN=${1:-build-claude/dbg/mylang}
 MODE=${2:-}
 LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2 mfact cest relent norec"
 COLD_TIERS="refstore"
-XROTS="0 1 2 3"
+# ⛔ DERIVED FROM THE BINARY, NOT HARDCODED (2026-08-18). This was
+# `XROTS="0 1 2 3"`, a literal, and the whole point of the mode is that
+# `take_reg` scans the pool in preference order so its LAST member gets
+# first-choice traffic from nothing - which is how an unsafe r9 sat
+# there for a day as a shipping wrong answer. A hardcoded rotation
+# count re-creates exactly that blind spot one level up: admit a fifth
+# caller-saved register and the sweep silently stops covering the
+# newest, least-exercised member, while still printing PASS.
+#
+# It got lucky once already - the literal covered 0..3 while the pool
+# held THREE, so rotation 3 was a duplicate of 0; when rdi joined the
+# count happened to be right. Not a property to rely on twice.
+#
+# `mylang -v` reports `jit_pins N (int pin budget; xcache M ...)`; M is
+# what XROT rotates. A binary that does not report it (an older build,
+# a non-JIT platform) falls back to the literal and SAYS SO.
+XCW=$("$BIN" -v 2>/dev/null | sed -n 's/.*xcache \([0-9][0-9]*\).*/\1/p')
+if [ -n "$XCW" ] && [ "$XCW" -gt 0 ] 2>/dev/null; then
+  XROTS=$(seq 0 $((XCW - 1)) | tr '\n' ' ')
+else
+  echo "warning: '$BIN' does not report its xcache width; --xrot is" >&2
+  echo "         falling back to a fixed 0..3 sweep, which may NOT" >&2
+  echo "         cover every pool member." >&2
+  XROTS="0 1 2 3"
+fi
 
 progs() {
   ls tests/functional/*.my 2>/dev/null
