@@ -2059,6 +2059,15 @@ struct Emitter {
         u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7)));
         u8(k);
     }
+    /* test <a64>, <b64> - replaces the hand-emitted `test r9, r9` the
+     * element bounds check used, so its register is an ARGUMENT (#96). */
+    void test_rr(uint8_t a, uint8_t b)
+    {
+        u8(static_cast<uint8_t>(0x48 | (b >= 8 ? 0x04 : 0)
+                                | (a >= 8 ? 0x01 : 0)));
+        u8(0x85);
+        u8(static_cast<uint8_t>(0xC0 | ((b & 7) << 3) | (a & 7)));
+    }
     void cmp_rr(uint8_t dst, uint8_t src)
     {
         u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 0x04 : 0)
@@ -7521,7 +7530,7 @@ pick_cached_slots(const Chunk &ck, size_t begin,
         case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
         case OpCode::OrdCharV:      /* same shape: idx cache-aware (a VALUE
                                      * arg to jit_ord_char), base/dst leas */
-            /* the INDEX is read cache-aware (load_index_r9), so it stays a
+            /* the INDEX is read cache-aware (load_index_idx), so it stays a
              * countable int use - it is the loop counter, the slot most worth
              * pinning. base is read in memory. LoadElemFloat's dst is
              * written via emit_float_store -> a C2a float candidate; the
@@ -7772,7 +7781,7 @@ pick_cached_slots(const Chunk &ck, size_t begin,
             break;
         case OpCode::LoadElemBool:
             /* INLINED (no helper); the index is read cache-aware
-             * (load_index_r9), so it stays a countable int use like
+             * (load_index_idx), so it stays a countable int use like
              * LoadElemInt's. */
             bad(in.target); bad(in.target2);
             if (!in.a_is_lit()) usei(in.a_slot());
@@ -7815,7 +7824,7 @@ pick_cached_slots(const Chunk &ck, size_t begin,
             break;
         case OpCode::JumpUnlessElemInt:
             /* reads the base (an array ref) from memory; the INDEX goes through
-             * the cache-aware load_index_r9, so it stays a countable int use -
+             * the cache-aware load_index_idx, so it stays a countable int use -
              * it is the loop counter. Nothing is written. */
             bad(in.target2);
             if (!in.a_is_lit()) usei(in.a_slot());
@@ -8976,25 +8985,34 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
  * memory would force the index to be disqualified from pinning for the whole
  * fragment - which is exactly how a hot loop counter lost its register once
  * runs began merging (mov_rr encodes r9 as a destination directly). */
-/* Load a SLOT's int payload into r9, cache-aware. */
-static void load_slot_r9(Emitter &e, int slot)
+/*
+ * Load a SLOT's int payload into the INDEX register, cache-aware.
+ *
+ * ⛔ #96: `ir` is a PARAMETER, and the pair used to be called
+ * `load_slot_r9` / `load_index_r9`. That naming is the sixth
+ * audit-table shape - the register lives in the METHOD NAME, where no
+ * `grep R9` can see it - and r9 is the register that shipped a wrong
+ * answer for a day precisely because a census could not see its ~80
+ * element-tier sites. Every caller now says which register it means.
+ */
+static void load_slot_idx(Emitter &e, uint8_t ir, int slot)
 {
-    e.scratch(R9);
+    e.scratch(ir);
     const int cr = e.creg(slot);
     if (cr >= 0)
-        e.mov_rr(R9, static_cast<uint8_t>(cr));
+        e.mov_rr(ir, static_cast<uint8_t>(cr));
     else
-        e.load(R9, slot_addr(slot).payload);
+        e.load(ir, slot_addr(slot).payload);
 }
 
-static void load_index_r9(Emitter &e, const Instr &in)
+static void load_index_idx(Emitter &e, uint8_t ir, const Instr &in)
 {
-    e.scratch(R9);
+    e.scratch(ir);
     if (in.a_is_lit()) {
-        e.movabs(R9, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(ir, static_cast<uint64_t>(in.a_lit()));
         return;
     }
-    load_slot_r9(e, in.a_slot());
+    load_slot_idx(e, ir, in.a_slot());
 }
 
 /* The index bounds check with the NEGATIVE-index WRAP on the COLD side
@@ -9007,30 +9025,30 @@ static void load_index_r9(Emitter &e, const Instr &in)
  * wrapped element, a REAL pre-existing divergence) + a re-check; a
  * non-negative or still-negative-after-wrap index RAISES OutOfBounds (this
  * pc's caret), matching the interpreter's `idx < 0 ||` check. */
-static void emit_elem_bounds_or_wrap(Emitter &e, uint32_t pc,
+static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint32_t pc,
                                     std::vector<size_t> *slows = nullptr)
 {
-    e.scratch(R9);            /* the index lives in r9 */
+    e.scratch(ir);            /* the index register */
     if (slows) {
         /* #56: DECLINE out-of-range (a negative wrap or a genuine OOB) to
          * the caller's slow tier - the interpreter core does the wrap and
          * throws CONVEYED (the raise path's loc_at would resolve against a
          * DELETED run's collapsed pcs). */
-        e.cmp_rr(R9, RDX);
+        e.cmp_rr(ir, RDX);
         slows->push_back(e.j32(0x73));       /* jae -> slow */
         return;
     }
-    e.cmp_rr(R9, RDX);
+    e.cmp_rr(ir, RDX);
     const size_t j_load = e.j32(0x72);       /* jb: in range -> the load */
     /* cold: unsigned out-of-range - negative (wrap) or genuine OOB */
-    e.u8(0x4D); e.u8(0x85); e.u8(0xC9);      /* test r9, r9 */
+    e.test_rr(ir, ir);
     {
         const size_t j_wrap = e.j8(0x78);    /* js -> the wrap */
         emit_raise(e, JR_OOB, pc);           /* non-negative OOB */
         e.patch8(j_wrap, e.pos());
     }
-    e.u8(0x49); e.u8(0x01); e.u8(0xD1);      /* add r9, rdx (idx += size) */
-    e.cmp_rr(R9, RDX);
+    e.add_rr(ir, RDX);                       /* idx += size */
+    e.cmp_rr(ir, RDX);
     raise_unless(e, 0x72, JR_OOB, pc);       /* doubly-negative -> OOB */
     e.patch32_here(j_load);
 }
@@ -9041,7 +9059,8 @@ static void emit_elem_bounds_or_wrap(Emitter &e, uint32_t pc,
  * check; cold negative wrap / OOB raise), else the element lands in RAX.
  * Shared by every flat int/bool element reader so the semantics cannot
  * drift. */
-static void emit_flat_int_tail(Emitter &e, uint32_t pc, bool bools,
+static void emit_flat_int_tail(Emitter &e, uint8_t ir, uint32_t pc,
+                               bool bools,
                                const Instr *idx_in, int idx_slot,
                                std::vector<size_t> *slows = nullptr)
 {
@@ -9052,14 +9071,14 @@ static void emit_flat_int_tail(Emitter &e, uint32_t pc, bool bools,
     if (!bools)
         e.sar_rdx_3();
     if (idx_in)
-        load_index_r9(e, *idx_in);
+        load_index_idx(e, ir, *idx_in);
     else
-        load_slot_r9(e, idx_slot);
-    emit_elem_bounds_or_wrap(e, pc, slows);
+        load_slot_idx(e, ir, idx_slot);
+    emit_elem_bounds_or_wrap(e, ir, pc, slows);
     if (bools)
-        e.load_elem_zx8(RAX, RCX, R9);                  /* movzx eax,[rcx+r9] */
+        e.load_elem_zx8(RAX, RCX, ir);          /* movzx eax,[rcx+ir] */
     else
-        e.load_elem_q(RAX, RCX, R9);                   /* mov rax,[rcx+r9*8] */
+        e.load_elem_q(RAX, RCX, ir);            /* mov rax,[rcx+ir*8] */
 }
 
 /*
@@ -9086,7 +9105,7 @@ static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc,
     if (const JitHoist *H = slows
             ? hoist_match(in.target2, in.elem_bool_hint() ? 3 : 0)
             : nullptr) {
-        load_index_r9(e, in);
+        load_index_idx(e, R9, in);
         e.cmp_rr(R9, H->rcount);
         slows->push_back(e.j32(0x73));           /* jae -> slow */
         if (H->kind == 3)
@@ -9116,11 +9135,11 @@ static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc,
     decline(0x74, 0x75);                     /* je (bools) else decline */
     /* flat bools: 1-byte elements, so the count is the raw pointer difference
      * (no sar) and the load is a movzx. */
-    emit_flat_int_tail(e, pc, /*bools=*/true, &in, -1, slows);
+    emit_flat_int_tail(e, R9, pc, /*bools=*/true, &in, -1, slows);
     const size_t j_done = e.j32(0xEB);
     /* flat ints */
     e.patch32_here(j_ints);
-    emit_flat_int_tail(e, pc, /*bools=*/false, &in, -1, slows);
+    emit_flat_int_tail(e, R9, pc, /*bools=*/false, &in, -1, slows);
     e.patch32_here(j_done);
 }
 
@@ -9495,7 +9514,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             slows.push_back(e.j32(0x74));        /* je (== 0.0) */
             e.patch8(j_nan, e.pos());
         }
-        load_index_r9(e, in);
+        load_index_idx(e, R9, in);
         e.cmp_rr(sc.idx, H->rcount);
         slows.push_back(e.j32(0x73));            /* jae -> the helper */
         if (compound && divmod && !in.b_is_lit() && !is_float) {
@@ -9689,7 +9708,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.mov_rdx_rax(L.data_off + 8);
         e.sub_rdx_rcx();
         e.sar_rdx_3();
-        load_index_r9(e, in);
+        load_index_idx(e, R9, in);
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
         bump();
@@ -9733,7 +9752,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             e.mov_rdx_rax(L.data_off + 8);
             e.sub_rdx_rcx();
             e.sar_rdx_3();
-            load_index_r9(e, in);
+            load_index_idx(e, R9, in);
             e.cmp_rr(sc.idx, sc.count);
             decline_if(0x73);                    /* OOB/neg -> helper */
             e.u8(0x4A); e.u8(0x8B); e.u8(0x14); e.u8(0xC9);
@@ -9748,7 +9767,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.mov_rdx_rax(L.data_off + 8);
         e.sub_rdx_rcx();
         e.sar_rdx_3();
-        load_index_r9(e, in);
+        load_index_idx(e, R9, in);
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
         bump();
@@ -9765,7 +9784,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.mov_rcx_rax(L.data_off);
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
-    load_index_r9(e, in);
+    load_index_idx(e, R9, in);
     e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));        /* jae: negative OR >= count */
     bump();
@@ -9780,7 +9799,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
     e.sar_rdx_3();
-    load_index_r9(e, in);
+    load_index_idx(e, R9, in);
     e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));
     bump();
@@ -9799,7 +9818,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.patch32_here(j);
     emit_call_prologue(e);
     e.lea_rdi(base_off);
-    load_index_r9(e, in);
+    load_index_idx(e, R9, in);
     e.mov_rr(RSI, sc.idx);
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
@@ -9866,7 +9885,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     const JitHoist *H2 = hoist_match(in.target2, 2);
     const bool hoisted = H2 != nullptr;
     if (hoisted) {
-        load_slot_r9(e, in.a_dual_lo());
+        load_slot_idx(e, R9, in.a_dual_lo());
         e.imul_rr_imm8(R9, R9, static_cast<uint8_t>(sizeof(LValue)));
         e.cmp_rr(R9, H2->rcount);               /* vs the BYTE length */
         slows.push_back(e.j32(0x73));          /* jae: negative OR OOB */
@@ -9887,7 +9906,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     e.mov_rcx_rax(L.data_off);
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();                           /* rdx = byte length */
-    load_slot_r9(e, in.a_dual_lo());           /* the outer index (slot) */
+    load_slot_idx(e, R9, in.a_dual_lo());           /* the outer index (slot) */
     e.imul_rr_imm8(R9, R9, static_cast<uint8_t>(sizeof(LValue)));
     e.cmp_rr(R9, RDX);
     slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
@@ -9909,7 +9928,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
         if (in.b_is_lit())
             e.movabs(R9, static_cast<uint64_t>(in.b_lit()));
         else
-            load_slot_r9(e, in.b_slot());
+            load_slot_idx(e, R9, in.b_slot());
     };
     const auto count_and_idx = [&](bool bytes) {
         e.mov_rcx_rax(L.data_off);
@@ -9986,7 +10005,7 @@ static void emit_load_elem2_inline(Emitter &e, const Chunk &ck,
     decline_ne();
     e.mov_rcx_rax(L.data_off);                 /* data, before rax dies */
     e.mov_edx_slot(base.payload + L.arr_len_off);
-    load_slot_r9(e, in.a_dual_lo());
+    load_slot_idx(e, R9, in.a_dual_lo());
     e.cmp_rr(R9, RDX);
     slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
     e.mov_eax_slot(base.payload + L.arr_off_off);
@@ -10126,7 +10145,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     e.mov_rcx_rax(L.data_off);
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
-    load_slot_r9(e, in.a_dual_lo());
+    load_slot_idx(e, R9, in.a_dual_lo());
     e.imul_rr_imm8(sc.idx, sc.idx, static_cast<uint8_t>(sizeof(LValue)));
     e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
@@ -10164,7 +10183,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         e.sub_rdx_rcx();
         if (!bytes)
             e.sar_rdx_3();
-        load_slot_r9(e, in.b_slot());
+        load_slot_idx(e, R9, in.b_slot());
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
     };
@@ -10267,7 +10286,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         e.u8(0x48); e.u8(0x85); e.u8(0xFF);      /* test rdi,rdi */
         decline_if(0x74);                        /* 0 -> the helper */
         e.mov_rdx_rax(L.data_off);               /* rdx = data */
-        load_slot_r9(e, in.b_slot());
+        load_slot_idx(e, R9, in.b_slot());
         e.u8(0x4A); e.u8(0x8D); e.u8(0x14); e.u8(0xCA);
                                                  /* lea rdx,[rdx+r9*8] */
         e.u8(0x48); e.u8(0x3B); e.u8(0x50);
@@ -10313,7 +10332,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     emit_call_prologue(e);
     /* &row (still live here) */
     e.mov_rr(sc.val, sc.data);
-    load_slot_r9(e, in.b_slot());
+    load_slot_idx(e, R9, in.b_slot());
     e.mov_rr(RSI, sc.idx);
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
@@ -11028,7 +11047,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const JitHoist *H = hoist_match(in.target2, hoist_want);
         const bool hoisted = H != nullptr;
         if (hoisted) {
-            load_index_r9(e, in);
+            load_index_idx(e, R9, in);
             e.cmp_rr(R9, H->rcount);
             j_slows.push_back(e.j32(0x73));      /* jae -> slow */
             if (is_float) {
@@ -11057,7 +11076,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.mov_rdx_rax(L.data_off + 8);       /* rdx = _M_finish */
             e.sub_rdx_rcx();
             e.sar_rdx_3();                        /* rdx = element count */
-            load_index_r9(e, in);                 /* cache-aware index */
+            load_index_idx(e, R9, in);                 /* cache-aware index */
             e.cmp_rr(R9, RDX);
             j_slows.push_back(e.j32(0x73));      /* jae (wrap/OOB) -> slow */
             /* movsd xmm0,[rcx+r9*8] */
@@ -11073,7 +11092,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.mov_rcx_rax(L.data_off);
             e.mov_rdx_rax(L.data_off + 8);
             e.sub_rdx_rcx();
-            load_index_r9(e, in);
+            load_index_idx(e, R9, in);
             e.cmp_rr(R9, RDX);
             j_slows.push_back(e.j32(0x73));
             e.load_elem_zx8(RAX, RCX, R9);
@@ -11083,7 +11102,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.mov_rdx_rax(L.data_off + 8);
             e.sub_rdx_rcx();
             e.sar_rdx_3();
-            load_index_r9(e, in);
+            load_index_idx(e, R9, in);
             e.cmp_rr(R9, RDX);
             j_slows.push_back(e.j32(0x73));
             e.load_elem_q(RAX, RCX, R9);
@@ -11105,7 +11124,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                        is_float ? L.kind_floats : L.kind_ints);
         j_slows.push_back(e.j32(0x75));
         e.mov_edx_slot(base.payload + L.arr_len_off);   /* count = len */
-        load_index_r9(e, in);
+        load_index_idx(e, R9, in);
         e.cmp_rr(R9, RDX);
         j_slows.push_back(e.j32(0x73));          /* jae: negative OR OOB */
         e.mov_rcx_rax(L.data_off);               /* rcx = vector data */
@@ -12558,7 +12577,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.sub_rdx_rcx();                         /* rdx = count (1B elems,
                                                       * so NO sar - unlike the
                                                       * 8-byte int/float path) */
-            load_index_r9(e, in);                    /* cache-aware index */
+            load_index_idx(e, R9, in);                    /* cache-aware index */
             e.cmp_rr(R9, RDX);
             e.bail_unless(0x72, pc);                 /* jb: unsigned in-range */
             /* movzx eax,[rcx+r9] */
@@ -13991,7 +14010,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x48); e.u8(0x39); e.u8(0xC8);               /* cmp rax, rcx */
         const size_t j_fall = e.j32(cc_for(cc_negate(in.aop)).short_op);
         if (hoisted) {
-            load_slot_r9(e, in.target2);      /* the stepped counter */
+            load_slot_idx(e, R9, in.target2);      /* the stepped counter */
             e.cmp_rr(R9, H->rcount);
             read_slows.push_back(e.j32(0x73));
             if (H->kind == 3)
@@ -14003,11 +14022,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         e.load(RAX, base.payload);            /* rax = shobj */
         e.cmp_byte_rax(L.kind_off, L.kind_bools);
         const size_t j_bools = e.j32(0x74);
-        emit_flat_int_tail(e, pc, /*bools=*/false, nullptr, in.target2,
+        emit_flat_int_tail(e, R9, pc, /*bools=*/false, nullptr, in.target2,
                            &read_slows);
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_bools);
-        emit_flat_int_tail(e, pc, /*bools=*/true, nullptr, in.target2,
+        emit_flat_int_tail(e, R9, pc, /*bools=*/true, nullptr, in.target2,
                            &read_slows);
         e.patch32_here(j_done);
         }
