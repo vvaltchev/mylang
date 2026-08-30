@@ -61,6 +61,15 @@ unsigned long g_jit_boxed_slow_f = 0;  /* H6 reach: ... of them float-float */
 unsigned long g_jit_boxed_slow_m = 0;  /* H6: ... of them MIXED */
 unsigned long g_jit_store_fast = 0;    /* #92: inline element-STORE runs */
 unsigned long g_jit_hoist_rmw = 0;     /* C1e: hoisted-compound stores */
+/* #96: the element tier's scratch plan FAILED - no free register for
+ * `idx`/`val`, so the store declined to the helper. An EMIT-time
+ * counter, and it exists because that decline is otherwise completely
+ * silent: the answer stays right and only the speed changes, which is
+ * the exact shape that hid the off-arena starvation for a day. */
+unsigned long g_jit_elem_noreg = 0;
+/* #96: ... and the reservation that PREVENTS it - one bump per pool
+ * member withheld from the pin pick so the tier keeps two candidates. */
+unsigned long g_jit_elem_reserve = 0;
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
@@ -6459,6 +6468,23 @@ struct HoistRegion {
     int uses2 = 0;
 };
 
+/*
+ * C1: the register pair a hoisted region's (data, count) live in, and
+ * the mask form of the same fact.
+ *
+ * ⛔ ONE DEFINITION, because THREE places assert it and a boolean `&&`
+ * over a register family is the fifth audit-table shape (CLAUDE.md):
+ * the region setup assigns from it, `jit_xcache_clobber` denies exactly
+ * these two to the pin pool while a region is live, and the element
+ * tier's `elem_scratch_reserve` has to count them OUT of its candidate
+ * list at pool-pick time - before g_hoist.active is set, so it cannot
+ * read the region. Two of those three used to spell `10` and `11` as
+ * literals, which is fine right up until the pair moves.
+ */
+static const uint8_t HOIST_RDATA = 10, HOIST_RCOUNT = 11;
+static const uint32_t HOIST_REGS_MASK =
+    (1u << HOIST_RDATA) | (1u << HOIST_RCOUNT);
+
 static std::vector<HoistRegion>
 jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
                const std::vector<std::pair<size_t, size_t>> &entries)
@@ -6761,6 +6787,13 @@ void jit_stats_report()
         { "hoist",            &g_jit_hoist },
         { "hoist2",           &g_jit_hoist2 },
         { "hoist_rmw",        &g_jit_hoist_rmw },
+        /* #96: the two halves of the element tier's REGISTER supply -
+         * how often the plan ran out (elem_noreg, an emit-time decline
+         * to the helper) and how often the pool gave a register back to
+         * prevent that (elem_reserve). A nonzero elem_noreg is the
+         * signal that the reservation is too weak for some shape. */
+        { "elem_noreg",       &g_jit_elem_noreg },
+        { "elem_reserve",     &g_jit_elem_reserve },
         /* #94: the BORROW - a reference argument bound with no retain
          * (arg_borrow) vs one the analysis cleared whose value turned
          * out to be a slice (arg_borrow_slice, the one dynamic
@@ -6983,7 +7016,43 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * now sweeps FOUR rotations, which is the net that would have caught r9
  * in seconds.
  */
-static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7 };
+/*
+ * ⛔ RSI (6) JOINED 2026-08-18, #96 step 2, pin 9 - AND, LIKE RDI, ITS
+ * OWN 24 CENSUS SITES WERE ENUMERATED AGAINST THE GATES. In three
+ * groups:
+ *
+ *   the t_int SINGLETON (12: emit_type_tags, emit_call_epilogue x2,
+ *     store_dst x2, emit_float_load, emit_store_elem2_inline x5,
+ *     emit_op) - live ONLY off-arena, where jit_xcache_busy above
+ *     claims rsi outright. Every one of them reaches rsi through
+ *     store_type_tag / cmp_reg_tag / cmp_rax_tag, the seams that take
+ *     the register as an ARGUMENT, so the on-arena form is an imm32
+ *     that names no register at all;
+ *   RAW SCRATCH (10: emit_sync_push_native x6, emit_sync_call_inline
+ *     x3, emit_ret_native) - the same emitters rdi's audit cleared, by
+ *     the same gates: jit_run_blocks_xcache denies the whole pool to a
+ *     run containing CallV/CachedCallV/CallValueV, which are exactly
+ *     the ops that emit the first two, and emit_ret_native's SECOND
+ *     LINE is flush_cache();
+ *   NON-USES (2): ELEM_CAND's own list and elem_reg_usable_nopin's own
+ *     guard.
+ *
+ * ⛔ TWO SITES HAD TO BE FIXED FIRST, and neither was in that tidy
+ * list's spirit - both were code that had quietly stopped being true:
+ *   - emit_store_elem staged its helper arguments into rsi/rdx BEFORE
+ *     emit_call_prologue, the only site in the file to invert the
+ *     order. A pin there is overwritten and then SPILLED, so the value
+ *     is lost with nothing to restore it. Fixed by emitting the
+ *     prologue first, as every other call site does;
+ *   - emit_op's boxed arm did `movabs rsi, t_int` unconditionally to
+ *     feed store_dst - dead code since the tag became an imm32, and a
+ *     pin clobber. Gated.
+ *
+ * PLACED LAST for the same reason rdi was: take_reg scans in order, so
+ * the tail is the least-exercised slot, and MYLANG_JIT_XROT now sweeps
+ * FIVE rotations to give it first-choice traffic.
+ */
+static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6 };
 static const size_t MAX_XCACHED =
     sizeof(XCACHE_ORDER) / sizeof(XCACHE_ORDER[0]);
 
@@ -7056,6 +7125,30 @@ static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
     if (run_needs_float_tag(ck, begin, end)
             && !jit_tag_is_imm(jit_layout().t_float))
         busy |= 1u << 8;
+    /*
+     * ⛔ rsi's twin, and it is deliberately UNCONDITIONAL where r8's is
+     * gated - the asymmetry is real, not an oversight.
+     *
+     * `emit_type_tags` materialises t_float into r8 only when
+     * `e.float_tag_live`, but it materialises t_int into rsi for EVERY
+     * fragment entry off-arena: there is no int analogue of that gate,
+     * because the int tag is what the ubiquitous `store_dst` writes.
+     * So off-arena rsi holds the singleton in every run and no run
+     * predicate could make it spendable; asking one would be a
+     * more-precise-looking answer to a question with a blunt answer.
+     *
+     * On-arena the tag is an imm32 and nothing materialises it, which
+     * is what makes rsi a pin candidate at all. Its remaining raw
+     * scratch is confined to the SAME four emitters rdi's audit
+     * enumerated - emit_sync_push_native and emit_sync_call_inline
+     * (jit_run_blocks_xcache denies the whole pool to a run with a
+     * MyLang call), emit_ret_native (flush_cache is its second line),
+     * and emit_op's boxed int-arith arm, whose `movabs rsi, t_int` is
+     * now correctly gated to the fallback path where this line has
+     * already claimed rsi anyway.
+     */
+    if (!jit_tag_is_imm(jit_layout().t_int))
+        busy |= 1u << 6;                     /* rsi holds t_int */
     return busy;
 }
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
@@ -7100,6 +7193,16 @@ static bool jit_run_blocks_xcache(const Chunk &ck, size_t begin, size_t end)
         }
     return false;
 }
+
+/*
+ * #96: the element tier's claim on the pin pool. DECLARED here because
+ * the pool pick must honour it; DEFINED with the tier itself (search
+ * ELEM_CAND), so the candidate list and the usability rules have
+ * exactly one home and cannot drift from what the emitter asks.
+ */
+static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
+                                     size_t end, bool has_hoist,
+                                     uint32_t clob);
 
 /*
  * #96: WHICH caller-saved pool registers this RUN may not spend - a
@@ -7147,38 +7250,49 @@ static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
         return xcache_mask();
     uint32_t clob = jit_xcache_busy(ck, begin, end);
     if (has_hoist)
-        clob |= (1u << 10) | (1u << 11);     /* g_hoist.rdata/rcount */
+        clob |= HOIST_REGS_MASK;             /* g_hoist.rdata/rcount */
     if (jit_run_blocks_xcache(ck, begin, end))
         clob |= xcache_mask();
     /*
-     * ⛔ THE ELEMENT TIER NEEDS TWO FREE CANDIDATES, AND OFF-ARENA IT
-     * CAN RUN OUT (2026-08-18, found by the nolowmem lane the day rdi
-     * joined the pool). `elem_scratch_plan` allocates two roles the ISA
-     * does not fix - `idx` and `val` - from
-     * CAND = { rdi, r9, r10, r11, rsi, r8 }, and DECLINES the whole
-     * tier to the helper if it cannot fill both.
+     * ⛔ THE ELEMENT TIER NEEDS TWO FREE CANDIDATES, AND THE POOL MUST
+     * LEAVE IT TWO (the general form, 2026-08-18).
      *
-     * With the low arena the tags are imm32, so rsi and r8 are ordinary
-     * candidates and the list is comfortable. WITHOUT it they carry
-     * t_int / t_float and elem_reg_usable denies both; a C1 hoist takes
-     * r10/r11; so pinning rdi leaves only r9 - one candidate for two
-     * roles - and every hoisted compound element store silently fell
-     * back to the helper. Watched: -rt 1921/1923 off-arena in BOTH
-     * build types ("the hoisted-compound arm never ran"), 1923/1923 on.
+     * `elem_scratch_plan` allocates two roles the ISA does not fix -
+     * `idx` and `val` - from ELEM_CAND = { rdi, r9, r10, r11, rsi, r8 },
+     * and DECLINES the WHOLE inline store tier to the helper if it
+     * cannot fill both. Every pin the pool spends out of that list is
+     * one candidate fewer.
      *
-     * So rdi names itself here, exactly as the hoist and the singletons
-     * do: it is spendable as a pin only when the arena made rsi/r8
-     * available to the element tier. This costs nothing in the shipping
-     * configuration and keeps the fallback one honest.
+     * ⛔ IT WAS A PER-REGISTER RULE FOR ONE DAY AND THAT DOES NOT
+     * SCALE. The first version read `if (!tag_is_imm(t_int)) clob |=
+     * rdi`, written when the nolowmem lane caught rdi's admission
+     * starving the tier: off-arena rsi and r8 carry the singletons and
+     * elem_reg_usable denies both, a C1 hoist takes r10/r11, so pinning
+     * rdi left r9 alone against two roles and every hoisted compound
+     * store fell silently back to the helper (-rt 1921/1923 off-arena
+     * in both build types, 1923/1923 on).
      *
-     * NOTE this is a POOL decision, not a per-op one - the pin is
-     * picked once per run, long before an element op is emitted, so it
-     * cannot be made conditional on the op actually appearing without
-     * scanning the run (which jit_xcache_busy already does for tags;
-     * doing it for elements too is the finer-grained follow-up).
+     * That rule is correct and useless: it names ONE register, and #96
+     * puts five more into this pool. rsi is the next one, and it is
+     * ITSELF a candidate - so the ad-hoc form would have to grow a
+     * clause per admission, each one re-deriving the arithmetic, which
+     * is how a family of `&&`s becomes an audit table nobody re-reads.
+     *
+     * The general rule instead COUNTS: take the candidates this run can
+     * actually use (arena state, float-tag liveness, the hoist pair -
+     * `elem_reg_usable_nopin`, the same predicate the emitter asks),
+     * separate the ones no pin can ever take from the ones this pool
+     * could spend, and withhold spendable members - LEAST-PREFERRED
+     * FIRST, so the withholding costs the pool its cheapest register -
+     * until ELEM_ALLOC_ROLES of them are guaranteed to survive.
+     *
+     * It is a POOL decision, so it is conditioned on the RUN actually
+     * containing an op that takes a plan (`run_has_elem_scratch`);
+     * a run with no element store pays nothing. Reserving for a tier
+     * that never appears is exactly the coarseness the boolean
+     * `xcache_ok` was replaced for.
      */
-    if (!jit_tag_is_imm(jit_layout().t_int))
-        clob |= 1u << 7;                     /* rdi: keep it for CAND */
+    clob |= elem_scratch_reserve(ck, begin, end, has_hoist, clob);
     return clob;
 }
 
@@ -9105,6 +9219,20 @@ struct ElemScratch {
 };
 
 /*
+ * The candidates for the two ALLOCATABLE roles, and how many of them
+ * must survive the pin pick.
+ *
+ * ⛔ ONE LIST, read from two ends. `elem_scratch_plan` picks from it at
+ * EMIT time; `elem_scratch_reserve` counts it at POOL-PICK time, long
+ * before any element op is emitted, to decide how many pool members the
+ * pin allocator may spend. A second copy of these six names is the
+ * audit-table trap in miniature - the two would agree until the day a
+ * register is added to one of them.
+ */
+static const uint8_t ELEM_CAND[] = { RDI, R9, R10, R11, RSI, R8 };
+static const size_t ELEM_ALLOC_ROLES = 2;      /* idx and val */
+
+/*
  * May this register be used as element-tier scratch right now?
  *
  * The list is deliberately explicit rather than "anything not pinned",
@@ -9119,22 +9247,129 @@ struct ElemScratch {
  *   - r10/r11 hold the C1 hoisted (data, count) while a loop region is
  *     emitting.
  */
-static bool elem_reg_usable(const Emitter &e, uint8_t r)
+/*
+ * The half of the answer that does NOT depend on a pin - split out
+ * because the POOL PICK must ask exactly this question before any pin
+ * exists (see elem_scratch_reserve), and asking it with a second copy
+ * of these rules is how the two drift.
+ *
+ * `hoist_claimed` is a mask rather than the g_hoist globals for the
+ * same reason: at pool-pick time the region has not been entered yet,
+ * so the caller supplies HOIST_REGS_MASK from its own `has_hoist`.
+ */
+static bool elem_reg_usable_nopin(uint8_t r, bool float_tag_live,
+                                  uint32_t hoist_claimed)
 {
     if (r == RBX || r == 4 /*rsp*/ || r == 5 /*rbp*/)
         return false;
-    if (e.reg_holds_pin(r))
-        return false;
     if (r == RSI && !jit_tag_is_imm(jit_layout().t_int))
         return false;
-    if (r == R8 && e.float_tag_live
+    if (r == R8 && float_tag_live
             && !jit_tag_is_imm(jit_layout().t_float))
         return false;
-    if (g_hoist.active && (r == g_hoist.rdata || r == g_hoist.rcount))
-        return false;
-    if (g_hoist2.active && (r == g_hoist2.rdata || r == g_hoist2.rcount))
+    if (hoist_claimed & (1u << r))
         return false;
     return true;
+}
+
+/* the registers a LIVE hoist region is holding at this instant */
+static uint32_t hoist_claimed_mask()
+{
+    uint32_t m = 0;
+    if (g_hoist.active)
+        m |= (1u << g_hoist.rdata) | (1u << g_hoist.rcount);
+    if (g_hoist2.active)
+        m |= (1u << g_hoist2.rdata) | (1u << g_hoist2.rcount);
+    return m;
+}
+
+static bool elem_reg_usable(const Emitter &e, uint8_t r)
+{
+    if (e.reg_holds_pin(r))
+        return false;
+    return elem_reg_usable_nopin(r, e.float_tag_live,
+                                 hoist_claimed_mask());
+}
+
+/*
+ * Does this run contain an op whose emitter takes an ElemScratch?
+ *
+ * ⛔ IT IS SELF-CHECKING, and it has to be: an op missing from this
+ * list loses its inline tier SILENTLY (the answer stays right, only the
+ * speed changes), which is precisely the failure the reservation exists
+ * to prevent - so a stale list here would defeat its own purpose.
+ * `elem_scratch_plan` therefore ML_CHECKs its caller's opcode against
+ * it, so a third emitter that takes a plan without registering its op
+ * aborts BY NAME in a debug build instead of quietly declining.
+ */
+static bool op_uses_elem_scratch(OpCode op)
+{
+    switch (op) {
+    case OpCode::StoreElemInt:
+    case OpCode::StoreElemFloat:      /* emit_store_elem -> #92 inline */
+    case OpCode::StoreElem2V:         /* #95 nested inline            */
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool run_has_elem_scratch(const Chunk &ck, size_t begin, size_t end)
+{
+    for (size_t p = begin; p < end; p++)
+        if (op_uses_elem_scratch(ck.code[p].op))
+            return true;
+    return false;
+}
+
+/*
+ * THE RESERVATION (declared up by jit_xcache_clobber, which states why).
+ *
+ * Withhold pool members until ELEM_ALLOC_ROLES candidates are
+ * GUARANTEED to survive the pin pick. A candidate survives if no pin
+ * can take it - either it is outside the caller-saved pool entirely
+ * (r9 today, and the callee-saved four are not candidates at all) or
+ * something already clobbered it.
+ *
+ * Withholding walks XCACHE_ORDER BACKWARDS: `take_reg` scans it
+ * forwards, so the tail member is handed out only to a run at the
+ * maximum pin count and is the cheapest one to give back. (Note it is
+ * the UNROTATED order - MYLANG_JIT_XROT permutes who is handed out
+ * first for coverage, and letting it also permute which register is
+ * reserved would make the rotation change emitted code, which is
+ * exactly what that axis must not do: every rotation must produce the
+ * same output.)
+ */
+static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
+                                     size_t end, bool has_hoist,
+                                     uint32_t clob)
+{
+    if (!run_has_elem_scratch(ck, begin, end))
+        return 0;
+    const bool ftl = run_needs_float_tag(ck, begin, end);
+    const uint32_t claimed = has_hoist ? HOIST_REGS_MASK : 0u;
+    const uint32_t pool = xcache_mask();
+    uint32_t spendable = 0;
+    size_t survivors = 0;
+    for (const uint8_t c : ELEM_CAND) {
+        if (!elem_reg_usable_nopin(c, ftl, claimed))
+            continue;
+        if ((pool & (1u << c)) && !(clob & (1u << c)))
+            spendable |= 1u << c;
+        else
+            survivors++;                 /* no pin can reach it */
+    }
+    uint32_t add = 0;
+    for (size_t i = MAX_XCACHED;
+         i-- > 0 && survivors < ELEM_ALLOC_ROLES; ) {
+        const uint8_t r = XCACHE_ORDER[i];
+        if (!(spendable & (1u << r)))
+            continue;
+        add |= 1u << r;
+        survivors++;
+        g_jit_elem_reserve++;
+    }
+    return add;
 }
 
 /*
@@ -9155,9 +9390,13 @@ static bool elem_reg_usable(const Emitter &e, uint8_t r)
  * emitting into a register that holds a hot local, which is a silent
  * wrong answer (it shipped, as r9, for a day).
  */
-static ElemScratch elem_scratch_plan(const Emitter &e)
+static ElemScratch elem_scratch_plan(const Emitter &e, OpCode op)
 {
-    static const uint8_t CAND[] = { RDI, R9, R10, R11, RSI, R8 };
+    ML_CHECK_MSG(op_uses_elem_scratch(op),
+                 "an emitter took an ElemScratch for an opcode "
+                 "op_uses_elem_scratch does not list - the pin pool's "
+                 "reservation cannot see this run, so the tier will "
+                 "decline silently whenever the pool is full (#96)");
     ElemScratch sc;
     uint32_t taken = (1u << sc.obj) | (1u << sc.data) | (1u << sc.count);
     auto pick = [&](uint8_t preferred) -> uint8_t {
@@ -9165,7 +9404,7 @@ static ElemScratch elem_scratch_plan(const Emitter &e)
             taken |= 1u << preferred;
             return preferred;
         }
-        for (uint8_t c : CAND)
+        for (uint8_t c : ELEM_CAND)
             if (!(taken & (1u << c)) && elem_reg_usable(e, c)) {
                 taken |= 1u << c;
                 return c;
@@ -9175,6 +9414,8 @@ static ElemScratch elem_scratch_plan(const Emitter &e)
     };
     sc.idx = pick(sc.idx);
     sc.val = pick(sc.val);
+    if (!sc.ok)
+        g_jit_elem_noreg++;      /* the decline, made VISIBLE */
     return sc;
 }
 static bool emit_store_elem_inline(Emitter &e, const Instr &in,
@@ -9182,7 +9423,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                                    std::vector<size_t> &dones,
                                    bool is_float)
 {
-    const ElemScratch sc = elem_scratch_plan(e);
+    const ElemScratch sc = elem_scratch_plan(e, in.op);
     if (!sc.ok)
         return false;          /* no free scratch - the helper tier */
     e.scratch2(sc.idx, sc.val);      /* index in r9; the value in rdi/dil */
@@ -9831,7 +10072,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
                                     std::vector<size_t> &slows,
                                     std::vector<size_t> &dones)
 {
-    const ElemScratch sc = elem_scratch_plan(e);
+    const ElemScratch sc = elem_scratch_plan(e, in.op);
     if (!sc.ok)
         return false;          /* no free scratch - the helper tier */
     e.scratch2(sc.idx, sc.val);      /* index in r9; the value in rdi/dil */
@@ -10100,7 +10341,27 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
         for (const size_t j : slows)
             e.patch32_here(j);
 
-    /* idx -> rsi (an int operand), read before the cache regs spill */
+    /*
+     * ⛔ #96: THE PROLOGUE COMES FIRST, AND IT USED NOT TO. This site
+     * staged its arguments into rsi/rdx BEFORE emit_call_prologue,
+     * commented "read before the cache regs spill" - the one call site
+     * in the file that inverted the order (compare emit_dict_store
+     * immediately below, which is the convention).
+     *
+     * That inversion is a WRONG ANSWER the moment an argument register
+     * can hold a pin: the stage overwrites the pin, and the prologue
+     * then spills the OVERWRITTEN register to the pin's slot, so the
+     * value is gone with nothing to restore. It is what blocked rsi
+     * from the pin pool, and rdx/rcx after it.
+     *
+     * The comment's premise was false anyway - the prologue's own note
+     * says a spill does not INVALIDATE, so a `load_operand` after it
+     * still finds a caller-saved pin in its register and reads exactly
+     * the same value. Only the `call` clobbers. So the order is a free
+     * fix, and it makes the epilogue's reload the thing that repairs
+     * rsi/rdx rather than a hazard nobody had hit yet.
+     */
+    emit_call_prologue(e);               /* save the cache, 16-align */
     load_operand(e, RSI, in.a_is_lit(), in.a_lit(), in.a_slot());
     /* value: int -> rdx; float -> xmm0 (may BAIL on a non-numeric tag, as
      * everywhere in the float tier - the value is proven numeric, so it
@@ -10114,7 +10375,6 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
     else
         load_operand(e, RDX, in.b_is_lit(), in.b_lit(), in.b_slot());
 
-    emit_call_prologue(e);               /* save the cache, 16-align */
     e.lea_rdi(base_off);                  /* rdi = &slots[base] (arg 0) */
     /* aop is the last GP arg: rcx (int helper) / rdx (float helper) */
     e.movabs(is_float ? RDX : RCX,
@@ -12535,8 +12795,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 if (comp) {
                     e.store(RAX, slot_addr(in.target).payload);
                 } else {
-                    e.movabs(RSI,
-                             reinterpret_cast<uint64_t>(jit_layout().t_int));
+                    /* ⛔ #96: store_dst's tag write is an imm32 when the
+                     * arena placed t_int low, and reads rsi only on the
+                     * fallback path - so materialising it here is DEAD
+                     * CODE in the shipping configuration, AND it
+                     * clobbers a register the pin pool wants. The
+                     * mirror image of the store_dst_bool bug: there an
+                     * argument outlived its loader, here a loader
+                     * outlived its reader. Both are found by asking
+                     * `jit_tag_is_imm` at the site. */
+                    if (!jit_tag_is_imm(jit_layout().t_int))
+                        e.movabs(RSI, reinterpret_cast<uint64_t>(
+                                          jit_layout().t_int));
                     store_dst(e, ck, RAX, in.target, pc);
                 }
             }
@@ -16226,10 +16496,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 };
                 g_hoist.base = hr.base;
                 g_hoist.kind = hr.kind;
-                g_hoist.rdata = 10;
-                g_hoist.rcount = 11;
+                g_hoist.rdata = HOIST_RDATA;
+                g_hoist.rcount = HOIST_RCOUNT;
                 g_hoist.store_ok = hr.has_store;
-                nav(hr.base, hr.kind, hr.has_store, 10, 11);
+                nav(hr.base, hr.kind, hr.has_store,
+                    HOIST_RDATA, HOIST_RCOUNT);
 #ifdef TESTS
                 e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_hoist));
                 e.u8(0x48); e.u8(0xFF); e.u8(0x02);

@@ -2096,3 +2096,130 @@ Watch it fail: the `hoist` -rt cases ("the hoisted-compound arm never
 ran") are the detector, and they only fire off-arena today - construct
 an ON-arena case too, or the reservation goes untested in the shipping
 configuration.
+
+---
+
+## (o) 2026-08-18 - THE GENERAL RESERVATION, AND RSI ADMITTED (pin 9)
+
+Both halves of (n), built in that order. `-rt` green in both arena
+configurations and both build types, corpus_diff green on all five
+matrices, and the emitted code byte-identical on-arena for the
+reservation alone (109/109) before rsi changed it.
+
+### THE RESERVATION - `elem_scratch_reserve` (jit.cpp)
+
+The ad-hoc rule it replaces was one line:
+
+    if (!jit_tag_is_imm(jit_layout().t_int))
+        clob |= 1u << 7;                 /* rdi: keep it for CAND */
+
+correct, and useless past one register: it names rdi, and #96 puts five
+more into this pool. rsi is the next one and is ITSELF a candidate, so
+the ad-hoc form would grow a clause per admission, each re-deriving the
+arithmetic - a family of `&&`s becoming an audit table nobody re-reads
+(CLAUDE.md's fifth shape).
+
+The general rule COUNTS instead. At pool-pick time:
+
+  - take the candidates this run can use for reasons other than a pin -
+    `elem_reg_usable_nopin(r, float_tag_live, hoist_claimed)`, which is
+    the SAME predicate the emitter asks, split out of
+    `elem_reg_usable` so there is one rule set and not two;
+  - separate the ones no pin can reach (outside the pool, or already
+    clobbered) from the ones this pool could spend;
+  - withhold spendable members, LEAST-PREFERRED FIRST, until
+    `ELEM_ALLOC_ROLES` (2) are guaranteed to survive.
+
+Three properties worth keeping:
+
+  - **it is conditioned on the RUN** (`run_has_elem_scratch`), so a run
+    with no element store pays nothing. That is strictly less coarse
+    than the rule it replaces, and it showed immediately: the
+    `jit_xcache_pins` hoist case expected a DECLINE off-arena and now
+    engages, because its element ops are READS, whose emitter takes no
+    ElemScratch. The expectation was stale in the good direction and is
+    now `true` in both configurations - a stronger assertion;
+  - **it walks the UNROTATED XCACHE_ORDER backwards.** `take_reg` scans
+    forwards, so the tail is handed out only at maximum pin count and
+    is the cheapest member to give back. Deliberately not rotated:
+    MYLANG_JIT_XROT must not change emitted code, only which member is
+    preferred;
+  - **the op list SELF-CHECKS.** `elem_scratch_plan` now takes the
+    opcode and ML_CHECKs it against `op_uses_elem_scratch`, so a third
+    emitter that takes a plan without registering its op aborts BY NAME
+    instead of silently losing its inline tier. A stale list here would
+    defeat the reservation's own purpose.
+
+### THE INSTRUMENT: `elem_noreg` / `elem_reserve` (MYLANG_JITSTATS)
+
+Two emit-time counters, because the decline they describe is otherwise
+invisible - the helper computes the same answer, so only the speed
+changes. Corpus-wide (bench + samples + functional):
+
+    on-arena, before rsi   elem_noreg 0   elem_reserve 0
+    off-arena, before rsi  elem_noreg 0   elem_reserve 17
+    on-arena, after rsi    elem_noreg 0   elem_reserve 14
+
+i.e. the reservation absorbs exactly the pressure each admission
+creates, and nothing has ever starved with it in place.
+
+### RSI (6) ADMITTED - pin 9, and TWO SITES THAT HAD ROTTED
+
+The audit in (n) held: 24 census sites, 12 the t_int singleton (live
+only off-arena, all reached through the register-taking seams), 10 raw
+scratch in the four functions rdi's audit already cleared, 2 non-uses.
+`jit_xcache_busy` claims rsi outright off-arena - deliberately
+UNCONDITIONAL where r8's is gated, because `emit_type_tags` has no
+`int_tag_live` analogue: off-arena every fragment entry materialises
+t_int into rsi.
+
+But the audit's tidy list missed two sites that had quietly stopped
+being true, and BOTH had to be fixed before rsi could join:
+
+ 1. **`emit_store_elem` staged its helper arguments BEFORE
+    `emit_call_prologue`** - the only call site in the file to invert
+    the order (compare `emit_dict_store` directly below it). The
+    comment said "read before the cache regs spill"; the prologue's own
+    comment says a spill does not INVALIDATE, so the premise was false.
+    With an argument register pinnable it is a WRONG ANSWER: the stage
+    overwrites the pin and the prologue then spills the overwritten
+    register to the pin's slot. Fixed by emitting the prologue first.
+ 2. **`emit_op`'s boxed int-arith arm did `movabs rsi, t_int`
+    unconditionally** to feed `store_dst`, whose tag write became an
+    imm32 in #96 step 3. Dead code on-arena - and a pin clobber. This
+    is the exact MIRROR of the `store_dst_bool` bug: there an argument
+    outlived its loader, here a loader outlived its reader. Both are
+    found by asking `jit_tag_is_imm` at the site, and both are the same
+    lesson - **an optimization that changes whether a register is
+    involved must fix BOTH ends.**
+
+Measured on the corpus: `movabs rsi, <int-tag>` occurrences 3 -> 0 over
+the sampled benches, and rsi now appears as a pin (83_regs_int_40: two
+rsi moves -> four).
+
+### THE DETECTOR, WATCHED FAILING
+
+`jit_elem_scratch_reserved` (tests.cpp). Eight hot int accumulators, a
+runtime bound, and an element store on a loop-invariant base so a C1
+hoist claims r10/r11 - which is what makes the candidate list tight.
+
+    with the reservation      store_fast 80  elem_noreg 0  elem_reserve 1
+    with it returning 0       store_fast  0  elem_noreg 2  elem_reserve 0
+
+⛔ **`-rt` WAS GREEN AT 1923/1923 UNDER THAT SABOTAGE** before this
+check existed, and so were all four differentials and corpus_diff. The
+tier vanished completely and no net in the project could see it. That
+is why the case asserts a COUNTER and not a value - the same shape as
+#96 step 3's nested-store tier, which emitted perfectly and reached 0
+of 64.
+
+It carries an ANTI-VACUITY assertion (`elem_reserve > 0`): the day the
+pool shrinks or ELEM_CAND grows, the case says so instead of passing
+having tested nothing.
+
+### WHAT THIS CHANGES FOR THE REMAINING FOUR
+
+r9, rdx, rcx, rax are all in the ISA-fixed or candidate sets, so the
+reservation is what makes each of them admissible at all. It is now
+generic: nothing about it names a register, and adding one to
+XCACHE_ORDER is answered by the count.

@@ -920,6 +920,11 @@ extern "C" unsigned long g_jit_hoist;         /* C1: hoisted-nav entries */
 extern "C" unsigned long g_jit_hoist_rmw;     /* C1e: hoisted-COMPOUND
                                                * element stores (the RMW
                                                * off r10/r11) */
+/* #96: the element tier's ElemScratch plan found no free register and
+ * DECLINED to the helper (emit-time), and the pool members the
+ * reservation withheld to stop that happening. See elem_scratch_reserve. */
+extern "C" unsigned long g_jit_elem_noreg;
+extern "C" unsigned long g_jit_elem_reserve;
 /* #96: fragment entries that spent a CALLER-saved pin (XCACHE_REGS -
  * r10/r11). The emitted-code proof that the extension reaches a real
  * program, and the discriminator between "the pool is wide" and "the
