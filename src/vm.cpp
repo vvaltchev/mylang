@@ -10,6 +10,7 @@
 #include "errors.h"
 #include "backtrace.h"   /* flush_inline_frames (Inc 4 backtrace parity) */
 #include "bitops.h"
+#include "lowmem.h"   /* the low arena: g_jit_sync_depth (see below) */
 #include "env.h"    /* env_get - the MYLANG_VM_STACK cap */
 
 #include <memory>
@@ -7431,7 +7432,21 @@ vm_cache_probe_vals(EvalContext &ctx, const FuncDescriptor *d,
  * call-site loc the lazy in-VM capture would have used), anything else
  * rides g_vm_jit_eptr.
  */
-static int g_jit_sync_depth = 0;
+/*
+ * ⛔ IN THE LOW ARENA, so the emitter can name it with an absolute
+ * disp32 (#96's whole point, extended 2026-08-26). As an ordinary PIE
+ * global this sat around 0x6348'0000'0000, so EVERY emitted access -
+ * five per sync call, plus the inc/dec pair - cost a `movabs reg,
+ * imm64` first, and the bump additionally borrowed a register with a
+ * push/pop bracket because it had nowhere to put the address. A
+ * REFERENCE bound at static init keeps every C++ use below unchanged
+ * (`g_jit_sync_depth++` still reads as it did), and `&g_jit_sync_depth`
+ * hands the emitter the low address. C++ touches it only on the SLOW
+ * sync paths; the hot path is emitted, which is what makes this side of
+ * the trade free. If the arena is unavailable ml_lowmem_new falls back
+ * to plain `new` and the emitter keeps the movabs form.
+ */
+static int &g_jit_sync_depth = *ml_lowmem_new<int>(0);
 /* M5a: 200 = the C-stack-safe cap; jit_native_stack_init raises it to
  * ~500k when the dedicated native stack is armed (jit.cpp). A VARIABLE:
  * the emitted guards bake it at chunk-compile time (the init runs before

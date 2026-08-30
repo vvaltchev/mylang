@@ -4326,8 +4326,67 @@ struct Emitter {
      * hand-rolled form did - so a bump still may not sit between a
      * compare and its jump.
      */
+    /*
+     * ⛔ THE ABSOLUTE disp32 MEMORY FORM - the low arena's whole point,
+     * applied to DATA the emitter touches rather than only to the type
+     * TAGS (#96 extended, 2026-08-26).
+     *
+     * `mod=00, rm=100` + SIB `base=101, index=100` is "[disp32]", an
+     * absolute address with NO base register - so a global that lives
+     * below 2^31 is reachable in ONE instruction and, crucially, with
+     * NO REGISTER AT ALL. The emitter knew this encoding only as a
+     * HAZARD (base_no_base_form exists to assert a base never lands
+     * there); it is a capability too, and not using it is what made
+     * every access to a JIT-side global cost `movabs reg, imm64` first
+     * - plus, where no register was free, a push/pop bracket to make
+     * one.
+     *
+     * NOT RIP-relative, deliberately: that is a two-instruction LOAD
+     * (`mov rax,[rip+d]; op [rax]`) and strictly worse - the reasoning
+     * is written out at the top of lowmem.h.
+     *
+     * Returns false when the address does not fit an imm32 (the arena
+     * was unavailable - MAP_32BIT can fail on an ordinary Linux box),
+     * so the caller keeps its movabs form. The choice is a pure
+     * function of the ADDRESS, which is fixed for the process, so an
+     * instruction's LENGTH stays a pure function of the bytecode plus
+     * one process-wide configuration - the same contract the tag
+     * stores live under, and the reason `nolowmem` is a CI lane.
+     */
+    bool mem_abs32(uint8_t opcode, uint8_t reg_field, const void *addr,
+                   bool dword)
+    {
+        if (!ml_lowmem_fits_imm32(addr))
+            return false;
+        if (!dword)
+            u8(0x48);                       /* REX.W for a qword op */
+        u8(opcode);
+        u8(static_cast<uint8_t>(0x04 | (reg_field << 3)));  /* mod=00 */
+        u8(0x25);                           /* SIB: no base, no index */
+        u32(static_cast<uint32_t>(
+                reinterpret_cast<uintptr_t>(addr)));
+        return true;
+    }
+    /* cmp dword [abs32], imm32 - `81 /7` plus the immediate tail. */
+    bool cmp_abs32_imm32(const void *addr, uint32_t imm)
+    {
+        if (!mem_abs32(0x81, 7, addr, /*dword=*/true))
+            return false;
+        u32(imm);
+        return true;
+    }
+    /* ++[abs32] / --[abs32] - `FF /0` and `FF /1`. */
+    bool inc_abs32(const void *addr, bool dword)
+    { return mem_abs32(0xFF, 0, addr, dword); }
+    bool dec_abs32(const void *addr, bool dword)
+    { return mem_abs32(0xFF, 1, addr, dword); }
+
     void bump_at(const void *ctr, bool dword)
     {
+        /* one instruction, no register, no bracket - when the counter
+         * lives in the arena (see mem_abs32) */
+        if (inc_abs32(ctr, dword))
+            return;
         /* The bump runs at ARBITRARY emission points, including
          * inside open accumulator windows, so it must have zero
          * register-state footprint: it saves and restores the
@@ -7925,8 +7984,12 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
 
     emit_call_prologue(e);
     /* depth guard: cmp dword [&g_jit_sync_depth], CAP; jge slow */
-    e.movabs(RAX, depth_addr);
-    e.cmp_dword_base_imm32(RAX, 0, static_cast<uint32_t>(jit_sync_depth_cap()));
+    if (!e.cmp_abs32_imm32(reinterpret_cast<const void *>(depth_addr),
+                           static_cast<uint32_t>(jit_sync_depth_cap()))) {
+        e.movabs(RAX, depth_addr);
+        e.cmp_dword_base_imm32(RAX, 0,
+                               static_cast<uint32_t>(jit_sync_depth_cap()));
+    }
     std::vector<size_t> j_slows, j_dones;
     j_slows.push_back(e.j32(0x7D));                /* jge slow */
     /* M5b/M5c: THE FULLY-INLINE PUSH - resolve/gates/(cached: probe)/
@@ -8133,8 +8196,12 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 static_cast<int32_t>(JP.act_vframe + JP.frame_size));
         }
     }
-    e.movabs(RCX, depth_addr);
-    e.dec_dword_base(RCX);
+    /* the abs32 form when the counter is in the arena: one
+     * instruction, no register (see Emitter::mem_abs32) */
+    if (!e.dec_abs32(reinterpret_cast<const void *>(depth_addr), true)) {
+        e.movabs(RCX, depth_addr);
+        e.dec_dword_base(RCX);
+    }
     const size_t j_done1 = e.j32(0xEB);            /* jmp done */
     e.patch32_here(j_notsent);                     /* notsent: */
     /* #56 step 3: the callee returned JIT_RET_SWITCH (a deeper capped sync
@@ -8180,8 +8247,12 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_sync_postexit) });
     e.u8(0xE8); e.u32(0);
-    e.movabs(RCX, depth_addr);
-    e.dec_dword_base(RCX);
+    /* the abs32 form when the counter is in the arena: one
+     * instruction, no register (see Emitter::mem_abs32) */
+    if (!e.dec_abs32(reinterpret_cast<const void *>(depth_addr), true)) {
+        e.movabs(RCX, depth_addr);
+        e.dec_dword_base(RCX);
+    }
     e.test32_rr(RAX, RAX);                        /* test eax, eax */
     const size_t j_done2 = e.j32(0x74);            /* jz done */
     emit_call_epilogue(e);
