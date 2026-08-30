@@ -148,10 +148,30 @@ FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
          * entry's OWN span so the caret lands on the name inside `[...]`
          * instead of the whole closure expression (#131 step 4). */
         try {
-            capture_slots.emplace_back(
-                RValue(read_sym(ctx, cap.kind, cap.slot, cap.name)),
-                ctx->const_ctx
-            );
+            /*
+             * #114: build the slot STRAIGHT from the source slot. The
+             * old spelling - `emplace_back(RValue(read_sym(...)), ...)`
+             * - put one captured int through FOUR EvalValue lifecycle
+             * events: read_sym boxed the slot's ADDRESS into an
+             * EvalValue, RValue unboxed it into a COPY, emplace_back
+             * MOVED that copy into the LValue, and the temporary was
+             * DESTROYED - each with its own `type->t >= t_str` test and
+             * potential type-erased PMF call. Taking the lvalue and
+             * copy-constructing in place is one event.
+             *
+             * `read_sym_lv` answers null exactly where `read_sym`
+             * answered `UndefinedId`, which is where the RValue() below
+             * throws - so the fallback is the ERROR path and the two
+             * spellings cannot disagree about a value.
+             */
+            if (LValue *src = read_sym_lv(ctx, cap.kind, cap.slot,
+                                          cap.name))
+                capture_slots.emplace_back(src->get(), ctx->const_ctx);
+            else
+                capture_slots.emplace_back(
+                    RValue(read_sym(ctx, cap.kind, cap.slot, cap.name)),
+                    ctx->const_ctx
+                );
         } catch (Exception &e) {
             if (!e.loc_start.line) {
                 e.loc_start = cap.start;

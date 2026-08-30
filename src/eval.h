@@ -325,6 +325,23 @@ public:
      */
     FlowState *flow;
 
+    /*
+     * #114: THE ROOT of this context chain - `this` for a root, the
+     * parent's otherwise, so it is inherited exactly like `frame`,
+     * `gfuncs` and `captures` above.
+     *
+     * Every closure creation needs it (`FuncObject::capture_root`), and
+     * `get_root_ctx` re-derived it by WALKING the parent chain - 5 Ir
+     * per closure to recompute a value that never changes. The trade is
+     * one store per EvalContext construction against one walk per
+     * closure, and it is lopsided the right way: under the VM+JIT an
+     * EvalContext is built a few dozen times in a whole program (the
+     * call protocol uses the native window instead), while 63_closures
+     * creates 400,000 closures. MEASURED before assuming: the ctor
+     * appears in that bench's profile at ~30k Ir total.
+     */
+    EvalContext *root;
+
     EvalContext(const EvalContext &rhs) = delete;
     EvalContext(EvalContext &&rhs) = delete;
 
@@ -663,10 +680,7 @@ extern bool g_pure_cache_enabled;
 inline EvalContext *
 get_root_ctx(EvalContext *ctx)
 {
-    while (ctx->parent)
-        ctx = ctx->parent;
-
-    return ctx;
+    return ctx->root;      /* #114: inherited, not walked */
 }
 
 /*
@@ -677,6 +691,19 @@ get_root_ctx(EvalContext *ctx)
  */
 EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
                    const UniqueId *uid);
+/*
+ * #114: read_sym's LVALUE half. Every answer it can give except an
+ * `UndefinedId` is `EvalValue(&some_lvalue)` - a value BOXED purely so
+ * the caller can immediately unbox it with RValue(). A caller that
+ * wants the VALUE and not the reference (the closure capture snapshot)
+ * takes the slot directly and skips a whole EvalValue round trip.
+ *
+ * Returns null EXACTLY where read_sym returns an `UndefinedId`, i.e.
+ * where the RValue() that followed it would have THROWN - so the
+ * caller's fallback is the error path, not a second normal path.
+ */
+LValue *read_sym_lv(EvalContext *ctx, SymKind kind, int slot,
+                    const UniqueId *uid);
 
 /*
  * A closure's captured values. A hand-rolled tiny vector, NOT a std::vector,
@@ -764,6 +791,19 @@ public:
     void emplace_back(const LValue &lv) {
         ML_CHECK(n < cap);
         new (ptr + n) LValue(lv);
+        n++;
+    }
+
+    /*
+     * #114: build the slot straight from a source VALUE. The
+     * rvalue-ref overload above exists for a caller holding a
+     * temporary; the capture snapshot holds a `const EvalValue &` from
+     * the source slot, and routing it through the temporary cost a
+     * copy, a move and a destroy where ONE copy does.
+     */
+    void emplace_back(const EvalValue &v, bool is_const) {
+        ML_CHECK(n < cap);
+        new (ptr + n) LValue(v, is_const);
         n++;
     }
 

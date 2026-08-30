@@ -10362,3 +10362,102 @@ because they are generic:
 A) and its tag is fail-closed` - reach from `g_jit_fwd`, RULE 2 with
 `fwd` off AND with `capbase` off (not redundant: the second is what
 caught the rax clobber), and the bool tag case above.
+
+## #114 - CLOSURE CREATION: 113 -> 85 Ir, and the profile that ranked it
+## (2026-08-27)
+
+**THE PROFILE FIRST, and it moved the target.** After #111-#113 the
+closure CALL was down to 44 emitted instructions, so 63_closures was
+re-profiled to find what actually dominated it. `jitprofile.py` said
+**`elsewhere` was 144.7M of 285.5M - 50.7% of the program in C++
+helpers**, against 8.6% for 11_closure_counter. That is not something
+the emitted-code profiler can see into, so the next step was
+callgrind's function view on a `DEBUG_INFO=1` build:
+
+    main#0 fragment            95.0M  34.8%   475 Ir/iteration
+    FuncObject::FuncObject     45.2M  16.5%   113 Ir/closure  <--
+    jit_ret_norec              39.2M  14.4%    65 Ir/return
+    move_assign (the DESTROY)  18.0M   6.6%    45 Ir/closure
+    counter closure body       17.6M   6.4%    44 Ir/call
+    the two factory bodies     15.4M   5.6%   ~38 Ir/call
+    adder closure body         12.8M   4.7%    64 Ir/call   (see #115)
+    jit_make_closure_ptr       10.8M   4.0%    27 Ir/closure
+
+Creation + destruction is **32.7%** of the program, and its largest
+piece is 113 instructions to build a closure with ONE int capture.
+
+**⛔ THE PROFILER HAD TO BE FIXED BEFORE ANY OF THIS COULD BE READ.**
+`jitprofile`'s per-fragment table was keyed by the fragment LABEL, and
+every anonymous closure is `<lambda>` - so it reported ONE `lambda#0` of
+30.4M for what is a 17.6M counter and a 12.8M adder, two different
+closures with two different problems. The `--listing` path had its own
+copy of the assumption in its filter and its printf. Fixed (commit
+6e2beac) before the numbers above were trusted: same-labelled fragments
+that RAN get a `~N` suffix; a dead twin (a chunk re-emitted after a
+register conflict) is left alone so the common case still reads plainly.
+
+**WHERE THE 113 WENT.** Line-level, per closure: 42 Ir of the ctor's own
+code, **39 Ir of inlined `EvalValue` lifecycle**, 22 Ir of
+`read_sym`/`CaptureSlots`/`get_root_ctx`, ~10 of pooled alloc. The 39
+was the fat, and it was for copying ONE int:
+
+    capture_slots.emplace_back(
+        RValue(read_sym(ctx, cap.kind, cap.slot, cap.name)),
+        ctx->const_ctx);
+
+FOUR EvalValue lifecycle events, each with its own `type->t >= t_str`
+test and potential type-erased PMF call - `read_sym` BOXES the slot's
+address into an EvalValue, `RValue` unboxes it into a COPY,
+`emplace_back` MOVES that copy into the LValue, and the temporary is
+DESTROYED.
+
+**THE FIX, in two parts, both "stop boxing a thing to immediately unbox
+it":**
+
+ - **`read_sym_lv`** - read_sym's LVALUE half. Every answer read_sym can
+   give except an `UndefinedId` is `EvalValue(&some_slot)`, so a caller
+   that wants the VALUE takes the slot and copy-constructs in place: one
+   event instead of four. It returns null EXACTLY where read_sym answers
+   `UndefinedId`, i.e. where the `RValue()` that followed would have
+   THROWN, so the caller's fallback is the ERROR path and the two cannot
+   disagree about a value. **`read_sym` is now written in terms of it** -
+   one dispatch, not two copies free to drift, which is the whole reason
+   the claim in its comment is safe to make.
+ - **`EvalContext::root`** - inherited from the parent exactly like
+   `frame` / `gfuncs` / `captures`, where `get_root_ctx` used to WALK
+   the parent chain once per closure. The trade is one store per
+   EvalContext against one walk per closure. **MEASURED BEFORE ASSUMING,
+   because the trade only works one way:** under the VM+JIT the call
+   protocol uses the native window and builds NO EvalContext per call -
+   the ctor appears in 63_closures' profile at ~30k Ir total, against
+   400,000 closure creations. Had contexts been per-call this would have
+   been a net loss, and the profile is what said so.
+
+**MEASURED** (callgrind Ir, `OPT=1 ASSERTS=0`):
+
+    FuncObject::FuncObject   45,200,176 -> 34,000,148   113 -> 85 Ir
+    63_closures whole        273,204,296 -> 262,005,166      -4.10%
+    63_closures per-iteration                              -4.217%
+
+**AND EVERY OTHER BENCH IS EXACTLY FLAT** - 11_closure_counter,
+12_higher_order, 76_funcval_dispatch, 34_sort_custom_cmp, 35_map_filter
+and 09_fib_recursive all read **+0.000%** per-iteration, to the
+instruction. (11_closure_counter creates ONE closure for the whole
+program, so a per-closure saving cannot show there - which is itself the
+check that the change touches only what it claims to.)
+
+**WALL CLOCK** (one interleaved `--baseline` A/B): 63_closures
+**0.95x**, everything else 1.00x, suite geomean 1.000x over 90.
+
+**WHAT IS LEFT IN THE 85**, measured, not guessed:
+ - the `CaptureSlots` destructor's ~11 Ir - but the line attribution
+   folds the inlined `~LValue`/`~EvalValue` into the `for`, so most of
+   that is the work, not the loop;
+ - `read_sym_lv`'s own 8 Ir (`ctx->frame->at(slot)`);
+ - `reserve` + the default `CaptureSlots()` ctor together write
+   ptr/n/cap twice, ~4 Ir of redundancy - not taken, because the class
+   carries a load-bearing layout contract (the JIT reads its data
+   pointer at offset 0) and 4 Ir does not justify touching it;
+ - #109 (the inlined `intrusive_ptr::release`) still applies to the
+   45-Ir DESTROY side, though here the destroy genuinely runs every
+   iteration, so that one is an I-cache argument rather than an Ir one.
