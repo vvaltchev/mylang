@@ -91,6 +91,10 @@ fi
 same=0
 diffs=0
 fails=0
+flakes=0
+# Where a NON-REPRODUCING difference's evidence is kept (see the
+# confirm step below). Not $TMP - that is deleted on exit.
+EVID=${VDJCMP_EVIDENCE:-./vdjcmp-flake}
 for f in bench/my/*.my samples/* tests/functional/*.my; do
     [ -f "$f" ] || continue
     "$A" -vdj "$f" > "$TMP/a" 2>"$TMP/ae"; rca=$?
@@ -133,16 +137,65 @@ for f in bench/my/*.my samples/* tests/functional/*.my; do
     fi
     if cmp -s "$TMP/a" "$TMP/b"; then
         same=$((same + 1))
-    else
-        diffs=$((diffs + 1))
-        echo "DIFF: $f"
-        if [ "$VERBOSE" = "-v" ]; then
-            diff "$TMP/a" "$TMP/b" | sed 's/^/    /'
-        fi
+        continue
+    fi
+    #
+    # ⛔ CONFIRM A DIFFERENCE BEFORE REPORTING ONE (2026-08-18).
+    #
+    # A real code change differs EVERY time; `-vdj` is documented
+    # reproducible, so a difference that does not reproduce means the
+    # ORACLE is unreliable for this program on this run, which is a
+    # third outcome and not the same as "your change altered the code".
+    #
+    # This is not a mask - the run above is not discarded, it is
+    # RE-ASKED, and a non-reproducing answer is reported LOUDLY, saved
+    # with its evidence, and made to fail the script. Masking would be
+    # ignoring it; this is instrument property 2, "it says when it does
+    # not know", plus the evidence needed to eventually root-cause it.
+    #
+    # ⛔ IT IS NOT HYPOTHETICAL AND IT IS NOT YET EXPLAINED. Twice in
+    # one session a full-corpus run reported exactly ONE differing
+    # program - 29_str_slice_readonly, then 67_make_dict - and neither
+    # reproduced: 250 same-binary runs and 200 cross-binary runs of
+    # each of those two programs, plus six clean self-tests, all
+    # identical. Rate is on the order of 1 in 1000 program
+    # comparisons. Until it is understood, a run that hits it must say
+    # so rather than accuse the change under test - the failure mode
+    # this whole script exists to avoid is a real regression being
+    # waved away as "that flake again".
+    #
+    "$A" -vdj "$f" > "$TMP/a2" 2>/dev/null; rca2=$?
+    "$B" -vdj "$f" > "$TMP/b2" 2>/dev/null; rcb2=$?
+    if [ $rca2 -eq 0 ] && [ $rcb2 -eq 0 ] && \
+       [ -s "$TMP/a2" ] && [ -s "$TMP/b2" ] && \
+       cmp -s "$TMP/a2" "$TMP/b2"; then
+        flakes=$((flakes + 1))
+        mkdir -p "$EVID"
+        base=$(echo "$f" | tr '/' '_')
+        cp "$TMP/a"  "$EVID/$base.run1.a"
+        cp "$TMP/b"  "$EVID/$base.run1.b"
+        cp "$TMP/a2" "$EVID/$base.run2.a"
+        echo "FLAKE: $f  (differed once, identical on re-run;" \
+             "evidence in $EVID)"
+        continue
+    fi
+    diffs=$((diffs + 1))
+    echo "DIFF: $f"
+    if [ "$VERBOSE" = "-v" ]; then
+        diff "$TMP/a" "$TMP/b" | sed 's/^/    /'
     fi
 done
 
-echo "identical: $same   differing: $diffs   failed: $fails"
+echo "identical: $same   differing: $diffs   failed: $fails" \
+     "  flaky: $flakes"
+if [ "$flakes" -ne 0 ]; then
+    echo "error: $flakes program(s) differed on one run and not on the" >&2
+    echo "       next. THE ORACLE, NOT THE CHANGE, IS AT FAULT for" >&2
+    echo "       those - do not read them as a code difference, and" >&2
+    echo "       do not read this run as a clean one either. The" >&2
+    echo "       dumps are saved; root-cause them." >&2
+    exit 3
+fi
 if [ "$fails" -ne 0 ]; then
     echo "error: $fails program(s) could not be disassembled by one or" >&2
     echo "       both binaries. Those are NOT differences - the run" >&2
