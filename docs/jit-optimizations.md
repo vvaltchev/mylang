@@ -9574,3 +9574,66 @@ producing a wrong value: `norec_enum.py --depth 3` (1920 engine runs
 over the enumerated frame-kind space, 9 of 25 sampled programs making
 record-less pushes) and `norec_sweep.py` (the forced reconstruction at
 every call event) both agree, plus -rt 1961/1961 and corpus_diff 29/29.
+
+## #97 step 3 - THE CLOSURE STORE IS INLINE, THE CONSTRUCTION IS NOT
+## (63_closures -11.2% Ir, 0.91x wall), 2026-08-26
+
+**WHAT.** `jit_make_closure` built the closure AND stored it, and the
+STORE was the expensive half: `frame->at(dst).put(EvalValue(..))`
+reaches `EvalValue::operator=(EvalValue&&)`, which destroys the old
+value and move-constructs the new one through the TYPE-ERASED ops
+table - TWO INDIRECT CALLS plus their machinery. Measured on
+63_closures that pair is ~125 Ir per closure, against ~110 for building
+the object.
+
+Emitted code knows two things C++ cannot: the new value's type is
+t_func, and the pointer can arrive with its count ALREADY at 1. So
+`jit_make_closure_ptr` CONSTRUCTS ONLY and transfers ownership (the
+count is set by hand rather than by an intrusive_ptr that would release
+it on the way out), returning null after conveying a throw - the
+capture snapshot can raise UnboundSymbolEx. The store is then the
+element tier's shape: release the old value (dec, cold
+`jit_release_slot` arm for destruction / a slice / an exception
+object), then two stores.
+
+    63_closures         336.2M -> 298.6M  (-11.18%)   wall 0.91x
+    11_closure_counter / 76_funcval_dispatch: flat (no closure CREATION
+    in their loops - 11 calls one closure a million times)
+
+63_closures: **18.19x -> 16.23x** vs C++.
+
+**⛔ THE TESTING LESSON, AND IT IS THE BIGGER HALF OF THIS ENTRY.**
+
+**(1) POOLING BLUNTS LeakSanitizer.** FuncObject carries
+ML_POOL_NEW_DELETE, so a leaked closure is memory the POOL already
+owns. Deleting the release arm and running ONE 300-closure program is
+SILENT under ASan+LSan - the leak fits inside a chunk LSan sees as
+reachable. Only at SUITE volume does it surface, at exit, as
+"179560 byte(s) leaked in 1349 allocation(s)" with no hint which tier
+is at fault. A TESTS-only live-object count (`g_live_funcobjs`) fails
+immediately, at any volume, and NAMES the tier. **The same blunting
+applies to every ML_POOL_NEW_DELETE type.**
+
+**(2) THREE SHAPES BEFORE THE TEST CAUGHT ITS OWN BUG** - the
+vacuous-test trap, twice in a row, both times passing GREEN with the
+whole release arm deleted:
+ - at the TOP LEVEL, `var f = ...` is a GLOBAL, so MakeClosureV targets
+   a TEMP and a StoreGlobalV moves the value out: the global store owns
+   the lifetime and this tier frees nothing;
+ - `f = mk(i)` is a CALL - the closure is built inside `mk`, into ITS
+   temp, and RETURNED, so the dst is again not `f`.
+What targets a live slot is a closure LITERAL assigned to a ref-listed
+LOCAL inside a function, which `-vd` shows as
+`make.closure f = closure_defs[0]` instead of a temp. **CHECK THE OP
+THE TEST PRODUCES, NOT THE SOURCE SHAPE** - this is the same rule the
+vacuous-test list already states, met twice in one test.
+
+The DANGEROUS direction needs no such help: dropping the ownership
+transfer in `jit_make_closure_ptr` is an ASan heap-use-after-free on
+the first run (watched).
+
+NETS: -rt 1962/1962 (dbg ASan+UBSan and RECYCLE=1); corpus_diff plain /
+--levers / --xrot / --cold 30/30; disasmcheck vs objdump zero
+disagreements; tests/functional/22_closure_store.my for the ownership
+shapes (overwrite, last-ref, shared, trivial-to-reference,
+reference-to-reference, independence, array/field destinations).

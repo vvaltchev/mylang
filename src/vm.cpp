@@ -4024,6 +4024,40 @@ extern "C" void jit_arr_len(LValue *slots, int_type dst, int_type base) noexcept
  * lambda. `defv` is the closure's program-lifetime FuncDescriptor* (baked by the
  * emitter as a value - the descriptor address is stable, like CallV's callee).
  * A resolved closure's captures are defined, so the ctor never throws. */
+/*
+ * #97 step 3: THE CLOSURE'S POINTER, HANDED TO EMITTED CODE.
+ *
+ * The storing form below writes the fresh closure with
+ * `frame->at(dst).put(EvalValue(...))`, and that store - not the
+ * construction - was the expensive half: `put` reaches
+ * EvalValue::operator=(EvalValue&&), which destroys the old value and
+ * move-constructs the new one through the TYPE-ERASED ops table, i.e.
+ * TWO INDIRECT CALLS plus their machinery. Measured on 63_closures
+ * that pair is ~125 Ir per closure, against ~110 for building the
+ * object itself.
+ *
+ * Emitted code can do the same store in about ten instructions,
+ * because it knows two things C++ does not: the new value's type is
+ * t_func, and the pointer arrives with the count ALREADY at 1. So this
+ * variant CONSTRUCTS ONLY and transfers ownership to the caller - the
+ * count is set to 1 by hand rather than by an intrusive_ptr that would
+ * release it on the way out. Returns null after conveying a throw (the
+ * capture snapshot can raise UnboundSymbolEx - see the storing form).
+ */
+extern "C" void *jit_make_closure_ptr(const void *defv) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+    try {
+        FuncObject *fo = new FuncObject(def, g_current_ctx);
+        fo->intr_refcount = 1;      /* the destination slot owns it */
+        return fo;
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return nullptr;
+    }
+}
+
 extern "C" int jit_make_closure(int_type dst, const void *defv) noexcept
 {
     ML_JIT_OP_RAN(MakeClosureV);

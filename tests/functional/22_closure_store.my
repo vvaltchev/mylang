@@ -1,0 +1,63 @@
+# THE INLINE CLOSURE STORE (#97 step 3). Building a closure and
+# STORING it were one helper; the store was the expensive half, because
+# `frame[dst].put(EvalValue(..))` reaches EvalValue::operator=(&&) and
+# its two type-erased indirect calls. The construct-only helper now
+# hands the pointer over with the count already at 1 and emitted code
+# does the store - which means the JIT, not C++, is responsible for
+# releasing whatever the slot held.
+#
+# So this file is about OWNERSHIP, not values: run it under
+# RECYCLE=1 + ASan, where a missed release leaks and a double release
+# is a use-after-free. corpus_diff compares it against the tree-walker.
+
+# ---- the slot is OVERWRITTEN by a new closure every iteration, so the
+# ---- release-old path runs 200 times and the last one must survive
+func mk(int k) => func [k] (int x) => x + k;
+var f = mk(0);
+var s = 0;
+for (var i = 0; i < 200; i++) {
+    f = mk(i);            # releases the previous closure
+    s += f(1);
+}
+print("overwrite", s, f(10));
+
+# ---- the old value was the LAST reference each time (nothing else
+# ---- holds it), so the cold destruction arm runs, not the plain dec
+var g = mk(0);
+for (var i = 0; i < 100; i++) g = mk(i * 2);
+print("lastref  ", g(5));
+
+# ---- the old value is NOT the last reference: a copy is kept alive,
+# ---- so the plain decrement arm runs and the copy stays valid
+var keep = mk(7);
+var h = keep;
+for (var i = 0; i < 50; i++) h = mk(i);
+print("shared   ", keep(1), h(1));
+
+# ---- the slot previously held a TRIVIAL value (no release needed)
+var dyn t = 42;
+t = mk(3);
+print("trivial  ", t(4));
+
+# ---- the slot previously held a NON-closure reference (an array), so
+# ---- the release path must handle a different reference kind
+var dyn r = [1, 2, 3];
+r = mk(9);
+print("otherref ", r(1));
+
+# ---- captures stay INDEPENDENT across creations (the snapshot is
+# ---- per instance, and the store must not alias them)
+var fns = [];
+for (var i = 0; i < 5; i++) append(fns, mk(i * 100));
+var tot = 0;
+foreach (var fn in fns) tot += fn(1);
+print("independ ", tot);
+
+# ---- a closure stored into an ARRAY element and a struct field, so
+# ---- the store is not only the frame-slot form
+struct Box { dyn? fn; }
+var b = Box(none);
+b.fn = mk(11);
+var dyn bf = b.fn;
+if (bf == none) { print("boxed    none"); }
+else { print("boxed    ", bf(1)); }

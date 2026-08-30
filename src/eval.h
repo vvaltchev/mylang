@@ -832,7 +832,29 @@ public:
 
     FuncObject(const FuncDescriptor *func, EvalContext *ctx);
     FuncObject(const FuncObject &rhs);
+#ifdef TESTS
+    /*
+     * ⛔ POOLING BLUNTS LeakSanitizer, which is why this exists (#97
+     * step 3, 2026-08-26). FuncObject carries ML_POOL_NEW_DELETE, so a
+     * leaked closure is memory the POOL already owns: a small leak
+     * fits inside a chunk LSan sees as reachable and is reported
+     * NOWHERE. Watched - deleting the inline store's release arm and
+     * running one 300-closure program is silent under ASan+LSan; only
+     * at SUITE volume does LSan report it, at exit, as a byte count
+     * with no hint which tier is at fault.
+     *
+     * The live count fails immediately, at any volume, and names the
+     * tier. The DANGEROUS direction (releasing one too many) needs no
+     * such help - it is an ASan use-after-free, watched.
+     *
+     * The same blunting applies to every ML_POOL_NEW_DELETE type.
+     */
+    ~FuncObject();
+#endif
 };
+#ifdef TESTS
+extern "C" unsigned long g_live_funcobjs;
+#endif
 
 /*
  * Deep, read-only copy of a const-evaluated array/dict value (see eval.cpp).

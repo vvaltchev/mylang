@@ -103,6 +103,8 @@ unsigned long g_jit_storev_fast = 0;   /* #97: inline boxed-element stores
                                         * (bumped from EMITTED code) */
 unsigned long g_jit_memberv_fast = 0;  /* #97: inline struct-field stores
                                         * (bumped from EMITTED code) */
+unsigned long g_jit_closure_fast = 0;  /* #97: inline closure STORE after
+                                        * the construct-only helper */
 /* #97 inc 2: the DECLINE LEDGER - one counter per guard, bumped from
  * the guard's own landing pad (see jit.h for why a fast-path counter
  * cannot answer this) */
@@ -9899,6 +9901,7 @@ void jit_stats_report()
         { "elemv_fast",       &g_jit_elemv_fast },
         { "storev_fast",      &g_jit_storev_fast },
         { "memberv_fast",     &g_jit_memberv_fast },
+        { "closure_fast",     &g_jit_closure_fast },
         { "peep_depbrk",      &g_jit_peep_depbrk },
         { "rax_retries",      &g_jit_rax_retries },
         { "step_imm",         &g_jit_step_imm },
@@ -17873,20 +17876,110 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * as "never throws", which turned that into a std::terminate; it
          * conveys through g_vm_jit_exc now and returns a status like every
          * other throwing tier. */
+        /*
+         * #97 step 3: THE STORE IS INLINE, the construction is not.
+         *
+         * The helper used to build the closure AND store it, and the
+         * STORE was the expensive half: `frame->at(dst).put(EvalValue(..))`
+         * reaches EvalValue::operator=(EvalValue&&), which destroys the
+         * old value and move-constructs the new one through the
+         * TYPE-ERASED ops table - two indirect calls plus their
+         * machinery, ~125 Ir per closure on 63_closures against ~110
+         * for building the object.
+         *
+         * Emitted code knows what C++ cannot: the new value's type is
+         * t_func, and jit_make_closure_ptr hands the pointer over with
+         * the count ALREADY at 1. So the store is the element tier's
+         * shape - release the old value (dec, with a cold
+         * jit_release_slot arm for destruction / a slice / an
+         * exception object), then two stores.
+         *
+         * The construct-only helper still conveys a throw (a captured
+         * global whose declaration has not run raises UnboundSymbolEx),
+         * as NULL rather than a status word.
+         */
+        const JitLayout &L = jit_layout();
+        const SlotAddr dst = slot_addr(in.target);
+        const int mc_s1 = jit_layout().elemv_inline_ok
+                          ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                            /*transient=*/true) : -1;
         emit_call_prologue(e);
-        e.mov_imm(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-        e.movabs(RSI,
-                 reinterpret_cast<uint64_t>(ck.closure_defs[in.target2]));
+        if (mc_s1 >= 0) {
+            /* the CONSTRUCT-ONLY form: (def) -> the pointer */
+            e.movabs(RDI,
+                     reinterpret_cast<uint64_t>(ck.closure_defs[in.target2]));
+        } else {
+            /* no scratch for the inline store: the STORING form, (dst, def) */
+            e.mov_imm(RDI, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target)));
+            e.movabs(RSI,
+                     reinterpret_cast<uint64_t>(ck.closure_defs[in.target2]));
+        }
         e.call_relocs.push_back(
-            { e.pos(), reinterpret_cast<const void *>(jit_make_closure) });
+            { e.pos(), mc_s1 >= 0
+                  ? reinterpret_cast<const void *>(jit_make_closure_ptr)
+                  : reinterpret_cast<const void *>(jit_make_closure) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
 
-        e.test32_rr(RAX, RAX);           /* test eax, eax; reg:abi */
-        const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = no raise) */
-        emit_exc_stamp(e, ck, pc);        /* cold: the op's own caret */
-        e.exit_pc(pc);                    /* raised: EnterNative raises exc */
+        if (mc_s1 < 0) {
+            e.test32_rr(RAX, RAX);       /* test eax, eax; reg:abi */
+            const size_t j_ok = e.j8(0x74);   /* jz -> continue */
+            emit_exc_stamp(e, ck, pc);    /* cold: the op's own caret */
+            e.exit_pc(pc);                /* raised */
+            e.patch8(j_ok, e.pos());
+            return true;
+        }
+        const uint8_t s1 = static_cast<uint8_t>(mc_s1);
+        e.test_rr(RAX, RAX);             /* null = it threw */
+        const size_t j_ok = e.j8(0x75);  /* jnz -> store */
+        emit_exc_stamp(e, ck, pc);
+        e.exit_pc(pc);
         e.patch8(j_ok, e.pos());
+        /* RELEASE the old dst (compile-skipped when the slot provably
+         * never holds a reference) */
+        if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                               static_cast<int32_t>(in.target))) {
+            e.load(s1, dst.type);
+            e.load32_base(s1, s1, L.type_t_off);
+            e.cmp_reg32_imm32(s1, static_cast<uint32_t>(L.t_str_val));
+            const size_t o_triv = e.j32(0x72);        /* jb: trivial */
+            e.cmp_reg32_imm32(s1, static_cast<uint32_t>(L.t_ex_val));
+            const size_t o_cold = e.j32(0x74);
+            e.cmp_reg32_imm32(s1, static_cast<uint32_t>(L.t_arr_val));
+            const size_t o_nsl = e.j8(0x75);
+            e.cmp_byte_slot(dst.payload + L.slice_off, 0);
+            const size_t o_cold2 = e.j32(0x75);
+            e.patch8(o_nsl, e.pos());
+            e.load(s1, dst.payload);
+            e.cmp_dword_base_imm32(s1, 0, 1);
+            const size_t o_cold3 = e.j32(0x74);       /* last ref -> cold */
+            e.dec_dword_base(s1);
+            const size_t o_st = e.j32(0xEB);
+            e.patch32_here(o_cold);
+            e.patch32_here(o_cold2);
+            e.patch32_here(o_cold3);
+            e.push_reg(RAX);                 /* the fresh closure */
+            e.push_reg(s1);                  /* parity */
+            emit_call_prologue(e);
+            e.lea(REG_ARG0, dst.payload
+                                - static_cast<int32_t>(slot_addr(0).payload));
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_release_slot) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            e.pop_reg(s1);
+            e.pop_reg(RAX);
+            e.patch32_here(o_triv);
+            e.patch32_here(o_st);
+        }
+        e.store(RAX, dst.payload);       /* the FuncObject*, count 1 */
+        e.store_type_tag_via(dst.type, jit_push_layout().t_func, s1);
+#ifdef TESTS
+        e.bump_counter(&g_jit_closure_fast);
+#endif
+        e.free_scratch(s1);
         return true;
     }
 

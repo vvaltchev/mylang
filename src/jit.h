@@ -914,6 +914,11 @@ extern "C" int jit_dict_load_float(int_type dst, int_type base_slot,
 /* returns 1 and sets g_vm_jit_exc when a captured GLOBAL is not bound yet
  * (UnboundSymbolEx, #131); 0 on success */
 extern "C" int jit_make_closure(int_type dst, const void *def) noexcept;
+/* #97 step 3: the CONSTRUCT-ONLY form - returns the fresh closure with
+ * its count already at 1 (ownership transferred), so emitted code can
+ * do the slot store inline instead of paying EvalValue::operator='s
+ * two type-erased indirect calls. Null after conveying a throw. */
+extern "C" void *jit_make_closure_ptr(const void *def) noexcept;
 
 /* model-flip (nativize-ops): MakeArrayV natively - build an array LITERAL from
  * the element run [base, base+n) via the shared build_array_from_values, honoring
@@ -1328,6 +1333,9 @@ extern "C" unsigned long g_jit_storev_fast;
  * field written straight to its baked byte offset, or a boxed field's
  * LValue with the reference lifecycle. Bumped from the EMITTED code. */
 extern "C" unsigned long g_jit_memberv_fast;
+/* #97 step 3: the inline closure STORE ran (the construct-only helper
+ * handed the pointer over and emitted code stored it). */
+extern "C" unsigned long g_jit_closure_fast;
 extern "C" unsigned long g_jit_peep_depbrk;
 /* the in-process OFF override for the lever mask (tests; pairs with
  * jit_lever_bit) - the env masks are cached statics. */
