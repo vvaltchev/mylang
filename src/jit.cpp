@@ -2660,16 +2660,44 @@ enum Reg : uint8_t { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSI = 6,
                      RDI = 7, R8 = 8, R9 = 9, R10 = 10, R11 = 11 };
 
 /* rax OP= rcx (reg-reg forms; 0x48 REX.W + opcode + ModRM(rcx->rax)) */
-static void op_rr(Emitter &e, Op aop)
+/*
+ * `dst OP= src`.
+ *
+ * ⛔ THE TWO REGISTERS ARE PARAMETERS NOW (#96, 2026-08-19). This was a
+ * fixed rax/rcx pair whose operands existed ONLY in the byte literals
+ * and the trailing comments - seven call sites, and not one of them
+ * mentioned a register. That is CLAUDE.md's sixth audit-table shape in
+ * its purest form: `grep RCX` cannot see any of them, so the census
+ * that decides when rcx may join the pin pool was blind to seven real
+ * uses of it.
+ *
+ * It is NOT re-routed through the existing `op_rr2`, deliberately.
+ * op_rr2 encodes the `r64, r/m64` direction (reg = dst) and this
+ * encodes `r/m64, r64` (reg = src); both are 3 bytes and both are
+ * correct, but swapping them would change every emitted byte and cost
+ * the byte-identity oracle for a change that is supposed to be inert.
+ * So the direction is preserved exactly - `imul`, which really is the
+ * reg = dst form, keeps its own arm.
+ */
+static void op_rr(Emitter &e, Op aop, uint8_t dst, uint8_t src)
 {
+    /* reg = src, rm = dst  (the `r/m64, r64` direction) */
+    const uint8_t rex_rm = static_cast<uint8_t>(
+        0x48 | (src >= 8 ? 0x04 : 0) | (dst >= 8 ? 0x01 : 0));
+    const uint8_t modrm_rm = static_cast<uint8_t>(
+        0xC0 | ((src & 7) << 3) | (dst & 7));
     switch (aop) {
-    case Op::plus:  e.u8(0x48); e.u8(0x01); e.u8(0xC8); break;   /* add  */
-    case Op::minus: e.u8(0x48); e.u8(0x29); e.u8(0xC8); break;   /* sub  */
-    case Op::times: e.u8(0x48); e.u8(0x0F); e.u8(0xAF);
-                    e.u8(0xC1);                         break;   /* imul */
-    case Op::band:  e.u8(0x48); e.u8(0x21); e.u8(0xC8); break;   /* and  */
-    case Op::bor:   e.u8(0x48); e.u8(0x09); e.u8(0xC8); break;   /* or   */
-    case Op::bxor:  e.u8(0x48); e.u8(0x31); e.u8(0xC8); break;   /* xor  */
+    case Op::plus:  e.u8(rex_rm); e.u8(0x01); e.u8(modrm_rm); break;
+    case Op::minus: e.u8(rex_rm); e.u8(0x29); e.u8(modrm_rm); break;
+    case Op::band:  e.u8(rex_rm); e.u8(0x21); e.u8(modrm_rm); break;
+    case Op::bor:   e.u8(rex_rm); e.u8(0x09); e.u8(modrm_rm); break;
+    case Op::bxor:  e.u8(rex_rm); e.u8(0x31); e.u8(modrm_rm); break;
+    case Op::times:                       /* imul: reg = dst, rm = src */
+        e.u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
+                                       | (src >= 8 ? 0x01 : 0)));
+        e.u8(0x0F); e.u8(0xAF);
+        e.u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7)));
+        break;
     default:        e.u8(0xCC); /* unreachable by selection */   break;
     }
 }
@@ -11274,7 +11302,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             read_slot(e, RAX, in.a_slot());
             load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
         }
-        op_rr(e, aop);
+        op_rr(e, aop, RAX, RCX);
         /* lever A, the PRODUCER side: elide a dead temp's write; a kept
          * (ref-listed) write reloads RAX in store_dst's COLD arm only. */
         const bool fw = g_fwd.prod == in.target;
@@ -11380,7 +11408,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_reg_shift(e, ck, in.aop, pc, old_pc);
             break;
         default:
-            op_rr(e, in.aop);
+            op_rr(e, in.aop, RAX, RCX);
             break;
         }
         write_slot(e, ck, RAX, in.target, pc);
@@ -11475,7 +11503,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         else
             read_slot(e, RAX, in.a_slot());
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
-        op_rr(e, Op::plus);
+        op_rr(e, Op::plus, RAX, RCX);
         {
             const int_type dv = static_cast<int_type>(in.target2);
             DivMagic mg;
@@ -12430,7 +12458,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         read_slot(e, RCX, in.b_dual_hi());        /* other */
-        op_rr(e, Op::plus);                        /* rax += rcx */
+        op_rr(e, Op::plus, RAX, RCX);                        /* rax += rcx */
         write_slot(e, ck, RAX, in.target, pc);
         return true;
     }
@@ -13407,7 +13435,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     if (bo.aop == Op::mod)
                         e.mov_rr(RAX, RDX);              /* the remainder */
                 } else {
-                    op_rr(e, bo.aop);
+                    op_rr(e, bo.aop, RAX, RCX);
                 }
                 if (comp) {
                     e.store(RAX, slot_addr(in.target).payload);
@@ -14275,6 +14303,38 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                         const std::vector<int> &remap,
                         std::vector<Fixup> &fixups, size_t old_pc)
 {
+    /*
+     * THE STAGING REGISTER. Every int compare and every counted-loop
+     * step in here holds its SECOND operand in one register while the
+     * accumulator sits in rax; `tmp` names that role so the register
+     * is an argument rather than a literal, which is what lets the
+     * census see these sites and what will let the allocator move it.
+     * (rax stays literal for now - it is the `obj`-style role of the
+     * rax increment, audited there in one pass rather than piecemeal.)
+     *
+     * ⛔ WRITE IT THROUGH THE THREE HELPERS BELOW, NOT DIRECTLY. Each
+     * declares the clobber AT the instruction that makes it, which is
+     * the rule a stale blanket declaration broke: three
+     * `e.scratch(RCX)` calls used to sit inside `#ifdef TESTS` next to
+     * a `bump_counter` that CLOBBERS NOTHING (it pushes and pops rax),
+     * so they asserted a register the path does not write - and an
+     * over-broad assert ABORTS a legal fragment the day the register
+     * becomes pinnable. They are deleted; these three replace them,
+     * covering the writes that are real.
+     */
+    const uint8_t tmp = RCX;
+    const auto tmp_lit = [&](uint64_t v) {
+        e.scratch(tmp);
+        e.movabs(tmp, v);
+    };
+    const auto tmp_slot = [&](int slot) {
+        e.scratch(tmp);
+        read_slot(e, tmp, slot);
+    };
+    const auto tmp_operand = [&](bool is_lit, int_type lit, int slot) {
+        e.scratch(tmp);
+        load_operand(e, tmp, is_lit, lit, slot);
+    };
     switch (in.op) {
 
     case OpCode::Jump: {
@@ -14292,8 +14352,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::JumpUnlessIntCmp: {
         /* jump to target when (a cmp b) is FALSE == when negate(cmp). */
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
-        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
-        e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
+        tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot());
+        e.cmp_rr(RAX, tmp);
         emit_cond_jump(e, cc_negate(in.aop),
                        static_cast<size_t>(in.target), begin, end,
                        remap, fixups);
@@ -14330,7 +14390,6 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         if (creg_i >= 0) {
             const uint8_t r = static_cast<uint8_t>(creg_i);
 #ifdef TESTS
-            e.scratch(RCX);
             e.bump_counter(&g_jit_step_imm);
 #endif
             if (lit_step && (in.b_lit() == 1 || in.b_lit() == -1)) {
@@ -14355,8 +14414,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                     && in.a_lit() <= INT32_MAX) {
                 e.cmp_reg_imm(r, static_cast<int32_t>(in.a_lit()));
             } else if (in.a_is_lit()) {
-                e.movabs(RCX, static_cast<uint64_t>(in.a_lit()));
-                e.cmp_rr2(r, RCX);
+                tmp_lit(static_cast<uint64_t>(in.a_lit()));
+                e.cmp_rr2(r, tmp);
             } else {
                 const int acr = e.creg(in.a_slot());
                 if (acr >= 0)
@@ -14374,12 +14433,12 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             e.op_reg_imm(up ? Op::plus : Op::minus, RAX,
                          static_cast<int32_t>(in.b_lit()));
         } else {
-            load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
-            op_rr(e, up ? Op::plus : Op::minus); /* rax += / -= rcx */
+            tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot());
+            op_rr(e, up ? Op::plus : Op::minus, RAX, tmp);
         }
         write_slot(e, ck, RAX, in.target2, pc);
-        load_operand(e, RCX, in.a_is_lit(), in.a_lit(), in.a_slot());
-        e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
+        tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot());
+        e.cmp_rr(RAX, tmp);
         emit_cond_jump(e, in.aop, static_cast<size_t>(in.target),
                        begin, end, remap, fixups);
         return;
@@ -14424,7 +14483,6 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             if (fb)                      /* adapter first - see above */
                 emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
 #ifdef TESTS
-            e.scratch(RCX);
             e.bump_counter(&g_jit_step_imm);
 #endif
             if (fb) {
@@ -14433,8 +14491,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                        && in.b_lit() <= INT32_MAX) {
                 e.op_reg_imm(Op::plus, d, static_cast<int32_t>(in.b_lit()));
             } else if (in.b_is_lit()) {
-                e.movabs(RCX, static_cast<uint64_t>(in.b_lit()));
-                e.op_rr2(Op::plus, d, RCX);
+                tmp_lit(static_cast<uint64_t>(in.b_lit()));
+                e.op_rr2(Op::plus, d, tmp);
             } else {
                 const int bcr = e.creg(in.b_slot());
                 if (bcr >= 0)
@@ -14447,13 +14505,12 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         } else {
             if (fb) {
                 emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
-                read_slot(e, RCX, adst);
+                tmp_slot(adst);
             } else {
                 read_slot(e, RAX, adst);
-                load_operand(e, RCX, in.b_is_lit(), in.b_lit(),
-                             in.b_slot());
+                tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot());
             }
-            op_rr(e, Op::plus);
+            op_rr(e, Op::plus, RAX, tmp);
             write_slot(e, ck, RAX, adst, pc);
         }
 
@@ -14461,7 +14518,6 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         if (ireg >= 0) {
             const uint8_t r = static_cast<uint8_t>(ireg);
 #ifdef TESTS
-            e.scratch(RCX);
             e.bump_counter(&g_jit_step_imm);
 #endif
             e.incdec_reg(r, up);
@@ -14469,8 +14525,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             if (in.a_is_lit() && bnd >= INT32_MIN && bnd <= INT32_MAX) {
                 e.cmp_reg_imm(r, static_cast<int32_t>(bnd));
             } else if (in.a_is_lit()) {
-                e.movabs(RCX, static_cast<uint64_t>(bnd));
-                e.cmp_rr2(r, RCX);
+                tmp_lit(static_cast<uint64_t>(bnd));
+                e.cmp_rr2(r, tmp);
             } else {
                 const int bcr = e.creg(in.a_dual_hi());
                 if (bcr >= 0)
@@ -14485,11 +14541,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8); /* inc/dec */
             write_slot(e, ck, RAX, in.target2, pc);
             if (in.a_is_lit())
-                e.movabs(RCX, static_cast<uint64_t>(
-                                  static_cast<int_type>(in.a_dual_hi())));
+                tmp_lit(static_cast<uint64_t>(
+                            static_cast<int_type>(in.a_dual_hi())));
             else
-                read_slot(e, RCX, in.a_dual_hi());
-            e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
+                tmp_slot(in.a_dual_hi());
+            e.cmp_rr(RAX, tmp);
         }
         /* Either converted half leaves RAX holding something OTHER than
          * what the boxed shape left there, so no consumer may believe a
@@ -14621,8 +14677,8 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         read_slot(e, RAX, in.target2);
         e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8);   /* inc/dec rax */
         write_slot(e, ck, RAX, in.target2, pc);
-        load_operand(e, RCX, in.a_is_lit(), in.a_lit(), in.a_slot());
-        e.u8(0x48); e.u8(0x39); e.u8(0xC8);               /* cmp rax, rcx */
+        tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot());
+        e.cmp_rr(RAX, tmp);
         const size_t j_fall = e.j32(cc_for(cc_negate(in.aop)).short_op);
         if (hoisted) {
             load_slot_idx(e, ir, in.target2);      /* the stepped counter */
