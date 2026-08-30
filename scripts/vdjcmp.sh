@@ -111,6 +111,24 @@ last_off() {
     sed -n 's/^ *\. *+ *\([0-9][0-9]*\):.*/\1/p' "$1" | tail -1
 }
 
+# ⛔ MAKE THE BINARY PATHS ABSOLUTE *BEFORE* THE cd TO THE ROOT.
+#
+# The executable test below runs in the CALLER's directory but every
+# USE of $A/$B happens after `cd "$ROOT"` - so a relative path passed
+# from elsewhere passes the check and then fails on every invocation.
+# CI does exactly that: `vdjcmp.sh ./mylang ./mylang` with
+# working-directory `build/`. The script reported it honestly (a `FAIL`
+# per program, `exit 127`, and a banner saying the run DIED rather than
+# differed - which is the refusal discipline working), but it could
+# never have passed, and it was added to CI in this state.
+for v in A B; do
+    eval "p=\$$v"
+    case "$p" in
+        /*) : ;;
+        *)  eval "$v=\$PWD/\$$v" ;;
+    esac
+done
+
 for bin in "$A" "$B"; do
     if [ ! -x "$bin" ]; then
         echo "error: '$bin' is not an executable" >&2

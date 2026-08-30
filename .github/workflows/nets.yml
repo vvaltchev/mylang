@@ -54,6 +54,20 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: python3 $GITHUB_WORKSPACE/scripts/disasmcheck.py ./mylang --matrix
 
+    # ⛔ AND IS IT REPRODUCIBLE? vdjcmp.sh's SELF-TEST - one binary
+    # against ITSELF over the whole corpus - is what makes every
+    # "emitted code byte-identical" claim mean anything, and until
+    # 2026-08-27 it ran ONLY when someone remembered to. It did not go
+    # wrong quietly: from the day #97 step 1a added the absolute-disp32
+    # operand (whose raw address reached the text) it FAILED on every
+    # invocation and refused to compare. Nobody invoked it.
+    #
+    # A SELF-TEST THAT IS NOT IN CI IS NOT A NET. The whole point of
+    # one is that it fires without being asked.
+    - name: "vdjcmp self-test: -vdj is reproducible"
+      working-directory: ${{github.workspace}}/build
+      run: $GITHUB_WORKSPACE/scripts/vdjcmp.sh ./mylang ./mylang
+
     # the same corpus with each JIT lever forced off, one at a time
     - name: corpus_diff --levers
       working-directory: ${{github.workspace}}/build

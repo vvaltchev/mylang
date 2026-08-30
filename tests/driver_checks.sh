@@ -18,6 +18,7 @@
 # Exit 0 if every check passes, 1 otherwise. POSIX sh, no dependencies.
 
 BIN="${1:-./build/mylang}"
+here=$(dirname "$0")
 [ -x "$BIN" ] || { echo "usage: $0 <path-to-mylang>"; exit 2; }
 
 TMP="${TMPDIR:-/tmp}/mylang-driver-$$"
@@ -263,7 +264,6 @@ fi
 # because every CI lane and the local battery already run this script.
 # The gate fails on drift in EITHER direction: a new unjustified site,
 # or an improvement whose floor was not lowered in the same commit.
-here=$(dirname "$0")
 if command -v python3 >/dev/null 2>&1 && \
    [ -f "$here/../scripts/regcensus.py" ]; then
     if python3 "$here/../scripts/regcensus.py" --gate >/dev/null 2>&1; then
@@ -271,6 +271,41 @@ if command -v python3 >/dev/null 2>&1 && \
     else
         fail "regcensus --gate: floors drifted (run scripts/regcensus.py --gate)"
     fi
+fi
+
+# ⛔ `-vdj` IS REPRODUCIBLE ACROSS PROCESSES - the property
+# scripts/vdjcmp.sh rests on, and the one -rt structurally CANNOT check
+# (it runs in-process, so it can only assert the address-free INVARIANT
+# that implies it; see the `-vdj decodes every emitted form` entry).
+#
+# This is the end-to-end form: two separate runs of the same binary on
+# the same program must produce byte-identical text. It exists because
+# the invariant check, correct as it was, enumerated WHERE an address
+# could appear and went blind to a new operand form (#97 step 1a's
+# absolute disp32) - after which the dump was non-reproducible and
+# vdjcmp.sh refused every comparison, unread, because nothing in the
+# battery ran it.
+# ⛔ AND THE GUARD SAYS WHEN IT SKIPS. The first version tested
+# `grep '^jit 1'` against a `-v` line that is actually indented and
+# column-aligned, so it matched nothing and the whole check skipped in
+# SILENCE - the vacuous-guard trap, in the check written to close a
+# silent gap. A skip is now reported.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    a=$("$BIN" -vdj "$here/../samples/gcd" 2>/dev/null | md5sum)
+    b=$("$BIN" -vdj "$here/../samples/gcd" 2>/dev/null | md5sum)
+    c=$("$BIN" -vdj "$here/../samples/shopping" 2>/dev/null | md5sum)
+    d=$("$BIN" -vdj "$here/../samples/shopping" 2>/dev/null | md5sum)
+    if [ -z "$a" ]; then
+        fail "-vdj produced NO output for samples/gcd - the check is vacuous"
+    elif [ "$a" = "$b" ] && [ "$c" = "$d" ]; then
+        pass "-vdj: two processes, byte-identical dumps"
+    else
+        fail "-vdj is NOT reproducible across processes - a baked address
+      reached the text. Every vdjcmp.sh comparison is void until it is
+      fixed; run '$BIN -vdj samples/gcd' twice and diff to see it."
+    fi
+else
+    echo "  skip  -vdj reproducibility (this build reports jit 0)"
 fi
 
 [ $rc = 0 ] && echo "all driver checks passed"
