@@ -936,6 +936,14 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             modrm(regf, rm);
             o << "movaps xmm" << regf << ", ";
             if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
+        else if (o2 == 0x57) {         /* xorps (#101: the cvtsi2sd
+                                        * merge-dependency break; always
+                                        * reg-reg, dst == src) */
+            const bool reg_form = (c[p] & 0xC0) == 0xC0;
+            const int rm_xmm = c[p] & 7;
+            modrm(regf, rm);
+            o << "xorps xmm" << regf << ", ";
+            if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
         else if (o2 == 0x10 || o2 == 0x11 || o2 == 0x51) {
             /* reg-reg form: the rm REGISTER is an XMM, not a GP (the
              * generic modrm would print `rsi` for xmm6 - found live on

@@ -9095,3 +9095,63 @@ reorder/rename need a decode-transform-reemit platform (the fixup/
 mark/reloc remap this increment deliberately avoided); the
 non-Instr-derived value movabs sites (island_pc, computed constants)
 are enumerable for the same mov_imm treatment; the 7 mov X,X sites.
+
+## #101 increment 2 - the residual sweep + THE MERGE-DEPENDENCY BREAK
+## (2026-08-26): the movsd disease's bigger sibling, 2-4x on its benches
+
+The residuals first: 106 more movabs sites converted to mov_imm after
+a value-vs-address audit of every non-reinterpret_cast site (the
+multi-line calls the increment-1 regex missed - 2,524 emitted sites).
+The audit's judgment calls, recorded: `site` is a packed line|col
+VALUE, `resume_stub` a remapped pc, `callee_arg` a slot index - all
+convert; `depth_addr`/`pool` are addresses and `q[0..2]` can hold a
+BUILTIN's function pointers (LoadBuiltinV's 24-byte payload copy), so
+they stay movabs. mov X,X now suppressed at the mov_rr seam (8 corpus
+sites, allocation coincidences). The myv_round_trip oracle guards the
+whole classification: a wrongly-converted address fails it the way
+increment 1's first version did.
+
+**THE HEADLINE - the cvtsi2sd MERGE-DEPENDENCY BREAK.** The census
+for levels 3-4 found 174 cvtsi2sd sites; the instruction merges into
+its destination's upper 64 bits, so every convert DEPENDS ON THE
+REGISTER'S LAST WRITER - the exact movsd disease the movaps fix cured
+for fmov_rr, sitting on every int->float promote arm. In a float loop
+whose counter promotes per iteration (`s = s + i` - 55_float_sum's
+hot loop, literally `cvtsi2sd xmm0, i`), the false dep CHAINS THE
+ITERATIONS. `xorps dst,dst` before the convert is recognized at
+rename (no execution dependency), touches no flags, and the upper
+half was dead anyway (every consumer is a scalar sd op - the movaps
+argument verbatim). Emitted at both cvt seams, lever-gated.
+
+MEASURED (OPT=1 ASSERTS=0, interleaved --baseline, full suite; the
+surprising numbers re-measured per the distrust rule, and the two
+apparent regressions re-measured to Ir-exact-flat + wall 1.01x -
+first-run noise): **suite geomean cur/base 0.954x over 89**, from
+
+    05_mixed_arith    0.26x     55_float_sum      0.26-0.29x
+    40_math_builtins  0.54x     64_struct_create  0.43x
+    88_elem_float_c.  0.72x
+
+- 55 also confirmed by a SAME-BINARY lever A/B (peep-on ~4x faster).
+The Ir ledger is FLAT to +1 instruction per convert: this win is
+INVISIBLE to callgrind, like the movaps one - stalls, not counts.
+
+THE LEVELS 3-4 DECISION, from the census (recorded so it is not
+re-litigated without new data): the generic decode-transform-reemit
+platform is DECLINED. Level 3's residue after lever A and the
+allocator is 180 store->reload pairs at distance 2-4 corpus-wide
+(~1.5/program, low heat), and latency scheduling proper is the OOO
+core's job (a 500+ instruction window). Level 4's one REAL class was
+the merge deps - fixed above at the seam, no platform needed. The
+platform's cost (full fixup/mark/reloc remap + x86 semantic modeling,
+each bug a silent wrong answer) buys nothing this data can see - the
+M4b shape. Re-open with a measurement, not an idea.
+
+WATCHED FAILING: the order-inverted sabotage (xorps AFTER the
+convert) fails 17 tests - the emission order is load-bearing and the
+nets see the value; a wrong-REGISTER sabotage passed everything
+(structurally harmless in this allocator's layout - recorded as the
+weak sabotage, the counter + disasmcheck being the real net for a
+silently-missing break). peep_selfmov/peep_depbrk join the report
+table; the -rt probe's float loop pins depbrk reach in both lever
+states.
