@@ -1,0 +1,47 @@
+# The COMPOUND element store's ARITHMETIC arm (#95's read-modify-write
+# tail): `a[i] OP= v` on a flat int array, inside a JIT'd run, for all
+# five operators. Every one lands in the same three-instruction tail -
+# load the element, apply the op, store it back - and the operand
+# registers there come from the threaded ElemScratch plan.
+#
+# ⛔ WHY THIS FILE EXISTS. Until it was written, the ENTIRE corpus
+# (bench/my + samples + tests/functional) emitted this arm ZERO times.
+# So `scripts/vdjcmp.sh` - the oracle for "my emitter change is a pure
+# restructuring" - reported 108/108 identical for a change that
+# rewrote every instruction in the arm, and would have reported the
+# same for one that broke it. A tool cannot compare code no program
+# emits, and 108/108 looks exactly the same either way.
+#
+# Found during #96 step 2, converting the arm off its hardcoded RDI.
+# Reach is `MYLANG_JITSTATS=1` -> `hoist_rmw` / `store_fast`.
+#
+# THE RESULT IS SELF-CHECKING BY COMPOSITION: += and -= of the same k
+# cancel, then *= and /= of the same k cancel, so a[i] returns to its
+# original i+7 and only the final %= survives into the sum. Getting any
+# one of the five wrong changes the total, so this is not a test that
+# merely runs the shape - it prices every operator.
+
+int n = int(runtime(64));
+int k = int(runtime(3));
+
+array<int> a = [];
+for (var i = 0; i < n; i++) { append(a, i + 7); }
+
+for (var i = 0; i < n; i++) { a[i] += k; }   # i+7+3
+for (var i = 0; i < n; i++) { a[i] -= k; }   # i+7
+for (var i = 0; i < n; i++) { a[i] *= k; }   # 3(i+7)
+for (var i = 0; i < n; i++) { a[i] /= k; }   # i+7
+for (var i = 0; i < n; i++) { a[i] %= k; }   # (i+7) % 3
+
+# (i+7)%3 over i=0..63 cycles 1,2,0 starting at 1: 21 full cycles (63)
+# plus a leading 1 => 21*3 + 1 = 64.
+var got = sum(a);
+if (got != 64) { print("FAIL rmw sum: ", got); } else { print("ok rmw"); }
+
+# the DIVISOR-in-a-register arm again, with a negative dividend, so the
+# sign handling of idiv (not just its encoding) is exercised too.
+array<int> b = [];
+for (var i = 0; i < n; i++) { append(b, 0 - (i + 7)); }
+for (var i = 0; i < n; i++) { b[i] /= k; }
+var gotb = sum(b);
+if (gotb != -800) { print("FAIL rmw negdiv: ", gotb); } else { print("ok negdiv"); }

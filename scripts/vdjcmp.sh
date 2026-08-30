@@ -90,10 +90,47 @@ fi
 
 same=0
 diffs=0
+fails=0
 for f in bench/my/*.my samples/* tests/functional/*.my; do
     [ -f "$f" ] || continue
-    "$A" -vdj "$f" > "$TMP/a" 2>/dev/null
-    "$B" -vdj "$f" > "$TMP/b" 2>/dev/null
+    "$A" -vdj "$f" > "$TMP/a" 2>"$TMP/ae"; rca=$?
+    "$B" -vdj "$f" > "$TMP/b" 2>"$TMP/be"; rcb=$?
+    #
+    # ⛔ A RUN THAT FAILED IS NOT A DIFFERENCE, AND SAYING SO IS THE
+    # WHOLE POINT (2026-08-18). This loop used to send both dumps to
+    # /dev/null and compare them without ever looking at the exit
+    # status. A binary that died - a signal, an OOM, a sanitizer abort,
+    # a bad argument - therefore produced a truncated or EMPTY dump,
+    # `cmp` duly reported it as different, and the script printed
+    # `DIFF: <prog>` - the exact output a genuine emitted-code
+    # regression produces. The two are indistinguishable, and the
+    # failure is the more likely of the two during an emitter
+    # conversion, which is precisely when this script is trusted most.
+    #
+    # It bit for real: one run of this script reported
+    # `108 identical / 1 differing` for bench/my/29_str_slice_readonly,
+    # while the same two binaries produced byte-identical dumps for
+    # that program 200 times in a row when asked directly. A one-off
+    # flake that reads as a code change is worse than no oracle,
+    # because the next real regression gets waved away as "that flake
+    # again".
+    #
+    # Verified premise: `-vdj` DUMPS and exits - it never runs the
+    # program - so across the whole corpus it exits 0 with a non-empty
+    # dump. A non-zero status or an empty file is therefore
+    # unambiguously a failed run, never a legitimate result.
+    #
+    # This is CLAUDE.md's instrument property 2, "it says when it does
+    # not know", applied to the script rather than to the disassembler
+    # it reads.
+    if [ $rca -ne 0 ] || [ $rcb -ne 0 ] || \
+       [ ! -s "$TMP/a" ] || [ ! -s "$TMP/b" ]; then
+        fails=$((fails + 1))
+        echo "FAIL: $f  (exit $rca/$rcb," \
+             "$(wc -c < "$TMP/a")/$(wc -c < "$TMP/b") bytes)"
+        head -3 "$TMP/ae" "$TMP/be" 2>/dev/null | sed 's/^/    /'
+        continue
+    fi
     if cmp -s "$TMP/a" "$TMP/b"; then
         same=$((same + 1))
     else
@@ -105,5 +142,11 @@ for f in bench/my/*.my samples/* tests/functional/*.my; do
     fi
 done
 
-echo "identical: $same   differing: $diffs"
+echo "identical: $same   differing: $diffs   failed: $fails"
+if [ "$fails" -ne 0 ]; then
+    echo "error: $fails program(s) could not be disassembled by one or" >&2
+    echo "       both binaries. Those are NOT differences - the run" >&2
+    echo "       died - and no verdict below covers them." >&2
+    exit 2
+fi
 [ "$diffs" -eq 0 ]
