@@ -17856,9 +17856,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             return true;
         }
         std::vector<size_t> jhelp;
-        jhelp.push_back(emit_ref_check_jae(e, src.type));
-        if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
-                               static_cast<int32_t>(in.target)))
+        /*
+         * ⛔ BOTH CHECKS ARE `ref_slots` QUESTIONS, AND ONLY THE DEST
+         * ONE ASKED. The source test - four instructions loading the
+         * source's Type*, dereferencing its `t` field and branching -
+         * is exactly the "can this slot hold a reference" question the
+         * chunk-wide invariant already answers, and an un-listed source
+         * provably cannot. It fired on every argument-staging move in
+         * the corpus (`scripts/jitprofile.py` put the staging move at
+         * 17 Ir, where the #162 recognizer's own comment estimated 8 -
+         * which is how an unasked question stays unasked).
+         */
+        if (jit_slot_ref_listed(ck, static_cast<int>(in.target2)))
+            jhelp.push_back(emit_ref_check_jae(e, src.type));
+        if (jit_slot_ref_listed(ck, static_cast<int>(in.target)))
             jhelp.push_back(emit_ref_check_jae(e, dst.type));
         AccScratch acc(e);
         e.load(acc.r, src.type);

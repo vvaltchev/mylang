@@ -35,7 +35,15 @@ void collect_funcs(const Construct *c,
  * them in a SECOND pass, so a caller's native-call gate sees every callee's
  * flag (#55 STEP 2's ordering fix). Disasm / -rt / the default keep true.
  */
-Chunk codegen_chunk(const Block *block, int slot_count, bool jit = true);
+/*
+ * `ref_seeds` - slots the CALLER knows can hold a reference but no
+ * instruction writes: the non-scalar PARAMETER slots, filled by the
+ * bind. They must go IN rather than be unioned with the result, because
+ * `ref_slots`' MoveV rule propagates from a source (see the note in
+ * compute_ref_slots).
+ */
+Chunk codegen_chunk(const Block *block, int slot_count, bool jit = true,
+                    const std::vector<int32_t> *ref_seeds = nullptr);
 
 /* The root/main wrapper: codegen_chunk(root, root->slot_count). */
 Chunk codegen_program(const Block *root, bool jit = true);
@@ -388,3 +396,11 @@ extern unsigned long g_bc_inline_caller_frames;
 /* Total call sites spliced - the shape matrix's non-vacuity check. */
 extern unsigned long g_bc_inline_splices;
 extern unsigned long g_ref_slots_proven_excluded;   /* C3 (TESTS) */
+/*
+ * #97: slots the MoveV rule kept OUT of `ref_slots` - a move's dst is a
+ * reference only if its SOURCE can hold one. An EMIT-time counter,
+ * because the thing it proves is an ABSENCE: the dst's ref-check, the
+ * bind's per-argument test and the frame pop's release scan are simply
+ * not emitted for it, so no emitted-code counter could see it.
+ */
+extern unsigned long g_ref_slots_move_excluded;    /* #97 (TESTS) */

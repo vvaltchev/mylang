@@ -29268,6 +29268,123 @@ static bool jit_fwd_deadtemp()
  * function's params stay listed (its calls are not all
  * compile-checked), asserted here by the counter NOT growing.
  */
+
+/*
+ * ⛔ #97 - `ref_slots` AND THE MoveV RULE. A move's dst can hold a
+ * reference only if its SOURCE can, and until 2026-08-27 the table said
+ * "always": `op_writes_scalar` cannot list MoveV (it copies whatever is
+ * there), so the conservative fallback marked every dst - and since a
+ * call's arguments are STAGED by MoveV, every argument temp in every
+ * program was reference-carrying, for an `int` argument, forever.
+ *
+ * BOTH DIRECTIONS, and the SECOND is the one that matters: this rule
+ * SHRINKS a set whose under-approximation is a leak or a
+ * use-after-free, so a false "scalar" is far worse than a missed one.
+ *
+ * The soundness nets are `jit_ret_audit` and the VM_HARDENING
+ * pop_window every-slot-trivial audit; both are live in this build, so
+ * the reference case below is checked by RUNNING it. The counter is the
+ * ENGAGEMENT proof - an elision emits no instruction, so nothing else
+ * can see whether the rule fired at all.
+ */
+static bool ref_slots_move_rule()
+{
+    auto go = [&](const std::vector<const char *> &src)
+        -> std::pair<std::string, unsigned long> {
+        const unsigned long c0 = g_ref_slots_move_excluded;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return { cap.str(), g_ref_slots_move_excluded - c0 };
+    };
+    bool ok = true;
+    /*
+     * FIRES: an int argument staged into a call's run. The callee is
+     * impure and big enough to survive the inliner, or there is no call
+     * and no staging move at all (the vacuous-test trap - watched: a
+     * one-line callee is spliced away and the counter reads 0).
+     */
+    {
+        auto [out, n] = go({
+            "var sink = 0;",
+            "func hot(dyn k) {",
+            "  sink = sink + 1;",
+            "  var dyn a = k * 3; var dyn b = a + k; var dyn c = b - 1;",
+            "  var dyn d = c * 2; var dyn e = d + 5; var dyn f = e - k;",
+            "  var dyn g = f * 3; var dyn h = g + 1;",
+            "  return h;",
+            "}",
+            "func drive(int reps) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < reps; i++) s = s + hot(i);",
+            "  return s;",
+            "}",
+            "print(drive(runtime(20)));" });
+        if (n == 0) {
+            fprintf(stderr, "ref_slots_move_rule: an INT argument's "
+                    "staging move still marks its temp reference-"
+                    "carrying - the rule did not fire\n");
+            ok = false;
+        }
+        if (out.find("4190") == std::string::npos) {
+            fprintf(stderr, "ref_slots_move_rule: wrong answer '%s'\n",
+                    out.c_str());
+            ok = false;
+        }
+    }
+    /*
+     * DECLINES, and is RUN: an array argument moved into a temp that is
+     * still live at the frame pop. A wrongly-excluded slot leaks it (or,
+     * under VM_HARDENING, aborts the every-slot-trivial audit at
+     * pop_window). The array is REBUILT each iteration so the move is a
+     * real reference write, and the result is asserted so the case
+     * cannot pass by not running.
+     */
+    {
+        auto [out, n] = go({
+            "var sink = 0;",
+            "func take(dyn arr, dyn k) {",
+            "  sink = sink + 1;",
+            "  var dyn t = len(arr) + k; var dyn u = t * 2;",
+            "  var dyn v = u - 1; var dyn w = v + 3;",
+            "  var dyn x = w * 2; var dyn y = x - k;",
+            "  return y;",
+            "}",
+            "func drive2(int reps) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < reps; i++) {",
+            "    var box = [i, i + 1, i + 2];",
+            "    var alias = box;",
+            "    s = s + take(alias, i);",
+            "  }",
+            "  return s;",
+            "}",
+            "print(drive2(runtime(20)));" });
+        (void)n;
+        if (out.find("890") == std::string::npos) {
+            fprintf(stderr, "ref_slots_move_rule: the reference-argument "
+                    "shape answered '%s'\n", out.c_str());
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static bool ref_slots_proven_params()
 {
     auto go = [&](const std::vector<const char *> &src)
@@ -37360,6 +37477,8 @@ static const std::vector<extra_check> extra_checks =
       jit_fcache_c2 },
     { "vm: C3 - inference-proven params leave the ref_slots release scan",
       ref_slots_proven_params },
+    { "codegen: a MoveV's dst is ref-listed only when its SOURCE can hold "
+      "a reference", ref_slots_move_rule },
     { "jit: C3 - type-elided slots (write elision + the exit/barrier "
       "type flush)",
       jit_telide_c3 },

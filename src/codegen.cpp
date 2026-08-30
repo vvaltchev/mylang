@@ -9370,19 +9370,76 @@ bool op_writes_scalar(OpCode op)
     }
 }
 
-static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
+static void compute_ref_slots(const std::vector<CgInstr> &code,
+                              Chunk &chunk,
+                              const std::vector<int32_t> *seeds)
 {
     const int total = chunk.slot_count + chunk.n_temps;
     std::vector<char> is_ref(total, 0);
     bool bail = false;
 
+    /*
+     * ⛔ THE PARAMETER SEEDS COME IN, THEY ARE NOT MERGED AFTERWARDS -
+     * and getting that backwards is the audit-table STAGE trap, caught
+     * by `jit_ret_audit` on the first run.
+     *
+     * A reference PARAMETER's slot is written by the BIND, which is no
+     * instruction, so `visit_use_def` cannot see it; `compile_func_body`
+     * used to union the non-scalar params into `ref_slots` AFTER this
+     * function returned. That was fine while every write was marked
+     * independently - and became wrong the moment a MoveV's answer
+     * DEPENDED on its source, because `move t = param` then propagated
+     * from a source this pass believed trivial. The fix is not to redo
+     * the union later but to make the input COMPLETE here.
+     */
+    if (seeds)
+        for (const int32_t sl : *seeds)
+            if (sl >= 0 && sl < total)
+                is_ref[sl] = 1;
+
+    /*
+     * ⛔ A `MoveV` IS NOT A REFERENCE WRITE - IT IS ITS SOURCE'S ANSWER,
+     * and treating it as an unconditional one made EVERY argument temp
+     * in the program reference-carrying.
+     *
+     * `op_writes_scalar` cannot list MoveV: it copies whatever the
+     * source holds, which is the whole point of the op. So the fallback
+     * marked its dst, and since a call's arguments are STAGED by MoveV,
+     * `ref_slots` claimed every argument temp could hold a reference -
+     * for an `int` argument, forever. The cost was silent and paid three
+     * times per call: the staging move's own dest ref-check, the bind
+     * copy's per-argument source test, and the frame pop's release scan.
+     * It also made the #162 fusion's "only a ref-listed slot" gate look
+     * like it separated shapes it did not.
+     *
+     * The refinement is one line of dataflow: `is_ref[dst] |= is_ref[src]`
+     * for a move, to a FIXPOINT (a move can precede its source's own
+     * marking - a loop body's move reads a slot a later op writes), and
+     * conservative in every other direction. It only ever SHRINKS the
+     * set, which is the dangerous direction, so the oracle matters: the
+     * VM_HARDENING full-window audit at `pop_window` asserts every
+     * NON-listed slot is trivial when the frame pops, and `jit_ret_audit`
+     * asserts the same about the emitted return path.
+     */
+    std::vector<std::pair<int, int>> moves;
     for (const CgInstr &in : code) {
         const bool known = visit_use_def(
             in, [](int) {},
             [&](int dslot) {
-                if (dslot >= 0 && dslot < total
-                    && !op_writes_scalar(in.op))
-                    is_ref[dslot] = 1;
+                if (dslot < 0 || dslot >= total)
+                    return;
+                if (op_writes_scalar(in.op))
+                    return;
+                if (in.op == OpCode::MoveV) {
+                    /* deferred to the fixpoint below - the source
+                     * decides, and it may not be marked yet */
+                    const int src = static_cast<int>(in.target2);
+                    if (src >= 0 && src < total) {
+                        moves.push_back({ dslot, src });
+                        return;
+                    }
+                }
+                is_ref[dslot] = 1;
             });
         if (!known) {
             /* A barrier op writes slots we can't enumerate (pool-target
@@ -9421,10 +9478,30 @@ static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
             if (cl.bind_slot >= 0 && cl.bind_slot < total)
                 is_ref[cl.bind_slot] = 1;
 
+    /* the move fixpoint - AFTER the catch binds, so a moved-from catch
+     * variable propagates too. Bounded by `moves.size()` passes; in
+     * practice it settles in one or two. */
+    for (size_t round = 0; round <= moves.size() && !bail; round++) {
+        bool changed = false;
+        for (const auto &mv : moves)
+            if (is_ref[mv.second] && !is_ref[mv.first]) {
+                is_ref[mv.first] = 1;
+                changed = true;
+            }
+        if (!changed)
+            break;
+    }
+
     chunk.ref_slots.clear();
     for (int i = 0; i < total; i++)
         if (bail || is_ref[i])
             chunk.ref_slots.push_back(i);
+#ifdef TESTS
+    if (!bail)
+        for (const auto &mv : moves)
+            if (!is_ref[mv.first])
+                g_ref_slots_move_excluded++;   /* the engagement proof */
+#endif
 }
 
 /* model-flip nativize-ops: copy each BinOpV/CmpV/CompoundV's FINAL operand data
@@ -10323,7 +10400,8 @@ void build_boxed_ops(Chunk &chunk)
 }
 
 Chunk
-codegen_chunk(const Block *block, int slot_count, bool jit)
+codegen_chunk(const Block *block, int slot_count, bool jit,
+              const std::vector<int32_t> *ref_seeds)
 {
     Codegen cg;
     cg.temp_base = cg.next_temp = cg.max_temp = slot_count;
@@ -10397,7 +10475,7 @@ codegen_chunk(const Block *block, int slot_count, bool jit)
     /* B3 stage 2: SLICE the runtime Instr sub-objects out of the codegen's
      * CgInstr vector - the runtime Chunk cannot hold a node handle AT THE
      * TYPE LEVEL (CgInstr, bytecode.h). */
-    compute_ref_slots(cg.code, cg.chunk);   /* profile #2 - the audited
+    compute_ref_slots(cg.code, cg.chunk, ref_seeds);  /* profile #2 - audited
                                              * reference-slot list */
     cg.chunk.code.assign(cg.code.begin(), cg.code.end());
     specialize_arith_ops(cg.chunk);   /* B1/B2 - AFTER extract_locs: an
@@ -10483,22 +10561,24 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
     if (!body->scope_free)
         throw_not_lowered(fn);
 
-    /* EVERY callable body keeps its chunk - even an empty/no-op one (a bare
-     * Halt returning none): after the AST teardown the chunk is the only way
-     * to run the body, so there is no "not worth it" tier anymore. */
-    out = codegen_chunk(body, fn->desc->frame_size, jit);
-
-    /* Param slots join ref_slots unless the param is int/float-COERCED
-     * (bind_param's coerce guarantees those never hold a reference) or
-     * inference-PROVEN i/f (C3: ParamDesc::proven_type - every call
-     * path is compile-checked, see funcdesc.h; the VM_HARDENING
-     * pop_window audit is the net). The BIND writes refs into param
-     * slots, which no chunk op accounts for. */
-    std::vector<int32_t> merged;
+    /* Param slots are ref_slots SEEDS unless the param is int/float-
+     * COERCED (bind_param's coerce guarantees those never hold a
+     * reference) or inference-PROVEN i/f (C3: ParamDesc::proven_type -
+     * every call path is compile-checked, see funcdesc.h; the
+     * VM_HARDENING pop_window audit is the net). The BIND writes refs
+     * into param slots, which no chunk op accounts for.
+     *
+     * ⛔ THEY GO IN, they are not merged with the RESULT. That was the
+     * order until 2026-08-27 and it was safe only while every write was
+     * marked independently of every other; `ref_slots`' MoveV rule
+     * propagates from a SOURCE, so a `move t = param` computed with the
+     * params still missing answered "trivial" for a reference. Caught by
+     * `jit_ret_audit` on the first run - watched. */
+    std::vector<int32_t> seeds;
     const auto &params = fn->desc->params;
     for (size_t i = 0; i < params.size(); i++) {
         if (!params[i].binds_scalar()) {
-            merged.push_back(static_cast<int32_t>(i));
+            seeds.push_back(static_cast<int32_t>(i));
         }
 #ifdef TESTS
         else if (params[i].proven_type == DeclType::i
@@ -10507,10 +10587,11 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
         }
 #endif
     }
-    merged.insert(merged.end(), out.ref_slots.begin(), out.ref_slots.end());
-    std::sort(merged.begin(), merged.end());
-    merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
-    out.ref_slots = std::move(merged);
+
+    /* EVERY callable body keeps its chunk - even an empty/no-op one (a bare
+     * Halt returning none): after the AST teardown the chunk is the only way
+     * to run the body, so there is no "not worth it" tier anymore. */
+    out = codegen_chunk(body, fn->desc->frame_size, jit, &seeds);
     return true;
 }
 
@@ -10722,6 +10803,7 @@ unsigned long g_bc_inline_caller_frames = 0;
  * shape it believes is spliceable actually was - without it a "all modes
  * agree" table is satisfied by a pass that inlines nothing. */
 unsigned long g_bc_inline_splices = 0;
+unsigned long g_ref_slots_move_excluded = 0;    /* #97 (TESTS) */
 unsigned long g_ref_slots_proven_excluded = 0;  /* C3 (TESTS): params the
                                                  * proven-type stamp kept
                                                  * out of ref_slots */

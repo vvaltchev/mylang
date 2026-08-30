@@ -9786,3 +9786,92 @@ where a SEAM exists to collect it.** The arena was in place for ten
 days; these three sites kept their two-instruction forms because no
 encoder offered the one-instruction one, and nothing in the tree could
 notice.
+
+## #97 step 5 - `ref_slots` LEARNS WHAT A `MoveV` ACTUALLY WRITES
+## (2026-08-27)
+
+**MEASURED FIRST, for once.** `scripts/jitprofile.py` (built in the
+same session, because nothing could answer this) put a 1-argument call
+to a 3-op function at **142 Ir**, split exactly:
+
+    the ARGUMENT round trip     28   (17 staging move + 11 bind copy)
+    ACTIVATION bookkeeping      71   (segment fit, window advance, the
+                                      record gate, vframe + captures
+                                      repoints, residue push/pop, and a
+                                      26-instruction residue RETURN arm)
+    the irreducible call        24
+    the callee's entry + body   15
+
+and the marginal cost of one more argument at **28 Ir**, measured
+independently by varying the arity. The `#162` recognizer's own comment
+estimated the staging move at "~8 instrs". It is 17.
+
+**WHY 17.** `MoveV`'s emit tests BOTH sides for reference-ness before
+the raw copy - four instructions each - and only the DEST test was
+gated on `ref_slots`. The source test was unconditional, though it asks
+exactly the question the chunk-wide invariant already answers. Gating
+it: **-4 per staged argument**, and it needed nothing but the gate its
+sibling already had.
+
+**AND WHY THE DEST TEST FIRED ON EVERY ARGUMENT IN THE CORPUS.**
+`op_writes_scalar` cannot list `MoveV` - it copies whatever the source
+holds, which is the op's whole point - so `compute_ref_slots`'
+conservative fallback marked its dst. A call's arguments are STAGED by
+MoveV, so **every argument temp in every program was
+reference-carrying**, for an `int` argument, forever. The cost was paid
+three times per call: the staging move's dest check, the bind copy's
+per-argument source test, and the frame pop's release scan. It also made
+`#162`'s "only a ref-listed slot is ever fused" gate look like it
+separated shapes it did not.
+
+The rule is one line of dataflow - `is_ref[dst] |= is_ref[src]` for a
+move, to a fixpoint, since a loop body's move can precede its source's
+own marking - and conservative everywhere else.
+
+    63_closures          -1.11%   (the A/B: the move rule alone)
+    76_funcval_dispatch   0.00%
+    09_fib_recursive      0.00%
+
+**Small, and honestly so.** It is kept for three reasons beyond the
+number: it only ever SHRINKS a set that was wrong in the expensive
+direction; it shortens the return-path release scan everywhere; and it
+forced the ordering fix below, which was a latent trap for any future
+refinement.
+
+**⛔ THE ORDERING FIX, AND `jit_ret_audit` CAUGHT IT ON THE FIRST RUN.**
+A reference PARAMETER's slot is written by the BIND, which is no
+instruction, so `visit_use_def` cannot see it - `compile_func_body`
+unioned the non-scalar params into `ref_slots` AFTER `compute_ref_slots`
+returned. That was safe while every write was marked INDEPENDENTLY, and
+became wrong the instant a MoveV's answer DEPENDED on its source: `move
+t = param` then propagated from a source the pass believed trivial. The
+fix is not to redo the union later but to make the INPUT complete -
+`codegen_chunk` takes `ref_seeds` and the params go in before the
+fixpoint.
+
+**The generalisation: a table's inputs must be complete before any rule
+in it becomes RELATIONAL.** An entirely-independent marking pass
+tolerates a late union; the first rule that reads one entry to decide
+another does not. Same family as the audit-table stage trap, one level
+in.
+
+**SABOTAGE LEDGER**, each reintroduced, built and watched failing:
+
+    the seeds merged AFTER (the old order) -> jit_ret_audit, rc 134
+    the move propagation deleted           -> jit_ret_audit, rc 134
+    the MoveV DEST check dropped           -> -rt AND corpus_diff fail
+    the SOURCE check never emitted         -> -rt AND corpus_diff fail
+
+**THE NEXT REFINEMENT, IDENTIFIED AND NOT BUILT:** `LoadConstV` is in
+the same position MoveV was. It is absent from `op_writes_scalar`
+because a constant can be a string or an array - but WHICH constant is
+known at codegen time, and `compute_ref_slots` holds the pool. A loop
+counter initialised by `load i, 0` is marked reference-carrying today,
+which then propagates into every argument staged from it.
+
+NETS: -rt 1964/1964 on dbg(ASan+UBSan), RECYCLE=1, rel-hard(VM_HARDENING)
+and clang; corpus_diff plain/--levers/--xrot/--cold/--nolowmem;
+disasmcheck vs objdump zero disagreements; driver_checks; norec_enum
+--depth 3. The soundness oracle for a SHRUNK `ref_slots` is
+`jit_ret_audit` plus the VM_HARDENING every-slot-trivial audit at
+`pop_window`, and both demonstrably fire.
