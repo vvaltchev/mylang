@@ -29886,6 +29886,264 @@ static bool ref_slots_move_rule()
     return ok;
 }
 
+/*
+ * ⛔ THE CALLEE-SET ANALYSIS (#116), asserted through its own dump -
+ * and the dump is not a convenience, it is the ONLY oracle there can
+ * be. This analysis changes no answer any program computes, so the
+ * five-mode engine differential, corpus_diff and every fuzzer are
+ * blind to it BY CONSTRUCTION (CLAUDE.md, *Testing an AST TRANSFORM*).
+ * What has to be asserted is the SET.
+ *
+ * Two halves, and the second is the one that matters:
+ *
+ *  1. one case per CONSTRAINT FORM - a lambda literal, a copy chain, a
+ *     return value, an array element, a dict value, a struct field, a
+ *     ternary, a parameter, `append` - each pinning the exact set;
+ *  2. one case per ⊤ SINK. A sink that quietly stopped answering ⊤
+ *     would make the analysis claim knowledge it does not have, and a
+ *     wrong MUST answer is a RULE 1 violation: #115's consumer types a
+ *     closure's parameters from the sites it can see, and every
+ *     unboxed tier downstream is built on that proof.
+ *
+ * ⛔ AND THE ⊥ CASES ARE ASSERTED TOO, because ⊥ ("no function value
+ * can reach here") and ⊤ ("I do not know") are DIFFERENT answers -
+ * that distinction is the entire reason this replaces
+ * StaticType::finfos, which could express only one of them and needed
+ * the escaped_finfos side ledger to fake the other.
+ *
+ * WATCHED FAILING, one sabotage build per rule (2026-08-28):
+ *   None-is-unpinned -> false          FAIL [append writes the container]
+ *   append/push not modelled           FAIL [append writes the container]
+ *   one shared heap, no alloc sites    FAIL [single-element array] + 4 more
+ *   LiteralObj back to a blanket ⊤     FAIL [append writes the container]
+ *   builtin arguments do not escape    FAIL [escape: a builtin argument]
+ *   a catch binding is not ⊤           FAIL [sink: a catch binding]
+ * A seventh - "a builtin's RESULT is ⊤" - PASSED, and that is
+ * recorded rather than papered over: the branch is redundant (a
+ * builtin name has no TypeSym, so the generic path reaches the same
+ * ⊤), and it now carries an ML_CHECK saying so.
+ */
+static bool callee_set_analysis()
+{
+    /* run the analysis over a program and return its -dcs text */
+    auto dcs = [&](const std::vector<const char *> &src) -> std::string {
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::ostringstream os;
+        try {
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            dump_callee_sets(root.get(), os);
+        } catch (Exception &e) {
+            return std::string("EXCEPTION: ") + e.name;
+        }
+        return os.str();
+    };
+
+    bool ok = true;
+    auto want = [&](const char *what, const std::vector<const char *> &src,
+                    const std::vector<const char *> &lines) {
+        const std::string out = dcs(src);
+        for (const char *l : lines) {
+            if (out.find(l) != std::string::npos)
+                continue;
+            cout << "  callee-set [" << what << "]: missing row\n"
+                 << "    want: " << l << "\n    got:\n" << out;
+            ok = false;
+            return;
+        }
+    };
+    /* the negative half: this row must NOT appear */
+    auto reject = [&](const char *what,
+                      const std::vector<const char *> &src,
+                      const char *line) {
+        const std::string out = dcs(src);
+        if (out.find(line) != std::string::npos) {
+            cout << "  callee-set [" << what << "]: forbidden row present\n"
+                 << "    row: " << line << "\n    got:\n" << out;
+            ok = false;
+        }
+    };
+
+    /* ------------------- the constraint forms ------------------- */
+
+    /* pts(g) ⊇ pts(f) - a copy chain, and the answer is the FUNCTION,
+     * not the shape: `neg` has the identical type and must not be in
+     * the set (this is what `finfos` got wrong - two functions with one
+     * signature were interchangeable to every equality-based path). */
+    want("copy chain", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "var a = sq;",
+        "var b = a;",
+        "print(b(2));" },
+        { "dcs\t5\t7\t-\tone\tsq" });
+
+    /* pts(k) ⊇ pts(ret(mk)) - through a return value */
+    want("return value", {
+        "func sq(int x) => x * x;",
+        "func mk() { var t = sq; return t; }",
+        "var k = mk();",
+        "print(k(3));" },
+        { "dcs\t4\t7\t-\tone\tsq" });
+
+    /* pts(elem(p)) ⊇ pts(a) ∪ pts(b), then pts(q) ⊇ pts(elem(p)) -
+     * TWO candidates, so no MUST answer. The index is not modelled and
+     * must not be: `p[0]` is `many`, never `one`. */
+    want("array element", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "var p = [sq, neg];",
+        "var q = p[runtime(0)];",
+        "print(q(4));" },
+        { "dcs\t5\t7\t-\tmany\tneg,sq" });
+
+    /* ...and a one-element container keeps the MUST answer. This is
+     * the case a single shared "heap" location would lose, which is
+     * why the analysis has one object per ALLOCATION SITE. */
+    want("single-element array", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "var one = [neg];",
+        "print(one[0](5));" },
+        { "dcs\t4\t7\t-\tone\tneg" });
+
+    /* ⛔ APPEND IS A WRITE, NOT AN OPAQUE BUILTIN. Treating every
+     * builtin as a black box loses the STORE, so the array stayed
+     * empty and this answered ⊥ - "nothing can reach here" - for a
+     * call that plainly reaches a closure. Found by the dump on the
+     * corpus (22_closure_store.my). */
+    want("append writes the container", {
+        "func mk(int k) => func [k] (int x) => x + k;",
+        "var fns = [];",
+        "append(fns, mk(3));",
+        "var g = fns[0];",
+        "print(g(1));" },
+        { "dcs\t5\t7\t-\tone\tlambda@1:19" });
+
+    /* a dict VALUE, and a struct FIELD */
+    want("dict value", {
+        "func neg(int x) => 0 - x;",
+        "var d = {\"k\": neg};",
+        "print(d[\"k\"](8));" },
+        { "dcs\t3\t7\t-\tone\tneg" });
+    want("struct field", {
+        "func sq(int x) => x * x;",
+        "struct Holder { dyn fn; }",
+        "var h = Holder(sq);",
+        "print(h.fn(7));" },
+        { "dcs\t4\t7\t-\tone\tsq" });
+
+    /* a ternary is the UNION of its arms */
+    want("ternary", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "var t = runtime(1) > 0 ? sq : neg;",
+        "print(t(6));" },
+        { "dcs\t4\t7\t-\tmany\tneg,sq" });
+
+    /* pts(param) ⊇ pts(arg) at the call site. The row names the
+     * function it is IN, because a template's INSTANCE is a clone
+     * whose nodes keep the original's locs - `apply` (never run, so
+     * ⊥) and `apply$0` (the real answer) collide at one line:col. */
+    want("parameter binding", {
+        "func sq(int x) => x * x;",
+        "func apply(f, int v) { var r = f(v); return r; }",
+        "print(apply(sq, 9));" },
+        { "dcs\t2\t32\tapply$0\tone\tsq",
+          "dcs\t2\t32\tapply\tnone\t-" });
+
+    /* ------------------------ the ⊤ sinks ------------------------ */
+
+    /* A BUILTIN'S RESULT. Every builtin is opaque here on purpose -
+     * see cs_call: `esc_builtin_transparent`'s allowlist is known to
+     * MISS map/filter/sort, and this analysis refuses to inherit that
+     * hole. */
+    want("sink: a builtin's result", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "var fs = [sq, neg];",
+        "var picked = sort(fs, func(a, b) { return 1; });",
+        "var dyn s = picked[0];",
+        "print(s(2));" },
+        { "dcs\t6\t7\t-\ttop\t-" });
+
+    /* A VALUE LAUNDERED THROUGH runtime() - a builtin too. */
+    want("sink: runtime()", {
+        "func sq(int x) => x * x;",
+        "var dyn s = runtime(sq);",
+        "print(s(4));" },
+        { "dcs\t3\t7\t-\ttop\t-" });
+
+    /* A CAUGHT EXCEPTION PAYLOAD - the throw/catch edge is not
+     * modelled, so what a catch binds is unknown. */
+    want("sink: a catch binding", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "struct Boom { dyn fn; }",
+        "var dyn s = sq;",
+        "try { throw Boom(neg); } catch (Boom as e) { s = e.fn; }",
+        "print(s(6));" },
+        { "dcs\t6\t7\t-\ttop\t-" });
+
+    /* ⛔ THE ⊥ CASE, and it is NOT a sink. A base TEMPLATE never
+     * runs - every call to it was redirected to a clone - so nothing
+     * can reach its parameter, and "none" is the correct, DIFFERENT
+     * answer from "top". A consumer must require `one`, never treat
+     * an empty set as an answer. */
+    want("bottom: an un-run template base", {
+        "func apply(f, x) { var r = f(x); return r; }",
+        "func sq(int v) => v * v;",
+        "print(apply(sq, 3));" },
+        { "dcs\t1\t28\tapply\tnone\t-" });
+
+    /* ------------------------- escapes -------------------------- */
+
+    /* A function only ever CALLED BY NAME never escapes; one handed to
+     * a builtin does. A consumer reasoning over ALL of a function's
+     * call sites needs this: a set of size 1 at every site it can SEE
+     * proves nothing if a site it cannot see exists. */
+    want("escape: a builtin argument", {
+        "func sq(int x) => x * x;",
+        "func helper(int v) => v + 100;",
+        "print(runtime(sq));",
+        "print(helper(7));" },
+        { "dcs-esc\tsq" });
+    reject("escape: a name-only callee does not escape", {
+        "func sq(int x) => x * x;",
+        "func helper(int v) => v + 100;",
+        "print(runtime(sq));",
+        "print(helper(7));" },
+        "dcs-esc\thelper");
+
+    /* ⛔ AND THE VACUITY GUARD. Every case above asserts a row is
+     * PRESENT, so an analysis that emitted nothing at all - or a dump
+     * that silently stopped running it - would fail loudly; but an
+     * analysis that answered ⊤ everywhere would fail only the `one`
+     * cases and could look like an ordinary regression. Require that
+     * a real corpus of forms produced MUST answers at all. */
+    {
+        const std::string out = dcs({
+            "func sq(int x) => x * x;",
+            "var a = sq;",
+            "var b = a;",
+            "print(b(2));" });
+        size_t n = 0, at = 0;
+        while ((at = out.find("\tone\t", at)) != std::string::npos)
+            { n++; at += 5; }
+        if (n == 0) {
+            cout << "  callee-set [vacuity]: the analysis produced no MUST "
+                    "answer at all\n" << out;
+            ok = false;
+        }
+    }
+
+    return ok;
+}
+
 static bool ref_slots_proven_params()
 {
     auto go = [&](const std::vector<const char *> &src)
@@ -38044,6 +38302,8 @@ static const std::vector<extra_check> extra_checks =
     { "jit: C2a - the FLOAT register cache (xmm4-7): pins, spills, "
       "run-splits",
       jit_fcache_c2 },
+    { "infer: the CALLEE-SET analysis - one answer per constraint form, "
+      "and a stated ⊤ per sink", callee_set_analysis },
     { "vm: C3 - inference-proven params leave the ref_slots release scan",
       ref_slots_proven_params },
     { "codegen: a MoveV's dst is ref-listed only when its SOURCE can hold "

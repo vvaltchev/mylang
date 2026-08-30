@@ -308,5 +308,37 @@ else
     echo "  skip  -vdj reproducibility (this build reports jit 0)"
 fi
 
+# ---------------------------------------------------------------------
+# -dcs: the CALLEE-SET dump (#116).
+#
+# ⛔ A NEW CLI FLAG NEEDS A CASE HERE, because `-rt` runs in-process and
+# cannot see mylang.cpp's argument handling at all - the whole reason
+# this file exists (#147: `-nr` was wired to the wrong side of an `if`
+# and every one of its prover tests passed regardless).
+#
+# What the driver must do, and what only a spawned process can show:
+# ANSWER (a real set, not an empty dump), then EXIT WITHOUT RUNNING -
+# `-dti` and `-a` are the precedent, and a dump flag that also executed
+# the program would be useless on anything with side effects.
+cat > "$TMP/dcs.my" <<'DCSEOF'
+func sq(int x) => x * x;
+var a = sq;
+var b = a;
+print("RAN", b(2));
+DCSEOF
+out=$("$BIN" -dcs "$TMP/dcs.my" 2>&1)
+if [ $? != 0 ]; then
+    fail "-dcs exited non-zero"
+elif ! printf '%s' "$out" | grep -q 'one.*sq'; then
+    fail "-dcs produced no MUST answer for a plain copy chain - the dump
+      is vacuous, which is indistinguishable from the analysis being
+      dead. Got:
+$out"
+elif printf '%s' "$out" | grep -q 'RAN'; then
+    fail "-dcs RAN the program; it must dump and exit (like -dti / -a)"
+else
+    pass "-dcs: names the callee of a copy chain, and does not run"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc

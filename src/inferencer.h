@@ -40,6 +40,21 @@ void infer_types(Construct *root, bool enable = true, bool strict = true);
 void dump_type_info(Construct *root, std::ostream &os);
 
 /*
+ * -dcs: run inference (non-strict) and dump THE CALLEE SET of every
+ * call site - which function(s) the callee expression can evaluate to,
+ * or ⊤ ("top") when the analysis cannot name them - plus one
+ * `dcs-esc` line per function whose value left the analysed program.
+ *
+ * ⛔ THIS IS THE ANALYSIS'S PRIMARY NET, not a convenience. A
+ * better-analysed program computes the SAME answers, so the engine
+ * differential is blind to it by construction (CLAUDE.md, *Testing an
+ * AST TRANSFORM*): the set itself is what a test must assert, and
+ * this is what makes that possible. Same role -dti plays for the
+ * mandatory-`dyn` work. See plans/callee-set-analysis.md.
+ */
+void dump_callee_sets(Construct *root, std::ostream &os);
+
+/*
  * The COMPLETE per-node child visitor (every Construct edge, incl. try/catch
  * bodies, slices, dict literals) - the inferencer's own walker, exported for
  * walks that must not miss a node: the VM's AOT precompile and the

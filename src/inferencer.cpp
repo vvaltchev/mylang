@@ -13,6 +13,8 @@
 
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
+#include <map>
 #include <vector>
 #include <memory>
 #include <string>
@@ -147,6 +149,49 @@ struct FuncInfo {
     bool value_escaped = false;
 };
 
+/*
+ * THE CALLEE-SET ANALYSIS's value domain (#116). The analysis itself
+ * is calleeset.cpp.h, included once at the end of this file; only the
+ * types the Inferencer's members need live here.
+ *
+ * A set of ABSTRACT VALUES a location may hold: functions, and
+ * container allocation sites ("objects"). `top` is ⊤ - "I do not
+ * know" - which the empty set (⊥, "nothing can reach here")
+ * deliberately does NOT mean. That distinction is the whole point:
+ * `StaticType::finfos`, which this replaces, could not express it and
+ * needed a side ledger (escaped_finfos) to fake it.
+ */
+struct CsSet {
+    bool top = false;                /* ⊤ - unknown */
+    std::vector<FuncInfo *> funcs;   /* unique, unordered */
+    std::vector<int> objs;           /* unique, unordered - alloc sites */
+
+    bool add_func(FuncInfo *f);
+    bool add_obj(int o);
+    bool set_top();
+    bool merge(const CsSet &o);      /* -> did anything change? */
+    bool empty() const { return !top && funcs.empty() && objs.empty(); }
+};
+
+/* An ABSTRACT LOCATION, keyed by PROGRAM LOCATION and never by type -
+ * which is exactly what `finfos` got wrong. */
+enum class CsLocKind : unsigned char {
+    sym,       /* a variable / parameter / capture (TypeSym *)   */
+    ret,       /* a function's return value      (FuncInfo *)    */
+    elem,      /* everything inside one container (an obj id)    */
+};
+
+struct CsLocKey {
+    CsLocKind kind;
+    const void *p;
+    int obj;
+    bool operator<(const CsLocKey &o) const {
+        if (kind != o.kind) return kind < o.kind;
+        if (p != o.p)       return p < o.p;
+        return obj < o.obj;
+    }
+};
+
 struct Scope {
     std::unordered_map<const UniqueId *, TypeSym *> syms;
     Scope *parent = nullptr;
@@ -163,6 +208,14 @@ public:
     void infer_input(Block *root); /* REPL: one input, commit+pin its globals */
     void undef_global(const UniqueId *name);  /* REPL undef(x) */
     void dump_debug_ti(std::ostream &os);   /* --debug-ti */
+    void dump_callee_sets(std::ostream &os); /* -dcs (see calleeset.cpp.h) */
+
+    /* THE CALLEE-SET ANALYSIS (#116). `callee_set(e)` answers which
+     * functions the expression `e` can evaluate to - a set, or ⊤;
+     * `callee_escaped(f)` whether f's value left the analysed program.
+     * Run at the end of infer_one, after instantiation (see there). */
+    CsSet callee_set(Construct *e);
+    bool callee_escaped(FuncInfo *f);
     void collect_arrays(AnalysisInfo &out); /* -a: array storage colors */
 
     /* Complete child-visitor (no `this`, hence static) - also used by the
@@ -338,6 +391,44 @@ private:
     void collect_calls(Construct *n,
                        std::vector<std::pair<CallExpr *, bool>> &out,
                        bool in_func = false);
+
+    /* ---- the callee-set analysis (#116; calleeset.cpp.h) ---- */
+    std::vector<CsSet> cs_pts;                 /* loc id -> points-to */
+    std::map<CsLocKey, int> cs_loc_ids;        /* location -> loc id   */
+    std::map<const Construct *, int> cs_obj_ids;  /* alloc site -> obj */
+    std::set<FuncInfo *> cs_escaped;           /* left our view        */
+    std::set<int> cs_escaping_objs;            /* worklist, per round  */
+    bool cs_escaped_all = false;
+    bool cs_changed = false;
+    bool cs_ran = false;      /* false => every query answers ⊤ */
+    int cs_top_callee_sites = 0;
+
+    void cs_run(Block *root);            /* the fixpoint */
+    void cs_visit(Construct *n, FuncInfo *fn);
+    void cs_assign(Construct *lv, Construct *rv);
+    void cs_bind_target(Construct *lv, const CsSet &v);
+    void cs_call(CallExpr *c);
+    void cs_builtin_container_effect(CallExpr *c);
+    CsSet cs_eval(Construct *e);
+    void cs_eval_value(const EvalValue &v, const Construct *site,
+                       CsSet &out);
+    CsSet cs_read_elems(const CsSet &base);
+    void cs_write_elems(const CsSet &base, const CsSet &v);
+    void cs_escape_set(const CsSet &v);
+    void cs_escape_flat(const CsSet &v);
+    bool cs_write(int loc, const CsSet &v);
+    int  cs_loc(CsLocKind k, const void *p, int obj);
+    int  cs_obj_for(const Construct *site);
+    bool cs_callee_is_builtin(Construct *e);
+    const StructTypeDef *cs_struct_callee(Construct *e);
+    bool cs_can_hold_func(const Construct *e);
+    bool cs_type_can_hold_func(StaticTypeRef t, std::set<const void *> &seen);
+    bool cs_annot_can_hold_func(const TypeAnnot *a,
+                                std::set<const void *> &seen);
+    bool cs_struct_can_hold_func(const StructTypeDef *def,
+                                 std::set<const void *> &seen);
+    std::string cs_func_name(FuncInfo *f);
+    std::string cs_set_str(const CsSet &s);
 
     /* check pass */
     void check(Construct *n);
@@ -1414,6 +1505,21 @@ void Inferencer::infer_one(Block *rootBlock)
         run_fixpoint(rootBlock);
         instantiate_to_fixpoint();
     }
+
+    /*
+     * THE CALLEE-SET ANALYSIS (#116). Placed here for the reason
+     * #115's snapshot is: it needs POST-INSTANTIATION types and a
+     * post-instantiation TREE. A call to a template DEFERS by design,
+     * so a factory's return type does not exist until instantiation
+     * has made the clone and REDIRECTED the call - run before this
+     * loop, the analysis would walk call sites that no longer exist
+     * and miss the ones that replaced them.
+     *
+     * INERT in increment 1: nothing consults it, so it must change no
+     * behaviour. Its consumers arrive in increments 2-4 (see
+     * plans/callee-set-analysis.md).
+     */
+    cs_run(rootBlock);
 
     /* finalize. An unconstrained value is `none` for a local ("only-none /
      * doesn't matter") but `dyn` for a PARAMETER: a never-(concretely-)called
@@ -6479,6 +6585,19 @@ void dump_type_info(Construct *root, std::ostream &os)
     inf.dump_debug_ti(os);
 }
 
+void dump_callee_sets(Construct *root, std::ostream &os)
+{
+    if (!root)
+        return;
+
+    /* Non-strict, exactly like -dti: the point is to SEE what the
+     * analysis concluded, not to refuse the program first. */
+    Inferencer inf(root);
+    inf.strict_dyn = false;
+    inf.run();
+    inf.dump_callee_sets(os);
+}
+
 void collect_array_analysis(Construct *root, AnalysisInfo &out)
 {
     if (!root)
@@ -6707,3 +6826,5 @@ void for_each_child_of(Construct *c,
 {
     Inferencer::for_each_child(c, f);
 }
+
+#include "calleeset.cpp.h"
