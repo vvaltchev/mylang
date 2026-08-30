@@ -1162,14 +1162,42 @@ struct Emitter {
     /* mov reg, [r9 + d] / mov [r9 + d], reg (de-helperize 6b: the
      * ctx-indirect chains walk through r9 as the scratch base; rm=001 with
      * REX.B is r9, no SIB needed). */
-    void load_r9b(uint8_t reg, int32_t d)
-    { u8(reg >= 8 ? 0x4D : 0x49); u8(0x8B);
-      u8(static_cast<uint8_t>(0x81 | ((reg & 7) << 3))); u32(
-          static_cast<uint32_t>(d)); }
-    void store_r9b(uint8_t reg, int32_t d)
-    { u8(reg >= 8 ? 0x4D : 0x49); u8(0x89);
-      u8(static_cast<uint8_t>(0x81 | ((reg & 7) << 3))); u32(
-          static_cast<uint32_t>(d)); }
+    /*
+     * `mov <reg>, [<base> + disp32]` and its store twin - the CAPTURE /
+     * global chain's addressing.
+     *
+     * ⛔ #96: these were `load_r9b` / `store_r9b`, the base baked into
+     * the NAME. That is the sixth audit-table shape, and this is the
+     * family that made it famous: the ctx chain walking through r9 is
+     * what printed 88854283473440 when r9 joined the pin pool for a
+     * day. The base is an argument now, so a `grep R9` finds the call
+     * sites and an allocator can redirect them.
+     *
+     * rsp (4) and rbp (5) are excluded rather than encoded: rsp needs a
+     * SIB byte and rbp a different mod form, and neither is ever a
+     * candidate here - a silent mis-encoding would be far worse than
+     * an abort.
+     */
+    void load_base(uint8_t reg, uint8_t base, int32_t d)
+    {
+        ML_CHECK_MSG(base != 4 && base != 5,
+                     "load_base: rsp/rbp need SIB / a different mod");
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x8B);
+        u8(static_cast<uint8_t>(0x80 | ((reg & 7) << 3) | (base & 7)));
+        u32(static_cast<uint32_t>(d));
+    }
+    void store_base(uint8_t reg, uint8_t base, int32_t d)
+    {
+        ML_CHECK_MSG(base != 4 && base != 5,
+                     "store_base: rsp/rbp need SIB / a different mod");
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x89);
+        u8(static_cast<uint8_t>(0x80 | ((reg & 7) << 3) | (base & 7)));
+        u32(static_cast<uint32_t>(d));
+    }
     /*
      * #96 TWO-ADDRESS ARITHMETIC: `<op> qword [rbx+disp], reg` - the MR
      * form, so the SLOT is both source and destination and the whole
@@ -3339,13 +3367,14 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off,
     return e.j8(0x72);                         /* jb -> fast (trivial value) */
 }
 
-/* The r9-based sibling (the value lives at [r9 + ...], a capture/global
- * slot): jump NEAR to the helper when it is a REFERENCE. Clobbers rcx. */
-static size_t emit_ref_check_jae_r9(Emitter &e, int32_t type_off)
+/* The chain-based sibling (the value lives at [base + ...], a capture or
+ * global slot): jump NEAR to the helper when it is a REFERENCE. Clobbers
+ * rcx; `cb` is only READ. */
+static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
+                                       int32_t type_off)
 {
-    e.scratch(R9);            /* the value is read at [r9 + off] */
     const JitLayout &L = jit_layout();
-    e.load_r9b(RCX, type_off);
+    e.load_base(RCX, cb, type_off);
     e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
     e.u32(static_cast<uint32_t>(L.type_t_off));
     e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
@@ -3376,22 +3405,21 @@ emit_store_src_gate(Emitter &e, int32_t type_off)
 /* Walk `r9 = ctx->captures->data()` (cap=true) or, with the GlobalFuncTable
  * kept in RDX for the caller's `defined` write, `r9 = gfuncs->slots.data()`
  * (cap=false). Clobbers rax (and rdx for the global chain). */
-static void emit_ctx_chain_r9(Emitter &e, bool cap)
+static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap)
 {
-    e.scratch(R9);            /* the ctx chain walks through r9 */
+    e.scratch(cb);            /* the ctx chain walks through it */
     const JitLayout &L = jit_layout();
     e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
     e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] (the ctx) */
     if (cap) {
         e.u8(0x48); e.u8(0x8B); e.u8(0x80);    /* mov rax,[rax+captures] */
         e.u32(static_cast<uint32_t>(L.ctx_captures));
-        e.u8(0x4C); e.u8(0x8B); e.u8(0x88);    /* mov r9,[rax+0] (data) */
-        e.u32(0);
+        e.load_base(cb, RAX, 0);               /* cb = the captures data */
     } else {
         e.u8(0x48); e.u8(0x8B); e.u8(0x90);    /* mov rdx,[rax+gfuncs] */
         e.u32(static_cast<uint32_t>(L.ctx_gfuncs));
-        e.u8(0x4C); e.u8(0x8B); e.u8(0x8A);    /* mov r9,[rdx+slots+0] */
-        e.u32(static_cast<uint32_t>(L.gft_slots));
+        e.load_base(cb, RDX,                   /* cb = the gfuncs slots */
+                    static_cast<int32_t>(L.gft_slots));
     }
 }
 
@@ -7094,7 +7122,59 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * the tail is the least-exercised slot, and MYLANG_JIT_XROT now sweeps
  * FIVE rotations to give it first-choice traffic.
  */
-static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6 };
+/*
+ * ⛔ R9 (9) REJOINED 2026-08-18 - THE REGISTER THAT SHIPPED A WRONG
+ * ANSWER, back only because every site the first attempt missed is now
+ * an ARGUMENT rather than a name.
+ *
+ * The 2026-08-16 admission claimed "r9 is used in exactly TWO local
+ * scopes and both are already safe". It was wrong by about eighty
+ * sites, all of them invisible to `grep R9` because the register lived
+ * in a METHOD NAME (`load_index_r9`, `load_slot_r9`, `load_r9b`,
+ * `emit_ctx_chain_r9`, `movabs_r9`, `cmp_r9_rdx`). This time the
+ * census DERIVES its accessor list, and the conversion took r9 from
+ * 103 unbracketed sites to 23:
+ *
+ *   the element READ tiers      -> elem_read_idx(e, op), an allocated
+ *                                  index register threaded through
+ *                                  every emitter and arm;
+ *   the element STORE tiers     -> ElemScratch's sc.idx, which they
+ *                                  ALREADY allocated and then ignored
+ *                                  (see below);
+ *   the CAPTURE / global chain  -> ctx_chain_reg(e) + load_base /
+ *                                  store_base. This is the exact site
+ *                                  that printed 88854283473440, and no
+ *                                  gate could ever have covered it -
+ *                                  LoadCaptureV is not a call op;
+ *   the C1 hoist preheader nav  -> its t_arr compare uses RCX now (the
+ *                                  nav's own scratch is rax/rdx).
+ *
+ * The 23 that remain are the `enum Reg` line, the ElemScratch default,
+ * ELEM_CAND and the two allocators' preference (definitions, not
+ * uses), and 16 in emit_sync_push_native / emit_sync_call_inline /
+ * emit_ret_native / emit_nstack_switch_post - the group
+ * jit_run_blocks_xcache and emit_ret_native's flush_cache() already
+ * cover, verified for rdi and rsi before it.
+ *
+ * ⛔ AND THE CONVERSION FOUND A LATENT BUG THAT WOULD HAVE MADE THIS
+ * ADMISSION WRONG AGAIN. Eleven sites in the store tiers read
+ *
+ *     load_index_r9(e, in);          // loads the index into r9
+ *     e.cmp_rr(sc.idx, sc.count);    // ...but compares sc.idx
+ *
+ * The ScratchPlan's whole promise is "the emitter is TOLD which
+ * register holds each role"; this role was told and ignored. It was
+ * invisible because sc.idx is r9 whenever nothing else can be, i.e.
+ * always - until r9 is pinnable. Making the register an argument is
+ * what made the disagreement legible, which is the argument for the
+ * seam in one line.
+ *
+ * PLACED LAST, as rdi and rsi were: take_reg scans in order, so the
+ * tail is the least-exercised slot, and MYLANG_JIT_XROT now sweeps SIX
+ * rotations - the net that would have caught the original r9 bug in
+ * seconds.
+ */
+static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9 };
 static const size_t MAX_XCACHED =
     sizeof(XCACHE_ORDER) / sizeof(XCACHE_ORDER[0]);
 
@@ -9387,6 +9467,13 @@ static size_t op_elem_scratch_roles(OpCode op)
     case OpCode::LoadElem2Float:
     case OpCode::ForStepElemInt:
     case OpCode::JumpUnlessElemInt:
+    /* the CAPTURE / global chain: one base register, via ctx_chain_reg.
+     * Not an element op, but it draws from the same candidate set and
+     * the pool must leave it one for exactly the same reason - see the
+     * 88854283473440 note there. */
+    case OpCode::LoadCaptureV:
+    case OpCode::StoreCaptureV:
+    case OpCode::StoreGlobalV:
         return 1;
     default:
         return 0;
@@ -9491,6 +9578,31 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
  * fragment stays interpreted) is merely slow.
  */
 static const uint8_t ELEM_NO_REG = 0xFF;
+
+/*
+ * The CAPTURE / global chain's base register.
+ *
+ * Same candidate set and same usability rules as the element index -
+ * the chain clobbers rax (and rdx on the global side) and the copy uses
+ * rcx, so what is left is exactly ELEM_CAND. Prefers r9, which is what
+ * the hand-written code used, so the conversion lands inert.
+ *
+ * ⛔ THIS IS THE SITE THAT SHIPPED A WRONG ANSWER. r9 was in the pin
+ * pool for a day (2026-08-16/17) and `emit_ctx_chain_r9` walked the ctx
+ * straight through a pinned accumulator: a twelve-line closure printed
+ * 88854283473440 where both interpreters printed 56640. It could not be
+ * gated the way the CALL emitters are, because LoadCaptureV is not a
+ * call op - so the register had to become an argument.
+ */
+static uint8_t ctx_chain_reg(const Emitter &e)
+{
+    if (elem_reg_usable(e, R9))
+        return R9;
+    for (const uint8_t c : ELEM_CAND)
+        if (elem_reg_usable(e, c))
+            return c;
+    return ELEM_NO_REG;
+}
 
 static uint8_t elem_read_idx(const Emitter &e, OpCode op)
 {
@@ -9612,7 +9724,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             slows.push_back(e.j32(0x74));        /* je (== 0.0) */
             e.patch8(j_nan, e.pos());
         }
-        load_index_idx(e, R9, in);
+        load_index_idx(e, sc.idx, in);
         e.cmp_rr(sc.idx, H->rcount);
         slows.push_back(e.j32(0x73));            /* jae -> the helper */
         if (compound && divmod && !in.b_is_lit() && !is_float) {
@@ -9806,7 +9918,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.mov_rdx_rax(L.data_off + 8);
         e.sub_rdx_rcx();
         e.sar_rdx_3();
-        load_index_idx(e, R9, in);
+        load_index_idx(e, sc.idx, in);
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
         bump();
@@ -9850,7 +9962,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             e.mov_rdx_rax(L.data_off + 8);
             e.sub_rdx_rcx();
             e.sar_rdx_3();
-            load_index_idx(e, R9, in);
+            load_index_idx(e, sc.idx, in);
             e.cmp_rr(sc.idx, sc.count);
             decline_if(0x73);                    /* OOB/neg -> helper */
             e.u8(0x4A); e.u8(0x8B); e.u8(0x14); e.u8(0xC9);
@@ -9865,7 +9977,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.mov_rdx_rax(L.data_off + 8);
         e.sub_rdx_rcx();
         e.sar_rdx_3();
-        load_index_idx(e, R9, in);
+        load_index_idx(e, sc.idx, in);
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
         bump();
@@ -9882,7 +9994,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.mov_rcx_rax(L.data_off);
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
-    load_index_idx(e, R9, in);
+    load_index_idx(e, sc.idx, in);
     e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));        /* jae: negative OR >= count */
     bump();
@@ -9897,7 +10009,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
     e.sar_rdx_3();
-    load_index_idx(e, R9, in);
+    load_index_idx(e, sc.idx, in);
     e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));
     bump();
@@ -9916,7 +10028,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.patch32_here(j);
     emit_call_prologue(e);
     e.lea_rdi(base_off);
-    load_index_idx(e, R9, in);
+    load_index_idx(e, sc.idx, in);
     e.mov_rr(RSI, sc.idx);
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
@@ -10242,7 +10354,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     e.mov_rcx_rax(L.data_off);
     e.mov_rdx_rax(L.data_off + 8);
     e.sub_rdx_rcx();
-    load_slot_idx(e, R9, in.a_dual_lo());
+    load_slot_idx(e, sc.idx, in.a_dual_lo());
     e.imul_rr_imm8(sc.idx, sc.idx, static_cast<uint8_t>(sizeof(LValue)));
     e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));              /* jae: negative OR OOB */
@@ -10280,7 +10392,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         e.sub_rdx_rcx();
         if (!bytes)
             e.sar_rdx_3();
-        load_slot_idx(e, R9, in.b_slot());
+        load_slot_idx(e, sc.idx, in.b_slot());
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
     };
@@ -10383,7 +10495,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         e.u8(0x48); e.u8(0x85); e.u8(0xFF);      /* test rdi,rdi */
         decline_if(0x74);                        /* 0 -> the helper */
         e.mov_rdx_rax(L.data_off);               /* rdx = data */
-        load_slot_idx(e, R9, in.b_slot());
+        load_slot_idx(e, sc.idx, in.b_slot());
         e.u8(0x4A); e.u8(0x8D); e.u8(0x14); e.u8(0xCA);
                                                  /* lea rdx,[rdx+r9*8] */
         e.u8(0x48); e.u8(0x3B); e.u8(0x50);
@@ -10429,7 +10541,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     emit_call_prologue(e);
     /* &row (still live here) */
     e.mov_rr(sc.val, sc.data);
-    load_slot_idx(e, R9, in.b_slot());
+    load_slot_idx(e, sc.idx, in.b_slot());
     e.mov_rr(RSI, sc.idx);
     e.call_relocs.push_back(
         { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
@@ -11623,17 +11735,23 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const int32_t coff = static_cast<int32_t>(
             in.target2 * static_cast<int_type>(sizeof(LValue)));
         const int32_t pv0 = slot_addr(0).payload, ty0 = slot_addr(0).type;
+        const uint8_t cb = ctx_chain_reg(e);
+        if (cb == ELEM_NO_REG)
+            return false;      /* no free chain register - decline */
         e.bump_op(OpCode::LoadCaptureV);
-        emit_ctx_chain_r9(e, /*cap=*/true);
+        emit_ctx_chain(e, cb, /*cap=*/true);
         std::vector<size_t> jhelp;
-        jhelp.push_back(emit_ref_check_jae_r9(e, coff + ty0));
+        jhelp.push_back(emit_ref_check_jae_chain(e, cb, coff + ty0));
         if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                                static_cast<int32_t>(in.target)))
             jhelp.push_back(emit_ref_check_jae(e, dst.type));
-        e.load_r9b(RAX, coff + ty0);
-        e.load_r9b(RCX, coff + pv0);      e.store(RCX, dst.payload);
-        e.load_r9b(RCX, coff + pv0 + 8);  e.store(RCX, dst.payload + 8);
-        e.load_r9b(RCX, coff + pv0 + 16); e.store(RCX, dst.payload + 16);
+        e.load_base(RAX, cb, coff + ty0);
+        e.load_base(RCX, cb, coff + pv0);
+        e.store(RCX, dst.payload);
+        e.load_base(RCX, cb, coff + pv0 + 8);
+        e.store(RCX, dst.payload + 8);
+        e.load_base(RCX, cb, coff + pv0 + 16);
+        e.store(RCX, dst.payload + 16);
         e.store(RAX, dst.type);
         const size_t j_done = e.j32(0xEB);
         for (const size_t sj : jhelp)
@@ -13347,13 +13465,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const int32_t pv0 = slot_addr(0).payload, ty0 = slot_addr(0).type;
         e.bump_op(in.op);
         const auto g = emit_store_src_gate(e, src.type);
-        emit_ctx_chain_r9(e, is_cap);
-        const size_t j_dref = emit_ref_check_jae_r9(e, soff + ty0);
+        const uint8_t cb = ctx_chain_reg(e);
+        if (cb == ELEM_NO_REG)
+            return false;      /* no free chain register - decline */
+        emit_ctx_chain(e, cb, is_cap);
+        const size_t j_dref = emit_ref_check_jae_chain(e, cb, soff + ty0);
         e.load(RAX, src.type);
-        e.load(RCX, src.payload);      e.store_r9b(RCX, soff + pv0);
-        e.load(RCX, src.payload + 8);  e.store_r9b(RCX, soff + pv0 + 8);
-        e.load(RCX, src.payload + 16); e.store_r9b(RCX, soff + pv0 + 16);
-        e.store_r9b(RAX, soff + ty0);
+        e.load(RCX, src.payload);
+        e.store_base(RCX, cb, soff + pv0);
+        e.load(RCX, src.payload + 8);
+        e.store_base(RCX, cb, soff + pv0 + 8);
+        e.load(RCX, src.payload + 16);
+        e.store_base(RCX, cb, soff + pv0 + 16);
+        e.store_base(RAX, cb, soff + ty0);
         if (!is_cap) {
             /* defined[gslot] = 1: rcx = defined.data() (the table is still
              * in rdx), then the byte store. */
@@ -14126,23 +14250,23 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x48); e.u8(0x39); e.u8(0xC8);               /* cmp rax, rcx */
         const size_t j_fall = e.j32(cc_for(cc_negate(in.aop)).short_op);
         if (hoisted) {
-            load_slot_idx(e, R9, in.target2);      /* the stepped counter */
-            e.cmp_rr(R9, H->rcount);
+            load_slot_idx(e, ir, in.target2);      /* the stepped counter */
+            e.cmp_rr(ir, H->rcount);
             read_slows.push_back(e.j32(0x73));
             if (H->kind == 3)
-                e.load_elem_zx8(RAX, H->rdata, R9);
+                e.load_elem_zx8(RAX, H->rdata, ir);
             else
-                e.load_elem_q(RAX, H->rdata, R9);
+                e.load_elem_q(RAX, H->rdata, ir);
         } else {
         /* the trusted read: the gate proved kind is ints or bools */
         e.load(RAX, base.payload);            /* rax = shobj */
         e.cmp_byte_rax(L.kind_off, L.kind_bools);
         const size_t j_bools = e.j32(0x74);
-        emit_flat_int_tail(e, R9, pc, /*bools=*/false, nullptr, in.target2,
+        emit_flat_int_tail(e, ir, pc, /*bools=*/false, nullptr, in.target2,
                            &read_slows);
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_bools);
-        emit_flat_int_tail(e, R9, pc, /*bools=*/true, nullptr, in.target2,
+        emit_flat_int_tail(e, ir, pc, /*bools=*/true, nullptr, in.target2,
                            &read_slows);
         e.patch32_here(j_done);
         }
@@ -16598,7 +16722,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                      uint8_t rdata, uint8_t rcount) {
                     const SlotAddr hb = slot_addr(base);
                     e.load(RAX, hb.type);
-                    e.cmp_reg_tag_via(RAX, L.t_arr, R9);
+                    e.cmp_reg_tag_via(RAX, L.t_arr, RCX);
                     cold.push_back(e.j32(0x75));
                     e.cmp_byte_slot(hb.payload + L.slice_off, 0);
                     cold.push_back(e.j32(0x75));

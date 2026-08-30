@@ -2291,3 +2291,74 @@ threading - they need the idiv arm to spill/restore around itself, or
 the arm to decline when either register is pinned. rcx is the SIB base
 of every element operand and the shift-count register. Expect these
 three to be the real work of #96, with rax (393 sites) last.
+
+---
+
+## (q) 2026-08-18 - r9 REJOINED (pin 10), and the latent bug it uncovered
+
+`mylang -v`: **`jit_pins 10 ... xcache 6 caller-saved`**. -rt green in
+{debug ASan/UBSan, release TESTS+VM_HARDENING} x {arena, no-arena};
+corpus_diff green on all five matrices (--xrot now sweeps SIX
+rotations); the historical wrong-answer repro prints 56640 at every
+rotation.
+
+r9 is the register that shipped a wrong answer for a day. It is back
+only because every site the first attempt missed is now an ARGUMENT
+instead of a name. Census: **103 -> 23**.
+
+    the element READ tiers   -> elem_read_idx(e, op), threaded through
+                                every emitter and every arm
+    the element STORE tiers  -> ElemScratch's sc.idx, which they had
+                                ALREADY allocated and then ignored
+    the CAPTURE/global chain -> ctx_chain_reg(e) + load_base/store_base
+    the C1 hoist nav         -> its t_arr compare uses RCX
+
+The 23 that remain are the `enum Reg` line, the ElemScratch default,
+ELEM_CAND and the two allocators' preference (definitions), plus 16 in
+emit_sync_push_native / emit_sync_call_inline / emit_ret_native /
+emit_nstack_switch_post - the group `jit_run_blocks_xcache` and
+`emit_ret_native`'s `flush_cache()` already cover.
+
+### ⛔ THE LATENT BUG: A PLAN THAT WAS NAMED AND IGNORED
+
+Eleven sites in the store tiers read
+
+    load_index_r9(e, in);          // loads the index into r9
+    e.cmp_rr(sc.idx, sc.count);    // ...but compares sc.idx
+
+The ScratchPlan's entire promise is "the emitter is TOLD which register
+holds each role". This role was told and ignored. It would have made
+this admission wrong AGAIN - the plan picks a non-r9 index precisely
+when r9 is pinned, which is the case r9 joining the pool creates.
+
+It was invisible for one reason: `load_index_r9` put the register in
+the NAME, so nothing in the source visibly disagreed with `sc.idx`.
+Turning the register into an argument is what made the disagreement
+legible. **That is the argument for the seam in one line**, and it is
+the sixth audit-table shape paying for itself.
+
+### THE RESERVATION CARRIED IT
+
+Nothing new was needed: `elem_scratch_reserve` already withholds pool
+members until the run's neediest element op has its candidates, and r9
+leaving the guaranteed-survivor set is just a smaller starting count.
+Corpus-wide on-arena: **elem_noreg 0, elem_reserve 55** (was 0/14 at
+nine pins). The withholding order - reverse XCACHE_ORDER, so the
+newest and least-preferred member goes first - hands r9 back to the
+element tier before anything else, which is exactly where it is most
+useful.
+
+### REMAINING: rdx, rcx, rax
+
+    RDX  118 unbracketed    ISA-FIXED as ElemScratch::count, and idiv's
+                            RDX:RAX dividend
+    RCX  222                the SIB base of every element operand, and
+                            the shift-count register
+    RAX  393                ElemScratch::obj, idiv's quotient, every
+                            helper's return value
+
+These are not freed by threading. Each needs the idiv arm and the
+element navigation to either spill around themselves or DECLINE when
+the register is pinned - a different mechanism from the one that got
+rdi, rsi and r9 in. Do rdx first (it is the smallest and its only hard
+constraint is idiv), then rcx, then rax.

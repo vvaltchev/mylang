@@ -6467,3 +6467,58 @@ evidence needed to root-cause it is now captured instead of lost.
 **IT FIRED ON ITS FIRST REAL USE** (and the evidence was then deleted
 by an `rm -rf` in the same command - don't do that). Twelve subsequent
 full-corpus runs have been clean.
+
+## 2026-08-18 - #96: r9 REJOINED the pin pool (pin 10)
+
+**WHAT.** `mylang -v` reports **`jit_pins 10 ... xcache 6
+caller-saved`**. r9 is the register that shipped a wrong answer for a
+day (2026-08-16/17); it is back only because every site the first
+attempt missed is now an ARGUMENT instead of a name. Census 103 -> 23.
+
+    the element READ tiers   -> elem_read_idx(e, op)
+    the element STORE tiers  -> ElemScratch's sc.idx (see below)
+    the CAPTURE/global chain -> ctx_chain_reg(e) + load_base/store_base
+    the C1 hoist preheader   -> its t_arr compare uses RCX
+
+The capture chain is the one that mattered: it is the site that printed
+88854283473440, and **no gate could ever have covered it** - a run-level
+predicate like `jit_run_blocks_xcache` keys on CALL ops, and
+`LoadCaptureV` is not one. It had to become an argument.
+
+**⛔ THE CONVERSION FOUND A LATENT BUG THAT WOULD HAVE MADE THE
+ADMISSION WRONG AGAIN.** Eleven sites in the store tiers read
+
+    load_index_r9(e, in);          /* loads the index into r9   */
+    e.cmp_rr(sc.idx, sc.count);    /* ...but compares sc.idx    */
+
+The ScratchPlan's whole promise is "the emitter is TOLD which register
+holds each role" - and this role was told and ignored. Harmless while
+`sc.idx` is r9 whenever nothing else can be (i.e. always), and a wrong
+answer the moment r9 is pinnable, which is exactly the state this
+change creates.
+
+It hid because `load_index_r9` put the register in the NAME, so nothing
+in the source visibly disagreed with `sc.idx`. **Making the register an
+argument is what made the disagreement legible** - the whole argument
+for the seam, in one line.
+
+**VERIFIED.** -rt green in {debug ASan+UBSan, release TESTS +
+VM_HARDENING} x {arena, MYLANG_NO_LOWMEM=1}, 1924/1924 each;
+corpus_diff plain / --levers / --cold / --xrot (SIX rotations now) /
+--nolowmem all 21/21; every intermediate step byte-identical on 109
+programs in both configurations (the register changes are inert until
+the pool takes r9); and the twelve-line historical repro prints 56640
+at every rotation, where the 2026-08-16 build printed
+88854283473440.
+
+**THE RESERVATION NEEDED NO CHANGE** - r9 leaving the
+guaranteed-survivor set is just a smaller starting count.
+Corpus-wide on-arena: elem_noreg 0, elem_reserve 55 (0/14 at nine
+pins). Because withholding walks XCACHE_ORDER backwards, r9 is handed
+back to the element tier before any other member, which is where it is
+most useful.
+
+**LEFT: rdx (118), rcx (222), rax (393)** - all ISA-fixed roles
+(ElemScratch's count/obj, idiv's RDX:RAX, the SIB base, the shift
+count, every helper's return). Threading does not free them; each needs
+its arm to spill around itself or decline when the register is pinned.
