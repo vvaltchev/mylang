@@ -1,6 +1,6 @@
 # THE CALLEE-SET ANALYSIS: one answer to "which function is this?"
 
-**Status: INCREMENTS 1-3 LANDED (2026-08-28), 4 NOT STARTED.** A
+**Status: COMPLETE - INCREMENTS 1-4 LANDED (2026-08-28).** A
 STRUCTURAL change, not a performance one - the maintainer's framing when
 agreeing to it. The measured payoff on today's corpus is ~2.8% on one
 bench (#115); the argument is that FOUR partial analyses answering
@@ -268,14 +268,57 @@ once per instantiate round - it must, because
 call sites to fresh clones, so the previous round's answer describes a
 tree that no longer exists.
 
-**4. MIGRATE THE RESOLVER'S THREE.** `callee_of` (the step-7 prover),
-`slot2fn` / `direct_func_slot` (devirtualization), `esc_callback_fn`
-(the escape analysis). ⛔ THIS INCREMENT IS MEMORY-SAFETY-CRITICAL: #93
-/ #94 make a false "safe" a USE-AFTER-FREE, and the escape analysis
-fails closed by design. Every rule there is pinned by a
-`param_escape_analysis` row that must be re-watched failing against the
-new source. Doing 1-3 and stopping is a legitimate outcome; it gets the
-correctness, and 4 is what collapses the duplication.
+**4. HAND THE ANSWER TO THE RESOLVER. ✅ DONE (2026-08-28).**
+`CallExpr::callee_fn` - the single function a call can reach - stamped
+by the inferencer at the end of `infer_one` and read by the #93 ESCAPE
+ANALYSIS. Freed with the AST, so nothing survives into execution.
+
+⛔ **THE SCOPE CHANGED, BECAUSE THE HEADROOM WAS MEASURED FIRST.** The
+plan named three consumers. The escape analysis's own poison counters
+(`MYLANG_JITSTATS`) answered which were worth migrating before a line
+was written:
+
+| poison reason | corpus-wide |
+|---|---|
+| `noesc_p_callee` - a CALLEE it cannot name | **8** |
+| `noesc_p_hobuiltin` - a CALLBACK it cannot name | **0** |
+| `noesc_p_shape` | 0 |
+
+So **`esc_callback_fn` never fails** and migrating it would have been
+inert. One consumer had the payoff, and it got it: `noesc_p_callee`
+8 -> 4, `noesc_cs_named` 6, one function un-poisoned. `arg_borrow` is
+UNCHANGED - no new parameter got marked, so #94's borrow set is
+identical and the risk this increment adds is LATENT, which is why the
+whole `param_escape_analysis` table was re-watched anyway.
+
+⛔ **TWO CONSUMERS WERE NOT WIRED, and both reasons are rules:**
+
+ - **the step-7 PROVER (`callee_of`)** decides whether a program
+   COMPILES, and the stamp exists only when inference ran - wiring it
+   would make `-nti` change whether a program is REFUSED. An
+   optimization may consult inference; a compile-error tier may not.
+ - **`direct_func_slot`** is not an identity question. It records a
+   global SLOT backed by a runtime `is<FuncObject>` check, and the
+   analysis cannot improve it without flow sensitivity it does not
+   have. The plan listing it was a mis-read.
+
+⛔ **AND A GATE COPIED FROM #115's CONSUMER WAS WRONG HERE.** The first
+version excluded a TEMPLATE BASE, copied from `snapshot_indirect_callees`
+where `is_template` means "instantiation handles those". This consumer
+asks a different question - *whose body runs here* - and a base whose
+value was never redirected to an instance runs its own boxed body. The
+gate cost the motivating bench: `12_higher_order`'s
+`func apply(f, x) => f(x);` reaches `sq`, which is a template precisely
+because it is only ever passed as a VALUE. Dropping it took that
+program from 2 poisoned functions to 1.
+
+**KEYING:** a stamp ON THE NODE, not a side map, and NOT copied by
+`copy_call_fields` - a clone is a new context (the inliner substitutes
+parameters), so it starts null and the consumer falls back to its own
+answer. The `fd2fn` lookup is the second half of the proof: a stamp
+naming anything this run did not collect declines rather than inventing
+an edge. RECYCLE=1 + ASan is the detector CLAUDE.md names for a stamped
+AST pointer, and it was run over `-rt` and the corpus.
 
 ## Placement, and why it is the hard part
 

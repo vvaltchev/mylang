@@ -10487,6 +10487,7 @@ void jit_stats_report()
         { "noesc_p_gwrite",   &g_esc_p_gwrite },
         { "noesc_p_hobuilt",  &g_esc_p_hobuiltin },
         { "noesc_p_shape",    &g_esc_p_shape },
+        { "noesc_cs_named",   &g_esc_named_by_cs },
         { "cb_prepared",      &g_invoke_prepared },
         { "cb_fallback",      &g_invoke_fallback },
         /* THE CALL PROTOCOL - which tier each call took */

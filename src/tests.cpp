@@ -21589,6 +21589,36 @@ static bool param_escape_analysis()
          * lands in, so these four rows differ only in what the callee does
          * with its own parameter.
          */
+        /*
+         * ⛔ #116 increment 4: A CALLEE REACHED THROUGH A PARAMETER.
+         * `cb(a)` has no global slot to look up, so before the
+         * callee-set analysis was wired in this POISONED the whole
+         * function (g_esc_p_callee) and `a` went unmarked - a call
+         * through a parameter made every reference param of the
+         * enclosing function unborrowable. The analysis names `g`,
+         * the fixpoint follows the ordinary call edge, and `g` does
+         * not let its own argument escape, so `a` survives.
+         *
+         * ⛔ IT IS THE STAMP THAT MAKES THIS PASS, and nothing else
+         * could: `cb` is a PARAMETER, so `direct_func_slot` is -1 and
+         * `slot2fn` has nothing to find. Watched: the pre-increment
+         * binary answers 0x0 here.
+         *
+         * (`g` reassigns a scalar param so block_inlinable_decl
+         * refuses it and a real call survives to be analysed - the
+         * vacuity trap this table's other rows already document.)
+         */
+        { "a callee reached through a PARAMETER is named (#116 inc 4)",
+          "func g(z, k) { k = k + 1; z[0] = k; }\n"
+          "func f(cb, a) { cb(a, 1); }\n"
+          "var q = [0]; f(g, q);", "f$0", 0x2 },
+        /* ...and the same shape where the named callee DOES let it
+         * escape must still decline - naming a callee is an edge, not
+         * a licence. */
+        { "...and a named param-callee that RETURNS it still declines",
+          "func gr(z, k) { k = k + 1; if (k > 0) { return z; } return z; }\n"
+          "func f2(cb, a) { var t = cb(a, 1); }\n"
+          "var q = [0]; f2(gr, q);", "f2$0", 0x0 },
         { "passed to a callee that does not let it escape: still marked",
           "func g(z, k) { k = k + 1; z[0] = k; }\n"
           "func f(a) { g(a, 1); }\nvar q = [0]; f(q);", "f", 0x1 },

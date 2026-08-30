@@ -67,6 +67,7 @@ enum class ConstructType {
  * rely on this (a dynamic_cast of null is null; a raw ct read of
  * null would crash). */
 class Construct;
+class FuncDeclStmt;   /* CallExpr::callee_fn - defined below */
 static inline ConstructType ctag(const Construct *c);
 
 /* the contiguous-family queries (the bytecode.h range pattern) */
@@ -831,6 +832,35 @@ public:
      * the boxed StructObject from a value run + per-arg locs), rather than
      * falling back to the tree-walker's construct_struct. */
     const StructTypeDef *vm_struct_boxed_def = nullptr;
+
+    /*
+     * #116 increment 4: THE SINGLE FUNCTION THIS CALL CAN REACH, or null
+     * when the callee-set analysis cannot name one (⊤, more than one
+     * candidate, an escaped function, a template base). Stamped by the
+     * inferencer at the end of infer_one, from a SETTLED analysis over the
+     * post-instantiation tree.
+     *
+     * Its consumer is the #93 ESCAPE ANALYSIS, which otherwise poisons a
+     * whole function whenever a call's callee is not a named global slot
+     * (`f(x)` where f is a parameter, or a closure held in a variable) - a
+     * callee it cannot name could reassign the global some caller passed
+     * us. Naming it turns that poison into an ordinary call EDGE.
+     *
+     * ⛔ DELIBERATELY NOT COPIED BY copy_call_fields, and that is
+     * FAIL-CLOSED, not an omission. A clone is a new context - the inliner
+     * splices a body and substitutes its parameters, so the callee of the
+     * cloned call may be something else entirely. A null stamp means "this
+     * pass does not know", which every consumer already treats as the
+     * conservative case. DO NOT "complete" copy_call_fields with this
+     * field.
+     *
+     * ⛔ AND IT IS DELIBERATELY NOT READ BY THE STEP-7 PROVER. That tier
+     * decides whether a program COMPILES, and this stamp exists only when
+     * inference ran - wiring it there would make `-nti` change whether a
+     * program is REFUSED. An optimization may consult inference; a
+     * compile-error tier may not.
+     */
+    FuncDeclStmt *callee_fn = nullptr;
 
     /* Set by the inferencer when the callee's static type is `dyn` (callable at
      * runtime, resolved dynamically). The VM lowers it to CallValueGenericV — a

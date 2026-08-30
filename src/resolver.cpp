@@ -72,6 +72,7 @@ bool MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out,
  * and an `extern` there would get internal linkage instead. */
 extern unsigned long g_esc_p_callee, g_esc_p_gwrite,
                      g_esc_p_hobuiltin, g_esc_p_shape;
+extern unsigned long g_esc_named_by_cs;
 #endif
 
 namespace {
@@ -3341,6 +3342,16 @@ struct EscFn {
 };
 
 #ifdef TESTS
+/* #116 inc 4 REACH: how many call sites the callee-set analysis named
+ * that the slot lookup could not. It is the number that says whether
+ * the wiring does anything at all - a silent zero here and the
+ * increment is inert, however green the tests are. */
+#define ESC_NAMED(ctr) ((ctr)++)
+#else
+#define ESC_NAMED(ctr) ((void) 0)
+#endif
+
+#ifdef TESTS
 /* WHY a function was poisoned - the reach diagnostic. Counted once per
  * function, at the FIRST rule that fires, so the columns sum to the number
  * of locally-poisoned functions and the rest were poisoned transitively. */
@@ -3503,6 +3514,32 @@ static void esc_scan_call(const CallExpr *call, EscCtx &ctx)
         auto it = ctx.w->slot2fn.find(call->direct_func_slot);
         if (it != ctx.w->slot2fn.end())
             callee = it->second;
+    }
+
+    /*
+     * #116 increment 4: A CALLEE THIS PASS CANNOT NAME MAY STILL BE
+     * NAMEABLE. The slot lookup above answers for `f(x)` only when `f` is
+     * an identifier bound to a global slot; a parameter (`func apply(f, x)
+     * => f(x);`) or a closure held in a variable has no slot at all, and
+     * that poisoned the whole enclosing function. The callee-set analysis
+     * answers exactly that question and stamps its answer on the node
+     * (`CallExpr::callee_fn`, syntax.h) - a MUST answer: one candidate, not
+     * ⊤, not escaped.
+     *
+     * ⛔ IT IS AN ADDITION, NEVER AN OVERRIDE. Consulted only where the
+     * slot lookup already failed, so no existing decision changes, and a
+     * missing stamp (no inference, a node the inliner cloned - clones do
+     * NOT inherit it, deliberately) leaves the poison exactly as it was.
+     * The `fd2fn` lookup is the second half of the proof: it fails unless
+     * the named decl is a function THIS run collected, so a stamp naming
+     * anything else declines rather than inventing an edge.
+     */
+    if (!is_builtin && !is_ctor && callee < 0 && call->callee_fn) {
+        auto it = ctx.w->fd2fn.find(call->callee_fn);
+        if (it != ctx.w->fd2fn.end()) {
+            callee = it->second;
+            ESC_NAMED(g_esc_named_by_cs);
+        }
     }
 
     /*
@@ -6592,6 +6629,7 @@ unsigned long g_noescape_cands = 0;
 unsigned long g_noescape_unsafe = 0;
 unsigned long g_esc_p_callee = 0, g_esc_p_gwrite = 0,
               g_esc_p_hobuiltin = 0, g_esc_p_shape = 0;
+unsigned long g_esc_named_by_cs = 0;   /* #116 inc 4 reach - see ESC_NAMED */
 #endif
 
 /* every named function body, plus which global slot names it and which
