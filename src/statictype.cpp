@@ -139,7 +139,6 @@ StaticTypeRef StaticTypeArena::with_opt(StaticTypeRef t, bool optflag)
     c->ret = t->ret;
     c->struct_def = t->struct_def;
     c->struct_name = t->struct_name;
-    c->finfos = t->finfos;             /* value-template tracking rides */
     return c;
 }
 
@@ -432,77 +431,17 @@ bool static_type_assignable(StaticTypeRef src, StaticTypeRef dst)
 
 /* -------------------------------- join ----------------------------------- */
 
-/* Record a dropped finfo set (see the header comment) - called at every
- * join outcome that does NOT produce a Func from a finfo-carrying input. */
-static void note_escaped_into(std::vector<void *> &ledger, StaticTypeRef t)
-{
-    if (t && t->kind == StaticTypeKind::Func)
-        for (void *fi : t->finfos)
-            ledger.push_back(fi);
-}
-
-/*
- * Does `b` name a candidate `a` does not? (Set containment, not
- * equality: if b's members are all in a, `a` already describes the
- * join.)  See the `static_type_equal` shortcut in join().
- */
-static bool finfos_add_to(StaticTypeRef a, StaticTypeRef b)
-{
-    for (void *fi : b->finfos)
-        if (std::find(a->finfos.begin(), a->finfos.end(), fi)
-                == a->finfos.end())
-            return true;
-    return false;
-}
-
 StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
 {
-    const auto note_escaped = [this](StaticTypeRef t) {
-        note_escaped_into(escaped_finfos, t);
-    };
     a = static_type_resolve(a);
     b = static_type_resolve(b);
 
-    /*
-     * ⛔ EQUAL IS NOT INTERCHANGEABLE FOR A FUNC, AND THIS SHORTCUT
-     * SILENTLY LOST CANDIDATES FOR IT (2026-08-28).
-     *
-     * `finfos` is METADATA - excluded from static_type_equal on
-     * purpose, so that two functions with the same signature remain the
-     * same TYPE. But that makes the shortcut below discard one side's
-     * candidate set whenever two DIFFERENT functions share a shape,
-     * which is the common case:
-     *
-     *     func mk_a(n) => func [n] (x) { return str(n) + str(x); };
-     *     func mk_b(n) => func [n] (x) { return str(n) + str(x); };
-     *     var p = [mk_a(1), mk_b(2)];      # array literal joins them
-     *
-     * Both lambdas are `func(dyn)->str`, so joining them returned `a`
-     * and `p`'s element type named ONE candidate for a value that has
-     * two. Everything downstream that asks "is this callee provably one
-     * function?" then got a confident wrong answer - #115 typed one
-     * lambda's parameter from call sites that reach either, and had to
-     * grow a uniformity rule to survive it.
-     *
-     * The metadata is exactly what must NOT take the shortcut. Fall
-     * through to the Func arm, which builds a fresh type and UNIONS the
-     * sets; the structure it computes for two equal inputs is the same
-     * structure, so nothing else changes.
-     *
-     * ⛔ AND THE MERGE MUST NOT BE DONE IN PLACE. `a` is some
-     * function's own type object; adding b's candidates to it would
-     * make that function's type claim a candidate it does not have,
-     * everywhere the object is shared.
-     */
-    if (static_type_equal(a, b)
-            && !(a->kind == StaticTypeKind::Func && finfos_add_to(a, b)))
+    if (static_type_equal(a, b))
         return a;
 
     if (a->kind == StaticTypeKind::Dyn || b->kind == StaticTypeKind::Dyn) {
         /* Nullability is orthogonal to dyn (Phase B): collapsing a mix to dyn
          * keeps the opt bit, so `dyn | none` / `dyn | opt T` is `opt dyn`. */
-        note_escaped(a);
-        note_escaped(b);
         return with_opt(g_dyn[0],
                         a->opt || b->opt ||
                         a->kind == StaticTypeKind::None ||
@@ -544,11 +483,8 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
         return ground(k, anyopt);
     }
 
-    if (a->kind != b->kind) {
-        note_escaped(a);                  /* a finfo-carrying Func lost here */
-        note_escaped(b);
+    if (a->kind != b->kind)
         return nullptr;                   /* irreconcilable conflict */
-    }
 
     switch (a->kind) {
 
@@ -579,8 +515,6 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
              * rounds does not spuriously conflict. Different arity: a real
              * conflict. */
             if (a->params.size() != b->params.size()) {
-                note_escaped(a);
-                note_escaped(b);
                 return nullptr;
             }
             /*
@@ -605,13 +539,9 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
              */
             for (size_t i = 0; i < a->params.size(); i++)
                 if (!static_type_sig_compat(a->params[i], b->params[i])) {
-                    note_escaped(a);
-                    note_escaped(b);
                     return nullptr;
                 }
             if (!static_type_sig_compat(a->ret, b->ret)) {
-                note_escaped(a);
-                note_escaped(b);
                 return nullptr;
             }
             std::vector<StaticTypeRef> ps;
@@ -623,15 +553,7 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
                                (i < b->param_opt.size() && b->param_opt[i]));
             }
             StaticTypeRef rj = join(a->ret, b->ret);
-            StaticTypeRef fj = func_of(ps, popt, rj ? rj : g_dyn[0], anyopt);
-            /* Union the value-template sets (plans/value-template-
-             * instantiation.md) - the set rides the ordinary lattice flow. */
-            fj->finfos = a->finfos;
-            for (void *fi : b->finfos)
-                if (std::find(fj->finfos.begin(), fj->finfos.end(), fi)
-                        == fj->finfos.end())
-                    fj->finfos.push_back(fi);
-            return fj;
+            return func_of(ps, popt, rj ? rj : g_dyn[0], anyopt);
         }
 
         default:

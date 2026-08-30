@@ -3714,18 +3714,26 @@ static const std::vector<test> tests =
         },
     },
     /*
-     * COMPLETENESS of the candidate set itself. `join`'s
-     * `static_type_equal` shortcut dropped one side's finfos whenever
-     * two functions shared a signature - metadata excluded from
-     * equality, then discarded by an equality-based early exit - so a
-     * callee that may be either of two closures named ONE. With a
-     * single agreeing call site, uniformity could not catch it: this
-     * asserted `a:int5` before the fix, a type `p[k]` cannot
+     * COMPLETENESS of the candidate set itself: a callee that may be
+     * either of two SAME-SHAPED closures must name BOTH. With a single
+     * agreeing call site, uniformity cannot catch a set that lost one -
+     * this asserted `a:int5` before the fix, a type `p[k]` cannot
      * guarantee.
+     *
+     * ⛔ IT HAS OUTLIVED THE MECHANISM IT WAS WRITTEN AGAINST, AND
+     * THAT IS THE POINT. The bug was in `StaticType::finfos`: `join`'s
+     * `static_type_equal` shortcut dropped one side's candidates
+     * whenever two functions shared a signature - metadata excluded
+     * from equality, then discarded by an equality-based early exit.
+     * `finfos` is DELETED now (#116 increment 3) and the answer comes
+     * from the callee-set analysis, yet this test needed no edit,
+     * because it asserts the BEHAVIOUR (`a:dyn`) and not the
+     * mechanism. A test written against the implementation would have
+     * had to be deleted with it, taking its coverage along.
      */
     {
         "infer: joining two same-signature functions keeps BOTH "
-        "candidates (#115 finfo completeness)",
+        "candidates (#115 candidate-set completeness)",
         {
             "func mk_a(n) => func [n] (x) { return \"a:\" + typestr(x); };",
             "func mk_b(n) => func [n] (x) { return \"b:\" + typestr(x); };",

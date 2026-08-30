@@ -64,17 +64,6 @@ struct StaticType {
     std::vector<StaticTypeRef> params;        /* Func */
     std::vector<bool> param_opt;       /* Func */
     StaticTypeRef ret = nullptr;              /* Func */
-    /*
-     * Func only - value-template tracking (plans/value-template-
-     * instantiation.md): the set of TEMPLATE FuncInfo* (opaque here; the
-     * inferencer owns the type) whose VALUES may flow through this type.
-     * Seeded by func_static_type for a template, UNIONED by join, copied by
-     * with_opt. METADATA: never part of equal/assignable/unify. When a join
-     * DROPS the set (a collapse to dyn / an irreconcilable conflict), the
-     * members land in the arena's `escaped_finfos` ledger - the inferencer
-     * drains it and marks those templates unsafe for value instantiation.
-     */
-    std::vector<void *> finfos;
     const void *struct_def = nullptr;  /* Struct: the StructTypeDef* identity */
     const UniqueId *struct_name = nullptr;  /* Struct: name (for to_string) */
 
@@ -119,9 +108,6 @@ public:
     /* Least upper bound; nullptr on an irreconcilable type conflict. */
     StaticTypeRef join(StaticTypeRef a, StaticTypeRef b);
 
-    /* Value-template escape ledger (see StaticType::finfos): joins that drop
-     * a finfo set append the members here; the inferencer drains per round. */
-    std::vector<void *> escaped_finfos;
 
 private:
 

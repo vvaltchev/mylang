@@ -1,6 +1,6 @@
 # THE CALLEE-SET ANALYSIS: one answer to "which function is this?"
 
-**Status: INCREMENTS 1-2 LANDED (2026-08-28), 3-4 NOT STARTED.** A
+**Status: INCREMENTS 1-3 LANDED (2026-08-28), 4 NOT STARTED.** A
 STRUCTURAL change, not a performance one - the maintainer's framing when
 agreeing to it. The measured payoff on today's corpus is ~2.8% on one
 bench (#115); the argument is that FOUR partial analyses answering
@@ -205,11 +205,48 @@ escaped: a **`throw`** escapes its value (the catch binding reads ⊤),
 and a write to a **REPL-pinned global** escapes (a later input can
 redefine it).
 
-**3. MIGRATE `value_instantiate_round`.** Then DELETE `finfos`,
-`escaped_finfos`, `value_escaped`, `note_escaped_into`, and REVERT
-4a1c246. `StaticType` goes back to describing shape and nothing else.
-Blast radius check: the value-template corpus (76_funcval_dispatch is
-the bench that feature exists for) must be byte-identical in `-vd`.
+**3. MIGRATE `value_instantiate_round`. ✅ DONE (2026-08-28).** It asks
+`callee_set` / `callee_escaped`; `StaticType::finfos`,
+`StaticTypeArena::escaped_finfos`, `note_escaped_into`, `finfos_add_to`
+and `drain_escapes` are DELETED, and 4a1c246's `join` union is
+REVERTED - the shortcut is a plain `if (static_type_equal(a, b)) return
+a;` again and an `StaticType` describes SHAPE and nothing else.
+**0 of 126** corpus programs change `-vd` or output, and
+76_funcval_dispatch still gets its `add_op$0`/`sub_op$0` instances (a
+vacuity check: byte-identity alone would also be satisfied by the
+feature having silently stopped firing).
+
+⛔ **`value_escaped` IS *NOT* DELETED, and that is a correction to this
+plan.** It had two producers and only one of them was the ledger. The
+one that stays asks a question the analysis deliberately does not
+model: is there a value use whose CONSUMERS cannot be enumerated - an
+ARG-position use or a capture-list use. `value_instantiate_round`
+REDIRECTS every value-use Identifier to the clone, so a use it cannot
+FOLLOW would hand the typed instance to a consumer free to call it with
+a mismatched signature. **Tracking a value further (which the analysis
+does - an argument flows into the parameter) is not the same as being
+able to redirect it.** The two gates now sit side by side, each with
+its question written down.
+
+⛔ **AND `stamp_proven_params` (C3) HAD TO GAIN `callee_escaped`.** Its
+gate leaned on `value_escaped`, half of which came from
+`drain_escapes`. Deleting the ledger without replacing that half would
+have silently weakened a stamp every unboxed tier is built on - the
+exact shape of "an optimization that only affects SPEED has no
+correctness oracle", except here it affects a PROOF.
+
+⛔ **A TEST WRITTEN AGAINST BEHAVIOUR OUTLIVED THE MECHANISM.** The two
+`-rt` rows added for the `join` completeness bug assert `271s` and
+`a:dyn` - values, not internals - so deleting the entire mechanism they
+were written against required no edit to either, and their coverage
+survived. A test written against `finfos` would have been deleted with
+it.
+
+Compile time: flat (0-3%, within noise) even though `cs_run` now runs
+once per instantiate round - it must, because
+`value_instantiate_round` CONSUMES the sets and each round redirects
+call sites to fresh clones, so the previous round's answer describes a
+tree that no longer exists.
 
 **4. MIGRATE THE RESOLVER'S THREE.** `callee_of` (the step-7 prover),
 `slot2fn` / `direct_func_slot` (devirtualization), `esc_callback_fn`
