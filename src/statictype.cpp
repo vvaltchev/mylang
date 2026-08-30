@@ -441,6 +441,20 @@ static void note_escaped_into(std::vector<void *> &ledger, StaticTypeRef t)
             ledger.push_back(fi);
 }
 
+/*
+ * Does `b` name a candidate `a` does not? (Set containment, not
+ * equality: if b's members are all in a, `a` already describes the
+ * join.)  See the `static_type_equal` shortcut in join().
+ */
+static bool finfos_add_to(StaticTypeRef a, StaticTypeRef b)
+{
+    for (void *fi : b->finfos)
+        if (std::find(a->finfos.begin(), a->finfos.end(), fi)
+                == a->finfos.end())
+            return true;
+    return false;
+}
+
 StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
 {
     const auto note_escaped = [this](StaticTypeRef t) {
@@ -449,7 +463,39 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
     a = static_type_resolve(a);
     b = static_type_resolve(b);
 
-    if (static_type_equal(a, b))
+    /*
+     * ⛔ EQUAL IS NOT INTERCHANGEABLE FOR A FUNC, AND THIS SHORTCUT
+     * SILENTLY LOST CANDIDATES FOR IT (2026-08-28).
+     *
+     * `finfos` is METADATA - excluded from static_type_equal on
+     * purpose, so that two functions with the same signature remain the
+     * same TYPE. But that makes the shortcut below discard one side's
+     * candidate set whenever two DIFFERENT functions share a shape,
+     * which is the common case:
+     *
+     *     func mk_a(n) => func [n] (x) { return str(n) + str(x); };
+     *     func mk_b(n) => func [n] (x) { return str(n) + str(x); };
+     *     var p = [mk_a(1), mk_b(2)];      # array literal joins them
+     *
+     * Both lambdas are `func(dyn)->str`, so joining them returned `a`
+     * and `p`'s element type named ONE candidate for a value that has
+     * two. Everything downstream that asks "is this callee provably one
+     * function?" then got a confident wrong answer - #115 typed one
+     * lambda's parameter from call sites that reach either, and had to
+     * grow a uniformity rule to survive it.
+     *
+     * The metadata is exactly what must NOT take the shortcut. Fall
+     * through to the Func arm, which builds a fresh type and UNIONS the
+     * sets; the structure it computes for two equal inputs is the same
+     * structure, so nothing else changes.
+     *
+     * ⛔ AND THE MERGE MUST NOT BE DONE IN PLACE. `a` is some
+     * function's own type object; adding b's candidates to it would
+     * make that function's type claim a candidate it does not have,
+     * everywhere the object is shared.
+     */
+    if (static_type_equal(a, b)
+            && !(a->kind == StaticTypeKind::Func && finfos_add_to(a, b)))
         return a;
 
     if (a->kind == StaticTypeKind::Dyn || b->kind == StaticTypeKind::Dyn) {

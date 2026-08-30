@@ -76,7 +76,23 @@ func two_closures(int k) {
 }
 print("pair   ", two_closures(runtime(3)));
 
-# (5) reached ONLY through a container element
+# (5) ⛔ COMPLETENESS. Two same-shaped closures in an array, ONE call
+#     site (so uniformity is trivially satisfied) and an index that
+#     selects the FIRST. `join`'s `static_type_equal` shortcut used to
+#     drop one side's candidate set whenever two functions shared a
+#     signature, so the callee named ONE function and this printed
+#     `a:int15` - a type the call site cannot guarantee, since `p[k]`
+#     may be either closure. Fixed in join; it declines now.
+func mk_ca(n) => func [n] (x) { return "a:" + typestr(x) + str(n + x); };
+func mk_cb(n) => func [n] (x) { return "b:" + typestr(x) + str(n + x); };
+func pick_first(int k) {
+  var p = [mk_ca(10), mk_cb(20)];
+  var f = p[k];
+  return f(5);
+}
+print("merge  ", pick_first(runtime(0)));
+
+# (6) reached ONLY through a container element
 func make_c(n) {
   var cbase = n * 100;
   return func [cbase] (x) { return typestr(x) + ":" + str(cbase + x); };

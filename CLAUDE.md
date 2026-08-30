@@ -3637,19 +3637,45 @@ the loop the snapshot found ZERO sites and the whole rule was inert.
 
 **(b) EVERY SITE ATTRIBUTED TO A CALLEE MUST AGREE, or none of them
 contributes** - the same uniformity `value_instantiate_round` requires
-of a template's signature. This is not a refinement. **The finfo set
-UNDER-COLLECTS**: two same-shaped closures in an array present a
-ONE-element set at every call site, because the path computing the
-element type never reaches `join`'s Func arm (watched, instrumented). So
+of a template's signature. It went in as a NECESSITY, because the set
+UNDER-COLLECTED (below); with that fixed it is a POLICY - a single
+closure whose sites disagree declines to `dyn` here, where a
+DIRECTLY-bound capturing lambda refuses the program. Removing this check
+is what would make the two agree, and that is a language decision.
 
-    var p = [mk_a(1), mk_b(2)];
-    var f = p[k % 2];
-    var g = p[(k + 1) % 2];
-    return f(7) + g("s");        # NO conflict - two functions
+**⛔ AND THE SET'S INCOMPLETENESS WAS A `join` BUG - METADATA EXCLUDED
+FROM EQUALITY, THEN DISCARDED BY AN EQUALITY-BASED SHORTCUT
+(2026-08-28).** `join` opens with
 
-fed BOTH `int` and `str` to one survivor and REFUSED a program with no
-conflict in it. `escaped_finfos` does not catch this and cannot: it
-reports members a join DROPPED, and here they never ENTERED.
+    if (static_type_equal(a, b))
+        return a;
+
+and `finfos` is deliberately NOT part of `static_type_equal` (two
+functions with one signature must stay one TYPE). So whenever two
+DIFFERENT functions shared a shape - the common case - the join
+returned `a` and **silently dropped b's candidates**:
+
+    func mk_a(n) => func [n] (x) { return str(n) + str(x); };
+    func mk_b(n) => func [n] (x) { return str(n) + str(x); };
+    var p = [mk_a(10), mk_b(20)];   # both `func(dyn)->str`
+    var f = p[k];
+    f(5);          # the callee named ONE function, for a value with two
+
+Everything asking "is this callee provably one function?" got a
+confident wrong answer: #115 typed one lambda's parameter from call
+sites that reach either, and `escaped_finfos` could not see it - that
+ledger reports members a join DROPPED, and here they never ENTERED.
+FIXED at the source: a Func whose partner adds candidates falls through
+to the Func arm, which builds a fresh type and UNIONS them. **The merge
+must not be done in place** - `a` is some function's own type object,
+and adding to it would make that function claim a candidate it does not
+have, everywhere the object is shared. Blast radius: 0 of 124 corpus
+programs change compile outcome or output. Watched failing (the helper
+neutered): `-rt` 1971/1972.
+
+**THE GENERAL SHAPE, worth carrying:** when a type carries METADATA that
+its equality deliberately ignores, every `if (equal) return one_of_them`
+in the system is a place that metadata dies.
 
 **THE PRICE, STATED PLAINLY: this does NOT match the directly-bound
 capturing lambda.** That form refuses `f(1)` and `f("s")`; a
