@@ -2113,7 +2113,7 @@ struct VmActivation {
  * Null outside VM execution - do_func_call's window push falls back to a
  * plain per-call Frame then (e.g. a harness helper calling eval_func with
  * the engine flag set but no VM run active). */
-static VmActivation *g_vm_act = nullptr;
+static VmActivation *&g_vm_act = *ml_lowmem_new<VmActivation *>(nullptr);
 
 Frame *vm_window_push(int_type nslots, const Chunk *ck)
 {
@@ -2818,7 +2818,7 @@ const void *g_norec_switch_rbp = nullptr;
 /* 4-v: the EXIT RELAY (see jit.h) - the fragment epilogue's last store. */
 const void *g_norec_exit_desc = nullptr;
 /* 4-iii: the residue-captures relay (see jit.h; was jit.cpp-static). */
-const void *g_jit_residue_caps = nullptr;
+const void *&g_jit_residue_caps = *ml_lowmem_new<const void *>(nullptr);
 #ifdef TESTS
 std::vector<NorecReconFrame> g_norec_recon;
 #endif
@@ -2960,7 +2960,11 @@ static const size_t JIT_BLOCK_RAISED = static_cast<size_t>(-3);
  * ctx), so the native ReturnV helper (jit_ret) reaches the right frame / flow /
  * captures; the fragment holds no ctx handle. The matching activation is the
  * existing g_vm_act. */
-static EvalContext *g_current_ctx = nullptr;
+/* in the LOW ARENA: the emitter reads it with an absolute disp32 (one
+ * instruction, no scratch). A reference, so every C++ use is unchanged.
+ * ⛔ This one is a TRADE, not a free win - C++ reads it in every helper
+ * and now pays an extra load - so it is MEASURED, not assumed. */
+static EvalContext *&g_current_ctx = *ml_lowmem_new<EvalContext *>(nullptr);
 
 /* #55: jit_ret's return values - a resume PC no real chunk pc can equal (a
  * remapped pc is always small). IN-VM: EnterNative switches to the parent

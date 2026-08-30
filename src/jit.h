@@ -1585,7 +1585,9 @@ extern const void *g_norec_exit_desc;
  * jit.cpp) - ALSO the record-less postexit's caller-captures source (the
  * site's residue_pop parks the popped captures value here before the
  * status dispatch, exception paths included). Defined in vm.cpp. */
-extern const void *g_jit_residue_caps;
+/* a REFERENCE to a low-arena cell (#97 step 1c): the emitter reaches it
+ * with an absolute disp32, one instruction and no scratch register. */
+extern const void *&g_jit_residue_caps;
 /*
  * LEVER A's whitelists, at the OPCODE level - the input to the
  * FAMILY-COVERAGE RATCHET (`jit_fwd_family_coverage`, tests.cpp). They
