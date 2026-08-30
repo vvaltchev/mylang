@@ -1137,22 +1137,51 @@ void Inferencer::snapshot_indirect_callees(Block *rootBlock)
     }
 
     /*
-     * 2) UNIFORMITY: every site attributed to a callee must agree, or
-     * none of them contributes - the same rule
-     * `value_instantiate_round` applies to a template's signature.
+     * 2) EVERY QUALIFYING SITE CONTRIBUTES, and the join decides.
      *
-     * ⛔ THIS IS A POLICY, NOT A NECESSITY, AND IT IS THE MAINTAINER'S
-     * CALL TO CHANGE. It went in as a necessity, when the finfo set
-     * UNDER-COLLECTED; that leak is fixed at its source and the
-     * callee-set analysis says "unknown" out loud, so what uniformity
-     * still does is choose a LANGUAGE behaviour: a single closure
-     * whose call sites disagree DECLINES to `dyn` here, where a
-     * DIRECTLY-bound capturing lambda REFUSES the program. Removing
-     * this check is what would make the two spellings agree - and it
-     * would change observable output (case (3) of
-     * 25_factory_closure_param.my joins int and float, so `f(1)`
-     * starts printing a coerced float), which is a language decision,
-     * not a cleanup.
+     * ⛔ THERE USED TO BE A UNIFORMITY CHECK HERE - "all of this
+     * closure's sites must pass the SAME argument types, or none of
+     * them contributes" - and DELETING IT (maintainer's call,
+     * 2026-08-28) is what made MyLang's two closure spellings agree.
+     *
+     * It was never computing a different answer; it decided whether to
+     * answer AT ALL. `contribute_arg` below is the SAME function the
+     * ordinary direct-call path uses, so a lambda the inferencer can
+     * NAME already had every one of its call sites contribute
+     * unconditionally, and the fixpoint JOINED them. A factory-returned
+     * closure cannot be named, so this map is its only route to
+     * `contribute_arg` - and with the gate closed it contributed
+     * nothing and its parameters finalized `dyn`. Same source shape,
+     * two behaviours:
+     *
+     *     var wbase = 20;                                  # B: DIRECT
+     *     var f = func [wbase] (x) { return typestr(x); };
+     *     print(f(1) + " " + f(2.5));   # was: float float
+     *
+     *     func mk(n) {                                     # A: FACTORY
+     *         var wbase = n * 10;
+     *         return func [wbase] (x) { return typestr(x); };
+     *     }
+     *     var g = mk(2);
+     *     print(g(1) + " " + g(2.5));   # was: dyn dyn
+     *
+     * Both print `float float` now: the join widens int to float, and
+     * an int/str pair is the join CONFLICT both spellings already
+     * raised for B. (A third spelling, a NON-capturing var-bound
+     * lambda, is a TEMPLATE and monomorphizes per signature - that is
+     * a different feature and is untouched.)
+     *
+     * ⛔ AND THE REASON IT WAS NEEDED IS GONE, which is what made
+     * deleting it safe rather than merely desirable. It went in when
+     * the candidate set UNDER-COLLECTED: `join`'s `static_type_equal`
+     * shortcut dropped one side's members whenever two functions shared
+     * a signature, so sites belonging to two DIFFERENT closures were
+     * attributed to one survivor - and joining those invents a
+     * TypeMismatchEx in a program that has no conflict in it. The
+     * callee-set analysis reports such a site as a TWO-candidate set,
+     * which `disqualified` above already refuses. Watched: the two
+     * pinned array cases in 25_factory_closure_param.my still decline,
+     * for that reason now and not for this one.
      */
     for (auto &kv : sites) {
         FuncInfo *fi = kv.first;
@@ -1160,28 +1189,10 @@ void Inferencer::snapshot_indirect_callees(Block *rootBlock)
             continue;
         /* A function whose VALUE left the analysed program can be
          * called from a site this pass never saw, so no number of
-         * agreeing visible sites proves anything about it. */
+         * visible sites proves anything about it. */
         if (callee_escaped(fi))
             continue;
-        const std::vector<CallExpr *> &cs = kv.second;
-        bool uniform = true;
-        for (size_t i = 1; i < cs.size() && uniform; i++) {
-            if (cs[i]->args->elems.size() != cs[0]->args->elems.size()) {
-                uniform = false;
-                break;
-            }
-            for (size_t j = 0; j < cs[i]->args->elems.size(); j++)
-                if (!static_type_equal(
-                        static_type_resolve(type_of(cs[i]->args->elems[j].get())),
-                        static_type_resolve(
-                            type_of(cs[0]->args->elems[j].get())))) {
-                    uniform = false;
-                    break;
-                }
-        }
-        if (!uniform)
-            continue;
-        for (CallExpr *c : cs)
+        for (CallExpr *c : kv.second)
             indirect_callee[c] = fi;
     }
 }

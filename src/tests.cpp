@@ -3654,34 +3654,49 @@ static const std::vector<test> tests =
     },
 
     /*
-     * ...and the DECLINE, which is what keeps the rule from refusing
-     * valid programs. It fires only when every site attributed to a
-     * closure AGREES, so two sites of different types leave the param
-     * `dyn` - the pre-#115 behaviour, values and all.
+     * ⛔ TWO DISAGREEING CALL SITES *JOIN*, AND BOTH SPELLINGS OF A
+     * CAPTURING CLOSURE DO THE SAME THING. These two entries are a
+     * PAIR: the same program written as a factory-returned closure and
+     * as a directly-bound capturing lambda, and BOTH must refuse an
+     * int/str pair - which is the join CONFLICT, not a rule of this
+     * pass.
      *
-     * ⛔ THAT IS DELIBERATELY *NOT* WHAT A DIRECTLY-BOUND CAPTURING
-     * LAMBDA DOES (the next entry: it refuses). The asymmetry is the
-     * price of a finfo set that UNDER-COLLECTS - two same-shaped
-     * closures in an array present a ONE-element set at every call
-     * site, so without uniformity both sites feed the same survivor and
-     * a program with no conflict is refused. Declining is the safe
-     * direction; the two entries sit together so the difference is on
-     * the record rather than discovered later.
+     * They used to disagree. A UNIFORMITY check refused to contribute
+     * anything unless every site attributed to a closure passed the
+     * SAME argument types, so the factory form declined to `dyn` and
+     * printed `dyn201dyn20s` where the direct form raised
+     * TypeMismatchEx. That check was never computing a different
+     * answer - it decided whether to answer AT ALL, because
+     * `contribute_arg` is the same function the direct path already
+     * called unconditionally. It is DELETED (maintainer's call,
+     * 2026-08-28).
+     *
+     * ⛔ IT WAS SAFE TO DELETE ONLY BECAUSE THE CANDIDATE SET IS
+     * COMPLETE NOW. Uniformity went in when `join`'s
+     * `static_type_equal` shortcut dropped one side's members whenever
+     * two functions shared a signature: sites belonging to two
+     * DIFFERENT closures were attributed to one survivor, and joining
+     * those invents a conflict in a program that has none. The
+     * callee-set analysis reports such a site as a TWO-candidate set,
+     * which `disqualified` refuses - see the two array entries below,
+     * which still decline for THAT reason.
      */
     {
-        "infer: a factory closure's param DECLINES when its call sites "
-        "disagree (#115 uniformity)",
+        "infer: a factory closure's disagreeing call sites JOIN - an "
+        "int/str pair is refused",
         {
             "func mk(n) {",
             "  var b = n * 10;",
-            "  return func [b] (x) { return typestr(x) + str(b) + str(x); };",
+            "  return func [b] (x) { return str(b) + str(x); };",
             "}",
             "func drive(int k) { var f = mk(k); return f(1) + f(\"s\"); }",
-            "assert(drive(runtime(2)) == \"dyn201dyn20s\");",
+            "print(drive(runtime(2)));",
         },
+        &typeid(TypeMismatchEx),
     },
     {
-        "infer: the DIRECTLY-bound capturing lambda still REFUSES it",
+        "infer: ...and the DIRECTLY-bound capturing lambda agrees - the "
+        "same program, the same refusal",
         {
             "func drive(int k) {",
             "  var b = k * 10;",
@@ -3693,10 +3708,38 @@ static const std::vector<test> tests =
         &typeid(TypeMismatchEx),
     },
     /*
-     * The case that made uniformity necessary: the survivor of an
-     * under-collected set attributed from two disagreeing sites. Before
-     * uniformity this was a TypeMismatchEx on a program with no
-     * conflict in it.
+     * ...and where the types JOIN instead of conflicting, both
+     * spellings coerce, again identically. This is the half a
+     * refusal-only pair cannot see: uniformity's other effect was that
+     * `f(1)` stayed an int where the direct spelling made it a float.
+     */
+    {
+        "infer: a factory closure's int/float sites join to float - "
+        "both spellings coerce",
+        {
+            "func mk(n) {",
+            "  var b = n * 10;",
+            "  return func [b] (x) { return typestr(x); };",
+            "}",
+            "func drive(int k) { var f = mk(k); return f(1) + f(2.5); }",
+            "var db = 20;",
+            "var dfn = func [db] (x) { return typestr(x); };",
+            "assert(drive(runtime(2)) == \"floatfloat\");",
+            "assert(dfn(1) + dfn(2.5) == \"floatfloat\");",
+        },
+    },
+    /*
+     * ⛔ THE CASE THAT ONCE MADE UNIFORMITY NECESSARY, AND IS NOW THE
+     * REASON IT COULD BE DELETED. Two same-shaped closures in an array
+     * and two disagreeing call sites: with an UNDER-COLLECTED
+     * candidate set both sites named the same survivor, joining them
+     * raised a TypeMismatchEx on a program with no conflict in it, and
+     * uniformity was the cheap way to survive that. The callee-set
+     * analysis reports these sites as TWO-candidate sets, so
+     * `disqualified` refuses them and no join happens - the decline
+     * that used to come from uniformity now comes from knowing the
+     * callee is not one function. Watched: this is what fails first if
+     * the candidate set ever under-collects again.
      */
     {
         "infer: two same-shaped closures in an array do not merge into "
@@ -3716,7 +3759,8 @@ static const std::vector<test> tests =
     /*
      * COMPLETENESS of the candidate set itself: a callee that may be
      * either of two SAME-SHAPED closures must name BOTH. With a single
-     * agreeing call site, uniformity cannot catch a set that lost one -
+     * agreeing call site, no per-callee agreement rule could catch a
+     * set that lost one -
      * this asserted `a:int5` before the fix, a type `p[k]` cannot
      * guarantee.
      *
