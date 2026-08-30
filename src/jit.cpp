@@ -10228,10 +10228,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.cmp_byte_rax(L.kind_off, L.kind_floats);
         decline_ne();
         cow_guards();
-        e.load_base(RCX, RAX, L.data_off);
-        e.load_base(RDX, RAX, L.data_off + 8);
-        e.sub_rr(RDX, RCX);
-        e.sar_rr_imm8(RDX, 3);
+        e.load_base(sc.data, sc.obj, L.data_off);
+        e.load_base(sc.count, sc.obj, L.data_off + 8);
+        e.sub_rr(sc.count, sc.data);
+        e.sar_rr_imm8(sc.count, 3);
         load_index_idx(e, sc.idx, in);
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
@@ -10272,10 +10272,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             const size_t j_ok = e.j32(0x77);     /* ja .ok (hot) */
             e.u8(0x48); e.u8(0x85); e.u8(0xFF);  /* test rdi,rdi */
             decline_if(0x74);                    /* 0 -> the helper */
-            e.load_base(RCX, RAX, L.data_off);
-            e.load_base(RDX, RAX, L.data_off + 8);
-            e.sub_rr(RDX, RCX);
-            e.sar_rr_imm8(RDX, 3);
+            e.load_base(sc.data, sc.obj, L.data_off);
+            e.load_base(sc.count, sc.obj, L.data_off + 8);
+            e.sub_rr(sc.count, sc.data);
+            e.sar_rr_imm8(sc.count, 3);
             load_index_idx(e, sc.idx, in);
             e.cmp_rr(sc.idx, sc.count);
             decline_if(0x73);                    /* OOB/neg -> helper */
@@ -10287,10 +10287,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             e.patch32_here(j_ok);
         }
         cow_guards();
-        e.load_base(RCX, RAX, L.data_off);
-        e.load_base(RDX, RAX, L.data_off + 8);
-        e.sub_rr(RDX, RCX);
-        e.sar_rr_imm8(RDX, 3);
+        e.load_base(sc.data, sc.obj, L.data_off);
+        e.load_base(sc.count, sc.obj, L.data_off + 8);
+        e.sub_rr(sc.count, sc.data);
+        e.sar_rr_imm8(sc.count, 3);
         load_index_idx(e, sc.idx, in);
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
@@ -10305,9 +10305,9 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
 
     /* --- BOOLS: 1-byte elements, count = finish - start --- */
     cow_guards();
-    e.load_base(RCX, RAX, L.data_off);
-    e.load_base(RDX, RAX, L.data_off + 8);
-    e.sub_rr(RDX, RCX);
+    e.load_base(sc.data, sc.obj, L.data_off);
+    e.load_base(sc.count, sc.obj, L.data_off + 8);
+    e.sub_rr(sc.count, sc.data);
     load_index_idx(e, sc.idx, in);
     e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));        /* jae: negative OR >= count */
@@ -10319,10 +10319,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     /* --- INTS: 8-byte elements, count = (finish - start) / 8 --- */
     e.patch32_here(j_ints);
     cow_guards();
-    e.load_base(RCX, RAX, L.data_off);
-    e.load_base(RDX, RAX, L.data_off + 8);
-    e.sub_rr(RDX, RCX);
-    e.sar_rr_imm8(RDX, 3);
+    e.load_base(sc.data, sc.obj, L.data_off);
+    e.load_base(sc.count, sc.obj, L.data_off + 8);
+    e.sub_rr(sc.count, sc.data);
+    e.sar_rr_imm8(sc.count, 3);
     load_index_idx(e, sc.idx, in);
     e.cmp_rr(sc.idx, sc.count);
     slows.push_back(e.j32(0x73));
@@ -10702,9 +10702,9 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     decline_ne();
 
     /* the row: data + k1 * sizeof(LValue), bounds by byte length */
-    e.load_base(RCX, RAX, L.data_off);
-    e.load_base(RDX, RAX, L.data_off + 8);
-    e.sub_rr(RDX, RCX);
+    e.load_base(sc.data, sc.obj, L.data_off);
+    e.load_base(sc.count, sc.obj, L.data_off + 8);
+    e.sub_rr(sc.count, sc.data);
     load_slot_idx(e, sc.idx, in.a_dual_lo());
     e.imul_rr_imm8(sc.idx, sc.idx, static_cast<uint8_t>(sizeof(LValue)));
     e.cmp_rr(sc.idx, sc.count);
@@ -10713,20 +10713,20 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     e.add_rr(sc.data, sc.idx);
 
     /* ROW: an array, not const, not readonly */
-    e.load_base(sc.obj, RCX, static_cast<int32_t>(L.off_type));
+    e.load_base(sc.obj, sc.data, static_cast<int32_t>(L.off_type));
     e.movabs(sc.idx, reinterpret_cast<uint64_t>(L.t_arr));
     e.cmp_rr(sc.obj, sc.idx);
     decline_ne();
-    e.cmp_byte_base(RCX, L.lv_const_off, 0);
+    e.cmp_byte_base(sc.data, L.lv_const_off, 0);
     decline_ne();
-    e.load_base(sc.obj, RCX,
+    e.load_base(sc.obj, sc.data,
                 static_cast<int32_t>(L.off_payload));   /* row shobj */
     e.cmp_byte_rax(L.ro_off, 0);
     decline_ne();
 
     /* the row's COW pair -> prep; every arm shares one stub */
     const auto cow_guards = [&]() {
-        e.cmp_byte_base(RCX,
+        e.cmp_byte_base(sc.data,
                         static_cast<int32_t>(L.off_payload) + L.slice_off,
                         0);
         preps.push_back(e.j32(0x75));
@@ -10740,11 +10740,11 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     };
     /* inner data/count/index/bounds (clobbers rcx - after cow_guards) */
     const auto inner_bounds = [&](bool bytes) {
-        e.load_base(RCX, RAX, L.data_off);
-        e.load_base(RDX, RAX, L.data_off + 8);
-        e.sub_rr(RDX, RCX);
+        e.load_base(sc.data, sc.obj, L.data_off);
+        e.load_base(sc.count, sc.obj, L.data_off + 8);
+        e.sub_rr(sc.count, sc.data);
         if (!bytes)
-            e.sar_rr_imm8(RDX, 3);
+            e.sar_rr_imm8(sc.count, 3);
         load_slot_idx(e, sc.idx, in.b_slot());
         e.cmp_rr(sc.idx, sc.count);
         slows.push_back(e.j32(0x73));
