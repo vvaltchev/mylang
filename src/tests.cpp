@@ -31986,7 +31986,20 @@ static bool jit_elemv_native()
             "}",
             "assert(t == 120);" }))
         return false;
-    /* DECLINES - the helper must serve each with the right answer */
+    /*
+     * DECLINES. Each must produce the right answer through the helper -
+     * AND each guard must be PROVEN TAKEN through the decline ledger
+     * (g_jit_decline, jit.h): a fast-path counter says the tier ran, it
+     * cannot say a value ever reached the guard under test, and a guard
+     * no value reaches is one whose test passes with it DELETED. Every
+     * `>= 1` below was watched at 0 first - two of these cases were
+     * VACUOUS as originally written (see the notes).
+     */
+    unsigned long d0[JD_COUNT];
+    for (int r = 0; r < JD_COUNT; r++)
+        d0[r] = g_jit_decline[r];
+    const unsigned long hv0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::LoadElemValue)];
     if (!run({
             /* a slice value stored in (and read from) a general array */
             "var big = [1, 2, 3, 4, 5];",
@@ -32027,18 +32040,80 @@ static bool jit_elemv_native()
             "for (var i = 0; i < 10; i++) w = box[i % 2];",
             /* NOT kindstr(w) - that folds on the STATIC type (dyn) */
             "assert(w == \"x\");",
-            /* negative wrap + the SCALE-WRAP index (2^60) */
+            /* THE SCALE-WRAP index: 2^60 * sizeof(LValue) == 0 mod
+             * 2^64, so without the `jo` the tier reads element 0 where
+             * OutOfBounds must raise */
             "var g = [[1], [2]];",
             "var dyn z = 0;",
             "var caught = 0;",
             "for (var i = 0; i < 6; i++) {",
-            "  z = g[runtime(-1)];",
             "  try { z = g[1152921504606846976]; }",
             "  catch (OutOfBoundsEx) { caught += 1; }",
             "}",
-            "assert(z[0] == 2);",
-            "assert(caught == 6);" }))
+            "assert(caught == 6);",
+            /* the NEGATIVE index (the helper WRAPS it; the tier's
+             * unsigned compare declines). ⛔ The first version of this
+             * case was `g[runtime(-1)]` and the ledger read
+             * elemv_bounds == 0: a runtime() call in the index splits
+             * the run, so the op never reached the tier at all. An
+             * index computed from the LOOP VARIABLE does. */
+            "var g2 = [[1], [2], [3]];",
+            "var s2 = 0;",
+            "for (var i = 0; i < 12; i++) {",
+            "  z = g2[i % 2 - 1];",     /* -1 wraps to the last element */
+            "  s2 += z[0];",
+            "}",
+            "assert(s2 == 24);",
+            /* a SLICE BASE (the array being indexed is itself a view) */
+            "var bb = [[1], [2], [3], [4]];",
+            "var sl = bb[1:4];",
+            "var s3 = 0;",
+            "for (var i = 0; i < 12; i++) {",
+            "  z = sl[i % 3];",
+            "  s3 += z[0];",
+            "}",
+            "assert(s3 == 36);",
+            /* a NON-GENERAL storage base: a flat POD-struct array is
+             * a byte buffer, not a vector<LValue>. ⛔ NOT a string
+             * array - a plain string LITERAL array is GENERAL storage
+             * (the value-driven rule: only split()/splitlines() and a
+             * hinted keys()/values() build flat strs), so the first
+             * version of this case took the FAST path and the ledger
+             * read elemv_base_kind == 0. */
+            "struct Pt { int x; int y; }",
+            "var ps = [Pt(1, 2), Pt(3, 4)];",
+            "var s4 = 0;",
+            "for (var i = 0; i < 12; i++) {",
+            "  var pe = ps[i % 2];",
+            "  s4 += pe.x;",
+            "}",
+            "assert(s4 == 24);" }))
         return false;
+    /* Option 1 - the helper served SOMETHING (any decline happened) */
+    if (g_jit_op_run[static_cast<size_t>(OpCode::LoadElemValue)] <= hv0) {
+        fprintf(stderr, "jit_elemv_native: nothing DECLINED to the "
+                        "helper - the decline cases are vacuous\n");
+        return false;
+    }
+    /* Option 2 - and each named guard was the one that sent it there.
+     * elemv_base_not_arr is deliberately absent: LoadElemValue is
+     * emitted only for a statically-proven array base (a dyn base
+     * lowers to SubscriptV - checked), so no compiled program can
+     * reach it. It stays because a `.myv` image's operands are bounded
+     * but NOT type-checked (the ML_UNTRUSTED_CHECK tier-2 case) - a
+     * hostile image can point that slot at anything. */
+    static const int want[] = {
+        JD_elemv_base_slice, JD_elemv_base_kind, JD_elemv_scale_wrap,
+        JD_elemv_bounds, JD_elemv_elem_ex, JD_elemv_elem_slice,
+    };
+    for (const int r : want) {
+        if (g_jit_decline[r] > d0[r])
+            continue;
+        fprintf(stderr, "jit_elemv_native: the guard `%s` was never "
+                        "TAKEN - its case is vacuous\n",
+                jit_decline_name(r));
+        return false;
+    }
     return true;
 #else
     return true;

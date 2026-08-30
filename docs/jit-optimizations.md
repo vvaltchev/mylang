@@ -9240,3 +9240,63 @@ programs changed, 110 byte-identical. REACH: `g_jit_elemv_fast`
 only. The coverage test is `jit_elemv_native` (tests.cpp); the
 `jit_op_nativized` LoadElemValue row accepts the inline counter (the
 BinOpV precedent - the helper legitimately starves).
+
+## #97 increment 2 - THE DECLINE LEDGER: "which GUARD did this value
+## take?", 2026-08-26
+
+**THE PROBLEM A FAST-PATH COUNTER CANNOT SEE.** `g_jit_elemv_fast`
+proves the tier RAN. It says nothing about whether a test's values
+ever REACHED a given guard - and a guard no value reaches is a guard
+whose test passes with the guard DELETED. Increment 1's first
+slice-decline test did exactly that: it passed with the guard removed
+while the fast counter read 17.
+
+**THE LEDGER.** Every decline arm gets its own counter
+(`g_jit_decline[]`, `ML_FOR_EACH_JIT_DECLINE` in jit.h - one X-macro
+so the enum, the name table and the MYLANG_JITSTATS rows cannot
+drift). The emitter's half is two functions next to `SlotAddr`:
+`decline_jump(e, jumps, cc, why)` records the jump WITH its reason,
+`decline_land(e, jumps)` lands them. Under TESTS each distinct reason
+gets a landing pad - bump this reason's counter, jump on to the slow
+tier; without TESTS every jump patches straight to the landing point.
+An unconditional jump over the pads is emitted first, so a caller
+never has to reason about fall-through to be correct.
+**PROVEN COST-FREE IN A SHIPPING BUILD:** `vdjcmp` of an
+`OPT=1 ASSERTS=0` build against the pre-ledger commit is 119/119
+byte-identical.
+
+A test then asserts `g_jit_decline[JD_x] > baseline` per guard, which
+makes vacuity for THAT guard impossible rather than unlikely. The
+report prints a `tier declines (which guard was taken)` section
+whenever anything declined, so "the tier ran" and "every value in this
+program took guard X" are separate answers.
+
+**IT FOUND TWO VACUOUS CASES IN ITS OWN FIRST TEST, WITHIN A MINUTE:**
+ - `elemv_bounds` read **0**. The negative-index case was
+   `z = g[runtime(-1)]` - a `runtime()` call in the INDEX splits the
+   run, so the op never reached the tier at all. An index computed
+   from the LOOP VARIABLE (`g2[i % 2 - 1]`) does: 6 declines, 6 fast.
+ - `elemv_base_kind` read **0**. The non-general-storage case used a
+   string-literal array - and a plain string LITERAL array is GENERAL
+   storage (the value-driven rule: only `split()`/`splitlines()` and a
+   hinted `keys()`/`values()` build flat `strs`), so it took the FAST
+   path. A flat POD-struct array reaches the guard.
+Both are now written up AT the case, so the next reader sees the trap
+rather than re-deriving it.
+
+**AND IT ANSWERED A QUESTION NOBODY COULD ASK BEFORE - is a guard
+REACHABLE AT ALL?** `elemv_base_not_arr` is taken by nothing: the
+codegen emits LoadElemValue only for a statically-proven array base (a
+`dyn` base lowers to SubscriptV - verified in `-vd`). It STAYS, and
+the reason is now written down instead of assumed: a `.myv` image's
+operands are bounded by `verify_chunk` but NOT type-checked (the
+ML_UNTRUSTED_CHECK tier-2 case), so a hostile image can point that
+slot at anything. The test lists it as a deliberate exemption with
+that reason - a non-answer as a row note, never a silent omission.
+
+**THE PATTERN TO REUSE.** Add reasons to the X-macro, call
+`decline_jump` instead of `push_back(e.j32(cc))`, `decline_land`
+instead of the patch loop, and assert the reasons in the tier's test.
+The next tier to use it is the boxed-element STORE twin, whose guards
+- read-only array, live-slice detach, hash invalidation, plus the
+reference lifecycle - are four separate correctness cliffs.
