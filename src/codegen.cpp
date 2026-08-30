@@ -9060,6 +9060,72 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                  * JumpUnlessElemInt arr[i], L (the sieve test). The temp
                  * must be dead on BOTH successor paths; op1's node/loc
                  * (the OOB caret) rides along in place. */
+                /*
+                 * store.cap k = v ; load.capture d, k  ->
+                 * store.cap k = v ; move d = v
+                 *
+                 * A closure that mutates a capture and then USES it -
+                 * `count++; return count`, the whole of 11_closure_
+                 * counter's callee - re-reads the slot it has just
+                 * written. The load is not cheap: reaching a capture
+                 * means ctx -> captures -> data() (three chained loads,
+                 * re-derived per access) plus the type guards and a
+                 * 24-byte boxed copy - about TWELVE emitted
+                 * instructions for a value already sitting in a slot.
+                 *
+                 * SOUND because a plain-assign StoreCaptureV is exactly
+                 * `lv.put(RValue(frame[v]))`: no coercion (unlike a
+                 * declared-type slot store), and a capture LValue has no
+                 * container, so no COW can intervene. The two ops are
+                 * ADJACENT, so nothing can write `v` in between.
+                 *
+                 * ⛔ THE aop GATE IS LOAD-BEARING: a COMPOUND store
+                 * (`cap += x`) writes num_binop's RESULT, which is not
+                 * what slot `v` holds - forwarding `v` there would
+                 * return the addend. A LITERAL operand is excluded for
+                 * the same reason MoveV needs a slot to copy from.
+                 */
+                if (op1.op == OpCode::StoreCaptureV
+                    && op2.op == OpCode::LoadCaptureV
+                    && op1.aop == Op::invalid
+                    && !op1.a_is_lit()
+                    && op2.target2 == op1.target
+                    && op1.a_slot() >= 0) {
+                    /*
+                     * THE THREE-OP WINDOW, which is where the win
+                     * actually is: `store.cap k = v; load.cap d, k;
+                     * return.v d` is the counter-closure idiom
+                     * (`count++; return count`) in full. Rewriting the
+                     * LOAD to a MoveV alone only traded ~12 emitted
+                     * instructions for ~9 - a boxed MoveV has its own
+                     * type guards and 24-byte copy. Pointing the RETURN
+                     * straight at `v` removes both.
+                     *
+                     * The load is neutralised as a Jump to the next pc
+                     * - the peephole rewrites in place and cannot
+                     * ERASE (pcs are jump targets), which is the same
+                     * idiom the LoadElemInt/JumpUnlessTrueV fusion
+                     * below uses for its consumed op.
+                     */
+                    if (p + 2 < n && code[p + 2].op == OpCode::ReturnV
+                        && !code[p + 2].a_is_lit()
+                        && code[p + 2].a_slot() == op2.target) {
+                        code[p + 2].set_a(slot_op(op1.a_slot()));
+                        op2.op = OpCode::Jump;
+                        op2.target = static_cast<int>(p) + 2;
+                        op2.target2 = -1;
+                        changed = true;
+                        continue;
+                    }
+                    /* MoveV reads its SOURCE from target2, not from
+                     * `a` (vm.cpp's handler) - the first version set
+                     * `a` and produced `move r0 = r-1`, which -vd
+                     * showed immediately. */
+                    op2.op = OpCode::MoveV;
+                    op2.target2 = op1.a_slot();
+                    changed = true;
+                    continue;
+                }
                 if (op1.op == OpCode::LoadElemInt
                     && op2.op == OpCode::JumpUnlessTrueV
                     && op2.target2 == op1.target

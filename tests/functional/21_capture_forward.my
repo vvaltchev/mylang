@@ -1,0 +1,68 @@
+# THE CAPTURE STORE-TO-LOAD FORWARD (#97): a closure that mutates a
+# capture and then USES it - `count++; return count`, the counter idiom
+# - used to re-read the slot it had just written. Reaching a capture is
+# ctx -> captures -> data(), three chained loads re-derived per access,
+# plus type guards and a 24-byte boxed copy: about twelve emitted
+# instructions for a value already sitting in a frame slot.
+#
+# This file pins BOTH directions. corpus_diff runs it against the
+# tree-walker, which never had the peephole, so any divergence is the
+# rewrite being wrong.
+
+# ---- THE SHAPE THE RULE IS FOR ----
+func make_counter(start) {
+    var count = start;
+    return func [count] { count++; return count; };
+}
+var c = make_counter(10);
+print("counter", c(), c(), c());
+
+# the same through a plain assignment rather than ++
+func make_setter(init) {
+    var v = init;
+    return func [v] (x) { v = x * 2; return v; };
+}
+var s = make_setter(0);
+print("setter ", s(3), s(5));
+
+# ---- THE DECLINES ----
+# a COMPOUND capture store writes num_binop's RESULT, not the source
+# slot - forwarding the source would return the addend
+func make_adder(start) {
+    var acc = start;
+    return func [acc] (x) { acc += x; return acc; };
+}
+var a = make_adder(100);
+print("compound", a(1), a(2), a(3));
+
+# a store to one capture followed by a read of a DIFFERENT one
+func make_pair(p, q) {
+    var x = p;
+    var y = q;
+    return func [x, y] (n) { x = n; return y; };
+}
+var pr = make_pair(7, 9);
+print("other   ", pr(1), pr(2));
+
+# the mutated capture read AFTER an intervening call, so the value in
+# the source slot is no longer trivially the capture's
+func make_mixed(start) {
+    var m = start;
+    return func [m] (int k) {
+        m = k;
+        var t = k + 1;
+        return m + t;
+    };
+}
+var mx = make_mixed(0);
+print("mixed   ", mx(4), mx(10));
+
+# two closures over the SAME factory call must keep independent state
+func two() {
+    var n = 0;
+    return [func [n] { n++; return n; }, func [n] { n++; return n; }];
+}
+var pairfns = two();
+var f0 = pairfns[0];
+var f1 = pairfns[1];
+print("indep   ", f0(), f0(), f1());

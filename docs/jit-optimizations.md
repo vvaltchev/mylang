@@ -9481,3 +9481,66 @@ bool on both sides. Suspected cause: a bool node is stamped `th == i`,
 and the member-read lowering's "bool -> 0/1 int" form writes an INT
 into the dst, losing the type. Tracked separately; the test here uses
 the comparison spelling, with a note saying why.
+
+## #97 step 2a - THE CAPTURE STORE-TO-LOAD FORWARD (a BYTECODE
+## peephole, so both engines get it), 2026-08-26
+
+**WHAT.** A closure that mutates a capture and then USES it re-read the
+slot it had just written. `count++; return count` - the whole of
+11_closure_counter's callee - compiled to FIVE ops:
+
+    0  load.capture r0, cap[0]
+    1  i.bin        r1 = r0 + 1
+    2  store.cap    count = r1
+    3  load.capture r0, cap[0]     <- re-reads what op 2 just wrote
+    4  return.v     r0
+
+Op 3 is not cheap. Reaching a capture is `ctx -> captures -> data()` -
+THREE CHAINED LOADS, re-derived at every access, since nothing caches
+the base - then the type guards and a 24-byte boxed copy: about TWELVE
+emitted instructions for a value already sitting in a frame slot.
+
+**THE RULE.** `store.cap k = v ; load.cap d, k` -> the load reads `v`
+instead. SOUND because a plain-assign StoreCaptureV is exactly
+`lv.put(RValue(frame[v]))`: no coercion (unlike a declared-type slot
+store), and a capture LValue has no container, so no COW can intervene.
+The ops are ADJACENT, so nothing can write `v` between them.
+
+**⛔ THE `aop` GATE IS THE SOUNDNESS CONDITION.** A COMPOUND store
+(`acc += x`) writes num_binop's RESULT, which is NOT what slot `v`
+holds - forwarding `v` there returns the ADDEND. Watched failing:
+removing that one condition turns `compound 101 103 106` into
+`compound 1 2 3` in tests/functional/21_capture_forward.my.
+
+**⛔ AND THE TWO-OP FORM WAS NOT WORTH MUCH - THE THREE-OP WINDOW IS.**
+Rewriting the load into a `MoveV` alone measured only **-1.56%**: a
+boxed MoveV has its own type guards and 24-byte copy, so it traded ~12
+emitted instructions for ~9. Extending the match to
+`store.cap; load.cap; return.v` - pointing the RETURN straight at `v` -
+removes both, and the body drops to four ops with no capture read at
+all after the store. **-10.42%.** The lesson generalises: replacing an
+expensive op with a cheaper one is worth a fraction of DELETING it, and
+the peephole's pair window hid the difference until the third op was
+looked at.
+
+The consumed load is neutralised as a `Jump` to the next pc, the idiom
+the LoadElemInt/JumpUnlessTrueV fusion already uses - the peephole
+rewrites IN PLACE and cannot erase, because pcs are jump targets.
+
+**MEASURED** (Ir per scale unit, scale3-minus-scale1, `-npc`, OPT=1
+ASSERTS=0; wall from an interleaved --baseline):
+
+    11_closure_counter  192.0M -> 172.0M  (-10.42%)   wall 0.88x
+    63_closures         346.2M -> 338.2M  (-2.31%)    wall 0.99x
+
+**THIS ONE MOVED THE WALL CLOCK, AND THE STEP-1 WORK DID NOT** - worth
+recording side by side, because the difference is the whole lesson of
+the guard-elision family. Step 1 removed 17 `movabs reg, imm64` per
+call: register writes with no memory access, which a wide OOO core
+absorbs (Ir -8.1%, wall 1.00x). This removes three chained LOADS and a
+24-byte copy - real memory traffic - and 10% of the instructions became
+12% of the time.
+
+It is a BYTECODE peephole, so the interpreter gets it too; and being
+engine-independent it is covered by corpus_diff against the
+tree-walker, which never had the rule.
