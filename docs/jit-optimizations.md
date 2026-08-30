@@ -6082,3 +6082,46 @@ free and covers every small constant, not just +-1.
    a release build emitting a garbage opcode. `-Werror=uninitialized`
    caught it; the debug build was clean. Same family as any check whose
    side effect is load-bearing.
+
+## 2026-08-18 - the MAXPINS sweep RE-RUN: a register is worth something now
+
+The same `MYLANG_JIT_MAXPINS` sweep that found every pin worth +0.00%,
+re-run after increments 1 and 2. Callgrind Ir, OPT=1 ASSERTS=0, and the
+instrument's self-test (a non-binding cap is a no-op) re-verified
+byte-identical on 108/108 first.
+
+**WHAT THE WHOLE POOL IS WORTH (cap 0 -> 7):**
+
+    bench              before      now
+    83_regs_int_40     +0.00%     -3.19%
+    80_regs_int_08     +0.00%    -12.44%
+    01_while_loop      -5.85%    -16.57%
+    07_nested_loops    -5.36%    -11.33%
+
+**AND THE MARGINAL VALUE, which is the number that decides the arc:**
+
+    83_regs_int_40   pins 3,4,5,6,7 -> -0.76 -0.61 -0.62 -0.62 -0.62 %
+    80_regs_int_08   pins 3,4,5,6,7 -> -2.96 -2.44 -2.50 -2.57 -2.64 %
+    01_while_loop    pins 1,2       -> -8.28 -9.04 %, then flat
+    07_nested_loops  pins 1,2       -> -8.50 -3.09 %, then flat
+
+⛔ **ON THE REGISTER-PRESSURE BENCHES THE CURVE HAS NOT PLATEAUED AT 7**
+- and 7 is the whole pool (MAX_CACHED 4 + MAX_XCACHED 3). Each further
+register returns a steady -0.62% on 83 and -2.6% on 80, with no sign of
+saturation. The two loop benches DO plateau, correctly: they have two
+hot locals, so pins 3+ have nothing left to hold.
+
+**THIS IS THE EVIDENCE THE 13-REGISTER GOAL NEVER HAD.** Three
+increments widened the pool against a site count and measured flat;
+the honest reading was "pin pressure is not the constraint". It was
+not the constraint *while the emitter could not name a pinned register
+as an arithmetic operand* - a pin then only changed an addressing mode.
+Now that `add r14, r13` exists, a pinned accumulator is 1 uop where a
+memory one is 3, and the pool is measurably too SMALL rather than
+irrelevant. Widening it is now a decision with a number behind it.
+
+The per-pin figure also says how much: 83 has 40 accumulators and each
+pin covers 1/40 of the body (-0.62%), 80 has 8 and each covers 1/8
+(-2.6%) - so the return scales with what fraction of the working set a
+register captures, exactly as it should, and going 7 -> 13 on 83
+projects to roughly another -3.7%.
