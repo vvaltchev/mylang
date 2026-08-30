@@ -6522,3 +6522,57 @@ most useful.
 (ElemScratch's count/obj, idiv's RDX:RAX, the SIB base, the shift
 count, every helper's return). Threading does not free them; each needs
 its arm to spill around itself or decline when the register is pinned.
+
+## 2026-08-19 - #96: instrumentation that perturbs nothing, and the
+## build configuration I never compiled
+
+**THE CHANGE.** `Emitter::bump_counter` takes NO register. It emits
+`push rax; movabs rax, &ctr; inc qword [rax]; pop rax`, so a TESTS
+counter cannot disturb any register at all. Every one of the 24 call
+sites - and `bump_op` - goes through it.
+
+**WHY, in three steps, because the first two fixes were not enough.**
+The seam already existed, with a comment saying exactly why ("for sites
+where rax is live"). Nineteen sites open-coded `movabs RDX, &ctr; inc
+qword [rdx]` past it, and `bump_op` hardcoded rax with the register
+named only inside a COMMENT - `movabs(0 /* rax */, ...)`, invisible to
+a grep for RAX.
+
+Routing them through one register-TAKING helper was fix two, and it
+still left something choosing, per site, a register that happened to be
+dead. These are all `#ifdef TESTS`, so a wrong choice makes the TESTS
+build's register traffic **differ from the shipping build's** - the net
+meant to catch a pin bug would report one the release does not have, or
+hide one it does. With rdx and rax both queued for the pin pool that
+was going to be wrong somewhere. **Instrumentation must not perturb
+what it measures**; two bytes in a build already paying for counters is
+the cheapest possible way to guarantee it. Census: RDX 119 -> 107,
+RAX 394 -> 390, RCX 223 -> 218.
+
+**⛔ AND THE PART WORTH MORE THAN THE CHANGE: `make OPT=1` HAD BEEN
+BROKEN FOR FIVE COMMITS.** The `elem_noreg` / `elem_reserve` counters
+added with the element-tier reservation are defined inside jit.cpp's
+`#ifdef TESTS` block, like every counter there - but their increments
+were not guarded, so a plain release build failed to compile:
+
+    error: 'g_jit_elem_reserve' was not declared in this scope
+
+Every lane I had run was `TESTS=1`: debug (`TESTS=1 OPT=0`) and
+rel-hard (`TESTS=1 OPT=1 VM_HARDENING=1`), plus corpus_diff and vdjcmp
+against those. `build-claude/release` - a plain `make OPT=1`, which
+CLAUDE.md names as the ONLY binary to benchmark - was compiled by
+nobody.
+
+This is the `LTO=0` lesson exactly: **a configuration nobody compiles
+is a configuration that is broken.** CI *does* have the lane
+(`release-smoke`, `-DTESTS=0` in linux.yml, whose own comment says a
+no-TESTS build "catches a declaration that escaped a TESTS guard"), so
+it would have failed on push - but five commits of local verification
+called itself green while the shipping build did not exist.
+
+**THE BATTERY GAINS A LANE.** A JIT change is now verified over
+{debug ASan+UBSan, rel-hard, **plain OPT=1 no-TESTS**} x {arena,
+no-arena}, not the first two alone. The no-TESTS build is also the only
+one that can tell a TESTS-guarded change from a real one - which
+matters directly here, since the push/pop makes every TESTS-build
+disassembly differ while the shipping build is untouched.
