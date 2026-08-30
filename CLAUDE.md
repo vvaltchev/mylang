@@ -98,7 +98,10 @@ them means anything:**
 - **`MYLANG_JITSTATS`** - which TIER a program's calls actually took.
   Oracle: the counters are bumped from EMITTED code only.
 - **`tests/corpus_diff.sh`** - do the engines agree. Oracle: the
-  `--levers` / `--cold` / `--xrot` matrices.
+  `--levers` / `--cold` / `--xrot` / `--nolowmem` matrices.
+- **`MYLANG_NO_LOWMEM=1`** - refuse the low-address arena, so the
+  JIT's REGISTER-form type tags (the shipping configuration wherever
+  `MAP_32BIT` is unavailable or fails) are reachable by a test.
 - **`tests/myv_doc_check.py`** - is `docs/myv-format.txt` still the
   spec. Oracle: it is written from the DOC, not from serialize.cpp.
 
@@ -763,6 +766,31 @@ collision). Three nets now:
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
   matrix runs against the CORPUS, not the suite.
+- **⛔ `MYLANG_NO_LOWMEM=1` - REFUSE THE LOW-ADDRESS ARENA (2026-08-18).**
+  The JIT names `t_int`/`t_float`/`t_bool` with a sign-extended `imm32`
+  only while they live below 2^31 (`lowmem.h`); everywhere else -
+  Darwin, Windows, a hardened kernel, an exhausted low 2GB, **a failed
+  `MAP_32BIT` on an ordinary Linux box** - every tag store and tag
+  compare falls back to a REGISTER form instead. That is materially
+  different emitted code, it ships, and **no build and no CI lane could
+  enter it**, because the arena is decided by an `mmap` at static init
+  with no switch. This is the `LTO=0` shape exactly: a configuration
+  only one platform can take is a configuration nobody tests.
+  Its FIRST run found a shipped wrong answer. `store_dst_bool` wrote
+  the `t_bool` tag as `store_type_tag(a.type, t_bool, RCX)` - and when
+  #96 step 3 made tags immediates, the `movabs RCX, t_bool` that made
+  that call TRUE was deleted as "an instruction saved". Nothing else
+  ever loads RCX with a tag, so on the fallback path every bool store
+  wrote whatever RCX happened to hold **as the slot's type pointer**:
+  7 corpus programs crashed or answered wrongly, `-rt` was 1922/1922
+  and plain `corpus_diff` 20/20 (both watched). The seam is split now -
+  `store_type_tag(disp, tag, held_reg)` ML_CHECKs that the tag is one
+  of the two something actually materialises, and
+  `store_type_tag_via(disp, tag, scratch)` BUILDS the value for any
+  other - so the next tag cannot repeat it.
+  **The general rule: an optimization that makes a register
+  UNNECESSARY must not leave an argument behind claiming it is still
+  LOADED.** Delete the parameter or honour it.
 - **`MYLANG_JIT_XROT=N` - ROTATE the caller-saved pin pool** so member
   N is handed out FIRST (`tests/corpus_diff.sh BIN --xrot` runs the
   matrix; `g_jit_xrot` is settable in-process, and `jit_xcache_pins`
