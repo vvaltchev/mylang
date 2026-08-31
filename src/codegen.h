@@ -81,6 +81,16 @@ bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit = true);
 void build_boxed_ops(Chunk &chunk);
 
 /*
+ * #106 phase 2 - fill `Chunk::nonneg_slots` (bytecode.h): the frame slots
+ * this chunk can only ever observe holding a value >= 0. Like
+ * `build_boxed_ops` it is a DERIVED pool - a pure function of the final
+ * code plus `consts` and `handler_sites` - so the LOADER calls it too and
+ * a stored image cannot disagree with a fresh compile. It reads no
+ * caller-supplied seed for exactly that reason.
+ */
+void compute_nonneg_slots(Chunk &chunk);
+
+/*
  * Lever A (dead-temp forwarding, plans/archived/unboxing.md): per-pc TEMP
  * live-out AND live-in masks + branch-target flags over the chunk's
  * FINAL code, for the JIT's adjacent-pair forwarding. Computed HERE,

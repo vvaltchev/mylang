@@ -612,6 +612,22 @@ RANGE, and these are not in it - so the lesson is the older one:
 when you build a lever, enumerate what it could serve, not only
 what it serves.
 
+**⛔ AND A TENTH SHAPE, FOUND BY BUILDING A NEW CONSUMER (#106 phase 2,
+2026-08-29): `OpCode::Throw` IS NOT IN `visit_use_def` AT ALL.** It
+reads `a_slot` and writes no frame slot, so it belongs in the verified
+set; being absent makes it a BARRIER, i.e. "reads every temp and may
+write anything". `compute_nonneg_slots` (the new consumer) fails closed
+on a barrier, so **42_exceptions - whose
+`for (var i = 0; i < N; i++) { ... i % 2 ... }` is the qualifying shape
+exactly - declines the whole chunk** and keeps a six-instruction sign
+bias it does not need. The same absence costs lever A and the E1
+liveness inside EVERY try body, and nothing announces it: a barrier is
+conservative, so the answer stays right and only the speed moves. It is
+NOT fixed here - adding it changes emitted code corpus-wide and needs
+its own Ir ledger. **The generalisable half: a table's gaps are found by
+writing a new consumer of it, because the new consumer is the first
+thing that cannot afford them.**
+
 **THE FIX, AND THE PATTERN TO REUSE: derive the test from the OPCODE
 ENUM, not from the table.** The B1/B2 specialized family is a
 CONTIGUOUS range (`IntAddRR .. FloatMulRI`, bytecode.h), so

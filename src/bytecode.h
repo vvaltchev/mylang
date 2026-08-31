@@ -1651,6 +1651,30 @@ struct Chunk {
      */
     std::vector<int32_t> ref_slots;
 
+    /*
+     * #106 phase 2 - THE NON-NEGATIVE SLOTS: frame slots this chunk can
+     * only ever observe holding a value >= 0. Consumed by the JIT's
+     * power-of-two div/mod reduction, where it deletes the whole
+     * sign-bias sequence: MyLang's `%` TRUNCATES, so `x % 2^k` needs
+     * four instructions of bias to answer -1 for `-5 % 4` - but a
+     * dividend that cannot be negative needs only `and x, 2^k-1`, and
+     * `x / 2^k` only `sar x, k`.
+     *
+     * DERIVED, therefore NOT SERIALIZED: `compute_nonneg_slots`
+     * (codegen.h) is a pure function of the FINAL code + `consts` +
+     * `handler_sites`, and the loader re-runs it, exactly as it re-runs
+     * `build_boxed_ops`. That is single-source-of-truth as much as it is
+     * bytes: the fact the JIT bakes into an emitted `and` is computed by
+     * the same function on both paths, so an image and a fresh compile
+     * cannot disagree about it. It is also why the analysis may read
+     * ONLY chunk data - the parameter seeds `compute_ref_slots` receives
+     * do not exist at load time.
+     *
+     * Sorted. See compute_nonneg_slots (codegen.cpp) for the rule and
+     * for why `<` and a step of exactly +1 are both load-bearing.
+     */
+    std::vector<int32_t> nonneg_slots;
+
     /* Native-AOT fragments (see NativeCode above). */
     NativeCode native;
 

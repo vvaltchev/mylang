@@ -62,6 +62,10 @@ unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_divmagic = 0;      /* const-divisor div/mod reduced */
 extern "C" unsigned long g_jit_divpow2;
 unsigned long g_jit_divpow2 = 0;       /* ...of those, by a POWER OF TWO */
+extern "C" unsigned long g_jit_divpow2_nn;
+unsigned long g_jit_divpow2_nn = 0;    /* ...of THOSE, with a PROVEN >= 0
+                                        * dividend: the whole sign bias
+                                        * gone, one instruction left */
 unsigned long g_jit_boxed_fastf = 0;   /* H6: inline float-float ones */
 unsigned long g_jit_boxed_slow = 0;    /* H6 reach: helper-path declines */
 unsigned long g_jit_boxed_slow_f = 0;  /* H6 reach: ... of them float-float */
@@ -3581,6 +3585,15 @@ struct Emitter {
     {
         bump_counter(&g_jit_divpow2);
     }
+    /* #106 phase 2 - a SEPARATE counter, not a replacement: "the pow2
+     * arm ran" and "the pow2 arm ran WITHOUT the bias" are different
+     * facts, and a test that cannot tell them apart cannot notice the
+     * range analysis going inert (the whole-lever-counter blind spot,
+     * CLAUDE.md's fourth audit-table shape). The nn site bumps BOTH. */
+    void bump_divpow2_nn()
+    {
+        bump_counter(&g_jit_divpow2_nn);
+    }
     void bump_divmagic()
     {
         /* the SIXTEENTH counter - it hid from the bump sweep by being
@@ -3590,6 +3603,7 @@ struct Emitter {
     }
 #else
     void bump_divpow2() { }
+    void bump_divpow2_nn() { }
     void bump_divmagic() { }
 #endif
     /* movq r64, xmm<src> - the div0 bit test's read (C4b: any source;
@@ -5206,13 +5220,67 @@ static bool div_magic(int_type d, DivMagic &out)
 }
 
 /*
+ * #106 phase 2 - can this div/mod's DIVIDEND ever be negative?
+ *
+ * The dividend is operand `a` at all three reduction sites: IntBin's
+ * div/mod loads it into the accumulator with `load_operand(.., a_is_lit,
+ * a_lit, a_slot)`, and IntModRI reads `a_slot` into rax. A FORWARDED
+ * lever-A temp is the same slot's value held in a register, so the slot
+ * question is the right one there too (and a temp never qualifies
+ * anyway - its producer is not a benign def).
+ *
+ * ⛔ IntAddModRI (the E4 fusion `(a + b) % IMM`) DELIBERATELY DOES NOT
+ * ASK. Its dividend is a SUM, and two non-negative addends can still
+ * wrap to a negative under -fwrapv - which is exactly the accumulator
+ * shape that fusion exists for. It keeps the full bias sequence.
+ */
+static bool jit_dividend_nonneg(const Chunk &ck, const Instr &in)
+{
+    if (in.a_is_lit())
+        return in.a_kind() != Operand::LitKind::f && in.a_lit() >= 0;
+    const int32_t sl = static_cast<int32_t>(in.a_slot());
+    return sl >= 0 && std::binary_search(ck.nonneg_slots.begin(),
+                                         ck.nonneg_slots.end(), sl);
+}
+
+/*
  * Emit the reduced division. On entry rax = the dividend and rcx is
  * FREE (the caller loaded the literal divisor there and no longer needs
  * it). On exit the result is in rax, for `div` and for `mod` alike.
  */
 static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
-                           bool want_mod)
+                           bool want_mod, bool nonneg = false)
 {
+    /*
+     * ⛔ #106 PHASE 2 - A PROVEN NON-NEGATIVE DIVIDEND DELETES THE BIAS.
+     * Everything the pow2 arm does beyond one instruction exists to make
+     * TRUNCATING `%` right for a negative dividend. When the caller can
+     * prove the dividend is >= 0 (Chunk::nonneg_slots - a counted loop's
+     * induction variable), `x % 2^k` IS `x & (2^k - 1)` and `x / 2^k` IS
+     * `x >> k`, and there is nothing to keep aside - so `keep` is not
+     * even allocated on this path. Six instructions become one.
+     *
+     * It is a strictly narrower claim than the arm below, never a
+     * different answer: for x >= 0 the bias register is 0 and every
+     * added instruction is an identity.
+     */
+    const bool pow2_nn = m.pow2_k && nonneg;
+    if (pow2_nn) {
+        const uint8_t k = static_cast<uint8_t>(m.pow2_k);
+        if (want_mod) {
+            /* the divisor's SIGN is irrelevant to truncating `%` */
+            e.op_reg_imm(Op::band, RAX,             /* reg:proto */
+                         static_cast<int32_t>((1u << k) - 1u));
+        } else {
+            /* x >>= k is EXACT for a non-negative x: no bias */
+            e.sar_rr_imm8(RAX, k);                  /* reg:proto */
+            if (m.negate)
+                e.neg_reg(RAX);                     /* reg:proto */
+        }
+        e.bump_divpow2();
+        e.bump_divpow2_nn();
+        return;
+    }
     /*
      * The dividend is kept aside for the remainder below. Naming the
      * role was step one; BORROWING it is step two.
@@ -10572,6 +10640,7 @@ void jit_stats_report()
         { "boxed_fast",       &g_jit_boxed_fast },
         { "divmagic",         &g_jit_divmagic },
         { "divpow2",          &g_jit_divpow2 },
+        { "divpow2_nn",       &g_jit_divpow2_nn },
         { "boxed_fastf",      &g_jit_boxed_fastf },
         { "boxed_slow",       &g_jit_boxed_slow },
         { "boxed_slow_f",     &g_jit_boxed_slow_f },
@@ -17078,7 +17147,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                      * and its own `keep` borrows rcx afresh */
                     drop();
                     emit_div_magic(e, mg, in.b_lit(),
-                                   in.aop == Op::mod);
+                                   in.aop == Op::mod,
+                                   jit_dividend_nonneg(ck, in));
                     e.bump_divmagic();
                     write_slot(e, ck, RAX,          /* reg:isa (imul) */
                                in.target, pc);
@@ -17259,7 +17329,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         DivMagic mg;
         if (div_magic(in.b_lit(), mg)) {
-            emit_div_magic(e, mg, in.b_lit(), /*want_mod=*/true);
+            emit_div_magic(e, mg, in.b_lit(), /*want_mod=*/true,
+                           jit_dividend_nonneg(ck, in));
             e.bump_divmagic();
             write_slot(e, ck, RAX, in.target, pc);       /* reg:isa */
             return true;

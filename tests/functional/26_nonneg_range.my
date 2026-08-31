@@ -1,0 +1,149 @@
+# #106 phase 2 - THE NON-NEGATIVE RANGE FACT, and the shapes that must
+# still DECLINE it.
+#
+# Phase 1 reduced `x % 2^k` to a SIGN-BIAS sequence, not to the textbook
+# mask, because MyLang's `%` TRUNCATES: `-5 % 4` is `-1`, not `3`. Phase
+# 2 proves a counted loop's induction variable is >= 0
+# (Chunk::nonneg_slots) and then emits ONE instruction - `and x, 2^k-1`
+# for the mod, `sar x, k` for the div.
+#
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL, NOT AN EYEBALLED CONSTANT.
+# Every line below is compared against the tree-walker, which computes
+# `%` and `/` in plain C++ - so a wrongly-claimed non-negative dividend
+# shows up as a DIFFERENT NUMBER on exactly the line whose loop var can
+# go negative. tests/corpus_diff.sh is what runs it.
+#
+# ⛔ AND THE BOUND IS A RUNTIME SLOT ON PURPOSE (the vacuous-test trap,
+# case 7): a literal bound lowers the loop to the top-tested form, which
+# is not the shape a real counted loop takes.
+
+var n = 40;
+if (len(argv) > 0)
+    n = int(argv[0]);
+
+# (1) THE QUALIFYING SHAPE. init 0, `<`, `i++`, body never writes i.
+#     Both operators, so the mask arm and the shift arm are covered.
+var t1 = 0;
+for (var i = 0; i < n; i++)
+    t1 = t1 + (i % 4) * 31 + (i / 8) * 17;
+print("plain   ", t1);
+
+# (1b) A NEGATIVE POWER-OF-TWO DIVISOR over the same proven dividend.
+#      The divisor's sign reaches only the DIV arm (negate the quotient);
+#      truncating `%` ignores it, since `x % -4` and `x % 4` agree for
+#      every x. Without this line the `m.negate` half of the one-
+#      instruction arm is emitted by nothing the corpus runs.
+var t1b = 0;
+for (var i = 0; i < n; i++)
+    t1b = t1b + (i % (0 - 4)) * 31 + (i / (0 - 8)) * 17;
+print("negdiv  ", t1b);
+
+# (2) A NON-ZERO NON-NEGATIVE INIT still qualifies - the rule is >= 0,
+#     not == 0 (03_int_arith's loop starts at 1).
+var t2 = 0;
+for (var i = 3; i < n; i++)
+    t2 = t2 + (i % 8) * 31 + (i / 4) * 17;
+print("init3   ", t2);
+
+# (3) THE #9 FUSED FORM. `s = s + x` falling into the step becomes ONE
+#     IntAddStep, which REPURPOSES the step operand - so the counter's
+#     +1 is structural there, not readable. If compute_nonneg_slots ever
+#     stops recognising it this line still prints the same number (the
+#     fact is only ever an optimization), which is why the -rt reach
+#     test asserts the COUNTER for this shape as well.
+var t3 = 0;
+for (var i = 0; i < n; i++)
+    t3 = t3 + i % 16;
+print("fused   ", t3);
+
+# ---------------------------------------------------------------
+# THE DECLINES. Each isolates ONE clause of the rule; each drives the
+# dividend NEGATIVE, so a wrong claim prints a different number here.
+# ---------------------------------------------------------------
+
+# (4) THE BODY WRITES THE COUNTER a negative constant. `for` re-reads
+#     the slot every iteration, so the loop variable really does go
+#     negative - this is the clause "every def of the slot is a
+#     NON-NEGATIVE constant or a +1 counter step".
+var t4 = 0;
+var flip4 = 0;
+for (var j = 0; j < n; j++) {
+    t4 = t4 + j % 4;
+    if (flip4 == 0 && j == 5) {
+        j = 0 - 3;
+        flip4 = 1;
+    }
+}
+print("negwrite", t4);
+
+# (5) THE BODY WRITES THE COUNTER an ARITHMETIC value - a def shape the
+#     rule does not recognise at all, rather than one it recognises and
+#     rejects.
+var t5 = 0;
+var flip5 = 0;
+for (var j = 0; j < n; j++) {
+    t5 = t5 + j % 4;
+    if (flip5 == 0 && j == 7) {
+        j = 1 - j;
+        flip5 = 1;
+    }
+}
+print("arithwr ", t5);
+
+# (6) NOT A LOOP COUNTER AT ALL - a plain local that happens to hold a
+#     negative value. Written twice so auto-const cannot promote it to a
+#     literal (the vacuous-test trap, case 6).
+var m = 1;
+m = 0 - 13;
+print("local   ", m % 4, m / 4, m % 8, m / 8);
+
+# (7) A DESCENDING loop: init is the runtime bound, the comparison is
+#     `>`, and the counter walks DOWN through zero into the negatives.
+var t7 = 0;
+for (var d = n; d > 0 - 6; d--)
+    t7 = t7 + d % 4;
+print("desc    ", t7);
+
+# (8) ⛔ A PARAMETER whose only INSTRUCTION-visible def is a non-negative
+#     constant. This is the sharp test for the "at least one counter
+#     step" clause: a parameter is written by the BIND, which is no
+#     opcode, so `visit_use_def` reports only the `k = 0` below. Without
+#     that clause the slot would be claimed non-negative and the read
+#     ABOVE the assignment would answer 3 for `-13 % 4` instead of -1.
+#     (The catch-bind half of the same premise has no printable shape -
+#     a bound exception is a struct - and is covered by the ML_CHECK in
+#     compute_nonneg_slots.)
+#
+#     ⛔ THREE SHAPE-EATERS DEFEATED HERE, or the case is vacuous:
+#     `k = 0` reassigns a SCALAR PARAM, which is exactly what
+#     block_inlinable_decl refuses, so the call survives to codegen; the
+#     body is a block, so the expression inliner never sees it; and the
+#     argument comes from a WRITE-TWICE local, so it is not a const the
+#     specializer could propagate into the body and fold.
+func param_read(int k) {
+    var r = k % 4;
+    var q = k / 4;
+    k = 0;
+    return r * 31 + q * 17 + k;
+}
+var neg = 1;
+neg = 0 - 13;
+print("param   ", param_read(neg), param_read(0 - neg));
+
+# (9) ⛔ A BARRIER WRITES THE COUNTER. `f, j = pair;` is a MultiUnpackV,
+#     which reaches its destinations through a POOL - so `visit_use_def`
+#     describes none of them and returns false. The counter really does
+#     go negative here, and the ONLY thing that stops the claim is
+#     compute_nonneg_slots refusing every candidate the moment it meets
+#     an op it cannot read. This is the case that makes that refusal
+#     testable rather than merely prudent.
+var t9 = 0;
+var f9 = 0;
+var pair9 = [1, 0 - 3];
+for (var j = 0; j < n; j++) {
+    t9 = t9 + j % 4;
+    if (f9 == 0 && j == 5) {
+        f9, j = pair9;
+    }
+}
+print("barrier ", t9, f9);

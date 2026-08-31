@@ -22396,6 +22396,135 @@ static bool jit_boxed_float_fast()
 #endif
 }
 
+/*
+ * #106 phase 2 - THE NON-NEGATIVE RANGE FACT's REACH, per loop SHAPE.
+ *
+ * `g_jit_divpow2_nn` is bumped by the EMITTED one-instruction arm, so
+ * growth is the only proof the sign bias was actually deleted - the
+ * VALUES are identical either way, which is precisely why the corpus
+ * differential cannot see this (the *Testing an AST TRANSFORM* gap, one
+ * layer down: an optimization that changes no answer has no correctness
+ * oracle).
+ *
+ * ⛔ THE DECLINE CASES ARE THE POINT OF THIS TEST. Two clauses of the
+ * rule - `<` rather than `<=`, and a step of exactly +1 - guard against
+ * an int64 OVERFLOW at a bound within one step of INT64_MAX. No program
+ * can DEMONSTRATE that (it is an infinite loop), so no value oracle
+ * anywhere can catch either clause being loosened; the counter staying
+ * flat is the whole net. Each decline asserts `divpow2` DID grow, so a
+ * case whose loop stopped compiling cannot pass vacuously.
+ *
+ * The VALUE side, including every shape where a wrong claim prints a
+ * wrong number, is tests/functional/26_nonneg_range.my.
+ */
+static bool jit_div_nonneg_range()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const char *what,
+                  const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (Exception &ex) {
+            fprintf(stderr, "jit_div_nonneg_range: %s raised %s\n",
+                    what, ex.name);
+            ok = false;
+        } catch (...) { ok = false; }
+        g_exec_engine = saved;
+        return ok;
+    };
+    struct Case {
+        const char *name;
+        bool want_nn;                    /* the bias must be GONE */
+        std::vector<const char *> lines;
+    };
+    const std::vector<Case> cases = {
+        /* `n` is written twice on purpose so auto-const cannot promote
+         * it to a literal and turn the loop into the top-tested form
+         * (the vacuous-test trap, cases 6 and 7). */
+        { "mod, i++ counter", true, {
+            "var n = 1; n = 400;",
+            "var t = 0;",
+            "for (var i = 0; i < n; i++) t = t + i % 4;",
+            "assert(t == 600);" } },
+        { "div, i++ counter", true, {
+            "var n = 1; n = 400;",
+            "var t = 0;",
+            "for (var i = 0; i < n; i++) t = t + i / 8;",
+            "assert(t == 9800);" } },
+        /* the #9 IntAddStep fusion: the accumulator's add is folded INTO
+         * the step, which REPURPOSES the step operand - so this arm
+         * trusts the fusion's own `b_lit() == 1` precondition. If that
+         * fusion is ever widened, this case is what fails. */
+        { "fused IntAddStep counter", true, {
+            "var n = 1; n = 400;",
+            "var t = 0;",
+            "for (var i = 0; i < n; i++) t = t + (i % 16);",
+            "assert(t == 3000);" } },
+        /* ⛔ `<=`: at bound == INT64_MAX the step wraps to INT64_MIN and
+         * the test still passes, so the body would run with a NEGATIVE
+         * counter. Unreachable in a terminating program - hence a
+         * counter test and not a value one. */
+        { "declines <= (overflow at INT64_MAX)", false, {
+            "var n = 1; n = 400;",
+            "var t = 0;",
+            "for (var i = 0; i <= n; i++) t = t + i % 4;",
+            "assert(t == 600);" } },
+        /* ⛔ a step of 2 overflows from bound - 1 just the same. */
+        { "declines step 2", false, {
+            "var n = 1; n = 400;",
+            "var t = 0;",
+            "for (var i = 0; i < n; i += 2) t = t + i % 4;",
+            "assert(t == 200);" } },
+        /* a DESCENDING loop walks below its bound's sign, and `>`/`>=`
+         * are not `<` anyway */
+        { "declines descending", false, {
+            "var n = 1; n = 400;",
+            "var t = 0;",
+            "for (var d = n; d > 0; d--) t = t + d % 4;",
+            "assert(t == 600);" } },
+    };
+    for (const Case &c : cases) {
+        const unsigned long b_nn = g_jit_divpow2_nn;
+        const unsigned long b_p2 = g_jit_divpow2;
+        if (!run(c.name, c.lines))
+            return false;
+        if (g_jit_divpow2 <= b_p2) {
+            fprintf(stderr, "jit_div_nonneg_range: '%s' did not even "
+                            "reach the POWER-OF-TWO arm - the case is "
+                            "vacuous\n", c.name);
+            return false;
+        }
+        const bool got = g_jit_divpow2_nn > b_nn;
+        if (got != c.want_nn) {
+            fprintf(stderr, "jit_div_nonneg_range: '%s' %s the "
+                            "non-negative arm\n", c.name,
+                    got ? "WRONGLY took" : "did NOT take");
+            return false;
+        }
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 /* The constant-divisor STRENGTH REDUCTION: g_jit_divmagic is bumped by the
  * EMITTED reciprocal sequence, never by a helper, so growth is the only
  * thing that can prove idiv was actually replaced - the values are
@@ -22688,8 +22817,18 @@ static bool myv_round_trip()
         "           + str(n * -32769) + str(n + 4611686018427387903)",
         "           + str(x * 2.5) + str(x + -1.0);",
         "}",
+        /* #106 phase 2: a COUNTED LOOP in a BARRIER-FREE chunk, which the
+         * `nnn` guard below requires. It cannot live in main - main's
+         * `append` and `throw` are visit_use_def barriers, so
+         * compute_nonneg_slots correctly drops every candidate there, and
+         * the guard caught exactly that when this test was first wired. */
+        "func nn(int k) {",
+        "    var acc = 0;",
+        "    for (var i = 0; i < k; i++) acc = acc + i % 4 + i / 8;",
+        "    return acc;",
+        "}",
         "print(s, t, d[\"a\"], d[\"b\"], tbl[1], len(pts),",
-        "      edge(runtime(3), runtime(1.5)));" };
+        "      edge(runtime(3), runtime(1.5)), nn(runtime(12)));" };
 
     std::string src;
     std::vector<Tok> toks;
@@ -22853,6 +22992,47 @@ static bool myv_round_trip()
         if (!nboxed) {
             fprintf(stderr, "myv: no boxed_ops to compare - the program above "
                             "no longer exercises the rebuild\n");
+            g_exec_engine = saved;
+            return false;
+        }
+
+        /*
+         * #106 phase 2: `nonneg_slots` is the SECOND derived pool the -vd
+         * dump cannot see - it prints no slot sets at all, for this or for
+         * `ref_slots`. That matters more here than it does for boxed_ops:
+         * the fact is BAKED INTO EMITTED MACHINE CODE (a lone `and` where
+         * the compile path emits a lone `and`), so a loader that computed
+         * a DIFFERENT set would make an image run different instructions
+         * from a fresh compile - silently, since the values agree either
+         * way. Compare it, and COUNT it so a program edit cannot make the
+         * comparison vacuous.
+         */
+        auto same_nonneg = [](const Chunk &x, const Chunk &y) {
+            return x.nonneg_slots == y.nonneg_slots;
+        };
+        bool nn_ok = same_nonneg(prog.root, loaded.root);
+        size_t nnn = prog.root.nonneg_slots.size();
+        for (size_t i = 0; nn_ok && i < prog.funcs.size(); i++) {
+            const Chunk *a =
+                static_cast<const Chunk *>(prog.funcs[i]->vm_chunk);
+            const Chunk *b =
+                static_cast<const Chunk *>(loaded.funcs[i]->vm_chunk);
+            if (!a != !b) {
+                nn_ok = false;
+            } else if (a) {
+                nnn += a->nonneg_slots.size();
+                if (!same_nonneg(*a, *b))
+                    nn_ok = false;
+            }
+        }
+        if (!nn_ok) {
+            fprintf(stderr, "myv: the REBUILT nonneg_slots differ\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        if (!nnn) {
+            fprintf(stderr, "myv: no nonneg_slots to compare - the program "
+                            "above no longer has a counted loop\n");
             g_exec_engine = saved;
             return false;
         }
@@ -38600,6 +38780,8 @@ static const std::vector<extra_check> extra_checks =
       jit_boxed_float_fast },
     { "jit: div/mod by a constant is strength-reduced (no idiv)",
       jit_div_magic_reach },
+    { "jit: a counted loop's counter deletes the pow2 sign bias (#106)",
+      jit_div_nonneg_range },
     { "jit: fragment-inline sync call runs (direct push + call rdx)",
       jit_sync_inline_call },
     { "jit: norec: shadow-verified side table + the full-stack audit",

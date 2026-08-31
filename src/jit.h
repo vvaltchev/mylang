@@ -1255,6 +1255,10 @@ extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
  * VALUES are identical either way, so nothing else can tell). */
 extern "C" unsigned long g_jit_divmagic;
 extern "C" unsigned long g_jit_divpow2;
+/* #106 phase 2: of the pow2 reductions, those whose DIVIDEND was proven
+ * non-negative (Chunk::nonneg_slots) - the arm that emits ONE
+ * instruction instead of the six-instruction truncating-sign bias. */
+extern "C" unsigned long g_jit_divpow2_nn;
 extern "C" unsigned long g_jit_boxed_fastf; /* H6: inline float-float ones */
 /* H6 REACH: the boxed ops that DECLINED to the exact-helper path, and how
  * many of those were float-float. The difference is the residue no inline

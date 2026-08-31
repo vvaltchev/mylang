@@ -10515,8 +10515,172 @@ naming the tag tokens in PROSE tripped the stale-tag check, because
 the scanner reads them per LINE. The explanatory comment now describes
 the tags without spelling them.
 
-**PHASE 2 IS NOT BUILT.** A counted `for (var i = 0; i < n; i++)`
-induction variable is provably >= 0, and for a non-negative dividend
-the whole thing collapses to ONE instruction (`and` for mod, `shr` for
-div). That needs a "non-negative" bit stamped by the for-range
-specializer - a range fact, not a peephole - and is a separate change.
+## #106 phase 2 - a PROVEN NON-NEGATIVE dividend deletes the bias
+
+Everything phase 1 emits beyond one instruction exists to make
+TRUNCATING `%` right for a NEGATIVE dividend. Prove the dividend cannot
+be negative and `x % 2^k` IS `and x, 2^k-1` and `x / 2^k` IS
+`sar x, k` - six instructions to one, and no register kept aside.
+
+**THE FACT IS A RANGE FACT, AND IT LIVES IN THE BYTECODE.** The first
+sketch put it in the for-range specializer as an AST stamp threaded
+through codegen into an `opflags` bit. It is instead a DERIVED POOL,
+`Chunk::nonneg_slots`, computed by `compute_nonneg_slots` (codegen.cpp)
+from the FINAL code - which is better on three counts: it cannot drift
+from what actually runs, it sees the peephole's fusions and
+`specialize_arith_ops`' `IntModRI` (both of which run AFTER any AST
+pass), and the LOADER can rebuild it, so a `.myv` image and a fresh
+compile bake the same fact into the same emitted `and` - verified end to
+end: `mylang -c 26_nonneg_range.my` then `-vdj` on the image is
+BYTE-IDENTICAL to `-vdj` on the source. Nothing new is stored and the
+format version does not move.
+
+**⛔ THE LOADER'S REBUILD RUNS AFTER `vm_verify_program`, NOT IN
+`read_chunk` BESIDE THE OTHER DERIVED POOLS.** This is the first
+loader-side pass to walk instruction OPERANDS through `visit_use_def`,
+and one of the things it walks is an iteration COUNT (`run(base, cnt)`
+for the call / MakeArray / MakeDict / StructCtor arms) taken straight
+from the file. On unverified bytecode that count is attacker-chosen.
+`build_boxed_ops` can sit in `read_chunk` because it indexes nothing by
+a file-supplied count; this cannot. Same "VERIFY BEFORE ANYTHING INDEXES
+IT" rule the JIT obeys, and still before the JIT, which is what bakes
+the fact into machine code.
+
+**THE RULE.** A slot S qualifies iff SOME instruction defines S, EVERY
+instruction that defines S is either
+
+  (a) `LoadImmInt` / `LoadConstV` of an int constant >= 0 - the init, or
+  (b) a STEP op (`ForLoopStep`, or the #9 fusions `IntAddStep` /
+      `ForStepElemInt`) naming S as its COUNTER (`target2`), with
+      `aop == Op::lt` and a step of exactly +1,
+
+and at least one (b) exists. Every clause is load-bearing:
+
+- **`<`, NEVER `<=`.** The counter is only read where the test held, so
+  `i < bound <= INT64_MAX` gives `i <= INT64_MAX - 1` and the step's
+  `i + 1` cannot overflow. With `<=` and `bound == INT64_MAX` it CAN:
+  `i + 1` wraps to INT64_MIN, `i <= bound` still holds, and the body
+  runs with a NEGATIVE counter.
+- **A STEP OF EXACTLY +1**, for the same reason - `i += 3` at
+  `i == bound - 1` overflows when the bound is within 2 of INT64_MAX.
+- **AT LEAST ONE STEP OP, i.e. S IS A LOOP COUNTER.** This is what
+  excludes the two writers no instruction performs - a PARAMETER slot
+  (written by the bind) and a CATCH-BIND slot (written by
+  `vm_dispatch_exc_body`) - WITHOUT this pass re-enumerating them. A
+  counter can be neither: it comes from `for (var i = ...)`, which
+  `try_for_range` requires to be a DECL, or from a foreach's hidden
+  `alloc_temp`. Both are fresh slots. Asserted against `handler_sites`,
+  which the pass can see; the parameter half rests on the decl
+  argument. Without the clause,
+  `func f(int k) { var r = k % 4; k = 0; return r; }` claims `k` is
+  non-negative on the strength of the LATER `k = 0` and answers 3 for
+  `f(-13)`.
+- **A BARRIER DROPS EVERYTHING.** `visit_use_def` returns false for an
+  op whose slot traffic it cannot describe, and such an op may write a
+  slot it does not report - `f, j = pair;` (a `MultiUnpackV`) really
+  can drive a loop counter negative.
+
+**THE TWO FUSIONS ARE TRUSTED, NOT RE-CHECKED, AND THAT IS WRITTEN AT
+BOTH ENDS.** `IntAddStep` and `ForStepElemInt` are formed ONLY from a
+`ForLoopStep` whose `b_lit() == 1`, and then REPURPOSE `b` (to the
+add's operand / the (array, elem dst) dual), so their step is +1 by
+CONSTRUCTION and no longer a readable field. Both fusion sites carry a
+note pointing here; the `fused IntAddStep counter` `-rt` case is what
+fails if one is ever widened.
+
+**IntAddModRI DELIBERATELY DOES NOT ASK.** The E4 fusion's dividend is
+a SUM, and two non-negative addends still wrap under `-fwrapv` - which
+is exactly the accumulator shape that fusion exists for. It keeps the
+full bias.
+
+**MEASURED** (callgrind Ir, `OPT=1 ASSERTS=0`, scale-3-minus-scale-1 so
+compile time is excluded): **03_int_arith -8.00%** (46.0M -> per scale
+unit, from 50.0M) and **76_funcval_dispatch -1.51%** (327.0M from
+332.0M). 42_exceptions, 53_collatz, 01_while_loop and 44_primes_sqrt
+are EXACTLY flat to the instruction - the two that take the arm are the
+two whose counters say they do.
+
+**⛔ AND THE WALL CLOCK IS FLAT, WHICH IS THE EXPECTED SHAPE, NOT A
+DISAPPOINTMENT.** One interleaved `--baseline` run over 90 benches:
+03_int_arith **0.99x**, 76_funcval_dispatch **1.01x**, suite geomean
+cur/base **1.008x**. This is the GUARD-ELISION SIGNATURE the
+specialized-family entry already documents - the deleted instructions
+are a short, dependency-free bias (`mov`/`sar`/`shr`/`add`) with no
+memory traffic, and a wide out-of-order core retires them alongside the
+real work. Take the Ir; do not expect the seconds.
+
+**AND THE RUN CARRIES ITS OWN NOISE FLOOR, which is worth more than the
+geomean:** `18_foreach_array` read **1.21x** and `67_make_dict`
+**1.10x**, and `scripts/vdjcmp.sh` says their emitted code is
+**BYTE-IDENTICAL between the two binaries - zero differing lines**. A
+bench whose machine code did not change by one byte measured 21%
+slower, so ±20% per bench is this box's spread today and the 1.008x
+geomean is inside it. When a number surprises you, ask the disassembler
+whether the code even changed before believing the clock.
+
+**⛔ AND READ A `vdjcmp` A/B ACROSS THIS COMMIT WITH THAT IN MIND: 45 of
+127 corpus programs DIFFER, and 43 of them for a reason that is not an
+optimization at all.** `Chunk` grew by 24 bytes (the new
+`std::vector<int32_t>`), so every baked field offset past `ref_slots`
+shifted by 0x18 - `cmp [rcx+0xd8], 0` became `cmp [rcx+0xf0], 0`, same
+instruction, same length, same Ir (which is why the four control
+benches are flat to the instruction). Filtering the offset lines out
+leaves 43_sieve, 09_fib_recursive, 18_foreach_array and the rest with
+NOTHING, and 03_int_arith with the actual win: the baseline's
+`mov rcx,rax; sar rcx,63; shr rcx,63; add rax,rcx; sar rax,1` collapses
+to one `sar`. **Adding a field to a serialized-adjacent struct makes the
+emitted-code differ report useless until you subtract the layout
+shift** - the tool is right, the headline count is not the blast
+radius.
+
+**REACH** is `MYLANG_JITSTATS`' `divpow2_nn`, a SEPARATE counter beside
+`divpow2` - "the pow2 arm ran" and "the pow2 arm ran WITHOUT the bias"
+are different facts, and a single counter cannot notice the range
+analysis going inert (the whole-lever-counter blind spot). Corpus-wide:
+03_int_arith 999,999 of 999,999 pow2 reductions, 76_funcval_dispatch
+1,000,000 of 1,000,000; 53_collatz and 57_bool_reduce correctly 0 (a
+reassigned sequence value and a callback parameter).
+
+**⛔ 42_exceptions IS A ZERO, AND THE REASON IS A TABLE GAP, NOT THIS
+RULE.** Its `for (var i = 0; i < N; i++) { ... i % 2 ... }` is the
+qualifying shape exactly - but its `throw` is `OpCode::Throw`, which is
+MISSING from `visit_use_def` and therefore a BARRIER, so the whole
+chunk declines. `Throw` reads `a_slot` and writes no frame slot; adding
+it is a strict improvement that also frees lever A and the E1 liveness
+inside every try body, and it changes emitted code across the corpus -
+so it is a separate change with its own measurement, not a rider on
+this one.
+
+**WATCHED FAILING - six sabotages, one per clause**, four of which
+print a wrong NUMBER in `tests/functional/26_nonneg_range.my` (compared
+against the tree-walker's C++ `%` and `/` by `corpus_diff`):
+
+    dropping the counter requirement   `param    25 82`   (was -82 82)
+    constants need not be >= 0         `negwrite 72`      (was 64)
+    an unknown def shape is benign     `arithwr  81`      (was 65)
+    a barrier does not drop candidates `barrier  72 1`    (was 64 1)
+
+and two that NO value oracle anywhere can reach, because the overflow
+they guard needs a bound within one step of INT64_MAX - i.e. a
+non-terminating program. Those are counter assertions in the
+`jit_div_nonneg_range` `-rt` entry, and the counter staying flat is the
+whole net:
+
+    `<=` accepted      -> 'declines <= (overflow)' WRONGLY took
+    any positive step    -> 'declines step 2' WRONGLY took
+
+Each decline case also asserts `divpow2` DID grow, so a case whose loop
+stopped compiling cannot pass vacuously.
+
+**⛔ AND A SEVENTH, ON THE DERIVED-POOL SIDE: `-vd` PRINTS NO SLOT SET,
+FOR THIS OR FOR `ref_slots`.** A loader that computed a DIFFERENT set
+would make an image emit different machine code from a fresh compile,
+silently - the values agree either way, and the dump oracle is blind.
+So `myv_round_trip` compares `nonneg_slots` directly, root chunk and
+every function chunk, the way it already compares `boxed_ops` and the
+delta-coded locs; dropping the loader's `compute_nonneg_slots` call
+fails it by name. Its NON-VACUITY COUNT earned its keep on the first
+run: the round-trip program's `for (var i = 0; i < 5; i++)` sits in
+MAIN, whose `append` and `throw` are barriers, so the set was empty and
+the comparison would have passed on nothing. The program now carries a
+counted loop in a barrier-free FUNCTION.
