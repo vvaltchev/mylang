@@ -2265,6 +2265,17 @@ struct Emitter {
             u32(static_cast<uint32_t>(d));
         }
     }
+    /* test r32, r32 - the 0/nonzero check every helper-status site
+     * emits. 59 of them spelled `u8(0x85); u8(0xC0)`, so `grep RAX`
+     * saw none of them. */
+    void test32_rr(uint8_t a, uint8_t b)
+    {
+        if (a >= 8 || b >= 8)
+            u8(static_cast<uint8_t>(0x40 | (b >= 8 ? 0x04 : 0)
+                                    | (a >= 8 ? 0x01 : 0)));
+        u8(0x85);
+        u8(static_cast<uint8_t>(0xC0 | ((b & 7) << 3) | (a & 7)));
+    }
     void test_rr(uint8_t a, uint8_t b)
     {
         u8(static_cast<uint8_t>(0x48 | (b >= 8 ? 0x04 : 0)
@@ -4130,8 +4141,8 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
         static_cast<uint32_t>(jit_off_exc_inline_frame());
 
     e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_exc()));
-    e.u8(0x48); e.u8(0x8B); e.u8(0x00);      /* mov rax, [rax] (the object) */
-    e.u8(0x48); e.u8(0x85); e.u8(0xC0);      /* test rax, rax */
+    e.load_base0(RAX, RAX);      /* mov rax, [rax] (the object) */
+    e.u8(0x48); e.test32_rr(RAX, RAX);      /* test rax, rax */
     const size_t j_null = e.j8(0x74);        /* jz end: bail/eptr - no exc */
 
     size_t j_has = 0;
@@ -4479,7 +4490,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.u8(0xE8); e.u32(0);
         e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08);  /* add rsp,8 (pad) */
         e.pop_reg(RDX);                   /* fo back */
-        e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
+        e.test32_rr(RAX, RAX);           /* test eax, eax */
         j_done.push_back(e.j32(0x75));    /* jnz done (hit) */
         /* the C++ call clobbered EVERY caller-saved register - rebuild
          * r9 = ctx and r8 = act too, not just fo/desc (the miss path's
@@ -4553,7 +4564,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
               * static_cast<int>(P.param_desc_size)));
     j_slow.push_back(e.j32(0x75));                    /* jne slow */
     ld(RCX, RAX, static_cast<int32_t>(L.desc_vm_chunk)); /* rcx = cck */
-    e.u8(0x48); e.u8(0x85); e.u8(0xC9);               /* test rcx, rcx */
+    e.test_rr(RCX, RCX);               /* test rcx, rcx */
     j_slow.push_back(e.j32(0x74));                    /* jz slow */
     cmp_q_imm8(RCX, static_cast<int32_t>(P.ck_sync_entry), 0);
     j_slow.push_back(e.j32(0x7C));                    /* jl slow */
@@ -5605,7 +5616,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.u8(0xE8); e.u32(0);
     e.movabs(RCX, depth_addr);
     e.u8(0xFF); e.u8(0x09);                        /* dec dword [rcx] */
-    e.u8(0x85); e.u8(0xC0);                        /* test eax, eax */
+    e.test32_rr(RAX, RAX);                        /* test eax, eax */
     const size_t j_done2 = e.j32(0x74);            /* jz done */
     emit_call_epilogue(e);
     e.exit_pc(pc);                                 /* exception -> re-raise */
@@ -5672,7 +5683,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     }
     e.call_relocs.push_back({ e.pos(), slow_helper });
     e.u8(0xE8); e.u32(0);
-    e.u8(0x85); e.u8(0xC0);                        /* test eax, eax */
+    e.test32_rr(RAX, RAX);                        /* test eax, eax */
     const size_t j_done3 = e.j32(0x74);            /* jz done */
     /* status 3 = SWITCH: the callee was pushed interpreted-flat; this
      * fragment returns JIT_RET_SWITCH - its consumer drives the callee and
@@ -9464,7 +9475,7 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
     const uint8_t modrm = aop == Op::shl ? 0xE0
                         : aop == Op::shr ? 0xF8 : 0xE8;
     /* test rcx,rcx; js Lraise (negative count throws) */
-    e.u8(0x48); e.u8(0x85); e.u8(0xC9);
+    e.test_rr(RCX, RCX);
     e.u8(0x0F); e.u8(0x88);
     const size_t js = e.pos(); e.u32(0);
     /* cmp rcx,64; jl Lnorm */
@@ -10174,7 +10185,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             /* rax = the element */
             e.load_elem_q(sc.obj, H->rdata, sc.idx);
             e.movabs(sc.count, 0x8000000000000000ull);
-            e.u8(0x48); e.u8(0x39); e.u8(0xD0);  /* cmp rax,rdx */
+            e.cmp_rr(RAX, RDX);  /* cmp rax,rdx */
             slows.push_back(e.j32(0x74));        /* INT_MIN -> helper */
             e.patch32_here(j_ok);
         }
@@ -10461,7 +10472,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
     e.u8(0xE8); e.u32(0);
     emit_call_epilogue(e);
-    e.u8(0x85); e.u8(0xC0);                    /* test eax, eax */
+    e.test32_rr(RAX, RAX);                    /* test eax, eax */
     slows.push_back(e.j32(0x75));              /* jnz -> the full helper */
     e.jmp32_to(retry);
     return true;
@@ -11032,7 +11043,7 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         { e.pos(), reinterpret_cast<const void *>(jit_store_elem_prep) });
     e.u8(0xE8); e.u32(0);
     emit_call_epilogue(e);
-    e.u8(0x85); e.u8(0xC0);                    /* test eax, eax */
+    e.test32_rr(RAX, RAX);                    /* test eax, eax */
     slows.push_back(e.j32(0x75));              /* jnz -> the full helper */
     e.jmp32_to(retry);
     return true;
@@ -11097,7 +11108,7 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
     /* restore rdi + cache; re-mat rsi/r8*/
     emit_call_epilogue(e);
 
-    e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+    e.test32_rr(RAX, RAX);               /* test eax, eax */
     const size_t j_ok = e.j8(0x74);       /* jz -> continue (0 = no raise) */
     emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
     e.exit_pc(pc);                        /* raised: EnterNative raises exc */
@@ -11129,7 +11140,7 @@ static void emit_dict_store(Emitter &e, const Chunk &ck, const Instr &in,
         { e.pos(), reinterpret_cast<const void *>(jit_dict_store) });
     e.u8(0xE8); e.u32(0);
     emit_call_epilogue(e);
-    e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+    e.test32_rr(RAX, RAX);               /* test eax, eax */
     const size_t j_ok = e.j8(0x74);
     emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
     e.exit_pc(pc);
@@ -11476,11 +11487,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (in.b_is_lit()) {
                 if (in.b_lit() == 0) {
                     /* always-throws: test on the loaded literal */
-                    e.u8(0x48); e.u8(0x85); e.u8(0xC9);  /* test rcx,rcx */
+                    e.test_rr(RCX, RCX);  /* test rcx,rcx */
                     raise_convey_unless(e, ck, 0x75, JR_DIV0, pc, old_pc);
                 } else if (in.b_lit() == -1) {
                     e.movabs(RDX, 0x8000000000000000ull);
-                    e.u8(0x48); e.u8(0x39); e.u8(0xD0);  /* cmp rax,rdx */
+                    e.cmp_rr(RAX, RDX);  /* cmp rax,rdx */
                     raise_convey_unless(e, ck, 0x75 /* jne */, JR_DIV_OVF,
                                         pc, old_pc);
                 }
@@ -11504,16 +11515,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                                      /* cmp rdx,1 */
                 const size_t j_div = e.j32(0x77);    /* ja .div (hot) */
                 /* cold: rcx is 0 or -1 */
-                e.u8(0x48); e.u8(0x85); e.u8(0xC9);  /* test rcx,rcx */
+                e.test_rr(RCX, RCX);  /* test rcx,rcx */
                 raise_convey_unless(e, ck, 0x75, JR_DIV0, pc, old_pc);
                 e.movabs(RDX, 0x8000000000000000ull);
-                e.u8(0x48); e.u8(0x39); e.u8(0xD0);  /* cmp rax,rdx */
+                e.cmp_rr(RAX, RDX);  /* cmp rax,rdx */
                 raise_convey_unless(e, ck, 0x75 /* jne */, JR_DIV_OVF,
                                     pc, old_pc);
                 /* rcx == -1, rax != INT_MIN: fall into the division */
                 e.patch32_here(j_div);
             }
-            e.u8(0x48); e.u8(0x99);              /* cqo */
+            e.cqo();              /* cqo */
             e.u8(0x48); e.u8(0xF7); e.u8(0xF9);  /* idiv rcx */
             write_slot(e, ck, in.aop == Op::div ? RAX : RDX, in.target, pc);
             return true;
@@ -11603,7 +11614,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             return true;
         }
         e.movabs(tmp, static_cast<uint64_t>(in.b_lit()));
-        e.u8(0x48); e.u8(0x99);                          /* cqo */
+        e.cqo();                          /* cqo */
         e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
         write_slot(e, ck, RDX, in.target, pc);            /* remainder */
         return true;
@@ -11628,7 +11639,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             }
             e.movabs(tmp, static_cast<uint64_t>(dv));
         }
-        e.u8(0x48); e.u8(0x99);                          /* cqo */
+        e.cqo();                          /* cqo */
         e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
         write_slot(e, ck, RDX, in.target, pc);
         return true;
@@ -11885,7 +11896,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                : jit_load_elem_int) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        e.test32_rr(RAX, RAX);                  /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);       /* the op's own caret */
@@ -11938,7 +11949,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                : jit_load_elem2_float) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        e.test32_rr(RAX, RAX);                  /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);
@@ -11985,7 +11996,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_store_elem_value) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
             emit_exc_stamp(e, ck, old_pc); /* cold; null-checked,
@@ -12011,7 +12022,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_store_member) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
             /* raise (exc set) or bail (unset) */
@@ -12044,7 +12055,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_store_elem2) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);  /* cold: own caret */
@@ -12072,7 +12083,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_store_elem_chain) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc); /* cold; null-checked,
@@ -12099,7 +12110,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_store_lvalue_chain) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc); /* cold; null-checked,
@@ -12295,7 +12306,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_load_global) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
             e.exit_pc(pc);                    /* bail: interpreter re-throws */
@@ -12318,7 +12329,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_slice) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             /* jz -> continue (0 = no raise) */
             const size_t j_ok = e.j8(0x74);
@@ -12433,7 +12444,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                   : reinterpret_cast<const void *>(jit_dict_load_float) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         /* jz -> continue (0 = no raise) */
         const size_t j_ok = e.j8(0x74);
         emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
@@ -12464,7 +12475,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
 
-        e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
+        e.test32_rr(RAX, RAX);           /* test eax, eax */
         const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = no raise) */
         emit_exc_stamp(e, ck, pc);        /* cold: the op's own caret */
         e.exit_pc(pc);                    /* raised: EnterNative raises exc */
@@ -12504,7 +12515,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_make_dict) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
@@ -12543,7 +12554,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_foreach_dyn_init) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
@@ -12594,7 +12605,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_emplace_struct) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
@@ -12755,7 +12766,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                ? jit_struct_ctor : jit_make_struct_array) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
@@ -12833,7 +12844,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_unpack_elem) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
@@ -12861,7 +12872,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_multi_unpack) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
@@ -12882,7 +12893,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_incdec_checked) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);
+        e.test32_rr(RAX, RAX);
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);   /* cold; null-checked, so the
@@ -12910,7 +12921,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_incdec_elem) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);
+        e.test32_rr(RAX, RAX);
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);   /* cold; null-checked, so the
@@ -12936,7 +12947,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_incdec_member) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);
+        e.test32_rr(RAX, RAX);
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);   /* cold; null-checked, so the
@@ -12967,7 +12978,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_incdec_chain) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);
+        e.test32_rr(RAX, RAX);
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);   /* cold; null-checked, so the
@@ -12992,7 +13003,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const uint32_t region = static_cast<uint32_t>(in.a_lit());
         e.bump_op(OpCode::PushHandler);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] (act) */
+        e.load_base0(RAX, RAX);        /* mov rax, [rax] (act) */
         e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));    /* finish */
         e.u8(0x48); e.u8(0x3B); e.u8(0x88);        /* cmp rcx, [rax+h+16] */
@@ -13025,7 +13036,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::PopHandler);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
+        e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));
         e.u8(0x48); e.u8(0x83); e.u8(0xE9); e.u8(4);   /* sub rcx, 4 */
@@ -13042,7 +13053,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::SetPend);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
+        e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+toprec] */
         e.u32(static_cast<uint32_t>(L.act_top_rec));   /* = &back_rec */
         e.u8(0x8B); e.u8(0x91);                    /* mov edx, [rcx+pbase] */
@@ -13074,7 +13085,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::EndFinally);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
+        e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+toprec] */
         e.u32(static_cast<uint32_t>(L.act_top_rec));   /* = &back_rec */
         e.u8(0x8B); e.u8(0x91);                    /* mov edx, [rcx+pbase] */
@@ -13120,7 +13131,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_not2, e.pos());
         }
-        e.u8(0x85); e.u8(0xC0);                   /* test eax, eax */
+        e.test32_rr(RAX, RAX);                   /* test eax, eax */
         {
             const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
             e.flush_cache();                      /* every raw ret must */
@@ -13130,7 +13141,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         e.flush_cache();
         e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x00);       /* mov rax, [rax] */
+        e.load_base0(RAX, RAX);       /* mov rax, [rax] */
         /* ret (the handler pc) */
         e.frag_ret(Emitter::RetFlush::flushed);
 
@@ -13171,7 +13182,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_not2, e.pos());
         }
-        e.u8(0x85); e.u8(0xC0);                   /* test eax, eax */
+        e.test32_rr(RAX, RAX);                   /* test eax, eax */
         {
             const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
             /* the N5 register cache MUST be flushed before ANY return -
@@ -13186,7 +13197,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         e.flush_cache();
         e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x00);       /* mov rax, [rax] */
+        e.load_base0(RAX, RAX);       /* mov rax, [rax] */
         /* ret (the handler pc) */
         e.frag_ret(Emitter::RetFlush::flushed);
         return true;
@@ -13223,7 +13234,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_not2, e.pos());
         }
-        e.u8(0x85); e.u8(0xC0);                   /* test eax, eax */
+        e.test32_rr(RAX, RAX);                   /* test eax, eax */
         {
             const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
             e.flush_cache();                      /* every raw ret must */
@@ -13233,7 +13244,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         e.flush_cache();
         e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_resume_pc()));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x00);       /* mov rax, [rax] */
+        e.load_base0(RAX, RAX);       /* mov rax, [rax] */
         /* ret (the handler pc) */
         e.frag_ret(Emitter::RetFlush::flushed);
         return true;
@@ -13404,7 +13415,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         if (in.op == OpCode::LoadElemValue || sfield_checked) {
-            e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
+            e.test32_rr(RAX, RAX);           /* test eax, eax */
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* cold: the OOB caret (the
                                                * InternalErrorEx net rides
@@ -13429,7 +13440,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_struct_ctor_boxed) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             e.exit_pc(pc);
@@ -13543,14 +13554,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         e.u8(0x48); e.u8(0x8D); e.u8(0x51); e.u8(0x01);
                         e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
                         const size_t j_div = e.j32(0x77);  /* ja .div */
-                        e.u8(0x48); e.u8(0x85); e.u8(0xC9);
+                        e.test_rr(RCX, RCX);
                         j_slows.push_back(e.j32(0x74));    /* 0 -> slow */
                         e.movabs(RDX, 0x8000000000000000ull);
-                        e.u8(0x48); e.u8(0x39); e.u8(0xD0);
+                        e.cmp_rr(RAX, RDX);
                         j_slows.push_back(e.j32(0x74));    /* ovf -> slow */
                         e.patch32_here(j_div);
                     }
-                    e.u8(0x48); e.u8(0x99);              /* cqo */
+                    e.cqo();              /* cqo */
                     e.u8(0x48); e.u8(0xF7); e.u8(0xF9);  /* idiv rcx */
                     if (bo.aop == Op::mod)
                         e.mov_rr(RAX, RDX);              /* the remainder */
@@ -13693,7 +13704,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.call_relocs.push_back({ e.pos(), fn });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         /* jz -> continue (0 = no raise) */
         const size_t j_ok = e.j8(0x74);
         /* raised: EnterNative re-raises */
@@ -13718,7 +13729,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_boxed_log) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             e.exit_pc(pc);
@@ -13739,7 +13750,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_coerce_num) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         const size_t j_ok_cn = e.j8(0x74);
         emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
         e.exit_pc(pc);
@@ -13763,7 +13774,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_call_builtin) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         const size_t j_ok_cb = e.j8(0x74);
         e.exit_pc(pc);
         e.patch8(j_ok_cb, e.pos());
@@ -13781,7 +13792,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_check_func) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         const size_t j_ok_cf = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
         e.exit_pc(pc);
@@ -13806,7 +13817,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_map_filter) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         const size_t j_ok_mf = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
         e.exit_pc(pc);
@@ -13824,7 +13835,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_check_callable) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         const size_t j_ok_cc = e.j8(0x74);
         emit_exc_stamp(e, ck, old_pc);        /* cold: the callee caret */
         e.exit_pc(pc);
@@ -13861,7 +13872,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
               reinterpret_cast<const void *>(jit_call_value_generic) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         const size_t j_ok_cvg = e.j8(0x74);
         e.exit_pc(pc);
         e.patch8(j_ok_cvg, e.pos());
@@ -13884,7 +13895,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_append) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
@@ -13912,7 +13923,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_call_builtin_lv) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
@@ -13942,7 +13953,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                : jit_call_builtin_lv_member) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
@@ -13968,7 +13979,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                            : jit_store_global_compound) });
             e.u8(0xE8); e.u32(0);
             emit_call_epilogue(e);
-            e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
+            e.test32_rr(RAX, RAX);             /* test eax, eax */
             const size_t j_ok = e.j8(0x74);
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
@@ -14048,7 +14059,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_subscript) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
+        e.test32_rr(RAX, RAX);             /* test eax, eax */
         const size_t j_ok = e.j8(0x74);     /* jz ok (0 = no throw) */
         emit_exc_stamp(e, ck, old_pc);      /* cold: the op's own caret */
         e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
@@ -14124,7 +14135,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_ord_char) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
+        e.test32_rr(RAX, RAX);             /* test eax, eax */
         const size_t j_ok = e.j8(0x74);     /* jz ok (0 = no throw) */
         emit_exc_stamp(e, ck, old_pc);      /* cold: the subscript's caret */
         e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
@@ -14174,7 +14185,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 /* movzx eax, byte [rax + moff] */
                 e.u8(0x0F); e.u8(0xB6); e.u8(0x80);
                 e.u32(static_cast<uint32_t>(moff));
-                e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+                e.test32_rr(RAX, RAX);               /* test eax, eax */
                 e.u8(0x0F); e.u8(0x95); e.u8(0xC0);   /* setne al */
                 e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);   /* movzx eax, al */
                 store_dst(e, ck, RAX, in.target, pc);
@@ -14259,7 +14270,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_load_member) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        e.test32_rr(RAX, RAX);               /* test eax, eax */
         {
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* belt: pooled carets (#56) */
@@ -14287,7 +14298,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_member) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
+        e.test32_rr(RAX, RAX);             /* test eax, eax */
         const size_t j_ok = e.j8(0x74);
         e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
         e.patch8(j_ok, e.pos());
@@ -14365,7 +14376,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_call_setup) });
         e.u8(0xE8); e.u32(0);               /* call jit_call_setup -> rax */
-        e.u8(0x48); e.u8(0x85); e.u8(0xC0); /* test rax, rax */
+        e.u8(0x48); e.test32_rr(RAX, RAX); /* test rax, rax */
         const size_t j_ok = e.j8(0x75);     /* jnz over_SO (rax != null) */
         emit_exc_stamp(e, ck, old_pc);      /* collapse-safe caret (#56) */
         emit_call_epilogue(e);              /* SO: re-mat rsi/r8 */
@@ -14717,7 +14728,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_is_true) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax (32-bit: -1
+        e.test32_rr(RAX, RAX);                  /* test eax, eax (32-bit: -1
                                                   * is negative here, while the
                                                   * 64-bit rax is zero-extended
                                                   * 0/1 on the success paths) */
@@ -14860,7 +14871,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                   reinterpret_cast<const void *>(jit_elem_int_value) });
             e.u8(0xE8); e.u32(0);
             emit_call_epilogue(e);
-            e.u8(0x85); e.u8(0xC0);
+            e.test32_rr(RAX, RAX);
             {
                 const size_t j_ok = e.j8(0x74);
                 emit_exc_stamp(e, ck, old_pc);
@@ -14868,7 +14879,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                 e.patch8(j_ok, e.pos());
             }
             e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
-            e.u8(0x48); e.u8(0x8B); e.u8(0x00);      /* mov rax,[rax] */
+            e.load_base0(RAX, RAX);      /* mov rax,[rax] */
             write_slot(e, ck, RAX, in.b_dual_hi(), pc);
             const size_t tgt = static_cast<size_t>(in.target);
             if (tgt >= begin && tgt < end) {
@@ -14907,7 +14918,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                 e.exit_pc(pc);
                 e.patch8(j_nothrow, e.pos());
             }
-            e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+            e.test32_rr(RAX, RAX);                  /* test eax, eax */
             j_takens.push_back(e.j32(0x75));         /* jnz -> taken */
             const size_t j_ff = e.j32(0xEB);         /* jmp fall-through */
             for (const size_t j : j_takens) {
@@ -14942,7 +14953,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_dict_iter_next) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        e.test32_rr(RAX, RAX);                  /* test eax, eax */
         emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
                            static_cast<size_t>(in.target), begin, end,
                            remap, fixups);
@@ -14961,7 +14972,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_foreach_dyn_next) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax (32-bit:
+        e.test32_rr(RAX, RAX);                  /* test eax, eax (32-bit:
                                                   * -1 is negative here) */
         {
             const size_t j_ok = e.j8(0x79);      /* jns -> did not throw */
@@ -15013,13 +15024,13 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                   reinterpret_cast<const void *>(jit_elem_int_value) });
             e.u8(0xE8); e.u32(0);
             emit_call_epilogue(e);
-            e.u8(0x85); e.u8(0xC0);                 /* test eax, eax */
+            e.test32_rr(RAX, RAX);                 /* test eax, eax */
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);          /* the op's own caret */
             e.exit_pc(pc);                          /* threw -> re-raise */
             e.patch8(j_ok, e.pos());
             e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_elem_tmp));
-            e.u8(0x48); e.u8(0x8B); e.u8(0x00);     /* mov rax, [rax] */
+            e.load_base0(RAX, RAX);     /* mov rax, [rax] */
         }
         e.patch32_here(j_conv);                     /* converge: */
         e.test_rax_rax();
@@ -15821,7 +15832,7 @@ static void emit_island_call(Emitter &e, const FuncDescriptor *desc,
         { e.pos(), reinterpret_cast<const void *>(jit_exec_block) });
     e.u8(0xE8); e.u32(0);                                    /* call rel32 */
     emit_call_epilogue(e);                 /* rsi=t_int; r8=t_float */
-    e.u8(0x48); e.u8(0x85); e.u8(0xC0);                      /* test rax, rax */
+    e.u8(0x48); e.test32_rr(RAX, RAX);                      /* test rax, rax */
     /* jns +over (rel8)*/
     e.u8(0x79); const size_t jfix = e.pos(); e.u8(0);
     e.u8(0xB8); e.u32(island_pc);                    /* mov eax, island_pc */
