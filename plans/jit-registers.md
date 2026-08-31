@@ -2785,3 +2785,39 @@ The failure is now loud, named, and enumerable in one pass, where at
 the start of this arc it was silent. And the survey - `scratch()`
 printing instead of asserting - is the technique to reuse for rax:
 it turns "fix aborts one at a time" into a single worklist.
+
+## (x) hand-encoded conversion - the (c) prerequisite, in progress
+
+    290 -> 205 -> 171 hand-encoded lines   (batches 1 and 2)
+
+Both batches byte-identical over 111 corpus programs in both arenas,
+-rt 1924/1924, corpus_diff 23/23, objdump oracle clean.
+
+**Read the two numbers TOGETHER.** RAX 360 -> 514 and RCX 99 -> 126
+over the same two batches, because a register spelled into a modrm byte
+was in NO count before and is in the operand count now. Falling
+hand-encoded + rising columns is the conversion working; only the first
+number is a target.
+
+### The next batch, and why it needs reading rather than sed
+
+What is left is mostly MULTI-LINE - an opcode byte on one line and its
+`u32`/`u8` displacement on the next:
+
+     6  48 8B 80 <u32>   mov rax, [rax+disp32]  -> load_base
+     5  48 8B 88 <u32>   mov rcx, [rax+disp32]  -> load_base
+     4  83 FE <imm>      cmp esi, imm8
+     4  83 B8 <u32> <i8> cmp dword [rax+d], imm8
+     4  48 83 FA 01      cmp rdx, 1
+     3  FF 09            dec dword [rcx]        -> dec_dword_base
+     3  48 C7 C0 <u32>   mov rax, imm32
+     3  48 89 E9         mov rcx, rbp
+     3  48 83 C4 08      add rsp, 8
+
+A blanket substitution across a line boundary is exactly the shape that
+would have mis-mapped a register twice already in this arc (the
+LoadElemBool tag scratch, the LoadElem2 ABI argument). Match the FULL
+multi-line form, or convert by hand and let vdjcmp prove it inert.
+
+**`dec_dword_base` and `load_base` already exist** - several of the
+above need no new encoder, only a call.
