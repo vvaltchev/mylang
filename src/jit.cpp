@@ -10550,6 +10550,11 @@ struct ElemRead {
     uint8_t idx   = R9;
 };
 
+/* The allocator for the two roles above that the ISA does NOT fix.
+ * Declared here because the first flat-read emitter is above its
+ * definition, which needs ELEM_CAND and elem_reg_usable. */
+static ElemRead elem_read_plan(const Emitter &e, uint8_t idx_reg);
+
 /* The per-kind FLAT element read tail (rax = the shobj): data -> rcx,
  * count -> rdx, the index -> r9 (from the op's a-operand when `idx_in`, else
  * cache-aware from `idx_slot`), then emit_elem_bounds_or_wrap (hot unsigned
@@ -10631,7 +10636,7 @@ static void emit_elem_int_read(Emitter &e, uint8_t ir,
     decline(0x74, 0x75);                     /* je (bools) else decline */
     /* flat bools: 1-byte elements, so the count is the raw pointer difference
      * (no sar) and the load is a movzx. */
-    ElemRead rr; rr.idx = ir;
+    const ElemRead rr = elem_read_plan(e, ir);
     emit_flat_int_tail(e, rr, pc, /*bools=*/true, &in, -1, slows);
     const size_t j_done = e.j32(0xEB);
     /* flat ints */
@@ -11008,6 +11013,52 @@ static uint8_t elem_read_idx(const Emitter &e, OpCode op)
     return ELEM_NO_REG;
 }
 
+/*
+ * ⛔ THE READ TIER'S PLAN (#96 (c), 2026-08-20). `ElemRead` held four
+ * FIXED roles; `idx` was already allocated by its callers, but `data`
+ * and `count` were rcx and rdx by default and nothing declared them -
+ * no `scratch()` call, so the pin-pool ADMISSION SURVEY could not see
+ * them at all. It reported a ZERO worklist for rcx while these tiers
+ * quietly wrote it, and admitting rcx then gave WRONG ANSWERS in
+ * 16_elem2_fused and 17_elem2_divmod_roles.
+ *
+ * ⛔ BOTH ARE FREE HERE, WHICH IS NOT TRUE OF THE STORE TIER. The
+ * ElemScratch note above records that `obj`/`count` are ISA-FIXED by
+ * the compound `/=`, `%=` arms - `cqo; idiv` reads RDX:RAX and writes
+ * the remainder to RDX. The READ tier emits no idiv: `count` is only
+ * `_M_finish - _M_start`, shifted and compared. So the read plan may
+ * allocate `data` AND `count`, while the store plan may allocate
+ * `data` alone.
+ *
+ * `data` becomes a SIB base (`load_elem_q(dst, data, idx)`), which
+ * every ELEM_CAND member can be - none of them is rsp/r12, the two
+ * encodings that mean something else.
+ *
+ * PREFERRED-FIRST, so with an empty pin set this is byte-identical to
+ * the hardcoded assignment and the mechanism lands INERT.
+ */
+static ElemRead elem_read_plan(const Emitter &e, uint8_t idx_reg)
+{
+    ElemRead r;
+    r.idx = idx_reg;
+    uint32_t taken = (1u << r.obj) | (1u << r.idx);
+    auto pick = [&](uint8_t preferred) -> uint8_t {
+        if (!(taken & (1u << preferred)) && elem_reg_usable(e, preferred)) {
+            taken |= 1u << preferred;
+            return preferred;
+        }
+        for (uint8_t c : ELEM_CAND)
+            if (!(taken & (1u << c)) && elem_reg_usable(e, c)) {
+                taken |= 1u << c;
+                return c;
+            }
+        return preferred;
+    };
+    r.data = pick(r.data);
+    r.count = pick(r.count);
+    return r;
+}
+
 static ElemScratch elem_scratch_plan(const Emitter &e, OpCode op)
 {
     ML_CHECK_MSG(op_elem_scratch_roles(op) == 2,
@@ -11016,7 +11067,10 @@ static ElemScratch elem_scratch_plan(const Emitter &e, OpCode op)
                  "pin pool's reservation cannot see this run, so the "
                  "tier will decline silently when the pool is full");
     ElemScratch sc;
-    uint32_t taken = (1u << sc.obj) | (1u << sc.data) | (1u << sc.count);
+    /* `count` stays rdx - the idiv arm hardware-pins it (see the note on
+     * the struct). `data` is NOT ISA-fixed, only conventional, and it is
+     * the role that was writing rcx undeclared. */
+    uint32_t taken = (1u << sc.obj) | (1u << sc.count);
     auto pick = [&](uint8_t preferred) -> uint8_t {
         if (!(taken & (1u << preferred)) && elem_reg_usable(e, preferred)) {
             taken |= 1u << preferred;
@@ -11030,6 +11084,7 @@ static ElemScratch elem_scratch_plan(const Emitter &e, OpCode op)
         sc.ok = false;
         return preferred;
     };
+    sc.data = pick(sc.data);
     sc.idx = pick(sc.idx);
     sc.val = pick(sc.val);
 #ifdef TESTS
@@ -11473,8 +11528,7 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
      * the byte length at the outer level and the element count at the
      * inner one, the same way the single-level tiers use it.
      */
-    ElemRead r;
-    r.idx = ir;
+    const ElemRead r = elem_read_plan(e, ir);
     const SlotAddr base = slot_addr(in.target2);
     const auto decline_ne = [&]() { slows.push_back(e.j32(0x75)); };
     /* lever A producer (the int tails; the CALLER reloads RAX on the
@@ -12698,7 +12752,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const uint8_t ir = elem_read_idx(e, in.op);
         if (ir == ELEM_NO_REG)
             return false;      /* no free index reg - decline */
-        ElemRead r; r.idx = ir;
+        const ElemRead r = elem_read_plan(e, ir);
         /* a[i] from a flat int/float array (N4; #56 delete-originals form).
          * The inline fast path serves the proven flat non-slice in-range
          * shape; EVERY declined precondition - non-array, a slice,
@@ -14253,7 +14307,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.load(RAX, base.payload);               /* rax = shobj */
             e.cmp_byte_rax(L.kind_off, L.kind_bools);/* flat bools? */
             e.bail_unless(0x74, pc);
-            ElemRead r; r.idx = ir;
+            const ElemRead r = elem_read_plan(e, ir);
             e.load_base(r.data, r.obj, L.data_off);      /* _M_start   */
             e.load_base(r.count, r.obj, L.data_off + 8); /* _M_finish  */
             e.sub_rr(r.count, r.data);            /* count (1B elems, so NO
