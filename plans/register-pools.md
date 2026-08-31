@@ -461,3 +461,79 @@ independent of everything above.
     scripts/disasmcheck.py build-claude/rel123/mylang
     scripts/vdjcmp.sh BIN BIN                      (self-test)
     read -vdj for the touched shapes, by hand
+
+---
+
+# #103 — RETIRING THE PICK: the map, and the fork it ends at
+
+## INCREMENT 0 (done): how much does the legacy pick still decide?
+
+Counters `runs_compiled` / `pick_decided` / `pick_pins`, over 125
+programs (bench/my + samples + tests/functional):
+
+    runs compiled       335
+    the PICK decided     75   (22%)
+    ...and pinned >= 1    0   (ZERO)
+
+So in the SHIPPING config the surviving fallback contributes NO PINS.
+Whenever the interval machinery declines, `pick_cached_slots`' own
+`hot` is empty too. Deleting that fallback costs nothing.
+
+## WHAT THE LEVER IS ACTUALLY HOLDING UP (measured)
+
+Building with the gate forced ON, FOUR of the eight tests that force
+`g_jit_lsra = false` still pass - their forcing was stale and is now
+REMOVED (commit 40ac11d). Two of those four are a direct consequence of
+#123: the C2b pair asks the allocator instead of predicting.
+
+The other four fail, all through their own VACUITY guards ("the shape
+is not reaching it"), and the corpus says why:
+
+    corpus-wide, DEFAULT config (LSRA on)
+      lsra_pins    250079      xcache        1   (46_matrix_mult only)
+      lsra_trans   150508      rax_pin       0
+      scache            7      range_share   0
+
+⛔ THE LINEAR SCAN SUPERSEDES THOSE MECHANISMS RATHER THAN LACKING
+THEM. At maximum pin pressure, 83_regs_int_40 gets
+`lsra_pins 1, lsra_trans 22, scache 1` under LSRA and `xcache 1` under
+the pick: the scan SPLITS LIVE RANGES instead of holding a value in a
+caller-saved register for the whole run and spilling it around every
+call. That is the better answer to the same problem.
+
+## THE FORK — a design decision, not a micro-step
+
+| mechanism            | its test               | LSRA reach |
+| caller-saved ext.    | jit_xcache_pins        | 1 - LIVE   |
+| ShareSeam L+1 clamp  | jit_share_region_clamp | 0          |
+| rax as the 13th pin  | jit_rax_pin_test       | 0          |
+| live-range reuse     | jit_range_share_test   | 0          |
+
+⛔ `xcache` IS LIVE CODE - 46_matrix_mult engages it. So the option of
+"delete the lever and let its test go" would leave LIVE code untested,
+which is the outcome this file's own rules forbid.
+
+  (A) KEEP THE LEVER, reframed. It stops being "the legacy allocator a
+      user might select" and becomes what it actually is: the TEST
+      VEHICLE for pressure shapes the linear scan does not produce,
+      plus the same-binary debugging A/B. Cost: a second allocator path
+      stays compiled.
+  (B) RETIRE THE PICK **AND** DELETE the three superseded mechanisms
+      (rax-as-pin, live-range reuse, the share clamp) with their tests,
+      keeping `xcache` and re-crafting `jit_xcache_pins` around the
+      shape that DOES reach it under LSRA (a nested-array loop like
+      46_matrix_mult, not the current max-pin int loop). Cost: a large
+      deletion of #96 machinery that measured wins when it was built.
+  (C) Retire the pick, keep the mechanisms, let the four tests go.
+      REJECTED - it leaves live code untested.
+
+RECOMMENDATION: **(A) for now, (B) as a separate, explicitly-scoped
+task.** The measured reason is the third row of the table: the pick is
+no longer a shipping alternative, and saying so in the code is most of
+the value; deleting #96's machinery is a bigger, separable decision
+that wants its own before/after, and (B)'s re-craft of
+`jit_xcache_pins` is real work with a real chance of ending in "no
+shape reaches it", which would itself be a finding.
+
+WHAT IS DONE EITHER WAY: increment 0's measurement, and four tests
+moved off the legacy path onto the shipping one.
