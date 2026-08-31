@@ -4231,6 +4231,49 @@ static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
  * stale ref). emit_ref_check emits the test and returns the `jb` to be
  * patched to the fast path. Uses rcx as scratch (dead at every store). */
 /*
+ * ⛔ #96 (c): THE REF CHECK'S SCRATCH, SPILLED WHEN IT IS PINNED.
+ *
+ * `emit_ref_check` and its jae twin are 531 of the 699 conflicts the rcx
+ * ADMISSION SURVEY reports - by far the largest block, because every
+ * de-helperized store emits one. Both already take the register as a
+ * PARAMETER; what they could not do is cope with it being spent as a pin.
+ *
+ * ⛔ AND THE FIX IS DELIBERATELY *NOT* "ASK FOR A DIFFERENT REGISTER",
+ * which is what alloc_scratch is for elsewhere. These two are called
+ * from the middle of other emitters, and their CALLERS know that rcx
+ * dies here and nothing else does. Handing back rdx or rsi instead
+ * would clobber whatever the caller left there - and `ra` cannot warn
+ * about it, because the untracked scratch registers are not in `busy`.
+ * That is the r9 shape exactly: a register admitted by analogy rather
+ * than by enumerating its sites.
+ *
+ * So the register does not change; only the pinned case does. The live
+ * range is THREE instructions (load, load32_base, cmp) with no call and
+ * no rsp-relative access between them, and `pop` does not touch flags,
+ * so the jcc that follows still reads the cmp. Two instructions, on a
+ * path that only exists once rcx is pinnable at all.
+ */
+struct RefScratch {
+    Emitter &e;
+    uint8_t sc;
+    bool spilled;
+    RefScratch(Emitter &em, uint8_t r)
+        : e(em), sc(r), spilled(em.reg_holds_pin(r))
+    {
+        if (spilled)
+            e.push_reg(sc);       /* it holds a pin - borrow and restore */
+        else
+            e.scratch(sc);        /* the ordinary case: assert it is free */
+    }
+    /* Call AFTER the compare and BEFORE the jump: pop preserves flags. */
+    void release()
+    {
+        if (spilled)
+            e.pop_reg(sc);
+    }
+};
+
+/*
  * `cold` opts THIS call site into MYLANG_JIT_COLD forcing. It is a
  * PARAMETER, not a global read inside the helper: a first version
  * overrode emit_ref_check for every caller at once, which is the wrong
@@ -4246,15 +4289,17 @@ static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
  */
 static size_t emit_ref_check(Emitter &e, int32_t type_off,
                              JitColdTier cold = JC_COUNT,
-                             uint8_t sc = RCX)
+                             uint8_t scr = RCX)
 {
     const JitLayout &L = jit_layout();
     const bool force = cold != JC_COUNT && jit_cold_forced(cold);
-    e.scratch(sc);
+    RefScratch rs(e, scr);
+    const uint8_t sc = rs.sc;
     e.load(sc, type_off);                     /* sc = current Type* */
     e.load32_base(sc, sc, L.type_t_off);      /* sc32 = type->t */
     e.cmp_reg32_imm32(sc, force ? 0u
                                 : static_cast<uint32_t>(L.t_str_val));
+    rs.release();
     /*
      * ⛔ NEAR, NOT SHORT (fixed 2026-08-19). Every one of the three
      * callers puts a HELPER CALL between this jump and its patch, and a
@@ -4328,13 +4373,15 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap)
  * t_str); fall through for a trivial value. Returns the jae rel32 site to
  * patch to the helper label. Clobbers rcx. */
 static size_t emit_ref_check_jae(Emitter &e, int32_t type_off,
-                                 uint8_t sc = RCX)
+                                 uint8_t scr = RCX)
 {
     const JitLayout &L = jit_layout();
-    e.scratch(sc);
+    RefScratch rs(e, scr);
+    const uint8_t sc = rs.sc;
     e.load(sc, type_off);
     e.load32_base(sc, sc, L.type_t_off);
     e.cmp_reg32_imm32(sc, static_cast<uint32_t>(L.t_str_val));
+    rs.release();
     return e.j32(0x73);                        /* jae -> the helper (a ref) */
 }
 
