@@ -2626,3 +2626,54 @@ the code gets safer. Both numbers have to be read together:
       39  emit_sync_push_native + emit_ret_native - safe by the
           existing gates; convert last, for the census only
      ~38  the scattered remainder
+
+## (u) the disassembler, and emit_op's roles
+
+**THE DISASSEMBLER FIRST** (maintainer: "I wanna see NO instruction
+whatsoever that cannot be decoded correctly - that's a hard
+requirement"). It was not met, and the reason it looked met is the
+whole lesson: `DUMP IS UNRELIABLE` counts `.byte` lines, so it can only
+report bytes we KNOW we failed on. A decoder cannot check itself.
+
+ - **`scripts/disasmcheck.py`** - `MYLANG_VDJ_HEX=1` puts each
+   instruction's raw bytes in the dump; the script hands each fragment
+   to **objdump** and compares BOUNDARIES and MNEMONICS. Now in the
+   Nets CI lane with `--matrix` (both arenas x 7 pin rotations x 5 pin
+   budgets - the axes that change WHICH encodings get emitted).
+   **2,209,682 instructions, 0 disagreements.**
+ - It found `F7 /3` (neg) and `F7 /5` (imul) missing on **284 corpus
+   sites**, printing `f7/? rdx` - neither a mnemonic nor a `.byte`, so
+   silent to the banner AND claiming a length it had not earned. Three
+   such markers existed (`f7/?`, `ff/?`, `.0f 0x..`); every path now
+   ends at one `undecoded:` label.
+ - **That retroactively armed the existing `-rt` check**: with the gap
+   put back it fails 1923/1924, having passed for the gap's lifetime.
+ - It also found an EMITTER defect: `movsd`'s REX.W is architecturally
+   ignored, so every float element access carried a dead prefix bit.
+
+**RCX 140 -> 97** with emit_op's two roles (`tmp`, the staged second
+operand; `cpy`, the 24-byte EvalValue copy scratch), 35 sites.
+
+**AND THE LAST FIVE STALE `e.scratch(RCX)` ARE GONE** - all beside a
+`bump_counter` that clobbers no register. `scratch()` is a pure
+ML_CHECK, and an over-broad one ABORTS A LEGAL FRAGMENT the day the
+register is pinnable, so these were a direct blocker on admitting rcx.
+One guarded a documented ordering invariant whose justification had
+rotted; the ordering stays, the reason is rewritten.
+
+### Remaining for rcx (97)
+
+    26  emit_sync_push_native ) ALREADY SAFE by the existing gates -
+    13  emit_ret_native       ) convert last, for the census only
+     4  emit_sync_call_inline )
+    20  emit_op's residue (StructCtorV, UnaryV, LoadMemberFloat, the
+        tag/pointer movabs sites)
+     8  jit_compile_chunk
+    26  the scattered remainder
+
+Then `data`/`count` allocatable in ElemRead/ElemScratch (the step with
+real decline risk - watch `g_jit_elem_noreg`), then rax (357).
+
+**And drive `regcensus.py --raw` (290 hand-encoded lines) to zero** -
+it is the more honest metric, since converting one moves a register
+from invisible to counted.
