@@ -328,6 +328,24 @@ public:
         std::memcpy(static_cast<void *>(this), &src, sizeof(EvalValue));
     }
 
+    /*
+     * #121: reset the tag to `none` AFTER the payload has already been moved
+     * out by a hand-written, type-specific assign (vm_slot_bind_ref, vm.cpp).
+     * The moved-from handle is null, so no destructor and no decrement is
+     * owed; dropping the tag is what makes this value's own destructor
+     * trivial instead of one more indirect call through the Type table.
+     *
+     * ⛔ NOT abandon_borrowed(), and the difference is the whole safety
+     * argument: THAT one drops a tag over a payload that was NEVER moved out
+     * (a #94 borrow, whose reference the caller's slot owns), and leaks
+     * anywhere else. HERE the move has already happened, so there is nothing
+     * left to release. Calling this on a value whose payload is still live
+     * LEAKS it.
+     */
+    void drop_moved_from_tag() {
+        type = AllTypes[Type::t_none];
+    }
+
     template <class T>
     T &get() {
 
