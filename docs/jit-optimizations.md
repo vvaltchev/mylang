@@ -11198,3 +11198,297 @@ bar is the LOAD, not the run"). An image that loads happily and dies on
 its first call is invisible to it. The lesson generalises past `.myv`: a
 net whose bar is "the input was accepted or refused cleanly" says nothing
 about what the accepted input then DOES.
+
+## #123 - THE PIN POOLS ARE DELETED: a pin asks the ALLOCATOR, GP and
+## FP (2026-08-29)
+
+**THE INSTRUCTION (maintainer):** *"Retire the pick and completely
+remove both the arrays CACHE_REGS and FCACHE_REGS. Use the allocator to
+get whatever register is more convenient which will include a weight
+for caller vs callee saved. ... STOP DOING NON-SENSE MEASUREMENTS. You
+need to do the RIGHT thing, STRUCTURALLY, instead of blindly measuring
+bad ideas. YOU ARE NOT USING ALL THE REGISTERS. ... check the
+disassembly MANUALLY, not comparing it blindly with what it was before
+as that makes NO SENSE."*
+
+**THE MODEL, AND WHERE THE ARRAYS SAT IN IT.** Three layers were
+routinely conflated:
+
+    (a) ALLOCATOR  jit_lsra_assign(.., int K, ..) - takes a COUNT,
+                   allocates ABSTRACT registers 0..K-1, never sees a
+                   register number.  Generic.  #96 built this.
+    (b) BUDGET     K = max_pins
+    (c) BINDING    abstract -> physical.  THE ARRAYS LIVED HERE.
+
+So #96's allocator was real and the arrays bypassed its cost model
+one layer out. `RegAlloc::take(need, prefer, exclude)` already filtered
+by capability and ranked by `gp_weight()`; four hand-written lists
+decided the answer before it was ever asked.
+
+### THE FLOAT FILE - four registers of sixteen, by construction
+
+It had been carved by hand into THREE disjoint sets: xmm0/1 the staging
+grant, xmm2/3 `FLIT_REGS` (the literal pool), xmm4-7 `FCACHE_REGS`
+(pins), **xmm8-15 unreachable** - and unreachable STRUCTURALLY, not by
+policy: nine of the emitter's xmm encoders wrote no REX prefix at all,
+so xmm8+ could not be named. (By `fp_weight`'s own logic xmm4-7 were
+not even the best four: they are SysV argument registers.)
+
+ 1. `Emitter::sse_rex(reg, rm, w)` - ONE seam for a float form's REX
+    byte, emitted only when it carries a bit. All nine encoders go
+    through it: fload, fstore, farith, fmov_rr, sqrtsd, cvt,
+    movq_xmm_from, ucomisd, xorps_self. REX goes AFTER the mandatory
+    66/F2/F3 and BEFORE 0F, as the ISA requires.
+ 2. **`-vdj` was a disassembler change too** - all five reg-reg SSE arms
+    read their rm operand as `c[p] & 7` and would have printed xmm0 for
+    xmm8. (CLAUDE.md: *adding an operand form to the emitter is a
+    disassembler change.*)
+ 3. `fp_allocatable`: `x <= 7` -> `x < 16`; the budget derived
+    (`fp_alloc_count() - FP_STAGE_RESERVED`).
+ 4. `FCACHE_REGS` and `FLIT_REGS` deleted; both ask `ra.ftake()`.
+
+⛔ **THE BUG THAT PROVED THE POINT, found by READING the dump in one
+look** - `a = a + b*c` printed 0.0 instead of 25625.0:
+
+    +28:  movq   xmm2, rcx      <- the literal 2.5
+    +61:  movsd  xmm3, b        <- a PIN overwrites it
+    +116: mulsd  xmm0, xmm2     <- reads the clobbered register
+
+Three pools disjoint BY CONSTRUCTION had never needed to coordinate, so
+the moment one of them started allocating they collided. That is the
+generalisable half: **a hand-partitioned resource has no conflict
+detection, because the partition WAS the detection.**
+
+### THE GP FILE - the arrays, and the fact one of them encoded
+
+`CACHE_REGS[] = {12,13,14,15}` is exactly `{allocatable} &
+{callee-saved}`; `XCACHE_ORDER[] = {10,11,8,7,6,9,2,1,0}` duplicated
+what `gp_weight` ranks - with ONE exception that turned out to be real
+information rather than noise: **it put rax LAST**, where the weight
+model ranked it second-cheapest.
+
+That is `CAP_ABI_RET` now, with a `+6` term. rax carries every emitted
+helper call's return value AND its status, which `emit_call_epilogue`
+reads at ~60 sites - so a rax pin, unlike an ordinary caller-saved one,
+**cannot be spilled around the call**; the epilogue needs the register
+itself. `rax_pin_conflict` evicts it and the chunk re-emits with rax
+denied. Without the term every call-containing run would pin rax, hit
+the conflict and pay a wasted emission pass to arrive where it started.
+
+The order the model yields, cheapest first:
+
+    r12 r13 r14 r15 (1) | r10 r11 (3) | rcx rdx rsi rdi (6)
+                        | r8 r9 (7)   | rax (8)
+
+Deleted: `CACHE_REGS`, `XCACHE_ORDER`, `MAX_CACHED`, `MAX_XCACHED`,
+`xcache_regs()`, `Emitter::take_reg`. `gp_pool_mask()` /
+`gp_volatile_pool_mask()` / `gp_pool_count()` are constexpr and derived
+from `gp_caps`; `max_pins` is "how many allocatable registers are left"
+rather than `MAX_CACHED + n_xcache`.
+
+**THE C2b HOIST PAIR ASKED THE HARDEST QUESTION.** It used to compute
+its two registers POSITIONALLY - `CACHE_REGS[cs_used]` and its
+successor - chosen so the pins' own later first-free scan over the same
+array would land elsewhere. Two arrays and one shared index; the
+comments there record two bugs it had already produced (a `size_t`
+underflow reading `CACHE_REGS[5]` out of bounds, and a tmode pop that
+left a pin "resident per the plan but never loaded").
+
+With one allocator the prediction machinery simply disappears: the pair
+TAKES FIRST, the pins take what is left. That is also the right
+priority - the pair MUST be callee-saved (a helper call preserves it,
+so no epilogue re-derivation), while a pin displaced into a
+caller-saved register is not lost at all, merely spilled by machinery
+that already exists.
+
+⛔ **AND THE PRIORITY FIXED A REAL OVER-DROP.** The old second arm
+dropped TWO pins whenever the callee-saved four were full, without ever
+asking whether anything was actually lost - so a run with four pins and
+seven free caller-saved registers threw two of them away to make room.
+The honest count is `hot.size() - (max_pins - 2)`, which drops none
+there. The `!lsra_tmode` guard moved onto the POP, which is what it was
+always about.
+
+**THE #112 CAPTURE BASE gained a STATED requirement.** It asks
+`CAP_ALLOCATABLE | CAP_MEM_BASE | CAP_CALLEE_SAVED`. `CAP_MEM_BASE` is
+exactly the r12 exclusion its comment used to spell out by hand;
+CALLEE_SAVED was **unstated and satisfied only by the array's
+contents** - the very next line pushes it onto `e.saved`, frag_entry's
+push list, which is wrong for a caller-saved register.
+
+### THE NET A STRUCTURAL FACT LEAVES BEHIND WHEN IT STOPS BEING ONE
+
+"A pin fills the callee-saved registers first" used to be unfalsifiable:
+`take_reg(CACHE_REGS)` was tried before `take_reg(xcache_regs())`, so
+it was two calls in an order. It is now a consequence of four integers
+in `gp_weight`, and a future tuning could silently invert it - every
+call site paying a spill and a reload while a free register sat idle.
+So `reg_model_check` asserts it: the worst callee-saved weight must be
+strictly below the best caller-saved one.
+
+**WATCHED FAILING**, one sabotage build each:
+
+  - drop the `+2` caller-saved term (a caller-saved register becomes
+    cheaper than a callee-saved one) -> `-rt` **ABORTS, rc=134,
+    1976/1978**;
+  - drop rbx from `GP_RESERVED_MASK` (the slots base becomes
+    allocatable) -> `-rt` **rc=1**.
+
+⛔ **AND THE THIRD SABOTAGE PASSES, WHICH IS THE HONEST RESULT AND
+WORTH RECORDING.** Deleting the `CAP_ABI_RET` term leaves `-rt` at
+**1978/1978** - because it is not a correctness fact. It costs a
+COMPILE PASS, and *"an optimization that only affects SPEED has no
+correctness oracle"* is a gap this file already names. So the evidence
+is a COUNTER, not a test, and `rax_retries` already was one. On a
+9-hot-local int loop:
+
+    build            frags   rax_retries
+    with    +6         1         -
+    without +6         1         1
+
+The EMITTED CODE IS IDENTICAL in both - the same nine `add`s over the
+same nine registers. Without the term rax is ranked second-cheapest,
+gets pinned, hits `rax_pin_conflict`, and **the whole chunk is emitted
+a second time** to arrive at the answer the first ordering would have
+reached directly. That is the term's entire job, measured rather than
+asserted.
+
+⛔ **AND `MYLANG_JIT_XROT` HAD TO MOVE FIRST.** It rotated the
+caller-saved ARRAY; with the arrays deleted there would have been
+nothing to rotate and the coverage axis would have gone **silently
+vacuous** - the axis that exists precisely because *a pool ordered by
+preference hides its own tail* (the r9 bug, a shipping wrong answer for
+a day). It now rotates the START OF THE SCAN inside `RegAlloc::take`
+and `RegAlloc::ftake`, which is strictly wider: the array form reached
+only the caller-saved GP pool, this reaches the whole GP file **and the
+float file**, which had no coverage axis at all. Period 16; `mylang -v`
+reports it and `corpus_diff --xrot` derives the sweep from that line.
+
+### VERIFICATION - BY READING, because a diff would be circular
+
+A `vdjcmp` diff against the OLD emission proves nothing here: the old
+emission is what is being replaced. Still required and still run:
+vdjcmp's SELF-test, the objdump oracle, `-rt`, `corpus_diff`.
+
+    -rt                1978/1978 + 4 differential modes 1696/1696
+    corpus_diff        plain / --levers / --cold / --xrot (0..15) /
+                       --nolowmem - all 34/34 agree
+    disasmcheck.py     202,433 instructions, 332 fragments,
+                       ZERO objdump disagreements
+    vdjcmp self-test   127/127 identical
+
+**READ BY HAND** - a 9-hot-local int loop, release build. Nine live
+values in nine registers, one instruction each, zero memory traffic in
+the body:
+
+    +515: cmp rsi, n
+    +522: jge +561
+    +528: add r12, rsi      ; a += i
+    +531: add r13, r12      ; b += a
+    +534: add r14, r13      ; c += b
+    +537: add r15, r14      ; d += c
+    +540: add r10, r15      ; e += d
+    +543: add r11, r10      ; f += e
+    +546: add rcx, r11      ; g += f
+    +549: add rdx, rcx      ; h += g
+    +552: add rsi, 1
+    +556: jmp +515
+
+Hand-decoded float forms: `66 4C 0F 6E C1` = `movq xmm8, rcx`
+(REX.W|REX.R), `F2 41 0F 59 C0` = `mulsd xmm0, xmm8` (REX.B).
+
+**CORPUS REGISTER CENSUS** (bench/my + samples + tests/functional,
+emitted text): all 13 allocatable GP registers appear; xmm0-11 appear
+(xmm12-15 need 12+ hot float locals, which no corpus program has - a
+dense 8-float loop reaches xmm9).
+
+### ⛔ THE MEASUREMENT FOUND A 45% Ir REGRESSION, AND ONE BIT WAS
+### ANSWERING TWO QUESTIONS
+
+Every net was green and the wall clock said **05_mixed_arith 4.54x
+SLOWER, 04_float_arith 2.56x**. This is the entry's most useful half,
+because the defect is invisible to every correctness oracle the project
+has: the answers were right, only the speed collapsed.
+
+`RegAlloc::busy` means *"taken right now"*. Under TRANSITION mode that
+is a **PER-PC** fact - the trans-mode binding gives a register back as
+soon as its abstract register has no ENTRY occupant, because each
+install `take_fixed`s it again at its own pc, and the comment there
+says exactly that. But a **RUN-SCOPED** consumer - `pick_float_lits`,
+the #112 capture base - asks the same bit and reads that give-back as
+*"free for the whole fragment"*.
+
+Found by logging every float transaction inside `ftake`/`fgive`, which
+settles it in five lines:
+
+    FT take -> xmm0   (stage a)
+    FT take -> xmm1   (stage b)
+    FT take -> xmm2   (the F4b trans-mode plan binds slot x here)
+    FT GIVE BACK xmm2       <- not an entry occupant
+    FT take -> xmm2         <- pick_float_lits takes it for a literal
+
+Both consumers then own xmm2. The literal's reload is emitted at every
+entry AFTER the cache loads, so the literal wins and `x` falls back to
+memory with a type dispatch FOUR times per iteration.
+
+FIX: two questions, two bits - `planned` / `fplanned`. An ordinary
+run-scoped ask (`take`/`ftake`) skips them; the plan's own install
+(`take_fixed`/`ftake_fixed`) ignores them. `free_reg` deliberately does
+NOT test `planned`, or the install could not claim its own register.
+**The GP twin is fixed in the same change**, not after: the identical
+give-back sits at ~24596 and the capture base asks after it.
+
+⛔ **AND THE PRE-#123 CODE WAS IMMUNE BY ACCIDENT.** `FLIT_REGS={2,3}`
+and `FCACHE_REGS={4,5,6,7}` were disjoint by construction, so the two
+consumers could not collide however confused the bookkeeping was. That
+is the SAME "a hand-partitioned resource has no conflict detection"
+lesson as the xmm2 clobber above - hit twice in one change, once on the
+take path and once on the GIVE-BACK path. **Deleting a partition
+converts every latent bookkeeping error in that resource into a live
+one, and they do not all surface as wrong answers.**
+
+MEASURED (callgrind Ir per 1M iterations, scale-3 minus scale-1 so
+compile time is excluded), pre-#123 baseline vs the fix, 22 benches:
+
+    46_matrix_mult   19,059,992 -> 15,052,569   -21.03%
+    04_float_arith   19,000,000 -> 17,000,000   -10.53%
+    54_mandelbrot    51,630,847 -> 49,991,859    -3.17%
+    05_mixed_arith   31,000,120 -> 31,000,120    exactly back to base
+    the other 18                                 byte-identical
+
+46_matrix_mult's -21% is the C2b over-drop fix; 04's -10.5% is the
+wider float file finally paying, which it could not do while the pool
+was taking the plan's register.
+
+TWO METHOD NOTES, both mistakes made here:
+ - `run.py`'s absolute times for these two benches are **15-26ms**, so
+   the first reading dismissed a 4.54x as startup noise. A ratio on a
+   15ms bench is evidence of NOTHING either way - re-time at scale, or
+   use Ir.
+ - a debug print showed `0.5` pooled TWICE and nearly earned a
+   "dedup bug" report. The literals are `0.5` and `0.4999999`, and
+   `%g` renders both as `0.5`. Print bit patterns, not `%g`.
+
+### WHAT IS **NOT** DONE, and why each is separable
+
+ - **THE xcache DENIAL.** `jit_run_blocks_xcache` still keeps a run
+   that emits a MyLang call off the caller-saved half, and **the denial
+   is currently CORRECT** - a first reading of this called it a
+   register wasted for nothing, and that was wrong. Read the emitter:
+   `emit_sync_push_native` holds rax, rbx, rcx, rdx, rsi, r8, r9, r10,
+   r11 as PROTOCOL across one long straight-line sequence - 8
+   allocatable registers of 13 - so "route its r10/r11 scratch through
+   `alloc_scratch()`" cannot be the fix; there is nothing to route them
+   to. And a MyLang call is a real SysV `call`: the callee clobbers
+   every caller-saved register regardless.
+   THE ACTUAL FIX is to BRACKET the MyLang call site with the same
+   `emit_call_prologue`/`emit_call_epilogue` the helper calls already
+   use - the pins spill to their slot payloads and reload after,
+   exactly the trade the caller-saved extension already makes for
+   helper calls. That is call-protocol surgery and belongs with #97.
+ - **RETIRING THE PICK** (#103's residual). NOTE the positional zip is
+   already gone - both allocator modes bind through `ra.take` - so what
+   is left is deleting the non-LSRA RANKING path and reworking the
+   eight coverage tests that force `g_jit_lsra = false`. It changes
+   which SLOTS are chosen, never which REGISTERS are used.
+

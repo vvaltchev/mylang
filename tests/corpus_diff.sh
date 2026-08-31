@@ -34,7 +34,7 @@
 # fallback register for the t_bool tag and the movabs that filled it had
 # been deleted as "an instruction saved" when the imm32 form landed.
 #
-# --xrot exists because take_reg hands out the caller-saved pin pool in
+# --xrot exists because the allocator hands out registers in
 # PREFERENCE order, so its last member is reached only by a run with the
 # maximum pin count - and an unsafe register can therefore sit in the
 # pool exercised by nothing. r9 did, for a day, as a wrong answer
@@ -95,14 +95,18 @@ COLD_TIERS="refstore"
 # held THREE, so rotation 3 was a duplicate of 0; when rdi joined the
 # count happened to be right. Not a property to rely on twice.
 #
-# `mylang -v` reports `jit_pins N (int pin budget; xcache M ...)`; M is
-# what XROT rotates. A binary that does not report it (an older build,
-# a non-JIT platform) falls back to the literal and SAYS SO.
-XCW=$("$BIN" -v 2>/dev/null | sed -n 's/.*xcache \([0-9][0-9]*\).*/\1/p')
+# `mylang -v` reports `jit_pins N (int pin budget; M xrot rotations)`;
+# M is XROT's period. #123: it used to be the caller-saved ARRAY's
+# length, because the rotation permuted that array - the rotation now
+# moves the start of RegAlloc::take's scan over the whole register
+# file, so M is 16 and the sweep covers the FLOAT file too. A binary
+# that does not report it (an older build, a non-JIT platform) falls
+# back to the literal and SAYS SO.
+XCW=$("$BIN" -v 2>/dev/null | sed -n 's/.*; \([0-9][0-9]*\) xrot.*/\1/p')
 if [ -n "$XCW" ] && [ "$XCW" -gt 0 ] 2>/dev/null; then
   XROTS=$(seq 0 $((XCW - 1)) | tr '\n' ' ')
 else
-  echo "warning: '$BIN' does not report its xcache width; --xrot is" >&2
+  echo "warning: '$BIN' does not report its xrot width; --xrot is" >&2
   echo "         falling back to a fixed 0..3 sweep, which may NOT" >&2
   echo "         cover every pool member." >&2
   XROTS="0 1 2 3"

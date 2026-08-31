@@ -268,6 +268,28 @@ case, so an early `set -e` exit or an interrupt cannot skip it. Same
 family as [[stale-build-lane-wrong-subject]] and RULE B1: before asking
 what a measurement means, ask what BINARY produced it.
 
+**⛔⛔ AND `git checkout -- <file>` IN A HARNESS DESTROYS THE
+UNCOMMITTED WORK IN THAT FILE. COMMIT BEFORE YOU SABOTAGE (2026-08-29,
+the same day, in the same session).** Every such harness restores with
+`git checkout --`, which is correct only if the file was CLEAN when it
+started. During #123 it was not: `src/jit.cpp` held the whole
+uncommitted GP change, the harness's `trap restore EXIT` fired when the
+run timed out, and one command erased it. It was recoverable only
+because every edit happened to be replayable from this session's
+transcript — the exact luck the FORBIDDEN-COMMANDS rule says not to
+rely on.
+
+`git checkout --`, `git restore`, `git reset --hard` and
+`git stash drop` are already FORBIDDEN as a way to "get back to green";
+what this adds is that a HARNESS runs them too, at a moment you are not
+watching. So the order is not optional:
+
+    1. commit the work (broken is fine — that is the whole point)
+    2. THEN run the harness that sabotages and restores
+
+A harness may also `cp` the file aside and restore from the copy
+instead, which removes the hazard entirely and costs one line.
+
 ## What this is
 
 MyLang is an educational, dynamically-typed scripting language (C-looking
@@ -777,6 +799,38 @@ REFERENCE. State it as an `ML_CHECK` on the opcode INSIDE the accessor,
 not as a comment above it — then asking the wrong family aborts by name
 instead of returning a plausible answer.
 
+**⛔ AN ELEVENTH SHAPE, AND IT IS THE COST OF DELETING A PARTITION
+(#123, 2026-08-29): ONE BIT ANSWERING TWO QUESTIONS.**
+`RegAlloc::busy` means "taken right now". Under the allocator's
+TRANSITION mode that is a **PER-PC** fact - the binding gives a
+register back the moment its abstract register has no ENTRY occupant,
+because each install re-takes it at its own pc. A **RUN-SCOPED**
+consumer - the float literal pool, the #112 capture base - asks the
+same bit and reads the give-back as "free for the whole fragment".
+
+Both then own the register. The literal's per-entry reload is emitted
+after the cache loads, so it wins, and the pinned local falls back to
+memory with a type dispatch four times an iteration: **+45% Ir on
+05_mixed_arith, 4.54x on the wall clock**, with `-rt` 1978/1978,
+corpus_diff 34/34 and every fuzzer green. The ANSWERS were right; only
+the speed collapsed, so no correctness oracle could see it.
+
+**The half worth carrying: the code was immune BEFORE only by
+ACCIDENT.** `FLIT_REGS = {2,3}` and `FCACHE_REGS = {4,5,6,7}` were
+disjoint by construction, so those two consumers could not collide
+however confused the bookkeeping was. **Deleting a hand-partition
+converts every latent bookkeeping error in that resource into a live
+one - and they do not all surface as wrong answers.** Expect the
+second one after you fix the first: #123 hit this class twice, once on
+the TAKE path (a wrong answer, found in minutes) and once on the
+GIVE-BACK path (a silent 45%, found only by the benchmark).
+
+Fixed by giving the two questions two bits (`planned`/`fplanned`);
+found by logging every take/give inside the allocator, which showed it
+in five lines. **When a resource has two lifetimes, it needs two
+bits** - and when you delete a partition, go looking for who was
+relying on it.
+
 **A boolean chain and a run of `.clear()` calls are the same enumeration
 in different clothes.** When you add a member to a family, grep for every
 site that mentions ALL the existing members together. FIXED
@@ -1071,11 +1125,11 @@ collision). Three nets now:
   per mode, so `-rt` is green with it on OR off), argfuse (#162: a
   reference argument already in a named local is bound STRAIGHT from
   that slot and its staging MoveV is not emitted; the cold arms
-  materialise the run), xcache (#96: the CALLER-saved pin
-  extension - r8/r10/r11 hold up to three more hot locals,
-  spilled/reloaded around every helper call by
-  emit_call_prologue/epilogue. **Which members a run may spend is a
-  per-register CLOBBER MASK, `jit_xcache_clobber` - not a boolean.**
+  materialise the run), xcache (#96: the CALLER-saved half of the
+  pin pool - it holds hot locals too, spilled/reloaded around every
+  helper call by emit_call_prologue/epilogue. **Which members a run
+  may spend is a per-register CLOBBER MASK, `jit_xcache_clobber` -
+  not a boolean.**
   It was a boolean until 2026-08-18, and the boolean cost a register
   for nothing: one C1 hoist region denied the WHOLE pool, though the
   hoist claims only r10/r11, and an element read on a loop-invariant
@@ -1111,9 +1165,12 @@ collision). Three nets now:
   cost gate alone and makes it fail in `Frame::at`),
   capbase (#112: a run making TWO OR MORE inline capture accesses
   walks `ctx -> ctx->captures -> data()` ONCE, at the run head, into
-  a CALLEE-saved register claimed from whatever `CACHE_REGS` the
-  pins, the C2b pair and trans mode's abstract registers left. **It
-  is a BASE register, not a value register, and that excludes r12**
+  a CALLEE-saved register claimed from whatever the pins, the C2b
+  pair and trans mode's abstract registers left (#123: it asks
+  `ra.take(CAP_ALLOCATABLE|CAP_MEM_BASE|CAP_CALLEE_SAVED)` - both
+  requirements STATED, where the callee-saved half used to be
+  implicit in a list's contents). **It is a BASE register, not a
+  value register, and that excludes r12**
   - `(r & 7) == 4` is the ModRM encoding meaning "a SIB byte
   follows", which `load_base` does not write; `base_needs_sib`'s
   ML_CHECK caught it on the first run, exactly as its own comment
@@ -1161,15 +1218,22 @@ collision). Three nets now:
   prove it is in the configuration it tests goes green doing nothing
   the day a default moves (the `lto0` lane's reason for asserting
   `lto 0` first).
-- **`MYLANG_JIT_XROT=N` - ROTATE the caller-saved pin pool** so member
-  N is handed out FIRST (`tests/corpus_diff.sh BIN --xrot` runs the
-  matrix; `g_jit_xrot` is settable in-process, and `jit_xcache_pins`
-  sweeps every rotation). `take_reg` scans the pool in PREFERENCE
-  order, so its last member is reached only by a run with the maximum
-  pin count - which is how an UNSAFE register (r9) sat in the pool for
-  a day, exercised by no net in the project, as a wrong answer. Unlike
-  a lever switch this is not an A/B: every rotation must produce the
-  SAME output, so it is a pure differential axis.
+- **`MYLANG_JIT_XROT=N` - ROTATE THE ALLOCATOR'S SCAN** so a different
+  one of several EQUALLY-WEIGHTED registers is met first
+  (`tests/corpus_diff.sh BIN --xrot` runs the matrix; `g_jit_xrot` is
+  settable in-process, and `jit_xcache_pins` sweeps every rotation).
+  `RegAlloc::take` scans in PREFERENCE order, so its last candidate is
+  reached only by a run with the maximum pin count - which is how an
+  UNSAFE register (r9) sat in the pool for a day, exercised by no net
+  in the project, as a wrong answer. Unlike a lever switch this is not
+  an A/B: every rotation must produce the SAME output, so it is a pure
+  differential axis.
+  **#123 MOVED IT INTO `RegAlloc::take`/`ftake`** (it used to permute a
+  caller-saved ARRAY, and with the arrays deleted there would be
+  nothing left to rotate - the axis would have gone silently vacuous).
+  It reaches the WHOLE GP file and the FLOAT file now, period 16;
+  `mylang -v` reports it and `corpus_diff --xrot` derives the sweep
+  from that line rather than hardcoding a count.
 - **`MYLANG_JIT_LSRA` - the D3 REGISTER-ALLOCATOR lever, ⛔ DEFAULT
   ON since 2026-08-26** (`g_jit_lsra`, settable in-process;
   `MYLANG_JIT_LSRA=0` is the debugging OPT-OUT). ON means the linear

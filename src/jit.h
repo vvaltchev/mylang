@@ -645,7 +645,7 @@ extern unsigned g_jit_xrot;
  * OFF restores the pick end to end, so a suspected allocator bug
  * has a same-binary A/B one env var away. */
 extern bool g_jit_lsra;
-size_t jit_xcache_width();
+size_t jit_xrot_width();
 /*
  * REACH (env MYLANG_JITSTATS=1): print the emitted-code counters after a
  * script run - which TIER each shape actually took, on a real program.
