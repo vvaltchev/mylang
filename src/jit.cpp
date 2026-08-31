@@ -1898,6 +1898,27 @@ struct Emitter {
                 return true;
         return false;
     }
+    /*
+     * ⛔ THE BORROW QUESTION IS "IS ANYTHING LIVING HERE", AND THE
+     * ALLOCATOR IS THE AUTHORITY - NOT `cache` (#96 (c), 2026-08-20).
+     *
+     * `reg_holds_pin` scans `cache`, which lists the slots the PIN
+     * machinery is holding. That is a SUBSET of what is occupied:
+     * `check_pins_are_busy()` asserts cache is contained in `ra.busy`,
+     * never the reverse, so a register taken by anything else - a
+     * take_fixed pair, a transient scratch - is busy while `cache` says
+     * nothing. A borrow site asking `cache` therefore skips its
+     * push/pop exactly where something IS live, which is a silent
+     * clobber; asking `busy` can only ever borrow more often, which
+     * costs two instructions.
+     *
+     * `denied` is deliberately NOT consulted: a denied register holds
+     * nothing, this run simply may not SPEND it, so there is nothing to
+     * preserve. Folding the two would push and pop for no reason on
+     * every run with a clobber mask.
+     */
+    bool reg_is_occupied(uint8_t r) const
+    { return (ra.busy & (1u << r)) != 0; }
 
     /*
      * ⛔ "I AM ABOUT TO USE <reg> AS RAW SCRATCH." Declare it, at the
@@ -3592,15 +3613,35 @@ static bool div_magic(int_type d, DivMagic &out)
 static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
                            bool want_mod)
 {
-    /* the dividend is kept aside for the remainder below; naming the
-     * role is what lets the allocator move it later */
+    /*
+     * The dividend is kept aside for the remainder below. Naming the
+     * role was step one; BORROWING it is step two.
+     *
+     * ⛔ THIS WAS THE LAST rcx BLOCKER, and it hid the longest because
+     * the role LOOKS allocated - it has a name and a comment saying an
+     * allocator will move it - while being a fixed default that
+     * declares nothing. No `scratch()`, so the admission survey never
+     * saw it; and it only bites a fragment that both strength-reduces a
+     * division AND has enough hot locals to spend an eleventh pin,
+     * which is one program in the corpus.
+     *
+     * rax and rdx are ISA-fixed here (`imul r64` writes RDX:RAX), so
+     * `keep` cannot be either; the sequence is straight-line with no
+     * call and no jump, so a push/pop bracket is safe exactly as it is
+     * in RefScratch (declared below, hence the open-coded form).
+     */
     const uint8_t keep = RCX;
+    const bool keep_spill = e.reg_is_occupied(keep);
+    if (keep_spill)
+        e.push_reg(keep);
+    else
+        e.scratch(keep);
     e.mov_rr(keep, RAX);                             /* keep = n */
     e.movabs(RDX, m.M);
     e.imul_reg(RDX);              /* imul rdx (signed,
                                                       * rdx:rax = n*M) */
     if (m.needs_add) {
-        e.add_rr(RDX, RCX);
+        e.add_rr(RDX, keep);
     }
     if (m.sh) {
         e.sar_rr_imm8(RDX, static_cast<uint8_t>(m.sh));   /* sar rdx, imm8 */
@@ -3623,8 +3664,10 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
         e.movabs(RAX, static_cast<uint64_t>(d));
         e.op_rr2(Op::times, RAX, RDX);  /* imul rax, rdx */
     }
-    e.sub_rr(RCX, RAX);
+    e.sub_rr(keep, RAX);
     e.mov_rr(RAX, keep);                             /* rax = remainder */
+    if (keep_spill)
+        e.pop_reg(keep);
 }
 
 /* Float ORDERING compare via ucomisd (N3). Jump-to-target when
@@ -4304,7 +4347,7 @@ struct RefScratch {
     uint8_t sc;
     bool spilled;
     RefScratch(Emitter &em, uint8_t r)
-        : e(em), sc(r), spilled(em.reg_holds_pin(r))
+        : e(em), sc(r), spilled(em.reg_is_occupied(r))
     {
         if (spilled)
             e.push_reg(sc);       /* it holds a pin - borrow and restore */
@@ -15480,7 +15523,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
      */
     bool tmp_spilled = false;
     const auto tmp_hold = [&]() {
-        tmp_spilled = e.reg_holds_pin(tmp);
+        tmp_spilled = e.reg_is_occupied(tmp);
         if (tmp_spilled)
             e.push_reg(tmp);
         else
