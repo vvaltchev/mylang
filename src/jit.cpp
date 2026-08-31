@@ -5158,8 +5158,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     e.pop_reg(RAX);                                   /* desc (done) */
     e.pop_reg(R11);                                   /* fo */
     /* lea rax, [r11 + fo_caps] */
-    e.u8(0x49); e.u8(0x8D); e.u8(0x83);
-    e.u32(static_cast<uint32_t>(P.fo_capture_slots));
+    e.lea_base(RAX, R11, static_cast<int32_t>(P.fo_capture_slots));
     st(R9R, static_cast<int32_t>(L.ctx_captures), RAX);
     /* rdi = the callee window; rdx = the fragment entry */
     e.mov_rr(RDI, RDX);
@@ -5591,8 +5590,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
          * record-less callee's arm could only set slots from [rbp-8];
          * either way OUR window is rbx, so the store is idempotent for
          * the record path and load-bearing for the record-less one. */
-        e.u8(0x48); e.u8(0x89); e.u8(0x99);        /* mov [rcx+d], rbx */
-        e.u32(static_cast<uint32_t>(JP.act_vframe + JP.frame_slots));
+        e.store_base(RBX, RCX,
+                     static_cast<int32_t>(JP.act_vframe + JP.frame_slots));
         if (g_cur_caller_desc) {
             e.u8(0xC7); e.u8(0x81);                /* mov dword [rcx+d], */
             e.u32(static_cast<uint32_t>(JP.act_vframe + JP.frame_size));
@@ -5601,10 +5600,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             /* MAIN: read nslots from its own boundary record - after
              * the callee popped, top_rec IS main's record, and it
              * persists in every step of the tier's future */
-            e.u8(0x48); e.u8(0x8B); e.u8(0x91);    /* mov rdx, [rcx+d] */
-            e.u32(static_cast<uint32_t>(JP.act_top_rec));
-            e.u8(0x8B); e.u8(0x92);                /* mov edx, [rdx+d] */
-            e.u32(static_cast<uint32_t>(JP.rec_nslots));
+            /* mov rdx, [rcx+d] */
+            e.load_base(RDX, RCX, static_cast<int32_t>(JP.act_top_rec));
+            /* mov edx, [rdx+d] */
+            e.load32_base(RDX, RDX, static_cast<int32_t>(JP.rec_nslots));
             e.u8(0x89); e.u8(0x91);                /* mov [rcx+d], edx */
             e.u32(static_cast<uint32_t>(JP.act_vframe + JP.frame_size));
         }
@@ -12688,8 +12687,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         else
                             e.load(RAX, s.payload);
                         /* mov [r9 + off], rax */
-                        e.u8(0x49); e.u8(0x89); e.u8(0x81);
-                        e.u32(static_cast<uint32_t>(pf.off));
+                        e.store_base(RAX, R9, static_cast<int32_t>(pf.off));
                         break;
                     }
                     case 1:               /* float (int/bool promote, r8) */
@@ -12723,8 +12721,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 const SlotAddr d = slot_addr(in.target);
                 e.load(RAX, d.payload);        /* rax = StructObject* */
                 /* r9 = bytes data (vector _M_start at +0, probed) */
-                e.u8(0x4C); e.u8(0x8B); e.u8(0x88);
-                e.u32(static_cast<uint32_t>(L.sobj_bytes));
+                e.load_base(R9, RAX, static_cast<int32_t>(L.sobj_bytes));
                 emit_ctor_fields();
                 return true;
             }
@@ -12755,8 +12752,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.inc_qword_base(RCX);   /* inc qword [rcx] */
 #endif
                 /* r9 = bytes data (vector _M_start at +0, probed) */
-                e.u8(0x4C); e.u8(0x8B); e.u8(0x88);
-                e.u32(static_cast<uint32_t>(L.sobj_bytes));
+                e.load_base(R9, RAX, static_cast<int32_t>(L.sobj_bytes));
                 emit_ctor_fields();
                 j_done = e.j32(0xEB);
                 e.patch32_here(js1);
@@ -13046,16 +13042,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.bump_op(OpCode::PushHandler);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] (act) */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
-        e.u32(static_cast<uint32_t>(L.act_handlers + 8));    /* finish */
-        e.u8(0x48); e.u8(0x3B); e.u8(0x88);        /* cmp rcx, [rax+h+16] */
-        e.u32(static_cast<uint32_t>(L.act_handlers + 16));   /* end cap */
+        /* finish */
+        e.load_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        /* end cap */
+        e.cmp_reg_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 16));
         const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
         e.u8(0xC7); e.u8(0x01);                    /* mov dword [rcx], rg */
         e.u32(region);
         e.op_reg_imm(Op::plus, RCX, 4);
-        e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
-        e.u32(static_cast<uint32_t>(L.act_handlers + 8));
+        /* mov [rax+h+8], rcx */
+        e.store_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_grow);
         emit_call_prologue(e);
@@ -13079,11 +13075,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.bump_op(OpCode::PopHandler);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
-        e.u32(static_cast<uint32_t>(L.act_handlers + 8));
+        /* mov rcx, [rax+h+8] */
+        e.load_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
         e.op_reg_imm(Op::minus, RCX, 4);
-        e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
-        e.u32(static_cast<uint32_t>(L.act_handlers + 8));
+        /* mov [rax+h+8], rcx */
+        e.store_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
         return true;
     }
 
@@ -13096,18 +13092,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.bump_op(OpCode::SetPend);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+toprec] */
-        e.u32(static_cast<uint32_t>(L.act_top_rec));   /* = &back_rec */
-        e.u8(0x8B); e.u8(0x91);                    /* mov edx, [rcx+pbase] */
-        e.u32(static_cast<uint32_t>(L.rec_pend_base));
+        /* = &back_rec */
+        e.load_base(RCX, RAX, static_cast<int32_t>(L.act_top_rec));
+        /* mov edx, [rcx+pbase] */
+        e.load32_base(RDX, RCX, static_cast<int32_t>(L.rec_pend_base));
         if (in.a_lit()) {
             e.u8(0x81); e.u8(0xC2);                /* add edx, region */
             e.u32(static_cast<uint32_t>(in.a_lit()));
         }
         ML_CHECK(L.pend_state_size == 16);
         e.u8(0x48); e.u8(0xC1); e.u8(0xE2); e.u8(4);   /* shl rdx, 4 */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x80);        /* mov rax, [rax+pends] */
-        e.u32(static_cast<uint32_t>(L.act_pends)); /* _M_start */
+        /* _M_start */
+        e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
         e.add_rr(RAX, RDX);
         e.u8(0xC6); e.u8(0x80);                    /* mov byte [rax+off], v */
         e.u32(static_cast<uint32_t>(L.pend_state_pend));
@@ -13128,18 +13124,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.bump_op(OpCode::EndFinally);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+toprec] */
-        e.u32(static_cast<uint32_t>(L.act_top_rec));   /* = &back_rec */
-        e.u8(0x8B); e.u8(0x91);                    /* mov edx, [rcx+pbase] */
-        e.u32(static_cast<uint32_t>(L.rec_pend_base));
+        /* = &back_rec */
+        e.load_base(RCX, RAX, static_cast<int32_t>(L.act_top_rec));
+        /* mov edx, [rcx+pbase] */
+        e.load32_base(RDX, RCX, static_cast<int32_t>(L.rec_pend_base));
         if (in.a_lit()) {
             e.u8(0x81); e.u8(0xC2);                /* add edx, region */
             e.u32(static_cast<uint32_t>(in.a_lit()));
         }
         ML_CHECK(L.pend_state_size == 16);
         e.u8(0x48); e.u8(0xC1); e.u8(0xE2); e.u8(4);   /* shl rdx, 4 */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x80);        /* mov rax, [rax+pends] */
-        e.u32(static_cast<uint32_t>(L.act_pends));
+        /* mov rax, [rax+pends] */
+        e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
         e.add_rr(RAX, RDX);
         e.u8(0x80); e.u8(0xB8);                    /* cmp byte [rax+off], 0 */
         e.u32(static_cast<uint32_t>(L.pend_state_pend));
@@ -14054,8 +14050,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (!is_cap) {
             /* defined[gslot] = 1: rcx = defined.data() (the table is still
              * in rdx), then the byte store. */
-            e.u8(0x48); e.u8(0x8B); e.u8(0x8A);    /* mov rcx,[rdx+defined] */
-            e.u32(static_cast<uint32_t>(jit_layout().gft_defined));
+            e.load_base(RCX, RDX,
+                        static_cast<int32_t>(jit_layout().gft_defined));
             e.u8(0xC6); e.u8(0x81);                /* mov byte [rcx+d], 1 */
             e.u32(static_cast<uint32_t>(in.target));
             e.u8(0x01);
@@ -14205,13 +14201,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * one so the two can never drift. */
         const auto emit_field_read = [&]() {
             /* rax = bytes data (vector _M_start at +0, probed) */
-            e.u8(0x48); e.u8(0x8B); e.u8(0x80);
-            e.u32(static_cast<uint32_t>(L.sobj_bytes));
+            e.load_base(RAX, RAX, static_cast<int32_t>(L.sobj_bytes));
             switch (form) {
             case 0:                                   /* int field */
                 /* mov rax, [rax + moff] */
-                e.u8(0x48); e.u8(0x8B); e.u8(0x80);
-                e.u32(static_cast<uint32_t>(moff));
+                e.load_base(RAX, RAX, static_cast<int32_t>(moff));
                 store_dst(e, ck, RAX, in.target, pc);
                 break;
             case 1:                                   /* float field */
@@ -14231,8 +14225,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 break;
             default:                       /* int field read as float */
                 /* mov rax, [rax + moff] */
-                e.u8(0x48); e.u8(0x8B); e.u8(0x80);
-                e.u32(static_cast<uint32_t>(moff));
+                e.load_base(RAX, RAX, static_cast<int32_t>(moff));
                 /* cvtsi2sd xmm0, rax */
                 e.u8(0xF2); e.u8(0x48); e.u8(0x0F); e.u8(0x2A); e.u8(0xC0);
                 emit_float_store(e, ck, X0, in.target, pc);
@@ -14425,12 +14418,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.mov_rr(RDI, RAX);                 /* rdi = callee window slots */
         /* fragment entry = callee->vm_chunk->native.base + native_entry_off: */
         e.movabs(RAX, reinterpret_cast<uint64_t>(callee));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x80); /* mov rax, [rax + desc.vm_chunk] */
-        e.u32(static_cast<uint32_t>(L.desc_vm_chunk));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x88); /* mov rcx, [rax + chunk.native.base]*/
-        e.u32(static_cast<uint32_t>(L.chunk_native_base));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x90); /* mov rdx, [rax + native_entry_off]*/
-        e.u32(static_cast<uint32_t>(L.chunk_native_entry));
+        /* mov rax, [rax + desc.vm_chunk] */
+        e.load_base(RAX, RAX, static_cast<int32_t>(L.desc_vm_chunk));
+        /* mov rcx, [rax + chunk.native.base]*/
+        e.load_base(RCX, RAX, static_cast<int32_t>(L.chunk_native_base));
+        /* mov rdx, [rax + native_entry_off]*/
+        e.load_base(RDX, RAX, static_cast<int32_t>(L.chunk_native_entry));
         e.add_rr(RCX, RDX);
         e.u8(0xFF); e.u8(0xD1);             /* call rcx (the callee fragment) */
         /* G1 step 2: a leaf call is the OTHER fragment-to-fragment call
