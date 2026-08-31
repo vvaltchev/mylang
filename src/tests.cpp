@@ -28977,8 +28977,9 @@ static bool jit_peephole_check()
      * for coverage tests + the cache lever family), which forces every
      * compare through cmp_operand's accumulator arm. Outputs must
      * still match the tree-walker's in all three configs. */
-    const bool lsra_save = g_jit_lsra;
-    g_jit_lsra = false;
+    /* #103: it used to ALSO force `g_jit_lsra = false`.  The LEVER
+     * family below is what this needs; the allocator choice is not,
+     * and forcing it ran the check against a path no user takes. */
     const unsigned pins_off = jit_lever_bit("cache")
         | jit_lever_bit("fcache") | jit_lever_bit("xcache")
         | jit_lever_bit("scache");
@@ -28986,7 +28987,6 @@ static bool jit_peephole_check()
     const std::string on_np = go(src, pins_off, nullptr, &fo_np, false);
     const std::string off_np = go(src, pins_off | jit_lever_bit("peep"),
                                   nullptr, &fo_np_off, false);
-    g_jit_lsra = lsra_save;
     if (on_np != want || off_np != want) {
         cout << "  peep: no-pin outputs diverge - tw '" << want
              << "' on '" << on_np << "' off '" << off_np << "'\n";
@@ -29409,12 +29409,11 @@ static bool jit_spill_homes()
 #if ML_JIT_SUPPORTED
     /* D3.b: pins the DEFAULT allocator's mechanism - see the note at
      * jit_xcache_pins. */
-    const bool lsra_saved = g_jit_lsra;
-    g_jit_lsra = false;
-    struct LsraRestore {
-        bool v;
-        ~LsraRestore() { g_jit_lsra = v; }
-    } lsra_restore{ lsra_saved };
+    /* #103: the DEFAULT-allocator forcing is GONE - the spill-home
+     * tier is reached by the SHIPPING allocator too (the linear
+     * scan carries its overflow in `lsra_homes`, feeding the same
+     * `scache`), so this now covers what ships.  The s0 guard
+     * below fails loudly the day that stops being true. */
     if (!g_jit_enabled)
         return true;
     const unsigned long s0 = g_jit_scache;
@@ -31693,18 +31692,16 @@ static bool jit_hoist_c1()
         return true;
     /* #103: this test pins the PICK's placements - the DISPLACEMENT
      * case especially, whose trade is FORBIDDEN under tmode (the
-     * entry-occupant zip) - so it forces the default allocator for
-     * its duration, the documented convention
-     * (jit_hoist_pair_conflict next door already does). Found by the
+     * entry-occupant zip). It used to force the default allocator for
+     * its duration; #123 made the C2b pair ask the allocator FIRST
+     * rather than predict its registers positionally, so the shape is
+     * no longer starved and the forcing is gone. Found by the
      * off-arena lane the day the second chance widened tmode's
      * residency: the shrunken pool left the pair no leftovers and
      * the second-base preheader never ran. */
-    const bool lsra_saved = g_jit_lsra;
-    g_jit_lsra = false;
-    struct Restore {
-        bool v;
-        ~Restore() { g_jit_lsra = v; }
-    } lsra_restore{ lsra_saved };
+    /* #103: the forcing is GONE - #123 made the C2b pair ask the
+     * allocator rather than predict its registers, so tmode no
+     * longer starves this shape. */
 
     auto go = [&](const std::vector<const char *> &src, bool vm,
                   unsigned long *hoist,
@@ -32231,12 +32228,15 @@ static bool jit_hoist_pair_conflict()
      * the crafted shape of the exact pressure it constructs. Force the
      * default for the test's duration (save/restore - the env-leak
      * trap). */
-    const bool lsra_saved = g_jit_lsra;
-    g_jit_lsra = false;
-    struct LsraRestore {
-        bool v;
-        ~LsraRestore() { g_jit_lsra = v; }
-    } lsra_restore{ lsra_saved };
+    /* ⛔ #103: THE FORCING IS GONE, AND #123 IS WHY.  It used to
+     * force the default allocator because "the lsra lever chooses
+     * a different pin set by design, which starves the crafted
+     * shape of the exact pressure it constructs" - true while the
+     * C2b pair PREDICTED its two registers positionally out of
+     * CACHE_REGS and the pins raced it for them.  #123 made the
+     * pair ASK the allocator FIRST, so a different pin set can no
+     * longer starve it and the shape reaches the conflict under
+     * the SHIPPING allocator.  Verified lever-unforced. */
     const std::vector<const char *> src = {
         "var a = array(64);",
         "for (var i = 0; i < 64; i++) a[i] = i;",
