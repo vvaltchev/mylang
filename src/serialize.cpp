@@ -2053,6 +2053,32 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
     read_chunk(r, prog.root);
     for (uint32_t i = 0; i < n; i++) {
         if (!has_chunk[i]) {
+            /*
+             * #122 TIER 1: a chunk-less descriptor is legal for EXACTLY one
+             * reason - a DEAD BASE TEMPLATE, which codegen_func_body skips
+             * because every call to it was redirected to an instance (that
+             * is the ONLY compiled-set exclusion; see its comment). So
+             * `no chunk` implies `is_template_base`, and both are stored
+             * bits sitting next to each other in the descriptor record.
+             *
+             * Flip the has-chunk bit on an ordinary function and the loader
+             * used to accept it happily: the descriptor then has NO chunk
+             * and - after the -vm AST teardown - no `decl` either, so the
+             * first call to it walked do_func_call's tree-walker arm into a
+             * null dereference. A debug build caught it on the ML_CHECK
+             * there; an ASSERTS=0 release, where that check is compiled
+             * away, SEGFAULTED. Found by tests/myv_fuzz.py, and it is
+             * precisely the failure #137's hardening exists to make
+             * impossible: a corrupt image must be REFUSED, never obeyed.
+             *
+             * Statically decidable from the image alone, so it belongs
+             * here at zero runtime cost rather than in the provenance
+             * tier - which still guards the residue a two-bit mutation
+             * could reach (both flags flipped together), in do_func_call.
+             */
+            if (!prog.funcs[i]->is_template_base)
+                bad_image("corrupt .myv (a callable descriptor has no "
+                          "chunk)");
             prog.funcs[i]->vm_chunk_tried = true;   /* a dead template base */
             continue;
         }

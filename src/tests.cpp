@@ -23563,6 +23563,188 @@ static bool myv_corrupt_refused()
 }
 
 /*
+ * #122: A CALLABLE DESCRIPTOR WITH NO CHUNK - both tiers, one shape.
+ *
+ * A FuncDescriptor may legitimately have no chunk: a DEAD BASE TEMPLATE is
+ * the ONLY compiled-set exclusion (codegen_func_body skips it because every
+ * call was redirected to an instance). The image stores that as two adjacent
+ * bits - `is_template_base` and a has-chunk flag - and clearing the second
+ * one alone produced a descriptor with no chunk and, after the -vm AST
+ * teardown, no `decl` either. The first call to it walked do_func_call's
+ * tree-walker arm into a NULL DEREFERENCE: a named abort in a debug build,
+ * and a SIGSEGV in the ASSERTS=0 release where that ML_CHECK is compiled
+ * away - the exact failure #137's hardening exists to prevent. Found by
+ * tests/myv_fuzz.py.
+ *
+ * BOTH HALVES ARE ASSERTED, because neither tier is sufficient alone:
+ *
+ *  - TIER 1 (serialize.cpp) refuses `no chunk && !is_template_base` at LOAD,
+ *    which is where a statically decidable property belongs - zero runtime
+ *    cost, and a diagnostic that names the file rather than the call;
+ *  - TIER 2 (eval.cpp, ML_UNTRUSTED_CHECK) is the residue: a mutation that
+ *    clears BOTH bits is self-consistent, so tier 1 accepts it and only a
+ *    runtime check standing in front of the dereference can catch it. It is
+ *    NOT gated on ASSERTS, which is the whole point of the provenance tier.
+ *
+ * THE CORRUPTION IS APPLIED THROUGH THE OBJECT MODEL, not to a file byte:
+ * half 1 nulls `vm_chunk` before myv_write (so the writer emits exactly the
+ * inconsistent pair), half 2 nulls it on the LOADED program. Neither depends
+ * on the byte encoding, so neither can rot into a vacuous test when the
+ * format changes - the same reasoning as myv_untrusted_field_index below.
+ */
+static bool myv_chunkless_callee()
+{
+    const char *lines_arr[] = {
+        /* Over the block-inline weight gate (two assigns + a return), so
+         * the call survives to a real chunked callee instead of being
+         * spliced into main - the vacuous-test trap. */
+        "func f(int a) { var t = a * 3; var u = t + 1; return u; }",
+        "var s = 0;",
+        "for (var i = 0; i < 4; i++) { var r = f(i); s = s + r; }",
+        "print(s);" };
+
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-chunkless.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    g_exec_engine = ExecEngine::Vm;
+    /* myv_read runs the load-time JIT, which would compile the call site
+     * against the chunk that is still there; the checked arm is on the
+     * interpreted path, which is where this tier lives. */
+    g_jit_enabled = false;
+    bool ok = false;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+
+        int idx = -1;
+        for (size_t i = 0; i < prog.funcs.size(); i++)
+            if (prog.funcs[i]->vm_chunk && !prog.funcs[i]->is_template_base) {
+                idx = static_cast<int>(i);
+                break;
+            }
+        if (idx < 0) {
+            fprintf(stderr, "myv-chunkless: no chunked descriptor - the "
+                            "shape changed\n");
+            g_exec_engine = saved; g_jit_enabled = saved_jit;
+            return false;
+        }
+
+        /* ---- HALF 1: TIER 1 must REFUSE the inconsistent pair at LOAD.
+         * `vm_chunk` only POINTS at the chunk (g_func_chunks owns it), so
+         * nulling it round the write leaks nothing. */
+        const void *saved_ck = prog.funcs[idx]->vm_chunk;
+        prog.funcs[idx]->vm_chunk = nullptr;
+        myv_write(prog, path, MyvSourceRef());
+        prog.funcs[idx]->vm_chunk = saved_ck;
+
+        bool refused = false;
+        try {
+            MyvSource s1;
+            VmProgram bad = myv_read(path, s1);
+            (void)bad;
+        } catch (Exception &) {
+            refused = true;
+        }
+        if (!refused) {
+            fprintf(stderr, "myv-chunkless: TIER 1 ACCEPTED a callable "
+                            "descriptor with no chunk\n");
+            g_exec_engine = saved; g_jit_enabled = saved_jit;
+            remove(path.c_str());
+            return false;
+        }
+
+        /* ---- the INTACT image must load AND print the right answer, or
+         * half 2 below would prove nothing: f(0..3) = 1+4+7+10 = 22. */
+        myv_write(prog, path, MyvSourceRef());
+        {
+            MyvSource s2;
+            VmProgram good = myv_read(path, s2);
+            std::ostringstream cap;
+            std::streambuf *ob = std::cout.rdbuf(cap.rdbuf());
+            vm_run(good);
+            std::cout.rdbuf(ob);
+            if (cap.str().find("22") == std::string::npos) {
+                fprintf(stderr, "myv-chunkless: the intact image printed "
+                                "\"%s\", wanted 22 - the call is not "
+                                "reaching the chunk\n", cap.str().c_str());
+                g_exec_engine = saved; g_jit_enabled = saved_jit;
+                remove(path.c_str());
+                return false;
+            }
+        }
+
+        /* ---- HALF 2: TIER 2. A self-consistent image tier 1 cannot
+         * refuse, corrupted after the load: the call must raise a CLEAN,
+         * located exception rather than dereference a null `decl`. */
+        MyvSource s3;
+        VmProgram loaded = myv_read(path, s3);
+        int lidx = -1;
+        for (size_t i = 0; i < loaded.funcs.size(); i++)
+            if (loaded.funcs[i]->vm_chunk
+                    && !loaded.funcs[i]->is_template_base) {
+                lidx = static_cast<int>(i);
+                break;
+            }
+        if (lidx < 0) {
+            fprintf(stderr, "myv-chunkless: the loaded image has no chunked "
+                            "descriptor\n");
+            g_exec_engine = saved; g_jit_enabled = saved_jit;
+            remove(path.c_str());
+            return false;
+        }
+        loaded.funcs[lidx]->vm_chunk = nullptr;
+
+        bool threw = false;
+        {
+            std::ostringstream cap;
+            std::streambuf *ob = std::cout.rdbuf(cap.rdbuf());
+            try {
+                vm_run(loaded);
+            } catch (Exception &) {
+                threw = true;
+            }
+            std::cout.rdbuf(ob);
+        }
+        if (!threw) {
+            fprintf(stderr, "myv-chunkless: TIER 2 did not fire - the call "
+                            "to a chunk-less function did not raise\n");
+            g_exec_engine = saved; g_jit_enabled = saved_jit;
+            remove(path.c_str());
+            return false;
+        }
+        ok = true;
+    } catch (Exception &e) {
+        fprintf(stderr, "myv-chunkless: setup threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+    }
+    remove(path.c_str());
+    g_exec_engine = saved;
+    g_jit_enabled = saved_jit;
+    return ok;
+}
+
+/*
  * #137 TIER 2: the PROVENANCE-gated runtime checks (ML_UNTRUSTED_CHECK).
  *
  * The shape here is the whole justification for the tier existing, so it is
@@ -38939,6 +39121,9 @@ static const std::vector<extra_check> extra_checks =
       myv_round_trip },
     { "myv: a mangled image is REFUSED, never obeyed (#137)",
       myv_corrupt_refused },
+    { "myv: a callable descriptor with no chunk is refused, then guarded "
+      "(#122)",
+      myv_chunkless_callee },
     { "myv: an UNTRUSTED image's out-of-range field index is caught (#137)",
       myv_untrusted_field_index },
     { "myv: a WRONG-TYPED base does not take the process down (#142)",

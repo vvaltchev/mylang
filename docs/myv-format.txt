@@ -393,6 +393,31 @@ follow in exactly this order, skipping descriptors whose flag is false.  A
 false flag makes the loader mark the descriptor `vm_chunk_tried`, so nothing
 tries to compile it later.
 
+    VALIDATION (v14 rule, #122) - `has_chunk == false` REQUIRES
+    `is_template_base == true`, and the loader REFUSES the image otherwise
+    ("corrupt .myv (a callable descriptor has no chunk)").
+
+    A dead base template is the ONLY reason a descriptor may lack a chunk:
+    every call to it was redirected to a monomorphized instance, so codegen
+    skips it deliberately (the only compiled-set exclusion).  Every other
+    function is compiled UPFRONT - the format stores no lazily-compiled
+    bodies - so a chunk-less non-template descriptor cannot be produced by
+    any writer.
+
+    The rule is not cosmetic: after the AST teardown a descriptor carries no
+    body either, so a call to one that also lacks a chunk has nothing to
+    execute.  Clearing this one bit on an ordinary function used to yield an
+    image that loaded happily and then dereferenced a null body pointer at
+    the first call - a named abort in an asserts build, a SIGSEGV in a
+    release.  Both bits together are self-consistent and pass this check; a
+    provenance-gated runtime check (ML_UNTRUSTED_CHECK in do_func_call)
+    covers that residue, since "is this descriptor ever CALLED" is not
+    decidable from the image.
+
+    NOTE this is a READER rule only.  It constrains no byte and adds no
+    field, so a v14 image written before the rule existed still loads
+    unchanged: every writer has always emitted the consistent pair.
+
 Like structs, descriptors are constructed first and filled second, because a
 chunk's `closure_defs` may reference any of them.
 

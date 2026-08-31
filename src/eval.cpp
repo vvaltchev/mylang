@@ -815,7 +815,21 @@ do_func_call(EvalContext *ctx,
         } else {
             /* Tree-walk the body. After the -vm AST teardown every callable
              * function has a chunk and decl is null - reaching here without
-             * one is a compiler bug, not a fallback. */
+             * one is a compiler bug, not a fallback.
+             *
+             * #122 TIER 2: unless the bytecode came off a DISK, where it is
+             * not a compiler bug but hostile input - a descriptor whose
+             * has-chunk bit was cleared. The loader refuses that shape
+             * (serialize.cpp, tier 1) whenever the is-template-base bit
+             * still disagrees with it; a mutation that clears BOTH is
+             * self-consistent and reaches here, so this is the residue.
+             * It must NOT be the ML_CHECK below and nothing else: that one
+             * is gated on ASSERTS, and the build with the most to lose - an
+             * optimized release running a shipped image - is exactly the
+             * build that compiles it out and dereferences the null. */
+            ML_UNTRUSTED_CHECK(obj.func->decl,
+                               "a called function has neither a chunk nor a "
+                               "body");
             ML_CHECK_MSG(obj.func->decl,
                          "call to a chunk-less function after AST teardown");
             obj.func->decl->body->eval(&args_ctx);
