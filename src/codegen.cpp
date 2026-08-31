@@ -2859,6 +2859,23 @@ struct Codegen {
         cv.target2 = dc->direct_func_slot;
         cv.set_a(int_lit(argbase));
         cv.set_b(int_lit(static_cast<int>(dc->args->elems.size())));
+        /*
+         * #120: annotate_hints stamped `th` on this CallExpr from
+         * `type_of(call)` - which IS the callee's return type - and only
+         * for a settled, concrete, non-opt scalar. Carry that proof to
+         * compute_ref_slots, which otherwise must assume a call returns
+         * a reference. Set AFTER set_a/set_b: they mask only their own
+         * operand bits (0x07 / 0x38) and leave 0x80 alone, but the order
+         * says so without the reader having to check.
+         *
+         * SIBLING, NOT DONE: `CallBuiltinV` (built a few hundred lines
+         * below with an otherwise identical operand setup) has the same
+         * question and the same answer available - `len(a)` is an int by
+         * construction. Left alone here because a builtin's dst is
+         * usually consumed immediately and the reach is unmeasured.
+         */
+        if (dc->th == TypeHint::i || dc->th == TypeHint::f)
+            cv.set_ret_scalar();
         ops.push_back(cv);
         out_slot = dst;
         return true;
@@ -9500,6 +9517,45 @@ static void compute_ref_slots(const std::vector<CgInstr> &code,
                  * the return path's release scan.
                  */
                 if (in.op == OpCode::LoadCaptureV && in.cap_scalar())
+                    return;
+                /*
+                 * #120: a CALL whose RETURN TYPE the inferencer proved
+                 * is a non-opt int/float/bool. The FOURTH instance of
+                 * the rule above, and the one the others make obvious:
+                 * `op_writes_scalar` cannot list CallV - a call returns
+                 * whatever the callee returns - but WHICH callee, and
+                 * what it returns, is a compile-time fact sitting on
+                 * the CallExpr as `th`, stamped by annotate_hints for
+                 * every node whose static type is a settled non-opt
+                 * scalar (`type_of(call)` IS the return type).
+                 *
+                 * ⛔ IT IS AN OPFLAG, AND THE FIRST TRY WAS WRONG.
+                 * Reading `th` off the AST here looks obvious -
+                 * `CgInstr` carries `node_idx` - and it silently does
+                 * NOTHING: by the time this pass runs, extract_locs has
+                 * already consumed and NULLED every handle (which is
+                 * what `verify_ast_free` then asserts). The probe read
+                 * `node_idx=-1` on every call. So the proof is stamped
+                 * at EMIT time, where the node is still live, exactly
+                 * as `cap_scalar` does.
+                 *
+                 * ⛔ WHY REASSIGNMENT CANNOT BREAK IT. `CallV`'s
+                 * callee is a GLOBAL SLOT read at RUNTIME, so the
+                 * obvious worry is `f = something_else`. Three layers
+                 * answer it: a signature-CHANGING assignment is
+                 * REFUSED at compile time by the function-subtyping
+                 * rule (`func(int)->str` into a `func(int)->int` name
+                 * is a TypeMismatchEx); a signature-PRESERVING one
+                 * leaves the return type identical by construction;
+                 * and `th` is stamped only where the type is settled,
+                 * concrete and non-opt, so a `dyn` callee - the case
+                 * subtyping DEFERS on - is never claimed here. A
+                 * reassignment to a NON-function throws NotCallableEx
+                 * and never writes the dst.
+                 */
+                if ((in.op == OpCode::CallV
+                         || in.op == OpCode::CachedCallV)
+                        && in.ret_scalar())
                     return;
                 if (in.op == OpCode::LoadConstV) {
                     const size_t ci = static_cast<size_t>(in.target2);

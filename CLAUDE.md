@@ -744,6 +744,18 @@ the FLUSHING epilogue, and that epilogue writes the whole RESTORED cache:
 pre-call register values over the slots the helper had just written,
 which is the exact clobber the clear exists to prevent.
 
+**⛔ AND WHEN THE FAMILY IS AN OPFLAGS BIT, ENFORCE IT IN THE ACCESSOR
+(#120, 2026-08-29).** `Instr::opflags` is a `uint8_t` with all eight
+bits spoken for, so a new per-instruction fact SHARES a bit with an
+unrelated opcode family — `cap_scalar` shares 0x40 with
+`elem_bool_hint`, and `ret_scalar` now shares 0x80 with
+`struct_checked`. The safety argument is always "these two opcode
+families do not overlap", which is a boolean over a family and so is a
+table in different clothes; its failure mode here is a LEAKED
+REFERENCE. State it as an `ML_CHECK` on the opcode INSIDE the accessor,
+not as a comment above it — then asking the wrong family aborts by name
+instead of returning a plausible answer.
+
 **A boolean chain and a run of `.clear()` calls are the same enumeration
 in different clothes.** When you add a member to a family, grep for every
 site that mentions ALL the existing members together. FIXED
@@ -1662,6 +1674,15 @@ cache on.** Two reasons, both measured:
   (now marked INVALID in `plans/cpp-gap-ladder.md`). **Only
   startup-correct a bench whose work actually SCALES** — and check that it
   does, rather than assuming.
+- **⛔ AN AD-HOC CALLGRIND SCRIPT IS NOT EXEMPT FROM `-npc` (2026-08-29).**
+  The rule above is written about `bench/run.py`, which passes the flag by
+  DEFAULT — so it reads as a property of the harness, and a one-off
+  `valgrind --tool=callgrind ./mylang bench/my/X.my` quietly loses it. That
+  happened while measuring #120: 09_fib's scale-3-minus-scale-1 delta came
+  out **2,375 instructions instead of 136 million** (a "-0.50%" that was
+  really a few thousand cache lookups), and the wrong number was reported
+  before the sanity check caught it. **Whatever runs the binary, pass
+  `-npc`** — the flag belongs to the MEASUREMENT, not to the harness.
 
 **BENCHMARK-RUN DISCIPLINE — 1-vs-1 BY DEFAULT, the maintainer controls the
 deep runs (maintainer-set, 2026-07-19).** Do NOT run the bench suite over and
