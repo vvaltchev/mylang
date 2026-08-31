@@ -53,11 +53,58 @@
 # error (including a failed self-test).
 
 if [ $# -lt 2 ]; then
-    echo "usage: $0 OLD_BINARY NEW_BINARY [-v]" >&2
-    echo "  -v   also print each differing program's diff" >&2
+    echo "usage: $0 OLD_BINARY NEW_BINARY [-v] [--same-shape]" >&2
+    echo "  -v            also print each differing program's diff" >&2
+    echo "  --same-shape  compare the INSTRUCTION STREAM, allowing" >&2
+    echo "                encoding LENGTHS to differ; reports the" >&2
+    echo "                byte delta (see the note below)" >&2
     exit 2
 fi
-A="$1"; B="$2"; VERBOSE="$3"
+A="$1"; B="$2"; shift 2
+VERBOSE=""; SHAPE=""
+for arg in "$@"; do
+    case "$arg" in
+    -v)           VERBOSE="-v" ;;
+    --same-shape) SHAPE="1" ;;
+    *) echo "error: unknown option '$arg'" >&2; exit 2 ;;
+    esac
+done
+
+#
+# --same-shape: THE WEAKER ORACLE, FOR A CHANGE THAT ALTERS INSTRUCTION
+# LENGTH BUT NOT MEANING (2026-08-19).
+#
+# The default `cmp` is the strong claim - "my change cannot have
+# altered what the machine does" - and it is the one to reach for. But
+# some changes legitimately alter LENGTH: converting a hand-encoded
+# `mov rcx, [rax+disp32]` to the load_base encoder gets the disp8 form
+# for a small offset, and every later jump displacement shifts with it.
+# Byte identity then reports every such program as differing and says
+# nothing about whether the INSTRUCTIONS are the same.
+#
+# This mode normalises exactly two things and nothing else:
+#   - the `+ NN:` instruction-offset column, and
+#   - a relative branch target that is the WHOLE operand (`je +107`).
+# Registers, memory displacements, immediates, tags and helper names
+# are all still compared, so a wrong register or a wrong offset still
+# fails. It also reports the total byte delta, which is the point of
+# making the change at all.
+#
+# ⛔ IT IS STRICTLY WEAKER, so say which mode a result came from. A
+# change that reorders two independent instructions passes `cmp` never
+# and passes this never either (the stream differs); a change that
+# swaps a register passes neither. What this mode CANNOT see is a
+# branch that now goes somewhere else - the displacement is exactly
+# what it erases. Pair it with the objdump oracle and the corpus
+# differential, which is what the length-changing batches did.
+#
+shape_norm() {
+    sed -e 's/^\( *\. *\)+ *[0-9][0-9]*:/\1+ N:/' \
+        -e 's/^\(.*[[:space:]]\(jmp\|je\|jne\|jl\|jle\|jg\|jge\|jb\|jbe\|ja\|jae\|js\|jns\|jo\|jno\|jp\|jnp\|loop\) \)[+-][0-9][0-9]*$/\1<rel>/'
+}
+last_off() {
+    sed -n 's/^ *\. *+ *\([0-9][0-9]*\):.*/\1/p' "$1" | tail -1
+}
 
 for bin in "$A" "$B"; do
     if [ ! -x "$bin" ]; then
@@ -88,10 +135,54 @@ if ! cmp -s "$TMP/s1" "$TMP/s2"; then
     exit 2
 fi
 
+#
+# ⛔ THE --same-shape NORMALISER MUST BE PROVED NON-VACUOUS, because a
+# normaliser is exactly the shape that silently erases the difference
+# it was meant to keep (this repo's own history: a sed pipeline that
+# masked so much it reported every program as differing, and one that
+# masked a real mis-decode). A regex one character too greedy turns
+# this mode into "everything matches", which reads as a clean run.
+#
+# So: feed it a pair that differs ONLY in a register, and in the
+# operand position the normaliser touches, and require it to SAY SO.
+#
+if [ -n "$SHAPE" ]; then
+    printf '%s\n' '       .   +  4: mov rcx, [rax+0x8]' \
+                   '       .   + 11: je +107' > "$TMP/nv1"
+    printf '%s\n' '       .   +  7: mov rdx, [rax+0x8]' \
+                   '       .   + 14: je +203' > "$TMP/nv2"
+    shape_norm < "$TMP/nv1" > "$TMP/nv1n"
+    shape_norm < "$TMP/nv2" > "$TMP/nv2n"
+    if cmp -s "$TMP/nv1n" "$TMP/nv2n"; then
+        echo "error: the --same-shape normaliser is VACUOUS - it" >&2
+        echo "       reported 'mov rcx' and 'mov rdx' as the same" >&2
+        echo "       instruction. Every result it prints would be" >&2
+        echo "       meaningless. Fix shape_norm." >&2
+        exit 2
+    fi
+    # ...and the two things it IS meant to erase must actually be
+    # erased, or the mode reports a difference for every program and
+    # is useless in the other direction.
+    printf '%s\n' '       .   +  4: mov rcx, [rax+0x8]' \
+                   '       .   + 11: je +107' > "$TMP/nv3"
+    printf '%s\n' '       .   + 91: mov rcx, [rax+0x8]' \
+                   '       .   + 98: je +203' > "$TMP/nv4"
+    shape_norm < "$TMP/nv3" > "$TMP/nv3n"
+    shape_norm < "$TMP/nv4" > "$TMP/nv4n"
+    if ! cmp -s "$TMP/nv3n" "$TMP/nv4n"; then
+        echo "error: the --same-shape normaliser does not erase the" >&2
+        echo "       offset column and the branch displacement, which" >&2
+        echo "       is its whole job. Fix shape_norm." >&2
+        exit 2
+    fi
+fi
+
 same=0
 diffs=0
 fails=0
 flakes=0
+sum_a=0
+sum_b=0
 # Where a NON-REPRODUCING difference's evidence is kept (see the
 # confirm step below). Not $TMP - that is deleted on exit.
 EVID=${VDJCMP_EVIDENCE:-./vdjcmp-flake}
@@ -133,6 +224,24 @@ for f in bench/my/*.my samples/* tests/functional/*.my; do
         echo "FAIL: $f  (exit $rca/$rcb," \
              "$(wc -c < "$TMP/a")/$(wc -c < "$TMP/b") bytes)"
         head -3 "$TMP/ae" "$TMP/be" 2>/dev/null | sed 's/^/    /'
+        continue
+    fi
+    if [ -n "$SHAPE" ]; then
+        shape_norm < "$TMP/a" > "$TMP/an"
+        shape_norm < "$TMP/b" > "$TMP/bn"
+        oa=$(last_off "$TMP/a"); ob=$(last_off "$TMP/b")
+        if [ -n "$oa" ] && [ -n "$ob" ]; then
+            sum_a=$((sum_a + oa)); sum_b=$((sum_b + ob))
+        fi
+        if cmp -s "$TMP/an" "$TMP/bn"; then
+            same=$((same + 1))
+            continue
+        fi
+        diffs=$((diffs + 1))
+        echo "DIFF: $f  (instruction stream, not just lengths)"
+        if [ "$VERBOSE" = "-v" ]; then
+            diff "$TMP/an" "$TMP/bn" | sed 's/^/    /'
+        fi
         continue
     fi
     if cmp -s "$TMP/a" "$TMP/b"; then
@@ -188,6 +297,10 @@ done
 
 echo "identical: $same   differing: $diffs   failed: $fails" \
      "  flaky: $flakes"
+if [ -n "$SHAPE" ]; then
+    echo "mode: --same-shape (encoding LENGTHS allowed to differ)"
+    echo "emitted bytes: old=$sum_a new=$sum_b  delta=$((sum_b - sum_a))"
+fi
 if [ "$flakes" -ne 0 ]; then
     echo "error: $flakes program(s) differed on one run and not on the" >&2
     echo "       next. THE ORACLE, NOT THE CHANGE, IS AT FAULT for" >&2
