@@ -2499,6 +2499,18 @@ struct Emitter {
         u8(static_cast<uint8_t>(0xC0 | (7 << 3) | (reg & 7)));
         u8(static_cast<uint8_t>(imm));
     }
+    /* sub r32, imm8 (sign-extended) - 83 /5. The range-check partner of
+     * cmp_reg32_imm8: `sub lo; cmp span; jae` is ONE unsigned test for
+     * a closed band, where the naive form needs two compares and two
+     * jumps. */
+    void sub_reg32_imm8(uint8_t reg, int8_t imm)
+    {
+        if (reg >= 8)
+            u8(0x41);
+        u8(0x83);
+        u8(static_cast<uint8_t>(0xC0 | (5 << 3) | (reg & 7)));
+        u8(static_cast<uint8_t>(imm));
+    }
     void cmp_reg32_imm32(uint8_t reg, uint32_t imm)
     {
         if (reg >= 8)
@@ -4336,38 +4348,51 @@ static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
  * RValue(*src), so besides a reference (>= t_str) the PSEUDO types t_lval/
  * t_undefid (1, 2 - collapse/throw) and the rare t_none (0) also take the
  * helper; the inline handles the 3..t_str-1 range (int/builtin/float/bool/
- * structtype). Returns the TWO jump sites to patch to the helper. */
-static std::pair<size_t, size_t>
-emit_store_src_gate(Emitter &e, int32_t type_off, uint8_t sc = RCX)
+ * structtype). Returns the ONE jump site to patch to the helper. */
+static size_t
+emit_store_src_gate(Emitter &e, int32_t type_off, uint8_t scr = RCX)
 {
     /*
-     * ⛔ #96 (c): THE ONE REF-GATE THAT `RefScratch` CANNOT TAKE, and
-     * the reason is worth stating so nobody "completes the set" without
-     * reading it. Its scratch is live across TWO compares with a
-     * CONDITIONAL JUMP BETWEEN THEM (j_lo, to the helper). A borrow
-     * would push before the loads and pop after the second compare -
-     * and the path that takes j_lo jumps over the pop, leaking 8 bytes
-     * of stack on every none/pseudo-typed store. That is not a wrong
-     * answer, it is a corrupted stack, so the spill is refused rather
-     * than fitted.
+     * ⛔ ONE UNSIGNED COMPARE FOR A CLOSED BAND (2026-08-20).
      *
-     * THE FIX IS TO NEED ONLY ONE JUMP: the admitted band is
-     * 3 .. t_str-1, which one UNSIGNED compare tests -
-     * `sub sc, 3; cmp sc, t_str-3; jae helper` - after which the pop
-     * sits before the single jump exactly as it does in RefScratch.
-     * That is fewer instructions as well, so it is an improvement and
-     * not a workaround - but it CHANGES EMITTED CODE, so it wants its
-     * own measurement rather than riding along here.
+     * The admitted types are the contiguous range 3 .. t_str-1 (int,
+     * builtin, float, bool, structtype). This used to test it with two
+     * compares and two jumps - `cmp 3; jb helper; cmp t_str; jae
+     * helper` - where the standard trick does it in one: bias by the
+     * band's low end and compare UNSIGNED, so everything below it wraps
+     * to a huge value and lands above the span, caught by the SAME jump
+     * that catches the references.
+     *
+     *      sub sc32, 3            t_none 0 -> 0xFFFFFFFD  (>= span)
+     *      cmp sc32, t_str-3      t_lval 1 -> 0xFFFFFFFE  (>= span)
+     *      jae -> the helper      t_int  3 -> 0   falls through
+     *                             t_bool 6 -> 3   falls through
+     *                             t_str  7 -> 4   >= span, helper
+     *
+     * TWO INSTRUCTIONS FEWER on every de-helperized global/capture
+     * store - and it is also what lets the gate take `RefScratch`. With
+     * one jump instead of two the pop sits BEFORE it, so no path can
+     * skip the restore; under the old shape a borrow would have leaked
+     * 8 bytes of stack whenever the first jump was taken. That is not a
+     * wrong answer but a corrupted stack, which is why this gate was
+     * the LAST rcx blocker instead of being spilled like its three
+     * siblings.
      */
     const JitLayout &L = jit_layout();
-    e.scratch(sc);
+    RefScratch rs(e, scr);
+    const uint8_t sc = rs.sc;
     e.load(sc, type_off);
     e.load32_base(sc, sc, L.type_t_off);
-    e.cmp_reg32_imm8(sc, 3);                   /* cmp sc32, 3 (t_int) */
-    const size_t j_lo = e.j32(0x72);           /* jb -> helper (none/pseudo) */
-    e.cmp_reg32_imm32(sc, static_cast<uint32_t>(L.t_str_val));
-    const size_t j_hi = e.j32(0x73);           /* jae -> helper (a ref) */
-    return { j_lo, j_hi };
+    e.sub_reg32_imm8(sc, 3);                   /* bias to the band's low end */
+    const int32_t span = static_cast<int32_t>(L.t_str_val) - 3;
+    ML_CHECK_MSG(span > 0, "the store gate's admitted band is empty - the "
+                           "TypeE order changed under it");
+    if (span <= 127)
+        e.cmp_reg32_imm8(sc, static_cast<int8_t>(span));
+    else
+        e.cmp_reg32_imm32(sc, static_cast<uint32_t>(span));
+    rs.release();
+    return e.j32(0x73);                    /* jae -> the helper (out of band) */
 }
 
 /* Walk `r9 = ctx->captures->data()` (cap=true) or, with the GlobalFuncTable
@@ -14909,7 +14934,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             in.target * static_cast<int_type>(sizeof(LValue)));
         const int32_t pv0 = slot_addr(0).payload, ty0 = slot_addr(0).type;
         e.bump_op(in.op);
-        const auto g = emit_store_src_gate(e, src.type);
+        const size_t g = emit_store_src_gate(e, src.type);
         const uint8_t cb = ctx_chain_reg(e);
         if (cb == ELEM_NO_REG)
             return false;      /* no free chain register - decline */
@@ -14931,8 +14956,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.store_byte_base_imm(RCX, static_cast<int32_t>(in.target), 0x01);
         }
         const size_t j_done = e.j32(0xEB);
-        e.patch32_here(g.first);
-        e.patch32_here(g.second);
+        e.patch32_here(g);
         e.patch32_here(j_dref);
         const auto off = [](int slot) {
             return static_cast<int32_t>(static_cast<long>(slot)
