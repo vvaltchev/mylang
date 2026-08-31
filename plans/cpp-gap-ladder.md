@@ -157,6 +157,46 @@ deltas is the loop-only ratio). It reorders the list substantially:
 | 03_int_arith | 1.36x | **1.18x** |
 | 09_fib_recursive | 6.41x | ~~0.09x~~ **INVALID - see below** |
 
+### ⛔ THE RAW my/cpp COLUMN FOR THESE BENCHES IS NOT A MEASUREMENT
+### (2026-08-20, after it produced a false regression report)
+
+A run printed `76_funcval_dispatch 15.26x` and read as a regression from
+the 10.68x above. It was not one. Measured the same day, same machine:
+
+    cur/base vs a pre-session baseline   1.01x   (interleaved A/B)
+    callgrind Ir, HEAD vs baseline       +0.0003%  (1,505 of 511M)
+    LOOP-ONLY my/cpp (scale 30 - 10)     10.41x  (BETTER than the 11.40x)
+
+and the RAW ratio, re-timed at four scales in one sitting:
+
+    scale  1   my 0.0197  cpp 0.0020   10.01x
+    scale  3   my 0.0534  cpp 0.0041   13.02x
+    scale 10   my 0.1751  cpp 0.0178    9.84x
+    scale 30   my 0.5761  cpp 0.0502   11.49x
+
+Same binaries, same minute: **9.84x to 13.02x**. Add the ~10% the
+machine-speed marker was already reporting (the cpp cache was written on
+a faster day, and run.py SAID so) and 15.26x is inside the noise band.
+
+**It is NOT startup.** MyLang's floor is 0.9 ms (`-e 0`), and subtracting
+it moves the scale-1 ratio 10.01x -> 9.53x. The instability is that
+**the DENOMINATOR is 2 ms**, and a 2 ms process time is not a
+measurement.
+
+**⛔ AND `bench/tune_scales.py` IS STRUCTURALLY BLIND TO IT.** The tuner
+raises a scale until *MyLang* settles inside run.py's variance gate - it
+never looks at the comparison side. 76 settles fine at scale 1, so the
+tuner is content, while the RATIO it feeds the table swings 30%. **A
+tuner for a ratio must gate the denominator too**, and it gates only the
+numerator. Same family as an oracle that shares its subject: the
+instrument is measuring one of the two things the answer depends on.
+
+Fixing that belongs to the agreed "lower bench volatility test-by-test"
+work item, which CLAUDE.md marks as done WITH the maintainer - so it is
+recorded here, not hand-patched by editing the tuner's output file.
+**Until it is fixed: quote LOOP-ONLY or `cur/base` for these benches,
+never the raw column.**
+
 03_int_arith is at PARITY once startup is removed - which independently
 confirms the rung-4 finding that its eleven slot references per iteration
 cost nothing.
