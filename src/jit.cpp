@@ -2204,6 +2204,17 @@ struct Emitter {
         u8(0x3B);
         emit_modrm_disp(reg, base, d);
     }
+    /* mov [base], src  - no displacement, the store twin of
+     * load_base0 (store_base always emits a disp32) */
+    void store_base0(uint8_t src, uint8_t base)
+    {
+        ML_CHECK_MSG((base & 7) != 4 && (base & 7) != 5,
+                     "store_base0: rsp/rbp cannot use mod=00");
+        u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 0x04 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x89);
+        u8(static_cast<uint8_t>(((src & 7) << 3) | (base & 7)));
+    }
     /* mov dst, [base]  - no displacement (3 bytes, unlike load_base's
      * unconditional disp32 form) */
     void load_base0(uint8_t dst, uint8_t base)
@@ -2579,9 +2590,6 @@ struct Emitter {
     /* ---- #95, the nested-STORE tier (boxed slot type guards in rdx) ---- */
     /* ---- C1, the hoisted-base navigation (r12-r15 operands) ---- */
     /* mov rH, [rax+disp]  (the vector's start/finish into a hoist reg) */
-    void mov_hr_rcx(uint8_t hr, int32_t d)       /* mov rH, [rcx+d] */
-    { u8(0x4C); u8(0x8B);
-      u8(static_cast<uint8_t>(0x81 | ((hr & 7) << 3))); u32(uint32_t(d)); }
     /* mov rax, [rH + r9*8] / movsd xmm0, [rH + r9*8]. SIB base = r13
      * (101b) with mod 00 means disp32-no-base - that case takes mod 01
      * with a zero disp8 instead. */
@@ -2600,8 +2608,6 @@ struct Emitter {
     void store_rax_slot(int32_t d)
     { u8(0x48); u8(0x89); u8(MODRM_SLOT); u32(uint32_t(d)); }
     /* mov [rbx+disp], rcx  (the Type* word of a slot) */
-    void store_rcx_slot(int32_t d)
-    { u8(0x48); u8(0x89); u8(MODRM_SLOT | (1 << 3)); u32(uint32_t(d)); }
     /* `<short jcc> +6; exit_pc(pc)` - bail unless the PASS condition. */
     void bail_unless(uint8_t short_pass, uint32_t pc)
     {
@@ -2903,7 +2909,10 @@ static bool div_magic(int_type d, DivMagic &out)
 static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
                            bool want_mod)
 {
-    e.mov_rr(RCX, RAX);                              /* rcx = n (kept) */
+    /* the dividend is kept aside for the remainder below; naming the
+     * role is what lets the allocator move it later */
+    const uint8_t keep = RCX;
+    e.mov_rr(keep, RAX);                             /* keep = n */
     e.movabs(RDX, m.M);
     e.u8(0x48); e.u8(0xF7); e.u8(0xEA);              /* imul rdx (signed,
                                                       * rdx:rax = n*M) */
@@ -2934,7 +2943,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
         e.u8(0x48); e.u8(0x0F); e.u8(0xAF); e.u8(0xC2);  /* imul rax, rdx */
     }
     e.u8(0x48); e.u8(0x29); e.u8(0xC1);              /* sub rcx, rax */
-    e.mov_rr(RAX, RCX);                              /* rax = remainder */
+    e.mov_rr(RAX, keep);                             /* rax = remainder */
 }
 
 /* Float ORDERING compare via ucomisd (N3). Jump-to-target when
@@ -3983,8 +3992,8 @@ static void emit_call_epilogue(Emitter &e)
          * every call site tests right after this epilogue */
         const JitLayout &L = jit_layout();
         e.load(RCX, slot_addr(g_hoist.base).payload);   /* the shobj */
-        e.mov_hr_rcx(g_hoist.rdata, L.data_off);
-        e.mov_hr_rcx(g_hoist.rcount, L.data_off + 8);
+        e.load_base(g_hoist.rdata, RCX, L.data_off);
+        e.load_base(g_hoist.rcount, RCX, L.data_off + 8);
         e.sub_rr(g_hoist.rcount, g_hoist.rdata);
         if (g_hoist.kind == 0 || g_hoist.kind == 1)
             e.sar_rr_imm8(g_hoist.rcount, 3);       /* 2/3 count BYTES */
@@ -4093,11 +4102,9 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
         e.u8(0x00);
         j_has = e.j8(0x75);                  /* jnz: caret already set */
         e.movabs(RCX, pack(le->start));
-        e.u8(0x48); e.u8(0x89); e.u8(0x88);  /* mov [rax+off_s], rcx */
-        e.u32(off_s);
+        e.store_base(RCX, RAX, static_cast<int32_t>(off_s));
         e.movabs(RCX, pack(le->end));
-        e.u8(0x48); e.u8(0x89); e.u8(0x88);  /* mov [rax+off_e], rcx */
-        e.u32(off_e);
+        e.store_base(RCX, RAX, static_cast<int32_t>(off_e));
         e.patch8(j_has, e.pos());            /* the CARET block only: the
                                               * chain stamp below still runs
                                               * for an exception that already
@@ -4179,7 +4186,7 @@ static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
     e.u32(static_cast<uint32_t>(chain));
     e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_call_inline_pool()));
     e.movabs(RCX, pool);
-    e.u8(0x48); e.u8(0x89); e.u8(0x08);      /* mov [rax], rcx */
+    e.store_base0(RCX, RAX);
 }
 
 /*
