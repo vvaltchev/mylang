@@ -3168,3 +3168,64 @@ is byte-identical by construction (pass the old register as `prefer`).
 The two hazards this one exposed are the ones to expect again - a
 family that must learn about `ra`, and a pressure point that needs a
 spill.
+
+## (ab) 2026-08-20 - the rcx worklist is EMPTY and rcx is STILL NOT
+## ADMISSIBLE, which is the finding
+
+Converting the four ref-gates and emit_op's staging register took the
+admission survey from **806 conflicts to 0**. Then admitting rcx for
+real: **4 `-rt` JIT cases fail and two corpus programs print WRONG
+ANSWERS** (16_elem2_fused, 17_elem2_divmod_roles).
+
+No `scratch()` assertion fires, and that is exactly the point.
+
+### The survey can only see a DECLARED clobber
+
+`Emitter::scratch(r)` is a DECLARATION - "I am about to use r as raw
+scratch". The survey reports the sites that make it. A site that simply
+WRITES the register declares nothing and is invisible: `ElemRead`'s
+`data = RCX` is a ROLE with a fixed default, and the nested-read tiers
+write it without ever calling `scratch()`.
+
+**Same family as the corpus hole one entry up, one level in.** The first
+version of the survey measured the wrong PROGRAMS (`-vdj` over files,
+missing `-rt`'s in-process ones). This version measures the wrong THING:
+declared intent instead of actual writes. Both reported CLEAN for a
+register that was not safe, which from an admission test is the most
+expensive wrong answer there is.
+
+### What the instrument does about it
+
+`scripts/rcx_admission.sh` no longer stops at the worklist. When the
+list is empty it BUILDS THE REGISTER IN and runs `-rt` and
+`corpus_diff`, and only that exiting clean prints "ADMISSIBLE". Its
+header states the declared-vs-actual limitation so the verdict cannot be
+read as stronger than it is. Today it prints, correctly:
+
+    conflicts: 0 ... worklist empty - now testing the register ADMITTED
+    -rt         : ABORTED
+    corpus_diff :  plain   22/24 agree
+    => NOT admissible: ... a site writes the register WITHOUT declaring
+       it
+
+### What is left for rcx: the ELEMENT ROLES
+
+`ElemRead` / `ElemScratch` hold `obj=RAX, data=RCX, count=RDX, idx=R9,
+val=RDI` as fixed DEFAULTS. `idx` and `val` are already picked from
+`ELEM_CAND` through `elem_scratch_plan`; **`data` and `count` are not**,
+and `data` is rcx.
+
+So the next step is the one the earlier plan already named: make
+`data`/`count` allocated rather than defaulted, from the same
+`ELEM_CAND` machinery, watching `g_jit_elem_noreg` for declines. That
+also removes rdx's last blocker (`count`), so the two come together.
+
+⛔ AND IT NEEDS THE SPILL DISCIPLINE, NOT THE PREFER DISCIPLINE. These
+roles are live across the whole element tier - several instructions, a
+bounds check and a branch - not the three-instruction window
+`RefScratch` relies on. Their live range crosses jumps, so a push/pop
+borrow would be skipped on some path exactly as it would have been in
+the store gate. Either they get a genuinely free register from
+`ELEM_CAND` (which is what `elem_scratch_plan` already does for the
+other two, and what makes this tractable) or the tier DECLINES to the
+helper - which it already knows how to do.
