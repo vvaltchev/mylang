@@ -10,6 +10,20 @@
 # The reciprocal's top bit decides whether the sequence needs the
 # add-back correction, and getting that bound wrong is SILENT - it broke
 # 3/3 and 7/3 while leaving every remainder right.
+#
+# ⛔ A POWER-OF-TWO DIVISOR TAKES A SEPARATE, SHORTER PATH (#106): six
+# instructions of shifts and a mask instead of the reciprocal's ten
+# with a 128-bit imul. The trap it must not fall into is the textbook
+# `x & (2^k - 1)`, which is WRONG for MyLang: `%` TRUNCATES, so the
+# sign follows the DIVIDEND (`-5 % 4` is `-1`, not `3`) and a bare mask
+# answers 3 for every negative dividend. The NEGATIVE entries in `ns`
+# are what catch that - watched: a naive mask diverges from the
+# tree-walker on the very first one.
+#
+# The path is capped at 2^31 because its mask rides `and r64, imm32`,
+# which SIGN-EXTENDS; the k=31 / k=32 pair below straddles that cap, so
+# both the handled edge and the first fall-through to the reciprocal
+# are covered.
 var acc = 0;
 var ns = [0,1,2,3,4,7,8,9,15,16,17,99,100,101,255,256,1023,1024,123456789,1000000006,2147483647,(0 - 1),(0 - 2),(0 - 3),(0 - 4),(0 - 7),(0 - 8),(0 - 9),(0 - 15),(0 - 16),(0 - 17),(0 - 99),(0 - 100),(0 - 101),(0 - 255),(0 - 256),(0 - 123456789),(0 - 2147483647),9223372036854775807,(0 - 9223372036854775807)];
 foreach (var n in ns) acc = acc + (n / 2) * 31 + (n % 2) * 17;
@@ -29,4 +43,13 @@ foreach (var n in ns) acc = acc + (n / (0 - 3)) * 31 + (n % (0 - 3)) * 17;
 foreach (var n in ns) acc = acc + (n / (0 - 7)) * 31 + (n % (0 - 7)) * 17;
 foreach (var n in ns) acc = acc + (n / (0 - 16)) * 31 + (n % (0 - 16)) * 17;
 foreach (var n in ns) acc = acc + (n / (0 - 1000)) * 31 + (n % (0 - 1000)) * 17;
+# the pow2 tier's own edges: k=1 (the smallest), k=31 (the largest it
+# takes) and k=32 (the first it declines, back to the reciprocal), each
+# with both divisor signs
+foreach (var n in ns) acc = acc + (n / 2147483648) * 31 + (n % 2147483648) * 17;
+foreach (var n in ns) acc = acc + (n / 4294967296) * 31 + (n % 4294967296) * 17;
+foreach (var n in ns) acc = acc + (n / (0 - 2147483648)) * 31
+                                + (n % (0 - 2147483648)) * 17;
+foreach (var n in ns) acc = acc + (n / (0 - 4294967296)) * 31
+                                + (n % (0 - 4294967296)) * 17;
 print("div-magic acc:", acc);
