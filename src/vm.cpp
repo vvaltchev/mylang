@@ -1322,12 +1322,39 @@ unsigned long g_dyn_foreach_fast[5] = {0};
 
 /* DictIterInit: pin the dict + set the live iterator to begin(). The
  * inferencer proved a Dict static type; the ML_VM_CHECK is the hardening
- * net (shared by both engines). Never throws. */
+ * net (shared by both engines). Never throws.
+ *
+ * ⛔ AND "NEVER THROWS" IS A CONTRACT IT MUST KEEP EVEN ON A CORRUPT
+ * IMAGE (#118, the #142 rule). `jit_dict_iter_init` is `noexcept` and
+ * the emitter takes NO status from it, so a type miss here has to take a
+ * DEFINED FALLBACK - it cannot report. Whether the slot really holds a
+ * dict is VALUE-dependent, so `verify_chunk` structurally cannot decide
+ * it at load either (#137 tier 1 ends before this question); and under
+ * ASSERTS=0 the ML_VM_CHECK above is compiled away, so `get<>()` threw
+ * TypeErrorEx straight through a noexcept frame and the process died
+ * with no message, no caret and no backtrace - in exactly the
+ * configuration a shipped image runs in.
+ *
+ * The fallback is an EMPTY dict, chosen so the loop simply runs zero
+ * times: `begin() == end()` for it, so `vm_dict_iter_next_body`'s
+ * EXISTING exhaustion test returns false on the first call and no new
+ * branch appears on the per-iteration path. The good path pays one
+ * type-tag compare, ONCE per loop rather than per iteration.
+ *
+ * Both twins are fixed by this one edit because the body is shared -
+ * which is the reason it is shared (the emit_elem_int_read lesson). */
 static ML_ALWAYS_INLINE void
 vm_dict_iter_init_body(DictIterState &st, const EvalValue &base)
 {
-    ML_VM_CHECK(base.is<intrusive_ptr<DictObject>>());
-    st.dict = base.get<intrusive_ptr<DictObject>>();
+    /* the tripwire stays for bytecode WE compiled - there a non-dict IS
+     * an interpreter bug - and stands down for an image, where it is
+     * input the fallback below handles */
+    ML_VM_CHECK(ml_untrusted_bytecode()
+                || base.is<intrusive_ptr<DictObject>>());
+    if (base.is<intrusive_ptr<DictObject>>())
+        st.dict = base.get<intrusive_ptr<DictObject>>();
+    else
+        st.dict = intrusive_ptr<DictObject>(new DictObject());
     st.it = st.dict->get_ref().begin();
 }
 
@@ -6495,6 +6522,29 @@ extern "C" int jit_end_finally(int_type region, int_type pc,
 #ifdef TESTS
     g_jit_end_finally_reraise++;
 #endif
+    /*
+     * ⛔ #118: ON A CORRUPT IMAGE THE PEND NEED NOT BE A RERAISE, and
+     * the ML_VM_CHECK below is compiled away under ASSERTS=0 - so a
+     * mutated `.myv` reached here with `Pend::ret`/`brk` and aborted a
+     * debug build while a release proceeded on a state this code does
+     * not describe. Whether the parked pend matches the EndFinally that
+     * jumped here is VALUE-dependent, so verify_chunk cannot decide it.
+     *
+     * This helper CAN report, unlike the dict-iterator's: it is
+     * `noexcept` but returns a STATUS the emitter tests, and status 2
+     * means "an exception is conveyed in g_vm_jit_exc". So the check
+     * throws as it does everywhere else and the catch turns it into
+     * that conveyance - the same idiom the vm_raise call below already
+     * uses, three lines down. The corrupt image is then REPORTED with a
+     * caret and a backtrace instead of aborting or drifting.
+     */
+    try {
+        ML_UNTRUSTED_CHECK(ps.pend == Pend::reraise,
+                           "EndFinally: the parked pend is not a reraise");
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    }
     ML_VM_CHECK(ps.pend == Pend::reraise);
     std::unique_ptr<RuntimeException> ex = std::move(ps.exc);
     if (!ex)

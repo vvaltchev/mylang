@@ -197,3 +197,22 @@ extern bool g_untrusted_bytecode;
 #else
 #  define ML_UNTRUSTED_CHECK(cond, what) ((void)0)
 #endif
+
+/*
+ * The same provenance question as a PREDICATE, for the one place the
+ * macro cannot serve: a helper the emitter takes NO status from, which
+ * must therefore take a DEFINED FALLBACK rather than throw (#142). Such
+ * a site still wants its ML_VM_CHECK tripwire for bytecode WE compiled -
+ * where the condition really is an interpreter bug - while staying
+ * silent for an image, where a corrupt value is input, not a bug. Spell
+ * that `ML_VM_CHECK(ml_untrusted_bytecode() || <invariant>)`.
+ * Constant-folds to `false` when the tier is compiled out.
+ */
+inline bool ml_untrusted_bytecode()
+{
+#if ML_UNTRUSTED_CHECKS
+    return g_untrusted_bytecode;
+#else
+    return false;
+#endif
+}
