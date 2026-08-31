@@ -7001,6 +7001,20 @@ the script hands each fragment to **objdump** and compares
 objdump is a development-time tool a script invokes, like python3 in
 the other scripts - not a build or test dependency.
 
+**WRAPPING IS PREVENTED WITH `-w`, AND THEN CHECKED FOR.** `-w`
+(--wide) plus `--insn-width=16` keep every instruction on one line -
+the direct fix for the two false alarms above, which both came from
+wrapping and both accused the decoder. A continuation line is no longer
+skipped, it is COUNTED and reported with its own wording (*THE ORACLE
+is misconfigured, not the decoder*) and its own exit code (2, a setup
+error, not 1, a decode mismatch). Silently tolerating it would leave
+the script working BY ACCIDENT on an objdump whose wrapping the flags
+failed to suppress - a workaround living in the consumer, the trap one
+level up from the one this script exists to close. Watched: dropping
+the flags reports 28,920 wrapped lines and exits 2. It also refuses to
+run at all when objdump is absent, rather than reporting a vacuous
+pass.
+
 **RESULT, and this is the answer to the requirement:**
 
     2,209,682 instructions   2,884 fragments
