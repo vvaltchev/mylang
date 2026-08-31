@@ -2774,8 +2774,14 @@ enum XReg : uint8_t { X0 = 0, X1 = 1 };   /* GP r8 = t_float (float
  * as the `cmp_r9_rdx()` wrapper it replaced - the #96 conversion
  * briefly made the census read 23 uses for a register with ~87,
  * which is the same blindness that let an unsafe r9 into the pin
- * pool. R8..R11 joined the enum for that reason. */
-enum Reg : uint8_t { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSI = 6,
+ * pool. R8..R11 joined the enum for that reason.
+ *
+ * RSP/RBP are NOT allocatable - rsp is the machine stack pointer and
+ * rbp is the fragment's slots base - but they are NAMED for exactly
+ * the same reason: a `0x48 0x89 0xE9` that means `mov rcx, rbp` hides
+ * rbp from the census as thoroughly as it hides rcx. */
+enum Reg : uint8_t { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4,
+                     RBP = 5, RSI = 6,
                      RDI = 7, R8 = 8, R9 = 9, R10 = 10, R11 = 11 };
 
 /* rax OP= rcx (reg-reg forms; 0x48 REX.W + opcode + ModRM(rcx->rax)) */
@@ -2988,7 +2994,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     e.u8(0x48); e.u8(0xF7); e.u8(0xEA);              /* imul rdx (signed,
                                                       * rdx:rax = n*M) */
     if (m.needs_add) {
-        e.u8(0x48); e.u8(0x01); e.u8(0xCA);          /* add rdx, rcx */
+        e.add_rr(RDX, RCX);
     }
     if (m.sh) {
         e.u8(0x48); e.u8(0xC1); e.u8(0xFA);          /* sar rdx, imm8 */
@@ -2997,7 +3003,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     /* truncate toward zero: += 1 when the quotient came out negative */
     e.mov_rr(RAX, RDX);
     e.u8(0x48); e.u8(0xC1); e.u8(0xE8); e.u8(63);    /* shr rax, 63 */
-    e.u8(0x48); e.u8(0x01); e.u8(0xC2);              /* add rdx, rax */
+    e.add_rr(RDX, RAX);
     if (m.negate) {
         e.u8(0x48); e.u8(0xF7); e.u8(0xDA);          /* neg rdx */
     }
@@ -3013,7 +3019,7 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
         e.movabs(RAX, static_cast<uint64_t>(d));
         e.u8(0x48); e.u8(0x0F); e.u8(0xAF); e.u8(0xC2);  /* imul rax, rdx */
     }
-    e.u8(0x48); e.u8(0x29); e.u8(0xC1);              /* sub rcx, rax */
+    e.sub_rr(RCX, RAX);
     e.mov_rr(RAX, keep);                             /* rax = remainder */
 }
 
@@ -4515,8 +4521,8 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * it). fo is spilled around the call (the probe clobbers the
          * resolve registers); desc re-derives from it. */
         e.push_reg(RDX);                  /* fo */
-        e.u8(0x48); e.u8(0x83); e.u8(0xEC); e.u8(0x08);  /* sub rsp,8 (pad:
-                                           * an even count stays call-ready) */
+        /* pad: an even push count keeps the stack call-ready */
+        e.op_reg_imm(Op::minus, RSP, 8);
         e.mov_rr(RDI, RAX);               /* rdi = desc */
         e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
         e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
@@ -4525,7 +4531,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_cached_probe) });
         e.u8(0xE8); e.u32(0);
-        e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08);  /* add rsp,8 (pad) */
+        e.op_reg_imm(Op::plus, RSP, 8);
         e.pop_reg(RDX);                   /* fo back */
         e.test32_rr(RAX, RAX);           /* test eax, eax */
         j_done.push_back(e.j32(0x75));    /* jnz done (hit) */
@@ -4694,7 +4700,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         const int32_t s = ((fsrc >= 0 ? fsrc : ARGBASE + i)) * 48;
         std::vector<size_t> j_next;
         ld(R10, R11, i * 8);                          /* the required Type* */
-        e.u8(0x4D); e.u8(0x85); e.u8(0xD2);           /* test r10, r10 */
+        e.test_rr(R10, R10);
         j_next.push_back(e.j32(0x74));                /* je next (no coerce) */
         /*
          * #162: a FUSED argument is read from the CALLER'S OWN SLOT, so
@@ -4849,7 +4855,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     }
     ld32sx(RSI, RAX, static_cast<int32_t>(P.desc_frame_size));
     ld32sx(R10, RCX, static_cast<int32_t>(P.ck_n_temps));
-    e.u8(0x4C); e.u8(0x01); e.u8(0xD6);               /* add rsi, r10 */
+    e.add_rr(RSI, R10);
     /* H8 inc 1: NO stack-cap test here. The cap is the SEGMENT BUDGET
      * (see VmActivation::room), so the fit test below is the cap test -
      * a frame can only exceed it by needing a segment the budget cannot
@@ -4858,13 +4864,13 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     /* record REUSE available: rec_n != recs_high (else the cold grow) */
     ld(R10, R8R, static_cast<int32_t>(L.act_rec_n));
     ld32(R11, R8R, static_cast<int32_t>(P.act_recs_high));
-    e.u8(0x4D); e.u8(0x39); e.u8(0xDA);               /* cmp r10, r11 */
+    e.cmp_rr(R10, R11);
     j_slow.push_back(e.j32(0x74));                    /* je slow */
     /* segment + fit. H8 inc 1: the activation HOLDS the current segment,
      * so this is one load where it used to be a sign-extended index, a
      * load of segs._M_start and an indexed load. */
     ld(R10, R8R, static_cast<int32_t>(P.act_cur_sg));  /* r10 = seg* */
-    e.u8(0x4D); e.u8(0x85); e.u8(0xD2);               /* test r10, r10 */
+    e.test_rr(R10, R10);
     j_slow.push_back(e.j32(0x74));                    /* jz slow (no seg) */
     /*
      * THE FIT TEST, ON POINTERS. The watermark is `seg->cur` (an LValue*)
@@ -4949,7 +4955,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     ld(R10, R8R, static_cast<int32_t>(L.act_records));
     ld(RAX, R8R, static_cast<int32_t>(L.act_rec_n));
     imul_imm(RAX, static_cast<int32_t>(L.rec_size));
-    e.u8(0x49); e.u8(0x01); e.u8(0xC2);               /* add r10, rax */
+    e.add_rr(R10, RAX);
     inc_q(R8R, static_cast<int32_t>(L.act_rec_n));
     st(R8R, static_cast<int32_t>(P.act_top_rec), R10);
     /* the record fill */
@@ -5102,7 +5108,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * removes the ordering question instead of documenting it, and it
          * makes the reference arm two stores cheaper.
          */
-        e.u8(0x45); e.u8(0x31); e.u8(0xDB);           /* xor r11d, r11d */
+        e.zero_reg32(R11);
         st(RDX, d + 32, R11);
         st(RDX, d + 40, R11);
         const size_t j_done = e.j32(0xEB);
@@ -5122,7 +5128,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          */
         e.push_reg(RCX); e.push_reg(R9R);
         e.push_reg(RDX);
-        e.u8(0x48); e.u8(0x83); e.u8(0xEC); e.u8(0x08);   /* sub rsp,8 (pad) */
+        e.op_reg_imm(Op::minus, RSP, 8);   /* pad */
         modrm(0x8D, RSI, RBX, s, true);               /* rsi = &src (arg 2) */
         modrm(0x8D, RDI, RDX, d, true);               /* rdi = &dst (arg 1) */
         /*
@@ -5140,10 +5146,10 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
             e.u8(0x48); e.u8(0xC1); e.u8(0xEA);
             e.u8(static_cast<uint8_t>(i));
         }
-        e.u8(0x48); e.u8(0x83); e.u8(0xE2); e.u8(0x01);   /* and rdx, 1 */
+        e.op_reg_imm(Op::band, RDX, 1);
         e.movabs(RAX, reinterpret_cast<uint64_t>(&jit_bind_ref_arg));
         e.call_rax();
-        e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08);   /* add rsp,8 (pad) */
+        e.op_reg_imm(Op::plus, RSP, 8);
         e.pop_reg(RDX);
         e.pop_reg(R9R); e.pop_reg(RCX);
         e.patch32_here(j_done);
@@ -5175,20 +5181,20 @@ static size_t emit_nstack_switch_pre(Emitter &e)
     /* mov qword [rcx], 0  (cur = null: active) */
     e.u8(0x48); e.u8(0xC7); e.u8(0x01); e.u32(0);
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_saved_rsp));
-    e.u8(0x48); e.u8(0x89); e.u8(0x21);               /* mov [rcx], rsp */
+    e.store_base0(RSP, RCX);
     e.movabs(RCX, reinterpret_cast<uint64_t>(g_nstack_top));
-    e.u8(0x48); e.u8(0x89); e.u8(0xCC);               /* mov rsp, rcx */
+    e.mov_rr(RSP, RCX);
     return j_plain;
 }
 
 static void emit_nstack_switch_post(Emitter &e)
 {
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_saved_rsp));
-    e.u8(0x48); e.u8(0x8B); e.u8(0x21);               /* mov rsp, [rcx] */
+    e.load_base0(RSP, RCX);
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_cur));
     /* cur = top (re-arm): movabs r9, top; mov [rcx], r9 */
     e.movabs(R9, reinterpret_cast<uint64_t>(g_nstack_top));
-    e.u8(0x4C); e.u8(0x89); e.u8(0x09);               /* mov [rcx], r9 */
+    e.store_base0(R9, RCX);
 }
 
 /*
@@ -5491,8 +5497,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     if (ns) {
         e.push_reg(RDI); e.push_reg(RDX);
         e.movabs(RDI, reinterpret_cast<uint64_t>(ns));
-        e.u8(0x48); e.u8(0x89); e.u8(0xEE);   /* mov rsi, rbp (the anchor:
-                                               * the caller's own frame) */
+        e.mov_rr(RSI, RBP);   /* the anchor: the caller's own frame */
         e.movabs(RAX, reinterpret_cast<uint64_t>(&jit_norec_push_verify));
         e.call_rax();
         e.pop_reg(RDX); e.pop_reg(RDI);
@@ -5524,7 +5529,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 e.u32(static_cast<uint32_t>(
                     in.target * static_cast<int32_t>(sizeof(LValue))));
             } else {
-                e.u8(0x31); e.u8(0xC9);               /* xor ecx, ecx */
+                e.zero_reg32(RCX);
             }
             e.u8(0x51);                               /* push rcx */
             e.movabs(RCX,
@@ -5537,8 +5542,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.u8(0x59);                               /* pop rcx (caps) */
             e.movabs(RDX,
                      reinterpret_cast<uint64_t>(&g_jit_residue_caps));
-            e.u8(0x48); e.u8(0x89); e.u8(0x0A);       /* mov [rdx], rcx */
-            e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08);
+            e.store_base0(RCX, RDX);
+            e.op_reg_imm(Op::plus, RSP, 8);
                                                       /* add rsp,8 (dst) */
         };
         const size_t j_plain = emit_nstack_switch_pre(e);
@@ -5564,7 +5569,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * a deep recursion whose bodies exit to the interpreter mid-body
      * stacked one un-capped C frame per level - a stack overflow the
      * clang-ASan lane caught (sanitized vm_dispatch frames are ~77KB). */
-    e.u8(0x48); e.u8(0x83); e.u8(0xF8); e.u8(0xFF); /* cmp rax, -1 */
+    e.cmp_reg_imm(RAX, -1);
     const size_t j_notsent = e.j32(0x75);          /* jne notsent */
     if (residue) {
         /* 4-iii, SENTINEL ONLY: the caller-side semantic restores. The
@@ -5580,7 +5585,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
          * return arm now restores them from the residue itself, so this
          * arm's per-call relay round-trip was pure overhead) */
         e.movabs(RCX, reinterpret_cast<uint64_t>(jit_layout().addr_act));
-        e.u8(0x48); e.u8(0x8B); e.u8(0x09);        /* mov rcx, [rcx] */
+        e.load_base0(RCX, RCX);
         /* 4-v: vframe.slots = rbx (OUR window) - a record-ful CALLEE's
          * pop repointed the view via its record's parent fields, but a
          * record-less callee's arm could only set slots from [rbp-8];
@@ -5605,18 +5610,18 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         }
     }
     e.movabs(RCX, depth_addr);
-    e.u8(0xFF); e.u8(0x09);                        /* dec dword [rcx] */
+    e.dec_dword_base(RCX);
     const size_t j_done1 = e.j32(0xEB);            /* jmp done */
     e.patch32_here(j_notsent);                     /* notsent: */
     /* #56 step 3: the callee returned JIT_RET_SWITCH (a deeper capped sync
      * call was pushed interpreted-flat). Our C frame dies too; balance the
      * depth (the flat continuation is uncounted by design) and propagate -
      * the record chain re-enters this fragment at OUR post-call stub. */
-    e.u8(0x48); e.u8(0x83); e.u8(0xF8); e.u8(0xFD); /* cmp rax, -3 */
+    e.cmp_reg_imm(RAX, -3);
     {
         const size_t j_nsw = e.j32(0x75);          /* jne next */
         e.movabs(RCX, depth_addr);
-        e.u8(0xFF); e.u8(0x09);                    /* dec dword [rcx] */
+        e.dec_dword_base(RCX);
         emit_call_epilogue(e);
         e.movabs(RAX, static_cast<uint64_t>(-3));
         /* ret (propagate) */
@@ -5641,7 +5646,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      * postexit reads top_rec->nslots, main being record-ful always) -
      * the record-less exited-callee cleanup repoints the vframe at the
      * caller from these. Dead args on the record path. */
-    e.u8(0x48); e.u8(0x89); e.u8(0xDA);            /* mov rdx, rbx */
+    e.mov_rr(RDX, RBX);
     e.movabs(RCX, static_cast<uint64_t>(
                       g_cur_caller_desc
                           ? static_cast<int_type>(
@@ -5652,7 +5657,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         { e.pos(), reinterpret_cast<const void *>(jit_sync_postexit) });
     e.u8(0xE8); e.u32(0);
     e.movabs(RCX, depth_addr);
-    e.u8(0xFF); e.u8(0x09);                        /* dec dword [rcx] */
+    e.dec_dword_base(RCX);
     e.test32_rr(RAX, RAX);                        /* test eax, eax */
     const size_t j_done2 = e.j32(0x74);            /* jz done */
     emit_call_epilogue(e);
@@ -5693,9 +5698,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     if (ns) {
         e.movabs(RAX, reinterpret_cast<uint64_t>(&g_norec_switch_site));
         e.movabs(RCX, reinterpret_cast<uint64_t>(ns));
-        e.u8(0x48); e.u8(0x89); e.u8(0x08);        /* mov [rax], rcx */
+        e.store_base0(RCX, RAX);
         e.movabs(RAX, reinterpret_cast<uint64_t>(&g_norec_switch_rbp));
-        e.u8(0x48); e.u8(0x89); e.u8(0x28);        /* mov [rax], rbp */
+        e.store_base0(RBP, RAX);
     }
     /* #88: the slow tier reads the same side channel. Reached only from a
      * GUARD decline, i.e. before the callee runs, so nothing can have
@@ -5725,7 +5730,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     /* status 3 = SWITCH: the callee was pushed interpreted-flat; this
      * fragment returns JIT_RET_SWITCH - its consumer drives the callee and
      * the record's baked resume re-enters us at the post-call stub. */
-    e.u8(0x83); e.u8(0xF8); e.u8(0x03);            /* cmp eax, 3 */
+    e.cmp_reg32_imm8(RAX, 3);
     {
         const size_t j_sw = e.j32(0x75);           /* jne exc_path */
         emit_call_epilogue(e);
@@ -5931,7 +5936,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         }
         /* dst < 0 (a discarded call statement) -> no guard, no write */
         ld(RDX, R10, static_cast<int32_t>(P.rec_dst));
-        e.u8(0x48); e.u8(0x85); e.u8(0xD2);        /* test rdx, rdx */
+        e.test_rr(RDX, RDX);
         const size_t j_nowrite = e.j32(0x78);      /* js no_write */
         /* rcx = &parent_win[dst] - from OUR record's parent_window (4-v:
          * captured at push; "top_rec - rec_size" is an ANCESTOR when
@@ -5941,7 +5946,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         e.u8(0x48); e.u8(0x69); e.u8(0xC2);        /* imul rax, rdx, 48 */
         e.u32(static_cast<uint32_t>(sizeof(LValue)));
         ld(RCX, R10, static_cast<int32_t>(P.rec_parent_window));
-        e.u8(0x48); e.u8(0x01); e.u8(0xC1);        /* add rcx, rax */
+        e.add_rr(RCX, RAX);
         /* the old dst value must be TRIVIAL (else: C++ release -> slow) */
         ld(RAX, RCX, static_cast<int32_t>(L.off_type));
         cmp_d_imm8(RAX, L.type_t_off, static_cast<int8_t>(L.t_str_val));
@@ -6122,7 +6127,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
              * checks what remains checkable. Clobbers caller-saved regs
              * - act/top_rec reloaded after. */
             ld(RDI, 5, 24);                    /* rdi = [rbp+24] */
-            e.u8(0x48); e.u8(0x89); e.u8(0xEE);/* mov rsi, rbp */
+            e.mov_rr(RSI, RBP);
             e.movabs(RDX, static_cast<uint64_t>(
                               static_cast<int_type>(my_total)));
             e.movabs(RAX, reinterpret_cast<uint64_t>(
@@ -6149,7 +6154,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             }
             /* rdx = dst_addr from the residue; 0 = discarded result */
             ld(RDX, 5, 24);
-            e.u8(0x48); e.u8(0x85); e.u8(0xD2);    /* test rdx, rdx */
+            e.test_rr(RDX, RDX);
             const size_t j_nw = e.j32(0x74);       /* jz no_write */
             ld(RAX, RDX, static_cast<int32_t>(L.off_type));
             cmp_d_imm8(RAX, L.type_t_off,
@@ -6218,10 +6223,10 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
 #ifdef TESTS
             e.movabs(RAX,
                      reinterpret_cast<uint64_t>(&g_jit_norec_ret_arm));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x00);    /* inc qword [rax] */
+            e.inc_qword_base(RAX);
             e.movabs(RAX,
                      reinterpret_cast<uint64_t>(&g_jit_native_returns));
-            e.u8(0x48); e.u8(0xFF); e.u8(0x00);
+            e.inc_qword_base(RAX);
 #endif
             e.u8(0x48); e.u8(0xC7); e.u8(0xC0);
             e.u32(0xFFFFFFFFu);                    /* mov rax, -1 */
@@ -6238,7 +6243,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                 ld(RSI, 5, 24);                    /* rsi = [rbp+24] */
                 e.movabs(RDX,
                          reinterpret_cast<uint64_t>(g_cur_caller_desc));
-                e.u8(0x48); e.u8(0x89); e.u8(0xE9);/* mov rcx, rbp */
+                e.mov_rr(RCX, RBP);
                 e.call_relocs.push_back(
                     { e.pos(),
                       reinterpret_cast<const void *>(jit_ret_norec) });
@@ -9520,7 +9525,7 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
     e.u8(0x0F); e.u8(0x8C);
     const size_t jl = e.pos(); e.u32(0);
     if (aop == Op::shr) {
-        e.u8(0x48); e.u8(0xC1); e.u8(0xF8); e.u8(63);    /* sar rax,63 */
+        e.sar_rr_imm8(RAX, 63);
     } else {
         e.zero_reg32(RAX);                          /* xor eax,eax */
     }
@@ -10213,11 +10218,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
              * the INT_MIN dividend does - an ordinary x / -1 falls
              * through to the native RMW (which reloads the element;
              * rax is free here). */
-            e.u8(0x48); e.u8(0x8D); e.u8(0x57); e.u8(0x01);
+            e.lea_base(RDX, RDI, 1);
                                                  /* lea rdx,[rdi+1] */
-            e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+            e.cmp_reg_imm(RDX, 1);
             const size_t j_ok = e.j32(0x77);     /* ja .ok (hot) */
-            e.u8(0x48); e.u8(0x85); e.u8(0xFF);  /* test rdi,rdi */
+            e.test_rr(RDI, RDI);
             slows.push_back(e.j32(0x74));        /* 0 -> the helper */
             /* rax = the element */
             e.load_elem_q(sc.obj, H->rdata, sc.idx);
@@ -10427,11 +10432,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
          * jumps back and stores natively.
          */
         if (divmod && !in.b_is_lit()) {
-            e.u8(0x48); e.u8(0x8D); e.u8(0x57); e.u8(0x01);
+            e.lea_base(RDX, RDI, 1);
                                                  /* lea rdx,[rdi+1] */
-            e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+            e.cmp_reg_imm(RDX, 1);
             const size_t j_ok = e.j32(0x77);     /* ja .ok (hot) */
-            e.u8(0x48); e.u8(0x85); e.u8(0xFF);  /* test rdi,rdi */
+            e.test_rr(RDI, RDI);
             decline_if(0x74);                    /* 0 -> the helper */
             e.load_base(sc.data, sc.obj, L.data_off);
             e.load_base(sc.count, sc.obj, L.data_off + 8);
@@ -10443,7 +10448,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             e.u8(0x4A); e.u8(0x8B); e.u8(0x14); e.u8(0xC9);
                                                  /* mov rdx,[rcx+r9*8] */
             e.movabs(sc.idx, 0x8000000000000000ull);
-            e.u8(0x4C); e.u8(0x39); e.u8(0xCA);  /* cmp rdx,r9 */
+            e.cmp_rr(RDX, R9);
             decline_if(0x74);                    /* INT_MIN -> helper */
             e.patch32_here(j_ok);
         }
@@ -11546,9 +11551,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     return true;
                 }
             } else {
-                e.u8(0x48); e.u8(0x8D); e.u8(0x51); e.u8(0x01);
+                e.lea_base(RDX, RCX, 1);
                                                      /* lea rdx,[rcx+1] */
-                e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+                e.cmp_reg_imm(RDX, 1);
                                                      /* cmp rdx,1 */
                 const size_t j_div = e.j32(0x77);    /* ja .div (hot) */
                 /* cold: rcx is 0 or -1 */
@@ -13048,7 +13053,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
         e.u8(0xC7); e.u8(0x01);                    /* mov dword [rcx], rg */
         e.u32(region);
-        e.u8(0x48); e.u8(0x83); e.u8(0xC1); e.u8(4);   /* add rcx, 4 */
+        e.op_reg_imm(Op::plus, RCX, 4);
         e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));
         const size_t j_done = e.j32(0xEB);
@@ -13076,7 +13081,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));
-        e.u8(0x48); e.u8(0x83); e.u8(0xE9); e.u8(4);   /* sub rcx, 4 */
+        e.op_reg_imm(Op::minus, RCX, 4);
         e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
         e.u32(static_cast<uint32_t>(L.act_handlers + 8));
         return true;
@@ -13103,7 +13108,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x48); e.u8(0xC1); e.u8(0xE2); e.u8(4);   /* shl rdx, 4 */
         e.u8(0x48); e.u8(0x8B); e.u8(0x80);        /* mov rax, [rax+pends] */
         e.u32(static_cast<uint32_t>(L.act_pends)); /* _M_start */
-        e.u8(0x48); e.u8(0x01); e.u8(0xD0);        /* add rax, rdx = entry */
+        e.add_rr(RAX, RDX);
         e.u8(0xC6); e.u8(0x80);                    /* mov byte [rax+off], v */
         e.u32(static_cast<uint32_t>(L.pend_state_pend));
         e.u8(static_cast<uint8_t>(in.target));
@@ -13135,7 +13140,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x48); e.u8(0xC1); e.u8(0xE2); e.u8(4);   /* shl rdx, 4 */
         e.u8(0x48); e.u8(0x8B); e.u8(0x80);        /* mov rax, [rax+pends] */
         e.u32(static_cast<uint32_t>(L.act_pends));
-        e.u8(0x48); e.u8(0x01); e.u8(0xD0);        /* add rax, rdx = entry */
+        e.add_rr(RAX, RDX);
         e.u8(0x80); e.u8(0xB8);                    /* cmp byte [rax+off], 0 */
         e.u32(static_cast<uint32_t>(L.pend_state_pend));
         e.u8(0);
@@ -13150,8 +13155,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.movabs(RSI, static_cast<uint64_t>(pc));
         e.movabs(RDX, static_cast<uint64_t>(
                           static_cast<int_type>(ck.inline_frame_at(old_pc))));
-        e.u8(0x48); e.u8(0x89); e.u8(0xE9);       /* mov rcx, rbp - the
-                                                   * raise anchor (4-ii) */
+        e.mov_rr(RCX, RBP);       /* the raise anchor (4-ii) */
         e.movabs(R8, reinterpret_cast<uint64_t>(g_cur_caller_desc));
                                                   /* the raising desc */
         e.call_relocs.push_back(
@@ -13159,9 +13163,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
 
-        e.u8(0x83); e.u8(0xF8); e.u8(0x03);       /* cmp eax, 3 */
+        e.cmp_reg32_imm8(RAX, 3);
         const size_t j_none = e.j32(0x74);        /* je -> fall through */
-        e.u8(0x83); e.u8(0xF8); e.u8(0x02);       /* cmp eax, 2 */
+        e.cmp_reg32_imm8(RAX, 2);
         {
             const size_t j_not2 = e.j8(0x75);
             emit_exc_stamp(e, ck, old_pc);        /* (already located) */
@@ -13202,8 +13206,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                           static_cast<int_type>(in.a_slot())));
         e.movabs(RSI, static_cast<uint64_t>(pc));
         e.movabs(RDX, reinterpret_cast<uint64_t>(loc_entry_addr(ck, old_pc)));
-        e.u8(0x48); e.u8(0x89); e.u8(0xE9);       /* mov rcx, rbp - the
-                                                   * raise anchor (4-ii) */
+        e.mov_rr(RCX, RBP);       /* the raise anchor (4-ii) */
         /* 4-ii(b): the RAISING function's desc - the one backtrace datum
          * no site can supply (a site names its CALLER); null for main,
          * matching main's null-desc boundary record. */
@@ -13212,7 +13215,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_throw) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x83); e.u8(0xF8); e.u8(0x02);       /* cmp eax, 2 */
+        e.cmp_reg32_imm8(RAX, 2);
         {
             const size_t j_not2 = e.j8(0x75);
             emit_exc_stamp(e, ck, old_pc);        /* (already located) */
@@ -13256,15 +13259,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.movabs(RDX, reinterpret_cast<uint64_t>(loc_entry_addr(ck, old_pc)));
         e.movabs(RCX, static_cast<uint64_t>(
                           static_cast<int_type>(ck.inline_frame_at(old_pc))));
-        e.u8(0x49); e.u8(0x89); e.u8(0xE8);       /* mov r8, rbp - the
-                                                   * raise anchor (4-ii) */
+        e.mov_rr(R8, RBP);       /* the raise anchor (4-ii) */
         e.movabs(R9, reinterpret_cast<uint64_t>(g_cur_caller_desc));
                                                   /* the raising desc */
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_rethrow) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x83); e.u8(0xF8); e.u8(0x02);       /* cmp eax, 2 */
+        e.cmp_reg32_imm8(RAX, 2);
         {
             const size_t j_not2 = e.j8(0x75);
             emit_exc_stamp(e, ck, old_pc);
@@ -13588,8 +13590,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                          * the overflow) - an ordinary x / -1 falls back
                          * into the native idiv (rax = the dividend is
                          * already loaded; rdx is dead, cqo is next). */
-                        e.u8(0x48); e.u8(0x8D); e.u8(0x51); e.u8(0x01);
-                        e.u8(0x48); e.u8(0x83); e.u8(0xFA); e.u8(0x01);
+                        e.lea_base(RDX, RCX, 1);
+                        e.cmp_reg_imm(RDX, 1);
                         const size_t j_div = e.j32(0x77);  /* ja .div */
                         e.test_rr(RCX, RCX);
                         j_slows.push_back(e.j32(0x74));    /* 0 -> slow */
@@ -14150,7 +14152,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             j_cold.push_back(e.j32(0x75));       /* jne -> a slice */
             e.load32_slot(RAX, b.payload + SL.str_len_off);   /* rax = len */
             load_operand(e, RDX, in.a_is_lit(), in.a_lit(), in.a_slot());
-            e.u8(0x48); e.u8(0x39); e.u8(0xC2);  /* cmp rdx, rax */
+            e.cmp_rr(RDX, RAX);
             j_cold.push_back(e.j32(0x73));       /* jae -> neg or >= len */
             e.load(RAX, b.payload + SL.str_obj_off);      /* the StrObj * */
             e.load_base(RCX, RAX, SL.strobj_data_off);   /* rcx = the char data */
@@ -14429,7 +14431,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u32(static_cast<uint32_t>(L.chunk_native_base));
         e.u8(0x48); e.u8(0x8B); e.u8(0x90); /* mov rdx, [rax + native_entry_off]*/
         e.u32(static_cast<uint32_t>(L.chunk_native_entry));
-        e.u8(0x48); e.u8(0x01); e.u8(0xD1); /* add rcx, rdx */
+        e.add_rr(RCX, RDX);
         e.u8(0xFF); e.u8(0xD1);             /* call rcx (the callee fragment) */
         /* G1 step 2: a leaf call is the OTHER fragment-to-fragment call
          * form, so its return address must be in the table or the entry
@@ -14705,7 +14707,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             clear_fwd = true;
         } else {
             read_slot(e, RAX, in.target2);
-            e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8); /* inc/dec */
+            e.incdec_reg(RAX, up);
             write_slot(e, ck, RAX, in.target2, pc);
             if (in.a_is_lit())
                 tmp_lit(static_cast<uint64_t>(
@@ -14854,7 +14856,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         if (!hoisted)
             emit_elem_base_gate(e, ir, in.b_dual_lo(), pc, &gate_slows);
         read_slot(e, RAX, in.target2);
-        e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8);   /* inc/dec rax */
+        e.incdec_reg(RAX, up);
         write_slot(e, ck, RAX, in.target2, pc);
         tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot());
         e.cmp_rr(RAX, tmp);
@@ -14948,7 +14950,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                   reinterpret_cast<const void *>(jit_for_step_elem) });
             e.u8(0xE8); e.u32(0);
             emit_call_epilogue(e);
-            e.u8(0x83); e.u8(0xF8); e.u8(0x02);      /* cmp eax, 2 */
+            e.cmp_reg32_imm8(RAX, 2);
             {
                 const size_t j_nothrow = e.j8(0x75);
                 emit_exc_stamp(e, ck, old_pc);
