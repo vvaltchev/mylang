@@ -294,6 +294,12 @@ Each ends with a MEASUREMENT that can kill the next one.
    on 78 and ~1,000,000 on 11. If it does not, stop — the naming path is
    wrong and nothing downstream matters.
 
+**1b. THE CALL SITE BRACKETS ITS PINS (§3b, inherited from #123).**
+   The caller runs on 4 pinnable registers of 13 today, and increment
+   2's gate is a wall-clock number — so this is a CONFOUNDER REMOVAL,
+   not a side quest. See §3b for why the obvious fix does not work and
+   what the real one is.
+
 **2. The callee-side protocol (§2), behind `MYLANG_JIT_OFF=frameless`.**
    The bulk. Landed with the tier ADMITTING ONLY LEAF CALLEES first, so
    E2's unwinder question is not entangled with the entry/return/
@@ -309,6 +315,83 @@ Each ends with a MEASUREMENT that can kill the next one.
 **4. E3 — the two-entry inline cache.** Serves 76. Last because it is
    the only one that adds a RUNTIME decision, and because it is worth
    nothing until 2 exists.
+
+---
+
+## 3b. INHERITED FROM #123 — THE CALL SITE MUST BRACKET ITS PINS
+## (added 2026-08-29, when #123 deleted the register pools)
+
+**THE SYMPTOM, measured:** a fragment that emits a MyLang call gets
+**4 pinnable registers of 13**. `jit_run_blocks_xcache` denies the
+whole CALLER-SAVED half of the pin pool to any run containing `CallV`,
+`CachedCallV` or `CallValueV`, so `fib$0` — the flagship shape of this
+whole task — runs on the callee-saved four alone.
+
+**⛔ AND THE DENIAL IS CORRECT TODAY. The first write-up of this called
+it a register wasted for nothing, and that was wrong.** Read
+`emit_sync_push_native`: it holds
+
+    rax  rbx  rcx  rdx  rsi  r8  r9  r10  r11
+
+as PROTOCOL across one long straight-line sequence — **8 allocatable
+registers of 13**, plus rbx which is reserved anyway. So the tempting
+fix, *"route its r10/r11 raw scratch through `alloc_scratch()`"*, cannot
+work: there is no spare register to route them to. And a MyLang call is
+a real SysV `call` — the callee clobbers every caller-saved register
+regardless of what the emitter does with them first.
+
+`jit_assert_no_volatile_pin` is the standing check that no caller-saved
+pin ever reaches that emitter, and it fires in every debug build.
+
+**THE ACTUAL FIX: BRACKET THE CALL SITE.** Emit the same
+`emit_call_prologue` / `emit_call_epilogue` pair that every HELPER call
+already uses:
+
+  - the prologue stores each caller-saved pin to its slot's PAYLOAD
+    (the type word stays stale, which is fine — a pinned slot is never
+    memory-read by any op in the run) and bumps `trk_bracket`, after
+    which the allocator treats those registers as free scratch;
+  - the emitter's r8/r10/r11 use is then legitimate rather than
+    scratch-by-convention;
+  - the epilogue reloads.
+
+The denial then drops to nothing, or at most to the registers the
+protocol needs live ACROSS the `call` itself.
+
+**THE COST is a store/load pair per pin per call site** — which is
+exactly the trade the caller-saved extension already makes for helper
+calls, and was measured worth it there (#96). It is NOT obviously worth
+it here, which is why it needs its own gate.
+
+**WHY IT BELONGS TO #97 AND NOT TO #123.** It changes the emitted CALL
+SEQUENCE, which is this task's subject and not the register model's.
+It also overlaps §2 directly: a frameless callee changes what the
+caller must preserve, so bracketing and the callee-side protocol want
+designing together rather than one on top of the other's assumptions.
+
+**SEQUENCING.** Do it AFTER increment 1 and BEFORE increment 2, for a
+reason that is not aesthetic: increment 2's gate is *"Ir on 78 and 11
+plus the wall clock"*, and if the caller is still running on 4 of 13
+registers then a flat wall clock there cannot be distinguished from
+"the frameless tier does not pay". Fixing the register starvation first
+removes a confounder from the measurement this plan turns on.
+
+**GATE, and it is a two-sided one:**
+  - `-vdj` on `fib$0` must show the entry pushing more than the
+    callee-saved four, i.e. the pin count actually rises;
+  - suite geomean must not regress. A run whose pins all sit in
+    callee-saved registers pays NOTHING new (the prologue's loop skips
+    them), so a regression would mean the newly-admitted pins are worth
+    less than their spill — in which case the honest answer is to admit
+    caller-saved pins only when the run's call count is low, and to say
+    so rather than to keep the widened pool.
+
+**⛔ AND RE-READ `jit_run_blocks_xcache`'s OPCODE LIST WHEN DOING
+THIS.** It is an audited table with the documented staleness risk, and
+its own comment records why ReturnV and Halt are deliberately absent
+(`emit_ret_native`'s first act is `flush_cache()`). If the bracket
+lands, the list may be deletable outright — which is the better outcome,
+one fewer table to go stale.
 
 ---
 
