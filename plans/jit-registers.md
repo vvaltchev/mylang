@@ -3392,3 +3392,58 @@ need not be re-derived:
 
 That last test is the one to run first: it is one command and it halves
 the search space.
+
+## (af) 2026-08-20 - MYLANG_JIT_MAXPINS BISECT: it is rcx, not the
+## budget - and the clobber is located to ONE instruction pair
+
+The (ae) test, run:
+
+    MAXPINS=4  : elem2dm: 728167 ...   CORRECT
+    MAXPINS=5  : elem2dm:  45737 ...   WRONG
+    MAXPINS=6,7,8,11, uncapped         WRONG
+
+Pin 5 is the FIRST caller-saved slot, which with rcx placed first in
+XCACHE_ORDER is rcx. **So it is rcx itself, not the eleventh pin** - 11
+pins is the shipping budget and is fine without rcx. One env var
+answered what an afternoon of reading could not; use it first next time.
+
+### The clobber, from the MAXPINS=5 dump (the minimal reproducer)
+
+    +439: movabs rcx, 1000        <-- rcx is the PIN, holding `j`
+    +449: imul rax, rcx
+    +453: push rcx                <-- the NEXT borrow dutifully saves
+    +454: mov rcx, r25.type           the ALREADY-DESTROYED value
+    ...
+    +473: pop rcx
+    +480: mov j, rcx              <-- and flushes the garbage to `j`
+
+A literal staged into rcx and multiplied into rax, with **no borrow**.
+Everything around it is correct - the flush/reload bracket the helper
+calls properly, and `RefScratch` pushes and pops exactly as designed -
+which is why the eye skips over it: the region LOOKS carefully managed.
+
+### What it is NOT (checked, so it is not re-checked)
+
+  - not `tmp_lit` - that borrows now, and its sites show push/pop;
+  - not `emit_div_magic` - borrowed in (ae), and its `imul` takes rdx;
+  - not the counter bumps - all fifteen route through `bump_at` (ad);
+  - not `emit_store_src_gate` / the ref checks - all four borrow.
+
+It is an **IntMulRI-shaped staging** in the specialized-arith family:
+`movabs <reg>, imm; imul rax, <reg>`. The emitter for it was not found
+before the context ran out; `grep -n "movabs(RCX" src/jit.cpp` lists 15
+sites and the arithmetic one is among the later ones, or it is reached
+through a helper that takes the register as a parameter defaulting to
+RCX (the shape `emit_div_magic`'s `keep` had - a role that looks
+allocated and is not).
+
+### The reproducer, in three commands
+
+    # put rcx first in XCACHE_ORDER, build, then:
+    MYLANG_JIT_MAXPINS=5 ./mylang tests/functional/17_elem2_divmod_roles.my
+    MYLANG_JIT_MAXPINS=5 ./mylang -vdj tests/functional/17_elem2_divmod_roles.my
+    # look for `movabs rcx, <imm>` with no `push rcx` before it
+
+Once that one site borrows, re-run `scripts/rcx_admission.sh 1`; it
+builds the register in and runs the nets itself, so it will say whether
+rcx is finally admissible rather than leaving it to judgement.
