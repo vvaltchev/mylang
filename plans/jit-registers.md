@@ -2677,3 +2677,50 @@ real decline risk - watch `g_jit_elem_noreg`), then rax (357).
 **And drive `regcensus.py --raw` (290 hand-encoded lines) to zero** -
 it is the more honest metric, since converting one moves a register
 from invisible to counted.
+
+## (v) THE ADMISSION TEST, and what it says about rcx today
+
+The census is a proxy. The real question - *may rcx join the pool?* -
+has a direct, empirical answer, and it should have been the metric all
+along:
+
+    XCACHE_ORDER[] = { 1, 10, 11, 8, 7, 6, 9 }   /* rcx FIRST */
+    ./mylang -rt  &&  tests/corpus_diff.sh ./mylang
+
+`take_reg` scans the pool in preference order, so putting a register
+first hands it out to essentially every run with a pin - the `--xrot`
+insight, used as a gate rather than a differential axis.
+
+**Run today: `-rt` ABORTS at `scratch()` and corpus_diff is 19/23.**
+Four programs give WRONG ANSWERS. So rcx is not admissible yet - but
+the failure is LOUD and NAMED, which it would not have been at the
+start of this arc.
+
+That is the point of the `scratch()` work. Before it there were five
+STALE declarations (asserting clobbers `bump_counter` no longer makes -
+those would have ABORTED LEGAL FRAGMENTS) and missing ones where real
+clobbers happen (those would have MISCOMPILED). Now the assertion fires
+at the site.
+
+### The one blocker already located and made loud
+
+`emit_call_epilogue` reloads the caller-saved GP pins and THEN, for a
+C1 hoist region, re-derives `rdata`/`rcount` through RCX. Reload, then
+clobber - the r9 shape exactly. It now carries `e.scratch(RCX)`, a
+no-op today, and the comment names the one-line fix for admission day:
+**`HOIST_REGS_MASK` must gain RCX**, so `jit_xcache_clobber` stops a
+run with a hoist from spending it. The mask exists precisely so each
+contributor names its own registers.
+
+### The order for the rest
+
+1. Run the admission test, read the ABORT, fix that site, repeat. The
+   aborts are the worklist; the 19/23 says at least one clobber is not
+   even declared yet.
+2. `emit_op`'s residue (20), `jit_compile_chunk` (8), `emit_exc_stamp`
+   (4), `emit_bake_call_site` (2).
+3. `emit_sync_push_native` (26) / `emit_ret_native` (13) /
+   `emit_sync_call_inline` (4) are gated by `jit_run_blocks_xcache`
+   (CallV / CachedCallV / CallValueV) - safe, and convertible last for
+   the census only. **Verify that gate covers `emit_nstack_switch_*`
+   (5) before trusting it for them.**

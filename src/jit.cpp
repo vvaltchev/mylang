@@ -3988,8 +3988,24 @@ static void emit_call_epilogue(Emitter &e)
     for (const Emitter::FLit &fl : e.flits)
         e.flit_load(fl);
     if (g_hoist.active) {
-        /* re-derive via RCX - RAX carries the helper's status, which
-         * every call site tests right after this epilogue */
+        /*
+         * Re-derive via RCX - RAX carries the helper's status, which
+         * every call site tests right after this epilogue.
+         *
+         * ⛔ AND THIS RUNS **AFTER** THE CALLER-SAVED PINS ARE RELOADED,
+         * a few lines up. So the day RCX joins the pin pool, a hoist
+         * region would reload a pin into it and then this line would
+         * destroy it - the r9 shape exactly, and a silent wrong answer.
+         *
+         * `scratch()` is a no-op today (nothing pins RCX) and costs
+         * nothing; the day that changes it ABORTS here, by name,
+         * instead of miscompiling. The fix at that point is one line:
+         * `HOIST_REGS_MASK` must gain RCX, so `jit_xcache_clobber`
+         * stops a run with a hoist region from spending it - the mask
+         * already exists precisely so each contributor names its own
+         * registers.
+         */
+        e.scratch(RCX);
         const JitLayout &L = jit_layout();
         e.load(RCX, slot_addr(g_hoist.base).payload);   /* the shobj */
         e.load_base(g_hoist.rdata, RCX, L.data_off);
