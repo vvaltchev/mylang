@@ -2724,3 +2724,64 @@ contributor names its own registers.
    (CallV / CachedCallV / CallValueV) - safe, and convertible last for
    the census only. **Verify that gate covers `emit_nstack_switch_*`
    (5) before trusting it for them.**
+
+## (w) THE ADMISSION TEST, RUN - one blocker, and it is a DESIGN step
+
+Ran it: `XCACHE_ORDER` with rcx first, `-rt` + `corpus_diff`.
+
+    -rt            ABORT at scratch(), then 1918/1924 with the
+                   assert bypassed (6 real failures)
+    corpus_diff    19/23 - four programs give WRONG ANSWERS
+
+Then made `scratch()` SURVEY instead of abort, to get the whole
+worklist in one run rather than one abort at a time:
+
+    1749 SCRATCH-PIN reg=1        <- rcx
+       0 everything else
+
+**One blocker class, and only one.** Every single occurrence is an
+emitter using rcx as raw scratch while the pool has handed it out as a
+pin. First site by gdb: `emit_branch`'s `tmp_operand`, i.e. the STAGING
+role - which is exactly right, and exactly what the threading was for.
+
+### Why this is not a "fix the aborts" job
+
+The clobbers are not bugs. They are declared, correct, and necessary:
+the emitters need a scratch register. The defect is structural - the
+scratch register is FIXED at rcx, so "rcx is pinned" and "this run
+needs staging" cannot both hold.
+
+Two ways out, and they are not equivalent:
+
+ - **(a) a run predicate.** Add RCX to `jit_xcache_clobber` whenever
+   the run contains an op whose emit uses staging. Sound, ~10 lines,
+   and it makes rcx spendable only for runs with NO int arithmetic,
+   compare, or 24-byte copy. That is close to no runs, so it would
+   "admit" a register that is never handed out - the boolean-clobber
+   mistake of 2026-08-18 in a new costume. **MEASURE the qualifying
+   fraction before choosing this**; if it is near zero, say so rather
+   than shipping a nominal admission.
+ - **(b) ALLOCATE the staging register**, from whatever is free in this
+   run, the way `elem_read_idx` allocates the element index. This is
+   the real answer and it is what "the real register allocator" means.
+   **The threading has already made it a LOCAL change**: every use
+   takes the register as an argument now (`tmp`, `cpy`, `keep`, the
+   gate helpers' `sc`), so the only edit is where those are BOUND -
+   `const uint8_t tmp = RCX;` becomes a pick.
+
+   The care needed is in the candidate set: RDI/R9 are the element
+   tiers' roles, RSI/R8 hold the type singletons off-arena, and RDX is
+   the divmod scratch. A staging pick must respect all of those, which
+   is the same bookkeeping `elem_scratch_reserve` already does - so the
+   honest shape is ONE reservation function that hands out every
+   emitter role for a run, not a second parallel one.
+
+(b) changes the allocator's structure, so it is the maintainer's call,
+not a mechanical continuation - flagged rather than started.
+
+### What the run DID buy
+
+The failure is now loud, named, and enumerable in one pass, where at
+the start of this arc it was silent. And the survey - `scratch()`
+printing instead of asserting - is the technique to reuse for rax:
+it turns "fix aborts one at a time" into a single worklist.
