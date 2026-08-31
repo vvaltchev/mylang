@@ -913,6 +913,245 @@ void jit_type_singletons(const void *&ti, const void *&tf, const void *&ta)
 static constexpr uint8_t MODRM_SLOT = 0x83;
 static constexpr uint8_t REG_SLOTS_BASE = 3;    /* rbx */
 static constexpr uint8_t REG_ARG0 = 7;          /* rdi */
+/*
+ * #96 (c): the FRAME ANCHOR. `frag_entry` establishes it and the
+ * no-record tier WALKS it (emit_norec_push hands it to the verify
+ * helper as "the caller's own frame"), so it is live for the whole
+ * fragment with no allocation record anywhere. Named here, beside the
+ * slots base, because these two plus rsp are the registers the
+ * allocator must never hand out - and the reserved mask is BUILT from
+ * these constants rather than restating their numbers, so a register
+ * cannot be freed for allocation without editing the role that makes
+ * it unavailable.
+ */
+static constexpr uint8_t REG_FRAME_ANCHOR = 5;  /* rbp */
+static constexpr uint8_t REG_STACK_PTR = 4;     /* rsp */
+
+/* ⛔ NAME THE REGISTER, NEVER WRITE THE NUMBER. A bare `9` in
+ * `cmp_rr(9, RDX)` is exactly as invisible to scripts/regcensus.py
+ * as the `cmp_r9_rdx()` wrapper it replaced - the #96 conversion
+ * briefly made the census read 23 uses for a register with ~87,
+ * which is the same blindness that let an unsafe r9 into the pin
+ * pool. R8..R11 joined the enum for that reason.
+ *
+ * RSP/RBP are NOT allocatable - rsp is the machine stack pointer and
+ * rbp is the fragment's slots base - but they are NAMED for exactly
+ * the same reason: a `0x48 0x89 0xE9` that means `mov rcx, rbp` hides
+ * rbp from the census as thoroughly as it hides rcx. */
+enum Reg : uint8_t { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4,
+                     RBP = 5, RSI = 6,
+                     RDI = 7, R8 = 8, R9 = 9, R10 = 10, R11 = 11 };
+
+/*
+ * ============================ #96 (c) ==============================
+ * THE REGISTER MODEL: CLASSES, CAPABILITIES, COST.
+ *
+ * The maintainer's requirement (2026-08-19): "no fixed scratch
+ * registers anywhere in the codegen - only classes of equivalent
+ * registers... within a class, a register capability bitmask... the
+ * allocator should FIRST determine the candidates that FUNCTIONALLY
+ * could do the job, THEN, based on a weight system, pick the most
+ * efficient choice."
+ *
+ * So there are three separate questions, and keeping them separate is
+ * the whole design:
+ *
+ *   1. CLASS - can this value live here at all? A float lives in an
+ *      xmm register and an integer in a GP one; they are not
+ *      interchangeable at any price.
+ *   2. CAPABILITY - can this register do THIS PARTICULAR JOB? Within
+ *      the GP class the registers are NOT equivalent, and the
+ *      inequalities are the ISA's, not ours: rsp/r12 cannot be a
+ *      memory base without a SIB byte, rbp/r13 cannot be one without a
+ *      displacement, only al/cl/dl/bl are byte-addressable without a
+ *      REX prefix, and only cl can be a variable shift count. This is
+ *      the "RCX can do everything R12 can, PLUS more" relation: a
+ *      SUPERSET of capability bits.
+ *   3. COST - given several capable candidates, which is cheapest
+ *      HERE? A callee-saved register survives a helper call for free
+ *      but costs a push/pop at fragment entry; a caller-saved one is
+ *      free at entry and spilled around every call; r8-r15 cost one
+ *      REX byte per use.
+ *
+ * ⛔ THE CAPABILITY TABLE IS DERIVED, NOT TYPED. `base_needs_sib` and
+ * `base_no_base_form` are the predicates the ENCODERS already assert
+ * on, so the table is built FROM them rather than restating them. A
+ * hand-typed table would be one more audited table free to drift out
+ * of agreement with the code it describes - the failure this file has
+ * hit five times (visit_use_def, op_writes_scalar, the LogV entry, the
+ * lever-A whitelist, the barrier's clear). `reg_model_agrees` (-rt)
+ * re-derives every bit from the encoders and fails BY NAME if one
+ * disagrees.
+ */
+enum RegClass : uint8_t { RC_GP = 0, RC_XMM = 1 };
+
+enum RegCap : uint32_t {
+    CAP_NONE        = 0,
+    /* usable as a byte register with NO REX prefix (al/cl/dl/bl).
+     * Without a REX, modrm 4..7 mean ah/ch/dh/bh, not sil/dil/spl/bpl -
+     * so this is a correctness bit, not a size one. See setcc_r8. */
+    CAP_BYTE_NOREX  = 1u << 0,
+    /* usable as a memory BASE with no SIB byte (everything but rsp/r12,
+     * whose low 3 bits are 100 - the encoding that MEANS "SIB
+     * follows") */
+    CAP_MEM_BASE    = 1u << 1,
+    /* usable as a memory base with mod=00, i.e. no displacement byte
+     * (everything but rbp/r13, whose low 3 bits are 101 - the encoding
+     * that means "disp32, no base") */
+    CAP_BASE_NODISP = 1u << 2,
+    /* the variable shift COUNT. cl and nothing else. */
+    CAP_SHIFT_CNT   = 1u << 3,
+    /* preserved across a helper call by the SysV convention */
+    CAP_CALLEE_SAVED = 1u << 4,
+    /* a SysV integer ARGUMENT register - rdi rsi rdx rcx r8 r9. Not a
+     * disqualifier by itself; it is what makes a register expensive to
+     * hold across a call site that builds arguments. */
+    CAP_SYSV_ARG    = 1u << 5,
+    /* the allocator may hand this out AT ALL. rsp is the machine stack
+     * pointer, rbx the fragment's slots base and rbp its frame anchor
+     * (the no-record tier walks it), so all three are structurally
+     * reserved - they are in the model to be NAMED and refused, not to
+     * be allocated. */
+    CAP_ALLOCATABLE = 1u << 6,
+};
+
+/*
+ * THE STRUCTURALLY RESERVED GP REGISTERS - see CAP_ALLOCATABLE.
+ *
+ * ⛔ BUILT FROM THE ROLE CONSTANTS, NOT FROM THEIR NUMBERS. Written as
+ * literals this was a mask a future edit could quietly shrink, and the
+ * self-test could not catch it: the test asked "is the result in
+ * GP_RESERVED_MASK", i.e. it consulted the very thing being sabotaged
+ * (watched, 2026-08-19 - dropping rbx from the mask made the whole
+ * suite pass while the SLOTS BASE became allocatable). Now freeing one
+ * means deleting the role that says what the register is FOR, and the
+ * test asks about the ROLES.
+ */
+static constexpr uint32_t GP_RESERVED_MASK =
+    (1u << REG_STACK_PTR) | (1u << REG_SLOTS_BASE)
+    | (1u << REG_FRAME_ANCHOR);
+
+/*
+ * The capability bits of GP register `r`, DERIVED from the encoders'
+ * own predicates wherever one exists.
+ */
+static constexpr uint32_t gp_caps(uint8_t r)
+{
+    return (r < 4 ? CAP_BYTE_NOREX : 0u)
+         | ((r & 7) != 4 ? CAP_MEM_BASE : 0u)      /* !base_needs_sib */
+         | ((r & 7) != 5 ? CAP_BASE_NODISP : 0u)   /* !base_no_base_form */
+         | (r == 1 ? CAP_SHIFT_CNT : 0u)           /* cl */
+         | ((r == 3 || r == 5 || r >= 12) ? CAP_CALLEE_SAVED : 0u)
+         | ((r == 7 || r == 6 || r == 2 || r == 1 || r == 8 || r == 9)
+                ? CAP_SYSV_ARG : 0u)
+         | ((GP_RESERVED_MASK & (1u << r)) ? 0u : CAP_ALLOCATABLE);
+}
+
+/*
+ * THE WEIGHT. Lower is cheaper. This is the "opportunity cost to use"
+ * the maintainer asked for, and it is deliberately a small integer
+ * rather than a measured model: the point is a STABLE, explainable
+ * preference order that a future measurement can tune, not a
+ * pretend-precise one now.
+ *
+ *   +4  a SysV argument register - every emitted helper call has to
+ *       build its arguments there, so holding a value in one is the
+ *       most likely to force a move;
+ *   +2  caller-saved - spilled and reloaded around each helper call
+ *       (emit_call_prologue/epilogue) rather than surviving free;
+ *   +1  needs a REX prefix (r8-r15) - one byte per use, and I-cache is
+ *       the one place the guard-elision family showed a real effect.
+ *
+ * A callee-saved low register is therefore cheapest, which reproduces
+ * today's hand-written preference (r12-r15 first) as an OUTPUT of the
+ * model instead of an assumption baked into an array's order.
+ */
+static constexpr int gp_weight(uint8_t r)
+{
+    return ((gp_caps(r) & CAP_SYSV_ARG) ? 4 : 0)
+         + ((gp_caps(r) & CAP_CALLEE_SAVED) ? 0 : 2)
+         + (r >= 8 ? 1 : 0);
+}
+
+/*
+ * THE ALLOCATOR. `take` answers the maintainer's two-step question in
+ * that order: filter to the FUNCTIONALLY capable, then pick the
+ * cheapest. `take_fixed` is the escape hatch for the cases where the
+ * ISA or the ABI names the register - idiv's rdx:rax, cl's shift
+ * count, the SysV argument slots - and it is a first-class part of the
+ * interface, not a workaround, because those cases are real and
+ * pretending otherwise would just push the hardcoding somewhere the
+ * model cannot see it.
+ */
+struct RegAlloc {
+    uint32_t busy = 0;          /* bit r: register r is taken */
+    uint32_t denied = 0;        /* bit r: this RUN may not spend it */
+
+    bool free_reg(uint8_t r) const
+    { return !(busy & (1u << r)) && !(denied & (1u << r)); }
+
+    /* the capable-and-available candidate set, as a mask */
+    uint32_t candidates(uint32_t need) const
+    {
+        uint32_t m = 0;
+        for (uint8_t r = 0; r < 16; r++)
+            if ((gp_caps(r) & need) == need && free_reg(r))
+                m |= 1u << r;
+        return m;
+    }
+
+    /*
+     * Take the cheapest register that has EVERY capability in `need`.
+     * `need` must include CAP_ALLOCATABLE for an ordinary request; a
+     * caller that genuinely wants a reserved register asks by name
+     * through take_fixed. Returns -1 under pressure - the caller
+     * spills, it does not get a wrong register.
+     */
+    int take(uint32_t need, uint32_t prefer = 0)
+    {
+        int best = -1, best_w = 0;
+        for (uint8_t r = 0; r < 16; r++) {
+            if ((gp_caps(r) & need) != need || !free_reg(r))
+                continue;
+            /* `prefer` breaks ties toward a register the caller has a
+             * reason to want (it already holds the value, it is the
+             * one the ABI wants next). It is a DISCOUNT, not an
+             * override: a preferred register that lacks a capability
+             * was already filtered out above. */
+            const int w = gp_weight(r) - ((prefer & (1u << r)) ? 8 : 0);
+            if (best < 0 || w < best_w) { best = r; best_w = w; }
+        }
+        if (best >= 0)
+            busy |= 1u << static_cast<uint8_t>(best);
+        return best;
+    }
+
+    /*
+     * Take one specific register, because the instruction or the ABI
+     * says so. Returns false if it is already taken - the caller must
+     * then free it (spill its occupant) rather than proceed.
+     */
+    bool take_fixed(uint8_t r)
+    {
+        if (!free_reg(r))
+            return false;
+        busy |= 1u << r;
+        return true;
+    }
+    /* take_fixed over a SET, all-or-nothing: idiv needs rax AND rdx,
+     * and taking one without the other leaves the emitter in a state
+     * no caller can recover from. */
+    bool take_fixed(std::initializer_list<uint8_t> rs)
+    {
+        for (uint8_t r : rs)
+            if (!free_reg(r))
+                return false;
+        for (uint8_t r : rs)
+            busy |= 1u << r;
+        return true;
+    }
+    void give(uint8_t r) { busy &= ~(1u << r); }
+};
 
 struct Emitter {
     std::vector<uint8_t> b;
@@ -958,24 +1197,31 @@ struct Emitter {
      * same frame - the maintainer's requirement - occupancy stops being
      * derivable from a position and has to be state.
      *
-     * `reg_busy` is that state, and `take_reg`/`give_reg` are the only
-     * two transitions. They are introduced here maintaining EXACTLY the
-     * present behaviour (the pool is handed out in order, nothing is
-     * ever given back mid-run), so the emitted code is byte-identical -
-     * the seam exists before anything drives it.
+     * `RegAlloc::busy` is that state, and take/take_fixed/give are the
+     * only transitions. It arrived maintaining EXACTLY the present
+     * behaviour (the pool handed out in order, nothing given back
+     * mid-run), so the emitted code was byte-identical - the seam
+     * existed before anything drove it.
      */
-    uint32_t reg_busy = 0;               /* bit r: register r is taken */
+    /*
+     * #96 (c): the OCCUPANCY is now the shared RegAlloc's, so the
+     * capability-driven `ra.take(caps)` and the positional
+     * `take_reg(pool)` cannot disagree about what is free. The POLICY
+     * is deliberately still positional here - switching a site from
+     * the pool scan to the cost model CHANGES which register it gets,
+     * so that happens per call site, each one measurable, rather than
+     * all at once behind a refactor.
+     */
+    RegAlloc ra;
 
     int take_reg(const uint8_t *pool, size_t n)
     {
         for (size_t i = 0; i < n; i++)
-            if (!(reg_busy & (1u << pool[i]))) {
-                reg_busy |= 1u << pool[i];
+            if (ra.take_fixed(pool[i]))
                 return pool[i];
-            }
         return -1;                       /* pressure: the caller spills */
     }
-    void give_reg(uint8_t r) { reg_busy &= ~(1u << r); }
+    void give_reg(uint8_t r) { ra.give(r); }
 
     /*
      * ⛔ #96 THE SCRATCH ALLOCATOR - `alloc_scratch()` hands out a
@@ -1011,8 +1257,7 @@ struct Emitter {
         /* Preference order is today's convention, so a converted site
          * gets the register it used to hardcode and the emitted code
          * stays byte-identical until the pool actually widens. */
-        static const uint8_t ORDER[] = { 0 /*rax*/, 1 /*rcx*/,
-                                         2 /*rdx*/ };
+        static const uint8_t ORDER[] = { RAX, RCX, RDX };
         const int r = take_reg(ORDER, sizeof(ORDER) / sizeof(ORDER[0]));
         ML_CHECK_MSG(r >= 0, "alloc_scratch: no scratch register free");
         return r;
@@ -2989,24 +3234,10 @@ struct Emitter {
     { patch32(at, static_cast<uint32_t>(pos() - (at + 4))); }
 };
 
+
 enum XReg : uint8_t { X0 = 0, X1 = 1 };   /* GP r8 = t_float (float
                                            * fragments); baked in the
                                            * encodings above/below */
-
-/* ⛔ NAME THE REGISTER, NEVER WRITE THE NUMBER. A bare `9` in
- * `cmp_rr(9, RDX)` is exactly as invisible to scripts/regcensus.py
- * as the `cmp_r9_rdx()` wrapper it replaced - the #96 conversion
- * briefly made the census read 23 uses for a register with ~87,
- * which is the same blindness that let an unsafe r9 into the pin
- * pool. R8..R11 joined the enum for that reason.
- *
- * RSP/RBP are NOT allocatable - rsp is the machine stack pointer and
- * rbp is the fragment's slots base - but they are NAMED for exactly
- * the same reason: a `0x48 0x89 0xE9` that means `mov rcx, rbp` hides
- * rbp from the census as thoroughly as it hides rcx. */
-enum Reg : uint8_t { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4,
-                     RBP = 5, RSI = 6,
-                     RDI = 7, R8 = 8, R9 = 9, R10 = 10, R11 = 11 };
 
 /* rax OP= rcx (reg-reg forms; 0x48 REX.W + opcode + ModRM(rcx->rax)) */
 /*
@@ -7938,6 +8169,238 @@ static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
  * improvement ate the test's shape. Deriving the count removes that
  * whole failure mode. */
 size_t jit_pin_budget() { return MAX_CACHED + MAX_XCACHED; }
+
+#ifdef TESTS
+/*
+ * ⛔ THE REGISTER MODEL'S SELF-TEST (#96 (c)). Everything the allocator
+ * decides rests on gp_caps(), so a wrong bit there is not a missed
+ * optimization - it is a wrong register in emitted code, which is the
+ * exact shape of the r9 bug that shipped for a day.
+ *
+ * It checks in TWO directions, and they are not equally strong - the
+ * comment says which is which rather than implying both are proof:
+ *
+ *  (a) AGAINST THE ENCODER'S OUTPUT - the strong half. For every
+ *      register the model calls a legal memory base, it EMITS a real
+ *      `load_base` and inspects the bytes: the modrm rm field must
+ *      name that register and must not be the 100 that means "a SIB
+ *      byte follows". For every byte-capable register it emits a real
+ *      `setcc_r8` and requires no REX prefix. This is independent of
+ *      the predicates, because it reads what the encoder actually
+ *      produced.
+ *
+ *  (b) AGAINST THE ENCODER'S PREDICATES - the weaker half, and it is
+ *      still worth having. `gp_caps` and `base_needs_sib` are the SAME
+ *      RULE written in two places, so this cannot catch a rule that is
+ *      wrong; it catches the two DRIFTING APART, which is the failure
+ *      this file has hit five times with its audited tables.
+ *
+ * Plus the pool invariants and the allocator's own contract.
+ */
+static bool reg_model_check(std::string &err)
+{
+    char buf[256];
+    /* (b) THE DRIFT HALF, RUN FIRST - because emitting with a wrong
+     * capability bit trips the ENCODER's own ML_CHECK and aborts,
+     * which is loud but names load_base rather than the model. Doing
+     * the cheap comparison first turns that into a clean report. */
+    for (uint8_t r = 0; r < 16; r++) {
+        const bool cap_base = (gp_caps(r) & CAP_MEM_BASE) != 0;
+        const bool cap_nod  = (gp_caps(r) & CAP_BASE_NODISP) != 0;
+        if (cap_base == Emitter::base_needs_sib(r)) {
+            snprintf(buf, sizeof(buf),
+                     "reg %u: CAP_MEM_BASE=%d but base_needs_sib=%d",
+                     r, cap_base, Emitter::base_needs_sib(r));
+            err = buf; return false;
+        }
+        if (cap_nod == Emitter::base_no_base_form(r)) {
+            snprintf(buf, sizeof(buf),
+                     "reg %u: CAP_BASE_NODISP=%d but base_no_base_form=%d",
+                     r, cap_nod, Emitter::base_no_base_form(r));
+            err = buf; return false;
+        }
+    }
+    /* (a) THE STRONG HALF - emit and read the bytes back. */
+    for (uint8_t r = 0; r < 16; r++) {
+        if (!(gp_caps(r) & CAP_MEM_BASE))
+            continue;
+        Emitter e;
+        e.load_base(RAX, r, 0x40);          /* mov rax, [r + 0x40] */
+        /* REX, 0x8B, modrm, disp8 */
+        if (e.b.size() < 3) {
+            snprintf(buf, sizeof(buf),
+                     "reg %u: load_base emitted %zu bytes", r, e.b.size());
+            err = buf; return false;
+        }
+        const uint8_t modrm = e.b[2];
+        if ((modrm & 7) != (r & 7) || (modrm & 7) == 4) {
+            snprintf(buf, sizeof(buf),
+                     "reg %u has CAP_MEM_BASE but load_base emitted "
+                     "modrm rm=%u (SIB escape is 4)", r, modrm & 7u);
+            err = buf; return false;
+        }
+    }
+    for (uint8_t r = 0; r < 16; r++) {
+        if (!(gp_caps(r) & CAP_BYTE_NOREX))
+            continue;
+        Emitter e;
+        e.setcc_r8(0x5, r);                 /* setne <r8> */
+        if (e.b.size() != 3 || e.b[0] != 0x0F) {
+            snprintf(buf, sizeof(buf),
+                     "reg %u has CAP_BYTE_NOREX but setcc_r8 emitted a "
+                     "REX prefix (%zu bytes, first 0x%02X)",
+                     r, e.b.size(), e.b.empty() ? 0 : e.b[0]);
+            err = buf; return false;
+        }
+    }
+    /* the shift count is cl and nothing else */
+    for (uint8_t r = 0; r < 16; r++)
+        if (((gp_caps(r) & CAP_SHIFT_CNT) != 0) != (r == RCX)) {
+            snprintf(buf, sizeof(buf),
+                     "reg %u: CAP_SHIFT_CNT must be RCX alone", r);
+            err = buf; return false;
+        }
+    /* THE ROLE REGISTERS must not be allocatable. Asked of the ROLE
+     * CONSTANTS, so this survives an edit to the reserved mask. */
+    {
+        const uint8_t roles[3] =
+            { REG_STACK_PTR, REG_SLOTS_BASE, REG_FRAME_ANCHOR };
+        const char *names[3] =
+            { "stack pointer", "slots base", "frame anchor" };
+        for (int i = 0; i < 3; i++)
+            if (gp_caps(roles[i]) & CAP_ALLOCATABLE) {
+                snprintf(buf, sizeof(buf),
+                         "reg %u is the %s and must not be allocatable",
+                         roles[i], names[i]);
+                err = buf; return false;
+            }
+        for (int i = 0; i < 3; i++)
+            for (int j = i + 1; j < 3; j++)
+                if (roles[i] == roles[j]) {
+                    snprintf(buf, sizeof(buf),
+                             "two roles claim reg %u", roles[i]);
+                    err = buf; return false;
+                }
+    }
+    /* THE POOL INVARIANTS. A pin lives for the whole fragment, so a
+     * callee-saved pool member must actually be callee-saved and a
+     * caller-saved one must not be - the two are spilled by different
+     * machinery (frag_entry vs emit_call_prologue), so a
+     * misclassification silently skips one of them. */
+    for (size_t i = 0; i < MAX_CACHED; i++) {
+        const uint8_t r = CACHE_REGS[i];
+        if (!(gp_caps(r) & CAP_CALLEE_SAVED) ||
+            !(gp_caps(r) & CAP_ALLOCATABLE)) {
+            snprintf(buf, sizeof(buf),
+                     "CACHE_REGS[%zu] = reg %u is not an allocatable "
+                     "callee-saved register", i, r);
+            err = buf; return false;
+        }
+    }
+    for (size_t i = 0; i < MAX_XCACHED; i++) {
+        const uint8_t r = XCACHE_ORDER[i];
+        if ((gp_caps(r) & CAP_CALLEE_SAVED) ||
+            !(gp_caps(r) & CAP_ALLOCATABLE)) {
+            snprintf(buf, sizeof(buf),
+                     "XCACHE_ORDER[%zu] = reg %u is not an allocatable "
+                     "caller-saved register", i, r);
+            err = buf; return false;
+        }
+    }
+    /* no pool may contain a structurally reserved register */
+    for (uint8_t r = 0; r < 16; r++) {
+        if (!(GP_RESERVED_MASK & (1u << r)))
+            continue;
+        for (size_t i = 0; i < MAX_CACHED; i++)
+            if (CACHE_REGS[i] == r) {
+                snprintf(buf, sizeof(buf),
+                         "reserved reg %u is in CACHE_REGS", r);
+                err = buf; return false;
+            }
+        for (size_t i = 0; i < MAX_XCACHED; i++)
+            if (XCACHE_ORDER[i] == r) {
+                snprintf(buf, sizeof(buf),
+                         "reserved reg %u is in XCACHE_ORDER", r);
+                err = buf; return false;
+            }
+    }
+    /* THE ALLOCATOR'S CONTRACT. take() must never hand back a register
+     * lacking a requested capability, however cheap it looks. */
+    static const uint32_t CAPS[] = {
+        CAP_BYTE_NOREX, CAP_MEM_BASE, CAP_BASE_NODISP, CAP_SHIFT_CNT,
+        CAP_CALLEE_SAVED, CAP_SYSV_ARG,
+    };
+    for (uint32_t c : CAPS) {
+        RegAlloc a;
+        for (;;) {
+            const int r = a.take(c | CAP_ALLOCATABLE);
+            if (r < 0)
+                break;
+            if ((gp_caps(static_cast<uint8_t>(r)) & c) != c) {
+                snprintf(buf, sizeof(buf),
+                         "take(cap 0x%X) returned reg %d, which lacks it",
+                         c, r);
+                err = buf; return false;
+            }
+            /* ⛔ ASK THE ROLES, NOT THE MASK. Testing against
+             * GP_RESERVED_MASK consults the thing a sabotage would
+             * edit, so it passed with the slots base allocatable. */
+            if (r == REG_STACK_PTR || r == REG_SLOTS_BASE ||
+                r == REG_FRAME_ANCHOR) {
+                snprintf(buf, sizeof(buf),
+                         "take() returned reg %d, which is the %s", r,
+                         r == REG_SLOTS_BASE  ? "SLOTS BASE" :
+                         r == REG_FRAME_ANCHOR ? "FRAME ANCHOR"
+                                               : "STACK POINTER");
+                err = buf; return false;
+            }
+        }
+    }
+    /* CAP_SHIFT_CNT must yield exactly one register, and it must be cl */
+    {
+        RegAlloc a;
+        const int r = a.take(CAP_SHIFT_CNT | CAP_ALLOCATABLE);
+        if (r != RCX || a.take(CAP_SHIFT_CNT | CAP_ALLOCATABLE) >= 0) {
+            snprintf(buf, sizeof(buf),
+                     "the shift-count class is not {rcx} alone (got %d)", r);
+            err = buf; return false;
+        }
+    }
+    /* take_fixed is ALL-OR-NOTHING: idiv needs rax and rdx together,
+     * and a partial take leaves the emitter unrecoverable. */
+    {
+        RegAlloc a;
+        if (!a.take_fixed(RDX)) { err = "take_fixed(RDX) failed"; return false; }
+        if (a.take_fixed({ RAX, RDX })) {
+            err = "take_fixed({RAX,RDX}) succeeded with RDX already taken";
+            return false;
+        }
+        if (a.busy & (1u << RAX)) {
+            err = "a FAILED take_fixed set still took RAX - not atomic";
+            return false;
+        }
+    }
+    /* THE WEIGHT MODEL must reproduce today's hand-written preference:
+     * the cheapest allocatable GP register is callee-saved (it survives
+     * a call for free), which is why CACHE_REGS is spent before
+     * XCACHE_ORDER. If this ever flips, the pools' ORDER is a lie. */
+    {
+        RegAlloc a;
+        const int first = a.take(CAP_ALLOCATABLE);
+        if (first < 0 || !(gp_caps(static_cast<uint8_t>(first))
+                           & CAP_CALLEE_SAVED)) {
+            snprintf(buf, sizeof(buf),
+                     "the cheapest allocatable register is %d, which is "
+                     "not callee-saved - the pool order is then wrong",
+                     first);
+            err = buf; return false;
+        }
+    }
+    return true;
+}
+
+bool jit_reg_model_check(std::string &err) { return reg_model_check(err); }
+#endif /* TESTS */
 
 static const uint8_t FCACHE_REGS[] = { 4, 5, 6, 7 };
 static const size_t MAX_FCACHED =
@@ -16162,7 +16625,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     Emitter e;
     /* no N5 register cache in a container*/
     e.cache.clear();
-    e.reg_busy = 0;
+    e.ra = RegAlloc();
     e.fcache.clear();                      /* C2a: nor a float one */
     e.tflush.clear();                      /* C3: nor type elision */
     e.fread.clear();                       /* C4a-i: nor read elision */
@@ -16729,7 +17192,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * ONE mask, so the budget above and the assignment below cannot
          * disagree about which registers exist. Set below, once hregs
          * is known. */
-        e.reg_busy = 0;
+        e.ra = RegAlloc();
         e.tflush.clear();       /* C3: per-RUN like the pools */
         /* #96: the pending exits + their interned cache states are also
          * per-RUN. emit_epilogues clears them, but a run whose emission
@@ -16831,7 +17294,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             if (cap < max_pins)
                 max_pins = cap;
         }
-        e.reg_busy = xclob;
+        /* the run's DENIED set, not its BUSY set: these registers
+         * are not occupied by anything, this fragment simply may not
+         * spend them (jit_xcache_clobber says why for each). The model
+         * keeps the two apart so a pressure report can tell "all taken"
+         * from "all forbidden". */
+        e.ra = RegAlloc();
+        e.ra.denied = xclob;
         std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
                               max_pins,
@@ -16966,8 +17435,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * that list and frag_ret pops it, and r10/r11 need neither.
          */
         if (pair_lo >= 0) {
-            e.reg_busy |= 1u << pair_lo;
-            e.reg_busy |= 1u << pair_hi;
+            e.ra.take_fixed({ static_cast<uint8_t>(pair_lo),
+                              static_cast<uint8_t>(pair_hi) });
         }
         std::vector<uint8_t> hot_reg(hot.size());
         for (size_t h = 0; h < hot.size(); h++) {
@@ -17475,7 +17944,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                  * the pre-op flush_cache() has already stamped it. */
                 saved_state = e.snapshot_cache();
                 e.clear_cache_state();
-                e.reg_busy = 0;
+                e.ra = RegAlloc();
             }
             if (op_is_branch(in.op)) {
                 /* targets get entry_remap (an external exit is a RESUME -

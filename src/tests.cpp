@@ -25094,6 +25094,53 @@ static bool jit_two_address()
 #endif
 }
 
+static bool jit_reg_model()
+{
+#if ML_JIT_SUPPORTED
+    /*
+     * #96 (c): the register MODEL - classes, the capability bitmask and
+     * the cost weights - re-derived from the encoders themselves, plus
+     * the pool invariants and the allocator's contract. Everything the
+     * allocator decides rests on that table, so a wrong bit is a wrong
+     * register in emitted code, not a missed optimization.
+     *
+     * ⛔ WATCHED FAILING (2026-08-19), one sabotage build per arm,
+     * with the message each produced:
+     *   rsp given CAP_MEM_BASE
+     *     "reg 4: CAP_MEM_BASE=1 but base_needs_sib=1"
+     *   r13 given CAP_BASE_NODISP
+     *     "reg 5: CAP_BASE_NODISP=1 but base_no_base_form=1"
+     *   CAP_BYTE_NOREX widened to r < 8
+     *     setcc_r8's own ML_CHECK aborts, naming the encoder and line
+     *   CAP_SHIFT_CNT given to rdx as well
+     *     "reg 2: CAP_SHIFT_CNT must be RCX alone"
+     *   rbx dropped from the reserved mask
+     *     "reg 3 is the slots base and must not be allocatable"
+     *   the weights flipped so caller-saved is cheapest
+     *     "the cheapest allocatable register is 0, which is not
+     *      callee-saved - the pool order is then wrong"
+     *   take_fixed made non-atomic
+     *     "a FAILED take_fixed set still took RAX - not atomic"
+     *
+     * ⛔ AND ONE OF THEM WAS VACUOUS AT FIRST, which is the reason to
+     * write these down. Freeing rbx passed the whole suite: the check
+     * asked "is take()'s result in GP_RESERVED_MASK", i.e. it consulted
+     * the very constant the sabotage edits. It asks the ROLE CONSTANTS
+     * now (REG_SLOTS_BASE / REG_FRAME_ANCHOR / REG_STACK_PTR), and the
+     * mask is BUILT from those, so freeing a register means deleting
+     * the role that says what it is for.
+     */
+    std::string err;
+    if (!jit_reg_model_check(err)) {
+        printf("  register model: %s\n", err.c_str());
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_xcache_pins()
 {
 #if ML_JIT_SUPPORTED
@@ -32804,6 +32851,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: two-address arithmetic `<op> [slot], reg` for dst = dst OP b "
       "- engages per MR-encodable op, declines for imul (#96)",
       jit_two_address },
+    { "jit: the register MODEL - capability bits re-derived from the "
+      "encoders, pool invariants, allocator contract (#96 (c))",
+      jit_reg_model },
     { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "
       "call-free fragment, declines around a MyLang call (#96)",
       jit_xcache_pins },

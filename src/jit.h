@@ -297,6 +297,13 @@ extern unsigned long g_jit_inline_baked;
 extern unsigned long g_jit_inline_call_baked;
 
 #ifdef TESTS
+/*
+ * #96 (c): re-derive the register model's capability table from the
+ * ENCODERS and check the pool invariants and the allocator contract.
+ * False + a named reason on any disagreement. See reg_model_check
+ * (jit.cpp) for which half of it is strong and which is drift-only.
+ */
+bool jit_reg_model_check(std::string &err);
 /* #78 step E: times EndFinally's cold RERAISE arm ran natively (see
  * jit_end_finally, vm.cpp) - the coverage counter for the arm that used
  * to bail to the interpreter. */
