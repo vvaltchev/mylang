@@ -170,8 +170,20 @@ def main():
     mapf = os.path.join(d, 'map.txt')
     cgf = os.path.join(d, 'cg.out')
     env = dict(os.environ, MYLANG_JIT_MAP=mapf)
+    # -npc: THE PURE-CALL CACHE IS OFF FOR EVERY MEASUREMENT (CLAUDE.md).
+    # The rule is written up about bench/run.py, which passes the flag by
+    # DEFAULT, so it reads as a property of THAT harness - and this one
+    # quietly lost it.  It is not optional here: the cache memoizes a pure
+    # call within a frame, so on a bench that repeats one (09_fib_recursive
+    # is `for (k...) r = fib(29)`) every iteration after the first is a
+    # cache HIT and the profile shows a few thousand lookups where the real
+    # work is 136 million instructions.  A per-call cost read off that is
+    # wrong by five orders of magnitude.  The flag belongs to the
+    # MEASUREMENT, not to the harness.  --pure-call-cache opts back in.
+    pre = [] if '--pure-call-cache' in rest else ['-npc']
+    rest = [a for a in rest if a != '--pure-call-cache']
     cmd = ['valgrind', '--tool=callgrind', '--dump-instr=yes',
-           '--callgrind-out-file=' + cgf, binary, prog] + rest
+           '--callgrind-out-file=' + cgf, binary] + pre + [prog] + rest
     r = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL,
                        stderr=subprocess.PIPE)
     if r.returncode != 0:
