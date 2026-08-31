@@ -1178,10 +1178,31 @@ struct Emitter {
      * candidate here - a silent mis-encoding would be far worse than
      * an abort.
      */
+    /*
+     * ⛔ THE modrm BASE RULE IS ABOUT THE LOW 3 BITS, NOT THE REGISTER
+     * NUMBER (2026-08-20). Six encoders below used to test
+     * `base != 4 && base != 5`, which is right for rsp/rbp and WRONG
+     * for r12/r13: 12 & 7 == 4, so r12 encodes rm=100 and the CPU then
+     * reads a SIB byte that is not there; 13 & 7 == 5 is the
+     * disp32-no-base form under mod=00.
+     *
+     * Nothing passes r12/r13 as a base today, which is precisely why
+     * it was silent. It stops being silent the moment a base register
+     * comes from an ALLOCATOR rather than a literal - so this is a
+     * prerequisite for the register-class work, not a tidy-up.
+     *
+     * `needs_sib` is the whole rule for a displaced form (rm=100 always
+     * means SIB); `no_base_form` is the extra one for mod=00 (rm=101
+     * means disp32-with-no-base). rbp/r13 WITH a disp32 are perfectly
+     * legal, which the old predicate also got wrong, in the harmless
+     * direction.
+     */
+    static bool base_needs_sib(uint8_t base)  { return (base & 7) == 4; }
+    static bool base_no_base_form(uint8_t b)  { return (b & 7) == 5; }
     void load_base(uint8_t reg, uint8_t base, int32_t d)
     {
-        ML_CHECK_MSG(base != 4 && base != 5,
-                     "load_base: rsp/rbp need SIB / a different mod");
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "load_base: rsp/r12 need a SIB byte");
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)
                                 | (base >= 8 ? 0x01 : 0)));
         u8(0x8B);
@@ -1190,8 +1211,8 @@ struct Emitter {
     }
     void store_base(uint8_t reg, uint8_t base, int32_t d)
     {
-        ML_CHECK_MSG(base != 4 && base != 5,
-                     "store_base: rsp/rbp need SIB / a different mod");
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "store_base: rsp/r12 need a SIB byte");
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)
                                 | (base >= 8 ? 0x01 : 0)));
         u8(0x89);
@@ -2105,8 +2126,8 @@ struct Emitter {
      * 64-bit register, which is what the callers rely on). */
     void load32_base(uint8_t reg, uint8_t base, int32_t d)
     {
-        ML_CHECK_MSG(base != 4 && base != 5,
-                     "load32_base: rsp/rbp need SIB / a different mod");
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "load32_base: rsp/r12 need a SIB byte");
         if (reg >= 8 || base >= 8)
             u8(static_cast<uint8_t>(0x40 | (reg >= 8 ? 0x04 : 0)
                                     | (base >= 8 ? 0x01 : 0)));
@@ -2177,7 +2198,8 @@ struct Emitter {
      * the same length the hand-written form used) */
     void lea_base(uint8_t dst, uint8_t base, int32_t d)
     {
-        ML_CHECK_MSG(base != 4, "lea_base: rsp needs a SIB byte");
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "lea_base: rsp/r12 need a SIB byte");
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
                                 | (base >= 8 ? 0x01 : 0)));
         u8(0x8D);
@@ -2186,7 +2208,7 @@ struct Emitter {
     /* lea dst, [base + index*8]  (the element address) */
     void lea_elem_q(uint8_t dst, uint8_t base, uint8_t index)
     {
-        ML_CHECK_MSG((base & 7) != 5,
+        ML_CHECK_MSG(!base_no_base_form(base),
                      "lea_elem_q: rbp/r13 base needs mod=01 + disp8");
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
                                 | (index >= 8 ? 0x02 : 0)
@@ -2198,7 +2220,8 @@ struct Emitter {
     /* cmp reg, [base + disp] */
     void cmp_reg_base(uint8_t reg, uint8_t base, int32_t d)
     {
-        ML_CHECK_MSG(base != 4, "cmp_reg_base: rsp needs a SIB byte");
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "cmp_reg_base: rsp/r12 need a SIB byte");
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)
                                 | (base >= 8 ? 0x01 : 0)));
         u8(0x3B);
@@ -2208,8 +2231,8 @@ struct Emitter {
      * load_base0 (store_base always emits a disp32) */
     void store_base0(uint8_t src, uint8_t base)
     {
-        ML_CHECK_MSG((base & 7) != 4 && (base & 7) != 5,
-                     "store_base0: rsp/rbp cannot use mod=00");
+        ML_CHECK_MSG(!base_needs_sib(base) && !base_no_base_form(base),
+                     "store_base0: rsp/r12 need SIB, rbp/r13 need a disp");
         u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 0x04 : 0)
                                 | (base >= 8 ? 0x01 : 0)));
         u8(0x89);
@@ -2219,8 +2242,8 @@ struct Emitter {
      * unconditional disp32 form) */
     void load_base0(uint8_t dst, uint8_t base)
     {
-        ML_CHECK_MSG((base & 7) != 4 && (base & 7) != 5,
-                     "load_base0: rsp/rbp cannot use mod=00");
+        ML_CHECK_MSG(!base_needs_sib(base) && !base_no_base_form(base),
+                     "load_base0: rsp/r12 need SIB, rbp/r13 need a disp");
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
                                 | (base >= 8 ? 0x01 : 0)));
         u8(0x8B);
@@ -2356,8 +2379,8 @@ struct Emitter {
      */
     void cmp_byte_base(uint8_t base, int32_t d, uint8_t imm)
     {
-        ML_CHECK_MSG(base != 4 && base != 5,
-                     "cmp_byte_base: rsp/rbp need SIB / a different mod");
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "cmp_byte_base: rsp/r12 need a SIB byte");
         if (base >= 8)
             u8(0x41);
         u8(0x80);
