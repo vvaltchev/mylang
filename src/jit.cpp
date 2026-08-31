@@ -12246,6 +12246,28 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
      * they are separate lifetimes: `tmp` is live across an arithmetic
      * op, `cpy` only between one load and its store.
      */
+    /*
+     * ⛔ THESE STAY `= RCX`, AND THE FAILED ATTEMPT IS THE REASON
+     * (2026-08-20). They are the LAST rcx blocker - with rcx pinned,
+     * `movabs rcx, <imm>; imul rax, rcx` here destroys a hot local
+     * (plans/jit-registers.md (af)) - and the obvious fix, asking
+     * alloc_scratch for a free register, was tried and made things
+     * WORSE: corpus_diff with rcx admitted went 23/24 -> 22/24.
+     *
+     * The reason is the one already written at RefScratch: handing back
+     * a DIFFERENT register clobbers whatever the caller left in it, and
+     * `ra` cannot warn, because the untracked scratch registers are not
+     * in `busy`. Excluding rax and rdx is not enough - rsi, rdi, r8 and
+     * r9 carry element-tier roles and type tags at various points.
+     *
+     * So this needs a BORROW (push/pop), like its three siblings. What
+     * makes it harder than they were: the lifetime spans a whole op
+     * emitter with many `return`s and several branches, so the pop must
+     * happen on every path - the same structure that made
+     * emit_store_src_gate refuse a borrow until its two jumps became
+     * one. An RAII guard over the switch, or a single exit point, is
+     * the shape to reach for; do NOT re-try reallocation.
+     */
     const uint8_t tmp = RCX;
     const uint8_t cpy = RCX;
     switch (in.op) {
