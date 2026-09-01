@@ -357,13 +357,13 @@ enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
-    JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_COUNT
+    JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
-    "peep", "bakecallee", "capbase"
+    "peep", "bakecallee", "capbase", "lsra"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -11369,10 +11369,20 @@ static constexpr size_t gp_pool_count()
  * MYLANG_JIT_LSRA=0 is the debugging OPT-OUT - the pick still
  * exists and serves it, so a suspected allocator bug has a
  * same-binary A/B one env var away. */
-bool g_jit_lsra = []() -> bool {
-    const char *s = getenv("MYLANG_JIT_LSRA");
-    return !(s && *s == '0');
-}();
+/*
+ * #103 (A'): `g_jit_lsra` AND `MYLANG_JIT_LSRA` ARE DELETED - the
+ * allocator choice is `JL_LSRA`, one lever like every other.
+ *
+ * It used to be THREE spellings of one gate: the env var, the global
+ * (which the coverage tests set in-process), and - after the lever
+ * landed - `MYLANG_JIT_OFF=lsra`. This codebase has been burned by
+ * exactly that shape before: the fixed-pair tag wrappers whose operand
+ * was in the METHOD NAME, and lever A's two whitelists that drifted
+ * apart. A second spelling is a second thing to keep in step.
+ *
+ * The in-process need is already served by `g_jit_off_extra`, which is
+ * what every other lever's coverage test uses.
+ */
 
 unsigned g_jit_xrot = []() -> unsigned {
     const char *s = getenv("MYLANG_JIT_XROT");
@@ -24118,7 +24128,37 @@ retry_emission:
         std::vector<int> lsra_entry;
         std::vector<int> lsra_aregs;
         std::vector<int> lsra_homes;         /* the home-tier overflow */
-        if (g_jit_lsra) {
+        /*
+         * #103 (A'): THE ALLOCATOR CHOICE IS A LEVER, so it joins the
+         * differential MATRIX.
+         *
+         * `MYLANG_JIT_LSRA=0` has always selected the legacy pick, and
+         * `g_jit_lsra` is settable in-process for the coverage tests
+         * that need the pick's pin sets. What it was NOT is a member
+         * of `jit_lever_names`, so `tests/corpus_diff.sh --levers` -
+         * the matrix CI runs - never covered it. A whole second
+         * allocator was therefore exercised by four hand-written `-rt`
+         * cases and nothing else: the "configuration nobody runs"
+         * shape this file names repeatedly as how a bug hides.
+         *
+         * ⛔ WHY IT IS WORTH A MATRIX SLOT AT ALL, stated honestly:
+         * the two allocators produce DIFFERENT PIN SETS for the same
+         * program (83_regs_int_40 gets `lsra_trans 22` under the scan
+         * and `xcache 1` under the pick), so running the corpus under
+         * both doubles the (slot -> register) pairings a program is
+         * tested against. That is the axis the r9 bug lived in - r9
+         * was raw scratch in emit_ctx_chain_r9 AND in the pin pool,
+         * and the wrong answer appeared only when the allocator
+         * happened to put a hot local there. MYLANG_JIT_XROT already
+         * perturbs that axis and is the stronger of the two; this adds
+         * the pin SET on top of the register CHOICE.
+         *
+         * It cannot see a bug that keeps the answers right - the #123
+         * give-back regression was correct-but-45%-slower and only the
+         * benchmark caught it. A differential is not a substitute for
+         * measuring.
+         */
+        if (!jit_lever_off(JL_LSRA)) {
             SlotLiveness lsl;
             std::vector<LiveInterval> liv;
             std::vector<IntervalQual> lq;
