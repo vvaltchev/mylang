@@ -501,39 +501,74 @@ the pick: the scan SPLITS LIVE RANGES instead of holding a value in a
 caller-saved register for the whole run and spilling it around every
 call. That is the better answer to the same problem.
 
-## THE FORK — a design decision, not a micro-step
+## ⛔ THE "FORK" WAS BUILT ON A MIS-READING — CORRECTED 2026-08-31
 
-| mechanism            | its test               | LSRA reach |
-| caller-saved ext.    | jit_xcache_pins        | 1 - LIVE   |
-| ShareSeam L+1 clamp  | jit_share_region_clamp | 0          |
-| rax as the 13th pin  | jit_rax_pin_test       | 0          |
-| live-range reuse     | jit_range_share_test   | 0          |
+This section used to present three "superseded mechanisms" and ask
+whether to delete them with the pick. TWO OF THE THREE ARE NOT THE
+PICK'S, and the error was reading a counter as if it were a reach
+measurement.
 
-⛔ `xcache` IS LIVE CODE - 46_matrix_mult engages it. So the option of
-"delete the lever and let its test go" would leave LIVE code untested,
-which is the outcome this file's own rules forbid.
+| mechanism           | its test               | what it really is        |
+|---------------------|------------------------|--------------------------|
+| caller-saved pins   | jit_xcache_pins        | SHARED, live (46 only)   |
+| rax as a pin        | jit_rax_pin_test       | SHARED, live (retries)   |
+| ShareSeam / seams   | jit_range_share_test   | PICK-ONLY, structurally  |
+| ShareSeam L+1 clamp | jit_share_region_clamp | PICK-ONLY, structurally  |
 
-  (A) KEEP THE LEVER, reframed. It stops being "the legacy allocator a
-      user might select" and becomes what it actually is: the TEST
-      VEHICLE for pressure shapes the linear scan does not produce,
-      plus the same-binary debugging A/B. Cost: a second allocator path
-      stays compiled.
-  (B) RETIRE THE PICK **AND** DELETE the three superseded mechanisms
-      (rax-as-pin, live-range reuse, the share clamp) with their tests,
-      keeping `xcache` and re-crafting `jit_xcache_pins` around the
-      shape that DOES reach it under LSRA (a nested-array loop like
-      46_matrix_mult, not the current max-pin int loop). Cost: a large
-      deletion of #96 machinery that measured wins when it was built.
-  (C) Retire the pick, keep the mechanisms, let the four tests go.
-      REJECTED - it leaves live code untested.
+**xcache is SHARED.** Since #123 both allocators bind pins through the
+same `ra.take(CAP_ALLOCATABLE)`. There is no xcache code path - only
+"the allocator handed out a caller-saved register", plus the
+save/restore `emit_call_prologue`/`epilogue` already emits. The scan
+reaches it on 46_matrix_mult. Deleting it would forbid the allocator 9
+of its 13 registers, i.e. undo #123.
 
-RECOMMENDATION: **(A) for now, (B) as a separate, explicitly-scoped
-task.** The measured reason is the third row of the table: the pick is
-no longer a shipping alternative, and saying so in the code is most of
-the value; deleting #96's machinery is a bigger, separable decision
-that wants its own before/after, and (B)'s re-craft of
-`jit_xcache_pins` is real work with a real chance of ending in "no
-shape reaches it", which would itself be a finding.
+**rax is SHARED, and `rax_pin` is the WRONG COUNTER.** It counts
+fragments that RAN with rax pinned - 0, because the eviction worked.
+`rax_retries` counts rax being chosen, conflicting, and the chunk
+re-emitting with it denied: **1 on each of 83/82/81_regs_int under the
+shipping allocator**. The machinery fires. The absence of a pin is its
+SUCCESS, not its death.
 
-WHAT IS DONE EITHER WAY: increment 0's measurement, and four tests
-moved off the legacy path onto the shipping one.
+**ShareSeam IS pick-only**, and structurally: under trans mode
+`spill_hot = lsra_homes`, so the scan substitutes its own overflow plan
+and the share plan never runs (`range_share` 0, `share_clamped` 0). It
+is the one genuine deletion candidate here, and it is small and
+self-contained - a separate question, not a fork attached to #103.
+
+⛔ **THE LESSON, and it is the transferable part: a counter reading 0
+may be measuring a mechanism that WORKED.** `rax_pin` and
+`rax_retries` differ by exactly that. Ask what a counter is bumped BY
+before concluding a path is dead - the same discipline as "an
+emitted-code counter proves the code was EMITTED; when the thing that
+broke is a GUARD, reach is zero and the counter looks exactly like
+'the tier was never nativized'".
+
+## AND THE SCAN-SIDE TEST WAS PROPOSED AND WITHDRAWN
+
+The proposal was: since 46_matrix_mult reaches xcache under the scan,
+write a test proving it works there. TWO attempts to build the shape
+FAILED - a two-deep `while` nest over arrays-of-arrays, and a close
+replica of 46's function-with-three-counted-loops - both giving
+`lsra_trans` and no xcache. Something specific about 46 triggers it and
+what that is, is not known.
+
+So it is NOT the small win it was described as, and a half-crafted
+version would pass while checking nothing. WITHDRAWN. What is worth
+recording instead is the fact itself: **46_matrix_mult is the only
+corpus program that makes the scan use a caller-saved register.**
+
+## WHAT #103 ACTUALLY DELIVERED
+
+ - increment 0: the legacy pick decides 75 of 335 runs and pins
+   NOTHING in any of them;
+ - four of eight coverage tests moved off the legacy allocator onto
+   the shipping one (two of them only possible because #123 made the
+   C2b pair ask the allocator rather than predict);
+ - the allocator choice became an ORDINARY LEVER (`JL_LSRA`), with
+   `MYLANG_JIT_LSRA` and `g_jit_lsra` deleted - three spellings of one
+   gate became one - and `corpus_diff --levers`, hence CI, now covers
+   it. NOT vacuous: 21 of 35 corpus programs emit different machine
+   code under the two allocators.
+
+OPEN, small and separable: whether to delete the ShareSeam family,
+which is the only genuinely pick-only code here.
