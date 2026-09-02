@@ -22946,12 +22946,37 @@ struct Run { size_t begin, end; };   /* [begin, end) in OLD pc space */
  * the SITE's business, not this chunk predicate's. */
 bool jit_chunk_norec_ok(const Chunk &chunk)
 {
+    /*
+     * ⛔ #97 increment 0: THE CACHED-CALL REFUSAL IS ABOUT THE CACHE,
+     * SO IT DOES NOT APPLY WHEN THE CACHE IS OFF.
+     *
+     * `norec_had_cached` means "this body contains a CachedCallV", and
+     * it refuses the tier because a cached-call body could acquire a
+     * live vframe pure cache, which a record-less return cannot stash.
+     * That is a statement about a PureCache EXISTING.
+     *
+     * `-npc` (g_pure_cache_enabled = false) disables the cache, and -
+     * this is the part that made the refusal wrong - it does NOT change
+     * codegen: the CachedCallV opcodes are emitted identically, `-vd`
+     * byte for byte. So under `-npc` a body carries the opcode, can
+     * never build a cache, and was refused anyway.
+     *
+     * That is not a corner case: `-npc` is what EVERY benchmark run
+     * uses (CLAUDE.md's rule - the memo table is not a language
+     * comparison, and it makes `scale` non-linear). 09_fib_recursive,
+     * the one bench the whole tier exists for, was excluded from it in
+     * the only configuration anyone measures. Worth -20.7% Ir there.
+     *
+     * ⛔ SOUNDNESS rests on "no PureCache exists when the flag is off",
+     * which is now an ML_CHECK in `Frame::ensure_pure_cache` - the ONE
+     * allocation site - rather than an audit someone did once. The flag
+     * is set during argument parsing, before any JIT compilation, and
+     * nothing else writes it, so this is a compile-time-stable fact and
+     * `-vdj` stays reproducible.
+     */
     if (!chunk.plain_frame || chunk.code.empty()
             || chunk.ref_slots.size() > RET_REF_GUARD_MAX
-            || chunk.norec_had_cached)   /* 4-v: a cached-call body could
-                                          * acquire a live vframe pure
-                                          * cache, which a record-less
-                                          * return cannot stash */
+            || (chunk.norec_had_cached && g_pure_cache_enabled))
         return false;
     for (const Instr &in : chunk.code)
         if (in.op != OpCode::EnterNative)
