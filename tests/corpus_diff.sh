@@ -96,6 +96,22 @@ MODE=${2:-}
 LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2 \
 mfact cest relent norec argfuse xcache scache rshare peep bakecallee \
 lsra"
+
+# ⛔ AN ASan LANE MUST BOUND ITSELF, OR A RUNAWAY TAKES THE MACHINE DOWN
+# INSTEAD OF FAILING (2026-09-03).  This script spawns a process per
+# (config x program) - the levers matrix alone is 23 x 34 - and under
+# AddressSanitizer a single runaway allocation is not a bounded failure:
+# it is an out-of-memory kill of whatever else is running, with the
+# harness dying before it can print WHICH config was at fault.  That
+# happened twice, and the log said nothing at all because the shell died
+# with its output still buffered.
+#
+# `hard_rss_limit_mb` makes ASan itself abort the offending process, so
+# the failure arrives as a NAMED report attributed to one program and one
+# config - which is what an instrument owes its reader.  Only set when the
+# caller has expressed no preference; a real ASAN_OPTIONS always wins.
+: "${ASAN_OPTIONS:=hard_rss_limit_mb=8000}"
+export ASAN_OPTIONS
 COLD_TIERS="refstore"
 # ⛔ DERIVED FROM THE BINARY, NOT HARDCODED (2026-08-18). This was
 # `XROTS="0 1 2 3"`, a literal, and the whole point of the mode is that
