@@ -11486,9 +11486,208 @@ TWO METHOD NOTES, both mistakes made here:
    use - the pins spill to their slot payloads and reload after,
    exactly the trade the caller-saved extension already makes for
    helper calls. That is call-protocol surgery and belongs with #97.
- - **RETIRING THE PICK** (#103's residual). NOTE the positional zip is
-   already gone - both allocator modes bind through `ra.take` - so what
-   is left is deleting the non-LSRA RANKING path and reworking the
-   eight coverage tests that force `g_jit_lsra = false`. It changes
-   which SLOTS are chosen, never which REGISTERS are used.
+ - **RETIRING THE PICK** (#103's residual; PARTLY DONE - see the #103
+   entry below, 2026-08-31). NOTE the positional zip is already gone -
+   both allocator modes bind through `ra.take`. #103 then made the
+   choice an ORDINARY LEVER (`MYLANG_JIT_OFF=lsra`, in
+   `corpus_diff --levers` and so in CI), deleted the `MYLANG_JIT_LSRA`
+   env var and the `g_jit_lsra` global, and took the tests that force
+   the legacy pick from eight to four. What is STILL left is deleting
+   the non-LSRA RANKING path itself and reworking those four. It
+   changes which SLOTS are chosen, never which REGISTERS are used.
 
+
+---
+
+## #103 - THE ALLOCATOR CHOICE BECOMES AN ORDINARY LEVER, AND A WHOLE
+## SECOND ALLOCATOR STOPS BEING "THE CONFIGURATION NOBODY RUNS"
+## (2026-08-31)
+
+**THE SUBJECT.** Two register allocators ship. The linear SCAN
+(`jit_lsra_assign` + snap/transitions + the float twin) chooses the
+register plan by default since 2026-08-26; the legacy PICK assigns one
+register per variable per run. Which one ran was decided by THREE
+spellings of one gate - the `MYLANG_JIT_LSRA` env var, the `g_jit_lsra`
+global the coverage tests set in-process, and the lever bit - and the
+lever was in NO differential matrix.
+
+**WHAT THAT COST, stated as REACH:** the pick was exercised by FOUR
+hand-written `-rt` cases and by nothing else. Not `corpus_diff`, not
+its `--levers` / `--cold` / `--xrot` / `--nolowmem` matrices, not CI.
+That is the `LTO=0` shape and the `MYLANG_NO_LOWMEM` shape exactly - a
+configuration a user can select that no net can enter.
+
+**THE CHANGE.** `JL_LSRA` joins the lever enum and `jit_lever_names`;
+`MYLANG_JIT_LSRA` and `g_jit_lsra` are DELETED; the in-process need is
+`g_jit_off_extra`, the seam every other lever's test already uses; and
+`tests/corpus_diff.sh` gains `lsra` to `LEVERS`, so CI runs the whole
+corpus under the legacy pick on every push. A suspected allocator bug
+is now one lever away from a same-binary A/B.
+
+**IT IS NOT VACUOUS, and the number is the evidence: 21 of the 35
+corpus programs emit DIFFERENT machine code under the two allocators.**
+That is 21 programs' worth of alternative slot -> register assignment,
+which is precisely the axis the r9 bug lived in.
+
+**⛔ WHAT A LEVER MATRIX STRUCTURALLY CANNOT SEE.** #123's give-back
+regression was correct-but-45%-slower: `-rt` 1978/1978, `corpus_diff`
+34/34, every fuzzer green, and only the benchmark caught it. Adding
+`lsra` to the matrix buys CORRECTNESS coverage over a second register
+plan. It buys nothing against a performance regression, and this entry
+should not be read as if it did.
+
+**⛔ AND THE INCREMENT-0 MEASUREMENT WAS READ WRONG ONCE. THE LESSON IS
+ABOUT COUNTERS, NOT ABOUT ALLOCATORS.** The question was "which
+mechanisms exist only for the pick, and would die with it?" Three
+candidates were named - xcache, the rax pin, and ShareSeam - and the
+first two were wrongly called pick-only, from counters that read ZERO:
+
+ - **xcache is SHARED and LIVE.** Since #123 both allocators bind pins
+   through the same `ra.take(CAP_ALLOCATABLE)`; there is no separate
+   xcache path left, only "the allocator handed out a caller-saved
+   register" plus the save/restore `emit_call_prologue`/`epilogue`
+   already does. The scan reaches it on 46_matrix_mult (`xcache 1`).
+ - **the rax pin is SHARED and LIVE, and `rax_pin` IS THE WRONG
+   COUNTER.** `rax_pin` counts fragments that RAN with rax pinned - 0,
+   *because the eviction worked*. `rax_retries` counts rax being
+   chosen, conflicting, and the chunk re-emitting with it denied: **1
+   on each of 83/82/81_regs_int, under the shipping allocator.** The
+   machinery fires; the absence of a pin is its SUCCESS.
+ - **ShareSeam / `range_share` IS pick-only**, and structurally so:
+   under trans mode `spill_hot = lsra_homes`, so the scan substitutes
+   its own overflow plan and the share plan never runs (`range_share`
+   0, `share_clamped` 0 corpus-wide). It is the one real deletion
+   candidate if the pick ever goes.
+
+**THE GENERAL RULE, and it is worth more than the increment: A COUNTER
+THAT READS 0 MAY BE MEASURING A MECHANISM THAT WORKED, NOT ONE THAT
+NEVER RAN.** Ask what the counter is bumped BY before concluding a path
+is dead. `rax_pin` and `rax_retries` differ by exactly that, and only
+the second answers "did the rax machinery execute".
+
+**WHAT THE SCAN DOES ANSWER DIFFERENTLY** (the sound half of the
+original claim): pin pressure. 83_regs_int_40 gets `lsra_trans 22`
+where the pick gets `xcache 1`.
+
+**RESIDUAL: retiring the pick outright is NOT done and is separable.**
+The positional zip is already gone - both modes bind through `ra.take` -
+so what remains is deleting the non-LSRA RANKING path and reworking the
+four coverage tests that still force the lever off for their duration
+(`jit_xcache_pins`, `jit_rax_pin_test`, `jit_range_share_test`,
+`jit_share_region_clamp`). It changes which SLOTS are chosen, never
+which REGISTERS are usable.
+
+---
+
+## #97 increment 0 - A REFUSAL THAT GUARDS AN OPTIONAL FEATURE'S HAZARD
+## MUST ASK WHETHER THE FEATURE IS ON (2026-09-02)
+
+**THE ANOMALY THAT OPENED IT.** `MYLANG_JIT_OFF=norec` turns the
+record-LESS call tier off, so the A/B is what NOT writing a `VmCallRec`
+already buys (callgrind Ir, `-npc`, scale 1):
+
+    bench                 norec on       norec off     the record costs
+    11_closure_counter    132,279,738   176,261,165        +33.25%
+    78_typed_param_call   358,136,934   446,101,906        +24.56%
+    76_funcval_dispatch   334,676,075   375,648,512        +12.24%
+    09_fib_recursive      152,679,514   145,422,118         -4.75%
+
+09_fib is the one bench the whole #97 arc exists for, and the tier that
+already exists was costing it 4.75%. Nothing in the record said why.
+
+**WHAT THE PROFILE FOUND: THE TIER NEVER FIRES THERE.** 555,823 call
+gates, **ZERO** record-less pushes (78 makes 2,000,001). Every gate is
+refused by `norec_had_cached` - fib is a pure tree-recursion, so the
+optimizer rewrites its self-calls into `CachedCallV`, and that flag
+means *"this body could acquire a live vframe pure cache, which a
+record-less return cannot stash"*.
+
+**⛔ AND THE HAZARD CANNOT OCCUR IN THE CONFIGURATION EVERY MEASUREMENT
+USES.** `-npc` disables the per-frame pure-call cache, and it does NOT
+change codegen: the `CachedCallV` opcodes are emitted identically,
+`-vd` byte for byte. So under `-npc` a body carries the opcode, can
+never build a cache, and was refused anyway. That is not a corner case -
+CLAUDE.md REQUIRES `-npc` for every measurement (the memo table is not
+a language comparison, and it makes `scale` non-linear).
+
+**THE FIX is one conjunct** in `jit_chunk_norec_ok`:
+
+    || (chunk.norec_had_cached && g_pure_cache_enabled)
+
+With the cache ON it still declines, which is correct - there the
+hazard is real.
+
+**MEASURED** (callgrind Ir, deterministic, `-npc`, scale 1):
+
+    09_fib_recursive   152,662,523 -> 120,995,037    -20.7%
+    norec_pushes                0 -> 555,823
+
+**BLAST RADIUS: NIL.** 16 benches swept, max |delta| **0.12%**
+(46_matrix_mult); 11/78/76/63 and every non-recursive bench are flat to
+±0.05%. The change reaches exactly the shape it was aimed at.
+
+**WALL CLOCK (2026-09-03, interleaved `--baseline`, both sides
+`OPT=1 ASSERTS=0`, `-npc`, 90 benches):**
+
+    09_fib_recursive     0.250s -> 0.177s     0.71x
+    suite geomean cur/base                    0.996x
+
+⛔ **AND THE CLOCK MOVED MORE THAN THE INSTRUCTION COUNT — -29% wall
+against -20.7% Ir — WHICH IS THE OPPOSITE OF THE GUARD-ELISION
+SIGNATURE** this project has recorded three times (delete N free
+instructions, measure flat). What the tier stops doing is WRITE a
+~19-field `VmCallRec` per call: a store burst plus the cache lines
+under it, not a predicted branch over an L1 hit. Memory traffic is the
+thing that has moved the clock every time on this arc (#111: 0.86x;
+#112: ~1%), and it did again.
+
+Three other benches read outside ±5% (52_cse_dedup 0.93x, 61_popcount
+0.94x, and at the other end 51_purefunc_fold / 53_collatz 1.05x) on
+absolute times of 2-38 ms. **They are noise and that is PROVEN, not
+assumed** — callgrind Ir on all of them plus 54_mandelbrot is flat to
+0.00-0.01%, the residual being one extra `g_pure_cache_enabled` load at
+JIT-compile time. A ratio on a sub-40 ms bench is evidence of nothing;
+the deterministic metric is.
+
+**⛔ SOUNDNESS IS MACHINE-CHECKED, NOT AUDITED.** The fix rests
+entirely on *"no PureCache exists when the flag is off"*. That held by
+audit - every path to the single allocation site tests the flag first
+(`pure_cache_call`'s two callers, `vm_cache_probe_vals`' four, and
+`vm_frame_leave_cached`, reachable only through a probe-parked key) -
+but an audit is a SNAPSHOT and this is now a precondition of EMITTED
+CODE. So the invariant lives as an `ML_CHECK_MSG` inside
+`Frame::ensure_pure_cache()`, the one allocation site, which aborts by
+name if a cache is ever built with the cache disabled. WATCHED FAILING:
+dropping the flag test in `jit_cached_probe` gives rc=134 with the
+named assertion. `g_pure_cache_enabled` moved above `Frame` in eval.h
+so the check compiles.
+
+`-vdj` stays reproducible: the flag is set during argument parsing,
+before any JIT compilation, and nothing else writes it - a
+compile-time-stable fact, like `lowmem` or a lever.
+
+**⛔ IT SUPERSEDES A SMALLER FIX THAT WAS BUILT AND DROPPED, AND THE
+TWO CONFLICT.** The first answer was *"a self-recursive call cannot
+read its own callee's `norec_ok` (§the seventh audit-table shape), so
+it emits a runtime fork plus a dead record-less arm"* - true, and
+eliding that fork is -4.01%. But skipping the fork stops the tier from
+ever firing, so the smaller fix actively PREVENTS this one. When two
+fixes address the same symptom, check whether one closes the door the
+other needs open.
+
+**THE GENERALISABLE HALF.** A gate that refuses on a hazard should
+name the hazard's PRECONDITION, not just its shape. `norec_had_cached`
+described a shape (*this body contains a cached call*) and was read as
+if it described a hazard (*a cache may be live*). The two differ by one
+runtime flag, and in every configuration this project MEASURES in, the
+flag is off. The failure mode is silent by construction: an A/B still
+runs, still prints a number, and the number is an honest measurement of
+a tier that never executed.
+
+**WHAT IT MEANS FOR THE PLAN.** `plans/frameless-callee.md` §0.5's
+table is the frameless tier's motivation, and its worst row was this
+one. 09_fib now reads **+20.7%** where it read -4.75%, so the
+record-less tier wins on all four benches and the frameless tier -
+which additionally removes the record READ - keeps its premise. It does
+NOT make the frameless tier cheaper to build; it moves 09_fib's
+baseline.
