@@ -2307,6 +2307,30 @@ vm_compile(const Construct *root_c, bool jit)
     g_func_chunks.clear();
 
     VmProgram prog;
+
+    /*
+     * #97 E1 - THE LIVE-DESCRIPTOR SET, installed before ANY codegen runs.
+     *
+     * `CallExpr::callee_desc` names the callee a value-call site reaches,
+     * but the optimizer stack can free the decl that owns that descriptor
+     * (an inline lambda dies with the call expression that held it), so
+     * codegen must never DEREFERENCE a stamp it has not first found here.
+     * Built from `collect_funcs` over the FINAL tree - the same walk that
+     * decides which bodies to compile and which descriptors the program
+     * image takes ownership of, so the three cannot drift.
+     *
+     * ⛔ IT MUST WRAP BOTH `codegen_program` (MAIN, right below - where
+     * every headline bench's call loop lives) AND `vm_precompile_all` (the
+     * function bodies). Installing it inside the latter left main's chunk
+     * compiled with a NULL set, so every stamp declined and the tier was
+     * silently inert - and the reach counter read exactly like "the
+     * liveness gate is too strict" rather than "the gate never ran".
+     */
+    std::vector<const FuncDeclStmt *> funcs;
+    for (const auto &e : root->elems)
+        collect_funcs(e.get(), funcs);
+    CodegenLiveDescs live_guard(funcs);
+
     /* #55 STEP 2: codegen main WITHOUT jit - its native_leaf flag is still set;
      * jit is deferred to below, after Pass A has set every function's flag (a
      * top-level native call to a function needs the callee's flag). */
@@ -2331,10 +2355,11 @@ vm_compile(const Construct *root_c, bool jit)
      * descriptor and struct type def out of the AST into the program image,
      * so the tree is droppable. The decls keep their raw aliases (desc/def),
      * which stay valid - a unique_ptr move does not relocate the pointee. The
-     * walks use the COMPLETE child visitor, so no decl is missed. */
-    std::vector<const FuncDeclStmt *> funcs;
-    for (const auto &e : root->elems)
-        collect_funcs(e.get(), funcs);
+     * walks use the COMPLETE child visitor, so no decl is missed.
+     * `funcs` is the SAME collection the live-descriptor set was built from
+     * above - one walk, so the set and the ownership transfer cannot
+     * disagree about which functions exist. */
+
     for (const FuncDeclStmt *fn : funcs)
         if (fn->desc_owner)
             prog.funcs.push_back(

@@ -20076,13 +20076,33 @@ static bool jit_callee_cache_hit()
         g_exec_engine = saved;
         return ok;
     };
-    /* MONOMORPHIC: 200 calls through one closure - the cache must hit. */
+    /*
+     * MONOMORPHIC: 200 calls that reach ONE closure at run time - the
+     * cache must hit.
+     *
+     * ⛔ THE CALLEE MUST BE ONE THE COMPILER CANNOT NAME, and that is a
+     * #97-E1 SHAPE EATER, not a stylistic choice. The obvious spelling -
+     * `var f = mk(3); ... f()` - is monomorphic AND nameable, so since E1
+     * the callee-set analysis names it, the site BAKES, and the cache arm
+     * it is testing never runs (this test failed exactly that way on E1's
+     * first run, which is what it is for).
+     *
+     * So the callee is picked out of an array holding TWO DIFFERENT lambda
+     * DECLS: the set has two candidates, no stamp is written, and the site
+     * falls to the cache tier - while at RUN time index 0 is always the
+     * same closure, so the cache hits from entry 0 on every call after the
+     * first. Two decls and not two closures of one decl, for the reason the
+     * polymorphic half below records: closures of one decl SHARE a
+     * descriptor, so the set would collapse to one and it would bake again.
+     */
     const unsigned long b0 = g_jit_callee_cache;
     const unsigned long b2 = g_jit_callee_cache2;
     if (!run({
-            "func mk(dyn k) { return func [k] () { return k; }; }",
+            "func mk1(dyn k) { return func [k] () { return k; }; }",
+            "func mk2(dyn k) { return func [k] () { return k + 100; }; }",
             "func drive(int n) {",
-            "  var f = mk(3);",
+            "  var fns = [mk1(3), mk2(8)];",
+            "  var f = fns[0];",
             "  var s = 0;",
             "  for (var i = 0; i < n; i++) s += f();",
             "  return s;",

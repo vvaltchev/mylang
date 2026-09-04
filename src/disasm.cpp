@@ -454,6 +454,24 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << ";   pc" << l.pc << " -> " << l.start.line << ":"
               << l.start.col << "\n";
     }
+    if (!ch.value_callees.empty()) {
+        /* #97 E1: the callee #116's analysis NAMED for a value-call site,
+         * as a closure_defs index - what the JIT bakes, and what its
+         * emitted identity compare then checks at run time. */
+        s << "; -- value_callees: call pc -> closure_defs idx (name) ("
+          << ch.value_callees.size() << ") --\n";
+        for (const auto &e : ch.value_callees) {
+            const FuncDescriptor *fd =
+                (e.def >= 0
+                 && static_cast<size_t>(e.def) < ch.closure_defs.size())
+                    ? ch.closure_defs[static_cast<size_t>(e.def)]
+                    : nullptr;
+            s << ";   pc" << e.pc << " -> [" << e.def << "] "
+              << (!fd ? std::string("<?>")
+                      : fd->name ? std::string(fd->name->val)
+                                 : std::string("<lambda>")) << "\n";
+        }
+    }
     if (!ch.inline_ctxs.empty()) {
         s << "; -- inline_ctxs (" << ch.inline_ctxs.size() << ", "
           << ch.inline_frames.size() << " frames) --\n";
@@ -2099,6 +2117,12 @@ std::string disassemble_program(const Block *root)
     std::vector<const FuncDeclStmt *> funcs;
     for (const auto &e : root->elems)
         collect_funcs(e.get(), funcs);
+
+    /* #97 E1: the same live-descriptor set a real compile installs - this is
+     * a SECOND codegen driver, and without it `-vd` dumps the un-baked form
+     * of a program a real run bakes (caught exactly that way: the image had
+     * the value_callees table and the fresh dump did not). */
+    CodegenLiveDescs live_guard(funcs);
 
     /* #55 STEP 2: dump EXACTLY what execution runs, native calls included. The
      * VM's precompile (vm_precompile_all) codegens ALL bodies THEN jits ALL

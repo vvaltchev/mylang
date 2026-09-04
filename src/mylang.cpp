@@ -722,6 +722,17 @@ int main(int argc, char **argv)
                 return 0;
             }
             vm_run(prog);
+            /*
+             * The image path had its OWN `return 0`, so it skipped both
+             * reports at the end of main - MYLANG_JITSTATS printed NOTHING
+             * for a `.myv` run. That is not cosmetic: the counters are how
+             * "which tier did this program's calls take?" is answered, and
+             * a SILENT instrument reads exactly like a tier that declined
+             * (it did: a loaded image was believed not to bake its callees,
+             * for as long as it took to instrument the emitter by hand).
+             */
+            jit_cache_audit_report();  /* no-op unless MYLANG_CACHEAUDIT=1 */
+            jit_stats_report();        /* no-op unless MYLANG_JITSTATS=1 */
             return 0;
         }
 

@@ -7513,12 +7513,40 @@ static const JitCtx *g_cur_jc = nullptr;
  * stale-pointer identity bug CLAUDE.md warns about, and the reason the
  * callee CACHE stores descriptors too.
  */
-static const FuncDescriptor *jit_baked_callee(int callee_arg, bool is_value)
+static const FuncDescriptor *jit_baked_callee(const Chunk &ck, size_t old_pc,
+                                              int callee_arg, bool is_value)
 {
-    if (is_value)                    /* the callee is a runtime VALUE */
-        return nullptr;
     if (jit_lever_off(JL_BAKECALLEE))
         return nullptr;
+    if (is_value) {
+        /*
+         * #97 E1 - THE VALUE CALLEE, NAMED. The callee is a runtime value
+         * in a temp, so there is no slot to read a descriptor from; the
+         * answer comes from #116's callee-set analysis instead, carried
+         * past the AST teardown in Chunk::value_callees (bytecode.h).
+         *
+         * ⛔ NO WRITE-ONCE ANALOGUE IS NEEDED HERE, and that is not an
+         * omission. The named path's write-once test is a PROFITABILITY
+         * gate - a reassigned slot would fail the identity compare on
+         * every call and lose the cache that would have hit. The
+         * callee-set stamp already carries the same property by
+         * construction: it is a MUST answer (|set| == 1, not ⊤, not
+         * escaped), and a flow-insensitive set unions every assignment,
+         * so a variable that is ever rebound to a different function has
+         * TWO candidates and is never stamped.
+         *
+         * Soundness is the emitted identity compare below, exactly as it
+         * is for the named path - the analysis being wrong would cost a
+         * slow path, never a wrong answer.
+         */
+        const int32_t di = ck.value_callee_at(old_pc);
+        if (di < 0 || static_cast<size_t>(di) >= ck.closure_defs.size())
+            return nullptr;
+        const FuncDescriptor *d = ck.closure_defs[static_cast<size_t>(di)];
+        if (!d || !d->vm_chunk)
+            return nullptr;
+        return d;
+    }
     const JitCtx *jc = g_cur_jc;
     if (!jc || !jc->slot_desc || !jc->slot_reassigned)
         return nullptr;              /* no program context (disasm, -rt) */
@@ -7683,7 +7711,8 @@ static const ArgFuse *argfuse_at(size_t old_pc)
  * contains one, so no pin can exist where this emits and every
  * register below is protocol, not scratch-by-assumption. */
 static void emit_sync_push_native(Emitter &e, const Chunk &ck,
-                                  const Instr &in, bool is_value,
+                                  const Instr &in, size_t old_pc,
+                                  bool is_value,
                                   bool cached, int callee_arg,
                                   std::vector<size_t> &j_slow,
                                   std::vector<size_t> &j_done,
@@ -7701,13 +7730,17 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
      * asks about the DESCRIPTOR, and for a write-once global slot the
      * emitter already knows which descriptor that is (jit_baked_callee).
      * So the five gates are decided HERE, at compile time, and what
-     * survives to run time is one identity compare. `bake` is null - and
-     * every baked branch inert - for a value callee, a reassignable
-     * slot, a callee whose chunk is missing or not yet native, or a
-     * coercing one (kept out of v1: its per-argument checks are a
-     * separate shape).
+     * survives to run time is one identity compare. Since #97 E1 the
+     * emitter has a SECOND naming source - #116's callee-set answer for
+     * a VALUE callee, carried in Chunk::value_callees - so a closure a
+     * factory returned bakes exactly like a global-slot function.
+     * `bake` is null - and every baked branch inert - for an UNNAMED
+     * value callee, a reassignable slot, a callee whose chunk is missing
+     * or not yet native, or a coercing one (kept out of v1: its
+     * per-argument checks are a separate shape).
      */
-    const FuncDescriptor *bake = jit_baked_callee(callee_arg, is_value);
+    const FuncDescriptor *bake =
+        jit_baked_callee(ck, old_pc, callee_arg, is_value);
     const Chunk *bake_ck =
         bake ? static_cast<const Chunk *>(bake->vm_chunk) : nullptr;
     if (bake
@@ -8967,7 +9000,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                    + ck.n_temps)
             : 0;
     const ArgFuse *af = argfuse_at(old_pc);
-    emit_sync_push_native(e, ck, in, is_value,
+    emit_sync_push_native(e, ck, in, old_pc, is_value,
                           in.op == OpCode::CachedCallV,
                           static_cast<int>(callee_arg), j_slows, j_dones,
                           cell, ns, residue, af);
@@ -23483,6 +23516,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &l : chunk.base_locs)          /* #127 */
         l.pc = static_cast<uint32_t>(remap[l.pc]);
+    for (auto &vc : chunk.value_callees)     /* #97 E1 */
+        vc.pc = static_cast<uint32_t>(remap[vc.pc]);
     for (auto &ic : chunk.inline_ctxs)
         ic.pc = static_cast<uint32_t>(remap[ic.pc]);
     /* #78: the handler table's pcs are resumes into ordinary code, remapped
@@ -26393,6 +26428,8 @@ retry_emission:
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &l : chunk.base_locs)          /* #127 */
         l.pc = static_cast<uint32_t>(remap[l.pc]);
+    for (auto &vc : chunk.value_callees)     /* #97 E1 */
+        vc.pc = static_cast<uint32_t>(remap[vc.pc]);
     for (auto &ic : chunk.inline_ctxs)
         ic.pc = static_cast<uint32_t>(remap[ic.pc]);
     /* #78: the handler table's pcs are RESUMES (a catch body / the shared

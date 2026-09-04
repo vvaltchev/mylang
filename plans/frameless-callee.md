@@ -334,11 +334,43 @@ Each ends with a MEASUREMENT that can kill the next one.
    blast radius nil. It was NOT "most of E2's win": E2 removes the
    record READ in the CALLER, which is untouched. See §0.5.
 
-**1. E1 — the value callee gets named.** Smallest, uses analysis that is
-   already done and already stamped, and it is the maintainer's stated
-   first priority. GATE: `frameless_calls` must go from 0 to ~2,000,000
-   on 78 and ~1,000,000 on 11. If it does not, stop — the naming path is
-   wrong and nothing downstream matters.
+**1. E1 — the value callee gets named.** ✅ **DONE 2026-09-03.**
+
+   ⛔ **THE GATE AS WRITTEN WAS IN THE WRONG UNIT, and that is worth more
+   than the increment.** `frameless_calls` is bumped by a C++ `++` inside
+   the emitter, so it counts SITES × their emission — 78 has TWO hot
+   sites, not two million. The number ~2,000,000 belongs to
+   `bake_push`, which is bumped by EMITTED code and so counts
+   EXECUTIONS. Reading the two as one unit is the same mistake #103
+   recorded (`rax_pin` vs `rax_retries`): **ask what a counter is bumped
+   BY before you write a threshold against it.**
+
+   MEASURED, restated per counter (`-npc`, scale 1):
+
+       bench                 bake_push (exec)      frameless_calls (sites)
+       11_closure_counter    1 -> 1,000,001        1 -> 2
+       63_closures           400,000 -> 1,000,000  2 -> 5
+       12_higher_order       -                     0 -> 1
+       09_fib_recursive      555,832 (unchanged - already named)
+       76_funcval_dispatch   unchanged             unchanged
+       78_typed_param_call   unchanged             unchanged
+
+   **76 IS A CORRECT DECLINE, NOT A MISS.** Its `ops[i % 2]` really can
+   reach two different functions, so the callee set has two candidates
+   and no stamp is written. That is the analysis answering honestly.
+
+   ⛔ **78 IS BLOCKED BY A GATE THAT HAS NOTHING TO DO WITH NAMING, AND
+   THE PLAN PICKED IT AS THE HEADLINE BY ACCIDENT.** Its callees ARE
+   named (`-dcs` says `one lambda@19:12`). They are refused by the FIRST
+   bake gate, `bake->fast_bind`, because `compute_bind_flags` clears
+   `fast_bind` for ANY parameter annotated `int` or `float` - and 78
+   exists precisely to measure ANNOTATED parameters. 11's lambda takes
+   no parameter at all, which is the whole reason it moved and 78 did
+   not. Extending the bake to a COERCING callee (per-argument coercion
+   in the emitted bind) is real work and was explicitly out of v1 scope
+   in #97 step 4; it is now the thing standing between this arc and its
+   own flagship bench. **It should be its own increment, sized on its
+   own, not smuggled into E1.**
 
 **1b. THE CALL SITE BRACKETS ITS PINS (§3b, inherited from #123).**
    The caller runs on 4 pinnable registers of 13 today, and increment

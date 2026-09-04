@@ -1237,6 +1237,7 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
     for (auto &cp : calls) {
         CallExpr *call = cp.first;
         call->callee_fn = nullptr;
+        call->callee_desc = nullptr;
         if (cs_struct_callee(call->what.get()))
             continue;                     /* a construction, not a call */
         const CsSet cs = callee_set(call->what.get());
@@ -1248,6 +1249,9 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
         if (callee_escaped(fi))
             continue;
         call->callee_fn = fi->decl;
+        /* #97 E1: the same answer, as the program-lifetime DESCRIPTOR, for
+         * consumers that run after the optimizers have freed decls. */
+        call->callee_desc = fi->decl->desc;
     }
 }
 

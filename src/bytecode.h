@@ -1509,6 +1509,12 @@ struct CgInstr : Instr {
      * node_idx can only carry one. -1 = this op records no base caret.
      * Codegen-transient like node_idx. */
     int32_t base_node_idx = -1;
+    /* #97 E1: the closure_defs index of the callee this CallValueV site
+     * can reach, from #116's callee-set stamp - or -1 for "not named".
+     * Codegen-transient like node_idx: it becomes a pc-keyed entry in
+     * Chunk::value_callees when the chunk is finalized, because the pc
+     * is not known until then. */
+    int32_t callee_def_idx = -1;
     CgInstr() = default;
     CgInstr(const Instr &i) : Instr(i) {}
 };
@@ -1972,6 +1978,54 @@ struct Chunk {
     bool base_loc_at(size_t pc, Loc &start, Loc &end) const
     {
         return loc_lookup(base_locs, pc, start, end);
+    }
+
+    /*
+     * #97 E1 - THE NAMED CALLEE OF A VALUE CALL SITE.
+     *
+     * `CallValueV`'s callee is a runtime VALUE in a temp (a closure a
+     * factory returned, a lambda in a variable), so the emitter has no
+     * slot to read a descriptor from and `jit_baked_callee` declined
+     * every such site. But #116's callee-set analysis NAMES it - a MUST
+     * answer, |set| == 1 and not escaped - and stamps it on the AST as
+     * `CallExpr::callee_fn`. This table carries that answer past the AST
+     * teardown, as an index into THIS chunk's `closure_defs`.
+     *
+     * ⛔ IT IS A PREDICTION, AND THE EMITTED IDENTITY COMPARE IS THE
+     * CHECK. Soundness does NOT rest on the analysis being right: the
+     * baked arm already compares the live callee's descriptor against
+     * the baked one and falls to the generic tier on a mismatch (the
+     * same compare a reassignable global slot takes under
+     * `MYLANG_JIT_FORCE=bakecallee`). A wrong prediction costs a slow
+     * path, never a wrong answer - which is why a stale or hostile
+     * entry here cannot do worse than deoptimize, once `verify_chunk`
+     * has bounded the index.
+     *
+     * Same shape as `locs`/`base_locs` - pc-keyed, ascending, binary
+     * searched - and SPARSE: only a CallValueV whose callee the analysis
+     * could name records one. Read ONLY at JIT-compile time, so the VM's
+     * dispatch never touches it.
+     */
+    struct CalleeName {
+        uint32_t pc;
+        int32_t def;              /* index into this chunk's closure_defs */
+    };
+    std::vector<CalleeName> value_callees;
+
+    /* The named callee's closure_defs index for the op at `pc`, or -1. */
+    int32_t value_callee_at(size_t pc) const
+    {
+        size_t lo = 0, hi = value_callees.size();
+        while (lo < hi) {
+            const size_t mid = (lo + hi) / 2;
+            if (value_callees[mid].pc < pc)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < value_callees.size() && value_callees[lo].pc == pc)
+            return value_callees[lo].def;
+        return -1;
     }
 
     /*
