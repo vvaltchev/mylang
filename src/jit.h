@@ -341,6 +341,9 @@ void jit_cache_audit_report();
  * spend. Exported for jit_telide_c3, which must build a program with
  * MORE hot int locals than this or it exercises nothing. */
 size_t jit_pin_budget();
+/* #96 inc-1: how many hot slots past the pins get native-stack spill
+ * homes - a test sizing an overflow shape must clear pins + spills. */
+size_t jit_spill_budget();
 
 /*
  * #96: ROTATE the caller-saved pin pool so member N is handed out
@@ -943,6 +946,8 @@ extern "C" unsigned long g_jit_xcache;
 /* #96: fragment entries that ran with RAX itself pinned - the 13th
  * and last register's own execution proof (see run_may_pin_rax). */
 extern "C" unsigned long g_jit_rax_pin;
+/* #96 inc-1: fragment entries that ran with >= 1 spill-homed slot. */
+extern "C" unsigned long g_jit_scache;
 /* #96: `<op> [slot], reg` emitted instead of the four-instruction
  * load/load/apply/store shape - the two-address form. */
 extern "C" unsigned long g_jit_two_addr;

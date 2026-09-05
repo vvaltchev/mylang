@@ -73,6 +73,7 @@ unsigned long g_jit_elem_reserve = 0;
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_rax_pin = 0;       /* #96: rax-pinned fragment entries */
+unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
 unsigned long g_jit_two_addr_reg = 0;  /* #96: two-address PINNED ops */
 unsigned long g_jit_step_imm = 0;      /* #96: pinned counted-loop steps */
@@ -250,12 +251,13 @@ bool g_jit_enabled = false;
 enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
-    JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_COUNT
+    JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
+    JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
-    "relent", "norec", "argfuse", "xcache"
+    "relent", "norec", "argfuse", "xcache", "scache"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -1224,6 +1226,21 @@ struct Emitter {
      * push/pop around every call. */
     struct CacheEnt { int slot; int32_t payload, type; uint8_t reg; };
     std::vector<CacheEnt> cache;
+    /*
+     * #96 INCREMENT 1 - the SPILL-EXTENDED hot set. A slot that
+     * qualified for a pin but lost the ranking is homed in a bare
+     * 8-byte NATIVE-STACK slot ([rbp+spill_off(k)]) instead of its
+     * frame slot: same entry/exit discipline as a pin (seed at entry,
+     * flush type+payload at every exit), same qualification (the same
+     * ranked pick, so the bad()-rule exclusions are inherited), but
+     * the value's home costs ONE 8-byte access instead of the frame
+     * slot's three accesses 48 bytes apart - which is the C-compiler
+     * spill-slot shape, and the whole point. Unlike a caller-saved
+     * pin it needs NO call-site spill/reload: the stack survives
+     * helper calls.
+     */
+    struct SpillEnt { int slot; int32_t payload, type; int k; };
+    std::vector<SpillEnt> scache;
 
     /*
      * THE ALLOCATOR'S REGISTER STATE (the real allocator, step 2).
@@ -1773,6 +1790,14 @@ struct Emitter {
                 return c.reg;
         return -1;
     }
+    /* #96 inc-1: the spill-slot index a slot is homed in, or -1 */
+    int cspill(int slot) const
+    {
+        for (const SpillEnt &c : scache)
+            if (c.slot == slot)
+                return c.k;
+        return -1;
+    }
 
     /* mov <reg64>, [rbx + disp32]  (reg 0-15; REX.R for r8-r15) */
     void load(uint8_t reg, int32_t disp)
@@ -2173,6 +2198,26 @@ struct Emitter {
                            t.flt ? jit_layout().t_float
                                  : jit_layout().t_int,
                            t.flt ? 8 : 6);   /* C3: restore the singleton */
+        /*
+         * #96 inc-1: the spill-homed slots, shuttled through RAX -
+         * WRAPPED in push/pop, because the flush runs inside the
+         * EPILOGUES where rax already carries the RESUME PC (`mov eax,
+         * pc; jmp <epilogue>` is the exit protocol) and a bare clobber
+         * sent the interpreter to a wild pc (WATCHED: opcode 190 out
+         * of a 128-entry dispatch table, the moment one loop counter
+         * became a spill home). The push/pop also covers rax-as-a-pin
+         * and the mid-op barrier flushes for free - it is transparent
+         * to whatever rax holds.
+         */
+        if (!scache.empty()) {
+            push_reg(0 /* rax */);
+            for (const SpillEnt &c : scache) {
+                store_type_tag(c.type, jit_layout().t_int, 6);
+                reload(0 /* rax */, c.k);
+                store(0 /* rax */, c.payload);
+            }
+            pop_reg(0 /* rax */);
+        }
     }
     /* The inverse: re-load every pinned slot's payload from memory. Used with
      * flush_cache to BRACKET an op that reads or writes frame slots the emitter
@@ -2191,6 +2236,20 @@ struct Emitter {
         trk_flushed = false;
         trk_flushdirty = 0;
 #endif
+        /* #96 inc-1: re-seed the spill slots from the (current)
+         * frame - push/pop around the rax shuttle, exactly as the
+         * flush does: a barrier RESTORE runs right after its op, and
+         * whether that op left something in rax is not this loop's
+         * question to answer. Seeded before the pin loads so the
+         * transient cannot disturb a just-loaded rax pin either. */
+        if (!scache.empty()) {
+            push_reg(0 /* rax */);
+            for (const SpillEnt &c : scache) {
+                load(0 /* rax */, c.payload);
+                spill(0 /* rax */, c.k);
+            }
+            pop_reg(0 /* rax */);
+        }
         for (const CacheEnt &c : cache)
             load(c.reg, c.payload);
         for (const CacheEnt &c : fcache)
@@ -2366,8 +2425,60 @@ struct Emitter {
     }
     void reload(uint8_t reg, int k)
     {
+        wrote(reg);          /* #96 inc-1: it writes a register like any
+                              * load - the tracker must see it */
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
         u8(0x8B);
+        u8(static_cast<uint8_t>(0x85 | ((reg & 7) << 3)));
+        u32(static_cast<uint32_t>(spill_off(k)));
+    }
+    /*
+     * #96 INCREMENT 1 - the SPILL-SLOT operand forms. A spill slot is a
+     * bare qword at [rbp+spill_off(k)]: no type word, 8-byte stride,
+     * and rbp-relative so a call site's pushes cannot shift it. These
+     * are the [rbx+disp] forms' rbp twins; modrm rm=101 with mod=10 is
+     * [rbp+disp32] directly (rbp is the ONE register whose no-disp form
+     * means something else - CAP_BASE_NODISP - and the disp32 form
+     * sidesteps that).
+     */
+    /* `<op> [rbp+off], src` - the RMW; MR ops only (no imul) */
+    void op_spill_reg(Op aop, int k, uint8_t reg)
+    {
+        uint8_t opc;
+        switch (aop) {
+        case Op::plus:  opc = 0x01; break;
+        case Op::minus: opc = 0x29; break;
+        case Op::band:  opc = 0x21; break;
+        case Op::bor:   opc = 0x09; break;
+        case Op::bxor:  opc = 0x31; break;
+        default:
+            ML_CHECK_MSG(false, "op_spill_reg: no MR encoding");
+            return;
+        }
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
+        u8(opc);
+        u8(static_cast<uint8_t>(0x85 | ((reg & 7) << 3)));
+        u32(static_cast<uint32_t>(spill_off(k)));
+    }
+    /* `<op> dst, [rbp+off]` - the RM family (imul included) */
+    void op_reg_spill(Op aop, uint8_t dst, int k)
+    {
+        wrote(dst);
+        uint8_t opc = 0, ext = 0; bool two = false;
+        const bool have = op_rm_opcode(aop, opc, two, ext);
+        ML_CHECK_MSG(have, "op_reg_spill: no RM encoding");
+        (void)have; (void)ext;
+        u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)));
+        if (two) u8(0x0F);
+        u8(opc);
+        u8(static_cast<uint8_t>(0x85 | ((dst & 7) << 3)));
+        u32(static_cast<uint32_t>(spill_off(k)));
+    }
+    /* `cmp reg, [rbp+off]` */
+    void cmp_reg_spill(uint8_t reg, int k)
+    {
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
+        u8(0x3B);
         u8(static_cast<uint8_t>(0x85 | ((reg & 7) << 3)));
         u32(static_cast<uint32_t>(spill_off(k)));
     }
@@ -2499,6 +2610,7 @@ struct Emitter {
     struct CacheState {
         std::vector<CacheEnt> cache, fcache;
         std::vector<TypedEnt> tflush;
+        std::vector<SpillEnt> scache;   /* #96 inc-1: the fifth member */
         /*
          * #96 (c): the ALLOCATOR'S OCCUPANCY is part of this family
          * too, and forgetting it was the family's SECOND miss - found
@@ -2517,7 +2629,8 @@ struct Emitter {
          */
         RegAlloc ra;
         bool is_empty() const
-        { return cache.empty() && fcache.empty() && tflush.empty(); }
+        { return cache.empty() && fcache.empty() && tflush.empty()
+              && scache.empty(); }
     };
 
     /*
@@ -2552,12 +2665,13 @@ struct Emitter {
      * rather than corrupting a slot.
      */
     CacheState snapshot_cache() const
-    { return { cache, fcache, tflush, ra }; }
+    { return { cache, fcache, tflush, scache, ra }; }
     void restore_cache(CacheState &&s)
     {
         cache = std::move(s.cache);
         fcache = std::move(s.fcache);
         tflush = std::move(s.tflush);
+        scache = std::move(s.scache);
         ra = s.ra;
         check_pins_are_busy();
     }
@@ -2566,6 +2680,7 @@ struct Emitter {
         cache.clear();
         fcache.clear();
         tflush.clear();
+        scache.clear();
         /* the OCCUPANCY goes with them; `denied` does NOT - it is a
          * property of the whole run, not of what is held right now. */
         ra.busy = 0;
@@ -2619,17 +2734,28 @@ struct Emitter {
                     return false;
             return true;
         };
+        const auto same_s = [](const std::vector<SpillEnt> &a,
+                               const std::vector<SpillEnt> &b) {
+            if (a.size() != b.size())
+                return false;
+            for (size_t i = 0; i < a.size(); i++)
+                if (a[i].slot != b[i].slot || a[i].payload != b[i].payload
+                        || a[i].type != b[i].type || a[i].k != b[i].k)
+                    return false;
+            return true;
+        };
         for (size_t i = 0; i < exit_states.size(); i++)
             if (same_c(exit_states[i].cache, cache)
                     && same_c(exit_states[i].fcache, fcache)
-                    && same_t(exit_states[i].tflush, tflush))
+                    && same_t(exit_states[i].tflush, tflush)
+                    && same_s(exit_states[i].scache, scache))
                 return i;
         /* `ra` rides along for the aggregate but is deliberately NOT
          * part of the comparison above: an exit state describes what
          * must be WRITTEN BACK, which is the pin vectors. Two exits
          * with the same pins and different transient scratch are the
          * same exit and must dedup to one epilogue. */
-        exit_states.push_back({ cache, fcache, tflush, ra });
+        exit_states.push_back({ cache, fcache, tflush, scache, ra });
         return exit_states.size() - 1;
     }
 
@@ -2706,12 +2832,16 @@ struct Emitter {
                  * (an entry stub emitted later still needs it). */
                 std::vector<CacheEnt> sc, sf;
                 std::vector<TypedEnt> st_;
+                std::vector<SpillEnt> ss;      /* #96 inc-1: member 5 */
                 sc.swap(cache); sf.swap(fcache); st_.swap(tflush);
+                ss.swap(scache);
                 cache = exit_states[st].cache;
                 fcache = exit_states[st].fcache;
                 tflush = exit_states[st].tflush;
+                scache = exit_states[st].scache;
                 flush_cache();
                 cache.swap(sc); fcache.swap(sf); tflush.swap(st_);
+                scache.swap(ss);
             }
             relay_store();
             frag_ret(RetFlush::epilogue);
@@ -4720,6 +4850,14 @@ static void read_slot(Emitter &e, uint8_t dst, int slot)
          * overwritten register would read the borrower's temp */
         e.trk_read_pin(static_cast<uint8_t>(cr));
         e.mov_rr(dst, static_cast<uint8_t>(cr));
+        return;
+    }
+    /* #96 inc-1: a spill-homed slot reads from its stack qword - the
+     * frame slot is STALE while the home is live (exactly a pin's
+     * contract, with memory for the register) */
+    const int sk = e.cspill(slot);
+    if (sk >= 0) {
+        e.reload(dst, sk);
         return;
     }
     e.load(dst, slot_addr(slot).payload);
@@ -7603,6 +7741,13 @@ static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
         e.mov_rr(static_cast<uint8_t>(cr), src);
         return;
     }
+    /* #96 inc-1: a spill-homed slot's update goes to its stack qword;
+     * type + payload reach the frame at the exits, like a pin's */
+    const int sk = e.cspill(slot);
+    if (sk >= 0) {
+        e.spill(src, sk);
+        return;
+    }
     store_dst(e, ck, src, slot, bail_pc);
 }
 
@@ -8387,6 +8532,7 @@ void jit_stats_report()
          * `fwd_skip_rel` is the narrower C5-discharged write-skip. */
         { "xcache",           &g_jit_xcache },
         { "rax_pin",          &g_jit_rax_pin },
+        { "scache",           &g_jit_scache },
         { "two_addr",         &g_jit_two_addr },
         { "two_addr_reg",     &g_jit_two_addr_reg },
         { "step_imm",         &g_jit_step_imm },
@@ -8822,6 +8968,12 @@ unsigned g_jit_xrot = []() -> unsigned {
 }();
 
 size_t jit_xcache_width() { return MAX_XCACHED; }
+
+/* #96 inc-1: how many hot slots past the register budget may be homed
+ * in native-stack spill slots. Stack is cheap; the cap exists so a
+ * pathological chunk cannot carve an unbounded frame. */
+static const size_t MAX_SPILL_HOMES = 16;
+size_t jit_spill_budget() { return MAX_SPILL_HOMES; }
 
 static const uint8_t *xcache_regs()
 {
@@ -11154,11 +11306,13 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
 static void load_slot_idx(Emitter &e, uint8_t ir, int slot)
 {
     e.scratch(ir);
-    const int cr = e.creg(slot);
-    if (cr >= 0)
-        e.mov_rr(ir, static_cast<uint8_t>(cr));
-    else
-        e.load(ir, slot_addr(slot).payload);
+    /* #96 inc-1: through read_slot, which is the ONE resolver that
+     * knows all three homes (pin register / native spill slot / frame).
+     * This function consulted creg by hand and fell to the frame for
+     * everything else - a stale read for a spill-homed index, WATCHED:
+     * the reservation test's `t += a[k]` summed a[k-at-entry] sixteen
+     * times the moment k became the fifth spill home. */
+    read_slot(e, ir, slot);
 }
 
 static void load_index_idx(Emitter &e, uint8_t ir, const Instr &in)
@@ -13090,10 +13244,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * C3 having to prove anything. `imul` is excluded because it has
          * no MR encoding (see op_mem_reg).
          */
+        /* #96 inc-1: a SPILL-homed dst has its own two-address arm
+         * below - the frame RMW here would hit the stale frame slot */
+        const int dspill_ta = (!in.a_is_lit()
+                               && in.target == in.a_slot())
+            ? e.cspill(in.target) : -1;
         const bool two_addr =
             !in.a_is_lit() && in.target == in.a_slot()
             && aop != Op::times
             && e.creg(in.target) < 0
+            && dspill_ta < 0
             && !(g_fwd.prod == in.target)
             && !fa
             && !std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
@@ -13128,6 +13288,43 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * a literal that fits imm32 (`add r14, 1`, which also removes
          * the `movabs rcx, 1` the loop counter was paying).
          */
+        /*
+         * #96 inc-1: the SPILL two-address form - `<op> [rbp+off], src`
+         * on the slot's stack home. Same soundness terms as the frame
+         * RMW (increment 1's five conditions), against the home the
+         * value actually lives in; imul excluded (no MR encoding), and
+         * a forwarded-out dst declines to the generic arm exactly as
+         * the frame form does (the consumer expects RAX, which this
+         * form never holds).
+         */
+        if (dspill_ta >= 0 && aop != Op::times
+                && !(g_fwd.prod == in.target) && !fa) {
+            if (fb)
+                emit_fwd_bump(e, fin < ck.slot_count);
+#ifdef TESTS
+            e.bump_counter(&g_jit_two_addr);
+#endif
+            if (fb) {
+                e.op_spill_reg(aop, dspill_ta, RAX);
+            } else if (in.b_is_lit()) {
+                /* no group-81 spill form yet: stage via rax (still one
+                 * instruction fewer than the generic arm) */
+                e.movabs(RAX, static_cast<uint64_t>(in.b_lit()));
+                e.op_spill_reg(aop, dspill_ta, RAX);
+            } else {
+                const int bcr_s = e.creg(in.b_slot());
+                if (bcr_s >= 0) {
+                    e.trk_read_pin(static_cast<uint8_t>(bcr_s));
+                    e.op_spill_reg(aop, dspill_ta,
+                                   static_cast<uint8_t>(bcr_s));
+                } else {
+                    read_slot(e, RAX, in.b_slot());
+                    e.op_spill_reg(aop, dspill_ta, RAX);
+                }
+            }
+            g_fwd = JitFwd{};    /* the result is in the HOME, not RAX */
+            return true;
+        }
         const int dreg = e.creg(in.target);
         /*
          * NOTE the forwarded-OUT case is ALLOWED here, unlike the
@@ -13182,8 +13379,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.op_reg_imm(aop, d, static_cast<int32_t>(in.b_lit()));
             } else {
                 const int bcr = e.creg(in.b_slot());
+                const int bsk = e.cspill(in.b_slot());
                 if (bcr >= 0)
                     e.op_rr2(aop, d, static_cast<uint8_t>(bcr));
+                else if (bsk >= 0)
+                    e.op_reg_spill(aop, d, bsk);   /* #96 inc-1 */
                 else
                     e.op_reg_slot(aop, d,
                                   slot_addr(in.b_slot()).payload);
@@ -13244,12 +13444,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          */
         const int bpin = (!fb && !in.b_is_lit())
             ? e.creg(in.b_slot()) : -1;
+        const int bskg = (!fb && !in.b_is_lit())
+            ? e.cspill(in.b_slot()) : -1;
         const bool bimm = !fb && in.b_is_lit()
             && in.b_lit() >= INT32_MIN && in.b_lit() <= INT32_MAX;
         if (!fa && !fb)
             read_slot(e, RAX, in.a_slot());
         if (!fb && bpin >= 0) {
             op_rr(e, aop, RAX, static_cast<uint8_t>(bpin));
+        } else if (!fb && bskg >= 0) {
+            e.op_reg_spill(aop, RAX, bskg);        /* #96 inc-1 */
         } else if (!fb && bimm) {
             e.op_reg_imm(aop, RAX, static_cast<int32_t>(in.b_lit()));
         } else {
@@ -14007,6 +14211,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             store_dst(e, ck, static_cast<uint8_t>(sreg), in.target, pc);
             return true;
         }
+        /* #96 inc-1: a SPILL-homed source is a proven int by exactly
+         * the pinned-source argument (only genuine int ops rank a slot
+         * into the pick), and its FRAME copy is stale - the 24-byte
+         * boxed copy below read it raw and a homed `s` printed <none>
+         * (WATCHED: the isolated final-sum repro). Reload the home and
+         * store as the ordinary int. */
+        if (const int ssk = e.cspill(in.target2); ssk >= 0) {
+            e.reload(RAX, ssk);
+            store_dst(e, ck, RAX, in.target, pc);
+            return true;
+        }
         /* C2a: the FLOAT twin - a float-PINNED source is a proven float
          * (only genuine float ops qualify a pin; the MoveV itself adds
          * no weight), so the move is the ordinary float store from the
@@ -14502,12 +14717,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     switch (pf.act) {
                     case 0: {                      /* raw int (bool = 0/1) */
                         /* cache-aware: a direct-local src can be the
-                         * N5-pinned loop counter */
-                        const int cr = e.creg(pf.src);
-                        if (cr >= 0)
-                            e.mov_rr(RAX, static_cast<uint8_t>(cr));
-                        else
-                            e.load(RAX, s.payload);
+                         * N5-pinned loop counter - or, #96 inc-1, a
+                         * spill-homed one; read_slot knows all three
+                         * homes (this site consulted creg by hand) */
+                        read_slot(e, RAX, pf.src);
                         /* mov [r9 + off], rax */
                         e.store_base(RAX, R9, static_cast<int32_t>(pf.off));
                         break;
@@ -16416,8 +16629,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                         [&]() { e.cmp_rr2(r, tmp); });
             } else {
                 const int bcr = e.creg(in.b_slot());
+                const int bsk = e.cspill(in.b_slot());
                 if (bcr >= 0)
                     e.cmp_rr2(r, static_cast<uint8_t>(bcr));
+                else if (bsk >= 0)                  /* #96 inc-1 */
+                    e.cmp_reg_spill(r, bsk);
                 else
                     e.cmp_reg_slot(r, slot_addr(in.b_slot()).payload);
             }
@@ -16482,9 +16698,13 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                                  static_cast<int32_t>(in.b_lit()));
                 } else {
                     const int bcr = e.creg(in.b_slot());
+                    const int bsk = e.cspill(in.b_slot());
                     if (bcr >= 0)
                         e.op_rr2(up ? Op::plus : Op::minus, r,
                                  static_cast<uint8_t>(bcr));
+                    else if (bsk >= 0)              /* #96 inc-1 */
+                        e.op_reg_spill(up ? Op::plus : Op::minus, r,
+                                       bsk);
                     else
                         e.op_reg_slot(up ? Op::plus : Op::minus, r,
                                       slot_addr(in.b_slot()).payload);
@@ -16498,8 +16718,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                         [&]() { e.cmp_rr2(r, tmp); });
             } else {
                 const int acr = e.creg(in.a_slot());
+                const int ask = e.cspill(in.a_slot());
                 if (acr >= 0)
                     e.cmp_rr2(r, static_cast<uint8_t>(acr));
+                else if (ask >= 0)                  /* #96 inc-1 */
+                    e.cmp_reg_spill(r, ask);
                 else
                     e.cmp_reg_slot(r, slot_addr(in.a_slot()).payload);
             }
@@ -16584,9 +16807,12 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                                 e.op_rr2(Op::plus, d, tmp); });
             } else {
                 const int bcr = e.creg(in.b_slot());
+                const int bsk = e.cspill(in.b_slot());
                 Emitter::PinMach pm(e);
                 if (bcr >= 0)
                     e.op_rr2(Op::plus, d, static_cast<uint8_t>(bcr));
+                else if (bsk >= 0)                  /* #96 inc-1 */
+                    e.op_reg_spill(Op::plus, d, bsk);
                 else
                     e.op_reg_slot(Op::plus, d,
                                   slot_addr(in.b_slot()).payload);
@@ -16625,8 +16851,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                         [&]() { e.cmp_rr2(r, tmp); });
             } else {
                 const int bcr = e.creg(in.a_dual_hi());
+                const int bsk = e.cspill(in.a_dual_hi());
                 if (bcr >= 0)
                     e.cmp_rr2(r, static_cast<uint8_t>(bcr));
+                else if (bsk >= 0)                  /* #96 inc-1 */
+                    e.cmp_reg_spill(r, bsk);
                 else
                     e.cmp_reg_slot(r,
                                    slot_addr(in.a_dual_hi()).payload);
@@ -17918,6 +18147,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     e.ra = RegAlloc();
     e.fcache.clear();                      /* C2a: nor a float one */
     e.tflush.clear();                      /* C3: nor type elision */
+    e.scache.clear();                      /* #96 inc-1: nor spill homes */
+    e.spill_slots = 0;
     e.fread.clear();                       /* C4a-i: nor read elision */
     std::vector<NativeCode::OpMark> marks;  /* -vdj: op-boundary annotations */
     /* fragment offset of each body pc */
@@ -18508,6 +18739,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                  * as a wrong 40_math-shape sum: floor/abs
                                  * split the run, and fragment 2 flushed
                                  * fragment 1's pin) */
+        e.scache.clear();       /* #96 inc-1: per-RUN, same reasons */
+        e.spill_slots = 0;
         e.saved.clear();
         std::vector<char> cache_barrier(end - begin, 0);
 
@@ -18594,11 +18827,35 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * from "all forbidden". */
         e.ra = RegAlloc();
         e.ra.denied = xclob;
+        /*
+         * #96 INCREMENT 1: the pick RANKS more candidates than the
+         * register budget; the overflow past max_pins is homed in
+         * NATIVE-STACK spill slots - bare 8-byte qwords, one access
+         * instead of the frame slot's three (payload + tag + reload,
+         * 48 bytes apart), and no call-site spill/reload since the
+         * stack survives helper calls. The qualification is inherited
+         * from the ranking itself: a slot in this list has every use
+         * on the cache-aware paths, which is exactly the pin
+         * contract's bad()-rule half.
+         */
         std::vector<int> hot =
             pick_cached_slots(chunk, begin, end, chunk.slot_count,
-                              max_pins,
+                              max_pins + MAX_SPILL_HOMES,
                               &cache_barrier, &fhot, &hot_counts,
                               &textra, &textra_f, &fread_raw);
+        std::vector<int> spill_hot;
+        if (hot.size() > max_pins) {
+            spill_hot.assign(hot.begin() + max_pins, hot.end());
+            hot.resize(max_pins);
+            hot_counts.resize(max_pins);
+        }
+        if (jit_lever_off(JL_SCACHE))
+            spill_hot.clear();
+        if (const char *ms = getenv("MYLANG_JIT_MAXSPILL")) {
+            const size_t cap = static_cast<size_t>(atoi(ms));
+            if (cap < spill_hot.size())
+                spill_hot.resize(cap);
+        }
         /* the per-lever kill switches (see JitLever): applied HERE, on
          * the pick's OUTPUT, so one place disables a lever no matter
          * how many emit sites consume it. */
@@ -18812,6 +19069,17 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         jit_pick_release_slots(chunk, begin, end, entries, fwd_lin,
                                fwd_live_ok, rel_active, rel_at);
 
+        /* #96 inc-1: the spill homes are decided before frag_entry,
+         * which carves their bytes out of the native stack. */
+        for (size_t j = 0; j < spill_hot.size(); j++) {
+            const SlotAddr a = slot_addr(spill_hot[j]);
+            e.scache.push_back({ spill_hot[j], a.payload, a.type,
+                                 static_cast<int>(j) });
+            if (getenv("MYLANG_SPILLDBG"))
+                fprintf(stderr, "SPILLDBG run[%zu,%zu) home %zu <- "
+                        "slot %d\n", begin, end, j, spill_hot[j]);
+        }
+        e.spill_slots = static_cast<int>(spill_hot.size());
         e.frag_entry();               /* push rbx + the cache regs; rbx=rdi */
         /* #96: ONE flag for "this fragment needs the t_float singleton",
          * read by emit_type_tags at every entry AND by
@@ -18828,6 +19096,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             Emitter::PinMach pm(e);          /* the entry pin loads */
             e.trk_flushed = false;
             e.trk_flushdirty = 0;
+            /* #96 inc-1: seed the spill homes FIRST - the seed
+             * shuttles through rax, which may itself be about to
+             * become a pin (the loads below); flush_cache runs the
+             * mirror order (pins first, scache last). */
+            for (const Emitter::SpillEnt &c : e.scache) {
+                e.load(0 /* rax */, c.payload);
+                e.spill(0 /* rax */, c.k);
+            }
             for (size_t h = 0; h < hot.size(); h++) {
                 const SlotAddr a = slot_addr(hot[h]);
                 e.cache.push_back(
@@ -18858,6 +19134,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                  * shipped at zero reach once; this counter is what
                  * notices). */
                 e.bump_counter(&g_jit_rax_pin);
+            }
+            if (!e.scache.empty()) {
+                /* #96 inc-1: ditto for the spill homes */
+                e.bump_counter(&g_jit_scache);
             }
         }
 #endif
@@ -19015,6 +19295,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 for (const int s : textra) if (s == slot) return true;
                 for (const int s : textra_f) if (s == slot) return true;
                 for (const int s : fread_raw) if (s == slot) return true;
+                /* #96 inc-1: a spill-homed slot's FRAME memory is
+                 * stale for the same reason a pin's is - the fused
+                 * bind would read it raw */
+                for (const int s : spill_hot) if (s == slot) return true;
                 return false;
             };
             for (size_t pc = begin; pc < end; pc++) {
@@ -19552,6 +19836,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 /* BEFORE the pin loads: r8 may be both the singleton
                  * and a pin register, and the pin must win. */
                 emit_type_tags(e);
+                /* #96 inc-1: seed the spill homes from the (current)
+                 * frame, before the pin loads - the rax shuttle, same
+                 * order argument as the head entry's */
+                for (const Emitter::SpillEnt &c : e.scache) {
+                    e.load(0 /* rax */, c.payload);
+                    e.spill(0 /* rax */, c.k);
+                }
                 for (const Emitter::CacheEnt &c : e.cache)
                     e.load(c.reg, c.payload);   /* #96: the ENTRY's own
                                                  * assignment, not the
