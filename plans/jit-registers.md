@@ -3609,3 +3609,45 @@ So the remaining options for this emitter, in order of appeal:
     never the pin; it was the four real bugs the conversions found.**
 
 ⛔ Do NOT try a fourth guard shape without first deciding (3).
+
+## (aj) 2026-08-20 - the admission FINISHED: both arenas green; what the
+## off-arena tail taught
+
+The tracker's admission (docs/jit-optimizations.md #96 (c) + addendum)
+ended with three off-arena defects, all silent declines:
+
+1. **alloc_scratch handed out unsaved callee-saved registers.**
+   gp_weight's "callee-saved cheapest" is a PIN ranking; for transient
+   scratch it selects the one register class whose corruption the
+   fragment cannot see - the C caller's. r14 reached the hoist
+   re-derive and jit_call_sync_core's frame base died. Scratch now
+   excludes callee-saved outright, and the tracker aborts on a write
+   to any callee-saved register not in e.saved.
+
+2. **Borrows honour `exclude`, never `denied`.** denied = "a pin here
+   would destroy this"; a push/pop borrow preserves it. Honouring
+   denied exhausted all 16 registers off-arena.
+
+3. **The reservation went PER-ROLE** (ElemRoleSig). The scalar count
+   failed both ways in one day: rcx withheld "for" a capture chain
+   that scans ELEM_CAND only (whole max-pin closure fragments dropped,
+   every rotation, off-arena - `emit_ok=false` on LoadCaptureV), and
+   three withholds for a read whose count role was already safe behind
+   the rdx whitelist (the pool starved on the hoisted-read shape).
+   The reservation now re-runs each plan's own preferred-then-CAND
+   scan with prefs read from the ElemScratch/ElemRead defaults, in a
+   FIXED order (never XCACHE_ORDER - a rotation must not change
+   emitted code).
+
+**A diagnostic lesson that cost half the hunt:** `grep -B2 FAIL` on an
+-rt log shows only failures ADJACENT to the summary - the failure
+counts read 6, then 2, then 24, and the first two spawned a
+"rotation-dependent" theory that was pure artifact. Count the failure
+marker itself (`grep -c 'engaged 0'`).
+
+**State:** rcx is pin 12; -rt 1925/1925 ON and OFF arena x {gcc dbg,
+clang dbg, rel-hard, CMake, non-JIT g++/clang, LTO=0}; corpus 24/24 x
+{plain, 15 levers, 8 rotations} x both arenas; disasmcheck clean both
+arenas; fuzz 40/40; vdjcmp self 112/112. Remaining from the arc:
+(y)'s ~20 raw u8() sequences bypass wrote(); rdx/rax admission needs
+the same treatment rcx got.
