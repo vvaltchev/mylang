@@ -72,6 +72,7 @@ unsigned long g_jit_elem_noreg = 0;
 unsigned long g_jit_elem_reserve = 0;
 unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
+unsigned long g_jit_rax_pin = 0;       /* #96: rax-pinned fragment entries */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
 unsigned long g_jit_two_addr_reg = 0;  /* #96: two-address PINNED ops */
 unsigned long g_jit_step_imm = 0;      /* #96: pinned counted-loop steps */
@@ -1316,15 +1317,31 @@ struct Emitter {
     int dbg_op = -1;
 
 #ifndef NDEBUG
-    [[noreturn]] void trk_fail(const char *what, unsigned r) const
+    /*
+     * ⛔ REPORT MODE (MYLANG_REGTRACK_REPORT=1) exists for ONE consumer:
+     * the admission survey (scripts/rcx_admission.sh). It turns each
+     * violation into a line instead of an abort, so one run yields the
+     * WHOLE worklist for a candidate register - the rcx admission got
+     * its list one abort at a time, which is how three hand audits
+     * produced four wrong answers before the tracker existed. Under
+     * report mode the emitted code IS wrong (the violations are real),
+     * so the run's OUTPUT is meaningless: only the report lines are.
+     * Never set it outside a survey.
+     */
+    void trk_fail(const char *what, unsigned r) const
     {
         fprintf(stderr,
                 "JIT-REGTRACK: %s: r%u  (vm pc %d, opcode %d; "
-                "borrowed=%#x dirty=%#x mach=%d bracket=%d)\n"
-                "  the emitted code at this point would silently "
-                "corrupt live register state.\n",
+                "borrowed=%#x dirty=%#x mach=%d bracket=%d)\n",
                 what, r, dbg_pc, dbg_op,
                 trk_borrowed, trk_dirty, trk_mach, trk_bracket);
+        static const bool report =
+            getenv("MYLANG_REGTRACK_REPORT") != nullptr;
+        if (report)
+            return;
+        fprintf(stderr,
+                "  the emitted code at this point would silently "
+                "corrupt live register state.\n");
         abort();
     }
 #endif
@@ -8369,6 +8386,7 @@ void jit_stats_report()
          * a real program?", could be asked only from inside -rt);
          * `fwd_skip_rel` is the narrower C5-discharged write-skip. */
         { "xcache",           &g_jit_xcache },
+        { "rax_pin",          &g_jit_rax_pin },
         { "two_addr",         &g_jit_two_addr },
         { "two_addr_reg",     &g_jit_two_addr_reg },
         { "step_imm",         &g_jit_step_imm },
@@ -8774,7 +8792,7 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * PLACED LAST, as every admission has been; MYLANG_JIT_XROT sweeps
  * EIGHT rotations.
  */
-static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2, 1 };
+static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2, 1, 0 };
 static const size_t MAX_XCACHED =
     sizeof(XCACHE_ORDER) / sizeof(XCACHE_ORDER[0]);
 
@@ -8871,6 +8889,82 @@ static bool run_may_pin_rdx(const Chunk &ck, size_t begin, size_t end)
                 fprintf(stderr, "rdx blocked by op %d at pc %zu\n",
                         static_cast<int>(ck.code[pc].op), pc);
             return false;                /* unknown -> keep rdx out */
+        }
+    }
+    return true;
+}
+
+/*
+ * #96: may this RUN spend rax as a pin? The LAST admission, and the
+ * hardest, because rax is three conventions at once: the emitter's
+ * accumulator (read_slot/write_slot/load_operand stage through it),
+ * every helper's C-ABI return value, and the fragment ABI's own
+ * return (exit_pc's resume pc). The admission survey (2026-08-21,
+ * scripts/rcx_admission.sh 0 under MYLANG_REGTRACK_REPORT) measured
+ * the consequence: ~2400 tracker hits across ~25 OPCODES - there is
+ * no site-by-site fix, only a RUN-SHAPE gate.
+ *
+ * So this is a positive whitelist in the run_may_pin_rdx mould, but
+ * per SHAPE, not per opcode: an op qualifies only in the form whose
+ * PINNED emission path is rax-free -
+ *
+ *  - the specialized int arith family, ACCUMULATOR shape only
+ *    (target == a_slot): the two_addr_reg path is op_rr2 /
+ *    op_reg_imm / op_reg_slot on the pin, no rax. The non-accumulator
+ *    shape (`s2 = s0 + s1`) takes the generic arm, which stages
+ *    through rax unconditionally;
+ *  - ForLoopStep / IntAddStep: the pinned halves step and compare in
+ *    the pin (incdec_reg / op_reg_imm / cmp_reg_imm / cmp_rr2 /
+ *    cmp_reg_slot);
+ *  - Jump: no operands;
+ *  - ReturnV / Halt: emit_ret_native uses rax freely but its second
+ *    line is flush_cache(), so every pin is back in memory first -
+ *    the same argument that keeps them in the rdx whitelist.
+ *
+ * Deliberately OUT, each with its reason:
+ *  - the shifts: the value is staged through rax in every form
+ *    (`sar rax, imm` / `sar rax, cl`);
+ *  - JumpUnlessIntCmp / CmpIntV: load_operand(RAX, a) even for a
+ *    pinned operand (a future creg-aware compare could join);
+ *  - LoadImmInt: movabs rax + write_slot;
+ *  - every element/capture/global op: `obj` is ISA-fixed rax, the
+ *    chain copies stage through it;
+ *  - everything boxed: read_slot/write_slot by convention.
+ *
+ * NECESSARY, NOT SUFFICIENT: the listed arith/step forms are rax-free
+ * only when their TARGET slots are actually pinned - an unpinned
+ * target falls to the generic arm. That half of the proof needs the
+ * pick's output and lives at the pick site (the coverage check), not
+ * here. The two gates fail CLOSED independently.
+ */
+static bool run_may_pin_rax(const Chunk &ck, size_t begin, size_t end)
+{
+    for (size_t pc = begin; pc < end; pc++) {
+        const Instr &in = ck.code[pc];
+        switch (in.op) {
+        case OpCode::IntAddRR: case OpCode::IntSubRR:
+        case OpCode::IntMulRR:
+        case OpCode::IntAndRR: case OpCode::IntOrRR:
+        case OpCode::IntXorRR:
+        case OpCode::IntAddRI: case OpCode::IntSubRI:
+        case OpCode::IntMulRI:
+        case OpCode::IntAndRI: case OpCode::IntOrRI:
+        case OpCode::IntXorRI:
+            if (in.a_is_lit() || in.target != in.a_slot())
+                return false;        /* non-accumulator: generic arm */
+            break;
+        case OpCode::ForLoopStep: case OpCode::IntAddStep:
+        case OpCode::Jump:
+        case OpCode::ReturnV: case OpCode::Halt:
+            break;
+        case OpCode::LoadImmInt:
+            break;                   /* pinned form is movabs-to-pin;
+                                      * coverage requires the pin */
+        case OpCode::JumpUnlessIntCmp:
+            break;                   /* pinned `a` compares in its pin;
+                                      * coverage requires it */
+        default:
+            return false;            /* unknown -> keep rax out */
         }
     }
     return true;
@@ -8976,6 +9070,10 @@ static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
             break;
         }
     }
+    /* #96 rax - the 13th and last register: the shape gate (see
+     * run_may_pin_rax above); the coverage gate runs at the pick. */
+    if (!run_may_pin_rax(ck, begin, end))
+        busy |= 1u << 0;
     return busy;
 }
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
@@ -12876,10 +12974,24 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     };
     switch (in.op) {
 
-    case OpCode::LoadImmInt:
+    case OpCode::LoadImmInt: {
+        /* the PINNED form goes straight into the pin - no rax staging.
+         * A small general win (one instruction per pinned init), and
+         * the reason LoadImmInt may appear in a rax-pinned run (see
+         * run_may_pin_rax). Skipped when lever A paired this op as a
+         * producer: the consumer expects the value in RAX. */
+        const int dreg = e.creg(in.target);
+        if (dreg >= 0 && g_fwd.prod != in.target) {
+            Emitter::PinMach pm(e);
+            e.movabs(static_cast<uint8_t>(dreg),
+                     static_cast<uint64_t>(in.a_lit()));
+            g_fwd = JitFwd{};      /* the result is in the PIN, not RAX */
+            return true;
+        }
         e.movabs(RAX, static_cast<uint64_t>(in.a_lit()));
         write_slot(e, ck, RAX, in.target, pc);
         return true;
+    }
 
     case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
     case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
@@ -16283,6 +16395,37 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::JumpUnlessIntCmp: {
         /* jump to target when (a cmp b) is FALSE == when negate(cmp). */
+        /*
+         * #96: a PINNED `a` compares in its pin - the same three cmp
+         * forms ForLoopStep's counter test uses (immediate, another
+         * pin, memory) - so the load into RAX and the staging of `b`
+         * both disappear. A standalone win on every pinned loop entry
+         * test, and the edit that lets JumpUnlessIntCmp into a
+         * rax-pinned run (every `for` loop opens with this op, so
+         * without it run_may_pin_rax refused every loop in the
+         * corpus - the reach probe read rax_pin = 0).
+         */
+        const int acr = (!in.a_is_lit()) ? e.creg(in.a_slot()) : -1;
+        if (acr >= 0) {
+            const uint8_t r = static_cast<uint8_t>(acr);
+            if (in.b_is_lit() && in.b_lit() >= INT32_MIN
+                    && in.b_lit() <= INT32_MAX) {
+                e.cmp_reg_imm(r, static_cast<int32_t>(in.b_lit()));
+            } else if (in.b_is_lit()) {
+                tmp_lit(static_cast<uint64_t>(in.b_lit()),
+                        [&]() { e.cmp_rr2(r, tmp); });
+            } else {
+                const int bcr = e.creg(in.b_slot());
+                if (bcr >= 0)
+                    e.cmp_rr2(r, static_cast<uint8_t>(bcr));
+                else
+                    e.cmp_reg_slot(r, slot_addr(in.b_slot()).payload);
+            }
+            emit_cond_jump(e, cc_negate(in.aop),
+                           static_cast<size_t>(in.target), begin, end,
+                           remap, fixups);
+            return;
+        }
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
         tmp_operand(in.b_is_lit(), in.b_lit(), in.b_slot(),
                     [&]() { e.cmp_rr(RAX, tmp); });
@@ -18464,6 +18607,64 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         if (jit_lever_off(JL_TELIDE))  { textra.clear(); textra_f.clear(); }
         if (jit_lever_off(JL_FREAD))   fread_raw.clear();
         /*
+         * ⛔ #96 rax, THE COVERAGE GATE - the sufficiency half of the
+         * proof run_may_pin_rax's comment promises. The whitelisted
+         * arith/step forms are rax-free only on their PINNED paths, so
+         * every slot they target must actually be in `hot`; one
+         * unpinned target means one op on the generic arm, which
+         * stages through rax. Decided HERE because only the pick's
+         * output answers it - and BEFORE the assignment, so denying
+         * rax simply shrinks the budget by one (pop the coldest pick)
+         * instead of un-assigning a register.
+         *
+         * Fails CLOSED: any doubt denies rax and the run keeps 12.
+         */
+        if (!(e.ra.denied & 1u)) {
+            bool covered = true;
+            const auto pinned_slot = [&](int sl) {
+                for (const int h : hot) if (h == sl) return true;
+                return false;
+            };
+            for (size_t pc = begin; pc < end && covered; pc++) {
+                const Instr &in = chunk.code[pc];
+                switch (in.op) {
+                case OpCode::IntAddRR: case OpCode::IntSubRR:
+                case OpCode::IntMulRR:
+                case OpCode::IntAndRR: case OpCode::IntOrRR:
+                case OpCode::IntXorRR:
+                case OpCode::IntAddRI: case OpCode::IntSubRI:
+                case OpCode::IntMulRI:
+                case OpCode::IntAndRI: case OpCode::IntOrRI:
+                case OpCode::IntXorRI:
+                case OpCode::LoadImmInt:
+                    covered = pinned_slot(in.target);
+                    break;
+                case OpCode::ForLoopStep:
+                    covered = pinned_slot(in.target2);
+                    break;
+                case OpCode::JumpUnlessIntCmp:
+                    /* a literal `a` never reaches the pinned form; it
+                     * stays on the RAX path, which rax cannot survive */
+                    covered = !in.a_is_lit()
+                           && pinned_slot(in.a_slot());
+                    break;
+                case OpCode::IntAddStep:
+                    covered = pinned_slot(in.a_dual_lo())
+                           && pinned_slot(in.target2);
+                    break;
+                default:
+                    break;   /* Jump/ReturnV/Halt: no pinned path */
+                }
+            }
+            if (!covered) {
+                e.ra.denied |= 1u;
+                if (!hot.empty() && hot.size() == max_pins) {
+                    hot.pop_back();      /* the budget just shrank by 1 */
+                    hot_counts.pop_back();
+                }
+            }
+        }
+        /*
          * C2b: allocate a CALLEE-saved pair for the regions' SECOND
          * bases (every region shares one pair - their lifetimes are
          * disjoint). Leftover pool registers first; else DISPLACE the
@@ -18640,12 +18841,23 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
              * that spent a CALLER-saved pin (the g_jit_fcache pattern).
              * A compile-time count would not do: the question is whether
              * the extension REACHES a running program. */
-            bool vol = false;
-            for (const uint8_t r : hot_reg)
+            bool vol = false, rax = false;
+            for (const uint8_t r : hot_reg) {
                 if (!jit_reg_is_callee_saved(r))
                     vol = true;
+                if (r == RAX)
+                    rax = true;
+            }
             if (vol) {
                 e.bump_counter(&g_jit_xcache);
+            }
+            if (rax) {
+                /* the 13th register's own execution proof - "the pool
+                 * contains rax" and "a fragment ever runs with rax
+                 * pinned" are different claims (the rdx admission
+                 * shipped at zero reach once; this counter is what
+                 * notices). */
+                e.bump_counter(&g_jit_rax_pin);
             }
         }
 #endif
@@ -18993,6 +19205,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                      * the trap in doing this the lazy way.
                      */
                     && jit_fwd_consumer(chunk.code[pc + 1], fdst)
+                    /* #96 rax: lever A travels IN rax - the producer
+                     * adapter is `mov rax, pin` and the consumer reads
+                     * rax - so a run that pinned rax cannot forward.
+                     * Nothing is lost: rax is granted only to a fully
+                     * pinned run (the coverage gate), where every
+                     * operand is already in a register and the
+                     * forwarding's saved reload does not exist. */
+                    && !e.reg_holds_pin(RAX)
                     && !fwd_tgt[pc + 1]
                     && !std::binary_search(
                            entries.begin(), entries.end(),

@@ -7173,3 +7173,62 @@ clang dbg, rel-hard (VM_HARDENING=1 OPT=1) and CMake Debug;
 corpus_diff 24/24 plain, all 15 levers, all 8 rotations in BOTH
 arenas; disasmcheck clean in both arenas; driver_checks green;
 non-JIT builds (gate forced 0, g++ + clang) 1925/1925; LTO=0 green.
+
+## #96 rax - THE 13TH AND LAST REGISTER (2026-08-21)
+
+**What.** rax joins XCACHE_ORDER (last; MYLANG_JIT_XROT now sweeps
+NINE rotations, jit_pin_budget() = 13), admissible per RUN through two
+gates that fail closed independently:
+
+ - **the SHAPE gate** (`run_may_pin_rax`, consulted by
+   jit_xcache_busy): a positive whitelist in run_may_pin_rdx's mould
+   but per SHAPE, not per opcode - the specialized int arith family in
+   ACCUMULATOR form only (target == a_slot), ForLoopStep / IntAddStep,
+   Jump, LoadImmInt, JumpUnlessIntCmp, and ReturnV / Halt on the
+   flush-first argument. Everything else stages through rax somewhere:
+   the survey (scripts/rcx_admission.sh 0 under the tracker's new
+   MYLANG_REGTRACK_REPORT mode) measured ~2400 hits over ~25 opcodes,
+   so there was never a site-by-site fix - only a run gate.
+ - **the COVERAGE gate** (at the pick, before assignment): the listed
+   forms are rax-free only on their PINNED paths, so every listed op's
+   target must be in `hot`; one unpinned target means one generic-arm
+   op staging through rax. Denial pops the coldest pick - the budget
+   shrinks by one, nothing is un-assigned.
+
+Forwarding is the third piece: lever A travels IN rax (the producer
+adapter is `mov rax, pin`), so the pairing site refuses to arm when
+rax holds a pin. Nothing is lost - rax is granted only to fully-pinned
+runs, where the reload forwarding saves does not exist.
+
+**Two emit improvements landed as prerequisites, both standalone
+wins on every pinned operand independent of rax:**
+ - LoadImmInt with a pinned target emits `movabs pin, imm` directly
+   (was movabs rax + write_slot);
+ - JumpUnlessIntCmp with a pinned `a` compares in the pin
+   (cmp_reg_imm / cmp_rr2 / cmp_reg_slot - ForLoopStep's three forms),
+   dropping both the rax load and the `b` staging. Every `for` loop
+   opens with this op, so without it the shape gate refused every
+   loop in the corpus (the reach probe read rax_pin = 0 - the
+   "prove the code ran" rule caught it before it shipped hollow).
+
+**Reach, honestly:** g_jit_rax_pin (JITSTATS `rax_pin`) is bumped by
+the emitted entry of a fragment that spent rax. It engages on
+fully-pinned accumulator kernels - 13 int slots on-arena, and NOT
+off-arena, where rsi carries the t_int singleton and the budget is 12
+(the jit_rax_pin_test reach case's `want` encodes the asymmetry). A
+reduction tail must be written accumulator-form (`s0 += s1; ...`);
+`return s0+s1+...` lowers into TEMPS, which are never pinned, and the
+shape gate refuses the run. This is a NARROW reach and the admission
+is the MODEL completing (13 of 16, every non-reserved register), not
+a perf claim - MAXPINS already measured the marginal pin near zero.
+
+**Watched, all three:** the coverage gate disabled aborts the
+14-accumulator case at LoadImmInt ("write to a PINNED register", r0);
+the shape gate disabled aborts the IMMEDIATE-count shift case at
+IntShrRI - note the variable-count shift case CANNOT catch this (its
+count is a 14th slot, so the budget arithmetic denies rax anyway and
+the sabotage stays green; the immediate form adds no slot and is the
+distinguishing shape); the tracker's report mode is what turned the
+survey from one-abort-at-a-time into a worklist (and its probe runs
+now carry timeouts - report-mode code is genuinely wrong and a
+clobbered loop counter span forever on the first rax survey).

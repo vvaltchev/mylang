@@ -25164,6 +25164,202 @@ static bool jit_reg_model()
 #endif
 }
 
+/*
+ * ⛔ #96 rax - THE 13TH AND LAST REGISTER. rax is the emitter's
+ * accumulator convention, every helper's return value and the fragment
+ * ABI's own return, so it is pinnable only in a run PROVEN rax-free:
+ * every op on run_may_pin_rax's shape whitelist AND every listed op's
+ * target actually pinned (the coverage gate at the pick). These cases
+ * pin all three outcomes; the VALUE is the oracle throughout and
+ * g_jit_rax_pin (bumped by the emitted entry of a fragment that spent
+ * rax) is the reach proof - "rax is in the pool" and "a fragment ever
+ * ran with rax pinned" are different claims, and the rdx admission
+ * once shipped at zero reach because nobody separated them.
+ *
+ * The REACH case needs 13 hot int slots (12 accumulators + i) so the
+ * pick spends the whole pool; its reduction tail is written as
+ * `s0 += s1; ...` - ACCUMULATOR shape - because a `return s0+s1+...`
+ * lowers to IntAddRR into TEMPS, which are never pinned, and the
+ * shape gate correctly refuses the run (that is the vacuous-test trap
+ * in a new outfit: the obvious spelling tests nothing).
+ */
+static bool jit_rax_pin_test()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    auto go = [&](const std::vector<const char *> &src, bool vm,
+                  unsigned long *rp) -> std::string {
+        const unsigned long r0 = g_jit_rax_pin;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (rp) *rp = g_jit_rax_pin - r0;
+        return cap.str();
+    };
+
+    struct Case {
+        const char *name;
+        std::vector<const char *> src;
+        bool want;              /* must rax itself have been SPENT? */
+    };
+    const std::vector<Case> cases = {
+      /*
+       * ⛔ THE EXPECTATION IS ARENA-DEPENDENT, and unlike the xcache
+       * hoist case there is no arena-neutral spelling: rax is reached
+       * only when the run needs the WHOLE pool, and the pool is one
+       * narrower off-arena (rsi carries the t_int singleton). A
+       * 13-slot kernel therefore spends rax on-arena and CANNOT off -
+       * the pick caps at 12, one target stays unpinned, and the
+       * coverage gate correctly gives rax back. Both outcomes are the
+       * gate working; the `want` below encodes each. (A 12-slot
+       * kernel is no better: on-arena its 8 caller-saved pins stop
+       * one short of rax at the rotations where rax sits last.)
+       */
+      { "a fully-pinned 13-slot accumulator kernel spends rax",
+        { "func f(int n) {",
+          "    var s0 = 1; var s1 = 2; var s2 = 3; var s3 = 4;",
+          "    var s4 = 5; var s5 = 6; var s6 = 7; var s7 = 8;",
+          "    var s8 = 9; var s9 = 10; var sa = 11; var sb = 12;",
+          "    for (var i = 0; i < n; i++) {",
+          "        s0 += i; s1 += s0; s2 += s1; s3 += s2;",
+          "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
+          "        s8 += s7; s9 += s8; sa += s9; sb += sa;",
+          "    }",
+          "    s0 += s1; s0 += s2; s0 += s3; s0 += s4; s0 += s5;",
+          "    s0 += s6; s0 += s7; s0 += s8; s0 += s9; s0 += sa;",
+          "    s0 += sb;",
+          "    return s0;",
+          "}",
+          "print(f(runtime(40)));" },
+        ml_lowmem_fits_imm32(AllTypes[Type::t_int]) },
+
+      /* SHAPE decline: one variable-count shift - not on the
+       * whitelist (its value stages through rax in every form), and
+       * the same op claims rcx. The count is assigned twice so it
+       * cannot auto-const into the immediate form (shape-eater #6). */
+      { "a variable-count shift in the run declines rax",
+        { "func f(int n) {",
+          "    var s0 = 1; var s1 = 2; var s2 = 3; var s3 = 4;",
+          "    var s4 = 5; var s5 = 6; var s6 = 7; var s7 = 8;",
+          "    var s8 = 9; var s9 = 10; var sa = 11; var sb = 12;",
+          "    var k = 1; k = n - 39;",
+          "    for (var i = 0; i < n; i++) {",
+          "        s0 += i; s1 += s0; s2 += s1; s3 += s2;",
+          "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
+          "        s8 += s7; s9 += s8; sa += s9;",
+          "        sb += sa >> k;",
+          "    }",
+          "    s0 += s1; s0 += s2; s0 += s3; s0 += s4; s0 += s5;",
+          "    s0 += s6; s0 += s7; s0 += s8; s0 += s9; s0 += sa;",
+          "    s0 += sb;",
+          "    return s0;",
+          "}",
+          "print(f(runtime(40)));" }, false },
+
+      /*
+       * SHAPE decline, the DISTINGUISHING form: an IMMEDIATE-count
+       * shift adds NO slot, so all 13 pins fit and the coverage gate
+       * is satisfied - only the shape gate knows IntShrRI stages its
+       * value through rax (`sar rax, imm`) in every form. WATCHED:
+       * with the shape gate disabled this is the case that aborts
+       * ("write to a PINNED register", the shift's read_slot), where
+       * the variable-count case above is saved by the budget
+       * arithmetic and catches nothing.
+       */
+      { "an immediate-count shift in a fully-pinned run declines rax",
+        { "func f(int n) {",
+          "    var s0 = 1; var s1 = 2; var s2 = 3; var s3 = 4;",
+          "    var s4 = 5; var s5 = 6; var s6 = 7; var s7 = 8;",
+          "    var s8 = 9; var s9 = 10; var sa = 11; var sb = 12;",
+          "    for (var i = 0; i < n; i++) {",
+          "        s0 += i; s1 += s0; s2 += s1; s3 += s2;",
+          "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
+          "        s8 += s7; s9 += s8; sa += s9;",
+          "        sb += sa >> 3;",
+          "    }",
+          "    s0 += s1; s0 += s2; s0 += s3; s0 += s4; s0 += s5;",
+          "    s0 += s6; s0 += s7; s0 += s8; s0 += s9; s0 += sa;",
+          "    s0 += sb;",
+          "    return s0;",
+          "}",
+          "print(f(runtime(40)));" }, false },
+
+      /* COVERAGE decline: FOURTEEN accumulators - one more than the
+       * 13-register budget - so one listed op's target stays unpinned
+       * and would fall to the rax-staging generic arm. The gate must
+       * give rax back rather than let that op clobber the pin;
+       * WATCHED: with the coverage gate removed, the tracker aborts
+       * here ("write to a PINNED register", IntAddRR) at every
+       * rotation that grants rax. */
+      { "a 14th accumulator (one past the budget) declines rax",
+        { "func f(int n) {",
+          "    var s0 = 1; var s1 = 2; var s2 = 3; var s3 = 4;",
+          "    var s4 = 5; var s5 = 6; var s6 = 7; var s7 = 8;",
+          "    var s8 = 9; var s9 = 10; var sa = 11; var sb = 12;",
+          "    var sc = 13;",
+          "    for (var i = 0; i < n; i++) {",
+          "        s0 += i; s1 += s0; s2 += s1; s3 += s2;",
+          "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
+          "        s8 += s7; s9 += s8; sa += s9; sb += sa;",
+          "        sc += sb;",
+          "    }",
+          "    s0 += s1; s0 += s2; s0 += s3; s0 += s4; s0 += s5;",
+          "    s0 += s6; s0 += s7; s0 += s8; s0 += s9; s0 += sa;",
+          "    s0 += sb; s0 += sc;",
+          "    return s0;",
+          "}",
+          "print(f(runtime(40)));" }, false },
+    };
+
+    bool ok = true;
+    /* swept over every rotation, like the xcache cases: the grant must
+     * be SAFE at every pool position, and at the rotations where rax
+     * comes first it is granted to the HOTTEST slot, which is the
+     * strongest traffic it can get. */
+    const unsigned rot0 = g_jit_xrot;
+    for (unsigned rot = 0; rot < jit_xcache_width(); rot++) {
+        g_jit_xrot = rot;
+        for (const Case &c : cases) {
+            unsigned long rp = 0;
+            const std::string got = go(c.src, true, &rp);
+            const std::string ref = go(c.src, false, nullptr);
+            if (got != ref || ref.empty()) {
+                cout << "  rax_pin [" << c.name << "] xrot=" << rot
+                     << ": tw=[" << ref << "] vm=[" << got << "]\n";
+                ok = false;
+            }
+            if (c.want != (rp > 0)) {
+                cout << "  rax_pin [" << c.name << "] xrot=" << rot
+                     << ": rax spent " << rp << ", expected "
+                     << (c.want ? "> 0" : "0") << "\n";
+                ok = false;
+            }
+        }
+    }
+    g_jit_xrot = rot0;
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_xcache_pins()
 {
 #if ML_JIT_SUPPORTED
@@ -32911,6 +33107,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "
       "call-free fragment, declines around a MyLang call (#96)",
       jit_xcache_pins },
+    { "jit: RAX as the 13th pin - engages on a fully-pinned accumulator "
+      "kernel, declines on shape and on coverage (#96 rax)",
+      jit_rax_pin_test },
     { "jit: adjacent dead-temp FORWARDING hands values in RAX "
       "(lever A; counter + slow-path rejoin)",
       jit_fwd_deadtemp },

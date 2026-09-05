@@ -940,6 +940,9 @@ extern "C" unsigned long g_jit_elem_reserve;
  * program, and the discriminator between "the pool is wide" and "the
  * pool is wide AND something used the width". */
 extern "C" unsigned long g_jit_xcache;
+/* #96: fragment entries that ran with RAX itself pinned - the 13th
+ * and last register's own execution proof (see run_may_pin_rax). */
+extern "C" unsigned long g_jit_rax_pin;
 /* #96: `<op> [slot], reg` emitted instead of the four-instruction
  * load/load/apply/store shape - the two-address form. */
 extern "C" unsigned long g_jit_two_addr;

@@ -3651,3 +3651,28 @@ clang dbg, rel-hard, CMake, non-JIT g++/clang, LTO=0}; corpus 24/24 x
 arenas; fuzz 40/40; vdjcmp self 112/112. Remaining from the arc:
 (y)'s ~20 raw u8() sequences bypass wrote(); rdx/rax admission needs
 the same treatment rcx got.
+
+## (ak) 2026-08-21 - rax ADMITTED: the model reaches 13 of 16
+
+The last register, through a two-gate run admission (docs entry "#96
+rax" has the full record): run_may_pin_rax's SHAPE whitelist
+(accumulator-form arith + loop control + flush-first returns, per the
+~2400-hit / ~25-opcode survey under the tracker's new report mode) and
+the pick-site COVERAGE gate (every listed op's target actually pinned,
+else the generic arm stages through rax). Lever A refuses to arm in a
+rax-pinned run (its adapter is `mov rax, pin`). Two standalone emit
+wins fell out: LoadImmInt-to-pin and the creg-aware JumpUnlessIntCmp
+(every for-loop's entry test).
+
+Reach is NARROW by design - fully-pinned accumulator kernels, 13 int
+slots, on-arena only (off-arena rsi carries t_int and the budget is
+12) - and that is the honest completion: the GOAL was the model
+("13 of 16 registers usable"), the marginal pin's VALUE was measured
+near zero long ago (the MAXPINS sweep), and g_jit_rax_pin is the
+counter that keeps the reach claim from quietly becoming the rdx
+zero-reach story.
+
+What remains on the arc: (y)'s ~20 raw u8() sequences bypassing
+wrote(); spill-to-native-stack (the task title's second half, never
+started); widening run_may_pin_rax with evidence (immediate-count
+shifts want a two-address `sar pin, imm` form first).
