@@ -7290,3 +7290,61 @@ argument has nothing to bite on at this working-set size. Increment 1
 is the SUBSTRATE: the location map {register | spill home | frame}
 that live-range reuse (increment 2) needs for its evictions, plus
 call-transparent homes, landed at zero measured cost.
+
+## #96 INCREMENT 2 - LIVE-RANGE REUSE (2026-08-21)
+
+**What.** One register serves several slots whose in-run live ranges
+are disjoint. `jit_share_plan` computes each hot slot's interval
+(first to last touch, `jit_op_slot_refs`) and chains overflow picks
+onto registers whose occupied span is disjoint - in EITHER direction,
+because the ranking is by use count and a late phase can out-rank an
+early one (watched: t2 took the pin and loop1's `i` became overflow in
+the exact shape the feature exists for; the BACKWARD chain makes the
+early slot the register's ENTRY occupant by editing the hot list, and
+the seam installs the pin at its own lo). At a SEAM the occupant is
+evicted (type+payload to its frame slot) and the next installed.
+Lever `rshare`; MYLANG_JIT_MAXSHARE caps; MYLANG_SHAREDBG=1 narrates
+the plan; g_jit_range_share (JITSTATS `range_share`) is bumped by the
+EXECUTED seam.
+
+**⛔ THE SOUNDNESS CONDITION IS ABOUT THE SEAM, NOT THE INTERVALS.**
+The REGAUDIT ceiling used "edge-closed intervals"; that is NOT
+executable - a seam inside a loop body re-runs per iteration and its
+reload reads a frame the register has been updating. The executable
+condition: NO branch edge crosses the seam, making it a LINEARIZATION
+POINT - with ONE refinement that turned reach from zero to real: an
+edge TARGETING the seam pc exactly is legal, side-patched by the
+fixup's own emission position (a source before the seam lands on the
+PRE-seam label and runs the eviction; a source after lands past it and
+cannot re-run it). That is the loop-exit-lands-on-the-next-init shape,
+which is precisely where sequential-loop sharing lives. The seam is
+emitted BEFORE the pc's label for the same reason.
+
+**Interpreted excursions**: the entry stubs install the cache state
+AS OF THEIR PC (a base-state snapshot plus every seam at or before
+it); exits intern per-state as always, so post-seam exits flush the
+new occupant. Argfuse treats every seam-installed slot as pinned (its
+frame is stale inside its range). The rax coverage gate ran earlier
+and is CONSERVATIVE about chained slots (rax and sharing do not
+coexist); the gate's popped 13th pick now becomes a spill home
+instead of being dropped (a hole inc-2 exposed: dropping it starved
+the plan of early-ending pins AND wasted a ranked slot).
+
+**Measured (callgrind, OPT=1 ASSERTS=0, vs increment 1):** the reach
+census finds THREE corpus programs executing seams (68_nested,
+15_elem_rmw_arith, 17_elem2_divmod_roles); 68_nested reads +0.36% Ir
+- the seam's evict+install pair on a shape where the shared
+register's saved slot traffic does not recoup it. Everything else is
+byte-identical (no plan, no cost). The placement COST MODEL - decide
+pin vs home vs share by weight, and decline a share whose seam
+outweighs its uses - is the named follow-up, not a patch-over.
+
+**OPEN watched-check, stated honestly:** disabling the stubs'
+seam application stays green in every shape built so far - the raise-
+resume stub demonstrably EXECUTES (g_jit_entry_resume) in the engage
+case, yet the wrong base state never propagates to an observable
+value there. The application code stays (it is reasoned-correct and
+cheap); a shape that makes its absence bite is still owed. The other
+pieces are watched: the two-phase decline case's first spelling was
+itself caught legitimately chaining backward, and the fully-
+overlapping spelling pins the decline.

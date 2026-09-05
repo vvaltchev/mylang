@@ -948,6 +948,8 @@ extern "C" unsigned long g_jit_xcache;
 extern "C" unsigned long g_jit_rax_pin;
 /* #96 inc-1: fragment entries that ran with >= 1 spill-homed slot. */
 extern "C" unsigned long g_jit_scache;
+/* #96 inc-2: range seams EXECUTED (eviction + install ran). */
+extern "C" unsigned long g_jit_range_share;
 /* #96: `<op> [slot], reg` emitted instead of the four-instruction
  * load/load/apply/store shape - the two-address form. */
 extern "C" unsigned long g_jit_two_addr;

@@ -3695,3 +3695,20 @@ targets, the seed/flush discipline at entries/exits/barriers, and the
 route slot access through read_slot/write_slot or pair creg with
 cspill, because the third home made every hand-rolled creg consult a
 stale read.
+
+## (am) 2026-08-21 - INCREMENT 2 LANDED: live-range reuse across seams
+
+The mandate's sentence is now mechanism: a register is REUSABLE by
+several variables in the same frame, evicted at seams to the frame
+slot (with increment 1's homes taking the un-chained overflow). See
+docs "#96 INCREMENT 2" for the two-direction chaining, the
+seam-as-linearization-point condition and its side-patched
+edge-targeting refinement, and the one honestly-open watched-check
+(the stubs' per-pc state). Reach today: phase-structured runs -
+sequential loops, init/loop splits; the single-big-loop shapes that
+dominate bench/ have no disjoint ranges and correctly plan nothing.
+
+What remains on the arc, unchanged in kind: the ~20 raw u8() tracker
+bypasses (y), widening run_may_pin_rax (two-address shifts), and -
+now that placement has three tiers - a COST model that decides pin vs
+home vs share by weight rather than rank order alone.

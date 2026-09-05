@@ -74,6 +74,7 @@ unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_rax_pin = 0;       /* #96: rax-pinned fragment entries */
 unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
+unsigned long g_jit_range_share = 0;   /* #96 inc-2: executed range seams */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
 unsigned long g_jit_two_addr_reg = 0;  /* #96: two-address PINNED ops */
 unsigned long g_jit_step_imm = 0;      /* #96: pinned counted-loop steps */
@@ -252,12 +253,12 @@ enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
-    JL_COUNT
+    JL_RSHARE, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
-    "relent", "norec", "argfuse", "xcache", "scache"
+    "relent", "norec", "argfuse", "xcache", "scache", "rshare"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -8533,6 +8534,7 @@ void jit_stats_report()
         { "xcache",           &g_jit_xcache },
         { "rax_pin",          &g_jit_rax_pin },
         { "scache",           &g_jit_scache },
+        { "range_share",      &g_jit_range_share },
         { "two_addr",         &g_jit_two_addr },
         { "two_addr_reg",     &g_jit_two_addr_reg },
         { "step_imm",         &g_jit_step_imm },
@@ -8973,6 +8975,173 @@ size_t jit_xcache_width() { return MAX_XCACHED; }
  * in native-stack spill slots. Stack is cheap; the cap exists so a
  * pathological chunk cannot carve an unbounded frame. */
 static const size_t MAX_SPILL_HOMES = 16;
+
+/*
+ * #96 INCREMENT 2 - LIVE-RANGE REUSE. One register serves several
+ * slots whose in-run live ranges are DISJOINT: at a SEAM pc between
+ * the earlier slot's last touch and the later one's first, the
+ * register's occupant is flushed to its frame slot and the next one
+ * loaded - "the way a C compiler does" (the mandate's words), with
+ * the frame as the eviction target increment 1 made cheap to reason
+ * about.
+ *
+ * ⛔ THE SOUNDNESS CONDITION IS ABOUT THE SEAM, NOT THE INTERVALS.
+ * The REGAUDIT ceiling measurement used "edge-closed intervals", and
+ * that is NOT sufficient to EXECUTE a share: a seam inside a loop
+ * body re-runs every iteration, and its reload of the later slot
+ * reads a FRAME the register has been updating - a stale read on
+ * iteration 2. The executable condition is that NO branch edge
+ * crosses the seam in either direction, which makes the seam a
+ * LINEARIZATION POINT: every native path from the run head to any pc
+ * past the seam falls through it exactly where emission put it, and
+ * the seam is emitted BEFORE the pc's label so a back edge TO the
+ * seam pc lands after it and cannot re-run it. Interpreted
+ * excursions are covered by the entry stubs, which install the cache
+ * state AS OF their pc (base state + the seams at or before it) -
+ * and a re-crossed seam after such an excursion reloads from a frame
+ * the excursion's exit flushed, which is exactly the truth.
+ *
+ * The candidates come from the SAME ranked pick as everything else
+ * (bad()-rule qualification inherited); a chained slot would
+ * otherwise have been a spill home, so a seam strictly upgrades its
+ * placement and frees a home for the next overflow.
+ */
+struct ShareSeam {
+    size_t pc;                 /* the linearization point (= to.lo) */
+    uint8_t reg;               /* whose occupant is evicted here */
+    int to_slot;               /* the register's next occupant */
+};
+static const size_t MAX_SHARE_SEAMS = 8;
+
+static void jit_share_plan(const Chunk &ck, size_t begin, size_t end,
+                           std::vector<int> &hot,
+                           const std::vector<uint8_t> &hot_reg,
+                           std::vector<int> &spill_hot,
+                           std::vector<ShareSeam> &seams)
+{
+    if (jit_lever_off(JL_RSHARE) || hot.empty() || spill_hot.empty())
+        return;
+    size_t cap = MAX_SHARE_SEAMS;
+    if (const char *ms = getenv("MYLANG_JIT_MAXSHARE"))
+        cap = static_cast<size_t>(atoi(ms));
+    if (!cap)
+        return;
+    /* the live interval of each slot of interest */
+    struct Iv { int lo = -1, hi = -1; };
+    std::map<int, Iv> iv;
+    for (const int sl : hot) iv[sl];
+    for (const int sl : spill_hot) iv[sl];
+    for (size_t p = begin; p < end; p++) {
+        std::vector<int> u2, d2;
+        Instr &i2 = const_cast<Instr &>(ck.code[p]);
+        if (!jit_op_slot_refs(i2, u2, d2))
+            continue;
+        const auto touch = [&](int sl) {
+            auto it = iv.find(sl);
+            if (it == iv.end())
+                return;
+            if (it->second.lo < 0)
+                it->second.lo = static_cast<int>(p);
+            it->second.hi = static_cast<int>(p);
+        };
+        for (const int sl : u2) touch(sl);
+        for (const int sl : d2) touch(sl);
+    }
+    /* the non-sequential edges (fall-through excluded: linear-order
+     * state change is exactly what a seam is) */
+    std::vector<std::pair<int,int>> edges;
+    for (size_t p = begin; p < end; p++) {
+        const Instr &i2 = ck.code[p];
+        if (op_is_branch(i2.op) && i2.target >= 0
+                && i2.target != static_cast<int>(p) + 1)
+            edges.push_back({ static_cast<int>(p), i2.target });
+    }
+    const auto seam_ok = [&](int sp) {
+        for (const auto &ed : edges) {
+            /* an edge TARGETING the seam pc itself is legal: the
+             * patcher sends a source emitted BEFORE the seam to the
+             * pre-seam position (it must run the eviction) and a
+             * source after it past the seam (it must not re-run it) -
+             * the fixup's own site says which, because emission is
+             * linear. This is the loop-exit-lands-on-the-next-init
+             * shape, which is exactly where sequential-loop sharing
+             * lives. */
+            if (ed.second == sp)
+                continue;
+            if ((ed.first < sp) != (ed.second < sp))
+                return false;            /* an edge crosses the seam */
+        }
+        return true;
+    };
+    /*
+     * Chain overflow slots onto registers whose occupied SPAN is
+     * disjoint from their range - in EITHER direction, because the
+     * ranking is by use count and a late-phase slot can out-rank an
+     * early-phase one (watched: t2 took the pin and i became overflow
+     * in exactly the shape this exists for):
+     *  - FORWARD: the overflow begins after the span ends; the seam
+     *    at its lo evicts the current occupant, installs it;
+     *  - BACKWARD: the overflow ends before the span begins; it
+     *    becomes the register's ENTRY occupant (the hot entry is
+     *    EDITED, so the cache build loads it), and the seam at the
+     *    old first occupant's lo installs that occupant.
+     */
+    struct ChainSpan { int lo, hi; size_t hot_idx; };
+    std::map<uint8_t, ChainSpan> chain;
+    for (size_t h = 0; h < hot.size(); h++) {
+        const Iv &v = iv[hot[h]];
+        if (v.lo < 0)
+            continue;
+        chain[hot_reg[h]] = { v.lo, v.hi, h };
+    }
+    static const bool dbg = getenv("MYLANG_SHAREDBG") != nullptr;
+    if (dbg) {
+        for (size_t h = 0; h < hot.size(); h++)
+            fprintf(stderr, "SHAREDBG pin slot %d reg %u iv [%d,%d]\n",
+                    hot[h], hot_reg[h], iv[hot[h]].lo, iv[hot[h]].hi);
+        for (const int o : spill_hot)
+            fprintf(stderr, "SHAREDBG ovf slot %d iv [%d,%d]\n",
+                    o, iv[o].lo, iv[o].hi);
+    }
+    std::vector<int> kept;
+    for (const int o : spill_hot) {
+        const Iv &v = iv[o];
+        bool chained = false;
+        if (seams.size() < cap && v.lo >= 0) {
+            for (auto &ce : chain) {
+                ChainSpan &cs = ce.second;
+                if (dbg)
+                    fprintf(stderr, "SHAREDBG try ovf %d [%d,%d] vs "
+                            "reg %u span [%d,%d] fwd_ok %d bwd_ok %d\n",
+                            o, v.lo, v.hi, ce.first, cs.lo, cs.hi,
+                            (int)(cs.hi < v.lo && seam_ok(v.lo)),
+                            (int)(v.hi < cs.lo && seam_ok(cs.lo)));
+                if (cs.hi < v.lo && seam_ok(v.lo)) {
+                    seams.push_back({ static_cast<size_t>(v.lo),
+                                      ce.first, o });
+                    cs.hi = v.hi;
+                    chained = true;
+                    break;
+                }
+                if (v.hi < cs.lo && seam_ok(cs.lo)) {
+                    const int old_first = hot[cs.hot_idx];
+                    seams.push_back({ static_cast<size_t>(cs.lo),
+                                      ce.first, old_first });
+                    hot[cs.hot_idx] = o;   /* o is the entry occupant */
+                    cs.lo = v.lo;
+                    chained = true;
+                    break;
+                }
+            }
+        }
+        if (!chained)
+            kept.push_back(o);
+    }
+    spill_hot.swap(kept);
+    std::sort(seams.begin(), seams.end(),
+              [](const ShareSeam &a, const ShareSeam &b)
+              { return a.pc < b.pc; });
+}
 size_t jit_spill_budget() { return MAX_SPILL_HOMES; }
 
 static const uint8_t *xcache_regs()
@@ -18916,6 +19085,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             if (!covered) {
                 e.ra.denied |= 1u;
                 if (!hot.empty() && hot.size() == max_pins) {
+                    /* #96 inc-1/2: the popped pick is still a ranked,
+                     * qualified hot slot - it becomes a SPILL HOME
+                     * (it used to be dropped on the floor, which also
+                     * starved the share plan of early-ending pins) */
+                    spill_hot.insert(spill_hot.begin(), hot.back());
                     hot.pop_back();      /* the budget just shrank by 1 */
                     hot_counts.pop_back();
                 }
@@ -19069,6 +19243,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         jit_pick_release_slots(chunk, begin, end, entries, fwd_lin,
                                fwd_live_ok, rel_active, rel_at);
 
+        /* #96 inc-2: chain overflow slots onto registers with disjoint
+         * ranges; a chained slot leaves spill_hot (a seam beats a
+         * home). Decided after the assignment so the plan knows the
+         * registers, before the scache build so the homes shrink. */
+        std::vector<ShareSeam> seams;
+        jit_share_plan(chunk, begin, end, hot, hot_reg, spill_hot,
+                       seams);
         /* #96 inc-1: the spill homes are decided before frag_entry,
          * which carves their bytes out of the native stack. */
         for (size_t j = 0; j < spill_hot.size(); j++) {
@@ -19111,6 +19292,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 e.load(hot_reg[h], a.payload);            /* entry load */
             }
         }
+        /* #96 inc-2: the stubs need the cache state AS OF their pc -
+         * base + the seams at or before it - and e.cache at stub-
+         * emission time is the post-all-seams FINAL state. */
+        const std::vector<Emitter::CacheEnt> base_cache = e.cache;
 #ifdef TESTS
         {
             /* #96: the execution proof, bumped per ENTRY of a fragment
@@ -19299,6 +19484,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                  * stale for the same reason a pin's is - the fused
                  * bind would read it raw */
                 for (const int s : spill_hot) if (s == slot) return true;
+                /* #96 inc-2: every seam-installed slot is register-
+                 * resident for part of the run */
+                for (const ShareSeam &sm : seams)
+                    if (sm.to_slot == slot) return true;
                 return false;
             };
             for (size_t pc = begin; pc < end; pc++) {
@@ -19625,6 +19814,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         };
 
         size_t hri = 0;                       /* the next region to enter */
+        size_t si = 0;                        /* #96 inc-2: next seam */
+        std::map<size_t, size_t> seam_pre;    /* seam pc -> pre position */
         for (size_t pc = begin; pc < end && emit_ok; pc++) {
             if (g_hoist.active && hri > 0
                     && pc == hregs[hri - 1].L + 1) {
@@ -19739,6 +19930,34 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                     g_fwd = JitFwd{};             /* the calls clobbered rax */
                 }
             }
+            /*
+             * #96 inc-2: the SEAM - evict the register's occupant to
+             * its frame slot, hand the register to the next range.
+             * Emitted BEFORE label[pc], so a back edge TARGETING the
+             * seam pc lands after it and cannot re-run it (re-running
+             * would reload the new occupant from a frame the register
+             * has been updating). All machinery to the tracker.
+             */
+            while (si < seams.size() && seams[si].pc == pc) {
+                const ShareSeam &sm = seams[si++];
+                seam_pre[pc] = e.pos();   /* early branches land HERE */
+                Emitter::PinMach pm(e);
+                for (Emitter::CacheEnt &c : e.cache) {
+                    if (c.reg != sm.reg)
+                        continue;
+                    e.store_type_tag(c.type, jit_layout().t_int, 6);
+                    e.store(c.reg, c.payload);       /* evict */
+                    const SlotAddr na = slot_addr(sm.to_slot);
+                    c.slot = sm.to_slot;
+                    c.payload = na.payload;
+                    c.type = na.type;
+                    e.load(c.reg, c.payload);        /* install */
+                    break;
+                }
+#ifdef TESTS
+                e.bump_counter(&g_jit_range_share);
+#endif
+            }
             label[pc - begin] = e.pos();
             e.released = rel_active[pc - begin];
             emit_one(pc, /*in_cold=*/false, end);
@@ -19755,7 +19974,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         e.exit_pc(static_cast<uint32_t>(remap[end]));   /* fall-through */
 
         for (const Fixup &f : fixups) {    /* patch internal jumps */
-            const size_t dst = label[f.target_pc - begin];
+            size_t dst = label[f.target_pc - begin];
+            /* #96 inc-2: a branch TARGETING a seam pc runs the seam
+             * iff its source precedes it (emission is linear, so the
+             * fixup site decides the side) */
+            const auto sp = seam_pre.find(f.target_pc);
+            if (sp != seam_pre.end() && f.site < sp->second)
+                dst = sp->second;
             e.patch32(f.site,
                       static_cast<uint32_t>(dst - (f.site + 4)));
         }
@@ -19789,6 +20014,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             e.jmp32_to(cL + 1 == end ? exit_pos
                                      : label[cL + 1 - begin]);
             for (const Fixup &f : cold_fix) {
+                /* cold copies emit after the whole stream: every site
+                 * is past every seam, so the post-seam label is the
+                 * right target unconditionally */
                 const size_t dst =
                     (f.target_pc >= cT && f.target_pc <= cL)
                         ? cold_label[f.target_pc - cT]
@@ -19843,7 +20071,25 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                     e.load(0 /* rax */, c.payload);
                     e.spill(0 /* rax */, c.k);
                 }
-                for (const Emitter::CacheEnt &c : e.cache)
+                /* #96 inc-2: this entry's pin ASSIGNMENT is the state
+                 * AS OF ITS PC - the base cache with every seam at or
+                 * before the pc applied. e.cache holds the FINAL
+                 * (post-all-seams) state here, which is right only
+                 * for entries past the last seam. */
+                std::vector<Emitter::CacheEnt> st_cache = base_cache;
+                for (const ShareSeam &sm : seams) {
+                    if (sm.pc > pe.first)
+                        break;
+                    for (Emitter::CacheEnt &c : st_cache)
+                        if (c.reg == sm.reg) {
+                            const SlotAddr na = slot_addr(sm.to_slot);
+                            c.slot = sm.to_slot;
+                            c.payload = na.payload;
+                            c.type = na.type;
+                            break;
+                        }
+                }
+                for (const Emitter::CacheEnt &c : st_cache)
                     e.load(c.reg, c.payload);   /* #96: the ENTRY's own
                                                  * assignment, not the
                                                  * positional
