@@ -25410,6 +25410,37 @@ static bool jit_xcache_pins()
           "    return s0 + s1 + s2 + s3 + s4 + s5 + s6 + acc; };",
           "print(f(runtime(64)));" }, true },
 
+      /*
+       * ⛔ THE VARIABLE-COUNT SHIFT CLAIMS rcx (2026-08-20). `sar rax,
+       * cl` takes its count in cl and nowhere else, and the RR shift
+       * emitter loads it with a raw read_slot(RCX) outside any borrow
+       * - so a max-pin run containing one must not pin rcx
+       * (jit_xcache_busy's rcx clause). Thirteen hot slots force the
+       * pick past every other pool member; the count is assigned
+       * TWICE because a write-once count auto-consts into the RI
+       * (immediate) form and the case goes vacuous (shape-eater #6).
+       * WATCHED: without the clause the tracker aborts at IntShrRR in
+       * every rotation - which in a release build is a silent wrong
+       * sum. The VALUE is the oracle; engaged proves the run still
+       * pins the rest of the pool.
+       */
+      { "a variable-count shift in a max-pin loop leaves rcx alone",
+        { "func f(int n) {",
+          "    var s0 = 1; var s1 = 2; var s2 = 3; var s3 = 4;",
+          "    var s4 = 5; var s5 = 6; var s6 = 7; var s7 = 8;",
+          "    var s8 = 9; var s9 = 10; var sa = 11; var sb = 12;",
+          "    var k = 1; k = n - 39;",
+          "    for (var i = 0; i < n; i++) {",
+          "        s0 += i; s1 += s0; s2 += s1; s3 += s2;",
+          "        s4 += s3; s5 += s4; s6 += s5; s7 += s6;",
+          "        s8 += s7; s9 += s8; sa += s9;",
+          "        sb += sa >> k;",
+          "    }",
+          "    return s0 + s1 + s2 + s3 + s4 + s5 + s6",
+          "        + s7 + s8 + s9 + sa + sb;",
+          "}",
+          "print(f(runtime(40)));" }, true },
+
       /* THREE hot locals: the callee-saved four suffice, so the
        * extension must stay out of it (a pool that always reaches for
        * r10/r11 would pass the case above and this one would catch it). */
