@@ -293,9 +293,24 @@ static unsigned jit_force_mask()
 }
 /* OFF wins over FORCE (a disabled lever stays disabled). */
 static bool jit_lever_off(JitLever l) { return jit_off_mask() & (1u << l); }
+/* the in-process FORCE override, for tests that must exercise a
+ * cost-declined mechanism without an environment round-trip (the
+ * g_jit_xrot pattern; the env masks are cached statics). */
+unsigned g_jit_force_extra = 0;
+/* the lever's BIT by name, for tests setting g_jit_force_extra - the
+ * name table is the identity, so this cannot drift when the enum
+ * grows (an unknown name is 0 = force nothing). */
+unsigned jit_lever_bit(const char *name)
+{
+    for (int i = 0; i < JL_COUNT; i++)
+        if (!strcmp(jit_lever_names[i], name))
+            return 1u << i;
+    return 0;
+}
 static bool jit_lever_forced(JitLever l)
 {
-    return !jit_lever_off(l) && (jit_force_mask() & (1u << l));
+    return !jit_lever_off(l)
+        && ((jit_force_mask() | g_jit_force_extra) & (1u << l));
 }
 
 /* 4-v inc 5 (2026-08-12): the no-record tier is the DEFAULT.
@@ -9032,6 +9047,7 @@ static void jit_share_plan(const Chunk &ck, size_t begin, size_t end,
                            std::vector<int> &hot,
                            const std::vector<uint8_t> &hot_reg,
                            std::vector<int> &spill_hot,
+                           size_t home_cap,
                            std::vector<ShareSeam> &seams)
 {
     if (jit_lever_off(JL_RSHARE) || hot.empty() || spill_hot.empty())
@@ -9118,9 +9134,39 @@ static void jit_share_plan(const Chunk &ck, size_t begin, size_t end,
             fprintf(stderr, "SHAREDBG ovf slot %d iv [%d,%d]\n",
                     o, iv[o].lo, iv[o].hi);
     }
+    /*
+     * ⛔ THE COST MODEL (#96), sized by what was MEASURED, and thin on
+     * purpose. Across the whole arc every placement except the seam
+     * measured Ir-flat (the MAXPINS sweep for pins, the inc-1 record
+     * for homes: the two-address family had already collected the
+     * body-op win, and entry/exit costs are noise at these shapes).
+     * The seam is the ONE placement with a demonstrated cost:
+     * evict+install is ~3 instructions and 68_nested paid +0.36% Ir
+     * for a chain whose alternative was a FREE home. So the
+     * arithmetic is a comparison of alternatives, not a weight sum:
+     *
+     *   overflow that FITS the home tier  -> home (0 measured cost)
+     *   overflow PAST the home capacity   -> a seam beats the frame
+     *                                        slot it would otherwise
+     *                                        keep; chain it
+     *
+     * MYLANG_JIT_FORCE=rshare ignores the cost half and chains
+     * everything chainable - the FORCE contract exactly: it tests the
+     * SEAM MACHINERY's correctness independently of profitability,
+     * which is what the -rt engage case does (via g_jit_force_extra,
+     * since the env masks are cached statics).
+     */
+    const bool forced = jit_lever_forced(JL_RSHARE);
     std::vector<int> kept;
+    size_t rank = 0;
     for (const int o : spill_hot) {
         const Iv &v = iv[o];
+        const bool has_home = rank < home_cap;
+        rank++;
+        if (has_home && !forced) {
+            kept.push_back(o);           /* the free alternative wins */
+            continue;
+        }
         bool chained = false;
         if (seams.size() < cap && v.lo >= 0) {
             for (auto &ce : chain) {
@@ -19035,10 +19081,16 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         }
         if (jit_lever_off(JL_SCACHE))
             spill_hot.clear();
+        /* #96 COST MODEL: the home CAPACITY is applied AFTER the share
+         * plan, not here - the overflow past it is exactly the set for
+         * which a seam beats the nothing it would otherwise get (see
+         * the plan's cost note). MYLANG_JIT_MAXSPILL still caps the
+         * homes; it does so below. */
+        size_t home_cap = MAX_SPILL_HOMES;
         if (const char *ms = getenv("MYLANG_JIT_MAXSPILL")) {
             const size_t cap = static_cast<size_t>(atoi(ms));
-            if (cap < spill_hot.size())
-                spill_hot.resize(cap);
+            if (cap < home_cap)
+                home_cap = cap;
         }
         /* the per-lever kill switches (see JitLever): applied HERE, on
          * the pick's OUTPUT, so one place disables a lever no matter
@@ -19264,7 +19316,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * registers, before the scache build so the homes shrink. */
         std::vector<ShareSeam> seams;
         jit_share_plan(chunk, begin, end, hot, hot_reg, spill_hot,
-                       seams);
+                       home_cap, seams);
+        /* the homes take what the plan left, up to capacity; a residue
+         * past it stays a frame slot (the pre-#96 placement) */
+        if (spill_hot.size() > home_cap)
+            spill_hot.resize(home_cap);
         /* #96 inc-1: the spill homes are decided before frag_entry,
          * which carves their bytes out of the native stack. */
         for (size_t j = 0; j < spill_hot.size(); j++) {
