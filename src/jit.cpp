@@ -1246,6 +1246,250 @@ struct Emitter {
      */
     RegAlloc ra;
 
+    /*
+     * ================== #96 (c): THE REGISTER-STATE TRACKER =========
+     *
+     * THE EMIT-TIME GUARDRAIL THIS ARC WAS MISSING. Three instruments
+     * watch registers and all three are REMOTE from the failure: the
+     * census reads the SOURCE, the admission survey reads DECLARATIONS
+     * (Emitter::scratch calls - a site that simply writes a register
+     * declares nothing), and the nets read the final ANSWER, hours of
+     * machinery away from the wrong write. The rcx admission produced
+     * FOUR undeclared-writer bugs in a row, each root-caused by hand
+     * from a -vdj dump.
+     *
+     * This closes the gap AT THE EMIT SITE. Batches 3-6 made every
+     * encoder take its registers as ARGUMENTS - so the Emitter can now
+     * check, on every instruction it emits, whether the register being
+     * written currently holds live state. A violation aborts DURING
+     * JIT COMPILATION, deterministically, naming the register, the vm
+     * pc and the opcode - not five layers later as a wrong answer.
+     *
+     * THE MODEL. A register is LIVE-STATE when a CacheEnt pins a slot
+     * in it. Legitimate writers are enumerated, not inferred:
+     *
+     *  - PIN MACHINERY (PinMach RAII): the entry loads, reload_cache,
+     *    emit_call_epilogue's reload loop, write_slot's pin update.
+     *  - A CALL BRACKET (trk_bracket): between emit_call_prologue and
+     *    the epilogue's reload, every CALLER-saved pin is safe in its
+     *    slot, so its register is free scratch - that is what the
+     *    census's "bracketed" column always meant. Callee-saved pins
+     *    are NOT spilled by the prologue and stay protected.
+     *  - A BORROW: push of a pinned register marks it borrowed; the
+     *    borrower may then write it freely (pop restores). While
+     *    borrowed: pin machinery touching it ABORTS (a reload would be
+     *    popped away; a spill would store the borrowed-away temp), and
+     *    read_slot resolving to it after the borrower wrote it ABORTS
+     *    (the slot read would see the temp, not the pin).
+     *
+     * Anything else that writes a pinned register is the bug class
+     * this exists for, and it dies HERE, by name.
+     *
+     * The checks run in every ASSERTS build (like ML_CHECK) and cost
+     * JIT-COMPILE time only - wrote() emits nothing, so the emitted
+     * bytes are identical with the tracker on or off.
+     */
+    uint32_t trk_borrowed = 0;   /* pinned regs push-saved by a borrow */
+    uint32_t trk_dirty = 0;      /* borrowed regs the borrower wrote   */
+    uint8_t trk_bstack[8] = {};  /* borrow ORDER - pops must reverse   */
+    int trk_bn = 0;
+    bool trk_flushed = false;    /* post-flush: memory is authoritative,
+                                  * pin REGISTERS are dead until reload */
+    uint32_t trk_flushdirty = 0; /* pins repurposed since the flush -
+                                  * reading the SLOT out of one of these
+                                  * registers reads the repurposed value */
+    int trk_mach = 0;            /* inside declared pin machinery      */
+    int trk_bracket = 0;         /* between call prologue and reload   */
+    int trk_takes = 0;           /* alloc_scratch takes not yet freed  */
+    int dbg_pc = -1;             /* the op being emitted, for messages */
+    int dbg_op = -1;
+
+#ifndef NDEBUG
+    [[noreturn]] void trk_fail(const char *what, unsigned r) const
+    {
+        fprintf(stderr,
+                "JIT-REGTRACK: %s: r%u  (vm pc %d, opcode %d; "
+                "borrowed=%#x dirty=%#x mach=%d bracket=%d)\n"
+                "  the emitted code at this point would silently "
+                "corrupt live register state.\n",
+                what, r, dbg_pc, dbg_op,
+                trk_borrowed, trk_dirty, trk_mach, trk_bracket);
+        abort();
+    }
+#endif
+    /* EVERY encoder that writes a GP register reports it here first. */
+    void wrote(uint8_t r)
+    {
+#ifndef NDEBUG
+        const uint32_t bit = 1u << r;
+        if (trk_borrowed & bit) {
+            if (trk_mach > 0)
+                trk_fail("pin machinery writes a BORROWED register "
+                         "(the pop will destroy this value)", r);
+            trk_dirty |= bit;            /* the borrower's own use */
+            return;
+        }
+        if (trk_mach > 0 || !reg_holds_pin(r))
+            return;
+        if (trk_flushed) {
+            trk_flushdirty |= bit;   /* dead until reload: repurposable */
+            return;
+        }
+        if (trk_bracket > 0 && !(gp_caps(r) & CAP_CALLEE_SAVED))
+            return;      /* spilled by the prologue; reloaded after */
+        trk_fail("write to a PINNED register with no borrow and no "
+                 "declaration", r);
+#else
+        (void)r;
+#endif
+    }
+    void trk_push(uint8_t r)
+    {
+#ifndef NDEBUG
+        if (trk_mach > 0 || !reg_holds_pin(r) || trk_flushed)
+            return;
+        if (trk_bracket > 0 && !(gp_caps(r) & CAP_CALLEE_SAVED))
+            return;                      /* pushing dead scratch */
+        if (trk_borrowed & (1u << r))
+            trk_fail("NESTED borrow of the same register - the inner "
+                     "pop would end the outer borrow early", r);
+        if (trk_bn >= 8)
+            trk_fail("borrow stack overflow", r);
+        trk_bstack[trk_bn++] = r;
+        trk_borrowed |= 1u << r;
+#else
+        (void)r;
+#endif
+    }
+    void trk_pop(uint8_t r)
+    {
+#ifndef NDEBUG
+        const uint32_t bit = 1u << r;
+        if (trk_borrowed & bit) {        /* the restore: borrow ends */
+            if (trk_bn <= 0 || trk_bstack[trk_bn - 1] != r)
+                trk_fail("borrow pops out of order - the values would "
+                         "swap registers", r);
+            trk_bn--;
+            trk_borrowed &= ~bit;
+            trk_dirty &= ~bit;
+            return;
+        }
+        wrote(r);                        /* any other pop WRITES r */
+#else
+        (void)r;
+#endif
+    }
+    /* read_slot's pin resolution: reading a slot out of a register the
+     * borrower has overwritten reads the TEMP, not the slot's value. */
+    void trk_read_pin(uint8_t r) const
+    {
+#ifndef NDEBUG
+        const uint32_t bit = 1u << r;
+        if ((trk_borrowed & bit) && (trk_dirty & bit))
+            trk_fail("read_slot resolves to a BORROWED register the "
+                     "borrower has already overwritten", r);
+        if (trk_flushdirty & bit)
+            trk_fail("read_slot resolves to a pin register that was "
+                     "REPURPOSED after the flush - the slot's value is "
+                     "in MEMORY now, not here", r);
+#else
+        (void)r;
+#endif
+    }
+    /* A spill/flush stores each pin REGISTER to its slot - done while
+     * one is borrowed, it stores the borrowed-away temp as the slot's
+     * value. The exact mechanism of the failed arm() guard. */
+    void assert_no_borrow(const char *where)
+    {
+#ifndef NDEBUG
+        if (trk_borrowed)
+            trk_fail(where, static_cast<unsigned>(trk_borrowed));
+#else
+        (void)where;
+#endif
+    }
+    /* Between ops nothing transient may remain: an open borrow means a
+     * pop was emitted as dead code (or not at all), and an unfreed
+     * alloc_scratch take silently reassigns every later allocation. */
+    void op_boundary()
+    {
+#ifndef NDEBUG
+        if (trk_borrowed)
+            trk_fail("op boundary reached with a BORROW still open "
+                     "(its pop is dead code or missing)",
+                     static_cast<unsigned>(trk_borrowed));
+        if (trk_takes != 0)
+            trk_fail("op boundary reached with an alloc_scratch take "
+                     "not freed", static_cast<unsigned>(trk_takes));
+        /* ⛔ THE FLUSH STATE IS PER-OP, NOT PER-EMISSION-ORDER. A run
+         * may contain a TERMINAL op mid-sequence (an early return): its
+         * flush ends ITS path, but the next op in EMISSION order is
+         * reached at runtime by a jump, with the pins LIVE - the
+         * fragment's entry contract. Carrying `flushed` across the
+         * boundary was wrong in both polarities at once: pin writes in
+         * the next op were silently allowed, and legitimate pin reads
+         * were flagged (watched: a StoreElemInt after an early
+         * ReturnV). Every op begins with pins live. */
+        trk_flushed = false;
+        trk_flushdirty = 0;
+#endif
+    }
+    /* RAII for the enumerated legitimate pin writers. */
+    struct PinMach {
+        Emitter &e;
+        explicit PinMach(Emitter &em) : e(em) { e.trk_mach++; }
+        ~PinMach() { e.trk_mach--; }
+        PinMach(const PinMach &) = delete;
+        PinMach &operator=(const PinMach &) = delete;
+    };
+    /* the pop's BYTES with no tracker transition - only BorrowSuspend
+     * may use this, for a restore on a DIVERGENT path */
+    void pop_bytes(uint8_t r)
+    { if (r >= 8) u8(0x41); u8(0x58 | (r & 7)); }
+    /*
+     * ⛔ A DIVERGENT ARM THAT LEAVES THE OP (a raise, a bail) while a
+     * borrow is open must restore the pins ON THAT PATH - the epilogue
+     * it jumps to flushes every pin register, and a borrowed one holds
+     * the borrower's temp. This is EXACTLY the mechanism of the rcx
+     * failures: a div0 raise flushed the DIVISOR as an accumulator's
+     * value, and the catch summed it.
+     *
+     * BorrowSuspend, at the head of such an arm: emits the restore
+     * pops (reverse order, bytes only) and CLEARS the tracker state so
+     * the arm's own machinery (the convey helper bracket, exit_pc's
+     * assert) sees the truth of that path; the destructor puts the
+     * state back, because the FALL-THROUGH path still holds the
+     * borrows and emission continues there.
+     */
+    struct BorrowSuspend {
+        Emitter &e;
+        uint32_t borrowed, dirty;
+        uint8_t bstack[8];
+        int bn;
+        explicit BorrowSuspend(Emitter &em)
+            : e(em), borrowed(em.trk_borrowed), dirty(em.trk_dirty),
+              bn(em.trk_bn)
+        {
+            for (int i = 0; i < 8; i++)
+                bstack[i] = e.trk_bstack[i];
+            for (int i = e.trk_bn; i-- > 0; )
+                e.pop_bytes(e.trk_bstack[i]);
+            e.trk_borrowed = 0;
+            e.trk_dirty = 0;
+            e.trk_bn = 0;
+        }
+        ~BorrowSuspend()
+        {
+            e.trk_borrowed = borrowed;
+            e.trk_dirty = dirty;
+            e.trk_bn = bn;
+            for (int i = 0; i < 8; i++)
+                e.trk_bstack[i] = bstack[i];
+        }
+        BorrowSuspend(const BorrowSuspend &) = delete;
+        BorrowSuspend &operator=(const BorrowSuspend &) = delete;
+    };
+
     int take_reg(const uint8_t *pool, size_t n)
     {
         for (size_t i = 0; i < n; i++)
@@ -1320,9 +1564,12 @@ struct Emitter {
          * hand out a pinned register - so it is checked here, at the
          * one place that consults both. */
         check_pins_are_busy();
-        return ra.take(need | CAP_ALLOCATABLE, prefer, exclude);
+        const int r = ra.take(need | CAP_ALLOCATABLE, prefer, exclude);
+        if (r >= 0)
+            trk_takes++;
+        return r;
     }
-    void free_scratch(uint8_t r) { give_reg(r); }
+    void free_scratch(uint8_t r) { trk_takes--; give_reg(r); }
     /* C2a: the FLOAT half of the pool - hot float slots pinned in
      * xmm4-xmm7 (xmm0/1 stay the per-op scratch). xmm registers are ALL
      * caller-saved, so unlike the GP pins these are spilled to their
@@ -1458,6 +1705,7 @@ struct Emitter {
     /* mov <reg64>, [rbx + disp32]  (reg 0-15; REX.R for r8-r15) */
     void load(uint8_t reg, int32_t disp)
     {
+        wrote(reg);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
         u8(0x8B);
         u8(static_cast<uint8_t>(MODRM_SLOT | ((reg & 7) << 3)));
@@ -1506,6 +1754,7 @@ struct Emitter {
     static bool base_no_base_form(uint8_t b)  { return (b & 7) == 5; }
     void load_base(uint8_t reg, uint8_t base, int32_t d)
     {
+        wrote(reg);
         ML_CHECK_MSG(!base_needs_sib(base),
                      "load_base: rsp/r12 need a SIB byte");
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)
@@ -1582,6 +1831,7 @@ struct Emitter {
     }
     void op_rr2(Op aop, uint8_t dst, uint8_t src)
     {
+        wrote(dst);
         /* ⛔ the lookup runs OUTSIDE the assert. Inside, ASSERTS=0
          * compiles the whole call away and opc/two are UNINITIALISED -
          * a release build emitting a garbage opcode. -Werror caught it;
@@ -1598,6 +1848,7 @@ struct Emitter {
     }
     void op_reg_slot(Op aop, uint8_t dst, int32_t disp)
     {
+        wrote(dst);
         uint8_t opc = 0, ext = 0; bool two = false;
         const bool have = op_rm_opcode(aop, opc, two, ext);
         ML_CHECK_MSG(have, "op_reg_slot: no RM encoding for this op");
@@ -1613,6 +1864,7 @@ struct Emitter {
      * the value fits int32. */
     void op_reg_imm(Op aop, uint8_t dst, int32_t imm)
     {
+        wrote(dst);
         uint8_t opc = 0, ext = 0; bool two = false;
         const bool have = op_rm_opcode(aop, opc, two, ext);
         ML_CHECK_MSG(have, "op_reg_imm: no encoding for this op");
@@ -1693,6 +1945,7 @@ struct Emitter {
      * partial-flags write is not newly introduced anywhere. */
     void incdec_reg(uint8_t reg, bool up)
     {
+        wrote(reg);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
         u8(0xFF);
         u8(static_cast<uint8_t>((up ? 0xC0 : 0xC8) | (reg & 7)));
@@ -1798,12 +2051,23 @@ struct Emitter {
                           reinterpret_cast<uintptr_t>(tag)));
             return;
         }
+        /* #96 (c): the helper BORROWS its own scratch - it alone knows
+         * this path (and only this path) writes the register, so every
+         * caller is covered at once and the on-arena form still emits
+         * neither push nor pop (found by the tracker's OFF-ARENA run:
+         * store_dst_bool passed a pinnable rcx here). */
+        const bool sp = reg_is_occupied(scratch);
+        if (sp)
+            push_reg(scratch);
         movabs(scratch, reinterpret_cast<uint64_t>(tag));
         store(scratch, disp);
+        if (sp)
+            pop_reg(scratch);
     }
     /* mov <dst>, <src>  (GP reg-reg, both 0-15) */
     void mov_rr(uint8_t dst, uint8_t src)
     {
+        wrote(dst);
         u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 0x04 : 0)
                                 | (dst >= 8 ? 0x01 : 0)));
         u8(0x89);
@@ -1814,6 +2078,12 @@ struct Emitter {
      * resumes with the correct slot values. */
     void flush_cache()
     {
+        assert_no_borrow("flush_cache with a BORROW open - it would "
+                         "store the borrowed-away temp as a slot value");
+#ifndef NDEBUG
+        trk_flushed = true;
+        trk_flushdirty = 0;
+#endif
         for (const CacheEnt &c : cache) {
             store_type_tag(c.type, jit_layout().t_int, 6);
             store(c.reg, c.payload);
@@ -1844,6 +2114,11 @@ struct Emitter {
      * call silently lost its pinned counters). */
     void reload_cache()
     {
+        PinMach pm(*this);
+#ifndef NDEBUG
+        trk_flushed = false;
+        trk_flushdirty = 0;
+#endif
         for (const CacheEnt &c : cache)
             load(c.reg, c.payload);
         for (const CacheEnt &c : fcache)
@@ -1869,6 +2144,7 @@ struct Emitter {
      * carries the register hides that register from the census. */
     void movabs(uint8_t reg, uint64_t imm)
     {
+        wrote(reg);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
         u8(static_cast<uint8_t>(0xB8 | (reg & 7)));
         u64(imm);
@@ -1947,10 +2223,18 @@ struct Emitter {
      */
     void scratch(uint8_t r) const
     {
-        ML_CHECK_MSG(!reg_holds_pin(r),
+        /* #96 (c): a DECLARATION is satisfied when the tracker's model
+         * says the register is safe - BORROWED (the caller pushed it),
+         * post-FLUSH (dead until reload), or bracket-spilled. Without
+         * this, a helper that declares its own clobber cannot be used
+         * inside a borrow window at all. */
+        ML_CHECK_MSG(!reg_holds_pin(r)
+                         || (trk_borrowed & (1u << r)) || trk_flushed
+                         || (trk_bracket > 0
+                             && !(gp_caps(r) & CAP_CALLEE_SAVED)),
                      "a raw-scratch emitter is about to clobber a "
                      "PINNED register - it must be excluded from the "
-                     "pin pool for this run (see XCACHE_ORDER)");
+                     "pin pool for this run, or borrowed first");
     }
     void scratch2(uint8_t a, uint8_t b) const { scratch(a); scratch(b); }
 
@@ -2103,10 +2387,16 @@ struct Emitter {
                          "frag_ret(empty) with a live register cache: this "
                          "return would resume the interpreter on stale "
                          "slots - flush_cache() first and say flushed");
+        assert_no_borrow("frag_ret with a BORROW open - the teardown "
+                         "pops would desynchronise against it");
         if (const int sb = spill_bytes())            /* add rsp, imm32 */
             { u8(0x48); u8(0x81); u8(0xC4); u32(static_cast<uint32_t>(sb)); }
         if (entry_pad())
             { u8(0x48); u8(0x83); u8(0xC4); u8(0x08); }       /* add rsp,8 */
+        /* the teardown pops restore the C CALLER's callee-saved
+         * registers; the pins those registers held are dead here (the
+         * caller flushed, or asserted empty above) - machinery */
+        PinMach pm(*this);
         for (size_t i = saved.size(); i-- > 0; )
             pop_reg(saved[i]);
         pop_reg(REG_SLOTS_BASE);
@@ -2284,6 +2574,9 @@ struct Emitter {
      * allocator adds more by changing a register's occupant mid-run. */
     void exit_pc(uint32_t pc)
     {
+        assert_no_borrow("exit with a BORROW open - the epilogue's "
+                         "flush would store the borrowed-away temp "
+                         "(wrap the arm in BorrowSuspend)");
         u8(0xB8); u32(pc);                                /* mov eax, pc */
         u8(0xE9);
         exits.push_back({ pos(), intern_exit_state() });
@@ -2390,8 +2683,10 @@ struct Emitter {
      * else can tell the two apart */
     void bump_divmagic()
     {
-        movabs(1 /*RCX*/, reinterpret_cast<uint64_t>(&g_jit_divmagic));
-        u8(0x48); u8(0xFF); u8(0x01);
+        /* the SIXTEENTH counter - it hid from the bump sweep by being
+         * its own method rather than a movabs+inc pair at a call site.
+         * Through bump_counter like the rest, which preserves rax. */
+        bump_counter(&g_jit_divmagic);
     }
 #else
     void bump_divmagic() { }
@@ -2399,6 +2694,7 @@ struct Emitter {
     /* movq rax, xmm<src> - the div0 bit test's read (C4b: any source). */
     void movq_rax_x(uint8_t src)
     {
+        wrote(RAX);
         u8(0x66); u8(0x48); u8(0x0F); u8(0x7E);
         u8(static_cast<uint8_t>(0xC0 | (src << 3)));
     }
@@ -2411,8 +2707,10 @@ struct Emitter {
     { u8(0xF2); u8(0x0F); u8(0x51);
       u8(static_cast<uint8_t>(0xC0 | (d << 3) | s)); }
     /* push/pop a GP reg (0x50+r / 0x58+r; REX.B for r8..r15) */
-    void push_reg(uint8_t r) { if (r >= 8) u8(0x41); u8(0x50 | (r & 7)); }
-    void pop_reg(uint8_t r)  { if (r >= 8) u8(0x41); u8(0x58 | (r & 7)); }
+    void push_reg(uint8_t r)
+    { trk_push(r); if (r >= 8) u8(0x41); u8(0x50 | (r & 7)); }
+    void pop_reg(uint8_t r)
+    { trk_pop(r); if (r >= 8) u8(0x41); u8(0x58 | (r & 7)); }
     void call_rax() { call_reg(0 /* rax: the Reg enum is
                                 * declared below the class */); }
     /* lea reg, [rbx + disp32]  (an EvalValue-ptr / LValue-ptr helper arg;
@@ -2420,6 +2718,7 @@ struct Emitter {
      * declared after this struct, so lea_rdi passes REG_ARG0). */
     void lea(uint8_t reg, int32_t d)
     { u8(0x48); u8(0x8D); u8(static_cast<uint8_t>(MODRM_SLOT | (reg << 3)));
+        wrote(reg);
       u32(uint32_t(d)); }
     /* lea rdi, [rbx + disp32]  (rdi = &frame->slots[slot], a helper arg).
      * With the base in rbx this no longer destroys anything - which is
@@ -2481,6 +2780,7 @@ struct Emitter {
      */
     void sub_rr(uint8_t dst, uint8_t src)
     {
+        wrote(dst);
         u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 0x04 : 0)
                                 | (dst >= 8 ? 0x01 : 0)));
         u8(0x29);
@@ -2488,6 +2788,7 @@ struct Emitter {
     }
     void sar_rr_imm8(uint8_t reg, uint8_t k)
     {
+        wrote(reg);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
         u8(0xC1);
         u8(static_cast<uint8_t>(0xF8 | (reg & 7)));
@@ -2498,6 +2799,7 @@ struct Emitter {
      * 64-bit register, which is what the callers rely on). */
     void load32_base(uint8_t reg, uint8_t base, int32_t d)
     {
+        wrote(reg);
         ML_CHECK_MSG(!base_needs_sib(base),
                      "load32_base: rsp/r12 need a SIB byte");
         if (reg >= 8 || base >= 8)
@@ -2526,6 +2828,7 @@ struct Emitter {
      * jumps. */
     void sub_reg32_imm8(uint8_t reg, int8_t imm)
     {
+        wrote(reg);
         if (reg >= 8)
             u8(0x41);
         u8(0x83);
@@ -2542,6 +2845,7 @@ struct Emitter {
     }
     void load32_slot(uint8_t reg, int32_t d)
     {
+        wrote(reg);
         if (reg >= 8)
             u8(0x44);
         u8(0x8B);
@@ -2550,6 +2854,7 @@ struct Emitter {
     }
     void add_rr(uint8_t dst, uint8_t src)
     {
+        wrote(dst);
         u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 0x04 : 0)
                                 | (dst >= 8 ? 0x01 : 0)));
         u8(0x01);
@@ -2559,6 +2864,7 @@ struct Emitter {
      * imul_r9_imm8 (#96). */
     void imul_rr_imm8(uint8_t dst, uint8_t src, uint8_t k)
     {
+        wrote(dst);
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
                                 | (src >= 8 ? 0x01 : 0)));
         u8(0x6B);
@@ -2582,6 +2888,7 @@ struct Emitter {
      * the same length the hand-written form used) */
     void lea_base(uint8_t dst, uint8_t base, int32_t d)
     {
+        wrote(dst);
         ML_CHECK_MSG(!base_needs_sib(base),
                      "lea_base: rsp/r12 need a SIB byte");
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
@@ -2592,6 +2899,7 @@ struct Emitter {
     /* lea dst, [base + index*8]  (the element address) */
     void lea_elem_q(uint8_t dst, uint8_t base, uint8_t index)
     {
+        wrote(dst);
         ML_CHECK_MSG(!base_no_base_form(base),
                      "lea_elem_q: rbp/r13 base needs mod=01 + disp8");
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
@@ -2638,6 +2946,7 @@ struct Emitter {
      * unconditional disp32 form) */
     void load_base0(uint8_t dst, uint8_t base)
     {
+        wrote(dst);
         ML_CHECK_MSG(!base_needs_sib(base) && !base_no_base_form(base),
                      "load_base0: rsp/r12 need SIB, rbp/r13 need a disp");
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
@@ -2687,6 +2996,7 @@ struct Emitter {
     /* xor r32, r32 - the canonical zeroing idiom */
     void zero_reg32(uint8_t r)
     {
+        wrote(r);
         if (r >= 8)
             u8(0x45);
         u8(0x31);
@@ -2695,6 +3005,7 @@ struct Emitter {
     /* movzx r32, r8 - widen a byte result (setcc, a bool element) */
     void movzx_r32_r8(uint8_t dst, uint8_t src)
     {
+        wrote(dst);
         if (dst >= 8 || src >= 8)
             u8(static_cast<uint8_t>(0x40 | (dst >= 8 ? 0x04 : 0)
                                     | (src >= 8 ? 0x01 : 0)));
@@ -2725,6 +3036,7 @@ struct Emitter {
      */
     void shl_rr_imm8(uint8_t reg, uint8_t k)          /* shl r64, imm8 */
     {
+        wrote(reg);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
         u8(0xC1);
         u8(static_cast<uint8_t>(0xE0 | (reg & 7)));
@@ -2732,6 +3044,7 @@ struct Emitter {
     }
     void shr_rr_imm8(uint8_t reg, uint8_t k)          /* shr r64, imm8 */
     {
+        wrote(reg);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
         u8(0xC1);
         u8(static_cast<uint8_t>(0xE8 | (reg & 7)));
@@ -2739,12 +3052,14 @@ struct Emitter {
     }
     void shl_reg_1(uint8_t reg)         /* shl r64, 1 (the D1 /4 form) */
     {
+        wrote(reg);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
         u8(0xD1);
         u8(static_cast<uint8_t>(0xE0 | (reg & 7)));
     }
     void neg_reg(uint8_t r)                                /* neg r64 */
     {
+        wrote(r);
         u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 0x01 : 0)));
         u8(0xF7);
         u8(static_cast<uint8_t>(0xD8 | (r & 7)));
@@ -2754,12 +3069,14 @@ struct Emitter {
      * is the only allocatable operand. */
     void imul_reg(uint8_t r)
     {
+        wrote(RAX); wrote(RDX);      /* rdx:rax = rax * r, ISA-fixed */
         u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 0x01 : 0)));
         u8(0xF7);
         u8(static_cast<uint8_t>(0xE8 | (r & 7)));
     }
     void imul_rr_imm32(uint8_t dst, uint8_t src, int32_t k)
     {
+        wrote(dst);
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
                                 | (src >= 8 ? 0x01 : 0)));
         u8(0x69);
@@ -2770,6 +3087,7 @@ struct Emitter {
      * value that fits, which every caller here has. */
     void mov_reg_imm32(uint8_t reg, uint32_t imm)
     {
+        wrote(reg);
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x01 : 0)));
         u8(0xC7);
         u8(static_cast<uint8_t>(0xC0 | (reg & 7)));
@@ -2795,6 +3113,7 @@ struct Emitter {
      * refuses those rather than emit the WRONG byte register. */
     void setcc_r8(uint8_t cc, uint8_t r)
     {
+        wrote(r);
         ML_CHECK_MSG(r < 4, "setcc_r8: only al/cl/dl/bl are REX-free");
         u8(0x0F);
         u8(static_cast<uint8_t>(0x90 | cc));
@@ -2850,6 +3169,7 @@ struct Emitter {
     }
     void add_reg32_imm32(uint8_t reg, uint32_t imm)
     {
+        wrote(reg);
         if (reg >= 8)
             u8(0x41);
         u8(0x81);
@@ -2919,6 +3239,7 @@ struct Emitter {
     /* movzx r32, byte [base + disp] */
     void movzx_r32_byte_base(uint8_t dst, uint8_t base, int32_t d)
     {
+        wrote(dst);
         ML_CHECK_MSG(!base_needs_sib(base),
                      "movzx_r32_byte_base: rsp/r12 need a SIB byte");
         if (dst >= 8 || base >= 8)
@@ -3012,10 +3333,18 @@ struct Emitter {
          * is pinnable, an over-broad assert ABORTS a legal fragment.
          * Same rule as "a helper's register ABI is the emitter's job":
          * state the clobber at the instruction that makes it. */
-        scratch(sc);
+        /* #96 (c): and BORROWED where it happens too - `pop` preserves
+         * the flags, so the caller's jcc still reads this compare. */
+        const bool sp = reg_is_occupied(sc);
+        if (sp)
+            push_reg(sc);
+        else
+            scratch(sc);
         movabs(sc, static_cast<uint64_t>(
                        reinterpret_cast<uintptr_t>(tag)));
         cmp_rr(reg, sc);
+        if (sp)
+            pop_reg(sc);
     }
     /* ---- N4 array element access ---- */
     /* cmp byte [rbx+disp], imm8  (the slice flag) */
@@ -3217,11 +3546,13 @@ struct Emitter {
     /* mov <dst64>, [base + index*8]   (a flat int element) */
     void load_elem_q(uint8_t dst, uint8_t base, uint8_t index)
     { u8(rex_sib(dst, base, index, true)); u8(0x8B);
+        wrote(dst);
       modrm_sib(dst, base, index, 8); }
     /* movzx <dst32>, byte [base + index]  (a flat bool element - the
      * 32-bit destination zeroes the high half, so it is a clean 0/1) */
     void load_elem_zx8(uint8_t dst, uint8_t base, uint8_t index)
     { u8(rex_sib(dst, base, index, false)); u8(0x0F); u8(0xB6);
+        wrote(dst);
       modrm_sib(dst, base, index, 1); }
     /*
      * movsd <xmm>, [base + index*8] / movsd [base + index*8], <xmm>
@@ -3285,12 +3616,13 @@ struct Emitter {
      * shipping wrong answer. Deleting them means no caller can reach
      * the fixed pair again; the arithmetic is `op_rr2(aop, dst, src)`,
      * which the census CAN see because both operands are arguments. */
-    void cqo()          { u8(0x48); u8(0x99); }
+    void cqo()          { wrote(RDX); u8(0x48); u8(0x99); }
     /* idiv r64 - rdx:rax / r. Quotient to RAX and remainder to RDX are
      * ISA-fixed, so the DIVISOR is the only allocatable operand here and
      * therefore the only one this takes. */
     void idiv_reg(uint8_t r)
-    { u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 1 : 0))); u8(0xF7);
+    {
+        wrote(RAX); wrote(RDX); u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 1 : 0))); u8(0xF7);
       u8(static_cast<uint8_t>(0xF8 | (r & 7))); }
     void cmp_rdi_imm8(int8_t v)        /* cmp rdi, imm8 (sign-extended) */
     { u8(0x48); u8(0x83); u8(0xFF); u8(static_cast<uint8_t>(v)); }
@@ -3433,6 +3765,7 @@ enum XReg : uint8_t { X0 = 0, X1 = 1 };   /* GP r8 = t_float (float
  */
 static void op_rr(Emitter &e, Op aop, uint8_t dst, uint8_t src)
 {
+    e.wrote(dst);
     /* reg = src, rm = dst  (the `r/m64, r64` direction) */
     const uint8_t rex_rm = static_cast<uint8_t>(
         0x48 | (src >= 8 ? 0x04 : 0) | (dst >= 8 ? 0x01 : 0));
@@ -4295,10 +4628,14 @@ static SlotAddr slot_addr(int slot)
 static void read_slot(Emitter &e, uint8_t dst, int slot)
 {
     const int cr = e.creg(slot);
-    if (cr >= 0)
+    if (cr >= 0) {
+        /* the tracker: reading the slot OUT of a borrowed-and-
+         * overwritten register would read the borrower's temp */
+        e.trk_read_pin(static_cast<uint8_t>(cr));
         e.mov_rr(dst, static_cast<uint8_t>(cr));
-    else
-        e.load(dst, slot_addr(slot).payload);
+        return;
+    }
+    e.load(dst, slot_addr(slot).payload);
 }
 
 static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
@@ -4554,6 +4891,11 @@ static ML_ALWAYS_INLINE bool jit_reg_is_callee_saved(uint8_t r)
 
 static void emit_call_prologue(Emitter &e)
 {
+    /* spilling stores each pin REGISTER to its slot; done while one is
+     * borrowed it stores the borrowed-away temp AS the slot's value -
+     * the exact mechanism that sank the arm() guard */
+    e.assert_no_borrow("call prologue reached with a BORROW open - the "
+                       "spill would store the temp as the slot's value");
     e.n_prologues++;              /* the rel8-span guard - see j8/patch8 */
     /* C2a: the FLOAT pins are in xmm registers, which are ALL
      * caller-saved - spill each to its slot's PAYLOAD before the call
@@ -4583,6 +4925,9 @@ static void emit_call_prologue(Emitter &e)
     for (const Emitter::CacheEnt &c : e.cache)
         if (!jit_reg_is_callee_saved(c.reg))
             e.store(c.reg, c.payload);
+    /* from here to the epilogue's reload, every caller-saved pin is
+     * safe in its slot - its register is legitimately free scratch */
+    e.trk_bracket++;
     /* Otherwise NOTHING. What this used to do for the CALLEE-saved half is
      * gone: the slots base is in rbx and r12-r15 are preserved by the
      * callee, and rsp is already call-ready (frag_entry made the body
@@ -4755,12 +5100,22 @@ static void emit_call_epilogue(Emitter &e)
      * (spilled to their slot payloads by emit_call_prologue). */
     for (const Emitter::CacheEnt &c : e.fcache)
         e.fload(c.reg, c.payload);
-    /* #96: and the caller-saved GP pins (r10/r11). RAX carries the
-     * helper's status, which every call site tests right after this
-     * epilogue - a load into r10/r11 cannot disturb it. */
-    for (const Emitter::CacheEnt &c : e.cache)
-        if (!jit_reg_is_callee_saved(c.reg))
-            e.load(c.reg, c.payload);
+    {
+        /* #96: and the caller-saved GP pins. RAX carries the helper's
+         * status, which every call site tests right after this
+         * epilogue - a load into a pin register cannot disturb it. */
+        Emitter::PinMach pm(e);
+        for (const Emitter::CacheEnt &c : e.cache)
+            if (!jit_reg_is_callee_saved(c.reg))
+                e.load(c.reg, c.payload);
+    }
+    /* ⛔ THE BRACKET CLOSES HERE, NOT AT THE END OF THIS FUNCTION. The
+     * pins are live in their registers again from this line on - so
+     * the tag and float-literal re-materialisations BELOW, and the
+     * hoist re-derive, are ordinary code that must not touch a pinned
+     * register. The tracker enforcing exactly that is what found
+     * flit_load clobbering a pinned rcx (see the FLit note below). */
+    e.trk_bracket--;
     /*
      * The two type singletons - compile-time constants held in
      * CALLER-saved rsi/r8, so re-materialising is cheaper than a
@@ -4956,10 +5311,27 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
     const uint32_t off_if =
         static_cast<uint32_t>(jit_off_exc_inline_frame());
 
+    /*
+     * ⛔ THE STAMP'S SCRATCH IS BORROWED, AND THIS WAS THE ROOT CAUSE
+     * OF THE rcx ADMISSION FAILURE (found by the register-state
+     * tracker, 2026-08-20). The caret/chain stamps below stage packed
+     * Locs through rcx on the CONVEYANCE arm - and that arm ends in an
+     * exit whose flush stores every pin register. With rcx pinned, a
+     * thrown-and-caught exception flushed a PACKED SOURCE LOCATION as
+     * the slot's value: 16_elem2_fused's "sum" of 88785564028992 is
+     * line:col pairs accumulated into a loop variable. Three hand
+     * audits missed this site because it declares nothing and is only
+     * emitted for ops that can throw.
+     *
+     * RAX needs no borrow - it is never allocatable (the accumulator).
+     * All interior branches join at `join` below, where the pop sits,
+     * so every path through the stamp restores the pin.
+     */
+    RefScratch rs(e, RCX);
     e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_exc()));
     e.load_base0(RAX, RAX);      /* mov rax, [rax] (the object) */
     e.u8(0x48); e.test32_rr(RAX, RAX);      /* test rax, rax */
-    const size_t j_null = e.j8(0x74);        /* jz end: bail/eptr - no exc */
+    const size_t j_null = e.j8(0x74);        /* jz join: bail/eptr - no exc */
 
     size_t j_has = 0;
     if (le) {
@@ -5010,7 +5382,9 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
         e.patch8(j_set, e.pos());
     }
 
-    e.patch8(j_null, e.pos());
+    const size_t join = e.pos();     /* every path lands on the pop */
+    rs.release();
+    e.patch8(j_null, join);
 }
 
 
@@ -7132,6 +7506,11 @@ static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
 {
     const int cr = e.creg(slot);
     if (cr >= 0) {
+        /* the ONE legitimate mid-op pin write: updating the pinned
+         * slot's value. Declared as machinery so the tracker can tell
+         * it from a clobber - and so it ABORTS if the pin is borrowed
+         * at this moment (the pop would destroy this update). */
+        Emitter::PinMach pm(e);
         e.mov_rr(static_cast<uint8_t>(cr), src);
         return;
     }
@@ -8299,7 +8678,31 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * so the tail is the least-exercised slot, and MYLANG_JIT_XROT now
  * sweeps SEVEN rotations.
  */
-static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2 };
+/*
+ * ⛔ RCX (1) JOINED 2026-08-20, #96 (c), pin 12 - THE FIRST ADMISSION
+ * DRIVEN BY AN INSTRUMENT RATHER THAN A HAND AUDIT. Three hand audits
+ * cleared rcx and all three were wrong; the register-state tracker
+ * (Emitter::wrote and its family, declared beside RegAlloc) then
+ * enumerated every real violator in one -rt run each:
+ *   - emit_exc_stamp staged packed Locs through rcx on the conveyance
+ *     arm (the caret machinery!) - a thrown-and-caught exception
+ *     flushed a SOURCE LOCATION as a pinned slot's value;
+ *   - bump_divmagic wrote movabs(1, ...) with the RCX in a COMMENT -
+ *     the register as a number, invisible to every grep;
+ *   - ForStepElemInt built its ElemRead by hand - the FIFTH site,
+ *     missed when the other four moved to elem_read_plan;
+ *   - the PushHandler/PopHandler/SetPend/EndFinally family and the
+ *     big emitter's tmp/cpy windows used rcx undeclared;
+ *   - the element divmod gate read the dividend via a hand-encoded
+ *     `mov rdx,[rcx+r9*8]` - hardcoded roles, so a real INT_MIN/-1
+ *     dividend was not declined and reached the raw idiv (a SIGFPE
+ *     where the language must throw).
+ * Every one now BORROWS (push/pop, closed before any flush/call/exit,
+ * with BorrowSuspend on raise arms) or goes through a plan.
+ * PLACED LAST, as every admission has been; MYLANG_JIT_XROT sweeps
+ * EIGHT rotations.
+ */
+static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2, 1 };
 static const size_t MAX_XCACHED =
     sizeof(XCACHE_ORDER) / sizeof(XCACHE_ORDER[0]);
 
@@ -10475,7 +10878,12 @@ static void raise_convey_unless(Emitter &e, const Chunk &ck,
      * ~100 bytes - far past a short jump's +127 (a patch8 assert caught the
      * first build). */
     const size_t sk = e.j32(pass_cond);
-    emit_raise_convey(e, ck, kind, pc, old_pc);
+    {
+        /* the raise arm leaves the op: restore any open borrow on THIS
+         * path, then let the convey sequence see a clean state */
+        Emitter::BorrowSuspend bs(e);
+        emit_raise_convey(e, ck, kind, pc, old_pc);
+    }
     e.patch32_here(sk);
 }
 
@@ -10918,12 +11326,25 @@ static bool elem_reg_usable(const Emitter &e, uint8_t r)
 static size_t op_elem_scratch_roles(OpCode op)
 {
     switch (op) {
-    /* the STORE tiers: `idx` AND `val` (see ElemScratch) */
+    /*
+     * ⛔ RE-RATED 2026-08-20, and the stale comment this replaces is
+     * the audit-table trap hit LIVE: it said "the index alone -
+     * rax/rcx/rdx are forced", which stopped being true the day
+     * elem_read_plan / elem_scratch_plan began ALLOCATING `data` (and
+     * the read tier's `count`). With rcx and rdx both pool members, a
+     * fragment at full pin pressure sends every preferred register to
+     * its CAND fallback - so a rating that counts only the OLD
+     * allocatable roles lets the pool eat the candidates the plan
+     * needs, and the tier declines silently (watched: the reservation
+     * test failed exactly this way when rcx landed as pin 12).
+     */
+    /* the STORE tiers: `data`, `idx` AND `val` (`count` stays rdx -
+     * the idiv arm hardware-pins it; see ElemScratch) */
     case OpCode::StoreElemInt:
     case OpCode::StoreElemFloat:      /* emit_store_elem -> #92 inline */
     case OpCode::StoreElem2V:         /* #95 nested inline            */
-        return 2;
-    /* the READ tiers: the index alone (rax/rcx/rdx are forced) */
+        return 3;
+    /* the READ tiers: `data`, `count` AND `idx` (obj = rax fixed) */
     case OpCode::LoadElemInt:
     case OpCode::LoadElemFloat:
     case OpCode::LoadElemBool:
@@ -10931,6 +11352,7 @@ static size_t op_elem_scratch_roles(OpCode op)
     case OpCode::LoadElem2Float:
     case OpCode::ForStepElemInt:
     case OpCode::JumpUnlessElemInt:
+        return 3;
     /* the CAPTURE / global chain: one base register, via ctx_chain_reg.
      * Not an element op, but it draws from the same candidate set and
      * the pool must leave it one for exactly the same reason - see the
@@ -10986,7 +11408,21 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
     const uint32_t pool = xcache_mask();
     uint32_t spendable = 0;
     size_t survivors = 0;
-    for (const uint8_t c : ELEM_CAND) {
+    /*
+     * ⛔ THE SET MUST MATCH THE PLAN'S, which is {preferred} u CAND -
+     * elem_read_plan / elem_scratch_plan try the PREFERRED register
+     * (rcx for `data`) before falling to ELEM_CAND. Reserving over
+     * CAND alone undercounts exactly where it matters: OFF-ARENA the
+     * tag registers leave two usable CAND members, and if the pins eat
+     * rcx the plan needs three from two - an inevitable silent
+     * decline (watched: the reservation test failed this way the day
+     * rcx joined the pool). Withholding rcx here instead keeps
+     * `data`'s own preferred register free, and CAND only has to
+     * cover the rest.
+     */
+    static const uint8_t RESERVE_SET[] =
+        { RDI, R9, R10, R11, RSI, R8, RCX };   /* ELEM_CAND + preferred */
+    for (const uint8_t c : RESERVE_SET) {
         if (!elem_reg_usable_nopin(c, ftl, claimed))
             continue;
         if ((pool & (1u << c)) && !(clob & (1u << c)))
@@ -11133,9 +11569,9 @@ static ElemRead elem_read_plan(const Emitter &e, uint8_t idx_reg)
 
 static ElemScratch elem_scratch_plan(const Emitter &e, OpCode op)
 {
-    ML_CHECK_MSG(op_elem_scratch_roles(op) == 2,
+    ML_CHECK_MSG(op_elem_scratch_roles(op) == 3,
                  "an emitter took an ElemScratch (two roles) for an "
-                 "opcode op_elem_scratch_roles does not rate at 2 - the "
+                 "opcode op_elem_scratch_roles does not rate at 3 - the "
                  "pin pool's reservation cannot see this run, so the "
                  "tier will decline silently when the pool is full");
     ElemScratch sc;
@@ -11479,10 +11915,23 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             load_index_idx(e, sc.idx, in);
             e.cmp_rr(sc.idx, sc.count);
             decline_if(0x73);                    /* OOB/neg -> helper */
-            e.u8(0x4A); e.u8(0x8B); e.u8(0x14); e.u8(0xC9);
-                                                 /* mov rdx,[rcx+r9*8] */
+            /*
+             * ⛔ THE LAST HAND-ENCODED ROLE USE, and it was a SHIPPED
+             * WRONG ANSWER waiting on the allocator (found by the
+             * register-state tracker + a SIGFPE, 2026-08-20). This
+             * read was `mov rdx,[rcx+r9*8]` - base and index HARDCODED
+             * - while the nav above loads the allocated sc.data and
+             * sc.idx. The moment the plan picked data != rcx, the
+             * INT_MIN test compared garbage: a real INT_MIN / -1
+             * dividend was NOT declined and reached the raw idiv - a
+             * hardware #DE where the language must throw. Every
+             * register below is a ROLE; sc.count and sc.idx are
+             * THROWAWAY here (the comment above: the arm re-derives
+             * the whole nav after the gate).
+             */
+            e.load_elem_q(sc.count, sc.data, sc.idx);  /* the dividend */
             e.movabs(sc.idx, 0x8000000000000000ull);
-            e.cmp_rr(RDX, R9);
+            e.cmp_rr(sc.count, sc.idx);
             decline_if(0x74);                    /* INT_MIN -> helper */
             e.patch32_here(j_ok);
         }
@@ -12246,30 +12695,38 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
      * they are separate lifetimes: `tmp` is live across an arithmetic
      * op, `cpy` only between one load and its store.
      */
-    /*
-     * ⛔ THESE STAY `= RCX`, AND THE FAILED ATTEMPT IS THE REASON
-     * (2026-08-20). They are the LAST rcx blocker - with rcx pinned,
-     * `movabs rcx, <imm>; imul rax, rcx` here destroys a hot local
-     * (plans/jit-registers.md (af)) - and the obvious fix, asking
-     * alloc_scratch for a free register, was tried and made things
-     * WORSE: corpus_diff with rcx admitted went 23/24 -> 22/24.
-     *
-     * The reason is the one already written at RefScratch: handing back
-     * a DIFFERENT register clobbers whatever the caller left in it, and
-     * `ra` cannot warn, because the untracked scratch registers are not
-     * in `busy`. Excluding rax and rdx is not enough - rsi, rdi, r8 and
-     * r9 carry element-tier roles and type tags at various points.
-     *
-     * So this needs a BORROW (push/pop), like its three siblings. What
-     * makes it harder than they were: the lifetime spans a whole op
-     * emitter with many `return`s and several branches, so the pop must
-     * happen on every path - the same structure that made
-     * emit_store_src_gate refuse a borrow until its two jumps became
-     * one. An RAII guard over the switch, or a single exit point, is
-     * the shape to reach for; do NOT re-try reallocation.
+        /*
+     * ⛔ #96 (c): THE STAGING/COPY REGISTER IS BORROWED, tied to the
+     * EMITTED control flow - the resolution of three failed shapes,
+     * each of whose reason is now structural knowledge:
+     *   - reallocation clobbered callers' untracked live registers;
+     *   - a scope-exit pop was dead code after a trailing branch;
+     *   - a top-of-function push leaked on `return false` (decline).
+     * `hold()` pushes lazily at the first real use; `drop()` pops at
+     * the last use of each window, BEFORE any write_slot / helper
+     * call / exit; a raise arm inside a window restores via
+     * BorrowSuspend (see raise_convey_unless). The register-state
+     * tracker verifies every placement - this conversion was DRIVEN by
+     * its aborts, not by reading.
      */
     const uint8_t tmp = RCX;
     const uint8_t cpy = RCX;
+    bool tmp_pushed = false;
+    const auto hold = [&]() {
+        if (e.trk_borrowed & (1u << tmp))
+            return;                       /* already held this window */
+        tmp_pushed = e.reg_is_occupied(tmp);
+        if (tmp_pushed)
+            e.push_reg(tmp);
+        else
+            e.scratch(tmp);
+    };
+    const auto drop = [&]() {
+        if (tmp_pushed) {
+            e.pop_reg(tmp);
+            tmp_pushed = false;
+        }
+    };
     switch (in.op) {
 
     case OpCode::LoadImmInt:
@@ -12456,6 +12913,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * fragment once the register is pinnable. */
             e.bump_counter(&g_jit_two_addr_reg);
 #endif
+            /* the tracker: the SECOND legitimate pin-update class
+             * beside write_slot's - two-address arithmetic computes
+             * the slot's new value directly IN its pin */
+            Emitter::PinMach pm(e);
             if (fb) {
                 e.op_rr2(aop, d, RAX);
             } else if (in.b_is_lit()) {
@@ -12510,6 +12971,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         if (fa || fb)
             emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+        hold();
         if (fa && fb) {
             e.mov_rr(tmp, RAX);            /* t OP t */
         } else if (fb && aop == Op::minus) {
@@ -12524,6 +12986,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         }
         op_rr(e, aop, RAX, tmp);
+        drop();
         /* lever A, the PRODUCER side: elide a dead temp's write; a kept
          * (ref-listed) write reloads RAX in store_dst's COLD arm only. */
         const bool fw = g_fwd.prod == in.target;
@@ -12561,6 +13024,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             break;
         }
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        hold();
         load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         switch (in.aop) {
         case Op::div: case Op::mod:
@@ -12599,6 +13063,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                  * uses it as its scratch. */
                 DivMagic mg;
                 if (div_magic(in.b_lit(), mg)) {
+                    /* the literal in tmp is DEAD here - div_magic
+                     * derives everything from the compile-time value,
+                     * and its own `keep` borrows rcx afresh */
+                    drop();
                     emit_div_magic(e, mg, in.b_lit(),
                                    in.aop == Op::mod);
                     e.bump_divmagic();
@@ -12623,6 +13091,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             }
             e.cqo();              /* cqo */
             e.idiv_reg(RCX);  /* idiv rcx */
+            drop();           /* the divisor is consumed */
             write_slot(e, ck, in.aop == Op::div ? RAX : RDX, in.target, pc);
             return true;
         case Op::shl: case Op::shr: case Op::ushr:
@@ -12632,6 +13101,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             op_rr(e, in.aop, RAX, tmp);
             break;
         }
+        drop();
         write_slot(e, ck, RAX, in.target, pc);
         return true;
 
@@ -12709,9 +13179,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             write_slot(e, ck, RAX, in.target, pc);
             return true;
         }
+        hold();
         e.movabs(tmp, static_cast<uint64_t>(in.b_lit()));
         e.cqo();                          /* cqo */
         e.idiv_reg(RCX);              /* idiv rcx */
+        drop();                       /* the divisor is consumed */
         write_slot(e, ck, RDX, in.target, pc);            /* remainder */
         return true;
     }
@@ -12722,8 +13194,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         else
             read_slot(e, RAX, in.a_slot());
+        hold();
         load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         op_rr(e, Op::plus, RAX, tmp);
+        drop();          /* window 1 ends: div_magic borrows rcx itself */
         {
             const int_type dv = static_cast<int_type>(in.target2);
             DivMagic mg;
@@ -12733,10 +13207,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 write_slot(e, ck, RAX, in.target, pc);
                 return true;
             }
+            hold();                   /* window 2: the idiv divisor */
             e.movabs(tmp, static_cast<uint64_t>(dv));
         }
         e.cqo();                          /* cqo */
         e.idiv_reg(RCX);              /* idiv rcx */
+        drop();
         write_slot(e, ck, RDX, in.target, pc);
         return true;
     }
@@ -13269,9 +13745,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                static_cast<int32_t>(in.target)))
             jhelp.push_back(emit_ref_check_jae(e, dst.type));
         e.load(RAX, src.type);
+        hold();
         e.load(cpy, src.payload);      e.store(cpy, dst.payload);
         e.load(cpy, src.payload + 8);  e.store(cpy, dst.payload + 8);
         e.load(cpy, src.payload + 16); e.store(cpy, dst.payload + 16);
+        drop();
         e.store(RAX, dst.type);
         const size_t j_done = e.j32(0xEB);
         for (const size_t s : jhelp)
@@ -13311,9 +13789,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             uint64_t q[3];
             std::memcpy(q, reinterpret_cast<const char *>(&bv)
                                + EvalValue::jit_payload_off(), sizeof q);
+            hold();
             e.movabs(cpy, q[0]); e.store(cpy, dst.payload);
             e.movabs(cpy, q[1]); e.store(cpy, dst.payload + 8);
             e.movabs(cpy, q[2]); e.store(cpy, dst.payload + 16);
+            drop();
             e.movabs(RAX, reinterpret_cast<uint64_t>(bv.get_type()));
             e.store(RAX, dst.type);
             if (!reflisted)
@@ -13366,12 +13846,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                static_cast<int32_t>(in.target)))
             jhelp.push_back(emit_ref_check_jae(e, dst.type));
         e.load_base(RAX, cb, coff + ty0);
+        hold();
         e.load_base(cpy, cb, coff + pv0);
         e.store(cpy, dst.payload);
         e.load_base(cpy, cb, coff + pv0 + 8);
         e.store(cpy, dst.payload + 8);
         e.load_base(cpy, cb, coff + pv0 + 16);
         e.store(cpy, dst.payload + 16);
+        drop();
         e.store(RAX, dst.type);
         const size_t j_done = e.j32(0xEB);
         for (const size_t sj : jhelp)
@@ -13456,9 +13938,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             uint64_t q[3];
             std::memcpy(q, reinterpret_cast<const char *>(&v)
                                + EvalValue::jit_payload_off(), sizeof q);
+            hold();
             e.movabs(cpy, q[0]); e.store(cpy, dst.payload);
             e.movabs(cpy, q[1]); e.store(cpy, dst.payload + 8);
             e.movabs(cpy, q[2]); e.store(cpy, dst.payload + 16);
+            drop();
             e.movabs(RAX, reinterpret_cast<uint64_t>(v.get_type()));
             e.store(RAX, dst.type);
             if (!reflisted)
@@ -13677,8 +14161,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
               reinterpret_cast<const void *>(jit_struct_field_add_int) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
+        hold();       /* the epilogue reloaded the pins - borrow again */
         read_slot(e, tmp, in.b_dual_hi());        /* other */
         op_rr(e, Op::plus, RAX, tmp);                        /* rax += tmp */
+        drop();
         write_slot(e, ck, RAX, in.target, pc);
         return true;
     }
@@ -13873,8 +14359,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * table drives it), `movzx` to a clean 0/1, then the bool two-store.
          * Never faults -> op_fully_native. */
         load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        hold();
         load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
         e.cmp_rr(RAX, tmp);
+        drop();                    /* flags survive the pop */
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>(cc_for(in.aop).near_op + 0x10));
         e.u8(0xC0);                               /* setcc al */
@@ -14095,17 +14583,22 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.bump_op(OpCode::PushHandler);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] (act) */
+        hold();
         /* finish */
         e.load_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
         /* end cap */
         e.cmp_reg_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 16));
+        const bool wp = tmp_pushed;
         const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
         e.store_dword_base_imm32(RCX, 0, region);   /* mov dword [rcx], rg */
         e.op_reg_imm(Op::plus, RCX, 4);
         /* mov [rax+h+8], rcx */
         e.store_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        drop();
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_grow);
+        if (wp)              /* the grow path left mid-window: unwind */
+            e.pop_bytes(RCX);
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(
                           static_cast<int_type>(region)));
@@ -14127,11 +14620,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.bump_op(OpCode::PopHandler);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
+        hold();
         /* mov rcx, [rax+h+8] */
         e.load_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
         e.op_reg_imm(Op::minus, RCX, 4);
         /* mov [rax+h+8], rcx */
         e.store_base(RCX, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        drop();
         return true;
     }
 
@@ -14145,9 +14640,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         /* = &back_rec */
+        hold();
         e.load_base(RCX, RAX, static_cast<int32_t>(L.act_top_rec));
         /* mov edx, [rcx+pbase] */
         e.load32_base(RDX, RCX, static_cast<int32_t>(L.rec_pend_base));
+        drop();                            /* the cursor is consumed */
         if (in.a_lit()) {
             e.add_reg32_imm32(RDX, static_cast<uint32_t>(in.a_lit()));
         }
@@ -14176,9 +14673,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         /* = &back_rec */
+        hold();
         e.load_base(RCX, RAX, static_cast<int32_t>(L.act_top_rec));
         /* mov edx, [rcx+pbase] */
         e.load32_base(RDX, RCX, static_cast<int32_t>(L.rec_pend_base));
+        drop();                            /* the cursor is consumed */
         if (in.a_lit()) {
             e.add_reg32_imm32(RDX, static_cast<uint32_t>(in.a_lit()));
         }
@@ -14606,19 +15105,28 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 #ifdef TESTS
             e.bump_counter(&g_jit_boxed_fast);
 #endif
-            /* payloads: rax = lhs, rcx = rhs (guard value dead now) */
+            /* payloads: rax = lhs, rcx = rhs (guard value dead now).
+             * The rhs register is BORROWED from here: the guard's
+             * j_slows above entered the slow arm with NO push, the
+             * divisor checks below enter WITH one - two stack shapes,
+             * so the divisor jumps get their own list and a
+             * compensation stub at the arm (see the patch site). */
             if (comp)
                 e.load(RAX, slot_addr(in.target).payload);
             else if (bo.a.is_lit)
                 e.movabs(RAX, static_cast<uint64_t>(bo.a.lit));
             else
                 e.load(RAX, slot_addr(bo.a.slot).payload);
+            hold();
+            const bool wp = tmp_pushed;
+            std::vector<size_t> j_slows_win;
             if (bo.b.is_lit)
                 e.movabs(tmp, static_cast<uint64_t>(bo.b.lit));
             else
                 e.load(RCX, slot_addr(bo.b.slot).payload);
             if (cmp) {
                 e.cmp_rr(RAX, tmp);
+                drop();                /* flags survive the pop */
                 e.u8(0x0F);
                 e.u8(static_cast<uint8_t>(cc_for(bo.aop).near_op + 0x10));
                 e.u8(0xC0);                           /* setcc al */
@@ -14638,10 +15146,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         e.cmp_reg_imm(RDX, 1);
                         const size_t j_div = e.j32(0x77);  /* ja .div */
                         e.test_rr(RCX, RCX);
-                        j_slows.push_back(e.j32(0x74));    /* 0 -> slow */
+                        j_slows_win.push_back(e.j32(0x74)); /* 0 -> slow */
                         e.movabs(RDX, 0x8000000000000000ull);
                         e.cmp_rr(RAX, RDX);
-                        j_slows.push_back(e.j32(0x74));    /* ovf -> slow */
+                        j_slows_win.push_back(e.j32(0x74)); /* ovf */
                         e.patch32_here(j_div);
                     }
                     e.cqo();              /* cqo */
@@ -14651,6 +15159,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 } else {
                     op_rr(e, bo.aop, RAX, RCX);
                 }
+                drop();               /* the rhs is consumed */
                 if (comp) {
                     e.store(RAX, slot_addr(in.target).payload);
                 } else {
@@ -14670,6 +15179,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 }
             }
             j_done = e.j32(0xEB);
+            /* the COMPENSATION STUB: a divisor-check jump left the op
+             * from INSIDE the borrow window, so on that path the push
+             * is still pending - unwind it (which also restores the
+             * pin), then fall through into the common slow arm. When
+             * nothing was pushed both lists land on the same byte. */
+            for (const size_t j : j_slows_win)
+                e.patch32_here(j);
+            if (wp && !j_slows_win.empty())
+                e.pop_bytes(RCX);
             for (const size_t j : j_slows)
                 e.patch32_here(j);
             j_slows.clear();
@@ -15088,6 +15606,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_ctx_chain(e, cb, is_cap);
         const size_t j_dref = emit_ref_check_jae_chain(e, cb, soff + ty0);
         e.load(RAX, src.type);
+        /* every jump to the slow arm below was emitted BEFORE this
+         * window opens (the gate; the chain check, whose own borrow
+         * self-closes), so no path enters that arm with this push
+         * pending - the window needs no compensation stub */
+        hold();
         e.load(RCX, src.payload);
         e.store_base(RCX, cb, soff + pv0);
         e.load(RCX, src.payload + 8);
@@ -15096,12 +15619,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.store_base(RCX, cb, soff + pv0 + 16);
         e.store_base(RAX, cb, soff + ty0);
         if (!is_cap) {
-            /* defined[gslot] = 1: rcx = defined.data() (the table is still
-             * in rdx), then the byte store. */
+            /* defined[gslot] = 1: rcx = defined.data() (the table is
+             * still in rdx), then the byte store. */
             e.load_base(RCX, RDX,
                         static_cast<int32_t>(jit_layout().gft_defined));
             e.store_byte_base_imm(RCX, static_cast<int32_t>(in.target), 0x01);
         }
+        drop();
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(g);
         e.patch32_here(j_dref);
@@ -15631,23 +16155,28 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 #ifdef TESTS
             e.bump_counter(&g_jit_step_imm);
 #endif
-            if (lit_step && (in.b_lit() == 1 || in.b_lit() == -1)) {
-                /* the emitter already used inc/dec for IntAddStep's
-                 * counter, so this introduces no new partial-flags
-                 * write - and the FLAGS here are dead: the cmp below
-                 * sets them afresh before the jump reads them. */
-                e.incdec_reg(r, up == (in.b_lit() == 1));
-            } else if (lit_step) {
-                e.op_reg_imm(up ? Op::plus : Op::minus, r,
-                             static_cast<int32_t>(in.b_lit()));
-            } else {
-                const int bcr = e.creg(in.b_slot());
-                if (bcr >= 0)
-                    e.op_rr2(up ? Op::plus : Op::minus, r,
-                             static_cast<uint8_t>(bcr));
-                else
-                    e.op_reg_slot(up ? Op::plus : Op::minus, r,
-                                  slot_addr(in.b_slot()).payload);
+            {
+                /* two-address pin update: the counter steps IN its pin */
+                Emitter::PinMach pm(e);
+                if (lit_step && (in.b_lit() == 1 || in.b_lit() == -1)) {
+                    /* the emitter already used inc/dec for IntAddStep's
+                     * counter, so this introduces no new partial-flags
+                     * write - and the FLAGS here are dead: the cmp
+                     * below sets them afresh before the jump reads
+                     * them. */
+                    e.incdec_reg(r, up == (in.b_lit() == 1));
+                } else if (lit_step) {
+                    e.op_reg_imm(up ? Op::plus : Op::minus, r,
+                                 static_cast<int32_t>(in.b_lit()));
+                } else {
+                    const int bcr = e.creg(in.b_slot());
+                    if (bcr >= 0)
+                        e.op_rr2(up ? Op::plus : Op::minus, r,
+                                 static_cast<uint8_t>(bcr));
+                    else
+                        e.op_reg_slot(up ? Op::plus : Op::minus, r,
+                                      slot_addr(in.b_slot()).payload);
+                }
             }
             if (in.a_is_lit() && in.a_lit() >= INT32_MIN
                     && in.a_lit() <= INT32_MAX) {
@@ -15725,16 +16254,25 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 #ifdef TESTS
             e.bump_counter(&g_jit_step_imm);
 #endif
+            /* the tracker: two-address pin updates. The PinMach wraps
+             * ONLY the instruction that writes the pin - never the
+             * operand staging, which is exactly the code the tracker
+             * exists to police (a tmp_lit inside a blanket wrap would
+             * be allowed to clobber anything). */
             if (fb) {
+                Emitter::PinMach pm(e);
                 e.op_rr2(Op::plus, d, RAX);
             } else if (in.b_is_lit() && in.b_lit() >= INT32_MIN
                        && in.b_lit() <= INT32_MAX) {
+                Emitter::PinMach pm(e);
                 e.op_reg_imm(Op::plus, d, static_cast<int32_t>(in.b_lit()));
             } else if (in.b_is_lit()) {
                 tmp_lit(static_cast<uint64_t>(in.b_lit()),
-                        [&]() { e.op_rr2(Op::plus, d, tmp); });
+                        [&]() { Emitter::PinMach pm(e);
+                                e.op_rr2(Op::plus, d, tmp); });
             } else {
                 const int bcr = e.creg(in.b_slot());
+                Emitter::PinMach pm(e);
                 if (bcr >= 0)
                     e.op_rr2(Op::plus, d, static_cast<uint8_t>(bcr));
                 else
@@ -15762,7 +16300,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 #ifdef TESTS
             e.bump_counter(&g_jit_step_imm);
 #endif
-            e.incdec_reg(r, up);
+            {
+                /* two-address pin update: the counter steps IN its pin */
+                Emitter::PinMach pm(e);
+                e.incdec_reg(r, up);
+            }
             const int_type bnd = static_cast<int_type>(in.a_dual_hi());
             if (in.a_is_lit() && bnd >= INT32_MIN && bnd <= INT32_MAX) {
                 e.cmp_reg_imm(r, static_cast<int32_t>(bnd));
@@ -15883,7 +16425,12 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::ForStepElemInt: {
         const uint8_t ir = elem_read_idx(e, in.op);
-        ElemRead fr; fr.idx = ir;
+        /* the FIFTH ElemRead construction site - it was built by hand
+         * and missed when the other four moved to the plan, so its
+         * `data` stayed rcx unconditionally. The register-state tracker
+         * found it the moment rcx was pinnable. */
+        const ElemRead fr = ir == ELEM_NO_REG
+            ? ElemRead{} : elem_read_plan(e, ir);
         if (ir == ELEM_NO_REG) {
             /* No free index register (unreachable while
              * elem_scratch_reserve keeps two candidates for this op -
@@ -17086,6 +17633,9 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
             continue;
         }
         label[pc] = e.pos();
+        e.op_boundary();
+        e.dbg_pc = static_cast<int>(pc);
+        e.dbg_op = static_cast<int>(chunk.code[pc].op);
         if (op_is_branch(chunk.code[pc].op))
             emit_branch(e, chunk, chunk.code[pc],
                         static_cast<uint32_t>(remap[pc]), 0, n, remap, fixups,
@@ -17904,10 +18454,16 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         /* Load each pinned slot ONCE here (the back edge jumps to the
          * first op below, so the loop keeps them in registers; every exit
          * flushes them back). */
-        for (size_t h = 0; h < hot.size(); h++) {
-            const SlotAddr a = slot_addr(hot[h]);
-            e.cache.push_back({ hot[h], a.payload, a.type, hot_reg[h] });
-            e.load(hot_reg[h], a.payload);                /* entry load */
+        {
+            Emitter::PinMach pm(e);          /* the entry pin loads */
+            e.trk_flushed = false;
+            e.trk_flushdirty = 0;
+            for (size_t h = 0; h < hot.size(); h++) {
+                const SlotAddr a = slot_addr(hot[h]);
+                e.cache.push_back(
+                    { hot[h], a.payload, a.type, hot_reg[h] });
+                e.load(hot_reg[h], a.payload);            /* entry load */
+            }
         }
 #ifdef TESTS
         {
@@ -18205,6 +18761,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         const auto emit_one = [&](size_t pc, bool in_cold,
                                   size_t cold_end) {
             const Instr &in = chunk.code[pc];
+            /* the tracker's per-op boundary: nothing transient survives
+             * an op - an open borrow means its pop is dead code, an
+             * unfreed alloc_scratch take silently reassigns every
+             * later allocation in the fragment */
+            e.op_boundary();
+            e.dbg_pc = static_cast<int>(pc);
+            e.dbg_op = static_cast<int>(in.op);
             if (g_jit_annotate)
                 marks.push_back({ static_cast<uint32_t>(e.pos() - frag_off[r]),
                                   static_cast<uint32_t>(remap[pc]) });
@@ -18585,16 +19148,29 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 continue;                /* interior entries only (a head
                                           * uses its run's own entry) */
             pe.second = e.pos();
-            e.frag_entry();                      /* a stub IS an entry too */
-            /* BEFORE the pin loads: r8 may be both the singleton and
-             * a pin register, and the pin must win. */
-            emit_type_tags(e);
-            for (const Emitter::CacheEnt &c : e.cache)
-                e.load(c.reg, c.payload);   /* #96: the ENTRY's own
-                                             * assignment, not the
-                                             * positional CACHE_REGS[h] */
-            for (const Emitter::CacheEnt &c : e.fcache)
-                e.fload(c.reg, c.payload);        /* C2a float pins */
+            {
+                /* the tracker: a stub is ENTRY ESTABLISHMENT - its
+                 * frag_entry pushes are the C caller's callee-saved
+                 * saves and its loads are the pin loads, all machinery.
+                 * The flit loads below stay OUTSIDE the scope on
+                 * purpose: flit_load stages through a real scratch
+                 * register, and whether that register is free here is
+                 * exactly what the tracker must keep judging. */
+                Emitter::PinMach pm(e);
+                e.trk_flushed = false;
+                e.trk_flushdirty = 0;
+                e.frag_entry();                  /* a stub IS an entry too */
+                /* BEFORE the pin loads: r8 may be both the singleton
+                 * and a pin register, and the pin must win. */
+                emit_type_tags(e);
+                for (const Emitter::CacheEnt &c : e.cache)
+                    e.load(c.reg, c.payload);   /* #96: the ENTRY's own
+                                                 * assignment, not the
+                                                 * positional
+                                                 * CACHE_REGS[h] */
+                for (const Emitter::CacheEnt &c : e.fcache)
+                    e.fload(c.reg, c.payload);    /* C2a float pins */
+            }
             for (const Emitter::FLit &fl : e.flits)
                 e.flit_load(fl);                  /* C4b literal pool */
 #ifdef TESTS

@@ -48,8 +48,14 @@ python3 - "$REG" <<'PY'
 import re, sys
 reg = sys.argv[1]
 p = "src/jit.cpp"; s = open(p).read()
-s = s.replace("static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2 };",
-              "static const uint8_t XCACHE_ORDER[] = { %s, 10, 11, 8, 7, 6, 9, 2 };" % reg)
+# rcx (1) LANDED as pin 12 on 2026-08-20, so the pool string this
+# rewrites moved. If the replace ever stops matching the script goes
+# VACUOUS (the probe would test the unmodified pool) - hence the
+# assert instead of a silent no-op.
+old = "static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2, 1 };"
+assert s.count(old) == 1, "XCACHE_ORDER moved - update rcx_admission.sh"
+s = s.replace(old, ("static const uint8_t XCACHE_ORDER[] = "
+                    "{ %s, 10, 11, 8, 7, 6, 9, 2, 1 };" % reg))
 # __builtin_LINE() as a DEFAULT ARGUMENT gives the CALLER's line on gcc
 # and clang - the C++17 stand-in for std::source_location, and what turns
 # a conflict COUNT into a worklist.
@@ -105,8 +111,14 @@ python3 - "$REG" <<'PY'
 import sys
 reg = sys.argv[1]
 p = "src/jit.cpp"; s = open(p).read()
-s = s.replace("static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2 };",
-              "static const uint8_t XCACHE_ORDER[] = { %s, 10, 11, 8, 7, 6, 9, 2 };" % reg)
+# rcx (1) LANDED as pin 12 on 2026-08-20, so the pool string this
+# rewrites moved. If the replace ever stops matching the script goes
+# VACUOUS (the probe would test the unmodified pool) - hence the
+# assert instead of a silent no-op.
+old = "static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2, 1 };"
+assert s.count(old) == 1, "XCACHE_ORDER moved - update rcx_admission.sh"
+s = s.replace(old, ("static const uint8_t XCACHE_ORDER[] = "
+                    "{ %s, 10, 11, 8, 7, 6, 9, 2, 1 };" % reg))
 open(p, "w").write(s)
 PY
 make -j BUILD_DIR=build-claude/adm-real TESTS=1 OPT=0 > "$TMP/b2.log" 2>&1 || {
