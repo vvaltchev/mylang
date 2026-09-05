@@ -3736,3 +3736,16 @@ pointing the CmpIntV setcc report at r12 aborts -rt at vm opcode 10
 by name. The remaining raw lines are memory-only stores/compares,
 xmm ops and control flow: no GP writes, census-cosmetic only, left
 for #101's encoder work if it wants them.
+
+## (ao) 2026-08-21 - two-address shifts + the rax whitelist widened
+
+The in-place literal shift (`s >>= 1`, or spelled out `s = s >> 1`)
+on a pinned dst emits `sar/shl pin, imm8` in place - no rax staging,
+saturation and the zero-count elision preserved in the emit - and the
+form joins `run_may_pin_rax` + the coverage gate, so shift-bearing
+13-slot kernels keep the 13th register. Watched decline: the
+non-in-place immediate shift still declines rax by SHAPE (the case
+that aborts when the shape gate is removed). g_jit_two_addr_reg
+counts it; probe 611 emits, `sar r14, 1` in -vdj; bench flat
+(1.007x geomean on a noise-flagged box). Full entry:
+docs/jit-optimizations.md "TWO-ADDRESS SHIFTS".

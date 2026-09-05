@@ -9352,6 +9352,14 @@ static bool run_may_pin_rax(const Chunk &ck, size_t begin, size_t end)
         case OpCode::JumpUnlessIntCmp:
             break;                   /* pinned `a` compares in its pin;
                                       * coverage requires it */
+        case OpCode::IntShlRI: case OpCode::IntShrRI:
+            /* rax-free ONLY in the in-place literal form (the
+             * two-address shift); the temp/staged forms run through
+             * rax in every arm */
+            if (in.a_is_lit() || in.target != in.a_slot()
+                    || !in.b_is_lit())
+                return false;
+            break;
         default:
             return false;            /* unknown -> keep rax out */
         }
@@ -13843,6 +13851,40 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const int fin = g_fwd.in_temp;
         const bool fa = fin >= 0 && in.a_slot() == fin;
         const bool fb = fin >= 0 && !in.b_is_lit() && in.b_slot() == fin;
+        /*
+         * #96: the TWO-ADDRESS shift - `sar/shl pin, imm` IN PLACE for
+         * an in-place literal shift on a pinned dst, the arithmetic
+         * family's increment-2 twin. One instruction where the staged
+         * form paid read/shift/write through rax - and the edit that
+         * admits the RI shifts to a RAX-pinned run (their value staged
+         * through rax in every form before this; run_may_pin_rax's
+         * shift case names exactly this shape). Saturation keeps the
+         * emit-time arms: c >= 64 zeroes the pin (shl) or sign-fills
+         * it (sar); c == 0 emits NOTHING, which is strictly better
+         * than the staged form's pointless round-trip. Forwarding
+         * declines: the consumer expects RAX, which this never holds.
+         */
+        if (!in.a_is_lit() && in.target == in.a_slot() && in.b_is_lit()
+                && !fa && !fb && g_fwd.prod != in.target) {
+            const int dsh = e.creg(in.target);
+            if (dsh >= 0) {
+                const uint8_t d = static_cast<uint8_t>(dsh);
+                const int_type c = in.b_lit();   /* >= 0 by selection */
+#ifdef TESTS
+                e.bump_counter(&g_jit_two_addr_reg);
+#endif
+                Emitter::PinMach pm(e);
+                if (c >= 64) {
+                    if (shl) e.zero_reg32(d);
+                    else     e.sar_rr_imm8(d, 63);
+                } else if (c > 0) {
+                    if (shl) e.shl_rr_imm8(d, static_cast<uint8_t>(c));
+                    else     e.sar_rr_imm8(d, static_cast<uint8_t>(c));
+                }
+                g_fwd = JitFwd{};
+                return true;
+            }
+        }
         if (fa || fb)
             emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
         if (fb)
@@ -19146,6 +19188,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 case OpCode::IntAndRI: case OpCode::IntOrRI:
                 case OpCode::IntXorRI:
                 case OpCode::LoadImmInt:
+                case OpCode::IntShlRI: case OpCode::IntShrRI:
                     covered = pinned_slot(in.target);
                     break;
                 case OpCode::ForLoopStep:
