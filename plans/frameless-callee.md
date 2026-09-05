@@ -479,11 +479,62 @@ Each ends with a MEASUREMENT that can kill the next one.
 ## 3b. INHERITED FROM #123 — THE CALL SITE MUST BRACKET ITS PINS
 ## (added 2026-08-29, when #123 deleted the register pools)
 
-**THE SYMPTOM, measured:** a fragment that emits a MyLang call gets
-**4 pinnable registers of 13**. `jit_run_blocks_xcache` denies the
-whole CALLER-SAVED half of the pin pool to any run containing `CallV`,
-`CachedCallV` or `CallValueV`, so `fib$0` — the flagship shape of this
-whole task — runs on the callee-saved four alone.
+**⛔ THE SYMPTOM AS FIRST WRITTEN WAS WRONG, AND THE CORRECTION IS THE
+WHOLE OF THIS INCREMENT (measured 2026-09-04).** It said *"a fragment
+that emits a MyLang call gets 4 pinnable registers of 13"*, i.e. that
+`jit_run_blocks_xcache`'s denial of the caller-saved half leaves such a
+run pinning from the callee-saved four.
+
+**It gets ZERO.** `MYLANG_JITSTATS` on 09_fib_recursive prints
+`pick_decided 2` and `runs_compiled 2` and NO pin row at all — no
+`cache`, no `lsra_pins`, no `xcache`. Same for 78, 11, 63 and 76. The
+two-program experiment isolates it: one identical hot loop, five live
+accumulators, differing only in whether the body calls an impure
+function that survives to codegen —
+
+    # A - no call in the loop
+    func hot(int n) {
+        var a = 0; var b = 1; var c = 2; var d = 3; var e = 4;
+        for (var i = 0; i < n; i++) {
+            a = a + i * 3;  b = b ^ (i >> 1);  c = c + a - b;
+            d = d + c * 2;  e = e ^ (d + i);
+        }
+        return a + b + c + d + e;
+    }
+    ->  lsra_pins 1   lsra_trans 11
+
+    # B - the SAME loop, plus `g = g + sink(i);`  (sink is impure and
+    #     over the inline weight gate, so `call.v` survives to pc 19)
+    ->  no pin row at all
+
+**THE REAL BLOCKER IS ONE LEVEL UP, AND THE SOURCE ALREADY SAYS SO.**
+`pick_visit_op` (jit.cpp) classifies which slots an op touches; its
+`default` arm returns FALSE, which means *"an unclassified op - the
+caller must assume EVERY slot is touched"*, and the CALL family lands
+there deliberately. Its own comment names this increment:
+
+    the CALL family (CallV/CachedCallV/CallValueV/CallValueGenericV -
+    whether a call should be a barrier instead is #97's decision,
+    entangled with the call protocol)
+
+So a run containing a MyLang call is disqualified from pinning
+ENTIRELY, and `jit_run_blocks_xcache` is a SECOND gate denying half of
+a pool the run never reaches in the first place. Deleting the denial
+alone — which is what this section used to prescribe — would change
+nothing at all.
+
+**WHAT 1b ACTUALLY IS, THEREFORE: classify the CALL family as a
+BARRIER** rather than as an unclassified op. `IncDecChainV` is the
+precedent already in the switch (`v.mark_barrier(pc)`, commented
+"BRACKET (not a branch)"). The call must additionally declare what it
+really touches — the argument RUN and the callee slot are read from
+memory, the dst is written — so the analysis stops guessing. Only THEN
+does the caller-saved question below become live.
+
+**THE OLD SYMPTOM TEXT, kept because its analysis of the DENIAL is
+still correct:** `jit_run_blocks_xcache` denies the whole CALLER-SAVED
+half of the pin pool to any run containing `CallV`, `CachedCallV` or
+`CallValueV`.
 
 **⛔ AND THE DENIAL IS CORRECT TODAY. The first write-up of this called
 it a register wasted for nothing, and that was wrong.** Read
