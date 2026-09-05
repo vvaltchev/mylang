@@ -3552,3 +3552,60 @@ against the arm sites answers it.
 
 Then: `scripts/rcx_admission.sh 1`, which builds rcx in and runs the
 nets itself.
+
+## (ai) 2026-08-20 - the lazy arm() guard was BUILT and it does not
+## work: RAII scope exit is not the end of the emitted control flow
+
+Built exactly as (ah) specified - `TmpBorrow` with an idempotent
+`arm()` emitting the push on first use and a destructor popping - with
+21 arm sites inserted across the emitter. It is byte-identical in the
+shipping configuration and takes rcx-admitted corpus_diff from
+**23/24 to 21/24**. Worse than doing nothing.
+
+### The flaw in (ah)'s reasoning, which I had checked and got wrong
+
+(ah) argued that every emitted jump lands at or before the pop, because
+every `patch32_here` runs during the switch while the destructor runs
+after. That is true and it is NOT SUFFICIENT.
+
+**The destructor emits the pop after the op's LAST INSTRUCTION - and
+that instruction may itself be a BRANCH.** When a case ends with an
+unconditional jump (to an exit, to a done label, to the next op), the
+pop sits after it as DEAD CODE: never executed, while the push at
+`arm()` already ran. Eight bytes leaked per execution.
+
+A C++ scope and an emitted basic block are not the same thing, and RAII
+only knows about the first. Every guard shape that ties the pop to
+scope exit has this hole, so:
+
+  - RAII over the switch:              broken (this entry)
+  - plain push at the top + RAII:      broken by `return false` (ah)
+  - reallocation instead of borrowing: broken by caller liveness (ag)
+
+Three shapes, three different reasons, all now recorded.
+
+### What is actually left
+
+The borrow must be tied to the emitted CONTROL FLOW, not to a C++
+scope - i.e. the pop belongs immediately after the last USE, on every
+path that reaches it, which is what `RefScratch::release()` does
+explicitly and what emit_op's callback form does structurally. Both
+work because their windows contain no branch.
+
+So the remaining options for this emitter, in order of appeal:
+
+ 1. **Per-use windows, like emit_op's.** Convert the ~20 tmp/cpy uses
+    to the callback form (`tmp_lit(v, use)`), which places the pop
+    right after the consumer. Mechanical, and the pattern is already
+    proven in the sibling emitter.
+ 2. **Give the emitter a single emitted exit** - a label every case
+    jumps to, with the pop there. Bigger surgery, but it makes the
+    whole family of "borrow across an op" problems go away.
+ 3. **Leave rcx out of the pool.** 11 pins is the shipping budget and
+    it is fine; the measured marginal value of pins beyond the first
+    two was ZERO on every bench (see the MAXPINS sweep at (r)). The
+    honest question is whether a 12th pin is worth this at all - and
+    on the evidence so far it is not. **The value of the work was
+    never the pin; it was the four real bugs the conversions found.**
+
+⛔ Do NOT try a fourth guard shape without first deciding (3).
