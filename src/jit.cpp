@@ -1176,7 +1176,17 @@ struct RegAlloc {
         for (uint8_t r = 0; r < 16; r++) {
             if ((gp_caps(r) & need) != need)
                 continue;
-            if ((denied | exclude) & (1u << r))
+            /* ⛔ `denied` is deliberately NOT consulted here, and that
+             * is the difference from take(): denied means "this run
+             * may not SPEND the register as a pin", but the caller of
+             * this function is about to push/pop-BORROW it, which
+             * preserves whatever the run reserved it for (a type
+             * singleton, a clobber-mask claim). Honouring denied here
+             * made the off-arena hoist re-derive run out of registers
+             * entirely - the tags plus the reservation plus the
+             * exclusions covered all sixteen. Only `exclude` (the
+             * caller's own live values) refuses. */
+            if (exclude & (1u << r))
                 continue;
             const int w = gp_weight(r);
             if (best < 0 || w < best_w) { best = r; best_w = w; }
@@ -1293,6 +1303,7 @@ struct Emitter {
     uint32_t trk_dirty = 0;      /* borrowed regs the borrower wrote   */
     uint8_t trk_bstack[8] = {};  /* borrow ORDER - pops must reverse   */
     int trk_bn = 0;
+    int trk_pushes = 0;          /* net emitted push depth within an op */
     bool trk_flushed = false;    /* post-flush: memory is authoritative,
                                   * pin REGISTERS are dead until reload */
     uint32_t trk_flushdirty = 0; /* pins repurposed since the flush -
@@ -1329,7 +1340,22 @@ struct Emitter {
             trk_dirty |= bit;            /* the borrower's own use */
             return;
         }
-        if (trk_mach > 0 || !reg_holds_pin(r))
+        if (trk_mach > 0)
+            return;
+        if ((gp_caps(r) & CAP_CALLEE_SAVED)
+                && !(GP_RESERVED_MASK & (1u << r))) {
+            /* a callee-saved register is writable ONLY if this fragment
+             * saved it at entry (i.e. it is a pin in e.saved) - an
+             * unsaved one belongs to the C CALLER, and writing it
+             * corrupts a frame the value oracles never look at */
+            bool saved_here = false;
+            for (const uint8_t sr : saved)
+                if (sr == r) { saved_here = true; break; }
+            if (!saved_here)
+                trk_fail("write to an UNSAVED callee-saved register - "
+                         "the C caller's value is destroyed", r);
+        }
+        if (!reg_holds_pin(r))
             return;
         if (trk_flushed) {
             trk_flushdirty |= bit;   /* dead until reload: repurposable */
@@ -1421,6 +1447,12 @@ struct Emitter {
         if (trk_takes != 0)
             trk_fail("op boundary reached with an alloc_scratch take "
                      "not freed", static_cast<unsigned>(trk_takes));
+        if (trk_pushes != 0)
+            trk_fail("op boundary reached with a NET EMITTED PUSH "
+                     "DEPTH - some path through this op leaks stack",
+                     static_cast<unsigned>(
+                         trk_pushes > 0 ? trk_pushes : -trk_pushes));
+        trk_pushes = 0;
         /* ⛔ THE FLUSH STATE IS PER-OP, NOT PER-EMISSION-ORDER. A run
          * may contain a TERMINAL op mid-sequence (an early return): its
          * flush ends ITS path, but the next op in EMISSION order is
@@ -1445,7 +1477,13 @@ struct Emitter {
     /* the pop's BYTES with no tracker transition - only BorrowSuspend
      * may use this, for a restore on a DIVERGENT path */
     void pop_bytes(uint8_t r)
-    { if (r >= 8) u8(0x41); u8(0x58 | (r & 7)); }
+    {
+        /* a divergent-path restore: the SHARED path's push is counted
+         * once and popped once on EACH path, so this must not touch
+         * the linear depth counter */
+        if (r >= 8) u8(0x41);
+        u8(0x58 | (r & 7));
+    }
     /*
      * ⛔ A DIVERGENT ARM THAT LEAVES THE OP (a raise, a bail) while a
      * borrow is open must restore the pins ON THAT PATH - the epilogue
@@ -1564,7 +1602,24 @@ struct Emitter {
          * hand out a pinned register - so it is checked here, at the
          * one place that consults both. */
         check_pins_are_busy();
-        const int r = ra.take(need | CAP_ALLOCATABLE, prefer, exclude);
+        /*
+         * ⛔ CALLEE-SAVED REGISTERS ARE NEVER TRANSIENT SCRATCH. The
+         * weight model calls them cheapest, and for PINNING that is
+         * right - frag_entry saves them and they survive helper calls
+         * free. For SCRATCH it is exactly wrong: an unsaved
+         * callee-saved register is the C CALLER'S property, and a
+         * saved one is a pin (busy). Found the hard way: with rcx
+         * denied, this handed the hoist re-derive r14 - unsaved - and
+         * the fragment returned to jit_call_sync_core with its ASan
+         * frame base destroyed. A silent C-caller corruption, one
+         * frame up from the fragment, invisible to every value oracle.
+         */
+        uint32_t cs = 0;
+        for (uint8_t r = 0; r < 16; r++)
+            if (gp_caps(r) & CAP_CALLEE_SAVED)
+                cs |= 1u << r;
+        const int r = ra.take(need | CAP_ALLOCATABLE, prefer,
+                              exclude | cs);
         if (r >= 0)
             trk_takes++;
         return r;
@@ -2306,6 +2361,9 @@ struct Emitter {
      * over. Called AFTER `saved` is filled (the cache pick decides it). */
     void frag_entry()
     {
+        /* the entry pushes are teardown-balanced (frag_ret), not
+         * op-balanced - machinery, like frag_ret's pops already are */
+        PinMach pm(*this);
 #ifdef TESTS
         /* G1 step 2: hand the HARDWARE return address to the table check
          * before anything else runs. One push keeps the entry parity
@@ -2708,9 +2766,21 @@ struct Emitter {
       u8(static_cast<uint8_t>(0xC0 | (d << 3) | s)); }
     /* push/pop a GP reg (0x50+r / 0x58+r; REX.B for r8..r15) */
     void push_reg(uint8_t r)
-    { trk_push(r); if (r >= 8) u8(0x41); u8(0x50 | (r & 7)); }
+    {
+        trk_push(r);
+        if (trk_mach == 0)
+            trk_pushes++;
+        if (r >= 8) u8(0x41);
+        u8(0x50 | (r & 7));
+    }
     void pop_reg(uint8_t r)
-    { trk_pop(r); if (r >= 8) u8(0x41); u8(0x58 | (r & 7)); }
+    {
+        trk_pop(r);
+        if (trk_mach == 0)
+            trk_pushes--;
+        if (r >= 8) u8(0x41);
+        u8(0x58 | (r & 7));
+    }
     void call_rax() { call_reg(0 /* rax: the Reg enum is
                                 * declared below the class */); }
     /* lea reg, [rbx + disp32]  (an EvalValue-ptr / LValue-ptr helper arg;
@@ -5199,7 +5269,9 @@ static void emit_call_epilogue(Emitter &e)
          */
         const bool hspill = hsc < 0;
         if (hspill) {
-            hsc = e.ra.any_capable(CAP_MEM_BASE | CAP_ALLOCATABLE, hex);
+            hsc = e.ra.any_capable(CAP_MEM_BASE | CAP_ALLOCATABLE,
+                                   hex | (1u << 12) | (1u << 13)
+                                       | (1u << 14) | (1u << 15));
             ML_CHECK_MSG(hsc >= 0,
                          "no register is even CAPABLE of re-deriving "
                          "the hoist region - the exclusion set is wrong");
@@ -9240,22 +9312,25 @@ static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
      * clause per admission, each one re-deriving the arithmetic, which
      * is how a family of `&&`s becomes an audit table nobody re-reads.
      *
-     * The general rule instead COUNTS: take the candidates this run can
-     * actually use (arena state, float-tag liveness, the hoist pair -
-     * `elem_reg_usable_nopin`, the same predicate the emitter asks),
-     * separate the ones no pin can ever take from the ones this pool
-     * could spend, and withhold spendable members - LEAST-PREFERRED
-     * FIRST, so the withholding costs the pool its cheapest register -
-     * until as many are guaranteed to survive as the run's neediest
-     * element op requires - TWO for a store, ONE for a read
-     * (`op_elem_scratch_roles`).
+     * ⛔ AND A SCALAR COUNT WAS THE NEXT FORM TO FAIL (2026-08-20):
+     * a count cannot say WHICH register it protected, and both
+     * directions bit in one day - rcx withheld "for" a capture chain
+     * that scans ELEM_CAND only (the count satisfied, the consumer
+     * starved: every max-pin closure loop silently lost its whole
+     * fragment, all 8 rotations, off-arena), and three withholds for a
+     * read whose `count` role was ALREADY safe behind the rdx
+     * whitelist (the pool starved instead: the hoisted-read shape had
+     * no member left to pin). The rule is now PER-ROLE:
+     * `elem_scratch_reserve` re-runs each present plan's own
+     * preferred-then-ELEM_CAND scan (`op_elem_role_sig` says which
+     * plans a run presents) and withholds exactly the register each
+     * unsatisfied role will look for - see its comment for the two
+     * watched failures.
      *
      * It is a POOL decision, so it is conditioned on the RUN actually
-     * containing an element op at all (`elem_roles_needed` is 0
-     * otherwise);
-     * a run with no element store pays nothing. Reserving for a tier
-     * that never appears is exactly the coarseness the boolean
-     * `xcache_ok` was replaced for.
+     * presenting a signature at all (`ElemRoleSig::none` runs pay
+     * nothing). Reserving for a tier that never appears is exactly the
+     * coarseness the boolean `xcache_ok` was replaced for.
      */
     clob |= elem_scratch_reserve(ck, begin, end, has_hoist, clob);
     return clob;
@@ -11310,41 +11385,36 @@ static bool elem_reg_usable(const Emitter &e, uint8_t r)
  * aborts BY NAME in a debug build instead of quietly declining.
  */
 /*
- * How many ELEM_CAND registers this op's inline tier needs, which is
- * also what the pin pool must leave it.
+ * Which reservation SIGNATURE an op's inline tier presents - the set of
+ * scratch ROLES its plan allocates, each with the PREFERRED register
+ * that plan tries first. The reservation below re-runs each plan's own
+ * preferred-then-ELEM_CAND scan against the pin pool, so what it
+ * guarantees is exactly what the emitter will ask for.
  *
- * ⛔ THE COUNT MATTERS, NOT JUST THE MEMBERSHIP, and getting that wrong
- * was immediately visible. A first version answered a bare "does this
- * run use element scratch", so a run of READS reserved TWO registers
- * where it needs ONE - and off-arena, where rsi and r8 carry the tag
- * singletons and a C1 hoist owns r10/r11, that reserved the last
- * spendable pool member and took the caller-saved extension back to
- * zero for every hoisted array loop. Watched: the `jit_xcache_pins`
- * hoist case went from engaging to "engaged 0, expected > 0" at all
- * five rotations.
+ * ⛔ A COUNT WAS NOT ENOUGH - the identity of the withheld register
+ * matters, twice over (both watched as "engaged 0" xcache failures,
+ * off-arena, 2026-08-20):
+ *  - the CAPTURE/GLOBAL chain scans ELEM_CAND only, so withholding rcx
+ *    (which satisfies the element tiers' `data` role) satisfied the
+ *    COUNT while leaving the chain nothing it could use, and every
+ *    max-pin closure loop silently lost its whole fragment;
+ *  - a role whose preferred register is ALREADY un-pinnable (rdx under
+ *    the run_may_pin_rdx whitelist, r9 under a clobber) needs no
+ *    withhold at all, and counting it starved the pool: the hoisted
+ *    read shape withheld three registers where its plan needed one.
  */
-static size_t op_elem_scratch_roles(OpCode op)
+enum class ElemRoleSig : uint8_t { none, chain, read, store };
+
+static ElemRoleSig op_elem_role_sig(OpCode op)
 {
     switch (op) {
-    /*
-     * ⛔ RE-RATED 2026-08-20, and the stale comment this replaces is
-     * the audit-table trap hit LIVE: it said "the index alone -
-     * rax/rcx/rdx are forced", which stopped being true the day
-     * elem_read_plan / elem_scratch_plan began ALLOCATING `data` (and
-     * the read tier's `count`). With rcx and rdx both pool members, a
-     * fragment at full pin pressure sends every preferred register to
-     * its CAND fallback - so a rating that counts only the OLD
-     * allocatable roles lets the pool eat the candidates the plan
-     * needs, and the tier declines silently (watched: the reservation
-     * test failed exactly this way when rcx landed as pin 12).
-     */
-    /* the STORE tiers: `data`, `idx` AND `val` (`count` stays rdx -
-     * the idiv arm hardware-pins it; see ElemScratch) */
+    /* the STORE tiers: `data` + `idx` + `val` allocated, `count` is
+     * ISA-FIXED rdx (the compound /=, %= arms' idiv) and `obj` rax */
     case OpCode::StoreElemInt:
     case OpCode::StoreElemFloat:      /* emit_store_elem -> #92 inline */
     case OpCode::StoreElem2V:         /* #95 nested inline            */
-        return 3;
-    /* the READ tiers: `data`, `count` AND `idx` (obj = rax fixed) */
+        return ElemRoleSig::store;
+    /* the READ tiers: `data`, `count` AND `idx` allocated (obj = rax) */
     case OpCode::LoadElemInt:
     case OpCode::LoadElemFloat:
     case OpCode::LoadElemBool:
@@ -11352,29 +11422,18 @@ static size_t op_elem_scratch_roles(OpCode op)
     case OpCode::LoadElem2Float:
     case OpCode::ForStepElemInt:
     case OpCode::JumpUnlessElemInt:
-        return 3;
-    /* the CAPTURE / global chain: one base register, via ctx_chain_reg.
-     * Not an element op, but it draws from the same candidate set and
-     * the pool must leave it one for exactly the same reason - see the
-     * 88854283473440 note there. */
+        return ElemRoleSig::read;
+    /* the CAPTURE / global chain: one base register via ctx_chain_reg,
+     * which prefers r9 and falls back to ELEM_CAND - and to NOTHING
+     * else, which is why this is its own signature: a withheld rcx is
+     * useless to it (see the ⛔ note above). */
     case OpCode::LoadCaptureV:
     case OpCode::StoreCaptureV:
     case OpCode::StoreGlobalV:
-        return 1;
+        return ElemRoleSig::chain;
     default:
-        return 0;
+        return ElemRoleSig::none;
     }
-}
-
-static size_t elem_roles_needed(const Chunk &ck, size_t begin, size_t end)
-{
-    size_t need = 0;
-    for (size_t p = begin; p < end; p++) {
-        const size_t r = op_elem_scratch_roles(ck.code[p].op);
-        if (r > need)
-            need = r;
-    }
-    return need;
 }
 
 /*
@@ -11396,52 +11455,115 @@ static size_t elem_roles_needed(const Chunk &ck, size_t begin, size_t end)
  * exactly what that axis must not do: every rotation must produce the
  * same output.)
  */
+static const uint8_t ELEM_NO_REG = 0xFF;
+
 static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
                                      size_t end, bool has_hoist,
                                      uint32_t clob)
 {
-    const size_t need_roles = elem_roles_needed(ck, begin, end);
-    if (!need_roles)
+    bool has_read = false, has_store = false, has_chain = false;
+    for (size_t p = begin; p < end; p++)
+        switch (op_elem_role_sig(ck.code[p].op)) {
+        case ElemRoleSig::read:  has_read  = true; break;
+        case ElemRoleSig::store: has_store = true; break;
+        case ElemRoleSig::chain: has_chain = true; break;
+        case ElemRoleSig::none:  break;
+        }
+    if (!has_read && !has_store && !has_chain)
         return 0;
     const bool ftl = run_needs_float_tag(ck, begin, end);
     const uint32_t claimed = has_hoist ? HOIST_REGS_MASK : 0u;
     const uint32_t pool = xcache_mask();
-    uint32_t spendable = 0;
-    size_t survivors = 0;
+    uint32_t withheld = 0;
+
     /*
-     * ⛔ THE SET MUST MATCH THE PLAN'S, which is {preferred} u CAND -
-     * elem_read_plan / elem_scratch_plan try the PREFERRED register
-     * (rcx for `data`) before falling to ELEM_CAND. Reserving over
-     * CAND alone undercounts exactly where it matters: OFF-ARENA the
-     * tag registers leave two usable CAND members, and if the pins eat
-     * rcx the plan needs three from two - an inevitable silent
-     * decline (watched: the reservation test failed this way the day
-     * rcx joined the pool). Withholding rcx here instead keeps
-     * `data`'s own preferred register free, and CAND only has to
-     * cover the rest.
+     * PER-ROLE, mirroring the plans' own scans (elem_read_plan /
+     * elem_scratch_plan / ctx_chain_reg: the preferred register first,
+     * then ELEM_CAND in order). For each role of each signature this
+     * run presents, ask: will the plan find a register?
+     *
+     *  - a register no pin can take (outside the pool, or clobbered/
+     *    already withheld) and that the plan can use satisfies the
+     *    role for FREE - this is what the old count got wrong in the
+     *    starving direction (rdx under the whitelist, r9 under a
+     *    clobber cost a withhold each);
+     *  - else WITHHOLD, the role's own preferred register first, so
+     *    the withhold satisfies the role it was made for - this is
+     *    what the count got wrong in the useless direction (rcx
+     *    withheld "for" a capture chain that cannot use rcx).
+     *
+     * Roles of the SAME op need DISTINCT registers (`used`); separate
+     * ops run at separate pcs and may share. The guarantee is a lower
+     * bound: at emit time a register the pins merely declined to take
+     * only ADDS to what the plan finds free.
+     *
+     * ROTATION-INDEPENDENT by construction - it consults preference
+     * lists, never XCACHE_ORDER - so every MYLANG_JIT_XROT value
+     * reserves identically, which that axis requires (every rotation
+     * must produce the same program output; a rotation-dependent
+     * reservation withheld r8 at two rotations and cost the xcache
+     * hoist case its last pool member - watched, 2026-08-20).
      */
-    static const uint8_t RESERVE_SET[] =
-        { RDI, R9, R10, R11, RSI, R8, RCX };   /* ELEM_CAND + preferred */
-    for (const uint8_t c : RESERVE_SET) {
-        if (!elem_reg_usable_nopin(c, ftl, claimed))
-            continue;
-        if ((pool & (1u << c)) && !(clob & (1u << c)))
-            spendable |= 1u << c;
-        else
-            survivors++;                 /* no pin can reach it */
-    }
-    uint32_t add = 0;
-    for (size_t i = MAX_XCACHED; i-- > 0 && survivors < need_roles; ) {
-        const uint8_t r = XCACHE_ORDER[i];
-        if (!(spendable & (1u << r)))
-            continue;
-        add |= 1u << r;
-        survivors++;
+    const auto usable = [&](uint8_t r) {
+        return elem_reg_usable_nopin(r, ftl, claimed);
+    };
+    const auto plan_free = [&](uint8_t r) {
+        return usable(r)
+            && (!(pool & (1u << r)) || ((clob | withheld) & (1u << r)));
+    };
+    const auto spendable = [&](uint8_t r) {
+        return usable(r) && (pool & (1u << r))
+            && !((clob | withheld) & (1u << r));
+    };
+    const auto role = [&](uint8_t pref, uint32_t &used) {
+        if (!(used & (1u << pref)) && plan_free(pref)) {
+            used |= 1u << pref;
+            return;
+        }
+        for (const uint8_t c : ELEM_CAND)
+            if (!(used & (1u << c)) && plan_free(c)) {
+                used |= 1u << c;
+                return;
+            }
+        uint8_t take = ELEM_NO_REG;
+        if (!(used & (1u << pref)) && spendable(pref)) {
+            take = pref;
+        } else {
+            for (const uint8_t c : ELEM_CAND)
+                if (!(used & (1u << c)) && spendable(c)) {
+                    take = c;
+                    break;
+                }
+        }
+        if (take == ELEM_NO_REG)
+            return;   /* nothing to withhold: the plan declines to the
+                       * helper - correct, only slower */
+        withheld |= 1u << take;
+        used |= 1u << take;
 #ifdef TESTS
         g_jit_elem_reserve++;
 #endif
+    };
+
+    const ElemScratch st;              /* the plans' OWN defaults, so */
+    const ElemRead    rd;              /* the preferences cannot drift */
+    if (has_store) {
+        uint32_t used = (1u << st.obj) | (1u << st.count);
+        role(st.data, used);
+        role(st.idx, used);
+        role(st.val, used);
     }
-    return add;
+    if (has_read) {
+        uint32_t used = 1u << rd.obj;
+        role(rd.data, used);
+        role(rd.count, used);
+        role(rd.idx, used);
+    }
+    if (has_chain) {
+        uint32_t used = 0;
+        role(R9, used);                /* ctx_chain_reg's preference */
+    }
+    return withheld;
 }
 
 /*
@@ -11479,7 +11601,7 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
  * silent wrong answer. A decline (`emit_op` returns false, the whole
  * fragment stays interpreted) is merely slow.
  */
-static const uint8_t ELEM_NO_REG = 0xFF;
+/* (ELEM_NO_REG moved above elem_scratch_reserve, which uses it) */
 
 /*
  * The CAPTURE / global chain's base register.
@@ -11508,9 +11630,9 @@ static uint8_t ctx_chain_reg(const Emitter &e)
 
 static uint8_t elem_read_idx(const Emitter &e, OpCode op)
 {
-    ML_CHECK_MSG(op_elem_scratch_roles(op) >= 1,
+    ML_CHECK_MSG(op_elem_role_sig(op) != ElemRoleSig::none,
                  "an emitter took an element index register for an "
-                 "opcode op_elem_scratch_roles rates at 0 - the pin "
+                 "opcode op_elem_role_sig does not classify - the pin "
                  "pool reserves nothing for this run");
     (void)op;
     if (elem_reg_usable(e, R9))
@@ -11569,9 +11691,9 @@ static ElemRead elem_read_plan(const Emitter &e, uint8_t idx_reg)
 
 static ElemScratch elem_scratch_plan(const Emitter &e, OpCode op)
 {
-    ML_CHECK_MSG(op_elem_scratch_roles(op) == 3,
-                 "an emitter took an ElemScratch (two roles) for an "
-                 "opcode op_elem_scratch_roles does not rate at 3 - the "
+    ML_CHECK_MSG(op_elem_role_sig(op) == ElemRoleSig::store,
+                 "an emitter took an ElemScratch for an opcode "
+                 "op_elem_role_sig does not classify as a STORE - the "
                  "pin pool's reservation cannot see this run, so the "
                  "tier will decline silently when the pool is full");
     ElemScratch sc;

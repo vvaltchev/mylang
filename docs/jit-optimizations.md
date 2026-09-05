@@ -7110,3 +7110,66 @@ previously shipped as an unattributable wrong answer.
 (~20 remain, see plans/jit-registers.md (y)) bypass `wrote()`; jumps
 patched into arms emitted after a window closes are checked by the
 compensation-stub CONVENTION, not by the model.
+
+## #96 (c) addendum: THE PER-ROLE RESERVATION, and the balance rules
+## the off-arena lane forced (2026-08-20)
+
+The rcx admission's tail was three off-arena failures, each of which
+hardened a different layer. All were found by the nolowmem lane +
+the xcache tests, not by any value differential - the failure mode in
+every case was a SILENT DECLINE (the fragment or its tier vanishes,
+the answer stays right, only "engaged 0" says anything).
+
+**1. Scratch may never be an UNSAVED callee-saved register.**
+`alloc_scratch` ranked by `gp_weight`, which calls callee-saved
+cheapest - right for PINS (frag_entry saves them), exactly wrong for
+transient scratch: with rcx denied by the reservation, the hoist
+re-derive was handed **r14 unsaved**, and the fragment returned to
+`jit_call_sync_core` with the C caller's frame base destroyed - a
+one-frame-up corruption invisible to every value oracle (ASan caught
+it as a wild frame access, off-arena only, because only there is rcx
+scarce enough). Fixed twice over: `alloc_scratch` excludes the
+callee-saved set outright, and the tracker gained the rule "a write
+to a callee-saved register not in `e.saved` aborts" - so the next
+path to one fails by name at compile time.
+
+**2. A borrow does not honour `denied` - only `exclude`.**
+`any_capable` consulted the run's denied mask; off-arena the tags +
+the reservation + the caller's exclusions covered all sixteen
+registers and the re-derive found "no register CAPABLE". Wrong
+premise: denied protects what a PIN would destroy, and a push/pop
+BORROW preserves it. Borrows now ignore denied.
+
+**3. The reservation is PER-ROLE, not a count** (`ElemRoleSig` +
+`elem_scratch_reserve` rewritten). The scalar count failed in both
+directions in one day, all watched via the xcache cases off-arena:
+  - the CAPTURE/GLOBAL chain (`ctx_chain_reg`) scans ELEM_CAND ONLY,
+    so a withheld rcx satisfied the count while the chain starved -
+    `LoadCaptureV` returned false, `emit_ok` dropped the WHOLE
+    fragment, and every max-pin closure loop ran interpreted at all
+    eight rotations ("engaged 0" was the only symptom; the earlier
+    per-rotation failure lists were a grep artifact - always read the
+    full failure count);
+  - a role whose preferred register is ALREADY un-pinnable (rdx under
+    `run_may_pin_rdx`, r9 under a clobber) needs no withhold, and
+    counting it starved the POOL: the hoisted-read shape withheld
+    three registers where its plan needed one, leaving nothing to pin.
+The rewrite re-runs each present plan's OWN preferred-then-ELEM_CAND
+scan (the signature per opcode from `op_elem_role_sig`; the preferred
+registers read from `ElemScratch`/`ElemRead` defaults so they cannot
+drift) and withholds exactly the register each unsatisfied role will
+look for. Rotation-independent by construction - it consults
+preference lists, never XCACHE_ORDER - which the XROT axis requires
+(a rotation-dependent withhold ate r8 at two rotations).
+
+**Also in this batch:** per-op NET PUSH DEPTH (`trk_pushes` - a path
+that leaks emitted stack aborts at the op boundary; `pop_bytes`
+compensation stubs are exempt, being per-path restores of a shared
+push), and `frag_entry` classified as machinery (its pushes balance
+against frag_ret's teardown, not within an op).
+
+**State after:** -rt 1925/1925 on-arena AND off-arena, in gcc dbg,
+clang dbg, rel-hard (VM_HARDENING=1 OPT=1) and CMake Debug;
+corpus_diff 24/24 plain, all 15 levers, all 8 rotations in BOTH
+arenas; disasmcheck clean in both arenas; driver_checks green;
+non-JIT builds (gate forced 0, g++ + clang) 1925/1925; LTO=0 green.
