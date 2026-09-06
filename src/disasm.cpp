@@ -568,10 +568,16 @@ const char *tag_name(uint64_t imm, const void *ti, const void *tf,
  *
  * The rule, in order:
  *   - a known Type singleton prints as its name;
- *   - a POWER OF TWO prints numerically. Real emitted constants are
- *     bit patterns (0x8000000000000000 for the INT_MIN division check,
- *     masks, strides), and they are deterministic - masking them would
- *     cost readability for no reproducibility gain;
+ *   - a power of two AT OR ABOVE 2^32 prints numerically. Real
+ *     emitted constants are bit patterns (0x8000000000000000 for the
+ *     INT_MIN division check), deterministic - masking them would
+ *     cost readability for no reproducibility gain. BELOW 2^32 the
+ *     exemption is a REPRODUCIBILITY HOLE, found the day it bit: the
+ *     MAP_32BIT arena sometimes lands at exactly 0x40000000, so a
+ *     baked singleton pointer printed as digits in the runs where
+ *     mmap returned a 1GiB-aligned base and as `<addr>` everywhere
+ *     else - the dump differed from ITSELF (vdjcmp's flake detector
+ *     caught it on 69_exc_crossframe, 2026-08-22);
  *   - anything else >= 0x1000 is assumed to be an ADDRESS and prints as
  *     `<addr>`, because its digits vary per process and would make the
  *     dump differ from itself;
@@ -584,7 +590,7 @@ std::string imm_str(int64_t v, const void *ti, const void *tf,
     if (const char *t = tag_name(static_cast<uint64_t>(v), ti, tf, ta))
         return t;
     const uint64_t u = static_cast<uint64_t>(v < 0 ? -v : v);
-    const bool pow2 = u && (u & (u - 1)) == 0;
+    const bool pow2 = u && (u & (u - 1)) == 0 && u >= (1ull << 32);
     if (!vdj_show_addrs() && u >= 0x1000 && !pow2)
         return "<addr>";
     std::ostringstream o;
