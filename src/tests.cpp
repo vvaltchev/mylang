@@ -25920,6 +25920,14 @@ static bool jit_staging_clobber_sweep()
     if (!g_jit_enabled)
         return true;
 
+    /* the ctor case's LIVENESS watch (see the case comment): the
+     * allocator's byte-buffer decision must be CONSUMED - across the
+     * sweep, at least one ctor emission granted a register OTHER than
+     * the r9 preference (r9 is reliably busy in ctor runs; a decorative
+     * alloc_scratch whose result nobody reads would leave this at 0
+     * only if r9 were always granted, which the busy-ness precludes) */
+    const unsigned long bb0 = g_jit_ctor_bb_moved;
+
     auto go = [&](const std::vector<const char *> &src) -> std::string {
         const ExecEngine se = g_exec_engine;
         g_exec_engine = ExecEngine::Vm;
@@ -26021,6 +26029,37 @@ static bool jit_staging_clobber_sweep()
           "try { f(int(runtime(1))); print(\"no-throw\"); }",
           "catch (OutOfBoundsEx) { print(\"oob\"); }" },
         "oob \n" },
+      /* the ctor plan's byte-buffer register: allocator-granted
+       * (prefer r9). A pinned-r9 sabotage CANNOT bite - r9 is reliably
+       * busy in ctor runs (the same occupancy the raw form silently
+       * leaned on, and why the corpus grants r10 here) - so the watch
+       * is LIVENESS, the (an) pattern: the harness asserts
+       * g_jit_ctor_bb_moved grew (the grant is CONSUMED, not
+       * decorative), plus the value oracle across every rotation. */
+      { "ctor plan: allocator-granted byte-buffer register",
+        { "struct P { int a; float b; bool c; }",
+          "func f(int n) {",
+          "    var arr = [3, 5, 7];",
+          "    var t = 0;",
+          "    var h0 = 1; var h1 = 2;",
+          "    var acc = 0.0;",
+          "    var j = 0;",
+          "    while (j < 4000) {",
+          "        h0 += j; h0 += t; h1 += h0; h1 += j;",
+          /* the element read keeps r9 busy at the ctor's emit point
+           * (the elem-role machinery holds it), so the byte-buffer
+           * grant MOVES - which is what the liveness watch requires */
+          "        t += arr[j % 3];",
+          "        var p = P(j + n, float(j) * 0.5, (j & 1) == 0);",
+          "        t += p.a;",
+          "        if (p.c) { t += 1; }",
+          "        acc += p.b;",
+          "        j++;",
+          "    }",
+          "    return t + h0 + h1 + int(acc);",
+          "}",
+          "print(f(int(runtime(1))));" },
+        nullptr },
       { "ord inline: allocator-granted index/data registers",
         { "func f(int n) {",
           "    var s = \"abcdefgh\";",
@@ -26080,6 +26119,11 @@ static bool jit_staging_clobber_sweep()
         }
     }
     g_jit_xrot = rot0;
+    if (ok && g_jit_ctor_bb_moved == bb0) {
+        cout << "  ctor byte-buffer grant never moved off r9 - the"
+             << " allocation is decorative (vacuous conversion?)\n";
+        ok = false;
+    }
     return ok;
 #else
     return true;

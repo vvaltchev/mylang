@@ -53,6 +53,7 @@
 /* struct baked-fast-path execution proof (see jit.h) */
 extern "C" {
 unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
+unsigned long g_jit_ctor_bb_moved = 0;
 unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_divmagic = 0;      /* const-divisor div/mod reduced */
 unsigned long g_jit_boxed_fastf = 0;   /* H6: inline float-float ones */
@@ -1893,6 +1894,35 @@ struct Emitter {
         u8(0x8B);
         u8(static_cast<uint8_t>(0x80 | ((reg & 7) << 3) | (base & 7)));
         u32(static_cast<uint32_t>(d));
+    }
+
+    /* movsd [BASE + disp32], XMM - the ctor plan's float field store,
+     * generalized from the r9-hardcoded `F2 41 0F 11 81` bytes (the
+     * emission is byte-identical for base = r9, xmm0). No GP write, so
+     * no wrote(). rsp/r12 need a SIB byte and are never granted by the
+     * allocator (rsp not allocatable, r12 callee-saved). */
+    void movsd_store_base(uint8_t base, int32_t disp, uint8_t xmm)
+    {
+        ML_CHECK((base & 7) != 4);
+        u8(0xF2);
+        const uint8_t rex = static_cast<uint8_t>(
+            0x40 | (xmm >= 8 ? 4 : 0) | (base >= 8 ? 1 : 0));
+        if (rex != 0x40)
+            u8(rex);
+        u8(0x0F); u8(0x11);
+        u8(static_cast<uint8_t>(0x80 | ((xmm & 7) << 3) | (base & 7)));
+        u32(static_cast<uint32_t>(disp));
+    }
+    /* mov [BASE + disp32], al - the ctor plan's bool byte store
+     * (`41 88 81` for r9, byte-identical). */
+    void store_al_base(uint8_t base, int32_t disp)
+    {
+        ML_CHECK((base & 7) != 4);
+        if (base >= 8)
+            u8(0x41);
+        u8(0x88);
+        u8(static_cast<uint8_t>(0x80 | (base & 7)));
+        u32(static_cast<uint32_t>(disp));
     }
 
     /* movzx DST32, byte [BASE + IDX] (scale 1). REX is emitted only
@@ -15176,7 +15206,29 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             size_t j_done = 0;
             bool have_fast = false;
 
-            /* the field stores off r9 (the instance's byte buffer) -
+            /* #96: the instance byte-buffer register ASKS the allocator
+             * (prefer the legacy r9, so the emission stays byte-identical
+             * while it is free); a run in which r9 is busy gets another
+             * register instead of leaning on that occupancy silently.
+             * Allocation failure skips BOTH fast arms - the planned helper
+             * serves, the same decline the H1 guards take. Freed at every
+             * return path below. */
+            const int rbb = e.alloc_scratch(CAP_MEM_BASE, 1u << R9);
+            /* 0xFF when declined: both fast arms are gated on the
+             * grant, so the value is never emitted */
+            const uint8_t bb = rbb >= 0 ? static_cast<uint8_t>(rbb) : 0xFF;
+#ifdef TESTS
+            /* the LIVENESS watch: a pinned-r9 sabotage cannot bite (r9
+             * is reliably busy in ctor runs - the very occupancy the
+             * raw form silently leaned on), so the sweep test instead
+             * asserts the allocator's decision is CONSUMED: this counts
+             * the grants that MOVED off r9 (emit-time, cost-free). */
+            if (rbb >= 0
+                    && bb != static_cast<uint8_t>(R9))  /* reg:conv */
+                g_jit_ctor_bb_moved++;
+#endif
+
+            /* the field stores off `bb` (the instance's byte buffer) -
              * shared by the guarded path and C4e's established one so
              * the two can never drift */
             const auto emit_ctor_fields = [&]() {
@@ -15190,25 +15242,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                          * spill-homed one; read_slot knows all three
                          * homes (this site consulted creg by hand) */
                         read_slot(e, RAX, pf.src);
-                        /* mov [r9 + off], rax */
-                        e.store_base(RAX, R9, static_cast<int32_t>(pf.off));
+                        e.store_base(RAX, bb, static_cast<int32_t>(pf.off));
                         break;
                     }
                     case 1:               /* float (int/bool promote, r8) */
                         emit_float_load(e, X0, false, 0, pf.src, pc,
                                         /*no_bail=*/true);
-                        /* movsd [r9 + off], xmm0 */
-                        e.u8(0xF2); e.u8(0x41); e.u8(0x0F); e.u8(0x11);
-                        e.u8(0x81); e.u32(static_cast<uint32_t>(pf.off));
+                        e.movsd_store_base(bb, static_cast<int32_t>(pf.off),
+                                           0);
                         break;
                     default:              /* bool byte (payload is 0/1) */
                         /* movzx eax, byte [rdi + payload] */
                         e.wrote(RAX);
                         e.u8(0x0F); e.u8(0xB6); e.u8(MODRM_SLOT);
                         e.u32(static_cast<uint32_t>(s.payload));
-                        /* mov [r9 + off], al */
-                        e.u8(0x41); e.u8(0x88); e.u8(0x81);
-                        e.u32(static_cast<uint32_t>(pf.off));
+                        e.store_al_base(bb, static_cast<int32_t>(pf.off));
                         break;
                     }
                 }
@@ -15222,16 +15270,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * instructions, and no slow tier - the guards were the only
              * thing that could decline.
              */
-            if (L.sobj_ok && old_pc < g_est_pc.size() && g_est_pc[old_pc]) {
+            if (rbb >= 0 && L.sobj_ok
+                    && old_pc < g_est_pc.size() && g_est_pc[old_pc]) {
                 const SlotAddr d = slot_addr(in.target);
                 e.load(RAX, d.payload);        /* rax = StructObject* */
-                /* r9 = bytes data (vector _M_start at +0, probed) */
-                e.load_base(R9, RAX, static_cast<int32_t>(L.sobj_bytes));
+                /* bb = bytes data (vector _M_start at +0, probed) */
+                e.load_base(bb, RAX, static_cast<int32_t>(L.sobj_bytes));
                 emit_ctor_fields();
+                e.free_scratch(static_cast<uint8_t>(rbb));
                 return true;
             }
 
-            if (L.sobj_ok) {
+            if (rbb >= 0 && L.sobj_ok) {
                 have_fast = true;
                 const SlotAddr d = slot_addr(in.target);
                 e.load(RAX, d.type);
@@ -15254,8 +15304,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 #ifdef TESTS
                 e.bump_counter(&g_jit_ctor_fast);
 #endif
-                /* r9 = bytes data (vector _M_start at +0, probed) */
-                e.load_base(R9, RAX, static_cast<int32_t>(L.sobj_bytes));
+                /* bb = bytes data (vector _M_start at +0, probed) */
+                e.load_base(bb, RAX, static_cast<int32_t>(L.sobj_bytes));
                 emit_ctor_fields();
                 j_done = e.j32(0xEB);
                 e.patch32_here(js1);
@@ -15282,6 +15332,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_call_epilogue(e);
             if (have_fast)
                 e.patch32_here(j_done);
+            if (rbb >= 0)
+                e.free_scratch(static_cast<uint8_t>(rbb));
             return true;
         }
     }
