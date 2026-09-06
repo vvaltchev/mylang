@@ -7430,19 +7430,38 @@ three engines (verified) and the COW non-detach agrees engine-wise.
 **The JIT split, deliberate:** the BITWISE three inline like plus -
 op_rr2 already encodes and/or/xor, no new guards (non-throwing, bool
 storage compile-unreachable) - in BOTH the hoisted (C1e) and ordinary
-inline arms. The SHIFT three DECLINE the inline arm at emit time and
-run the helper (`jit_store_elem_int`, the interpreter's exact body): a
-reg-count shift wants the rcx shift core plus a runtime negative-count
-decline, machinery the helper gets free. An emitted inline shift arm is
-a possible later increment; measure reach first.
+inline arms. A SHIFT inlines only with a NON-NEGATIVE LITERAL count
+(the imm8 arm, added 2026-08-21 as the follow-up increment): it then
+cannot throw, and saturation is an EMIT-time decision - c >= 64
+becomes zero_reg32 (shl/ushr) or `sar reg, 63` (shr), c == 0 emits
+nothing, exactly the two-address IntShlRI treatment. A REG-count
+shift (and a negative literal) still DECLINES to the helper
+(`jit_store_elem_int`, the interpreter's exact body): the reg form
+wants the rcx shift core plus a runtime negative-count decline
+ordered BEFORE the COW prep, machinery the helper gets free.
 
 **Proof (three counters, because a value oracle cannot tell the flat
-helper from the boxed fallback):** the tier test's new bitwise case
-pins `fast_exact = 56` (32 fills + 24 bitwise, ALL inline);
-`jit_store_elem_shift_helper` pins g_jit_store_fast == 32 (fills only)
+helper from the boxed fallback):** the tier test's bitwise case pins
+`fast_exact = 56` (32 fills + 24 bitwise, ALL inline); the
+literal-shift case pins `fast_exact = 72` (32 + 8*5, covering normal
+counts, the c >= 64 saturation and c == 0, values reseeded per
+iteration so the zeroing cannot make them vacuous);
+`jit_store_elem_shift_helper` (REG-count shifts, its argument
+runtime()-wrapped because a literal arg SPECIALIZES the function and
+folds the counts to literals - the vacuous-test trap's shape-eater #6,
+watched doing exactly that) pins g_jit_store_fast == 32 (fills only)
 AND `g_jit_op_run[StoreElemInt] == 24` - the helpers now bump their
 per-op counter (they did not before), which is what makes "the shifts
 were LOWERED flat and executed the flat helper" assertable at all.
 WATCHED: reverting the codegen admission leaves every value right and
-fails the helper-count fact; dropping bitwise from the inline admission
-fails fast_exact 56 (each sabotage run separately, committed tree).
+fails the helper-count fact; dropping bitwise from the inline
+admission fails fast_exact 56; dropping the literal-shift admission
+fails fast_exact 72 (each sabotage run separately, committed tree).
+
+**Bench reach (new, 2026-08-21):** NO bench contained ANY compound
+element store - not even `a[i] +=` - so the whole #92/#95 compound arm
+had zero bench reach. `86_elem_arith_compound` (+= -= *= /= %=, values
+kept non-negative so truncating and flooring division agree with the
+Python twin) and `87_elem_shift_compound` (<<= >>= >>>= &= |= ^= with
+literal counts, values masked below 2^60 so `>>>` equals Python's `>>`
+and `<<` never wraps) close it, with .py and .cpp twins.

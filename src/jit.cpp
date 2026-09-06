@@ -12275,18 +12275,26 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     const bool compound = aop != Op::invalid;
     const bool divmod = aop == Op::div || aop == Op::mod;
     const bool bitw = aop == Op::band || aop == Op::bor || aop == Op::bxor;
+    const bool shift = aop == Op::shl || aop == Op::shr || aop == Op::ushr;
 
     /* The compound emit-time refusals FIRST (they hold for the hoisted
      * arm too - a refused shape takes the full helper either way).
      * The BITWISE compounds (&= |= ^=) inline like plus - non-throwing,
      * op_rr2 encodes them, int storage only (a float target is
-     * compile-unreachable: bitwise is int-only). The SHIFT compounds
-     * stay on the helper: a reg-count shift needs the rcx shift core +
-     * a runtime negative-count decline, machinery the helper (the
-     * interpreter's exact body, negshift thrower included) gets free. */
+     * compile-unreachable: bitwise is int-only). A SHIFT compound
+     * inlines only with a NON-NEGATIVE LITERAL count - then it cannot
+     * throw and the saturation is an emit-time decision (>= 64 becomes
+     * zero_reg32 / sar 63, 0 emits nothing, like the two-address
+     * IntShlRI arm). A REG-count shift declines to the helper: it needs
+     * the rcx shift core + a runtime negative-count decline ordered
+     * BEFORE the COW prep (a throwing store must not clone), machinery
+     * the helper (the interpreter's exact body) gets free. A NEGATIVE
+     * literal declines too - the helper's negshift thrower owns it. */
     if (compound) {
         if (aop != Op::plus && aop != Op::minus && aop != Op::times
-            && !divmod && !(bitw && !is_float))
+            && !divmod && !((bitw || shift) && !is_float))
+            return false;
+        if (shift && (!in.b_is_lit() || in.b_lit() < 0))
             return false;
         if (is_float && aop == Op::mod)
             return false;                       /* fmod: helper */
@@ -12297,6 +12305,28 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             && in.b_flit() == 0.0)
             return false;
     }
+
+    /* The literal-count shift on the element register (count >= 0 by the
+     * admission above): 0 emits nothing, >= 64 saturates, else one imm8
+     * shift - `>>` arithmetic (sar), `>>>` logical (shr). */
+    const auto imm_shift = [&](uint8_t reg) {
+        const int_type c = in.b_lit();
+        if (c == 0)
+            return;
+        if (c >= 64) {
+            if (aop == Op::shr)
+                e.sar_rr_imm8(reg, 63);          /* full sign-fill */
+            else
+                e.zero_reg32(reg);               /* shl / ushr -> 0 */
+            return;
+        }
+        if (aop == Op::shl)
+            e.shl_rr_imm8(reg, static_cast<uint8_t>(c));
+        else if (aop == Op::shr)
+            e.sar_rr_imm8(reg, static_cast<uint8_t>(c));
+        else
+            e.shr_rr_imm8(reg, static_cast<uint8_t>(c));
+    };
 
     /*
      * C1b: the HOISTED store - the preheader proved the base AND the
@@ -12388,6 +12418,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                 else
                     /* remainder */
                     e.store_elem_q(sc.data, sc.idx, sc.count);
+            } else if (shift) {
+                e.load_elem_q(sc.obj, sc.data, sc.idx);
+                imm_shift(sc.obj);
+                e.store_elem_q(sc.data, sc.idx, sc.obj);
             } else {
                 e.load_elem_q(sc.obj, sc.data, sc.idx);
                 e.op_rr2(aop, sc.obj, sc.val);
@@ -12502,6 +12536,11 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             else
                 /* remainder */
                 e.store_elem_q(sc.data, sc.idx, sc.count);
+            return;
+        case Op::shl: case Op::shr: case Op::ushr:
+            e.load_elem_q(sc.obj, sc.data, sc.idx);
+            imm_shift(sc.obj);
+            e.store_elem_q(sc.data, sc.idx, sc.obj);
             return;
         default:
             e.load_elem_q(sc.obj, sc.data, sc.idx);
