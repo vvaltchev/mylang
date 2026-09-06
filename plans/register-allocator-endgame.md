@@ -253,7 +253,26 @@ denies at least one more register). CONVERTED: the rcx per-op shift
 scan in jit_xcache_busy is DELETED - the RR-shift's raw CL load
 evicts a pinned rcx itself (the WATCHED 13-pin `sb += sa >> k` shape
 now takes conflict->retry and emits identically; vdjcmp 116/116).
-STILL STANDING, the last per-register whitelist: run_may_pin_rdx.
+[DONE 2026-08-22] run_may_pin_rdx IS DELETED - see below; nothing
+of the whitelist class remains for GP registers.
+THE THREE FINDINGS its deletion flushed, each caught by a net in
+minutes (the tracker, -rt's store-tier value tests, the nolowmem
+rotation sweep):
+ 1. elem_scratch_plan never picked COUNT - literal rdx, covered by
+    the whitelist; picking it broke an implicit count==rdx remainder
+    dependence AND ate a reservation candidate (two watched value
+    failures) - so count STAYS rdx and the store tiers claim rdx at
+    ENTRY via the conflict seam instead;
+ 2. the deny bit DOUBLED as a GRANT filter (the r8 lesson verbatim):
+    un-denying rdx let ordinary grants return it, and div_magic's
+    keep died at the imul two instructions later (a wrong `k % 2`,
+    watched live at ZERO pins). Every ask whose value must survive
+    cqo/idiv/imul now EXCLUDES rdx (hold gained an exclude param);
+    cqo/idiv_reg/imul_reg are SELF-DECLARING encoders (they call the
+    conflict seam at the one place the ISA claim is made);
+ 3. the ctx-chain table fallback's "refusal implies no pin" argument
+    broke under all-pinned pressure - it evicts now.
+Old whitelist text (for the record):
 Deleting it = every raw rdx writer calls the seam or asks - the BIG
 one is the element tiers' ElemRead/ElemScratch role registers
 (count=RDX, data=RCX conv defaults used raw across the tiers), plus

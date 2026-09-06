@@ -7636,3 +7636,28 @@ emission, structurally derived: vdjcmp 116/116, the xrot matrix
 green. run_may_pin_rdx is the last per-register whitelist standing;
 its deletion plan (the element-tier role registers + the div arms)
 is in plans/register-allocator-endgame.md B2c.
+
+## Endgame B2c-rdx (2026-08-22) - run_may_pin_rdx, the LAST
+## per-register whitelist, is DELETED
+
+rdx is optimistic now. Every raw claimant participates: the div arms
+and both store tiers call the conflict seam at entry; cqo/idiv_reg/
+imul_reg are SELF-DECLARING (the encoder calls reg_pin_conflict at
+the one place the ISA claim is made, covering every present and
+future emitter); the ctx-chain table fallback evicts (its "refusal
+implies no pin" argument broke under all-pinned pressure); and every
+ask whose value must survive cqo/idiv/imul EXCLUDES rdx (hold gained
+an exclude parameter; div_magic's keep - which DIED at the imul two
+instructions after a grant returned rdx, a wrong `k % 2` watched
+live at zero pins - is the case that proved the deny bit had been
+doubling as a grant filter, the r8 lesson verbatim). One deliberate
+non-conversion: elem_scratch_plan's COUNT stays literal rdx - the
+remainder handling depends on count==rdx post-idiv, and picking it
+also ate a reservation candidate (two watched value failures); the
+tiers claim rdx at entry instead.
+
+MEASURED: 88/116 byte-identical; 27 programs drift by pure grant
+substitution (ties that broke to rsi now break to rdx - counts equal
+program by program); 43_sieve drops SIX instructions (rdx pinning
+gained it a register). -rt 1946/1946 both arenas; corpus + xrot
+green; gate at zero floors.
