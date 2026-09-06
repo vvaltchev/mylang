@@ -4216,3 +4216,82 @@ keeping rax out of the pin pool - ra.busy now carries the same truth
 structurally. Retiring them (and letting rax pin generally) is #101-
 adjacent work; the alt-grant and reuse arms are already in place for
 the day the gates die.
+
+## (bc) 2026-08-22 - THE MAINTAINER WIDENS THE MANDATE: the endgame is
+## IN scope, rax-as-policy is out, and the target is a C-compiler-class
+## allocator (live ranges, splitting - one variable, many registers)
+
+The maintainer's words: the three endgame steps must be done before
+other tasks; asking FOR rax is still not OK without a hard reason
+(ABI return, encoding); pinning must become TEMPORARY - "the same
+variable MUST be able to use multiple registers (if needed) even in
+the same basic block"; the bar is what a C compiler does with a
+10000-line function. And: enumerate everything else of the same kind.
+
+THE HONEST SAME-KIND INVENTORY (what is still a static table or a
+fixed convention, beyond run_may_pin_rax + the coverage gate):
+
+ 1. run_needs_float_tag + the rsi/r8 SINGLETON RESERVATIONS
+    (jit_xcache_busy): rsi excluded from the pool UNCONDITIONALLY,
+    r8 by another run-scanning opcode gate - the same audited-table
+    class as run_may_pin_rax, one register over.
+ 2. THE ENTIRE FLOAT SIDE. The model (caps/weights/take/census) is
+    GP-only: xmm0/xmm1 are hardcoded per-op scratch in every float
+    emitter, xmm4-xmm7 are a fixed fcache pool, and the census never
+    counted xmm at all - the mandate's blind spot, not a finished
+    corner.
+ 3. The FWD BUS residue: res_reg defaults to rax (the tagged conv
+    line), producers PAY A MOV into the bus instead of declaring
+    their pin (mov rax, r14 before every forwarded consume), and
+    lever A's pairing guard statically declines rax-pinned runs.
+ 4. The fixed PREFERENCE ORDERS and legacy prefer masks: CACHE_REGS
+    {r12..r15}, XCACHE_ORDER, ELEM_CAND, and every ask site's
+    prefer-the-old-register discount (a byte-identity transition
+    device, not a cost model). "Preference order hides the tail" is
+    already a recorded lesson (r9).
+ 5. The C1/C2b HOIST register claims (the fixed rdata/rcount pair and
+    its r10/r11 clobber mask) - regions should ask like everything
+    else.
+ 6. THE WHOLE-RUN PICK ITSELF (pick_cached_slots): one slot = one
+    register for the entire run, ranked by whole-run counts,
+    qualified by the audited bad()-rules, no splitting, no per-pc
+    assignment - the structural opposite of the C-compiler model the
+    maintainer named. Its bad()-rules and the pin contract are
+    themselves opcode-classified tables.
+ 7. Every reg:conv TAG is by definition a deferred conversion - the
+    census's justified column doubles as the worklist: grep reg:conv
+    and re-litigate each under the new bar (isa/abi stay; conv
+    shrinks to genuine fragment-wide protocol).
+
+Structurally reserved and STAYING (hard reasons): rsp, rbx (the slot
+window base), rbp (frame anchor), the SysV argument/return registers
+at call boundaries, CL for variable shifts, rax:rdx for
+idiv/imul/cqo, the low-8 setcc forms.
+
+THE PHASE PLAN:
+ A. THE RAX ENDGAME (approved): a force lever that puts rax first in
+    the pool (the xrot philosophy) so the alt-grant + reuse arms and
+    the bus-declaration paths RUN under the whole net; then the pick
+    treats rax as an ordinary member; then run_may_pin_rax + the
+    coverage gate are DELETED.
+ B. THE SAME-KIND SWEEP: retire run_needs_float_tag + the rsi/r8
+    reservations through the existing tag seams; producers declare
+    their landing register (delete the bus mov); relax the pairing
+    guard.
+ C. THE FLOAT MANDATE: extend caps/weights/take + the census to xmm;
+    fcache and the X0/X1 scratch become asks; the ratchet governs
+    xmm the way it governs GP.
+ D. THE INTERVAL ALLOCATOR: live intervals from jit_slot_liveness
+    (built in #96 inc-0 - the dataflow already exists), linear scan
+    WITH SPLITTING (per-pc assignment map replaces creg()/the cache
+    vectors; moves emitted at split points; every exit flushes the
+    assignment AT THAT PC), spill homes as the spill substrate,
+    rematerialization for literals. The whole-run pick and its
+    bad()-tables retire into interval constraints. #101 (peephole/
+    scheduling) sits on top of D, not beside it.
+
+FOUNDATIONS ALREADY IN PLACE, which is why this is feasible: the
+emitters are fully threaded (#96 - ops consume register VALUES),
+jit_slot_liveness computes livein/liveout per pc, the spill-home
+machinery exists, take/free + the tracker police occupancy, and
+vdjcmp/xrot/the nets are the oracles.
