@@ -220,7 +220,21 @@ alive behind the deleted gates' semantics until D. Prefer (O).
  - Oracle: the nolowmem lane is THE net for the off-arena half
    (vacuity-guarded both directions already).
 
-### B2. The fwd bus declares instead of moving
+### B2. The fwd bus declares instead of moving  [LANDED 2026-08-22]
+RESULT, measured honestly: pure mov MIGRATION, zero net Ir - the
+corpus's forwarded pin consumers are all DESTRUCTIVE (accumulator
+chains compute INTO the bus value), so the copy the producer no
+longer pays is owed at the consumer instead (21 programs drift by
+instruction POSITION, every count equal). The value is STRUCTURAL:
+res_reg is declared state now, which D's arbitrary-register
+producers require, and no consumer may assume the bus was moved to
+rax (the read-only consumers - op_rr2/spill/mem - take the pin
+directly the day one appears). The div consumers copy a non-rax bus
+value into rax (ISA); the destructive consumers guard with
+reg_holds_pin. ALSO in this batch: the Phase A gap - IntModRI /
+IntAddModRI write rax raw under reg:isa with no ask and no bracket,
+so they call rax_pin_conflict() themselves.
+
  - Producers with a pinned result set g_fwd.res_reg = <pin> and stop
    emitting `mov rax, d` (the publisher move) - consumers already
    read emit_fwd_bump's return. This DELETES an instruction per
@@ -231,6 +245,16 @@ alive behind the deleted gates' semantics until D. Prefer (O).
  - jit_fwd_deadtemp + the fwd family-coverage test adapt; remember
    the lesson "a test derived from a table cannot find a hole in
    that table" - assert on the DECLARED register, not on rax.
+
+### B2b. AUDIT ITEM found during B2 (pre-existing, not Phase A's):
+the IntShlRR/IntShrRR case's raw `read_slot(e, RCX, ...)` (reg:isa,
+the CL count) writes rcx with no ask - rcx has been PINNABLE since
+the xcache widening, so a 9+-pin run containing a reg-count shift
+would clobber a pin (tracker-caught in TESTS builds only). Fix like
+the ModRI evict: an rcx conflict seam, or route through
+hold(CAP_SHIFT_CNT) which already exists. Same class: any reg:isa
+raw write whose register is pool-admitted needs an ask-or-evict.
+Sweep ALL reg:isa sites for this when B2 lands.
 
 ### B3. The hoist/C2b claims become recorded grants
  - The region's rdata/rcount pair: allocate through take() at region
