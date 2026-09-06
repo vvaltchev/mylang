@@ -15670,22 +15670,35 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * value - neither is a pc). Never throws. */
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::SetPend);
+        /* #96: the pend-slot cursor ASKS the allocator (prefer the
+         * legacy rdx); refused -> a bracketed push of rdx. The window
+         * is straight-line (no decline edge crosses the push), and the
+         * pop lands right after the cursor's last use. */
+        const int rp = e.alloc_scratch(CAP_MEM_BASE, 1u << RDX);
+        const bool rpush = rp < 0;
+        const uint8_t pr = rpush ? static_cast<uint8_t>(RDX)
+                                 : static_cast<uint8_t>(rp);
+        if (rpush)
+            e.push_reg(RDX);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         /* = &back_rec */
         hold();
         e.load_base(RCX, RAX, static_cast<int32_t>(L.act_top_rec));
-        /* mov edx, [rcx+pbase] */
-        e.load32_base(RDX, RCX, static_cast<int32_t>(L.rec_pend_base));
+        e.load32_base(pr, RCX, static_cast<int32_t>(L.rec_pend_base));
         drop();                            /* the cursor is consumed */
         if (in.a_lit()) {
-            e.add_reg32_imm32(RDX, static_cast<uint32_t>(in.a_lit()));
+            e.add_reg32_imm32(pr, static_cast<uint32_t>(in.a_lit()));
         }
         ML_CHECK(L.pend_state_size == 16);
-        e.shl_rr_imm8(RDX, 4);   /* shl rdx, 4 */
+        e.shl_rr_imm8(pr, 4);
         /* _M_start */
         e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
-        e.add_rr(RAX, RDX);
+        e.add_rr(RAX, pr);
+        if (rpush)
+            e.pop_reg(RDX);
+        else
+            e.free_scratch(static_cast<uint8_t>(rp));
         e.store_byte_base_imm(
             RAX, static_cast<int32_t>(L.pend_state_pend),
             static_cast<uint8_t>(in.target));
@@ -15703,22 +15716,33 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * (a = the region id, #78.) */
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::EndFinally);
+        /* #96: same as SetPend - the pop lands after the cursor's last
+         * use and BEFORE the j_norm branch, so no edge crosses it. */
+        const int rp = e.alloc_scratch(CAP_MEM_BASE, 1u << RDX);
+        const bool rpush = rp < 0;
+        const uint8_t pr = rpush ? static_cast<uint8_t>(RDX)
+                                 : static_cast<uint8_t>(rp);
+        if (rpush)
+            e.push_reg(RDX);
         e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
         e.load_base0(RAX, RAX);        /* mov rax, [rax] */
         /* = &back_rec */
         hold();
         e.load_base(RCX, RAX, static_cast<int32_t>(L.act_top_rec));
-        /* mov edx, [rcx+pbase] */
-        e.load32_base(RDX, RCX, static_cast<int32_t>(L.rec_pend_base));
+        e.load32_base(pr, RCX, static_cast<int32_t>(L.rec_pend_base));
         drop();                            /* the cursor is consumed */
         if (in.a_lit()) {
-            e.add_reg32_imm32(RDX, static_cast<uint32_t>(in.a_lit()));
+            e.add_reg32_imm32(pr, static_cast<uint32_t>(in.a_lit()));
         }
         ML_CHECK(L.pend_state_size == 16);
-        e.shl_rr_imm8(RDX, 4);   /* shl rdx, 4 */
+        e.shl_rr_imm8(pr, 4);
         /* mov rax, [rax+pends] */
         e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
-        e.add_rr(RAX, RDX);
+        e.add_rr(RAX, pr);
+        if (rpush)
+            e.pop_reg(RDX);
+        else
+            e.free_scratch(static_cast<uint8_t>(rp));
         e.cmp_byte_base(RAX, static_cast<int32_t>(L.pend_state_pend), 0);
         /* rel32: the cold arm below is far bigger than a short jump's
          * reach (emit_exc_stamp alone exceeds it). */
