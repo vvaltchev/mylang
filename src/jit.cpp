@@ -1947,15 +1947,21 @@ struct Emitter {
         u8(static_cast<uint8_t>(0x80 | ((xmm & 7) << 3) | (base & 7)));
         u32(static_cast<uint32_t>(disp));
     }
-    /* mov [BASE + disp32], al - the ctor plan's bool byte store
-     * (`41 88 81` for r9, byte-identical). */
-    void store_al_base(uint8_t base, int32_t disp)
+    /* mov [BASE + disp32], <src lo8> - the ctor plan's bool byte
+     * store (#96: the source is an argument; the rax-fixed
+     * store_al_base is deleted). REX only when needed - a bare REX
+     * for sil/dil/spl/bpl, the extension bits for src/base >= 8 - so
+     * the legacy al spelling stays byte-identical. */
+    void store_lo8_base(uint8_t src, uint8_t base, int32_t disp)
     {
         ML_CHECK((base & 7) != 4);
-        if (base >= 8)
-            u8(0x41);
+        uint8_t rex = 0x40;
+        if (src >= 8)  rex |= 0x04;
+        if (base >= 8) rex |= 0x01;
+        if (rex != 0x40 || (src >= 4 && src < 8))
+            u8(rex);
         u8(0x88);
-        u8(static_cast<uint8_t>(0x80 | (base & 7)));
+        u8(static_cast<uint8_t>(0x80 | ((src & 7) << 3) | (base & 7)));
         u32(static_cast<uint32_t>(disp));
     }
 
@@ -15508,6 +15514,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 g_jit_ctor_bb_moved++;
 #endif
 
+            /* the staging window for the whole ctor emit (a ctor
+             * run is never rax-pinned, so the take cannot refuse) */
+            AccScratch acc(e);
             /* the field stores off `bb` (the instance's byte buffer) -
              * shared by the guarded path and C4e's established one so
              * the two can never drift */
@@ -15521,8 +15530,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                          * N5-pinned loop counter - or, #96 inc-1, a
                          * spill-homed one; read_slot knows all three
                          * homes (this site consulted creg by hand) */
-                        read_slot(e, RAX, pf.src);
-                        e.store_base(RAX, bb, static_cast<int32_t>(pf.off));
+                        read_slot(e, acc.r, pf.src);
+                        e.store_base(acc.r, bb,
+                                     static_cast<int32_t>(pf.off));
                         break;
                     }
                     case 1:               /* float (int/bool promote, r8) */
@@ -15532,11 +15542,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                            0);
                         break;
                     default:              /* bool byte (payload is 0/1) */
-                        /* movzx eax, byte [rdi + payload] */
-                        e.wrote(RAX);
-                        e.u8(0x0F); e.u8(0xB6); e.u8(MODRM_SLOT);
+                        /* movzx acc32, byte [slots + payload] -
+                         * the raw disp32 form on purpose: the modrm
+                         * helper would shorten a small displacement
+                         * and the batch is a pure restructuring */
+                        e.wrote(acc.r);
+                        if (acc.r >= 8)
+                            e.u8(0x44);
+                        e.u8(0x0F); e.u8(0xB6);
+                        e.u8(static_cast<uint8_t>(
+                                 MODRM_SLOT | ((acc.r & 7) << 3)));
                         e.u32(static_cast<uint32_t>(s.payload));
-                        e.store_al_base(bb, static_cast<int32_t>(pf.off));
+                        e.store_lo8_base(acc.r, bb,
+                                         static_cast<int32_t>(pf.off));
                         break;
                     }
                 }
@@ -15553,9 +15571,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (rbb >= 0 && L.sobj_ok
                     && old_pc < g_est_pc.size() && g_est_pc[old_pc]) {
                 const SlotAddr d = slot_addr(in.target);
-                e.load(RAX, d.payload);        /* rax = StructObject* */
+                e.load(acc.r, d.payload);        /* rax = StructObject* */
                 /* bb = bytes data (vector _M_start at +0, probed) */
-                e.load_base(bb, RAX, static_cast<int32_t>(L.sobj_bytes));
+                e.load_base(bb, acc.r, static_cast<int32_t>(L.sobj_bytes));
                 emit_ctor_fields();
                 e.free_scratch(static_cast<uint8_t>(rbb));
                 return true;
@@ -15564,33 +15582,33 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (rbb >= 0 && L.sobj_ok) {
                 have_fast = true;
                 const SlotAddr d = slot_addr(in.target);
-                e.load(RAX, d.type);
+                e.load(acc.r, d.type);
                 {
                     RefScratch rt(e, RCX);
-                    e.cmp_reg_tag_via(RAX, L.t_struct, rt.sc);
+                    e.cmp_reg_tag_via(acc.r, L.t_struct, rt.sc);
                     rt.release();          /* before the edge */
                 }
                 const size_t js1 = e.j32(0x75);
-                e.load(RAX, d.payload);           /* rax = StructObject* */
+                e.load(acc.r, d.payload);           /* rax = StructObject* */
                 RefScratch rd(e, RCX);
                 e.movabs(rd.sc, reinterpret_cast<uint64_t>(
                                     ck.struct_defs[in.target2]));
-                e.cmp_base_reg(RAX, static_cast<int32_t>(L.sobj_def),
+                e.cmp_base_reg(acc.r, static_cast<int32_t>(L.sobj_def),
                                rd.sc);
                 rd.release();
                 const size_t js2 = e.j32(0x75);
                 /* cmp dword [rax + sobj_rc], 1  (use_count == 1) */
                 e.cmp_dword_base_imm8(
-                    RAX, static_cast<int32_t>(L.sobj_rc), 1);
+                    acc.r, static_cast<int32_t>(L.sobj_rc), 1);
                 const size_t js3 = e.j32(0x75);
                 /* cmp byte [rax + sobj_ro], 0  (not readonly) */
-                e.cmp_byte_base(RAX, static_cast<int32_t>(L.sobj_ro), 0);
+                e.cmp_byte_base(acc.r, static_cast<int32_t>(L.sobj_ro), 0);
                 const size_t js4 = e.j32(0x75);
 #ifdef TESTS
                 e.bump_counter(&g_jit_ctor_fast);
 #endif
                 /* bb = bytes data (vector _M_start at +0, probed) */
-                e.load_base(bb, RAX, static_cast<int32_t>(L.sobj_bytes));
+                e.load_base(bb, acc.r, static_cast<int32_t>(L.sobj_bytes));
                 emit_ctor_fields();
                 j_done = e.j32(0xEB);
                 e.patch32_here(js1);
@@ -15885,18 +15903,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const JitLayout &L = jit_layout();
         const uint32_t region = static_cast<uint32_t>(in.a_lit());
         e.bump_op(OpCode::PushHandler);
-        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        e.load_base0(RAX, RAX);        /* mov rax, [rax] (act) */
+        AccScratch acc(e);
+        e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_act));
+        e.load_base0(acc.r, acc.r);        /* mov rax, [rax] (act) */
         hold();
         /* finish */
-        e.load_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        e.load_base(tmp, acc.r, static_cast<int32_t>(L.act_handlers + 8));
         /* end cap */
-        e.cmp_reg_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 16));
+        e.cmp_reg_base(tmp, acc.r, static_cast<int32_t>(L.act_handlers + 16));
         const bool wp = tmp_pushed;
         const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
         e.store_dword_base_imm32(tmp, 0, region);
         e.op_reg_imm(Op::plus, tmp, 4);
-        e.store_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        e.store_base(tmp, acc.r, static_cast<int32_t>(L.act_handlers + 8));
         drop();
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_grow);
@@ -15923,12 +15942,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * PopHandler by codegen construction). Never throws. */
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::PopHandler);
-        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        e.load_base0(RAX, RAX);        /* mov rax, [rax] */
+        AccScratch acc(e);
+        e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_act));
+        e.load_base0(acc.r, acc.r);        /* mov rax, [rax] */
         hold();
-        e.load_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        e.load_base(tmp, acc.r, static_cast<int32_t>(L.act_handlers + 8));
         e.op_reg_imm(Op::minus, tmp, 4);
-        e.store_base(tmp, RAX, static_cast<int32_t>(L.act_handlers + 8));
+        e.store_base(tmp, acc.r, static_cast<int32_t>(L.act_handlers + 8));
         drop();
         return true;
     }
@@ -15940,6 +15960,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * value - neither is a pc). Never throws. */
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::SetPend);
+        AccScratch acc(e);
         /* #96: the pend-slot cursor ASKS the allocator (prefer the
          * legacy rdx); refused -> a bracketed push of rdx. The window
          * is straight-line (no decline edge crosses the push), and the
@@ -15950,11 +15971,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                  : static_cast<uint8_t>(rp);
         if (rpush)
             e.push_reg(RDX);  /* reg:conv */
-        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        e.load_base0(RAX, RAX);        /* mov rax, [rax] */
+        e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_act));
+        e.load_base0(acc.r, acc.r);        /* mov rax, [rax] */
         /* = &back_rec */
         hold();
-        e.load_base(tmp, RAX, static_cast<int32_t>(L.act_top_rec));
+        e.load_base(tmp, acc.r, static_cast<int32_t>(L.act_top_rec));
         e.load32_base(pr, tmp, static_cast<int32_t>(L.rec_pend_base));
         drop();                            /* the cursor is consumed */
         if (in.a_lit()) {
@@ -15963,14 +15984,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         ML_CHECK(L.pend_state_size == 16);
         e.shl_rr_imm8(pr, 4);
         /* _M_start */
-        e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
-        e.add_rr(RAX, pr);
+        e.load_base(acc.r, acc.r, static_cast<int32_t>(L.act_pends));
+        e.add_rr(acc.r, pr);
         if (rpush)
             e.pop_reg(RDX);  /* reg:conv */
         else
             e.free_scratch(static_cast<uint8_t>(rp));
         e.store_byte_base_imm(
-            RAX, static_cast<int32_t>(L.pend_state_pend),
+            acc.r, static_cast<int32_t>(L.pend_state_pend),
             static_cast<uint8_t>(in.target));
         return true;
     }
@@ -15986,6 +16007,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * (a = the region id, #78.) */
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::EndFinally);
+        AccScratch acc(e);
         /* #96: same as SetPend - the pop lands after the cursor's last
          * use and BEFORE the j_norm branch, so no edge crosses it. */
         const int rp = e.alloc_scratch(CAP_MEM_BASE, 1u << RDX);
@@ -15994,11 +16016,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                  : static_cast<uint8_t>(rp);
         if (rpush)
             e.push_reg(RDX);  /* reg:conv */
-        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        e.load_base0(RAX, RAX);        /* mov rax, [rax] */
+        e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_act));
+        e.load_base0(acc.r, acc.r);        /* mov rax, [rax] */
         /* = &back_rec */
         hold();
-        e.load_base(tmp, RAX, static_cast<int32_t>(L.act_top_rec));
+        e.load_base(tmp, acc.r, static_cast<int32_t>(L.act_top_rec));
         e.load32_base(pr, tmp, static_cast<int32_t>(L.rec_pend_base));
         drop();                            /* the cursor is consumed */
         if (in.a_lit()) {
@@ -16007,13 +16029,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         ML_CHECK(L.pend_state_size == 16);
         e.shl_rr_imm8(pr, 4);
         /* mov rax, [rax+pends] */
-        e.load_base(RAX, RAX, static_cast<int32_t>(L.act_pends));
-        e.add_rr(RAX, pr);
+        e.load_base(acc.r, acc.r, static_cast<int32_t>(L.act_pends));
+        e.add_rr(acc.r, pr);
         if (rpush)
             e.pop_reg(RDX);  /* reg:conv */
         else
             e.free_scratch(static_cast<uint8_t>(rp));
-        e.cmp_byte_base(RAX, static_cast<int32_t>(L.pend_state_pend), 0);
+        e.cmp_byte_base(acc.r, static_cast<int32_t>(L.pend_state_pend), 0);
         /* rel32: the cold arm below is far bigger than a short jump's
          * reach (emit_exc_stamp alone exceeds it). */
         const size_t j_norm = e.j32(0x74);  /* je -> the NORMAL fall-through */
