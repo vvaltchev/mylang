@@ -4016,3 +4016,91 @@ Census: RCX 0, TOTAL 460. 35 corpus programs drift (substitution /
 dropped push-pops); Ir 83_regs +0.001%, 14_array +0.05%,
 09_fib +0.11% (scale-1, compile-share heavy). ONLY RAX (455)
 REMAINS - the staging convention.
+
+## (az) 2026-08-22 - THE RAX MAP: what the last 455 occurrences ARE,
+## and the batch plan for the finale
+
+The census names 455 UNJUSTIFIED RAX occurrences over 376 source
+lines. Read site by site, they fall into four clusters:
+
+### Cluster A - the HELPER-CALL PROTOCOL (~110 occurrences): reg:abi
+
+Every `e.test32_rr(RAX, RAX)` after a `call` (53 lines) is the SysV
+status test - the C++ helper RETURNS in rax, and the register is the
+ABI's choice, not ours. The result-consumption moves right after
+`emit_call_epilogue` (`mov_rr(dst, RAX)`, a store of rax to the dst
+slot) are the same fact one instruction later. Hard reason:
+calling convention. TAG, never convert.
+
+### Cluster B - the FRAGMENT ENTRY/EXIT + TRAMPOLINE PROTOCOL
+### (~40 occurrences): reg:abi / reg:conv(fn)
+
+The `movabs(RAX, fn); jmp_reg(RAX)` relocation thunks (no allocator
+context exists there - the stub runs with every caller-saved register
+dead), the EnterNative status/resume-pc protocol (the fragment
+RETURNS its resume pc in rax - the fragment ABI), the raise-path
+status returns. Hard reason: the documented fragment ABI.
+
+### Cluster C - ISA residue (small): reg:isa
+
+cqo/idiv/imul rax:rdx halves not already tagged in the div batches.
+NOTE `movq_rax_x`/`mov_byte_rax_imm`/`cmp_byte_rax` are NOT ISA -
+despite the names, they take rax as an ordinary operand/base (the
+AL-short-form encodings are not used); those are cluster D and the
+encoder names will need the lo8-style rename treatment if threaded.
+
+### Cluster D - THE ACCUMULATOR (~280-300 occurrences): CONVERT
+
+emit_op (180 lines), emit_branch (38), the element tiers (~40), the
+C1 hoist preamble, exc_stamp, div_magic's quotient path: rax as the
+staging bus - read_slot/load_operand into rax, arithmetic on rax,
+tag compares of rax, object navigation through rax as memory base,
+store_dst/write_slot from rax.
+
+FIVE FACTS that shape the conversion, all verified in-source:
+
+ 1. rax is CAP_ALLOCATABLE, weight 2 (the cheapest caller-saved
+    tier) - the model can already reason about it.
+ 2. `ra.denied` bit 0 is set for every run that fails
+    run_may_pin_rax - i.e. in EXACTLY the runs whose ops stage
+    through rax. The deny bit MODELS the raw clobbers; the
+    accumulator askers ARE the clobbers it models. So the
+    accumulator ask may take rax THROUGH the deny (documented,
+    ML_CHECKed !reg_holds_pin(RAX)) - for any other register that
+    shortcut would be the r9 bug, for bit 0 it is the definition.
+ 3. Lever A/C4b forwarding ALREADY records where a value landed
+    (g_fwd.res_reg / fres_reg / in_reg) - cross-op forwarding is
+    registered state, not a hard-wired rax contract. The feared
+    blocker does not exist.
+ 4. read_slot/write_slot/store_dst/load_operand already take the
+    register as a PARAMETER - callers pass literal RAX. The
+    threading is mostly call-site respelling, not new plumbing.
+ 5. The take-balance boundary check (trk_takes) already aborts on a
+    leaked take per op - the same net that caught div_magic's
+    early-return leak polices the accumulator takes for free.
+
+THE DESIGN - `AccScratch` (the accumulator ask): grant rax when not
+busy (no pin), ignoring denied bit 0 per fact 2; refuse when busy.
+Today refusal is UNREACHABLE BY THE GATES (run_may_pin_rax +
+coverage prove no staging op coexists with a rax pin), so phase-1
+sites may fall back to literal rax under ML_CHECK - but sites where
+the register is already a parameter (fact 4) thread the grant
+directly. Emission stays byte-identical everywhere: the grant is
+deterministically rax while rax is unpinned, which is every run that
+contains a cluster-D op.
+
+THE ENDGAME this buys (recorded, not scheduled): once the LAST
+cluster-D site asks, `run_may_pin_rax` + the coverage gate stop
+being load-bearing audited opcode tables - ra.busy becomes the
+single source of truth, the whitelist becomes derivable, and rax can
+join the pin pool generally (any run, not the audited shapes). That
+is the #101-adjacent architectural payoff, the same shape as
+retiring the r8 gate: a table replaced by a negotiation.
+
+BATCHES:
+ - 9a: tag clusters A/B/C (~150 occurrences) -> UNJUSTIFIED ~300.
+   No emission change; floors ratcheted.
+ - 9b: AccScratch + the emit_op core (the 180-line slab).
+ - 9c: emit_branch + the element tiers.
+ - 9d: the residue (hoist preamble, exc_stamp, div_magic quotient,
+   fwd_bump, the model-internal mentions) + the ledger close-out.
