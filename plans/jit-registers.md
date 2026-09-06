@@ -3877,3 +3877,34 @@ R8 52->10). Zero registers: RDI, RSI, R9, R10, R11 - five of nine.
 vdjcmp 116/116 (comments only). What remains: R8's 10, RDX's 55,
 RCX's 88 (the IntBin tmp-borrow family), RAX's 470 (the staging
 convention - the structural conversion, last).
+
+## (au) 2026-08-22 - batch 6: R8 at zero; RDX down to two deferred
+## conversions; SIX of nine registers clean
+
+R8's 10: three are the t_float-singleton convention (reg:conv, the
+rsi/t_int twin); SEVEN were census FALSE POSITIVES from the encoders'
+own naming - setcc_r8 / movzx_r32_r8 use "r8" as a WIDTH suffix (an
+8-bit register operand), which no scan for the x86 R8 can tell apart.
+Renamed setcc_lo8 / movzx_r32_lo8: fix the confusing NAME, not the
+tool (the sixth-shape lesson applied to its own instrument).
+
+RDX's 55: the idiv/imul ISA cluster tagged reg:isa (cqo, the div-magic
+kit, the divisor gates and INT_MIN compares, the remainder
+write-backs); the role metadata reg:conv; take_fixed() joined the
+census's allocator-API exemption; and the elem-store/elem2 gate lines
+that spelled literal RDX beside the plan's sc.count were RESPELLED to
+sc.count (byte-identical - the count role IS rdx, ISA-fixed for idiv;
+one of those blocks already carried the "r9 class exactly" comment
+and its own pinned functional test).
+
+RDX's remaining 11 are TWO deferred conversions, batch 7's job, kept
+deliberately UNJUSTIFIED on the ratchet:
+ - emit_ctx_chain's HIDDEN CROSS-FUNCTION CONTRACT: the global chain
+   leaves the GlobalFuncTable in rdx for the CALLER's `defined`-byte
+   write (the helper-ABI class by the book) - the fix is a `tbl`
+   parameter, caller-allocated;
+ - SetPend/EndFinally's raw rdx pend-slot math (no prologue, no
+   denial - the ord shape; convert with a push-fallback since the
+   ops have no decline tier).
+Census: 623 -> 552; R8/RDI/RSI/R9/R10/R11 all ZERO. vdjcmp 116/116
+(the respells byte-identical, as the role identity guarantees).

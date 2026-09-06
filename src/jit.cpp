@@ -1009,7 +1009,7 @@ enum RegCap : uint32_t {
     CAP_NONE        = 0,
     /* usable as a byte register with NO REX prefix (al/cl/dl/bl).
      * Without a REX, modrm 4..7 mean ah/ch/dh/bh, not sil/dil/spl/bpl -
-     * so this is a correctness bit, not a size one. See setcc_r8. */
+     * so this is a correctness bit, not a size one. See setcc_lo8. */
     CAP_BYTE_NOREX  = 1u << 0,
     /* usable as a memory BASE with no SIB byte (everything but rsp/r12,
      * whose low 3 bits are 100 - the encoding that MEANS "SIB
@@ -3303,7 +3303,7 @@ struct Emitter {
         u8(static_cast<uint8_t>(0xC0 | ((r & 7) << 3) | (r & 7)));
     }
     /* movzx r32, r8 - widen a byte result (setcc, a bool element) */
-    void movzx_r32_r8(uint8_t dst, uint8_t src)
+    void movzx_r32_lo8(uint8_t dst, uint8_t src)
     {
         wrote(dst);
         if (dst >= 8 || src >= 8)
@@ -3369,7 +3369,7 @@ struct Emitter {
      * is the only allocatable operand. */
     void imul_reg(uint8_t r)
     {
-        wrote(RAX); wrote(RDX);      /* rdx:rax = rax * r, ISA-fixed */
+        wrote(RAX); wrote(RDX);      /* reg:isa: rdx:rax = rax * r, ISA-fixed */
         u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 0x01 : 0)));
         u8(0xF7);
         u8(static_cast<uint8_t>(0xE8 | (r & 7)));
@@ -3411,10 +3411,10 @@ struct Emitter {
      * the low-8 registers are reachable without a REX, and a REX is
      * what a caller wanting sil/dil/spl/bpl would need, so this
      * refuses those rather than emit the WRONG byte register. */
-    void setcc_r8(uint8_t cc, uint8_t r)
+    void setcc_lo8(uint8_t cc, uint8_t r)
     {
         wrote(r);
-        ML_CHECK_MSG(r < 4, "setcc_r8: only al/cl/dl/bl are REX-free");
+        ML_CHECK_MSG(r < 4, "setcc_lo8: only al/cl/dl/bl are REX-free");
         u8(0x0F);
         u8(static_cast<uint8_t>(0x90 | cc));
         u8(static_cast<uint8_t>(0xC0 | (r & 7)));
@@ -3916,13 +3916,14 @@ struct Emitter {
      * shipping wrong answer. Deleting them means no caller can reach
      * the fixed pair again; the arithmetic is `op_rr2(aop, dst, src)`,
      * which the census CAN see because both operands are arguments. */
-    void cqo()          { wrote(RDX); u8(0x48); u8(0x99); }
+    void cqo()          { wrote(RDX); u8(0x48); u8(0x99); }  /* reg:isa */
     /* idiv r64 - rdx:rax / r. Quotient to RAX and remainder to RDX are
      * ISA-fixed, so the DIVISOR is the only allocatable operand here and
      * therefore the only one this takes. */
     void idiv_reg(uint8_t r)
     {
-        wrote(RAX); wrote(RDX); u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 1 : 0))); u8(0xF7);
+        wrote(RAX); wrote(RDX);                  /* reg:isa */
+        u8(static_cast<uint8_t>(0x48 | (r >= 8 ? 1 : 0))); u8(0xF7);
       u8(static_cast<uint8_t>(0xF8 | (r & 7))); }
     void cmp_rdi_imm8(int8_t v)        /* cmp rdi, imm8 (sign-extended) */
     { u8(0x48); u8(0x83); u8(0xFF); u8(static_cast<uint8_t>(v)); }
@@ -4270,32 +4271,33 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
     else
         e.scratch(keep);
     e.mov_rr(keep, RAX);                             /* keep = n */
-    e.movabs(RDX, m.M);
-    e.imul_reg(RDX);              /* imul rdx (signed,
+    e.movabs(RDX, m.M);  /* reg:isa */
+    e.imul_reg(RDX);              /* reg:isa: imul rdx (signed,
                                                       * rdx:rax = n*M) */
     if (m.needs_add) {
-        e.add_rr(RDX, keep);
+        e.add_rr(RDX, keep);  /* reg:isa */
     }
     if (m.sh) {
-        e.sar_rr_imm8(RDX, static_cast<uint8_t>(m.sh));   /* sar rdx, imm8 */
+        e.sar_rr_imm8(RDX,                       /* reg:isa */
+                      static_cast<uint8_t>(m.sh));
     }
     /* truncate toward zero: += 1 when the quotient came out negative */
-    e.mov_rr(RAX, RDX);
+    e.mov_rr(RAX, RDX);  /* reg:isa */
     e.shr_rr_imm8(RAX, 63);    /* shr rax, 63 */
-    e.add_rr(RDX, RAX);
+    e.add_rr(RDX, RAX);  /* reg:isa */
     if (m.negate) {
-        e.neg_reg(RDX);          /* neg rdx */
+        e.neg_reg(RDX);          /* reg:isa: neg rdx */
     }
     if (!want_mod) {
-        e.mov_rr(RAX, RDX);                          /* rax = quotient */
+        e.mov_rr(RAX, RDX);    /* reg:isa: rax = quotient */
         return;
     }
     /* n % d == n - (n/d)*d */
     if (d >= INT32_MIN && d <= INT32_MAX) {
-        e.imul_rr_imm32(RAX, RDX, static_cast<int32_t>(d));
+        e.imul_rr_imm32(RAX, RDX, static_cast<int32_t>(d));  /* reg:isa */
     } else {
         e.movabs(RAX, static_cast<uint64_t>(d));
-        e.op_rr2(Op::times, RAX, RDX);  /* imul rax, rdx */
+        e.op_rr2(Op::times, RAX, RDX);  /* reg:isa: imul rax, rdx */
     }
     e.sub_rr(keep, RAX);
     e.mov_rr(RAX, keep);                             /* rax = remainder */
@@ -5441,7 +5443,8 @@ static void emit_type_tags(Emitter &e)
         e.movabs(RSI,                            /* reg:conv */
                  reinterpret_cast<uint64_t>(jit_layout().t_int));
     if (e.float_tag_live && !jit_tag_is_imm(jit_layout().t_float))
-        e.movabs(R8, reinterpret_cast<uint64_t>(jit_layout().t_float));
+        e.movabs(R8,                             /* reg:conv */
+                 reinterpret_cast<uint64_t>(jit_layout().t_float));
 }
 
 static void emit_call_epilogue(Emitter &e)
@@ -5492,7 +5495,8 @@ static void emit_call_epilogue(Emitter &e)
                  reinterpret_cast<uint64_t>(jit_layout().t_int));
     if (e.float_tag_live && !jit_tag_is_imm(jit_layout().t_float)
             && !e.reg_holds_pin(8))
-        e.movabs(R8, reinterpret_cast<uint64_t>(jit_layout().t_float));
+        e.movabs(R8,                             /* reg:conv */
+                 reinterpret_cast<uint64_t>(jit_layout().t_float));
     /* C4b: the pinned float LITERALS, same argument - caller-saved and
      * compile-time constant. THIS is where their correctness lives, not
      * in pick_float_lits' opcode whitelist: a call can be
@@ -9608,7 +9612,7 @@ size_t jit_pin_budget() { return MAX_CACHED + MAX_XCACHED; }
  *      `load_base` and inspects the bytes: the modrm rm field must
  *      name that register and must not be the 100 that means "a SIB
  *      byte follows". For every byte-capable register it emits a real
- *      `setcc_r8` and requires no REX prefix. This is independent of
+ *      `setcc_lo8` and requires no REX prefix. This is independent of
  *      the predicates, because it reads what the encoder actually
  *      produced.
  *
@@ -9667,10 +9671,10 @@ static bool reg_model_check(std::string &err)
         if (!(gp_caps(r) & CAP_BYTE_NOREX))
             continue;
         Emitter e;
-        e.setcc_r8(0x5, r);                 /* setne <r8> */
+        e.setcc_lo8(0x5, r);                 /* setne <r8> */
         if (e.b.size() != 3 || e.b[0] != 0x0F) {
             snprintf(buf, sizeof(buf),
-                     "reg %u has CAP_BYTE_NOREX but setcc_r8 emitted a "
+                     "reg %u has CAP_BYTE_NOREX but setcc_lo8 emitted a "
                      "REX prefix (%zu bytes, first 0x%02X)",
                      r, e.b.size(), e.b.empty() ? 0 : e.b[0]);
             err = buf; return false;
@@ -11735,7 +11739,7 @@ static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint8_t cr,
 struct ElemRead {
     uint8_t obj   = RAX;
     uint8_t data  = RCX;
-    uint8_t count = RDX;
+    uint8_t count = RDX;  /* reg:conv */
     uint8_t idx   = R9;  /* reg:conv */
 };
 
@@ -11924,7 +11928,7 @@ static void emit_elem_base_gate(Emitter &e, uint8_t ir, int base_slot,
 struct ElemScratch {
     uint8_t obj   = RAX;   /* the SharedObject *      (ISA-fixed: idiv) */
     uint8_t data  = RCX;   /* the flat element data pointer            */
-    uint8_t count = RDX;   /* the element count / byte length (idiv)   */
+    uint8_t count = RDX;   /* reg:conv: count (idiv-fixed)  */
     uint8_t idx   = R9;    /* the element index (reg:conv)   */
     uint8_t val   = RDI;   /* the stored value / rhs (reg:conv) */
     bool    ok    = true;  /* false = no free register; DECLINE        */
@@ -11981,7 +11985,7 @@ static bool elem_reg_usable_nopin(uint8_t r, bool float_tag_live,
         return false;
     if (r == RSI && !jit_tag_is_imm(jit_layout().t_int))  /* reg:conv */
         return false;
-    if (r == R8 && float_tag_live
+    if (r == R8 && float_tag_live               /* reg:conv */
             && !jit_tag_is_imm(jit_layout().t_float))
         return false;
     if (hoist_claimed & (1u << r))
@@ -12536,7 +12540,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             /* rax = the element */
             e.load_elem_q(sc.obj, H->rdata, sc.idx);
             e.movabs(sc.count, 0x8000000000000000ull);
-            e.cmp_rr(RAX, RDX);  /* cmp rax,rdx */
+            e.cmp_rr(RAX, sc.count);   /* cmp rax, count(INT_MIN) */
             slows.push_back(e.j32(0x74));        /* INT_MIN -> helper */
             e.patch32_here(j_ok);
         }
@@ -13375,21 +13379,21 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
          * audit for the register can see. Pinned by
          * tests/functional/17_elem2_divmod_roles.my.
          */
-        e.lea_base(RDX, sc.val, 1);              /* rdx = divisor + 1 */
-        e.cmp_reg_imm(RDX, 1);
+        e.lea_base(sc.count, sc.val, 1);       /* count = divisor + 1 */
+        e.cmp_reg_imm(sc.count, 1);
         const size_t j_ok = e.j32(0x77);         /* ja .ok (hot) */
         e.test_rr(sc.val, sc.val);
         decline_if(0x74);                        /* 0 -> the helper */
-        e.load_base(RDX, sc.obj, L.data_off);    /* rdx = data */
+        e.load_base(sc.count, sc.obj, L.data_off);       /* the data */
         load_slot_idx(e, sc.idx, in.b_slot());
-        e.lea_elem_q(RDX, RDX, sc.idx);          /* rdx = &elem */
-        e.cmp_reg_base(RDX, sc.obj, L.data_off);
+        e.lea_elem_q(sc.count, sc.count, sc.idx);        /* &elem */
+        e.cmp_reg_base(sc.count, sc.obj, L.data_off);
         decline_if(0x72);                        /* jb: negative idx */
-        e.cmp_reg_base(RDX, sc.obj, L.data_off + 8);
+        e.cmp_reg_base(sc.count, sc.obj, L.data_off + 8);
         decline_if(0x73);                        /* jae: OOB */
-        e.load_base0(RDX, RDX);                  /* rdx = the element */
+        e.load_base0(sc.count, sc.count);        /* the element */
         e.movabs(sc.idx, 0x8000000000000000ull);
-        e.cmp_rr(RDX, sc.idx);
+        e.cmp_rr(sc.count, sc.idx);
         decline_if(0x74);                        /* INT_MIN -> helper */
         e.patch32_here(j_ok);
     }
@@ -14005,8 +14009,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     e.test_rr(RCX, RCX);  /* test rcx,rcx */
                     raise_convey_unless(e, ck, 0x75, JR_DIV0, pc, old_pc);
                 } else if (in.b_lit() == -1) {
-                    e.movabs(RDX, 0x8000000000000000ull);
-                    e.cmp_rr(RAX, RDX);  /* cmp rax,rdx */
+                    e.movabs(RDX, 0x8000000000000000ull);  /* reg:isa */
+                    e.cmp_rr(RAX, RDX);  /* reg:isa: cmp rax,rdx */
                     raise_convey_unless(e, ck, 0x75 /* jne */, JR_DIV_OVF,
                                         pc, old_pc);
                 }
@@ -14028,16 +14032,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     return true;
                 }
             } else {
-                e.lea_base(RDX, RCX, 1);
+                e.lea_base(RDX, RCX, 1);  /* reg:isa */
                                                      /* lea rdx,[rcx+1] */
-                e.cmp_reg_imm(RDX, 1);
+                e.cmp_reg_imm(RDX, 1);  /* reg:isa */
                                                      /* cmp rdx,1 */
                 const size_t j_div = e.j32(0x77);    /* ja .div (hot) */
                 /* cold: rcx is 0 or -1 */
                 e.test_rr(RCX, RCX);  /* test rcx,rcx */
                 raise_convey_unless(e, ck, 0x75, JR_DIV0, pc, old_pc);
-                e.movabs(RDX, 0x8000000000000000ull);
-                e.cmp_rr(RAX, RDX);  /* cmp rax,rdx */
+                e.movabs(RDX, 0x8000000000000000ull);  /* reg:isa */
+                e.cmp_rr(RAX, RDX);  /* reg:isa: cmp rax,rdx */
                 raise_convey_unless(e, ck, 0x75 /* jne */, JR_DIV_OVF,
                                     pc, old_pc);
                 /* rcx == -1, rax != INT_MIN: fall into the division */
@@ -14046,7 +14050,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.cqo();              /* cqo */
             e.idiv_reg(RCX);  /* idiv rcx */
             drop();           /* the divisor is consumed */
-            write_slot(e, ck, in.aop == Op::div ? RAX : RDX, in.target, pc);
+            write_slot(e, ck,
+                       in.aop == Op::div ? RAX : RDX,  /* reg:isa */
+                       in.target, pc);
             return true;
         case Op::shl: case Op::shr: case Op::ushr:
             emit_reg_shift(e, ck, in.aop, pc, old_pc);
@@ -14173,7 +14179,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.cqo();                          /* cqo */
         e.idiv_reg(RCX);              /* idiv rcx */
         drop();                       /* the divisor is consumed */
-        write_slot(e, ck, RDX, in.target, pc);            /* remainder */
+                write_slot(e, ck, RDX,           /* reg:isa */
+                           in.target, pc);       /* remainder */
         return true;
     }
 
@@ -14202,7 +14209,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.cqo();                          /* cqo */
         e.idiv_reg(RCX);              /* idiv rcx */
         drop();
-        write_slot(e, ck, RDX, in.target, pc);
+        write_slot(e, ck, RDX, in.target, pc);  /* reg:isa */
         return true;
     }
 
@@ -15391,7 +15398,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>(cc_for(in.aop).near_op + 0x10));
         e.u8(0xC0);                               /* setcc al */
-        e.movzx_r32_r8(RAX, RAX);       /* movzx eax, al */
+        e.movzx_r32_lo8(RAX, RAX);       /* movzx eax, al */
         store_dst_bool(e, ck, RAX, in.target);
         return true;
     }
@@ -15415,7 +15422,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
         e.u8(0xC0);                               /* setcc al */
-        e.movzx_r32_r8(RAX, RAX);       /* movzx eax, al */
+        e.movzx_r32_lo8(RAX, RAX);       /* movzx eax, al */
         store_dst_bool(e, ck, RAX, in.target);
         return true;
     }
@@ -16157,7 +16164,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(0x0F);
                 e.u8(static_cast<uint8_t>(cc_for(bo.aop).near_op + 0x10));
                 e.u8(0xC0);                           /* setcc al */
-                e.movzx_r32_r8(RAX, RAX);   /* movzx eax, al */
+                e.movzx_r32_lo8(RAX, RAX);   /* movzx eax, al */
                 store_dst_bool(e, ck, RAX, in.target);
             } else {
                 if (dv) {
@@ -16169,20 +16176,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                          * the overflow) - an ordinary x / -1 falls back
                          * into the native idiv (rax = the dividend is
                          * already loaded; rdx is dead, cqo is next). */
-                        e.lea_base(RDX, RCX, 1);
-                        e.cmp_reg_imm(RDX, 1);
+                        e.lea_base(RDX, RCX, 1);  /* reg:isa */
+                        e.cmp_reg_imm(RDX, 1);  /* reg:isa */
                         const size_t j_div = e.j32(0x77);  /* ja .div */
                         e.test_rr(RCX, RCX);
                         j_slows_win.push_back(e.j32(0x74)); /* 0 -> slow */
-                        e.movabs(RDX, 0x8000000000000000ull);
-                        e.cmp_rr(RAX, RDX);
+                        e.movabs(RDX, 0x8000000000000000ull);  /* reg:isa */
+                        e.cmp_rr(RAX, RDX);  /* reg:isa */
                         j_slows_win.push_back(e.j32(0x74)); /* ovf */
                         e.patch32_here(j_div);
                     }
                     e.cqo();              /* cqo */
                     e.idiv_reg(RCX);  /* idiv rcx */
                     if (bo.aop == Op::mod)
-                        e.mov_rr(RAX, RDX);              /* the remainder */
+                e.mov_rr(RAX, RDX);  /* reg:isa: the remainder */
                 } else {
                     op_rr(e, bo.aop, RAX, RCX);
                 }
@@ -16289,7 +16296,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(0x0F);
                 e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
                 e.u8(0xC0);                           /* setcc al */
-                e.movzx_r32_r8(RAX, RAX);   /* movzx eax, al */
+                e.movzx_r32_lo8(RAX, RAX);   /* movzx eax, al */
                 store_dst_bool(e, ck, RAX, in.target);
             } else {
                 if (bo.aop == Op::div && !bo.b.is_lit) {
@@ -16835,8 +16842,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 /* movzx eax, byte [rax + moff] */
                 e.movzx_r32_byte_base(RAX, RAX, static_cast<int32_t>(moff));
                 e.test32_rr(RAX, RAX);               /* test eax, eax */
-                e.setcc_r8(0x5, RAX);   /* setne al */
-                e.movzx_r32_r8(RAX, RAX);   /* movzx eax, al */
+                e.setcc_lo8(0x5, RAX);   /* setne al */
+                e.movzx_r32_lo8(RAX, RAX);   /* movzx eax, al */
                 store_dst(e, ck, RAX, in.target, pc);
                 break;
             default:                       /* int field read as float */
@@ -17036,8 +17043,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* mov rcx, [rax + chunk.native.base]*/
         e.load_base(RCX, RAX, static_cast<int32_t>(L.chunk_native_base));
         /* mov rdx, [rax + native_entry_off]*/
-        e.load_base(RDX, RAX, static_cast<int32_t>(L.chunk_native_entry));
-        e.add_rr(RCX, RDX);
+        e.load_base(RDX, RAX,                    /* reg:conv */
+                    static_cast<int32_t>(L.chunk_native_entry));
+        e.add_rr(RCX, RDX);  /* reg:conv */
         e.call_reg(RCX);             /* call rcx (the callee fragment) */
         /* G1 step 2: a leaf call is the OTHER fragment-to-fragment call
          * form, so its return address must be in the table or the entry
