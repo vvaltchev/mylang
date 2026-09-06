@@ -397,6 +397,20 @@ vm_store_throw_div0(const Chunk *chunk, size_t pc)
     throw DivisionByZeroEx();
 }
 
+/* The flat compound store's negative-shift-count throw (`a[i] <<= n`,
+ * n < 0) - checked BEFORE the COW clone, exactly like div0 above and
+ * like the tree-walker's flat_store_core (apply_compound_op throws
+ * before its clone), so a throwing store never detaches a slice
+ * (intptr-observable). Message matches bitops.h's bit_shl/shr/ushr. */
+[[noreturn]] static ML_COLD void
+vm_store_throw_negshift(const Chunk *chunk, size_t pc)
+{
+    Loc s, en;
+    if (chunk)
+        chunk->loc_at(pc, s, en);
+    throw InvalidValueEx("negative shift count", s, en);
+}
+
 /* The StoreElemInt/StoreElemFloat store body, SHARED by the interpreter
  * handler AND the approach-A JIT helper (jit_store_elem_int/float, below):
  * a[i] = v / a[i] OP= v for a flat mutable int/bool/float array (COW), else
@@ -432,6 +446,9 @@ vm_store_elem_int_body(LValue &alv, int_type idx, int_type rhs, Op aop,
                 vm_store_throw_oob(chunk, pc);
             if ((aop == Op::div || aop == Op::mod) && rhs == 0)
                 vm_store_throw_div0(chunk, pc);
+            if ((aop == Op::shl || aop == Op::shr || aop == Op::ushr)
+                    && rhs < 0)
+                vm_store_throw_negshift(chunk, pc);
             if (arr.is_slice())
                 arr.clone_internal_vec();
             else if (arr.use_count() > 1)
@@ -451,6 +468,13 @@ vm_store_elem_int_body(LValue &alv, int_type idx, int_type rhs, Op aop,
                               el /= rhs; break;
             case Op::mod:     check_int_div_overflow(el, rhs);
                               el %= rhs; break;
+            case Op::band:    el &= rhs; break;
+            case Op::bor:     el |= rhs; break;
+            case Op::bxor:    el ^= rhs; break;
+            /* count proven >= 0 above; bit_* saturate past the width */
+            case Op::shl:     el = bit_shl(el, rhs);  break;
+            case Op::shr:     el = bit_shr(el, rhs);  break;
+            case Op::ushr:    el = bit_ushr(el, rhs); break;
             default: throw InternalErrorEx();
             }
             arr.invalidate_hash();
@@ -2980,6 +3004,9 @@ static std::exception_ptr g_vm_jit_eptr;
 extern "C" int jit_store_elem_int(LValue *base, int_type idx, int_type rhs,
                                   int aop) noexcept
 {
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(OpCode::StoreElemInt)]++;
+#endif
     try {
         vm_store_elem_int_body(*base, idx, rhs, static_cast<Op>(aop),
                                nullptr, 0);
@@ -3043,6 +3070,9 @@ extern "C" int jit_store_elem_prep(LValue *base, int_type idx) noexcept
 extern "C" int jit_store_elem_float(LValue *base, int_type idx, double rhs,
                                     int aop) noexcept
 {
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(OpCode::StoreElemFloat)]++;
+#endif
     try {
         vm_store_elem_float_body(*base, idx, rhs, static_cast<Op>(aop),
                                  nullptr, 0);

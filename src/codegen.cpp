@@ -5082,21 +5082,15 @@ struct Codegen {
              * StoreElemFloat (excluded from the catch-all). */
             if (sub->th == TypeHint::i && sub->base_array) {
                 const size_t mark = ops.size();
+                /* EVERY compound maps (the shared table): the flat store
+                 * body dispatches all eleven bases - the shift arms check
+                 * the negative count BEFORE the COW clone via the
+                 * loc-stamped vm_store_throw_negshift, like div0. */
                 Op aop = Op::invalid;
                 bool ok = true;
-                switch (e->op) {
-                    case Op::assign: aop = Op::invalid; break;
-                    case Op::addeq:  aop = Op::plus;    break;
-                    case Op::subeq:  aop = Op::minus;   break;
-                    case Op::muleq:  aop = Op::times;   break;
-                    case Op::diveq:  aop = Op::div;     break;
-                    case Op::modeq:  aop = Op::mod;     break;
-                    /* the shift/bitwise compounds (`a[i] <<= n`) fall
-                     * through to the boxed StoreElemValue below - the flat
-                     * store body dispatches only the arith five (its shift
-                     * arms would need the loc-stamped InvalidValueEx
-                     * throwers); a typed flat tier is a follow-up */
-                    default: ok = false; break;
+                if (e->op != Op::assign) {
+                    aop = compound_assign_base(e->op);
+                    ok = aop != Op::invalid;
                 }
                 int aslot, akind;
                 Operand val, idx;

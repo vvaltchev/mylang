@@ -376,7 +376,14 @@ GENERAL array, a **DYN / captured / unproven** base, or a flat int array whose
 index isn't int-compilable (the flat `StoreElemInt` path rolls back and falls
 through) — while a **proven flat int/float array keeps its unboxed
 `StoreElemInt`/`StoreElemFloat`** (the catch-all excludes `th==f && base_array`,
-left to `compile_float_stmt`). A **GENERAL nested lvalue-chain store** mixing
+left to `compile_float_stmt`). `StoreElemInt`'s compound `aop` carries any
+BASE op from `compound_assign_base` — the arith five plus the shift/bitwise
+six (`a[i] <<= n` is flat too); the flat body dispatches all eleven, the
+shift arms checking a negative count BEFORE the COW clone through the
+loc-stamped `vm_store_throw_negshift`, exactly like div0 (and like the
+tree-walker's `flat_store_core`, whose `apply_compound_op` throws before its
+clone). `StoreElemFloat` still meets only the arith five: a shift/bitwise
+compound on a proven-float element is compile-rejected upstream. A **GENERAL nested lvalue-chain store** mixing
 MEMBER and SUBSCRIPT steps (`a[i].f=v`, `q.p.x=v`, `s.f[i]=v`, `d.a[0].f=v`) →
 **`StoreLValueChainV`** (`try_native_chain_store` decomposes the lvalue into a
 slotted base + a `Chunk::chain_steps` list — a member is a `member_keys` pool

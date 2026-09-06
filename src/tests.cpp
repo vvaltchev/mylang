@@ -23519,6 +23519,21 @@ static bool jit_store_elem_inline_tier()
           "    return s; }",
           "print(f(2));" }, true, true, -1, /*fast_exact=*/64 },
 
+      /* the BITWISE compounds inline like plus (op_rr2 encodes them; no
+       * runtime guards beyond the shared ones) - 32 fills + 8*3 */
+      { "COMPOUND int &= |= ^=: served inline (32 + 8*3)",
+        { "func f(n) {",
+          "    var a = array(32); var i = 0;",
+          "    while (i < 32) { a[i] = i * 7 + 1; i++; }",
+          "    var j = 0;",
+          "    while (j < 8) {",
+          "        a[j] &= n; a[j] |= j; a[j] ^= 3;",
+          "        j++; }",
+          "    var s = 0; var k = 0;",
+          "    while (k < 32) { s = s + a[k]; k++; }",
+          "    return s; }",
+          "print(f(21));" }, true, true, -1, /*fast_exact=*/56 },
+
       /* the inc-dec lowering `a[i]++` == `a[i] += 1` (a literal rhs) */
       { "COMPOUND: the a[i]++ inc-dec shape (32 + 8)",
         { "func f(n) {",
@@ -23761,6 +23776,91 @@ static bool jit_store_elem_inline_tier()
         }
     }
     return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * The SHIFT compounds on a flat int element (`a[i] <<= n`) lower to
+ * StoreElemInt (the typed flat tier) but the inline arm DECLINES them at
+ * emit time (a reg-count shift needs the rcx core + a negative-count
+ * decline; the helper gets both free from the shared body). Three facts,
+ * each with its own counter, because a value oracle cannot tell the flat
+ * helper from the boxed StoreElemValue fallback:
+ *   1. g_jit_store_fast counts ONLY the 32 fills - the 24 shift
+ *      compounds never took the inline arm;
+ *   2. g_jit_op_run[StoreElemInt] grows by exactly 24 - the shifts were
+ *      LOWERED to StoreElemInt and executed the flat HELPER (a boxed
+ *      lowering would leave this counter untouched);
+ *   3. the value matches the tree-walker (the differential's job, but
+ *      asserted here so this test stands alone).
+ * WATCHED: reverting the codegen admission (the compound_assign_base map
+ * at the StoreElemInt site) leaves the value right and fails fact 2.
+ */
+static bool jit_store_elem_shift_helper()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+
+    const std::vector<const char *> src = {
+        "func f(n) {",
+        "    var a = array(32); var i = 0;",
+        "    while (i < 32) { a[i] = i * 7 + 1; i++; }",
+        "    var j = 0;",
+        "    while (j < 8) {",
+        "        a[j] <<= n; a[j] >>= 1; a[j] >>>= n;",
+        "        j++; }",
+        "    var s = 0; var k = 0;",
+        "    while (k < 32) { s = s + a[k]; k++; }",
+        "    return s; }",
+        "print(f(2));" };
+
+    const unsigned long fast0 = g_jit_store_fast;
+    const unsigned long help0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::StoreElemInt)];
+
+    const ExecEngine se = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    std::ostringstream cap;
+    std::streambuf *old = cout.rdbuf(cap.rdbuf());
+    bool ok = true;
+    try {
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (...) { ok = false; }
+    cout.rdbuf(old);
+    g_exec_engine = se;
+
+    const unsigned long fast = g_jit_store_fast - fast0;
+    const unsigned long help =
+        g_jit_op_run[static_cast<size_t>(OpCode::StoreElemInt)] - help0;
+
+    if (!ok) { cout << "  threw\n"; return false; }
+    if (cap.str() != "3400 \n") {
+        cout << "  value: got \"" << cap.str() << "\", want 3400\n";
+        return false;
+    }
+    if (fast != 32) {
+        cout << "  inline fast stores: " << fast << ", want 32 (fills only;"
+             << " a shift served inline would inflate this)\n";
+        return false;
+    }
+    if (help != 24) {
+        cout << "  StoreElemInt helper runs: " << help << ", want 24 - the"
+             << " shifts did not reach the flat helper (boxed lowering?)\n";
+        return false;
+    }
+    return true;
 #else
     return true;
 #endif
@@ -33437,6 +33537,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the INLINE element-store tier serves plain + COMPOUND stores "
       "and REFUSES bad divisors / const stores (#92, #95)",
       jit_store_elem_inline_tier },
+    { "jit: the SHIFT compounds take the flat StoreElemInt HELPER "
+      "(lowered typed, inline-declined, counted)",
+      jit_store_elem_shift_helper },
     { "jit: the pin pool leaves the element tier two scratch candidates "
       "- the reservation, whose absence is SILENT (#96)",
       jit_elem_scratch_reserved },
