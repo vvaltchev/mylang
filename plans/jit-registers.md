@@ -3855,3 +3855,25 @@ R10 (70), mostly the sync-push machinery the MyLang-call clobber-mask
 justification already covers for rsi/r9; then R8 (52); then the two
 structural masses - the IntBin rcx borrow family (RCX 134) and RAX's
 staging convention (605).
+
+## (at) 2026-08-22 - batch 5: R10 + R11 at zero via the function-scope
+## tag; TOTAL 623
+
+All 106 R10/R11 unbracketed sites sit inside the three CALL-PROTOCOL
+emitters - emit_sync_push_native, emit_sync_call_inline,
+emit_ret_native - where a MyLang call's clobber mask denies the whole
+caller-saved pool, so no pin can exist and every register IS protocol.
+Tagging ~150 lines one by one would say less than that one sentence,
+so the census gained the FUNCTION-SCOPE form `reg:conv(fn)`: placed on
+the definition, it justifies to the next top-level `}`, and a region
+with ZERO register sites is reported STALE like a line tag. THE
+DELIBERATE TRADE, recorded in the census header: a future unjustified
+site added inside such a function escapes the ratchet - the form is
+reserved for functions that are wholly protocol.
+
+The three regions also absorbed the protocol's RAX/RCX/RDX/R8 mass:
+UNJUSTIFIED 995 -> 623 (RAX 605->470, RCX 134->88, RDX 98->55,
+R8 52->10). Zero registers: RDI, RSI, R9, R10, R11 - five of nine.
+vdjcmp 116/116 (comments only). What remains: R8's 10, RDX's 55,
+RCX's 88 (the IntBin tmp-borrow family), RAX's 470 (the staging
+convention - the structural conversion, last).
