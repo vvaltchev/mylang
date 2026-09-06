@@ -246,15 +246,22 @@ so they call rax_pin_conflict() themselves.
    the lesson "a test derived from a table cannot find a hole in
    that table" - assert on the DECLARED register, not on rax.
 
-### B2b. AUDIT ITEM found during B2 (pre-existing, not Phase A's):
-the IntShlRR/IntShrRR case's raw `read_slot(e, RCX, ...)` (reg:isa,
-the CL count) writes rcx with no ask - rcx has been PINNABLE since
-the xcache widening, so a 9+-pin run containing a reg-count shift
-would clobber a pin (tracker-caught in TESTS builds only). Fix like
-the ModRI evict: an rcx conflict seam, or route through
-hold(CAP_SHIFT_CNT) which already exists. Same class: any reg:isa
-raw write whose register is pool-admitted needs an ask-or-evict.
-Sweep ALL reg:isa sites for this when B2 lands.
+### B2c. THE GENERALIZED SEAM  [LANDED 2026-08-22]
+reg_pin_conflict(r) - any register; pin_conflicts is a MASK; the
+retry accumulates g_jit_pins_denied and loops (bounded: each retry
+denies at least one more register). CONVERTED: the rcx per-op shift
+scan in jit_xcache_busy is DELETED - the RR-shift's raw CL load
+evicts a pinned rcx itself (the WATCHED 13-pin `sb += sa >> k` shape
+now takes conflict->retry and emits identically; vdjcmp 116/116).
+STILL STANDING, the last per-register whitelist: run_may_pin_rdx.
+Deleting it = every raw rdx writer calls the seam or asks - the BIG
+one is the element tiers' ElemRead/ElemScratch role registers
+(count=RDX, data=RCX conv defaults used raw across the tiers), plus
+the div arms' movabs RDX/cqo/lea (add reg_pin_conflict(RDX) beside
+the existing RAX call at IntModRI/IntAddModRI/IntBin-div/UnaryV-dv).
+Do the div arms first (mechanical), then the tier roles via ONE seam
+in elem_read_plan/elem_scratch_plan (evict any pinned role), then
+delete run_may_pin_rdx. NEXT SESSION'S FIRST ITEM.
 
 ### B3. The hoist/C2b claims become recorded grants
  - The region's rdata/rcount pair: allocate through take() at region

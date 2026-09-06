@@ -7622,3 +7622,17 @@ they invoke the conflict eviction themselves - without it a
 rax-pinned attempt would have clobbered the pin unretried (a shape no
 corpus program has: 12+ hot slots AND a specialized mod - closed on
 inspection, not by a failure).
+
+## Endgame B2c (2026-08-22) - the conflict seam generalizes; the rcx
+## shift scan is deleted
+
+reg_pin_conflict(r) works for ANY register now (pin_conflicts is a
+mask; the re-emission accumulates a denied mask and is bounded by the
+pool size). First consumer beyond rax: the RR-shift's raw CL load
+evicts a pinned rcx itself, so the per-op rcx scan in jit_xcache_busy
+- the table added when the WATCHED 13-pin `sb += sa >> k` shape
+clobbered a pinned rcx at every rotation - is DELETED. Same final
+emission, structurally derived: vdjcmp 116/116, the xrot matrix
+green. run_may_pin_rdx is the last per-register whitelist standing;
+its deletion plan (the element-tier role registers + the div arms)
+is in plans/register-allocator-endgame.md B2c.

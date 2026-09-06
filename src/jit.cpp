@@ -1737,21 +1737,23 @@ struct Emitter {
      * the deleted run_may_pin_rax whitelist approximated, now derived
      * from what emission actually DOES instead of from a table.
      */
-    bool rax_conflict = false;
-    void rax_pin_conflict()
+    uint32_t pin_conflicts = 0;    /* the registers evicted this
+                                    * attempt - the retry denies them */
+    void reg_pin_conflict(uint8_t r)
     {
-        if (!reg_holds_pin(RAX))                       /* reg:conv */
+        if (!reg_holds_pin(r))
             return;
-        rax_conflict = true;
+        pin_conflicts |= 1u << r;
         for (size_t i = 0; i < cache.size(); i++) {
-            if (cache[i].reg == RAX) {                 /* reg:conv */
+            if (cache[i].reg == r) {
                 cache.erase(cache.begin()
                             + static_cast<ptrdiff_t>(i));
                 break;
             }
         }
-        ra.give(RAX);                                  /* reg:conv */
+        ra.give(r);
     }
+    void rax_pin_conflict() { reg_pin_conflict(RAX); } /* reg:conv */
     int acc_take()
     {
         check_pins_are_busy();
@@ -9681,7 +9683,7 @@ static bool run_may_pin_rdx(const Chunk &ck, size_t begin, size_t end)
  * once with rax denied (g_jit_rax_denied). The safety fact moved from
  * two hand-audited opcode tables into what emission actually does.
  */
-static bool g_jit_rax_denied = false;
+static uint32_t g_jit_pins_denied = 0;
 
 /* Which XCACHE registers this run must NOT spend, because they still
  * hold a type singleton. Empty when both tags encode as imm32. */
@@ -9776,19 +9778,15 @@ static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
      * the RI form (shape-eater #6) - the pinned test's count is
      * assigned twice for exactly that reason.
      */
-    for (size_t pc = begin; pc < end; pc++) {
-        const OpCode op = ck.code[pc].op;
-        if (op == OpCode::IntShlRR || op == OpCode::IntShrRR) {
-            busy |= 1u << 1;                 /* rcx carries the count */
-            break;
-        }
-    }
-    /* Phase A: rax is OPTIMISTIC now - the conflict eviction + the
-     * one-shot re-emission replace the deleted run_may_pin_rax
-     * whitelist and its coverage gate; the deny exists only on the
-     * retry attempt. */
-    if (g_jit_rax_denied)
-        busy |= 1u << 0;
+    /* Phase A/B2c: rax and rcx are OPTIMISTIC - the conflict
+     * eviction + re-emission replace the deleted run_may_pin_rax
+     * whitelist, its coverage gate, AND the per-op rcx shift scan
+     * that used to live here (the RR-shift's raw CL load evicts a
+     * pinned rcx itself now). rdx still has its whitelist
+     * (run_may_pin_rdx) until the raw-rdx-writer sweep - the
+     * element-tier role registers - converts (the plan's B2c note).
+     * The denies exist only on retry attempts. */
+    busy |= g_jit_pins_denied;
     return busy;
 }
 /* C2a: the float pool - xmm4-7 (xmm0/1 are the per-op scratch) */
@@ -14437,11 +14435,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(static_cast<uint8_t>(c));
             }
         } else {
-            if (!fb)
+            if (!fb) {
                 /* cache-aware (the classifier counts this shift count
                  * as a cacheable int use); CL is the ISA's one variable
-                 * shift-count register */
+                 * shift-count register. B2c: a pinned rcx is a
+                 * conflicting event - evict + retry, exactly the rax
+                 * pattern (this replaced the per-op rcx scan in
+                 * jit_xcache_busy). */
+                e.reg_pin_conflict(RCX);         /* reg:isa: CL */
                 read_slot(e, RCX, in.b_slot());  /* reg:isa: CL */
+            }
             emit_reg_shift(e, ck, shl ? Op::shl : Op::shr, A, pc, old_pc);
         }
         /* lever A, the PRODUCER side - identical to the arith family's.
@@ -19792,8 +19795,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * op's fragment offset in label[]; branch ops emit local jumps
      * (patched from label[] after) or exit_pc; a trailing exit_pc handles
      * fall-through off the end. */
-    bool rax_retried = false;
-    g_jit_rax_denied = false;
+    int rax_retried = 0;
+    g_jit_pins_denied = 0;
 retry_emission:
     /* Phase A: the one-shot re-emission after a rax-pin conflict. The
      * backward goto DESTROYS everything declared below it (e included)
@@ -20868,13 +20871,17 @@ retry_emission:
         }
         g_hoist.active = false;
         g_hoist2.active = false;
-        if (e.rax_conflict && !rax_retried) {
-            /* Phase A: a rax pin met a conflicting emission event
-             * (call bracket / accumulator ask / raise-path reuse).
-             * Discard exactly as the give-up path does and re-emit
-             * the chunk ONCE with rax denied. */
-            rax_retried = true;
-            g_jit_rax_denied = true;
+        if (e.pin_conflicts & ~g_jit_pins_denied) {
+            /* Phase A/B2c: a pin met a conflicting emission event
+             * (call bracket / accumulator ask / raise-path reuse /
+             * an ISA-fixed raw write). Discard exactly as the
+             * give-up path does and re-emit with the conflicted
+             * registers denied. Each retry denies at least one MORE
+             * register, so the loop is bounded by the pool size -
+             * the ML_CHECK is the backstop. */
+            rax_retried++;
+            ML_CHECK_MSG(rax_retried <= 16, "conflict retry runaway");
+            g_jit_pins_denied |= e.pin_conflicts;
             g_hoist = JitHoist{};
             g_hoist2 = JitHoist{};
             chunk.call_caches.clear();
@@ -20885,13 +20892,11 @@ retry_emission:
 #endif
             goto retry_emission;
         }
-        ML_CHECK_MSG(!e.rax_conflict,
-                     "a rax-pin conflict on the DENIED attempt");
         if (!emit_ok) {
             g_hoist = JitHoist{};
             g_hoist2 = JitHoist{};
             e.b.clear();
-            g_jit_rax_denied = false;
+            g_jit_pins_denied = 0;
             return;
         }
         const size_t exit_pos = e.pos();
@@ -21242,7 +21247,7 @@ retry_emission:
         for (int i = 0; i < 4; i++)
             dst[1 + i] = static_cast<uint8_t>(r32 >> (i * 8));
     }
-    g_jit_rax_denied = false;    /* Phase A: chunk-scoped, never sticky */
+    g_jit_pins_denied = 0;       /* Phase A: chunk-scoped, never sticky */
     if (mprotect(mem, len, PROT_READ | PROT_EXEC) != 0) {
         munmap(mem, len);
         return;
