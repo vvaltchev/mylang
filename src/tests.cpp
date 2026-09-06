@@ -5692,6 +5692,21 @@ static const std::vector<test> tests =
     { "compound shift: a negative LITERAL count on a flat element throws",
       { "var a = [4, 5]; var i = int(runtime(1)); a[i] <<= 0 - 3;" },
       &typeid(InvalidValueEx) },
+    /* the float TWIN of the shift/bitwise element arms is VACUOUS BY
+     * CONSTRUCTION - these pins are what make that claim machine-checked
+     * (if shifts on floats ever become legal, they fire and the twin
+     * becomes real work: StoreElemFloat would need the arms) */
+    { "compound shift: a float ELEMENT target is a compile error",
+      { "array<float> f = [1.0, 2.0]; f[0] <<= 1;" },
+      &typeid(TypeMismatchEx) },
+    { "compound bitwise: a float ELEMENT target is a compile error",
+      { "array<float> f = [1.0, 2.0]; f[0] &= 3;" },
+      &typeid(TypeMismatchEx) },
+    /* ... while %= IS the float element residue (the fmod helper) */
+    { "compound %= on a float element (the fmod tier)",
+      { "array<float> f = [1.0]; var i = int(runtime(0));",
+        "f[i] %= 0.75;",
+        "assert(f[i] == 0.25);" } },
     { "compound shift: lexer maximal munch (>>>= is ONE token)",
       { "var a = -16; var b = 2; a>>>=b; assert(a == 4611686018427387900);",
         "var c = 8; c>>=2; assert(c == 2);",

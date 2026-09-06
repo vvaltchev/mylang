@@ -90,3 +90,4 @@
 85_regs_ref_25           2
 86_elem_arith_compound   61
 87_elem_shift_compound   103
+88_elem_float_compound   17
