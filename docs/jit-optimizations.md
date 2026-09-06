@@ -7427,18 +7427,25 @@ flat_store_core already throws before its clone). Caret parity for the
 uncaught negative-count element shift is byte-identical across all
 three engines (verified) and the COW non-detach agrees engine-wise.
 
-**The JIT split, deliberate:** the BITWISE three inline like plus -
-op_rr2 already encodes and/or/xor, no new guards (non-throwing, bool
-storage compile-unreachable) - in BOTH the hoisted (C1e) and ordinary
-inline arms. A SHIFT inlines only with a NON-NEGATIVE LITERAL count
-(the imm8 arm, added 2026-08-21 as the follow-up increment): it then
-cannot throw, and saturation is an EMIT-time decision - c >= 64
-becomes zero_reg32 (shl/ushr) or `sar reg, 63` (shr), c == 0 emits
-nothing, exactly the two-address IntShlRI treatment. A REG-count
-shift (and a negative literal) still DECLINES to the helper
-(`jit_store_elem_int`, the interpreter's exact body): the reg form
-wants the rcx shift core plus a runtime negative-count decline
-ordered BEFORE the COW prep, machinery the helper gets free.
+**The JIT split:** the BITWISE three inline like plus - op_rr2
+already encodes and/or/xor, no new guards (non-throwing, bool storage
+compile-unreachable) - in BOTH the hoisted (C1e) and ordinary inline
+arms. A LITERAL-count shift is the imm8 arm: it cannot throw, and
+saturation is an EMIT-time decision (c >= 64 -> zero_reg32 / sar 63,
+c == 0 emits nothing - the two-address IntShlRI treatment). A
+REG-count shift inlines too (the third increment, 2026-08-21): its
+negative-count test is a runtime js DECLINE to the helper, emitted
+BEFORE the COW prep (a throwing store must not clone; the helper owns
+the loc-stamped throw), and the shift itself is `shl/sar/shr rax, cl`
+inside a BRACKETED rcx borrow - push rcx / mov the count in / shift /
+pop - because rcx may be a PIN or even one of this very tier's own
+scratch registers (sc.idx / sc.data): the window is exactly the
+shift, straight-line, between load_elem_q and store_elem_q, so a
+clobbered-and-restored rcx is never read inside it and no decline
+edge crosses a push (the release-only stack-skew class). The runtime
+>= 64 saturation branch is internal to the window. Only a NEGATIVE
+LITERAL still declines at emit time - it always throws, so the
+helper is the whole story.
 
 **Proof (three counters, because a value oracle cannot tell the flat
 helper from the boxed fallback):** the tier test's bitwise case pins
@@ -7446,17 +7453,22 @@ helper from the boxed fallback):** the tier test's bitwise case pins
 literal-shift case pins `fast_exact = 72` (32 + 8*5, covering normal
 counts, the c >= 64 saturation and c == 0, values reseeded per
 iteration so the zeroing cannot make them vacuous);
-`jit_store_elem_shift_helper` (REG-count shifts, its argument
-runtime()-wrapped because a literal arg SPECIALIZES the function and
-folds the counts to literals - the vacuous-test trap's shape-eater #6,
-watched doing exactly that) pins g_jit_store_fast == 32 (fills only)
-AND `g_jit_op_run[StoreElemInt] == 24` - the helpers now bump their
-per-op counter (they did not before), which is what makes "the shifts
-were LOWERED flat and executed the flat helper" assertable at all.
+`jit_store_elem_shift_regcount` (argument runtime()-wrapped because a
+literal arg SPECIALIZES the function and folds the counts to
+literals - the vacuous-test trap's shape-eater #6, watched doing
+exactly that) pins TWO episodes: the hot reg-count loop at
+g_jit_store_fast == 56 with ZERO flat-helper runs (all inline), and a
+runtime negative count whose js decline routes exactly the offending
+store to the helper (delta >= 1) and surfaces the InvalidValueEx - an
+inverted polarity would compute cl&63 garbage inline and throw
+nothing. The helpers bump `g_jit_op_run[StoreElemInt/Float]` (they
+did not before), which is what makes helper-vs-inline attribution
+assertable at all.
 WATCHED: reverting the codegen admission leaves every value right and
 fails the helper-count fact; dropping bitwise from the inline
 admission fails fast_exact 56; dropping the literal-shift admission
-fails fast_exact 72 (each sabotage run separately, committed tree).
+fails fast_exact 72; re-declining the reg-count form fails episode 1
+(fast 32, helper 24) - each sabotage run separately, committed tree.
 
 **Measured (RULE B1: build/ deleted, --mylang build-claude/perf +
 --baseline a worktree build of the language commit, header read, both
@@ -7467,6 +7479,11 @@ tier; 86_elem_arith_compound 0.97x (flat, as expected - the arith
 compound tier predates the baseline). my/python: 86 at 0.04x, 87 at
 0.03x. Both benches read ~5ms at scale 1 on this box - candidates for
 the scales.txt tuning pass.
+
+**Reg-count arm measured (callgrind Ir, OPT=1 ASSERTS=0 both sides,
+a 6M-reg-count-shift probe, deterministic):** 918.98M -> 125.00M Ir,
+**-86.4%** - six million helper calls become six million inline RMWs.
+The bench (87) uses literal counts and is untouched by this arm.
 
 **Bench reach (new, 2026-08-21):** NO bench contained ANY compound
 element store - not even `a[i] +=` - so the whole #92/#95 compound arm

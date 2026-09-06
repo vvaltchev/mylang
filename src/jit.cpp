@@ -12285,16 +12285,18 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
      * inlines only with a NON-NEGATIVE LITERAL count - then it cannot
      * throw and the saturation is an emit-time decision (>= 64 becomes
      * zero_reg32 / sar 63, 0 emits nothing, like the two-address
-     * IntShlRI arm). A REG-count shift declines to the helper: it needs
-     * the rcx shift core + a runtime negative-count decline ordered
-     * BEFORE the COW prep (a throwing store must not clone), machinery
-     * the helper (the interpreter's exact body) gets free. A NEGATIVE
-     * literal declines too - the helper's negshift thrower owns it. */
+     * IntShlRI arm). A REG-count shift inlines too: its negative-count
+     * test is a runtime DECLINE to the helper (the interpreter's exact
+     * body owns the loc-stamped throw), emitted BEFORE the COW prep so
+     * a throwing store never clones; the shift itself runs on the
+     * loaded element through a bracketed rcx borrow (see
+     * elem_reg_shift). Only a NEGATIVE LITERAL declines at emit time -
+     * it always throws, so the helper is the whole story. */
     if (compound) {
         if (aop != Op::plus && aop != Op::minus && aop != Op::times
             && !divmod && !((bitw || shift) && !is_float))
             return false;
-        if (shift && (!in.b_is_lit() || in.b_lit() < 0))
+        if (shift && in.b_is_lit() && in.b_lit() < 0)
             return false;
         if (is_float && aop == Op::mod)
             return false;                       /* fmod: helper */
@@ -12328,6 +12330,39 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             e.shr_rr_imm8(reg, static_cast<uint8_t>(c));
     };
 
+    /* The REG-count shift on the ELEMENT in rax (sc.obj): count in `cnt`,
+     * proven >= 0 by the runtime decline emitted before the COW prep.
+     * x86 variable shifts read CL only, and RCX may be a PIN or even one
+     * of this very tier's scratch registers (sc.idx / sc.data) - so the
+     * borrow window is exactly the shift: push rcx unconditionally, move
+     * the count in, shift, pop. Straight-line by construction (the
+     * saturation branch is internal; no decline edge may cross a push -
+     * the release-only stack-skew class). Callers order it BETWEEN
+     * load_elem_q and store_elem_q, so a clobbered-and-restored rcx that
+     * happens to BE sc.idx/sc.data is never read inside the window. */
+    const auto elem_reg_shift = [&](uint8_t cnt) {
+        const uint8_t modrm = aop == Op::shl ? 0xE0
+                            : aop == Op::shr ? 0xF8 : 0xE8;
+        const bool borrow = cnt != RCX;
+        if (borrow) {
+            e.push_reg(RCX);
+            e.mov_rr(RCX, cnt);
+        }
+        e.cmp_reg_imm(RCX, 64);
+        const size_t jl = e.j8(0x7C);            /* jl .norm */
+        if (aop == Op::shr)
+            e.sar_rr_imm8(RAX, 63);              /* full sign-fill */
+        else
+            e.zero_reg32(RAX);                   /* shl / ushr -> 0 */
+        const size_t jd = e.j8(0xEB);            /* jmp .done */
+        e.patch8(jl, e.pos());
+        e.wrote(0);
+        e.u8(0x48); e.u8(0xD3); e.u8(modrm);     /* shl/sar/shr rax, cl */
+        e.patch8(jd, e.pos());
+        if (borrow)
+            e.pop_reg(RCX);
+    };
+
     /*
      * C1b: the HOISTED store - the preheader proved the base AND the
      * store guards (const/readonly/no live views) and invalidated the
@@ -12359,6 +12394,12 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             const size_t j_nan = e.j8(0x7A);     /* jp -> not zero */
             slows.push_back(e.j32(0x74));        /* je (== 0.0) */
             e.patch8(j_nan, e.pos());
+        }
+        if (shift && !in.b_is_lit()) {
+            /* a negative count declines to the helper (which throws
+             * without storing), like the divisor guards above */
+            e.test_rr(sc.val, sc.val);
+            slows.push_back(e.j32(0x78));        /* js -> the helper */
         }
         load_index_idx(e, sc.idx, in);
         e.cmp_rr(sc.idx, H->rcount);
@@ -12420,7 +12461,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
                     e.store_elem_q(sc.data, sc.idx, sc.count);
             } else if (shift) {
                 e.load_elem_q(sc.obj, sc.data, sc.idx);
-                imm_shift(sc.obj);
+                if (in.b_is_lit())
+                    imm_shift(sc.obj);
+                else
+                    elem_reg_shift(sc.val);
                 e.store_elem_q(sc.data, sc.idx, sc.obj);
             } else {
                 e.load_elem_q(sc.obj, sc.data, sc.idx);
@@ -12481,6 +12525,13 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
      * The INT guards moved INTO the compound-ints arm (below): deciding
      * the -1 case needs the ELEMENT, whose read needs the kind proven.
      */
+    if (shift && !in.b_is_lit()) {
+        /* a negative count DECLINES to the helper before the per-kind
+         * arms and before any COW prep - the helper throws (loc-stamped)
+         * without cloning, matching the interpreter's order */
+        e.test_rr(sc.val, sc.val);
+        decline_if(0x78);                             /* js -> the helper */
+    }
     if (divmod && !in.b_is_lit()) {
         if (!is_float) {
             /* moved into the ints arm */
@@ -12539,7 +12590,10 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             return;
         case Op::shl: case Op::shr: case Op::ushr:
             e.load_elem_q(sc.obj, sc.data, sc.idx);
-            imm_shift(sc.obj);
+            if (in.b_is_lit())
+                imm_shift(sc.obj);
+            else
+                elem_reg_shift(sc.val);
             e.store_elem_q(sc.data, sc.idx, sc.obj);
             return;
         default:
