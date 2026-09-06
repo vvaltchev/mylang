@@ -15423,11 +15423,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * cache-aware BEFORE the prologue, rdx=field idx), then the ADD and
          * the dst write IN the fragment (rax survives the epilogue), so the
          * reduction's accumulator dst stays cache-aware. */
-        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        AccScratch acc(e);
+        load_operand(e, acc.r, in.a_is_lit(), in.a_lit(), in.a_slot());
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(
                           static_cast<int_type>(in.target2)));
-        e.mov_rr(RSI, RAX);
+        e.mov_rr(RSI, acc.r);
         e.movabs(RDX, static_cast<uint64_t>(
                           static_cast<int_type>(in.b_dual_lo())));
         e.call_relocs.push_back(
@@ -15658,17 +15659,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * setcc opcode is the near-jcc opcode + 0x10, so the existing cc_for
          * table drives it), `movzx` to a clean 0/1, then the bool two-store.
          * Never faults -> op_fully_native. */
-        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        AccScratch acc(e, CAP_BYTE_NOREX | CAP_MEM_BASE);
+        load_operand(e, acc.r, in.a_is_lit(), in.a_lit(), in.a_slot());
         hold();
         load_operand(e, tmp, in.b_is_lit(), in.b_lit(), in.b_slot());
-        e.cmp_rr(RAX, tmp);
+        e.cmp_rr(acc.r, tmp);
         drop();                    /* flags survive the pop */
-        e.wrote(RAX);                    /* setcc al writes rax's low byte */
-        e.u8(0x0F);
-        e.u8(static_cast<uint8_t>(cc_for(in.aop).near_op + 0x10));
-        e.u8(0xC0);                               /* setcc al */
-        e.movzx_r32_lo8(RAX, RAX);       /* movzx eax, al */
-        store_dst_bool(e, ck, RAX, in.target);
+        e.setcc_lo8(static_cast<uint8_t>(
+                        (cc_for(in.aop).near_op + 0x10) & 0x0F),
+                    acc.r);
+        e.movzx_r32_lo8(acc.r, acc.r);
+        store_dst_bool(e, ck, acc.r, in.target);
         return true;
     }
 
@@ -15687,12 +15688,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
                         /*no_bail=*/true);
         if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
-        e.wrote(RAX);
-        e.u8(0x0F);
-        e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
-        e.u8(0xC0);                               /* setcc al */
-        e.movzx_r32_lo8(RAX, RAX);       /* movzx eax, al */
-        store_dst_bool(e, ck, RAX, in.target);
+        AccScratch acc(e, CAP_BYTE_NOREX | CAP_MEM_BASE);
+        e.setcc_lo8(static_cast<uint8_t>(
+                        ((fc.near_op ^ 1) + 0x10) & 0x0F),
+                    acc.r);
+        e.movzx_r32_lo8(acc.r, acc.r);
+        store_dst_bool(e, ck, acc.r, in.target);
         return true;
     }
 
@@ -15709,13 +15710,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const int kind = in.op == OpCode::UnpackElemInt ? 0
                        : in.op == OpCode::UnpackElemFloat ? 1 : 2;
         const bool tg = in.op == OpCode::UnpackElemTargets;
-        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        AccScratch acc(e);
+        load_operand(e, acc.r, in.a_is_lit(), in.a_lit(), in.a_slot());
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(
                           static_cast<int_type>(tg ? -1 : in.target)));
         e.movabs(RSI, static_cast<uint64_t>(
                           static_cast<int_type>(in.target2)));
-        e.mov_rr(RDX, RAX);                    /* the index value */
+        e.mov_rr(RDX, acc.r);                  /* the index value */
         e.movabs(RCX, static_cast<uint64_t>(
                           in.b_lit() | (static_cast<int_type>(kind) << 8)));
         e.movabs(R8, tg ? reinterpret_cast<uint64_t>(
@@ -16276,11 +16278,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          */
         const JitLayout &L = jit_layout();
         const SlotAddr b = slot_addr(in.target2);
-        e.load32_slot(RAX, b.payload + L.str_len_off);   /* zero-extended u32 */
+        AccScratch acc(e);
+        e.load32_slot(acc.r, b.payload + L.str_len_off); /* zext u32 */
 #ifdef TESTS
         e.bump_counter(&g_jit_strlen_fast);
 #endif
-        store_dst(e, ck, RAX, in.target, pc);
+        store_dst(e, ck, acc.r, in.target, pc);
         return true;
     }
 
@@ -17380,15 +17383,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.exit_pc(pc);
         e.patch8(j_ok, e.pos());            /* over_SO: */
         e.mov_rr(RDI, RAX);   /* callee window slots (reg:abi) */
-        /* fragment entry = callee->vm_chunk->native.base + native_entry_off: */
-        e.movabs(RAX, reinterpret_cast<uint64_t>(callee));
-        /* mov rax, [rax + desc.vm_chunk] */
-        e.load_base(RAX, RAX, static_cast<int32_t>(L.desc_vm_chunk));
-        /* mov rcx, [rax + chunk.native.base]*/
-        e.load_base(RCX, RAX,                    /* reg:conv */
+        /* fragment entry = callee->vm_chunk->native.base + entry_off: */
+        AccScratch acc(e);
+        e.movabs(acc.r, reinterpret_cast<uint64_t>(callee));
+        /* mov acc, [acc + desc.vm_chunk] */
+        e.load_base(acc.r, acc.r, static_cast<int32_t>(L.desc_vm_chunk));
+        /* mov rcx, [acc + chunk.native.base]*/
+        e.load_base(RCX, acc.r,                  /* reg:conv */
                     static_cast<int32_t>(L.chunk_native_base));
-        /* mov rdx, [rax + native_entry_off]*/
-        e.load_base(RDX, RAX,                    /* reg:conv */
+        /* mov rdx, [acc + native_entry_off]*/
+        e.load_base(RDX, acc.r,                  /* reg:conv */
                     static_cast<int32_t>(L.chunk_native_entry));
         e.add_rr(RCX, RDX);  /* reg:conv */
         e.call_reg(RCX);   /* reg:conv: call the callee frag */
