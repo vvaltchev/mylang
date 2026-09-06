@@ -1,0 +1,346 @@
+# THE REGISTER-ALLOCATOR ENDGAME (#96 widened, 2026-08-22)
+
+THE MAINTAINER'S MANDATE, verbatim in substance:
+ - The three rax-endgame steps are IN scope and come BEFORE other
+   tasks.
+ - Asking FOR a specific register is still not OK without a HARD
+   reason (ABI: rax holds returns; ISA: cl/rax:rdx; encoding facts
+   belong in the COST MODEL, not in per-site preferences).
+ - Register pinning must become TEMPORARY: "the same variable MUST
+   be able to use multiple registers (if needed) even in the same
+   basic block, depending on what's more efficient". The bar is what
+   a C compiler does with a 10000-line function.
+ - Everything of the same kind as run_may_pin_rax must be found and
+   converted - the full inventory is below.
+ - Claude has FULL freedom to reorder steps for ease of execution.
+   The goal is ALL of it done. This file exists so no step is lost
+   across context compactions: RESUME FROM THE PHASE CHECKLIST.
+
+STATUS LEDGER (update as steps land):
+ - [x] Census-to-zero milestone (1137 -> 0, plans/jit-registers.md
+       entries ap..bb) - the enabling precondition for everything
+       here: every emitter consumes register VALUES now.
+ - [ ] Phase A - the rax endgame
+ - [ ] Phase B - the same-kind sweep
+ - [ ] Phase C - the float (xmm) mandate
+ - [ ] Phase D - the interval allocator (splitting)
+ - [ ] Phase E - retire the transition devices + doc sync
+
+---------------------------------------------------------------------
+## THE HONEST INVENTORY - what is still a static table or a fixed
+## convention, and which phase kills each
+
+ 1. run_may_pin_rax + the coverage gate (jit.cpp ~9500 / ~19660):
+    the hand-audited whitelist of "rax-free" op shapes + the
+    pick-time check that every such op's target actually got a pin.
+    Phase A deletes both.
+ 2. run_needs_float_tag + the rsi/r8 SINGLETON RESERVATIONS
+    (jit_xcache_busy): rsi excluded from the xcache pool
+    UNCONDITIONALLY (it may carry the t_int singleton off-arena), r8
+    excluded by another run-scanning opcode gate (t_float). Phase B.
+ 3. THE FWD BUS RESIDUE: g_fwd.res_reg defaults to rax (the tagged
+    conv line); a pin-producing op pays `mov rax, r14` to put its
+    value on the bus instead of DECLARING r14; lever A's pairing
+    guard statically declines rax-pinned runs
+    (`!e.reg_holds_pin(RAX)` at the pairing site). Phase B.
+ 4. FIXED PREFERENCE ORDERS + legacy prefer masks: CACHE_REGS
+    {r12..r15}, XCACHE_ORDER {10,11,8,7,6,9,2,1,0}, ELEM_CAND, and
+    every alloc_scratch(prefer = 1u << <legacy reg>) discount - a
+    byte-identity transition device from the conversion batches, not
+    a cost model. Phase D absorbs preference into interval costs;
+    Phase E deletes the masks.
+ 5. THE HOIST/C2b REGISTER CLAIMS: the region's rdata/rcount pair and
+    its r10/r11 clobber-mask claim. Regions ask like everything else.
+    Phase B (the claim -> a recorded grant); fully dissolved in D
+    (hoisted values become ordinary intervals).
+ 6. THE WHOLE-RUN PICK ITSELF (pick_cached_slots): one slot = one
+    register for the WHOLE run, ranked by whole-run use counts,
+    qualified by the audited bad()-rules, no splitting, no per-pc
+    assignment. Phase D replaces it.
+ 7. THE ENTIRE FLOAT SIDE: xmm0/xmm1 hardcoded per-op scratch in
+    every float emitter; xmm4..xmm7 a fixed fcache pool; the CENSUS
+    NEVER COUNTED XMM AT ALL. Phase C brings xmm under the model and
+    the ratchet; Phase D allocates GP and xmm with ONE allocator.
+ 8. Every reg:conv TAG is by definition a deferred conversion - the
+    justified column doubles as the worklist. Phase E re-litigates
+    each: isa/abi stay; conv must shrink to genuine fragment
+    protocol (the slot-window base, the counter bump's
+    zero-footprint bracket) or convert.
+
+ STRUCTURALLY RESERVED AND STAYING (hard reasons, forever): rsp;
+ rbx = the slot-window base (one stable base per fragment IS the
+ addressing convention every slot access encodes); rbp = the frame
+ anchor; SysV argument/return registers AT call boundaries; CL for
+ variable shifts; rax:rdx around cqo/idiv/imul; low-8 setcc forms.
+
+---------------------------------------------------------------------
+## PHASE A - THE RAX ENDGAME
+
+GOAL: rax is an ordinary pool member; run_may_pin_rax and the
+coverage gate are DELETED; the never-executed AccScratch refusal
+(alt-grant) and reuse arms run under the whole net first.
+
+### A0. THE ONE REAL DESIGN PROBLEM: a rax pin vs the helper-status
+### convention. SOLVE THIS FIRST - everything else in A is mechanical.
+
+The collision: ~60 emit sites do
+    call <helper>; emit_call_epilogue(e); test eax, eax
+and the comment discipline is "the epilogue runs FIRST - rax
+survives it". If rax became a spillable pin like r10/r11, the
+epilogue would RELOAD the pin into rax between the call and the
+status test, destroying the status. The interim resolution (v1,
+until D dissolves it): rax may be PINNED only in runs that emit NO
+helper calls at all. Derive "call-free" STRUCTURALLY, not from a new
+hand list - candidates, in preference order:
+  (a) reuse the delete-originals classification: a run whose every
+      op is op_fully_native/never-exits emits no helper call on any
+      path (these tables are correctness-audited elsewhere and
+      heavily tested);
+  (b) a post-emit check is NOT possible (the pick runs first), so if
+      (a) is too coarse in practice, measure how many runs it
+      excludes before inventing anything finer.
+NOTE: Phase D dissolves this entirely - with interval splitting, a
+rax interval simply ENDS before each call, which is exactly what a C
+compiler does with caller-saved registers. Do not gold-plate the v1.
+
+### A1. Make rax grantable to the PICK behind the existing machinery
+ - Remove the unconditional bit-0 deny; instead deny rax only when
+   the run fails the A0 call-free predicate.
+ - Verify emit_call_prologue/epilogue would never see a rax pin
+   (call-free runs by construction) - add an ML_CHECK saying so.
+ - Verify flush_cache/exit_pc handle a rax pin (generic store; no
+   rax-specific assumption) - read the code, then trust the nets.
+ - The fwd pairing guard (`!reg_holds_pin(RAX)`) STAYS in A
+   (conservative decline); B2 relaxes it.
+
+### A2. Exercise the never-run arms UNDER FORCE before shipping
+ - rax is already LAST in XCACHE_ORDER; MYLANG_JIT_XROT already
+   rotates the pool. With A1 in place, the xrot rotation that puts
+   rax FIRST is the force lever - no new mechanism. Confirm
+   jit_xcache_pins sweeps it in-process and corpus_diff --xrot
+   covers it.
+ - What must be OBSERVED running (JITSTATS/TESTS counters; add one
+   per arm if none exists - "the tier ran" proof, per the
+   prove-the-code-ran rule):
+     * AccScratch::take() refusal -> alt-grant (today ML_CHECK-dead);
+     * AccScratch::reuse_t hitting an OPEN WINDOW (already runs) and
+       hitting a rax PIN (must stay unreachable in call-free runs -
+       the ML_CHECK is the net);
+     * a staging op emitting through the alt register end-to-end
+       (vdj inspection of one forced fragment).
+ - Battery: -rt both arenas, corpus plain/--levers/--xrot/--cold/
+   --nolowmem, nested_fuzz, Net 2/3 samples, rel-hard, clang lane.
+ - REMOVE the ML_CHECK(false) from the refusal arm when it becomes
+   reachable-by-design (it stops being "gates make this impossible"
+   and becomes an ordinary code path).
+
+### A3. Delete the gates
+ - Delete run_may_pin_rax, the coverage-gate block, and their
+   comments; the two-address emit forms REMAIN (they are
+   optimizations, not gates).
+ - Grep tests/docs for references (the #162 decline-case tests, the
+   "run_may_pin_rax" mentions in comments and docs/CLAUDE.md) and
+   update in the SAME commit.
+ - Sabotage on the committed tree: make the alt arm grant but emit
+   literal rax anyway -> with xrot forcing a rax pin, the tracker or
+   the differential must fail BY NAME. Watch it.
+
+### A4. Measure
+ - RULE B1 discipline. Expect ~flat (call-free rax-pinnable runs are
+   rare); the win is the deleted tables. Record honestly.
+
+---------------------------------------------------------------------
+## PHASE B - THE SAME-KIND SWEEP
+
+### B1. The rsi/r8 type-singleton reservations
+ - Today (off-arena only): fragment entry + every call epilogue
+   re-materialize t_int in rsi, t_float in r8; cmp_reg_tag /
+   store_type_tag take the holder as an argument at each site; the
+   POOL statically excludes rsi always and r8 via
+   run_needs_float_tag (another opcode scan).
+ - Conversion: the singleton holders become MODEL-OWNED, RUN-SCOPED
+   GRANTS: at fragment entry, if the run is off-arena, take two
+   registers (prefer rsi/r8 for byte identity) and record them in
+   the Emitter (e.tag_reg(t_int) / e.tag_reg(t_float) queries);
+   every site that passes literal RSI/R8/8 consults the query
+   instead. The reservation then IS ra.busy - delete
+   run_needs_float_tag and the unconditional rsi exclusion.
+ - On the ARENA (the shipping config) nothing is materialized and
+   the grants are never taken - the pool gains rsi/r8 there, which
+   is the actual payoff.
+ - Oracle: the nolowmem lane is THE net for the off-arena half
+   (vacuity-guarded both directions already).
+
+### B2. The fwd bus declares instead of moving
+ - Producers with a pinned result set g_fwd.res_reg = <pin> and stop
+   emitting `mov rax, d` (the publisher move) - consumers already
+   read emit_fwd_bump's return. This DELETES an instruction per
+   forwarded pin-produced value: measure Ir on the regs_int family.
+ - Relax lever A's pairing guard: pairing works in rax-pinned runs
+   once nothing assumes the bus is rax. (Guard text at the pairing
+   site names the old reasoning - rewrite it.)
+ - jit_fwd_deadtemp + the fwd family-coverage test adapt; remember
+   the lesson "a test derived from a table cannot find a hole in
+   that table" - assert on the DECLARED register, not on rax.
+
+### B3. The hoist/C2b claims become recorded grants
+ - The region's rdata/rcount pair: allocate through take() at region
+   setup (prefer the current pair for byte identity), record in
+   JitHoist, and delete the hand-built r10/r11 clobber-mask entry -
+   the busy bits ARE the claim. The "pool-denied run" scratch
+   fallback keeps its conv tag until D.
+
+---------------------------------------------------------------------
+## PHASE C - THE FLOAT (XMM) MANDATE
+
+### C1. Census first (instrument before change - the standing rule)
+ - Extend scripts/regcensus.py to xmm0..xmm15: operand tokens (X0,
+   X1, XMM constants), accessor-name derivation (the movq_x/fload/
+   movsd/cvt families name xmm registers the way movabs_r9 named
+   r9 - the sixth audit shape applies verbatim).
+ - Baseline the counts, add xmm floors to regcensus_floor.txt (the
+   gate already fails both directions).
+
+### C2. The model learns xmm
+ - RegAlloc gains an xmm occupancy mask + take/free; fp_caps is
+   nearly trivial (all caller-saved, no byte/base/SIB concepts;
+   encoding preference for xmm0..7 - no REX - is a WEIGHT fact).
+ - Emitter::alloc_fscratch(prefer) / free_fscratch mirroring the GP
+   seams; the tracker learns xmm writes (trk parity).
+
+### C3. Convert
+ - The per-op X0/X1 scratch sites ask with prefer X0/X1 (byte-
+   identical while free) - emit_float_load/store, farith, ucomisd,
+   the cvt family, emit_float_operands, the div0 bits test's xmm
+   side, the libm call marshalling (xmm0/1 at CALL boundaries are
+   reg:abi - SysV float args - and stay).
+ - The fcache pool {xmm4..7} registers its picks in the xmm mask
+   (C2a's spill-around-calls discipline is already per-pin).
+ - ffwd: fres_reg is already a declaration - consumers must READ it
+   (audit for assumed-xmm0 consumers, the C4a-ii/C4b family).
+ - Ratchet xmm floors batch by batch to zero, same discipline as GP
+   (vdjcmp byte-identity per batch, sabotage watched, floors in the
+   same commit).
+
+---------------------------------------------------------------------
+## PHASE D - THE INTERVAL ALLOCATOR (the C-compiler bar)
+
+THE TARGET, by example. Today `pick_cached_slots` decides "s lives
+in r12 for the WHOLE run" or not at all; a 20-hot-variable loop
+serves ~7 and the rest stay memory-bound forever. After D:
+
+    lines 1..40    x in r12        (hot stretch)
+    lines 41..900  x in its slot   (cold stretch - r12 serves y)
+    lines 901..950 x in rax        (hot again; rax free here)
+
+one variable, several registers, decided per LIVE RANGE by cost -
+including INSIDE one basic block. Splitting also dissolves A0's
+interim rule: a caller-saved interval simply ENDS before each helper
+call and resumes after, which is how a C compiler treats caller-
+saved registers.
+
+FOUNDATIONS ALREADY IN PLACE (why this is feasible):
+ - every emitter consumes register VALUES (#96's threading);
+ - jit_slot_liveness computes livein/liveout per pc (the fixpoint
+   built for lever A's widening - the dataflow EXISTS);
+ - the native-stack spill homes (#96 inc-1) are the spill substrate;
+ - take/free + the REGTRACK tracker police occupancy;
+ - per-pc entry stubs (M5b/c) already exist - the constraint they
+   impose is listed below, not discovered later.
+
+### D0. Baselines and the pressure corpus
+ - Ir + wall baselines per RULE B1 over bench/ (the 80..85 regs
+   family IS the pressure corpus); keep the numbers in the ledger.
+
+### D1. Live intervals
+ - Per run, from livein/liveout: per-slot interval lists WITH HOLES
+   ({slot, [start_pc, end_pc), next_use chain, weight}). A dev dump
+   (-rt entry: intervals agree with the liveness fixpoint at every
+   pc - derive the check from the SPEC, not from the builder; the
+   oracle-shares-its-subject trap is recorded for exactly this).
+
+### D2. The per-pc assignment seam - RESTRUCTURING BEFORE THE BRAIN
+ - Introduce reg_at(slot, pc) / assignment map; implement it FIRST
+   as a wrapper over today's whole-run answer so every consumer
+   migrates while emission stays byte-identical (vdjcmp 116/116 is
+   the oracle for this step, exactly like the #96 batches).
+ - Consumers to migrate: read_slot/write_slot/load_operand/
+   store_dst, the two-address arms, creg()/cspill()/fcreg() callers,
+   the fwd machinery, emit_call_prologue/epilogue,
+   flush_cache/snapshot/restore/clear (RetFlush's contract becomes
+   "flush the assignment AS OF THIS PC"), exit_pc, and the
+   PER-PC ENTRY STUBS (an entry at pc P must load the assignment AT
+   P - today they rebuild the whole-run cache).
+ - The tracker learns the map (a read must match the assignment at
+   the current pc; REGTRACK aborts on drift).
+
+### D3. Linear scan with splitting (the brain)
+ - Walk intervals by start; free-until/next-use-distance; at
+   pressure evict/split the interval with the furthest next use;
+   SPLIT before helper calls for caller-saved assignments (callee-
+   saved intervals may span them - the existing spill-bracket
+   discipline retires); spill to the native-stack homes;
+   REMATERIALIZE LoadImmInt-defined values instead of spilling.
+ - Moves at split points; at LABELS (loop heads, branch joins) the
+   assignment must AGREE along every in-edge - v1: a canonical
+   per-label assignment with fixup moves on in-edges (the classic
+   resolution pass). The native back edge is the case that matters
+   (loop head reached from above AND from the back edge).
+ - COST MODEL: gp_weight seeds it; callee-saved preferred across
+   calls, caller-saved in call-free spans; rax's ABI/encoding
+   advantages live HERE (the maintainer's rule: facts in the model,
+   not per-site requests).
+ - The bad()-rules retire into structural constraints: an op that
+   takes a slot's ADDRESS (lea rdi, slot; the boxed 24-byte forms)
+   forces the interval into memory at that pc - derived from the
+   emitters' own asks, not from an opcode list.
+ - C3 type-elision and the xcache clobber masks retire likewise
+   (a helper call is a split point; a singleton grant is an
+   interval).
+
+### D4. The oracle strategy for a change that CANNOT be
+### byte-identical
+ - Correctness: the 5-mode differential, corpus plain/--levers/
+   --xrot/--cold/--nolowmem, all four fuzzers, Net 2/3, rel-hard,
+   clang, MSVC via CI - the full net, because vdjcmp stops being an
+   equality oracle the day the allocator changes emission.
+ - vdjcmp still self-tests (a binary vs ITSELF must stay 108/108) -
+   it remains the reproducibility oracle, not the change oracle.
+ - disasmcheck (objdump) still proves the dump decodes - run it on
+   the new emission.
+ - A NEW static validator (the verify_chunk philosophy, at emit
+   time): every emitted read of a slot matches the assignment at
+   that pc; every label's in-edge assignments agree; every exit
+   flushes exactly the live-and-dirty set at its pc. This is the
+   replacement for byte-identity - it must FAIL LOUDLY on a wrong
+   allocator, and be watched failing (sabotage: skip one fixup
+   move).
+ - Performance: RULE B1 full-suite A/B + callgrind on the regs
+   family and the top-8 my/cpp benches.
+
+### D5. Retirement
+ - pick_cached_slots, the pin-contract bad() tables, MAXPINS/
+   MAXSPILL knobs re-expressed against the allocator (the marginal-
+   value-of-one-register instrument must survive - re-derive it as
+   an allocator budget), JITSTATS rows for split/spill/remat counts.
+
+### D6. #101 (peephole/scheduling) happens AFTER D, on the
+### allocator's output - not before, not beside.
+
+---------------------------------------------------------------------
+## PHASE E - RETIREMENT + DOC SYNC
+ - Delete the legacy prefer masks (cost model owns preference).
+ - Re-litigate every reg:conv tag (grep reg:conv = the worklist):
+   isa/abi stay; conv shrinks to genuine protocol or converts.
+ - regcensus: the justified column should end as isa/abi/protocol
+   only; floors stay ZERO for both files.
+ - CLAUDE.md's JIT sections + docs/jit-optimizations.md entries for
+   every phase; memory files updated.
+
+## RESUME PROTOCOL (post-compaction)
+ 1. Read this file top to bottom.
+ 2. `python3 scripts/regcensus.py --gate` and `git log --oneline`
+    tell you where the arc stopped.
+ 3. The phase checklist at the top is the truth; the per-phase
+    sections carry the design decisions already made - do not
+    re-derive them.
