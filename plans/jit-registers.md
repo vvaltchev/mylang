@@ -3938,3 +3938,38 @@ register-free line - reworded (third catch for that net).
 
 Census: RDX 0; TOTAL 541. Remaining: RCX 85 (the IntBin tmp borrow
 family), RAX 456 (the staging convention).
+
+## (aw) 2026-08-22 - batch 8a: the RCX safe half; THE 8b DESIGN
+
+Tagged: the CL shift-count family reg:isa (the ONE register the ISA
+names for a variable shift - elem_reg_shift's borrow brackets, the RR
+shift-count read), the allocator self-test line, the leaf-call
+staging, and the nstack switch pair as reg:conv(fn) regions. Census:
+RCX 85 -> 63, TOTAL 518. vdjcmp 116/116 (comments only).
+
+### THE 8b DESIGN - the BORROW FAMILY (RCX 63 + much of RAX 455),
+### for a FRESH session (allocator-flow surgery is not end-of-session
+### work; batches 4 and 7 both proved that the hard way)
+
+The remaining RCX mass is ONE pattern in four spellings: a borrow of
+rcx with a push-when-occupied fallback -
+ - emit_op's `tmp = RCX` / `cpy = RCX` + hold()/drop() (~20 sites),
+ - RefScratch(e, RCX) and the `scr = RCX` default parameters of the
+   ref-check family,
+ - div_magic's `keep = RCX`,
+ - the cmp_reg_tag_via / store_type_tag_via literal-RCX scratch args.
+
+The conversion is hold()-ASKS-FIRST: hold(need) consults
+alloc_scratch(need, prefer RCX) and only falls back to the push when
+refused; `tmp` becomes mutable, `cpy` an alias of it. The capability
+model already expresses the ISA constraint - the IntBin shift arm
+passes need = CAP_SHIFT_CNT, which only rcx satisfies, so the CL
+requirement is enforced by the allocator instead of by luck. THE
+AUDIT EACH ARM NEEDS before flipping: any raw encoding inside an arm
+that spells rcx/cl in modrm bytes must be generalized first (the
+batch-4 movsd lesson), and idiv_reg(RCX) sites become idiv_reg(tmp).
+Watched-failing plan: the grant-moved liveness counter (the ctor
+pattern) per family, plus the existing tracker as referee.
+
+RAX 455 after that is the staging convention - read_slot/write_slot/
+store_dst's caller contract - the arc's finale (#101 adjacency).

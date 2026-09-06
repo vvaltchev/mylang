@@ -6680,6 +6680,9 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
  * rcx/r9 are free. cur == null -> jump to the plain path (returned fixup);
  * else mark active, save rsp, switch to the baked top. POST: restore rsp
  * + re-arm cur (runs on the outermost path only). */
+/* reg:conv(fn) - the native-stack SWITCH protocol (entry side):
+ * runs only at MyLang-call boundaries, where the clobber mask has
+ * denied the whole caller-saved pool. */
 static size_t emit_nstack_switch_pre(Emitter &e)
 {
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_cur));
@@ -6693,6 +6696,7 @@ static size_t emit_nstack_switch_pre(Emitter &e)
     return j_plain;
 }
 
+/* reg:conv(fn) - the switch's RETURN side, same denial. */
 static void emit_nstack_switch_post(Emitter &e)
 {
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_saved_rsp));
@@ -9687,7 +9691,7 @@ static bool reg_model_check(std::string &err)
     }
     /* the shift count is cl and nothing else */
     for (uint8_t r = 0; r < 16; r++)
-        if (((gp_caps(r) & CAP_SHIFT_CNT) != 0) != (r == RCX)) {
+        if (((gp_caps(r) & CAP_SHIFT_CNT) != 0) != (r == RCX)) {  /* reg:conv */
             snprintf(buf, sizeof(buf),
                      "reg %u: CAP_SHIFT_CNT must be RCX alone", r);
             err = buf; return false;
@@ -11615,11 +11619,11 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint32_t pc,
     const uint8_t modrm = aop == Op::shl ? 0xE0
                         : aop == Op::shr ? 0xF8 : 0xE8;
     /* test rcx,rcx; js Lraise (negative count throws) */
-    e.test_rr(RCX, RCX);
+    e.test_rr(RCX, RCX);  /* reg:isa */
     e.u8(0x0F); e.u8(0x88);
     const size_t js = e.pos(); e.u32(0);
     /* cmp rcx,64; jl Lnorm */
-    e.cmp_reg_imm(RCX, 64);
+    e.cmp_reg_imm(RCX, 64);  /* reg:isa */
     e.u8(0x0F); e.u8(0x8C);
     const size_t jl = e.pos(); e.u32(0);
     if (aop == Op::shr) {
@@ -12464,12 +12468,12 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     const auto elem_reg_shift = [&](uint8_t cnt) {
         const uint8_t modrm = aop == Op::shl ? 0xE0
                             : aop == Op::shr ? 0xF8 : 0xE8;
-        const bool borrow = cnt != RCX;
+        const bool borrow = cnt != RCX;  /* reg:isa */
         if (borrow) {
-            e.push_reg(RCX);
-            e.mov_rr(RCX, cnt);
+            e.push_reg(RCX);  /* reg:isa */
+            e.mov_rr(RCX, cnt);  /* reg:isa */
         }
-        e.cmp_reg_imm(RCX, 64);
+        e.cmp_reg_imm(RCX, 64);  /* reg:isa */
         const size_t jl = e.j8(0x7C);            /* jl .norm */
         if (aop == Op::shr)
             e.sar_rr_imm8(RAX, 63);              /* full sign-fill */
@@ -12481,7 +12485,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.u8(0x48); e.u8(0xD3); e.u8(modrm);     /* shl/sar/shr rax, cl */
         e.patch8(jd, e.pos());
         if (borrow)
-            e.pop_reg(RCX);
+            e.pop_reg(RCX);  /* reg:isa */
     };
 
     /*
@@ -14142,10 +14146,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             }
         } else {
             if (!fb)
-                read_slot(e, RCX, in.b_slot());  /* cache-aware (the
-                                                  * classifier counts this
-                                                  * shift count as a
-                                                  * cacheable int use) */
+                /* cache-aware (the classifier counts this shift count
+                 * as a cacheable int use); CL is the ISA's one variable
+                 * shift-count register */
+                read_slot(e, RCX, in.b_slot());  /* reg:isa: CL */
             emit_reg_shift(e, ck, shl ? Op::shl : Op::shr, pc, old_pc);
         }
         /* lever A, the PRODUCER side - identical to the arith family's.
@@ -17100,12 +17104,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* mov rax, [rax + desc.vm_chunk] */
         e.load_base(RAX, RAX, static_cast<int32_t>(L.desc_vm_chunk));
         /* mov rcx, [rax + chunk.native.base]*/
-        e.load_base(RCX, RAX, static_cast<int32_t>(L.chunk_native_base));
+        e.load_base(RCX, RAX,                    /* reg:conv */
+                    static_cast<int32_t>(L.chunk_native_base));
         /* mov rdx, [rax + native_entry_off]*/
         e.load_base(RDX, RAX,                    /* reg:conv */
                     static_cast<int32_t>(L.chunk_native_entry));
         e.add_rr(RCX, RDX);  /* reg:conv */
-        e.call_reg(RCX);             /* call rcx (the callee fragment) */
+        e.call_reg(RCX);   /* reg:conv: call the callee frag */
         /* G1 step 2: a leaf call is the OTHER fragment-to-fragment call
          * form, so its return address must be in the table or the entry
          * RA check false-aborts on every leaf call. No record is pushed
