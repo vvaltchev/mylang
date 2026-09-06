@@ -203,5 +203,20 @@ else
     fail "-v: MYLANG_NO_LOWMEM=1 did not refuse the arena [$out]"
 fi
 
+# #96: the hardcoded-register RATCHET (scripts/regcensus.py header has
+# the rule). A source-analysis check, not a binary one - it lives here
+# because every CI lane and the local battery already run this script.
+# The gate fails on drift in EITHER direction: a new unjustified site,
+# or an improvement whose floor was not lowered in the same commit.
+here=$(dirname "$0")
+if command -v python3 >/dev/null 2>&1 && \
+   [ -f "$here/../scripts/regcensus.py" ]; then
+    if python3 "$here/../scripts/regcensus.py" --gate >/dev/null 2>&1; then
+        pass "regcensus --gate: UNJUSTIFIED hardcoded-register floors hold"
+    else
+        fail "regcensus --gate: floors drifted (run scripts/regcensus.py --gate)"
+    fi
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc

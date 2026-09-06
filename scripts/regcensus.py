@@ -78,6 +78,29 @@ this scan cannot see, and an accessor's IMPLICIT operands are invisible
 to it (`idiv_rdi` also clobbers rax and rdx; `store_elem_int_rdi` reads
 rcx and r9 - the encoding says so, the name does not). Read the sites
 before trusting a count.
+
+THE JUSTIFICATION RULE (maintainer-set, 2026-08-22). An emitter site
+may demand a SPECIFIC register only with a HARD reason; everything
+else must ask alloc_scratch(caps). A hard reason is declared ON THE
+LINE with a tag inside a comment:
+
+    reg:isa     the INSTRUCTION requires it (cl shift counts,
+                rax:rdx for cqo/idiv/mul, movabs-A forms, ...)
+    reg:abi     a calling convention outside a prologue bracket
+                (the fragment's own entry/exit protocol: the resume
+                pc returned in eax, EnterNative's status, ret values)
+    reg:conv    a documented fragment-WIDE convention that functions
+                as an internal ABI (the t_int/t_float singletons in
+                rsi/r8 that helpers rely on)
+
+A tag with any other reason word is an ERROR; a tag on a line with no
+hardcoded register is reported STALE (the norec-coverage exemption
+pattern - a marker that cannot rot silently). The table splits the
+unbracketed column into justified / UNJUSTIFIED, and UNJUSTIFIED is
+the work. `--gate` compares each register's UNJUSTIFIED count against
+scripts/regcensus_floor.txt and FAILS on any increase - the ratchet:
+a conversion batch lowers the floor in the same commit, a regression
+cannot land silently.
 """
 
 import re
@@ -233,8 +256,11 @@ def census(path):
         if m and m.group(1) in acc:
             decl_line[i] = m.group(1)
 
-    res = {MERGE.get(r, r): {'br': 0, 'un': 0, 'lines': []} for r in REGS}
+    res = {MERGE.get(r, r): {'br': 0, 'un': 0, 'ju': 0, 'lines': []}
+           for r in REGS}
     res['__raw__'] = raw_encodings(lines)
+    TAG = re.compile(r'reg:(\w+)')
+    tag_errors, stale_tags = [], []
     for i, l in enumerate(lines):
         if 'enum Reg' in l:
             continue
@@ -258,14 +284,37 @@ def census(path):
                 n = len(re.findall(r'\b' + re.escape(name) + r'\b', l))
                 if n:
                     hits[r] = hits.get(r, 0) + n
+        # the justification tag lives in a COMMENT, so it is read from
+        # the RAW line (the scrub removed it from `l`)
+        m = TAG.search(rawl[i])
+        tag = m.group(1) if m else None
+        if tag is not None and tag not in ('isa', 'abi', 'conv'):
+            tag_errors.append((i + 1, tag))
+            tag = None
+        if tag is not None and not hits:
+            stale_tags.append(i + 1)
         for r0, n in hits.items():
             r = MERGE.get(r0, r0)
             if bracketed[i]:
                 res[r]['br'] += n
+            elif tag is not None:
+                res[r]['ju'] += n
             else:
                 res[r]['un'] += n
                 res[r]['lines'].append(i + 1)
+    res['__tag_errors__'] = tag_errors
+    res['__stale_tags__'] = stale_tags
     return res, rawl, acc
+
+
+def read_floor(path):
+    floor = {}
+    for l in open(path):
+        l = l.split('#', 1)[0].strip()
+        if l:
+            k, v = l.split()
+            floor[k] = int(v)
+    return floor
 
 
 def main():
@@ -284,6 +333,19 @@ def main():
         print()
 
     raw = res.pop('__raw__')
+    tag_errors = res.pop('__tag_errors__')
+    stale_tags = res.pop('__stale_tags__')
+    rc = 0
+    if tag_errors:
+        rc = 1
+        for n, t in tag_errors:
+            print("⛔ UNKNOWN reg: tag '%s' at line %d "
+                  "(isa/abi/conv only)" % (t, n))
+    if stale_tags:
+        rc = 1
+        for n in stale_tags:
+            print("⛔ STALE reg: tag at line %d - no hardcoded register "
+                  "on the line; delete or fix it" % n)
     if raw:
         print("⛔ BLIND SPOT: %d line(s) emit a hand-encoded instruction "
               "(two or more\n   literal bytes in a row). Their register "
@@ -293,19 +355,47 @@ def main():
 
     print("hardcoded scratch registers in src/jit.cpp "
           "(code only; comments/strings removed)\n")
-    print("%-6s %10s %13s %7s   %s"
-          % ("reg", "bracketed", "UNbracketed", "total", "cost to free"))
-    tb = tu = 0
+    print("%-6s %10s %10s %12s %7s"
+          % ("reg", "bracketed", "justified", "UNJUSTIFIED", "total"))
+    tb = tj = tu = 0
     for r in REPORT:
-        b, u = res[r]['br'], res[r]['un']
+        b, j, u = res[r]['br'], res[r]['ju'], res[r]['un']
         tb += b
+        tj += j
         tu += u
-        verdict = "CHEAP" if u <= 20 else ("mid" if u <= 80 else "expensive")
-        print("%-6s %10d %13d %7d   %s" % (r, b, u, b + u, verdict))
-    print("%-6s %10d %13d %7d" % ("TOTAL", tb, tu, tb + tu))
-    print("\nonly the UNbracketed column is work: a use between "
-          "emit_call_prologue\nand emit_call_epilogue cannot disturb a pin "
-          "(the prologue spilled it).")
+        print("%-6s %10d %10d %12d %7d" % (r, b, j, u, b + j + u))
+    print("%-6s %10d %10d %12d %7d" % ("TOTAL", tb, tj, tu, tb + tj + tu))
+    print("\nbracketed = inside a call prologue/epilogue (the spill "
+          "covers it);\njustified = tagged reg:isa / reg:abi / reg:conv "
+          "on the line.\nUNJUSTIFIED is the work: it must reach ZERO "
+          "(maintainer mandate,\n2026-08-22) - every such site converts "
+          "to alloc_scratch(caps).")
+
+    if '--gate' in sys.argv:
+        here2 = os.path.dirname(os.path.abspath(__file__))
+        floor = read_floor(os.path.join(here2, 'regcensus_floor.txt'))
+        for r in REPORT + ['TOTAL', 'RAWENC']:
+            got = (tu if r == 'TOTAL'
+                   else len(raw) if r == 'RAWENC'
+                   else res[r]['un'])
+            want_ = floor.get(r)
+            if want_ is None:
+                print("gate: no floor for %s" % r)
+                rc = 1
+            elif got > want_:
+                print("⛔ GATE: %s UNJUSTIFIED %d > floor %d - a new "
+                      "hardcoded site landed" % (r, got, want_))
+                rc = 1
+            elif got < want_:
+                print("gate: %s improved (%d < floor %d) - LOWER the "
+                      "floor in scripts/regcensus_floor.txt in this "
+                      "commit" % (r, got, want_))
+                rc = 1
+        if rc == 0:
+            print("gate: every register at its floor.")
+        sys.exit(rc)
+    if rc:
+        sys.exit(rc)
 
     if '--raw' in sys.argv:
         print("\n=== hand-encoded instructions (%d) ===" % len(raw))
