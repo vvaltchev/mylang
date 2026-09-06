@@ -3775,3 +3775,28 @@ for reach); the hand-coded movzx became a generic encoder. Net:
 jit_staging_clobber_sweep, 4 programs x 9 rotations vs the
 tree-walker oracle. docs/jit-optimizations.md "#96 RE-OPENED" has the
 full record. Census: 1137 -> 1132 UNJUSTIFIED, RAWENC 20 -> 19.
+
+## (aq) 2026-08-22 - batch 2: RDI reaches ZERO unjustified
+
+The first register fully clean. 26 unbracketed sites classified:
+ - 4 CONVERTED: the elem-store divisor gates spelled literal RDI/RDX
+   where the plan's sc.val/sc.count were meant - correct today ONLY
+   because the elem-role reservation keeps val==RDI/count==RDX (an
+   invisible coupling; vdjcmp 116/116 byte-identical after, which is
+   the proof the respelling is pure);
+ - 19 TAGGED reg:abi - the fragment entry/exit protocol (rbx <- arg0,
+   the window argument save), the ABI-arg wrapper seams
+   (lea_rdi/slots_to_arg0), and helper-argument staging outside
+   prologue brackets (the M5b/sync machinery's own save/restore);
+ - 2 TAGGED reg:conv - the ElemScratch role default + ELEM_CAND (the
+   allocator's own preference metadata);
+ - 1 census artifact fixed (the enum Reg CONTINUATION lines were
+   counted; the skip now spans the block).
+The stale-tag detector earned its keep immediately: two tags left on
+declaration lines whose register moved to a continuation line were
+reported STALE and rc=1'd the census - the exemption-rot net working
+on its author. Census: 1094 -> 1087 UNJUSTIFIED (the shared-line tags
+also justified one metadata mention each of RSI/R8/R9/R10/R11);
+floors lowered. Next: RSI (36) and R9 (27) are the cheapest;
+RCX/RDX's remaining mass is the IntBin tmp-borrow family and the
+elem-role spellings, which convert with their emitters.
