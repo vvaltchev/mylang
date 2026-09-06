@@ -4147,3 +4147,72 @@ preamble, emit_exc_stamp, emit_raise, bump_at's push-bracketed rax,
 jit_compile_chunk's residue, and the g_fwd.res_reg reset line (the
 bus default - the LAST line, deliberately, since it names the whole
 convention).
+
+## (bb) 2026-08-22 - batch 9d: UNJUSTIFIED REACHES ZERO. The mandate's
+## census target is met - every register, every site
+
+The residue, converted: the store-elem inline tiers (both take a
+case-wide window for the shobj role; mov_byte_rax_imm DELETED for
+mov_byte_base_imm), the C1 hoist preamble's nav lambda, emit_ctx_chain
+(a plain ask - no caller holds a window at that point), emit_exc_stamp
+/ emit_raise / emit_bake_call_site / emit_float_load via the new
+REUSE form (AccScratch::reuse_t: inside an open window the caller's
+staged value is dead on a raise path, so the stamp recycles the
+window's register - busy-but-not-pin proves the bit is a take, and no
+whitelisted op raises, so busy-by-pin is ML_CHECK-unreachable),
+store_dst's cold-arm reload restored to the CALLER's register
+(pin-aware: the tracker aborted the naive form instantly - a pinned
+src was already restored by the bracket and keeps the legacy dead
+accumulator load, byte-identical). Tagged with their hard reasons:
+bump_at (zero register-state footprint at arbitrary emission points -
+asking inside a window would change the emission), the model
+self-test's example operand, ElemScratch's idiv-doomed obj, and THE
+BUS DEFAULT (g_fwd.res_reg = RAX) - the one conv line that names the
+whole accumulator convention, left standing on purpose.
+
+TWO MORE PRE-EXISTING DEFECTS SURFACED BY THE CONVERSION, the arc's
+sixth and seventh:
+ - store_dst's cold arm could be handed a PINNED src register and its
+   unconditional rax reload was a dead store that happened to be
+   harmless - the tracker named it the moment the reload became the
+   src register;
+ - THE BAKED-PADDING NONDETERMINISM: LoadConstV/LoadBuiltinV memcpy'd
+   a scalar constant's FULL 24-byte payload into movabs immediates,
+   including the union's indeterminate padding - so the emitted bytes
+   depended on what the emit-time stack held, and an unrelated edit
+   shifting the stack made two same-source binaries dump differently
+   on 4 corpus programs (vdjcmp caught it; HEAD-vs-HEAD agreed, so it
+   had been hiding behind stack-layout luck since the ops were built).
+   Scalars now bake their ONE meaningful qword (none: zero of them)
+   with a zero tail. The first fix assumed trivial == one qword and a
+   baked `len` lost its function pointer two qwords in - Builtin is
+   trivial with a MULTI-qword payload - caught by -rt in seconds.
+
+DRIFT, fully classified: 22 corpus programs, every changed line one
+of two shapes - a padding immediate becoming 0 (the determinism fix)
+or the cold-arm reload's register substitution. Ir spot-checks flat
+(44_primes -0.0004%, 36_sum -0.002%). -rt 1946/1946 both arenas;
+corpus plain green; gate at ZERO floors in every lane.
+
+Census: RAX 0. TOTAL UNJUSTIFIED 0. Justified 741 + bracketed 291.
+What remains register-hardcoded in src/jit.cpp is exactly the set
+with a written hard reason on its line: ISA (idiv/imul/cqo, CL, the
+setcc byte forms), ABI (SysV args/returns, the fragment protocol),
+and the tagged conventions (the type-singleton registers, the bus
+default, the zero-footprint counter bracket).
+
+SABOTAGE DISPOSITIONS: the reuse form's pin check watched GREEN by
+design - busy-by-pin is unreachable while no whitelisted op raises,
+so it is the defensive-check class (the escape analysis's
+reassignment-guard precedent): it fires the day the gates die, and
+deleting it costs nothing today, which is exactly why it must stay.
+The bake fix's failing proof happened LIVE during development: the
+first predicate (trivial == one qword) cost a baked `len` its
+function pointer and -rt named it at 1944/1946.
+
+THE ENDGAME (recorded, not scheduled): with every staging site asking,
+run_may_pin_rax + the coverage gate are the last audited tables
+keeping rax out of the pin pool - ra.busy now carries the same truth
+structurally. Retiring them (and letting rax pin generally) is #101-
+adjacent work; the alt-grant and reuse arms are already in place for
+the day the gates die.
