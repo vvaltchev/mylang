@@ -1,0 +1,42 @@
+# The compound shift/bitwise assignments (<<= >>= >>>= &= |= ^=) are
+# byte-identical sugar for `x = x OP rhs`. Exercise every op over scalars,
+# elements, dict keys, struct fields, globals and captures, hot enough for
+# the JIT to compile the loop (the IntBin lowering + the two-address arm).
+var n = 20000 + int(runtime(0));
+var s = 1 << 40;
+s = s + int(runtime(0));
+var arr = [8, 1, -64];
+var G = 32;
+func nudge() { G >>= 1; G |= 1; }
+var cap = func[G]() { G <<= 1; return G; };
+struct P { int v; }
+var p = P(4096);
+
+for (var i = 0; i < n; i++) {
+    s >>= 1; s += i; s <<= 1; s >>= 1;
+    s &= 281474976710655; s |= 1; s ^= 1;
+}
+print(s);
+
+arr[0] >>= 2; arr[1] <<= 5; arr[2] >>>= 58;
+print(arr);
+
+var d = {"k": 12};
+d.k &= 10; d["k"] |= 5;
+print(d.k);
+
+nudge(); print(G);
+print(cap());
+
+p.v >>= 3; p.v ^= 6;
+print(p.v);
+
+var dyn z = runtime(-8);
+z >>= 1; z >>>= 60; z <<= 2;
+print(z);
+
+# saturation + errors
+var a = 1; a <<= 100; print(a);
+var b = -1; b >>= 999; print(b);
+try { var c = 4; c <<= int(runtime(0 - 1)); }
+catch (InvalidValueEx) { print("neg"); }

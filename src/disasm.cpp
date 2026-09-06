@@ -142,6 +142,16 @@ std::string store_op(Op aop)
     return aop == Op::invalid ? std::string("=") : opsym(aop) + "=";
 }
 
+/* The Expr14-op spelling (`=` / `+=` / `<<=` / ...) for the stores whose
+ * `aop` carries the COMPOUND op, not the base arith form (DictStore,
+ * StoreMemberV, StoreElemValue, StoreElem2V). OpString already spells a
+ * compound op with its `=`, so this is a direct lookup - a new compound
+ * operator renders here with no edit. */
+static std::string expr14_op(Op aop)
+{
+    return aop == Op::assign ? std::string("=") : opsym(aop);
+}
+
 /* collect_funcs moved to codegen.cpp (shared with the VM's AOT precompile);
  * declared in codegen.h. */
 
@@ -1464,22 +1474,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::DictStore: {
             /* aop is the Expr14 op (assign/addeq/...), not the arith form. */
-            const char *o = in.aop == Op::assign ? "=" :
-                            in.aop == Op::addeq  ? "+=" :
-                            in.aop == Op::subeq  ? "-=" :
-                            in.aop == Op::muleq  ? "*=" :
-                            in.aop == Op::diveq  ? "/=" : "%=";
+            const std::string o = expr14_op(in.aop);
             row << "dict.store   " << bref(in.target, in.target2) << "["
                 << RI(in.a(), false) << "] " << o << " " << RI(in.b(), false);
             break;
         }
         case OpCode::StoreMemberV: {
             /* aop is the Expr14 op; the member name comes from the pool. */
-            const char *o = in.aop == Op::assign ? "=" :
-                            in.aop == Op::addeq  ? "+=" :
-                            in.aop == Op::subeq  ? "-=" :
-                            in.aop == Op::muleq  ? "*=" :
-                            in.aop == Op::diveq  ? "/=" : "%=";
+            const std::string o = expr14_op(in.aop);
             row << "member.store " << bref(in.target, in.target2) << "."
                 << chunk.member_keys[in.a_lit()].memId.get_type()
                        ->to_string(chunk.member_keys[in.a_lit()].memId)
@@ -1487,21 +1489,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         }
         case OpCode::StoreElemValue: {
-            const char *o = in.aop == Op::assign ? "=" :
-                            in.aop == Op::addeq  ? "+=" :
-                            in.aop == Op::subeq  ? "-=" :
-                            in.aop == Op::muleq  ? "*=" :
-                            in.aop == Op::diveq  ? "/=" : "%=";
+            const std::string o = expr14_op(in.aop);
             row << "store.elem.v " << bref(in.target, in.target2) << "["
                 << RI(in.a(), false) << "] " << o << " " << RI(in.b(), false);
             break;
         }
         case OpCode::StoreElem2V: {
-            const char *o = in.aop == Op::assign ? "=" :
-                            in.aop == Op::addeq  ? "+=" :
-                            in.aop == Op::subeq  ? "-=" :
-                            in.aop == Op::muleq  ? "*=" :
-                            in.aop == Op::diveq  ? "/=" : "%=";
+            const std::string o = expr14_op(in.aop);
             row << "store.elem2 " << D(in.target2) << "[" << RI(in.a(), false)
                 << "][" << RI(in.b(), false) << "] " << o << " " << D(in.target);
             break;

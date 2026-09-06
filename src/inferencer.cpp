@@ -464,14 +464,7 @@ bool Inferencer::is_builtin(const UniqueId *name)
 
 Op Inferencer::compound_binop(Op op)
 {
-    switch (op) {
-        case Op::addeq: return Op::plus;
-        case Op::subeq: return Op::minus;
-        case Op::muleq: return Op::times;
-        case Op::diveq: return Op::div;
-        case Op::modeq: return Op::mod;
-        default:        return Op::invalid;
-    }
+    return compound_assign_base(op);    /* operators.h - the single map */
 }
 
 /* True when control cannot fall off the end of `n` (it always returns/throws).

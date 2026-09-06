@@ -328,7 +328,9 @@ aspects:
 
   - The assignment operator `=` can be used like in `C`, inside expressions, but
     there's no such thing as the comma operator, because of the array-expansion
-    feature.
+    feature. The full C set of compound assignments is supported: `+=` `-=`
+    `*=` `/=` `%=` and (int-only, like their binary forms) `<<=` `>>=` `>>>=`
+    `&=` `|=` `^=` — each behaves exactly like `x = x OP rhs`.
 
   - MyLang supports both the classic `for` loop and an explicit `foreach` loop.
 
@@ -1117,7 +1119,11 @@ Key rules:
     c` parses as `a & (b == c)`, the classic C trap; parenthesize as `(a & b) ==
     c`). The `~` token doubles as the `dyn` modifier in a *parameter* position
     (`func f(~x)`), but that is a declaration, not an expression, so the two
-    never collide.
+    never collide. Every one of these (except unary `~`) also has the compound
+    assignment form — `x <<= 1`, `x >>= 2`, `x >>>= 3`, `x &= m`, `x |= m`,
+    `x ^= m` — identical to `x = x OP rhs`, with the same int-only rule and
+    the same shift-count semantics (a negative count throws `InvalidValueEx`,
+    a count `>= 64` saturates).
   * **Ternary conditional** `cond ? a : b` — evaluates `cond` (any truthy value,
     like `if`), then **only** the taken branch (short-circuit). Its type is the
     join of the two branches (`c ? 1 : 2.0` is `float`); branches of

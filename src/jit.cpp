@@ -12948,7 +12948,9 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
     if (!sc.ok)
         return false;          /* no free scratch - the helper tier */
     e.scratch2(sc.idx, sc.val);      /* index in r9; the value in rdi/dil */
-    /* the Expr14 op -> the base op (Op::invalid == plain assign) */
+    /* the Expr14 op -> the base op (Op::invalid == plain assign). The
+     * arith five only: a shift/bitwise compound (`a[i][j] <<= n`) declines
+     * to the helper tier, whose boxed store dispatches the full set. */
     Op bop;
     switch (in.aop) {
     case Op::assign: bop = Op::invalid; break;

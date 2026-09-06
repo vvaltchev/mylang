@@ -2901,12 +2901,21 @@ static inline void
 apply_compound_op(EvalValue &acc, const EvalValue &rhs, Op op)
 {
     switch (op) {
-        case Op::addeq: num_bin_op(acc, rhs, &Type::add); break;
-        case Op::subeq: num_bin_op(acc, rhs, &Type::sub); break;
-        case Op::muleq: num_bin_op(acc, rhs, &Type::mul); break;
-        case Op::diveq: num_bin_op(acc, rhs, &Type::div); break;
-        case Op::modeq: num_bin_op(acc, rhs, &Type::mod); break;
-        default:        throw InternalErrorEx();
+        case Op::addeq:  num_bin_op(acc, rhs, &Type::add);  break;
+        case Op::subeq:  num_bin_op(acc, rhs, &Type::sub);  break;
+        case Op::muleq:  num_bin_op(acc, rhs, &Type::mul);  break;
+        case Op::diveq:  num_bin_op(acc, rhs, &Type::div);  break;
+        case Op::modeq:  num_bin_op(acc, rhs, &Type::mod);  break;
+        /* int-only (like the binary forms): a non-int operand reaches the
+         * base Type's virtual, which throws TypeErrorEx - num_bin_op's
+         * float promotion routes a float there, exactly as `x << 2.5`. */
+        case Op::shleq:  num_bin_op(acc, rhs, &Type::shl);  break;
+        case Op::shreq:  num_bin_op(acc, rhs, &Type::shr);  break;
+        case Op::ushreq: num_bin_op(acc, rhs, &Type::ushr); break;
+        case Op::bandeq: num_bin_op(acc, rhs, &Type::band); break;
+        case Op::boreq:  num_bin_op(acc, rhs, &Type::bor);  break;
+        case Op::bxoreq: num_bin_op(acc, rhs, &Type::bxor); break;
+        default:         throw InternalErrorEx();
     }
 }
 
