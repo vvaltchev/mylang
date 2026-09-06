@@ -112,11 +112,22 @@ mid-emission return false kills the run's nativization" is a known,
 handled event) and the run RE-EMITS ONCE with rax added to the
 denied mask. Sound BY CONSTRUCTION: the decision is made from what
 emission actually did, not from a prediction table; the cost is one
-wasted partial emission on a rare shape. PREREQUISITE to verify
-before building: read the run-emission loop's existing
-bail/rollback path (what state is rewound - e.b, call_relocs,
-labels/fixups, the tracker, the cache vectors) and reuse it for the
-restart rather than inventing rollback.
+wasted partial emission on a rare shape. PREREQUISITE VERIFIED
+(2026-08-22): the existing bail path (`emit_ok = false` -> jit.cpp
+~20915 `if (!emit_ok) { g_hoist = {}; g_hoist2 = {}; e.b.clear();
+return; }`) is a TOTAL DISCARD at the emission function's own level
+- the function is simply re-callable. THE RETRY IMPLEMENTATION:
+ 1. emit_call_prologue: if a rax PIN is in the cache, set a new
+    `e.rax_conflict = true` and take the emit_ok=false path (no new
+    rollback machinery - the discard already works);
+ 2. the caller re-invokes the run's emission ONCE with rax added to
+    the denied mask (a `for (int attempt : {0, 1})` around the
+    existing call, second attempt only on rax_conflict);
+ 3. an ML_CHECK that attempt 2 never conflicts again (rax denied ->
+    no rax pin -> no conflict, structurally).
+Also confirm which state OUTSIDE the Emitter the first attempt
+mutated (labels/fixups/h_cold vectors passed by reference; remap is
+read-only) - clear those the way the discard path leaves them.
 FALLBACK if rollback is messier than it looks: v0 ships with rax
 denied UNCONDITIONALLY except in runs the pick proves trivially
 bracket-free by construction... does NOT exist without a table - so
