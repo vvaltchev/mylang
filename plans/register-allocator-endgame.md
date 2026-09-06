@@ -20,7 +20,8 @@ STATUS LEDGER (update as steps land):
  - [x] Census-to-zero milestone (1137 -> 0, plans/jit-registers.md
        entries ap..bb) - the enabling precondition for everything
        here: every emitter consumes register VALUES now.
- - [ ] Phase A - the rax endgame
+ - [x] Phase A - the rax endgame (A1-A3 landed; A2's sabotage +
+       measurement in the same batch; see the ledger entry)
  - [ ] Phase B - the same-kind sweep
  - [ ] Phase C - the float (xmm) mandate
  - [ ] Phase D - the interval allocator (splitting)
@@ -102,6 +103,23 @@ A0 ANALYSIS RESULT (2026-08-22, investigated): there is NO existing
  - a NEW hand list would be an audited table whose stale entry
    corrupts a pin (the DANGEROUS failure direction) - inventing one
    is the exact thing this arc deletes.
+
+DESIGN REFINEMENT (2026-08-22, during implementation): the retry
+distills to ONE seam, CONFLICT-EVICT. Emitter::rax_pin_conflict():
+if a pin occupies rax -> remove it from the cache list, free bit 0,
+set e.rax_conflict. Called from (1) emit_call_prologue (the
+status-clobber class), (2) acc_take when rax is busy-BY-PIN (the
+staging class - after eviction the take proceeds and gets rax, so
+every downstream acc.r==RAX assumption, incl. the idiv ML_CHECKs,
+HOLDS on the doomed attempt - no per-arm special cases), (3) the
+reuse form's pin branch. The doomed attempt finishes emitting
+(tracker-consistent post-eviction; its runtime wrongness is
+irrelevant - it is DISCARDED), and the chunk re-emits once with a
+global deny flag. rax pins therefore survive exactly the runs where
+NO conflicting event fires - the old whitelist's semantic set,
+derived structurally from what emission DID. Expected: byte-
+identical final emission on the whole corpus (any vdjcmp drift must
+be root-caused, not accepted).
 
 THE CHOSEN RESOLUTION - (O) RE-EMIT ON CONFLICT, zero new tables:
 the pick may hand rax to a pin optimistically (it is LAST in

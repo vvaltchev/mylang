@@ -78,6 +78,7 @@ unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
 unsigned long g_jit_range_share = 0;   /* #96 inc-2: executed range seams */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
 unsigned long g_jit_two_addr_reg = 0;  /* #96: two-address PINNED ops */
+unsigned long g_jit_rax_retries = 0;   /* Phase A: conflict re-emissions */
 unsigned long g_jit_step_imm = 0;      /* #96: pinned counted-loop steps */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
@@ -1687,6 +1688,14 @@ struct Emitter {
         for (uint8_t r = 0; r < 16; r++)
             if (gp_caps(r) & CAP_CALLEE_SAVED)
                 cs |= 1u << r;
+        /* Phase A: rax stopped being run-denied, which would have
+         * opened it to EVERY ask - but the accumulator convention
+         * (every op's staging, the fwd bus default, the helper-status
+         * reads) needs rax reachable ONLY through acc_take and the
+         * pin pick. An ordinary scratch grant of rax would sit inside
+         * some op while that op's own accumulator ask finds its
+         * register taken. */
+        cs |= 1u << RAX;                               /* reg:conv */
         const int r = ra.take(need | CAP_ALLOCATABLE, prefer,
                               exclude | cs);
         if (r >= 0)
@@ -1714,11 +1723,41 @@ struct Emitter {
      * refusal is structurally unreachable today - AccScratch below
      * turns it into an alternative grant, the endgame arm.
      */
+    /*
+     * Phase A (plans/register-allocator-endgame.md): THE CONFLICT
+     * EVICTION. An emission event that cannot coexist with a rax PIN
+     * - a helper-call bracket (the ABI status and the pin compete for
+     * rax and no reload order reconciles them), an accumulator ask, a
+     * raise-path reuse - EVICTS the pin from the model, flags the
+     * conflict, and lets the DOOMED attempt finish emitting (tracker-
+     * consistent after the eviction; its runtime wrongness is
+     * irrelevant - the chunk re-emits once with rax denied and the
+     * first buffer is discarded). rax pins therefore survive exactly
+     * the runs where no conflicting event fires - the semantic set
+     * the deleted run_may_pin_rax whitelist approximated, now derived
+     * from what emission actually DOES instead of from a table.
+     */
+    bool rax_conflict = false;
+    void rax_pin_conflict()
+    {
+        if (!reg_holds_pin(RAX))                       /* reg:conv */
+            return;
+        rax_conflict = true;
+        for (size_t i = 0; i < cache.size(); i++) {
+            if (cache[i].reg == RAX) {                 /* reg:conv */
+                cache.erase(cache.begin()
+                            + static_cast<ptrdiff_t>(i));
+                break;
+            }
+        }
+        ra.give(RAX);                                  /* reg:conv */
+    }
     int acc_take()
     {
         check_pins_are_busy();
+        rax_pin_conflict();          /* a pinned rax: evict + retry */
         if (ra.busy & (1u << RAX))                     /* reg:conv */
-            return -1;
+            return -1;               /* an OPEN WINDOW: a caller bug */
         ra.busy |= 1u << RAX;                          /* reg:conv */
         trk_takes++;
         return RAX;                                    /* reg:conv */
@@ -5191,10 +5230,11 @@ struct AccScratch {
     AccScratch(Emitter &em, reuse_t) : e(em)
     {
         on = true;
+        e.rax_pin_conflict();        /* a pinned rax: evict + retry */
         if (e.reg_is_occupied(RAX)) {                  /* reg:conv */
-            ML_CHECK_MSG(!e.reg_holds_pin(RAX),        /* reg:conv */
-                         "raise-path reuse met a rax PIN");
-            alt = -3;             /* recycled: the dtor frees nothing */
+            alt = -3;             /* an open WINDOW: recycle - the
+                                   * staged value is dead on a raise
+                                   * path; the dtor frees nothing */
             return;               /* r is already rax */
         }
         const int g = e.acc_take();
@@ -5219,9 +5259,10 @@ struct AccScratch {
             r = static_cast<uint8_t>(g);
             return;
         }
-        ML_CHECK_MSG(false, "accumulator ask refused: a staging op "
-                            "in a rax-pinned run (the run_may_pin_rax "
-                            "+ coverage gates should forbid this)");
+        ML_CHECK_MSG(false, "accumulator ask refused with no rax pin "
+                            "present: a DOUBLE WINDOW (one AccScratch "
+                            "per case; sub-emitters take the register "
+                            "as a parameter or use the reuse form)");
         alt = e.alloc_scratch(need);
         ML_CHECK_MSG(alt >= 0, "accumulator alternative grant failed");
         if (alt >= 0)
@@ -5445,6 +5486,11 @@ static ML_ALWAYS_INLINE bool jit_reg_is_callee_saved(uint8_t r)
 
 static void emit_call_prologue(Emitter &e)
 {
+    /* Phase A: after a helper call the ABI status and a rax pin would
+     * COMPETE for rax (the ~60 `test eax, eax` sites read the status
+     * after the epilogue, so no reload order reconciles them) - evict
+     * the pin and let the retry re-emit the chunk with rax denied. */
+    e.rax_pin_conflict();
     /* spilling stores each pin REGISTER to its slot; done while one is
      * borrowed it stores the borrowed-away temp AS the slot's value -
      * the exact mechanism that sank the arm() guard */
@@ -8044,8 +8090,10 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
          * accumulator load is kept for it - dead, but byte-identical */
         if (!e.reg_holds_pin(src_reg))
             e.load(src_reg, a.payload);
-        else
+        else if (!e.reg_holds_pin(RAX))          /* reg:conv */
             e.load(RAX, a.payload);              /* reg:conv */
+        /* both pinned: the load was dead anyway - emit nothing
+         * (reachable only in a rax-pinned run; Phase A) */
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
         e.patch32_here(jb_fast);              /* fast: */
         e.store_type_tag(a.type, jit_layout().t_int, RSI);  /* reg:conv */
@@ -8915,6 +8963,7 @@ void jit_stats_report()
         { "range_share",      &g_jit_range_share },
         { "two_addr",         &g_jit_two_addr },
         { "two_addr_reg",     &g_jit_two_addr_reg },
+        { "rax_retries",      &g_jit_rax_retries },
         { "step_imm",         &g_jit_step_imm },
         { "fwd",              &g_jit_fwd },
         { "fwd_local",        &g_jit_fwd_local },
@@ -9625,88 +9674,14 @@ static bool run_may_pin_rdx(const Chunk &ck, size_t begin, size_t end)
 }
 
 /*
- * #96: may this RUN spend rax as a pin? The LAST admission, and the
- * hardest, because rax is three conventions at once: the emitter's
- * accumulator (read_slot/write_slot/load_operand stage through it),
- * every helper's C-ABI return value, and the fragment ABI's own
- * return (exit_pc's resume pc). The admission survey (2026-08-21,
- * scripts/rcx_admission.sh 0 under MYLANG_REGTRACK_REPORT) measured
- * the consequence: ~2400 tracker hits across ~25 OPCODES - there is
- * no site-by-site fix, only a RUN-SHAPE gate.
- *
- * So this is a positive whitelist in the run_may_pin_rdx mould, but
- * per SHAPE, not per opcode: an op qualifies only in the form whose
- * PINNED emission path is rax-free -
- *
- *  - the specialized int arith family, ACCUMULATOR shape only
- *    (target == a_slot): the two_addr_reg path is op_rr2 /
- *    op_reg_imm / op_reg_slot on the pin, no rax. The non-accumulator
- *    shape (`s2 = s0 + s1`) takes the generic arm, which stages
- *    through rax unconditionally;
- *  - ForLoopStep / IntAddStep: the pinned halves step and compare in
- *    the pin (incdec_reg / op_reg_imm / cmp_reg_imm / cmp_rr2 /
- *    cmp_reg_slot);
- *  - Jump: no operands;
- *  - ReturnV / Halt: emit_ret_native uses rax freely but its second
- *    line is flush_cache(), so every pin is back in memory first -
- *    the same argument that keeps them in the rdx whitelist.
- *
- * Deliberately OUT, each with its reason:
- *  - the shifts: the value is staged through rax in every form
- *    (`sar rax, imm` / `sar rax, cl`);
- *  - JumpUnlessIntCmp / CmpIntV: load_operand(RAX, a) even for a
- *    pinned operand (a future creg-aware compare could join);
- *  - LoadImmInt: movabs rax + write_slot;
- *  - every element/capture/global op: `obj` is ISA-fixed rax, the
- *    chain copies stage through it;
- *  - everything boxed: read_slot/write_slot by convention.
- *
- * NECESSARY, NOT SUFFICIENT: the listed arith/step forms are rax-free
- * only when their TARGET slots are actually pinned - an unpinned
- * target falls to the generic arm. That half of the proof needs the
- * pick's output and lives at the pick site (the coverage check), not
- * here. The two gates fail CLOSED independently.
+ * Phase A (plans/register-allocator-endgame.md): the run_may_pin_rax
+ * WHITELIST and its coverage gate are DELETED. rax joins the pick
+ * optimistically; any emission event that cannot coexist with a rax
+ * pin evicts it (Emitter::rax_pin_conflict) and the chunk re-emits
+ * once with rax denied (g_jit_rax_denied). The safety fact moved from
+ * two hand-audited opcode tables into what emission actually does.
  */
-static bool run_may_pin_rax(const Chunk &ck, size_t begin, size_t end)
-{
-    for (size_t pc = begin; pc < end; pc++) {
-        const Instr &in = ck.code[pc];
-        switch (in.op) {
-        case OpCode::IntAddRR: case OpCode::IntSubRR:
-        case OpCode::IntMulRR:
-        case OpCode::IntAndRR: case OpCode::IntOrRR:
-        case OpCode::IntXorRR:
-        case OpCode::IntAddRI: case OpCode::IntSubRI:
-        case OpCode::IntMulRI:
-        case OpCode::IntAndRI: case OpCode::IntOrRI:
-        case OpCode::IntXorRI:
-            if (in.a_is_lit() || in.target != in.a_slot())
-                return false;        /* non-accumulator: generic arm */
-            break;
-        case OpCode::ForLoopStep: case OpCode::IntAddStep:
-        case OpCode::Jump:
-        case OpCode::ReturnV: case OpCode::Halt:
-            break;
-        case OpCode::LoadImmInt:
-            break;                   /* pinned form is movabs-to-pin;
-                                      * coverage requires the pin */
-        case OpCode::JumpUnlessIntCmp:
-            break;                   /* pinned `a` compares in its pin;
-                                      * coverage requires it */
-        case OpCode::IntShlRI: case OpCode::IntShrRI:
-            /* rax-free ONLY in the in-place literal form (the
-             * two-address shift); the temp/staged forms run through
-             * rax in every arm */
-            if (in.a_is_lit() || in.target != in.a_slot()
-                    || !in.b_is_lit())
-                return false;
-            break;
-        default:
-            return false;            /* unknown -> keep rax out */
-        }
-    }
-    return true;
-}
+static bool g_jit_rax_denied = false;
 
 /* Which XCACHE registers this run must NOT spend, because they still
  * hold a type singleton. Empty when both tags encode as imm32. */
@@ -9808,9 +9783,11 @@ static uint32_t jit_xcache_busy(const Chunk &ck, size_t begin, size_t end)
             break;
         }
     }
-    /* #96 rax - the 13th and last register: the shape gate (see
-     * run_may_pin_rax above); the coverage gate runs at the pick. */
-    if (!run_may_pin_rax(ck, begin, end))
+    /* Phase A: rax is OPTIMISTIC now - the conflict eviction + the
+     * one-shot re-emission replace the deleted run_may_pin_rax
+     * whitelist and its coverage gate; the deny exists only on the
+     * retry attempt. */
+    if (g_jit_rax_denied)
         busy |= 1u << 0;
     return busy;
 }
@@ -19782,6 +19759,13 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * op's fragment offset in label[]; branch ops emit local jumps
      * (patched from label[] after) or exit_pc; a trailing exit_pc handles
      * fall-through off the end. */
+    bool rax_retried = false;
+    g_jit_rax_denied = false;
+retry_emission:
+    /* Phase A: the one-shot re-emission after a rax-pin conflict. The
+     * backward goto DESTROYS everything declared below it (e included)
+     * and reconstructs fresh - the same total-discard semantics the
+     * emit_ok=false give-up path has always had. */
     Emitter e;
     std::vector<size_t> frag_off(runs.size());
     /* #162: the in-place-argument decision, refilled per fragment but
@@ -19962,70 +19946,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         if (jit_lever_off(JL_FCACHE))  fhot.clear();
         if (jit_lever_off(JL_TELIDE))  { textra.clear(); textra_f.clear(); }
         if (jit_lever_off(JL_FREAD))   fread_raw.clear();
-        /*
-         * ⛔ #96 rax, THE COVERAGE GATE - the sufficiency half of the
-         * proof run_may_pin_rax's comment promises. The whitelisted
-         * arith/step forms are rax-free only on their PINNED paths, so
-         * every slot they target must actually be in `hot`; one
-         * unpinned target means one op on the generic arm, which
-         * stages through rax. Decided HERE because only the pick's
-         * output answers it - and BEFORE the assignment, so denying
-         * rax simply shrinks the budget by one (pop the coldest pick)
-         * instead of un-assigning a register.
-         *
-         * Fails CLOSED: any doubt denies rax and the run keeps 12.
-         */
-        if (!(e.ra.denied & 1u)) {
-            bool covered = true;
-            const auto pinned_slot = [&](int sl) {
-                for (const int h : hot) if (h == sl) return true;
-                return false;
-            };
-            for (size_t pc = begin; pc < end && covered; pc++) {
-                const Instr &in = chunk.code[pc];
-                switch (in.op) {
-                case OpCode::IntAddRR: case OpCode::IntSubRR:
-                case OpCode::IntMulRR:
-                case OpCode::IntAndRR: case OpCode::IntOrRR:
-                case OpCode::IntXorRR:
-                case OpCode::IntAddRI: case OpCode::IntSubRI:
-                case OpCode::IntMulRI:
-                case OpCode::IntAndRI: case OpCode::IntOrRI:
-                case OpCode::IntXorRI:
-                case OpCode::LoadImmInt:
-                case OpCode::IntShlRI: case OpCode::IntShrRI:
-                    covered = pinned_slot(in.target);
-                    break;
-                case OpCode::ForLoopStep:
-                    covered = pinned_slot(in.target2);
-                    break;
-                case OpCode::JumpUnlessIntCmp:
-                    /* a literal `a` never reaches the pinned form; it
-                     * stays on the RAX path, which rax cannot survive */
-                    covered = !in.a_is_lit()
-                           && pinned_slot(in.a_slot());
-                    break;
-                case OpCode::IntAddStep:
-                    covered = pinned_slot(in.a_dual_lo())
-                           && pinned_slot(in.target2);
-                    break;
-                default:
-                    break;   /* Jump/ReturnV/Halt: no pinned path */
-                }
-            }
-            if (!covered) {
-                e.ra.denied |= 1u;
-                if (!hot.empty() && hot.size() == max_pins) {
-                    /* #96 inc-1/2: the popped pick is still a ranked,
-                     * qualified hot slot - it becomes a SPILL HOME
-                     * (it used to be dropped on the floor, which also
-                     * starved the share plan of early-ending pins) */
-                    spill_hot.insert(spill_hot.begin(), hot.back());
-                    hot.pop_back();      /* the budget just shrank by 1 */
-                    hot_counts.pop_back();
-                }
-            }
-        }
+        /* Phase A: the coverage gate is DELETED with run_may_pin_rax -
+         * an unpinned target's generic arm now ASKS, evicts a rax pin
+         * on conflict, and the chunk re-emits with rax denied. */
         /*
          * C2b: allocate a CALLEE-saved pair for the regions' SECOND
          * bases (every region shares one pair - their lifetimes are
@@ -20912,10 +20835,30 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         }
         g_hoist.active = false;
         g_hoist2.active = false;
+        if (e.rax_conflict && !rax_retried) {
+            /* Phase A: a rax pin met a conflicting emission event
+             * (call bracket / accumulator ask / raise-path reuse).
+             * Discard exactly as the give-up path does and re-emit
+             * the chunk ONCE with rax denied. */
+            rax_retried = true;
+            g_jit_rax_denied = true;
+            g_hoist = JitHoist{};
+            g_hoist2 = JitHoist{};
+            chunk.call_caches.clear();
+            chunk.norec_sites.clear();
+            chunk.arg_stage_pools.clear();
+#ifdef TESTS
+            g_jit_rax_retries++;
+#endif
+            goto retry_emission;
+        }
+        ML_CHECK_MSG(!e.rax_conflict,
+                     "a rax-pin conflict on the DENIED attempt");
         if (!emit_ok) {
             g_hoist = JitHoist{};
             g_hoist2 = JitHoist{};
             e.b.clear();
+            g_jit_rax_denied = false;
             return;
         }
         const size_t exit_pos = e.pos();
@@ -21266,6 +21209,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         for (int i = 0; i < 4; i++)
             dst[1 + i] = static_cast<uint8_t>(r32 >> (i * 8));
     }
+    g_jit_rax_denied = false;    /* Phase A: chunk-scoped, never sticky */
     if (mprotect(mem, len, PROT_READ | PROT_EXEC) != 0) {
         munmap(mem, len);
         return;
