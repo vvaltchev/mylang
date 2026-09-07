@@ -22,7 +22,8 @@ STATUS LEDGER (update as steps land):
        here: every emitter consumes register VALUES now.
  - [x] Phase A - the rax endgame (A1-A3 landed; A2's sabotage +
        measurement in the same batch; see the ledger entry)
- - [ ] Phase B - the same-kind sweep
+ - [x] Phase B - the same-kind sweep (B1/B2/B2c/B2c-rdx/B3 all
+       landed 2026-08-22)
  - [ ] Phase C - the float (xmm) mandate
  - [ ] Phase D - the interval allocator (splitting)
  - [ ] Phase E - retire the transition devices + doc sync
