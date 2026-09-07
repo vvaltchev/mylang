@@ -20907,20 +20907,29 @@ retry_emission:
              * an ISA-fixed raw write). Discard exactly as the
              * give-up path does and re-emit with the conflicted
              * registers denied. Each retry denies at least one MORE
-             * register, so the loop is bounded by the pool size -
-             * the ML_CHECK is the backstop. */
-            rax_retried++;
-            ML_CHECK_MSG(rax_retried <= 16, "conflict retry runaway");
-            g_jit_pins_denied |= e.pin_conflicts;
-            g_hoist = JitHoist{};
-            g_hoist2 = JitHoist{};
-            chunk.call_caches.clear();
-            chunk.norec_sites.clear();
-            chunk.arg_stage_pools.clear();
+             * register, so the loop is bounded by the pool size. The
+             * bound is a REAL branch, not an assert-only backstop: a
+             * checked build aborts by name, and a release - where
+             * ML_CHECK compiles away - DECLINES the chunk through the
+             * give-up path below rather than looping (an unbounded
+             * compile is as much a wrong answer as a wrong value; and
+             * an assert-only read left the counter set-but-unused
+             * under NDEBUG, which -Werror rightly refused). */
+            if (++rax_retried > 16) {
+                ML_CHECK_MSG(false, "conflict retry runaway");
+                emit_ok = false;
+            } else {
+                g_jit_pins_denied |= e.pin_conflicts;
+                g_hoist = JitHoist{};
+                g_hoist2 = JitHoist{};
+                chunk.call_caches.clear();
+                chunk.norec_sites.clear();
+                chunk.arg_stage_pools.clear();
 #ifdef TESTS
-            g_jit_rax_retries++;
+                g_jit_rax_retries++;
 #endif
-            goto retry_emission;
+                goto retry_emission;
+            }
         }
         if (!emit_ok) {
             g_hoist = JitHoist{};
