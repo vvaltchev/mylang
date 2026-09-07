@@ -27913,6 +27913,96 @@ static bool jit_hoist_c1()
 }
 
 /*
+ * B3 (plans/register-allocator-endgame.md): the hoist pair is claimed
+ * THROUGH THE MODEL at region entry - a pin holding r10/r11 (the pick
+ * is optimistic about them since the hand-built HOIST_REGS_MASK
+ * clobber entry was deleted) is evicted via the conflict seam and the
+ * chunk re-emits with it denied. This drives that path on purpose:
+ * seven hot int accumulators overflow the callee-saved pin budget
+ * into r10/r11, and the loop walks an array, which is exactly what
+ * CREATES a region - so the first emission pass pins the pair the
+ * region is about to claim.
+ *
+ * Three assertions, each vacuity-guarded: the values match the
+ * tree-walker (a clobbered pin is a silent wrong sum), the region
+ * actually entered (no region, no conflict - the test would pass
+ * exercising nothing), and the retry actually fired (the shape lost
+ * to a future pick change would leave the eviction path untested
+ * again - this is the assertion that names it).
+ *
+ * WATCHED FAILING: with the two reg_pin_conflict calls removed from
+ * the region entry, the region's nav() writes the pinned pair and the
+ * tracker aborts by name ("write to a PINNED register", load_base).
+ */
+static bool jit_hoist_pair_conflict()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const std::vector<const char *> src = {
+        "var a = array(64);",
+        "for (var i = 0; i < 64; i++) a[i] = i;",
+        "var s0 = 0; var s1 = 0; var s2 = 0; var s3 = 0;",
+        "var s4 = 0; var s5 = 0; var s6 = 0;",
+        "var n = len(a);",
+        "for (var k = 0; k < n; k++) {",
+        "    s0 += a[k];",
+        "    s1 += k; s2 += k * 2; s3 += k * 3;",
+        "    s4 += k * 5; s5 += k * 7; s6 += k * 11;",
+        "}",
+        "print(s0, s1, s2, s3, s4, s5, s6);",
+    };
+    const auto go = [&](bool vm, unsigned long *retries,
+                        unsigned long *hoist) -> std::string {
+        const unsigned long r0 = g_jit_rax_retries;
+        const unsigned long h0 = g_jit_hoist;
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = vm ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::string joined;
+            for (const char *l : src) { joined += l; joined += "\n"; }
+            std::vector<Tok> toks;
+            lexer(joined, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (vm) vm_execute(root.get()); else root->eval(nullptr);
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        if (retries) *retries = g_jit_rax_retries - r0;
+        if (hoist) *hoist = g_jit_hoist - h0;
+        return cap.str();
+    };
+    bool ok = true;
+    const std::string ref = go(false, nullptr, nullptr);
+    unsigned long retries = 0, hoist = 0;
+    const std::string got = go(true, &retries, &hoist);
+    if (got != ref || ref.empty()) {
+        cout << "  hoist-pair: tw=[" << ref << "] vm=[" << got << "]\n";
+        ok = false;
+    }
+    if (hoist == 0) {
+        cout << "  hoist-pair: no region entered - the shape decayed "
+                "and the test is vacuous\n";
+        ok = false;
+    }
+    if (retries == 0) {
+        cout << "  hoist-pair: the conflict retry never fired - the "
+                "pick no longer pins r10/r11 here, find a new shape\n";
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * THE COUNTED-LOOP FUSIONS' OPERAND LAYOUT SURVIVES A SPLICE (#87).
  *
  * `IntAddStep` packs TWO things into one operand: `a_dual_lo` is always a
@@ -33904,6 +33994,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: C1 per-loop navigation HOISTING (entry nav + cold twin + "
       "refusals)",
       jit_hoist_c1 },
+    { "jit: B3 - a pin in the hoist pair is EVICTED at region entry "
+      "and the chunk re-emits (the deleted clobber-mask's successor)",
+      jit_hoist_pair_conflict },
     { "jit: C2a - the FLOAT register cache (xmm4-7): pins, spills, "
       "run-splits",
       jit_fcache_c2 },

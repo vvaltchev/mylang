@@ -7721,3 +7721,41 @@ plain/nolowmem/xrot(both arenas) green; census gate at zero floors -
 where it also caught cmp_rax_tag's callers losing their justifying
 tags (the register lives in the METHOD NAME, the sixth audit-table
 shape, seen by the accessor-derived scan).
+
+## Endgame B3 (2026-08-22) - the hoist pair is claimed THROUGH THE
+## MODEL at region entry; the hand-built clobber-mask entry is deleted
+
+`if (has_hoist) clob |= HOIST_REGS_MASK` - the run-wide, pick-time
+deny of r10/r11 - is gone. The REGION claims its pair at its own
+entry: a pin holding r10/r11 (the pick is optimistic about them now)
+is a conflicting event - evicted via the seam, the retry denies it,
+and the second pass arrives at the preheader with both registers
+free; the claim is then ra.busy, so the elem plans, every scratch ask
+and the barrier machinery refuse the pair from the same fact the tag
+holders use. The claim is held to run end, matching the deleted
+mask's deny scope for scratch (region-scoped release is a Phase D
+refinement); elem_scratch_reserve still models the future claim at
+pick time via has_hoist.
+
+GENERALIZED WITH IT: `Emitter::claim_mask` - every run-scoped,
+non-pin claim (the B1 tag holders, the B3 pair) in one mask, restored
+by clear_cache_state (a barrier no longer wipes a live claim) and
+enforced by check_pins_are_busy at every allocation seam. A new claim
+class ORs itself in.
+
+REACH, proven not assumed: NO corpus program pins into r10/r11 in a
+hoist run (their hot sets fit the callee-saved budget), so the
+eviction path would have shipped untested - the `jit: B3` -rt case
+constructs the shape (seven hot int accumulators + an array walk),
+asserts values, region entry AND that the retry actually fired, and
+was WATCHED FAILING: with the eviction removed the tracker aborts by
+name ("write to a PINNED register: r10", the region's nav()).
+
+MEASURED: 104/116 byte-identical, both arenas. The 12 drifting
+programs are all hoist runs and every one is a PURE substitution
+(instruction counts equal program by program): transient scratch asks
+before/after the region now win the freed r10 (weight 3) over
+rsi/rdx (weight 6 - the SysV-arg penalty), which is the cost model
+applied to a candidate set the hand mask had been truncating.
+-rt 1947/1947 both arenas; corpus plain/nolowmem/xrot green; census
+gate at zero floors; TESTS=1 OPT=1 ASSERTS=0 and clang lto0 green.

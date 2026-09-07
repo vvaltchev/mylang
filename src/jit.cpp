@@ -2458,6 +2458,12 @@ struct Emitter {
     uint8_t tag_int_reg = RSI;                   /* reg:conv */
     uint8_t tag_float_reg = R8;                   /* reg:conv */
     uint32_t tag_granted = 0;   /* mask of holders actually taken */
+    /* B1/B3: EVERY run-scoped, non-pin claim on a register - the tag
+     * holders, the hoist pair once a region claims it. This is what
+     * survives a cache clear (clear_cache_state restores ra.busy to
+     * exactly this) and what check_pins_are_busy enforces at every
+     * allocation seam. A new claim class ORs itself in here. */
+    uint32_t claim_mask = 0;
 
     /* Decide this run's grants. Pure decision - the caller applies
      * it to a (fresh) allocator with `ra.busy |= tag_granted`, so
@@ -2465,11 +2471,13 @@ struct Emitter {
      * every scratch ask all see the SAME claim. */
     uint32_t grant_tag_regs(bool float_live)
     {
+        claim_mask = 0;              /* fresh run: no claims yet */
         tag_granted = 0;
         if (!ml_lowmem_fits_imm32(jit_layout().t_int))
             tag_granted |= 1u << tag_int_reg;
         if (float_live && !ml_lowmem_fits_imm32(jit_layout().t_float))
             tag_granted |= 1u << tag_float_reg;
+        claim_mask |= tag_granted;
         return tag_granted;
     }
     /* Which register holds `tag` THIS run? ML_CHECKs the grant was
@@ -2878,10 +2886,11 @@ struct Emitter {
         scache.clear();
         /* the PIN occupancy goes with them; `denied` does NOT - it
          * is a property of the whole run, not of what is held right
-         * now - and neither do the B1 singleton-holder grants: the
-         * tags stay live in their registers across whatever emptied
-         * the cache, so a scratch ask must still be refused them. */
-        ra.busy = tag_granted;
+         * now - and neither do the run-scoped CLAIMS (the B1 tag
+         * holders, a region's B3 pair): those values stay live in
+         * their registers across whatever emptied the cache, so a
+         * scratch ask must still be refused them. */
+        ra.busy = claim_mask;
         ML_CHECK_MSG(!cache_live(),
                      "clear_cache_state() left something live: a cache "
                      "vector was added to cache_live() but not here");
@@ -2900,14 +2909,14 @@ struct Emitter {
             ML_CHECK_MSG(ra.busy & (1u << c.reg),
                          "a pinned register is not busy in the "
                          "allocator - cache and RegAlloc have diverged");
-        /* B1: and the singleton-holder grants - "the reservation IS
+        /* B1/B3: and the run-scoped claims - "the reservation IS
          * ra.busy" is a claim, this is its enforcement. An allocator
-         * reset that forgets to re-apply the grant would let a
-         * scratch ask take a live tag holder; caught here, at every
-         * allocation seam, instead of as a garbage type pointer. */
-        ML_CHECK_MSG((ra.busy & tag_granted) == tag_granted,
-                     "a granted tag holder is not busy in the "
-                     "allocator - a reset dropped the B1 grant");
+         * reset that forgets to re-apply one would let a scratch ask
+         * take a live tag holder or the hoist pair; caught here, at
+         * every allocation seam, instead of as a garbage pointer. */
+        ML_CHECK_MSG((ra.busy & claim_mask) == claim_mask,
+                     "a run-scoped claim is not busy in the "
+                     "allocator - a reset dropped it");
 #endif
     }
     /* "is anything held in a register right now" - asked by the barrier
@@ -10051,8 +10060,13 @@ static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
      * claimed as ra.busy and passed here as `tag_claimed` only so the
      * element-tier reservation consults the same decision. */
     uint32_t clob = g_jit_pins_denied;
-    if (has_hoist)
-        clob |= HOIST_REGS_MASK;             /* g_hoist.rdata/rcount */
+    /* B3: the hoist pair (r10/r11) is no longer a hand-built entry
+     * here - the REGION claims it at its own entry through the model
+     * (evict a conflicting pin via the seam, retry denies it; then
+     * ra.busy carries the claim for the rest of the run). `has_hoist`
+     * is still passed to elem_scratch_reserve below: the reservation
+     * runs at pick time and must model the claim the region will
+     * make at emit time. */
     if (jit_run_blocks_xcache(ck, begin, end))
         clob |= xcache_mask();
     /*
@@ -19936,7 +19950,7 @@ retry_emission:
          * claim survives every allocator reset. */
         e.ra = RegAlloc();
         e.ra.denied = xclob;
-        e.ra.busy |= e.tag_granted;
+        e.ra.busy |= e.claim_mask;
         /*
          * #96 INCREMENT 1: the pick RANKS more candidates than the
          * register budget; the overflow past max_pins is homed in
@@ -20717,6 +20731,11 @@ retry_emission:
         };
 
         size_t hri = 0;                       /* the next region to enter */
+        /* B3: the C1 pair is claimed at the FIRST region entry and
+         * held to run end - matching the deny scope the deleted
+         * pick-time mask had, so scratch asks post-region see the
+         * same world (region-scoped release is a Phase D refinement). */
+        bool hoist_pair_claimed = false;
         size_t si = 0;                        /* #96 inc-2: next seam */
         std::map<size_t, size_t> seam_pre;    /* seam pc -> pre position */
         for (size_t pc = begin; pc < end && emit_ok; pc++) {
@@ -20726,6 +20745,26 @@ retry_emission:
                 g_hoist2.active = false;
             }
             if (hri < hregs.size() && pc == hregs[hri].T) {
+                /* B3: the region claims its pair THROUGH THE MODEL.
+                 * A pin holding r10/r11 (the pick is optimistic about
+                 * them now) is a conflicting event: evict via the
+                 * seam, the retry denies it, and the second pass
+                 * arrives here with both registers free. The claim is
+                 * ra.busy - a scratch ask during the region is refused
+                 * the pair by the same fact the elem plans consult
+                 * through hoist_claimed_mask(). Deliberately NOT
+                 * ra.take_fixed: a retry pass has the pair in `denied`
+                 * (pins may not spend it), and this claim is not a
+                 * pin. */
+                if (!hoist_pair_claimed) {
+                    e.reg_pin_conflict(HOIST_RDATA);
+                    e.reg_pin_conflict(HOIST_RCOUNT);
+                    ML_CHECK_MSG(!(e.ra.busy & HOIST_REGS_MASK),
+                                 "hoist pair occupied at region entry");
+                    e.ra.busy |= HOIST_REGS_MASK;
+                    e.claim_mask |= HOIST_REGS_MASK;
+                    hoist_pair_claimed = true;
+                }
                 /* the PREHEADER: guards + (data, count) derivation, per
                  * BASE (C2b: a granted second base repeats the sequence
                  * into its callee-saved pair; ANY base's failed guard
