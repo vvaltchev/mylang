@@ -18,7 +18,7 @@ R11     0
 # X0/X1 - the per-op float scratch pair - is the float side's rax:
 # every site converts to alloc_fscratch(caps) or earns a tag, and
 # these numbers only go DOWN.
-XMM0   61
-XMM1   28
-TOTAL  89
+XMM0   54
+XMM1   27
+TOTAL  81
 RAWENC  15
