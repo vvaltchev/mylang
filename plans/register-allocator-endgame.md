@@ -466,14 +466,30 @@ code motion: vdjcmp 116/116 BOTH arenas, -rt 1690x5 both arenas,
 corpus_diff 25/25, driver_checks, census gate at floor, TESTS=1
 OPT=1 -rt, clang OPT=1 ASSERTS=0 LTO=0 zero warnings.
 
-⛔ NEXT: D3.b step 2 - the `lsra` lever (default OFF) + the linear
-scan with splitting, driving pick_visit_op with the interval side's
-own callbacks to classify interval-local uses (the design-decisions
-block above holds the settled choices: per-interval qualification,
-memory-demanding ops as forced interval ends, label resolution v1
-with the loop head as the critical case). Byte-identity ENDS there
-by design - the oracle becomes the full correctness net + the D0 Ir
-ledger A/B.]
+D3.b step 2a LANDED 2026-08-23: jit_qualify_intervals (jit.cpp,
+IntervalQual in jit.h) - pick_visit_op driven with the interval
+side's callbacks, each event attributed to the interval covering
+(slot, pc). Raw facts per interval (int/ret/float use counts,
+wrote/full_read/mem flags); pool derivations stated in jit.h, left
+to the scan. `orphans` = the visit_use_def-vs-pick_visit_op drift
+detector, asserted 0. The `jit: D3.b` -rt check pins aggregation
+against the pick's public answer (TESTS-only export of the static
+pick): A picked => per-interval clean (+ A-float for fhot), D
+refused-yet-hot => mem_int somewhere, B the payoff interval
+observed + vacuity-guarded, C orphans == 0. WATCHED failing both
+ways (mem_int stripped -> D names 4 slots; attribution disabled ->
+C + A). Recorded gaps for 2b: uses_ret float-exemption needs a
+function-chunk case; corpus-wide orphan census rides with the scan.
+
+⛔ NEXT: D3.b step 2b - the `lsra` lever (default OFF) + the linear
+scan with splitting, allocating from D1 intervals + step 2a's
+IntervalQual facts (the design-decisions block above holds the
+settled choices: memory-demanding pcs as forced interval ends,
+assignment-agnostic call brackets, label resolution v1 with the
+loop head as the critical case, remat of LoadImmInt, gp_weight as
+the cost-model seed). Byte-identity ENDS there by design - the
+oracle becomes the full correctness net + validator arms 2/3 + the
+D0 Ir ledger A/B.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)

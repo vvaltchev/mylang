@@ -11282,6 +11282,114 @@ pick_cached_slots(const Chunk &ck, size_t begin,
     return out;
 }
 
+/*
+ * D3.b step 2a (plans/register-allocator-endgame.md): PER-INTERVAL
+ * QUALIFICATION. The same pick_visit_op switch, driven with the
+ * interval side's callbacks: each classification event lands on the
+ * interval COVERING (slot, pc), so an interval is judged by the uses
+ * inside IT, not by the whole run - the payoff shape the endgame plan
+ * names (one late boxed op no longer costs a slot its whole run).
+ * Raw facts only; the consumer decides pools (the derivations are in
+ * jit.h at IntervalQual). `orphans` counts events no interval covers -
+ * a drift detector between visit_use_def (the liveness the intervals
+ * are built from) and pick_visit_op (the classification): the two
+ * tables run at the same stage here, so a disagreement is a table gap
+ * worth failing a test over, not a soft anomaly. Returns false when
+ * some op is unclassifiable (the pick's cache-nothing answer).
+ */
+bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
+                           const std::vector<LiveInterval> &iv,
+                           std::vector<IntervalQual> &out, int *orphans)
+{
+    out.assign(iv.size(), IntervalQual());
+
+    /* per-slot index; iv is start-sorted, so per-slot order is too */
+    std::unordered_map<int, std::vector<size_t>> by_slot;
+    for (size_t i = 0; i < iv.size(); i++)
+        by_slot[iv[i].slot].push_back(i);
+
+    struct Vis {
+        std::vector<IntervalQual> &out;
+        const std::vector<LiveInterval> &iv;
+        const std::unordered_map<int, std::vector<size_t>> &by_slot;
+        size_t cur = 0;                  /* the pc being classified */
+        int orphans = 0;
+
+        IntervalQual *find(int s) {
+            if (s < 0)
+                return nullptr;          /* "not a slot" - tolerated */
+            const auto it = by_slot.find(s);
+            if (it != by_slot.end())
+                for (const size_t idx : it->second) {
+                    const LiveInterval &l = iv[idx];
+                    if (l.start <= cur && cur < l.end)
+                        return &out[idx];
+                }
+            orphans++;
+            return nullptr;
+        }
+        void usei(int s) {
+            if (IntervalQual *q = find(s)) q->uses_int++;
+        }
+        void usei_dst(int s) {
+            if (IntervalQual *q = find(s)) {
+                q->uses_int++;
+                q->wrote_int = true;
+            }
+        }
+        void usef(int s) {
+            if (IntervalQual *q = find(s)) q->uses_float++;
+        }
+        void use_ret(int s) {
+            if (IntervalQual *q = find(s)) q->uses_ret++;
+        }
+        void fdst_mark(int s) {
+            if (IntervalQual *q = find(s)) q->wrote_float = true;
+        }
+        void full_read_mark(int s) {
+            if (IntervalQual *q = find(s)) q->full_read = true;
+        }
+        void bad(int s) {
+            if (IntervalQual *q = find(s)) {
+                q->mem_int = true;
+                q->mem_float = true;
+            }
+        }
+        void badi(int s) {
+            if (IntervalQual *q = find(s)) q->mem_int = true;
+        }
+        void badf(int s) {
+            if (IntervalQual *q = find(s)) q->mem_float = true;
+        }
+        /* a bracketed op constrains no interval: the flush/reload
+         * spill-around discipline is assignment-agnostic */
+        void mark_barrier(size_t) {}
+    } vis { out, iv, by_slot };
+
+    for (size_t pc = begin; pc < end; pc++) {
+        vis.cur = pc;
+        if (!pick_visit_op(ck, ck.code[pc], pc, vis))
+            return false;
+    }
+    if (orphans)
+        *orphans = vis.orphans;
+    return true;
+}
+
+#ifdef TESTS
+/* Test-only export of the (static) pick, so the D3 qualification check
+ * can assert per-interval facts AGAINST the pick's public answer. */
+std::vector<int>
+jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
+                           int slot_count, size_t max_pins,
+                           std::vector<int> *fhot)
+{
+    return pick_cached_slots(ck, begin, end, slot_count, max_pins,
+                             nullptr, fhot);
+}
+#endif
+
+
 /* Approach-A slow-path helper: release the slot's CURRENT value (whatever
  * reference it holds) and store a scalar float. Called from native ONLY on
  * the cold path where the store target is proven to hold a reference (once

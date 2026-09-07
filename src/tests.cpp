@@ -25172,6 +25172,159 @@ static bool jit_intervals_check()
 }
 
 /*
+ * D3.b step 2a: PER-INTERVAL QUALIFICATION agrees with the pick.
+ *
+ * jit_qualify_intervals drives the SAME pick_visit_op switch the pick
+ * does, so the classification RULES cannot drift by construction; what
+ * this check pins is the AGGREGATION - that events land on the interval
+ * covering (slot, pc), and that the per-interval facts imply the pick's
+ * run-wide answer:
+ *   A. every slot the pick RETURNED is per-interval clean: total int
+ *      weight >= 3, no interval mem_int, no float facts anywhere;
+ *   A-float. every fhot slot: wrote_float somewhere, total float uses
+ *      >= 3, zero countable int uses, no mem_float;
+ *   D. every local the pick REFUSED despite >= 3 pure-int uses has
+ *      mem_int on some interval (with max_pins generous, dis-
+ *      qualification is the only refusal left) - the arrow that fails
+ *      when bad() stops setting mem_int;
+ *   B. THE PAYOFF SHAPE (and the vacuity guard): a slot the pick
+ *      refuses run-wide still owns a clean >= 3-use interval - the
+ *      per-interval win the whole D3 exists for;
+ *   C. orphans == 0: no classification event fell outside every
+ *      interval - visit_use_def (liveness) and pick_visit_op
+ *      (classification) agree about which slots an op touches.
+ */
+static bool jit_interval_qual_check()
+{
+#if ML_JIT_SUPPORTED
+    struct Case { const char *name; std::string src; };
+    const Case cases[] = {
+        /* the loop counter + two accumulators are picked; everything
+         * per-interval clean */
+        { "hot int loop",
+          "var a = 0; var b = 0; var n = 0; n = n + runtime(50);\n"
+          "for (var i = 0; i < n; i++) { a = a + i; b = b + a; }\n"
+          "print(a + b);\n" },
+        /* the payoff shape: s's FIRST interval is hot and clean, its
+         * SECOND holds a DictStore key - the pick refuses s run-wide,
+         * the qualifier keeps the first interval eligible */
+        { "clean phase + DictStore phase",
+          "var s = 0; var n = 0; n = n + runtime(40);\n"
+          "for (var i = 0; i < n; i++) s = s + i;\n"
+          "var u = s * 2;\n"
+          "var d = {};\n"
+          "s = 0;\n"
+          "d[s] = 1;\n"
+          "print(u + len(d));\n" },
+        /* the float pool's side of property A */
+        { "hot float loop",
+          "var f = 0.0; var n = 0; n = n + runtime(30);\n"
+          "for (var i = 0; i < n; i++) f = f + 0.5;\n"
+          "print(f);\n" },
+    };
+    bool ok = true, saw_payoff = false, saw_pick = false, saw_fhot = false;
+    for (const Case &c : cases) {
+        std::vector<Tok> toks;
+        lexer(c.src, 1, toks);
+        ParseContext pctx(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pctx);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        const Chunk &ck = prog.root;
+        SlotLiveness sl;
+        std::vector<LiveInterval> iv;
+        if (!jit_slot_liveness(ck, sl)
+                || !jit_build_intervals(ck, 0, ck.code.size(), sl, iv)) {
+            printf("  qual [%s]: liveness/intervals declined\n", c.name);
+            ok = false;
+            continue;
+        }
+        std::vector<IntervalQual> q;
+        int orphans = -1;
+        if (!jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
+                                   &orphans)) {
+            printf("  qual [%s]: an op was unclassifiable\n", c.name);
+            ok = false;
+            continue;
+        }
+        if (orphans != 0) {                              /* property C */
+            printf("  qual [%s]: %d orphan event(s)\n", c.name, orphans);
+            ok = false;
+        }
+        std::vector<int> fhot;
+        const std::vector<int> picked =
+            jit_test_pick_cached_slots(ck, 0, ck.code.size(),
+                                       ck.slot_count, 6, &fhot);
+        /* per-slot totals from the interval facts */
+        const int nslots = ck.slot_count + ck.n_temps;
+        std::vector<long> wi(nslots, 0), wf(nslots, 0), wint(nslots, 0);
+        std::vector<char> memi(nslots, 0), memf(nslots, 0), wf_dst(nslots, 0);
+        std::vector<char> anyfloat(nslots, 0), clean_hot_iv(nslots, 0);
+        for (size_t k = 0; k < iv.size(); k++) {
+            const int s = iv[k].slot;
+            if (s < 0 || s >= nslots)
+                continue;
+            wi[s] += q[k].uses_int + q[k].uses_ret;
+            wint[s] += q[k].uses_int;
+            wf[s] += q[k].uses_float;
+            memi[s] |= q[k].mem_int;
+            memf[s] |= q[k].mem_float;
+            wf_dst[s] |= q[k].wrote_float;
+            anyfloat[s] |= q[k].uses_float > 0 || q[k].wrote_float;
+            if (q[k].uses_int >= 3 && !q[k].mem_int)
+                clean_hot_iv[s] = 1;
+        }
+        for (const int p : picked) {                     /* property A */
+            saw_pick = true;
+            if (wi[p] < 3 || memi[p] || anyfloat[p]) {
+                printf("  qual [%s]: picked slot %d not per-interval "
+                       "clean (wi=%ld memi=%d float=%d)\n",
+                       c.name, p, wi[p], memi[p], anyfloat[p]);
+                ok = false;
+            }
+        }
+        for (const int f : fhot) {                       /* A-float */
+            saw_fhot = true;
+            if (!wf_dst[f] || wf[f] < 3 || memf[f] || wint[f] != 0) {
+                printf("  qual [%s]: fhot slot %d facts wrong "
+                       "(wrote=%d wf=%ld memf=%d wint=%ld)\n",
+                       c.name, f, wf_dst[f], wf[f], memf[f], wint[f]);
+                ok = false;
+            }
+        }
+        for (int s = 0; s < ck.slot_count; s++) {        /* property D */
+            if (wi[s] < 3 || anyfloat[s])
+                continue;
+            const bool got =
+                std::find(picked.begin(), picked.end(), s) != picked.end();
+            if (!got && !memi[s]) {
+                printf("  qual [%s]: slot %d refused with no mem_int "
+                       "anywhere (wi=%ld)\n", c.name, s, wi[s]);
+                ok = false;
+            }
+            if (!got && memi[s] && clean_hot_iv[s])
+                saw_payoff = true;                       /* property B */
+        }
+    }
+    if (!saw_pick || !saw_fhot) {
+        printf("  qual: a pool never picked anything - property A is "
+               "vacuous (int=%d float=%d)\n", saw_pick, saw_fhot);
+        ok = false;
+    }
+    if (!saw_payoff) {
+        printf("  qual: no run-refused slot owned a clean hot interval "
+               "- the payoff shape is untested\n");
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * #96: the LOW-ADDRESS ARENA actually placed the Type singletons.
  *
  * The arena exists so the JIT can write a type tag with a sign-extended
@@ -34100,6 +34253,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: D1 - live INTERVALS agree with the liveness fixpoint at "
       "every pc, per-slot holes observed (the allocator's input)",
       jit_intervals_check },
+    { "jit: D3.b - per-interval qualification implies the pick's "
+      "run-wide answer; the payoff interval observed (step 2a)",
+      jit_interval_qual_check },
     { "jit: the low-address arena placed every Type singleton below "
       "2^31, so a type tag can encode as imm32 (#96)",
       jit_lowmem_singletons },
