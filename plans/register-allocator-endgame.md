@@ -485,14 +485,29 @@ POSITIONS the scan cuts on; property E pins stream/flags agreement
 both ways (watched: pc+1 stamp fails at four named sites).
 
 ⛔ NEXT: D3.b step 2b - the `lsra` lever (default OFF) + the linear
-scan with splitting, allocating from D1 intervals + step 2a's
-IntervalQual facts (the design-decisions block above holds the
+scan with splitting (the design-decisions block above holds the
 settled choices: memory-demanding pcs as forced interval ends,
 assignment-agnostic call brackets, label resolution v1 with the
 loop head as the critical case, remat of LoadImmInt, gp_weight as
-the cost-model seed). Byte-identity ENDS there by design - the
-oracle becomes the full correctness net + validator arms 2/3 + the
-D0 Ir ledger A/B.]
+the cost-model seed). SEQUENCE IT IN TWO INCREMENTS:
+ - 2b-i, THE SCAN AS PURE ANALYSIS (no emission change, no lever
+   needed yet): jit_lsra_assign(intervals, quals, mem_events,
+   next_use, K) -> per-interval {reg | spill | memory} + split
+   points. Inputs ALL exist now: D1 intervals, 2a IntervalQual,
+   the MemEvent cut positions, jit_next_use. Cut intervals at
+   mem pcs first, then walk by start with free-until + furthest-
+   next-use eviction. Its -rt net: no two same-pc-live intervals
+   share a register; only qualified pieces assigned; a DOMINANCE
+   property vs the pick (every pick-pinned slot's hot interval
+   gets a register at equal K) + the payoff case assigned where
+   the pick refused. Watched failing per property.
+ - 2b-ii, EMISSION behind the `lsra` lever: entry stubs / split
+   moves / label fixups / exit flushes from the per-pc map (the
+   D2 seam), validator arms 2/3 land WITH it, full-net oracle +
+   the D0 Ir ledger A/B.
+⛔ 2b-i IS A FRESH-CONTEXT-WINDOW JOB (the extraction precedent):
+allocation-algorithm subtleties + a new invariant net do not
+belong in a squeezed tail. Byte-identity ENDS at 2b-ii by design.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
