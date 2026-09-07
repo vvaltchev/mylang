@@ -14,11 +14,11 @@ R8      0
 R9      0
 R10     0
 R11     0
-# Phase C baseline (2026-08-22): the xmm mandate's starting work list.
-# X0/X1 - the per-op float scratch pair - is the float side's rax:
-# every site converts to alloc_fscratch(caps) or earns a tag, and
-# these numbers only go DOWN.
-XMM0   54
-XMM1   27
-TOTAL  81
+# Phase C3 (2026-08-22): the xmm mandate's conversion is COMPLETE -
+# the staging pair is a run-scoped grant (Emitter::grant_fstage) and
+# every former X0/X1 site queries fsa()/fsb(); what remains justified
+# is the SysV float ABI (libm args/returns, helper float arg0).
+XMM0    0
+XMM1    0
+TOTAL   0
 RAWENC  15

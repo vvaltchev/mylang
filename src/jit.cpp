@@ -1098,24 +1098,25 @@ static constexpr int gp_weight(uint8_t r)
  * C2 (plans/register-allocator-endgame.md): THE FLOAT FILE joins the
  * model. Which xmm registers may the allocator hand out?
  *
- *  - xmm0/xmm1 are the per-op float scratch convention - the float
- *    side's rax: helper float results arrive in xmm0 (SysV), the
- *    farith/cvt staging runs through the pair - so they are reachable
- *    only through their conventional sites until Phase C3 converts
- *    those to asks (exactly how rax is reachable only through
- *    acc_take and the pick);
+ *  - xmm0/xmm1 are allocatable since C3: the float STAGING PAIR is a
+ *    run-scoped GRANT (Emitter::grant_fstage - the B1 pattern), taken
+ *    at run setup with prefer xmm0/xmm1, so it always lands there
+ *    while nothing competes and every staging site reads the recorded
+ *    pair (fsa()/fsb()) instead of naming the registers. The SysV
+ *    float-ABI sites (libm args/returns, helper float arg0) name
+ *    xmm0/xmm1 LITERALLY under an abi tag - the ABI fixes those
+ *    regardless of where the stage lives;
  *  - xmm8-15 need a REX prefix that the float encoders do not emit
  *    (fload/fstore/movsd_store_base encode 3-bit register fields) -
  *    an encoding CAPABILITY fact, not policy; they join when the
  *    encoders do;
- *  - xmm2..xmm7 are allocatable: xmm4-7 are the C2a pin pool, 2/3
- *    free scratch. All xmm registers are caller-saved (no
- *    callee-saved concept in the SysV float file), so there is no
+ *  - xmm4-7 are the C2a pin pool. All xmm registers are caller-saved
+ *    (no callee-saved concept in the SysV float file), so there is no
  *    fp analog of the unsaved-callee-saved hazard.
  */
 static constexpr bool fp_allocatable(uint8_t x)
 {
-    return x >= 2 && x <= 7;
+    return x <= 7;
 }
 static constexpr int fp_weight(uint8_t x)
 {
@@ -2571,6 +2572,34 @@ struct Emitter {
      * exactly this) and what check_pins_are_busy enforces at every
      * allocation seam. A new claim class ORs itself in here. */
     uint32_t claim_mask = 0;
+    /*
+     * C3: THE FLOAT STAGING PAIR - the run-scoped grant every float
+     * op stages through, the float file's analog of B1's tag holders.
+     * Decided once per run by grant_fstage() (prefer xmm0/xmm1, which
+     * always wins on the fresh allocator - byte identity by
+     * construction); every former hardcoded X0/X1 staging site reads
+     * fsa()/fsb() instead. The float FWD BUS rides the same pair
+     * (g_fwd.fres_reg/fin_reg record which member), and holding the
+     * grant for the whole run is what makes the bus sound with no
+     * per-op exclude dance: nothing else can be granted the registers
+     * a forwarded value sleeps in between ops. The SysV float-ABI
+     * sites (libm marshalling) are NOT this - they name xmm0/xmm1
+     * literally under an abi tag, and the day Phase D moves the stage
+     * off 0/1 they keep their meaning while these queries move.
+     */
+    uint8_t fstage[2] = { 0, 1 };
+    uint32_t fclaim_mask = 0;   /* the float twin of claim_mask */
+    uint8_t fsa() const { return fstage[0]; }
+    uint8_t fsb() const { return fstage[1]; }
+    void grant_fstage()
+    {
+        const int a = ra.ftake(1u << 0), b = ra.ftake(1u << 1);
+        ML_CHECK_MSG(a >= 0 && b >= 0,
+                     "float staging pair unavailable at run setup");
+        fstage[0] = static_cast<uint8_t>(a);
+        fstage[1] = static_cast<uint8_t>(b);
+        fclaim_mask = (1u << fstage[0]) | (1u << fstage[1]);
+    }
 
     /* Decide this run's grants. Pure decision - the caller applies
      * it to a (fresh) allocator with `ra.busy |= tag_granted`, so
@@ -2998,7 +3027,9 @@ struct Emitter {
          * their registers across whatever emptied the cache, so a
          * scratch ask must still be refused them. */
         ra.busy = claim_mask;
-        ra.fbusy = 0;                    /* C2: no float claims exist */
+        ra.fbusy = fclaim_mask;          /* C3: the staging pair is a
+                                          * run-scoped claim, like the
+                                          * GP tag holders */
         ML_CHECK_MSG(!cache_live(),
                      "clear_cache_state() left something live: a cache "
                      "vector was added to cache_live() but not here");
@@ -3030,6 +3061,9 @@ struct Emitter {
         ML_CHECK_MSG((ra.busy & claim_mask) == claim_mask,
                      "a run-scoped claim is not busy in the "
                      "allocator - a reset dropped it");
+        ML_CHECK_MSG((ra.fbusy & fclaim_mask) == fclaim_mask,
+                     "the float staging pair is not busy in the "
+                     "allocator - a reset dropped the C3 grant");
 #endif
     }
     /* "is anything held in a register right now" - asked by the barrier
@@ -4212,10 +4246,16 @@ struct Emitter {
     /* movsd xmm1, [rcx + r9*8] / movsd [rcx + r9*8], xmm1 */
     /* addsd/subsd/mulsd/divsd xmm1, xmm0 (op = 0x58/0x5C/0x59/0x5E) -
      * the compound direction: el = el OP rhs, el in xmm1, rhs in xmm0 */
-    void farith_x1_x0(uint8_t op)
-    { fwrote(1 /* X1 */); u8(0xF2); u8(0x0F); u8(op); u8(0xC8); }
-    void pxor_x1()
-    { fwrote(1 /* X1 */); u8(0x66); u8(0x0F); u8(0xEF); u8(0xC9); }
+    /* C3: farith_x1_x0 / pxor_x1 - the float file's fixed-pair
+     * wrappers - are DELETED (the sixth audit-table shape's rule: an
+     * operand in a METHOD NAME is invisible to every audit). farith
+     * covers the first; pxor_rr is the generic zero/xor form. */
+    void pxor_rr(uint8_t d, uint8_t s2)
+    {
+        fwrote(d);
+        u8(0x66); u8(0x0F); u8(0xEF);
+        u8(static_cast<uint8_t>(0xC0 | (d << 3) | s2));
+    }
     /* ---- #95, the nested-STORE tier (boxed slot type guards in rdx) ---- */
     /* ---- C1, the hoisted-base navigation (r12-r15 operands) ---- */
     /* mov rH, [rax+disp]  (the vector's start/finish into a hoist reg) */
@@ -11253,7 +11293,7 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
          * combination, so a test must be able to ASSERT it happened
          * rather than hope. rcx is scratch here (the ref check used rax;
          * the helper's args come after). */
-        if (xr != X0) {
+        if (xr != X0) {                              /* reg:abi */
             e.bump_counter(&g_jit_fstore_movx0);
         }
 #endif
@@ -11710,19 +11750,20 @@ static FOperands emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
         emit_fwd_fbump(e);
         if (!force_x0_x1)
             return { freg, freg };
-        if (freg != X0) e.fmov_rr(X0, freg);
-        e.fmov_rr(X1, X0);
-        return { X0, X1 };
+        if (freg != e.fsa()) e.fmov_rr(e.fsa(), freg);
+        e.fmov_rr(e.fsb(), e.fsa());
+        return { e.fsa(), e.fsb() };
     }
 
     if (fb) {
         /* b is forwarded and already in a scratch - keep it there and
          * build `a` in the OTHER scratch, which becomes the result */
         emit_fwd_fbump(e);
-        const uint8_t dst = force_x0_x1 ? uint8_t(X0)
-                          : (freg == X0 ? uint8_t(X1) : uint8_t(X0));
+        const uint8_t dst = force_x0_x1 ? e.fsa()
+                          : (freg == e.fsa() ? e.fsb() : e.fsa());
         uint8_t src = freg;
-        if (force_x0_x1 && freg != X1) { e.fmov_rr(X1, freg); src = X1; }
+        if (force_x0_x1 && freg != e.fsb())
+            { e.fmov_rr(e.fsb(), freg); src = e.fsb(); }
         if (const int h = home(in.a_is_lit(), in.a_flit(), in.a_slot());
                 h >= 0)
             e.fmov_rr(dst, static_cast<uint8_t>(h));
@@ -11736,9 +11777,9 @@ static FOperands emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
         /* a is forwarded: its scratch IS the result register (the temp
          * is dead after this op, so computing over it is free) */
         emit_fwd_fbump(e);
-        const uint8_t dst = force_x0_x1 ? uint8_t(X0) : freg;
+        const uint8_t dst = force_x0_x1 ? e.fsa() : freg;
         if (dst != freg) e.fmov_rr(dst, freg);
-        const uint8_t other = dst == X0 ? uint8_t(X1) : uint8_t(X0);
+        const uint8_t other = dst == e.fsa() ? e.fsb() : e.fsa();
         const int h = force_x0_x1 ? -1
                     : home(in.b_is_lit(), in.b_flit(), in.b_slot());
         if (h >= 0)
@@ -11750,18 +11791,18 @@ static FOperands emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
 
     /* neither forwarded: `a` into xmm0, `b` where it lives or xmm1 */
     if (const int h = home(in.a_is_lit(), in.a_flit(), in.a_slot()); h >= 0)
-        e.fmov_rr(X0, static_cast<uint8_t>(h));
+        e.fmov_rr(e.fsa(), static_cast<uint8_t>(h));
     else
-        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+        emit_float_load(e, e.fsa(), in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
                         /*no_bail=*/true);
     if (!force_x0_x1) {
         if (const int h = home(in.b_is_lit(), in.b_flit(), in.b_slot());
                 h >= 0)
-            return { X0, static_cast<uint8_t>(h) };
+            return { e.fsa(), static_cast<uint8_t>(h) };
     }
-    emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+    emit_float_load(e, e.fsb(), in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
                     /*no_bail=*/true);
-    return { X0, X1 };
+    return { e.fsa(), e.fsb() };
 }
 
 /* N6a: call a libm function `fn` (arg(s) already in xmm0[/xmm1], result
@@ -12803,13 +12844,13 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
     const JitHoist *H = hoist_match(in.target2, hoist_want);
     if (H && H->store_ok && !(compound && hoist_want == 3)) {
         if (is_float)
-            emit_float_load(e, X0, in.b_is_lit(), in.b_flit(),
+            emit_float_load(e, e.fsa(), in.b_is_lit(), in.b_flit(),
                             in.b_slot(), 0, /*no_bail=*/true);
         else
             load_operand(e, sc.val, in.b_is_lit(), in.b_lit(), in.b_slot());
         if (compound && divmod && !in.b_is_lit() && is_float) {
-            e.pxor_x1();
-            e.ucomisd(X0, X1);
+            e.pxor_rr(e.fsb(), e.fsb());
+            e.ucomisd(e.fsa(), e.fsb());
             const size_t j_nan = e.j8(0x7A);     /* jp -> not zero */
             slows.push_back(e.j32(0x74));        /* je (== 0.0) */
             e.patch8(j_nan, e.pos());
@@ -12871,11 +12912,12 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
 #endif
             e.mov_rr(sc.data, H->rdata);             /* the [rcx+r9*8] tails */
             if (is_float) {
-                e.load_elem_sd(1, sc.data, sc.idx);          /* xmm1 = elem */
-                e.farith_x1_x0(aop == Op::plus  ? 0x58
+                e.load_elem_sd(e.fsb(), sc.data, sc.idx);    /* stage-b = elem */
+                e.farith(aop == Op::plus  ? 0x58
                              : aop == Op::minus ? 0x5C
-                             : aop == Op::times ? 0x59 : 0x5E);
-                e.store_elem_sd(sc.data, sc.idx, 1);
+                             : aop == Op::times ? 0x59 : 0x5E,
+                         e.fsb(), e.fsa());     /* elem OP= value */
+                e.store_elem_sd(sc.data, sc.idx, e.fsb());
             } else if (divmod) {
                 /* rax = elem */
                 e.load_elem_q(sc.obj, sc.data, sc.idx);
@@ -12926,7 +12968,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
      * exactly as read_float_slot does). Loaded at the retry head because
      * the prep stub's call clobbers both. */
     if (is_float)
-        emit_float_load(e, X0, in.b_is_lit(), in.b_flit(), in.b_slot(), 0,
+        emit_float_load(e, e.fsa(), in.b_is_lit(), in.b_flit(), in.b_slot(), 0,
                         /*no_bail=*/true);
     else
         load_operand(e, sc.val, in.b_is_lit(), in.b_lit(), in.b_slot());
@@ -12966,8 +13008,8 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
             /* xmm0 == 0.0 declines; NaN (unordered sets ZF too) must NOT
              * - jp hops the decline first. -0.0 compares equal, matching
              * the interpreter's `rhs == 0.0`. */
-            e.pxor_x1();
-            e.ucomisd(X0, X1);
+            e.pxor_rr(e.fsb(), e.fsb());
+            e.ucomisd(e.fsa(), e.fsb());
             const size_t j_nan = e.j8(0x7A);          /* jp -> not zero */
             decline_if(0x74);                         /* je (== 0.0) */
             e.patch8(j_nan, e.pos());
@@ -13047,13 +13089,14 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
         e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
         if (!compound) {
             /* movsd [rcx+r9*8], xmm0 */
-            e.store_elem_sd(sc.data, sc.idx, 0);
+            e.store_elem_sd(sc.data, sc.idx, e.fsa());
         } else {
-            e.load_elem_sd(1, sc.data, sc.idx);            /* xmm1 = elem */
-            e.farith_x1_x0(aop == Op::plus  ? 0x58
-                         : aop == Op::minus ? 0x5C
-                         : aop == Op::times ? 0x59 : 0x5E);
-            e.store_elem_sd(sc.data, sc.idx, 1);
+            e.load_elem_sd(e.fsb(), sc.data, sc.idx);      /* stage-b = elem */
+            e.farith(aop == Op::plus  ? 0x58
+                   : aop == Op::minus ? 0x5C
+                   : aop == Op::times ? 0x59 : 0x5E,
+                     e.fsb(), e.fsa());          /* elem OP= value */
+            e.store_elem_sd(sc.data, sc.idx, e.fsb());
         }
         dones.push_back(e.jmp32());
         /* fall through to the shared PREP stub below */
@@ -13338,13 +13381,13 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
         count_and_idx(/*bytes=*/false);
         e.cvtsi2sd_elem(0, r.data, r.idx);       /* xmm0 = (double)elem */
         bump();
-        emit_float_store(e, ck, X0, in.target, pc);
+        emit_float_store(e, ck, e.fsa(), in.target, pc);
         dones.push_back(e.jmp32());
         e.patch32_here(j_frow);
         count_and_idx(/*bytes=*/false);
-        e.load_elem_sd(0, r.data, r.idx);        /* xmm0 = [data + idx*8] */
+        e.load_elem_sd(e.fsa(), r.data, r.idx);  /* stage-a = elem */
         bump();
-        emit_float_store(e, ck, X0, in.target, pc);
+        emit_float_store(e, ck, e.fsa(), in.target, pc);
         dones.push_back(e.jmp32());
     } else {
     /* INT semantics accept flat ints AND flat bools, exactly as the
@@ -13418,8 +13461,8 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
     e.bump_counter(&g_jit_elem_slice_fast);
 #endif
     if (is_float) {
-        e.load_elem_sd(0, r.data, r.idx);
-        emit_float_store(e, ck, X0, in.target, pc);
+        e.load_elem_sd(e.fsa(), r.data, r.idx);
+        emit_float_store(e, ck, e.fsa(), in.target, pc);
     } else {
         e.load_elem_q(r.obj, r.data, r.idx);
         dst_write();
@@ -13596,15 +13639,15 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         /* t_int? (promote) */
         e.cmp_reg_tag(sc.count, jit_layout().t_int);
         decline_ne();
-        e.cvt(X0, val.payload);                /* cvtsi2sd xmm0, [val] */
+        e.cvt(e.fsa(), val.payload);         /* promote to stage-a */
         const size_t j_vgot = e.j8(0xEB);
         e.patch8(j_vf, e.pos());
-        e.fload(X0, val.payload);              /* movsd xmm0, [val] */
+        e.fload(e.fsa(), val.payload);
         e.patch8(j_vgot, e.pos());
         cow_guards();
         inner_bounds(/*bytes=*/false);
         bump();
-        e.store_elem_sd(sc.data, sc.idx, 0);
+        e.store_elem_sd(sc.data, sc.idx, e.fsa());
         e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
         dones.push_back(e.jmp32());
 
@@ -13634,19 +13677,20 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
         const size_t j_vf = e.j8(0x74);
         e.cmp_reg_tag(sc.count, jit_layout().t_int);
         decline_ne();
-        e.cvt(X0, val.payload);
+        e.cvt(e.fsa(), val.payload);
         const size_t j_vgot = e.j8(0xEB);
         e.patch8(j_vf, e.pos());
-        e.fload(X0, val.payload);
+        e.fload(e.fsa(), val.payload);
         e.patch8(j_vgot, e.pos());
         cow_guards();
         inner_bounds(/*bytes=*/false);
         bump();
         e.mov_byte_base_imm(acc.r, L.hashv_off, 0);
-        e.load_elem_sd(1, sc.data, sc.idx);                /* xmm1 = elem */
-        e.farith_x1_x0(bop == Op::plus  ? 0x58
-                     : bop == Op::minus ? 0x5C : 0x59);
-        e.store_elem_sd(sc.data, sc.idx, 1);
+        e.load_elem_sd(e.fsb(), sc.data, sc.idx);          /* stage-b = elem */
+        e.farith(bop == Op::plus  ? 0x58
+                     : bop == Op::minus ? 0x5C : 0x59,
+                 e.fsb(), e.fsa());             /* elem OP= value */
+        e.store_elem_sd(sc.data, sc.idx, e.fsb());
         dones.push_back(e.jmp32());
     } else {
         decline_if(0xEB);                      /* div/mod: ints only */
@@ -13803,7 +13847,7 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
          * ONLY exit was this load's bail, which kept it non-deletable.
          * (No staging-clobber hazard: it reads slot MEMORY, current
          * post-prologue, never a GP pin.) */
-        emit_float_load(e, X0, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+        emit_float_load(e, e.fsa(), in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
                         /*no_bail=*/true);
     else
         /* avoid RSI: the index staging above clobbered it, and the rhs
@@ -14660,8 +14704,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::LoadImmFloat:
-        emit_float_load(e, X0, true, in.a_flit(), 0, pc);
-        emit_float_store(e, ck, X0, in.target, pc);
+        emit_float_load(e, e.fsa(), true, in.a_flit(), 0, pc);
+        emit_float_store(e, ck, e.fsa(), in.target, pc);
         return true;
 
     case OpCode::FloatBin:
@@ -14689,6 +14733,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * armed by the previous op hands its value over in XMM0), and
          * returning the register operand b actually landed in (its own,
          * when it already lived in a pin or the literal pool). */
+        /* fmod forces the pair BECAUSE libm wants xmm0/xmm1 (SysV) -
+         * force_x0_x1 forces the STAGE, so this is sound only while
+         * the stage IS the ABI pair. A Phase D stage move must add
+         * marshalling moves here instead. */
+        if (is_mod)
+            ML_CHECK_MSG(e.fsa() == 0 && e.fsb() == 1,
+                         "fmod: the stage moved off the SysV pair - "
+                         "marshal explicitly");
         const FOperands ops = emit_float_operands(e, in, pc, is_mod);
         if (fop == 0x5E || is_mod) {
             /* float DIV and MOD throw DivisionByZeroEx on a +-0.0 divisor
@@ -14753,14 +14805,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                           * the libm result (SysV) */
             return true;
         }
-        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+        emit_float_load(e, e.fsa(), in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
                         /*no_bail=*/true);
         switch (fn) {
-        case MathFn::sqrt_:    e.sqrtsd(X0, X0); break;
+        case MathFn::sqrt_:
+            e.sqrtsd(e.fsa(), e.fsa());
+            break;
         case MathFn::tofloat_: break;   /* float(x): the read already widened */
         default:               e.u8(0xCC); break;   /* unreachable: MK_SSE */
         }
-        emit_float_store(e, ck, X0, in.target, pc);
+        emit_float_store(e, ck, e.fsa(), in.target, pc);
         return true;
     }
 
@@ -14809,8 +14863,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.cmp_rr(ir, H->rcount);
             j_slows.push_back(e.j32(0x73));      /* jae -> slow */
             if (is_float) {
-                e.load_elem_sd(0, H->rdata, ir);
-                emit_float_store(e, ck, X0, in.target, pc);
+                e.load_elem_sd(e.fsa(), H->rdata, ir);
+                emit_float_store(e, ck, e.fsa(), in.target, pc);
             } else {
                 if (hoist_want == 3)             /* C1c: byte read, 0/1 */
                     e.load_elem_zx8(acc.r, H->rdata, ir);
@@ -14837,8 +14891,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.cmp_rr(ir, r.count);
             j_slows.push_back(e.j32(0x73));      /* jae (wrap/OOB) -> slow */
             /* movsd xmm0,[rcx+r9*8] */
-            e.load_elem_sd(0, r.data, ir);
-            emit_float_store(e, ck, X0, in.target, pc);
+            e.load_elem_sd(e.fsa(), r.data, ir);
+            emit_float_store(e, ck, e.fsa(), in.target, pc);
             j_dones.push_back(e.j32(0xEB));
         } else {
             e.cmp_byte_base(acc.r, L.kind_off, L.kind_ints);
@@ -14891,8 +14945,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.bump_counter(&g_jit_elem_slice_fast);
 #endif
         if (is_float) {
-            e.load_elem_sd(0, r.data, ir);
-            emit_float_store(e, ck, X0, in.target, pc);
+            e.load_elem_sd(e.fsa(), r.data, ir);
+            emit_float_store(e, ck, e.fsa(), in.target, pc);
         } else {
             e.load_elem_q(acc.r, r.data, ir);
             dst_write();
@@ -15764,10 +15818,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         break;
                     }
                     case 1:               /* float (int/bool promote, r8) */
-                        emit_float_load(e, X0, false, 0, pf.src, pc,
-                                        /*no_bail=*/true);
+                        emit_float_load(e, e.fsa(), false, 0, pf.src,
+                                        pc, /*no_bail=*/true);
                         e.movsd_store_base(bb, static_cast<int32_t>(pf.off),
-                                           0);
+                                           e.fsa());
                         break;
                     default:              /* bool byte (payload is 0/1) */
                         /* movzx acc32, byte [slots + payload] -
@@ -15929,11 +15983,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * so the op has NO exit - never-exits, leaf-safe. */
         const FCmp fc = float_cmp(in.aop);
         e.bump_op(OpCode::CmpFloatV);        /* before loads (rax) */
-        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+        emit_float_load(e, e.fsa(), in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
                         /*no_bail=*/true);
-        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+        emit_float_load(e, e.fsb(), in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
                         /*no_bail=*/true);
-        if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
+        if (fc.swap) e.ucomisd(e.fsb(), e.fsa());
+            else         e.ucomisd(e.fsa(), e.fsb());
         AccScratch acc(e, CAP_BYTE_NOREX | CAP_MEM_BASE);
         e.setcc_lo8(static_cast<uint8_t>(
                         ((fc.near_op ^ 1) + 0x10) & 0x0F),
@@ -16856,13 +16911,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.movq_xmm_from(xr, acc.r);
             };
             if (comp)
-                e.fload(X0, slot_addr(in.target).payload);
+                e.fload(e.fsa(), slot_addr(in.target).payload);
             else
-                fload_opnd(X0, bo.a);
-            fload_opnd(X1, bo.b);
+                fload_opnd(e.fsa(), bo.a);
+            fload_opnd(e.fsb(), bo.b);
             if (cmp) {
                 const FCmp fc = float_cmp(bo.aop);
-                if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
+                if (fc.swap) e.ucomisd(e.fsb(), e.fsa());
+            else         e.ucomisd(e.fsa(), e.fsb());
                 e.setcc_lo8(static_cast<uint8_t>(
                                 ((fc.near_op ^ 1) + 0x10) & 0x0F),
                             acc.r);
@@ -16875,21 +16931,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                      * stripped is exactly fpclassify's answer, where a
                      * bare `ucomisd; je` would also decline a NaN
                      * divisor - the same reasoning as FloatBin's. */
-                    e.movq_r_x(acc.r, X1);
+                    e.movq_r_x(acc.r, e.fsb());
                     e.shl_reg_1(acc.r);
                     j_slows.push_back(e.j32(0x74));       /* jz -> slow */
                 }
                 e.farith(bo.aop == Op::plus    ? 0x58
                        : bo.aop == Op::minus   ? 0x5C
                        : bo.aop == Op::times   ? 0x59
-                                               : 0x5E, X0, X1);
+                                               : 0x5E, e.fsa(), e.fsb());
                 if (comp)
                     /* the guard proved the dst already holds a float, so
                      * its type word is t_float and there is nothing to
                      * release - payload only, the int arm's shape */
-                    e.fstore(X0, slot_addr(in.target).payload);
+                    e.fstore(e.fsa(), slot_addr(in.target).payload);
                 else
-                    emit_float_store(e, ck, X0, in.target, pc);
+                    emit_float_store(e, ck, e.fsa(), in.target, pc);
             }
             j_donef = e.j32(0xEB);
             for (const size_t j : j_slows)
@@ -17446,7 +17502,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(0x0F); e.u8(0x10);
                 e.u8(static_cast<uint8_t>(0x80 | (acc.r & 7)));
                 e.u32(static_cast<uint32_t>(moff));
-                emit_float_store(e, ck, X0, in.target, pc);
+                emit_float_store(e, ck, e.fsa(), in.target, pc);
                 break;
             case 2:                                   /* bool -> 0/1 int */
                 /* movzx eax, byte [rax + moff] */
@@ -17464,7 +17520,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(static_cast<uint8_t>(0x48 | (acc.r >= 8 ? 1 : 0)));
                 e.u8(0x0F); e.u8(0x2A);
                 e.u8(static_cast<uint8_t>(0xC0 | (acc.r & 7)));
-                emit_float_store(e, ck, X0, in.target, pc);
+                emit_float_store(e, ck, e.fsa(), in.target, pc);
                 break;
             }
         };
@@ -18476,11 +18532,12 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         /* jump to target when (a cmp b) is FALSE (the ordering compares;
          * the swap trick makes NaN correctly jump - see float_cmp). */
         const FCmp fc = float_cmp(in.aop);
-        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+        emit_float_load(e, e.fsa(), in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
                         /*no_bail=*/true);
-        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+        emit_float_load(e, e.fsb(), in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
                         /*no_bail=*/true);
-        if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
+        if (fc.swap) e.ucomisd(e.fsb(), e.fsa());
+            else         e.ucomisd(e.fsa(), e.fsb());
         emit_cond_jump_raw(e, fc.near_op, fc.short_neg_op,
                            static_cast<size_t>(in.target), begin, end,
                            remap, fixups);
@@ -19390,6 +19447,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     /* B1: a container takes the holder grants too - it has no pins,
      * but its scratch asks must not land on a granted holder. */
     e.ra.busy |= e.grant_tag_regs(run_needs_float_tag(chunk, 0, n));
+    e.grant_fstage();           /* C3: the float staging pair */
     emit_type_tags(e);
     size_t isl_idx = 0;                     /* islands are in ascending order */
     for (size_t pc = 0; pc < n; ) {
@@ -20079,6 +20137,7 @@ retry_emission:
         e.ra = RegAlloc();
         e.ra.denied = xclob;
         e.ra.busy |= e.claim_mask;
+        e.grant_fstage();       /* C3: the float staging pair */
         /*
          * #96 INCREMENT 1: the pick RANKS more candidates than the
          * register budget; the overflow past max_pins is homed in

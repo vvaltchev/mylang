@@ -24,8 +24,10 @@ STATUS LEDGER (update as steps land):
        measurement in the same batch; see the ledger entry)
  - [x] Phase B - the same-kind sweep (B1/B2/B2c/B2c-rdx/B3 all
        landed 2026-08-22)
- - [~] Phase C - the float (xmm) mandate (C1+C2 landed; C3 the
-       89-site conversion + C4 ratchet remain)
+ - [x] Phase C - the float (xmm) mandate (COMPLETE 2026-08-22:
+       census, model, tracker, conversion, floors at ZERO; xmm8-15
+       wait on REX-capable float encoders - a capability gap, not a
+       policy one)
  - [ ] Phase D - the interval allocator (splitting)
  - [ ] Phase E - retire the transition devices + doc sync
 
@@ -346,8 +348,20 @@ knows X0/X1 + the x0/x1 accessor tokens; floors XMM0=61 XMM1=28.
    marshalling, fmod/MathFn MK_CALL's libm args+return, the
    fcreg->jit_put_float move. Floors: XMM0 61->54, XMM1 28->27,
    TOTAL 89->81. What remains is EXACTLY the staging class.
- - THE REMAINDER IS ONE SEAM, NOT 81 EDITS - design settled
-   2026-08-22, build it from here:
+ - [DONE 2026-08-22] THE REMAINDER WAS ONE SEAM - built same day,
+   with ONE simplification over the design below: the pair is a
+   RUN-SCOPED grant (grant_fstage, the B1 pattern), not per-op RAII -
+   holding it run-long is what makes the float fwd bus sound with NO
+   per-op exclude dance (nothing else can be granted the registers a
+   forwarded value sleeps in between ops). Every staging site reads
+   fsa()/fsb(); the fixed-pair encoders farith_x1_x0/pxor_x1 are
+   DELETED (generic farith/pxor_rr); the bare-number xmm element
+   operands converted too; fmod ML_CHECKs the stage IS the SysV pair
+   (force_x0_x1 conflates "the stage" with "the ABI pair" - a D-era
+   stage move must add marshalling there). fp_allocatable now
+   includes xmm0/1. FLOORS AT ZERO: XMM0 0, XMM1 0 (8+1 abi-tagged
+   sites remain, all SysV). 116/116 byte-identical both arenas.
+   The original per-op design, kept for the D-era revisit:
    * FStage: a per-op RAII PAIR ask (mirroring AccScratch) - two
      ra.ftake calls, prefer X0 then X1, freed at op end. With the
      prefer discounts it is byte-identical while xmm0/1 are free,
