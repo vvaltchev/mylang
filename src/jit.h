@@ -326,10 +326,23 @@ struct IntervalQual {
     bool mem_int = false;        /* memory-demanded for the GP pool */
     bool mem_float = false;      /* memory-demanded for the xmm pool */
 };
+/* One memory-demand event: at `pc`, `slot`'s value must be IN ITS
+ * FRAME SLOT (a bad()/badi() site - the op takes the slot's address or
+ * a helper reads it via g_current_ctx). For the D3 scan this is a
+ * FORCED INTERVAL END: the interval is cut there, and only the
+ * mem-free pieces are register-allocatable (the design decision that
+ * retires the pick's run-wide bad() semantics). gp_only marks a
+ * badi() - the float side may still hold the slot across it. */
+struct MemEvent {
+    uint32_t pc;
+    int slot;
+    bool gp_only;
+};
 bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
                            const std::vector<LiveInterval> &iv,
                            std::vector<IntervalQual> &out,
-                           int *orphans = nullptr);
+                           int *orphans = nullptr,
+                           std::vector<MemEvent> *mem_events = nullptr);
 #ifdef TESTS
 /* Test-only export of the (static) pick - the D3 qualification check
  * asserts per-interval facts against the pick's public answer. */

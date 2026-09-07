@@ -25223,6 +25223,7 @@ static bool jit_interval_qual_check()
           "print(f);\n" },
     };
     bool ok = true, saw_payoff = false, saw_pick = false, saw_fhot = false;
+    bool saw_gponly = false, saw_both = false;
     for (const Case &c : cases) {
         std::vector<Tok> toks;
         lexer(c.src, 1, toks);
@@ -25242,9 +25243,10 @@ static bool jit_interval_qual_check()
             continue;
         }
         std::vector<IntervalQual> q;
+        std::vector<MemEvent> ev;
         int orphans = -1;
         if (!jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
-                                   &orphans)) {
+                                   &orphans, &ev)) {
             printf("  qual [%s]: an op was unclassifiable\n", c.name);
             ok = false;
             continue;
@@ -25252,6 +25254,39 @@ static bool jit_interval_qual_check()
         if (orphans != 0) {                              /* property C */
             printf("  qual [%s]: %d orphan event(s)\n", c.name, orphans);
             ok = false;
+        }
+        /* property E: the MemEvent stream and the mem flags agree -
+         * every mem_int interval contains a matching event, and every
+         * event lands inside an interval whose flag it set (pc
+         * attribution, the fact the scan CUTS on) */
+        for (size_t k = 0; k < iv.size(); k++) {
+            bool got = false;
+            for (const MemEvent &e : ev)
+                if (e.slot == iv[k].slot && e.pc >= iv[k].start
+                        && e.pc < iv[k].end)
+                    got = true;
+            if (q[k].mem_int != got) {
+                printf("  qual [%s]: interval slot %d [%u,%u) mem_int=%d"
+                       " but event=%d\n", c.name, iv[k].slot,
+                       iv[k].start, iv[k].end, q[k].mem_int, got);
+                ok = false;
+            }
+        }
+        for (const MemEvent &e : ev) {
+            bool in = false;
+            for (size_t k = 0; k < iv.size(); k++)
+                if (e.slot == iv[k].slot && e.pc >= iv[k].start
+                        && e.pc < iv[k].end
+                        && q[k].mem_int
+                        && (e.gp_only ? true : q[k].mem_float))
+                    in = true;
+            if (!in) {
+                printf("  qual [%s]: event pc %u slot %d matches no "
+                       "flagged interval\n", c.name, e.pc, e.slot);
+                ok = false;
+            }
+            if (e.gp_only) saw_gponly = true;
+            else saw_both = true;
         }
         std::vector<int> fhot;
         const std::vector<int> picked =
@@ -25311,6 +25346,12 @@ static bool jit_interval_qual_check()
     if (!saw_pick || !saw_fhot) {
         printf("  qual: a pool never picked anything - property A is "
                "vacuous (int=%d float=%d)\n", saw_pick, saw_fhot);
+        ok = false;
+    }
+    if (!saw_gponly || !saw_both) {
+        printf("  qual: an event kind never occurred (gp_only=%d "
+               "both=%d) - property E is half-vacuous\n",
+               saw_gponly, saw_both);
         ok = false;
     }
     if (!saw_payoff) {
