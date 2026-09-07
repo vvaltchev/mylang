@@ -25039,6 +25039,139 @@ static bool jit_fwd_family_coverage()
 }
 
 /*
+ * D1: the interval builder against its SPEC ("an interval of slot s
+ * covers pc iff live_in(pc,s) || s in defs(pc)"), where the liveness
+ * side comes from the fixpoint the PREVIOUS check already validates
+ * against the dataflow equation - so this is not the builder checked
+ * against itself. Structural facts checked per chunk: coverage in
+ * both directions at every (pc, slot), per-slot disjointness +
+ * maximality (the pc before a start and the end pc are NOT covered),
+ * and weights recounted from jit_op_slot_refs. VACUITY GUARDED: some
+ * slot in the corpus must produce >= 2 intervals - a real HOLE - or
+ * the "with holes" half of the representation was never exercised.
+ */
+static bool jit_intervals_check()
+{
+#if ML_JIT_SUPPORTED
+    struct Case { const char *name; std::string src; };
+    const Case cases[] = {
+        { "loop + branch",
+          "var a = 0; var b = 0; b = b + runtime(7);\n"
+          "for (var i = 0; i < b; i++) { if (i % 2 == 0) a = a + i;"
+          " else a = a - i; }\nprint(a);\n" },
+        /* two disjoint hot phases of ONE variable, separated by a
+         * stretch where it is dead - the hole shape D exists for */
+        { "phase-local reuse (a hole)",
+          "var t = 0; t = t + runtime(2);\nvar u = t * 3;\n"
+          "print(u);\n"
+          "t = 0;\nfor (var i = 0; i < runtime(9); i++) t = t + i;\n"
+          "print(t);\n" },
+        { "calls + element stores",
+          "func h(int n) { var r = n * 3; return r + 1; }\n"
+          "var lim = 0; lim = lim + runtime(4);\n"
+          "var arr = array(lim);\n"
+          "for (var i = 0; i < lim; i++) { arr[i] = h(i); }\n"
+          "print(sum(arr));\n" },
+    };
+    bool ok = true, saw_hole = false;
+    for (const Case &c : cases) {
+        std::vector<Tok> toks;
+        lexer(c.src, 1, toks);
+        ParseContext pctx(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pctx);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        std::vector<const Chunk *> chunks;
+        chunks.push_back(&prog.root);
+        for (const auto &fd : prog.funcs)
+            if (fd->vm_chunk)
+                chunks.push_back(static_cast<const Chunk *>(fd->vm_chunk));
+        for (const Chunk *ck : chunks) {
+            SlotLiveness sl;
+            if (!jit_slot_liveness(*ck, sl))
+                continue;
+            std::vector<LiveInterval> iv;
+            if (!jit_build_intervals(*ck, 0, ck->code.size(), sl, iv)) {
+                printf("  intervals [%s]: builder declined\n", c.name);
+                ok = false;
+                continue;
+            }
+            const int count = sl.count;
+            std::vector<int> uses, defs;
+            std::vector<int> nseen(count, 0);
+            /* covered(pc, slot), rebuilt from the interval LIST */
+            std::vector<uint8_t> cov(ck->code.size()
+                                     * static_cast<size_t>(count), 0);
+            std::vector<long> w(count, 0);
+            for (const LiveInterval &l : iv) {
+                if (l.start >= l.end || l.end > ck->code.size()
+                        || l.slot < sl.base
+                        || l.slot >= sl.base + count) {
+                    printf("  intervals [%s]: malformed entry\n", c.name);
+                    ok = false;
+                    continue;
+                }
+                nseen[l.slot - sl.base]++;
+                for (uint32_t p = l.start; p < l.end; p++) {
+                    uint8_t &b =
+                        cov[p * static_cast<size_t>(count)
+                            + (l.slot - sl.base)];
+                    if (b) {
+                        printf("  intervals [%s]: overlap at pc %u "
+                               "slot %d\n", c.name, p, l.slot);
+                        ok = false;
+                    }
+                    b = 1;
+                }
+                w[l.slot - sl.base] += l.weight;
+            }
+            for (size_t p = 0; p < ck->code.size(); p++) {
+                jit_op_slot_refs(ck->code[p], uses, defs);
+                for (int sN = 0; sN < count; sN++) {
+                    const int slot = sl.base + sN;
+                    bool isdef = false, isuse = false;
+                    for (const int d : defs)
+                        if (d == slot) isdef = true;
+                    for (const int uu : uses)
+                        if (uu == slot) isuse = true;
+                    const bool active = sl.live_in(p, slot) || isdef;
+                    const bool covd =
+                        cov[p * static_cast<size_t>(count) + sN] != 0;
+                    if (active != covd) {
+                        printf("  intervals [%s]: pc %zu slot %d "
+                               "active=%d covered=%d\n",
+                               c.name, p, slot, active, covd);
+                        ok = false;
+                    }
+                    if (covd && (isdef || isuse))
+                        w[sN]--;
+                }
+            }
+            for (int sN = 0; sN < count; sN++) {
+                if (w[sN] != 0) {
+                    printf("  intervals [%s]: slot %d weight off by "
+                           "%ld\n", c.name, sl.base + sN, w[sN]);
+                    ok = false;
+                }
+                if (nseen[sN] >= 2)
+                    saw_hole = true;
+            }
+        }
+    }
+    if (!saw_hole) {
+        printf("  intervals: no slot ever produced two intervals - the "
+               "hole half of the representation is untested\n");
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * #96: the LOW-ADDRESS ARENA actually placed the Type singletons.
  *
  * The arena exists so the JIT can write a type tag with a sign-extended
@@ -33964,6 +34097,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the all-slot LIVE RANGES agree with the temps-only analysis "
       "they generalise, and clear its 64-temp cliff (#96)",
       jit_slot_liveness_check },
+    { "jit: D1 - live INTERVALS agree with the liveness fixpoint at "
+      "every pc, per-slot holes observed (the allocator's input)",
+      jit_intervals_check },
     { "jit: the low-address arena placed every Type singleton below "
       "2^31, so a type tag can encode as imm32 (#96)",
       jit_lowmem_singletons },

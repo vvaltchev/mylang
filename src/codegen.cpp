@@ -8357,6 +8357,61 @@ bool jit_slot_liveness(const Chunk &chunk, SlotLiveness &out)
     return true;
 }
 
+bool jit_build_intervals(const Chunk &chunk, size_t begin, size_t end,
+                         const SlotLiveness &sl,
+                         std::vector<LiveInterval> &out)
+{
+    out.clear();
+    if (!sl.ok || begin >= end || end > chunk.code.size())
+        return false;
+    const int count = sl.count;
+    /* per-pc defs/uses, per slot - one pass over the ops */
+    const size_t n = end - begin;
+    std::vector<uint8_t> defbit(n * static_cast<size_t>(count), 0);
+    std::vector<uint8_t> usebit(n * static_cast<size_t>(count), 0);
+    std::vector<int> uses, defs;
+    for (size_t p = begin; p < end; p++) {
+        jit_op_slot_refs(chunk.code[p], uses, defs);
+        for (const int s : defs)
+            if (s >= sl.base && s < sl.base + count)
+                defbit[(p - begin) * count + (s - sl.base)] = 1;
+        for (const int s : uses)
+            if (s >= sl.base && s < sl.base + count)
+                usebit[(p - begin) * count + (s - sl.base)] = 1;
+    }
+    for (int s = 0; s < count; s++) {
+        const int slot = sl.base + s;
+        bool open = false;
+        LiveInterval cur{ slot, 0, 0, 0 };
+        for (size_t p = begin; p < end; p++) {
+            const size_t k = (p - begin) * count + s;
+            const bool active = sl.live_in(p, slot) || defbit[k];
+            if (active && !open) {
+                open = true;
+                cur = { slot, static_cast<uint32_t>(p), 0, 0 };
+            }
+            if (active && (defbit[k] || usebit[k]))
+                cur.weight++;
+            if (!active && open) {
+                open = false;
+                cur.end = static_cast<uint32_t>(p);
+                out.push_back(cur);
+            }
+        }
+        if (open) {
+            cur.end = static_cast<uint32_t>(end);
+            out.push_back(cur);
+        }
+    }
+    /* by start pc - the order a linear scan consumes */
+    std::sort(out.begin(), out.end(),
+              [](const LiveInterval &a, const LiveInterval &b) {
+                  return a.start != b.start ? a.start < b.start
+                                            : a.slot < b.slot;
+              });
+    return true;
+}
+
 void jit_next_use(const Chunk &chunk, size_t begin, size_t end,
                   int base, int count, std::vector<int> &dist)
 {

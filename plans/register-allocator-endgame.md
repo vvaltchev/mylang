@@ -435,12 +435,25 @@ FOUNDATIONS ALREADY IN PLACE (why this is feasible):
      01_while_loop     24,315,122
      07_nested_loops   42,586,938
 
-### D1. Live intervals
- - Per run, from livein/liveout: per-slot interval lists WITH HOLES
-   ({slot, [start_pc, end_pc), next_use chain, weight}). A dev dump
-   (-rt entry: intervals agree with the liveness fixpoint at every
-   pc - derive the check from the SPEC, not from the builder; the
-   oracle-shares-its-subject trap is recorded for exactly this).
+### D1. Live intervals  [LANDED 2026-08-22]
+RESULT: jit_build_intervals (codegen.cpp/.h) - per-slot maximal
+stretches WITH HOLES ({slot, [start,end), weight}), sorted by start.
+SPEC (stated in codegen.h, and the -rt check derives from it, not
+from the builder): an interval of s covers pc iff
+live_in(pc,s) || s in defs(pc); a def OPENS the stretch at the
+defining pc. Barrier ops read as use-everything/define-nothing -
+conservative-safe. The `jit: D1` -rt check verifies coverage both
+directions at every (pc,slot), disjointness, and recounted weights,
+with a HOLE vacuity guard (some slot must yield >= 2 intervals);
+WATCHED failing (the def-opens rule removed -> coverage mismatches
+named by pc/slot). next-use chains stay with jit_next_use for D3.
+
+⛔ RESUME HERE (next session): D2 - the per-pc assignment seam.
+Introduce reg_at(slot, pc) as a WRAPPER over today's whole-run
+answer (creg/cspill/fcreg), migrate the consumers listed below one
+cluster at a time with vdjcmp 116/116 after each, and teach the
+tracker the map. Only after every consumer reads the seam does D3
+put the linear scan behind it.
 
 ### D2. The per-pc assignment seam - RESTRUCTURING BEFORE THE BRAIN
  - Introduce reg_at(slot, pc) / assignment map; implement it FIRST
