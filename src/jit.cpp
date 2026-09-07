@@ -10392,6 +10392,574 @@ static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
  * read the register itself. MYLANG_CACHEAUDIT=1 ranks the sites by
  * candidacies killed; check that FIRST, then check which kind it is.
  */
+/*
+ * D3.b - THE SHARED OP-CLASSIFICATION VISITOR. The ONE switch that
+ * answers, per op, which frame slots it touches and THROUGH WHICH CHOKE
+ * POINT - the qualification rules pick_cached_slots has always applied,
+ * exported so the interval allocator (D3) drives the SAME rules with its
+ * own callbacks. Two copies of these rules would drift silently, and a
+ * dropped bad() in one of them is a wrongly-pinned slot - the r9 shape.
+ *
+ * The visitor contract - V is any struct with these callable members
+ * (the pick binds its accounting lambdas; each takes an int slot and
+ * must tolerate s < 0 == "not a slot", as the lambdas always have):
+ *   usei(s)      countable INT use - read/written via a cache-aware int
+ *                choke point (also disqualifies the float pool);
+ *   usei_dst(s)  usei + the op WRITES s as an int (C3 type elision);
+ *   usef(s)      countable FLOAT use (emit_float_load / _store);
+ *   fdst_mark(s) a float op WROTE s - the float-pool qualifier;
+ *   use_ret(s)   ReturnV's int count: weight with NO float-side
+ *                disqualification (see the case's soundness note);
+ *   full_read_mark(s)  s is read as a FULL 32-byte value from memory
+ *                (may pin, must NOT type-elide);
+ *   bad(s)       memory-touched: no pin in EITHER pool;
+ *   badi(s)      int-side-only disqualifier (a float op's slots);
+ *   badf(s)      float-side-only disqualifier;
+ *   mark_barrier(pc)  the op is BRACKETED by flush/reload instead.
+ *
+ * Returns false for an op it cannot classify, or whose written slots it
+ * cannot enumerate per-pc - the caller must then assume every slot is
+ * touched (the pick answers by caching NOTHING for the run).
+ */
+template <class V>
+static bool
+pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
+{
+    switch (in.op) {
+    case OpCode::IntBin:
+    case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+    case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+    case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+    case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShrRR:
+    case OpCode::IntShlRI: case OpCode::IntShrRI:
+    case OpCode::IntAddModRI:
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        if (!in.b_is_lit()) v.usei(in.b_slot());
+        v.usei_dst(in.target);
+        break;
+    case OpCode::IntModRI:
+        v.usei(in.a_slot()); v.usei_dst(in.target);
+        break;
+    case OpCode::JumpUnlessIntCmp:
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        if (!in.b_is_lit()) v.usei(in.b_slot());
+        break;
+    case OpCode::ForLoopStep:
+        v.usei_dst(in.target2);
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        if (!in.b_is_lit()) v.usei(in.b_slot());
+        break;
+    case OpCode::IntAddStep:
+        /* operand layout MUST match the emitter (emit_branch): accum =
+         * a_dual_lo, counter = target2, rhs = b (b_slot unless b_is_lit),
+         * bound = a_dual_hi (slot unless the private a-lit flag, read as
+         * a_is_lit). Counting the wrong field - e.g. a bare `in.pb`,
+         * which for a LITERAL rhs is the literal VALUE - would treat that
+         * value as a slot index and cache/corrupt whatever slot it
+         * collides with (an array slot -> LoadElem InternalErrorEx). */
+        v.usei_dst(in.a_dual_lo());  /* accumulator */
+        v.usei_dst(in.target2);      /* counter */
+        if (!in.b_is_lit()) v.usei(in.b_slot());      /* rhs slot */
+        if (!in.a_is_lit()) v.usei(in.a_dual_hi());    /* bound slot */
+        break;
+    case OpCode::LoadImmInt:
+        v.usei_dst(in.target);
+        break;
+    case OpCode::ReturnV:
+        /* the result value slot is read by the return. Counting it as an
+         * int use is SAFE: a FLOAT result slot is always disqualified by
+         * the float op that produced it (badi()), and a slot reachable
+         * only via ReturnV is used once (< the 3-use cache threshold) - so
+         * no float slot is ever cached as an int here. C2a: it must NOT
+         * disqualify the FLOAT side (usei normally badf's) - the emit
+         * runs flush_cache BEFORE jit_ret, so a float-pinned result
+         * slot is current in memory when the helper reads it. */
+        if (in.a_slot() >= 0)
+            v.use_ret(in.a_slot());
+        break;
+    /* float ops: no int-pin (bad), but C2a float-pool USES - the
+     * operand reads go through emit_float_load and the dst writes
+     * through emit_float_store, both cache-aware. Only the DST
+     * qualifies a slot (`fdst`); an operand may be a definitely-int
+     * slot served by the promote arm. FloatBin's div/mod arms are
+     * fine: the div0 raise exits through the flushing epilogue and
+     * the fmod libm call spills the pins via the shared prologue. */
+    case OpCode::FloatBin:
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+        if (!in.a_is_lit()) { v.badi(in.a_slot()); v.usef(in.a_slot()); }
+        if (!in.b_is_lit()) { v.badi(in.b_slot()); v.usef(in.b_slot()); }
+        v.badi(in.target); v.usef(in.target); v.fdst_mark(in.target);
+        break;
+    case OpCode::JumpUnlessFloatCmp:
+        if (!in.a_is_lit()) { v.badi(in.a_slot()); v.usef(in.a_slot()); }
+        if (!in.b_is_lit()) { v.badi(in.b_slot()); v.usef(in.b_slot()); }
+        break;
+    case OpCode::LoadImmFloat:
+        v.badi(in.target); v.usef(in.target); v.fdst_mark(in.target);
+        break;
+    case OpCode::MathFnV:
+        /* C2a: previously UNLISTED - one math builtin disabled
+         * pinning for its whole run. Arg(s) via emit_float_load,
+         * dst via emit_float_store (cache-aware); an MK_CALL
+         * selector's libm call spills the float pins via the shared
+         * prologue/epilogue. The int side stays memory (bad). */
+        if (!in.a_is_lit()) { v.badi(in.a_slot()); v.usef(in.a_slot()); }
+        if (!in.b_is_lit()) { v.badi(in.b_slot()); v.usef(in.b_slot()); }
+        v.badi(in.target); v.usef(in.target); v.fdst_mark(in.target);
+        break;
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::OrdCharV:      /* same shape: idx cache-aware (a VALUE
+                                 * arg to jit_ord_char), base/dst leas */
+        /* the INDEX is read cache-aware (load_index_idx), so it stays a
+         * countable int use - it is the loop counter, the slot most worth
+         * pinning. base is read in memory. LoadElemFloat's dst is
+         * written via emit_float_store -> a C2a float candidate; the
+         * int/ord dsts stay memory (the two-store / store_dst). */
+        v.bad(in.target2);
+        if (in.op == OpCode::LoadElemFloat) {
+            v.badi(in.target);
+            v.usef(in.target); v.fdst_mark(in.target);
+        } else {
+            v.bad(in.target);
+        }
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        break;
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+        /* BOTH indices are VALUE args to jit_load_elem2_* (read
+         * cache-aware), so they stay countable int uses - in a matrix
+         * loop they are the two loop counters, the slots most worth
+         * pinning. base is a lea -> memory. The FLOAT dst is written
+         * via emit_float_store -> a C2a float candidate. */
+        v.bad(in.target2);
+        if (in.op == OpCode::LoadElem2Float) {
+            v.badi(in.target);
+            v.usef(in.target); v.fdst_mark(in.target);
+        } else {
+            v.bad(in.target);
+        }
+        v.usei(in.a_dual_lo());
+        if (!in.b_is_lit()) v.usei(in.b_slot());
+        break;
+    case OpCode::StoreElemInt:
+        v.bad(in.target2);             /* base slot holds an array */
+        if (!in.a_is_lit()) v.usei(in.a_slot());   /* index (int) */
+        if (!in.b_is_lit()) v.usei(in.b_slot());   /* value (int) */
+        break;
+    case OpCode::StoreElemFloat:
+        v.bad(in.target2);             /* base slot holds an array */
+        if (!in.b_is_lit()) {        /* value: a FLOAT, read via
+                                      * emit_float_load (cache-aware -
+                                      * a C2a float use, no fdst) */
+            v.badi(in.b_slot()); v.usef(in.b_slot());
+        }
+        if (!in.a_is_lit()) v.usei(in.a_slot());   /* index (int) */
+        break;
+    case OpCode::DictStore:
+        /* the fragment passes &slot for base/key/value, so those slots
+         * must hold CURRENT EvalValues - a cached int key (a counter used
+         * as d[i]) would leave its slot stale. Disqualify all three -
+         * flushing them at the emit instead was measured and REJECTED,
+         * see the note above pick_cached_slots. */
+        v.bad(in.target2); v.bad(in.a_slot()); v.bad(in.b_slot());
+        break;
+    case OpCode::StoreElemValue:
+        /* jit_store_elem_value reads idx (a_slot) + val (b_slot) - and a
+         * LOCAL base (target2) - from MEMORY via g_current_ctx. The idx and
+         * index (a counter used as a[i]) would be stale. FLUSHING it at the
+         * emit instead was measured and REJECTED - see the note above
+         * pick_cached_slots. The base is a frame slot only for a LOCAL
+         * base (kind == target == 0). */
+        if (in.target == 0) v.bad(in.target2);
+        v.bad(in.a_slot()); v.bad(in.b_slot());
+        break;
+    case OpCode::StoreMemberV:
+      /* jit_store_member reads val (b_slot) - and a LOCAL base (target2) -
+      
+         * from MEMORY; the member key is a_lit (a pool index, not a slot). */
+        if (in.target == 0) v.bad(in.target2);
+        v.bad(in.b_slot());
+        break;
+    case OpCode::StoreElem2V:
+      /* jit_store_elem2 reads base (target2, always LOCAL), k1 (a_dual_lo),
+      
+         * k2 (b_slot), val (target) from MEMORY. (StoreElemChainV /
+         * StoreLValueChainV read a key RUN of unknown-here size, so they hit
+         * the default -> no caching for the run, which is safe.) */
+        v.bad(in.target2); v.bad(static_cast<int>(in.a_dual_lo()));
+        v.bad(in.b_slot()); v.bad(in.target);
+        break;
+    case OpCode::MoveV:
+        /* C2a: the source side is float-cache-aware too (the emit
+         * reads the pin via emit_float_store), and like the int side
+         * it contributes NO WEIGHT - a boxed move must never be the
+         * evidence a slot holds a float. The DEST stays memory-only
+         * (a MoveV can write ANY type). C3: an UNPINNED source is
+         * copied from memory as a FULL value - no type elision. */
+        v.full_read_mark(in.target2);
+        v.badf(in.target);
+        /* CACHE-AWARE ON THE SOURCE SIDE (see the emit). A pinned source
+         * is a proven int, so the move is just the ordinary int store and
+         * the register is read directly - which is why target2 is NOT
+         * disqualified here.
+         *
+         * It is NOT counted either (no usei), and that omission is the
+         * SOUNDNESS ANCHOR. A MoveV is the BOXED move: the bytecode says
+         * nothing about the value's type, so it can never be the evidence
+         * that a slot holds an int. Contributing zero weight means a slot
+         * reaches the cache only if some genuine int op qualified it - and
+         * once it has, every write to it in this run is an int write, so
+         * the value this MoveV reads really is an int.
+         *
+         * The DEST stays memory-only: a MoveV can write ANY type, so a
+         * pinned dst could silently stop holding an int. */
+        v.bad(in.target);
+        break;
+    case OpCode::SubscriptV:
+      /* the fragment leas &slot for base/idx/dst - all must be current. */
+      
+        v.bad(in.target2); v.bad(in.a_slot()); v.bad(in.target);
+        break;
+    case OpCode::SliceV:
+        /* jit_slice reads base/start/end + writes dst from MEMORY (via
+         * g_current_ctx->frame); start/end are int bounds that COULD be
+         * int-cached (a loop counter as a[i:j]), so disqualify them. */
+        v.bad(in.target2); v.bad(in.target);
+        if (in.a_slot() >= 0) v.bad(static_cast<int>(in.a_slot()));
+        if (in.b_slot() >= 0) v.bad(static_cast<int>(in.b_slot()));
+        break;
+    case OpCode::MemberV:
+    case OpCode::LoadMemberInt:
+    case OpCode::LoadMemberFloat:
+        /* base read + dst written from memory by the helper (the member
+         * key is a baked pool entry, not a slot). */
+        v.bad(in.target2); v.bad(in.target);
+        break;
+    case OpCode::ArrLen:
+        /* dst written from memory; base (target2) holds an array reference,
+         * never an int - both must stay in memory. */
+        v.bad(in.target); v.bad(in.target2);
+        break;
+    case OpCode::DictLoadInt:
+    case OpCode::DictLoadFloat:
+        /* dst written from memory; base (target2) holds a dict reference;
+         * a subscript key temp (a_slot when !a_is_lit) is lea'd, so it must
+         * be current. A member key (a_is_lit) is a baked const, no slot. */
+        v.bad(in.target); v.bad(in.target2);
+        if (!in.a_is_lit()) v.bad(in.a_slot());
+        break;
+    case OpCode::MakeClosureV:
+        /* A closure SNAPSHOTS its capture sources from frame MEMORY, but
+         * the captured slots are the closure's (runtime) capture list - the
+         * emitter can't enumerate them to disqualify individually. An N5
+         * register-cached capture source (e.g. a hot loop accumulator the
+         * closure captures) would be STALE in memory when jit_make_closure
+         * reads it. BRACKET it (flush before / reload after) so the rest of
+         * the fragment keeps its pinned registers. */
+        v.mark_barrier(pc);
+        break;
+    case OpCode::CallBuiltinV:
+        /* A callback builtin (make_array/make_dict/find) re-enters
+         * vm_dispatch and can mutate ARBITRARY slots (globals, captures,
+         * the accumulator) - the emitter can't enumerate them. BRACKET it:
+         * flush the pinned registers to memory before (so the builtin and
+         * any callback see current values) and reload after (so a callback
+         * write is picked up). Disabling pinning for the whole fragment
+         * instead - the old rule - cost a hot loop its registers whenever it
+         * merged into a fragment containing ANY builtin call. */
+        v.mark_barrier(pc);
+        break;
+    case OpCode::MapFilterV:
+        /* map/filter's callback re-enters vm_dispatch (same as a
+         * callback builtin) - bracket; the boxed operand/dst slots are
+         * never int candidates, disqualify defensively. */
+        v.mark_barrier(pc);
+        v.bad(in.a_slot()); v.bad(in.b_slot()); v.bad(in.target);
+        break;
+    case OpCode::CheckFuncV:
+    case OpCode::CheckCallableV:
+        v.bad(in.a_slot());            /* a func-value slot - never int */
+        break;
+    case OpCode::BinOpV:
+    case OpCode::CmpV:
+    case OpCode::LogV:
+        /* boxed operands/dst read/written from memory (dyn/string - not an
+         * int-scalar cache candidate anyway, but disqualify defensively). */
+        if (!in.a_is_lit()) v.bad(in.a_slot());
+        if (!in.b_is_lit()) v.bad(in.b_slot());
+        v.bad(in.target);
+        break;
+    case OpCode::UnaryV:         /* 1-operand boxed: a_slot + dst */
+        if (!in.a_is_lit()) v.bad(in.a_slot());
+        v.bad(in.target);
+        break;
+    case OpCode::CompoundV:
+        v.bad(in.target);              /* read + written from memory */
+        if (!in.b_is_lit()) v.bad(in.b_slot());
+        break;
+    case OpCode::CoerceNumV:
+        /* dst (a typed int/float coerces_dyn accumulator - COULD be a hot
+         * int slot) is written from memory by the helper; an N5-cached dst
+         * would be overwritten stale by the flush. src (a_slot) holds a dyn
+         * value (never int-cached). Disqualify both. */
+        v.bad(in.target); v.bad(in.a_slot());
+        break;
+    case OpCode::StoreGlobalV:
+    case OpCode::StoreCaptureV:
+      /* reads the rhs operand from memory (target is a GLOBAL/CAPTURE slot,
+      
+         * not a frame slot). PLAIN: `a` is the src slot; COMPOUND: `a` is the
+         * rhs (a slot OR a lit - skip a lit). */
+        if (!in.a_is_lit()) v.bad(in.a_slot());
+        break;
+    case OpCode::AppendV:
+      /* jit_append reads the VALUE (b_lit, a frame slot - could be a cached
+      
+         * int counter `append(a, i)`) and a LOCAL arg0 array (target2 when
+         * kind == a_dual_hi() == 0) from MEMORY; the dst is written. */
+        if (in.a_dual_hi() == 0) v.bad(in.target2);
+        v.bad(static_cast<int>(in.b_lit()));
+        if (in.target >= 0) v.bad(in.target);
+        break;
+    case OpCode::MakeArrayV:
+        /* jit_make_array reads the whole ELEMENT run [a_lit, a_lit+b_lit)
+         * from MEMORY (an element can be a cached int counter - `[i, i*2]`
+         * in a loop), and writes dst. The run IS enumerable here (base + n
+         * are both in the instruction), so disqualify it precisely instead
+         * of turning caching off for the whole run. */
+        for (int_type i = 0; i < in.b_lit(); i++)
+            v.bad(static_cast<int>(in.a_lit() + i));
+        v.bad(in.target);
+        break;
+    case OpCode::MakeDictV:
+        /* same, over the INTERLEAVED key/value run [a_lit, a_lit+2*b_lit)
+         * (b_lit is the PAIR count) - a key or value can be a cached int
+         * counter (`{i: i * 2}` in a loop). */
+        for (int_type i = 0; i < 2 * in.b_lit(); i++)
+            v.bad(static_cast<int>(in.a_lit() + i));
+        v.bad(in.target);
+        break;
+    case OpCode::StructCtorV:
+        /* PLANNED (b_dual_hi >= 0): an act-0 (int) plan src is read
+         * CACHE-AWARE by the emit (a direct-local src can be the loop
+         * counter - `P(i, ..)`), so it stays a countable int use; an
+         * act-1/2 src reads memory (emit_float_load / byte load) ->
+         * bad. dst: the H1 guards read/write it from memory -> bad.
+         * UNPLANNED: the whole run is read from memory by the helper. */
+        if (in.b_dual_hi() >= 0) {
+            for (const Chunk::CtorPlanField &pf :
+                     ck.ctor_plans[in.b_dual_hi()].f) {
+                if (pf.act == 0)
+                    v.usei(pf.src);
+                else
+                    v.bad(pf.src);
+            }
+        } else {
+            for (int i = 0; i < in.b_dual_lo(); i++)
+                v.bad(static_cast<int>(in.a_lit()) + i);
+        }
+        v.bad(in.target);
+        break;
+    case OpCode::LoadElemBool:
+        /* INLINED (no helper); the index is read cache-aware
+         * (load_index_idx), so it stays a countable int use like
+         * LoadElemInt's. */
+        v.bad(in.target); v.bad(in.target2);
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        break;
+    case OpCode::StrLen:
+    case OpCode::LoadStrChar:
+    case OpCode::LoadStructFieldInt:
+    case OpCode::LoadStructFieldFloat:
+    case OpCode::LoadStructElemV:
+    case OpCode::LoadElemValue:
+        /* The helper WRITES dst and READS the base from MEMORY, so both
+         * must stay in memory. The INDEX is different: the emitter
+         * materializes it with the cache-aware load_operand BEFORE the
+         * call, so it is read from its register when pinned - it stays a
+         * countable int use (this is the foreach COUNTER, the slot N5 most
+         * wants to cache; disqualifying it would lose the loop's caching). */
+        v.bad(in.target); v.bad(in.target2);
+        if (in.op != OpCode::StrLen && !in.a_is_lit())
+            v.usei(in.a_slot());
+        break;
+    case OpCode::StructCtorBoxedV:
+    case OpCode::MakeStructArrayV:
+        /* Their run LENGTH is not derivable from the instruction alone -
+         * the boxed ctor's arg count lives in the boxed_ctors pool, and the
+         * struct-array literal's run is n * nfields (the field count is in
+         * the DEF); the visitor deliberately does not chase pools.
+         * Per the MakeClosureV rule (a helper reading slots the emit site
+         * cannot name), BRACKET them with flush/reload. */
+        v.mark_barrier(pc);
+        break;
+    case OpCode::LoadBuiltinV:
+    case OpCode::LoadConstV:
+    case OpCode::LoadLiteralObjV:
+    case OpCode::LoadCaptureV:
+    case OpCode::LoadGlobalV:
+        /* writes dst from memory (a builtin / const / literal / capture /
+         * global value, not an int); target2 is a compile-time index (the
+         * global slot for LoadGlobalV), not a frame slot. */
+        v.bad(in.target);
+        break;
+    case OpCode::JumpUnlessElemInt:
+        /* reads the base (an array ref) from memory; the INDEX goes through
+         * the cache-aware load_index_idx, so it stays a countable int use -
+         * it is the loop counter. Nothing is written. */
+        v.bad(in.target2);
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        break;
+    case OpCode::CmpIntV:
+        /* both operands are plain int reads (cache-aware load_operand), so
+         * they stay countable int uses; the dst holds a BOOL, written to
+         * memory - never an int-cache candidate. Without this case the op
+         * hit the `default` and disabled pinning for the WHOLE run. */
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        if (!in.b_is_lit()) v.usei(in.b_slot());
+        v.bad(in.target);
+        break;
+    case OpCode::JumpUnlessTrueV:
+        /* jit_is_true reads the CONDITION slot (target2) from MEMORY via
+         * g_current_ctx, so it must be current - and it holds a boxed value
+         * (dyn/bool/string), never an int-scalar cache candidate anyway. */
+        v.bad(in.target2);
+        break;
+    case OpCode::StructFieldAddInt:
+        /* idx (a) is materialized cache-aware pre-call; `other`
+         * (b_dual_hi) and the dst are read/written via the cache-aware
+         * read_slot/write_slot in the FRAGMENT - all stay countable int
+         * uses (the dst is the reduction's hot accumulator). Only the
+         * base array slot must stay in memory. */
+        v.bad(in.target2);
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        v.usei(static_cast<int>(in.b_dual_hi()));
+        v.usei(in.target);
+        break;
+    case OpCode::ForStepElemInt:
+        /* counter (target2) stepped + used as the index cache-aware;
+         * bound (a) cache-aware; the elem dst (b_dual_hi) written via
+         * write_slot. The base array slot stays in memory. */
+        v.bad(static_cast<int>(in.b_dual_lo()));
+        v.usei(in.target2);
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        v.usei(static_cast<int>(in.b_dual_hi()));
+        break;
+    case OpCode::EmplaceStruct:
+        /* the field-value RUN length lives in the emplace_sites pool
+         * (nfields), not in the instruction - the emitter cannot
+         * enumerate the slots the helper reads. BRACKET it (the
+         * StructCtorBoxedV rule; not a branch, so the reload always
+         * runs). */
+        v.mark_barrier(pc);
+        break;
+    case OpCode::DictIterInit:
+        /* reads the dict slot (target2) from memory; target is the iter_id,
+         * not a slot. The iterator state itself is activation-side. */
+        v.bad(in.target2);
+        break;
+    case OpCode::DictIterNext:
+        /* the helper WRITES the key/value slots (a/b; -1 == unbound) from
+         * memory - a cached int value slot (a dict<str,int> loop's v used
+         * in int arith) would be stale. target/target2 are end_pc/iter_id,
+         * not slots. */
+        v.bad(in.a_slot()); v.bad(in.b_slot());
+        break;
+    case OpCode::ForeachDynInit:
+        /* reads the container slot (target2) from memory; a/b are lits
+         * (the shape + the unpack_targets pool index). */
+        v.bad(in.target2);
+        break;
+    case OpCode::ForeachDynNext:
+        /* the helper writes the POOL-listed target slots - which the
+         * emitter cannot enumerate (the slot list lives in unpack_targets,
+         * as a per-pc slot set). A barrier is not an option either:
+         * this is a BRANCH (a taken end_pc would skip the reload).
+         * Per the MakeClosureV can't-enumerate rule, cache nothing. */
+        return false;
+    case OpCode::CmpFloatV:
+        /* float operands (cache-aware via emit_float_load - C2a
+         * float uses) + a BOOL dst written to memory (bad both). */
+        if (!in.a_is_lit()) { v.badi(in.a_slot()); v.usef(in.a_slot()); }
+        if (!in.b_is_lit()) { v.badi(in.b_slot()); v.usef(in.b_slot()); }
+        v.bad(in.target); v.badf(in.target);
+        break;
+    case OpCode::JumpIfNotNoneV:
+        /* reads the lhs slot's type tag from memory (a boxed value). */
+        v.bad(in.a_slot());
+        break;
+    case OpCode::DeclConstV:
+        /* the helper reads src (a) + writes the dst LValue from memory;
+         * for a GLOBAL dst (target2==1) `target` is a global slot, not a
+         * frame slot. */
+        v.bad(in.a_slot());
+        if (in.target2 == 0) v.bad(in.target);
+        break;
+    case OpCode::DefinedGlobalV:
+        /* writes the bool dst from memory (target2 is the global slot). */
+        v.bad(in.target);
+        break;
+    case OpCode::ThrowRuntimeV:
+        break;                       /* no slots - it only exits */
+    case OpCode::PushHandler:
+    case OpCode::PopHandler:
+    case OpCode::SetPend:
+    case OpCode::EndFinally:
+        break;                       /* pure activation state - no slots */
+    case OpCode::Throw:
+    case OpCode::Rethrow:
+        break;                       /* an unconditional exit - no slots */
+    case OpCode::UnpackElemInt:
+    case OpCode::UnpackElemFloat:
+    case OpCode::UnpackElemValue:
+        /* the helper writes the CONSECUTIVE dst run [target, target+N)
+         * (N = b_lit, enumerable) and reads the base from memory; the
+         * index is materialized cache-aware pre-call (the foreach
+         * counter stays a countable int use). */
+        v.bad(in.target2);
+        for (int_type k = 0; k < in.b_lit(); k++)
+            v.bad(in.target + static_cast<int>(k));
+        if (!in.a_is_lit()) v.usei(in.a_slot());
+        break;
+    case OpCode::UnpackElemTargets:
+    case OpCode::MultiUnpackV:
+        /* the target slots live in the unpack_targets pool - not
+         * enumerable here (no chunk). BRACKET (neither is a branch). */
+        v.mark_barrier(pc);
+        break;
+    case OpCode::IncDecCheckedV:
+        /* the helper RMWs the slot in memory; a LOCAL (kind target2==0)
+         * must not be register-pinned. */
+        if (in.target2 == 0) v.bad(in.target);
+        break;
+    case OpCode::IncDecElemCheckedV:
+        /* base (target2, when a LOCAL - kind is in target) + the key
+         * temp (a) are read from memory by the helper. */
+        if (in.target == 0) v.bad(in.target2);
+        v.bad(in.a_slot());
+        break;
+    case OpCode::IncDecMemberCheckedV:
+        if (in.target == 0) v.bad(in.target2);
+        break;
+    case OpCode::IncDecChainV:
+        /* the chain's key temps live in the incdec_chains pool - not
+         * enumerable here. BRACKET (not a branch). */
+        v.mark_barrier(pc);
+        break;
+    case OpCode::Jump:
+    /* returns none - reads/writes no slot */
+    case OpCode::Halt:
+        break;                       /* no slots */
+    default:
+        return false;                /* an unclassified op - the caller
+                                      * must assume EVERY slot is
+                                      * touched */
+    }
+    return true;
+}
+
 static std::vector<int>
 pick_cached_slots(const Chunk &ck, size_t begin,
                   size_t end, int slot_count,
@@ -10487,543 +11055,39 @@ pick_cached_slots(const Chunk &ck, size_t begin,
             killed_by[s].push_back(cur_op);
     };
 
+    /* D3.b: the op classification is the shared pick_visit_op (above) -
+     * the pick supplies its accounting lambdas. `use_ret` is ReturnV's
+     * no-float-disq int count; the insert wrappers keep the visitor
+     * ignorant of the pick's containers. */
+    const auto use_ret = [&](int s) { use[s]++; };
+    const auto fdst_mark = [&](int s) { fdst.insert(s); };
+    const auto full_read_mark = [&](int s) { full_read.insert(s); };
+    using FUsei = decltype(usei);      using FUseiDst = decltype(usei_dst);
+    using FUsef = decltype(usef);      using FBad = decltype(bad);
+    using FBadi = decltype(badi);      using FBadf = decltype(badf);
+    using FUseRet = decltype(use_ret); using FFdst = decltype(fdst_mark);
+    using FFullRead = decltype(full_read_mark);
+    using FMarkBarrier = decltype(mark_barrier);
+    struct Fns {
+        const FUsei &usei;             const FUseiDst &usei_dst;
+        const FUsef &usef;             const FBad &bad;
+        const FBadi &badi;             const FBadf &badf;
+        const FUseRet &use_ret;        const FFdst &fdst_mark;
+        const FFullRead &full_read_mark;
+        const FMarkBarrier &mark_barrier;
+    } fns = { usei, usei_dst, usef, bad, badi, badf,
+              use_ret, fdst_mark, full_read_mark, mark_barrier };
+
     for (size_t pc = begin; pc < end; pc++) {
         const Instr &in = code[pc];
         cur_op = in.op;
-        switch (in.op) {
-        case OpCode::IntBin:
-        case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
-        case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
-        case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
-        case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
-        case OpCode::IntShlRR: case OpCode::IntShrRR:
-        case OpCode::IntShlRI: case OpCode::IntShrRI:
-        case OpCode::IntAddModRI:
-            if (!in.a_is_lit()) usei(in.a_slot());
-            if (!in.b_is_lit()) usei(in.b_slot());
-            usei_dst(in.target);
-            break;
-        case OpCode::IntModRI:
-            usei(in.a_slot()); usei_dst(in.target);
-            break;
-        case OpCode::JumpUnlessIntCmp:
-            if (!in.a_is_lit()) usei(in.a_slot());
-            if (!in.b_is_lit()) usei(in.b_slot());
-            break;
-        case OpCode::ForLoopStep:
-            usei_dst(in.target2);
-            if (!in.a_is_lit()) usei(in.a_slot());
-            if (!in.b_is_lit()) usei(in.b_slot());
-            break;
-        case OpCode::IntAddStep:
-            /* operand layout MUST match the emitter (emit_branch): accum =
-             * a_dual_lo, counter = target2, rhs = b (b_slot unless b_is_lit),
-             * bound = a_dual_hi (slot unless the private a-lit flag, read as
-             * a_is_lit). Counting the wrong field - e.g. a bare `in.pb`,
-             * which for a LITERAL rhs is the literal VALUE - would treat that
-             * value as a slot index and cache/corrupt whatever slot it
-             * collides with (an array slot -> LoadElem InternalErrorEx). */
-            usei_dst(in.a_dual_lo());  /* accumulator */
-            usei_dst(in.target2);      /* counter */
-            if (!in.b_is_lit()) usei(in.b_slot());      /* rhs slot */
-            if (!in.a_is_lit()) usei(in.a_dual_hi());    /* bound slot */
-            break;
-        case OpCode::LoadImmInt:
-            usei_dst(in.target);
-            break;
-        case OpCode::ReturnV:
-            /* the result value slot is read by the return. Counting it as an
-             * int use is SAFE: a FLOAT result slot is always disqualified by
-             * the float op that produced it (badi()), and a slot reachable
-             * only via ReturnV is used once (< the 3-use cache threshold) - so
-             * no float slot is ever cached as an int here. C2a: it must NOT
-             * disqualify the FLOAT side (usei normally badf's) - the emit
-             * runs flush_cache BEFORE jit_ret, so a float-pinned result
-             * slot is current in memory when the helper reads it. */
-            if (in.a_slot() >= 0)
-                use[in.a_slot()]++;
-            break;
-        /* float ops: no int-pin (bad), but C2a float-pool USES - the
-         * operand reads go through emit_float_load and the dst writes
-         * through emit_float_store, both cache-aware. Only the DST
-         * qualifies a slot (`fdst`); an operand may be a definitely-int
-         * slot served by the promote arm. FloatBin's div/mod arms are
-         * fine: the div0 raise exits through the flushing epilogue and
-         * the fmod libm call spills the pins via the shared prologue. */
-        case OpCode::FloatBin:
-        case OpCode::FloatAddRR: case OpCode::FloatSubRR:
-        case OpCode::FloatMulRR: case OpCode::FloatAddRI:
-        case OpCode::FloatSubRI: case OpCode::FloatMulRI:
-            if (!in.a_is_lit()) { badi(in.a_slot()); usef(in.a_slot()); }
-            if (!in.b_is_lit()) { badi(in.b_slot()); usef(in.b_slot()); }
-            badi(in.target); usef(in.target); fdst.insert(in.target);
-            break;
-        case OpCode::JumpUnlessFloatCmp:
-            if (!in.a_is_lit()) { badi(in.a_slot()); usef(in.a_slot()); }
-            if (!in.b_is_lit()) { badi(in.b_slot()); usef(in.b_slot()); }
-            break;
-        case OpCode::LoadImmFloat:
-            badi(in.target); usef(in.target); fdst.insert(in.target);
-            break;
-        case OpCode::MathFnV:
-            /* C2a: previously UNLISTED - one math builtin disabled
-             * pinning for its whole run. Arg(s) via emit_float_load,
-             * dst via emit_float_store (cache-aware); an MK_CALL
-             * selector's libm call spills the float pins via the shared
-             * prologue/epilogue. The int side stays memory (bad). */
-            if (!in.a_is_lit()) { badi(in.a_slot()); usef(in.a_slot()); }
-            if (!in.b_is_lit()) { badi(in.b_slot()); usef(in.b_slot()); }
-            badi(in.target); usef(in.target); fdst.insert(in.target);
-            break;
-        case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
-        case OpCode::OrdCharV:      /* same shape: idx cache-aware (a VALUE
-                                     * arg to jit_ord_char), base/dst leas */
-            /* the INDEX is read cache-aware (load_index_idx), so it stays a
-             * countable int use - it is the loop counter, the slot most worth
-             * pinning. base is read in memory. LoadElemFloat's dst is
-             * written via emit_float_store -> a C2a float candidate; the
-             * int/ord dsts stay memory (the two-store / store_dst). */
-            bad(in.target2);
-            if (in.op == OpCode::LoadElemFloat) {
-                badi(in.target);
-                usef(in.target); fdst.insert(in.target);
-            } else {
-                bad(in.target);
-            }
-            if (!in.a_is_lit()) usei(in.a_slot());
-            break;
-        case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
-            /* BOTH indices are VALUE args to jit_load_elem2_* (read
-             * cache-aware), so they stay countable int uses - in a matrix
-             * loop they are the two loop counters, the slots most worth
-             * pinning. base is a lea -> memory. The FLOAT dst is written
-             * via emit_float_store -> a C2a float candidate. */
-            bad(in.target2);
-            if (in.op == OpCode::LoadElem2Float) {
-                badi(in.target);
-                usef(in.target); fdst.insert(in.target);
-            } else {
-                bad(in.target);
-            }
-            usei(in.a_dual_lo());
-            if (!in.b_is_lit()) usei(in.b_slot());
-            break;
-        case OpCode::StoreElemInt:
-            bad(in.target2);             /* base slot holds an array */
-            if (!in.a_is_lit()) usei(in.a_slot());   /* index (int) */
-            if (!in.b_is_lit()) usei(in.b_slot());   /* value (int) */
-            break;
-        case OpCode::StoreElemFloat:
-            bad(in.target2);             /* base slot holds an array */
-            if (!in.b_is_lit()) {        /* value: a FLOAT, read via
-                                          * emit_float_load (cache-aware -
-                                          * a C2a float use, no fdst) */
-                badi(in.b_slot()); usef(in.b_slot());
-            }
-            if (!in.a_is_lit()) usei(in.a_slot());   /* index (int) */
-            break;
-        case OpCode::DictStore:
-            /* the fragment passes &slot for base/key/value, so those slots
-             * must hold CURRENT EvalValues - a cached int key (a counter used
-             * as d[i]) would leave its slot stale. Disqualify all three -
-             * flushing them at the emit instead was measured and REJECTED,
-             * see the note above pick_cached_slots. */
-            bad(in.target2); bad(in.a_slot()); bad(in.b_slot());
-            break;
-        case OpCode::StoreElemValue:
-            /* jit_store_elem_value reads idx (a_slot) + val (b_slot) - and a
-             * LOCAL base (target2) - from MEMORY via g_current_ctx. The idx and
-             * index (a counter used as a[i]) would be stale. FLUSHING it at the
-             * emit instead was measured and REJECTED - see the note above
-             * pick_cached_slots. The base is a frame slot only for a LOCAL
-             * base (kind == target == 0). */
-            if (in.target == 0) bad(in.target2);
-            bad(in.a_slot()); bad(in.b_slot());
-            break;
-        case OpCode::StoreMemberV:
-          /* jit_store_member reads val (b_slot) - and a LOCAL base (target2) -
-          
-             * from MEMORY; the member key is a_lit (a pool index, not a slot). */
-            if (in.target == 0) bad(in.target2);
-            bad(in.b_slot());
-            break;
-        case OpCode::StoreElem2V:
-          /* jit_store_elem2 reads base (target2, always LOCAL), k1 (a_dual_lo),
-          
-             * k2 (b_slot), val (target) from MEMORY. (StoreElemChainV /
-             * StoreLValueChainV read a key RUN of unknown-here size, so they hit
-             * the default -> no caching for the run, which is safe.) */
-            bad(in.target2); bad(static_cast<int>(in.a_dual_lo()));
-            bad(in.b_slot()); bad(in.target);
-            break;
-        case OpCode::MoveV:
-            /* C2a: the source side is float-cache-aware too (the emit
-             * reads the pin via emit_float_store), and like the int side
-             * it contributes NO WEIGHT - a boxed move must never be the
-             * evidence a slot holds a float. The DEST stays memory-only
-             * (a MoveV can write ANY type). C3: an UNPINNED source is
-             * copied from memory as a FULL value - no type elision. */
-            full_read.insert(in.target2);
-            badf(in.target);
-            /* CACHE-AWARE ON THE SOURCE SIDE (see the emit). A pinned source
-             * is a proven int, so the move is just the ordinary int store and
-             * the register is read directly - which is why target2 is NOT
-             * disqualified here.
-             *
-             * It is NOT counted either (no usei), and that omission is the
-             * SOUNDNESS ANCHOR. A MoveV is the BOXED move: the bytecode says
-             * nothing about the value's type, so it can never be the evidence
-             * that a slot holds an int. Contributing zero weight means a slot
-             * reaches the cache only if some genuine int op qualified it - and
-             * once it has, every write to it in this run is an int write, so
-             * the value this MoveV reads really is an int.
-             *
-             * The DEST stays memory-only: a MoveV can write ANY type, so a
-             * pinned dst could silently stop holding an int. */
-            bad(in.target);
-            break;
-        case OpCode::SubscriptV:
-          /* the fragment leas &slot for base/idx/dst - all must be current. */
-          
-            bad(in.target2); bad(in.a_slot()); bad(in.target);
-            break;
-        case OpCode::SliceV:
-            /* jit_slice reads base/start/end + writes dst from MEMORY (via
-             * g_current_ctx->frame); start/end are int bounds that COULD be
-             * int-cached (a loop counter as a[i:j]), so disqualify them. */
-            bad(in.target2); bad(in.target);
-            if (in.a_slot() >= 0) bad(static_cast<int>(in.a_slot()));
-            if (in.b_slot() >= 0) bad(static_cast<int>(in.b_slot()));
-            break;
-        case OpCode::MemberV:
-        case OpCode::LoadMemberInt:
-        case OpCode::LoadMemberFloat:
-            /* base read + dst written from memory by the helper (the member
-             * key is a baked pool entry, not a slot). */
-            bad(in.target2); bad(in.target);
-            break;
-        case OpCode::ArrLen:
-            /* dst written from memory; base (target2) holds an array reference,
-             * never an int - both must stay in memory. */
-            bad(in.target); bad(in.target2);
-            break;
-        case OpCode::DictLoadInt:
-        case OpCode::DictLoadFloat:
-            /* dst written from memory; base (target2) holds a dict reference;
-             * a subscript key temp (a_slot when !a_is_lit) is lea'd, so it must
-             * be current. A member key (a_is_lit) is a baked const, no slot. */
-            bad(in.target); bad(in.target2);
-            if (!in.a_is_lit()) bad(in.a_slot());
-            break;
-        case OpCode::MakeClosureV:
-            /* A closure SNAPSHOTS its capture sources from frame MEMORY, but
-             * the captured slots are the closure's (runtime) capture list - the
-             * emitter can't enumerate them to disqualify individually. An N5
-             * register-cached capture source (e.g. a hot loop accumulator the
-             * closure captures) would be STALE in memory when jit_make_closure
-             * reads it. BRACKET it (flush before / reload after) so the rest of
-             * the fragment keeps its pinned registers. */
-            mark_barrier(pc);
-            break;
-        case OpCode::CallBuiltinV:
-            /* A callback builtin (make_array/make_dict/find) re-enters
-             * vm_dispatch and can mutate ARBITRARY slots (globals, captures,
-             * the accumulator) - the emitter can't enumerate them. BRACKET it:
-             * flush the pinned registers to memory before (so the builtin and
-             * any callback see current values) and reload after (so a callback
-             * write is picked up). Disabling pinning for the whole fragment
-             * instead - the old rule - cost a hot loop its registers whenever it
-             * merged into a fragment containing ANY builtin call. */
-            mark_barrier(pc);
-            break;
-        case OpCode::MapFilterV:
-            /* map/filter's callback re-enters vm_dispatch (same as a
-             * callback builtin) - bracket; the boxed operand/dst slots are
-             * never int candidates, disqualify defensively. */
-            mark_barrier(pc);
-            bad(in.a_slot()); bad(in.b_slot()); bad(in.target);
-            break;
-        case OpCode::CheckFuncV:
-        case OpCode::CheckCallableV:
-            bad(in.a_slot());            /* a func-value slot - never int */
-            break;
-        case OpCode::BinOpV:
-        case OpCode::CmpV:
-        case OpCode::LogV:
-            /* boxed operands/dst read/written from memory (dyn/string - not an
-             * int-scalar cache candidate anyway, but disqualify defensively). */
-            if (!in.a_is_lit()) bad(in.a_slot());
-            if (!in.b_is_lit()) bad(in.b_slot());
-            bad(in.target);
-            break;
-        case OpCode::UnaryV:         /* 1-operand boxed: a_slot + dst */
-            if (!in.a_is_lit()) bad(in.a_slot());
-            bad(in.target);
-            break;
-        case OpCode::CompoundV:
-            bad(in.target);              /* read + written from memory */
-            if (!in.b_is_lit()) bad(in.b_slot());
-            break;
-        case OpCode::CoerceNumV:
-            /* dst (a typed int/float coerces_dyn accumulator - COULD be a hot
-             * int slot) is written from memory by the helper; an N5-cached dst
-             * would be overwritten stale by the flush. src (a_slot) holds a dyn
-             * value (never int-cached). Disqualify both. */
-            bad(in.target); bad(in.a_slot());
-            break;
-        case OpCode::StoreGlobalV:
-        case OpCode::StoreCaptureV:
-          /* reads the rhs operand from memory (target is a GLOBAL/CAPTURE slot,
-          
-             * not a frame slot). PLAIN: `a` is the src slot; COMPOUND: `a` is the
-             * rhs (a slot OR a lit - skip a lit). */
-            if (!in.a_is_lit()) bad(in.a_slot());
-            break;
-        case OpCode::AppendV:
-          /* jit_append reads the VALUE (b_lit, a frame slot - could be a cached
-          
-             * int counter `append(a, i)`) and a LOCAL arg0 array (target2 when
-             * kind == a_dual_hi() == 0) from MEMORY; the dst is written. */
-            if (in.a_dual_hi() == 0) bad(in.target2);
-            bad(static_cast<int>(in.b_lit()));
-            if (in.target >= 0) bad(in.target);
-            break;
-        case OpCode::MakeArrayV:
-            /* jit_make_array reads the whole ELEMENT run [a_lit, a_lit+b_lit)
-             * from MEMORY (an element can be a cached int counter - `[i, i*2]`
-             * in a loop), and writes dst. The run IS enumerable here (base + n
-             * are both in the instruction), so disqualify it precisely instead
-             * of turning caching off for the whole run. */
-            for (int_type i = 0; i < in.b_lit(); i++)
-                bad(static_cast<int>(in.a_lit() + i));
-            bad(in.target);
-            break;
-        case OpCode::MakeDictV:
-            /* same, over the INTERLEAVED key/value run [a_lit, a_lit+2*b_lit)
-             * (b_lit is the PAIR count) - a key or value can be a cached int
-             * counter (`{i: i * 2}` in a loop). */
-            for (int_type i = 0; i < 2 * in.b_lit(); i++)
-                bad(static_cast<int>(in.a_lit() + i));
-            bad(in.target);
-            break;
-        case OpCode::StructCtorV:
-            /* PLANNED (b_dual_hi >= 0): an act-0 (int) plan src is read
-             * CACHE-AWARE by the emit (a direct-local src can be the loop
-             * counter - `P(i, ..)`), so it stays a countable int use; an
-             * act-1/2 src reads memory (emit_float_load / byte load) ->
-             * bad. dst: the H1 guards read/write it from memory -> bad.
-             * UNPLANNED: the whole run is read from memory by the helper. */
-            if (in.b_dual_hi() >= 0) {
-                for (const Chunk::CtorPlanField &pf :
-                         ck.ctor_plans[in.b_dual_hi()].f) {
-                    if (pf.act == 0)
-                        usei(pf.src);
-                    else
-                        bad(pf.src);
-                }
-            } else {
-                for (int i = 0; i < in.b_dual_lo(); i++)
-                    bad(static_cast<int>(in.a_lit()) + i);
-            }
-            bad(in.target);
-            break;
-        case OpCode::LoadElemBool:
-            /* INLINED (no helper); the index is read cache-aware
-             * (load_index_idx), so it stays a countable int use like
-             * LoadElemInt's. */
-            bad(in.target); bad(in.target2);
-            if (!in.a_is_lit()) usei(in.a_slot());
-            break;
-        case OpCode::StrLen:
-        case OpCode::LoadStrChar:
-        case OpCode::LoadStructFieldInt:
-        case OpCode::LoadStructFieldFloat:
-        case OpCode::LoadStructElemV:
-        case OpCode::LoadElemValue:
-            /* The helper WRITES dst and READS the base from MEMORY, so both
-             * must stay in memory. The INDEX is different: the emitter
-             * materializes it with the cache-aware load_operand BEFORE the
-             * call, so it is read from its register when pinned - it stays a
-             * countable int use (this is the foreach COUNTER, the slot N5 most
-             * wants to cache; disqualifying it would lose the loop's caching). */
-            bad(in.target); bad(in.target2);
-            if (in.op != OpCode::StrLen && !in.a_is_lit())
-                usei(in.a_slot());
-            break;
-        case OpCode::StructCtorBoxedV:
-        case OpCode::MakeStructArrayV:
-            /* Their run LENGTH is not derivable from the instruction alone -
-             * the boxed ctor's arg count lives in the boxed_ctors pool, and the
-             * struct-array literal's run is n * nfields (the field count is in
-             * the DEF) - and pick_cached_slots has no chunk to resolve either.
-             * Per the MakeClosureV rule (a helper reading slots the emit site
-             * cannot name), BRACKET them with flush/reload. */
-            mark_barrier(pc);
-            break;
-        case OpCode::LoadBuiltinV:
-        case OpCode::LoadConstV:
-        case OpCode::LoadLiteralObjV:
-        case OpCode::LoadCaptureV:
-        case OpCode::LoadGlobalV:
-            /* writes dst from memory (a builtin / const / literal / capture /
-             * global value, not an int); target2 is a compile-time index (the
-             * global slot for LoadGlobalV), not a frame slot. */
-            bad(in.target);
-            break;
-        case OpCode::JumpUnlessElemInt:
-            /* reads the base (an array ref) from memory; the INDEX goes through
-             * the cache-aware load_index_idx, so it stays a countable int use -
-             * it is the loop counter. Nothing is written. */
-            bad(in.target2);
-            if (!in.a_is_lit()) usei(in.a_slot());
-            break;
-        case OpCode::CmpIntV:
-            /* both operands are plain int reads (cache-aware load_operand), so
-             * they stay countable int uses; the dst holds a BOOL, written to
-             * memory - never an int-cache candidate. Without this case the op
-             * hit the `default` and disabled pinning for the WHOLE run. */
-            if (!in.a_is_lit()) usei(in.a_slot());
-            if (!in.b_is_lit()) usei(in.b_slot());
-            bad(in.target);
-            break;
-        case OpCode::JumpUnlessTrueV:
-            /* jit_is_true reads the CONDITION slot (target2) from MEMORY via
-             * g_current_ctx, so it must be current - and it holds a boxed value
-             * (dyn/bool/string), never an int-scalar cache candidate anyway. */
-            bad(in.target2);
-            break;
-        case OpCode::StructFieldAddInt:
-            /* idx (a) is materialized cache-aware pre-call; `other`
-             * (b_dual_hi) and the dst are read/written via the cache-aware
-             * read_slot/write_slot in the FRAGMENT - all stay countable int
-             * uses (the dst is the reduction's hot accumulator). Only the
-             * base array slot must stay in memory. */
-            bad(in.target2);
-            if (!in.a_is_lit()) usei(in.a_slot());
-            usei(static_cast<int>(in.b_dual_hi()));
-            usei(in.target);
-            break;
-        case OpCode::ForStepElemInt:
-            /* counter (target2) stepped + used as the index cache-aware;
-             * bound (a) cache-aware; the elem dst (b_dual_hi) written via
-             * write_slot. The base array slot stays in memory. */
-            bad(static_cast<int>(in.b_dual_lo()));
-            usei(in.target2);
-            if (!in.a_is_lit()) usei(in.a_slot());
-            usei(static_cast<int>(in.b_dual_hi()));
-            break;
-        case OpCode::EmplaceStruct:
-            /* the field-value RUN length lives in the emplace_sites pool
-             * (nfields), not in the instruction - the emitter cannot
-             * enumerate the slots the helper reads. BRACKET it (the
-             * StructCtorBoxedV rule; not a branch, so the reload always
-             * runs). */
-            mark_barrier(pc);
-            break;
-        case OpCode::DictIterInit:
-            /* reads the dict slot (target2) from memory; target is the iter_id,
-             * not a slot. The iterator state itself is activation-side. */
-            bad(in.target2);
-            break;
-        case OpCode::DictIterNext:
-            /* the helper WRITES the key/value slots (a/b; -1 == unbound) from
-             * memory - a cached int value slot (a dict<str,int> loop's v used
-             * in int arith) would be stale. target/target2 are end_pc/iter_id,
-             * not slots. */
-            bad(in.a_slot()); bad(in.b_slot());
-            break;
-        case OpCode::ForeachDynInit:
-            /* reads the container slot (target2) from memory; a/b are lits
-             * (the shape + the unpack_targets pool index). */
-            bad(in.target2);
-            break;
-        case OpCode::ForeachDynNext:
-            /* the helper writes the POOL-listed target slots - which the
-             * emitter cannot enumerate (the slot list lives in unpack_targets,
-             * and pick_cached_slots has no chunk). A barrier is not an option
-             * either: this is a BRANCH (a taken end_pc would skip the reload).
-             * Per the MakeClosureV can't-enumerate rule, cache nothing. */
-            return {};
-        case OpCode::CmpFloatV:
-            /* float operands (cache-aware via emit_float_load - C2a
-             * float uses) + a BOOL dst written to memory (bad both). */
-            if (!in.a_is_lit()) { badi(in.a_slot()); usef(in.a_slot()); }
-            if (!in.b_is_lit()) { badi(in.b_slot()); usef(in.b_slot()); }
-            bad(in.target); badf(in.target);
-            break;
-        case OpCode::JumpIfNotNoneV:
-            /* reads the lhs slot's type tag from memory (a boxed value). */
-            bad(in.a_slot());
-            break;
-        case OpCode::DeclConstV:
-            /* the helper reads src (a) + writes the dst LValue from memory;
-             * for a GLOBAL dst (target2==1) `target` is a global slot, not a
-             * frame slot. */
-            bad(in.a_slot());
-            if (in.target2 == 0) bad(in.target);
-            break;
-        case OpCode::DefinedGlobalV:
-            /* writes the bool dst from memory (target2 is the global slot). */
-            bad(in.target);
-            break;
-        case OpCode::ThrowRuntimeV:
-            break;                       /* no slots - it only exits */
-        case OpCode::PushHandler:
-        case OpCode::PopHandler:
-        case OpCode::SetPend:
-        case OpCode::EndFinally:
-            break;                       /* pure activation state - no slots */
-        case OpCode::Throw:
-        case OpCode::Rethrow:
-            break;                       /* an unconditional exit - no slots */
-        case OpCode::UnpackElemInt:
-        case OpCode::UnpackElemFloat:
-        case OpCode::UnpackElemValue:
-            /* the helper writes the CONSECUTIVE dst run [target, target+N)
-             * (N = b_lit, enumerable) and reads the base from memory; the
-             * index is materialized cache-aware pre-call (the foreach
-             * counter stays a countable int use). */
-            bad(in.target2);
-            for (int_type k = 0; k < in.b_lit(); k++)
-                bad(in.target + static_cast<int>(k));
-            if (!in.a_is_lit()) usei(in.a_slot());
-            break;
-        case OpCode::UnpackElemTargets:
-        case OpCode::MultiUnpackV:
-            /* the target slots live in the unpack_targets pool - not
-             * enumerable here (no chunk). BRACKET (neither is a branch). */
-            mark_barrier(pc);
-            break;
-        case OpCode::IncDecCheckedV:
-            /* the helper RMWs the slot in memory; a LOCAL (kind target2==0)
-             * must not be register-pinned. */
-            if (in.target2 == 0) bad(in.target);
-            break;
-        case OpCode::IncDecElemCheckedV:
-            /* base (target2, when a LOCAL - kind is in target) + the key
-             * temp (a) are read from memory by the helper. */
-            if (in.target == 0) bad(in.target2);
-            bad(in.a_slot());
-            break;
-        case OpCode::IncDecMemberCheckedV:
-            if (in.target == 0) bad(in.target2);
-            break;
-        case OpCode::IncDecChainV:
-            /* the chain's key temps live in the incdec_chains pool - not
-             * enumerable here. BRACKET (not a branch). */
-            mark_barrier(pc);
-            break;
-        case OpCode::Jump:
-        /* returns none - reads/writes no slot */
-        case OpCode::Halt:
-            break;                       /* no slots */
-        default:
-            return {};                   /* an unclassified op - be SAFE and
-                                          * cache nothing (a new eligible op
-                                          * that isn't handled here just
-                                          * turns caching off, never
-                                          * corrupts a slot) */
-        }
+        if (!pick_visit_op(ck, in, pc, fns))
+            return {};               /* unclassified, or written slots it
+                                      * cannot enumerate - be SAFE and
+                                      * cache nothing (a new eligible op
+                                      * that isn't handled just turns
+                                      * caching off, never corrupts a
+                                      * slot) */
     }
 
     std::vector<std::pair<int, int>> cand;   /* (count, slot) */
