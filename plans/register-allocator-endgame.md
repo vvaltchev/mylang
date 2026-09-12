@@ -713,13 +713,64 @@ stays blocked; the partial-rescue split has real complexity and
 ~zero reach on every known ledger shape: nothing frees mid-span
 at these pressures). Re-open only when a ledger bench demands it.
 
-NEXT (2b-iii-d, prioritized by the sweep): diagnose 69 -> 34 ->
-44; then C2b regions into trans mode (⛔ fresh-window job: the
-cold-copy emission reads e.cache at STREAM-END state, so a
-region copy after any transition is emitted against the wrong
-map - the merge needs per-region state replay, and whether
-TODAY's ShareSeams already have this hazard must be checked
-first); the float twin; the wall A/B + flip gate.]
+ALL FOUR DIAGNOSED (2026-08-23, the maintainer's flatness
+mandate: "no theoretical reason to be worse than flat" - correct,
+and the mechanisms prove it):
+
+⛔ 69_exc_crossframe +4.13%/iter: NOT a codegen defect - the
+emission is BYTE-IDENTICAL under the lever (zero -vdj diff
+lines), a dummy same-length env var reproduces nothing, and the
+whole delta is _int_malloc doing 2.3x the WORK PER CALL at
+identical call counts/callers (operator-new caller rows byte-
+equal): the lever's compile-time analysis allocations re-prime
+malloc's free lists, and 69's throw-per-iteration allocation
+pattern then pays bin walks. The heap-priming artifact class
+(the pooled-allocator-rejected / layout-tax family). Mitigation
+if ever needed: an arena for the analysis's transients.
+
+⛔ 44_primes_sqrt +3.21%/iter: UNDER-PINNING. The pick pins r12
+(11 exit pops); the lever pins nothing callee-saved. The snap
+DEMOTES pieces whose interior boundaries sit on non-lin pcs with
+zero extension room (a mem-cut flush at a crossed pc; a same-slot
+neighbour at zero distance) - while the pick's whole-run pin
+needs NO transitions at all and is immune to lin points. Slot 1
+qualifies whole-run (no events, evidence, float-free) and got
+shredded instead.
+
+⛔ 34_sort +3.88%/iter, 73_multi_unpack +1.81%: OVER-PINNING,
+the mirror image. Callee-saved pops: 34 goes 0 (pick) -> 12
+(lever); 73 goes 9 -> 16. The scan admits any evidenced used
+piece; the pick's >= 3 floor is a COST MODEL for per-ENTRY
+overhead (push + entry load + exit flush + pop), and 34/73's
+chunks are entered PER CALLBACK CALL - a barely-used pin paid
+per entry, millions of times.
+
+⛔ NEXT - THE PICK-PARITY PAIR, one increment, flat by
+construction (both gaps are "the pick's contract not fully
+inherited"):
+ 1. THE ADMISSION FLOOR: any residency (entry occupant, install,
+    home) requires the slot's RUN-WIDE wint >= 3 - exactly the
+    pick's floor, which is profitability (entry/exit amortization)
+    on top of the soundness it already carried once (the m3
+    lesson). Fixes 34/73. A per-piece cost model (entry count x
+    piece weight) is the later refinement.
+ 2. THE WHOLE-RUN RESCUE: when the snap would demote a piece of a
+    slot with NO forced pieces (no mem events, no float - the
+    pick's whole-run criteria), merge ALL the slot's pieces into
+    ONE resident piece [begin, end) on one register (a free-over
+    abstract reg; else demote as today): the pick's pin as the
+    degenerate snap output, immune to lin points. Fixes 44.
+    Consequences to handle: S3 (demotion-only) gains the rescue
+    exemption; the translation emits NO interior flush for it
+    (no interior ends exist on a single piece); the tiling
+    property applies to the SCAN's output only (the snap already
+    extends past intervals).
+ Re-run the FULL sweep after; target: nothing above the ~+0.3%
+ compile-side band except the 69 heap-priming class.
+THEN: C2b regions into trans mode (⛔ fresh-window: the cold-copy
+emission reads e.cache at STREAM-END state - needs per-region
+state replay; check whether today's ShareSeams already carry the
+hazard); the float twin; the wall A/B + flip gate.]
 
 ⛔ MAINTAINER DIRECTION (2026-08-23): #96 was PAUSED for the #99
 DETOUR; #99 closed same day. Task #102 created for the
