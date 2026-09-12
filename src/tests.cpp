@@ -25221,9 +25221,21 @@ static bool jit_interval_qual_check()
           "var f = 0.0; var n = 0; n = n + runtime(30);\n"
           "for (var i = 0; i < n; i++) f = f + 0.5;\n"
           "print(f);\n" },
+        /* the ReturnV FLOAT-exemption, on a FUNCTION chunk (the 2a
+         * recorded gap - a root chunk ends in Halt, never ReturnV):
+         * fs returns its float accumulator, so f is read by ReturnV
+         * AND must STAY an fhot pick - use_ret does not disqualify
+         * the float pool (the emit flushes before jit_ret) */
+        { "float return exemption", 
+          "func fs(int n) {\n"
+          "    var f = 0.0;\n"
+          "    for (var i = 0; i < n; i++) f = f + 0.5;\n"
+          "    return f;\n"
+          "}\n"
+          "print(fs(runtime(40)));\n" },
     };
     bool ok = true, saw_payoff = false, saw_pick = false, saw_fhot = false;
-    bool saw_gponly = false, saw_both = false;
+    bool saw_gponly = false, saw_both = false, saw_ret_exempt = false;
     for (const Case &c : cases) {
         std::vector<Tok> toks;
         lexer(c.src, 1, toks);
@@ -25233,7 +25245,14 @@ static bool jit_interval_qual_check()
         infer_types(root.get(), true);
         run_optimizers(root.get());
         VmProgram prog = vm_compile(root.get(), /*jit=*/false);
-        const Chunk &ck = prog.root;
+        std::vector<const Chunk *> qchunks;
+        qchunks.push_back(&prog.root);
+        for (const auto &fd : prog.funcs)
+            if (fd->vm_chunk)
+                qchunks.push_back(
+                    static_cast<const Chunk *>(fd->vm_chunk));
+        for (const Chunk *qcp : qchunks) {
+        const Chunk &ck = *qcp;
         SlotLiveness sl;
         std::vector<LiveInterval> iv;
         if (!jit_slot_liveness(ck, sl)
@@ -25247,8 +25266,9 @@ static bool jit_interval_qual_check()
         int orphans = -1;
         if (!jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
                                    &orphans, &ev)) {
-            printf("  qual [%s]: an op was unclassifiable\n", c.name);
-            ok = false;
+            /* legitimate on a chunk with an unclassifiable op (the
+             * float-return case's root holds a CallV); the vacuity
+             * guards below catch a case where NOTHING ran */
             continue;
         }
         if (orphans != 0) {                              /* property C */
@@ -25320,6 +25340,10 @@ static bool jit_interval_qual_check()
                 ok = false;
             }
         }
+        std::vector<long> wret(nslots, 0);
+        for (size_t k = 0; k < iv.size(); k++)
+            if (iv[k].slot >= 0 && iv[k].slot < nslots)
+                wret[iv[k].slot] += q[k].uses_ret;
         for (const int f : fhot) {                       /* A-float */
             saw_fhot = true;
             if (!wf_dst[f] || wf[f] < 3 || memf[f] || wint[f] != 0) {
@@ -25328,6 +25352,13 @@ static bool jit_interval_qual_check()
                        c.name, f, wf_dst[f], wf[f], memf[f], wint[f]);
                 ok = false;
             }
+            /* the ReturnV float-EXEMPTION observed: an fhot slot the
+             * return reads proves use_ret disqualified nothing (the
+             * pick's ReturnV soundness note; sabotaging the visitor's
+             * ReturnV case to usei() kills this pick and the vacuity
+             * guard below names it) */
+            if (wret[f] > 0)
+                saw_ret_exempt = true;
         }
         for (int s = 0; s < ck.slot_count; s++) {        /* property D */
             if (wi[s] < 3 || anyfloat[s])
@@ -25342,10 +25373,16 @@ static bool jit_interval_qual_check()
             if (!got && memi[s] && clean_hot_iv[s])
                 saw_payoff = true;                       /* property B */
         }
+        }                                /* qchunks */
     }
     if (!saw_pick || !saw_fhot) {
         printf("  qual: a pool never picked anything - property A is "
                "vacuous (int=%d float=%d)\n", saw_pick, saw_fhot);
+        ok = false;
+    }
+    if (!saw_ret_exempt) {
+        printf("  qual: no fhot slot was ever ReturnV-read - the "
+               "float exemption is untested\n");
         ok = false;
     }
     if (!saw_gponly || !saw_both) {
