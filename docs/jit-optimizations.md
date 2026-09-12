@@ -8343,3 +8343,34 @@ was not its shape after all); noted, not claimed.
 Verified: full lever x arena -rt + corpus, vdjcmp 116/116 default,
 TESTS=1 OPT=1 both lever states, clang OPT=1 ASSERTS=0 LTO=0 zero
 warnings, census gate.
+
+## #99: the arity-1 already-boxed VmInvoker::call overload (2026-08-23)
+
+The 2026-08-16 regression check's 67_make_dict +5.91% was bisected to
+202f816 (the ONE-entry callback unification) and diagnosed to the
+line: make_dict passes an already-boxed `const EvalValue k`, and the
+template's single-boxing `EvalValue argv[] = { EvalValue(args)... }`
+COPY-CONSTRUCTS it - a full EvalValue copy + retain/release per
+callback that the old `inv.invoke(&k, 1)` never paid. "Boxed exactly
+once" is true for RAW C++ types (the 34_sort -16.2% win); an
+already-boxed lvalue was boxed twice in effect.
+
+THE FIX: a non-template `call(const EvalValue &)` overload forwarding
+the POINTER (no copy; same tier selection; same argument contract).
+Overload resolution does the routing: a const lvalue prefers the
+non-template; an RVALUE EvalValue prefers the template's && binding
+(move into argv); raw types only match the template - so the
+single-boxing contract is unchanged everywhere else. Arity >= 2
+cannot use the trick (invoke's argv is contiguous; two separate
+lvalues are not).
+
+MEASURED (isolated HEAD-with vs HEAD-without, callgrind, OPT=1
+ASSERTS=0): 67_make_dict -3.04%; 39_find_builtin, 35_map_filter,
+34_sort_custom_cmp all +0.00% exactly. The isolation step earned its
+keep: a first comparison against 202f816 itself showed 34 "-1.1%"
+and 39 "+0.57%" that were unrelated drift across the intervening
+weeks. RESIDUAL, attributed and open: 67 remains +2.4% vs
+pre-202f816 - +12 Ir/call inside the unified invoke's bind path
+itself, not a copy (task #99 carries it).
+
+Nets: -rt 1690 x 5, corpus_diff. No emission change.

@@ -197,6 +197,30 @@ public:
         return call_eval_func(argv, sizeof...(A));
     }
 
+    /*
+     * The ARITY-1 ALREADY-BOXED form (#99, the 67_make_dict finding):
+     * a const-lvalue EvalValue argument is forwarded BY POINTER - no
+     * copy, no retain/release. The template's single-boxing line
+     * copy-constructs an already-boxed argument into its local argv,
+     * a full EvalValue copy per callback that the pre-unification
+     * call sites never paid (+5.9% Ir on 67_make_dict, ~27/call).
+     * Overload resolution keeps everything else on the template: a
+     * non-template function beats the template for a const lvalue,
+     * while an RVALUE EvalValue prefers the template's && binding
+     * (move into argv) and raw C++ types only match the template -
+     * so the single-boxing contract for those is unchanged. Same
+     * argument contract as the template: it must outlive the call
+     * and must not alias the callee window. Arity >= 2 cannot use
+     * this trick - invoke's argv is contiguous, and two separate
+     * lvalues are not.
+     */
+    EvalValue call(const EvalValue &arg)
+    {
+        if (ready_)
+            return invoke(&arg, 1);
+        return call_eval_func(&arg, 1);
+    }
+
     EvalValue invoke(const EvalValue *argv, size_t n);
 
 private:
