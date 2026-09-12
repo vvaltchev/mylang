@@ -25366,6 +25366,239 @@ static bool jit_interval_qual_check()
 }
 
 /*
+ * D3.b step 2b-i: THE LINEAR SCAN's invariants, on real compiled
+ * chunks. jit_lsra_assign is analysis-only (no lever, no emission),
+ * so its net is structural:
+ *   I1 TILING - the pieces of every interval cover it exactly, no
+ *      gap and no overlap (a gap is a pc where "where does the slot
+ *      live" has no answer - the D2 seam's question);
+ *   I2 NO CONFLICT - at no pc do two register-resident pieces share
+ *      an abstract register;
+ *   I3 FORCED MEMORY - the piece covering a MemEvent pc has no
+ *      register (the op takes the slot's address there), and no
+ *      piece of a float-fact interval has one;
+ *   plus the shape assertions: K=1 pressure SPLITS the idle slot and
+ *   keeps the hot one resident (fails under evict-nearest); the 2a
+ *   payoff slot's pre-DictStore piece is register-resident at K=4
+ *   though the pick refuses the slot run-wide; every pick-picked
+ *   slot is register-resident somewhere at K=4.
+ */
+static bool jit_lsra_check()
+{
+#if ML_JIT_SUPPORTED
+    struct Case { const char *name; int K; std::string src; };
+    const Case cases[] = {
+        /* K=1: `a` is the loop's hot accumulator; `z` is written
+         * before the loop and read only after it, so at the point of
+         * pressure z's next use is FURTHEST and the split must land
+         * on z - evict-nearest picks a instead, and the shape
+         * assertion below fails (the watched sabotage) */
+        { "K=1 pressure split", 1,
+          "var z = 0; z = z + runtime(3);\n"
+          "var a = 0; var n = 0; n = n + runtime(50);\n"
+          "for (var i = 0; i < n; i++) a = a + i;\n"
+          "print(a + z);\n" },
+        /* the 2a payoff program: s's first interval is hot and clean,
+         * its second holds a DictStore key */
+        { "payoff piece resident", 4,
+          "var s = 0; var n = 0; n = n + runtime(40);\n"
+          "for (var i = 0; i < n; i++) s = s + i;\n"
+          "var u = s * 2;\n"
+          "var d = {};\n"
+          "s = 0;\n"
+          "d[s] = 1;\n"
+          "print(u + len(d));\n" },
+        { "picked slots resident", 4,
+          "var a = 0; var b = 0; var n = 0; n = n + runtime(50);\n"
+          "for (var i = 0; i < n; i++) { a = a + i; b = b + a; }\n"
+          "print(a + b);\n" },
+    };
+    bool ok = true, saw_evict = false, saw_cut = false;
+    for (const Case &c : cases) {
+        std::vector<Tok> toks;
+        lexer(c.src, 1, toks);
+        ParseContext pctx(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pctx);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        const Chunk &ck = prog.root;
+        SlotLiveness sl;
+        std::vector<LiveInterval> iv;
+        std::vector<IntervalQual> q;
+        std::vector<MemEvent> ev;
+        int orphans = -1;
+        LsraOut plan;
+        if (!jit_slot_liveness(ck, sl)
+                || !jit_build_intervals(ck, 0, ck.code.size(), sl, iv)
+                || !jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
+                                          &orphans, &ev)
+                || !jit_lsra_assign(ck, 0, ck.code.size(), iv, q, ev,
+                                    c.K, plan)) {
+            printf("  lsra [%s]: a stage declined\n", c.name);
+            ok = false;
+            continue;
+        }
+        saw_evict |= plan.evictions > 0;
+        saw_cut |= plan.cuts > 0;
+        /* I1: tiling per interval */
+        for (size_t k = 0; k < iv.size(); k++) {
+            std::vector<const LsraPiece *> ps;
+            for (const LsraPiece &p : plan.pieces)
+                if (p.iv_idx == static_cast<int>(k))
+                    ps.push_back(&p);
+            std::sort(ps.begin(), ps.end(),
+                      [](const LsraPiece *x, const LsraPiece *y) {
+                          return x->start < y->start;
+                      });
+            uint32_t at = iv[k].start;
+            for (const LsraPiece *p : ps) {
+                if (p->start != at || p->end <= p->start
+                        || p->slot != iv[k].slot) {
+                    printf("  lsra [%s]: tiling broken at slot %d "
+                           "pc %u (piece [%u,%u))\n", c.name,
+                           iv[k].slot, at, p->start, p->end);
+                    ok = false;
+                    break;
+                }
+                at = p->end;
+            }
+            if (at != iv[k].end) {
+                printf("  lsra [%s]: interval slot %d [%u,%u) not "
+                       "tiled to its end (stopped %u)\n", c.name,
+                       iv[k].slot, iv[k].start, iv[k].end, at);
+                ok = false;
+            }
+        }
+        /* I2: no two resident pieces share a register at any pc */
+        for (size_t p1 = 0; p1 < plan.pieces.size(); p1++)
+            for (size_t p2 = p1 + 1; p2 < plan.pieces.size(); p2++) {
+                const LsraPiece &x = plan.pieces[p1];
+                const LsraPiece &y = plan.pieces[p2];
+                if (x.reg >= 0 && x.reg == y.reg
+                        && x.start < y.end && y.start < x.end) {
+                    printf("  lsra [%s]: register %d shared by slots "
+                           "%d and %d over [%u,%u)x[%u,%u)\n", c.name,
+                           x.reg, x.slot, y.slot, x.start, x.end,
+                           y.start, y.end);
+                    ok = false;
+                }
+            }
+        /* I3: an event pc's covering piece has no register; a
+         * float-fact interval is memory throughout */
+        for (const MemEvent &e : ev)
+            for (const LsraPiece &p : plan.pieces)
+                if (p.slot == e.slot && e.pc >= p.start && e.pc < p.end
+                        && p.reg >= 0) {
+                    printf("  lsra [%s]: event pc %u slot %d landed in "
+                           "a register-resident piece\n", c.name,
+                           e.pc, e.slot);
+                    ok = false;
+                }
+        for (const LsraPiece &p : plan.pieces) {
+            const IntervalQual &pq = q[p.iv_idx];
+            if ((pq.uses_float > 0 || pq.wrote_float) && p.reg >= 0) {
+                printf("  lsra [%s]: float-fact slot %d got GP reg "
+                       "%d\n", c.name, p.slot, p.reg);
+                ok = false;
+            }
+        }
+        /* the shape assertions, via the pick's public answer */
+        std::vector<int> fhot;
+        const std::vector<int> picked =
+            jit_test_pick_cached_slots(ck, 0, ck.code.size(),
+                                       ck.slot_count, 6, &fhot);
+        const auto resident = [&](int slot) {
+            for (const LsraPiece &p : plan.pieces)
+                if (p.slot == slot && p.reg >= 0)
+                    return true;
+            return false;
+        };
+        if (c.K >= 4) {
+            for (const int s : picked)
+                if (!resident(s)) {
+                    printf("  lsra [%s]: pick-picked slot %d never "
+                           "register-resident at K=%d\n", c.name, s,
+                           c.K);
+                    ok = false;
+                }
+        }
+        if (std::string(c.name) == "payoff piece resident") {
+            /* the run-refused DictStore slot must be resident in some
+             * clean piece AND memory at the event */
+            bool got = false;
+            for (size_t k = 0; k < iv.size(); k++) {
+                if (q[k].uses_int < 3 || q[k].mem_int)
+                    continue;
+                bool run_refused = true;
+                for (const int s : picked)
+                    if (s == iv[k].slot)
+                        run_refused = false;
+                if (!run_refused)
+                    continue;
+                for (const LsraPiece &p : plan.pieces)
+                    if (p.iv_idx == static_cast<int>(k) && p.reg >= 0)
+                        got = true;
+            }
+            if (!got) {
+                printf("  lsra [%s]: the run-refused hot interval is "
+                       "not register-resident - the payoff is not "
+                       "collected\n", c.name);
+                ok = false;
+            }
+        }
+        if (std::string(c.name) == "K=1 pressure split") {
+            /* Three hot slots (i, a, n) overlap in the loop, so only
+             * ONE can be resident there - "every picked slot gets the
+             * register" is unsatisfiable at K=1 (learned on the first
+             * run). What evict-furthest DOES guarantee: the idle z
+             * (slot 0 - written before the loop, read only after it)
+             * loses the register at the first pressure point, so some
+             * hot slot's residency LENGTH beats z's short prefix.
+             * Under evict-nearest z keeps the register across the
+             * whole loop and this comparison flips - the watched
+             * sabotage. */
+            if (picked.empty()) {
+                printf("  lsra [%s]: the pick chose nothing - the "
+                       "shape is not the one intended\n", c.name);
+                ok = false;
+            }
+            std::map<int, long> rl;
+            for (const LsraPiece &p : plan.pieces)
+                if (p.reg >= 0)
+                    rl[p.slot] += p.end - p.start;
+            long best_hot = 0;
+            for (const int s : picked)
+                if (rl.count(s) && rl[s] > best_hot)
+                    best_hot = rl[s];
+            const long z_len = rl.count(0) ? rl[0] : 0;
+            if (best_hot <= z_len) {
+                printf("  lsra [%s]: idle z resident %ld pcs vs best "
+                       "hot %ld - the split landed on the wrong "
+                       "slot\n", c.name, z_len, best_hot);
+                ok = false;
+            }
+        }
+    }
+    if (!saw_evict) {
+        printf("  lsra: no case ever evicted - the pressure half is "
+               "untested\n");
+        ok = false;
+    }
+    if (!saw_cut) {
+        printf("  lsra: no case ever cut at an event - the forced-end "
+               "half is untested\n");
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+
+/*
  * #96: the LOW-ADDRESS ARENA actually placed the Type singletons.
  *
  * The arena exists so the JIT can write a type tag with a sign-extended
@@ -34297,6 +34530,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: D3.b - per-interval qualification implies the pick's "
       "run-wide answer; the payoff interval observed (step 2a)",
       jit_interval_qual_check },
+    { "jit: D3.b - the linear scan (analysis): tiling, no register "
+      "conflicts, forced memory, pressure split (step 2b-i)",
+      jit_lsra_check },
     { "jit: the low-address arena placed every Type singleton below "
       "2^31, so a type tag can encode as imm32 (#96)",
       jit_lowmem_singletons },

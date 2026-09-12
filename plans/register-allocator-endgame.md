@@ -484,30 +484,35 @@ ADDENDUM: MemEvent stream {pc, slot, gp_only} - the forced-end
 POSITIONS the scan cuts on; property E pins stream/flags agreement
 both ways (watched: pc+1 stamp fails at four named sites).
 
-⛔ NEXT: D3.b step 2b - the `lsra` lever (default OFF) + the linear
-scan with splitting (the design-decisions block above holds the
-settled choices: memory-demanding pcs as forced interval ends,
-assignment-agnostic call brackets, label resolution v1 with the
-loop head as the critical case, remat of LoadImmInt, gp_weight as
-the cost-model seed). SEQUENCE IT IN TWO INCREMENTS:
- - 2b-i, THE SCAN AS PURE ANALYSIS (no emission change, no lever
-   needed yet): jit_lsra_assign(intervals, quals, mem_events,
-   next_use, K) -> per-interval {reg | spill | memory} + split
-   points. Inputs ALL exist now: D1 intervals, 2a IntervalQual,
-   the MemEvent cut positions, jit_next_use. Cut intervals at
-   mem pcs first, then walk by start with free-until + furthest-
-   next-use eviction. Its -rt net: no two same-pc-live intervals
-   share a register; only qualified pieces assigned; a DOMINANCE
-   property vs the pick (every pick-pinned slot's hot interval
-   gets a register at equal K) + the payoff case assigned where
-   the pick refused. Watched failing per property.
- - 2b-ii, EMISSION behind the `lsra` lever: entry stubs / split
-   moves / label fixups / exit flushes from the per-pc map (the
-   D2 seam), validator arms 2/3 land WITH it, full-net oracle +
-   the D0 Ir ledger A/B.
-⛔ 2b-i IS A FRESH-CONTEXT-WINDOW JOB (the extraction precedent):
-allocation-algorithm subtleties + a new invariant net do not
-belong in a squeezed tail. Byte-identity ENDS at 2b-ii by design.]
+2b-i LANDED 2026-08-23: jit_lsra_assign (jit.cpp; contract in
+jit.h) - cut at MemEvent pcs (event pc = one-pc forced-memory
+piece), admit float-free pieces with a jit_next_use-proven use
+inside, walk by start with expire-and-free, evict-furthest WITH
+the split (loser keeps its register up to the contested pc,
+remainder is a memory piece). Abstract registers 0..K-1; GP only.
+The `jit: D3.b 2b-i` -rt net: I1 tiling / I2 no conflicts / I3
+forced memory + shapes (payoff piece RESIDENT at K=4 where the
+pick refuses the slot; picked slots resident at K=4; K=1 the idle
+slot LOSES residency-length to a hot one). WATCHED failing 3 ways
+(evict-nearest, unmarked register, cutting disabled). FINDING:
+"every picked slot resident" is unsatisfiable at K=1 - pressure
+guarantees are COMPARATIVE (who loses), the assertion states that
+now. v1 gaps recorded: no split-remainder re-queue (second
+chance), float twin, physical binding/cost model - all 2b-ii.
+
+⛔ NEXT: D3.b step 2b-ii - EMISSION behind the `lsra` lever
+(default OFF): serve reg_at/spill_at (the D2 seam) from the plan's
+pieces at cur_pc; entry loads at piece starts, split stores at
+piece ends, label resolution v1 (canonical per-label assignment +
+in-edge fixup moves; the loop head is the critical case), exit
+flushes from the per-pc map; the physical binding (pool order,
+callee/caller-saved cost, gp_weight seed, rax ISA facts in the
+model). Validator arms 2/3 land WITH it; byte-identity ENDS here
+by design - oracle = the full net (5-mode, corpus matrices,
+fuzzers, Net 2/3) + the D0 Ir ledger A/B. START by wiring the
+lever + serving the seam for the DEGENERATE plan (K = pool size,
+no cuts fire) and prove THAT against today's pick emission with
+the full net before enabling splits.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)

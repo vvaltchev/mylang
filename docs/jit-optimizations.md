@@ -7975,3 +7975,53 @@ Analysis-only: no emission change (vdjcmp trivially identical); -rt
 clang OPT=1 ASSERTS=0 LTO=0 zero warnings, and the non-JIT compile
 check (jit.h's platform test forced to 0, g++ TESTS=1 build + -rt
 green) - the new jit.h decls are unguarded, so the check mattered.
+
+## Endgame D3.b step 2b-i (2026-08-23) - the linear scan, as analysis
+
+WHAT: `jit_lsra_assign(ck, begin, end, iv, q, mem, K, out)` (jit.cpp,
+contract in jit.h) - the allocator's BRAIN, landed with no lever and
+no emission change: the output is a plan (LsraPiece: interval piece ->
+abstract register 0..K-1 or memory) and the -rt net checks its
+invariants. Three stages: CUT every D1 interval at its slot's MemEvent
+pcs (the forced-interval-end decision - the event pc becomes a one-pc
+forced-memory piece), admitting a piece only when its interval is
+float-free and jit_next_use proves a use inside it; WALK pieces by
+start with expire-and-free (lowest free index, deterministic); at
+pressure EVICT the active piece whose next use at the contested pc is
+furthest, SPLITTING it there - it keeps its register up to the
+contested pc, the remainder becomes a memory piece. The split is what
+lets one variable use different registers - or none - in different
+parts of one run, the maintainer's 10000-line-function requirement.
+v1 decisions recorded: no re-queue of the split remainder (the
+second-chance re-entry is a quality follow-up), registers are abstract
+indices (the physical binding - pool order, callee/caller cost, rax's
+ISA facts - is 2b-ii's cost model), GP only (the float twin is a
+sibling case for 2b-ii).
+
+NET (`jit: D3.b ... step 2b-i`): I1 TILING (every interval covered
+exactly by its pieces - a gap is a pc where the D2 seam's question has
+no answer), I2 NO CONFLICT (no two resident pieces share a register at
+any pc), I3 FORCED MEMORY (an event pc's covering piece is memory; a
+float-fact interval is memory throughout), plus the shape assertions:
+the 2a payoff slot's pre-DictStore piece IS resident at K=4 though the
+pick refuses the slot run-wide (the payoff, now collected in the
+plan), every pick-picked slot resident at K=4, and at K=1 the idle
+slot's residency length loses to the best hot slot's.
+
+WATCHED FAILING three ways: evict-NEAREST (comparison flipped) fails
+the K=1 comparative property (z resident 9 pcs vs hot 0) AND the K=4
+residency; a register handed out without marking it busy fails I2 at
+four named overlaps; cutting disabled fails I3 at five named event
+pcs.
+
+A FINDING ON THE FIRST RUN, recorded because the correction is a
+design fact: "every pick-picked slot is register-resident" is
+UNSATISFIABLE at K=1 - three hot slots (i, a, n) overlap in the loop,
+so the guarantee evict-furthest actually makes is COMPARATIVE (the
+idle slot loses to a hot one), and the K=1 assertion now states
+exactly that. Properties of an allocator under pressure are about who
+LOSES, not who wins.
+
+Verified: -rt 1690 x 5 x both arenas, TESTS=1 OPT=1, clang OPT=1
+ASSERTS=0 LTO=0 zero warnings, non-JIT compile check, census gate at
+floor. Analysis-only - no emission change.
