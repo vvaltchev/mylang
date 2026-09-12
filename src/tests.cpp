@@ -25461,6 +25461,13 @@ static bool jit_lsra_check()
           "}\n"
           "var cf = mk();\n"
           "print(cf(400));\n" },
+        /* the d1 finding's shape: property G says a resident piece
+         * owns an int-op touch INSIDE ITSELF - d's one interval spans
+         * the boxed redefinitions, and interval-level evidence let
+         * the post-cut remainder pin an ARRAY */
+        { "dyn redefinition remainder stays memory", 4,
+          "var dyn d = 5; d = \"hi\"; d = [1,2];\n"
+          "print(len(d));\n" },
     };
     bool ok = true, saw_evict = false, saw_cut = false;
     bool saw_retonly = false;
@@ -25484,21 +25491,39 @@ static bool jit_lsra_check()
         SlotLiveness sl;
         std::vector<LiveInterval> iv;
         std::vector<IntervalQual> q;
-        std::vector<MemEvent> ev;
+        std::vector<MemEvent> ev, iu;
         int orphans = -1;
         LsraOut plan;
         if (!jit_slot_liveness(ck, sl)
                 || !jit_build_intervals(ck, 0, ck.code.size(), sl, iv)
                 || !jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
-                                          &orphans, &ev)
+                                          &orphans, &ev, &iu)
                 || !jit_lsra_assign(ck, 0, ck.code.size(), iv, q, ev,
-                                    c.K, plan)) {
+                                    iu, c.K, plan)) {
             /* a chunk may legitimately decline (an unclassifiable
              * op - a CallV in the root, say); the case fails only if
              * NO chunk was analyzable (below) */
             continue;
         }
         any_ran = true;
+        /* property G: a resident piece owns an int-op touch INSIDE
+         * itself (the d1 finding - interval-level evidence crosses a
+         * cut and pins a remainder holding a non-int) */
+        for (const LsraPiece &p : plan.pieces) {
+            if (p.reg < 0)
+                continue;
+            bool inside = false;
+            for (const MemEvent &u : iu)
+                if (u.slot == p.slot && u.pc >= p.start
+                        && u.pc < p.end)
+                    inside = true;
+            if (!inside) {
+                printf("  lsra [%s]: resident piece slot %d [%u,%u) "
+                       "has no int-op touch inside it\n", c.name,
+                       p.slot, p.start, p.end);
+                ok = false;
+            }
+        }
         saw_evict |= plan.evictions > 0;
         saw_cut |= plan.cuts > 0;
         /* I1: tiling per interval */
@@ -25741,15 +25766,15 @@ static bool jit_lsra_snap_check()
         SlotLiveness sl;
         std::vector<LiveInterval> iv;
         std::vector<IntervalQual> q;
-        std::vector<MemEvent> ev;
+        std::vector<MemEvent> ev, iu;
         int orphans = -1;
         LsraOut plan;
         if (!jit_slot_liveness(ck, sl)
                 || !jit_build_intervals(ck, 0, ck.code.size(), sl, iv)
                 || !jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
-                                          &orphans, &ev)
+                                          &orphans, &ev, &iu)
                 || !jit_lsra_assign(ck, 0, ck.code.size(), iv, q, ev,
-                                    c.K, plan)) {
+                                    iu, c.K, plan)) {
             printf("  snap [%s]: a stage declined\n", c.name);
             ok = false;
             continue;
@@ -25832,13 +25857,13 @@ static bool jit_lsra_snap_check()
                    c.name, trans.size() - ti);
             ok = false;
         }
-        /* S2b: every CONTINUATION end owns its flush - replay alone
-         * cannot see a dropped flush (memory state is outside the
-         * model), so the property is stated directly */
+        /* S2b: every INTERIOR end owns its flush (uniform - the
+         * truthful-cache rule; a death end's flush writes a dead
+         * value, which is the price of the emitter's cache never
+         * lying) - replay alone cannot see a dropped flush, so the
+         * property is stated directly */
         for (const LsraPiece &p2 : plan.pieces) {
-            if (p2.reg < 0
-                    || p2.end >= iv[static_cast<size_t>(
-                                        p2.iv_idx)].end)
+            if (p2.reg < 0 || p2.end >= ck.code.size())
                 continue;
             bool got = false;
             for (const LsraTrans &tr : trans)
@@ -25940,8 +25965,30 @@ static bool jit_lsra_bridge_check()
             "    return f;",
             "}",
             "var cf = mk();",
-            "assert(cf(400) == 400);" })) {
+            "assert(cf(400) == 400);" })
+        || !run({
+            /* the d1 finding's end-to-end pin: a dyn slot's ONE
+             * interval spans its boxed redefinitions (liveness
+             * barriers glue the defs), so interval-level type
+             * evidence let the post-cut remainder pin an ARRAY as an
+             * int - per-PIECE evidence keeps it in memory */
+            "var dyn d = 5; d = \"hi\"; d = [1,2];",
+            "assert(len(d) == 2);" })) {
         printf("  lsra bridge: a program failed under the lever\n");
+        return false;
+    }
+    /* 2b-iii-b: the phase-handoff shape must EXECUTE transitions -
+     * the emitted install/flush code bumps the counter */
+    const unsigned long t0 = g_jit_lsra_trans;
+    if (!run({
+            "var z = 0; z = z + runtime(5);",
+            "var a = 0; var n = 0; n = n + runtime(500);",
+            "for (var i = 0; i < n; i++) a = a + i;",
+            "assert(z + a == 124755);" }))
+        return false;
+    if (g_jit_lsra_trans <= t0) {
+        printf("  lsra bridge: no transition ever executed (counter "
+               "flat at %lu)\n", t0);
         return false;
     }
     if (g_jit_lsra_pins <= p0) {
@@ -26344,6 +26391,14 @@ static bool jit_reg_model()
 static bool jit_range_share_test()
 {
 #if ML_JIT_SUPPORTED
+    /* D3.b: pins the DEFAULT allocator's mechanism - see the note at
+     * jit_xcache_pins. */
+    const bool lsra_saved = g_jit_lsra;
+    g_jit_lsra = false;
+    struct LsraRestore {
+        bool v;
+        ~LsraRestore() { g_jit_lsra = v; }
+    } lsra_restore{ lsra_saved };
     if (!g_jit_enabled)
         return true;
 
@@ -26527,6 +26582,14 @@ static bool jit_range_share_test()
 static bool jit_spill_homes()
 {
 #if ML_JIT_SUPPORTED
+    /* D3.b: pins the DEFAULT allocator's mechanism - see the note at
+     * jit_xcache_pins. */
+    const bool lsra_saved = g_jit_lsra;
+    g_jit_lsra = false;
+    struct LsraRestore {
+        bool v;
+        ~LsraRestore() { g_jit_lsra = v; }
+    } lsra_restore{ lsra_saved };
     if (!g_jit_enabled)
         return true;
     const unsigned long s0 = g_jit_scache;
@@ -26607,6 +26670,14 @@ static bool jit_spill_homes()
 static bool jit_rax_pin_test()
 {
 #if ML_JIT_SUPPORTED
+    /* D3.b: pins the DEFAULT allocator's mechanism - see the note at
+     * jit_xcache_pins. */
+    const bool lsra_saved = g_jit_lsra;
+    g_jit_lsra = false;
+    struct LsraRestore {
+        bool v;
+        ~LsraRestore() { g_jit_lsra = v; }
+    } lsra_restore{ lsra_saved };
     if (!g_jit_enabled)
         return true;
 

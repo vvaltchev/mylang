@@ -342,11 +342,21 @@ struct MemEvent {
     int slot;
     bool gp_only;
 };
+/* `int_uses` (optional): one {pc, slot} per countable INT-OP touch
+ * (usei / usei_dst; gp_only unused). The scan's PER-PIECE type
+ * evidence: an interval's evidence must not cross a cut - a dyn
+ * slot's single interval can span `d = 5; d = "hi"; d = [1,2]`
+ * (boxed redefinitions are liveness barriers that glue the defs
+ * together), and the post-cut remainder then holds an ARRAY while
+ * the interval still counts pc 0's int use. Admission therefore
+ * asks for an int touch INSIDE the piece, never inside the
+ * interval (the d1 finding). */
 bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
                            const std::vector<LiveInterval> &iv,
                            std::vector<IntervalQual> &out,
                            int *orphans = nullptr,
-                           std::vector<MemEvent> *mem_events = nullptr);
+                           std::vector<MemEvent> *mem_events = nullptr,
+                           std::vector<MemEvent> *int_uses = nullptr);
 
 /*
  * D3.b step 2b-i (plans/register-allocator-endgame.md): THE LINEAR
@@ -391,6 +401,7 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<LiveInterval> &iv,
                      const std::vector<IntervalQual> &q,
                      const std::vector<MemEvent> &mem,
+                     const std::vector<MemEvent> &int_uses,
                      int K, LsraOut &out);
 
 /*
@@ -410,16 +421,17 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
  * pc demands), cannot sit on such a pc is DEMOTED to memory -
  * demotion only, never a new resident pc.
  *
- * A piece end needs a FLUSH transition exactly when the INTERVAL
- * CONTINUES past it (p.end < iv[p.iv_idx].end) - a mem-cut or an
- * eviction-split remainder reads the slot from memory right after,
- * so the register's value must land there on every path. A DEATH or
- * HOLE end (p.end == the interval's end) emits nothing: the register
- * is dropped silently in the model - the stale memory is unread
- * (liveness), and a silent drop needs no linearization point. The
- * drop must happen by the slot's next DEF (a later flush would
- * clobber it), which dropping AT the death end guarantees; installs
- * therefore never evict - every flush is a continuation-end's.
+ * EVERY interior piece end (p.end < the run's end) emits a FLUSH
+ * transition, uniformly. A continuation end (mem-cut / eviction-
+ * split remainder) NEEDS it - memory is read right after; a death or
+ * hole end's flush merely writes a dead value (unread by liveness) -
+ * one wasted store, and what it buys is that the emitter's cache is
+ * TRUTHFUL at every pc: a silently-dropped dead hold would leave a
+ * stale cache entry that every cache-aware op keeps honoring, and a
+ * later mem-event read of the slot would then see stale memory (the
+ * hazard that killed the silent-drop design). A piece ending AT the
+ * run's end emits nothing - the exit flush machinery owns it.
+ * Installs never evict: the previous occupant's end flushed first.
  *
  * Replaying `entry_by_reg` + `trans` in pc order MUST reproduce the
  * (post-demotion) pieces' residency at every pc - the -rt net derives
@@ -1117,6 +1129,9 @@ extern "C" unsigned long g_jit_scache;
 /* D3.b 2b-ii: fragments ENTERED whose pin set came from the linear
  * scan (the lsra lever) - the bridge's execution proof. */
 extern "C" unsigned long g_jit_lsra_pins;
+/* D3.b 2b-iii-b: lsra TRANSITIONS executed (bumped by the emitted
+ * transition code itself - flush and install arms alike). */
+extern "C" unsigned long g_jit_lsra_trans;
 /* #96 inc-2: range seams EXECUTED (eviction + install ran). */
 extern "C" unsigned long g_jit_range_share;
 /* the in-process FORCE override (a bitmask of JitLever bits), for

@@ -76,6 +76,7 @@ unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_rax_pin = 0;       /* #96: rax-pinned fragment entries */
 unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
 unsigned long g_jit_lsra_pins = 0;     /* D3.b: lsra-chosen pin sets */
+unsigned long g_jit_lsra_trans = 0;    /* D3.b: executed transitions */
 unsigned long g_jit_range_share = 0;   /* #96 inc-2: executed range seams */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
 unsigned long g_jit_two_addr_reg = 0;  /* #96: two-address PINNED ops */
@@ -9256,6 +9257,7 @@ void jit_stats_report()
         { "rax_pin",          &g_jit_rax_pin },
         { "scache",           &g_jit_scache },
         { "lsra_pins",        &g_jit_lsra_pins },
+        { "lsra_trans",       &g_jit_lsra_trans },
         { "range_share",      &g_jit_range_share },
         { "two_addr",         &g_jit_two_addr },
         { "two_addr_reg",     &g_jit_two_addr_reg },
@@ -11326,10 +11328,13 @@ pick_cached_slots(const Chunk &ck, size_t begin,
 bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
                            const std::vector<LiveInterval> &iv,
                            std::vector<IntervalQual> &out, int *orphans,
-                           std::vector<MemEvent> *mem_events)
+                           std::vector<MemEvent> *mem_events,
+                           std::vector<MemEvent> *int_uses)
 {
     if (mem_events)
         mem_events->clear();
+    if (int_uses)
+        int_uses->clear();
     out.assign(iv.size(), IntervalQual());
 
     /* per-slot index; iv is start-sorted, so per-slot order is too */
@@ -11344,6 +11349,7 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
         size_t cur = 0;                  /* the pc being classified */
         int orphans = 0;
         std::vector<MemEvent> *mem_events;
+        std::vector<MemEvent> *int_uses;
 
         IntervalQual *find(int s) {
             if (s < 0)
@@ -11359,12 +11365,20 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
             return nullptr;
         }
         void usei(int s) {
-            if (IntervalQual *q = find(s)) q->uses_int++;
+            if (IntervalQual *q = find(s)) {
+                q->uses_int++;
+                if (int_uses)
+                    int_uses->push_back(
+                        { static_cast<uint32_t>(cur), s, false });
+            }
         }
         void usei_dst(int s) {
             if (IntervalQual *q = find(s)) {
                 q->uses_int++;
                 q->wrote_int = true;
+                if (int_uses)
+                    int_uses->push_back(
+                        { static_cast<uint32_t>(cur), s, false });
             }
         }
         void usef(int s) {
@@ -11402,7 +11416,7 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
         /* a bracketed op constrains no interval: the flush/reload
          * spill-around discipline is assignment-agnostic */
         void mark_barrier(size_t) {}
-    } vis { out, iv, by_slot, 0, 0, mem_events };
+    } vis { out, iv, by_slot, 0, 0, mem_events, int_uses };
 
     for (size_t pc = begin; pc < end; pc++) {
         vis.cur = pc;
@@ -11432,17 +11446,15 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
     std::vector<std::pair<int, int>> edges;
     jit_run_edges(ck, begin, end, edges);
 
-    /* DEMOTE: a resident piece whose interior start, or whose
-     * continuation end, is not a linearization point cannot have its
-     * transition placed - demotion only, never a new resident pc */
+    /* DEMOTE: a resident piece whose interior start or interior end
+     * is not a linearization point cannot have its transition placed
+     * - demotion only, never a new resident pc */
     for (LsraPiece &p : pieces) {
         if (p.reg < 0)
             continue;
-        const bool cont =
-            p.end < iv[static_cast<size_t>(p.iv_idx)].end;
         if ((p.start > begin
                 && !jit_lin_point(edges, static_cast<int>(p.start)))
-            || (cont
+            || (p.end < end
                 && !jit_lin_point(edges, static_cast<int>(p.end))))
             p.reg = -1;
     }
@@ -11462,7 +11474,7 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
         } else {
             evs.push_back({ p.start, 1, i });
         }
-        if (p.end < iv[static_cast<size_t>(p.iv_idx)].end)
+        if (p.end < end)
             evs.push_back({ p.end, 0, i });
     }
     std::sort(evs.begin(), evs.end(), [](const Ev &a, const Ev &b) {
@@ -11470,45 +11482,27 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
              : a.kind != b.kind ? a.kind < b.kind
              : a.pi < b.pi;
     });
-    /* the model: slot each register holds, and the pc its hold dies.
-     * A DEATH end drops silently; a CONTINUATION hold is removed only
-     * by its own flush event (dropping it early would fail the very
-     * check that validates the flush). */
-    struct Occ { int slot = -1; uint32_t live_end = 0;
-                 bool cont = false; };
-    std::vector<Occ> occ(static_cast<size_t>(K));
+    /* the model: slot each register holds. UNIFORM removal - only a
+     * flush event vacates a register (the header's truthful-cache
+     * rule), so the model is a pure transition replay. */
+    std::vector<int> occ(static_cast<size_t>(K), -1);
     for (size_t r = 0; r < occ.size(); r++)
-        if (entry_by_reg[r] >= 0) {
-            for (const LsraPiece &p : pieces)
-                if (p.reg == static_cast<int>(r) && p.start == begin) {
-                    occ[r] = { p.slot, p.end,
-                               p.end < iv[static_cast<size_t>(
-                                              p.iv_idx)].end };
-                    break;
-                }
-        }
-    const auto drop_dead = [&](uint32_t now) {
-        for (Occ &o : occ)
-            if (o.slot >= 0 && !o.cont && o.live_end <= now)
-                o = Occ();
-    };
+        occ[r] = entry_by_reg[r];
     for (const Ev &ev : evs) {
         const LsraPiece &p = pieces[ev.pi];
-        drop_dead(ev.pc);
-        if (ev.kind == 0) {              /* continuation flush */
-            if (occ[p.reg].slot != p.slot)
+        if (ev.kind == 0) {              /* interior-end flush */
+            if (occ[p.reg] != p.slot)
                 return false;            /* model out of step */
             trans.push_back({ p.end, p.reg, p.slot, -1 });
-            occ[p.reg] = Occ();
+            occ[p.reg] = -1;
         } else {                         /* install */
-            if (occ[p.reg].slot >= 0)
+            if (occ[p.reg] >= 0)
                 return false;            /* overlap the scan forbids */
             trans.push_back({ p.start, p.reg, -1, p.slot });
-            occ[p.reg] = { p.slot, p.end,
-                           p.end < iv[static_cast<size_t>(
-                                          p.iv_idx)].end };
+            occ[p.reg] = p.slot;
         }
     }
+    (void)iv;
     return true;
 }
 
@@ -11539,6 +11533,7 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<LiveInterval> &iv,
                      const std::vector<IntervalQual> &q,
                      const std::vector<MemEvent> &mem,
+                     const std::vector<MemEvent> &int_uses,
                      int K, LsraOut &out)
 {
     out = LsraOut();
@@ -11575,17 +11570,25 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
         const bool fl = q[k].uses_float > 0 || q[k].wrote_float;
         /* ⛔ TYPE EVIDENCE: a GP pin's flush stamps the slot t_int (the
          * C3 elision re-established), so admission requires an INT-OP
-         * touch - uses_int > 0, which inference proved. uses_ret is
-         * WEIGHT, never evidence: ReturnV reads ANY type, and a
-         * closure-holding slot admitted on its ReturnV alone was
-         * flushed as t_int over its t_func tag - cf(400) NotCallable +
-         * a leaked FuncObject (the m3 finding; the pick's >= 3
-         * threshold was silently carrying this rule, its own ReturnV
-         * comment says so). */
-        const bool evid = q[k].uses_int > 0;
+         * touch - which inference proved. uses_ret is WEIGHT, never
+         * evidence: ReturnV reads ANY type (the m3 finding - a
+         * closure slot flushed t_int over t_func on its ReturnV
+         * alone). ⛔ AND THE EVIDENCE IS PER PIECE, NOT PER INTERVAL
+         * (the d1 finding): a dyn slot's one interval can span
+         * `d = 5; d = "hi"; d = [1,2]` - boxed redefinitions are
+         * liveness barriers that glue the defs together - and the
+         * post-cut remainder then holds an ARRAY while the interval
+         * still counts pc 0's int use. Ask for an int touch INSIDE
+         * the piece. */
         const auto piece = [&](uint32_t s, uint32_t e2, bool forced) {
             if (s >= e2)
                 return;
+            bool evid = false;
+            for (const MemEvent &u : int_uses)
+                if (u.slot == l.slot && u.pc >= s && u.pc < e2) {
+                    evid = true;
+                    break;
+                }
             /* admit only an int-evidenced, float-free piece with a USE
              * inside - a stretch nothing reads gains nothing */
             const bool cand = !forced && !fl && evid
@@ -20720,17 +20723,108 @@ retry_emission:
          * soundness. Any stage declining falls back to the pick's
          * answer above. */
         bool lsra_chose = false;
+        /* 2b-iii-b: TRANSITION MODE - the snapped plan's per-pc pieces
+         * reach emission. The seam-application loop executes the
+         * LsraTrans list, entry stubs replay it, exits and brackets
+         * read the evolving e.cache (truthful at every pc by the
+         * uniform-flush rule). v1 bounds, each with its reason:
+         * hregs must be empty (a hoist region's COLD COPY re-emits
+         * ops elsewhere - a transition inside one would be re-run);
+         * no temps (the pick's scratch-reuse rule, kept until pieces
+         * are proven on temp lifetimes); no spill homes (a piece is
+         * register or memory; the home tier is a later merge); a
+         * transitioned slot leaves textra (two machineries on one
+         * slot's type word is a review, not a v1). */
+        bool lsra_tmode = false;
+        std::vector<LsraTrans> lsra_tr;      /* ABSTRACT until bound */
+        std::vector<int> lsra_entry;
+        std::vector<int> lsra_aregs;
         if (g_jit_lsra) {
             SlotLiveness lsl;
             std::vector<LiveInterval> liv;
             std::vector<IntervalQual> lq;
             std::vector<MemEvent> lev;
             LsraOut lplan;
+            bool tmode_done = false;
+            std::vector<MemEvent> liu;
             if (jit_slot_liveness(chunk, lsl)
                     && jit_build_intervals(chunk, begin, end, lsl, liv)
                     && jit_qualify_intervals(chunk, begin, end, liv, lq,
-                                             nullptr, &lev)
+                                             nullptr, &lev, &liu)
+                    && hregs.empty() && !jit_lever_off(JL_CACHE)) {
+                LsraOut tp;
+                std::vector<int> entry;
+                std::vector<LsraTrans> tr;
+                if (jit_lsra_assign(chunk, begin, end, liv, lq, lev,
+                                    liu, static_cast<int>(max_pins),
+                                    tp)) {
+                    for (LsraPiece &p : tp.pieces)
+                        if (p.slot >= chunk.slot_count)
+                            p.reg = -1;          /* v1: no temps */
+                    if (jit_lsra_snap(chunk, begin, end, liv,
+                                      static_cast<int>(max_pins),
+                                      tp.pieces, entry, tr)) {
+                        std::map<int, long> w;
+                        for (size_t k2 = 0; k2 < liv.size(); k2++)
+                            w[liv[k2].slot] += lq[k2].uses_int
+                                             + lq[k2].uses_ret;
+                        hot.clear();
+                        hot_counts.clear();
+                        /* entry occupants IN ABSTRACT-REG ORDER - the
+                         * physical zip below maps areg r to hot_reg[h]
+                         * in exactly this order */
+                        for (size_t r = 0; r < entry.size(); r++)
+                            if (entry[r] >= 0) {
+                                hot.push_back(entry[r]);
+                                hot_counts.push_back(
+                                    static_cast<int>(w[entry[r]]));
+                            }
+                        for (const LsraPiece &p : tp.pieces)
+                            if (p.reg >= 0)
+                                lsra_aregs.push_back(p.reg);
+                        std::sort(lsra_aregs.begin(), lsra_aregs.end());
+                        lsra_aregs.erase(
+                            std::unique(lsra_aregs.begin(),
+                                        lsra_aregs.end()),
+                            lsra_aregs.end());
+                        lsra_tr.swap(tr);
+                        lsra_entry.swap(entry);
+                        lsra_tmode = true;
+                        lsra_chose = true;
+                        tmode_done = true;
+                        if (getenv("MYLANG_LSRADBG")) {
+                            for (size_t k2 = 0; k2 < liv.size(); k2++)
+                                fprintf(stderr, "LSRADBG iv slot %d "
+                                        "[%u,%u) ui %d ur %d uf %d "
+                                        "mem %d\n", liv[k2].slot,
+                                        liv[k2].start, liv[k2].end,
+                                        lq[k2].uses_int,
+                                        lq[k2].uses_ret,
+                                        lq[k2].uses_float,
+                                        lq[k2].mem_int);
+                            for (const LsraPiece &p : tp.pieces)
+                                fprintf(stderr, "LSRADBG run[%zu,%zu) "
+                                        "piece slot %d [%u,%u) reg %d"
+                                        "%s\n", begin, end, p.slot,
+                                        p.start, p.end, p.reg,
+                                        p.forced_mem ? " forced" : "");
+                            for (const LsraTrans &tr2 : lsra_tr)
+                                fprintf(stderr, "LSRADBG   trans pc %u"
+                                        " areg %d evict %d install "
+                                        "%d\n", tr2.pc, tr2.reg,
+                                        tr2.evict_slot,
+                                        tr2.install_slot);
+                        }
+                    }
+                }
+            }
+            if (!tmode_done
+                    && jit_slot_liveness(chunk, lsl)
+                    && jit_build_intervals(chunk, begin, end, lsl, liv)
+                    && jit_qualify_intervals(chunk, begin, end, liv, lq,
+                                             nullptr, &lev, &liu)
                     && jit_lsra_assign(chunk, begin, end, liv, lq, lev,
+                                       liu,
                                        static_cast<int>(
                                            max_pins + MAX_SPILL_HOMES),
                                        lplan)) {
@@ -20942,6 +21036,86 @@ retry_emission:
             hot_reg[h] = static_cast<uint8_t>(r);
             if (jit_reg_is_callee_saved(hot_reg[h]))
                 e.saved.push_back(hot_reg[h]);
+        }
+        /* 2b-iii-b: bind ABSTRACT registers to physical pool members.
+         * Entry occupants ride the zip above (hot is in abstract-reg
+         * order); an areg with only mid-run pieces takes its own pool
+         * member here - it must be claimed for the WHOLE run (its
+         * callee-saved push happens once, at frag_entry, and scratch
+         * must never collide with a mid-run install). An areg the
+         * pool cannot serve (denied members) is DROPPED: its
+         * transitions vanish as a pair-consistent set (only occupant-
+         * less aregs can drop, and their lists are install-first), so
+         * its slots simply stay in memory - the cache-aware paths'
+         * fallback, correct by construction. */
+        std::vector<uint8_t> aphys;
+        if (lsra_tmode) {
+            aphys.assign(max_pins, 0xFF);
+            size_t h = 0;
+            for (size_t r = 0; r < lsra_entry.size(); r++)
+                if (lsra_entry[r] >= 0) {
+                    ML_CHECK(h < hot_reg.size());
+                    aphys[r] = hot_reg[h++];
+                }
+            ML_CHECK(h == hot_reg.size());
+            for (const int ar : lsra_aregs) {
+                if (aphys[static_cast<size_t>(ar)] != 0xFF)
+                    continue;
+                int pr = e.take_reg(CACHE_REGS, MAX_CACHED);
+                if (pr < 0)
+                    pr = e.take_reg(xcache_regs(), MAX_XCACHED);
+                if (pr < 0)
+                    continue;            /* denied-shrunk pool: drop */
+                aphys[static_cast<size_t>(ar)] =
+                    static_cast<uint8_t>(pr);
+                if (jit_reg_is_callee_saved(static_cast<uint8_t>(pr)))
+                    e.saved.push_back(static_cast<uint8_t>(pr));
+            }
+            /* busy is PER-PC under transitions - busy <=> a cache
+             * entry exists, the invariant the conflict-evict and the
+             * accumulator machinery pivot on (a busy-but-empty
+             * register was invisible to both: rax bound at setup with
+             * no entry until its install pc hit AccScratch's "no rax
+             * pin present" abort). The occupant-less physicals were
+             * taken above only to fix their identity and their
+             * callee-saved push; give them back - each install
+             * take_fixed's its register at its own pc, each flush
+             * gives it back, and scratch is op-scoped so nothing can
+             * hold a register across a transition. */
+            for (const int ar : lsra_aregs) {
+                if (aphys[static_cast<size_t>(ar)] == 0xFF)
+                    continue;
+                bool is_entry = false;
+                if (static_cast<size_t>(ar) < lsra_entry.size()
+                        && lsra_entry[ar] >= 0)
+                    is_entry = true;
+                if (!is_entry)
+                    e.ra.give(aphys[static_cast<size_t>(ar)]);
+            }
+            std::vector<LsraTrans> bound;
+            for (const LsraTrans &tr2 : lsra_tr) {
+                if (aphys[static_cast<size_t>(tr2.reg)] == 0xFF)
+                    continue;
+                LsraTrans b2 = tr2;
+                b2.reg = aphys[static_cast<size_t>(tr2.reg)];
+                bound.push_back(b2);
+            }
+            lsra_tr.swap(bound);
+            /* a transitioned slot leaves the C3 type-elision extras -
+             * one machinery per type word in v1 */
+            if (!lsra_tr.empty()) {
+                std::vector<int> tx;
+                for (const int s : textra) {
+                    bool hit = false;
+                    for (const LsraTrans &tr2 : lsra_tr)
+                        if (tr2.evict_slot == s
+                                || tr2.install_slot == s)
+                            hit = true;
+                    if (!hit)
+                        tx.push_back(s);
+                }
+                textra.swap(tx);
+            }
         }
         if (pair_lo >= 0) {
             e.saved.push_back(static_cast<uint8_t>(pair_lo));
@@ -21565,6 +21739,7 @@ retry_emission:
          * same world (region-scoped release is a Phase D refinement). */
         bool hoist_pair_claimed = false;
         size_t si = 0;                        /* #96 inc-2: next seam */
+        size_t lt = 0;                        /* 2b-iii-b: next trans */
         std::map<size_t, size_t> seam_pre;    /* seam pc -> pre position */
         for (size_t pc = begin; pc < end && emit_ok; pc++) {
             if (g_hoist.active && hri > 0
@@ -21735,6 +21910,51 @@ retry_emission:
                 e.bump_counter(&g_jit_range_share);
 #endif
             }
+            /* 2b-iii-b: the lsra TRANSITIONS - the same pattern with
+             * the arms split: an interior-end FLUSH evicts and frees
+             * the register (the entry leaves e.cache, so every later
+             * consumer - flushes, brackets, exits, reg_at - reads the
+             * truth), an INSTALL claims it. Emitted before label[pc]
+             * for the same back-edge reason as the seam above. */
+            while (lt < lsra_tr.size() && lsra_tr[lt].pc == pc) {
+                const LsraTrans &tr = lsra_tr[lt++];
+                if (!seam_pre.count(pc))
+                    seam_pre[pc] = e.pos();
+                Emitter::PinMach pm(e);
+                if (tr.evict_slot >= 0) {
+                    for (size_t ci = 0; ci < e.cache.size(); ci++) {
+                        Emitter::CacheEnt &c = e.cache[ci];
+                        if (c.reg != static_cast<uint8_t>(tr.reg))
+                            continue;
+                        ML_CHECK(c.slot == tr.evict_slot);
+                        e.store_type_tag(c.type, jit_layout().t_int);
+                        e.store(c.reg, c.payload);
+                        e.cache.erase(e.cache.begin()
+                                      + static_cast<long>(ci));
+                        e.ra.give(static_cast<uint8_t>(tr.reg));
+                        break;
+                    }
+                }
+                if (tr.install_slot >= 0
+                        && e.ra.take_fixed(
+                               static_cast<uint8_t>(tr.reg))) {
+                    /* take_fixed re-claims the register AT ITS PC -
+                     * busy <=> entry, so the conflict-evict and
+                     * accumulator machinery see a normal pin. A
+                     * refusal means a Phase-A conflict denied it
+                     * mid-pass; skipping is safe - the pass retries
+                     * with the register denied and the next binding
+                     * never sees it. */
+                    const SlotAddr na = slot_addr(tr.install_slot);
+                    e.cache.push_back({ tr.install_slot, na.payload,
+                                        na.type,
+                                        static_cast<uint8_t>(tr.reg) });
+                    e.load(static_cast<uint8_t>(tr.reg), na.payload);
+                }
+#ifdef TESTS
+                e.bump_counter(&g_jit_lsra_trans);
+#endif
+            }
             label[pc - begin] = e.pos();
             e.released = rel_active[pc - begin];
             emit_one(pc, /*in_cold=*/false, end);
@@ -21896,6 +22116,29 @@ retry_emission:
                             c.type = na.type;
                             break;
                         }
+                }
+                /* 2b-iii-b: the lsra transitions at or before this
+                 * entry, replayed the same way (a transition AT the
+                 * entry pc is included - the stub jumps to label[pc],
+                 * which is emitted after the transitions there) */
+                for (const LsraTrans &tr : lsra_tr) {
+                    if (tr.pc > pe.first)
+                        break;
+                    if (tr.evict_slot >= 0)
+                        for (size_t ci = 0; ci < st_cache.size(); ci++)
+                            if (st_cache[ci].reg
+                                    == static_cast<uint8_t>(tr.reg)) {
+                                st_cache.erase(st_cache.begin()
+                                    + static_cast<long>(ci));
+                                break;
+                            }
+                    if (tr.install_slot >= 0) {
+                        const SlotAddr na = slot_addr(tr.install_slot);
+                        st_cache.push_back({ tr.install_slot,
+                                             na.payload, na.type,
+                                             static_cast<uint8_t>(
+                                                 tr.reg) });
+                    }
                 }
                 for (const Emitter::CacheEnt &c : st_cache)
                     e.load(c.reg, c.payload);   /* #96: the ENTRY's own
