@@ -592,15 +592,24 @@ caught the draft); jit_share_plan disabled under trans mode (the
 transitions own sharing). MEASURED: 83 +6.09% -> +0.76%; the
 six-bench ledger reads +0.14%..+0.76%.
 
-⛔ NEXT: 2b-iii-d - close the gap to zero and gate the flip:
- - the residual sub-1%: per-call transition code on hot entries
-   (fuse install runs into the entry-load block when they sit in
-   the straight-line prologue), the textra filter (transitioned
-   slots could re-enter type elision per-piece), selection
-   polish (weight-aware eviction ties);
- - validator arm 2 as a machine check; second-chance re-queue;
-   C2b hoist regions into trans mode (they currently decline it);
-   the float pool twin;
+2b-iii-d inc 1 LANDED 2026-08-23: VALIDATOR ARM 2 - label
+in-edge agreement as a machine check (per-fixup GP-cache
+signatures vs the landing position's, pre- vs post-transition
+respected; runs under BOTH modes, so it validates ShareSeams
+too). Watched failing: jit_lin_point admitting one crossing
+aborts the next lever -rt by name. The check is #ifndef NDEBUG
+(validation only) - `want` and then `to_pre` were the cc1f50f
+set-but-unused shape, both caught by the pre-push clang
+OPT=1 ASSERTS=0 LTO=0 step.
+
+⛔ NEXT: 2b-iii-d remainder, in flip-gating order:
+ - the residual sub-1%: install-run fusion into the entry-load
+   block, the textra per-piece filter, weight-aware eviction
+   ties;
+ - second-chance re-queue; C2b hoist regions into trans mode
+   (they currently decline it); the float pool twin; arm 3
+   (exit-flush completeness) if the exit machinery ever stops
+   flushing e.cache wholesale;
  - the D0 full-suite ledger (RULE B1) + wall-clock interleaved
    A/B, and the default flip only when D4 is green AND the
    ledger pays.]

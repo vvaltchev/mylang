@@ -8274,3 +8274,37 @@ noise, the textra filter) is cost-model polish, still listed.
 Verified: full lever x arena -rt + corpus + --levers composed,
 vdjcmp 116/116 default config, TESTS=1 OPT=1 both lever states,
 clang OPT=1 ASSERTS=0 LTO=0 zero warnings, census gate.
+
+## Endgame D3.b 2b-iii-d inc 1 (2026-08-23) - validator arm 2: label
+## in-edge agreement as a machine check
+
+WHAT: at every fragment-local branch patch, the source-side register
+state must equal the landing position's - the guarantee the
+linearization-point discipline makes BY CONSTRUCTION, now asserted so
+a future scan, snap or seam change that breaks the discipline aborts
+by name at compile time instead of running a stale register. The
+signature folds the GP cache's (reg, slot) pairs (the per-pc-varying
+state; fcache/scache/tflush are run-constant in both modes); a branch
+patched to seam_pre runs the pc's transitions and compares against
+the PRE-transition signature, one patched to the label against the
+post-transition one. Per-fixup signatures are recorded in the main
+loop after each op (no Fixup struct change - fixups only append, so a
+resize-to-current covers exactly the op's own branches); label and
+pre-transition signatures at their recording sites. The check runs
+under BOTH modes - it validates the ShareSeams as much as the lsra
+transitions - and passed over the whole suite and corpus in all four
+lever x arena configs, which is the discipline's first machine-veri-
+fied sweep.
+
+WATCHED FAILING: jit_lin_point sabotaged to admit one crossing edge -
+the very next lever -rt run aborts with the arm's named message.
+
+⛔ THE cc1f50f SHAPE, TWICE IN ONE CHANGE: the check block is
+validation only, so it is gated #ifndef NDEBUG - and first `want`,
+then `to_pre` went set-but-unused in the ASSERTS=0 clang lane
+(-Werror). The pre-push battery's clang OPT=1 ASSERTS=0 LTO=0 step
+caught both before CI could.
+
+Verified: vdjcmp 116/116 (bookkeeping adds no bytes), the full
+lever x arena -rt + corpus matrix, TESTS=1 OPT=1 both lever states,
+clang OPT=1 ASSERTS=0 LTO=0 zero warnings, census gate.
