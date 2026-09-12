@@ -8491,3 +8491,18 @@ walks from the analysis' transient allocations).
 Verified: -rt + corpus, both configs, both arenas; vdjcmp 116/116
 default; TESTS=1 OPT=1 both configs; clang OPT=1 ASSERTS=0 LTO=0
 zero warnings; census gate.
+
+THE FULL 88-BENCH SWEEP (2026-08-24, callgrind s1+s3, lever
+off/on, -npc both sides): ZERO per-iteration regressions. Wins
+over the 0.30% band: 06_if_branch -16.80% (the scan pins r14/r15
+across the branchy body the pick declines - 3 fewer helper calls,
+9 fewer tag stores per loop), 81 -2.72%, 82 -1.56%, 83 -0.98%,
+68_nested -0.46%. The one positive entry, 69_exc_crossframe
++4.13%, has BYTE-IDENTICAL emission both ways - the heap-priming
+artifact class (69 allocates an exception every iteration, so a
+differently-primed malloc free list scales with iterations).
+Everything else +-0.00%/iter; the +0.0..1.2% s1 residue is the
+compile-side band. Sweep hygiene rule re-learned: an ad-hoc
+callgrind sweep BYPASSES bench/run.py and so must pass -npc
+itself - the first sweep did not and was discarded (09_fib's
+4,820 Ir/2sc per-iteration denominator was the tell).

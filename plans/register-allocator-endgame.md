@@ -754,9 +754,21 @@ form; saw_rescue vacuity watched; the case needed int(runtime())
 correctly ineligible). MEASURED per-iteration: 34/44/73/86/87 all
 +0.00%, 07/43 hold, ⛔ 81 -2.72% and 83 -0.98% - the lever BEATS
 the pick on the register-pressure family, the arc's first wins.
-Residual s1 band = compile-side + 69's heap class. STILL TO DO
-here: re-run the FULL 87-bench sweep (only the 9-bench spot set
-was re-measured).
+Residual s1 band = compile-side + 69's heap class. THE FULL 88-BENCH SWEEP RAN 2026-08-24 (callgrind, -npc both
+sides - a first sweep without -npc was DISCARDED and re-run: the
+runner passes -npc for exactly this reason, and an ad-hoc script
+that bypasses run.py must add it back; 09_fib's non-scaling
+denominator was the tell). RESULT: ZERO per-iteration regressions
+except 69_exc_crossframe +4.13%, whose emission is BYTE-IDENTICAL
+lever-on/off (verified again) - the documented heap-priming class,
+scaling with iterations because 69 allocates an exception per
+iteration. Six benches over the 0.30% band, five of them WINS:
+06_if_branch -16.80% (real allocation: 3 fewer helper calls, 9
+fewer tag stores, r14/r15 pinned across the branchy body where
+the pick declines), 81 -2.72%, 82 -1.56%, 83 -0.98%, 68_nested
+-0.46%. Everything else +-0.00%/iter; the s1 column's +0.0..1.2%
+is the compile-side band. The committed spot numbers are confirmed
+by the -npc sweep unchanged.
 THEN: C2b regions into trans mode (⛔ fresh-window: the cold-copy
 emission reads e.cache at STREAM-END state - needs per-region
 state replay; check whether today's ShareSeams already carry the
