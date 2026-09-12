@@ -11468,8 +11468,10 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                    const std::vector<MemEvent> &int_uses, int K,
                    std::vector<LsraPiece> &pieces,
                    std::vector<int> &entry_by_reg,
-                   std::vector<LsraTrans> &trans)
+                   std::vector<LsraTrans> &trans,
+                   const std::vector<FltEvent> *fev)
 {
+    const bool fm = fev != nullptr;      /* F3: the float twin */
     entry_by_reg.assign(static_cast<size_t>(K), -1);
     trans.clear();
     if (begin >= end || K < 0)
@@ -11626,18 +11628,27 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
     for (const int s : lin_demoted) {
         bool eligible = false;
         long wint = 0;
-        bool memf = false, fl2 = false;
+        bool memf = false, fl2 = false, wrotef = false;
         int first_iv = -1;
         for (size_t k2 = 0; k2 < iv.size(); k2++) {
             if (iv[k2].slot != s)
                 continue;
             if (first_iv < 0)
                 first_iv = static_cast<int>(k2);
-            wint += q[k2].uses_int;
-            memf |= q[k2].mem_int;
-            fl2 |= q[k2].uses_float > 0 || q[k2].wrote_float;
+            if (fm) {
+                /* the pick's fhot rule (jit.h's F3 note) */
+                wint += q[k2].uses_float;
+                memf |= q[k2].mem_float;
+                fl2 |= q[k2].uses_int > 0;
+                wrotef |= q[k2].wrote_float;
+            } else {
+                wint += q[k2].uses_int;
+                memf |= q[k2].mem_int;
+                fl2 |= q[k2].uses_float > 0 || q[k2].wrote_float;
+            }
         }
-        eligible = !memf && !fl2 && wint >= 3 && first_iv >= 0;
+        eligible = !memf && !fl2 && wint >= 3 && first_iv >= 0
+                && (!fm || wrotef);
         (void)int_uses;
         if (!eligible)
             continue;

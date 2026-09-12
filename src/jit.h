@@ -491,13 +491,21 @@ void jit_run_edges(const Chunk &ck, size_t begin, size_t end,
  * pin as the degenerate snap output, needing NO transitions and
  * therefore immune to linearization points (44_primes_sqrt's
  * -3.2%/iter shape: the snap shredded what the pick pins). */
+/* FLOAT MODE (F3): non-null `fev` flips the RESCUE's eligibility to
+ * the pick's fhot rule - sum(uses_float) >= 3, wrote_float somewhere
+ * (the pick's fdst requirement: its whole-run soundness note is the
+ * argument), no mem_float anywhere, and uses_int == 0 on every
+ * interval (the disjoint-pools rule; uses_ret exempt). Everything
+ * else - lin points, demotion, translation, the occupancy model -
+ * is register-file-agnostic and shared verbatim. */
 bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                    const std::vector<LiveInterval> &iv,
                    const std::vector<IntervalQual> &q,
                    const std::vector<MemEvent> &int_uses, int K,
                    std::vector<LsraPiece> &pieces,
                    std::vector<int> &entry_by_reg,
-                   std::vector<LsraTrans> &trans);
+                   std::vector<LsraTrans> &trans,
+                   const std::vector<FltEvent> *fev = nullptr);
 #ifdef TESTS
 /* Test-only export of the (static) pick - the D3 qualification check
  * asserts per-interval facts against the pick's public answer. */

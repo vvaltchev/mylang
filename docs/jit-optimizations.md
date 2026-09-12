@@ -8544,3 +8544,23 @@ jit_lsra_float_check (FI1 tiling, FG write-first, FD disjoint
 pools, FF2 floor; WATCHED both ways - accepting read-first names
 the piece, inflating the floor weights names the slots; four
 vacuity-guarded refusal shapes).
+
+## Endgame F3 (2026-08-24) - the snap's FLOAT mode
+
+jit_lsra_snap gains the same trailing-fev convention as the scan:
+non-null flips the WHOLE-RUN RESCUE's eligibility to the pick's
+fhot rule (sum uses_float >= 3, wrote_float somewhere - the pick's
+fdst requirement, whose whole-run soundness note is the argument -
+no mem_float anywhere, no countable int use on any interval). The
+lin-point machinery, demotion, translation and the occupancy model
+are register-file-agnostic and shared verbatim.
+
+The rescue's float test shape is the int one's twin with one
+lowering fact doing the work: `sc = float(runtime(7))` in a branch
+lowers to a CallBuiltinV whose DST is sc - a BARRIER (bracketed
+flush/reload), not a bad() - so sc keeps a mem-free float ledger
+and stays pick-eligible while the branch edge makes its piece
+boundary a non-lin point, demoting it; the rescue must then merge
+sc whole-run. Net: jit_lsra_snap_float_check (FS2 replay, FS5
+single-residency, the rescue + vacuity). WATCHED: forcing
+float-mode ineligibility fails the vacuity guard by name.

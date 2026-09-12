@@ -26334,6 +26334,144 @@ static bool jit_lsra_snap_check()
 }
 
 /*
+ * F3 (the float/xmm twin): THE SNAP IN FLOAT MODE. The lin-point /
+ * demotion / translation machinery is register-file-agnostic; what
+ * flips is the WHOLE-RUN RESCUE's eligibility (the pick's fhot rule:
+ * sum uses_float >= 3, wrote_float somewhere, no mem_float, no int
+ * uses). Properties: FS2 - replaying entry_by_reg + trans reproduces
+ * every resident piece's residency at every pc; FS5 - no slot on two
+ * registers at once; and the RESCUE case - the float twin of the int
+ * rescue shape (`sc = float(runtime(7))` in a branch: the builtin
+ * dst is a BARRIER, not a bad(), so sc stays pick-eligible, and the
+ * branch edge makes sc's piece boundary a non-lin point, demoting it
+ * - the rescue must merge sc whole-run). WATCHED: forcing the
+ * float-mode rescue ineligible trips the saw_rescue vacuity guard.
+ */
+static bool jit_lsra_snap_float_check()
+{
+#if ML_JIT_SUPPORTED
+    struct Case { const char *name; int K; std::string src; };
+    const Case cases[] = {
+        { "float rescue", 4,
+          "var sc = 1.5;\n"
+          "if (runtime(1) > 0) { sc = float(runtime(7)); }\n"
+          "var t1 = sc + 1.0;\n"
+          "var t2 = sc * 2.0;\n"
+          "print(t1 + t2 + sc);\n" },
+        { "hot float loop", 4,
+          "var f = 0.0; var n = 0; n = n + runtime(30);\n"
+          "for (var i = 0; i < n; i++) f = f + 0.5;\n"
+          "print(f);\n" },
+    };
+    bool ok = true, saw_rescue = false, saw_res = false;
+    for (const Case &c : cases) {
+        std::vector<Tok> toks;
+        lexer(c.src, 1, toks);
+        ParseContext pctx(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pctx);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        std::vector<const Chunk *> chunks;
+        chunks.push_back(&prog.root);
+        for (const auto &fd : prog.funcs)
+            if (fd->vm_chunk)
+                chunks.push_back(static_cast<const Chunk *>(fd->vm_chunk));
+        bool any_ran = false;
+        for (const Chunk *ckp : chunks) {
+        const Chunk &ck = *ckp;
+        SlotLiveness sl;
+        std::vector<LiveInterval> iv;
+        std::vector<IntervalQual> q;
+        std::vector<MemEvent> ev, iu;
+        std::vector<FltEvent> fev;
+        int orphans = -1;
+        LsraOut plan;
+        std::vector<int> entry(static_cast<size_t>(c.K), -1);
+        std::vector<LsraTrans> trans;
+        if (!jit_slot_liveness(ck, sl)
+                || !jit_build_intervals(ck, 0, ck.code.size(), sl, iv)
+                || !jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
+                                          &orphans, &ev, &iu, &fev)
+                || !jit_lsra_assign(ck, 0, ck.code.size(), iv, q, ev,
+                                    iu, c.K, plan, &fev)
+                || !jit_lsra_snap(ck, 0, ck.code.size(), iv, q, iu,
+                                  c.K, plan.pieces, entry, trans,
+                                  &fev)) {
+            continue;
+        }
+        any_ran = true;
+        /* FS2: replay => coverage at every pc */
+        std::vector<int> hold(static_cast<size_t>(c.K), -1);
+        for (int r = 0; r < c.K; r++)
+            hold[r] = entry[r];
+        size_t ti = 0;
+        for (size_t p = 0; p < ck.code.size(); p++) {
+            while (ti < trans.size() && trans[ti].pc == p) {
+                const LsraTrans &tr = trans[ti++];
+                if (tr.evict_slot >= 0) {
+                    if (hold[tr.reg] != tr.evict_slot) {
+                        printf("  snap-f [%s]: flush of %d at pc %u "
+                               "but reg %d holds %d\n", c.name,
+                               tr.evict_slot, tr.pc, tr.reg,
+                               hold[tr.reg]);
+                        ok = false;
+                    }
+                    hold[tr.reg] = -1;
+                }
+                if (tr.install_slot >= 0)
+                    hold[tr.reg] = tr.install_slot;
+            }
+            for (const LsraPiece &pc2 : plan.pieces) {
+                if (pc2.reg < 0 || p < pc2.start || p >= pc2.end)
+                    continue;
+                if (hold[pc2.reg] != pc2.slot) {
+                    printf("  snap-f [%s]: pc %zu slot %d expected "
+                           "in reg %d, model holds %d\n", c.name, p,
+                           pc2.slot, pc2.reg, hold[pc2.reg]);
+                    ok = false;
+                }
+            }
+        }
+        /* FS5: no slot on two registers at once */
+        for (size_t a = 0; a < plan.pieces.size(); a++)
+            for (size_t b = a + 1; b < plan.pieces.size(); b++) {
+                const LsraPiece &x = plan.pieces[a];
+                const LsraPiece &y = plan.pieces[b];
+                if (x.reg >= 0 && y.reg >= 0 && x.slot == y.slot
+                        && x.start < y.end && y.start < x.end) {
+                    printf("  snap-f [%s]: slot %d on TWO registers"
+                           "\n", c.name, x.slot);
+                    ok = false;
+                }
+            }
+        for (const LsraPiece &p : plan.pieces) {
+            if (p.reg < 0)
+                continue;
+            saw_res = true;
+            if (p.start == 0 && p.end == ck.code.size()
+                    && ck.code.size() > 4)
+                saw_rescue = true;
+        }
+        }                                /* chunks */
+        if (!any_ran) {
+            printf("  snap-f [%s]: no chunk was analyzable\n", c.name);
+            ok = false;
+        }
+    }
+    if (!saw_res || !saw_rescue) {
+        printf("  snap-f: a shape never occurred (res=%d rescue=%d) "
+               "- vacuous\n", saw_res, saw_rescue);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * D3.b 2b-ii: THE LSRA BRIDGE - with the lever ON, the linear scan
  * chooses the pin set (whole-run reduction) and the program still
  * computes the right answers end to end, with the execution-proof
@@ -35436,6 +35574,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: D3.b - the SNAP to linearization points: replay equals "
       "coverage, demotion only, in-loop events demote (2b-iii-a)",
       jit_lsra_snap_check },
+    { "jit: F3 - the snap in FLOAT mode (replay, single-residency, "
+      "the float whole-run rescue)",
+      jit_lsra_snap_float_check },
     { "jit: the low-address arena placed every Type singleton below "
       "2^31, so a type tag can encode as imm32 (#96)",
       jit_lowmem_singletons },
