@@ -25412,8 +25412,21 @@ static bool jit_lsra_check()
           "var a = 0; var b = 0; var n = 0; n = n + runtime(50);\n"
           "for (var i = 0; i < n; i++) { a = a + i; b = b + a; }\n"
           "print(a + b);\n" },
+        /* the m3 finding's shape, on the FUNCTION chunk: f holds a
+         * CLOSURE and its only touch is ReturnV - property F says it
+         * never gets a register (uses_ret is weight, not type
+         * evidence; a resident f was flushed t_int over t_func) */
+        { "ret-only closure slot stays memory", 4,
+          "func mk() {\n"
+          "    var c = 0;\n"
+          "    var f = func [c] (int n) { return c + n; };\n"
+          "    return f;\n"
+          "}\n"
+          "var cf = mk();\n"
+          "print(cf(400));\n" },
     };
     bool ok = true, saw_evict = false, saw_cut = false;
+    bool saw_retonly = false;
     for (const Case &c : cases) {
         std::vector<Tok> toks;
         lexer(c.src, 1, toks);
@@ -25423,7 +25436,14 @@ static bool jit_lsra_check()
         infer_types(root.get(), true);
         run_optimizers(root.get());
         VmProgram prog = vm_compile(root.get(), /*jit=*/false);
-        const Chunk &ck = prog.root;
+        std::vector<const Chunk *> chunks;
+        chunks.push_back(&prog.root);
+        for (const auto &fd : prog.funcs)
+            if (fd->vm_chunk)
+                chunks.push_back(static_cast<const Chunk *>(fd->vm_chunk));
+        bool any_ran = false;
+        for (const Chunk *ckp : chunks) {
+        const Chunk &ck = *ckp;
         SlotLiveness sl;
         std::vector<LiveInterval> iv;
         std::vector<IntervalQual> q;
@@ -25436,10 +25456,12 @@ static bool jit_lsra_check()
                                           &orphans, &ev)
                 || !jit_lsra_assign(ck, 0, ck.code.size(), iv, q, ev,
                                     c.K, plan)) {
-            printf("  lsra [%s]: a stage declined\n", c.name);
-            ok = false;
+            /* a chunk may legitimately decline (an unclassifiable
+             * op - a CallV in the root, say); the case fails only if
+             * NO chunk was analyzable (below) */
             continue;
         }
+        any_ran = true;
         saw_evict |= plan.evictions > 0;
         saw_cut |= plan.cuts > 0;
         /* I1: tiling per interval */
@@ -25502,6 +25524,18 @@ static bool jit_lsra_check()
                 printf("  lsra [%s]: float-fact slot %d got GP reg "
                        "%d\n", c.name, p.slot, p.reg);
                 ok = false;
+            }
+            /* property F: no int-op touch, no register - uses_ret is
+             * weight, never TYPE evidence (the m3 finding: a resident
+             * ret-only closure slot was flushed t_int over t_func) */
+            if (pq.uses_int == 0 && pq.uses_ret > 0) {
+                saw_retonly = true;
+                if (p.reg >= 0) {
+                    printf("  lsra [%s]: ret-only slot %d resident "
+                           "(reg %d) with no int evidence\n",
+                           c.name, p.slot, p.reg);
+                    ok = false;
+                }
             }
         }
         /* the shape assertions, via the pick's public answer */
@@ -25580,6 +25614,12 @@ static bool jit_lsra_check()
                 ok = false;
             }
         }
+        }                                /* chunks */
+        if (!any_ran) {
+            printf("  lsra [%s]: every chunk declined - the case "
+                   "exercises nothing\n", c.name);
+            ok = false;
+        }
     }
     if (!saw_evict) {
         printf("  lsra: no case ever evicted - the pressure half is "
@@ -25591,7 +25631,102 @@ static bool jit_lsra_check()
                "half is untested\n");
         ok = false;
     }
+    if (!saw_retonly) {
+        printf("  lsra: no ret-only interval ever appeared - property "
+               "F is vacuous\n");
+        ok = false;
+    }
     return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * D3.b 2b-ii: THE LSRA BRIDGE - with the lever ON, the linear scan
+ * chooses the pin set (whole-run reduction) and the program still
+ * computes the right answers end to end, with the execution-proof
+ * counter growing (g_jit_lsra_pins is bumped by EMITTED code at the
+ * entry of a fragment whose pins came from the scan - a compile-time
+ * flag cannot prove reach). The lever is saved and RESTORED - an
+ * env-gated tool leaked into the next test is a named trap.
+ */
+static bool jit_lsra_bridge_check()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const bool saved = g_jit_lsra;
+    g_jit_lsra = true;
+    struct Restore {
+        bool v;
+        ~Restore() { g_jit_lsra = v; }
+    } restore{ saved };
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok2 = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok2 = false;
+        }
+        g_exec_engine = se;
+        return ok2;
+    };
+    const unsigned long p0 = g_jit_lsra_pins;
+    /* hot int loop (the pin shape), the 2a payoff program (a mem
+     * event inside the run), and a float loop (the GP scan must not
+     * touch the float pool's answer) - each SELF-ASSERTING */
+    if (!run({
+            "var a = 0; var b = 0; var n = 0; n = n + runtime(2000);",
+            "for (var i = 0; i < n; i++) { a = a + i; b = b + a; }",
+            "assert(a == 1999000);",
+            "assert(b == 1333333000);" })
+        || !run({
+            "var s = 0; var n = 0; n = n + runtime(1000);",
+            "for (var i = 0; i < n; i++) s = s + i;",
+            "var u = s * 2;",
+            "var d = {};",
+            "s = 0;",
+            "d[s] = 1;",
+            "assert(u + len(d) == 999001);" })
+        || !run({
+            "var f = 0.0; var n = 0; n = n + runtime(500);",
+            "for (var i = 0; i < n; i++) f = f + 0.5;",
+            "assert(f == 250.0);" })
+        || !run({
+            /* the m3 finding's end-to-end pin: a returned closure
+             * must stay callable (a ret-only slot wrongly pinned was
+             * flushed t_int over t_func -> NotCallableEx here) */
+            "func mk() {",
+            "    var c = 0;",
+            "    var f = func [c] (int n) { return c + n; };",
+            "    return f;",
+            "}",
+            "var cf = mk();",
+            "assert(cf(400) == 400);" })) {
+        printf("  lsra bridge: a program failed under the lever\n");
+        return false;
+    }
+    if (g_jit_lsra_pins <= p0) {
+        printf("  lsra bridge: no fragment ever entered with an "
+               "lsra-chosen pin set (counter flat at %lu)\n", p0);
+        return false;
+    }
+    return true;
 #else
     return true;
 #endif
@@ -26695,6 +26830,17 @@ static bool jit_xcache_pins()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
+    /* D3.b: this test pins the DEFAULT allocator's mechanism - the
+     * lsra lever chooses a different pin set by design, which starves
+     * the crafted shape of the exact pressure it constructs. Force the
+     * default for the test's duration (save/restore - the env-leak
+     * trap). */
+    const bool lsra_saved = g_jit_lsra;
+    g_jit_lsra = false;
+    struct LsraRestore {
+        bool v;
+        ~LsraRestore() { g_jit_lsra = v; }
+    } lsra_restore{ lsra_saved };
 
     auto go = [&](const std::vector<const char *> &src, bool vm,
                   unsigned long *xc) -> std::string {
@@ -28499,6 +28645,17 @@ static bool jit_hoist_pair_conflict()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
+    /* D3.b: this test pins the DEFAULT allocator's mechanism - the
+     * lsra lever chooses a different pin set by design, which starves
+     * the crafted shape of the exact pressure it constructs. Force the
+     * default for the test's duration (save/restore - the env-leak
+     * trap). */
+    const bool lsra_saved = g_jit_lsra;
+    g_jit_lsra = false;
+    struct LsraRestore {
+        bool v;
+        ~LsraRestore() { g_jit_lsra = v; }
+    } lsra_restore{ lsra_saved };
     const std::vector<const char *> src = {
         "var a = array(64);",
         "for (var i = 0; i < 64; i++) a[i] = i;",
@@ -34533,6 +34690,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },
+    { "jit: D3.b - the lsra lever BRIDGE: the scan's whole-run pin "
+      "set runs end to end, execution-proven (step 2b-ii opening)",
+      jit_lsra_bridge_check },
     { "jit: the low-address arena placed every Type singleton below "
       "2^31, so a type tag can encode as imm32 (#96)",
       jit_lowmem_singletons },

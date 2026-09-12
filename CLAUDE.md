@@ -853,6 +853,23 @@ collision). Three nets now:
   a day, exercised by no net in the project, as a wrong answer. Unlike
   a lever switch this is not an A/B: every rotation must produce the
   SAME output, so it is a pure differential axis.
+- **`MYLANG_JIT_LSRA=1` - the D3 REGISTER-ALLOCATOR lever, DEFAULT
+  OFF** (`g_jit_lsra`, settable in-process). While the linear-scan
+  allocator is built (plans/register-allocator-endgame.md), ON means
+  the scan (`jit_lsra_assign`) chooses the PIN SET - the plan reduced
+  to whole-run residency - and every downstream stage runs unchanged.
+  The default config is byte-identical with the lever off (vdjcmp
+  116/116); the lever-on config is a CORRECTNESS config (-rt and
+  corpus_diff green in both arenas), not yet a perf one. ⛔ TWO RULES
+  it already earned: GP admission needs uses_int > 0 - an int-op
+  touch is the TYPE evidence the t_int flush relies on; a ReturnV
+  read is weight, never evidence (a ret-only closure slot pinned on
+  its ReturnV was flushed t_int over t_func - NotCallableEx + a leak;
+  the pick's >= 3 threshold had been carrying this rule silently).
+  And a coverage test that pins the DEFAULT allocator's mechanism
+  (jit_xcache_pins, jit_hoist_pair_conflict) must force
+  g_jit_lsra = false for its duration, or the lever-on suite starves
+  its crafted shape.
 - **`MYLANG_JIT_FORCE=lever[,...]`** - ignore a lever's COST heuristic
   but NOT its soundness guards, so it engages in shapes it would
   normally decline as unprofitable. This is the half with real catch

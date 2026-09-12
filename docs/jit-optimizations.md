@@ -8025,3 +8025,53 @@ LOSES, not who wins.
 Verified: -rt 1690 x 5 x both arenas, TESTS=1 OPT=1, clang OPT=1
 ASSERTS=0 LTO=0 zero warnings, non-JIT compile check, census gate at
 floor. Analysis-only - no emission change.
+
+## Endgame D3.b step 2b-ii opening (2026-08-23) - the lsra lever
+## bridge, and the ReturnV type-evidence rule
+
+WHAT: `MYLANG_JIT_LSRA=1` (g_jit_lsra, default OFF, test-settable) -
+the scan chooses the PIN SET: intervals + qualification + MemEvents +
+jit_lsra_assign per run, the plan reduced to WHOLE-RUN residency (a
+slot every piece of which is register-resident), fed to the existing
+machinery in the pick's own order (weight desc, slot asc); any stage
+declining falls back to the pick. Execution proof: g_jit_lsra_pins
+(JITSTATS row), bumped by emitted code at the entry of a fragment
+whose pins came from the scan.
+
+⛔ THE FINDING THE LEVER'S FIRST SWEEP PAID FOR - THE ReturnV
+TYPE-EVIDENCE RULE. The first lever-on -rt run failed 11 tests plus a
+corpus divergence with a leak: `var f = <closure>; return f;` pinned
+f on the strength of its single ReturnV read (my reduction admitted
+any weight > 0), and the flush's C3 tag re-establishment then stamped
+`mov f.type, <int-tag>` OVER THE CLOSURE's t_func - cf(400) raised
+NotCallableEx and the FuncObject leaked. The pick never hits this
+because its >= 3 threshold happens to exclude ReturnV-only slots -
+its own ReturnV comment says so for floats - i.e. A PROFITABILITY
+KNOB WAS SILENTLY CARRYING A SOUNDNESS RULE. The rule is now
+explicit at every layer: GP admission requires uses_int > 0 (an
+int-op touch, which inference proved - so the t_int stamp is sound);
+uses_ret is WEIGHT, never evidence (ReturnV reads ANY type).
+ - jit_lsra_assign's cut phase gates admission on it (`evid`);
+ - the bridge's reduction gates on wint > 0;
+ - property F in the 2b-i net: a piece of a uses_int == 0 &&
+   uses_ret > 0 interval is never resident - WATCHED failing (the
+   evid gate removed names the slot), on a FUNCTION-chunk case (the
+   root ends in Halt, so the shape needs a real callee);
+ - the bridge test runs the closure program end to end.
+
+Two coverage tests (jit_xcache_pins, jit_hoist_pair_conflict) pin
+g_jit_lsra = false for their duration - they assert the DEFAULT
+allocator's mechanism fires on a crafted shape, which the scan's
+different pin choice legitimately starves.
+
+Verified: the 2x2 matrix (lever x arena) of -rt 1690 x 5 all green,
+corpus_diff plain both lever states + lever-on off-arena, vdjcmp
+116/116 BOTH arenas for the default config (everything emission-side
+is lever-gated), TESTS=1 OPT=1 -rt in both lever states, clang OPT=1
+ASSERTS=0 LTO=0 zero warnings ((void)lsra_chose - the TESTS-only-read
+cc1f50f shape, closed preemptively), non-JIT compile check, census
+gate.
+
+NEXT (the plan's marker): per-pc emission - serve the D2 seam from
+the plan's pieces, entry loads / split stores / label resolution /
+exit flushes, validator arms 2/3, then the D0 ledger A/B.

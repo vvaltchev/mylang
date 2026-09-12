@@ -302,8 +302,12 @@ extern unsigned long g_jit_inline_call_baked;
  * (codegen.h's LiveInterval), produced by driving pick_visit_op
  * (jit.cpp) over the run with the interval side's callbacks. Raw
  * facts only; the consumer derives the pools:
- *   GP candidate   : uses_int + uses_ret as weight; !mem_int;
- *                    uses_float == 0 && !wrote_float (disjoint pools)
+ *   GP candidate   : uses_int + uses_ret as weight; ADMISSION needs
+ *                    uses_int > 0 (an int-op touch is the TYPE
+ *                    evidence the t_int flush relies on - a ReturnV
+ *                    read is weight, never evidence: it reads ANY
+ *                    type); !mem_int; uses_float == 0 &&
+ *                    !wrote_float (disjoint pools)
  *   XMM candidate  : wrote_float && uses_float > 0; !mem_float;
  *                    uses_int == 0 (uses_ret is EXEMPT - the emit
  *                    flushes before jit_ret; the pick's ReturnV note)
@@ -457,6 +461,14 @@ size_t jit_spill_budget();
  * every member take the first-choice traffic.
  */
 extern unsigned g_jit_xrot;
+/* D3.b 2b-ii: the `lsra` LEVER, DEFAULT OFF (env MYLANG_JIT_LSRA=1;
+ * settable in-process for tests). While the allocator is built, ON
+ * means: the linear scan (jit_lsra_assign) chooses the PIN SET - the
+ * plan reduced to whole-run residency - and every downstream stage
+ * (physical assignment, spill homes, seams, brackets, flushes) runs
+ * unchanged. The default flips only when the full D4 net is green AND
+ * the D0 ledger says it pays (the endgame plan's rule). */
+extern bool g_jit_lsra;
 size_t jit_xcache_width();
 /*
  * REACH (env MYLANG_JITSTATS=1): print the emitted-code counters after a
@@ -1051,6 +1063,9 @@ extern "C" unsigned long g_jit_xcache;
 extern "C" unsigned long g_jit_rax_pin;
 /* #96 inc-1: fragment entries that ran with >= 1 spill-homed slot. */
 extern "C" unsigned long g_jit_scache;
+/* D3.b 2b-ii: fragments ENTERED whose pin set came from the linear
+ * scan (the lsra lever) - the bridge's execution proof. */
+extern "C" unsigned long g_jit_lsra_pins;
 /* #96 inc-2: range seams EXECUTED (eviction + install ran). */
 extern "C" unsigned long g_jit_range_share;
 /* the in-process FORCE override (a bitmask of JitLever bits), for

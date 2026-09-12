@@ -75,6 +75,7 @@ unsigned long g_jit_fcache = 0;        /* C2a: float-pinned fragment entries */
 unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_rax_pin = 0;       /* #96: rax-pinned fragment entries */
 unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
+unsigned long g_jit_lsra_pins = 0;     /* D3.b: lsra-chosen pin sets */
 unsigned long g_jit_range_share = 0;   /* #96 inc-2: executed range seams */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
 unsigned long g_jit_two_addr_reg = 0;  /* #96: two-address PINNED ops */
@@ -9254,6 +9255,7 @@ void jit_stats_report()
         { "xcache",           &g_jit_xcache },
         { "rax_pin",          &g_jit_rax_pin },
         { "scache",           &g_jit_scache },
+        { "lsra_pins",        &g_jit_lsra_pins },
         { "range_share",      &g_jit_range_share },
         { "two_addr",         &g_jit_two_addr },
         { "two_addr_reg",     &g_jit_two_addr_reg },
@@ -9687,6 +9689,13 @@ static const size_t MAX_XCACHED =
  * always yields a valid pool, and it reaches every member in position
  * 0, which is the only position that matters for this test.
  */
+/* D3.b 2b-ii: the lsra lever (contract in jit.h) - env-seeded,
+ * test-settable, DEFAULT OFF. */
+bool g_jit_lsra = []() -> bool {
+    const char *s = getenv("MYLANG_JIT_LSRA");
+    return s && *s == '1';
+}();
+
 unsigned g_jit_xrot = []() -> unsigned {
     const char *s = getenv("MYLANG_JIT_XROT");
     return s ? static_cast<unsigned>(atoi(s)) : 0u;
@@ -11449,12 +11458,22 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
         std::sort(pcs.begin(), pcs.end());
         pcs.erase(std::unique(pcs.begin(), pcs.end()), pcs.end());
         const bool fl = q[k].uses_float > 0 || q[k].wrote_float;
+        /* ⛔ TYPE EVIDENCE: a GP pin's flush stamps the slot t_int (the
+         * C3 elision re-established), so admission requires an INT-OP
+         * touch - uses_int > 0, which inference proved. uses_ret is
+         * WEIGHT, never evidence: ReturnV reads ANY type, and a
+         * closure-holding slot admitted on its ReturnV alone was
+         * flushed as t_int over its t_func tag - cf(400) NotCallable +
+         * a leaked FuncObject (the m3 finding; the pick's >= 3
+         * threshold was silently carrying this rule, its own ReturnV
+         * comment says so). */
+        const bool evid = q[k].uses_int > 0;
         const auto piece = [&](uint32_t s, uint32_t e2, bool forced) {
             if (s >= e2)
                 return;
-            /* admit only a float-free piece with a USE inside - a
-             * stretch nothing reads gains nothing from a register */
-            const bool cand = !forced && !fl
+            /* admit only an int-evidenced, float-free piece with a USE
+             * inside - a stretch nothing reads gains nothing */
+            const bool cand = !forced && !fl && evid
                     && nu(s, l.slot) < static_cast<int>(e2 - s);
             out.pieces.push_back({ static_cast<int>(k), l.slot, s, e2,
                                    -1, forced || fl || !cand });
@@ -20571,6 +20590,80 @@ retry_emission:
                               max_pins + MAX_SPILL_HOMES,
                               &cache_barrier, &fhot, &hot_counts,
                               &textra, &textra_f, &fread_raw);
+        /* D3.b 2b-ii BRIDGE (the lsra lever, default OFF): the linear
+         * scan chooses the pin SET. The plan is reduced to WHOLE-RUN
+         * residency - a slot every piece of which is register-resident
+         * - because the emission downstream is still whole-run (one
+         * entry load, one register, every exit flushes); per-pc pieces
+         * reach emission only with the split machinery of the next
+         * increment. Soundness is the same contract as the pick's:
+         * all-pieces-resident means every touch in the run went
+         * through a cache-aware choke point (a non-cache-aware touch
+         * is a MemEvent, whose piece is forced memory). The threshold
+         * difference is deliberate - the scan admits any proven-used
+         * slot, the pick required >= 3 - and is profitability, not
+         * soundness. Any stage declining falls back to the pick's
+         * answer above. */
+        bool lsra_chose = false;
+        if (g_jit_lsra) {
+            SlotLiveness lsl;
+            std::vector<LiveInterval> liv;
+            std::vector<IntervalQual> lq;
+            std::vector<MemEvent> lev;
+            LsraOut lplan;
+            if (jit_slot_liveness(chunk, lsl)
+                    && jit_build_intervals(chunk, begin, end, lsl, liv)
+                    && jit_qualify_intervals(chunk, begin, end, liv, lq,
+                                             nullptr, &lev)
+                    && jit_lsra_assign(chunk, begin, end, liv, lq, lev,
+                                       static_cast<int>(
+                                           max_pins + MAX_SPILL_HOMES),
+                                       lplan)) {
+                std::map<int, char> res;   /* slot -> all resident? */
+                for (const LsraPiece &p : lplan.pieces) {
+                    auto it = res.emplace(p.slot, 1).first;
+                    if (p.reg < 0)
+                        it->second = 0;
+                }
+                std::map<int, long> w;     /* slot -> qual weight */
+                std::map<int, long> wint;  /* the TYPE EVIDENCE half */
+                for (size_t k2 = 0; k2 < liv.size(); k2++) {
+                    w[liv[k2].slot] += lq[k2].uses_int
+                                     + lq[k2].uses_ret;
+                    wint[liv[k2].slot] += lq[k2].uses_int;
+                }
+                std::vector<std::pair<long, int>> cnd;
+                for (const auto &kv : res)
+                    if (kv.second && kv.first >= 0
+                            && kv.first < chunk.slot_count
+                            /* uses_int > 0: the t_int flush needs an
+                             * int-op touch as evidence; a ReturnV-only
+                             * slot holds ANY type (the m3 finding) */
+                            && wint[kv.first] > 0)
+                        cnd.push_back({ w[kv.first], kv.first });
+                /* the pick's own order: weight desc, slot asc - so the
+                 * downstream split (registers first, spill homes past
+                 * max_pins) serves the heaviest first */
+                std::sort(cnd.begin(), cnd.end(),
+                          [](const std::pair<long, int> &a,
+                             const std::pair<long, int> &b) {
+                              return a.first != b.first
+                                         ? a.first > b.first
+                                         : a.second < b.second;
+                          });
+                hot.clear();
+                hot_counts.clear();
+                for (const auto &cd : cnd) {
+                    hot.push_back(cd.second);
+                    hot_counts.push_back(static_cast<int>(cd.first));
+                }
+                lsra_chose = true;
+            }
+        }
+        /* read only under TESTS (the execution-proof bump below) - a
+         * bare bool here is the cc1f50f -Wunused-but-set shape in a
+         * release build */
+        (void)lsra_chose;
         std::vector<int> spill_hot;
         if (hot.size() > max_pins) {
             spill_hot.assign(hot.begin() + max_pins, hot.end());
@@ -20831,6 +20924,11 @@ retry_emission:
             if (!e.scache.empty()) {
                 /* #96 inc-1: ditto for the spill homes */
                 e.bump_counter(&g_jit_scache);
+            }
+            if (lsra_chose && !hot.empty()) {
+                /* D3.b: the bridge's execution proof - this fragment
+                 * runs with an lsra-chosen pin set */
+                e.bump_counter(&g_jit_lsra_pins);
             }
         }
 #endif
