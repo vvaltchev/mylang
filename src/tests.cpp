@@ -25506,6 +25506,38 @@ static bool jit_lsra_check()
             continue;
         }
         any_ran = true;
+        /* property H (the split-worthiness floor, the 81 finding):
+         * an EVICTION's kept prefix carries >= 2 int touches, or the
+         * split was not worth its cost - a 1-use prefix costs the
+         * slot its whole-run HOME eligibility, and the remainder then
+         * pays frame traffic + a type stamp in the loop (81's +1
+         * instruction per iteration, +1.36%). An eviction split is a
+         * resident piece whose NON-forced memory successor of the
+         * same slot starts exactly at its end (a mem-CUT successor is
+         * forced and exempt - its flush is data-carrying). */
+        for (const LsraPiece &p : plan.pieces) {
+            if (p.reg < 0)
+                continue;
+            bool evict_split = false;
+            for (const LsraPiece &q2 : plan.pieces)
+                if (q2.slot == p.slot && q2.reg < 0
+                        && !q2.forced_mem && q2.start == p.end)
+                    evict_split = true;
+            if (!evict_split)
+                continue;
+            int inside = 0;
+            for (const MemEvent &u : iu)
+                if (u.slot == p.slot && u.pc >= p.start
+                        && u.pc < p.end)
+                    inside++;
+            if (inside < 2) {
+                printf("  lsra [%s]: eviction kept a %d-use prefix "
+                       "of slot %d [%u,%u) - below the split-"
+                       "worthiness floor\n", c.name, inside,
+                       p.slot, p.start, p.end);
+                ok = false;
+            }
+        }
         /* property G: a resident piece owns an int-op touch INSIDE
          * itself (the d1 finding - interval-level evidence crosses a
          * cut and pins a remainder holding a non-int) */
@@ -25655,24 +25687,38 @@ static bool jit_lsra_check()
              * Under evict-nearest z keeps the register across the
              * whole loop and this comparison flips - the watched
              * sabotage. */
-            if (picked.empty()) {
-                printf("  lsra [%s]: the pick chose nothing - the "
-                       "shape is not the one intended\n", c.name);
-                ok = false;
-            }
+            /* Restated (third formulation - each previous one
+             * conflated something): the discriminator between
+             * evict-furthest and evict-nearest is WHO HOLDS the one
+             * register across the loop. z (slot 0) is idle there -
+             * its uses all precede the loop - so the register must
+             * spend most of its residency on someone ELSE: the MAX
+             * residency over all slots must exceed z's. Under
+             * evict-nearest, arrivals with near uses keep losing and
+             * z holds the loop (z == max, fails); under furthest -
+             * with or without the split-worthiness floor - z's
+             * residency is a short prefix or zero. The picked-based
+             * and weight-based forms both broke: the pick's
+             * tie-breaks differ legitimately, and z's own pre-loop
+             * uses make it "hot" to a weight filter. */
             std::map<int, long> rl;
             for (const LsraPiece &p : plan.pieces)
                 if (p.reg >= 0)
                     rl[p.slot] += p.end - p.start;
-            long best_hot = 0;
-            for (const int s : picked)
-                if (rl.count(s) && rl[s] > best_hot)
-                    best_hot = rl[s];
+            long max_rl = 0;
+            for (const auto &kv : rl)
+                if (kv.second > max_rl)
+                    max_rl = kv.second;
             const long z_len = rl.count(0) ? rl[0] : 0;
-            if (best_hot <= z_len) {
-                printf("  lsra [%s]: idle z resident %ld pcs vs best "
-                       "hot %ld - the split landed on the wrong "
-                       "slot\n", c.name, z_len, best_hot);
+            if (max_rl == 0) {
+                printf("  lsra [%s]: nothing resident at K=1 - the "
+                       "shape is not the one intended\n", c.name);
+                ok = false;
+            }
+            if (max_rl <= z_len && max_rl > 0) {
+                printf("  lsra [%s]: idle z holds the register (%ld "
+                       "pcs, max %ld) - evict-furthest failed\n",
+                       c.name, z_len, max_rl);
                 ok = false;
             }
         }

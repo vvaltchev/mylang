@@ -11813,7 +11813,12 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
         const size_t li = active[far_i];
         const int freed = out.pieces[li].reg;
         const uint32_t here = p.start;
-        if (out.pieces[li].start < here) {
+        int kept_uses = 0;
+        for (const MemEvent &u : int_uses)
+            if (u.slot == out.pieces[li].slot
+                    && u.pc >= out.pieces[li].start && u.pc < here)
+                kept_uses++;
+        if (out.pieces[li].start < here && kept_uses >= 2) {
             LsraPiece rest = out.pieces[li];
             rest.start = here;
             rest.reg = -1;
