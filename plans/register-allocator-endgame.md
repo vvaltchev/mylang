@@ -682,16 +682,20 @@ cpp-bench re-timing. Bench-infra notes from this audit:
 78_typed_param_call failed to time in the recompute - both need
 a look (infrastructure first).
 
-⛔ NEXT, reordered by the audit:
- - task #99 (the two pre-D0 regressions) - the maintainer's
-   actual trend suspicion lives there, not in the D-arc;
- - the RTTI compile bill (~84%): propose the tag-dispatch
-   conversion of the hot pass chains to the maintainer as its
-   own item - it is compile-time, not codegen;
- - fix the two bench-infra breakages (28 py timeout, 78 timing);
- - then the 2b-iii-d remainder as before: 81's +1.24% (lever-
-   only, ships nothing), second chance, C2b regions, float twin,
-   the flip gate.]
+⛔ MAINTAINER DIRECTION (2026-08-23): #96 is PAUSED for the #99
+DETOUR; it resumes when #99 closes. Task #102 created for the
+RTTI compile bill (his call: "optimize the compilation step
+itself"). #99 progress lives in the TASK's own description
+(67_make_dict: attribution confirmed at 202f816, tier intact,
+~19-27 Ir/callback inside the unified entry - next is the
+builtin_make_dict diff and the argv-borrowing-overload-vs-
+accepted-trade decision; 09_fib: the #93-window -vdj diff not
+yet started). Bench-infra breakages to fix en route: 28's python
+timeout, 78's timing failure.
+ON RESUME (#96, 2b-iii-d remainder): 81's +1.24% (lever-only,
+ships nothing), second chance, C2b regions, float twin, arm 3 if
+exits stop flushing wholesale, the flip gate (D4 green AND the
+ledger pays).]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)
