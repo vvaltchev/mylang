@@ -21028,6 +21028,14 @@ retry_emission:
          * arm below; fhot replaced from them (never from the plan's
          * pieces - the 43_sieve idle-prefix lesson) */
         bool lsra_facts = false, lsra_f_chose = false;
+        /* F4b: FLOAT trans mode - per-pc xmm pieces through e.fcache.
+         * Same v1 bounds as GP tmode (no temps; hregs empty - the
+         * fresh-window cold-copy hazard). ABSTRACT until bound. */
+        bool lsra_f_tmode = false;
+        std::vector<LsraTrans> lsra_ftr;
+        std::vector<int> lsra_fentry;
+        std::vector<int> lsra_faregs;
+        std::vector<FltEvent> lfev;
         /* 2b-iii-b: TRANSITION MODE - the snapped plan's per-pc pieces
          * reach emission. The seam-application loop executes the
          * LsraTrans list, entry stubs replay it, exits and brackets
@@ -21055,7 +21063,8 @@ retry_emission:
             if (jit_slot_liveness(chunk, lsl)
                     && jit_build_intervals(chunk, begin, end, lsl, liv)
                     && jit_qualify_intervals(chunk, begin, end, liv, lq,
-                                             nullptr, &lev, &liu)
+                                             nullptr, &lev, &liu,
+                                             &lfev)
                     && hregs.empty() && !jit_lever_off(JL_CACHE)) {
                 lsra_facts = true;       /* F4a: liv/lq are valid */
                 LsraOut tp;
@@ -21180,7 +21189,8 @@ retry_emission:
                     && jit_slot_liveness(chunk, lsl)
                     && jit_build_intervals(chunk, begin, end, lsl, liv)
                     && jit_qualify_intervals(chunk, begin, end, liv, lq,
-                                             nullptr, &lev, &liu)) {
+                                             nullptr, &lev, &liu,
+                                             &lfev)) {
                 lsra_facts = true;       /* F4a: liv/lq are valid */
                 /* the WHOLE-RUN fallback is the pick's contract
                  * restated on the interval facts - NOT a detour
@@ -21280,6 +21290,75 @@ retry_emission:
                     for (const int h2 : fhot)
                         fprintf(stderr, "LSRADBG fr[%zu,%zu) fhot "
                                 "slot %d\n", begin, end, h2);
+                /* F4b: FLOAT TRANS MODE - the F2/F3 machinery becomes
+                 * an emission consumer. On success fhot becomes the
+                 * ENTRY-OCCUPANT list in abstract-reg order (the
+                 * physical zip below maps areg r to the r'th ftake);
+                 * on any decline the F4a facts fhot above stands. */
+                if (hregs.empty()) {
+                    LsraOut fp;
+                    std::vector<int> fentry;
+                    std::vector<LsraTrans> ftr;
+                    if (jit_lsra_assign(chunk, begin, end, liv, lq,
+                                        lev, liu,
+                                        static_cast<int>(MAX_FCACHED),
+                                        fp, &lfev)) {
+                        for (LsraPiece &p : fp.pieces)
+                            if (p.slot >= chunk.slot_count)
+                                p.reg = -1;      /* v1: no temps */
+                        if (jit_lsra_snap(chunk, begin, end, liv, lq,
+                                          liu,
+                                          static_cast<int>(MAX_FCACHED),
+                                          fp.pieces, fentry, ftr,
+                                          &lfev)) {
+                            fhot.clear();
+                            for (size_t r = 0; r < fentry.size(); r++)
+                                if (fentry[r] >= 0)
+                                    fhot.push_back(fentry[r]);
+                            for (const LsraPiece &p : fp.pieces)
+                                if (p.reg >= 0)
+                                    lsra_faregs.push_back(p.reg);
+                            std::sort(lsra_faregs.begin(),
+                                      lsra_faregs.end());
+                            lsra_faregs.erase(
+                                std::unique(lsra_faregs.begin(),
+                                            lsra_faregs.end()),
+                                lsra_faregs.end());
+                            lsra_ftr.swap(ftr);
+                            lsra_fentry.swap(fentry);
+                            lsra_f_tmode = true;
+                            /* one machinery per slot: a transitioned
+                             * slot leaves the float type-elision and
+                             * read-elision extras */
+                            if (!lsra_ftr.empty()) {
+                                const auto hit2 = [&](int s) {
+                                    for (const LsraTrans &t2 : lsra_ftr)
+                                        if (t2.evict_slot == s
+                                                || t2.install_slot == s)
+                                            return true;
+                                    return false;
+                                };
+                                std::vector<int> tx;
+                                for (const int s : textra_f)
+                                    if (!hit2(s))
+                                        tx.push_back(s);
+                                textra_f.swap(tx);
+                                tx.clear();
+                                for (const int s : fread_raw)
+                                    if (!hit2(s))
+                                        tx.push_back(s);
+                                fread_raw.swap(tx);
+                            }
+                            if (getenv("MYLANG_LSRADBG"))
+                                for (const LsraTrans &t2 : lsra_ftr)
+                                    fprintf(stderr, "LSRADBG   ftrans "
+                                            "pc %u areg %d evict %d "
+                                            "install %d\n", t2.pc,
+                                            t2.reg, t2.evict_slot,
+                                            t2.install_slot);
+                        }
+                    }
+                }
             }
         }
         /* read only under TESTS (the execution-proof bump below) - a
@@ -21677,6 +21756,64 @@ retry_emission:
             }
         }
 #endif
+        /* F4b: bind the float plan's abstract registers - entry
+         * occupants took the fhot loop's ftake results in areg order;
+         * occupant-less aregs fix their identity here and give the
+         * register straight back (busy <=> entry per pc: each install
+         * ftake_fixed's it at its own pc, each flush fgives it).
+         * xmm is caller-saved, so no push bookkeeping. An areg the
+         * pool cannot serve is DROPPED pair-consistently (its lists
+         * are install-first), its slot staying in memory. */
+        std::vector<uint8_t> afphys;
+        if (lsra_f_tmode) {
+            afphys.assign(MAX_FCACHED, 0xFF);
+            size_t h2 = 0;
+            for (size_t r = 0; r < lsra_fentry.size(); r++)
+                if (lsra_fentry[r] >= 0) {
+                    ML_CHECK(h2 < e.fcache.size());
+                    afphys[r] = e.fcache[h2++].reg;
+                }
+            ML_CHECK(h2 == e.fcache.size());
+            /* TWO loops, deliberately (the GP aphys structure): take
+             * every occupant-less areg's register FIRST, then give
+             * them back - an fgive inside the take loop hands the
+             * SAME physical register to the next areg (both bound to
+             * xmm4; watched aborting `c.slot == tr.evict_slot` on
+             * 01_float_chain_ref_temp). */
+            for (const int ar : lsra_faregs) {
+                if (afphys[static_cast<size_t>(ar)] != 0xFF)
+                    continue;
+                const int xr = e.ftake_reg(FCACHE_REGS, MAX_FCACHED);
+                if (xr < 0)
+                    continue;            /* drop: stays memory */
+                afphys[static_cast<size_t>(ar)] =
+                    static_cast<uint8_t>(xr);
+            }
+            for (const int ar : lsra_faregs) {
+                if (afphys[static_cast<size_t>(ar)] == 0xFF)
+                    continue;
+                bool is_entry = false;
+                if (static_cast<size_t>(ar) < lsra_fentry.size()
+                        && lsra_fentry[ar] >= 0)
+                    is_entry = true;
+                if (!is_entry)
+                    e.ra.fgive(afphys[static_cast<size_t>(ar)]);
+            }
+            std::vector<LsraTrans> fbound;
+            for (const LsraTrans &tr2 : lsra_ftr) {
+                if (afphys[static_cast<size_t>(tr2.reg)] == 0xFF)
+                    continue;
+                LsraTrans b2 = tr2;
+                b2.reg = afphys[static_cast<size_t>(tr2.reg)];
+                fbound.push_back(b2);
+            }
+            lsra_ftr.swap(fbound);
+        }
+        /* F4b: the stubs replay the FLOAT cache as of their pc from
+         * this base - e.fcache at stub-emission time is the
+         * post-all-transitions FINAL state (the inc-2 lesson, on the
+         * float file) */
+        const std::vector<Emitter::CacheEnt> base_fcache = e.fcache;
         /* C4b: the float LITERAL pool - materialised once here (and at
          * every entry stub, below) instead of at each use. */
         e.flits = pick_float_lits(chunk, begin, end);
@@ -22168,6 +22305,7 @@ retry_emission:
         bool hoist_pair_claimed = false;
         size_t si = 0;                        /* #96 inc-2: next seam */
         size_t lt = 0;                        /* 2b-iii-b: next trans */
+        size_t flt = 0;                       /* F4b: next FLOAT trans */
         std::map<size_t, size_t> seam_pre;    /* seam pc -> pre position */
         /*
          * D4 VALIDATOR ARM 2 - LABEL IN-EDGE AGREEMENT, the machine
@@ -22420,6 +22558,46 @@ retry_emission:
                 e.bump_counter(&g_jit_lsra_trans);
 #endif
             }
+            /* F4b: the FLOAT transitions - same pattern on e.fcache
+             * (fstore + t_float tag at an interior-end flush, fload
+             * at an install; fgive/ftake_fixed keep busy <=> entry
+             * per pc). run_has_float holds in any fragment with
+             * float pieces, so the tag is materialisable exactly as
+             * at a barrier flush. */
+            while (flt < lsra_ftr.size() && lsra_ftr[flt].pc == pc) {
+                const LsraTrans &tr = lsra_ftr[flt++];
+                if (!pre_sig.count(pc))
+                    pre_sig[pc] = cache_sig();
+                if (!seam_pre.count(pc))
+                    seam_pre[pc] = e.pos();
+                Emitter::PinMach pm(e);
+                if (tr.evict_slot >= 0) {
+                    for (size_t ci = 0; ci < e.fcache.size(); ci++) {
+                        Emitter::CacheEnt &c = e.fcache[ci];
+                        if (c.reg != static_cast<uint8_t>(tr.reg))
+                            continue;
+                        ML_CHECK(c.slot == tr.evict_slot);
+                        e.store_type_tag(c.type, jit_layout().t_float);
+                        e.fstore(c.reg, c.payload);
+                        e.fcache.erase(e.fcache.begin()
+                                       + static_cast<long>(ci));
+                        e.ra.fgive(static_cast<uint8_t>(tr.reg));
+                        break;
+                    }
+                }
+                if (tr.install_slot >= 0
+                        && e.ra.ftake_fixed(
+                               static_cast<uint8_t>(tr.reg))) {
+                    const SlotAddr na = slot_addr(tr.install_slot);
+                    e.fcache.push_back({ tr.install_slot, na.payload,
+                                         na.type,
+                                         static_cast<uint8_t>(tr.reg) });
+                    e.fload(static_cast<uint8_t>(tr.reg), na.payload);
+                }
+#ifdef TESTS
+                e.bump_counter(&g_jit_lsra_trans);
+#endif
+            }
             label[pc - begin] = e.pos();
             lbl_sig[pc - begin] = cache_sig();
             e.released = rel_active[pc - begin];
@@ -22638,7 +22816,32 @@ retry_emission:
                                                  * assignment, not the
                                                  * positional
                                                  * CACHE_REGS[h] */
-                for (const Emitter::CacheEnt &c : e.fcache)
+                /* F4b: the FLOAT cache as of this entry - replayed
+                 * from base_fcache + the transitions at or before it
+                 * (e.fcache here is the post-all-transitions FINAL
+                 * state, the inc-2 lesson; with no float transitions
+                 * this degenerates to the old run-constant loop) */
+                std::vector<Emitter::CacheEnt> st_f = base_fcache;
+                for (const LsraTrans &tr : lsra_ftr) {
+                    if (tr.pc > pe.first)
+                        break;
+                    if (tr.evict_slot >= 0)
+                        for (size_t ci = 0; ci < st_f.size(); ci++)
+                            if (st_f[ci].reg
+                                    == static_cast<uint8_t>(tr.reg)) {
+                                st_f.erase(st_f.begin()
+                                    + static_cast<long>(ci));
+                                break;
+                            }
+                    if (tr.install_slot >= 0) {
+                        const SlotAddr na = slot_addr(tr.install_slot);
+                        st_f.push_back({ tr.install_slot, na.payload,
+                                         na.type,
+                                         static_cast<uint8_t>(
+                                             tr.reg) });
+                    }
+                }
+                for (const Emitter::CacheEnt &c : st_f)
                     e.fload(c.reg, c.payload);    /* C2a float pins */
             }
             for (const Emitter::FLit &fl : e.flits)

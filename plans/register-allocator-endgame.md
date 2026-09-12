@@ -845,12 +845,27 @@ THE F-LADDER (mirror of the int increments, same lever):
      vdjcmp needs counters compiled out). Default 116/116.
      g_jit_lsra_fpins execution proof, WATCHED via the bridge
      check (skip the replacement -> counter flat).
- F4b. NOT BUILT: trans mode installs per-pc xmm pieces through
-     e.fcache (seam arms emit fload/fstore + t_float tag stores;
-     entry stubs replay; helper-call brackets and reload_cache
-     already handle e.fcache by register STATE, so per-pc pieces
-     ride them for free). This is where the F2/F3 float scan+snap
-     become emission consumers.
+ F4b. CORE LANDED 2026-08-24: float trans mode - per-pc xmm
+     pieces execute through e.fcache. The bridge runs the F2/F3
+     scan+snap (fev mode, same v1 bounds: no temps, hregs empty;
+     a transitioned slot leaves textra_f AND fread_raw - one
+     machinery per slot); fhot becomes the entry-occupant list;
+     afphys binds abstract regs to FCACHE_REGS (⛔ TWO loops -
+     take all, THEN give back the occupant-less: an fgive inside
+     the take loop handed the SAME xmm to the next areg, watched
+     aborting `c.slot == tr.evict_slot` on 01_float_chain);
+     seam arms fstore+t_float-tag / fload with fgive/ftake_fixed
+     per pc; entry stubs replay base_fcache + transitions (the
+     inc-2 final-state lesson, float file). Verified: -rt +
+     corpus both configs, off-arena lever config, default vdjcmp
+     116/116. Real float transitions execute on the corpus
+     (01_float_chain: install@9/11, evict@22/28 across 2 runs).
+     ⛔ STILL TO DO in F4b: a FLOAT-specific transition execution
+     counter + its watched sabotage (g_jit_lsra_trans conflates
+     the pools); a bridge-check float-handoff case; the lever-on
+     parity vdjcmp (expect DIFFERENCES now - the whole point -
+     so the oracle is corpus_diff + per-iteration Ir, not byte
+     identity); then F5 measurement.
  F5. measure: the float benches (04, 46, 54, 55, 79_dyn_float,
      88) per-iteration, then the FULL 88-bench sweep (-npc, the
      parallel harness) - the flatness mandate applies unchanged.]
