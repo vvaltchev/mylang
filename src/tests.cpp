@@ -25820,6 +25820,234 @@ static bool jit_lsra_check()
 }
 
 /*
+ * F2 (the float/xmm twin): THE SCAN IN FLOAT MODE - jit_lsra_assign
+ * with a FltEvent stream allocates the xmm pool. Properties, each
+ * recomputed independently from a fresh stream:
+ *   FI1 TILING   - the pieces of every interval cover it exactly;
+ *   FG  EVIDENCE - every resident piece holds a float WRITE with no
+ *        read at a strictly earlier pc (the promote-arm rule: a usef
+ *        READ is not type evidence - a float op legitimately reads a
+ *        definitely-int slot, and the entry movsd would reinterpret
+ *        its int payload as a double; a same-pc read+write pair is
+ *        one dst touch, admissible). WATCHED: accepting read-first
+ *        residency fails here;
+ *   FD  DISQ     - no resident piece of an interval with a countable
+ *        int use (uses_ret exempt - the disjoint-pools rule);
+ *   FF2 FLOOR    - no resident piece of a slot under the run-wide
+ *        >= 3 read-weight floor (pick parity). WATCHED.
+ * Vacuity: a resident float piece must occur; the READ-FIRST refusal
+ * must occur (case 6's f: a DictStore key bad() CUTS its interval
+ * after the LoadImmFloat def - which IS a float write, so an uncut
+ * accumulator is write-first from its def and case 2's f stays
+ * legitimately resident - and the post-cut piece reads f for g
+ * before f's own write); the PROMOTE shape must occur (case 4's x -
+ * float-read, int-used, never resident); a SUB-FLOOR slot must
+ * occur (a 1-touch temp or case 5's h).
+ */
+static bool jit_lsra_float_check()
+{
+#if ML_JIT_SUPPORTED
+    struct Case { const char *name; int K; std::string src; };
+    const Case cases[] = {
+        { "hot float loop", 4,
+          "var f = 0.0; var n = 0; n = n + runtime(30);\n"
+          "for (var i = 0; i < n; i++) f = f + 0.5;\n"
+          "print(f);\n" },
+        /* g is write-first at its dst touch (resident); f is READ for
+         * g at a pc STRICTLY BEFORE its own write in the loop body -
+         * conservative v1 refuses it (recorded opportunity) */
+        { "read-first float refused", 4,
+          "func fs(int n) {\n"
+          "    var f = 0.0; var g = 0.0;\n"
+          "    for (var i = 0; i < n; i++) { g = g + f; f = f + 0.5; }\n"
+          "    return f + g;\n"
+          "}\n"
+          "print(fs(runtime(40)));\n" },
+        { "int loop off the float pool", 4,
+          "var a = 0; var n = 0; n = n + runtime(50);\n"
+          "for (var i = 0; i < n; i++) a = a + i;\n"
+          "print(a);\n" },
+        /* the promote-arm shape: x is int-written, float-READ */
+        { "promote-arm int slot refused", 4,
+          "var x = 0; var n = 0; n = n + runtime(30); x = x + 3;\n"
+          "var f = 0.0;\n"
+          "for (var i = 0; i < n; i++) f = f + x;\n"
+          "print(f);\n" },
+        { "sub-floor float slot stays memory", 4,
+          "var h = 0.0; var n = 0; n = n + runtime(5);\n"
+          "h = h + 0.5;\n"
+          "print(h + n);\n" },
+        /* the READ-FIRST shape: the dict store's key bad() cuts f
+         * after its float def, and the post-cut piece reads f (for
+         * g) at a pc strictly before f's own write - conservative
+         * v1 refuses that piece (recorded opportunity) */
+        { "post-cut read-first refused", 4,
+          "var dd = {};\n"
+          "var f = 0.0; var g = 0.0; var n = 0; n = n + runtime(20);\n"
+          "dd[f] = 1;\n"
+          "for (var i = 0; i < n; i++) { g = g + f; f = f + 0.5; }\n"
+          "print(g + len(dd));\n" },
+    };
+    bool ok = true, saw_res = false, saw_readfirst = false;
+    bool saw_promote = false, saw_subfloor = false;
+    for (const Case &c : cases) {
+        std::vector<Tok> toks;
+        lexer(c.src, 1, toks);
+        ParseContext pctx(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pctx);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        std::vector<const Chunk *> chunks;
+        chunks.push_back(&prog.root);
+        for (const auto &fd : prog.funcs)
+            if (fd->vm_chunk)
+                chunks.push_back(static_cast<const Chunk *>(fd->vm_chunk));
+        bool any_ran = false;
+        for (const Chunk *ckp : chunks) {
+        const Chunk &ck = *ckp;
+        SlotLiveness sl;
+        std::vector<LiveInterval> iv;
+        std::vector<IntervalQual> q;
+        std::vector<MemEvent> ev, iu;
+        std::vector<FltEvent> fev;
+        int orphans = -1;
+        LsraOut plan;
+        if (!jit_slot_liveness(ck, sl)
+                || !jit_build_intervals(ck, 0, ck.code.size(), sl, iv)
+                || !jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
+                                          &orphans, &ev, &iu, &fev)
+                || !jit_lsra_assign(ck, 0, ck.code.size(), iv, q, ev,
+                                    iu, c.K, plan, &fev)) {
+            continue;                    /* an unanalyzable chunk */
+        }
+        any_ran = true;
+        /* FI1: tiling per interval */
+        for (size_t k = 0; k < iv.size(); k++) {
+            std::vector<const LsraPiece *> ps;
+            for (const LsraPiece &p : plan.pieces)
+                if (p.iv_idx == static_cast<int>(k))
+                    ps.push_back(&p);
+            std::sort(ps.begin(), ps.end(),
+                      [](const LsraPiece *x, const LsraPiece *y) {
+                          return x->start < y->start;
+                      });
+            uint32_t at = iv[k].start;
+            bool tiled = true;
+            for (const LsraPiece *p : ps) {
+                if (p->start != at) { tiled = false; break; }
+                at = p->end;
+            }
+            if (!tiled || at != iv[k].end) {
+                printf("  lsra-f [%s]: interval slot %d [%u,%u) not "
+                       "tiled\n", c.name, iv[k].slot, iv[k].start,
+                       iv[k].end);
+                ok = false;
+            }
+        }
+        for (const LsraPiece &p : plan.pieces) {
+            if (p.reg < 0)
+                continue;
+            saw_res = true;
+            /* FG: write-first evidence, recomputed */
+            uint32_t fw = UINT32_MAX, fr = UINT32_MAX;
+            for (const FltEvent &e : fev)
+                if (e.slot == p.slot && e.pc >= p.start
+                        && e.pc < p.end) {
+                    if (e.kind == FltEvent::write && e.pc < fw)
+                        fw = e.pc;
+                    if (e.kind == FltEvent::read && e.pc < fr)
+                        fr = e.pc;
+                }
+            if (fw == UINT32_MAX || fr < fw) {
+                printf("  lsra-f [%s]: resident slot %d [%u,%u) has "
+                       "no write-first evidence (fw=%u fr=%u)\n",
+                       c.name, p.slot, p.start, p.end, fw, fr);
+                ok = false;
+            }
+            /* FD: the disjoint-pools rule */
+            if (q[p.iv_idx].uses_int > 0) {
+                printf("  lsra-f [%s]: resident slot %d [%u,%u) on an "
+                       "int-used interval (uses_int=%d)\n", c.name,
+                       p.slot, p.start, p.end, q[p.iv_idx].uses_int);
+                ok = false;
+            }
+            /* FF2: the admission floor */
+            long w = 0;
+            for (const FltEvent &e : fev)
+                if (e.slot == p.slot && e.kind == FltEvent::read)
+                    w++;
+            if (w < 3) {
+                printf("  lsra-f [%s]: slot %d resident with run-wide "
+                       "float weight %ld < 3\n", c.name, p.slot, w);
+                ok = false;
+            }
+        }
+        /* READ-FIRST is a PER-PIECE refusal (an interval's early def
+         * write hides it at interval granularity - f's pc-1 def made
+         * interval-level fw <= fr while the post-cut piece is
+         * genuinely read-first), so detect it over refused pieces */
+        for (const LsraPiece &p : plan.pieces) {
+            if (p.reg >= 0)
+                continue;
+            uint32_t fw = UINT32_MAX, fr = UINT32_MAX;
+            for (const FltEvent &e : fev)
+                if (e.slot == p.slot && e.pc >= p.start
+                        && e.pc < p.end) {
+                    if (e.kind == FltEvent::write && e.pc < fw)
+                        fw = e.pc;
+                    if (e.kind == FltEvent::read && e.pc < fr)
+                        fr = e.pc;
+                }
+            if (fw != UINT32_MAX && fr < fw)
+                saw_readfirst = true;
+        }
+        /* the vacuity shapes: a refused slot of each refusal kind */
+        for (size_t k = 0; k < iv.size(); k++) {
+            bool res = false;
+            for (const LsraPiece &p : plan.pieces)
+                if (p.iv_idx == static_cast<int>(k) && p.reg >= 0)
+                    res = true;
+            if (res)
+                continue;
+            uint32_t fw = UINT32_MAX, fr = UINT32_MAX;
+            long w = 0;
+            for (const FltEvent &e : fev)
+                if (e.slot == iv[k].slot && e.pc >= iv[k].start
+                        && e.pc < iv[k].end) {
+                    if (e.kind == FltEvent::write && e.pc < fw)
+                        fw = e.pc;
+                    if (e.kind == FltEvent::read && e.pc < fr) 
+                        fr = e.pc;
+                    if (e.kind == FltEvent::read)
+                        w++;
+                }
+            (void)fw; (void)fr;
+            if (q[k].uses_int > 0 && q[k].uses_float > 0)
+                saw_promote = true;
+            if (fw != UINT32_MAX && fr >= fw && w > 0 && w < 3)
+                saw_subfloor = true;
+        }
+        }                                /* chunks */
+        if (!any_ran) {
+            printf("  lsra-f [%s]: no chunk was analyzable\n", c.name);
+            ok = false;
+        }
+    }
+    if (!saw_res || !saw_readfirst || !saw_promote || !saw_subfloor) {
+        printf("  lsra-f: a shape never occurred (res=%d readfirst=%d "
+               "promote=%d subfloor=%d) - vacuous\n", saw_res,
+               saw_readfirst, saw_promote, saw_subfloor);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * D3.b step 2b-iii-a: the SNAP to linearization points, checked by
  * REPLAY. jit_lsra_snap translates the plan into entry state +
  * transitions the seam-application pattern can execute; this net
@@ -35199,6 +35427,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },
+    { "jit: F2 - the scan in FLOAT mode (write-first evidence, "
+      "disjoint pools, the admission floor)",
+      jit_lsra_float_check },
     { "jit: D3.b - the lsra lever BRIDGE: the scan's whole-run pin "
       "set runs end to end, execution-proven (step 2b-ii opening)",
       jit_lsra_bridge_check },

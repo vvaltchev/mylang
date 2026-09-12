@@ -8506,3 +8506,41 @@ compile-side band. Sweep hygiene rule re-learned: an ad-hoc
 callgrind sweep BYPASSES bench/run.py and so must pass -npc
 itself - the first sweep did not and was discarded (09_fib's
 4,820 Ir/2sc per-iteration denominator was the tell).
+
+## Endgame F1+F2 (2026-08-24) - THE FLOAT/XMM TWIN's analysis half:
+## the FltEvent stream and the scan's FLOAT mode
+
+Pure analysis, no emission change (the bridge still leaves fhot to
+the pick in both modes; F4 is the consumer). F1: jit_qualify_
+intervals exports a FltEvent {pc, slot, read|write|mem} stream,
+self-contained for cutting (mem entries from bad() AND badf(); a
+badi() must never cut the float side). F2: jit_lsra_assign's
+trailing `fev` param flips the pool - cuts, evidence, the >= 3
+admission floor and the split-worthiness count all derive from the
+stream; an interval with any countable int use is disqualified
+(uses_ret exempt).
+
+⛔ THE EVIDENCE ASYMMETRY, the one real rule difference vs the int
+side: a usef READ is not float type evidence - a float op
+legitimately reads a definitely-int slot through the promote arm,
+and a float entry-load movsd would reinterpret its int payload as
+a double. Per-piece admission is therefore WRITE-FIRST: a float
+write must exist with no read at a strictly earlier pc (a same-pc
+read+write pair is one dst touch, admissible).
+
+Findings: LoadImmFloat is a float WRITE (usef+fdst, badi only), so
+an uncut float accumulator is write-first FROM ITS DEF and stays
+resident - the conservative refusal only bites a slot whose
+interval a float-side cut (a DictStore key, a MoveV dest) splits
+between its def and a read-before-write region. A badf-ONLY site
+does not exist today (every visitor badf() pairs with a bad()), so
+badf's own event push is documented DEFENSIVE. And a read-first
+VACUITY detector must run per PIECE - an interval's early def
+write hides the shape at interval granularity.
+
+Nets: property E-float (stream reconciles with the per-interval
+facts; WATCHED - mislabeling a read as a write fails), and
+jit_lsra_float_check (FI1 tiling, FG write-first, FD disjoint
+pools, FF2 floor; WATCHED both ways - accepting read-first names
+the piece, inflating the floor weights names the slots; four
+vacuity-guarded refusal shapes).

@@ -417,12 +417,25 @@ struct LsraOut {
     int cuts = 0;            /* extra pieces made by event cutting */
     int evictions = 0;       /* pressure splits (the second chance) */
 };
+/* FLOAT MODE (F2, the xmm twin): pass `fev` non-null and the scan
+ * allocates the FLOAT pool instead - cuts, evidence, the admission
+ * floor and the split-worthiness count all derive from the FltEvent
+ * stream (`mem` and `int_uses` are ignored; pass empty). The three
+ * rule flips vs GP: an interval with ANY countable int use is
+ * disqualified (uses_ret exempt - the emit flushes before jit_ret);
+ * cut pcs come from FltEvent::mem entries (bad() + badf() - a
+ * badi() must NOT cut this side); and ⛔ per-piece evidence is a
+ * float WRITE with NO READ AT A STRICTLY EARLIER PC in the piece -
+ * a read is not type evidence (the promote arm reads int slots),
+ * and a same-pc read+write pair is one dst touch, admissible. The
+ * floor counts read-kind events (== the pick's use_f weight). */
 bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<LiveInterval> &iv,
                      const std::vector<IntervalQual> &q,
                      const std::vector<MemEvent> &mem,
                      const std::vector<MemEvent> &int_uses,
-                     int K, LsraOut &out);
+                     int K, LsraOut &out,
+                     const std::vector<FltEvent> *fev = nullptr);
 
 /*
  * D3.b step 2b-iii-a (plans/register-allocator-endgame.md): SNAP the
