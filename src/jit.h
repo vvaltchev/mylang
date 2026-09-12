@@ -392,6 +392,57 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<IntervalQual> &q,
                      const std::vector<MemEvent> &mem,
                      int K, LsraOut &out);
+
+/*
+ * D3.b step 2b-iii-a (plans/register-allocator-endgame.md): SNAP the
+ * plan to the run's LINEARIZATION POINTS and translate it into the
+ * seam vocabulary the emitter already executes (#96 inc-2's
+ * ShareSeam, generalized).
+ *
+ * The executable condition comes from the share plan's soundness note,
+ * which REFUTED per-edge reasoning about intervals: a register-state
+ * transition may only sit at a pc NO branch edge crosses in either
+ * direction (an edge TARGETING the pc is legal - the emitter's
+ * seam_pre patching sends pre-transition sources before it and
+ * post-transition sources past it, which is exactly how a loop-head
+ * install becomes the loop-carried pin). A resident piece whose
+ * interior START, or whose interior MEM-CUT end (the flush the event
+ * pc demands), cannot sit on such a pc is DEMOTED to memory -
+ * demotion only, never a new resident pc.
+ *
+ * A piece end needs a FLUSH transition exactly when the INTERVAL
+ * CONTINUES past it (p.end < iv[p.iv_idx].end) - a mem-cut or an
+ * eviction-split remainder reads the slot from memory right after,
+ * so the register's value must land there on every path. A DEATH or
+ * HOLE end (p.end == the interval's end) emits nothing: the register
+ * is dropped silently in the model - the stale memory is unread
+ * (liveness), and a silent drop needs no linearization point. The
+ * drop must happen by the slot's next DEF (a later flush would
+ * clobber it), which dropping AT the death end guarantees; installs
+ * therefore never evict - every flush is a continuation-end's.
+ *
+ * Replaying `entry_by_reg` + `trans` in pc order MUST reproduce the
+ * (post-demotion) pieces' residency at every pc - the -rt net derives
+ * that replay independently. Registers are still the plan's abstract
+ * indices.
+ */
+struct LsraTrans {
+    uint32_t pc;             /* a linearization point in [begin, end) */
+    int reg;                 /* abstract register index */
+    int evict_slot;          /* occupant flushed here, or -1 */
+    int install_slot;        /* new occupant loaded here, or -1 */
+};
+/* The run's non-sequential branch edges (fall-through excluded) -
+ * the ONE edge scan, shared by the share plan, the snap, and the
+ * snap's -rt net (which re-derives only the CROSSING rule from the
+ * spec; a second edge scan would drift). */
+void jit_run_edges(const Chunk &ck, size_t begin, size_t end,
+                   std::vector<std::pair<int, int>> &edges);
+bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
+                   const std::vector<LiveInterval> &iv, int K,
+                   std::vector<LsraPiece> &pieces,
+                   std::vector<int> &entry_by_reg,
+                   std::vector<LsraTrans> &trans);
 #ifdef TESTS
 /* Test-only export of the (static) pick - the D3 qualification check
  * asserts per-interval facts against the pick's public answer. */

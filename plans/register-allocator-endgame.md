@@ -520,19 +520,36 @@ Verified: 2x2 lever-x-arena -rt matrix, corpus both states +
 off-arena, vdjcmp 116/116 both arenas for the DEFAULT config,
 rel-t both states, clang lto0, non-JIT, census.
 
-⛔ NEXT: D3.b step 2b-iii - PER-PC EMISSION behind the lever:
-serve reg_at/spill_at (the D2 seam) from the plan's pieces at
-cur_pc; entry loads at piece starts, split stores at piece ends,
-label resolution v1 (canonical per-label assignment + in-edge
-fixup moves; the loop head is the critical case), exit flushes
-from the per-pc map; the physical binding (pool order,
-callee/caller-saved cost, gp_weight seed, rax ISA facts in the
-model). Validator arms 2/3 land WITH it. Oracle = the full net
-(the 2x2 matrix above, corpus matrices, fuzzers, Net 2/3) + the
-D0 Ir ledger A/B. ⛔ FRESH-WINDOW JOB: this is the deepest
-emission surgery of the endgame - flush_cache / snapshot /
-restore / brackets / entry stubs all restate their contracts
-per-pc.]
+2b-iii-a LANDED 2026-08-23: jit_lsra_snap - the plan translated
+into the SEAM VOCABULARY (#96 inc-2's pattern, generalized):
+entry state + LsraTrans transitions at LINEARIZATION POINTS (the
+share plan's own soundness note refuted the marker's earlier
+"in-edge fixup moves" sketch - a transition may only sit at a pc
+no edge crosses; targeting is legal, which makes a loop-head
+install the loop-carried pin). THE CONTINUATION RULE: a piece end
+flushes iff the interval continues (mem-cut or split remainder);
+death/hole ends drop silently (no lin point needed, and
+drop-at-death protects the slot's next def) - so installs never
+evict. jit_run_edges/jit_lin_point are the ONE shared edge scan +
+crossing test (share plan + snap + net). Net: S1 lin-only, S2
+replay==coverage, S2b every continuation end owns its flush
+(replay alone cannot see a dropped flush), S3 demotion-only, S4
+in-loop events demote; watched failing three ways. Share-plan
+refactor byte-identical (vdjcmp 116/116 both arenas).
+
+⛔ NEXT: 2b-iii-b - EMISSION behind the lever, in the seam
+pattern: generalize the seam-application loop (jit.cpp ~21600) to
+LsraTrans - evict-only and install-only arms beside ShareSeam's
+evict+install; entry stubs install the replayed state AS OF their
+pc (the existing base+seams rebuild, driven from entry_by_reg +
+trans); exits flush the replayed state at their pc (the
+exit_states machinery); brackets spill/reload the residents at
+cur_pc (assignment-agnostic already). Physical binding: abstract
+reg index -> the pool order (CACHE_REGS then xcache), denied
+masks respected. Validator arm 2 (label in-edge agreement) lands
+WITH it. Oracle = the full net + the D0 Ir ledger A/B. Still
+behind MYLANG_JIT_LSRA=1; the default flips only when D4 is green
+AND the ledger pays.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)

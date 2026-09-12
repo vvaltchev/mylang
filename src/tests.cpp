@@ -25680,6 +25680,192 @@ static bool jit_lsra_check()
 }
 
 /*
+ * D3.b step 2b-iii-a: the SNAP to linearization points, checked by
+ * REPLAY. jit_lsra_snap translates the plan into entry state +
+ * transitions the seam-application pattern can execute; this net
+ * derives the replay independently and pins:
+ *   S1 every transition pc is a linearization point (recomputed from
+ *      the spec definition - no edge crosses it, targeting is legal);
+ *   S2 REPLAY => COVERAGE: playing entry + transitions in pc order,
+ *      wherever a (post-demotion) resident piece covers (slot, pc)
+ *      the model's register holds exactly that slot - and at a piece
+ *      with NO coverage the register holds it only as a dead-or-
+ *      continuation hold, never past the slot's next resident piece;
+ *   S3 DEMOTION ONLY: snap never makes a memory piece resident;
+ *   S4 the in-loop-event case demotes (a DictStore inside the loop
+ *      body puts every boundary on a non-lin pc);
+ *   vacuity: a mid-run INSTALL and a continuation FLUSH observed.
+ */
+static bool jit_lsra_snap_check()
+{
+#if ML_JIT_SUPPORTED
+    struct Case { const char *name; int K; std::string src; };
+    const Case cases[] = {
+        /* two sequential phases at K=1: z's piece, then a's install
+         * at a straight-line pc - the mid-run install shape */
+        { "phase handoff install", 1,
+          "var z = 0; z = z + runtime(5);\n"
+          "var a = 0; var n = 0; n = n + runtime(50);\n"
+          "for (var i = 0; i < n; i++) a = a + i;\n"
+          "print(z + a);\n" },
+        /* the payoff program: s's clean piece ends at the DictStore
+         * cut - the continuation FLUSH shape */
+        { "cut flush", 4,
+          "var s = 0; var n = 0; n = n + runtime(40);\n"
+          "for (var i = 0; i < n; i++) s = s + i;\n"
+          "var u = s * 2;\n"
+          "var d = {};\n"
+          "s = 0;\n"
+          "d[s] = 1;\n"
+          "print(u + len(d));\n" },
+        /* the event INSIDE the loop body: every piece boundary of s
+         * sits on a pc the back edge crosses - all demoted (S4) */
+        { "in-loop event demotes", 4,
+          "var s = 0; var n = 0; n = n + runtime(30);\n"
+          "var d = {};\n"
+          "for (var i = 0; i < n; i++) { s = s + i; d[s] = 1; }\n"
+          "print(len(d));\n" },
+    };
+    bool ok = true, saw_install = false, saw_flush = false;
+    bool saw_demote = false;
+    for (const Case &c : cases) {
+        std::vector<Tok> toks;
+        lexer(c.src, 1, toks);
+        ParseContext pctx(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pctx);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        const Chunk &ck = prog.root;
+        SlotLiveness sl;
+        std::vector<LiveInterval> iv;
+        std::vector<IntervalQual> q;
+        std::vector<MemEvent> ev;
+        int orphans = -1;
+        LsraOut plan;
+        if (!jit_slot_liveness(ck, sl)
+                || !jit_build_intervals(ck, 0, ck.code.size(), sl, iv)
+                || !jit_qualify_intervals(ck, 0, ck.code.size(), iv, q,
+                                          &orphans, &ev)
+                || !jit_lsra_assign(ck, 0, ck.code.size(), iv, q, ev,
+                                    c.K, plan)) {
+            printf("  snap [%s]: a stage declined\n", c.name);
+            ok = false;
+            continue;
+        }
+        std::vector<LsraPiece> before = plan.pieces;
+        std::vector<int> entry;
+        std::vector<LsraTrans> trans;
+        if (!jit_lsra_snap(ck, 0, ck.code.size(), iv, c.K,
+                           plan.pieces, entry, trans)) {
+            printf("  snap [%s]: snap declined\n", c.name);
+            ok = false;
+            continue;
+        }
+        /* S3: demotion only */
+        for (size_t i = 0; i < plan.pieces.size(); i++) {
+            if (plan.pieces[i].reg >= 0 && before[i].reg < 0) {
+                printf("  snap [%s]: piece slot %d PROMOTED - snap "
+                       "must only demote\n", c.name,
+                       plan.pieces[i].slot);
+                ok = false;
+            }
+            if (plan.pieces[i].reg < 0 && before[i].reg >= 0)
+                saw_demote |= std::string(c.name)
+                                  == "in-loop event demotes";
+        }
+        /* S1: transitions only at linearization points (from spec) */
+        std::vector<std::pair<int, int>> edges;
+        jit_run_edges(ck, 0, ck.code.size(), edges);
+        for (const LsraTrans &tr : trans) {
+            for (const auto &ed : edges) {
+                if (ed.second == static_cast<int>(tr.pc))
+                    continue;
+                if ((ed.first < static_cast<int>(tr.pc))
+                        != (ed.second < static_cast<int>(tr.pc))) {
+                    printf("  snap [%s]: transition at pc %u crossed "
+                           "by edge %d->%d\n", c.name, tr.pc,
+                           ed.first, ed.second);
+                    ok = false;
+                }
+            }
+            if (tr.install_slot >= 0)
+                saw_install = true;
+            if (tr.evict_slot >= 0)
+                saw_flush = true;
+        }
+        /* S2: replay => coverage, at every pc */
+        std::vector<int> hold(static_cast<size_t>(c.K), -1);
+        for (int r = 0; r < c.K; r++)
+            hold[r] = entry.empty() ? -1 : entry[r];
+        size_t ti = 0;
+        for (size_t p = 0; p < ck.code.size(); p++) {
+            while (ti < trans.size() && trans[ti].pc == p) {
+                const LsraTrans &tr = trans[ti++];
+                if (tr.evict_slot >= 0) {
+                    if (hold[tr.reg] != tr.evict_slot) {
+                        printf("  snap [%s]: flush of %d at pc %u but "
+                               "reg %d holds %d\n", c.name,
+                               tr.evict_slot, tr.pc, tr.reg,
+                               hold[tr.reg]);
+                        ok = false;
+                    }
+                    hold[tr.reg] = -1;
+                }
+                if (tr.install_slot >= 0)
+                    hold[tr.reg] = tr.install_slot;
+            }
+            for (const LsraPiece &pc2 : plan.pieces) {
+                if (pc2.reg < 0 || p < pc2.start || p >= pc2.end)
+                    continue;
+                if (hold[pc2.reg] != pc2.slot) {
+                    printf("  snap [%s]: pc %zu slot %d expected in "
+                           "reg %d, model holds %d\n", c.name, p,
+                           pc2.slot, pc2.reg, hold[pc2.reg]);
+                    ok = false;
+                }
+            }
+        }
+        if (ti != trans.size()) {
+            printf("  snap [%s]: %zu transition(s) past every pc\n",
+                   c.name, trans.size() - ti);
+            ok = false;
+        }
+        /* S2b: every CONTINUATION end owns its flush - replay alone
+         * cannot see a dropped flush (memory state is outside the
+         * model), so the property is stated directly */
+        for (const LsraPiece &p2 : plan.pieces) {
+            if (p2.reg < 0
+                    || p2.end >= iv[static_cast<size_t>(
+                                        p2.iv_idx)].end)
+                continue;
+            bool got = false;
+            for (const LsraTrans &tr : trans)
+                if (tr.pc == p2.end && tr.reg == p2.reg
+                        && tr.evict_slot == p2.slot)
+                    got = true;
+            if (!got) {
+                printf("  snap [%s]: continuation end of slot %d at "
+                       "pc %u has no flush\n", c.name, p2.slot,
+                       p2.end);
+                ok = false;
+            }
+        }
+    }
+    if (!saw_install || !saw_flush || !saw_demote) {
+        printf("  snap: a shape never occurred (install=%d flush=%d "
+               "demote=%d) - the net is part-vacuous\n",
+               saw_install, saw_flush, saw_demote);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * D3.b 2b-ii: THE LSRA BRIDGE - with the lever ON, the linear scan
  * chooses the pin set (whole-run reduction) and the program still
  * computes the right answers end to end, with the execution-proof
@@ -34730,6 +34916,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: D3.b - the lsra lever BRIDGE: the scan's whole-run pin "
       "set runs end to end, execution-proven (step 2b-ii opening)",
       jit_lsra_bridge_check },
+    { "jit: D3.b - the SNAP to linearization points: replay equals "
+      "coverage, demotion only, in-loop events demote (2b-iii-a)",
+      jit_lsra_snap_check },
     { "jit: the low-address arena placed every Type singleton below "
       "2^31, so a type tag can encode as imm32 (#96)",
       jit_lowmem_singletons },
