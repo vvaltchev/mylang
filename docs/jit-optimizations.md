@@ -8197,3 +8197,47 @@ model / physical preference (rax stays excluded from mid-run pieces
 via pool order for now), spill homes + C2b hoist regions merged into
 trans mode (both currently decline it), the D0 Ir ledger A/B, and the
 default flip gated on D4 + the ledger.
+
+## Endgame D3.b 2b-iii-c inc 1 (2026-08-23) - BOUNDARY EXTENSION:
+## +14% recovered to +0.2%
+
+WHAT: the snap's blind demotion becomes EXTEND-OR-DEMOTE. A resident
+piece whose interior start is not a linearization point slides its
+start BACKWARD to the latest legal pc (a lin point, or run begin =
+the entry-load set); an interior end slides FORWARD to the earliest
+(a lin point, or run end = the exit machinery). The extension covers
+only pcs where the slot is untouched (bounded by every other piece of
+the same slot) and the register unoccupied (bounded by its reg
+neighbours): over such a stretch the register holds a DEAD value -
+the pick's own entry-load soundness argument (def-before-use) - and
+an extended end's flush writes a dead value, the uniform-flush rule's
+price. THE PICK'S WHOLE-RUN PIN IS THE DEGENERATE EXTENSION, so trans
+mode can no longer lose to the pick on a shape the pick handled. A
+continuation end still demotes off a non-lin pc: its same-slot
+successor bounds the extension at zero, and a data-carrying flush
+cannot move past its reader.
+
+MEASURED (same-binary env A/B, OPT=1 ASSERTS=0, callgrind Ir,
+lever-on vs off): 07_nested_loops +14.29% -> +0.23% - the diagnosed
+inner counter (demoted because the outer loop's exit edge crosses its
+whole body) now extends to a whole-run-class pin. Still open:
+83_regs_int_40 +6.09% unchanged - the COST MODEL item (scan-order
+admission + furthest-next-use eviction vs the pick's weight ranking
+at 40 slots / 13 pins), next on the 2b-iii-c list.
+
+THE BOUNDS' NET, and an honest record of its shape: both extension
+bounds (reg neighbour, same slot) are DEFENSIVE - two crafted cases
+and two sabotages could not reach a violation (a lin point nearly
+always separates two intervals of one slot, and the eviction-split
+truncation shapes refused to line up) - so, per the escape analysis'
+reassignment-guard precedent, the enforcement is a MACHINE CHECK
+rather than a test: the snap's translation model now refuses BOTH a
+register overlap AND a slot resident on two registers (slot_on),
+at every lever compile of every program. Property S5 in the -rt net
+states the same emission hazard (the second register's flush writes
+a STALE copy over the live one), and two new cases pin the extension
+shapes that DO occur.
+
+Verified: full lever x arena -rt + corpus, vdjcmp 116/116 default
+config, TESTS=1 OPT=1 both lever states, clang OPT=1 ASSERTS=0 LTO=0
+zero warnings, census gate.

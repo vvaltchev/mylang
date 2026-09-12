@@ -570,22 +570,26 @@ needs NO transition (entry dead-load, sound by def-before-use).
 83 is the same class at scale (40 slots, 13 pins - demotions +
 scan-order admission vs the pick's weight ranking).
 
-⛔ NEXT: 2b-iii-c - BOUNDARY EXTENSION, the fix the diagnosis
-names: a resident piece whose interior START is not a lin point is
-START-EXTENDED backward (to the nearest lin point, or to run begin
-= the entry-load set) instead of demoted - sound when the
-register is unoccupied over the extension and the slot has no mem
-event inside it (the extension covers only dead/idle pcs; the
-entry dead-load is the pick's own soundness argument). END
-extension likewise (to the next lin point or run end = the exit
-flush). The pick's whole-run pin becomes the DEGENERATE extension,
-so trans mode can never lose to it on a shape the pick handled -
-j extends to [0, end) and is the whole-run pin again. Then:
-weight-aware admission/eviction (the cost model - a piece must
-save more than its install+flush; the pick's >= 3 threshold
-returns as a profitability floor), re-measure the ledger, then
-validator arm 2, second chance, spill homes + C2b merge, float
-twin; the default flip only when D4 is green AND the ledger pays.]
+2b-iii-c inc 1 LANDED 2026-08-23: BOUNDARY EXTENSION.
+Extend-or-demote replaces blind demotion (start backward to the
+latest legal pc, end forward to the earliest; bounded by same-slot
+pieces and reg neighbours; the whole-run pin is the degenerate
+extension). MEASURED: 07_nested +14.29% -> +0.23%. The bounds are
+DEFENSIVE (two sabotages unreachable by crafted shapes) - enforced
+by the translation model as a MACHINE CHECK (register overlap AND
+slot-on-two-registers refused at every lever compile; the escape
+analysis' reassignment-guard precedent), plus property S5 and two
+extension-shape cases in the -rt net.
+
+⛔ NEXT: 2b-iii-c inc 2 - THE COST MODEL (83_regs_int_40 +6.09%
+is its measured target): weight-aware admission and eviction (a
+piece must save more than its install+flush; the pick's >= 3
+threshold returns as a profitability floor; prefer the heavier
+piece at pressure ties instead of scan order). Re-measure the
+six-bench ledger after. Then: validator arm 2, second-chance
+re-queue, spill homes + C2b merge into trans mode, float twin,
+the D0 full-suite ledger (RULE B1), and the default flip only
+when D4 is green AND the ledger pays.]
 
 ### D2. The per-pc assignment seam  [LANDED 2026-08-23]
 RESULT: reg_at/spill_at/freg_at (Emitter, beside creg/cspill/fcreg)

@@ -11446,18 +11446,103 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
     std::vector<std::pair<int, int>> edges;
     jit_run_edges(ck, begin, end, edges);
 
-    /* DEMOTE: a resident piece whose interior start or interior end
-     * is not a linearization point cannot have its transition placed
-     * - demotion only, never a new resident pc */
-    for (LsraPiece &p : pieces) {
-        if (p.reg < 0)
-            continue;
-        if ((p.start > begin
-                && !jit_lin_point(edges, static_cast<int>(p.start)))
-            || (p.end < end
-                && !jit_lin_point(edges, static_cast<int>(p.end))))
-            p.reg = -1;
+    /*
+     * EXTEND-OR-DEMOTE. A boundary that cannot sit on a linearization
+     * point is MOVED, not surrendered: the start slides BACKWARD to
+     * the latest legal pc (a lin point, or the run begin = the
+     * entry-load set), the end FORWARD to the earliest (a lin point,
+     * or the run end = the exit machinery). The extension covers only
+     * pcs where the slot is untouched (bounded by every other piece
+     * of the same slot) and the register unoccupied (bounded by its
+     * neighbours) - over such a stretch the register holds a DEAD
+     * value, which is the pick's own entry-load soundness argument
+     * (def-before-use), and the flush at an extended end writes a
+     * dead value (the uniform-flush rule's price). The pick's
+     * whole-run pin is the degenerate extension - which is the fix
+     * the first ledger read demanded: 07_nested_loops' inner counter
+     * was DEMOTED because the outer loop's exit edge crosses its
+     * whole body, while the pick pinned it run-long with no
+     * transition at all (+14% Ir). A CONTINUATION end can never
+     * extend (the same-slot successor piece bounds it at zero) and
+     * still demotes off a non-lin pc - a data-carrying flush cannot
+     * move past its reader.
+     */
+    std::map<int, std::vector<size_t>> by_reg2, by_slot2;
+    for (size_t i = 0; i < pieces.size(); i++) {
+        if (pieces[i].reg >= 0)
+            by_reg2[pieces[i].reg].push_back(i);
+        by_slot2[pieces[i].slot].push_back(i);
     }
+    for (auto &kv : by_reg2)
+        std::sort(kv.second.begin(), kv.second.end(),
+                  [&](size_t a, size_t b) {
+                      return pieces[a].start < pieces[b].start;
+                  });
+    /* pass 1: starts (per reg, in start order - the previous piece's
+     * pre-extension end bounds; pass 2's forward extension respects
+     * this pass's results through the next piece's start) */
+    for (auto &kv : by_reg2)
+        for (size_t k = 0; k < kv.second.size(); k++) {
+            LsraPiece &p = pieces[kv.second[k]];
+            if (p.reg < 0 || p.start == begin
+                    || jit_lin_point(edges,
+                                     static_cast<int>(p.start)))
+                continue;
+            uint32_t lo = static_cast<uint32_t>(begin);
+            if (k > 0) {
+                const LsraPiece &pv = pieces[kv.second[k - 1]];
+                if (pv.reg >= 0 && pv.end > lo)
+                    lo = pv.end;
+            }
+            for (const size_t j : by_slot2[p.slot]) {
+                const LsraPiece &q2 = pieces[j];
+                if (&q2 != &p && q2.end <= p.start && q2.end > lo)
+                    lo = q2.end;
+            }
+            bool done = false;
+            for (uint32_t s = p.start; s-- > lo; ) {
+                if (s == begin
+                        || jit_lin_point(edges,
+                                         static_cast<int>(s))) {
+                    p.start = s;
+                    done = true;
+                    break;
+                }
+            }
+            if (!done)
+                p.reg = -1;
+        }
+    /* pass 2: ends */
+    for (auto &kv : by_reg2)
+        for (size_t k = 0; k < kv.second.size(); k++) {
+            LsraPiece &p = pieces[kv.second[k]];
+            if (p.reg < 0 || p.end >= end
+                    || jit_lin_point(edges, static_cast<int>(p.end)))
+                continue;
+            uint32_t hi = static_cast<uint32_t>(end);
+            if (k + 1 < kv.second.size()) {
+                const LsraPiece &pn = pieces[kv.second[k + 1]];
+                if (pn.reg >= 0 && pn.start < hi)
+                    hi = pn.start;
+            }
+            for (const size_t j : by_slot2[p.slot]) {
+                const LsraPiece &q2 = pieces[j];
+                if (&q2 != &p && q2.start >= p.end && q2.start < hi)
+                    hi = q2.start;
+            }
+            bool done = false;
+            for (uint32_t s = p.end + 1; s <= hi; s++) {
+                if (s == end
+                        || jit_lin_point(edges,
+                                         static_cast<int>(s))) {
+                    p.end = s;
+                    done = true;
+                    break;
+                }
+            }
+            if (!done)
+                p.reg = -1;
+        }
 
     /* TRANSLATE: flushes (continuation ends) before installs at the
      * same pc; the model validates occupancy as it goes */
@@ -11488,6 +11573,24 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
     std::vector<int> occ(static_cast<size_t>(K), -1);
     for (size_t r = 0; r < occ.size(); r++)
         occ[r] = entry_by_reg[r];
+    /* the model is the MACHINE CHECK behind the extension bounds: it
+     * refuses a register overlap (install on an occupied register)
+     * AND a slot on two registers at once (the second register's
+     * flush would write a STALE copy over the live one - the
+     * emission hazard S5 states). The extension's reg-neighbour and
+     * same-slot bounds keep both from arising; no current program
+     * shape reaches a violation (both sabotages stayed green), so
+     * like the escape analysis' reassignment guard the bounds are
+     * DEFENSIVE and this model is what fires - at every lever
+     * compile of every program - the day a change makes one
+     * load-bearing. */
+    std::map<int, int> slot_on;          /* slot -> reg holding it */
+    for (size_t r = 0; r < occ.size(); r++)
+        if (occ[r] >= 0) {
+            if (slot_on.count(occ[r]))
+                return false;
+            slot_on[occ[r]] = static_cast<int>(r);
+        }
     for (const Ev &ev : evs) {
         const LsraPiece &p = pieces[ev.pi];
         if (ev.kind == 0) {              /* interior-end flush */
@@ -11495,11 +11598,15 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                 return false;            /* model out of step */
             trans.push_back({ p.end, p.reg, p.slot, -1 });
             occ[p.reg] = -1;
+            slot_on.erase(p.slot);
         } else {                         /* install */
             if (occ[p.reg] >= 0)
                 return false;            /* overlap the scan forbids */
+            if (slot_on.count(p.slot))
+                return false;            /* a slot on two registers */
             trans.push_back({ p.start, p.reg, -1, p.slot });
             occ[p.reg] = p.slot;
+            slot_on[p.slot] = p.reg;
         }
     }
     (void)iv;
