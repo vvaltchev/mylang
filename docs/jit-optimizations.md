@@ -8241,3 +8241,36 @@ shapes that DO occur.
 Verified: full lever x arena -rt + corpus, vdjcmp 116/116 default
 config, TESTS=1 OPT=1 both lever states, clang OPT=1 ASSERTS=0 LTO=0
 zero warnings, census gate.
+
+## Endgame D3.b 2b-iii-c inc 2 (2026-08-23) - the HOME-TIER MERGE:
+## 83's +6% was the missing spill homes, not the winner selection
+
+WHAT the diagnosis corrected: inc 2 was scoped as "the cost model"
+with 83_regs_int_40's +6.09% as its target - but the emission diff
+showed the lever-off fragment serving 13 register pins PLUS 16
+native-stack SPILL HOMES ([rbp-...] qwords, one access, no tag,
+call-surviving), and trans mode's v1 bound had zeroed the home tier
+out entirely. The winner set and the eviction were fine; the
+overflow's PLACEMENT was the whole number.
+
+THE MERGE: trans mode now hands its overflow to the existing scache
+machinery - a slot with total uses_int >= 3 (the pick's floor: the
+home's seed + flush cost), NO mem_int on any interval (a d1-style
+boxed redefinition excludes), no float facts, and NO resident piece
+(registers or a home, never both) joins spill_hot, weight-ranked.
+Carried in lsra_homes and assigned after the split - appending to
+`hot` would corrupt the abstract-reg zip, whose order IS the
+entry-occupant list (the zip's ML_CHECK caught exactly that draft).
+jit_share_plan is DISABLED under trans mode: the transitions own
+register sharing, and a ShareSeam chained onto the same registers
+would collide with them.
+
+MEASURED (same-binary env A/B, OPT=1 ASSERTS=0, callgrind Ir):
+83_regs_int_40 +6.09% -> +0.76%. The six-bench ledger now reads
++0.14%..+0.76% lever-on vs the pick - the headline regressions are
+gone; the residual sub-1% (per-call transition code, selection
+noise, the textra filter) is cost-model polish, still listed.
+
+Verified: full lever x arena -rt + corpus + --levers composed,
+vdjcmp 116/116 default config, TESTS=1 OPT=1 both lever states,
+clang OPT=1 ASSERTS=0 LTO=0 zero warnings, census gate.
