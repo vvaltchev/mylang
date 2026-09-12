@@ -1180,6 +1180,9 @@ extern "C" unsigned long g_jit_scache;
 /* D3.b 2b-ii: fragments ENTERED whose pin set came from the linear
  * scan (the lsra lever) - the bridge's execution proof. */
 extern "C" unsigned long g_jit_lsra_pins;
+/* F4a: entries of a fragment whose FLOAT pin set the lsra float
+ * fallback chose (the facts-based fhot replacement) */
+extern "C" unsigned long g_jit_lsra_fpins;
 /* D3.b 2b-iii-b: lsra TRANSITIONS executed (bumped by the emitted
  * transition code itself - flush and install arms alike). */
 extern "C" unsigned long g_jit_lsra_trans;

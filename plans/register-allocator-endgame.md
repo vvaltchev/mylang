@@ -837,14 +837,20 @@ THE F-LADDER (mirror of the int increments, same lever):
      is a BARRIER, not a bad(), so sc stays pick-eligible while
      the branch edge demotes its piece boundary). WATCHED: forcing
      fm-ineligibility trips the rescue vacuity guard.
- F4. the bridge's float half: whole-run fallback replaces the
-     pick's fhot with the scan's whole-run float choice; trans
-     mode installs per-pc xmm pieces through e.fcache (the seam
-     arms emit fload/fstore + t_float tag stores; entry stubs
-     replay; helper-call brackets and reload_cache already handle
-     e.fcache by register STATE, so per-pc pieces ride them for
-     free). g_jit_lsra_fpins execution proof. vdjcmp: default
-     config stays byte-identical (lever OFF touches nothing).
+ F4a. LANDED 2026-08-24: lever-on fhot from the interval FACTS
+     (the pick's rule restated - never the plan's pieces, the
+     43_sieve idle-prefix lesson). EXACT PICK PARITY MEASURED:
+     lever-on vdjcmp 116/116 byte-identical (OPT=1 ASSERTS=0 -
+     ⛔ a TESTS build's counter bump perturbs the dump, so parity
+     vdjcmp needs counters compiled out). Default 116/116.
+     g_jit_lsra_fpins execution proof, WATCHED via the bridge
+     check (skip the replacement -> counter flat).
+ F4b. NOT BUILT: trans mode installs per-pc xmm pieces through
+     e.fcache (seam arms emit fload/fstore + t_float tag stores;
+     entry stubs replay; helper-call brackets and reload_cache
+     already handle e.fcache by register STATE, so per-pc pieces
+     ride them for free). This is where the F2/F3 float scan+snap
+     become emission consumers.
  F5. measure: the float benches (04, 46, 54, 55, 79_dyn_float,
      88) per-iteration, then the FULL 88-bench sweep (-npc, the
      parallel harness) - the flatness mandate applies unchanged.]

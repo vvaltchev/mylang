@@ -76,6 +76,7 @@ unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_rax_pin = 0;       /* #96: rax-pinned fragment entries */
 unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
 unsigned long g_jit_lsra_pins = 0;     /* D3.b: lsra-chosen pin sets */
+unsigned long g_jit_lsra_fpins = 0;    /* F4a: lsra-chosen FLOAT pins */
 unsigned long g_jit_lsra_trans = 0;    /* D3.b: executed transitions */
 unsigned long g_jit_range_share = 0;   /* #96 inc-2: executed range seams */
 unsigned long g_jit_two_addr = 0;      /* #96: two-address memory ops */
@@ -9257,6 +9258,7 @@ void jit_stats_report()
         { "rax_pin",          &g_jit_rax_pin },
         { "scache",           &g_jit_scache },
         { "lsra_pins",        &g_jit_lsra_pins },
+        { "lsra_fpins",       &g_jit_lsra_fpins },
         { "lsra_trans",       &g_jit_lsra_trans },
         { "range_share",      &g_jit_range_share },
         { "two_addr",         &g_jit_two_addr },
@@ -21022,6 +21024,10 @@ retry_emission:
          * soundness. Any stage declining falls back to the pick's
          * answer above. */
         bool lsra_chose = false;
+        /* F4a: the FLOAT fallback's flags - facts collected by either
+         * arm below; fhot replaced from them (never from the plan's
+         * pieces - the 43_sieve idle-prefix lesson) */
+        bool lsra_facts = false, lsra_f_chose = false;
         /* 2b-iii-b: TRANSITION MODE - the snapped plan's per-pc pieces
          * reach emission. The seam-application loop executes the
          * LsraTrans list, entry stubs replay it, exits and brackets
@@ -21051,6 +21057,7 @@ retry_emission:
                     && jit_qualify_intervals(chunk, begin, end, liv, lq,
                                              nullptr, &lev, &liu)
                     && hregs.empty() && !jit_lever_off(JL_CACHE)) {
+                lsra_facts = true;       /* F4a: liv/lq are valid */
                 LsraOut tp;
                 std::vector<int> entry;
                 std::vector<LsraTrans> tr;
@@ -21174,6 +21181,7 @@ retry_emission:
                     && jit_build_intervals(chunk, begin, end, lsl, liv)
                     && jit_qualify_intervals(chunk, begin, end, liv, lq,
                                              nullptr, &lev, &liu)) {
+                lsra_facts = true;       /* F4a: liv/lq are valid */
                 /* the WHOLE-RUN fallback is the pick's contract
                  * restated on the interval facts - NOT a detour
                  * through the plan's pieces. The earlier all-pieces-
@@ -21229,11 +21237,56 @@ retry_emission:
                         fprintf(stderr, "LSRADBG wr[%zu,%zu) hot "
                                 "slot %d\n", begin, end, h2);
             }
+            /* F4a: THE FLOAT FALLBACK - the pick's fhot rule restated
+             * on the interval FACTS (sum uses_float >= 3, wrote_float
+             * somewhere, no mem_float anywhere, no countable int use;
+             * temps excluded; weight-ranked, capped MAX_FCACHED).
+             * NEVER a detour through the plan's pieces - a live-in
+             * float slot's idle prefix is not a candidate piece, and
+             * an all-pieces-resident rule would un-pin it (the
+             * 43_sieve +37% lesson, on the GP side). The emission
+             * downstream (ftake_reg + fload, the barrier brackets,
+             * the exit flushes) consumes fhot unchanged. Per-pc xmm
+             * pieces are F4b's trans-mode work. */
+            if (lsra_facts && !jit_lever_off(JL_FCACHE)) {
+                std::map<int, long> wf3;
+                std::map<int, char> memf3, intf3, wrf3;
+                for (size_t k2 = 0; k2 < liv.size(); k2++) {
+                    const int s2 = liv[k2].slot;
+                    wf3[s2] += lq[k2].uses_float;
+                    memf3[s2] |= lq[k2].mem_float;
+                    intf3[s2] |= lq[k2].uses_int > 0;
+                    wrf3[s2] |= lq[k2].wrote_float;
+                }
+                std::vector<std::pair<long, int>> fc3;
+                for (const auto &kv : wf3)
+                    if (kv.first >= 0 && kv.first < chunk.slot_count
+                            && kv.second >= 3 && wrf3[kv.first]
+                            && !memf3[kv.first] && !intf3[kv.first])
+                        fc3.push_back({ kv.second, kv.first });
+                std::sort(fc3.begin(), fc3.end(),
+                          [](const std::pair<long, int> &a,
+                             const std::pair<long, int> &b) {
+                              return a.first != b.first
+                                  ? a.first > b.first
+                                  : a.second < b.second;
+                          });
+                fhot.clear();
+                for (size_t i2 = 0; i2 < fc3.size() && i2 < MAX_FCACHED;
+                        i2++)
+                    fhot.push_back(fc3[i2].second);
+                lsra_f_chose = true;
+                if (getenv("MYLANG_LSRADBG"))
+                    for (const int h2 : fhot)
+                        fprintf(stderr, "LSRADBG fr[%zu,%zu) fhot "
+                                "slot %d\n", begin, end, h2);
+            }
         }
         /* read only under TESTS (the execution-proof bump below) - a
          * bare bool here is the cc1f50f -Wunused-but-set shape in a
          * release build */
         (void)lsra_chose;
+        (void)lsra_f_chose;
         std::vector<int> spill_hot;
         if (hot.size() > max_pins) {
             spill_hot.assign(hot.begin() + max_pins, hot.end());
@@ -21617,6 +21670,11 @@ retry_emission:
             /* the execution proof: bumped per ENTRY of a float-pinned
              * fragment (the g_jit_hoist pattern) */
             e.bump_counter(&g_jit_fcache);
+            if (lsra_f_chose) {
+                /* F4a: this fragment runs with an lsra-chosen FLOAT
+                 * pin set (the g_jit_lsra_pins pattern) */
+                e.bump_counter(&g_jit_lsra_fpins);
+            }
         }
 #endif
         /* C4b: the float LITERAL pool - materialised once here (and at
