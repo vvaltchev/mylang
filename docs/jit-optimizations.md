@@ -8443,3 +8443,51 @@ is otherwise exercised (not verified) by every lever run.
 Verified: -rt + corpus, both configs, both arenas; vdjcmp 116/116
 default; TESTS=1 OPT=1 both configs; clang OPT=1 ASSERTS=0 LTO=0
 zero warnings; census gate.
+
+## Endgame 2b-iii-d inc 4 (2026-08-23) - THE PICK-PARITY PAIR: the
+## lever's per-iteration ledger goes to <= 0.00% everywhere measured
+
+The maintainer's flatness mandate ("no theoretical reason to be worse
+than flat") implemented as two pick-contract inheritances, one
+increment:
+
+1. THE ADMISSION FLOOR: any residency requires the slot's RUN-WIDE
+   int weight >= 3 - the pick's threshold, now understood to carry
+   TWO loads: soundness once (the m3 ReturnV lesson) and the
+   per-ENTRY cost model (push + entry load + exit flush + pop, paid
+   per fragment entry - 34_sort/73's chunks are entered per callback
+   call, and the scan admitting 1-2-use slots there cost
+   +3.88%/+1.81% per iteration; callee-saved pops went 0->12 and
+   9->16). Property F2 pins it (no resident piece below the floor),
+   WATCHED: removing the floor names slots with weight 1 and 2.
+
+2. THE WHOLE-RUN RESCUE: a lin-demotion striking a slot the pick
+   would pin whole-run (no mem_int on any interval, no float facts,
+   at the floor) now merges ALL the slot's pieces into ONE resident
+   [begin, end) piece on a run-free register - the pick's pin as the
+   degenerate snap output, needing no transitions and therefore
+   immune to linearization points (44_primes_sqrt's +3.21%/iter: the
+   pick pinned r12, the snap had shredded the same slot). S3 is
+   restated in COVERAGE form (the rescue erases pieces, so per-index
+   comparison is structurally dead): new residency is legal only
+   where the slot is dead or pick-qualifies. The rescue is vacuity-
+   guarded (saw_rescue - a [0, size) resident piece over live,
+   pick-qualified pcs), WATCHED: forcing eligibility false trips the
+   guard. The crafted case took three sources: `sc = runtime(7)` in
+   a branch lowers via a temp + MoveV (a mem event - correctly
+   ineligible), argv is unregistered in the -rt harness (FIX-1
+   refuses it), `sc = int(runtime(7))` lowers with the call target
+   direct and rescues.
+
+MEASURED (same-binary env A/B, callgrind, per-iteration =
+(s3-s1)/2): 34 +3.88% -> +0.00%, 44 +3.21% -> +0.00%, 73 +1.81% ->
++0.00%, 86/87 -> +0.00%, 07/43 hold at +0.00% - and 81 -> -2.72%,
+83 -> -0.98%: the lever now BEATS the pick on the register-pressure
+family, the arc's first per-iteration wins. Residual s1 deltas
+(+0.02..1.17%) are the compile-side band plus 69's heap-priming
+class (attributed separately: byte-identical emission, malloc bin
+walks from the analysis' transient allocations).
+
+Verified: -rt + corpus, both configs, both arenas; vdjcmp 116/116
+default; TESTS=1 OPT=1 both configs; clang OPT=1 ASSERTS=0 LTO=0
+zero warnings; census gate.

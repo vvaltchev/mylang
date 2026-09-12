@@ -11434,7 +11434,9 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
  * transition the seam-application pattern can execute.
  */
 bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
-                   const std::vector<LiveInterval> &iv, int K,
+                   const std::vector<LiveInterval> &iv,
+                   const std::vector<IntervalQual> &q,
+                   const std::vector<MemEvent> &int_uses, int K,
                    std::vector<LsraPiece> &pieces,
                    std::vector<int> &entry_by_reg,
                    std::vector<LsraTrans> &trans)
@@ -11513,6 +11515,7 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                 return false;
         return true;
     };
+    std::set<int> lin_demoted;           /* the rescue's trigger set */
     /* pass 1: starts */
     for (const size_t pi : order) {
         LsraPiece &p = pieces[pi];
@@ -11547,8 +11550,10 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                 }
             }
         }
-        if (!moved)
+        if (!moved) {
             p.reg = -1;
+            lin_demoted.insert(p.slot);
+        }
     }
     /* pass 2: ends */
     for (const size_t pi : order) {
@@ -11574,8 +11579,59 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                 break;
             }
         }
-        if (!done)
+        if (!done) {
             p.reg = -1;
+            lin_demoted.insert(p.slot);
+        }
+    }
+    /*
+     * THE WHOLE-RUN RESCUE (pick parity; contract in jit.h). A slot
+     * hit by lin-demotion whose intervals carry no mem_int and no
+     * float facts, at the run-wide floor, is exactly a slot the pick
+     * pins WHOLE-RUN with no transitions - so give it that: all its
+     * pieces merge into one resident [begin, end) piece on a register
+     * free over the whole run. Dead gaps and the demoted spans become
+     * register-held dead value, the pick's own entry-load soundness.
+     * No free register -> the demotions stand.
+     */
+    for (const int s : lin_demoted) {
+        bool eligible = false;
+        long wint = 0;
+        bool memf = false, fl2 = false;
+        int first_iv = -1;
+        for (size_t k2 = 0; k2 < iv.size(); k2++) {
+            if (iv[k2].slot != s)
+                continue;
+            if (first_iv < 0)
+                first_iv = static_cast<int>(k2);
+            wint += q[k2].uses_int;
+            memf |= q[k2].mem_int;
+            fl2 |= q[k2].uses_float > 0 || q[k2].wrote_float;
+        }
+        eligible = !memf && !fl2 && wint >= 3 && first_iv >= 0;
+        (void)int_uses;
+        if (!eligible)
+            continue;
+        int reg = -1;
+        for (int r = 0; r < K && reg < 0; r++) {
+            bool free2 = true;
+            for (const LsraPiece &p : pieces)
+                if (p.reg == r && p.slot != s) {
+                    free2 = false;
+                    break;
+                }
+            if (free2)
+                reg = r;
+        }
+        if (reg < 0)
+            continue;
+        pieces.erase(std::remove_if(pieces.begin(), pieces.end(),
+                                    [&](const LsraPiece &p) {
+                                        return p.slot == s;
+                                    }),
+                     pieces.end());
+        pieces.push_back({ first_iv, s, static_cast<uint32_t>(begin),
+                           static_cast<uint32_t>(end), reg, false });
     }
 
     /* TRANSLATE: flushes (continuation ends) before installs at the
@@ -11682,6 +11738,19 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
         return false;
     const int nslots = ck.slot_count + ck.n_temps;
 
+    /* THE ADMISSION FLOOR (pick parity): any residency requires the
+     * slot's RUN-WIDE int weight >= 3 - exactly the pick's threshold,
+     * which turned out to carry the ENTRY/EXIT COST MODEL on top of
+     * the soundness it already carried once (the m3 lesson): a pin
+     * costs push + entry load + exit flush + pop PER FRAGMENT ENTRY,
+     * and 34_sort/73's chunks are entered per callback call - the
+     * scan admitting 1-2-use slots there paid that bill millions of
+     * times (+3.9%/+1.8% per iteration). A per-piece cost model
+     * (entry count x piece weight) is the later refinement. */
+    std::map<int, int> slot_wint;
+    for (const MemEvent &u : int_uses)
+        slot_wint[u.slot]++;
+
     /* next-use distances, the admission + eviction input (a HEURISTIC
      * - see its codegen.h note; a wrong eviction costs a reload) */
     std::vector<int> dist;
@@ -11731,8 +11800,10 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                     break;
                 }
             /* admit only an int-evidenced, float-free piece with a USE
-             * inside - a stretch nothing reads gains nothing */
+             * inside - a stretch nothing reads gains nothing - of a
+             * slot over the run-wide floor (pick parity, above) */
             const bool cand = !forced && !fl && evid
+                    && slot_wint[l.slot] >= 3
                     && nu(s, l.slot) < static_cast<int>(e2 - s);
             out.pieces.push_back({ static_cast<int>(k), l.slot, s, e2,
                                    -1, forced || fl || !cand });
@@ -20907,8 +20978,8 @@ retry_emission:
                     for (LsraPiece &p : tp.pieces)
                         if (p.slot >= chunk.slot_count)
                             p.reg = -1;          /* v1: no temps */
-                    if (jit_lsra_snap(chunk, begin, end, liv,
-                                      static_cast<int>(max_pins),
+                    if (jit_lsra_snap(chunk, begin, end, liv, lq,
+                                      liu, static_cast<int>(max_pins),
                                       tp.pieces, entry, tr)) {
                         std::map<int, long> w;
                         for (size_t k2 = 0; k2 < liv.size(); k2++)

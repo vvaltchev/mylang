@@ -745,28 +745,18 @@ overhead (push + entry load + exit flush + pop), and 34/73's
 chunks are entered PER CALLBACK CALL - a barely-used pin paid
 per entry, millions of times.
 
-⛔ NEXT - THE PICK-PARITY PAIR, one increment, flat by
-construction (both gaps are "the pick's contract not fully
-inherited"):
- 1. THE ADMISSION FLOOR: any residency (entry occupant, install,
-    home) requires the slot's RUN-WIDE wint >= 3 - exactly the
-    pick's floor, which is profitability (entry/exit amortization)
-    on top of the soundness it already carried once (the m3
-    lesson). Fixes 34/73. A per-piece cost model (entry count x
-    piece weight) is the later refinement.
- 2. THE WHOLE-RUN RESCUE: when the snap would demote a piece of a
-    slot with NO forced pieces (no mem events, no float - the
-    pick's whole-run criteria), merge ALL the slot's pieces into
-    ONE resident piece [begin, end) on one register (a free-over
-    abstract reg; else demote as today): the pick's pin as the
-    degenerate snap output, immune to lin points. Fixes 44.
-    Consequences to handle: S3 (demotion-only) gains the rescue
-    exemption; the translation emits NO interior flush for it
-    (no interior ends exist on a single piece); the tiling
-    property applies to the SCAN's output only (the snap already
-    extends past intervals).
- Re-run the FULL sweep after; target: nothing above the ~+0.3%
- compile-side band except the 69 heap-priming class.
+THE PICK-PARITY PAIR LANDED 2026-08-23 (inc 4): the admission
+floor (run-wide wint >= 3, property F2 watched by name) + the
+whole-run rescue (lin-demoted pick-qualified slots merge into one
+[begin,end) piece on a run-free register; S3 restated in coverage
+form; saw_rescue vacuity watched; the case needed int(runtime())
+- a branch's `sc = runtime()` lowers via MoveV = a mem event,
+correctly ineligible). MEASURED per-iteration: 34/44/73/86/87 all
++0.00%, 07/43 hold, ⛔ 81 -2.72% and 83 -0.98% - the lever BEATS
+the pick on the register-pressure family, the arc's first wins.
+Residual s1 band = compile-side + 69's heap class. STILL TO DO
+here: re-run the FULL 87-bench sweep (only the 9-bench spot set
+was re-measured).
 THEN: C2b regions into trans mode (⛔ fresh-window: the cold-copy
 emission reads e.cache at STREAM-END state - needs per-region
 state replay; check whether today's ShareSeams already carry the

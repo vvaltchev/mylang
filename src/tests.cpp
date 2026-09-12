@@ -25538,6 +25538,24 @@ static bool jit_lsra_check()
                 ok = false;
             }
         }
+        /* property F2 (the ADMISSION FLOOR, pick parity): no
+         * resident piece of a slot below the run-wide >= 3 floor -
+         * the pick's threshold is the per-entry cost model (34's
+         * chunks are entered per callback call, and a barely-used
+         * pin pays push + load + flush + pop on every entry) */
+        {
+            std::map<int, long> wf2;
+            for (const MemEvent &u : iu)
+                wf2[u.slot]++;
+            for (const LsraPiece &p : plan.pieces)
+                if (p.reg >= 0 && wf2[p.slot] < 3) {
+                    printf("  lsra [%s]: slot %d resident with "
+                           "run-wide weight %ld < 3 - the admission "
+                           "floor is off\n", c.name, p.slot,
+                           wf2[p.slot]);
+                    ok = false;
+                }
+        }
         /* property G: a resident piece owns an int-op touch INSIDE
          * itself (the d1 finding - interval-level evidence crosses a
          * cut and pins a remainder holding a non-int) */
@@ -25789,6 +25807,16 @@ static bool jit_lsra_snap_check()
           "s = 0;\n"
           "d[s] = 1;\n"
           "print(u + len(d));\n" },
+        /* the 44-prologue shape: scale/lim used before, inside and
+         * after a conditional - boundaries land on crossed pcs with
+         * no extension room, and the WHOLE-RUN RESCUE must merge the
+         * pieces into the pick's pin (saw_rescue) */
+        { "whole-run rescue", 4,
+          "var sc = 1;\n"
+          "if (runtime(1) > 0) { sc = int(runtime(7)); }\n"
+          "var t1 = sc + 1;\n"
+          "var t2 = sc * 2;\n"
+          "print(t1 + t2 + sc);\n" },
         /* the event INSIDE the loop body: every piece boundary of s
          * sits on a pc the back edge crosses - all demoted (S4) */
         { "in-loop event demotes", 4,
@@ -25821,7 +25849,7 @@ static bool jit_lsra_snap_check()
           "print(u + s);\n" },
     };
     bool ok = true, saw_install = false, saw_flush = false;
-    bool saw_demote = false;
+    bool saw_demote = false, saw_rescue = false;
     for (const Case &c : cases) {
         std::vector<Tok> toks;
         lexer(c.src, 1, toks);
@@ -25851,23 +25879,71 @@ static bool jit_lsra_snap_check()
         std::vector<LsraPiece> before = plan.pieces;
         std::vector<int> entry;
         std::vector<LsraTrans> trans;
-        if (!jit_lsra_snap(ck, 0, ck.code.size(), iv, c.K,
+        if (!jit_lsra_snap(ck, 0, ck.code.size(), iv, q, iu, c.K,
                            plan.pieces, entry, trans)) {
             printf("  snap [%s]: snap declined\n", c.name);
             ok = false;
             continue;
         }
-        /* S3: demotion only */
-        for (size_t i = 0; i < plan.pieces.size(); i++) {
-            if (plan.pieces[i].reg >= 0 && before[i].reg < 0) {
-                printf("  snap [%s]: piece slot %d PROMOTED - snap "
-                       "must only demote\n", c.name,
-                       plan.pieces[i].slot);
-                ok = false;
+        /* S3, coverage form (the rescue ERASES pieces, so per-index
+         * comparison is structurally dead): a (slot, pc) resident
+         * AFTER but not BEFORE is legal only where the slot is DEAD
+         * (extension/merge over a gap - no interval covers the pc)
+         * or the slot PICK-QUALIFIES (the whole-run rescue: no
+         * mem_int, no float facts, run-wide wint >= 3). */
+        {
+            std::map<int, long> wq3;
+            std::map<int, char> mem3, fl3;
+            for (size_t k3 = 0; k3 < iv.size(); k3++) {
+                wq3[iv[k3].slot] += q[k3].uses_int;
+                mem3[iv[k3].slot] |= q[k3].mem_int;
+                fl3[iv[k3].slot] |= q[k3].uses_float > 0
+                                  || q[k3].wrote_float;
             }
-            if (plan.pieces[i].reg < 0 && before[i].reg >= 0)
-                saw_demote |= std::string(c.name)
-                                  == "in-loop event demotes";
+            for (const LsraPiece &p : plan.pieces) {
+                if (p.reg < 0)
+                    continue;
+                for (uint32_t pc2 = p.start; pc2 < p.end; pc2++) {
+                    bool was = false;
+                    for (const LsraPiece &b2 : before)
+                        if (b2.reg >= 0 && b2.slot == p.slot
+                                && pc2 >= b2.start && pc2 < b2.end)
+                            was = true;
+                    if (was)
+                        continue;
+                    bool covered = false;
+                    for (const LiveInterval &l2 : iv)
+                        if (l2.slot == p.slot && pc2 >= l2.start
+                                && pc2 < l2.end)
+                            covered = true;
+                    const bool pickq = !mem3[p.slot] && !fl3[p.slot]
+                                     && wq3[p.slot] >= 3;
+                    if (covered && !pickq) {
+                        printf("  snap [%s]: slot %d pc %u newly "
+                               "resident, live, and NOT pick-"
+                               "qualified\n", c.name, p.slot, pc2);
+                        ok = false;
+                        break;
+                    }
+                    if (covered && pickq
+                            && p.start == 0
+                            && p.end == ck.code.size())
+                        saw_rescue = true;
+                }
+            }
+        }
+        {
+            std::set<int> bres, ares;
+            for (const LsraPiece &b2 : before)
+                if (b2.reg >= 0)
+                    bres.insert(b2.slot);
+            for (const LsraPiece &p : plan.pieces)
+                if (p.reg >= 0)
+                    ares.insert(p.slot);
+            for (const int s2 : bres)
+                if (!ares.count(s2))
+                    saw_demote |= std::string(c.name)
+                                      == "in-loop event demotes";
         }
         /* S1: transitions only at linearization points (from spec) */
         std::vector<std::pair<int, int>> edges;
@@ -25966,10 +26042,10 @@ static bool jit_lsra_snap_check()
             }
         }
     }
-    if (!saw_install || !saw_flush || !saw_demote) {
+    if (!saw_install || !saw_flush || !saw_demote || !saw_rescue) {
         printf("  snap: a shape never occurred (install=%d flush=%d "
-               "demote=%d) - the net is part-vacuous\n",
-               saw_install, saw_flush, saw_demote);
+               "demote=%d rescue=%d) - the net is part-vacuous\n",
+               saw_install, saw_flush, saw_demote, saw_rescue);
         ok = false;
     }
     return ok;
