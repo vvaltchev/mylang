@@ -11467,82 +11467,116 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
      * still demotes off a non-lin pc - a data-carrying flush cannot
      * move past its reader.
      */
-    std::map<int, std::vector<size_t>> by_reg2, by_slot2;
-    for (size_t i = 0; i < pieces.size(); i++) {
+    /* processed in GLOBAL start order with bounds computed on demand
+     * from the CURRENT pieces - a reassignment (below) moves a piece
+     * between registers, which maintained per-reg lists would have to
+     * chase; a direct scan cannot go stale. O(n^2) over a run's piece
+     * count, which is small. */
+    std::vector<size_t> order;
+    for (size_t i = 0; i < pieces.size(); i++)
         if (pieces[i].reg >= 0)
-            by_reg2[pieces[i].reg].push_back(i);
-        by_slot2[pieces[i].slot].push_back(i);
+            order.push_back(i);
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return pieces[a].start != pieces[b].start
+                   ? pieces[a].start < pieces[b].start
+                   : pieces[a].slot < pieces[b].slot;
+    });
+    const auto slot_lo = [&](const LsraPiece &p) {
+        uint32_t lo = static_cast<uint32_t>(begin);
+        for (const LsraPiece &q2 : pieces)
+            if (&q2 != &p && q2.slot == p.slot && q2.end <= p.start
+                    && q2.end > lo)
+                lo = q2.end;
+        return lo;
+    };
+    const auto reg_lo = [&](const LsraPiece &p) {
+        uint32_t lo = static_cast<uint32_t>(begin);
+        for (const LsraPiece &q2 : pieces)
+            if (&q2 != &p && q2.reg == p.reg && q2.end <= p.start
+                    && q2.end > lo)
+                lo = q2.end;
+        return lo;
+    };
+    const auto latest_legal = [&](uint32_t lo, uint32_t start)
+        -> long {
+        for (uint32_t s = start; s-- > lo; )
+            if (s == begin || jit_lin_point(edges,
+                                            static_cast<int>(s)))
+                return static_cast<long>(s);
+        return -1;
+    };
+    const auto reg_free_over = [&](int r2, uint32_t s, uint32_t e2,
+                                   const LsraPiece &self) {
+        for (const LsraPiece &q2 : pieces)
+            if (&q2 != &self && q2.reg == r2 && q2.start < e2
+                    && s < q2.end)
+                return false;
+        return true;
+    };
+    /* pass 1: starts */
+    for (const size_t pi : order) {
+        LsraPiece &p = pieces[pi];
+        if (p.reg < 0 || p.start == begin
+                || jit_lin_point(edges, static_cast<int>(p.start)))
+            continue;
+        const uint32_t ls = slot_lo(p);
+        const uint32_t lo = std::max(ls, reg_lo(p));
+        long s2 = latest_legal(lo, p.start);
+        if (s2 >= 0) {
+            p.start = static_cast<uint32_t>(s2);
+            continue;
+        }
+        /* the 43_sieve shape: the reg neighbour blocks the extension
+         * (a predecessor ends mid-crossed-region, so no legal pc
+         * exists in the gap) while the SLOT-only bound leaves room -
+         * REASSIGN the piece to a register free over the whole
+         * extended span (lowest first, deterministic). The
+         * translation is per-register and handles any assignment;
+         * the same-slot bound and both machine checks stand. */
+        s2 = latest_legal(ls, p.start);
+        bool moved = false;
+        if (s2 >= 0) {
+            for (int r2 = 0; r2 < K && !moved; r2++) {
+                if (r2 == p.reg)
+                    continue;
+                if (reg_free_over(r2, static_cast<uint32_t>(s2),
+                                  p.end, p)) {
+                    p.reg = r2;
+                    p.start = static_cast<uint32_t>(s2);
+                    moved = true;
+                }
+            }
+        }
+        if (!moved)
+            p.reg = -1;
     }
-    for (auto &kv : by_reg2)
-        std::sort(kv.second.begin(), kv.second.end(),
-                  [&](size_t a, size_t b) {
-                      return pieces[a].start < pieces[b].start;
-                  });
-    /* pass 1: starts (per reg, in start order - the previous piece's
-     * pre-extension end bounds; pass 2's forward extension respects
-     * this pass's results through the next piece's start) */
-    for (auto &kv : by_reg2)
-        for (size_t k = 0; k < kv.second.size(); k++) {
-            LsraPiece &p = pieces[kv.second[k]];
-            if (p.reg < 0 || p.start == begin
-                    || jit_lin_point(edges,
-                                     static_cast<int>(p.start)))
-                continue;
-            uint32_t lo = static_cast<uint32_t>(begin);
-            if (k > 0) {
-                const LsraPiece &pv = pieces[kv.second[k - 1]];
-                if (pv.reg >= 0 && pv.end > lo)
-                    lo = pv.end;
-            }
-            for (const size_t j : by_slot2[p.slot]) {
-                const LsraPiece &q2 = pieces[j];
-                if (&q2 != &p && q2.end <= p.start && q2.end > lo)
-                    lo = q2.end;
-            }
-            bool done = false;
-            for (uint32_t s = p.start; s-- > lo; ) {
-                if (s == begin
-                        || jit_lin_point(edges,
-                                         static_cast<int>(s))) {
-                    p.start = s;
-                    done = true;
-                    break;
-                }
-            }
-            if (!done)
-                p.reg = -1;
-        }
     /* pass 2: ends */
-    for (auto &kv : by_reg2)
-        for (size_t k = 0; k < kv.second.size(); k++) {
-            LsraPiece &p = pieces[kv.second[k]];
-            if (p.reg < 0 || p.end >= end
-                    || jit_lin_point(edges, static_cast<int>(p.end)))
+    for (const size_t pi : order) {
+        LsraPiece &p = pieces[pi];
+        if (p.reg < 0 || p.end >= end
+                || jit_lin_point(edges, static_cast<int>(p.end)))
+            continue;
+        uint32_t hi = static_cast<uint32_t>(end);
+        for (const LsraPiece &q2 : pieces) {
+            if (&q2 == &p)
                 continue;
-            uint32_t hi = static_cast<uint32_t>(end);
-            if (k + 1 < kv.second.size()) {
-                const LsraPiece &pn = pieces[kv.second[k + 1]];
-                if (pn.reg >= 0 && pn.start < hi)
-                    hi = pn.start;
-            }
-            for (const size_t j : by_slot2[p.slot]) {
-                const LsraPiece &q2 = pieces[j];
-                if (&q2 != &p && q2.start >= p.end && q2.start < hi)
-                    hi = q2.start;
-            }
-            bool done = false;
-            for (uint32_t s = p.end + 1; s <= hi; s++) {
-                if (s == end
-                        || jit_lin_point(edges,
-                                         static_cast<int>(s))) {
-                    p.end = s;
-                    done = true;
-                    break;
-                }
-            }
-            if (!done)
-                p.reg = -1;
+            if ((q2.slot == p.slot
+                     || (q2.reg >= 0 && q2.reg == p.reg))
+                    && q2.start >= p.end && q2.start < hi)
+                hi = q2.start;
         }
+        bool done = false;
+        for (uint32_t s = p.end + 1; s <= hi; s++) {
+            if (s == end
+                    || jit_lin_point(edges, static_cast<int>(s))) {
+                p.end = s;
+                done = true;
+                break;
+            }
+        }
+        if (!done)
+            p.reg = -1;
+    }
 
     /* TRANSLATE: flushes (continuation ends) before installs at the
      * same pc; the model validates occupancy as it goes */
@@ -20852,7 +20886,6 @@ retry_emission:
             std::vector<LiveInterval> liv;
             std::vector<IntervalQual> lq;
             std::vector<MemEvent> lev;
-            LsraOut lplan;
             bool tmode_done = false;
             std::vector<MemEvent> liu;
             if (jit_slot_liveness(chunk, lsl)
@@ -20982,34 +21015,40 @@ retry_emission:
                     && jit_slot_liveness(chunk, lsl)
                     && jit_build_intervals(chunk, begin, end, lsl, liv)
                     && jit_qualify_intervals(chunk, begin, end, liv, lq,
-                                             nullptr, &lev, &liu)
-                    && jit_lsra_assign(chunk, begin, end, liv, lq, lev,
-                                       liu,
-                                       static_cast<int>(
-                                           max_pins + MAX_SPILL_HOMES),
-                                       lplan)) {
-                std::map<int, char> res;   /* slot -> all resident? */
-                for (const LsraPiece &p : lplan.pieces) {
-                    auto it = res.emplace(p.slot, 1).first;
-                    if (p.reg < 0)
-                        it->second = 0;
-                }
+                                             nullptr, &lev, &liu)) {
+                /* the WHOLE-RUN fallback is the pick's contract
+                 * restated on the interval facts - NOT a detour
+                 * through the plan's pieces. The earlier all-pieces-
+                 * resident rule was STRICTER than the pick for a
+                 * live-in slot with an IDLE PREFIX (43_sieve's inner
+                 * counters enter their loop-body run live-in and
+                 * untouched for the first pcs; that no-use stretch is
+                 * not a candidate piece, so all_res failed and the
+                 * hot inner counters ran from MEMORY: +37% Ir). A
+                 * qualifying slot needs: int evidence (wint > 0 - the
+                 * m3 rule), NO mem event on any interval (the d1
+                 * rule; the pick's bad()), no float facts, and the
+                 * pick's >= 3 floor. */
                 std::map<int, long> w;     /* slot -> qual weight */
                 std::map<int, long> wint;  /* the TYPE EVIDENCE half */
+                std::map<int, char> memq, flq;
                 for (size_t k2 = 0; k2 < liv.size(); k2++) {
                     w[liv[k2].slot] += lq[k2].uses_int
                                      + lq[k2].uses_ret;
                     wint[liv[k2].slot] += lq[k2].uses_int;
+                    memq[liv[k2].slot] |= lq[k2].mem_int;
+                    flq[liv[k2].slot] |= lq[k2].uses_float > 0
+                                       || lq[k2].wrote_float;
                 }
                 std::vector<std::pair<long, int>> cnd;
-                for (const auto &kv : res)
-                    if (kv.second && kv.first >= 0
+                for (const auto &kv : w)
+                    if (kv.first >= 0
                             && kv.first < chunk.slot_count
-                            /* uses_int > 0: the t_int flush needs an
-                             * int-op touch as evidence; a ReturnV-only
-                             * slot holds ANY type (the m3 finding) */
-                            && wint[kv.first] > 0)
-                        cnd.push_back({ w[kv.first], kv.first });
+                            && kv.second >= 3
+                            && wint[kv.first] > 0
+                            && !memq[kv.first]
+                            && !flq[kv.first])
+                        cnd.push_back({ kv.second, kv.first });
                 /* the pick's own order: weight desc, slot asc - so the
                  * downstream split (registers first, spill homes past
                  * max_pins) serves the heaviest first */
@@ -21027,6 +21066,10 @@ retry_emission:
                     hot_counts.push_back(static_cast<int>(cd.first));
                 }
                 lsra_chose = true;
+                if (getenv("MYLANG_LSRADBG"))
+                    for (const int h2 : hot)
+                        fprintf(stderr, "LSRADBG wr[%zu,%zu) hot "
+                                "slot %d\n", begin, end, h2);
             }
         }
         /* read only under TESTS (the execution-proof bump below) - a

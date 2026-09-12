@@ -8308,3 +8308,38 @@ caught both before CI could.
 Verified: vdjcmp 116/116 (bookkeeping adds no bytes), the full
 lever x arena -rt + corpus matrix, TESTS=1 OPT=1 both lever states,
 clang OPT=1 ASSERTS=0 LTO=0 zero warnings, census gate.
+
+## Endgame D3.b 2b-iii-d inc 2 (2026-08-23) - the whole-run fallback
+## restated on interval FACTS; 43_sieve's +37% was an idle prefix
+
+WHAT the broad ledger found (13 benches; the six-bench set had a
+corpus hole - the standing lesson, again): 43_sieve +37.27%,
+14_array_subscript +2.48%. The first theory (a reg neighbour blocking
+the trans-mode extension) was WRONG - trans mode never engages on 43
+at all (hoist regions decline it); the cost lived in the WHOLE-RUN
+BRIDGE FALLBACK, and LSRADBG on that branch showed it: the sieve's
+inner counters enter their loop-body run LIVE-IN and untouched for
+the first pcs, that idle prefix is not a candidate piece (no use
+inside), and the fallback's all-pieces-resident rule therefore
+excluded the run's HOTTEST slots - a rule stricter than the pick,
+which never cared about idle stretches.
+
+THE FIX: the whole-run fallback is now the pick's contract restated
+directly on the interval facts - int evidence (wint > 0, the m3
+rule), NO mem event on any interval (the d1 rule, the pick's bad()),
+no float facts, the >= 3 floor - with no detour through the plan's
+pieces at all (the fallback no longer calls jit_lsra_assign; the
+plan is a TRANS-mode input, and reading whole-run answers off its
+pieces was the category error). MEASURED: 43 +37.19% -> +0.45%,
+14 +2.48% -> +0.31%; the 10-bench ledger reads +0.12%..+1.24%
+(81_regs_int_14's +1.24% is the residual class).
+
+Rider: the trans-mode start-extension gained REASSIGNMENT (a piece
+whose extension the reg neighbour blocks moves to a register free
+over the extended span, lowest-first) - correct by the snap model's
+machine checks and green everywhere, but its REACH is unverified (43
+was not its shape after all); noted, not claimed.
+
+Verified: full lever x arena -rt + corpus, vdjcmp 116/116 default,
+TESTS=1 OPT=1 both lever states, clang OPT=1 ASSERTS=0 LTO=0 zero
+warnings, census gate.
