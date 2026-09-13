@@ -7869,8 +7869,29 @@ static void specialize_arith_ops(Chunk &ck)
                                        : OpCode::IntAddRR; break;
             case Op::minus: in.op = ri ? OpCode::IntSubRI
                                        : OpCode::IntSubRR; break;
-            case Op::times: in.op = ri ? OpCode::IntMulRI
-                                       : OpCode::IntMulRR; break;
+            case Op::times:
+                /* #100: `x * 2^k` -> `x << k` AT THE BYTECODE LEVEL,
+                 * so both engines take the shift (the JIT's IntShlRI
+                 * arms then emit `shl` where imul's 3-cycle latency
+                 * sat on the dependency chain). EXACT for every int64
+                 * x: bit_shl with a count in [1,62] is the plain
+                 * shift, and x*2^k == x<<k mod 2^64 under -fwrapv -
+                 * no operand can make one throw where the other does
+                 * not. m == 0/1 and every non-power stay IntMulRI
+                 * (the JIT strength-reduces those at emit; see
+                 * mul_plan, jit.cpp). */
+                if (ri && in.b_lit() >= 2
+                        && (in.b_lit() & (in.b_lit() - 1)) == 0) {
+                    int_type k = 0;
+                    while (!((in.b_lit() >> k) & 1))
+                        k++;
+                    in.op = OpCode::IntShlRI;
+                    in.pb = k;             /* the count (kind stays
+                                            * the int literal m was) */
+                    break;
+                }
+                in.op = ri ? OpCode::IntMulRI
+                           : OpCode::IntMulRR; break;
             case Op::band:  in.op = ri ? OpCode::IntAndRI
                                        : OpCode::IntAndRR; break;
             case Op::bor:   in.op = ri ? OpCode::IntOrRI

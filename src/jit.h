@@ -1254,6 +1254,11 @@ extern "C" unsigned long g_jit_two_addr;
 /* #96 increment 2: `<op> pin, <src>` - the two-address form with a
  * PINNED destination, which collapses four instructions to one uop. */
 extern "C" unsigned long g_jit_two_addr_reg;
+/* #100: a literal multiply emitted as shl/lea/neg forms instead of
+ * imul (the #91 div-magic sibling). Bumped from the EMITTED code, so
+ * it is an execution count - the "prove the code ran" counter for the
+ * strength-reduced forms (TESTS builds only, like its siblings). */
+extern "C" unsigned long g_jit_mul_strength;
 extern "C" unsigned long g_jit_rax_retries;
 /* #96 increment 3: a counted loop whose counter is PINNED - the step
  * and the bound test run entirely in registers, RAX untouched. */

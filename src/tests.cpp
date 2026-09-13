@@ -27430,6 +27430,134 @@ static bool jit_two_address()
 #endif
 }
 
+/*
+ * #100 - the MULTIPLY strength reduction (div_magic's sibling), three
+ * claims: (1) `x * 2^k` is rewritten to IntShlRI at the BYTECODE level
+ * (specialize_arith_ops) - checked STRUCTURALLY on the compiled chunk;
+ * (2) the JIT's planned forms (lea / shl+neg / mov+shl+add/sub) EMIT
+ * AND EXECUTE - g_jit_mul_strength is bumped from the emitted code, so
+ * a nonzero delta is the "prove the code ran" evidence; (3) the VALUES
+ * match the tree-walker byte-for-byte, wraparound included - the
+ * expected output is computed by running the SAME source through the
+ * tree-walker, so a wrong lea scale or a flipped shl_add/shl_sub is a
+ * value divergence here, not just in the corpus sweep
+ * (tests/functional/19_mul_strength.my, the exhaustive multiplier x
+ * value matrix).
+ */
+static bool jit_mul_strength_check()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    bool ok = true;
+
+    const auto compile_only =
+        [](const std::string &src) -> VmProgram {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        return vm_compile(root.get(), /*jit=*/false);
+    };
+
+    /* (1) the bytecode rewrite: `* 8` must compile to IntShlRI, and no
+     * IntMulRI-by-a-power may survive. The multiplicand is runtime so
+     * no AST fold can eat the shape. */
+    {
+        VmProgram prog = compile_only(
+            "var x = 0; x = x + runtime(7);\n"
+            "var y = x * 8; print(y, x * 2);\n");
+        int shl = 0, mulpow = 0;
+        for (const Instr &in : prog.root.code) {
+            if (in.op == OpCode::IntShlRI)
+                shl++;
+            if (in.op == OpCode::IntMulRI && in.b_lit() >= 2
+                    && (in.b_lit() & (in.b_lit() - 1)) == 0)
+                mulpow++;
+        }
+        if (shl < 2 || mulpow != 0) {
+            cout << "  mul_strength: the bytecode rewrite did not fire "
+                    "(IntShlRI x" << shl << ", power-of-2 IntMulRI x"
+                 << mulpow << " - want >= 2 and 0)\n";
+            ok = false;
+        }
+    }
+
+    /* (2) + (3): run a program through BOTH engines; the tree-walker's
+     * stdout is the oracle, and the counter delta proves the planned
+     * forms executed. */
+    const auto go = [](const std::string &src, bool tw,
+                       unsigned long *hits) -> std::string {
+        const unsigned long m0 = g_jit_mul_strength;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (tw) root->eval(nullptr); else vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        if (hits)
+            *hits = g_jit_mul_strength - m0;
+        return cap.str();
+    };
+
+    struct Case { const char *name; std::string src; bool fires; };
+    const Case cases[] = {
+        /* the GENERIC arm: temp dsts (h*31 -> shl_sub via hold()/tmp,
+         * i*17 -> shl_add, i*3 -> lea, i*10 -> lea+shl, i*-5 ->
+         * lea+neg) in a hot loop; values wrap nowhere, the oracle is
+         * still the tree-walker */
+        { "generic",
+          "func f(int n) { var h = 7; var s = 0;\n"
+          "  for (var i = 0; i < n; i++) {\n"
+          "    h = h * 31 + i; s = s + i * 17 + i * 3\n"
+          "        + i * 10 + i * (0 - 5); }\n"
+          "  return h + s; }\n"
+          "print(f(runtime(4000)));\n",
+          true },
+        /* the PINNED two-address arm: `a = a * 3` (dst == src, lea -
+         * scratch-free) - and `b = b * 31`, which the arm DECLINES to
+         * imul (the one-window rule); its value pins the decline's
+         * correctness whichever arm serves it. Both wrap - mod-2^64
+         * exactness is the claim. */
+        { "pinned two-address",
+          "func g(int n) { var a = 0; a = a + runtime(7);\n"
+          "  var b = 0; b = b + runtime(3);\n"
+          "  for (var i = 0; i < n; i++) { a = a * 3; b = b * 31; }\n"
+          "  return a + b; }\n"
+          "print(g(runtime(5000)));\n",
+          true },
+    };
+    for (const Case &c : cases) {
+        unsigned long hits = 0;
+        const std::string want = go(c.src, /*tw=*/true, nullptr);
+        const std::string got = go(c.src, /*tw=*/false, &hits);
+        if (got != want) {
+            cout << "  mul_strength [" << c.name << "]: tw '" << want
+                 << "' vs jit '" << got << "'\n";
+            ok = false;
+        }
+        if (c.fires && hits == 0) {
+            cout << "  mul_strength [" << c.name
+                 << "]: no planned form executed (vacuous)\n";
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_reg_model()
 {
 #if ML_JIT_SUPPORTED
@@ -36141,6 +36269,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: two-address arithmetic `<op> [slot], reg` for dst = dst OP b "
       "- engages per MR-encodable op, declines for imul (#96)",
       jit_two_address },
+    { "jit: #100 mul strength reduction - bytecode shl rewrite, planned "
+      "lea/shl forms execute, values match the tree-walker",
+      jit_mul_strength_check },
     { "jit: the register MODEL - capability bits re-derived from the "
       "encoders, pool invariants, allocator contract (#96 (c))",
       jit_reg_model },
