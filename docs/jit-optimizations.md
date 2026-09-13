@@ -8708,3 +8708,35 @@ transitions involved - the tmode pin set meets the ElemScratch
 divisor-gate roles; the cold replay is bisected OUT). Both recorded
 in the plan with the repro; shipping and lever-on corpus behavior
 are unchanged except the 68 epilogue re-bind.
+
+## C2b-regions arc step 3 (2026-08-25) - the elem2-divmod wrong
+## value fixed (RefScratch's excl); the xrot matrix finds a
+## pre-existing lever defect
+
+The open wrong value is diagnosed and closed: RefScratch granted
+the ref-check scratch a register the allocator sees as FREE but
+which holds the op's ISA RESULT - idiv leaves the mod remainder in
+rdx, the encoder's claim is transient, and with rcx unavailable
+the grant handed rdx to the type-tag load, so jit_put_int received
+the type pointer's dword as the value (mods 1531 vs 513 on
+17_elem2_divmod_roles). Only the CALLER knows where the value
+lives: emit_ref_check gains `excl`, passed by store_dst and both
+of store_dst_bool's scratches; when even the preferred register is
+excluded, the push-borrow arm serves - push/pop restores the value
+before use, so borrowing an excluded register is safe where
+granting it is not. Verified 513 under the lifted gate with the
+whole lever-on corpus green; default emission 116/116 unchanged.
+A latent hole any dense-enough pin set could reach.
+
+The pair's DISPLACE branch is now forbidden under tmode (leftover-
+only) - the zip-corruption diagnosis stands at the site.
+
+The gates STAY closed on one remaining, PRE-EXISTING defect the
+lever-on xrot matrix found (it had never been run): rotation 4
+puts rax first, a lever pin spans the elem2 fused read, and its
+raw `mov rax, [rcx+r9*8]` never asks the Phase-A conflict
+machinery - JIT-REGTRACK aborts at compile, the tripwire doing
+its job. Repro: MYLANG_JIT_LSRA=1 MYLANG_JIT_XROT=4 on
+tests/functional/16_elem2_fused.my, at committed HEAD. The fix
+arc is the elem2 raw-rax sites joining ask-and-evict, then the
+re-lift.

@@ -829,8 +829,36 @@ hregs.empty() WAS LIFTED, one diagnosed, one open:
    NOT the cold replay (neutralizing it changes nothing). Next
    diagnostic: -vdj diff the divisor-gate sequence between the
    fallback and tmode pin sets on that file's hot chunk.
-THEN: the pair-displacement fix + the roles diagnosis, re-lift;
-the wall A/B + flip gate.
+STEP 3, 2026-08-25 - BOTH BLOCKERS FIXED; A THIRD FOUND BY THE
+XROT MATRIX (pre-existing, so the gates stay closed on it alone):
+ - the elem2-divmod wrong value DIAGNOSED AND FIXED: RefScratch
+   granted the ref-check scratch a register the allocator sees as
+   FREE but which holds the op's ISA RESULT (idiv's rdx - the mod
+   remainder being stored); the helper then received the type
+   pointer's dword as the value. The fix is emit_ref_check's
+   `excl` (the VALUE's registers), passed by store_dst and BOTH
+   of store_dst_bool's scratches; when even the preferred reg is
+   excluded, the push-borrow arm serves (push/pop restores the
+   value before use). VERIFIED: 513 under the lifted gate and
+   the whole lever-on corpus green with gates lifted. A latent
+   hole ANY dense pin set could reach - tmode merely got there
+   first. Default emission 116/116 unchanged (rcx free -> the
+   grant lands as before).
+ - the pair displacement forbidden under tmode (leftover-only;
+   the zip-corruption diagnosis stands, commented at the site).
+ - ⛔ NEW, PRE-EXISTING (reproduces at HEAD, gates closed):
+   MYLANG_JIT_LSRA=1 MYLANG_JIT_XROT=4 on tests/functional/
+   16_elem2_fused.my - rotation 4 puts rax first, a lever pin
+   lands in rax and SPANS the elem2 fused read, whose raw
+   `mov rax, [rcx+r9*8]` never ASKS the Phase-A conflict
+   machinery - JIT-REGTRACK aborts at compile (vm pc 67, opcode
+   126; the tripwire working as designed). The pick's rax spans
+   never crossed that site; the lever's do. ⛔ THE LEVER-ON XROT
+   MATRIX HAD NEVER BEEN RUN - add it to the standing battery.
+   The fix arc: the elem2 raw-rax sites join the ask-and-evict
+   protocol (the Phase-A generic arm), then re-lift the gates
+   (they now fail ONLY on this).
+THEN: the elem2 rax asks + re-lift; the wall A/B + flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
