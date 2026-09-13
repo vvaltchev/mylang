@@ -21410,28 +21410,17 @@ retry_emission:
                             lsra_ftr.swap(ftr);
                             lsra_fentry.swap(fentry);
                             lsra_f_tmode = true;
-                            /* one machinery per slot: a transitioned
-                             * slot leaves the float type-elision and
-                             * read-elision extras */
-                            if (!lsra_ftr.empty()) {
-                                const auto hit2 = [&](int s) {
-                                    for (const LsraTrans &t2 : lsra_ftr)
-                                        if (t2.evict_slot == s
-                                                || t2.install_slot == s)
-                                            return true;
-                                    return false;
-                                };
-                                std::vector<int> tx;
-                                for (const int s : textra_f)
-                                    if (!hit2(s))
-                                        tx.push_back(s);
-                                textra_f.swap(tx);
-                                tx.clear();
-                                for (const int s : fread_raw)
-                                    if (!hit2(s))
-                                        tx.push_back(s);
-                                fread_raw.swap(tx);
-                            }
+                            /* #103: the v1 exclusion is LIFTED on the
+                             * float side too - a transitioned slot
+                             * keeps its C4a-i read elision and float
+                             * type elision. Same review as the GP
+                             * twin: the float seam's evict writes the
+                             * t_float tag itself, and both elisions'
+                             * soundness (every writer a float op) is
+                             * per-SLOT, orthogonal to residency;
+                             * emit_float_load already serves a pinned
+                             * slot before the elided path (the pick's
+                             * "overlap is harmless" note). */
                             if (getenv("MYLANG_LSRADBG"))
                                 for (const LsraTrans &t2 : lsra_ftr)
                                     fprintf(stderr, "LSRADBG   ftrans "
@@ -21689,21 +21678,16 @@ retry_emission:
                 bound.push_back(b2);
             }
             lsra_tr.swap(bound);
-            /* a transitioned slot leaves the C3 type-elision extras -
-             * one machinery per type word in v1 */
-            if (!lsra_tr.empty()) {
-                std::vector<int> tx;
-                for (const int s : textra) {
-                    bool hit = false;
-                    for (const LsraTrans &tr2 : lsra_tr)
-                        if (tr2.evict_slot == s
-                                || tr2.install_slot == s)
-                            hit = true;
-                    if (!hit)
-                        tx.push_back(s);
-                }
-                textra.swap(tx);
-            }
+            /* #103: the v1 "one machinery per type word" exclusion is
+             * LIFTED - a transitioned slot keeps its C3 type elision.
+             * The review the v1 note deferred: the seam's evict arm
+             * writes the tag itself (store_type_tag + store), the
+             * install arm loads payload only, and C3's soundness
+             * (every writer is an int op, no full-value reads) is a
+             * property of the SLOT's ops, orthogonal to where the
+             * value resides at any pc. A slot both resident and
+             * type-elided at a barrier flush gets its tag written
+             * twice (the cache loop and tflush) - harmless. */
         }
         if (pair_lo >= 0) {
             e.saved.push_back(static_cast<uint8_t>(pair_lo));
