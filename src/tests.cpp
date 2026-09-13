@@ -29125,6 +29125,20 @@ static bool jit_hoist_c1()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
+    /* #103: this test pins the PICK's placements - the DISPLACEMENT
+     * case especially, whose trade is FORBIDDEN under tmode (the
+     * entry-occupant zip) - so it forces the default allocator for
+     * its duration, the documented convention
+     * (jit_hoist_pair_conflict next door already does). Found by the
+     * off-arena lane the day the second chance widened tmode's
+     * residency: the shrunken pool left the pair no leftovers and
+     * the second-base preheader never ran. */
+    const bool lsra_saved = g_jit_lsra;
+    g_jit_lsra = false;
+    struct Restore {
+        bool v;
+        ~Restore() { g_jit_lsra = v; }
+    } lsra_restore{ lsra_saved };
 
     auto go = [&](const std::vector<const char *> &src, bool vm,
                   unsigned long *hoist,
