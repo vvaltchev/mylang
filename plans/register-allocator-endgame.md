@@ -796,7 +796,41 @@ snap refusing transition pcs in [T, L+1] per region (mirror of
 noseam), and (b) the cold copy emitted against the REPLAYED cache
 state at T (base + seams/trans <= T - the stub-replay recompute),
 which with (a) equals the state everywhere in the region.
-THEN: that tmode lift; the wall A/B + flip gate.
+THE TMODE LIFT, ATTEMPTED 2026-08-25 - MACHINERY LANDED, GATES
+KEPT CLOSED. What landed and is LIVE: (1) jit_lsra_snap's
+`noreach` refusal ((T, L+1] per region - a transition AT T is
+legal, emitted before the guard); (2) the cold copies emitted
+against the REPLAYED guard-point state (base + ShareSeams <= T +
+transitions <= T; snapshot/restore brackets, ra rebuilt busy <=>
+entry; no code emitted - the registers hold the values at
+runtime). The replay fix is VISIBLE on lever-on 68_nested: its
+cold exits re-bound to the guard-point epilogue (jump targets
+only; lever-on 68 has seams + regions - ⛔ the coexistence scan
+ran DEFAULT config only, lever-on's pin/home economy differs, so
+the fresh-window bug was LIVE there in emission, dormant only
+because a C1 guard never fails at runtime).
+⛔ WHY THE GATES STAYED CLOSED - TWO NEW INTERACTIONS FOUND WHEN
+hregs.empty() WAS LIFTED, one diagnosed, one open:
+ - DIAGNOSED (structurally, no repro needed): the C2b PAIR's
+   DISPLACE branch pops pins from `hot` AFTER the plan spent
+   them - under tmode `hot` is the entry-occupant list whose
+   ORDER is the abstract-reg zip, so displaced pins stay
+   "resident" per the plan but are never loaded (hot_reg is
+   built post-displacement, so the aphys ML_CHECK does not even
+   abort). The lift must forbid displacement under tmode
+   (leftover-only; else drop the second bases - C1 status quo).
+ - OPEN, WITH A ONE-COMMAND REPRO: lever-on tmode on
+   tests/functional/17_elem2_divmod_roles.my prints mods=1531
+   where 513 is right (third value; rt green, corpus catches
+   it). The chunk shows NO transitions - the wrongness is the
+   tmode PIN SET meeting the elem2 compound-divmod ElemScratch
+   ROLES (the file exists to test exactly that class: roles
+   moved off preferred registers under pin pressure). Bisected:
+   NOT the cold replay (neutralizing it changes nothing). Next
+   diagnostic: -vdj diff the divisor-gate sequence between the
+   fallback and tmode pin sets on that file's hot chunk.
+THEN: the pair-displacement fix + the roles diagnosis, re-lift;
+the wall A/B + flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the

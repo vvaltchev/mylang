@@ -8682,3 +8682,29 @@ The finding also sizes the remaining tmode lift: transitions inside
 a region are impossible by the snap's own lin rule, so lifting
 hregs.empty() needs only the snap's [T, L+1] refusal (the noseam
 mirror) plus the cold copy emitted against the replayed state at T.
+
+## C2b-regions arc step 2 (2026-08-25) - the tmode-lift machinery
+## lands (gates closed); the cold-copy fresh-window fixed for real
+
+jit_lsra_snap gains `noreach` ((T, L+1] per region; a transition AT
+T is legal - emitted before the guard, both paths see it), and each
+cold copy is now emitted against the REPLAYED guard-point cache
+state - base + ShareSeams <= T + transitions <= T, ra rebuilt to
+busy <=> entry, snapshot/restore bracketing, no code emitted. The
+first replay version applied only transitions; the stub replay's
+rule (seams too) is the correct one, and lever-on 68_nested proves
+it matters: its cold exits re-bound to the guard-point epilogue -
+lever-on 68 HAS seams + regions (the coexistence scan ran default
+config only; lever-on's pin/home economy differs), so the
+fresh-window defect was live in its emission, dormant only because
+a C1 guard never fails at runtime.
+
+The hregs.empty() tmode gates stay CLOSED: lifting them exposed two
+further interactions - the C2b pair's DISPLACE branch pops pins
+from `hot` after the plan spent them (under tmode `hot` IS the
+abstract-reg zip; displaced pins stay "resident" but unloaded), and
+an open wrong-value on 17_elem2_divmod_roles (mods 1531 vs 513, no
+transitions involved - the tmode pin set meets the ElemScratch
+divisor-gate roles; the cold replay is bisected OUT). Both recorded
+in the plan with the repro; shipping and lever-on corpus behavior
+are unchanged except the 68 epilogue re-bind.

@@ -498,6 +498,17 @@ void jit_run_edges(const Chunk &ck, size_t begin, size_t end,
  * interval (the disjoint-pools rule; uses_ret exempt). Everything
  * else - lin points, demotion, translation, the occupancy model -
  * is register-file-agnostic and shared verbatim. */
+/* `noreach` (the C2b tmode lift): pc ranges (T, L+1] of the run's
+ * hoist REGIONS, where a transition may NOT sit - the region's cold
+ * copy is entered by the failed C1 guard (an emission edge the edge
+ * scan cannot see), replays [T, L] and rejoins at label[L+1], PAST
+ * anything emitted there; a transition in (T, L+1] simply never
+ * runs on the cold path. A transition AT T is legal - it is emitted
+ * before the guard, so both paths see it - and the cold copy is
+ * emitted against the replayed state at T, which the refusal makes
+ * constant across the region. Interior region pcs are already
+ * non-lin-points (the loop back edge), so in practice this bounds
+ * only L+1 and start-relocation scans. */
 bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                    const std::vector<LiveInterval> &iv,
                    const std::vector<IntervalQual> &q,
@@ -505,7 +516,9 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                    std::vector<LsraPiece> &pieces,
                    std::vector<int> &entry_by_reg,
                    std::vector<LsraTrans> &trans,
-                   const std::vector<FltEvent> *fev = nullptr);
+                   const std::vector<FltEvent> *fev = nullptr,
+                   const std::vector<std::pair<size_t, size_t>>
+                       *noreach = nullptr);
 #ifdef TESTS
 /* Test-only export of the (static) pick - the D3 qualification check
  * asserts per-interval facts against the pick's public answer. */
