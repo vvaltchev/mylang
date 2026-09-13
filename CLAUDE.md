@@ -123,6 +123,15 @@ them means anything:**
   Oracle: the counters are bumped from EMITTED code only.
 - **`tests/corpus_diff.sh`** - do the engines agree. Oracle: the
   `--levers` / `--cold` / `--xrot` / `--nolowmem` matrices.
+  **⛔ IT COMPARED ONLY `tail -3` UNTIL 2026-08-26** - the last THREE
+  LINES of each program - so a divergence anywhere earlier was
+  INVISIBLE, and the tool answered "28/28 agree" for a binary that
+  printed `1 0` where the tree-walker printed `true false`. The
+  truncation was only ever meant to keep the DIFF MESSAGE short; it
+  compares the WHOLE output now and truncates the printed `diff`
+  instead. The re-run over every matrix found nothing else hidden -
+  the corpus was clean, the tool simply could not have proved it.
+  **A comparison oracle must compare everything it claims to.**
 - **`MYLANG_NO_LOWMEM=1`** - refuse the low-address arena, so the
   JIT's REGISTER-form type tags (the shipping configuration wherever
   `MAP_32BIT` is unavailable or fails) are reachable by a test.
@@ -3098,7 +3107,28 @@ its promoted value, so a typed scalar over bool operands is unboxed like int
 (the boxing in `TypedScalarExpr::do_eval`/`LiteralBool` keeps a bool where it
 must — a comparison/logical/`!` result, a bool literal — while arithmetic over
 bools correctly yields int). `Construct`/`Identifier`/`Subscript`
-`eval_int`/`eval_float` read a bool value/slot/flat element as `0`/`1`. After
+`eval_int`/`eval_float` read a bool value/slot/flat element as `0`/`1`.
+**⛔ SO `th == i` DOES NOT MEAN "int" - IT ALSO MEANS BOOL, AND A
+CONSUMER THAT NEEDS THE VALUE MUST ASK (`Construct::th_bool`, added
+2026-08-26).** The VM lost that distinction for four shapes:
+`compile_boxed_expr` lowered a `th==i` node through the typed INT path
+on the written argument that the result "is a valid int EvalValue, so a
+boxed consumer reads it fine" - true for an int, FALSE for a bool. So
+`a[i]`, `p.b`, `d[k]` and a slice element printed **`1`/`0`** under the
+VM and the JIT where the tree-walker printed `true`/`false` - a RULE 2
+divergence that shipped, while a bool VARIABLE, RETURN, `foreach`,
+unpack and `dyn` read were all correct (which is exactly why nothing
+noticed). `th_bool` is set wherever the inferencer stamps `th=i` for a
+Bool type, and `compile_boxed_expr` falls through to the BOXED lowering
+for it. **The `truthy_only` exemption is not a shortcut**: a consumer
+that only asks `is_true()` cannot tell an int 0/1 from a bool, so the
+four JumpUnlessTrueV feeders (if/while/for/ternary conditions) keep the
+typed path - without it, `if (a[k])` stopped emitting LoadElemInt and
+the E4 peephole that fuses it into `JumpUnlessElemInt`
+(57_bool_reduce's whole hot loop) no longer matched. Pinned by
+`tests/functional/20_bool_value_reads.my`, which asserts BOTH halves -
+the value shapes render as bools, the condition/arithmetic shapes still
+promote to 0/1. After
 `resolve_names`, `specialize_types`
 (`inferencer.cpp`, called from `mylang.cpp` + the test harness, gated by `-nti`)
 rewrites hot scalar nodes — `Expr03/04` (arith), `Expr06/07` (compare),

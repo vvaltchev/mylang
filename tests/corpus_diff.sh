@@ -91,11 +91,21 @@ progs() {
 run_one() {                      # $1 = env assignment ("" = plain)
   local bad=0 n=0 a b
   for f in $(progs); do
-    a=$(timeout 60 "$BIN" -tw "$f" 2>&1 | tail -3)
-    b=$(env $1 timeout 60 "$BIN" "$f" 2>&1 | tail -3)
+    # ⛔ COMPARE THE WHOLE OUTPUT. This used to pipe both sides through
+    # `tail -3`, so a divergence anywhere but a program's last three
+    # lines was INVISIBLE - the tool answered "28/28 agree" for a
+    # binary that printed `1 0` where the tree-walker printed
+    # `true false`, because the offending lines were at the top. The
+    # truncation was only ever meant to keep the DIFF MESSAGE short,
+    # which is what the diff below does instead: compare everything,
+    # print the first few DIFFERING lines (more useful than the tail).
+    a=$(timeout 60 "$BIN" -tw "$f" 2>&1)
+    b=$(env $1 timeout 60 "$BIN" "$f" 2>&1)
     n=$((n + 1))
     if [ "$a" != "$b" ]; then
-      echo "DIFF [${1:-plain}] $f"; echo "  tw : $a"; echo "  jit: $b"
+      echo "DIFF [${1:-plain}] $f"
+      diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") \
+        | head -8 | sed 's/^/  /'
       bad=$((bad + 1))
     fi
   done
