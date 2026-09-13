@@ -108,6 +108,8 @@ unsigned long g_jit_member_noguard = 0; /* C4d: guard-elided member reads */
 unsigned long g_jit_ctor_est = 0;      /* C4e: established ctor preheaders */
 unsigned long g_jit_release_entry = 0; /* C5: entries that released a temp */
 unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
+unsigned long g_jit_cold_copy = 0;     /* C1: region COLD-COPY entries (a
+                                        * failed guard took the copy) */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
 unsigned long g_jit_callee_cache = 0;  /* G1: callee-cache HITS (emitted) */
 unsigned long g_jit_callee_cache2 = 0; /* G1: hits on the SECOND entry */
@@ -9313,6 +9315,7 @@ void jit_stats_report()
         { "elem2_fast",       &g_jit_elem2_fast },
         { "elem_slice_fast",  &g_jit_elem_slice_fast },
         { "hoist",            &g_jit_hoist },
+        { "cold_copy",        &g_jit_cold_copy },
         { "hoist2",           &g_jit_hoist2 },
         { "hoist_rmw",        &g_jit_hoist_rmw },
         /* #96: the two halves of the element tier's REGISTER supply -
@@ -22865,6 +22868,15 @@ retry_emission:
             const size_t cT = hregs[ri].T, cL = hregs[ri].L;
             for (const size_t j : h_cold[ri])
                 e.patch32_here(j);
+#ifdef TESTS
+            /* the cold-copy EXECUTION count - `hoist` counts
+             * preheader entries and says nothing about the guard's
+             * verdict. Built for the 43 two_addr chase, where it
+             * REFUTED the cold-copy theory in one run (zero in both
+             * configs); it stays as the guard's missing verdict
+             * observability. */
+            e.bump_counter(&g_jit_cold_copy);
+#endif
             g_fwd = JitFwd{};
             /* the C2b tmode lift: the copy is emitted against the
              * REPLAYED cache state at T - e.cache/e.fcache here hold

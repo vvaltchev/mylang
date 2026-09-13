@@ -1202,6 +1202,9 @@ extern "C" unsigned long g_jit_lsra_ftrans;
 /* seams the share plan refused inside a C2b hoist region (the
  * cold-path-bypass hazard; compile-time, not from emitted code) */
 extern "C" unsigned long g_jit_share_clamped;
+/* C1: region cold-copy ENTRIES (a failed guard took the copy) - the
+ * per-verdict twin of g_jit_hoist's per-preheader count */
+extern "C" unsigned long g_jit_cold_copy;
 /* D3.b 2b-iii-b: lsra TRANSITIONS executed (bumped by the emitted
  * transition code itself - flush and install arms alike). */
 extern "C" unsigned long g_jit_lsra_trans;
