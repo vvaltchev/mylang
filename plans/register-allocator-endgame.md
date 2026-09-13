@@ -1166,10 +1166,15 @@ paradox (drefs -40% yet 1.43x WORSE) found a PRE-EXISTING
 corpus-wide tax: fmov_rr emitted reg-reg MOVSD, whose upper-half
 merge is a false dependency serializing every float chain -
 MOVAPS fixed it for 04_float_arith 0.53x, 55_float_sum 0.85x, 89
-0.87x wall. The second-chance re-queue remains unbuilt (the holes
-made it unnecessary for the phased class); the suite-geomean
-close is blocked on the standing 28_str_concat python-recompute
-timeout.
+0.87x wall. The second-chance re-queue LANDED 2026-08-25
+(maintainer-directed completion of (b) to its original two-half
+design) - the event-driven walk, park/re-bid at lin points, the
+density contest as the churn guard; see docs/jit-optimizations.md
+#103b-2. 83 - the bench that killed v1 at +7.9% - takes 2 re-bids
+at zero per-iteration cost. The 28_str_concat blocker is FIXED
+(the .py's module-level accumulator defeated CPython's in-place
+append - function-wrapped, 2-11 min -> 0.11s; recompute default
+timeout 600s), so the suite-geomean close is unblocked.
 THE FIX CLASS, for the maintainer to sequence: (a) DENSITY-AWARE
 eviction/admission (uses-remaining / span-remaining instead of
 next-use distance) reaches roughly pick parity on this shape; (b)

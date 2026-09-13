@@ -25517,6 +25517,25 @@ static bool jit_lsra_check()
           "  b = b + k; b = b + 1; b = b + 2;\n"
           "}\n"
           "print(a + b);\n" },
+        /* the second-chance shape (#103b-2): b is touched in loop 1
+         * (so no use gap contains a FULL loop - the hole pass cannot
+         * pre-split it) and hot in loop 2; a out-densities it in
+         * loop 1, so b loses at arrival. Without the re-queue b is
+         * memory for its whole interval while the register sits
+         * FREE after a dies; with it, b parks, re-bids at the
+         * post-loop lin point and takes the register for loop 2
+         * (out-densifying the loop-2 counter). */
+        { "second chance serves the survivor", 1,
+          "var a = 0; var b = 0; var n = 0; n = n + runtime(30);\n"
+          "for (var i = 0; i < n; i++) {\n"
+          "  a = a + i; a = a + 1; a = a + 2;\n"
+          "  b = b + i;\n"
+          "}\n"
+          "a = 0;\n"
+          "for (var k = 0; k < n; k++) {\n"
+          "  b = b + k; b = b + 1; b = b + 2;\n"
+          "}\n"
+          "print(a + b);\n" },
         /* the 89 microshape: at z's arrival the holder a has a NEAR
          * next use (the very next statement) but only ~3 remaining
          * events, while z's uses are FAR (its loop) but dense (6
@@ -25774,6 +25793,32 @@ static bool jit_lsra_check()
                 printf("  lsra [%s]: the run-refused hot interval is "
                        "not register-resident - the payoff is not "
                        "collected\n", c.name);
+                ok = false;
+            }
+        }
+        if (std::string(c.name) == "second chance serves the survivor") {
+            /* b (slot 1) must be register-resident somewhere AND the
+             * plan must record a WON re-bid - the vacuity guard: a
+             * plan that serves b some other way (a future pass) must
+             * not silently retire this case's subject. Without the
+             * re-queue b's verdict is sealed at its arrival and its
+             * residency is ZERO - the watched sabotage (neuter
+             * park). */
+            std::map<int, long> rl;
+            for (const LsraPiece &p : plan.pieces)
+                if (p.reg >= 0)
+                    rl[p.slot] += p.end - p.start;
+            const long b_len = rl.count(1) ? rl[1] : 0;
+            if (b_len == 0) {
+                printf("  lsra [%s]: b resident %ld pcs - the loser "
+                       "never re-bid (the second chance is off)\n",
+                       c.name, b_len);
+                ok = false;
+            }
+            if (plan.rebids < 1) {
+                printf("  lsra [%s]: rebids == %d - the case no "
+                       "longer exercises a won re-bid (vacuous)\n",
+                       c.name, plan.rebids);
                 ok = false;
             }
         }
