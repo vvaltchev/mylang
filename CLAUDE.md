@@ -5518,6 +5518,25 @@ first two cannot see what the third checks:
     per-field byte offset plus ITS OWN store width must land inside the
     instance (the width matters: a blanket 8 falsely refuses a trailing
     bool).
+**⛔ AND A FOURTH SHAPE ALL THREE LAYERS MISS BY CONSTRUCTION: A
+CONSTRUCTOR THE LOADER ITSELF CALLS (2026-08-25).** The three layers
+bound what an image CONTAINS. They cannot bound an argument the READER
+supplies: `read_value`'s `func` case built
+`FuncObject(desc, nullptr)`, whose ctor ran `get_root_ctx(nullptr)` -
+`while (ctx->parent)` on a null pointer - so `mylang prog.myv`
+SEGFAULTED for any image whose pool holds a FUNCTION value, i.e. on a
+VALID image of our own making, not a hostile one. **A `pure func` in a
+const array (`const OPS = [sq];`) is the whole reproducer**, and no net
+saw it for one reason worth generalising: **no corpus program produced
+that record**, so `myv_fuzz.py` mutated an image that never contained a
+`func` value and `myv_round_trip` round-tripped one too. The fat fuzz
+corpus now ends with exactly that shape, and `driver_checks.sh` runs the
+image and compares it to the source run (watched failing: `img 139`).
+A ctx-less closure is capture-free - the reader now REFUSES any other
+kind rather than trusting the writer's assertion - and gets a null
+`capture_root`, for which `do_func_call` substitutes the CALLER's root.
+**When a loader hands a value to a runtime constructor, the constructor's
+PRECONDITIONS are part of the format's trust model.**
 **TIER 2 - THE PROVENANCE GATE (`ML_UNTRUSTED_CHECK`, defs.h).** A few facts
 no load-time pass can decide, because they belong to the VALUE in a slot and
 not to the image: a flat array's storage-kind union tag, a struct field index

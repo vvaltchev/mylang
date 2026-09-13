@@ -671,7 +671,20 @@ do_func_call(EvalContext *ctx,
      * The parent is the closure's captured ROOT (G2): the empty link context
      * that used to sit between them passed root's fields through unchanged -
      * see FuncObject::capture_root. */
-    EvalContext args_ctx(obj.capture_root, false, true);
+    /*
+     * A closure loaded from a .myv pool has NO root of its own (it was built
+     * before any EvalContext existed - see FuncObject::capture_root). It is
+     * capture-free, so its body reads only globals and builtins, and those
+     * live in the CALLER's root: substituting it keeps the body's lookups
+     * defined instead of handing it a parent-less context whose `gfuncs` is
+     * null. Never taken for a closure the running program created.
+     */
+    EvalContext *croot = obj.capture_root;
+
+    if (!croot && ctx)
+        croot = get_root_ctx(ctx);
+
+    EvalContext args_ctx(croot, false, true);
 
     /*
      * A SymKind::capture reference in the body reads this closure's

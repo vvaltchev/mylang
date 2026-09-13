@@ -813,9 +813,20 @@ EvalValue read_value(Reader &r)
     }
     case VTag::func: {
         const uint32_t fi = r.idx(r.descs.size(), "corrupt .myv (descriptor)");
-        /* a pool FuncObject is capture-free (asserted on write), so the
-         * root ctx it links to is the one the run installs */
-        return EvalValue(make_intrusive<FuncObject>(r.descs[fi], nullptr));
+        const FuncDescriptor *fd = r.descs[fi];
+        /*
+         * A pool FuncObject is capture-free - the WRITER refuses any other
+         * kind - and the loader must not TRUST that: a capture snapshot
+         * reads its sources from a context, and there is NONE here (the
+         * loader runs before any EvalContext exists). Refuse the image
+         * instead, so a hostile one ends in a clean MyvError like every
+         * other #137 case rather than in the ctor walking a null ctx.
+         */
+        if (!fd->captures.empty())
+            bad_image("corrupt .myv (capturing closure in a pool)");
+        /* No context, hence no root of its own: do_func_call substitutes
+         * the CALLER's root for a ctx-less closure (see capture_root). */
+        return EvalValue(make_intrusive<FuncObject>(fd, nullptr));
     }
     }
     bad_image("corrupt .myv (value tag)");
