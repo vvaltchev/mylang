@@ -21141,7 +21141,7 @@ retry_emission:
                     && jit_qualify_intervals(chunk, begin, end, liv, lq,
                                              nullptr, &lev, &liu,
                                              &lfev)
-                    && hregs.empty() && !jit_lever_off(JL_CACHE)) {
+                    && !jit_lever_off(JL_CACHE)) {
                 lsra_facts = true;       /* F4a: liv/lq are valid */
                 LsraOut tp;
                 std::vector<int> entry;
@@ -21152,7 +21152,6 @@ retry_emission:
                     for (LsraPiece &p : tp.pieces)
                         if (p.slot >= chunk.slot_count)
                             p.reg = -1;          /* v1: no temps */
-                    bool cost_ok = true;
                     if (jit_lsra_snap(chunk, begin, end, liv, lq,
                                       liu, static_cast<int>(max_pins),
                                       tp.pieces, entry, tr, nullptr,
@@ -21161,76 +21160,7 @@ retry_emission:
                         for (size_t k2 = 0; k2 < liv.size(); k2++)
                             w[liv[k2].slot] += lq[k2].uses_int
                                              + lq[k2].uses_ret;
-                        /* ⛔ THE COST GATE (the 43_sieve lesson,
-                         * 2026-08-25): tmode's SUCCESS used to preempt
-                         * arm 2 unconditionally, and on 43's mem-cut
-                         * idle-prefix shape its plan served ~6
-                         * residents where the facts fallback - BUILT
-                         * for that shape - serves far more (+47.4%
-                         * Ir/iter). NOTHING compared the two. Adopt
-                         * tmode only when the total weight of the
-                         * slots it serves (a resident piece or a
-                         * home) covers what the facts rule would
-                         * serve; else decline to arm 2. */
-                        {
-                            std::map<int, char> mem2, fl2, srv;
-                            std::map<int, long> wq;
-                            for (size_t k2 = 0; k2 < liv.size(); k2++) {
-                                const int s2 = liv[k2].slot;
-                                mem2[s2] |= lq[k2].mem_int;
-                                fl2[s2] |= lq[k2].uses_float > 0
-                                         || lq[k2].wrote_float;
-                                wq[s2] += lq[k2].uses_int;
-                            }
-                            for (const LsraPiece &p : tp.pieces)
-                                if (p.reg >= 0)
-                                    srv[p.slot] = 1;
-                            long t_served = 0, f_served = 0;
-                            std::vector<long> fb;
-                            for (const auto &kv : wq) {
-                                const bool facts =
-                                    kv.first >= 0
-                                    && kv.first < chunk.slot_count
-                                    && kv.second >= 3
-                                    && !mem2[kv.first]
-                                    && !fl2[kv.first];
-                                if (srv[kv.first])
-                                    t_served += kv.second;
-                                if (facts)
-                                    fb.push_back(kv.second);
-                            }
-                            std::sort(fb.begin(), fb.end(),
-                                      std::greater<long>());
-                            const size_t fcap =
-                                max_pins + MAX_SPILL_HOMES;
-                            for (size_t i2 = 0;
-                                    i2 < fb.size() && i2 < fcap; i2++)
-                                f_served += fb[i2];
-                            /* homes serve weight too - count them on
-                             * tmode's side (they are its overflow) */
-                            /* (computed below into lsra_homes; the
-                             * qualification is the same facts rule,
-                             * so add the non-resident facts slots
-                             * tmode will home) */
-                            for (const auto &kv : wq) {
-                                const bool facts =
-                                    kv.first >= 0
-                                    && kv.first < chunk.slot_count
-                                    && kv.second >= 3
-                                    && !mem2[kv.first]
-                                    && !fl2[kv.first];
-                                if (facts && !srv[kv.first])
-                                    t_served += kv.second;
-                            }
-                            cost_ok = t_served >= f_served;
-                            if (!cost_ok && getenv("MYLANG_LSRADBG"))
-                                fprintf(stderr, "LSRADBG cost gate "
-                                        "DECLINES tmode [%zu,%zu): "
-                                        "%ld < %ld\n", begin, end,
-                                        t_served, f_served);
-                        }
-                        if (!cost_ok)
-                            goto lsra_tmode_declined;
+
                         hot.clear();
                         hot_counts.clear();
                         /* entry occupants IN ABSTRACT-REG ORDER - the
@@ -21333,7 +21263,6 @@ retry_emission:
                     }
                 }
             }
-            lsra_tmode_declined:
             if (!tmode_done
                     && jit_slot_liveness(chunk, lsl)
                     && jit_build_intervals(chunk, begin, end, lsl, liv)
@@ -21444,7 +21373,7 @@ retry_emission:
                  * ENTRY-OCCUPANT list in abstract-reg order (the
                  * physical zip below maps areg r to the r'th ftake);
                  * on any decline the F4a facts fhot above stands. */
-                if (hregs.empty()) {
+                {
                     LsraOut fp;
                     std::vector<int> fentry;
                     std::vector<LsraTrans> ftr;
@@ -22711,21 +22640,35 @@ retry_emission:
                         break;
                     }
                 }
-                if (tr.install_slot >= 0
-                        && e.ra.take_fixed(
-                               static_cast<uint8_t>(tr.reg))) {
-                    /* take_fixed re-claims the register AT ITS PC -
-                     * busy <=> entry, so the conflict-evict and
-                     * accumulator machinery see a normal pin. A
-                     * refusal means a Phase-A conflict denied it
-                     * mid-pass; skipping is safe - the pass retries
-                     * with the register denied and the next binding
-                     * never sees it. */
-                    const SlotAddr na = slot_addr(tr.install_slot);
-                    e.cache.push_back({ tr.install_slot, na.payload,
-                                        na.type,
-                                        static_cast<uint8_t>(tr.reg) });
-                    e.load(static_cast<uint8_t>(tr.reg), na.payload);
+                if (tr.install_slot >= 0) {
+                    if (e.ra.take_fixed(static_cast<uint8_t>(tr.reg))) {
+                        /* take_fixed re-claims the register AT ITS
+                         * PC - busy <=> entry, so the conflict-evict
+                         * and accumulator machinery see a normal
+                         * pin. */
+                        const SlotAddr na = slot_addr(tr.install_slot);
+                        e.cache.push_back({ tr.install_slot,
+                                            na.payload, na.type,
+                                            static_cast<uint8_t>(
+                                                tr.reg) });
+                        e.load(static_cast<uint8_t>(tr.reg),
+                               na.payload);
+                    } else {
+                        /* ⛔ the register is CLAIMED mid-run (a C1
+                         * region's B3 take at its entry, a B1
+                         * grant). The old comment called skipping
+                         * "safe", and it is, for VALUES; it also
+                         * silently abandoned the piece the plan
+                         * promised (43_sieve: j's areg bound to r10
+                         * at bind time, the region claimed r10 at T,
+                         * this install failed - the hot op ran
+                         * STAGED 2.2M times, tmode's pins WORSE
+                         * than none). Declare the conflict: the
+                         * pass re-emits with the register denied
+                         * and the binding picks another. */
+                        e.pin_conflicts |=
+                            1u << static_cast<uint8_t>(tr.reg);
+                    }
                 }
 #ifdef TESTS
                 e.bump_counter(&g_jit_lsra_trans);

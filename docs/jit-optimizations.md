@@ -8740,3 +8740,26 @@ its job. Repro: MYLANG_JIT_LSRA=1 MYLANG_JIT_XROT=4 on
 tests/functional/16_elem2_fused.my, at committed HEAD. The fix
 arc is the elem2 raw-rax sites joining ask-and-evict, then the
 re-lift.
+
+## C2b-regions arc SOLVED (2026-08-26) - a failed tmode install now
+## declares its conflict; the gates lift with 43 at exact parity
+
+The 43_sieve chase's end: of five two_addr candidate sites, one
+missed - j's op in the MAIN stream (dreg=-1) while its cold copy
+printed dreg=10. The aphys binding gave j's abstract register r10
+at BIND time, before the C1 region's B3 claim took r10 at its
+entry; the install's take_fixed then failed, and the seam arm's
+documented "skipping is safe" silently abandoned the piece the
+plan promised - the hot op ran STAGED 2.2M times, making tmode's
+pins worse than no pins at all (the MAXPINS=0 triangle). The fix:
+a failed install DECLARES the conflict (a pin_conflicts bit), the
+pass re-emits with the register denied, and the binding picks
+another. 43 lever-on: 42.5M Ir/iter, exact fallback parity;
+two_addr_reg restored to 2,201,542; 46's -5.5%/iter win retained.
+The refuted served-weight cost gate is deleted.
+
+Both hregs gates are lifted for real: -rt + corpus in both
+configs, the lever-on xrot matrix on every rotation, the off-arena
+lever config, the census gate, and default vdjcmp 116/116 - all
+green. What remains for #96's endgame: the clean lifted-config
+wall A/B, then the flip gate.
