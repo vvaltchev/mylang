@@ -769,10 +769,34 @@ the pick declines), 81 -2.72%, 82 -1.56%, 83 -0.98%, 68_nested
 -0.46%. Everything else +-0.00%/iter; the s1 column's +0.0..1.2%
 is the compile-side band. The committed spot numbers are confirmed
 by the -npc sweep unchanged.
-THEN: C2b regions into trans mode (⛔ fresh-window: the cold-copy
-emission reads e.cache at STREAM-END state - needs per-region
-state replay; check whether today's ShareSeams already carry the
-hazard); the wall A/B + flip gate.
+C2b-REGIONS ARC, STEP 1 LANDED 2026-08-24 - THE HAZARD CHECK
+ANSWERED AND THE SHARESEAM HOLE CLOSED. The probes settled the
+structure (and it is smaller than feared):
+ - a corpus scan (MYLANG_SHAREDBG, new) found ZERO programs where
+   seams and regions coexist - the hazard was LATENT;
+ - IN-region seam pcs were ALREADY impossible: a region lives
+   inside a loop, and the loop's back edge makes every interior
+   pc a non-lin-point, which seam_ok refuses;
+ - ⛔ the ONE reachable hazard pc is exactly L+1: outside the
+   loop (uncrossed, lin-LEGAL), yet the cold copy's rejoin jumps
+   to label[L+1], which is PAST a seam there - the failed-guard
+   edge is an EMISSION construct jit_run_edges cannot see. A
+   crafted shape reaches it (early-phase pin freed before the
+   loop; a post-loop slot whose lo == L+1, rank-first).
+The fix: jit_share_plan's `noseam` ranges ([T, L+1] per region;
+T included cheaply); g_jit_share_clamped is the reach counter;
+jit_share_region_clamp is the -rt net (WATCHED: removing the
+clamp fails only the counter - the value-level demonstration
+needs a FAILING C1 guard at runtime, which no lever can force;
+that is the designed-not-built cold-arm forcing lane).
+THE SAME STRUCTURE ANSWERS THE TMODE QUESTION: transitions inside
+a region are already impossible via the snap's lin rule (same
+back edge); lifting hregs.empty() from tmode needs only (a) the
+snap refusing transition pcs in [T, L+1] per region (mirror of
+noseam), and (b) the cold copy emitted against the REPLAYED cache
+state at T (base + seams/trans <= T - the stub-replay recompute),
+which with (a) equals the state everywhere in the region.
+THEN: that tmode lift; the wall A/B + flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
