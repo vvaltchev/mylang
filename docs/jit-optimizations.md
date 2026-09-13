@@ -9387,3 +9387,97 @@ bounded by `verify_chunk` but never type-checked.
 heap-use-after-free; release deleted -> LeakSanitizer; the has_slices
 guard deleted -> the detach spec fails in `-rt`; the readonly guard
 deleted -> a const array becomes writable, `-rt` fails.
+
+## #97 increment 4 - THE INLINE STRUCT-FIELD STORE TIER (StoreMemberV),
+## 2026-08-26
+
+**WHAT.** `p.x = i` paid **278.7 Ir**: jit_store_member ->
+vm_member_store -> a field-slot resolve, a const/readonly check,
+`coerce_struct_field` (which takes its 32-byte EvalValue BY VALUE,
+twice) and pod_set - or, for a boxed field, slot_rmw's type-erased
+assignment. Callgrind put ~54% of a field-store loop in that chain.
+
+**EVERYTHING THE STORE NEEDS IS A COMPILE-TIME FACT.** The member key
+already carries `bake_def` + `bake_slot` (the 64_struct_create fix), so
+the emit resolves the FieldDef itself - its KIND and, for a POD layout,
+its BYTE OFFSET. The def-identity guard is what makes those facts true
+at runtime, the same argument the baked member READ makes.
+
+TWO FORMS, chosen at emit time:
+ - **POD**: one store to `[bytes + offset]` (8 bytes int/float, 1 byte
+   bool). The value's tag must match the field's kind EXACTLY, which is
+   precisely `field_exact_scalar` - the predicate that says
+   coerce_struct_field would hand the value straight back. Every real
+   conversion (bool -> int, int -> float, `none` into an opt field)
+   DECLINES.
+ - **BOXED**: the field is `obj.fields[slot]`, a plain LValue with NO
+   container, so it is the element tier's reference lifecycle with no
+   COW at all: retain-new, release-old (cold arm), copy 24 + the tag.
+
+**NO CLONE ON EITHER PATH, and that is the semantics, not an
+omission**: a struct assignment ALIASES (`var q = p; q.x = 77` is
+visible through `p`), so vm_member_store writes in place too.
+
+**⛔ THE 32-BIT ADD THAT TRUNCATED A POINTER.** The boxed form's field
+offset was first added to the pointer with `add_reg32_imm32` - a 32-BIT
+add, which ZEROES the upper half of the register. The field pointer
+came out truncated and the store SEGV'd on a small address. Only slot 0
+survived (offset 0, add skipped), so ONE field store worked and TWO
+crashed - a shape that looks like an interaction bug and is really an
+encoding one. Fixed by folding the offset into every DISPLACEMENT (they
+are disp32 already, so it costs nothing) and using `lea_base` for the
+cold arm's argument. **When an emitted address computation misbehaves,
+check the operand SIZE of the arithmetic before the logic.**
+
+**MEASURED** (Ir per scale unit, scale3-minus-scale1, `-npc`, OPT=1
+ASSERTS=0 both sides):
+
+    a field-store probe   278.7 -> 70.0 Ir PER STORE   (-74.9%)
+    90_struct_field_store 832.4M -> 111.2M  (-86.6%)   wall 0.18x
+
+vdjcmp over the OLD corpus: **119/119 byte-identical** - which is the
+finding as much as the win.
+
+**⛔ THE CORPUS HOLE THIS EXPOSED, AND CLOSED.** `member.store`
+occurred **ZERO times** in bench/ + samples/, so a field WRITE - as
+fundamental an operation as the field read 65_struct_field_sum
+measures - was never measured, never differentially exercised over the
+lever/rotation matrices, and could not have shown a regression.
+`bench/my/90_struct_field_store.my` (+ its CPython twin) is the write
+twin of 65, in both shapes. Before this tier MyLang was **SLOWER than
+CPython** on it (0.031s vs 0.028s); after, 4.95x faster. That is the
+"an oracle's corpus hole is a test hole" lesson again: the number
+nobody could see was the bad one.
+
+**GUARD REACH, from the ledger.** Five of seven are reachable and are
+asserted TAKEN in `jit_memberv_native`: base_const, readonly,
+val_kind, val_ex, val_slice. Two notes worth keeping:
+ - **`readonly` needed a readonly OBJECT in a NON-const SLOT**, since
+   a const struct through a parameter keeps the const flag and
+   base_const shadows it. `func poke(s, v) { var t = s; t.x = v; }` is
+   the shape - a struct assignment ALIASES, so `t` is a plain local
+   pointing at the same readonly object. Note a const ARRAY element
+   does NOT work: `var s = CA[0]` COPIES the struct out, and the copy
+   is mutable in all three engines (checked).
+ - **`base_not_struct` and `def` are unreachable from compiled code**
+   and stay for the untrusted-image reason: the tier is emitted ONLY
+   where the member key carries a baked def (a PROVEN struct base), so
+   no program can present a non-struct or a different struct there.
+   Deleting the def guard was watched and caught nothing, exactly like
+   the read tier's identical guard - which is the precedent for
+   keeping it.
+
+**SABOTAGE:** the exact-kind guard deleted -> `-rt` FAILS (a real
+coercion silently skipped). ⛔ Note the first attempt at that sabotage
+left `want` unused, so the BUILD failed with -Werror and `-rt` then ran
+a STALE BINARY and passed - a false "not caught". **Check the build's
+own exit code before believing a sabotage result.**
+
+**A PRE-EXISTING BUG FOUND IN PASSING (not caused by this tier; `-nj`
+shows it):** every VALUE use of a **bool struct field** renders as int
+`1`/`0` under the VM and `true`/`false` under the tree-walker - a RULE
+2 divergence. Only `p.b == true` agrees, because `==` makes a fresh
+bool on both sides. Suspected cause: a bool node is stamped `th == i`,
+and the member-read lowering's "bool -> 0/1 int" form writes an INT
+into the dst, losing the type. Tracked separately; the test here uses
+the comparison spelling, with a note saying why.

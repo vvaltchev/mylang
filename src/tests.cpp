@@ -32307,6 +32307,187 @@ static bool jit_storev_native()
 #endif
 }
 
+/*
+ * #97 inc 4: THE INLINE STRUCT-FIELD STORE TIER (StoreMemberV), in two
+ * emit-time forms - a POD field written to its baked byte offset, and a
+ * BOXED field's LValue with the reference lifecycle. g_jit_memberv_fast
+ * is bumped by the emitted code; every reachable guard is additionally
+ * proven TAKEN through the decline ledger.
+ */
+static bool jit_memberv_native()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long mv0 = g_jit_memberv_fast;
+    /* THE POD FORM: int / float / bool fields, each written straight to
+     * its baked byte offset. ⛔ The value must ALREADY be the field's
+     * exact kind - `p.f = i` (an int into a float field) is a real
+     * coercion and declines, so the float case assigns a float. */
+    if (!run({
+            "struct P { int x; float f; bool b; }",
+            "var p = P(0, 0.0, false);",
+            "for (var i = 0; i < 20; i++) {",
+            "  p.x = i;",
+            "  p.f = float(i) * 0.5;",
+            "  p.b = i % 2 == 0;",
+            "}",
+            "assert(p.x == 19);",
+            "assert(p.f == 9.5);",
+            /* `p.b == false`, NOT print/str of it: a bool struct FIELD
+             * renders as int 0/1 under the VM and true/false under the
+             * tree-walker - a PRE-EXISTING RULE 2 divergence (`-nj`
+             * shows it too), tracked separately. The comparison is the
+             * one spelling both engines agree on. */
+            "assert(p.b == false);",
+            /* a struct assignment ALIASES, so the write is visible
+             * through the other name - no clone on this path, matching
+             * the interpreter */
+            "var q = p;",
+            "for (var i = 0; i < 8; i++) q.x = 77;",
+            "assert(p.x == 77);" }))
+        return false;
+    if (g_jit_memberv_fast <= mv0) {
+        fprintf(stderr,
+                "jit_memberv_native: the POD form DID NOT RUN\n");
+        return false;
+    }
+    /* THE BOXED FORM: a reference into a boxed field - retain-new,
+     * release-old (the cold arm destroys when it was the last one). */
+    {
+        const unsigned long mv1 = g_jit_memberv_fast;
+        if (!run({
+                "struct B { dyn? a; int n; }",
+                "var b = B(none, 0);",
+                "var refs = [[1], [2], [3]];",
+                "for (var i = 0; i < 21; i++) {",
+                "  b.a = refs[i % 3];",
+                "  b.n = i;",
+                "}",
+                "var dyn t = b.a;",
+                /* an `if` guard NARROWS an opt, an assert does not */
+                "if (t == none) { assert(false); }",
+                "else { assert(t[0] == 3); }",
+                "assert(b.n == 20);",
+                /* the old value was the LAST reference each time: a
+                 * fresh array per iteration exercises the cold
+                 * destruction arm */
+                "var b2 = B(none, 0);",
+                "for (var i = 0; i < 12; i++) b2.a = [i, i + 1];",
+                "var dyn t2 = b2.a;",
+                "if (t2 == none) { assert(false); }",
+                "else { assert(t2[1] == 12); }" }))
+            return false;
+        if (g_jit_memberv_fast <= mv1) {
+            fprintf(stderr,
+                    "jit_memberv_native: the BOXED form DID NOT RUN\n");
+            return false;
+        }
+    }
+    /* DECLINES + the per-guard proof */
+    unsigned long d0[JD_COUNT];
+    for (int r = 0; r < JD_COUNT; r++)
+        d0[r] = g_jit_decline[r];
+    const unsigned long hv0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::StoreMemberV)];
+    if (!run({
+            "struct P { int x; float f; bool b; }",
+            "struct B { dyn? a; int n; }",
+            "var p = P(0, 0.0, false);",
+            "var bx = B(none, 0);",
+            "var flat = [1, 2, 3, 4, 5];",
+            "var n = 0;",
+            /* val_kind: an INT into a FLOAT field is a real coercion */
+            "for (var i = 0; i < 6; i++) p.f = i;",
+            "assert(p.f == 5.0);",
+            /* val_slice: a slice into a boxed field must go through the
+             * C++ copy that registers it in its parent's set */
+            "for (var i = 0; i < 6; i++) bx.a = flat[1:3];",
+            "var dyn v = bx.a;",
+            "if (v == none) { assert(false); }",
+            "else {",
+            "  assert(v[0] == 2);",
+            "  flat[1] = 99;",
+            "  assert(v[0] == 2);",
+            "}",
+            /* val_ex: a caught exception object (vtable'd pointee) */
+            "var dyn ex = 0;",
+            "try { var q = [1]; q[9] = 1; }",
+            "catch (OutOfBoundsEx as e) { ex = e; }",
+            "for (var i = 0; i < 6; i++) bx.a = ex;",
+            /* base_const: a const struct bound to a parameter keeps the
+             * const flag on its slot */
+            "const RO = P(1, 1.0, true);",
+            "func poke(s, val) { s.x = val; }",
+            "for (var i = 0; i < 6; i++) {",
+            "  try { poke(RO, i); } catch (NotLValueEx) { n += 1; }",
+            "}",
+            "assert(n == 6);",
+            /* readonly: the same const object reached through a plain
+             * local - a struct assignment ALIASES, so the slot is not
+             * const but the OBJECT still is, and base_const no longer
+             * shadows the readonly guard */
+            "var m = 0;",
+            "func poke2(s, val) { var t = s; t.x = val; }",
+            "for (var i = 0; i < 6; i++) {",
+            "  try { poke2(RO, i); } catch (NotLValueEx) { m += 1; }",
+            "}",
+            "assert(m == 6);" }))
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::StoreMemberV)] <= hv0) {
+        fprintf(stderr, "jit_memberv_native: nothing DECLINED to the "
+                        "helper - the decline cases are vacuous\n");
+        return false;
+    }
+    /* memberv_base_not_struct and memberv_def are deliberately absent:
+     * the tier is emitted ONLY when the member key carries a baked def
+     * (the base was PROVEN a struct at compile time), and a dyn base
+     * has none - so no compiled program can present a non-struct, or a
+     * different struct, there. Both stay for the reason the other
+     * proven-fact guards do: a `.myv` image's operands are bounded by
+     * verify_chunk but never type-checked. */
+    static const int want[] = {
+        JD_memberv_base_const, JD_memberv_readonly, JD_memberv_val_kind,
+        JD_memberv_val_ex, JD_memberv_val_slice,
+    };
+    for (const int r : want) {
+        if (g_jit_decline[r] > d0[r])
+            continue;
+        fprintf(stderr, "jit_memberv_native: the guard `%s` was never "
+                        "TAKEN - its case is vacuous\n",
+                jit_decline_name(r));
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_len_ord()
 {
 #if ML_JIT_SUPPORTED
@@ -34914,6 +35095,7 @@ static bool jit_op_nativized()
         const unsigned long ri = g_jit_ret_inline;
         const unsigned long ce = g_jit_ctor_est;
         const unsigned long ev = g_jit_elemv_fast;
+        const unsigned long mv = g_jit_memberv_fast;
         if (!run(c.src)) {
             fprintf(stderr, "jit_op_nativized: op %d WRONG RESULT\n",
                     (int)c.op);
@@ -34942,7 +35124,11 @@ static bool jit_op_nativized()
             /* #97: a general-storage element read of a non-slice, non-ex
              * value is served by the emitted boxed-element tier - the
              * helper legitimately starves on the simple shapes. */
-            || (c.op == OpCode::LoadElemValue && g_jit_elemv_fast > ev);
+            || (c.op == OpCode::LoadElemValue && g_jit_elemv_fast > ev)
+            /* #97: a struct-field store on a def-proven base is served
+             * by the emitted tier (the baked field offset), so the
+             * helper legitimately starves. */
+            || (c.op == OpCode::StoreMemberV && g_jit_memberv_fast > mv);
         if (g_jit_op_run[static_cast<size_t>(c.op)] <= b && !inline_ok) {
             fprintf(stderr, "jit_op_nativized: op %d DID NOT RUN\n",
                     (int)c.op);
@@ -36727,6 +36913,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 the boxed-element inline STORE tier - fires on a general "
       "array, DECLINES const/readonly/slice/live-views/kind/bounds",
       jit_storev_native },
+    { "jit: #97 the inline struct-FIELD store tier (POD byte + boxed "
+      "reference forms), DECLINES const/readonly/coercion/ex/slice",
+      jit_memberv_native },
     { "jit: capped sync calls SWITCH interpreted-flat (#56 step 3)",
       jit_call_switch_protocol },
     { "jit: native throw (same-frame / cross-frame / non-struct) (#56)",
