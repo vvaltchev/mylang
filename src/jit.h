@@ -1266,6 +1266,8 @@ extern "C" unsigned long g_jit_mul_strength;
  * count is the right reach evidence, unlike the runtime tiers. */
 extern "C" unsigned long g_jit_peep_short;
 extern "C" unsigned long g_jit_peep_fold;
+extern "C" unsigned long g_jit_peep_selfmov;
+extern "C" unsigned long g_jit_peep_depbrk;
 /* the in-process OFF override for the lever mask (tests; pairs with
  * jit_lever_bit) - the env masks are cached statics. */
 extern "C" unsigned g_jit_off_extra;

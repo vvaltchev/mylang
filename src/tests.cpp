@@ -27453,11 +27453,13 @@ static bool jit_peephole_check()
 
     const auto go = [](const std::string &src, unsigned off_bits,
                        unsigned long *sh, unsigned long *fo,
-                       bool tw) -> std::string {
+                       bool tw, unsigned long *db = nullptr)
+        -> std::string {
         const unsigned save = g_jit_off_extra;
         g_jit_off_extra |= off_bits;
         const unsigned long s0 = g_jit_peep_short;
         const unsigned long f0 = g_jit_peep_fold;
+        const unsigned long d0 = g_jit_peep_depbrk;
         std::ostringstream cap;
         std::streambuf *old = cout.rdbuf(cap.rdbuf());
         try {
@@ -27474,6 +27476,7 @@ static bool jit_peephole_check()
         g_jit_off_extra = save;
         if (sh) *sh = g_jit_peep_short - s0;
         if (fo) *fo = g_jit_peep_fold - f0;
+        if (db) *db = g_jit_peep_depbrk - d0;
         return cap.str();
     };
 
@@ -27487,26 +27490,34 @@ static bool jit_peephole_check()
         "if (q < 100) { print(3); } else { print(4); }\n"
         "var s = 0;\n"
         "for (var i = 0; i < 40; i++) { s = s + i * 5 + d; }\n"
-        "print(s);\n";
+        "print(s);\n"
+        /* the int->float promote arm: cvtsi2sd per iteration, so the
+         * merge-dependency break (xorps) must emit with the lever on */
+        "var f = 0.5;\n"
+        "for (var k = 0; k < 40; k++) { f = f + k; }\n"
+        "print(f);\n";
 
     const std::string want = go(src, 0, nullptr, nullptr, /*tw=*/true);
-    unsigned long sh = 0, fo = 0;
-    const std::string on = go(src, 0, &sh, &fo, false);
-    unsigned long sh_off = 0, fo_off = 0;
+    unsigned long sh = 0, fo = 0, db = 0;
+    const std::string on = go(src, 0, &sh, &fo, false, &db);
+    unsigned long sh_off = 0, fo_off = 0, db_off = 0;
     const std::string off = go(src, jit_lever_bit("peep"),
-                               &sh_off, &fo_off, false);
+                               &sh_off, &fo_off, false, &db_off);
     if (on != want || off != want) {
         cout << "  peep: outputs diverge - tw '" << want << "' on '"
              << on << "' off '" << off << "'\n";
         ok = false;
     }
-    if (sh == 0) {
-        cout << "  peep: lever-on compile shortened 0 loads - VACUOUS\n";
+    if (sh == 0 || db == 0) {
+        cout << "  peep: lever-on compile shortened " << sh
+             << " loads, dep-broke " << db << " converts - a zero is "
+                "VACUOUS\n";
         ok = false;
     }
-    if (sh_off != 0 || fo_off != 0) {
+    if (sh_off != 0 || fo_off != 0 || db_off != 0) {
         cout << "  peep: the lever did not turn the pass off (short "
-             << sh_off << ", fold " << fo_off << ")\n";
+             << sh_off << ", fold " << fo_off << ", depbrk "
+             << db_off << ")\n";
         ok = false;
     }
 
