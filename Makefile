@@ -6,7 +6,19 @@ PROJ_ROOT:=$(shell pwd)
 OPT ?= 1
 LTO ?= $(OPT)
 FL_LANG ?= -std=c++17
-FL_DBG ?= -ggdb
+
+# DEBUG_INFO (default 0, for EVERY build type): debug info multiplies the
+# binary's size many times over and is unused in the vast majority of
+# builds (maintainer-set, 2026-08-26 - disk wear). DEBUG_INFO=1 restores
+# the old unconditional -ggdb; pass it whenever a debugger, a symbolized
+# sanitizer report, or line-accurate callgrind attribution is wanted.
+# CI carries a DEBUG_INFO=1 lane so the configuration cannot rot.
+DEBUG_INFO ?= 0
+ifeq ($(DEBUG_INFO),1)
+	FL_DBG ?= -ggdb
+else
+	FL_DBG ?=
+endif
 FL_WARN ?= -Wall -Wextra -Wno-unused-parameter
 
 # WERROR (default 1): a warning FAILS the build, so it must be addressed, not
