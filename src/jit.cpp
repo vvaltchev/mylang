@@ -10111,7 +10111,7 @@ static bool reg_model_check(std::string &err)
         if (!(gp_caps(r) & CAP_MEM_BASE))
             continue;
         Emitter e;
-        e.load_base(RAX, r, 0x40);            /* reg:conv - an
+        e.load_base(RAX, r, 0x40);            /* reg:proto - an
                                       * example operand of the encoder
                                       * under test */
         /* REX, 0x8B, modrm, disp8 */
@@ -10143,7 +10143,7 @@ static bool reg_model_check(std::string &err)
     }
     /* the shift count is cl and nothing else */
     for (uint8_t r = 0; r < 16; r++)
-        if (((gp_caps(r) & CAP_SHIFT_CNT) != 0) != (r == RCX)) {  /* reg:conv */
+        if (((gp_caps(r) & CAP_SHIFT_CNT) != 0) != (r == RCX)) {  /* reg:isa */
             snprintf(buf, sizeof(buf),
                      "reg %u: CAP_SHIFT_CNT must be RCX alone", r);
             err = buf; return false;
@@ -13243,10 +13243,10 @@ static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint8_t cr,
  * this lands INERT, and making them allocatable is the next step.
  */
 struct ElemRead {
-    uint8_t obj   = RAX;   /* reg:conv */
+    uint8_t obj   = RAX;   /* reg:proto */
     uint8_t data  = RCX;  /* reg:conv */
     uint8_t count = RDX;  /* reg:conv */
-    uint8_t idx   = R9;  /* reg:conv */
+    uint8_t idx   = R9;  /* reg:proto */
 };
 
 /* The allocator for the two roles above that the ISA does NOT fix.
@@ -13436,9 +13436,9 @@ static void emit_elem_base_gate(Emitter &e, uint8_t ir, uint8_t obj,
 struct ElemScratch {
     uint8_t obj   = RAX;  /* the SharedObject * (reg:isa: idiv) */
     uint8_t data  = RCX;   /* reg:conv: elem data ptr */
-    uint8_t count = RDX;   /* reg:conv: count (idiv-fixed)  */
-    uint8_t idx   = R9;    /* the element index (reg:conv)   */
-    uint8_t val   = RDI;   /* the stored value / rhs (reg:conv) */
+    uint8_t count = RDX;   /* reg:isa: count (idiv-fixed)  */
+    uint8_t idx   = R9;    /* the element index (reg:proto)   */
+    uint8_t val   = RDI;   /* the stored value / rhs (reg:proto) */
     bool    ok    = true;  /* false = no free register; DECLINE        */
 };
 
@@ -13455,7 +13455,7 @@ struct ElemScratch {
  * register is added to one of them.
  */
 static const uint8_t ELEM_CAND[] =
-    { RDI, R9, R10, R11, RSI, R8 };                   /* reg:conv */
+    { RDI, R9, R10, R11, RSI, R8 };                   /* reg:proto */
 
 /*
  * May this register be used as element-tier scratch right now?
@@ -13709,7 +13709,7 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
     }
     if (has_chain) {
         uint32_t used = 0;
-        role(R9, used);      /* ctx_chain_reg pref (reg:conv) */
+        role(R9, used);      /* ctx_chain_reg pref (reg:proto) */
     }
     return withheld;
 }
@@ -13768,8 +13768,8 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
  */
 static uint8_t ctx_chain_reg(const Emitter &e)
 {
-    if (elem_reg_usable(e, R9))  /* reg:conv */
-        return R9;  /* reg:conv */
+    if (elem_reg_usable(e, R9))  /* reg:proto */
+        return R9;  /* reg:proto */
     for (const uint8_t c : ELEM_CAND)
         if (elem_reg_usable(e, c))
             return c;
@@ -13783,8 +13783,8 @@ static uint8_t elem_read_idx(const Emitter &e, OpCode op)
                  "opcode op_elem_role_sig does not classify - the pin "
                  "pool reserves nothing for this run");
     (void)op;
-    if (elem_reg_usable(e, R9))  /* reg:conv */
-        return R9;  /* reg:conv */
+    if (elem_reg_usable(e, R9))  /* reg:proto */
+        return R9;  /* reg:proto */
     for (const uint8_t c : ELEM_CAND)
         if (elem_reg_usable(e, c))
             return c;
@@ -18477,8 +18477,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 tbl_owned = true;
             } else {
                 e.reg_pin_conflict(RDX);
-                ML_CHECK(!e.reg_holds_pin(RDX));  /* reg:conv */
-                tbl = RDX;                     /* reg:conv */
+                ML_CHECK(!e.reg_holds_pin(RDX));  /* reg:proto */
+                tbl = RDX;                     /* reg:proto */
             }
         }
         e.bump_op(in.op);
