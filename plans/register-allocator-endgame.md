@@ -1090,6 +1090,32 @@ green. ⛔ THE OTHER TWO v1 BOUNDS STAY, EACH WITH ITS WRITTEN REASON
    redesign for a shape the whole-run rescue and the homes tier
    already mostly serve (a slot heavy enough to want both is
    heavy enough to be rescued whole-run).
+#103 THE reg:conv SWEEP, INSTRUMENTED AND MAPPED (2026-08-26).
+The census now splits justified by tag (isa 69 / abi 173 / CONV
+499) and the gate ratchets CONV downward (regcensus_floor.txt's
+CONV row). ⛔ THE MAP - the residue is FIVE STRUCTURAL FAMILIES,
+not mechanical conversions (those - the xmm staging pair, the
+element roles, RefScratch - are already done, which is why 499
+uses remain):
+ 1. THE RAX ACCUMULATOR (acc_take, lever A's conveyance, the
+    exit-pc protocol): the fragment's value ABI. Converting =
+    redesigning value conveyance; the Phase-A conflict machinery
+    already lets rax be pinned around it. HIGH effort, LOW
+    payoff post-D4.
+ 2. THE TAG GRANT IDENTITY (tag_int_reg = RSI, tag_float_reg =
+    R8): consumers already query the RECORDED grant (B1's
+    refactor), so converting = choosing the registers
+    dynamically at grant time. REAL payoff: frees rsi/r8 as pool
+    members on the OFF-ARENA configs (register-form tags).
+    MODERATE effort, the seams exist. THE FIRST TARGET.
+ 3. THE CALL PROTOCOL (the M5b/c record push, ctx chain via r9,
+    frame sizes via rsi): a fragment-internal ABI shared by
+    every call site and entry stub. Converting = a protocol
+    redesign. HIGH effort; payoff only if the protocol registers
+    contend, which the clobber mask already prices in.
+ 4. THE CTX/CAPTURE WALKERS (r9 chains): same protocol family.
+ 5. bump_counter's rax shuttle: TESTS-only emission - zero
+    shipping payoff; convert only for the ratchet's sake.
 THE FLIP GATE WAS - THE MAINTAINER'S CALL, with the
 ledger now complete on both axes: Ir (zero per-iteration
 regressions corpus-wide; wins 06 -16.8%, 81 -2.7%, 82 -1.6%, 83
