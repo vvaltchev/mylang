@@ -47,7 +47,11 @@ set -u
 cd "$(dirname "$0")/.."
 BIN=${1:-build-claude/dbg/mylang}
 MODE=${2:-}
-LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2 mfact cest relent norec"
+# ⛔ KEEP IN SYNC WITH jit_lever_names (jit.cpp) - this list went stale
+# once (#101 found argfuse/xcache/scache/rshare missing, so those four
+# levers' per-lever-off configs were tested by nothing but `all`).
+LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2 \
+mfact cest relent norec argfuse xcache scache rshare peep"
 COLD_TIERS="refstore"
 # ⛔ DERIVED FROM THE BINARY, NOT HARDCODED (2026-08-18). This was
 # `XROTS="0 1 2 3"`, a literal, and the whole point of the mode is that

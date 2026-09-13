@@ -731,11 +731,17 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             o << "movabs " << gp64(rr) << ", "
               << imm_str(static_cast<int64_t>(imm), ti, tf, ta);
         } else {
-            const uint32_t imm = rd32();            /* mov eNN, imm32 = the
-                                                     * resume VM pc (exit) */
+            /* mov eNN, imm32 (zero-extending). Until #101 the only
+             * emitter of this form was the exit's resume-pc load, and
+             * the comment asserted that; movabs now auto-shortens
+             * every imm32-range literal to it, so the assertion would
+             * lie on ordinary staged constants - the tag comment (the
+             * REX.W arm's rule) is the one claim that stays true. */
+            const uint32_t imm = rd32();
+            if (tag_name(static_cast<uint64_t>(imm), ti, tf, ta))
+                cmt = "the Type-tag constant";
             o << "mov e" << (gp64(rr) + 1) << ", "
               << imm_str(static_cast<int64_t>(imm), ti, tf, ta);
-            cmt = "return: resume at vm pc " + std::to_string(imm);
         }
         break; }
     case 0xC3: o << "ret"; break;

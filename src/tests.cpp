@@ -27430,6 +27430,123 @@ static bool jit_two_address()
 #endif
 }
 
+
+/*
+ * #101 (the peephole, levels 1-2): the VALUE-immediate short forms and
+ * the literal-compare fold. Claims: (1) with the lever on, the probe's
+ * compile shortens loads AND folds compares (the counters' deltas -
+ * vacuity-guarded); (2) with MYLANG_JIT_OFF=peep (via g_jit_off_extra)
+ * neither fires; (3) the two configs' outputs are BYTE-IDENTICAL to
+ * each other and to the tree-walker. The probe deliberately covers
+ * every arm: a small positive (zero-extend), a NEGATIVE staged literal
+ * (the C7 sign-extend arm - a lit-first IntBin is what stages one), a
+ * >imm32 literal (the long-form fallthrough), a >imm32 compare bound
+ * (cmp_operand's DECLINE - the truncation sabotage flips the printed
+ * branch), and an ordinary foldable bound.
+ */
+static bool jit_peephole_check()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    bool ok = true;
+
+    const auto go = [](const std::string &src, unsigned off_bits,
+                       unsigned long *sh, unsigned long *fo,
+                       bool tw) -> std::string {
+        const unsigned save = g_jit_off_extra;
+        g_jit_off_extra |= off_bits;
+        const unsigned long s0 = g_jit_peep_short;
+        const unsigned long f0 = g_jit_peep_fold;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (tw) root->eval(nullptr); else vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_jit_off_extra = save;
+        if (sh) *sh = g_jit_peep_short - s0;
+        if (fo) *fo = g_jit_peep_fold - f0;
+        return cap.str();
+    };
+
+    const std::string src =
+        "var d = 0; d = d + runtime(2);\n"
+        "print((0 - 7) / d);\n"                 /* C7 sign-extend arm */
+        "var big = 0; big = big + runtime(1);\n"
+        "print(big * 98765432109876);\n"        /* > imm32: long form */
+        "var q = 0; q = q + runtime(5000000000);\n"
+        "if (q < 5100000000) { print(1); } else { print(2); }\n"
+        "if (q < 100) { print(3); } else { print(4); }\n"
+        "var s = 0;\n"
+        "for (var i = 0; i < 40; i++) { s = s + i * 5 + d; }\n"
+        "print(s);\n";
+
+    const std::string want = go(src, 0, nullptr, nullptr, /*tw=*/true);
+    unsigned long sh = 0, fo = 0;
+    const std::string on = go(src, 0, &sh, &fo, false);
+    unsigned long sh_off = 0, fo_off = 0;
+    const std::string off = go(src, jit_lever_bit("peep"),
+                               &sh_off, &fo_off, false);
+    if (on != want || off != want) {
+        cout << "  peep: outputs diverge - tw '" << want << "' on '"
+             << on << "' off '" << off << "'\n";
+        ok = false;
+    }
+    if (sh == 0) {
+        cout << "  peep: lever-on compile shortened 0 loads - VACUOUS\n";
+        ok = false;
+    }
+    if (sh_off != 0 || fo_off != 0) {
+        cout << "  peep: the lever did not turn the pass off (short "
+             << sh_off << ", fold " << fo_off << ")\n";
+        ok = false;
+    }
+
+    /* The FOLD's reach needs an UNPINNED compare, and the allocator
+     * pins every hot slot in the probe - so run it again with the
+     * pinning levers off (the documented g_jit_lsra=false convention
+     * for coverage tests + the cache lever family), which forces every
+     * compare through cmp_operand's accumulator arm. Outputs must
+     * still match the tree-walker's in all three configs. */
+    const bool lsra_save = g_jit_lsra;
+    g_jit_lsra = false;
+    const unsigned pins_off = jit_lever_bit("cache")
+        | jit_lever_bit("fcache") | jit_lever_bit("xcache")
+        | jit_lever_bit("scache");
+    unsigned long fo_np = 0, fo_np_off = 0;
+    const std::string on_np = go(src, pins_off, nullptr, &fo_np, false);
+    const std::string off_np = go(src, pins_off | jit_lever_bit("peep"),
+                                  nullptr, &fo_np_off, false);
+    g_jit_lsra = lsra_save;
+    if (on_np != want || off_np != want) {
+        cout << "  peep: no-pin outputs diverge - tw '" << want
+             << "' on '" << on_np << "' off '" << off_np << "'\n";
+        ok = false;
+    }
+    if (fo_np == 0) {
+        cout << "  peep: no-pin lever-on compile folded 0 compares - "
+                "VACUOUS\n";
+        ok = false;
+    }
+    if (fo_np_off != 0) {
+        cout << "  peep: the lever did not turn the fold off ("
+             << fo_np_off << ")\n";
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 /*
  * #100 - the MULTIPLY strength reduction (div_magic's sibling), three
  * claims: (1) `x * 2^k` is rewritten to IntShlRI at the BYTECODE level
@@ -36272,6 +36389,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #100 mul strength reduction - bytecode shl rewrite, planned "
       "lea/shl forms execute, values match the tree-walker",
       jit_mul_strength_check },
+    { "jit: #101 peephole - value-immediate short forms + literal cmp "
+      "fold; lever off restores the long forms, outputs identical",
+      jit_peephole_check },
     { "jit: the register MODEL - capability bits re-derived from the "
       "encoders, pool invariants, allocator contract (#96 (c))",
       jit_reg_model },
