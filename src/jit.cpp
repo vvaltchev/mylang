@@ -3343,9 +3343,17 @@ struct Emitter {
         u8(0x0F); u8(0x7E);
         u8(static_cast<uint8_t>(0xC0 | ((src & 7) << 3) | (dst & 7)));
     }
-    /* movsd xmm<dst>, xmm<src> (reg-reg; both < 8, no REX needed) */
+    /* movaps xmm<dst>, xmm<src> (reg-reg; both < 8, no REX needed).
+     * MOVAPS, not reg-reg MOVSD, on purpose (#103b): movsd xmm,xmm
+     * MERGES into the destination's upper half, so it carries a
+     * false dependency on the dst's last writer - the lifetime-hole
+     * plans turned most operand reads into reg-reg moves and the
+     * merge serialized the whole loop body (89: drefs -40% yet wall
+     * 1.43x WORSE). movaps copies all 128 bits: no merge, and the
+     * rename stage eliminates it. The upper half is dead everywhere
+     * here - every consumer is a scalar sd op. */
     void fmov_rr(uint8_t dst, uint8_t src)
-    { fwrote(dst); u8(0xF2); u8(0x0F); u8(0x10);
+    { fwrote(dst); u8(0x0F); u8(0x28);
       u8(static_cast<uint8_t>(0xC0 | (dst << 3) | src)); }
     /* sqrtsd xmm<d>, xmm<s>  (SSE2) */
     void sqrtsd(uint8_t d, uint8_t s)
