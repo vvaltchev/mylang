@@ -417,10 +417,15 @@ static bool jit_cold_forced(JitColdTier t)
  * pays this check per callback, so it is kept to one load + two stores):
  * null = not armed OR currently ACTIVE (either way: plain call on the
  * current stack); else = the armed, inactive stack's top. */
-static char *g_nstack_cur = nullptr;
-static char *g_nstack_top = nullptr;    /* the armed top (a baked imm in
+/* ⛔ THESE THREE LIVE IN THE LOW ARENA so the emitted switch can reach
+ * them with an absolute disp32 - one instruction each, and no scratch
+ * register at all (see Emitter::mem_abs32). References bound at static
+ * init, so every C++ use below is unchanged. C++ writes them once at
+ * init and on the slow paths; the per-call traffic is all emitted. */
+static char *&g_nstack_cur = *ml_lowmem_new<char *>(nullptr);
+static char *&g_nstack_top = *ml_lowmem_new<char *>(nullptr); /* the top (read from its CELL now, not baked as an imm - it is a 1GB mapping's high address
                                          * emitted site switches) */
-static void *g_nstack_saved_rsp = nullptr;  /* the OUTERMOST emitted site's
+static void *&g_nstack_saved_rsp = *ml_lowmem_new<void *>(nullptr);  /* the OUTERMOST emitted site's
                                              * C rsp (single-threaded; nested
                                              * sites are plain by cur==null) */
 
@@ -4358,13 +4363,48 @@ struct Emitter {
     {
         if (!ml_lowmem_fits_imm32(addr))
             return false;
-        if (!dword)
-            u8(0x48);                       /* REX.W for a qword op */
+        /* REX.R extends the REG field - needed when that field names a
+         * real register r8-r15, not when it is an opcode extension
+         * (/0../7), which is why the inc/dec forms above got away
+         * without it. There is no base and no index, so REX.B and
+         * REX.X are always clear. */
+        const uint8_t rex = static_cast<uint8_t>((dword ? 0x00 : 0x08)
+                                                 | (reg_field >= 8 ? 0x04 : 0));
+        if (rex)
+            u8(static_cast<uint8_t>(0x40 | rex));
         u8(opcode);
+        reg_field = static_cast<uint8_t>(reg_field & 7);
         u8(static_cast<uint8_t>(0x04 | (reg_field << 3)));  /* mod=00 */
         u8(0x25);                           /* SIB: no base, no index */
         u32(static_cast<uint32_t>(
                 reinterpret_cast<uintptr_t>(addr)));
+        return true;
+    }
+    /* mov REG, [abs32]  (`8B /r`) and mov [abs32], REG (`89 /r`) - a
+     * global read/written with no base register at all. */
+    bool load_abs32(uint8_t reg, const void *addr)
+    {
+        if (!ml_lowmem_fits_imm32(addr))
+            return false;
+        wrote(reg);
+        return mem_abs32(0x8B, reg, addr, /*dword=*/false);
+    }
+    bool store_abs32(const void *addr, uint8_t reg)
+    { return mem_abs32(0x89, reg, addr, /*dword=*/false); }
+    /* cmp qword [abs32], imm8 (`83 /7 ib`) - the null test. */
+    bool cmp_qword_abs32_imm8(const void *addr, int8_t imm)
+    {
+        if (!mem_abs32(0x83, 7, addr, /*dword=*/false))
+            return false;
+        u8(static_cast<uint8_t>(imm));
+        return true;
+    }
+    /* mov qword [abs32], imm32 (`C7 /0 id`, sign-extended). */
+    bool store_qword_abs32_imm32(const void *addr, uint32_t imm)
+    {
+        if (!mem_abs32(0xC7, 0, addr, /*dword=*/false))
+            return false;
+        u32(imm);
         return true;
     }
     /* cmp dword [abs32], imm32 - `81 /7` plus the immediate tail. */
@@ -7757,6 +7797,21 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
  * denied the whole caller-saved pool. */
 static size_t emit_nstack_switch_pre(Emitter &e)
 {
+    /* the abs32 forms when the cells are in the arena: each `movabs
+     * RCX, <addr>` + memop pair collapses to ONE instruction, and the
+     * switch stops needing a scratch register at all. `g_nstack_top` is
+     * a VALUE (a 1GB mmap's high address, so never an imm32) - it is
+     * read from its own arena CELL rather than materialized. */
+    if (ml_lowmem_fits_imm32(&g_nstack_cur)
+            && ml_lowmem_fits_imm32(&g_nstack_saved_rsp)
+            && ml_lowmem_fits_imm32(&g_nstack_top)) {
+        e.cmp_qword_abs32_imm8(&g_nstack_cur, 0);
+        const size_t j_plain = e.j32(0x74);           /* je plain */
+        e.store_qword_abs32_imm32(&g_nstack_cur, 0);  /* cur = null */
+        e.store_abs32(&g_nstack_saved_rsp, RSP);
+        e.load_abs32(RSP, &g_nstack_top);
+        return j_plain;
+    }
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_cur));
     e.cmp_qword_base_imm8(RCX, 0);   /* cmp qword [rcx],0 */
     const size_t j_plain = e.j32(0x74);               /* je plain */
@@ -7771,6 +7826,16 @@ static size_t emit_nstack_switch_pre(Emitter &e)
 /* reg:proto(fn) - the switch's RETURN side, same denial. */
 static void emit_nstack_switch_post(Emitter &e)
 {
+    if (ml_lowmem_fits_imm32(&g_nstack_cur)
+            && ml_lowmem_fits_imm32(&g_nstack_saved_rsp)
+            && ml_lowmem_fits_imm32(&g_nstack_top)) {
+        e.load_abs32(RSP, &g_nstack_saved_rsp);
+        /* re-arm: cur = top, both through their cells (the top is a
+         * high address, so it cannot be an immediate) */
+        e.load_abs32(R9, &g_nstack_top);                 /* reg:proto */
+        e.store_abs32(&g_nstack_cur, R9);                /* reg:proto */
+        return;
+    }
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_saved_rsp));
     e.load_base0(RSP, RCX);
     e.movabs(RCX, reinterpret_cast<uint64_t>(&g_nstack_cur));
