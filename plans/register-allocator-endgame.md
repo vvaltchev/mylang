@@ -1090,6 +1090,23 @@ green. ⛔ THE OTHER TWO v1 BOUNDS STAY, EACH WITH ITS WRITTEN REASON
    redesign for a shape the whole-run rescue and the homes tier
    already mostly serve (a slot heavy enough to want both is
    heavy enough to be rescued whole-run).
+#103 CONV = 0 - THE RATCHET IS CLOSED (2026-08-25). The "3-use
+allocatable-roles batch" did not exist: elem_read_plan has
+allocated data AND count, and elem_scratch_plan data, since
+#96 (c) (2026-08-20) - preferred-first picks over ELEM_CAND with
+the pin-conflict eviction on exhaustion, pressure-covered by the
+xrot matrix (which found the rotation-4 rax bug in this very
+plan). The three tagged literals were pick()'s PREFERRED SEEDS,
+identical in role to the idx/val seeds batch 3 already classified
+proto. What made them look like open work was a STALE struct
+comment ("this lands INERT, and making them allocatable is the
+next step") - written when the plan landed inert, never updated
+when the picks went live. The comment is fixed IN the same change,
+and the lesson is the doc-sync rule's oldest shape: a plan-status
+sentence inside a code comment rots the day the next commit lands;
+the census priced an already-built conversion because of it.
+FINAL LEDGER of the 499: isa 71 / abi 173 / proto 497 / conv 0 -
+every use read, every disposition on its line.
 #103 BATCH 3 - EVERY SITE READ, CONV = 3 (2026-08-25): the
 model-check's CL-shift assert and ElemScratch's count are the ISA
 itself (reg:isa; count's comment already said "idiv-fixed"); the

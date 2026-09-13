@@ -13239,13 +13239,19 @@ static void emit_elem_bounds_or_wrap(Emitter &e, uint8_t ir, uint8_t cr,
  *
  * `data` and `count` are threaded TOGETHER because they are computed
  * together - three instructions off the same shobj - so one pass frees
- * a site for rcx AND for rdx. They are still RCX/RDX at every caller:
- * this lands INERT, and making them allocatable is the next step.
+ * a site for rcx AND for rdx. BOTH ARE ALLOCATED since #96 (c),
+ * 2026-08-20: elem_read_plan's pick() takes these literals as its
+ * PREFERRED seeds (byte-identical with an empty pin set) and scans
+ * ELEM_CAND under pressure, with a pin-conflict eviction on
+ * exhaustion. This paragraph used to say "this lands INERT, and
+ * making them allocatable is the next step" - it went stale the day
+ * the plan went live, and it cost a #103 census batch that priced
+ * an already-built conversion (2026-08-25).
  */
 struct ElemRead {
     uint8_t obj   = RAX;   /* reg:proto */
-    uint8_t data  = RCX;  /* reg:conv */
-    uint8_t count = RDX;  /* reg:conv */
+    uint8_t data  = RCX;  /* reg:proto: pick()'s preferred seed */
+    uint8_t count = RDX;  /* reg:proto: pick()'s preferred seed */
     uint8_t idx   = R9;  /* reg:proto */
 };
 
@@ -13435,7 +13441,8 @@ static void emit_elem_base_gate(Emitter &e, uint8_t ir, uint8_t obj,
  */
 struct ElemScratch {
     uint8_t obj   = RAX;  /* the SharedObject * (reg:isa: idiv) */
-    uint8_t data  = RCX;   /* reg:conv: elem data ptr */
+    uint8_t data  = RCX;   /* reg:proto: elem data ptr -
+                            * elem_scratch_plan's pick() seed */
     uint8_t count = RDX;   /* reg:isa: count (idiv-fixed)  */
     uint8_t idx   = R9;    /* the element index (reg:proto)   */
     uint8_t val   = RDI;   /* the stored value / rhs (reg:proto) */
