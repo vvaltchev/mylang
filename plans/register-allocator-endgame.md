@@ -904,8 +904,30 @@ any new criterion: -vdj diff 43's hot loop between the lifted
 tmode emission and the fallback emission - the mechanism is
 something tmode emits (per-pc flushes in the loop? the homes-set
 difference? textra filtering?) that no weight ledger sees.
-THEN: the 43 emission diff -> the real gate criterion -> re-lift;
-the clean wall A/B; the flip gate.
+THE 43 EMISSION DIFF RAN 2026-08-25 AND NAMES THE DEFECT: in the
+hot chunk the fallback pins SIX slots (i, n, j, i2, count, k -
+r12..r15, r8, rsi) and tmode pins THREE (n, i, count) - the inner
+counters j and k are UNPINNED under tmode. They are MEM-FREE in
+this run (the fallback's facts rule passed them) and loop-phase
+with an idle prefix - the exact shape THE WHOLE-RUN RESCUE was
+built for, and it is NOT FIRING for them. So the 43 regression is
+a RESCUE REACH HOLE, not a cost-model gap (which is why the
+served-weight gate could never catch it). ⛔ NEXT: instrument WHY
+the rescue skips j/k on that chunk - candidates: (a) their pieces
+are never resident in the walk (so never lin_demoted - the rescue
+triggers ONLY on lin_demoted; a slot whose loop piece the walk
+denied a register never enters the set), (b) pass-1 start
+relocation "succeeds" to a legal earlier pc so no demotion is
+recorded while the piece still under-serves, (c) the free-
+register-over-whole-run scan fails against phantom pieces. Repro:
+build with both gates lifted (the two-line edit), then
+MYLANG_LSRADBG=1 MYLANG_JIT_LSRA=1 on bench/my/43_sieve.my and
+read the HOT chunk's pieces (the run whose entry loads name
+i/n/j/count/k). Once the rescue reaches them, re-measure 43, then
+re-lift; the inert cost gate can then likely be DELETED (its
+premise was wrong).
+THEN: the rescue reach fix -> re-lift; the clean wall A/B; the
+flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
