@@ -5179,9 +5179,9 @@ static bool jit_op_eligible(const Instr &in)
     /* model-flip (nativize-ops): the STRUCT BUILDS - a POD ctor `P(x,y)`
      * (jit_struct_ctor), a BOXED ctor `B(a,x)` (jit_struct_ctor_boxed), and the
      * fused flat array<PodStruct> literal (jit_make_struct_array). Each can
-     * throw a TypeErrorEx from a field coerce -> re-raise, so NONE is
-     * op_fully_native (the POD/array pair carry a side-table caret; the boxed
-     * ctor carries its own POOLED per-arg caret). */
+     * throw a TypeErrorEx from a field coerce, but every throw CONVEYS
+     * (exc-stamped at the emit; the boxed ctor's rides its POOLED per-arg
+     * caret) - all three are op_fully_native since #56/#98. */
     case OpCode::StructCtorV:
     case OpCode::StructCtorBoxedV:
     case OpCode::MakeStructArrayV:
@@ -10765,6 +10765,20 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
          * merged into a fragment containing ANY builtin call. */
         v.mark_barrier(pc);
         break;
+    case OpCode::CallBuiltinLV:
+    case OpCode::CallBuiltinLVElem:
+    case OpCode::CallBuiltinLVMember:
+        /* #98 (the census audit): the LV (mutating lvalue-ABI) builtin
+         * family was UNLISTED, so one sort/pop/insert/erase in a run
+         * turned caching off for the WHOLE run - the exact silent shape
+         * MathFnV and CmpIntV were found in. The CallBuiltinV rule
+         * applies verbatim: the helper reads arg0's lvalue + the value
+         * run from MEMORY, and a callback builtin (sort's comparator)
+         * re-enters vm_dispatch and can mutate ARBITRARY slots the
+         * emitter cannot enumerate - so BRACKET (flush before / reload
+         * after; none of the three is a branch). */
+        v.mark_barrier(pc);
+        break;
     case OpCode::MapFilterV:
         /* map/filter's callback re-enters vm_dispatch (same as a
          * callback builtin) - bracket; the boxed operand/dst slots are
@@ -11049,7 +11063,22 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
     default:
         return false;                /* an unclassified op - the caller
                                       * must assume EVERY slot is
-                                      * touched */
+                                      * touched. The ops that land here
+                                      * TODAY do so DELIBERATELY, each
+                                      * with a reason recorded in its
+                                      * opcode_table_census row
+                                      * (tests.cpp): the CALL family
+                                      * (CallV/CachedCallV/CallValueV/
+                                      * CallValueGenericV - whether a
+                                      * call should be a barrier instead
+                                      * is #97's decision, entangled
+                                      * with the call protocol), the
+                                      * key-run chain stores (run size
+                                      * unknown here), and EnterNative/
+                                      * ExitBlock (never in a pre-jit
+                                      * run). A NEW op reaching this
+                                      * default fails the census until a
+                                      * row decides it. */
     }
     return true;
 }
@@ -17874,6 +17903,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
         {
             const size_t j_ok = e.j8(0x74);
+            /* collapse-safe (#98): a LOC-LESS conveyance (the eptr net /
+             * a defensive InternalError) must not depend on the loc side
+             * table once the run's originals are deleted; the pooled
+             * per-arg caret already on a coerce throw survives (the
+             * stamp skips a non-empty loc). This is what makes the op
+             * op_fully_native. */
+            emit_exc_stamp(e, ck, old_pc);
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -20269,6 +20305,19 @@ static bool op_fully_native(const Instr &in)
     case OpCode::StoreGlobalV:
     case OpCode::StoreCaptureV:
         return true;
+    /* #98 (the census audit): the two struct ctors the #56 batch left
+     * undecided in silence - both convey-only, so both deletable. The
+     * UNPLANNED StructCtorV shares MakeStructArrayV's emit (the same
+     * cold-side exc-stamp) and jit_struct_ctor's every throw is a
+     * conveyed RuntimeException; the PLANNED form was already
+     * never-exits, so this case only widens the unplanned one.
+     * StructCtorBoxedV's helper is convey-only too (the pooled per-arg
+     * caret rides the exception; its emit's exc-stamp + the eptr net
+     * were added WITH this entry - without the stamp a loc-less throw
+     * would have read the deleted run's loc table). */
+    case OpCode::StructCtorV:
+    case OpCode::StructCtorBoxedV:
+        return true;
     default:
         return false;
     }
@@ -20505,6 +20554,32 @@ static bool op_is_simple_island(OpCode op)
         return false;
     }
 }
+
+#ifdef TESTS
+/* #98: test-only exports of the OPCODE-KEYED tables, so the census
+ * ratchet (opcode_table_census, tests.cpp) can walk the whole opcode
+ * enum against the LIVE predicates - the jit_fwd_family_coverage
+ * pattern, generalized. Plain forwarders: one edit site, no copy to
+ * drift. */
+bool jit_test_op_eligible(const Instr &in)      { return jit_op_eligible(in); }
+bool jit_test_op_never_exits(const Instr &in)   { return op_never_exits(in); }
+bool jit_test_op_fully_native(const Instr &in)  { return op_fully_native(in); }
+bool jit_test_op_is_simple_island(OpCode op)  { return op_is_simple_island(op); }
+bool jit_test_pick_op_classified(const Chunk &ck, const Instr &in)
+{
+    /* pick_visit_op with inert accounting - the only question asked is
+     * "does the visitor CLASSIFY this op" (true) vs "must the caller
+     * assume every slot is touched" (false). */
+    struct NopV {
+        void usei(int) const {}          void usei_dst(int) const {}
+        void usef(int) const {}          void bad(int) const {}
+        void badi(int) const {}          void badf(int) const {}
+        void use_ret(int) const {}       void fdst_mark(int) const {}
+        void full_read_mark(int) const {} void mark_barrier(size_t) const {}
+    } v;
+    return pick_visit_op(ck, in, 0, v);
+}
+#endif
 
 /* Emit a container fragment's ISLAND CALL: `call jit_exec_block(desc,
  * island_pc)` (SysV rdi=desc, rsi=island_pc), then branch on the result -

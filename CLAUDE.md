@@ -526,6 +526,23 @@ on all 94 corpus programs.
 And when you add a lever, give it a JITSTATS row too - `g_jit_fwd` was
 bumped from emitted code and appeared in no REPORT table, the third
 counter found that way.
+**DONE WHOLESALE (#98, 2026-08-25): `opcode_table_census` (tests.cpp)
+is that ratchet over the ENTIRE opcode enum x SIX opcode-keyed
+optimization tables** - `jit_op_eligible`, `op_fully_native`,
+`pick_visit_op` (register caching / LSRA qualification),
+`op_is_simple_island`, `op_writes_pure_target` (the arg-staging
+retarget whitelist) and `bc_inline_op_ok` (the splice whitelist) -
+one row per opcode, each claim checked against the LIVE predicate
+through exported forwarder shims (jit_test_* / bc_test_*), in both
+directions. **Adding an opcode now fails this test until all six
+columns are decided**; a deliberate non-answer is a row note, not a
+silent `default`. Its first run found and fixed two real holes: the
+CallBuiltinLV family was unlisted in `pick_visit_op` (one sort/pop in
+a run turned register caching off for the WHOLE run), and both struct
+ctors were left out of the #56 deletability batch though convey-only
+(the boxed one also missing its emit exc-stamp and the `catch (...)`
+eptr net - a #142-class terminate hazard). Record:
+docs/jit-optimizations.md, the #98 entry.
 
 **⛔ A HELPER'S REGISTER ABI IS THE EMITTER'S JOB, NOT THE CALLER'S
 (2026-08-05).** THREE bugs in two days were one shape - an implicit

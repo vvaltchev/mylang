@@ -4199,10 +4199,12 @@ extern "C" int jit_foreach_dyn_next(int_type iter_id) noexcept
  * StructTypeDef* from the struct_defs pool, baked by the emitter as a VALUE
  * (like MakeClosureV's FuncDescriptor*). The codegen's typed-scalar arg gate
  * means coerce_struct_field cannot throw here, but the field buffer is coerced
- * DEFENSIVELY, so a throw is caught LOC-LESS -> g_vm_jit_exc and EnterNative
- * re-raises stamping the construction's caret from the loc side table (vm_raise
- * stamps only when the exception has no loc). Every reachable throw is a
- * TypeErrorEx (a RuntimeException). NOT op_fully_native (side-table caret). */
+ * DEFENSIVELY, so a throw is caught LOC-LESS -> g_vm_jit_exc; the emit's
+ * cold-side exc-stamp gives it the construction's caret (vm_raise stamps only
+ * when the exception has no loc). Every reachable throw is a TypeErrorEx (a
+ * RuntimeException). Convey-only -> op_fully_native (deletable; #98 - the
+ * census audit found it left out of the #56 batch its emit twin
+ * MakeStructArrayV joined). */
 extern "C" int jit_struct_ctor(const void *defv, int_type base, int_type nf,
                                int_type dst) noexcept
 {
@@ -4266,7 +4268,9 @@ extern "C" void jit_struct_ctor_establish(const void *defv,
  * CAN throw (a dyn-laundered wrong value), and the exception already carries the
  * offending arg's caret from the pool - vm_raise's stamp is conditional on an
  * EMPTY loc, so that pooled caret survives the re-raise untouched (byte-identical
- * to the tree-walker's construct_struct). NOT op_fully_native. */
+ * to the tree-walker's construct_struct). Convey-only -> op_fully_native
+ * (deletable; #98 - the emit's cold-side exc-stamp covers a loc-less throw,
+ * and the stamp's own non-empty-loc guard keeps the pooled caret intact). */
 extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
                                      const void *bcv) noexcept
 {
@@ -4282,6 +4286,12 @@ extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (#56's net, missing here
+         * alone - its emit twin jit_make_struct_array had it; without it
+         * the noexcept would std::terminate) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
     }
     return 0;
 }
@@ -4293,8 +4303,9 @@ extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
  * buffer when it owns it). `defv` is the baked program-lifetime StructTypeDef*;
  * `n` is the ELEMENT count (the run holds n * nfields values). The all-scalar
  * field gate means the coerce can't throw; a defensive throw is caught LOC-LESS
- * -> g_vm_jit_exc, EnterNative stamps from the loc side table. NOT
- * op_fully_native. */
+ * -> g_vm_jit_exc, stamped by the emit's cold-side exc-stamp. Convey-only ->
+ * op_fully_native (deletable, the #56 batch; this comment used to deny that -
+ * it predated the batch and went stale, #98). */
 extern "C" int jit_make_struct_array(const void *defv, int_type base,
                                      int_type n, int_type dst) noexcept
 {
