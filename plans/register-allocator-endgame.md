@@ -870,7 +870,11 @@ change (drop hregs.empty() from both tmode gates, the exact edit
 from step 2/3's diag builds, which passed the full lever-on
 corpus + battery when combined with these fixes) plus the
 standing battery re-run.
-THEN: the re-lift; the wall A/B + flip gate.
+THE RE-LIFT LANDED 2026-08-25: both hregs.empty() tmode gates
+are GONE - C2b regions and trans mode coexist. Battery green with
+the gates lifted: -rt + corpus both configs, the lever-on xrot
+matrix (all rotations), off-arena; default vdjcmp 116/116.
+THEN: the wall A/B + flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the

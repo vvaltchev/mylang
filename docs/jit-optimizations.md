@@ -8740,3 +8740,16 @@ its job. Repro: MYLANG_JIT_LSRA=1 MYLANG_JIT_XROT=4 on
 tests/functional/16_elem2_fused.my, at committed HEAD. The fix
 arc is the elem2 raw-rax sites joining ask-and-evict, then the
 re-lift.
+
+## C2b-regions arc CLOSED (2026-08-25) - the tmode gates lift
+
+With the three blockers fixed (RefScratch's excl, the pair
+displacement forbidden under tmode, elem_read_plan's rax ask), both
+hregs.empty() gates are gone: a run with C2b hoist regions now
+takes trans mode, its transitions kept out of (T, L+1] by the
+snap's noreach ranges and its cold copies emitted against the
+replayed guard-point state. Battery green with the gates lifted:
+-rt + corpus in both configs, the lever-on xrot matrix on every
+rotation, the off-arena lever config; default emission 116/116
+byte-identical. The endgame's remaining markers are the wall-clock
+A/B and the flip gate.
