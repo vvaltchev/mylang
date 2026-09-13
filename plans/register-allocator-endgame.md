@@ -1103,11 +1103,19 @@ uses remain):
     already lets rax be pinned around it. HIGH effort, LOW
     payoff post-D4.
  2. THE TAG GRANT IDENTITY (tag_int_reg = RSI, tag_float_reg =
-    R8): consumers already query the RECORDED grant (B1's
-    refactor), so converting = choosing the registers
-    dynamically at grant time. REAL payoff: frees rsi/r8 as pool
-    members on the OFF-ARENA configs (register-form tags).
-    MODERATE effort, the seams exist. THE FIRST TARGET.
+    R8): AUDITED 2026-08-26 - every functional consumer already
+    reads the recorded grant (tag_holder / the variables; the
+    remaining rsi/r8 literals are COMMENTS), so the plumbing for
+    a dynamic pick exists. ⛔ BUT the payoff is OFF-ARENA ONLY
+    (the arena default makes tags imm32 - no grant at all), and
+    a better pick needs the grant/pick PIPELINE REORDERED (the
+    clobber mask consumes the grant's answer before the pick
+    runs - circular), while the plausible alternates (rdi, rdx,
+    rcx) are all hotter than rsi/r8, which is why B1 chose
+    these. Verdict: an off-arena optimization, priced at a
+    pipeline reorder for +1 pool member on float runs - NOT the
+    first target after all; fund only if off-arena perf ever
+    matters.
  3. THE CALL PROTOCOL (the M5b/c record push, ctx chain via r9,
     frame sizes via rsi): a fragment-internal ABI shared by
     every call site and entry stub. Converting = a protocol
