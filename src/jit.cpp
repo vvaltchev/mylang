@@ -4407,6 +4407,21 @@ struct Emitter {
         u32(imm);
         return true;
     }
+    /*
+     * LOAD A GLOBAL into `reg`. One instruction when the object is in
+     * the low arena; otherwise the two-instruction movabs form through
+     * `scratch`. THE SEAM EXISTS so a caller cannot pick the wrong one
+     * by hand - the same reason store_type_tag/_via are the only tag
+     * entry points (a caller that "knew" a register was loaded shipped
+     * a wrong answer once already).
+     */
+    void load_global(uint8_t reg, const void *addr, uint8_t scratch)
+    {
+        if (load_abs32(reg, addr))
+            return;
+        movabs(scratch, reinterpret_cast<uint64_t>(addr));
+        load_base0(reg, scratch);
+    }
     /* cmp dword [abs32], imm32 - `81 /7` plus the immediate tail. */
     bool cmp_abs32_imm32(const void *addr, uint32_t imm)
     {
@@ -6273,8 +6288,7 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap, uint8_t tbl)
     e.scratch(cb);            /* the ctx chain walks through it */
     const JitLayout &L = jit_layout();
     AccScratch acc(e);
-    e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_ctx));
-    e.load_base0(acc.r, acc.r);                /* the ctx */
+    e.load_global(acc.r, L.addr_ctx, acc.r);   /* the ctx */
     if (cap) {
         e.load_base(acc.r, acc.r, static_cast<int32_t>(L.ctx_captures));
         e.load_base(cb, acc.r, 0);             /* cb = the captures data */
@@ -7106,10 +7120,10 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      * which meant EVERY call passing an array/string/dict/struct, i.e. most
      * real code. It is now bound per-argument at the copy loop below, so the
      * decision moved to where the copy happens and stopped being a decline. */
-    e.movabs(RCX, reinterpret_cast<uint64_t>(L.addr_ctx));
-    ld(R9R, RCX, 0);                                  /* reg:proto: r9 = ctx */
-    e.movabs(RCX, reinterpret_cast<uint64_t>(L.addr_act));
-    ld(R8R, RCX, 0);                                  /* r8 = act */
+    /* one instruction each when the cells are in the arena, and RCX
+     * is left alone (see Emitter::load_global) */
+    e.load_global(R9R, L.addr_ctx, RCX);              /* reg:proto */
+    e.load_global(R8R, L.addr_act, RCX);
     if (!is_value) {
         /*
          * NO `defined` PROBE. It used to load a second vector's data pointer
@@ -7162,10 +7176,8 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * remaining guards and the whole mutation phase read them; the
          * un-rebuilt r8 was a release-only SEGV - dbg helpers happened
          * to preserve it) */
-        e.movabs(RCX, reinterpret_cast<uint64_t>(L.addr_ctx));
-        ld(R9R, RCX, 0);  /* reg:proto */
-        e.movabs(RCX, reinterpret_cast<uint64_t>(L.addr_act));
-        ld(R8R, RCX, 0);
+        e.load_global(R9R, L.addr_ctx, RCX);  /* reg:proto */
+        e.load_global(R8R, L.addr_act, RCX);
         ld(RAX, RDX, static_cast<int32_t>(P.fo_func));  /* rax = desc */
     }
     /*
@@ -7555,8 +7567,10 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          * spilled - the record path reloads it from [rsp]; r11 is dead
          * here, the fill it fed is skipped) */
         ld(RAX, R9R, static_cast<int32_t>(L.ctx_captures));  /* reg:proto */
-        movabs_r11(reinterpret_cast<uint64_t>(&g_jit_residue_caps));
-        st(R11, 0, RAX);
+        if (!e.store_abs32(&g_jit_residue_caps, RAX)) {
+            movabs_r11(reinterpret_cast<uint64_t>(&g_jit_residue_caps));
+            st(R11, 0, RAX);
+        }
 #ifdef TESTS
         movabs_r11(reinterpret_cast<uint64_t>(&g_jit_norec_pushes));
         e.inc_qword_base(R11);           /* inc qword [r11] */
@@ -8235,8 +8249,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
          * pop restores them from its record, and a record-less callee's
          * return arm now restores them from the residue itself, so this
          * arm's per-call relay round-trip was pure overhead) */
-        e.movabs(RCX, reinterpret_cast<uint64_t>(jit_layout().addr_act));
-        e.load_base0(RCX, RCX);
+        e.load_global(RCX, jit_layout().addr_act, RCX);
         /* 4-v: vframe.slots = rbx (OUR window) - a record-ful CALLEE's
          * pop repointed the view via its record's parent fields, but a
          * record-less callee's arm could only set slots from [rbp-8];
