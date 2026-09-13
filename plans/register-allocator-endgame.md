@@ -1090,6 +1090,18 @@ green. ⛔ THE OTHER TWO v1 BOUNDS STAY, EACH WITH ITS WRITTEN REASON
    redesign for a shape the whole-run rescue and the homes tier
    already mostly serve (a slot heavy enough to want both is
    heavy enough to be rescued whole-run).
+#103 THE 38-USE WORKLIST, READ SITE BY SITE (2026-08-25, batch
+2): 15 more uses promoted - every one turned out to be the
+ask-fallback bracket AGAIN (emit_op/emit_branch's hold() asks
+alloc_scratch first and RCX is its refusal path; ref_check's scr
+default feeds RefScratch, itself the ask bracket; div_magic's own
+comment says "ask-first, like RefScratch's ctor"; store_dst passes
+the same scr). CONV 23 remains: the elem base-gate/bounds roles,
+the R9 ctx-chain preference, the model-check probes, the switch
+tbl - each to be READ before moved; blanket conversion was the
+wrong frame for this residue, since the sweep's mechanical
+conversions (8b/8c) already put the ask in front of nearly every
+site and left only its fallback registers behind.
 #103 PHASE E EXECUTED ON THE FIVE FAMILIES (2026-08-25): 461 of
 the 499 conv uses are PROMOTED to the terminal `reg:proto` tag -
 the phase-E rule's own outcome ("conv must shrink to genuine
