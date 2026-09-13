@@ -32120,6 +32120,193 @@ static bool jit_elemv_native()
 #endif
 }
 
+/*
+ * #97 inc 3: THE BOXED-ELEMENT INLINE STORE TIER (StoreElemValue).
+ * g_jit_storev_fast is bumped by the EMITTED code only. Every guard is
+ * additionally proven TAKEN through the decline ledger - see
+ * jit_elemv_native for why a fast-path counter cannot do that.
+ *
+ * The declines are where this tier's correctness lives: the
+ * interpreter throws on a const / read-only / out-of-range store
+ * WITHOUT cloning or invalidating anything, and the COW clone is
+ * `intptr`-observable, so a declined store must leave the array
+ * byte-for-byte untouched.
+ */
+static bool jit_storev_native()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long sv0 = g_jit_storev_fast;
+    /* THE FAST SHAPE: reference elements overwritten by other
+     * references - each store releases the old value (the initial four
+     * arrays are the LAST reference, so the COLD destruction arm runs)
+     * and retains the new one. */
+    if (!run({
+            "var pool = [[1], [2], [3], [4]];",
+            "var src = [[9], [8]];",
+            "for (var i = 0; i < 20; i++) {",
+            "  pool[i % 4] = src[i % 2];",
+            "}",
+            "var s = 0;",
+            "for (var i = 0; i < 4; i++) s += pool[i][0];",
+            "assert(s == 34);",
+            /* a SELF-store: the emit retains the new value BEFORE
+             * releasing the old one, so an aliasing store can never
+             * destroy the source it is about to copy. (The source slot
+             * holds its own retained reference, so the count is >= 2
+             * here - the ordering is defensive, not load-bearing, and
+             * is written that way on purpose.) */
+            "var sp = [[5], [6]];",
+            "for (var i = 0; i < 10; i++) sp[i % 2] = sp[i % 2];",
+            "assert(sp[0][0] == 5);",
+            "assert(sp[1][0] == 6);",
+            /* VALUE SEMANTICS: a plain alias SHARES the mutation */
+            "var b1 = [[1], [2], [3]];",
+            "var al = b1;",
+            "for (var i = 0; i < 8; i++) b1[0] = src[0];",
+            "assert(al[0][0] == 9);" }))
+        return false;
+    if (g_jit_storev_fast <= sv0) {
+        fprintf(stderr,
+                "jit_storev_native: the INLINE store tier DID NOT RUN\n");
+        return false;
+    }
+    /* DECLINES: right answers through the helper, and each guard
+     * proven TAKEN. */
+    unsigned long d0[JD_COUNT];
+    for (int r = 0; r < JD_COUNT; r++)
+        d0[r] = g_jit_decline[r];
+    const unsigned long hv0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::StoreElemValue)];
+    if (!run({
+            "var src = [[9], [8]];",
+            "var n = 0;",
+            /* base_slice. ⛔ It fires ONCE, not once per iteration: the
+             * helper's store on a slice base runs clone_internal_vec,
+             * which makes the view a standalone non-slice array - so
+             * every later store takes the FAST path. */
+            "var dst = [[1], [2], [3], [4]];",
+            "var sl = dst[0:2];",
+            "for (var i = 0; i < 6; i++) sl[i % 2] = src[i % 2];",
+            "assert(sl[0][0] == 9);",
+            /* has_slices - AND its COW spec: the write detaches the
+             * live view, which keeps the PRE-write value while the
+             * array gets the new one */
+            "var wv = [[1], [2], [3]];",
+            "var view = wv[0:2];",
+            "for (var i = 0; i < 6; i++) wv[0] = src[0];",
+            "assert(view[0][0] == 1);",
+            "assert(wv[0][0] == 9);",
+            /* val_slice: a slice stored INTO an element must go through
+             * the C++ copy that registers it in its parent's set */
+            "var flat = [1, 2, 3, 4, 5];",
+            "var hold = [[0], [0]];",
+            "for (var i = 0; i < 6; i++) hold[i % 2] = flat[1:3];",
+            "assert(hold[0][0] == 2);",
+            "flat[1] = 99;",
+            "assert(hold[0][0] == 2);",
+            /* val_ex: a caught exception object (vtable'd pointee) */
+            "var dyn ex = 0;",
+            "try { var q = [1]; q[9] = 1; }",
+            "catch (OutOfBoundsEx as e) { ex = e; }",
+            "var eh = [[0], [0]];",
+            "for (var i = 0; i < 6; i++) eh[i % 2] = ex;",
+            /* bounds (a negative index WRAPS in the helper) and the
+             * SCALE-WRAP index (2^60 * sizeof(LValue) == 0 mod 2^64) */
+            "var g = [[1], [2], [3]];",
+            "var caught = 0;",
+            "for (var i = 0; i < 6; i++) {",
+            "  g[i % 2 - 1] = src[i % 2];",
+            "  try { g[1152921504606846976] = src[0]; }",
+            "  catch (OutOfBoundsEx) { caught += 1; }",
+            "}",
+            "assert(caught == 6);",
+            "assert(g[2][0] == 9);",
+            /* base_kind: a dyn ALIAS of a FLAT int array (a dyn
+             * DESTINATION would have built a general one) */
+            "var fa = [1, 2, 3];",
+            "var dyn da = fa;",
+            "var dyn dv = 7;",
+            "for (var i = 0; i < 6; i++) da[i % 3] = dv;",
+            "assert(fa[0] == 7);",
+            /* base_not_arr: StoreElemValue is the UNIVERSAL store, so a
+             * dyn base holding a DICT reaches it */
+            "var dyn dd = {0: \"a\", 1: \"b\"};",
+            "for (var i = 0; i < 6; i++) dd[i % 2] = \"z\";",
+            "assert(dd[0] == \"z\");",
+            /* base_const: a const array bound to a (non-const-declared)
+             * parameter still carries the const flag on its slot */
+            "const RO = [[1], [2]];",
+            "func poke(a, v) { a[0] = v; }",
+            "for (var i = 0; i < 6; i++) {",
+            "  try { poke(RO, src[0]); } catch (NotLValueEx) { n += 1; }",
+            "}",
+            "assert(n == 6);",
+            /* readonly: a SLICE of a const lands read-only in a plain
+             * var, so the const-slot guard does not shadow it */
+            "const C2 = [[1], [2], [3]];",
+            "var rs = C2[0:2];",
+            "var m = 0;",
+            "for (var i = 0; i < 6; i++) {",
+            "  try { rs[0] = src[0]; } catch (NotLValueEx) { m += 1; }",
+            "}",
+            "assert(m == 6);" }))
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::StoreElemValue)] <= hv0) {
+        fprintf(stderr, "jit_storev_native: nothing DECLINED to the "
+                        "helper - the decline cases are vacuous\n");
+        return false;
+    }
+    /* storev_elem_const is deliberately absent: an array element's
+     * LValue is always constructed non-const (a const CONTAINER is
+     * readonly, which the guard above catches), so no program can
+     * reach it. It stays for the same reason elemv_base_not_arr does -
+     * a `.myv` image's operands are bounded but not type-checked. */
+    static const int want[] = {
+        JD_storev_base_not_arr, JD_storev_base_const,
+        JD_storev_base_slice, JD_storev_readonly, JD_storev_base_kind,
+        JD_storev_has_slices, JD_storev_scale_wrap, JD_storev_bounds,
+        JD_storev_val_ex, JD_storev_val_slice,
+    };
+    for (const int r : want) {
+        if (g_jit_decline[r] > d0[r])
+            continue;
+        fprintf(stderr, "jit_storev_native: the guard `%s` was never "
+                        "TAKEN - its case is vacuous\n",
+                jit_decline_name(r));
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_len_ord()
 {
 #if ML_JIT_SUPPORTED
@@ -36537,6 +36724,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 the boxed-element inline read tier - fires on reference "
       "elements, DECLINES slice / t_ex / negative / scale-wrap index",
       jit_elemv_native },
+    { "jit: #97 the boxed-element inline STORE tier - fires on a general "
+      "array, DECLINES const/readonly/slice/live-views/kind/bounds",
+      jit_storev_native },
     { "jit: capped sync calls SWITCH interpreted-flat (#56 step 3)",
       jit_call_switch_protocol },
     { "jit: native throw (same-frame / cross-frame / non-struct) (#56)",
