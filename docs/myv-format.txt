@@ -310,6 +310,16 @@ through this table: a string CONSTANT is data, not an identifier.
         uid   name
         value value         the folded `const NAME = expr;` member
 
+                            A `func` value (tag 9) is REFUSED here: this
+                            section is read before the DESCRIPTOR TABLE
+                            (section 8), so a descriptor index written
+                            here resolves against an empty table.  The
+                            writer aborts with "unserializable value (a
+                            function in a struct's const member ...)"
+                            rather than emit an image that cannot be
+                            read.  Lifting the restriction means moving
+                            these consts AFTER section 8.
+
 Structs are written in definition order.  A field's `struct_def` can only
 reference an EARLIER struct (inline fields only go backwards - a parser
 invariant enforced by the recursive-struct rejection), so no forward reference
@@ -735,7 +745,12 @@ keys and values, and recursively by itself.
     6  dict         see 11.2
     7  strct        see 11.3
     8  structtype   sref
-    9  func         dref     (a FuncObject; the descriptor MUST have
+    9  func         dref     (a FuncObject; NOT legal inside a struct's
+                              const members - section 7 is read BEFORE the
+                              descriptor table exists, so the reference
+                              cannot be resolved; the writer REFUSES one
+                              there rather than emit an unreadable image.
+                              The descriptor MUST have
                               NO captures - the writer refuses a
                               capturing closure and the READER
                               REJECTS one: "corrupt .myv (capturing

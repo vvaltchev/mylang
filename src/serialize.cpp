@@ -250,6 +250,20 @@ struct Writer {
     std::map<const StructTypeDef *, uint32_t> struct_ids;
     std::map<const FuncDescriptor *, uint32_t> desc_ids;
 
+    /*
+     * True while writing the STRUCT table's folded `const` members, which
+     * the reader parses BEFORE the descriptor table exists - so a `func`
+     * value there is unreadable however faithfully it is written. The
+     * writer knows every descriptor index up front and so cannot notice;
+     * the reader's `r.descs` is simply still empty, and the image dies as
+     * "corrupt .myv (descriptor)" on a file that is nothing of the kind.
+     * Refuse it AT WRITE TIME instead - an image is never silently lossy.
+     * THE REAL FIX is a format change (write struct consts AFTER the
+     * descriptor table, the way a chunk's pools already come later);
+     * until then this is a clean compile-time refusal, not a broken file.
+     */
+    bool in_struct_consts = false;
+
     void u8v(uint8_t v) { buf.push_back(static_cast<char>(v)); }
     void u32v(uint32_t v)
     {
@@ -750,6 +764,10 @@ void write_value(Writer &w, const EvalValue &v)
         const FuncObject &fo = *v.get<intrusive_ptr<FuncObject>>();
         if (!fo.capture_slots.empty())
             bad_image("unserializable value (capturing closure in a pool)");
+        if (w.in_struct_consts)
+            bad_image("unserializable value (a function in a struct's "
+                      "const member - the descriptor table is written "
+                      "after the struct table, so it cannot be read back)");
         auto it = w.desc_ids.find(fo.func);
         if (it == w.desc_ids.end())
             bad_image("unserializable value (func descriptor)");
@@ -1723,10 +1741,12 @@ void myv_write(const VmProgram &prog, const std::string &path,
             w.u32v(static_cast<uint32_t>(f.slot));
         }
         w.u32v(static_cast<uint32_t>(sd->consts.size()));
+        w.in_struct_consts = true;
         for (const auto &kv : sd->consts) {
             w.uidv(kv.first);
             write_value(w, kv.second);
         }
+        w.in_struct_consts = false;
     }
 
     tick("structs");
