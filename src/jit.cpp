@@ -11828,10 +11828,12 @@ jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
  * Steps: (1) cut every interval at its slot's event pcs, admitting a
  * piece only when its interval is float-free and jit_next_use proves a
  * use inside it; (2) walk pieces by start with expire-and-free; (3) at
- * pressure evict the active piece with the furthest next use at the
- * contested pc, truncating it there (its remainder is the memory half
- * of the split). Deterministic throughout: free registers are taken
- * lowest-index-first, eviction ties break toward the smaller slot.
+ * pressure evict the piece with the LOWEST use density over its
+ * remaining interval (uses-remaining / span-remaining; the newcomer
+ * competes), truncating the loser at the contested pc (its remainder
+ * is the memory half of the split). Deterministic throughout: free
+ * registers are taken lowest-index-first, eviction ties break toward
+ * the smaller slot.
  */
 bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<LiveInterval> &iv,
@@ -12005,17 +12007,47 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
             active.push_back(i);
             continue;
         }
-        /* pressure: the furthest next use at the contested pc loses.
-         * The newcomer competes too - if ITS next use is furthest, it
-         * is the one that stays in memory. */
-        int far_i = -1, far_nu = nu(p.start, p.slot);
+        /* pressure: the LOWEST use DENSITY over the REMAINING
+         * interval loses - uses in [here, end) over (end - here),
+         * cross-multiplied so there is no float compare. The 89
+         * finding replaced furthest-NEXT-USE here: distance evicted
+         * the 2-op/iter recurrence (f3) to keep the 1-op index, and
+         * left the phase-2 index (fj, ~6 uses) unserved because its
+         * loop was far - while the pick's static COUNT ranking, which
+         * IS a density ranking, served both and won the wall. The
+         * newcomer competes too; ties evict the smaller slot (the
+         * pre-density tie direction, kept). */
+        const auto uses_rem = [&](int slot, uint32_t from,
+                                  uint32_t to) -> uint64_t {
+            uint64_t n = 0;
+            if (fm) {
+                for (const FltEvent &e2 : *fev)
+                    if (e2.slot == slot && e2.pc >= from && e2.pc < to
+                            && e2.kind != FltEvent::mem)
+                        n++;
+            } else {
+                for (const MemEvent &u : int_uses)
+                    if (u.slot == slot && u.pc >= from && u.pc < to)
+                        n++;
+            }
+            return n;
+        };
+        const uint32_t here0 = p.start;
+        int far_i = -1;                  /* -1 = the newcomer loses */
+        uint64_t lu = uses_rem(p.slot, here0, p.end);
+        uint64_t ls = p.end - here0;
         for (size_t a = 0; a < active.size(); a++) {
             const LsraPiece &c = out.pieces[active[a]];
-            const int d = nu(p.start, c.slot);
-            if (d > far_nu || (d == far_nu && far_i >= 0
-                    && c.slot < out.pieces[active[far_i]].slot)) {
-                far_nu = d;
+            const uint64_t cu = uses_rem(c.slot, here0, c.end);
+            const uint64_t cs = c.end - here0;
+            /* c loses to the current loser iff cu/cs < lu/ls */
+            const uint64_t lhs = cu * ls, rhs = lu * cs;
+            const int lslot = far_i < 0 ? p.slot
+                                        : out.pieces[active[far_i]].slot;
+            if (lhs < rhs || (lhs == rhs && c.slot < lslot)) {
                 far_i = static_cast<int>(a);
+                lu = cu;
+                ls = cs;
             }
         }
         if (far_i < 0)

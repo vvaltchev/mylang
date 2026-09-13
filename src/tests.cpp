@@ -25500,6 +25500,21 @@ static bool jit_lsra_check()
           "var a = 0; var b = 0; var n = 0; n = n + runtime(50);\n"
           "for (var i = 0; i < n; i++) { a = a + i; b = b + a; }\n"
           "print(a + b);\n" },
+        /* the 89 microshape: at z's arrival the holder a has a NEAR
+         * next use (the very next statement) but only ~3 remaining
+         * events, while z's uses are FAR (its loop) but dense (6
+         * events + the print). Furthest-next-use leaves z in memory
+         * for its whole interval - the fj failure; the density
+         * contest evicts a and z holds the loop. */
+        { "density beats distance", 1,
+          "var a = 0; a = a + runtime(2);\n"
+          "var z = 0; z = z + runtime(3);\n"
+          "a = a + 1;\n"
+          "var n = 0; n = n + runtime(40);\n"
+          "for (var i = 0; i < n; i++) {\n"
+          "  z = z + i; z = z + 1; z = z + 2;\n"
+          "}\n"
+          "print(a + z);\n" },
         /* the m3 finding's shape, on the FUNCTION chunk: f holds a
          * CLOSURE and its only touch is ReturnV - property F says it
          * never gets a register (uses_ret is weight, not type
@@ -25742,6 +25757,34 @@ static bool jit_lsra_check()
                 printf("  lsra [%s]: the run-refused hot interval is "
                        "not register-resident - the payoff is not "
                        "collected\n", c.name);
+                ok = false;
+            }
+        }
+        if (std::string(c.name) == "density beats distance") {
+            /* z (slot 1, the second decl) carries ~7 of the run's
+             * int events, all in or after the loop; a (slot 0) has
+             * ~4, all near the top. Whoever holds the ONE register
+             * longest is the contest's answer: under the density
+             * rule it is z (it owns the loop); under furthest-next-
+             * use z is the far newcomer, never installs, and a keeps
+             * the register end to end - the watched sabotage. */
+            std::map<int, long> rl;
+            for (const LsraPiece &p : plan.pieces)
+                if (p.reg >= 0)
+                    rl[p.slot] += p.end - p.start;
+            long max_rl = 0;
+            for (const auto &kv : rl)
+                if (kv.second > max_rl)
+                    max_rl = kv.second;
+            const long z_len = rl.count(1) ? rl[1] : 0;
+            if (max_rl == 0) {
+                printf("  lsra [%s]: nothing resident - the shape is "
+                       "not the one intended\n", c.name);
+                ok = false;
+            } else if (z_len < max_rl) {
+                printf("  lsra [%s]: dense z holds %ld pcs, max %ld "
+                       "- the density contest did not serve it\n",
+                       c.name, z_len, max_rl);
                 ok = false;
             }
         }
