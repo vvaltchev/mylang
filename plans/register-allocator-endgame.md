@@ -1018,8 +1018,30 @@ the lever-on xrot matrix, off-arena, census, default vdjcmp
 measurement: an edit verified green can be LOST by a later
 git-restore in the same probe session - the "no effect" run was
 of a binary WITHOUT the fix; grep the anchor before measuring.
-THEN: the clean wall A/B (the lifted config, all benches) ->
-the flip gate.
+THE CLEAN WALL A/B RAN 2026-08-26 (RULE B1: rm -rf build, fresh
+perf lane opt1/asserts0, explicit --mylang/--baseline, header
+checked; 28 excluded - the standing cache-infra item; env
+wrapper for the lever side, interleaved so drift cancels):
+⛔ GEOMEAN cur/base 0.997x OVER 87 - THE LEVER IS A NET WALL WIN
+SUITE-WIDE, the arc's first sub-1.0 full-suite verdict. Wins:
+85_regs_ref 0.73x, 46_matrix 0.82x, 82 0.83x, 18 0.85x, 83
+0.91x, 84 0.91x, 06 0.93x. 43 is GONE from the tail (the install
+-conflict fix held on the wall). The tail (59 1.08x, 52 1.07x, a
+1.06x band) was Ir-SPOT-CHECKED and is EXACTLY identical per
+iteration both configs (59: 24,000,000 = 24,000,000; 52: 27,000
+= 27,000) - single-run wall noise on sub-100ms benches, per the
+documented small-bench divergence.
+WHAT REMAINS IS THE FLIP GATE - THE MAINTAINER'S CALL, with the
+ledger now complete on both axes: Ir (zero per-iteration
+regressions corpus-wide; wins 06 -16.8%, 81 -2.7%, 82 -1.6%, 83
+-1.0%, 68 -0.5%, 46 -5.5% post-lift, 43 at exact parity) and
+WALL (geomean 0.997x, wins to -27%, tail verified noise). The
+float twin is complete and flat; the gates are lifted; every
+watched net is green in both configs, both arenas, every
+rotation. Compile-side cost: the +0.0..1.2% s1 band (task #102's
+RTTI work is the remedy). D4 (default ON) would retire the pick
+after a soak; the lever-off config would then need the same
+coverage discipline the lever-on one got.]
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the

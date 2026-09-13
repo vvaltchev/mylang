@@ -8763,3 +8763,16 @@ configs, the lever-on xrot matrix on every rotation, the off-arena
 lever config, the census gate, and default vdjcmp 116/116 - all
 green. What remains for #96's endgame: the clean lifted-config
 wall A/B, then the flip gate.
+
+## #96 endgame - the clean wall A/B (2026-08-26): geomean 0.997x,
+## the lever's first net full-suite wall win
+
+RULE B1 observed end to end. Interleaved lever-on vs lever-off at
+the lifted HEAD over 87 benchmarks: geomean cur/base 0.997x - the
+allocator now WINS the wall suite-wide. Wins: 85_regs_ref 0.73x,
+46_matrix_mult 0.82x, 82_regs 0.83x, 18_foreach 0.85x, 83 0.91x,
+84 0.91x, 06_if_branch 0.93x. 43_sieve is gone from the tail; the
+worst entries (59 1.08x, 52 1.07x) were Ir-spot-checked and are
+EXACTLY identical per iteration in both configs - single-run wall
+noise on sub-100ms benches. The ledger for the maintainer's flip
+decision is complete on both axes.
