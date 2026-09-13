@@ -207,7 +207,8 @@ EvalValue Construct::eval(EvalContext *ctx, bool rec) const
 }
 
 LiteralStr::LiteralStr(const std::string_view &v)
-    : value(v.empty() ? empty_str : EvalValue(SharedStr(unescape_str(v))))
+    : Literal(ConstructType::lit_str)
+    , value(v.empty() ? empty_str : EvalValue(SharedStr(unescape_str(v))))
 { }
 
 /*

@@ -2718,68 +2718,152 @@ private:
 void
 for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
 {
-    if (auto *n = dynamic_cast<SingleChildConstruct *>(c)) {
-        fn(n->elem.get());
-    } else if (auto *n = dynamic_cast<MultiOpConstruct *>(c)) {
-        for (auto &p : n->elems) {
+    /* #102: a TAG SWITCH (see Inferencer::for_each_child's note). NO
+     * default: -Werror=switch keeps it exhaustive. The SCOPE nodes -
+     * Block, for/foreach/for-range, try, Expr14, FuncDecl - are
+     * DELIBERATELY childless here exactly as in the old chain:
+     * Resolver::walk handles them and they never reach this walker
+     * (the documented for_each_child contract). */
+    switch (c->ct) {
+    case ConstructType::expr01:
+    case ConstructType::inlined_call:
+    case ConstructType::throw_stmt: {
+        fn(static_cast<SingleChildConstruct *>(c)->elem.get());
+        break;
+    }
+    case ConstructType::expr02:
+    case ConstructType::expr03:
+    case ConstructType::expr04:
+    case ConstructType::expr05:
+    case ConstructType::expr06:
+    case ConstructType::expr07:
+    case ConstructType::expr08:
+    case ConstructType::expr09:
+    case ConstructType::expr10:
+    case ConstructType::expr11:
+    case ConstructType::expr12: {
+        for (auto &p : static_cast<MultiOpConstruct *>(c)->elems)
             fn(p.second.get());
-        }
-    } else if (auto *n = dynamic_cast<TypedScalarExpr *>(c)) {
-        /* an M8 specialized node: same elems shape as MultiOpConstruct. The
-         * inliner normally runs before specialize_types and never sees one,
-         * but a CROSS-INPUT inlined prior body is already specialized. */
-        for (auto &p : n->elems) fn(p.second.get());
-    } else if (auto *n = dynamic_cast<IncDecExpr *>(c)) {
-        fn(n->lvalue.get());
-    } else if (auto *n = dynamic_cast<TernaryExpr *>(c)) {
+        break;
+    }
+    case ConstructType::typed_scalar: {
+        /* an M8 specialized node: same elems shape as
+         * MultiOpConstruct. The inliner normally runs before
+         * specialize_types and never sees one, but a CROSS-INPUT
+         * inlined prior body is already specialized. */
+        for (auto &p : static_cast<TypedScalarExpr *>(c)->elems)
+            fn(p.second.get());
+        break;
+    }
+    case ConstructType::incdec: {
+        fn(static_cast<IncDecExpr *>(c)->lvalue.get());
+        break;
+    }
+    case ConstructType::ternary: {
+        auto *n = static_cast<TernaryExpr *>(c);
         fn(n->condExpr.get());
         fn(n->thenExpr.get());
         fn(n->elseExpr.get());
-    } else if (auto *n = dynamic_cast<CoalesceExpr *>(c)) {
+        break;
+    }
+    case ConstructType::coalesce: {
+        auto *n = static_cast<CoalesceExpr *>(c);
         fn(n->lhs.get());
         fn(n->rhs.get());
-    } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
+        break;
+    }
+    case ConstructType::call: {
+        auto *n = static_cast<CallExpr *>(c);
         fn(n->what.get());
         fn(n->args.get());
-    } else if (auto *n = dynamic_cast<IfStmt *>(c)) {
+        break;
+    }
+    case ConstructType::if_stmt: {
+        auto *n = static_cast<IfStmt *>(c);
         fn(n->condExpr.get());
         fn(n->thenBlock.get());
         fn(n->elseBlock.get());
-    } else if (auto *n = dynamic_cast<WhileStmt *>(c)) {
+        break;
+    }
+    case ConstructType::while_stmt: {
+        auto *n = static_cast<WhileStmt *>(c);
         fn(n->condExpr.get());
         fn(n->body.get());
-    } else if (auto *n = dynamic_cast<Subscript *>(c)) {
+        break;
+    }
+    case ConstructType::subscript: {
+        auto *n = static_cast<Subscript *>(c);
         fn(n->what.get());
         fn(n->index.get());
-    } else if (auto *n = dynamic_cast<Slice *>(c)) {
+        break;
+    }
+    case ConstructType::slice: {
+        auto *n = static_cast<Slice *>(c);
         fn(n->what.get());
         fn(n->start_idx.get());
         fn(n->end_idx.get());
-    } else if (auto *n = dynamic_cast<MemberExpr *>(c)) {
-        fn(n->what.get());
-    } else if (auto *n = dynamic_cast<ReturnStmt *>(c)) {
-        fn(n->elem.get());
-    } else if (auto *n = dynamic_cast<LiteralDictKVPair *>(c)) {
+        break;
+    }
+    case ConstructType::member: {
+        fn(static_cast<MemberExpr *>(c)->what.get());
+        break;
+    }
+    case ConstructType::ret: {
+        fn(static_cast<ReturnStmt *>(c)->elem.get());
+        break;
+    }
+    case ConstructType::lit_dict_kv: {
+        auto *n = static_cast<LiteralDictKVPair *>(c);
         fn(n->key.get());
         fn(n->value.get());
-    } else if (auto *n = dynamic_cast<MultiElemConstruct<Construct> *>(c)) {
-        /* ExprList, LiteralArray (Block is handled in walk) */
-        for (auto &e : n->elems) {
-            fn(e.get());
-        }
-    } else if (auto *n = dynamic_cast<MultiElemConstruct<Identifier> *>(c)) {
-        /* IdList */
-        for (auto &e : n->elems) {
-            fn(e.get());
-        }
-    } else if (auto *n =
-                   dynamic_cast<MultiElemConstruct<LiteralDictKVPair> *>(c)) {
-        /* LiteralDict */
-        for (auto &e : n->elems) {
-            fn(e.get());
-        }
+        break;
     }
-    /* literals, Identifier and childless constructs have no children */
+    case ConstructType::lit_arr:
+    case ConstructType::expr_list: {
+        /* ExprList, LiteralArray (Block is handled in walk) */
+        for (auto &e : static_cast<MultiElemConstruct<Construct> *>(c)
+                           ->elems)
+            fn(e.get());
+        break;
+    }
+    case ConstructType::idlist: {
+        for (auto &e : static_cast<MultiElemConstruct<Identifier> *>(c)
+                           ->elems)
+            fn(e.get());
+        break;
+    }
+    case ConstructType::lit_dict: {
+        auto *n = static_cast<MultiElemConstruct<LiteralDictKVPair> *>(c);
+        for (auto &e : n->elems)
+            fn(e.get());
+        break;
+    }
+    /* literals, Identifier and childless constructs have no
+     * children; the scope nodes (block/for/for-range/foreach/try/
+     * expr14/func_decl/struct_decl) are walk()'s, never walked
+     * here */
+    case ConstructType::other:
+    case ConstructType::nop:
+    case ConstructType::brk:
+    case ConstructType::cont:
+    case ConstructType::rethrow:
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+    case ConstructType::lit_obj:
+    case ConstructType::id:
+    case ConstructType::block:
+    case ConstructType::expr14:
+    case ConstructType::for_stmt:
+    case ConstructType::for_range:
+    case ConstructType::foreach_stmt:
+    case ConstructType::try_catch:
+    case ConstructType::func_decl:
+    case ConstructType::struct_decl:
+        break;
+    }
 }
 
 /*
@@ -2828,20 +2912,38 @@ static void fmi_children(Construct *c,
 {
     if (!c)
         return;
-    if (auto *b = dynamic_cast<Block *>(c)) {
-        for (auto &e : b->elems) fn(e.get());
-    } else if (auto *f = dynamic_cast<ForStmt *>(c)) {
+    /* #102: tag dispatch for the five added kinds; everything else
+     * falls to the (already tag-switched) for_each_child */
+    switch (c->ct) {
+    case ConstructType::block: {
+        for (auto &e : static_cast<Block *>(c)->elems)
+            fn(e.get());
+        return;
+    }
+    case ConstructType::for_stmt: {
+        auto *f = static_cast<ForStmt *>(c);
         fn(f->init.get()); fn(f->cond.get());
         fn(f->inc.get()); fn(f->body.get());
-    } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        return;
+    }
+    case ConstructType::foreach_stmt: {
+        auto *fe = static_cast<ForeachStmt *>(c);
         fn(fe->container.get()); fn(fe->body.get());
-    } else if (auto *t = dynamic_cast<TryCatchStmt *>(c)) {
-        fn(t->tryBody.get());
-        for (auto &p : t->catchStmts) fn(p.second.get());
-        fn(t->finallyBody.get());
-    } else if (auto *e = dynamic_cast<Expr14 *>(c)) {
+        return;
+    }
+    case ConstructType::try_catch: {
+        auto *tc = static_cast<TryCatchStmt *>(c);
+        fn(tc->tryBody.get());
+        for (auto &p : tc->catchStmts) fn(p.second.get());
+        fn(tc->finallyBody.get());
+        return;
+    }
+    case ConstructType::expr14: {
+        auto *e = static_cast<Expr14 *>(c);
         fn(e->lvalue.get()); fn(e->rvalue.get());
-    } else {
+        return;
+    }
+    default:
         for_each_child(c, fn);
     }
 }
@@ -2850,10 +2952,10 @@ static void fmi_children(Construct *c,
 static bool fmi_mentions(const Construct *e,
                          const std::unordered_set<const UniqueId *> &t)
 {
-    if (!e || dynamic_cast<const FuncDeclStmt *>(e))
+    if (!e || e->ct == ConstructType::func_decl)
         return false;
-    if (auto *id = dynamic_cast<const Identifier *>(e))
-        return t.count(id->uid) != 0;
+    if (e->ct == ConstructType::id)
+        return t.count(static_cast<const Identifier *>(e)->uid) != 0;
     bool found = false;
     fmi_children(const_cast<Construct *>(e),
                  [&](Construct *ch) { if (fmi_mentions(ch, t)) found = true; });
@@ -4024,70 +4126,171 @@ void
 for_each_child_slot(Construct *c,
                     const std::function<void(unique_ptr<Construct> &)> &fn)
 {
-    if (auto *n = dynamic_cast<SingleChildConstruct *>(c)) {
-        fn(n->elem);
-    } else if (auto *n = dynamic_cast<MultiOpConstruct *>(c)) {
-        for (auto &p : n->elems) fn(p.second);
-    } else if (auto *n = dynamic_cast<TypedScalarExpr *>(c)) {
-        /* M8 specialized node (same elems shape); a cross-input inlined prior
-         * body is already specialized, so substitution must descend here. */
-        for (auto &p : n->elems) fn(p.second);
-    } else if (auto *n = dynamic_cast<IncDecExpr *>(c)) {
-        fn(n->lvalue);
-    } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
+    /* #102: a TAG SWITCH (see Inferencer::for_each_child's note) -
+     * the dynamic_cast chain here was the resolver's share of the
+     * compile RTTI bill. NO default: -Werror=switch keeps it
+     * exhaustive. Child sets and null guards are EXACTLY the old
+     * chain's. */
+    switch (c->ct) {
+    case ConstructType::expr01:
+    case ConstructType::inlined_call:
+    case ConstructType::throw_stmt: {
+        fn(static_cast<SingleChildConstruct *>(c)->elem);
+        break;
+    }
+    case ConstructType::expr02:
+    case ConstructType::expr03:
+    case ConstructType::expr04:
+    case ConstructType::expr05:
+    case ConstructType::expr06:
+    case ConstructType::expr07:
+    case ConstructType::expr08:
+    case ConstructType::expr09:
+    case ConstructType::expr10:
+    case ConstructType::expr11:
+    case ConstructType::expr12: {
+        for (auto &p : static_cast<MultiOpConstruct *>(c)->elems)
+            fn(p.second);
+        break;
+    }
+    case ConstructType::typed_scalar: {
+        /* M8 specialized node (same elems shape); a cross-input
+         * inlined prior body is already specialized, so substitution
+         * must descend here. */
+        for (auto &p : static_cast<TypedScalarExpr *>(c)->elems)
+            fn(p.second);
+        break;
+    }
+    case ConstructType::incdec: {
+        fn(static_cast<IncDecExpr *>(c)->lvalue);
+        break;
+    }
+    case ConstructType::call: {
+        auto *n = static_cast<CallExpr *>(c);
         fn(n->what);
         for (auto &e : n->args->elems) fn(e);
-    } else if (auto *n = dynamic_cast<IfStmt *>(c)) {
+        break;
+    }
+    case ConstructType::if_stmt: {
+        auto *n = static_cast<IfStmt *>(c);
         fn(n->condExpr);
         if (n->thenBlock) fn(n->thenBlock);
         if (n->elseBlock) fn(n->elseBlock);
-    } else if (auto *n = dynamic_cast<WhileStmt *>(c)) {
+        break;
+    }
+    case ConstructType::while_stmt: {
+        auto *n = static_cast<WhileStmt *>(c);
         fn(n->condExpr); fn(n->body);
-    } else if (auto *n = dynamic_cast<ForStmt *>(c)) {
+        break;
+    }
+    case ConstructType::for_stmt: {
+        auto *n = static_cast<ForStmt *>(c);
         if (n->init) fn(n->init);
         if (n->cond) fn(n->cond);
         if (n->inc) fn(n->inc);
         fn(n->body);
-    } else if (auto *n = dynamic_cast<ForeachStmt *>(c)) {
+        break;
+    }
+    case ConstructType::foreach_stmt: {
+        auto *n = static_cast<ForeachStmt *>(c);
         fn(n->container); fn(n->body);
-    } else if (auto *n = dynamic_cast<ForRangeStmt *>(c)) {
-        /* post-specialize node (fold_show_calls walks the FINAL tree) */
+        break;
+    }
+    case ConstructType::for_range: {
+        /* post-specialize node (fold_show_calls walks the FINAL
+         * tree) */
+        auto *n = static_cast<ForRangeStmt *>(c);
         if (n->init) fn(n->init);
         fn(n->bound);
         if (n->step) fn(n->step);
         fn(n->body);
-    } else if (auto *n = dynamic_cast<Subscript *>(c)) {
+        break;
+    }
+    case ConstructType::subscript: {
+        auto *n = static_cast<Subscript *>(c);
         fn(n->what); fn(n->index);
-    } else if (auto *n = dynamic_cast<Slice *>(c)) {
+        break;
+    }
+    case ConstructType::slice: {
+        auto *n = static_cast<Slice *>(c);
         fn(n->what);
         if (n->start_idx) fn(n->start_idx);
         if (n->end_idx) fn(n->end_idx);
-    } else if (auto *n = dynamic_cast<MemberExpr *>(c)) {
-        fn(n->what);
-    } else if (auto *n = dynamic_cast<TernaryExpr *>(c)) {
+        break;
+    }
+    case ConstructType::member: {
+        fn(static_cast<MemberExpr *>(c)->what);
+        break;
+    }
+    case ConstructType::ternary: {
+        auto *n = static_cast<TernaryExpr *>(c);
         fn(n->condExpr); fn(n->thenExpr); fn(n->elseExpr);
-    } else if (auto *n = dynamic_cast<CoalesceExpr *>(c)) {
+        break;
+    }
+    case ConstructType::coalesce: {
+        auto *n = static_cast<CoalesceExpr *>(c);
         fn(n->lhs); fn(n->rhs);
-    } else if (auto *n = dynamic_cast<ReturnStmt *>(c)) {
+        break;
+    }
+    case ConstructType::ret: {
+        auto *n = static_cast<ReturnStmt *>(c);
         if (n->elem) fn(n->elem);
-    } else if (auto *n = dynamic_cast<Expr14 *>(c)) {
+        break;
+    }
+    case ConstructType::expr14: {
+        auto *n = static_cast<Expr14 *>(c);
         if (n->lvalue) fn(n->lvalue);
         if (n->rvalue) fn(n->rvalue);
-    } else if (auto *n = dynamic_cast<LiteralDictKVPair *>(c)) {
+        break;
+    }
+    case ConstructType::lit_dict_kv: {
+        auto *n = static_cast<LiteralDictKVPair *>(c);
         fn(n->key); fn(n->value);
-    } else if (auto *n = dynamic_cast<FuncDeclStmt *>(c)) {
+        break;
+    }
+    case ConstructType::func_decl: {
+        auto *n = static_cast<FuncDeclStmt *>(c);
         if (n->body) fn(n->body);
-    } else if (auto *n = dynamic_cast<TryCatchStmt *>(c)) {
+        break;
+    }
+    case ConstructType::try_catch: {
+        auto *n = static_cast<TryCatchStmt *>(c);
         fn(n->tryBody);
         for (auto &p : n->catchStmts) fn(p.second);
         if (n->finallyBody) fn(n->finallyBody);
-    } else if (auto *n = dynamic_cast<MultiElemConstruct<Construct> *>(c)) {
-        for (auto &e : n->elems) fn(e);   /* Block, ExprList, LiteralArray */
-    } else if (auto *n =
-                   dynamic_cast<MultiElemConstruct<LiteralDictKVPair> *>(c)) {
+        break;
+    }
+    case ConstructType::block:
+    case ConstructType::lit_arr:
+    case ConstructType::expr_list: {
+        /* Block, ExprList, LiteralArray */
+        for (auto &e : static_cast<MultiElemConstruct<Construct> *>(c)
+                           ->elems)
+            fn(e);
+        break;
+    }
+    case ConstructType::lit_dict: {
+        auto *n = static_cast<MultiElemConstruct<LiteralDictKVPair> *>(c);
         for (auto &e : n->elems) { fn(e->key); fn(e->value); }
+        break;
     }
     /* literals, Identifier, IdList, childless: nothing inlinable */
+    case ConstructType::other:
+    case ConstructType::nop:
+    case ConstructType::brk:
+    case ConstructType::cont:
+    case ConstructType::rethrow:
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+    case ConstructType::lit_obj:
+    case ConstructType::id:
+    case ConstructType::idlist:
+    case ConstructType::struct_decl:
+        break;
+    }
 }
 
 /* True if `c` holds a ForRangeStmt anywhere (walking statement containers - a

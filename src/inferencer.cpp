@@ -495,85 +495,148 @@ void Inferencer::for_each_child(Construct *n,
     if (!n)
         return;
 
-    if (auto *e = dynamic_cast<Expr14 *>(n)) {
+    /* #102: a TAG SWITCH, not a dynamic_cast chain - the walkers run
+     * per pass x per node, and the RTTI chain (~19 probes, each a
+     * type_info graph walk with strcmp inside) was ~86% of compile
+     * Ir. NO default on purpose: -Werror=switch forces every
+     * ConstructType to be classified, so a new node kind cannot walk
+     * as silently childless (the hidden-occurrence trap that bit the
+     * escape analysis). The per-kind child sets are EXACTLY the old
+     * chain's - IdList's Identifier children stay unwalked, and
+     * TypedScalarExpr stays a leaf here, as before. */
+    switch (n->ct) {
+    case ConstructType::expr14: {
+        auto *e = static_cast<Expr14 *>(n);
         fn(e->lvalue.get()); fn(e->rvalue.get()); return;
     }
-    if (auto *c = dynamic_cast<CallExpr *>(n)) {
+    case ConstructType::call: {
+        auto *c = static_cast<CallExpr *>(n);
         fn(c->what.get()); fn(c->args.get()); return;
     }
-    if (auto *m = dynamic_cast<MemberExpr *>(n)) {
-        fn(m->what.get()); return;
+    case ConstructType::member: {
+        fn(static_cast<MemberExpr *>(n)->what.get()); return;
     }
-    if (auto *s = dynamic_cast<Subscript *>(n)) {
+    case ConstructType::subscript: {
+        auto *s = static_cast<Subscript *>(n);
         fn(s->what.get()); fn(s->index.get()); return;
     }
-    if (auto *s = dynamic_cast<Slice *>(n)) {
-        fn(s->what.get()); fn(s->start_idx.get()); fn(s->end_idx.get()); return;
-    }
-    if (auto *i = dynamic_cast<IfStmt *>(n)) {
-        fn(i->condExpr.get()); fn(i->thenBlock.get()); fn(i->elseBlock.get());
+    case ConstructType::slice: {
+        auto *s = static_cast<Slice *>(n);
+        fn(s->what.get()); fn(s->start_idx.get()); fn(s->end_idx.get());
         return;
     }
-    if (auto *w = dynamic_cast<WhileStmt *>(n)) {
+    case ConstructType::if_stmt: {
+        auto *i = static_cast<IfStmt *>(n);
+        fn(i->condExpr.get()); fn(i->thenBlock.get());
+        fn(i->elseBlock.get());
+        return;
+    }
+    case ConstructType::while_stmt: {
+        auto *w = static_cast<WhileStmt *>(n);
         fn(w->condExpr.get()); fn(w->body.get()); return;
     }
-    if (auto *f = dynamic_cast<ForStmt *>(n)) {
+    case ConstructType::for_stmt: {
+        auto *f = static_cast<ForStmt *>(n);
         fn(f->init.get()); fn(f->cond.get());
         fn(f->inc.get()); fn(f->body.get());
         return;
     }
-    if (auto *fr = dynamic_cast<ForRangeStmt *>(n)) {
+    case ConstructType::for_range: {
+        auto *fr = static_cast<ForRangeStmt *>(n);
         fn(fr->init.get()); fn(fr->bound.get());
         fn(fr->step.get()); fn(fr->body.get());
         return;
     }
-    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+    case ConstructType::foreach_stmt: {
+        auto *fe = static_cast<ForeachStmt *>(n);
         fn(fe->container.get()); fn(fe->body.get()); return;
     }
-    if (auto *t = dynamic_cast<TryCatchStmt *>(n)) {
-        fn(t->tryBody.get());
-        for (auto &cs : t->catchStmts)
+    case ConstructType::try_catch: {
+        auto *tc = static_cast<TryCatchStmt *>(n);
+        fn(tc->tryBody.get());
+        for (auto &cs : tc->catchStmts)
             fn(cs.second.get());
-        fn(t->finallyBody.get());
+        fn(tc->finallyBody.get());
         return;
     }
-    if (auto *r = dynamic_cast<ReturnStmt *>(n)) {
-        fn(r->elem.get()); return;
+    case ConstructType::ret: {
+        fn(static_cast<ReturnStmt *>(n)->elem.get()); return;
     }
-    if (auto *idc = dynamic_cast<IncDecExpr *>(n)) {
-        fn(idc->lvalue.get()); return;
+    case ConstructType::incdec: {
+        fn(static_cast<IncDecExpr *>(n)->lvalue.get()); return;
     }
-    if (auto *te = dynamic_cast<TernaryExpr *>(n)) {
+    case ConstructType::ternary: {
+        auto *te = static_cast<TernaryExpr *>(n);
         fn(te->condExpr.get()); fn(te->thenExpr.get());
-        fn(te->elseExpr.get()); return;
+        fn(te->elseExpr.get());
+        return;
     }
-    if (auto *co = dynamic_cast<CoalesceExpr *>(n)) {
+    case ConstructType::coalesce: {
+        auto *co = static_cast<CoalesceExpr *>(n);
         fn(co->lhs.get()); fn(co->rhs.get()); return;
     }
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
-        fn(fd->body.get()); return;
+    case ConstructType::func_decl: {
+        fn(static_cast<FuncDeclStmt *>(n)->body.get()); return;
     }
-    if (auto *ld = dynamic_cast<LiteralDict *>(n)) {
+    case ConstructType::lit_dict: {
+        auto *ld = static_cast<LiteralDict *>(n);
         for (auto &kv : ld->elems) {
             fn(kv->key.get()); fn(kv->value.get());
         }
         return;
     }
-    if (auto *sc = dynamic_cast<SingleChildConstruct *>(n)) {
-        fn(sc->elem.get()); return;
+    case ConstructType::expr01:
+    case ConstructType::inlined_call:
+    case ConstructType::throw_stmt: {
+        fn(static_cast<SingleChildConstruct *>(n)->elem.get()); return;
     }
-    if (auto *mo = dynamic_cast<MultiOpConstruct *>(n)) {
+    case ConstructType::expr02:
+    case ConstructType::expr03:
+    case ConstructType::expr04:
+    case ConstructType::expr05:
+    case ConstructType::expr06:
+    case ConstructType::expr07:
+    case ConstructType::expr08:
+    case ConstructType::expr09:
+    case ConstructType::expr10:
+    case ConstructType::expr11:
+    case ConstructType::expr12: {
+        auto *mo = static_cast<MultiOpConstruct *>(n);
         for (auto &pr : mo->elems)
             fn(pr.second.get());
         return;
     }
-    /* MultiElemConstruct<>: Block, LiteralArray, ExprList */
-    if (auto *me = dynamic_cast<MultiElemConstruct<> *>(n)) {
+    case ConstructType::block:
+    case ConstructType::lit_arr:
+    case ConstructType::expr_list: {
+        auto *me = static_cast<MultiElemConstruct<> *>(n);
         for (auto &e : me->elems)
             fn(e.get());
         return;
     }
-    /* leaves: literals, Identifier, Break/Continue/Rethrow/Nop */
+    /* leaves - literals, Identifier, IdList (its Identifier children
+     * deliberately unwalked, as in the chain), the childless
+     * statements, StructDeclStmt (consts folded at parse),
+     * TypedScalarExpr (a leaf HERE; the resolver's walkers descend
+     * into it), and the asserted-unreachable `other` */
+    case ConstructType::other:
+    case ConstructType::nop:
+    case ConstructType::brk:
+    case ConstructType::cont:
+    case ConstructType::rethrow:
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+    case ConstructType::lit_obj:
+    case ConstructType::lit_dict_kv:
+    case ConstructType::id:
+    case ConstructType::idlist:
+    case ConstructType::typed_scalar:
+    case ConstructType::struct_decl:
+        return;
+    }
 }
 
 /* ----------------------- monomorphization (templates) -------------------- */
