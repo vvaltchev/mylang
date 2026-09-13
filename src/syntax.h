@@ -60,6 +60,15 @@ enum class ConstructType {
     incdec, ternary, coalesce, for_stmt, for_range,
 };
 
+/* Null-safe tag read: null -> `other`, which no real node carries
+ * (the ctor ML_CHECKs it) - so `ctag(e) == ConstructType::x` is
+ * exactly `dynamic_cast<X *>(e) != nullptr` for a leaf class,
+ * including the null-operand case. The #102 ladder conversions
+ * rely on this (a dynamic_cast of null is null; a raw ct read of
+ * null would crash). */
+class Construct;
+static inline ConstructType ctag(const Construct *c);
+
 /* the contiguous-family queries (the bytecode.h range pattern) */
 static inline bool is_multiop_ct(ConstructType c)
 {
@@ -242,6 +251,11 @@ public:
         d.arr_hint_struct = arr_hint_struct;
     }
 };
+
+static inline ConstructType ctag(const Construct *c)
+{
+    return c ? c->ct : ConstructType::other;
+}
 
 /*
  * Clone a child pointer, preserving its static type: c->clone() returns a
