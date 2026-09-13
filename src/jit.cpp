@@ -99,6 +99,22 @@ unsigned long g_jit_peep_selfmov = 0;  /* #101: mov X,X suppressed
                                         * (COMPILE-time count) */
 unsigned long g_jit_elemv_fast = 0;    /* #97: inline boxed-element reads
                                         * (bumped from EMITTED code) */
+/* #97 inc 2: the DECLINE LEDGER - one counter per guard, bumped from
+ * the guard's own landing pad (see jit.h for why a fast-path counter
+ * cannot answer this) */
+unsigned long g_jit_decline[JD_COUNT] = { 0 };
+static const char *const g_jit_decline_names[JD_COUNT] = {
+#define ML_JD_NAME(n) #n,
+    ML_FOR_EACH_JIT_DECLINE(ML_JD_NAME)
+#undef ML_JD_NAME
+};
+}  /* extern "C" - the name lookup has C++ linkage */
+const char *jit_decline_name(int reason)
+{
+    return reason >= 0 && reason < JD_COUNT
+               ? g_jit_decline_names[reason] : "<bad reason>";
+}
+extern "C" {
 unsigned long g_jit_peep_depbrk = 0;   /* #101: cvtsi2sd merge-dep
                                         * breaks (COMPILE-time count) */
 unsigned long g_jit_rax_retries = 0;   /* Phase A: conflict re-emissions */
@@ -5700,6 +5716,61 @@ static bool jit_op_eligible(const Instr &in)
 
 /* ------------------------ fragment compiler ------------------------- */
 
+/*
+ * THE DECLINE LEDGER's emitter half (#97 inc 2; the WHY is in jit.h).
+ *
+ * A guarded tier collects its decline jumps in a `DeclineJumps` and
+ * lands them all with `decline_land`. Under TESTS each distinct REASON
+ * gets its own landing pad - bump this reason's counter, jump on to the
+ * slow tier - so a test can assert that a specific guard was actually
+ * TAKEN by some value. Without TESTS every jump patches straight to the
+ * landing point and not one byte differs from a ledger-free build.
+ *
+ * The pads sit between the fast path and the slow tier, and an
+ * unconditional jump over them is emitted FIRST so the helper is
+ * reached correctly whether or not the fast path already jumped away -
+ * a caller must not have to reason about fall-through to be correct.
+ */
+struct DeclineJump { size_t at; int reason; };
+typedef std::vector<DeclineJump> DeclineJumps;
+
+static void decline_jump(Emitter &e, DeclineJumps &v, uint8_t cc,
+                         JitDecline why)
+{
+    v.push_back({ e.j32(cc), static_cast<int>(why) });
+}
+
+static void decline_land(Emitter &e, DeclineJumps &v)
+{
+#ifdef TESTS
+    if (!v.empty()) {
+        std::vector<size_t> exits;
+        exits.push_back(e.j32(0xEB));         /* over the pads */
+        for (size_t i = 0; i < v.size(); i++) {
+            bool seen = false;
+            for (size_t k = 0; k < i && !seen; k++)
+                seen = v[k].reason == v[i].reason;
+            if (seen)
+                continue;                     /* one pad per reason */
+            const size_t pad = e.pos();
+            e.bump_counter(&g_jit_decline[v[i].reason]);
+            exits.push_back(e.j32(0xEB));
+            for (size_t k = i; k < v.size(); k++)
+                if (v[k].reason == v[i].reason)
+                    e.patch32(v[k].at,
+                              static_cast<uint32_t>(pad - (v[k].at + 4)));
+        }
+        for (const size_t x : exits)
+            e.patch32_here(x);
+        v.clear();
+        return;
+    }
+#endif
+    for (const DeclineJump &d : v)
+        e.patch32_here(d.at);
+    v.clear();
+}
+
 struct SlotAddr {
     int32_t payload;
     int32_t type;
@@ -9760,6 +9831,21 @@ void jit_stats_report()
     for (const Ent &e : ents)
         if (*e.v)
             fprintf(stderr, "  %-16s %lu\n", e.name, *e.v);
+    /* the DECLINE LEDGER: which GUARD sent a value to the slow tier.
+     * Printed whenever anything declined, so "the tier ran" and "this
+     * program's values all took guard X" are separate answers. */
+    {
+        bool any = false;
+        for (int r = 0; r < JD_COUNT && !any; r++)
+            any = g_jit_decline[r] != 0;
+        if (any) {
+            fprintf(stderr, "tier declines (which guard was taken)\n");
+            for (int r = 0; r < JD_COUNT; r++)
+                if (g_jit_decline[r])
+                    fprintf(stderr, "  %-20s %lu\n",
+                            jit_decline_name(r), g_jit_decline[r]);
+        }
+    }
     if (g_norec_total) {
         fprintf(stderr, "no-record tier reach (JIT-off path)\n");
         for (const Ent &e : norec)
@@ -18269,7 +18355,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * the tier - grants have no runtime footprint, so the decline
          * jumps need no release choreography.
          */
-        std::vector<size_t> lev_slows;
+        DeclineJumps lev_slows;
         size_t lev_done = SIZE_MAX;
         const int lev_s1 = in.op == OpCode::LoadElemValue
                                && in.target != in.target2
@@ -18287,18 +18373,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             const SlotAddr dst = slot_addr(in.target);
             const uint8_t s1 = static_cast<uint8_t>(lev_s1);
             const uint8_t s2 = static_cast<uint8_t>(lev_s2);
-            const auto decline_ne = [&]() {
-                lev_slows.push_back(e.j32(0x75));         /* jne -> slow */
+            const auto decline_ne = [&](JitDecline why) {
+                decline_jump(e, lev_slows, 0x75, why);    /* jne -> slow */
             };
             /* NAVIGATION (the elem2 outer shape) */
             e.load(s1, base.type);
             e.cmp_reg_tag_via(s1, L.t_arr, s2);
-            decline_ne();
+            decline_ne(JD_elemv_base_not_arr);
             e.cmp_byte_slot(base.payload + L.slice_off, 0);
-            decline_ne();
+            decline_ne(JD_elemv_base_slice);
             e.load(s1, base.payload);                     /* shobj */
             e.cmp_byte_base(s1, L.kind_off, L.kind_general);
-            decline_ne();
+            decline_ne(JD_elemv_base_kind);
             load_operand(e, acc.r, in.a_is_lit(), in.a_lit(),
                          in.a_slot());                    /* the index */
             /* Scale BEFORE the bounds compare (48 is not a SIB scale).
@@ -18307,12 +18393,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * sets OF exactly when the product does not fit 64 bits. */
             e.imul_rr_imm8(acc.r, acc.r,
                            static_cast<uint8_t>(sizeof(LValue)));
-            lev_slows.push_back(e.j32(0x70));   /* jo: scale wrapped */
+            decline_jump(e, lev_slows, 0x70,    /* jo: scale wrapped */
+                         JD_elemv_scale_wrap);
             e.load_base(s2, s1, L.data_off + 8);          /* end */
             e.load_base(s1, s1, L.data_off);              /* data */
             e.sub_rr(s2, s1);                             /* byte length */
             e.cmp_rr(acc.r, s2);
-            lev_slows.push_back(e.j32(0x73));   /* jae: negative OR OOB */
+            decline_jump(e, lev_slows, 0x73,    /* jae: negative OR OOB */
+                         JD_elemv_bounds);
             e.add_rr(acc.r, s1);                          /* &elem */
             /* the ELEMENT's type + the reference gates */
             e.load_base(s1, acc.r, static_cast<int32_t>(L.off_type));
@@ -18320,13 +18408,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
             const size_t j_triv = e.j8(0x72);             /* jb: trivial */
             e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
-            lev_slows.push_back(e.j32(0x74));             /* je -> slow */
+            decline_jump(e, lev_slows, 0x74,              /* je -> slow */
+                         JD_elemv_elem_ex);
             e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_arr_val));
             const size_t j_nsl = e.j8(0x75);
             e.cmp_byte_base(acc.r,
                             static_cast<int32_t>(L.off_payload)
                                 + L.slice_off, 0);
-            decline_ne();                       /* a slice value -> slow */
+            decline_ne(JD_elemv_elem_slice);    /* a slice value -> slow */
             e.patch8(j_nsl, e.pos());
             e.load_base(s2, acc.r, static_cast<int32_t>(L.off_payload));
             e.inc_dword_base(s2);                         /* RETAIN */
@@ -18391,8 +18480,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.bump_counter(&g_jit_elemv_fast);
 #endif
             lev_done = e.j32(0xEB);                       /* -> done */
-            for (const size_t sj : lev_slows)
-                e.patch32_here(sj);
+            decline_land(e, lev_slows);
             e.free_scratch(s2);
             e.free_scratch(s1);
         }

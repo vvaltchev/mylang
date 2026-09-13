@@ -1162,6 +1162,46 @@ extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
  * "prove the code ran" rule). Read per-op by a `jit:` test. Bumps are gated to
  * TESTS via ML_JIT_OP_RAN so a release build pays nothing. */
 extern unsigned long g_jit_op_run[];
+/*
+ * ⛔ THE DECLINE LEDGER (#97 increment 2) - "WHICH GUARD did this
+ * value take?", the question a fast-path counter structurally cannot
+ * answer.
+ *
+ * An emitted-code counter proves a tier RAN. It says nothing about
+ * whether a test's values ever REACHED a given guard - and a guard no
+ * value reaches is a guard whose test passes with the guard DELETED.
+ * That is not hypothetical: the first slice-decline test for the
+ * boxed-element tier passed with the guard removed while
+ * g_jit_elemv_fast read 17, because a later MoveV laundered the raw
+ * copy before the program could look at it. The fast counter was
+ * green, the tier had run, and the test proved nothing.
+ *
+ * So every decline arm gets its own counter, bumped from a per-reason
+ * LANDING PAD the emitter inserts between the fast path and the slow
+ * tier. A test then asserts `this guard fired N >= 1 times`, which
+ * makes vacuity for THAT guard impossible rather than unlikely.
+ *
+ * TESTS-ONLY: the pads are emitted only under -DTESTS (bump_counter is
+ * already a no-op otherwise), so a shipping fragment is byte-identical
+ * to one built without the ledger.
+ *
+ * Reasons are declared HERE, in one X-macro, so the enum, the name
+ * table and the MYLANG_JITSTATS rows cannot drift apart.
+ */
+#define ML_FOR_EACH_JIT_DECLINE(X) \
+    X(elemv_base_not_arr) X(elemv_base_slice) X(elemv_base_kind) \
+    X(elemv_scale_wrap) X(elemv_bounds) X(elemv_elem_ex) \
+    X(elemv_elem_slice)
+
+enum JitDecline {
+#define ML_JD_ENUM(n) JD_##n,
+    ML_FOR_EACH_JIT_DECLINE(ML_JD_ENUM)
+#undef ML_JD_ENUM
+    JD_COUNT
+};
+extern "C" unsigned long g_jit_decline[JD_COUNT];
+/* the reason's name, for a report row or a failing test's message */
+const char *jit_decline_name(int reason);
 #ifdef TESTS
 /* Execution-proof counters for the struct BAKED fast paths - bumped by the
  * EMITTED inline code itself (the helpers bump g_jit_op_run), so a test can
