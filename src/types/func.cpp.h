@@ -67,7 +67,21 @@ EvalValue TypeFunc::intptr(const EvalValue &a)
 
 EvalValue TypeFunc::clone(const EvalValue &a)
 {
-    const FuncObject &func = *a.get<intrusive_ptr<FuncObject>>().get();
+    /*
+     * get_ref, NOT get: `get<T>() const` returns a COPY of the handle, so
+     * reading the pointee afterwards is a read THROUGH a handle that has
+     * already been destroyed. Its ~intrusive_ptr inlines release() ->
+     * `delete ptr` -> FuncObject's pooled operator delete, which writes the
+     * freelist link over the first 8 bytes and ends the object's lifetime -
+     * a path GCC cannot rule out (it cannot prove the count never reaches 0),
+     * so at -flto it reported the `capture_slots.empty()` below as reading
+     * uninitialized storage and -Werror failed the LINK (GCC 16.2, and only
+     * under LTO: the plain -O3 compile of types.cpp inlines the free
+     * differently and stays silent). get_ref borrows the handle that `a`
+     * owns - no retain/release pair, and no phantom free before the read.
+     * TypeDict::clone already reads its handle this way.
+     */
+    const FuncObject &func = *a.get_ref<intrusive_ptr<FuncObject>>();
 
     /* A non-capturing function has no per-instance state, so clone()ing it can
      * share the same object; a capturing one is deep-copied so each clone owns

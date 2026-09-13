@@ -290,6 +290,25 @@ tracking the OUTCOME of `check_ipo_supported`, not the request; a CMake
 build used to answer `lto unknown`). **A warning that only one build
 configuration can see is a warning nobody sees.**
 
+**⛔ AND IT CUTS BOTH WAYS: THE LTO BUILD SEES WARNINGS THE PER-TU ONE
+CANNOT, SO A GREEN `make -c` DOES NOT MEAN A GREEN LINK (2026-08-25).**
+`-Werror` fires at **lto1**, i.e. during the LINK, on code the LTRANS
+inliner assembled — so the failure names a line in a file that compiled
+silently minutes earlier. The first instance: `TypeFunc::clone` read
+`func.capture_slots.empty()` through a handle obtained from
+`EvalValue::get<T>() const`, which returns a **COPY** — the temporary's
+`~intrusive_ptr` inlines `release()` -> `delete` -> the POOLED
+`operator delete`, which writes the freelist link over the object's
+first 8 bytes and ends its lifetime. GCC cannot prove the count never
+reaches 0, so the read after it is "may be used uninitialized"; the
+plain `-O3` compile of types.cpp inlines the free differently and says
+nothing. **The idiom, not a suppression: read a handle you only borrow
+with `get_ref<T>()`** (no retain/release pair, no phantom free before
+the read — `TypeDict::clone` already did). When a link-only warning
+appears, reproduce it with the LINK STEP ALONE (the objects are already
+built: ~3 min vs a full rebuild) and add `-Wno-error
+-fopt-info-inline-optimized=FILE` to see what the inliner put there.
+
 **Sanitizers default on for debug builds.** `ASAN` and `UBSAN` (AddressSanitizer
 / UndefinedBehaviorSanitizer) both default to **on when `OPT=0`** and **off when
 `OPT=1`**, and either can be forced: `make ASAN=0` (debug, no ASan),
