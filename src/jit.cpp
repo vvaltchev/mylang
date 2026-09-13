@@ -21422,6 +21422,14 @@ retry_emission:
                              * slot before the elided path (the pick's
                              * "overlap is harmless" note). */
                             if (getenv("MYLANG_LSRADBG"))
+                                for (const LsraPiece &p2 : fp.pieces)
+                                    fprintf(stderr, "LSRADBG fpiece "
+                                            "slot %d [%u,%u) reg %d"
+                                            "%s\n", p2.slot, p2.start,
+                                            p2.end, p2.reg,
+                                            p2.forced_mem ? " forced"
+                                                          : "");
+                            if (getenv("MYLANG_LSRADBG"))
                                 for (const LsraTrans &t2 : lsra_ftr)
                                     fprintf(stderr, "LSRADBG   ftrans "
                                             "pc %u areg %d evict %d "
