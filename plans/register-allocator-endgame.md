@@ -1157,6 +1157,19 @@ byte-identical, 89 -6.10% (EXACT pick parity, off=new-on to the
 Ir), 68_nested -0.12%, zero regressions; 89 wall 0.90x. Pinned by
 the `density beats distance` K=1 case, watched failing under a
 next-use sabotage. (b) remains the open follow-up below.
+(b) IS BUILT AND MEASURED TOO (2026-08-25, the day after (a)):
+the LIFETIME-HOLE pass - see docs/jit-optimizations.md's #103b
+entry for the mechanism and the full ledger. The headline pair:
+89's plan reaches the phased ideal (drefs -40%, Ir flat, corpus
+86/88 byte-identical + two small wins), and chasing its wall
+paradox (drefs -40% yet 1.43x WORSE) found a PRE-EXISTING
+corpus-wide tax: fmov_rr emitted reg-reg MOVSD, whose upper-half
+merge is a false dependency serializing every float chain -
+MOVAPS fixed it for 04_float_arith 0.53x, 55_float_sum 0.85x, 89
+0.87x wall. The second-chance re-queue remains unbuilt (the holes
+made it unnecessary for the phased class); the suite-geomean
+close is blocked on the standing 28_str_concat python-recompute
+timeout.
 THE FIX CLASS, for the maintainer to sequence: (a) DENSITY-AWARE
 eviction/admission (uses-remaining / span-remaining instead of
 next-use distance) reaches roughly pick parity on this shape; (b)

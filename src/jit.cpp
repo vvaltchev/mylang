@@ -11974,6 +11974,132 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                                           * interval - inconsistent
                                           * inputs, refuse the plan */
 
+    /* (1c) LIFETIME HOLES (#103b). A candidate piece whose use GAP
+     * contains a FULL loop (a back-edge with target and source both
+     * inside the gap) releases its register across it - the 89
+     * finding's second half: the phase-1 pins held their registers
+     * through the phase-2 loop while owning no use there, so the
+     * phase-2 pieces had nothing to install into. The hole becomes a
+     * forced-memory piece; its boundaries are placed on LIN POINTS
+     * here (jit_run_edges + jit_lin_point, the snap's own legality),
+     * because the snap's extend-or-demote slide is bounded by the
+     * same slot's neighbouring piece - the hole itself - so a
+     * boundary it cannot accept in place would DEMOTE, not slide.
+     * The full-loop rule is also the churn guard: a gap inside one
+     * iteration contains no complete loop, so a hot body never gains
+     * a per-iteration seam. A split side keeps candidacy only with
+     * >= 2 events inside (a def-only prologue piece or a lone sum
+     * read is not worth a reload). */
+    {
+        std::vector<std::pair<int, int>> hedges;
+        jit_run_edges(ck, begin, end, hedges);
+        std::vector<std::pair<uint32_t, uint32_t>> bedges;
+        for (size_t p2 = begin; p2 < end; p2++) {
+            const Instr &in = ck.code[p2];
+            if (op_is_branch(in.op) && in.target >= 0
+                    && static_cast<uint32_t>(in.target) <= p2)
+                bedges.push_back({ static_cast<uint32_t>(in.target),
+                                   static_cast<uint32_t>(p2) });
+        }
+        const auto evs_in = [&](int slot, uint32_t s, uint32_t e2) {
+            std::vector<uint32_t> r;
+            if (fm) {
+                for (const FltEvent &e3 : *fev)
+                    if (e3.slot == slot && e3.pc >= s && e3.pc < e2
+                            && e3.kind != FltEvent::mem)
+                        r.push_back(e3.pc);
+            } else {
+                for (const MemEvent &u : int_uses)
+                    if (u.slot == slot && u.pc >= s && u.pc < e2)
+                        r.push_back(u.pc);
+            }
+            std::sort(r.begin(), r.end());
+            r.erase(std::unique(r.begin(), r.end()), r.end());
+            return r;
+        };
+        const auto lin_at = [&](uint32_t x) {
+            return x == begin
+                   || jit_lin_point(hedges, static_cast<int>(x));
+        };
+        if (!bedges.empty()) {
+        const size_t cap = out.pieces.size() * 4 + 16;
+        for (size_t i = 0; i < out.pieces.size()
+                && out.pieces.size() < cap; i++) {
+            if (out.pieces[i].forced_mem)
+                continue;
+            const int hslot = out.pieces[i].slot;
+            const std::vector<uint32_t> us =
+                evs_in(hslot, out.pieces[i].start, out.pieces[i].end);
+            if (us.empty())
+                continue;
+            /* gap candidates: HEAD (piece start -> first use - a
+             * post-cut piece often starts at a call boundary with
+             * its first use a loop away, the harness finding), the
+             * between-use stretches, and the TAIL (last use -> piece
+             * end, a pure trim: its post side has no events and goes
+             * memory-by-decision) */
+            std::vector<std::pair<uint32_t, uint32_t>> gaps;
+            if (out.pieces[i].start < us.front())
+                gaps.push_back({ out.pieces[i].start, us.front() });
+            for (size_t k = 0; k + 1 < us.size(); k++)
+                if (us[k] + 1 < us[k + 1])
+                    gaps.push_back({ us[k] + 1, us[k + 1] });
+            if (us.back() + 1 < out.pieces[i].end)
+                gaps.push_back({ us.back() + 1,
+                                 out.pieces[i].end });
+            uint32_t g1 = 0, g2 = 0;
+            for (const auto &gp : gaps) {
+                const uint32_t a = gp.first, b = gp.second;
+                bool loop_in = false;
+                for (const auto &be : bedges)
+                    if (be.first >= a && be.second < b) {
+                        loop_in = true;
+                        break;
+                    }
+                if (!loop_in)
+                    continue;
+                /* flush pc: the EARLIEST lin point in [a, b);
+                 * reload pc: the LATEST lin point in (flush, b) -
+                 * both outside every loop by lin-ness, so each
+                 * boundary seam runs once per crossing */
+                uint32_t f2 = 0, r2 = 0;
+                for (uint32_t x = a; x < b; x++)
+                    if (lin_at(x)) { f2 = x; break; }
+                for (uint32_t x = b; x-- > a; )
+                    if (lin_at(x)) { r2 = x; break; }
+                if (f2 && r2 > f2) { g1 = f2; g2 = r2; break; }
+            }
+            if (g2 == 0)
+                continue;
+            LsraPiece pre = out.pieces[i], hole = out.pieces[i],
+                      post = out.pieces[i];
+            pre.end = g1;
+            hole.start = g1; hole.end = g2; hole.forced_mem = true;
+            hole.reg = -1;
+            post.start = g2;
+            if (evs_in(hslot, pre.start, pre.end).size() < 2)
+                pre.forced_mem = true;
+            if (evs_in(hslot, post.start, post.end).size() < 2)
+                post.forced_mem = true;
+            /* an empty side is dropped (a HEAD hole starts at the
+             * piece start, a TAIL hole ends at its end) - tiling
+             * stays exact either way */
+            if (pre.start < pre.end) {
+                out.pieces[i] = pre;
+                out.pieces.push_back(hole);
+            } else {
+                out.pieces[i] = hole;
+            }
+            if (post.start < post.end)
+                out.pieces.push_back(post);  /* index > i: re-
+                                          * examined, so a later gap
+                                          * of the same interval
+                                          * splits too */
+            out.cuts++;
+        }
+        }
+    }
+
     std::sort(out.pieces.begin(), out.pieces.end(),
               [](const LsraPiece &a, const LsraPiece &b) {
                   return a.start != b.start ? a.start < b.start
@@ -12058,6 +12184,30 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                 ls = cs;
             }
         }
+        /* the contest probe (MYLANG_LSRADBG2, K=1 only - the
+         * jit_lsra_check harness's K; a real pool would spam): it is
+         * what found the density TIE that hid the first lifetime-
+         * hole shape (cu=3/cs=3 vs 4/4 - both 1.0, tie keeps the
+         * active) */
+        if (getenv("MYLANG_LSRADBG2") && K == 1)
+            for (size_t a = 0; a < active.size(); a++) {
+                const LsraPiece &c2 = out.pieces[active[a]];
+                fprintf(stderr, "  ACT pc %u slot %d [%u,%u) "
+                        "cu=%llu cs=%llu\n", here0, c2.slot,
+                        c2.start, c2.end,
+                        (unsigned long long)uses_rem(c2.slot, here0,
+                                                     c2.end),
+                        (unsigned long long)(c2.end - here0));
+            }
+        if (getenv("MYLANG_LSRADBG2") && K == 1)
+            fprintf(stderr, "CONTEST pc %u newcomer slot %d "
+                    "(u=%llu s=%llu) loser %s slot %d\n",
+                    here0, p.slot,
+                    (unsigned long long)uses_rem(p.slot, here0, p.end),
+                    (unsigned long long)(p.end - here0),
+                    far_i < 0 ? "NEWCOMER" : "active",
+                    far_i < 0 ? p.slot
+                              : out.pieces[active[far_i]].slot);
         if (far_i < 0)
             continue;                    /* the newcomer stays memory */
         /* split the loser at this pc: it KEEPS its register up to

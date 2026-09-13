@@ -25500,6 +25500,23 @@ static bool jit_lsra_check()
           "var a = 0; var b = 0; var n = 0; n = n + runtime(50);\n"
           "for (var i = 0; i < n; i++) { a = a + i; b = b + a; }\n"
           "print(a + b);\n" },
+        /* the lifetime-hole shape (#103b): a is hot in loop 1, b in
+         * loop 2, both defined at the top and read at the bottom, so
+         * both intervals span the whole run. At K=1 with no holes,
+         * whoever wins the register holds it through the OTHER loop
+         * while owning no use there, and the other slot never
+         * installs. The hole pass frees the register across the
+         * foreign loop (the gap contains a full back edge), so BOTH
+         * loops are served. */
+        { "lifetime hole frees the loop", 1,
+          "var a = 0; a = a + runtime(2);\n"
+          "var b = 0; b = b + runtime(3);\n"
+          "var n = 0; n = n + runtime(30);\n"
+          "for (var i = 0; i < n; i++) { a = a + i; a = a + 1; }\n"
+          "for (var k = 0; k < n; k++) {\n"
+          "  b = b + k; b = b + 1; b = b + 2;\n"
+          "}\n"
+          "print(a + b);\n" },
         /* the 89 microshape: at z's arrival the holder a has a NEAR
          * next use (the very next statement) but only ~3 remaining
          * events, while z's uses are FAR (its loop) but dense (6
@@ -25757,6 +25774,34 @@ static bool jit_lsra_check()
                 printf("  lsra [%s]: the run-refused hot interval is "
                        "not register-resident - the payoff is not "
                        "collected\n", c.name);
+                ok = false;
+            }
+        }
+        if (std::string(c.name) == "lifetime hole frees the loop") {
+            /* both a (slot 0) and b (slot 1) must be register-
+             * resident somewhere: without the hole pass the winner
+             * holds the single register across the foreign loop and
+             * the loser's residency is ZERO - the watched sabotage
+             * (disable the hole pass) fails exactly here. */
+            std::map<int, long> rl;
+            for (const LsraPiece &p : plan.pieces)
+                if (p.reg >= 0)
+                    rl[p.slot] += p.end - p.start;
+            /* only b is asserted: at K=1 the call-site TEMPS (the
+             * harness has no bridge temp filter) out-density the
+             * sparse a everywhere, with or without holes. b's claim
+             * is the mechanism's: its piece starts at a call
+             * boundary with the first use a full loop away (a HEAD
+             * gap), so only the hole pass can serve loop 2. */
+            const long b_len = rl.count(1) ? rl[1] : 0;
+            if (b_len == 0) {
+                printf("  lsra [%s]: b resident %ld pcs - a spanning "
+                       "interval starved its loop (the hole pass is "
+                       "off)\n", c.name, b_len);
+                for (const LsraPiece &p : plan.pieces)
+                    printf("    piece slot %d [%u,%u) reg %d%s\n",
+                           p.slot, p.start, p.end, p.reg,
+                           p.forced_mem ? " forced" : "");
                 ok = false;
             }
         }
