@@ -156,13 +156,19 @@ public:
         /* the object the offset is INTO, so the emitter can bound it
          * without needing StrObj (which is private) visible there */
         size_t strobj_size;
+        /* #97: StrObj's RefCounted base offset (see sharedarray.h's
+         * refcnt probe) */
+        ptrdiff_t strobj_refcnt;
     };
     JitProbe jit_probe() const {
         return { &len, &slice, &obj,
                  obj ? reinterpret_cast<const char *>(&obj->s)
                        - reinterpret_cast<const char *>(obj.get())
                      : 0,
-                 sizeof(StrObj) };
+                 sizeof(StrObj),
+                 obj ? reinterpret_cast<const char *>(&obj->intr_refcount)
+                       - reinterpret_cast<const char *>(obj.get())
+                     : 0 };
     }
 
     bool is_slice() const { return slice; }

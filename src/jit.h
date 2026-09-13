@@ -1267,6 +1267,11 @@ extern "C" unsigned long g_jit_mul_strength;
 extern "C" unsigned long g_jit_peep_short;
 extern "C" unsigned long g_jit_peep_fold;
 extern "C" unsigned long g_jit_peep_selfmov;
+/* #97: the boxed-element inline READ tier (LoadElemValue's fast path -
+ * general-storage array, in-range index, non-ex non-slice value; the
+ * reference lifecycle inline: retain-new, dec-release-old with a cold
+ * C++ arm for destruction). Bumped from the EMITTED code. */
+extern "C" unsigned long g_jit_elemv_fast;
 extern "C" unsigned long g_jit_peep_depbrk;
 /* the in-process OFF override for the lever mask (tests; pairs with
  * jit_lever_bit) - the env masks are cached statics. */

@@ -31904,6 +31904,147 @@ static bool jit_load_elem2_native()
 #endif
 }
 
+/*
+ * #97: THE BOXED-ELEMENT INLINE TIER (LoadElemValue). g_jit_elemv_fast is
+ * bumped by the EMITTED fast path only - the helper serves the declines
+ * and makes the values right too, so requiring the counter strictly is
+ * what proves the inline code ran (the verify-native-emission rule).
+ *
+ * The fast shape is 76_funcval_dispatch's own disease: closures in a
+ * general array, bound through a subscript into a dyn local per
+ * iteration - a reference RETAIN into the dst plus a release of the old
+ * value, alternating element types so both release arms run.
+ *
+ * The declines each pin a rule from the emit:
+ *  - a SLICE value on either side must go through the C++ copy that
+ *    (un)registers it in the parent's live-slices set (#94's rule);
+ *  - a t_ex element (vtable'd pointee - the refcount is NOT at +0);
+ *  - a NEGATIVE index (the helper wraps it; the tier's unsigned compare
+ *    declines);
+ *  - the SCALE-WRAP index: 2^60 * sizeof(LValue) == 0 mod 2^64, so
+ *    without the jo guard the inline tier would silently read element 0
+ *    where OutOfBounds must raise - the watched-failing case for that
+ *    guard.
+ */
+static bool jit_elemv_native()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long ev0 = g_jit_elemv_fast;
+    /* the FAST shape: reference elements (closures) bound into a dyn
+     * local, the old value released each iteration */
+    if (!run({
+            "func mkf(int k) => func [k] (int x) => x + k;",
+            "var ops = [mkf(10), mkf(20)];",
+            "var dyn fn = 0;",
+            "var s = 0;",
+            "for (var i = 0; i < 20; i++) {",
+            "  fn = ops[i % 2];",
+            "  s += fn(i);",
+            "}",
+            "assert(s == 490);" }))
+        return false;
+    if (g_jit_elemv_fast <= ev0) {
+        fprintf(stderr,
+                "jit_elemv_native: the INLINE tier DID NOT RUN\n");
+        return false;
+    }
+    /* mixed lifecycle: array elements (retain/plain-release/cold full
+     * release when the count hits 1) + a trivial int element */
+    if (!run({
+            "var rows = [[1, 2], [3, 4], [5, 6]];",
+            "var dyn r = 0;",
+            "var t = 0;",
+            "for (var i = 0; i < 30; i++) {",
+            "  r = rows[i % 3];",
+            "  t += r[1];",
+            "}",
+            "assert(t == 120);" }))
+        return false;
+    /* DECLINES - the helper must serve each with the right answer */
+    if (!run({
+            /* a slice value stored in (and read from) a general array */
+            "var big = [1, 2, 3, 4, 5];",
+            "var holder = [big[1:4], 7];",
+            "var dyn v = 0;",
+            "var u = 0;",
+            "for (var i = 0; i < 12; i++) {",
+            "  v = holder[0];",
+            "  u += v[0];",
+            "}",
+            "assert(u == 24);",
+            /* the copy must have REGISTERED v in big's live-slices set:
+             * a parent write detaches registered views in place, so a
+             * raw (inline) copy would keep reading the mutated storage
+             * and see 99 here - the observable for the slice decline */
+            "big[1] = 99;",
+            "assert(v[0] == 2);",
+            /* the FOREACH form is the real catcher: `v = holder[k]`
+             * loads into a TEMP that MoveV then copies PROPERLY (so a
+             * raw temp is laundered before any parent write can look),
+             * but foreach binds the LOOP VAR as the LoadElemValue dst
+             * directly - a parent write while it is live detaches a
+             * registered copy (pre-write view) and leaves a raw one
+             * reading the mutated storage (u == 41, not 40; watched) */
+            "var b2 = [10, 20, 30];",
+            "var h2 = [b2[0:3], b2[0:3]];",
+            "var u2 = 0;",
+            "foreach (var e in h2) {",
+            "  b2[1] = b2[1] + 1;",
+            "  u2 += e[1];",
+            "}",
+            "assert(u2 == 40);",
+            /* a t_ex element (a caught builtin exception object) */
+            "var box = [0, \"x\"];",
+            "try { var q = [1]; q[5] = 1; }",
+            "catch (OutOfBoundsEx as e) { box[0] = e; }",
+            "var dyn w = 0;",
+            "for (var i = 0; i < 10; i++) w = box[i % 2];",
+            /* NOT kindstr(w) - that folds on the STATIC type (dyn) */
+            "assert(w == \"x\");",
+            /* negative wrap + the SCALE-WRAP index (2^60) */
+            "var g = [[1], [2]];",
+            "var dyn z = 0;",
+            "var caught = 0;",
+            "for (var i = 0; i < 6; i++) {",
+            "  z = g[runtime(-1)];",
+            "  try { z = g[1152921504606846976]; }",
+            "  catch (OutOfBoundsEx) { caught += 1; }",
+            "}",
+            "assert(z[0] == 2);",
+            "assert(caught == 6);" }))
+        return false;
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_len_ord()
 {
 #if ML_JIT_SUPPORTED
@@ -34510,6 +34651,7 @@ static bool jit_op_nativized()
         const unsigned long s2 = g_jit_store2_fast;
         const unsigned long ri = g_jit_ret_inline;
         const unsigned long ce = g_jit_ctor_est;
+        const unsigned long ev = g_jit_elemv_fast;
         if (!run(c.src)) {
             fprintf(stderr, "jit_op_nativized: op %d WRONG RESULT\n",
                     (int)c.op);
@@ -34534,7 +34676,11 @@ static bool jit_op_nativized()
              * ESTABLISHED form (2 instructions, no guards and no slow
              * tier), so jit_struct_ctor_planned legitimately starves -
              * the deeper form of native, the BinOpV precedent. */
-            || (c.op == OpCode::StructCtorV && g_jit_ctor_est > ce);
+            || (c.op == OpCode::StructCtorV && g_jit_ctor_est > ce)
+            /* #97: a general-storage element read of a non-slice, non-ex
+             * value is served by the emitted boxed-element tier - the
+             * helper legitimately starves on the simple shapes. */
+            || (c.op == OpCode::LoadElemValue && g_jit_elemv_fast > ev);
         if (g_jit_op_run[static_cast<size_t>(c.op)] <= b && !inline_ok) {
             fprintf(stderr, "jit_op_nativized: op %d DID NOT RUN\n",
                     (int)c.op);
@@ -36313,6 +36459,9 @@ static const std::vector<extra_check> extra_checks =
       jit_load_elem_slow_tier },
     { "jit: the nested-read fusion a[i][j] runs natively (unboxing A)",
       jit_load_elem2_native },
+    { "jit: #97 the boxed-element inline read tier - fires on reference "
+      "elements, DECLINES slice / t_ex / negative / scale-wrap index",
+      jit_elemv_native },
     { "jit: capped sync calls SWITCH interpreted-flat (#56 step 3)",
       jit_call_switch_protocol },
     { "jit: native throw (same-frame / cross-frame / non-struct) (#56)",

@@ -97,6 +97,8 @@ unsigned long g_jit_peep_fold = 0;     /* #101: literal cmp folded to an
                                         * immediate (COMPILE-time count) */
 unsigned long g_jit_peep_selfmov = 0;  /* #101: mov X,X suppressed
                                         * (COMPILE-time count) */
+unsigned long g_jit_elemv_fast = 0;    /* #97: inline boxed-element reads
+                                        * (bumped from EMITTED code) */
 unsigned long g_jit_peep_depbrk = 0;   /* #101: cvtsi2sd merge-dep
                                         * breaks (COMPILE-time count) */
 unsigned long g_jit_rax_retries = 0;   /* Phase A: conflict re-emissions */
@@ -573,6 +575,19 @@ struct JitLayout {
     int t_str_val;        /* Type::t_str: types >= this hold a REFERENCE */
     /* G1's widening bind compares KIND bytes, not singleton pointers */
     int t_none_val, t_int_val, t_float_val, t_bool_val;
+    /* #97: the boxed-element inline tier's REFERENCE lifecycle. Every
+     * pointee it retains/releases inline (StrObj, SharedObject,
+     * DictObject, FuncObject, StructObject) inherits RefCounted as its
+     * FIRST base with no vtable, so intr_refcount sits at offset 0 in
+     * all five - verified at build; a layout where any differs turns
+     * the tier off (elemv_inline_ok) instead of emitting a wrong
+     * offset. ExceptionObject is a RuntimeException (vtable), so t_ex
+     * values DECLINE - t_ex_val is that compare. t_arr_val gates the
+     * SLICE check (a copied slice must register in its parent's
+     * live-slices set, which only the C++ copy machinery does - the
+     * #94 rule). */
+    int t_ex_val, t_arr_val;
+    bool elemv_inline_ok;
     /* De-helperize 6b: the ctx-indirect chain (via the vm.cpp probes) */
     const void *addr_ctx; /* &g_current_ctx */
     int ctx_captures;     /* EvalContext::captures (a vector<LValue>*) */
@@ -870,6 +885,37 @@ static const JitLayout &jit_layout()
         l.t_int_val = static_cast<int>(Type::t_int);
         l.t_float_val = static_cast<int>(Type::t_float);
         l.t_bool_val = static_cast<int>(Type::t_bool);
+        l.t_ex_val = static_cast<int>(Type::t_ex);
+        l.t_arr_val = static_cast<int>(Type::t_arr);
+        {
+            /* #97: the RefCounted base offset per retained pointee, via
+             * the compiler's own base conversion on a fake pointer (the
+             * offsetof idiom for a non-standard-layout class). All five
+             * must be 0 for inc/dec_dword_base's disp-0 form. */
+            const auto rc_off = [](auto *tp) -> long {
+                using T = std::remove_pointer_t<decltype(tp)>;
+                T *p = reinterpret_cast<T *>(
+                    static_cast<uintptr_t>(0x1000));
+                return reinterpret_cast<char *>(&p->intr_refcount)
+                     - reinterpret_cast<char *>(p);
+            };
+            /* StrObj / SharedObject are PRIVATE nested types - their
+             * offsets come from live probes (arr/sref are the builder's
+             * existing probe objects); the accessible three use the
+             * fake-pointer idiom directly. */
+            const SharedStr::JitProbe sp2 =
+                SharedStr(std::string("x")).jit_probe();
+            l.elemv_inline_ok =
+                sp2.strobj_refcnt == 0
+                && (static_cast<const char *>(jp.refcnt)
+                    - static_cast<const char *>(jp.shobj)) == 0
+                && rc_off(static_cast<DictObject *>(nullptr)) == 0
+                && rc_off(static_cast<FuncObject *>(nullptr)) == 0
+                && rc_off(static_cast<StructObject *>(nullptr)) == 0;
+            ML_CHECK_MSG(l.elemv_inline_ok,
+                         "a RefCounted base moved off offset 0 - the "
+                         "boxed-element inline tier is disabled");
+        }
         /* #55 STEP 2.1: native-call member offsets (vm.cpp probes) */
         l.addr_ctx = jit_addr_current_ctx();
         l.ctx_captures = static_cast<int>(jit_off_ctx_captures());
@@ -1808,8 +1854,16 @@ struct Emitter {
      * one must say so itself - handing back a wrong register would be
      * the r9 bug again.
      */
+    /* `transient` grants may come from the run's DENIED set too: a
+     * deny is by contract NON-occupancy ("not occupied by anything,
+     * this fragment simply may not SPEND them" - i.e. hold a value
+     * across a helper call, which is what a PIN does). A grant that
+     * lives and dies inside ONE op cannot violate any deny reason
+     * (acc_take, which ignores denied entirely, is the precedent).
+     * Anything the run genuinely occupies - a hoist region's claim,
+     * a tag-singleton grant - is ra.busy, which still excludes. */
     int alloc_scratch(uint32_t need, uint32_t prefer = 0,
-                      uint32_t exclude = 0)
+                      uint32_t exclude = 0, bool transient = false)
     {
         /* THE TWO OCCUPANCY RECORDS MUST AGREE. `cache` is what the
          * pin machinery reads (reg_holds_pin, flush_cache); `ra.busy`
@@ -1842,8 +1896,12 @@ struct Emitter {
          * some op while that op's own accumulator ask finds its
          * register taken. */
         cs |= 1u << RAX;                               /* reg:proto */
+        const uint32_t saved_denied = ra.denied;
+        if (transient)
+            ra.denied = 0;
         const int r = ra.take(need | CAP_ALLOCATABLE, prefer,
                               exclude | cs);
+        ra.denied = saved_denied;
         if (r >= 0)
             trk_takes++;
         return r;
@@ -9603,6 +9661,7 @@ void jit_stats_report()
         { "peep_short",       &g_jit_peep_short },
         { "peep_fold",        &g_jit_peep_fold },
         { "peep_selfmov",     &g_jit_peep_selfmov },
+        { "elemv_fast",       &g_jit_elemv_fast },
         { "peep_depbrk",      &g_jit_peep_depbrk },
         { "rax_retries",      &g_jit_rax_retries },
         { "step_imm",         &g_jit_step_imm },
@@ -18180,6 +18239,163 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const bool is_field = in.op == OpCode::LoadStructFieldInt
                            || in.op == OpCode::LoadStructFieldFloat;
         AccScratch acc(e);
+        /*
+         * #97 - THE BOXED-ELEMENT INLINE TIER. `fn = ops[k]` (a func
+         * value out of an array, 76_funcval_dispatch's per-iteration
+         * feeder), `x = a[i]` over a general array - the interpreted
+         * shape paid jit_load_elem_value + arr_elem_at + LValue::put
+         * (~160 Ir): TWO boxed 32-byte copies with a type-erased
+         * VIRTUAL each, plus the old value's release. Inline: navigate
+         * (array / non-slice / GENERAL storage / unsigned byte-bounds,
+         * which also rejects a negative index to the wrapping helper),
+         * then the reference lifecycle the other inline tiers decline:
+         *  - RETAIN the element (inc on intr_refcount at pointee+0 -
+         *    the layout check guards the 0) BEFORE touching dst, so no
+         *    aliasing order can free it;
+         *  - dec-RELEASE dst's old value with a COLD arm for the
+         *    count==1 destruction (jit_release_slot - the full C++
+         *    dtor semantics; a plain dec on the last count would skip
+         *    slice unregistration and the pool free);
+         *  - DECLINE t_ex (its pointee has a vtable, so the refcount
+         *    offset differs) and a SLICE-holding value on EITHER side
+         *    (a slice copy/destroy must run the C++ machinery that
+         *    (un)registers it in the parent's live-slices set - #94's
+         *    rule);
+         *  - dst == base declines at COMPILE time: with them distinct,
+         *    the base slot's own reference keeps the array alive
+         *    through the old value's release, and the element itself
+         *    is already retained.
+         * Scratch is GRANT-ONLY (no push-borrow): a refused ask skips
+         * the tier - grants have no runtime footprint, so the decline
+         * jumps need no release choreography.
+         */
+        std::vector<size_t> lev_slows;
+        size_t lev_done = SIZE_MAX;
+        const int lev_s1 = in.op == OpCode::LoadElemValue
+                               && in.target != in.target2
+                               && jit_layout().elemv_inline_ok
+                           ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                             /*transient=*/true) : -1;
+        const int lev_s2 = lev_s1 >= 0
+                           ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                             /*transient=*/true) : -1;
+        if (lev_s1 >= 0 && lev_s2 < 0)
+            e.free_scratch(static_cast<uint8_t>(lev_s1));
+        if (lev_s1 >= 0 && lev_s2 >= 0) {
+            const JitLayout &L = jit_layout();
+            const SlotAddr base = slot_addr(in.target2);
+            const SlotAddr dst = slot_addr(in.target);
+            const uint8_t s1 = static_cast<uint8_t>(lev_s1);
+            const uint8_t s2 = static_cast<uint8_t>(lev_s2);
+            const auto decline_ne = [&]() {
+                lev_slows.push_back(e.j32(0x75));         /* jne -> slow */
+            };
+            /* NAVIGATION (the elem2 outer shape) */
+            e.load(s1, base.type);
+            e.cmp_reg_tag_via(s1, L.t_arr, s2);
+            decline_ne();
+            e.cmp_byte_slot(base.payload + L.slice_off, 0);
+            decline_ne();
+            e.load(s1, base.payload);                     /* shobj */
+            e.cmp_byte_base(s1, L.kind_off, L.kind_general);
+            decline_ne();
+            load_operand(e, acc.r, in.a_is_lit(), in.a_lit(),
+                         in.a_slot());                    /* the index */
+            /* Scale BEFORE the bounds compare (48 is not a SIB scale).
+             * A huge index's idx*48 can wrap mod 2^64 back INTO bounds
+             * (2^60 * 48 == 0), so the wrap itself must decline: imul
+             * sets OF exactly when the product does not fit 64 bits. */
+            e.imul_rr_imm8(acc.r, acc.r,
+                           static_cast<uint8_t>(sizeof(LValue)));
+            lev_slows.push_back(e.j32(0x70));   /* jo: scale wrapped */
+            e.load_base(s2, s1, L.data_off + 8);          /* end */
+            e.load_base(s1, s1, L.data_off);              /* data */
+            e.sub_rr(s2, s1);                             /* byte length */
+            e.cmp_rr(acc.r, s2);
+            lev_slows.push_back(e.j32(0x73));   /* jae: negative OR OOB */
+            e.add_rr(acc.r, s1);                          /* &elem */
+            /* the ELEMENT's type + the reference gates */
+            e.load_base(s1, acc.r, static_cast<int32_t>(L.off_type));
+            e.load32_base(s2, s1, L.type_t_off);          /* t */
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
+            const size_t j_triv = e.j8(0x72);             /* jb: trivial */
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
+            lev_slows.push_back(e.j32(0x74));             /* je -> slow */
+            e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_arr_val));
+            const size_t j_nsl = e.j8(0x75);
+            e.cmp_byte_base(acc.r,
+                            static_cast<int32_t>(L.off_payload)
+                                + L.slice_off, 0);
+            decline_ne();                       /* a slice value -> slow */
+            e.patch8(j_nsl, e.pos());
+            e.load_base(s2, acc.r, static_cast<int32_t>(L.off_payload));
+            e.inc_dword_base(s2);                         /* RETAIN */
+            e.patch8(j_triv, e.pos());
+            /* RELEASE-OLD dst (runtime type check; compile-skipped when
+             * the slot can never hold a reference) */
+            size_t j_st = SIZE_MAX, j_cold = SIZE_MAX, j_st2 = SIZE_MAX;
+            if (std::binary_search(ck.ref_slots.begin(),
+                                   ck.ref_slots.end(),
+                                   static_cast<int32_t>(in.target))) {
+                e.load(s2, dst.type);
+                e.load32_base(s2, s2, L.type_t_off);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
+                j_st = e.j32(0x72);                       /* jb: trivial */
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
+                j_cold = e.j32(0x74);                     /* je -> cold */
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_arr_val));
+                const size_t j_ons = e.j8(0x75);
+                e.cmp_byte_slot(dst.payload + L.slice_off, 0);
+                const size_t j_cold2 = e.j32(0x75);       /* slice-> cold */
+                e.patch8(j_ons, e.pos());
+                e.load(s2, dst.payload);
+                e.cmp_dword_base_imm32(s2, 0, 1);
+                const size_t j_cold3 = e.j32(0x74);   /* last ref -> cold */
+                e.dec_dword_base(s2);                     /* plain release */
+                j_st2 = e.j32(0xEB);                      /* -> store */
+                /* the COLD full release: acc (&elem) and s1 (etype) are
+                 * caller-saved grants a C++ call clobbers - two pushes
+                 * keep them AND the 16-byte call parity */
+                e.patch32_here(j_cold);
+                e.patch32_here(j_cold2);
+                e.patch32_here(j_cold3);
+                e.push_reg(acc.r);
+                e.push_reg(s1);
+                emit_call_prologue(e);
+                e.lea(REG_ARG0, dst.payload
+                                    - static_cast<int32_t>(
+                                          slot_addr(0).payload));
+                e.call_relocs.push_back(
+                    { e.pos(),
+                      reinterpret_cast<const void *>(jit_release_slot) });
+                e.u8(0xE8); e.u32(0);
+                emit_call_epilogue(e);
+                e.pop_reg(s1);
+                e.pop_reg(acc.r);
+            }
+            if (j_st != SIZE_MAX)
+                e.patch32_here(j_st);
+            if (j_st2 != SIZE_MAX)
+                e.patch32_here(j_st2);
+            /* the copy: 24 payload bytes + the Type* */
+            e.load_base(s2, acc.r, static_cast<int32_t>(L.off_payload));
+            e.store(s2, dst.payload);
+            e.load_base(s2, acc.r,
+                        static_cast<int32_t>(L.off_payload) + 8);
+            e.store(s2, dst.payload + 8);
+            e.load_base(s2, acc.r,
+                        static_cast<int32_t>(L.off_payload) + 16);
+            e.store(s2, dst.payload + 16);
+            e.store(s1, dst.type);
+#ifdef TESTS
+            e.bump_counter(&g_jit_elemv_fast);
+#endif
+            lev_done = e.j32(0xEB);                       /* -> done */
+            for (const size_t sj : lev_slows)
+                e.patch32_here(sj);
+            e.free_scratch(s2);
+            e.free_scratch(s1);
+        }
         if (has_idx)
             load_operand(e, acc.r, in.a_is_lit(), in.a_lit(),
                          in.a_slot());
@@ -18220,6 +18436,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
+        if (lev_done != SIZE_MAX)
+            e.patch32_here(lev_done);         /* #97: the fast tier joins
+                                               * past the helper + status */
         return true;
     }
 

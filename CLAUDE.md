@@ -851,7 +851,18 @@ collision). Three nets now:
   contributor now names its own: hoist -> {r10,r11}, a MyLang call ->
   the whole pool; a type singleton still in a register is a B1 GRANT
   claimed as ra.busy, not a clobber entry - Emitter::grant_tag_regs
-  decides it once per run and tag_holder() is the one query),
+  decides it once per run and tag_holder() is the one query.
+  **⛔ A DENY IS ABOUT SPENDING, NOT OCCUPANCY (#97, 2026-08-26):**
+  it says this fragment may not HOLD a value there across a helper
+  call, which is what a PIN does - it does NOT say the register is
+  in use. So `alloc_scratch(..., transient=true)` ignores `denied`
+  for a grant that lives and dies inside ONE op (acc_take, which
+  always ignored it, is the precedent), while `busy` - a hoist
+  region's claim, a tag grant - still excludes. Getting that
+  backwards is not a wrong answer, it is a SILENT STARVATION: a run
+  containing a MyLang call denies the whole pool, so every inline
+  tier asking for scratch in exactly the shape it exists for
+  declined to its helper and the counter read zero),
   `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
