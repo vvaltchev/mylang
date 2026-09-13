@@ -985,8 +985,20 @@ finish the ob=-aware join and name the hot instructions
 directly; (3) the lever-off matrix (MYLANG_JIT_OFF per lever)
 under tmode vs fallback on 43 to isolate which lever's
 interaction burns.
-THEN: those probes -> the real fix -> re-lift; the clean wall
-A/B; the flip gate.
+PROBE 1 RAN 2026-08-25 AND IS DECISIVE: at MYLANG_JIT_MAXPINS=0
+the two configs are EQUAL on 43 (85.3M vs 85.5M, the compile
+band). The triangle: fallback pins 73.0M (pins HELP, -12M vs no
+pins); tmode pins 92.1M (pins HURT, +7M WORSE THAN NO PINS AT
+ALL). So tmode's pin SERVING on this shape costs more than it
+saves - consistent with the two_addr evidence if the hot ops
+under tmode take a non-two_addr path their pins should enable
+(⛔ check `fa` first: the two_addr gate requires !fa, and my miss
+print required dreg < 0, so a ferrying/forwarding arm engaging
+under tmode at the hot ops was INVISIBLE to the instrumentation
+- print the fa-taken case next). A MAXPINS sweep (1..N) under
+tmode would show where the hurt starts.
+THEN: the fa-visibility print + the MAXPINS sweep -> the real
+fix -> re-lift; the clean wall A/B; the flip gate.
 
 ⛔ IN PROGRESS (2026-08-24): THE FLOAT/XMM TWIN - the maintainer's
 "continue with the float/xmm twin". The mandate's xmm half: the
