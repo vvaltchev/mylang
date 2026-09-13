@@ -853,14 +853,18 @@ collision). Three nets now:
   a day, exercised by no net in the project, as a wrong answer. Unlike
   a lever switch this is not an A/B: every rotation must produce the
   SAME output, so it is a pure differential axis.
-- **`MYLANG_JIT_LSRA=1` - the D3 REGISTER-ALLOCATOR lever, DEFAULT
-  OFF** (`g_jit_lsra`, settable in-process). While the linear-scan
-  allocator is built (plans/register-allocator-endgame.md), ON means
-  the scan (`jit_lsra_assign`) chooses the PIN SET - the plan reduced
-  to whole-run residency - and every downstream stage runs unchanged.
-  The default config is byte-identical with the lever off (vdjcmp
-  116/116); the lever-on config is a CORRECTNESS config (-rt and
-  corpus_diff green in both arenas), not yet a perf one. ⛔ TWO RULES
+- **`MYLANG_JIT_LSRA` - the D3 REGISTER-ALLOCATOR lever, ⛔ DEFAULT
+  ON since 2026-08-26** (`g_jit_lsra`, settable in-process;
+  `MYLANG_JIT_LSRA=0` is the debugging OPT-OUT). ON means the linear
+  scan (`jit_lsra_assign` + snap/transitions + the float twin)
+  chooses the register plan; OFF restores the legacy pick end to
+  end, so a suspected allocator bug has a same-binary A/B one env
+  var away. Flipped on the completed two-axis ledger: Ir zero
+  per-iteration regressions corpus-wide (wins to -16.8%), wall
+  geomean 0.997x over 87 (wins to 0.73x). The opt-out config stays
+  covered: -rt/corpus run it in the flip battery, and the coverage
+  tests that pin the PICK's mechanisms force g_jit_lsra = false for
+  their duration (the documented convention). ⛔ TWO RULES
   it already earned: GP admission needs uses_int > 0 - an int-op
   touch is the TYPE evidence the t_int flush relies on; a ReturnV
   read is weight, never evidence (a ret-only closure slot pinned on

@@ -588,13 +588,14 @@ size_t jit_spill_budget();
  * every member take the first-choice traffic.
  */
 extern unsigned g_jit_xrot;
-/* D3.b 2b-ii: the `lsra` LEVER, DEFAULT OFF (env MYLANG_JIT_LSRA=1;
- * settable in-process for tests). While the allocator is built, ON
- * means: the linear scan (jit_lsra_assign) chooses the PIN SET - the
- * plan reduced to whole-run residency - and every downstream stage
- * (physical assignment, spill homes, seams, brackets, flushes) runs
- * unchanged. The default flips only when the full D4 net is green AND
- * the D0 ledger says it pays (the endgame plan's rule). */
+/* D3.b 2b-ii: the `lsra` LEVER - ⛔ DEFAULT ON (flipped 2026-08-26
+ * by maintainer decision on the completed ledger; MYLANG_JIT_LSRA=0
+ * is the debugging opt-out, settable in-process for tests). ON
+ * means: the linear scan (jit_lsra_assign) chooses the register
+ * plan - whole-run pins, per-pc pieces with transitions, spill
+ * homes, the float pool - and every downstream stage runs on it.
+ * OFF restores the pick end to end, so a suspected allocator bug
+ * has a same-binary A/B one env var away. */
 extern bool g_jit_lsra;
 size_t jit_xcache_width();
 /*

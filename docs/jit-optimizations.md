@@ -8776,3 +8776,31 @@ worst entries (59 1.08x, 52 1.07x) were Ir-spot-checked and are
 EXACTLY identical per iteration in both configs - single-run wall
 noise on sub-100ms benches. The ledger for the maintainer's flip
 decision is complete on both axes.
+
+## ⛔ D4 - THE DEFAULT FLIP (2026-08-26, maintainer's decision)
+
+MYLANG_JIT_LSRA defaults ON: the linear-scan allocator (whole-run
+pins, per-pc pieces with transitions, spill homes, the float twin)
+chooses the register plan for every fragment. MYLANG_JIT_LSRA=0 is
+the debugging OPT-OUT and restores the legacy pick end to end - a
+same-binary A/B for any suspected allocator bug, the same role -nj
+and --no-opt play one layer down and up.
+
+The decision ledger, complete on both axes at the flip: Ir - zero
+per-iteration regressions across all 88 corpus benches, wins
+06_if_branch -16.8%, 46_matrix -5.5% (post gate-lift), 81 -2.7%,
+82 -1.6%, 83 -1.0%, 68 -0.5%, 43_sieve at exact parity after the
+install-conflict fix; wall - geomean cur/base 0.997x over 87
+(RULE B1, interleaved), wins to 0.73x on the pressure/region
+family, the residual tail Ir-verified as single-run noise.
+
+Coverage of the OPT-OUT config: the flip battery runs -rt +
+corpus with MYLANG_JIT_LSRA=0, and the coverage tests pinning the
+pick's own mechanisms (jit_xcache_pins, jit_hoist_pair_conflict,
+jit_range_share_test, jit_spill_homes, jit_rax_pin_test) force
+g_jit_lsra = false for their duration, so the pick cannot rot
+silently while it remains the opt-out. Default-config emission
+CHANGES with this flip, by design - vdjcmp against a pre-flip
+binary reports the allocator's differences, and byte-identity
+retires as the default-config oracle in favor of corpus_diff +
+the per-iteration Ir ledger.
