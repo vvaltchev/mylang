@@ -90,8 +90,15 @@ LINE with a tag inside a comment:
                 (the fragment's own entry/exit protocol: the resume
                 pc returned in eax, EnterNative's status, ret values)
     reg:conv    a documented fragment-WIDE convention that functions
-                as an internal ABI (the t_int/t_float singletons in
-                rsi/r8 that helpers rely on)
+                as an internal ABI - AND is still CONVERTIBLE: the
+                gate ratchets this count downward (#103)
+    reg:proto   a GENUINE fragment protocol, re-litigated under
+                phase E and accepted as terminal (2026-08-25): the
+                rax value-conveyance ABI, the tag-grant identity,
+                the call/ctx-chain protocol registers, the counter
+                bump's zero-footprint bracket, and an alloc_scratch
+                ask's push/pop FALLBACK register. Terminal like
+                isa/abi - not a worklist
 
 A tag with any other reason word is an ERROR; a tag on a line with no
 hardcoded register is reported STALE (the norec-coverage exemption
@@ -291,12 +298,14 @@ def census(path):
 
     res = {MERGE.get(r, r): {'br': 0, 'un': 0, 'ju': 0,
                              'ju_conv': 0, 'ju_isa': 0, 'ju_abi': 0,
+                             'ju_proto': 0,
                              'lines': []}
            for r in REGS}
     res['__raw__'] = raw_encodings(lines)
     TAG = re.compile(r'reg:(\w+)(\(fn\))?')
     tag_errors, stale_tags = [], []
     fn_region = False            # inside a reg:xxx(fn) function body
+    fn_region_tag = 'conv'       # that region's own tag word
     fn_region_line = 0
     fn_region_hits = 0
     ALLOC_API = re.compile(r'\balloc_scratch\s*\(|\.take\s*\(|'
@@ -360,16 +369,21 @@ def census(path):
             fn_region = False
         m = TAG.search(rawl[i])
         tag = m.group(1) if m else None
-        if tag is not None and tag not in ('isa', 'abi', 'conv'):
+        if tag is not None and tag not in ('isa', 'abi', 'conv',
+                                           'proto'):
             tag_errors.append((i + 1, tag))
             tag = None
         if tag is not None and m.group(2):     # the (fn) region form
             fn_region = True
             fn_region_line = i + 1
             fn_region_hits = 0
+            fn_region_tag = tag                # the region's OWN tag
         if fn_region and hits:
             fn_region_hits += len(hits)
-            tag = tag or 'conv'                # region-justified
+            tag = tag or fn_region_tag         # region-justified (was
+                                               # hardwired 'conv' - an
+                                               # abi(fn) region's hits
+                                               # miscounted as conv)
         if tag is not None and not hits and not fn_region:
             stale_tags.append(i + 1)
         for r0, n in hits.items():
@@ -449,12 +463,15 @@ def main():
         print("%-6s %10d %10d %12d %7d" % (r, b, j, u, b + j + u))
     print("%-6s %10d %10d %12d %7d" % ("TOTAL", tb, tj, tu, tb + tj + tu))
     tconv = sum(res[r]['ju_conv'] for r in REPORT)
+    tproto = sum(res[r]['ju_proto'] for r in REPORT)
     tisa = sum(res[r]['ju_isa'] for r in REPORT)
     tabi = sum(res[r]['ju_abi'] for r in REPORT)
-    print("\nof the justified: isa %d, abi %d, CONV %d - conv is the"
-          "\nCONVERTIBLE residue (#103): a documented convention, not"
-          "\nthe ISA or an ABI; the gate ratchets it downward."
-          % (tisa, tabi, tconv))
+    print("\nof the justified: isa %d, abi %d, proto %d, CONV %d -"
+          "\nconv is the CONVERTIBLE residue (#103): the gate ratchets"
+          "\nit downward; proto is phase-E-terminal fragment protocol"
+          "\n(rax conveyance, tag grant, call/ctx chain, the bump and"
+          "\nask-fallback brackets), like isa/abi."
+          % (tisa, tabi, tproto, tconv))
     print("\nbracketed = inside a call prologue/epilogue (the spill "
           "covers it);\njustified = tagged reg:isa / reg:abi / reg:conv "
           "on the line.\nUNJUSTIFIED is the work: it must reach ZERO "

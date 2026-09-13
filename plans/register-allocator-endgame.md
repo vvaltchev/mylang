@@ -1090,6 +1090,21 @@ green. ⛔ THE OTHER TWO v1 BOUNDS STAY, EACH WITH ITS WRITTEN REASON
    redesign for a shape the whole-run rescue and the homes tier
    already mostly serve (a slot heavy enough to want both is
    heavy enough to be rescued whole-run).
+#103 PHASE E EXECUTED ON THE FIVE FAMILIES (2026-08-25): 461 of
+the 499 conv uses are PROMOTED to the terminal `reg:proto` tag -
+the phase-E rule's own outcome ("conv must shrink to genuine
+fragment protocol ... or convert"): the rax value-conveyance ABI,
+the tag-grant identity, the call/ctx-chain protocol, the counter
+bump's zero-footprint bracket, and an alloc_scratch ask's push/pop
+FALLBACK register (a bracket the ask itself needs). The census
+reports proto beside isa/abi (and the (fn)-region form now counts
+hits under the REGION'S OWN tag - they were hardwired to conv, so
+an abi(fn) region miscounted). CONV = 38 is now the honestly
+convertible worklist, priced in the floor file's comment: the
+per-emitter scratch DEFAULTS, the elem base-gate roles, the R9
+ctx-chain preference, the model-check probes. Comment-only in
+jit.cpp - emission untouched (vdjcmp self 108/108, -rt green,
+gate ratcheted 499 -> 38).
 #103 THE reg:conv SWEEP, INSTRUMENTED AND MAPPED (2026-08-26).
 The census now splits justified by tag (isa 69 / abi 173 / CONV
 499) and the gate ratchets CONV downward (regcensus_floor.txt's

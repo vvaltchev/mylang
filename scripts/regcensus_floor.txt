@@ -22,4 +22,13 @@ XMM0    0
 XMM1    0
 TOTAL   0
 RAWENC  15
-CONV 499  # 103: the convertible residue - only ever lower this
+CONV 38   # 103: the convertible residue - only ever lower this.
+# 2026-08-25 phase-E re-litigation: 461 uses promoted to the
+# TERMINAL reg:proto tag (rax value conveyance, the tag grant,
+# the call/ctx-chain protocol, the bump + ask-fallback brackets
+# - each a genuine fragment protocol, argued in the plan's
+# five-family map). What remains conv IS the priced worklist:
+# the per-emitter scratch DEFAULTS (emit_op/emit_branch tmp,
+# store_dst/ref_check/div_magic scratch, the elem base-gate
+# data role + pool list, the R9 ctx-chain preference, the
+# model-check's own probes).
