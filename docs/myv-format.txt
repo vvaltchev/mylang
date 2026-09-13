@@ -317,8 +317,11 @@ through this table: a string CONSTANT is data, not an identifier.
                             writer aborts with "unserializable value (a
                             function in a struct's const member ...)"
                             rather than emit an image that cannot be
-                            read.  Lifting the restriction means moving
-                            these consts AFTER section 8.
+                            read.  Lifting the restriction is NOT a
+                            section swap - classes make the table
+                            references CYCLIC - it is the identity-
+                            before-content read designed in
+                            plans/myv-table-ordering.md.
 
 Structs are written in definition order.  A field's `struct_def` can only
 reference an EARLIER struct (inline fields only go backwards - a parser
@@ -749,7 +752,8 @@ keys and values, and recursively by itself.
                               const members - section 7 is read BEFORE the
                               descriptor table exists, so the reference
                               cannot be resolved; the writer REFUSES one
-                              there rather than emit an unreadable image.
+                              there rather than emit an unreadable image
+                              (plans/myv-table-ordering.md).
                               The descriptor MUST have
                               NO captures - the writer refuses a
                               capturing closure and the READER
