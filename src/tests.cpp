@@ -36609,27 +36609,94 @@ static bool jit_disasm_decodes_all()
                 if (line.compare(0, PFX.size(), PFX) != 0)
                     continue;                    /* not a native line */
                 const size_t semi = line.find(" ; ");
-                const std::string body =
+                std::string body =
                     semi == std::string::npos ? line : line.substr(0, semi);
-                size_t at = 0;
-                while ((at = body.find(", ", at)) != std::string::npos) {
-                    at += 2;
-                    if (at >= body.size()) break;
+                /* start past the `+NNN: ` offset prefix, and past a
+                 * `{hex}` group if MYLANG_VDJ_HEX is on - both are
+                 * numbers this check must not read as operands */
+                size_t bs = body.find(": ");
+                bs = bs == std::string::npos ? 0 : bs + 2;
+                if (bs < body.size() && body[bs] == '{') {
+                    const size_t rb = body.find("} ", bs);
+                    bs = rb == std::string::npos ? body.size() : rb + 2;
+                }
+                /* A CONTROL TRANSFER's operand is a fragment-RELATIVE
+                 * offset (`jmp +4259`), deterministic by construction
+                 * and legitimately large; a rel32 call target is already
+                 * masked to `<helper>`. Neither can carry an address, so
+                 * the line is skipped wholesale - the ONE exemption, and
+                 * it is stated as a property, not as a position. */
+                {
+                    size_t ms = bs;
+                    while (ms < body.size() && body[ms] == ' ') ms++;
+                    const size_t me = body.find(' ', ms);
+                    const std::string mn =
+                        body.substr(ms, me == std::string::npos
+                                            ? std::string::npos : me - ms);
+                    if (!mn.empty()
+                            && (mn[0] == 'j' || mn == "call" || mn == "loop"))
+                        continue;
+                }
+                /*
+                 * ⛔ SCAN THE WHOLE LINE, NOT THE OPERAND POSITIONS -
+                 * AND THIS IS THE NINTH AUDIT-TABLE SHAPE.
+                 *
+                 * This check was written to make exactly the bug it
+                 * later missed impossible, and it was correct,
+                 * deterministic and cross-platform. It failed because
+                 * it ENUMERATED WHERE AN ADDRESS CAN APPEAR: it walked
+                 * `", "` separators and skipped anything whose first
+                 * character was not a digit or `-`, on the reasoning
+                 * that a `[` starts "a register / [mem]".
+                 *
+                 * That reasoning was true when it was written, when an
+                 * address could only ever be an IMMEDIATE. #97 step 1a
+                 * added the absolute-disp32 MEMORY operand -
+                 * `mov rax, [+0x41250108]`, the low-arena global reached
+                 * in one instruction - and put an address inside the
+                 * brackets the scanner was skipping. A raw pointer then
+                 * reached the text, `-vdj` stopped being reproducible,
+                 * and `vdjcmp.sh` refused every comparison from that
+                 * day.
+                 *
+                 * A check that enumerates the PLACES a hazard can occur
+                 * goes stale exactly like a table that enumerates the
+                 * OPCODES that can cause it. So this one enumerates
+                 * nothing: every number ANYWHERE on the line, brackets
+                 * included, must be small or a power of two.
+                 */
+                for (size_t at = bs; at < body.size(); ) {
                     const char ch = body[at];
-                    if (!(isdigit(static_cast<unsigned char>(ch))
-                          || ch == '-'))
-                        continue;                /* a register / [mem] */
+                    if (!isdigit(static_cast<unsigned char>(ch))) {
+                        at++;
+                        continue;
+                    }
+                    /* a number - but not one glued to an identifier
+                     * (`r11`, `xmm0`, `cvtsi2sd`), which is a register
+                     * or a mnemonic, never an operand value */
+                    const char prev = at ? body[at - 1] : ' ';
                     errno = 0;
                     char *end = nullptr;
-                    const long long v =
-                        strtoll(body.c_str() + at, &end, 0);
-                    if (end == body.c_str() + at || errno)
+                    const long long v = strtoll(body.c_str() + at, &end, 0);
+                    const size_t len =
+                        end > body.c_str() + at
+                            ? static_cast<size_t>(end - body.c_str() - at)
+                            : 1;
+                    const bool glued =
+                        isalpha(static_cast<unsigned char>(prev))
+                        || prev == '_';
+                    const char next = at + len < body.size()
+                                          ? body[at + len] : ' ';
+                    const bool trails =
+                        isalpha(static_cast<unsigned char>(next));
+                    at += len;
+                    if (glued || trails || errno || end == body.c_str())
                         continue;
                     const unsigned long long u =
                         static_cast<unsigned long long>(v < 0 ? -v : v);
                     if (u >= 0x1000 && (u & (u - 1)) != 0) {
                         cout << "  disasm[" << i << "]: a raw ADDRESS-sized"
-                                " immediate survived - `" << body
+                                " number survived - `" << body
                              << "`. Route it through imm_str (disasm.cpp)"
                                 " or the dump is not reproducible\n";
                         ok = false;

@@ -107,7 +107,13 @@ them means anything:**
 - **`-s` / `-a` / `-dti`** - what the optimizers did to the tree.
   Oracle: the `analyze:` `-rt` entry.
 - **`scripts/vdjcmp.sh`** - "is my JIT change a pure restructuring?"
-  Oracle: a SELF-TEST - one binary against itself must be 108/108.
+  Oracle: a SELF-TEST - one binary against itself must be 124/124.
+  **⛔ IT RUNS IN CI NOW (`nets.yml`, the differential job), because
+  for one day it was correctly REFUSING every comparison and nobody
+  invoked it** (see the `-vdj` reproducibility note below). Two more
+  layers cover the same property: `-rt`'s address-free invariant (which
+  a new OPERAND FORM once walked straight past) and
+  `driver_checks.sh`'s two-process dump comparison.
 - **`scripts/regcensus.py`** - how much work is left to free a
   register. Oracle: it DERIVES its accessor list from the source.
 - **`bench/run.py`** - is it faster. Oracle: RULE B1, the build-config
@@ -795,30 +801,58 @@ return site must pick one**, and `empty` is the one that will fail
 loudly the day the allocator keeps a value in a register across a call.
 Do not "fix" that abort by switching to `flushed` - emit the flush.
 
-**⛔ AND IT BROKE AGAIN THE DAY THE LOW ARENA LANDED - FOR SIX WEEKS,
-SILENTLY, WITH THE SELF-TEST SHOUTING (found 2026-08-27).** The
-absolute-disp32 memory operand (`mov rax, [+0x41250108]` - the arena
-global reached in ONE instruction, #97 step 1) printed its RAW ADDRESS.
-Every other baked pointer in the dump masks to
-`<addr>`/`<int-tag>`/`<helper>` for exactly one reason - so two runs and
-two separately-linked binaries produce IDENTICAL text - and the new
-operand form was added without learning the rule.
+**⛔ AND IT BROKE AGAIN, ONE DAY AFTER THE ABS32 MEMORY OPERAND LANDED,
+WITH THREE NETS PRESENT AND ALL THREE BLIND (2026-08-26 -> found
+2026-08-27).** `mov rax, [+0x41250108]` - the arena global reached in
+ONE instruction (#97 step 1a) - printed its RAW ADDRESS. Every other
+baked pointer masks to `<addr>`/`<int-tag>`/`<helper>` for exactly one
+reason, that two runs and two separately-linked binaries must produce
+IDENTICAL text, and the new operand form was added without learning it.
 
-From that commit on, `vdjcmp.sh` failed its own SELF-TEST on EVERY
-invocation ("the same binary gave two different dumps for samples/gcd")
-and refused to report. So every "verified as a pure restructuring:
-emitted code byte-identical" claim in that window was UNVERIFIED - not
-wrong, unverified, which is worse because it reads the same.
+**THIS IS THE MOST INSTRUCTIVE INSTRUMENT FAILURE IN THE REPO, because
+the defences existed and each failed DIFFERENTLY:**
 
-**The self-test did its job. Nobody ran it.** That is the difference
-between this and the 2026-08-17 mask-rot, and it is the more
-uncomfortable failure: the tool was not broken as an oracle, it was
-correctly REFUSING, and the refusal went unread because the tool went
-unrun. **Run `scripts/vdjcmp.sh BIN BIN` after any change that adds an
-OPERAND FORM** - not just after a change you think is a restructuring.
+1. **`vdjcmp.sh`'s SELF-TEST was correct and refused every comparison**
+   from that commit on ("the same binary gave two different dumps for
+   samples/gcd"). It was not lying - it was shouting. **Nobody ran it.**
+   A self-test that fires only when someone remembers is not a net; it
+   is now a CI step (`nets.yml`, the differential job).
+2. **`-rt`'s ADDRESS-FREE INVARIANT check - written expressly to make
+   this bug impossible - did not fire, because it ENUMERATED WHERE AN
+   ADDRESS CAN APPEAR.** It walked `", "` operand separators and
+   skipped anything whose first character was not a digit, on the
+   reasoning that `[` begins "a register / [mem]". True when written,
+   when an address could only be an IMMEDIATE; the new operand put one
+   inside the brackets it was skipping. **⛔ THE NINTH AUDIT-TABLE
+   SHAPE: a check that enumerates the PLACES a hazard can occur goes
+   stale exactly like a table that enumerates the OPCODES that can
+   cause it.** It enumerates nothing now - every number anywhere on the
+   line, brackets included - with ONE exemption stated as a property
+   (a control transfer's operand is a fragment-RELATIVE offset).
+3. **Nothing checked the property END TO END.** `-rt` runs in-process,
+   so it can only assert the invariant that IMPLIES reproducibility,
+   never reproducibility itself. `tests/driver_checks.sh` now spawns
+   the binary twice and compares - the same split as every other
+   driver-visible property.
+
+**THREE RULES, all of them earned here:**
+
+- **⛔ ADDING AN OPERAND FORM TO THE EMITTER IS A DISASSEMBLER CHANGE.**
+  A new addressing mode, a new immediate position, a new prefix: the
+  rendering obligation (mask every baked address) attaches to it, and
+  no existing check can be assumed to cover a shape it was not written
+  against. Run `scripts/vdjcmp.sh BIN BIN` - not only after a change
+  you believe is a pure restructuring.
+- **⛔ A SELF-TEST THAT IS NOT IN CI IS NOT A NET.** The whole point of
+  one is that it fires without being asked. If a tool can check itself,
+  that check belongs in `nets.yml`.
+- **⛔ WHEN AN INSTRUMENT REFUSES, THAT IS A RESULT.** "The tool errored
+  so I moved on" is how a correct refusal becomes a silent regression.
+  A refusal is a failing test.
+
 (`MYLANG_VDJ_HEX=1` remains non-reproducible BY CONSTRUCTION - the raw
 bytes contain the address - which is why the comparison path does not
-use it.)
+use it, and why the driver check compares the plain dump.)
 
 **⛔ `-vdj` IS REPRODUCIBLE - AND THE FOUR YEARS OF WORKAROUNDS THAT
 SAY WHY YOU MUST FIX A TOOL, NOT ITS CALLERS (2026-08-17).** Comparing
