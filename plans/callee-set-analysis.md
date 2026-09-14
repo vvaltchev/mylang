@@ -157,16 +157,36 @@ six pinned cases in `tests/functional/25_factory_closure_param.my`
 print exactly what they printed before, and the migration changes
 **0 of 126** corpus programs' `-vd` or output.
 
-⛔ **THE PLAN SAID UNIFORMITY WOULD DISSOLVE. IT DOES NOT, AND THAT IS
-A CORRECTION TO THIS PLAN, NOT A SHORTCUT.** Uniformity went in as a
-NECESSITY (the finfo set under-collected); once `join` was fixed it
-became a POLICY, and the two are not interchangeable. Removing it
-changes OBSERVABLE OUTPUT - case (3) joins int and float, so `f(1)`
-starts printing a coerced `21.000000` where it printed `21` - and it
-decides a LANGUAGE question: whether a factory-returned closure with
-disagreeing call sites declines to `dyn` (today) or REFUSES the
-program, the way a directly-bound capturing lambda does. That is the
-maintainer's call. The comment at the rule says so.
+⛔ **UNIFORMITY: SURFACED AS A LANGUAGE QUESTION, THEN DELETED ON THE
+MAINTAINER'S CALL (2026-08-28).** The plan said it would "dissolve" on
+migration. It did not dissolve - it had become a POLICY once `join` was
+fixed, and deleting it changes OBSERVABLE OUTPUT, so it went to the
+maintainer as a decision with both behaviours measured. He chose
+agreement, and it is deleted.
+
+What it was: "every site attributed to a callee must pass the SAME
+argument types, or none of them contributes." It never computed a
+different answer - it decided whether to answer AT ALL, because
+`contribute_arg` is the same function the direct-call path already ran
+unconditionally. A named lambda's sites always joined; a
+factory-returned closure's route to `contribute_arg` is
+`indirect_callee`, and this was the gate on it.
+
+Result: the two spellings of a CAPTURING closure are now
+indistinguishable - `int`/`float` sites widen and coerce in both,
+`int`/`str` refuses in both. A NON-capturing var-bound lambda is a
+TEMPLATE and still monomorphizes per signature; that is a different
+feature and untouched. Blast radius: 1 of 123 corpus programs, one
+line. Watched: restoring the check fails 10 `-rt` checks and re-splits
+the two adjacent lines of `25_factory_closure_param.my` (case (3) and
+its new direct-spelling twin (3b), kept side by side so they cannot
+drift apart again).
+
+⛔ **DO NOT RESTORE IT TO FIX A REFUSAL.** It was safe to delete only
+because the candidate set is COMPLETE: it existed to survive an
+under-collecting set, where sites of two DIFFERENT closures were
+attributed to one survivor and joining them invented a conflict. If a
+valid program is refused now, the candidate set is wrong - fix that.
 
 ⛔ **AND THE REAL ANSWER'S FIRST DIVIDEND WAS A SOUNDNESS FIX #115
 SHIPPED WITHOUT: THE MULTI-SITE HOLE.** Attributing every size-1 site

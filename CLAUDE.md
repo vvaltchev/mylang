@@ -3684,13 +3684,51 @@ defers by design, so a factory's return type does not exist until
 instantiation has made the clone and redirected the call. Placed before
 the loop the snapshot found ZERO sites and the whole rule was inert.
 
-**(b) EVERY SITE ATTRIBUTED TO A CALLEE MUST AGREE, or none of them
-contributes** - the same uniformity `value_instantiate_round` requires
-of a template's signature. It went in as a NECESSITY, because the set
-UNDER-COLLECTED (below); with that fixed it is a POLICY - a single
-closure whose sites disagree declines to `dyn` here, where a
-DIRECTLY-bound capturing lambda refuses the program. Removing this check
-is what would make the two agree, and that is a language decision.
+**(b) EVERY SITE CONTRIBUTES, AND THE JOIN DECIDES - the UNIFORMITY
+rule that used to sit here is DELETED (maintainer's call, 2026-08-28),
+and that is a LANGUAGE change, not a cleanup.** It said "every site
+attributed to a callee must agree on the argument types, or none of
+them contributes", so a factory-returned closure with disagreeing sites
+declined to `dyn`.
+
+⛔ **IT WAS NEVER COMPUTING A DIFFERENT ANSWER - IT DECIDED WHETHER TO
+ANSWER AT ALL.** `contribute_arg` is the SAME function the ordinary
+direct-call path uses, and a lambda the inferencer can NAME already had
+every call site contribute unconditionally, the fixpoint joining them.
+A factory-returned closure cannot be named, so `indirect_callee` is its
+only route to `contribute_arg` - and uniformity was the gate on that
+map. Same source shape, two behaviours:
+
+```C#
+var wbase = 20;                                     # B: DIRECT
+var f = func [wbase] (x) { return typestr(x); };
+print(f(1) + " " + f(2.5));      # float float  (join widened, int coerced)
+
+func mk(n) { var wbase = n * 10;                    # A: FACTORY
+             return func [wbase] (x) { return typestr(x); }; }
+var g = mk(2);
+print(g(1) + " " + g(2.5));      # WAS: dyn dyn      NOW: float float
+```
+
+and with an int/str pair, B raised `TypeMismatchEx: 'x' has type 'int'
+but is assigned 'str'` while A printed happily - now both refuse. **The
+two spellings of a CAPTURING closure are indistinguishable.** (A third
+spelling, a NON-capturing var-bound lambda, is a TEMPLATE and
+monomorphizes per signature: `f(1)` and `f("s")` both work. That is a
+different feature and is untouched.)
+
+⛔ **IT WAS SAFE TO DELETE ONLY BECAUSE THE CANDIDATE SET IS COMPLETE.**
+Uniformity went in when the set UNDER-COLLECTED - `join`'s
+`static_type_equal` shortcut dropped one side's members whenever two
+functions shared a signature, so sites belonging to two DIFFERENT
+closures were attributed to one survivor, and joining those invents a
+`TypeMismatchEx` in a program with no conflict in it. The callee-set
+analysis reports such a site as a TWO-candidate set, which gate (c)
+below already refuses. **Do not restore this check to fix a refusal:
+if a valid program is refused, the candidate set is wrong.**
+Blast radius of the deletion: 1 of 123 corpus programs, one line.
+Watched: restoring it fails 10 `-rt` checks and re-splits the two
+adjacent lines of `25_factory_closure_param.my`.
 
 **(c) EVERY SITE WHOSE SET *CONTAINS* THE CALLEE MUST NAME IT ALONE -
 THE MULTI-SITE HOLE, which #115 SHIPPED WITH and #116 increment 2
@@ -3724,9 +3762,8 @@ rule had invented - `argument 1 has type 'str' but the parameter is
 `callee_set(e)` and `callee_escaped(f)`; `value_escaped` is gone from
 this consumer. Measured blast radius of the migration: **0 of 126**
 corpus programs change `-vd` or output - the only behaviour change is
-the hole above closing. Uniformity is DELIBERATELY KEPT: it is now a
-language policy (see (b)), and removing it would change observable
-output, so it is the maintainer's call, not a cleanup.
+the hole above closing. Uniformity was kept at that point as an
+open language question; it has since been DELETED - see gate (b).
 
 **⛔ AND THE SET'S INCOMPLETENESS WAS A `join` BUG - METADATA EXCLUDED
 FROM EQUALITY, THEN DISCARDED BY AN EQUALITY-BASED SHORTCUT
@@ -3771,14 +3808,12 @@ open-ended, because "treat equal types as interchangeable" is what a
 type system is FOR. The identity question has its own answer now, keyed
 by PROGRAM LOCATION.
 
-**THE PRICE, STATED PLAINLY: this does NOT match the directly-bound
-capturing lambda.** That form refuses `f(1)` and `f("s")`; a
-factory-returned closure declines to `dyn` instead and compiles. The
-asymmetry is deliberate - declining is the safe direction while the set
-is incomplete - and both spellings sit adjacent in the `-rt` table so
-the difference is on the record. **With uniformity the rule's ONLY
-observable effect is that a uniformly-called closure's parameter is
-typed**: no new refusals, no coercion changes. Measured blast radius:
+**THE ASYMMETRY IS GONE (2026-08-28).** This used to read "the price,
+stated plainly: this does NOT match the directly-bound capturing
+lambda" - that form refused `f(1)` and `f("s")` while a
+factory-returned closure declined to `dyn` and compiled. Deleting the
+uniformity rule (gate (b)) made the two spellings identical, so the
+price is no longer paid. Measured blast radius when the rule LANDED:
 0 of 125 corpus programs change compile outcome, 0 of 124 change output.
 Pinned by `tests/functional/25_factory_closure_param.my` and four `-rt`
 entries. **Making the set COMPLETE is the real fix and is not done** -

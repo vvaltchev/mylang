@@ -45,10 +45,25 @@ for (var i = 0; i < 4; i++) {
 }
 print("loop   ", last);
 
-# (3) DECLINE: two call sites that disagree. The rule fires only when
-#     EVERY site attributed to a closure agrees, so this one stays dyn
-#     and the values are exactly what they were before #115 - an int 21,
-#     not a coerced 21.000000.
+# (3) ⛔ TWO CALL SITES THAT DISAGREE *JOIN*, exactly as they do for a
+#     DIRECTLY-bound capturing lambda. This case used to DECLINE to
+#     `dyn` and print `dyn:21 dyn:22.500000`, because a UNIFORMITY
+#     check refused to contribute anything unless every site of a
+#     closure agreed. That check is deleted (maintainer's call,
+#     2026-08-28) and the two spellings of a capturing closure now
+#     behave identically:
+#
+#       var wbase = 20;                                    # DIRECT
+#       var f = func [wbase] (x) { return typestr(x); };
+#       print(f(1) + " " + f(2.5));   -> float float
+#
+#     - which is what this now prints too. `join(int, float)` is
+#     float, so `f(1)` coerces; an int/str pair is the join CONFLICT
+#     that the direct spelling already raised.
+#
+#     ⛔ WATCHED: restoring the uniformity check turns this line back
+#     into `widen  dyn:21 dyn:22.500000` - it is the ONE corpus line
+#     the deletion moves, which is why it is asserted here.
 func make_w(n) {
   var wbase = n * 10;
   return func [wbase] (x) { return typestr(x) + ":" + str(wbase + x); };
@@ -59,13 +74,22 @@ func widen(int k) {
 }
 print("widen  ", widen(runtime(2)));
 
-# (4) DECLINE, and this is the case that made uniformity necessary
-#     rather than nice. The finfo set UNDER-COLLECTS: two same-shaped
-#     closures in an array present a ONE-element set at every call site,
-#     so both sites below attribute to the same survivor. Contributing
-#     per site gave that one FuncInfo both `int` and `str` and REFUSED a
-#     program with no conflict in it. Deciding per callee over all its
-#     sites is what makes it compile.
+# (3b) the SAME shape written as a directly-bound capturing lambda -
+#      the spelling case (3) must agree with. Kept adjacent so the two
+#      cannot silently drift apart again.
+var dbase = 20;
+var dfn = func [dbase] (x) { return typestr(x) + ":" + str(dbase + x); };
+print("direct ", dfn(1) + " " + dfn(2.5));
+
+# (4) DECLINE - and this is the case that once made a UNIFORMITY rule
+#     necessary, and is now the reason it could be deleted. The old
+#     finfo set UNDER-COLLECTED: two same-shaped closures in an array
+#     presented a ONE-element set at every call site, so both sites
+#     below attributed to the same survivor, joining them gave that one
+#     FuncInfo both `int` and `str`, and a program with no conflict in
+#     it was REFUSED. The callee-set analysis reports these sites as
+#     TWO-candidate sets, so they are disqualified and no join happens.
+#     The decline is the same; the reason for it is now the true one.
 func mk_a(n) => func [n] (x) { return str(n) + str(x); };
 func mk_b(n) => func [n] (x) { return str(n) + str(x); };
 func two_closures(int k) {
@@ -77,8 +101,8 @@ func two_closures(int k) {
 print("pair   ", two_closures(runtime(3)));
 
 # (5) ⛔ COMPLETENESS. Two same-shaped closures in an array, ONE call
-#     site (so uniformity is trivially satisfied) and an index that
-#     selects the FIRST. `join`'s `static_type_equal` shortcut used to
+#     site (so no per-callee agreement rule could ever have caught it)
+#     and an index that selects the FIRST. `join`'s `static_type_equal` shortcut used to
 #     drop one side's candidate set whenever two functions shared a
 #     signature, so the callee named ONE function and this printed
 #     `a:int15` - a type the call site cannot guarantee, since `p[k]`

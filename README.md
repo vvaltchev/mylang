@@ -1541,10 +1541,9 @@ A lambda with un-annotated parameters is typed from the places it is
   `float`, and the `int` argument is then coerced); two irreconcilable ones
   are a compile error.
 
-A closure that reaches you **indirectly** - returned from a factory, or read
-out of a container - is typed only when every call through it agrees on the
-argument types; otherwise its parameters stay `dyn`. So an indirectly-reached
-closure is never *refused* for a disagreement, it simply stays dynamic.
+**How the closure reaches the call makes no difference.** Bound directly to a
+variable, returned from a factory, or read out of a container - as long as the
+compiler can tell *which* closure is being called, every call site joins:
 
 ```C#
 func make_adder(n) {
@@ -1554,6 +1553,33 @@ func make_adder(n) {
 
 var add = make_adder(3);
 print(add(4));            # 34 - `x` is typed `int` from this call site
+```
+
+```C#
+func make_f(n) => func [n] (x) { return typestr(x); };
+var f = make_f(1);
+print(f(1) + " " + f(2.5));      # float float - int widened to float
+
+var base = 20;                                    # the same, written
+var g = func [base] (x) { return typestr(x); };   # directly
+print(g(1) + " " + g(2.5));      # float float - identical
+```
+
+What *does* stop the typing is not knowing **which** closure a call reaches.
+When a value may hold more than one, nothing is attributed to either and their
+parameters stay `dyn` - which is why the two closures below keep working with
+arguments of different types:
+
+```C#
+func mk_a(n) => func [n] (x) { return "a" + str(x); };
+func mk_b(n) => func [n] (x) { return "b" + str(x); };
+
+func pick(int k) {
+  var ops = [mk_a(1), mk_b(2)];
+  var p = ops[k];               # may be either closure
+  var q = ops[k + 1];           # ...so neither gets typed
+  return p(7) + q("s");         # both fine: their `x` stays dyn
+}
 ```
 
 
