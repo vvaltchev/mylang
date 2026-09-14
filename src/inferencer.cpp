@@ -242,11 +242,34 @@ private:
     /* Templates already value-instantiated (their uses redirected). */
     std::set<FuncInfo *> value_inst_done;
     std::unordered_set<FuncInfo *> tmpl_cap_warned;
+    /*
+     * #115 (fixed 2026-08-27): the INDIRECT call sites whose callee is
+     * provably ONE function, decided ONCE from a settled fixpoint.
+     *
+     * ⛔ THE GATE CANNOT BE EVALUATED MID-FIXPOINT. A `Func` type's
+     * finfo set only GROWS (join unions it), so a callee that will end
+     * up with two candidates passes through a round where it has one -
+     * and a contribution made in that round is already committed when
+     * the second appears. The answer then depended on ROUND ORDER,
+     * which is exactly what the fixpoint's read-stable-values design
+     * exists to prevent, and it is unrecoverable: nothing can un-join a
+     * param.
+     *
+     * So the decision is a SNAPSHOT, taken after `run_fixpoint` has
+     * settled and never revised. While the map is empty (the first
+     * fixpoint) `accumulate_call` behaves exactly as it did before
+     * #115, which is what makes the snapshot trustworthy: it is read
+     * off a fixpoint that this rule did not influence.
+     */
+    std::map<CallExpr *, FuncInfo *> indirect_callee;
 
     /* Flow-sensitive null narrowing (check pass only): inside the proven branch
      * of `if (x != none)` / `if (x)`, x reads as non-opt. */
     std::unordered_map<const TypeSym *, StaticTypeRef> narrowed;
     bool narrowing_on = false;
+
+    /* #115: fill `indirect_callee` from a SETTLED fixpoint (see it). */
+    void snapshot_indirect_callees(Block *rootBlock);
 
     void infer_one(Block *root);     /* the per-root passes (shared) */
 
@@ -958,6 +981,102 @@ void Inferencer::drain_escapes()
 }
 
 /*
+ * #115: which INDIRECT call sites have a callee this pass may name.
+ *
+ * Read off a SETTLED fixpoint and stored, never recomputed - see
+ * `indirect_callee` for why the gate is unsound to evaluate mid-round.
+ * A call qualifies when its callee type names EXACTLY ONE non-template
+ * function.
+ *
+ * ⛔ ONE, AND CONTRIBUTING TO ALL OF A LARGER SET IS NOT THE
+ * ALTERNATIVE. It looks sound - the value may be any member, so each
+ * may really receive these arguments - and it is, per site. Across
+ * sites it is not conservative at all: two vars each holding {A, B},
+ * one called with an int and one with a str, would give BOTH A and B
+ * both types and turn a working program into a TypeMismatchEx. The
+ * single-candidate rule is what keeps this pass from inventing
+ * conflicts that no single closure ever sees.
+ */
+void Inferencer::snapshot_indirect_callees(Block *rootBlock)
+{
+    std::vector<std::pair<CallExpr *, bool>> calls;
+    for (auto &e : rootBlock->elems)
+        collect_calls(e.get(), calls);
+
+    /* 1) attribute every indirect call whose callee names ONE function */
+    std::map<FuncInfo *, std::vector<CallExpr *>> sites;
+    for (auto &cp : calls) {
+        CallExpr *call = cp.first;
+        if (indirect_callee.count(call))
+            continue;                       /* decided already - never revise */
+        if (callee_funcinfo(call->what.get()))
+            continue;                       /* a direct call */
+        StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
+        if (!ct || ct->kind != StaticTypeKind::Func || ct->finfos.size() != 1)
+            continue;
+        FuncInfo *fi = static_cast<FuncInfo *>(ct->finfos[0]);
+        if (!fi || fi->is_template || fi->value_escaped)
+            continue;                       /* instantiation handles those */
+        sites[fi].push_back(call);
+    }
+
+    /*
+     * 2) ⛔ UNIFORMITY, AND IT IS NOT A REFINEMENT - WITHOUT IT THIS
+     * PASS REFUSES VALID PROGRAMS.
+     *
+     * "The callee type names exactly one function" is NOT the same as
+     * "this call provably reaches that one function". The finfo set is
+     * built by flow and it UNDER-COLLECTS: two same-shaped closures put
+     * in an array and selected by index present a ONE-element set at
+     * every call site, because the path that computes the element type
+     * never reaches `join`'s Func arm (watched, with the arm
+     * instrumented). Both sites then attribute to the SAME survivor:
+     *
+     *     var p = [mk_a(1), mk_b(2)];
+     *     var f = p[k % 2];
+     *     var g = p[(k + 1) % 2];
+     *     return f(7) + g("s");        # NO conflict - two functions
+     *
+     * and contributing per site gave that one FuncInfo both `int` and
+     * `str`, refusing a program that has no conflict in it at all.
+     *
+     * So the decision is made PER CALLEE over ALL of its attributed
+     * sites, exactly as `value_instantiate_round` decides a template's
+     * signature: they must agree, or none of them contributes. A
+     * genuinely single closure called from several places with one
+     * signature still qualifies; a survivor standing in for two does
+     * not, because the sites it collected disagree.
+     *
+     * `escaped_finfos` is consulted above as well, but it is NOT
+     * sufficient on its own and this is why: it reports a set that a
+     * join DROPPED members from, and here the members never ENTERED.
+     */
+    for (auto &kv : sites) {
+        FuncInfo *fi = kv.first;
+        const std::vector<CallExpr *> &cs = kv.second;
+        bool uniform = true;
+        for (size_t i = 1; i < cs.size() && uniform; i++) {
+            if (cs[i]->args->elems.size() != cs[0]->args->elems.size()) {
+                uniform = false;
+                break;
+            }
+            for (size_t j = 0; j < cs[i]->args->elems.size(); j++)
+                if (!static_type_equal(
+                        static_type_resolve(type_of(cs[i]->args->elems[j].get())),
+                        static_type_resolve(
+                            type_of(cs[0]->args->elems[j].get())))) {
+                    uniform = false;
+                    break;
+                }
+        }
+        if (!uniform)
+            continue;
+        for (CallExpr *c : cs)
+            indirect_callee[c] = fi;
+    }
+}
+
+/*
  * Value-used template instantiation (plans/archived/value-template-instantiation.md).
  * A template whose VALUE flows (through vars/containers - the finfo set on
  * its Func static type rides the ordinary lattice) to indirect call sites
@@ -1262,15 +1381,44 @@ void Inferencer::infer_one(Block *rootBlock)
      * until no new signature appears - a clone's body may call other templates
      * (or itself), which surface only once its own params are settled.
      */
-    for (int round = 0; round < 64; round++) {
+    const auto instantiate_to_fixpoint = [&]() {
+        for (int round = 0; round < 64; round++) {
+            drain_escapes();
+            const bool p1 = instantiate_round(rootBlock);
+            const bool p2 = value_instantiate_round(rootBlock);
+            if (!p1 && !p2)
+                break;
+            run_fixpoint(rootBlock);
+        }
         drain_escapes();
-        const bool p1 = instantiate_round(rootBlock);
-        const bool p2 = value_instantiate_round(rootBlock);
-        if (!p1 && !p2)
-            break;
+    };
+    instantiate_to_fixpoint();
+
+    /*
+     * #115: ONLY NOW is "this callee is provably one function" a
+     * question with a stable answer, and the ordering is not a detail -
+     * it was the bug. Taken before this loop, every candidate callee
+     * read `dyn`: a call to a TEMPLATE defers by design (see the
+     * defer-on-Unknown invariant), so a factory's return type does not
+     * exist until instantiation has made the clone and redirected the
+     * call. The snapshot found ZERO sites and the whole rule was inert.
+     *
+     * Taken here, the finfo sets are settled and the decision is made
+     * once from complete information - which is the property the
+     * mid-fixpoint gate could not have (a set only GROWS, so a callee
+     * that ends with two candidates passes through a round holding
+     * one, and a contribution made there is already committed when the
+     * second arrives; nothing can un-join a param).
+     *
+     * The contributions can settle new template signatures, so the
+     * instantiate loop runs again. It is idempotent when nothing
+     * changed and bounded either way.
+     */
+    snapshot_indirect_callees(rootBlock);
+    if (!indirect_callee.empty()) {
         run_fixpoint(rootBlock);
+        instantiate_to_fixpoint();
     }
-    drain_escapes();
 
     /* finalize. An unconstrained value is `none` for a local ("only-none /
      * doesn't matter") but `dyn` for a PARAMETER: a never-(concretely-)called
@@ -3954,18 +4102,15 @@ void Inferencer::accumulate_call(CallExpr *call)
      * redirects them to a typed clone.
      */
     {
-        StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
-        if (ct && ct->kind == StaticTypeKind::Func
-                && ct->finfos.size() == 1) {
-            FuncInfo *ifi = static_cast<FuncInfo *>(ct->finfos[0]);
-            if (ifi && !ifi->is_template) {
-                size_t n = std::min(ifi->params.size(), args->elems.size());
-                for (size_t i = 0; i < n; i++)
-                    contribute_arg(ifi->params[i],
-                                   type_of(args->elems[i].get()),
-                                   args->elems[i]->start);
-                return;
-            }
+        auto ic = indirect_callee.find(call);
+        if (ic != indirect_callee.end()) {
+            FuncInfo *ifi = ic->second;
+            size_t n = std::min(ifi->params.size(), args->elems.size());
+            for (size_t i = 0; i < n; i++)
+                contribute_arg(ifi->params[i],
+                               type_of(args->elems[i].get()),
+                               args->elems[i]->start);
+            return;
         }
     }
 

@@ -3618,25 +3618,52 @@ never affected). The finfo set already carried the answer the whole way
 - the lambda's type flows into the factory's `ret`, out of the call and
 into the variable's symbol, `join` unioning the sets - so the fix is to
 seed it for every function and to contribute through an INDIRECT call
-whose callee type names **exactly one** candidate. One, not any:
-contributing to a larger set is SOUND (the value may be any member) but
-WIDENS params a different call site must then live with, and a param
-widened to `dyn` costs every unboxed tier built on it.
+whose callee type names **exactly one** candidate.
 
-**⛔ THE CONSEQUENCE IS A REAL SEMANTIC CHANGE, AND IT MAKES TWO
-SPELLINGS AGREE RATHER THAN INVENTING A RULE.** A typed parameter can
-conflict where `dyn` accepted everything, so `f(1)` and `f("s")` on the
-same factory-returned closure is now a `TypeMismatchEx`, and `f(1)` plus
-`f(2.5)` WIDENS it to float (the int argument is then coerced, so the
-result prints `21.000000` where it printed `21`). Neither is new: a
-DIRECTLY-bound capturing lambda has always done exactly this, with the
-same message - a closure was escaping the rule by being returned rather
-than written inline. (A NON-capturing var-bound lambda is a TEMPLATE and
-monomorphizes instead, so it is unaffected.) Measured blast radius:
-**0 of 125 corpus programs change compile outcome, 0 of 124 change
-output.** Pinned by `tests/functional/25_factory_closure_param.my` and
-three `-rt` entries, one of which is the directly-bound twin, so the two
-are visibly the same behaviour.
+**⛔ TWO GATES, AND BOTH ARE LOAD-BEARING - EACH WAS A REFUSED-VALID-
+PROGRAM BUG BEFORE IT WENT IN.**
+
+**(a) THE DECISION IS A SNAPSHOT, TAKEN AFTER INSTANTIATION.** A finfo
+set only GROWS (`join` unions it), so a callee that ends with two
+candidates passes through a round holding one - and a contribution made
+in that round is already committed when the second arrives. The answer
+depended on ROUND ORDER, which is what the fixpoint's read-stable-values
+design exists to prevent, and it is unrecoverable: nothing un-joins a
+param. `snapshot_indirect_callees` decides once, from a converged state.
+⛔ AND IT MUST RUN **AFTER** THE INSTANTIATE LOOP: a call to a TEMPLATE
+defers by design, so a factory's return type does not exist until
+instantiation has made the clone and redirected the call. Placed before
+the loop the snapshot found ZERO sites and the whole rule was inert.
+
+**(b) EVERY SITE ATTRIBUTED TO A CALLEE MUST AGREE, or none of them
+contributes** - the same uniformity `value_instantiate_round` requires
+of a template's signature. This is not a refinement. **The finfo set
+UNDER-COLLECTS**: two same-shaped closures in an array present a
+ONE-element set at every call site, because the path computing the
+element type never reaches `join`'s Func arm (watched, instrumented). So
+
+    var p = [mk_a(1), mk_b(2)];
+    var f = p[k % 2];
+    var g = p[(k + 1) % 2];
+    return f(7) + g("s");        # NO conflict - two functions
+
+fed BOTH `int` and `str` to one survivor and REFUSED a program with no
+conflict in it. `escaped_finfos` does not catch this and cannot: it
+reports members a join DROPPED, and here they never ENTERED.
+
+**THE PRICE, STATED PLAINLY: this does NOT match the directly-bound
+capturing lambda.** That form refuses `f(1)` and `f("s")`; a
+factory-returned closure declines to `dyn` instead and compiles. The
+asymmetry is deliberate - declining is the safe direction while the set
+is incomplete - and both spellings sit adjacent in the `-rt` table so
+the difference is on the record. **With uniformity the rule's ONLY
+observable effect is that a uniformly-called closure's parameter is
+typed**: no new refusals, no coercion changes. Measured blast radius:
+0 of 125 corpus programs change compile outcome, 0 of 124 change output.
+Pinned by `tests/functional/25_factory_closure_param.my` and four `-rt`
+entries. **Making the set COMPLETE is the real fix and is not done** -
+it is an audit of finfo propagation through every flow path, which
+value-template instantiation depends on too.
 
 **⛔ A DEAD BASE TEMPLATE IS DECIDED FROM THE TREE, AND A BAKED CONST
 VALUE IS NOT IN THE TREE (2026-08-25).** `is_template_base` excludes a
