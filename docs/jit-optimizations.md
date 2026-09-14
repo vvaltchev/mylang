@@ -10461,3 +10461,62 @@ check that the change touches only what it claims to.)
  - #109 (the inlined `intrusive_ptr::release`) still applies to the
    45-Ir DESTROY side, though here the destroy genuinely runs every
    iteration, so that one is an I-cache argument rather than an Ir one.
+
+## #106 - a POWER-OF-TWO divisor skips the reciprocal entirely
+
+`div_magic` declined only `d == 0/1/-1`, so `i % 4` paid the full
+multiply-high sequence: a `movabs` of the magic constant, a
+serialising 128-bit `imul`, and the truncation fixup - about ten
+instructions. A power of two needs none of it.
+
+**⛔ THE OBVIOUS FORM IS WRONG, AND SILENTLY SO.** `x & (2^k - 1)` is
+the textbook mod-by-a-power-of-two and it does not implement MyLang's
+`%`, which TRUNCATES: the sign follows the DIVIDEND (`-5 % 4` is `-1`,
+not `3`), so a bare mask answers `3` for every negative dividend.
+The correct any-sign forms bias first:
+
+    tmp = x >> 63            all ones when x is negative
+    tmp = tmp >>> (64 - k)   so tmp is (2^k - 1) or 0
+    x  += tmp
+    div:  x >>= k  (arithmetic)      -> trunc(x / 2^k)
+    mod:  x &= (2^k - 1); x -= tmp   -> x - trunc(x/2^k)*2^k
+
+Six instructions, no multiply. The DIVISOR's sign matters only to
+`div` (negate the quotient) - truncating `%` is independent of it,
+since `x % -4` and `x % 4` agree for every x.
+
+**CAPPED AT k <= 31.** The mod arm masks with `and r64, imm32`, whose
+immediate is SIGN-EXTENDED: a mask with bit 31 set would extend to
+all-ones in the high half and mask nothing. Bigger powers - and
+INT64_MIN, whose `|d|` is 2^63 - fall through to the reciprocal path,
+which already handles them. The `k=31` / `k=32` pair in
+`tests/functional/14_div_magic.my` straddles the cap, so the handled
+edge and the first fall-through are both covered.
+
+**MEASURED** (callgrind Ir, `OPT=1 ASSERTS=0`, scale-corrected so
+compile time is excluded): **53_collatz -23.2%** (`n % 2` and `n / 2`
+are its whole inner loop), **03_int_arith -7.4%**,
+76_funcval_dispatch -1.5%, 57_bool_reduce -0.7%, 47_wordcount -0.4%.
+No program regressed.
+
+**REACH** is `MYLANG_JITSTATS`' `divpow2`, beside `divmagic`, so "the
+tier ran" and "the reduction ran" cannot be confused: the 682-case
+sweep reports 992 pow2 of 1364 reductions.
+
+**WATCHED FAILING:** emitting the naive `and` without the bias makes
+`14_div_magic.my` print `1420516668398` where the tree-walker prints
+`106236609362`, and `corpus_diff` reports 32/33.
+
+**THE REGISTER CENSUS CAUGHT TWO THINGS**, both worth knowing: the six
+new `rax` uses needed justification tags (they are the div/mod
+entry/exit PROTOCOL - the dividend arrives and the result leaves in
+rax - not an ISA requirement, since this arm has no `imul`); and
+naming the tag tokens in PROSE tripped the stale-tag check, because
+the scanner reads them per LINE. The explanatory comment now describes
+the tags without spelling them.
+
+**PHASE 2 IS NOT BUILT.** A counted `for (var i = 0; i < n; i++)`
+induction variable is provably >= 0, and for a non-negative dividend
+the whole thing collapses to ONE instruction (`and` for mod, `shr` for
+div). That needs a "non-negative" bit stamped by the for-range
+specializer - a range fact, not a peephole - and is a separate change.

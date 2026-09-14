@@ -60,6 +60,8 @@ unsigned long g_jit_member_fast = 0, g_jit_ctor_fast = 0;
 unsigned long g_jit_ctor_bb_moved = 0;
 unsigned long g_jit_boxed_fast = 0;    /* #60: inline int-int boxed-op runs */
 unsigned long g_jit_divmagic = 0;      /* const-divisor div/mod reduced */
+extern "C" unsigned long g_jit_divpow2;
+unsigned long g_jit_divpow2 = 0;       /* ...of those, by a POWER OF TWO */
 unsigned long g_jit_boxed_fastf = 0;   /* H6: inline float-float ones */
 unsigned long g_jit_boxed_slow = 0;    /* H6 reach: helper-path declines */
 unsigned long g_jit_boxed_slow_f = 0;  /* H6 reach: ... of them float-float */
@@ -3575,6 +3577,10 @@ struct Emitter {
     /* the strength reduction's execution proof - bumped by the EMITTED
      * sequence, since the VALUES are identical to idiv's and nothing
      * else can tell the two apart */
+    void bump_divpow2()
+    {
+        bump_counter(&g_jit_divpow2);
+    }
     void bump_divmagic()
     {
         /* the SIXTEENTH counter - it hid from the bump sweep by being
@@ -3583,6 +3589,7 @@ struct Emitter {
         bump_counter(&g_jit_divmagic);
     }
 #else
+    void bump_divpow2() { }
     void bump_divmagic() { }
 #endif
     /* movq r64, xmm<src> - the div0 bit test's read (C4b: any source;
@@ -5135,6 +5142,12 @@ struct DivMagic {
     unsigned sh;         /* the post-multiply arithmetic shift */
     bool needs_add;      /* M did not fit in 64 bits: add n back */
     bool negate;         /* the divisor was negative */
+    /*
+     * |d| == 2^pow2_k, so the reciprocal is not needed at all (0 = not
+     * a power of two). See the emit side for the sequences and for why
+     * a plain `and` is WRONG here.
+     */
+    unsigned pow2_k;
 };
 
 static bool div_magic(int_type d, DivMagic &out)
@@ -5147,6 +5160,34 @@ static bool div_magic(int_type d, DivMagic &out)
                             : static_cast<uint64_t>(d);
     if (ad < 2)
         return false;
+
+    /*
+     * A POWER OF TWO needs no reciprocal: shifts and a mask do it in
+     * about half the instructions and with no 128-bit multiply. See
+     * emit_div_magic's pow2 arm.
+     *
+     * ⛔ CAPPED AT k <= 31 ON PURPOSE. The mod arm masks with
+     * `and r64, imm32`, which SIGN-EXTENDS its immediate: a mask with
+     * bit 31 set would extend to all-ones in the high half and mask
+     * nothing. k <= 31 keeps every mask positive. Bigger powers (and
+     * INT64_MIN, whose |d| is 2^63) fall through to the reciprocal
+     * path, which already handles them and is already tested - the
+     * shapes this tier exists for are `% 4`, `% 8`, `% 1024`.
+     */
+    if ((ad & (ad - 1)) == 0) {
+        unsigned k = 0;
+        while ((ad >> k) != 1u)
+            k++;
+        if (k >= 1 && k <= 31) {
+            out.M = 0;
+            out.sh = 0;
+            out.needs_add = false;
+            out.negate = neg;
+            out.pow2_k = k;
+            return true;
+        }
+    }
+
     typedef unsigned __int128 u128;
     for (unsigned s = 0; s < 64; s++) {
         const u128 p = static_cast<u128>(1) << (64 + s);
@@ -5157,6 +5198,7 @@ static bool div_magic(int_type d, DivMagic &out)
             out.sh = s;
             out.needs_add = (M >> 63) != 0;        /* imul is SIGNED */
             out.negate = neg;
+            out.pow2_k = 0;
             return true;
         }
     }
@@ -5207,6 +5249,65 @@ static void emit_div_magic(Emitter &e, const DivMagic &m, int_type d,
         else
             e.scratch(keep);
     }
+    /*
+     * ⛔ THE POWER-OF-TWO ARM. `x & (2^k-1)` is the textbook mod-by-a-
+     * power-of-two and it is WRONG HERE: MyLang's `%` TRUNCATES (the
+     * sign follows the DIVIDEND, C semantics - `-5 % 4` is `-1`, not
+     * `3`), so a bare mask answers 3 for every negative dividend. The
+     * bias sequence below is the correct any-sign form:
+     *
+     *   tmp = x >> 63            all ones when x is negative
+     *   tmp = tmp >>> (64 - k)   so tmp is (2^k - 1) or 0
+     *   x  += tmp                bias a negative dividend up
+     *   div:  x >>= k  (arithmetic)      -> trunc(x / 2^k)
+     *   mod:  x &= (2^k - 1); x -= tmp   -> x - trunc(x/2^k)*2^k
+     *
+     * Six instructions and no multiply, against the reciprocal path's
+     * ten - which includes a `movabs` of the magic constant and a
+     * serialising 128-bit `imul`.
+     *
+     * The DIVISOR's sign matters only to `div` (negate the quotient);
+     * truncating `%` is independent of it - `x % -4` and `x % 4` agree
+     * for every x, which is why the mod arm ignores m.negate.
+     */
+    /*
+     * ⛔ RAX HERE IS THE *PROTOCOL*, NOT AN ISA REQUIREMENT, and the
+     * per-line tags below say so. The reciprocal arm marks its rax/rdx
+     * uses as ISA-forced because `imul r64` WRITES the RDX:RAX pair by
+     * ISA; this arm has no multiply at all. What fixes rax here is
+     * emit_div_magic's own contract, stated at the top of the
+     * function: the dividend ARRIVES in rax and the result LEAVES in
+     * rax - the fragment's value conveyance.
+     *
+     * (Written without the literal tag tokens on purpose:
+     * scripts/regcensus.py scans for them per LINE, so naming them in
+     * prose reads as a tag on a line with no register - which it
+     * correctly reports as STALE.)
+     */
+    if (m.pow2_k) {
+        const uint8_t k = static_cast<uint8_t>(m.pow2_k);
+        e.mov_rr(keep, RAX);                  /* tmp = x;  reg:proto */
+        e.sar_rr_imm8(keep, 63);              /* tmp = x<0 ? -1 : 0 */
+        e.shr_rr_imm8(keep,                   /* tmp = x<0 ? 2^k-1 : 0 */
+                      static_cast<uint8_t>(64 - k));
+        e.add_rr(RAX, keep);                  /* x += tmp; reg:proto */
+        if (want_mod) {
+            e.op_reg_imm(Op::band, RAX,       /* reg:proto */
+                         static_cast<int32_t>((1u << k) - 1u));
+            e.sub_rr(RAX, keep);              /* x -= tmp; reg:proto */
+        } else {
+            e.sar_rr_imm8(RAX, k);   /* x >>= k, arithmetic; reg:proto */
+            if (m.negate)
+                e.neg_reg(RAX);               /* reg:proto */
+        }
+        e.bump_divpow2();
+        if (keep_g >= 0)
+            e.free_scratch(static_cast<uint8_t>(keep_g));
+        else if (keep_spill)
+            e.pop_reg(keep);
+        return;
+    }
+
     e.mov_rr(keep, RAX);           /* keep = n; reg:isa (imul) */
     e.mov_imm(RDX, m.M);  /* reg:isa */
     e.imul_reg(RDX);              /* reg:isa: imul rdx (signed,
@@ -10470,6 +10571,7 @@ void jit_stats_report()
         /* which TIER the boxed (dyn) arithmetic took */
         { "boxed_fast",       &g_jit_boxed_fast },
         { "divmagic",         &g_jit_divmagic },
+        { "divpow2",          &g_jit_divpow2 },
         { "boxed_fastf",      &g_jit_boxed_fastf },
         { "boxed_slow",       &g_jit_boxed_slow },
         { "boxed_slow_f",     &g_jit_boxed_slow_f },
