@@ -323,6 +323,7 @@ private:
 
     /* #115: fill `indirect_callee` from a SETTLED fixpoint (see it). */
     void snapshot_indirect_callees(Block *rootBlock);
+    void stamp_callee_fn(Block *rootBlock);  /* #116 inc 4 - see it */
 
     void infer_one(Block *root);     /* the per-root passes (shared) */
 
@@ -1198,6 +1199,69 @@ void Inferencer::snapshot_indirect_callees(Block *rootBlock)
 }
 
 /*
+ * #116 increment 4: stamp `CallExpr::callee_fn` - the single function a
+ * call can reach - so a pass that runs AFTER the inferencer is gone can
+ * still ask the callee-set analysis's question.
+ *
+ * Its consumer is the #93 ESCAPE ANALYSIS (resolver.cpp), which poisons a
+ * whole function whenever a call's callee is not a named global slot,
+ * because a callee it cannot name could reassign the global some caller
+ * passed us and drop the last reference mid-call. Naming the callee turns
+ * that blanket poison into an ordinary call EDGE, which the `unsafe`
+ * fixpoint already propagates.
+ *
+ * ⛔ THE GATES ARE THE SAME ONES A MUST-ANSWER ALWAYS NEEDS, and each is
+ * load-bearing for MEMORY SAFETY here, not for precision:
+ *  - exactly ONE candidate and not ⊤. A flow-insensitive set unions every
+ *    assignment, so |set| == 1 means only that function can ever be there
+ *    - which is also why no separate "is the slot reassigned?" test is
+ *    needed (a reassigned variable holds two candidates and declines).
+ *  - not ESCAPED: a function whose value left the analysed program can be
+ *    reached from a site this pass never saw.
+ *  - it must have a `decl` - a FuncInfo with no node is nothing the
+ *    resolver can match.
+ *
+ * ⛔ A TEMPLATE BASE IS *NOT* EXCLUDED, and that is deliberate - the
+ * question this consumer asks is "WHOSE BODY RUNS HERE", not "which
+ * signature should I type". A base whose value was never redirected to
+ * an instance runs its own (boxed) body, and the analysis names exactly
+ * what the redirect left behind: if `value_instantiate_round` rebound
+ * the value use, the set holds the INSTANCE. Excluding bases here was a
+ * copy of #115's gate, where `is_template` means "instantiation handles
+ * those" - a different question - and it cost the motivating bench
+ * (12_higher_order's `func apply(f, x) => f(x);` reaches `sq`, which is
+ * a template because it is only ever passed as a VALUE).
+ *
+ * A stamp is only ever an ADDITION to what the resolver could already
+ * name, so the failure direction is: a wrong stamp lets the escape
+ * analysis believe a call is analysable when it is not, which is a #94
+ * BORROW of a reference that may be dropped - a use-after-free. The
+ * conservative answer is null, and every path that cannot name returns it.
+ */
+void Inferencer::stamp_callee_fn(Block *rootBlock)
+{
+    std::vector<std::pair<CallExpr *, bool>> calls;
+    for (auto &e : rootBlock->elems)
+        collect_calls(e.get(), calls);
+
+    for (auto &cp : calls) {
+        CallExpr *call = cp.first;
+        call->callee_fn = nullptr;
+        if (cs_struct_callee(call->what.get()))
+            continue;                     /* a construction, not a call */
+        const CsSet cs = callee_set(call->what.get());
+        if (cs.top || cs.funcs.size() != 1)
+            continue;
+        FuncInfo *fi = cs.funcs[0];
+        if (!fi || !fi->decl)
+            continue;
+        if (callee_escaped(fi))
+            continue;
+        call->callee_fn = fi->decl;
+    }
+}
+
+/*
  * Value-used template instantiation (plans/archived/value-template-instantiation.md).
  * A template whose VALUE flows (through vars/containers - the finfo set on
  * its Func static type rides the ordinary lattice) to indirect call sites
@@ -1583,6 +1647,15 @@ void Inferencer::infer_one(Block *rootBlock)
         run_fixpoint(rootBlock);
         instantiate_to_fixpoint();
     }
+
+    /*
+     * #116 increment 4: hand the callee sets to the RESOLVER by stamping
+     * them on the call nodes. Last, because everything above can still
+     * redirect a call site to a fresh clone - `instantiate_to_fixpoint`
+     * re-runs `cs_run` per round for exactly that reason, so only now is
+     * the tree final and the analysis current for it.
+     */
+    stamp_callee_fn(rootBlock);
 
     /* finalize. An unconstrained value is `none` for a local ("only-none /
      * doesn't matter") but `dyn` for a PARAMETER: a never-(concretely-)called

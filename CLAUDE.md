@@ -3985,7 +3985,7 @@ entry asserts the SET per constraint form AND a stated ⊤ per SINK, each
 watched failing against a sabotage build (see the entry's header for the
 six that fail and the one that is proven redundant instead).
 
-**Status: increments 1-3 done.** #115 is migrated
+**Status: increments 1-4 done - #116 IS COMPLETE.** #115 is migrated
 (`snapshot_indirect_callees` asks `callee_set`/`callee_escaped`, and
 closing the multi-site hole was the first thing the real answer bought
 - see gate (c) above); 0 of 126 corpus programs changed. Increments
@@ -3993,13 +3993,37 @@ increment 3 migrated `value_instantiate_round` and DELETED
 `finfos`/`escaped_finfos`/`note_escaped_into`/`drain_escapes`,
 reverting the `join` union - `StaticType` describes shape and nothing
 else again, and `stamp_proven_params` (C3) gained `callee_escaped` to
-replace the half of `value_escaped` the ledger used to supply. 0 of 126
-corpus programs changed. Increment 4 migrates the resolver's three
-partial analyses (`callee_of`, `slot2fn`/`direct_func_slot`,
-`esc_callback_fn`) and is **MEMORY-SAFETY-CRITICAL**: #93/#94 make a
-false "safe" a use-after-free, so every `param_escape_analysis` row
-must be re-watched failing against the new source. Full plan:
-`plans/callee-set-analysis.md`.
+replace the half of `value_escaped` the ledger used to supply.
+
+**Increment 4 handed the answer to the RESOLVER** via
+`CallExpr::callee_fn` - the single function a call can reach, stamped
+by the inferencer, read by the #93 ESCAPE ANALYSIS where its own slot
+lookup fails (`f(x)` with `f` a parameter, or a closure in a variable,
+has no global slot and used to poison the whole enclosing function).
+⛔ **MEMORY-SAFETY-CRITICAL**: #93/#94 make a false "safe" a
+use-after-free. Measured: `noesc_p_callee` 8 -> 4 corpus-wide,
+`noesc_cs_named` 6, one function un-poisoned, and `arg_borrow`
+UNCHANGED - the borrow set is identical, so the risk surface is a
+latent one and the whole `param_escape_analysis` table was re-watched.
+Full plan: `plans/callee-set-analysis.md`.
+
+**⛔ TWO CONSUMERS WERE DELIBERATELY NOT WIRED, and the reasons are
+rules:**
+
+ - **the step-7 PROVER (`callee_of`)** decides whether a program
+   COMPILES. The stamp exists only when inference ran, so wiring it
+   there would make **`-nti` change whether a program is REFUSED**. An
+   optimization may consult inference; a compile-error tier may not.
+ - **`direct_func_slot`** is not an identity question at all - it
+   records a global SLOT, backed by a runtime `is<FuncObject>` check,
+   and the analysis cannot improve it without flow sensitivity it does
+   not have.
+
+Also measured and not built: **`esc_callback_fn` never fails on the
+corpus** (`noesc_p_hobuiltin` is **0**), so migrating it would have
+been inert. Measuring the poison counters BEFORE writing any code is
+what redirected this increment from three consumers to the one with a
+payoff.
 
 ## The value & type model (the subtle part)
 

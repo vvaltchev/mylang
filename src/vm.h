@@ -96,6 +96,7 @@ extern unsigned long g_noescape_cands;
 extern unsigned long g_noescape_unsafe;
 extern unsigned long g_esc_p_callee, g_esc_p_gwrite;
 extern unsigned long g_esc_p_hobuiltin, g_esc_p_shape;
+extern unsigned long g_esc_named_by_cs;
 /* Which VmInvoker::call entry each callback element took (vm.cpp) */
 extern unsigned long g_invoke_prepared;
 extern unsigned long g_invoke_fallback;
