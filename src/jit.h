@@ -585,6 +585,17 @@ extern unsigned long g_jit_rethrow_native;
  * exactly (it sets native_entry_off when this holds).
  */
 bool jit_chunk_is_native_leaf(const Chunk &chunk);
+/*
+ * #97 - is this chunk a FRAMELESS CANDIDATE (see Chunk::frameless_ok)?
+ * A REACH PROBE: nothing consumes the answer to decide emission yet.
+ */
+bool jit_chunk_frameless_ok(const Chunk &chunk);
+/* the native-stack window a frameless callee may allocate, in SLOTS -
+ * 64 x 48 bytes = 3KB, the same bound Frame::init already imposes. */
+enum { FRAMELESS_MAX_SLOTS = 64 };
+/* REACH (TESTS): chunks that qualify, and calls made to one. */
+extern unsigned long g_jit_frameless_chunks;
+extern unsigned long g_jit_frameless_calls;
 
 /*
  * Call a compiled fragment (frameless: slots base in, resume pc out).

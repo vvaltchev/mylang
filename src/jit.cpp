@@ -7262,6 +7262,14 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
         bake_ck = nullptr;
     }
     const bool bake_norec_final = bake && bake_final && bake_ck->norec_ok;
+#ifdef TESTS
+    /* #97 REACH PROBE: this SITE could take a frameless call - the
+     * callee is named at compile time and its chunk qualifies. An
+     * emit-time count, so it measures SITES x their emission, not
+     * executions; the emission is not written. */
+    if (bake && bake_ck->frameless_ok)
+        g_jit_frameless_calls++;
+#endif
     const int32_t bake_nslots =
         bake ? static_cast<int32_t>(bake->frame_size + bake_ck->n_temps) : 0;
 
@@ -10196,6 +10204,8 @@ void jit_stats_report()
         { "sync_inline",      &g_jit_sync_inline },
         { "arg_inplace",      &g_jit_arg_inplace },
         { "arg_scalar",       &g_jit_arg_scalar },
+        { "frameless_chunks", &g_jit_frameless_chunks },
+        { "frameless_calls",  &g_jit_frameless_calls },
         { "arg_stage",        &g_jit_arg_stage },
         { "sync_switch",      &g_jit_sync_switch },
         { "sync_boundary",    &g_jit_sync_boundary_call },
@@ -22109,6 +22119,114 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk)
     return true;
 }
 
+/*
+ * #97 - THE FRAMELESS CANDIDATE. A REACH PROBE: it decides nothing
+ * today, it only counts. See the contract on `Chunk::frameless_ok`.
+ *
+ * Deliberately measured BEFORE the emission is written, because the
+ * design has an obvious way to be worthless: 09_fib_recursive is
+ * SELF-RECURSIVE and 63/11/76 call CLOSURES, so a leaf-only,
+ * named-callee-only tier could reach exactly zero of the four benches
+ * it exists for. That is the vacuous-tier trap one level up - not a
+ * test that proves nothing, a TIER that serves nobody - and the cost of
+ * finding out afterwards is a week.
+ */
+bool jit_chunk_frameless_ok(const Chunk &chunk)
+{
+    const char *why = nullptr;
+    bool ok = true;
+    /*
+     * ⛔ NOT `native_leaf` - THAT IS #55'S GATE AND IT MEANS SOMETHING
+     * ELSE. It requires `op_never_exits` of EVERY op, because a #55
+     * direct caller IGNORES the fragment's return value and a conveying
+     * throw would be dropped. A frameless callee does NOT ignore the
+     * return - its throw conveys through the postexit exactly as a
+     * record-less frame's does - so exit-freedom is not what it needs.
+     * Reusing that gate measured a reach of ZERO whose reasons were an
+     * artifact of the wrong question.
+     *
+     * What it needs is that the body runs entirely in NATIVE code and
+     * never resumes in the interpreter mid-body, since there is no
+     * vframe or record for the interpreter to resume ON. That is
+     * `jit_op_eligible` over every op - the same bar the run builder
+     * uses - plus a terminal ReturnV so the frame has one exit.
+     */
+    if (chunk.code.empty()
+            || (chunk.code.back().op != OpCode::ReturnV
+                && chunk.code.back().op != OpCode::Halt))
+                                 { why = "no terminal ReturnV/Halt";
+                                   ok = false; }
+    else if (!chunk.plain_frame) { why = "not plain_frame";  ok = false; }
+    /*
+     * ⛔ AND NOT `ref_slots.empty()` EITHER - the first version required
+     * it on the reasoning "nothing to release at the return, nothing in
+     * the window an unwinder must see", and BOTH halves were wrong. The
+     * window is still addressable through rbx wherever it lives, so the
+     * release scan runs exactly as `emit_ret_native`'s does today; and
+     * the unwinder reads the window through the same rbx, not through
+     * the segment. What the bound is really for is the SCAN'S COST, so
+     * it is the norec tier's own bound, not zero.
+     *
+     * Measured: `empty()` rejected 209 of 253 corpus chunks (83%) and
+     * every chunk in all four target benches. It was not a gate, it was
+     * a wall.
+     */
+    else if (chunk.ref_slots.size() > RET_REF_GUARD_MAX)
+                                 { why = "ref_slots too many"; ok = false; }
+    else if (chunk.slot_count + chunk.n_temps > FRAMELESS_MAX_SLOTS)
+                                 { why = "window too big";   ok = false; }
+    else
+        for (const Instr &in : chunk.code) {
+            switch (in.op) {
+            case OpCode::CallV: case OpCode::CachedCallV:
+            case OpCode::CallValueV: case OpCode::CallValueGenericV:
+            case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
+                /*
+                 * ⛔ AND IT IS NOT UNIFORMLY REDUNDANT - I ASSERTED THAT
+                 * IT WAS AND THE ASSERT FIRED ON THE FIRST RUN.
+                 *
+                 * For the MyLang-call ops it looks redundant: a `CallV`
+                 * is not `jit_op_eligible` (calls are admitted to a run
+                 * by `op_run_eligible`, separately), so the loop's own
+                 * eligibility test rejects the chunk first and deleting
+                 * these labels changes nothing observable. That is a
+                 * true statement about four of the six labels, and I
+                 * generalised it to all six.
+                 *
+                 * `CallBuiltinV` / `CallBuiltinLV` ARE `jit_op_eligible`
+                 * - they are nativized ops - so for them this clause is
+                 * the ONLY thing standing between a builtin-calling body
+                 * and a tier that cannot walk a frame with one below it.
+                 * The test's reject case therefore calls a BUILTIN;
+                 * with a MyLang call it was unfalsifiable and green.
+                 */
+                why = "not a leaf"; ok = false; break;
+            default:
+                if (!jit_op_eligible(in))
+                    { why = "an op is not nativizable"; ok = false; break; }
+                continue;
+            }
+            break;
+        }
+    /* MYLANG_FRAMELESS_WHY=1 - the REACH REPORT that produced the table
+     * in docs/jit-optimizations.md. Per chunk: the verdict, the window
+     * size, the op count and the ref_slots list. It is how the gate's
+     * three wrong versions were found, each in one run. */
+    const std::optional<std::string> wenv = env_get("MYLANG_FRAMELESS_WHY");
+    if (wenv && !wenv->empty() && (*wenv)[0] != '0')
+        {
+            fprintf(stderr, "[frameless] %-22s slots=%d+%d ops=%zu refs=[",
+                    ok ? "OK" : why, chunk.slot_count, chunk.n_temps,
+                    chunk.code.size());
+            for (const int32_t r : chunk.ref_slots)
+                fprintf(stderr, "%d ", r);
+            fprintf(stderr, "] last=%d\n",
+                    chunk.code.empty()
+                        ? -1 : static_cast<int>(chunk.code.back().op));
+        }
+    return ok;
+}
+
 /* plans/archived/model-flip.md M1: partition the chunk into maximal NATIVE / ISLAND
  * segments. An op is NATIVE iff it is an inserted EnterNative (a compiled run)
  * or it is op_run_eligible (an op the container WOULD nativize - note this is
@@ -25310,6 +25428,11 @@ void jit_compile_chunk(Chunk &, const JitCtx *)
 bool jit_chunk_is_native_leaf(const Chunk &)
 {
     return false;
+}
+
+bool jit_chunk_frameless_ok(const Chunk &)
+{
+    return false;   /* no fragments off-platform -> no frameless tier */
 }
 
 bool jit_chunk_norec_ok(const Chunk &)

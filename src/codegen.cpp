@@ -10512,6 +10512,14 @@ codegen_chunk(const Block *block, int slot_count, bool jit,
      * callee's flag for a caller's native-call gate. jit_compile_chunk reads
      * this flag and records native_entry_off. */
     cg.chunk.native_leaf = jit_chunk_is_native_leaf(cg.chunk);
+    /* #97 REACH PROBE - derived here, beside native_leaf, for the same
+     * reason: both ends of a call protocol must read it BEFORE any jit.
+     * Nothing consumes it to decide emission yet. */
+    cg.chunk.frameless_ok = jit_chunk_frameless_ok(cg.chunk);
+#ifdef TESTS
+    if (cg.chunk.frameless_ok)
+        g_jit_frameless_chunks++;
+#endif
     if (jit)
         jit_compile_chunk(cg.chunk);  /* native-AOT (plans/archived/native-aot.md):
                                        * LAST - needs the specialized ops +
@@ -11275,5 +11283,6 @@ bool bc_inline_chunk(Chunk &ck,
     ck.boxed_ops.clear();
     build_boxed_ops(ck);
     ck.native_leaf = jit_chunk_is_native_leaf(ck);
+    ck.frameless_ok = jit_chunk_frameless_ok(ck);   /* #97 reach probe */
     return true;
 }

@@ -9885,3 +9885,106 @@ disasmcheck vs objdump zero disagreements; driver_checks; norec_enum
 --depth 3. The soundness oracle for a SHRUNK `ref_slots` is
 `jit_ret_audit` plus the VM_HARDENING every-slot-trivial audit at
 `pop_window`, and both demonstrably fire.
+
+## #97 step 6 - THE FRAMELESS GATE, MEASURED BEFORE IT WAS BUILT
+## (2026-08-27) - INERT: it decides nothing yet
+
+The measured budget says **71 of a 142-Ir call is ACTIVATION
+BOOKKEEPING** - the segment fit test, the window advance, the record or
+its record-less fork, the residue push/pop, the vframe and captures
+repoints, and a 26-instruction residue RETURN arm. All of it exists so
+the interpreter can resume mid-call and an unwind can rebuild frames. A
+callee needing none of it could take its window off the NATIVE STACK
+(`sub rsp, N*48`) and return in five instructions: projected **~42 Ir
+against 142**.
+
+**⛔ THE GATE WAS MEASURED FIRST, AND THAT DECISION PAID FOR ITSELF
+THREE TIMES OVER.** The design has an obvious way to be worthless -
+09_fib_recursive is SELF-RECURSIVE and 63/11/76 call CLOSURES, so a
+leaf-only, named-callee tier could serve exactly zero of the four
+benches it exists for. That is the vacuous-test trap one level up: not a
+test that proves nothing, a TIER that serves nobody. `MYLANG_FRAMELESS_WHY=1`
+reports the verdict per chunk, and each wrong gate died in one run:
+
+    gate version              corpus chunks admitted (of ~253)
+    `native_leaf`                    - reach 0, reasons meaningless
+    + terminal ReturnV only          18   (Halt bodies all rejected)
+    + `ref_slots.empty()`            20   (that clause alone: -209)
+    + `ref_slots <= RET_REF_GUARD_MAX`  83   (33%)
+
+Each rejected clause was wrong for a *reason*, not by an off-by-one:
+
+ - **`native_leaf` is #55's gate and means something else.** It requires
+   `op_never_exits` of EVERY op because a #55 direct caller IGNORES the
+   fragment's return, so a conveying throw would be dropped. A frameless
+   callee does not ignore the return - its throw conveys through the
+   postexit exactly as a record-less frame's does.
+ - **A `Halt`-terminated body is fine.** `emit_ret_native(e, ck, -1)`
+   already lowers Halt as "return none". Requiring ReturnV rejected 131
+   of 256 chunks - every void function and every `main`.
+ - **`ref_slots.empty()` was a wall, not a gate**, and its stated reason
+   ("nothing to release at the return, nothing in the window an unwinder
+   must see") was false on both halves: the window is addressable
+   through rbx wherever it lives, so the release scan runs exactly as
+   `emit_ret_native`'s does, and the unwinder reads the window through
+   the same rbx, never through the segment. What the bound is for is the
+   SCAN'S COST, so it is the norec tier's own `RET_REF_GUARD_MAX`.
+
+**⛔ AND THE ANSWER THE REACH NUMBER GIVES IS STILL NO** - which is the
+whole point of asking before building. Per CALL SITE, with the callee
+resolvable at compile time:
+
+    09_fib_recursive     0 sites   (fib calls itself: not a leaf)
+    63_closures          2 sites   (of 5 calls per iteration)
+    11_closure_counter   1 site    (cold - the hot call is a CLOSURE)
+    76_funcval_dispatch  0 sites   (the callee is a func VALUE)
+
+**The blocker is not the callee's BODY, it is that the hot callees are
+reached through a VALUE or are RECURSIVE**, so the caller cannot name
+them at compile time or they are not leaves. A leaf-only,
+baked-callee-only frameless tier cannot deliver the requirement. What it
+would take is written in task #97.
+
+**⛔ THE BACKTRACE IS NOT THE PROBLEM, AND THIS IS WORTH RECORDING
+BECAUSE IT WAS THE FIRST WORRY.** A frame is named from TWO sources that
+are already disjoint:
+
+ - the PHYSICAL frames come from the **rbp chain** - `frag_entry` pushes
+   rbp then rbx FIRST (a documented load-bearing order), so `[rbp+8]` is
+   the return address, `[rbp]` the caller's rbp and `[rbp-8]` the
+   caller's WINDOW. `norec_walk_chain` already descends it, and names
+   each frame by the site of the frame above (`desc(frame below) =
+   site(this frame).caller_desc`);
+ - the VIRTUAL frames from INLINING come from pc-keyed side tables baked
+   at compile time - the callee's own `inline_frames` at the raise pc
+   (`vm_flush_inline`) and the CALL SITE's `NorecSite::inline_chain` +
+   `inline_pool` (`vm_jit_stamp_call_site`).
+
+**Neither consults rbp, and a frameless callee changes neither.** It
+keeps the same prologue, so the physical chain is byte-identical; and
+the inlined-at chain of a call op belongs to the CALLER, whose frame the
+tier does not touch. `jit_norec_postexit` is already ~the frameless
+postexit: the four state restores it performs (the segment watermark,
+`ctx.captures`, the vframe repoint, the release scan) become no-ops or
+unchanged, and `ex->backtrace.emplace_back(d, Loc())` - the line that
+names the frame - is untouched.
+
+WHAT LANDED: `Chunk::frameless_ok` + `jit_chunk_frameless_ok`, derived
+at codegen beside `native_leaf`; `MYLANG_FRAMELESS_WHY=1`, the reach
+report; two TESTS counters (`frameless_chunks`, `frameless_calls`); and
+`jit_frameless_gate`, which pins each clause. Nothing reads the flag to
+decide emission.
+
+**SABOTAGE LEDGER**, and the leaf clause needed TWO corrections before
+it was falsifiable at all:
+
+    the plain_frame clause deleted -> -rt names the try-region case
+    the leaf clause deleted        -> -rt names the builtin-call case
+    ...with a MyLang call instead  -> GREEN. `CallV` is not
+        `jit_op_eligible` (calls join a run via `op_run_eligible`), so
+        the eligibility test rejects first and the leaf clause decides
+        nothing. `CallBuiltinV` IS eligible, so only a BUILTIN caller
+        makes the clause load-bearing.
+    ...with `len()` as that builtin -> the body QUALIFIED: lever 4b
+        fuses `len()` into the native `ArrLen` and the call disappears.
+        `max()` survives as `call.blt.v`.
