@@ -8262,16 +8262,23 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 RCX, static_cast<int32_t>(JP.act_vframe + JP.frame_size),
                 static_cast<uint32_t>(caller_total));
         } else {
-            /* MAIN: read nslots from its own boundary record - after
-             * the callee popped, top_rec IS main's record, and it
-             * persists in every step of the tier's future */
-            /* mov rdx, [rcx+d] */
-            e.load_base(RDX, RCX, static_cast<int32_t>(JP.act_top_rec));
-            /* mov edx, [rdx+d] */
-            e.load32_base(RDX, RDX, static_cast<int32_t>(JP.rec_nslots));
-            e.store32_base(
-                RDX, RCX,
-                static_cast<int32_t>(JP.act_vframe + JP.frame_size));
+            /*
+             * MAIN, BAKED (#97 step 2b). This used to read main's
+             * nslots back through TWO CHAINED LOADS - act->top_rec,
+             * then rec->nslots - on every return, because
+             * `caller_total` is derived from a DESCRIPTOR and main has
+             * none. But main's window size is not a runtime fact: it
+             * is `root_slot_count + root.n_temps` at the one place the
+             * root window is pushed (vm.cpp, `lim.nslots = ...`), and
+             * `ck` here IS main's chunk. So the same immediate store
+             * the non-main arm already used works, and two dependent
+             * loads leave the return path - which is worth more than
+             * their count, since the record line is otherwise untouched
+             * on a record-less return.
+             */
+            e.store_dword_base_imm32(
+                RCX, static_cast<int32_t>(JP.act_vframe + JP.frame_size),
+                static_cast<uint32_t>(ck.slot_count + ck.n_temps));
         }
     }
     /* the abs32 form when the counter is in the arena: one
