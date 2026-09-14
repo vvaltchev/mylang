@@ -3589,26 +3589,38 @@ visible. **Not yet specialized:** a pure-user-func bound with a *container* arg
 **VALUE-USED templates instantiate too (plans/value-template-
 instantiation.md).** A template stored in a container/var and called
 INDIRECTLY (`ops = [add_op, sub_op]; fn = ops[i%2]; fn(st, i)`) gets a
-typed instance when every such call agrees on ONE settled signature: the
-`Func` StaticType carries a **finfo set** (`StaticType::finfos`, seeded
-by `func_static_type` for **every** function since #115 - it was
-templates only - UNIONED by `join`, copied by
-`with_opt` - metadata, never part of equal/assignable), which rides the
-ordinary lattice through array/dict elements and var joins, so each
-indirect call's callee type names its candidate templates with no new
-dataflow machinery. `value_instantiate_round` (run beside
+typed instance when every such call agrees on ONE settled signature.
+
+**⛔ THE CANDIDATE SET COMES FROM THE CALLEE-SET ANALYSIS (#116
+increment 3), NOT FROM THE TYPE.** It used to be a **finfo set**
+stapled to the `Func` StaticType (`StaticType::finfos`, unioned by
+`join`) - and that was a category error: identity metadata on a SHAPE
+object, which every equality-based path in the lattice quietly
+destroyed. `finfos`, `escaped_finfos`, `note_escaped_into` and
+`drain_escapes` are all DELETED; `value_instantiate_round` asks
+`callee_set(e)` and `callee_escaped(f)`. Blast radius of the deletion:
+**0 of 126** corpus programs change `-vd` or output, and
+76_funcval_dispatch still gets its `add_op$0`/`sub_op$0` instances.
+See *THE CALLEE-SET ANALYSIS* below. `value_instantiate_round` (run beside
 `instantiate_round`) checks per-template UNIFORMITY over the attributed
 sites, makes the instance through the ordinary clone machinery
 (`tmpl_cache`/`make_template_clone` - same `$N` naming/display_name),
 REDIRECTS every value-use Identifier IN PLACE (uid + id_sym rebind), and
 seeds the clone's params with the signature each fixpoint round (a
 phantom call - no direct call feeds them). **ESCAPES disable it**
-(`FuncInfo::value_escaped`): a join that DROPS the finfo set (collapse
-to dyn / conflict - recorded in the arena's `escaped_finfos` ledger,
-drained per round), an ARG-position value use (any call/builtin arg -
-`map(f, ...)`, `runtime(f)`), or a capture-list use - an untracked call
-site could reach the typed instance with a mismatched signature, so an
-escaped template keeps its boxed base (sound, as before). Non-uniform
+- **TWO of them, and they are different questions.**
+`callee_escaped(f)` (the analysis) asks *can this function be CALLED
+from a site I did not see?* - what the deleted `escaped_finfos` ledger
+was faking. `FuncInfo::value_escaped` asks something the analysis
+deliberately does not model: *is there a value use whose CONSUMERS I
+cannot enumerate* - an ARG-position use (`map(f, ...)`, `runtime(f)`)
+or a capture-list use. That second one matters because this pass
+REDIRECTS every value-use Identifier to the clone, so a use it cannot
+follow would hand the TYPED instance to a consumer free to call it with
+a mismatched signature. **Tracking a value further is not the same as
+being able to redirect it**, which is why keeping both gates is not
+belt-and-braces. Either one makes the template keep its boxed base
+(sound, as before). Non-uniform
 signatures across sites → no instantiation. **An UNINFORMATIVE signature
 is declined too** — a `dyn` param (the clone would be just as boxed) or a
 container carrying the BOTTOM `none` element type (`type_has_bottom_elem`:
@@ -3749,6 +3761,15 @@ neutered): `-rt` 1971/1972.
 **THE GENERAL SHAPE, worth carrying:** when a type carries METADATA that
 its equality deliberately ignores, every `if (equal) return one_of_them`
 in the system is a place that metadata dies.
+
+**⛔ AND THE REAL FIX WAS TO STOP PUTTING IT THERE.** The `join` union
+above is REVERTED (#116 increment 3): `finfos` is deleted, the shortcut
+is a plain `if (static_type_equal(a, b)) return a;` again, and an
+`StaticType` describes SHAPE and nothing else. Patching `join` to
+preserve identity was treating the symptom - the class of bug is
+open-ended, because "treat equal types as interchangeable" is what a
+type system is FOR. The identity question has its own answer now, keyed
+by PROGRAM LOCATION.
 
 **THE PRICE, STATED PLAINLY: this does NOT match the directly-bound
 capturing lambda.** That form refuses `f(1)` and `f("s")`; a
@@ -3929,16 +3950,21 @@ entry asserts the SET per constraint form AND a stated ⊤ per SINK, each
 watched failing against a sabotage build (see the entry's header for the
 six that fail and the one that is proven redundant instead).
 
-**Status: increments 1-2 done.** #115 is migrated
+**Status: increments 1-3 done.** #115 is migrated
 (`snapshot_indirect_callees` asks `callee_set`/`callee_escaped`, and
 closing the multi-site hole was the first thing the real answer bought
 - see gate (c) above); 0 of 126 corpus programs changed. Increments
-3-4 migrate `value_instantiate_round` (then DELETE
-`finfos`/`escaped_finfos`/`value_escaped` and REVERT the `join` union)
-and the resolver's three partial analyses (`callee_of`,
-`slot2fn`/`direct_func_slot`, `esc_callback_fn`). ⛔ Increment 4 is
-MEMORY-SAFETY-CRITICAL: #93/#94 make a false "safe" a use-after-free.
-Full plan: `plans/callee-set-analysis.md`.
+increment 3 migrated `value_instantiate_round` and DELETED
+`finfos`/`escaped_finfos`/`note_escaped_into`/`drain_escapes`,
+reverting the `join` union - `StaticType` describes shape and nothing
+else again, and `stamp_proven_params` (C3) gained `callee_escaped` to
+replace the half of `value_escaped` the ledger used to supply. 0 of 126
+corpus programs changed. Increment 4 migrates the resolver's three
+partial analyses (`callee_of`, `slot2fn`/`direct_func_slot`,
+`esc_callback_fn`) and is **MEMORY-SAFETY-CRITICAL**: #93/#94 make a
+false "safe" a use-after-free, so every `param_escape_analysis` row
+must be re-watched failing against the new source. Full plan:
+`plans/callee-set-analysis.md`.
 
 ## The value & type model (the subtle part)
 

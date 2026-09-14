@@ -383,7 +383,6 @@ private:
     bool value_instantiate_round(Block *root);  /* value-used templates (see
                                                  * plans/value-template-
                                                  * instantiation.md) */
-    void drain_escapes();       /* arena escape ledger -> value_escaped */
     FuncDeclStmt *make_template_clone(FuncInfo *tmpl, const std::string &key,
                                       Block *root);
     std::string template_sig_key(FuncInfo *tmpl,
@@ -1064,12 +1063,6 @@ bool Inferencer::instantiate_round(Block *rootBlock)
     return progress;
 }
 
-void Inferencer::drain_escapes()
-{
-    for (void *p : A.escaped_finfos)
-        static_cast<FuncInfo *>(p)->value_escaped = true;
-    A.escaped_finfos.clear();
-}
 
 /*
  * #115: which INDIRECT call sites have a callee this pass may name.
@@ -1276,20 +1269,44 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
     for (auto &cp : calls) {
         if (callee_funcinfo(cp.first->what.get()))
             continue;                       /* a direct call */
-        StaticTypeRef ct =
-            static_type_resolve(type_of(cp.first->what.get()));
-        if (!ct || ct->kind != StaticTypeKind::Func)
+        /*
+         * #116 increment 3: the CALLEE-SET analysis, not `finfos`.
+         * A ⊤ callee names nothing, and `callee_escaped` below is what
+         * turns that into a decline for the templates it could reach.
+         */
+        const CsSet cs = callee_set(cp.first->what.get());
+        if (cs.top)
             continue;
-        for (void *p : ct->finfos)
-            sites[static_cast<FuncInfo *>(p)].push_back(
-                { cp.first, cp.second });
+        for (FuncInfo *f : cs.funcs)
+            sites[f].push_back({ cp.first, cp.second });
     }
 
     bool progress = false;
 
     for (auto &kv : uses) {
         FuncInfo *tmpl = kv.first;
+        /*
+         * ⛔ `value_escaped` AND `callee_escaped` ARE DIFFERENT
+         * QUESTIONS, and this gate needs BOTH.
+         *
+         * `callee_escaped` (the analysis) asks: can this function be
+         * CALLED from a site I did not see? That is what replaces the
+         * old `escaped_finfos` ledger - the "unknown" a set with no ⊤
+         * could not express.
+         *
+         * `value_escaped` (set in the walk above) asks something this
+         * analysis deliberately does not model: is there a value use
+         * whose CONSUMERS I cannot enumerate - an ARG-position use or
+         * a CAPTURE-list use. That matters because this pass REDIRECTS
+         * every value-use Identifier to the clone, so a use it cannot
+         * follow would hand the TYPED instance to a consumer that may
+         * call it with a mismatched signature. Tracking the value
+         * further (which the analysis does - an argument flows into
+         * the parameter) is not the same as being able to redirect it.
+         */
         if (!tmpl->is_template || tmpl->value_escaped || !tmpl->decl)
+            continue;
+        if (callee_escaped(tmpl))
             continue;
         if (value_inst_done.count(tmpl))
             continue;
@@ -1500,14 +1517,22 @@ void Inferencer::infer_one(Block *rootBlock)
      */
     const auto instantiate_to_fixpoint = [&]() {
         for (int round = 0; round < 64; round++) {
-            drain_escapes();
+            /*
+             * ⛔ THE CALLEE SETS ARE RE-DERIVED PER ROUND, because
+             * `value_instantiate_round` CONSUMES them and runs here.
+             * It is not an optimization to hoist this out: each round
+             * REDIRECTS call sites to fresh clones, so the answer from
+             * the previous round describes a tree that no longer
+             * exists. Cheap - the domain is function values only, and
+             * the loop converges in 2-4 rounds on the corpus.
+             */
+            cs_run(rootBlock);
             const bool p1 = instantiate_round(rootBlock);
             const bool p2 = value_instantiate_round(rootBlock);
             if (!p1 && !p2)
                 break;
             run_fixpoint(rootBlock);
         }
-        drain_escapes();
     };
     instantiate_to_fixpoint();
 
@@ -1897,6 +1922,19 @@ void Inferencer::stamp_proven_params()
         FuncInfo *fi = s->func;
         if (fi->is_template || fi->value_escaped || !fi->decl
                 || !fi->decl->desc)
+            continue;
+        /*
+         * ⛔ AND THE ANALYSIS'S ESCAPE TOO (#116 increment 3). This
+         * gate used to lean on `value_escaped`, half of which came
+         * from `drain_escapes` - the ledger of finfo members a `join`
+         * DROPPED. With `finfos` deleted that half is gone, and
+         * `callee_escaped` is what replaces it: it says the function's
+         * value left the part of the program this pass can see, which
+         * is exactly the condition under which "never used as a value"
+         * is not a proof. Dropping it silently would weaken a C3 stamp
+         * every unboxed tier is built on.
+         */
+        if (callee_escaped(fi))
             continue;
         FuncDescriptor *d =
             const_cast<FuncDescriptor *>(fi->decl->desc);
@@ -3188,24 +3226,22 @@ StaticTypeRef Inferencer::func_static_type(FuncInfo *fi)
         ps.push_back(p->dyn_decl ? A.dyn_ty() : p->type);
         popt.push_back(p->opt_decl);
     }
-    StaticTypeRef t = A.func_of(ps, popt, fi->ret);
     /*
-     * #115: EVERY function value is tracked, not only a template's.
-     * `finfos` means "the FuncInfos whose values may flow through this
-     * type", which is true of any of them; the TEMPLATE restriction
-     * belonged to the CONSUMER, and that is where it already lives -
-     * `value_instantiate_round` skips a non-template
-     * (`!tmpl->is_template`) and its `uses` map is built from template
-     * identifiers only, so the extra members are inert there.
+     * ⛔ THIS TYPE CARRIES NO IDENTITY, AND THAT IS THE POINT (#116
+     * increment 3). It used to end with `t->finfos.push_back(fi)` - a
+     * set of candidate FuncInfos stapled to the SHAPE object - so that
+     * an indirect call could name its callee. Two distinct functions
+     * routinely have equal types, so every equality-based path in the
+     * lattice was a place that identity died: `join`'s
+     * `static_type_equal` shortcut dropped one side's candidates
+     * whenever two functions shared a signature, and no `escaped_finfos`
+     * ledger could report members that never ENTERED.
      *
-     * What they enable is the OTHER consumer, added with this comment:
-     * an INDIRECT call can now name its callee. `var add =
-     * make_adder(i); add(i);` used to leave the lambda's parameter
-     * `dyn` - the call names `add`, not the lambda, so nothing fed it -
-     * and a `dyn` parameter makes the whole closure body boxed.
+     * The identity question has its own answer now - the CALLEE-SET
+     * analysis (calleeset.cpp.h), keyed by PROGRAM LOCATION - so an
+     * StaticType is back to describing SHAPE and nothing else.
      */
-    t->finfos.push_back(fi);
-    return t;
+    return A.func_of(ps, popt, fi->ret);
 }
 
 /*
