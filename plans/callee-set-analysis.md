@@ -337,9 +337,24 @@ Not the solver - the sequencing.
    for increment 4, re-run or incrementally update it after the inliner,
    because a spliced body is new call sites.
 
-**Open**: whether one run serves both sides or increment 4 needs its own
-re-run. Decide with a measurement (does re-running change any answer on
-the corpus?), not by argument.
+**RESOLVED (2026-08-29): ONE RUN SERVES BOTH SIDES.** The question was
+whether increment 4 needs the analysis RE-RUN after the inliner, since
+a spliced body is new call sites whose stamp was never set. Answered by
+measurement, not argument: the escape analysis's residual poisons are
+**4 corpus-wide** (`noesc_p_callee`), and every one of them is
+INHERENT rather than a lost stamp -
+
+ - `12_higher_order`: the poisoned site is the BASE `apply`'s `f(x)`,
+   which the analysis reports as **⊥** - every call was redirected to
+   `apply$0`, so nothing reaches the base and there is no function to
+   name. The instance's own site IS named (`one sq$0`).
+ - `25_factory_closure_param`: the poisoned sites are the **`many`**
+   rows - genuinely two-candidate callees, which a single-callee stamp
+   cannot name by construction.
+
+So no stamp was lost to cloning on this corpus, and a re-run would
+change nothing. Revisit only if a `noesc_p_callee` appears at a site
+`-dcs` reports as `one`.
 
 **Increment 1 placed it at the end of `infer_one`, after
 `instantiate_to_fixpoint()`** - for #115's reason exactly: a call to a
@@ -358,7 +373,13 @@ must assign ⊤ unless proven otherwise:
    `esc_builtin_transparent` / `esc_builtin_no_invoke`, and re-derive
    the invoker list by the awk over `VmInvoker`/`eval_func` that
    CLAUDE.md quotes - remembering it MISSES map/filter/sort);
- - a capture list (a closure snapshots by value);
+ - ~~a capture list~~ - **NOT a sink, and it never was.** The
+   inferencer's scoping is lexical, so a body's reference to a captured
+   name resolves to the SAME `TypeSym` as the outer variable; reading
+   it is tracked, and being flow-INSENSITIVE the set is a superset of
+   what the by-value snapshot can hold. (Follow-up 2 separately lifted
+   the capture-list rule in `value_instantiate_round`, which was about
+   REDIRECTING such a use, not about the query.);
  - a struct field, a dict value, a container reached through `dyn`;
  - the REPL's open world (a global can be redefined between inputs);
  - a `.myv` image's pool values (a const array may hold a FuncObject -
