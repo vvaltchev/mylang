@@ -67,3 +67,29 @@ std::string disassemble_image(const VmProgram &prog);
  * piped, honoring NO_COLOR / --no-color), so a redirected dump stays plain.
  */
 std::string highlight_disasm(const std::string &plain);
+
+/*
+ * ⛔ THE JIT PROFILE MAP (`MYLANG_JIT_MAP=<path>`) - the instrument that
+ * answers "which EMITTED INSTRUCTION does the JIT spend its cycles on".
+ *
+ * Nothing in the repo could answer that. `-vdj` says what was emitted,
+ * `bench/run.py` says how long the whole program took, callgrind says
+ * how many instructions ran and which C++ FUNCTION they were in - but
+ * JIT code lives in an anonymous mapping with no symbols, so every
+ * emitted instruction lands in one nameless blob. The whole call-protocol
+ * arc was costed by COUNTING the emitted sequence by hand and hoping the
+ * hot path was the one being counted.
+ *
+ * This appends, per placed fragment, a header and one line per decoded
+ * instruction at its RUNTIME ADDRESS:
+ *
+ *     frag <abs-hex> <len> <chunk-name>#<frag-index>
+ *     i <abs-hex> <len> <mnemonic>
+ *
+ * `scripts/jitprofile.py` joins that against a callgrind
+ * `--dump-instr=yes` run, which records costs by absolute address, and
+ * prints per-instruction Ir. Written only when the env var is set (the
+ * decode is not free), and it FORCES `g_jit_annotate` on, because the
+ * per-fragment table it walks is built only under that flag.
+ */
+void jit_write_map(const Chunk &chunk, const std::string &name);

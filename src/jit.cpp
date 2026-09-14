@@ -30,6 +30,9 @@
 
 #include <queue>
 #include "jit.h"
+#include "disasm.h"
+#include "env.h"      /* env_get - MSVC deprecates getenv */
+#include <optional>
 #include "lowmem.h"
 #include "codegen.h"
 #include "bytecode.h"
@@ -210,6 +213,28 @@ unsigned long g_jit_frags = 0;
 bool g_jit_annotate = false;
 
 #if ML_JIT_SUPPORTED
+/*
+ * MYLANG_JIT_MAP forces `g_jit_annotate` on: the per-fragment table the
+ * map writer walks (`chunk.native.frags`) is built ONLY under that flag,
+ * so without this the map would be silently empty - the profiler's
+ * version of a vacuous test. Read once, like the arena's own env read.
+ *
+ * ⛔ INSIDE THE GUARD, and that is not a detail: every caller is, so
+ * off-platform this would be a defined-but-unused static and macOS
+ * clang fails the build on it (`-Werror,-Wunused-function`). That is
+ * the trap CLAUDE.md records verbatim under *EMITTER-ONLY CODE LIVES
+ * INSIDE `#if ML_JIT_SUPPORTED`* - `jit_lever_forced` broke three CI
+ * lanes the same way, none of them reproducible on Linux.
+ */
+static bool jit_map_wanted()
+{
+    static const bool on = [] {
+        const std::optional<std::string> v = env_get("MYLANG_JIT_MAP");
+        return v && !v->empty();
+    }();
+    return on;
+}
+
 static bool jit_default_enabled()
 {
     const char *e = getenv("MYLANG_JIT");
@@ -22467,11 +22492,22 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         chunk.native.frags.push_back(
             { 0, static_cast<uint32_t>(len), std::move(marks) });
     g_jit_frags++;
+    if (jit_map_wanted())
+        jit_write_map(chunk, "container");
     return true;
 }
 
 void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 {
+    if (jit_map_wanted())
+        g_jit_annotate = true;
+    /* captured HERE: the placement site below runs after
+     * `g_cur_caller_desc` is cleared, so reading it there labelled every
+     * chunk "main" - the profiler's own vacuous-output trap */
+    const std::string map_name =
+        (jc && jc->caller_desc && jc->caller_desc->name)
+            ? jc->caller_desc->name->val
+            : (jc && jc->caller_desc ? std::string("lambda") : "main");
     jit_native_stack_init();   /* M5a: arm the stack + raise the cap BEFORE
                                 * any guard bakes jit_sync_depth_cap() */
     /* G1 4-iii: recompute the DERIVED norec_ok on EVERY exit path (this
@@ -25250,6 +25286,8 @@ retry_emission:
      * sync caller fragment (jit_sync_push_* returns base + this). */
     if (!chunk.code.empty() && chunk.code[0].op == OpCode::EnterNative)
         chunk.sync_entry_off = static_cast<int64_t>(chunk.code[0].a_lit());
+    if (jit_map_wanted())
+        jit_write_map(chunk, map_name);
 }
 
 #else   /* !ML_JIT_SUPPORTED */

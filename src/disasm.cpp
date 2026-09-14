@@ -4,7 +4,8 @@
 #include "codegen.h"
 #include "vm.h"
 #include "eval.h"      /* builtin_slot / builtin_slot_name */
-#include "env.h"      /* env_get - MSVC deprecates getenv */
+#include "env.h"      /* env_get / file_open - MSVC deprecates
+                       * getenv and fopen (C4996) */
 #include "jit.h"       /* jit_type_singletons (-vdj); JitCtx (native calls) */
 #include "funcdesc.h"  /* FuncDescriptor::vm_chunk (faithful native-call dump) */
 #include "coderender.h"   /* render_construct_code - shared AST decompiler */
@@ -1119,6 +1120,60 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
 }
 
 }  // namespace
+
+/*
+ * THE JIT PROFILE MAP - see the contract in disasm.h. One header line
+ * per fragment plus one line per decoded instruction, at the RUNTIME
+ * address, appended to the file named by MYLANG_JIT_MAP.
+ *
+ * It reuses `decode_one`, the SAME decoder `-vdj` uses and that
+ * `scripts/disasmcheck.py` cross-checks against objdump - so a length
+ * this writes is a length objdump agrees with, which is what makes the
+ * address join sound. An undecodable byte would desynchronise the rest
+ * of the fragment, so the writer reports it in the header rather than
+ * emitting addresses it cannot stand behind.
+ */
+void jit_write_map(const Chunk &chunk, const std::string &name)
+{
+    const std::optional<std::string> path = env_get("MYLANG_JIT_MAP");
+    if (!path || path->empty() || !chunk.native.base)
+        return;
+    FILE *f = file_open(path->c_str(), "a");
+    if (!f)
+        return;
+    const uint8_t *base = static_cast<const uint8_t *>(chunk.native.base);
+    const SlotNamer nm = [](int i) {
+        return "s" + std::to_string(i);
+    };
+    for (size_t r = 0; r < chunk.native.frags.size(); r++) {
+        const NativeCode::Frag &fr = chunk.native.frags[r];
+        const uint8_t *code = base + fr.start;
+        uint32_t p = 0, undecoded = 0;
+        std::string body;
+        while (p < fr.len) {
+            const uint32_t st = p;
+            std::string mn, cmt;
+            /* a REAL namer: decode_one CALLS it for every slot operand,
+             * and an empty std::function throws bad_function_call (which
+             * a `noexcept`-free path turns into terminate - watched). */
+            decode_one(code, fr.len, p, mn, cmt, nm, nullptr,
+                       nullptr, nullptr);
+            if (mn.compare(0, 6, ".byte ") == 0)
+                undecoded++;
+            char buf[64];
+            snprintf(buf, sizeof(buf), "i %p %u ",
+                     static_cast<const void *>(code + st), p - st);
+            body += buf;
+            body += mn;
+            body += "\n";
+        }
+        fprintf(f, "frag %p %u %s#%zu undecoded=%u\n",
+                static_cast<const void *>(code), fr.len, name.c_str(), r,
+                undecoded);
+        fputs(body.c_str(), f);
+    }
+    fclose(f);
+}
 
 std::string disassemble(const Chunk &chunk, const std::string &title,
                         const std::vector<std::string> &cap_names,
