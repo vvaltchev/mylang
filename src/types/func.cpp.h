@@ -98,7 +98,18 @@ FuncObject::FuncObject(const FuncObject &rhs)
     , capture_slots(rhs.capture_slots)
     , capture_root(rhs.capture_root)
 {
+#ifdef TESTS
+    g_live_funcobjs++;
+#endif
 }
+
+#ifdef TESTS
+/* see the note at the declaration: a leaked POOLED object is invisible
+ * to LeakSanitizer, so the live count is the only net that sees a
+ * missing release. */
+unsigned long g_live_funcobjs = 0;
+FuncObject::~FuncObject() { g_live_funcobjs--; }
+#endif
 
 FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
     : func(func)
@@ -114,6 +125,9 @@ FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
      */
     , capture_root(ctx ? get_root_ctx(ctx) : nullptr)
 {
+#ifdef TESTS
+    g_live_funcobjs++;
+#endif
     if (func->captures.empty())
         return;
 

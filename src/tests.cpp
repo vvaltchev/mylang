@@ -32488,6 +32488,106 @@ static bool jit_memberv_native()
 #endif
 }
 
+/*
+ * #97 step 3: THE INLINE CLOSURE STORE RELEASES WHAT IT OVERWRITES.
+ *
+ * ⛔ WHY A COUNT AND NOT JUST LeakSanitizer. FuncObject carries
+ * ML_POOL_NEW_DELETE, so a leaked closure is memory the POOL already
+ * owns: a small leak fits inside a chunk LSan sees as reachable and is
+ * reported NOWHERE. Watched - deleting the release arm and running one
+ * 300-closure program is silent under ASan+LSan; only at SUITE volume
+ * (1349 allocations) does LSan finally report it, at exit, as a byte
+ * count with no hint which tier is at fault. The live count fails
+ * immediately, at any volume, and names the tier.
+ *
+ * The opposite direction - releasing one too many - is an ASan
+ * use-after-free and is covered (watched: dropping the ownership
+ * transfer in jit_make_closure_ptr fails immediately).
+ *
+ * The same blind spot applies to every ML_POOL_NEW_DELETE type, which
+ * is the reason this note is here rather than in a commit message.
+ */
+static bool jit_closure_store_releases()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long live0 = g_live_funcobjs;
+    const unsigned long cf0 = g_jit_closure_fast;
+    /* 300 closures built into ONE slot: 299 of them must be released
+     * by the emitted store as it overwrites, and the last by the
+     * frame teardown.
+     *
+     * ⛔ TWO SHAPE-EATERS ATE THIS TEST BEFORE IT CAUGHT ANYTHING, and
+     * both are the vacuous-test trap in its purest form - the sabotage
+     * ran GREEN twice:
+     *   1. at the TOP LEVEL, `f` is a GLOBAL, so MakeClosureV targets
+     *      a temp and a StoreGlobalV moves the value out: the global
+     *      store owns the lifetime and this tier frees nothing;
+     *   2. `f = mk(i)` is a CALL - the closure is built inside `mk`,
+     *      into ITS temp, and RETURNED, so again the dst is not `f`.
+     * What targets a live slot is a closure LITERAL assigned to a
+     * ref-listed LOCAL inside a function: `-vd` shows
+     * `make.closure f = closure_defs[0]` rather than a temp. Check the
+     * op, not the source shape. */
+    if (!run({ "func spin(int n) {",
+               "  var dyn f = [1, 2];",   /* a reference to release */
+               "  var s = 0;",
+               "  for (var i = 0; i < n; i++) {",
+               "    f = func [i] () => i;",
+               "    s += 1;",
+               "  }",
+               "  return s;",
+               "}",
+               "assert(spin(300) == 300);" }))
+        return false;
+    if (g_jit_closure_fast <= cf0) {
+        fprintf(stderr, "jit_closure_store: the INLINE store DID NOT RUN\n");
+        return false;
+    }
+    /* every closure the program built must be gone. A few objects may
+     * legitimately outlive it (the retained programs vm_execute keeps
+     * for backtrace rendering), so the bar is the BASELINE, not zero -
+     * and a missing release would leave 299 behind, not a handful. */
+    if (g_live_funcobjs > live0 + 8) {
+        fprintf(stderr, "jit_closure_store: %lu FuncObjects LEAKED "
+                        "(the emitted store did not release what it "
+                        "overwrote; the type is POOL-allocated, so LSan "
+                        "sees this only at suite volume, at exit, as a "
+                        "byte count)\n",
+                g_live_funcobjs - live0);
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool jit_len_ord()
 {
 #if ML_JIT_SUPPORTED
@@ -36916,6 +37016,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 the inline struct-FIELD store tier (POD byte + boxed "
       "reference forms), DECLINES const/readonly/coercion/ex/slice",
       jit_memberv_native },
+    { "jit: #97 the inline closure store RELEASES what it overwrites "
+      "(a leaked POOLED object is invisible to LeakSanitizer)",
+      jit_closure_store_releases },
     { "jit: capped sync calls SWITCH interpreted-flat (#56 step 3)",
       jit_call_switch_protocol },
     { "jit: native throw (same-frame / cross-frame / non-struct) (#56)",
