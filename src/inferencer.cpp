@@ -2913,8 +2913,22 @@ StaticTypeRef Inferencer::func_static_type(FuncInfo *fi)
         popt.push_back(p->opt_decl);
     }
     StaticTypeRef t = A.func_of(ps, popt, fi->ret);
-    if (fi->is_template)
-        t->finfos.push_back(fi);   /* value-template tracking (see the plan) */
+    /*
+     * #115: EVERY function value is tracked, not only a template's.
+     * `finfos` means "the FuncInfos whose values may flow through this
+     * type", which is true of any of them; the TEMPLATE restriction
+     * belonged to the CONSUMER, and that is where it already lives -
+     * `value_instantiate_round` skips a non-template
+     * (`!tmpl->is_template`) and its `uses` map is built from template
+     * identifiers only, so the extra members are inert there.
+     *
+     * What they enable is the OTHER consumer, added with this comment:
+     * an INDIRECT call can now name its callee. `var add =
+     * make_adder(i); add(i);` used to leave the lambda's parameter
+     * `dyn` - the call names `add`, not the lambda, so nothing fed it -
+     * and a `dyn` parameter makes the whole closure body boxed.
+     */
+    t->finfos.push_back(fi);
     return t;
 }
 
@@ -3907,6 +3921,52 @@ void Inferencer::accumulate_call(CallExpr *call)
             contribute_arg(fi->params[i], type_of(args->elems[i].get()),
                            args->elems[i]->start);
         return;
+    }
+
+    /*
+     * #115: an INDIRECT call whose callee TYPE names exactly one
+     * function - the factory-returned closure:
+     *
+     *     func make_adder(n) {
+     *         var base = n * 10;
+     *         return func [base] (x) { return base + x; };
+     *     }
+     *     var add = make_adder(i);
+     *     add(i);                    // always an int
+     *
+     * `callee_funcinfo` cannot resolve this (the callee is a var, not a
+     * named function or an inline lambda), so `x` finalized to `dyn`
+     * and the closure ran fully boxed - a three-load ctx chain, a
+     * 32-byte capture read and two runtime type checks per call. The
+     * finfo set carried the answer the whole way: the lambda's type
+     * flows into make_adder's `ret`, out of the call, and into `add`'s
+     * symbol, `join` unioning the sets as it goes.
+     *
+     * ⛔ EXACTLY ONE CANDIDATE, and the restriction is about PRECISION,
+     * not soundness. Contributing to every member of a larger set is
+     * sound - the value may be any of them, so each may receive these
+     * arguments - but it WIDENS params that a different call site will
+     * then have to live with, and a param widened to dyn costs every
+     * unboxed tier built on it. One candidate is exact.
+     *
+     * A TEMPLATE is excluded here for the same reason the direct branch
+     * excludes it: its calls are handled by instantiation, which
+     * redirects them to a typed clone.
+     */
+    {
+        StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
+        if (ct && ct->kind == StaticTypeKind::Func
+                && ct->finfos.size() == 1) {
+            FuncInfo *ifi = static_cast<FuncInfo *>(ct->finfos[0]);
+            if (ifi && !ifi->is_template) {
+                size_t n = std::min(ifi->params.size(), args->elems.size());
+                for (size_t i = 0; i < n; i++)
+                    contribute_arg(ifi->params[i],
+                                   type_of(args->elems[i].get()),
+                                   args->elems[i]->start);
+                return;
+            }
+        }
     }
 
     auto *cid = dynamic_cast<Identifier *>(call->what.get());

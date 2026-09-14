@@ -1528,6 +1528,34 @@ function declared at the **outermost (program) scope** is visible everywhere
 
 A `var`-bound lambda (`var f = func(x) => x;`) follows ordinary variable scope.
 
+##### How a lambda's un-annotated parameters get their types
+
+A lambda with un-annotated parameters is typed from the places it is
+**called**, and there are two regimes:
+
+* a **non-capturing** lambda bound to a write-once variable that is only
+  ever called is a *template*, so it is monomorphized per call signature -
+  `f(1)` and `f("hi")` simply produce two typed instances;
+* a **capturing** lambda is not, so all of its call sites *join* into one
+  parameter type. Two numeric argument types widen (`int` and `float` give
+  `float`, and the `int` argument is then coerced); two irreconcilable ones
+  are a compile error.
+
+```C#
+func make_adder(n) {
+  var base = n * 10;
+  return func [base] (x) { return base + x; };   # `x` is int below
+}
+
+var add = make_adder(3);
+print(add(4));            # 34 - `x` is typed `int` from this call site
+```
+
+The second rule applies **however the closure reaches you** - written
+inline, returned from a factory, or read back out of an array - so a
+closure does not change its typing by being returned rather than written
+in place.
+
 #### Const parameters
 
 A parameter can be declared `const`, which forbids reassigning it in the body:
