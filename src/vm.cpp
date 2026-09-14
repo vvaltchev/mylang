@@ -1228,7 +1228,8 @@ static bool g_vm_executing = false;
  */
 static std::unordered_map<const FuncDescriptor *, Chunk> g_func_chunks;
 
-static void vm_precompile_all(const Block *root, bool jit = true);
+static void vm_precompile_all(const Block *root, bool jit = true,
+                              Chunk *main_chunk = nullptr);
 
 /*
  * Execute the optimized program via the bytecode VM. It builds the program's
@@ -2231,7 +2232,16 @@ void vm_jit_loaded_image(VmProgram &prog)
         jc.caller_desc = desc;
         jit_compile_chunk(ck, &jc);
     });
-    jit_compile_chunk(prog.root);
+    /* main gets the map too (a null caller_desc, as the fresh-compile
+     * path does): without it a LOADED image's main would emit different
+     * native code from a fresh compile's - the two must agree, which is
+     * the whole point of re-running the tier here. */
+    {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &prog.global_slot_reassigned;
+        jit_compile_chunk(prog.root, &jc);
+    }
 }
 
 /* Declared in vm.h - see the contract there. */
@@ -2279,12 +2289,11 @@ vm_compile(const Construct *root_c, bool jit)
      * maintainer's no-lazy rule + a `.myv`-serialization prerequisite. After
      * this, do_func_call reads a precomputed vm_chunk and never compiles.
      * Pass A codegens all bodies (flags set), Pass B jits them. */
-    vm_precompile_all(root, jit);
-
-    /* Now jit main - every function's native_leaf flag is set (Pass A), so
-     * main's top-level native calls can see them (#55 STEP 2). */
-    if (jit)
-        jit_compile_chunk(prog.root);
+    /* Pass B jits every body and then MAIN, last - main needs the same
+     * global slot -> descriptor map to bake its callees (#97 step 4), and
+     * it must come after every body so their `native_leaf` flags and
+     * fragments exist (#55 STEP 2). */
+    vm_precompile_all(root, jit, jit ? &prog.root : nullptr);
 
     /* Root-context data the run needs, copied OUT of the root Block. */
     prog.root_slot_count = root->slot_count;
@@ -2484,7 +2493,7 @@ vm_func_chunk(const FuncDescriptor *fdesc, bool jit)
  * (g_vm_executing true, the AST final), so vm_func_chunk's guard is satisfied.
  */
 static void
-vm_precompile_all(const Block *root, bool jit)
+vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
 {
     std::vector<const FuncDeclStmt *> funcs;
     for (const auto &e : root->elems)
@@ -2549,6 +2558,23 @@ vm_precompile_all(const Block *root, bool jit)
         jc.caller_desc = kv.first;
         jit_compile_chunk(kv.second, &jc);
     }
+    /*
+     * ...AND MAIN, LAST, WITH THE SAME MAP (#97 step 4). It used to be
+     * jitted by the caller with NO JitCtx at all, on the #55 reasoning
+     * that main has no stable descriptor and so cannot make a native
+     * DIRECT call. True, and `callv_native_ok` still declines on
+     * `!jc->caller_desc` - but the map itself is what lets the inline
+     * push BAKE its callee, and main is where most call loops live
+     * (every headline bench's outer loop). Handing main a context with
+     * a null caller_desc gives it the bake and changes nothing else.
+     */
+    if (main_chunk)
+        {
+            JitCtx jc;
+            jc.slot_desc = &slot_desc;
+            jc.slot_reassigned = &root->global_slot_reassigned;
+            jit_compile_chunk(*main_chunk, &jc);
+        }
 }
 
 /* The in-flight exception's type NAME for catch-matching (a user struct
@@ -3331,6 +3357,10 @@ unsigned long g_arg_borrow_scalar = 0;
 /* THE IN-PLACE ARGUMENT (#162): bumped by the EMITTED copy loop, once per
  * fused argument bound from its caller slot. */
 unsigned long g_jit_arg_inplace = 0;
+
+/* #97 step 4: an EMIT-time count (see jit.h) - the scalar argument binds
+ * that dropped their source-type test because the slot is not ref-listed. */
+unsigned long g_jit_arg_scalar = 0;
 
 /*
  * The fused site's COLD arm: replay the staging MoveVs the emit skipped.

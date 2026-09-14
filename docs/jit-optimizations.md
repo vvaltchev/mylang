@@ -9637,3 +9637,152 @@ NETS: -rt 1962/1962 (dbg ASan+UBSan and RECYCLE=1); corpus_diff plain /
 disagreements; tests/functional/22_closure_store.my for the ownership
 shapes (overwrite, last-ref, shared, trivial-to-reference,
 reference-to-reference, independence, array/field destinations).
+
+## #97 step 4 - THE BAKED CALLEE: the emitter NAMES the callee
+## at compile time (2026-08-27)
+
+**THE PROBLEM.** The inline call push spends ~14 instructions and ~9
+loads re-establishing, on every call, five facts that never change: the
+callee's arity, its `fast_bind` flag, that its chunk exists and starts
+native, that its frame carries no per-frame side state, and how big its
+window is. The monomorphic callee CACHE (G1) already noticed this - a
+hit re-establishes all five with one pointer compare - but a cache is
+still a runtime data structure: a baked address, a load, a compare, and
+then the derived values loaded back out of the descriptor and the chunk.
+
+**THE OBSERVATION.** For a call to a WRITE-ONCE global slot the emitter
+does not need a cache at all: `JitCtx::slot_desc` maps the slot to the
+`FuncDescriptor` declared there and `slot_reassigned` says no assignment
+targets it. That is the SAME gate `callv_native_ok` (#55) has used since
+2026, applied one layer down - to the PUSH rather than to the call.
+`jit_baked_callee()` is that gate; everything the five checks ask
+becomes a compile-time constant, and one identity compare is what
+survives to run time.
+
+**WHAT IS BAKED**, and what each replaced:
+
+    the five descriptor gates      13 instructions   -> 0
+    the callee-cache probe          4 (movabs/cmp/je/cck load) -> 3
+    the window size                 4 (2 sign-extended loads + add)
+                                                     -> 1 (an imm32)
+    the record-less FORK            2 (a byte load + a branch) -> 0
+    a proven-scalar ARGUMENT's
+      reference test                4 per argument   -> 0
+
+    09_fib_recursive     152.95M -> 147.95M per scale unit  (-3.27%)
+    63_closures                                             (-2.61%)
+    11_closure_counter                                      (-2.94%)
+    76_funcval_dispatch                                     (-1.45%)
+
+63 and 11 call CLOSURES, whose callee is a runtime value - they get
+none of the bake and their numbers come from step 4's arena work below.
+
+**THE SCALAR ARGUMENT BIND, and why `ref_slots` could not answer it.**
+The per-argument copy loads the source's `Type *`, dereferences its `t`
+field and branches to a reference arm - four instructions to decide
+something codegen already knows. The obvious source of truth is the
+CALLER's `ref_slots`, and it is useless here: an argument temp is
+written by a staging `MoveV`, `op_writes_scalar` does not list MoveV, so
+`compute_ref_slots` marks EVERY argument temp as reference-carrying.
+(Measured: the elision fired 0 times corpus-wide on that predicate.)
+The answer is the CALLEE's `ParamDesc::binds_scalar()` - the same
+predicate codegen uses to leave a parameter OUT of the callee's
+`ref_slots`, so the bind and the release scan cannot disagree.
+
+**⛔ TWO OF THE CALLEE'S PROPERTIES ARE WRITTEN BY ITS OWN JIT PASS.**
+`sync_entry_off` and `norec_ok` are both set at the END of
+`jit_compile_chunk` for the callee's chunk, so a SELF-RECURSIVE call -
+fib -> fib, the flagship shape - reads them UNSET. The first version
+gated the whole bake on `sync_entry_off >= 0` and 09_fib_recursive's
+reach was **4 of 555,823 calls**; `norec_ok` unset reads as FALSE, which
+would have silently disabled the record-less tier at exactly that site.
+The audit-table stage trap in its "a value computed later" shape.
+
+**⛔ AND "READ IT IF IT HAPPENS TO BE SET" IS WORSE THAN NOT READING
+IT**, because it makes the EMITTED CODE DEPEND ON COMPILATION ORDER -
+and Pass B walks a POINTER-keyed map, whose order is not stable across
+runs. `-vdj` reproducibility (two runs, two separately-linked binaries,
+byte-identical text) is what `scripts/vdjcmp.sh` IS. So the elision is
+allowed for exactly one caller, on a structural argument: **MAIN is
+compiled LAST**, after every function body (`vm_precompile_all`'s Pass B
+and `vm_jit_loaded_image`), so every callee it can name is already
+placed. Every other caller keeps the two runtime tests. `bake_final` is
+that distinction; a null `g_cur_caller_desc` IS main.
+
+**MAIN NEEDED A `JitCtx` AT ALL, WHICH IT DID NOT HAVE.** #55 gave main
+none, on the correct reasoning that main has no stable descriptor and so
+cannot make a native DIRECT call (`callv_native_ok` still declines on
+`!jc->caller_desc`). But the MAP is what the bake needs, and main is
+where the corpus's call loops live - every headline bench's outer loop.
+Main's jit moved inside `vm_precompile_all`, after Pass B, with the same
+map and a null `caller_desc`; `vm_jit_loaded_image` does the same, so a
+loaded image's main emits what a fresh compile's does.
+
+**⛔ THE WRITE-ONCE GATE IS A PROFITABILITY GATE, NOT A SOUNDNESS ONE -
+AND THAT IS WHY THE FORCE LEVER EXISTS.** Soundness comes from the
+emitted identity compare: a reassigned slot holding a different function
+fails it and declines. So removing the WRITE-ONCE gate cannot produce a
+wrong answer - it produces a site that can never pass its compare, i.e.
+every call to the C++ tier with the two-entry cache never consulted
+(watched: the test's second case reports `callee_cache` 0).
+
+And removing the COMPARE, under our own compilation, changes nothing any
+net can see: a write-once slot can hold only its own declaration's
+FuncObject or `none`, and `none` fails the type test. Watched with the
+compare deleted: **-rt 1963/1963 and corpus_diff 31/31, both green.** It
+is still the guard an untrusted `.myv` image needs, whose slot ->
+descriptor map is resolved BY NAME out of the file.
+**`MYLANG_JIT_FORCE=bakecallee` lifts the profitability gate and leaves
+the soundness one** - exactly what the FORCE half of a lever pair is
+for - which makes the compare reachable by a test. With two callees of
+different frame sizes, deleting the compare then aborts in `Frame::at`
+(rc 134, watched).
+
+**SABOTAGE LEDGER** (each reintroduced, built, and watched failing):
+
+    the write-once gate      -> -rt names it ("the declined site did not
+                                reach the cache tier either (0)")
+    the identity compare     -> abort in Frame::at under FORCE (rc 134)
+    the baked window size +1 -> abort in Frame::at (rc 134)
+    every argument claimed
+      scalar                 -> -rt fails AND corpus_diff fails
+
+NETS: -rt 1963/1963; corpus_diff plain / --levers / --xrot / --cold /
+--nolowmem; disasmcheck vs objdump zero disagreements;
+`tests/functional/23_baked_callee.my` (main and nested callers,
+self-recursion, a reassigned slot, a reference argument, a mixed
+signature, a decl re-bound per loop iteration, floats, and a throwing
+callee unwinding through the record-less arm).
+
+## #97 step 4a - THE ARENA RESIDUALS: three encodings the low
+## arena had already paid for
+
+Step 1 moved the JIT's globals into the low-address arena so they could
+be named by an `imm32`. Three sites on the call path never collected:
+
+ - **the callee TYPE test** was `movabs rax, t_func` + a compare. The
+   Type singletons ARE arena-allocated (`ml_lowmem_new<TypeFunc>()`), so
+   `cmp qword [slot+24], <t_func>` is ONE instruction. The missing piece
+   was an ENCODER: the tag seam had a register-compare
+   (`cmp_reg_tag`) and a store (`store_type_tag`) but no MEMORY compare,
+   so nine call sites open-coded the pair. `Emitter::cmp_mem_tag` is the
+   third member, and like its siblings it takes the tag as an ARGUMENT -
+   the rule that exists because a wrapper naming its operand in the
+   METHOD is invisible to an audit that greps for the operand;
+ - **the residue relay** pushed and popped `g_jit_residue_caps` through
+   a `movabs`-materialised address, twice per call.
+   `Emitter::push_abs32` (`FF /6` through the no-base SIB form) and the
+   existing `store_abs32` make each one instruction;
+ - **nine `movabs X, &global; mov Y, [X]` pairs** - five of them on the
+   RETURN path, which every call pays - became `load_global`, the seam
+   that already picks the one-instruction form.
+
+Measured **-3 instructions per call**, exactly as predicted, on all four
+call benches (63_closures / 11_closure_counter / 76_funcval_dispatch
+each moved by precisely 3 Ir x their call count).
+
+**The generalisation worth keeping: an infrastructure change pays only
+where a SEAM exists to collect it.** The arena was in place for ten
+days; these three sites kept their two-instruction forms because no
+encoder offered the one-instruction one, and nothing in the tree could
+notice.

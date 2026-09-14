@@ -768,6 +768,17 @@ extern unsigned long g_jit_arg_inplace;
 /* ...and for the COLD arm that replays them - the path where a mistake is
  * a use-after-free rather than a wrong number, so it gets its own proof. */
 extern unsigned long g_jit_arg_stage;
+/*
+ * ⛔ AN EMIT-TIME COUNTER, DELIBERATELY - and the distinction matters.
+ * Every other counter here is bumped by EMITTED code, because the thing
+ * being proved is "this tier RAN". What #97 step 4 does to a scalar
+ * argument bind is an ELISION: the source-type test and the reference
+ * arm are simply not emitted, so there is no instruction left to bump
+ * anything, and an emitted-code counter would be structurally incapable
+ * of seeing it. This counts the binds the elision CLAIMED, so a test can
+ * assert it fires on a scalar argument and does NOT on a ref-listed one.
+ */
+extern unsigned long g_jit_arg_scalar;
 
 /*
  * model-flip (nativize-ops): SubscriptV natively - `dst = base[idx]` via the
@@ -1358,6 +1369,15 @@ extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
 /* G1: HITS of the emitted monomorphic callee cache - the same callee as last
  * time at this site, so the five callee-property guards are skipped. Bumped
  * by EMITTED code on the hit arm only (a miss falls into the full chain). */
+/*
+ * #97 step 4: the BAKED-CALLEE arm, bumped by EMITTED code once per call
+ * that passed the identity compare. An emitted-code counter is the right
+ * proof here (unlike g_jit_arg_scalar's emit-time one): the baked arm IS
+ * an instruction sequence, and what it replaced - the cache probe and the
+ * five gates - would otherwise be indistinguishable from it in any
+ * value-level test.
+ */
+extern "C" unsigned long g_jit_bake_push;
 extern "C" unsigned long g_jit_callee_cache;
 extern "C" unsigned long g_jit_callee_cache2;
 /* G1: inline pushes made to a callee with an int/float-declared param - the

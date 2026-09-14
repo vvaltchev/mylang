@@ -150,6 +150,7 @@ unsigned long g_jit_hoist = 0;         /* C1: hoisted-nav loop ENTRIES */
 unsigned long g_jit_cold_copy = 0;     /* C1: region COLD-COPY entries (a
                                         * failed guard took the copy) */
 unsigned long g_jit_sync_inline = 0;   /* fragment-inline sync calls run */
+unsigned long g_jit_bake_push = 0;     /* #97 step 4: BAKED arm runs */
 unsigned long g_jit_callee_cache = 0;  /* G1: callee-cache HITS (emitted) */
 unsigned long g_jit_callee_cache2 = 0; /* G1: hits on the SECOND entry */
 unsigned long g_jit_bind_coerce = 0;   /* G1: inline pushes to a callee
@@ -302,13 +303,13 @@ enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
-    JL_RSHARE, JL_PEEP, JL_COUNT
+    JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
-    "peep"
+    "peep", "bakecallee"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -4247,6 +4248,71 @@ struct Emitter {
         if (sp)
             pop_reg(sc);
     }
+    /*
+     * THE THIRD MEMBER OF THE TAG SEAM: compare a tag against a value
+     * IN MEMORY - `cmp qword [base+disp], <tag>` - which is what a
+     * slot's type field is at every call site (`is this callee a
+     * function?`, `is this argument a reference?`). Like its two
+     * siblings the tag is an ARGUMENT, never a register named in the
+     * method, and like them it is ONE instruction on the arena and the
+     * movabs pair off it.
+     *
+     * It was missing, and the cost was invisible for the usual reason:
+     * `movabs rax, t_func; cmp [rcx+d], rax` reads as ordinary code,
+     * not as a missed encoding - and it sits on the hottest path in the
+     * interpreter, the inline call push, once per call. `scratch` is
+     * clobbered ONLY off-arena.
+     */
+    void cmp_mem_tag(uint8_t base, int32_t disp, const void *tag,
+                     uint8_t sc)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "cmp_mem_tag: rsp/r12 need a SIB byte");
+        if (ml_lowmem_fits_imm32(tag)) {
+            u8(static_cast<uint8_t>(0x48 | (base >= 8 ? 1 : 0)));
+            u8(0x81);                     /* 81 /7 id: cmp qword, imm32 */
+            u8(static_cast<uint8_t>(0x80 | (7 << 3) | (base & 7)));
+            u32(static_cast<uint32_t>(disp));
+            u32(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(tag)));
+            return;
+        }
+        /* the clobber is declared where it happens (cmp_reg_tag_via's
+         * rule), and `pop` preserves the flags the caller's jcc reads */
+        const bool sp = reg_is_occupied(sc);
+        if (sp)
+            push_reg(sc);
+        else
+            scratch(sc);
+        movabs(sc, static_cast<uint64_t>(
+                       reinterpret_cast<uintptr_t>(tag)));
+        u8(static_cast<uint8_t>(0x48 | (sc >= 8 ? 4 : 0)
+                                | (base >= 8 ? 1 : 0)));
+        u8(0x39);                         /* cmp [base+disp], sc */
+        u8(static_cast<uint8_t>(0x80 | ((sc & 7) << 3) | (base & 7)));
+        u32(static_cast<uint32_t>(disp));
+        if (sp)
+            pop_reg(sc);
+    }
+    /*
+     * push qword [abs32] - `FF /6` through the no-base SIB form, so a
+     * global is pushed with no register and no movabs. Returns false
+     * off-arena, where the caller keeps its two-instruction form.
+     */
+    bool push_abs32(const void *addr)
+    {
+        if (!ml_lowmem_fits_imm32(addr))
+            return false;
+        /* NO REX: `FF /6` is 64-bit by default in long mode, so a REX.W
+         * here would be a redundant prefix objdump and our own decoder
+         * would both have to special-case. mod=00 rm=100 + SIB 0x25 is
+         * the no-base disp32 form (mem_abs32's encoding, spelled out
+         * because that helper always picks a REX by operand size). */
+        u8(0xFF);
+        u8(0x34);                         /* mod=00, /6, rm=100 (SIB) */
+        u8(0x25);                         /* SIB: no base, no index */
+        u32(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(addr)));
+        return true;
+    }
     /* ---- N4 array element access ---- */
     /* cmp byte [rbx+disp], imm8  (the slice flag) */
     void cmp_byte_slot(int32_t d, uint8_t imm)
@@ -6894,6 +6960,92 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
  * Clobbers rax (rcx now goes through RefScratch - granted or borrowed,
  * never silently clobbered) - emit only where rax is dead.
  */
+/* The descriptor keying the chunk being compiled - null for MAIN
+ * (step 3b; #97 step 4's bake_final also reads it). */
+static const FuncDescriptor *g_cur_caller_desc = nullptr;
+
+/*
+ * The program context this chunk is being compiled in - the global
+ * slot -> descriptor map plus the write-once flags. `callv_native_ok`
+ * (#55) has always taken it as an argument; the inline PUSH is emitted
+ * far from that call, so it reads it from here.
+ */
+static const JitCtx *g_cur_jc = nullptr;
+
+/*
+ * ⛔ THE CALLEE A CALL SITE PROVABLY REACHES, decided at JIT TIME - the
+ * #97 step 4 gate, and a COMPILE-TIME decision, never a runtime bail
+ * (approach A: the fallback is chosen when the code is emitted).
+ *
+ * A global-slot call whose slot is WRITE-ONCE (no assignment anywhere
+ * targets it - `slot_reassigned`) can only ever hold the FuncObject its
+ * declaration bound there, and that object's DESCRIPTOR is a
+ * program-lifetime object created at parse time. So `params`,
+ * `frame_size`, `fast_bind`, `noescape_params` and the whole compiled
+ * `Chunk` behind `vm_chunk` are CONSTANTS the emitter can bake, where
+ * the monomorphic callee cache re-establishes them from memory on every
+ * call.
+ *
+ * ⛔ THE DESCRIPTOR IS STILL VERIFIED AT RUNTIME. Baking does not skip
+ * the identity check, it CHANGES it: the emitted guard compares the
+ * live callee's descriptor against the baked one instead of against a
+ * cache cell. Two shapes make that necessary rather than paranoid - a
+ * global slot is `none` until its decl has run, and a func/struct decl
+ * inside a LOOP BODY re-binds its slot per iteration (#134). The first
+ * fails the type test, the second keeps the same descriptor; neither
+ * can reach the baked body wrongly.
+ *
+ * ⛔ AND IT IS THE DESCRIPTOR, NEVER THE FuncObject. A FuncObject is
+ * refcounted, so a later closure allocated at a freed one's address
+ * would answer a cached-pointer test for a different function - the
+ * stale-pointer identity bug CLAUDE.md warns about, and the reason the
+ * callee CACHE stores descriptors too.
+ */
+static const FuncDescriptor *jit_baked_callee(int callee_arg, bool is_value)
+{
+    if (is_value)                    /* the callee is a runtime VALUE */
+        return nullptr;
+    if (jit_lever_off(JL_BAKECALLEE))
+        return nullptr;
+    const JitCtx *jc = g_cur_jc;
+    if (!jc || !jc->slot_desc || !jc->slot_reassigned)
+        return nullptr;              /* no program context (disasm, -rt) */
+    if (callee_arg < 0
+            || static_cast<size_t>(callee_arg) >= jc->slot_desc->size()
+            || static_cast<size_t>(callee_arg) >= jc->slot_reassigned->size())
+        return nullptr;
+    /*
+     * ⛔ WRITE-ONCE IS A PROFITABILITY GATE, AND THE FORCE LEVER IS WHAT
+     * PROVES THE SOUNDNESS ONE SEPARATELY. A reassigned slot may hold a
+     * DIFFERENT function than the one declared there, so baking it would
+     * fail the identity compare on every call and send the whole site to
+     * the C++ tier - strictly worse than the two-entry cache, which can
+     * hit both callees. That is a COST argument, not a correctness one.
+     *
+     * `MYLANG_JIT_FORCE=bakecallee` lifts exactly this gate and nothing
+     * else, which is what the FORCE half of the lever pair is for: it
+     * makes the emitted identity compare LOAD-BEARING, so a test can
+     * watch the compare's removal fail. Without it that compare is
+     * redundant under our own compilation (a write-once slot can only
+     * ever hold its own declaration's FuncObject or `none`) and NO test
+     * could reach it - it would still be the guard an untrusted `.myv`
+     * image needs, with nothing to prove it works.
+     */
+    if ((*jc->slot_reassigned)[callee_arg]
+            && !jit_lever_forced(JL_BAKECALLEE))
+        return nullptr;              /* not write-once */
+    const FuncDescriptor *d = (*jc->slot_desc)[callee_arg];
+    if (!d || !d->vm_chunk)
+        return nullptr;
+    return d;
+}
+
+static bool jit_slot_ref_listed(const Chunk &ck, int slot)
+{
+    return std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                              static_cast<int32_t>(slot));
+}
+
 static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
 {
     const int32_t chain = ck.inline_frame_at(old_pc);
@@ -7018,7 +7170,8 @@ static const ArgFuse *argfuse_at(size_t old_pc)
  * clobber mask denies the whole caller-saved pool in any run that
  * contains one, so no pin can exist where this emits and every
  * register below is protocol, not scratch-by-assumption. */
-static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
+static void emit_sync_push_native(Emitter &e, const Chunk &ck,
+                                  const Instr &in, bool is_value,
                                   bool cached, int callee_arg,
                                   std::vector<size_t> &j_slow,
                                   std::vector<size_t> &j_done,
@@ -7031,6 +7184,61 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     const JitLayout &L = jit_layout();
     const int NARGS = static_cast<int>(in.b_lit());
     const int ARGBASE = static_cast<int>(in.a_lit());
+    /*
+     * #97 step 4: THE BAKED CALLEE. Every gate below the cache probe
+     * asks about the DESCRIPTOR, and for a write-once global slot the
+     * emitter already knows which descriptor that is (jit_baked_callee).
+     * So the five gates are decided HERE, at compile time, and what
+     * survives to run time is one identity compare. `bake` is null - and
+     * every baked branch inert - for a value callee, a reassignable
+     * slot, a callee whose chunk is missing or not yet native, or a
+     * coercing one (kept out of v1: its per-argument checks are a
+     * separate shape).
+     */
+    const FuncDescriptor *bake = jit_baked_callee(callee_arg, is_value);
+    const Chunk *bake_ck =
+        bake ? static_cast<const Chunk *>(bake->vm_chunk) : nullptr;
+    if (bake
+            && !(bake->fast_bind
+                 && static_cast<int>(bake->params.size()) == NARGS
+                 && bake_ck && bake_ck->plain_frame)) {
+        bake = nullptr;                  /* a gate the bake cannot make */
+        bake_ck = nullptr;
+    }
+    /*
+     * ⛔ TWO OF THE CALLEE'S PROPERTIES ARE SET BY ITS OWN JIT PASS, SO
+     * THEY ARE NOT ALWAYS READABLE HERE - and reading them anyway is the
+     * audit-table stage trap in its "a value computed later" shape.
+     * `sync_entry_off` and `norec_ok` are both written at the END of
+     * `jit_compile_chunk` for the callee's chunk, so a SELF-RECURSIVE
+     * call (fib -> fib, the flagship shape) sees them unset - and
+     * `norec_ok` unset reads as FALSE, which would have silently
+     * disabled the record-less tier at exactly the site that needs it.
+     *
+     * ⛔ AND "READ IT IF IT HAPPENS TO BE SET" IS WORSE, because it
+     * makes the EMITTED CODE DEPEND ON COMPILATION ORDER - and Pass B
+     * walks a POINTER-keyed map, so that order is not stable across
+     * runs. `-vdj` reproducibility (two runs, two separately-linked
+     * binaries, byte-identical text) is what `scripts/vdjcmp.sh` is,
+     * and an order-dependent elision would quietly end it.
+     *
+     * So the elision is allowed for exactly ONE caller, on a structural
+     * argument rather than on luck: MAIN is compiled LAST, after every
+     * function body (vm_precompile_all's Pass B and, for a loaded image,
+     * vm_jit_loaded_image - both say so at the call). A null
+     * `g_cur_caller_desc` IS main, so every callee it can name is
+     * already placed. Any other caller emits the two runtime tests, as
+     * it always did.
+     */
+    const bool bake_final =
+        bake && !g_cur_caller_desc && bake_ck->native.base != nullptr;
+    if (bake_final && bake_ck->sync_entry_off < 0) {
+        bake = nullptr;              /* the callee does not start native */
+        bake_ck = nullptr;
+    }
+    const bool bake_norec_final = bake && bake_final && bake_ck->norec_ok;
+    const int32_t bake_nslots =
+        bake ? static_cast<int32_t>(bake->frame_size + bake_ck->n_temps) : 0;
 
     /* [base + disp32] micro-encoders (base/reg 0-15, never rsp/r12) */
     const auto modrm = [&](uint8_t op, uint8_t reg, uint8_t base,
@@ -7140,13 +7348,13 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
          */
         ld(RAX, R9R, static_cast<int32_t>(L.ctx_gfuncs));  /* reg:proto */
         ld(RCX, RAX, static_cast<int32_t>(L.gft_slots));
-        e.movabs(RAX, reinterpret_cast<uint64_t>(P.t_func));
-        modrm(0x39, RAX, RCX, callee_arg * 48 + 24, true); /* cmp [..],rax */
+        /* ONE instruction on the arena (cmp_mem_tag), where this was
+         * `movabs rax, t_func` + a compare - once per call. */
+        e.cmp_mem_tag(RCX, callee_arg * 48 + 24, P.t_func, RAX);
         j_slow.push_back(e.j32(0x75));                /* jne slow */
         ld(RDX, RCX, callee_arg * 48);                /* rdx = fo */
     } else {
-        e.movabs(RAX, reinterpret_cast<uint64_t>(P.t_func));
-        modrm(0x39, RAX, RBX, callee_arg * 48 + 24, true);
+        e.cmp_mem_tag(RBX, callee_arg * 48 + 24, P.t_func, RAX);
         j_slow.push_back(e.j32(0x75));                /* jne slow */
         ld(RDX, RBX, callee_arg * 48);                /* rdx = fo */
     }
@@ -7222,6 +7430,41 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
     };
     const int32_t off_e1 = cache_cell ? cell_off(&cache_cell->desc[1]) : 0;
     const int32_t off_ec = cache_cell ? cell_off(&cache_cell->coerce) : 0;
+    /*
+     * ⛔ THE BAKED ARM (#97 step 4). Everything the cache probe and the
+     * five gates below establish is a property of the DESCRIPTOR, and
+     * `bake` means the emitter already knows which descriptor this site
+     * reaches (jit_baked_callee). So the whole block collapses to ONE
+     * identity compare - and the compare is not optional: it is what
+     * makes the baked constants below (`bake_nslots`, the per-argument
+     * scalar decision, the record path's descriptor) true of the callee
+     * actually standing in the slot.
+     *
+     * The gates are NOT re-tested at run time because they cannot have
+     * changed: `params` is frozen at sync_params, `vm_chunk`/`fast_bind`
+     * are write-once under `vm_chunk_tried`, `sync_entry_off` and
+     * `plain_frame` are set by the tier that compiled the chunk - all of
+     * them before this fragment is emitted, all of them read HERE.
+     */
+    if (bake) {
+        movabs_r11(reinterpret_cast<uint64_t>(bake));
+        e.cmp_rr(RAX, R11);
+        j_slow.push_back(e.j32(0x75));                /* jne slow */
+        ld(RCX, RAX, static_cast<int32_t>(L.desc_vm_chunk)); /* rcx = cck */
+        if (!bake_final) {
+            /* the callee's fragment may not exist yet at EMIT time (see
+             * the bake_final note): keep the one runtime test that says
+             * its body starts native */
+            cmp_q_imm8(RCX, static_cast<int32_t>(P.ck_sync_entry), 0);
+            j_slow.push_back(e.j32(0x7C));            /* jl slow */
+        }
+#ifdef TESTS
+        /* the EXECUTION proof: bumped by the emitted baked arm, so it
+         * cannot be satisfied by the cache tier or by the C++ one */
+        movabs_r11(reinterpret_cast<uint64_t>(&g_jit_bake_push));
+        e.inc_qword_base(R11);           /* inc qword [r11] */
+#endif
+    } else {
     size_t j_hit0 = 0, j_hit1 = 0, j_hit_coerce = 0;
     if (cache_addr) {
         movabs_r11(cache_addr);
@@ -7472,6 +7715,7 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.patch32_here(j_coerce_done);
     }
     e.patch32_here(j_plain);                          /* done: */
+    }   /* end of the un-baked probe + gate chain */
     /* rsi = total = frame_size + n_temps */
     if (!cached) {
         /* a PLAIN call from a cache-carrying caller declines (the stash
@@ -7484,9 +7728,17 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
                    0);
         j_slow.push_back(e.j32(0x75));                /* jne slow */
     }
-    ld32sx(RSI, RAX, static_cast<int32_t>(P.desc_frame_size));  /* reg:proto */
-    ld32sx(R10, RCX, static_cast<int32_t>(P.ck_n_temps));
-    e.add_rr(RSI, R10);  /* reg:proto */
+    if (bake) {
+        /* the window SIZE is `desc->frame_size + chunk->n_temps`, both
+         * fixed before this fragment was emitted - two sign-extending
+         * loads and an add become one immediate */
+        e.mov_imm(RSI, static_cast<uint64_t>(bake_nslots));  /* reg:proto */
+    } else {
+        ld32sx(RSI, RAX,
+               static_cast<int32_t>(P.desc_frame_size));  /* reg:proto */
+        ld32sx(R10, RCX, static_cast<int32_t>(P.ck_n_temps));
+        e.add_rr(RSI, R10);  /* reg:proto */
+    }
     /* H8 inc 1: NO stack-cap test here. The cap is the SEGMENT BUDGET
      * (see VmActivation::room), so the fit test below is the cap test -
      * a frame can only exceed it by needing a segment the budget cannot
@@ -7544,9 +7796,16 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
      * with the skipped fill.
      */
     size_t j_norec_join = 0;
-    if (jit_norec_on()) {
-        cmp_b_imm8(RCX, static_cast<int32_t>(P.ck_norec_ok), 0);
-        const size_t j_rec1 = e.j32(0x74);            /* je record path */
+    /* BAKED: `norec_ok` is a chunk flag set before this fragment was
+     * emitted, so a baked site knows which side of the fork it takes and
+     * emits only that side - no byte load, no branch, and for a
+     * record-ful callee no record-less arm at all. */
+    if (jit_norec_on() && (!bake_final || bake_norec_final)) {
+        size_t j_rec1 = 0;
+        if (!bake_final) {
+            cmp_b_imm8(RCX, static_cast<int32_t>(P.ck_norec_ok), 0);
+            j_rec1 = e.j32(0x74);                     /* je record path */
+        }
         size_t j_rec2 = 0, j_rec3 = 0;
         if (cached) {
             /* only a CachedCallV site's OWN probe parks a key, consumed
@@ -7578,7 +7837,8 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.inc_qword_base(R11);           /* inc qword [r11] */
 #endif
         j_norec_join = e.j32(0xEB);                   /* jmp the tail */
-        e.patch32_here(j_rec1);
+        if (j_rec1)
+            e.patch32_here(j_rec1);
         if (cached) {
             e.patch32_here(j_rec2);
             e.patch32_here(j_rec3);
@@ -7722,10 +7982,54 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
             e.inc_qword_base(R10);       /* inc qword [r10] */
         }
 #endif
-        ld(RAX, RBX, s + 24);                         /* rax = type* */
-        cmp_d_imm8(RAX, static_cast<int32_t>(L.type_t_off),
-                   static_cast<int8_t>(L.t_str_val));
-        const size_t j_ref = e.j32(0x7D);             /* jge -> reference */
+        /*
+         * ⛔ A SLOT OUTSIDE `ref_slots` CAN ONLY EVER HOLD A TRIVIAL
+         * VALUE - the chunk-wide invariant this file's header states and
+         * that emit_ret_native's `res_listed` already trusts for the
+         * RESULT copy. The argument copy asked the same question at
+         * RUNTIME, once per argument per call: a load of the source's
+         * Type*, a dereference of its `t` field, and a branch - four
+         * instructions to re-establish what codegen proved. So an
+         * un-listed source emits the scalar arm ALONE, with no test, no
+         * reference arm and no join.
+         *
+         * A FUSED argument (#162) always keeps the test: fusing is
+         * gated ON the slot being ref-listed at the recognizer, so
+         * `fsrc >= 0` implies `listed` and the arms below are exactly
+         * the ones it needs. The two rules therefore cannot disagree.
+         */
+        /*
+         * ⛔ AND THE STRONGER ANSWER, when the callee is BAKED: the
+         * parameter's own `binds_scalar()`. `ref_slots` is derived from
+         * instruction write-dsts and a staging `MoveV` writes "anything",
+         * so an argument temp is ALWAYS ref-listed by it - the caller-side
+         * question is asked here for completeness and for the fused case,
+         * but it is the callee's parameter that actually answers.
+         *
+         * `binds_scalar()` holds for an int/float-DECLARED param (the
+         * bind coercion guarantees it, and the coercing checks above have
+         * already run by the time we copy) and for an inference-PROVEN
+         * one (C3, funcdesc.h: every call path compile-checked). It is
+         * the SAME predicate codegen uses to leave a param out of the
+         * callee's ref_slots, so the bind and the release scan cannot
+         * disagree about which slots hold references.
+         */
+        const bool listed =
+            (!bake || !bake->params[i].binds_scalar())
+            && jit_slot_ref_listed(
+                   ck, static_cast<int>(fsrc >= 0 ? fsrc : ARGBASE + i));
+        size_t j_ref = 0;
+        if (listed) {
+            ld(RAX, RBX, s + 24);                     /* rax = type* */
+            cmp_d_imm8(RAX, static_cast<int32_t>(L.type_t_off),
+                       static_cast<int8_t>(L.t_str_val));
+            j_ref = e.j32(0x7D);                      /* jge -> reference */
+        }
+#ifdef TESTS
+        else {
+            g_jit_arg_scalar++;   /* the reach proof for the elision */
+        }
+#endif
         for (int32_t o = 0; o <= 24; o += 8) {        /* scalar: raw copy */
             ld(R11, RBX, s + o);
             st(RDX, d + o, R11);
@@ -7747,6 +8051,8 @@ static void emit_sync_push_native(Emitter &e, const Instr &in, bool is_value,
         e.zero_reg32(R11);
         st(RDX, d + 32, R11);
         st(RDX, d + 40, R11);
+        if (!listed)
+            continue;                     /* no reference arm to join */
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(j_ref);
         /*
@@ -8043,7 +8349,6 @@ static std::vector<std::unique_ptr<NorecSite>> *g_cur_norec_sites = nullptr;
 /* STEP 3b: the function whose chunk is being emitted, baked into each
  * NorecSite as caller_desc. From the JitCtx (null for main); file-static
  * like g_cur_norec_sites, safe for the same single-threaded reason. */
-static const FuncDescriptor *g_cur_caller_desc = nullptr;
 
 
 /* reg:proto(fn) - the sync-call sequence: the same MyLang-call pool
@@ -8142,7 +8447,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                    + ck.n_temps)
             : 0;
     const ArgFuse *af = argfuse_at(old_pc);
-    emit_sync_push_native(e, in, is_value,
+    emit_sync_push_native(e, ck, in, is_value,
                           in.op == OpCode::CachedCallV,
                           static_cast<int>(callee_arg), j_slows, j_dones,
                           cell, ns, residue, af);
@@ -8198,18 +8503,24 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 e.zero_reg32(RCX);
             }
             e.u8(0x51);                               /* push rcx */
-            e.movabs(RCX,
-                     reinterpret_cast<uint64_t>(&g_jit_residue_caps));
-            e.u8(0xFF); e.u8(0x31);                   /* push [rcx] */
+            /* `push qword [abs32]` - one instruction on the arena,
+             * where the relay used to cost a movabs first */
+            if (!e.push_abs32(&g_jit_residue_caps)) {
+                e.movabs(RCX,
+                         reinterpret_cast<uint64_t>(&g_jit_residue_caps));
+                e.u8(0xFF); e.u8(0x31);               /* push [rcx] */
+            }
         };
         const auto residue_pop = [&]() {
             if (!residue)
                 return;
             e.wrote(1);              /* a raw pop WRITES its register */
             e.u8(0x59);                               /* pop rcx (caps) */
-            e.movabs(RDX,
-                     reinterpret_cast<uint64_t>(&g_jit_residue_caps));
-            e.store_base0(RCX, RDX);
+            if (!e.store_abs32(&g_jit_residue_caps, RCX)) {
+                e.movabs(RDX,
+                         reinterpret_cast<uint64_t>(&g_jit_residue_caps));
+                e.store_base0(RCX, RDX);
+            }
             e.op_reg_imm(Op::plus, RSP, 8);
                                                       /* add rsp,8 (dst) */
         };
@@ -8549,8 +8860,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         e.u8(0xE8); e.u32(0);
 #endif
         /* r8 = act, r10 = top_rec (OUR record) */
-        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-        ld(R8R, RAX, 0);
+        e.load_global(R8R, L.addr_act, RAX);
         ld(R10, R8R, static_cast<int32_t>(L.act_top_rec));
         /* the record guards FIRST - guard order is decline-frequency, not
          * per-guard cost: the common decliners are a BOUNDARY record (a
@@ -8693,8 +9003,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         ld(RDX, R10, static_cast<int32_t>(P.rec_ret_pc));
         st(RAX, 0, RDX);
         /* ctx.captures = rec.caller_captures */
-        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
-        ld(R9R, RAX, 0);  /* reg:proto */
+        e.load_global(R9R, L.addr_ctx, RAX);  /* reg:proto */
         ld(RDX, R10, static_cast<int32_t>(P.rec_caller_caps));
         st(R9R, static_cast<int32_t>(L.ctx_captures), RDX);  /* reg:proto */
         /* cur_sg->cur = rec.window - the popping frame IS the current
@@ -8756,8 +9065,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                            static_cast<int8_t>(L.t_str_val));
                 j_slow.push_back(e.j32(0x7D));     /* jge slow */
             }
-            e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
-            ld(R9R, RAX, 0);                       /* reg:proto: r9 = ctx */
+            e.load_global(R9R, L.addr_ctx, RAX);   /* reg:proto: r9 = ctx */
             ld(RCX, R9R, L.ctx_flow);              /* reg:proto: rcx = flow */
             /* flow->value's OLD value must be trivial (else: release) */
             ld(RAX, RCX, L.fs_value
@@ -8814,8 +9122,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             e.movabs(RAX, reinterpret_cast<uint64_t>(
                               &jit_norec_retarm_verify));
             e.call_rax();
-            e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
-            ld(R8R, RAX, 0);
+            e.load_global(R8R, L.addr_act, RAX);
             ld(R10, R8R, static_cast<int32_t>(L.act_top_rec));
 #endif
             /* 4-v: NO cache guards - the gate excludes cached-call
@@ -8892,8 +9199,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
              * - lets the caller's sentinel arm drop its per-call relay
              * restore, which record-ful returns paid for nothing: their
              * pop restores captures from the record anyway) */
-            e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
-            ld(RCX, RAX, 0);
+            e.load_global(RCX, L.addr_ctx, RAX);
             ld(RAX, 5, 16);
             st(RCX, static_cast<int32_t>(L.ctx_captures), RAX);
             /* seg->top -= total; used -= total (baked) */
@@ -9196,11 +9502,6 @@ struct JitFwd {
 };
 static JitFwd g_fwd;
 
-static bool jit_slot_ref_listed(const Chunk &ck, int slot)
-{
-    return std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
-                              static_cast<int32_t>(slot));
-}
 
 /*
  * ⛔ THE OPCODE-LEVEL HALF, split out so the FAMILY-COVERAGE RATCHET can
@@ -9869,9 +10170,11 @@ void jit_stats_report()
         /* THE CALL PROTOCOL - which tier each call took */
         { "sync_inline",      &g_jit_sync_inline },
         { "arg_inplace",      &g_jit_arg_inplace },
+        { "arg_scalar",       &g_jit_arg_scalar },
         { "arg_stage",        &g_jit_arg_stage },
         { "sync_switch",      &g_jit_sync_switch },
         { "sync_boundary",    &g_jit_sync_boundary_call },
+        { "bake_push",        &g_jit_bake_push },
         { "callee_cache",     &g_jit_callee_cache },
         { "callee_cache2",    &g_jit_callee_cache2 },
         { "coerce_cached",    &g_jit_coerce_cached },
@@ -17931,7 +18234,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             return true;
         }
         const uint8_t s1 = static_cast<uint8_t>(mc_s1);
-        e.test_rr(RAX, RAX);             /* null = it threw */
+        /* rax IS the helper's return value (SysV), and it stays the
+         * live FuncObject* until the store below */
+        e.test_rr(RAX, RAX);       /* reg:abi: null = it threw */
         const size_t j_ok = e.j8(0x75);  /* jnz -> store */
         emit_exc_stamp(e, ck, pc);
         e.exit_pc(pc);
@@ -17959,7 +18264,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.patch32_here(o_cold);
             e.patch32_here(o_cold2);
             e.patch32_here(o_cold3);
-            e.push_reg(RAX);                 /* the fresh closure */
+            e.push_reg(RAX);   /* reg:abi: the returned FuncObject* */
             e.push_reg(s1);                  /* parity */
             emit_call_prologue(e);
             e.lea(REG_ARG0, dst.payload
@@ -17970,11 +18275,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.u8(0xE8); e.u32(0);
             emit_call_epilogue(e);
             e.pop_reg(s1);
-            e.pop_reg(RAX);
+            e.pop_reg(RAX);                  /* reg:abi */
             e.patch32_here(o_triv);
             e.patch32_here(o_st);
         }
-        e.store(RAX, dst.payload);       /* the FuncObject*, count 1 */
+        e.store(RAX, dst.payload);   /* reg:abi: returned, count 1 */
         e.store_type_tag_via(dst.type, jit_push_layout().t_func, s1);
 #ifdef TESTS
         e.bump_counter(&g_jit_closure_fast);
@@ -18545,8 +18850,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const uint32_t region = static_cast<uint32_t>(in.a_lit());
         e.bump_op(OpCode::PushHandler);
         AccScratch acc(e);
-        e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_act));
-        e.load_base0(acc.r, acc.r);        /* mov rax, [rax] (act) */
+        e.load_global(acc.r, L.addr_act, acc.r);   /* rax = act */
         hold();
         /* finish */
         e.load_base(tmp, acc.r, static_cast<int32_t>(L.act_handlers + 8));
@@ -18584,8 +18888,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const JitLayout &L = jit_layout();
         e.bump_op(OpCode::PopHandler);
         AccScratch acc(e);
-        e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_act));
-        e.load_base0(acc.r, acc.r);        /* mov rax, [rax] */
+        e.load_global(acc.r, L.addr_act, acc.r);   /* rax = act */
         hold();
         e.load_base(tmp, acc.r, static_cast<int32_t>(L.act_handlers + 8));
         e.op_reg_imm(Op::minus, tmp, 4);
@@ -18612,8 +18915,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                  : static_cast<uint8_t>(rp);
         if (rpush)
             e.push_reg(RDX);  /* reg:proto */
-        e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_act));
-        e.load_base0(acc.r, acc.r);        /* mov rax, [rax] */
+        e.load_global(acc.r, L.addr_act, acc.r);   /* rax = act */
         /* = &back_rec */
         hold();
         e.load_base(tmp, acc.r, static_cast<int32_t>(L.act_top_rec));
@@ -18657,8 +18959,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                  : static_cast<uint8_t>(rp);
         if (rpush)
             e.push_reg(RDX);  /* reg:proto */
-        e.movabs(acc.r, reinterpret_cast<uint64_t>(L.addr_act));
-        e.load_base0(acc.r, acc.r);        /* mov rax, [rax] */
+        e.load_global(acc.r, L.addr_act, acc.r);   /* rax = act */
         /* = &back_rec */
         hold();
         e.load_base(tmp, acc.r, static_cast<int32_t>(L.act_top_rec));
@@ -22559,6 +22860,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                          * addresses is being replaced */
     g_cur_norec_sites = &chunk.norec_sites;
     g_cur_caller_desc = jc ? jc->caller_desc : nullptr;   /* step 3b */
+    g_cur_jc = jc;                       /* #97 step 4: the bake gate */
     /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
      * across the loop - no op clobbers it - so the native back edge, a
      * jump to label[begin] AFTER this movabs, keeps it live); record each
@@ -24897,6 +25199,7 @@ retry_emission:
     g_cur_call_caches = nullptr;
     g_cur_norec_sites = nullptr;
     g_cur_caller_desc = nullptr;
+    g_cur_jc = nullptr;
 
     /* Trampoline pool (out-of-line, one per DISTINCT libm fn): the rare
      * rel32-out-of-range fallback for a call (and the arm64-style veneer a
