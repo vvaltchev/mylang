@@ -138,15 +138,6 @@ struct FuncInfo {
      */
     bool is_template = false;
 
-    /*
-     * Value-template tracking (plans/archived/value-template-instantiation.md): the
-     * template's VALUE escaped precise tracking (a join dropped its finfo
-     * set, or it was passed as a call/builtin ARGUMENT or captured) - an
-     * untracked call site could then reach a typed instance with a
-     * mismatched signature, so an escaped template is never
-     * value-instantiated (its base keeps running, as before).
-     */
-    bool value_escaped = false;
 };
 
 /*
@@ -1272,10 +1263,38 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
  */
 bool Inferencer::value_instantiate_round(Block *rootBlock)
 {
-    /* 1) Every VALUE USE of a template identifier: a non-callee Identifier
-     * resolving to a template FuncInfo. An ARG-position use (any call's
-     * argument - incl. builtins: map/filter/runtime/...) or a CAPTURE-list
-     * use ESCAPES the template (an untracked consumer). */
+    /*
+     * 1) Every VALUE USE of a template identifier: a non-callee
+     * Identifier resolving to a template FuncInfo.
+     *
+     * ⛔ AN ARG-POSITION AND A CAPTURE-LIST USE ARE ORDINARY VALUE USES
+     * NOW (#116 follow-up, 2026-08-28). They used to ESCAPE the
+     * template outright, on the reasoning that "an untracked call site
+     * could reach the typed instance with a mismatched signature" -
+     * true when nothing could name the consumer of an argument. The
+     * callee-set analysis names it: an argument bound to a parameter
+     * shows up in `pts(param)`, so a call THROUGH that parameter is an
+     * attributed site like any other and lands in `sites[tmpl]` below,
+     * where the signature is computed and uniformity is checked.
+     *
+     * What replaced the blanket rule, and each is load-bearing:
+     *  - every indirect call whose callee set NAMES tmpl is attributed
+     *    to it - including a multi-candidate site, which is attributed
+     *    to ALL its candidates, so it still constrains;
+     *  - a ⊤-callee site anywhere makes tmpl `callee_escaped`, and the
+     *    gate below declines;
+     *  - UNIFORMITY over the attributed sites still decides.
+     *
+     * Measured: `12_higher_order` (`func apply(f, x) => f(x);` with
+     * `apply(sq, i)`) instantiates `sq$0` for the first time, so the
+     * higher-order chain is typed end to end -
+     * `apply$0 : func(func(int)->int, int)->int` where it was
+     * `func(dyn,dyn)->dyn` - and costs **-63.5% Ir per scale unit**.
+     * It is the ONLY corpus program whose bytecode changes; lifting
+     * the CAPTURE half changes none, and is lifted anyway because it
+     * is the SAME rule with the same argument, and one of the two
+     * surviving would be an asymmetry with no reason behind it.
+     */
     struct Use { Identifier *id; TypeSym *sym; bool in_func; };
     std::map<FuncInfo *, std::vector<Use>> uses;
 
@@ -1293,7 +1312,9 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
                     auto it = id_sym.find(id);
                     if (it != id_sym.end() && it->second && it->second->func
                             && it->second->func->is_template) {
-                        it->second->func->value_escaped = true;
+                        /* an ARG-position value use - see the header */
+                        uses[it->second->func].push_back(
+                            { id, it->second, in_func });
                         continue;
                     }
                 }
@@ -1311,7 +1332,14 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
                         if (it != id_sym.end() && it->second
                                 && it->second->func
                                 && it->second->func->is_template)
-                            it->second->func->value_escaped = true;
+                            /* a CAPTURE-LIST value use. `in_func` is
+                             * TRUE unconditionally: the consumer is
+                             * the closure being declared, which is a
+                             * function body - and marking it so only
+                             * makes the REPL keep the instance rather
+                             * than GC it, the conservative side. */
+                            uses[it->second->func].push_back(
+                                { id, it->second, true });
                     }
                 }
             for_each_child(n, [&](Construct *c) { walk(c, true); });
@@ -1360,25 +1388,22 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
     for (auto &kv : uses) {
         FuncInfo *tmpl = kv.first;
         /*
-         * ⛔ `value_escaped` AND `callee_escaped` ARE DIFFERENT
-         * QUESTIONS, and this gate needs BOTH.
+         * ⛔ ONE ESCAPE QUESTION, ONE ANSWER. There used to be TWO
+         * gates here: this one, and `FuncInfo::value_escaped` - a flag
+         * the walk above set whenever a template's name appeared as a
+         * call ARGUMENT or in a CAPTURE LIST, on the reasoning that an
+         * untracked consumer could reach the typed instance with a
+         * mismatched signature.
          *
-         * `callee_escaped` (the analysis) asks: can this function be
-         * CALLED from a site I did not see? That is what replaces the
-         * old `escaped_finfos` ledger - the "unknown" a set with no ⊤
-         * could not express.
-         *
-         * `value_escaped` (set in the walk above) asks something this
-         * analysis deliberately does not model: is there a value use
-         * whose CONSUMERS I cannot enumerate - an ARG-position use or
-         * a CAPTURE-list use. That matters because this pass REDIRECTS
-         * every value-use Identifier to the clone, so a use it cannot
-         * follow would hand the TYPED instance to a consumer that may
-         * call it with a mismatched signature. Tracking the value
-         * further (which the analysis does - an argument flows into
-         * the parameter) is not the same as being able to redirect it.
+         * Both of its producers are gone (see the walk's header): those
+         * uses are ordinary value uses now, because the callee-set
+         * analysis NAMES their consumers - an argument bound to a
+         * parameter appears in `pts(param)`, so a call through that
+         * parameter is an attributed site like any other. `value_escaped`
+         * had no producers left and is DELETED; `callee_escaped` is the
+         * single escape question, answered by the analysis.
          */
-        if (!tmpl->is_template || tmpl->value_escaped || !tmpl->decl)
+        if (!tmpl->is_template || !tmpl->decl)
             continue;
         if (callee_escaped(tmpl))
             continue;
@@ -2003,19 +2028,19 @@ void Inferencer::stamp_proven_params()
         if (!s->func || s->value_used)
             continue;
         FuncInfo *fi = s->func;
-        if (fi->is_template || fi->value_escaped || !fi->decl
-                || !fi->decl->desc)
+        if (fi->is_template || !fi->decl || !fi->decl->desc)
             continue;
         /*
-         * ⛔ AND THE ANALYSIS'S ESCAPE TOO (#116 increment 3). This
-         * gate used to lean on `value_escaped`, half of which came
-         * from `drain_escapes` - the ledger of finfo members a `join`
-         * DROPPED. With `finfos` deleted that half is gone, and
-         * `callee_escaped` is what replaces it: it says the function's
-         * value left the part of the program this pass can see, which
-         * is exactly the condition under which "never used as a value"
-         * is not a proof. Dropping it silently would weaken a C3 stamp
-         * every unboxed tier is built on.
+         * ⛔ THE ESCAPE GATE, AND IT IS THE ONLY ONE LEFT. This used
+         * to read `fi->value_escaped` as well - a flag fed partly by
+         * the `finfos` ledger (#116 increment 3 deleted that half) and
+         * partly by a blanket "a template passed as an argument
+         * escapes" rule (the follow-up deleted the rest). Both are
+         * subsumed by the callee-set analysis, which says whether the
+         * function's value left the part of the program this pass can
+         * see - exactly the condition under which "never used as a
+         * value" stops being a proof, and what a C3 stamp every
+         * unboxed tier is built on depends on.
          */
         if (callee_escaped(fi))
             continue;
