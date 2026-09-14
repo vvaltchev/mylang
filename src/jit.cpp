@@ -129,6 +129,8 @@ unsigned long g_jit_peep_depbrk = 0;   /* #101: cvtsi2sd merge-dep
 unsigned long g_jit_rax_retries = 0;   /* Phase A: conflict re-emissions */
 unsigned long g_jit_step_imm = 0;      /* #96: pinned counted-loop steps */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
+unsigned long g_jit_capbase = 0;       /* #112: runs entering with the
+                                        * capture base pinned */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
 unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
@@ -328,13 +330,13 @@ enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
-    JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_COUNT
+    JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
-    "peep", "bakecallee"
+    "peep", "bakecallee", "capbase"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -2081,6 +2083,48 @@ struct Emitter {
                                                            * is not 0.0 */
                 return f.reg;
         return -1;
+    }
+    /*
+     * #112: THE CAPTURE BASE - `ctx->captures->data()` pinned in a
+     * CALLEE-saved register for the run.
+     *
+     * Every capture access walked the chain itself: three DEPENDENT
+     * loads (the ctx global, `ctx->captures`, then the data pointer),
+     * re-emitted per access although nothing between two accesses can
+     * change it. A closure body that reads and writes one captured
+     * counter therefore paid the walk TWICE per call - and the second
+     * walk sits ON the dependency chain of the store that follows it,
+     * which is the half that costs wall clock rather than only Ir.
+     *
+     * ⛔ IT MUST BE CALLEE-SAVED, and that is not a preference. The
+     * value is re-derived at `emit_call_epilogue` (the choke point,
+     * exactly as the float literals above are) - but a CALLER-saved
+     * register would additionally need re-deriving after every call
+     * the emitter makes WITHOUT that bracket, and "which emitted
+     * sequences call" is not scannable: the flits note one paragraph
+     * up records a float store to a ref-listed dst calling
+     * jit_put_float from an arm no opcode scan can see. Callee-saved
+     * means the REGISTER survives regardless and only its VALUE is
+     * refreshed, at one place.
+     *
+     * -1 = this run has no capture base (the usual case).
+     */
+    int capbase = -1;
+    /*
+     * The walk, through the DESTINATION register - no scratch at all,
+     * which is what lets it run at the epilogue where rax carries the
+     * helper's status (the flit_load lesson below, avoided by
+     * construction rather than by choosing rcx).
+     */
+    void capbase_load()
+    {
+        if (capbase < 0)
+            return;
+        const uint8_t cb = static_cast<uint8_t>(capbase);
+        const JitLayout &L = jit_layout();
+        load_global(cb, L.addr_ctx, cb);            /* cb = ctx */
+        load_base(cb, cb, static_cast<int32_t>(L.ctx_captures));
+        load_base(cb, cb, 0);                       /* cb = the data ptr */
     }
     /*
      * Materialise a pinned literal. Through RCX, NEVER rax: this also
@@ -3871,15 +3915,33 @@ struct Emitter {
     }
     /* mov dst, [base]  - no displacement (3 bytes, unlike load_base's
      * unconditional disp32 form) */
+    /*
+     * ⛔ rbp/r13 ARE LEGAL HERE NOW, AND THE OFF-ARENA LANE IS WHY
+     * (#112, 2026-08-27). `(base & 7) == 5` at mod=00 does not mean
+     * `[r13]`, it means "disp32, no base" - so this used to ML_CHECK
+     * rather than encode. That was fine while every base was a
+     * LITERAL register; the day one came from the ALLOCATOR (the #112
+     * capture base, which lands in r13 whenever nothing else wants
+     * it) the abort became reachable - but ONLY off the low-address
+     * arena, because on it `load_global` returns before this via
+     * `load_abs32` and never calls it at all. `corpus_diff
+     * --nolowmem` is what surfaced it, one lane, four programs.
+     *
+     * The fix is the SHARED displacement tail, which already picks
+     * mod=01 disp8=0 for rm==5. Byte-identical for every existing
+     * caller: none passes rsp/r12/rbp/r13, which is exactly what the
+     * ML_CHECK below (now the SIB half alone - emit_modrm_disp writes
+     * no SIB byte) still enforces.
+     */
     void load_base0(uint8_t dst, uint8_t base)
     {
         wrote(dst);
-        ML_CHECK_MSG(!base_needs_sib(base) && !base_no_base_form(base),
-                     "load_base0: rsp/r12 need SIB, rbp/r13 need a disp");
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "load_base0: rsp/r12 need a SIB byte");
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
                                 | (base >= 8 ? 0x01 : 0)));
         u8(0x8B);
-        u8(static_cast<uint8_t>(((dst & 7) << 3) | (base & 7)));
+        emit_modrm_disp(dst, base, 0);
     }
     /* the shared mod/rm + displacement tail: mod=00 when the
      * displacement is zero and the base allows it, else disp8, else
@@ -6392,6 +6454,33 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap, uint8_t tbl)
     }
 }
 
+/*
+ * #112: how many INLINE capture accesses this run makes - the ops that
+ * would each walk `ctx -> ctx->captures -> data()` for themselves.
+ *
+ * The COMPOUND store (`aop != invalid`) is excluded because it does not
+ * take the inline path at all: it calls jit_store_capture_compound and
+ * never walks the chain, so counting it would claim a register for a
+ * run that cannot spend it.
+ *
+ * This is a COST heuristic and nothing else. Being wrong about it can
+ * only waste (a register plus three head instructions) or forgo (the
+ * status quo) - never miscompile: the pinned base is CORRECT wherever
+ * it is established, and the accesses read it only when it is.
+ */
+static size_t jit_capbase_uses(const Chunk &ck, size_t begin, size_t end)
+{
+    size_t n = 0;
+    for (size_t i = begin; i < end && i < ck.code.size(); i++) {
+        const Instr &in = ck.code[i];
+        if (in.op == OpCode::LoadCaptureV)
+            n++;
+        else if (in.op == OpCode::StoreCaptureV && in.aop == Op::invalid)
+            n++;
+    }
+    return n;
+}
+
 /* The INVERTED form for the de-helperize inline paths: jump NEAR to the
  * HELPER fallback when the value at `type_off` is a REFERENCE (type->t >=
  * t_str); fall through for a trivial value. Returns the jae rel32 site to
@@ -6726,6 +6815,37 @@ static void emit_call_epilogue(Emitter &e)
      * heuristic, and being wrong about it can only cost instructions. */
     for (const Emitter::FLit &fl : e.flits)
         e.flit_load(fl);
+    /*
+     * #112: the capture base. The REGISTER survived (callee-saved), so
+     * this refreshes only its VALUE. The walk goes through capbase
+     * itself, so rax - which carries the helper's status for the test
+     * every call site does right after this epilogue - is untouched.
+     *
+     * ⛔ IT IS CURRENTLY UNFALSIFIABLE, AND THAT IS RECORDED RATHER
+     * THAN HIDDEN. Deleting it leaves `-rt` at 1966/1966 and
+     * corpus_diff green, while `vdjcmp` says it does emit real bytes on
+     * four corpus programs - so this is a live-but-not-load-bearing
+     * refresh, not dead code.
+     *
+     * The argument that it is REDUNDANT is strong and worth writing
+     * down, because a future measurement may want to act on it: the
+     * UN-pinned path already walks `ctx->captures` after calls and must
+     * get OUR captures, so "every path that repoints it restores it" is
+     * a premise this optimization inherits rather than adds; and a
+     * CaptureSlots is neither movable nor assignable and never grows
+     * after the snapshot, so its data pointer cannot move under us.
+     *
+     * It is kept anyway, for the reason the float literals above are
+     * refreshed here and not gated on an opcode scan: which emitted
+     * sequences call a helper is not scannable (a float store to a
+     * ref-listed dst calls jit_put_float from an arm no scan sees), so
+     * the choke point is where this family's correctness lives. And it
+     * costs the shapes that motivated the work NOTHING - the hot
+     * closure bodies in 11_closure_counter and 63_closures make no
+     * helper call at all, which is why removing it would be measured in
+     * noise. Delete it only with a test that FAILS without it.
+     */
+    e.capbase_load();
     if (g_hoist.active) {
         /*
          * Re-derive via RCX - RAX carries the helper's status, which
@@ -10275,6 +10395,7 @@ void jit_stats_report()
         { "hoist",            &g_jit_hoist },
         { "cold_copy",        &g_jit_cold_copy },
         { "hoist2",           &g_jit_hoist2 },
+        { "capbase",          &g_jit_capbase },
         { "hoist_rmw",        &g_jit_hoist_rmw },
         /* #96: the two halves of the element tier's REGISTER supply -
          * how often the plan ran out (elem_noreg, an emit-time decline
@@ -17994,11 +18115,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const int32_t coff = static_cast<int32_t>(
             in.target2 * static_cast<int_type>(sizeof(LValue)));
         const int32_t pv0 = slot_addr(0).payload, ty0 = slot_addr(0).type;
-        const uint8_t cb = ctx_chain_reg(e);
+        /* #112: the run may already hold `ctx->captures->data()` in a
+         * callee-saved register (claimed at the head when the run makes
+         * two or more inline capture accesses). Then this op walks
+         * nothing - and must not `scratch()` the register either, since
+         * the NEXT access reads it. */
+        const bool cpin = e.capbase >= 0;
+        const uint8_t cb = cpin ? static_cast<uint8_t>(e.capbase)
+                                : ctx_chain_reg(e);
         if (cb == ELEM_NO_REG)
             return false;      /* no free chain register - decline */
         e.bump_op(OpCode::LoadCaptureV);
-        emit_ctx_chain(e, cb, /*cap=*/true, 0xFF);
+        if (!cpin)
+            emit_ctx_chain(e, cb, /*cap=*/true, 0xFF);
         std::vector<size_t> jhelp;
         /*
          * #111: a PROVEN-SCALAR capture (Instr::cap_scalar - the
@@ -20193,14 +20322,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          */
         const bool cscal = is_cap && in.cap_scalar();
         const size_t g = cscal ? 0 : emit_store_src_gate(e, src.type);
-        const uint8_t cb = ctx_chain_reg(e);
+        /* #112: only the CAPTURE chain is pinnable - the GLOBAL side
+         * walks to a different table AND leaves it in `tbl` for the
+         * `defined` byte, so it keeps its own walk. */
+        const bool cpin = is_cap && e.capbase >= 0;
+        const uint8_t cb = cpin ? static_cast<uint8_t>(e.capbase)
+                                : ctx_chain_reg(e);
         if (cb == ELEM_NO_REG) {
             if (tbl_owned)
                 e.free_scratch(static_cast<uint8_t>(tbl));
             return false;      /* no free chain register - decline */
         }
-        emit_ctx_chain(e, cb, is_cap,
-                       is_cap ? 0xFF : static_cast<uint8_t>(tbl));
+        if (!cpin)
+            emit_ctx_chain(e, cb, is_cap,
+                           is_cap ? 0xFF : static_cast<uint8_t>(tbl));
         const size_t j_dref =
             cscal ? 0 : emit_ref_check_jae_chain(e, cb, soff + ty0);
 #ifdef TESTS
@@ -23121,6 +23256,10 @@ retry_emission:
         e.flits.clear();        /* C4b: per-RUN (a stale entry would let
                                  * the next fragment read a register it
                                  * never loaded - the C2a fcache bug) */
+        e.capbase = -1;         /* #112: per-RUN, same reasons - a stale
+                                 * capture base would let the next
+                                 * fragment read a register it never
+                                 * walked the ctx chain into */
         e.released.clear();     /* C5: per-RUN AND per-pc below (a stale
                                  * entry would let a store skip a guard
                                  * nothing released - the C2a fcache bug) */
@@ -23869,10 +24008,66 @@ retry_emission:
              * type-elided at a barrier flush gets its tag written
              * twice (the cache loop and tflush) - harmless. */
         }
+        /*
+         * #112: the CAPTURE BASE, claimed LAST - after the pins, after
+         * the C2b hoist pair, and after trans mode has bound its
+         * abstract registers. So it can only ever spend a CACHE_REG
+         * nothing above it wanted, which is the right priority: a pin
+         * is worth a slot's whole traffic and an abstract register
+         * serves a live range, while this is worth three instructions
+         * per capture access past the first.
+         *
+         * `take_reg` (first-free) rather than a positional index,
+         * because under trans mode the physical assignment is not the
+         * positional zip the pair's own pick assumes.
+         *
+         * It stays `busy` for the whole run with no cache entry behind
+         * it. Under trans mode that is a state the comment above calls
+         * out - and it is exactly what the C2b pair's primary arm
+         * already does (its take_fixed is not tmode-gated), on the same
+         * pool. The register is never rax, so the accumulator
+         * machinery's "no rax pin present" abort is out of reach.
+         */
+        if (!jit_lever_off(JL_CAPBASE)
+                && jit_capbase_uses(chunk, begin, end) >= 2) {
+            for (size_t i = 0; i < MAX_CACHED; i++) {
+                const uint8_t r = CACHE_REGS[i];
+                /* ⛔ IT IS A BASE REGISTER, NOT A VALUE REGISTER, AND
+                 * THAT EXCLUDES r12. Every access addresses off it
+                 * (`load_base`/`store_base`), and `(r & 7) == 4` is the
+                 * ModRM encoding that means "a SIB byte follows" - so
+                 * r12 as a base would need a form the emitter does not
+                 * write. `base_needs_sib`'s own comment predicted this
+                 * exact moment ("nothing passes r12/r13 as a base
+                 * today, which is precisely why it was silent - it
+                 * stops being silent the moment a base register comes
+                 * from an ALLOCATOR"), and its ML_CHECK is what caught
+                 * it on the first run rather than emitting a wrong
+                 * instruction. r13 IS fine: `(r13 & 7) == 5` only
+                 * forbids the mod=00 no-displacement form, and
+                 * load_base always writes disp32.
+                 *
+                 * Teaching the emitter the SIB form is the right fix
+                 * one day (it is a register-class prerequisite, not a
+                 * tidy-up) - but it is a change to the hottest emit
+                 * path and belongs to that work, not to this. Skipping
+                 * one of four registers costs nothing while the other
+                 * three are free, which is every case measured. */
+                if (Emitter::base_needs_sib(r))
+                    continue;
+                if (e.ra.take_fixed(r)) {
+                    e.capbase = r;
+                    break;
+                }
+            }
+        }
         if (pair_lo >= 0) {
             e.saved.push_back(static_cast<uint8_t>(pair_lo));
             e.saved.push_back(static_cast<uint8_t>(pair_hi));
         }
+        if (e.capbase >= 0)       /* #112: callee-saved, so frag_entry
+                                   * pushes it and frag_ret pops it */
+            e.saved.push_back(static_cast<uint8_t>(e.capbase));
 
         /* C5: which ref-listed temps each loop preheader releases, and
          * where each release is still in force. Picked BEFORE any op is
@@ -23955,6 +24150,20 @@ retry_emission:
                 e.load(hot_reg[h], a.payload);            /* entry load */
             }
         }
+        /* #112: walk the ctx chain ONCE for the run. After the pin
+         * loads because the walk goes through capbase alone and touches
+         * nothing they need; before any op, so it dominates every
+         * access (the back edge jumps to the first op below). */
+        e.capbase_load();
+#ifdef TESTS
+        if (e.capbase >= 0) {
+            /* the EMITTED-code proof: "a run claimed a capture base" is
+             * a compile-time claim, "a fragment RAN with one" is not,
+             * and the two have come apart before (the rdx admission
+             * shipped at zero reach). */
+            e.bump_counter(&g_jit_capbase);
+        }
+#endif
         /* #96 inc-2: the stubs need the cache state AS OF their pc -
          * base + the seams at or before it - and e.cache at stub-
          * emission time is the post-all-seams FINAL state. */
@@ -25225,6 +25434,14 @@ retry_emission:
             }
             for (const Emitter::FLit &fl : e.flits)
                 e.flit_load(fl);                  /* C4b literal pool */
+            /* #112: a stub IS an entry - the run head's walk did not
+             * run on this path, and the register holds the C caller's
+             * value. Emits ZERO bytes corpus-wide today (vdjcmp: 125
+             * identical with it removed), because no run that claims a
+             * capture base currently has an entry stub; it is here for
+             * the day one does, when its absence would be a read
+             * through a garbage pointer rather than a wrong number. */
+            e.capbase_load();                     /* #112 capture base */
 #ifdef TESTS
             e.bump_counter(&g_jit_entry_resume);
 #endif
