@@ -490,6 +490,27 @@ slots into `compute_ref_slots`; pinned by
 **When a RUNTIME path starts writing a frame slot, it must join
 `ref_slots` - an opcode-derived table cannot see it.**
 
+**⛔ AND AN EIGHTH SHAPE, ONE LEVEL IN: A TABLE'S INPUTS MUST BE
+COMPLETE BEFORE ANY RULE IN IT BECOMES RELATIONAL (#97 step 5,
+2026-08-27).** `compute_ref_slots` marks a slot that may hold a
+reference, and `compile_func_body` unioned the non-scalar PARAMETER
+slots into the result AFTERWARDS - the bind writes them and no
+instruction does, so `visit_use_def` cannot see them. That order was
+safe for years because every marking was INDEPENDENT: a late union of
+extra members changes nothing about the members already decided.
+
+It stopped being safe the instant one rule READ another entry to decide
+its own. Teaching the table that a `MoveV`'s dst is a reference only if
+its SOURCE is - the fix for "every argument temp in every program is
+reference-carrying" - made `move t = param` ask about a source the pass
+believed trivial, because the params had not gone in yet. The seeds are
+an INPUT now (`codegen_chunk`'s `ref_seeds`), not a post-hoc union.
+`jit_ret_audit` caught it on the first run and the old order is watched
+failing (rc 134).
+
+**When you add a rule that derives one entry from another, re-ask where
+every entry comes from** - including the ones no instruction writes.
+
 **THE RULE this earns:** a table is "audited" only for the PIPELINE
 STAGES that existed when it was written. A pass added later, at a
 DIFFERENT stage, sees a different opcode universe - and a conservative
