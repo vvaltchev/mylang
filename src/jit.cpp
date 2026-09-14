@@ -10204,6 +10204,7 @@ void jit_stats_report()
         { "sync_inline",      &g_jit_sync_inline },
         { "arg_inplace",      &g_jit_arg_inplace },
         { "arg_scalar",       &g_jit_arg_scalar },
+        { "cap_scalar",       &g_jit_cap_scalar },
         { "frameless_chunks", &g_jit_frameless_chunks },
         { "frameless_calls",  &g_jit_frameless_calls },
         { "arg_stage",        &g_jit_arg_stage },
@@ -17999,21 +18000,43 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.bump_op(OpCode::LoadCaptureV);
         emit_ctx_chain(e, cb, /*cap=*/true, 0xFF);
         std::vector<size_t> jhelp;
-        jhelp.push_back(emit_ref_check_jae_chain(e, cb, coff + ty0));
-        if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
-                               static_cast<int32_t>(in.target)))
+        /*
+         * #111: a PROVEN-SCALAR capture (Instr::cap_scalar - the
+         * inferencer's TypeHint, carried on the op) can hold neither a
+         * reference nor a payload wider than its first qword, so the
+         * source check and two thirds of the copy are dead. This read
+         * was TWENTY emitted instructions for what a closure counter
+         * does once per call.
+         */
+        const bool cscal = in.cap_scalar();
+        if (!cscal)
+            jhelp.push_back(emit_ref_check_jae_chain(e, cb, coff + ty0));
+        if (jit_slot_ref_listed(ck, static_cast<int>(in.target)))
             jhelp.push_back(emit_ref_check_jae(e, dst.type));
+#ifdef TESTS
+        if (cscal)
+            e.bump_counter(&g_jit_cap_scalar);
+#endif
         AccScratch acc(e);
         e.load_base(acc.r, cb, coff + ty0);
         hold();
         e.load_base(cpy, cb, coff + pv0);
         e.store(cpy, dst.payload);
-        e.load_base(cpy, cb, coff + pv0 + 8);
-        e.store(cpy, dst.payload + 8);
-        e.load_base(cpy, cb, coff + pv0 + 16);
-        e.store(cpy, dst.payload + 16);
+        if (!cscal) {
+            e.load_base(cpy, cb, coff + pv0 + 8);
+            e.store(cpy, dst.payload + 8);
+            e.load_base(cpy, cb, coff + pv0 + 16);
+            e.store(cpy, dst.payload + 16);
+        }
         drop();
         e.store(acc.r, dst.type);
+        /* NOTHING JUMPS TO THE HELPER when every guard was elided, so
+         * neither the join jump nor the helper body is emitted - a
+         * proven-scalar read ends at its last store. The `jmp` was one
+         * EXECUTED instruction per access and the helper a page of
+         * unreachable bytes in the fragment's I-cache footprint. */
+        if (jhelp.empty())
+            return true;
         const size_t j_done = e.j32(0xEB);
         for (const size_t sj : jhelp)
             e.patch32_here(sj);
@@ -20160,7 +20183,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             }
         }
         e.bump_op(in.op);
-        const size_t g = emit_store_src_gate(e, src.type);
+        /*
+         * #111: the same proof on the STORE side. `cap_scalar` says the
+         * captured VARIABLE is a proven int/float, so (1) the source is
+         * that scalar - the src gate cannot fail - and (2) the
+         * capture's CURRENT value is one too, so there is nothing to
+         * release and the chain's reference check is dead. Only a
+         * CAPTURE carries the flag; a global store keeps both.
+         */
+        const bool cscal = is_cap && in.cap_scalar();
+        const size_t g = cscal ? 0 : emit_store_src_gate(e, src.type);
         const uint8_t cb = ctx_chain_reg(e);
         if (cb == ELEM_NO_REG) {
             if (tbl_owned)
@@ -20169,7 +20201,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         emit_ctx_chain(e, cb, is_cap,
                        is_cap ? 0xFF : static_cast<uint8_t>(tbl));
-        const size_t j_dref = emit_ref_check_jae_chain(e, cb, soff + ty0);
+        const size_t j_dref =
+            cscal ? 0 : emit_ref_check_jae_chain(e, cb, soff + ty0);
+#ifdef TESTS
+        if (cscal)
+            e.bump_counter(&g_jit_cap_scalar);
+#endif
         AccScratch acc(e);
         e.load(acc.r, src.type);
         /* every jump to the slow arm below was emitted BEFORE this
@@ -20179,10 +20216,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         hold();
         e.load(cpy, src.payload);
         e.store_base(cpy, cb, soff + pv0);
-        e.load(cpy, src.payload + 8);
-        e.store_base(cpy, cb, soff + pv0 + 8);
-        e.load(cpy, src.payload + 16);
-        e.store_base(cpy, cb, soff + pv0 + 16);
+        if (!cscal) {
+            e.load(cpy, src.payload + 8);
+            e.store_base(cpy, cb, soff + pv0 + 8);
+            e.load(cpy, src.payload + 16);
+            e.store_base(cpy, cb, soff + pv0 + 16);
+        }
         e.store_base(acc.r, cb, soff + ty0);
         if (!is_cap) {
             /* defined[gslot] = 1: cpy = defined.data() (the table is
@@ -20195,6 +20234,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.free_scratch(static_cast<uint8_t>(tbl));
         }
         drop();
+        /* the same: with both guards elided the helper is unreachable */
+        if (cscal)
+            return true;
         const size_t j_done = e.j32(0xEB);
         e.patch32_here(g);
         e.patch32_here(j_dref);

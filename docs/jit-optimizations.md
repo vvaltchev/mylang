@@ -9988,3 +9988,98 @@ it was falsifiable at all:
     ...with `len()` as that builtin -> the body QUALIFIED: lever 4b
         fuses `len()` into the native `ArrLen` and the call disappears.
         `max()` survives as `call.blt.v`.
+
+## #111 - THE PROVEN-SCALAR CAPTURE: 40 emitted instructions for one
+## `add` (2026-08-27)
+
+**FOUND BY `scripts/jitprofile.py`**, built the same day, while sizing
+#97's frameless tier - and it redirected that work. The instrument's
+first real use paid for it.
+
+    func mk(start) => func [start] { start++; return start; };
+
+`11_closure_counter` calls that closure a million times. Its fragment
+cost **83 Ir per call**, split:
+
+    entry                    5
+    THE CAPTURE READ        20    ctx -> captures -> data() (3 loads),
+                                  then a boxed 32-byte EvalValue copy
+                                  with a REFERENCE CHECK on each side
+    the actual `+1`          4
+    THE CAPTURE WRITE       20    the same chain, walked again from
+                                  scratch, the same copy, the same checks
+    the return arm         ~31
+
+**40 of 83 - and 24% of the whole program - for one integer increment.**
+
+**WHY: THERE IS NO TYPED CAPTURE OP.** `LoadElemInt`,
+`LoadStructFieldInt`, `DictLoadInt` all exist; a capture has only the
+boxed `LoadCaptureV` / `StoreCaptureV`, so a proven-`int` capture takes
+the general path that must assume any value. The gap was KNOWN and
+written down - `try_capture_leaf`'s own comment says "the dedicated
+typed load ... is a separate, later question - the arithmetic is where
+the cost was". The arithmetic was fixed then; the load was not.
+
+**THE FIX NEEDS NO NEW OPCODE AND NO FORMAT BUMP.** `Instr::cap_scalar`
+rides bit 0x40 of the already-serialized `opflags`, per-OPCODE like
+`struct_checked` on bit 7 (the element and capture families do not
+overlap, and `set_a`/`set_b` mask only 0x07/0x38). It is set at the two
+sites where the inferencer's `TypeHint` is in hand - `try_capture_leaf`
+and `emit_typed_capture_update` - and it is a HINT: the VM ignores it
+entirely, so only a WRONGLY SET flag is unsound.
+
+Three consumers, and the third is the one that compounds:
+
+ - the emitted READ drops the source reference check and copies 8
+   payload bytes instead of 24;
+ - the emitted WRITE drops the source gate AND the capture's own
+   current-value check - a proven-scalar variable never holds a
+   reference, so there is nothing to release;
+ - **`compute_ref_slots` learns it too.** A `cap_scalar` LoadCaptureV
+   writes a proven scalar, so its dst leaves `ref_slots` - which
+   removes the read's *destination* check as well and shortens the
+   return path's release scan. That is the THIRD instance in one day of
+   the same rule (MoveV, LoadConstV, and now this): **a table entry that
+   says "this op writes anything" is right about the OPCODE and wrong
+   about the INSTRUCTION.**
+
+And with every guard elided, **nothing jumps to the helper** - so
+neither the join `jmp` nor the helper body is emitted at all. That is
+one executed instruction per access and a page of unreachable bytes out
+of the fragment's I-cache footprint.
+
+    the closure's fragment    83 -> 53 Ir per call   (-36%)
+    11_closure_counter                    -20.6%   (was -2.9%)
+    78_typed_param_call                   -12.4%   (was ~0)
+    63_closures                            -9.9%   (was -4.8%)
+    76_funcval_dispatch                    -2.6%   (unchanged - no
+                                                    capture in its loop)
+
+`78_typed_param_call` was not a target and moved 12% - `func [base]
+(int k) { return base + k; }` is the same shape.
+
+**SABOTAGE LEDGER**, each reintroduced, built and watched failing:
+
+    the flag set on EVERY capture load
+      (so a REFERENCE capture claims scalar) -> -rt AND corpus_diff fail,
+      18_store_src_gate printing `<none> 399` where it prints `599`
+    the JIT ignoring the flag on the READ
+      (cscal forced true)                    -> -rt AND corpus_diff fail
+
+**WHAT IS LEFT, MEASURED NOT GUESSED.** The `ctx -> captures -> data()`
+chain is still walked from scratch at EACH access - 3 instructions, 6
+per call for this closure - though it is loop-invariant within a
+fragment. Hoisting it needs a register held across the run (the C1
+shape) or a cached arena cell maintained at every site that writes
+`ctx->captures`; the second is 4 instructions for a miss that would read
+the WRONG closure's captures, so it is not obviously worth it. Recorded,
+not built.
+
+NETS: -rt 1965/1965 on dbg(ASan+UBSan), RECYCLE=1, rel-hard
+(VM_HARDENING) and clang; corpus_diff plain/--levers/--xrot/--cold/
+--nolowmem; disasmcheck vs objdump; driver_checks; vdjcmp self-test;
+norec_enum --depth 3; `tests/functional/24_capture_scalar.my` for the
+boundary (int / float / bool take it; an array, a string, a `dyn` that
+alternates int and string, and two closures over one factory call must
+not, and are run under RECYCLE=1 + ASan where a torn handle or a missed
+release is a use-after-free).

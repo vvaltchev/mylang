@@ -3360,6 +3360,7 @@ unsigned long g_jit_arg_inplace = 0;
 
 /* #97 step 4: an EMIT-time count (see jit.h) - the scalar argument binds
  * that dropped their source-type test because the slot is not ref-listed. */
+unsigned long g_jit_cap_scalar = 0;        /* #111 (emitted) */
 unsigned long g_jit_frameless_chunks = 0;  /* #97 reach probe (TESTS) */
 unsigned long g_jit_frameless_calls = 0;   /* #97 reach probe (TESTS) */
 unsigned long g_jit_arg_scalar = 0;

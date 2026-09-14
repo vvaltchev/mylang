@@ -1303,6 +1303,30 @@ struct Instr {
     bool a_is_lit() const { return opflags & 1; }
     bool elem_bool_hint() const { return opflags & 0x40; }
     void set_elem_bool_hint() { opflags |= 0x40; }
+    /*
+     * #111: on a CAPTURE op (LoadCaptureV / StoreCaptureV), bit 0x40
+     * instead means "the captured variable is a PROVEN int/float".
+     * Sharing the bit with `elem_bool_hint` is safe for the reason
+     * `struct_checked` gives for bit 7: these flags are per-OPCODE and
+     * the two opcode families do not overlap. `set_a`/`set_b` mask only
+     * their own bits (0x07 / 0x38), so the flag survives them.
+     *
+     * WHAT IT BUYS. A capture read/write is the boxed 32-byte
+     * EvalValue copy with a runtime reference check on each side -
+     * TWENTY emitted instructions apiece. `start++` inside
+     * `func [start] { start++; return start; }` therefore costs 40 of
+     * its fragment's 83 Ir, for one `add`, because there is no typed
+     * capture op and the boxed path cannot know the value is an int.
+     * The inferencer does know: this flag carries that proof to the
+     * JIT, which then copies 8 payload bytes and skips both checks.
+     *
+     * ⛔ A HINT, NEVER A REQUIREMENT: the VM ignores it entirely and
+     * the JIT may too. Only a WRONGLY SET flag is unsound - it would
+     * skip a release (a leak) or tear a reference into 8 bytes - so it
+     * is set ONLY where the inferencer's `TypeHint` is in hand.
+     */
+    bool cap_scalar() const { return opflags & 0x40; }
+    void set_cap_scalar() { opflags |= 0x40; }
     /* G4: LoadStructFieldInt/Float in its SUBSCRIPT form (`a[i].f`) - it must
      * wrap a negative index, bounds-check, and serve a PROMOTED general array,
      * none of which the struct-foreach form needs. A flag on the SAME opcode

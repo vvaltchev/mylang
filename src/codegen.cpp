@@ -4277,6 +4277,11 @@ struct Codegen {
         in.op = OpCode::LoadCaptureV;
         in.target = t;
         in.target2 = id->sym.slot;
+        /* #111: the guard above already proved `id->th` is i (or f, for
+         * the float caller), so the captured variable can only ever hold
+         * that scalar - the JIT may skip the boxed copy's reference
+         * checks and move 8 payload bytes instead of 24. */
+        in.set_cap_scalar();
         ops.push_back(in);
         out = slot_op(t);
         return true;
@@ -4398,6 +4403,12 @@ struct Codegen {
         st.op = OpCode::StoreCaptureV;
         st.target = id->sym.slot;
         st.set_a(slot_op(t));        /* aop invalid == a PLAIN assign */
+        /* #111: `t` is the int/float the typed op above produced, and
+         * the capture is the same variable `try_capture_leaf` proved
+         * scalar - so neither the source gate nor the capture's own
+         * current-value reference check can fail. AFTER set_a, which
+         * masks only bits 0x07. */
+        st.set_cap_scalar();
         ops.push_back(st);
     }
 
@@ -9450,6 +9461,20 @@ static void compute_ref_slots(const std::vector<CgInstr> &code,
                  * propagates that into every argument staged from it:
                  * a refinement is only as good as the facts under it.
                  */
+                /*
+                 * #111: a `cap_scalar` LoadCaptureV writes a PROVEN
+                 * int/float, so its dst is no more a reference than an
+                 * IntBin's. The third instance today of the same rule
+                 * (MoveV, LoadConstV, and now this): a table entry that
+                 * says "this op writes anything" is right about the
+                 * OPCODE and wrong about the INSTRUCTION.
+                 *
+                 * It matters twice over here: the dst's own ref-check in
+                 * the emitted read disappears, and so does the slot from
+                 * the return path's release scan.
+                 */
+                if (in.op == OpCode::LoadCaptureV && in.cap_scalar())
+                    return;
                 if (in.op == OpCode::LoadConstV) {
                     const size_t ci = static_cast<size_t>(in.target2);
                     if (ci < chunk.consts.size()

@@ -1,0 +1,85 @@
+# THE PROVEN-SCALAR CAPTURE (#111). A capture read/write was the boxed
+# 32-byte EvalValue copy with a runtime reference check on EACH side -
+# twenty emitted instructions apiece - because no typed capture op
+# exists and the boxed path cannot know the value is an int. The
+# inferencer does know, and `Instr::cap_scalar` carries that proof to
+# the JIT, which then moves 8 payload bytes and skips both checks.
+#
+# So this file is about the PROOF's boundary: every shape below either
+# must take the short form and stay correct, or must NOT take it and
+# stay correct. corpus_diff runs it against the tree-walker, which has
+# none of this, so any divergence is the flag being wrong.
+
+# ---- THE SHAPE IT IS FOR: an int capture, read and written
+func make_counter(start) => func [start] { start++; return start; };
+var c = make_counter(10);
+var s = 0;
+for (var i = 0; i < 50; i++) s = s + c();
+print("int    ", s, c());
+
+# ---- the FLOAT twin: read_float_slot promotes, so `f` qualifies too
+func make_acc(base) => func [base] (x) { base = base + x * 0.5; return base; };
+var fa = make_acc(1.5);
+var f = 0.0;
+for (var i = 0; i < 20; i++) f = f + fa(i * 1.0);
+print("float  ", f);
+
+# ---- a BOOL capture is stamped `th == i` and promotes to 0/1, so it
+# ---- takes the same path - and must still READ BACK as a bool
+func make_flag(b) => func [b] { var dyn t = b; return t; };
+var fl = make_flag(runtime(1) > 0);
+print("bool   ", fl(), fl());
+
+# ---- THE DECLINE: a REFERENCE capture must keep both checks and the
+# ---- boxed copy. A wrongly-flagged one would tear the handle into 8
+# ---- bytes and skip the release - under RECYCLE=1 + ASan that is a
+# ---- use-after-free, which is why this case mutates and re-reads.
+func make_box(arr) => func [arr] (v) { append(arr, v); return len(arr); };
+var box = [1, 2, 3];
+var bx = make_box(box);
+var n = 0;
+for (var i = 0; i < 30; i++) n = n + bx(i);
+print("ref    ", n, len(box));
+
+# ---- a STRING capture: a reference whose value is REPLACED each call,
+# ---- so the capture's own release path runs every time
+func make_app(sep) => func [sep] (t) { sep = sep + t; return len(sep); };
+var ap = make_app("-");
+var m = 0;
+for (var i = 0; i < 20; i++) m = m + ap("x");
+print("str    ", m);
+
+# ---- a DYN capture that alternates between an int and a string: the
+# ---- variable is not scalar-typed, so the flag must never be set
+func make_dyn(seed) {
+    var dyn cur = seed;
+    return func [cur] (k) {
+        var dyn t = cur;
+        if (k % 2 == 0) { cur = k; } else { cur = "s"; }
+        return str(t);
+    };
+}
+var dn = make_dyn(0);
+var acc = "";
+for (var i = 0; i < 6; i++) acc = acc + dn(i);
+print("dyn    ", acc);
+
+# ---- TWO closures over the SAME factory call keep independent
+# ---- captures - the short form writes through the closure's own
+# ---- capture vector, not a shared one
+func two() {
+    var n = 0;
+    return [func [n] { n++; return n; }, func [n] { n++; return n; }];
+}
+var pair = two();
+var p0 = pair[0];
+var p1 = pair[1];
+print("indep  ", p0(), p0(), p1());
+
+# ---- a capture read in a CONDITION and in ARITHMETIC, the two shapes
+# ---- that reach the typed leaf by different routes
+func make_cmp(limit) => func [limit] (x) { if (x < limit) { return 1; } return 0; };
+var cm = make_cmp(10);
+var below = 0;
+for (var i = 0; i < 20; i++) below = below + cm(i);
+print("cond   ", below);
