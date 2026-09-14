@@ -146,6 +146,18 @@ them means anything:**
   that cannot prove it is in the configuration it tests goes vacuous
   the day a default moves.
 
+- **`-dcs`** (calleeset.cpp.h) - WHICH FUNCTION does this call site
+  reach. The CALLEE-SET analysis's only possible oracle: the analysis
+  changes no answer any program computes, so the five-mode
+  differential, `corpus_diff` and every fuzzer are blind to it BY
+  CONSTRUCTION (the *Testing an AST TRANSFORM* gap) - the SET is what
+  a test must assert, which is why the dump was built in the same
+  increment as the analysis and before any consumer. Oracle: the
+  `infer: the CALLEE-SET analysis` `-rt` entry, one case per
+  constraint form and one per ⊤ SINK, each watched failing against a
+  sabotage build. Note ⊥ ("nothing can reach here") and ⊤ ("I do not
+  know") are DIFFERENT answers and both are pinned - collapsing them
+  is the flaw in `StaticType::finfos` that this replaces.
 - **`tests/myv_doc_check.py`** - is `docs/myv-format.txt` still the
   spec. Oracle: it is written from the DOC, not from serialize.cpp.
 - **`scripts/jitprofile.py` + `MYLANG_JIT_MAP=<path>`** - WHICH
@@ -1397,6 +1409,14 @@ Running scripts:
                                  # for 5543 bytes until 2026-08-17)
 ./build/mylang -nti FILE         # disable static type inference / checking
 ./build/mylang -dti FILE   # dump every identifier's inferred type + uses
+./build/mylang -dcs FILE   # dump every CALL SITE's CALLEE SET (#116):
+                                 # which function(s) the callee expression can
+                                 # reach - `direct` / `one` / `many` / `top`
+                                 # (unknown) / `none` (nothing can reach here)
+                                 # / `builtin` - plus one `dcs-esc` line per
+                                 # function whose value left the analysed
+                                 # program. Runs inference non-strict and
+                                 # exits, exactly like -dti
 ./build/mylang -a FILE           # analyze: source colored by optimization
 ./build/mylang -a --no-color F   # same, plain (for piping / diffing)
 ./build/mylang -T CATS FILE      # trace the compiler's reasoning to stderr
@@ -1851,6 +1871,12 @@ nothing to register).
   structural array/dict/func shapes). See `plans/archived/type-inference.md`.
 - `inferencer.cpp` / `inferencer.h` — `infer_types(root)`, the **whole-program
   static type inference + checking** pass (see the dedicated section below).
+- `calleeset.cpp.h` — **THE CALLEE-SET ANALYSIS** (#116), `#include`d once
+  at the end of `inferencer.cpp` (the `.cpp.h` convention below; it needs
+  `TypeSym`/`FuncInfo`, which live in that file's anonymous namespace). It
+  answers ONE question - *which function does this expression evaluate
+  to?* - as a set or ⊤, keyed by PROGRAM LOCATION rather than by type.
+  See the dedicated section below.
 - `backtrace.cpp` / `backtrace.h` — `format_backtrace()`, which renders an
   `Exception`'s captured call-stack (see the error model section).
 - `analyzer.h` / `analyzer.cpp` — the `AnalysisInfo` `Loc`-keyed annotation
@@ -1862,9 +1888,10 @@ nothing to register).
   `specialize_types` in `inferencer.cpp`, mutation-time records in
   `parser.cpp`/`resolver.cpp`). See the `-a` description under "Build & run".
 
-**The `.cpp.h` convention.** Files under `src/types/` and `src/builtins/` are
-named `*.cpp.h` and are
-`#include`d *once* into `types.cpp`. Each starts with a comment: "this is NOT a
+**The `.cpp.h` convention.** Files under `src/types/` and `src/builtins/` (and
+`src/calleeset.cpp.h`) are named `*.cpp.h` and are
+`#include`d *once* into one TU (`types.cpp`; `inferencer.cpp` for
+`calleeset.cpp.h`). Each starts with a comment: "this is NOT a
 header file… it's a
 C++ file in the form of a header, just because it's faster to compile it this
 way." So `types.cpp` is
@@ -3769,6 +3796,100 @@ callee to a prior clone), and `make_template_clone` clears the clone subtree's
 `id_sym`/`func_of_decl`. (This was an MSVC-only, address-dependent,
 non-deterministic bug, root-caused via CI instrumentation; GCC/clang +
 sanitizers never reproduced it.)
+
+### THE CALLEE-SET ANALYSIS (#116, `calleeset.cpp.h`)
+
+**The category error it fixes.** There are TWO different questions about
+a callable value, and MyLang had been answering both with one mechanism:
+
+ - **SHAPE** - *how do I emit the call, the window, the return?* Asked
+   by the JIT, answered by the `Func` StaticType. N functions
+   assignable to one variable share ONE shape, and one answer is
+   exactly what the emitter needs - so `join`'s
+   `if (static_type_equal(a,b)) return a;` shortcut is CORRECT for it
+   and nothing here changes that.
+ - **IDENTITY** - *is it always the SAME function?* Asked by
+   devirtualization, by value-template instantiation, and by #115
+   (typing a factory-returned closure's parameters from its call
+   sites).
+
+`StaticType::finfos` asks IDENTITY off the SHAPE object. Two distinct
+functions routinely have equal types (`func sq(x) => x*x;` and
+`func neg(x) => 0-x;` are both `func(?)->?`), so **every shape-level
+equivalence is a place identity dies** - the `join` shortcut was the
+first one found (fixed 2026-08-28) and the class is open-ended, because
+"treat equal types as interchangeable" is what a type system is FOR.
+
+**And the deeper flaw: `finfos` has no ⊤.** It cannot distinguish
+*"nothing flows here"* from *"I have no idea"* - both are the empty set.
+That is why `escaped_finfos` / `FuncInfo::value_escaped` exist at all (a
+side ledger carrying the unknown the set cannot express), why that
+ledger is structurally insufficient (it records members a join DROPPED
+and says nothing about members that never ENTERED), and why
+`finfos.size() == 1` was never a proof - #115 needed a UNIFORMITY rule
+on top purely to survive it.
+
+**The analysis**: a monotone least fixpoint over FUNCTION VALUES ONLY -
+inclusion-based (Andersen-style), flow-insensitive, one abstract object
+per container ALLOCATION SITE. Locations are `Sym(TypeSym*)`,
+`Ret(FuncInfo*)` and `Elem(obj)`, keyed by PROGRAM LOCATION and never by
+type. Every constraint is `dst ⊇ src` with ⊤ absorbing, so - unlike the
+type fixpoint, which is deliberately Jacobi because a `join` CONFLICT is
+order-sensitive - iteration order cannot change the answer.
+
+**Queries**: `callee_set(e)` -> a set or ⊤; `callee_escaped(f)` ->
+did f's value leave the analysed program. **A consumer must require
+`|set| == 1 && !top`**; ⊥ is a real, different answer ("no function can
+reach here" - a base TEMPLATE's parameter, since every call was
+redirected to a clone) and must never be read as a MUST answer.
+
+**⛔ THE FAIL-CLOSED DIRECTION IS ⊤, AND IT IS RULE 1, NOT PRECISION.**
+A MISSING member is a wrong MUST answer: `{F}` where the truth is
+`{F,G}` makes #115 type F's parameters from arguments G received, and
+every unboxed tier downstream is built on that proof (*static types
+imply runtime guards*). An EXTRA member costs an optimization. So every
+path that cannot name what flows answers ⊤ - a builtin's result, a
+value read out of a baked const pool, a caught exception payload, the
+REPL's open world - and **`cs_eval`'s switch has NO `default`**, so
+`-Werror=switch` forces every new `ConstructType` to be classified
+rather than falling through as "no function here" (the
+`esc_known_shape` rule: an unrecognised kind HIDES occurrences).
+
+**⛔ THREE RULES IT ALREADY EARNED, all three found by its own `-dcs`
+dump on the corpus, and all three in the UNSOUND direction:**
+
+ - **`append` IS A WRITE, not an opaque builtin.** Treating every
+   builtin as a black box loses the STORE, so `var fns = []; append(fns,
+   mk(i));` left the array EMPTY and `fn(1)` answered ⊥ for a site that
+   reaches five closures. Note the allowlist here is INVERTED from
+   `esc_builtin_transparent`'s: a builtin handed a container makes its
+   contents UNKNOWN unless the write is modelled exactly, so a missing
+   entry costs precision and can never cost soundness.
+ - **`None` IS "NOT PINNED YET", NOT "EMPTY"** - the inferencer's own
+   defer-on-Unknown/None invariant. `var fns = [];` types the LITERAL
+   `array<none>`, so a `can this hold a function?` gate that answered
+   *no* pruned the allocation site before it existed.
+ - **A BAKED CONST VALUE IS NOT IN THE TREE.** `const OPS = [sq];` folds
+   to ONE `LiteralObj` at parse time, FuncObject and all
+   (`const_pool_func.my`'s shape) - and so does the everyday `var a =
+   [];`. A blanket ⊤ there is sound but makes the commonest container
+   initialiser untraceable, so the value is WALKED, FuncObjects resolved
+   back through `desc->decl`, with ⊤ only for what cannot be named.
+
+**Testing it: `-dcs` is the ONLY possible oracle.** The analysis changes
+no answer any program computes, so the five-mode differential,
+`corpus_diff` and every fuzzer are blind by construction. The `-rt`
+entry asserts the SET per constraint form AND a stated ⊤ per SINK, each
+watched failing against a sabotage build (see the entry's header for the
+six that fail and the one that is proven redundant instead).
+
+**Status: increment 1 only - the analysis exists and NOTHING CONSUMES
+IT.** Increments 2-4 migrate #115, `value_instantiate_round` (then
+DELETE `finfos`/`escaped_finfos`/`value_escaped`) and the resolver's
+three partial analyses (`callee_of`, `slot2fn`/`direct_func_slot`,
+`esc_callback_fn`). ⛔ Increment 4 is MEMORY-SAFETY-CRITICAL: #93/#94
+make a false "safe" a use-after-free. Full plan:
+`plans/callee-set-analysis.md`.
 
 ## The value & type model (the subtle part)
 

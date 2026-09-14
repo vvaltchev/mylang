@@ -38,6 +38,7 @@ static int opt_inline_threshold = 24;  /* max inlined body size (nodes) */
 static bool opt_no_run;
 static bool opt_no_type_infer;
 static bool opt_debug_ti;
+static bool opt_debug_cs;
 static bool opt_analyze;
 static bool opt_no_color;
 static bool opt_repl;
@@ -284,6 +285,9 @@ void help()
     cout << " -nti      No type inference / checking (debug)" << endl;
     cout << " -dti      Dump inferred types of all identifiers, then exit"
          << endl;
+    cout << " -dcs      Dump each call site's CALLEE SET (which function(s)"
+         << endl;
+    cout << "           it can reach, or 'top'), then exit" << endl;
     cout << "  -a       Analyze: reprint the source with colors showing which"
          << endl;
     cout << "           optimizations fired (--analyze; --no-color for plain)"
@@ -545,6 +549,10 @@ parse_args(int argc, char **argv)
 
             opt_debug_ti = true;
 
+        } else if (!strcmp(arg, "-dcs")) {
+
+            opt_debug_cs = true;
+
         } else if (!strcmp(arg, "-a") || !strcmp(arg, "--analyze")) {
 
             opt_analyze = true;
@@ -763,6 +771,12 @@ int main(int argc, char **argv)
          * sites (machine-readable) and exit, without running. */
         if (opt_debug_ti) {
             dump_type_info(root.get(), cout);
+            return 0;
+        }
+
+        /* -dcs: dump each call site's callee set (#116) and exit. */
+        if (opt_debug_cs) {
+            dump_callee_sets(root.get(), cout);
             return 0;
         }
 

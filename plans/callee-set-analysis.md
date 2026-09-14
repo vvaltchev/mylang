@@ -1,10 +1,11 @@
 # THE CALLEE-SET ANALYSIS: one answer to "which function is this?"
 
-**Status: AGREED, NOT STARTED (2026-08-28).** A STRUCTURAL change, not a
-performance one - the maintainer's framing when agreeing to it. The
-measured payoff on today's corpus is ~2.8% on one bench (#115); the
-argument is that FOUR partial analyses answering slices of one question
-become ONE, and that the answer becomes able to say "I do not know".
+**Status: INCREMENT 1 LANDED (2026-08-28), 2-4 NOT STARTED.** A
+STRUCTURAL change, not a performance one - the maintainer's framing when
+agreeing to it. The measured payoff on today's corpus is ~2.8% on one
+bench (#115); the argument is that FOUR partial analyses answering
+slices of one question become ONE, and that the answer becomes able to
+say "I do not know".
 
 ## The category error this fixes
 
@@ -95,6 +96,24 @@ already runs.
 (unknown). Cap the set at a small N and collapse to ⊤ past it, so a
 pathological program cannot make the sets large.
 
+⛔ **AS BUILT, THE LOCATIONS ARE `Sym` / `Ret` / `Elem(obj)` ONLY** -
+one abstract object per container ALLOCATION SITE, with symbols
+pointing at objects as well as functions (textbook Andersen). That
+replaces the plan's `elem(S)`/`val(S)`-per-SYMBOL sketch, which is
+unsound without an alias analysis: two symbols can name ONE container
+with no copy the walk models (`f(p)` binds it to a parameter, `[p]`
+nests it, a `dyn` alias re-reads it). Letting the OBJECT be the
+location makes aliasing fall out of the ordinary `q = p` copy rule.
+Struct fields and dict keys/values share their instance's object -
+field- and key-insensitive, which costs precision only on a program
+that puts different functions in different fields of one struct type.
+
+The opposite simplification - ONE shared "heap" location - was tried
+first and is trivially sound but useless: it merges every container in
+the program, and would alone drop
+`tests/functional/25_factory_closure_param.my` case (6) from a MUST
+answer to a 5-way decline. That is now a watched-failing sabotage.
+
 **Constraints**, one walk:
 
 ```C#
@@ -116,13 +135,20 @@ typing that one function's parameters.
 Each lands green on the full net battery. The order is chosen so the
 first one is measurable and the risky one is last.
 
-**1. THE ANALYSIS + ITS OWN TESTS, CONSUMED BY NOBODY.** Build the
-locations, lattice, constraints, solver and the query. Add a dump
-(`-dcs`, in the `-dti` spirit) printing each call site's callee set, so
-the pass is inspectable before anything depends on it. `-rt` cases
-assert the set for each constraint form ABOVE, and - the part that
-matters - assert ⊤ for each sink. INERT: no consumer, no behaviour
-change, the corpus must be byte-identical.
+**1. THE ANALYSIS + ITS OWN TESTS, CONSUMED BY NOBODY. ✅ DONE
+(2026-08-28)** - `src/calleeset.cpp.h`, `#include`d once into
+inferencer.cpp, run at the end of `infer_one` after the instantiate
+loop. `-dcs` dumps one row per call site
+(`direct`/`one`/`many`/`top`/`none`/`builtin`) plus one `dcs-esc` per
+escaped function; the `infer: the CALLEE-SET analysis` `-rt` entry
+asserts the set per constraint form and a stated ⊤ per sink, plus a
+`driver_checks.sh` case (a new CLI flag - `-rt` cannot see the driver).
+INERTNESS PROVEN: `-vd` byte-identical on all 126 corpus programs
+against a HEAD baseline.
+
+Corpus-wide answers: **48 `one`** (a MUST answer reached through a
+value), 14 `many`, **2 `top`**, 1 `none`, 152 `direct`, 767 `builtin`;
+21 functions escape.
 
 **2. MIGRATE #115.** `snapshot_indirect_callees` queries the analysis
 instead of `finfos`. Its uniformity rule DISSOLVES: it exists only to
@@ -167,6 +193,13 @@ Not the solver - the sequencing.
 **Open**: whether one run serves both sides or increment 4 needs its own
 re-run. Decide with a measurement (does re-running change any answer on
 the corpus?), not by argument.
+
+**Increment 1 placed it at the end of `infer_one`, after
+`instantiate_to_fixpoint()`** - for #115's reason exactly: a call to a
+template DEFERS by design, so a factory's return type does not exist
+until instantiation has made the clone and REDIRECTED the call. Run
+before that loop, the analysis walks call sites that no longer exist
+and misses the ones that replaced them.
 
 ## The sink audit
 
@@ -216,3 +249,55 @@ oracles are:
  - It is not a general points-to analysis. Function values only; no
    aliasing of containers, no field sensitivity beyond "this field can
    hold these functions".
+
+## What increment 1 actually found
+
+Three bugs, ALL in the unsound direction (a wrong MUST answer, not a
+lost optimization), and all three found by the `-dcs` dump run over the
+corpus rather than by any test written in advance. That is the argument
+for building the dump in the same increment as the analysis.
+
+1. **`append` IS A WRITE, not an opaque builtin.** Treating every
+   builtin as a black box loses the STORE, so
+
+       var fns = [];
+       for (var i = 0; i < 5; i++) append(fns, mk(i * 100));
+       foreach (var fn in fns) tot += fn(1);      # <- ⊥ !
+
+   left the array empty and answered ⊥ - "no function value can reach
+   here" - for a site that reaches five closures. ⊥ is a MUST answer.
+   FIXED with an allowlist INVERTED from `esc_builtin_transparent`'s: a
+   builtin handed a container makes its contents UNKNOWN unless the
+   write is modelled exactly, so a missing entry costs precision and
+   can never cost soundness.
+
+2. **`None` is "NOT PINNED YET", not "empty"** - the inferencer's own
+   defer-on-Unknown/None invariant, met from a new direction. The
+   cheap precision gate ("can a function be in this expression at
+   all?") answered *no* for the LITERAL in `var fns = [];`, whose own
+   type is `array<none>` even though the variable is `array<func>` -
+   so no abstract object was ever allocated for the commonest
+   container initialiser in the language.
+
+3. **A BAKED CONST VALUE IS NOT IN THE TREE, so it is walked as a
+   VALUE.** `const OPS = [sq];` folds to ONE `LiteralObj` at parse time
+   (`const_pool_func.my`'s shape) - and so does `var a = [];`. A
+   blanket ⊤ is sound but makes that untraceable, so `cs_eval_value`
+   chases the FuncObjects out through `desc->decl`, ⊤ only for what it
+   cannot name. It resolves `NESTED[0][0]` to `inc` through two levels.
+
+Plus one UBSan catch (`LiteralDict`'s elements are `LiteralDictKVPair`,
+not `Construct`, so the plain `MultiElemConstruct<>` downcast is a
+different type) and one structural decision recorded rather than
+papered over: `cs_eval`'s builtin-callee branch is PROVEN REDUNDANT -
+deleting it fails no test, because a builtin name has no `TypeSym` and
+the generic path reaches the same ⊤ - so it carries an `ML_CHECK`
+saying so, the same treatment #93's reassignment guard has.
+
+**Watched failing, one sabotage build per rule:** None-is-unpinned ->
+false; append/push not modelled; one shared heap instead of allocation
+sites; LiteralObj back to a blanket ⊤; builtin arguments do not escape;
+a catch binding is not ⊤; the flag falls through and `-dcs` runs the
+program; `cs_ran` forced false. Deleting the `cs_run` CALL fails the
+BUILD (`-Werror=unused-function`), which is a free structural guard
+against the pass going dead.
