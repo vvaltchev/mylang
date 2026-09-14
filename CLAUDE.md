@@ -4177,10 +4177,29 @@ sanitizers never reproduced it.)
   **`const FuncDescriptor *`** (funcdesc.h — NEVER a `FuncDeclStmt*`), the
   per-instance **`capture_slots`** (captured values, read via
   `SymKind::capture`; snapshot at creation from the descriptor's RESOLVED
-  capture kind/slot list via `read_sym`, the descriptor twin of
+  capture kind/slot list via **`read_sym_lv`**, the descriptor twin of
   `Identifier::do_eval` — no capture Identifier is evaluated), and
-  **`capture_root`** — the program root (`get_root_ctx` at creation), which
+  **`capture_root`** — the program root (`EvalContext::root`), which
   the body's `args_ctx` parents to so it reaches `gfuncs` + the builtins map.
+  **⛔ `read_sym_lv` IS THE DISPATCH; `read_sym` IS A WRAPPER OVER IT
+  (#114, 2026-08-27)** — every answer either can give except an
+  `UndefinedId` is a slot, and `read_sym` boxed its ADDRESS into an
+  `EvalValue` purely so the caller could unbox it again with `RValue()`.
+  The capture snapshot took the slot directly and built its `LValue` in
+  place, turning FOUR `EvalValue` lifecycle events per captured value
+  (box the address, copy out, move in, destroy the temporary — each with
+  its own `type->t >= t_str` test) into ONE. `read_sym_lv` returns null
+  EXACTLY where `read_sym` answers `UndefinedId`, i.e. where the
+  following `RValue()` throws, so a caller's fallback is the ERROR path
+  and the two cannot disagree about a value. **`EvalContext::root`** is
+  the same shape one level down: inherited from the parent like `frame`
+  / `gfuncs` / `captures`, where `get_root_ctx` used to WALK the parent
+  chain per closure. The trade is one store per EvalContext against one
+  walk per closure, and it is lopsided the right way *because the VM+JIT
+  call protocol builds no EvalContext per call* — measured at ~30k Ir of
+  EvalContext construction in a program that creates 400,000 closures.
+  Together: **113 -> 85 Ir per closure creation, 63_closures -4.22% Ir
+  and 0.95x wall.**
   That used to be an `EvalContext capture_ctx` BY VALUE, an empty node whose
   only job was to be that parent; constructing one cost ~39 Ir per closure and
   carried a `std::map` nobody wrote, and since the ctor inherits

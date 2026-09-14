@@ -90,6 +90,7 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx,
     , gfuncs(parent ? parent->gfuncs : nullptr)
     , captures(parent ? parent->captures : nullptr)
     , flow((parent && !func_ctx) ? parent->flow : &flow_state)
+    , root(parent ? parent->root : this)     /* #114 */
 {
     /* Load builtins into the map ONLY for a context that resolves names through
      * the map: the const-evaluator (const_builtins) and the REPL (both). A
@@ -364,15 +365,25 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
  * unresolved name. Keep the two in lockstep - the FuncObject ctor's capture
  * snapshot must read a captured name EXACTLY as an Identifier read would.
  */
-EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
-                   const UniqueId *uid)
+/*
+ * #114: see the declaration. The SAME dispatch as read_sym, handing
+ * back the slot instead of an EvalValue wrapping it; null where
+ * read_sym would have answered `UndefinedId`.
+ *
+ * ⛔ THE TWO MUST AGREE, and the shape that keeps them agreeing is
+ * that read_sym is written IN TERMS OF THIS ONE below - there is one
+ * dispatch, not two copies free to drift. The unbound-global throw
+ * lives here, so both callers get it.
+ */
+LValue *read_sym_lv(EvalContext *ctx, SymKind kind, int slot,
+                    const UniqueId *uid)
 {
     if (kind == SymKind::local && ctx->frame)
-        return EvalValue(&ctx->frame->at(slot));
+        return &ctx->frame->at(slot);
 
     if (kind == SymKind::global && ctx->gfuncs) {
         if (ctx->gfuncs->defined[slot])
-            return EvalValue(&ctx->gfuncs->slots[slot]);
+            return &ctx->gfuncs->slots[slot];
 
         /* See Identifier::do_eval: declared (it has a slot) but not bound. */
         throw UnboundSymbolEx(
@@ -380,13 +391,13 @@ EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
     }
 
     if (kind == SymKind::capture && ctx->captures)
-        return EvalValue(&(*ctx->captures)[slot]);
+        return &(*ctx->captures)[slot];
 
     if (kind == SymKind::builtin) {
         if (ctx && ctx->const_ctx && !builtin_is_const(slot))
-            return UndefinedId{uid->val};
+            return nullptr;              /* read_sym: UndefinedId */
 
-        return EvalValue(&builtin_slot(slot));
+        return &builtin_slot(slot);
     }
 
     while (ctx) {
@@ -394,10 +405,19 @@ EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
         LValue *lval = ctx->lookup(uid);
 
         if (lval)
-            return EvalValue(lval);
+            return lval;
 
         ctx = ctx->parent;
     }
+
+    return nullptr;                      /* read_sym: UndefinedId */
+}
+
+EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
+                   const UniqueId *uid)
+{
+    if (LValue *lv = read_sym_lv(ctx, kind, slot, uid))
+        return EvalValue(lv);
 
     return UndefinedId{uid->val};
 }
