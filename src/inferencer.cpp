@@ -1017,39 +1017,34 @@ void Inferencer::snapshot_indirect_callees(Block *rootBlock)
         FuncInfo *fi = static_cast<FuncInfo *>(ct->finfos[0]);
         if (!fi || fi->is_template || fi->value_escaped)
             continue;                       /* instantiation handles those */
+        /* `value_escaped` covers the OTHER way a set stops describing
+         * the value: a join that could not reconcile its members drops
+         * them into the ledger rather than losing them silently. */
         sites[fi].push_back(call);
     }
 
     /*
-     * 2) ⛔ UNIFORMITY, AND IT IS NOT A REFINEMENT - WITHOUT IT THIS
-     * PASS REFUSES VALID PROGRAMS.
+     * 2) UNIFORMITY: every site attributed to a callee must agree, or
+     * none of them contributes - the same rule
+     * `value_instantiate_round` applies to a template's signature.
      *
-     * "The callee type names exactly one function" is NOT the same as
-     * "this call provably reaches that one function". The finfo set is
-     * built by flow and it UNDER-COLLECTS: two same-shaped closures put
-     * in an array and selected by index present a ONE-element set at
-     * every call site, because the path that computes the element type
-     * never reaches `join`'s Func arm (watched, with the arm
-     * instrumented). Both sites then attribute to the SAME survivor:
+     * ⛔ ITS JUSTIFICATION CHANGED, AND THAT IS WORTH KNOWING. It went
+     * in as a NECESSITY: the finfo set used to UNDER-COLLECT, because
+     * `join`'s `static_type_equal` shortcut dropped one side's
+     * candidates whenever two functions shared a signature. Two
+     * same-shaped closures in an array then presented a ONE-element set
+     * at every call site, both sites fed the same survivor `int` AND
+     * `str`, and a program with no conflict in it was REFUSED. That
+     * leak is fixed at its source now (statictype.cpp, join), so
+     * "size == 1" genuinely means one closure.
      *
-     *     var p = [mk_a(1), mk_b(2)];
-     *     var f = p[k % 2];
-     *     var g = p[(k + 1) % 2];
-     *     return f(7) + g("s");        # NO conflict - two functions
-     *
-     * and contributing per site gave that one FuncInfo both `int` and
-     * `str`, refusing a program that has no conflict in it at all.
-     *
-     * So the decision is made PER CALLEE over ALL of its attributed
-     * sites, exactly as `value_instantiate_round` decides a template's
-     * signature: they must agree, or none of them contributes. A
-     * genuinely single closure called from several places with one
-     * signature still qualifies; a survivor standing in for two does
-     * not, because the sites it collected disagree.
-     *
-     * `escaped_finfos` is consulted above as well, but it is NOT
-     * sufficient on its own and this is why: it reports a set that a
-     * join DROPPED members from, and here the members never ENTERED.
+     * What uniformity still does is a POLICY choice: a single closure
+     * whose call sites disagree DECLINES to `dyn` here, where a
+     * DIRECTLY-bound capturing lambda refuses the program. The factory
+     * form is the more permissive of the two. That asymmetry is
+     * deliberate and documented (CLAUDE.md, README); removing this
+     * check is what would make them agree, and it is a language
+     * decision, not a cleanup.
      */
     for (auto &kv : sites) {
         FuncInfo *fi = kv.first;

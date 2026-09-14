@@ -3713,6 +3713,30 @@ static const std::vector<test> tests =
             "assert(drive(runtime(3)) == \"271s\");",
         },
     },
+    /*
+     * COMPLETENESS of the candidate set itself. `join`'s
+     * `static_type_equal` shortcut dropped one side's finfos whenever
+     * two functions shared a signature - metadata excluded from
+     * equality, then discarded by an equality-based early exit - so a
+     * callee that may be either of two closures named ONE. With a
+     * single agreeing call site, uniformity could not catch it: this
+     * asserted `a:int5` before the fix, a type `p[k]` cannot
+     * guarantee.
+     */
+    {
+        "infer: joining two same-signature functions keeps BOTH "
+        "candidates (#115 finfo completeness)",
+        {
+            "func mk_a(n) => func [n] (x) { return \"a:\" + typestr(x); };",
+            "func mk_b(n) => func [n] (x) { return \"b:\" + typestr(x); };",
+            "func drive(int k) {",
+            "  var p = [mk_a(10), mk_b(20)];",
+            "  var f = p[k];",
+            "  return f(5);",
+            "}",
+            "assert(drive(runtime(0)) == \"a:dyn\");",
+        },
+    },
 
     {
         "Array equality: equal, length mismatch, type mismatch",
