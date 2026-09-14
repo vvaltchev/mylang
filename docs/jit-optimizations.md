@@ -10231,3 +10231,134 @@ not per access`, which asserts reach, RULE 2 (the lever off gives the
 same answer and claims no base), and the invariant - a closure calling
 ANOTHER closure between two accesses to its own capture, which really
 does repoint `ctx->captures` and back.
+
+## #113 - THE CAPTURE ROUND TRIP JOINS LEVER A (2026-08-27)
+
+#112 removed the second walk of the ctx chain. What was left in
+11_closure_counter's closure body was the value itself going through
+memory twice for one `add`:
+
+    +32  mov rax, [r13+0x18]   ; the capture's TYPE
+    +39  mov rcx, [r13+0x0]    ; the capture's PAYLOAD
+    +46  mov s0, rcx           ; store both into a temp...
+    +53  mov s0.type, rax
+    +60  mov rax, s0           ; ...that the next instruction reloads
+    +67  add rax, 1
+    +71  mov s1.type, <t_int>
+    +82  mov s1, rax
+    +89  mov rax, s1.type      ; reload the type just written
+    +96  mov rcx, s1           ; reload the payload just written
+    +103 mov [r13+0x0], rcx
+    +110 mov [r13+0x18], rax
+
+**LEVER A ALREADY REMOVES EXACTLY THIS SHAPE.** The capture ops were
+simply not in its whitelists - the AUDIT-TABLE FOURTH SHAPE from
+CLAUDE.md ("a table whose stale entry costs an OPTIMIZATION is not
+self-announcing"), and this time the table was not even stale: the ops
+had never been considered. Three pieces:
+
+ - **LoadCaptureV is a PRODUCER.** Its payload is the whole value, so
+   it loads straight into the bus register and, when the dst temp is
+   dead after the consumer, neither slot store is emitted - which kills
+   the capture's TYPE LOAD along with the type store it fed. Four
+   instructions for a temp that lives for one. Its helper arm REJOINS,
+   so it needs the slow-path bus reload the LoadElem* producers needed;
+   the helper always writes the slot, including where the fast arm
+   elided its store, so the slot is the right source there.
+ - **StoreCaptureV is a CONSUMER** at `a`. ⛔ IT ALSO READS THAT SLOT'S
+   TYPE WORD, which no other consumer does, so the arming site clears
+   `skip_write` for it: a type-word read is a live read the liveness
+   fixpoint cannot see, because it tracks SLOTS, not half-slots.
+ - **THE BUS CARRIES A TAG.** `Fwd::res_tag` - the producer declares
+   the type tag its own dst store wrote, the consumer writes that
+   IMMEDIATE into the capture instead of copying the word back out of
+   the slot. `jit_fwd_bus_tag` is an ALLOWLIST and the polarity is
+   load-bearing: null means "read the slot", the status quo.
+
+Both are per-INSTRUCTION refinements of per-OPCODE whitelists
+(`jit_fwd_producer` refuses a boxed capture; `jit_fwd_consumer` refuses
+a boxed or compound capture store), which keeps the opcode predicates
+meaning "this opcode CAN forward" for the ratchet and the census - the
+same split `jit_fwd_consumer` already made for its aliasing rules.
+
+**THE BUG IT FOUND, AND THE CONFIGURATION THAT FOUND IT.**
+`emit_ctx_chain` took an `AccScratch` - i.e. clobbered rax - for an
+intermediate it did not need, every step's source being the previous
+step's result. rax IS lever A's bus, so the walk emitted before a
+capture store destroyed the forwarded value: **17682002402471496 where
+20100 was expected.** The DEFAULT configuration cannot see it, because
+#112's pinned base skips the walk entirely - only
+`MYLANG_JIT_OFF=capbase` reaches it, and that case existed only because
+#112's own test asserts RULE 2 with its lever off. Fixed in the walk
+(it goes through its own output register now, same instruction count,
+one fewer register touched, and the global arm still leaves the table
+in `tbl`).
+
+**MEASURED** (callgrind Ir, `OPT=1 ASSERTS=0`, scale3-minus-scale1):
+
+    11_closure_counter   264,000,027 -> 252,000,027   -4.55%
+    63_closures          536,000,000 -> 531,200,000   -0.90%
+    78_typed_param_call  710,000,147 -> 702,000,147   -1.13%
+
+Each delta is EXACTLY six instructions times the bench's own capture
+call count (6 x 1,000,000 and 6 x 400,000). The closure fragment is
+**53 -> 44 instructions per call across #112 and #113**, and its whole
+capture round trip is now six:
+
+    mov rax, [r13+0x0]        ; read the capture
+    add rax, 1
+    mov s1.type, <t_int>      ; s1 is RETURNED, so both stores stay
+    mov s1, rax
+    mov [r13+0x0], rax        ; payload out, from the bus
+    mov [r13+0x18], <t_int>   ; tag out, as an immediate
+
+**WALL CLOCK** (one interleaved `--baseline` A/B): 11_closure_counter
+0.95x, 63_closures 0.97x, suite geomean **1.000x over 90**.
+
+**⛔ AND THE SCATTER IN THAT RUN IS NOISE, PROVEN NOT ASSERTED.** 53 of
+125 corpus programs' emitted code changed - `emit_ctx_chain`'s GLOBAL
+arm changed too, and most programs have a global store - so "the ±5-8%
+movers are noise" needed evidence, not a shrug. Per-iteration callgrind
+Ir for the six worst (24_dict_lookup, 43_sieve, 03_int_arith,
+37_range_builtin, 31_str_split_join, 09_fib_recursive) is **+0.0000%,
+exactly identical**, as are 12_higher_order, 80_regs_int_08,
+83_regs_int_40 and 14_array_subscript. The walk is the same three
+instructions either way.
+
+**SABOTAGE LEDGER.** One real, three unfalsifiable-and-recorded:
+
+    emit_ctx_chain walks through rax   -> the REAL bug above; -rt fails
+                                          via #112's capbase-off case
+    bus tag claims t_int for a
+      capture read                     -> every net green (see below)
+    the consumer may trigger
+      skip_write                       -> every net green (see below)
+    a boxed capture admitted as a
+      producer                         -> every net green (see below)
+
+**⛔ THE THREE UNFALSIFIABLE ONES ARE UNREACHABLE BY CONSTRUCTION, NOT
+UNDER-TESTED, and the difference took real work to establish.** The
+only `cap_scalar` StoreCaptureV codegen emits comes from
+`emit_typed_capture_update`, whose `a` operand is always the
+IntBin/FloatBin temp it just produced - never a LoadCaptureV. So a
+capture READ can never arm a capture STORE, which is what all three
+rules guard. Each is kept with that argument written at its site: the
+cost is nil, the failure prevented is a wrong VALUE, and the day
+codegen emits a typed `capA = capB` they must already be right.
+
+Getting there defeated TWO shape-eaters, both of which made an earlier
+version of the tag test pass WITH the sabotage in - worth recording
+because they are generic:
+ - returning the copy's SOURCE reads the tag the capture READ produced,
+   which is correct either way; the corrupted tag is the one the STORE
+   wrote, so the CAPTURE has to be read back;
+ - reading it back in the same call does not work either - the #97 step
+   2a BYTECODE peephole rewrites `b = a; var t = b;` into
+   `move t = <the store's source>`, so the capture is never re-read.
+   Reading it at the TOP of the body, i.e. observing what the PREVIOUS
+   call stored, is what defeats both.
+
+**TEST**: the `-rt` entry `jit: the capture round trip forwards (lever
+A) and its tag is fail-closed` - reach from `g_jit_fwd`, RULE 2 with
+`fwd` off AND with `capbase` off (not redundant: the second is what
+caught the rax clobber), and the bool tag case above.

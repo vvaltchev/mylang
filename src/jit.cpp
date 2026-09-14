@@ -4196,6 +4196,26 @@ struct Emitter {
         emit_modrm_disp(0, base, d);
         u8(imm);
     }
+    /*
+     * #113: THE TAG SEAM, base-relative. Same contract as
+     * store_type_tag_via and for the same reason its comment gives at
+     * length: the imm32 form exists only while the arena holds the
+     * singleton, so `scratch` is a REQUIRED parameter that the
+     * fallback genuinely uses, never an assumption that some register
+     * already holds the tag. `scratch` is clobbered either way.
+     */
+    void store_type_tag_base(uint8_t base, int32_t d, const void *tag,
+                             uint8_t scratch)
+    {
+        if (ml_lowmem_fits_imm32(tag)) {
+            store_qword_base_imm32(
+                base, d, static_cast<uint32_t>(
+                             reinterpret_cast<uintptr_t>(tag)));
+            return;
+        }
+        movabs(scratch, reinterpret_cast<uint64_t>(tag));
+        store_base(scratch, base, d);
+    }
     /* sub qword [base + disp], imm32  (group 81 /5) */
     void sub_qword_base_imm32(uint8_t base, int32_t d, uint32_t imm)
     {
@@ -6442,13 +6462,30 @@ static void emit_ctx_chain(Emitter &e, uint8_t cb, bool cap, uint8_t tbl)
 {
     e.scratch(cb);            /* the ctx chain walks through it */
     const JitLayout &L = jit_layout();
-    AccScratch acc(e);
-    e.load_global(acc.r, L.addr_ctx, acc.r);   /* the ctx */
+    /*
+     * ⛔ IT WALKS THROUGH ITS OWN OUTPUT REGISTER, NOT THROUGH RAX
+     * (#113). This used to take an AccScratch, i.e. clobber rax, for
+     * an intermediate it did not need - every step's source is the
+     * previous step's result, so the destination register serves.
+     *
+     * That was invisible until lever A started forwarding a value INTO
+     * a capture store: the bus register IS rax, and the walk emitted
+     * before the consumer read it destroyed the value. The default
+     * configuration hid it, because #112 pins the base and skips the
+     * walk entirely - only `MYLANG_JIT_OFF=capbase` reached it, and
+     * printed 17682002402471496 for 20100.
+     *
+     * Same instruction count, one fewer register touched, and the
+     * global arm still leaves the TABLE in `tbl` for the caller's
+     * `defined` byte - the parameterized contract is unchanged.
+     */
     if (cap) {
-        e.load_base(acc.r, acc.r, static_cast<int32_t>(L.ctx_captures));
-        e.load_base(cb, acc.r, 0);             /* cb = the captures data */
+        e.load_global(cb, L.addr_ctx, cb);     /* cb = ctx */
+        e.load_base(cb, cb, static_cast<int32_t>(L.ctx_captures));
+        e.load_base(cb, cb, 0);                /* cb = the captures data */
     } else {
-        e.load_base(tbl, acc.r, static_cast<int32_t>(L.ctx_gfuncs));
+        e.load_global(tbl, L.addr_ctx, tbl);   /* tbl = ctx */
+        e.load_base(tbl, tbl, static_cast<int32_t>(L.ctx_gfuncs));
         e.load_base(cb, tbl,                   /* cb = the gfuncs slots */
                     static_cast<int32_t>(L.gft_slots));
     }
@@ -9632,6 +9669,23 @@ struct JitFwd {
     uint8_t in_reg = 0; /* consumer side: the register holding it */
     int prod = -1;      /* producer side: this op's dst temp qualifies */
     uint8_t res_reg = 0;/* producer side: where the result was left */
+    /*
+     * #113: the TYPE TAG the producer's own dst store wrote, or null
+     * for "not known". A consumer that must write the value's tag
+     * somewhere else (the capture store) then writes the IMMEDIATE
+     * instead of copying the word back out of the slot.
+     *
+     * ⛔ FAIL-CLOSED BY CONSTRUCTION: null means "read the slot", the
+     * status quo. `jit_fwd_bus_tag` is an ALLOWLIST for that reason -
+     * a producer added later gets null and loses an optimization,
+     * where a denylist would claim t_int for it and could write the
+     * wrong tag. That is not hypothetical here: `cap_scalar` covers
+     * BOOL as well as int (`th == i` does), so the capture read - a
+     * producer - is exactly the op that must not claim t_int, and
+     * #108 is what the wrong answer looks like.
+     */
+    const void *res_tag = nullptr;
+    const void *in_tag = nullptr;   /* consumer side: the tag behind in_reg */
     bool skip_write = false;
     bool armed = false; /* the producer's emit confirmed res_reg at exit */
     /*
@@ -9695,6 +9749,16 @@ bool jit_fwd_op_is_producer(OpCode op)
     case OpCode::IntShlRI: case OpCode::IntShrRI:
     case OpCode::LoadElemInt:
     case OpCode::LoadElem2Int:
+    /*
+     * #113: the PROVEN-SCALAR capture read. Its payload is the whole
+     * value, it lands in the bus register, and its helper arm REJOINS -
+     * so it needs the slow-path reload the LoadElem* producers needed,
+     * which the emit does. The `cap_scalar` half of the condition is
+     * INSTRUCTION-level and lives in jit_fwd_producer below: a boxed
+     * capture copies 24 payload bytes and a reference is not a value
+     * anything downstream can consume from a register.
+     */
+    case OpCode::LoadCaptureV:
         return true;
     default:
         return false;
@@ -9703,9 +9767,67 @@ bool jit_fwd_op_is_producer(OpCode op)
 
 /* every producer's result slot is `target` - that is what makes the
  * opcode-level split above lossless */
+/*
+ * #113: the TAG a producer's dst store provably wrote, or null.
+ * An ALLOWLIST - see Fwd::res_tag for why the polarity is load-bearing.
+ */
+static const void *jit_fwd_bus_tag(OpCode op)
+{
+    switch (op) {
+    case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+    case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+    case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+    case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShrRR:
+    case OpCode::IntShlRI: case OpCode::IntShrRI:
+    case OpCode::LoadElemInt:
+    case OpCode::LoadElem2Int:
+        /* results that are ints BY CONSTRUCTION - the specialized
+         * arithmetic and the typed element reads. LoadCaptureV is
+         * deliberately ABSENT: it hands on whatever the capture held,
+         * and `cap_scalar` is set on `th == i`, which COVERS BOOL (see
+         * Construct::th_bool and bug #108, where exactly that
+         * conflation printed 1 for true).
+         *
+         * ⛔ THE EXEMPTION IS UNREACHABLE TODAY, and saying so is the
+         * point. A capture READ can only reach the capture STORE that
+         * would spend this tag by being its `a` operand - and the only
+         * cap_scalar StoreCaptureV codegen emits comes from
+         * `emit_typed_capture_update`, whose source is always the
+         * IntBin/FloatBin temp it just produced, never a LoadCaptureV.
+         * So the sabotage (adding LoadCaptureV here) leaves every net
+         * green, WATCHED. It is kept because the cost is nil and the
+         * failure it prevents is a wrong VALUE, not a crash - and
+         * because the day codegen emits a plain `capA = capB` in typed
+         * form, this is the line that has to already be right. */
+        return jit_layout().t_int;
+    default:
+        return nullptr;
+    }
+}
+
 static bool jit_fwd_producer(const Instr &in, int &dst)
 {
     if (jit_lever_off(JL_FWD) || !jit_fwd_op_is_producer(in.op))
+        return false;
+    /*
+     * #113: the one producer whose eligibility is per-INSTRUCTION, not
+     * per-opcode. A LoadCaptureV over a BOXED capture moves a 32-byte
+     * EvalValue and may move a REFERENCE; only the inferencer-proven
+     * scalar form has a single-register value to hand on. Refining here
+     * rather than in the opcode predicate keeps that predicate's
+     * meaning intact ("this opcode CAN forward") for the ratchet and
+     * the census, the same split jit_fwd_consumer already makes for its
+     * per-op aliasing rules.
+     */
+    /* ⛔ UNFALSIFIABLE TODAY (watched: removing it leaves every net
+     * green) - a boxed capture's dst is a reference-carrying slot, and
+     * no whitelisted CONSUMER reads one: the arithmetic family is
+     * typed and the capture store refuses its boxed form. It is the
+     * clause that keeps the producer's contract - "the value is a
+     * single register" - true by construction rather than by the
+     * consumer list's current membership. */
+    if (in.op == OpCode::LoadCaptureV && !in.cap_scalar())
         return false;
     dst = in.target;
     return true;
@@ -9816,9 +9938,44 @@ unsigned jit_fwd_op_consumer_slots(OpCode op)
         /* the accumulate VALUE only; the accumulator, the counter and a
          * slot bound all read their SLOTS */
         return JIT_FWD_B;
+    /*
+     * #113: the capture/global STORE reads its source at `a`. ⛔ IT
+     * ALSO READS THAT SLOT'S TYPE WORD, which no other consumer does -
+     * so the arming site must NOT let the producer skip its write for
+     * this one (jit_fwd_consumer_reads_type below). Forwarding here
+     * therefore removes the payload reload only, and the contract's
+     * "any other field naming the temp reads the SLOT, which
+     * skip_write may have left stale" is honoured by keeping the
+     * write rather than by refusing the pair.
+     */
+    case OpCode::StoreCaptureV:
+        return JIT_FWD_A;
     default:
         return 0;
     }
+}
+
+/*
+ * #113: does this consumer read the forwarded temp's TYPE word as well
+ * as its payload? Only the capture/global store does. The arming site
+ * clears `skip_write` for it - the elision's whole premise is that the
+ * slot is dead, and a consumer reading the type word is a live read the
+ * liveness fixpoint (which tracks slots, not half-slots) cannot see.
+ */
+static bool jit_fwd_consumer_reads_type(OpCode op)
+{
+    /*
+     * ⛔ ALSO UNFALSIFIABLE TODAY - watched, and for a reason worth
+     * writing down: the TAG mechanism covers it. Where this consumer
+     * is reachable the producer is a specialized int op, which DOES
+     * declare its tag, so the emit writes the immediate and never
+     * reads the (elided) type word at all. The two features protect
+     * each other. This is the belt: it is what stays correct if
+     * `jit_fwd_bus_tag` is ever narrowed, and it states the rule -
+     * "a consumer that reads the temp's TYPE word is a live read the
+     * liveness fixpoint cannot see" - which no other line does.
+     */
+    return op == OpCode::StoreCaptureV;
 }
 
 static bool jit_fwd_consumer(const Instr &nx, int t)
@@ -9829,6 +9986,18 @@ static bool jit_fwd_consumer(const Instr &nx, int t)
     const bool at_a = (m & JIT_FWD_A) && nx.a_slot() == t;
     const bool at_b = (m & JIT_FWD_B) && !nx.b_is_lit() && nx.b_slot() == t;
     if (!at_a && !at_b)
+        return false;
+    /*
+     * #113: the capture store forwards only in its PROVEN-SCALAR form.
+     * The boxed one copies 24 payload bytes through a borrowed scratch
+     * window, so a single bus register is not its value and the emit
+     * would have to read the slot anyway - arming it would cost the
+     * producer its write elision (see jit_fwd_consumer_reads_type) and
+     * buy nothing. StoreGlobalV is out entirely for the same reason:
+     * it has no scalar form.
+     */
+    if (nx.op == OpCode::StoreCaptureV
+            && (!nx.cap_scalar() || nx.aop != Op::invalid))
         return false;
     /* the per-op aliasing rules - "any OTHER field naming the temp reads
      * the SLOT, which skip_write may have left stale" */
@@ -18146,7 +18315,32 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (cscal)
             e.bump_counter(&g_jit_cap_scalar);
 #endif
+        /*
+         * #113: LEVER A PRODUCER. The payload IS the value here, so
+         * with the pair armed it is loaded straight into the declared
+         * bus register instead of via the slot - and when the dst temp
+         * is provably dead after the consumer, NEITHER slot store is
+         * emitted, which kills the capture's TYPE load along with the
+         * type store it existed to feed. Four instructions for a temp
+         * that lives for one.
+         *
+         * `fw` implies `cscal` (jit_fwd_producer refuses a boxed
+         * capture), so this arm never faces the 24-byte copy.
+         */
+        const bool fw = g_fwd.prod == in.target;
+        const bool skipw = fw && g_fwd.skip_write;
         AccScratch acc(e);
+        if (fw) {
+            e.load_base(acc.r, cb, coff + pv0);   /* payload -> the bus */
+            g_fwd.res_reg = acc.r;                /* declare where */
+            if (!skipw) {
+                e.store(acc.r, dst.payload);
+                hold();
+                e.load_base(cpy, cb, coff + ty0);
+                e.store(cpy, dst.type);
+                drop();
+            }
+        } else {
         e.load_base(acc.r, cb, coff + ty0);
         hold();
         e.load_base(cpy, cb, coff + pv0);
@@ -18159,13 +18353,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         drop();
         e.store(acc.r, dst.type);
+        }
         /* NOTHING JUMPS TO THE HELPER when every guard was elided, so
          * neither the join jump nor the helper body is emitted - a
          * proven-scalar read ends at its last store. The `jmp` was one
          * EXECUTED instruction per access and the helper a page of
          * unreachable bytes in the fragment's I-cache footprint. */
-        if (jhelp.empty())
+        if (jhelp.empty()) {
+            if (fw)
+                g_fwd.armed = true;
             return true;
+        }
         const size_t j_done = e.j32(0xEB);
         for (const size_t sj : jhelp)
             e.patch32_here(sj);
@@ -18176,7 +18374,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_load_capture) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
+        /* #113: the helper's status clobbered the bus - reload it on
+         * the SLOW arm only (the fast path jumps past this). The helper
+         * always writes the slot, including where the fast arm elided
+         * its store, so the slot is the right source on this path. */
+        if (fw)
+            e.load(g_fwd.res_reg, slot_addr(in.target).payload);
         e.patch32_here(j_done);
+        if (fw)
+            g_fwd.armed = true;
         return true;
     }
 
@@ -20342,6 +20548,40 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         if (cscal)
             e.bump_counter(&g_jit_cap_scalar);
 #endif
+        /*
+         * #113: LEVER A CONSUMER. The value the previous op just wrote
+         * to `src` is still in the bus register, so the reload is a
+         * store-to-load forwarding stall for nothing. It applies only
+         * to the PROVEN-SCALAR form (jit_fwd_consumer refuses the boxed
+         * one, whose value is 24 bytes and not a register).
+         *
+         * ⛔ THE PAYLOAD GOES OUT FIRST, and the order is the point:
+         * the bus IS rax, and rax is what AccScratch hands out for the
+         * type word. Storing first frees it. Nothing can observe the
+         * two-instruction window in which the capture's payload is new
+         * and its type word old - no call, no branch, no exception
+         * between them - and `cscal` says both are the same scalar
+         * type anyway.
+         */
+        const bool fwin = cscal && g_fwd.in_temp >= 0
+                       && in.a_slot() == g_fwd.in_temp;
+        if (fwin) {
+            const uint8_t br =
+                emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+            e.store_base(br, cb, soff + pv0);
+            AccScratch acc(e);
+            if (g_fwd.in_tag) {
+                /* #113: the producer DECLARED the tag it wrote, so the
+                 * capture's type word is an immediate - not a copy of
+                 * a word the previous instruction just stored. */
+                e.store_type_tag_base(cb, soff + ty0, g_fwd.in_tag,
+                                      acc.r);
+            } else {
+                e.load(acc.r, src.type);
+                e.store_base(acc.r, cb, soff + ty0);
+            }
+            return true;      /* cscal: both guards elided, no helper */
+        }
         AccScratch acc(e);
         e.load(acc.r, src.type);
         /* every jump to the slow arm below was emitted BEFORE this
@@ -24587,6 +24827,7 @@ retry_emission:
              * the same register-carrying too. */
             g_fwd.in_temp = g_fwd.armed ? g_fwd.prod : -1;
             g_fwd.in_reg = g_fwd.res_reg;
+            g_fwd.in_tag = g_fwd.armed ? g_fwd.res_tag : nullptr;
             g_fwd.prod = -1;
             /* THE BUS DEFAULT - the one conv-tagged line that
              * names the whole accumulator convention: a producer
@@ -24595,6 +24836,7 @@ retry_emission:
              * emit_fwd_bump's return, never by assuming. The last
              * literal rax the mandate leaves standing, on purpose. */
             g_fwd.res_reg = RAX;                       /* reg:proto */
+            g_fwd.res_tag = nullptr;                   /* #113 default */
             g_fwd.skip_write = false;
             g_fwd.armed = false;
             /* C4a-ii: the float twin, same one-shot discipline - in
@@ -24652,6 +24894,7 @@ retry_emission:
                                return x.first < y.first;
                            })) {
                 g_fwd.prod = fdst;
+                g_fwd.res_tag = jit_fwd_bus_tag(in.op);
                 const bool is_temp = fdst >= chunk.slot_count;
                 const int tb = is_temp ? fdst - chunk.slot_count : 0;
                 /*
@@ -24677,7 +24920,16 @@ retry_emission:
                 const bool listed = jit_slot_ref_listed(chunk, fdst);
                 g_fwd.skip_write = is_temp && fwd_live_ok && tb < 64
                     && !(fwd_lout[pc + 1] & (uint64_t(1) << tb))
-                    && (!listed || e.relok(fdst));
+                    && (!listed || e.relok(fdst))
+                    /*
+                     * #113: a consumer that also reads the temp's TYPE
+                     * word is a live read the liveness fixpoint cannot
+                     * see - it tracks SLOTS, not half-slots - so the
+                     * elision's premise ("nothing reads this slot
+                     * again") is false for it. The pair still forwards;
+                     * only the write survives.
+                     */
+                    && !jit_fwd_consumer_reads_type(chunk.code[pc + 1].op);
 #ifdef TESTS
                 if (g_fwd.skip_write && listed)
                     g_jit_fwd_skip_rel++;   /* the C5-discharged case only */

@@ -576,6 +576,20 @@ incapable of seeing it, which is the part worth internalising:
    everywhere;
  - no corpus program had a dense shift loop until #96 wrote one.
 
+**⛔ AND IT HAPPENED AGAIN IN THE OTHER DIRECTION (#113,
+2026-08-27) - THE OPS THAT WERE NEVER CONSIDERED.** The shifts were
+a table gone STALE. `LoadCaptureV` / `StoreCaptureV` had never been
+in these lists at all, so a closure's captured counter moved
+through memory twice for one `add`: the read stored payload AND
+type into a temp the next instruction reloaded, and the write
+reloaded both out of the slot the instruction before had filled.
+Admitting them read **-4.55% Ir on 11_closure_counter** and took
+its closure fragment from 53 to 44 instructions per call. The
+ratchet cannot catch this one - it walks the specialized-arith
+RANGE, and these are not in it - so the lesson is the older one:
+when you build a lever, enumerate what it could serve, not only
+what it serves.
+
 **THE FIX, AND THE PATTERN TO REUSE: derive the test from the OPCODE
 ENUM, not from the table.** The B1/B2 specialized family is a
 CONTIGUOUS range (`IntAddRR .. FloatMulRI`, bytecode.h), so

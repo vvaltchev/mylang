@@ -19431,6 +19431,142 @@ static bool jit_frameless_gate()
 }
 
 /*
+ * #113: THE CAPTURE ROUND TRIP JOINS LEVER A.
+ *
+ * `func [start] { start++; return start; }` moved its captured counter
+ * through memory twice for one `add`: the read stored payload AND type
+ * into a temp the next instruction immediately reloaded, and the write
+ * reloaded both back out of the slot the instruction before had just
+ * filled. Lever A already removes exactly that shape - the capture ops
+ * were simply not in its whitelists (CLAUDE.md's "a table whose stale
+ * entry costs an OPTIMIZATION is not self-announcing").
+ *
+ * FOUR things, and only the first is about instructions:
+ *  (1) REACH - g_jit_fwd bumps, from EMITTED code.
+ *  (2) RULE 2 with the lever off, and
+ *  (3) RULE 2 with `capbase` off - NOT redundant with (2). That
+ *      configuration is what caught the real bug in this change: with
+ *      the base unpinned, `emit_ctx_chain` walked through rax, which
+ *      IS lever A's bus, and destroyed the forwarded value. The
+ *      default config cannot see it, because #112's pinned base skips
+ *      the walk. It printed 17682002402471496 for 20100.
+ *  (4) THE FAIL-CLOSED TAG. The capture STORE writes its value's type
+ *      as an immediate when the producer DECLARED one - and a capture
+ *      READ never declares, because `cap_scalar` covers BOOL as well
+ *      as int. A capture-to-capture copy of a `true` must still print
+ *      `true`, not `1` (bug #108's shape).
+ */
+static bool jit_capture_fwd()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (Exception &e) {
+            fprintf(stderr, "jit_capture_fwd: %s: %s\n", e.name, e.msg);
+            ok = false;
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    /* the counter: LoadCaptureV -> IntAddRI -> StoreCaptureV, so BOTH
+     * new pairs arm in one four-op body */
+    const std::vector<const char *> counter = {
+        "func mk(start) => func [start] {",
+        "  start++;",
+        "  return start;",
+        "};",
+        "func drive(int n) {",
+        "  var c = mk(0);",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = s + c();",
+        "  return s;",
+        "}",
+        "assert(drive(runtime(200)) == 20100);" };
+
+    const unsigned long f0 = g_jit_fwd;
+    if (!run(counter))
+        return false;
+    if (g_jit_fwd <= f0 + 100) {
+        fprintf(stderr, "jit_capture_fwd: the capture pairs did not "
+                "FORWARD (%lu bumps for 200 calls)\n", g_jit_fwd - f0);
+        return false;
+    }
+
+    /* RULE 2, twice - and the second is the one that caught the bug */
+    {
+        const unsigned save = g_jit_off_extra;
+        g_jit_off_extra |= jit_lever_bit("fwd");
+        const bool ok = run(counter);
+        g_jit_off_extra = save;
+        if (!ok)
+            return false;
+    }
+    {
+        const unsigned save = g_jit_off_extra;
+        g_jit_off_extra |= jit_lever_bit("capbase");
+        const bool ok = run(counter);
+        g_jit_off_extra = save;
+        if (!ok)
+            return false;
+    }
+
+    /* the fail-closed tag: a capture READ feeding a capture STORE, over
+     * a BOOL. The producer declares no tag, so the store must copy the
+     * source's type word - claiming t_int here prints 1 for true. */
+    /*
+     * ⛔ TWO SHAPE-EATERS HAD TO BE DEFEATED, and both made an earlier
+     * version pass WITH the sabotage in (LoadCaptureV declaring t_int):
+     *  - returning the SOURCE temp reads the tag the capture READ
+     *    produced, which is right either way - the corrupted tag is
+     *    the one the capture STORE wrote, so the CAPTURE must be read
+     *    back;
+     *  - reading it back in the same call does not work either: the
+     *    #97 step 2a BYTECODE peephole rewrites `b = a; var t = b;`
+     *    into `move t = <the store's source>`, so the capture is never
+     *    re-read at all.
+     * Reading `b` at the TOP of the body is what defeats both: the
+     * value observed is the one the PREVIOUS call stored, tag and all.
+     */
+    if (!run({
+            "func mk(a, b) => func [a, b] {",
+            "  var t = b;",
+            "  b = a;",
+            "  return t;",
+            "};",
+            "func drive2(int n) {",
+            "  var c = mk(true, false);",
+            "  var last = \"\";",
+            "  for (var i = 0; i < n; i++) last = str(c());",
+            "  return last;",
+            "}",
+            "assert(drive2(runtime(50)) == \"true\");" }))
+        return false;
+#endif
+    return true;
+}
+
+/*
  * #112: the CAPTURE BASE is walked ONCE per run.
  *
  * Every capture access used to emit `ctx -> ctx->captures -> data()`
@@ -37848,6 +37984,8 @@ static const std::vector<extra_check> extra_checks =
       jit_baked_callee_tier },
     { "jit: the capture base is walked ONCE per run, not per access",
       jit_capbase_pinned },
+    { "jit: the capture round trip forwards (lever A) and its tag is "
+      "fail-closed", jit_capture_fwd },
     { "jit: the FRAMELESS gate admits a scalar leaf and rejects a caller "
       "/ a try region (#97, inert)", jit_frameless_gate },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
