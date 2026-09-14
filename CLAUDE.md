@@ -138,6 +138,16 @@ them means anything:**
   instead. The re-run over every matrix found nothing else hidden -
   the corpus was clean, the tool simply could not have proved it.
   **A comparison oracle must compare everything it claims to.**
+  **⛔ AND THE SAME LESSON HAD A SECOND SHAPE, FOUND 2026-08-28: A
+  PROGRAM THAT STOPS COMPILING "AGREES" WITH ITSELF.** The comparison
+  is between two ENGINES, and a COMPILE-TIME refusal happens before
+  either one runs - so it prints the identical message on both sides
+  and reads as perfect agreement. Watched: reopening #115's multi-site
+  hole made `tests/functional/25_factory_closure_param.my` fail to
+  compile ENTIRELY, and the script still reported 33/33. There is a
+  **`compile gate`** now - `-nr` per program, reported and failing on
+  its own line. Exit CODE would not have done it: `samples/gcd`
+  legitimately exits 1 with a usage message when given no arguments.
 - **`MYLANG_NO_LOWMEM=1`** - refuse the low-address arena, so the
   JIT's REGISTER-form type tags (the shipping configuration wherever
   `MAP_32BIT` is unavailable or fails) are reachable by a test.
@@ -3670,6 +3680,42 @@ closure whose sites disagree declines to `dyn` here, where a
 DIRECTLY-bound capturing lambda refuses the program. Removing this check
 is what would make the two agree, and that is a language decision.
 
+**(c) EVERY SITE WHOSE SET *CONTAINS* THE CALLEE MUST NAME IT ALONE -
+THE MULTI-SITE HOLE, which #115 SHIPPED WITH and #116 increment 2
+closed (2026-08-28).** Gates (a) and (b) are both about the sites
+ATTRIBUTED to a closure. Neither asks about a site that can reach it
+and was *not* attributed, and a closure can be reached by both kinds
+at once:
+
+```C#
+func mk_a(n) => func [n] (x) { return "A:" + typestr(x) + str(n); };
+func mk_b(n) => func [n] (x) { return "B:" + typestr(x) + str(n); };
+func probe(int k) {
+    var only_a = mk_a(1);           # names ONE closure
+    var p = [mk_a(2), mk_b(3)];     # ...the SAME FuncInfo as only_a
+    var either = p[k];              # may be either
+    return only_a(7) + " " + either("str");
+}
+print(probe(runtime(0)));
+```
+
+`only_a(7)` typed the parameter `int`; `either("str")` was never
+attributed; the check pass then REFUSED the program on a signature the
+rule had invented - `argument 1 has type 'str' but the parameter is
+'int'`. The IDENTICAL program with no size-1 site compiles and prints
+`A:dyn B:dyn`. Pinned as case (7) of
+`tests/functional/25_factory_closure_param.my`, and it is what exposed
+`corpus_diff`'s compile-gate gap above.
+
+**⛔ AND THE SOURCE OF THE ANSWER IS THE CALLEE-SET ANALYSIS NOW, not
+`finfos`** (#116 increment 2). `snapshot_indirect_callees` asks
+`callee_set(e)` and `callee_escaped(f)`; `value_escaped` is gone from
+this consumer. Measured blast radius of the migration: **0 of 126**
+corpus programs change `-vd` or output - the only behaviour change is
+the hole above closing. Uniformity is DELIBERATELY KEPT: it is now a
+language policy (see (b)), and removing it would change observable
+output, so it is the maintainer's call, not a cleanup.
+
 **⛔ AND THE SET'S INCOMPLETENESS WAS A `join` BUG - METADATA EXCLUDED
 FROM EQUALITY, THEN DISCARDED BY AN EQUALITY-BASED SHORTCUT
 (2026-08-28).** `join` opens with
@@ -3883,13 +3929,16 @@ entry asserts the SET per constraint form AND a stated ⊤ per SINK, each
 watched failing against a sabotage build (see the entry's header for the
 six that fail and the one that is proven redundant instead).
 
-**Status: increment 1 only - the analysis exists and NOTHING CONSUMES
-IT.** Increments 2-4 migrate #115, `value_instantiate_round` (then
-DELETE `finfos`/`escaped_finfos`/`value_escaped`) and the resolver's
-three partial analyses (`callee_of`, `slot2fn`/`direct_func_slot`,
-`esc_callback_fn`). ⛔ Increment 4 is MEMORY-SAFETY-CRITICAL: #93/#94
-make a false "safe" a use-after-free. Full plan:
-`plans/callee-set-analysis.md`.
+**Status: increments 1-2 done.** #115 is migrated
+(`snapshot_indirect_callees` asks `callee_set`/`callee_escaped`, and
+closing the multi-site hole was the first thing the real answer bought
+- see gate (c) above); 0 of 126 corpus programs changed. Increments
+3-4 migrate `value_instantiate_round` (then DELETE
+`finfos`/`escaped_finfos`/`value_escaped` and REVERT the `join` union)
+and the resolver's three partial analyses (`callee_of`,
+`slot2fn`/`direct_func_slot`, `esc_callback_fn`). ⛔ Increment 4 is
+MEMORY-SAFETY-CRITICAL: #93/#94 make a false "safe" a use-after-free.
+Full plan: `plans/callee-set-analysis.md`.
 
 ## The value & type model (the subtle part)
 

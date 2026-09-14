@@ -1074,10 +1074,38 @@ void Inferencer::drain_escapes()
 /*
  * #115: which INDIRECT call sites have a callee this pass may name.
  *
- * Read off a SETTLED fixpoint and stored, never recomputed - see
- * `indirect_callee` for why the gate is unsound to evaluate mid-round.
- * A call qualifies when its callee type names EXACTLY ONE non-template
- * function.
+ * ⛔ IT ASKS THE CALLEE-SET ANALYSIS NOW (#116 increment 2), not
+ * `StaticType::finfos`. The old source could not distinguish "nothing
+ * flows here" from "I have no idea" - both were the empty set - so
+ * `finfos.size() == 1` was never a proof of anything, and a side
+ * ledger (`escaped_finfos` / `value_escaped`) existed to carry the
+ * "unknown" the set itself could not express.
+ *
+ * Read off a SETTLED analysis and stored, never recomputed - see
+ * `indirect_callee` for why the gate is unsound to evaluate
+ * mid-fixpoint.
+ *
+ * ⛔ AND IT CLOSES A SOUNDNESS HOLE THE FIRST VERSION SHIPPED WITH.
+ * Attributing every size-1 site is not enough: a closure can be
+ * reached BOTH by a site that names it alone AND by a site that may
+ * reach it or another, and only the first was ever counted -
+ *
+ *     func mk_a(n) => func [n] (x) { return "A:" + typestr(x); };
+ *     func mk_b(n) => func [n] (x) { return "B:" + typestr(x); };
+ *     func probe(int k) {
+ *         var only_a = mk_a(1);         # names ONE closure
+ *         var p = [mk_a(2), mk_b(3)];   # ...the SAME FuncInfo
+ *         var either = p[k];            # may be either
+ *         return only_a(7) + " " + either("str");
+ *     }
+ *
+ * - `only_a(7)` typed the closure's parameter `int`, `either("str")`
+ * was never attributed, and the check pass then REFUSED the program on
+ * a signature #115 had invented (`argument 1 has type 'str' but the
+ * parameter is 'int'`). The identical program with no size-1 site
+ * compiles and prints `A:dyn B:dyn`. So a callee is usable only when
+ * EVERY site whose set contains it names it ALONE, which is what
+ * `disqualified` records.
  *
  * ⛔ ONE, AND CONTRIBUTING TO ALL OF A LARGER SET IS NOT THE
  * ALTERNATIVE. It looks sound - the value may be any member, so each
@@ -1094,24 +1122,25 @@ void Inferencer::snapshot_indirect_callees(Block *rootBlock)
     for (auto &e : rootBlock->elems)
         collect_calls(e.get(), calls);
 
-    /* 1) attribute every indirect call whose callee names ONE function */
+    /* 1) attribute every indirect call whose callee names ONE function,
+     *    and DISQUALIFY every function named by a site that does not */
     std::map<FuncInfo *, std::vector<CallExpr *>> sites;
+    std::set<FuncInfo *> disqualified;
     for (auto &cp : calls) {
         CallExpr *call = cp.first;
         if (indirect_callee.count(call))
             continue;                       /* decided already - never revise */
         if (callee_funcinfo(call->what.get()))
             continue;                       /* a direct call */
-        StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
-        if (!ct || ct->kind != StaticTypeKind::Func || ct->finfos.size() != 1)
-            continue;
-        FuncInfo *fi = static_cast<FuncInfo *>(ct->finfos[0]);
-        if (!fi || fi->is_template || fi->value_escaped)
-            continue;                       /* instantiation handles those */
-        /* `value_escaped` covers the OTHER way a set stops describing
-         * the value: a join that could not reconcile its members drops
-         * them into the ledger rather than losing them silently. */
-        sites[fi].push_back(call);
+        const CsSet cs = callee_set(call->what.get());
+        if (cs.top)
+            continue;   /* ⊤ - covered by callee_escaped below, which
+                         * marks every function such a site can reach */
+        if (cs.funcs.size() == 1)
+            sites[cs.funcs[0]].push_back(call);
+        else
+            for (FuncInfo *f : cs.funcs)
+                disqualified.insert(f);
     }
 
     /*
@@ -1119,26 +1148,28 @@ void Inferencer::snapshot_indirect_callees(Block *rootBlock)
      * none of them contributes - the same rule
      * `value_instantiate_round` applies to a template's signature.
      *
-     * ⛔ ITS JUSTIFICATION CHANGED, AND THAT IS WORTH KNOWING. It went
-     * in as a NECESSITY: the finfo set used to UNDER-COLLECT, because
-     * `join`'s `static_type_equal` shortcut dropped one side's
-     * candidates whenever two functions shared a signature. Two
-     * same-shaped closures in an array then presented a ONE-element set
-     * at every call site, both sites fed the same survivor `int` AND
-     * `str`, and a program with no conflict in it was REFUSED. That
-     * leak is fixed at its source now (statictype.cpp, join), so
-     * "size == 1" genuinely means one closure.
-     *
-     * What uniformity still does is a POLICY choice: a single closure
+     * ⛔ THIS IS A POLICY, NOT A NECESSITY, AND IT IS THE MAINTAINER'S
+     * CALL TO CHANGE. It went in as a necessity, when the finfo set
+     * UNDER-COLLECTED; that leak is fixed at its source and the
+     * callee-set analysis says "unknown" out loud, so what uniformity
+     * still does is choose a LANGUAGE behaviour: a single closure
      * whose call sites disagree DECLINES to `dyn` here, where a
-     * DIRECTLY-bound capturing lambda refuses the program. The factory
-     * form is the more permissive of the two. That asymmetry is
-     * deliberate and documented (CLAUDE.md, README); removing this
-     * check is what would make them agree, and it is a language
-     * decision, not a cleanup.
+     * DIRECTLY-bound capturing lambda REFUSES the program. Removing
+     * this check is what would make the two spellings agree - and it
+     * would change observable output (case (3) of
+     * 25_factory_closure_param.my joins int and float, so `f(1)`
+     * starts printing a coerced float), which is a language decision,
+     * not a cleanup.
      */
     for (auto &kv : sites) {
         FuncInfo *fi = kv.first;
+        if (!fi || fi->is_template || disqualified.count(fi))
+            continue;
+        /* A function whose VALUE left the analysed program can be
+         * called from a site this pass never saw, so no number of
+         * agreeing visible sites proves anything about it. */
+        if (callee_escaped(fi))
+            continue;
         const std::vector<CallExpr *> &cs = kv.second;
         bool uniform = true;
         for (size_t i = 1; i < cs.size() && uniform; i++) {
@@ -1500,26 +1531,22 @@ void Inferencer::infer_one(Block *rootBlock)
      * instantiate loop runs again. It is idempotent when nothing
      * changed and bounded either way.
      */
+    /*
+     * THE CALLEE-SET ANALYSIS (#116), and its placement is the same
+     * constraint #115's snapshot has: it needs POST-INSTANTIATION
+     * types and a post-instantiation TREE. A call to a template DEFERS
+     * by design, so a factory's return type does not exist until
+     * instantiation has made the clone and REDIRECTED the call - run
+     * before this loop, the analysis would walk call sites that no
+     * longer exist and miss the ones that replaced them.
+     */
+    cs_run(rootBlock);
+
     snapshot_indirect_callees(rootBlock);
     if (!indirect_callee.empty()) {
         run_fixpoint(rootBlock);
         instantiate_to_fixpoint();
     }
-
-    /*
-     * THE CALLEE-SET ANALYSIS (#116). Placed here for the reason
-     * #115's snapshot is: it needs POST-INSTANTIATION types and a
-     * post-instantiation TREE. A call to a template DEFERS by design,
-     * so a factory's return type does not exist until instantiation
-     * has made the clone and REDIRECTED the call - run before this
-     * loop, the analysis would walk call sites that no longer exist
-     * and miss the ones that replaced them.
-     *
-     * INERT in increment 1: nothing consults it, so it must change no
-     * behaviour. Its consumers arrive in increments 2-4 (see
-     * plans/callee-set-analysis.md).
-     */
-    cs_run(rootBlock);
 
     /* finalize. An unconstrained value is `none` for a local ("only-none /
      * doesn't matter") but `dyn` for a PARAMETER: a never-(concretely-)called

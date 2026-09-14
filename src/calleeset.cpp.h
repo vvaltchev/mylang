@@ -857,6 +857,20 @@ void Inferencer::cs_visit(Construct *n, FuncInfo *fn)
         cs_call(static_cast<CallExpr *>(n));
         break;
 
+    case ConstructType::throw_stmt:
+        /*
+         * ⛔ THE OTHER HALF OF THE catch-BINDING SINK. A catch binding
+         * reads ⊤ because the throw/catch edge is not modelled - and
+         * that is only SAFE if a thrown value counts as having left
+         * our view. Without this, `throw Boom(neg)` puts `neg`
+         * somewhere a ⊤ can produce it while `neg` is not marked
+         * escaped, so a consumer asking "are all of neg's call sites
+         * ones I attributed?" gets a wrong yes.
+         */
+        cs_escape_set(cs_eval(
+            static_cast<SingleChildConstruct *>(n)->elem.get()));
+        break;
+
     case ConstructType::lit_arr: {
         /* the ALLOCATION's initial contents. Without this the object
          * exists and is empty, so `var p = [f]; p[0]()` reads ⊥ -
@@ -965,6 +979,17 @@ void Inferencer::cs_bind_target(Construct *lv, const CsSet &v)
         auto it = id_sym.find(id);
         if (it == id_sym.end() || !it->second) {
             /* an unresolved / builtin target: the value left our view */
+            cs_escape_set(v);
+            return;
+        }
+        /*
+         * THE REPL'S OPEN WORLD, the write half. cs_eval already reads
+         * a `pinned` (prior-input) global as ⊤; the WRITE has to
+         * escape for the same reason, or a function stored into a
+         * committed global would be reachable from a later input we
+         * cannot see while looking un-escaped here.
+         */
+        if (it->second->pinned) {
             cs_escape_set(v);
             return;
         }

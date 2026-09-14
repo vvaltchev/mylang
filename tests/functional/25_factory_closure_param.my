@@ -102,3 +102,27 @@ func through_array(int k) {
   return fs[0](7);
 }
 print("array  ", through_array(runtime(1)));
+
+# (7) ⛔ THE MULTI-SITE HOLE, which #115 shipped with and #116
+#     increment 2 closed. A closure reached BOTH by a site that names
+#     it alone AND by a site that may reach it or another: only the
+#     first was ever counted, so `only_a(7)` typed the parameter `int`
+#     and the check pass then REFUSED the program on a signature the
+#     rule had invented -
+#
+#       TypeMismatchEx: argument 1 has type 'str' but the parameter
+#       is 'int'
+#
+#     - while the IDENTICAL program with no size-1 site compiled and
+#     printed `A:dyn B:dyn`. A callee is usable only when EVERY site
+#     whose set contains it names it ALONE. Watched: reverting the
+#     `disqualified` set makes this file fail to compile at all.
+func mk_h1(n) => func [n] (x) { return "1:" + typestr(x) + str(n); };
+func mk_h2(n) => func [n] (x) { return "2:" + typestr(x) + str(n); };
+func multisite(int k) {
+  var only_1 = mk_h1(1);          # names exactly one closure
+  var pair = [mk_h1(2), mk_h2(3)];   # ...the SAME FuncInfo as only_1
+  var either = pair[k];           # may be either
+  return only_1(7) + " " + either("s");
+}
+print("multi  ", multisite(runtime(0)));
