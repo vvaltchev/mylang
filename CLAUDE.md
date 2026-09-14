@@ -795,6 +795,31 @@ return site must pick one**, and `empty` is the one that will fail
 loudly the day the allocator keeps a value in a register across a call.
 Do not "fix" that abort by switching to `flushed` - emit the flush.
 
+**⛔ AND IT BROKE AGAIN THE DAY THE LOW ARENA LANDED - FOR SIX WEEKS,
+SILENTLY, WITH THE SELF-TEST SHOUTING (found 2026-08-27).** The
+absolute-disp32 memory operand (`mov rax, [+0x41250108]` - the arena
+global reached in ONE instruction, #97 step 1) printed its RAW ADDRESS.
+Every other baked pointer in the dump masks to
+`<addr>`/`<int-tag>`/`<helper>` for exactly one reason - so two runs and
+two separately-linked binaries produce IDENTICAL text - and the new
+operand form was added without learning the rule.
+
+From that commit on, `vdjcmp.sh` failed its own SELF-TEST on EVERY
+invocation ("the same binary gave two different dumps for samples/gcd")
+and refused to report. So every "verified as a pure restructuring:
+emitted code byte-identical" claim in that window was UNVERIFIED - not
+wrong, unverified, which is worse because it reads the same.
+
+**The self-test did its job. Nobody ran it.** That is the difference
+between this and the 2026-08-17 mask-rot, and it is the more
+uncomfortable failure: the tool was not broken as an oracle, it was
+correctly REFUSING, and the refusal went unread because the tool went
+unrun. **Run `scripts/vdjcmp.sh BIN BIN` after any change that adds an
+OPERAND FORM** - not just after a change you think is a restructuring.
+(`MYLANG_VDJ_HEX=1` remains non-reproducible BY CONSTRUCTION - the raw
+bytes contain the address - which is why the comparison path does not
+use it.)
+
 **⛔ `-vdj` IS REPRODUCIBLE - AND THE FOUR YEARS OF WORKAROUNDS THAT
 SAY WHY YOU MUST FIX A TOOL, NOT ITS CALLERS (2026-08-17).** Comparing
 two binaries' emitted code is a plain `cmp` now

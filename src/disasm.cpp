@@ -700,9 +700,36 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
                 if (!no_base) so << "+";
                 so << gp64(idx) << "*" << scale;
             }
-            if (d || (no_base && idx3 == 4))
+            if (no_base && idx3 == 4) {
+                /*
+                 * ⛔ THE NO-BASE disp32 IS AN ABSOLUTE ADDRESS, AND IT
+                 * MUST BE MASKED LIKE EVERY OTHER BAKED POINTER.
+                 *
+                 * This is the low arena's operand (#97 step 1): a
+                 * process-lifetime global reached in ONE instruction,
+                 * with the pointer sitting in the displacement. Every
+                 * other baked address in this dump prints as
+                 * `<addr>` / `<int-tag>` / `<helper>` precisely so two
+                 * runs and two separately-linked binaries produce
+                 * IDENTICAL text - that is what `scripts/vdjcmp.sh`
+                 * IS - and this form was added later without learning
+                 * the rule.
+                 *
+                 * ⛔ IT BROKE THE ORACLE AND NOTHING SAID SO. From the
+                 * day the arena landed, `vdjcmp.sh` failed its own
+                 * SELF-TEST ("the same binary gave two different dumps")
+                 * on every invocation, so every "verified byte-identical
+                 * emitted code" claim since was unverifiable. The
+                 * self-test did its job; nobody ran it. Same shape as
+                 * the 2026-08-17 mask-rot, one arena later.
+                 */
+                so << imm_str(static_cast<int64_t>(
+                                  static_cast<uint32_t>(d)),
+                              ti, tf, ta);
+            } else if (d) {
                 so << (d < 0 ? "-0x" : "+0x") << std::hex
                    << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec;
+            }
             so << "]";
             rm = so.str();
             return;
