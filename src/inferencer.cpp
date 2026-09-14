@@ -398,7 +398,6 @@ private:
     std::map<const Construct *, int> cs_obj_ids;  /* alloc site -> obj */
     std::set<FuncInfo *> cs_escaped;           /* left our view        */
     std::set<int> cs_escaping_objs;            /* worklist, per round  */
-    bool cs_escaped_all = false;
     bool cs_changed = false;
     bool cs_ran = false;      /* false => every query answers ⊤ */
     int cs_top_callee_sites = 0;

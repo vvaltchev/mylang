@@ -448,3 +448,53 @@ a catch binding is not ⊤; the flag falls through and `-dcs` runs the
 program; `cs_ran` forced false. Deleting the `cs_run` CALL fails the
 BUILD (`-Werror=unused-function`), which is a free structural guard
 against the pass going dead.
+
+## Follow-up: the loss ledger replaces the blanket escape (2026-08-28)
+
+The maintainer's observation - *"a callee should not escape that easily
+in those single-file mylang scripts... we can make that harder with
+more static analysis"* - was right, and the instrument said where.
+
+`cs_run` ended with a hammer: if `cs_escaped_all` (an unnameable value
+escaped anywhere) **or** a ⊤-callee call site existed, escape EVERY
+function in EVERY points-to set. Measured with a temporary reason
+probe:
+
+| | |
+|---|---|
+| programs hitting the hammer | **20 of 124** |
+| firings from `cs_escaped_all` with ZERO ⊤-callee sites | **31 of 38** |
+
+`cs_escaped_all` is DELETED. In its place, `CsSet::set_top()` reports
+the members it discards into a per-run ledger which `cs_run` drains
+into `cs_escaped`. That is precise where the hammer was blanket, and
+complete because `set_top` is the only way a non-empty set loses
+members. The ⊤-CALLEE half of the hammer stays: a program that really
+does call through something the analysis cannot name is a different
+and genuine case.
+
+**Measured:** corpus escapes **21 -> 10**. The C3 proven-param gate,
+which was blocking **1 corpus + 15 suite** stamps, blocks **0** - so
+the maintainer's *"how is it possible that we hit this?"* had the
+answer *"because of this rule, and now we don't"*. 0 of 126 corpus
+programs change `-vd` or output.
+
+**One behaviour DID change, and it is an improvement**: in
+`func g(a) {...}; var dyn h = g; print(g(4) + h(1));` the value use
+`h` used to escape `g`, so value-instantiation declined and `h` held
+the boxed base. It is redirected to `g$0` now, so the indirect call
+runs monomorphized code; C3 correctly stops stamping `g$0` because an
+instance reachable as a value is dyn-launderable. The `-rt` row's
+expectation moved 1 -> 0 exclusions with that reasoning written down.
+
+**Pinned** by two `-dcs` rows: a function discarded into a ⊤ is still
+reported escaped, and a name-only callee is still not - the second half
+matters because without it the case would also pass for the blanket
+rule this replaced.
+
+**STILL OPEN** (the next step the maintainer named): an ARG-POSITION
+use of a template is never redirected, even when every consumer is
+nameable. `value_instantiate_round`'s walk `continue`s past it - and
+that `continue`, not `value_escaped`, is what makes the arg case safe.
+Lifting it where the analysis can name every consumer is the remaining
+precision win.

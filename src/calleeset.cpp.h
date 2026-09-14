@@ -162,10 +162,34 @@ bool CsSet::add_obj(int o)
     return true;
 }
 
+/*
+ * ⛔ ⊤ ABSORBS, SO A SET THAT WIDENS TO ⊤ DISCARDS ITS MEMBERS - AND A
+ * DISCARDED MEMBER IS THE ONE THING THAT MUST NOT VANISH SILENTLY. A
+ * consumer reading ⊤ from wherever this set ends up may still call
+ * what was in it, so those functions have left the part of the program
+ * this analysis can follow: they ESCAPED.
+ *
+ * This is the same fact `escaped_finfos` existed to carry in the TYPE
+ * lattice - "the members a join dropped" - and the same reason it was
+ * structurally insufficient there (it could not see members that never
+ * ENTERED). Here it is complete, because `set_top` is the ONLY way a
+ * non-empty set loses its members: `merge` with a ⊤ partner, and the
+ * CS_MAX_SET cap, both funnel through it.
+ *
+ * Kept as a file-static sink rather than a CsSet member because a
+ * CsSet is a plain value copied all over the walk; only ONE analysis
+ * is ever live (cs_run installs it), and the alternative - an escape
+ * hook per loss SITE - is exactly the enumeration that goes stale.
+ */
+static std::vector<FuncInfo *> *g_cs_lost = nullptr;
+
 bool CsSet::set_top()
 {
     if (top)
         return false;
+    if (g_cs_lost)
+        for (FuncInfo *f : funcs)
+            g_cs_lost->push_back(f);
     top = true;
     funcs.clear();
     objs.clear();
@@ -428,7 +452,20 @@ void Inferencer::cs_write_elems(const CsSet &base, const CsSet &v)
 void Inferencer::cs_escape_set(const CsSet &v)
 {
     if (v.top) {
-        cs_escaped_all = true;           /* an unnameable value escaped */
+        /*
+         * ⛔ NOTHING EXTRA ESCAPES HERE, and that is the #116 follow-up
+         * fix. This used to set `cs_escaped_all`, which made the final
+         * closure escape EVERY function in EVERY points-to set - the
+         * bluntest rule in the analysis, and measured firing on 20 of
+         * 124 corpus programs, 31 of its 38 firings from this branch
+         * alone. It said "an unnameable value went somewhere unknown",
+         * and answered it by giving up on the whole program.
+         *
+         * A ⊤ set is EMPTY of named members by construction, because
+         * `set_top` recorded them in the loss ledger the moment they
+         * were discarded. So the precise answer is already known and
+         * there is nothing left to be conservative about.
+         */
         return;
     }
     for (FuncInfo *f : v.funcs)
@@ -436,10 +473,10 @@ void Inferencer::cs_escape_set(const CsSet &v)
             cs_changed = true;
     /* A container that escapes takes its contents with it. */
     for (int o : v.objs) {
-        if (o == CS_OBJ_UNKNOWN) {
-            cs_escaped_all = true;
-            continue;
-        }
+        if (o == CS_OBJ_UNKNOWN)
+            continue;   /* its elements are permanently ⊤; anything
+                         * written there escaped at the write (see
+                         * cs_write_elems) */
         const int el = cs_loc(CsLocKind::elem, nullptr, o);
         if (cs_escaping_objs.insert(o).second)
             cs_changed = true;
@@ -453,19 +490,14 @@ void Inferencer::cs_escape_set(const CsSet &v)
  * recursion - a container may contain itself). */
 void Inferencer::cs_escape_flat(const CsSet &v)
 {
-    if (v.top) {
-        cs_escaped_all = true;
-        return;
-    }
+    if (v.top)
+        return;                          /* see cs_escape_set */
     for (FuncInfo *f : v.funcs)
         if (cs_escaped.insert(f).second)
             cs_changed = true;
-    for (int o : v.objs) {
-        if (o == CS_OBJ_UNKNOWN)
-            cs_escaped_all = true;
-        else if (cs_escaping_objs.insert(o).second)
+    for (int o : v.objs)
+        if (o != CS_OBJ_UNKNOWN && cs_escaping_objs.insert(o).second)
             cs_changed = true;
-    }
 }
 
 /* ---------------------------------------------------------------- */
@@ -1188,9 +1220,15 @@ void Inferencer::cs_run(Block *rootBlock)
     cs_obj_ids.clear();
     cs_escaped.clear();
     cs_escaping_objs.clear();
-    cs_escaped_all = false;
     cs_top_callee_sites = 0;
     cs_ran = false;
+
+    /* the loss ledger (see CsSet::set_top) - live for this run only */
+    std::vector<FuncInfo *> lost;
+    g_cs_lost = &lost;
+    struct LostGuard {
+        ~LostGuard() { g_cs_lost = nullptr; }
+    } lost_guard;
 
     /* id 0 must be the UNKNOWN object's element location, so that a
      * bare `cs_loc(elem, nullptr, CS_OBJ_UNKNOWN)` is always ⊤. */
@@ -1208,6 +1246,12 @@ void Inferencer::cs_run(Block *rootBlock)
                               cs_escaping_objs.end());
         for (int o : objs)
             cs_escape_flat(cs_pts[cs_loc(CsLocKind::elem, nullptr, o)]);
+        /* drain the loss ledger: a member discarded by a widening to ⊤
+         * is reachable only through that ⊤ from here on */
+        for (FuncInfo *f : lost)
+            if (cs_escaped.insert(f).second)
+                cs_changed = true;
+        lost.clear();
         if (!cs_changed)
             break;
     }
@@ -1220,14 +1264,26 @@ void Inferencer::cs_run(Block *rootBlock)
      */
     cs_ran = round < CS_MAX_ROUNDS;
 
+    /* whatever the last round discarded */
+    for (FuncInfo *f : lost)
+        cs_escaped.insert(f);
+
     /*
-     * The derived escape closure. A call site whose callee is ⊤ may
-     * reach any function whose VALUE ever became reachable - so every
-     * function that is anywhere in a points-to set escapes. Functions
-     * only ever called by name are untouched, which is the common case
-     * and the reason this is not simply "everything".
+     * A call site whose callee is ⊤ may reach any function whose VALUE
+     * ever became reachable, so every function anywhere in a points-to
+     * set escapes. Functions only ever called BY NAME are untouched,
+     * which is the common case and the reason this is not simply
+     * "everything".
+     *
+     * ⛔ THE OTHER HALF OF THIS CONDITION IS GONE. It used to fire on
+     * `cs_escaped_all` too - "an unnameable value escaped somewhere" -
+     * which is a far weaker premise and did nearly all the damage: 31
+     * of 38 firings corpus-wide came from it, with ZERO ⊤-callee sites
+     * in the program. The loss ledger answers that case precisely now.
+     * This branch keeps only the case where the program really does
+     * CALL through something the analysis cannot name.
      */
-    if (cs_escaped_all || cs_top_callee_sites > 0) {
+    if (cs_top_callee_sites > 0) {
         for (const CsSet &s : cs_pts)
             for (FuncInfo *f : s.funcs)
                 cs_escaped.insert(f);

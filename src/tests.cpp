@@ -30222,6 +30222,40 @@ static bool callee_set_analysis()
         "print(helper(7));" },
         "dcs-esc\thelper");
 
+    /*
+     * ⛔ THE LOSS LEDGER: A FUNCTION DISCARDED INTO A ⊤ STILL ESCAPES.
+     * ⊤ absorbs, so `set_top` throws away whatever named members the
+     * set held - and a consumer reading that ⊤ can still call them. If
+     * the discard were silent, `callee_escaped` would answer NO for a
+     * function that is reachable only through an unnameable value, and
+     * every consumer that reasons over ALL of a function's call sites
+     * (#115, value-instantiation, C3's proven_type) would be doing so
+     * on an incomplete list.
+     *
+     * `sq` is discarded when a builtin's ⊤ result is assigned over it;
+     * `helper` is only ever CALLED BY NAME and must stay un-escaped -
+     * without that half the case would also pass for an analysis that
+     * simply escaped everything, which is what this replaced.
+     *
+     * ⛔ NO ⊤-CALLEE SITE HERE, ON PURPOSE. `f` is never called, so the
+     * separate "a call through an unnameable callee escapes everything"
+     * rule cannot fire and mask the ledger.
+     */
+    want("the loss ledger: discarded into ⊤ still escapes", {
+        "func sq(int x) => x * x;",
+        "func helper(int v) => v + 1;",
+        "var f = sq;",
+        "f = runtime(sq);",
+        "print(helper(3));" },
+        { "dcs-esc\tsq" });
+    reject("...and a name-only callee is still not escaped by it", {
+        "func sq(int x) => x * x;",
+        "func helper(int v) => v + 1;",
+        "var f = sq;",
+        "f = runtime(sq);",
+        "print(helper(3));" },
+        "dcs-esc\thelper");
+
     /* ⛔ AND THE VACUITY GUARD. Every case above asserts a row is
      * PRESENT, so an analysis that emitted nothing at all - or a dump
      * that silently stopped running it - would fail loudly; but an
@@ -30287,18 +30321,36 @@ static bool ref_slots_proven_params()
             ok = false;
         }
     }
-    /* the dyn-launder of the BASE is checked-safe: `h = g` escapes
-     * the TEMPLATE (never stamped), h(1) runs the boxed base; the
-     * direct-call instance g$0 stamps its (compile-checked) param -
-     * exactly 1 exclusion, and the values agree */
+    /*
+     * ⛔ THE DYN-LAUNDERED TEMPLATE, AND WHY THIS ROW NOW WANTS **0**.
+     *
+     * `var dyn h = g;` is a VALUE use of a template. It used to make
+     * `g` ESCAPE, so value-instantiation declined, `h` held the BOXED
+     * BASE, `h(1)` ran untyped - and the direct-call instance `g$0`,
+     * reachable only from `g(4)`, kept its proven_type: 1 exclusion.
+     *
+     * The callee-set analysis stopped escaping `g` when its blunt
+     * "an unnameable value escaped, so give up on the whole program"
+     * rule was replaced by the precise loss ledger (#116 follow-up).
+     * Now `h` is REDIRECTED to `g$0` - the indirect call runs the
+     * MONOMORPHIZED clone instead of the boxed base, which is the
+     * bigger win of the two - and C3 correctly steps back, because an
+     * instance reachable as a VALUE is dyn-launderable and therefore
+     * callable with unchecked args. That is this gate's own rule
+     * (`s->value_used`), doing exactly what it says.
+     *
+     * So the 1 -> 0 here is not a lost optimization, it is the stamp
+     * declining for a reason that became TRUE. The `10` is what pins
+     * that the trade changed no answer.
+     */
     {
         auto [out, n] = go({
             "func g(a) { return a + a; }",
             "var dyn h = g;",
             "print(g(4) + h(1));" });
-        if (out != "10 \n" || n != 1) {
+        if (out != "10 \n" || n != 0) {
             cout << "  c3 [dyn base launder]: out=[" << out
-                 << "] excluded=" << n << " (want 1)\n";
+                 << "] excluded=" << n << " (want 0)\n";
             ok = false;
         }
     }
