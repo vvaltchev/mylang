@@ -1617,7 +1617,19 @@ Running scripts:
                                  # oracle (plans/bytecode-inliner.md)
 ./build/mylang -vdj FILE         # -vd + the native x86-64 disassembly of
                                  # each JIT fragment, interleaved under its
-                                 # `enter.nat` line with `; vm pc N` markers.
+                                 # `enter.nat` line with `; vm pc N` markers
+                                 # (`; vm op N` on a fragment whose originals
+                                 # were deleted - #56 - naming the op by its
+                                 # pre-remap pc; each mark carries a copy of
+                                 # the op, so a deleted one is still named).
+                                 # IT RUNS THE JIT SEQUENCE A RUN DOES:
+                                 # vm_jit_program (vm.h) is the ONE driver
+                                 # for a compile, a .myv load and this dump
+                                 # - the dump's own copy went stale twice
+                                 # (main with no map, no frameless pre-pass)
+                                 # and showed a push the run never took;
+                                 # pinned by the `-vd/-vdj's driver` -rt
+                                 # check and a driver_checks.sh case.
                                  # REPRODUCIBLE: a baked address prints as
                                  # <int-tag>/<addr>/<helper>, so two runs
                                  # and two separately-linked binaries give

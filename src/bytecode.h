@@ -1532,10 +1532,18 @@ struct NativeCode {
 
     /* -vdj debug annotation: per fragment, the native byte offset (from
      * `base`) where each VM op's machine code begins, paired with that
-     * op's (post-remap) pc. Populated ONLY when g_jit_annotate is set
-     * (the -vdj dump); empty on a normal run. The disassembler uses these
-     * to interleave "; pc N" markers and to resync its decode per op. */
-    struct OpMark { uint32_t off; uint32_t vm_pc; };
+     * op's (post-remap) pc, its PRE-remap pc and a COPY of the op
+     * itself. The copy is what keeps a delete-originals fragment (#56)
+     * readable: the rebuilt `code` holds only the EnterNative head, so
+     * every mark's post-remap pc named it and the dump read
+     * `; vm pc 0: enter.nat` at every boundary of main - the op each
+     * native sequence belonged to was unrecoverable, on exactly the
+     * fragment the call protocol is measured in. Populated ONLY when
+     * g_jit_annotate is set (the -vdj dump); empty on a normal run.
+     * The disassembler uses these to interleave "; pc N" markers and to
+     * resync its decode per op. */
+    struct OpMark { uint32_t off; uint32_t vm_pc; uint32_t orig_pc;
+                    Instr orig; };
     struct Frag { uint32_t start, len; std::vector<OpMark> marks; };
     std::vector<Frag> frags;
 

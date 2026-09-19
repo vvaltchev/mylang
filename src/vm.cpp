@@ -2258,29 +2258,63 @@ void vm_jit_loaded_image(VmProgram &prog)
                 break;
             }
     }
-    {
-        /* the frameless pre-pass, exactly as vm_precompile_all runs it */
-        JitCtx jc;
-        jc.slot_desc = &slot_desc;
-        jc.slot_reassigned = &prog.global_slot_reassigned;
-        jit_mark_frameless_wanted(prog.root, &jc);
-    }
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> bodies;
     for_each_chunk([&](Chunk &ck, const FuncDescriptor *desc) {
-        JitCtx jc;
-        jc.slot_desc = &slot_desc;
-        jc.slot_reassigned = &prog.global_slot_reassigned;
-        jc.caller_desc = desc;
-        jit_compile_chunk(ck, &jc);
+        bodies.push_back({ &ck, desc });
     });
-    /* main gets the map too (a null caller_desc, as the fresh-compile
-     * path does): without it a LOADED image's main would emit different
-     * native code from a fresh compile's - the two must agree, which is
-     * the whole point of re-running the tier here. */
-    {
+    /* the ONE driver (vm.h): a loaded image's main must emit the native
+     * code a fresh compile's does - that is the whole point of re-running
+     * the tier here, and it holds by construction only while both run
+     * the same function. */
+    vm_jit_program(&prog.root, bodies, slot_desc,
+                   prog.global_slot_reassigned);
+}
+
+/* Declared in vm.h - see the contract there. */
+void vm_jit_program(Chunk *main,
+                    const std::vector<std::pair<Chunk *,
+                                                const FuncDescriptor *>>
+                        &bodies,
+                    const std::vector<const FuncDescriptor *> &slot_desc,
+                    const std::vector<char> &slot_reassigned)
+{
+    /* #97 inc 2 (F6): which callees will MAIN call framelessly - decided
+     * from main's code before any body is jitted, so a body knows whether
+     * to emit its frameless entry and return arm (bytecode.h) */
+    if (main) {
         JitCtx jc;
         jc.slot_desc = &slot_desc;
-        jc.slot_reassigned = &prog.global_slot_reassigned;
-        jit_compile_chunk(prog.root, &jc);
+        jc.slot_reassigned = &slot_reassigned;
+        jit_mark_frameless_wanted(*main, &jc);
+    }
+    /* Pass B: every body with its own JitCtx (caller_desc = the
+     * descriptor keying its chunk). Order-independent: every
+     * native_leaf / frameless_ok flag was set by codegen, a caller bakes
+     * the callee DESCRIPTOR and loads its native entry at RUNTIME - the
+     * one placement-dependent site, main's frameless `call rel32`, is
+     * emitted after every body is placed. */
+    for (const auto &b : bodies) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &slot_reassigned;
+        jc.caller_desc = b.second;
+        jit_compile_chunk(*b.first, &jc);
+    }
+    /*
+     * ...AND MAIN, LAST, WITH THE SAME MAP (#97 step 4). It used to be
+     * jitted by the caller with NO JitCtx at all, on the #55 reasoning
+     * that main has no stable descriptor and so cannot make a native
+     * DIRECT call. True, and `callv_native_ok` still declines on
+     * `!jc->caller_desc` - but the map itself is what lets the inline
+     * push BAKE its callee, and main is where most call loops live
+     * (every headline bench's outer loop). Handing main a context with
+     * a null caller_desc gives it the bake and changes nothing else.
+     */
+    if (main) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &slot_reassigned;
+        jit_compile_chunk(*main, &jc);
     }
 }
 
@@ -2608,47 +2642,16 @@ vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
     for (auto &kv : g_func_chunks)
         bc_inline_chunk(kv.second, slot_desc, bc_snaps);
 
-    /* Pass B: JIT every compiled body, each with its own JitCtx (caller_desc =
-     * the descriptor keying its chunk). Order-independent (all native_leaf
-     * flags set in Pass A; a caller bakes the callee DESCRIPTOR and loads its
-     * native entry at RUNTIME, by when every body is jit'd). Main is jit'd by
-     * vm_compile after this (with no JitCtx -> no native call from main in v1,
-     * since main has no stable descriptor for the record's ret_chunk). */
+    /* Pass B: the native tier, through the ONE driver (vm.h) - the
+     * frameless pre-pass over main, every body with its own JitCtx, then
+     * main last with the same map. */
     if (!jit)
         return;                 /* the .myv writer stores PRE-jit bytecode */
-    /* #97 inc 2 (F6): which callees will MAIN call framelessly - decided
-     * from main's code before any body is jitted, so a body knows whether
-     * to emit its frameless entry and return arm (bytecode.h) */
-    if (main_chunk) {
-        JitCtx jc;
-        jc.slot_desc = &slot_desc;
-        jc.slot_reassigned = &root->global_slot_reassigned;
-        jit_mark_frameless_wanted(*main_chunk, &jc);
-    }
-    for (auto &kv : g_func_chunks) {
-        JitCtx jc;
-        jc.slot_desc = &slot_desc;
-        jc.slot_reassigned = &root->global_slot_reassigned;
-        jc.caller_desc = kv.first;
-        jit_compile_chunk(kv.second, &jc);
-    }
-    /*
-     * ...AND MAIN, LAST, WITH THE SAME MAP (#97 step 4). It used to be
-     * jitted by the caller with NO JitCtx at all, on the #55 reasoning
-     * that main has no stable descriptor and so cannot make a native
-     * DIRECT call. True, and `callv_native_ok` still declines on
-     * `!jc->caller_desc` - but the map itself is what lets the inline
-     * push BAKE its callee, and main is where most call loops live
-     * (every headline bench's outer loop). Handing main a context with
-     * a null caller_desc gives it the bake and changes nothing else.
-     */
-    if (main_chunk)
-        {
-            JitCtx jc;
-            jc.slot_desc = &slot_desc;
-            jc.slot_reassigned = &root->global_slot_reassigned;
-            jit_compile_chunk(*main_chunk, &jc);
-        }
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> bodies;
+    for (auto &kv : g_func_chunks)
+        bodies.push_back({ &kv.second, kv.first });
+    vm_jit_program(main_chunk, bodies, slot_desc,
+                   root->global_slot_reassigned);
 }
 
 /* The in-flight exception's type NAME for catch-matching (a user struct
@@ -3438,6 +3441,9 @@ unsigned long g_jit_cap_scalar = 0;        /* #111 (emitted) */
 unsigned long g_jit_frameless_chunks = 0;  /* #97 reach probe (TESTS) */
 unsigned long g_jit_frameless_calls = 0;   /* #97 reach probe (TESTS) */
 unsigned long g_jit_frameless_entries = 0; /* #97 inc 2: entries EMITTED */
+unsigned long g_jit_frameless_sites = 0;   /* #97 inc 2: sites EMITTED
+                                            * frameless (the dump driver's
+                                            * net reads it) */
 unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
                                             * (emitted code) */
 unsigned long g_jit_frameless_rets = 0;    /* #97 inc 2: frameless RETURN

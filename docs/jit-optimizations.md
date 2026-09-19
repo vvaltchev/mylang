@@ -12359,3 +12359,62 @@ site's `NorecSite::frameless` is already recorded for them). And the
 caller-built-window variant (the site fills the callee's window on ITS
 stack, binding fused arguments in place) is the one that would recover
 the #162 fusion the tier now forgoes - recorded, not built.
+
+## #97 increment 3, T0 - THE DUMP DRIVER RUNS THE SEQUENCE A RUN DOES,
+## AND A DELETED OP KEEPS ITS NAME IN THE DUMP (2026-09-20)
+
+Infrastructure first. Increment 3's micro-steps are to be verified on
+the DISASSEMBLY - the expected `-vdj` text against the emitted one -
+before any perf number is taken, so the first thing checked was the
+instrument, and it was wrong on exactly the fragment the tier lives in.
+
+**Three drivers, one sequence.** `disassemble_program` (disasm.cpp) is
+a second codegen driver, and it replicated the JIT pass sequence by
+hand. Two things had moved under it: #97 step 4 handed MAIN a JitCtx
+(the slot->descriptor map), and #97 inc 2 added the frameless pre-pass
+(`jit_mark_frameless_wanted`) before any body is jitted. The dump did
+neither, so `-vdj bench/my/78` showed the generic `call rdx` push on a
+program whose run took 2,000,002 frameless calls, and no chunk showed
+its frameless entry or return arm. `vm_jit_program` (vm.h) is now the
+ONE driver - the pre-pass, every body with its own JitCtx, main last
+with the same map - called by `vm_precompile_all`,
+`vm_jit_loaded_image` and the dump. The `.myv` loader had already
+drifted once from the fresh compile (the 649-byte main, inc 2); a
+sequence that exists three times drifts three ways.
+
+**A mark carries the op.** `NativeCode::OpMark` records the post-remap
+pc, and on a delete-originals fragment (#56) every op remaps to the
+surviving EnterNative - so main's dump read `; vm pc 0: enter.nat` at
+every op boundary and the op each native sequence implemented was
+unrecoverable. The mark now also holds the pre-remap pc and a COPY of
+the `Instr`; the dump renders the copy, as `; vm op N: <op>` on a
+fragment whose originals are gone (`vm op`, not `vm pc`, so a reader
+does not look for N in the listing above). A fragment with its ops
+intact prints exactly as before. `render_row(pc)` became
+`render_instr(const Instr &)`, the same switch.
+
+**The header names the entry.** A chunk with a frameless entry prints
+`; frameless entry @+N` beside its `native_leaf` line.
+
+**A pre-existing reproducibility bug it exposed.** With main jitted
+through the real sequence, `scripts/vdjcmp.sh BIN BIN` refused THREE
+corpus programs (64_struct_create, 11_catch_bind_release,
+23_baked_callee): `movabs rcx, 2` in one run, `9` in the next. The
+LoadConstV inline copy bakes a trivial const's payload as immediates,
+and #96 9d had narrowed the copy to the meaningful bytes for
+int/float/bool/none - a STRUCT TYPE descriptor (one pointer) fell to
+the whole-copy default and baked 16 bytes of union padding. The
+padding happened to be stable until the driver's heap history changed.
+Every trivial kind names its payload width now (a Builtin's is its two
+pointers and the Kind byte - its own tail is struct padding), and an
+unlisted trivial kind is an ML_CHECK rather than a whole copy. Self-test
+back to 127/127.
+
+**Nets.** `vm_disasm_driver_jit_parity` (-rt): over 78's shape, the
+emit-time counters `frameless_entries` and the new `frameless_sites`
+(bumped only when the site takes the frameless tail) advance by the
+program's four leaves during `disassemble_program`, the text carries
+four `frameless entry` lines, and main's marks name a `call.val`.
+`driver_checks.sh` asks the CLI the same over bench/my/78. Both watched
+failing against the old driver (0 entries, 0 sites). `disasmcheck.py`:
+233,153 instructions, 0 disagreements; `vdjcmp.sh` self-test 127/127.

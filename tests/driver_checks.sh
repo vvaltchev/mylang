@@ -308,6 +308,28 @@ else
     echo "  skip  -vdj reproducibility (this build reports jit 0)"
 fi
 
+# ⛔ `-vdj` DUMPS THE NATIVE TIER A RUN USES (#97 inc 2, 2026-09-20).
+# The dump is a SECOND codegen driver, and its hand copy of the JIT
+# pass sequence went stale twice: main jitted with no map, no frameless
+# pre-pass - so `-vdj bench/my/78` showed the generic `call rdx` push
+# for a program whose run took 2,000,002 frameless calls, and the tier
+# was being "read" off a dump of code that never ran. The drivers share
+# vm_jit_program now; this asks the CLI itself, over the bench the tier
+# was built for: its four leaves (two factories, two closures - the
+# count MYLANG_JITSTATS reports) must each show their frameless entry.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    n=$("$BIN" -npc -vdj "$here/../bench/my/78_typed_param_call.my" \
+            2>/dev/null | grep -c '^; frameless entry @+')
+    if [ "$n" = "4" ]; then
+        pass "-vdj: the dump carries the frameless tier a run uses (4 entries)"
+    else
+        fail "-vdj shows $n frameless entries for bench/my/78 (want 4): the
+      dump driver is not running the JIT sequence a run does"
+    fi
+else
+    echo "  skip  -vdj frameless parity (this build reports jit 0)"
+fi
+
 # ---------------------------------------------------------------------
 # -dcs: the CALLEE-SET dump (#116).
 #

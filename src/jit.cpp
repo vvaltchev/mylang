@@ -9502,6 +9502,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.lea_base(RDI, RBX,                      /* reg:abi: the run */
                    static_cast<int32_t>(in.a_lit()) * 48);
 #ifdef TESTS
+        g_jit_frameless_sites++;                  /* emit-time */
         e.bump_counter(&g_jit_frameless_pushes);
         e.bump_counter(&g_jit_sync_inline);
         e.bump_counter(&g_jit_op_run[static_cast<size_t>(in.op)]);
@@ -11565,6 +11566,7 @@ void jit_stats_report()
         { "frameless_chunks", &g_jit_frameless_chunks },
         { "frameless_calls",  &g_jit_frameless_calls },
         { "frameless_entries", &g_jit_frameless_entries },
+        { "frameless_sites",   &g_jit_frameless_sites },
         { "frameless_pushes",  &g_jit_frameless_pushes },
         { "frameless_rets",    &g_jit_frameless_rets },
         { "arg_stage",        &g_jit_arg_stage },
@@ -19724,15 +19726,44 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * zero. Builtin - trivial but with a MULTI-qword payload
              * (the first fix assumed "trivial == one qword" and a
              * baked `len` value lost its function pointer, caught by
-             * -rt in seconds) - and every reference copy whole. */
+             * -rt in seconds) - and every reference copy whole.
+             * ⛔ IT RECURRED (2026-09-20): a STRUCT TYPE descriptor is one
+             * pointer too, and it fell to the whole-copy default - so a
+             * `load rN, Trouble` baked 16 padding bytes, and vdjcmp's
+             * self-test refused three programs the day the dump driver's
+             * heap history changed (`movabs rcx, 2` in one run, `9` in
+             * the next). Every trivial kind names its payload width
+             * here; a Builtin's is its two pointers plus the Kind byte
+             * (its tail is struct padding, indeterminate like the
+             * union's), and an unlisted trivial kind is an ML_CHECK, not
+             * a whole copy. */
             const Type::TypeE bt_v = v.get_type()->t;
+            static_assert(sizeof(Builtin) == 24 && sizeof(q) == 24,
+                          "a Builtin const is copied field by field below");
             const size_t nb_v =
                 bt_v == Type::t_none ? 0
                 : (bt_v == Type::t_int || bt_v == Type::t_float
-                   || bt_v == Type::t_bool) ? 8
+                   || bt_v == Type::t_bool || bt_v == Type::t_structtype)
+                      ? 8
+                : bt_v == Type::t_builtin ? 0   /* copied below */
                 : sizeof q;
-            std::memcpy(q, reinterpret_cast<const char *>(&v)
-                               + EvalValue::jit_payload_off(), nb_v);
+            ML_CHECK_MSG(bt_v == Type::t_none || bt_v == Type::t_int
+                         || bt_v == Type::t_float || bt_v == Type::t_bool
+                         || bt_v == Type::t_structtype
+                         || bt_v == Type::t_builtin,
+                         "LoadConstV: a trivial const kind with no baked "
+                         "payload width");
+            if (bt_v == Type::t_builtin) {
+                const Builtin &bf = v.get<Builtin>();
+                std::memcpy(&q[0], &bf.func, sizeof q[0]);
+                std::memcpy(&q[1], &bf.func_v, sizeof q[1]);
+                q[2] = static_cast<uint64_t>(bf.kind);
+                static_assert(offsetof(Builtin, kind) == 16,
+                              "Builtin::kind is the third qword's low byte");
+            } else {
+                std::memcpy(q, reinterpret_cast<const char *>(&v)
+                                   + EvalValue::jit_payload_off(), nb_v);
+            }
             hold();
             e.movabs(cpy, q[0]); e.store(cpy, dst.payload);
             e.movabs(cpy, q[1]); e.store(cpy, dst.payload + 8);
@@ -24210,7 +24241,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     for (size_t pc = 0; pc < n; ) {
         if (g_jit_annotate)
             marks.push_back({ static_cast<uint32_t>(e.pos()),
-                              static_cast<uint32_t>(remap[pc]) });
+                              static_cast<uint32_t>(remap[pc]),
+                              static_cast<uint32_t>(pc), chunk.code[pc] });
         if (isl_idx < islands.size() && pc == islands[isl_idx].first) {
             const size_t ib = islands[isl_idx].first, ie = islands[isl_idx].second;
             /* a back edge may target this call */
@@ -26185,7 +26217,8 @@ retry_emission:
             e.dbg_op = static_cast<int>(in.op);
             if (g_jit_annotate)
                 marks.push_back({ static_cast<uint32_t>(e.pos() - frag_off[r]),
-                                  static_cast<uint32_t>(remap[pc]) });
+                                  static_cast<uint32_t>(remap[pc]),
+                                  static_cast<uint32_t>(pc), in });
 
             /* Lever A protocol. in_temp is one-shot: it names the temp
              * whose value the JUST-EMITTED producer left in res_reg

@@ -306,6 +306,39 @@ struct VmProgram {
 void vm_jit_loaded_image(VmProgram &prog);
 
 /*
+ * THE JIT DRIVER - the one pass sequence that turns a codegen'd program
+ * into its native tier, shared by the THREE places that run it: a fresh
+ * compile (vm_precompile_all), a `.myv` load (vm_jit_loaded_image) and
+ * the -vd/-vdj dump driver (disassemble_program). In order: the
+ * frameless pre-pass over MAIN (which callees will main call
+ * framelessly - a body reads the answer to decide whether to emit its
+ * frameless entry and return arm), every body with its own JitCtx
+ * (caller_desc = the descriptor keying it), then main LAST with the
+ * same map and a null caller_desc (bake_final: every callee main can
+ * name is placed by then).
+ *
+ * ⛔ ONE copy, not three. The dump driver used to replicate this by
+ * hand and went stale TWICE without anything noticing: it jitted main
+ * with no JitCtx after #97 step 4 gave main the map, and it never ran
+ * the #97 inc 2 pre-pass - so `-vdj` showed the generic `call rdx` push
+ * on a program whose real run took 2,000,002 frameless calls. The dump
+ * is the instrument this tier is measured with; a driver of its own is
+ * a second implementation free to drift (the vm_precompile_all /
+ * vm_jit_loaded_image pair had already drifted once, the 649-byte
+ * main). `bodies` pairs each chunk with its descriptor, in whatever
+ * order the caller iterates (the dump driver's is source order, for a
+ * reproducible arena; a fresh compile's is g_func_chunks' - order does
+ * not change any fragment's text, only its placement). `main` may be
+ * null (a program with no root chunk to jit).
+ */
+void vm_jit_program(Chunk *main,
+                    const std::vector<std::pair<Chunk *,
+                                                const FuncDescriptor *>>
+                        &bodies,
+                    const std::vector<const FuncDescriptor *> &slot_desc,
+                    const std::vector<char> &slot_reassigned);
+
+/*
  * #137: REFUSE a structurally impossible image, BEFORE the JIT or the
  * interpreter indexes anything in it. Runs verify_chunk (codegen.h) over the
  * root and every function body.
