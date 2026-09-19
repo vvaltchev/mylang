@@ -1267,11 +1267,41 @@ collision). Three nets now:
   coverage tests that pin the PICK's mechanisms
   (jit_xcache_pins, jit_rax_pin_test, jit_range_share_test,
   jit_share_region_clamp) set the lever through `g_jit_off_extra`
-  for their duration. ⛔ THOSE MECHANISMS ARE THE PICK'S ALONE:
-  corpus-wide under the scan, `xcache` is 1 (46_matrix_mult),
-  `rax_pin` 0 and `range_share` 0 - the scan answers pin pressure
-  with TRANSITIONS instead (83_regs_int_40: `lsra_trans 22` vs
-  `xcache 1`). ⛔ TWO RULES
+  for their duration.
+
+  ⛔ **AND ONLY ONE OF THE THREE IS ACTUALLY THE PICK'S** - this said
+  "those mechanisms are the pick's alone" for a day and that was
+  WRONG on two counts, both from reading a counter as if it were a
+  reach measurement:
+   - **xcache is SHARED and LIVE.** Since #123 both allocators bind
+     pins through the same `ra.take(CAP_ALLOCATABLE)`; there is no
+     separate xcache path, only "the allocator handed out a
+     caller-saved register" plus the save/restore
+     emit_call_prologue/epilogue already does. The scan reaches it on
+     46_matrix_mult (`xcache 1`), the ONLY corpus program that makes
+     it do so. Deleting it would forbid the allocator 9 of its 13
+     registers - the opposite of what #123 was for.
+   - **rax is SHARED and LIVE, and `rax_pin` is the WRONG COUNTER.**
+     `rax_pin` counts fragments that RAN with rax pinned (0 - because
+     the eviction worked). `rax_retries` counts rax being chosen,
+     conflicting, and the chunk re-emitting with it denied: **1 on
+     each of 83/82/81_regs_int**, under the shipping allocator. The
+     machinery fires; the absence of a pin is its SUCCESS.
+   - **ShareSeam / `range_share` IS pick-only**, and structurally so:
+     under trans mode `spill_hot = lsra_homes`, so the scan
+     substitutes its own overflow plan and the share plan never runs
+     (`range_share` 0, `share_clamped` 0 corpus-wide). That is the one
+     real deletion candidate if the pick ever goes.
+
+  **THE GENERAL LESSON: a counter that reads 0 may be measuring a
+  mechanism that WORKED, not one that never ran.** Ask what the
+  counter is bumped BY before concluding a path is dead - `rax_pin`
+  and `rax_retries` differ by exactly that, and only the second
+  answers "did the rax machinery execute".
+
+  The scan does answer pin pressure differently, which is true and
+  was the sound half: 83_regs_int_40 gets `lsra_trans 22` where the
+  pick gets `xcache 1`. ⛔ TWO RULES
   it already earned: GP admission needs uses_int > 0 - an int-op
   touch is the TYPE evidence the t_int flush relies on; a ReturnV
   read is weight, never evidence (a ret-only closure slot pinned on
