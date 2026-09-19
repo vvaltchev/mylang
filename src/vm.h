@@ -63,6 +63,12 @@ bool vm_lookup_builtin(const UniqueId *name, Builtin &out);
  * owns those re-enters vm_dispatch DIRECTLY, paying no per-element entry setup.
  */
 void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
+/* RULE 2: a loc-less exception out of a call's SETUP (arity, a bind
+ * coercion, the window push) gets the ARGUMENT LIST's caret - the call
+ * op's second caret (base_locs) - as the tree-walker's CallExpr::do_eval
+ * stamps it; `locs` (the whole call) is the fallback. See the definition. */
+struct Exception;
+void vm_stamp_setup_caret(Exception &e, const Chunk &chunk, size_t pc);
 
 /*
  * model-flip M2 (plans/archived/model-flip.md): headless self-test for vm_exec_block -

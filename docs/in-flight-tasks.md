@@ -664,8 +664,20 @@ does not rediscover (a) as a mystery.
 
 ---
 
-## 3c. FOUND, NOT FIXED — A BIND-COERCION ERROR'S CARET DIFFERS PER
-## ENGINE (2026-09-20, during #97 inc 3 W2; RULE 2)
+## 3c. ✅ FIXED 2026-09-20 (the maintainer's call, the same day) — A
+## BIND-COERCION ERROR'S CARET DIFFERED PER ENGINE (found during #97
+## inc 3 W2; RULE 2)
+
+The fix, in one line: the user call ops carry the ARGUMENT LIST's span as
+their second caret (`base_locs`), the interpreter and the JIT stamp a
+loc-less setup throw with it, and the tree-walker's devirtualized
+`DirectCallExpr`/`CachedCallExpr` reproduce the plain `CallExpr` catch -
+which was a FOURTH divergence the fix turned up: a named function's call
+marked the whole call, a closure's the arguments, in the tree-walker
+itself. Four 5-mode `err loc:` tests with the exact spans (each throwing
+on a warmed re-descent, so the JIT's emitted sites are what is tested),
+watched failing in every mode. Record: docs/vm-ops.md, `Chunk::base_locs`.
+The original finding follows.
 
     func mk2(int z) { return func [z] (int a, int b) { ... }; }
     var f2 = mk2(1); var dyn z = 0; z = runtime("str");

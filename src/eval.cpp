@@ -890,8 +890,19 @@ EvalValue vm_call_func(EvalContext *ctx,
                        size_t n,
                        const Chunk *ck, size_t pc)
 {
-    return do_func_call(ctx, obj, VmArgs{argslots, n}, Loc(), nullptr, ck, pc,
-                        /*as_signal=*/true);
+    try {
+        return do_func_call(ctx, obj, VmArgs{argslots, n}, Loc(), nullptr,
+                            ck, pc, /*as_signal=*/true);
+    } catch (Exception &e) {
+        /* the bind runs BEFORE do_func_call's try, so its throw escapes
+         * loc-less: the argument list's caret, as the tree-walker's
+         * CallExpr::do_eval stamps it (an interpreted op passes its chunk;
+         * the JIT's boundary path passes none and stamps in its own
+         * conveyance) */
+        if (ck)
+            vm_stamp_setup_caret(e, *ck, pc);
+        throw;
+    }
 }
 
 EvalValue eval_func(EvalContext *ctx,
@@ -1709,18 +1720,42 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
  * construction, a slot reassigned to a non-function, an undefined slot, or the
  * REPL (no global table) falls back to the full CallExpr path.
  */
+/*
+ * RULE 2 (2026-09-20): the argument-list caret a loc-less error out of
+ * do_func_call gets in CallExpr::do_eval's catch - a bind coercion, an
+ * arity throw - is reproduced here, exactly as DirectBuiltinCallExpr
+ * reproduces it for a builtin. Without it the DEVIRTUALIZATION changed
+ * the caret: `fi(x)` with a `dyn` float into an `int` parameter marked
+ * the whole call from a named function and the argument list from a
+ * closure (a plain CallExpr), and the VM carets the argument list for
+ * both (the call ops' second caret, base_locs).
+ */
+static inline void stamp_args_loc(Exception &e, const ExprList *args)
+{
+    if (!e.loc_start) {
+        e.loc_start = args->start;
+        e.loc_end = args->end;
+    }
+}
+
 EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     if (ctx->gfuncs && ctx->gfuncs->defined[direct_func_slot]) {
         const EvalValue &fv = ctx->gfuncs->slots[direct_func_slot].get();
-        if (fv.is<intrusive_ptr<FuncObject>>())
-            return do_func_call(
-                ctx,
-                *fv.get<intrusive_ptr<FuncObject>>().get(),
-                args->elems,
-                start,
-                inline_ctx
-            );
+        if (fv.is<intrusive_ptr<FuncObject>>()) {
+            try {
+                return do_func_call(
+                    ctx,
+                    *fv.get<intrusive_ptr<FuncObject>>().get(),
+                    args->elems,
+                    start,
+                    inline_ctx
+                );
+            } catch (Exception &e) {
+                stamp_args_loc(e, args.get());
+                throw;
+            }
+        }
     }
     return CallExpr::do_eval(ctx, rec);
 }
@@ -1738,14 +1773,20 @@ EvalValue CachedCallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     if (ctx->gfuncs && ctx->gfuncs->defined[direct_func_slot]) {
         const EvalValue &fv = ctx->gfuncs->slots[direct_func_slot].get();
-        if (fv.is<intrusive_ptr<FuncObject>>())
-            return cached_call(
-                ctx,
-                *fv.get<intrusive_ptr<FuncObject>>().get(),
-                args->elems,
-                start,
-                inline_ctx
-            );
+        if (fv.is<intrusive_ptr<FuncObject>>()) {
+            try {
+                return cached_call(
+                    ctx,
+                    *fv.get<intrusive_ptr<FuncObject>>().get(),
+                    args->elems,
+                    start,
+                    inline_ctx
+                );
+            } catch (Exception &e) {
+                stamp_args_loc(e, args.get());   /* RULE 2: see above */
+                throw;
+            }
+        }
     }
     return CallExpr::do_eval(ctx, rec);
 }

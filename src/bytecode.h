@@ -1986,8 +1986,14 @@ struct Chunk {
      * - a backtrace reading "line 0".
      *
      * Same shape and cost as `locs` - pc-keyed, ascending, binary-searched,
-     * read ONLY from vm_store_base's cold unbound-global arm - and SPARSE: only
-     * a store whose base can be a global records one.
+     * read ONLY on a throw path - and SPARSE: a store whose base can be a
+     * global records one, and (2026-09-20, RULE 2) so does every USER CALL
+     * op (CallV/CachedCallV/CallValueV), whose second caret is the ARGUMENT
+     * LIST's span: a loc-less exception out of the call's setup - an arity
+     * throw, a bind coercion - is what the tree-walker's CallExpr::do_eval
+     * carets there, while `locs` holds the whole call. Read by the
+     * interpreter's enter paths (vm_stamp_setup_caret) and baked by the
+     * JIT's conveyance (emit_exc_stamp's args form).
      */
     std::vector<LocEntry> base_locs;
 
