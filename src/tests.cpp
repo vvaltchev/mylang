@@ -20220,14 +20220,27 @@ static bool jit_bind_widen_inline()
     };
     const unsigned long b0 = g_jit_bind_widen;
     const unsigned long c0 = g_jit_coerce_cached;
+    /* ⛔ #97 1c EATS THE NAMEABLE SHAPE: `var ff = mkf(); ff(i)` names
+     * ONE closure (#116), so the site BAKES and the generic coercing
+     * arm - this test's subject - never runs (its widening counter is
+     * separate: g_jit_bake_widen). The callee is therefore picked out
+     * of an array of TWO different lambda decls - two candidates, no
+     * stamp, the generic tier - while staying monomorphic at run time.
+     * Same rewrite E1 gave jit_callee_cache. */
     if (!run({
             "func mkf() { var b = 0.5;",
             "  return func[b](float x) { return b + x; }; }",
+            "func mkf2() { var b = 0.25;",
+            "  return func[b](float x) { return b - x; }; }",
             "func mki() { var b = 100;",
             "  return func[b](int k) { return b + k; }; }",
+            "func mki2() { var b = 7;",
+            "  return func[b](int k) { return b * k; }; }",
             "func drive(int n) {",
-            "  var ff = mkf();",
-            "  var fi = mki();",
+            "  var fsf = [mkf(), mkf2()];",
+            "  var fsi = [mki(), mki2()];",
+            "  var ff = fsf[0];",
+            "  var fi = fsi[0];",
             "  var w = 0.0;",
             "  var bs = 0;",
             "  for (var i = 0; i < n; i++) w = w + ff(i);",
@@ -27241,6 +27254,247 @@ static bool jit_argfuse_vs_pins()
     if (ok && g_jit_call_pinned_sites <= p0) {
         fprintf(stderr, "jit_argfuse_vs_pins: the call was not emitted "
                         "inside a PINNED run (vacuous)\n");
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 probe elision: the pure-call cache is an EMIT-TIME fact. With the
+ * cache OFF the emitted CachedCallV site must not call jit_cached_probe
+ * at all - the helper's own early return keeps the answers right with
+ * the call still emitted, which is exactly why a value check cannot see
+ * this and the counter has to be the probe's CALL count. With the cache
+ * ON the probe must run (and the same program must still be right - the
+ * two emissions differ, so both are asserted). Watched failing with the
+ * elision reverted: the OFF half reports the calls.
+ */
+static bool jit_cached_probe_elided()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const auto run = [&](bool cache_on, const char *what) -> bool {
+        const bool saved_pc = g_pure_cache_enabled;
+        g_pure_cache_enabled = cache_on;
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        const std::string src =
+            "func fib(n) { if (n < 2) return n;\n"
+            "  return fib(n - 1) + fib(n - 2); }\n"
+            "var m = 20; m = m + runtime(0);\n"
+            "print(fib(m));\n";
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        bool ok = true;
+        const unsigned long c0 = g_jit_cached_probe_calls;
+        const unsigned long b0 = g_jit_bake_push;
+        std::ostringstream out;
+        std::streambuf *old = std::cout.rdbuf(out.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        std::cout.rdbuf(old);
+        g_exec_engine = saved;
+        g_pure_cache_enabled = saved_pc;
+        if (ok && out.str() != "6765 \n") {
+            fprintf(stderr, "jit_cached_probe_elided [%s]: stdout %s != "
+                            "6765\n", what, out.str().c_str());
+            ok = false;
+        }
+        const unsigned long calls = g_jit_cached_probe_calls - c0;
+        if (ok && g_jit_bake_push <= b0) {
+            fprintf(stderr, "jit_cached_probe_elided [%s]: the baked push "
+                            "did not run (vacuous - the sites were not "
+                            "emitted inline)\n", what);
+            ok = false;
+        }
+        if (ok && cache_on && calls == 0) {
+            fprintf(stderr, "jit_cached_probe_elided [%s]: the probe was "
+                            "NOT called with the cache on\n", what);
+            ok = false;
+        }
+        if (ok && !cache_on && calls != 0) {
+            fprintf(stderr, "jit_cached_probe_elided [%s]: %lu probe "
+                            "call(s) with the cache OFF - the emitted "
+                            "site still pays the C++ round trip\n",
+                    what, calls);
+            ok = false;
+        }
+        return ok;
+    };
+    return run(false, "cache off") && run(true, "cache on");
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 1c: THE BAKED COERCING CALLEE. A callee with an `int`/`float`
+ * parameter used to be refused by the bake gate (`fast_bind` is false),
+ * so 78_typed_param_call's calls took the generic coercing tier on every
+ * call. Baked, the required type is an emit-time constant: one compare
+ * per coercing argument, then the same total widenings the generic arm
+ * does, in place. Each case proves WHICH arm ran with the counters the
+ * two arms bump separately - g_jit_bake_push / g_jit_bake_widen for the
+ * baked arm, g_jit_bind_coerce / g_jit_coerce_cached for the generic
+ * one - so a gate that quietly sent the shape back to the generic tier
+ * (correct, slower, and otherwise silent) fails here:
+ *  (a) 78's shape: an int into an int param (exact) and an int into a
+ *      float param (widened) - baked, widened, generic arm NOT taken;
+ *  (b) a bool into an int param (the retag arm);
+ *  (c) `none` into an `opt int` param passes through the baked arm;
+ *  (d) a NARROWING (a float into an int param) and a non-numeric still
+ *      raise TypeErrorEx - the baked arm declines to the C++ tier
+ *      pre-mutation, which is the one that raises.
+ * Watched failing: the gate reverted to `fast_bind` (bake_push stays
+ * 0 on (a)); the cvtsi2sd skipped (the float sum is wrong).
+ */
+static bool jit_bake_coercing()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    struct Delta { unsigned long push, widen, coerce, cached; };
+    const auto run = [&](const std::vector<std::string> &lines,
+                         const char *expect, const char *what,
+                         Delta *d) -> bool {
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::string src;
+        for (const std::string &l : lines)
+            src += l + "\n";
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        bool ok = true;
+        const unsigned long p0 = g_jit_bake_push, w0 = g_jit_bake_widen;
+        const unsigned long c0 = g_jit_bind_coerce,
+                            h0 = g_jit_coerce_cached;
+        std::ostringstream out;
+        std::streambuf *old = std::cout.rdbuf(out.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        std::cout.rdbuf(old);
+        g_exec_engine = saved;
+        if (ok && out.str() != expect) {
+            fprintf(stderr, "jit_bake_coercing [%s]: stdout %s != "
+                            "expected %s\n", what, out.str().c_str(),
+                    expect);
+            ok = false;
+        }
+        *d = { g_jit_bake_push - p0, g_jit_bake_widen - w0,
+               g_jit_bind_coerce - c0, g_jit_coerce_cached - h0 };
+        return ok;
+    };
+    Delta d;
+    bool ok = run({
+        "func make_adder(int base) {",
+        "  return func [base] (int k) { return base + k; }; }",
+        "func make_scaler(float f) {",
+        "  return func [f] (float x) { return f * x; }; }",
+        "var add = make_adder(7);",
+        "var scale_it = make_scaler(0.5);",
+        "var s = 0;",
+        "var t = 0.0;",
+        "for (var i = 0; i < runtime(60); i++) {",
+        "  s = s + add(i);",
+        "  t = t + scale_it(i);",
+        "}",
+        "print(s, t);" }, "2190 885.000000 \n", "78 shape", &d);
+    if (ok && d.push < 120) {
+        fprintf(stderr, "jit_bake_coercing [78 shape]: only %lu baked "
+                        "pushes for 120 calls - the coercing callee did "
+                        "not bake\n", d.push);
+        ok = false;
+    }
+    if (ok && d.widen < 60) {
+        fprintf(stderr, "jit_bake_coercing [78 shape]: only %lu baked "
+                        "widenings for 60 int->float arguments\n",
+                d.widen);
+        ok = false;
+    }
+    if (ok && (d.coerce || d.cached)) {
+        fprintf(stderr, "jit_bake_coercing [78 shape]: the GENERIC "
+                        "coercing arm ran (%lu pushes, %lu cache hits) - "
+                        "the site did not bake\n", d.coerce, d.cached);
+        ok = false;
+    }
+    /* (b) bool -> int, the retag arm */
+    if (ok)
+        ok = run({
+            "func make_adder(int base) {",
+            "  return func [base] (int k) { return base + k; }; }",
+            "var add = make_adder(100);",
+            "var bs = 0;",
+            "for (var i = 0; i < runtime(60); i++) bs = bs + add(i % 2 == 0);",
+            "print(bs);" }, "6030 \n", "bool->int", &d);
+    if (ok && (d.push < 60 || d.widen < 60 || d.coerce)) {
+        fprintf(stderr, "jit_bake_coercing [bool->int]: push %lu widen "
+                        "%lu generic %lu\n", d.push, d.widen, d.coerce);
+        ok = false;
+    }
+    /* (c) none into an opt int parameter: passes the baked check with no
+     * conversion (the callee decides) */
+    if (ok)
+        ok = run({
+            "func make_adder(int base) {",
+            "  return func [base] (opt int k) {",
+            "    if (k == none) { return base; } return base + k; }; }",
+            "var add = make_adder(5);",
+            "var acc = 0;",
+            "for (var i = 0; i < runtime(40); i++) {",
+            "  if (i % 4 == 0) { acc = acc + add(none); }",
+            "  else { acc = acc + add(i); }",
+            "}",
+            "print(acc);" }, "800 \n", "none->opt int", &d);
+    if (ok && (d.push < 40 || d.widen != 0 || d.coerce)) {
+        fprintf(stderr, "jit_bake_coercing [none->opt int]: push %lu "
+                        "widen %lu generic %lu\n", d.push, d.widen,
+                d.coerce);
+        ok = false;
+    }
+    /* (d) the declines that RAISE: a float into an int parameter and a
+     * string into a float one - both in a loop so the site is baked,
+     * both caught in the same frame */
+    if (ok)
+        ok = run({
+            "func make_adder(int base) {",
+            "  return func [base] (int k) { return base + k; }; }",
+            "func make_scaler(float f) {",
+            "  return func [f] (float x) { return f * x; }; }",
+            "var add = make_adder(7);",
+            "var scale_it = make_scaler(0.5);",
+            "var caught = 0; var s = 0;",
+            "for (var i = 0; i < runtime(30); i++) {",
+            "  s = s + add(i);",
+            "  try { s = s + add(runtime(2.5)); }",
+            "  catch (TypeErrorEx) { caught = caught + 1; }",
+            "  try { s = s + int(scale_it(runtime(\"x\"))); }",
+            "  catch (TypeErrorEx) { caught = caught + 10; }",
+            "}",
+            "print(s, caught);" }, "645 330 \n", "narrowing raises", &d);
+    if (ok && d.push < 30) {
+        fprintf(stderr, "jit_bake_coercing [narrowing raises]: only %lu "
+                        "baked pushes - the exact calls did not bake\n",
+                d.push);
         ok = false;
     }
     return ok;
@@ -36564,6 +36818,7 @@ static bool jit_counter_coverage()
         { "bind_coerce",      &g_jit_bind_coerce,      nullptr },
         { "bind_widen",       &g_jit_bind_widen,       nullptr },
         { "coerce_cached",    &g_jit_coerce_cached,    nullptr },
+        { "bake_widen",       &g_jit_bake_widen,       nullptr },
         { "entry_resume",     &g_jit_entry_resume,     nullptr },
         { "ret_inline",       &g_jit_ret_inline,       nullptr },
         { "member_fast",      &g_jit_member_fast,      nullptr },
@@ -39593,6 +39848,12 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 1b - an in-place argument (#162) beside a pin installed "
       "by a scan TRANSITION: the fusion gate sees the transition",
       jit_argfuse_vs_pins },
+    { "jit: #97 - the cached-call PROBE is not emitted while the pure "
+      "cache is off (an emit-time fact), and runs when it is on",
+      jit_cached_probe_elided },
+    { "jit: #97 1c - a COERCING callee bakes: exact, widened (int->float, "
+      "bool->int), none->opt, and the narrowing decline still raises",
+      jit_bake_coercing },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },

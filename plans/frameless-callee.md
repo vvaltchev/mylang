@@ -408,7 +408,15 @@ Each ends with a MEASUREMENT that can kill the next one.
    found on the way and what it leaves open.
 
 **1c. THE COERCING-CALLEE BAKE — added 2026-09-04, from E1's own
-   measurement.** E1 named 78_typed_param_call's callees and the bench
+   measurement.** ✅ DONE 2026-09-19, with the PROBE ELISION beside it:
+   the baked arm accepts a coercing callee (per-parameter checks from
+   `bind_req` at emit time: 2 instructions for an exact argument, 7
+   for the int -> float widening 78 does on every call), and the
+   CachedCallV site no longer emits the pure-cache probe, fork test,
+   stash and key store while the cache is off. 78 -13.6% Ir, 09_fib
+   -17.5% Ir. Record: `docs/jit-optimizations.md`, *#97 increment 1c*.
+   The analysis below is kept as written.
+   E1 named 78_typed_param_call's callees and the bench
    did not move one instruction, because naming was never what stopped
    it. The FIRST bake gate is
 

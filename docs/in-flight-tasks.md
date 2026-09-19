@@ -367,7 +367,17 @@ newly-admitted pins are worth less than their spill.
 is an audited table with the documented staleness risk. If the barrier
 lands, the list may be deletable outright — the better outcome.
 
-### 1.5 INCREMENT 1c — THE COERCING-CALLEE BAKE (new, added today)
+### 1.5 INCREMENT 1c — ✅ DONE 2026-09-19 (with the probe elision)
+
+**STATUS AS OF 2026-09-19: LANDED**, together with the pure-cache PROBE
+ELISION (the CachedCallV site emits no probe / fork test / stash / key
+store while `g_pure_cache_enabled` is off - an emit-time fact since
+increment 0's ML_CHECK). 78_typed_param_call's 2,000,001 calls all take
+the baked arm now (`bake_push` 0 -> 2,000,002, `bake_widen` 1,000,000,
+the generic coercing counters 0): -13.6% Ir. 09_fib -17.5% Ir from the
+probe elision alone. Record: `docs/jit-optimizations.md`, *#97 increment
+1c*. The text below is the pre-landing analysis.
+
 
 E1 named 78_typed_param_call's callees and the bench did not move one
 instruction, **because naming was never what stopped it**. The FIRST

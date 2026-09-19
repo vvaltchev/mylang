@@ -1395,6 +1395,7 @@ extern "C" unsigned long g_jit_telide;        /* C3: type-elided fragment
 extern "C" unsigned long g_jit_fread;         /* C4a-i: float read-dispatch
                                                * elision entries */
 extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
+extern unsigned long g_jit_cached_probe_calls;  /* probe elision (2026-09-19) */
 extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
 /* G1: HITS of the emitted monomorphic callee cache - the same callee as last
  * time at this site, so the five callee-property guards are skipped. Bumped
@@ -1408,6 +1409,7 @@ extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
  * value-level test.
  */
 extern "C" unsigned long g_jit_bake_push;
+extern "C" unsigned long g_jit_bake_widen;   /* #97 1c */
 extern "C" unsigned long g_jit_callee_cache;
 extern "C" unsigned long g_jit_callee_cache2;
 /* G1: inline pushes made to a callee with an int/float-declared param - the

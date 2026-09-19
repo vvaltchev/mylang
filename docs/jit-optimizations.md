@@ -12019,3 +12019,124 @@ the scan-hole reason above); the gap that remains, ~100 Ir per call, is
 the call protocol - increment 2's subject. Worth carrying: a BAKED
 callee's clobber set is known at JIT-compile time exactly as it is to
 gcc, so caller-saved pins across a named call need no spill either.
+
+## #97 increment 1c - THE COERCING CALLEE BAKES, AND THE PURE-CACHE PROBE
+## IS AN EMIT-TIME FACT (2026-09-19)
+
+**THE SUBJECT.** 78_typed_param_call - the bench that exists to show a
+TYPED parameter is faster - was the slowest call shape in the suite at
+18.1x C++, because the bake gate (#97 step 4) refused any callee whose
+`fast_bind` is false, and `compute_bind_flags` clears it for ANY
+parameter annotated `int`/`float`. E1 had named its callees
+(`-dcs`: `one lambda@19:12`, `one lambda@23:12`) and the bench did not
+move one instruction: every one of its 2,000,001 calls took the GENERIC
+coercing tier - the three-entry callee cache (`coerce_cached
+1,999,998`), the five descriptor gates, and a per-argument `bind_req`
+loop that loads the required type, tests it, compares the argument's
+tag against it, then the widening ladder (`bind_coerce 2,000,002`,
+`bind_widen 1,000,000`).
+
+**WHAT CHANGES.** With the descriptor known at emit time, the REQUIRED
+type per parameter is a compile-time constant, so the baked arm accepts
+a coercing callee: after the one identity compare, each `int`/`float`
+parameter costs `cmp qword [arg.type], <tag>; je` - exact, the common
+case, two instructions - and otherwise the same TOTAL widenings the
+generic arm performs, in place in the argument temp (bool -> int is a
+retag, int/bool -> float a `cvtsi2sd`), with the int -> float case
+tested straight off the tag immediate since it is the widening 78 does
+on every call. A narrowing or a non-numeric declines to the C++ tier,
+which raises - pre-mutation, as it must. The one shape that still
+declines: a FUSED argument (#162) meeting a coercing parameter - the
+widening writes the temp in place, and a fused argument has none. The
+soundness is the generic arm's own: `emit_args_range` gives every
+argument a fresh temp compiled immediately before the call.
+
+Emitted at 78's two loop sites, verified in `-vdj`:
+
+    add(i)        cmp r7.type, <int-tag> ; je exact          2 executed
+    scale_it(i)   cmp r7.type, <float-tag> ; je exact
+                  cmp r7.type, <int-tag>   ; je cvt
+                  cvtsi2sd xmm0, r7 ; movsd r7, xmm0
+                  mov r7.type, <float-tag>                    7 executed
+
+against the generic arm's per-argument `ld r10,[r11+i*8]; test; je;
+cmp [arg.type], r10; je` plus its byte ladder - and no cache probe, no
+gate chain at either site (`bake_push` 0 -> 2,000,002, `bake_widen`
+1,000,000, `bind_coerce`/`coerce_cached` 0).
+
+**THE SHAPE-EATER, AGAIN.** `jit_bind_widen_inline` and the coverage
+ratchet's `bind_widen`/`coerce_cached` rows went red the moment this
+landed: their callees were nameable, so they baked, and the generic
+arm they test never ran - E1's `jit_callee_cache` lesson verbatim. The
+test picks its callees out of an array of two different lambda decls
+now (two candidates, no stamp, the generic tier) and stays monomorphic
+at run time. **An optimization that bakes more callees eats every test
+whose subject is the tier for UNBAKED ones.**
+
+**THE PROBE ELISION, a side dish with a bigger number than it looks.**
+`jit_cached_probe` returns 0 on its second instruction when
+`g_pure_cache_enabled` is off - and the emitted CachedCallV site still
+paid the C++ round trip: spill fo, four argument movs, the call,
+rebuild r8/r9/rax, test: **16 Ir per call on 09_fib, 7.5% of the
+bench**, in the one configuration every measurement runs (`-npc`).
+Increment 0 made "no PureCache exists while the flag is off" a
+precondition of EMITTED code (the ML_CHECK in
+`Frame::ensure_pure_cache`, the single allocation site), so the flag is
+read ONCE at emit time (`cached_live`) and every piece the cache needs
+- the probe, the parked-key fork test, the stash, the `rec.cache_key`
+store, and the plain site's "caller holds a cache" decline - is not
+emitted. The flag is fixed before any chunk compiles (the CLI sets it;
+`-rt` toggles it around whole runs). Proven by `jit_cached_probe_elided`
+on the probe's CALL count (`g_jit_cached_probe_calls`, bumped in the
+helper - a value check cannot see this, the helper's early return keeps
+the answers right with the call still emitted): 0 with the cache off,
+> 0 with it on; watched failing at 7,352 calls with the elision
+reverted.
+
+**TESTS.** `jit_bake_coercing`: 78's shape (baked, widened, the
+generic arm's counters at zero), bool -> int (the retag arm),
+`none` into an `opt int` parameter (passes, no conversion), and the
+two declines that RAISE (a float into an int parameter, a string into a
+float one - `TypeErrorEx` caught in the same frame, 30 iterations).
+Watched failing: the gate reverted to `fast_bind` (`0 baked pushes for
+120 calls`) and the `cvtsi2sd` skipped (`2190 0.000000` for
+`2190 885.000000`). `bake_widen` joined the coverage ratchet.
+
+**NETS** (`build-claude/dbg`, TESTS=1 OPT=0, ASan+UBSan): `-rt`
+1984/1984 + the four differential modes 1696/1696; `corpus_diff` plain
+34/34, `--levers` 34/34 x 23, `--cold`, `--xrot` 34/34 x 16,
+`--nolowmem` 34/34; `driver_checks` all passed - after the REGCENSUS
+RATCHET caught the two `cvtsi2sd`/`movsd` byte sequences the first
+version of the baked arm copied from the generic one (RAWENC 17 > floor
+15); they are the `cvt`/`fstore` encoders now, which is what the ratchet
+is for; `vdjcmp` self-test 127/127 on the release lane; `disasmcheck`
+every instruction agrees with objdump; `norec_enum --depth 3` 480
+programs agree; `norec_sweep` 37 OK; `nested_fuzz --count 300` 0
+diverged.
+
+**MEASURED** (callgrind Ir and interleaved wall clock, `OPT=1
+ASSERTS=0`, `-npc`, 90 benches, baseline = 1b as landed):
+
+    bench                    Ir        wall
+    78_typed_param_call   -13.30%     0.90x     the coercing bake
+    09_fib_recursive      -17.47%     0.86x     the probe elision
+        (scale 3          -19.32%)
+    10_recursion_deep      -1.22%     1.01x   ┐ the plain site's
+    11_closure_counter     -1.61%     1.00x   │ "caller holds a cache"
+    63_closures            -0.83%     0.98x   │ decline, no longer
+    76_funcval_dispatch    -0.64%     0.98x   ┘ emitted
+    12 / 75 / 64 / 03 / 01  0.00%     1.00x
+    suite geomean cur/base            1.001x
+
+Three call-free benches read outside +/-5% on the clock (13 1.08x,
+86 1.07x, 19 0.94x) and are noise, PROVEN: identical instruction
+streams (+0.00% each).
+
+**WHAT THE TWO NUMBERS SAY.** Both are the STORE/CALL family, not the
+guard family: the probe elision deletes a C++ call, a spill and a
+rebuild per CachedCallV (37 Ir/call, 0.86x); the coercing bake deletes
+a cache probe, five gates and a per-argument load-test-compare loop
+(~23 Ir/call, 0.90x). 78 goes from 18.1x to ~16x C++ and fib from 8.3x
+to ~7x - the remaining ~100 Ir per call on the caller side is the sync
+push itself: the window, the record-less site bookkeeping, the argument
+round trip, the result copy. That is increment 2.
