@@ -8196,6 +8196,24 @@ static bool visit_use_def(const Instr &in, U u, D d)
         if (in.b_slot() >= 0) u(static_cast<int>(in.b_slot()));
         d(in.target); return true;
     case OpCode::ReturnV:
+    /*
+     * ⛔ `Throw` WAS ABSENT HERE UNTIL 2026-08-29, so it fell to the
+     * `default:` BARRIER - "reads every temp, may write anything" - for
+     * no reason but omission. It reads the value in slot `a` (vm.cpp's
+     * VM_CASE(Throw), and verify_chunk classifies it as exactly one
+     * register read) and writes no frame slot at all, which is this
+     * line's contract precisely.
+     *
+     * A barrier is CONSERVATIVE, so nothing was ever wrong - only
+     * slower, and silently: lever A and the E1 liveness gave up inside
+     * every `try` body in the corpus. It was found by writing a new
+     * consumer of this table (compute_nonneg_slots, #106 phase 2),
+     * which fails CLOSED on a barrier and so declined 42_exceptions -
+     * a program whose counted loop is the qualifying shape exactly.
+     * The generalisable half: a table's gaps surface when something
+     * that cannot afford them starts reading it.
+     */
+    case OpCode::Throw:
         opnd(in.a()); return true;
     case OpCode::StoreGlobalV: case OpCode::StoreCaptureV:
         /* target = the GLOBAL/CAPTURE index, NOT a frame slot - no def */

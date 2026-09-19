@@ -626,11 +626,22 @@ on a barrier, so **42_exceptions - whose
 exactly - declines the whole chunk** and keeps a six-instruction sign
 bias it does not need. The same absence costs lever A and the E1
 liveness inside EVERY try body, and nothing announces it: a barrier is
-conservative, so the answer stays right and only the speed moves. It is
-NOT fixed here - adding it changes emitted code corpus-wide and needs
-its own Ir ledger. **The generalisable half: a table's gaps are found by
-writing a new consumer of it, because the new consumer is the first
-thing that cannot afford them.**
+conservative, so the answer stays right and only the speed moves.
+
+**FIXED the same day, and the ledger says where the cost actually was:**
+42_exceptions took the arm it had been declining (200,000 of 200,000
+pow2 reductions, from 0) for **-0.26% Ir** - while **69_exc_crossframe
+read -6.03%** with no div or mod in it at all. That second number IS the
+liveness half, and it is 20x the first: the barrier was costing lever A
+and E1 inside the try body, exactly as predicted and nowhere near where
+the search started. 70_exc_runtime_error, 71_exc_no_throw,
+72_exc_finally, 03_int_arith and 01_while_loop are flat to the
+instruction.
+
+**The generalisable half: a table's gaps are found by writing a new
+consumer of it, because the new consumer is the first thing that cannot
+afford them** - and the gap's real cost is rarely paid where the new
+consumer noticed it.
 
 **THE FIX, AND THE PATTERN TO REUSE: derive the test from the OPCODE
 ENUM, not from the table.** The B1/B2 specialized family is a

@@ -10684,3 +10684,46 @@ run: the round-trip program's `for (var i = 0; i < 5; i++)` sits in
 MAIN, whose `append` and `throw` are barriers, so the set was empty and
 the comparison would have passed on nothing. The program now carries a
 counted loop in a barrier-free FUNCTION.
+
+## #119 - `OpCode::Throw` joins `visit_use_def`, and the cost was not
+## where the search started (2026-08-29)
+
+`Throw` reads the value in slot `a` (vm.cpp's `VM_CASE(Throw)`) and
+writes no frame slot - `verify_chunk` has always classified it as
+exactly one register read, `reg(in.a_slot())`. It was simply ABSENT from
+`visit_use_def`, so it fell to the `default:` BARRIER: "reads every temp
+and may write anything".
+
+**A BARRIER IS CONSERVATIVE, SO NOTHING WAS EVER WRONG - ONLY SLOWER,
+AND SILENTLY.** Lever A's forwarding and the E1 liveness gave up inside
+every `try` body in the corpus, and no net could report it: the answers
+stay right, so the differential, `corpus_diff` and every fuzzer are
+blind BY CONSTRUCTION (the *an optimization that only affects SPEED has
+no correctness oracle* gap), and no whole-lever counter drops to zero
+either - the levers keep firing everywhere else.
+
+**IT WAS FOUND BY WRITING A NEW CONSUMER OF THE TABLE.**
+`compute_nonneg_slots` (#106 phase 2) fails CLOSED on a barrier, so it
+declined 42_exceptions - a program whose
+`for (var i = 0; i < N; i++) { ... i % 2 ... }` is the qualifying shape
+exactly. A pass that cannot afford a gap is what makes the gap visible;
+a pass that can afford it never mentions it again.
+
+**MEASURED** (callgrind Ir, `OPT=1 ASSERTS=0`, scale-corrected):
+
+    69_exc_crossframe     -6.03%    <- the LIVENESS half
+    42_exceptions         -0.26%    <- the arm it had been declining
+    70_exc_runtime_error  +0.00%
+    71_exc_no_throw       +0.00%
+    72_exc_finally        +0.00%
+    03_int_arith          +0.00%    (control)
+    01_while_loop         +0.00%    (control)
+
+**⛔ READ THOSE TWO NUMBERS IN THAT ORDER.** The search started at
+42_exceptions, because that is where the declining consumer pointed -
+and 42_exceptions is the SMALL number. The 20x-bigger win is
+69_exc_crossframe, which contains no division at all: it is pure
+liveness, recovered in a program the investigation was never about.
+**When a conservative fallback is removed, measure the whole family it
+was throttling, not the one case that led you there.**
+
