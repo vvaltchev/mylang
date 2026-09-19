@@ -223,7 +223,11 @@ already exists so a new one can copy it:
 
  1. **REPRODUCIBLE.** `-vdj` prints `<int-tag>`/`<addr>`/`<helper>`
     instead of baked pointers, so two runs and two separately-linked
-    binaries give identical text (`MYLANG_VDJ_ADDRS=1` for the digits).
+    binaries give identical text (`MYLANG_VDJ_ADDRS=1` for the digits;
+    it is a VALUE check, so `=0` means OFF - it was a PRESENCE check
+    until 2026-08-29, which made `MYLANG_VDJ_ADDRS=0` turn the masking
+    off and read as "the dump is not reproducible", the exact wrong
+    conclusion the masking exists to prevent. `MYLANG_VDJ_HEX` too).
     Before that it was not comparable at all.
  2. **IT SAYS WHEN IT DOES NOT KNOW.** `-vdj` counts undecoded bytes
     AND skipped op marks (a mark is an offset the JIT recorded at a

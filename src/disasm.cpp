@@ -483,17 +483,36 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
  * runtime-probed offsets). */
 namespace {
 
+/*
+ * A boolean MYLANG_* env knob: SET, non-empty and not "0". The same
+ * three-part test lowmem.h applies to MYLANG_NO_LOWMEM - stated once
+ * here because a presence-only check makes `=0` mean ON, which is the
+ * opposite of what anyone spelling it that way intends.
+ */
+bool env_flag_on(const char *name)
+{
+    /* env_get, not getenv: MSVC deprecates getenv and WERROR is on.
+     * jit.cpp may call getenv freely because every one of its calls is
+     * inside `#if ML_JIT_SUPPORTED`, which MSVC never compiles - this
+     * file is compiled on every platform. */
+    const std::optional<std::string> v = env_get(name);
+    return v && !v->empty() && *v != "0";
+}
+
 /* MYLANG_VDJ_ADDRS=1 - print baked ADDRESSES numerically instead of as
  * `<addr>`. Off by default so the dump is REPRODUCIBLE (see tag_name);
  * on when you are chasing one specific baked pointer and the digits are
  * the thing you need. */
 bool vdj_show_addrs()
 {
-    /* env_get, not getenv: MSVC deprecates getenv and WERROR is on.
-     * jit.cpp may call getenv freely because every one of its calls is
-     * inside `#if ML_JIT_SUPPORTED`, which MSVC never compiles - this
-     * file is compiled on every platform. */
-    static const bool on = env_get("MYLANG_VDJ_ADDRS").has_value();
+    /* ⛔ A VALUE CHECK, NOT A PRESENCE CHECK - `=0` MUST MEAN OFF.
+     * With a bare has_value() this knob turned the masking OFF for
+     * `MYLANG_VDJ_ADDRS=0`, so a reader who spelled the disable that way
+     * saw raw pointers and concluded the dump is NOT reproducible - the
+     * exact wrong conclusion the masking exists to prevent (it happened,
+     * 2026-08-29, while comparing a .myv image's -vdj against its
+     * source's). The idiom is lowmem.h's: set, non-empty, not "0". */
+    static const bool on = env_flag_on("MYLANG_VDJ_ADDRS");
     return on;
 }
 
@@ -1069,7 +1088,8 @@ undecoded:
  */
 static bool vdj_hex_on()
 {
-    static const bool on = env_get("MYLANG_VDJ_HEX").has_value();
+    /* a VALUE check like its ADDRS sibling: `=0` means off */
+    static const bool on = env_flag_on("MYLANG_VDJ_HEX");
     return on;
 }
 
