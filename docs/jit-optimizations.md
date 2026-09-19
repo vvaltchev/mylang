@@ -11109,3 +11109,92 @@ table.
 no semantics - it moves one statement behind a call. Its evidence is the
 measurement plus the existing nets (`-rt` 1977/1977 in five modes, the
 corpus differential over five matrices, the ASan/LSan debug lane).
+
+## #122 - a CALLABLE descriptor with no chunk: refused at load, guarded at
+## the call (2026-08-29)
+
+`tests/myv_fuzz.py` found a mutated image that took the process down:
+
+    debug   (TESTS=1 OPT=0, ASan):  rc=134, a NAMED abort -
+        src/eval.cpp: do_func_call: Assertion `(obj.func->decl) &&
+        "call to a chunk-less function after AST teardown"' failed.
+    release (OPT=1 ASSERTS=0):      rc=139, SIGSEGV
+
+**THE SECOND LINE IS THE BUG.** #137's whole position on a structurally
+valid image with nonsense values is *"a named abort, never a SIGSEGV"* -
+the reason its checks were put at LOAD and its runtime tier was
+deliberately NOT gated on ASSERTS is that the build with the most to
+lose (an optimized release running a shipped image) is precisely the one
+an assert-gated check abandons. Here the ML_CHECK was the only thing
+between a mutated bit and a null dereference, and a release compiles it
+away.
+
+**THE SHAPE.** A `FuncDescriptor` may legitimately have no chunk, and for
+exactly one reason: a DEAD BASE TEMPLATE, which `codegen_func_body` skips
+because every call to it was redirected to an instance. Its own comment
+says this is *the ONLY compiled-set exclusion*. The image stores the fact
+as two adjacent bits - `is_template_base` and `has_chunk` - and clearing
+`has_chunk` alone leaves a descriptor with no chunk and, after the `-vm`
+AST teardown, no `decl` either. `do_func_call` then takes its
+tree-walker arm and dereferences the null.
+
+**TWO TIERS, because neither is sufficient alone.**
+
+**Tier 1 (serialize.cpp, `read_program`)** refuses `!has_chunk &&
+!is_template_base` at LOAD. That is where it belongs: the property is
+decidable from the image alone, so it costs nothing at run time and its
+diagnostic names the FILE rather than the call. It is also a READER rule
+only - no byte moves, no field is added, `MYV_FORMAT_VERSION` does NOT
+bump, and every previously-written v14 image still loads, because every
+writer has always emitted the consistent pair.
+
+**Tier 2 (eval.cpp, `ML_UNTRUSTED_CHECK`)** is the residue. A mutation
+that clears BOTH bits is self-consistent, so tier 1 accepts it, and
+"is this descriptor ever CALLED" is not decidable from the image - it
+depends on what a global slot holds at run time. Only a check standing
+in front of the dereference catches that, and only a provenance-gated
+one does it without taxing every trusted run.
+
+**MEASURED, on the saved findings** (release, `OPT=1 ASSERTS=0`):
+
+    small-1090.myv   rc=139 SIGSEGV  ->  rc=1  InternalErrorEx, located,
+                                             with a backtrace
+    fat-740.myv      rc=1 (already covered by #118's EndFinally check)
+    fat-1485.myv     rc=1 OutOfBoundsEx
+    fat-5, fat-680   rc=124 - HANGS, and `myv_fuzz.py --triage` says
+                     both "load cleanly - a non-terminating program",
+                     i.e. #137's documented, accepted residual rather
+                     than a loader bug. Nothing open there.
+
+`myv_fuzz` over 3200 mutations of two images now reports **0 crashes on
+BOTH** a debug (ASan) and an `OPT=1 ASSERTS=0` release build, where it
+reported 1 before - and the two builds AGREE, which is the property #137
+exists to hold: a check a release flag removes is a check nobody gets.
+
+Note tier 1 did NOT fire on `small-1090.myv` - that mutation happens to
+have produced the self-consistent pair, so tier 2 is what caught it. The
+tier that fixed the reported crash is the one that would have been easy
+to skip as "the residue"; both were needed and only one was enough.
+
+**WATCHED FAILING**, both halves of `myv_chunkless_callee` (tests.cpp):
+ - tier 1 deleted -> `TIER 1 ACCEPTED a callable descriptor with no
+   chunk`, 1977/1978;
+ - tier 2 deleted -> `-rt` ABORTS (rc 134) - the very dereference, on the
+   debug build where the ML_CHECK still stands.
+
+**THE TEST CORRUPTS THROUGH THE OBJECT MODEL, NOT THE BYTES.** Half 1
+nulls `vm_chunk` before `myv_write`, so the writer emits exactly the
+inconsistent pair; half 2 nulls it on the LOADED program. Neither depends
+on the encoding, so neither can rot into a vacuous test when the format
+changes - the same reasoning `myv_untrusted_field_index` records. And
+between them the INTACT image is loaded and run, asserting it prints 22:
+without that, half 2 would pass on a program whose call never reached a
+chunk at all.
+
+**⛔ AND `myv_corrupt_refused` STRUCTURALLY CANNOT SEE THIS CLASS.** That
+net writes `0xFFFFFFFF` over every 4-byte word and requires each LOAD to
+be a clean Exception - it never RUNS the loaded program, by design ("the
+bar is the LOAD, not the run"). An image that loads happily and dies on
+its first call is invisible to it. The lesson generalises past `.myv`: a
+net whose bar is "the input was accepted or refused cleanly" says nothing
+about what the accepted input then DOES.
