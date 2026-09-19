@@ -10813,3 +10813,104 @@ nonsense reaching code that trusted them. Different input, different
 layer, different fix. The one connection is that the plan's acceptance
 list includes "myv_fuzz over both builds: 0 crashes", which #118 was
 independently making unreachable; that line is now clear.
+
+## #120 - `ref_slots` learns a CALL's PROVEN-SCALAR return, and the
+## information was already there (2026-08-29)
+
+`op_writes_scalar` is keyed on the OPCODE, so `CallV` / `CachedCallV`
+must answer "a call returns anything" and every call-result temp is
+reference-carrying for the whole chunk. `fib$0` listed five:
+
+    11  call.cached  r4 = g0(r3)      <- r4 marked possibly-a-reference
+    13  call.cached  r6 = g0(r5)      <- r6 likewise
+    14  i.bin        r2 = r4 + r6
+
+**AND THE COMPILER ALREADY KNEW BETTER, THREE WAYS.** `-dcs` answers
+`direct fib$0` at every site including the recursive ones; `-dti` says
+`fib$0 : func(int)->int`; and `annotate_hints` had already stamped the
+CallExpr's own `th` from `type_of(call)`, which IS the return type.
+Nothing consumed any of it.
+
+This is the FOURTH per-instruction refinement in `compute_ref_slots`,
+after MoveV, LoadConstV and LoadCaptureV+`cap_scalar`, and it is the
+same sentence every time: **a table entry that says "this op writes
+anything" is right about the OPCODE and wrong about the INSTRUCTION.**
+
+**MEASURED** (callgrind Ir, `OPT=1 ASSERTS=0`, scale-corrected, `-npc`):
+
+    09_fib_recursive     -8.17%   (135.9M vs 147.9M per scale unit)
+    10_recursion_deep    -6.13%
+    78_typed_param_call  +0.00%
+    76_funcval_dispatch  +0.00%
+    63_closures          +0.00%
+    01_while_loop        +0.00%   (control)
+
+09_fib is the bench that had moved LEAST across the whole of #97, and
+the win is not the frameless tier - it is `ref_slots` driving
+`pop_window`'s reference-release scan on EVERY return.
+
+**⛔ THE FIRST 09_fib NUMBER WAS AN ARTIFACT, AND THIS FILE PREDICTED
+IT.** An ad-hoc callgrind script without `-npc` measured
+`cur=2375 base=2387, -0.50%` - because 09_fib is
+`for (k...) r = fib(29);` and iterations 2..N are pure-call-cache HITS,
+so the scale-3-minus-scale-1 delta is a few thousand instructions of
+cache lookup instead of 136 million of work. `bench/run.py` passes
+`-npc` by DEFAULT for exactly this reason and the rule is written up
+under *THE PURE-CALL CACHE IS OFF FOR EVERY BENCHMARK RUN*; an ad-hoc
+script is not exempt from it. Only startup-correct a bench whose work
+actually SCALES - and check that it does.
+
+**⛔ THE OBVIOUS IMPLEMENTATION SILENTLY DOES NOTHING.** `CgInstr`
+carries `node_idx`, so reading `th` off the AST inside
+`compute_ref_slots` looks right. It compiles, passes 1976/1976 and
+changes NOTHING: `extract_locs` has already consumed and NULLED every
+handle by then, which is precisely what `verify_ast_free` asserts. A
+debug probe printed `node_idx=-1` on every call. The proof must be
+stamped at EMIT time, where the node is still live - the same place
+`cap_scalar` stamps its own.
+
+**⛔ AND THERE ARE TWO EMIT SITES WITH IDENTICAL OPERAND SETUP.** The
+first patch attempt matched both; the second is `CallBuiltinV`, a
+different opcode. It is a real sibling (`len(a)` is an int by
+construction) and is deliberately NOT done - a builtin's dst is usually
+consumed immediately and the reach is unmeasured. Noted at the site.
+
+**THE FLAG SHARES BIT 0x80, AND THE FAMILY CLAIM IS NOW ENFORCED.**
+`opflags` is a `uint8_t` with all eight bits spoken for, so `ret_scalar`
+shares bit 7 with `struct_checked` on the argument that the two opcode
+families do not overlap. That is the "an && over a family is a table
+that does not look like one" shape with a LEAKED REFERENCE as its
+failure mode, so BOTH accessors now `ML_CHECK` their opcode family
+instead of asserting it in a comment. Ask the wrong family and the
+build aborts by name.
+
+**SOUNDNESS - why reassigning the callee cannot break it.** `CallV`
+reads its callee from a GLOBAL SLOT at RUNTIME, so `f = something_else`
+is the obvious worry. Three layers answer it, and the first was
+verified by experiment: a signature-CHANGING assignment is REFUSED at
+compile time by the function-subtyping rule (`func(int)->str` into a
+`func(int)->int` name raises TypeMismatchEx); a signature-PRESERVING one
+reports `many {a,b}` from the callee-set analysis and leaves the return
+type identical anyway; and `th` is stamped ONLY for a settled, concrete,
+non-opt scalar, so the `dyn` case subtyping DEFERS on is never claimed
+here. A reassignment to a NON-function throws NotCallableEx without
+writing the dst.
+
+**WATCHED FAILING.** `ref_slots` only ever SHRINKS, which is the
+dangerous direction, and the two oracles this file already names cover
+it exactly. Setting the flag unconditionally, on the `rel-hard` build:
+
+    mylang: src/vm.cpp:6427: void jit_ret_audit():
+      Assertion `binary_search(my_ck->ref_slots..., i)' failed.   rc=134
+    corpus_diff: 32/34   < merge  a:dyn15     < array  int:107
+
+`jit_ret_audit` aborts by name and the corpus shows visibly leaked
+values.
+
+**WHAT IT UNBLOCKS.** `fib$0` now satisfies the frameless gate's
+`ref_slots` EMPTY condition (`refs=[4 5 6 7 8]` -> `refs=[]`) and
+09_fib's main moved past that condition too
+(`refs=[0 3 4 5 6 7 8 9]` -> `refs=[0 3 4 5]`, reason
+"ref_slots too many" -> "not a leaf"). What remains for both is the v1
+gate's NO-CALL-OP rule - a self-imposed leaf restriction, not an
+information gap.

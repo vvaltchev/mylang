@@ -1332,8 +1332,47 @@ struct Instr {
      * none of which the struct-foreach form needs. A flag on the SAME opcode
      * rather than a new one: bit 7 is the last free one in this byte, which is
      * already serialized, so no ordinal moves and no .myv version bump. */
-    bool struct_checked() const { return opflags & 0x80; }
+    bool struct_checked() const
+    {
+        ML_CHECK(op == OpCode::LoadStructFieldInt
+                 || op == OpCode::LoadStructFieldFloat);
+        return opflags & 0x80;
+    }
     void set_struct_checked() { opflags |= 0x80; }
+    /*
+     * #120: on a CALL op (CallV / CachedCallV), bit 0x80 instead means
+     * "the callee's RETURN is a proven non-opt int/float/bool", i.e.
+     * the dst slot can never hold a reference. Sharing the bit is the
+     * same argument `cap_scalar` makes for 0x40 - the two opcode
+     * families do not overlap - but stated as an ML_CHECK in BOTH
+     * accessors rather than as a comment, because "an && over a family
+     * is a table that does not look like one" (CLAUDE.md) and this
+     * one's failure mode is a LEAKED REFERENCE. Ask the wrong family
+     * and the build aborts by name instead of answering plausibly.
+     *
+     * WHAT IT BUYS. `op_writes_scalar` is keyed on the OPCODE and so
+     * must answer "a call returns anything"; the inferencer knows
+     * better per SITE, and `annotate_hints` already stamped it as the
+     * CallExpr's own `th`. Without this every call-result temp is
+     * reference-carrying for the whole chunk - `fib$0` lists five -
+     * which costs the return path's release scan on EVERY call and
+     * blocks the frameless tier's `ref_slots` EMPTY condition.
+     *
+     * ⛔ A HINT, NEVER A REQUIREMENT, and only a WRONGLY SET one is
+     * unsound (it would skip a release). It is set ONLY from `th`,
+     * which annotate_hints stamps solely for a SETTLED, CONCRETE,
+     * NON-OPT scalar - so a `dyn` callee is never claimed. Reassigning
+     * the callee cannot break it: a signature-CHANGING assignment is
+     * refused by the function-subtyping rule, a signature-PRESERVING
+     * one keeps the return type, and a non-function throws
+     * NotCallableEx without writing the dst.
+     */
+    bool ret_scalar() const
+    {
+        ML_CHECK(op == OpCode::CallV || op == OpCode::CachedCallV);
+        return opflags & 0x80;
+    }
+    void set_ret_scalar() { opflags |= 0x80; }
     bool b_is_lit() const { return opflags & 8; }
     Operand::LitKind a_kind() const {
         return static_cast<Operand::LitKind>((opflags >> 1) & 3);
