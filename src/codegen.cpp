@@ -8913,6 +8913,11 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                  * once fused here, target = load pc + 1 marks it a branch
                  * target (is_tgt next round) - the sieve rule then declines
                  * at the load forever. */
+                /* ⛔ the `b_lit() == 1` below is READ BY
+                 * compute_nonneg_slots: the fusion repurposes b, so a
+                 * ForStepElemInt's step is +1 by CONSTRUCTION and the
+                 * pass cannot re-check it. Widening this precondition
+                 * means excluding the op there. */
                 if (op1.op == OpCode::ForLoopStep
                     && op1.b_is_lit() && op1.b_lit() == 1
                     && op1.target >= 0
@@ -8973,6 +8978,9 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                  * excludes loops with `continue` (it targets the step); a
                  * branch to the ADD is fine (add-then-step is what it
                  * expects). Never throws - node-free. */
+                /* ⛔ same as F-B above: `op2.b_lit() == 1` is what
+                 * lets compute_nonneg_slots treat an IntAddStep as a
+                 * +1 counter step it can no longer read. */
                 if (op1.op == OpCode::IntBin && op1.aop == Op::plus
                     && op2.op == OpCode::ForLoopStep
                     && op2.b_is_lit() && op2.b_lit() == 1
@@ -10442,6 +10450,161 @@ void build_boxed_ops(Chunk &chunk)
     }
 }
 
+/*
+ * #106 phase 2 - THE NON-NEGATIVE SLOTS. Fill `Chunk::nonneg_slots`
+ * (bytecode.h) with the frame slots this chunk can only ever observe
+ * holding a value >= 0.
+ *
+ * ⛔ WHY THE FACT IS WORTH A PASS. MyLang's `%` TRUNCATES (C semantics -
+ * the sign follows the DIVIDEND, so `-5 % 4` is `-1`, not `3`), which is
+ * why phase 1's power-of-two arm is a FOUR-instruction sign bias around
+ * the mask rather than the textbook `and`. Prove the dividend cannot be
+ * negative and the bias is dead: `x % 2^k` becomes one `and`, `x / 2^k`
+ * one `sar`. Six instructions to one, on a loop's hot path.
+ *
+ * ⛔ THE RULE, and every clause of it is load-bearing:
+ *
+ *   S qualifies iff SOME instruction defines S, EVERY instruction that
+ *   defines S is one of
+ *     (a) LoadImmInt / LoadConstV of an int constant >= 0 - the init;
+ *     (b) a STEP op (ForLoopStep, or the #9 fusions IntAddStep /
+ *         ForStepElemInt) naming S as its COUNTER (target2), with
+ *         `aop == Op::lt` and a step of exactly +1,
+ *   and at least one (b) exists.
+ *
+ * - **`<`, NEVER `<=`.** The counter is only read where the test held,
+ *   so `i < bound <= INT64_MAX` gives `i <= INT64_MAX - 1` and the step's
+ *   `i + 1` cannot overflow. With `<=` and `bound == INT64_MAX` it CAN:
+ *   `i + 1` wraps to INT64_MIN, `i <= bound` is still true, and the body
+ *   runs with a NEGATIVE counter. That is an infinite loop either way,
+ *   but it is a DEFINED one (RULE 1) whose printed answers an
+ *   optimization may not change (RULE 2).
+ * - **A STEP OF EXACTLY +1**, for the same reason: `i += 3` at
+ *   `i == bound - 1` overflows when `bound` is within 2 of INT64_MAX.
+ *   (A literal bound below INT64_MAX - step would license a bigger step;
+ *   not built - no corpus program wants it.)
+ * - **AT LEAST ONE STEP OP, i.e. S is a loop COUNTER.** This is what
+ *   excludes the two writers no instruction performs, WITHOUT this pass
+ *   having to enumerate them (the enumeration lives in
+ *   compute_ref_slots, and going stale is exactly the audit-table trap):
+ *   a PARAMETER slot, written by the bind, and a CATCH-BIND slot,
+ *   written by vm_dispatch_exc_body. Neither can be a counter - a
+ *   counter comes from `for (var i = ...)`, which try_for_range REQUIRES
+ *   to be a DECL (`init->fl & pInDecl`, inferencer.cpp), or from a
+ *   foreach's hidden `alloc_temp` counter. Both are fresh slots the
+ *   resolver hands out monotonically. Without this clause
+ *   `func f(n) { var r = n % 4; n = 0; return r; }` would claim `n` is
+ *   non-negative on the strength of the LATER `n = 0` and answer 3 for
+ *   f(-5). ASSERTED below against handler_sites, which this pass can
+ *   see; the parameter half rests on the decl argument.
+ * - **A BARRIER DROPS EVERYTHING.** `visit_use_def` returns false for an
+ *   op whose slot traffic it cannot describe (the LV builtin family, the
+ *   stores, MultiUnpackV / UnpackElem* / IncDecChainV - they reach slots
+ *   through pools and runs). Such an op may write a slot it does not
+ *   report, so no candidate can survive it. Conservative on purpose: a
+ *   narrower rule needs a per-barrier write table, which is one more
+ *   thing to go stale for a fact whose false direction is a wrong
+ *   answer.
+ *
+ * ⛔ IT MUST RUN ON THE FINAL CODE - after the peephole (which MAKES the
+ * IntAddStep / ForStepElemInt forms) and after specialize_arith_ops
+ * (which makes the IntModRI that consumes the fact). Both call sites -
+ * codegen_chunk and the loader's read_chunk - place it beside
+ * build_boxed_ops for that reason.
+ */
+void compute_nonneg_slots(Chunk &chunk)
+{
+    chunk.nonneg_slots.clear();
+    const int total = chunk.slot_count + chunk.n_temps;
+    if (total <= 0)
+        return;
+
+    /* Is `in` a definition of slot `s` that PRESERVES non-negativity?
+     * `counter` reports whether it was a step op naming s as its
+     * counter, which is the "at least one (b)" evidence. */
+    const auto benign_def = [&chunk](const Instr &in, int s, bool &counter) {
+        counter = false;
+        switch (in.op) {
+        case OpCode::LoadImmInt:
+            /* slot[target] = a.lit (bytecode.h) */
+            return in.a_is_lit() && in.a_kind() != Operand::LitKind::f
+                   && in.a_lit() >= 0;
+        case OpCode::LoadConstV: {
+            if (in.target2 < 0
+                || static_cast<size_t>(in.target2) >= chunk.consts.size())
+                return false;
+            const EvalValue &c = chunk.consts[in.target2];
+            return c.is<int_type>() && c.get<int_type>() >= 0;
+        }
+        case OpCode::ForLoopStep:
+            /* the only form whose step is still readable: b is it */
+            counter = s == in.target2 && in.aop == Op::lt
+                      && in.b_is_lit()
+                      && in.b_kind() != Operand::LitKind::f
+                      && in.b_lit() == 1;
+            return counter;
+        case OpCode::IntAddStep:
+        case OpCode::ForStepElemInt:
+            /* ⛔ THE STEP IS +1 BY CONSTRUCTION AND NOT BY INSPECTION.
+             * Both #9 fusions are formed ONLY from a ForLoopStep with
+             * `b_is_lit() && b_lit() == 1` (the peephole, above) and
+             * then REPURPOSE b - IntAddStep to the add's operand,
+             * ForStepElemInt to the (array, elem dst) dual - so the
+             * step is no longer a readable field. The fusion sites
+             * carry a note pointing back here; a fusion taught to
+             * accept another step must exclude itself from this arm. */
+            counter = s == in.target2 && in.aop == Op::lt;
+            return counter;
+        default:
+            return false;
+        }
+    };
+
+    std::vector<char> cand(total, 1), is_counter(total, 0);
+    bool any = false;
+
+    for (const Instr &in : chunk.code) {
+        const bool described = visit_use_def(in, [](int) { },
+            [&](int s) {
+                if (s < 0 || s >= total)
+                    return;
+                bool counter = false;
+                if (!benign_def(in, s, counter))
+                    cand[s] = 0;
+                else if (counter)
+                    is_counter[s] = 1;
+            });
+        if (!described)
+            return;               /* a BARRIER: nothing can be claimed */
+    }
+
+    for (int i = 0; i < total; i++)
+        if (cand[i] && is_counter[i]) {
+            chunk.nonneg_slots.push_back(i);
+            any = true;
+        }
+
+#ifndef NDEBUG
+    /*
+     * The rule's own premise, checked where it IS checkable: a loop
+     * counter is a fresh decl slot, so it can never be the slot the
+     * raise path binds a caught exception into. (The PARAMETER half of
+     * the same premise has no chunk-visible input - see the header.)
+     */
+    if (any)
+        for (const Chunk::HandlerSite &site : chunk.handler_sites)
+            for (const Chunk::HandlerClause &cl : site.clauses)
+                ML_CHECK_MSG(cl.bind_slot < 0
+                             || !std::binary_search(
+                                    chunk.nonneg_slots.begin(),
+                                    chunk.nonneg_slots.end(),
+                                    static_cast<int32_t>(cl.bind_slot)),
+                             "nonneg: a catch-bind slot is a loop counter");
+#else
+    (void) any;
+#endif
+}
+
 Chunk
 codegen_chunk(const Block *block, int slot_count, bool jit,
               const std::vector<int32_t> *ref_seeds)
@@ -10529,6 +10692,9 @@ codegen_chunk(const Block *block, int slot_count, bool jit,
     build_boxed_ops(cg.chunk);        /* model-flip: BinOpV/CmpV/CompoundV pool
                                        * (stable JIT-bakeable operand data;
                                        * stores the pool index in target2) */
+    compute_nonneg_slots(cg.chunk);   /* #106 phase 2 - derived like
+                                       * boxed_ops, and for the same reason
+                                       * rebuilt by the loader, not stored */
     /* #78 step B: the handler table must still describe the (now compacted,
      * threaded, specialized) chain - a missed remap aborts HERE. */
     verify_handler_sites(cg.chunk);

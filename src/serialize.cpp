@@ -1672,6 +1672,8 @@ void read_chunk(Reader &r, Chunk &c)
      * boxed_ops needs the loc table, hence here.)
      */
     build_boxed_ops(c);
+    /* #106 phase 2's `nonneg_slots` is DERIVED too, but it is rebuilt in
+     * myv_read AFTER vm_verify_program, not here - see the note there. */
 }
 
 }  /* anon namespace */
@@ -2079,6 +2081,25 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
      * (`&struct_defs[target2]`), which is where a mutated operand crashed.
      */
     vm_verify_program(prog);
+
+    /*
+     * #106 phase 2: the `nonneg_slots` rebuild, HERE and not in
+     * read_chunk beside the other derived pools - because it is the
+     * first loader-side pass to walk instruction OPERANDS through
+     * `visit_use_def`, whose `run(base, cnt)` iterates a count taken
+     * straight from the file. On unverified bytecode that count is
+     * attacker-chosen; after vm_verify_program every operand is bounded
+     * against the table it indexes, so the walk is finite and in range.
+     * The same "VERIFY BEFORE ANYTHING INDEXES IT" rule the JIT below
+     * obeys, for the same reason - and still before the JIT, which is
+     * what BAKES the fact into emitted machine code.
+     */
+    compute_nonneg_slots(prog.root);
+    for (const auto &d : prog.funcs)          /* vm.cpp's own idiom for a
+                                               * MUTABLE loaded chunk */
+        if (d->vm_chunk)
+            compute_nonneg_slots(*static_cast<Chunk *>(
+                                     const_cast<void *>(d->vm_chunk)));
 
     /*
      * #137 tier 2: from here on this process is running UNTRUSTED bytecode.

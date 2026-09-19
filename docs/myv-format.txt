@@ -834,6 +834,26 @@ implementation free to drift.
                           the stored value with an identical one.
                           49 bytes per entry saved.
 
+    Chunk::nonneg_slots   The frame slots this chunk can only ever observe
+                          holding a value >= 0 - what lets the JIT reduce
+                          `i % 2^k` on a counted loop's induction variable
+                          to a single `and`.  A pure function of the final
+                          code plus `consts` and `handler_sites`, so
+                          `myv_read` calls `compute_nonneg_slots`
+                          (codegen.h) - NOT in `read_chunk` beside the
+                          other derived pools but AFTER
+                          `vm_verify_program`, because it is the first
+                          loader-side pass to walk instruction OPERANDS,
+                          and one of them is an iteration COUNT taken
+                          straight from the file.  Being
+                          derived is not only a size argument here: the
+                          fact is BAKED into emitted machine code, so an
+                          image and a fresh compile must not be able to
+                          disagree about it.  It is also why the analysis
+                          may read only chunk data - the parameter seeds
+                          `compute_ref_slots` receives do not exist at
+                          load time.
+
     Chunk::catch_uids     The interned twins of `catch_types`; re-interned
                           inline as the names are read.
 
