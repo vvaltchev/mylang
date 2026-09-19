@@ -266,6 +266,34 @@ EvalValue builtin_intptr(EvalContext *ctx, const ArgLocs *exprList,
     return e.get_type()->intptr(e);
 }
 
+/*
+ * refcount(symbol) - DEV-ONLY (the test harness and the REPL): the number
+ * of handles sharing the reference `symbol` holds, i.e. use_count(); 1 for
+ * a scalar. An LVALUE builtin like intptr, so the slot is read in place
+ * and the answer is not perturbed by an argument copy. It exists because a
+ * LEAKED reference is otherwise unobservable from a program: a plain alias
+ * never triggers a copy (assignment aliases, only a slice is a COW view),
+ * and a pooled object is invisible to LeakSanitizer - so a call protocol
+ * that forgets to release a window slot passes every value check. The
+ * frameless-call tests (#97 inc 2) assert the count after a caught
+ * exception left the callee's window on a dead native frame.
+ */
+EvalValue builtin_refcount(EvalContext *ctx, const ArgLocs *exprList,
+                           LValue *target, const EvalValue *rest,
+                           size_t n_rest)
+{
+    if (exprList->nargs != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    const ArgLoc *arg = exprList->arg(0);
+
+    if (!target)
+        throw NotLValueEx(arg->start, arg->end);
+
+    const EvalValue &e = target->get();
+    return EvalValue(e.get_type()->use_count(e));
+}
+
 EvalValue builtin_assert(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {

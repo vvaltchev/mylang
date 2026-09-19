@@ -61,6 +61,13 @@ measurement lanes and their worktrees were deleted, per the lane rule.
     #111 #112    the proven-scalar capture; the capture base pinned
     increment 0  the norec/pure-cache refusal (commit 50af0f4)
     increment 1  E1, the value callee gets NAMED (commit 77943e6)
+    increment 1b the call is a classified op, pins survive it
+    increment 1c the coercing callee bakes + the probe elision
+    increment 2  THE FRAMELESS CALLEE (F1-F6, 2026-09-19):
+                 78 -32.9% Ir / 0.70x, 11 -35.0% / 0.64x, 63 -18.1% /
+                 0.80x - record: docs/jit-optimizations.md, *#97
+                 increment 2*; plan section 3 item 2 lists what is left
+                 per call and in which order
 
 ### 1.2 Increment 0, in full (commit `50af0f4`, docs `94c818b`)
 
@@ -431,14 +438,25 @@ E1 measured the gate collapse at ~0 wall clock. What 1c removes is a
 per-argument HELPER CALL and its argument marshalling, which is real
 work — but profile it before building, the way increment 0 was.
 
-### 1.6 The REST of #97, unchanged
+### 1.6 The REST of #97
 
-    2.  THE CALLEE-SIDE PROTOCOL (plan section 2), behind
-        MYLANG_JIT_OFF=frameless, admitting LEAF callees only at first.
-        The bulk: a second entry point, the stack marker, a new return
-        arm, a new exception path.
-        GATE: Ir on 78 and 11; corpus_diff over the five matrices; the
-        norec nets re-run, since the rbp chain gains a second frame kind.
+    2.  THE CALLEE-SIDE PROTOCOL - ✅ DONE 2026-09-19 (increment 2,
+        LEAF callees only; the gate met, see 1.1). Two things a
+        successor must know that the record spells out: the tier
+        EXPOSED a pre-existing -2 conveyance bug (a warmed call's
+        callee frame rendered "at line 0" - fixed in
+        vm_jit_stamp_callee_frame, pinned by
+        vm_warmed_throw_backtrace_parity, shape-eater #9 in CLAUDE.md),
+        and the release scan on the exception exit was only testable
+        with the new refcount() dev builtin (a leaked reference is
+        otherwise invisible: aliases never copy, pooled objects hide
+        from LSan).
+        THE NEXT MICRO-INCREMENTS ON THIS PROTOCOL, ranked by the
+        per-call profile (plan section 3 item 2): the capture protocol
+        (a base register from the site), the window init (skip tails
+        no helper writes), the ref-listed arg-temp staging guard, the
+        caller-built window (recovers the #162 fusion), the float pin
+        spill around the call (#124).
     3.  E2 - drop the leaf rule. Serves 09_fib. GATE includes
         norec_enum --depth 4 (2272 programs x 4 engines), because a
         throw crossing a frameless frame is exactly its shape space.

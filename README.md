@@ -2720,6 +2720,14 @@ Get the internal shared object pointer referred by `symbol`.
 It's currently used in tests to check if two array slices refer internally
 to the same object.
 
+#### `refcount(symbol)` — dev-only
+The number of handles sharing the reference `symbol` holds (its internal
+use count; `1` for a scalar). Like `show()` it is a **dev-only** builtin,
+available at the REPL and in the test harness and a compile-time error in a
+script: it is a test instrument for the call protocol, since a leaked
+reference is otherwise unobservable from a program (a plain alias never
+copies, so a forgotten release changes no value).
+
 #### `array_storage(array)`
 Return the array's internal storage, named by the element type: `"int"`,
 `"float"`, `"bool"`, `"struct"`, or `"str"` for a compact *flat* (unboxed)

@@ -6029,6 +6029,20 @@ AST transform joins **all three** on the day it is written:
 >    that survives to codegen (a plain `p = q` MoveV took the same
 >    sabotage from 4 guards to 2), or check `-vd` for the op the test
 >    actually produces.
+> 9. **A call's FIRST descent never takes the emitted push** (#97 inc
+>    2, 2026-09-19). The record high-water gate sends every call at a
+>    new depth through the C++ tier; only a WARMED re-descent runs the
+>    emitted site, its record-less fork and its -2 conveyance. So an
+>    exception-path test whose callee throws on the first call
+>    exercises the C++ tier only - which is how a warmed call's callee
+>    frame rendered `[1] mid(n) at line 0` under BOTH `OFF=norec` and
+>    the default, unseen by `norec_enum` (2272 first-descent programs)
+>    and every corpus throw. Throw on iteration N > 1 of a loop
+>    (`vm_warmed_throw_backtrace_parity`), and compare the BACKTRACE,
+>    not just the exception type. A leaked REFERENCE on such a path is
+>    invisible to every value check and to LSan (aliases never copy,
+>    pooled objects are reachable): `refcount(x)` - the dev-only
+>    instrument - read twice, asserting the DIFFERENCE grows by zero.
 >
 > The mechanical safeguards, both mandatory: an **EMITTED-code counter**
 > (the `g_jit_store_fast` pattern - the helper's counter also counts
@@ -6932,7 +6946,11 @@ instrumentation (see `plans/archived/function-templates.md`).
    name in `g_dev_builtin_ids`, so the inferencer (`reject_dev_builtins`) makes a
    SCRIPT call a compile-time error while the REPL / test harness (which set
    `g_dev_builtins_allowed`) allow it. This keeps the AST out of serialized
-   script bytecode. **A builtin whose argument is a NODE property (never
+   script bytecode. **A test INSTRUMENT that must run under BOTH engines**
+   (`refcount(x)`, the use-count of a reference read in place) uses
+   `make_dev_builtin_lv<...>` instead — the lvalue ABI both engines
+   share (`CallBuiltinLV` in the VM), plus the dev-only reservation.
+   **A builtin whose argument is a NODE property (never
    evaluated — `defined`/`isconst`/`isconstdecl`) must additionally be wrapped
    in `mark_lazy_builtin(...)`** at registration: a script may only CALL it
    directly — using the name as a VALUE is a compile error (the F1 rule; an

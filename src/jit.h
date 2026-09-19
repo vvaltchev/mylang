@@ -209,6 +209,12 @@ extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
 extern "C" int jit_sync_postexit(size_t r, int_type site_packed,
                                  LValue *caller_win,
                                  int_type caller_total) noexcept;
+/* #97 increment 2: the FRAMELESS callee's post-exit (an exception left
+ * a frameless frame; its window died with the native frame, released
+ * by the callee's own epilogue - no release, no segment adjust here) */
+extern "C" int jit_frameless_postexit(size_t r, int_type site_packed,
+                                      LValue *caller_win,
+                                      int_type caller_total) noexcept;
 extern "C" int jit_cached_probe(const void *desc, int_type argbase,
                                 int_type nargs, int_type dst) noexcept;
 void *jit_addr_pending_key();
@@ -594,6 +600,10 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk);
  * A REACH PROBE: nothing consumes the answer to decide emission yet.
  */
 bool jit_chunk_frameless_ok(const Chunk &chunk);
+/* #97 inc 2 (F6): the pre-pass that sets Chunk::frameless_wanted on
+ * every callee MAIN will call framelessly (see bytecode.h). Run with the
+ * SAME JitCtx main will be jitted with, before any body is jitted. */
+void jit_mark_frameless_wanted(const Chunk &main, const JitCtx *jc);
 /* the native-stack window a frameless callee may allocate, in SLOTS -
  * 64 x 48 bytes = 3KB, the same bound Frame::init already imposes. */
 enum { FRAMELESS_MAX_SLOTS = 64 };
@@ -608,6 +618,8 @@ extern unsigned long g_jit_cap_scalar;
 extern unsigned long g_jit_frameless_chunks;
 extern unsigned long g_jit_frameless_calls;
 extern unsigned long g_jit_frameless_entries;   /* inc 2 (emit-time) */
+extern unsigned long g_jit_frameless_pushes;    /* inc 2 (emitted code) */
+extern unsigned long g_jit_frameless_rets;      /* inc 2 (emitted code) */
 
 /*
  * Call a compiled fragment (frameless: slots base in, resume pc out).

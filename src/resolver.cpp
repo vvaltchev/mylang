@@ -173,6 +173,7 @@ static bool is_lvalue_arg_builtin(std::string_view name)
 {
     return name == "append" || name == "push" || name == "pop"
         || name == "insert" || name == "erase" || name == "intptr"
+        || name == "refcount"
         || name == "sort" || name == "rev_sort" || name == "reverse";
 }
 
@@ -3303,7 +3304,8 @@ static bool esc_builtin_transparent(const UniqueId *name)
     static const char *const transparent[] = {
         "abs", "array_storage", "chr", "endswith", "float", "hash",
         "int", "intptr", "join", "kindstr", "len", "max", "min", "ord",
-        "print", "split", "splitlines", "startswith", "str", "typestr",
+        "print", "refcount", "split", "splitlines", "startswith", "str",
+        "typestr",
     };
     for (const char *n : transparent)
         if (name->val == n)
