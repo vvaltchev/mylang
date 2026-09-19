@@ -607,6 +607,10 @@ void jit_mark_frameless_wanted(const Chunk &main, const JitCtx *jc);
 /* the native-stack window a frameless callee may allocate, in SLOTS -
  * 64 x 48 bytes = 3KB, the same bound Frame::init already imposes. */
 enum { FRAMELESS_MAX_SLOTS = 64 };
+/* #97 inc 3 (W1): where a frameless callee finds the window its CALLER
+ * built - above the residue's two words and the return address, so
+ * rbp + this (Chunk::frameless_entry_off has the layout). */
+enum { JIT_FRAMELESS_WIN_OFF = 32 };
 /* REACH (TESTS): chunks that qualify, and calls made to one. */
 /*
  * #111 EXECUTION PROOF: bumped by the EMITTED capture read/write once

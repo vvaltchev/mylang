@@ -493,7 +493,13 @@ Each ends with a MEASUREMENT that can kill the next one.
 
    **WHAT IS LEFT PER CALL (78's `add(i)`, 105 Ir with the loop
    share, C++ ~10), in the order the profile ranks it - each its own
-   micro-increment, none started:**
+   micro-increment. INCREMENT 3 (2026-09-20) TAKES THEM IN THE ORDER
+   THAT MAKES THE PATCHES SIMPLER (the maintainer's instruction), each
+   verified on the expected `-vdj` text before any number: the
+   caller-built window FIRST (W1 ✅ - a relocation, net zero per call,
+   record: docs/jit-optimizations.md *#97 increment 3, W1*; it puts
+   every per-callee decision at the site), then the fusion it enables
+   (W2), then the init elision and the capture base at the site:**
    - the CAPTURE PROTOCOL: the body reads captures through
      `ctx -> captures -> data()` (4 Ir per read) and the site/arm
      repoint + restore `ctx.captures` (5 Ir); a capture base handed in
@@ -506,10 +512,11 @@ Each ends with a MEASUREMENT that can kill the next one.
      an audit table, so build it with the enum-derived ratchet;
    - the SITE's staging guard on a ref-listed argument temp (4 Ir) -
      ref_slots precision, the same slot `print`'s arguments reuse;
-   - the CALLER-BUILT WINDOW: the site fills the callee's window on
-     its own stack, binding a FUSED argument straight from the caller
-     slot - recovers the #162 fusion the tier forgoes today and one
-     retain/release pair per reference argument;
+   - the CALLER-BUILT WINDOW: ✅ W1 (2026-09-20) - the site fills the
+     callee's window on its own stack, at [rbp+32] from the callee's
+     anchor; W2 is the fusion it exists for: a FUSED argument bound
+     straight from the caller slot - recovers the #162 fusion the tier
+     forgoes today and one retain/release pair per reference argument;
    - the float pin spill/reload around the call - #124's territory.
 
 **3. E2 — drop the leaf rule.** Serves 09_fib, and only after the

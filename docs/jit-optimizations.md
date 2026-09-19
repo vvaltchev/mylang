@@ -12418,3 +12418,84 @@ four `frameless entry` lines, and main's marks name a `call.val`.
 `driver_checks.sh` asks the CLI the same over bench/my/78. Both watched
 failing against the old driver (0 entries, 0 sites). `disasmcheck.py`:
 233,153 instructions, 0 disagreements; `vdjcmp.sh` self-test 127/127.
+
+## #97 increment 3, W1 - THE CALLER BUILDS THE FRAMELESS WINDOW: a
+## relocation, verified instruction for instruction on the dump
+## (2026-09-20)
+
+**Why this first.** The plan's list of what is left per frameless call
+(inc 2: the capture protocol, the window init, the staging guard, the
+caller-built window, the float spill) was ranked by profile share. The
+maintainer's instruction for increment 3 was to order the work by what
+makes the later patches simpler, and to verify each step on the
+disassembly rather than on a number. Read that way the caller-built
+window comes first: the callee's frameless entry held one half of the
+per-callee protocol (the argument copy, the reference bind, the slot
+init) and the site the other (the identity compare, the coercing
+checks, the residue). With the window on the CALLER's stack every
+per-callee decision lives at the site - which is the one place that
+knows the callee AND holds the argument sources - so the fusion (W2),
+the init elision and the capture base all become site-local edits, and
+E3's two-candidate site is two copies of one tail rather than two
+entries in two callees.
+
+**The layout.** The site reserves the callee's N*48 bytes first, so
+the residue's two words and the return address sit BELOW it:
+
+    [rbp+ 8]  the return address
+    [rbp+16]  the caller's captures          (the residue, as inc 2)
+    [rbp+24]  the dst word, bit 0 set
+    [rbp+32]  the window, slot 0 ..          (JIT_FRAMELESS_WIN_OFF)
+
+The frameless entry is `frag_entry; lea rbx, [rbp+32]; act.vframe =
+rbx (slots, size); establish; jmp` - 9 instructions where inc 2's was
+22. The site fills the window exactly as the entry did (the same copy
+loop, the same bind helper, the same t_none init - `emit_frameless_
+window`, r10 = the window base because rsp cannot be a base without
+the SIB byte the encoders refuse; the bind helper call saves rdx/r9
+around itself and re-derives r10 from rsp), pushes the residue, calls,
+and drops residue and window together: `add rsp, 16+N*48` on the
+sentinel path, `8+N*48` after the exception path's pop. The return arm
+tells the frame apart by `lea rax, [rbp+32]; cmp rax, rbx` - one
+instruction more than inc 2's `cmp rbx, rsp`, still no load (a segment
+window is a heap address and can never sit at rbp+32). The exit-release
+hook is unchanged: it decides by the record compare and the residue
+bit, and releases through rbx, which still names the window.
+
+**The expected dump, and the dump.** Written before the change, for
+78's `add(i)` (perf build; the TESTS build interleaves its counter
+bumps):
+
+    entry   push rbp / mov rbp,rsp / push rbx / sub rsp,8 /
+            lea rbx,[rbp+0x20] / mov r8,[act] / mov [r8+slots],rbx /
+            mov [r8+size],3 / jmp body                          9
+    arm     lea rax,[rbp+0x20] / cmp rax,rbx / je arm           3
+    site    sub rsp,144 / mov r10,rsp /
+            mov [r10+0x20],0 / mov [r10+0x28],0 /
+            mov r11,r7 / mov [r10],r11 / mov [r10+0x18],<int-tag> /
+            xor r11,r11 / 4 tail stores / 2 t_none stores /
+            lea rcx,[rbx+dst|1] / push rcx / push [r9+caps] /
+            lea rax,[rdx+0x10] / mov [r9+caps],rax /
+            call entry / cmp rax,-1 / jne / add rsp,160        23
+
+Emitted: identical. Per call the accounting is a relocation: the
+entry -13, the arm +1, the site +12 (the fill and init moved in, the
+`lea rdi` and the entry's `sub/mov` pair out) - net zero, as intended.
+Nothing is faster yet; W2 is where the site starts spending what it
+now holds.
+
+**The expected-sequence harness** (tests.cpp: `native_ins_of`,
+`native_find`, `native_expect`, `native_dump_of`). It reads the same
+`-vdj` text a human reads, strips the TESTS counter quadruple, and
+matches instruction PATTERNS (`*` for a layout-probed displacement, a
+jump target, a slot name). `jit_frameless_w1_shape` pins the entry,
+the discriminator, the frameless arm and the site of 78's shape;
+watched failing on a wrong stack drop (`add rsp, 112` for 160). It
+would have been impossible before T0: the dump did not show main's
+site at all.
+
+**Nets:** -rt dbg 1989/1989 + the four differential modes; corpus_diff
+plain and every matrix 34/34; driver_checks; regcensus at its floors;
+norec_enum --depth 3, norec_sweep, nested_fuzz, vdjcmp self-test,
+disasmcheck - see the commit. Perf is measured at the end of the
+increment, not per step.

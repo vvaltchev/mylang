@@ -457,6 +457,13 @@ work — but profile it before building, the way increment 0 was.
         no helper writes), the ref-listed arg-temp staging guard, the
         caller-built window (recovers the #162 fusion), the float pin
         spill around the call (#124).
+        INCREMENT 3 (2026-09-20, in progress) takes them in the order
+        that makes the patches simpler, verified on the expected -vdj
+        text first (the maintainer's instruction; perf at the end):
+        T0 the dump driver (it lied about main - fixed, one JIT driver
+        for compile/load/dump), W1 the caller-built window (done, a
+        relocation), W2 the fusion into it, then the init elision and
+        the capture base, both site-local now.
     3.  E2 - drop the leaf rule. Serves 09_fib. GATE includes
         norec_enum --depth 4 (2272 programs x 4 engines), because a
         throw crossing a frameless frame is exactly its shape space.
