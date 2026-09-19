@@ -462,8 +462,11 @@ work — but profile it before building, the way increment 0 was.
         text first (the maintainer's instruction; perf at the end):
         T0 the dump driver (it lied about main - fixed, one JIT driver
         for compile/load/dump), W1 the caller-built window (done, a
-        relocation), W2 the fusion into it, then the init elision and
-        the capture base, both site-local now.
+        relocation), W2 the fusion into it (done: the staging move
+        gone, a pin stored from its register, the coercing check an
+        emit-time fact - 78's add(i) 90 -> 73 instructions per call),
+        then the init elision and the capture base, both site-local
+        now.
     3.  E2 - drop the leaf rule. Serves 09_fib. GATE includes
         norec_enum --depth 4 (2272 programs x 4 engines), because a
         throw crossing a frameless frame is exactly its shape space.
@@ -660,6 +663,26 @@ remaining increments (1c, the probe elision, increment 2) are where the
 does not rediscover (a) as a mystery.
 
 ---
+
+## 3c. FOUND, NOT FIXED — A BIND-COERCION ERROR'S CARET DIFFERS PER
+## ENGINE (2026-09-20, during #97 inc 3 W2; RULE 2)
+
+    func mk2(int z) { return func [z] (int a, int b) { ... }; }
+    var f2 = mk2(1); var dyn z = 0; z = runtime("str");
+    ... s = s + f2(i, z);        # a string into `int b`
+
+The C++ call tier raises `TypeErrorEx: cannot store a non-int value in
+an 'int' variable ...` under every engine, but the CARET is not the
+same: the VM+JIT carets the whole call `f2(i, z)` (col 44:52), the
+tree-walker the argument (col 47:51), and the interpreted VM (`-nj`)
+prints NO location at all. Present on the inc 2 and W1 trees and with
+`MYLANG_JIT_OFF=frameless`, so it is the C++ sync tier's stamp, not
+the frameless site's. The reach harness compares backtraces and
+messages, not carets, which is why no test fails. A `tests` entry with
+`ex_col` pinned per engine would; the fix is in the bind's raise site
+(the argument's caret is what the tree-walker's `bind_param` stamps).
+Small, but a caret that differs between engines is a RULE 2 violation
+and is on record. Not a detour from #97 - the maintainer's call.
 
 ## 4. QUESTIONS FOR THE MAINTAINER
 

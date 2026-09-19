@@ -1155,7 +1155,11 @@ collision). Three nets now:
   per mode, so `-rt` is green with it on OR off), argfuse (#162: a
   reference argument already in a named local is bound STRAIGHT from
   that slot and its staging MoveV is not emitted; the cold arms
-  materialise the run), xcache (#96: the CALLER-saved half of the
+  materialise the run. A FRAMELESS site - #97 inc 3 W2 - fuses ANY
+  named local, pinned or not: the site builds the callee's window
+  itself and binds each argument from where it lives at that pc, a
+  pin from its register; its decline trampoline materialises the
+  run the same way), xcache (#96: the CALLER-saved half of the
   pin pool - it holds hot locals too, spilled/reloaded around every
   helper call by emit_call_prologue/epilogue. **Which members a run
   may spend is a per-register CLOBBER MASK, `jit_xcache_clobber` -
