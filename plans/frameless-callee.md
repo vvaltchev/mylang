@@ -355,6 +355,31 @@ Each ends with a MEASUREMENT that can kill the next one.
        76_funcval_dispatch   unchanged             unchanged
        78_typed_param_call   unchanged             unchanged
 
+   **WALL CLOCK, 2026-09-04** (interleaved `--baseline`, `OPT=1
+   ASSERTS=0`, `-npc`, 90 benches): **11_closure_counter 0.95x**,
+   63_closures 0.99x, suite geomean **0.999x**. Four benches read
+   outside ±5% and are PROVEN noise — 19_foreach_indexed 0.80x,
+   18_foreach_array 0.83x, 20_foreach_unpack 1.09x, 60_bit_sieve 1.09x,
+   none of which contains a value call, and whose Ir deltas are
+   −0.00% / −0.00% / −0.56% / −0.01%.
+
+   ⛔ **AND THAT IS THE MOST USEFUL NUMBER THIS PLAN HAS PRODUCED, for
+   a reason that is not about E1.** Put it beside increment 0, in the
+   same arc, on the same benches:
+
+       increment 0   removed a ~19-field VmCallRec STORE BURST
+                     -20.7% Ir  ->  0.71x   (clock moved MORE than Ir)
+       E1            removed a cache PROBE + five descriptor GATES
+                     -3.0% Ir   ->  0.95x   (about flat)
+
+   §4 says this plan is only worth doing because what it removes is a
+   dependent load chain gating a branch. E1 has now measured the OTHER
+   half of that claim directly: collapsing GATES is the guard-elision
+   family and pays ~nothing on the clock. **So the frameless tier's
+   value is the record WRITE it removes — increment 0's family, which
+   paid 0.71x — and NOT the gates it collapses.** Size increment 2 on
+   the store burst, and expect nothing from the gate collapse.
+
    **76 IS A CORRECT DECLINE, NOT A MISS.** Its `ops[i % 2]` really can
    reach two different functions, so the callee set has two candidates
    and no stamp is written. That is the analysis answering honestly.

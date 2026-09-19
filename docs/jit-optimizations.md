@@ -11691,3 +11691,124 @@ record-less tier wins on all four benches and the frameless tier -
 which additionally removes the record READ - keeps its premise. It does
 NOT make the frameless tier cheaper to build; it moves 09_fib's
 baseline.
+
+---
+
+## #97 E1 - THE VALUE CALLEE GETS NAMED, AND THE WALL CLOCK SAYS WHICH
+## KIND OF REMOVAL PAYS (2026-09-04)
+
+**THE SUBJECT.** The emitter could name a callee only through a
+write-once GLOBAL FUNCTION SLOT, so `var add = mk(7); ... add(i)`
+re-established the callee's properties from memory on every call. #116's
+callee-set analysis names it exactly (`-dcs` prints
+`one lambda@19:12`) - this was a CONSUMER that never asked, not an
+analysis that could not answer.
+
+**THE CARRIER.** The JIT runs AST-FREE, so the answer has to survive the
+teardown and a trip through a `.myv`: a per-chunk, pc-keyed
+`Chunk::value_callees` (myv v15, section 9.20), each entry an index into
+that chunk's existing `closure_defs` pool. Packing the index into
+`CallValueV`'s `b` beside nargs - the idiom `CallDynV` already uses - was
+REJECTED: `b` is read as nargs in three VM hot-dispatch sites and a
+missed mask there is a silent wrong argument count. The table is read
+only at JIT-compile time, so the VM never touches it.
+
+**THE EMITTER NEEDED NO CHANGE.** RAX already holds the live callee's
+descriptor on both the slot path and the value path, so the existing
+baked arm is generic; only `jit_baked_callee` gained an arm.
+
+**SOUNDNESS IS THE COMPARE, NOT THE ANALYSIS.** The baked arm compares
+the live descriptor against the baked one and falls to the generic tier
+on a mismatch. So this is a PREDICTION: a wrong one costs a slow path and
+never a wrong answer - which is also why no write-once analogue is needed
+(a flow-insensitive set unions every assignment, so a rebound variable
+has two candidates and is never stamped).
+
+**REACH** (`-npc`, scale 1). ⛔ The two counters are DIFFERENT UNITS -
+`bake_push` is bumped by EMITTED code (executions), `frameless_calls` by
+a C++ `++` in the emitter (sites). The plan's gate conflated them, which
+is the `rax_pin` / `rax_retries` mistake in a new place:
+
+    bench                bake_push (exec)        frameless_calls (sites)
+    11_closure_counter   1 -> 1,000,001          1 -> 2
+    63_closures          400,000 -> 1,000,000    2 -> 5
+    12_higher_order      -                       0 -> 1
+
+76_funcval_dispatch is a CORRECT DECLINE - `ops[i % 2]` really reaches
+two functions. 78_typed_param_call does not move and NOT for a naming
+reason: its callees are named, then refused by the first bake gate,
+`fast_bind`, which `compute_bind_flags` clears for ANY `int`/`float`
+ANNOTATED parameter. 78 exists to measure annotated parameters; 11's
+lambda takes none. The coercing-callee bake is a separate increment.
+
+**MEASURED** (callgrind Ir and interleaved wall clock, `OPT=1
+ASSERTS=0`, `-npc`, 90 benches):
+
+    bench                  Ir        wall
+    11_closure_counter   -3.02%      0.95x
+    63_closures          -0.96%      0.99x
+    12_higher_order      -0.07%      1.04x   (22 ms - noise scale)
+    suite geomean cur/base           0.999x
+
+**⛔ FOUR BENCHES READ OUTSIDE +/-5% ON THE CLOCK AND ARE PURE NOISE,
+PROVEN.** 19_foreach_indexed 0.80x, 18_foreach_array 0.83x,
+20_foreach_unpack 1.09x, 60_bit_sieve 1.09x - none of which contains a
+value call at all. Their Ir deltas are **-0.00%, -0.00%, -0.56%,
+-0.01%**: identical instruction streams. Had the Ir check been skipped,
+this run would have "shown" a 20% win and a 9% regression that do not
+exist. **On a 60-160 ms bench the clock is not evidence on its own.**
+
+**⛔ AND THE REAL FINDING IS THE CONTRAST WITH INCREMENT 0, INSIDE THIS
+SAME ARC.** Both changes remove per-call work; they removed DIFFERENT
+KINDS and the clock answered differently:
+
+    increment 0   removed a ~19-field VmCallRec STORE BURST
+                  -20.7% Ir  ->  0.71x wall   (the clock moved MORE)
+    E1            removed a 3-entry cache PROBE plus five descriptor
+                  GATES, leaving one compare
+                  -3.0% Ir   ->  0.95x wall   (about flat)
+
+E1's removal is perfectly-predicted branches over L1-hitting loads - the
+GUARD-ELISION FAMILY this file has recorded three times, with a
+wall-clock ceiling near zero. Increment 0's was memory traffic.
+
+**THE CONSEQUENCE FOR THE REST OF #97, and it is worth more than E1's
+own number:** the frameless tier's value is the record WRITE it removes
+(increment 0's family, which paid 0.71x) and NOT the gates it collapses
+(this family, which paid ~nothing). Size increment 2 on the store burst,
+and re-read section 4's kill criterion before building E3.
+
+**THREE BUGS THIS SURFACED, each caught by a net:**
+
+ - a USE-AFTER-FREE reading `callee_fn->desc` at codegen. The stamp is a
+   raw AST pointer written at the end of inference; its only previous
+   consumer (#93's escape analysis) runs moments later inside
+   `resolve_names`, while every decl is alive. Codegen runs after the
+   whole optimizer stack. Fixed by stamping `CallExpr::callee_desc`, the
+   program-lifetime DESCRIPTOR;
+ - THE DESCRIPTOR CAN DIE TOO - an inline lambda passed as an argument
+   dies with the call expression that held it, taking the
+   `FuncDeclStmt::desc_owner` it lives in. So codegen never TRUSTS a
+   stamp: `CodegenLiveDescs` builds the set from `collect_funcs` over the
+   FINAL tree - the same walk that decides which bodies to compile - and
+   membership is a pointer COMPARE, never a deref;
+ - THERE ARE THREE CODEGEN DRIVERS AND ONLY ONE WAS WIRED. `vm_compile`
+   (covering `vm_precompile_all`, nested) and `disassemble_program`,
+   which runs its own two-pass codegen. Installing the set in the wrong
+   one left the tier SILENTLY INERT while the reach counter read exactly
+   like *"the liveness gate is too strict"*. It is an RAII type now so
+   the second site is one line and cannot half-install.
+
+**AND AN INSTRUMENT FIX THAT WAS MASQUERADING AS A FINDING:**
+`MYLANG_JITSTATS` printed NOTHING for a `.myv` run - the image branch has
+its own `return 0` and skipped both reports at the end of `main`. A
+loaded image therefore looked like it did not bake. With the report
+restored it bakes 1,000,001, exactly as a fresh compile does.
+
+**A NEW SHAPE-EATER for the vacuous-test list.** `jit_callee_cache`'s
+MONOMORPHIC case was `var f = mk(3); f()` - monomorphic AND nameable, so
+it now BAKES and the cache arm it tests never runs. It picks its callee
+out of an array of two different lambda DECLS instead (two candidates, no
+stamp, so the cache tier) while staying monomorphic at run time. **An
+optimization that names more callees eats every test whose subject is the
+tier for UNNAMED ones.**
