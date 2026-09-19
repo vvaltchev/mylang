@@ -546,7 +546,11 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
 std::vector<int>
 jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
                            int slot_count, size_t max_pins,
-                           std::vector<int> *fhot);
+                           std::vector<int> *fhot,
+                           /* #97 1b: the pick's BARRIER marks, one
+                            * char per pc in [begin, end) - which ops the
+                            * emitter brackets with flush/reload */
+                           std::vector<char> *barrier = nullptr);
 
 /* #98: the opcode-keyed tables, exported for the census ratchet
  * (opcode_table_census, tests.cpp) - every opcode in the enum must be
@@ -1309,6 +1313,7 @@ extern "C" unsigned long g_jit_scache;
 /* D3.b 2b-ii: fragments ENTERED whose pin set came from the linear
  * scan (the lsra lever) - the bridge's execution proof. */
 extern "C" unsigned long g_jit_lsra_pins;
+extern "C" unsigned long g_jit_call_pinned_sites;  /* #97 1b (emit-time) */
 /* F4a: entries of a fragment whose FLOAT pin set the lsra float
  * fallback chose (the facts-based fhot replacement) */
 extern "C" unsigned long g_jit_lsra_fpins;

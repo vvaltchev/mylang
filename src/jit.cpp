@@ -86,6 +86,11 @@ unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_rax_pin = 0;       /* #96: rax-pinned fragment entries */
 unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
 unsigned long g_jit_lsra_pins = 0;     /* D3.b: lsra-chosen pin sets */
+/* #97 1b: sync-call SITES emitted while the register cache was LIVE -
+ * a compile-time count, so a test can prove the call it exercises was
+ * emitted INSIDE a pinned run (the pre-1b answer is 0 for every
+ * program: a run holding a call cached nothing). */
+unsigned long g_jit_call_pinned_sites = 0;
 /*
  * #103 increment 0: HOW OFTEN DOES THE LEGACY PICK STILL DECIDE?
  *
@@ -1904,6 +1909,17 @@ struct Emitter {
                      "DEPTH - some path through this op leaks stack",
                      static_cast<unsigned>(
                          trk_pushes > 0 ? trk_pushes : -trk_pushes));
+        /* #97 1b: a multi-exit call emitter must close its bracket
+         * exactly once on the fall-through path (its divergent exits
+         * use emit_call_epilogue_divergent). The count feeds trk_push,
+         * which drives EMISSION, so an imbalance is not a diagnostics
+         * bug - it changes the emitted bytes for the next pinned run. */
+        if (trk_bracket != 0)
+            trk_fail("op boundary reached with an UNBALANCED call "
+                     "bracket (a divergent-path epilogue closed it, or "
+                     "a prologue was never closed)",
+                     static_cast<unsigned>(
+                         trk_bracket > 0 ? trk_bracket : -trk_bracket));
 #endif
         /* the RESETS are unconditional - trk_flushed feeds trk_push's
          * discrimination, which drives EMISSION (see trk_push's ⛔) */
@@ -7286,6 +7302,63 @@ static void emit_call_epilogue(Emitter &e)
 }
 
 /*
+ * #97 1b: THE EPILOGUE OF A PATH THAT LEAVES THE FRAGMENT. A call
+ * emitter with several exits (the sync call: SWITCH-propagate ret,
+ * exception exit_pc, ..., then the fall-through `done:`) emits ONE
+ * prologue and one epilogue PER PATH - five copies of the epilogue
+ * after one prologue. The register tracker's model is EMISSION-LINEAR,
+ * so a plain epilogue on a divergent path would close the bracket for
+ * every instruction emitted after it, though the fall-through
+ * continuation is still inside it; the count then went to -4 per sync
+ * call and negative from there.
+ *
+ * That was LATENT while a run holding a MyLang call pinned nothing
+ * (pick_visit_op's default arm): a negative bracket count only matters
+ * to a PINNED register. It went live the day the CALL family became a
+ * barrier and such a run could pin - the first `-rt` run aborted at a
+ * MoveV's cold arm two ops after two calls (`bracket=-7`), where the
+ * helper epilogue's float-pin reload read as a stray write. And it is
+ * not only the tracker's checks: trk_push's borrow discrimination
+ * reads the same count and DRIVES EMISSION (see its ⛔), so a wrong
+ * count would have emitted a compensating pop for dead scratch.
+ *
+ * A divergent-path epilogue therefore REOPENS the bracket for the
+ * continuation. op_boundary asserts the count is back to zero after
+ * every op, so a future emitter with the same shape fails by name.
+ */
+static void emit_call_epilogue_divergent(Emitter &e)
+{
+    emit_call_epilogue(e);
+    e.trk_bracket++;                     /* the fall-through path is
+                                          * still inside the bracket */
+}
+
+/*
+ * #97 1b: A FLUSH ON A PATH THAT LEAVES THE FRAGMENT MID-OP. The sync
+ * call's two JIT_RET_SWITCH exits `ret` with the record's baked resume
+ * re-entering this fragment at the post-call stub, which loads the pins
+ * FROM MEMORY - and the interpreter runs the switched callee (and any
+ * handler of ours) in between. So the live pins must be in their slots
+ * on that path, while the fall-through continuation keeps them in
+ * registers. flush_cache() is stores only (its scache shuttle is
+ * push/pop-wrapped), so the path's register state is untouched; what
+ * must be put back is the TRACKER's flush state, which is emission-
+ * linear and would otherwise judge the continuation with dead pins
+ * (pin writes silently allowed, pin reads flagged - the polarity
+ * op_boundary's own comment records). These sites used
+ * frag_ret(RetFlush::empty), which was correct exactly as long as no
+ * call run could pin.
+ */
+static void emit_divergent_flush(Emitter &e)
+{
+    const bool was_flushed = e.trk_flushed;
+    const uint32_t was_dirty = e.trk_flushdirty;
+    e.flush_cache();
+    e.trk_flushed = was_flushed;
+    e.trk_flushdirty = was_dirty;
+}
+
+/*
  * ⛔ #96 THE TRIPWIRE. `emit_sync_push_native` and `emit_sync_call_inline`
  * use r10/r11 as RAW SCRATCH, outside any emit_call_prologue bracket -
  * they are building a call RECORD, not calling a helper - so a
@@ -8913,6 +8986,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                   int_type callee_arg)
 {
     jit_assert_no_volatile_pin(e);
+#ifdef TESTS
+    if (e.cache_live())
+        g_jit_call_pinned_sites++;       /* #97 1b: the reach proof */
+#endif
     Loc ls, le;
     ck.loc_at(old_pc, ls, le);
     const uint64_t site =
@@ -9164,10 +9241,11 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         const size_t j_nsw = e.j32(0x75);          /* jne next */
         e.movabs(RCX, depth_addr);
         e.dec_dword_base(RCX);
-        emit_call_epilogue(e);
+        emit_call_epilogue_divergent(e);
+        emit_divergent_flush(e);           /* #97 1b: pins -> memory */
         e.mov_imm(RAX, static_cast<uint64_t>(-3));
         /* ret (propagate) */
-        e.frag_ret(Emitter::RetFlush::empty);
+        e.frag_ret(Emitter::RetFlush::flushed);
         e.patch32_here(j_nsw);
     }
     /* #56 (native Throw): the callee raised past THIS sync frame - the
@@ -9206,7 +9284,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     }
     e.test32_rr(RAX, RAX);                        /* test eax, eax */
     const size_t j_done2 = e.j32(0x74);            /* jz done */
-    emit_call_epilogue(e);
+    emit_call_epilogue_divergent(e);
     e.exit_pc(pc);                                 /* exception -> re-raise */
     /* slow: the full helper (identical to the plain emit_sync_call tail).
      * r9 = the baked &locs[i] for THIS call op (#56 step 1: the
@@ -9280,14 +9358,15 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.cmp_reg32_imm8(RAX, 3);
     {
         const size_t j_sw = e.j32(0x75);           /* jne exc_path */
-        emit_call_epilogue(e);
+        emit_call_epilogue_divergent(e);
+        emit_divergent_flush(e);           /* #97 1b: pins -> memory */
         e.mov_imm(RAX, static_cast<uint64_t>(-3));  /* JIT_RET_SWITCH */
         /* ret */
-        e.frag_ret(Emitter::RetFlush::empty);
+        e.frag_ret(Emitter::RetFlush::flushed);
         e.patch32_here(j_sw);
     }
     emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56 step 1) */
-    emit_call_epilogue(e);
+    emit_call_epilogue_divergent(e);
     e.exit_pc(pc);
     /* done: */
     e.patch32_here(j_done1);
@@ -10884,6 +10963,7 @@ void jit_stats_report()
         { "rax_pin",          &g_jit_rax_pin },
         { "scache",           &g_jit_scache },
         { "lsra_pins",        &g_jit_lsra_pins },
+        { "call_pinned_sites", &g_jit_call_pinned_sites },
         /* #103 increment 0: the legacy pick's remaining reach */
         { "runs_compiled",    &g_jit_runs_compiled },
         { "pick_decided",     &g_jit_pick_decided },
@@ -12756,6 +12836,83 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
          * enumerable here. BRACKET (not a branch). */
         v.mark_barrier(pc);
         break;
+    case OpCode::CallV:
+    case OpCode::CachedCallV:
+    case OpCode::CallValueV:
+        /* #97 increment 1b: the MyLang CALL, classified PRECISELY. It was
+         * UNCLASSIFIED (the default arm below) until 2026-09-19, so a run
+         * holding ONE call cached NOTHING - measured on 09_fib/10/11/63/
+         * 76/78: `pick_decided 2` and no pin row at all. The plan's older
+         * claim that such a run kept "4 pinnable registers of 13"
+         * (jit_run_blocks_xcache denying only the caller-saved half)
+         * described a gate the run never reached.
+         *
+         * A BARRIER was built and measured first (flush every pin before,
+         * reload after - the CallBuiltinV rule): it makes the run pin and
+         * then charges 3 instructions per executed call for registers the
+         * `call` PRESERVES - 09_fib +2.6% Ir for a pin that saves nothing
+         * (a read-only parameter), 11_closure_counter 1.10x on the clock.
+         * The full flush/reload discipline is the wrong tool for a SysV
+         * call whose callee cannot reach the caller's frame.
+         *
+         * WHAT THE CALL TOUCHES, exactly - and the argument that this is
+         * ALL of it:
+         *  - it READS the argument run [a_lit, a_lit + b_lit) from MEMORY
+         *    (the inline push copies it raw; the C++ tiers read it through
+         *    the frame) - bad(): a run slot may not be pinned OR
+         *    type-elided at the call, which for the scan is a cut at this
+         *    pc (its piece here is forced memory; the transition machinery
+         *    stores it before the call);
+         *  - a VALUE call READS the callee temp (target2) from memory -
+         *    bad(); for CallV/CachedCallV target2 is a GLOBAL-table index,
+         *    not a frame slot;
+         *  - it WRITES the dst (target): the callee's native ReturnV /
+         *    jit_ret writes it through the window, the cached probe's hit
+         *    arm writes it in C++ - bad().
+         *  Nothing else in the CALLER's frame is reachable from the
+         *  callee: a global lives in the global table, a capture is a
+         *  BY-VALUE snapshot in the FuncObject, and a MyLang function
+         *  cannot name its caller's locals. So a pin in a CALLEE-SAVED
+         *  register (all a call run may hold - jit_run_blocks_xcache
+         *  denies the caller-saved half, jit_assert_no_volatile_pin
+         *  checks it) stays LIVE across the `call` with no store and no
+         *  reload: the SysV callee preserves the register, and the memory
+         *  copy is never read by the call.
+         *
+         * THE THREE EXITS that leave the fragment mid-op are the price:
+         *  - an EXCEPTION exit is exit_pc, whose shared epilogue flushes
+         *    the live pins (state captured at the exit);
+         *  - the two JIT_RET_SWITCH exits used frag_ret(RetFlush::empty)
+         *    and now FLUSH first (emit_sync_call_inline): the record's
+         *    baked resume re-enters this fragment at the post-call stub,
+         *    which loads the pins FROM MEMORY, and the interpreter runs
+         *    our handlers in the meantime - memory must be current;
+         *  - the native-direct CallV's StackOverflow arm is exit_pc.
+         * The #162 argfuse gate (`pinned`) is what keeps a FUSED source
+         * out of a register; it consults the scan's transitions too.
+         *
+         * NOT a barrier, NOT a branch. The staging hazard that once
+         * shipped (a bracketed helper's argument staging clobbering pins
+         * that later cache-aware reads still trusted) needs a CALLER-saved
+         * pin, which the denial above excludes from every call run. */
+        for (int_type k = 0; k < in.b_lit(); k++)
+            v.bad(static_cast<int>(in.a_lit() + k));   /* the arg run */
+        if (in.op == OpCode::CallValueV)
+            v.bad(in.target2);                           /* the callee */
+        v.bad(in.target);                                /* the dst */
+        break;
+    case OpCode::CallValueGenericV:
+        /* #97 1b: the DYN callee's generic dispatch. Its argument run is
+         * enumerable (a_lit, b_lit & 0xfff) but arg0's LVALUE DESCRIPTOR
+         * - re-derived at dispatch when the callee turns out to be an
+         * lvalue-ABI builtin - names a frame slot only the call_sites
+         * pool knows, and the visitor deliberately does not chase pools
+         * (the EmplaceStruct / StructCtorBoxedV rule). BRACKET it. Its
+         * bail is an exit_pc from the EMPTIED cache, which is the
+         * barrier's own exit contract. A dyn call is the generic tier
+         * anyway; precision buys nothing there. */
+        v.mark_barrier(pc);
+        break;
     case OpCode::Jump:
     /* returns none - reads/writes no slot */
     case OpCode::Halt:
@@ -12767,18 +12924,15 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
                                       * TODAY do so DELIBERATELY, each
                                       * with a reason recorded in its
                                       * opcode_table_census row
-                                      * (tests.cpp): the CALL family
-                                      * (CallV/CachedCallV/CallValueV/
-                                      * CallValueGenericV - whether a
-                                      * call should be a barrier instead
-                                      * is #97's decision, entangled
-                                      * with the call protocol), the
-                                      * key-run chain stores (run size
-                                      * unknown here), and EnterNative/
-                                      * ExitBlock (never in a pre-jit
-                                      * run). A NEW op reaching this
-                                      * default fails the census until a
-                                      * row decides it. */
+                                      * (tests.cpp): the key-run chain
+                                      * stores (run size unknown here),
+                                      * and EnterNative/ExitBlock (never
+                                      * in a pre-jit run). The CALL
+                                      * family left this arm in #97
+                                      * increment 1b (a barrier, above).
+                                      * A NEW op reaching this default
+                                      * fails the census until a row
+                                      * decides it. */
     }
     return true;
 }
@@ -13560,10 +13714,13 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
 std::vector<int>
 jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
                            int slot_count, size_t max_pins,
-                           std::vector<int> *fhot)
+                           std::vector<int> *fhot,
+                           std::vector<char> *barrier)
 {
+    if (barrier)
+        barrier->assign(end - begin, 0);
     return pick_cached_slots(ck, begin, end, slot_count, max_pins,
-                             nullptr, fhot);
+                             barrier, fhot);
 }
 #endif
 
@@ -21450,9 +21607,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * when callv_native_ok). Push the callee frame via jit_call_setup, then
          * `call` the callee's fragment directly; the callee's native ReturnV
          * (jit_ret) pops its window + writes OUR dst slot + rets a sentinel we
-         * IGNORE (a native_leaf never bails post-setup). A call run is NOT
-         * N5-cached (pick_cached_slots -> {}), so the args already sit in memory
-         * and no cache flush/reload is needed. This fragment (holding a CallV)
+         * IGNORE (a native_leaf never bails post-setup). A CallV is a cache
+         * BARRIER (#97 1b, pick_visit_op): every pin was flushed before this
+         * op and the cache is EMPTY across its emission, so the args sit in
+         * memory and the prologue below has nothing to spill; the reload is
+         * emitted after the op. This fragment (holding a CallV)
          * is non-leaf, so it is only ever entered via jit_enter/EnterNative -
          * a StackOverflow exit therefore returns to EnterNative, which raises
          * g_vm_jit_exc. */
@@ -21474,7 +21633,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x48); e.test32_rr(RAX, RAX); /* test rax, rax */
         const size_t j_ok = e.j8(0x75);     /* jnz over_SO (rax != null) */
         emit_exc_stamp(e, ck, old_pc);      /* collapse-safe caret (#56) */
-        emit_call_epilogue(e);              /* SO: re-mat rsi/r8 */
+        emit_call_epilogue_divergent(e);    /* SO: re-mat rsi/r8 */
         /* -> EnterNative raises g_vm_jit_exc*/
         e.exit_pc(pc);
         e.patch8(j_ok, e.pos());            /* over_SO: */
@@ -25252,6 +25411,20 @@ retry_emission:
                  * resident for part of the run */
                 for (const ShareSeam &sm : seams)
                     if (sm.to_slot == slot) return true;
+                /* #97 1b: and every slot the SCAN installs by a
+                 * TRANSITION (trans mode's per-pc plan) - `hot` holds
+                 * only the ENTRY occupants there. Unreachable until a
+                 * call run could pin at all; the first pinned call run
+                 * fused a loop counter that lived in r13 from pc 1 on
+                 * and the callee read its never-written memory as
+                 * <none> (the #162 slice test, watched). Both files:
+                 * the float twin's transitions install into xmm. */
+                for (const LsraTrans &t : lsra_tr)
+                    if (t.install_slot == slot || t.evict_slot == slot)
+                        return true;
+                for (const LsraTrans &t : lsra_ftr)
+                    if (t.install_slot == slot || t.evict_slot == slot)
+                        return true;
                 return false;
             };
             for (size_t pc = begin; pc < end; pc++) {
