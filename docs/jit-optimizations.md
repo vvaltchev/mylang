@@ -10914,3 +10914,87 @@ values.
 "ref_slots too many" -> "not a leaf"). What remains for both is the v1
 gate's NO-CALL-OP rule - a self-imposed leaf restriction, not an
 information gap.
+
+## #109 - `intrusive_ptr::release` splits into an inline decrement and
+## an out-of-line destroy (2026-08-29)
+
+`release()` was
+
+    if (ptr) { ML_CHECK(count > 0); if (--count == 0) delete ptr; }
+
+The hot half is three instructions. The cold half drags in T's whole
+destructor - for `SharedStr::StrObj` that is `~std::string` -> `free` -
+which makes the function big enough that GCC out-lines the WHOLE thing,
+so every reference drop in the interpreter pays a call frame to do a
+decrement. `ML_NOINLINE void destroy() { delete ptr; }` splits them.
+
+**MEASURED** (callgrind Ir per scale unit, `OPT=1 ASSERTS=0`, `-npc`,
+scale-3-minus-scale-1 so compile time cancels), ALONE, against a9f2e65,
+over 18 benches:
+
+    75_indexed_unpack    -1.73%      31_str_split_join    +1.29%
+    28_str_concat        -1.39%      63_closures          +0.81%
+    47_wordcount         -1.23%      17_array_concat      +0.45%
+    32_str_build_join    -0.94%
+    58_structs           -0.78%      flat: 64_struct_create,
+    62_dict_word_count   -0.78%      13_array_append, 34_sort_custom_cmp,
+    23_dict_insert       -0.30%      11_closure_counter, 76, 09_fib,
+                                     01_while_loop, 46_matrix_mult
+
+**⛔ THE PREDICTION WAS 7.8% AND THE TRUTH IS 1.73% - ATTRIBUTION IS NOT
+REMOVABLE COST.** The task was filed off a profile attributing 90M Ir to
+a standalone `intrusive_ptr<StrObj>::release()` symbol on
+75_indexed_unpack. A symbol's self-Ir includes everything INLINED INTO
+it, and almost all of that 90M was the destructor and the `free`, which
+no amount of restructuring removes. Only the call frame was removable.
+Same lesson as [[callgrind-attribution-vs-mechanism]], and it is worth
+restating because the trap is that the number is real - it is the
+INFERENCE from it that is wrong.
+
+**THE THREE REGRESSIONS ARE THE MECHANISM WORKING, INVERTED.** The split
+pays where a release mostly does NOT free - an aliased string, a shared
+array - because the decrement then inlines and the destroy is never
+reached. 63_closures creates and drops a closure per iteration and
+31_str_split_join drops every StrObj `split()` makes: there the release
+ALWAYS frees, so the cold path IS the hot path and the split adds a call
+frame to the common case.
+
+Net over the measured set is positive (-7.15 points of wins against
++2.55 of losses) but it is a REDISTRIBUTION, not a free win, and both
+patterns are common in real code. Recorded here so the trade can be
+reversed on evidence rather than rediscovered.
+
+**⛔ `ML_COLD` WAS TRIED AND IS WORSE - AND THE FIRST COMPARISON OF IT
+WAS CONFOUNDED.** `__attribute__((cold, noinline))` looks like the
+strictly better spelling: it tells GCC the CALL SITE is unlikely too, so
+the block calling `destroy()` moves to a cold section and the hot path
+carries less register pressure. Measured against `ML_NOINLINE`, both
+builds carrying #121:
+
+    63_closures          +1.15%   <- WORSE, and it is the bench #121 exists for
+    17_array_concat      -0.45%
+    28_str_concat        -0.37%
+    31_str_split_join    -0.01%
+    75/58/62/01          +0.00%
+
+A wash that trades the one bench this arc is aimed at for two smaller
+wins elsewhere, so `ML_NOINLINE` stays.
+
+⛔ The FIRST reading of that experiment said the opposite - that `cold`
+flipped 63_closures from +0.81% to -0.65% - because the `cold` lane was
+built from a working tree that ALSO contained #121 and was compared
+against the pre-#121 baseline. The delta being attributed to `cold` was
+mostly #121's. **A one-variable experiment needs a one-variable pair of
+binaries**; when a lane is built from the working tree, ask what else is
+in the working tree.
+
+Note the symbol does NOT disappear from the annotate output - GCC still
+emits an out-of-line `release()` for the sites it chooses not to inline,
+alongside the new `destroy() [clone .isra.0]`. Text grew 840 bytes. The
+win is real but small; judge any successor by Ir, not by the symbol
+table.
+
+**NO CORRECTNESS TEST, and that is the honest position.** This changes
+no semantics - it moves one statement behind a call. Its evidence is the
+measurement plus the existing nets (`-rt` 1977/1977 in five modes, the
+corpus differential over five matrices, the ASan/LSan debug lane).

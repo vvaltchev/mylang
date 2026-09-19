@@ -48,6 +48,24 @@ class intrusive_ptr final {
     T *ptr;
 
     void retain() { if (ptr) ++ptr->intr_refcount; }
+
+    /*
+     * #109: the COLD half of release(), kept OUT OF LINE on purpose.
+     *
+     * `delete ptr` drags in T's whole destructor - for SharedStr::StrObj that
+     * is ~std::string -> free - which makes release() big enough that GCC
+     * out-lines the WHOLE function. Every reference drop in the interpreter
+     * then pays a call frame to perform a three-instruction decrement: 90M Ir
+     * on 75_indexed_unpack alone (callgrind, DEBUG_INFO=1, OPT=1 ASSERTS=0),
+     * ~9 Ir per release where the inline form is 3-4.
+     *
+     * Splitting it lets the hot half inline at the call site and leaves the
+     * destroy - which is a real free, and rare - behind one call. The
+     * ML_CHECK stays in the INLINE half: it is the over-release tripwire and
+     * must fire at the exact point the balance breaks, not one frame away.
+     */
+    ML_NOINLINE void destroy() { delete ptr; }
+
     void release()
     {
         if (ptr) {
@@ -56,7 +74,7 @@ class intrusive_ptr final {
              * catch it at the exact point the balance breaks. */
             ML_CHECK(ptr->intr_refcount > 0);
             if (--ptr->intr_refcount == 0)
-                delete ptr;
+                destroy();
         }
     }
 
