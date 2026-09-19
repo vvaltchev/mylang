@@ -644,7 +644,6 @@ extern unsigned g_jit_xrot;
  * homes, the float pool - and every downstream stage runs on it.
  * OFF restores the pick end to end, so a suspected allocator bug
  * has a same-binary A/B one env var away. */
-extern bool g_jit_lsra;
 size_t jit_xrot_width();
 /*
  * REACH (env MYLANG_JITSTATS=1): print the emitted-code counters after a

@@ -1163,6 +1163,17 @@ collision). Three nets now:
   compare is unreachable under our own compilation and deleting it
   leaves every net green - `MYLANG_JIT_FORCE=bakecallee` lifts the
   cost gate alone and makes it fail in `Frame::at`),
+  lsra (#103 A': selects the LEGACY pick over the linear scan -
+  a different PIN SET for the same program.  It was ONLY the
+  `MYLANG_JIT_LSRA=0` env var until 2026-08-31 and so was absent
+  from this matrix, which meant a whole second allocator was
+  exercised by four hand-written `-rt` cases and nothing else -
+  the "configuration nobody runs" shape.  NOT VACUOUS: 21 of the
+  35 corpus programs emit DIFFERENT machine code under the two,
+  which is 21 programs' worth of alternative slot -> register
+  assignment - the axis the r9 bug lived in.  ⛔ It cannot see a
+  bug that keeps the ANSWERS right: #123's give-back regression
+  was correct-but-45%-slower and only the benchmark caught it),
   capbase (#112: a run making TWO OR MORE inline capture accesses
   walks `ctx -> ctx->captures -> data()` ONCE, at the run head, into
   a CALLEE-saved register claimed from whatever the pins, the C2b
@@ -1234,18 +1245,33 @@ collision). Three nets now:
   It reaches the WHOLE GP file and the FLOAT file now, period 16;
   `mylang -v` reports it and `corpus_diff --xrot` derives the sweep
   from that line rather than hardcoding a count.
-- **`MYLANG_JIT_LSRA` - the D3 REGISTER-ALLOCATOR lever, ⛔ DEFAULT
-  ON since 2026-08-26** (`g_jit_lsra`, settable in-process;
-  `MYLANG_JIT_LSRA=0` is the debugging OPT-OUT). ON means the linear
-  scan (`jit_lsra_assign` + snap/transitions + the float twin)
+- **`MYLANG_JIT_OFF=lsra` - the D3 REGISTER-ALLOCATOR lever, ⛔ DEFAULT
+  ON since 2026-08-26.** ⛔ **IT IS AN ORDINARY LEVER NOW (#103 A',
+  2026-08-31), AND THAT WAS THE WHOLE POINT.** It used to be THREE
+  spellings of one gate - the `MYLANG_JIT_LSRA` env var, the
+  `g_jit_lsra` global the coverage tests set in-process, and the
+  lever - and it was in NO differential matrix, so a whole second
+  allocator was exercised by four hand-written `-rt` cases and
+  nothing else. The env var and the global are DELETED; the in-process
+  need is `g_jit_off_extra`, the seam every other lever's test uses;
+  and `corpus_diff --levers` (hence CI) now covers it. ON means the
+  linear scan (`jit_lsra_assign` + snap/transitions + the float twin)
   chooses the register plan; OFF restores the legacy pick end to
-  end, so a suspected allocator bug has a same-binary A/B one env
-  var away. Flipped on the completed two-axis ledger: Ir zero
+  end, so a suspected allocator bug has a same-binary A/B one lever
+  away. Flipped on the completed two-axis ledger: Ir zero
   per-iteration regressions corpus-wide (wins to -16.8%), wall
   geomean 0.997x over 87 (wins to 0.73x). The opt-out config stays
-  covered: -rt/corpus run it in the flip battery, and the coverage
-  tests that pin the PICK's mechanisms force g_jit_lsra = false for
-  their duration (the documented convention). ⛔ TWO RULES
+  covered: `corpus_diff --levers` runs the whole corpus under the
+  pick on every CI run - NOT VACUOUS, 21 of 35 programs emit
+  DIFFERENT machine code under the two allocators - and the four
+  coverage tests that pin the PICK's mechanisms
+  (jit_xcache_pins, jit_rax_pin_test, jit_range_share_test,
+  jit_share_region_clamp) set the lever through `g_jit_off_extra`
+  for their duration. ⛔ THOSE MECHANISMS ARE THE PICK'S ALONE:
+  corpus-wide under the scan, `xcache` is 1 (46_matrix_mult),
+  `rax_pin` 0 and `range_share` 0 - the scan answers pin pressure
+  with TRANSITIONS instead (83_regs_int_40: `lsra_trans 22` vs
+  `xcache 1`). ⛔ TWO RULES
   it already earned: GP admission needs uses_int > 0 - an int-op
   touch is the TYPE evidence the t_int flush relies on; a ReturnV
   read is weight, never evidence (a ret-only closure slot pinned on

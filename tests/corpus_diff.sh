@@ -79,8 +79,23 @@ MODE=${2:-}
 # ⛔ KEEP IN SYNC WITH jit_lever_names (jit.cpp) - this list went stale
 # once (#101 found argfuse/xcache/scache/rshare missing, so those four
 # levers' per-lever-off configs were tested by nothing but `all`).
+# `lsra` joined 2026-08-31 (#103 A'): it selects the LEGACY pick over
+# the linear scan, i.e. a different PIN SET for the same program.  It
+# was an env var (MYLANG_JIT_LSRA=0) and NOT a lever, so this matrix -
+# the one CI runs - never covered it, and a whole second allocator was
+# exercised by four hand-written -rt cases and nothing else.
+#
+# NOT VACUOUS, measured when it was added: 21 of the 35 programs below
+# emit DIFFERENT machine code under the two allocators (compare
+# `MYLANG_VDJ_ADDRS=0 mylang -vdj` with and without the lever).  So
+# this row buys 21 programs' worth of alternative (slot -> register)
+# assignment - the axis the r9 bug lived in, where a hot local landing
+# in a register that was also raw scratch was a WRONG ANSWER that only
+# appeared for the programs whose pin set happened to reach it.
+# Re-measure that ratio if it ever looks like this row is free.
 LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2 \
-mfact cest relent norec argfuse xcache scache rshare peep bakecallee"
+mfact cest relent norec argfuse xcache scache rshare peep bakecallee \
+lsra"
 COLD_TIERS="refstore"
 # ⛔ DERIVED FROM THE BINARY, NOT HARDCODED (2026-08-18). This was
 # `XROTS="0 1 2 3"`, a literal, and the whole point of the mode is that

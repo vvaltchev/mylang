@@ -28242,8 +28242,10 @@ static bool jit_share_region_clamp()
      * this test forces the default allocator for its duration - the
      * documented convention for coverage tests of the pick's
      * mechanisms (jit_xcache_pins et al.) */
-    const bool lsra_saved = g_jit_lsra;
-    g_jit_lsra = false;
+    /* #103 (A'): through the JL_LSRA LEVER, the same in-process seam
+     * `g_jit_force_extra` next door already uses. */
+    const unsigned lsra_saved = g_jit_off_extra;
+    g_jit_off_extra |= jit_lever_bit("lsra");
     g_jit_force_extra |= jit_lever_bit("rshare");
     setenv("MYLANG_JIT_MAXPINS", "1", 1);
     bool ok = true;
@@ -28265,7 +28267,7 @@ static bool jit_share_region_clamp()
     }
     unsetenv("MYLANG_JIT_MAXPINS");
     g_jit_force_extra &= ~jit_lever_bit("rshare");
-    g_jit_lsra = lsra_saved;
+    g_jit_off_extra = lsra_saved;
     if (ok && g_jit_share_clamped <= c0) {
         printf("  share-clamp: the clamp never fired (counter flat "
                "at %lu) - the L+1 shape is not reaching it\n", c0);
@@ -28429,11 +28431,13 @@ static bool jit_lsra_bridge_check()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
-    const bool saved = g_jit_lsra;
-    g_jit_lsra = true;
+    /* #103 (A'): force the scan ON by CLEARING the lever - the
+     * lane may be running with MYLANG_JIT_OFF=lsra set. */
+    const unsigned saved = g_jit_off_extra;
+    g_jit_off_extra &= ~jit_lever_bit("lsra");
     struct Restore {
-        bool v;
-        ~Restore() { g_jit_lsra = v; }
+        unsigned v;
+        ~Restore() { g_jit_off_extra = v; }
     } restore{ saved };
     auto run = [](const std::vector<const char *> &lines) -> bool {
         std::string src;
@@ -28973,11 +28977,10 @@ static bool jit_peephole_check()
 
     /* The FOLD's reach needs an UNPINNED compare, and the allocator
      * pins every hot slot in the probe - so run it again with the
-     * pinning levers off (the documented g_jit_lsra=false convention
-     * for coverage tests + the cache lever family), which forces every
+     * pinning levers off (the cache lever family), which forces every
      * compare through cmp_operand's accumulator arm. Outputs must
      * still match the tree-walker's in all three configs. */
-    /* #103: it used to ALSO force `g_jit_lsra = false`.  The LEVER
+    /* #103: it used to ALSO force the legacy allocator.  The LEVER
      * family below is what this needs; the allocator choice is not,
      * and forcing it ran the check against a path no user takes. */
     const unsigned pins_off = jit_lever_bit("cache")
@@ -29218,11 +29221,14 @@ static bool jit_range_share_test()
 #if ML_JIT_SUPPORTED
     /* D3.b: pins the DEFAULT allocator's mechanism - see the note at
      * jit_xcache_pins. */
-    const bool lsra_saved = g_jit_lsra;
-    g_jit_lsra = false;
+    /* #103 (A'): the allocator choice is the JL_LSRA LEVER now,
+     * set through the same in-process seam every other lever's
+     * coverage test uses.  `g_jit_lsra` is deleted. */
+    const unsigned lsra_saved = g_jit_off_extra;
+    g_jit_off_extra |= jit_lever_bit("lsra");
     struct LsraRestore {
-        bool v;
-        ~LsraRestore() { g_jit_lsra = v; }
+        unsigned v;
+        ~LsraRestore() { g_jit_off_extra = v; }
     } lsra_restore{ lsra_saved };
     if (!g_jit_enabled)
         return true;
@@ -29496,11 +29502,14 @@ static bool jit_rax_pin_test()
 #if ML_JIT_SUPPORTED
     /* D3.b: pins the DEFAULT allocator's mechanism - see the note at
      * jit_xcache_pins. */
-    const bool lsra_saved = g_jit_lsra;
-    g_jit_lsra = false;
+    /* #103 (A'): the allocator choice is the JL_LSRA LEVER now,
+     * set through the same in-process seam every other lever's
+     * coverage test uses.  `g_jit_lsra` is deleted. */
+    const unsigned lsra_saved = g_jit_off_extra;
+    g_jit_off_extra |= jit_lever_bit("lsra");
     struct LsraRestore {
-        bool v;
-        ~LsraRestore() { g_jit_lsra = v; }
+        unsigned v;
+        ~LsraRestore() { g_jit_off_extra = v; }
     } lsra_restore{ lsra_saved };
     if (!g_jit_enabled)
         return true;
@@ -29953,11 +29962,14 @@ static bool jit_xcache_pins()
      * the crafted shape of the exact pressure it constructs. Force the
      * default for the test's duration (save/restore - the env-leak
      * trap). */
-    const bool lsra_saved = g_jit_lsra;
-    g_jit_lsra = false;
+    /* #103 (A'): the allocator choice is the JL_LSRA LEVER now,
+     * set through the same in-process seam every other lever's
+     * coverage test uses.  `g_jit_lsra` is deleted. */
+    const unsigned lsra_saved = g_jit_off_extra;
+    g_jit_off_extra |= jit_lever_bit("lsra");
     struct LsraRestore {
-        bool v;
-        ~LsraRestore() { g_jit_lsra = v; }
+        unsigned v;
+        ~LsraRestore() { g_jit_off_extra = v; }
     } lsra_restore{ lsra_saved };
 
     auto go = [&](const std::vector<const char *> &src, bool vm,
