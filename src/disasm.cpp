@@ -979,7 +979,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             o << j[o2 - 0x80] << " +" << std::dec << (int32_t(p) + d); }
         else if (o2 == 0x28) {         /* movaps (reg-reg fmov) */
             const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = c[p] & 7;
+            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
             modrm(regf, rm);
             o << "movaps xmm" << regf << ", ";
             if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
@@ -987,7 +987,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
                                         * merge-dependency break; always
                                         * reg-reg, dst == src) */
             const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = c[p] & 7;
+            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
             modrm(regf, rm);
             o << "xorps xmm" << regf << ", ";
             if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
@@ -997,7 +997,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
              * 89_regs_float_08's xmm-pinned fj; the 0x58 family below
              * had the fix, these three arms did not) */
             const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = c[p] & 7;
+            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
             modrm(regf, rm);
             const char *m = o2 == 0x51 ? "sqrtsd" : "movsd";
             if (o2 == 0x11) {           /* store direction: rm first */
@@ -1012,7 +1012,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             /* reg-reg form: the rm REGISTER is an XMM, not a GP (the generic
              * modrm would print `rcx` for xmm1) */
             const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = c[p] & 7;
+            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
             modrm(regf, rm);
             const char *m = o2==0x58?"addsd":o2==0x59?"mulsd":
                             o2==0x5C?"subsd":"divsd";
@@ -1027,7 +1027,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             o << "movq " << rm << ", xmm" << regf; }
         else if (o2 == 0x2E) {
             const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = c[p] & 7;
+            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
             modrm(regf, rm);
             o << "ucomisd xmm" << regf << ", ";
             if (reg_form) o << "xmm" << rm_xmm; else o << rm; }

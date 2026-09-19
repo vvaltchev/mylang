@@ -212,8 +212,8 @@ static void show_build_config()
      * are 0 and say so. */
 #if ML_JIT_SUPPORTED
     cout << "  jit_pins          " << jit_pin_budget()
-         << "        (int pin budget; xcache " << jit_xcache_width()
-         << " caller-saved)" << endl;
+         << "       (int pin budget; " << jit_xrot_width()
+         << " xrot rotations)" << endl;
 #else
     cout << "  jit_pins          0        (no native codegen)" << endl;
 #endif

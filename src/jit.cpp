@@ -1176,6 +1176,23 @@ enum RegCap : uint32_t {
      * reserved - they are in the model to be NAMED and refused, not to
      * be allocated. */
     CAP_ALLOCATABLE = 1u << 6,
+    /*
+     * #123: THE ABI's RETURN REGISTER. Every emitted helper call lands
+     * its value AND its status in rax, and `emit_call_epilogue` reads
+     * the status there (~60 `test eax, eax` sites). So a rax pin is
+     * not merely expensive like an ordinary caller-saved one - it
+     * CANNOT be spilled around the call, because the epilogue needs
+     * the register itself. `Emitter::rax_pin_conflict` evicts it and
+     * the whole chunk re-emits with rax denied.
+     *
+     * That is a real cost the weight model owed an entry: without it
+     * rax ranks second-cheapest in the whole file (caller-saved, no
+     * REX, not a SysV argument), so a run containing any helper call
+     * would pin it, hit the conflict and pay a wasted emission pass to
+     * arrive where it started. The hand-written pool order used to
+     * encode this by putting rax LAST; this is the fact it encoded.
+     */
+    CAP_ABI_RET     = 1u << 7,
 };
 
 /*
@@ -1207,6 +1224,7 @@ static constexpr uint32_t gp_caps(uint8_t r)
          | ((r == 3 || r == 5 || r >= 12) ? CAP_CALLEE_SAVED : 0u)
          | ((r == 7 || r == 6 || r == 2 || r == 1 || r == 8 || r == 9)
                 ? CAP_SYSV_ARG : 0u)
+         | (r == 0 ? CAP_ABI_RET : 0u)             /* rax */
          | ((GP_RESERVED_MASK & (1u << r)) ? 0u : CAP_ALLOCATABLE);
 }
 
@@ -1224,15 +1242,31 @@ static constexpr uint32_t gp_caps(uint8_t r)
  *       (emit_call_prologue/epilogue) rather than surviving free;
  *   +1  needs a REX prefix (r8-r15) - one byte per use, and I-cache is
  *       the one place the guard-elision family showed a real effect.
+ *   +6  the ABI RETURN register (rax) - see CAP_ABI_RET. The largest
+ *       term because it is the only one a spill cannot buy off: the
+ *       pin is EVICTED and the chunk re-emitted, so taking rax in a
+ *       run that calls anything costs an emission pass and yields
+ *       nothing. It sorts rax behind every SysV argument register,
+ *       which is where the hand-written order had put it.
  *
  * A callee-saved low register is therefore cheapest, which reproduces
  * today's hand-written preference (r12-r15 first) as an OUTPUT of the
- * model instead of an assumption baked into an array's order.
+ * model instead of an assumption baked into an array's order. The full
+ * order the model yields, cheapest first:
+ *
+ *     r12 r13 r14 r15 (1) | r10 r11 (3) | rcx rdx rsi rdi (6)
+ *                         | r8 r9 (7)   | rax (8)
+ *
+ * ⛔ IT IS A PREFERENCE, NOT A MEASUREMENT. The magnitudes are chosen
+ * to be explainable and stable; a future measurement may tune them.
+ * What must NOT happen is a caller re-deriving one of these facts as a
+ * hard-coded list - that is what #123 deleted.
  */
 static constexpr int gp_weight(uint8_t r)
 {
     return ((gp_caps(r) & CAP_SYSV_ARG) ? 4 : 0)
          + ((gp_caps(r) & CAP_CALLEE_SAVED) ? 0 : 2)
+         + ((gp_caps(r) & CAP_ABI_RET) ? 6 : 0)
          + (r >= 8 ? 1 : 0);
 }
 
@@ -1248,22 +1282,45 @@ static constexpr int gp_weight(uint8_t r)
  *    float-ABI sites (libm args/returns, helper float arg0) name
  *    xmm0/xmm1 LITERALLY under an abi tag - the ABI fixes those
  *    regardless of where the stage lives;
- *  - xmm8-15 need a REX prefix that the float encoders do not emit
- *    (fload/fstore/movsd_store_base encode 3-bit register fields) -
+ *  - xmm8-15 ARE ALLOCATABLE SINCE #123. They were excluded because
+ *    "they need a REX prefix that the float encoders do not emit -
  *    an encoding CAPABILITY fact, not policy; they join when the
- *    encoders do;
- *  - xmm4-7 are the C2a pin pool. All xmm registers are caller-saved
- *    (no callee-saved concept in the SysV float file), so there is no
- *    fp analog of the unsaved-callee-saved hazard.
+ *    encoders do". The encoders now do: `Emitter::sse_rex` is the one
+ *    place a float form's REX byte is built, every xmm-touching
+ *    encoder goes through it, and it emits the byte ONLY when it
+ *    carries a bit, so an xmm0-7 form is byte-identical to what it
+ *    was. `-vdj` decodes the extended forms (the rm operand of every
+ *    reg-reg SSE arm gained REX.B) and disasmcheck.py cross-checks
+ *    them against objdump;
+ *  - ALL xmm registers are caller-saved (there is no callee-saved
+ *    concept in the SysV float file), so there is no fp analog of the
+ *    unsaved-callee-saved hazard and no fp analog of CACHE_REGS vs
+ *    XCACHE_ORDER: one flat file, ordered by weight alone.
  */
 static constexpr bool fp_allocatable(uint8_t x)
 {
-    return x <= 7;
+    return x < 16;
 }
 static constexpr int fp_weight(uint8_t x)
 {
     return x >= 8 ? 1 : 0;               /* the REX byte, when legal */
 }
+/*
+ * #123: HOW MANY xmm A RUN MAY PIN - DERIVED, never a hand-written
+ * list. The float staging pair (grant_fstage, taken at run setup) holds
+ * two for the whole run, so the pin budget is the allocatable count
+ * minus those. The day fp_allocatable changes, this follows; that is
+ * the whole point of deleting FCACHE_REGS.
+ */
+static constexpr size_t fp_alloc_count()
+{
+    size_t n = 0;
+    for (uint8_t x = 0; x < 16; x++)
+        if (fp_allocatable(x))
+            n++;
+    return n;
+}
+static constexpr size_t FP_STAGE_RESERVED = 2;   /* fsa() + fsb() */
 
 /*
  * THE ALLOCATOR. `take` answers the maintainer's two-step question in
@@ -1281,6 +1338,40 @@ struct RegAlloc {
     uint32_t fbusy = 0;         /* bit x: xmm<x> is taken (C2 - the
                                  * float file; no fdenied yet, nothing
                                  * run-denies a float register) */
+    /*
+     * #123: THE REGISTER PLAN'S CLAIM - held for the WHOLE RUN, even
+     * where `busy` says the register is free.
+     *
+     * ⛔ `busy` WAS ANSWERING TWO DIFFERENT QUESTIONS AND ONE BIT
+     * CANNOT. Under TRANSITION mode it is a PER-PC fact - "a cache
+     * entry exists right here" - so the trans-mode binding gives a
+     * register back as soon as its abstract register has no ENTRY
+     * occupant, and each install `take_fixed`s it again at its own pc.
+     * A RUN-SCOPED consumer - the float literal pool, the #112 capture
+     * base - asks the same bit and reads that give-back as "free for
+     * the whole fragment".
+     *
+     * That shipped as a **45% Ir regression** on 05_mixed_arith: the
+     * plan installed slot `x` into xmm2 at its install pc while
+     * `pick_float_lits` held xmm2 for a literal. The literal's
+     * per-entry reload is emitted AFTER the cache loads, so it won,
+     * and `x` fell back to memory with a type dispatch four times per
+     * iteration. EVERY NET STAYED GREEN - the answers were right, only
+     * the speed collapsed - which is why this class needs the
+     * measurement and not a test.
+     *
+     * Two questions, two bits. `take`/`ftake` - an ordinary run-scoped
+     * ask - skips these; `take_fixed`/`ftake_fixed` - which IS the
+     * plan installing at its own pc - ignores them.
+     *
+     * The pre-#123 code was immune by ACCIDENT: FLIT_REGS = {2,3} and
+     * FCACHE_REGS = {4,5,6,7} were disjoint by construction, so the
+     * two consumers could not collide however confused the bookkeeping
+     * was. The same "a hand-partitioned resource has no conflict
+     * detection" lesson as the xmm2 clobber, on the GIVE-BACK path.
+     */
+    uint32_t planned = 0;       /* GP:  the plan owns it for the run  */
+    uint32_t fplanned = 0;      /* xmm: ditto                          */
 
     bool free_reg(uint8_t r) const
     { return !(busy & (1u << r)) && !(denied & (1u << r)); }
@@ -1305,8 +1396,36 @@ struct RegAlloc {
     int take(uint32_t need, uint32_t prefer = 0, uint32_t exclude = 0)
     {
         int best = -1, best_w = 0;
-        for (uint8_t r = 0; r < 16; r++) {
+        for (uint8_t i = 0; i < 16; i++) {
+            /*
+             * #123: MYLANG_JIT_XROT ROTATES THE SCAN, and this is where
+             * it lives now that there are no pool ARRAYS to rotate.
+             *
+             * The axis exists because an allocator with a fixed
+             * preference order hands its LAST candidate out only to a
+             * run at maximum pressure - which is how an unsafe r9 sat
+             * in the pool for a day, exercised by no net in the project
+             * (CLAUDE.md, "a pool ordered by preference hides its own
+             * tail"). Rotating the START of the scan changes which of
+             * several EQUALLY-WEIGHTED registers is met first, so the
+             * tail gets exercised while every rotation must still
+             * produce the same ANSWER - a pure differential axis.
+             *
+             * Strictly BETTER coverage than the array form it replaces:
+             * that rotated only the caller-saved GP pool, this reaches
+             * the whole file (and ftake below does the same for xmm).
+             * At the default rotation 0 the scan is r = 0..15 and the
+             * behaviour is identical to before.
+             */
+            const uint8_t r = static_cast<uint8_t>((i + g_jit_xrot) & 15);
             if ((gp_caps(r) & need) != need || !free_reg(r))
+                continue;
+            /* #123: a register the PLAN installs into at some pc is
+             * not available to a run-scoped ask, whatever `busy` says
+             * at the moment we are asked. `free_reg` deliberately does
+             * NOT test this - `take_fixed` is the plan's own install
+             * and must still be able to claim it. */
+            if (planned & (1u << r))
                 continue;
             /* `exclude` is a LOCAL reason this particular site cannot
              * use a register that is otherwise free and capable - it
@@ -1359,11 +1478,13 @@ struct RegAlloc {
     int ftake(uint32_t prefer = 0, uint32_t exclude = 0)
     {
         int best = -1, best_w = 0;
-        for (uint8_t x = 0; x < 16; x++) {
+        for (uint8_t i = 0; i < 16; i++) {
+            const uint8_t x =            /* #123: rotated, see take() */
+                static_cast<uint8_t>((i + g_jit_xrot) & 15);
             if (!fp_allocatable(x))
                 continue;
-            if ((fbusy | exclude) & (1u << x))
-                continue;
+            if ((fbusy | fplanned | exclude) & (1u << x))
+                continue;   /* #123: fplanned - see the mask's note */
             const int w = fp_weight(x)
                         - ((prefer & (1u << x)) ? 8 : 0);
             if (best < 0 || w < best_w) { best = x; best_w = w; }
@@ -1465,10 +1586,11 @@ struct Emitter {
      * THE ALLOCATOR'S REGISTER STATE (the real allocator, step 2).
      *
      * `cache` says which slot is in which register. What it does NOT say
-     * is which registers are AVAILABLE - because today nothing needs to
-     * ask: the pick is zipped positionally onto CACHE_REGS
-     * (`hot[h] -> CACHE_REGS[h]`) once per run and never changes, so
-     * "free" is just "index past hot.size()".
+     * is which registers are AVAILABLE - which, when this was written,
+     * nothing needed to ask: the pick was zipped positionally onto a
+     * hand-written array (`hot[h] -> CACHE_REGS[h]`) once per run and
+     * never changed, so "free" was just "index past hot.size()".
+     * #123 deleted that array; `busy`/`denied` below are the answer.
      *
      * That zip is exactly what a real allocator replaces. The moment a
      * register can be handed out mid-fragment, given up at a live
@@ -1485,7 +1607,7 @@ struct Emitter {
     /*
      * #96 (c): the OCCUPANCY is now the shared RegAlloc's, so the
      * capability-driven `ra.take(caps)` and the positional
-     * `take_reg(pool)` cannot disagree about what is free. The POLICY
+     * a pin ask cannot disagree about what is free. The POLICY
      * is deliberately still positional here - switching a site from
      * the pool scan to the cost model CHANGES which register it gets,
      * so that happens per call site, each one measurable, rather than
@@ -1839,24 +1961,10 @@ struct Emitter {
         BorrowSuspend &operator=(const BorrowSuspend &) = delete;
     };
 
-    int take_reg(const uint8_t *pool, size_t n)
-    {
-        for (size_t i = 0; i < n; i++)
-            if (ra.take_fixed(pool[i]))
-                return pool[i];
-        return -1;                       /* pressure: the caller spills */
-    }
     void give_reg(uint8_t r) { ra.give(r); }
     /* C2: the float twins - the pin pool scan and the ordinary ask.
      * The occupancy they write is what check_pins_are_busy verifies
      * against fcache, so the two records cannot drift. */
-    int ftake_reg(const uint8_t *pool, size_t n)
-    {
-        for (size_t i = 0; i < n; i++)
-            if (ra.ftake_fixed(pool[i]))
-                return pool[i];
-        return -1;
-    }
     int alloc_fscratch(uint32_t prefer = 0, uint32_t exclude = 0)
     {
         check_pins_are_busy();
@@ -3545,21 +3653,47 @@ struct Emitter {
         exit_states.clear();
     }
 
-    /* ---- N3 SSE float ---- (xmm0=a/acc, xmm1=b; r8 = t_float) */
+    /* ---- N3 SSE float ---- */
+    /*
+     * #123: THE REX BYTE FOR AN SSE FORM. `reg` is the modrm.reg
+     * operand (REX.R), `rm` the modrm.rm one (REX.B) - a second xmm in
+     * a reg-reg form, or a GP base in a memory one. `w` is REX.W where
+     * the operand SIZE is being selected (cvtsi2sd's 64-bit source).
+     *
+     * ⛔ EMITTED ONLY WHEN IT CARRIES A BIT. REX is a real byte, not a
+     * free annotation: emitting a bare 0x40 for xmm0-7 would grow every
+     * float instruction in the corpus by one byte for nothing, and
+     * I-cache is the one place the guard-elision family showed a real
+     * effect. So a low-register form stays byte-identical to what it
+     * was before xmm8-15 became reachable.
+     *
+     * This is what jit.cpp's own fp_allocatable comment promised: the
+     * xmm8-15 exclusion was "an encoding CAPABILITY fact, not policy;
+     * they join when the encoders do". These are the encoders.
+     */
+    void sse_rex(uint8_t reg, uint8_t rm, bool w = false)
+    {
+        const uint8_t rex = static_cast<uint8_t>(
+            0x40 | (w ? 8 : 0) | (reg >= 8 ? 4 : 0) | (rm >= 8 ? 1 : 0));
+        if (rex != 0x40)
+            u8(rex);
+    }
     /* movsd xmm<r>, [rbx+disp] */
     void fload(uint8_t r, int32_t d)
     {
         fwrote(r);
         slot_mem_check(d, false);
-        u8(0xF2); u8(0x0F); u8(0x10);
-        u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
+        u8(0xF2); sse_rex(r, REG_SLOTS_BASE); u8(0x0F); u8(0x10);
+        u8(static_cast<uint8_t>(MODRM_SLOT | ((r & 7) << 3)));
+        u32(uint32_t(d));
     }
     /* movsd [rbx+disp], xmm<r> */
     void fstore(uint8_t r, int32_t d)
     {
         slot_mem_check(d, true);
-        u8(0xF2); u8(0x0F); u8(0x11);
-        u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
+        u8(0xF2); sse_rex(r, REG_SLOTS_BASE); u8(0x0F); u8(0x11);
+        u8(static_cast<uint8_t>(MODRM_SLOT | ((r & 7) << 3)));
+        u32(uint32_t(d));
     }
     /* addsd/subsd/mulsd xmm0, xmm1 (op = 0x58/0x5C/0x59) */
     /* addsd/subsd/mulsd/divsd xmm<dst>, xmm<src> (op = 0x58/0x5C/0x59/
@@ -3575,8 +3709,8 @@ struct Emitter {
      * then in xmm1, the next op's forwarded operand lives there, and
      * the two alternate. Both < 8 (no REX): the pools are xmm0-xmm7. */
     void farith(uint8_t op, uint8_t dst = 0, uint8_t src = 1)
-    { fwrote(dst); u8(0xF2); u8(0x0F); u8(op);
-      u8(static_cast<uint8_t>(0xC0 | (dst << 3) | src)); }
+    { fwrote(dst); u8(0xF2); sse_rex(dst, src); u8(0x0F); u8(op);
+      u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7))); }
 #ifdef TESTS
     /* the strength reduction's execution proof - bumped by the EMITTED
      * sequence, since the VALUES are identical to idiv's and nothing
@@ -3628,12 +3762,12 @@ struct Emitter {
      * rename stage eliminates it. The upper half is dead everywhere
      * here - every consumer is a scalar sd op. */
     void fmov_rr(uint8_t dst, uint8_t src)
-    { fwrote(dst); u8(0x0F); u8(0x28);
-      u8(static_cast<uint8_t>(0xC0 | (dst << 3) | src)); }
+    { fwrote(dst); sse_rex(dst, src); u8(0x0F); u8(0x28);
+      u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7))); }
     /* sqrtsd xmm<d>, xmm<s>  (SSE2) */
     void sqrtsd(uint8_t d, uint8_t s)
-    { fwrote(d); u8(0xF2); u8(0x0F); u8(0x51);
-      u8(static_cast<uint8_t>(0xC0 | (d << 3) | s)); }
+    { fwrote(d); u8(0xF2); sse_rex(d, s); u8(0x0F); u8(0x51);
+      u8(static_cast<uint8_t>(0xC0 | ((d & 7) << 3) | (s & 7))); }
     /* push/pop a GP reg (0x50+r / 0x58+r; REX.B for r8..r15) */
     void push_reg(uint8_t r)
     {
@@ -3683,8 +3817,8 @@ struct Emitter {
     void xorps_self(uint8_t r)
     {
         fwrote(r);
-        if (r >= 8)
-            u8(0x45);
+        sse_rex(r, r);               /* #123: 0x45 for xmm8-15 - R|B,
+                                      * since dst and src are the same */
         u8(0x0F); u8(0x57);
         u8(static_cast<uint8_t>(0xC0 | ((r & 7) << 3) | (r & 7)));
     }
@@ -3699,8 +3833,11 @@ struct Emitter {
         }
         fwrote(r);
         slot_mem_check(d, false);
-        u8(0xF2); u8(0x48); u8(0x0F); u8(0x2A);
-        u8(static_cast<uint8_t>(MODRM_SLOT | (r << 3))); u32(uint32_t(d));
+        /* REX.W is LOAD-BEARING - it selects the 64-bit integer
+         * SOURCE; sse_rex carries it plus REX.R for xmm8-15. */
+        u8(0xF2); sse_rex(r, REG_SLOTS_BASE, true); u8(0x0F); u8(0x2A);
+        u8(static_cast<uint8_t>(MODRM_SLOT | ((r & 7) << 3)));
+        u32(uint32_t(d));
     }
     /* movq xmm<r>, rax  (double bits GP -> xmm) */
     void movq_xmm(uint8_t r) { movq_xmm_from(r, 0 /*rax*/); }
@@ -3709,14 +3846,16 @@ struct Emitter {
     void movq_xmm_from(uint8_t r, uint8_t gp)
     {
         fwrote(r);
-        u8(0x66); u8(0x48); u8(0x0F); u8(0x6E);
-        u8(static_cast<uint8_t>(0xC0 | (r << 3) | gp));
+        /* REX.W selects the 64-bit GP source; .R/.B extend the xmm
+         * and the GP. */
+        u8(0x66); sse_rex(r, gp, true); u8(0x0F); u8(0x6E);
+        u8(static_cast<uint8_t>(0xC0 | ((r & 7) << 3) | (gp & 7)));
     }
     /* ucomisd xmm<d>, xmm<s> */
     void ucomisd(uint8_t d, uint8_t s)
     {
-        u8(0x66); u8(0x0F); u8(0x2E);
-        u8(static_cast<uint8_t>(0xC0 | (d << 3) | s));
+        u8(0x66); sse_rex(d, s); u8(0x0F); u8(0x2E);
+        u8(static_cast<uint8_t>(0xC0 | ((d & 7) << 3) | (s & 7)));
     }
     /* mov rax, [rbx+disp]  (a slot's type ptr) */
     void load_type(int32_t d)
@@ -6737,7 +6876,8 @@ static void jit_put_bool(LValue *lv, int_type v) noexcept
 /*
  * #96: SysV's callee-saved set. A pin in one of these survives a helper
  * call for free; a pin in anything else must be spilled around one - see
- * XCACHE_ORDER and emit_call_prologue/epilogue below.
+ * emit_call_prologue/epilogue below. That difference is what
+ * `gp_weight`'s caller-saved term prices.
  */
 static ML_ALWAYS_INLINE bool jit_reg_is_callee_saved(uint8_t r)
 {
@@ -6777,8 +6917,8 @@ static void emit_call_prologue(Emitter &e)
             e.fstore(c.reg, c.payload);
     }
     /*
-     * #96: and the GP pins that are CALLER-saved (XCACHE_ORDER),
-     * for the same reason and to the same place: the slot's PAYLOAD. The
+     * #96: and the GP pins that are CALLER-saved, for the same reason
+     * and to the same place: the slot's PAYLOAD. The
      * type word is left alone exactly as the float pins leave theirs - a
      * pinned slot is never memory-read by any op in the run (the bad()
      * rules), and an exceptional exit reloads here and then flushes type
@@ -10848,12 +10988,49 @@ void jit_cache_audit_report()
                 jit_op_name(static_cast<OpCode>(pr.second)), pr.first);
 }
 
-/* How many hot slots a fragment may pin: one per available CALLEE-SAVED
- * register (r12-r15). They survive a helper call for free, so the pool
- * costs one push/pop per fragment ENTRY instead of one per CALL - which
- * is what let it grow from two registers to four at the same time. */
-static const uint8_t CACHE_REGS[] = { 12, 13, 14, 15 };
-static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
+/*
+ * #123: THE PIN POOL IS THE REGISTER FILE. `CACHE_REGS[] = {12,13,14,15}`
+ * used to sit here and cap every fragment at four pins; the caller-saved
+ * `XCACHE_ORDER` below extended it by hand. Both are DELETED - a pin now
+ * asks `ra.take(CAP_ALLOCATABLE)` like any other consumer and gets the
+ * cheapest register `gp_weight` allows, which reproduces "callee-saved
+ * first" as an OUTPUT of the model.
+ *
+ * The two masks below are what the arrays were FOR, derived: they answer
+ * "which registers is a pin allowed to live in" (all allocatable ones)
+ * and "which of those does a helper call destroy" (the caller-saved
+ * half, the set emit_call_prologue spills and the epilogue reloads).
+ */
+static constexpr uint32_t gp_pool_mask()
+{
+    uint32_t m = 0;
+    for (uint8_t r = 0; r < 16; r++)
+        if (gp_caps(r) & CAP_ALLOCATABLE)
+            m |= 1u << r;
+    return m;
+}
+
+/* the CALLER-saved half of the pool - a pin here is spilled around each
+ * helper call, and is destroyed outright by an emitter that uses raw
+ * scratch outside that bracket (see jit_run_blocks_xcache). */
+static constexpr uint32_t gp_volatile_pool_mask()
+{
+    uint32_t m = 0;
+    for (uint8_t r = 0; r < 16; r++)
+        if ((gp_caps(r) & CAP_ALLOCATABLE)
+                && !(gp_caps(r) & CAP_CALLEE_SAVED))
+            m |= 1u << r;
+    return m;
+}
+
+static constexpr size_t gp_pool_count()
+{
+    size_t n = 0;
+    for (uint8_t r = 0; r < 16; r++)
+        if (gp_caps(r) & CAP_ALLOCATABLE)
+            n++;
+    return n;
+}
 
 /*
  * #96: THE CALLER-SAVED EXTENSION - the first registers the JIT uses
@@ -10980,7 +11157,7 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  *   the two accessor bodies + the enum line - definitions, not uses.
  *
  * Unlike rsi/r8 it carries no type singleton, so it contributes nothing
- * to jit_xcache_clobber. It is placed LAST because take_reg scans in
+ * to jit_xcache_clobber. It was placed LAST because the pool scan ran in
  * order and the tail member is the least exercised - MYLANG_JIT_XROT
  * now sweeps FOUR rotations, which is the net that would have caught r9
  * in seconds.
@@ -11017,7 +11194,7 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  *     feed store_dst - dead code since the tag became an imm32, and a
  *     pin clobber. Gated.
  *
- * PLACED LAST for the same reason rdi was: take_reg scans in order, so
+ * PLACED LAST for the same reason rdi was: the pool scan ran in order, so
  * the tail is the least-exercised slot, and MYLANG_JIT_XROT now sweeps
  * FIVE rotations to give it first-choice traffic.
  */
@@ -11068,7 +11245,7 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * what made the disagreement legible, which is the argument for the
  * seam in one line.
  *
- * PLACED LAST, as rdi and rsi were: take_reg scans in order, so the
+ * PLACED LAST, as rdi and rsi were: the pool scan ran in order, so the
  * tail is the least-exercised slot, and MYLANG_JIT_XROT now sweeps SIX
  * rotations - the net that would have caught the original r9 bug in
  * seconds.
@@ -11101,7 +11278,7 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * where an eleventh pin pays: 83_regs_int_40 and its siblings have
  * more hot int locals than registers.
  *
- * PLACED LAST, as every admission has been: take_reg scans in order,
+ * PLACED LAST, as every admission has been: the pool scan ran in order,
  * so the tail is the least-exercised slot, and MYLANG_JIT_XROT now
  * sweeps SEVEN rotations.
  */
@@ -11129,16 +11306,23 @@ static const size_t MAX_CACHED = sizeof(CACHE_REGS) / sizeof(CACHE_REGS[0]);
  * PLACED LAST, as every admission has been; MYLANG_JIT_XROT sweeps
  * EIGHT rotations.
  */
-static const uint8_t XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2, 1, 0 };
-static const size_t MAX_XCACHED =
-    sizeof(XCACHE_ORDER) / sizeof(XCACHE_ORDER[0]);
+/*
+ * #123: `XCACHE_ORDER[] = { 10, 11, 8, 7, 6, 9, 2, 1, 0 }` USED TO SIT
+ * HERE, and the admission notes above are its history - one per
+ * register, each recording the audit that made that register safe to
+ * hold a value in. Those facts are still true and still worth reading;
+ * what is gone is the hand-written ORDER, which duplicated (and, for
+ * rax, contradicted) `gp_weight`. Every register in the mask below is
+ * one of the admissions above; the preference between them is the
+ * model's.
+ */
 
 /*
  * ⛔ MYLANG_JIT_XROT=N - ROTATE the pool so member N is handed out
  * FIRST. This exists because of lesson 2 above, and it is the net that
  * would have caught the r9 bug in seconds instead of a day.
  *
- * take_reg scans this array in order, so the LAST member is reached
+ * the pool scan ran over this array in order, so its LAST member was reached
  * only by a run with the maximum number of pins. Every test net in the
  * project - -rt, the four differentials, corpus_diff, the fuzzers -
  * therefore exercises the FIRST member heavily and the last one almost
@@ -11170,7 +11354,14 @@ unsigned g_jit_xrot = []() -> unsigned {
     return s ? static_cast<unsigned>(atoi(s)) : 0u;
 }();
 
-size_t jit_xcache_width() { return MAX_XCACHED; }
+/*
+ * #123: how many MYLANG_JIT_XROT rotations a coverage sweep must
+ * cover. It used to be the caller-saved ARRAY's length, because the
+ * rotation permuted that array; the rotation now moves the start of
+ * `RegAlloc::take`'s scan over the whole 16-register file, so the
+ * period is 16 - and the float file is swept by the same knob.
+ */
+size_t jit_xrot_width() { return 16; }
 
 /* #96 inc-1: how many hot slots past the register budget may be homed
  * in native-stack spill slots. Stack is cheap; the cap exists so a
@@ -11415,26 +11606,11 @@ static void jit_share_plan(const Chunk &ck, size_t begin, size_t end,
 }
 size_t jit_spill_budget() { return MAX_SPILL_HOMES; }
 
-static const uint8_t *xcache_regs()
-{
-    static uint8_t order[MAX_XCACHED];
-    static unsigned cached = ~0u;
-    if (cached != g_jit_xrot) {
-        cached = g_jit_xrot;
-        for (size_t i = 0; i < MAX_XCACHED; i++)
-            order[i] = XCACHE_ORDER[(i + g_jit_xrot) % MAX_XCACHED];
-    }
-    return order;
-}
-
-/* every member of the caller-saved pin pool, as a bit mask */
-static uint32_t xcache_mask()
-{
-    uint32_t m = 0;
-    for (size_t i = 0; i < MAX_XCACHED; i++)
-        m |= 1u << XCACHE_ORDER[i];
-    return m;
-}
+/* every CALLER-saved member of the pin pool, as a bit mask. #123: the
+ * rotation that used to be applied here lives in RegAlloc::take, so
+ * this is rotation-INDEPENDENT - which is what the reservation below
+ * requires (every MYLANG_JIT_XROT value must produce the same code). */
+static constexpr uint32_t xcache_mask() { return gp_volatile_pool_mask(); }
 
 /* B2c: run_may_pin_rdx - the last per-register whitelist - is
  * DELETED. rdx is optimistic; the raw writers (the div arms,
@@ -11477,7 +11653,7 @@ static uint32_t g_jit_pins_denied = 0;
  * it silently stopped doing so the moment r9 widened the pool - the
  * improvement ate the test's shape. Deriving the count removes that
  * whole failure mode. */
-size_t jit_pin_budget() { return MAX_CACHED + MAX_XCACHED; }
+size_t jit_pin_budget() { return gp_pool_count(); }
 
 #ifdef TESTS
 /*
@@ -11593,47 +11769,76 @@ static bool reg_model_check(std::string &err)
                     err = buf; return false;
                 }
     }
-    /* THE POOL INVARIANTS. A pin lives for the whole fragment, so a
-     * callee-saved pool member must actually be callee-saved and a
-     * caller-saved one must not be - the two are spilled by different
-     * machinery (frag_entry vs emit_call_prologue), so a
-     * misclassification silently skips one of them. */
-    for (size_t i = 0; i < MAX_CACHED; i++) {
-        const uint8_t r = CACHE_REGS[i];
-        if (!(gp_caps(r) & CAP_CALLEE_SAVED) ||
-            !(gp_caps(r) & CAP_ALLOCATABLE)) {
+    /*
+     * THE POOL INVARIANTS. #123 deleted the two ARRAYS these used to
+     * check; the facts they encoded became properties of the WEIGHT
+     * MODEL, so this is where they are now asserted instead.
+     *
+     * ⛔ THE FIRST ONE IS THE LOAD-BEARING ONE AND IT USED TO BE
+     * STRUCTURAL. A pin asked `take_reg(CACHE_REGS)` before
+     * `take_reg(xcache_regs())`, so "a pin fills the callee-saved
+     * registers first" could not be violated - it was two calls in an
+     * order. It is now a consequence of `gp_weight`, i.e. of four
+     * integers, and a future tuning of those integers could silently
+     * invert it: a fragment would start pinning caller-saved registers
+     * while callee-saved ones sat free, paying a spill and a reload at
+     * every call site for nothing. So the ordering is a TEST.
+     */
+    {
+        int worst_cs = -1, best_vol = 1 << 30;
+        for (uint8_t r = 0; r < 16; r++) {
+            if (!(gp_caps(r) & CAP_ALLOCATABLE))
+                continue;
+            if (gp_caps(r) & CAP_CALLEE_SAVED)
+                worst_cs = std::max(worst_cs, gp_weight(r));
+            else
+                best_vol = std::min(best_vol, gp_weight(r));
+        }
+        if (worst_cs < 0 || best_vol == (1 << 30)) {
+            err = "the GP pool has no callee-saved or no caller-saved "
+                  "member - the spill machinery below assumes both";
+            return false;
+        }
+        if (worst_cs >= best_vol) {
             snprintf(buf, sizeof(buf),
-                     "CACHE_REGS[%zu] = reg %u is not an allocatable "
-                     "callee-saved register", i, r);
+                     "gp_weight ranks a CALLER-saved register (%d) at "
+                     "least as cheap as a CALLEE-saved one (%d): a pin "
+                     "would take a register it must spill around every "
+                     "call while a free one survives for nothing",
+                     best_vol, worst_cs);
             err = buf; return false;
         }
     }
-    for (size_t i = 0; i < MAX_XCACHED; i++) {
-        const uint8_t r = XCACHE_ORDER[i];
-        if ((gp_caps(r) & CAP_CALLEE_SAVED) ||
-            !(gp_caps(r) & CAP_ALLOCATABLE)) {
+    /* the pool and the structurally reserved set are disjoint, and the
+     * caller-saved half is a subset of the pool holding no callee-saved
+     * member (the two halves are spilled by DIFFERENT machinery -
+     * frag_entry vs emit_call_prologue - so a misclassification
+     * silently skips one of them). */
+    if (gp_pool_mask() & GP_RESERVED_MASK) {
+        err = "a structurally reserved register is in the GP pin pool";
+        return false;
+    }
+    if (gp_volatile_pool_mask() & ~gp_pool_mask()) {
+        err = "the caller-saved pin pool is not a subset of the pool";
+        return false;
+    }
+    for (uint8_t r = 0; r < 16; r++)
+        if ((gp_volatile_pool_mask() & (1u << r))
+                && (gp_caps(r) & CAP_CALLEE_SAVED)) {
             snprintf(buf, sizeof(buf),
-                     "XCACHE_ORDER[%zu] = reg %u is not an allocatable "
-                     "caller-saved register", i, r);
+                     "reg %u is in the CALLER-saved pool and is "
+                     "callee-saved", r);
             err = buf; return false;
         }
-    }
-    /* no pool may contain a structurally reserved register */
-    for (uint8_t r = 0; r < 16; r++) {
-        if (!(GP_RESERVED_MASK & (1u << r)))
-            continue;
-        for (size_t i = 0; i < MAX_CACHED; i++)
-            if (CACHE_REGS[i] == r) {
-                snprintf(buf, sizeof(buf),
-                         "reserved reg %u is in CACHE_REGS", r);
-                err = buf; return false;
-            }
-        for (size_t i = 0; i < MAX_XCACHED; i++)
-            if (XCACHE_ORDER[i] == r) {
-                snprintf(buf, sizeof(buf),
-                         "reserved reg %u is in XCACHE_ORDER", r);
-                err = buf; return false;
-            }
+    {
+        size_t n = 0;
+        for (uint8_t r = 0; r < 16; r++)
+            if (gp_pool_mask() & (1u << r))
+                n++;
+        if (n != gp_pool_count()) {
+            err = "gp_pool_count() disagrees with gp_pool_mask()";
+            return false;
+        }
     }
     /* THE ALLOCATOR'S CONTRACT. take() must never hand back a register
      * lacking a requested capability, however cheap it looks. */
@@ -11693,8 +11898,9 @@ static bool reg_model_check(std::string &err)
     }
     /* THE WEIGHT MODEL must reproduce today's hand-written preference:
      * the cheapest allocatable GP register is callee-saved (it survives
-     * a call for free), which is why CACHE_REGS is spent before
-     * XCACHE_ORDER. If this ever flips, the pools' ORDER is a lie. */
+     * a call for free), which is why the callee-saved half is spent
+     * first. #123 made that a consequence of gp_weight rather than of
+     * two arrays, and the ordering check above is what holds it. */
     {
         RegAlloc a;
         const int first = a.take(CAP_ALLOCATABLE);
@@ -11713,12 +11919,15 @@ static bool reg_model_check(std::string &err)
 bool jit_reg_model_check(std::string &err) { return reg_model_check(err); }
 #endif /* TESTS */
 
-static const uint8_t FCACHE_REGS[] = { 4, 5, 6, 7 };
-static const size_t MAX_FCACHED =
-    sizeof(FCACHE_REGS) / sizeof(FCACHE_REGS[0]);
+/* #123: the float pin budget, DERIVED from the register model - the
+ * hand-written FCACHE_REGS[] = {4,5,6,7} that used to sit here capped
+ * every float fragment at FOUR of sixteen registers for no stated
+ * reason (xmm4-7 are also SysV ARGUMENT registers, so by fp_weight's
+ * own logic they were not even the best four). */
+static const size_t MAX_FCACHED = fp_alloc_count() - FP_STAGE_RESERVED;
 
 /*
- * #96: may this RUN spend the caller-saved extension (XCACHE_ORDER)?
+ * #96: may this RUN spend the CALLER-saved half of the pin pool?
  *
  * Not if it emits a MyLang CALL. `emit_sync_push_native` builds the call
  * RECORD with r10/r11 as raw scratch - it is not calling a helper, so it
@@ -11870,11 +12079,11 @@ static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
     return clob;
 }
 
-/* N5: pick up to MAX_CACHED hot INT-scalar slots to pin for a run.
+/* N5: pick up to `max_pins` hot INT-scalar slots to pin for a run.
  * A slot qualifies iff it is a RESOLVED LOCAL (< slot_count) and EVERY use
  * in [begin,end) is an int-scalar read/write (the int-arith / loop ops);
  * any float / array / member touch DISQUALIFIES it. Ranked by use count
- * (>= 3), the top MAX_CACHED chosen.
+ * (>= 3), the top `max_pins` chosen.
  *
  * TEMPS (>= slot_count) are EXCLUDED: a temp is scratch the VM REUSES for
  * different roles across run boundaries - an int scratch inside one JIT
@@ -12510,9 +12719,9 @@ static std::vector<int>
 pick_cached_slots(const Chunk &ck, size_t begin,
                   size_t end, int slot_count,
                   /* #96: how many int pins this FRAGMENT can afford -
-                   * MAX_CACHED, plus the caller-saved extension when
+                   * the callee-saved half, plus the caller-saved one when
                    * the C1 hoist does not own r10/r11. Was hardcoded to
-                   * MAX_CACHED, which is a property of the POOL, not of
+                   * a fixed count, which is a property of the POOL, not of
                    * the pick. */
                   size_t max_pins,
                   std::vector<char> *barrier = nullptr,
@@ -14028,11 +14237,29 @@ static bool op_calls_on_hot_path(const Instr &in)
  * a real trade (the C2b pattern) is a later step if it measures worth
  * it. Ranked by weighted use, capped at FLIT_REGS.
  */
-static const uint8_t FLIT_REGS[] = { 2, 3 };
-static const size_t MAX_FLITS = sizeof FLIT_REGS / sizeof FLIT_REGS[0];
-
+/*
+ * #123: THE POOL ASKS THE ALLOCATOR. This used to be
+ * `FLIT_REGS[] = { 2, 3 }` - the THIRD hand-written partition of the
+ * float file, alongside the staging pair (xmm0/xmm1) and the pin pool
+ * (xmm4-7), with xmm8-15 unreachable behind the encoder gap. The three
+ * sets were disjoint BY CONSTRUCTION, which is exactly why nothing ever
+ * noticed they were not coordinated: make the pins allocator-chosen and
+ * they land on xmm2 while a literal is still living there.
+ *
+ * WATCHED, and it is what a hand-partitioned file fails like:
+ *
+ *     +28:  movq   xmm2, rcx      <- the literal 2.5
+ *     +61:  movsd  xmm3, b        <- a PIN overwrites the literal
+ *     +116: mulsd  xmm0, xmm2     <- reads the clobbered register
+ *
+ * `a = a + b * c` then printed 0.0 instead of 25625.0. The registers
+ * are claimed through `ra.ftake()` now, so the claim is recorded in
+ * `fbusy` and no second consumer can be handed the same register. The
+ * COUNT follows from what is free rather than from the array's length:
+ * a run that pins fewer slots gets more literals.
+ */
 static std::vector<Emitter::FLit>
-pick_float_lits(const Chunk &chunk, size_t begin, size_t end)
+pick_float_lits(Emitter &e, const Chunk &chunk, size_t begin, size_t end)
 {
     /*
      * EVERYTHING here is scoped to LOOP BODIES, and that is the whole
@@ -14100,10 +14327,14 @@ pick_float_lits(const Chunk &chunk, size_t begin, size_t end)
                          return a.second > b.second;
                      });
     std::vector<Emitter::FLit> out;
-    for (size_t i = 0; i < w.size() && i < MAX_FLITS; i++) {
+    for (size_t i = 0; i < w.size(); i++) {
         if (w[i].second < 2)
             break;                     /* a single a-use is a wash */
-        out.push_back({ w[i].first, FLIT_REGS[i] });
+        const int r = e.ra.ftake();
+        if (r < 0)
+            break;                     /* the file is full: the rest of
+                                        * the literals stay inline */
+        out.push_back({ w[i].first, static_cast<uint8_t>(r) });
     }
     return out;
 }
@@ -15054,14 +15285,15 @@ static ElemRoleSig op_elem_role_sig(OpCode op)
  * (r9 today, and the callee-saved four are not candidates at all) or
  * something already clobbered it.
  *
- * Withholding walks XCACHE_ORDER BACKWARDS: `take_reg` scans it
- * forwards, so the tail member is handed out only to a run at the
- * maximum pin count and is the cheapest one to give back. (Note it is
- * the UNROTATED order - MYLANG_JIT_XROT permutes who is handed out
- * first for coverage, and letting it also permute which register is
- * reserved would make the rotation change emitted code, which is
- * exactly what that axis must not do: every rotation must produce the
- * same output.)
+ * Withholding takes the EXPENSIVE end of the pool first: a pin asks
+ * `ra.take`, which returns the cheapest register `gp_weight` allows, so
+ * the dearest one is handed out only to a run at the maximum pin count
+ * and is the cheapest to give back. (#123: this consults preference
+ * LISTS and the weight model, never a rotated order - MYLANG_JIT_XROT
+ * permutes who is met first for coverage, and letting it also permute
+ * which register is reserved would make the rotation change emitted
+ * code, which is exactly what that axis must not do: every rotation
+ * must produce the same output.)
  */
 static const uint8_t ELEM_NO_REG = 0xFF;
 
@@ -15105,7 +15337,7 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
      * only ADDS to what the plan finds free.
      *
      * ROTATION-INDEPENDENT by construction - it consults preference
-     * lists, never XCACHE_ORDER - so every MYLANG_JIT_XROT value
+     * lists, never a rotated order - so every MYLANG_JIT_XROT value
      * reserves identically, which that axis requires (every rotation
      * must produce the same program output; a rotation-dependent
      * reservation withheld r8 at two rotations and cost the xcache
@@ -23648,13 +23880,13 @@ retry_emission:
         g_cur_argfuse = nullptr;
         g_cur_argfuse_skip = nullptr;
 
-        /* N5: pin up to MAX_CACHED hot int slots for this run. The PICK
+        /* N5: pin up to `max_pins` hot int slots for this run. The PICK
          * runs BEFORE the entry is emitted, because it decides which
          * callee-saved registers this fragment takes over and therefore
          * what frag_entry must push (and what every exit must pop). */
         e.cache.clear();
         /* #96: every register some part of this run has CLAIMED starts
-         * BUSY, so take_reg cannot hand it to a pin - a type singleton
+         * BUSY, so `ra.take` cannot hand it to a pin - a type singleton
          * still in a register (step 3), r10/r11 under a C1 hoist
          * region, the whole pool in a run that emits a MyLang call.
          * ONE mask, so the budget above and the assignment below cannot
@@ -23727,8 +23959,8 @@ retry_emission:
          * has CLAIMED - see jit_xcache_clobber, which is the single
          * place that answers that and states each claim's reason.
          * Decided HERE because it is a property of the fragment, not of
-         * the pool - which is why the pick can no longer read MAX_CACHED
-         * for itself.
+         * the pool - which is why the pick is passed a budget rather
+         * than reading a pool size for itself.
          */
         /* B1: the type-singleton HOLDER GRANTS, decided before the
          * budget so the pool count, the pick, the element-tier
@@ -23739,11 +23971,18 @@ retry_emission:
         const uint32_t xclob =
             jit_xcache_clobber(chunk, begin, end, !hregs.empty(),
                                tagres);
-        size_t n_xcache = 0;
-        for (size_t i = 0; i < MAX_XCACHED; i++)
-            if (!((xclob | tagres) & (1u << XCACHE_ORDER[i])))
-                n_xcache++;
-        size_t max_pins = MAX_CACHED + n_xcache;
+        /* #123: the budget is simply HOW MANY REGISTERS ARE LEFT -
+         * every allocatable one this run has not denied (xclob) and
+         * nothing has claimed (tagres). It used to be
+         * `MAX_CACHED + n_xcache`, i.e. "the four callee-saved always,
+         * plus whichever of the nine hand-listed caller-saved ones
+         * survive", which said the same thing in terms of two arrays
+         * that no longer exist. */
+        size_t max_pins = 0;
+        for (uint8_t r = 0; r < 16; r++)
+            if ((gp_pool_mask() & (1u << r))
+                    && !((xclob | tagres) & (1u << r)))
+                max_pins++;
         /*
          * ⛔ MYLANG_JIT_MAXPINS=N - CAP THE PIN BUDGET, so "what is a
          * pin actually WORTH here?" is a measurement instead of an
@@ -24062,7 +24301,7 @@ retry_emission:
              * float slot's idle prefix is not a candidate piece, and
              * an all-pieces-resident rule would un-pin it (the
              * 43_sieve +37% lesson, on the GP side). The emission
-             * downstream (ftake_reg + fload, the barrier brackets,
+             * downstream (ra.ftake + fload, the barrier brackets,
              * the exit flushes) consumes fhot unchanged. Per-pc xmm
              * pieces are F4b's trans-mode work. */
             if (lsra_facts && !jit_lever_off(JL_FCACHE)) {
@@ -24233,118 +24472,120 @@ retry_emission:
                 if (h.base2 >= 0)
                     u2 += h.uses2;
             /*
-             * How many CALLEE-saved registers the pins will consume.
-             * take_reg fills CACHE_REGS before the caller-saved
-             * extension, so a pin that OVERFLOWS into the extension
-             * costs the pair nothing.
+             * #123: THE PAIR ASKS THE ALLOCATOR, IT NO LONGER PREDICTS.
              *
-             * ⛔ A `min`, NOT the plain `MAX_CACHED - hot.size()` this
-             * used to be. That subtraction was safe only while a run
-             * with a hoist region got NO caller-saved pin - the exact
-             * coupling the clobber mask above removes. With the mask a
-             * hoist region can also hold a pin in r8, so hot.size() may
-             * EXCEED MAX_CACHED, and the size_t underflows to a huge
-             * value: the pair is granted unconditionally and
-             * CACHE_REGS[5] is read out of bounds. Same trap as the
-             * pop_back note below, in a second place - and it is the
-             * only thing in this function that the wider budget could
-             * have broken silently.
+             * This block used to compute the pair's two registers
+             * POSITIONALLY - `CACHE_REGS[cs_used]` and its successor -
+             * chosen so that the pins' own later first-free scan over
+             * the same array would land somewhere else. Two arrays and
+             * one shared index: a coupling that had already produced
+             * two bugs (a size_t underflow reading CACHE_REGS[5] out of
+             * bounds, and the tmode pop below).
+             *
+             * With one allocator the whole prediction disappears. The
+             * pair simply TAKES FIRST and the pins take what is left,
+             * which is also the right PRIORITY: the pair must be
+             * callee-saved (a helper call preserves it, so no epilogue
+             * re-derivation - unlike the r10/r11 primary), while a pin
+             * displaced into a caller-saved register is not lost at
+             * all, merely spilled and reloaded by machinery that
+             * already exists.
+             *
+             * ⛔ AND THAT PRIORITY FIXES A REAL OVER-DROP. The old
+             * second arm dropped TWO pins whenever the callee-saved
+             * four were full, without asking whether anything was
+             * actually lost - so a run with four pins and seven free
+             * caller-saved registers threw two of them away to make
+             * room. The honest count is below: a pin is LOST only when
+             * it does not fit in `max_pins - 2`.
              */
-            const size_t cs_used = std::min(hot.size(), MAX_CACHED);
+            const uint32_t cs_free =
+                e.ra.candidates(CAP_ALLOCATABLE | CAP_CALLEE_SAVED);
+            size_t n_cs = 0;
+            for (uint8_t r = 0; r < 16; r++)
+                if (cs_free & (1u << r))
+                    n_cs++;
+            const size_t pins_in_cs = std::min(hot.size(), n_cs);
+            const auto grant_pair = [&]() {
+                const int lo =
+                    e.ra.take(CAP_ALLOCATABLE | CAP_CALLEE_SAVED);
+                if (lo < 0)
+                    return;
+                const int hi =
+                    e.ra.take(CAP_ALLOCATABLE | CAP_CALLEE_SAVED);
+                if (hi < 0) { e.ra.give(static_cast<uint8_t>(lo)); return; }
+                pair_lo = lo;
+                pair_hi = hi;
+            };
             if (u2 > 0) {
-                if (MAX_CACHED - cs_used >= 2) {
-                    pair_lo = CACHE_REGS[cs_used];
-                    pair_hi = CACHE_REGS[cs_used + 1];
-                } else if (hot.size() >= 2 && !lsra_tmode) {
-                    /* ⛔ NEVER under tmode: `hot` is then the ENTRY-
-                     * OCCUPANT list whose ORDER is the abstract-reg
-                     * zip, and popping pins from it leaves them
-                     * "resident" per the plan but never loaded
-                     * (hot_reg is built post-displacement, so even
-                     * the aphys ML_CHECK cannot see it). Leftover-
-                     * only; else the second bases drop - the C1
-                     * status quo. */
-                    /*
-                     * DISPLACE the coldest pins to free the pair.
-                     *
-                     * ⛔ "THE TWO COLDEST" WAS AN APPROXIMATION VALID
-                     * ONLY UNDER AN INVARIANT THE CLOBBER MASK ABOVE
-                     * REMOVED, and the C1 hoist test is what says so.
-                     * The pair needs two CALLEE-saved registers; while
-                     * hot.size() <= MAX_CACHED, dropping two pins frees
-                     * exactly two. A hoist run may now ALSO pin r8, so
-                     * hot.size() can be 5 - and then the number to drop
-                     * is neither 2 nor 3:
-                     *   - 3 (drop until only 2 pins remain) is too
-                     *     many. The pin in r8 does not occupy a
-                     *     callee-saved register, so dropping it buys
-                     *     the pair NOTHING and costs a pin for free;
-                     *   - the honest count is "how many pins do not fit
-                     *     in what is left", i.e. MAX_CACHED - 2 for the
-                     *     pair plus the caller-saved members, so a
-                     *     5-pin run drops 2 and the third survivor
-                     *     moves into r8.
-                     * The trade is then weighed against exactly the
-                     * pins that actually lose their register.
-                     */
-                    const size_t n_avail = MAX_CACHED - 2 + n_xcache;
+                if (n_cs - pins_in_cs >= 2) {
+                    grant_pair();          /* free: nothing has to move */
+                } else {
+                    /* the pair costs the pins two callee-saved
+                     * registers. How many pins does that actually
+                     * LOSE, as opposed to merely displace? */
+                    const size_t n_avail =
+                        max_pins >= 2 ? max_pins - 2 : 0;
                     const size_t n_drop =
-                        hot.size() <= MAX_CACHED ? 2
-                      : hot.size() > n_avail ? hot.size() - n_avail : 2;
-                    long lost = 0;
-                    for (size_t k = 0; k < n_drop; k++)
-                        lost += hot_counts[hot.size() - 1 - k];
-                    if (12 * u2 > lost) {
-                        /* `pop_back` in a loop, not `resize(size() - n)`:
-                         * the subtraction is a size_t that UNDERFLOWS if
-                         * a future edit weakens the guard, and GCC's LTO
-                         * inliner cannot always carry the range fact
-                         * across the reallocated call tree - it reported
-                         * a -Wstringop-overflow on the `memset` behind
-                         * `resize`, with a size of (size_t)-12, and
-                         * WERROR turned that into a failed release
-                         * build. This spelling cannot express the bad
-                         * value at all. */
+                        hot.size() > n_avail ? hot.size() - n_avail : 0;
+                    if (n_drop == 0) {
+                        grant_pair();      /* displaced, not lost */
+                    } else if (!lsra_tmode) {
+                        /* ⛔ NEVER UNDER TMODE - and the guard is on
+                         * the POP, not on the arm. `hot` is then the
+                         * ENTRY-OCCUPANT list whose ORDER is the
+                         * abstract-reg zip, and popping pins from it
+                         * leaves them "resident" per the plan but
+                         * never loaded (hot_reg is built
+                         * post-displacement, so even the aphys
+                         * ML_CHECK cannot see it). */
+                        long lost = 0;
                         for (size_t k = 0; k < n_drop; k++)
-                            hot.pop_back();
-                        /* the two callee-saved the survivors do not
-                         * need; a survivor past MAX_CACHED - 2 takes a
-                         * caller-saved member instead (take_reg skips
-                         * the pair, which is marked busy below). */
-                        const size_t k0 =
-                            std::min(hot.size(), MAX_CACHED - 2);
-                        pair_lo = CACHE_REGS[k0];
-                        pair_hi = CACHE_REGS[k0 + 1];
+                            lost += hot_counts[hot.size() - 1 - k];
+                        if (12 * u2 > lost) {
+                            /* `pop_back` in a loop, not
+                             * `resize(size() - n)`: the subtraction is
+                             * a size_t that UNDERFLOWS if a future
+                             * edit weakens the guard, and GCC's LTO
+                             * inliner cannot always carry the range
+                             * fact across the reallocated call tree -
+                             * it reported a -Wstringop-overflow on the
+                             * `memset` behind `resize`, with a size of
+                             * (size_t)-12, and WERROR turned that into
+                             * a failed release build. This spelling
+                             * cannot express the bad value at all. */
+                            for (size_t k = 0; k < n_drop; k++)
+                                hot.pop_back();
+                            grant_pair();
+                        }
                     }
                 }
             }
         }
         /*
-         * #96: ASSIGN a register to each pin, through the register STATE
-         * rather than the positional zip `hot[h] -> CACHE_REGS[h]`. The
-         * callee-saved pool first, then the caller-saved extension - so
-         * a fragment that pins five or six slots spends r10/r11 on the
-         * overflow and everything else is exactly as before.
+         * #96/#123: ASSIGN a register to each pin - ONE ask of the
+         * allocator, which returns the cheapest register `gp_weight`
+         * allows. This used to be two calls in a fixed order,
+         * `take_reg(CACHE_REGS)` then `take_reg(xcache_regs())`, i.e.
+         * "the callee-saved four first, then the hand-listed
+         * caller-saved nine". The ORDER survives - a callee-saved
+         * register weighs less, so it is still handed out first - but
+         * as a consequence of the model rather than as two arrays a
+         * future edit could put out of step with it. `reg_model_check`
+         * asserts that consequence, because it is now the weights'
+         * job and no longer structural.
          *
-         * The C2b hoist pair is reserved FIRST because its own pick above
-         * already chose `CACHE_REGS[hot.size()..+1]` positionally; marking
-         * those busy makes take_reg's first-free scan reproduce the old
-         * assignment byte for byte instead of colliding with it. (The pair
-         * exists only when hregs is non-empty, which is exactly when the
-         * extension is off, so the two can never compete.)
+         * The C2b hoist pair took its registers ABOVE, from the same
+         * allocator, so nothing here can collide with it and nothing
+         * has to be reserved to make the two agree.
          *
-         * Only a CALLEE-saved register joins `e.saved`: frag_entry pushes
-         * that list and frag_ret pops it, and r10/r11 need neither.
+         * Only a CALLEE-saved register joins `e.saved`: frag_entry
+         * pushes that list and frag_ret pops it, and a caller-saved
+         * pin is handled by emit_call_prologue/epilogue instead.
          */
-        if (pair_lo >= 0) {
-            e.ra.take_fixed({ static_cast<uint8_t>(pair_lo),
-                              static_cast<uint8_t>(pair_hi) });
-        }
         std::vector<uint8_t> hot_reg(hot.size());
         for (size_t h = 0; h < hot.size(); h++) {
-            int r = e.take_reg(CACHE_REGS, MAX_CACHED);
-            if (r < 0)
-                r = e.take_reg(xcache_regs(), MAX_XCACHED);
+            const int r = e.ra.take(CAP_ALLOCATABLE);
             ML_CHECK(r >= 0);            /* hot.size() <= max_pins */
             hot_reg[h] = static_cast<uint8_t>(r);
             if (jit_reg_is_callee_saved(hot_reg[h]))
@@ -24374,11 +24615,15 @@ retry_emission:
             for (const int ar : lsra_aregs) {
                 if (aphys[static_cast<size_t>(ar)] != 0xFF)
                     continue;
-                int pr = e.take_reg(CACHE_REGS, MAX_CACHED);
-                if (pr < 0)
-                    pr = e.take_reg(xcache_regs(), MAX_XCACHED);
+                const int pr = e.ra.take(CAP_ALLOCATABLE);
                 if (pr < 0)
                     continue;            /* denied-shrunk pool: drop */
+                /* #123: the PLAN owns this for the whole run, even
+                 * across the give-back below - see RegAlloc::planned.
+                 * Without it the #112 capture base, which asks AFTER
+                 * that give-back, can be handed a register an install
+                 * writes at its own pc. */
+                e.ra.planned |= 1u << static_cast<uint8_t>(pr);
                 aphys[static_cast<size_t>(ar)] =
                     static_cast<uint8_t>(pr);
                 if (jit_reg_is_callee_saved(static_cast<uint8_t>(pr)))
@@ -24434,9 +24679,9 @@ retry_emission:
          * serves a live range, while this is worth three instructions
          * per capture access past the first.
          *
-         * `take_reg` (first-free) rather than a positional index,
-         * because under trans mode the physical assignment is not the
-         * positional zip the pair's own pick assumes.
+         * An allocator ask rather than a positional index, because
+         * under trans mode the physical assignment is not a positional
+         * zip over any list.
          *
          * It stays `busy` for the whole run with no cache entry behind
          * it. Under trans mode that is a state the comment above calls
@@ -24447,36 +24692,38 @@ retry_emission:
          */
         if (!jit_lever_off(JL_CAPBASE)
                 && jit_capbase_uses(chunk, begin, end) >= 2) {
-            for (size_t i = 0; i < MAX_CACHED; i++) {
-                const uint8_t r = CACHE_REGS[i];
-                /* ⛔ IT IS A BASE REGISTER, NOT A VALUE REGISTER, AND
-                 * THAT EXCLUDES r12. Every access addresses off it
-                 * (`load_base`/`store_base`), and `(r & 7) == 4` is the
-                 * ModRM encoding that means "a SIB byte follows" - so
-                 * r12 as a base would need a form the emitter does not
-                 * write. `base_needs_sib`'s own comment predicted this
-                 * exact moment ("nothing passes r12/r13 as a base
-                 * today, which is precisely why it was silent - it
-                 * stops being silent the moment a base register comes
-                 * from an ALLOCATOR"), and its ML_CHECK is what caught
-                 * it on the first run rather than emitting a wrong
-                 * instruction. r13 IS fine: `(r13 & 7) == 5` only
-                 * forbids the mod=00 no-displacement form, and
-                 * load_base always writes disp32.
-                 *
-                 * Teaching the emitter the SIB form is the right fix
-                 * one day (it is a register-class prerequisite, not a
-                 * tidy-up) - but it is a change to the hottest emit
-                 * path and belongs to that work, not to this. Skipping
-                 * one of four registers costs nothing while the other
-                 * three are free, which is every case measured. */
-                if (Emitter::base_needs_sib(r))
-                    continue;
-                if (e.ra.take_fixed(r)) {
-                    e.capbase = r;
-                    break;
-                }
-            }
+            /* ⛔ IT IS A BASE REGISTER, NOT A VALUE REGISTER, AND THAT
+             * EXCLUDES r12 - which is `CAP_MEM_BASE` and is why the
+             * capability exists. Every access addresses off it
+             * (`load_base`/`store_base`), and `(r & 7) == 4` is the
+             * ModRM encoding that means "a SIB byte follows", a form
+             * the emitter does not write. `base_needs_sib`'s own
+             * comment predicted this exact moment ("nothing passes
+             * r12/r13 as a base today, which is precisely why it was
+             * silent - it stops being silent the moment a base
+             * register comes from an ALLOCATOR"), and its ML_CHECK is
+             * what caught it on the first run rather than emitting a
+             * wrong instruction. r13 IS fine: `(r13 & 7) == 5` only
+             * forbids the mod=00 no-displacement form (CAP_BASE_NODISP,
+             * which is NOT asked for here), and load_base always
+             * writes disp32.
+             *
+             * Teaching the emitter the SIB form is the right fix one
+             * day (it is a register-class prerequisite, not a
+             * tidy-up) - but it is a change to the hottest emit path
+             * and belongs to that work, not to this.
+             *
+             * #123: CALLEE-SAVED is asked for EXPLICITLY now. It was
+             * implicit before - the loop scanned a list holding
+             * nothing else - and the line below that pushes capbase
+             * onto `e.saved` (frag_entry's push list) is only correct
+             * for a callee-saved register. An unstated requirement
+             * satisfied by a list's contents is exactly what this
+             * change is deleting, so it is stated. */
+            const int cb = e.ra.take(CAP_ALLOCATABLE | CAP_MEM_BASE
+                                     | CAP_CALLEE_SAVED);
+            if (cb >= 0)
+                e.capbase = cb;
         }
         if (pair_lo >= 0) {
             e.saved.push_back(static_cast<uint8_t>(pair_lo));
@@ -24634,7 +24881,11 @@ retry_emission:
                  * zip - the first-free scan over the same pool
                  * reproduces the old assignment byte for byte (the N5
                  * conversion's argument, on the float file). */
-                const int xr = e.ftake_reg(FCACHE_REGS, MAX_FCACHED);
+                /* #123: the ALLOCATOR picks, by weight, from the whole
+                 * float file - not a scan of a hand-written pool. The
+                 * staging pair is already fbusy from grant_fstage, so
+                 * it cannot be handed out here. */
+                const int xr = e.ra.ftake();
                 ML_CHECK(xr >= 0);       /* fhot.size() <= MAX_FCACHED */
                 e.fcache.push_back({ fhot[h], a.payload, a.type,
                                      static_cast<uint8_t>(xr) });
@@ -24680,9 +24931,17 @@ retry_emission:
             for (const int ar : lsra_faregs) {
                 if (afphys[static_cast<size_t>(ar)] != 0xFF)
                     continue;
-                const int xr = e.ftake_reg(FCACHE_REGS, MAX_FCACHED);
+                const int xr = e.ra.ftake();      /* #123 */
                 if (xr < 0)
                     continue;            /* drop: stays memory */
+                /* ⛔ #123: THE PLAN OWNS THIS FOR THE WHOLE RUN, and
+                 * the give-back below does NOT release it to a
+                 * run-scoped consumer - see RegAlloc::fplanned. This
+                 * exact line, without the claim, cost 45% of the
+                 * instructions on 05_mixed_arith: pick_float_lits took
+                 * the register back and its per-entry literal reload
+                 * beat the install. */
+                e.ra.fplanned |= 1u << static_cast<uint8_t>(xr);
                 afphys[static_cast<size_t>(ar)] =
                     static_cast<uint8_t>(xr);
             }
@@ -24713,7 +24972,7 @@ retry_emission:
         const std::vector<Emitter::CacheEnt> base_fcache = e.fcache;
         /* C4b: the float LITERAL pool - materialised once here (and at
          * every entry stub, below) instead of at each use. */
-        e.flits = pick_float_lits(chunk, begin, end);
+        e.flits = pick_float_lits(e, chunk, begin, end);
         for (const Emitter::FLit &fl : e.flits)
             e.flit_load(fl);
 #ifdef TESTS
@@ -25831,8 +26090,8 @@ retry_emission:
                 for (const Emitter::CacheEnt &c : st_cache)
                     e.load(c.reg, c.payload);   /* #96: the ENTRY's own
                                                  * assignment, not the
-                                                 * positional
-                                                 * CACHE_REGS[h] */
+                                                 * positional zip a
+                                                 * pool array gave */
                 /* F4b: the FLOAT cache as of this entry - replayed
                  * from base_fcache + the transitions at or before it
                  * (e.fcache here is the post-all-transitions FINAL

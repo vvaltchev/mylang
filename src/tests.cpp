@@ -29332,7 +29332,7 @@ static bool jit_range_share_test()
      */
     const unsigned rot0 = g_jit_xrot;
     g_jit_force_extra |= jit_lever_bit("rshare");
-    for (unsigned rot = 0; rot < jit_xcache_width(); rot++) {
+    for (unsigned rot = 0; rot < jit_xrot_width(); rot++) {
         g_jit_xrot = rot;
         for (const Case &c : cases) {
             unsigned long rs = 0;
@@ -29678,7 +29678,7 @@ static bool jit_rax_pin_test()
      * comes first it is granted to the HOTTEST slot, which is the
      * strongest traffic it can get. */
     const unsigned rot0 = g_jit_xrot;
-    for (unsigned rot = 0; rot < jit_xcache_width(); rot++) {
+    for (unsigned rot = 0; rot < jit_xrot_width(); rot++) {
         g_jit_xrot = rot;
         for (const Case &c : cases) {
             unsigned long rp = 0;
@@ -30254,7 +30254,7 @@ static bool jit_xcache_pins()
      * program.
      */
     const unsigned rot0 = g_jit_xrot;
-    for (unsigned rot = 0; rot < jit_xcache_width(); rot++) {
+    for (unsigned rot = 0; rot < jit_xrot_width(); rot++) {
         g_jit_xrot = rot;
         for (const Case &c : cases) {
             unsigned long xc = 0;
