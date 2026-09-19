@@ -7530,11 +7530,16 @@ extern "C" size_t jit_halt() noexcept
  * reference result must unregister its slice from the dying slot; a
  * non-trivial old dst must release); the rest mirrors the emitted arm.
  * The vframe/captures restores are the CALLER's sentinel arm's job. */
-extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
+extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr_raw,
                                 const void *descv,
                                 const void *rbp) noexcept
 {
     g_jit_native_returns++;
+    /* #97 increment 2: bit 0 of the residue's dst word marks a FRAMELESS
+     * frame (its window is on the native stack, not the segment) */
+    const uintptr_t dst_bits = reinterpret_cast<uintptr_t>(dst_addr_raw);
+    const bool frameless = (dst_bits & 1) != 0;
+    LValue *dst_addr = reinterpret_cast<LValue *>(dst_bits & ~uintptr_t(1));
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
     const auto *desc = static_cast<const FuncDescriptor *>(descv);
@@ -7554,7 +7559,8 @@ extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
         if (lv.get().get_type()->t >= Type::t_str)
             lv.frame_release();
     }
-    act.cur_sg->cur -= total;
+    if (!frameless)
+        act.cur_sg->cur -= total;
     ctx.captures = *reinterpret_cast<CaptureSlots *const *>(
         static_cast<const char *>(rbp) + 16);
     /* #121: a REFERENCE result re-binding a slot that already holds the same

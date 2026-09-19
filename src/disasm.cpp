@@ -951,6 +951,15 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         break; }
     case 0x80: { modrm(regf, rm); const uint8_t imm = c[p++];
         o << "cmp byte " << rm << ", " << int(imm); break; }
+    /* F6 /0: test r/m8, imm8 - the record-less return arm's frameless
+     * discriminator (bit 0 of the pushed dst word, #97 increment 2). Only
+     * /0 is emitted; the other subs of this group are not, so they stay
+     * undecoded rather than guessed. */
+    case 0xF6: { modrm(regf, rm);
+        if ((regf & 7) != 0)
+            goto undecoded;
+        const uint8_t imm = c[p++];
+        o << "test byte " << rm << ", " << int(imm); break; }
     /* group 1 (add/or/adc/sbb/and/sub/xor/cmp by the reg field) with an
      * imm32 (0x81) or a sign-ext imm8 (0x83): the ref-check `cmp ecx, t_str`
      * and the call prologue's `sub/add rsp, 8` alignment pad. */
