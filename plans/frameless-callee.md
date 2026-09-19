@@ -403,6 +403,61 @@ Each ends with a MEASUREMENT that can kill the next one.
    not a side quest. See §3b for why the obvious fix does not work and
    what the real one is.
 
+**1c. THE COERCING-CALLEE BAKE — added 2026-09-04, from E1's own
+   measurement.** E1 named 78_typed_param_call's callees and the bench
+   did not move one instruction, because naming was never what stopped
+   it. The FIRST bake gate is
+
+       if (bake && !(bake->fast_bind
+                     && (int)bake->params.size() == NARGS
+                     && bake_ck && bake_ck->plain_frame))
+           bake = nullptr;
+
+   and `compute_bind_flags` (eval.cpp) clears `fast_bind` for ANY
+   parameter annotated `int` or `float`:
+
+       for (const auto &p : d->params)
+           if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+               fast = false;
+
+   THE TWO PROGRAMS, and they differ in one word:
+
+       func mk(base)  { return func [base] (k)     { return base + k; }; }
+       var add = mk(7);  for (...) s = s + add(i);
+       # bakes: bake_push 1 -> 1,000,001               (11's shape)
+
+       func mk(int base) { return func [base] (int k) { return base+k; }; }
+       var add = mk(7);  for (...) s = s + add(i);
+       # DECLINES: fast_bind is false, bake_push stays 0   (78's shape)
+
+   The annotated one is the shape 78 exists to measure - *"the shape a
+   typed language should make FASTER, not slower"*, its own header
+   comment - and it is the one that loses the tier. It was kept out of
+   #97 step 4 as *"a coercing one … its per-argument checks are a
+   separate shape"*, which was right then and is now the thing standing
+   between this arc and its flagship bench.
+
+   WHAT IT NEEDS: the emitted bind currently copies each argument raw.
+   A coercing callee needs, per parameter, either a proven-exact copy or
+   a widening (`int -> float`) - and the per-argument decision is a
+   COMPILE-TIME constant once the callee is baked, which is exactly what
+   E1 just made available at a value site. `FuncDescriptor::bind_req`
+   already holds the per-parameter Type singleton the copy must match,
+   computed by the same `compute_bind_flags`; the gate can consult it
+   instead of refusing outright.
+
+   GATE: `bake_push` on 78 must go 0 -> ~2,000,001, and `-vdj` must show
+   the widening emitted inline for `scale_it` (int argument, float
+   parameter) rather than a call to the coercing helper. If the emitted
+   per-argument sequence is longer than the helper call it replaces,
+   STOP - that is a decline, not a tier.
+
+   ⛔ SIZE IT ON THE STORE BURST, NOT ON THE GATES. E1 measured the gate
+   collapse at ~0 wall clock (§3 increment 1). What this increment
+   removes is a per-argument HELPER CALL and its argument marshalling,
+   which is real work, not a predicted branch - but say so with a
+   profile before building, the way increment 0 was.
+
 **2. The callee-side protocol (§2), behind `MYLANG_JIT_OFF=frameless`.**
    The bulk. Landed with the tier ADMITTING ONLY LEAF CALLEES first, so
    E2's unwinder question is not entangled with the entry/return/
