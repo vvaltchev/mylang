@@ -501,6 +501,25 @@ never reaches the inline push" stayed in the plan for two days after the
 increments that made it false. **Re-measure reach after any change to a
 tier's GATES, not just its body.**
 
+**⛔ AND MEASURE REACH IN THE CONFIGURATION YOU MEASURE IN — A LEVER A/B
+CANNOT TELL "THIS TIER IS SLOWER" FROM "THIS TIER NEVER RAN" (#97
+increment 0, 2026-09-02).** `MYLANG_JIT_OFF=norec` said the record-less
+call tier COST 09_fib_recursive 4.75%, on the one bench the whole call
+arc exists for. It was not the tier: 555,823 gates, ZERO pushes. The
+gate `norec_had_cached` refuses a body containing `CachedCallV`, whose
+hazard — a live vframe pure cache a record-less return cannot stash —
+**can only exist when the pure-call cache is ON, and every measurement
+here runs `-npc`.** So the number was an honest measurement of a tier
+that never executed, and it sat in a plan for days directing the work.
+One conjunct (`&& g_pure_cache_enabled`) is **-20.7% Ir** there.
+**A gate must name the hazard's PRECONDITION, not just its SHAPE** —
+`norec_had_cached` describes *this body contains a cached call*, which
+was read as *a cache may be live*; the two differ by one runtime flag.
+And when the fix makes a runtime flag a soundness precondition of
+EMITTED CODE, state it as an `ML_CHECK` at the site that would violate
+it (`Frame::ensure_pure_cache`), not as an audit — an audit is a
+snapshot. Record: `docs/jit-optimizations.md`, *#97 increment 0*.
+
 The RULES that came out of that work stay HERE, because a rule must be
 obeyed before you know you are in the area it governs:
 

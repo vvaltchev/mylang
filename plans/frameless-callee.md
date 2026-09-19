@@ -120,6 +120,50 @@ tier is a net LOSS of 4.75%. Nothing in the record says why. **Increment
 0 is to find out**, because the answer decides whether frameless is a
 20% win there or a 0% one, and it is one profile away.
 
+#### ✅ ANSWERED — increment 0, 2026-09-02 (commit `50af0f4`)
+
+**The tier never fired on fib.** 555,823 call gates, ZERO record-less
+pushes; 78 makes 2,000,001. Every gate was refused by
+`norec_had_cached` — fib is a pure tree-recursion, so the optimizer
+rewrites its self-calls into `CachedCallV`, and that flag means *"this
+body could acquire a live vframe pure cache, which a record-less return
+cannot stash"*.
+
+**And the hazard cannot occur in the configuration this table was
+measured in.** `-npc` disables the pure-call cache and does NOT change
+codegen (`-vd` byte for byte), so the body carries the opcode, can
+never build a cache, and was refused anyway. The `-4.75%` was therefore
+never the tier's cost; it was the cost of the runtime FORK plus a dead
+record-less arm, paid on every call for a tier that then declined.
+
+The fix is one conjunct — `chunk.norec_had_cached && g_pure_cache_enabled`
+— with the soundness precondition made an `ML_CHECK` inside
+`Frame::ensure_pure_cache()`, the single allocation site. The row now
+reads:
+
+    09_fib_recursive      120,995,037   145,422,118        +20.74%
+
+so the record-less tier wins on **all four** benches, and the frameless
+tier — which additionally removes the record READ — keeps its premise
+intact. Blast radius nil: 16 benches, max |delta| 0.12%.
+
+**WALL CLOCK, 2026-09-03** (interleaved `--baseline`, `OPT=1
+ASSERTS=0`, `-npc`, 90 benches): **09_fib 0.250s -> 0.177s = 0.71x**,
+suite geomean 0.996x. The clock moved MORE than the Ir (-29% vs
+-20.7%) — this is a store burst removed, not free instructions, which
+is why it does not show the guard-elision signature §4 warns about.
+
+⛔ **THIS DOES NOT MAKE FRAMELESS CHEAPER TO BUILD.** It moves 09_fib's
+BASELINE, which means the frameless tier now has to beat a faster
+starting point on its flagship bench. Increment 3 (E2, drop the leaf
+rule) is the increment that serves 09_fib, and its gate should be
+re-derived from the new baseline rather than from the -4.75% row.
+
+Full record: `docs/jit-optimizations.md`, the *#97 increment 0* entry —
+including the smaller fix that was built, measured at -4.01%, and
+DROPPED because it CONFLICTS (eliding the fork stops the tier from ever
+firing).
+
 ---
 
 ## 1. THE THREE ENABLERS
@@ -281,12 +325,14 @@ constant matched by luck is a wrong answer, not a missed one.
 
 Each ends with a MEASUREMENT that can kill the next one.
 
-**0. WHY IS 09_fib NEGATIVE UNDER norec?** One profile. It is the target
-   bench and the tier that already exists is costing it 4.75%. If the
-   answer is "the record-less tier declines for a self-recursive callee
-   and pays the probe anyway", that is a bug to fix before building a
-   second tier on the same ground — and it may be most of E2's win,
-   for none of E2's work.
+**0. WHY IS 09_fib NEGATIVE UNDER norec?** ✅ **DONE 2026-09-02,
+   commit `50af0f4`.** The guess in this line was close and not right:
+   the tier does decline for fib and does pay the fork anyway, but the
+   reason is `norec_had_cached`, a refusal whose hazard only exists
+   when the pure-call cache is ON — and every measurement runs `-npc`.
+   One conjunct, **09_fib -20.74% Ir**, tier reach 0 -> 555,823 pushes,
+   blast radius nil. It was NOT "most of E2's win": E2 removes the
+   record READ in the CALLER, which is untouched. See §0.5.
 
 **1. E1 — the value callee gets named.** Smallest, uses analysis that is
    already done and already stamped, and it is the maintainer's stated
