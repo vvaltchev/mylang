@@ -19546,7 +19546,8 @@ static bool jit_frameless_gate()
      * instead), so the gate's own eligibility test rejects the chunk
      * first and the leaf clause never decides anything - watched:
      * deleting the whole leaf clause left -rt GREEN, the verdict merely
-     * changing from "not a leaf" to "an op is not nativizable".
+     * changing from "not a leaf" to "an op can bail" (the default arm
+     * asks op_fully_native since increment 2's F1 - a call is neither).
      * `CallBuiltinV` IS jit_op_eligible, so for a builtin caller the
      * leaf clause is the ONLY rejector and deleting it fails here.
      *
@@ -27495,6 +27496,97 @@ static bool jit_bake_coercing()
         fprintf(stderr, "jit_bake_coercing [narrowing raises]: only %lu "
                         "baked pushes - the exact calls did not bake\n",
                 d.push);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 increment 2, F2: the FRAMELESS ENTRY is emitted for exactly the
+ * chunks the gate admits - one entry per frameless_ok chunk, none for a
+ * body that calls a builtin - and, at this increment, nothing calls it
+ * (F4 does). The two emit-time counters are compared as DELTAS over one
+ * compile so the assertion is about this program, not the suite.
+ */
+static bool jit_frameless_entry_emitted()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const auto run = [&](const std::vector<std::string> &lines,
+                         const char *expect, const char *what,
+                         unsigned long *chunks, unsigned long *entries)
+        -> bool {
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::string src;
+        for (const std::string &l : lines)
+            src += l + "\n";
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        bool ok = true;
+        const unsigned long c0 = g_jit_frameless_chunks;
+        const unsigned long e0 = g_jit_frameless_entries;
+        std::ostringstream out;
+        std::streambuf *old = std::cout.rdbuf(out.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        std::cout.rdbuf(old);
+        g_exec_engine = saved;
+        if (ok && out.str() != expect) {
+            fprintf(stderr, "jit_frameless_entry_emitted [%s]: stdout %s "
+                            "!= expected %s\n", what, out.str().c_str(),
+                    expect);
+            ok = false;
+        }
+        *chunks = g_jit_frameless_chunks - c0;
+        *entries = g_jit_frameless_entries - e0;
+        return ok;
+    };
+    unsigned long chunks = 0, entries = 0;
+    /* 78's shape: two leaf closures, both frameless_ok */
+    bool ok = run({
+        "func make_adder(int base) {",
+        "  return func [base] (int k) { return base + k; }; }",
+        "func make_scaler(float f) {",
+        "  return func [f] (float x) { return f * x; }; }",
+        "var add = make_adder(7);",
+        "var scale_it = make_scaler(0.5);",
+        "var s = 0; var t = 0.0;",
+        "for (var i = 0; i < runtime(40); i++) {",
+        "  s = s + add(i); t = t + scale_it(i); }",
+        "print(s, t);" }, "1060 390.000000 \n", "two leaves",
+        &chunks, &entries);
+    if (ok && (chunks < 2 || entries != chunks)) {
+        fprintf(stderr, "jit_frameless_entry_emitted [two leaves]: %lu "
+                        "frameless chunks, %lu entries emitted\n",
+                chunks, entries);
+        ok = false;
+    }
+    /* a body that calls a builtin is not a leaf: no entry */
+    if (ok)
+        ok = run({
+            "var garr = [4, 2, 9, 1];",
+            "func usesblt(int k) { return max(garr) + k; }",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(40); i++) s = s + usesblt(i);",
+            "print(s);" }, "1140 \n", "builtin caller", &chunks,
+            &entries);
+    if (ok && (chunks != 0 || entries != 0)) {
+        fprintf(stderr, "jit_frameless_entry_emitted [builtin caller]: "
+                        "%lu chunks, %lu entries - the gate admitted a "
+                        "non-leaf\n", chunks, entries);
         ok = false;
     }
     return ok;
@@ -39854,6 +39946,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 1c - a COERCING callee bakes: exact, widened (int->float, "
       "bool->int), none->opt, and the narrowing decline still raises",
       jit_bake_coercing },
+    { "jit: #97 inc 2 (F2) - the FRAMELESS ENTRY is emitted for every "
+      "frameless_ok chunk and for no other",
+      jit_frameless_entry_emitted },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },

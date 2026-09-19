@@ -1821,6 +1821,21 @@ struct Chunk {
      * sync path must go through vm_dispatch). Derived post-JIT, never
      * serialized (like NativeCode). */
     int64_t sync_entry_off = -1;
+    /*
+     * #97 increment 2: the FRAMELESS ENTRY (derived post-JIT, never
+     * serialized, -1 = none). A second prologue for a `frameless_ok`
+     * body: it takes rdi = the CALLER's argument run and allocates the
+     * window on the NATIVE STACK (`sub rsp, N*48`; rbx = rsp), copies
+     * the arguments in, writes t_none over every other slot's type
+     * word, points act.vframe at the window, then replays the run
+     * head's establishment (tags, pins, literals) and jumps to the
+     * first op. No segment, no record, no record-less fork. The body,
+     * the return arm and the exit epilogues are SHARED with the
+     * recorded entry - a frameless frame is told apart at its return
+     * by bit 0 of the dst word the caller pushed ([rbp+24]), and its
+     * teardown is frag_ret's absolute `lea rsp, [rbp-K]`.
+     */
+    int64_t frameless_entry_off = -1;
 
     /* Live dyn-foreach iterator state slots (max iter_id + 1); one per native
      * ForeachDyn in the chunk. See the ForeachDyn ops. */

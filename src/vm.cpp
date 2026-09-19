@@ -3415,6 +3415,7 @@ unsigned long g_jit_arg_inplace = 0;
 unsigned long g_jit_cap_scalar = 0;        /* #111 (emitted) */
 unsigned long g_jit_frameless_chunks = 0;  /* #97 reach probe (TESTS) */
 unsigned long g_jit_frameless_calls = 0;   /* #97 reach probe (TESTS) */
+unsigned long g_jit_frameless_entries = 0; /* #97 inc 2: entries EMITTED */
 unsigned long g_jit_arg_scalar = 0;
 
 /*
