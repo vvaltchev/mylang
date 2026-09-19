@@ -10727,3 +10727,89 @@ liveness, recovered in a program the investigation was never about.
 **When a conservative fallback is removed, measure the whole family it
 was throttling, not the one case that led you there.**
 
+## #118 - two `.myv` PROVENANCE gaps: a corrupt image must not take the
+## process down (2026-08-29)
+
+Found by `tests/myv_fuzz.py` while validating #106 phase 2, and
+PRE-EXISTING - both reproduce byte-identically on the commit before it,
+debug and release alike. Both are the #137 TIER-2 shape: the fact is
+VALUE-dependent, so `verify_chunk` structurally cannot decide it at load
+from the image alone.
+
+**(1) `vm_dict_iter_init_body` - a slot that does not hold a dict.**
+Under ASSERTS the `ML_VM_CHECK` aborted; under `ASSERTS=0` it is
+compiled away and the following `get<>()` threw `TypeErrorEx` straight
+through `jit_dict_iter_init`, which is `noexcept`. The process died with
+`terminate called after throwing an instance of 'TypeErrorEx'` - no
+message, no caret, no backtrace, in exactly the configuration a shipped
+image runs in.
+
+⛔ **IT CANNOT REPORT, SO IT TAKES A DEFINED FALLBACK** (the #142 rule):
+the emitter takes NO status from that helper. The fallback is an EMPTY
+dict, chosen so the loop runs ZERO times - `begin() == end()` for it, so
+`vm_dict_iter_next_body`'s EXISTING exhaustion test returns false on the
+first call and **no new branch appears on the per-iteration path**. The
+good path pays one type-tag compare, once per loop. Both twins are fixed
+by one edit because the body is shared, which is why it is shared.
+
+**(2) `jit_end_finally` - a parked pend that is not a reraise.** The
+emitter INLINES the normal path (`cmp byte [pend.pend], 0; je`) and
+calls the helper only on the cold arm, so `pend != none` is its
+precondition and `pend == reraise` its assumption; a mutated image
+reached it with `Pend::ret`. This one CAN report - it is `noexcept` but
+returns a STATUS the emitter tests, and status 2 means "an exception is
+conveyed in `g_vm_jit_exc`". So the check throws as it does everywhere
+else and a catch turns it into that conveyance, the same idiom the
+`vm_raise` call three lines below already uses. The corrupt image is
+REPORTED, with a caret and a backtrace.
+(The INTERPRETED `EndFinally` needed nothing: it already branches on the
+pend rather than asserting - the JIT helper was the outlier.)
+
+**`ml_untrusted_bytecode()` (defs.h) is new, and small on purpose.** A
+site that must take a fallback rather than throw still wants its
+`ML_VM_CHECK` tripwire for bytecode WE compiled - where a non-dict IS an
+interpreter bug - while standing down for an image, where it is input.
+`ML_VM_CHECK(ml_untrusted_bytecode() || <invariant>)` says exactly that,
+and folds to `false` when the tier is compiled out.
+
+**WATCHED FAILING, one sabotage per fix.** Removing the dict fallback
+brings back `terminate called after throwing an instance of
+'TypeErrorEx'` (rc=134) on fat-1485. Removing the EndFinally conveyance
+does something quieter and worth naming: fat-740 still exits 1, but
+with `OutOfBoundsEx ... line 21` - **the process MISDIAGNOSES the
+corrupt image as a bug in the program**, having proceeded on a pend
+state the code does not describe. A sabotage whose symptom is a
+plausible wrong answer rather than a crash is exactly what this tier
+exists to turn back into a report.
+
+**MEASURED, and this is the point of the whole tier:** the two
+reproducers now exit 1 with the SAME rendered, located error in the
+debug build and in the `ASSERTS=0` release -
+
+    fat-1485  OutOfBoundsEx: ... at fat.my, line 21, col 15:22
+    fat-740   InternalErrorEx: corrupt bytecode image (EndFinally: the
+              parked pend is not a reraise) at fat.my, line 3, ...
+
+where before the build type decided whether you got an abort, a
+terminate, or a silent continue.
+
+**THE NET IS `myv_fuzz.py` ITSELF, and it is already in CI** (the
+`myv-fuzz` job, both build types). Its seed is FIXED, so mutation #740
+and #1485 of the fat corpus reproduce deterministically. Crashes over
+3200 mutations: **release (`OPT=1 ASSERTS=0`) 1 -> 0, debug+ASan
+2 -> 0**; the 2 HANGS are unchanged and both triage as "loads cleanly -
+a non-terminating program", the undecidable case the tool exists to
+separate out. There is no targeted `-rt` case because no VALID program can
+reach either condition - `DictIterInit` is emitted only where the
+inferencer PROVED a Dict, and the EndFinally cold arm only where a pend
+is set. That is what makes them provenance-tier at all.
+
+**⛔ THIS IS NOT `plans/myv-table-ordering.md`.** That plan is about a
+WELL-FORMED image the writer produced on purpose, which the reader
+cannot resolve because a struct's const member references the
+descriptor table written after it - a FORMAT ordering defect, refused at
+write time today. These two are a MUTATED image whose VALUES are
+nonsense reaching code that trusted them. Different input, different
+layer, different fix. The one connection is that the plan's acceptance
+list includes "myv_fuzz over both builds: 0 crashes", which #118 was
+independently making unreachable; that line is now clear.
