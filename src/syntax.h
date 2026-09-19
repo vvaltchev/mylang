@@ -862,6 +862,31 @@ public:
      */
     FuncDeclStmt *callee_fn = nullptr;
 
+    /*
+     * #97 E1: the SAME answer as `callee_fn`, held as the callee's
+     * program-lifetime DESCRIPTOR instead of its AST node.
+     *
+     * ⛔ IT EXISTS BECAUSE `callee_fn` CANNOT BE READ LATE, AND THAT IS
+     * NOT A STYLE POINT - IT IS A USE-AFTER-FREE. The stamp is written
+     * at the end of inference; its first consumer (#93's escape
+     * analysis) runs inside `resolve_names`, moments later, while every
+     * decl is still alive. The VM CODEGEN runs after the whole optimizer
+     * stack, which drops and replaces FuncDeclStmts - so dereferencing
+     * `callee_fn->desc` there read freed memory (ASan: heap-use-after-
+     * free in add_value_callee, caught on this field's first run).
+     *
+     * A FuncDescriptor is created at parse time and lives for the whole
+     * program - `vm_compile` MOVES it into the VmProgram precisely so it
+     * outlives the AST teardown - so holding one is safe at any later
+     * stage, which is also why the runtime call model reads descriptors
+     * and never decls.
+     *
+     * ⛔ NOT COPIED BY copy_call_fields either, for `callee_fn`'s exact
+     * reason: a clone is a new context and a null stamp is the
+     * conservative answer.
+     */
+    const FuncDescriptor *callee_desc = nullptr;
+
     /* Set by the inferencer when the callee's static type is `dyn` (callable at
      * runtime, resolved dynamically). The VM lowers it to CallValueGenericV — a
      * generic value-call that dispatches on the runtime callee (FuncObject /

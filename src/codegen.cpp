@@ -39,6 +39,24 @@ struct NotLoweredEx : public Exception {
 #include <vector>
 #include <algorithm>   /* std::count (peephole_chunk) */
 
+/* #97 E1: see codegen.h - the descriptors codegen may trust a stamp for. */
+static const std::unordered_set<const FuncDescriptor *> *g_live_descs
+    = nullptr;
+
+CodegenLiveDescs::CodegenLiveDescs(
+    const std::vector<const FuncDeclStmt *> &funcs)
+{
+    live.reserve(funcs.size() * 2);
+    for (const FuncDeclStmt *fn : funcs)
+        live.insert(fn->desc);
+    g_live_descs = &live;
+}
+
+CodegenLiveDescs::~CodegenLiveDescs()
+{
+    g_live_descs = nullptr;
+}
+
 namespace {
 
 /*
@@ -636,6 +654,38 @@ struct Codegen {
     int add_base_node(int kind, const Construct *base)
     {
         return kind == 1 ? add_ast_node(base) : -1;
+    }
+
+    /*
+     * #97 E1: the closure_defs index of the single function a call site can
+     * reach, from #116's callee-set answer - read as `CallExpr::callee_desc`,
+     * the program-lifetime DESCRIPTOR, never `callee_fn`, whose AST node the
+     * optimizers have freed by the time codegen runs (see syntax.h). -1 when
+     * the analysis could not NAME one (⊤, more than one candidate, an escaped
+     * function, or no inference at all under `-nti`).
+     *
+     * ⛔ THIS IS A PREDICTION, NOT A PROOF OBLIGATION. The JIT's baked arm
+     * compares the live callee's descriptor against the baked one and falls
+     * to the generic tier on a mismatch, so a wrong answer here costs a slow
+     * path and never a wrong result. That is why no gate beyond "the stamp
+     * exists and has a descriptor" is needed - and why `-nti`, which leaves
+     * every stamp null, simply gets the old code.
+     *
+     * The descriptor joins THIS chunk's closure_defs (deduped - a hot call
+     * in a loop is one site, but two sites may name one function), which is
+     * already the per-chunk, SERIALIZABLE pool of FuncDescriptor*.
+     */
+    int add_value_callee(const CallExpr *call)
+    {
+        if (!call || !call->callee_desc || !g_live_descs
+                || !g_live_descs->count(call->callee_desc))
+            return -1;            /* unstamped, or a stamp that may dangle */
+        const FuncDescriptor *d = call->callee_desc;
+        for (size_t i = 0; i < chunk.closure_defs.size(); i++)
+            if (chunk.closure_defs[i] == d)
+                return static_cast<int>(i);
+        chunk.closure_defs.push_back(d);
+        return static_cast<int>(chunk.closure_defs.size() - 1);
     }
 
     /* Pool a value-ABI builtin call's AST-free data (the Builtin + the ArgLocs
@@ -3060,6 +3110,7 @@ struct Codegen {
         CgInstr cv;
         cv.op = OpCode::CallValueV;
         cv.node_idx = add_ast_node(call);
+        cv.callee_def_idx = add_value_callee(call);   /* #97 E1 */
         cv.target = dst;
         cv.target2 = callee_slot;
         cv.set_a(int_lit(argbase));
@@ -7684,6 +7735,17 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
             chunk.base_locs.push_back(
                 {static_cast<uint32_t>(pc), bn->start, bn->end});
         in.base_node_idx = -1;
+        /*
+         * #97 E1: the named callee -> value_callees, on exactly the same
+         * terms and for the same reason (the pc is only known here, and a
+         * peephole fusion can copy the source struct into an op that never
+         * had one). pc-ascending, so the table comes out sorted.
+         */
+        if (in.callee_def_idx >= 0) {
+            chunk.value_callees.push_back(
+                {static_cast<uint32_t>(pc), in.callee_def_idx});
+            in.callee_def_idx = -1;
+        }
         if (!node)
             continue;
         /*
@@ -7883,6 +7945,10 @@ static void verify_ast_free(const std::vector<CgInstr> &code)
         ML_CHECK(in.node_idx == -1);
         ML_CHECK(in.loc_node_idx == -1);   /* #76: the loc twin too */
         ML_CHECK(in.base_node_idx == -1);  /* #127: the base-caret twin */
+        /* #97 E1: not an AST handle, but the same "consumed exactly once"
+         * invariant - a stamp still set here never reached value_callees,
+         * so the site would silently lose its baked callee. */
+        ML_CHECK(in.callee_def_idx == -1);
         (void)in;
     }
 }
@@ -10484,6 +10550,20 @@ void verify_chunk(const Chunk &chunk, const ChunkLimits &lim)
         v.target_pc(static_cast<int_type>(e.pc));
         v.pool(e.frame, chunk.inline_frames.size(), "inline frame");
     }
+    /*
+     * #97 E1. The pc is remapped by indexing like the tables above, and the
+     * `def` is handed to the EMITTER, which bakes closure_defs[def] into
+     * machine code as a descriptor pointer - so an out-of-range index from a
+     * mutated image would be baked and then dereferenced. The identity
+     * compare makes a WRONG entry harmless; it does nothing about an
+     * out-of-range one, which is this check's job.
+     */
+    for (const Chunk::CalleeName &e : chunk.value_callees) {
+        v.target_pc(static_cast<int_type>(e.pc));
+        v.pool(e.def, chunk.closure_defs.size(), "value callee");
+        v.defined_ptr(chunk.closure_defs[static_cast<size_t>(e.def)],
+                      "value callee");
+    }
     for (const Chunk::InlineFrame &f : chunk.inline_frames)
         if (f.parent >= 0)
             v.pool(f.parent, chunk.inline_frames.size(), "inline frame");
@@ -11374,6 +11454,7 @@ bool bc_inline_chunk(Chunk &ck,
     std::vector<Instr> nc;
     std::vector<Chunk::LocEntry> nlocs;
     std::vector<Chunk::LocEntry> nbase;                /* #127 */
+    std::vector<Chunk::CalleeName> nvc;                /* #97 E1 */
     std::vector<Chunk::InlineEntry> nctx;
     std::vector<char> from_caller;
     std::vector<uint32_t> old2new(ck.code.size() + 1);
@@ -11388,6 +11469,18 @@ bool bc_inline_chunk(Chunk &ck,
         for (const auto &le : ck.base_locs)
             if (le.pc == pc) { s = le.start; e = le.end; return true; }
         return false;
+    };
+    /*
+     * #97 E1: the named callee rides the splice the same way. A SPLICED
+     * body's own sites are dropped rather than carried: the splice pastes
+     * the callee's bytecode into this chunk, so a `def` index from the
+     * callee's closure_defs would name an entry in the WRONG pool. Losing
+     * it costs a bake, never an answer.
+     */
+    const auto caller_value_callee = [&](size_t pc) -> int32_t {
+        for (const auto &e : ck.value_callees)
+            if (e.pc == pc) return e.def;
+        return -1;
     };
 
     size_t si = 0;
@@ -11506,6 +11599,8 @@ bool bc_inline_chunk(Chunk &ck,
             nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
         if (caller_base_loc(pc, s, e))
             nbase.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        if (const int32_t vcd = caller_value_callee(pc); vcd >= 0)
+            nvc.push_back({ static_cast<uint32_t>(nc.size()), vcd });
         const int32_t f = ck.inline_frame_at(pc);
         if (f >= 0) {
 #ifdef TESTS
@@ -11534,6 +11629,7 @@ bool bc_inline_chunk(Chunk &ck,
     ck.code = std::move(nc);
     ck.locs = std::move(nlocs);
     ck.base_locs = std::move(nbase);                   /* #127 */
+    ck.value_callees = std::move(nvc);                 /* #97 E1 */
     ck.inline_ctxs = std::move(nctx);
     ck.n_temps = next_base - ck.slot_count;
     for (const Site &S : sites)

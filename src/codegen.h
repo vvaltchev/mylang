@@ -3,6 +3,7 @@
 #pragma once
 
 #include "bytecode.h"
+#include <unordered_set>
 
 #include <string>
 #include <vector>
@@ -63,6 +64,47 @@ Chunk codegen_program(const Block *root, bool jit = true);
  * shared by the VM's AOT precompile (vm.cpp) and the -vd dump (disasm.cpp).
  */
 bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit = true);
+
+/*
+ * #97 E1 - THE LIVE-DESCRIPTOR SET, and it exists to make a stamp SAFE to
+ * read rather than to make it precise.
+ *
+ * `CallExpr::callee_desc` names the callee a value-call site reaches. It is
+ * written at the end of inference and read at CODEGEN, and in between the
+ * optimizer stack rewrites the tree - an inline lambda passed as an argument
+ * dies with the call expression that held it, taking its FuncDescriptor
+ * (owned by FuncDeclStmt::desc_owner) with it. Reading such a stamp is a
+ * use-after-free, and ASan caught exactly that on this field's first run.
+ *
+ * So codegen never TRUSTS the stamp: it accepts one only if the descriptor
+ * is in this set, which vm_precompile_all builds from `collect_funcs` over
+ * the FINAL tree - the same walk that decides which bodies to compile, so
+ * the two cannot drift. Membership is a pointer COMPARE, never a deref, so
+ * a dangling stamp is safe to test; and if a freed descriptor's address is
+ * ever recycled by a live one, the worst case is a wrong PREDICTION, which
+ * the emitted identity compare turns into a slow path rather than a wrong
+ * answer.
+ *
+ * Null (the tree-walker, the REPL, any path that did not precompile) means
+ * "trust nothing" - every stamp declines and the old code is emitted.
+ *
+ * ⛔ EVERY CODEGEN DRIVER MUST INSTANTIATE THIS, and there are THREE:
+ * `vm_compile` (which covers `vm_precompile_all`, nested inside it) and
+ * `disassemble_program`, which runs its OWN two-pass codegen over throwaway
+ * chunks. Missing one does not break anything visibly - it just emits the
+ * un-baked form there, so `-vd` and a real run disagree about the bytecode
+ * a program produces. It is an RAII TYPE rather than a setter pair exactly
+ * so the second site is one line and cannot half-install.
+ */
+class CodegenLiveDescs {
+public:
+    explicit CodegenLiveDescs(const std::vector<const FuncDeclStmt *> &funcs);
+    ~CodegenLiveDescs();
+    CodegenLiveDescs(const CodegenLiveDescs &) = delete;
+    CodegenLiveDescs &operator=(const CodegenLiveDescs &) = delete;
+private:
+    std::unordered_set<const FuncDescriptor *> live;
+};
 
 /*
  * Build `chunk.boxed_ops` (the JIT-bakeable operand pool for BinOpV / CmpV /

@@ -443,6 +443,8 @@ Each chunk is:
     N x value consts
     N x LocEntry locs               9.2
     N x LocEntry base_locs          9.2 - the store-BASE carets (v13)
+    u32      n_value_callees        the named value-call callees (v15)
+    n x { u32 pc; u32 def }         9.20
     N x InlineFrame inline_frames   9.3
     N x InlineCtx inline_ctxs       9.3
     N x MemberKey member_keys       9.4
@@ -944,6 +946,41 @@ bytes") on purpose - it needs no knowledge of the record it guards, so it
 cannot drift when a record's encoding changes.  The RESIDUAL is a different
 class (a slot or pool INDEX that is in range for the file but not for the
 structure it indexes) and is tracked separately.
+
+9.20  value_callees - the NAMED CALLEE of a value-call site (v15)
+
+A `CallValueV` calls a function held in a TEMP - a closure a factory
+returned, a lambda in a variable - so the callee is not a slot the emitter
+can read a descriptor from.  The compiler's callee-set analysis often knows
+it anyway (a MUST answer: exactly one candidate, not unknown, not escaped),
+and this table carries that answer into the image so a loaded chunk compiles
+to the same machine code a fresh one does.
+
+    u32   count
+    count x:
+        u32  pc     the CallValueV's pc, ascending, exact-match searched
+        u32  def    an index into THIS chunk's closure_defs
+
+SPARSE - only a call site whose callee the analysis could name records one -
+so a chunk with none pays the 4-byte count and nothing else.
+
+A reader must bound BOTH fields: `pc` against the chunk's instruction count
+(it is remapped by INDEXING a per-pc vector, exactly like `locs` and
+`base_locs`), and `def` against `closure_defs`, whose entry the JIT bakes
+into machine code as a descriptor pointer.  Note that a WRONG-but-in-range
+entry is harmless by construction: the emitted code compares the live
+callee's descriptor against the baked one and takes a generic path on a
+mismatch, so a bad prediction costs a slow path and never a wrong answer.
+An OUT-OF-RANGE one is not harmless, which is what the bound is for.
+
+Version 15 adds `value_callees` (section 9.20), a per-chunk table naming the
+single function a value-call site can reach.  The emitter could previously
+name a callee only through a write-once GLOBAL FUNCTION SLOT, so every call
+through a closure held in a variable re-established the callee's properties
+from memory on every call, even where the compiler had proved which function
+it was.  The table is what lets that proof survive the AST teardown and the
+trip through an image.  It changes no instruction encoding - the record is
+appended to the chunk after `base_locs`.
 
 Version 13 adds `base_locs`, a second loc table per chunk, written straight
 after `locs` in the identical encoding.  A container store has TWO error

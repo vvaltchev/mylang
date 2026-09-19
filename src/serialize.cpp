@@ -1147,6 +1147,18 @@ void write_chunk(Writer &w, const Chunk &c)
      * whose base can be an unbound global records one). */
     write_loc_table(w, c.base_locs);
     ct("  base_locs");
+    /*
+     * #97 E1: the NAMED CALLEE of each value-call site (sparse - only a
+     * CallValueV whose callee #116's analysis could name). Two u32s per
+     * entry; the `def` is an index into this chunk's closure_defs, which
+     * follows below, so the reader bounds it in vm_verify_program rather
+     * than here.
+     */
+    w.u32v(static_cast<uint32_t>(c.value_callees.size()));
+    for (const auto &e : c.value_callees) {
+        w.u32v(e.pc); w.u32v(static_cast<uint32_t>(e.def));
+    }
+    ct("  value_callees");
     w.u32v(static_cast<uint32_t>(c.inline_frames.size()));
     for (const auto &f : c.inline_frames) {
         w.strv(f.callee_name);
@@ -1422,6 +1434,15 @@ void read_chunk(Reader &r, Chunk &c)
 
     read_loc_table(r, c.locs, c.code.size());
     read_loc_table(r, c.base_locs, c.code.size());     /* #127 */
+
+    n = r.countv();                                   /* #97 E1 */
+    c.value_callees.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::CalleeName e;
+        e.pc = r.u32v();
+        e.def = static_cast<int32_t>(r.u32v());
+        c.value_callees.push_back(e);
+    }
 
     n = r.countv();
     c.inline_frames.reserve(n);
