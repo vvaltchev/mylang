@@ -86,6 +86,27 @@ unsigned long g_jit_xcache = 0;        /* #96: caller-saved-pin entries */
 unsigned long g_jit_rax_pin = 0;       /* #96: rax-pinned fragment entries */
 unsigned long g_jit_scache = 0;        /* #96 inc-1: spill-homed entries */
 unsigned long g_jit_lsra_pins = 0;     /* D3.b: lsra-chosen pin sets */
+/*
+ * #103 increment 0: HOW OFTEN DOES THE LEGACY PICK STILL DECIDE?
+ *
+ * `pick_cached_slots` runs for every run and produces SIX outputs; the
+ * linear scan overrides only three of them (hot / hot_counts / fhot),
+ * and only when the interval machinery succeeds. So the pick's own
+ * `hot` reaches emission exactly when `jit_slot_liveness`,
+ * `jit_build_intervals` or `jit_qualify_intervals` DECLINES.
+ *
+ * That is the whole question behind "retire the pick": if this counter
+ * is zero corpus-wide the surviving path is dead code and retiring it
+ * is a deletion; if it is not, deleting it costs those runs their pins
+ * and the size of that has to be known BEFORE the edit, not after.
+ *
+ * A COMPILE-TIME count (bumped once per run as it is compiled), not an
+ * emitted-code one - the question is about a compiler decision, not
+ * about what executed.
+ */
+unsigned long g_jit_pick_decided = 0;  /* runs the legacy pick chose  */
+unsigned long g_jit_pick_pins = 0;     /* ...and it picked >= 1 pin   */
+unsigned long g_jit_runs_compiled = 0; /* runs reaching the decision  */
 unsigned long g_jit_lsra_fpins = 0;    /* F4a: lsra-chosen FLOAT pins */
 unsigned long g_jit_lsra_ftrans = 0;   /* F4b: FLOAT transitions run */
 unsigned long g_jit_lsra_rebids = 0;   /* #103b-2: won second-chance
@@ -10830,6 +10851,10 @@ void jit_stats_report()
         { "rax_pin",          &g_jit_rax_pin },
         { "scache",           &g_jit_scache },
         { "lsra_pins",        &g_jit_lsra_pins },
+        /* #103 increment 0: the legacy pick's remaining reach */
+        { "runs_compiled",    &g_jit_runs_compiled },
+        { "pick_decided",     &g_jit_pick_decided },
+        { "pick_pins",        &g_jit_pick_pins },
         { "lsra_fpins",       &g_jit_lsra_fpins },
         { "lsra_ftrans",      &g_jit_lsra_ftrans },
         { "lsra_rebids",      &g_jit_lsra_rebids },
@@ -24413,6 +24438,18 @@ retry_emission:
          * release build */
         (void)lsra_chose;
         (void)lsra_f_chose;
+#ifdef TESTS
+        /* #103 increment 0 - see the counters' note. `lsra_chose` is
+         * set by BOTH lsra arms (trans mode and the whole-run
+         * fallback), so !lsra_chose is exactly "the interval machinery
+         * declined and pick_cached_slots' own hot survived". */
+        g_jit_runs_compiled++;
+        if (!lsra_chose) {
+            g_jit_pick_decided++;
+            if (!hot.empty())
+                g_jit_pick_pins++;
+        }
+#endif
         std::vector<int> spill_hot;
         if (hot.size() > max_pins) {
             spill_hot.assign(hot.begin() + max_pins, hot.end());
