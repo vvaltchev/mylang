@@ -94,6 +94,19 @@ sees a kind of field the others structurally cannot (#137):
      emplace site, a flat struct array - must be POD and must have exactly
      the field count the site was compiled for.
 
+     Two JIT-ONLY facts (2026-09-20, myv_fuzz): a stored chunk contains NO
+     EnterNative and NO ExitBlock - both are inserted by the load-time JIT
+     and never written (`-c` compiles with jit=false), so either op in
+     read code was invented by corruption and is refused (an ExitBlock in
+     a body the frameless gate otherwise admits sends the chunk down the
+     container path with no frameless entry, and its return arm then runs
+     on a frame that was never frameless).  And a FUNCTION chunk's
+     `slot_count` must equal its descriptor's `frame_size` (section 8,
+     `frame_size`): the push sizes a frame from the descriptor and the
+     JIT's return arms from the chunk, and a mutated count makes the two
+     disagree on how many slots a frame has.  Checked in
+     vm_verify_program, across the two records.
+
   4. THE VALUE-DEPENDENT RESIDUE (ML_UNTRUSTED_CHECK, defs.h).  A few facts
      no load-time pass can decide, because they are properties of the VALUE a
      slot holds rather than of the image: a flat array's storage-kind union
@@ -960,11 +973,18 @@ to the same machine code a fresh one does.
 
     u32   count
     count x:
-        u32  pc     the CallValueV's pc, ascending, exact-match searched
+        u32  pc     the CallValueV's pc, non-decreasing, exact-match searched
         u32  def    an index into THIS chunk's closure_defs
 
 SPARSE - only a call site whose callee the analysis could name records one -
 so a chunk with none pays the 4-byte count and nothing else.
+
+A pc may appear TWICE, in consecutive entries (since 2026-09-20, no
+encoding change): a TWO-WAY site - a callee set of exactly two functions,
+`ops[i % 2]` reaching add_op or sub_op - records both candidates, in the
+analysis's order.  A reader keeps both, in that order; a consumer that
+needs ONE named callee treats such a pc as unnamed.  Three or more
+candidates record nothing.
 
 A reader must bound BOTH fields: `pc` against the chunk's instruction count
 (it is remapped by INDEXING a per-pc vector, exactly like `locs` and

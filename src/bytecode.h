@@ -1513,8 +1513,11 @@ struct CgInstr : Instr {
      * can reach, from #116's callee-set stamp - or -1 for "not named".
      * Codegen-transient like node_idx: it becomes a pc-keyed entry in
      * Chunk::value_callees when the chunk is finalized, because the pc
-     * is not known until then. */
+     * is not known until then. `callee_def_idx2` (#97 E3) is the second
+     * candidate of a TWO-WAY site, recorded as a second entry at the same
+     * pc. */
     int32_t callee_def_idx = -1;
+    int32_t callee_def_idx2 = -1;
     CgInstr() = default;
     CgInstr(const Instr &i) : Instr(i) {}
 };
@@ -2058,6 +2061,14 @@ struct Chunk {
      * searched - and SPARSE: only a CallValueV whose callee the analysis
      * could name records one. Read ONLY at JIT-compile time, so the VM's
      * dispatch never touches it.
+     *
+     * #97 E3 (2026-09-20): a TWO-WAY site (`ops[i % 2]` reaching add_op
+     * or sub_op) records TWO entries at the same pc, in the analysis's
+     * candidate order - the encoding is unchanged (each entry is still
+     * `pc, def`; the table is non-decreasing in pc). `value_callees_at`
+     * returns both; `value_callee_at` - the single-candidate query the
+     * generic push's bake asks - answers -1 for such a pc, so a two-way
+     * site is UNNAMED to every consumer but the frameless dispatch.
      */
     struct CalleeName {
         uint32_t pc;
@@ -2065,8 +2076,8 @@ struct Chunk {
     };
     std::vector<CalleeName> value_callees;
 
-    /* The named callee's closure_defs index for the op at `pc`, or -1. */
-    int32_t value_callee_at(size_t pc) const
+    /* the entries at `pc`: 0, 1 or 2 closure_defs indices in `out` */
+    int value_callees_at(size_t pc, int32_t out[2]) const
     {
         size_t lo = 0, hi = value_callees.size();
         while (lo < hi) {
@@ -2076,9 +2087,19 @@ struct Chunk {
             else
                 hi = mid;
         }
-        if (lo < value_callees.size() && value_callees[lo].pc == pc)
-            return value_callees[lo].def;
-        return -1;
+        int n = 0;
+        for (; lo < value_callees.size() && value_callees[lo].pc == pc
+               && n < 2; lo++)
+            out[n++] = value_callees[lo].def;
+        return n;
+    }
+
+    /* The SINGLE named callee's closure_defs index for the op at `pc`, or
+     * -1 - also for a two-way site (see value_callees_at). */
+    int32_t value_callee_at(size_t pc) const
+    {
+        int32_t d[2];
+        return value_callees_at(pc, d) == 1 ? d[0] : -1;
     }
 
     /*

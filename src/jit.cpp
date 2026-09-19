@@ -7736,6 +7736,10 @@ static const FuncDescriptor *jit_baked_callee(const Chunk &ck, size_t old_pc,
          * is for the named path - the analysis being wrong would cost a
          * slow path, never a wrong answer.
          */
+        /* (#97 E3: a TWO-WAY site's pc carries two entries and answers
+         * -1 here - the generic push bakes ONE callee, and baking half a
+         * pair would fail its identity compare every other call; the
+         * frameless site asks jit_frameless_candidates instead) */
         const int32_t di = ck.value_callee_at(old_pc);
         if (di < 0 || static_cast<size_t>(di) >= ck.closure_defs.size())
             return nullptr;
@@ -7926,40 +7930,86 @@ static const ArgFuse *argfuse_at(size_t old_pc)
  */
 static bool callv_native_ok(const Instr &in, const JitCtx *jc);
 
+/*
+ * #97 E3: THE CANDIDATES of a frameless site - one for a named callee
+ * (E1, or a write-once global slot), TWO for a two-way value site
+ * (Chunk::value_callees carries both). Each candidate must pass the
+ * whole chain above on its own; a site is frameless only when EVERY
+ * candidate does, so the emitted dispatch (`cmp rax, desc_k; je tail_k`
+ * per candidate, then the slow tier) never needs a per-candidate
+ * decline. Returns the count (0 = not a frameless site); `fl_why` names
+ * the first failing condition for MYLANG_FRAMELESS_WHY. `with_placement`
+ * false skips the tests that only hold once the callee is placed (the
+ * pre-pass asks before any body is jitted).
+ */
+static int jit_frameless_candidates(const Chunk &ck, size_t old_pc,
+                                    const Instr &in,
+                                    const FuncDescriptor *out[2],
+                                    const char **fl_why,
+                                    bool with_placement = true)
+{
+    const bool is_value = in.op == OpCode::CallValueV;
+    const bool cached = in.op == OpCode::CachedCallV;
+    const int callee_arg = static_cast<int>(in.target2);
+    const char *why = nullptr;
+    int n = 0;
+    if (is_value && !jit_lever_off(JL_BAKECALLEE)) {
+        int32_t di[2];
+        const int k = ck.value_callees_at(old_pc, di);
+        for (int i = 0; i < k; i++) {
+            const FuncDescriptor *d =
+                (di[i] >= 0
+                 && static_cast<size_t>(di[i]) < ck.closure_defs.size())
+                    ? ck.closure_defs[static_cast<size_t>(di[i])] : nullptr;
+            if (d && d->vm_chunk)
+                out[n++] = d;
+        }
+        if (n != k)
+            n = 0;                       /* a pair with a chunk-less half */
+    } else if (!is_value) {
+        const FuncDescriptor *bake =
+            (in.op == OpCode::CallV && callv_native_ok(in, g_cur_jc))
+                ? nullptr    /* the native-direct tier, not a sync site */
+                : jit_baked_callee(ck, old_pc, callee_arg, is_value);
+        if (bake)
+            out[n++] = bake;
+    }
+    if (n == 0)
+        why = "not baked";
+    for (int i = 0; i < n && !why; i++) {
+        const FuncDescriptor *bake = out[i];
+        const Chunk *bake_ck = static_cast<const Chunk *>(bake->vm_chunk);
+        why =
+            g_cur_caller_desc ? "not bake_final (the caller is not main)"
+            : (with_placement && bake_ck->native.base == nullptr)
+                  ? "not bake_final (the callee is unplaced)"
+            : (with_placement && bake_ck->sync_entry_off < 0)
+                  ? "the callee does not start native"
+            : static_cast<int>(bake->params.size()) != in.b_lit()
+                  ? "arity (omitted trailing opt args - the push does not bake)"
+            : !bake->fast_bind && bake->bind_req.size() != bake->params.size()
+                  ? "bind_req not derived (the push does not bake)"
+            : !jit_norec_on() ? "the record-less arm is off"
+            : !bake_ck->frameless_ok ? "the callee is not frameless_ok"
+            : (with_placement && bake_ck->frameless_entry_off < 0)
+                  ? "no frameless entry emitted"
+            : jit_lever_off(JL_FRAMELESS) ? "lever off"
+            : cached ? "a cached call"
+            : nullptr;
+    }
+    if (fl_why)
+        *fl_why = why;
+    return why ? 0 : n;
+}
+
+/* the ONE-candidate view (the fusion decision, the site's ML_CHECKs) */
 static const FuncDescriptor *
 jit_frameless_callee(const Chunk &ck, size_t old_pc, const Instr &in,
                      const char **fl_why)
 {
-    const bool is_value = in.op == OpCode::CallValueV;
-    const bool cached = in.op == OpCode::CachedCallV;
-    /* the callee operand: a global slot (CallV/CachedCallV) or the
-     * value temp (CallValueV) - target2 for all three */
-    const int callee_arg = static_cast<int>(in.target2);
-    const FuncDescriptor *bake =
-        (in.op == OpCode::CallV && callv_native_ok(in, g_cur_jc))
-            ? nullptr           /* the native-direct tier, not a sync site */
-            : jit_baked_callee(ck, old_pc, callee_arg, is_value);
-    const Chunk *bake_ck =
-        bake ? static_cast<const Chunk *>(bake->vm_chunk) : nullptr;
-    const char *why =
-        !bake ? "not baked"
-        : g_cur_caller_desc ? "not bake_final (the caller is not main)"
-        : bake_ck->native.base == nullptr
-              ? "not bake_final (the callee is unplaced)"
-        : bake_ck->sync_entry_off < 0 ? "the callee does not start native"
-        : static_cast<int>(bake->params.size()) != in.b_lit()
-              ? "arity (omitted trailing opt args - the push does not bake)"
-        : !bake->fast_bind && bake->bind_req.size() != bake->params.size()
-              ? "bind_req not derived (the push does not bake)"
-        : !jit_norec_on() ? "the record-less arm is off"
-        : !bake_ck->frameless_ok ? "the callee is not frameless_ok"
-        : bake_ck->frameless_entry_off < 0 ? "no frameless entry emitted"
-        : jit_lever_off(JL_FRAMELESS) ? "lever off"
-        : cached ? "a cached call"
-        : nullptr;
-    if (fl_why)
-        *fl_why = why;
-    return why ? nullptr : bake;
+    const FuncDescriptor *c[2] = { nullptr, nullptr };
+    const int n = jit_frameless_candidates(ck, old_pc, in, c, fl_why);
+    return n == 1 ? c[0] : nullptr;
 }
 
 /*
@@ -8285,20 +8335,14 @@ void jit_mark_frameless_wanted(const Chunk &main, const JitCtx *jc)
         if (in.op != OpCode::CallV && in.op != OpCode::CallValueV)
             continue;
         /* the placement tests (bake_final / an entry emitted) cannot
-         * hold yet - only the callee's own contract is asked here */
-        const bool is_value = in.op == OpCode::CallValueV;
-        const FuncDescriptor *bake =
-            jit_baked_callee(main, pc, static_cast<int>(in.target2),
-                             is_value);
-        if (!bake || !bake->vm_chunk)
-            continue;
-        Chunk *ck = static_cast<Chunk *>(const_cast<void *>(bake->vm_chunk));
-        if (!ck->frameless_ok
-                || static_cast<int>(bake->params.size()) != in.b_lit()
-                || (!bake->fast_bind
-                    && bake->bind_req.size() != bake->params.size()))
-            continue;
-        ck->frameless_wanted = true;
+         * hold yet - only the callees' own contract is asked here; a
+         * two-way site (E3) wants BOTH its candidates' entries */
+        const FuncDescriptor *c[2] = { nullptr, nullptr };
+        const int n = jit_frameless_candidates(main, pc, in, c, nullptr,
+                                              /*with_placement=*/false);
+        for (int i = 0; i < n; i++)
+            static_cast<Chunk *>(const_cast<void *>(c[i]->vm_chunk))
+                ->frameless_wanted = true;
     }
     g_cur_jc = saved_jc;
     g_cur_caller_desc = saved_desc;
@@ -8453,15 +8497,20 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
      * here, where the generic push must refuse a coercing one.)
      */
     const char *fl_why = nullptr;
-    const FuncDescriptor *fl_callee =
-        frameless_out ? jit_frameless_callee(ck, old_pc, in, &fl_why)
-                      : nullptr;
+    const FuncDescriptor *fl_cands[2] = { nullptr, nullptr };
+    const int fl_n =
+        frameless_out
+            ? jit_frameless_candidates(ck, old_pc, in, fl_cands, &fl_why)
+            : 0;
     if (!frameless_out)
         fl_why = "the helper-path site";
-    else if (fl_callee && !residue)
+    else if (fl_n > 0 && !residue)
         fl_why = "the site is not a residue site";
     const bool frameless_site = fl_why == nullptr;
-    ML_CHECK(!frameless_site || fl_callee == bake);
+    /* a one-candidate site's callee IS the push's bake; a two-way site
+     * (E3) is unnamed to the push - its dispatch is the site's */
+    ML_CHECK(!frameless_site || fl_n == 2 || fl_cands[0] == bake);
+    ML_CHECK(!frameless_site || fl_n != 2 || bake == nullptr);
     {
         /* MYLANG_FRAMELESS_WHY=1 - the SITE half of the reach report */
         static const bool why_on = [] {
@@ -8470,9 +8519,13 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
             return w && !w->empty() && (*w)[0] != '0';
         }();
         if (why_on)
-            fprintf(stderr, "[frameless-site] %s pc=%zu callee=%s\n",
+            fprintf(stderr, "[frameless-site] %s pc=%zu callee=%s%s\n",
                     frameless_site ? "TAKEN" : fl_why, old_pc,
-                    bake && bake->name ? bake->name->val.c_str() : "?");
+                    fl_cands[0] && fl_cands[0]->name
+                        ? fl_cands[0]->name->val.c_str()
+                        : bake && bake->name ? bake->name->val.c_str()
+                        : "?",
+                    fl_n == 2 ? " (+1: a two-way site)" : "");
     }
 #ifdef TESTS
     /* #97 REACH PROBE: this SITE could take a frameless call - the
@@ -8605,6 +8658,16 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
         ld(RDX, RBX, callee_arg * 48);                /* rdx = fo */
     }
     ld(RAX, RDX, static_cast<int32_t>(P.fo_func));    /* rax = desc */
+    if (frameless_site) {
+        /* The frameless tail is the CALL EMITTER's (emit_sync_call_inline,
+         * the `frameless_taken` branch): the identity compare - the
+         * DISPATCH, one per candidate (E3) - and everything after it are
+         * the site's, with rdx = fo, r9 = ctx and rax = the live
+         * descriptor. No cache probe, no gates, no window, no segment,
+         * no record, no fork. */
+        *frameless_out = true;
+        return;
+    }
     if (cached_live) {
         /* M5c: probe the caller's per-frame cache (a map lookup - C++).
          * HIT -> dst written, jump to the site's done label; MISS -> the
@@ -9046,15 +9109,6 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
     }
     e.patch32_here(j_plain);                          /* done: */
     }   /* end of the un-baked probe + gate chain */
-    if (frameless_site) {
-        /* The frameless tail is the CALL EMITTER's (emit_sync_call_inline,
-         * the `frameless_taken` branch): everything after the identity
-         * compare and the per-argument checks is the site's, with
-         * rdx = fo and r9 = ctx live - the baked arm's contract. No
-         * window, no segment, no record, no fork. */
-        *frameless_out = true;
-        return;
-    }
     /* rsi = total = frame_size + n_temps */
     if (!cached && g_pure_cache_enabled) {
         /* a PLAIN call from a cache-carrying caller declines (the stash
@@ -9722,8 +9776,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
      */
     const ArgFuse *af = argfuse_at(old_pc);
     const bool residue = jit_norec_on();
+    const FuncDescriptor *fl_c[2] = { nullptr, nullptr };
     const bool frameless_site =
-        residue && jit_frameless_callee(ck, old_pc, in, nullptr);
+        residue && jit_frameless_candidates(ck, old_pc, in, fl_c, nullptr) > 0;
     std::vector<size_t> j_slows, j_dones;
     if (!frameless_site) {
         /* depth guard: cmp dword [&g_jit_sync_depth], CAP; jge slow */
@@ -9843,57 +9898,25 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
          * on the way out.
          */
         const JitPushLayout &JP = jit_push_layout();
-        const FuncDescriptor *fl_callee =
-            jit_frameless_callee(ck, old_pc, in, nullptr);
-        ML_CHECK(fl_callee && fl_callee->vm_chunk);
-        const Chunk *fl_ck = static_cast<const Chunk *>(fl_callee->vm_chunk);
-        /* W1: the callee's window, on THIS stack, filled here (the
-         * contract: Chunk::frameless_entry_off); dropped with the
-         * residue on both return paths */
-        const int32_t fl_win =
-            (fl_ck->slot_count + fl_ck->n_temps) * 48;
-        std::vector<size_t> j_slow_win;   /* declines AFTER the reserve */
-        emit_frameless_window(e, in, fl_callee, *fl_ck, af, j_slow_win);
-        /* the dst word: the slot address with bit 0 set, or bare 1 for a
-         * discarded result (the arm masks the bit, so it reads 0 = no
-         * write, exactly the record-less spelling). A ref-listed dst
-         * needs no gate: the arm tests the OLD value's type at run time
-         * and declines a reference to jit_ret_norec, which knows the bit. */
-        if (in.target >= 0)
-            e.lea_base(RCX, RBX,                  /* reg:proto: dst|1 */
-                       in.target * static_cast<int32_t>(sizeof(LValue))
-                       + 1);
-        else
-            e.mov_reg_imm32(RCX, 1);              /* reg:proto: discarded */
-        e.push_reg(RCX);                          /* push rcx (dst|1) */
-        e.push_base(R9, static_cast<int32_t>(jit_layout().ctx_captures));
-                                                  /* push [r9+caps]: the
-                                                   * caller's captures */
-        /* ctx.captures = &fo.capture_slots */
-        e.lea_base(RAX, RDX,                      /* reg:proto */
-                   static_cast<int32_t>(JP.fo_capture_slots));
-        e.store_base(RAX, R9,                     /* reg:proto */
-                     static_cast<int32_t>(jit_layout().ctx_captures));
-#ifdef TESTS
-        g_jit_frameless_sites++;                  /* emit-time */
-        e.bump_counter(&g_jit_frameless_pushes);
-        e.bump_counter(&g_jit_sync_inline);
-        e.bump_counter(&g_jit_op_run[static_cast<size_t>(in.op)]);
-#endif
-        e.call_relocs.push_back(
-            { e.pos(),
-              static_cast<const void *>(
-                  static_cast<const char *>(fl_ck->native.base)
-                  + fl_ck->frameless_entry_off) });
-        e.u8(0xE8); e.u32(0);                     /* call <frameless> */
-        if (ns) {
-            ns->off_plain = e.pos();              /* G1: the hardware RA */
-            ns->off_switched = e.pos();           /* one call: both keys */
-            ns->frameless = true;
-        }
-        e.cmp_reg_imm(RAX, -1);
-        const size_t j_fexc = e.j32(0x75);        /* jne: an exception */
-        e.op_reg_imm(Op::plus, RSP, 16 + fl_win); /* the residue + window */
+        /*
+         * #97 E3: THE CANDIDATES. One for a named callee; TWO for a
+         * two-way value site (76's `ops[i % 2]`), where the push ended
+         * with rax = the live descriptor and NO compare (the compare is
+         * the dispatch, and it is emitted here): `cmp rax, desc_k; jne
+         * next_k; <tail_k>` per candidate, and after the last compare
+         * the slow tier. Each tail is the whole frameless call for ITS
+         * callee - window fill, residue, `call rel32` into its entry,
+         * sentinel test, exception path - because the window size, the
+         * parameter binds and the entry differ per callee; the decline
+         * trampolines and the materialisation are shared (the argument
+         * sources are the site's). Every emitted `call` gets its own
+         * NorecSite (the walkers and the entry RA check key by return
+         * address), a copy of the site's with the second call's offsets.
+         */
+        const FuncDescriptor *cands[2] = { nullptr, nullptr };
+        const int ncand =
+            jit_frameless_candidates(ck, old_pc, in, cands, nullptr);
+        ML_CHECK(ncand >= 1 && ncand <= 2);
         /* the caller's view: vframe.slots = rbx, size = the caller's
          * total (main's = its own baked total) */
         const auto vframe_restore = [&]() {
@@ -9907,55 +9930,152 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                     g_cur_caller_desc ? caller_total
                                       : ck.slot_count + ck.n_temps));
         };
-        vframe_restore();
-        j_done1 = e.j32(0xEB);                    /* jmp done */
-        /* an exception conveyed out of the frameless callee: park the
-         * pushed captures in the relay (the postexit restores from it),
-         * repoint the vframe, stamp the site, and re-raise through this
-         * site's exit (no window to release - the callee's epilogue did
-         * that; no segment to adjust) */
-        e.patch32_here(j_fexc);
-        e.pop_reg(RCX);                           /* the captures */
-        if (!e.store_abs32(&g_jit_residue_caps, RCX)) {
-            e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_residue_caps));
-            e.store_base0(RCX, RDX);
+        std::vector<size_t> j_done_fl;            /* every tail's -> done */
+        struct WinTramp { std::vector<size_t> j; int32_t win; };
+        std::vector<WinTramp> tramps;             /* declines after a reserve */
+        std::vector<size_t> j_next;               /* the failed compares */
+        for (int k = 0; k < ncand; k++) {
+            const FuncDescriptor *fl_callee = cands[k];
+            ML_CHECK(fl_callee && fl_callee->vm_chunk);
+            const Chunk *fl_ck =
+                static_cast<const Chunk *>(fl_callee->vm_chunk);
+            /* the identity compare - the one thing that makes every
+             * baked constant below true of the callee actually standing
+             * in the slot (see the push's baked arm) */
+            e.movabs(R11, reinterpret_cast<uint64_t>(fl_callee));
+            e.cmp_rr(RAX, R11);                   /* reg:proto */
+            j_next.push_back(e.j32(0x75));        /* jne next / slow */
+#ifdef TESTS
+            e.bump_counter(&g_jit_bake_push);     /* the baked arm ran */
+#endif
+            /* W1: the callee's window, on THIS stack, filled here (the
+             * contract: Chunk::frameless_entry_off); dropped with the
+             * residue on both return paths */
+            const int32_t fl_win =
+                (fl_ck->slot_count + fl_ck->n_temps) * 48;
+            WinTramp wt; wt.win = fl_win;
+            emit_frameless_window(e, in, fl_callee, *fl_ck, af, wt.j);
+            /* the dst word: the slot address with bit 0 set, or bare 1
+             * for a discarded result (the arm masks the bit, so it reads
+             * 0 = no write, exactly the record-less spelling). A
+             * ref-listed dst needs no gate: the arm tests the OLD value's
+             * type at run time and declines a reference to
+             * jit_ret_norec, which knows the bit. */
+            if (in.target >= 0)
+                e.lea_base(RCX, RBX,              /* reg:proto: dst|1 */
+                           in.target * static_cast<int32_t>(sizeof(LValue))
+                           + 1);
+            else
+                e.mov_reg_imm32(RCX, 1);          /* reg:proto: discarded */
+            e.push_reg(RCX);                      /* push rcx (dst|1) */
+            e.push_base(R9,
+                        static_cast<int32_t>(jit_layout().ctx_captures));
+                                                  /* push [r9+caps]: the
+                                                   * caller's captures */
+            /* ctx.captures = &fo.capture_slots */
+            e.lea_base(RAX, RDX,                  /* reg:proto */
+                       static_cast<int32_t>(JP.fo_capture_slots));
+            e.store_base(RAX, R9,                 /* reg:proto */
+                         static_cast<int32_t>(jit_layout().ctx_captures));
+#ifdef TESTS
+            g_jit_frameless_sites++;              /* emit-time */
+            e.bump_counter(&g_jit_frameless_pushes);
+            e.bump_counter(&g_jit_sync_inline);
+            e.bump_counter(&g_jit_op_run[static_cast<size_t>(in.op)]);
+#endif
+            e.call_relocs.push_back(
+                { e.pos(),
+                  static_cast<const void *>(
+                      static_cast<const char *>(fl_ck->native.base)
+                      + fl_ck->frameless_entry_off) });
+            e.u8(0xE8); e.u32(0);                 /* call <frameless> */
+            if (ns) {
+                NorecSite *kns = ns;
+                if (k > 0) {
+                    /* the second call's own site record */
+                    g_cur_norec_sites->push_back(
+                        std::unique_ptr<NorecSite>(new NorecSite(*ns)));
+                    kns = g_cur_norec_sites->back().get();
+                }
+                kns->off_plain = e.pos();         /* G1: the hardware RA */
+                kns->off_switched = e.pos();      /* one call: both keys */
+                kns->frameless = true;
+            }
+            e.cmp_reg_imm(RAX, -1);
+            const size_t j_fexc = e.j32(0x75);    /* jne: an exception */
+            e.op_reg_imm(Op::plus, RSP, 16 + fl_win);  /* residue + window */
+            vframe_restore();
+            j_done_fl.push_back(e.j32(0xEB));     /* jmp done */
+            /* an exception conveyed out of the frameless callee: park
+             * the pushed captures in the relay (the postexit restores
+             * from it), repoint the vframe, stamp the site, and re-raise
+             * through this site's exit (no window to release - the
+             * callee's epilogue did that; no segment to adjust) */
+            e.patch32_here(j_fexc);
+            e.pop_reg(RCX);                       /* the captures */
+            if (!e.store_abs32(&g_jit_residue_caps, RCX)) {
+                e.movabs(RDX,
+                         reinterpret_cast<uint64_t>(&g_jit_residue_caps));
+                e.store_base0(RCX, RDX);
+            }
+            e.op_reg_imm(Op::plus, RSP, 8 + fl_win);  /* the dst word +
+                                                   * window (its references:
+                                                   * the callee's exit
+                                                   * released them) */
+            vframe_restore();
+            e.mov_rr(RDI, RAX);                   /* reg:abi */
+            emit_bake_call_site(e, ck, old_pc);
+            e.mov_imm(RSI, site);                 /* reg:abi */
+            e.mov_rr(RDX, RBX);
+            e.mov_imm(RCX, static_cast<uint64_t>(
+                              g_cur_caller_desc
+                                  ? static_cast<int_type>(
+                                        g_cur_caller_desc->frame_size
+                                        + ck.n_temps)
+                                  : static_cast<int_type>(-1)));
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_frameless_postexit) });
+            e.u8(0xE8); e.u32(0);
+            e.test32_rr(RAX, RAX);                /* test eax, eax */
+            j_done_fl.push_back(e.j32(0x74));     /* jz done */
+            emit_call_epilogue_divergent(e);
+            e.exit_pc(pc);                        /* re-raise */
+            tramps.push_back(std::move(wt));
+            /* next_k: the next candidate's compare, or the slow tier */
+            e.patch32_here(j_next.back());
         }
-        e.op_reg_imm(Op::plus, RSP, 8 + fl_win);  /* the dst word + window
-                                                   * (its references: the
-                                                   * callee's exit released
-                                                   * them) */
-        vframe_restore();
-        e.mov_rr(RDI, RAX);                       /* reg:abi */
-        emit_bake_call_site(e, ck, old_pc);
-        e.mov_imm(RSI, site);                     /* reg:abi */
-        e.mov_rr(RDX, RBX);
-        e.mov_imm(RCX, static_cast<uint64_t>(
-                          g_cur_caller_desc
-                              ? static_cast<int_type>(
-                                    g_cur_caller_desc->frame_size
-                                    + ck.n_temps)
-                              : static_cast<int_type>(-1)));
-        e.call_relocs.push_back(
-            { e.pos(),
-              reinterpret_cast<const void *>(jit_frameless_postexit) });
-        e.u8(0xE8); e.u32(0);
-        e.test32_rr(RAX, RAX);                    /* test eax, eax */
-        j_done2 = e.j32(0x74);                    /* jz done */
-        emit_call_epilogue_divergent(e);
-        e.exit_pc(pc);                            /* re-raise */
+        for (size_t j : j_done_fl)
+            j_dones.push_back(j);                 /* patched at done: */
         /*
          * W2: THE DECLINE TRAMPOLINES, falling through into the common
-         * slow tail below. A decline inside the fill (after the window
-         * was reserved) gives it back first; every decline - the push's
-         * own (the callee type/identity tests, before the reserve) and
-         * the fill's - then materialises the fused arguments into the
-         * run, which the C++ tier binds from.
+         * slow tail below. A decline inside a fill (after its window was
+         * reserved) gives that window back first; every decline - the
+         * push's own (the callee type test, before any reserve), the
+         * failed compares, and the fills' - then materialises the fused
+         * arguments into the run, which the C++ tier binds from.
          */
-        if (!j_slow_win.empty()) {
-            for (const size_t j : j_slow_win)
+        size_t j_over = 0;
+        bool have_tramp = false;
+        for (const WinTramp &wt : tramps)
+            if (!wt.j.empty())
+                have_tramp = true;
+        if (have_tramp)
+            j_over = e.j32(0xEB);                 /* the compares' path
+                                                   * skips the fixes */
+        std::vector<size_t> j_join;
+        for (size_t t = 0; t < tramps.size(); t++) {
+            if (tramps[t].j.empty())
+                continue;
+            for (const size_t j : tramps[t].j)
                 e.patch32_here(j);
-            e.op_reg_imm(Op::plus, RSP, fl_win);
+            e.op_reg_imm(Op::plus, RSP, tramps[t].win);
+            j_join.push_back(e.j32(0xEB));
         }
+        if (have_tramp)
+            e.patch32_here(j_over);
+        for (const size_t j : j_join)
+            e.patch32_here(j);
         for (const size_t j : j_slows)
             e.patch32_here(j);
         j_slows.clear();                          /* patched here, once */
@@ -10251,11 +10371,16 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     emit_call_epilogue_divergent(e);
     e.exit_pc(pc);
     /* done: */
-    e.patch32_here(j_done1);
-    e.patch32_here(j_done2);
+    if (j_done1)                          /* the recorded tail's (a
+                                           * frameless site's are in
+                                           * j_dones, one per candidate) */
+        e.patch32_here(j_done1);
+    if (j_done2)
+        e.patch32_here(j_done2);
     e.patch32_here(j_done3);              /* the shared slow tail's */
     for (const size_t j : j_dones)
-        e.patch32_here(j);                /* the cached probe's HIT path */
+        e.patch32_here(j);                /* the cached probe's HIT path,
+                                           * the frameless tails' */
     emit_call_epilogue(e);
 }
 
@@ -26499,8 +26624,9 @@ retry_emission:
                  * fuse a frameless site at all: its entry copied the
                  * RUN.)
                  */
+                const FuncDescriptor *fl_c[2] = { nullptr, nullptr };
                 const bool fl_site =
-                    jit_frameless_callee(chunk, pc, in, nullptr) != nullptr;
+                    jit_frameless_candidates(chunk, pc, in, fl_c, nullptr) > 0;
                 const int nargs = static_cast<int>(in.b_lit());
                 const int abase = static_cast<int>(in.a_lit());
                 if (nargs <= 0 || abase < 0)

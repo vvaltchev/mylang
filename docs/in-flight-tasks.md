@@ -465,15 +465,15 @@ work — but profile it before building, the way increment 0 was.
         relocation), W2 the fusion into it (done: the staging move
         gone, a pin stored from its register, the coercing check an
         emit-time fact - 78's add(i) 90 -> 73 instructions per call),
-        then the init elision and the capture base, both site-local
-        now.
+        then E3 (done the same day: the two-way site serves 76), then
+        the init elision and the capture base, both site-local now.
     3.  E2 - drop the leaf rule. Serves 09_fib. GATE includes
         norec_enum --depth 4 (2272 programs x 4 engines), because a
         throw crossing a frameless frame is exactly its shape space.
         ⛔ Its gate must be re-derived from 09_fib's NEW baseline
         (increment 0 made it 20.7% faster), not from the old -4.75% row.
-    4.  E3 - the two-entry inline cache. Serves 76. Last, because it is
-        the only one adding a RUNTIME decision.
+    4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
+        two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 
 **⛔ THE STANDING KILL CRITERION (plan section 4):** if increment 2's
 gate comes back byte-flat on the WALL CLOCK while Ir drops, STOP AND SAY

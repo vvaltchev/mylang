@@ -12661,3 +12661,94 @@ compares the caret too. All four stamps sabotaged together: tw
 1991/1993, the VM modes 1698/1700, the JIT modes 1696/1700. corpus_diff
 34/34 + levers, driver_checks, myv_doc_check, norec_enum --depth 3 (the
 byte-for-byte stderr oracle) all green.
+
+## #97 E3 - THE TWO-WAY FRAMELESS SITE: a value call with two candidates
+## dispatches on the live descriptor into one of two site-local tails
+## (2026-09-20)
+
+**What it is.** 76_funcval_dispatch's `fn = ops[i % 2]; fn(st, i)` has
+a callee SET of exactly two functions (`-dcs`: `many add_op$0,sub_op$0`),
+so E1's one-name stamp could not name it and every call took the generic
+push with its callee cache. The plan's E3 was a runtime decision between
+two BAKED entries, and W1/W2 made it cheap: the frameless tail is
+site-local now, so a two-way site is one resolve, then per candidate
+`movabs r11, desc_k; cmp rax, r11; jne next_k` and that candidate's whole
+tail - its window (the sizes differ: a 4-slot and a 5-slot callee in
+the test), its binds, `call rel32` into ITS entry, the sentinel test,
+its exception path - and after the last compare the slow tier. The
+decline trampolines and the materialisation are shared (the argument
+sources are the site's, not the callee's).
+
+**Where each half lives.**
+ - the INFERENCER stamps `CallExpr::callee_desc2` beside `callee_desc`
+   when the set has exactly two members, both nameable, neither escaped;
+   `callee_fn` stays null (the resolver's consumers need ONE function);
+ - CODEGEN records BOTH as `value_callees` entries at one pc (the
+   encoding is unchanged - `pc, def` per entry, the table
+   non-decreasing; docs/myv-format.txt 9.20). `value_callees_at` returns
+   the pair; `value_callee_at` - the single-candidate query the generic
+   push's bake asks - answers -1 for such a pc, so a two-way site is
+   UNNAMED to everything but the frameless dispatch (baking half a pair
+   would fail the generic arm's compare every other call). The splice
+   carries both entries; verify_chunk bounds each;
+ - the JIT's `jit_frameless_candidates` (one or two; every candidate
+   must pass the whole chain on its own, so the emitted chain never
+   needs a per-candidate decline) replaces `jit_frameless_callee`, which
+   is the one-candidate view now. The pre-pass marks BOTH callees
+   `frameless_wanted`. The push returns for a frameless site right after
+   `rax = desc` - before its cache probe and baked/unbaked arms - and the
+   site emits the compares. Each emitted `call` gets its own NorecSite (a
+   copy of the site's with the second call's return address): the
+   walkers and the entry RA check key by RA.
+
+**Measured (callgrind, OPT=1 ASSERTS=0, -npc, vs W2's tree 9c99f8c):**
+76 **-20.2% Ir** at scale 1 (whole program; JITSTATS: frameless_pushes
+1,000,000 of 1,000,000 calls, two tails at one site); 78/09/12 flat to
+the instruction. What is left per 76 call is what 78's site still pays
+plus the REFERENCE bind through jit_bind_ref_arg (the BORROW: `st` is
+non-escaping) - the helper the inline borrow arm was measured not to
+beat (plans/archived/inline-borrow-arm.md).
+
+**Nets.** Reach cases (values on both engines): 76's shape with the
+refcount difference asserted (the borrow takes no count), two candidates
+with DIFFERENT tails (a declared and a proven int param, 192 and 240
+bytes), THREE candidates staying generic (the `no_pushes` assertion).
+`jit_frameless_e3_shape` reads the dispatch chain and the paired pool
+entry from the dump; `myv_round_trip`'s program gained a two-way site so
+a loaded image must reproduce the pair. Watched failing with the
+two-way stamp removed: both reach cases and the shape test. corpus_diff
+every matrix, driver_checks, the census, myv_doc_check, and the long
+nets - see the commit.
+
+**A note on typed pairs.** Two candidates of a `func`-typed variable
+always share the SIGNATURE - a mixed pair makes the array `array<dyn>`
+and the call the generic dyn op - but not their declarations or frame
+sizes, which is exactly why each candidate needs its own tail.
+
+**Wall clock, one 1-vs-1 run at the end of the task, HEAD vs inc 2
+(3514581), `bench/run.py --mylang build-claude/perf/mylang --baseline
+build-claude/base-3514581/mylang`, -npc:** 76 **0.86x**, 78 **0.90x**,
+63 0.95x, 11 1.02x, 09/10/12/35/75 0.99-1.01x, geomean cur/base 1.001x
+over 90. One outlier: 19_foreach_indexed 1.23x (0.063 -> 0.077s) - a
+loop with no call in it, whose emitted code the protocol does not touch
+and whose callgrind Ir is flat to 0.005% (84.876M -> 84.880M) between
+the two binaries; reported as measured, not re-run (the 1-vs-1 rule),
+and read as a layout/noise artifact of a 63 ms bench rather than a
+regression of anything in this task.
+
+**Two loader refusals the increment's `myv_fuzz` run found** (both
+pre-existing since inc 2 - the images changed shape with the caret
+fix's base_locs entries, so the mutation space did): a stored
+`ExitBlock`, a container-only op the JIT inserts and never writes,
+which the frameless gate admitted (every op "fully native", a terminal
+ReturnV) and the container path then compiled with NO frameless entry
+- its return arm ran on a frame that was never frameless (an oracle
+abort in the debug build, a SEGV in the assert-free one); and a
+function chunk whose `slot_count` was mutated away from its
+descriptor's `frame_size` (0 -> 1024, 0 -> 66) - the push sizes the
+window from the descriptor, the JIT's return arms from the chunk.
+`verify_chunk` refuses the first exactly as it refuses a stored
+EnterNative; `vm_verify_program` checks the second across the two
+records. `myv_verify_cross_records` (-rt) tampers with the compiled
+program in memory and requires the refusal, watched failing both ways;
+docs/myv-format.txt lists both rules under layer 3.
