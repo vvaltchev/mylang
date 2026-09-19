@@ -93,6 +93,11 @@ struct PureCacheKeyHash {
 
 /* Node-POOLED (poolalloc.h) like the dict map: a recursion's per-frame
  * cache inserts a node per novel call - the pool serves + reuses them. */
+/* -npc: the per-frame pure-call cache is OFF.  Declared HERE, above
+ * Frame, because ensure_pure_cache()'s ML_CHECK reads it - and the
+ * JIT's -npc norec exemption rests on that check. */
+extern bool g_pure_cache_enabled;
+
 typedef std::unordered_map<PureCacheKey, EvalValue, PureCacheKeyHash,
                            std::equal_to<PureCacheKey>,
                            PoolAlloc<std::pair<const PureCacheKey,
@@ -116,8 +121,29 @@ struct Frame {
     Frame(const Frame &) = delete;  /* never copied; slots would dangle */
     Frame(Frame &&) = delete;
 
+    /*
+     * ⛔ THE ONE ALLOCATION SITE, AND THE JIT NOW DEPENDS ON ITS GUARD.
+     *
+     * `jit_chunk_norec_ok` refuses a body containing CachedCallV,
+     * because "a cached-call body could acquire a live vframe pure
+     * cache, which a record-less return cannot stash".  Under `-npc`
+     * that hazard CANNOT occur - no cache is ever built - so the tier
+     * is allowed there, which is worth -20.7% Ir on 09_fib.
+     *
+     * That makes "no PureCache exists when the flag is off" a
+     * SOUNDNESS PRECONDITION of emitted code, not a tidy fact.  It
+     * held by audit when written (every path here - pure_cache_call's
+     * two callers, vm_cache_probe_vals' four, and
+     * vm_frame_leave_cached, which is reachable only via a parked
+     * probe key - tests the flag first).  An audit is a snapshot; this
+     * is the invariant, stated where it cannot be walked past.
+     */
     PureCache &ensure_pure_cache()
     {
+        ML_CHECK_MSG(g_pure_cache_enabled,
+                     "a pure cache is being built with the cache "
+                     "DISABLED - jit_chunk_norec_ok's -npc exemption "
+                     "rests on this being impossible");
         if (!pure_cache)
             pure_cache = std::unique_ptr<PureCache>(new PureCache());
         return *pure_cache;
@@ -674,7 +700,6 @@ void run_weight_bench();
 
 /* The per-frame pure-call cache (PureCache) is on by default; `-npc` clears
  * this to measure the recursion unroll without it. */
-extern bool g_pure_cache_enabled;
 
 
 inline EvalContext *
