@@ -10661,6 +10661,9 @@ void jit_stats_report()
         { "noesc_cs_named",   &g_esc_named_by_cs },
         { "cb_prepared",      &g_invoke_prepared },
         { "cb_fallback",      &g_invoke_fallback },
+        /* #121: slot binds served by the dispatch-free same-kind handle
+         * move-assign, vs the ordinary put() they decline to. */
+        { "ref_bind_fast",    &g_ref_bind_fast },
         /* THE CALL PROTOCOL - which tier each call took */
         { "sync_inline",      &g_jit_sync_inline },
         { "arg_inplace",      &g_jit_arg_inplace },

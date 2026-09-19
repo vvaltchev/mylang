@@ -107,6 +107,9 @@ extern unsigned long g_dyn_foreach_fast[5];
 /* H3 (#159) execution proof: unpack binds that took the direct SharedStr
  * copy-assign (no type-erased dispatch) instead of put() */
 extern unsigned long g_unpack_fast_binds;
+/* #121 execution proof: slot binds that took the direct same-kind handle
+ * move-assign (vm_slot_bind_ref) instead of put()'s three-frame chain */
+extern unsigned long g_ref_bind_fast;
 #endif
 
 /*

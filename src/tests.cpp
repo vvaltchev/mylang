@@ -21468,6 +21468,187 @@ static bool unpack_fast_bind_shapes()
     return true;
 }
 
+/*
+ * #121: the DISPATCH-FREE same-kind reference bind at a call RETURN actually
+ * RUNS, per reference kind, and DECLINES where it must (prove the code ran).
+ *
+ * g_ref_bind_fast is bumped ONLY inside vm_slot_bind_ref's taken arm, never
+ * by the put() fallback, so growth proves the fast arm executed and an exact
+ * ZERO proves a guard declined. One script per shape, so the counter
+ * attributes per shape rather than program-wide.
+ *
+ * Shape notes (the VACUOUS-TEST TRAP, CLAUDE.md):
+ *  - every callee is called as `var x = f(i)`, never `return f(i)`, so the
+ *    AST tail-inliner does not splice the call away before codegen sees it;
+ *  - every callee's argument is the LOOP VARIABLE, so nothing const-folds and
+ *    no const-arg specialization propagates a literal into the body;
+ *  - every body is deliberately over the block-inline weight gate (a call
+ *    plus two statements), so the call survives to a real return;
+ *  - the first iteration binds over a `none` slot - a TYPE CHANGE, which
+ *    declines - so N iterations yield N-1 fast binds, and the floors below
+ *    are set from that, not from N.
+ *
+ * The ARRAY case is the pin on the deliberate t_arr omission: it must stay at
+ * exactly zero, or the "cost, not safety" decision recorded at
+ * vm_slot_bind_ref has silently been reversed.
+ *
+ * The ALTERNATING case alternates two DIFFERENT REFERENCE kinds (str and
+ * func) rather than reference-vs-int on purpose: with an int, dropping the
+ * type-equality guard would still decline at the switch's `default`, so the
+ * sabotage would pass. With two reference kinds it reaches the wrong case
+ * arm and fails loudly.
+ */
+static bool ref_bind_fast_shapes()
+{
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    struct Case {
+        const char *name;
+        std::vector<const char *> lines;
+        unsigned long min_fast;   /* growth floor */
+        bool exact_zero;          /* a DECLINE shape: growth must be 0 */
+    };
+    const std::vector<Case> cases = {
+        /* t_func - 63_closures' own shape: a factory returning a closure,
+         * its result re-bound in a loop. 8 iterations -> >= 7 fast binds. */
+        { "closure result (the 63 shape)", {
+            "func mkc(int i) {",
+            "    var b = i * 2;",
+            "    var q = b + 1;",
+            "    return func [q] () { return q; };",
+            "}",
+            "var s = 0;",
+            "for (var k = 0; k < 8; k++) { var c = mkc(k); s = s + c(); }",
+            "assert(s == 64);" }, 7, false },
+        /* t_str */
+        { "string result", {
+            "func mks(int i) {",
+            "    var a = \"v\" + str(i);",
+            "    var b = a + \"!\";",
+            "    return b;",
+            "}",
+            "var n = 0;",
+            "for (var k = 0; k < 8; k++) { var t = mks(k); n = n + len(t); }",
+            "assert(n == 24);" }, 7, false },
+        /* t_dict */
+        { "dict result", {
+            "func mkd(int i) {",
+            "    var d = {};",
+            "    d[\"k\"] = i * 3;",
+            "    return d;",
+            "}",
+            "var n = 0;",
+            "for (var k = 0; k < 8; k++) { var m = mkd(k); n = n + m[\"k\"]; }",
+            "assert(n == 84);" }, 7, false },
+        /* t_struct - a struct INSTANCE handle. POD or boxed, the VALUE is
+         * an intrusive_ptr<StructObject> either way, which is what this
+         * arm binds; a `str` field keeps it off the POD layout so the
+         * boxed shape is the one exercised. */
+        { "struct result", {
+            "struct P { int x; str tag; }",
+            "func mkp(int i) {",
+            "    var v = i + 1;",
+            "    var w = v * 2;",
+            "    return P(w, \"t\");",
+            "}",
+            "var n = 0;",
+            "for (var k = 0; k < 8; k++) { var p = mkp(k); n = n + p.x; }",
+            "assert(n == 72);" }, 7, false },
+        /* DECLINE: t_arr is deliberately absent from the switch */
+        { "array result declines (t_arr omitted)", {
+            "func mka(int i) {",
+            "    var a = [];",
+            "    append(a, i * 5);",
+            "    return a;",
+            "}",
+            "var n = 0;",
+            "for (var k = 0; k < 8; k++) { var z = mka(k); n = n + z[0]; }",
+            "assert(n == 140);" }, 0, true },
+        /* DECLINE: two DIFFERENT reference kinds alternating, so every bind
+         * is a type change and the equality guard must refuse all of them */
+        { "alternating str/func declines", {
+            "func pick(int i) {",
+            "    var b = i + 1;",
+            "    if (i % 2 == 0) {",
+            "        var f = func [b] () { return b; };",
+            "        return f;",
+            "    }",
+            "    var t = \"s\" + str(b);",
+            "    return t;",
+            "}",
+            "var n = 0;",
+            "for (var k = 0; k < 8; k++) {",
+            "    var dyn v = pick(k);",
+            "    n = n + len(typestr(v));",
+            "}",
+            "assert(n > 0);" }, 0, true },
+        /* DECLINE: a TRIVIAL (int) result never reaches the switch */
+        { "int result declines", {
+            "func mki(int i) {",
+            "    var b = i * 7;",
+            "    var c = b + 2;",
+            "    return c;",
+            "}",
+            "var n = 0;",
+            "for (var k = 0; k < 8; k++) { var r = mki(k); n = n + r; }",
+            "assert(n == 212);" }, 0, true },
+    };
+    for (const Case &c : cases) {
+        const unsigned long b0 = g_ref_bind_fast;
+        /* ⛔ THE LEAK ORACLE FOR THE CLOSURE ARM. Every other reference kind
+         * here is caught by the debug lane's LeakSanitizer, but FuncObject
+         * carries ML_POOL_NEW_DELETE, so a leaked closure is memory the POOL
+         * already owns and LSan reports it NOWHERE (see the ~FuncObject note
+         * in eval.h). The live count is the substitute, and it is exactly
+         * what a fast arm that forgot to release the OLD value - or that
+         * dropped the source tag over a payload it had only COPIED - would
+         * move. 8 iterations, so a per-iteration leak is +8. */
+        const unsigned long live0 = g_live_funcobjs;
+        if (!run(c.lines)) {
+            fprintf(stderr, "ref_bind_fast_shapes: '%s' FAILED to run\n",
+                    c.name);
+            return false;
+        }
+        if (g_live_funcobjs > live0 + 2) {
+            fprintf(stderr, "ref_bind_fast_shapes: '%s' LEAKED %lu "
+                            "FuncObject(s)\n",
+                    c.name, g_live_funcobjs - live0);
+            return false;
+        }
+        const unsigned long grew = g_ref_bind_fast - b0;
+        if (c.exact_zero ? (grew != 0) : (grew < c.min_fast)) {
+            fprintf(stderr, "ref_bind_fast_shapes: '%s' fast binds = %lu, "
+                            "wanted %s%lu\n",
+                    c.name, grew, c.exact_zero ? "exactly " : ">= ",
+                    c.exact_zero ? 0ul : c.min_fast);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Lever 2 (VmInvoker direct fragment entry): per callback ELEMENT the
  * invoker calls jit_enter directly instead of re-entering vm_dispatch -
  * g_jit_invoke_direct counts those entries, so growth ~ the element
@@ -38828,6 +39009,8 @@ static const std::vector<extra_check> extra_checks =
       array_elem_read_shapes },
     { "vm: the dispatch-free string unpack bind runs (H3)",
       unpack_fast_bind_shapes },
+    { "vm: the dispatch-free same-kind reference bind runs (#121)",
+      ref_bind_fast_shapes },
     { "codegen: an indirect call's result is a typed operand (H4)",
       call_result_typed_shapes },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",

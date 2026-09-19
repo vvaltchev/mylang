@@ -10915,6 +10915,117 @@ values.
 gate's NO-CALL-OP rule - a self-imposed leaf restriction, not an
 information gap.
 
+## #121 - the REFERENCE-RETURNING return skips three call frames to do
+## one handle assign (2026-08-29)
+
+A call whose result is a REFERENCE writes the caller's slot with
+`dst->put(std::move(res))`. That is correct, and to perform a release
+plus two pointer stores it costs THREE nested out-of-line frames:
+
+    LValue::put(EvalValue &&)                       ~7 Ir of frame
+      EvalValue::operator=(EvalValue &&)            ~24 Ir  (call frame
+                                                     + the type compare)
+        TypeImpl<intrusive_ptr<FuncObject>>::move_assign
+                                                    ~38 Ir  (14 of it
+                                                     prologue/epilogue)
+
+**MEASURED FIRST, and the ledger is the point** (callgrind, `-npc`,
+`DEBUG_INFO=1 OPT=1 ASSERTS=0`, 63_closures at scale 1 - 400,000
+reference-returning returns):
+
+    the whole put chain        27.6M Ir   69 Ir per return
+      of which REAL WORK        9.6M      24 Ir  (the release, the
+                                                  destroy, the stores)
+      of which FRAME/DISPATCH  18.0M      45 Ir  = 7.0% of the program
+
+45 of 69 instructions were spent asking a function-pointer table which
+handle assign to run, for a handle whose concrete type was known at the
+call site all along. This is H3's finding (`vm_slot_bind_str`,
+75_indexed_unpack 0.84x wall / -25.4% Ir) one type family over, and H3's
+own note had already enumerated it as an unbuilt sibling: *"the
+general-storage branch (a func/array/dict element - the same
+indirect-call chain)"*.
+
+**THE FIX** is `vm_slot_bind_ref` (vm.cpp), beside its two H3 siblings:
+when the destination is a plain slot and BOTH sides carry the same
+reference tag, run that handle's own `operator=` inline. It is the very
+operator the type table would have dispatched to - the change is not
+asking which one.
+
+Wired at BOTH return tiers - `jit_ret_norec` (the JIT's record-less
+decline arm) and `vm_frame_leave_body` (the interpreted leave, shared by
+`vm_leave_call` / `jit_ret` / `jit_halt`). **Deliberately both**: `-nj`
+and `MYLANG_JIT_OFF` are shipping configurations, and a tier that exists
+in only one of them makes any test of it silently vacuous in the other.
+Verified with `MYLANG_JITSTATS`: 499 fast binds over 500 closure
+creations under the JIT, under `-nj`, and under `MYLANG_JIT_OFF=norec`
+alike (the one miss is iteration 1, binding over a `none` slot - a type
+change, which declines).
+
+**THREE DECLINE CONDITIONS, and only one of them is reachable today.**
+A different tag declines (that is the whole guard). A CONTAINER-backed
+slot must take put()'s copy-on-write path, and a BORROWED slot (#94)
+holds a bit-copy whose reference the caller owns - both are kept because
+the helper is written to be reusable, and both are UNREACHABLE from the
+two callers here, which pass frame slots. No test claims them; saying so
+is the honest form.
+
+**t_arr IS ABSENT FOR COST, NOT SAFETY - and the comment says so.**
+`SharedArrayObj::operator=(&&)` would be correct here; it already erases
+`this` from its old SharedObject's live-slices set. But it is not a
+handle move - for a slice it is two `std::set` operations plus four
+field copies - so the dispatch this removes is a small fraction of what
+the op costs. Admitting it is a measurable follow-up. Writing "must stay
+absent for safety" would have been a false claim, which is worse than no
+claim: the next reader would have believed a hazard that is not there.
+
+**REACH + THE LEAK ORACLE** - `ref_bind_fast_shapes` (tests.cpp), seven
+shapes, one script each so the counter attributes per shape:
+t_func/t_str/t_dict/t_struct assert growth >= N-1; t_arr, an
+alternating str/func rebind, and an int result assert EXACTLY ZERO.
+
+⛔ The alternating case uses two different REFERENCE kinds on purpose.
+With int-vs-func, dropping the type-equality guard still declines at the
+switch's `default`, so the sabotage would pass. With str-vs-func it
+reaches the wrong case arm and aborts.
+
+⛔ And every case additionally asserts `g_live_funcobjs` did not grow.
+FuncObject carries `ML_POOL_NEW_DELETE`, so a leaked closure is memory
+the pool already owns and LeakSanitizer reports it NOWHERE (the reason
+`~FuncObject` exists at all under TESTS). The live count is the
+substitute, and it is exactly what a fast arm that forgot to release the
+OLD value would move.
+
+**WATCHED FAILING**, all three:
+ - the type-equality guard removed -> `-rt` ABORTS (rc 134);
+ - `case Type::t_arr` admitted -> `array result declines` reports
+   `fast binds = 7, wanted exactly 0`;
+ - the func arm placement-new'd over the old handle instead of
+   assigning -> `closure result` reports `LEAKED 7 FuncObject(s)`.
+
+**MEASURED** (callgrind Ir per scale unit, `OPT=1 ASSERTS=0`, `-npc`),
+marginal, i.e. against the #109 build below:
+
+    63_closures          -2.56%
+    76_funcval_dispatch  +0.00%
+    09_fib_recursive     +0.00%
+    75_indexed_unpack    +0.00%
+    47_wordcount         +0.00%
+    01_while_loop        +0.00%   (control)
+
+A narrow blast radius by construction: the tier fires only where a call
+RETURNS a reference into a slot that already holds one.
+
+**⛔ A SABOTAGE HARNESS MUST REBUILD AFTER IT RESTORES.** The sabotage
+script here restored `src/vm.cpp` from a `trap` on exit and did NOT
+rebuild, so `build-claude/t121/mylang` stayed built from sabotage #3 -
+"the old closure is not released". The next thing run against it was
+`corpus_diff`, which duly reported `32/34 agree` with LeakSanitizer
+traces on the two closure programs, and half an hour went into
+attributing a leak that only the harness had created. The tree was
+clean the whole time. Same family as [[stale-build-lane-wrong-subject]]:
+restoring the SOURCE is not restoring the SUBJECT.
+
 ## #109 - `intrusive_ptr::release` splits into an inline decrement and
 ## an out-of-line destroy (2026-08-29)
 

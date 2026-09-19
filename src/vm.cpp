@@ -4714,6 +4714,105 @@ vm_slot_bind_value(LValue &dst, const EvalValue &src)
     dst.put(src);
 }
 
+#ifdef TESTS
+unsigned long g_ref_bind_fast = 0;   /* #121 execution proof */
+#endif
+
+/*
+ * #121: the DISPATCH-FREE same-kind REFERENCE bind - H3's shape (the two
+ * helpers above), one type family over.
+ *
+ * `dst.put(std::move(src))` is correct and costs THREE nested out-of-line
+ * frames to perform a release plus two pointer stores: put() itself, then
+ * EvalValue::operator=(EvalValue &&), then the type-erased
+ * TypeImpl<T>::move_assign reached through the Type ops table. Measured on
+ * 63_closures (callgrind, DEBUG_INFO=1, OPT=1 ASSERTS=0, 400,000
+ * reference-returning returns): 69 Ir per return, of which the release and
+ * the destroy are 24 - the other 45, i.e. 7.0% of the whole program, is
+ * frame and dispatch to reach a handle assign whose concrete type was known
+ * all along.
+ *
+ * When both sides carry the SAME reference tag and the slot is a plain one,
+ * that type IS known here, so the bind is the handle's own operator=, fully
+ * inline. Observably identical to put(): it is the very operator= the type
+ * table would have dispatched to, without asking the table which one.
+ *
+ * THREE DECLINE CONDITIONS, each load-bearing:
+ *  - a CONTAINER-backed slot (an array element) must take put()'s
+ *    copy-on-write path. A frame slot never sets `container`, so the caller
+ *    below always passes this - it is kept because the helper is written to
+ *    be reusable, and a future caller with an element destination must not
+ *    silently skip COW;
+ *  - a BORROWED slot (#94) holds a raw bit-copy whose reference the caller
+ *    owns; assigning over it would release a count this slot never took.
+ *    put() ML_CHECKs that this never happens, so declining here preserves
+ *    that abort instead of racing past it in an ASSERTS=0 build;
+ *  - DIFFERENT tags: the destination must be destroyed and re-constructed as
+ *    another type, which is exactly what operator= exists for.
+ *
+ * t_arr IS DELIBERATELY ABSENT, and the reason is COST, not safety - say it
+ * accurately, because a false safety claim in a comment is worse than none.
+ * SharedArrayObj::operator=(&&) would be correct here: it is the same
+ * operator the type table dispatches to, and it already erases `this` from
+ * its old SharedObject's live-slices set before taking the new one (see
+ * *Copy-on-write containers* in CLAUDE.md - the missing erase there was a
+ * real use-after-free). But it is NOT a handle move: for a slice it is two
+ * std::set operations plus four field copies, so the dispatch this helper
+ * removes is a small fraction of what the op costs, and inlining it at every
+ * return site buys little for real text growth. Admitting t_arr is a
+ * measurable follow-up, not a correctness question.
+ *
+ * The switch FAILS CLOSED: an unlisted tag returns false and the caller does
+ * the ordinary put(), so a reference type added later costs this
+ * optimization and can never cost correctness.
+ */
+static inline bool
+vm_slot_bind_ref(LValue &dst, EvalValue &src)
+{
+    if (dst.container || dst.is_borrowed()
+            || dst.get().get_type() != src.get_type())
+        return false;
+
+    switch (src.get_type()->t) {
+
+    case Type::t_str:
+        dst.getval<SharedStr>() = std::move(src.get<SharedStr>());
+        break;
+
+    case Type::t_func:
+        dst.getval<intrusive_ptr<FuncObject>>() =
+            std::move(src.get<intrusive_ptr<FuncObject>>());
+        break;
+
+    case Type::t_ex:
+        dst.getval<intrusive_ptr<ExceptionObject>>() =
+            std::move(src.get<intrusive_ptr<ExceptionObject>>());
+        break;
+
+    case Type::t_dict:
+        dst.getval<intrusive_ptr<DictObject>>() =
+            std::move(src.get<intrusive_ptr<DictObject>>());
+        break;
+
+    case Type::t_struct:
+        dst.getval<intrusive_ptr<StructObject>>() =
+            std::move(src.get<intrusive_ptr<StructObject>>());
+        break;
+
+    default:
+        return false;       /* t_arr and every trivial tag */
+    }
+
+    /* The payload is moved-from (a null handle), so the tag is all that is
+     * left to drop - and dropping it is what spares the caller's EvalValue
+     * one more indirect dtor call when it goes out of scope. */
+    src.drop_moved_from_tag();
+#ifdef TESTS
+    g_ref_bind_fast++;
+#endif
+    return true;
+}
+
 /* The SHARED UnpackElem* body (the STRICT foreach-unpack of pairs[i] into N
  * loop vars): ONE implementation for the four interpreter handlers AND
  * jit_unpack_elem. `kind` 0 = int (flat-ints fast path), 1 = float, 2 =
@@ -7326,9 +7425,17 @@ vm_frame_leave_body(VmActivation &act, EvalContext &ctx, EvalValue &&res)
         return;
     }
     act.pop_window();
-    if (dst >= 0)                /* -1 = a DISCARDED call statement's dst
+    if (dst >= 0) {              /* -1 = a DISCARDED call statement's dst
                                   * (the peephole's dead-dst rule) */
-        ctx.frame->at(dst).put(std::move(res));
+        /* #121: the same dispatch-free reference re-bind jit_ret_norec
+         * takes. Wired HERE as well so the tier is not JIT-only: `-nj`
+         * and MYLANG_JIT_OFF are shipping configurations, and an
+         * optimization that exists in one tier only makes any test of it
+         * silently vacuous in the other. */
+        LValue &d = ctx.frame->at(dst);
+        if (!vm_slot_bind_ref(d, res))
+            d.put(std::move(res));
+    }
 }
 
 
@@ -7424,7 +7531,11 @@ extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
     act.cur_sg->cur -= total;
     ctx.captures = *reinterpret_cast<CaptureSlots *const *>(
         static_cast<const char *>(rbp) + 16);
-    if (dst_addr)
+    /* #121: a REFERENCE result re-binding a slot that already holds the same
+     * reference kind - the steady state of every factory loop - skips the
+     * put/operator=/move_assign frame chain entirely. It declines to put()
+     * for a first bind, a type change, and every trivial result. */
+    if (dst_addr && !vm_slot_bind_ref(*dst_addr, res))
         dst_addr->put(std::move(res));
     return JIT_RET_SENTINEL;
 }

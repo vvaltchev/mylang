@@ -247,6 +247,27 @@ section at all; and its programs were all statically typed while the
 missing opcode lives in a boxed TYPE CHECK. See *THE VACUOUS-TEST
 TRAP*.
 
+**⛔ AND A SABOTAGE HARNESS MUST REBUILD AFTER IT RESTORES — RESTORING
+THE SOURCE IS NOT RESTORING THE SUBJECT (2026-08-29).** The
+watch-it-fail rule means running a build with the defect reintroduced,
+so every such harness ends by putting the source back. That is only
+half the job: the BINARY it left behind is still the sabotaged one, and
+the next command run against it measures the sabotage.
+
+Watched, and it cost half an hour: a `trap restore EXIT` put
+`src/vm.cpp` back after three #121 sabotages and did not rebuild, so
+`build-claude/t121/mylang` stayed built from *"the old closure is not
+released"*. `corpus_diff` was the next thing run and duly reported
+`32/34 agree` with LeakSanitizer traces on the two closure programs —
+a completely convincing leak, in a tree that was clean. The tell that
+should have come first: `git diff` showed nothing wrong, and a
+BASELINE worktree build did not reproduce it.
+
+**Put the rebuild INSIDE the restore function**, not after the last
+case, so an early `set -e` exit or an interrupt cannot skip it. Same
+family as [[stale-build-lane-wrong-subject]] and RULE B1: before asking
+what a measurement means, ask what BINARY produced it.
+
 ## What this is
 
 MyLang is an educational, dynamically-typed scripting language (C-looking
