@@ -1160,7 +1160,12 @@ collision). Three nets now:
   itself and binds each argument from where it lives at that pc, a
   pin from its register; its decline trampoline materialises the
   run the same way; a TWO-WAY value site - E3 - dispatches on the
-  live descriptor into one of two such tails), xcache (#96: the
+  live descriptor into one of two such tails; W3: the site leaves a
+  window slot UNINITIALISED when it is not a parameter, not
+  ref-listed and written ONLY by ops in `jit_instr_stores_dst_raw` -
+  a per-INSTRUCTION whitelist an op joins only when EVERY tier of its
+  emission stores the dst raw; a TESTS build poisons such a slot with
+  `jit_poison_type`, so a wrong row aborts by name), xcache (#96: the
   CALLER-saved half of the
   pin pool - it holds hot locals too, spilled/reloaded around every
   helper call by emit_call_prologue/epilogue. **Which members a run

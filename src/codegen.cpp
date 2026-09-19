@@ -10892,6 +10892,8 @@ codegen_chunk(const Block *block, int slot_count, bool jit,
      * reason: both ends of a call protocol must read it BEFORE any jit.
      * Nothing consumes it to decide emission yet. */
     cg.chunk.frameless_ok = jit_chunk_frameless_ok(cg.chunk);
+    cg.chunk.frameless_init_free =                     /* #97 inc 3 W3 */
+        jit_chunk_frameless_init_free(cg.chunk);
 #ifdef TESTS
     if (cg.chunk.frameless_ok)
         g_jit_frameless_chunks++;
@@ -11680,5 +11682,6 @@ bool bc_inline_chunk(Chunk &ck,
     build_boxed_ops(ck);
     ck.native_leaf = jit_chunk_is_native_leaf(ck);
     ck.frameless_ok = jit_chunk_frameless_ok(ck);   /* #97 reach probe */
+    ck.frameless_init_free = jit_chunk_frameless_init_free(ck);   /* W3 */
     return true;
 }

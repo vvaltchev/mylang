@@ -28316,13 +28316,21 @@ static bool jit_frameless_w2_shape()
                     "mov [r10+0x28], 0",
                     "mov [r10+0x0], r1*",        /* the pinned i, r12-r15 */
                     "mov [r10+0x18], <int-tag>@r11",  /* declared int */
-                    "xor r11, r11",              /* the two temps' tails */
+                    /* W3: the two temps are written raw by the body
+                     * (a proven-scalar capture read, an int add), so
+                     * the site leaves them UNINITIALISED - in this
+                     * TESTS build it zeroes their tails and POISONS
+                     * their type words instead (the static sentinel
+                     * through r11; t_none would be an arena immediate
+                     * `mov [..], <addr>` - jit_frameless_w3_shape) */
+                    "xor r11, r11",
                     "mov [r10+0x50], r11",
                     "mov [r10+0x58], r11",
                     "mov [r10+0x80], r11",
                     "mov [r10+0x88], r11",
-                    "mov [r10+0x48], <addr>@r11", /* t_none */
-                    "mov [r10+0x78], <addr>@r11",
+                    "movabs r11, <addr>",        /* jit_poison_type */
+                    "mov [r10+0x48], r11",
+                    "mov [r10+0x78], r11",
                     "lea rcx, [rbx+0x*]",        /* dst|1 */
                     "push rcx",
                     "push [r9+0x*]",             /* the caller's captures */
@@ -28384,6 +28392,135 @@ static bool jit_frameless_w2_shape()
                             "`a` still emits code\n");
             ok = false;
         }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 increment 3, W3 - THE SITE WRITES ONLY WHAT THE BINDS DO NOT.
+ * A window slot that is not a parameter, not ref-listed, and written
+ * only by ops that store their dst RAW (Chunk::frameless_init_free) is
+ * left as raw stack: no tail zeroing, no t_none - nothing ever reads
+ * its old state. In a TESTS build the site POISONS such a slot instead
+ * (its tails zeroed, its type word the static jit_poison_type, whose
+ * lifecycle ops abort by name), which is what the dump shows here and
+ * what tells a skipped slot from a kept one: a kept slot's t_none is
+ * an arena IMMEDIATE (`mov [r10+d], <addr>`), the poison a static
+ * object materialised through r11 (`mov r11, <addr>` once, then a
+ * register store per slot).
+ *
+ * The shape: a closure whose body reads `st[x]` (LoadElemInt - its
+ * slow tier writes the dst through put(), so r2 KEEPS its init), a
+ * proven-scalar capture (LoadCaptureV with cap_scalar: raw, SKIPPED)
+ * and an int add (SKIPPED). The parameters' tails and binds precede.
+ * The RELEASE form (no poison, the slots simply absent from the site)
+ * is pinned by tests/driver_checks.sh against a non-TESTS binary.
+ */
+static bool jit_frameless_w3_shape()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    std::string d;
+    try {
+        d = native_dump_of({
+            "func mkget(int d) {",
+            "  return func [d] (st, x) { return st[x] + d; }; }",
+            "var gt = mkget(2);",
+            "var st = [7, 5, 9];",
+            "var N = int(runtime(40));",
+            "var s = 0;",
+            "for (var i = 0; i < N; i++) s = s + gt(st, (i % 3) - 3);",
+            "print(s);" });
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_frameless_w3_shape: threw %s: %s\n", e.name,
+                e.msg);
+        return false;
+    }
+    bool ok = true;
+    const std::vector<NativeIns> mn = native_ins_of(d, "main");
+    const size_t at = native_find(mn, 0, "sub rsp, 240");
+    if (at == std::string::npos) {
+        fprintf(stderr, "jit_frameless_w3_shape: no 5-slot frameless site "
+                        "in main\n");
+        return false;
+    }
+    /* the init follows the second parameter's bind join: find the
+     * `xor r11, r11` after the site's start */
+    const size_t xr = native_find(mn, mn[at].off + 1, "xor r11, r11");
+    ok = xr != std::string::npos
+         && native_expect(mn, xr, {
+                "xor r11, r11",
+                "mov [r10+0x80], r11",       /* r2's tails (kept) */
+                "mov [r10+0x88], r11",
+                "mov [r10+0xb0], r11",       /* r3's, r4's (poisoned) */
+                "mov [r10+0xb8], r11",
+                "mov [r10+0xe0], r11",
+                "mov [r10+0xe8], r11",
+                "mov [r10+0x78], <addr>@r11", /* r2: t_none - an immediate
+                                               * on the arena; off it the
+                                               * same movabs form as the
+                                               * poison, and the pin then
+                                               * tells the two apart by
+                                               * their GROUPING (one
+                                               * movabs per group) */
+                "movabs r11, <addr>",        /* jit_poison_type */
+                "mov [r10+0xa8], r11",       /* r3 */
+                "mov [r10+0xd8], r11",       /* r4 */
+                "lea rcx, [rbx+0x*]" },      /* the residue */
+                "W3 site gt(st, x)") && ok;
+    /* and the count the site reports: two slots of this site's window
+     * (the counter is emit-time; the 78 shape in the W2 test adds its
+     * own) */
+    if (g_jit_frameless_init_free == 0) {
+        fprintf(stderr, "jit_frameless_w3_shape: frameless_init_free "
+                        "never bumped\n");
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 inc 3, W3 - THE RAW WHITELIST IS A SUBSET OF op_writes_scalar.
+ * The site leaves a slot uninitialised only if every writer stores it
+ * raw; a ref-listed slot is excluded on top, and for a non-parameter
+ * slot that exclusion is redundant EXACTLY WHEN no raw-whitelisted op
+ * can write a reference - i.e. when every opcode the whitelist admits
+ * is one `op_writes_scalar` calls trivial (LoadCaptureV's admission is
+ * per instruction, `cap_scalar`, which compute_ref_slots honours the
+ * same way). Walked over the WHOLE opcode enum, so admitting an opcode
+ * that can write a reference fails here by name.
+ */
+static bool jit_raw_whitelist_is_scalar()
+{
+#if ML_JIT_SUPPORTED
+    bool ok = true;
+    int admitted = 0;
+    for (const OpCode o : ml_opcheck::ml_op_order) {
+        Instr in{};
+        in.op = o;
+        if (o == OpCode::LoadCaptureV)
+            continue;                    /* per-instruction: cap_scalar */
+        if (!jit_test_instr_stores_dst_raw(in))
+            continue;
+        admitted++;
+        if (!op_writes_scalar(o)) {
+            fprintf(stderr, "W3: opcode %d is in the raw whitelist but "
+                            "op_writes_scalar says it may write a "
+                            "reference\n", static_cast<int>(o));
+            ok = false;
+        }
+    }
+    if (admitted < 20) {                 /* the family alone is 23 */
+        fprintf(stderr, "W3: only %d opcodes admitted - the whitelist "
+                        "shim is not the live table\n", admitted);
+        ok = false;
     }
     return ok;
 #else
@@ -28749,6 +28886,41 @@ static bool jit_frameless_call_reach()
             "var N = int(runtime(30));",
             "for (var i = 0; i < N; i++) { var fn = ops[i % 3]; fn(st, i); }",
             "print(st[0]);" }, "3039 \n", 0, false, true },
+        /* #97 inc 3, W3: the site leaves a raw-written slot UNINITIALISED
+         * (poisoned in this build - jit_poison_type aborts by name if
+         * anything reads it) */
+        { "W3: a KEPT slot beside SKIPPED ones - `st[x]` with a NEGATIVE "
+          "index takes LoadElemInt's slow tier, whose put() reads the "
+          "dst's old state (kept); the capture read and the add store "
+          "raw (skipped). Watched: admitting LoadElemInt to the raw list "
+          "hits the poison here", {
+            "func mkget(int d) {",
+            "  return func [d] (st, x) { return st[x] + d; }; }",
+            "var gt = mkget(2);",
+            "var st = [7, 5, 9];",
+            "var N = int(runtime(40));",
+            "var s = 0;",
+            "for (var i = 0; i < N; i++) s = s + gt(st, (i % 3) - 3);",
+            "print(s);" }, "360 \n", 40, false },
+        { "W3: LOCALS written raw are skipped like temps (the same rule: "
+          "not a parameter, not ref-listed, raw writers only)", {
+            "func mk(int z) { return func [z] (int k) {",
+            "  var t = k * z; var u = t + 1; var f = u * 0.5;",
+            "  return f + t; }; }",
+            "var fk = mk(3);",
+            "var N = int(runtime(30));",
+            "var s = 0.0;",
+            "for (var i = 0; i < N; i++) s = s + fk(i);",
+            "print(s);" }, "1972.500000 \n", 30, false },
+        { "W3: a skipped temp WRITTEN, then the body THROWS (a zero "
+          "divisor, warmed) - the raise path releases by ref_slots and "
+          "reads no skipped slot (backtrace parity)", {
+            "func mk(int z) { return func [z] (int k) {",
+            "  var t = k * 3; return t / (z - k); }; }",
+            "var fd = mk(5);",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(8); i++) s = s + fd(i);",
+            "print(s);" }, "", 5, true },
         { "W2: a pinned int sibling next to a dyn STRING into an int "
           "param - the decline trampoline materialises BOTH into the run "
           "(the pin from its register) before the C++ tier raises", {
@@ -41171,6 +41343,14 @@ static const std::vector<extra_check> extra_checks =
       "discriminator, arm and site sequences (a pinned int into an int "
       "and a float param, a dyn memory source), read from the dump",
       jit_frameless_w2_shape },
+    { "jit: #97 inc 3 (W3) - the site leaves a raw-written, unlisted "
+      "window slot UNINITIALISED (poisoned in this build): a kept "
+      "t_none immediate beside two poisoned slots, read from the dump",
+      jit_frameless_w3_shape },
+    { "jit: #97 inc 3 (W3) - the raw whitelist is a subset of "
+      "op_writes_scalar (the ref-listed exclusion's redundancy, pinned at "
+      "the opcode level)",
+      jit_raw_whitelist_is_scalar },
     { "jit: #97 E3 - the TWO-WAY frameless site: the dispatch chain and "
       "the paired pool entry, read from the dump",
       jit_frameless_e3_shape },

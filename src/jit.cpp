@@ -8013,6 +8013,125 @@ jit_frameless_callee(const Chunk &ck, size_t old_pc, const Instr &in,
 }
 
 /*
+ * #97 INCREMENT 3 (W3): WHICH WINDOW SLOTS A SITE NEED NOT INITIALISE.
+ *
+ * The site zeroes every non-parameter slot's tail and writes it a
+ * `t_none` type word - three stores per slot - so that whatever first
+ * touches the slot finds a valid LValue: a helper writing it through
+ * LValue::put reads `container`, `borrowed` and the OLD type (the
+ * assignment releases the old value), and a release scan reads the
+ * type. For a TEMP written by an arithmetic op none of that is ever
+ * read: the op stores the payload and the type word raw (store_dst /
+ * emit_float_store / store_dst_bool for an UNLISTED dst), the frameless
+ * return arm scans `ref_slots` only, the frameless window is never
+ * popped through pop_window, and the raise path releases by
+ * `ref_slots` too. So a slot that is not a parameter, not ref-listed,
+ * and written ONLY by ops that store their dst raw is left as the raw
+ * stack it is - 78's `add(i)` site drops seven instructions.
+ *
+ * ⛔ THE CLASSIFICATION IS THE WHOLE SOUNDNESS ARGUMENT, and it is a
+ * table (jit_instr_stores_dst_raw) whose stale row costs a read of
+ * stack garbage, not an optimization. Three things keep it honest:
+ *  - it is a WHITELIST with a false default, and per INSTRUCTION, not
+ *    per opcode: LoadCaptureV stores raw only with `cap_scalar` (the
+ *    proven-scalar read emits no helper at all - the other shape has a
+ *    helper arm); an op whose emit case has ANY helper tier writing the
+ *    dst (LoadElemInt's slow tier, MoveV's boxed copy, every helper
+ *    taking a dst INDEX) is not here, however hot;
+ *  - an op `jit_op_slot_refs` does not know refuses the whole chunk (it
+ *    may define anything), and an op defining more than its `target`
+ *    refuses its defs;
+ *  - in a TESTS build the site POISONS every slot it skips (jit.h:
+ *    jit_poison_type), so a wrongly admitted op's helper tier aborts by
+ *    name in every net lane - watched failing with LoadElemInt admitted
+ *    (a NEGATIVE index takes its slow tier; a slice has an inline arm).
+ *
+ * Parameters are excluded here because the fill writes them itself
+ * (their tails are zeroed before the binds - the bind helper's
+ * ML_CHECK(!borrowed) reads the old flag).
+ */
+static bool jit_instr_stores_dst_raw(const Instr &in)
+{
+    switch (in.op) {
+    /* store_dst: the two-store for an unlisted dst; the ref-listed arm
+     * (the put helper) is excluded by the caller's listed test. The
+     * derivation runs at CODEGEN, on the unspecialized code (IntBin /
+     * FloatBin); the B1/B2 twins specialize_arith_ops makes of them at
+     * jit time are listed too, so the answer cannot change if it ever
+     * moves there */
+    case OpCode::IntBin:
+    case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+    case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+    case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+    case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShrRR:
+    case OpCode::IntShlRI: case OpCode::IntShrRI:
+    case OpCode::IntModRI: case OpCode::IntAddModRI:
+    case OpCode::LoadImmInt:
+    /* emit_float_store: movsd + the float tag for an unlisted dst */
+    case OpCode::FloatBin:
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+    case OpCode::LoadImmFloat:
+    /* store_dst_bool */
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
+        return true;
+    /* the proven-scalar capture read: payload + type, no helper emitted
+     * (#111); the boxed shape has a jit_load_capture arm */
+    case OpCode::LoadCaptureV:
+        return in.cap_scalar();
+    default:
+        return false;
+    }
+}
+
+uint64_t jit_chunk_frameless_init_free(const Chunk &ck)
+{
+    const int total = ck.slot_count + ck.n_temps;
+    if (total > FRAMELESS_MAX_SLOTS)
+        return 0;                       /* not frameless_ok either */
+    const auto bit = [](int sl) { return uint64_t(1) << sl; };
+    uint64_t mask = total >= 64 ? ~uint64_t(0) : bit(total) - 1;
+    std::vector<int> uses, defs;
+    for (const Instr &in : ck.code) {
+        if (!jit_op_slot_refs(in, uses, defs))
+            return 0;                   /* unaudited: may define anything */
+        const bool raw = jit_instr_stores_dst_raw(in);
+        for (const int d : defs)
+            if (d >= 0 && d < total && (!raw || d != in.target))
+                mask &= ~bit(d);
+    }
+    /*
+     * A ref-listed slot is excluded - and for a NON-PARAMETER slot that
+     * exclusion is REDUNDANT with the loop above: such a slot is listed
+     * because some writer of it is not `op_writes_scalar`, and no op in
+     * the raw whitelist is such a writer (jit_raw_whitelist_is_scalar,
+     * -rt, pins the subset at the opcode level), so its bit is already
+     * clear. What survives listed is a slot the ref_slots SEEDS listed
+     * - a reference PARAMETER, which the body may reassign raw (`opt y
+     * ... y = -1`), and which the site excludes by index. The chunk
+     * does not know its parameter count, so the exclusion is kept as
+     * the stated invariant rather than asserted here (a chunk-side
+     * check fired on exactly that reassigned parameter). Watched:
+     * removing it leaves every net green, which is what redundancy
+     * looks like.
+     */
+    for (int sl = 0; sl < total; sl++)
+        if (jit_slot_ref_listed(ck, sl))
+            mask &= ~bit(sl);
+    return mask;
+}
+
+#ifdef TESTS
+/* the raw whitelist, for the -rt subset check (see above) */
+bool jit_test_instr_stores_dst_raw(const Instr &in)
+{
+    return jit_instr_stores_dst_raw(in);
+}
+#endif
+
+/*
  * #97 INCREMENT 3 (W1/W2): THE SITE BUILDS THE CALLEE'S WINDOW. Called
  * by the frameless tail of emit_sync_call_inline with rdx = fo and
  * r9 = ctx live and rsp call-ready. It reserves the callee's N*48
@@ -8236,16 +8355,55 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
         e.mov_rr(R10, RSP);                              /* reg:proto */
         e.patch32_here(j_join);
     }
-    /* every non-parameter slot reads as a fresh `none` until written:
-     * r11 = 0 for the tails, then the tag stores (which use it as
-     * scratch only off the arena) */
-    e.zero_reg32(R11);                                   /* reg:proto */
+    /* every non-parameter slot reads as a fresh `none` until written -
+     * except the ones W3 proves nothing reads before a raw write
+     * (Chunk::frameless_init_free), which stay raw stack: r11 = 0 for
+     * the tails, then the tag stores (which use it as scratch only off
+     * the arena) */
+    const uint64_t free = nargs >= 64 ? 0
+        : cck.frameless_init_free & ~((uint64_t(1) << nargs) - 1);
+    const auto skipped = [&](int sl) { return (free >> sl) & 1; };
+    bool any_tail = false;
+    for (int sl = nargs; sl < total; sl++)
+        if (!skipped(sl))
+            any_tail = true;
+#ifdef TESTS
+    any_tail = any_tail || free;      /* the poison zeroes the tails too */
+#endif
+    if (any_tail)
+        e.zero_reg32(R11);                               /* reg:proto */
     for (int sl = nargs; sl < total; sl++) {
+#ifndef TESTS
+        if (skipped(sl))
+            continue;
+#endif
         e.store_base(R11, R10, sl * 48 + 32);            /* reg:proto */
         e.store_base(R11, R10, sl * 48 + 40);            /* reg:proto */
     }
     for (int sl = nargs; sl < total; sl++)
-        tag_q(sl * 48 + 24, L.t_none);
+        if (!skipped(sl))
+            tag_q(sl * 48 + 24, L.t_none);
+#ifdef TESTS
+    /*
+     * W3's net: a skipped slot is POISONED rather than left - its type
+     * word names jit_poison_type, whose every lifecycle op aborts, so a
+     * helper that reads the old state (a wrongly admitted op's put) or
+     * a release scan that visits it (a wrongly skipped ref-listed slot)
+     * fails by name in every test lane. The tails were zeroed above so
+     * the first read to fault is the type's, not a garbage `borrowed`.
+     * A static object, so the tag goes through r11 (a two-instruction
+     * form the shape test tells from the arena's t_none immediate).
+     */
+    if (free) {
+        e.movabs(R11, reinterpret_cast<uint64_t>(       /* reg:proto */
+                          jit_poison_type()));
+        for (int sl = nargs; sl < total; sl++)
+            if (skipped(sl)) {
+                e.store_base(R11, R10, sl * 48 + 24);    /* reg:proto */
+                g_jit_frameless_init_free++;
+            }
+    }
+#endif
 }
 
 static void emit_put_int_call(Emitter &e, const void *fn, int slot,
@@ -12094,6 +12252,7 @@ void jit_stats_report()
         { "frameless_sites",   &g_jit_frameless_sites },
         { "frameless_pushes",  &g_jit_frameless_pushes },
         { "frameless_rets",    &g_jit_frameless_rets },
+        { "frameless_init_free", &g_jit_frameless_init_free },
         { "arg_stage",        &g_jit_arg_stage },
         { "sync_switch",      &g_jit_sync_switch },
         { "cached_probe_calls", &g_jit_cached_probe_calls },
@@ -28070,6 +28229,11 @@ bool jit_chunk_is_native_leaf(const Chunk &)
 bool jit_chunk_frameless_ok(const Chunk &)
 {
     return false;   /* no fragments off-platform -> no frameless tier */
+}
+
+uint64_t jit_chunk_frameless_init_free(const Chunk &)
+{
+    return 0;       /* no frameless site to read it */
 }
 
 void jit_mark_frameless_wanted(const Chunk &, const JitCtx *)

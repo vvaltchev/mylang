@@ -2244,6 +2244,7 @@ void vm_jit_loaded_image(VmProgram &prog)
          * default (false) it made a loaded image's main 649 bytes bigger
          * than the fresh compile's, which myv_round_trip caught. */
         ck.frameless_ok = jit_chunk_frameless_ok(ck);
+        ck.frameless_init_free = jit_chunk_frameless_init_free(ck);  /* W3 */
     });
 
     std::vector<const FuncDescriptor *> slot_desc(
@@ -3463,7 +3464,51 @@ unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
                                             * (emitted code) */
 unsigned long g_jit_frameless_rets = 0;    /* #97 inc 2: frameless RETURN
                                             * arm taken (emitted code) */
+unsigned long g_jit_frameless_init_free = 0; /* #97 inc 3 W3: window slots
+                                              * a site left uninitialised
+                                              * (emit-time) */
 unsigned long g_jit_arg_scalar = 0;
+
+#ifdef TESTS
+/*
+ * #97 INCREMENT 3 (W3): THE POISON TYPE - see jit.h. Every lifecycle op
+ * is an abort, because reaching one means emitted code or a helper read
+ * the OLD state of a window slot the frameless site proved nothing
+ * reads: the site's raw-only classification (jit_instr_stores_dst_raw)
+ * admitted an op whose helper tier writes its dst through LValue::put.
+ * That is the failure this object exists to make deterministic and
+ * named; without it the same read is a garbage Type* dereference that
+ * may or may not fault. `t_dict` is any non-trivial kind: every scan
+ * that asks `t >= t_str` then takes the releasing path and lands here.
+ */
+namespace {
+struct JitPoisonType final : Type {
+    JitPoisonType() : Type(Type::t_dict) {}
+    [[noreturn]] static void hit(const char *op)
+    {
+        fprintf(stderr,
+                "\n*** W3 POISON HIT (%s): a helper read the old state of a "
+                "frameless window slot the site left uninitialised - "
+                "jit_instr_stores_dst_raw admits an op whose helper tier "
+                "writes its dst through LValue::put ***\n", op);
+        fflush(stderr);
+        abort();
+    }
+    void default_ctor(void *) override { hit("default_ctor"); }
+    void dtor(void *) override { hit("dtor"); }
+    void copy_ctor(void *, const void *) override { hit("copy_ctor"); }
+    void move_ctor(void *, void *) override { hit("move_ctor"); }
+    void copy_assign(void *, const void *) override { hit("copy_assign"); }
+    void move_assign(void *, void *) override { hit("move_assign"); }
+};
+JitPoisonType g_jit_poison_type;
+}   /* namespace */
+
+const void *jit_poison_type()
+{
+    return &g_jit_poison_type;
+}
+#endif
 
 /*
  * The fused site's COLD arm: replay the staging MoveVs the emit skipped.
@@ -6624,6 +6669,19 @@ extern "C" void jit_ret_audit() noexcept
         const int_type total = static_cast<int_type>(my_ck->slot_count)
                                + my_ck->n_temps;
         for (int_type i = 0; i < total; i++) {
+#ifdef TESTS
+            /* #97 inc 3 W3: a frameless SITE poisons the window slots it
+             * proved nothing reads (jit_poison_type, a non-trivial `t`,
+             * so this scan would take it for an unlisted reference).
+             * The poison is legitimate on exactly the slots the chunk
+             * claims - anywhere else it is the site writing a slot the
+             * derivation did not clear, and stays an abort. */
+            if (win[i].get().get_type() == jit_poison_type()) {
+                ML_VM_CHECK(i < 64
+                            && (my_ck->frameless_init_free >> i & 1));
+                continue;
+            }
+#endif
             if (win[i].get().get_type()->t >= Type::t_str)
                 ML_VM_CHECK(std::binary_search(my_ck->ref_slots.begin(),
                                                my_ck->ref_slots.end(),

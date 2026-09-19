@@ -466,7 +466,9 @@ work — but profile it before building, the way increment 0 was.
         gone, a pin stored from its register, the coercing check an
         emit-time fact - 78's add(i) 90 -> 73 instructions per call),
         then E3 (done the same day: the two-way site serves 76), then
-        the init elision and the capture base, both site-local now.
+        W3 the init elision (done: a raw-written unlisted slot is left
+        uninitialised, poisoned in TESTS builds - 78's add(i) 73 -> 66
+        per call), then the capture base (W4, site-local now).
     3.  E2 - drop the leaf rule. Serves 09_fib. GATE includes
         norec_enum --depth 4 (2272 programs x 4 engines), because a
         throw crossing a frameless frame is exactly its shape space.

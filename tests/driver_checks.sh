@@ -330,6 +330,48 @@ else
     echo "  skip  -vdj frameless parity (this build reports jit 0)"
 fi
 
+# #97 inc 3 W3: the frameless SITE leaves a raw-written, unlisted window
+# slot UNINITIALISED - and only a NON-TESTS binary shows that form,
+# because a TESTS build poisons such a slot instead (the abort-by-name
+# net every -rt lane runs on). So the -rt shape test can only ever pin
+# the poison; the elided form is pinned HERE, over the same bench, by
+# what the site of 78's `add(i)` does after the parameter's int tag:
+# in a TESTS build a `movabs r11` (the sentinel) and two r11 stores at
+# the temps' type words; in a release build NOTHING - the tag store is
+# followed straight by the residue's `lea rcx`. Both configurations are
+# asserted, so neither can rot: the poison (the net) and the elision
+# (the point).
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    site=$("$BIN" -npc -vdj "$here/../bench/my/78_typed_param_call.my" \
+            2>/dev/null | sed -n '/; ===== main/,$p' \
+          | sed -n '/sub rsp, 144/,/call <helper>/p' \
+          | sed -n '1,/call <helper>/p')
+    after_tag=$(printf '%s\n' "$site" \
+          | sed -n '/mov \[r10+0x18\], <int-tag>/{n;p;}' | head -1)
+    if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+        if printf '%s\n' "$site" | grep -q 'movabs r11, <addr>' \
+                && printf '%s\n' "$site" | grep -q 'mov \[r10+0x48\], r11' \
+                && printf '%s\n' "$site" | grep -q 'mov \[r10+0x78\], r11'; then
+            pass "-vdj: W3 - a TESTS build poisons the skipped window slots"
+        else
+            fail "-vdj: W3 - a TESTS build should poison the two temps of
+      78's add(i) site (movabs r11 + two r11 stores); the site read:
+$site"
+        fi
+    else
+        case "$after_tag" in
+        *"lea rcx, [rbx+"*)
+            pass "-vdj: W3 - a release build leaves the temps' init out" ;;
+        *)
+            fail "-vdj: W3 - a release build should follow the parameter's
+      int tag straight with the residue's lea (the temps' init elided);
+      the instruction after it was: $after_tag" ;;
+        esac
+    fi
+else
+    echo "  skip  -vdj W3 site form (this build reports jit 0)"
+fi
+
 # ---------------------------------------------------------------------
 # -dcs: the CALLEE-SET dump (#116).
 #
