@@ -541,10 +541,13 @@ class Gen:
         return my, py
 
 
+RUN_TIMEOUT = 30
+
+
 def run(cmd, src_path):
     try:
         out = subprocess.run(cmd + [src_path], capture_output=True, text=True,
-                             timeout=30)
+                             timeout=RUN_TIMEOUT)
     except subprocess.TimeoutExpired:
         return "<timeout>"
     if out.returncode != 0:
@@ -637,6 +640,7 @@ def main():
 
     failures = 0
     fallbacks = 0
+    timeouts = 0
     tmp = tempfile.mkdtemp(prefix="mylang_fuzz_")
     my_path = os.path.join(tmp, "p.my")
     py_path = os.path.join(tmp, "p.py")
@@ -679,17 +683,53 @@ def main():
                                        "--no-opt", "all"], my_path)
 
         vals = list(results.values())
-        ok = all(v == vals[0] for v in vals) and not vals[0].startswith("<")
+        # ⛔ A TIMEOUT IS "I DO NOT KNOW", NOT "A DIFFERENT ANSWER".
+        #
+        # This used to render a timed-out engine as just another
+        # result string, so the all-equal test failed and the program
+        # was reported DIVERGE - indistinguishable from a real
+        # cross-engine disagreement until someone chased it.  Watched
+        # costing exactly that: seed 279 reported `tw-noopt=<timeout>`
+        # while every other engine said 54, purely because two
+        # `make -j` builds were running beside the fuzzer; re-run
+        # alone it agrees in 8.8s against a 30s limit.
+        #
+        # CLAUDE.md's second instrument property is "it says when it
+        # does not know".  A timeout is that case, so it gets its own
+        # category and its own exit-status contribution, and the line
+        # NAMES the likely cause - because the cheapest fix is almost
+        # always "stop building while the differential runs".
+        timed_out = [k for k, v in results.items() if v == "<timeout>"]
+        answered = [v for v in vals if v != "<timeout>"]
+        ok = (not timed_out
+              and all(v == vals[0] for v in vals)
+              and not vals[0].startswith("<"))
+        agree_but_slow = bool(timed_out) and answered and all(
+            v == answered[0] for v in answered
+        ) and not answered[0].startswith("<")
         fb = args.check_fallbacks and has_fallback(args.mylang, my_path)
         if fb:
             fallbacks += 1
 
         if not ok or fb:
-            failures += 0 if ok else 1
-            tag = "DIVERGE" if not ok else "FALLBACK"
+            if agree_but_slow:
+                timeouts += 1
+                tag = "TIMEOUT"
+            elif ok:
+                tag = "FALLBACK"
+            else:
+                failures += 1
+                tag = "DIVERGE"
             print("[%s] program %d (seed=%d depth=%d): %s"
                   % (tag, i, seed, depth,
                      "  ".join("%s=%s" % (k, v) for k, v in results.items())))
+            if agree_but_slow:
+                print("        %s hit the %ds limit; every engine that "
+                      "ANSWERED agrees on %r."
+                      % (", ".join(timed_out), RUN_TIMEOUT, answered[0]))
+                print("        NOT a divergence.  Re-run this seed alone "
+                      "before believing it - a concurrent build is the "
+                      "usual cause.")
             if args.keep_failures:
                 base = os.path.join(args.keep_failures,
                                     "fail_%d_seed%d_d%d" % (i, seed, depth))
@@ -702,10 +742,15 @@ def main():
         elif (i + 1) % 100 == 0:
             print("... %d/%d ok" % (i + 1, args.count))
 
-    print("\n%d programs, depth <= %d, engines=%s: %d diverged%s"
+    print("\n%d programs, depth <= %d, engines=%s: %d diverged%s%s"
           % (args.count, args.max_depth, args.engines, failures,
+             (", %d timed out" % timeouts) if timeouts else "",
              (", %d fallbacks" % fallbacks) if args.check_fallbacks else ""))
-    bad = failures + (fallbacks if args.check_fallbacks else 0)
+    if timeouts:
+        print("A TIMEOUT IS NOT A DIVERGENCE - every engine that answered "
+              "agreed.  Re-run those seeds alone (--seed N --count 1); a "
+              "build running beside the fuzzer is the usual cause.")
+    bad = failures + timeouts + (fallbacks if args.check_fallbacks else 0)
     if bad == 0:
         print("ALL AGREE - tree-walker == VM == CPython"
               + (" == optimizers-off" if "noopt" in engines else "")
