@@ -23792,6 +23792,130 @@ static bool myv_verify_cross_records()
     return ok;
 }
 
+/*
+ * #137, the HANDLER-STACK BALANCE (myv_fuzz, 2026-09-21; task #26's third
+ * loader finding). One mutated opcode byte turned a LoadLiteralObjV into a
+ * PopHandler with no PushHandler before it, and the VM's bare pop_back()
+ * ran on an EMPTY handler vector - a SEGV in the assert-free build, a
+ * libstdc++ hardening abort in the debug one. No per-operand bound can
+ * see it (the depth is a PATH property), so handler_balance_fault is a
+ * forward dataflow over the CFG, and this pins its three refusals on the
+ * compiled program itself (tampering with the program IS tampering with
+ * an image - the verifier runs on what the reader produced):
+ *  (1) the finding: an op at handler depth 0 becomes a PopHandler;
+ *  (2) a JOIN reached at two depths: the try's own PopHandler is
+ *      overwritten with a COPY of the `Jump Lend` that follows it, so the
+ *      normal exit arrives at the try's end one handler deep while the
+ *      catch exit arrives at zero;
+ *  (3) a region pushed at two depths: the PushHandler duplicated over
+ *      the op right after it (the second push finds the region already
+ *      entered one deeper).
+ * The intact program must pass first and after every restore. Found by
+ * decoding the chunk (the PushHandler/PopHandler pcs), never by offset.
+ */
+static bool myv_verify_handler_balance()
+{
+    const char *lines_arr[] = {
+        "struct E { int code; }",
+        "func f(int a) {",
+        "  var r = 0;",
+        "  try { if (a > 2) throw E(a); r = a * 2; }",
+        "  catch (E as e) { r = e.code + 100; }",
+        "  return r;",
+        "}",
+        "var t = f(runtime(3)) + f(runtime(1));",
+        "print(t);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        vm_verify_program(prog);                    /* intact: passes */
+        Chunk *fck = nullptr;
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk && d->name && d->name->val == "f")
+                fck = static_cast<Chunk *>(const_cast<void *>(d->vm_chunk));
+        size_t push_pc = fck ? fck->code.size() : 0;
+        size_t pop_pc = push_pc;
+        if (fck)
+            for (size_t i = 0; i < fck->code.size(); i++) {
+                if (fck->code[i].op == OpCode::PushHandler
+                        && push_pc == fck->code.size())
+                    push_pc = i;
+                if (fck->code[i].op == OpCode::PopHandler
+                        && pop_pc == fck->code.size())
+                    pop_pc = i;
+            }
+        if (!fck || push_pc >= pop_pc || pop_pc + 1 >= fck->code.size()
+                || push_pc == 0
+                || fck->code[pop_pc + 1].op != OpCode::Jump) {
+            fprintf(stderr, "myv_verify_handler_balance: the try shape "
+                            "did not lower as expected\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        const auto refused = [&](const char *what, const char *needle)
+            -> bool {
+            try {
+                vm_verify_program(prog);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError"
+                        && e.msg && strstr(e.msg, needle))
+                    return true;
+                fprintf(stderr, "myv_verify_handler_balance [%s]: threw "
+                                "%s: %s\n", what, e.name,
+                        e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_verify_handler_balance [%s]: ACCEPTED\n",
+                    what);
+            return false;
+        };
+        /* (1) the finding: the op BEFORE the push (depth 0) pops */
+        {
+            const Instr keep = fck->code[push_pc - 1];
+            Instr bad = keep;
+            bad.op = OpCode::PopHandler;
+            fck->code[push_pc - 1] = bad;
+            ok = refused("pop at depth 0",
+                         "a PopHandler with no handler pushed") && ok;
+            fck->code[push_pc - 1] = keep;
+        }
+        /* (2) the try's normal exit at depth 1, the catch exit at 0 */
+        {
+            const Instr keep = fck->code[pop_pc];
+            fck->code[pop_pc] = fck->code[pop_pc + 1];
+            ok = refused("a join at two depths",
+                         "the handler depth disagrees at a join") && ok;
+            fck->code[pop_pc] = keep;
+        }
+        /* (3) the same region pushed again one deeper */
+        {
+            const Instr keep = fck->code[push_pc + 1];
+            fck->code[push_pc + 1] = fck->code[push_pc];
+            ok = refused("a region pushed at two depths",
+                         "a handler region pushed at two depths") && ok;
+            fck->code[push_pc + 1] = keep;
+        }
+        vm_verify_program(prog);                    /* restored: passes */
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_verify_handler_balance: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_corrupt_refused()
 {
     const char *lines_arr[] = {
@@ -41764,6 +41888,10 @@ static const std::vector<extra_check> extra_checks =
     { "myv: #137 - a stored ExitBlock and a slot_count/frame_size "
       "disagreement are refused at load (myv_fuzz, 2026-09-20)",
       myv_verify_cross_records },
+    { "myv: #137 - the HANDLER-STACK BALANCE: a PopHandler with nothing "
+      "pushed, a join at two depths and a region pushed twice are refused "
+      "at load (myv_fuzz fat-486, 2026-09-21)",
+      myv_verify_handler_balance },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "
       "and binds from the argument SOURCES: the expected entry, "
       "discriminator, arm and site sequences (a pinned int into an int "

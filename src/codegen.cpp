@@ -9784,6 +9784,85 @@ void verify_handler_sites(const Chunk &chunk)
 #endif
 }
 
+/* Declared in codegen.h - see the contract there. */
+const char *handler_balance_fault(const Chunk &chunk, size_t *at_pc)
+{
+    const size_t n = chunk.code.size();
+    const size_t nregions = chunk.handler_sites.size();
+    /* -1 = not reached; else the handler depth ON ENTRY to the pc */
+    std::vector<int> depth(n, -1);
+    /* the depth each region's PushHandler was met at, -1 = not yet */
+    std::vector<int> entry(nregions, -1);
+    std::vector<size_t> work;
+    const char *fault = nullptr;
+    size_t fault_pc = 0;
+    const auto fail = [&](size_t pc, const char *what) {
+        if (!fault) {
+            fault = what;
+            fault_pc = pc;
+        }
+    };
+    /* control (or a dispatch) reaches `t` with depth `d` */
+    const auto reach = [&](size_t from, int_type t, int d) {
+        if (t < 0 || static_cast<size_t>(t) >= n) {
+            fail(from, "a branch past the code");
+            return;
+        }
+        const size_t s = static_cast<size_t>(t);
+        if (depth[s] < 0) {
+            depth[s] = d;
+            work.push_back(s);
+        } else if (depth[s] != d) {
+            fail(s, "the handler depth disagrees at a join");
+        }
+    };
+    if (n == 0)
+        return nullptr;                 /* "empty chunk" is refused apart */
+    reach(0, 0, 0);
+    while (!work.empty() && !fault) {
+        const size_t pc = work.back();
+        work.pop_back();
+        /* visit_pc_fields takes Instr& (the remaps write through it); this
+         * read-only walk borrows it via a const_cast, mutating nothing. */
+        Instr &in = const_cast<Instr &>(chunk.code[pc]);
+        int d = depth[pc];
+        if (in.op == OpCode::PushHandler) {
+            const int_type r = in.a_lit();
+            if (r < 0 || static_cast<size_t>(r) >= nregions) {
+                fail(pc, "handler region");
+                break;
+            }
+            /* The dispatch pops THIS handler (and every inner one) before
+             * resuming at a clause body or the finally, so those pcs are
+             * entered at the depth the push was met at. One region, one
+             * push depth: the table is per region, not per push. */
+            if (entry[r] >= 0 && entry[r] != d) {
+                fail(pc, "a handler region pushed at two depths");
+                break;
+            }
+            entry[r] = d;
+            const Chunk::HandlerSite &site = chunk.handler_sites[r];
+            for (const Chunk::HandlerClause &cl : site.clauses)
+                reach(pc, cl.body_pc, d);
+            if (site.fin_pc >= 0)
+                reach(pc, site.fin_pc, d);
+            d++;
+        } else if (in.op == OpCode::PopHandler) {
+            if (d == 0) {
+                fail(pc, "a PopHandler with no handler pushed");
+                break;
+            }
+            d--;
+        }
+        visit_pc_fields(in, [&](int &t) { reach(pc, t, d); });
+        if (op_falls_through(in.op) && pc + 1 < n)
+            reach(pc, static_cast<int_type>(pc + 1), d);
+    }
+    if (fault && at_pc)
+        *at_pc = fault_pc;
+    return fault;
+}
+
 /* ------------------------------------------------------------------ */
 /* #137: STRUCTURAL VERIFICATION of a chunk's instruction operands      */
 /* ------------------------------------------------------------------ */
@@ -10595,6 +10674,22 @@ void verify_chunk(const Chunk &chunk, const ChunkLimits &lim)
     }
 
     /*
+     * The handler-stack BALANCE - the one property of a PopHandler no
+     * per-operand bound above can express (see handler_balance_fault). A
+     * chunk with a native fragment is skipped: its pushes and pops live
+     * inside the fragment, and its bytecode is no longer the whole CFG.
+     * That skip costs nothing here - a STORED image has no fragments, and
+     * vm_compile's self-check runs this on every chunk the JIT declined.
+     */
+    if (!chunk.native.base) {
+        size_t at = 0;
+        if (const char *what = handler_balance_fault(chunk, &at)) {
+            v.pc = at;
+            v.reject(what);
+        }
+    }
+
+    /*
      * The pc-KEYED side tables. It is tempting to leave their pcs unchecked -
      * the VM only ever binary-searches them for an exact match, so a pc past
      * the code simply never matches. That reasoning is WRONG, and a fuzz run
@@ -10926,6 +11021,19 @@ codegen_chunk(const Block *block, int slot_count, bool jit,
     /* #78 step B: the handler table must still describe the (now compacted,
      * threaded, specialized) chain - a missed remap aborts HERE. */
     verify_handler_sites(cg.chunk);
+    /* #137: and the handler-stack BALANCE the loader will demand of an
+     * image - asserted here on everything codegen emits, BEFORE the JIT
+     * moves any push or pop into a fragment, so a lowering that leaves a
+     * PopHandler reachable with nothing pushed (or a join at two depths)
+     * aborts the suite instead of teaching the verifier to refuse our own
+     * output. ASSERTS-only. */
+#ifndef NDEBUG
+    {
+        size_t at = 0;
+        const char *what = handler_balance_fault(cg.chunk, &at);
+        ML_CHECK_MSG(!what, "codegen: the handler stack is unbalanced");
+    }
+#endif
     /* #55 STEP 2: set the native_leaf FLAG from the (now final, specialized)
      * ops - BEFORE jit, so the precompile can defer jit and still have every
      * callee's flag for a caller's native-call gate. jit_compile_chunk reads
