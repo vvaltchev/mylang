@@ -195,6 +195,10 @@ unsigned long g_jit_bind_coerce = 0;   /* G1: inline pushes to a callee
 unsigned long g_jit_bind_widen = 0;    /* G1: arguments WIDENED inline */
 unsigned long g_jit_coerce_cached = 0; /* G1: coercing-callee cache
                                         * HITS (emitted) */
+/* #97 1c: a BAKED site's widening ran (bool -> int / int|bool -> float
+ * decided from bind_req at emit time) - separate from the generic arm's
+ * g_jit_bind_widen so a test can tell WHICH arm converted. */
+unsigned long g_jit_bake_widen = 0;
 unsigned long g_jit_entry_resume = 0;  /* post-call entry stubs entered */
 unsigned long g_jit_ret_inline = 0;    /* C4c: inline-pop returns run */
 /* C4a-i: TEMP slots admitted to the float read-elision set, process-wide.
@@ -7799,6 +7803,24 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
     const int NARGS = static_cast<int>(in.b_lit());
     const int ARGBASE = static_cast<int>(in.a_lit());
     /*
+     * #97 probe elision (2026-09-19): THE PURE-CALL CACHE IS AN EMIT-TIME
+     * FACT. `jit_cached_probe` returns 0 on its second instruction when
+     * `g_pure_cache_enabled` is off, and the emitted site still paid the
+     * C++ round trip - spill fo, four argument movs, call, rebuild
+     * r8/r9/rax, test - 16 Ir per call on 09_fib, 7.5% of the bench, in
+     * the ONE configuration every measurement runs (`-npc`). Increment 0
+     * already made "no PureCache exists while the flag is off" a
+     * precondition of EMITTED code (the ML_CHECK in
+     * Frame::ensure_pure_cache, the single allocation site), so the flag
+     * may be read HERE, once, and every piece the cache needs - the
+     * probe, the parked-key fork test, the stash, the rec.cache_key
+     * store, and the plain site's "caller holds a cache" decline - is
+     * simply not emitted. The flag is fixed before any chunk compiles
+     * (the CLI sets it; `-rt` toggles it around whole runs), which is
+     * what makes it an emit-time constant rather than a runtime one.
+     */
+    const bool cached_live = cached && g_pure_cache_enabled;
+    /*
      * #97 step 4: THE BAKED CALLEE. Every gate below the cache probe
      * asks about the DESCRIPTOR, and for a write-once global slot the
      * emitter already knows which descriptor that is (jit_baked_callee).
@@ -7816,8 +7838,34 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
         jit_baked_callee(ck, old_pc, callee_arg, is_value);
     const Chunk *bake_ck =
         bake ? static_cast<const Chunk *>(bake->vm_chunk) : nullptr;
+    /*
+     * #97 1c: A COERCING CALLEE BAKES TOO. The gate used to require
+     * `fast_bind`, which `compute_bind_flags` clears for ANY parameter
+     * annotated `int`/`float` - so 78_typed_param_call, the bench that
+     * exists to show typed parameters are FASTER, took the generic
+     * coercing tier on all 2,000,001 calls (three cache compares, five
+     * descriptor gates and a per-argument bind_req loop, every call)
+     * while its untyped twin baked. What a coercing parameter needs is
+     * decided per ARGUMENT VALUE and cannot be cached on the descriptor;
+     * but with the descriptor known at emit time the REQUIRED type is a
+     * compile-time constant, so the per-argument test is one compare
+     * against an immediate (the baked arm below). The one shape that
+     * still declines: a FUSED argument (#162) meeting a coercing
+     * parameter - the widening writes the argument temp in place, and a
+     * fused argument has none (it is the caller's own variable).
+     */
+    bool bake_coerce_ok = true;
+    if (bake && !bake->fast_bind) {
+        if (bake->bind_req.size() != bake->params.size())
+            bake_coerce_ok = false;      /* not derived yet - never bake */
+        else
+            for (int i = 0; i < NARGS; i++)
+                if (bake->bind_req[static_cast<size_t>(i)]
+                        && af && af->src[static_cast<size_t>(i)] >= 0)
+                    bake_coerce_ok = false;
+    }
     if (bake
-            && !(bake->fast_bind
+            && !(bake_coerce_ok
                  && static_cast<int>(bake->params.size()) == NARGS
                  && bake_ck && bake_ck->plain_frame)) {
         bake = nullptr;                  /* a gate the bake cannot make */
@@ -7985,7 +8033,7 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
         ld(RDX, RBX, callee_arg * 48);                /* rdx = fo */
     }
     ld(RAX, RDX, static_cast<int32_t>(P.fo_func));    /* rax = desc */
-    if (cached) {
+    if (cached_live) {
         /* M5c: probe the caller's per-frame cache (a map lookup - C++).
          * HIT -> dst written, jump to the site's done label; MISS -> the
          * key is PARKED in g_jit_pending_key for the record store below
@@ -8090,6 +8138,85 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
         movabs_r11(reinterpret_cast<uint64_t>(&g_jit_bake_push));
         e.inc_qword_base(R11);           /* inc qword [r11] */
 #endif
+        /*
+         * #97 1c: THE BAKED COERCING CHECKS. For each parameter the
+         * callee declares `int`/`float` (bind_req[i] set, an emit-time
+         * constant here), the argument must hold EXACTLY that type for
+         * the raw copy below to be the bind - one compare against the
+         * tag immediate, and the common case is over. Otherwise the same
+         * TOTAL widenings the generic arm performs (bool -> int is a
+         * retag, int/bool -> float is a cvtsi2sd), IN PLACE in the
+         * argument temp - sound for the generic arm's own reason:
+         * emit_args_range gives every argument a FRESH temp compiled
+         * immediately before the call, and a fused argument was refused
+         * by the gate above. `none` passes through (an `opt int`
+         * parameter takes it; a non-opt one is refused at compile time).
+         * A NARROWING or a non-numeric declines to the C++ tier, which
+         * raises - raising cannot happen once the frame exists, so
+         * every decline sits here, pre-mutation.
+         * SCRATCH: rsi and r10 (rax = desc, rcx = cck, rdx = fo, r8/r9
+         * live - exactly the generic arm's register budget).
+         */
+        if (!bake->fast_bind) {
+            for (int i = 0; i < NARGS; i++) {
+                const void *req = bake->bind_req[static_cast<size_t>(i)];
+                if (!req)
+                    continue;            /* no coercion for this param */
+                ML_CHECK_MSG(req == L.t_int || req == L.t_float,
+                             "bind_req names a type that is not int or "
+                             "float");
+                const int32_t s = (ARGBASE + i) * 48;   /* never fused */
+                std::vector<size_t> j_next;
+                e.cmp_mem_tag(RBX, s + 24, req, R10);   /* [arg.type] */
+                j_next.push_back(e.j32(0x74));          /* je next: EXACT */
+                size_t j_cvt = 0;
+                if (req == L.t_float) {
+                    /* the COMMON widening - an int into a float param
+                     * (78's `scale_it(i)`, every call) - is one more tag
+                     * compare against an immediate, straight to the
+                     * conversion; the byte ladder below is for the rare
+                     * none/bool */
+                    e.cmp_mem_tag(RBX, s + 24, L.t_int, R10);
+                    j_cvt = e.j32(0x74);                /* je cvt */
+                }
+                ld(RSI, RBX, s + 24);        /* reg:proto: rsi = arg type */
+                e.movzx_r32_byte_base(RSI, RSI,  /* reg:proto */
+                                      static_cast<int32_t>(L.type_t_off));
+                e.cmp_reg32_imm8(RSI,               /* reg:proto */
+                                 static_cast<uint8_t>(L.t_none_val));
+                j_next.push_back(e.j32(0x74));          /* none passes */
+                e.cmp_reg32_imm8(RSI,               /* reg:proto */
+                                 static_cast<uint8_t>(L.t_bool_val));
+                j_slow.push_back(e.j32(0x75));          /* jne slow */
+                if (req == L.t_int) {
+                    /* only a bool widens, and its payload is already the
+                     * int 0/1 (the EvalValue(bool) ctor zeroes the word):
+                     * a pure RETAG */
+                    e.store_type_tag_base(RBX, s + 24, L.t_int, R10);
+                } else {
+                    /* a bool reads as an int payload too */
+                    e.patch32_here(j_cvt);
+                    /* cvtsi2sd xmm0, [rbx+s] ; movsd [rbx+s], xmm0 - xmm0
+                     * is free: the call prologue spilled the float pins
+                     * and the call about to happen clobbers every xmm.
+                     * The encoders, not bytes (the regcensus ratchet):
+                     * `cvt` also breaks cvtsi2sd's merge dependency. */
+                    e.cvt(X0, s);
+                    e.fstore(X0, s);
+                    e.store_type_tag_base(RBX, s + 24, L.t_float, R10);
+                }
+#ifdef TESTS
+                /* only the two CONVERSION arms reach here (exact / none
+                 * jump past it): "a baked widening ran", separately from
+                 * "the baked push ran" and from the generic arm's
+                 * g_jit_bind_widen */
+                movabs_r10(reinterpret_cast<uint64_t>(&g_jit_bake_widen));
+                e.inc_qword_base(R10);           /* inc qword [r10] */
+#endif
+                for (const size_t j : j_next)
+                    e.patch32_here(j);
+            }
+        }
     } else {
     size_t j_hit0 = 0, j_hit1 = 0, j_hit_coerce = 0;
     if (cache_addr) {
@@ -8343,7 +8470,7 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
     e.patch32_here(j_plain);                          /* done: */
     }   /* end of the un-baked probe + gate chain */
     /* rsi = total = frame_size + n_temps */
-    if (!cached) {
+    if (!cached && g_pure_cache_enabled) {
         /* a PLAIN call from a cache-carrying caller declines (the stash
          * costs ~2 Ir on every push and only cached-call chains carry
          * caches as a rule - measured -0.3..-0.5% on 10/11/63 when
@@ -8433,7 +8560,7 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
             j_rec1 = e.j32(0x74);                     /* je record path */
         }
         size_t j_rec2 = 0, j_rec3 = 0;
-        if (cached) {
+        if (cached_live) {
             /* only a CachedCallV site's OWN probe parks a key, consumed
              * by this same site's push - a PLAIN site can never see one
              * (tax shrink: the test was 5 instructions on every plain
@@ -8465,7 +8592,7 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
         j_norec_join = e.j32(0xEB);                   /* jmp the tail */
         if (j_rec1)
             e.patch32_here(j_rec1);
-        if (cached) {
+        if (cached_live) {
             e.patch32_here(j_rec2);
             e.patch32_here(j_rec3);
         }
@@ -8561,7 +8688,7 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
      * self-truthing, a re-entered record-ful frame's top_rec IS its own
      * record, so neither the byte nor the EnterNative-entry clear that
      * protected it is needed.) */
-    if (cached) {
+    if (cached_live) {
         /* the caller's pure-cache STASH (per-frame scoping):
          * rec.caller_cache = move(view_frame.pure_cache) - a raw pointer
          * move (rec's field is null on a reused record: pop moved it
@@ -8575,7 +8702,7 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
             R8R, static_cast<int32_t>(P.act_vframe + P.frame_pure_cache),
             0);
     }
-    if (cached) {
+    if (cached_live) {
         /* rec.cache_key = the probe's parked key (ownership transfer) */
         e.movabs(RAX, reinterpret_cast<uint64_t>(jit_addr_pending_key()));
         ld(R11, RAX, 0);
@@ -10946,12 +11073,14 @@ void jit_stats_report()
         { "frameless_calls",  &g_jit_frameless_calls },
         { "arg_stage",        &g_jit_arg_stage },
         { "sync_switch",      &g_jit_sync_switch },
+        { "cached_probe_calls", &g_jit_cached_probe_calls },
         { "sync_boundary",    &g_jit_sync_boundary_call },
         { "bake_push",        &g_jit_bake_push },
         { "callee_cache",     &g_jit_callee_cache },
         { "callee_cache2",    &g_jit_callee_cache2 },
         { "coerce_cached",    &g_jit_coerce_cached },
         { "bind_coerce",      &g_jit_bind_coerce },
+        { "bake_widen",       &g_jit_bake_widen },
         { "bind_widen",       &g_jit_bind_widen },
         { "ref_arg_binds",    &g_jit_ref_arg_binds },
         /* lever A: `fwd` is the EMITTED-code proof that a forwarded

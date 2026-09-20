@@ -7951,6 +7951,9 @@ static PureCacheKey *g_jit_pending_key = nullptr;
 extern "C" int jit_cached_probe(const void *descv, int_type argbase,
                                 int_type nargs, int_type dst) noexcept
 {
+#ifdef TESTS
+    g_jit_cached_probe_calls++;
+#endif
     EvalContext &ctx = *g_current_ctx;
     const FuncDescriptor *d =
         static_cast<const FuncDescriptor *>(descv);
@@ -8005,6 +8008,11 @@ void jit_set_sync_depth_cap(int cap)
 #ifdef TESTS
 unsigned long g_jit_sync_switch = 0;        /* #56: cap SWITCH pushes */
 unsigned long g_jit_sync_boundary_call = 0; /* #56: chunk-less helper calls */
+/* #97 probe elision: how many times the emitted site CALLED
+ * jit_cached_probe - 0 for every program while the pure cache is off,
+ * which is what the elision test asserts (the helper's own early return
+ * would keep the answers right with the call still emitted). */
+unsigned long g_jit_cached_probe_calls = 0;
 #endif
 
 /* #56 step 2: the CHUNK-LESS boundary call, performed in the helper (the
