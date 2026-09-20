@@ -3505,6 +3505,7 @@ unsigned long g_jit_frameless_sites = 0;   /* #97 inc 2: sites EMITTED
                                             * frameless (the dump driver's
                                             * net reads it) */
 unsigned long g_jit_frameless_self_sites = 0; /* #97 E2: emit-time */
+unsigned long g_jit_frameless_self_id = 0;    /* #97 E2c: emit-time */
 unsigned long g_jit_frameless_boundary = 0;   /* #97 E2: run-time */
 unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
                                             * (emitted code) */

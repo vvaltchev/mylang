@@ -643,6 +643,9 @@ extern unsigned long g_jit_frameless_sites;     /* inc 2 (emit-time): the
                                                  * tail */
 extern unsigned long g_jit_frameless_pushes;    /* inc 2 (emitted code) */
 extern unsigned long g_jit_frameless_self_sites; /* E2: self sites EMITTED */
+extern unsigned long g_jit_frameless_self_id;  /* E2c: self sites whose
+                                                * callee identity chain
+                                                * was elided (emit-time) */
 extern unsigned long g_jit_frameless_boundary;  /* E2: boundary calls RUN */
 extern unsigned long g_jit_frameless_rets;      /* inc 2 (emitted code) */
 extern unsigned long g_jit_frameless_init_free; /* inc 3 W3 (emit-time):

@@ -578,10 +578,10 @@ work — but profile it before building, the way increment 0 was.
         wall**, 10_recursion_deep **-23.5% Ir, 1.00x wall** (1.09-1.13x
         SLOWER before E2b - the per-call window init; found by attributing
         CYCLES to JIT code with perf + a map from MYLANG_JIT_MAP), every
-        other call bench flat. NEXT, by the cycle profile of 10: the self
-        site's callee identity chain (5 dependent loads; for a SELF call
-        the callee is the running function - its own soundness argument),
-        the depth counter's store-forwarding chain, a non-SELF callee
+        other call bench flat. ✅ **E2c DONE 2026-09-23**: the self
+        site's callee identity chain is elided (09 -11.0% Ir, 10 -9.1%;
+        record: *E2c* in the JIT record). NEXT, by the cycle profile of
+        10: the depth counter's store-forwarding chain, a non-SELF callee
         (needs the callee's placement facts at a non-main site - the
         seventh audit-table shape), builtin calls in a calling body.
         **2026-09-23 - THE DESIGN, after the maintainer revised RULE 2**

@@ -9005,6 +9005,57 @@ jit_frameless_callee(const Chunk &ck, size_t old_pc, const Instr &in,
 }
 
 /*
+ * #97 E2c: A SELF SITE WHOSE CALLEE IS THE RUNNING FUNCTION. The frameless
+ * site proves its callee with an identity compare at the end of a chain of
+ * five dependent loads (ctx -> gfuncs -> slots -> the FuncObject -> its
+ * descriptor) - 18% of 10_recursion_deep's cycles once E2 took the window
+ * off the segment. For a SELF call that chain can prove nothing the site
+ * does not already know, when every one of these holds:
+ *  - a NAMED callee in a global slot the resolver saw written ONCE - the
+ *    real write-once fact, read here, never the FORCE lever's relaxation
+ *    of it (under FORCE a reassigned slot is baked, and the compare is
+ *    what sends a slot that now holds another function to the slow tier;
+ *    the `jit_frameless_calling` FORCE case watches exactly that). A
+ *    write-once slot holds its own declaration's FuncObject or `none`,
+ *    and it cannot be `none` while that function's body runs: the slot
+ *    is bound at scope ENTRY (#134), before any value of the function
+ *    can exist to be called;
+ *  - the callee is the body being compiled (`g_cur_caller_desc`), so
+ *    every constant the site bakes - window size, parameter binds, the
+ *    entry - is true of the function that will run, whichever FuncObject
+ *    stands in the slot;
+ *  - it CAPTURES NOTHING. The FuncObject matters only for its capture
+ *    slots, and a capturing function's clones carry different ones (a
+ *    `clone()` of a closure copies them), so for such a callee "the
+ *    running function" and "the slot's function" can differ in the one
+ *    field the site would read. Capture-free, ctx.captures needs no
+ *    repoint either, and nothing reads rdx (no W4 capture base).
+ * A `.myv` image whose write-once flag lies stays memory-safe here: the
+ * site calls the running body with the arity and window it was compiled
+ * against - the one thing an image mutation can change is the ANSWER.
+ */
+static bool jit_self_site_is_running(const Chunk &ck, size_t old_pc,
+                                     const Instr &in)
+{
+    if (in.op == OpCode::CallValueV || !g_cur_caller_desc)
+        return false;
+    const FuncDescriptor *c = jit_frameless_callee(ck, old_pc, in, nullptr);
+    if (c != g_cur_caller_desc || !c->captures.empty())
+        return false;
+    const Chunk *cck = static_cast<const Chunk *>(c->vm_chunk);
+    if (!cck || cck->frameless_capbase)
+        return false;
+    const JitCtx *jc = g_cur_jc;
+    const int slot = static_cast<int>(in.target2);
+    if (!jc || !jc->slot_desc || !jc->slot_reassigned || slot < 0
+            || static_cast<size_t>(slot) >= jc->slot_reassigned->size()
+            || static_cast<size_t>(slot) >= jc->slot_desc->size())
+        return false;
+    return !(*jc->slot_reassigned)[static_cast<size_t>(slot)]
+           && (*jc->slot_desc)[static_cast<size_t>(slot)] == c;
+}
+
+/*
  * #97 INCREMENT 3 (W3): WHICH WINDOW SLOTS A SITE NEED NOT INITIALISE.
  *
  * The site zeroes every non-parameter slot's tail and writes it a
@@ -9887,6 +9938,13 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
     e.load_global(R9R, L.addr_ctx, RCX);              /* reg:proto */
     if (!frameless_site)                 /* act: dead on the frameless tail */
         e.load_global(R8R, L.addr_act, RCX);
+    if (frameless_site && jit_self_site_is_running(ck, old_pc, in)) {
+        /* E2c: the callee is the running function - r9 = ctx is all the
+         * tail reads (rax/rdx are not needed: no compare, no capture
+         * repoint, no W4 base) */
+        *frameless_out = true;
+        return;
+    }
     if (!is_value) {
         /*
          * NO `defined` PROBE. It used to load a second vector's data pointer
@@ -11244,10 +11302,16 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             /* the identity compare - the one thing that makes every
              * baked constant below true of the callee actually standing
              * in the slot (see the push's baked arm) */
-            e.movabs(R11, reinterpret_cast<uint64_t>(fl_callee));
-            e.cmp_rr(RAX, R11);                   /* reg:proto */
-            j_next.push_back(e.j32(0x75));        /* jne next / slow */
+            const bool self_running =
+                ncand == 1 && jit_self_site_is_running(ck, old_pc, in);
+            if (!self_running) {
+                e.movabs(R11, reinterpret_cast<uint64_t>(fl_callee));
+                e.cmp_rr(RAX, R11);               /* reg:proto */
+                j_next.push_back(e.j32(0x75));    /* jne next / slow */
+            }
 #ifdef TESTS
+            else
+                g_jit_frameless_self_id++;        /* emit-time */
             e.bump_counter(&g_jit_bake_push);     /* the baked arm ran */
 #endif
             /*
@@ -11324,7 +11388,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                         static_cast<int32_t>(jit_layout().ctx_captures));
                                                   /* push [r9+caps]: the
                                                    * caller's captures */
-            if (!fl_ck->frameless_capbase) {
+            if (self_running) {
+                /* E2c: capture-free, and the caller IS the callee - the
+                 * captures pushed above stay current */
+            } else if (!fl_ck->frameless_capbase) {
                 /* ctx.captures = &fo.capture_slots */
                 e.lea_base(RAX, RDX,              /* reg:proto */
                            static_cast<int32_t>(JP.fo_capture_slots));
@@ -11424,7 +11491,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.exit_pc(pc);                        /* re-raise */
             tramps.push_back(std::move(wt));
             /* next_k: the next candidate's compare, or the slow tier */
-            e.patch32_here(j_next.back());
+            if (!self_running)
+                e.patch32_here(j_next.back());
             for (const size_t j : j_pre)          /* E2: the self bounds */
                 e.patch32_here(j);
             j_pre.clear();
@@ -13531,6 +13599,7 @@ void jit_stats_report()
         /* #97 E2: self sites EMITTED frameless, and the BOUNDARY calls a
          * frameless frame's declines took (the cap / the floor) */
         { "frameless_self_sites", &g_jit_frameless_self_sites },
+        { "frameless_self_id", &g_jit_frameless_self_id },
         { "frameless_boundary", &g_jit_frameless_boundary },
         { "borrow_inline",     &g_jit_borrow_inline },
         { "arg_stage",        &g_jit_arg_stage },

@@ -19864,11 +19864,13 @@ static bool jit_frameless_calling()
         const unsigned long s0 = g_jit_frameless_self_sites;
         const unsigned long p0 = g_jit_frameless_pushes;
         const unsigned long b0 = g_jit_frameless_boundary;
+        const unsigned long i0 = g_jit_frameless_self_id;
         const std::string tw = run(lines, false);   /* the reference */
         const std::string vm = run(lines, true);
         const unsigned long ds = g_jit_frameless_self_sites - s0;
         const unsigned long dp = g_jit_frameless_pushes - p0;
         const unsigned long db = g_jit_frameless_boundary - b0;
+        const unsigned long di = g_jit_frameless_self_id - i0;
         if (tw != vm || tw.find(must) == std::string::npos) {
             fprintf(stderr, "jit_frameless_calling: %s differs\n  nj: "
                     "%s\n  vm: %s\n", what, tw.c_str(), vm.c_str());
@@ -19886,10 +19888,13 @@ static bool jit_frameless_calling()
             }
             return;
         }
-        if (!ds || dp < 30 || !db) {
+        /* E2c: every case here is a capture-free named function in a
+         * write-once slot, so its self sites skip the identity chain */
+        if (!ds || dp < 30 || !db || di != ds) {
             fprintf(stderr, "jit_frameless_calling: %s VACUOUS - %lu self "
-                    "sites emitted, %lu frameless calls, %lu boundary "
-                    "calls\n", what, ds, dp, db);
+                    "sites emitted (%lu without the identity chain), %lu "
+                    "frameless calls, %lu boundary calls\n", what, ds, di,
+                    dp, db);
             ok = false;
         }
     };
@@ -19951,6 +19956,49 @@ static bool jit_frameless_calling()
         "  try { print(v(int(runtime(60)))); }",
         "  catch (Boom as b) { print(\"boom\", b.at); }",
         "}" }, "boom 7", /*expect_tier=*/false);
+    /*
+     * E2c's soundness half: the identity chain may be skipped only for a
+     * slot that is REALLY written once. Under FORCE=bakecallee a
+     * reassigned slot is baked all the same, and while t's body runs
+     * (entered through `keep`) its slot holds u - so each self call must
+     * reach u. The site keeps its compare, fails it, and the slow tier
+     * calls u (202: the unroll inlines one level of t). Watched: with the
+     * predicate reading the forced bake
+     * instead of the write-once flag, this prints 41 twice.
+     */
+    {
+        const unsigned saved_force = g_jit_force_extra;
+        g_jit_force_extra |= jit_lever_bit("bakecallee");
+        const unsigned long s0 = g_jit_frameless_self_sites;
+        const unsigned long i0 = g_jit_frameless_self_id;
+        const std::vector<const char *> lines = {
+            "func t(int n) {",
+            "  if (n <= 0) return 1;",
+            "  return t(n - 1) + t(n % 2 - 5);",
+            "}",
+            "func u(int n) { return 100; }",
+            "var keep = t;",
+            "print(t(int(runtime(40))));",
+            "t = u;",
+            "print(keep(int(runtime(40))));" };
+        const std::string tw = run(lines, false);
+        const std::string vm = run(lines, true);
+        g_jit_force_extra = saved_force;
+        if (tw != vm || tw.find("202") == std::string::npos) {
+            fprintf(stderr, "jit_frameless_calling: a reassigned self slot "
+                    "under FORCE differs\n  nj: %s\n  vm: %s\n",
+                    tw.c_str(), vm.c_str());
+            ok = false;
+        }
+        if (g_jit_frameless_self_sites == s0
+                || g_jit_frameless_self_id != i0) {
+            fprintf(stderr, "jit_frameless_calling: FORCE case - %lu self "
+                    "sites, %lu of them without the identity chain (want "
+                    ">0 and 0)\n", g_jit_frameless_self_sites - s0,
+                    g_jit_frameless_self_id - i0);
+            ok = false;
+        }
+    }
     return ok;
 #else
     return true;
