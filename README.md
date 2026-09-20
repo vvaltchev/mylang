@@ -1982,6 +1982,12 @@ far deeper than the old process-stack bound) and can be changed with the
 `MYLANG_VM_STACK` environment variable (a slot count). The tree-walking
 engine still relies on the process stack, so an uncatchable crash remains
 possible there for extreme depths.
+How DEEP a program can recurse - like how fast it runs and how much memory
+it can use - is a property of the engine and the environment, not of the
+language: the native-code tier may carve some frames from the machine stack
+and go deeper than the interpreter, so the depth at which `StackOverflowEx`
+is raised can differ between engines and configurations. What does not
+differ is that it IS raised, catchably, rather than the process crashing.
 It's also possible in `MyLang` to catch ANY exception use a catch-anything
 block:
 

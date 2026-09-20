@@ -1096,19 +1096,17 @@ and a new emitter must obey all four:
 Record, with the measurements and the seven watched sabotages:
 `docs/jit-optimizations.md`, *SP1/SP2/SP3*.
 
-**⛔ EVERY CALL TIER CHARGES THE SLOT SEGMENT EXACTLY AS `push_window`
-DOES (2026-09-23).** `StackOverflowEx` is raised when a push cannot get
-a window from the `MYLANG_VM_STACK` budget, so the depth a runaway
-recursion reaches is OBSERVABLE - a program catches the overflow and
-prints how deep it got. A tier that carves a window anywhere else (the
-native stack - the frameless tier's shape, sound today only because a
-frameless site exists only in MAIN, never at depth) moves that number:
-a RULE 2 divergence nothing else in the tree sees. `driver_checks.sh`'s
-*overflow depth* case pins it across `-nj` and five JIT configurations;
-its first run also found two real bugs in the depth-cap SWITCH
-materializer, reachable only on a build whose native stack is off (a
-sanitized one, or `MYLANG_NATIVE_STACK=0`). Record: *THE SWITCH
-MATERIALIZER* in docs/jit-optimizations.md.
+**⛔ EVERY CALL TIER MUST END A RUNAWAY RECURSION IN `StackOverflowEx`
+(2026-09-23).** Recursion depth is unspecified (RULE 2) - a tier may
+carve windows from the native stack and go deeper than the slot
+segment would - but it must still reach a CATCHABLE overflow, never a
+SIGSEGV, and the rest of the output must not change. `driver_checks.sh`'s
+*overflow* case runs five recursion shapes at four caps under `-nj` and
+five JIT configurations and compares everything but the depth. Its first
+run found two real bugs in the depth-cap SWITCH materializer, reachable
+only on a build whose native stack is off (a sanitized one, or
+`MYLANG_NATIVE_STACK=0`). Record: *THE SWITCH MATERIALIZER* in
+docs/jit-optimizations.md.
 
 **⛔ AND IT BROKE AGAIN, ONE DAY AFTER THE ABS32 MEMORY OPERAND LANDED,
 WITH THREE NETS PRESENT AND ALL THREE BLIND (2026-08-26 -> found
@@ -6288,8 +6286,21 @@ body note under *Invariants & hazards*).
 `--no-opt all` + `-nc` + `-tw` at one end, and the full VM + JIT + every
 transform at the other, must be **observably identical in every
 respect** — printed output, the exception raised, the message, the
-**caret span**, the **backtrace**, and the exit code. The ONLY thing an
-optimization may change is **how long the script takes**.
+**caret span**, the **backtrace**, and the exit code. An optimization may
+change exactly TWO things, both properties of the ENVIRONMENT rather
+than of the program (maintainer-set, 2026-09-23):
+ - **how long the script takes**, and
+ - **how much memory it has** - for variables, big containers, and
+   RECURSION DEPTH. A faster engine may also be a roomier one: the
+   depth at which a runaway recursion overflows is unspecified and MAY
+   differ between engines and configurations.
+
+What may NOT differ is what happens when memory runs out: a recursion
+that is too deep raises the catchable `StackOverflowEx`, in every
+engine - never a crash. (The tree-walker, which recurses on the C
+stack, is the one documented exception, README *StackOverflowEx*.)
+So a test of overflow compares the OUTCOME, never the depth -
+`driver_checks.sh`'s *overflow* case masks the number.
 
 This is stronger than "the tests agree", and it is the reason the
 engine differential exists. It applies to:
