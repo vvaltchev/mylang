@@ -7529,6 +7529,25 @@ static const void *loc_entry_addr(const Chunk &ck, size_t old_pc)
  * is {int line; int col} = one qword store per Loc, little-endian
  * line | col<<32. rax/rcx are dead here (exit_pc's cache flush uses
  * rdi/rsi/r8/r10/r11; eax is set after). */
+/* The per-argument caret run of the call op at `old_pc` (RULE 2), or
+ * null: the same exact-match search as loc_entry_in over Chunk::arg_locs. */
+static const Chunk::ArgLocEntry *arg_locs_entry_in(const Chunk &ck,
+                                                   size_t old_pc)
+{
+    const auto &tbl = ck.arg_locs;
+    size_t lo = 0, hi = tbl.size();
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (tbl[mid].pc < old_pc)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < tbl.size() && tbl[lo].pc == old_pc && tbl[lo].n > 0)
+        return &tbl[lo];
+    return nullptr;
+}
+
 /*
  * `args_caret` (RULE 2, 2026-09-20): a CALL op's failure branch stamps
  * the ARGUMENT LIST's span - the op's second caret, base_locs - not the
@@ -7538,14 +7557,39 @@ static const void *loc_entry_addr(const Chunk &ck, size_t old_pc)
  * argument list (CallExpr::do_eval's catch). A callee-body error arrives
  * with its own caret and is left alone by the guard below either way.
  * Falls back to `locs` for an op with no args entry.
+ *
+ * AND A BIND COERCION NAMES ITS ARGUMENT (the op's THIRD caret,
+ * Chunk::arg_locs): the C++ bind that rejected a `dyn` value recorded the
+ * parameter index in Exception::bind_arg, so the stamp SELECTS AT RUN TIME
+ * - `mov ecx, [exc+bind_arg]` (a 32-bit load: -1 zero-extends to
+ * 0xFFFFFFFF, which the UNSIGNED `cmp ecx, n; jae list` sends to the list
+ * span along with any index past the count), `shl rcx, 4` (an ArgLoc is
+ * two packed Locs, 16 bytes - static_asserted), add the baked pool base,
+ * and copy the entry's two qwords into loc_start/loc_end. The list span
+ * stays the fall-through, so an arity error (bind_arg -1) renders exactly
+ * as before. Two borrowed scratches (rcx holds the entry address while
+ * rdx carries each qword); every path joins at `join`, where both are
+ * released in LIFO order. Emitted only where the op recorded a run with
+ * n > 0 - a 0-argument call has no argument to name.
  */
 static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
-                           bool args_caret = false)
+                           bool args_caret = false, bool arg_select = true)
 {
     const Chunk::LocEntry *le = static_cast<const Chunk::LocEntry *>(
         args_caret ? loc_entry_in(ck.base_locs, old_pc) : nullptr);
     if (!le)
         le = static_cast<const Chunk::LocEntry *>(loc_entry_addr(ck, old_pc));
+    /* `arg_select`: the site's word on whether a bind coercion can be
+     * thrown here at all (jit_site_may_coerce) - where it cannot, the
+     * select would be ~60 dead cold bytes per call site */
+    const Chunk::ArgLocEntry *ae =
+        args_caret && arg_select && le ? arg_locs_entry_in(ck, old_pc)
+                                       : nullptr;
+    static_assert(sizeof(ArgLoc) == 16 && sizeof(Loc) == 8
+                      && offsetof(ArgLoc, end) == 8
+                      && offsetof(Loc, col) == 4,
+                  "the emitted per-argument select indexes ArgLoc as two "
+                  "packed {line, col} qwords at stride 16");
     /* #56: ... and the op's INLINED-AT chain, so a raise from a DELETED run
      * does not have to resolve one from its collapsed pc (see
      * Exception::jit_inline_frame). -1 = this op is not inlined code. */
@@ -7590,24 +7634,63 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
      */
     AccScratch acc(e, AccScratch::reuse_t{});
     RefScratch rs(e, RCX);
+    /* the SECOND scratch of the per-argument select, taken only when the
+     * select is emitted (a granted/free register costs no instruction; a
+     * push-borrow only happens when rdx holds a pin) - released before
+     * `rs` at the join, LIFO */
+    std::unique_ptr<RefScratch> rs2;
+    if (ae)
+        rs2.reset(new RefScratch(e, RDX));
     e.movabs(acc.r, reinterpret_cast<uint64_t>(jit_addr_exc()));
     e.load_base0(acc.r, acc.r);      /* mov rax, [rax] (the object) */
     e.u8(0x48); e.test32_rr(acc.r, acc.r);      /* test rax, rax */
-    const size_t j_null = e.j8(0x74);        /* jz join: bail/eptr - no exc */
+    /* the per-argument select puts the null-exc skip and the has-caret
+     * skip past a rel8's reach (a select with r8+ scratches is ~60
+     * bytes, on top of the list and chain stamps), so both take the
+     * rel32 form exactly when it is emitted - the ordinary stamp keeps
+     * its short jumps, and its bytes, unchanged */
+    const size_t j_null = ae ? e.j32(0x74) : e.j8(0x74);   /* jz join */
 
     size_t j_has = 0;
     if (le) {
         e.cmp_dword_base_imm8(acc.r, off_s + 4, 0x00); /* loc_start.col */
-        j_has = e.j8(0x75);                  /* jnz: caret already set */
+        j_has = ae ? e.j32(0x75) : e.j8(0x75);   /* jnz: caret already set */
+        size_t j_done_arg = 0;
+        if (ae) {
+            const uint32_t off_ba =
+                static_cast<uint32_t>(jit_off_exc_bind_arg());
+            const uint8_t ix = rs.sc, qw = rs2->sc;
+            e.load32_base(ix, acc.r, static_cast<int32_t>(off_ba));
+            if (ae->n <= 127)
+                e.cmp_reg32_imm8(ix, static_cast<int8_t>(ae->n));
+            else
+                e.cmp_reg32_imm32(ix, ae->n);
+            const size_t j_list = e.j8(0x73);     /* jae: -1 / past n */
+            e.shl_rr_imm8(ix, 4);                 /* * sizeof(ArgLoc) */
+            e.movabs(qw, reinterpret_cast<uint64_t>(
+                             &ck.arg_loc_pool[ae->first]));
+            e.add_rr(ix, qw);                     /* the entry's address */
+            e.load_base(qw, ix, 0);               /* start: line | col<<32 */
+            e.store_base(qw, acc.r, static_cast<int32_t>(off_s));
+            e.load_base(qw, ix, 8);               /* end */
+            e.store_base(qw, acc.r, static_cast<int32_t>(off_e));
+            j_done_arg = e.j8(0xEB);              /* jmp has */
+            e.patch8(j_list, e.pos());
+        }
         e.mov_imm(rs.sc, pack(le->start));
         e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_s));
         e.mov_imm(rs.sc, pack(le->end));
         e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_e));
-        e.patch8(j_has, e.pos());            /* the CARET block only: the
+        if (ae) {
+            e.patch8(j_done_arg, e.pos());
+            e.patch32_here(j_has);
+        } else {
+            e.patch8(j_has, e.pos());        /* the CARET block only: the
                                               * chain stamp below still runs
                                               * for an exception that already
                                               * carries a caret but whose
                                               * frames are not yet emitted */
+        }
     }
 
     /*
@@ -7644,9 +7727,14 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
         e.patch8(j_set, e.pos());
     }
 
-    const size_t join = e.pos();     /* every path lands on the pop */
+    const size_t join = e.pos();     /* every path lands on the pops */
+    if (rs2)
+        rs2->release();              /* LIFO: the later borrow pops first */
     rs.release();
-    e.patch8(j_null, join);
+    if (ae)
+        e.patch32(j_null, static_cast<uint32_t>(join - (j_null + 4)));
+    else
+        e.patch8(j_null, join);
 }
 
 
@@ -9902,6 +9990,47 @@ static std::vector<std::unique_ptr<NorecSite>> *g_cur_norec_sites = nullptr;
  * like g_cur_norec_sites, safe for the same single-threaded reason. */
 
 
+/*
+ * RULE 2 (2026-09-20): CAN A BIND COERCION BE THROWN AT THIS SITE? The
+ * conveyance stamp's per-argument select (emit_exc_stamp) is emitted only
+ * where one can. A callee the emitter can NAME - the write-once slot's
+ * descriptor, or the callee-set stamp's one or two candidates - whose
+ * every member is `fast_bind` has no coercing parameter, so its bind
+ * cannot throw one and the select would be dead code: the common
+ * non-coercing site keeps its bytes exactly as they were. An unnamed
+ * callee (a reassignable slot, a value the analysis could not name, the
+ * bakecallee lever off) may be anything, so the select is emitted. The
+ * name is the SOUND answer, not a guess: the write-once slot holds its
+ * declaration's descriptor at every call, and the callee-set stamp is a
+ * MUST answer - the same facts the baked push relies on.
+ */
+static bool jit_site_may_coerce(const Chunk &ck, size_t old_pc,
+                                int callee_arg, bool is_value)
+{
+    if (const FuncDescriptor *d =
+            jit_baked_callee(ck, old_pc, callee_arg, is_value))
+        return !d->fast_bind;
+    if (is_value) {                      /* a two-way site (E3) */
+        int32_t di[2];
+        const int k = ck.value_callees_at(old_pc, di);
+        if (k == 2) {
+            bool coerce = false;
+            for (int i = 0; i < 2; i++) {
+                if (di[i] < 0
+                        || static_cast<size_t>(di[i])
+                               >= ck.closure_defs.size())
+                    return true;
+                const FuncDescriptor *d =
+                    ck.closure_defs[static_cast<size_t>(di[i])];
+                if (!d || !d->fast_bind)
+                    coerce = true;
+            }
+            return coerce;
+        }
+    }
+    return true;
+}
+
 /* reg:proto(fn) - the sync-call sequence: the same MyLang-call pool
  * denial as emit_sync_push_native above. */
 static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
@@ -10524,7 +10653,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.frag_ret(Emitter::RetFlush::flushed);
         e.patch32_here(j_sw);
     }
-    emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true);
+    emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true,
+                   jit_site_may_coerce(ck, old_pc,
+                                       static_cast<int>(callee_arg),
+                                       is_value));
                                       /* collapse-safe caret (#56 step 1) */
     emit_call_epilogue_divergent(e);
     e.exit_pc(pc);
@@ -22971,13 +23103,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_call_setup) });
         e.u8(0xE8); e.u32(0);               /* call jit_call_setup -> rax */
         e.u8(0x48); e.test32_rr(RAX, RAX); /* test rax, rax */
-        const size_t j_ok = e.j8(0x75);     /* jnz over_SO (rax != null) */
-        emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true);
+        /* rel32: the args-form stamp's per-argument select (RULE 2) puts
+         * the skipped arm past a rel8's reach */
+        const size_t j_ok = e.j32(0x75);    /* jnz over_SO (rax != null) */
+        emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true,
+                       /*arg_select=*/!callee->fast_bind);
                                             /* collapse-safe caret (#56) */
         emit_call_epilogue_divergent(e);    /* SO: re-mat rsi/r8 */
         /* -> EnterNative raises g_vm_jit_exc*/
         e.exit_pc(pc);
-        e.patch8(j_ok, e.pos());            /* over_SO: */
+        e.patch32_here(j_ok);               /* over_SO: */
         e.mov_rr(RDI, RAX);   /* callee window slots (reg:abi) */
         /* fragment entry = callee->vm_chunk->native.base + entry_off: */
         AccScratch acc(e);
@@ -25032,6 +25167,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &l : chunk.base_locs)          /* #127 */
         l.pc = static_cast<uint32_t>(remap[l.pc]);
+    for (auto &al : chunk.arg_locs)          /* RULE 2: per-arg carets */
+        al.pc = static_cast<uint32_t>(remap[al.pc]);
     for (auto &vc : chunk.value_callees)     /* #97 E1 */
         vc.pc = static_cast<uint32_t>(remap[vc.pc]);
     for (auto &ic : chunk.inline_ctxs)
@@ -28133,6 +28270,8 @@ retry_emission:
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &l : chunk.base_locs)          /* #127 */
         l.pc = static_cast<uint32_t>(remap[l.pc]);
+    for (auto &al : chunk.arg_locs)          /* RULE 2: per-arg carets */
+        al.pc = static_cast<uint32_t>(remap[al.pc]);
     for (auto &vc : chunk.value_callees)     /* #97 E1 */
         vc.pc = static_cast<uint32_t>(remap[vc.pc]);
     for (auto &ic : chunk.inline_ctxs)

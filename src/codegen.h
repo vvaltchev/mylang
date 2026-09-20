@@ -412,6 +412,8 @@ struct BcInlineSnapshot {
     std::vector<Instr> code;
     std::vector<Chunk::LocEntry> locs;
     std::vector<Chunk::LocEntry> base_locs;   /* #127: the store-base carets */
+    std::vector<Chunk::ArgLocEntry> arg_locs; /* RULE 2: per-arg carets */
+    std::vector<ArgLoc> arg_loc_pool;
     std::vector<int32_t> ref_slots;
     int slot_count = 0;
     int n_temps = 0;

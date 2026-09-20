@@ -556,8 +556,11 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
 /* VM (CoerceNumV): the typed-store numeric coerce - the same
  * coerce_to_decl_type the tree-walker's op==assign path runs (widen float <-
  * int/bool and int <- bool, pass none, THROW on a non-fitting dyn value).
- * See eval.cpp. */
-EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float);
+ * `site_arg`: the call-site argument index when this coerces a PARAMETER
+ * for a call site (the throw carries it - Exception::bind_arg - so the
+ * site carets that argument); -1 for an assignment. See eval.cpp. */
+EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float,
+                             int site_arg = -1);
 
 /* The ONE derivation of a function's bind plan: `fast_bind` + `bind_req`
  * (funcdesc.h). Every site that needs either calls this. */

@@ -12662,6 +12662,117 @@ compares the caret too. All four stamps sabotaged together: tw
 34/34 + levers, driver_checks, myv_doc_check, norec_enum --depth 3 (the
 byte-for-byte stderr oracle) all green.
 
+### RULE 2, refined - A BIND COERCION CARETS THE FAILING ARGUMENT
+### (2026-09-20, the same day, on the maintainer's "as accurate as
+### possible")
+
+The argument-list span was CONSISTENT and BROAD: `f2(i, z)` with a
+string in `z` underlined `i, z`. The bind knows which parameter it
+rejected, so now:
+
+    for (...) { s = s + f2(i, i); s = s + f2(i, z); }
+                                                 ^      every engine
+    (arity)                                   ^^^^      the list, as before
+
+**The rule.** A loc-less exception out of a call's setup is stamped by
+the CALL SITE. A BIND COERCION (`coerce_to_decl_type`'s two throws - a
+declared `int`/`float` parameter refusing a `dyn` runtime value) carets
+the failing argument's own expression; an ARITY error (about the list)
+and the window push (about no argument) keep the argument list;
+`NotCallableEx` keeps the callee. An argument with no span of its own (a
+const-folded literal carries none) takes the list's, in every engine
+alike - codegen records the list's span for it, and both the
+tree-walker's and the generic dyn-callee op's stamps test the span
+before using it. That is not a theoretical case: a literal is
+statically typed, so a NAMED callee's coercion of one is refused at
+compile time, but a DYN callee's is not (`f2(2.5, i)` with `f2` a dyn),
+and the first version wrote the empty span - which left the exception
+loc-less: NO location under `-nj`, the whole call under the JIT, the
+list in the tree-walker (watched, pinned).
+
+**The carrier: `Exception::bind_arg`** (-1 = not a bind failure). Set
+ONLY by a bind made for a CALL SITE - the tree-walker's two call-site
+`do_func_bind_params` overloads (argument expressions, the VM's arg
+run) and `vm_frame_setup`'s coercing loop pass the index into
+`coerce_to_decl_type` / `vm_coerce_decl_num` (`site_arg`), whose throws
+carry it. A builtin CALLBACK's bind passes -1: its parameter index names
+no argument of the builtin call the caret lands on (`sort(a, func(int
+x, int y) ...)` over a dyn string keeps sort's whole argument list in
+every engine - pinned, because parameter 0 pointing at sort's argument
+0, the ARRAY, would have been a plausible wrong answer). An assignment's
+coercion (`CoerceNumV`, a typed decl) passes nothing. A stale value is
+harmless by construction: every stamp is guarded by `!loc_start`, and
+the innermost setup catch of the call whose bind failed stamps first.
+
+**The table: `Chunk::arg_locs` + `arg_loc_pool`** - the call ops' THIRD
+caret (`locs` the whole call, `base_locs` the list). pc-keyed and
+ascending like the other two, each entry a run `[first, first + n)` of
+the flat pool, one span per argument; recorded in `extract_locs` off
+the SAME ExprList node the list caret comes from, gated on the opcode
+(a peephole fusion copies a source struct); SPARSE - only
+`CallV`/`CachedCallV`/`CallValueV` (the generic dyn-callee op's
+`CallSite` already carries per-argument carets, and its stamps -
+`vm_stamp_args_caret`, shared by the interpreted op and
+`jit_call_value_generic` - select from those). It joins every place a
+pc-keyed table lives: both JIT pc remaps, the bytecode splice (a
+caller entry keeps its run; a spliced body's would append to the
+caller's pool - unreachable today, like base_locs' carry, and kept for
+the same reason), `verify_chunk` (pc in range, run within the pool -
+the JIT bakes the run's ADDRESS, and the emitted select indexes it),
+`.myv` v16 (section 9.21: on disk each entry is SELF-CONTAINED, `pc, n,
+n x {loc, loc}` - the reader rebuilds `first`, so no pool index exists
+in the file for a hostile image to point past; the round trip compares
+the runs entry for entry, with a vacuity guard) and the `-vd` dump.
+
+**The stamps.** `stamp_args_loc` (tree-walker: `CallExpr`'s dispatch
+catch and the devirtualized nodes), `vm_stamp_setup_caret` (the
+interpreter's enter paths and the boundary call: `arg_loc_at(pc,
+bind_arg)` first, the list second, still no `locs` fallback), and the
+JIT's `emit_exc_stamp` args form, which SELECTS AT RUN TIME on the cold
+conveyance arm - the emitted code cannot know which argument will fail:
+
+    mov  ecx, [rax+bind_arg]     ; a 32-bit load: -1 -> 0xFFFFFFFF
+    cmp  ecx, n ; jae list       ; unsigned: -1 and past-n go to the list
+    shl  rcx, 4                  ; sizeof(ArgLoc) == 16, static_asserted
+    movabs rdx, &pool[first] ; add rcx, rdx
+    mov  rdx, [rcx] ; mov [rax+loc_start], rdx
+    mov  rdx, [rcx+8] ; mov [rax+loc_end], rdx ; jmp has
+  list: (the two packed-Loc stores as before)
+
+Two borrowed scratches (`RefScratch` rcx and rdx - the second is the
+constructor-expression form in a unique_ptr, which `regcensus.py` now
+recognises as an allocator ask), released LIFO at the one join; the
+null-exc and has-caret skips take the rel32 form exactly when the
+select is emitted (the ordinary stamp keeps its short jumps and its
+bytes), and the sync direct-call site's `jnz over_SO` is rel32 now - a
+`patch8` assertion found both within one `-rt` run. **Emitted only
+where a coercion can happen** (`jit_site_may_coerce`): a callee the
+emitter can NAME - the write-once slot, the callee-set stamp's one or
+two candidates - that is `fast_bind` has no coercing parameter, so the
+common non-coercing site is byte-identical to before (09_fib: 0
+selects; the c1/c2 probes: 3 and 2). An unnamed callee gets the select.
+
+**Nets, watched failing (each defect committed first, the build checked
+to have compiled - the first sabotage of the select did NOT, an
+`-Werror=unused-function` on the helper it orphaned, and would have
+"measured" the intact binary):**
+ - the codegen record removed: the four VM modes 1701/1703 (the
+   two-argument cases; a one-argument list coincides with its argument),
+   the tree-walker 1996/1998 (the round trip's vacuity guard);
+ - the JIT's select removed: ONLY the two JIT modes 1701/1703 and the
+   reach harness's cross-engine compare (`@6:48-50` vs `@6:45-50`) -
+   which is the proof that the emitted select, not a C++ stamp, renders
+   the argument under the JIT;
+ - the tree-walker's index removed: the reference run 1994/1998 and the
+   two JIT-OFF VM modes 1702/1703 (the boundary `vm_call_func` binds
+   through the same overload).
+The `err loc:` entries: the three re-pinned to the argument, plus the
+FIRST of two arguments (so the index is what is tested), a `float`
+parameter (the coercion's other throw), and the callback shape above;
+`driver_checks.sh` renders the caret from a `.myv` image and compares
+it to the source run; `myv_round_trip`'s program has user calls in
+every chunk. Verification: see the commit.
+
 ## #97 E3 - THE TWO-WAY FRAMELESS SITE: a value call with two candidates
 ## dispatches on the live descriptor into one of two site-local tails
 ## (2026-09-20)

@@ -1388,6 +1388,29 @@ marked the arguments. The interpreter stamps it in `vm_stamp_setup_caret`
 fallback, so the generic dyn-callee op, whose `CallSite` carries its own arg
 carets, keeps stamping downstream), and the JIT bakes it in `emit_exc_stamp`'s
 args form on the sync slow tail and the direct-call failure branch.
+
+**`Chunk::arg_locs` + `arg_loc_pool` — the user CALL ops' THIRD caret (RULE
+2 refined, 2026-09-20).** A BIND COERCION carets the FAILING ARGUMENT alone
+(`f2(i, z)` with a string in `z` underlines `z`, not `i, z`): the bind that
+rejected the value recorded the parameter index in `Exception::bind_arg`
+(set only by a CALL-SITE bind — never a builtin callback's, never an
+assignment's coercion), and the site turns it into that argument's own
+span. `locs` holds the whole call and `base_locs` the list, so a third
+pc-keyed table carries one span per argument: `arg_locs` names a run
+`[first, first + n)` of the flat `arg_loc_pool`, recorded by
+`extract_locs` off the same ExprList node the list caret comes from, only
+for `CallV`/`CachedCallV`/`CallValueV` (the generic dyn-callee op selects
+from its own `CallSite::args`). An argument with no span of its own (a
+const-folded literal) takes the list's, in every engine. Read by
+`vm_stamp_setup_caret` (`arg_loc_at(pc, bind_arg)` first, then the list)
+and by the JIT's `emit_exc_stamp` args form, which bakes `&pool[first]`
+and SELECTS AT RUN TIME on the exception's `bind_arg` — emitted only
+where the site's callee can coerce (`jit_site_may_coerce`). Rides both
+JIT pc remaps and the splice like the other two; bounded by
+`verify_chunk`; serialized after `base_locs` as myv **v16** (section
+9.21); printed by `-vd` with both ends of every span. An arity error
+(about the list) keeps `base_locs`' span. Record: docs/jit-optimizations.md,
+*RULE 2, refined*.
 The AST-node side table this section used to describe -
 `Chunk::node_table`/`node_at_pc` and the `ast_nodes` pool - is GONE with the
 fallback op it existed for; the codegen-transient handle now lives on

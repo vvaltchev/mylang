@@ -3702,6 +3702,17 @@ ptrdiff_t jit_off_exc_inline_frame()
          - reinterpret_cast<char *>(b);
 }
 
+/* RULE 2 (2026-09-20): the FAILING ARGUMENT index a bind coercion recorded
+ * (Exception::bind_arg), which a call site's emitted stamp reads to pick
+ * that argument's caret over the list's - probed like the fields above. */
+ptrdiff_t jit_off_exc_bind_arg()
+{
+    DivisionByZeroEx e;
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->bind_arg)
+         - reinterpret_cast<char *>(b);
+}
+
 /* model-flip (nativize-ops): the native SubscriptV body - the interpreter's
  * exact `dst = RValue(base.subscript(idx, for_write=false))`. base_lv is passed
  * as an LValue* (like Subscript::do_eval, for COW identity). Throws -> conveyed
@@ -7359,7 +7370,10 @@ vm_frame_setup(VmActivation &act, EvalContext &ctx, const Chunk *ret_chunk,
                 if (p.decl_type == DeclType::i
                         || p.decl_type == DeclType::f)
                     val = vm_coerce_decl_num(
-                        val, p.decl_type == DeclType::f);
+                        val, p.decl_type == DeclType::f,
+                        static_cast<int>(i));    /* a call-site bind:
+                                                  * the throw names the
+                                                  * argument (RULE 2) */
                 w->at(static_cast<int_type>(i)).rebind(std::move(val));
             }
         } catch (...) {
@@ -7513,6 +7527,17 @@ void vm_stamp_setup_caret(Exception &e, const Chunk &chunk, size_t pc)
     if (e.loc_start)
         return;
     Loc s, en;
+    /* A BIND COERCION names the argument it rejected (Exception::bind_arg,
+     * set by vm_frame_setup's coercing loop and the tree-walker's
+     * call-site binds): the op's THIRD caret, arg_locs, is that argument's
+     * own span. An out-of-range index (a stale value) takes the list;
+     * nothing is invented. */
+    if (e.bind_arg >= 0
+            && chunk.arg_loc_at(pc, static_cast<size_t>(e.bind_arg), s, en)) {
+        e.loc_start = s;
+        e.loc_end = en;
+        return;
+    }
     /* NO fallback to `locs`: an op that records no args entry (the
      * generic dyn-callee call, whose CallSite carries its own arg
      * carets) stamps downstream as it always did - a whole-call caret
@@ -7522,6 +7547,34 @@ void vm_stamp_setup_caret(Exception &e, const Chunk &chunk, size_t pc)
         return;
     e.loc_start = s;
     e.loc_end = en;
+}
+
+/*
+ * The generic dyn-callee op's twin of vm_stamp_setup_caret: its carets
+ * live in its CallSite (an ArgLocs view), not the pc-keyed tables. A
+ * loc-less exception out of the call takes the FAILING ARGUMENT's span
+ * when the bind named one (Exception::bind_arg, in range), else the
+ * argument list's. Shared by the interpreted op and the JIT's generic
+ * helper (jit_call_value_generic), so the two cannot drift.
+ */
+static inline void vm_stamp_args_caret(Exception &e, const ArgLocs &al)
+{
+    if (e.loc_start)
+        return;
+    const int i = e.bind_arg;
+    /* an argument with no span of its own - a const-folded LITERAL, which
+     * only a dyn callee can hand to a coercing parameter (`f(2.5)` with
+     * `f` a dyn) - takes the list's, as the tree-walker's stamp_args_loc
+     * does; writing its empty Loc would leave the exception loc-less
+     * (watched: no location under -nj, the whole call under the JIT) */
+    if (i >= 0 && static_cast<size_t>(i) < al.nargs && al.args
+            && al.args[static_cast<size_t>(i)].start) {
+        e.loc_start = al.args[static_cast<size_t>(i)].start;
+        e.loc_end = al.args[static_cast<size_t>(i)].end;
+        return;
+    }
+    e.loc_start = al.start;
+    e.loc_end = al.end;
 }
 
 /* The lean twin of vm_enter_call (the common shape: fast_bind + no cache
@@ -8973,10 +9026,7 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
             try {
                 ctx.frame->at(argbase).put(RValue(a0_value()));
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = al.start;
-                    e.loc_end = al.end;
-                }
+                vm_stamp_args_caret(e, al);
                 if (auto *re = dynamic_cast<RuntimeException *>(&e))
                     g_vm_jit_exc.reset(re->clone());
                 else
@@ -9015,20 +9065,15 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
              * conveyance would otherwise get the whole call's caret at
              * the re-raise (RULE 2; watched: the arity error through a
              * dyn callee carets `i` in the tree-walker and `-nj`) */
-            if (r == 2 && g_vm_jit_exc && !g_vm_jit_exc->loc_start) {
-                g_vm_jit_exc->loc_start = al.start;
-                g_vm_jit_exc->loc_end = al.end;
-            }
+            if (r == 2 && g_vm_jit_exc)
+                vm_stamp_args_caret(*g_vm_jit_exc, al);
             return r;
         }
         try {
             vm_dispatch(*g_vm_resume_chunk, ctx, *g_vm_act,
                         g_vm_resume_pc);
         } catch (Exception &e) {
-            if (!e.loc_start) {
-                e.loc_start = al.start;
-                e.loc_end = al.end;
-            }
+            vm_stamp_args_caret(e, al);
             if (auto *re = dynamic_cast<RuntimeException *>(&e))
                 g_vm_jit_exc.reset(re->clone());
             else
@@ -9039,11 +9084,7 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
             return 2;
         }
         if (g_vm_exc_pending) {
-            Exception &e = *g_vm_exc_pending;
-            if (!e.loc_start) {
-                e.loc_start = al.start;
-                e.loc_end = al.end;
-            }
+            vm_stamp_args_caret(*g_vm_exc_pending, al);
             g_vm_jit_exc = std::move(g_vm_exc_pending);
             return 2;
         }
@@ -9141,10 +9182,7 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
         }
         ctx.frame->at(dst).put(std::move(res));
     } catch (Exception &e) {
-        if (!e.loc_start) {
-            e.loc_start = al.start;
-            e.loc_end = al.end;
-        }
+        vm_stamp_args_caret(e, al);
         if (auto *re = dynamic_cast<RuntimeException *>(&e))
             g_vm_jit_exc.reset(re->clone());
         else
@@ -12038,10 +12076,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                     }
                 }
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = al.start;
-                    e.loc_end = al.end;
-                }
+                vm_stamp_args_caret(e, al);        /* RULE 2: the failing
+                                                    * argument, else the
+                                                    * list */
                 throw;
             }
             if (g_vm_exc_pending) {                /* FuncObject cross-frame */

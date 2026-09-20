@@ -764,43 +764,92 @@ static const std::vector<test> tests =
       &typeid(OutOfBoundsEx), 51, 2, 56, 2 },
 
     /*
-     * A CALL'S SETUP ERROR CARETS THE ARGUMENT LIST, IN EVERY ENGINE AND
-     * FOR EVERY CALL SHAPE (RULE 2, 2026-09-20). A loc-less exception out
-     * of a call's setup - a bind coercion (a `dyn` string or float into
-     * an `int` parameter), an arity throw through a `dyn` callee - is
-     * stamped with the argument list's span by CallExpr::do_eval's catch.
-     * Found divergent four ways on one shape: the VM's in-VM push escaped
-     * with NO location, the JIT's tiers stamped the whole call, and the
-     * tree-walker's own DEVIRTUALIZED call (DirectCallExpr, a named
-     * function) marked the whole call where the plain CallExpr (a closure)
-     * marked the arguments. The call ops carry the argument list as their
-     * second caret now (base_locs), the JIT's conveyance stamps it, and
-     * DirectCallExpr/CachedCallExpr reproduce the CallExpr catch. Each
-     * case below throws on a WARMED re-descent (the call succeeded once at
-     * that depth first), so the EMITTED site's exception path is the one
-     * exercised under the JIT modes (shape-eater #9).
+     * A CALL'S SETUP ERROR: A BIND COERCION CARETS THE FAILING ARGUMENT,
+     * AN ARITY ERROR THE ARGUMENT LIST - IN EVERY ENGINE AND FOR EVERY
+     * CALL SHAPE (RULE 2, 2026-09-20). A loc-less exception out of a
+     * call's setup is stamped by the call site (stamp_args_loc in the
+     * tree-walker, vm_stamp_setup_caret / vm_stamp_args_caret in the VM,
+     * emit_exc_stamp's args form in the JIT): a bind coercion (a `dyn`
+     * string or float into an `int`/`float` parameter) recorded the
+     * parameter index it rejected (Exception::bind_arg), so the site
+     * carets THAT argument's own span - the call ops' THIRD caret,
+     * Chunk::arg_locs; an arity throw names no argument and takes the
+     * list. It used to be the list for both, and before that it diverged
+     * four ways on one shape (the VM's in-VM push escaped with NO
+     * location, the JIT's tiers stamped the whole call, and the
+     * tree-walker's DEVIRTUALIZED call marked the whole call where the
+     * plain CallExpr marked the arguments). Each case below throws on a
+     * WARMED re-descent (the call succeeded once at that depth first), so
+     * the EMITTED site's exception path - the run-time select on
+     * bind_arg - is the one exercised under the JIT modes (shape-eater
+     * #9). Watched failing: the codegen record removed fails the four VM
+     * modes; the JIT's select removed fails the two JIT modes; the
+     * tree-walker's index removed fails the reference run.
      */
-    { "err loc: a bind coercion at a CLOSURE call marks the argument list",
+    { "err loc: a bind coercion at a CLOSURE call marks the FAILING argument",
       { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
         "var f2 = mk2(1);",
         "var dyn z = 0; z = runtime(\"str\"); var s = 0;",
         "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(i, z); }",
         "print(s);" },
-      &typeid(TypeErrorEx), 69, 4, 74, 4 },
+      &typeid(TypeErrorEx), 72, 4, 74, 4 },
     { "err loc: a bind coercion at a NAMED function call (devirtualized) "
-      "marks the argument list, like the plain call",
+      "marks the failing argument, like the plain call",
       { "func fi(int k) { var t = 0; for (var j = 0; j < k; j++) t = t + j; return t; }",
         "var dyn x = 0; x = runtime(2.5); var s = 0;",
         "for (var i = 0; i < runtime(3); i++) { s = s + fi(i); s = s + fi(x); }",
         "print(s);" },
       &typeid(TypeErrorEx), 66, 3, 68, 3 },
-    { "err loc: a bind coercion through a DYN callee marks the argument list",
+    { "err loc: a bind coercion through a DYN callee marks the failing arg",
       { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
         "var dyn f2 = 0; f2 = runtime(mk2(1));",
         "var dyn z = 0; z = runtime(\"str\"); var s = 0;",
         "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(i, z); }",
         "print(s);" },
-      &typeid(TypeErrorEx), 69, 4, 74, 4 },
+      &typeid(TypeErrorEx), 72, 4, 74, 4 },
+    /* the FIRST of two arguments - so it is the INDEX that is tested, not
+     * "the last argument" or "the one before the closing paren" */
+    { "err loc: a bind coercion at the FIRST argument marks that argument",
+      { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
+        "var f2 = mk2(1);",
+        "var dyn z = 0; z = runtime(\"str\"); var s = 0;",
+        "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(z, i); }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 69, 4, 71, 4 },
+    /* the coercion's OTHER throw: a declared `float` parameter refusing a
+     * non-numeric dyn value (the int/bool widening is the only other arm) */
+    { "err loc: a FLOAT parameter's bind coercion marks the failing argument",
+      { "func ff(float x) { var t = 0.0; for (var j = 0; j < 3; j++) t = t + x; return t; }",
+        "var dyn x = 0; x = runtime(\"s\"); var s = 0.0;",
+        "for (var i = 0; i < runtime(3); i++) { s = s + ff(i); s = s + ff(x); }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 66, 3, 68, 3 },
+    /* a builtin CALLBACK's bind names no argument of the builtin call, so
+     * its coercion keeps the BUILTIN's argument-list caret in every engine
+     * (the tree-walker's DirectBuiltinCallExpr catch; the VM's
+     * CallBuiltinLV catch) - a callback parameter index pointing into
+     * sort's own argument list would be a wrong answer, not a precise one
+     * (`x` is parameter 0; sort's argument 0 is the ARRAY) */
+    { "err loc: a CALLBACK's bind coercion keeps the builtin call's "
+      "argument-list caret, not a callback parameter's",
+      { "var a = [3, 1, 2]; var dyn b = 0; b = runtime(\"x\"); append(a, b);",
+        "var r = sort(a, func(int x, int y) { return x < y; });",
+        "print(r);" },
+      &typeid(TypeErrorEx), 14, 2, 54, 2 },
+    /* a LITERAL argument has no span of its own (const-folding leaves it
+     * loc-less) and only a DYN callee can hand one to a coercing parameter
+     * unchecked - every engine then takes the argument LIST, the
+     * tree-walker's stamp_args_loc and the VM's stamps alike (watched:
+     * the generic op's CallSite carries the empty span, and writing it
+     * left the exception loc-less - no location under -nj, the whole call
+     * under the JIT) */
+    { "err loc: a LITERAL argument's coercion through a DYN callee marks "
+      "the argument list (it has no span of its own)",
+      { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
+        "var dyn f2 = 0; f2 = runtime(mk2(1)); var s = 0;",
+        "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(2.5, i); }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 69, 3, 76, 3 },
     { "err loc: a runtime ARITY error through a DYN callee marks the argument",
       { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
         "var dyn f2 = 0; f2 = runtime(mk2(1)); var s = 0;",
@@ -23058,12 +23107,49 @@ static bool myv_loc_table_equal(const char *what,
     return true;
 }
 
-/* Both pc-keyed loc tables: `locs` and, since #127, the store-BASE carets
- * (which the `-vd` dump prints only as `pc -> start`, same blind spot). */
+/* The PER-ARGUMENT caret runs (RULE 2, 2026-09-20): entry for entry, and
+ * every span of every run - the on-disk form nests the spans per entry
+ * while the in-memory form is a flat pool, so a loader that rebuilt
+ * `first` wrongly would still count the same and dump the same pcs. */
+static bool myv_arg_locs_equal(const Chunk &x, const Chunk &y)
+{
+    if (x.arg_locs.size() != y.arg_locs.size()) {
+        fprintf(stderr, "myv: arg_locs count %zu != %zu\n",
+                x.arg_locs.size(), y.arg_locs.size());
+        return false;
+    }
+    for (size_t i = 0; i < x.arg_locs.size(); i++) {
+        const Chunk::ArgLocEntry &a = x.arg_locs[i];
+        const Chunk::ArgLocEntry &b = y.arg_locs[i];
+        if (a.pc != b.pc || a.n != b.n) {
+            fprintf(stderr, "myv: arg_locs[%zu] pc%u/%u != pc%u/%u\n", i,
+                    a.pc, a.n, b.pc, b.n);
+            return false;
+        }
+        for (uint32_t k = 0; k < a.n; k++) {
+            const ArgLoc &p = x.arg_loc_pool[a.first + k];
+            const ArgLoc &q = y.arg_loc_pool[b.first + k];
+            if (p.start.line != q.start.line || p.start.col != q.start.col
+                    || p.end.line != q.end.line || p.end.col != q.end.col) {
+                fprintf(stderr, "myv: arg_locs[%zu] arg %u %d:%d..%d:%d != "
+                                "%d:%d..%d:%d\n", i, k, p.start.line,
+                        p.start.col, p.end.line, p.end.col, q.start.line,
+                        q.start.col, q.end.line, q.end.col);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* All three pc-keyed caret tables: `locs`, the store-BASE carets (#127) and
+ * the per-ARGUMENT carets (RULE 2) - the `-vd` dump prints the first two
+ * only as `pc -> start`, the same blind spot. */
 static bool myv_locs_equal(const Chunk &x, const Chunk &y)
 {
     return myv_loc_table_equal("loc", x.locs, y.locs)
-           && myv_loc_table_equal("base_loc", x.base_locs, y.base_locs);
+           && myv_loc_table_equal("base_loc", x.base_locs, y.base_locs)
+           && myv_arg_locs_equal(x, y);
 }
 
 /*
@@ -23380,6 +23466,7 @@ static bool myv_round_trip()
          * counted: the table is SPARSE, so a program edit that drops the
          * global-based store above would make its comparison vacuous. */
         size_t nbase = prog.root.base_locs.size();
+        size_t nargl = prog.root.arg_locs.size();   /* RULE 2: likewise */
 
         for (size_t i = 0; locs_ok && i < prog.funcs.size(); i++) {
             const Chunk *a =
@@ -23388,6 +23475,7 @@ static bool myv_round_trip()
                 static_cast<const Chunk *>(loaded.funcs[i]->vm_chunk);
             if (a && b) {
                 nbase += a->base_locs.size();
+                nargl += a->arg_locs.size();
                 if (!myv_locs_equal(*a, *b))
                     locs_ok = false;
             }
@@ -23401,6 +23489,12 @@ static bool myv_round_trip()
         if (!nbase) {
             fprintf(stderr, "myv: no base_locs to compare - the program "
                             "above no longer stores through a global\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        if (!nargl) {
+            fprintf(stderr, "myv: no arg_locs to compare - the program "
+                            "above no longer makes a user call\n");
             g_exec_engine = saved;
             return false;
         }
