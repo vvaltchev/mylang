@@ -1290,6 +1290,39 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         return EvalValue(acc);
     }
 
+    /*
+     * The key_func form. Elements are read with arr_elem_at, which never
+     * promotes flat storage - get_view() below is GENERAL-ONLY and threw
+     * InternalErrorEx on every flat array (#43: `sum([5,1,4], f)` failed in
+     * every engine). The callback goes through VmInvoker::call, the one
+     * entry a higher-order builtin may use. The size is re-read each step:
+     * the callback is arbitrary script code and may resize the array, and
+     * the index must stay in bounds whatever it does.
+     */
+    if (nargs == 2) {
+
+        const ArgLoc *arg1 = exprList->arg(1);
+        const EvalValue &val1 = args[1];
+
+        if (!val1.is<intrusive_ptr<FuncObject>>())
+            throw TypeErrorEx("Expected function", arg1->start, arg1->end);
+
+        if (arr.size() == 0)
+            return none; /* like the 1-arg form */
+
+        VmInvoker inv(ctx, *val1.get<intrusive_ptr<FuncObject>>().get());
+
+        /* Seed with a COPY of the first result, as the 1-arg path does:
+         * `+=` mutates the accumulator in place, and a callback may return
+         * an array it still references. */
+        EvalValue val = inv.call(arr_elem_at(arr, 0)).clone();
+
+        for (size_type i = 1; i < arr.size(); i++)
+            num_bin_op(val, inv.call(arr_elem_at(arr, i)), &Type::add);
+
+        return val;
+    }
+
     /* A flat-strs array reaches the general path via promotion on a local
      * HANDLE copy (the caller's array keeps its storage): sum of strings
      * concatenates through the general `+=` loop, as it always did. */
@@ -1301,72 +1334,48 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
     if (view.size() == 0)
         return none; /* sum of an empty array is none, like min()/max() */
 
-    if (nargs == 1) {
+    const EvalValue &first = view[0].get();
 
-        const EvalValue &first = view[0].get();
+    /*
+     * Fast path for an all-int array: accumulate raw int_type in a tight
+     * loop, skipping num_bin_op's promotion check and the per-element
+     * virtual TypeInt::add dispatch. Overflow wraps (-fwrapv), exactly as
+     * TypeInt::add does. The first non-int (a float, say) breaks out and
+     * the general loop below resumes from there, so a mixed array still
+     * promotes correctly (int accumulator -> float via num_bin_op).
+     */
+    if (first.is<int_type>()) {
 
-        /*
-         * Fast path for an all-int array: accumulate raw int_type in a tight
-         * loop, skipping num_bin_op's promotion check and the per-element
-         * virtual TypeInt::add dispatch. Overflow wraps (-fwrapv), exactly as
-         * TypeInt::add does. The first non-int (a float, say) breaks out and
-         * the general loop below resumes from there, so a mixed array still
-         * promotes correctly (int accumulator -> float via num_bin_op).
-         */
-        if (first.is<int_type>()) {
+        int_type acc = first.get<int_type>();
+        size_type i = 1;
 
-            int_type acc = first.get<int_type>();
-            size_type i = 1;
-
-            for (; i < view.size(); i++) {
-                const EvalValue &e = view[i].get();
-                if (!e.is<int_type>())
-                    break;
-                acc += e.get<int_type>();
-            }
-
-            if (i == view.size())
-                return EvalValue(acc);
-
-            EvalValue val(acc);
-            for (; i < view.size(); i++)
-                num_bin_op(val, view[i].get(), &Type::add);
-            return val;
+        for (; i < view.size(); i++) {
+            const EvalValue &e = view[i].get();
+            if (!e.is<int_type>())
+                break;
+            acc += e.get<int_type>();
         }
 
-        /*
-         * General path. Seed the accumulator with a *copy* of the first elem:
-         * num_bin_op with Type::add mutates the accumulator in place (array
-         * `+=` appends to it), so aliasing view[0] would mutate the input array
-         * - and would be rejected outright when the input is a read-only const.
-         */
-        EvalValue val = first.clone();
+        if (i == view.size())
+            return EvalValue(acc);
 
-        for (size_type i = 1; i < view.size(); i++) {
+        EvalValue val(acc);
+        for (; i < view.size(); i++)
             num_bin_op(val, view[i].get(), &Type::add);
-        }
-
-        return val;
-
-    } else {
-
-        const ArgLoc *arg1 = exprList->arg(1);
-        const EvalValue &val1 = args[1];
-
-        if (!val1.is<intrusive_ptr<FuncObject>>())
-            throw TypeErrorEx("Expected function", arg1->start, arg1->end);
-
-        FuncObject &funcObj = *val1.get<intrusive_ptr<FuncObject>>().get();
-        EvalValue val = eval_func(ctx, funcObj, view[0].get());
-
-        for (size_type i = 1; i < view.size(); i++) {
-            num_bin_op(
-                val,
-                eval_func(ctx, funcObj, view[i].get()),
-                &Type::add
-            );
-        }
-
         return val;
     }
+
+    /*
+     * General path. Seed the accumulator with a *copy* of the first elem:
+     * num_bin_op with Type::add mutates the accumulator in place (array
+     * `+=` appends to it), so aliasing view[0] would mutate the input array
+     * - and would be rejected outright when the input is a read-only const.
+     */
+    EvalValue val = first.clone();
+
+    for (size_type i = 1; i < view.size(); i++) {
+        num_bin_op(val, view[i].get(), &Type::add);
+    }
+
+    return val;
 }

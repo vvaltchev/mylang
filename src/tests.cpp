@@ -10251,6 +10251,56 @@ static const std::vector<test> tests =
         },
     },
 
+    /* #43: the key_func path read the array through get_view(), which is
+     * GENERAL-ONLY, so every flat array (int/float/bool/str) raised
+     * InternalErrorEx - in all engines. One case per storage kind, plus an
+     * empty one, a template key (its param is fed the element type), the
+     * result TYPE (the callback's return, not the element's), and a
+     * runtime (non-const) array so nothing folds away. */
+    {
+        "Builtin sum() with key func over every array storage (#43)",
+        {
+            "func weight(int x) { return x * 2 + 1; }",
+            "var xs = [5, 1, 4];",
+            "append(xs, int(runtime(0)));",
+            "assert(array_storage(xs) == \"int\");",
+            "assert(sum(xs, weight) == 24);",
+            "func tw(x) { return x * 3; }",
+            "assert(sum(xs, tw) == 30);",
+            "var fs = [1.5, 2.5];",
+            "assert(array_storage(fs) == \"float\");",
+            "assert(sum(fs, func(float f) => f * 2.0) == 8.0);",
+            "var tot = sum(fs, func(x) => int(x));",
+            "assert(tot == 3 && typestr(tot) == \"int\");",
+            "var bs = [true, false, true];",
+            "assert(array_storage(bs) == \"bool\");",
+            "assert(sum(bs, func(bool b) => b) == 2);",
+            "var ss = split(\"ab,c,def\", \",\");",
+            "assert(array_storage(ss) == \"str\");",
+            "assert(sum(ss, func(s) => len(s)) == 6);",
+            "assert(sum(ss, func(s) => s + \"!\") == \"ab!c!def!\");",
+            "var dyn g = [1, \"a\", 2.5];",
+            "assert(sum(g, func(dyn v) => str(v)) == \"1a2.500000\");",
+            "array<int> e = [];",
+            "assert(sum(e, weight) == none);",
+            "var n = sum(xs, weight) + 1;",
+            "assert(n == 25 && typestr(n) == \"int\");",
+        },
+    },
+
+    {
+        /* A key_func that throws: the callback's own exception comes out
+         * (not InternalErrorEx), with the callback's caret. */
+        "Builtin sum() with a throwing key func propagates it (#43)",
+        {
+            "func kz(int x) { return 10 / (x - 1); }",
+            "var xs = [5, 1, 4];",
+            "append(xs, int(runtime(0)));",
+            "print(sum(xs, kz));",
+        },
+        &typeid(DivisionByZeroEx), 31, 1,
+    },
+
     {
         "Builtin sum() on array of strings",
         {
