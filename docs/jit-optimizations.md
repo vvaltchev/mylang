@@ -13375,3 +13375,27 @@ build-claude/perf/mylang --baseline build-claude/base-25/mylang`,
 **0.991x** over 90. The full battery was green (the one `myv_fuzz`
 report on the debug build is the known small-1305 LSan finding, task
 #26).
+
+**W3 ADDENDUM (2026-09-22, myv_fuzz small-60 on a v18 image): "written
+only by raw ops" is VACUOUSLY true of a slot no op writes.** A mutated
+`StructCtorV` dst left `p` unwritten; the derivation kept its bit, the
+site left it uninitialised, and `p.x` read stale stack whose type word
+said "dict" - `member_read_core` retained a garbage pointer, a SEGV in
+both builds where `-nj` raised a clean TypeErrorEx. Codegen never emits
+the shape (a local is declared before use, a temp written before read),
+which is why the rule read as complete. The site now also subtracts
+`Chunk::frameless_read_first` - the slots some path can READ before any
+instruction WROTE them, a MUST dataflow over the CFG
+(`chunk_read_before_write`, codegen.h: entries start with nothing
+written, a join is the intersection, a barrier op makes it every slot)
+- from the LOCAL half of `frameless_init_free`; a parameter's read-first
+bit is ignored, since the bind that writes it is no instruction and the
+fill writes every parameter (W5's tails keep their elision). The three
+frameless facts are derived in ONE place now, `jit_chunk_frameless_
+derive` (codegen_chunk, the bytecode splice's re-derivation and the
+image loader used to carry a pair each). Cost to our own output: NONE
+- emitted code byte-identical on all 127 corpus programs (`vdjcmp`).
+Pinned by `jit_frameless_init_free_read_first` (the mutated shape built
+in process, `ref_slots` re-derived as the loader would, the read-first
+slot required OUT of the site's local mask; watched: `mask 0xb, slot 1`
+before the dataflow).

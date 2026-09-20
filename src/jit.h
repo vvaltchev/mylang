@@ -605,6 +605,10 @@ bool jit_chunk_frameless_ok(const Chunk &chunk);
  * frameless_ok, at the same three sites, for the same reason (the
  * CALLER's site reads it, after this chunk's originals are gone). */
 uint64_t jit_chunk_frameless_init_free(const Chunk &chunk);
+/* THE derivation point for frameless_ok / frameless_init_free /
+ * frameless_read_first - codegen_chunk, the bytecode splice and the
+ * image loader all call this one (2026-09-22). */
+void jit_chunk_frameless_derive(Chunk &chunk);
 #ifdef TESTS
 bool jit_test_instr_stores_dst_raw(const Instr &in);   /* W3's whitelist */
 #endif

@@ -792,15 +792,21 @@ compile), after `vm_verify_program` and before the JIT. Pinned by
 `myv_ref_slots_derived` and the round trip's entry-for-entry compare.
 Two findings still open: fat-676 (terminate) and small-938 (a hang).
 **And the v18 images shifted the seeded mutation space onto FOUR more
-(2026-09-22, all pre-existing classes):** `small-60.myv` - a mutated
-`StructCtorV` dst leaves `p` never written, and W3's
+(2026-09-22, all pre-existing classes):** ✅ `small-60.myv` - a
+mutated `StructCtorV` dst leaves `p` never written, and W3's
 `jit_chunk_frameless_init_free` asks only that every WRITE of a slot
 be raw, so a slot with NO write at all kept its bit and the frameless
 site left it uninitialised: a SEGV in both builds (`-nj`: a clean
-TypeErrorEx) - fixed in the commit after v18 by a definitely-written
-dataflow; `fat-260.myv` / `fat-845.myv` - debug-only C `assert`s on
-codegen-proven arms (`vm_unpack_elem_body`'s array base,
-`read_float_slot`'s float) that a corrupt image violates, a clean
+TypeErrorEx). FIXED the same day: `chunk_read_before_write` (codegen.h,
+a definitely-written MUST dataflow over the CFG) feeds
+`Chunk::frameless_read_first`, which the site subtracts from the LOCAL
+half of init_free (a parameter's bit is ignored - the fill writes it);
+`jit_chunk_frameless_derive` is the one derivation point now. Emitted
+code byte-identical corpus-wide (vdjcmp 127/127); pinned by
+`jit_frameless_init_free_read_first`. `fat-260.myv` / `fat-845.myv` -
+debug-only C `assert`s on codegen-proven arms (`vm_unpack_elem_body`'s
+array base, `read_float_slot`'s float) that a corrupt image violates, a
+clean
 TypeErrorEx / OutOfBoundsEx on the ASSERTS=0 build - the "named abort"
 outcome the spec accepts, which the fuzzer nonetheless counts as a
 crash on an ASSERTS build; `fat-316.myv` - an LSan report (256 bytes)
