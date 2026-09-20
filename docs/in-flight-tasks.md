@@ -594,8 +594,12 @@ work — but profile it before building, the way increment 0 was.
         maintainer: write the bench first): benches 91/92 written, then a
         function calls a LEAF framelessly (F1, 91 -80% Ir) and a calling
         frameless body may call a leaf (F2, 92 -60% then -29%; record:
-        *#97 F1/F2*). STILL OPEN: a CALLING callee at a non-self site
-        (mutual recursion - its placement needs a cycle-aware order).
+        *#97 F1/F2*). ✅ **G1 DONE 2026-09-24** (bench 93 first): a
+        CALLING callee at another function's site, placed at RUN time
+        through Chunk::frameless_entry_abs (93 -36.5% Ir; record: *#97
+        G1*). NEXT: the identity chain for ANY named write-once
+        capture-free callee (E2c's argument generalises), then builtin
+        calls in a calling body, then #124.
         NEXT was: a non-SELF callee
         (needs the callee's placement facts at a non-main site - the
         seventh audit-table shape), builtin calls in a calling body.

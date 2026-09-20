@@ -19410,6 +19410,14 @@ static bool jit_norec_shadow()
  */
 static bool norec_segment_boundary()
 {
+    /* #97 G1: this test's call chain (functions calling functions) is
+     * FRAMELESS now; the tier it tests still serves every call that is
+     * not frameless-eligible, so pin it by turning that lever off */
+    struct FlOff {
+        unsigned saved = g_jit_off_extra;
+        FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
+        ~FlOff() { g_jit_off_extra = saved; }
+    } fl_off;
 #if ML_JIT_SUPPORTED
     auto run = [](bool jit) -> long {
         const std::vector<const char *> lines = {
@@ -19501,6 +19509,14 @@ static bool norec_segment_boundary()
  */
 static bool jit_norec_recon_sweep()
 {
+    /* #97 G1: this test's call chain (functions calling functions) is
+     * FRAMELESS now; the tier it tests still serves every call that is
+     * not frameless-eligible, so pin it by turning that lever off */
+    struct FlOff {
+        unsigned saved = g_jit_off_extra;
+        FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
+        ~FlOff() { g_jit_off_extra = saved; }
+    } fl_off;
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -19777,6 +19793,163 @@ static bool jit_frameless_gate()
     want("a body whose only calls are MyLang calls (E2)", probe({
         "func rec(int n) { if (n <= 0) return 0; return rec(n - 1) + 1; }",
         "print(rec(runtime(20)));" }), true);
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 G1: A CALLING FUNCTION CALLED FRAMELESSLY FROM ANOTHER - mutual
+ * recursion. The callee is placed at RUN time (Chunk::frameless_entry_abs,
+ * a null cell declines), and its site keeps a self site's bounds, so the
+ * same four things E2's test checks must hold here, against the VM with
+ * the JIT off (stdout and the rendered backtrace): values deep and warmed;
+ * the BOUNDARY decline at the bound (the cap is 16 off the native stack,
+ * the floor 24KB below the top on it); a throw at the bottom of a chain,
+ * caught three times, then uncaught; a reference argument threaded
+ * through every level. Plus the refusal: a partner that is not frameless-
+ * eligible (it calls a builtin) refuses the OTHER's pre-pass too, whose
+ * entry cell stays null - so the one G1 site emitted (into it) declines
+ * on every call.
+ * Watched failing: with the cell test removed, a refused partner is
+ * entered through a null cell (SIGSEGV); with the bounds not applied to a
+ * G1 site, the chains never meet the bound (0 boundary calls).
+ */
+static bool jit_frameless_mutual()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled || !jit_norec_on())
+        return true;
+    struct Restore {
+        bool pc; int cap;
+        ~Restore() {
+            g_pure_cache_enabled = pc;
+            jit_set_sync_depth_cap(cap);
+            jit_test_nstack_floor(0);
+        }
+    } restore{ g_pure_cache_enabled, jit_sync_depth_cap() };
+    g_pure_cache_enabled = false;
+    jit_set_sync_depth_cap(16);       /* baked at emission: set it first */
+    jit_test_nstack_floor(24 * 1024);
+    const auto run = [&](const std::vector<const char *> &lines,
+                         bool jit) -> std::string {
+        const bool jit_was = g_jit_enabled;
+        g_jit_enabled = jit;
+        std::string src;
+        for (const char *l : lines) { src += l; src += "\n"; }
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        std::string tail;
+        unique_ptr<Construct> root;      /* outside: see jit_frameless_calling */
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (const Exception &e) {
+            tail = std::string("EXC ") + e.name + "\n" + format_backtrace(e);
+        }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        g_jit_enabled = jit_was;
+        return cap.str() + tail;
+    };
+    bool ok = true;
+    const auto same = [&](const char *what,
+                          const std::vector<const char *> &lines,
+                          const char *must, bool expect_tier = true) {
+        const unsigned long m0 = g_jit_frameless_mutual;
+        const unsigned long p0 = g_jit_frameless_pushes;
+        const unsigned long b0 = g_jit_frameless_boundary;
+        const std::string ref = run(lines, false);
+        const std::string vm = run(lines, true);
+        const unsigned long dm = g_jit_frameless_mutual - m0;
+        const unsigned long dp = g_jit_frameless_pushes - p0;
+        const unsigned long db = g_jit_frameless_boundary - b0;
+        if (ref != vm || ref.find(must) == std::string::npos) {
+            fprintf(stderr, "jit_frameless_mutual: %s differs\n  nj: %s\n"
+                    "  vm: %s\n", what, ref.c_str(), vm.c_str());
+            ok = false;
+        }
+        if (!expect_tier) {
+            /* od's site to ev IS a G1 site (ev is eligible on its own),
+             * but ev's pre-pass refuses it - its one site calls a partner
+             * that is not eligible - so ev's entry cell stays NULL and
+             * the site declines on every call: the run-time placement's
+             * decline path, taken */
+            if (!dm || dp) {
+                fprintf(stderr, "jit_frameless_mutual: %s - %lu G1 sites "
+                        "emitted, %lu frameless calls (want >0 and 0: the "
+                        "null cell must decline)\n", what, dm, dp);
+                ok = false;
+            }
+            return;
+        }
+        if (!dm || dp < 30 || !db) {
+            fprintf(stderr, "jit_frameless_mutual: %s VACUOUS - %lu G1 "
+                    "sites, %lu frameless calls, %lu boundary calls\n",
+                    what, dm, dp, db);
+            ok = false;
+        }
+    };
+    same("values, deep and warmed", {
+        "func ev(int n, int acc) {",
+        "  if (n <= 0) return acc;",
+        "  return od(n - 1, (acc * 3 + n) % 1000003);",
+        "}",
+        "func od(int n, int acc) {",
+        "  if (n <= 0) return acc + 1;",
+        "  return ev(n - 1, (acc + n * 7) % 1000003);",
+        "}",
+        "var s = 0;",
+        "for (var k = 0; k < 3; k++)",
+        "  s = (s + ev(int(runtime(300 + k)), k)) % 1000000007;",
+        "print(s);" }, "\n");
+    same("a throw at the bottom: caught three times, then uncaught", {
+        "struct Boom { int at; }",
+        "func ev(int n, int acc) {",
+        "  if (n == 0) throw Boom(acc % 97);",
+        "  return od(n - 1, acc + n);",
+        "}",
+        "func od(int n, int acc) {",
+        "  if (n == 0) throw Boom(acc % 89);",
+        "  return ev(n - 1, acc * 2 % 1000003);",
+        "}",
+        "for (var k = 0; k < 3; k++) {",
+        "  try { print(ev(int(runtime(150 + k)), k)); }",
+        "  catch (Boom as b) { print(\"boom\", b.at); }",
+        "}",
+        "print(ev(int(runtime(120)), 1));" }, "EXC");
+    same("a reference argument threaded through every level", {
+        "func ev(int n, array<int> a) {",
+        "  if (n <= 0) return a[0];",
+        "  return od(n - 1, a) + 1;",
+        "}",
+        "func od(int n, array<int> a) {",
+        "  if (n <= 0) return a[1];",
+        "  return ev(n - 1, a) + 2;",
+        "}",
+        "var arr = [5, 6];",
+        "var s = 0;",
+        "var rc1 = 0;",
+        "var rc2 = 0;",
+        "for (var k = 0; k < 9; k++) {",
+        "  s = s + ev(int(runtime(200)), arr);",
+        "  if (k == 2) rc1 = refcount(arr);",
+        "  if (k == 8) rc2 = refcount(arr);",
+        "}",
+        "print(s, rc1 == rc2);" }, "true");
+    same("a partner that is not frameless-eligible: the null cell declines", {
+        "func ev(int n) { if (n <= 0) return 0; return od(n - 1) + 1; }",
+        "func od(int n) { if (n <= 0) return abs(n); return ev(n - 1) + 2; }",
+        "print(ev(int(runtime(100))));" }, "\n", /*expect_tier=*/false);
     return ok;
 #else
     return true;
@@ -20917,6 +21090,14 @@ static bool jit_bind_widen_inline()
  * the inserted post-call EnterNative. Result asserted too. */
 static bool jit_post_call_entry()
 {
+    /* #97 G1: this test's call chain (functions calling functions) is
+     * FRAMELESS now; the tier it tests still serves every call that is
+     * not frameless-eligible, so pin it by turning that lever off */
+    struct FlOff {
+        unsigned saved = g_jit_off_extra;
+        FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
+        ~FlOff() { g_jit_off_extra = saved; }
+    } fl_off;
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -28890,6 +29071,14 @@ static bool jit_intervals_check()
  */
 static bool jit_call_pins_survive_switch()
 {
+    /* #97 G1: this test's call chain (functions calling functions) is
+     * FRAMELESS now; the tier it tests still serves every call that is
+     * not frameless-eligible, so pin it by turning that lever off */
+    struct FlOff {
+        unsigned saved = g_jit_off_extra;
+        FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
+        ~FlOff() { g_jit_off_extra = saved; }
+    } fl_off;
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -38474,6 +38663,14 @@ static bool jit_native_throw()
 
 static bool jit_call_switch_protocol()
 {
+    /* #97 G1: this test's call chain (functions calling functions) is
+     * FRAMELESS now; the tier it tests still serves every call that is
+     * not frameless-eligible, so pin it by turning that lever off */
+    struct FlOff {
+        unsigned saved = g_jit_off_extra;
+        FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
+        ~FlOff() { g_jit_off_extra = saved; }
+    } fl_off;
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -44300,6 +44497,9 @@ static const std::vector<extra_check> extra_checks =
       "a threaded reference", jit_frameless_calling },
     { "jit: #97 F1 - a function calls a leaf framelessly: values, a throw "
       "caught and uncaught, a reference argument", jit_frameless_nonmain },
+    { "jit: #97 G1 - mutual recursion framelessly: values, the boundary "
+      "decline, a throw caught and uncaught, a threaded reference, the "
+      "refusal", jit_frameless_mutual },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
       jit_bind_widen_inline },
     { "jit: a reference argument binds IN PLACE, and the declines (#162)",
