@@ -13829,11 +13829,57 @@ self-test 128/128, `regcensus --gate` at its floor.
     (2016/2016, `--spcheck` 35/35) and the `ASSERTS=0` `--spcheck` lane
     reports 31/35.
 
-### THE ONE THING IT FOUND AND DID NOT FIX
+### SP3 FOLLOW-UP - THE DEAD-MODEL POPULATION GOES TO ZERO, AND ONE OF
+### THE TWO CAUSES WAS NOT DEAD CODE AT ALL
 
-`MoveV` emits its helper arm even when neither slot is ref-listed, so
-`jhelp` is empty, nothing is patched to it, and the arm is
-**UNREACHABLE** - roughly 35 emitted bytes per move. The model noticed
-because a call emitted there has no branch state to align against. It
-is a code-SIZE finding with no correctness component; `g_jit_call_dead_
-model` counts them.
+`call_site` has to pick a stack depth for code no branch has reached
+yet, so it assumes the body contract and counts the case in
+`g_jit_call_dead_model`. The corpus read **18**. Both causes are now
+closed, and they were different kinds of thing - which is the whole
+argument for having counted them rather than reasoned about them.
+
+**(1) `MoveV`'s helper arm was UNREACHABLE (15 of the 18).** Both of
+its guards are `ref_slots` questions; when both answer no the
+chunk-wide invariant says neither slot can hold a reference, the
+24-byte payload plus `Type*` copy IS the whole move, and nothing is
+patched to the helper. #113 gave the capture read exactly this rule
+("NOTHING JUMPS TO THE HELPER when every guard was elided") and `MoveV`
+never got it.
+
+**It is not only I-cache.** The elision also drops the `jmp` that hopped
+over the arm, which is **one EXECUTED instruction per move** - the same
+sentence #113's comment already contains. And because the dead arm
+carried an `emit_call_prologue`, removing it un-bumps `n_prologues`
+and stops asking `rax_pin_conflict` on a path that cannot run: a run
+whose only calls were these arms now reads as CALL-FREE, so it drops
+its entry filler too (SP3) and keeps pins it used to lose to a
+spurious rax conflict.
+
+Measured (Ir, scale-3 minus scale-1, `OPT=1 ASSERTS=0`, `-npc`):
+**45_gcd -2.93%** - from FIVE fewer emitted instructions, because one
+of them is the `jmp` and gcd does a move per iteration -
+**10_recursion_deep -1.25%**, 63_closures -0.12%; 12_higher_order,
+46_matrix_mult, 60_bit_sieve, 09_fib_recursive and 01_while_loop flat.
+Corpus-wide emitted code 186,238 -> 185,964 instructions over 23
+programs.
+
+**(2) `emit_reg_shift`'s three branches were HAND-ENCODED (the other
+3), and that code is perfectly reachable - the MODEL was blind.** It
+spelled its jumps `0F 88`, `0F 8C`, `E9` with a bare `patch32` instead
+of `j32`/`jmp32`/`patch32_here`. Byte-identical, and invisible to the
+seams: the unconditional `jmp` ended the model's path and the raw
+patches never revived it, so the negative-shift raise arm's own call
+read as emitted-on-a-dead-model. Routed through the seams (RAWENC
+12 -> 10). **A seam only covers what goes through it** - the same
+lesson as every other "the operand is in the method name" blind spot
+in this file, and the reason the counter exists rather than a
+comment.
+
+**THE RATCHET.** `g_jit_call_dead_model` is **0** corpus-wide and
+across `-rt`, and `jit: SP - the CALL SEAM is total` now asserts it
+stays there over a program carrying both shapes: the untyped Euclid
+swap (`var tt = q; ... p = tt;` in a TEMPLATE instance - annotate the
+parameters and the source becomes PINNED, the move takes an early
+return and the case goes VACUOUS, watched) and a runtime-count shift.
+Watched failing: restoring `MoveV`'s arm, and hand-encoding the shift's
+branches again - one sabotage build each, both named by count.

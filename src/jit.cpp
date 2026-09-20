@@ -17365,33 +17365,42 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint8_t val,
     /* D3 /4 shl, /7 sar (signed shr), /5 shr (ushr); C1 imm forms same /r */
     const uint8_t modrm = aop == Op::shl ? 0xE0
                         : aop == Op::shr ? 0xF8 : 0xE8;
+    /*
+     * ⛔ THE THREE BRANCHES GO THROUGH j32/jmp32/patch32_here, NOT RAW
+     * BYTES (SP3 follow-up). They were hand-encoded - `0F 88`, `0F 8C`,
+     * `E9` with a bare `patch32` - which is BYTE-IDENTICAL to the seams
+     * and was invisible to them: the unconditional `jmp` ended the rsp
+     * model's path and the raw patches never revived it, so the raise
+     * arm's own call read as emitted-on-a-dead-model. That arm is
+     * perfectly reachable; the MODEL was blind, which is the one thing
+     * a model must not be silently. Same lesson as every other "the
+     * operand is in the method name" blind spot in this file: a seam
+     * only covers what goes through it.
+     */
     /* test rcx,rcx; js Lraise (negative count throws) */
     e.test_rr(RCX, RCX);  /* reg:isa */
-    e.u8(0x0F); e.u8(0x88);
-    const size_t js = e.pos(); e.u32(0);
+    const size_t js = e.j32(0x78);
     /* cmp rcx,64; jl Lnorm */
     e.cmp_reg_imm(RCX, 64);  /* reg:isa */
-    e.u8(0x0F); e.u8(0x8C);
-    const size_t jl = e.pos(); e.u32(0);
+    const size_t jl = e.j32(0x7C);
     if (aop == Op::shr) {
         e.sar_rr_imm8(val, 63);
     } else {
         e.zero_reg32(val);
     }
-    e.u8(0xE9);
-    const size_t jdone = e.pos(); e.u32(0);
-    e.patch32(js, static_cast<uint32_t>(e.pos() - (js + 4)));
+    const size_t jdone = e.jmp32();
+    e.patch32_here(js);
     emit_raise_convey(e, ck, JR_NEG_SHIFT, pc, old_pc);  /* negative count:
                                                           * CONVEY InvalidValue
                                                           * with the op's own
                                                           * caret (deletable) */
-    e.patch32(jl, static_cast<uint32_t>(e.pos() - (jl + 4)));
+    e.patch32_here(jl);
     /* shl/sar/shr val,cl */
     e.wrote(val);
     e.u8(val >= 8 ? 0x49 : 0x48);
     e.u8(0xD3);
     e.u8(static_cast<uint8_t>(modrm | (val & 7)));
-    e.patch32(jdone, static_cast<uint32_t>(e.pos() - (jdone + 4)));
+    e.patch32_here(jdone);
 }
 
 /* Approach A: a flat-array element STORE `a[i] = v` / `a[i] OP= v` as a CALL
@@ -21127,6 +21136,29 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.load(cpy, src.payload + 16); e.store(cpy, dst.payload + 16);
         drop();
         e.store(acc.r, dst.type);
+        /*
+         * ⛔ NOTHING JUMPS TO THE HELPER when NEITHER slot is
+         * ref-listed, so neither the join jump nor the helper body is
+         * emitted - the same rule #113 gave the capture read, which
+         * this op never got. Both guards above are `ref_slots`
+         * questions; when both answer no, the chunk-wide invariant
+         * says neither slot can hold a reference, the 24-byte payload
+         * plus Type* copy IS the whole move, and the arm behind the
+         * `jmp` was a page of UNREACHABLE bytes in every fragment's
+         * I-cache footprint - about 40 of them per staging move, which
+         * is the commonest MoveV there is.
+         *
+         * Found by the SP2 rsp model, which had to ask what stack
+         * depth to align that call at and discovered no branch reaches
+         * it (Emitter::call_site's dead-model arm; g_jit_call_dead_
+         * model counts what is left). It also un-bumps `n_prologues`
+         * and stops asking rax_pin_conflict on a path that cannot run,
+         * so a run whose only calls were these dead arms now reads as
+         * CALL-FREE - it keeps no entry filler and its pins stop
+         * conflicting over rax.
+         */
+        if (jhelp.empty())
+            return true;
         const size_t j_done = e.j32(0xEB);
         for (const size_t s : jhelp)
             e.patch32_here(s);
