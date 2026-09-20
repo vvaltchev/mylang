@@ -91,3 +91,5 @@
 86_elem_arith_compound   61
 87_elem_shift_compound   103
 88_elem_float_compound   17
+91_call_from_function    6
+92_recursion_with_helper 5
