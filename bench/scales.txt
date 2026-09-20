@@ -93,3 +93,4 @@
 88_elem_float_compound   17
 91_call_from_function    6
 92_recursion_with_helper 5
+93_mutual_recursion      8
