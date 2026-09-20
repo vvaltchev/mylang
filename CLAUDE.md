@@ -127,8 +127,19 @@ them means anything:**
   a full budget.)
 - **`MYLANG_JITSTATS`** - which TIER a program's calls actually took.
   Oracle: the counters are bumped from EMITTED code only.
+- **`MYLANG_JIT_SPCHECK=1`** (TESTS) - is every emitted CALL reached
+  with `rsp % 16 == 0`, as System V requires? It emits `test rsp, 15`
+  before each one and reports through `jit_sp_misaligned` with the REAL
+  rsp. Oracle: it needs NO MODEL - which is the whole point, since the
+  emitter's own `sp_depth`/`sp_mod` model is complete only while every
+  rsp-moving emission goes through a `sp_move` seam, and a MISSING seam
+  would silence the very check it feeds. `corpus_diff.sh --spcheck` is
+  its lane, and it belongs on an **`OPT=1 ASSERTS=0`** build as much as
+  a debug one: the first bug it caught was invisible to every checked
+  build (see *THE 16-ALIGNMENT RULE* below).
 - **`tests/corpus_diff.sh`** - do the engines agree. Oracle: the
-  `--levers` / `--cold` / `--xrot` / `--nolowmem` matrices.
+  `--levers` / `--cold` / `--xrot` / `--nolowmem` / `--spcheck`
+  matrices.
   **⛔ IT COMPARED ONLY `tail -3` UNTIL 2026-08-26** - the last THREE
   LINES of each program - so a divergence anywhere earlier was
   INVISIBLE, and the tool answered "28/28 agree" for a binary that
@@ -1007,6 +1018,52 @@ could pin); and a gate that enumerates "is this slot register-resident"
 must include the scan's TRANSITIONS, not only the entry occupants
 (argfuse's `pinned()` did not, and fused a loop counter that lived in
 r13). Record: `docs/jit-optimizations.md`, *#97 increment 1b*.
+
+**⛔ THE 16-ALIGNMENT RULE IS "AT THE CALL", NOT "EVERYWHERE" - AND
+THERE IS ONE CALL SEAM AND ONE rsp MODEL (SP1-SP3, 2026-09-22).**
+System V requires `rsp % 16 == 0` AT the `call` instruction. This file
+used to hold the far stronger *the body of every fragment is aligned at
+ALL times*, propped up by `frag_entry`'s parity filler, a comment rule
+that the hand-spill sites "push in PAIRS", and a third clause that had
+been STALE for months - and checked by NOTHING. Four rules replace it,
+and a new emitter must obey all four:
+
+ - **EVERY emitted call goes through `Emitter::call_direct` or
+   `call_reg`. There is no third spelling** - `u8(0xE8)` as a call
+   opcode appears in exactly two places in jit.cpp. 97 sites used to
+   open-code the reloc+E8 pair, so each carried the alignment
+   obligation privately and "does this run emit a call?" had to be
+   reconstructed from `call_relocs.size()`. The seam ALIGNS the call
+   if the model says it must, so a site that spills an ODD number of
+   registers no longer pads.
+ - **EVERY emission that moves rsp goes through a seam that calls
+   `Emitter::sp_move`** - push/pop, `push_base0`/`push_base`/
+   `push_abs32`, `op_reg_imm` on RSP, `push_rbp`/`pop_rbp`,
+   `frag_entry`'s pad and spill reserve, `frag_ret`'s `lea`, the
+   native-stack switch. A missed one is not a wrong diagnostic, it is
+   a SILENCED check: the model would say call-ready when it is not.
+   `MYLANG_JIT_SPCHECK` (above) is the layer that catches that, and it
+   is the reason that lever exists.
+ - **⛔ A VALUE THAT DRIVES EMISSION IS NOT DIAGNOSTICS, WHATEVER IT
+   LOOKS LIKE.** `sp_at_jump` only ever feeds an `ML_CHECK`, so it was
+   written `#ifndef NDEBUG` - but it is ALSO how a label revives the
+   model after a terminator. Compiled out, `sp_live` went false at a
+   fragment's first `ret` and never came back, so every later call
+   skipped BOTH the alignment and the check: bench/my/78 GP-faulted
+   inside `jit_ret_norec` in an `OPT=1 ASSERTS=0` build while `-rt`
+   2016/2016, every corpus matrix and even `--spcheck` on the DEBUG
+   build were green. Same family as `trk_push`'s own ⛔.
+ - **A CALL WHOSE CALLEE READS THE CALLER'S FRAME AT A FIXED OFFSET
+   FROM THE RETURN ADDRESS uses `call_fixed_frame`.** The push
+   protocol's captures (`[rbp+16]`), the pushed dst word (`[rbp+24]`)
+   and the frameless WINDOW (`[rbp+32]`) are all counted through the
+   residue the SITE pushed, so an alignment `sub rsp, 8` slipped in
+   between the last push and the call MOVES the window. Found by
+   sabotage, where it surfaced as a `jit_ret_audit` abort four layers
+   from the cause.
+
+Record, with the measurements and the seven watched sabotages:
+`docs/jit-optimizations.md`, *SP1/SP2/SP3*.
 
 **⛔ AND IT BROKE AGAIN, ONE DAY AFTER THE ABS32 MEMORY OPERAND LANDED,
 WITH THREE NETS PRESENT AND ALL THREE BLIND (2026-08-26 -> found

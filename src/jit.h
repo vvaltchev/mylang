@@ -1458,6 +1458,9 @@ extern "C" unsigned long g_jit_capbase;       /* #112: fragment entries with
  * call_reg; this counts them, and `spcheck_sites` the MYLANG_JIT_SPCHECK
  * runtime alignment checks emitted beside them. */
 extern "C" unsigned long g_jit_call_sites;
+extern "C" unsigned long g_jit_entry_pad_off;   /* SP3 reach */
+extern "C" unsigned long g_jit_call_align;      /* SP3: self-aligned */
+extern "C" unsigned long g_jit_call_dead_model; /* SP3: unreachable */
 extern "C" unsigned long g_jit_spcheck_sites;
 #if defined(TESTS) && ML_JIT_SUPPORTED
 extern "C" bool g_jit_spcheck;      /* MYLANG_JIT_SPCHECK=1 */

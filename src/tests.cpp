@@ -29478,16 +29478,17 @@ static bool jit_frameless_w2_shape()
                     "push rbp",
                     "mov rbp, rsp",
                     "push rbx",
-                    /* ⛔ W6: THE PARITY FILLER, WHERE W4's `push r13`
-                     * WAS. The base is CALLER-saved in a call-free body,
-                     * so it joins no save list - and the entry then has
-                     * an EVEN number of pushes, which `entry_pad` pays
-                     * for with 8 bytes so the cold raise exits (which
-                     * call before restoring rsp) stay 16-aligned. The
-                     * push/pop PAIR therefore becomes one filler plus
-                     * one fewer pop: the win is the POP, not both, and
-                     * this line is where that is stated. */
-                    "sub rsp, 8",
+                    /* ⛔ NO PARITY FILLER, AND THAT LINE IS THE POINT
+                     * (SP3). W4's `push r13` became W6's CALLER-saved
+                     * base, which joins no save list - and the entry
+                     * was then left with an EVEN number of pushes, so
+                     * `entry_pad` bought 8 bytes back as `sub rsp, 8`
+                     * and the push/pop pair's win collapsed to the pop
+                     * alone. The filler existed for CALLS, and this
+                     * body makes none on its mainline: the cold arms
+                     * that do call align themselves at the seam. So
+                     * this per-CALL prologue is three instructions,
+                     * and W6's second one is recovered here. */
                     "lea rbx, [rbp+0x20]",       /* the caller's window */
                     "mov r8, [<addr>]@r11",      /* act */
                     "mov [r8+0x*], rbx",         /* vframe.slots */
@@ -30184,6 +30185,129 @@ static bool jit_frameless_e3_shape()
 }
 
 /*
+ * ==========  THE ENTRY FILLER IS FOR THE CALLS  ==========
+ *
+ * SP3. `entry_pad` pads a fragment's prologue to CALL-READY when its
+ * push count is even. A body that makes no call has nothing to be ready
+ * for - and for a function body, and above all for a FRAMELESS callee,
+ * the prologue runs PER CALL, so that filler is an instruction on the
+ * hot path. W6 measured exactly this: taking the capture base out of
+ * the save list flipped the parity and `entry_pad` bought the win back
+ * as `sub rsp, 8`.
+ *
+ * ONE program, BOTH directions, which is the point - an equivalence
+ * test is satisfied by a change that never fires:
+ *
+ *   closure#0   a leaf whose body is `return b + x;`  -> NO filler
+ *   func grow   a leaf whose body calls append()      -> filler KEPT
+ *
+ * Both have exactly one saved register (rbx), so `entry_pad` says the
+ * same thing about both and ONLY the call makes the difference. Each is
+ * checked at EVERY prologue in its section - the ordinary entry and the
+ * frameless one, which must agree because they jump into one body.
+ */
+static bool jit_entry_pad_is_for_calls()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const std::vector<const char *> lines = {
+        "func mk(int n) { var b = n * 10;",
+        "              return func [b] (int x) { return b + x; }; }",
+        "func grow(array a, int k) { append(a, k); return len(a); }",
+        "var add = mk(7);",
+        "var arr = []; var s = 0; var g = 0;",
+        "for (var i = 0; i < runtime(5); i++) {",
+        "  s = s + add(i); g = g + grow(arr, i); }",
+        "print(s, g);"
+    };
+    const unsigned long p0 = g_jit_entry_pad_off;
+    const unsigned long a0 = g_jit_call_align;
+    std::string d;
+    try {
+        d = native_dump_of(lines);
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_entry_pad_is_for_calls: threw %s: %s\n",
+                e.name, e.msg);
+        return false;
+    }
+    if (g_jit_entry_pad_off == p0) {
+        fprintf(stderr, "jit_entry_pad_is_for_calls: VACUOUS - no run "
+                        "in this program dropped its entry filler\n");
+        return false;
+    }
+    bool ok = true;
+    /* `want_pad` == does this section's every prologue carry the
+     * filler? Checked at EVERY `push rbx` that follows a `push rbp`. */
+    const auto check = [&](const char *section, bool want_pad) {
+        const std::vector<NativeIns> in = native_ins_of(d, section);
+        size_t seen = 0;
+        for (size_t i = 0; i + 1 < in.size(); i++) {
+            if (in[i].text != "mov rbp, rsp" || in[i + 1].text != "push rbx")
+                continue;
+            seen++;
+            const bool pad = i + 2 < in.size()
+                             && in[i + 2].text == "sub rsp, 8";
+            if (pad != want_pad) {
+                fprintf(stderr, "jit_entry_pad_is_for_calls: %s's "
+                                "prologue at +%u %s the 16-alignment "
+                                "filler (want: %s)\n",
+                        section, in[i].off,
+                        pad ? "HAS" : "does NOT have",
+                        want_pad ? "has" : "has not");
+                ok = false;
+            }
+        }
+        if (seen < 2) {
+            fprintf(stderr, "jit_entry_pad_is_for_calls: only %zu "
+                            "prologue(s) found in %s - the ordinary "
+                            "entry AND the frameless one are wanted\n",
+                    seen, section);
+            ok = false;
+        }
+    };
+    /* the call-FREE leaf: no filler, at either entry */
+    check("closure#0", false);
+    /* the leaf that CALLS (append, then len): the filler stays */
+    check("func grow", true);
+    /*
+     * ...AND THE OTHER HALF OF THE TRADE, IN THE SAME DUMP. Dropping
+     * the filler leaves the body at an odd depth, so the COLD arms
+     * that do call - the ref-listed return slot's release, the
+     * return's slow tier, an exit epilogue - must align themselves at
+     * the seam. Without this the test would pass for an emitter that
+     * dropped the filler and emitted a misaligned call, which is the
+     * bug the whole change is about.
+     */
+    if (g_jit_call_align == a0) {
+        fprintf(stderr, "jit_entry_pad_is_for_calls: no call aligned "
+                        "itself - a run that dropped its filler has "
+                        "cold arms that call, and they must\n");
+        ok = false;
+    }
+    {
+        const std::vector<NativeIns> cl = native_ins_of(d, "closure#0");
+        size_t triples = 0;
+        for (size_t i = 2; i < cl.size(); i++)
+            if (cl[i - 2].text == "sub rsp, 8"
+                    && cl[i - 1].text.compare(0, 5, "call ") == 0
+                    && cl[i].text == "add rsp, 8")
+                triples++;
+        if (!triples) {
+            fprintf(stderr, "jit_entry_pad_is_for_calls: closure#0 has "
+                            "no `sub rsp,8 / call / add rsp,8` triple - "
+                            "the seam is not paying the parity its own "
+                            "prologue stopped paying\n");
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * ==========  THE CALL SEAM IS TOTAL, AND THE STACK IS ALIGNED  ==========
  *
  * System V requires rsp % 16 == 0 AT the call. The emitter used to
@@ -30228,7 +30352,7 @@ static bool jit_call_seam_is_total()
         "var t = 0.0; var acc = 0;",
         "for (var i = 0; i < runtime(6); i++) {",
         "  append(a, i * 3); d[i] = i + 1; s = s + str(i);",
-        "  t = t + sqrt(float(i) + 1.0); acc = acc + add(i);",
+        "  t = t + sin(float(i)) + sqrt(float(i) + 1.0); acc = acc + add(i);",
         "}",
         "print(len(a), len(d), len(s), t > 0.0, acc);"
     };
@@ -43249,6 +43373,10 @@ static const std::vector<extra_check> extra_checks =
     { "jit: SP - the CALL SEAM is total: every emitted call carries the "
       "MYLANG_JIT_SPCHECK alignment check, read from the dump",
       jit_call_seam_is_total },
+    { "jit: SP3 - the entry's 16-alignment FILLER is for the calls: a "
+      "call-free leaf's prologue drops it, a calling leaf's keeps it "
+      "(one program, both directions, every prologue)",
+      jit_entry_pad_is_for_calls },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },
