@@ -841,6 +841,9 @@ public:
      * Reading the real member means a layout change cannot move it out
      * from under the emitter. Probe-only, never hot. */
     const bool &jit_const_probe() const { return is_const; }
+    /* #97 inc 3 W5: the borrowed flag's byte, for the frameless site's
+     * inline borrow (it writes 1 there) and the arm's skip (it tests it) */
+    const bool &jit_borrowed_probe() const { return borrowed; }
     const EvalValue &get() const { return val; }
     EvalValue get_rval() const { return val; }
     Type *valtype() const { return val.get_type(); }

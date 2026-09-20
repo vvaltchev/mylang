@@ -1854,6 +1854,12 @@ void myv_write(const VmProgram &prog, const std::string &path,
         w.boolv(d->cache_results); w.boolv(d->pure_ctx);
         w.boolv(d->is_template_base);
         w.boolv(d->fast_bind);
+        /* v17: the parameter ESCAPE bits (#93) - a resolver-time analysis
+         * over the AST, so a loaded image cannot recompute them; without
+         * them an image never BORROWED a reference argument (#94), and
+         * since W5 the frameless site's emitted code depends on them, so
+         * a fresh compile and its image would disassemble differently */
+        w.i64v(static_cast<int64_t>(d->noescape_params));
         /* has a chunk? (a dead template base has none) */
         w.boolv(d->vm_chunk != nullptr);
     }
@@ -2099,6 +2105,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         d.cache_results = r.boolv(); d.pure_ctx = r.boolv();
         d.is_template_base = r.boolv();
         d.fast_bind = r.boolv();
+        d.noescape_params = static_cast<uint64_t>(r.i64v());    /* v17 */
         has_chunk[i] = r.boolv();
         d.decl = nullptr;                      /* compile-only back-pointer */
         /*

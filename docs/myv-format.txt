@@ -2,12 +2,13 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 16.  This document describes the on-disk image exhaustively:
+Format version 17.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
 
-(v16 adds one per-chunk record, `arg_locs` - section 9.21 - written right
-after `base_locs`; v15 added `value_callees`, section 9.20.  Neither
-changed an existing encoding.)
+(v17 adds one descriptor field, `noescape_params` - section 8 - written
+right after `fast_bind`; v16 added one per-chunk record, `arg_locs` -
+section 9.21 - written right after `base_locs`; v15 added
+`value_callees`, section 9.20.  None changed an existing encoding.)
 
 (v14 changed no encoding: it widened the VALUE DOMAIN of an instruction's
 `aop` byte - the compound shift/bitwise assignment operators `<<=` `>>=`
@@ -375,6 +376,23 @@ whole call model reads it, never an AST node.
         bool  pure_ctx
         bool  is_template_base
         bool  fast_bind             see the note below
+        i64   noescape_params       v17 - bit i set: parameter i is
+                                    NON-ESCAPING (#93, the resolver's
+                                    parameter escape analysis): the
+                                    reference bound to it cannot be
+                                    reachable after the call returns, so
+                                    the bind BORROWS it (#94) - no retain,
+                                    no release. Stored because the
+                                    analysis runs on the AST, which an
+                                    image does not have; before v17 an
+                                    image never borrowed, and since the
+                                    frameless site binds a borrow INLINE
+                                    (#97 W5) the emitted code depends on
+                                    it, so a fresh compile and its image
+                                    must agree. A hostile value costs
+                                    nothing worse than the analysis being
+                                    wrong would (see #93's rules). Written
+                                    as the i64 of the 64-bit mask.
         bool  has_chunk             false for a dead template base
 
     NOTE on fast_bind: the reader RECOMPUTES it from the params it just

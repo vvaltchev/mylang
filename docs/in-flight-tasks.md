@@ -67,9 +67,11 @@ kept in `myv-fuzz-bad/` (git-ignored) - see the loader item in §3.
     75_indexed_unpack             0.208      0.024    8.79x
     76_funcval_dispatch           0.170      0.018    9.72x
 
-RESUMED 2026-09-21 with W4 (done). Next per §1.6: the parameter
-tails' zeroing, `visit_use_def` learning the element-store family (it
-is what keeps W3 off 76), a caller-saved capture base for a body with
+RESUMED 2026-09-21 with W4 (done) and W5 (done: the inline borrow at
+the site, the arm's borrowed skip, the scalar parameter tails - 76
+-13.5% Ir, 78 -2.5%). Next per §1.6: `visit_use_def` learning the
+element-store family (#25 - it is what keeps W3, the tails and the
+one-slot arm scan off 76), a caller-saved capture base for a body with
 no helper call (the 2 W4 does not recover), then E2 for 09.
 
 ### 1.1 What is DONE
@@ -499,7 +501,12 @@ work — but profile it before building, the way increment 0 was.
         uninitialised, poisoned in TESTS builds - 78's add(i) 73 -> 66
         per call), W4 the capture base (done 2026-09-21: the entry
         loads it from fo, ctx.captures untouched, poisoned in TESTS
-        builds - 78 -7.1% Ir, 11 -8.9%, 76 -2.0%).
+        builds - 78 -7.1% Ir, 11 -8.9%, 76 -2.0%), W5 the inline
+        borrow at the site + the arm's borrowed skip + the scalar
+        parameter tails (done 2026-09-21: the noescape bit is baked, a
+        non-slice reference is a raw copy with the flag set, the
+        helper kept for a slice; myv v17 stores the bit - 76 -13.5%
+        Ir, 78 -2.5%).
     3.  E2 - drop the leaf rule. Serves 09_fib. GATE includes
         norec_enum --depth 4 (2272 programs x 4 engines), because a
         throw crossing a frameless frame is exactly its shape space.

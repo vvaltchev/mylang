@@ -655,6 +655,9 @@ const void *jit_poison_captures();
 #endif
 extern unsigned long g_jit_frameless_capbase;   /* W4 (emit-time): sites
                                                  * that skip the repoint */
+extern unsigned long g_jit_borrow_inline;       /* W5 (emitted code): a
+                                                 * borrow bound INLINE at
+                                                 * a frameless site */
 
 /*
  * Call a compiled fragment (frameless: slots base in, resume pc out).

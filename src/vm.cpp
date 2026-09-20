@@ -3470,6 +3470,9 @@ unsigned long g_jit_frameless_init_free = 0; /* #97 inc 3 W3: window slots
 unsigned long g_jit_frameless_capbase = 0;   /* #97 inc 3 W4: sites that
                                               * skip the captures repoint
                                               * (emit-time) */
+unsigned long g_jit_borrow_inline = 0;       /* #97 inc 3 W5: borrows the
+                                              * frameless site bound inline
+                                              * (emitted code) */
 unsigned long g_jit_arg_scalar = 0;
 
 #ifdef TESTS

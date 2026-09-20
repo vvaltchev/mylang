@@ -1165,7 +1165,13 @@ collision). Three nets now:
   ref-listed and written ONLY by ops in `jit_instr_stores_dst_raw` -
   a per-INSTRUCTION whitelist an op joins only when EVERY tier of its
   emission stores the dst raw; a TESTS build poisons such a slot with
-  `jit_poison_type`, so a wrong row aborts by name), capprot (W4: a
+  `jit_poison_type`, so a wrong row aborts by name; W5: a frameless
+  site BORROWS a non-escaping reference INLINE - the callee is baked,
+  so `noescape_params` is an emit-time bit - as a raw copy with the
+  `borrowed` byte set, declining ONLY an array whose slice byte is set
+  to the helper (#94's slice rule); the arm tests that byte before
+  calling the release helper; a proven-scalar parameter's tail stores
+  are gone. The bit rides in the image since myv v17), capprot (W4: a
   W4 callee's frameless site leaves `ctx.captures` ALONE - the entry
   takes the capture base from the FuncObject in rdx - which is sound
   only while NO op in the body can reach `ctx->captures`: the
@@ -2782,14 +2788,19 @@ REACH is `MYLANG_JITSTATS`' `arg_borrow` (the retain actually skipped) and
 counters so "the tier ran" and "the tier was reachable and every value
 declined" cannot be confused.
 
-**The emitted INLINE borrow arm was BUILT AND REVERTED** — −3.27% Ir on
-bench 76 (999,999 of its calls served by generated code) for **1.00x wall
-clock**, while two benches that never borrow paid +1.44% / +0.48% Ir for
-the emitted bytes. The guard-elision signature again. Full record,
-including how to re-introduce it and the condition that would make it pay:
-`plans/archived/inline-borrow-arm.md`. **Remaining cases, none built:** the
-builtin-CALLBACK bind paths (`argv[i]` — sort/map/filter/make_dict) and the
-tree-walker's `do_func_bind_params`.
+**The emitted INLINE borrow arm was BUILT AND REVERTED at the generic
+push** — −3.27% Ir on bench 76 (999,999 of its calls served by generated
+code) for **1.00x wall clock**, while two benches that never borrow paid
++1.44% / +0.48% Ir for the emitted bytes. The guard-elision signature
+again. Full record, including the conditions under which to re-introduce
+it: `plans/archived/inline-borrow-arm.md`. **One of them came true and it
+is BUILT there (#97 inc 3 W5, 2026-09-21): at a FRAMELESS site the callee
+is baked, so the bit is an emit-time fact and the arm is emitted only at
+the sites that take it** - 76 −13.5% Ir, the whole cut being the two
+helper bodies (`vm_bind_arg`, `frame_release`), while the emitted site
+grew by four. The generic push keeps the helper. **Remaining cases, none
+built:** the builtin-CALLBACK bind paths (`argv[i]` — sort/map/filter/
+make_dict) and the tree-walker's `do_func_bind_params`.
 
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to

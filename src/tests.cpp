@@ -28412,8 +28412,8 @@ static bool jit_frameless_w2_shape()
              && native_expect(mn, at, {
                     "sub rsp, 144",              /* the callee's 3 slots */
                     "mov r10, rsp",
-                    "mov [r10+0x20], 0",         /* param 0: the tail */
-                    "mov [r10+0x28], 0",
+                    /* W5: no tail stores for the declared-int parameter
+                     * (unlisted, bound raw, never written) */
                     "mov [r10+0x0], r1*",        /* the pinned i, r12-r15 */
                     "mov [r10+0x18], <int-tag>@r11",  /* declared int */
                     /* W3: the two temps are written raw by the body
@@ -28454,8 +28454,6 @@ static bool jit_frameless_w2_shape()
              && native_expect(mn, at2, {
                     "sub rsp, 144",
                     "mov r10, rsp",
-                    "mov [r10+0x20], 0",
-                    "mov [r10+0x28], 0",
                     "xorps xmm0, xmm0",          /* the merge-dep break */
                     "cvtsi2sd xmm0, r1*",        /* from the register */
                     "movsd [r10+0x0], xmm0",
@@ -28470,8 +28468,6 @@ static bool jit_frameless_w2_shape()
              && native_expect(m2, at, {
                     "sub rsp, 144",
                     "mov r10, rsp",
-                    "mov [r10+0x20], 0",
-                    "mov [r10+0x28], 0",
                     "cmp a.type, <int-tag>@r11", /* exact? */
                     "je +*",
                     "mov rsi, a.type",
@@ -28696,6 +28692,95 @@ static bool jit_frameless_w4_shape()
     if (g_jit_frameless_capbase == 0) {
         fprintf(stderr, "jit_frameless_w4_shape: frameless_capbase never "
                         "bumped\n");
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 increment 3, W5 - THE INLINE BORROW at a frameless site, and the
+ * arm's borrowed skip. Read from the dump of 76's shape (`add_op(st, x)`
+ * with `st` a non-escaping array parameter):
+ *  - the site's reference path: after the `jge` on the source's Type::t
+ *    comes the ARRAY test (`cmp r11, 10`), the SLICE flag byte in the
+ *    payload, the four-qword raw copy and the `borrowed` flag byte set
+ *    to 1 - no helper on that path; the slice declines to the helper
+ *    (`lea rdi, [r10+0x0] ... call`), which is still emitted after it;
+ *  - the callee's frameless arm tests the flag byte before the release
+ *    call of every listed slot and skips a borrowed one.
+ * (78's proven-int parameter losing its two tail stores is pinned in
+ * the W2 shape test.)
+ */
+static bool jit_frameless_w5_shape()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    std::string d;
+    try {
+        d = native_dump_of({
+            "func add_op(st, x) { st[0] = st[0] + x; }",
+            "func sub_op(st, x) { st[0] = st[0] - x; }",
+            "var ops = [add_op, sub_op];",
+            "var st = [0];",
+            "var N = int(runtime(40));",
+            "for (var i = 0; i < N; i++) { var fn = ops[i % 2]; fn(st, i); }",
+            "print(st[0]);" });
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_frameless_w5_shape: threw %s: %s\n", e.name,
+                e.msg);
+        return false;
+    }
+    bool ok = true;
+    {
+        const std::vector<NativeIns> mn = native_ins_of(d, "main");
+        const size_t at = native_find_seq(mn, 0, {
+            "cmp r11, 10",               /* an array? */
+            "jne +*",
+            "cmp byte [rbx+0x*], 0",     /* its slice flag (in the payload) */
+            "jne +*",                    /* a slice -> the helper */
+            "mov r11, st",               /* the raw copy: four qwords */
+            "mov [r10+0x0], r11",
+            "mov r11, [rbx+0x*]",
+            "mov [r10+0x8], r11",
+            "mov r11, [rbx+0x*]",
+            "mov [r10+0x10], r11",
+            "mov r11, st.type",
+            "mov [r10+0x18], r11",
+            "mov byte [r10+0x*], 1" });  /* borrowed = 1 */
+        if (at == std::string::npos) {
+            fprintf(stderr, "jit_frameless_w5_shape: no inline borrow at "
+                            "76's site\n");
+            ok = false;
+        }
+        /* the helper decline still follows (a slice must take it) */
+        if (ok && native_find_seq(mn, mn[at].off, {
+                "lea rsi, st", "lea rdi, [r10+0x0]", "mov rdx, 1",
+                "call <helper>" }) == std::string::npos) {
+            fprintf(stderr, "jit_frameless_w5_shape: the helper arm after "
+                            "the inline borrow is gone\n");
+            ok = false;
+        }
+    }
+    {
+        const std::vector<NativeIns> cl = native_ins_of(d, "func add_op$0");
+        if (native_find_seq(cl, 0, {
+                "mov rax, st.type", "cmp [rax+0x8], 8", "jl +*",
+                "cmp byte [rbx+0x*], 0",     /* borrowed? */
+                "jne +*",                    /* -> nothing to release */
+                "lea rdi, st", "call <helper>" }) == std::string::npos) {
+            fprintf(stderr, "jit_frameless_w5_shape: the arm's release of "
+                            "`st` has no borrowed skip\n");
+            ok = false;
+        }
+    }
+    if (g_jit_borrow_inline == 0) {
+        fprintf(stderr, "jit_frameless_w5_shape: borrow_inline never "
+                        "bumped (the dump driver runs no code - this counts "
+                        "the -rt cases before this one)\n");
         ok = false;
     }
     return ok;
@@ -29183,6 +29268,73 @@ static bool jit_frameless_call_reach()
             "var s = 0;",
             "for (var i = 0; i < runtime(30); i++) { s = s + ctr(); }",
             "print(s);" }, "615 \n", 30, false },
+        /* #97 inc 3, W5: the inline borrow. A SLICE must decline to the
+         * helper - the retaining copy registers the view in its parent's
+         * live-slices set, and the element write to the base between
+         * calls detaches every REGISTERED view; a raw-copied slice would
+         * keep reading storage the detach gave away (a use-after-free
+         * ASan catches, and a wrong sum). The array and string cases are
+         * borrowed inline; the refcount difference proves no count was
+         * taken by either path. */
+        { "W5: a SLICE argument at a frameless site declines the inline "
+          "borrow to the helper (its view registered; the base mutated "
+          "between calls)", {
+            "func mk(int d) { return func [d] (a, int k) {",
+            "  var t = a[0] + a[1]; var u = t * 2 - k; return u - t + d; }; }",
+            "var f = mk(1);",
+            "var base = [10, 20, 30, 40, 50];",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(20); i++) {",
+            "  var sl = base[1:4];",
+            "  s = s + f(sl, i);",
+            "  base[1] = base[1] + 1;",
+            "}",
+            "print(s, base[1]);" }, "1020 40 \n", 20, false },
+        { "W5: an ARRAY and a STRING borrowed INLINE at frameless sites - "
+          "no count taken (refcount back where it was), values right", {
+            "func mk(int d) { return func [d] (a, int k) {",
+            "  var t = a[0] + k; var u = t * 2; return u - t + d; }; }",
+            "func mks() { return func (s, int k) {",
+            "  var t = len(s) + k; var u = t * 2; return u - t; }; }",
+            "var f = mk(3); var g = mks();",
+            "var arr = [7, 8]; var sv = \"abcd\";",
+            "var c1 = refcount(arr); var c2 = refcount(sv);",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(30); i++) {",
+            "  s = s + f(arr, i) + g(sv, i); }",
+            "print(s, refcount(arr) - c1, refcount(sv) - c2);" },
+          "1290 0 0 \n", 60, false },
+        /* the two shapes that make a RAW-COPIED slice observable, both
+         * frameless (an element store keeps the body under the ref cap
+         * only when it is this small): the parent written INSIDE the
+         * call while the slice is live - a registered view is detached
+         * by the write, an unregistered one reads the new value; and a
+         * write THROUGH the slice - its COW clone releases a count the
+         * borrow never took, and the caller's handle dangles (ASan). */
+        { "W5: a slice parameter beside its PARENT, the parent written "
+          "inside the frameless call - the registered view is detached, "
+          "the value is the old one", {
+            "func mk(int d) { return func [d] (p, v, int k) {",
+            "  p[1] = p[1] + k; return v[0] + d; }; }",
+            "var f = mk(1);",
+            "var base = [10, 20, 30, 40, 50];",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(20); i++) {",
+            "  var sl = base[1:4];",
+            "  s = s + f(base, sl, i);",
+            "}",
+            "print(s, base[1]);" }, "1560 210 \n", 20, false },
+        { "W5: an element write THROUGH a slice parameter at a frameless "
+          "site - the COW clone releases the retained copy's count, the "
+          "caller's view and the base are intact", {
+            "func mk(int d) { return func [d] (a, int k) {",
+            "  a[0] = a[0] + k; return a[0] + d; }; }",
+            "var f = mk(1);",
+            "var base = [10, 20, 30, 40, 50];",
+            "var sl = base[1:4];",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(20); i++) { s = s + f(sl, i); }",
+            "print(s, sl[0], base[1]);" }, "610 20 20 \n", 20, false },
         { "W2: a pinned int sibling next to a dyn STRING into an int "
           "param - the decline trampoline materialises BOTH into the run "
           "(the pin from its register) before the C++ tier raises", {
@@ -37790,8 +37942,16 @@ static bool jit_ref_arg_bind()
     /* An ARRAY argument through a DIRECT call. The body is deliberately
      * several statements: a small one is INLINED away by the optimizer, so
      * there is no call left to bind - which is how the first version of this
-     * test managed to exercise nothing. */
-    unsigned long b0 = g_jit_ref_arg_binds;
+     * test managed to exercise nothing.
+     * #97 inc 3 W5: a frameless site binds a non-escaping reference
+     * INLINE (g_jit_borrow_inline) and never reaches the helper, so the
+     * "bound natively, no decline" claim is the SUM of the two counters
+     * for the first two shapes; the SLICE shape below must still take
+     * the helper - its registration is what only the C++ copy does. */
+    const auto binds = []() {
+        return g_jit_ref_arg_binds + g_jit_borrow_inline;
+    };
+    unsigned long b0 = binds();
     if (!run({ "func addto(a, x) {",
                "  var t = a[0] + x;",
                "  var u = t * 2;",
@@ -37803,11 +37963,11 @@ static bool jit_ref_arg_bind()
                "for (var i = 0; i < 40; i++) addto(st, i);",
                "assert(st[0] == 780);" }))
         return false;
-    if (g_jit_ref_arg_binds <= b0)
+    if (binds() <= b0)
         return false;         /* the inline push still DECLINED the call */
 
     /* a STRING argument, and an indirect call through a func value */
-    b0 = g_jit_ref_arg_binds;
+    b0 = binds();
     if (!run({ "func f1(s, k) { return len(s) + k; }",
                "func f2(s, k) { return len(s) - k; }",
                "var ops = [f1, f2];",
@@ -37818,7 +37978,7 @@ static bool jit_ref_arg_bind()
                "}",
                "assert(acc == 180);" }))
         return false;
-    if (g_jit_ref_arg_binds <= b0)
+    if (binds() <= b0)
         return false;
 
     /* a SLICE argument: the copy must register the new view in the parent's
@@ -37909,7 +38069,11 @@ static bool jit_borrow_arg_shapes()
      * escapes. The body is several statements on purpose - a small one is
      * inlined away and leaves no call to bind at all.
      */
-    unsigned long b0 = g_arg_borrow, s0 = g_arg_borrow_slice;
+    /* #97 inc 3 W5: a frameless site borrows INLINE (g_jit_borrow_inline,
+     * emitted code) and never reaches vm_bind_arg, so "borrowed" is the
+     * SUM of the two counters - and a DECLINE must leave BOTH flat */
+    const auto borrows = []() { return g_arg_borrow + g_jit_borrow_inline; };
+    unsigned long b0 = borrows(), s0 = g_arg_borrow_slice;
     if (!run({ "func total(array a, int k) {",
                "  var t = a[0] + a[1];",
                "  var u = t * 2 - k;",
@@ -37921,7 +38085,7 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 60; i++) s += total(arr, i);",
                "assert(s == 420);" }))
         return false;
-    if (g_arg_borrow <= b0 || g_arg_borrow_slice != s0)
+    if (borrows() <= b0 || g_arg_borrow_slice != s0)
         return false;
 
     /*
@@ -37937,7 +38101,7 @@ static bool jit_borrow_arg_shapes()
      * borrow that happened to be harmless in this shape, which is the whole
      * difference between checking a counter and checking the hazard.
      */
-    b0 = g_arg_borrow;
+    b0 = borrows();
     if (!run({ "var g = [1, 2, 3];",
                "func drop(array a, int k) {",
                "  var x = a[0];",
@@ -37953,7 +38117,7 @@ static bool jit_borrow_arg_shapes()
                /* a[1] must still read the OLD array's 2 */
                "assert(s == 60 * 120);" }))
         return false;
-    if (g_arg_borrow != b0)
+    if (borrows() != b0)
         return false;
 
     /*
@@ -37966,7 +38130,7 @@ static bool jit_borrow_arg_shapes()
      * does. Reading a stale or baked bit is a use-after-free in `dropper`,
      * caught by ASan and by the value.
      */
-    b0 = g_arg_borrow;
+    b0 = borrows();
     if (!run({ "var g = [1, 2, 3];",
                "func dropper(array<int> a, int k) {",
                "  var x = a[0];",
@@ -37989,7 +38153,7 @@ static bool jit_borrow_arg_shapes()
                "}",
                "assert(s == 80 * 3);" }))
         return false;
-    if (g_arg_borrow <= b0)
+    if (borrows() <= b0)
         return false;         /* `plain` must still borrow at this site */
 
     /*
@@ -37999,7 +38163,7 @@ static bool jit_borrow_arg_shapes()
      * written THROUGH THE OTHER PARAMETER during the call, so a borrowed view
      * would observe the write.
      */
-    b0 = g_arg_borrow;
+    b0 = borrows();
     s0 = g_arg_borrow_slice;
     if (!run({ "func sum2(array p, array view) {",
                "  var a = view[0];",
@@ -38032,7 +38196,7 @@ static bool jit_borrow_arg_shapes()
      * non-transparent builtin clears its bit for a different reason (the
      * builtin may store it), which would mask what this case is testing.
      */
-    b0 = g_arg_borrow;
+    b0 = borrows();
     if (!run({ "var pool = [1, 2, 3, 4];",
                "func f(array<int> a) {",
                "  var t = a[0] + a[1];",
@@ -38045,7 +38209,7 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 30; i++) s = s + f(arr);",
                "assert(s == 30 * 17);" }))
         return false;
-    if (g_arg_borrow <= b0)
+    if (borrows() <= b0)
         return false;         /* the map call still poisoned the function */
 
     /*
@@ -38055,7 +38219,7 @@ static bool jit_borrow_arg_shapes()
      * loses its bit. This is the case that says the previous one is a real
      * gate and not just "the rule was deleted".
      */
-    b0 = g_arg_borrow;
+    b0 = borrows();
     if (!run({ "var pool = [1, 2, 3, 4];",
                "func dbl(int e) { var z = e * 2; return z; }",
                "func trp(int e) { var z = e * 3; return z; }",
@@ -38071,7 +38235,7 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 30; i++) s = s + f(arr);",
                "assert(s == 30 * 17);" }))
         return false;
-    if (g_arg_borrow != b0)
+    if (borrows() != b0)
         return false;         /* an unnameable callback must still poison */
 
     /*
@@ -38090,7 +38254,7 @@ static bool jit_borrow_arg_shapes()
      * with the no-invoke list deleted. The corpus hits it on the
      * un-instantiated template BASE, which this cannot reproduce.
      */
-    b0 = g_arg_borrow;
+    b0 = borrows();
     if (!run({ "func f(array<int> a, dyn n) {",
                "  var t = a[0] + a[1];",
                "  var buf = array(n);",
@@ -38102,7 +38266,7 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 30; i++) s = s + f(arr, 4);",
                "assert(s == 30 * 15);" }))
         return false;
-    if (g_arg_borrow <= b0)
+    if (borrows() <= b0)
         return false;         /* array(n) still poisoned over a dyn arg */
 
     /*
@@ -38123,7 +38287,7 @@ static bool jit_borrow_arg_shapes()
      * and `keeper`'s own parameter borrows never. Both bind paths read the
      * bit per position, so the tier a given call takes cannot change it.
      */
-    b0 = g_arg_borrow;
+    b0 = borrows();
     if (!run({ "func keeper(array<int> v) {",
                "  var t = v[0];",
                "  var u = t * 2;",
@@ -38143,7 +38307,7 @@ static bool jit_borrow_arg_shapes()
                "for (var i = 0; i < 60; i++) s = s + mix(a1, a2);",
                "assert(s == 480);" }))
         return false;
-    if (g_arg_borrow - b0 != 60)
+    if (borrows() - b0 != 60)
         return false;         /* 2 per call == the index shift was dropped */
 
     /*
@@ -38177,7 +38341,7 @@ static bool jit_borrow_arg_shapes()
      * "declined here" from "never reached the bind", which is exactly how
      * both earlier versions passed while testing nothing.
      */
-    b0 = g_arg_borrow;
+    b0 = borrows();
     unsigned long c0 = g_arg_borrow_scalar;
     const bool saved_jit = g_jit_enabled;
     g_jit_enabled = false;
@@ -38189,7 +38353,7 @@ static bool jit_borrow_arg_shapes()
     g_jit_enabled = saved_jit;
     if (!scalar_ok)
         return false;
-    if (g_arg_borrow != b0)
+    if (borrows() != b0)
         return false;
     if (g_arg_borrow_scalar <= c0)
         return false;         /* the analysis never claimed it - vacuous */
@@ -41614,6 +41778,10 @@ static const std::vector<extra_check> extra_checks =
       "call, a reference capture's helper arms take the base register, "
       "a factory (MakeClosureV) keeps the repoint - read from the dump",
       jit_frameless_w4_shape },
+    { "jit: #97 inc 3 (W5) - the INLINE BORROW at a frameless site (array "
+      "test, slice flag, four-qword copy, the borrowed byte) with the "
+      "helper decline behind it, and the arm's borrowed skip - from the dump",
+      jit_frameless_w5_shape },
     { "jit: #97 inc 3 (W3) - the raw whitelist is a subset of "
       "op_writes_scalar (the ref-listed exclusion's redundancy, pinned at "
       "the opcode level)",

@@ -664,6 +664,7 @@ struct JitLayout {
     int hashv_off;     /* SharedObject: &hash_valid - shobj */
     int slices_off;    /* SharedObject: &has_slices - shobj */
     int lv_const_off;  /* LValue: &is_const - &slot */
+    int lv_borrowed_off; /* LValue: &borrowed - &slot (W5) */
     int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
     int t_str_val;        /* Type::t_str: types >= this hold a REFERENCE */
     /* G1's widening bind compares KIND bytes, not singleton pointers */
@@ -964,6 +965,9 @@ static const JitLayout &jit_layout()
             static_cast<const char *>(jp.has_slices) - so);
         l.lv_const_off = static_cast<int>(
             reinterpret_cast<const char *>(&alv.jit_const_probe()) -
+            reinterpret_cast<const char *>(&alv));
+        l.lv_borrowed_off = static_cast<int>(
+            reinterpret_cast<const char *>(&alv.jit_borrowed_probe()) -
             reinterpret_cast<const char *>(&alv));
         /* Type::t offset + the t_str boundary: a slot whose current type has
          * t >= t_str holds a REFERENCE (needs a C++ release before overwrite);
@@ -8467,6 +8471,15 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
         return !callee->params[i].binds_scalar()
                && jit_slot_ref_listed(cck, i);
     };
+    /* W5: a parameter the W3 derivation marks raw-written and unlisted
+     * (Chunk::frameless_init_free, whose parameter bits the site alone
+     * reads) binds from this fill's scalar paths - payload and type word,
+     * nothing else - and nothing in the callee reads its tail: no tail
+     * stores for it. A listed parameter keeps them: the bind helper's
+     * ML_CHECK(!borrowed) and the inline borrow's flag write below both
+     * rely on a zeroed tail. */
+    const uint64_t tail_free = nargs >= 64 ? 0
+        : cck.frameless_init_free & ((uint64_t(1) << nargs) - 1);
     /* pass 1: the tails, and every scalar bind (declines live here) */
     for (int i = 0; i < nargs; i++) {
         const int32_t d = i * 48;                        /* window slot */
@@ -8476,8 +8489,10 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
         const void *req = pd.decl_type == DeclType::i ? L.t_int
                         : pd.decl_type == DeclType::f ? L.t_float
                         : nullptr;
-        e.store_qword_base_imm32(R10, d + 32, 0);        /* reg:proto */
-        e.store_qword_base_imm32(R10, d + 40, 0);        /* reg:proto */
+        if (!((tail_free >> i) & 1)) {
+            e.store_qword_base_imm32(R10, d + 32, 0);    /* reg:proto */
+            e.store_qword_base_imm32(R10, d + 40, 0);    /* reg:proto */
+        }
         /* a REGISTER-resident source is a scalar whatever the parameter
          * admits (a pin is a proven int/float), and its slot memory is
          * STALE - so it binds here, from the register, even into a
@@ -8589,8 +8604,54 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
         const size_t j_ref = e.j32(0x7D);        /* jge: a reference */
         for (int32_t o = 0; o <= 24; o += 8)
             copy_q(s + o, d + o);
-        const size_t j_join = e.j32(0xEB);
+        std::vector<size_t> j_joins;
+        j_joins.push_back(e.j32(0xEB));
         e.patch32_here(j_ref);
+        /*
+         * #97 inc 3 (W5): THE INLINE BORROW. The callee is baked, so
+         * whether this parameter is non-escaping (FuncDescriptor::
+         * noescape_params, #93) is an emit-time fact - the condition the
+         * archived inline-borrow plan named for re-introducing the arm
+         * ("the bit becomes bakeable"), and the arm is emitted at exactly
+         * the sites that take it, not at every reference slot of every
+         * push. A borrow is a RAW BIT-COPY of the caller's value with the
+         * `borrowed` flag set (LValue::borrow_from: no retain here, no
+         * release at the frame's death - the caller's slot holds the
+         * reference for the whole synchronous call). ⛔ NEVER A SLICE
+         * (#94): a slice registers itself in its parent's live-slices
+         * set when COPIED and an element write to the parent detaches
+         * every registered view; a borrowed one is not in the set and
+         * would keep reading storage the detach gave away. So an ARRAY
+         * whose slice flag is set declines to the helper, which copies
+         * with a retain; every other reference type is a plain retain
+         * with no registration, and the bit-copy is its exact twin. The
+         * tail was zeroed above (container = 0, is_const = 0), so the
+         * flag byte is the one store the copy needs beyond the value.
+         */
+        const bool noesc = i < 64 && ((callee->noescape_params >> i) & 1);
+        if (noesc) {
+            /* r11 = Type::t of the source (a reference here) */
+            e.cmp_reg32_imm32(R11,                       /* reg:proto */
+                              static_cast<uint32_t>(L.t_arr_val));
+            const size_t j_notarr = e.j32(0x75);         /* jne: not an
+                                                          * array */
+            /* the SharedArrayObj sits INLINE in the payload; its slice
+             * flag is a byte at slice_off from the slot (the element
+             * tiers' own test) */
+            e.cmp_byte_base(RBX, s + L.slice_off, 0);
+            const size_t j_slice = e.j32(0x75);          /* jne: a slice ->
+                                                          * the helper */
+            e.patch32_here(j_notarr);
+            for (int32_t o = 0; o <= 24; o += 8)
+                copy_q(s + o, d + o);
+            e.store_byte_base_imm(R10, d + L.lv_borrowed_off,   /* reg:proto */
+                                  0x01);
+#ifdef TESTS
+            e.bump_counter(&g_jit_borrow_inline);
+#endif
+            j_joins.push_back(e.j32(0xEB));
+            e.patch32_here(j_slice);
+        }
         /* the helper's retaining copy RELEASES the slot's old value
          * first (LValue::rebind) - on raw stack that is a garbage
          * Type*, so the slot reads as `none` first */
@@ -8609,7 +8670,8 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
         e.pop_reg(R9R);                                  /* reg:proto */
         e.pop_reg(RDX);                                  /* reg:proto */
         e.mov_rr(R10, RSP);                              /* reg:proto */
-        e.patch32_here(j_join);
+        for (const size_t j : j_joins)
+            e.patch32_here(j);
     }
     /* every non-parameter slot reads as a fresh `none` until written -
      * except the ones W3 proves nothing reads before a raw write
@@ -11320,7 +11382,14 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                  * so every ref-listed slot but the moved result is
                  * released here (the record-less arm's exact shape;
                  * watched: without it the frameless_call_reach refcount
-                 * case read 3 for 3 normal returns) */
+                 * case read 3 for 3 normal returns).
+                 * #97 inc 3 (W5): a slot found BORROWED needs no work at
+                 * all - the borrow took no count (LValue::borrow_from)
+                 * and frame_release's abandon only resets a slot that is
+                 * about to be given back with the window; the helper
+                 * call was the whole cost of a borrowed parameter's
+                 * return. The flag is tested only where the type says
+                 * reference, since only a reference is ever borrowed. */
                 for (const int32_t sl : ck.ref_slots) {
                     if (res_listed && sl == res_slot)
                         continue;
@@ -11330,12 +11399,16 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                     cmp_d_imm8(RAX, L.type_t_off,
                                static_cast<int8_t>(L.t_str_val));
                     const size_t j_tr = e.j32(0x7C);   /* jl skip */
+                    e.cmp_byte_base(RBX, d + L.lv_borrowed_off, 0);
+                    const size_t j_bw = e.j32(0x75);   /* jne: borrowed ->
+                                                        * nothing to do */
                     e.lea_rdi(d);                     /* reg:abi */
                     e.call_relocs.push_back(
                         { e.pos(),
                           reinterpret_cast<const void *>(jit_release_slot) });
                     e.u8(0xE8); e.u32(0);
                     e.patch32_here(j_tr);
+                    e.patch32_here(j_bw);
                 }
                 /* ctx.captures = the caller's, from the residue - unless
                  * the site never repointed it (W4: the callee reached
@@ -12581,6 +12654,7 @@ void jit_stats_report()
         { "frameless_rets",    &g_jit_frameless_rets },
         { "frameless_init_free", &g_jit_frameless_init_free },
         { "frameless_capbase", &g_jit_frameless_capbase },
+        { "borrow_inline",     &g_jit_borrow_inline },
         { "arg_stage",        &g_jit_arg_stage },
         { "sync_switch",      &g_jit_sync_switch },
         { "cached_probe_calls", &g_jit_cached_probe_calls },
