@@ -185,6 +185,70 @@ else
     fail "depth cap: uncaught overflow rc=$got_rc [$out]"
 fi
 
+# THE OVERFLOW DEPTH IS THE SAME IN EVERY ENGINE CONFIGURATION (RULE 2).
+# StackOverflowEx is decided by SEGMENT usage - a push that cannot get a
+# window from the budget throws - so the depth a runaway recursion
+# reaches is observable, and every call tier must charge the segment
+# exactly as the interpreter's push_window does. A tier that carved its
+# window anywhere else (the native stack - the frameless tier's shape)
+# would move that depth, and nothing else in the tree would notice: the
+# program still throws, still catches, still prints a number. The caps
+# straddle a SEG_SLOTS (16384) boundary, where the budget arithmetic
+# changes, and the shapes are the ones the call tiers treat differently:
+# plain self recursion, a leaf call per level, mutual recursion, a
+# closure call per level, and a leaf called from MAIN (the frameless
+# site's home). Untested until 2026-09-23, when the question "may a
+# frameless callee make calls?" turned on exactly this property.
+cat > "$TMP/sodepth.my" <<'SODEOF'
+var depth = 0;
+func leaf(int x) { var a = x + 1; var b = a * 2; return b - a; }
+func self(int n) { depth = n; return self(n + 1) + 1; }
+func withleaf(int n) {
+    depth = n; var t = leaf(n); return withleaf(n + 1) + t;
+}
+func ev(int n) { depth = n; return od(n + 1) + 1; }
+func od(int n) { depth = n; return ev(n + 1) + 1; }
+func mk(int k) { return func [k] (int n) { return k + n; }; }
+var cl = mk(3);
+func viacl(int n) { depth = n; var q = cl(n); return viacl(n + 1) + q; }
+func run(int which) {
+    depth = 0;
+    try {
+        if (which == 0) print(self(runtime(1)));
+        if (which == 1) print(withleaf(runtime(1)));
+        if (which == 2) print(ev(runtime(1)));
+        if (which == 3) print(viacl(runtime(1)));
+    } catch (StackOverflowEx) { print("overflow", which, "at", depth); }
+}
+for (var w = 0; w < 4; w++) { print(leaf(w)); run(w); }
+SODEOF
+sod_ok=1
+for cap in 3001 16384 16390 40000; do
+    want=$(MYLANG_VM_STACK=$cap "$BIN" -nj "$TMP/sodepth.my" 2>&1)
+    if ! printf '%s\n' "$want" | grep -q '^overflow 3 at'; then
+        fail "overflow depth: -nj did not overflow every shape at cap $cap
+      (the check would be vacuous) [$want]"
+        sod_ok=0
+        continue
+    fi
+    # MYLANG_NATIVE_STACK=0 puts a release build's sync depth cap at 200,
+    # so its deep calls take the SWITCH protocol the way a sanitized
+    # build's (cap 32) always do - the path both bugs this check found
+    # on its first run live on (2026-09-23)
+    for cfg in "" "MYLANG_JIT_OFF=norec" "MYLANG_JIT_OFF=frameless" \
+               "MYLANG_JIT_OFF=bakecallee" "MYLANG_NATIVE_STACK=0"; do
+        got=$(env $cfg MYLANG_VM_STACK=$cap "$BIN" "$TMP/sodepth.my" 2>&1)
+        if [ "$got" != "$want" ]; then
+            fail "overflow depth: cap $cap, [${cfg:-default}] differs from -nj:
+      want: $(printf '%s' "$want" | tr '\n' '|')
+      got:  $(printf '%s' "$got" | tr '\n' '|')"
+            sod_ok=0
+        fi
+    done
+done
+[ $sod_ok = 1 ] &&
+    pass "overflow depth: identical in every engine configuration (4 caps)"
+
 # -v REPORTS THE ARENA, and MYLANG_NO_LOWMEM=1 refuses it. This is the
 # VACUITY GUARD for the no-arena CI lane: a lane that tests a
 # configuration must be able to prove it is IN that configuration, or it

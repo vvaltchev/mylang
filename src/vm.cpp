@@ -8546,10 +8546,29 @@ jit_sync_boundary_call(EvalContext &ctx, FuncObject &fo, int_type argbase,
  * table is unconditional) but no frame is ever record-less, so the walk
  * degenerates to pure retargets - the pre-flip default's behaviour.
  */
+/*
+ * ⛔ `seg` / `sg` NAME THE SEGMENT THE WALKED FRAMES LIVE IN, and the
+ * caller must pass them - they are NOT `act.cur_seg` in general
+ * (2026-09-23). Every frame the walk visits was pushed natively (a push
+ * that does not fit declines to C++, whose frame is the walk's floor),
+ * so they all share ONE segment: the switching caller's. For the -3
+ * switch itself that is the current one. For jit_call_sync_core's
+ * r == JIT_RET_SWITCH branch it is NOT: the core's own push may have
+ * ADVANCED to a new segment for its callee, so `cur_seg` names the
+ * callee's segment while the frames being materialised sit in the
+ * caller's. The inserted records then claimed the wrong segment, and
+ * the next pop - an overflow unwind, typically - aborted on
+ * `cur_sg == segs[rec.seg]` (or, assert-free, gave back a watermark in
+ * the wrong segment). Found by driver_checks' overflow-depth parity
+ * case: a mutual recursion that overflows TWICE, the second pass
+ * reusing the segment the first one allocated, with a sync depth cap
+ * low enough that the crossing call is a core call (a sanitized build,
+ * or MYLANG_NATIVE_STACK=0).
+ */
 static void norec_switch_retarget(VmActivation &act, const char *fp,
                                   size_t idx, const Chunk *my_ck,
                                   const FuncDescriptor *my_desc,
-                                  LValue *my_win)
+                                  LValue *my_win, int seg, VmStackSeg *sg)
 {
     /* `guard` exists ONLY to feed the ML_CHECK below, which an
      * ASSERTS=0 build compiles away - so there it is incremented and
@@ -8587,13 +8606,15 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
             ML_CHECK(S != nullptr);    /* only an emitted site creates a
                                         * record-less frame */
             ML_CHECK(my_ck != nullptr && my_win != nullptr);
+            /* the inline-push invariant: a record-less frame shares
+             * its caller's segment - the one the caller named */
+            ML_CHECK(sg != nullptr && my_win >= sg->slots.data()
+                     && my_win < sg->end);
             VmCallRec nr;
             nr.window = my_win;
             nr.nslots = static_cast<int_type>(my_ck->slot_count)
                         + my_ck->n_temps;
-            nr.seg = act.cur_seg;      /* the inline-push invariant: a
-                                        * record-less frame shares its
-                                        * caller's segment */
+            nr.seg = seg;
             nr.run_chunk = my_ck;
             nr.desc = my_desc;
             nr.ret_chunk = S->caller;
@@ -8617,8 +8638,8 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
                 *reinterpret_cast<LValue *const *>(fp - 8);
             nr.parent_nslots = static_cast<int32_t>(
                 S->caller->slot_count + S->caller->n_temps);
-            nr.parent_seg = static_cast<int32_t>(act.cur_seg);
-            nr.parent_sg = act.cur_sg;
+            nr.parent_seg = static_cast<int32_t>(seg);
+            nr.parent_sg = sg;
             act.records.insert(
                 act.records.begin() + static_cast<ptrdiff_t>(idx),
                 std::move(nr));
@@ -8687,19 +8708,37 @@ jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
      * frame's sentinel resume, INSERT a full record for each record-less
      * one (see norec_switch_retarget). The descent is seeded by the
      * relay SITE (the switching caller's own identity - back_rec() can
-     * be an ancestor's in the record-less world) and the live vframe
-     * (its window). After this, back_rec() below IS the switching
-     * caller's record in every world. */
-    if (entry_rbp) {
-        const auto *seed =
-            static_cast<const NorecSite *>(g_norec_switch_site);
-        ML_CHECK(seed != nullptr);
-        norec_switch_retarget(
-            act, entry_rbp, act.rec_n, seed->caller,
-            static_cast<const FuncDescriptor *>(seed->caller_desc),
-            ctx.frame ? ctx.frame->slots : nullptr);
-    }
-    const Chunk *caller_ck = act.back_rec().run_chunk;  /* BEFORE the push */
+     * be an ancestor's in the record-less world) and the caller's window.
+     *
+     * ⛔ THE PUSH COMES FIRST, THE MATERIALIZATION SECOND (2026-09-23).
+     * The push can THROW - StackOverflowEx, an arity or bind-coercion
+     * error - and a throw here conveys as status 2, i.e. through the
+     * NATIVE frames, each of which unwinds itself as the record-less or
+     * record-ful frame it was pushed as. Materialized first, those frames
+     * had records they then never popped (a record-less exit gives its
+     * window back and returns; it has no record to pop), and the catch's
+     * unwind walk popped them a second time - an abort in any checked
+     * build (`cur_sg == segs[rec.seg]`, jit_ret_audit), a double
+     * segment give-back without one. Only a push that SUCCEEDED commits
+     * the switch, so only then may the native chain become the record
+     * world's. Found by driver_checks' overflow-depth case: an overflow
+     * whose first descent went through the C++ core (every record at a
+     * new high-water) was fine; the SECOND run of the same recursion
+     * took the emitted pushes and overflowed inside the switch.
+     *
+     * Everything the walk reads is captured BEFORE the push, which
+     * repoints the view at the callee and may advance the segment. */
+    const NorecSite *seed =
+        entry_rbp ? static_cast<const NorecSite *>(g_norec_switch_site)
+                  : nullptr;
+    ML_CHECK(!entry_rbp || seed != nullptr);
+    LValue *const caller_win = ctx.frame ? ctx.frame->slots : nullptr;
+    const size_t rec_n0 = act.rec_n;
+    const int caller_seg = act.cur_seg;
+    VmStackSeg *const caller_sg = act.cur_sg;
+    /* the switching caller's chunk: the seed's (which is what the
+     * materialized top record will run), else the record top's */
+    const Chunk *caller_ck = seed ? seed->caller : act.back_rec().run_chunk;
     try {
         if (d->fast_bind && !key)
             vm_frame_setup_lean(act, ctx, caller_ck,
@@ -8718,6 +8757,13 @@ jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
         g_vm_jit_eptr = std::current_exception();
         return 2;
     }
+    /* the inserts land BELOW the callee's record (positions <= rec_n0)
+     * and repoint top_rec at it, so back_rec() is the callee below */
+    if (seed)
+        norec_switch_retarget(
+            act, entry_rbp, rec_n0, seed->caller,
+            static_cast<const FuncDescriptor *>(seed->caller_desc),
+            caller_win, caller_seg, caller_sg);
     act.back_rec().call_site_packed = site_packed;   /* backtrace caret */
 #ifdef TESTS
     g_jit_sync_switch++;
@@ -8862,12 +8908,19 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
                 mine.sync_stop = 0;
                 mine.call_site_packed = site_packed;
             }
-            if (entry_rbp && entry_site && my_idx >= 2)
+            if (entry_rbp && entry_site && my_idx >= 2) {
+                /* the CALLER's segment - OUR record's parent view, not
+                 * cur_seg, which our own push may have advanced (read
+                 * before the walk: its inserts shift records) */
+                const VmCallRec &mine = act.records[my_idx - 1];
+                const int pseg = mine.parent_seg;
+                VmStackSeg *const psg = mine.parent_sg;
                 norec_switch_retarget(
                     act, entry_rbp, my_idx - 1, entry_site->caller,
                     static_cast<const FuncDescriptor *>(
                         entry_site->caller_desc),
-                    entry_caller_win);
+                    entry_caller_win, pseg, psg);
+            }
             g_jit_sync_depth--;
             return 3;
         }

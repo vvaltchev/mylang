@@ -1096,6 +1096,20 @@ and a new emitter must obey all four:
 Record, with the measurements and the seven watched sabotages:
 `docs/jit-optimizations.md`, *SP1/SP2/SP3*.
 
+**⛔ EVERY CALL TIER CHARGES THE SLOT SEGMENT EXACTLY AS `push_window`
+DOES (2026-09-23).** `StackOverflowEx` is raised when a push cannot get
+a window from the `MYLANG_VM_STACK` budget, so the depth a runaway
+recursion reaches is OBSERVABLE - a program catches the overflow and
+prints how deep it got. A tier that carves a window anywhere else (the
+native stack - the frameless tier's shape, sound today only because a
+frameless site exists only in MAIN, never at depth) moves that number:
+a RULE 2 divergence nothing else in the tree sees. `driver_checks.sh`'s
+*overflow depth* case pins it across `-nj` and five JIT configurations;
+its first run also found two real bugs in the depth-cap SWITCH
+materializer, reachable only on a build whose native stack is off (a
+sanitized one, or `MYLANG_NATIVE_STACK=0`). Record: *THE SWITCH
+MATERIALIZER* in docs/jit-optimizations.md.
+
 **⛔ AND IT BROKE AGAIN, ONE DAY AFTER THE ABS32 MEMORY OPERAND LANDED,
 WITH THREE NETS PRESENT AND ALL THREE BLIND (2026-08-26 -> found
 2026-08-27).** `mov rax, [+0x41250108]` - the arena global reached in
