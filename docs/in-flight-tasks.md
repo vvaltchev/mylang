@@ -67,6 +67,41 @@ kept in `myv-fuzz-bad/` (git-ignored) - see the loader item in §3.
     75_indexed_unpack             0.208      0.024    8.79x
     76_funcval_dispatch           0.170      0.018    9.72x
 
+**AND AFTER W5 / #25 / W6 / SP1-SP3 / 1b(ii) - THE MAINTAINER'S OWN
+RUN, 2026-09-22 (`my/cpp`), which is the table above one arc later:**
+
+    34_sort_custom_cmp            0.106      0.020    5.21x
+    64_struct_create              0.103      0.018    5.73x
+    11_closure_counter            0.079      0.012    6.42x
+    76_funcval_dispatch           0.113      0.017    6.66x
+    78_typed_param_call           0.051      0.007    6.85x
+    09_fib_recursive              0.152      0.022    6.99x
+    73_multi_unpack               0.227      0.032    7.09x
+    63_closures                   0.190      0.025    7.54x
+    35_map_filter                 0.190      0.024    7.86x
+    75_indexed_unpack             0.209      0.024    8.69x
+    58_structs                    0.079      0.009    8.87x
+
+**NOTHING IS OVER 9x ANY MORE** (76 was 9.72x and 11.45x before it),
+and 34 is within 0.21x of the standing <= 5x requirement.
+
+⛔ **READ THE `my` COLUMN, NOT THE RATIO, FOR MyLang'S PROGRESS.** The
+C++ side is CACHED, so a ratio moves when the DENOMINATOR moves and
+says nothing about this work - both directions are in this table:
+64_struct_create improves 6.49x -> 5.73x on a `my` that went 0.105 ->
+0.103 (its cpp went 0.016 -> 0.018), and **58_structs "regresses"
+7.12x -> 8.87x on a `my` that went 0.077 -> 0.079 while its cpp went
+0.011 -> 0.009**. Neither is a MyLang change. The same trap the
+machine-speed marker exists for on the python side (CLAUDE.md: *`cur/
+base` from `--baseline` is the trustworthy number; my/py alone is
+not*).
+
+By the `my` column the real movement since the W4-era table is:
+**76_funcval_dispatch 0.170 -> 0.113 (-34%)** - E3, W5 and #25 landing
+on the bench they were aimed at - 78 0.057 -> 0.051 (-11%), 11 0.082
+-> 0.079, 09 0.156 -> 0.152, 35/63 0.193/0.194 -> 0.190; 34, 73 and 75
+flat.
+
 RESUMED 2026-09-21 with W4 (done), W5 (done: the inline borrow at
 the site, the arm's borrowed skip, the scalar parameter tails - 76
 -13.5% Ir, 78 -2.5%) and #25 (done: `visit_use_def` learned six store
@@ -74,8 +109,12 @@ ops - 76 -9.0% Ir with `refs=[0 1]` and a 76-instruction callee, and
 far more elsewhere: 60_bit_sieve -23%, 14 -20%, 86 -20%, 68 -18%,
 zero per-iteration regressions), and W6 (done 2026-09-22: the capture
 base is CALLER-saved in a call-free frameless body - 78 -1.30% Ir, 11
--1.40%, 63 -0.32%; HALF the predicted step, see §1.6). Next per §1.6:
-E2 for 09.
+-1.40%, 63 -0.32%; HALF the predicted step, see §1.6), then SP1/SP2/
+SP3 (the 16-alignment invariant: one call seam, an emit-time rsp
+model, aligned AT the call), their follow-up (the dead-model
+population to zero) and 1b(ii) (`lea dst, [src+k]`, 09_fib -2.69% Ir)
+- with the shape tests moved onto a STRUCTURED decode along the way.
+Next per §1.6: E2 for 09.
 
 ### 1.1 What is DONE
 
