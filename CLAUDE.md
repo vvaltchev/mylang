@@ -1028,9 +1028,11 @@ that the hand-spill sites "push in PAIRS", and a third clause that had
 been STALE for months - and checked by NOTHING. Four rules replace it,
 and a new emitter must obey all four:
 
- - **EVERY emitted call goes through `Emitter::call_direct` or
-   `call_reg`. There is no third spelling** - `u8(0xE8)` as a call
-   opcode appears in exactly two places in jit.cpp. 97 sites used to
+ - **EVERY emitted call goes through `Emitter::call_direct`,
+   `call_reg` or `call_local_fixed_frame`** (#97 E2: a self site's call
+   to its own fragment's frameless entry, patched once that entry is
+   emitted) - all three open with `call_site()` and close with
+   `call_done()`, and there is no fourth spelling. 97 sites used to
    open-code the reloc+E8 pair, so each carried the alignment
    obligation privately and "does this run emit a call?" had to be
    reconstructed from `call_relocs.size()`. The seam ALIGNS the call

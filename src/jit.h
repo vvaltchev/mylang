@@ -224,6 +224,10 @@ void *jit_addr_pending_key();
 void *jit_addr_call_inline_chain();
 void *jit_addr_call_inline_pool();
 void *jit_addr_sync_depth();
+/* #97 E2: the decline relay - set by a frameless frame's slow tail, read
+ * and cleared by jit_call_sync(_cached): run the callee as a BOUNDARY
+ * call, so no depth-cap switch can propagate into that frame */
+void *jit_addr_nosw();
 int jit_sync_depth_cap();
 void jit_set_sync_depth_cap(int cap);   /* M5a: raised when the native
                                          * stack arms; tests pin it low */
@@ -638,6 +642,8 @@ extern unsigned long g_jit_frameless_sites;     /* inc 2 (emit-time): the
                                                  * SITE took the frameless
                                                  * tail */
 extern unsigned long g_jit_frameless_pushes;    /* inc 2 (emitted code) */
+extern unsigned long g_jit_frameless_self_sites; /* E2: self sites EMITTED */
+extern unsigned long g_jit_frameless_boundary;  /* E2: boundary calls RUN */
 extern unsigned long g_jit_frameless_rets;      /* inc 2 (emitted code) */
 extern unsigned long g_jit_frameless_init_free; /* inc 3 W3 (emit-time):
                                                  * window slots a site

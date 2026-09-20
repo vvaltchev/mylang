@@ -573,6 +573,17 @@ work — but profile it before building, the way increment 0 was.
         throw crossing a frameless frame is exactly its shape space.
         ⛔ Its gate must be re-derived from 09_fib's NEW baseline
         (increment 0 made it 20.7% faster), not from the old -4.75% row.
+        ✅ **v1 DONE 2026-09-23** (self sites + E2b, the call dst raw;
+        record: *#97 E2* in the JIT record): 09_fib **-30.5% Ir, 0.68x
+        wall**, 10_recursion_deep **-23.5% Ir, 1.00x wall** (1.09-1.13x
+        SLOWER before E2b - the per-call window init; found by attributing
+        CYCLES to JIT code with perf + a map from MYLANG_JIT_MAP), every
+        other call bench flat. NEXT, by the cycle profile of 10: the self
+        site's callee identity chain (5 dependent loads; for a SELF call
+        the callee is the running function - its own soundness argument),
+        the depth counter's store-forwarding chain, a non-SELF callee
+        (needs the callee's placement facts at a non-main site - the
+        seventh audit-table shape), builtin calls in a calling body.
         **2026-09-23 - THE DESIGN, after the maintainer revised RULE 2**
         (recursion depth is an unspecified property of the
         environment, like speed; what must hold is that a runaway

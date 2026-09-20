@@ -3504,6 +3504,8 @@ unsigned long g_jit_frameless_entries = 0; /* #97 inc 2: entries EMITTED */
 unsigned long g_jit_frameless_sites = 0;   /* #97 inc 2: sites EMITTED
                                             * frameless (the dump driver's
                                             * net reads it) */
+unsigned long g_jit_frameless_self_sites = 0; /* #97 E2: emit-time */
+unsigned long g_jit_frameless_boundary = 0;   /* #97 E2: run-time */
 unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
                                             * (emitted code) */
 unsigned long g_jit_frameless_rets = 0;    /* #97 inc 2: frameless RETURN
@@ -7906,7 +7908,13 @@ extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr_raw,
      * frame (its window is on the native stack, not the segment) */
     const uintptr_t dst_bits = reinterpret_cast<uintptr_t>(dst_addr_raw);
     const bool frameless = (dst_bits & 1) != 0;
-    LValue *dst_addr = reinterpret_cast<LValue *>(dst_bits & ~uintptr_t(1));
+    /* #97 E2b: bit 1 - the old dst value is trivial and the slot may be
+     * RAW (a calling frameless body's W3-skipped call dst): construct a
+     * valid LValue before the put reads the old one */
+    const bool raw_dst = (dst_bits & 2) != 0;
+    LValue *dst_addr = reinterpret_cast<LValue *>(dst_bits & ~uintptr_t(3));
+    if (raw_dst && dst_addr)
+        new (dst_addr) LValue();
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
     const auto *desc = static_cast<const FuncDescriptor *>(descv);
@@ -8439,6 +8447,14 @@ void *jit_addr_sync_depth()
     return &g_jit_sync_depth;
 }
 
+/* #97 E2: the decline relay (jit.h: jit_addr_nosw). In the low arena so
+ * the emitted store is one instruction. */
+static int_type &g_jit_nosw = *ml_lowmem_new<int_type>(0);
+void *jit_addr_nosw()
+{
+    return &g_jit_nosw;
+}
+
 int jit_sync_depth_cap()
 {
     return g_jit_sync_cap;
@@ -8581,6 +8597,12 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
         ML_CHECK(guard <= 100000);
         const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
         const NorecSite *S = jit_norec_site_for(ra);
+        /* #97 E2: the invariant the whole calling-frameless tier rests on
+         * - its window is on the native stack this unwind destroys, and
+         * no record can be made for it (jit_call_sync_boundary is what
+         * keeps a switch from ever getting here) */
+        ML_CHECK_MSG(!S || !S->frameless,
+                     "a SWITCH is materializing a FRAMELESS frame");
         if (idx && act.records[idx - 1].window == my_win) {
             /* RECORD-FUL: 4-iv's retarget - its sentinel consumer dies
              * with the -3 unwind, so its resume becomes the real one */
@@ -8776,7 +8798,8 @@ jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
 static int
 jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
                    int_type dst, int_type site_packed, bool cached,
-                   int_type resume_pc, const char *entry_rbp) noexcept
+                   int_type resume_pc, const char *entry_rbp,
+                   bool via_dispatch = false) noexcept
 {
     /* #88: CLAIM the baked call site (read + reset) before dispatching the
      * callee, which would otherwise overwrite it. */
@@ -8872,7 +8895,7 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
      * fragment-INLINE call path also uses - lever 1 step 5). A fragment
      * cannot C++-throw (machine-code frames are non-unwindable; every
      * helper it calls conveys), so the entry sits OUTSIDE the try. */
-    if (cck->sync_entry_off >= 0) {
+    if (cck->sync_entry_off >= 0 && !via_dispatch) {
         const size_t r =
             jit_enter_deep(static_cast<const char *>(cck->native.base)
                                + cck->sync_entry_off,
@@ -9000,6 +9023,43 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
  * CONSTRUCTION; a NotCallableEx (Runtime) conveys loc-less and the emit's
  * exc-stamp writes the same caret. The DEPTH CAP and the core's chunk-less
  * net remain declines (return 1) until the SWITCH-protocol step. */
+/*
+ * #97 E2: THE BOUNDARY CALL - a frameless frame's decline. A frameless
+ * frame's window is on the native stack, so the -3 SWITCH (which unwinds
+ * every native frame down to the nearest C++ one and turns each into a
+ * record) must never pass through it. This call is that C++ frame: the
+ * callee runs under a nested dispatch loop (the core's via_dispatch
+ * path), which consumes every switch below it and returns the value
+ * synchronously - never status 3.
+ *
+ * The depth is held at the CAP for the boundary's duration, so every
+ * sync call below it takes the switch (consumed here) and no frameless
+ * frame can form inside it: a second boundary cannot nest, and a chain
+ * that reached the cap or the native stack's floor continues in the flat
+ * interpreter, whose segment budget ends a runaway recursion in the
+ * catchable StackOverflowEx. Reached only from a frameless frame's
+ * declines (the cap, the floor, a guard) - cold.
+ */
+static int jit_call_sync_boundary(FuncObject &fo, int_type argbase,
+                                  int_type nargs, int_type dst,
+                                  int_type site_packed, bool cached,
+                                  int_type resume_pc) noexcept
+{
+#ifdef TESTS
+    g_jit_frameless_boundary++;
+#endif
+    const int saved = g_jit_sync_depth;
+    if (g_jit_sync_depth < g_jit_sync_cap)
+        g_jit_sync_depth = g_jit_sync_cap;
+    const int r = jit_call_sync_core(fo, argbase, nargs, dst, site_packed,
+                                     cached, resume_pc,
+                                     /*entry_rbp=*/nullptr,
+                                     /*via_dispatch=*/true);
+    g_jit_sync_depth = saved;
+    ML_CHECK_MSG(r != 3, "a boundary call propagated a SWITCH");
+    return r;
+}
+
 extern "C" int jit_call_sync(int_type callee_slot, int_type ab_n,
                              int_type resume_pc, int_type dst,
                              int_type site_packed, const void *lep) noexcept
@@ -9046,6 +9106,11 @@ extern "C" int jit_call_sync(int_type callee_slot, int_type ab_n,
      * can never walk a stale frame pointer. */
     const char *arbp = static_cast<const char *>(g_norec_switch_rbp);
     g_norec_switch_rbp = nullptr;
+    if (g_jit_nosw) {                      /* #97 E2: a frameless caller */
+        g_jit_nosw = 0;
+        return jit_call_sync_boundary(fo, argbase, nargs, dst, site_packed,
+                                      /*cached=*/false, resume_pc);
+    }
     if (g_jit_sync_depth >= g_jit_sync_cap)
         return jit_call_sync_switch(*ctx, *g_vm_act, fo, argbase, nargs,
                                     dst, site_packed, resume_pc,
@@ -9098,6 +9163,11 @@ extern "C" int jit_call_sync_cached(int_type callee_slot, int_type ab_n,
     /* 4-iv: consume the materializer anchor (see jit_call_sync) */
     const char *arbp = static_cast<const char *>(g_norec_switch_rbp);
     g_norec_switch_rbp = nullptr;
+    if (g_jit_nosw) {                      /* #97 E2: a frameless caller */
+        g_jit_nosw = 0;
+        return jit_call_sync_boundary(fo, argbase, nargs, dst, site_packed,
+                                      /*cached=*/true, resume_pc);
+    }
     if (g_jit_sync_depth >= g_jit_sync_cap)
         return jit_call_sync_switch(*ctx, *g_vm_act, fo, argbase, nargs,
                                     dst, site_packed, resume_pc,
@@ -9128,6 +9198,11 @@ extern "C" int jit_call_sync_value(int_type callee_temp, int_type ab_n,
     /* 4-iv: consume the materializer anchor (see jit_call_sync) */
     const char *arbp = static_cast<const char *>(g_norec_switch_rbp);
     g_norec_switch_rbp = nullptr;
+    if (g_jit_nosw) {                      /* #97 E2: a frameless caller */
+        g_jit_nosw = 0;
+        return jit_call_sync_boundary(fo, argbase, nargs, dst, site_packed,
+                                      /*cached=*/false, resume_pc);
+    }
     if (g_jit_sync_depth >= g_jit_sync_cap)
         return jit_call_sync_switch(*ctx, *g_vm_act, fo, argbase, nargs,
                                     dst, site_packed, resume_pc,
