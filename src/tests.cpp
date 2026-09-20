@@ -29467,16 +29467,25 @@ static bool jit_frameless_w2_shape()
                     "push rbp",
                     "mov rbp, rsp",
                     "push rbx",
-                    "push r1*",                  /* W4: capbase (r12-r15),
-                                                  * claimed for ONE access
-                                                  * in a W4 body */
+                    /* ⛔ W6: THE PARITY FILLER, WHERE W4's `push r13`
+                     * WAS. The base is CALLER-saved in a call-free body,
+                     * so it joins no save list - and the entry then has
+                     * an EVEN number of pushes, which `entry_pad` pays
+                     * for with 8 bytes so the cold raise exits (which
+                     * call before restoring rsp) stay 16-aligned. The
+                     * push/pop PAIR therefore becomes one filler plus
+                     * one fewer pop: the win is the POP, not both, and
+                     * this line is where that is stated. */
+                    "sub rsp, 8",
                     "lea rbx, [rbp+0x20]",       /* the caller's window */
                     "mov r8, [<addr>]@r11",      /* act */
                     "mov [r8+0x*], rbx",         /* vframe.slots */
                     "mov [r8+0x*], 3",           /* vframe.size = 3 */
                     "mov r1*, [rdx+0x*]",        /* W4: the capture data
                                                   * pointer from fo (rdx) -
-                                                  * ONE load, no ctx walk */
+                                                  * ONE load, no ctx walk.
+                                                  * W6: into r10/r11 now,
+                                                  * the caller-saved half */
                     "movabs rsi, <int-tag>@-",   /* the register-form
                                                   * singletons, off-arena */
                     "movabs r8, <float-tag>@-",
@@ -29513,8 +29522,11 @@ static bool jit_frameless_w2_shape()
                         "mov rax, [rbp+0x10]",
                         "mov [r9+0x*], rax",
                         "mov rax, -1",
-                        "lea rsp, [rbp-0x10]",   /* W4: rbx + capbase */
-                        "pop r1*",               /* capbase */
+                        /* W6: rbx ALONE - the caller-saved base is
+                         * pushed by nobody, so the restore is one slot
+                         * shallower and the `pop` that stood here is
+                         * the instruction per call this step buys */
+                        "lea rsp, [rbp-0x8]",
                         "pop rbx",
                         "pop rbp",
                         "ret" }, "W2 frameless arm") && ok;
@@ -40005,6 +40017,10 @@ static bool jit_counter_coverage()
         { "hoist",            &g_jit_hoist,            nullptr },
         { "hoist2",           &g_jit_hoist2,           nullptr },
         { "capbase",          &g_jit_capbase,          nullptr },
+        /* W6: the emit-time half - how many runs hold the base in the
+         * CALLER-saved file. Zero would mean the call-free gate never
+         * admits anything, i.e. the step is inert. */
+        { "capbase_cs",       &g_jit_capbase_cs,       nullptr },
         { "hoist_rmw",        &g_jit_hoist_rmw,        nullptr },
         { "fwd",              &g_jit_fwd,              nullptr },
         { "ffwd",             &g_jit_ffwd,             nullptr },

@@ -1274,7 +1274,23 @@ collision). Three nets now:
   follows", which `load_base` does not write; `base_needs_sib`'s
   ML_CHECK caught it on the first run, exactly as its own comment
   predicted it would the day a base came from an ALLOCATOR rather
-  than a literal),
+  than a literal.
+  ⛔ **W6 (2026-09-22): CALLEE-SAVED IS A CONDITION, NOT A PROPERTY
+  OF THE JOB.** It is what SURVIVES A CALL, paid for with a push at
+  `frag_entry` and a pop at every exit - and a FRAMELESS entry runs
+  PER CALL. A run that makes no call has nothing to survive, so its
+  base is claimed from the caller-saved half (a `prefer` mask, never
+  a capability: "caller-saved" is the ABSENCE of one) and joins no
+  save list. "Makes no call" is two halves: `jit_run_blocks_xcache`
+  refuses a MyLang CALL op statically (its emitter uses r8/r10/r11
+  raw, outside any bracket), and the HELPER half is bet
+  optimistically and settled from `n_prologues` after the run, with
+  one re-emission. The base then needs a LIVE RANGE - it ends at the
+  run's terminal ReturnV, whose arm uses caller-saved registers as
+  raw scratch - and `reg_holds_pin` reads it, so the establishing
+  loads must declare themselves MACHINERY. **`--xrot` found that
+  last part on its first run** (r11 at rotation 11; the default
+  rotation picks r10 and never meets the arm)),
   `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by

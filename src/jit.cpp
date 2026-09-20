@@ -162,6 +162,9 @@ unsigned long g_jit_peep_depbrk = 0;   /* #101: cvtsi2sd merge-dep
 unsigned long g_jit_rax_retries = 0;   /* Phase A: conflict re-emissions */
 unsigned long g_jit_step_imm = 0;      /* #96: pinned counted-loop steps */
 unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
+unsigned long g_jit_capbase_cs = 0;    /* W6: runs holding the capture
+                                        * base in a CALLER-saved
+                                        * register (no entry push) */
 unsigned long g_jit_capbase = 0;       /* #112: runs entering with the
                                         * capture base pinned */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
@@ -1307,6 +1310,26 @@ static constexpr int gp_weight(uint8_t r)
 }
 
 /*
+ * W6: the caller-saved half of the ALLOCATABLE file, as a `prefer`
+ * mask. Deliberately NOT a capability bit: a capability says what a
+ * register CAN DO, and "caller-saved" is the ABSENCE of one - asking
+ * for it would invert the superset relation the whole model rests on.
+ * A caller that knows its run makes no call passes this to bias the
+ * pick, because the weight above prices callee-saved as the cheaper
+ * kind and that pricing assumes a call. DERIVED from gp_caps, like
+ * every other register fact in this file.
+ */
+static constexpr uint32_t gp_caller_saved_mask()
+{
+    uint32_t m = 0;
+    for (uint8_t r = 0; r < 16; r++)
+        if ((gp_caps(r) & CAP_ALLOCATABLE)
+                && !(gp_caps(r) & CAP_CALLEE_SAVED))
+            m |= 1u << r;
+    return m;
+}
+
+/*
  * C2 (plans/register-allocator-endgame.md): THE FLOAT FILE joins the
  * model. Which xmm registers may the allocator hand out?
  *
@@ -2272,6 +2295,23 @@ struct Emitter {
      */
     int capbase = -1;
     /*
+     * W6: is the capture base still LIVE? The register is claimed for
+     * the run, but its last READER is the run's last capture access -
+     * and the RETURN ARM, emitted for the terminal ReturnV, uses
+     * caller-saved registers as raw scratch. That is harmless (every
+     * path out of the arm leaves the fragment, and the next call
+     * re-establishes the base at the entry), but the D3 tracker judges
+     * a write by whether the register is live, so it has to be TOLD.
+     * A frameless run's last op IS that ReturnV (the F1 gate), so the
+     * range ends exactly there - and a back edge cannot re-enter a
+     * capture access from past it, since nothing follows it.
+     * ⛔ Found by `corpus_diff --xrot`: at rotation 11 the base lands
+     * in r11, which the arm writes. The default rotation picks r10 and
+     * never met it - the pool-tail blindness CLAUDE.md names, caught by
+     * the axis built for exactly that.
+     */
+    bool capbase_live = false;
+    /*
      * #97 inc 3 (W4): this run's capture base came from the FuncObject
      * at a frameless entry and MUST NOT be refreshed from ctx: under W4
      * ctx.captures still names the CALLER's captures for the whole call
@@ -3133,6 +3173,16 @@ struct Emitter {
      * reachable the moment r8 joined the pool. */
     bool reg_holds_pin(uint8_t r) const
     {
+        /* W6: the CAPTURE BASE counts. While it was always
+         * callee-saved this could not matter - raw scratch is
+         * caller-saved - but a call-free run now holds it in the
+         * volatile file, and the ~80 emitters that name r9/r10/r11
+         * literally declare their clobber through `scratch(r)`, which
+         * asks exactly this. Answering "no" there would be a silent
+         * clobber of the base every capture access reads. */
+        if (capbase >= 0 && capbase_live
+                && static_cast<uint8_t>(capbase) == r)
+            return true;
         for (const CacheEnt &c : cache)
             if (c.reg == r)
                 return true;
@@ -7504,8 +7554,14 @@ static void emit_call_epilogue(Emitter &e)
      * early return carried the poison type into the C3 audit). So it is
      * gated, and the gate IS the test that fails with the refresh on.
      */
-    if (!e.capbase_fixed)
+    if (!e.capbase_fixed) {
+        /* W6: MACHINERY, like the run head's copy - the walk writes the
+         * base register, and the model now knows that register is live
+         * (reg_holds_pin), so an undeclared write to it is what the D3
+         * tracker aborts on. */
+        Emitter::PinMach pm(e);
         e.capbase_load();
+    }
     if (g_hoist.active) {
         /*
          * Re-derive via RCX - RAX carries the helper's status, which
@@ -7658,6 +7714,16 @@ static void jit_assert_no_volatile_pin(const Emitter &e)
         ML_CHECK_MSG(jit_reg_is_callee_saved(e.cache[i].reg),
                      "a caller-saved pin reached a raw-scratch call "
                      "emitter - see jit_run_blocks_xcache");
+    /* W6: and the CAPTURE BASE, which is not in `cache` and is
+     * caller-saved in a call-free run. Its own gate is the same
+     * `jit_run_blocks_xcache`, so reaching here with a volatile base
+     * means that gate was not asked - the failure this check exists
+     * to name rather than to leave as a corrupted capture read. */
+    ML_CHECK_MSG(e.capbase < 0
+                     || jit_reg_is_callee_saved(
+                            static_cast<uint8_t>(e.capbase)),
+                 "a caller-saved CAPTURE BASE reached a raw-scratch "
+                 "call emitter - see jit_run_blocks_xcache (W6)");
 }
 
 /* Re-raise DELETABILITY: the op's own LocEntry (`&ck.locs[i]`, a stable
@@ -12760,6 +12826,11 @@ void jit_stats_report()
         { "cold_copy",        &g_jit_cold_copy },
         { "hoist2",           &g_jit_hoist2 },
         { "capbase",          &g_jit_capbase },
+        /* W6: how many of those hold it CALLER-saved, which is the
+         * emit-time reach of the entry push/pop elision (compile-time,
+         * so it counts RUNS, not calls - `capbase` above is bumped by
+         * emitted code and counts entries) */
+        { "capbase_cs",       &g_jit_capbase_cs },
         { "hoist_rmw",        &g_jit_hoist_rmw },
         /* #96: the two halves of the element tier's REGISTER supply -
          * how often the plan ran out (elem_noreg, an emit-time decline
@@ -25946,6 +26017,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * (patched from label[] after) or exit_pc; a trailing exit_pc handles
      * fall-through off the end. */
     int rax_retried = 0;
+    /* W6: the capture base was claimed CALLER-saved on the bet that the
+     * run emits no bracketed call; set when the bet loses, and read by
+     * the claim on the one re-emission that follows. A bool that only
+     * ever goes false -> true, so it bounds the loop by itself. */
+    bool capbase_cs_forced = false;
     g_jit_pins_denied = 0;
 retry_emission:
     /* Phase A: the one-shot re-emission after a rax-pin conflict. The
@@ -25993,6 +26069,7 @@ retry_emission:
         e.flits.clear();        /* C4b: per-RUN (a stale entry would let
                                  * the next fragment read a register it
                                  * never loaded - the C2a fcache bug) */
+        e.capbase_live = false;  /* W6: with it */
         e.capbase = -1;         /* #112: per-RUN, same reasons - a stale
                                  * capture base would let the next
                                  * fragment read a register it never
@@ -26868,11 +26945,62 @@ retry_emission:
              * onto `e.saved` (frag_entry's push list) is only correct
              * for a callee-saved register. An unstated requirement
              * satisfied by a list's contents is exactly what this
-             * change is deleting, so it is stated. */
-            const int cb = e.ra.take(CAP_ALLOCATABLE | CAP_MEM_BASE
-                                     | CAP_CALLEE_SAVED);
-            if (cb >= 0)
+             * change is deleting, so it is stated.
+             *
+             * ⛔ W6 (#97 inc 3): AND THE REQUIREMENT IS CONDITIONAL.
+             * Callee-saved is what SURVIVES A CALL, and the cost model
+             * prices it accordingly (gp_weight gives it the discount)
+             * - but the price of the discount is a push at frag_entry
+             * and a pop at every exit, and for a FRAMELESS callee
+             * frag_entry runs PER CALL. A run that emits no call has
+             * nothing to survive, so there the relation inverts: a
+             * caller-saved base is strictly cheaper, by exactly the
+             * push/pop pair (the two of W4's eight it did not
+             * recover).
+             *
+             * "Emits no call" is decided in two halves, because the
+             * two kinds of call differ in what they clobber:
+             *  - a MyLang CALL op's emitter uses r8/r10/r11 as RAW
+             *    scratch OUTSIDE any bracket, so no spill could save
+             *    the base from it: `jit_run_blocks_xcache` refuses
+             *    those runs STATICALLY, the same gate the caller-saved
+             *    pin pool already asks;
+             *  - a HELPER call is bracketed (emit_call_prologue), and
+             *    a bracket is also exactly where #112's refresh would
+             *    have to restore the base - which under W4 would read
+             *    the CALLER's captures. That half cannot be known
+             *    before the run is emitted, so it is decided
+             *    OPTIMISTICALLY and VERIFIED from `n_prologues` after
+             *    the run, with a one-shot re-emission (the rax-conflict
+             *    shape). An unbracketed call on an EXIT path is
+             *    harmless by construction: the path returns, and a
+             *    base that is never popped needs no value.
+             *
+             * `prefer` is what actually moves the pick: without
+             * CAP_CALLEE_SAVED the scan would still choose r12-r15,
+             * since the cost model's discount is written for the
+             * call-bearing case. */
+            const bool cb_volatile_ok =
+                w4_run && !capbase_cs_forced
+                && !jit_run_blocks_xcache(chunk, begin, end);
+            /* ⛔ AND NOT RAX. It is the accumulator `acc_take` hands
+             * out by NAME and the status every call site tests after a
+             * helper call, so a value that must survive the whole run
+             * cannot live there. CAP_CALLEE_SAVED excluded it for free
+             * while the base was callee-saved; asking the caller-saved
+             * half puts it back in the running as the LAST preference
+             * (weight 8), which is exactly where a run under pressure
+             * lands - the nolowmem lane, whose tag singletons occupy
+             * two more registers, found it on its first run. */
+            const int cb = e.ra.take(
+                CAP_ALLOCATABLE | CAP_MEM_BASE
+                    | (cb_volatile_ok ? 0u : CAP_CALLEE_SAVED),
+                /*prefer=*/cb_volatile_ok ? gp_caller_saved_mask() : 0u,
+                /*exclude=*/1u << RAX);                /* reg:proto */
+            if (cb >= 0) {
                 e.capbase = cb;
+                e.capbase_live = true;
+            }
         }
         /* W4: decided here, once (Chunk::frameless_capbase's contract) */
         chunk.frameless_capbase =
@@ -26883,9 +27011,20 @@ retry_emission:
             e.saved.push_back(static_cast<uint8_t>(pair_lo));
             e.saved.push_back(static_cast<uint8_t>(pair_hi));
         }
-        if (e.capbase >= 0)       /* #112: callee-saved, so frag_entry
-                                   * pushes it and frag_ret pops it */
+        /* #112: a CALLEE-saved base is pushed by frag_entry and popped
+         * by frag_ret; W6's caller-saved one joins neither list, which
+         * IS the win. `e.saved`'s stated rule - only a callee-saved
+         * register belongs here - decides it, so the two cannot
+         * disagree about which registers the entry saves. */
+        if (e.capbase >= 0
+                && jit_reg_is_callee_saved(static_cast<uint8_t>(e.capbase)))
             e.saved.push_back(static_cast<uint8_t>(e.capbase));
+#ifdef TESTS
+        if (e.capbase >= 0
+                && !jit_reg_is_callee_saved(static_cast<uint8_t>(e.capbase)))
+            g_jit_capbase_cs++;              /* W6 reach, emit-time */
+#endif
+        const size_t cb_prologues0 = e.n_prologues;   /* W6: the verify */
 
         /* C5: which ref-listed temps each loop preheader releases, and
          * where each release is still in force. Picked BEFORE any op is
@@ -26971,8 +27110,19 @@ retry_emission:
         /* #112: walk the ctx chain ONCE for the run. After the pin
          * loads because the walk goes through capbase alone and touches
          * nothing they need; before any op, so it dominates every
-         * access (the back edge jumps to the first op below). */
-        e.capbase_load();
+         * access (the back edge jumps to the first op below).
+         *
+         * W6: declared as MACHINERY, like every other entry load. The
+         * walk WRITES the base register, and since the register model
+         * learned that the base is live (reg_holds_pin), an undeclared
+         * write to it is exactly what the D3 tracker aborts on - it
+         * cannot tell "the load that establishes it" from "an emitter
+         * clobbering it". `establish`'s own copy of this load is
+         * already inside its PinMach for the same reason. */
+        {
+            Emitter::PinMach pm(e);
+            e.capbase_load();
+        }
         /* #96 inc-2: the stubs need the cache state AS OF their pc -
          * base + the seams at or before it - and e.cache at stub-
          * emission time is the post-all-seams FINAL state. */
@@ -27976,6 +28126,12 @@ retry_emission:
             label[pc - begin] = e.pos();
             lbl_sig[pc - begin] = cache_sig();
             e.released = rel_active[pc - begin];
+            /* W6: the capture base's live range ends at the run's LAST
+             * op - the terminal ReturnV of a frameless run - whose arm
+             * uses caller-saved registers as raw scratch. See
+             * Emitter::capbase_live for why that is sound. */
+            if (pc + 1 == end)
+                e.capbase_live = false;
             emit_one(pc, /*in_cold=*/false, end);
             /* every fixup this op appended sees the op's own state */
             if (fix_sigs.size() < fixups.size())
@@ -27983,6 +28139,35 @@ retry_emission:
         }
         g_hoist.active = false;
         g_hoist2.active = false;
+        /*
+         * W6: THE BET, SETTLED. A caller-saved capture base is sound
+         * only while nothing in the run clobbers it, and a BRACKETED
+         * call does - `emit_call_prologue` is both the one place a
+         * helper call is made from and the place #112's refresh would
+         * have had to restore the base from ctx (which a W4 run may
+         * not read: those are the CALLER's captures). `n_prologues`
+         * counts exactly those brackets, so the bet is settled by
+         * arithmetic rather than by an opcode list that could go
+         * stale. Losing it costs ONE re-emission, the rax-conflict
+         * shape; an unbracketed call is on an exit path, which returns
+         * without reading a capture again.
+         */
+        if (e.capbase >= 0
+                && !jit_reg_is_callee_saved(
+                       static_cast<uint8_t>(e.capbase))
+                && e.n_prologues != cb_prologues0
+                && !capbase_cs_forced) {
+            capbase_cs_forced = true;
+            g_hoist = JitHoist{};
+            g_hoist2 = JitHoist{};
+            chunk.call_caches.clear();
+            chunk.norec_sites.clear();
+            chunk.arg_stage_pools.clear();
+#ifdef TESTS
+            g_jit_capbase_cs--;         /* the claim that did not stand */
+#endif
+            goto retry_emission;
+        }
         if (e.pin_conflicts & ~g_jit_pins_denied) {
             /* Phase A/B2c: a pin met a conflicting emission event
              * (call bracket / accumulator ask / raise-path reuse /
@@ -28340,8 +28525,10 @@ retry_emission:
              * capture base currently has an entry stub; it is here for
              * the day one does, when its absence would be a read
              * through a garbage pointer rather than a wrong number. */
-            if (!(frameless && chunk.frameless_capbase))
+            if (!(frameless && chunk.frameless_capbase)) {
+                Emitter::PinMach pm(e);   /* W6: machinery, as above */
                 e.capbase_load();                 /* #112 capture base */
+            }
         };
 
         /* PER-PC ENTRY STUBS (post-call resume): an interior offset cannot

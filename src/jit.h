@@ -1454,6 +1454,9 @@ extern "C" unsigned long g_jit_hoist2;        /* C2b: second-base preheader
 extern "C" unsigned long g_jit_capbase;       /* #112: fragment entries with
                                                * ctx->captures->data() pinned
                                                * for the run */
+extern "C" unsigned long g_jit_capbase_cs;    /* W6: runs whose capture base
+                                               * is CALLER-saved (a call-free
+                                               * run: no entry push/pop) */
 extern "C" unsigned long g_jit_telide;        /* C3: type-elided fragment
                                                * entries */
 extern "C" unsigned long g_jit_fread;         /* C4a-i: float read-dispatch
