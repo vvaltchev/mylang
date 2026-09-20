@@ -648,6 +648,13 @@ extern unsigned long g_jit_frameless_init_free; /* inc 3 W3 (emit-time):
  * lands in one of its lifecycle ops, all of which abort.
  */
 const void *jit_poison_type();
+#ifdef TESTS
+/* W4 (TESTS): the CaptureSlots a W4 site installs as ctx.captures - 64
+ * slots whose type word is jit_poison_type; see vm.cpp */
+const void *jit_poison_captures();
+#endif
+extern unsigned long g_jit_frameless_capbase;   /* W4 (emit-time): sites
+                                                 * that skip the repoint */
 
 /*
  * Call a compiled fragment (frameless: slots base in, resume pc out).
@@ -946,6 +953,12 @@ extern "C" void jit_store_global(int_type gslot, const EvalValue *src) noexcept;
  * `cap OP= v` runs num_bin_op, stays interpreted). */
 extern "C" void jit_store_capture(int_type cap_slot,
                                   const EvalValue *src) noexcept;
+/* #97 inc 3 W4: the BASE-RELATIVE twins for a run holding capbase - the
+ * helper reads the array the register names, never ctx->captures */
+extern "C" void jit_load_capture_at(int_type dst, const LValue *base,
+                                    int_type idx) noexcept;
+extern "C" void jit_store_capture_at(LValue *base, int_type cap_slot,
+                                     const EvalValue *src) noexcept;
 
 /* model-flip (nativize-ops): the native LoadGlobalV read `frame[dst] =
  * gfuncs->slots[gslot]`. Returns 0 on success; 1 to BAIL (the global is

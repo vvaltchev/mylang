@@ -28345,11 +28345,16 @@ static bool jit_frameless_w2_shape()
                     "push rbp",
                     "mov rbp, rsp",
                     "push rbx",
-                    "sub rsp, 8",
+                    "push r1*",                  /* W4: capbase (r12-r15),
+                                                  * claimed for ONE access
+                                                  * in a W4 body */
                     "lea rbx, [rbp+0x20]",       /* the caller's window */
                     "mov r8, [<addr>]@r11",      /* act */
                     "mov [r8+0x*], rbx",         /* vframe.slots */
                     "mov [r8+0x*], 3",           /* vframe.size = 3 */
+                    "mov r1*, [rdx+0x*]",        /* W4: the capture data
+                                                  * pointer from fo (rdx) -
+                                                  * ONE load, no ctx walk */
                     "movabs rsi, <int-tag>@-",   /* the register-form
                                                   * singletons, off-arena */
                     "movabs r8, <float-tag>@-",
@@ -28386,7 +28391,8 @@ static bool jit_frameless_w2_shape()
                         "mov rax, [rbp+0x10]",
                         "mov [r9+0x*], rax",
                         "mov rax, -1",
-                        "lea rsp, [rbp-0x8]",
+                        "lea rsp, [rbp-0x10]",   /* W4: rbx + capbase */
+                        "pop r1*",               /* capbase */
                         "pop rbx",
                         "pop rbp",
                         "ret" }, "W2 frameless arm") && ok;
@@ -28428,7 +28434,13 @@ static bool jit_frameless_w2_shape()
                     "lea rcx, [rbx+0x*]",        /* dst|1 */
                     "push rcx",
                     "push [r9+0x*]",             /* the caller's captures */
-                    "lea rax, [rdx+0x*]",        /* ctx.captures = callee's */
+                    /* W4: no `lea rax, [rdx+0x10]; mov [r9+caps], rax`
+                     * repoint - the callee takes its base from rdx. In
+                     * this TESTS build the POISON captures are stored
+                     * there instead (jit_poison_captures); the release
+                     * form, with nothing at all between the push and
+                     * the call, is pinned by tests/driver_checks.sh */
+                    "movabs rax, <addr>",        /* jit_poison_captures */
                     "mov [r9+0x*], rax",
                     "call <helper>",             /* the frameless entry */
                     "cmp rax, -1",
@@ -28572,6 +28584,118 @@ static bool jit_frameless_w3_shape()
     if (g_jit_frameless_init_free == 0) {
         fprintf(stderr, "jit_frameless_w3_shape: frameless_init_free "
                         "never bumped\n");
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 increment 3, W4 - THE CAPTURE BASE FROM THE SITE. Read from the
+ * dump (a TESTS build, so the site's repoint is replaced by the POISON
+ * store - jit_poison_captures - where the release build emits nothing;
+ * the release form is pinned by tests/driver_checks.sh):
+ *  - a callee with NO captures (76's shape): the site pushes the
+ *    caller's captures into the residue and does NOT repoint - the
+ *    two instructions after the push are the poison store, then the
+ *    call; the entry claims no base;
+ *  - a closure whose capture holds a REFERENCE (a dyn string): the
+ *    read's helper arm passes the BASE REGISTER (`mov rsi, r1*`) to
+ *    jit_load_capture_at and the store's arm `mov rdi, r1*` to
+ *    jit_store_capture_at - neither helper reads ctx->captures;
+ *  - a FACTORY (a MakeClosureV body) DECLINES: its site keeps the
+ *    `lea rax, [rdx+fo.capture_slots]; mov [r9+caps], rax` repoint,
+ *    because jit_make_closure snapshots through ctx.
+ * (The int-capture closure - 78's shape - is pinned in the W2 test:
+ * the entry's `mov r1*, [rdx+0x10]` and the site's poison store.)
+ */
+static bool jit_frameless_w4_shape()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    std::string d76, dref, dfac;
+    try {
+        d76 = native_dump_of({
+            "func add_op(st, x) { st[0] = st[0] + x; }",
+            "func sub_op(st, x) { st[0] = st[0] - x; }",
+            "var ops = [add_op, sub_op];",
+            "var st = [0];",
+            "var N = int(runtime(40));",
+            "for (var i = 0; i < N; i++) { var fn = ops[i % 2]; fn(st, i); }",
+            "print(st[0]);" });
+        dref = native_dump_of({
+            "func mk(dyn s) { return func [s] (dyn k) { return s + k; }; }",
+            "func mkc(dyn s) { return func [s] (dyn k) {",
+            "  s = s + k; return s; }; }",
+            "var f = mk(\"ab\"); var g = mkc(\"x\");",
+            "var n = 0;",
+            "for (var i = 0; i < runtime(30); i++) {",
+            "  n = n + len(f(\"cd\")) + len(g(\"y\")); }",
+            "print(n, g(\"\"));" });
+        dfac = native_dump_of({
+            "func mk(int z) { return func [z] (int k) { return k + z; }; }",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(40); i++) {",
+            "  var g = mk(i); s = s + g(1); }",
+            "print(s);" });
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_frameless_w4_shape: threw %s: %s\n", e.name,
+                e.msg);
+        return false;
+    }
+    bool ok = true;
+    {
+        /* 76: no captures - the site after the residue push */
+        const std::vector<NativeIns> mn = native_ins_of(d76, "main");
+        const size_t at = native_find_seq(mn, 0, {
+            "push [r9+0x*]", "movabs rax, <addr>", "mov [r9+0x*], rax",
+            "call <helper>" });
+        if (at == std::string::npos) {
+            fprintf(stderr, "jit_frameless_w4_shape: 76's site does not "
+                            "push the residue and go straight to the "
+                            "call (poison form)\n");
+            ok = false;
+        }
+        if (native_find(mn, 0, "lea rax, [rdx+0x*]") != std::string::npos) {
+            fprintf(stderr, "jit_frameless_w4_shape: 76's main still "
+                            "repoints ctx.captures somewhere\n");
+            ok = false;
+        }
+    }
+    {
+        /* the reference capture: both helper arms take the base */
+        const std::vector<NativeIns> cl = native_ins_of(dref, "closure#1");
+        const size_t rd = native_find_seq(cl, 0, {
+            "mov edi, 1", "mov rsi, r1*", "mov edx, 0", "call <helper>" });
+        const size_t st = native_find_seq(cl, 0, {
+            "lea rdx, r2", "mov esi, 0", "mov rdi, r1*", "call <helper>" });
+        if (rd == std::string::npos || st == std::string::npos) {
+            fprintf(stderr, "jit_frameless_w4_shape: the reference "
+                            "capture's helper arms do not pass the base "
+                            "register (read %s, store %s)\n",
+                    rd == std::string::npos ? "missing" : "ok",
+                    st == std::string::npos ? "missing" : "ok");
+            ok = false;
+        }
+    }
+    {
+        /* the factory declines: its site repoints */
+        const std::vector<NativeIns> mn = native_ins_of(dfac, "main");
+        if (native_find_seq(mn, 0, { "push [r9+0x*]", "lea rax, [rdx+0x*]",
+                                     "mov [r9+0x*], rax" })
+                == std::string::npos) {
+            fprintf(stderr, "jit_frameless_w4_shape: the factory's site "
+                            "(a MakeClosureV body) should keep the "
+                            "ctx.captures repoint\n");
+            ok = false;
+        }
+    }
+    if (g_jit_frameless_capbase == 0) {
+        fprintf(stderr, "jit_frameless_w4_shape: frameless_capbase never "
+                        "bumped\n");
         ok = false;
     }
     return ok;
@@ -29015,6 +29139,50 @@ static bool jit_frameless_call_reach()
             "var s = 0;",
             "for (var i = 0; i < runtime(8); i++) s = s + fd(i);",
             "print(s);" }, "", 5, true },
+        /* #97 inc 3, W4: ctx.captures is left the CALLER's (a TESTS site
+         * installs the poison captures - any read of it aborts by name) */
+        { "W4: a REFERENCE capture read and written through the "
+          "base-relative helper arms (jit_load/store_capture_at)", {
+            "func mk(dyn s) { return func [s] (dyn k) { return s + k; }; }",
+            "func mkc(dyn s) { return func [s] (dyn k) {",
+            "  s = s + k; return s; }; }",
+            "var f = mk(\"ab\"); var g = mkc(\"x\");",
+            "var n = 0;",
+            "for (var i = 0; i < runtime(30); i++) {",
+            "  n = n + len(f(\"cd\")) + len(g(\"y\")); }",
+            "print(n, g(\"\"));" },
+          "615 xyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy \n", 60, false },
+        { "W4: a FACTORY called framelessly in a loop declines W4 (its "
+          "MakeClosureV snapshots through ctx) and each closure it "
+          "returns reads ITS OWN capture through the base", {
+            "func mk(int z) { return func [z] (int k) { return k + z; }; }",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(40); i++) {",
+            "  var g = mk(i); s = s + g(1); }",
+            "print(s);" }, "820 \n", 40, false },
+        { "W4: a NESTED closure capturing a CAPTURE - the outer body's "
+          "MakeClosureV reads ctx (declines), the inner reads its base", {
+            "func mk(int a) {",
+            "  return func [a] (int b) { return func [a, b] (int c) {",
+            "    return a * 100 + b * 10 + c; }; }; }",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(20); i++) {",
+            "  var f = mk(i % 3); var h = f(i % 4); s = s + h(i % 5); }",
+            "print(s);" }, "2240 \n", 20, false },
+        /* (a `c++` STATEMENT on a proven-int capture lowers to a plain
+         * add and store - a W4 body; the IncDecCheckedV shape needs the
+         * UNTYPED capture 11's counter has, which the checked inc/dec
+         * keeps as a helper that reads ctx - so this body declines) */
+        { "W4: a checked inc/dec on an untyped capture declines "
+          "(jit_incdec_checked reads ctx->captures; 11's counter shape)", {
+            "func mk(start) => func [start] {",
+            "    start++;",
+            "    return start;",
+            "};",
+            "var ctr = mk(runtime(5));",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(30); i++) { s = s + ctr(); }",
+            "print(s);" }, "615 \n", 30, false },
         { "W2: a pinned int sibling next to a dyn STRING into an int "
           "param - the decline trampoline materialises BOTH into the run "
           "(the pin from its register) before the C++ tier raises", {
@@ -41441,6 +41609,11 @@ static const std::vector<extra_check> extra_checks =
       "window slot UNINITIALISED (poisoned in this build): a kept "
       "t_none immediate beside two poisoned slots, read from the dump",
       jit_frameless_w3_shape },
+    { "jit: #97 inc 3 (W4) - the capture base from the site: a "
+      "capture-free callee's site goes from the residue push to the "
+      "call, a reference capture's helper arms take the base register, "
+      "a factory (MakeClosureV) keeps the repoint - read from the dump",
+      jit_frameless_w4_shape },
     { "jit: #97 inc 3 (W3) - the raw whitelist is a subset of "
       "op_writes_scalar (the ref-listed exclusion's redundancy, pinned at "
       "the opcode level)",
