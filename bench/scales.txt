@@ -94,3 +94,5 @@
 91_call_from_function    6
 92_recursion_with_helper 5
 93_mutual_recursion      8
+94_builtin_in_helper     3
+95_recursion_with_builtin 4
