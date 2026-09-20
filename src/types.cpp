@@ -552,6 +552,17 @@ inline auto make_builtin_lv(const char *name)
     return make_pair(UniqueId::get(name), LValue(b, false));
 }
 
+/* The DEV-ONLY twin of make_builtin_lv (refcount): the same lvalue ABI on
+ * both engines, plus the name recorded in g_dev_builtin_ids so a SCRIPT
+ * call is a compile-time error - the instrument is for the harnesses. */
+template <decltype(Builtin::func_lv) FLV>
+inline auto make_dev_builtin_lv(const char *name)
+{
+    auto p = make_builtin_lv<FLV>(name);
+    g_dev_builtin_ids.insert(p.first);
+    return p;
+}
+
 /* Custom-func mutating registration (append/push): NON-const analogue of
  * make_const_builtin_lv. `f` is a CUSTOM tree-walker `func` (not the generic
  * adapter) - append/push need it so construct-in-place (which needs the ctor
@@ -706,6 +717,8 @@ EvalContext::SymbolsType EvalContext::builtins =
     /* show() is a DEV-ONLY builtin (it decompiles the AST): available in the
      * REPL / tests, a compile-time error in a script (use :show at the REPL). */
     make_dev_builtin("show", builtin_show),
+    /* refcount() is DEV-ONLY too: the use_count of a reference, in place */
+    make_dev_builtin_lv<builtin_refcount>("refcount"),
 
     /* Diagnostic tracing (see trace.h) */
     make_builtin_v<builtin_trace>("trace"),

@@ -12140,3 +12140,222 @@ a cache probe, five gates and a per-argument load-test-compare loop
 to ~7x - the remaining ~100 Ir per call on the caller side is the sync
 push itself: the window, the record-less site bookkeeping, the argument
 round trip, the result copy. That is increment 2.
+
+## #97 increment 2 - THE FRAMELESS CALLEE: a named leaf runs on a native-
+## stack window, and the site that reaches it pushes no record, no window,
+## no fork (2026-09-19)
+
+**THE SUBJECT.** After 1c, ~100 Ir of every call to a named leaf was
+activation bookkeeping the callee never used: the segment fit and
+bump, the record or its record-less fork, the residue's fo/desc
+spills, the window fill on the caller side; the record-less return
+arm's three-load discrimination, its segment give-back and vframe
+repoint on the callee side. A LEAF that is FULLY NATIVE (every op
+conveys with a baked caret, nothing bails - `frameless_ok`,
+increment F1's gate) cannot resume through the interpreter and cannot
+be an ancestor of anything, so none of that is needed: the callee can
+carve its own window on the NATIVE STACK and the site can hand it the
+argument run.
+
+**THE PROTOCOL, in six micro-steps (F1-F6), every one landed green
+before the next:**
+
+ - **F1** the gate is `op_fully_native` for every op plus a terminal
+   ReturnV (a frameless frame has no vframe to resume on - a BAIL exit
+   would be a resume with no frame);
+ - **F2** the callee's FRAMELESS ENTRY - a second prologue sharing the
+   body: `frag_entry` (so `[rbp-8]` is still the caller's window and
+   every spill home keeps its offset), `sub rsp, N*48; mov rbx, rsp`,
+   the argument bind from rdi (the caller's RUN), every other slot's
+   type word AND container/flag tail initialised (below), the vframe
+   pointed at the window, `establish()` (the head's register contract),
+   `jmp` to the first op;
+ - **F3** the residue's dst word carries BIT 0 for a frameless frame:
+   the C++ decline tier (`jit_ret_norec`) and the raise arm
+   (`vm_raise`'s norec_raiser branch) read it to skip the segment
+   give-back a frameless frame never took;
+ - **F4** the SITE: for a `bake_final` callee (main's calls - main is
+   compiled last, so every callee it names is placed) that is
+   `frameless_ok`, has an entry emitted, is not cached and not fused,
+   with the record-less arm on: push `[dst|1]`, push `[ctx.captures]`
+   straight from ctx, repoint ctx.captures at the callee's, `lea rdi,
+   [run]`, a DIRECT `call rel32` into the entry (the reloc finalizer
+   trampolines an out-of-range one), then `cmp rax, -1`; the sentinel
+   path drops the residue and repoints the vframe (slots + size); the
+   exception path parks the pushed captures in the relay, stamps the
+   site and calls `jit_frameless_postexit` (no release, no segment
+   adjust) before `exit_pc`. NO depth guard (a leaf cannot nest), no
+   `mov r8, [act]` / `cck` load (dead on this tail);
+ - **F5** the walkers need NO change, structurally: a frameless frame
+   is a leaf, so it is only ever the INNERMOST frame - never on a chain
+   a reconstruction, a materialiser or the shadow walk traverses. The
+   nets were re-run to prove it rather than argued (below);
+ - **F6** the callee's FRAMELESS RETURN ARM, told apart FIRST and with
+   NO LOAD: `cmp rbx, rsp; je` - the window IS the stack top (rsp is
+   call-ready at every terminator; a segment window is a heap address).
+   The arm: dst from `[rbp+24]` masked, the old dst's type test, an
+   UNLISTED result copied as payload + type word (trivial by the
+   ref_slots invariant - not four qwords), the release scan, captures
+   from `[rbp+16]`, `mov rax,-1; ret`. No vframe store (the caller's
+   job on this protocol), no bit test, no top_rec reads. The arm and
+   the entry are emitted only for a chunk MAIN NAMES FRAMELESSLY
+   (`Chunk::frameless_wanted`, a pre-pass over main's code with the
+   same `JitCtx` main will be jitted with, in both jit sequences) - a
+   frameless_ok callee that is never called that way keeps its return
+   path byte-identical (76_funcval_dispatch had paid +2 Ir per return
+   for a `cmp/je` it never took).
+
+**THE SHARED PREDICATE.** `jit_frameless_callee(ck, old_pc, in, &why)`
+answers "will this call be a frameless site" from emit-time facts alone
+(the baked callee, main as the caller, the callee placed and started
+native, arity, `bind_req` derived, `frameless_ok`, an entry emitted,
+the levers), and THREE consumers ask it: the #162 fusion decision (a
+fused argument has no run slot, and the frameless entry copies the
+RUN - so a call that will go frameless keeps its staging moves; the
+frameless saving is an order of magnitude the fusion's), the depth
+guard, and the push, which ML_CHECKs that its own `bake` agrees. Two
+copies of the decision would have been the audit-table trap with a
+pointer read on the losing side (watched: `brw(arr, i)` was fused and
+declined the tier as "a fused argument" until the fusion asked first).
+
+**FOUR THINGS THE FIRST VERSION GOT WRONG, each a real test failure:**
+
+ 1. **A raw copy of a reference argument is a use-after-free.** The
+    push's copy loop BINDS a reference (retain, or #94's borrow); the
+    entry copied bytes. The callee's release scan then dropped a count
+    it never took - `jit_ret_inline_c4c`'s `h(arr, n)`, ASan. The entry
+    binds now, with every question answered at emit time by the callee
+    that is being compiled: `binds_scalar()` -> payload + type (or the
+    tag as an immediate for a DECLARED int/float, whose bind coercion
+    the 1c checks guarantee - a PROVEN param may hold a bool under `i`,
+    so its tag must travel); ref-listed -> the type test and
+    `jit_bind_ref_arg` with `can_borrow` a constant.
+ 2. **A native-stack window is raw memory; a segment slot never is.**
+    `LValue::put` reads `container` and `borrowed`, `rebind` reads the
+    old value's TYPE, the release scan reads every listed slot's type -
+    and a segment window is constructed once with every tail clean.
+    So the entry initialises the tail (+32/+40) of EVERY non-argument
+    slot and the type word (`t_none`) of every one, plus the type word
+    of a reference parameter before its bind (its rebind destroys the
+    old value first). Three crashes found it: the dyn-arithmetic
+    helper's put (UBSan on `borrowed`), the bind's rebind (a garbage
+    Type* into code bytes), the container test's boxed call.
+ 3. **The exit epilogue must release the window's references BEFORE
+    frag_ret gives the stack back.** The record-less postexit releases
+    from the vframe, which still points at a live segment window; a
+    frameless window is gone after the teardown. So `emit_epilogues`
+    takes a `pre_ret` hook: for a chunk with a frameless entry, the
+    run compiler supplies the guarded scan - window compare against
+    the top record FIRST (a record-ful frame has no residue and
+    `[rbp+24]` is garbage), then bit 0, then per ref slot a
+    `jit_release_slot` call with rax (the exit pc) preserved.
+    **Watched: `42 12 9`** - nine leaked retains for nine caught
+    throws - which nothing but the new instrument could see (below).
+ 4. **`frameless_ok` is derived from the ops and never stored**, like
+    `native_leaf`, and the LOADER did not recompute it: a loaded
+    image's main came out 649 bytes bigger than the fresh compile's
+    (no frameless sites), which `myv_round_trip` caught. The loader's
+    derived-flag pass sets it now; the test writes both dumps to the
+    temp dir on a mismatch.
+
+**⛔ A PRE-EXISTING RULE 2 BUG THE TIER EXPOSED: THE -2 CONVEYANCE
+LOST THE CALLEE FRAME'S CALL SITE.** A WARMED inline sync call - the
+record high-water gate sends every FIRST descent through the C++ tier,
+so only a re-descent takes the emitted push - whose callee THROWS
+exits the site with -2, and the site's conveyance stamped the callee
+frame's call site against the CALLER's descriptor (`back_rec().desc`,
+read AFTER the pop) or a null one (the record-less arm, written "to
+match" that miss). The stamp landed only for a self-recursive callee;
+everything else rendered `[1] mid(n) at line 0` where `-nj` says
+line 3, under BOTH `MYLANG_JIT_OFF=norec` and the default, at the F3
+commit and before. Every net missed it for one reason: every
+enumerated throw throws on a FIRST descent (norec_enum's programs,
+the corpus's exception tests), which the high-water gate never lets
+reach the emitted site. The frameless site has no such gate and
+exposed it on the first call (`vm_inlined_backtrace_parity`). Fixed at
+the one place all three -2 arms share: `vm_jit_stamp_callee_frame`
+stamps `back()` - the frame the walk captured LAST, the direct
+callee's - against ITS OWN desc. Pinned by
+`vm_warmed_throw_backtrace_parity` (a non-main caller, so the site is
+record-less/record-ful, in every JIT mode). Watched failing with the
+null desc restored: `[1] snd(x) at line 0`, `[1] leaf(n) at line 0`,
+`[1] mid(n) at line 0`. **THE RULE: a test of an exception path must
+throw on a WARMED call** - shape-eater #9 in CLAUDE.md.
+
+**⛔ A NEW INSTRUMENT: `refcount(symbol)`, DEV-ONLY.** A leaked
+reference is unobservable from a program: a plain alias never copies
+(assignment aliases; only a SLICE is a COW view), and a pooled object
+is invisible to LeakSanitizer. The release-scan sabotage (3) above
+passed every value check. `refcount` reads the slot in place (an
+lvalue builtin like `intptr`) and returns `use_count()`; the tests
+read it TWICE (after N and after 3N iterations) and assert the
+DIFFERENCE, because a live argument temp may legitimately hold the
+array after the last call - what grows per call is a leak. Registered
+by `make_dev_builtin_lv` (a script call is a compile-time error, like
+`show()`), typed int, listed with the lvalue-arg builtins in the
+resolver/codegen/escape tables, documented in README and `:help`.
+
+**TESTS.** `jit_frameless_call_reach` - values in the JIT engine +
+`g_jit_frameless_pushes` >= a floor per case, uncaught-exception cases
+compare the rendered backtrace with the tree-walker's: 78's closure
+pair (exact int + widening float), a counter closure, boxed dyn
+arithmetic (helper-written slots), a REFERENCE result (declines the
+arm to the C++ tier), a borrowed + a retained param (refcount delta
+0), a discarded result (bare 1), an OOB read caught in main (refcount
+delta 0 after 9 throws), a native throw caught in main then a RECORD-
+FUL recursion (a wrongly-adjusted watermark lands rec's windows below
+the segment - watched: ASan heap-buffer-overflow with the raise arm's
+bit test removed), and the two uncaught twins. Three sabotages
+watched: the exit release scan deleted (`42 12 9` + LSan), the -2
+stamp with a null desc (three parity failures), the raise arm's
+segment guard removed (ASan). `jit_argfuse_vs_pins` runs with the
+frameless lever off - its call would otherwise go frameless and the
+fusion it tests would not fire (vacuous, and it said so).
+`jit_ret_inline_c4c` counts the frameless arm as a record-less one.
+
+**NETS** (`build-claude/dbg`, TESTS=1 OPT=0, ASan+UBSan): `-rt`
+1987/1987 + the four differential modes 1696/1696, off-arena
+(`MYLANG_NO_LOWMEM=1`) 1987/1987; `corpus_diff` plain 34/34,
+`--levers` 34/34 x 24 (the `frameless` lever is in the matrix),
+`--cold`, `--xrot` 34/34 x 16, `--nolowmem`; `driver_checks` all
+passed on dbg and rel-hard; `rel-hard` and `clang` suites 1987/1987;
+`vdjcmp` self-test 127/127 and `disasmcheck` every instruction agrees
+with objdump on the release lane; `norec_enum --depth 3` 480 programs
+agree; `norec_sweep` OK; `nested_fuzz --count 300` 0 diverged; the
+regcensus gate at its floors (RAWENC 15 -> 14: the residue `push
+qword [rcx]` and the site's `lea` got encoders).
+
+**MEASURED** (callgrind Ir, `OPT=1 ASSERTS=0`, `-npc`, baseline = the
+F3 commit, whose frameless code was unreachable = 1c as landed; wall =
+ONE interleaved `--baseline` run per bench):
+
+    bench                 scale     Ir        per scale unit   wall
+    78_typed_param_call   1/3    -32.1/-32.6%     -32.9%       0.70x
+    11_closure_counter    1/3    -33.2/-34.4%     -35.0%       0.64x
+    63_closures           1/3    -17.4/-17.9%     -18.1%       0.80x
+    76_funcval_dispatch   1       -0.00%                       1.03x (noise)
+    09_fib / 10 / 12 / 75 / 64 / 03 / 01 / 46    -0.02 .. +0.03%
+
+The per-call ledger on 78's `add(i)` (`scripts/jitprofile.py
+--listing`): the callee 67 -> 51 Ir (F6: 28 -> 22 at the entry, the
+arm 31 -> 21), the site 40 -> 31; 105 Ir per call+loop share against
+~150 at 1c. Where the rest is, in order, for the next increments:
+the ctx-chain capture read (4 Ir; a capture BASE register handed by
+the site would make it 1 and delete the ctx.captures repoint/restore
+pair, ~8 Ir, but every capture access in the body must then be
+emitted), the window init (7 Ir for two temps: a per-slot "does a
+helper ever put() here" fact would skip most tails), the site's
+staging guard on a ref-listed arg temp (4 Ir; ref_slots precision),
+the vframe repoint (3 Ir; inherent while helpers reach the frame
+through it), the float pin spill/reload around the call (#124).
+Blast radius vs the F3 baseline: 35 corpus programs' code changed, all
+but 78/11/63's by the DELETION of the unreachable F2 entries.
+
+**OPEN (increment 3 = E2, dropping the leaf rule, serves 09_fib):** a
+frameless frame that can CALL is an ancestor, so every walker's
+structural exemption above ends - the chain reconstruction, the
+materialiser and the shadow walk must all learn `[rbp+24]` bit 0 (a
+site's `NorecSite::frameless` is already recorded for them). And the
+caller-built-window variant (the site fills the callee's window on ITS
+stack, binding fused arguments in place) is the one that would recover
+the #162 fusion the tier now forgoes - recorded, not built.

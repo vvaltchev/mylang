@@ -471,11 +471,46 @@ Each ends with a MEASUREMENT that can kill the next one.
    profile before building, the way increment 0 was.
 
 **2. The callee-side protocol (§2), behind `MYLANG_JIT_OFF=frameless`.**
-   The bulk. Landed with the tier ADMITTING ONLY LEAF CALLEES first, so
-   E2's unwinder question is not entangled with the entry/return/
-   exception work. GATE: Ir on 78 and 11; `corpus_diff` over the five
-   matrices; the norec nets re-run, since the rbp chain now has a second
-   kind of frame in it.
+   ✅ **DONE 2026-09-19**, in six micro-steps F1-F6 (the gate, the
+   entry, the residue bit, the site, the walkers - which need no change
+   while the tier admits only LEAVES, a leaf being never an ancestor -
+   and the frameless return arm told apart by `rbx == rsp`). GATE MET:
+   **78 -32.9% Ir per scale unit / 0.70x, 11 -35.0% / 0.64x, 63
+   -18.1% / 0.80x**, everything else flat to the instruction, every
+   matrix green. Record: `docs/jit-optimizations.md`, *#97 increment
+   2* - including the four things the first version got wrong (a raw
+   copy of a reference argument; raw stack is not a segment slot; the
+   exit epilogue must release before the teardown; the loader must
+   recompute `frameless_ok`), the PRE-EXISTING -2 conveyance bug it
+   exposed (a warmed call's callee frame rendered at line 0 - a RULE 2
+   divergence no net could reach), and the `refcount()` dev instrument
+   that made the release scan testable.
+   Original text: The bulk. Landed with the tier ADMITTING ONLY LEAF
+   CALLEES first, so E2's unwinder question is not entangled with the
+   entry/return/exception work. GATE: Ir on 78 and 11; `corpus_diff`
+   over the five matrices; the norec nets re-run, since the rbp chain
+   now has a second kind of frame in it.
+
+   **WHAT IS LEFT PER CALL (78's `add(i)`, 105 Ir with the loop
+   share, C++ ~10), in the order the profile ranks it - each its own
+   micro-increment, none started:**
+   - the CAPTURE PROTOCOL: the body reads captures through
+     `ctx -> captures -> data()` (4 Ir per read) and the site/arm
+     repoint + restore `ctx.captures` (5 Ir); a capture base handed in
+     a register by the site would make the read 1 Ir and delete the
+     repoint - sound only when EVERY capture access in the body is
+     emitted (a helper reading `ctx->captures` would see the caller's);
+   - the WINDOW INIT: 3 stores per non-argument slot (type + tail),
+     needed only for a slot some HELPER may `put()`/rebind into; an
+     opcode-level "helper writes its dst" fact would skip the rest -
+     an audit table, so build it with the enum-derived ratchet;
+   - the SITE's staging guard on a ref-listed argument temp (4 Ir) -
+     ref_slots precision, the same slot `print`'s arguments reuse;
+   - the CALLER-BUILT WINDOW: the site fills the callee's window on
+     its own stack, binding a FUSED argument straight from the caller
+     slot - recovers the #162 fusion the tier forgoes today and one
+     retain/release pair per reference argument;
+   - the float pin spill/reload around the call - #124's territory.
 
 **3. E2 — drop the leaf rule.** Serves 09_fib, and only after the
    marker and the walker are proven by increment 2. GATE: 09_fib Ir, and

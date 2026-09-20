@@ -21,7 +21,10 @@ R11     0
 XMM0    0
 XMM1    0
 TOTAL   0
-RAWENC  15
+RAWENC  14
+# 2026-09-19 (#97 inc 2): the residue push's `push qword [rcx]` and
+# the frameless site's `lea rcx,[rbx+d]` got encoders (push_base0,
+# lea_base): 15 -> 14.
 CONV 0    # 103: CLOSED 2026-08-25 - the mandate's zero. The final
 # 3 uses were ALREADY-BUILT conversions hiding behind stale struct
 # comments ('this lands INERT, and making them allocatable is the

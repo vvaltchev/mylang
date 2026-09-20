@@ -1590,6 +1590,11 @@ struct NorecSite {
                                       * record is pushed at all; registered
                                       * so the entry RA check can resolve
                                       * its return address (step 2) */
+    /* #97 increment 2: a FRAMELESS call - the callee built its window on
+     * the native stack (Chunk::frameless_entry_off); no record, no
+     * segment space, the residue's dst word carries bit 0. The walkers
+     * must not expect a segment window for such a frame. */
+    bool frameless = false;
     uint32_t resume_pc = 0;          /* STEP 4-i: the POST-CALL entry-stub
                                       * pc in `caller` - where the flat
                                       * (JIT_RET_SWITCH) driver re-enters
@@ -1911,6 +1916,19 @@ struct Chunk {
      * unchanged, and changes nothing about either side table.
      */
     bool frameless_ok = false;
+    /*
+     * #97 increment 2 (F6): main NAMES this chunk at a site the shared
+     * predicate (jit_frameless_callee) says will be frameless - so the
+     * frameless ENTRY and the frameless RETURN ARM are worth emitting.
+     * Set by jit_mark_frameless_wanted, a pre-pass over MAIN's code run
+     * before any body is jitted (bodies compile first, main last, so a
+     * body cannot know its callers otherwise). Without it every
+     * frameless_ok chunk paid the arm's `cmp rbx, rsp; je` on EVERY
+     * return - +2 Ir per call on 76_funcval_dispatch, whose value calls
+     * reach a two-candidate set and are never frameless. Never stored:
+     * derived at jit time, the loader runs the same pre-pass.
+     */
+    bool frameless_wanted = false;
     /*
      * The BOXED general-value path's constant pool: literal EvalValues baked at
      * codegen (a machine-code backend would put these in the data section),

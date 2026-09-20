@@ -113,6 +113,13 @@ const BuiltinDoc builtin_docs[] = {
 { "specializations", "reflect", "specializations(f)",
   "The <name>$N / <name>$sN template-instance & specialization clones derived "
   "from f.", nullptr },
+{ "refcount", "reflect", "refcount(symbol)  [dev-only]",
+  "The number of handles sharing the reference symbol holds (1 for a scalar) "
+  "- DEV-ONLY, a test instrument.",
+  "DEV-ONLY (the REPL and the test harness; a script call is a compile-time "
+  "error). Reads the slot in place like intptr(), so the count is exact: a "
+  "leaked reference - one a call protocol forgot to release - is otherwise "
+  "invisible to a program, since a plain alias never copies." },
 { "show", "reflect", "show(x)  [dev-only]",
   "Render x's FINAL optimized AST back into synthetic MyLang code (DEV-ONLY).",
   "DEV-ONLY: it decompiles the AST, so it is reserved to the REPL and the test "

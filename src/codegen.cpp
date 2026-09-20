@@ -396,7 +396,8 @@ bool as_int_operand(const Construct *e, Operand &out)
 bool builtin_requires_lvalue_arg0(std::string_view name)
 {
     return name == "append" || name == "push" || name == "pop"
-        || name == "insert" || name == "erase" || name == "intptr";
+        || name == "insert" || name == "erase" || name == "intptr"
+        || name == "refcount";
 }
 
 bool incdec_lvalue_pure(const Construct *lv)

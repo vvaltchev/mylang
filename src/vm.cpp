@@ -2238,6 +2238,12 @@ void vm_jit_loaded_image(VmProgram &prog)
 
     for_each_chunk([](Chunk &ck, const FuncDescriptor *) {
         ck.native_leaf = jit_chunk_is_native_leaf(ck);
+        /* #97 increment 2: derived from the ops exactly like native_leaf,
+         * never stored - and read by the CALLER's site (frameless_site),
+         * so it must exist before main is jitted. Left at its loaded
+         * default (false) it made a loaded image's main 649 bytes bigger
+         * than the fresh compile's, which myv_round_trip caught. */
+        ck.frameless_ok = jit_chunk_frameless_ok(ck);
     });
 
     std::vector<const FuncDescriptor *> slot_desc(
@@ -2251,6 +2257,13 @@ void vm_jit_loaded_image(VmProgram &prog)
                 slot_desc[s] = d.get();
                 break;
             }
+    }
+    {
+        /* the frameless pre-pass, exactly as vm_precompile_all runs it */
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &prog.global_slot_reassigned;
+        jit_mark_frameless_wanted(prog.root, &jc);
     }
     for_each_chunk([&](Chunk &ck, const FuncDescriptor *desc) {
         JitCtx jc;
@@ -2603,6 +2616,15 @@ vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
      * since main has no stable descriptor for the record's ret_chunk). */
     if (!jit)
         return;                 /* the .myv writer stores PRE-jit bytecode */
+    /* #97 inc 2 (F6): which callees will MAIN call framelessly - decided
+     * from main's code before any body is jitted, so a body knows whether
+     * to emit its frameless entry and return arm (bytecode.h) */
+    if (main_chunk) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &root->global_slot_reassigned;
+        jit_mark_frameless_wanted(*main_chunk, &jc);
+    }
     for (auto &kv : g_func_chunks) {
         JitCtx jc;
         jc.slot_desc = &slot_desc;
@@ -3416,6 +3438,10 @@ unsigned long g_jit_cap_scalar = 0;        /* #111 (emitted) */
 unsigned long g_jit_frameless_chunks = 0;  /* #97 reach probe (TESTS) */
 unsigned long g_jit_frameless_calls = 0;   /* #97 reach probe (TESTS) */
 unsigned long g_jit_frameless_entries = 0; /* #97 inc 2: entries EMITTED */
+unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
+                                            * (emitted code) */
+unsigned long g_jit_frameless_rets = 0;    /* #97 inc 2: frameless RETURN
+                                            * arm taken (emitted code) */
 unsigned long g_jit_arg_scalar = 0;
 
 /*
@@ -6255,6 +6281,31 @@ vm_jit_stamp_call_site(Exception &e, const FuncDescriptor *d,
     }
 }
 
+/*
+ * The -2 CONVEYANCE's stamp (#97 increment 2, found by the frameless
+ * site). When a callee's own raise unwound to this site, the innermost
+ * captured frame - `back()`, the direct callee's, captured LOC-LESS by
+ * the raise arm or by the walk's pop of an inline-pushed record - is
+ * exactly the frame whose call site THIS site is. The desc to match is
+ * therefore the frame's own, not a guess from the caller side: the
+ * record path used to read `back_rec().desc` AFTER the pop (the caller's
+ * descriptor, so the stamp landed only for a self-recursive callee), and
+ * the record-less arm passed a null desc to "match" that miss. Both
+ * rendered `[1] caller at line 0` for a WARMED inline call whose callee
+ * throws - a RULE 2 divergence from `-nj` that every net missed because
+ * every enumerated throw happens on a FIRST descent, which the record
+ * high-water gate sends through the C++ tier. The frameless site has no
+ * such gate, so vm_inlined_backtrace_parity saw it on the first call.
+ */
+static ML_NOINLINE void
+vm_jit_stamp_callee_frame(Exception &e, int_type site_packed,
+                          int32_t chain, const void *pool)
+{
+    vm_jit_stamp_call_site(
+        e, e.backtrace.empty() ? nullptr : e.backtrace.back().desc,
+        site_packed, chain, pool);
+}
+
 /* fwd (defined below CachedCallV's probe) - vm_raise now walks natively. */
 static ML_COLD bool
 vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
@@ -6334,8 +6385,12 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
             if (lv.get().get_type()->t >= Type::t_str)
                 lv.frame_release();
         }
-        act.cur_sg->cur -= total;
         const char *fp = static_cast<const char *>(frag_rbp);
+        /* #97 increment 2: a FRAMELESS raiser's window is on the native
+         * stack (bit 0 of the residue's dst word at [rbp+24]) - it took
+         * no segment space, so there is none to give back */
+        if (!(*reinterpret_cast<const uintptr_t *>(fp + 24) & 1))
+            act.cur_sg->cur -= total;
         ctx.captures =
             *reinterpret_cast<CaptureSlots *const *>(fp + 16);
         const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
@@ -7799,8 +7854,7 @@ jit_norec_postexit(size_t r, int_type site_packed, LValue *caller_win,
     if (r == static_cast<size_t>(-2)) {
         if (g_vm_exc_pending) {
             Exception &e = *g_vm_exc_pending;
-            vm_jit_stamp_call_site(e, nullptr, site_packed, inl_chain,
-                                   inl_pool);
+            vm_jit_stamp_callee_frame(e, site_packed, inl_chain, inl_pool);
             g_vm_jit_exc = std::move(g_vm_exc_pending);
             return 2;
         }
@@ -7842,6 +7896,75 @@ jit_norec_postexit(size_t r, int_type site_packed, LValue *caller_win,
             lv.frame_release();
     }
     act.cur_sg->cur -= total;
+    ctx.captures = static_cast<CaptureSlots *>(
+        const_cast<void *>(g_jit_residue_caps));
+    act.view_frame.point_at(
+        caller_win,
+        caller_total >= 0 ? static_cast<int>(caller_total)
+                          : static_cast<int>(act.top_rec->nslots));
+    vm_jit_stamp_call_site(*ex, d, site_packed, inl_chain, inl_pool);
+    g_vm_jit_exc = std::move(ex);
+    return 2;
+}
+
+/*
+ * #97 increment 2: the post-exit of a FRAMELESS callee that left its
+ * fragment with an exception (rax = the exit pc). jit_norec_postexit's
+ * shape minus the two things a frameless frame has no more: its window
+ * died with its native-stack frame - the callee's exit epilogue released
+ * every ref-listed slot before the teardown (emit_epilogues), so there
+ * is nothing here to release and NOTHING here may read it - and it took
+ * no segment space, so the watermark is untouched. What remains: the
+ * exception's caret and callee frame, the caller's captures back from
+ * the relay, the caller's view repointed, the site stamped.
+ */
+extern "C" int jit_frameless_postexit(size_t r, int_type site_packed,
+                                      LValue *caller_win,
+                                      int_type caller_total) noexcept
+{
+    const int32_t inl_chain = g_jit_call_inline_chain;
+    const void *inl_pool = g_jit_call_inline_pool;
+    g_jit_call_inline_chain = -1;
+    g_jit_call_inline_pool = nullptr;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    if (r == static_cast<size_t>(-2)) {
+        /* the callee's own native raise already cleaned its frame (the
+         * norec_raiser arm of vm_raise, which reads the frameless bit) -
+         * only the pending conveyance conversion remains */
+        if (g_vm_exc_pending) {
+            Exception &e = *g_vm_exc_pending;
+            vm_jit_stamp_callee_frame(e, site_packed, inl_chain, inl_pool);
+            g_vm_jit_exc = std::move(g_vm_exc_pending);
+            return 2;
+        }
+        return 0;
+    }
+    if (g_vm_jit_eptr)
+        return 2;              /* fatal (uncatchable) - conveyed as-is */
+    const auto *d = static_cast<const FuncDescriptor *>(g_norec_exit_desc);
+    const Chunk *ck =
+        d ? static_cast<const Chunk *>(d->vm_chunk) : nullptr;
+    ML_CHECK(d && ck);
+    std::unique_ptr<RuntimeException> ex;
+    if (g_vm_jit_raise) {
+        const int kind = g_vm_jit_raise;
+        g_vm_jit_raise = 0;
+        ex = vm_jit_raise_kind_new(kind);
+    } else if (g_vm_jit_exc) {
+        ex = std::move(g_vm_jit_exc);
+    } else {
+        ML_CHECK_MSG(false, "a frameless frame exited with no signal");
+        return 2;
+    }
+    if (!ex->loc_start) {
+        Loc s, en;
+        ck->loc_at(r, s, en);
+        ex->loc_start = s;
+        ex->loc_end = en;
+    }
+    vm_flush_inline(*ck, r, *ex);
+    ex->backtrace.emplace_back(d, Loc());
     ctx.captures = static_cast<CaptureSlots *>(
         const_cast<void *>(g_jit_residue_caps));
     act.view_frame.point_at(
@@ -7936,8 +8059,10 @@ extern "C" int jit_sync_postexit(size_t r, int_type site_packed,
             g_jit_norec_stamp_verify++;
         }
 #endif
-        vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
-                               inl_pool);
+        /* the frame to stamp is the one the walk captured last - at a
+         * -2 exit the callee record is already popped, so `d` (read at
+         * the top) is the CALLER's; see vm_jit_stamp_callee_frame */
+        vm_jit_stamp_callee_frame(e, site_packed, inl_chain, inl_pool);
         g_vm_jit_exc = std::move(g_vm_exc_pending);
         return 2;
     }

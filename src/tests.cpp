@@ -15418,6 +15418,68 @@ vm_inlined_backtrace_parity()
 }
 
 /*
+ * #97 increment 2 found this one: a WARMED inline sync call - the record
+ * high-water gate sends a FIRST descent through the C++ tier, so only a
+ * re-descent takes the emitted push - whose callee THROWS exits the site
+ * with -2, and the site's conveyance stamped the callee frame's call site
+ * against the CALLER's descriptor (read after the pop) or a null one, so
+ * it landed only for a self-recursive callee. Rendered as
+ * `[1] mid(n) at line 0` where the tree-walker says line 3. Every net's
+ * throwing shape throws on the first descent, which is why none saw it.
+ * The frameless site has no such gate and exposed it on the first call;
+ * this pins the RECORD-LESS and RECORD-FUL twins (a non-main caller, so
+ * the site is not frameless), in every JIT mode of the differential.
+ */
+static bool
+vm_warmed_throw_backtrace_parity()
+{
+    const char *src_lines[] = {
+        "struct E { int v; }",
+        "func thr(int n) { var k = n * 2; if (k > 4) { throw E(k); }",
+        "  return k; }",
+        "func mid(int n) { var t = 0;",
+        "  for (var i = 0; i < n; i++) t = t + thr(i); return t; }",
+        "var q = mid(runtime(5));",
+    };
+    auto run = [&](ExecEngine eng) -> std::string {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < sizeof(src_lines) / sizeof(src_lines[0]); i++) {
+            if (i)
+                src += '\n';
+            src += src_lines[i];
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        run_optimizers(root.get());
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = eng;
+        std::string bt;
+        try {
+            if (eng == ExecEngine::Vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (const Exception &e) {
+            bt = format_backtrace(e);
+        }
+        g_exec_engine = saved;
+        return bt;
+    };
+    const std::string tw = run(ExecEngine::TreeWalk);
+    const std::string vm = run(ExecEngine::Vm);
+    const bool ok = !tw.empty() && tw == vm
+                    && tw.find("thr(n)") != std::string::npos
+                    && tw.find("mid(n)") != std::string::npos;
+    if (!ok)
+        cout << "  tw:\n" << tw << "  vm:\n" << vm;
+    return ok;
+}
+
+/*
  * Task #75: the TYPED-chain twin of the parity check above - the throw
  * happens inside an M8 TypedScalarExpr spliced from TWO inline levels
  * (inner into outer, outer into main) whose enclosing `+` chain the
@@ -23140,6 +23202,12 @@ static bool myv_round_trip()
         const std::string dump_img = disassemble_image(loaded);
         if (dump_mem != dump_img) {
             fprintf(stderr, "myv: the loaded image's disassembly DIFFERS\n");
+            /* the two dumps, for `diff` - a mismatch is otherwise a
+             * one-line verdict over ~1000 lines of disassembly */
+            std::ofstream(tdir + "/mylang-myv-dump-mem.txt") << dump_mem;
+            std::ofstream(tdir + "/mylang-myv-dump-img.txt") << dump_img;
+            fprintf(stderr, "  (written to %s/mylang-myv-dump-{mem,img}.txt)\n",
+                    tdir.c_str());
             g_exec_engine = saved;
             return false;
         }
@@ -27207,6 +27275,11 @@ static bool jit_argfuse_vs_pins()
                                   * own lever ran (CLAUDE.md) */
     const ExecEngine saved = g_exec_engine;
     g_exec_engine = ExecEngine::Vm;
+    /* #97 inc 2: main's call to `first` would take the FRAMELESS site,
+     * which keeps its staging moves (no fusion) - this test is about the
+     * fusion gate, so it runs with that lever off for its duration */
+    const unsigned save_off = g_jit_off_extra;
+    g_jit_off_extra |= jit_lever_bit("frameless");
     const std::string src =
         "func first(a, k) {\n"
         "  var t = a[0] + k;\n"
@@ -27241,6 +27314,7 @@ static bool jit_argfuse_vs_pins()
     }
     std::cout.rdbuf(old);
     g_exec_engine = saved;
+    g_jit_off_extra = save_off;
     if (ok && out.str() != "780 40 \n") {
         fprintf(stderr, "jit_argfuse_vs_pins: stdout %s != 780 40 (a "
                         "fused argument read a pinned slot's memory?)\n",
@@ -27590,6 +27664,217 @@ static bool jit_frameless_entry_emitted()
         ok = false;
     }
     return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 increment 2 (F4): THE FRAMELESS CALL - main's site calls a
+ * frameless_ok leaf through its frameless entry (no segment window, no
+ * record, no fork). Reach is g_jit_frameless_pushes, bumped by the
+ * EMITTED site; every case asserts its VALUES too, in the default (JIT)
+ * engine, and the exception shapes compare their rendered backtrace with
+ * the tree-walker's, because a frameless frame has no record and no
+ * segment window for the exception path to read - its window dies with
+ * the native frame, so every fact the postexit needs must be baked or
+ * relayed, and a missing one renders as a wrong line, a wrong frame, or
+ * a leaked reference (the intptr check below).
+ */
+static bool jit_frameless_call_reach()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    struct Res { bool ok; std::string out; std::string bt;
+                 unsigned long pushes; unsigned long norec_ret; };
+    const auto run = [&](const std::vector<std::string> &lines,
+                         ExecEngine eng) -> Res {
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = eng;
+        std::string src;
+        for (const std::string &l : lines)
+            src += l + "\n";
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        Res r{ true, "", "", 0, 0 };
+        const unsigned long p0 = g_jit_frameless_pushes;
+        const unsigned long n0 = g_jit_norec_ret_verify;
+        std::ostringstream out;
+        std::streambuf *old = std::cout.rdbuf(out.rdbuf());
+        /* declared OUTSIDE the try: a lazy backtrace frame renders from
+         * the descriptor, which the AST owns here (the tree-walker run),
+         * so the tree must outlive the catch handler's format call */
+        unique_ptr<Construct> root;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            if (eng == ExecEngine::Vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (const Exception &e) {
+            r.bt = format_backtrace(e);
+            r.ok = false;
+        } catch (...) {
+            r.ok = false;
+        }
+        std::cout.rdbuf(old);
+        g_exec_engine = saved;
+        r.out = out.str();
+        r.pushes = g_jit_frameless_pushes - p0;
+        r.norec_ret = g_jit_norec_ret_verify - n0;
+        return r;
+    };
+    struct Case {
+        const char *name;
+        std::vector<std::string> src;
+        const char *expect;           /* stdout */
+        unsigned long min_pushes;     /* the reach floor */
+        bool throws;                  /* uncaught: compare the backtrace */
+    };
+    const std::vector<Case> cases = {
+        { "closure loop: exact int + widening float (78)", {
+            "func make_adder(int base) {",
+            "  return func [base] (int k) { return base + k; }; }",
+            "func make_scaler(float f) {",
+            "  return func [f] (float x) { return f * x; }; }",
+            "var add = make_adder(7);",
+            "var scale_it = make_scaler(0.5);",
+            "var s = 0; var t = 0.0;",
+            "for (var i = 0; i < runtime(40); i++) {",
+            "  s = s + add(i); t = t + scale_it(i); }",
+            "print(s, t);" }, "1060 390.000000 \n", 80, false },
+        { "counter closure: a captured value mutated across calls (11)", {
+            "func make_counter() {",
+            "  var c = 0;",
+            "  return func [c] () { c = c + 1; return c; }; }",
+            "var next = make_counter();",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(30); i++) s = s + next();",
+            "print(s, next());" }, "465 31 \n", 31, false },
+        { "leaf with HELPER-written slots (boxed dyn arithmetic: the "
+          "helper's put() reads the slot's container/borrowed tail)", {
+            "func cx(dyn a, dyn b) { var dyn t = a + b; var dyn u = t * 2;",
+            "  return u - b; }",
+            "var dyn s = 0;",
+            "for (var i = 0; i < runtime(20); i++) s = s + cx(i, 3);",
+            "print(s);" }, "440 \n", 20, false },
+        { "a REFERENCE result declines the return arm to the C++ tier", {
+            "func mk(int n) { var r = [n, n + 1]; return r; }",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(20); i++) {",
+            "  var a = mk(i); s = s + a[0] + a[1]; }",
+            "print(s);" }, "400 \n", 20, false },
+        { "a ref-listed param, BORROWED (non-escaping) and RETAINED "
+          "(escaping) - the count is back to 1 after either", {
+            "var g = [1, 2, 3];",
+            "func brw(array a, int k) {",
+            "  var t = a[0] + a[1]; var u = t * 2 - k; return u - t; }",
+            "func drop(array a, int k) {",
+            "  var x = a[0]; g = [9, 9, 9]; var y = a[1];",
+            "  return x * 100 + y * 10 + k; }",
+            /* the count is read TWICE, after 30 and after 60 more
+             * iterations, and the DIFFERENCE is asserted: a live argument
+             * temp may legitimately hold the array after the last call,
+             * but a leaked retain grows the count per call */
+            "var arr = [3, 4, 5];",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(30); i++) {",
+            "  s = s + brw(arr, i); g = [1, 2, 3]; s = s + drop(g, 0); }",
+            "var c1 = refcount(arr);",
+            "for (var i = 0; i < runtime(60); i++) {",
+            "  s = s + brw(arr, i); g = [1, 2, 3]; s = s + drop(g, 0); }",
+            "print(s, refcount(arr) - c1);" }, "9225 0 \n", 180, false },
+        { "a DISCARDED result (the site pushes a bare 1)", {
+            /* a loop-bodied callee: a smaller one is SPLICED into main
+             * by the bytecode inliner and no call survives (shape-eater
+             * #8) */
+            "var hits = 0;",
+            "func bump(int k) { var t = 0;",
+            "  for (var j = 0; j < k; j++) t = t + j;",
+            "  hits = hits + t; return t; }",
+            "for (var i = 0; i < runtime(25); i++) bump(i);",
+            "print(hits);" }, "2300 \n", 25, false },
+        { "an OOB read in the leaf, CAUGHT in main: the window's "
+          "RETAINED reference is released by the callee's exit epilogue "
+          "(refcount back to 1 - a leak is otherwise unobservable)", {
+            "var g = [1, 2, 3];",
+            "func rd(array a, int k) {",
+            "  var x = a[0]; g = [7]; var y = a[k]; return x + y; }",
+            "var arr = [3, 4, 5];",
+            "var s = 0; var caught = 0;",
+            "for (var i = 0; i < runtime(6); i++) {",
+            "  try { s = s + rd(arr, i); }",
+            "  catch (OutOfBoundsEx) { caught = caught + 1; } }",
+            "var c1 = refcount(arr);",
+            "for (var i = 0; i < runtime(12); i++) {",
+            "  try { s = s + rd(arr, i); }",
+            "  catch (OutOfBoundsEx) { caught = caught + 1; } }",
+            "print(s, caught, refcount(arr) - c1);" }, "42 12 0 \n", 18,
+          false },
+        { "a native THROW in the leaf, CAUGHT in main (the -2 path), "
+          "then a RECORD-FUL recursion: the raise arm must not give back "
+          "segment space a frameless frame never took", {
+            "struct E { int v; }",
+            "func thr(int n) { var k = n * 2; if (k > 4) { throw E(k); }",
+            "  return k; }",
+            /* 20 throws lower a wrongly-adjusted watermark by 20 windows,
+             * well below the segment; rec's record-ful pushes then land
+             * there (watched: ASan on the sabotaged raise arm) */
+            "func rec(int n) { if (n <= 0) { return 0; }",
+            "  var r = rec(n - 1); return r + 1; }",
+            "var s = 0; var got = 0;",
+            "for (var i = 0; i < runtime(23); i++) {",
+            "  try { s = s + thr(i); } catch (E as e) { got = got + e.v; } }",
+            "print(s, got, rec(runtime(3)));" }, "6 500 3 \n", 23, false },
+        { "an OOB read in the leaf, UNCAUGHT: backtrace parity", {
+            "func rd(array a, int k) { var x = a[0]; var y = a[k];",
+            "  return x + y; }",
+            "var arr = [3, 4, 5];",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(6); i++) s = s + rd(arr, i);",
+            "print(s);" }, "", 3, true },
+        { "a native THROW in the leaf, UNCAUGHT: backtrace parity "
+          "(the callee frame's call site is THIS site)", {
+            "struct E { int v; }",
+            "func thr(int n) { var k = n * 2; if (k > 4) { throw E(k); }",
+            "  return k; }",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(6); i++) s = s + thr(i);",
+            "print(s);" }, "", 3, true },
+    };
+    bool all = true;
+    for (const Case &c : cases) {
+        const Res vm = run(c.src, ExecEngine::Vm);
+        bool ok = true;
+        if (c.throws) {
+            const Res tw = run(c.src, ExecEngine::TreeWalk);
+            if (vm.ok || tw.ok || vm.bt.empty() || vm.bt != tw.bt) {
+                fprintf(stderr, "jit_frameless_call_reach [%s]: backtrace "
+                                "differs\n  tw:\n%s  vm:\n%s", c.name,
+                        tw.bt.c_str(), vm.bt.c_str());
+                ok = false;
+            }
+        } else if (!vm.ok || vm.out != c.expect) {
+            fprintf(stderr, "jit_frameless_call_reach [%s]: stdout %s != "
+                            "expected %s (ok=%d)\n", c.name,
+                    vm.out.c_str(), c.expect, static_cast<int>(vm.ok));
+            ok = false;
+        }
+        if (vm.pushes < c.min_pushes) {
+            fprintf(stderr, "jit_frameless_call_reach [%s]: %lu frameless "
+                            "pushes, expected >= %lu - the site did not "
+                            "take the frameless call\n", c.name,
+                    vm.pushes, c.min_pushes);
+            ok = false;
+        }
+        all = all && ok;
+    }
+    return all;
 #else
     return true;
 #endif
@@ -39949,6 +40234,10 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 inc 2 (F2) - the FRAMELESS ENTRY is emitted for every "
       "frameless_ok chunk and for no other",
       jit_frameless_entry_emitted },
+    { "jit: #97 inc 2 (F4) - the FRAMELESS CALL: main's site reaches the "
+      "leaf's frameless entry (closures, temps, a reference result, "
+      "borrowed/retained params, a discarded dst, exceptions both ways)",
+      jit_frameless_call_reach },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },
@@ -40236,6 +40525,9 @@ static const std::vector<extra_check> extra_checks =
     { "backtrace: inlined virtual frames", backtrace_inline_frames },
     { "backtrace: VM inlined-frame parity (Inc 4)",
       vm_inlined_backtrace_parity },
+    { "backtrace: a WARMED inline call whose callee throws keeps the "
+      "callee frame's call site (tw == vm; the -2 conveyance stamp)",
+      vm_warmed_throw_backtrace_parity },
     { "backtrace: typed-chain inlined-frame parity (#75)",
       typed_inlined_backtrace_parity },
     { "backtrace: a recursion inlined into itself renders identically "
