@@ -4,10 +4,12 @@
 #include "eval.h"
 #include "syntax.h"
 #include "analyzer.h"
+#include "resolver.h"
 
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using std::string;
@@ -628,6 +630,14 @@ cse_materialize(ParseContext &c,
                 unique_ptr<Construct> &out,
                 bool process_arrays,
                 bool immutable);
+
+static void
+collect_value_descs(const EvalValue &v,
+                    std::unordered_set<const FuncDescriptor *> &out);
+
+static void
+detach_baked_funcs(ParseContext &c, unique_ptr<Construct> &slot,
+                   const std::unordered_set<const FuncDescriptor *> &descs);
 
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
@@ -2202,6 +2212,21 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
     c.cse->push();                  // matching CSE cache scope
     c.shadow_push();                // #133: matching shadowed-builtin scope
 
+    /*
+     * #47: a statement of THIS block whose const bake detached a function
+     * literal (ParseContext::baked_funcs) gets it back here, as an ordinary
+     * expression statement placed just BEFORE it - same scope, so the
+     * lambda's body resolves exactly as it would have in place. Only the
+     * entries past `baked_base` are ours: an enclosing block's pending ones
+     * (a bake in an `if` condition, before its body block) stay for it.
+     */
+    const size_t baked_base = c.baked_funcs.size();
+    const auto take_baked = [&]() {
+        for (size_t i = baked_base; i < c.baked_funcs.size(); i++)
+            ret->elems.emplace_back(std::move(c.baked_funcs[i]));
+        c.baked_funcs.resize(baked_base);
+    };
+
     if (!c.eoi()) {
 
         do {
@@ -2209,11 +2234,14 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
             added_elem = false;
 
             if (pAcceptBracedBlock(c, tmp, fl)) {
+                take_baked();
                 ret->elems.emplace_back(std::move(tmp));
                 added_elem = true;
             }
 
             while ((stmt = pStmt(c, fl))) {
+
+                take_baked();
 
                 if (!stmt->is_nop())
                     ret->elems.emplace_back(std::move(stmt));
@@ -2748,6 +2776,15 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                 throw ExpressionIsNotConstEx(rv->start, rv->end);
 
             EvalValue cv = make_const_clone(RValue(rv->eval(c.const_ctx)));
+            /* #47: `rv` dies below - keep the function literals the
+             * member's value names (`const F = pure func(a) => a;` is
+             * itself one) */
+            {
+                std::unordered_set<const FuncDescriptor *> descs;
+                collect_value_descs(cv, descs);
+                if (!descs.empty())
+                    detach_baked_funcs(c, rv, descs);
+            }
             stmt->def->consts.emplace_back(cn, std::move(cv));
             pExpectOp(c, Op::semicolon);
             continue;
@@ -3061,6 +3098,100 @@ cse_key(ParseContext &c, const Construct *node)
 }
 
 /*
+ * #47: the FuncDescriptors a baked const value NAMES - every FuncObject in
+ * it, through general arrays, dicts (keys too), boxed struct fields and a
+ * struct type's const members. A flat array (ints/floats/bools/strs/POD
+ * structs) cannot hold a function, and get_view() on one would PROMOTE it,
+ * so those kinds are skipped rather than viewed.
+ */
+static void
+collect_value_descs(const EvalValue &v,
+                    std::unordered_set<const FuncDescriptor *> &out)
+{
+    switch (v.get_type()->t) {
+
+    case Type::t_func:
+        out.insert(v.get_ref<intrusive_ptr<FuncObject>>()->func);
+        break;
+
+    case Type::t_arr: {
+        const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+        if (arr.skind() != SharedArrayObj::Storage::general)
+            break;
+        ArrayConstView view = arr.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            collect_value_descs(view[i].get(), out);
+        break;
+    }
+
+    case Type::t_dict:
+        for (const auto &kv :
+                 v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
+            collect_value_descs(kv.first, out);
+            collect_value_descs(kv.second.get(), out);
+        }
+        break;
+
+    case Type::t_struct:
+        for (const LValue &f :
+                 v.get_ref<intrusive_ptr<StructObject>>()->fields)
+            collect_value_descs(f.get(), out);   /* POD holds no func */
+        break;
+
+    case Type::t_structtype:
+        for (const auto &cm : v.get<StructTypeDef *>()->consts)
+            collect_value_descs(cm.second, out);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/*
+ * #47: before a const bake FREES `slot`'s subtree, move out every function
+ * LITERAL in it whose descriptor the baked value still names, parking it in
+ * ParseContext::baked_funcs for the enclosing pBlock to re-insert (see that
+ * field). A decl the value does not name dies with the subtree as before -
+ * `sort([3, 1], pure func(a, b) => a < b)` bakes ints, and its comparator
+ * has nothing left to call it. The body of a detached decl goes with it; a
+ * literal nested in an UNNAMED decl's body is still searched, since a
+ * parse-time call of the outer one may have returned the inner one.
+ */
+static void
+detach_baked_funcs(ParseContext &c, unique_ptr<Construct> &slot,
+                   const std::unordered_set<const FuncDescriptor *> &descs)
+{
+    if (!slot)
+        return;
+    if (ctag(slot.get()) == ConstructType::func_decl
+        && descs.count(static_cast<FuncDeclStmt *>(slot.get())->desc))
+    {
+        c.baked_funcs.push_back(std::move(slot));
+        return;
+    }
+    for_each_child_slot(slot.get(), [&](unique_ptr<Construct> &ch) {
+        detach_baked_funcs(c, ch, descs);
+    });
+}
+
+/* The same, for a subtree the caller still owns through a raw pointer: its
+ * ROOT is never a function literal at the bake sites that use this (they
+ * bake array/dict/struct results), so only its children are searched. */
+static void
+detach_baked_funcs_below(ParseContext &c, Construct *node,
+                         const EvalValue &baked)
+{
+    std::unordered_set<const FuncDescriptor *> descs;
+    collect_value_descs(baked, descs);
+    if (descs.empty())
+        return;
+    for_each_child_slot(node, [&](unique_ptr<Construct> &ch) {
+        detach_baked_funcs(c, ch, descs);
+    });
+}
+
+/*
  * Materialize a const expression's value into `out`, de-duplicating identical
  * const array/dict results across the parse. A drop-in for the
  * `MakeConstructFromConstVal(node->eval(...), out, ...)` pattern at the three
@@ -3070,11 +3201,11 @@ cse_key(ParseContext &c, const Construct *node)
  * result when it is a read-only (shareable) array/dict.
  */
 static bool
-cse_materialize(ParseContext &c,
-                Construct *node,
-                unique_ptr<Construct> &out,
-                bool process_arrays,
-                bool immutable)
+cse_materialize_core(ParseContext &c,
+                     Construct *node,
+                     unique_ptr<Construct> &out,
+                     bool process_arrays,
+                     bool immutable)
 {
     /*
      * Only read-only array/dict results are cacheable, and those arise only
@@ -3126,6 +3257,23 @@ cse_materialize(ParseContext &c,
      * identical to the non-cached path.
      */
     return MakeConstructFromConstVal(v, out, process_arrays, immutable);
+}
+
+static bool
+cse_materialize(ParseContext &c,
+                Construct *node,
+                unique_ptr<Construct> &out,
+                bool process_arrays,
+                bool immutable)
+{
+    if (!cse_materialize_core(c, node, out, process_arrays, immutable))
+        return false;
+    /* #47: `node` is about to be freed by the caller - keep alive every
+     * function literal in it that the baked value still names. */
+    if (out && ctag(out.get()) == ConstructType::lit_obj)
+        detach_baked_funcs_below(
+            c, node, static_cast<LiteralObj *>(out.get())->literal_value());
+    return true;
 }
 
 bool

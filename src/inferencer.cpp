@@ -7030,6 +7030,22 @@ bool ReplInfer::instance_has_consumer(const FuncDeclStmt *fn)
 void for_each_child_of(Construct *c,
                        const std::function<void (Construct *)> &f)
 {
+    /*
+     * #47: its callers walk the FINAL tree - after specialize_types - and
+     * there a TypedScalarExpr is an ordinary interior node: `sum(xs, func
+     * (int x) => x * 2) + 1`, or an inlined `f(x) + 1` whose `f` was a
+     * lambda argument, puts a FUNCTION LITERAL under one. The inferencer's
+     * own walker keeps it a leaf (its passes run before M8), and this
+     * wrapper used to inherit that: collect_funcs never saw such a lambda,
+     * so vm_compile neither compiled its body nor took its descriptor, the
+     * AST teardown freed it, and the first MakeClosureV read freed memory
+     * (ASan: heap-use-after-free under -nj and the JIT; -tw keeps its AST).
+     */
+    if (c && c->ct == ConstructType::typed_scalar) {
+        for (auto &pr : static_cast<TypedScalarExpr *>(c)->elems)
+            f(pr.second.get());
+        return;
+    }
     Inferencer::for_each_child(c, f);
 }
 
