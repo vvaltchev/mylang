@@ -19784,6 +19784,170 @@ static bool jit_frameless_gate()
 }
 
 /*
+ * #97 F1: A FUNCTION CALLS A LEAF FRAMELESSLY - not only main. What
+ * confined the frameless site to main was PLACEMENT (the callee's entry is
+ * an immediate); vm_jit_program now jits every frameless leaf first, so
+ * any caller finds its leaf callee placed. Each case compares the JIT
+ * against the VM with the JIT OFF - stdout AND the rendered backtrace -
+ * and requires the site to have been emitted in a non-main caller
+ * (frameless_nonmain) and run (frameless_pushes):
+ *  - values, warmed in a loop;
+ *  - a throw from the leaf on iteration 37 - caught, then uncaught (the
+ *    postexit stamps the leaf's frame under a FUNCTION's, whose total is
+ *    baked at the site);
+ *  - a reference argument on every call: its use count unchanged between
+ *    two points (a leaked retain is invisible to every value check).
+ * Watched failing: with the leaves jitted LAST instead of first, no
+ * callee is placed when its caller is emitted and every case reports 0
+ * non-main sites.
+ */
+static bool jit_frameless_nonmain()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled || !jit_norec_on())
+        return true;
+    struct Restore {
+        bool pc;
+        ~Restore() { g_pure_cache_enabled = pc; }
+    } restore{ g_pure_cache_enabled };
+    g_pure_cache_enabled = false;
+    const auto run = [&](const std::vector<const char *> &lines,
+                         bool jit) -> std::string {
+        const bool jit_was = g_jit_enabled;
+        g_jit_enabled = jit;
+        std::string src;
+        for (const char *l : lines) { src += l; src += "\n"; }
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        std::string tail;
+        unique_ptr<Construct> root;      /* outside: see jit_frameless_calling */
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (const Exception &e) {
+            tail = std::string("EXC ") + e.name + "\n" + format_backtrace(e);
+        }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        g_jit_enabled = jit_was;
+        return cap.str() + tail;
+    };
+    bool ok = true;
+    const auto same = [&](const char *what,
+                          const std::vector<const char *> &lines,
+                          const char *must) {
+        const unsigned long n0 = g_jit_frameless_nonmain;
+        const unsigned long p0 = g_jit_frameless_pushes;
+        const std::string ref = run(lines, false);
+        const std::string vm = run(lines, true);
+        const unsigned long dn = g_jit_frameless_nonmain - n0;
+        const unsigned long dp = g_jit_frameless_pushes - p0;
+        if (ref != vm || ref.find(must) == std::string::npos) {
+            fprintf(stderr, "jit_frameless_nonmain: %s differs\n  nj: "
+                    "%s\n  vm: %s\n", what, ref.c_str(), vm.c_str());
+            ok = false;
+        }
+        if (!dn || dp < 30) {
+            fprintf(stderr, "jit_frameless_nonmain: %s VACUOUS - %lu "
+                    "non-main frameless sites emitted, %lu frameless "
+                    "calls\n", what, dn, dp);
+            ok = false;
+        }
+    };
+    same("values, warmed", {
+        "func mix(int a, int b) {",
+        "  var x = a * 31 + b;",
+        "  x = x ^ (x >> 7);",
+        "  x = x * 5 + 3;",
+        "  if (x < 0) x = 0 - x;",
+        "  return x % 1000003;",
+        "}",
+        "func drive(int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = (s + mix(i, s)) % 1000000007;",
+        "  return s;",
+        "}",
+        "print(drive(int(runtime(500))));" }, "\n");
+    same("a throw from the leaf, caught then uncaught", {
+        "struct Boom { int at; }",
+        "func chk(int v) {",
+        "  var w = v * 3 + 1;",
+        "  w = w ^ (w >> 2);",
+        "  if (v == 37) throw Boom(w);",
+        "  return w % 101;",
+        "}",
+        "func loop(int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = s + chk(i);",
+        "  return s;",
+        "}",
+        "try { print(loop(int(runtime(50)))); }",
+        "catch (Boom as b) { print(\"boom\", b.at); }",
+        "print(loop(int(runtime(30))));",
+        "print(loop(int(runtime(60))));" }, "EXC");
+    same("a reference argument on every call", {
+        "func pick(array<int> a, int i) {",
+        "  var k = i * 7 + 3;",
+        "  k = k ^ (k >> 1);",
+        "  return a[k % 3];",
+        "}",
+        "func total(array<int> a, int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = s + pick(a, i);",
+        "  return s;",
+        "}",
+        /* the COUNT is not the check (an argument temp may still hold
+         * the array) - what must not grow is the count between two
+         * points three and nine calls in, both read INSIDE the loop (read
+         * again in the final print's argument list it reads one higher,
+         * in every engine) */
+        "var arr = [5, 6, 7];",
+        "var s = 0;",
+        "var rc1 = 0;",
+        "var rc2 = 0;",
+        "for (var k = 0; k < 9; k++) {",
+        "  s = s + total(arr, int(runtime(40)));",
+        "  if (k == 2) rc1 = refcount(arr);",
+        "  if (k == 8) rc2 = refcount(arr);",
+        "}",
+        "print(s, rc1 == rc2);" }, "true");
+    /*
+     * A CALLBACK that makes the frameless call: the lambda is a calling
+     * frameless body, so its vframe is published lazily (E2e) - and a
+     * builtin enters it as a BOUNDARY frame through VmInvoker, which
+     * reuses act.view_frame for the next element straight after the
+     * boundary return. That return did not publish, so the invoker bound
+     * element 2 into the leaf's dead window: a SEGV in a release build,
+     * the poison window in a TESTS one. Every callback builtin, several
+     * elements each. Watched failing: without the boundary arm's
+     * publish, the poison hit aborts the suite.
+     */
+    same("a builtin callback's lambda calls a leaf, per element", {
+        "func key(int x) { if (x == 999) return 7; return x % 5; }",
+        "func wt(int x, int y) { return x * 3 + y; }",
+        "var xs = make_array(200, func(int i) => (i * 37) % 101);",
+        "var f = filter(func(int x) => key(x) > 1, xs);",
+        "var m = map(func(int x) => wt(x, 2) - key(x), xs);",
+        "var s = sort(xs, func(int a, int b) =>",
+        "             key(a) * 1000 + a < key(b) * 1000 + b);",
+        "var g = make_array(50, func(int i) => wt(i, key(i)));",
+        "print(len(f), sum(f), sum(m), s[0], s[199], sum(g));" },
+        "118 5969 30033 0 99 3775");
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * #97 E2: A CALLING FRAMELESS CALLEE - a self-recursive body entered
  * framelessly at its own self sites, its window on the native stack, a
  * frame that is now an ANCESTOR. What must hold, each checked against
@@ -19964,22 +20128,43 @@ static bool jit_frameless_calling()
         "var rc1 = refcount(arr);",
         "for (var k = 0; k < 6; k++) s = s + r(int(runtime(80)), arr);",
         "print(s, refcount(arr) == rc1);" }, "true");
-    /* REFUSED: the body also calls ANOTHER function - `v(-1)` is const-
-     * specialized into its own clone. A normal push from a frameless
-     * frame could switch THROUGH it; the pre-pass must refuse the whole
-     * body. Watched: with the refusal removed, norec_switch_retarget's
-     * tripwire aborts on this case (the cap is 16, the recursion 60). */
-    same("a body that also calls another function is refused", {
+    /* REFUSED: the body also calls another CALLING function (F2 admits
+     * a LEAF - it cannot switch - so the other callee here recurses). A
+     * normal push from a frameless frame could switch THROUGH it; the
+     * pre-pass must refuse the whole body. Watched (E2): with the
+     * refusal removed, norec_switch_retarget's tripwire aborts on this
+     * shape (the cap is 16, the recursion 60). */
+    same("a body that also calls a CALLING function is refused", {
         "struct Boom { int at; }",
+        "func deep(int n) { if (n <= 0) return 1; return deep(n - 1) + 1; }",
         "func v(int n) {",
         "  if (n == 0) throw Boom(n + 7);",
         "  if (n < 0) return 1;",
-        "  return v(n - 1) + v(-1);",
+        "  return v(n - 1) + deep(n % 3 + 20);",
         "}",
         "for (var k = 0; k < 3; k++) {",
         "  try { print(v(int(runtime(60)))); }",
         "  catch (Boom as b) { print(\"boom\", b.at); }",
         "}" }, "boom 7", /*expect_tier=*/false);
+    /* F2: a calling body whose OTHER callee is a LEAF is admitted - the
+     * self sites and the leaf site are all frameless */
+    same("a recursion that also calls a leaf", {
+        "func weight(int n) {",
+        "  var x = n * 7 + 3;",
+        "  x = x ^ (x >> 3);",
+        "  if (x < 0) x = 0 - x;",
+        "  return x % 1009;",
+        "}",
+        "func walk(int n) {",
+        "  if (n <= 0) return 0;",
+        /* two self calls: a CachedCallV (a plain call with the cache
+         * off), which is run-eligible even under the sanitized build's
+         * cap - a lone self CallV is not (op_run_eligible) */
+        "  return (weight(n) + walk(n - 1) + walk(n % 2 - 5)) % 1000000007;",
+        "}",
+        "var s = 0;",
+        "for (var k = 0; k < 3; k++) s = s + walk(int(runtime(200 + k)));",
+        "print(s);" }, "\n");
     /*
      * E2c's soundness half: the identity chain may be skipped only for a
      * slot that is REALLY written once. Under FORCE=bakecallee a
@@ -20489,6 +20674,14 @@ static bool jit_callee_cache_hit()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
+    /* #97 F1: this tier's shape - a function calling a leaf - now takes
+     * the FRAMELESS site; the tier still serves every callee that is not
+     * frameless-eligible, so pin it here by turning that lever off */
+    struct FlOff {
+        unsigned saved = g_jit_off_extra;
+        FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
+        ~FlOff() { g_jit_off_extra = saved; }
+    } fl_off;
     auto run = [](const std::vector<const char *> &lines) -> bool {
         std::string src;
         std::vector<Tok> toks;
@@ -20631,6 +20824,14 @@ static bool jit_bind_widen_inline()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
+    /* #97 F1: this tier's shape - a function calling a leaf - now takes
+     * the FRAMELESS site; the tier still serves every callee that is not
+     * frameless-eligible, so pin it here by turning that lever off */
+    struct FlOff {
+        unsigned saved = g_jit_off_extra;
+        FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
+        ~FlOff() { g_jit_off_extra = saved; }
+    } fl_off;
     auto run = [](const std::vector<const char *> &lines) -> bool {
         std::string src;
         std::vector<Tok> toks;
@@ -39931,6 +40132,14 @@ static bool jit_native_call()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
+    /* #97 F1: this tier's shape - a function calling a leaf - now takes
+     * the FRAMELESS site; the tier still serves every callee that is not
+     * frameless-eligible, so pin it here by turning that lever off */
+    struct FlOff {
+        unsigned saved = g_jit_off_extra;
+        FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
+        ~FlOff() { g_jit_off_extra = saved; }
+    } fl_off;
     auto run = [](const std::vector<const char *> &lines) -> bool {
         std::string src;
         std::vector<Tok> toks;
@@ -44089,6 +44298,8 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 E2 - a CALLING frameless callee (self sites): values, the "
       "boundary decline at the cap, a throw through frameless ancestors, "
       "a threaded reference", jit_frameless_calling },
+    { "jit: #97 F1 - a function calls a leaf framelessly: values, a throw "
+      "caught and uncaught, a reference argument", jit_frameless_nonmain },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
       jit_bind_widen_inline },
     { "jit: a reference argument binds IN PLACE, and the declines (#162)",

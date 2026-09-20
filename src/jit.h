@@ -650,6 +650,9 @@ extern unsigned long g_jit_frameless_sites;     /* inc 2 (emit-time): the
                                                  * tail */
 extern unsigned long g_jit_frameless_pushes;    /* inc 2 (emitted code) */
 extern unsigned long g_jit_frameless_self_sites; /* E2: self sites EMITTED */
+extern unsigned long g_jit_frameless_nonmain; /* F1: frameless sites
+                                                * in a non-main caller to
+                                                * ANOTHER function (emit) */
 extern unsigned long g_jit_vframe_publish;     /* E2e: vframe
                                                 * publishes EMITTED */
 extern unsigned long g_jit_frameless_self_floor; /* E2d: self sites

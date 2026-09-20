@@ -2291,13 +2291,35 @@ void vm_jit_program(Chunk *main,
         jc.slot_reassigned = &slot_reassigned;
         jit_mark_frameless_wanted(*main, &jc);
     }
-    /* Pass B: every body with its own JitCtx (caller_desc = the
-     * descriptor keying its chunk). Order-independent: every
-     * native_leaf / frameless_ok flag was set by codegen, a caller bakes
-     * the callee DESCRIPTOR and loads its native entry at RUNTIME - the
-     * one placement-dependent site, main's frameless `call rel32`, is
-     * emitted after every body is placed. */
+    /* #97 F1: ...and from every body - any caller may call a LEAF
+     * framelessly now */
     for (const auto &b : bodies) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &slot_reassigned;
+        jc.caller_desc = b.second;
+        jit_mark_frameless_wanted(*b.first, &jc);
+    }
+    /*
+     * Pass B: every body with its own JitCtx (caller_desc = the
+     * descriptor keying its chunk). A frameless site's entry is an
+     * IMMEDIATE, so its callee must be placed before the caller is
+     * emitted - and placement is made by the callee's own JIT pass,
+     * whose position in `bodies` is a pointer-keyed map's order. So the
+     * frameless LEAF bodies go FIRST (#97 F1): a leaf names no callee,
+     * so it needs no placement of its own, and every leaf a site can
+     * name is placed before any site is emitted - in every run. The
+     * partition is STABLE, so the relative order within each half is
+     * what it always was. (main, compiled last, was the only caller
+     * this used to hold for.)
+     */
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> order(bodies);
+    std::stable_partition(
+        order.begin(), order.end(),
+        [](const std::pair<Chunk *, const FuncDescriptor *> &b) {
+            return b.first->frameless_ok && !b.first->frameless_calls;
+        });
+    for (const auto &b : order) {
         JitCtx jc;
         jc.slot_desc = &slot_desc;
         jc.slot_reassigned = &slot_reassigned;
@@ -3508,6 +3530,7 @@ unsigned long g_jit_frameless_self_sites = 0; /* #97 E2: emit-time */
 unsigned long g_jit_frameless_self_id = 0;    /* #97 E2c: emit-time */
 unsigned long g_jit_frameless_self_floor = 0; /* #97 E2d: emit-time */
 unsigned long g_jit_vframe_publish = 0;      /* #97 E2e: emit-time */
+unsigned long g_jit_frameless_nonmain = 0;   /* #97 F1: emit-time */
 unsigned long g_jit_frameless_boundary = 0;   /* #97 E2: run-time */
 unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
                                             * (emitted code) */

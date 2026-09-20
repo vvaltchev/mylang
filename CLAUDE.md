@@ -798,7 +798,12 @@ which is precisely what `scripts/vdjcmp.sh` is. The elision is allowed
 for exactly ONE caller, on a structural argument rather than on luck:
 **MAIN is compiled LAST**, after every function body, so every callee
 it can name is already placed (`bake_final`; a null
-`g_cur_caller_desc` IS main). **When you read a field at emit time,
+`g_cur_caller_desc` IS main). **#97 F1 added the second such
+argument, and it is the same kind:** Pass B jits every frameless
+LEAF body FIRST (a stable partition in `vm_jit_program` - a leaf
+names no callee, so it needs no placement of its own), so ANY caller
+may read a leaf callee's placement; a CALLING callee is still read
+only at its own self sites. **When you read a field at emit time,
 ask which PASS writes it and whether that pass has run for THIS
 object** - and if the answer varies, do not let it vary per run.
 
@@ -1043,7 +1048,10 @@ and a new emitter must obey all four:
    (unless fixed-frame) and `call_rax` - so a C++ helper there must
    be reached through one of those two, never a bare `call_reg`,
    or it runs with a stale `ctx->frame` (a TESTS build's poison
-   window then aborts it by name).
+   window then aborts it by name). **Any other way control reaches
+   C++ publishes too**: the exception epilogues and the ReturnV's
+   BOUNDARY arm (a callback's owner reuses the frame for the next
+   element - missing it was a release SEGV, 2026-09-25).
  - **EVERY emission that moves rsp goes through a seam that calls
    `Emitter::sp_move`** - push/pop, `push_base0`/`push_base`/
    `push_abs32`, `op_reg_imm` on RSP, `push_rbp`/`pop_rbp`,
