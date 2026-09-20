@@ -27786,6 +27786,9 @@ static bool vm_disasm_driver_jit_parity()
  * instrumentation prologue (the entry RA check, the return-arm oracle)
  * simply starts at the first shipping instruction.
  */
+#if ML_JIT_SUPPORTED   /* used by the JIT shape tests alone: off-platform
+                        * they are unused statics, and macOS clang fails
+                        * the build on one (-Werror=unused-function) */
 struct NativeIns { uint32_t off; std::string text; };
 
 /* the instructions of one chunk section's native dump, in offset order,
@@ -27988,38 +27991,86 @@ static long native_frameless_entry_off(const std::string &dump,
     return std::atol(dump.c_str() + f + 20);
 }
 
+/* the mark line `; vm op N: <text>` has NO instruction of its own:
+ * the next dump line is a separator or another mark */
+static bool native_mark_empty(const std::string &dump,
+                              const std::string &section,
+                              const std::string &mark_text)
+{
+    const size_t s = dump.find("; ===== " + section);
+    if (s == std::string::npos)
+        return false;
+    const size_t m = dump.find("; vm op ", s);
+    size_t p = m;
+    while (p != std::string::npos) {
+        const size_t nl = dump.find('\n', p);
+        const std::string line = dump.substr(p, nl - p);
+        if (line.find(mark_text) != std::string::npos) {
+            const size_t q = nl + 1;
+            const size_t nl2 = dump.find('\n', q);
+            const std::string next = dump.substr(q, nl2 - q);
+            return next == "       ."
+                   || next.find("; vm op ") != std::string::npos;
+        }
+        p = dump.find("; vm op ", nl);
+    }
+    return false;
+}
+#endif   /* ML_JIT_SUPPORTED */
+
 /*
- * #97 increment 3, W1 - THE CALLER BUILDS THE WINDOW. The expected
- * disassembly of 78's `add(i)`, read from the dump:
+ * #97 increment 3, W1/W2 - THE CALLER BUILDS THE WINDOW AND BINDS FROM
+ * THE ARGUMENT SOURCES. The expected disassembly of 78's shape, read
+ * from the dump:
  *  - the callee's frameless ENTRY is the recorded prologue plus
  *    `lea rbx, [rbp+32]` and the vframe repoint - no window carve, no
- *    argument copy, no slot init (all three moved to the site);
+ *    argument copy, no slot init (all three are the site's);
  *  - the return arm tells the frame apart by `rbx == rbp+32`, an lea
  *    and a compare, no load;
- *  - the SITE reserves the callee's 3 slots (144 bytes), fills the
- *    parameter from the staged run slot (payload, the declared int tag
- *    as an immediate, a zeroed tail), gives the two temps a zero tail
- *    and a t_none type word, pushes the residue, calls, and drops the
- *    residue and the window together (160) on the sentinel path.
- * W2 rewrites the site's fill (the staging move disappears); this
- * expectation is W1's and is replaced with it.
+ *  - the SITE of `add(i)`, `i` a pinned int: the staging `move` emits
+ *    NOTHING, the callee's 3 slots are reserved (144), the parameter's
+ *    payload is stored STRAIGHT FROM THE REGISTER with the declared
+ *    int tag as an immediate - no coercing check, an emit-time fact -
+ *    the two temps get a zero tail and t_none, the residue is pushed,
+ *    the call made, residue and window dropped together (160);
+ *  - the site of `scale_it(i)`, the same pin into a FLOAT parameter:
+ *    one cvtsi2sd from the register into the window, the float tag;
+ *  - the site of `fi(a)`, `a` a `dyn` (memory) source into an int
+ *    parameter: the 1c dispatch on the SOURCE's type word - exact,
+ *    bool retag, none, decline - widening into the window slot.
  */
-static bool jit_frameless_w1_shape()
+static bool jit_frameless_w2_shape()
 {
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
-    std::string d;
+    std::string d, d2;
     try {
         d = native_dump_of({
             "func make_adder(int base) {",
             "  return func [base] (int k) { return base + k; }; }",
+            "func make_scaler(float f) {",
+            "  return func [f] (float x) { return f * x; }; }",
             "var add = make_adder(7);",
+            "var scale_it = make_scaler(0.5);",
+            "var N = int(runtime(40));",
+            "var s = 0; var t = 0.0;",
+            "for (var i = 0; i < N; i++) {",
+            "  s = s + add(i); t = t + scale_it(i); }",
+            "print(s, t);" });
+        d2 = native_dump_of({
+            "func mk(int z) { return func [z] (int k) { return k * z; }; }",
+            "var fi = mk(3);",
+            /* written twice: a write-once `dyn` initialised with a
+             * literal is auto-const-promoted and the argument becomes
+             * a LoadConstV into the run (shape-eater #6) */
+            "var dyn a = 0; a = runtime(5);",
+            "var N = int(runtime(40));",
             "var s = 0;",
-            "for (var i = 0; i < runtime(40); i++) s = s + add(i);",
+            "for (var i = 0; i < N; i++) s = s + fi(a);",
             "print(s);" });
     } catch (Exception &e) {
-        fprintf(stderr, "jit_frameless_w1_shape: threw %s: %s\n", e.name,
+        fprintf(stderr, "jit_frameless_w2_shape: threw %s: %s\n", e.name,
                 e.msg);
         return false;
     }
@@ -28028,7 +28079,7 @@ static bool jit_frameless_w1_shape()
     const std::vector<NativeIns> cl = native_ins_of(d, "closure#0");
     const long fe = native_frameless_entry_off(d, "closure#0");
     if (fe < 0 || cl.empty()) {
-        fprintf(stderr, "jit_frameless_w1_shape: closure#0 has no "
+        fprintf(stderr, "jit_frameless_w2_shape: closure#0 has no "
                         "frameless entry in the dump\n");
         return false;
     }
@@ -28048,7 +28099,7 @@ static bool jit_frameless_w1_shape()
                     "movabs rsi, <int-tag>@-",   /* the register-form
                                                   * singletons, off-arena */
                     "movabs r8, <float-tag>@-",
-                    "jmp +*" }, "W1 entry") && ok;
+                    "jmp +*" }, "W2 entry") && ok;
     }
     {
         /* the return arm: the discriminator, then the frameless arm at
@@ -28059,7 +28110,7 @@ static bool jit_frameless_w1_shape()
              && native_expect(cl, at, {
                     "lea rax, [rbp+0x20]",
                     "cmp rax, rbx",
-                    "je +*" }, "W1 arm discriminator") && ok;
+                    "je +*" }, "W2 arm discriminator") && ok;
         if (ok) {
             const uint32_t tgt = static_cast<uint32_t>(
                 std::atoi(cl[at + 2].text.c_str() + 4));
@@ -28084,12 +28135,18 @@ static bool jit_frameless_w1_shape()
                         "lea rsp, [rbp-0x8]",
                         "pop rbx",
                         "pop rbp",
-                        "ret" }, "W1 frameless arm") && ok;
+                        "ret" }, "W2 frameless arm") && ok;
         }
     }
-    /* the site, in main */
+    /* the sites, in main: the staging moves emit nothing */
+    if (!native_mark_empty(d, "main", "move         r6 = i")) {
+        fprintf(stderr, "jit_frameless_w2_shape: the staging `move r6 = i` "
+                        "still emits code (or the mark is not `r6`)\n");
+        ok = false;
+    }
     const std::vector<NativeIns> mn = native_ins_of(d, "main");
     {
+        /* add(i): the pin straight into the window, no check */
         const size_t at = native_find(mn, 0, "sub rsp, 144");
         ok = at != std::string::npos
              && native_expect(mn, at, {
@@ -28097,8 +28154,7 @@ static bool jit_frameless_w1_shape()
                     "mov r10, rsp",
                     "mov [r10+0x20], 0",         /* param 0: the tail */
                     "mov [r10+0x28], 0",
-                    "mov r11, r*",               /* from the run slot */
-                    "mov [r10+0x0], r11",
+                    "mov [r10+0x0], r1*",        /* the pinned i, r12-r15 */
                     "mov [r10+0x18], <int-tag>@r11",  /* declared int */
                     "xor r11, r11",              /* the two temps' tails */
                     "mov [r10+0x50], r11",
@@ -28116,7 +28172,58 @@ static bool jit_frameless_w1_shape()
                     "cmp rax, -1",
                     "jne +*",
                     "add rsp, 160" },            /* residue + window */
-                    "W1 site") && ok;
+                    "W2 site add(i)") && ok;
+        /* scale_it(i): the same pin, converted straight into the window */
+        const size_t at2 = at == std::string::npos ? at
+                           : native_find(mn, mn[at].off + 1, "sub rsp, 144");
+        ok = at2 != std::string::npos
+             && native_expect(mn, at2, {
+                    "sub rsp, 144",
+                    "mov r10, rsp",
+                    "mov [r10+0x20], 0",
+                    "mov [r10+0x28], 0",
+                    "xorps xmm0, xmm0",          /* the merge-dep break */
+                    "cvtsi2sd xmm0, r1*",        /* from the register */
+                    "movsd [r10+0x0], xmm0",
+                    "mov [r10+0x18], <float-tag>@r11",
+                    "xor r11, r11" }, "W2 site scale_it(i)") && ok;
+    }
+    {
+        /* fi(a), `a` dyn: the dispatch on the source's own type word */
+        const std::vector<NativeIns> m2 = native_ins_of(d2, "main");
+        const size_t at = native_find(m2, 0, "sub rsp, 144");
+        ok = at != std::string::npos
+             && native_expect(m2, at, {
+                    "sub rsp, 144",
+                    "mov r10, rsp",
+                    "mov [r10+0x20], 0",
+                    "mov [r10+0x28], 0",
+                    "cmp a.type, <int-tag>@r11", /* exact? */
+                    "je +*",
+                    "mov rsi, a.type",
+                    "movzx rsi, [rsi+0x8]",
+                    "cmp rsi, 0",                /* none? */
+                    "je +*",
+                    "cmp rsi, 6",                /* bool? else decline */
+                    "jne +*",
+                    "mov r11, a",                /* bool: retag */
+                    "mov [r10+0x0], r11",
+                    "mov [r10+0x18], <int-tag>@r11",
+                    "jmp +*",
+                    "mov r11, a",                /* none: both words */
+                    "mov [r10+0x0], r11",
+                    "mov r11, a.type",
+                    "mov [r10+0x18], r11",
+                    "jmp +*",
+                    "mov r11, a",                /* exact */
+                    "mov [r10+0x0], r11",
+                    "mov [r10+0x18], <int-tag>@r11",
+                    "xor r11, r11" }, "W2 site fi(dyn a)") && ok;
+        if (!native_mark_empty(d2, "main", "= a")) {
+            fprintf(stderr, "jit_frameless_w2_shape: the staging move of "
+                            "`a` still emits code\n");
+            ok = false;
+        }
     }
     return ok;
 #else
@@ -28172,7 +28279,10 @@ static bool jit_frameless_call_reach()
             else
                 root->eval(nullptr);
         } catch (const Exception &e) {
-            r.bt = format_backtrace(e);
+            /* the name and message too (W2: a decline's C++ raise names
+             * the ARGUMENT's type, which the trampoline materialised) */
+            r.bt = std::string(e.name ? e.name : "?") + ": "
+                   + (e.msg ? e.msg : "") + "\n" + format_backtrace(e);
             r.ok = false;
         } catch (...) {
             r.ok = false;
@@ -28301,6 +28411,74 @@ static bool jit_frameless_call_reach()
             "var s = 0;",
             "for (var i = 0; i < runtime(6); i++) s = s + thr(i);",
             "print(s);" }, "", 3, true },
+        /* #97 inc 3, W2: the fill binds from the argument SOURCES */
+        /* (closures, like 78: a named leaf this small is inlined away
+         * at compile time and no call survives - shape-eater #8) */
+        { "W2: MEMORY sources through the 1c dispatch into the window - "
+          "a dyn int into an int param (exact), a dyn bool into an int "
+          "param (retag), a dyn int into a float param (cvt), a dyn "
+          "float into a float param (exact), none into an opt int", {
+            "func mk(int z) { return func [z] (int k) { return k * z; }; }",
+            "func mkf(float w) {",
+            "  return func [w] (float x) { return x * w; }; }",
+            "func mko(int z) { return func [z] (opt int k) {",
+            "  if (k == none) { return -1; } return k + z; }; }",
+            "var fi = mk(3); var ff = mkf(2.0); var fo = mko(1);",
+            "var dyn a = 5; var dyn b = true; var dyn c = 2.5;",
+            "var dyn n = none;",
+            "var s = 0; var t = 0.0;",
+            "for (var i = 0; i < runtime(20); i++) {",
+            "  s = s + fi(a) + fi(b) + fo(n) + fo(a);",
+            "  t = t + ff(a) + ff(c); }",
+            "print(s, t);" }, "460 300.000000 \n", 120, false },
+        /* the two DECLINE shapes. A declined site hands the call to
+         * the C++ tier, which binds from the RUN - and the fused
+         * argument's staging move was not emitted, so the trampoline
+         * must materialise it first. Both cases make a stale run
+         * OBSERVABLE: the `print(s, s)` just before stages INTS into
+         * the very run slots the declined call would have staged into,
+         * so a C++ tier reading a stale run binds those ints, never
+         * raises, and prints a number where the tree-walker raises
+         * (watched: with the materialisation removed, `324` for a
+         * TypeErrorEx). A string there would raise the same generic
+         * message and hide the bug - the first version of these cases
+         * did exactly that. (A statically typed float into an int
+         * parameter is refused at COMPILE time, so the fill's float-pin
+         * narrowing arm is unreachable from a program; a `dyn` float is
+         * the runtime shape.) */
+        { "W2: a dyn FLOAT into an int param declines the fill's memory "
+          "dispatch to the C++ tier, which raises - the run materialised "
+          "first (backtrace + message parity; a stale run would bind the "
+          "previous iteration's int and not raise)", {
+            "func mk(int z) { return func [z] (int k) { return k * z; }; }",
+            "var fi = mk(3);",
+            "var dyn t = 0.5; var s = 0;",
+            "for (var i = 0; i < runtime(4); i++) {",
+            "  s = s + fi(i); print(s, s); t = t + 1.0; s = s + fi(t); }",
+            "print(s);" }, "", 1, true },
+        { "W2: a PINNED int into an UN-ANNOTATED (ref-listed) parameter "
+          "binds from the register - the memory path read the pin's "
+          "STALE slot (found by corpus_diff on 24_capture_scalar: the "
+          "flat append refused the garbage type)", {
+            "func make_box(arr) => func [arr] (v) { append(arr, v);",
+            "  return len(arr); };",
+            "var box = [1, 2, 3];",
+            "var bx = make_box(box);",
+            "var n = 0; var N = int(runtime(30));",
+            "for (var i = 0; i < N; i++) n = n + bx(i);",
+            "print(n, len(box), box[32]);" }, "555 33 29 \n", 30, false },
+        { "W2: a pinned int sibling next to a dyn STRING into an int "
+          "param - the decline trampoline materialises BOTH into the run "
+          "(the pin from its register) before the C++ tier raises", {
+            "func mk2(int z) {",
+            "  return func [z] (int a, int b) { return a + b + z; }; }",
+            "var f2 = mk2(1);",
+            /* written twice, or the write-once `dyn` folds to a
+             * LoadConstV into the run and nothing is fused */
+            "var dyn z = 0; z = runtime(\"str\"); var s = 0;",
+            "for (var i = 0; i < runtime(4); i++) {",
+            "  s = s + f2(i, i); print(s, s); s = s + f2(i, z); }",
+            "print(s);" }, "", 1, true },
     };
     bool all = true;
     for (const Case &c : cases) {
@@ -40697,10 +40875,11 @@ static const std::vector<extra_check> extra_checks =
       "frameless pre-pass, main's map), and a deleted-originals "
       "fragment's marks name the original ops",
       vm_disasm_driver_jit_parity },
-    { "jit: #97 inc 3 (W1) - the CALLER builds the frameless window: the "
-      "expected entry, discriminator, arm and site sequences, read from "
-      "the dump",
-      jit_frameless_w1_shape },
+    { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "
+      "and binds from the argument SOURCES: the expected entry, "
+      "discriminator, arm and site sequences (a pinned int into an int "
+      "and a float param, a dyn memory source), read from the dump",
+      jit_frameless_w2_shape },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },

@@ -12499,3 +12499,116 @@ plain and every matrix 34/34; driver_checks; regcensus at its floors;
 norec_enum --depth 3, norec_sweep, nested_fuzz, vdjcmp self-test,
 disasmcheck - see the commit. Perf is measured at the end of the
 increment, not per step.
+
+## #97 increment 3, W2 - THE SITE BINDS FROM THE ARGUMENT SOURCES: the
+## staging move disappears, a pin is stored from its register, the
+## coercing check is an emit-time fact (2026-09-20)
+
+**What it is.** With the window at the site (W1), the argument's
+staging `MoveV run[i] = x` has exactly one consumer four instructions
+later - the fill - and the fill can read `x` where it lives instead.
+The #162 fusion decision already skips staging moves for the generic
+push under narrow gates (a ref-listed, non-pinned named local); a
+frameless site now fuses under its own: ANY named local, pinned or
+not, scalar or reference. The site's fill (`emit_frameless_window`)
+then binds each parameter from its SOURCE:
+
+    an int in a register    `mov [win], reg` + the int tag immediate;
+    (or a spill home)       into a declared-float param one cvtsi2sd
+                            from the register - no check either way,
+                            a pin is a proven int;
+    a float in a register   `movsd [win], xmm` + the float tag;
+    memory, declared        the 1c dispatch on the SOURCE's type word,
+    int/float               widening INTO THE WINDOW SLOT (the generic
+                            push could not fuse a coercing argument -
+                            its widening writes the temp in place, and
+                            a fused argument has none; the window is
+                            fresh stack, so here it can);
+    memory, ref-listed      the reference bind helper straight from
+                            the caller's slot (the #162 shape);
+    memory, otherwise       payload + type word.
+
+Two rules the first version got wrong, both found by a net the same
+hour: **a register-resident source binds from the register whatever
+the parameter admits** - a pinned counter into an un-annotated (hence
+ref-listed) parameter took the memory path and bound the pin's STALE
+slot (corpus_diff: 24_capture_scalar's flat append refused the garbage
+type; -rt was green, its pinned cases all had declared int params); and
+**every decline must give the window back and materialise the skipped
+moves into the run** (`emit_frameless_materialise`: a register-resident
+source through the put helpers, a memory one through jit_stage_args
+with a pool allocated at the site, because residence is a per-pc fact
+the fusion decision does not have) - the C++ tier binds from the run,
+and a stale run slot holding an int from the `print(s, s)` before it
+BINDS and never raises (watched: `324` printed where the tree-walker
+raises TypeErrorEx). A string there raises the same generic message and
+hides the bug, which is what the first version of that test did.
+
+The scalar binds run first, the reference binds last: a retain is the
+one side effect in the fill, so no decline ever has one to undo.
+
+**The expected dump, and the dump** (78, perf build; W1's site for
+reference in its own entry):
+
+    op 21  move r7 = i              W1: 6 (guard + two stores)   W2: 0
+    op 22  the site                  W1: 45                       W2: 34
+           ... identity compare (8), then
+           sub rsp,144 / mov r10,rsp / two tail stores /
+           mov [r10],r14 / mov [r10+0x18],<int-tag> /     <- the pin
+           xor r11,r11 / 4 tails / 2 t_none / residue (5) /
+           call / cmp rax,-1 / jne / add rsp,160 / vframe (3) / jmp
+    scale_it(i): xorps xmm0,xmm0 / cvtsi2sd xmm0,r14 /
+           movsd [r10],xmm0 / mov [r10+0x18],<float-tag>  - no dispatch
+
+Per `add(i)` call: the caller 52 -> 35, the callee unchanged at 38
+(entry 9, body 8, arm 21) - 90 -> 73, against inc 2's 83 and C++'s
+~10. What is left at the site, for the next steps: the two temps'
+init (6), the captures push/repoint/restore (5 + 3, W4), the vframe
+repoint and restore (3 + 3), the float pin spill/reload (2, #124).
+
+**Callgrind (OPT=1 ASSERTS=0, -npc; the baseline is inc 2's tree,
+3514581):** 78 per scale unit 196.00M -> 176.00M Ir, **-10.2%** -
+exactly -20 Ir per iteration for its two calls (add(i) -9,
+scale_it(i) -11, the dispatch-free cvt); 63_closures -2.81%;
+11_closure_counter **+1.19%**, which is +1 Ir per call and is W1's:
+a 0-argument call gains nothing from W2 and pays the site's
+`mov r10, rsp` and the arm's `lea` (the entry's `sub/mov` pair and the
+site's `lea rdi` went, the window base and the discriminator came) -
+two register-only instructions, noted, not chased: the init elision
+(-6) and the capture base (-8) on the same path are next. 09, 75, 76,
+12 flat to the instruction (not frameless).
+
+**Wall clock, one 1-vs-1 run at the end of the task (the maintainer's
+instruction: the disassembly during, the clock after), `bench/run.py
+--mylang build-claude/perf/mylang --baseline build-claude/
+base-3514581/mylang`, -npc:** 78 **0.91x**, 11 **0.93x**, 63 0.99x,
+09/10/12/75/76 1.00-1.01x, geomean cur/base 0.999x over 90; my/cpp
+now 78 9.97x (was 10.63x), 11 8.32x (8.76x), 63 8.67x (8.73x), 76
+10.79x and 09 7.21x untouched. 11's clock moved against its +1 Ir -
+the instruction count and the clock disagree in the usual direction
+on this path (a dependent-load chain shortened at the entry is what
+the clock sees).
+
+**Encoders:** `Emitter::fstore_base` (movsd [base+disp], xmm) and
+`Emitter::cvt_reg` (cvtsi2sd xmm, r64) - the register-source convert
+existed only as raw bytes at the struct-field read.
+
+**Nets:** `jit_frameless_w2_shape` pins the entry, the discriminator,
+the arm, and three sites from the dump - the pin into an int param,
+the pin into a float param, a `dyn` memory source's dispatch - and that
+the staging moves emit nothing. Four reach cases (values, both engines;
+the two declines compare name, message and backtrace). Both declines
+watched failing with the materialisation removed; the register-
+residence rule watched failing on the un-annotated case. `g_jit_bake_
+widen` is bumped by the fill's two widening arms, so `jit_bake_
+coercing`'s 78 shape still counts 60 widenings. The census at its
+floors; -rt, every corpus matrix, driver_checks, norec_enum --depth 3,
+norec_sweep, nested_fuzz, vdjcmp, disasmcheck - see the commit.
+
+**A pre-existing RULE 2 divergence this exposed, not fixed here:** a
+bind-coercion error raised by the C++ call tier carets the whole call
+(`f2(i, z)`, col 44:52) under the VM+JIT, the argument under the
+tree-walker (col 47:51), and has NO location at all under `-nj`. Same
+on the W1 tree and with the frameless lever off; the reach harness
+compares backtraces and messages, not carets. Filed in
+docs/in-flight-tasks.md.

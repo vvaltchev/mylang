@@ -3777,6 +3777,16 @@ struct Emitter {
         u8(static_cast<uint8_t>(MODRM_SLOT | ((r & 7) << 3)));
         u32(uint32_t(d));
     }
+    /* movsd [base+disp32], xmm<r> - a window that is not the slots
+     * base (#97 W2: the caller-built frameless window at r10) */
+    void fstore_base(uint8_t r, uint8_t base, int32_t d)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "fstore_base: rsp/r12 need a SIB byte");
+        u8(0xF2); sse_rex(r, base); u8(0x0F); u8(0x11);
+        u8(static_cast<uint8_t>(0x80 | ((r & 7) << 3) | (base & 7)));
+        u32(uint32_t(d));
+    }
     /* addsd/subsd/mulsd xmm0, xmm1 (op = 0x58/0x5C/0x59) */
     /* addsd/subsd/mulsd/divsd xmm<dst>, xmm<src> (op = 0x58/0x5C/0x59/
      * 0x5E), computing dst = dst OP src.
@@ -3920,6 +3930,20 @@ struct Emitter {
         u8(0xF2); sse_rex(r, REG_SLOTS_BASE, true); u8(0x0F); u8(0x2A);
         u8(static_cast<uint8_t>(MODRM_SLOT | ((r & 7) << 3)));
         u32(uint32_t(d));
+    }
+    /* cvtsi2sd xmm<r>, r64<src>  (int -> double, from a REGISTER: a
+     * pinned int argument into a float parameter, #97 W2) */
+    void cvt_reg(uint8_t r, uint8_t src)
+    {
+        if (!jit_lever_off(JL_PEEP)) {
+#ifdef TESTS
+            g_jit_peep_depbrk++;
+#endif
+            xorps_self(r);           /* break the merge dependency */
+        }
+        fwrote(r);
+        u8(0xF2); sse_rex(r, src, true); u8(0x0F); u8(0x2A);
+        u8(static_cast<uint8_t>(0xC0 | ((r & 7) << 3) | (src & 7)));
     }
     /* movq xmm<r>, rax  (double bits GP -> xmm) */
     void movq_xmm(uint8_t r) { movq_xmm_from(r, 0 /*rax*/); }
@@ -7851,6 +7875,11 @@ struct ArgFuse {
  * OLD pc over the whole chunk; `fuse` is keyed by the call's old pc. */
 static const std::vector<char> *g_cur_argfuse_skip = nullptr;
 static const std::unordered_map<size_t, ArgFuse> *g_cur_argfuse = nullptr;
+/* W2: the chunk's staging pools, so a frameless SITE can allocate the
+ * replay list its decline trampoline bakes (residence is a per-pc fact
+ * the fusion decision does not have) */
+static std::vector<std::unique_ptr<std::vector<int32_t>>>
+    *g_cur_arg_stage_pools = nullptr;
 
 static const ArgFuse *argfuse_at(size_t old_pc)
 {
@@ -7863,9 +7892,9 @@ static const ArgFuse *argfuse_at(size_t old_pc)
 /*
  * #97 INCREMENT 2 (F4): WILL THIS CALL BE A FRAMELESS SITE? The callee
  * (or null) - answered from emit-time facts alone, so the two consumers
- * that must agree can both ask it: the #162 fusion decision (a fused
- * argument has no run slot, and the frameless entry copies the RUN - so
- * a call that will go frameless keeps its staging moves) and the push
+ * that must agree can both ask it: the #162 fusion decision (a
+ * frameless site fuses under its own, wider rules - W2 - since the site
+ * builds the window and binds from the argument sources) and the push
  * itself. The conditions:
  *   bake_final     the callee is named AND its fragment is placed, so
  *                  the entry is an immediate (main's calls: main is
@@ -7915,40 +7944,59 @@ jit_frameless_callee(const Chunk &ck, size_t old_pc, const Instr &in,
 }
 
 /*
- * #97 INCREMENT 3 (W1): THE SITE BUILDS THE CALLEE'S WINDOW. Called by
- * the frameless tail of emit_sync_call_inline with the run staged,
- * rdx = fo and r9 = ctx live, rsp call-ready. It reserves the callee's
- * N*48 bytes on the caller's native stack and fills them exactly as
- * the frameless ENTRY used to (increment 2), with the CALLEE answering
- * every question at emit time - it is a baked, placed descriptor here:
- *   binds_scalar()     an int/float-declared or proven param can only
- *                      receive a scalar (the baked push's coercing
- *                      checks ran first) - the payload copied, the type
- *                      word an immediate for a DECLARED int/float
- *                      (the 1c checks guarantee the exact tag) or
- *                      copied for a PROVEN one (a bool travels as `i`);
- *   not ref-listed     a slot outside the callee's ref_slots never
- *                      holds a reference (the chunk invariant its
- *                      release scan trusts) - the same arm;
- *   otherwise          the run slot's type is tested and a REFERENCE
- *                      goes to jit_bind_ref_arg - the retaining copy,
- *                      or #94's borrow when bit i of noescape_params
- *                      says the reference cannot outlive the call.
+ * #97 INCREMENT 3 (W1/W2): THE SITE BUILDS THE CALLEE'S WINDOW. Called
+ * by the frameless tail of emit_sync_call_inline with rdx = fo and
+ * r9 = ctx live and rsp call-ready. It reserves the callee's N*48
+ * bytes on the caller's native stack and BINDS every parameter into
+ * it, with the CALLEE answering every question at emit time (a baked,
+ * placed descriptor) and, since W2, the ARGUMENT SOURCE answering the
+ * rest: an argument whose staging move the fusion decision skipped
+ * (`af->src[i]`, a named local) is read from where it LIVES at this
+ * pc - the pinned register, the spill home, or its own slot - and one
+ * that was produced into the run is read from the run slot.
+ *   an int in a register    the payload stored from the register, the
+ *   (or a spill home)       tag an immediate: a pin is a proven int, so
+ *                           a declared-int parameter needs no test and
+ *                           a declared-float one is one cvtsi2sd - the
+ *                           1c coercing check is an EMIT-TIME fact;
+ *   a float in a register   the same, the other way; into a declared
+ *                           int parameter it is a NARROWING, so the site
+ *                           simply declines (the C++ tier raises);
+ *   memory, declared        the 1c dispatch on the source's type word -
+ *   int/float param         exact copy, bool->int retag, int/bool->float
+ *                           cvtsi2sd, none passes, anything else
+ *                           declines - widening INTO THE WINDOW SLOT,
+ *                           never the source (which is why the generic
+ *                           push could not fuse a coercing argument and
+ *                           this site can: its window is fresh stack);
+ *   memory, ref-listed      the run slot's type is tested and a
+ *                           REFERENCE goes to jit_bind_ref_arg - the
+ *                           retaining copy, or #94's borrow when bit i
+ *                           of noescape_params says the reference
+ *                           cannot outlive the call;
+ *   memory, otherwise       a proven scalar or an unlisted any: the
+ *                           payload and the type word.
  * The container/flag tail is zeroed FIRST for every parameter (raw
  * stack; the bind helper's ML_CHECK(!borrowed) reads the OLD flag),
  * and every non-parameter slot gets a zero tail and a t_none type word
  * (a helper writing a slot goes through LValue::put, which reads
  * `container` and `borrowed` before it stores). r10 = the window base
  * (rsp cannot be a base without a SIB byte the encoders refuse), r11
- * scratch; the bind helper call saves rdx/r9 around itself (two
- * pushes keep the call parity) and re-derives r10 from rsp after.
+ * and rsi scratch; the bind helper call saves rdx/r9 around itself
+ * (two pushes keep the call parity) and re-derives r10 from rsp after.
+ * DECLINES: every one is collected in `j_slow_win` and lands on the
+ * site's trampoline, which gives the window back and materialises the
+ * skipped moves into the run for the C++ tier (emit_frameless_
+ * materialise). The reference binds come LAST so a decline never has a
+ * retain to undo - they are the one thing here with a side effect.
  * ⛔ A raw copy of a reference is a use-after-free: the callee's
  * release scan would drop a count it never took (watched, inc 2:
  * jit_ret_inline_c4c's `h(arr, n)`).
  */
 static void emit_frameless_window(Emitter &e, const Instr &in,
                                   const FuncDescriptor *callee,
-                                  const Chunk &cck)
+                                  const Chunk &cck, const ArgFuse *af,
+                                  std::vector<size_t> &j_slow_win)
 {
     const JitLayout &L = jit_layout();
     const uint8_t R9R = 9, R10 = 10, R11 = 11;
@@ -7958,50 +8006,154 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
     ML_CHECK(nargs == in.b_lit() && abase >= 0);
     e.op_reg_imm(Op::minus, RSP, total * 48);
     e.mov_rr(R10, RSP);                                  /* reg:proto */
+    /* one qword, memory to window */
+    const auto copy_q = [&](int32_t sd, int32_t dd) {
+        e.load_base(R11, RBX, sd);                       /* reg:proto */
+        e.store_base(R11, R10, dd);                      /* reg:proto */
+    };
+    const auto tag_q = [&](int32_t dd, const void *tag) {
+        e.store_type_tag_base(R10, dd,                   /* reg:proto */
+                              tag, R11);                 /* reg:proto */
+    };
+    const auto src_slot = [&](int i) {
+        return (af && af->src[static_cast<size_t>(i)] >= 0)
+                   ? af->src[static_cast<size_t>(i)] : abase + i;
+    };
+    const auto listed_param = [&](int i) {
+        return !callee->params[i].binds_scalar()
+               && jit_slot_ref_listed(cck, i);
+    };
+    /* pass 1: the tails, and every scalar bind (declines live here) */
     for (int i = 0; i < nargs; i++) {
         const int32_t d = i * 48;                        /* window slot */
-        const int32_t r = (abase + i) * 48;              /* run slot */
-        const bool listed = !callee->params[i].binds_scalar()
-                            && jit_slot_ref_listed(cck, i);
+        const FuncDescriptor::ParamDesc &pd = callee->params[i];
+        const int ss = src_slot(i);
+        const int32_t s = ss * 48;                       /* source slot */
+        const void *req = pd.decl_type == DeclType::i ? L.t_int
+                        : pd.decl_type == DeclType::f ? L.t_float
+                        : nullptr;
         e.store_qword_base_imm32(R10, d + 32, 0);        /* reg:proto */
         e.store_qword_base_imm32(R10, d + 40, 0);        /* reg:proto */
-        size_t j_ref = 0;
-        if (listed) {
-            e.load_base(R11, RBX, r + 24);               /* reg:proto */
-            e.load32_base(R11, R11, L.type_t_off);       /* reg:proto */
-            e.cmp_reg32_imm32(R11,                       /* reg:proto */
-                              static_cast<uint32_t>(L.t_str_val));
-            j_ref = e.j32(0x7D);                 /* jge: a reference */
-            for (int32_t o = 0; o <= 24; o += 8) {
-                e.load_base(R11, RBX, r + o);            /* reg:proto */
-                e.store_base(R11, R10, d + o);           /* reg:proto */
-            }
-        } else {
-            const FuncDescriptor::ParamDesc &pd = callee->params[i];
-            e.load_base(R11, RBX, r);                    /* reg:proto */
-            e.store_base(R11, R10, d);                   /* reg:proto */
-            if (pd.decl_type == DeclType::i) {
-                e.store_type_tag_base(R10, d + 24,       /* reg:proto */
-                                      L.t_int, R11);     /* reg:proto */
-            } else if (pd.decl_type == DeclType::f) {
-                e.store_type_tag_base(R10, d + 24,       /* reg:proto */
-                                      L.t_float, R11);   /* reg:proto */
+        /* a REGISTER-resident source is a scalar whatever the parameter
+         * admits (a pin is a proven int/float), and its slot memory is
+         * STALE - so it binds here, from the register, even into a
+         * ref-listed parameter (watched: 24_capture_scalar's `bx(i)`,
+         * a pinned counter into an un-annotated param, bound from the
+         * stale slot by the memory path) */
+        const int ireg = e.reg_at(ss);
+        const int freg = e.freg_at(ss);
+        const int spill = e.spill_at(ss);
+        if (listed_param(i) && ireg < 0 && freg < 0 && spill < 0)
+            continue;                                    /* pass 2 */
+        if (ireg >= 0 || spill >= 0) {
+            /* a REGISTER-resident int (a pin is a proven int - the
+             * MoveV emitter stores it as one for the same reason) */
+            uint8_t r = R11;                             /* reg:proto */
+            if (ireg >= 0) {
+                r = static_cast<uint8_t>(ireg);
+                e.trk_read_pin(r);
             } else {
-                e.load_base(R11, RBX, r + 24);           /* reg:proto */
-                e.store_base(R11, R10, d + 24);          /* reg:proto */
+                e.reload(R11, spill);                    /* reg:proto */
             }
-        }
-        if (!listed)
+            if (req == L.t_float) {
+                e.cvt_reg(X0, r);                        /* reg:abi */
+                e.fstore_base(X0, R10, d);               /* reg:abi */
+                tag_q(d + 24, L.t_float);
+#ifdef TESTS
+                e.bump_counter(&g_jit_bake_widen);   /* a baked widening */
+#endif
+            } else {
+                e.store_base(r, R10, d);                 /* reg:proto */
+                tag_q(d + 24, L.t_int);
+            }
             continue;
+        }
+        if (freg >= 0) {
+            if (req == L.t_int) {
+                /* a NARROWING: never a fast call - the C++ tier raises */
+                j_slow_win.push_back(e.j32(0xEB));
+                continue;
+            }
+            e.fstore_base(static_cast<uint8_t>(freg),
+                          R10, d);                       /* reg:proto */
+            tag_q(d + 24, L.t_float);
+            continue;
+        }
+        if (!req) {
+            /* a proven scalar or an unlisted any: payload + type */
+            copy_q(s, d);
+            copy_q(s + 24, d + 24);
+            continue;
+        }
+        /* the 1c dispatch on a memory source, widening into the window */
+        std::vector<size_t> j_join;
+        e.cmp_mem_tag(RBX, s + 24, req, R11);            /* reg:proto */
+        const size_t j_exact = e.j32(0x74);              /* je exact */
+        size_t j_cvt = 0;
+        if (req == L.t_float) {
+            e.cmp_mem_tag(RBX, s + 24, L.t_int, R11);    /* reg:proto */
+            j_cvt = e.j32(0x74);                         /* je cvt */
+        }
+        e.load_base(RSI, RBX, s + 24);                   /* reg:proto */
+        e.movzx_r32_byte_base(RSI, RSI,                  /* reg:proto */
+                              static_cast<int32_t>(L.type_t_off));
+        e.cmp_reg32_imm8(RSI,                            /* reg:proto */
+                         static_cast<int8_t>(L.t_none_val));
+        const size_t j_none = e.j32(0x74);               /* je none */
+        e.cmp_reg32_imm8(RSI,                            /* reg:proto */
+                         static_cast<int8_t>(L.t_bool_val));
+        j_slow_win.push_back(e.j32(0x75));               /* jne slow */
+        if (req == L.t_int) {
+            /* a bool widens by a RETAG: its payload is already the int
+             * 0/1 (the EvalValue(bool) ctor zeroes the word) */
+            copy_q(s, d);
+            tag_q(d + 24, L.t_int);
+        } else {
+            e.patch32_here(j_cvt);       /* a bool reads as an int too */
+            e.cvt(X0, s);                                /* reg:abi */
+            e.fstore_base(X0, R10, d);                   /* reg:abi */
+            tag_q(d + 24, L.t_float);
+        }
+#ifdef TESTS
+        e.bump_counter(&g_jit_bake_widen);       /* a baked widening */
+#endif
+        j_join.push_back(e.j32(0xEB));
+        e.patch32_here(j_none);                          /* none: */
+        copy_q(s, d);
+        copy_q(s + 24, d + 24);
+        j_join.push_back(e.j32(0xEB));
+        e.patch32_here(j_exact);                         /* exact: */
+        copy_q(s, d);
+        tag_q(d + 24, req);
+        for (const size_t j : j_join)
+            e.patch32_here(j);
+    }
+    /* pass 2: the reference-capable parameters with a MEMORY source (a
+     * retain is the one side effect here, so these come after every
+     * decline) */
+    for (int i = 0; i < nargs; i++) {
+        const int ss = src_slot(i);
+        if (!listed_param(i) || e.reg_at(ss) >= 0 || e.freg_at(ss) >= 0
+                || e.spill_at(ss) >= 0)
+            continue;
+        const int32_t d = i * 48;
+        const int32_t s = ss * 48;
+        e.load_base(R11, RBX, s + 24);                   /* reg:proto */
+        e.load32_base(R11, R11, L.type_t_off);           /* reg:proto */
+        e.cmp_reg32_imm32(R11,                           /* reg:proto */
+                          static_cast<uint32_t>(L.t_str_val));
+        const size_t j_ref = e.j32(0x7D);        /* jge: a reference */
+        for (int32_t o = 0; o <= 24; o += 8)
+            copy_q(s + o, d + o);
         const size_t j_join = e.j32(0xEB);
         e.patch32_here(j_ref);
         /* the helper's retaining copy RELEASES the slot's old value
          * first (LValue::rebind) - on raw stack that is a garbage
          * Type*, so the slot reads as `none` first */
-        e.store_type_tag_base(R10, d + 24, L.t_none, R11);  /* reg:proto */
+        tag_q(d + 24, L.t_none);
         e.push_reg(RDX);                                 /* reg:proto: fo */
         e.push_reg(R9R);                                 /* reg:proto: ctx */
-        e.lea_base(RSI, RBX, r);                         /* reg:abi: &src */
+        e.lea_base(RSI, RBX, s);                         /* reg:abi: &src */
         e.lea_base(RDI, R10, d);                         /* reg:abi: &dst */
         /* a uint64 mask bit into a u32 immediate: the cast is what
          * keeps MSVC's C4244 (/WX) off the Windows lane */
@@ -8024,8 +8176,78 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
         e.store_base(R11, R10, sl * 48 + 40);            /* reg:proto */
     }
     for (int sl = nargs; sl < total; sl++)
-        e.store_type_tag_base(R10, sl * 48 + 24,         /* reg:proto */
-                              L.t_none, R11);            /* reg:proto */
+        tag_q(sl * 48 + 24, L.t_none);
+}
+
+static void emit_put_int_call(Emitter &e, const void *fn, int slot,
+                              uint8_t src_reg);
+static void emit_put_scalar_call(Emitter &e, const void *fn, int slot,
+                                 uint8_t value_reg);
+static void jit_put_float(LValue *lv, double v) noexcept;
+
+/*
+ * #97 INCREMENT 3 (W2): THE DECLINE TRAMPOLINE'S MATERIALISATION. A
+ * frameless site whose fill declined hands the call to the C++ tier,
+ * which binds from the argument RUN - and the staging moves that fill
+ * it were not emitted. Each fused argument is written into its run
+ * slot from where it lives at this pc: a register-resident int or
+ * float through the put helpers (a pin's slot memory is STALE, so a
+ * memory replay would copy the wrong value), a memory-resident one
+ * through jit_stage_args (the #162 replay, whose pool is allocated
+ * here, at the site, because residence is a per-pc fact the fusion
+ * decision does not have). Cold: reached only by a decline, every one
+ * of which raises in C++ - but the run must be right for the raise to
+ * render the ARGUMENT it names (a stale slot once held a string from a
+ * print).
+ */
+static void emit_frameless_materialise(Emitter &e, const Instr &in,
+                                       const ArgFuse *af)
+{
+    if (!af)
+        return;
+    const int32_t abase = static_cast<int32_t>(in.a_lit());
+    std::vector<int32_t> mem_pairs;
+    for (size_t i = 0; i < af->src.size(); i++) {
+        const int ss = af->src[i];
+        if (ss < 0)
+            continue;
+        const int dst = abase + static_cast<int>(i);
+        const int ireg = e.reg_at(ss);
+        const int freg = e.freg_at(ss);
+        const int spill = e.spill_at(ss);
+        if (ireg >= 0) {
+            e.trk_read_pin(static_cast<uint8_t>(ireg));
+            emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_int),
+                              dst, static_cast<uint8_t>(ireg));
+        } else if (spill >= 0) {
+            const uint8_t R11 = 11;
+            e.reload(R11, spill);                        /* reg:proto */
+            emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_int),
+                              dst, R11);                 /* reg:proto */
+        } else if (freg >= 0) {
+            emit_put_scalar_call(e,
+                                 reinterpret_cast<const void *>(jit_put_float),
+                                 dst, static_cast<uint8_t>(freg));
+        } else {
+            mem_pairs.push_back(static_cast<int32_t>(dst));
+            mem_pairs.push_back(static_cast<int32_t>(ss));
+        }
+    }
+    if (mem_pairs.empty())
+        return;
+    /* separately heap-allocated: its address is baked as an immediate
+     * and must not move as later sites are added (the #162 pool rule) */
+    ML_CHECK(g_cur_arg_stage_pools);
+    g_cur_arg_stage_pools->push_back(
+        std::unique_ptr<std::vector<int32_t>>(
+            new std::vector<int32_t>(std::move(mem_pairs))));
+    const std::vector<int32_t> *pool = g_cur_arg_stage_pools->back().get();
+    e.movabs(RDI, reinterpret_cast<uint64_t>(pool->data()));   /* reg:abi */
+    e.mov_imm(RSI, static_cast<uint64_t>(                      /* reg:abi */
+                      static_cast<int_type>(pool->size() / 2)));
+    e.call_relocs.push_back(
+        { e.pos(), reinterpret_cast<const void *>(jit_stage_args) });
+    e.u8(0xE8); e.u32(0);
 }
 
 void jit_mark_frameless_wanted(const Chunk &main, const JitCtx *jc)
@@ -8139,7 +8361,12 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
     if (bake && !bake->fast_bind) {
         if (bake->bind_req.size() != bake->params.size())
             bake_coerce_ok = false;      /* not derived yet - never bake */
-        else
+        else if (!(frameless_out
+                   && jit_frameless_callee(ck, old_pc, in, nullptr)))
+            /* W2: a FRAMELESS site widens a fused argument into its own
+             * window slot, so the rule below is the generic push's alone
+             * (the predicate is pure: asking it here and again below
+             * cannot disagree) */
             for (int i = 0; i < NARGS; i++)
                 if (bake->bind_req[static_cast<size_t>(i)]
                         && af && af->src[static_cast<size_t>(i)] >= 0)
@@ -8201,9 +8428,10 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
      *   residue          the record-less return arm is armed - the
      *                    frameless return IS that arm, told apart by
      *                    bit 0 of the pushed dst word;
-     *   not cached       (a CachedCallV's probe/key ride the record);
-     *   no fused args    (#162 reads a fused source in place of the run
-     *                    slot; the callee copies the run).
+     *   not cached       (a CachedCallV's probe/key ride the record).
+     * (W1/W2: the SITE builds the window and binds from the argument
+     * sources - emit_frameless_window - so a fused argument is welcome
+     * here, where the generic push must refuse a coercing one.)
      */
     const char *fl_why = nullptr;
     const FuncDescriptor *fl_callee =
@@ -8211,8 +8439,6 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
                       : nullptr;
     if (!frameless_out)
         fl_why = "the helper-path site";
-    else if (fl_callee && af)
-        fl_why = "a fused argument (the fusion decision disagrees)";
     else if (fl_callee && !residue)
         fl_why = "the site is not a residue site";
     const bool frameless_site = fl_why == nullptr;
@@ -8486,7 +8712,10 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
          * SCRATCH: rsi and r10 (rax = desc, rcx = cck, rdx = fo, r8/r9
          * live - exactly the generic arm's register budget).
          */
-        if (!bake->fast_bind) {
+        /* W2: a FRAMELESS site binds - and coerces - in its own window
+         * fill (emit_frameless_window), from the argument SOURCES; the
+         * run slots these checks read may not even be written there */
+        if (!bake->fast_bind && !frameless_site) {
             for (int i = 0; i < NARGS; i++) {
                 const void *req = bake->bind_req[static_cast<size_t>(i)];
                 if (!req)
@@ -9466,8 +9695,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     emit_call_prologue(e);
     /*
      * #97 inc 2: WILL THIS SITE BE FRAMELESS? Decided once, here, from
-     * the shared predicate (the fusion decision asked the same one, so
-     * `af` is null whenever it says yes); the push re-derives and
+     * the shared predicate (the fusion decision asked the same one and
+     * fused under the frameless rules, W2); the push re-derives and
      * ML_CHECKs it. A frameless callee is a LEAF whose window is one
      * bounded native frame, so the DEPTH GUARD below is not emitted for
      * it: the cap bounds native-stack NESTING, and a leaf cannot nest.
@@ -9475,7 +9704,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     const ArgFuse *af = argfuse_at(old_pc);
     const bool residue = jit_norec_on();
     const bool frameless_site =
-        residue && !af && jit_frameless_callee(ck, old_pc, in, nullptr);
+        residue && jit_frameless_callee(ck, old_pc, in, nullptr);
     std::vector<size_t> j_slows, j_dones;
     if (!frameless_site) {
         /* depth guard: cmp dword [&g_jit_sync_depth], CAP; jge slow */
@@ -9604,7 +9833,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
          * residue on both return paths */
         const int32_t fl_win =
             (fl_ck->slot_count + fl_ck->n_temps) * 48;
-        emit_frameless_window(e, in, fl_callee, *fl_ck);
+        std::vector<size_t> j_slow_win;   /* declines AFTER the reserve */
+        emit_frameless_window(e, in, fl_callee, *fl_ck, af, j_slow_win);
         /* the dst word: the slot address with bit 0 set, or bare 1 for a
          * discarded result (the arm masks the bit, so it reads 0 = no
          * write, exactly the record-less spelling). A ref-listed dst
@@ -9694,6 +9924,23 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         j_done2 = e.j32(0x74);                    /* jz done */
         emit_call_epilogue_divergent(e);
         e.exit_pc(pc);                            /* re-raise */
+        /*
+         * W2: THE DECLINE TRAMPOLINES, falling through into the common
+         * slow tail below. A decline inside the fill (after the window
+         * was reserved) gives it back first; every decline - the push's
+         * own (the callee type/identity tests, before the reserve) and
+         * the fill's - then materialises the fused arguments into the
+         * run, which the C++ tier binds from.
+         */
+        if (!j_slow_win.empty()) {
+            for (const size_t j : j_slow_win)
+                e.patch32_here(j);
+            e.op_reg_imm(Op::plus, RSP, fl_win);
+        }
+        for (const size_t j : j_slows)
+            e.patch32_here(j);
+        j_slows.clear();                          /* patched here, once */
+        emit_frameless_materialise(e, in, af);
     } else {
     /* depth++ (the callee is committed) */
     e.bump_counter32_live(
@@ -24908,6 +25155,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     chunk.arg_stage_pools.clear();      /* #162: ditto - the old native
                                          * code that baked these
                                          * addresses is being replaced */
+    g_cur_arg_stage_pools = &chunk.arg_stage_pools;
     g_cur_norec_sites = &chunk.norec_sites;
     g_cur_caller_desc = jc ? jc->caller_desc : nullptr;   /* step 3b */
     g_cur_jc = jc;                       /* #97 step 4: the bake gate */
@@ -26214,14 +26462,24 @@ retry_emission:
                     continue;
                 if (in.op == OpCode::CallV && callv_native_ok(in, jc))
                     continue;
-                /* #97 inc 2: a call that will take the FRAMELESS site
-                 * keeps its staging moves - the frameless entry copies
-                 * the argument RUN, and the frameless saving (the whole
-                 * activation bookkeeping) is an order of magnitude the
-                 * fusion's. Decided by the SAME predicate the push asks,
-                 * so the two cannot disagree; the push ML_CHECKs it. */
-                if (jit_frameless_callee(chunk, pc, in, nullptr))
-                    continue;
+                /*
+                 * #97 inc 3 (W2): a call that will take the FRAMELESS
+                 * site fuses under ITS rules - the site builds the
+                 * callee's window itself (W1) and binds each argument
+                 * from where it lives, so ANY named local qualifies:
+                 * a scalar (the staging move was the whole cost - a
+                 * pinned counter's two stores, a ref-listed temp's four-
+                 * instruction guard), a pinned one (the site reads the
+                 * register), a coercing one (the widening lands in the
+                 * fresh window slot, never the source). The generic
+                 * push keeps its narrower gates below. Decided by the
+                 * SAME predicate the push asks, so the two cannot
+                 * disagree; the push ML_CHECKs it. (Inc 2 refused to
+                 * fuse a frameless site at all: its entry copied the
+                 * RUN.)
+                 */
+                const bool fl_site =
+                    jit_frameless_callee(chunk, pc, in, nullptr) != nullptr;
                 const int nargs = static_cast<int>(in.b_lit());
                 const int abase = static_cast<int>(in.a_lit());
                 if (nargs <= 0 || abase < 0)
@@ -26229,6 +26487,7 @@ retry_emission:
                 ArgFuse af;
                 af.src.assign(static_cast<size_t>(nargs), -1);
                 std::vector<int32_t> pairs;
+                bool fused_any = false;
                 for (size_t p = pc; p > begin; p--) {
                     const Instr &m = chunk.code[p - 1];
                     /* Only the staging run itself ends the scan: an op
@@ -26266,6 +26525,27 @@ retry_emission:
                      * that is the right trade. */
                     if (s < 0 || s >= chunk.slot_count)
                         continue;
+                    if (fl_site) {
+                        /* W2: the frameless site's gates - a named local
+                         * that is not the run itself; residence is the
+                         * SITE's question, per pc (emit_frameless_window
+                         * reads reg_at/freg_at/spill_at there), and the
+                         * decline trampoline materialises the run from
+                         * the same answer. `pairs` stays empty: the
+                         * generic replay would copy a pin's STALE slot
+                         * memory. A pinned DESTINATION is left alone,
+                         * as below. */
+                        if (s >= abase && s < abase + nargs)
+                            continue;
+                        if (pinned(d))
+                            continue;
+                        af.src[static_cast<size_t>(d - abase)] = s;
+                        fused_any = true;
+                        if (argfuse_skip.empty())
+                            argfuse_skip.assign(chunk.code.size(), 0);
+                        argfuse_skip[p - 1] = 1;
+                        continue;
+                    }
                     /* ONLY a slot the ref_slots audit says can hold a
                      * REFERENCE. Two reasons, and the second is the
                      * load-bearing one:
@@ -26293,14 +26573,19 @@ retry_emission:
                     if (pinned(s) || pinned(d))
                         continue;
                     af.src[static_cast<size_t>(d - abase)] = s;
+                    fused_any = true;
                     pairs.push_back(static_cast<int32_t>(d));
                     pairs.push_back(static_cast<int32_t>(s));
                     if (argfuse_skip.empty())
                         argfuse_skip.assign(chunk.code.size(), 0);
                     argfuse_skip[p - 1] = 1;
                 }
-                if (pairs.empty())
+                if (!fused_any)
                     continue;
+                if (pairs.empty()) {           /* a frameless site (W2) */
+                    argfuse.emplace(pc, std::move(af));
+                    continue;
+                }
                 /* The cold arm replays them in CODEGEN order (the scan
                  * collected them backwards), so a materialised run is
                  * byte-identical to the unfused one. Separately heap-
@@ -27561,6 +27846,7 @@ retry_emission:
     g_cur_entry_remap = nullptr;        /* #56: emission done */
     g_cur_argfuse = nullptr;            /* #162: fragment-scoped storage */
     g_cur_argfuse_skip = nullptr;
+    g_cur_arg_stage_pools = nullptr;
     g_cur_call_caches = nullptr;
     g_cur_norec_sites = nullptr;
     g_cur_caller_desc = nullptr;

@@ -510,13 +510,17 @@ Each ends with a MEASUREMENT that can kill the next one.
      needed only for a slot some HELPER may `put()`/rebind into; an
      opcode-level "helper writes its dst" fact would skip the rest -
      an audit table, so build it with the enum-derived ratchet;
-   - the SITE's staging guard on a ref-listed argument temp (4 Ir) -
-     ref_slots precision, the same slot `print`'s arguments reuse;
    - the CALLER-BUILT WINDOW: ✅ W1 (2026-09-20) - the site fills the
      callee's window on its own stack, at [rbp+32] from the callee's
-     anchor; W2 is the fusion it exists for: a FUSED argument bound
-     straight from the caller slot - recovers the #162 fusion the tier
-     forgoes today and one retain/release pair per reference argument;
+     anchor; ✅ W2 (2026-09-20) - the fusion it exists for: the staging
+     move is not emitted, a pinned argument is stored from its
+     register with its tag an immediate (the coercing check an
+     emit-time fact; a declared-float param gets one cvtsi2sd), a
+     memory one takes the 1c dispatch widening INTO the window, a
+     reference one binds straight from the caller slot. 78's add(i):
+     90 -> 73 instructions per call (record: *#97 increment 3, W2*);
+   - the SITE's staging guard on a ref-listed argument temp: ✅ gone
+     with W2 (the temp is not written at all);
    - the float pin spill/reload around the call - #124's territory.
 
 **3. E2 — drop the leaf rule.** Serves 09_fib, and only after the
