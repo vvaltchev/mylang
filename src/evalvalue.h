@@ -922,3 +922,34 @@ EvalValue eval_func(EvalContext *ctx,
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const std::pair<EvalValue, EvalValue> &args);
+
+/*
+ * #97 B1: A BUILTIN'S ARGUMENT BUFFER, CONSTRUCTING ONLY WHAT IT HOLDS.
+ * `EvalValue buf[8]` default-constructs and destroys all eight on every
+ * call whatever the argument count - measured as most of the ~200 Ir a
+ * JIT'd builtin call cost before the builtin ran (94_builtin_in_helper:
+ * jit_call_builtin 51% of the program). This is aligned raw storage: push()
+ * copy-constructs one argument in place, the destructor destroys exactly
+ * the ones pushed - also when the builtin throws, since it is an ordinary
+ * local. A caller past N keeps its heap vector.
+ */
+template <size_t N> class SmallArgs {
+    alignas(EvalValue) unsigned char raw_[N * sizeof(EvalValue)];
+    size_t n_ = 0;
+public:
+    SmallArgs() = default;
+    SmallArgs(const SmallArgs &) = delete;
+    SmallArgs &operator=(const SmallArgs &) = delete;
+    ~SmallArgs()
+    {
+        for (size_t i = 0; i < n_; i++)
+            data()[i].~EvalValue();
+    }
+    EvalValue *data() { return reinterpret_cast<EvalValue *>(raw_); }
+    void push(const EvalValue &v)
+    {
+        ML_CHECK(n_ < N);
+        new (raw_ + n_ * sizeof(EvalValue)) EvalValue(v);
+        n_++;
+    }
+};

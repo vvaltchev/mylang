@@ -575,10 +575,11 @@ static ML_NOINLINE EvalValue
 vm_make_array(EvalContext &ctx, int_type base, int_type n, ArrHint hint)
 {
     if (n <= 16) {
-        EvalValue stackbuf[16];
+        SmallArgs<16> stackbuf;                       /* #97 B1 */
         for (int_type i = 0; i < n; i++)
-            stackbuf[i] = ctx.frame->at(base + i).get();
-        return build_array_from_values(stackbuf, n, hint, nullptr, false);
+            stackbuf.push(ctx.frame->at(base + i).get());
+        return build_array_from_values(stackbuf.data(), n, hint, nullptr,
+                                       false);
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
     for (int_type i = 0; i < n; i++)
@@ -593,10 +594,10 @@ static ML_NOINLINE EvalValue
 vm_make_dict(EvalContext &ctx, int_type base, int_type npairs)
 {
     if (npairs <= 8) {
-        EvalValue stackbuf[16];
+        SmallArgs<16> stackbuf;                       /* #97 B1 */
         for (int_type i = 0; i < 2 * npairs; i++)
-            stackbuf[i] = ctx.frame->at(base + i).get();
-        return build_dict_from_pairs(stackbuf, npairs, false);
+            stackbuf.push(ctx.frame->at(base + i).get());
+        return build_dict_from_pairs(stackbuf.data(), npairs, false);
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(2 * npairs));
     for (int_type i = 0; i < 2 * npairs; i++)
@@ -760,10 +761,12 @@ vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
                   const EvalValue &val, Op op)
 {
     if (nkeys <= 8) {
-        EvalValue keybuf[8];
+        SmallArgs<8> keybuf;                          /* #97 B1 */
         for (size_t k = 0; k < nkeys; k++)
-            keybuf[k] = ctx.frame->at(kbase + static_cast<int_type>(k)).get();
-        vm_subscript_chain_store(base, keybuf, nkeys, val, op, steplocs);
+            keybuf.push(
+                ctx.frame->at(kbase + static_cast<int_type>(k)).get());
+        vm_subscript_chain_store(base, keybuf.data(), nkeys, val, op,
+                                 steplocs);
         return;
     }
     std::vector<EvalValue> keyheap(nkeys);
@@ -989,10 +992,11 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
     };
 
     if (total <= 32) {
-        EvalValue stackbuf[32];
+        SmallArgs<32> stackbuf;                       /* #97 B1 */
         for (size_t k = 0; k < total; k++)
-            stackbuf[k] = ctx.frame->at(base + static_cast<int_type>(k)).get();
-        build(stackbuf);
+            stackbuf.push(
+                ctx.frame->at(base + static_cast<int_type>(k)).get());
+        build(stackbuf.data());
         return;
     }
     std::vector<EvalValue> heapbuf(total);
@@ -1021,10 +1025,10 @@ vm_call_builtin_lv_rest(EvalContext &ctx, const Chunk::BuiltinCall &bc,
     al.nargs = bc.args.size();
     al.arr_hint = bc.arr_hint;
     if (n_rest <= 8) {
-        EvalValue stackbuf[8];
+        SmallArgs<8> stackbuf;                        /* #97 B1 */
         for (int_type i = 0; i < n_rest; i++)
-            stackbuf[i] = ctx.frame->at(base + i).get();
-        return bc.builtin.func_lv(&ctx, &al, target, stackbuf,
+            stackbuf.push(ctx.frame->at(base + i).get());
+        return bc.builtin.func_lv(&ctx, &al, target, stackbuf.data(),
                                   static_cast<size_t>(n_rest));
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n_rest));
@@ -1045,12 +1049,12 @@ vm_do_emplace(EvalContext &ctx, const Chunk::EmplaceSite &site,
 {
     const size_t nf = site.field_locs.size();
     if (nf <= 8) {
-        EvalValue stackbuf[8];
+        SmallArgs<8> stackbuf;                        /* #97 B1 */
         for (size_t i = 0; i < nf; i++)
-            stackbuf[i] = ctx.frame->at(base + i).get();
+            stackbuf.push(ctx.frame->at(base + i).get());
         return vm_emplace_struct(&ctx, target, site.a0_start, site.a0_end,
                                  site.def, site.field_locs.data(),
-                                 stackbuf, nf);
+                                 stackbuf.data(), nf);
     }
     std::vector<EvalValue> heapbuf(nf);
     for (size_t i = 0; i < nf; i++)
@@ -6002,10 +6006,10 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
     try {
         EvalValue r;
         if (n <= 8) {
-            EvalValue stackbuf[8];
+            SmallArgs<8> stackbuf;                    /* #97 B1 */
             for (int_type i = 0; i < n; i++)
-                stackbuf[i] = ctx->frame->at(base + i).get();
-            r = bc->builtin.func_v(ctx, &al, stackbuf, n);
+                stackbuf.push(ctx->frame->at(base + i).get());
+            r = bc->builtin.func_v(ctx, &al, stackbuf.data(), n);
         } else {
             std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
             for (int_type i = 0; i < n; i++)
@@ -6287,9 +6291,9 @@ extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
             if (holder.is<LValue *>())
                 elem = holder.get<LValue *>();
         }
-        EvalValue restbuf[8];   /* n_rest small (append 1, pop 0) */
+        SmallArgs<8> restbuf;   /* n_rest small (append 1, pop 0); B1 */
         for (int_type i = 0; i < n_rest; i++)
-            restbuf[i] = ctx->frame->at(run_base + 1 + i).get();
+            restbuf.push(ctx->frame->at(run_base + 1 + i).get());
         ArgLocs al;
         al.start = bc->start;
         al.end = bc->end;
@@ -6297,7 +6301,8 @@ extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
         al.nargs = bc->args.size();
         al.arr_hint = bc->arr_hint;
         ctx->frame->at(dst_slot).put(
-            bc->builtin.func_lv(ctx, &al, elem, n_rest ? restbuf : nullptr,
+            bc->builtin.func_lv(ctx, &al, elem,
+                                n_rest ? restbuf.data() : nullptr,
                                 static_cast<size_t>(n_rest)));
     } catch (RuntimeException &e) {
         if (!e.loc_start) {                /* the subscript's caret = arg0. */
@@ -6346,9 +6351,9 @@ extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
             field = vm_member_lvalue(base, bc->member,
                                      bc->args[0].start, bc->args[0].end,
                                      bc->args[0].start, bc->args[0].end);
-        EvalValue restbuf[8];   /* append/push 1 value arg */
+        SmallArgs<8> restbuf;   /* append/push 1 value arg; #97 B1 */
         for (int_type i = 0; i < n_rest; i++)
-            restbuf[i] = ctx->frame->at(run_base + i).get();
+            restbuf.push(ctx->frame->at(run_base + i).get());
         ArgLocs al;
         al.start = bc->start;
         al.end = bc->end;
@@ -6356,7 +6361,8 @@ extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
         al.nargs = bc->args.size();
         al.arr_hint = bc->arr_hint;
         ctx->frame->at(dst_slot).put(
-            bc->builtin.func_lv(ctx, &al, field, n_rest ? restbuf : nullptr,
+            bc->builtin.func_lv(ctx, &al, field,
+                                n_rest ? restbuf.data() : nullptr,
                                 static_cast<size_t>(n_rest)));
     } catch (RuntimeException &e) {
         if (!e.loc_start) {
@@ -11699,13 +11705,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             const int_type base = in->a_lit(), n = in->b_lit();
             try {
                 if (n <= 8) {
-                    EvalValue stackbuf[8];
-                    for (int_type i = 0; i < n; i++) {
-                        stackbuf[i] = ctx.frame->at(base + i).get();
-                }
+                    SmallArgs<8> stackbuf;            /* #97 B1 */
+                    for (int_type i = 0; i < n; i++)
+                        stackbuf.push(ctx.frame->at(base + i).get());
                     ArgLocs al = chunk->arglocs_at(in->target2);
                     ctx.frame->at(in->target).put(
-                        bc.builtin.func_v(&ctx, &al, stackbuf, n));
+                        bc.builtin.func_v(&ctx, &al, stackbuf.data(), n));
                 } else {
                     ctx.frame->at(in->target).put(
                         vm_call_builtin_big(ctx, *chunk, in->target2, base, n));
@@ -12054,14 +12059,13 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                     if (holder.is<LValue *>())
                         elem = holder.get<LValue *>();
                 }
-                EvalValue restbuf[8];   /* n_rest is small (append 1, pop 0) */
-                for (int_type i = 0; i < n_rest; i++) {
-                    restbuf[i] = ctx.frame->at(in->b_lit() + 1 + i).get();
-                }
+                SmallArgs<8> restbuf;   /* n_rest small (append 1, pop 0) */
+                for (int_type i = 0; i < n_rest; i++)
+                    restbuf.push(ctx.frame->at(in->b_lit() + 1 + i).get());
                 ArgLocs al = chunk->arglocs_at(in->a_dual_lo());
                 ctx.frame->at(in->target).put(
                     bc.builtin.func_lv(&ctx, &al, elem,
-                                       n_rest ? restbuf : nullptr,
+                                       n_rest ? restbuf.data() : nullptr,
                                        static_cast<size_t>(n_rest)));
             } catch (Exception &e) {
                 if (!e.loc_start) {
@@ -12098,14 +12102,13 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                     field = vm_member_lvalue(base, bc.member,
                                              bc.args[0].start, bc.args[0].end,
                                              bc.args[0].start, bc.args[0].end);
-                EvalValue restbuf[8];   /* append/push 1 value arg */
-                for (int_type i = 0; i < n_rest; i++) {
-                    restbuf[i] = ctx.frame->at(in->b_lit() + i).get();
-                }
+                SmallArgs<8> restbuf;   /* append/push 1 value arg */
+                for (int_type i = 0; i < n_rest; i++)
+                    restbuf.push(ctx.frame->at(in->b_lit() + i).get());
                 ArgLocs al = chunk->arglocs_at(in->a_dual_lo());
                 ctx.frame->at(in->target).put(
                     bc.builtin.func_lv(&ctx, &al, field,
-                                       n_rest ? restbuf : nullptr,
+                                       n_rest ? restbuf.data() : nullptr,
                                        static_cast<size_t>(n_rest)));
             } catch (Exception &e) {
                 if (!e.loc_start) {
