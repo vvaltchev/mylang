@@ -1054,20 +1054,25 @@ and a new emitter must obey all four:
    2016/2016, every corpus matrix and even `--spcheck` on the DEBUG
    build were green. Same family as `trk_push`'s own ⛔.
  - **⛔ A SHAPE TEST ASSERTS ON AN INSTRUCTION, NOT ON THE TEXT THAT
-   RENDERS IT (maintainer, 2026-09-22).** `tests.cpp` parses a `-vdj`
-   line into `MIns2`/`MOp` - mnemonic plus typed operands (`Name`,
-   `Mem{base,index,scale,disp}`, `Imm`, `Sym`, `Rel`) - and a new shape
-   test compares FIELDS. The `native_*` string patterns remain for
-   pinning a long SEQUENCE verbatim, which is what they are good at;
-   they degenerate the moment a test wants to say something about ONE
-   OPERAND, because "does this line contain `-0x1]` and not `rbp`" is a
-   heuristic classifier that passes for any instruction rendering the
-   same way, with exclusions that go stale exactly like an enumerated
-   hazard list. ANCHOR the instruction under test (its destination
-   store, its op mark) rather than counting matches. The model FAILS
-   CLOSED and has its own `-rt` self-test over every form the emitter
-   produces. Its one unresolvable case is named there: the dump spells
-   a scratch TEMP `rN`, colliding with r8..r15.
+   RENDERS IT (maintainer, 2026-09-22).** `decode_one` FILLS a
+   `DecodedIns` - mnemonic plus typed `DecOp`s (`Gpr`, `Xmm`, `Cl`,
+   `Mem{base,index,scale,disp}`, **`Slot`**, `Imm`, `Rel`, ...) - and
+   `-vdj` is `render_op` of that, so a test reads the structure the
+   dump was rendered FROM, through `g_jit_decode_sink`. The `native_*`
+   string patterns remain for pinning a long SEQUENCE verbatim, which
+   is what they are good at; they degenerate the moment a test wants to
+   say something about ONE OPERAND.
+   **⛔ AND DO NOT "FIX" THAT BY PARSING THE DUMP BACK** - that is a
+   SECOND DECODER in all but name: it re-derives what the disassembler
+   knew, it is not what `disasmcheck` cross-checks against objdump, and
+   it cannot recover what the rendering COLLAPSED (the dump spells a
+   scratch TEMP `rN`, the same as r8..r15, so `mov r10, rax` is
+   ambiguous in the TEXT and not in the decode). ANCHOR the instruction
+   under test - its destination store, its op mark - rather than
+   counting matches. The decode FAILS CLOSED and has its own `-rt`
+   self-test over every form the emitter produces. When you change the
+   renderer or the decoder, `vdjcmp` byte-identity is the proof that it
+   is inert.
  - **WHEN EVERY GUARD IS ELIDED, EMIT NEITHER THE JOIN JUMP NOR THE
    ARM.** A tier that falls to a helper behind one or more `ref_slots`
    guards has an UNREACHABLE helper when all of them are elided -

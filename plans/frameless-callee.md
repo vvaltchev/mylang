@@ -664,8 +664,9 @@ flat, the instruction-count family's usual answer. It needed an
 ENCODER fix first: `emit_modrm_disp` refused an rsp/r12 base, and r12
 is a pin the allocator hands out constantly - it writes the SIB byte
 now. Record: *#97 1b(ii)* in the JIT record, which also carries the
-maintainer's call that a shape test asserts on an INSTRUCTION MODEL,
-not on disassembly strings; (iii) PROFITABILITY on a
+maintainer's call that a shape test asserts on an INSTRUCTION MODEL -
+`decode_one` fills a DecodedIns and -vdj renders from it - and not on
+disassembly strings; (iii) PROFITABILITY on a
 loop-free body: a recursive function pays the pin's `push`/`pop` on
 every invocation, and for a read-only parameter with three uses that
 is a pure cost - 10_recursion_deep +3.2% Ir / 1.03x, fib flat - while
