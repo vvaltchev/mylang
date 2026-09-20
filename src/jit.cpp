@@ -4389,6 +4389,19 @@ struct Emitter {
         u8(static_cast<uint8_t>(0xC0 | (reg & 7)));
         u32(imm);
     }
+    /* test byte [base + d], imm8  (F6 /0 ib) - one instruction, flags
+     * only; the return arm's frameless discriminator (#97 inc 2) */
+    void test_byte_base_imm8(uint8_t base, int32_t d, uint8_t imm)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "test_byte_base_imm8: rsp/r12 need a SIB byte");
+        if (base >= 8)
+            u8(0x41);
+        u8(0xF6);
+        u8(static_cast<uint8_t>(0x80 | (base & 7)));
+        u32(static_cast<uint32_t>(d));
+        u8(imm);
+    }
     void store_dword_base_imm32(uint8_t base, int32_t d, uint32_t imm)
     {
         ML_CHECK_MSG(!base_needs_sib(base),
@@ -9920,8 +9933,16 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                            static_cast<int8_t>(L.t_str_val));
                 j_nslow.push_back(e.j32(0x7D));    /* a reference result */
             }
-            /* rdx = dst_addr from the residue; 0 = discarded result */
+            /* rdx = dst_addr from the residue; 0 = discarded result.
+             * #97 increment 2: a FRAMELESS caller pushes the same word
+             * with BIT 0 SET - its window is on the native stack and it
+             * took no segment space, so the seg-top adjust below must
+             * not run for it. The bit is cleared here (a slot address is
+             * 48-byte aligned, so a recorded site's word never has it)
+             * and re-read at the adjust; a frameless site never
+             * discards its result (F4's gate), so `dst|1` is never 1. */
             ld(RDX, 5, 24);
+            e.op_reg_imm(Op::band, RDX, -2);           /* clear bit 0 */
             e.test_rr(RDX, RDX);
             const size_t j_nw = e.j32(0x74);       /* jz no_write */
             ld(RAX, RDX, static_cast<int32_t>(L.off_type));
@@ -9982,11 +10003,16 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             e.load_global(RCX, L.addr_ctx, RAX);
             ld(RAX, 5, 16);
             st(RCX, static_cast<int32_t>(L.ctx_captures), RAX);
-            /* seg->top -= total; used -= total (baked) */
+            /* seg->top -= total; used -= total (baked) - NOT for a
+             * frameless frame (bit 0 of the residue's dst word), whose
+             * window never came from the segment */
+            e.test_byte_base_imm8(5 /* rbp */, 24, 1);
+            const size_t j_noseg = e.j32(0x75);        /* jnz: frameless */
             ld(RCX, R8R, static_cast<int32_t>(P.act_cur_sg));
             e.sub_qword_base_imm32(       /* the watermark is in BYTES */
                 RCX, static_cast<int32_t>(P.seg_cur),
                 static_cast<uint32_t>(my_total * 48));
+            e.patch32_here(j_noseg);
 #ifdef TESTS
             e.movabs(RAX,
                      reinterpret_cast<uint64_t>(&g_jit_norec_ret_arm));
