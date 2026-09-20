@@ -133,6 +133,20 @@ void build_boxed_ops(Chunk &chunk);
 void compute_nonneg_slots(Chunk &chunk);
 
 /*
+ * `Chunk::ref_slots` is DERIVED too (myv v18, 2026-09-22): the frame
+ * slots that can hold a reference, from the final code's write-dsts
+ * (visit_use_def + op_writes_scalar and the per-instruction refinements),
+ * the handler table's catch binds, and the parameter SEEDS - the param
+ * slots whose bind can write a reference, which `ref_seeds_of` computes
+ * from the descriptor for the compile and the loader alike. It decides
+ * what a frame pop RELEASES, so a stored list that disagreed with the
+ * code beside it leaked (myv_fuzz small-1305); the loader now rebuilds
+ * it after vm_verify_program and never reads it from the file.
+ */
+void compute_ref_slots(Chunk &chunk, const std::vector<int32_t> *seeds);
+void ref_seeds_of(const FuncDescriptor &desc, std::vector<int32_t> &seeds);
+
+/*
  * Lever A (dead-temp forwarding, plans/archived/unboxing.md): per-pc TEMP
  * live-out AND live-in masks + branch-target flags over the chunk's
  * FINAL code, for the JIT's adjacent-pair forwarding. Computed HERE,

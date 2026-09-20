@@ -2,12 +2,14 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 17.  This document describes the on-disk image exhaustively:
+Format version 18.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
 
-(v17 adds one descriptor field, `noescape_params` - section 8 - written
-right after `fast_bind`; v16 added one per-chunk record, `arg_locs` -
-section 9.21 - written right after `base_locs`; v15 added
+(v18 REMOVES one per-chunk record: `ref_slots`, which used to follow
+`handler_sites` - it is DERIVED at load now, see "DERIVED POOLS" in
+section 9.  v17 added one descriptor field, `noescape_params` - section
+8 - written right after `fast_bind`; v16 added one per-chunk record,
+`arg_locs` - section 9.21 - written right after `base_locs`; v15 added
 `value_callees`, section 9.20.  None changed an existing encoding.)
 
 (v14 changed no encoding: it widened the VALUE DOMAIN of an instruction's
@@ -508,7 +510,8 @@ Each chunk is:
                                     the dict-iterator slice (v7)
     N x HandlerSite handler_sites   the per-try-region catch table (v8),
                                     section 9.18
-    N x u32  ref_slots              (signed) slots that may hold a reference
+                                    (v18: `ref_slots`, once here, is NOT
+                                    stored - see DERIVED POOLS)
     N x value consts
     N x LocEntry locs               9.2
     N x LocEntry base_locs          9.2 - the store-BASE carets (v13)
@@ -951,8 +954,38 @@ implementation free to drift.
                           image and a fresh compile must not be able to
                           disagree about it.  It is also why the analysis
                           may read only chunk data - the parameter seeds
-                          `compute_ref_slots` receives do not exist at
-                          load time.
+                          `compute_ref_slots` receives are a
+                          DESCRIPTOR's, rebuilt from it (below).
+
+    Chunk::ref_slots      (v18) The frame slots that can hold a
+                          REFERENCE: what a frame pop RELEASES, what the
+                          return arms scan, what the frameless gate
+                          counts.  Stored until v17, and that was the
+                          one derived pool whose stored copy could be
+                          DANGEROUSLY wrong rather than merely stale:
+                          one mutated entry (myv_fuzz small-1305, a
+                          single bit, `[1, 2]` -> `[0, 2]`) unlisted the
+                          temp two closures were built in, the release
+                          scan skipped it, and the image ran to the
+                          right answer while leaking both.  Now a pure
+                          function of the final code (its write-dsts
+                          through the audited `visit_use_def` /
+                          `op_writes_scalar` tables and their
+                          per-instruction refinements), `consts`,
+                          `handler_sites` (the catch binds) and the
+                          PARAMETER SEEDS - the descriptor's parameter
+                          slots whose bind can write a reference, i.e.
+                          those neither int/float-coerced nor
+                          inference-proven scalar (`ref_seeds_of`,
+                          codegen.h, the same function the compile
+                          calls).  `myv_read` calls `compute_ref_slots`
+                          right after `compute_nonneg_slots`, for the
+                          same two reasons: it walks operands, so it
+                          runs after `vm_verify_program`, and the JIT
+                          bakes the list into its release arms, so it
+                          runs before `vm_jit_loaded_image`.  Derived
+                          from the code beside it, the list cannot
+                          disagree with that code.
 
     Chunk::catch_uids     The interned twins of `catch_types`; re-interned
                           inline as the names are read.

@@ -9602,9 +9602,23 @@ bool op_writes_scalar(OpCode op)
     }
 }
 
-static void compute_ref_slots(const std::vector<CgInstr> &code,
-                              Chunk &chunk,
-                              const std::vector<int32_t> *seeds)
+/*
+ * Templated over the instruction type because it runs TWICE: at codegen
+ * over the CgInstr vector (before `chunk.code` exists), and at LOAD over a
+ * stored chunk's `Instr` code - `ref_slots` is a DERIVED pool since myv
+ * v18 (2026-09-22), rebuilt by the loader exactly like boxed_ops and
+ * nonneg_slots and never read from the file. The reason is the one the
+ * v4 note gives, in its sharpest form: a list the image carries can
+ * DISAGREE with the code beside it, and `ref_slots` decides which slots
+ * the frame pop RELEASES - a mutated entry (myv_fuzz small-1305: one bit,
+ * `[1, 2]` -> `[0, 2]`) made the release scan skip the temp two closures
+ * were built in, and LeakSanitizer reported them at exit. Derived from
+ * the verified code, the list cannot disagree with it.
+ */
+template <class I>
+static void compute_ref_slots_impl(const std::vector<I> &code,
+                                   Chunk &chunk,
+                                   const std::vector<int32_t> *seeds)
 {
     const int total = chunk.slot_count + chunk.n_temps;
     std::vector<char> is_ref(total, 0);
@@ -9654,7 +9668,7 @@ static void compute_ref_slots(const std::vector<CgInstr> &code,
      * asserts the same about the emitted return path.
      */
     std::vector<std::pair<int, int>> moves;
-    for (const CgInstr &in : code) {
+    for (const I &in : code) {
         const bool known = visit_use_def(
             in, [](int) {},
             [&](int dslot) {
@@ -9805,6 +9819,34 @@ static void compute_ref_slots(const std::vector<CgInstr> &code,
             if (!is_ref[mv.first])
                 g_ref_slots_move_excluded++;   /* the engagement proof */
 #endif
+}
+
+static void compute_ref_slots(const std::vector<CgInstr> &code,
+                              Chunk &chunk,
+                              const std::vector<int32_t> *seeds)
+{
+    compute_ref_slots_impl(code, chunk, seeds);
+}
+
+void compute_ref_slots(Chunk &chunk, const std::vector<int32_t> *seeds)
+{
+    compute_ref_slots_impl(chunk.code, chunk, seeds);
+}
+
+/*
+ * The parameter SEEDS of `compute_ref_slots` for a function chunk: every
+ * param slot whose bind can write a reference - i.e. not int/float-COERCED
+ * (bind_param's coerce guarantees those never hold one) and not
+ * inference-PROVEN i/f (C3, ParamDesc::proven_type; the VM_HARDENING
+ * pop_window audit is the net). ONE function for the compile and the
+ * loader, so the two seed sets cannot drift.
+ */
+void ref_seeds_of(const FuncDescriptor &desc, std::vector<int32_t> &seeds)
+{
+    seeds.clear();
+    for (size_t i = 0; i < desc.params.size(); i++)
+        if (!desc.params[i].binds_scalar())
+            seeds.push_back(static_cast<int32_t>(i));
 }
 
 /* model-flip nativize-ops: copy each BinOpV/CmpV/CompoundV's FINAL operand data
@@ -11240,18 +11282,13 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
      * params still missing answered "trivial" for a reference. Caught by
      * `jit_ret_audit` on the first run - watched. */
     std::vector<int32_t> seeds;
-    const auto &params = fn->desc->params;
-    for (size_t i = 0; i < params.size(); i++) {
-        if (!params[i].binds_scalar()) {
-            seeds.push_back(static_cast<int32_t>(i));
-        }
+    ref_seeds_of(*fn->desc, seeds);       /* shared with the LOADER */
 #ifdef TESTS
-        else if (params[i].proven_type == DeclType::i
-                 || params[i].proven_type == DeclType::f) {
+    for (const FuncDescriptor::ParamDesc &pd : fn->desc->params)
+        if (pd.binds_scalar() && (pd.proven_type == DeclType::i
+                                  || pd.proven_type == DeclType::f))
             g_ref_slots_proven_excluded++;   /* C3: the engagement proof */
-        }
 #endif
-    }
 
     /* EVERY callable body keeps its chunk - even an empty/no-op one (a bare
      * Halt returning none): after the AST teardown the chunk is the only way

@@ -6369,6 +6369,27 @@ separately, a `dyn` div0 in a JIT'd loop (whose caret the JIT stamps
 straight from `boxed_ops[i].start/end`) renders byte-identically from an
 image and from source. Measured: shopping 6588 -> 5641, gcd 1957 = 1.08x
 its source; cumulative from v1 shopping -56%, gcd -60%.
+**⛔ AND `ref_slots` IS DERIVED TOO (v18, 2026-09-22) - THE ONE POOL WHOSE
+STORED COPY WAS DANGEROUS, NOT MERELY REDUNDANT.** It decides what a frame
+pop RELEASES, what the return arms scan, what the frameless gate counts.
+`myv_fuzz` flipped ONE bit of the stored list (`[1, 2]` -> `[0, 2]`,
+small-1305): the temp two closures were built in went unlisted, the
+release scan skipped it, and the image ran to the right answer while
+LeakSanitizer reported both at exit - the failure mode the format text
+used to call "accepted" for a wrong list. It is not accepted; it is gone:
+`myv_read` calls `compute_ref_slots` (codegen.h) right after
+`compute_nonneg_slots`, with the descriptor's seeds from `ref_seeds_of` -
+the SAME function `compile_func_body` uses, so the two seed sets cannot
+drift - and the record left the format. The placement rule is
+nonneg_slots': after `vm_verify_program` (the walk reads operands),
+before the JIT (which bakes the list into its release arms).
+`myv_round_trip` compares the derived lists entry-for-entry on every
+chunk and counts them; `myv_ref_slots_derived` tampers the writer-side
+lists and requires the loaded ones to be the pristine derivation
+(watched: with the rebuild removed, or its seeds dropped, both it and the
+round trip fail - the JIT's release arms differ). **A pool that a
+mutation can turn into a wrong LIFETIME decision is not a bytes question;
+derive it.**
 **THE DELTA-CODED LOC TABLE (v5, same day).** `{u32 pc, u32 line, u32
 col, u32 line, u32 col}` = 20 bytes per entry, ~19 of them zero (over
 bench/ + samples/, 969 entries: the pc delta never exceeded 19, the

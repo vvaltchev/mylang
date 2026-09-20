@@ -98,7 +98,7 @@ def chunk(r):
     for _ in range(r.u32()):                      # 9.18 handler_sites
         for _ in range(r.u32()): r.u32(); r.u32(); r.u32()   # clauses
         r.u32(); r.boolv()                        # fin_pc, has_rethrow
-    r.nx(r.u32)                                   # ref_slots
+    # (v18: no ref_slots record - it is derived at load)
     r.nx(lambda: value(r))                        # consts
     def loc_table():                              # 9.2 delta loc table
         for _ in range(r.u32()):

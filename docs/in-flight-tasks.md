@@ -781,6 +781,30 @@ StoreElemValue / StoreMemberV / StoreElem2V, which the VM reads as a
 slot unconditionally. `chain_pair`, `a_slot_only`/`b_slot_only` in
 verify_chunk; pinned by `myv_verify_store_operands` (nine patched
 chunks, all nine ACCEPTED before the fix).
+✅ FIXED 2026-09-22 (the maintainer's call: derive, do not accept):
+`small-1305.myv` - one bit in the STORED `ref_slots` list unlisted the
+temp two closures were built in; the release scan skipped it and the
+image ran to the right answer while LeakSanitizer reported both. The
+record is GONE from the format (myv v18): `myv_read` rebuilds
+`ref_slots` from the verified code with the descriptor's seeds
+(`compute_ref_slots` / `ref_seeds_of`, codegen.h, shared with the
+compile), after `vm_verify_program` and before the JIT. Pinned by
+`myv_ref_slots_derived` and the round trip's entry-for-entry compare.
+Two findings still open: fat-676 (terminate) and small-938 (a hang).
+**And the v18 images shifted the seeded mutation space onto FOUR more
+(2026-09-22, all pre-existing classes):** `small-60.myv` - a mutated
+`StructCtorV` dst leaves `p` never written, and W3's
+`jit_chunk_frameless_init_free` asks only that every WRITE of a slot
+be raw, so a slot with NO write at all kept its bit and the frameless
+site left it uninitialised: a SEGV in both builds (`-nj`: a clean
+TypeErrorEx) - fixed in the commit after v18 by a definitely-written
+dataflow; `fat-260.myv` / `fat-845.myv` - debug-only C `assert`s on
+codegen-proven arms (`vm_unpack_elem_body`'s array base,
+`read_float_slot`'s float) that a corrupt image violates, a clean
+TypeErrorEx / OutOfBoundsEx on the ASSERTS=0 build - the "named abort"
+outcome the spec accepts, which the fuzzer nonetheless counts as a
+crash on an ASSERTS build; `fat-316.myv` - an LSan report (256 bytes)
+after an uncaught OutOfBoundsEx from a mutated image.
 **A fourth, reported by the fixed fuzzer the same day, NOT fixed:**
 `small-1305.myv` runs to completion (prints `4`) and LeakSanitizer
 reports two 136-byte `FuncObject`s allocated by `jit_make_closure_ptr`
