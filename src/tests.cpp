@@ -15925,6 +15925,67 @@ callback_frame_call_site()
 }
 
 /*
+ * #38 (repro A): a builtin call spliced from an INLINED body. Its carets
+ * live in the builtin_calls pool, so the op carried no node - and
+ * extract_locs records an op's inlined-at chain only from its node - so
+ * the VM had no inline_ctxs entry at the builtin op's pc and dropped the
+ * inlined callee's virtual frame from any backtrace crossing it: `top`
+ * vanished under the JIT-off VM while the tree-walker (and, by another
+ * route, the JIT) rendered it. Both ways an exception leaves such a
+ * builtin are covered - a callback's throw and the builtin's OWN error -
+ * through the value op (sum/find), the lvalue op (sort) and map, in all
+ * five engine configurations. `top` is expression-bodied so the AST
+ * inliner splices it into drive's loop; the callbacks are NAMED
+ * functions (a lambda literal inside an inlined body is a separate,
+ * unfixed defect).
+ */
+static bool
+inlined_builtin_backtrace_parity()
+{
+    const char *shapes[] = {
+        "sum(xs, weight)",
+        "find(xs, 99, weight) ?? 0",
+        "len(map(weight, xs))",
+        "len(sort(xs, cmpw))",
+        "sum(xs, fz)",                /* the builtin's own TypeErrorEx */
+        "len(sort(xs, fz))",
+    };
+    bool ok = true;
+    for (const char *sh : shapes) {
+        const std::string src =
+            std::string("func weight(int x) { return 10 / (x - 1); }\n")
+            /* the comparator divides ITSELF: a call to `weight` would be
+             * inlined into it, and a virtual frame flushed inside a
+             * callee drops the caller's inlined frames in EVERY engine
+             * (the once-only inline_origin_emitted guard crosses the
+             * physical frame - a separate, tree-walker-level defect) */
+            + "func cmpw(int a, int b) { return 10 / (a - 1) < b; }\n"
+            + "var dyn fz = 5;\n"
+            + "func top(array<int> xs, int k) { return " + sh + " + k; }\n"
+            + "func drive(array<int> xs, int n) {\n"
+            + "  var s = 0;\n"
+            + "  for (var i = 0; i < n; i++) s = s + top(xs, i);\n"
+            + "  return s;\n"
+            + "}\n"
+            + "var xs = [5, 1, 4];\n"
+            + "print(drive(xs, int(runtime(40))));\n";
+        std::string tw;
+        if (!engines_agree_bt(sh, src, &tw))
+            ok = false;
+        /* not vacuous: the reference must END in the exception and
+         * RENDER the inlined frame (at its call site, line 7) */
+        if (tw.find("EXC ") == std::string::npos
+                || tw.find("top(xs, k)") == std::string::npos
+                || tw.find("drive(xs, n) at line 7") == std::string::npos) {
+            cout << "  " << sh << ": the tree-walker does not render "
+                 << "the inlined frame:\n" << tw;
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+/*
  * Backtrace parity for a RECURSION whose self-call sits inside an INLINED
  * region (what the AST inliner's recursion unroll produces for the fib
  * shape). Two VM-only defects, both invisible under `-ni` and both found
@@ -45275,6 +45336,8 @@ static const std::vector<extra_check> extra_checks =
       inlined_recursion_backtrace_parity },
     { "backtrace: a builtin callback's frame names the builtin call (#44)",
       callback_frame_call_site },
+    { "backtrace: a builtin call in an inlined body keeps its frame (#38)",
+      inlined_builtin_backtrace_parity },
     { "static_type: ground caching & with_opt", static_type_ground_caching },
     { "static_type: assignable rules", static_type_assignable_rules },
     { "static_type: join (LUB) rules", static_type_join_rules },
