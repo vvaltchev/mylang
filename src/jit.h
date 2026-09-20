@@ -228,6 +228,9 @@ void *jit_addr_sync_depth();
  * and cleared by jit_call_sync(_cached): run the callee as a BOUNDARY
  * call, so no depth-cap switch can propagate into that frame */
 void *jit_addr_nosw();
+/* #97 G2: an empty CaptureSlots, ctx.captures for a capture-free callee
+ * whose FuncObject a site no longer loads */
+const void *jit_empty_captures();
 int jit_sync_depth_cap();
 void jit_set_sync_depth_cap(int cap);   /* M5a: raised when the native
                                          * stack arms; tests pin it low */
@@ -656,6 +659,9 @@ extern unsigned long g_jit_frameless_nonmain; /* F1: frameless sites
 extern unsigned long g_jit_frameless_mutual;  /* G1: frameless sites to
                                                 * ANOTHER calling function
                                                 * (emit-time) */
+extern unsigned long g_jit_frameless_fixed;   /* G2: non-self sites
+                                                * without the identity
+                                                * chain (emit-time) */
 extern unsigned long g_jit_vframe_publish;     /* E2e: vframe
                                                 * publishes EMITTED */
 extern unsigned long g_jit_frameless_self_floor; /* E2d: self sites

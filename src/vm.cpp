@@ -3532,6 +3532,7 @@ unsigned long g_jit_frameless_self_floor = 0; /* #97 E2d: emit-time */
 unsigned long g_jit_vframe_publish = 0;      /* #97 E2e: emit-time */
 unsigned long g_jit_frameless_nonmain = 0;   /* #97 F1: emit-time */
 unsigned long g_jit_frameless_mutual = 0;    /* #97 G1: emit-time */
+unsigned long g_jit_frameless_fixed = 0;     /* #97 G2: emit-time */
 unsigned long g_jit_frameless_boundary = 0;   /* #97 E2: run-time */
 unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
                                             * (emitted code) */
@@ -8488,6 +8489,12 @@ void *jit_addr_sync_depth()
 /* #97 E2: the decline relay (jit.h: jit_addr_nosw). In the low arena so
  * the emitted store is one instruction. */
 static int_type &g_jit_nosw = *ml_lowmem_new<int_type>(0);
+const void *jit_empty_captures()
+{
+    static CaptureSlots empty;       /* never written: nothing captures */
+    return &empty;
+}
+
 void *jit_addr_nosw()
 {
     return &g_jit_nosw;

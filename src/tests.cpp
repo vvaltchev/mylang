@@ -20018,6 +20018,7 @@ static bool jit_frameless_nonmain()
                           const std::vector<const char *> &lines,
                           const char *must) {
         const unsigned long n0 = g_jit_frameless_nonmain;
+        const unsigned long x0 = g_jit_frameless_fixed;
         const unsigned long p0 = g_jit_frameless_pushes;
         const std::string ref = run(lines, false);
         const std::string vm = run(lines, true);
@@ -20028,10 +20029,14 @@ static bool jit_frameless_nonmain()
                     "%s\n  vm: %s\n", what, ref.c_str(), vm.c_str());
             ok = false;
         }
-        if (!dn || dp < 30) {
+        /* G2: every callee here is a named, write-once, capture-free
+         * leaf - its site skips the identity chain */
+        const unsigned long dx = g_jit_frameless_fixed - x0;
+        if (!dn || dp < 30 || !dx) {
             fprintf(stderr, "jit_frameless_nonmain: %s VACUOUS - %lu "
-                    "non-main frameless sites emitted, %lu frameless "
-                    "calls\n", what, dn, dp);
+                    "non-main frameless sites emitted (%lu without the "
+                    "identity chain), %lu frameless calls\n", what, dn, dx,
+                    dp);
             ok = false;
         }
     };
@@ -20114,6 +20119,52 @@ static bool jit_frameless_nonmain()
         "var g = make_array(50, func(int i) => wt(i, key(i)));",
         "print(len(f), sum(f), sum(m), s[0], s[199], sum(g));" },
         "118 5969 30033 0 99 3775");
+    /*
+     * G2's soundness half: the chain is skipped only for a slot REALLY
+     * written once. Under FORCE=bakecallee a reassigned slot is baked all
+     * the same - so after `mix = mix2` the site must keep its compare,
+     * fail it, and reach mix2 through the slow tier. Watched: with the
+     * predicate reading the forced bake, the second line repeats the first.
+     */
+    {
+        const unsigned saved_force = g_jit_force_extra;
+        g_jit_force_extra |= jit_lever_bit("bakecallee");
+        const unsigned long x0 = g_jit_frameless_fixed;
+        const std::vector<const char *> lines = {
+            "func mix(int a) {",
+            "  var x = a * 31 + 7;",
+            "  x = x ^ (x >> 7);",
+            "  return x % 1003;",
+            "}",
+            "func mix2(int a) {",
+            "  var y = a * 5 + 1;",
+            "  y = y ^ (y >> 3);",
+            "  return y % 7 + 5000;",
+            "}",
+            "func drive(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + mix(i);",
+            "  return s;",
+            "}",
+            "print(drive(int(runtime(40))));",
+            "mix = mix2;",
+            "print(drive(int(runtime(40))));" };
+        const std::string ref = run(lines, false);
+        const std::string vm = run(lines, true);
+        g_jit_force_extra = saved_force;
+        if (ref != vm) {
+            fprintf(stderr, "jit_frameless_nonmain: a reassigned callee "
+                    "slot under FORCE differs\n  nj: %s\n  vm: %s\n",
+                    ref.c_str(), vm.c_str());
+            ok = false;
+        }
+        if (g_jit_frameless_fixed != x0) {
+            fprintf(stderr, "jit_frameless_nonmain: FORCE case - %lu "
+                    "sites skipped the identity chain for a reassigned "
+                    "slot\n", g_jit_frameless_fixed - x0);
+            ok = false;
+        }
+    }
     return ok;
 #else
     return true;
@@ -30522,9 +30573,10 @@ static bool jit_frameless_w3_shape()
  *    read's helper arm passes the BASE REGISTER (`mov rsi, r1*`) to
  *    jit_load_capture_at and the store's arm `mov rdi, r1*` to
  *    jit_store_capture_at - neither helper reads ctx->captures;
- *  - a FACTORY (a MakeClosureV body) DECLINES: its site keeps the
- *    `lea rax, [rdx+fo.capture_slots]; mov [r9+caps], rax` repoint,
- *    because jit_make_closure snapshots through ctx.
+ *  - a FACTORY (a MakeClosureV body) DECLINES: its site keeps a
+ *    ctx.captures repoint, because jit_make_closure snapshots through
+ *    ctx - to the EMPTY set since #97 G2 (a named capture-free callee's
+ *    site no longer loads the FuncObject).
  * (The int-capture closure - 78's shape - is pinned in the W2 test:
  * the entry's `mov r1*, [rdx+0x10]` and the site's poison store.)
  */
@@ -30534,6 +30586,7 @@ static bool jit_frameless_w4_shape()
     if (!g_jit_enabled)
         return true;
     std::string d76, dref, dfac;
+    unsigned long fac_cb0 = 0, fac_fx0 = 0;
     try {
         d76 = native_dump_of({
             "func add_op(st, x) { st[0] = st[0] + x; }",
@@ -30552,6 +30605,8 @@ static bool jit_frameless_w4_shape()
             "for (var i = 0; i < runtime(30); i++) {",
             "  n = n + len(f(\"cd\")) + len(g(\"y\")); }",
             "print(n, g(\"\"));" });
+        fac_cb0 = g_jit_frameless_capbase;
+        fac_fx0 = g_jit_frameless_fixed;
         dfac = native_dump_of({
             "func mk(int z) { return func [z] (int k) { return k + z; }; }",
             "var s = 0;",
@@ -30599,14 +30654,23 @@ static bool jit_frameless_w4_shape()
         }
     }
     {
-        /* the factory declines: its site repoints */
+        /* the factory declines W4: its site REPOINTS ctx.captures. Since
+         * #97 G2 a named, write-once, capture-free callee's site no
+         * longer loads the FuncObject, so the repoint is to an EMPTY set
+         * (`movabs rax, <addr>`) - the same shape as W4's TESTS poison
+         * store, told apart by the G2 counter (the poison counter is
+         * program-wide, and the closure's own call IS a W4 site) */
         const std::vector<NativeIns> mn = native_ins_of(dfac, "main");
-        if (native_find_seq(mn, 0, { "push [r9+0x*]", "lea rax, [rdx+0x*]",
+        if (native_find_seq(mn, 0, { "push [r9+0x*]", "movabs rax, <addr>",
                                      "mov [r9+0x*], rax" })
-                == std::string::npos) {
+                    == std::string::npos
+                || g_jit_frameless_fixed == fac_fx0) {
             fprintf(stderr, "jit_frameless_w4_shape: the factory's site "
                             "(a MakeClosureV body) should keep the "
-                            "ctx.captures repoint\n");
+                            "ctx.captures repoint - to the empty set "
+                            "(poison sites %lu, G2 sites %lu)\n",
+                    g_jit_frameless_capbase - fac_cb0,
+                    g_jit_frameless_fixed - fac_fx0);
             ok = false;
         }
     }

@@ -597,9 +597,11 @@ work — but profile it before building, the way increment 0 was.
         *#97 F1/F2*). ✅ **G1 DONE 2026-09-24** (bench 93 first): a
         CALLING callee at another function's site, placed at RUN time
         through Chunk::frameless_entry_abs (93 -36.5% Ir; record: *#97
-        G1*). NEXT: the identity chain for ANY named write-once
-        capture-free callee (E2c's argument generalises), then builtin
-        calls in a calling body, then #124.
+        G1*). ✅ **G2 DONE 2026-09-24**: no identity chain for ANY
+        named write-once capture-free callee (93 -8.9%, 91 -6.7%, 92
+        -4.4% Ir - but WALL FLAT, the guard-elision signature; record:
+        *#97 G2*). NEXT: builtin calls in a calling
+        body (bench first), then #124.
         NEXT was: a non-SELF callee
         (needs the callee's placement facts at a non-main site - the
         seventh audit-table shape), builtin calls in a calling body.

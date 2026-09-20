@@ -9156,16 +9156,35 @@ jit_frameless_callee(const Chunk &ck, size_t old_pc, const Instr &in,
  * site calls the running body with the arity and window it was compiled
  * against - the one thing an image mutation can change is the ANSWER.
  */
+/*
+ * #97 G2: AND THE SAME ARGUMENT HOLDS FOR ANY SUCH CALLEE, not only the
+ * running function. What E2c needed of "the callee is the running body"
+ * was that the baked constants are true of what will run - and for a
+ * write-once slot they are true of its ONE declaration, which is also
+ * the only thing the slot can hold. And "cannot be none" does not need
+ * the callee to be running either: a slot_desc entry is always a NAMED
+ * declaration (a lambda's descriptor has no name, so neither map lists
+ * one), a named declaration binds at SCOPE ENTRY (#134), and a site can
+ * name it only from inside that scope - which was entered before any of
+ * its code ran. The one field a non-self site still owes the callee is
+ * ctx.captures: the caller's are installed, and while nothing in a
+ * capture-free body reads them, the site points it at an EMPTY set
+ * (one constant store) rather than rely on that.
+ */
 static bool jit_self_site_is_running(const Chunk &ck, size_t old_pc,
                                      const Instr &in)
 {
-    if (in.op == OpCode::CallValueV || !g_cur_caller_desc)
+    if (in.op == OpCode::CallValueV)
         return false;
     const FuncDescriptor *c = jit_frameless_callee(ck, old_pc, in, nullptr);
-    if (c != g_cur_caller_desc || !c->captures.empty())
+    if (!c || !c->captures.empty())
         return false;
-    const Chunk *cck = static_cast<const Chunk *>(c->vm_chunk);
-    if (!cck || cck->frameless_capbase)
+    /* NOT the callee's frameless_capbase: its entry loads a capture base
+     * from rdx only when it CLAIMED one, which takes a capture op, which
+     * a capture-free body has none of - and that flag is written by the
+     * callee's own JIT pass, which a G1 (calling) callee may not have
+     * run yet: reading it here would make the emission order-dependent */
+    if (!c->vm_chunk)
         return false;
     const JitCtx *jc = g_cur_jc;
     const int slot = static_cast<int>(in.target2);
@@ -11347,6 +11366,12 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                           cell, ns, residue, af, &frameless_taken);
     ML_CHECK(frameless_taken == frameless_site);
     size_t j_done1 = 0, j_done2 = 0, j_notsent = 0;
+    /* #97 G2: a frameless site whose every guard is elided (a baked leaf
+     * with no identity compare, no bounds and no fill decline) has NO
+     * path into the slow tail - so it emits neither the materialisation
+     * nor the tail (CLAUDE.md: when every guard is elided, emit neither
+     * the join jump nor the arm; *the CALL SEAM is total* is the net) */
+    bool slow_dead = false;
     if (frameless_taken) {
         /*
          * #97 INCREMENT 2 (F4/F6) / 3 (W1): THE FRAMELESS CALL. The push
@@ -11417,6 +11442,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         std::vector<WinTramp> tramps;             /* declines after a reserve */
         std::vector<size_t> j_next;               /* the failed compares */
         std::vector<size_t> j_pre;                /* E2: a self site's bounds */
+        bool fl_slow_reached = false;             /* G2: see slow_dead */
         for (int k = 0; k < ncand; k++) {
             const FuncDescriptor *fl_callee = cands[k];
             ML_CHECK(fl_callee && fl_callee->vm_chunk);
@@ -11433,8 +11459,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 j_next.push_back(e.j32(0x75));    /* jne next / slow */
             }
 #ifdef TESTS
-            else
+            else if (fl_callee == g_cur_caller_desc)
                 g_jit_frameless_self_id++;        /* emit-time */
+            else
+                g_jit_frameless_fixed++;          /* G2: emit-time */
             e.bump_counter(&g_jit_bake_push);     /* the baked arm ran */
 #endif
             /*
@@ -11573,7 +11601,16 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                                    * caller's captures */
             if (self_running) {
                 /* E2c: capture-free, and the caller IS the callee - the
-                 * captures pushed above stay current */
+                 * captures pushed above stay current; G2: another
+                 * capture-free callee gets an EMPTY set (the callee's own
+                 * is empty too - no FuncObject is at hand to point at) */
+                if (!fl_self) {
+                    e.movabs(RAX, reinterpret_cast<uint64_t>( /* reg:proto */
+                                      jit_empty_captures()));
+                    e.store_base(RAX, R9,         /* reg:proto */
+                                 static_cast<int32_t>(
+                                     jit_layout().ctx_captures));
+                }
             } else if (!fl_ck->frameless_capbase) {
                 /* ctx.captures = &fo.capture_slots */
                 e.lea_base(RAX, RDX,              /* reg:proto */
@@ -11690,6 +11727,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.exit_pc(pc);                        /* re-raise */
             tramps.push_back(std::move(wt));
             /* next_k: the next candidate's compare, or the slow tier */
+            if (k + 1 == ncand && (!self_running || !j_pre.empty()))
+                fl_slow_reached = true;           /* the post-loop point */
             if (!self_running)
                 e.patch32_here(j_next.back());
             for (const size_t j : j_pre)          /* E2: the self bounds */
@@ -11711,6 +11750,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         for (const WinTramp &wt : tramps)
             if (!wt.j.empty())
                 have_tramp = true;
+        slow_dead = !fl_slow_reached && !have_tramp && j_slows.empty();
         if (have_tramp)
             j_over = e.j32(0xEB);                 /* the compares' path
                                                    * skips the fixes */
@@ -11730,7 +11770,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         for (const size_t j : j_slows)
             e.patch32_here(j);
         j_slows.clear();                          /* patched here, once */
-        emit_frameless_materialise(e, in, af);
+        if (!slow_dead)
+            emit_frameless_materialise(e, in, af);
     } else {
     /* depth++ (the callee is committed) */
     e.bump_counter32_live(
@@ -11940,124 +11981,127 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     emit_call_epilogue_divergent(e);
     e.exit_pc(pc);                                 /* exception -> re-raise */
     }   /* the recorded / record-less call tail */
-    /* slow: the full helper (identical to the plain emit_sync_call tail).
-     * r9 = the baked &locs[i] for THIS call op (#56 step 1: the
-     * undefined-callee UndefinedVariableEx is constructed WITH the
-     * callee-identifier caret; the Runtime conveys get the same caret from
-     * the exc-stamp below). */
-    for (const size_t j : j_slows)
-        e.patch32_here(j);
-    /*
-     * #162: MATERIALISE the fused arguments. Everything below reads the
-     * argument RUN - the C++ slow tier binds from it, the depth-cap
-     * SWITCH pushes from it, and a BAIL (status 1) resumes the INTERPRETED
-     * call op, which reads it too - and the staging MoveVs that fill it
-     * were not emitted. This is the ONE join every decline passes through,
-     * which is why the fusion needs exactly one materialisation point.
-     * Cold: reached only by a guard decline. rdi/rsi are dead here (the
-     * slow-helper setup below redefines both).
-     */
-    if (af && af->pairs) {
-        e.movabs(RDI,                                 /* reg:abi */
-                 reinterpret_cast<uint64_t>(af->pairs->data()));
+    size_t j_done3 = 0;
+    if (!slow_dead) {
+        /* slow: the full helper (identical to the plain emit_sync_call tail).
+         * r9 = the baked &locs[i] for THIS call op (#56 step 1: the
+         * undefined-callee UndefinedVariableEx is constructed WITH the
+         * callee-identifier caret; the Runtime conveys get the same caret from
+         * the exc-stamp below). */
+        for (const size_t j : j_slows)
+            e.patch32_here(j);
+        /*
+         * #162: MATERIALISE the fused arguments. Everything below reads the
+         * argument RUN - the C++ slow tier binds from it, the depth-cap
+         * SWITCH pushes from it, and a BAIL (status 1) resumes the INTERPRETED
+         * call op, which reads it too - and the staging MoveVs that fill it
+         * were not emitted. This is the ONE join every decline passes through,
+         * which is why the fusion needs exactly one materialisation point.
+         * Cold: reached only by a guard decline. rdi/rsi are dead here (the
+         * slow-helper setup below redefines both).
+         */
+        if (af && af->pairs) {
+            e.movabs(RDI,                                 /* reg:abi */
+                     reinterpret_cast<uint64_t>(af->pairs->data()));
+            e.mov_imm(RSI, static_cast<uint64_t>(  /* reg:abi */
+                              static_cast<int_type>(af->pairs->size() / 2)));
+            e.call_direct(reinterpret_cast<const void *>(jit_stage_args));
+        }
+        /* 4-iv (design 4d): the MATERIALIZER ANCHOR relay - the site pointer
+         * and THIS fragment's rbp, stored just before the helper call so a
+         * depth-cap SWITCH inside it can walk the native chain from the
+         * switching caller (and, in 4-v, insert records for the record-less
+         * frames the -3 propagation is about to unwind). Every integer arg
+         * register is taken by the helper's six arguments, hence the relay;
+         * rax/rcx are dead at slow entry (the helper's return redefines
+         * both). Cold path - guard declines and cap switches only. */
+        if (ns) {
+            e.movabs(RAX, reinterpret_cast<uint64_t>(&g_norec_switch_site));
+            e.movabs(RCX, reinterpret_cast<uint64_t>(ns));
+            e.store_base0(RCX, RAX);
+            e.movabs(RAX, reinterpret_cast<uint64_t>(&g_norec_switch_rbp));
+            e.store_base0(RBP, RAX);
+        }
+        /*
+         * #97 E2: A SWITCH NEVER PASSES THROUGH A FRAMELESS FRAME. In a body
+         * that can be entered framelessly, a decline asks whether THIS frame
+         * is the frameless one - the return arm's own test, rbx == rbp+32 (a
+         * segment window is a heap address) - and if so tells the helper to
+         * run the callee as a BOUNDARY call: under a nested dispatch loop that
+         * consumes every switch below it, so this frame never receives -3
+         * and never needs the record the materializer could not give a
+         * native-stack window. rax is dead here (the relay above is done;
+         * the helper's arguments are set below).
+         */
+        if (g_cur_self_fl) {
+            e.lea_base(RAX, RBP, JIT_FRAMELESS_WIN_OFF);   /* reg:proto */
+            e.cmp_rr(RAX, RBX);                            /* reg:proto */
+            const size_t j_nf = e.j32(0x75);               /* jne: not ours */
+            const void *nosw = jit_addr_nosw();
+            if (!e.store_qword_abs32_imm32(nosw, 1)) {
+                e.movabs(RAX, reinterpret_cast<uint64_t>(nosw));  /* reg:proto */
+                e.store_qword_base_imm32(RAX, 0, 1);
+            }
+            /* E2b: the helper put()s the result into the dst, which reads
+             * the old value's type and tail - and in a frameless frame the
+             * site that built this window may have left the dst raw (W3). A
+             * valid `none` first, on this cold path only. */
+            if (in.target >= 0) {
+                const JitLayout &LL = jit_layout();
+                const int32_t d = in.target * static_cast<int32_t>(sizeof(LValue));
+                e.zero_reg32(RAX);                          /* reg:proto */
+                e.store_base(RAX, RBX, d + 32);             /* reg:proto */
+                e.store_base(RAX, RBX, d + 40);             /* reg:proto */
+                e.movabs(RAX, reinterpret_cast<uint64_t>(LL.t_none));
+                e.store_base(RAX, RBX, d + static_cast<int32_t>(LL.off_type));
+            }
+            e.patch32_here(j_nf);
+        }
+        /* #88: the slow tier reads the same side channel. Reached only from a
+         * GUARD decline, i.e. before the callee runs, so nothing can have
+         * clobbered the globals between here and the helper. */
+        emit_bake_call_site(e, ck, old_pc);
+        e.mov_imm(RDI, static_cast<uint64_t>(callee_arg)); /* reg:abi */
+        /* #56 step 3: argbase|nargs<<32 packed into ONE arg; the freed reg
+         * carries the POST-CALL entry-stub pc (the SWITCH record's resume). */
         e.mov_imm(RSI, static_cast<uint64_t>(  /* reg:abi */
-                          static_cast<int_type>(af->pairs->size() / 2)));
-        e.call_direct(reinterpret_cast<const void *>(jit_stage_args));
-    }
-    /* 4-iv (design 4d): the MATERIALIZER ANCHOR relay - the site pointer
-     * and THIS fragment's rbp, stored just before the helper call so a
-     * depth-cap SWITCH inside it can walk the native chain from the
-     * switching caller (and, in 4-v, insert records for the record-less
-     * frames the -3 propagation is about to unwind). Every integer arg
-     * register is taken by the helper's six arguments, hence the relay;
-     * rax/rcx are dead at slow entry (the helper's return redefines
-     * both). Cold path - guard declines and cap switches only. */
-    if (ns) {
-        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_norec_switch_site));
-        e.movabs(RCX, reinterpret_cast<uint64_t>(ns));
-        e.store_base0(RCX, RAX);
-        e.movabs(RAX, reinterpret_cast<uint64_t>(&g_norec_switch_rbp));
-        e.store_base0(RBP, RAX);
-    }
-    /*
-     * #97 E2: A SWITCH NEVER PASSES THROUGH A FRAMELESS FRAME. In a body
-     * that can be entered framelessly, a decline asks whether THIS frame
-     * is the frameless one - the return arm's own test, rbx == rbp+32 (a
-     * segment window is a heap address) - and if so tells the helper to
-     * run the callee as a BOUNDARY call: under a nested dispatch loop that
-     * consumes every switch below it, so this frame never receives -3
-     * and never needs the record the materializer could not give a
-     * native-stack window. rax is dead here (the relay above is done;
-     * the helper's arguments are set below).
-     */
-    if (g_cur_self_fl) {
-        e.lea_base(RAX, RBP, JIT_FRAMELESS_WIN_OFF);   /* reg:proto */
-        e.cmp_rr(RAX, RBX);                            /* reg:proto */
-        const size_t j_nf = e.j32(0x75);               /* jne: not ours */
-        const void *nosw = jit_addr_nosw();
-        if (!e.store_qword_abs32_imm32(nosw, 1)) {
-            e.movabs(RAX, reinterpret_cast<uint64_t>(nosw));  /* reg:proto */
-            e.store_qword_base_imm32(RAX, 0, 1);
+                          static_cast<uint64_t>(in.a_lit())
+                          | (static_cast<uint64_t>(in.b_lit()) << 32)));
+        e.mov_imm(RDX, static_cast<uint64_t>(resume_stub));   /* the SWITCH
+                                            * resume - the SAME local the
+                                            * site's resume_pc holds (4-i) */
+        e.mov_imm(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.mov_imm(R8, site);
+        {
+            const Chunk::LocEntry *lep = nullptr;
+            for (const auto &l : ck.locs)
+                if (l.pc == old_pc) { lep = &l; break; }
+            e.movabs(R9, reinterpret_cast<uint64_t>(lep));  /* reg:abi */
         }
-        /* E2b: the helper put()s the result into the dst, which reads
-         * the old value's type and tail - and in a frameless frame the
-         * site that built this window may have left the dst raw (W3). A
-         * valid `none` first, on this cold path only. */
-        if (in.target >= 0) {
-            const JitLayout &LL = jit_layout();
-            const int32_t d = in.target * static_cast<int32_t>(sizeof(LValue));
-            e.zero_reg32(RAX);                          /* reg:proto */
-            e.store_base(RAX, RBX, d + 32);             /* reg:proto */
-            e.store_base(RAX, RBX, d + 40);             /* reg:proto */
-            e.movabs(RAX, reinterpret_cast<uint64_t>(LL.t_none));
-            e.store_base(RAX, RBX, d + static_cast<int32_t>(LL.off_type));
+        e.call_direct(slow_helper);
+        e.test32_rr(RAX, RAX);                        /* test eax, eax */
+        j_done3 = e.j32(0x74);                         /* jz done */
+        /* status 3 = SWITCH: the callee was pushed interpreted-flat; this
+         * fragment returns JIT_RET_SWITCH - its consumer drives the callee and
+         * the record's baked resume re-enters us at the post-call stub. */
+        e.cmp_reg32_imm8(RAX, 3);
+        {
+            const size_t j_sw = e.j32(0x75);           /* jne exc_path */
+            emit_call_epilogue_divergent(e);
+            emit_divergent_flush(e);           /* #97 1b: pins -> memory */
+            e.mov_imm(RAX, static_cast<uint64_t>(-3));  /* JIT_RET_SWITCH */
+            /* ret */
+            e.frag_ret(Emitter::RetFlush::flushed);
+            e.patch32_here(j_sw);
         }
-        e.patch32_here(j_nf);
-    }
-    /* #88: the slow tier reads the same side channel. Reached only from a
-     * GUARD decline, i.e. before the callee runs, so nothing can have
-     * clobbered the globals between here and the helper. */
-    emit_bake_call_site(e, ck, old_pc);
-    e.mov_imm(RDI, static_cast<uint64_t>(callee_arg)); /* reg:abi */
-    /* #56 step 3: argbase|nargs<<32 packed into ONE arg; the freed reg
-     * carries the POST-CALL entry-stub pc (the SWITCH record's resume). */
-    e.mov_imm(RSI, static_cast<uint64_t>(  /* reg:abi */
-                      static_cast<uint64_t>(in.a_lit())
-                      | (static_cast<uint64_t>(in.b_lit()) << 32)));
-    e.mov_imm(RDX, static_cast<uint64_t>(resume_stub));   /* the SWITCH
-                                        * resume - the SAME local the
-                                        * site's resume_pc holds (4-i) */
-    e.mov_imm(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-    e.mov_imm(R8, site);
-    {
-        const Chunk::LocEntry *lep = nullptr;
-        for (const auto &l : ck.locs)
-            if (l.pc == old_pc) { lep = &l; break; }
-        e.movabs(R9, reinterpret_cast<uint64_t>(lep));  /* reg:abi */
-    }
-    e.call_direct(slow_helper);
-    e.test32_rr(RAX, RAX);                        /* test eax, eax */
-    const size_t j_done3 = e.j32(0x74);            /* jz done */
-    /* status 3 = SWITCH: the callee was pushed interpreted-flat; this
-     * fragment returns JIT_RET_SWITCH - its consumer drives the callee and
-     * the record's baked resume re-enters us at the post-call stub. */
-    e.cmp_reg32_imm8(RAX, 3);
-    {
-        const size_t j_sw = e.j32(0x75);           /* jne exc_path */
+        emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true,
+                       jit_site_may_coerce(ck, old_pc,
+                                           static_cast<int>(callee_arg),
+                                           is_value));
+                                          /* collapse-safe caret (#56 step 1) */
         emit_call_epilogue_divergent(e);
-        emit_divergent_flush(e);           /* #97 1b: pins -> memory */
-        e.mov_imm(RAX, static_cast<uint64_t>(-3));  /* JIT_RET_SWITCH */
-        /* ret */
-        e.frag_ret(Emitter::RetFlush::flushed);
-        e.patch32_here(j_sw);
-    }
-    emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true,
-                   jit_site_may_coerce(ck, old_pc,
-                                       static_cast<int>(callee_arg),
-                                       is_value));
-                                      /* collapse-safe caret (#56 step 1) */
-    emit_call_epilogue_divergent(e);
-    e.exit_pc(pc);
+        e.exit_pc(pc);
+    }   /* the slow tail */
     /* done: */
     if (j_done1)                          /* the recorded tail's (a
                                            * frameless site's are in
@@ -12065,7 +12109,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.patch32_here(j_done1);
     if (j_done2)
         e.patch32_here(j_done2);
-    e.patch32_here(j_done3);              /* the shared slow tail's */
+    if (j_done3)
+        e.patch32_here(j_done3);          /* the shared slow tail's */
     for (const size_t j : j_dones)
         e.patch32_here(j);                /* the cached probe's HIT path,
                                            * the frameless tails' */
@@ -13811,6 +13856,7 @@ void jit_stats_report()
         { "vframe_publish",    &g_jit_vframe_publish },
         { "frameless_nonmain", &g_jit_frameless_nonmain },
         { "frameless_mutual",  &g_jit_frameless_mutual },
+        { "frameless_fixed",   &g_jit_frameless_fixed },
         { "frameless_boundary", &g_jit_frameless_boundary },
         { "borrow_inline",     &g_jit_borrow_inline },
         { "arg_stage",        &g_jit_arg_stage },
