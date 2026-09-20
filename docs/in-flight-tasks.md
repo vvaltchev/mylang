@@ -600,8 +600,11 @@ work — but profile it before building, the way increment 0 was.
         G1*). ✅ **G2 DONE 2026-09-24**: no identity chain for ANY
         named write-once capture-free callee (93 -8.9%, 91 -6.7%, 92
         -4.4% Ir - but WALL FLAT, the guard-elision signature; record:
-        *#97 G2*). NEXT: builtin calls in a calling
-        body (bench first), then #124.
+        *#97 G2*). ✅ **H1 DONE 2026-09-24** (benches 94/95 first): a
+        frameless body may call builtins (95 0.87x wall; 94 0.99x - its
+        cost is the BUILTIN CALL itself, 51% in jit_call_builtin; record:
+        *#97 H1*). NEXT candidates: the generic builtin helper's
+        per-call cost, and abs/min/max lowered on proven ints; then #124.
         NEXT was: a non-SELF callee
         (needs the callee's placement facts at a non-main site - the
         seventh audit-table shape), builtin calls in a calling body.

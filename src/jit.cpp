@@ -26203,8 +26203,22 @@ bool jit_chunk_frameless_ok(const Chunk &chunk)
              */
             case OpCode::CallV: case OpCode::CachedCallV:
                 continue;
-            case OpCode::CallValueV: case OpCode::CallValueGenericV:
+            /*
+             * #97 H1 (2026-09-24): a BUILTIN call no longer refuses the
+             * chunk. The refusal was increment 2's, when nothing could
+             * walk a frame with a frameless one below it; F5 taught every
+             * walker the kind. What a builtin can do below a frameless
+             * frame: RAISE (the op conveys it as a status, as every
+             * conveying helper does); read the frame through ctx->frame
+             * (the vframe - eager in a leaf, published before every C++
+             * call in a calling body, E2e); run a CALLBACK (VmInvoker -
+             * a nested dispatch, which consumes any depth-cap switch, so
+             * none can cross this frame). None needs the record the
+             * frame lacks. The pre-pass asks only about MyLang calls.
+             */
             case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
+                continue;
+            case OpCode::CallValueV: case OpCode::CallValueGenericV:
                 /*
                  * ⛔ AND IT IS NOT UNIFORMLY REDUNDANT - I ASSERTED THAT
                  * IT WAS AND THE ASSERT FIRED ON THE FIRST RUN.
