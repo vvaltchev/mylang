@@ -37,10 +37,11 @@ first:
 `origin/exp-work` is at `77943e6`; the last FOUR commits are local only.
 The working tree is clean. Nothing is half-applied.
 
-**BUILD LANES PRESENT** (`build-claude/`, 843 MB): `release`, `dbg`
-(TESTS=1 OPT=0, ASan+UBSan), `clang`, `rel-hard`, and `e1` (TESTS=1
-OPT=0 — the lane every net in this session ran against). The throwaway
-measurement lanes and their worktrees were deleted, per the lane rule.
+**BUILD LANES PRESENT** (`build-claude/`): `release`, `dbg` (TESTS=1
+OPT=0, ASan+UBSan), `clang`, `rel-hard`, `perf` (OPT=1 ASSERTS=0, the
+measurement binary). The throwaway measurement lanes and the fork's
+worktree were deleted, per the lane rule. Two `myv_fuzz` findings are
+kept in `myv-fuzz-bad/` (git-ignored) - see the loader item in §3.
 
 ---
 
@@ -49,6 +50,27 @@ measurement lanes and their worktrees were deleted, per the lane rule.
 **THE STANDING REQUIREMENT:** the worst `my/cpp` benches must reach
 <= 5x. Plan: `plans/frameless-callee.md`. Per-change record:
 `docs/jit-optimizations.md`.
+
+**WHERE THE WORST BENCHES STAND after W3 + the per-argument caret
+(the maintainer's own run, 2026-09-20, `my/cpp`; the previous table,
+before E3/W3, read 34 5.28x ... 78 10.35x, 76 11.45x):**
+
+    34_sort_custom_cmp            0.106      0.020    5.22x
+    64_struct_create              0.106      0.016    6.58x
+    09_fib_recursive              0.154      0.022    7.04x
+    73_multi_unpack               0.232      0.032    7.16x
+    58_structs                    0.078      0.011    7.28x
+    11_closure_counter            0.093      0.012    7.59x
+    63_closures                   0.201      0.025    7.95x
+    35_map_filter                 0.200      0.025    8.10x
+    78_typed_param_call           0.061      0.007    8.47x
+    75_indexed_unpack             0.210      0.024    8.88x
+    76_funcval_dispatch           0.172      0.018    9.80x
+
+STOPPED HERE (2026-09-20, the maintainer's call); the work resumes
+with §1.6's list: W4 the capture base, the parameter tails' zeroing,
+`visit_use_def` learning the element-store family (it is what keeps
+W3 off 76), then E2 for 09.
 
 ### 1.1 What is DONE
 
@@ -68,6 +90,13 @@ measurement lanes and their worktrees were deleted, per the lane rule.
                  0.80x - record: docs/jit-optimizations.md, *#97
                  increment 2*; plan section 3 item 2 lists what is left
                  per call and in which order
+    increment 3  T0 (the dump driver), W1 (the caller-built window),
+                 W2 (the fill binds from the sources), E3 (the two-way
+                 site: 76 -20.2% Ir), W3 (the init elision: 78 -7.6%
+                 Ir / 0.85x, 11 -8.2% / 0.90x, 63 -2.5% / 0.92x) -
+                 commits 17d1662 ce17271 9c99f8c 9017e80 856bf06; and
+                 RULE 2's caret work beside it (e4f8b8f the argument
+                 list, d370a76 the failing argument, myv v16)
 
 ### 1.2 Increment 0, in full (commit `50af0f4`, docs `94c818b`)
 
@@ -706,6 +735,32 @@ messages, not carets, which is why no test fails. A `tests` entry with
 (the argument's caret is what the tree-walker's `bind_param` stamps).
 Small, but a caret that differs between engines is a RULE 2 violation
 and is on record. Not a detour from #97 - the maintainer's call.
+
+## 3d. FOUND 2026-09-20, NOT FIXED — TWO LOADER FINDINGS (`myv_fuzz`,
+## #137/#142 class) AND ONE TABLE GAP (the tenth shape, again)
+
+**The loader (task #26).** Both reached by the mutation space the v16
+`arg_locs` records shifted, both pre-existing, reproducers kept in
+`myv-fuzz-bad/`: `fat-676.myv` - an `InternalErrorEx` thrown through
+the `noexcept` `jit_load_struct_elem` -> `vm_struct_elem` ->
+`flat_structs()`' untrusted check = `std::terminate` (the same on the
+debug and the assert-free build); `small-938.myv` - a HANG in the
+load-time JIT's `jit_liveness_core`, whose fixpoint never converges on
+a mutated chunk. Both violate "no input may crash the interpreter".
+
+**The table (task #25).** `visit_use_def` does not know the
+element-STORE family (StoreElemInt/Float/Value, StoreElem2V, the chain
+stores, DictStore): each hits its `default:` BARRIER. Found by W3, the
+newest consumer, exactly as CLAUDE.md's tenth shape predicts - it fails
+closed, so 76_funcval_dispatch's `st[0] = st[0] + x` body gets no init
+elision (3 Ir per call), and lever A, the E1 liveness and C5 give up
+inside every element-store loop in the corpus. Six consumers, so its
+own increment with its own measurement.
+
+**Two caret residues, reported not fixed:** a LITERAL argument through
+a `dyn` callee still carets the argument list (a const-folded literal
+node carries no loc - a parser property, the same in every engine),
+and a builtin CALLBACK's bind keeps the builtin call's list.
 
 ## 4. QUESTIONS FOR THE MAINTAINER
 
