@@ -556,6 +556,76 @@ corpus hole of the same family as the field store's.
 
 ---
 
+## 3b. TASK #124 — REMOVE THE 4-REGISTER CAP ON CALL-CONTAINING RUNS
+## [PENDING — maintainer's call 2026-09-19: "completely fix this with
+## both approaches, but not as a detour right now"]
+
+**THE CAP, precisely.** A native run holding a MyLang call may pin only
+in CALLEE-SAVED registers. SysV has six (rbx, rbp, r12-r15); rbx is the
+slots base and rbp the frame anchor the record-less walk depends on, so
+FOUR. The nine caller-saved ones (rax, rcx, rdx, rsi, rdi, r8-r11) are
+denied to such a run by `jit_run_blocks_xcache`, for two reasons: the
+`call` clobbers all nine by ABI, and the sync push
+(`emit_sync_push_native` / `emit_sync_call_inline`) uses EIGHT of them
+as raw protocol registers across one straight-line stretch -
+`jit_assert_no_volatile_pin` is the tripwire. A call-free run gets all
+thirteen.
+
+**IT IS NOT WHAT STANDS BETWEEN THE SIX WORST BENCHES AND 5x.** The
+`MYLANG_JIT_MAXPINS` sweep (2026-08-18) found every pin past the first
+one or two worth +0.00% Ir on the int loops, and on 09/11/63/75/76/78
+the call protocol is 74-169 Ir per call on the caller side alone -
+10-20x any register effect (the per-call map is in the #97 1b record).
+So this is filed as its own task, after the protocol work.
+
+**THREE PARTS, all wanted:**
+
+ (a) **THE ALLOCATOR BUG - fix first, it is small.** At K=4 with six
+     candidates the linear scan uses THREE registers: an eviction
+     victim's early piece is demoted (no use inside it) and the freed
+     register is never re-offered to the losers. Repro, no call needed:
+
+         MYLANG_JIT_MAXPINS=4 MYLANG_LSRADBG=1 mylang -npc progA.my
+         # progA = program A of plans/frameless-callee.md §3b:
+         #   a/b/i -> regs 0/1/3, c/d/e -> reg -1 (homes), reg 2 IDLE
+
+     On program B (the call twin) that is c in a stack home while r15
+     sits idle. Gate: all four used at K=4; `-vdj` shows r15.
+
+ (b) **SPILL CALLER-SAVED PINS AROUND THE CALL.** The mechanism exists:
+     `emit_call_prologue` stores each caller-saved pin to its slot
+     payload and `emit_call_epilogue` reloads (every helper call does
+     this). Lifting the denial for a sync call costs a store + a load
+     per caller-saved pin per call - and the 1b barrier measurement
+     says stores on the call path are exactly what the wall clock sees
+     (11_closure_counter 1.10x for 2.4% Ir). So it needs a
+     PROFITABILITY rule: pay only in a loop with more than four hot
+     locals and few calls per iteration. The push emitters' own use of
+     r10/r11/rax/rcx/rdx/rsi/r8/r9 is legitimate inside the bracket
+     (the prologue already spilled); `jit_run_blocks_xcache`'s list
+     may then be deletable outright. Gate: Ir + wall on a loop with
+     8 hot int locals and one call per iteration, vs the same loop
+     with the cap.
+
+ (c) **IPA-RA FOR A BAKED CALLEE - what g++ does.** On program B's C++
+     twin g++ -O2 keeps all six loop values in CALLER-saved registers
+     (rcx, r8-r10, rsi) across `call sink`, legal only because it sees
+     `sink`'s clobber set. A BAKED callee's fragment is known to the
+     JIT at compile time just as well: its own pins are callee-saved
+     (saved/restored by its frag_entry), so what it clobbers is its
+     scratch use. The obstacle is OUR side: the push protocol's eight
+     scratch registers are clobbered before the callee ever runs, so
+     (c) needs the push rewritten to use two or three scratch registers
+     - which is also what increment 2 (the frameless callee) changes.
+     Do (c) after increment 2, on the frameless protocol, not before.
+
+**WHY NOT DURING #97:** the maintainer's rule - no detour. #97's
+remaining increments (1c, the probe elision, increment 2) are where the
+5x lives; this task is filed so it is not forgotten and so a successor
+does not rediscover (a) as a mystery.
+
+---
+
 ## 4. QUESTIONS FOR THE MAINTAINER
 
 These are the decisions a successor session must NOT guess at. Each is
