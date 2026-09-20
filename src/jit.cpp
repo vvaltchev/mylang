@@ -7495,19 +7495,25 @@ static void jit_assert_no_volatile_pin(const Emitter &e)
  * where a table lookup would be wrong). The loc table is OLD-pc-keyed at
  * emission (the side tables are remapped after). Null if the op recorded no
  * loc (then nothing anywhere holds a caret for it - both engines loc-less). */
-static const void *loc_entry_addr(const Chunk &ck, size_t old_pc)
+static const void *loc_entry_in(const std::vector<Chunk::LocEntry> &tbl,
+                                size_t old_pc)
 {
-    size_t lo = 0, hi = ck.locs.size();
+    size_t lo = 0, hi = tbl.size();
     while (lo < hi) {
         const size_t mid = (lo + hi) / 2;
-        if (ck.locs[mid].pc < old_pc)
+        if (tbl[mid].pc < old_pc)
             lo = mid + 1;
         else
             hi = mid;
     }
-    if (lo < ck.locs.size() && ck.locs[lo].pc == old_pc)
-        return &ck.locs[lo];
+    if (lo < tbl.size() && tbl[lo].pc == old_pc)
+        return &tbl[lo];
     return nullptr;
+}
+
+static const void *loc_entry_addr(const Chunk &ck, size_t old_pc)
+{
+    return loc_entry_in(ck.locs, old_pc);
 }
 
 /* The COLD-side caret stamp: on a conveying helper's failure branch (taken
@@ -7523,10 +7529,23 @@ static const void *loc_entry_addr(const Chunk &ck, size_t old_pc)
  * is {int line; int col} = one qword store per Loc, little-endian
  * line | col<<32. rax/rcx are dead here (exit_pc's cache flush uses
  * rdi/rsi/r8/r10/r11; eax is set after). */
-static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
+/*
+ * `args_caret` (RULE 2, 2026-09-20): a CALL op's failure branch stamps
+ * the ARGUMENT LIST's span - the op's second caret, base_locs - not the
+ * whole call: the only loc-less exception that reaches a call site's
+ * conveyance is one out of the call's SETUP (arity, a bind coercion,
+ * the window push), and that is what the tree-walker carets at the
+ * argument list (CallExpr::do_eval's catch). A callee-body error arrives
+ * with its own caret and is left alone by the guard below either way.
+ * Falls back to `locs` for an op with no args entry.
+ */
+static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
+                           bool args_caret = false)
 {
     const Chunk::LocEntry *le = static_cast<const Chunk::LocEntry *>(
-        loc_entry_addr(ck, old_pc));
+        args_caret ? loc_entry_in(ck.base_locs, old_pc) : nullptr);
+    if (!le)
+        le = static_cast<const Chunk::LocEntry *>(loc_entry_addr(ck, old_pc));
     /* #56: ... and the op's INLINED-AT chain, so a raise from a DELETED run
      * does not have to resolve one from its collapsed pc (see
      * Exception::jit_inline_frame). -1 = this op is not inlined code. */
@@ -10227,7 +10246,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.frag_ret(Emitter::RetFlush::flushed);
         e.patch32_here(j_sw);
     }
-    emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56 step 1) */
+    emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true);
+                                      /* collapse-safe caret (#56 step 1) */
     emit_call_epilogue_divergent(e);
     e.exit_pc(pc);
     /* done: */
@@ -22668,7 +22688,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);               /* call jit_call_setup -> rax */
         e.u8(0x48); e.test32_rr(RAX, RAX); /* test rax, rax */
         const size_t j_ok = e.j8(0x75);     /* jnz over_SO (rax != null) */
-        emit_exc_stamp(e, ck, old_pc);      /* collapse-safe caret (#56) */
+        emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true);
+                                            /* collapse-safe caret (#56) */
         emit_call_epilogue_divergent(e);    /* SO: re-mat rsi/r8 */
         /* -> EnterNative raises g_vm_jit_exc*/
         e.exit_pc(pc);

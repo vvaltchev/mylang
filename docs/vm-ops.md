@@ -1373,6 +1373,21 @@ location whatsoever** (a backtrace rendering "line 0"). Produced by
 `vm_store_base` prefers it and falls back to `locs`. It rides the two JIT pc
 remaps and the bytecode splice's rebuild like `locs`, and is serialized right
 after it (myv **v13**).
+
+**It is the user CALL ops' second caret too (RULE 2, 2026-09-20).**
+`CallV`/`CachedCallV`/`CallValueV` record the ARGUMENT LIST's span there
+(`try_native_call` / the CallValueV emit), because a loc-less exception out
+of a call's SETUP — an arity throw, a bind coercion (`func f(int k)` handed
+a `dyn` float) — is what the tree-walker's `CallExpr::do_eval` carets at the
+argument list, while `locs` holds the whole call for the callee-side errors.
+Before it the VM's in-VM push escaped such an error with NO location, the
+JIT's tiers stamped the whole call, and the tree-walker's own devirtualized
+`DirectCallExpr` marked the whole call where a closure's plain `CallExpr`
+marked the arguments. The interpreter stamps it in `vm_stamp_setup_caret`
+(the two enter paths and the boundary `vm_call_func` — with NO `locs`
+fallback, so the generic dyn-callee op, whose `CallSite` carries its own arg
+carets, keeps stamping downstream), and the JIT bakes it in `emit_exc_stamp`'s
+args form on the sync slow tail and the direct-call failure branch.
 The AST-node side table this section used to describe -
 `Chunk::node_table`/`node_at_pc` and the `ast_nodes` pool - is GONE with the
 fallback op it existed for; the codegen-transient handle now lives on

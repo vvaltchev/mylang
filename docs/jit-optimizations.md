@@ -12612,3 +12612,52 @@ tree-walker (col 47:51), and has NO location at all under `-nj`. Same
 on the W1 tree and with the frameless lever off; the reach harness
 compares backtraces and messages, not carets. Filed in
 docs/in-flight-tasks.md.
+
+## RULE 2 - A CALL'S SETUP ERROR CARETS THE ARGUMENT LIST, IN EVERY ENGINE
+## AND FOR EVERY CALL SHAPE (2026-09-20)
+
+Found while testing #97 inc 3 W2's decline path, fixed on the
+maintainer's call. A `dyn` string handed to `func (int a, int b)`:
+
+    for (...) { s = s + f2(i, i); s = s + f2(i, z); }
+                                              ^^^^      tree-walker: the
+                                                        argument list
+    (VM, -nj)   no location at all
+    (JIT)       ^^^^^^^^  the whole call, f2(i, z)
+
+and a FOURTH answer the fix turned up: the tree-walker's own
+devirtualized `DirectCallExpr` (a NAMED function) marked the whole call,
+where a closure's plain `CallExpr` marked the arguments - the
+devirtualization changing a caret, i.e. RULE 2 inside one engine.
+
+**The rule, from CallExpr::do_eval's catch:** a loc-less exception out of
+`do_func_call` - only the SETUP throws one: an arity error, a bind
+coercion, the window push; a callee-body error arrives with its caret -
+gets the argument list's span. **The fix, at each tier:**
+
+ - codegen records the argument list's span on `CallV`/`CachedCallV`/
+   `CallValueV` as the op's SECOND caret, in `base_locs` - #127's table,
+   whose entries were the store ops' base identifiers; the encoding and
+   the `.myv` format are unchanged, only which pcs have an entry;
+ - the interpreter stamps it in `vm_stamp_setup_caret`, on the two
+   enter paths and the boundary `vm_call_func`. With NO fallback to
+   `locs`: the first version fell back, and the generic dyn-callee op -
+   whose `CallSite` carries its own arg carets and stamps downstream -
+   moved from the argument to the whole call (watched);
+ - the JIT's conveyance bakes it: `emit_exc_stamp(..., args_caret)` on
+   the sync slow tail and the direct-call failure branch reads
+   `base_locs` at the OLD pc (the same collapse-safe address bake
+   `locs` gets, #56), and the generic helper stamps a setup throw the
+   core conveyed loc-less with its CallSite caret;
+ - the tree-walker's `DirectCallExpr`/`CachedCallExpr` reproduce the
+   `CallExpr` catch (`stamp_args_loc`), as `DirectBuiltinCallExpr`
+   already did for a builtin.
+
+**Nets:** four 5-mode `err loc:` entries with the exact spans - a closure
+call, a named (devirtualized) call, a dyn callee, a dyn-callee arity
+error - each throwing on a WARMED re-descent so the JIT modes exercise
+the emitted sites (shape-eater #9); the frameless reach harness now
+compares the caret too. All four stamps sabotaged together: tw
+1991/1993, the VM modes 1698/1700, the JIT modes 1696/1700. corpus_diff
+34/34 + levers, driver_checks, myv_doc_check, norec_enum --depth 3 (the
+byte-for-byte stderr oracle) all green.

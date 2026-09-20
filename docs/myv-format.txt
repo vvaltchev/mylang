@@ -537,9 +537,11 @@ at a byte boundary, decoded in O(1), and two compiles remain byte-identical.
 9.2  LocEntry - the delta-coded loc tables
 
 `locs` maps the pc of an op that can throw to the source span its caret
-covers.  `base_locs` (v13) has the IDENTICAL encoding and holds a container
-store's SECOND caret - see the version note in section 12.  Both are
-pc-ascending, and each entry is FOUR bytes in the common case:
+covers.  `base_locs` (v13) has the IDENTICAL encoding and holds an op's
+SECOND caret - a container store's base identifier, and (since 2026-09-20,
+no encoding change) a user call op's argument list - see the version note in
+section 12.  Both are pc-ascending, and each entry is FOUR bytes in the
+common case:
 
     u8    pcd       pc - previous pc            255  = escape
     i8    lined     start.line - previous line  -128 = escape

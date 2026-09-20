@@ -2906,6 +2906,12 @@ struct Codegen {
         cv.op = dynamic_cast<const CachedCallExpr *>(dc)
                     ? OpCode::CachedCallV : OpCode::CallV;
         cv.node_idx = add_ast_node(dc);
+        /* the ARGUMENT LIST's span, the op's second caret (base_locs): a
+         * loc-less error escaping the call's setup - an arity or a bind
+         * coercion throw - is what the tree-walker carets there
+         * (CallExpr::do_eval's catch), where `locs` holds the whole call
+         * for the callee-side errors */
+        cv.base_node_idx = add_ast_node(dc->args.get());
         cv.target = dst;
         cv.target2 = dc->direct_func_slot;
         cv.set_a(int_lit(argbase));
@@ -3111,6 +3117,8 @@ struct Codegen {
         CgInstr cv;
         cv.op = OpCode::CallValueV;
         cv.node_idx = add_ast_node(call);
+        cv.base_node_idx = add_ast_node(call->args.get());  /* the args
+                                             * caret - see try_native_call */
         cv.callee_def_idx = add_value_callee(call);   /* #97 E1 */
         cv.target = dst;
         cv.target2 = callee_slot;

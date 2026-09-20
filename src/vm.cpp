@@ -7421,6 +7421,36 @@ static void norec_classify(const FuncObject &fo, const Chunk *cck)
 }
 #endif
 
+/*
+ * THE CALL'S SETUP CARET (RULE 2, 2026-09-20). A loc-less exception
+ * escaping a call's SETUP - an arity throw, a bind coercion (`func f(int
+ * k)` handed a float), the window push - carets the ARGUMENT LIST in the
+ * tree-walker (CallExpr::do_eval's catch stamps `args->start/end` on
+ * anything loc-less out of do_func_call). The VM's in-VM push escaped
+ * with NO location at all, and the JIT's tiers stamped the whole call;
+ * the argument list's span is the call op's second caret (base_locs,
+ * the same table a store op's base caret rides - codegen records it on
+ * CallV/CachedCallV/CallValueV). Applied to the interpreter's two
+ * enter paths here and to the boundary call (vm_call_func); the JIT's
+ * conveyance stamps it itself (emit_exc_stamp's args form), since its
+ * pcs collapse.
+ */
+void vm_stamp_setup_caret(Exception &e, const Chunk &chunk, size_t pc)
+{
+    if (e.loc_start)
+        return;
+    Loc s, en;
+    /* NO fallback to `locs`: an op that records no args entry (the
+     * generic dyn-callee call, whose CallSite carries its own arg
+     * carets) stamps downstream as it always did - a whole-call caret
+     * from here would pre-empt it (watched: the arity error through a
+     * dyn callee moved from the argument to the call) */
+    if (!chunk.base_loc_at(pc, s, en))
+        return;
+    e.loc_start = s;
+    e.loc_end = en;
+}
+
 /* The lean twin of vm_enter_call (the common shape: fast_bind + no cache
  * key). ONE out-of-line call from the dispatch loop (the loop-body text
  * rule), with the setup inlined - the old shape paid a second nested
@@ -7433,7 +7463,13 @@ vm_enter_call_lean(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 #ifdef TESTS
     norec_classify(fo, cck);
 #endif
-    vm_frame_setup_lean(act, ctx, chunk, pc, fo, cck, argbase, nargs, dst);
+    try {
+        vm_frame_setup_lean(act, ctx, chunk, pc, fo, cck, argbase, nargs,
+                            dst);
+    } catch (Exception &e) {
+        vm_stamp_setup_caret(e, *chunk, pc);
+        throw;
+    }
     chunk = cck;
     pc = 0;
 }
@@ -7453,8 +7489,13 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 #ifdef TESTS
     norec_classify(fo, cck);
 #endif
-    vm_frame_setup(act, ctx, chunk, pc, fo, cck, argbase, nargs, dst,
-                   std::move(ckey));
+    try {
+        vm_frame_setup(act, ctx, chunk, pc, fo, cck, argbase, nargs, dst,
+                       std::move(ckey));
+    } catch (Exception &e) {
+        vm_stamp_setup_caret(e, *chunk, pc);
+        throw;
+    }
     chunk = cck;
     pc = 0;
 }
@@ -8893,8 +8934,20 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
             *callee.get_ref<intrusive_ptr<FuncObject>>().get(), argbase, nargs,
             dst, site_packed, /*cached=*/false, /*resume_pc=*/-1,
             /*entry_rbp=*/nullptr);
-        if (r != 3)
+        if (r != 3) {
+            /* a SETUP throw the core conveyed loc-less (arity, a bind
+             * coercion, the window push): the args caret, as every other
+             * catch here stamps it and as the interpreted op does - the
+             * generic site emits no exc-stamp of its own, so a loc-less
+             * conveyance would otherwise get the whole call's caret at
+             * the re-raise (RULE 2; watched: the arity error through a
+             * dyn callee carets `i` in the tree-walker and `-nj`) */
+            if (r == 2 && g_vm_jit_exc && !g_vm_jit_exc->loc_start) {
+                g_vm_jit_exc->loc_start = al.start;
+                g_vm_jit_exc->loc_end = al.end;
+            }
             return r;
+        }
         try {
             vm_dispatch(*g_vm_resume_chunk, ctx, *g_vm_act,
                         g_vm_resume_pc);

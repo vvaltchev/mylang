@@ -763,6 +763,51 @@ static const std::vector<test> tests =
         "f(9);" },
       &typeid(OutOfBoundsEx), 51, 2, 56, 2 },
 
+    /*
+     * A CALL'S SETUP ERROR CARETS THE ARGUMENT LIST, IN EVERY ENGINE AND
+     * FOR EVERY CALL SHAPE (RULE 2, 2026-09-20). A loc-less exception out
+     * of a call's setup - a bind coercion (a `dyn` string or float into
+     * an `int` parameter), an arity throw through a `dyn` callee - is
+     * stamped with the argument list's span by CallExpr::do_eval's catch.
+     * Found divergent four ways on one shape: the VM's in-VM push escaped
+     * with NO location, the JIT's tiers stamped the whole call, and the
+     * tree-walker's own DEVIRTUALIZED call (DirectCallExpr, a named
+     * function) marked the whole call where the plain CallExpr (a closure)
+     * marked the arguments. The call ops carry the argument list as their
+     * second caret now (base_locs), the JIT's conveyance stamps it, and
+     * DirectCallExpr/CachedCallExpr reproduce the CallExpr catch. Each
+     * case below throws on a WARMED re-descent (the call succeeded once at
+     * that depth first), so the EMITTED site's exception path is the one
+     * exercised under the JIT modes (shape-eater #9).
+     */
+    { "err loc: a bind coercion at a CLOSURE call marks the argument list",
+      { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
+        "var f2 = mk2(1);",
+        "var dyn z = 0; z = runtime(\"str\"); var s = 0;",
+        "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(i, z); }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 69, 4, 74, 4 },
+    { "err loc: a bind coercion at a NAMED function call (devirtualized) "
+      "marks the argument list, like the plain call",
+      { "func fi(int k) { var t = 0; for (var j = 0; j < k; j++) t = t + j; return t; }",
+        "var dyn x = 0; x = runtime(2.5); var s = 0;",
+        "for (var i = 0; i < runtime(3); i++) { s = s + fi(i); s = s + fi(x); }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 66, 3, 68, 3 },
+    { "err loc: a bind coercion through a DYN callee marks the argument list",
+      { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
+        "var dyn f2 = 0; f2 = runtime(mk2(1));",
+        "var dyn z = 0; z = runtime(\"str\"); var s = 0;",
+        "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(i, z); }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 69, 4, 74, 4 },
+    { "err loc: a runtime ARITY error through a DYN callee marks the argument",
+      { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
+        "var dyn f2 = 0; f2 = runtime(mk2(1)); var s = 0;",
+        "for (var i = 0; i < runtime(2); i++) { s = s + f2(i); }",
+        "print(s);" },
+      &typeid(InvalidNumberOfArgsEx), 51, 3, 53, 3 },
+
     { "struct elem field: flat / negative index / float + bool fields",
       { "struct P { int x; float w; bool b; }",
         "func g(int i) {",
@@ -28282,7 +28327,9 @@ static bool jit_frameless_call_reach()
             /* the name and message too (W2: a decline's C++ raise names
              * the ARGUMENT's type, which the trampoline materialised) */
             r.bt = std::string(e.name ? e.name : "?") + ": "
-                   + (e.msg ? e.msg : "") + "\n" + format_backtrace(e);
+                   + (e.msg ? e.msg : "") + " @" + std::to_string(e.loc_start.line)
+                   + ":" + std::to_string(e.loc_start.col) + "-"
+                   + std::to_string(e.loc_end.col) + "\n" + format_backtrace(e);
             r.ok = false;
         } catch (...) {
             r.ok = false;
