@@ -638,7 +638,7 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
  * function to each element of a container. See eval.cpp. */
 EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                         const EvalValue &container, bool is_filter,
-                        Loc cstart, Loc cend);
+                        Loc cstart, Loc cend, Loc site);
 
 /* VM (ForeachDynNext): read element `i` of the array VALUE box-free (boxing a
  * flat scalar), reaching arr_elem_at in its own TU. See generic.cpp.h. */

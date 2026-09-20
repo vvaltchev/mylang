@@ -1584,7 +1584,8 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
                               al->arg(0)->start, al->arg(0)->end);
         const EvalValue c = RValue(args[1]);
         return vm_map_filter(ctx, f, c, b.kind == Builtin::Kind::filter,
-                             al->arg(1)->start, al->arg(1)->end);
+                             al->arg(1)->start, al->arg(1)->end,
+                             al->arg(1)->start);
     }
 
     case Builtin::Kind::lazy:

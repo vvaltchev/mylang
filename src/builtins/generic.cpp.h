@@ -438,7 +438,8 @@ EvalValue builtin_find(EvalContext *ctx, const ArgLocs *exprList,
             key = key_holder.get();
         }
 
-        return builtin_find_arr(container_val.get<SharedArrayObj>(), elem_val, key, ctx);
+        return builtin_find_arr(container_val.get<SharedArrayObj>(),
+                                elem_val, key, ctx, exprList->start);
 
     } else if (container_val.is<SharedStr>()) {
 
@@ -485,14 +486,16 @@ EvalValue builtin_hash(EvalContext *ctx, const ArgLocs *exprList,
  */
 EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                         const EvalValue &container, bool is_filter,
-                        Loc cstart, Loc cend)
+                        Loc cstart, Loc cend, Loc site)
 {
     FuncObject &funcObj = *func_val.get<intrusive_ptr<FuncObject>>().get();
 
     /* Prepared per-loop callback invoker (VmInvoker, vm.h): under -vm the
      * callback frame is pushed ONCE and each element just rebinds the param
-     * slot(s); tree-walk/const-eval fall back to eval_func per element. */
-    VmInvoker inv(ctx, funcObj);
+     * slot(s); tree-walk/const-eval fall back to eval_func per element.
+     * `site` (the container argument's start, which every engine can
+     * supply - the JIT bakes it) names the callback's frame (#44). */
+    VmInvoker inv(ctx, funcObj, site);
 
     if (container.is<SharedArrayObj>()) {
 
@@ -582,7 +585,7 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
 
     const EvalValue val1 = RValue(arg1->eval(ctx));
     return vm_map_filter(ctx, val0, val1, /*is_filter=*/false,
-                         arg1->start, arg1->end);
+                         arg1->start, arg1->end, arg1->start);
 }
 
 EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
@@ -599,5 +602,5 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
 
     const EvalValue val1 = RValue(arg1->eval(ctx));
     return vm_map_filter(ctx, val0, val1, /*is_filter=*/true,
-                         arg1->start, arg1->end);
+                         arg1->start, arg1->end, arg1->start);
 }

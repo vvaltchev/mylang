@@ -23875,9 +23875,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::MapFilterV: {
-        /* jit_map_filter(fn, cont, dst, is_map) - rdi=a_slot, rsi=b_slot,
-         * rdx=target, rcx=target2. The callback re-enters vm_dispatch; a
-         * throw conveys (exc/eptr) -> test eax + exit_pc. */
+        /* jit_map_filter(fn, cont, dst, is_map, site) - rdi=a_slot,
+         * rsi=b_slot, rdx=target, rcx=target2, r8=the op's baked loc
+         * (packed line<<32|col: the callback frame's call site, #44 - the
+         * interpreted op reads the same loc_at(pc)). The callback
+         * re-enters vm_dispatch; a throw conveys (exc/eptr) -> test eax +
+         * exit_pc. */
+        Loc mls, mle;
+        ck.loc_at(old_pc, mls, mle);
         emit_call_prologue(e);
         e.mov_imm(RDI, static_cast<uint64_t>(
                           static_cast<int_type>(in.a_slot())));
@@ -23887,6 +23892,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                           static_cast<int_type>(in.target)));
         e.mov_imm(RCX, static_cast<uint64_t>(
                           static_cast<int_type>(in.target2)));
+        e.mov_imm(R8,
+                  (static_cast<uint64_t>(static_cast<uint32_t>(mls.line))
+                   << 32) | static_cast<uint32_t>(mls.col));
         e.call_direct(reinterpret_cast<const void *>(jit_map_filter));
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */

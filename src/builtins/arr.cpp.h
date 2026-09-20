@@ -178,7 +178,8 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
         mode = 3;
     };
 
-    VmInvoker inv(ctx, funcObj);   /* prepared per-loop invoker (vm.h) */
+    /* prepared per-loop invoker (vm.h); the call site names the frame */
+    VmInvoker inv(ctx, funcObj, exprList->start);
 
     for (int_type i = 0; i < n; i++) {
 
@@ -764,14 +765,16 @@ EvalValue
 builtin_find_arr(const SharedArrayObj &arr,
                  const EvalValue &v,
                  FuncObject *key,
-                 EvalContext *ctx)
+                 EvalContext *ctx,
+                 Loc site)
 {
     /* Read elements without promoting flat storage (arr_elem_at). */
     const size_type n = arr.size();
 
     if (key) {
 
-        VmInvoker inv(ctx, *key);   /* prepared per-loop invoker (vm.h) */
+        /* prepared per-loop invoker (vm.h); `site` names the frame */
+        VmInvoker inv(ctx, *key, site);
 
         for (size_type i = 0; i < n; i++) {
 
@@ -1014,7 +1017,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
          * NATIVE storage type - the shared `cmp2(EvalValue, EvalValue)`
          * helper this replaced boxed a flat int comparison's operands
          * twice, once for its own parameters and again into the argv. */
-        VmInvoker inv(ctx, funcObj);
+        VmInvoker inv(ctx, funcObj, exprList->start);
 
         switch (arr.skind()) {
             case SharedArrayObj::Storage::ints: {
@@ -1310,7 +1313,8 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         if (arr.size() == 0)
             return none; /* like the 1-arg form */
 
-        VmInvoker inv(ctx, *val1.get<intrusive_ptr<FuncObject>>().get());
+        VmInvoker inv(ctx, *val1.get<intrusive_ptr<FuncObject>>().get(),
+                      exprList->start);
 
         /* Seed with a COPY of the first result, as the 1-arg path does:
          * `+=` mutates the accumulator in place, and a callback may return

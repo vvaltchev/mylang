@@ -6130,7 +6130,8 @@ extern "C" int jit_check_func(int_type slot) noexcept
  * callback's own throw already carries its loc. A PLAIN exception (a
  * callback's UndefinedVariableEx - no clone()) rides g_vm_jit_eptr. */
 extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
-                              int_type dst, int_type is_map) noexcept
+                              int_type dst, int_type is_map,
+                              int_type site) noexcept
 {
     ML_JIT_OP_RAN(MapFilterV);
     EvalContext *ctx = g_current_ctx;
@@ -6138,7 +6139,9 @@ extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
         ctx->frame->at(dst).put(
             vm_map_filter(ctx, ctx->frame->at(fn_slot).get(),
                           ctx->frame->at(cont_slot).get(),
-                          is_map != 0, Loc(), Loc()));
+                          is_map != 0, Loc(), Loc(),
+                          Loc(static_cast<int>(site >> 32),
+                              static_cast<int>(site & 0xffffffff))));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -7097,17 +7100,18 @@ extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
 }
 
 /* The desc-based twin of do_func_call's vm_capture_frame for the invoke
- * boundary: name/params/pure tag; the call site is loc-less (builtin
- * callbacks pass no call site - matching eval_func's captures today). */
+ * boundary: name/params/pure tag. The call site is loc-less unless the
+ * caller has one: VmInvoker passes its builtin call's (#44). */
 static ML_COLD void
-vm_capture_desc_frame(Exception &e, const FuncDescriptor *d)
+vm_capture_desc_frame(Exception &e, const FuncDescriptor *d,
+                      Loc site = Loc())
 {
     if (d->pure_ctx)
         if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
             undefEx->in_pure_func = true;
 
     /* profile #3: the LAZY frame - no strings at capture time */
-    e.backtrace.emplace_back(d, Loc());
+    e.backtrace.emplace_back(d, site);
 }
 
 /* #60 (b): the bare dispatch loop, split out of vm_run_chunk so a builtin
@@ -7276,8 +7280,9 @@ vm_invoke_postexit(const Chunk &cck, EvalContext &ctx, VmActivation &act,
      * is set for invoke()'s existing conversion. */
 }
 
-VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj)
+VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj, Loc site)
 {
+    site_ = site;
     caller_ctx_ = ctx;
     obj_ = &obj;
     if (g_exec_engine != ExecEngine::Vm || !g_vm_act
@@ -7337,7 +7342,7 @@ VmInvoker::~VmInvoker()
 static ML_ALWAYS_INLINE EvalValue
 vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
                 const FuncDescriptor *d, LValue *win, int_type total,
-                const char *entry)
+                const char *entry, Loc site)
 {
     c->flow->type = FlowState::none;
 
@@ -7365,12 +7370,12 @@ vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
             vm_dispatch(*cck, *c, *act);
         }
     } catch (Exception &e) {
-        vm_capture_desc_frame(e, d);
+        vm_capture_desc_frame(e, d, site);
         throw;
     }
 
     if (g_vm_exc_pending) {
-        vm_capture_desc_frame(*g_vm_exc_pending, d);
+        vm_capture_desc_frame(*g_vm_exc_pending, d, site);
         std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
         ex->rethrow();
     }
@@ -7431,7 +7436,7 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
     }
 
     return vm_invoker_body(cck_, c_, act_, d, w_->slots,
-                           static_cast<int_type>(w_->size), entry_);
+                           static_cast<int_type>(w_->size), entry_, site_);
 }
 
 /*
@@ -7445,13 +7450,23 @@ EvalValue VmInvoker::call_eval_func(const EvalValue *argv, size_t n)
 #ifdef TESTS
     g_invoke_fallback++;
 #endif
-    if (n == 1)
-        return eval_func(caller_ctx_, *obj_, argv[0]);
-    if (n == 2)
+    try {
+        if (n == 1)
+            return eval_func(caller_ctx_, *obj_, argv[0]);
+        if (n == 2)
+            return eval_func(caller_ctx_, *obj_,
+                             std::make_pair(argv[0], argv[1]));
         return eval_func(caller_ctx_, *obj_,
-                         std::make_pair(argv[0], argv[1]));
-    return eval_func(caller_ctx_, *obj_,
-                     std::vector<EvalValue>(argv, argv + n));
+                         std::vector<EvalValue>(argv, argv + n));
+    } catch (Exception &e) {
+        /* eval_func has no call site to give the callback's frame, so it
+         * captured it loc-less - and nothing can have captured a frame
+         * since, so back() IS that frame; the builtin call is its site
+         * (#44), exactly as invoke() captures it directly */
+        if (!e.backtrace.empty() && !e.backtrace.back().call_site.line)
+            e.backtrace.back().call_site = site_;
+        throw;
+    }
 }
 
 /*
@@ -12463,7 +12478,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             ctx.frame->at(in->target).put(
                 vm_map_filter(&ctx, ctx.frame->at(in->a_slot()).get(),
                               ctx.frame->at(in->b_slot()).get(),
-                              in->target2 != 0, s, en));
+                              in->target2 != 0, s, en, s));
             pc++;
         }
         VM_NEXT;
