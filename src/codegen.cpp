@@ -615,15 +615,22 @@ struct Codegen {
     int max_dict_iters = 0;   /* # native dict foreachs -> n_dict_iters */
     int max_dyn_iters = 0;    /* # native dyn foreachs -> n_dyn_iters */
 
-    /* Active struct-foreach direct-read mapping: while compiling a
-     * try_native_struct_foreach body, a MemberExpr reading `sfe_loop_slot`'s
-     * scalar field compiles to a LoadStructField* (a direct byte read of
-     * sfe_arr_slot[sfe_ctr_slot].field) instead of materializing the loop var.
-     * sfe_loop_slot == -1 when inactive. */
-    int sfe_loop_slot = -1;
-    int sfe_arr_slot = -1;
-    int sfe_ctr_slot = -1;
-    const StructTypeDef *sfe_def = nullptr;
+    /* Active struct-foreach direct-read mappings: while compiling a
+     * try_native_struct_foreach body, a MemberExpr reading an ACTIVE loop
+     * var's scalar field compiles to a LoadStructField* (a direct byte read
+     * of arr_slot[ctr_slot].field) instead of materializing the loop var.
+     * A STACK, one entry per enclosing struct foreach (2026-09-22): it was
+     * four scalars, so an INNER struct foreach overwrote the outer's
+     * mapping and then cleared it - `foreach (var a in pts) foreach (var b
+     * in pts) if (a.x < b.x)` compiled `a.x` as a member read of a slot
+     * nothing had ever written (the outer var is never materialized by
+     * design), and the VM threw where the tree-walker printed 255
+     * (tests/functional/27_struct_whole_p.my, case 4). */
+    struct SfeMap {
+        int loop_slot, arr_slot, ctr_slot;
+        const StructTypeDef *def;
+    };
+    std::vector<SfeMap> sfe_maps;
 
     int here() const { return static_cast<int>(code.size()); }
 
@@ -4037,31 +4044,38 @@ struct Codegen {
         return false;
     }
 
-    /* Struct-foreach direct read: if `m` reads the ACTIVE loop var's scalar
+    /* Struct-foreach direct read: if `m` reads an ACTIVE loop var's scalar
      * field (`p.x`), emit LoadStructField{Int,Float} - a direct byte read of
-     * sfe_arr_slot[sfe_ctr_slot].field - into a temp (out). The body analysis
+     * arr_slot[ctr_slot].field - into a temp (out). The body analysis
      * (struct_fe_body_ok) already proved the base is the loop var + the field a
-     * scalar, so this can't misfire. */
+     * scalar, so this can't misfire. Every enclosing struct foreach is a
+     * candidate (the stack), since an outer var's field is read inside an
+     * inner loop's body too. */
     bool try_sfe_field(const MemberExpr *m, Operand &out,
                        std::vector<CgInstr> &ops, OpCode fieldop)
     {
-        if (sfe_loop_slot < 0)
+        if (sfe_maps.empty())
             return false;
         const Identifier *bid =
             dynamic_cast<const Identifier *>(m->what.get());
-        if (!bid || bid->sym.kind != SymKind::local
-            || bid->sym.slot != sfe_loop_slot)
+        if (!bid || bid->sym.kind != SymKind::local)
             return false;
-        const FieldDef *f = sfe_def->field_of(m->memUid);
+        const SfeMap *sm = nullptr;
+        for (const SfeMap &e : sfe_maps)
+            if (e.loop_slot == bid->sym.slot)
+                sm = &e;             /* innermost wins, if ever shadowed */
+        if (!sm)
+            return false;
+        const FieldDef *f = sm->def->field_of(m->memUid);
         if (!f || f->offset < 0)
             return false;
-        const int fidx = static_cast<int>(f - sfe_def->fields.data());
+        const int fidx = static_cast<int>(f - sm->def->fields.data());
         const int tt = alloc_temp();
         CgInstr in;
         in.op = fieldop;
         in.target = tt;
-        in.target2 = sfe_arr_slot;
-        in.set_a(slot_op(sfe_ctr_slot));
+        in.target2 = sm->arr_slot;
+        in.set_a(slot_op(sm->ctr_slot));
         in.set_b(int_lit(fidx));
         ops.push_back(in);
         out = slot_op(tt);
@@ -7058,20 +7072,18 @@ struct Codegen {
             ld.set_a(slot_op(i));
             code.push_back(ld);
         } else {
-            /* No element load - p is never materialized. Activate the direct-
-             * read mapping so a p.field read -> LoadStructField*(c[i].fld). */
-            sfe_loop_slot = x_slot;
-            sfe_arr_slot = c;
-            sfe_ctr_slot = i;
-            sfe_def = fe->container_struct_def;
+            /* No element load - p is never materialized. Push the direct-
+             * read mapping so a p.field read -> LoadStructField*(c[i].fld),
+             * ABOVE any enclosing loop's (which stays active: its var is
+             * read in this body too). */
+            sfe_maps.push_back({ x_slot, c, i, fe->container_struct_def });
         }
 
         push_loop();
         const bool body_ok = compile_scalar_body(body_stmts(fe->body.get()));
 
-        sfe_loop_slot = -1;   /* deactivate (success AND failure path) */
-        sfe_arr_slot = sfe_ctr_slot = -1;
-        sfe_def = nullptr;
+        if (!whole_p)
+            sfe_maps.pop_back();  /* deactivate (success AND failure path) */
 
         if (!body_ok) {
             loops.pop_back();
@@ -10759,6 +10771,16 @@ void ChunkVerifier::verify_one(const Instr &in)
              * a null pointer. */
             pod_def(ck.struct_defs[in.target2], "planned ctor def");
             pool(in.b_dual_hi(), ck.ctor_plans.size(), "ctor plan");
+            /* The plan's computed-arg MINI-RUN rides `a` as a DUAL (lo =
+             * base or -1, hi = count) and is read by NO handler - only by
+             * visit_use_def, whose run(base, cnt) then ITERATES the
+             * count. Unbounded, a burst mutation made it 0x73A07676
+             * (myv_fuzz small-938: the load-time liveness "never
+             * converged" - it was walking two billion uses per op). */
+            if (in.a_dual_lo() >= 0)
+                run(in.a_dual_lo(), in.a_dual_hi());
+            else if (in.a_dual_hi() != 0)
+                reject("ctor mini-run");
             const StructTypeDef *d = ck.struct_defs[in.target2];
             for (const Chunk::CtorPlanField &f
                      : ck.ctor_plans[in.b_dual_hi()].f) {

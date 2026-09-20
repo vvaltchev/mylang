@@ -6400,6 +6400,28 @@ lists and requires the loaded ones to be the pristine derivation
 round trip fail - the JIT's release arms differ). **A pool that a
 mutation can turn into a wrong LIFETIME decision is not a bytes question;
 derive it.**
+**⛔ AND A PRIMARY FACT STORED TWICE MUST BE CHECKED, NOT MADE ONE (v19,
+2026-09-22 - learned in two steps the same day).** `root_slot_count` is
+the root chunk's `slot_count` written a second time in the globals
+section, and the two had different consumers: the loader pushed main's
+WINDOW from the second record while the JIT baked main's frame size into
+its return arm from the chunk's (`ck.slot_count + ck.n_temps`, #97 step
+2b). One byte in the chunk's copy (myv_fuzz fat-316, 26 -> 145) made the
+exception path release a frame of a different size than the one pushed;
+LeakSanitizer reported the escaped reference after the uncaught throw.
+The FIRST fix dropped the second record - "derive it from the chunk" -
+and the very next fuzz run answered with fat-311: the chunk's copy
+mutated 22 -> 101, now undetectable, and the register cache took the
+TEMPS for locals (the count is what partitions the frame), pinned one
+that also held a reference at another pc, and leaked it. `slot_count`
+is PRIMARY data with no derivation, unlike `ref_slots` above: for such a
+fact a redundant copy is not waste, it is the only way a mutation can be
+SEEN. So both copies are written and `vm_verify_program` refuses an
+image whose two disagree - the rule the function chunks already had
+(`slot_count == frame_size`). **Derive what has a derivation; duplicate
+and CHECK what does not.** Pinned by `myv_root_slot_count_checked` (both
+copies tampered, each a refusal by name; watched: both accepted with the
+check out).
 **THE DELTA-CODED LOC TABLE (v5, same day).** `{u32 pc, u32 line, u32
 col, u32 line, u32 col}` = 20 bytes per entry, ~19 of them zero (over
 bench/ + samples/, 969 entries: the pc delta never exceeded 19, the
@@ -6546,7 +6568,16 @@ first two cannot see what the third checks:
     the LoadElem2 reads) must hold two. **When you bound an operand,
     read the HANDLER, not the encoding: what the VM does with the field
     is the contract, and the encoding can say "literal" about a field
-    the VM never asks.**
+    the VM never asks.** **AND THE CONVERSE (2026-09-22): AN OPERAND NO
+    HANDLER READS IS STILL AN OPERAND.** A planned StructCtorV's `a`
+    dual is its computed-argument MINI-RUN, consumed by NO handler and
+    by exactly one analysis - `visit_use_def`'s `run(base, cnt)`, which
+    ITERATES the count. Nothing bounded it, so nothing could trip at
+    run time, and the failure was a HANG at load: a burst mutation made
+    the count 0x73A07676 and the load-time liveness walked two billion
+    uses per op (myv_fuzz small-938). The verifier runs the same
+    `run()` bound on it now, and a `-1` base must carry a zero count.
+    **Bound what the ANALYSES read, not only what the VM reads.**
 **⛔ AND A FOURTH SHAPE ALL THREE LAYERS MISS BY CONSTRUCTION: A
 CONSTRUCTOR THE LOADER ITSELF CALLS (2026-08-25).** The three layers
 bound what an image CONTAINS. They cannot bound an argument the READER
@@ -6566,6 +6597,36 @@ kind rather than trusting the writer's assertion - and gets a null
 `capture_root`, for which `do_func_call` substitutes the CALLER's root.
 **When a loader hands a value to a runtime constructor, the constructor's
 PRECONDITIONS are part of the format's trust model.**
+**⛔ AND A FIFTH, ON A VALID IMAGE AGAIN, AND ONLY THROUGH THE SCRIPT
+DRIVER (2026-09-22): THE LOADED PROGRAM MOVES AFTER THE JIT RAN.** A
+JIT'd root chunk is ADDRESS-BAKED - every NorecSite's `caller` (which the
+record-less tier's retarget writes into a record's `ret_chunk`) and the
+fragment -> chunk map name main's `Chunk` object - and `main()` moves the
+VmProgram out of `myv_read`'s return slot into the variable it keeps
+outside the `try` (`prog = myv_read(...)`; it must outlive the catch
+handlers). The compile path called `jit_norec_rebind` after its identical
+move; the load path did not, so `mylang prog.myv` resumed main at a
+stack address that had gone out of scope on ANY image whose main takes a
+SWITCHED call (recursion past the sync depth cap, an exception across a
+call: 12_deep_switch, 07_exceptions, 23_baked_callee - ASan, or a wild
+read in a release build that happened to print the right answer). Three
+nets could not see it: `-rt` runs in-process and initialises its
+`VmProgram loaded = myv_read(...)` (guaranteed elision, no move);
+`myv_fuzz` runs the driver but its corpus has no switched call from
+main; `driver_checks` had no deep image. **The rebind is the MOVE's job
+now** - `VmProgram`'s move constructor and move assignment call
+`jit_norec_rebind(root)` (vm.h states the contract), the harness's
+explicit rebind loop is gone, and a caller cannot forget what the type
+does for it. Pinned in-process by `vm_program_move_rebinds` (a
+move-constructed and a move-assigned program's sites must name the
+object it lives in; watched: the assignment's rebind alone removed
+fails it, both removed kills the whole suite in the harness) and
+end-to-end by the `driver_checks.sh` deep-image case (watched failing).
+**And the net that found it is now a rule: run EVERY corpus image
+against its source run after a loader change** (`tests/functional/*` +
+`samples/*`, stdout+rc compared; skip the two stdin-driven samples and
+`rand_sort`) - `myv_round_trip` compares DUMPS, and a dump cannot see a
+stale pointer.**
 **TIER 2 - THE PROVENANCE GATE (`ML_UNTRUSTED_CHECK`, defs.h).** A few facts
 no load-time pass can decide, because they belong to the VALUE in a slot and
 not to the image: a flat array's storage-kind union tag, a struct field index
@@ -6610,6 +6671,43 @@ changes. And **fix the INTERPRETED TWIN in the same change**: `ArrLen`,
 `LoadStrChar` and `LoadElemBool` each have a hand-inlined copy in `vm.cpp`'s
 dispatch with the identical hazard, and the unbounded index there is a wild
 read even though the interpreter may legally throw.
+**⛔ A FIFTH, FOUND BY THE FUZZER A MONTH LATER (fat-676, 2026-09-22),
+AND THE TIER ITSELF WAS THE THROWER.** `jit_load_struct_elem` (the
+whole-`p` foreach bind) was `void noexcept` on the argument that its base
+is an inference-proven flat struct array. On an image the base is
+whatever the mutated operand names, and `flat_structs()`'s
+ML_UNTRUSTED_CHECK - the provenance tier, doing exactly its job - threw
+the InternalErrorEx that then hit the `noexcept` boundary: `terminate
+called after throwing an instance of 'InternalErrorEx'`, exit 134, on
+an image the interpreted twin renders cleanly. So the two halves of
+#142 must be applied TOGETHER: a helper reached from emitted code with
+no status either takes a defined fallback OR becomes a STATUS helper
+(`extern "C" int`, `catch (RuntimeException &)` ->
+`g_vm_jit_exc.reset(e.clone())`, the emitter's `test eax` after the
+call) - and a status helper is a CONVEYING op, so it leaves
+`op_never_exits` (the NATIVE_LEAF bar: a leaf's direct caller ignores
+the callee's status) for `op_fully_native`'s convey family, beside
+LoadElemValue. `myv_struct_elem_base` requires the emitted helper to
+have RUN (`g_jit_op_run`) and the right exception out of `vm_run`;
+watched: the void shape terminates the whole suite. Reach note: no
+corpus program emitted `load.selem` at all until
+`tests/functional/27_struct_whole_p.my` (a whole-`p` bind needs a VALUE
+use of `p`; every corpus foreach read fields only), so the leaf-bar
+move costs nothing measurable.
+**⛔ AND A TRIPWIRE ON A CODEGEN-PROVEN ARM IS A FALSE ALARM ON AN
+IMAGE, LIKE THE AUDITS ABOVE (fat-845 / fat-260, same day).**
+`read_float_slot`'s "a `th==f` operand holds a float" and
+`vm_unpack_elem_body`'s "the base is an array" are `ML_VM_CHECK`s that
+state an interpreter INVARIANT for bytecode we compiled - and on an
+image the proof is input, so they aborted the debug lane where the
+assert-free build gave the defined answer (0.0; TypeErrorEx). The
+spelling for that case is the `ml_untrusted_bytecode()` idiom (defs.h):
+`ML_VM_CHECK(ml_untrusted_bytecode() || <invariant>)`, the tripwire
+kept for our own bytecode and silent for a loaded image, so the
+outcome is the SAME in every build (`myv_untrusted_proven_arms`,
+watched aborting both ways). When a fuzz finding is a DEBUG-ONLY abort
+on an image, ask which side of that line the assertion is on before
+calling it harmless.
 
 Two producer-side rules fell out: **only PRE-JIT bytecode is storable**
 (`myv_write` ML_CHECKs it - the JIT rewrites code in place and fragments

@@ -91,7 +91,16 @@ on `65_struct_field_sum`). The inferencer stamps
 every loop-var use is a scalar-field READ (a whole-`p` use or a `p.field` WRITE
 — which must NOT hit the array, `p` is a copy — falls back to the tree-walker's
 reused-`StructObject` bind), and a per-body `sfe` mapping makes
-`compile_int/float_expr` emit the direct read for `p.field`. The
+`compile_int/float_expr` emit the direct read for `p.field`. **The mapping
+is a STACK, one entry per enclosing direct-read foreach** (`sfe_maps`,
+2026-09-22): it was four scalars, so an INNER struct foreach overwrote the
+outer's and then cleared it, and `a.x` in `foreach (var a in pts) foreach
+(var b in pts) if (a.x < b.x)` compiled as a member read of `a`'s slot -
+which the direct-read design never writes - so the VM threw `Expected dict
+object` where the tree-walker printed the sum
+(`tests/functional/27_struct_whole_p.my` case 4; a RULE 2 divergence that
+no corpus program had reached). `try_sfe_field` now matches the base slot
+against every active entry. The
 **STRICT-UNPACK**
 `foreach (x, y in
 pairs)` over a proven `array<array<int>>` / `array<array<float>>` (flat

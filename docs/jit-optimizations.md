@@ -13399,3 +13399,73 @@ Pinned by `jit_frameless_init_free_read_first` (the mutated shape built
 in process, `ref_slots` re-derived as the loader would, the read-first
 slot required OUT of the site's local mask; watched: `mask 0xb, slot 1`
 before the dataflow).
+
+## TASK #26 (loader hardening) - LoadStructElemV's helper becomes a STATUS
+## helper and the op moves to the CONVEY family (myv_fuzz fat-676,
+## 2026-09-22)
+
+**What.** `jit_load_struct_elem` (the whole-`p` foreach bind over a flat
+struct array) was a `void noexcept` helper the emitter took no status
+from, on the argument that its base is an inference-proven flat struct
+array and `vm_struct_elem` cannot throw. On an IMAGE the base is whatever
+the mutated operand names: `flat_structs()`'s ML_UNTRUSTED_CHECK threw
+the InternalErrorEx the provenance tier exists to throw, and the throw
+hit the `noexcept` boundary - `terminate called after throwing an
+instance of 'InternalErrorEx'`, exit 134, no caret, on an image the
+interpreted twin renders cleanly. It is `extern "C" int` now, with
+`jit_load_struct_elem_field`'s exact shape (`catch (RuntimeException &)`
+-> `g_vm_jit_exc.reset(e.clone())`, return 1), and the emitter's status
+test after the call covers it beside LoadElemValue and the checked field
+read (`emit_exc_stamp` + `exit_pc`, so EnterNative re-raises with the
+op's caret).
+
+**The classification move, and why it is forced.** A status helper is a
+CONVEYING op: LoadStructElemV leaves `op_never_exits` (the NATIVE_LEAF
+bar - a leaf's #55 direct caller IGNORES the callee fragment's status,
+so a conveying op inside a leaf would drop its exception with the frame
+pushed, the 2026-07-25 hang) for `op_fully_native`'s convey family, where
+LoadElemValue already sits. Still deletable (an exc exit is not a
+re-run exit). NOT made provenance-dependent on purpose: `-vdj` of an
+image and of a fresh compile must stay byte-identical (`myv_round_trip`),
+and a leaf decision that varied with `g_untrusted_bytecode` would not be.
+
+**Reach: zero corpus programs.** No program in bench/ + samples/ +
+tests/functional/ emitted `load.selem` at all - a whole-`p` bind needs a
+VALUE use of `p` (`last = p`, `append(o, p)`), and every corpus foreach
+read fields only, which lowers to LoadStructFieldInt off the array bytes
+with no bind. So the leaf-bar move and the two-instruction status test
+cost nothing measurable; `tests/functional/27_struct_whole_p.my` gives
+the corpus_diff matrices the shape from now on. `vdjcmp` HEAD vs new:
+identical on every pre-existing corpus program.
+
+**Pinned by** `myv_struct_elem_base` (two retargets of the op's base on a
+loaded image, JIT'd from the retargeted op: a flat INT array -> the
+untrusted tier's InternalErrorEx, the finding's shape; an int ->
+get_ref's TypeErrorEx; the emitted helper must have RUN, `g_jit_op_run`).
+Watched failing: with the try/catch removed the WHOLE suite terminates
+(rc 134, the exact original message).
+
+**Found on the way, by the new functional test:** the struct-foreach
+direct-read mapping was four scalars, so a nested fields-only struct
+foreach clobbered the outer's - `a.x` inside the inner body compiled as a
+member read of a slot the design never writes, the VM threw where the
+tree-walker printed the sum. `sfe_maps` is a stack (codegen.cpp,
+`try_sfe_field` matches every active entry); a RULE 2 divergence, fixed
+the same day, pinned 5-mode. Record: docs/vm-ops.md, the struct-foreach
+paragraph.
+
+**A sixth loader finding on the way, and the net that found it (same
+day).** The "every corpus image runs like its source" loop added to this
+batch's net battery found `mylang prog.myv` resuming MAIN at a stack
+address out of scope (ASan) on any image whose main takes a switched
+call - 12_deep_switch, 07_exceptions, 23_baked_callee. Main's VmProgram
+moves out of `myv_read`'s return slot into the driver's variable; a JIT'd
+root chunk is address-baked (every NorecSite's `caller`, the fragment ->
+chunk map); the compile path called `jit_norec_rebind` after its
+identical move and the load path did not. The rebind is the MOVE's job
+now (VmProgram's move ctor / move assignment, vm.h), the harness's
+explicit rebind loop is gone. Pinned by `vm_program_move_rebinds`
+(watched: the assignment's rebind alone removed fails it; both removed
+kills the suite in the harness) and a `driver_checks.sh` deep-image case.
+Not visible to -rt (its loads are elided initialisations, no move), nor
+to myv_fuzz (its corpus has no switched call from main).

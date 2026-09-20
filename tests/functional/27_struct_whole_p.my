@@ -1,0 +1,59 @@
+# The WHOLE-`p` foreach bind over a flat struct array (LoadStructElemV):
+# `p` used as a VALUE, not only through its fields - with fields alone the
+# loop lowers to LoadStructFieldInt straight off the array bytes and the
+# bind never exists, which is why NO corpus program emitted the op until
+# this file (found while fixing myv_fuzz fat-676, 2026-09-22: the op's
+# JIT helper became a STATUS helper - it can convey an IMAGE's corrupt-base
+# exception - so its emitted status test needs a shape under every
+# corpus_diff matrix).
+#
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL: every line is compared
+# against the tree-walker (tests/corpus_diff.sh).
+
+struct P { int x; int y; }
+
+var n = 6;
+if (len(argv) > 0)
+    n = int(argv[0]);
+
+var pts = [];
+for (var i = 0; i < n; i++)
+    append(pts, P(i, i * 3));
+
+# (1) the bind as a value: kept past the loop, and passed on
+var last = P(-1, -1);
+var s = 0;
+foreach (var p in pts) {
+    s = s + p.x + p.y;
+    last = p;
+}
+print("value   ", s, last.x, last.y);
+
+# (2) the bound struct stored into a general array (a reference use)
+var kept = [];
+foreach (var p in pts)
+    if (p.x % 2 == 0)
+        append(kept, p);
+print("kept    ", len(kept), kept[1].y);
+
+# (3) an exception raised INSIDE the loop, after the bind, caught outside:
+#     the release path over a loop var holding a struct
+var seen = 0;
+try {
+    foreach (var p in pts) {
+        seen = seen + 1;
+        last = p;
+        if (p.x == 3)
+            throw P(p.x, p.y);
+    }
+} catch (P as e) {
+    print("caught  ", e.x, e.y, seen, last.x);
+}
+
+# (4) a nested loop: the outer bind stays live across the inner one
+var cross = 0;
+foreach (var a in pts)
+    foreach (var b in pts)
+        if (a.x < b.x)
+            cross = cross + a.y * b.x;
+print("cross   ", cross);
