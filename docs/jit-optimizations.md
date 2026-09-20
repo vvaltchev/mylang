@@ -13269,3 +13269,109 @@ space, task #26's third finding (docs/in-flight-tasks.md §3d). The
 debug lane had counted the same mutation CLEAN: UBSan exits 1, exactly
 as a `MyvError` refusal does. `myv_fuzz.py` treats a sanitizer report
 as a crash now.
+
+## #25 - `visit_use_def` LEARNS THE ELEMENT-STORE FAMILY: six store ops
+## stop being barriers, and every consumer of the table wakes up inside
+## every element-store loop in the corpus (2026-09-21)
+
+**What it is.** `StoreElemInt`, `StoreElemFloat`, `StoreElemValue`,
+`DictStore`, `StoreMemberV` and `StoreElem2V` fell to `visit_use_def`'s
+`default:` - a BARRIER, "reads every slot, may write anything" - for no
+reason but omission, exactly as `Throw` had until #106 (CLAUDE.md's
+tenth audit-table shape). Their rows now say what vm.cpp's `VM_CASE`s
+do: a store READS its base (only when the base KIND is local - the kind
+rides `target`, 1 global / 2 capture / else local, `vm_store_base`'s
+switch; a global's or capture's `target2` is not a frame slot), its
+keys and its value, and WRITES NO FRAME SLOT. `StoreElem2V`'s `a` is a
+DUAL (k1 slot, chain_locs idx), its base always a frame slot, its value
+in `target`. The two CHAIN forms (`StoreElemChainV`, `StoreLValueChainV`)
+stay barriers for a structural reason: their key slots live in a POOL
+(the chain_locs entry's length, the chain_steps operands) the Instr-only
+signature cannot reach - zero corpus programs emit either. Still
+barriers by contract: the IncDec family, the Unpack family,
+`MultiUnpackV`, `EmplaceStruct` - they DO write frame slots through
+pools.
+
+**Why "no def" is right although a store can rewrite its base slot.**
+The COW paths - `clone_internal_vec` on a slice base,
+`clone_aliased_slices` on an aliased one, the dict and struct clones in
+`vm_subscript_store` / `vm_member_store` - replace the HANDLE inside the
+base slot's value in place, type unchanged: an array of the same
+elements, a struct of the same def. No consumer of a def can see that:
+liveness already has the base as a USE at the same pc;
+`compute_ref_slots` needs the base listed and it already is (whatever
+put the container there listed it, or it is a parameter seed); the C4d
+struct fact is `(slot, def)` and a same-def clone preserves it; a sign
+fact is about an int slot. A def would only KILL the struct fact at
+every member store for nothing. `jit_hoist_op_defs` (jit.cpp) had said
+the same of these ops all along: "no frame-slot writes".
+
+**Where the cost was, and it was not where W3 found it.** The barrier
+was found by W3 because `compute_ref_slots` BAILS on one - every chunk
+with an element store listed EVERY slot as reference-carrying
+(76_funcval_dispatch's `st[0] = st[0] + x` body: `refs=[0 1 2 3]` for
+an array, a dyn-launderable int and two temps) - and that is what kept
+76's tails, its four-slot arm scan and the frameless gate's
+`RET_REF_GUARD_MAX` in the way. But six consumers read this table, and
+the ledger says the E1 liveness and the ref-store guards were paying
+far more than the frameless protocol: with the store audited, the
+peephole retargets `call.blt.v r8 = array(r7); move primes = r8` into
+one op and fuses `load.elem.i r7 = primes[i]; jmp.ifnot.v r7` into
+`jmp.ifnotel primes[i]` past the store (43_sieve's inner loop), and a
+chunk's scalar temps stop being "reference-carrying" - so the C5-class
+store guard (`mov r10, s2.type; mov r10, [r10+8]; cmp r10, 8; jb`
+before every write to them) and the return arm's release test go.
+Bytecode changed in 20 of 127 corpus programs; emitted code on 76's
+callee went from 92 to 76 instructions per call (the two temps' write
+guards, 10, and their two arm scans, 6), its site from 112.5 to 109.5
+(the tails and tags W3 can now elide) - and `refs=[0 1]`, the two
+parameters, exactly the truth.
+
+**Measured (callgrind, OPT=1 ASSERTS=0, -npc, scale 1, the whole of
+bench/my; the base is the tree before this change):**
+
+    60_bit_sieve            -23.02%     38_min_max         -9.62%
+    14_array_subscript      -19.99%     76_funcval_dispatch -8.96%
+    86_elem_arith_compound  -19.80%     46_matrix_mult     -7.33%
+    68_nested               -18.40%     90_struct_field_store -7.03%
+    87_elem_shift_compound  -13.82%     88_elem_float_compound -5.82%
+    43_sieve                 -1.81%     62_dict_word_count -1.51%
+    23_dict_insert           -1.26%     32_str_build_join  -0.95%
+    16/20/27/47/34/56/24/31  -0.64% .. -0.01%
+
+Every other bench reads +0.01% to +0.05%, and those are COMPILE-TIME
+constants, not per-iteration cost: 09_fib +35,586 Ir at scale 1 and
++35,586 at scale 3, 12_higher_order +14,400 / +14,400, 83_regs_int_40
++135,862 / +135,862 - the passes that used to bail at the first store
+now run to their fixpoint. Zero per-iteration regressions corpus-wide.
+
+**Nets.** `use_def_store_family` (tests.cpp): a program producing every
+op in the family at every base kind (local, global, capture) plus an
+all-literal `StoreElemInt`, each instruction found by opcode, its
+`jit_op_slot_refs` answer required to equal the frame slots the VM
+handler reads and its defs to be empty - vacuity-guarded on all six ops
+and all three kinds. `arg_inplace_shapes`' leaf callee is FRAMELESS now
+(its refs went from all seven slots to `[0]`), so that case accepts the
+frameless push as the fused bind and a new self-recursive (non-leaf)
+callee pins the generic push's #162 arm; `jit_slot_liveness_check`'s
+"unaudited op" case is a `MultiUnpackV` now, the store kept as an
+audited case. ⛔ Watched failing, three sabotage builds, and the finding
+is that the structural test is the ONLY net: the value use dropped from
+StoreElemValue/DictStore, a def invented for a StoreElemInt base, and a
+global base's index reported as a frame slot each fail
+`use_def_store_family` (the first also trips D3.b's interval
+qualification with an orphan event) while `-rt`'s five modes,
+`corpus_diff` and every printed value stayed GREEN on all three. A
+wrong row here costs optimizations silently, or a miscompile in a
+shape the corpus does not contain; the answers are not an oracle for
+it - the same lesson as lever A's whitelists and the census.
+
+**Wall clock, one 1-vs-1 run at the end of the task (#25 vs the tree
+before it, kept as `build-claude/base-25`; `bench/run.py --mylang
+build-claude/perf/mylang --baseline build-claude/base-25/mylang`,
+-npc, both OPT=1 ASSERTS=0):** 76 **0.85x**, 46_matrix_mult **0.85x**,
+68_nested **0.86x**, 87 **0.86x**, 60_bit_sieve **0.88x**, 14 **0.92x**,
+53_collatz 0.95x, everything else 0.99-1.01x, geomean cur/base
+**0.991x** over 90. The full battery was green (the one `myv_fuzz`
+report on the debug build is the known small-1305 LSan finding, task
+#26).

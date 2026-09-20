@@ -705,6 +705,29 @@ consumer of it, because the new consumer is the first thing that cannot
 afford them** - and the gap's real cost is rarely paid where the new
 consumer noticed it.
 
+**IT HAPPENED A SECOND TIME, SIX OPCODES AT ONCE, AND THE SAME WAY
+(#25, 2026-09-21): THE ELEMENT-STORE FAMILY WAS NOT IN
+`visit_use_def` EITHER.** `StoreElemInt/Float/Value`, `DictStore`,
+`StoreMemberV`, `StoreElem2V` - every one a barrier. Found by W3, the
+newest consumer, because `compute_ref_slots` BAILS on a barrier and so
+listed EVERY slot of any function containing `a[i] = v` as
+reference-carrying (76's `refs=[0 1 2 3]` for an array, an int and two
+temps). And again the cost was not where the finder looked: 76 read
+-9.0% Ir, but **60_bit_sieve -23%, 14_array_subscript -20%,
+86_elem_arith_compound -20%, 68_nested -18%** - the E1 peephole
+retargeting and fusing past the store, and the C5-class write guards
+and arm scans on temps that were never references. The rows say what
+the VM reads: base (when its KIND is local), keys, value - and NO def,
+because the COW paths rewrite the container handle in place, type
+unchanged, and a def would only kill C4d's `(slot, def)` fact for
+nothing. The two CHAIN forms stay barriers on purpose: their keys live
+in a pool the Instr-only signature cannot reach. **Pinned by
+`use_def_store_family`, which was the ONLY net that fired on any of
+three sabotaged rows** - the five-mode differential and corpus_diff
+stayed green through a dropped value use, an invented def and a global
+index reported as a frame slot. A wrong row in this table is not an
+answer the engines can disagree about.
+
 **THE FIX, AND THE PATTERN TO REUSE: derive the test from the OPCODE
 ENUM, not from the table.** The B1/B2 specialized family is a
 CONTIGUOUS range (`IntAddRR .. FloatMulRI`, bytecode.h), so
