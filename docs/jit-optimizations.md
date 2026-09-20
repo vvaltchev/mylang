@@ -14328,3 +14328,36 @@ baseline E2c):
     09_fib_recursive     49,707,378 -> 47,484,066    -4.47%   0.92x
     10_recursion_deep   147,723,000 -> 142,335,000   -3.65%   0.97x
     08 / 45 / 11 / 78 / 76 / 03                     flat to the instruction
+
+**E2e - THE LAZY VFRAME IN A CALLING FRAMELESS BODY (2026-09-24).**
+`act.view_frame` is where C++ finds the running frame (`ctx->frame`
+points at it), and every frame kept it current EAGERLY: the frameless
+entry wrote `{window, size}` and the site wrote the caller's back after
+every call - two loads and four stores per call, the hottest stores left
+on 10 by the cycle profile. No EMITTED code in a calling frameless body
+reads it (the return arms only write it), so there it is PUBLISHED
+instead (`Emitter::vframe_publish`): immediately before every C++ call -
+`call_direct` unless fixed-frame, and `call_rax` - and at every exception
+epilogue. Each C++ entry therefore sees exactly what the eager scheme
+showed it; between them the cell may name a window already gone. `rbx`
+is the window throughout a body (`frag_entry` suspends the mode: its
+TESTS probe calls C++ before `rbx` is set), and `r11` is the scratch -
+caller-saved, so no pin lives in it at a call.
+**THE NET is a poison, W4's pattern:** in a TESTS build the two places
+the eager scheme stored now store a POISON window (size 0, slots whose
+type word is `jit_poison_type`), so a C++ reader reached without a
+publish fails by name. Watched: without the `call_direct` publish, `-rt`
+aborts in `Frame::at` on its first case. The EPILOGUE publish is NOT
+watched and is redundant today: a calling frameless body has no bail
+exits, so every exception exit follows a C++ call from the same frame
+(the raise helper, or the postexit after a callee's exception) that
+already published - kept as a cold guard for a future op that exits
+without one. The `-rt` case requires every admitted body to emit
+publishes (`vframe_publish`, a JITSTATS row). Measured - exactly the
+ceiling the deletion experiment predicted (baseline E2d; wall = ONE
+interleaved `--baseline` run):
+
+    bench                Ir per scale unit            wall
+    09_fib_recursive     47,484,066 -> 44,149,098    -7.02%   0.91x
+    10_recursion_deep   142,335,000 -> 134,253,000   -5.68%   0.96x
+    08 / 45 / 11 / 78 / 76 / 03                     flat to the instruction
